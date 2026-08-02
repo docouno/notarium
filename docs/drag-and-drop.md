@@ -503,7 +503,7 @@ Explorer scope (`packages/web/src/libs/tree/tree/explorerScope.ts`, pure unit te
 - [ ] `pushRecent`: prepends a new id; moves an existing id to the front (dedup); caps at 5 (drops the oldest).
 - [ ] e2e: Files→Projects→single-project switch (nested project shown once, plain folders hidden); a focused project becomes a recent quick-jump in the dropdown; opening an out-of-scope note bounces to Files; Projects-empty state until a folder is marked.
 
-Sidebar interactions (component / DnD tests — mind the native-DnD mechanics in §7):
+Sidebar interactions (component / DnD tests — note the native-DnD mechanics in §7):
 - [ ] **Plain** folder click toggles expand/collapse; no folder gets `.active`/selection highlight, and it clears any multi-selection.
 - [ ] Open a file → only that file highlighted; no folder highlighted.
 - [ ] **Active vs selected are visually distinct (#229, `test/e2e/tree-active-selection.spec.ts`)**: an open note keeps the light `--bg-hover` pill while a selected-only row is a DENSER `--border-strong` grey — different `background-color`, no accent; a row that is BOTH open and selected also carries a neutral left border (`::before`), so all three states are distinct; ctrl-clicking the OPEN note toggles it into the set VISIBLY (its pill deepens + gains the border; the row becomes both `aria-current` + `aria-selected`); deleting a set that includes the open note carries it too (the issue's example); a plain click on the open note clears the set but keeps it active (Model 1 — the set is the explicit pick, the open note does not auto-join). The gap between rows survives selection (background-color keeps `background-clip`).

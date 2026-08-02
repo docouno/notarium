@@ -25,14 +25,19 @@ The split that trips people up first is `engine` vs `engine-vector`: semantic se
 Node 24 is expected.
 
 ```bash
-npm install
+npm run deps:lean      # or `npm install` — see the note below
 npm run dev            # → http://localhost:3000
 npm run dev:tunnel     # the same behind an HTTPS tunnel (see ALLOWED_HOSTS below)
 npm run server         # one Fastify process → http://localhost:3000
 npm run build && npm start
 ```
 
-**The app answers on `3000` in every mode** — in production that is Fastify itself, in dev it is Vite with the backend behind the proxy on `3001`, so the URL you open never changes. Move them with `PORT` and `API_PORT`.
+A bare `npm install` installs every workspace, and that includes `engine-vector` — so it
+pulls the ~660 MB native stack this file says a default install skips. `deps:lean` is the
+default install the split was made for; `npm run deps:full` (or `make deps-vector`) adds
+the native stack when you actually need semantic search.
+
+**The app answers on `3000` in every mode** — in production that is Fastify itself, in dev it is Vite with the backend behind the proxy on `3001`, so the URL you open never changes. `npm run dev` moves them with `VITE_PORT` and `API_PORT`; `npm run server` and `npm start` use `PORT`. `dev:tunnel` is the exception and takes the web port from `PORT` (it has to hand the same number to the HMR client, so it sets `VITE_PORT` itself).
 
 Vite only accepts local Host headers by default (a DNS-rebinding guard), so reaching the dev server through a tunnel or a remote box needs `ALLOWED_HOSTS=my.host` (a leading dot — `.example.dev` — covers all subdomains; `all` disables the check). `dev:tunnel` additionally pins the HMR websocket to `:443`.
 
@@ -42,6 +47,8 @@ Keep these green before opening a pull request:
 npm run typecheck
 npm run lint
 npm run format:check
+npm run canon:check    # every `// canon: docs/…` reference resolves to a real anchor
+npm run audit:runtime
 npm test
 npm run test:pg        # requires TEST_PG_URL; `make test-pg` supplies an ephemeral DB
 npm run e2e            # Playwright; e2e:docker / visual run in a container
@@ -86,13 +93,84 @@ One package goes to npm: the `notarium` CLI, published by hand under the maintai
 - **Comments earn their place.** A comment should carry local, non-obvious truth — an invariant, a footgun, a wire-vs-domain mismatch — or point at the canon with `// canon: docs/<file>.md#anchor`. Restating what the code or the canon already says is noise. The full rubric is in [docs/architecture.md](docs/architecture.md#comments).
 - **Docs and code move together.** If a change alters behaviour described in `docs/`, update that file in the same pull request; `npm run canon:check` validates the canon references.
 - Repository-facing text is English. Cyrillic appears only where it is a functional fixture — slug transliteration, search-over-Russian test corpora, query samples in the benchmarks.
-- **`#N` refers to the project's internal issue tracker**, which is not public. The issues themselves are not the canon: the reasoning that survived them lives in `docs/`, and the numbers are kept as provenance for people who do have access.
+- **`#N` anywhere in the repository except commit messages refers to the project's internal issue tracker**, which is not public — it turns up in `docs/`, in code comments and in a few package READMEs. The issues themselves are not the canon: the reasoning that survived them lives in `docs/`, and the numbers are kept as provenance for people who do have access. Commit messages carry no issue references at all — see [Commits](#commits).
+
+## Commits
+
+What lands on `main` is one commit per change — pull requests are squashed — so the
+message that matters is the pull request's title and description, not the checkpoints on
+the branch behind it.
+
+```
+<type>(<scope>): <subject>
+```
+
+There are four types, and the type answers one question: does a user see this?
+
+| Type | Means |
+|---|---|
+| `feat` | new behaviour a user can observe |
+| `fix` | behaviour that was wrong is now right |
+| `perf` | the same behaviour, measurably cheaper — with the measurement in the body |
+| `chore` | everything else: docs, dependencies, refactors, tests, CI, repository mechanics |
+
+The scope is where a reader would look first: a package's directory under `packages/`
+(`core`, `contract`, `engine`, `engine-vector`, `engine-memory`, `server`, `web`, `cli`,
+`desktop` — the directory, not the manifest name, so the published CLI is `cli`), a
+subsystem where that says more than the package it lives in (`search`, `graph`, `editor`,
+`auth`, `jobs`), or a cross-cutting area (`docs`, `ci`, `release`, `deps`, `repo`). A
+change spread across packages takes the primary one.
+
+The subject is English, imperative, lowercase after the colon, no full stop, and the whole
+line fits in 72 characters. A breaking change marks the type with `!` — `fix(server)!:` —
+and a `BREAKING CHANGE:` footer says what breaks and how to migrate; being pre-1.0 is not
+a reason to leave that out. The body is optional and carries the *why*, under the same
+rubric as comments — local, non-obvious truth rather than a restatement of the diff. The
+one exception to all of this is written by a machine: `npm run release` commits
+`chore(release): vX.Y.Z`, naming the version rather than an action, because that is the
+line people scan the log for.
+
+**Issues are referenced from the pull request, never from the commit message.** A commit
+message is immutable and outlives the tracker it was written against, while a pull request
+stays editable and is where the conversation already is — closing keywords in its
+description work just as well. (GitHub's squash button appends its own `(#N)` to the
+subject; that one is generated, points at the pull request itself, and is fine.)
 
 ## Pull requests
 
-Work on a branch, keep the checks above green, and describe *why* in the pull request rather than restating the diff. Small, focused changes get reviewed faster than large ones.
+This repository is where contributions are accepted. `main` here is the branch you fork,
+and a pull request opened against it is merged here, with the button, under your own name.
+Day-to-day work happens in a private repository as well — that is where `#N` points and
+why the published history starts at a single commit — but it changes nothing about the
+path below: a fork of this repository is a complete working copy, canon included.
 
-> ⚠️ **Before a first external contribution:** a Contributor License Agreement is required, because Notarium is dual-licensed (AGPL-3.0 plus a commercial license) and offering a commercial license requires the rights to all first-party code. The CLA process is being set up — please open an issue or write to commercial@notarium.ai before submitting a substantial contribution.
+1. **Fork, then branch.** Work on a branch in your fork rather than on `main`.
+2. **Keep the checks green before opening the pull request** — the commands under
+   [Working on the host](#working-on-the-host). They do not run automatically on pull
+   requests yet, so otherwise the first thing a review does is run them by hand; a branch
+   that already passes gets read as code instead of triaged as a maybe.
+3. **Open the pull request against `main`.** Title it the way a commit is titled —
+   `type(scope): subject`, imperative, under 72 characters — because that title *becomes*
+   the commit message on `main` when the pull request is squashed. In the description say
+   *why* rather than restating the diff; the diff is already there. Small, focused changes
+   get reviewed faster than large ones, and a change that alters behaviour described in
+   `docs/` updates that file in the same pull request.
+4. **Sign the CLA.** Notarium is dual-licensed (AGPL-3.0 plus a commercial license), and
+   offering a commercial license requires the rights to all first-party code — so a
+   contribution has to come with permission to relicense it. You keep your copyright.
+   **The agreement is still being finalised, and until it exists nothing external can be
+   merged** — not because the change is unwelcome, but because merging first is precisely
+   what would make that code impossible to license commercially, and unpicking it later
+   means rewriting your work. So write to commercial@notarium.ai *before* starting on
+   anything substantial: you will get the current state, and small fixes can often be
+   handled another way in the meantime. Pull requests opened now are read and reviewed;
+   they wait on this one step, not on interest.
+5. **Review, then merge.** Notarium is maintained by one person, so review is sequential
+   rather than fast; a pull request that sits is queued, not ignored.
+
+Unsure whether a change is wanted before you write it? Open an issue first — a short
+description of the problem you hit is enough, and it is cheaper than a pull request that
+has to be turned down.
 
 ## Security
 
