@@ -146,8 +146,8 @@ export type CreateServerOptions = {
   /** Direct proxy IP/CIDR allowlist for canonical client-IP resolution. Unset
    *  means X-Forwarded-For cannot affect req.ip or its rate-limit budgets. */
   trustProxy?: string[]
-  /** Cooperative background-scheduler tuning: the quiet window the embed backfill
-   *  waits after interactive traffic, and the drip floor that still grants it a turn
+  /** Cooperative background-scheduler tuning: the quiet window background workers
+   *  wait after interactive traffic, and the drip floor that still grants one a turn
    *  under load. Unset ⇒ scheduler defaults. canon: docs/core.md#cooperative */
   backgroundQuietMs?: number
   backgroundDripMs?: number
@@ -178,7 +178,7 @@ export const createServer = async ({
   const metaDb = metaDbUrl ? createMetaDb(metaDbUrl) : undefined
   const mutationGate = createMutationGate()
   // The ONE process-global cooperative scheduler — a single instance gates all
-  // spaces, so one space's embed backfill yields to another space's traffic.
+  // spaces, so embed backfill and graph enrichment yield to every space's traffic.
   const scheduler = new BackgroundScheduler({
     quietMs: backgroundQuietMs,
     dripMs: backgroundDripMs,

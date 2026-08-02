@@ -1,5 +1,5 @@
 // The process-global background scheduler: one cooperative gate so CPU-heavy background work
-// (embed backfill today) yields to interactive traffic instead of starving it. PROCESS-GLOBAL,
+// (embed backfill and graph enrichment) yields to interactive traffic instead of starving it. PROCESS-GLOBAL,
 // not per-space — cores and the event loop are shared, so a backfill in one space must yield to
 // navigation in another. A worker calls `awaitTurn()` between units; the gate holds it while
 // interactive requests are in flight (counted via the server's request hooks). Two guarantees:
@@ -84,14 +84,23 @@ export class BackgroundScheduler implements BackgroundGate, InteractiveSignal {
     return quietOk || dripOk
   }
 
-  async awaitTurn(): Promise<void> {
-    while (!this.stopped) {
+  async awaitTurn(signal?: AbortSignal): Promise<void> {
+    while (!this.stopped && !signal?.aborted) {
+      // Yield BEFORE EVERY potentially-final predicate check — both the first
+      // one and the one after a parked sleep. An interactive socket may already
+      // be ready in the poll phase when a quiet-window timer wakes us; checking
+      // in the timer's microtask would otherwise let background work overtake it.
+      await macrotaskYield()
+      if (this.stopped || signal?.aborted) {
+        return
+      }
       const t = this.now()
       const quietOk = this.interactive === 0 && t - this.lastBusyAt >= this.quietMs
       const dripOk = t - this.lastTurnAt >= this.dripMs
 
       if (quietOk || dripOk) {
-        break
+        this.lastTurnAt = t
+        return
       }
       // Sleep until the earliest condition that could flip: the quiet window
       // elapsing (only meaningful while idle — an enter wakes us to recompute), or
@@ -100,13 +109,8 @@ export class BackgroundScheduler implements BackgroundGate, InteractiveSignal {
       const untilQuiet =
         this.interactive === 0 ? this.quietMs - (t - this.lastBusyAt) : Number.POSITIVE_INFINITY
       const untilDrip = this.dripMs - (t - this.lastTurnAt)
-      await this.sleep(Math.max(0, Math.min(untilQuiet, untilDrip)))
+      await this.sleep(Math.max(0, Math.min(untilQuiet, untilDrip)), signal)
     }
-    this.lastTurnAt = this.now()
-    // Always release the loop once before the worker proceeds, so a worker whose
-    // turn was granted with no wait (the quiet/idle path) still can't monopolise the
-    // event loop across iterations — this subsumes the loop's old per-note setImmediate.
-    await macrotaskYield()
   }
 
   /** Wake every sleeper so each awaitTurn recomputes against the new state. */
@@ -124,21 +128,32 @@ export class BackgroundScheduler implements BackgroundGate, InteractiveSignal {
   /** A timer-bounded sleep that any wake() cuts short. Resolves on the timer OR the
    *  next interactive transition, whichever is first; the awaitTurn loop then
    *  re-tests its conditions. */
-  private sleep(ms: number): Promise<void> {
-    if (ms <= 0) {
+  private sleep(ms: number, signal?: AbortSignal): Promise<void> {
+    if (ms <= 0 || signal?.aborted) {
       return Promise.resolve()
     }
 
     return new Promise<void>((resolve) => {
-      const waker = (): void => {
+      let settled = false
+
+      const finish = (): void => {
+        if (settled) {
+          return
+        }
+        settled = true
         this.clearTimer(handle)
+        this.wakers.delete(waker)
+        signal?.removeEventListener('abort', finish)
         resolve()
       }
-      const handle = this.setTimer(() => {
-        this.wakers.delete(waker)
-        resolve()
-      }, ms)
+      const waker = (): void => finish()
+      const handle = this.setTimer(finish, ms)
       this.wakers.add(waker)
+      signal?.addEventListener('abort', finish, { once: true })
+      // Abort can race the listener registration in a host callback.
+      if (signal?.aborted) {
+        finish()
+      }
     })
   }
 

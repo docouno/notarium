@@ -37,6 +37,7 @@ const spyScheduler = () => {
   let exits = 0
   return {
     signal: {
+      awaitTurn: async () => {},
       enterInteractive: () => {
         enters++
         count++

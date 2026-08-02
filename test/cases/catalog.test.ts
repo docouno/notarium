@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest'
 
+import {
+  buildLinkIndex,
+  computeCommunities,
+  deriveNoteEdges,
+  type NoteMeta,
+  shapeGraph,
+} from '@notarium/core'
+
 import { buildCasesWorld, buildCaseWorld, DEFAULT_NOW } from './build'
 import { normDate } from './generators'
 import { CASES, getCase, listCases } from './registry'
@@ -206,6 +214,39 @@ describe('seed catalog (#175)', () => {
     const small = buildCaseWorld('feed-scroll', { scale: 0.1 }).events.length
     const big = buildCaseWorld('feed-scroll', { scale: 0.5 }).events.length
     expect(big).toBeGreaterThan(small)
+  })
+
+  it('graph-load scales to the canonical 3k-node linked workload', () => {
+    const world = buildCaseWorld('graph-load', { scale: 10 })
+    const creates = world.events.filter((event) => event.op === 'create')
+    const notes: NoteMeta[] = creates.map((event) => ({
+      id: event.noteId,
+      title: event.title,
+      filePath: event.path,
+      tags: event.tags,
+      createdAt: event.date,
+      modifiedAt: event.date,
+    }))
+    const index = buildLinkIndex(notes)
+    const ghosts = new Map<string, ReturnType<typeof deriveNoteEdges>['ghosts'][number]>()
+    const edgesBySource = creates.map((event) => {
+      const derived = deriveNoteEdges(event.noteId, event.content, index, 'links_to')
+
+      for (const ghost of derived.ghosts) {
+        ghosts.set(ghost.id, ghost)
+      }
+
+      return [event.noteId, derived.edges] as [string, typeof derived.edges]
+    })
+    const graph = shapeGraph(notes, edgesBySource, ghosts)
+    const communities = computeCommunities(graph.nodes, graph.links)
+
+    expect(graph.nodes).toHaveLength(3_000)
+    expect(graph.nodes.every((node) => !node.ghost)).toBe(true)
+    expect(graph.links).toHaveLength(8_976)
+    expect(new Set(graph.links.map((edge) => `${edge.source}\0${edge.target}`)).size).toBe(8_976)
+    expect(new Set(notes.map((note) => note.filePath.split('/')[1])).size).toBe(12)
+    expect(new Set(communities.values()).size).toBe(12)
   })
 
   it('agent-context carries a real retrieval-audit demo (#243)', () => {

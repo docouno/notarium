@@ -7,6 +7,7 @@ import { favorites } from './cases/favorites'
 import { feedScroll } from './cases/feedScroll'
 import { folderPage } from './cases/folderPage'
 import { graph } from './cases/graph'
+import { graphLoad } from './cases/graphLoad'
 import { historyRich } from './cases/historyRich'
 import { importLayout } from './cases/importLayout'
 import { importThread } from './cases/importThread'
@@ -44,6 +45,7 @@ export const CASES: readonly CaseSpec[] = [
   // graph / identity / search
   wikiWeb,
   graph,
+  graphLoad,
   searchCorpus,
   externalEdits,
   // content / reader

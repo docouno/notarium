@@ -13,6 +13,16 @@ const nextTurn = (): Promise<void> =>
     setTimeout(resolve, 0)
   })
 
+const waitUntil = async (predicate: () => boolean): Promise<void> => {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (predicate()) {
+      return
+    }
+    await nextTurn()
+  }
+  throw new Error('condition did not become true')
+}
+
 const chain = (size: number): Graph => ({
   nodes: Array.from({ length: size }, (_, index) => ({
     id: `n${index}`,
@@ -38,6 +48,122 @@ type GraphCacheState = {
 const stateOf = (cache: GraphCache): GraphCacheState => cache as unknown as GraphCacheState
 
 describe('GraphCache lifecycle', () => {
+  it('uses the shared gate before Louvain and at every layout yield boundary', async () => {
+    let turns = 0
+    let releaseFirst!: () => void
+    let releaseSecond!: () => void
+    const firstTurn = new Promise<void>((resolve) => {
+      releaseFirst = resolve
+    })
+    const secondTurn = new Promise<void>((resolve) => {
+      releaseSecond = resolve
+    })
+    let emits = 0
+    let shaped!: Graph
+    const cache = new GraphCache({
+      shape: () => {
+        shaped = chain(350)
+        return shaped
+      },
+      emitGraph: () => {
+        emits++
+      },
+      debounceMs: 0,
+      canSchedule: () => true,
+      scheduler: {
+        awaitTurn: () => {
+          turns++
+          return turns === 1 ? firstTurn : turns === 2 ? secondTurn : Promise.resolve()
+        },
+      },
+    })
+
+    cache.read()
+    await nextTurn()
+    expect(turns).toBe(1)
+    expect(shaped.nodes.every((node) => node.ghost || node.community == null)).toBe(true)
+    expect(emits).toBe(0)
+
+    releaseFirst()
+    await waitUntil(() => turns === 2)
+    expect(shaped.nodes.every((node) => node.ghost || node.community != null)).toBe(true)
+    expect(shaped.nodes.every((node) => node.x == null && node.y == null)).toBe(true)
+    expect(emits).toBe(0)
+
+    releaseSecond()
+    await cache.settle()
+
+    expect(turns).toBeGreaterThan(1)
+    expect(emits).toBe(1)
+    expect(stateOf(cache).layoutPositions.size).toBe(350)
+  })
+
+  it.each(['reset', 'dispose'] as const)(
+    'cancels a layout parked at the shared gate after %s',
+    async (action) => {
+      let turns = 0
+      let emits = 0
+      const cache = new GraphCache({
+        shape: () => chain(350),
+        emitGraph: () => {
+          emits++
+        },
+        debounceMs: 0,
+        canSchedule: () => true,
+        scheduler: {
+          awaitTurn: async (signal) => {
+            turns++
+            if (turns === 1) {
+              return
+            }
+            await new Promise<void>((resolve) => {
+              signal?.addEventListener('abort', () => resolve(), { once: true })
+            })
+          },
+        },
+      })
+
+      cache.read()
+      await waitUntil(() => turns === 2)
+      const stale = stateOf(cache).enriching?.promise
+
+      expect(stale).toBeTruthy()
+      cache[action]()
+      await stale
+      await cache.settle()
+
+      expect(turns).toBe(2)
+      expect(emits).toBe(0)
+      expect(stateOf(cache).layoutPositions.size).toBe(0)
+    },
+  )
+
+  it('cancels a bare-host layout at its next local yield after reset', async () => {
+    vi.useFakeTimers()
+    try {
+      const cache = new GraphCache({
+        shape: () => chain(350),
+        emitGraph: () => {},
+        debounceMs: 0,
+        canSchedule: () => true,
+      })
+
+      cache.read()
+      await vi.advanceTimersToNextTimerAsync() // start enrich, park at layout's first local yield
+      const stale = stateOf(cache).enriching?.promise
+
+      expect(stale).toBeTruthy()
+      cache.reset()
+      await vi.advanceTimersToNextTimerAsync() // release that yield; signal stops the next tick
+      await stale
+
+      expect(stateOf(cache).layoutPositions.size).toBe(0)
+      expect(stateOf(cache).enriching).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('joins an active enrichment without publishing after dispose', async () => {
     let emits = 0
     const cache = new GraphCache({

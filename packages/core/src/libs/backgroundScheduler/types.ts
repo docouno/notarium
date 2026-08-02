@@ -1,12 +1,14 @@
-/** The narrow seam a background worker (the embed loop) depends on — it only ever
- *  awaits a turn. Kept separate from the full class so the engine/read-model can be
- *  fed a test double without the timer machinery. */
+/** The narrow seam every background worker depends on — it only ever awaits a
+ *  turn. Kept separate from the full class so the engine/read-model can be fed a
+ *  test double without the timer machinery. */
 export type BackgroundGate = {
   /** Resolve when the worker may run its next unit of work — immediately when the
    *  process is quiet, after a wait when interactive traffic is in flight (bounded
    *  by the drip floor). Always yields the macrotask phase at least once before
-   *  resolving, so a synchronous work loop can't starve the event loop on its own. */
-  awaitTurn(): Promise<void>
+   *  resolving, so a synchronous work loop can't starve the event loop on its own.
+   *  An aborted wait resolves without consuming a turn; the owner can then drop
+   *  obsolete work without leaving a sleeper in the shared drip queue. */
+  awaitTurn(signal?: AbortSignal): Promise<void>
 }
 
 /** The interactive-traffic side of the scheduler — what the server's request
@@ -16,6 +18,10 @@ export type InteractiveSignal = {
   enterInteractive(): void
   exitInteractive(): void
 }
+
+/** Both sides of the process-global scheduler, for an owner that contributes
+ *  interactive traffic and also runs background work. */
+export type BackgroundSchedulerPort = BackgroundGate & InteractiveSignal
 
 export type BackgroundSchedulerOptions = {
   /** How long the process must stay free of interactive requests before a parked

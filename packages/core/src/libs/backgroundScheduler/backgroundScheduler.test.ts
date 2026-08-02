@@ -139,6 +139,46 @@ describe('BackgroundScheduler', () => {
     expect(done).toBe(true)
   })
 
+  it('rechecks the gate after the mandatory macrotask yield', async () => {
+    const clk = fakeClock()
+    const s = make(clk, { quietMs: 100, dripMs: 1_000 })
+    await s.awaitTurn() // spend the initial drip credit
+    let done = false
+
+    void s.awaitTurn().then(() => (done = true))
+    // The call saw an idle process, but this request arrives before its
+    // setImmediate continuation. It must close the gate before the grant lands.
+    s.enterInteractive()
+    await flush()
+    expect(done).toBe(false)
+
+    s.exitInteractive()
+    await clk.advance(100)
+    await flush()
+    expect(done).toBe(true)
+  })
+
+  it('lets interactive traffic overtake a parked quiet-window wake', async () => {
+    const clk = fakeClock()
+    const s = make(clk, { quietMs: 100, dripMs: 1_000 })
+    await s.awaitTurn()
+    s.enterInteractive()
+    s.exitInteractive()
+    let done = false
+
+    void s.awaitTurn().then(() => (done = true))
+    await flush() // initial check parks on the quiet-window timer
+    await clk.advance(100) // timer wakes; the final setImmediate has not run yet
+    s.enterInteractive() // poll-phase request must overtake the background grant
+    await flush()
+    expect(done).toBe(false)
+
+    s.exitInteractive()
+    await clk.advance(100)
+    await flush()
+    expect(done).toBe(true)
+  })
+
   it('still grants a drip turn under unrelenting load', async () => {
     const clk = fakeClock()
     const s = make(clk, { quietMs: 100, dripMs: 1_000 })
@@ -157,6 +197,52 @@ describe('BackgroundScheduler', () => {
     await clk.advance(2)
     await flush()
     expect(done).toBe(true) // >= 1000ms starved → drip floor grants a turn despite load
+  })
+
+  it('shares one drip floor across competing background workers', async () => {
+    const clk = fakeClock()
+    const s = make(clk, { quietMs: 100, dripMs: 1_000 })
+    await s.awaitTurn()
+    s.enterInteractive()
+    let completed = 0
+
+    void s.awaitTurn().then(() => completed++)
+    void s.awaitTurn().then(() => completed++)
+    await flush()
+    expect(completed).toBe(0)
+
+    await clk.advance(1_000)
+    await flush()
+    expect(completed).toBe(1)
+
+    await clk.advance(1_000)
+    await flush()
+    expect(completed).toBe(2)
+  })
+
+  it('cancels a parked waiter without spending the shared drip turn', async () => {
+    const clk = fakeClock()
+    const s = make(clk, { quietMs: 100, dripMs: 1_000 })
+    await s.awaitTurn()
+    s.enterInteractive()
+    const abort = new AbortController()
+    let cancelled = false
+    let worker = false
+
+    void s.awaitTurn(abort.signal).then(() => (cancelled = true))
+    void s.awaitTurn().then(() => (worker = true))
+    await flush()
+    expect(cancelled).toBe(false)
+    expect(worker).toBe(false)
+
+    abort.abort()
+    await flush()
+    expect(cancelled).toBe(true)
+    expect(worker).toBe(false)
+
+    await clk.advance(1_000)
+    await flush()
+    expect(worker).toBe(true)
   })
 
   it('clamps the interactive count at zero (a double-exit cannot pin it busy)', async () => {

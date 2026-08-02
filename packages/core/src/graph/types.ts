@@ -46,6 +46,15 @@ export type LayoutOptions = {
   /** Yield to the event loop every N ticks so a big layout doesn't block the
    *  host (0 = run synchronously, for tests/tiny graphs). */
   yieldEvery?: number
+  /** Host-owned cooperative yield. The server injects its process-global
+   *  scheduler; engine-less/fake callers omit it and use a local macrotask. */
+  yieldToHost?: () => Promise<void>
+  /** Lifecycle cancellation for an obsolete layout. Checked between ticks, so
+   *  both scheduler-backed and bare hosts stop at the next existing boundary. */
+  signal?: AbortSignal
 }
 
-export type EnrichOptions = Pick<LayoutOptions, 'positions' | 'yieldEvery'>
+export type EnrichOptions = Pick<
+  LayoutOptions,
+  'positions' | 'yieldEvery' | 'yieldToHost' | 'signal'
+>

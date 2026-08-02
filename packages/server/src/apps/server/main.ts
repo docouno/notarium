@@ -77,8 +77,8 @@ const embedPrefixes =
 // between passes at a throughput cost (the memory-constrained tier knob).
 const EMBED_CPU_MEM_ARENA = (process.env.EMBED_CPU_MEM_ARENA ?? 'on') !== 'off'
 // Cooperative background scheduler tuning: quiet window after the last interactive
-// request before the embed backfill resumes (BACKFILL_QUIET_MS), and the floor that
-// still grants it a turn under unrelenting load (BACKFILL_DRIP_MS).
+// request before background work resumes, and the floor that still grants one worker
+// a turn under unrelenting load. The BACKFILL_* names are retained as deployment API.
 // canon: docs/core.md#cooperative
 const BACKFILL_QUIET_MS = posIntEnv('BACKFILL_QUIET_MS', process.env.BACKFILL_QUIET_MS)
 const BACKFILL_DRIP_MS = posIntEnv('BACKFILL_DRIP_MS', process.env.BACKFILL_DRIP_MS)

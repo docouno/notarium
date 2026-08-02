@@ -100,6 +100,7 @@ and for `security` — it parses the sanitized HTML into a live DOM and checks t
 |---|---|---|
 | `wiki-web` | a dense wikilink graph, alias/ghost (#202/#100) | graph, identity, content |
 | `graph` | hubs/orphans/ghost-by-refcount/former-name/cross-folder communities (#38/#202) | graph, identity |
+| `graph-load` | scalable linked communities: 300 nodes / ~900 links per scale unit; `SCALE=10` reproduces the 3k/9k cold-enrichment workload (#195/#284) | graph, scale |
 | `search-corpus` | a spotlight corpus: same-named notes, content/path-match, tag case-fold (#188/#204) | search, content |
 | `external-edits` | a direct same-size, mtime-preserving markdown rewrite: search marker + graph edge must self-heal on server boot/poll (#267) | search, graph, content |
 

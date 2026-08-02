@@ -1,6 +1,9 @@
 import { enrichGraph, hash01, type LayoutPositions, seedAtPlacedNeighbours } from '../../../graph'
 import type { Graph } from '../../../knowledgeStore'
+import type { BackgroundGate } from '../../../libs/backgroundScheduler'
 import type { GraphCacheOptions } from './types'
+
+const GRAPH_ENRICHMENT_CANCELLED = Symbol('graph-enrichment-cancelled')
 
 /** Graph enrichment cache: the communities+layout pass runs at most once per snapshot
  *  revision, never on the request path. `rev` ticks on every snapshot mutation; `layoutPositions`
@@ -10,12 +13,18 @@ export class GraphCache {
   private readonly emitGraph: () => void
   private readonly debounceMs: number
   private readonly canSchedule: () => boolean
+  private readonly scheduler?: BackgroundGate
   private rev = 0
   /** Full-reset generation. Unlike a normal snapshot revision, a reset makes
    *  every in-flight result unusable, including its layout warm-start state. */
   private epoch = 0
   private enriched: { rev: number; graph: Graph } | null = null
-  private enriching: { rev: number; epoch: number; promise: Promise<Graph> } | null = null
+  private enriching: {
+    rev: number
+    epoch: number
+    promise: Promise<Graph>
+    abort: AbortController
+  } | null = null
   /** SWR shape for the current revision: fresh topology dressed in the
    *  last computed enrichment, built once per revision and served while the
    *  real re-enrichment chases the snapshot in the background. */
@@ -28,11 +37,12 @@ export class GraphCache {
   private disposed = false
   private readonly activeEnrichments = new Set<Promise<Graph>>()
 
-  constructor({ shape, emitGraph, debounceMs, canSchedule }: GraphCacheOptions) {
+  constructor({ shape, emitGraph, debounceMs, canSchedule, scheduler }: GraphCacheOptions) {
     this.shape = shape
     this.emitGraph = emitGraph
     this.debounceMs = debounceMs
     this.canSchedule = canSchedule
+    this.scheduler = scheduler
   }
 
   /** A 'changed' event: the snapshot moved, so the enriched graph for the
@@ -55,6 +65,7 @@ export class GraphCache {
   /** Full reset (rescan): the snapshot is being rebuilt from scratch. */
   reset(): void {
     this.epoch++
+    this.enriching?.abort.abort()
     this.enriched = null
     this.staleShape = null
     this.enriching = null
@@ -65,6 +76,7 @@ export class GraphCache {
   /** Drop the pending refresh timer and suppress a running pass's late publish. */
   dispose(): void {
     this.disposed = true
+    this.enriching?.abort.abort()
     if (this.refreshTimer) {
       clearTimeout(this.refreshTimer)
     }
@@ -225,8 +237,9 @@ export class GraphCache {
       this.scheduleRefresh()
       return
     }
-    const promise = this.enrich(rev, epoch)
-    this.enriching = { rev, epoch, promise }
+    const abort = new AbortController()
+    const promise = this.enrich(rev, epoch, abort.signal)
+    this.enriching = { rev, epoch, promise, abort }
     this.activeEnrichments.add(promise)
     void promise.then(
       () => {
@@ -261,17 +274,38 @@ export class GraphCache {
    *  the waiters but not cached — the next call recomputes against the new
    *  revision. A failed enrichment degrades to the bare shaped graph.
    *  @see docs/core.md#graph-derivation */
-  private async enrich(rev: number, epoch: number): Promise<Graph> {
+  private async enrich(rev: number, epoch: number, signal: AbortSignal): Promise<Graph> {
     const graph = this.shape()
+    const scheduler = this.scheduler
     let positions: LayoutPositions | null = null
 
+    const assertActive = (): void => {
+      if (signal.aborted || this.disposed || this.epoch !== epoch) {
+        throw GRAPH_ENRICHMENT_CANCELLED
+      }
+    }
+    const awaitSchedulerTurn = scheduler
+      ? async (): Promise<void> => {
+          await scheduler.awaitTurn(signal)
+          assertActive()
+        }
+      : undefined
+
     try {
+      // Louvain is synchronous, so the cooperative boundary is immediately
+      // BEFORE it. Force-layout then re-enters the same shared gate at each of
+      // its existing size-dependent yield points instead of merely yielding the
+      // loop and continuing through fresh interactive traffic.
+      await awaitSchedulerTurn?.()
+      assertActive()
       // A layout computed before any edges existed (the 'notes' phase serves a
       // node-only graph) is no seed for the real one — relaxing from it would
       // leave the map half-formed. Re-anneal from scratch when edges first land.
       const warmable = this.layoutLinks > 0 || graph.links.length === 0
       positions = await enrichGraph(graph, {
         positions: warmable ? this.layoutPositions : undefined,
+        signal,
+        yieldToHost: awaitSchedulerTurn,
         // Tiny graphs lay out in microseconds — run them synchronously (yieldEvery
         // 0), so a setTimeout yield never adds a macrotask hop to a cheap pass. A
         // big graph (post-import) has expensive ticks (a 3k-node force tick is
@@ -289,6 +323,9 @@ export class GraphCache {
                 : 0,
       })
     } catch (err) {
+      if (err === GRAPH_ENRICHMENT_CANCELLED) {
+        return graph
+      }
       console.error('[cached-store] graph enrichment failed:', (err as Error).message)
     }
     if (this.disposed || this.epoch !== epoch) {

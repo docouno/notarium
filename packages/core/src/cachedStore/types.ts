@@ -5,7 +5,7 @@ import type {
   RevisionPersistence,
   StoreEvent,
 } from '../knowledgeStore'
-import type { InteractiveSignal } from '../libs/backgroundScheduler'
+import type { BackgroundSchedulerPort } from '../libs/backgroundScheduler'
 
 export type CachedStoreOptions = {
   /** The engine being decorated. */
@@ -53,12 +53,10 @@ export type CachedStoreOptions = {
    *  is where `[[oldpath/note]]` heals — buildLinkIndex gets these as alias keys).
    *  Refetched at boot and each poll; absent (the bare engine / fake) ⇒ none. */
   folderAliases?: () => Promise<FolderAlias[]>
-  /** The process-global background scheduler's interactive side. A streaming
-   *  import is itself heavy interactive work the user is waiting on, so the bulk
-   *  bracket marks it busy on the SHARED scheduler — that makes the embed backfill in
-   *  EVERY OTHER space yield to it too (the engine's own per-space suspendBackground
-   *  only pauses this space's loop). Absent (bare/fake) ⇒ no cross-space signal. */
-  scheduler?: InteractiveSignal
+  /** The process-global background scheduler. A streaming import contributes an
+   *  interactive signal, while graph enrichment consumes background turns alongside
+   *  engine backfill in every space. Absent (bare/fake) ⇒ local event-loop yields only. */
+  scheduler?: BackgroundSchedulerPort
   /** Clock, injectable for deterministic tests. */
   now?: () => Date
 }

@@ -44,6 +44,7 @@ const ALPHA_MIN = 0.001
 const MAX_TICKS = 400
 /** Warm-start coverage below which we treat the graph as new and re-anneal. */
 const WARM_FRACTION = 0.5
+const macrotaskYield = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0))
 
 /** Lay the graph out in place (writes x/y onto its nodes) and return the
  *  positions keyed by node id, to warm-start the next rebuild. */
@@ -51,7 +52,7 @@ export const layoutGraph = async (
   graph: Graph,
   opts: LayoutOptions = {},
 ): Promise<LayoutPositions> => {
-  const { positions, groupOf, yieldEvery = 25 } = opts
+  const { positions, groupOf, yieldEvery = 25, yieldToHost = macrotaskYield, signal } = opts
 
   if (!graph.nodes.length) {
     return new Map()
@@ -145,9 +146,12 @@ export const layoutGraph = async (
   sim.alphaDecay(reAnneal ? COLD_DECAY : WARM_DECAY)
 
   for (let tick = 0; sim.alpha() > ALPHA_MIN && tick < MAX_TICKS; tick++) {
+    if (signal?.aborted) {
+      break
+    }
     sim.tick()
     if (yieldEvery > 0 && tick % yieldEvery === yieldEvery - 1) {
-      await new Promise((resolve) => setTimeout(resolve, 0))
+      await yieldToHost()
     }
   }
 

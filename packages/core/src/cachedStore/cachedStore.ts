@@ -282,6 +282,7 @@ export class CachedStore implements KnowledgeStore {
       emitGraph: () => this.emit({ type: 'graph' }),
       debounceMs: graphDebounceMs,
       canSchedule: () => !this.stopped && this.phase === SCAN_PHASE.ready && !this.bulk.isActive,
+      scheduler,
     })
     this.trash = new HistorySurface(
       {

@@ -39,6 +39,38 @@ const twoCliques = (): Graph => ({
 })
 
 describe('layoutGraph', () => {
+  it('uses an injected host yield at the configured tick boundary', async () => {
+    const graph = twoCliques()
+    let yields = 0
+
+    await layoutGraph(graph, {
+      yieldEvery: 1,
+      yieldToHost: async () => {
+        yields++
+      },
+    })
+
+    expect(yields).toBeGreaterThan(1)
+    expect(graph.nodes.every((n) => n.x != null && n.y != null)).toBe(true)
+  })
+
+  it('stops an obsolete layout at the next tick boundary without a scheduler', async () => {
+    const graph = twoCliques()
+    const abort = new AbortController()
+    let yields = 0
+
+    await layoutGraph(graph, {
+      signal: abort.signal,
+      yieldEvery: 1,
+      yieldToHost: async () => {
+        yields++
+        abort.abort()
+      },
+    })
+
+    expect(yields).toBe(1)
+  })
+
   it('gives every node a finite position', async () => {
     const g = twoCliques()
     await layoutGraph(g, { yieldEvery: 0 })

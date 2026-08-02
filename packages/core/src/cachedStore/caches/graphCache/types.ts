@@ -1,4 +1,5 @@
 import type { Graph } from '../../../knowledgeStore'
+import type { BackgroundGate } from '../../../libs/backgroundScheduler'
 
 export type GraphCacheOptions = {
   /** A freshly shaped topology from the CURRENT snapshot (nodes+links+ghosts),
@@ -13,4 +14,7 @@ export type GraphCacheOptions = {
    *  stopped, not yet 'ready', or a bulk import is in flight (endBulk
    *  kicks the single catch-up pass once the burst is over). */
   canSchedule: () => boolean
+  /** Process-global cooperative gate shared with every other CPU-heavy background
+   *  worker. Absent in bare/fake hosts: layout keeps its local macrotask yields. */
+  scheduler?: BackgroundGate
 }
