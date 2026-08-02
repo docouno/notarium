@@ -380,6 +380,42 @@ describe('SpaceManager', () => {
     expect((await metaDb!.spaces.list()).filter((s) => s.notesDir === 'work')).toHaveLength(1)
   })
 
+  it('fails closed on an alias shared by config and runtime spaces regardless of load order', async () => {
+    const metaDb = fakeMetaDb()
+    await metaDb!.spaces.upsert({
+      id: 'olderRuntime1',
+      slug: 'runtime',
+      displayName: 'Runtime',
+      notesDir: 'runtime',
+      aliases: ['retired'],
+      createdAt: '2026-01-01T00:00:00.000Z',
+      archivedAt: null,
+      archivedBy: null,
+    })
+    await metaDb!.spaces.upsert({
+      id: 'newerConfig1',
+      slug: 'config',
+      displayName: 'Config',
+      notesDir: 'config',
+      aliases: ['retired'],
+      createdAt: '2026-02-01T00:00:00.000Z',
+      archivedAt: null,
+      archivedBy: null,
+    })
+    const manager = new SpaceManager({
+      spaces: [{ slug: 'config', displayName: 'Config' }],
+      createStore: () => stubStore(),
+      metaDb,
+    })
+
+    await manager.init()
+    expect(manager.resolveId('config')).toBe('newerConfig1')
+    expect(manager.resolveId('runtime')).toBe('olderRuntime1')
+    expect(manager.resolveId('retired')).toBeNull()
+    expect(manager.resolvableAliasesOf('newerConfig1')).toEqual([])
+    expect(manager.resolvableAliasesOf('olderRuntime1')).toEqual([])
+  })
+
   it('a registry row for the folder wins over a divergent marker id — no duplicate (#126)', async () => {
     const metaDb = fakeMetaDb()
     // The folder already has a row under id A — e.g. a prior collision-mint whose marker

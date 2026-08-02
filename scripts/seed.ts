@@ -244,10 +244,28 @@ const run = async (): Promise<void> => {
 
   // 1. Provision the case's spaces (mkdir + auto-mark root + registry).
   const idOf = new Map<string, string>()
+  const records = new Map<string, SpaceRecord>()
 
   for (const s of world.spaces) {
     const rec = await manager.create({ slug: s.slug, displayName: s.displayName || s.slug })
     idOf.set(s.slug, rec.id)
+    records.set(s.slug, rec)
+  }
+
+  // Author alias history only after every current slug exists. This mirrors the
+  // fake applier and preserves current > alias when one space's retired handle is
+  // another space's current slug, regardless of declaration order.
+  for (const s of world.spaces) {
+    const initial = records.get(s.slug)
+
+    if (initial && s.aliases?.length) {
+      const rec = { ...initial, aliases: [...s.aliases] }
+      await metaDb.spaces.upsert(rec)
+      manager.applyRename(rec)
+      // The marker is the re-clone truth, not just a cache of the current slug.
+      // Re-heal after authoring aliases so a fresh meta-DB adopts the same history.
+      await healSpaceMarker({ spaces: metaDb.spaces, markerStore, now: () => new Date() }, rec)
+    }
   }
 
   // 2. Mark declared (non-root) projects — writes the .notariummeta marker so the

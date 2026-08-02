@@ -14,6 +14,8 @@ import { loadEnv } from '../../../../libs/env'
 import { createAuthService } from '../../../../services/auth'
 import type { SpaceRole } from '../../../../services/authz'
 import { createMetaDb, describeMetaDbUrl } from '../../../../services/metaDb'
+import { normalizeAdminArguments } from './arguments'
+import { grantSpaceMember } from './grant'
 import { resolveMetaDbUrl } from './resolveMetaDbUrl'
 
 loadEnv()
@@ -69,7 +71,7 @@ const resolvePassword = async (
 }
 
 const main = async (): Promise<void> => {
-  const parsed = parseCommandLine(process.argv.slice(2), {
+  const parsed = parseCommandLine(normalizeAdminArguments(process.argv.slice(2)), {
     password: 'value',
     random: 'boolean',
     display: 'value',
@@ -186,11 +188,15 @@ const main = async (): Promise<void> => {
         const roles: SpaceRole[] = [SPACE_ROLE.owner, SPACE_ROLE.writer, SPACE_ROLE.reader]
         const role = roles.find((r) => r === roleArg) ?? die('role must be owner, writer or reader')
 
-        if (!(await metaDb.auth.getUser(username))) {
-          die(`no such user: ${username}`)
-        }
-        await metaDb.auth.upsertMember(space, username, role, new Date().toISOString())
-        console.log(`✓ ${username} is now ${role} of ${space}`)
+        const record = await grantSpaceMember(
+          {
+            auth: metaDb.auth,
+            spaces: metaDb.spaces,
+            grantMemberToActiveSpace: (...args) => metaDb.grantMemberToActiveSpace(...args),
+          },
+          { username, space, role },
+        ).catch((err) => die((err as Error).message))
+        console.log(`✓ ${username} is now ${role} of ${record.slug}`)
         break
       }
 

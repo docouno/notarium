@@ -26,6 +26,7 @@ export type {
   FolderIdentityPersistence,
   FolderRecord,
   GatewayStatePersistence,
+  GrantMemberToActiveSpaceResult,
   JobEnqueueInput,
   JobRecord,
   JobsPersistence,

@@ -226,6 +226,32 @@ describe('SqliteMetaDb', () => {
       expect(restored?.archivedBy).toBeNull()
     })
 
+    it('atomically grants only while the stable space id exists and is active', async () => {
+      const db = make()
+      await db.spaces.upsert(sp())
+
+      await expect(
+        db.grantMemberToActiveSpace('spc-main-0001', 'al', 'reader', '2026-08-02T12:00:00Z'),
+      ).resolves.toEqual({ status: 'granted', space: sp() })
+      expect(await db.auth.grantsFor('al')).toEqual([{ space: 'spc-main-0001', role: 'reader' }])
+
+      const archived = sp({
+        archivedAt: '2026-08-02T12:01:00Z',
+        archivedBy: 'user:admin',
+      })
+      await db.spaces.upsert(archived)
+      await expect(
+        db.grantMemberToActiveSpace('spc-main-0001', 'al', 'owner', '2026-08-02T12:02:00Z'),
+      ).resolves.toEqual({ status: 'archived', space: archived })
+      expect(await db.auth.grantsFor('al')).toEqual([{ space: 'spc-main-0001', role: 'reader' }])
+
+      await db.purgeSpace('spc-main-0001')
+      await expect(
+        db.grantMemberToActiveSpace('spc-main-0001', 'al', 'owner', '2026-08-02T12:03:00Z'),
+      ).resolves.toEqual({ status: 'missing' })
+      expect(await db.auth.grantsFor('al')).toEqual([])
+    })
+
     it('purgeSpace erases every child place + the row, scrubs PATs, spares other spaces (#110)', async () => {
       const db = make()
       const victim = 'spc-gone-0001'

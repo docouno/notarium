@@ -44,6 +44,19 @@ There is no SMTP and only an admin issues a reset link — which means "lost the
 
 Commands: `list` · `passwd <user> [--password <pw> | --random]` · `create-admin <user> [--random] [--display "Name"]` · `grant <user> <space> <owner|writer|reader>`. A password without a flag is read from stdin with echo suppressed (it does not land in history/scrollback). The CLI finds the meta-DB on its own: first the **explicitly named** one (`META_DB_URL`, or the root from `DATA_DIR` — the same resolution as the server, [canon](architecture.md#data-root)); then up the tree to `docker/volumes/data/meta.db`, and after that to the pre-#101 layouts `docker/volumes/notarium-state/meta.db` and `.data/meta.db` (recovery must also find an unmigrated deployment); and only **last** — the implicit host default `~/.local/share/notarium/meta.db`. The order is exactly this because that file is materialized by any bare `npm run server`: prefer it and `list` would show "no users", while `create-admin` would create an admin in an unrelated DB, whereas the real deployment sits one folder up and REFUSES to silently create an empty DB — a wrong path fails with an error rather than looking like "no users". The scheme of an explicit `META_DB_URL` is read by the [one classifier](architecture.md#data-root) the driver itself uses, never a local prefix test: a path that merely looks Postgres-shaped (`postgres-backup/meta.db`) stays a path and meets the existence guard, an unknown scheme is refused outright, and `sqlite::memory:` is refused as having nothing to recover. The meta-DB is echoed on every run: a SQLite target by its full path — the one recovery actually needs, since opening the wrong file is the failure this guards — and a Postgres one by its scheme alone, because no rule for finding where a password ends survived review, and the driver names host, database and user in its own connection error anyway. `setPassword`/`createAdmin` are available ONLY from the CLI: there is no HTTP path (no current-credential proof), this is the host's operator boundary.
 
+`grant` accepts what an operator can actually have: the current space slug, a retired
+slug alias, or the exact stable space id. Slug/alias resolution uses the same
+`current > alias` precedence as the server, but the membership row always receives the
+stable id; success prints the canonical current slug. An unknown reference fails with
+`no such space`; an archived space fails explicitly too — restore it first, then grant.
+An alias shared by multiple spaces is ambiguous and therefore fails as unknown rather
+than depending on registry order. Neither refusal writes a membership, so the recovery
+CLI cannot report success while `/api/spaces` remains empty. The final active-space
+check and membership upsert are one driver-level atomic operation; concurrent archive
+or purge therefore either happens before the grant (which refuses) or after the
+completed grant. Purge then removes the membership; archive preserves it for restore.
+Neither operation can land between validation and a false-success write.
+
 ## SSE: revoke = disconnect
 
 Open `/api/s/<slug>/events` streams are registered (principal, user, space) in the auth service's registry. Removal from members tears down that user's sockets on that space; disabling a user — all of their sockets; revoking a PAT — that token's sockets; **a permission change to a PAT/OAuth connection (#162)** tears down that principal's sockets via the same `dropSse` — reducing permissions forces a reconnect under the new ceiling (for ordinary request/response the ceiling already applies from the next request — the principal is reassembled). There is no silent going-quiet: the client EventSource will see the break, and the reconnect will hit a 401/404.

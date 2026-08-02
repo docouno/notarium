@@ -76,7 +76,7 @@ and for `security` — it parses the sanitized HTML into a live DOM and checks t
 
 | Case | About | Axes |
 |---|---|---|
-| `multi-space` | 3 spaces + a personal domain with memory + **archived scratch** + **connected apps with narrowing** + **pending OAuth registration** | structure, agent-memory, auth, note-classes, trash |
+| `multi-space` | 3 spaces + a personal domain with memory + **live/archived/shadowed/ambiguous space aliases** + **archived scratch** + a **zero-grant recovery user** + **connected apps with narrowing** + **pending OAuth registration** | structure, agent-memory, auth, note-classes, trash, identity |
 | `folder-page` | `index.md` pages (nested), children summary, breadcrumbs (#212-214) | folder-page, structure, content |
 | `note-classes` | one note per class — visibility matrix for user-doc/agent-memory/profile (#78/#74) | note-classes, agent-memory, structure |
 | `explorer-scroll` | a deep tree: a note near the bottom + many collapsible folders above — the explorer scroll-position invariant (#242): a reflow above the open note does not move the scroll | structure, scale |

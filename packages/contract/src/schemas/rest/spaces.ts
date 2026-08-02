@@ -7,8 +7,9 @@ export const SpaceSchema = z.object({
   id: z.string().min(1),
   slug: SpaceSlugSchema,
   displayName: z.string().min(1),
-  /** Past slugs so the client can canonicalise an old `/s/<old-slug>` URL to
-   *  the current one; omitted when the space was never renamed. */
+  /** Past slugs that still resolve uniquely to this space, so the client can
+   *  canonicalise an old `/s/<old-slug>` URL to the current one. Shadowed or
+   *  ambiguous history is omitted; absent when no retired handle is resolvable. */
   aliases: z.array(SpaceSlugSchema).optional(),
   /** ISO timestamp the space was ARCHIVED (soft-delete). Absent on an active
    *  space — carried only by the archived-spaces listing (GET /api/spaces/archived),

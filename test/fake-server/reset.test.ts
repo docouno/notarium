@@ -127,4 +127,23 @@ describe('reset hook fixture swap (#127: opaque space ids)', () => {
     // The slug still resolves cleanly to exactly the new id (no stale row shadowing).
     expect((await app.inject({ method: 'GET', url: '/api/s/work/notes' })).statusCode).toBe(200)
   })
+
+  it('a retired alias cannot capture a current slug introduced by the next fixture', async () => {
+    await app.close()
+    const aliased = base()
+    aliased.spaces[0] = { ...aliased.spaces[0], aliases: ['work'] }
+    app = await createApp(aliased)
+
+    // Before reset, /work is legitimately main's retired alias. The next fixture
+    // promotes work to a current slug while retaining main, with work deliberately
+    // first to pin that reset does not depend on declaration order.
+    expect((await app.inject({ method: 'GET', url: '/api/s/work/notes' })).statusCode).toBe(200)
+    const next: Fixture = { ...TWO, spaces: [TWO.spaces[1], base().spaces[0]] }
+    expect((await reset(next)).statusCode).toBe(200)
+    expect((await spacesOf()).map((space) => space.slug).sort()).toEqual(['main', 'work'])
+
+    const workNotes = (await app.inject({ method: 'GET', url: '/api/s/work/notes' })).json()
+      .notes as Array<{ title: string }>
+    expect(workNotes.map((note) => note.title)).toEqual(['Work Note'])
+  })
 })

@@ -10,14 +10,22 @@ export const multiSpace: CaseSpec = {
   name: 'multi-space',
   description:
     '3 spaces, 2 projects and a personal domain with agent memory — the multi-space / projects axis (#16/#13/#78).',
-  axes: ['structure', 'agent-memory', 'auth', 'note-classes', 'trash'],
+  axes: ['structure', 'agent-memory', 'auth', 'note-classes', 'trash', 'identity'],
   build: ({ now }) => {
     const b = new WorldBuilder(now)
-    b.space({ slug: 'work', displayName: 'Work' })
-    b.space({ slug: 'research', displayName: 'Research' })
+    b.space({
+      slug: 'work',
+      displayName: 'Work',
+      aliases: ['research', 'shared-history'],
+    })
+    b.space({
+      slug: 'research',
+      displayName: 'Research',
+      aliases: ['library', 'shared-history'],
+    })
     b.space({ slug: 'home', displayName: 'Home', personalFor: 'sergey' })
     // A soft-archived space (#110) — lives in the Trash (Spaces tab), data intact.
-    b.space({ slug: 'scratch', displayName: 'Scratch', archived: true })
+    b.space({ slug: 'scratch', displayName: 'Scratch', aliases: ['drafts'], archived: true })
 
     b.project({ space: 'work', path: 'product', displayName: 'Product' })
     b.project({ space: 'research', path: 'papers', displayName: 'Papers' })
@@ -28,6 +36,13 @@ export const multiSpace: CaseSpec = {
       displayName: 'Sergey',
       admin: true,
       personalSpace: 'home',
+    })
+    // Deliberately starts with zero grants: the operator-facing recovery account
+    // for manually proving admin grant by slug/alias/id and unknown/archived refusal.
+    b.user({
+      username: 'recovery',
+      password: 'seed-pass',
+      displayName: 'Recovery User',
     })
     b.member({ space: 'work', username: 'sergey', role: 'owner' })
     b.member({ space: 'research', username: 'sergey', role: 'owner' })

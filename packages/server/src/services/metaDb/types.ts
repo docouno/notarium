@@ -16,6 +16,11 @@ export type SpaceRecord = {
   archivedBy: string | null
 }
 
+export type GrantMemberToActiveSpaceResult =
+  | { status: 'granted'; space: SpaceRecord }
+  | { status: 'missing' }
+  | { status: 'archived'; space: SpaceRecord }
+
 /** Persistence for SpaceRecord, keyed by `id`. */
 export type SpacesPersistence = {
   /** A slug collision surfaces as a driver UNIQUE violation — the rename caller maps it to 409. */
@@ -803,6 +808,15 @@ export type MetaDb = {
   /** Stamp pre-space-column rows ('') with the legacy single-space's id, BEFORE any
    *  registry loads so space-filtered loads see a complete world. Idempotent. */
   adoptLegacyRows(legacySlug: string): Promise<void>
+  /** Atomically prove that a stable space id still exists and is active, then
+   *  upsert its membership. This is the recovery-CLI TOCTOU boundary: archive
+   *  and purge cannot interleave between validation and the write. */
+  grantMemberToActiveSpace(
+    spaceId: string,
+    username: string,
+    role: SpaceRole,
+    createdAt: string,
+  ): Promise<GrantMemberToActiveSpaceResult>
   /** Erase one space's rows across every facet in a single transaction (journal with
    *  CAS-blob GC, identity, folders/projects, favorites, sets, pins, order, memberships,
    *  bookmarks) + scrub its id from every `pats.spaces` (an emptied PAT stays `[]` =

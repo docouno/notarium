@@ -14,12 +14,73 @@ import {
   parsePatToken,
   type Principal,
   sha256,
+  type SpaceRecord,
+  type SpacesPersistence,
   timingSafeEqualHex,
   type UserRecord,
   verifyPassword,
 } from '@notarium/server'
 
 import { InMemoryAuthPersistence } from '../fake-server/authPersistence'
+
+describe('me: space aliases are wire capabilities, not raw history', () => {
+  it('does not fall back to raw history when no resolver capability is wired', async () => {
+    const persistence = new InMemoryAuthPersistence()
+    const records: SpaceRecord[] = [
+      {
+        id: 'work-id',
+        slug: 'work',
+        displayName: 'Work',
+        notesDir: 'work',
+        aliases: ['research', 'shared-history'],
+        createdAt: '2026-01-01T00:00:00Z',
+        archivedAt: null,
+        archivedBy: null,
+      },
+      {
+        id: 'research-id',
+        slug: 'research',
+        displayName: 'Research',
+        notesDir: 'research',
+        aliases: ['library', 'shared-history'],
+        createdAt: '2026-01-02T00:00:00Z',
+        archivedAt: null,
+        archivedBy: null,
+      },
+    ]
+    const spaces: SpacesPersistence = {
+      list: async () => records,
+      getById: async (id) => records.find((record) => record.id === id) ?? null,
+      getBySlug: async (slug) => records.find((record) => record.slug === slug) ?? null,
+      upsert: async () => {},
+    }
+    await persistence.createUser({
+      username: 'bob',
+      displayName: 'Bob',
+      passwordHash: 'x',
+      admin: false,
+      disabledAt: null,
+      createdAt: '2026-01-01T00:00:00Z',
+      personalSpace: null,
+    })
+    // The raw work row carries both a shadowed and an ambiguous alias. Without the
+    // registry-owned resolver capability, auth must expose neither by default.
+    await persistence.upsertMember('work-id', 'bob', 'owner', '2026-01-01T00:00:00Z')
+    const auth = createAuthService({
+      mode: 'password',
+      persistence,
+      spaces,
+    })
+
+    await expect(auth.me('bob')).resolves.toEqual({
+      username: 'bob',
+      displayName: 'Bob',
+      admin: false,
+      spaces: [{ slug: 'work', role: 'owner' }],
+      personalSpace: null,
+    })
+  })
+})
 
 describe('ensureOwners: a personal domain never gets the admin fan-out (#13 privacy)', () => {
   const mkUser = (username: string, admin: boolean, personalSpace: string | null): UserRecord => ({

@@ -110,11 +110,13 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
       if (!prev) {
         spaces.set(s.slug, s)
       } else {
+        const aliases = [...new Set([...(prev.aliases ?? []), ...(s.aliases ?? [])])]
         spaces.set(s.slug, {
           ...prev,
           archived: prev.archived || s.archived,
           personalFor: prev.personalFor ?? s.personalFor,
           displayName: prev.displayName ?? s.displayName,
+          ...(aliases.length ? { aliases } : {}),
         })
       }
     }

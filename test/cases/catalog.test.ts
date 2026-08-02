@@ -8,10 +8,11 @@ import {
   shapeGraph,
 } from '@notarium/core'
 
-import { buildCasesWorld, buildCaseWorld, DEFAULT_NOW } from './build'
+import { buildCasesWorld, buildCaseWorld, DEFAULT_NOW, mergeWorlds } from './build'
 import { normDate } from './generators'
 import { CASES, getCase, listCases } from './registry'
 import { caseToFixture } from './toFixture'
+import type { CaseWorld } from './types'
 
 const NAMES = CASES.map((c) => c.name)
 
@@ -152,6 +153,20 @@ describe('seed catalog (#175)', () => {
       expect(w.auth).toBeTruthy() // multi-space contributes auth → password mode
     })
 
+    it('unions same-space aliases in stable first-seen order without duplicates', () => {
+      const world = (aliases: string[]): CaseWorld => ({
+        now: DEFAULT_NOW,
+        spaces: [{ slug: 'main', aliases }],
+        events: [],
+      })
+      const merged = mergeWorlds([
+        { name: 'a', world: world(['old-a']) },
+        { name: 'b', world: world(['old-b', 'old-a']) },
+      ])
+
+      expect(merged.spaces).toEqual([{ slug: 'main', aliases: ['old-a', 'old-b'] }])
+    })
+
     it('namespaces logical ids and never collides paths across cases', () => {
       const w = buildCasesWorld('feed-scroll,trash-mixed,multi-space', {
         scale: 0.1,
@@ -271,6 +286,27 @@ describe('seed catalog (#175)', () => {
         clientName: 'Pending MCP Inspector',
         registeredHoursAgo: 2,
       }),
+    ])
+  })
+
+  it('multi-space carries the admin-recovery alias and zero-grant edges', () => {
+    const world = buildCaseWorld('multi-space', { now: DEFAULT_NOW })
+    expect(world.spaces.find((space) => space.slug === 'work')?.aliases).toEqual([
+      'research',
+      'shared-history',
+    ])
+    expect(world.spaces.find((space) => space.slug === 'research')?.aliases).toEqual([
+      'library',
+      'shared-history',
+    ])
+    expect(world.spaces.find((space) => space.slug === 'scratch')?.aliases).toEqual(['drafts'])
+    expect(world.auth?.users.some((user) => user.username === 'recovery')).toBe(true)
+    expect(world.auth?.members.some((member) => member.username === 'recovery')).toBe(false)
+
+    const fixture = caseToFixture(world)
+    expect(fixture.spaces.find((space) => space.slug === 'research')?.aliases).toEqual([
+      'library',
+      'shared-history',
     ])
   })
 

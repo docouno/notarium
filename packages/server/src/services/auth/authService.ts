@@ -109,6 +109,10 @@ export type CreateAuthServiceOptions = {
   oauth?: OAuthPersistence
   /** id↔slug translation for the wire. Absent (none-mode) ⇒ id≡slug. */
   spaces?: SpacesPersistence
+  /** Registry-owned filter for retired handles that still resolve uniquely.
+   *  Omit only when no registry is present; a missing capability exposes no
+   *  aliases rather than widening client-side resolution. */
+  aliasesForSpace?: (id: string) => readonly string[]
   now?: () => Date
   /** Test seam for the expensive verifier; production always uses scrypt. */
   passwordVerifier?: (password: string, encoded: string) => Promise<boolean>
@@ -168,6 +172,7 @@ export function createAuthService({
   persistence,
   oauth,
   spaces,
+  aliasesForSpace,
   now,
   passwordVerifier,
   runMutation,
@@ -430,7 +435,8 @@ export function createAuthService({
     }
     // The wire speaks slugs: translate the id-keyed grants + personal pointer, dropping any
     // grant whose space the registry no longer lists.
-    const recs = spacesStore ? new Map((await spacesStore.list()).map((s) => [s.id, s])) : null
+    const records = spacesStore ? await spacesStore.list() : null
+    const recs = records ? new Map(records.map((s) => [s.id, s])) : null
     const toSlug = (id: string): string | undefined => (recs ? recs.get(id)?.slug : id)
     const grants = await db.grantsFor(user.username)
     return {
@@ -447,7 +453,7 @@ export function createAuthService({
         if (!slug || rec?.archivedAt) {
           return []
         }
-        const aliases = rec?.aliases ?? []
+        const aliases = rec ? [...(aliasesForSpace?.(rec.id) ?? [])] : []
         return [{ slug, role: g.role, ...(aliases.length ? { aliases } : {}) }]
       }),
       personalSpace: user.personalSpace ? (toSlug(user.personalSpace) ?? null) : null,

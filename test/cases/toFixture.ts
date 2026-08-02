@@ -208,6 +208,7 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
     return {
       slug: s.slug,
       displayName: s.displayName,
+      aliases: s.aliases,
       notes: live,
       activity: activityBySpace.get(s.slug),
     }

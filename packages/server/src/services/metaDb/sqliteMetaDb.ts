@@ -22,7 +22,8 @@ import { createScopePinsFacet } from './drivers/sqlite/scopePins'
 import { createSpacesFacet } from './drivers/sqlite/spaces'
 import { IN_MEMORY_DB } from './metaDbUrl'
 import { runSqliteMigrations } from './migrations'
-import type { MetaDb } from './types'
+import { spaceOfRow, type SpaceRow } from './rows'
+import type { GrantMemberToActiveSpaceResult, MetaDb, SpaceRole } from './types'
 
 /** Gate the boot-time reclaim below this freelist size — pages, not bytes:
  *  64 pages ≈ 256 KiB at the 4 KiB default. */
@@ -135,6 +136,43 @@ export class SqliteMetaDb implements MetaDb {
          WHERE space = '' AND EXISTS (SELECT 1 FROM spaces WHERE slug = ?)`,
       )
       .run(legacySlug, legacySlug)
+  }
+
+  async grantMemberToActiveSpace(
+    spaceId: string,
+    username: string,
+    role: SpaceRole,
+    createdAt: string,
+  ): Promise<GrantMemberToActiveSpaceResult> {
+    await this.ensureInit()
+    const db = this.required
+    // IMMEDIATE takes the writer reservation before validation: another connection
+    // cannot archive/purge after our read and before the membership upsert.
+    db.exec('BEGIN IMMEDIATE')
+    try {
+      const row = db.prepare('SELECT * FROM spaces WHERE id = ?').get(spaceId) as
+        SpaceRow | undefined
+
+      if (!row) {
+        db.exec('COMMIT')
+        return { status: 'missing' }
+      }
+      const space = spaceOfRow(row)
+
+      if (space.archivedAt) {
+        db.exec('COMMIT')
+        return { status: 'archived', space }
+      }
+      db.prepare(
+        `INSERT INTO space_members (space, username, role, created_at) VALUES (?, ?, ?, ?)
+           ON CONFLICT(space, username) DO UPDATE SET role = excluded.role`,
+      ).run(spaceId, username, role, createdAt)
+      db.exec('COMMIT')
+      return { status: 'granted', space }
+    } catch (err) {
+      db.exec('ROLLBACK')
+      throw err
+    }
   }
 
   async purgeSpace(spaceId: string): Promise<void> {

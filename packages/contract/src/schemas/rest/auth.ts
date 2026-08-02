@@ -30,12 +30,12 @@ export const MeSchema = z.object({
   username: UsernameSchema,
   displayName: z.string().min(1),
   admin: z.boolean(),
-  /** A grant: the space's CURRENT slug + role, plus its past slugs
+  /** A grant: the space's CURRENT slug + role, plus its uniquely resolvable past slugs
    *  so the client's access classifier stays correct through a rename. Without
    *  `aliases`, a tab whose active slug lags a just-renamed space reads as a lost
    *  grant — a false `space-lost` takeover and a read-only chrome flash; a
-   *  stale-but-aliased active slug still resolves to the held grant. Omitted when
-   *  the space was never renamed. */
+   *  stale-but-aliased active slug still resolves to the held grant. Shadowed or
+   *  ambiguous history is omitted because it does not resolve server-side. */
   spaces: z.array(
     z.object({
       slug: SpaceSlugSchema,

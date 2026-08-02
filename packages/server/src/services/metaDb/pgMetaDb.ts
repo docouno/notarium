@@ -20,7 +20,8 @@ import { createRevisionsFacet } from './drivers/pg/revisions'
 import { createScopePinsFacet } from './drivers/pg/scopePins'
 import { createSpacesFacet } from './drivers/pg/spaces'
 import { runPgMigrations } from './migrations'
-import type { MetaDb } from './types'
+import { spaceOfRow, type SpaceRow } from './rows'
+import type { GrantMemberToActiveSpaceResult, MetaDb, SpaceRole } from './types'
 
 export class PgMetaDb implements MetaDb {
   private pool: pg.Pool | null = null
@@ -150,6 +151,48 @@ export class PgMetaDb implements MetaDb {
     )
   }
 
+  async grantMemberToActiveSpace(
+    spaceId: string,
+    username: string,
+    role: SpaceRole,
+    createdAt: string,
+  ): Promise<GrantMemberToActiveSpaceResult> {
+    await this.ensureInit()
+    const client = await this.required.connect()
+
+    try {
+      await client.query('BEGIN')
+      // The row lock serializes this decision with archive/rename and with purge's
+      // matching lock. If grant wins, a later purge removes the new membership;
+      // if purge/archive wins, this transaction refuses without writing.
+      const result = await client.query('SELECT * FROM spaces WHERE id = $1 FOR UPDATE', [spaceId])
+      const row = result.rows[0] as SpaceRow | undefined
+
+      if (!row) {
+        await client.query('COMMIT')
+        return { status: 'missing' }
+      }
+      const space = spaceOfRow(row)
+
+      if (space.archivedAt) {
+        await client.query('COMMIT')
+        return { status: 'archived', space }
+      }
+      await client.query(
+        `INSERT INTO space_members (space, username, role, created_at) VALUES ($1, $2, $3, $4)
+           ON CONFLICT (space, username) DO UPDATE SET role = EXCLUDED.role`,
+        [spaceId, username, role, createdAt],
+      )
+      await client.query('COMMIT')
+      return { status: 'granted', space }
+    } catch (err) {
+      await client.query('ROLLBACK')
+      throw err
+    } finally {
+      client.release()
+    }
+  }
+
   async purgeSpace(spaceId: string): Promise<void> {
     await this.ensureInit()
     const client = await this.required.connect()
@@ -158,6 +201,10 @@ export class PgMetaDb implements MetaDb {
       await client.query('BEGIN')
       await client.query("SELECT set_config('notarium.revision_purge_protocol', 'v26', true)")
       await lockRevisionKeys(client, 'space', [spaceId])
+      // Serialize child cleanup with recovery grant. Without this early row lock,
+      // purge could delete memberships, wait on the final space delete, then leave
+      // a concurrent late grant orphaned after passing the cleanup point.
+      await client.query('SELECT id FROM spaces WHERE id = $1 FOR UPDATE', [spaceId])
       await client.query(
         `INSERT INTO revision_purge_fences (kind, entity_id) VALUES ('space', $1)
          ON CONFLICT (kind, entity_id) DO NOTHING`,

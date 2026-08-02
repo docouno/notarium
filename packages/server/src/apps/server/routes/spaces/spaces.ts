@@ -18,17 +18,20 @@ import { recordSpaceRename } from '../../../../services/projects'
 import { type ApiRouteCtx, authz, batchFailure, notFound } from '../_shared'
 
 /** Domain space record → wire row. canon: docs/contract.md#mappers */
-const spaceToWire = (s: {
-  id: string
-  slug: string
-  displayName: string
-  aliases: string[]
-  archivedAt?: string | null
-}) => ({
+const spaceToWire = (
+  s: {
+    id: string
+    slug: string
+    displayName: string
+    aliases: string[]
+    archivedAt?: string | null
+  },
+  aliases: readonly string[],
+) => ({
   id: s.id,
   slug: s.slug,
   displayName: s.displayName,
-  ...(s.aliases.length ? { aliases: s.aliases } : {}),
+  ...(aliases.length ? { aliases } : {}),
   ...(s.archivedAt ? { archivedAt: s.archivedAt } : {}),
 })
 
@@ -63,7 +66,7 @@ export const spacesRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
       spaces: spaces
         .list()
         .filter((s) => can(req.principal, 'space:read', { space: s.id }))
-        .map(spaceToWire),
+        .map((space) => spaceToWire(space, spaces.resolvableAliasesOf(space.id))),
     }),
   )
 
@@ -114,7 +117,9 @@ export const spacesRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
       auth.notifyGrantsChanged(req.principal.username)
     }
 
-    return reply.code(HTTP_STATUS.CREATED).send(SpaceSchema.parse(spaceToWire(rec)))
+    return reply
+      .code(HTTP_STATUS.CREATED)
+      .send(SpaceSchema.parse(spaceToWire(rec, spaces.resolvableAliasesOf(rec.id))))
   })
 
   // ── archived spaces (soft-delete) ───────────────────────────────────────
@@ -129,7 +134,7 @@ export const spacesRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
     // Resolve "deleted by" to a privacy-filtered Author, relative to the viewer.
     const rows = await Promise.all(
       mine.map(async (srec) => ({
-        ...spaceToWire(srec),
+        ...spaceToWire(srec, spaces.resolvableAliasesOf(srec.id)),
         archivedBy: await auth.describeAuthor(srec.archivedBy, req.principal.username),
       })),
     )
@@ -149,7 +154,7 @@ export const spacesRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
       try {
         const rec = await spaces.restore(id)
         await auth.notifySpaceRestored(id)
-        return SpaceSchema.parse(spaceToWire(rec))
+        return SpaceSchema.parse(spaceToWire(rec, spaces.resolvableAliasesOf(rec.id)))
       } catch (err) {
         return mapSpaceError(err, reply)
       }
@@ -180,7 +185,7 @@ export const spacesRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
         }
         try {
           const rec = await spaces.restore(id)
-          restored.push(spaceToWire(rec))
+          restored.push(spaceToWire(rec, spaces.resolvableAliasesOf(rec.id)))
           await auth.notifySpaceRestored(id).catch((err) => {
             console.error('[api] /api/spaces/restore-many notify ->', (err as Error).message)
           })
@@ -268,7 +273,9 @@ export const spacesRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
     // SSE `rename` event so other tabs follow the new slug without a reload; the stream
     // is keyed by the unchanged id, so it still resolves.
     auth.notifySpaceRenamed(id)
-    return SpaceSchema.parse(spaceToWire(result.record))
+    return SpaceSchema.parse(
+      spaceToWire(result.record, spaces.resolvableAliasesOf(result.record.id)),
+    )
   })
 
   // Archive a space (soft-delete): stop serving it while data/journal/index stay whole;

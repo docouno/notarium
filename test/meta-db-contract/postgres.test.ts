@@ -184,6 +184,109 @@ describePostgres('live Postgres driver', () => {
     return { persistence: testSchema.db.revisions, teardown: testSchema.teardown }
   })
 
+  it('atomically grants only while a stable space id exists and is active', async () => {
+    const testSchema = await createPostgresTestSchema('grant_active_space')
+    const space = {
+      id: 'space-grant-1',
+      slug: 'research',
+      displayName: 'Research',
+      notesDir: 'research',
+      aliases: ['library'],
+      createdAt: '2026-08-02T12:00:00Z',
+      archivedAt: null,
+      archivedBy: null,
+    }
+
+    try {
+      await testSchema.db.spaces.upsert(space)
+      await expect(
+        testSchema.db.grantMemberToActiveSpace(
+          space.id,
+          'recovery',
+          'reader',
+          '2026-08-02T12:01:00Z',
+        ),
+      ).resolves.toEqual({ status: 'granted', space })
+      expect(await testSchema.db.auth.grantsFor('recovery')).toEqual([
+        { space: space.id, role: 'reader' },
+      ])
+
+      const archived = {
+        ...space,
+        archivedAt: '2026-08-02T12:02:00Z',
+        archivedBy: 'user:admin',
+      }
+      await testSchema.db.spaces.upsert(archived)
+      await expect(
+        testSchema.db.grantMemberToActiveSpace(
+          space.id,
+          'recovery',
+          'owner',
+          '2026-08-02T12:03:00Z',
+        ),
+      ).resolves.toEqual({ status: 'archived', space: archived })
+      expect(await testSchema.db.auth.grantsFor('recovery')).toEqual([
+        { space: space.id, role: 'reader' },
+      ])
+
+      await testSchema.db.purgeSpace(space.id)
+      await expect(
+        testSchema.db.grantMemberToActiveSpace(
+          space.id,
+          'recovery',
+          'owner',
+          '2026-08-02T12:04:00Z',
+        ),
+      ).resolves.toEqual({ status: 'missing' })
+      expect(await testSchema.db.auth.grantsFor('recovery')).toEqual([])
+    } finally {
+      await testSchema.teardown()
+    }
+  })
+
+  it('does not orphan a late recovery grant when purge already owns the lock queue', async () => {
+    const testSchema = await createPostgresTestSchema('grant_purge_race')
+    const blockerPool = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const blocker = await blockerPool.connect()
+    let purgeTask: Promise<void> | undefined
+    let grantTask: ReturnType<PgMetaDb['grantMemberToActiveSpace']> | undefined
+
+    try {
+      await testSchema.db.spaces.upsert({
+        id: 'space-race-1',
+        slug: 'research',
+        displayName: 'Research',
+        notesDir: 'research',
+        aliases: [],
+        createdAt: '2026-08-02T12:00:00Z',
+        archivedAt: null,
+        archivedBy: null,
+      })
+      await blocker.query('BEGIN')
+      await blocker.query('SELECT id FROM spaces WHERE id = $1 FOR UPDATE', ['space-race-1'])
+
+      purgeTask = testSchema.db.purgeSpace('space-race-1')
+      await waitForTupleLockWaiter(testSchema)
+      grantTask = testSchema.db.grantMemberToActiveSpace(
+        'space-race-1',
+        'recovery',
+        'owner',
+        '2026-08-02T12:01:00Z',
+      )
+      await blocker.query('COMMIT')
+
+      await purgeTask
+      await expect(grantTask).resolves.toEqual({ status: 'missing' })
+      expect(await testSchema.db.auth.grantsFor('recovery')).toEqual([])
+    } finally {
+      await blocker.query('ROLLBACK').catch(() => {})
+      blocker.release()
+      await Promise.allSettled([purgeTask, grantTask].filter((task) => task != null))
+      await blockerPool.end()
+      await testSchema.teardown()
+    }
+  })
+
   it('keeps BIGSERIAL delta cursors exact above Number.MAX_SAFE_INTEGER', async () => {
     const testSchema = await createPostgresTestSchema('revision_bigserial')
 

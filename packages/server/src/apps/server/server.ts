@@ -209,6 +209,7 @@ export const createServer = async ({
     oauth: metaDb?.oauth,
     // Translate stored space ids ↔ wire slugs.
     spaces: metaDb?.spaces,
+    aliasesForSpace: (id) => manager.resolvableAliasesOf(id),
     runMutation: (task) => mutationGate.run(task),
   })
   const configBySlug = new Map(spaces.map((s) => [s.slug, s]))

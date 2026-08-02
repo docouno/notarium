@@ -89,6 +89,8 @@ export type ActivityFixture = {
 export type SpaceFixture = {
   slug: string
   displayName?: string
+  /** Past slugs pre-seeded into the real SpaceManager registry. */
+  aliases?: string[]
   notes: StoreSnapshot['notes']
   /** Seeded revision history for the activity dashboard. */
   activity?: ActivityFixture[]
@@ -396,6 +398,23 @@ export const createApp = async (
   // Boot: resolve-or-mint each config space's id (populates the registry), then a
   // stable slug→id translator for the seeders below.
   await manager.init()
+  // A fixture authors the current slug plus its retired handles. Config provision
+  // mints the current record; apply the history afterward through the same
+  // persistence + in-memory seams a committed rename updates.
+  for (const fixtureSpace of fixture.spaces) {
+    if (!fixtureSpace.aliases?.length) {
+      continue
+    }
+    const id = manager.resolveId(fixtureSpace.slug)
+    const record = id ? manager.recOf(id) : undefined
+
+    if (!record) {
+      throw new Error(`fixture aliases reference undeclared space: ${fixtureSpace.slug}`)
+    }
+    const withAliases = { ...record, aliases: [...fixtureSpace.aliases] }
+    await spacesRegistry.upsert(withAliases)
+    manager.applyRename(withAliases)
+  }
   // slug→id for the seeders. Fail LOUD on an undeclared space: this fake always has a
   // registry (so every declared space minted an opaque id ≠ slug), hence resolveId
   // only returns null for a slug NOT in `spaces` — a fixture authoring mistake. A
@@ -452,6 +471,7 @@ export const createApp = async (
     // here (production's slugById/idBySlug). Without it the fake leaked raw ids —
     // invisible only while id ≡ slug.
     spaces: spacesRegistry,
+    aliasesForSpace: (id) => manager.resolvableAliasesOf(id),
   })
 
   const seedAuth = async (af: AuthFixture | undefined) => {
@@ -585,13 +605,24 @@ export const createApp = async (
         worlds.delete(id)
       }
     }
+    // Reset is a replacement, not a sequence of renames. Retired aliases from the
+    // previous fixture must not reserve a current slug the next fixture introduces.
+    // Clear history first, materialize every exact current slug, then apply the new
+    // history in a second pass (current > alias, independent of fixture order).
+    for (const rec of [...manager.list(), ...manager.listArchived()]) {
+      if (rec.aliases.length) {
+        manager.applyRename({ ...rec, aliases: [] })
+      }
+    }
     for (const s of next.spaces) {
-      const id = manager.resolveId(s.slug)
-      const world = id ? worlds.get(id) : undefined
+      const record = [...manager.list(), ...manager.listArchived()].find(
+        (candidate) => candidate.slug === s.slug,
+      )
+      const world = record ? worlds.get(record.id) : undefined
 
-      if (id && world) {
+      if (record && world) {
         await world.store.settle()
-        world.engine.load({ space: id, now: next.now, notes: s.notes })
+        world.engine.load({ space: record.id, now: next.now, notes: s.notes })
         world.revisions.clear()
         await world.store.rescan()
       } else {
@@ -599,6 +630,16 @@ export const createApp = async (
         manager.add({ slug: s.slug, displayName: s.displayName || s.slug })
         await manager.store(manager.resolveId(s.slug) as string)
       }
+    }
+    for (const s of next.spaces) {
+      const record = [...manager.list(), ...manager.listArchived()].find(
+        (candidate) => candidate.slug === s.slug,
+      )
+
+      if (!record) {
+        throw new Error(`fixture aliases reference undeclared space: ${s.slug}`)
+      }
+      manager.applyRename({ ...record, aliases: [...(s.aliases ?? [])] })
     }
     // Mirror the registry to the live entries: drops removed spaces, picks up the
     // fresh ids of re-added ones (manager.add mints but doesn't persist) — so id↔slug

@@ -26,6 +26,10 @@ export type CaseDate = string
 export type SpaceDecl = {
   slug: string
   displayName?: string
+  /** Past human-facing slugs that still resolve to this space. Applied to both
+   *  the fake registry and the real meta-DB/marker so alias-boundary cases are
+   *  reproducible rather than hand-edited after every seed. */
+  aliases?: string[]
   /** Seed this space as a user's personal domain (#21/#13): the auth user's
    *  `personalSpace` pointer is set to it, and agent-memory/profile notes land in
    *  the hidden mounts. */

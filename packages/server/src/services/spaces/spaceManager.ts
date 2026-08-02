@@ -14,6 +14,7 @@ import {
 import type { SpaceRecord } from '../metaDb'
 import { provisionSpaceIdentity } from '../projects/spaceIdentity'
 import { spaceNotFound } from './errors'
+import { buildSpaceSlugIndex, resolvableSpaceAliases } from './spaceResolver'
 import type { SpaceDef, SpaceManagerOptions, SpaceStore } from './types'
 
 const EVICT_SWEEP_MS = 60_000
@@ -233,6 +234,16 @@ export class SpaceManager {
 
   slugOf(id: string): string | undefined {
     return this.entries.get(id)?.rec.slug
+  }
+
+  /** Past slugs that still resolve to this exact space. Durable history also
+   *  retains shadowed/ambiguous aliases, but those are intentionally not wire
+   *  capabilities. */
+  resolvableAliasesOf(id: string): string[] {
+    return resolvableSpaceAliases(
+      [...this.entries.values()].map((entry) => entry.rec),
+      id,
+    )
   }
 
   /** Resolve a slug or past-slug alias → the stable id (current wins over alias);
@@ -583,22 +594,14 @@ export class SpaceManager {
     this.rebuildSlugIndex()
   }
 
-  /** Rebuild slug→id: all CURRENT slugs first, then aliases only where free — the
-   *  current > alias rule (a live space is never shadowed by another's retired slug).
-   *  Few spaces per host, so a full rebuild per change is cheap. */
+  /** Rebuild slug→id: all CURRENT slugs first, then only uniquely-owned aliases —
+   *  current > alias and ambiguous alias > fail closed. Few spaces per host, so a
+   *  full rebuild per change is cheap. */
   private rebuildSlugIndex(): void {
+    const next = buildSpaceSlugIndex([...this.entries.values()].map((entry) => entry.rec))
     this.bySlug.clear()
-    for (const e of this.entries.values()) {
-      this.bySlug.set(e.rec.slug, e.rec.id)
-    }
-    for (const e of this.entries.values()) {
-      for (const a of e.rec.aliases) {
-        const k = slugify(a)
-
-        if (k && !this.bySlug.has(k)) {
-          this.bySlug.set(k, e.rec.id)
-        }
-      }
+    for (const [slug, id] of next) {
+      this.bySlug.set(slug, id)
     }
   }
 
