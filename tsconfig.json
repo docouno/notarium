@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "allowJs": true,
+    "checkJs": false,
+    "types": ["vitest/globals", "node"]
+  },
+  "include": ["test", "scripts/seed.ts", "scripts/seedOwner.ts", "scripts/coverage.ts", "vitest.config.ts", "playwright.config.ts"]
+}

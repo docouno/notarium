@@ -1,0 +1,61 @@
+/* Slider — a custom-styled range control. A thin track the thumb rides; with a
+   `distribution` it grows a faint histogram and becomes a threshold-over-data view
+   (bars at/above the thumb = kept). `--pct` (value as 0–100%) drives the fill. */
+.slider { display: flex; flex-direction: column; gap: 7px; padding: 4px 0; }
+.slider-head { display: flex; align-items: baseline; gap: 7px; }
+.slider-label { font-size: 13px; color: var(--text-dim); }
+.slider-value { font-size: 13px; font-variant-numeric: tabular-nums; color: var(--text-faint); }
+
+.slider-control { position: relative; height: 16px; }
+.slider-control.has-hist { height: 34px; }
+
+.slider-hist {
+  position: absolute; left: 0; right: 0; top: 0; bottom: 14px;
+  display: flex; align-items: flex-end; gap: 1px;
+}
+.slider-bar {
+  flex: 1 1 0; min-width: 0; border-radius: 2px 2px 0 0;
+  background: var(--accent); opacity: 0.4;
+  transition: opacity 0.1s, background 0.1s;
+}
+.slider-bar.cut { background: var(--text-faint); opacity: 0.22; }
+
+/* Track line — accent fills from the left up to the thumb (magnitude sliders). */
+.slider-control::before {
+  content: ''; position: absolute; left: 0; right: 0; bottom: 6px; height: 2px;
+  border-radius: 999px; pointer-events: none;
+  background: linear-gradient(to right,
+    var(--accent) 0 var(--pct, 0%), var(--border-strong) var(--pct, 0%) 100%);
+}
+/* Distribution (threshold) variant: the bars carry kept-vs-dropped, so the track is
+   just a neutral rail. */
+.slider-control.has-hist::before {
+  background: var(--border-strong);
+}
+
+.slider-input {
+  position: absolute; left: 0; right: 0; bottom: 0; width: 100%; height: 14px;
+  margin: 0; padding: 0; background: transparent; cursor: pointer;
+  -webkit-appearance: none; appearance: none;
+}
+.slider-input::-webkit-slider-runnable-track { height: 14px; background: transparent; }
+.slider-input::-moz-range-track { height: 14px; background: transparent; }
+.slider-input::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 14px; height: 14px; border-radius: 50%;
+  background: var(--bg); border: 2px solid var(--accent);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.22);
+  transition: transform 0.1s;
+}
+.slider-input::-moz-range-thumb {
+  width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--accent);
+  background: var(--bg); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.22);
+  transition: transform 0.1s;
+}
+.slider-input:hover::-webkit-slider-thumb,
+.slider-input:active::-webkit-slider-thumb { transform: scale(1.14); }
+.slider-input:hover::-moz-range-thumb,
+.slider-input:active::-moz-range-thumb { transform: scale(1.14); }
+.slider-input:focus-visible { outline: none; }
+.slider-input:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 4px var(--accent-soft); }
+.slider-input:focus-visible::-moz-range-thumb { box-shadow: 0 0 0 4px var(--accent-soft); }

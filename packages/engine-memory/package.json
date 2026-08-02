@@ -1,0 +1,18 @@
+{
+  "name": "@notarium/engine-memory",
+  "version": "0.1.0",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "type": "module",
+  "description": "InMemoryStore: the reference KnowledgeStore implementation over an in-memory snapshot — executable spec of the port; powers the deterministic e2e fake (#18)",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@notarium/contract": "*",
+    "@notarium/core": "*"
+  }
+}

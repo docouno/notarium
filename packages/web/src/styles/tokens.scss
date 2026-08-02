@@ -1,0 +1,251 @@
+/* Theme tokens — runtime-switchable CSS custom properties (P #1: theme + accent
+   can change at runtime, so these stay global vars, not SCSS $-vars). Components
+   reference them as var(--…). Reading typography (#27) is ALSO runtime now (the
+   font/size of the rendered markdown body) — its defaults live here; the
+   @font-face assets and the data-reading-* preset mappings are in reading.scss.
+   Genuinely non-runtime tokens (breakpoints #26) still belong in SCSS partials. */
+
+:root {
+  /* The pure OS system stack — the native UI font per platform (SF on macOS,
+     Segoe UI on Windows, Roboto on Android). Used as the fallback under the
+     bundled fonts AND as the reading "System" preset (the OS font, zero fetch),
+     kept SEPARATE from --font-sans so "System" never means the Inter UI font. */
+  --font-system: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+    Helvetica, Arial, sans-serif;
+  /* App UI font (#27): Inter by default — a bundled web font for a consistent,
+     polished interface on EVERY OS (notably Linux, where the system sans is a
+     lottery), falling back to the OS stack until it loads. Preloaded in
+     index.html so the first paint already has it (no chrome-wide swap flash). */
+  --font-sans: 'Inter', var(--font-system);
+  /* JetBrains Mono leads (#27): it's a bundled @font-face, so code blocks AND the
+     editor render in it on every OS (a real, consistent code font instead of
+     "whatever mono the system has"). It loads wherever code/the editor appear —
+     accepted tradeoff for the quality. Falls back to the system mono if not yet
+     loaded. The 'mono' / 'fira-code' reading presets sit on top of this. */
+  --font-mono: 'JetBrains Mono', 'SFMono-Regular', Consolas, 'Liberation Mono',
+    Menlo, monospace;
+
+  /* Reading typography (#27) — defaults for the rendered markdown body. The
+     preset overrides keyed by data-reading-font/-size live in reading.scss;
+     markdown.scss expresses its whole type scale in `em` over --reading-size so
+     one knob scales headings/code/lists/tables proportionally. Default reading
+     font = the OS system stack (--font-system, NOT the Inter UI font — the
+     "System" preset means the OS font); default size = 17px.
+
+     History diffs are source/code-like (mono, dense) but still part of the
+     reading surface, so they follow the same knob via a compact derived token. */
+  --reading-font: var(--font-system);
+  --reading-size: 17px;
+  --reading-diff-size: calc(var(--reading-size) * 0.85);
+
+  /* light theme */
+  --bg: #ffffff;
+  --bg-rail: #f4f3f1;
+  --bg-list: #faf9f7;
+  --bg-elevated: #ffffff;
+  --bg-hover: #ecebe7;
+  --bg-active: #efeaff;
+  --border: #e9e7e2;
+  --border-strong: #d8d5cd;
+  --text: #20242c;
+  --text-dim: #6b7280;
+  --text-faint: #9a9690;
+  /* Reading body foreground (#189) — a softened twin of --text for the RENDERED
+     markdown body (`.markdown`) and the WYSIWYM editor surface ONLY, never the
+     chrome. --text drives the whole UI at near-max contrast, which fatigues the
+     eye over long-form prose (worst in dark, where body sat at ~16:1); this token
+     calms the body to AAA (~13:1) while headings stay pinned to full --text so the
+     hierarchy gets stronger for free. Same warm hue as --text, just a step down. */
+  --reading-text: #2c313a;
+  --accent: #6d4ee0;
+  --accent-2: #5a3dc4;
+  --accent-soft: #efeaff;
+  --danger: #e5484d;
+  --warning: #b97f17;
+  --ok: #2e9d5b;
+  /* Info blue — the one callout (#117) hue the semantic palette lacked (note/info/
+     abstract); the rest reuse --ok/--warning/--danger/--accent. */
+  --callout-info: #2f7bd1;
+  /* Modal/overlay dim layer. Theme-toned on purpose: a plain rgba(0,0,0)
+     reads neutral on light but muddy over dark surfaces — each theme dims
+     with its own deep tone (dark derives it from --bg-rail via color-mix). */
+  --backdrop-dim: color-mix(in srgb, #2a2723 45%, transparent);
+  --shadow: 0 1px 3px rgba(16, 24, 40, 0.06), 0 1px 2px rgba(16, 24, 40, 0.04);
+  --cm-active: rgba(109, 78, 224, 0.05);
+  /* Editor text selection — NEUTRAL, not the brand accent: a translucent grey so
+     selecting text reads like a plain editor highlight rather than tinting everything
+     purple. Derived from --text-dim (a cool, neutral grey — NOT --text, whose warm
+     off-white tinted the selection) and kept light on opacity so it stays see-through.
+     color-mix keeps it tracking the light/dark theme. */
+  --cm-selection: color-mix(in srgb, var(--text-dim) 18%, transparent);
+  /* Opaque twin of --cm-selection (the same grey flattened onto the page bg).
+     WYSIWYM mode draws block backdrops in a layer BELOW the selection, so the
+     selection must be opaque there to read uniformly over a backdrop vs bare text
+     (a translucent one still tints with whatever sits under it). */
+  --cm-selection-solid: color-mix(in srgb, var(--text-dim) 18%, var(--bg));
+  /* ── Radius scale (#230) — ONE geometry language for every surface ───────────
+     A 4-step plate scale + a pill; components reference these, never a hardcoded
+     px, so the whole product's roundness turns from a single knob here.
+       --radius-xs   small details INSIDE a control — swatches, tiny icon-buttons
+                     (≤24px), checkboxes, inline-code, skeleton lines
+       --radius-sm   compact controls — buttons, nav rows, menu items, inputs,
+                     chips-as-plate, badges (the everyday control radius)
+       --radius-md   containers & mid plates — cards, popovers, dropdowns, code
+                     blocks, toasts (the base plate radius; was the old --radius)
+       --radius-lg   large surfaces — modals, the auth card, drop zones, the
+                     splash glyph (the roundest a rectangular plate ever gets)
+       --radius-pill fully-rounded capsules — pill chips, count badges
+     NOT on this scale, left hardcoded on purpose: 50% circles (avatars/dots),
+     Switch/Slider tracks (functional capsules that must stay full regardless of
+     the pill token) and ~2px indicator strips (tab underlines, diff/heatmap
+     micro-rounding) — none of these are plates. Scale/docs: docs/web-ui.md. */
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-pill: 999px;
+  /* Reading column width — shared by the reader (.doc) and the editor's centered
+     title/body columns so a note's width never shifts between read and edit. */
+  --doc-width: 740px;
+  /* ── Layout gutters (not theme-specific) ───────────────────────────────────
+     Two related insets, one source of truth:
+
+     --gutter         The "chrome" inset: a panel's edge → its controls. Used by
+                      the topbar (both sides) and the right aside (header + body).
+                      The right-aside toggle must sit at this inset in BOTH places
+                      it lives — the topbar (collapsed) and the aside header
+                      (expanded) — or it visibly jumps, so keep them equal.
+     --icon-btn-inset How far a ~16px glyph sits inside a 32px icon button
+                      (≈ (32-16)/2). Lets page content line up under a toolbar
+                      *glyph* rather than the button's box.
+     --content-gutter The page content's LEFT inset = --gutter + --icon-btn-inset,
+                      so a page's content sits under the topbar toggle's glyph.
+                      Content's RIGHT uses plain --gutter (smaller); the scroll
+                      container adds the scrollbar on that side via scrollbar-gutter,
+                      which is why the right needs no extra inset to look balanced. */
+  --gutter: 12px;
+  --icon-btn-inset: 8px;
+  --content-gutter: calc(var(--gutter) + var(--icon-btn-inset));
+  /* --tab-pad  Half the gutter — how far an aside tab's underline (and hit area)
+                reaches BEYOND its text on each side. An aside tab header pads by
+                (--gutter − --tab-pad), so the first tab's TEXT still lands on the
+                gutter (aligned with the body) while the underline gets a little
+                wider than the text; tabs meet with no dead gap (the pad replaces the
+                inter-tab gap); and the header's right control gets --tab-pad back as
+                margin to keep its edge on the gutter. Shared by core/Aside AND
+                AsideGroups so every aside tab strip reads identically. */
+  --tab-pad: calc(var(--gutter) / 2);
+  /* Height of the fixed chrome band — the topbar, every aside/group header and the
+     rail panel head all share it, so a floating glass bar and the content's
+     padding-top under it stay in lockstep from one source. */
+  --chrome-h: 52px;
+  /* Height of the editor's floating status bar (#115) — the glass strip pinned to
+     the window bottom over the editing scroller. Single source for the bar's own
+     height (EditorBody .status-bar) AND the band the editor keeps the caret clear of
+     (#231): chromeInsetScroll reads this token to nudge the page scroller so the line
+     you type never hides behind the bar (the topbar uses --chrome-h the same way). */
+  --editor-statusbar-h: 30px;
+  /* ── Glass material (#72) ───────────────────────────────────────────────────
+     ONE recipe for every frosted surface (chrome bars, floating menus/chips). The
+     class `.glass` (+ an edge variant) in styles/glass.scss reads these; a surface
+     can override a knob locally (e.g. an elevated menu bumps --glass-bg opaquer for
+     readability). Defaults here suit the chrome bars over page content.
+       --glass-bg        translucent fill; blur pulls the colour from behind it
+       --glass-bg-opaque solid fallback when transparency is reduced / unsupported
+       --glass-blur      8–15px is the sweet spot (cost grows fast past that)
+       --glass-saturate  frosted look — colours behind the glass stay vivid
+       --glass-border    hairline edge (translucent so it reads as a glass rim)
+       --glass-highlight the lit top edge that "sells" the glass (Apple keeps the
+                         specular ≤6px; this is a 1px inner line)
+       --glass-shadow    soft depth under a bar
+       --glass-drop      drop shadow for FLOATING surfaces (menus/chips/modals) */
+  --glass-bg: color-mix(in srgb, var(--bg) 72%, transparent);
+  --glass-bg-opaque: var(--bg);
+  /* 12px (not higher): blur cost grows ~quadratically with the radius and these
+     bars sit over scrolling lists/the editor body — 12 keeps a full frost at a
+     lighter GPU cost than 14. */
+  --glass-blur: 12px;
+  --glass-saturate: 180%;
+  --glass-border: color-mix(in srgb, var(--border) 55%, transparent);
+  --glass-highlight: rgba(255, 255, 255, 0.5);
+  --glass-shadow: 0 1px 2px rgba(16, 24, 40, 0.05);
+  --glass-drop: 0 10px 30px rgba(16, 24, 40, 0.18);
+  /* FLOATING surfaces over arbitrary content — dropdowns/menus (ContextMenu, Select,
+     sync popover) AND the graph canvas chips — share this fill (one knob). More
+     opaque than the chrome bars: they carry text/icons over unpredictable content, so
+     a readability floor wins over translucency, but glassy enough to read AS glass.
+     --glass-menu-border/-drop below are menu-only (chips bring their own drop). */
+  --glass-menu-bg: color-mix(in srgb, var(--bg-elevated) 70%, transparent);
+  --glass-menu-border: var(--border-strong);
+  --glass-menu-drop: 0 10px 30px rgba(0, 0, 0, 0.28);
+  /* Grain dose for the large frosted bars (0 = off). 0.5/0.15 read too heavy live
+     (#72); a barely-there tooth that breaks banding without speckling text lives
+     around 0.05–0.1. One knob — nudge it or set 0 to drop grain entirely. */
+  --glass-grain: 0.1;
+  /* ── Scrollbar (#176) ───────────────────────────────────────────────────────
+     The thumb over the glass chrome reads as translucent, not a hard grey brick: a
+     toned-down --border-strong at rest, brightening to --text-faint when the pointer
+     is on the bar. Both derive from themed vars, so they re-resolve per theme with no
+     per-theme override. Auto-hide fades the thumb by multiplying this colour by --sb-op
+     (0→1), which useAutoHideScrollbars writes per animation frame — WebKit won't animate
+     the scrollbar pseudo with `transition`, so the fade is driven by hand, the same way
+     useScrollGlass drives --glass-lift (#185). */
+  --scrollbar-thumb: color-mix(in srgb, var(--border-strong) 82%, transparent);
+  --scrollbar-thumb-hover: var(--text-faint);
+  /* Overlay stacking order (not theme-specific): menus sit below modals, and
+     toasts sit above everything so an action's result stays visible even while
+     a dialog is open. A menu OPENED FROM WITHIN a modal (a Select's dropdown in a
+     picker dialog) is the exception — it must clear the modal it belongs to, so it
+     opts into --z-menu-over (still below toasts). Safe because a menu dismisses on
+     the pointerdown that would open any modal, so a page menu never coexists under
+     a newly-raised dialog. */
+  --z-menu: 1000;
+  --z-modal: 1100;
+  --z-menu-over: 1150;
+  --z-toast: 1200;
+}
+
+:root[data-theme='dark'] {
+  --bg: #151517;
+  --bg-rail: #0d0d0e;
+  --bg-list: #111113;
+  --bg-elevated: #1e1e22;
+  --bg-hover: #27272e;
+  --bg-active: #211f38;
+  --border: #212127;
+  --border-strong: #33333b;
+  --text: #f2f0ec;
+  --text-dim: #b2b1b8;
+  --text-faint: #72717b;
+  /* Dark reading body (#189): the near-white #f2f0ec sat at ~16:1 over --bg —
+     the long-form fatigue this issue is about. Calmed to #d6d4cf (~12.3:1, still
+     AAA) so a page of prose reads soft; headings keep full --text. */
+  --reading-text: #d6d4cf;
+  --accent: #8b7cf6;
+  --accent-2: #7c6cf0;
+  --accent-soft: rgba(139, 124, 246, 0.16);
+  --danger: #ef5a5a;
+  --warning: #d9a03f;
+  --ok: #3fb368;
+  --callout-info: #5b9bf0;
+  --backdrop-dim: color-mix(in srgb, var(--bg-rail) 70%, transparent);
+  --shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+  /* Faint neutral active-line wash; the selection below is also neutral now, so
+     they share a tone without clashing. */
+  --cm-active: rgba(255, 255, 255, 0.035);
+  /* Neutral grey selection from --text-dim (cool, not the warm off-white --text),
+     kept see-through. */
+  --cm-selection: color-mix(in srgb, var(--text-dim) 18%, transparent);
+  --cm-selection-solid: color-mix(in srgb, var(--text-dim) 18%, var(--bg));
+  /* Dark glass: more opaque than light — dark bar text/icons need a contrast floor
+     under them over scrolling content (68% keeps body text ≥4.5:1 even at the worst
+     scroll moment), a near-invisible top highlight (a bright rim looks plastic on
+     dark), and a deeper drop. blur/saturate inherit from :root. */
+  --glass-bg: color-mix(in srgb, var(--bg) 68%, transparent);
+  --glass-border: color-mix(in srgb, var(--border-strong) 65%, transparent);
+  --glass-highlight: rgba(255, 255, 255, 0.07);
+  --glass-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+  --glass-drop: 0 12px 32px rgba(0, 0, 0, 0.5);
+  /* Menus need a higher floor on dark (more contrasty content can sit behind them). */
+  --glass-menu-bg: color-mix(in srgb, var(--bg-elevated) 80%, transparent);
+}

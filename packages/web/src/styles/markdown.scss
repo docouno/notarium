@@ -1,0 +1,370 @@
+/* Rendered markdown body. The HTML here comes from `marked` (injected via
+   dangerouslySetInnerHTML), so these descendant selectors must target real,
+   un-hashed tag/class names — hence global, not a CSS module. */
+
+/* Font + base size come from the reading-typography knobs (#27): --reading-font
+   (a preset family) and --reading-size (the base px the whole scale below is
+   `em`-relative to, so S/M/L/XL grows headings/code/lists/tables in proportion,
+   not just paragraphs). Code stays --font-mono regardless of the reading font. */
+.markdown { font-family: var(--reading-font); font-size: var(--reading-size); line-height: 1.72; color: var(--reading-text); }
+.markdown > *:first-child { margin-top: 0; }
+/* Headings stay at full --text while the body softens to --reading-text (#189):
+   the contrast step between them IS the heading hierarchy, so it costs nothing.
+   h4 keeps --text-dim below (it's a minor heading, intentionally quieter). */
+.markdown h1, .markdown h2, .markdown h3, .markdown h4 {
+  font-weight: 650; letter-spacing: -0.01em; line-height: 1.3;
+  margin: 1.8em 0 0.6em; color: var(--text);
+}
+.markdown h1 { font-size: 1.625em; }
+.markdown h2 { font-size: 1.3125em; padding-bottom: 0.3em; border-bottom: 1px solid var(--border); }
+.markdown h3 { font-size: 1.09375em; }
+.markdown h4 { font-size: 0.9375em; color: var(--text-dim); }
+/* Paragraph rhythm is tuned for breaks:true (#115): a single newline now renders
+   as a <br>, so the line gap WITHIN a paragraph is just the 1.72 leading (~8px).
+   Paragraph margins must read as clearly bigger than that, or "new paragraph"
+   (blank line) and "new line" (single newline) look the same. 0.9em (~14px) gives
+   a ~1.8× step over the line gap. */
+.markdown p { margin: 0.9em 0; }
+/* Bold is emphasis — it keeps full --text while the body softens (#189), exactly
+   like headings, so a bold word still pops out of soft prose. Italic (em) is NOT
+   pinned: it emphasises by slant, not brightness, so it tracks the body tone.
+   Mirrors the WYSIWYM surface, where t.strong is pinned to --text (wysiwymSource.ts)
+   and t.emphasis isn't — bold reads identically in the reader and the editor. */
+.markdown strong, .markdown b { color: var(--text); }
+/* Struck text is de-emphasised content → --text-dim, mirroring the WYSIWYM
+   t.strikethrough pin (wysiwymSource.ts). Without this it would inherit the soft
+   body --reading-text and read brighter than in the editor. */
+.markdown del, .markdown s { color: var(--text-dim); }
+.markdown a { color: var(--accent); text-decoration: none; border-bottom: 1px solid transparent; }
+.markdown a:hover { border-bottom-color: var(--accent); }
+.markdown ul, .markdown ol { padding-left: 1.5em; margin: 0.6em 0; }
+.markdown li { margin: 0.25em 0; }
+.markdown li::marker { color: var(--text-faint); }
+.markdown blockquote {
+  margin: 1em 0; padding: 0.4em 1em; color: var(--text-dim);
+  border-left: 3px solid var(--border-strong); background: var(--bg-list);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+}
+/* Code stays expressive at full --text (#189 keeps code/headings crisp while body
+   softens): inline code reads sharp on its pill, and a fenced block's base text
+   stays legible (highlight.js spans override per-token where a language is set).
+   Matches the WYSIWYM t.monospace pin (--text), so code tone is surface-stable. */
+.markdown code {
+  font-family: var(--font-mono); font-size: 0.86em; color: var(--text);
+  background: var(--bg-hover); padding: 0.15em 0.4em; border-radius: var(--radius-xs);
+}
+.markdown pre {
+  background: var(--bg-list); border: 1px solid var(--border);
+  padding: 14px 16px; border-radius: var(--radius-md); overflow-x: auto; margin: 1em 0;
+}
+.markdown pre code { background: none; padding: 0; font-size: 0.8125em; line-height: 1.6; }
+.markdown hr { border: none; border-top: 1px solid var(--border); margin: 2em 0; }
+/* Base table styling — applies to EVERY table, including a raw HTML <table> written
+   literally in a note (which bypasses the markdown table() wrapper below). Kept
+   self-contained: collapse borders + its own frame + block margin, so an unwrapped
+   table is still fully framed and spaced (a #235 regression fix — the wrapper-only
+   frame left raw tables edgeless). */
+.markdown table { border-collapse: collapse; margin: 1em 0; width: 100%; font-size: 0.875em; }
+.markdown th, .markdown td { border: 1px solid var(--border); padding: 7px 11px; text-align: left; }
+.markdown th { background: var(--bg-list); font-weight: 600; }
+
+/* A markdown pipe-table is wrapped in .md-table (#235) so it can scroll sideways.
+   There the OUTER frame is drawn once by the .md-table-wrap border+radius, so the
+   cells switch to INNER grid lines only (right + bottom) — no doubled edge where a
+   cell border meets the wrapper border. `separate` keeps lines crisp under the
+   wrapper's radius clip; the figure owns the block margin, so the table drops its. */
+.md-table-wrap table { border-collapse: separate; border-spacing: 0; margin: 0; }
+.md-table-wrap :is(th, td) {
+  border: none;
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+.md-table-wrap tr > *:last-child { border-right: none; }
+/* Drop the bottom edge of the last row so it doesn't double with the wrapper border.
+   Two cases: the last BODY row, and a header-only table (no <tbody> — marked emits
+   `<thead>` alone for `| a |`+`|---|` with zero data rows), where the thead row is
+   the last row. `thead:last-child` matches only when no tbody follows. */
+.md-table-wrap tbody tr:last-child > *,
+.md-table-wrap thead:last-child tr:last-child > * { border-bottom: none; }
+/* Block images (#235): centre-free left-aligned blocks that cap their height so a
+   tall image can't dominate the reading column, lazy-loaded below the fold. */
+.markdown img {
+  display: block; max-width: 100%; height: auto; max-height: 60vh;
+  margin: 1em 0; border-radius: var(--radius-md);
+}
+
+/* Footnotes (#117), from marked-footnote. A ref is a superscript accent anchor;
+   the definitions collect into a <section class="footnotes"> at the end, set off by
+   a top rule and rendered smaller/dimmer (it's apparatus, not body). The sr-only
+   "Footnotes" heading stays visually hidden — the rule is the visual separator.
+   In-page anchors (`#footnote-…`) are smooth-scrolled by NoteReader, not opened in
+   a new tab. */
+.markdown sup [data-footnote-ref] {
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 600;
+  padding: 0 0.1em;
+}
+.markdown .footnotes {
+  margin-top: 2.4em;
+  padding-top: 1em;
+  border-top: 1px solid var(--border);
+  font-size: 0.875em;
+  color: var(--text-dim);
+}
+.markdown .footnotes .sr-only {
+  position: absolute;
+  width: 1px; height: 1px;
+  margin: -1px; padding: 0; border: 0;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap;
+}
+.markdown .footnotes li { margin: 0.4em 0; }
+.markdown .footnotes li:target { background: var(--bg-active); border-radius: var(--radius-sm); }
+.markdown [data-footnote-backref] {
+  color: var(--text-faint);
+  text-decoration: none;
+  margin-left: 0.3em;
+}
+.markdown [data-footnote-backref]:hover { color: var(--accent); }
+
+/* ── Reader render polish (#235) ─────────────────────────────────────────────
+   Small fixes to the shared render surface. Everything here is CSS-only and so
+   applies to every .markdown surface (reader / editor-preview / history /
+   settings sample); the copy button that pairs with .md-copy is attached by a
+   post-render hook only where it makes sense (reader + history). */
+
+/* Long words / bare URLs must not spill past the --doc-width column. `anywhere`
+   only breaks when a token genuinely can't fit the line, so ordinary prose is
+   untouched. It's inherited, so links/inline code (the usual long-token offenders)
+   pick it up automatically — no per-element rule needed, which also lets the cells'
+   `overflow-wrap: normal` (below) win inside a table so a long token widens the
+   table and the wrapper scrolls, rather than shrinking the column character by char. */
+.markdown { overflow-wrap: anywhere; }
+
+/* Anchored headings (#235) shouldn't hide under the floating topbar after a
+   `[jump](#id)` scroll: the scroll lands the heading at the top of .content-scroll,
+   but the glass topbar floats over the first --chrome-h of it. Reserve that band
+   plus a little breathing room. h1–h6 to match the id the renderer puts on all six. */
+.markdown :is(h1, h2, h3, h4, h5, h6) { scroll-margin-top: calc(var(--chrome-h) + 0.5em); }
+
+/* Table figure (#235): an OUTER non-scrolling positioning context (`.md-table`)
+   holding the horizontal-scroll box (`.md-table-wrap`). A border frames the table
+   so its edges don't dissolve into the page background; a soft edge FADE hints that
+   content continues off-screen. The fade IS the SURFACE colour dissolving the last
+   column back into its background — theme-neutral by construction, no foreign shadow
+   colour to clash with the palette. `--md-surface` is that colour: the page bg by
+   default, re-pointed to the container tint inside a blockquote/callout (below) so
+   the fade matches the (transparent-celled) table's real backdrop there instead of
+   punching a page-bg strip over the tint. The overlays live on the OUTER element,
+   pinned to its edges, so they sit OVER the (wider-than-view) table. The post-render
+   hook flips data-* by scroll offset; a fade shows only on a side with content off. */
+.md-table {
+  position: relative;
+  margin: 1em 0;
+  --md-surface: var(--bg);
+}
+.markdown blockquote .md-table { --md-surface: var(--bg-list); }
+.markdown .callout .md-table {
+  --md-surface: color-mix(in srgb, var(--callout-color, var(--text-dim)) 7%, var(--bg-list));
+}
+.md-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+/* Edge fades, inset 1px so they don't cover the frame. Hidden by default; the hook
+   reveals a side only when it has more content that way (data-at-start/-end='false').
+   pointer-events:none so they never intercept clicks/selection. */
+.md-table::before,
+.md-table::after {
+  content: '';
+  position: absolute;
+  top: 1px;
+  bottom: 1px;
+  width: 40px;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+.md-table::before {
+  left: 1px;
+  background: linear-gradient(to right, var(--md-surface) 35%, transparent);
+  border-top-left-radius: var(--radius-md);
+  border-bottom-left-radius: var(--radius-md);
+}
+.md-table::after {
+  right: 1px;
+  background: linear-gradient(to left, var(--md-surface) 35%, transparent);
+  border-top-right-radius: var(--radius-md);
+  border-bottom-right-radius: var(--radius-md);
+}
+.md-table[data-at-start='false']::before { opacity: 1; }
+.md-table[data-at-end='false']::after { opacity: 1; }
+/* Cells opt OUT of the inherited `anywhere` break: inside the scroll wrapper a wide
+   table should stay wide and scroll, not shrink every column into a tall ribbon.
+   A long unbroken token in a cell widens the table → the wrapper scrolls it. Cells
+   stay TRANSPARENT (no bg hardcode) so a table inside a tinted container — a
+   blockquote or a callout — inherits that tint instead of punching --bg holes; the
+   edge fades are painted as overlays above the table, so they don't need opaque
+   cells the way the old background-based shadows did. */
+.markdown th, .markdown td { overflow-wrap: normal; }
+
+/* GFM task lists (#235): marked renders `- [ ]` as a disabled <input type=checkbox>,
+   so the native OS box sits beside the list bullet — a double marker. Drop the marker
+   ONLY on the item that directly owns a checkbox: a TIGHT item holds the input as a
+   direct child (`<li><input>…`), a LOOSE item wraps it in a leading <p>
+   (`<li><p><input>…`). Both forms are matched — but NOT a descendant `:has(input)`,
+   which would also strip the bullet from a plain PARENT item that merely contains a
+   nested task list (e.g. a category row with sub-tasks). The input skin itself is a
+   descendant match (it only paints the box). Interactivity (click → edit the note)
+   is deliberately out of scope: marked emits `disabled`. */
+.markdown li:has(> input[type='checkbox']),
+.markdown li:has(> p > input[type='checkbox']) { list-style: none; }
+.markdown li input[type='checkbox'] {
+  appearance: none; -webkit-appearance: none;
+  width: 1.05em; height: 1.05em;
+  margin: 0 0.5em 0 -1.5em; /* pull the box left into the list gutter */
+  vertical-align: -0.16em;
+  border: 1.5px solid var(--border-strong);
+  border-radius: var(--radius-xs);
+  background: var(--bg-elevated);
+  cursor: default;
+}
+.markdown li input[type='checkbox']:checked {
+  background: var(--accent); border-color: var(--accent);
+}
+.markdown li input[type='checkbox']:checked::after {
+  content: ''; display: block;
+  width: 0.3em; height: 0.55em;
+  margin: 0.02em auto 0;
+  border: solid #fff; border-width: 0 0.13em 0.13em 0;
+  transform: rotate(45deg);
+}
+
+/* Wikilinks vs external links (#235). A wikilink is an internal reference — mark
+   it with a dotted underline (Obsidian-style) so it reads as "goes to a note",
+   distinct from an external link's solid hover underline. `#wiki/` covers the
+   first paint and the preview/history surfaces (no post-render pass there);
+   `[data-wiki]` is the reader's RESOLVED state (href already rewritten). A GHOST
+   target the cache couldn't resolve (`[data-wiki-target]`) dims to signal
+   "not created yet" — a plain click offers to create it. */
+.markdown a[href^='#wiki/'],
+.markdown a[data-wiki] {
+  border-bottom: 1px dashed var(--accent);
+}
+.markdown a[href^='#wiki/']:hover,
+.markdown a[data-wiki]:hover {
+  border-bottom-style: solid;
+}
+.markdown a[data-wiki-target] {
+  color: var(--text-dim);
+  border-bottom-color: var(--text-faint);
+}
+.markdown a[data-wiki-target]:hover { color: var(--accent); }
+
+/* Copy button for code blocks (#235). The post-render hook wraps each <pre> in a
+   relative, non-scrolling .md-code so the button stays pinned to the visible corner
+   even when the code scrolls sideways. The wrapper owns the block margin; the <pre>
+   inside drops its own so spacing doesn't double up. */
+.md-code { position: relative; margin: 1em 0; }
+.md-code > pre { margin: 0; }
+
+/* Attached to each wrapped block by the post-render hook. Idle-quiet: fades in on
+   block hover / keyboard focus, so it never clutters the read but is a click away.
+   Confirms via a `data-copied` flip the hook sets. */
+.md-copy {
+  position: absolute; top: 6px; right: 6px;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 28px; padding: 0;
+  color: var(--text-dim);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  opacity: 0; transition: opacity 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+  cursor: pointer;
+}
+.md-code:hover .md-copy,
+.md-copy:focus-visible { opacity: 1; }
+.md-copy:hover { color: var(--text); border-color: var(--border-strong); }
+.md-copy[data-copied='true'] { color: var(--accent); border-color: var(--accent); opacity: 1; }
+
+/* Mermaid diagrams (#236). The post-render hook (renderMermaid) swaps each
+   ```mermaid <pre> for a <figure class="md-mermaid"> holding the rendered SVG.
+   mermaid renders with useMaxWidth (see mermaid.ts): the SVG gets width:100% +
+   an inline max-width of its natural size, so it scales DOWN to fit the reading
+   column and never spills past it (overflow-x is only a defensive backstop for a
+   hypothetical fixed-width diagram). Colours are baked into the SVG from our tokens
+   at render time. */
+.markdown .md-mermaid {
+  margin: 1.25em 0;
+  overflow-x: auto;
+  text-align: center;
+}
+.markdown .md-mermaid svg {
+  max-width: 100%;
+  height: auto;
+}
+/* Round the rect-family shapes (nodes, sequence actors, subgraph clusters, notes) to
+   match Notarium's surfaces. `rx`/`ry` are CSS geometry properties on <rect>; they win
+   because they override mermaid's presentation ATTRIBUTE `rx` (author CSS always beats
+   a presentation attribute, regardless of specificity — unlike mermaid's id-scoped
+   inlined <style>, which our selectors do NOT outrank). Border WIDTH is left to
+   mermaid (base theme = 1px); to change it, use themeVariables.strokeWidth, not CSS —
+   the id-scoped <style> would win here.
+   Polygons (diamond/decision, hexagon, parallelogram, trapezoid) stay crisp on purpose:
+   they anchor their edges at their VERTICES (a decision's arrows meet the top/bottom
+   points), so rounding a corner would pull the outline off the arrowhead. rx/ry don't
+   apply to <polygon> anyway, and stroke-linejoin:round is visually nil at a 1px stroke
+   while still nudging the vertex — so we force nothing there. */
+.markdown .md-mermaid :is(.node, .cluster) rect,
+.markdown .md-mermaid rect.actor,
+.markdown .md-mermaid rect.note {
+  rx: 6px;
+  ry: 6px;
+}
+/* Belt-and-suspenders vertical centring for SVG-<text> labels (sequence actors/notes;
+   flowchart labels are HTML and centre themselves). mermaid sets both
+   `dominant-baseline` and `alignment-baseline`='central' as attributes; we keep the
+   former through DOMPurify (ADD_ATTR in mermaid.ts) so it already centres. This rule —
+   keyed on `alignment-baseline`, which DOMPurify keeps by default — is an independent
+   fallback that still centres if that ADD_ATTR is ever dropped. Scoped by the attribute
+   so it can't touch anything mermaid didn't already mean to centre. */
+.markdown .md-mermaid text[alignment-baseline='central'] {
+  dominant-baseline: central;
+}
+/* Fallback for a diagram that won't parse: the source is shown as a code block under
+   this caption (never a blank), so the note stays readable and the error is visible. */
+.markdown .md-mermaid[data-state='error'] { text-align: left; }
+.markdown .md-mermaid-error {
+  margin-bottom: 0.5em;
+  font-family: var(--font-mono);
+  font-size: 0.8125em;
+  color: var(--danger);
+}
+.markdown .md-mermaid[data-state='error'] pre { margin: 0; }
+
+/* Math (KaTeX) (#237). Rendered synchronously into the HTML string by the math
+   extension (math.ts): inline `$…$`/`\(…\)` become `span.katex` in the text flow; block
+   `$$…$$`/`\[…\]` are wrapped in `.md-math` holding KaTeX's own `.katex-display`. KaTeX
+   inherits `color` from the prose, so formulas track --reading-text and read correctly in
+   both themes with no per-theme work. The bundled katex.min.css draws the glyphs; the
+   rules below own only the block frame, overflow, and the error colour. */
+.markdown .md-math { margin: 1.25em 0; }
+/* A display formula wider than the reading column scrolls instead of spilling (issue).
+   The scroll box is `.katex-display` itself so BOTH forms scroll: a standalone block
+   (wrapped in `.md-math`) AND a mid-flow `$$…$$`/`\[…\]` (rendered inline as a bare
+   `.katex-display`, no wrapper). KaTeX's own centring and `\tag` positioning stay intact.
+   `overflow-y:hidden` keeps the horizontal scrollbar from adding a phantom vertical one. */
+.markdown .katex-display { overflow-x: auto; overflow-y: hidden; }
+/* `.katex-display` ships with its own 1em block margins; the `.md-math` wrapper already
+   owns the block rhythm, so drop them inside it to avoid doubled spacing. */
+.markdown .md-math .katex-display { margin: 0; }
+/* Invalid TeX (throwOnError:false) renders as its source in KaTeX's error colour. Retint
+   it to the palette's --danger so the honest fallback matches the reader's other error
+   states (e.g. the mermaid error caption) instead of KaTeX's hard-coded #cc0000. KaTeX
+   bakes that colour as an INLINE `style="color:#cc0000"` on the `.katex-error` span, so
+   `!important` is required to win over it — the deliberate, narrow use of `!important` to
+   override a third-party inline style. Retinting via CSS (not KaTeX's errorColor option)
+   keeps it theme-reactive: no colour is baked at render time, so it stays correct across a
+   light/dark flip with no redraw. */
+.markdown .katex-error { color: var(--danger) !important; }

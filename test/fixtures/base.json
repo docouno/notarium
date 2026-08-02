@@ -1,0 +1,60 @@
+{
+  "now": "2026-06-10T12:00:00.000Z",
+  "spaces": [
+    {
+      "slug": "main",
+      "displayName": "Main",
+      "notes": [
+        {
+          "title": "Titanium",
+          "filePath": "demo/Titanium.md",
+          "noteType": "element",
+          "modifiedAt": "2026-06-08T00:00:00.000Z",
+          "createdAt": "2026-06-01T09:00:00.000Z",
+          "tags": [
+            "metal",
+            "element"
+          ],
+          "content": "# Titanium\n\nA strong, light metal. Pairs with [[Carbon]] in alloys.\n\nSee also [[Missing Element]], not yet written.\n\n![sample](https://example.test/ti.png)"
+        },
+        {
+          "title": "Carbon",
+          "filePath": "demo/Carbon.md",
+          "noteType": "element",
+          "modifiedAt": "2026-06-07T00:00:00.000Z",
+          "createdAt": "2026-06-02T10:30:00.000Z",
+          "tags": [
+            "element"
+          ],
+          "content": "# Carbon\n\nThe basis of organic chemistry. Bonds with [[Titanium]] under heat."
+        },
+        {
+          "title": "My Note",
+          "filePath": "demo/My Note.md",
+          "modifiedAt": "2026-05-20T00:00:00.000Z",
+          "createdAt": null,
+          "tags": [],
+          "content": "# My Note\n\nA note whose path contains a space — the #24 edge case."
+        },
+        {
+          "title": "Welcome",
+          "filePath": "root.md",
+          "modifiedAt": "2026-06-09T00:00:00.000Z",
+          "createdAt": "2026-06-05T08:00:00.000Z",
+          "tags": [
+            "intro"
+          ],
+          "content": "# Welcome\n\nA root-level note with a cover image.\n\n![cover](https://example.test/cover.png)"
+        },
+        {
+          "title": "Old Archive",
+          "filePath": "archive/2020/old.md",
+          "modifiedAt": "2020-01-15T00:00:00.000Z",
+          "createdAt": null,
+          "tags": [],
+          "content": "# Old Archive\n\nOlder than the 1-year window, so no created_at."
+        }
+      ]
+    }
+  ]
+}

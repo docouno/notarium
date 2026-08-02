@@ -1,0 +1,11 @@
+# Prettier formats source code only (see the `format` script's globs). Everything
+# generated, vendored, or prose lives outside its reach.
+**/dist/**
+**/node_modules/**
+package-lock.json
+test-results/
+playwright-report/
+temp/
+docker/
+# Markdown / docs are authored by hand — Prettier must not reflow them.
+**/*.md

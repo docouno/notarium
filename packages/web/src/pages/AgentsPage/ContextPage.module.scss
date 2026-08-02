@@ -1,0 +1,651 @@
+// The Context constructor (#165/#208): the agent-context control surface. A
+// settings-like routed layout owns scope selection; ONE aggregate token scale
+// headlines the page with a clickable tab per scope, and below it the selected
+// scope's panel is a focused column of sections (Pinned / Memory / Auto), each a
+// list of steerable rows carrying a per-note weight meter. Visuals match the rest
+// of the app (bordered cards, dim text, DS accent).
+
+.page {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.inner {
+  width: 100%;
+  padding: 0 0 48px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.pageHead {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.pageTitle {
+  margin: 0;
+  font-size: 19px;
+  font-weight: 650;
+}
+
+.pageSub {
+  margin: 2px 0 0;
+  max-width: 64ch;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+
+// ── section (Profile / Project): an OUTLINE, no fill (#165 UX r2) — the border is
+// the boundary, the rows inside are the cards. ──
+.section {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 14px 15px 15px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+// ── block (Pinned / Memory / Auto) ──
+.block {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+}
+
+.block + .block {
+  margin-top: 4px;
+  padding-top: 15px;
+  border-top: 1px solid var(--border);
+}
+
+.blockHead {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--text-faint);
+
+  svg {
+    flex: none;
+  }
+}
+
+.blockActions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  margin-left: auto;
+}
+
+// A one-line caption under a block head: the audit count (project memory) or the
+// trimmed/muted summary (profile). Text, never a budget bar (#208).
+.blockCaption {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-faint);
+
+  strong {
+    color: var(--text);
+    font-weight: 650;
+  }
+}
+
+.trimmedText {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+// ── list of cards (the shared <ContextCard>) ──
+// A query container (#208): the per-row meter columns shrink to the LIST's own width
+// (which tracks the collapsible sidebar), not the viewport — so the layout stays right
+// whether the panel is wide or squeezed.
+.list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  container: contextList / inline-size;
+}
+
+// The flexible title slot of a loading card placeholder (mirrors .item-title) — the meter
+// + caret shimmers sit after it, so the row reads like a real collapsed ContextCard.
+.skeleton-title {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+}
+
+// ── aggregate context-load scale (#208): the headline above the sections ──
+.aggregate {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px 13px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--bg-elevated) 55%, transparent);
+}
+
+.aggregateHead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.aggregateTitle {
+  font-size: 11.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--text-faint);
+}
+
+.aggregateValue {
+  font-size: 13px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+
+  strong {
+    color: var(--text);
+    font-weight: 650;
+  }
+}
+
+// The scale itself: bands sized by token weight, strictly within the total budget
+// (loaded bands + unused headroom = 100%). No trimmed band ever — a scope's trimmed
+// weight lives on its items, so the scale never shows "gray gap then red" (#208).
+.tokenBar {
+  position: relative;
+  display: flex;
+  width: 100%;
+  height: 20px;
+  border-radius: var(--radius-xs);
+  overflow: hidden;
+  background: color-mix(in srgb, var(--text-faint) 12%, var(--bg-elevated));
+}
+
+.tokenSeg {
+  height: 100%;
+  min-width: 2px;
+  flex: 0 1 auto; // width from inline %, may shrink to fit (bar clips overflow)
+  border-right: 1px solid color-mix(in srgb, var(--bg-elevated) 55%, transparent);
+
+  &:last-child {
+    border-right: 0;
+  }
+}
+
+.tokenSegEmpty {
+  height: 100%;
+  flex: 0 1 auto;
+  background: transparent;
+}
+
+// Colour encodes SELECTION (heatmap ramp, #33): the ACTIVE band is the bright top
+// step (accent toward white — "lit"), every idle band the full accent. One brand hue.
+.segActive {
+  background: color-mix(in srgb, var(--accent) 55%, white);
+}
+
+.segIdle {
+  background: var(--accent);
+}
+
+// ── scope tabs (#208): the legend doubles as the scope selector ──
+.tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-faint);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+
+  &:hover {
+    background: var(--bg-hover);
+    color: var(--text);
+  }
+
+  &:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+}
+
+.tabActive {
+  background: var(--bg-hover);
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.tabDot {
+  width: 10px;
+  height: 10px;
+  border-radius: var(--radius-xs);
+  flex: none;
+  border: 1px solid color-mix(in srgb, var(--text) 12%, transparent);
+}
+
+.tabLabel {
+  font-weight: 600;
+}
+
+.tabValue {
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.tabTrimmed {
+  color: var(--danger);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+// ── one row's layout (#208): a grid so the pieces sit in aligned COLUMNS —
+//   [ name (flex, ellipsis) | badges | weight bar | number ]
+// The bar and number columns are FIXED width and anchored to the right, so the bar
+// lines up vertically across every row and the (variable-width) number never nudges
+// it; the name column (1fr) absorbs all the slack, badges sit just before the bar.
+.itemTitle {
+  --meter-bar-w: 52px;
+  --meter-num-w: 46px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto var(--meter-bar-w) var(--meter-num-w);
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+
+.itemName {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+// The badges cell is always present (empty when none) so the grid keeps its columns —
+// a trimmed/muted tag lands here, just LEFT of the bar.
+.itemBadges {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+// ── per-note weight meter (#208): "how much it eats", to spot the fattest ──
+.meterTrack {
+  height: 6px;
+  border-radius: var(--radius-pill);
+  overflow: hidden;
+  background: color-mix(in srgb, var(--text-faint) 16%, transparent);
+}
+
+.meterFill {
+  display: block;
+  height: 100%;
+  min-width: 3px; // a note that's a sliver of the budget still shows a legible hairline
+  border-radius: var(--radius-pill);
+  background: var(--accent);
+}
+
+.meterFillTrimmed {
+  background: var(--danger);
+}
+
+.meterValue {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+// Squeezed panel (collapsed sidebar / narrow window): trim the meter columns and gap
+// so the name keeps room; the bar stays a legible minimum. Container-query = it reacts
+// to the list's own width, not the viewport.
+@container contextList (max-width: 460px) {
+  .itemTitle {
+    --meter-bar-w: 34px;
+    --meter-num-w: 42px;
+    gap: 6px;
+  }
+}
+
+.statusBadge {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+  font-size: 10.5px;
+  line-height: 1.45;
+  font-weight: 650;
+}
+
+.statusTrimmed {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
+
+.statusMuted {
+  color: var(--text-faint);
+  background: var(--bg-hover);
+}
+
+.auto {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 0;
+}
+
+.muted {
+  color: var(--text-faint);
+  font-size: 13px;
+  margin: 0;
+}
+
+// ── pin picker (Modal) ──
+.pickerPanel {
+  align-self: flex-start;
+  margin-top: 12vh;
+}
+
+.pickerOverlay {
+  --modal-backdrop-dim: color-mix(in srgb, var(--backdrop-dim) 42%, transparent);
+  --modal-backdrop-blur: 2px;
+}
+
+.pickerPanel:global(.glass) {
+  --glass-bg: color-mix(in srgb, var(--bg-elevated) 70%, transparent);
+  --glass-blur: 24px;
+  --glass-saturate: 180%;
+}
+
+.picker {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.pickerTitle {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.pickerHead {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 52px;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+
+.pickerSearchIcon {
+  color: var(--text-faint);
+  flex: none;
+}
+
+.pickerInput {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text);
+  font-size: 16px;
+  line-height: 1.2;
+}
+
+.pickerInput::placeholder {
+  color: var(--text-faint);
+}
+
+.pickerBody {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: 46vh;
+  overflow-y: auto;
+  padding: 6px;
+}
+
+.pickerList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+// A picker row IS a DS <Checkbox> stretched to a full list row (#209): the whole
+// label is the click target (native checkbox toggle), padded, with a hover/selected
+// fill. No bespoke checkbox — the tick is the shared DS box.
+.pickerRow {
+  display: flex;
+  width: 100%;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+
+  &:hover {
+    background: var(--bg-hover);
+  }
+
+  // The Checkbox renders [hidden input][box span][label span]; let the label span
+  // (the row text) absorb the slack and constrain so long titles/paths ellipsize.
+  > span:last-child {
+    flex: 1;
+    min-width: 0;
+  }
+}
+
+.pickerRowChecked,
+.pickerRowChecked:hover {
+  background: var(--accent-soft);
+}
+
+.pickerItemText {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.pickerItemTitle,
+.pickerItemPath {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pickerItemTitle {
+  font-size: 13.5px;
+}
+
+.pickerItemPath {
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+
+.pickerSkeleton {
+  padding: 6px 4px;
+}
+
+.pickerSkeletonRow {
+  padding: 8px 10px;
+}
+
+.pickerEmpty {
+  list-style: none;
+  color: var(--text-faint);
+  font-size: 13px;
+  padding: 16px 10px;
+}
+
+// ── add-picker action bar + chips (#209 UX r4) ──
+// One bar under the search: the "From space" CHIP on the left (opens the space dropdown —
+// no full-width select; the selection accumulates across switches) and the set control on
+// the right (Create set / Add set / Cancel). space-between so each side keeps its edge.
+.pickerActionBar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.pickerSpaceGroup {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.pickerFieldLabel {
+  flex: none;
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+// A chip trigger (space picker): a compact pill that opens an elevated ContextMenu.
+.pickerChip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 9px 4px 8px;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--text);
+  background: var(--bg-hover);
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+
+  svg {
+    flex: none;
+    color: var(--text-faint);
+  }
+
+  &:hover {
+    border-color: var(--border-strong);
+  }
+
+  &:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+}
+
+// The ghost "Add set / Create set" control in the action bar (right of the space chip).
+// Ghost so it reads as secondary to the primary pin flow; opens the elevated set menu.
+.pickerGhostBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: none;
+  padding: 5px 10px;
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 550;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+
+  svg {
+    flex: none;
+    color: var(--text-faint);
+  }
+
+  &:hover {
+    color: var(--text);
+    border-color: var(--border-strong);
+    background: var(--bg-hover);
+  }
+
+  &:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+}
+
+.pickerChipCaret {
+  transform: rotate(90deg); // IconChevron points right → point it down
+}
+
+// The footer: a NAME row (only when building a new set) above a bar of live hint + the
+// primary action. A fixed min-height reserves the bar so the appearing action never jumps it.
+.pickerFoot {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--border);
+}
+
+.pickerFootName {
+  width: 100%;
+  font: inherit;
+  font-size: 13px;
+  padding: 7px 10px;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+
+  &::placeholder {
+    color: var(--text-faint);
+  }
+
+  &:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+}
+
+.pickerFootBar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 33px;
+}

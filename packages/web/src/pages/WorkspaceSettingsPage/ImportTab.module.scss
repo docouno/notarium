@@ -1,0 +1,106 @@
+.picker {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* The native file input is replaced by the styled button — keep it reachable
+   (a click forwards to it) but out of the visual flow. */
+.fileInput {
+  display: none;
+}
+
+/* The button never shrinks/wraps; the filename takes the rest and ellipsises. */
+.choose {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.filename {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The action + result, continuing the SettingsSection rhythm (a divider with the
+   same air) so the Import button doesn't float free of the option sections. */
+.footer {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding-top: 22px;
+  border-top: 1px solid var(--border);
+}
+
+.actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.result {
+  margin-top: 0;
+}
+
+.fileLine {
+  margin-top: 6px;
+  font-size: 12px;
+  opacity: 0.85;
+}
+
+.warning {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* Durable-import progress (#191): the note count is unknown upfront (a ZIP stream),
+   so the bar is always indeterminate — the honest signal is the status line's live
+   written count + phase, with a cancel beside it. */
+.progress {
+  margin-bottom: 4px;
+}
+
+.bar {
+  height: 6px;
+  border-radius: var(--radius-pill);
+  background: var(--border);
+  overflow: hidden;
+}
+
+.fill {
+  height: 100%;
+  border-radius: var(--radius-pill);
+  background: var(--accent, #4f7cff);
+
+  &[data-indeterminate='true'] {
+    animation: import-indeterminate 1.1s ease-in-out infinite;
+  }
+}
+
+@keyframes import-indeterminate {
+  0% {
+    margin-left: 0;
+    width: 15%;
+  }
+  50% {
+    margin-left: 42%;
+    width: 35%;
+  }
+  100% {
+    margin-left: 100%;
+    width: 15%;
+  }
+}
+
+.status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 8px;
+  font-size: 13px;
+  color: var(--text-muted, #888);
+}

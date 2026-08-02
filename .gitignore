@@ -1,0 +1,63 @@
+node_modules
+dist
+.env
+*.log
+temp
+
+# TypeScript incremental build info (artifact of tsc --build / --incremental)
+*.tsbuildinfo
+
+# Local, machine-specific compose overrides. Nothing layers this automatically —
+# pass it yourself: docker compose -f docker/compose.yml -f docker/compose.spec.yml …
+docker/compose.spec.yml
+
+# Host bind volumes (notes + engine/meta state) — not for git
+docker/volumes/
+
+# Coverage reports (v8; baseline thresholds live in vitest.config.ts — #56)
+/coverage/
+
+# Playwright
+/test-results/
+/playwright-report/
+/playwright/.cache/
+
+# Visual baselines — kept local / in S3, not git (#18.4; CI sync is a separate task)
+/test/visual/**/*.png
+.data/
+
+# registry-less image export (make save)
+notarium-*.tar.gz
+
+# Operator-created backup archives (#268)
+/backups/
+
+# Local, machine-specific agent bootstrap and helper scripts
+/\.docs-local/
+/AGENTS.md
+/CLAUDE.md
+
+# Generated demo stills (#256) — re-shot with `make demo-shots`, and deliberately not
+# carried as binaries: twelve full-resolution PNGs per run. What IS committed is the
+# handful of artifacts `make demo-preview` cuts from them into assets/ — the README
+# banner, the social card and the gallery (docs/demo-screenshots.md).
+/test/demo/out/
+
+# The OG plates, likewise. assets/ is committed because GitHub serves those files
+# straight out of this repository for the README; nothing here reads a plate. Its
+# consumer is the docs site's build, which cannot see a sibling checkout — so the plate
+# is committed THERE, next to the screenshots it already imports, and this stays the
+# place the recipe lives rather than a second copy of the same bytes.
+/assets/og/
+
+# Records CI jobs write INTO the checkout: the visual lane's dotenv report and its
+# Playwright JSON, and the release entrypoint's published identity. Job artefacts, not
+# sources. `release.json` in particular MUST be here — the release gate refuses a dirty
+# tree, and `--json | tee release.json` creates the file before the gate reads
+# `git status`, so without this line the lane cannot publish anything at all.
+review.env
+visual-report.json
+release.json
+
+# npm's own cache when it is pointed inside the checkout (npm_config_cache in CI)
+/.npm/

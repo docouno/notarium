@@ -1,0 +1,122 @@
+/* OmniSearch (#190): the topbar field (shared core/SearchField shell) + its
+   anchored suggestion dropdown. Fixed width, bar-centred by the topbar grid
+   (PageFrame); PageFrame hides the whole field on a bar too narrow to seat it
+   (search stays reachable via the rail icon / Cmd+P / `/`), so there's no in-field
+   collapse to handle here. */
+.omni {
+  position: relative;
+  width: 320px;
+  max-width: 100%;
+}
+.field {
+  width: 100%;
+}
+
+/* The suggestion popover, anchored under the field. Frosted chrome over content,
+   like Spotlight — a floating surface, not an inline panel. */
+.dropdown {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  z-index: 30;
+  max-height: 56vh;
+  overflow-y: auto;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-pop, 0 12px 32px rgba(16, 24, 40, 0.18));
+}
+
+.sectionLabel {
+  padding: 6px 10px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  color: var(--text);
+}
+/* Keyboard + hover share one highlight (aria-selected is the source of truth). */
+.rowActive {
+  background: var(--accent-soft);
+}
+
+.rowIcon {
+  color: var(--text-faint);
+  flex: 0 0 auto;
+}
+.rowActive .rowIcon {
+  color: var(--accent);
+}
+
+.rowText {
+  min-width: 0;
+  flex: 1;
+}
+.rowTitle {
+  font-size: 13.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rowSub {
+  margin-top: 1px;
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Match highlight (computed client-side — the backend has no offsets). */
+.row mark {
+  background: transparent;
+  color: var(--accent);
+  font-weight: 600;
+}
+.rowActive mark {
+  color: var(--accent-2);
+}
+
+/* The "Search … in Feed" action row sits above note suggestions, separated by a
+   hairline so the JUMP vs SEARCH split reads at a glance. */
+.rowSubmit {
+  border-bottom: 1px solid var(--border);
+  border-radius: var(--radius-md) var(--radius-md) 0 0;
+  margin-bottom: 2px;
+  padding-bottom: 9px;
+}
+.rowSubmit .q {
+  color: var(--accent);
+  font-weight: 600;
+}
+.rowEnter {
+  flex: 0 0 auto;
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1;
+  padding: 3px 6px;
+  border: 1px solid var(--border-strong);
+  border-bottom-width: 2px;
+  border-radius: var(--radius-xs);
+  background: var(--bg);
+  color: var(--text-dim);
+}
+
+.skeleton {
+  padding: 6px 4px;
+}
+.skeletonRow {
+  padding: 7px 10px;
+}

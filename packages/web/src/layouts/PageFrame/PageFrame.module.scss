@@ -1,0 +1,55 @@
+/* The shared frame chrome: a FLOATING glass topbar over the scrolling content
+   column. The `.main` wrapper is a shared global (styles/shared.scss); `.frame`
+   only makes it the topbar's containing block. Pages fill the topbar slots and the
+   content; they must NOT add side padding — the horizontal content gutter lives
+   here, once, for every page. */
+.frame { position: relative; }
+/* Absolute (not in flow) so the content scrolls UNDER it — that's what gives the
+   glass something to refract. The content re-claims the band via padding-top
+   below, so nothing hides behind the bar. The frosted material + bottom edge come
+   from the shared `.glass` classes (added in JSX). */
+.topbar {
+  position: absolute; top: 0; left: 0; right: 0; z-index: 5;
+  height: var(--chrome-h); min-height: var(--chrome-h);
+  /* 3 columns with EQUAL side tracks (1fr each) so the centre (auto = its content)
+     sits at the bar's true centre regardless of breadcrumb/actions widths — the
+     search never drifts page to page. The side tracks shrink to 0 (minmax) so the
+     breadcrumb truncates instead of pushing the centre off. */
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  /* Symmetric --gutter: the left toggle's box sits at --gutter (its glyph then
+     lands on --content-gutter, where page content starts); the right keeps the
+     same inset so a panel toggle doesn't jump when it moves between here
+     (collapsed) and the aside header (expanded), which also pads by --gutter. */
+  padding: 0 var(--gutter);
+}
+/* Col 1: the rail toggle + the breadcrumb (which truncates within the track). */
+.topbar-lead { min-width: 0; display: flex; align-items: center; gap: 8px; }
+.topbar-left { min-width: 0; overflow: hidden; display: flex; align-items: center; font-size: 13px; color: var(--text); }
+/* Col 2: the bar-centred search slot (auto width = the search's own width). */
+.topbar-center { min-width: 0; display: flex; justify-content: center; }
+/* Col 3: page actions, shrink-wrapped (max-content) and pinned to the right edge
+   of the track — so its measured width is the buttons' NATURAL width (the fit
+   test needs that, not the 1fr track width). */
+.topbar-actions { justify-self: end; width: max-content; max-width: 100%; display: flex; align-items: center; gap: 8px; }
+
+/* The one place the horizontal content gutter lives, shared by every page
+   (reader, editor, feed, splash, settings…). Pages set only max-width + vertical
+   padding; they must NOT add their own side padding. scrollbar-gutter keeps the
+   gutter stable whether or not the scrollbar is present, so content never shifts. */
+.content-scroll {
+  flex: 1; overflow-y: auto;
+  /* Reserve the floating topbar's band so the first content isn't hidden under it.
+     A sticky child inside (e.g. the editor's control-bar) then parks at top:0 of
+     the padding box = exactly under the topbar, with no extra offset. */
+  padding-top: var(--chrome-h);
+  padding-left: var(--content-gutter);
+  padding-right: var(--gutter);
+  scrollbar-gutter: stable;
+  /* Keep the scrollbar thumb out of the topbar's blind zone (#176): the same band the
+     padding-top reclaims, so the bar lives in the gutter below the glass. The editor
+     adds a bottom inset for its status bar via .editing-scroll (DocumentLayout). */
+  --sb-inset-top: var(--chrome-h);
+}

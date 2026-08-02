@@ -1,0 +1,204 @@
+/* Feed page (main area). Two layouts share preview bits: the List view renders as
+   a timeline (date/image gutter + content split by a spine), the Grid view as a
+   c1/c3/c5 tile grid (plus a mobile single-column fallback). The feed-skeleton
+   placeholders are kept :global — they're applied through the shared <Skeleton>
+   className passthrough and one (.feed-snippet-skeleton) is an E2E/visual hook. */
+.feed-page {
+  max-width: 960px; margin: 0 auto; padding: 28px 0 30vh; width: 100%;
+  container-type: inline-size; /* lets the grid cap columns to the page width */
+}
+.feed-head {
+  display: flex; align-items: center; gap: 10px; margin-bottom: 18px; flex-wrap: wrap;
+}
+.feed-head-icon { color: var(--accent); display: flex; }
+.feed-title { font-size: 22px; margin: 0; }
+.feed-controls { display: flex; align-items: center; gap: 8px; margin-left: auto; flex-wrap: wrap; }
+
+/* Compact controls: when the header is too narrow, the segmented controls move
+   into this dropdown instead of wrapping. */
+.feed-controls-compact { margin-left: auto; position: relative; }
+.feed-controls-btn { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
+.feed-controls-btn svg { transition: transform 0.12s; }
+.feed-controls-btn svg.open { transform: rotate(90deg); }
+.feed-controls-menu {
+  position: absolute; right: 0; top: calc(100% + 6px); z-index: 20;
+  display: flex; flex-direction: column; gap: 12px; min-width: 250px;
+  padding: 12px; border-radius: var(--radius-md);
+  background: var(--bg-elevated); border: 1px solid var(--border); box-shadow: var(--shadow);
+}
+.feed-cgroup { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.feed-cgroup-label { font-size: 12px; color: var(--text-faint); }
+
+/* Non-blocking feed-refresh error notice (#65) — sits above kept cards. */
+.feed-notice { margin-bottom: 14px; }
+
+/* Empty feed: centre the placeholder card so it doesn't stretch the full width. */
+.feed-empty { display: flex; justify-content: center; padding: 48px var(--gutter); }
+
+/* Section heading of the grouped grid (rendered inside the section's first
+   virtual block — see FeedVirtualGroupedGrid). */
+.feed-section-title {
+  font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--text-faint); margin: 14px 0 8px; font-weight: 600;
+}
+
+/* Shared preview bits (snippet + chips), used by both views' cards. */
+.feed-body { min-width: 0; display: flex; flex-direction: column; }
+.feed-row-title { min-width: 0; color: var(--text); }
+.feed-snippet { color: var(--text-faint); font-size: 12.5px; line-height: 1.4; }
+/* The date pill (neutral grey). Tags render via the shared neutral <TagChip>
+   read primitive — `feed-tag` is kept only as a marker class on those chips for
+   contextual overrides below (dense-grid `display:none`), not the pill look. */
+.feed-date {
+  font-size: 11px; padding: 1px 7px; border-radius: var(--radius-pill); line-height: 1.5; white-space: nowrap;
+  color: var(--text-faint); background: var(--bg-hover);
+}
+
+/* ── List view — timeline (date/image gutter + content, split by a vertical spine) ── */
+.feed-timeline { --tl-gutter: 160px; }
+
+/* Virtualized timeline (#64): the container is sized to the virtualizer's
+   total, each row wrapper is translated to its measured offset. Rows being
+   absolutely positioned, "previous sibling" CSS can't see across them — the
+   per-row top rule is the explicit .with-rule class computed from indices. */
+.feed-tl-virtual { position: relative; width: 100%; }
+.feed-tl-vrow { position: absolute; top: 0; left: 0; width: 100%; }
+.feed-tl-row.with-rule .feed-date { box-shadow: inset 0 1px 0 var(--border); }
+.feed-tl-row.with-rule .feed-tl-title { box-shadow: inset 0 1px 0 var(--border); }
+/* Ghost row (an unfetched window scrolled into view): keep the title block's
+   metrics so the spine geometry doesn't jump when the real row lands. */
+.feed-tl-title-ghost { min-width: 140px; }
+.feed-tl-group { margin: 22px 0; }
+.feed-tl-group-label {
+  display: block; width: calc(var(--tl-gutter) * 2); text-align: center;
+  font-size: 13px; font-weight: 600; color: var(--text);
+}
+.feed-tl-row {
+  display: grid; grid-template-columns: var(--tl-gutter) 1fr;
+  color: var(--text-dim); text-decoration: none;
+}
+/* Hover: title goes from its resting grey to white; body lifts a touch. */
+.feed-tl-row:hover .feed-tl-title { color: var(--text); }
+.feed-tl-row:hover .feed-tl-snippet { color: color-mix(in srgb, var(--text-dim) 55%, var(--text)); }
+.feed-tl-row:hover .feed-date { color: var(--text); }
+.feed-tl-gutter {
+  padding: 8px 16px 14px 0; display: flex; flex-direction: column;
+  align-items: flex-end; gap: 13px; text-align: right;
+}
+.feed-tl-gutter .feed-date {
+  line-height: calc(16px * 1.3); background: transparent; border-radius: 0;
+  margin-right: -16px; padding: 6px 11px 0 7px; /* left pad: rule overshoots the date */
+}
+.feed-tl-thumb {
+  width: 100%; max-width: 140px; aspect-ratio: 16 / 10;
+  object-fit: cover; border-radius: var(--radius-md); background: var(--bg-hover);
+}
+/* Small size (2-line snippets): drop the thumb entirely. */
+.feed-timeline-c5 .feed-tl-thumb { display: none; }
+.feed-tl-main {
+  min-width: 0; padding: 8px 0 14px 16px; border-left: 1px solid var(--border);
+  display: flex; flex-direction: column; gap: 8px;
+}
+.feed-tl-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.feed-tl-title {
+  color: var(--text-dim); font-weight: 600; font-size: 16px; line-height: 1.3;
+  margin-left: -16px; padding: 6px 7px 0 16px; /* right pad: rule overshoots the title */
+}
+.feed-tl-tags { flex: 0 0 auto; padding-top: 6px; display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 4px; }
+.feed-tl-snippet {
+  display: -webkit-box; -webkit-line-clamp: var(--lines, 6); -webkit-box-orient: vertical; overflow: hidden;
+}
+
+/* ── Grid view — structured tile grid (--cols 1|3|5 picks the column count) ── */
+/* Block virtualization (#64): blocks are absolutely positioned grids; the
+   bottom padding recreates the grid's 12px gap BETWEEN blocks. */
+.feed-grid-virtual { position: relative; width: 100%; }
+.feed-grid-block { position: absolute; top: 0; left: 0; width: 100%; padding-bottom: 12px; }
+.feed-grid { display: grid; gap: 12px; }
+.feed-grid-c1 { grid-template-columns: 1fr; align-items: start; }
+/* Mobile: forced single-column card stack. A moderate 16/9 banner, not the c1 hero. */
+.feed-grid-mobile { grid-template-columns: 1fr; align-items: start; }
+.feed-grid-mobile .feed-thumb { aspect-ratio: 16 / 9; }
+.feed-grid-c3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.feed-grid-c5 { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+.feed-grid-c3 { grid-auto-flow: row dense; }
+.feed-grid-c5 { align-items: start; } /* poster tiles self-size by aspect-ratio */
+.feed-grid-c3 { grid-auto-rows: calc(100cqw / 3 * 0.74); }
+/* Narrow content area (e.g. both side panels open): step the column counts down. */
+@container (max-width: 640px) {
+  .feed-grid-c3, .feed-grid-c5 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .feed-grid-c3 { grid-auto-rows: calc(100cqw / 2 * 0.68); }
+}
+@container (max-width: 380px) {
+  .feed-grid-c3, .feed-grid-c5 { grid-template-columns: 1fr; }
+  .feed-grid-c3 { grid-auto-flow: row; align-items: start; }
+  .feed-grid-c3 .feed-card { height: auto; }
+  .feed-grid-c3 .feed-card.has-image { grid-row: auto; }
+}
+
+.feed-card {
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 14px; border-radius: var(--radius-md);
+  border: 1px solid var(--border); background: var(--bg);
+  color: var(--text-dim); text-decoration: none;
+}
+.feed-card:hover { border-color: var(--border-strong); background: var(--bg-hover); }
+.feed-grid-c3 .feed-card { height: 100%; overflow: hidden; }
+.feed-grid-c3 .feed-card.has-image { grid-row: span 2; }
+
+/* c5 — uniform "poster" tiles: the image as a cover, the title in its own solid
+   block so it reads over any image or the plain dark card. */
+.feed-grid-c5 .feed-card { position: relative; overflow: hidden; aspect-ratio: 1 / 1; padding: 8px; gap: 6px; }
+.feed-grid-c5 .feed-thumb {
+  position: absolute; inset: 0; z-index: 0;
+  width: 100%; height: 100%; margin: 0; aspect-ratio: auto; border-radius: inherit;
+  filter: grayscale(0.3); opacity: 0.9;
+  transition: transform 0.2s, filter 0.2s, opacity 0.2s;
+}
+.feed-grid-c5 .feed-card:hover .feed-thumb { filter: grayscale(0.5); opacity: 1; }
+.feed-grid-c5 .feed-card .feed-body { position: relative; z-index: 2; margin-top: 0; margin-bottom: auto; }
+.feed-grid-c5 .feed-card .feed-chips { position: relative; z-index: 2; margin-top: 0; justify-content: flex-end; }
+.feed-grid-c5 .feed-card .feed-snippet,
+.feed-grid-c5 .feed-card .feed-tag { display: none; }
+.feed-grid-c5 .feed-card .feed-row-title {
+  font-size: 13.5px; -webkit-line-clamp: 3; line-height: 1.25;
+  width: fit-content; max-width: 100%;
+  background: var(--bg); color: var(--text);
+  padding: 7px 10px; border-radius: var(--radius-sm);
+}
+.feed-grid-c5 .feed-card:hover .feed-row-title { background: var(--bg-hover); }
+.feed-grid-c5 .feed-card .feed-date { font-size: 10.5px; }
+
+/* Preview banner (first image), full-bleed across the card top. */
+.feed-thumb {
+  display: block; width: calc(100% + 28px); margin: -14px -14px 0;
+  flex: 0 0 auto; aspect-ratio: 16 / 9;
+  object-fit: cover; border-radius: var(--radius-md) var(--radius-md) 0 0; background: var(--bg-hover);
+}
+.feed-grid-c1 .feed-thumb { aspect-ratio: auto; height: 420px; }
+.feed-grid-c3 .feed-thumb { aspect-ratio: 16 / 7; }
+
+.feed-card .feed-body { gap: 6px; min-height: 0; }
+.feed-card .feed-row-title {
+  overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  font-weight: 500; line-height: 1.35;
+}
+.feed-card .feed-snippet {
+  overflow: hidden; display: -webkit-box; -webkit-line-clamp: var(--lines, 6); -webkit-box-orient: vertical;
+}
+.feed-card .feed-chips {
+  margin-top: auto; display: flex; flex-wrap: wrap; align-items: center; gap: 4px;
+}
+
+/* Feed-card preview skeletons. Kept :global — applied via the shared <Skeleton>
+   className passthrough; .feed-snippet-skeleton is also an E2E/visual hook. They
+   mirror where the real parts sit AND honour the same per-size visibility (c5
+   hides snippet/tags and shimmers the cover instead). */
+:global(.feed-snippet-skeleton) { margin: 0; }
+:global(.feed-chip-skeleton) { width: 44px; height: 15px; border-radius: var(--radius-pill); flex: 0 0 auto; }
+:global(.feed-thumb-skeleton) { display: none; } /* off by default: only c5 reserves a cover */
+.feed-grid-c5 .feed-card :global(.feed-snippet-skeleton),
+.feed-grid-c5 .feed-card :global(.feed-chip-skeleton) { display: none; }
+.feed-grid-c5 .feed-card :global(.feed-thumb-skeleton) {
+  display: block; position: absolute; inset: 0; z-index: 0; border-radius: inherit;
+}

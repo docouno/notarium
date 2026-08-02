@@ -1,0 +1,186 @@
+/* Editor popovers (#119): the `/` slash menu (@codemirror/autocomplete) and the
+   floating format bar (showTooltip). Both wear the app's SHARED glass-menu look —
+   the same material + tokens core/ContextMenu uses — instead of CM's default light
+   chrome. Both carry `cm-pop glass` (CM also stamps `cm-tooltip` onto the element).
+
+   Cascade note (load-bearing): CM injects its baseTheme at editor-MOUNT, AND treats our
+   editor as a LIGHT theme (we never flag it dark; it flips at runtime via `data-theme`,
+   which CM can't track). CM's real selectors carry an extra editor-class ancestor (the
+   `cm-<themeID>` on `.cm-editor`, which the tooltip lives inside since we pass NO
+   `parent`), so e.g. its list rule is `.cm-<id> .cm-tooltip.cm-tooltip-autocomplete > ul`
+   = (0,3,1) — and our `.cm-tooltip.cm-tooltip-autocomplete.cm-pop > ul` = (0,3,1) TIES it.
+   Two things make us win WITHOUT `!important`: (a) style-mod inserts CM's sheet as the
+   FIRST <head> child, so our later-loaded bundle wins every tie on source order; (b) the
+   rules that MUST win regardless — the selected row + the leaf icon/label/detail — add a
+   class and genuinely outweigh on count (e.g. `…autocomplete.cm-pop > ul > li[aria-selected]`
+   (0,4,2) > CM's (0,3,2)). So: structural list rules tie-and-win on order; the colour
+   overrides win on count. The `.cm-tooltip.cm-pop` (0,2,0) shell does beat `.cm-tooltip`. */
+
+/* ---- shared glass shell (both popovers) ------------------------------------- */
+.cm-tooltip.cm-pop {
+  --glass-bg: var(--glass-menu-bg);
+  --glass-bg-opaque: var(--bg-elevated);
+  --glass-border: var(--glass-menu-border);
+  --glass-drop: var(--glass-menu-drop);
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-md);
+  box-shadow: inset 0 1px 0 var(--glass-highlight), var(--glass-drop);
+  color: var(--text);
+  /* The specificity bump above also bypasses `.glass`'s own reduced-transparency
+     fallback, so mirror it here (solid fill + no blur) to keep the contrast floor. */
+  @media (prefers-reduced-transparency: reduce), (prefers-contrast: more) {
+    background: var(--glass-bg-opaque);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+
+/* ---- slash-command menu (a vertical list, mirroring .context-menu items) ----
+   Scoped under the THREE classes the element carries, so every rule outweighs CM's
+   `.cm-tooltip.cm-tooltip-autocomplete …` baseTheme (font/padding/selection). */
+.cm-tooltip.cm-tooltip-autocomplete.cm-pop {
+  padding: 5px;
+
+  > ul {
+    font-family: var(--font-sans);
+    max-height: 22em;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+
+    /* Section header — a `<completion-section>` custom element. */
+    > completion-section {
+      display: block;
+      border: none;
+      opacity: 1;
+      margin: 0;
+      padding: 8px 8px 3px;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--text-faint);
+    }
+    > completion-section:first-child { padding-top: 3px; }
+
+    /* Rows mirror .context-menu-item (padding/gap/radius/colour/hover). */
+    > li {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      margin: 1px 0;
+      padding: 7px 9px;
+      border-radius: var(--radius-sm);
+      color: var(--text-dim);
+      font-size: 13px;
+      line-height: 1.25;
+      cursor: pointer;
+    }
+    > li:hover {
+      background: var(--bg-hover);
+      color: var(--text);
+    }
+    /* Keyboard-selected row: soft accent tint + accent ink (like Raycast/Linear),
+       refined vs CM's solid-blue default. */
+    > li[aria-selected] {
+      background: var(--accent-soft);
+      color: var(--text);
+    }
+  }
+
+  /* Icon column — a small mono glyph per command `type`; follows the row ink. */
+  .cm-completionIcon {
+    flex: none;
+    width: 18px;
+    margin: 0;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0.85;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    font-weight: 700;
+    line-height: 1;
+    color: inherit;
+
+    &::after { content: '◦'; }
+  }
+  .cm-completionLabel { flex: 1; min-width: 0; }
+  .cm-completionDetail {
+    flex: none;
+    font-style: normal;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-faint);
+  }
+  /* The fuzzy-matched chars in the label. */
+  .cm-completionMatchedText {
+    text-decoration: none;
+    color: var(--accent);
+    font-weight: 700;
+  }
+
+  /* Selected row → accent ink on label + icon. */
+  > ul > li[aria-selected] {
+    .cm-completionLabel { color: var(--accent); font-weight: 550; }
+    .cm-completionIcon { color: var(--accent); opacity: 1; }
+    .cm-completionDetail { color: var(--accent); }
+  }
+
+  /* Per-type glyphs. */
+  .cm-completionIcon-h1::after { content: 'H1'; }
+  .cm-completionIcon-h2::after { content: 'H2'; }
+  .cm-completionIcon-h3::after { content: 'H3'; }
+  .cm-completionIcon-bullet::after { content: '•'; font-size: 15px; }
+  .cm-completionIcon-ordered::after { content: '1.'; }
+  .cm-completionIcon-task::after { content: '\2611\FE0E'; font-size: 13px; } /* \FE0E = text, not emoji, presentation */
+  .cm-completionIcon-quote::after { content: '"'; font-size: 16px; }
+  .cm-completionIcon-callout::after { content: '!'; font-size: 13px; }
+  .cm-completionIcon-code::after { content: '</>'; font-size: 9.5px; }
+  .cm-completionIcon-table::after { content: '⊞'; font-size: 15px; }
+  .cm-completionIcon-divider::after { content: '—'; }
+  .cm-completionIcon-image::after { content: '▣'; font-size: 14px; }
+  .cm-completionIcon-link::after { content: '↗'; font-size: 14px; }
+  .cm-completionIcon-wikilink::after { content: '[['; letter-spacing: -1px; }
+  .cm-completionIcon-footnote::after { content: '*'; font-size: 16px; }
+  .cm-completionIcon-date::after { content: '◷'; font-size: 15px; }
+}
+
+/* ---- floating format bar (a horizontal button row on the same glass shell) -- */
+.cm-md-formatbar.cm-pop {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px;
+}
+.cm-md-formatbar-sep {
+  width: 1px;
+  height: 18px;
+  margin: 0 3px;
+  background: var(--border);
+}
+.cm-md-formatbar-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+
+  &:hover {
+    background: var(--bg-hover);
+    color: var(--text);
+  }
+  &.is-active {
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+}

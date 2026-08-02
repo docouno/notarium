@@ -1,0 +1,216 @@
+// Markdown rendering for the read/bootstrap tools: the prose projection of each tool's structured payload.
+import {
+  type DeltaEntry,
+  type FolderEntry,
+  type ListNotesItem,
+  type NoteLink,
+  type ProjectSummary,
+  type Provenance,
+  type RecentActivityItem,
+  RESPONSE_FORMAT,
+  type SearchHit,
+  type ToolHelp,
+} from '@notarium/contract/tools'
+
+import { renderProvenance } from '../provenance'
+
+type SessionStructured = {
+  profile: {
+    memory: Array<{ noteId: string; category: string; summary: string }>
+    alwaysLoad: Array<{ noteId: string; title: string }>
+  }
+  projects: ProjectSummary[]
+  project?: {
+    index: { noteCount: number; folders: FolderEntry[] }
+    alwaysLoad: Array<{ noteId: string; title: string }>
+    delta: { changes: DeltaEntry[]; total: number; truncated?: boolean }
+    knownValues?: { categories: string[]; tags: string[] }
+  }
+  toolsHelp: ToolHelp[]
+  truncated?: boolean
+}
+
+/** Renders the session bundle as prose; `concise` (default) vs `detailed`. */
+export const renderSession = (
+  s: SessionStructured,
+  project: string | undefined,
+  format: 'concise' | 'detailed',
+): string => {
+  const lines: string[] = []
+
+  if (s.profile.memory.length) {
+    lines.push('**What I remember about you:**')
+    for (const m of s.profile.memory) {
+      lines.push(`- _${m.category}_: ${m.summary}`)
+    }
+  }
+  if (s.profile.alwaysLoad.length) {
+    lines.push('', '**Always-load notes:**')
+    for (const a of s.profile.alwaysLoad) {
+      lines.push(`- ${a.title} \`${a.noteId}\``)
+    }
+  }
+  lines.push(
+    '',
+    s.projects.length
+      ? `**Your projects:** ${s.projects.map((p) => `\`${p.handle}\``).join(', ')}`
+      : 'You have no project workspaces yet.',
+  )
+  if (s.project) {
+    const idx = s.project.index
+    const folderNames = idx.folders.map((f) => f.name)
+    const folderTail =
+      format === RESPONSE_FORMAT.detailed && folderNames.length
+        ? ` — folders: ${folderNames.join(', ')}`
+        : ''
+    lines.push(
+      '',
+      `**\`${project}\`:** ${idx.noteCount} note${idx.noteCount === 1 ? '' : 's'}${folderTail} (enumerate with list_notes)`,
+    )
+    if (s.project.alwaysLoad.length) {
+      lines.push('', `**Always-load notes in \`${project}\`:**`)
+      for (const a of s.project.alwaysLoad) {
+        lines.push(`- ${a.title} \`${a.noteId}\``)
+      }
+    }
+    const d = s.project.delta
+    const head = d.total
+      ? `**Changes in \`${project}\` since you last looked** (${d.changes.length}${d.truncated ? ` of ${d.total}, more via search` : ''}):`
+      : `Nothing changed in \`${project}\` since you last looked.`
+    lines.push('', head)
+    if (format === RESPONSE_FORMAT.detailed) {
+      for (const c of d.changes) {
+        const who = c.principal ? ` by \`${c.principal}\`` : ''
+        lines.push(`- ${c.title} \`${c.noteId}\` (${c.kind}${who})`)
+      }
+    }
+    const kv = s.project.knownValues
+
+    if (format === RESPONSE_FORMAT.detailed && kv && (kv.categories.length || kv.tags.length)) {
+      lines.push('', '**Known values** (reuse these, do not coin synonyms):')
+      if (kv.categories.length) {
+        lines.push(`- categories: ${kv.categories.join(', ')}`)
+      }
+      if (kv.tags.length) {
+        lines.push(`- tags: ${kv.tags.join(', ')}`)
+      }
+    }
+  }
+  if (format === RESPONSE_FORMAT.detailed && s.toolsHelp.length) {
+    lines.push('', '**Tools:**')
+    for (const t of s.toolsHelp) {
+      lines.push(`- \`${t.name}\` — ${t.summary}`)
+    }
+  }
+  if (s.truncated) {
+    lines.push('', '_(profile truncated — use search/get_note for the rest)_')
+  }
+
+  return lines.join('\n').trim() || 'Session ready.'
+}
+
+/** Where a note lives, in prose: project handle, else space slug, else personal. */
+const whereLabel = (loc: { space?: string; project?: string }): string => {
+  if (loc.project) {
+    return ` _(project: ${loc.project})_`
+  }
+  if (loc.space) {
+    return ` _(${loc.space})_`
+  }
+
+  return ' _(personal)_'
+}
+
+export const renderSearch = (results: SearchHit[], format: 'concise' | 'detailed'): string => {
+  if (!results.length) {
+    return 'No matches.'
+  }
+  const lines = results.map((h) => {
+    const head = `- **${h.title}** \`${h.noteId}\`${whereLabel(h)}`
+    return format === RESPONSE_FORMAT.detailed && h.snippet ? `${head}\n  ${h.snippet}` : head
+  })
+  return `${results.length} match${results.length === 1 ? '' : 'es'}:\n${lines.join('\n')}`
+}
+
+export const renderNote = (
+  note: {
+    title: string
+    content: string
+    space?: string
+    project?: string
+    versionToken: string
+    provenance?: Provenance
+    outline?: Array<{ level: number; title: string }>
+    links?: { outgoing: NoteLink[]; incoming: NoteLink[] }
+  },
+  format: 'concise' | 'detailed',
+): string => {
+  const where = whereLabel(note)
+
+  if (format === RESPONSE_FORMAT.concise) {
+    const firstPara = note.content.split('\n\n')[0]?.trim() ?? ''
+    const brief = firstPara.length > 500 ? `${firstPara.slice(0, 500)}…` : firstPara
+    return `# ${note.title}${where}\n\n${brief}`
+  }
+  const parts = [`# ${note.title}${where}\n\n${note.content}`]
+
+  if (note.outline && note.outline.length) {
+    const lines = note.outline.map((h) => `${'  '.repeat(Math.max(0, h.level - 1))}- ${h.title}`)
+    parts.push(`**Sections** (edit with replaceSection):\n${lines.join('\n')}`)
+  }
+  if (note.links && (note.links.outgoing.length || note.links.incoming.length)) {
+    const lines: string[] = []
+
+    for (const l of note.links.outgoing) {
+      lines.push(
+        `- → _${l.relation}_ ${l.title}${l.noteId ? ` \`${l.noteId}\`` : ' (not yet created)'}`,
+      )
+    }
+    for (const l of note.links.incoming) {
+      lines.push(`- ← _${l.relation}_ ${l.title}${l.noteId ? ` \`${l.noteId}\`` : ''}`)
+    }
+    parts.push(`**Links:**\n${lines.join('\n')}`)
+  }
+  if (note.provenance) {
+    parts.push(renderProvenance(note.provenance))
+  }
+
+  return parts.join('\n\n')
+}
+
+/** The list_notes (ls) rendering: subfolders, then notes. */
+export const renderListNotes = (
+  items: ListNotesItem[],
+  folders: FolderEntry[],
+  total: number,
+  folder: string,
+): string => {
+  const where = folder ? `\`${folder}\`` : 'the root'
+
+  if (!items.length && !folders.length) {
+    return `Nothing in ${where}.`
+  }
+  const lines: string[] = []
+
+  for (const f of folders) {
+    lines.push(`- 📁 **${f.name}/** \`${f.path}\` (${f.count})`)
+  }
+  for (const i of items) {
+    lines.push(`- ${i.title} \`${i.noteId}\``)
+  }
+  const more =
+    items.length < total ? ` (showing ${items.length} of ${total} notes — page with cursor)` : ''
+  return `Contents of ${where}${more}:\n${lines.join('\n')}`
+}
+
+/** recent_activity rendering, newest-first. */
+export const renderRecentActivity = (items: RecentActivityItem[]): string => {
+  if (!items.length) {
+    return 'No recent activity.'
+  }
+  const lines = items.map((i) => {
+    const who = i.principal ? ` by \`${i.principal}\`` : ''
+    return `- **${i.title}** \`${i.noteId}\`${whereLabel(i)} — ${i.kind}${who} (${i.modifiedAt})`
+  })
+  return `${items.length} recently changed:\n${lines.join('\n')}`
+}

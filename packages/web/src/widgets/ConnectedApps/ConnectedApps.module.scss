@@ -1,0 +1,133 @@
+/* The access-level edit form (#162) — same form pattern as the API-tokens edit,
+   shown above the table while a connection is being re-scoped. */
+.edit-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px;
+  background: var(--bg-list);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  /* Size the field grid off the form's own width (the sidebar can resize it). */
+  container: conn-form / inline-size;
+}
+
+/* Name + Access on one row (Name flexes, Access sits at the right edge) — mirrors
+   the API-tokens edit grid so both forms read identically. */
+.grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 12px;
+}
+
+@container conn-form (min-width: 360px) {
+  .grid {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+}
+
+/* Title line — mirrors the API-tokens form header so both screens read the same. */
+.form-header {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+
+  > span {
+    font-size: 11px;
+    font-weight: 550;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-faint);
+  }
+
+  input {
+    width: 100%;
+    padding: 7px 10px;
+    font: inherit;
+    font-size: 13px;
+    color: var(--text);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    outline: none;
+
+    &:disabled {
+      color: var(--text-dim);
+      background: var(--bg-list);
+      cursor: not-allowed;
+    }
+  }
+}
+
+/* The access control sizes to its content (segmented pills) instead of stretching
+   to the form width — mirrors AccountSettings' .field-control. */
+.field-control {
+  align-items: flex-start;
+}
+
+.form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+
+  th {
+    padding: 6px 8px;
+    text-align: left;
+    font-size: 10.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-faint);
+    border-bottom: 1px solid var(--border);
+  }
+
+  td {
+    padding: 7px 8px;
+    color: var(--text-dim);
+    border-bottom: 1px solid var(--border);
+    vertical-align: middle;
+  }
+}
+
+.cell-name {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.cell-actions {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.badge {
+  display: inline-block;
+  padding: 1px 7px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+  background: var(--bg-hover);
+  border-radius: var(--radius-pill);
+}
+
+.badge-accent {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.error {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--danger);
+}

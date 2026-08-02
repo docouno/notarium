@@ -1,0 +1,45 @@
+# Base stack — Notarium as the single self-contained image.
+#
+# One Node process serves the built SPA + the REST API and runs the engine
+# in-process. This file mirrors what gets published; all config comes from
+# ../.env (passed straight through).
+#
+# The Makefile layers exactly one file on top of this one (`make help`):
+#   base (this file)  →  compose.dev.yml   (dev only: `make dev`)
+# `make up` runs the base alone — the published shape.
+name: notarium
+
+services:
+  notarium:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: ${IMAGE:-docouno/notarium}:${TAG:-latest}
+    env_file:
+      - ../.env
+    environment:
+      # The ONE data root (#101). Everything under it is derived IN CODE — the
+      # meta-DB (identity #51, journal #12, spaces #16, auth #10), the engine
+      # indexes (#69, P2), job artifacts + import staging (#105/#191, P11), and
+      # the notes root itself (one folder per space, #69/#99):
+      #
+      #   /data/meta.db  ·  /data/engine  ·  /data/jobs  ·  /data/spaces
+      #
+      # This line is the ONLY data setting, and even it is optional — the image
+      # already pins DATA_DIR=/data. Nothing here is required, so nothing here can
+      # be forgotten one-by-one; that is the whole point (a deploy that set
+      # meta/engine but missed the jobs path shipped a green boot whose exports
+      # died on EACCES). Operator overrides still exist for real needs —
+      # META_DB_URL=postgres://… for shared state, SPACES_ROOT to mount notes from
+      # elsewhere, ENGINE_DATA_DIR/JOBS_DATA_DIR to move derived data to another
+      # disk — pass them through ../.env; unset, they all derive from here.
+      DATA_DIR: ${DATA_DIR:-/data}
+    volumes:
+      # One host bind (docker/volumes/, gitignored) for the whole root. The notes
+      # under spaces/ are the truth (P1); everything beside them is derived from
+      # it and degrades softly (indexes reindex, artifacts re-export), but Feed
+      # dates and unsaved notes' URLs survive restarts only with this mount.
+      - ./volumes/data:/data
+    ports:
+      - "${PORT:-3000}:${PORT:-3000}"
+    restart: unless-stopped

@@ -1,0 +1,4 @@
+/* Reader loading skeleton (#65 no-flicker boot) — laid out to echo the note's
+   title + body so the swap to real content doesn't shift anything. */
+.skeleton { display: flex; flex-direction: column; gap: 22px; }
+.skeleton-body { display: flex; flex-direction: column; gap: 18px; }

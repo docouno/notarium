@@ -1,0 +1,18 @@
+/* Force-graph canvas fills its positioned parent (graph-wrap / localgraph-body). */
+.graph-canvas { position: absolute; inset: 0; overflow: hidden; }
+
+.graph-controls {
+  position: absolute; right: var(--gutter); bottom: var(--gutter); z-index: 6;
+  display: flex; flex-direction: column; gap: 5px;
+}
+.graph-controls button {
+  display: inline-flex; align-items: center; justify-content: center;
+  /* 32px = the app's standard icon-button size (cf. --icon-btn-inset) — same as the
+     filters toggle above, so both right-edge-on-the-gutter controls share one width
+     and sit in a single vertical line (centres aligned, not just right edges). */
+  width: 32px; height: 32px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border); background: var(--bg-elevated);
+  color: var(--text-dim); box-shadow: var(--shadow);
+  transition: background 0.12s, color 0.12s;
+}
+.graph-controls button:hover { background: var(--bg-hover); color: var(--text); }

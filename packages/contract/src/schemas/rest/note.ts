@@ -1,0 +1,149 @@
+import { z } from 'zod'
+import { AuthorSchema, IsoTimestampSchema, NoteClassSchema, SpaceSlugSchema } from '../primitives'
+import { noteWriteFields } from './_fields'
+
+export const NoteDetailResponseSchema = z.object({
+  id: z.string(),
+  /** The space the note lives in — what scopes the client's chrome
+   *  (sidebar, tree, sibling navigation) when a reader arrives through the
+   *  space-free `/n/<id>`. Absent only inside the 409 conflict envelope —
+   *  the saver already knows where it was saving. */
+  space: SpaceSlugSchema.optional(),
+  title: z.string().optional(),
+  filePath: z.string().optional(),
+  /** The note's class, mount-derived and read-only. Orthogonal to the
+   *  free-form frontmatter `type`: `class` follows the mount, `type` is a label.
+   *  canon: docs/note-model.md#note-classes */
+  class: NoteClassSchema.optional(),
+  content: z.string(),
+  frontmatter: z.record(z.unknown()),
+  /** The editable display slug, lifted from frontmatter `slug:`; the
+   *  client builds the canonical `/n/<id>/<slug>` URL from it. Absent when the
+   *  note has no custom slug (the URL tail then derives from the title). */
+  slug: z.string().optional(),
+  /** Alias-history: past human names the resolver honours, lifted from
+   *  frontmatter `aliases:` to a typed field so a client round-trips them without
+   *  re-parsing frontmatter. Absent when never renamed. */
+  aliases: z.array(z.string()).optional(),
+  /** Last content change. Precise for everything that happened on this server's
+   *  watch (journal is the source); day precision when only the engine's
+   *  inventory date is known. */
+  modifiedAt: IsoTimestampSchema.optional(),
+  /** The note's resolved creation instant, full ISO-8601 UTC — the editable
+   *  date-as-data axis. Served on the read form so the metadata aside prefills the
+   *  date field WITHOUT re-parsing `frontmatter.created` (which is absent when the
+   *  date is birthtime-derived, not yet pinned). null = the engine knows no date. */
+  createdAt: z.string().nullable().optional(),
+  /** Opaque version of the content just read. Echoed back on save for
+   *  compare-and-swap; the client never inspects the value.
+   *  canon: docs/architecture.md#p3 */
+  versionToken: z.string(),
+  /** Trash state: true when this id resolves to a DELETED note — the read
+   *  served its last journaled state (read-only) instead of 404ing, so the reader
+   *  shows it under a "deleted" banner. The fields below ride along then; on a
+   *  live note they are absent. `content` is the last body (empty when an honest
+   *  gap left nothing to recover); `versionToken` is meaningless (no live note to
+   *  save against) and the reader hides editing. */
+  deleted: z.boolean().optional(),
+  /** When the note was deleted (the delete-tombstone's journal timestamp). */
+  deletedAt: z.string().optional(),
+  /** Who deleted it, resolved + privacy-filtered; null = an external delete. */
+  deletedBy: AuthorSchema.nullable().optional(),
+  /** Whether the last body is recoverable (a blob is in the CAS) — the banner's
+   *  Restore is disabled when false (an honest gap). */
+  restorable: z.boolean().optional(),
+})
+
+export const CreateNoteRequestSchema = z.object(noteWriteFields)
+
+export const UpdateNoteRequestSchema = z.object({
+  ...noteWriteFields,
+  /** The note-id being edited in place — triggers move-then-write so a
+   *  title/folder change renames rather than duplicating (the rename invariant). */
+  originalId: z.string(),
+  /** The version the editor read (see NoteDetailResponseSchema.versionToken): the
+   *  writer must prove what it's overwriting. A stale token → 409 ConflictResponse. */
+  versionToken: z.string(),
+})
+
+export const SaveResponseSchema = z.object({
+  ok: z.literal(true),
+  /** The saved note's identity — what the client navigates to. Stable across
+   *  renames: equals originalId when one was sent. */
+  id: z.string(),
+  filePath: z.string().optional(),
+  /** Version of the note as just written — lets a client (or agent) chain a
+   *  follow-up save without an interim read. */
+  versionToken: z.string(),
+})
+
+/** One note restored by a batch trash-restore: the same write echo as a
+ *  single restore/save, minus the envelope's top-level `ok`. */
+export const RestoredNoteSchema = SaveResponseSchema.omit({ ok: true })
+
+/** 409 envelope for a save whose versionToken went stale: the writer's
+ *  read happened before someone else's write. Carries the LIVE note — content
+ *  and a fresh token — so the client can show the other side and let the user
+ *  decide; neither version is lost silently (P3). Re-sending the save with
+ *  `current.versionToken` is the explicit "I saw it, overwrite" move. */
+export const ConflictResponseSchema = z.object({
+  error: z.string(),
+  reason: z.literal('version_conflict'),
+  current: NoteDetailResponseSchema,
+})
+
+export const RemoveResponseSchema = z.object({
+  ok: z.literal(true),
+})
+
+export const MoveRequestSchema = z.object({
+  id: z.string(),
+  destinationPath: z.string(),
+})
+
+export const MoveResponseSchema = z.object({
+  ok: z.literal(true),
+})
+
+/** PUT /api/note/pin — toggle a note's `always-load` membership: pin adds the tag,
+ *  unpin removes it. WHERE it then surfaces (personal profile vs a project bundle) follows
+ *  from WHERE the note lives — the scan owns that (a note outside the personal domain and
+ *  any project pins nowhere; the UI hides the action there). `note:write` on the note's
+ *  registry space. */
+export const PinNoteRequestSchema = z.object({ id: z.string(), pinned: z.boolean() })
+
+export const PinNoteResponseSchema = z.object({ ok: z.literal(true), pinned: z.boolean() })
+
+/** PUT /api/note/mute — toggle a memory category's `muted` opt-out: muted
+ *  stays in the audit but drops from the agent's eager profile. `note:write` on the
+ *  note's registry space (the personal domain for about-user memory, the project's
+ *  space for about-project memory). */
+export const MuteNoteRequestSchema = z.object({ id: z.string(), muted: z.boolean() })
+
+export const MuteNoteResponseSchema = z.object({ ok: z.literal(true), muted: z.boolean() })
+
+export type NoteDetail = z.infer<typeof NoteDetailResponseSchema>
+
+export type CreateNoteRequest = z.infer<typeof CreateNoteRequestSchema>
+
+export type UpdateNoteRequest = z.infer<typeof UpdateNoteRequestSchema>
+
+export type MoveRequest = z.infer<typeof MoveRequestSchema>
+
+export type SaveResponse = z.infer<typeof SaveResponseSchema>
+
+export type RestoredNote = z.infer<typeof RestoredNoteSchema>
+
+export type ConflictResponse = z.infer<typeof ConflictResponseSchema>
+
+export type RemoveResponse = z.infer<typeof RemoveResponseSchema>
+
+export type MoveResponse = z.infer<typeof MoveResponseSchema>
+
+export type PinNoteRequest = z.infer<typeof PinNoteRequestSchema>
+
+export type PinNoteResponse = z.infer<typeof PinNoteResponseSchema>
+
+export type MuteNoteRequest = z.infer<typeof MuteNoteRequestSchema>
+
+export type MuteNoteResponse = z.infer<typeof MuteNoteResponseSchema>

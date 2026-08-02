@@ -1,0 +1,455 @@
+// The MCP gateway core: transport-agnostic tool dispatch — listTools (tools/list
+// scope filter) + callTool (tools/call). All agent-facing policy is enforced here;
+// each tool is a thin wrapper over the KnowledgeStore methods REST uses (P4).
+// canon: docs/mcp-gateway.md#security · docs/architecture.md#p4
+
+import type { z } from 'zod'
+import { PROJECT_STATUS } from '@notarium/contract'
+import {
+  type ProjectSummary,
+  toolActions,
+  type ToolHelp,
+  type ToolName,
+  tools,
+} from '@notarium/contract/tools'
+import { slugify } from '@notarium/core'
+
+import { type AuthService } from '../auth'
+import { type Action, can, type Principal, scopeAllows } from '../authz'
+import type {
+  ContextOrderPersistence,
+  ContextSetsPersistence,
+  FolderIdentityPersistence,
+  GatewayStatePersistence,
+  ProjectRecord,
+  ProjectsPersistence,
+  RetrievalLogPersistence,
+  ScopePinsPersistence,
+} from '../metaDb'
+import { type MarkerStore } from '../projects'
+import { ensurePersonalSpace, type SpaceManager } from '../spaces'
+import { createStoreAccess, type StoreAccess } from '../storeAccess'
+import { TOOL_META, type ToolAnnotations } from './descriptions'
+import { projectSummaryOf } from './helpers/projectAddressing'
+import { retrievalRowOf } from './helpers/retrievalAudit'
+import { sanitizeText } from './sanitize'
+import { handleMoveFolder, handleRenameFolder, handleRenameProject } from './tools/containers'
+import { handleCreateNote, handleCreateNotes } from './tools/create'
+import { handleLink, handleLinkMany } from './tools/links'
+import { handleRememberProject, handleRememberUser } from './tools/memory'
+import {
+  handleDeleteNote,
+  handleEditNote,
+  handleMoveNote,
+  handleRenameNote,
+} from './tools/noteLifecycle'
+import { handleGetMyProjects, handleWhoami } from './tools/projectsList'
+import {
+  handleGetNote,
+  handleListNotes,
+  handleRecall,
+  handleRecentActivity,
+  handleSearch,
+} from './tools/read'
+import { handleStartSession } from './tools/session'
+
+export type GatewayDeps = {
+  spaces: SpaceManager
+  auth: AuthService
+  /** Per-token gateway state: start_session bookmarks + write dedup.
+   *  Absent → no delta cursor, no retry-dedup (honest degradation). */
+  gatewayState?: GatewayStatePersistence
+  /** Agent-retrieval audit log: read-tool calls (search/recall/get_note) appended
+   *  fire-and-forget. Absent → no capture (honest degradation). */
+  retrievalLog?: RetrievalLogPersistence
+  /** Tracks fire-and-forget persistence in the online-backup write barrier. */
+  runMutation?: <T>(task: () => Promise<T>) => Promise<T>
+  /** The project registry. Absent (meta-DB-less host) → no projects exist
+   *  (honest degradation). */
+  projects?: ProjectsPersistence
+  /** Folder path-history, lazily minted on a folder's first rename so
+   *  `[[oldpath/note]]` keeps resolving. Absent → move/rename still works, only the
+   *  path-history isn't recorded. */
+  folders?: FolderIdentityPersistence
+  /** The `.notariummeta` marker store: on-disk truth, written through before the
+   *  derived registry cache. Absent (the e2e fake) → registry-only, no marker file. */
+  markerStore?: MarkerStore
+  /** The context-sets registry. Absent (meta-DB-less host) → no sets exist
+   *  (honest degradation; the location-bound pin still works). */
+  contextSets?: ContextSetsPersistence
+  /** Cross-space scope-pins registry (notes pinned into a scope, into
+   *  start_session's always-load). */
+  scopePins?: ScopePinsPersistence
+  /** Per-scope context-order overlay (order = load priority). Absent → the default
+   *  sequence (pins then sets). */
+  contextOrder?: ContextOrderPersistence
+  /** Clock — injectable for tests (stamps dedup/bookmark rows, computes dedup windows). */
+  now?: () => Date
+}
+
+/** One tools/list row. `input`/`output` stay zod here (the gateway's own
+ *  validation source); the transport renders them to JSON Schema on the wire. */
+export type ToolListing = {
+  name: ToolName
+  description: string
+  annotations: ToolAnnotations
+  input: z.AnyZodObject
+  output: z.AnyZodObject
+}
+
+/** CallToolResult (structural subset): Markdown text + machine-readable
+ *  structuredContent (the *Output contract shape). */
+export type ToolResult = {
+  content: Array<{ type: 'text'; text: string }>
+  structuredContent?: Record<string, unknown>
+  isError?: boolean
+}
+
+export type McpGateway = {
+  listTools(principal: Principal): ToolListing[]
+  callTool(principal: Principal, name: string, args: unknown): Promise<ToolResult>
+}
+
+/** Per-call context handed to every handler: the principal plus the shared
+ *  resolvers and derived lookups (personal domain, project registry). Facets are
+ *  undefined on a meta-DB-less host (honest degradation). */
+export type Ctx = {
+  principal: Principal
+  spaces: SpaceManager
+  store: StoreAccess
+  projects?: ProjectsPersistence
+  /** Folder path-history + marker store, written through by the container-reorg tools. */
+  folders?: FolderIdentityPersistence
+  markerStore?: MarkerStore
+  contextSets?: ContextSetsPersistence
+  scopePins?: ScopePinsPersistence
+  contextOrder?: ContextOrderPersistence
+  gatewayState?: GatewayStatePersistence
+  now(): Date
+  /** Peek the personal-domain slug; NEVER provisions (a read surface must not mint
+   *  a space). none-mode → the host's first space. */
+  personalSpace(): Promise<string | null>
+  /** Resolve, MINTING on first touch — the write path (contrast personalSpace's
+   *  read-only peek). Degrades to the host's first space when it can't mint. */
+  ensurePersonalDomain(): Promise<string>
+  /** Spaces this token can read, INCLUDING the personal domain (search fan-out). */
+  readableSpaces(): Promise<string[]>
+  /** ACTIVE projects in every space the token is a member of, INCLUDING the
+   *  personal domain. [] without a registry. */
+  readableProjects(): Promise<ProjectSummary[]>
+  /** Resolve a handle (`space/slug` or bare `slug`) to its row, scoped to reachable
+   *  spaces (anti-enumeration); 404-semantic on miss. Resolves any status (archived
+   *  stays addressable). Read-reachability only — a write tool must additionally
+   *  check can(space:write) on the resolved space. */
+  resolveProject(handle: string): Promise<ProjectRecord>
+  /** Projects living in one space. [] without a registry. */
+  projectsInSpace(space: string): Promise<ProjectRecord[]>
+}
+
+export type Rendered = { markdown: string; structured: Record<string, unknown> }
+export type Handler = (ctx: Ctx, args: unknown) => Promise<Rendered>
+
+/** A tool-execution failure carrying safe, actionable guidance (404-semantics for
+ *  denials — never "forbidden"). Thrown directly (not via a helper) so TS narrows
+ *  the guarded value after it. */
+export class ToolFailure extends Error {}
+
+/** A tool-error result, text sanitised on the way out: most messages are static
+ *  server strings, but a few embed note-derived content (edit_note's replaceSection
+ *  lists the note's headings — untrusted), so defang centrally rather than trust
+ *  each call site (anti tool-poisoning). */
+const errorResult = (text: string): ToolResult => ({
+  content: [{ type: 'text', text: sanitizeText(text) }],
+  isError: true,
+})
+
+export const createGateway = (deps: GatewayDeps): McpGateway => {
+  const store = createStoreAccess(deps.spaces)
+  const now = deps.now ?? (() => new Date())
+
+  const ctxFor = (principal: Principal): Ctx => {
+    // Both return the STABLE space id — the gateway addresses stores/meta-DB by id;
+    // only handle/space EMISSION translates back to slug.
+    const personalSpace = async (): Promise<string | null> => {
+      // none-mode/system principal owns the host — its personal domain is the
+      // host's first space.
+      if (principal.system) {
+        return deps.spaces.list()[0]?.id ?? null
+      }
+
+      return principal.username ? deps.auth.personalSpaceOf(principal.username) : null
+    }
+    const readableSpaces = async (): Promise<string[]> =>
+      deps.spaces
+        .list()
+        .map((s) => s.id)
+        .filter((id) => can(principal, 'space:read', { space: id }))
+    return {
+      principal,
+      spaces: deps.spaces,
+      store,
+      projects: deps.projects,
+      folders: deps.folders,
+      markerStore: deps.markerStore,
+      contextSets: deps.contextSets,
+      scopePins: deps.scopePins,
+      contextOrder: deps.contextOrder,
+      gatewayState: deps.gatewayState,
+      now,
+      personalSpace,
+      ensurePersonalDomain: () =>
+        ensurePersonalSpace({ auth: deps.auth, spaces: deps.spaces }, principal),
+      readableSpaces,
+      readableProjects: async () => {
+        if (!deps.projects) {
+          return []
+        }
+        // Membership-scoped (the same reachable set /api/spaces uses), INCLUDING the
+        // personal domain — no `!= personal` filter: the personal slug in the handle
+        // is the principal's own, never a cross-principal leak.
+        const reachable = await readableSpaces()
+        const rows = await deps.projects.listForSpaces(reachable)
+        return rows
+          .filter((p) => p.status === PROJECT_STATUS.active)
+          .map((p) => projectSummaryOf(p, deps.spaces.slugOf(p.space) ?? p.space))
+      },
+      resolveProject: async (handle: string): Promise<ProjectRecord> => {
+        if (!deps.projects) {
+          throw new ToolFailure(`no such project: ${handle}`)
+        }
+        const projects = deps.projects
+        const reachable = await readableSpaces()
+
+        // Shared ambiguous-handle error; lists full handles to disambiguate, only
+        // over reachable rows (anti-enumeration).
+        const ambiguous = (matches: readonly ProjectRecord[]): never => {
+          const handles = matches
+            .map((m) => `${deps.spaces.slugOf(m.space) ?? m.space}/${m.slug}`)
+            .join(', ')
+          throw new ToolFailure(
+            `ambiguous project "${handle}" — it matches more than one project; use the full handle (one of: ${handles}).`,
+          )
+        }
+
+        // Alias-history pass, consulted ONLY after the current-slug pass misses:
+        // current > alias, so a stale alias never shadows a live project's current slug.
+        const byAlias = (slug: string, rows: readonly ProjectRecord[]): ProjectRecord[] => {
+          const key = slugify(slug)
+          return key ? rows.filter((r) => r.aliases.some((a) => slugify(a) === key)) : []
+        }
+        const slash = handle.indexOf('/')
+
+        if (slash >= 0) {
+          // Full path `space-slug/slug`: resolve the space slug (or a past-slug
+          // alias) → id; an unreachable space is indistinguishable from "no such
+          // project" (anti-enumeration).
+          const spaceId = deps.spaces.resolveId(handle.slice(0, slash))
+          // Slugify the input into the same space as stored slugs (mint/rename always
+          // slugify), so a non-normalised handle still hits the live current holder
+          // FIRST — else current > alias could be violated and a foreign project's
+          // alias shadow it.
+          const slug = slugify(handle.slice(slash + 1))
+
+          if (!spaceId || !reachable.includes(spaceId)) {
+            throw new ToolFailure(`no such project: ${handle}`)
+          }
+          const rec = await projects.getByHandle(spaceId, slug)
+
+          if (rec) {
+            return rec
+          }
+          // Current-slug miss → alias history.
+          const aliased = byAlias(slug, await projects.listForSpace(spaceId))
+
+          if (aliased.length === 1) {
+            return aliased[0]
+          }
+          if (aliased.length > 1) {
+            ambiguous(aliased)
+          }
+          throw new ToolFailure(`no such project: ${handle}`)
+        }
+        // Bare token, resolved over ONLY reachable spaces (a collision message must
+        // never leak a foreign space's slug). May name a project by slug OR — a ROOT
+        // project's handle collapses to just `<space>` — a reachable space whose root
+        // is marked; gather both and dedup. Slug is normalised; the space/root check
+        // stays on the raw token (a space slug is its own canonical form).
+        const bareSlug = slugify(handle)
+        const bySlug = await projects.findBySlug(bareSlug, reachable)
+        const bareSpaceId = deps.spaces.resolveId(handle)
+        const root =
+          bareSpaceId && reachable.includes(bareSpaceId)
+            ? (await projects.listForSpace(bareSpaceId)).find((r) => r.path === '')
+            : undefined
+        const matches = root ? [root, ...bySlug.filter((m) => m.id !== root.id)] : bySlug
+
+        if (matches.length === 1) {
+          return matches[0]
+        }
+        if (matches.length > 1) {
+          ambiguous(matches)
+        }
+        // No current match → alias history, over the reachable spaces.
+        const aliased = byAlias(bareSlug, await projects.listForSpaces(reachable))
+
+        if (aliased.length === 1) {
+          return aliased[0]
+        }
+        if (aliased.length > 1) {
+          ambiguous(aliased)
+        }
+        throw new ToolFailure(`no such project: ${handle}`)
+      },
+      projectsInSpace: async (space: string): Promise<ProjectRecord[]> =>
+        deps.projects ? deps.projects.listForSpace(space) : [],
+    }
+  }
+
+  return {
+    listTools: (principal) =>
+      (Object.keys(HANDLERS) as ToolName[])
+        // A handler without static metadata yet is simply not surfaced — never a
+        // TypeError on the whole list.
+        .filter((name) => name in TOOL_META)
+        .filter((name) => scopeAllows(principal, toolActions[name] as Action))
+        .map((name) => ({
+          name,
+          description: TOOL_META[name as keyof typeof TOOL_META].description,
+          annotations: TOOL_META[name as keyof typeof TOOL_META].annotations,
+          input: tools[name].input,
+          output: tools[name].output,
+        })),
+
+    callTool: async (principal, name, args) => {
+      const handler = HANDLERS[name as ToolName]
+
+      if (!handler || !(name in TOOL_META)) {
+        return errorResult(`unknown tool: ${name}`)
+      }
+      // Defence in depth: the tools/list filter is visibility; this is the gate — a
+      // hidden tool still 404s here if called.
+      const action = toolActions[name as ToolName] as Action
+
+      if (!scopeAllows(principal, action)) {
+        return errorResult(`your token cannot use the "${name}" tool`)
+      }
+      const parsed = tools[name as ToolName].input.safeParse(args ?? {})
+
+      if (!parsed.success) {
+        const issue = parsed.error.issues[0]
+        const where = issue?.path.length ? `\`${issue.path.join('.')}\`: ` : ''
+        return errorResult(
+          `invalid arguments for ${name} — ${where}${issue?.message ?? 'bad input'}`,
+        )
+      }
+      try {
+        const { markdown, structured } = await handler(ctxFor(principal), parsed.data)
+        // Validate the machine payload against the contract before it leaves (P9
+        // boundary discipline): a drift fails loudly here, never silently corrupts
+        // the agent's context.
+        const out = tools[name as ToolName].output.safeParse(structured)
+
+        if (!out.success) {
+          console.error(`[mcp] ${name} output drift ->`, out.error.issues[0]?.message)
+          return errorResult('internal error: malformed tool response')
+        }
+        // Retrieval audit: fire-and-forget AFTER the answer is built, so capture never
+        // adds latency and a failed append never fails the call.
+        if (deps.retrievalLog) {
+          const row = retrievalRowOf(
+            name as ToolName,
+            principal,
+            parsed.data,
+            out.data as Record<string, unknown>,
+            (deps.now?.() ?? new Date()).toISOString(),
+          )
+
+          if (row) {
+            const append = () => deps.retrievalLog!.append(row)
+            void (deps.runMutation ? deps.runMutation(append) : append()).catch(() => {})
+          }
+        }
+
+        return {
+          content: [{ type: 'text', text: markdown }],
+          structuredContent: out.data as Record<string, unknown>,
+        }
+      } catch (err) {
+        return mapError(err, name)
+      }
+    },
+  }
+}
+
+/** The actionable message for a thrown error, shared by mapError and the batch
+ *  handlers. A ToolFailure carries its own safe message; a domain error keeps its
+ *  guidance (CAS conflict → re-read and retry); anything unexpected is logged and
+ *  reported opaquely (no internal leak). NOT sanitised here — every caller defangs
+ *  its own output. */
+export const toolErrorMessage = (err: unknown, name: string): string => {
+  if (err instanceof ToolFailure) {
+    return err.message
+  }
+  const e = err as {
+    isConflict?: boolean
+    isNotFound?: boolean
+    isToolError?: boolean
+    message?: string
+  }
+
+  if (e.isConflict) {
+    return 'This note changed since you last read it. Re-read it with get_note to get the current versionToken, then retry.'
+  }
+  if (e.isNotFound) {
+    return e.message || 'not found'
+  }
+  if (e.isToolError) {
+    return e.message || 'the request could not be completed'
+  }
+  console.error(`[mcp] ${name} ->`, (err as Error)?.message)
+  return 'internal error'
+}
+
+/** Map a thrown error to an actionable tool-error result (whole-call failure). */
+const mapError = (err: unknown, name: string): ToolResult =>
+  errorResult(toolErrorMessage(err, name))
+
+// ── handlers ────────────────────────────────────────────────────────────────
+
+/** The self-describe list: the tools THIS token can see, each with a one-line
+ *  summary. Cheap insurance for a weak model that skipped the server `instructions`. */
+export const toolsHelpFor = (principal: Principal): ToolHelp[] =>
+  (Object.keys(HANDLERS) as ToolName[])
+    .filter((name) => name in TOOL_META)
+    .filter((name) => scopeAllows(principal, toolActions[name] as Action))
+    .map((name) => {
+      const desc = TOOL_META[name as keyof typeof TOOL_META].description
+      const summary = `${desc.split('. ')[0]}.`.replace(/\.\.$/, '.')
+      return { name, summary }
+    })
+
+/** The live tool registry — its keys are exactly what listTools/callTool surface.
+ *  canon: docs/mcp-gateway.md#tools */
+const HANDLERS: Partial<Record<ToolName, Handler>> = {
+  start_session: handleStartSession,
+  whoami: handleWhoami,
+  get_my_projects: handleGetMyProjects,
+  list_notes: handleListNotes,
+  recent_activity: handleRecentActivity,
+  search: handleSearch,
+  get_note: handleGetNote,
+  recall: handleRecall,
+  remember_about_user: handleRememberUser,
+  create_note: handleCreateNote,
+  remember_about_project: handleRememberProject,
+  edit_note: handleEditNote,
+  delete_note: handleDeleteNote,
+  move_note: handleMoveNote,
+  rename_note: handleRenameNote,
+  move_folder: handleMoveFolder,
+  rename_folder: handleRenameFolder,
+  rename_project: handleRenameProject,
+  link: handleLink,
+  create_notes: handleCreateNotes,
+  link_many: handleLinkMany,
+}

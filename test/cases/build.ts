@@ -1,0 +1,261 @@
+import { compareEvents } from './generators'
+import { getCase } from './registry'
+import { makeRng } from './rng'
+import type {
+  CaseEvent,
+  CaseWorld,
+  ConnectedAppDecl,
+  ContextOrderDecl,
+  ContextSetDecl,
+  DurableImportDecl,
+  ExternalRewriteDecl,
+  FavoriteDecl,
+  JobDecl,
+  MemberDecl,
+  PendingOAuthClientDecl,
+  ProjectDecl,
+  RetrievalDecl,
+  ScopePinDecl,
+  SpaceDecl,
+  UserDecl,
+} from './types'
+
+/** The catalog's fixed determinism anchor — the case's "today" when the caller
+ *  doesn't override it. A stable instant so a fake/visual re-seed is
+ *  byte-reproducible and the heatmap window doesn't drift with the wall clock.
+ *  The REAL applier overrides it with the actual current date so a freshly seeded
+ *  stand shows activity right up to today. */
+export const DEFAULT_NOW = '2026-07-01T12:00:00.000Z'
+
+export type BuildOptions = {
+  /** RNG seed → reproducible generated worlds (the CLI's `SEED`). */
+  seed?: string
+  /** Multiplies generated volume (the CLI's `SCALE`). */
+  scale?: number
+  /** The determinism anchor / "today"; defaults to DEFAULT_NOW. */
+  now?: string
+  /** Content locale for the cases that author per-language copy (the demo case,
+   *  #256); ignored by every other case. */
+  locale?: string
+}
+
+/** Resolve a case name + options into its CaseWorld — the ONE builder both
+ *  appliers call, so the fake and the real stand get the identical world for a
+ *  given (name, seed, scale, now). */
+export const buildCaseWorld = (name: string, opts: BuildOptions = {}): CaseWorld => {
+  const spec = getCase(name)
+  const rng = makeRng(`${name}:${opts.seed ?? 'default'}`)
+  const now = new Date(opts.now ?? DEFAULT_NOW)
+
+  if (Number.isNaN(now.getTime())) {
+    throw new Error(`invalid now: "${opts.now}"`)
+  }
+
+  return spec.build({ rng, scale: opts.scale ?? 1, now, locale: opts.locale })
+}
+
+/** Build ONE OR MANY cases: a comma-separated `spec` combines several catalog
+ *  cases into a single stand (`feed-scroll,trash-mixed,multi-space`). Cases keep
+ *  their own worlds; on overlap they COMPOSE — spaces merge by slug, users/
+ *  projects/members dedup, and per-case logical note-ids + colliding paths are
+ *  disambiguated so nothing silently overwrites. One case = the single world
+ *  unchanged. Both appliers consume the merged world with no special-casing. */
+export const buildCasesWorld = (spec: string, opts: BuildOptions = {}): CaseWorld => {
+  const names = spec
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+
+  if (names.length === 0) {
+    throw new Error('no case named')
+  }
+  if (names.length === 1) {
+    return buildCaseWorld(names[0], opts)
+  }
+
+  return mergeWorlds(names.map((name) => ({ name, world: buildCaseWorld(name, opts) })))
+}
+
+const suffixName = (path: string, n: number): string =>
+  path.replace(/(\.md)?$/, (ext) => `-${n}${ext}`)
+
+/** Compose several cases' worlds into one. Deterministic — no wall-clock, no RNG
+ *  (each world was already built). */
+export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): CaseWorld => {
+  const spaces = new Map<string, SpaceDecl>()
+  const projects = new Map<string, ProjectDecl>()
+  const contextSets: ContextSetDecl[] = []
+  const scopePins: ScopePinDecl[] = []
+  const contextOrder: ContextOrderDecl[] = []
+  const users = new Map<string, UserDecl>()
+  const members = new Map<string, MemberDecl>()
+  const connectedApps = new Map<string, ConnectedAppDecl>()
+  const pendingOAuthClients = new Map<string, PendingOAuthClientDecl>()
+  const favorites = new Map<string, FavoriteDecl>()
+  const retrievals: RetrievalDecl[] = []
+  const jobs: JobDecl[] = []
+  const durableImports: DurableImportDecl[] = []
+  const externalRewrites: ExternalRewriteDecl[] = []
+  const events: CaseEvent[] = []
+  const takenPaths = new Set<string>()
+  let hasAuth = false
+
+  for (const { name, world } of parts) {
+    for (const s of world.spaces) {
+      const prev = spaces.get(s.slug)
+
+      // First declaration wins the identity, but merge flags a later same-slug case
+      // sets (archived / personalFor / displayName) so combining doesn't silently drop
+      // e.g. an archived marker or a personal-domain pointer.
+      if (!prev) {
+        spaces.set(s.slug, s)
+      } else {
+        spaces.set(s.slug, {
+          ...prev,
+          archived: prev.archived || s.archived,
+          personalFor: prev.personalFor ?? s.personalFor,
+          displayName: prev.displayName ?? s.displayName,
+        })
+      }
+    }
+    for (const p of world.projects ?? []) {
+      const key = `${p.space}\0${p.path}`
+
+      if (!projects.has(key)) {
+        projects.set(key, p)
+      }
+    }
+    // Namespace the set's item note-ids to match the namespaced events (spaces/users
+    // aren't namespaced, so homeSpace/attach references pass through unchanged).
+    for (const set of world.contextSets ?? []) {
+      contextSets.push({ ...set, items: set.items.map((id) => `${name}:${id}`) })
+    }
+    // A scope pin's note id is namespaced the same way (its attach targets are spaces/
+    // users/paths, which pass through unchanged).
+    for (const pin of world.scopePins ?? []) {
+      scopePins.push({ ...pin, note: `${name}:${pin.note}` })
+    }
+    // A scope order (#210): a `pin` entry's note is a logical id (namespace it); a `set`
+    // entry references a set by NAME (like homeSpace, passes through). The scope attach
+    // targets (spaces/users/paths) pass through too.
+    for (const ord of world.contextOrder ?? []) {
+      contextOrder.push({
+        ...ord,
+        entries: ord.entries.map((e) =>
+          e.kind === 'pin' ? { kind: 'pin', note: `${name}:${e.note}` } : e,
+        ),
+      })
+    }
+    if (world.auth) {
+      hasAuth = true
+      for (const u of world.auth.users) {
+        const prev = users.get(u.username)
+
+        // First declaration wins, but fill in a personalSpace / admin a later case sets.
+        if (!prev) {
+          users.set(u.username, u)
+        } else {
+          users.set(u.username, {
+            ...prev,
+            admin: prev.admin || u.admin,
+            personalSpace: prev.personalSpace ?? u.personalSpace,
+          })
+        }
+      }
+      for (const m of world.auth.members) {
+        const key = `${m.space}\0${m.username}`
+
+        if (!members.has(key)) {
+          members.set(key, m)
+        }
+      }
+      for (const app of world.auth.connectedApps ?? []) {
+        const key = `${app.owner ?? ''}\0${app.appName}`
+
+        if (!connectedApps.has(key)) {
+          connectedApps.set(key, app)
+        }
+      }
+      for (const client of world.auth.pendingOAuthClients ?? []) {
+        const key = client.clientId ?? `${client.kind}\0${client.clientName}`
+
+        if (!pendingOAuthClients.has(key)) {
+          pendingOAuthClients.set(key, client)
+        }
+      }
+    }
+    for (const e of world.events) {
+      const noteId = `${name}:${e.noteId}` // namespace so two cases' n-1 never clash
+
+      if (e.op === 'create') {
+        let path = e.path
+
+        for (let n = 2; takenPaths.has(`${e.space}\0${path}`); n++) {
+          path = suffixName(e.path, n)
+        }
+        takenPaths.add(`${e.space}\0${path}`)
+        events.push({ ...e, noteId, path })
+      } else {
+        events.push({ ...e, noteId })
+      }
+    }
+    // Favorites (#42/#245): a NOTE ref is a logical id — namespace it exactly like the
+    // events above so it still resolves after the merge; a folder/project ref is a
+    // space-relative PATH, which merge keeps stable (only colliding note FILE basenames
+    // are suffixed, never folder paths / project paths), so it passes through. Dedup by
+    // (space, kind, ref) — two cases starring the same folder/project is idempotent.
+    for (const f of world.favorites ?? []) {
+      const ref = f.kind === 'note' ? `${name}:${f.ref}` : f.ref
+      const key = `${f.space}\0${f.kind}\0${ref}`
+
+      if (!favorites.has(key)) {
+        favorites.set(key, { ...f, ref })
+      }
+    }
+    // Retrieval hits reference notes by logical id — namespace them the same way so a
+    // combined case's audit rows resolve to the right notes (#243).
+    for (const r of world.retrievals ?? []) {
+      retrievals.push({ ...r, hits: r.hits?.map((h) => ({ ...h, note: `${name}:${h.note}` })) })
+    }
+    // Jobs carry no logical note handles — they address a SPACE, and spaces merge by
+    // slug WITHOUT namespacing (see above), so a job's `space` resolves unchanged in a
+    // combined world and the decls concatenate verbatim (#105/#101).
+    for (const j of world.jobs ?? []) {
+      jobs.push(j)
+    }
+    for (const durableImport of world.durableImports ?? []) {
+      durableImports.push(durableImport)
+    }
+    // External rewrites reference logical note handles, so namespace them exactly
+    // like timeline events and retrieval hits.
+    for (const rewrite of world.externalRewrites ?? []) {
+      externalRewrites.push({ ...rewrite, note: `${name}:${rewrite.note}` })
+    }
+  }
+
+  events.sort(compareEvents)
+  return {
+    now: parts[0].world.now,
+    spaces: [...spaces.values()],
+    projects: projects.size ? [...projects.values()] : undefined,
+    contextSets: contextSets.length ? contextSets : undefined,
+    scopePins: scopePins.length ? scopePins : undefined,
+    contextOrder: contextOrder.length ? contextOrder : undefined,
+    auth: hasAuth
+      ? {
+          users: [...users.values()],
+          members: [...members.values()],
+          ...(connectedApps.size ? { connectedApps: [...connectedApps.values()] } : {}),
+          ...(pendingOAuthClients.size
+            ? { pendingOAuthClients: [...pendingOAuthClients.values()] }
+            : {}),
+        }
+      : undefined,
+    events,
+    favorites: favorites.size ? [...favorites.values()] : undefined,
+    ...(retrievals.length ? { retrievals } : {}),
+    ...(jobs.length ? { jobs } : {}),
+    ...(durableImports.length ? { durableImports } : {}),
+    ...(externalRewrites.length ? { externalRewrites } : {}),
+  }
+}

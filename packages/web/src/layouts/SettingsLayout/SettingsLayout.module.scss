@@ -1,0 +1,116 @@
+/* Shared settings chrome (#28) — hosted in PageFrame (which owns the topbar +
+   the horizontal content gutter): a centered column with a left tab rail and the
+   active section. No side padding here — the frame's content-scroll provides it.
+   Serves both the user settings and the per-space workspace settings. */
+
+.inner {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 28px 0 64px;
+}
+
+/* Section pill-bar (#243): the Agents sections (Context | Audit) as a permanent bar
+   above the surface body — the same PillTabs the dashboard uses. Spans the full inner
+   width, over the [scope-rail | panel] split below. */
+.section-tabs {
+  margin-bottom: 24px;
+}
+
+.body {
+  display: grid;
+  grid-template-columns: 176px 1fr;
+  gap: 40px;
+  align-items: start;
+}
+
+/* No left rail (a section with no scope axis, e.g. Agents → Audit): the panel takes
+   the whole width. */
+.body-no-rail {
+  grid-template-columns: 1fr;
+}
+
+.tabs {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  position: sticky;
+  top: 28px;
+}
+
+.tab-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.tab-sep {
+  height: 1px;
+  background: var(--border);
+  margin: 8px 8px 9px;
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 7px 10px;
+  border: 0;
+  font-family: inherit;
+  font-size: 13.5px;
+  font-weight: 550;
+  line-height: 1.25;
+  color: var(--text-dim);
+  text-decoration: none;
+  text-align: left;
+  background: transparent;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+
+  svg {
+    flex: none;
+  }
+
+  &:hover {
+    background: var(--bg-list);
+    color: var(--text);
+  }
+}
+
+.tab-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-on {
+  background: var(--bg-list);
+  color: var(--text);
+}
+
+.panel {
+  min-width: 0;
+}
+
+/* Narrow viewport: drop the tab rail above the panel. */
+@media (max-width: 720px) {
+  .body {
+    grid-template-columns: 1fr;
+    gap: 20px;
+  }
+
+  .tabs {
+    position: static;
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+
+  .tab-group {
+    flex-direction: row;
+  }
+
+  .tab-sep {
+    display: none;
+  }
+}

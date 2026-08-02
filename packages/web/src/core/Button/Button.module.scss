@@ -1,0 +1,48 @@
+/* Text/icon button primitive. Base `.btn` carries layout + size; variants set
+   colour. `icon` makes it square (glyph-only); `active` is the pressed look for
+   ghost buttons whose menu/panel is open (no accent — neutral fill). */
+.btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 32px; padding: 0 13px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  background: var(--bg-elevated);
+  color: var(--text);
+  font-size: 13px; font-weight: 500;
+  transition: background 0.12s, border-color 0.12s;
+}
+.btn:hover { background: var(--bg-hover); }
+
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.primary:hover { filter: brightness(1.05); }
+.btn.primary:disabled { opacity: 0.55; cursor: default; }
+
+.btn.ghost { border-color: transparent; background: transparent; color: var(--text-dim); }
+.btn.ghost:hover { background: var(--bg-hover); color: var(--text); }
+/* Ghost button stays highlighted while its menu/panel is open (e.g. the topbar
+   kebab) — neutral fill + accent glyph. */
+.btn.ghost.active { color: var(--accent); background: var(--bg-hover); }
+
+/* Icon-only buttons are square, not text-width rectangles. */
+.btn.icon { width: 32px; padding: 0; justify-content: center; }
+
+/* Cautionary action (e.g. restore overwrites the current state): a soft warm
+   tint, louder than ghost but not a red alarm. */
+.btn.warning {
+  background: color-mix(in srgb, var(--warning) 14%, var(--bg-elevated));
+  border-color: color-mix(in srgb, var(--warning) 45%, transparent);
+  color: var(--warning);
+}
+.btn.warning:hover {
+  background: color-mix(in srgb, var(--warning) 22%, var(--bg-elevated));
+}
+.btn.warning:disabled { opacity: 0.55; cursor: default; }
+
+/* Solid destructive button — used for the confirm action in danger dialogs. */
+.btn.danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+/* Hover stays red, just a shade darker (same hue) — a solid danger button must
+   not turn grey. */
+.btn.danger:hover {
+  background: color-mix(in srgb, var(--danger) 86%, #000);
+  border-color: color-mix(in srgb, var(--danger) 86%, #000);
+}

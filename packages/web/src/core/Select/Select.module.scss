@@ -1,0 +1,50 @@
+/* Custom select (#28) — the trigger wears the app's input chrome; the option
+   list is a ContextMenu popover (so it's themed, unlike a native select's list). */
+.trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 7px 10px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  outline: none;
+  cursor: pointer;
+
+  &:hover {
+    border-color: var(--border-strong);
+  }
+
+  &:focus-visible {
+    border-color: var(--accent);
+  }
+
+  &.disabled {
+    cursor: default;
+    opacity: 0.5;
+  }
+}
+
+.value {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+}
+
+.chevron {
+  flex: none;
+  color: var(--text-faint);
+  transform: rotate(90deg); /* IconChevron points right → point it down */
+  transition: transform 0.12s ease;
+
+  &.open {
+    transform: rotate(-90deg);
+  }
+}

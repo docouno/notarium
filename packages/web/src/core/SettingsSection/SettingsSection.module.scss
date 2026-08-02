@@ -1,0 +1,66 @@
+/* SettingsSection (#28): the uniform block used by every settings tab — a header
+   (title + optional description, optional right-side action) over its body. */
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  /* Symmetric padding so the divider between sections has equal air on both
+     sides (the next section's border-top is the divider) — content never sticks
+     to the rule. */
+  padding: 22px 0;
+  border-top: 1px solid var(--border);
+
+  /* The first section in a tab sits flush at the top — no rule above it. */
+  &:first-child {
+    padding-top: 0;
+    border-top: none;
+  }
+}
+
+.head {
+  display: flex;
+  /* Top-aligned (NOT centred): a centred control jumps as the description's
+     height changes (e.g. a Memory hint that varies per option). A small offset on
+     the action keeps it off the very top edge, level with the title. */
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 32px;
+}
+
+.head-text {
+  min-width: 0;
+  /* Cap the readable line length — a description never runs the full section
+     width (long lines hurt readability); the action slot takes the rest. */
+  max-width: 70%;
+}
+
+/* When the header text labels a control (htmlFor): the whole block toggles it. */
+.clickable {
+  cursor: pointer;
+  user-select: none;
+}
+
+.title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+
+.desc {
+  margin: 3px 0 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+
+.action {
+  flex-shrink: 0;
+}
+
+/* Only when there's a description: nudge the control down so it reads level with
+   the title text. A title-only section keeps the control top-aligned (no offset). */
+.action-offset {
+  margin-top: 6px;
+}

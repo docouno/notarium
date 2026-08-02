@@ -1,0 +1,130 @@
+// The e2e reset hook (POST /api/__test/reset) swaps the whole fixture world between
+// Playwright specs. Since #127 the fake mints opaque space ids (id ≠ slug, #100 phase 4),
+// so the reset's remove/add dance + the registry mirror that keeps id↔slug
+// translation exact are non-trivial — and ONLY this route exercises them (the other
+// vitest suites build a fresh app per test, never reset). This pins that a fixture
+// swap lands a working id≠slug world (the new space reachable BY ITS SLUG, the wire
+// projecting slugs throughout) and tears the old one down.
+
+import type { FastifyInstance } from 'fastify'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+
+import { createApp, type Fixture } from './app.js'
+
+const base = (): Fixture => ({
+  now: '2026-06-10T12:00:00.000Z',
+  spaces: [
+    {
+      slug: 'main',
+      displayName: 'Main',
+      notes: [
+        {
+          title: 'Main Note',
+          filePath: 'main/Main Note.md',
+          modifiedAt: '2026-06-08T00:00:00.000Z',
+          createdAt: '2026-06-01T00:00:00.000Z',
+          tags: [],
+          content: '# Main Note\n\nlives in main',
+        },
+      ],
+    },
+  ],
+})
+
+// A two-space swap: 'main' survives, 'work' is brand-new (the reset-add path —
+// SpaceManager.add mints its opaque id, the registry mirror picks it up).
+const TWO: Fixture = {
+  now: '2026-06-10T12:00:00.000Z',
+  capabilities: { spaceCreate: true },
+  spaces: [
+    base().spaces[0],
+    {
+      slug: 'work',
+      displayName: 'Work',
+      notes: [
+        {
+          title: 'Work Note',
+          filePath: 'projects/Work Note.md',
+          modifiedAt: '2026-06-09T00:00:00.000Z',
+          createdAt: '2026-06-02T00:00:00.000Z',
+          tags: [],
+          content: '# Work Note\n\nlives in work',
+        },
+      ],
+    },
+  ],
+}
+
+let app: FastifyInstance
+
+beforeEach(async () => {
+  app = await createApp(base())
+})
+afterEach(async () => {
+  await app.close()
+})
+
+const reset = (fixture?: Fixture) =>
+  app.inject({ method: 'POST', url: '/api/__test/reset', payload: fixture ? { fixture } : {} })
+const spacesOf = async (): Promise<Array<{ id: string; slug: string; displayName: string }>> =>
+  (await app.inject({ method: 'GET', url: '/api/spaces' })).json().spaces
+
+describe('reset hook fixture swap (#127: opaque space ids)', () => {
+  it('a fixture swap lands a fresh id≠slug world reachable by slug; reset back removes it', async () => {
+    // Base: one space, already opaque (id ≠ slug).
+    let spaces = await spacesOf()
+    expect(spaces.map((s) => s.slug)).toEqual(['main'])
+    expect(spaces[0].id).not.toBe('main')
+
+    // Swap → main survives, work is added (the reset-add mint path).
+    expect((await reset(TWO)).statusCode).toBe(200)
+    spaces = await spacesOf()
+    expect(spaces.map((s) => s.slug).sort()).toEqual(['main', 'work'])
+    // EVERY space is opaque — the seam holds across a swap, for survivor and newcomer.
+    for (const s of spaces) {
+      expect(s.id).not.toBe(s.slug)
+    }
+
+    // The new space's notes are live and reachable BY ITS SLUG (URL slug → id resolve).
+    const notes = (await app.inject({ method: 'GET', url: '/api/s/work/notes' })).json()
+      .notes as Array<{
+      id: string
+    }>
+    expect(notes.length).toBe(1)
+
+    // A space-FREE note URL (the /n/<id> re-anchor path) resolves the space from the
+    // id (resolveNote → opaque work id) and projects its SLUG, never the raw id.
+    const detail = (
+      await app.inject({ method: 'GET', url: `/api/note?id=${notes[0].id}` })
+    ).json() as {
+      space?: string
+    }
+    expect(detail.space).toBe('work')
+    expect(detail.space).not.toBe(spaces.find((s) => s.slug === 'work')!.id)
+
+    // Reset back to the canonical base → work is torn down, only main remains.
+    expect((await reset()).statusCode).toBe(200)
+    expect((await spacesOf()).map((s) => s.slug)).toEqual(['main'])
+    // …and work is gone from the registry too: its slug no longer resolves a space.
+    expect((await app.inject({ method: 'GET', url: '/api/s/work/notes' })).statusCode).toBe(404)
+  })
+
+  it('re-adding a removed space mints a FRESH opaque id (no stale registry row survives)', async () => {
+    const idOf = async (slug: string) => (await spacesOf()).find((s) => s.slug === slug)?.id
+    expect((await reset(TWO)).statusCode).toBe(200)
+    const work1 = await idOf('work')
+    expect(work1).toBeTruthy()
+
+    // Drop work…
+    expect((await reset(base())).statusCode).toBe(200)
+    expect(await idOf('work')).toBeUndefined()
+
+    // …and bring it back: a brand-new mint, not the resurrected old id.
+    expect((await reset(TWO)).statusCode).toBe(200)
+    const work2 = await idOf('work')
+    expect(work2).toBeTruthy()
+    expect(work2).not.toBe(work1)
+    // The slug still resolves cleanly to exactly the new id (no stale row shadowing).
+    expect((await app.inject({ method: 'GET', url: '/api/s/work/notes' })).statusCode).toBe(200)
+  })
+})

@@ -1,0 +1,24 @@
+// The shared filter facet (#13): head (title + reset) + FolderTree + the per-row
+// context menu — one assembly behind the Feed and the Memory filters so they
+// can't drift. Gutters mirror the topbar's --gutter token (same rhythm as every
+// aside). The FolderTree primitive owns the row anatomy; this owns the chrome.
+.facet {
+  display: flex;
+  flex-direction: column;
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px var(--gutter) 6px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+  font-weight: 600;
+}
+
+.tree {
+  padding: 0 var(--gutter) 12px;
+}

@@ -1,0 +1,491 @@
+/* Left rail (#103, VS Code mechanic) — TWO side-by-side columns: a permanent
+   activity strip (.strip: logo, scope icons, "+", sync + profile) and an optional
+   wide panel (.panel: brand wordmark, space switcher, search, the folder tree),
+   shown by railOpen and resizable. The collapse toggle hides only the panel; the
+   strip is always there. DnD highlight classes (dragging / drop-target / drop-root
+   / context-target) are toggled on the tree rows here. The tree's loading/empty/
+   error skin is the shared widgets/TreeState (#220). */
+
+/* Loading / cold-error / empty for the tree now live in the shared widgets/TreeState
+   skin (#220) — the file tree, the memory tree and the filter can't drift apart. */
+
+/* The rail is two side-by-side columns (#103, VS Code): the permanent activity
+   strip + the optional wide panel. The two zones are told apart by a slight
+   BACKGROUND step (strip darkest, panel a touch lighter) — no divider line — and
+   the rail's outer edge against the content is the one border, on .rail itself. */
+.rail {
+  position: relative;
+  flex: 0 0 auto;
+  background: var(--bg-rail);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: row;
+  height: 100%;
+}
+
+/* The activity strip (VS Code's Activity Bar): a permanent slim column — logo,
+   scope icons, "+", then sync + profile pinned to the foot. The darkest surface
+   (--bg-rail), so it reads as the recessed bar the lighter panel sits beside. */
+.strip {
+  flex: 0 0 auto;
+  /* 47px (not 48): the centred logo lands at the exact same x as the panel's brand
+     wordmark, so the two read as one mark across the seam. */
+  width: 47px;
+  background: var(--bg-rail);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 0 0 10px;
+}
+/* Logo occupies the same chrome-band as the panel head / topbar, so its centre
+   lands at its midpoint, aligned with the topbar icons. */
+.strip .rail-logo { color: var(--accent); height: var(--chrome-h); }
+
+/* The wide panel: brand wordmark, space switcher, search, the file tree. Shown
+   only when railOpen; its width is the resizable bm-rail-w. A hair lighter than
+   the strip (--bg-list) so it lifts off it without a border. */
+.panel {
+  position: relative;
+  flex: 0 0 auto;
+  min-width: 0;
+  background: var(--bg-list);
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+/* Collapsed: hide the panel WITHOUT unmounting it (#103) — keeps the virtualized
+   tree's measurement alive (a remount loses it) and preserves search + scroll. */
+.panel-hidden { display: none; }
+
+/* Right-edge resize handle on the panel (mirrors the aside's left-edge one). */
+.panel-resize {
+  position: absolute; right: -3px; top: 0; bottom: 0; width: 6px;
+  cursor: col-resize; z-index: 6;
+}
+.panel-resize::after {
+  content: ''; position: absolute; top: 0; bottom: 0; left: 50%;
+  width: 2px; transform: translateX(-50%);
+  background: var(--accent); opacity: 0; transition: opacity 0.12s;
+}
+.panel-resize:hover::after { opacity: 0.5; }
+/* Short rule under the logo. -1px so it occupies the same pixel row as the
+   topbar's border-bottom, reading as continuous across rail + content. */
+.rail-strip-sep { width: 28px; height: 1px; margin-top: -1px; background: var(--border); }
+.rail-strip-scopes { display: flex; flex-direction: column; align-items: center; gap: 5px; margin-top: 6px; }
+/* Footer stack (#112), mode-aware: auth = Settings gear over the avatar; no-auth
+   = the standalone sync glyph over the gear. */
+.rail-strip-foot { margin-top: auto; display: flex; flex-direction: column; align-items: center; gap: 5px; }
+
+/* Logo header band matches the chrome-band (--chrome-h) so the brand mark sits on
+   the exact same baseline as the topbar icons. */
+.rail-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: var(--chrome-h);
+  min-height: var(--chrome-h);
+  padding: 0 14px;
+}
+
+.brand {
+  display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0;
+  text-decoration: none; color: inherit; cursor: pointer;
+}
+/* The logo is a link, not a menu row — no hover fill (unlike .icon-btn rows).
+   Higher specificity than .icon-btn:hover so it wins regardless of source order. */
+.icon-btn.rail-logo:hover { background: transparent; color: var(--accent); }
+.brand-name { font-weight: 650; font-size: 15px; letter-spacing: -0.01em; }
+
+.icon-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px; height: 30px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+.icon-btn:hover { background: var(--bg-hover); color: var(--text); }
+/* Active scope (#103): a neutral grey pill + the icon at full contrast (white in
+   dark) — the "current" signal is brightness + a quiet fill, NOT a primary colour.
+   Same fill as :hover, but it persists, so the active scope stays legible unhovered. */
+.icon-btn.on { background: var(--bg-hover); color: var(--text); }
+
+/* Bottom spacing lives on .folders-section (the last child), not here: a flex
+   column scroll container drops its own padding-bottom at the scroll end. */
+/* padding-top clears the floating glass head (its measured height, --panel-head-h,
+   set live in Sidebar.tsx; the 132px fallback ≈ wordmark+switcher+search, used only
+   for the first frame before the measurement lands). NO scrollbar-gutter here — a
+   DELIBERATE divergence from the wide content reader (.content-scroll keeps it so
+   prose never reflows). scrollbar-gutter: stable reserves a bar column at ALL times
+   (even for a 0-width overlay bar), insetting the tree's right edge ~11px past the
+   search box — which sits in the floating head, OUTSIDE the scroll, so it gets no such
+   reserve. Rows and search then stopped at different right lines, and with an overlay
+   bar the reserve was just a hollow gap on the right (#157). Dropping it lets the rows
+   reach the same 8px inset as the search — one shared right line — matching the VS Code
+   explorer idiom this rail follows (full-width rows, an on-demand bar). The bar shows
+   only while the tree overflows: an overlay bar takes no space (no shift); a classic
+   bar (11px, styled in base.scss) insets the rows for as long as it overflows. Either
+   way the glass head still paints over its top. */
+.rail-scroll {
+  flex: 1; overflow-y: auto;
+  padding: var(--panel-head-h, 132px) 8px 0;
+  display: flex; flex-direction: column;
+  /* Keep the tree's scrollbar thumb below the floating glass head (#176) — the same
+     measured band the top padding reclaims, so the bar never hides under the head. */
+  --sb-inset-top: var(--panel-head-h, 132px);
+}
+
+/* The panel's fixed head as ONE frosted band. It floats OVER the scroll (absolute,
+   not inside it) so the glass covers the tree's scrollbar top — same pattern as the
+   content topbar over .main. NO bottom edge here: the hairline+shadow read too dense
+   in the narrow panel (#72 feedback), so it's the frosted material only (`.glass`,
+   no `.glass-edge-*`), toned to the panel surface (--bg-list). */
+.panel-head {
+  position: absolute; top: 0; left: 0; right: 0; z-index: 5;
+  --glass-bg: color-mix(in srgb, var(--bg-list) 72%, transparent);
+  --glass-bg-opaque: var(--bg-list);
+  /* The hairline + soft shadow rise IN PROPORTION to --glass-lift (0→1), the scroll
+     fraction driven by the shared useScrollGlass primitive (#185, unified in #194):
+     flush at the top, fully lifted once the tree has scrolled ~36px under it. This is
+     the edge-only half of the primitive — the .glass fill/blur stay constant (frost
+     is always on in the narrow panel, #72), only the box-shadow tracks the lift. NO
+     transition — the scroll position drives it directly, frame-for-frame. */
+  box-shadow:
+    0 1px 0 0 color-mix(in srgb, var(--glass-border) calc(var(--glass-lift, 0) * 100%), transparent),
+    0 6px 12px -8px rgba(0, 0, 0, calc(var(--glass-lift, 0) * 0.18));
+}
+
+/* The avatar disc — a future profile image; the user glyph by default. */
+.avatar {
+  width: 30px; height: 30px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 50%; overflow: hidden;
+  background: var(--bg-elevated); border: 1px solid var(--border);
+  color: var(--text-dim);
+}
+.avatar img { width: 100%; height: 100%; object-fit: cover; }
+/* The avatar disc is the button (#103 strip-only footer). `position: relative`
+   anchors the sync staleness corner badge it carries now (#112); `--badge-ring`
+   matches the badge's cut-out to the elevated disc it sits on (not the rail). */
+.avatar-btn { position: relative; --badge-ring: var(--bg-elevated); border: none; background: transparent; padding: 0; cursor: pointer; border-radius: 50%; flex-shrink: 0; }
+.avatar-btn:hover .avatar,
+.avatar-btn.menu-open .avatar { border-color: var(--accent); color: var(--text); }
+
+.nav-section { margin-top: 6px; }
+/* The folders section grows to fill the rail so its empty area below the tree is a
+   generous "drop here to move to project root" target. */
+/* The FILES tree is now the only section under the search box (the scope nav moved
+   to the activity strip, #103) — so just a small gap, not the old inter-section 18px.
+   It grows to fill the rail so the empty area below the tree is a generous "drop to
+   project root" target. */
+.folders-section {
+  flex: 1 0 auto; min-height: 90px;
+  margin-top: 4px;
+  padding-bottom: 16px;
+}
+.nav-section-title {
+  font-size: 11px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.06em; color: var(--text-faint);
+  padding: 7px 8px;
+}
+/* The FILES header row (scope picker + collapse/refresh/new) sits directly above
+   the first explorer row, with the tree abutting it flush. Its action buttons fill
+   the row's full height, so their hover pill — and a first row that's hovered/active
+   right below — had no daylight between them and read as one merged fill (#157). A
+   small bottom gap separates the header band from the tree. The virtualizer's
+   scrollMargin is measured live off this box's top, so it follows automatically. */
+/* Lives in the floating glass head now (#31), not the 8px-padded scroll, so it
+   carries its own inset (8px sides, matching the search field + the brand row). */
+.section-head { display: flex; align-items: center; justify-content: space-between; margin: 6px 8px 6px; }
+.section-head .nav-section-title { flex: 1; min-width: 0; }
+/* The view selector (#164): the FILES header doubles as a Files / Projects
+   picker. Minimalist — just the label (no chevron); a hover/open background pill
+   is the only affordance, so it reads as a plain heading until you reach for it.
+   Width hugs the label (not flex:1) so the pill wraps the text, not the whole row. */
+.scope-picker {
+  min-width: 0; max-width: 100%;
+  display: inline-flex; align-items: center;
+  border: none; background: transparent; cursor: pointer;
+  border-radius: var(--radius-sm); padding: 0;
+  color: inherit; text-align: left;
+  transition: background 0.12s ease;
+}
+.scope-picker .nav-section-title {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.scope-picker:hover,
+.scope-picker.menu-open { background: var(--bg-hover); }
+.scope-picker:hover .nav-section-title,
+.scope-picker.menu-open .nav-section-title { color: var(--text-dim); }
+/* The FILES header's action cluster — collapse-all, refresh, new (#98 item 2 / #13). */
+.section-actions { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
+/* Spin the refresh glyph while a tree refresh is in flight (#98 item 2). */
+@keyframes rail-spin { to { transform: rotate(360deg); } }
+.spin { animation: rail-spin 0.8s linear infinite; }
+@media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
+
+.nav-item { position: relative; display: flex; align-items: center; border-radius: var(--radius-sm); }
+.nav-item-btn {
+  flex: 1; min-width: 0;
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 8px;
+  border: none; background: transparent;
+  border-radius: var(--radius-sm);
+  color: var(--text-dim);
+  font-size: 13.5px; text-align: left;
+  text-decoration: none; /* nav items rendered as <a> for native middle-click */
+  cursor: pointer;
+  /* The row pill's fill is INSTANT (#246): the hover / open / selected background snaps, as
+     it always has. The trailing .row-action overlay's FILL snaps with it on the SAME frame
+     (it carries no background transition either), so the two surfaces of one row light and
+     gutter as ONE — the #246 sync — while only the go-to-page ICON reveals with a fade
+     (.row-action svg, below). Deliberately NOT a background transition here: hanging one on
+     this shared base would also fade the .active/.selected EXIT (CSS starts a transition
+     from the after-change style, so a row LOSING the class fades out) and would bleed the
+     fade onto the space-switcher (which reuses .nav-item-btn). Instant keeps the VS Code
+     idiom and #229's instant open-vs-selected colour swap. */
+}
+.nav-item-btn svg { flex-shrink: 0; opacity: 0.85; }
+.nav-item-btn:hover { background: var(--bg-hover); color: var(--text); }
+/* Hovering ANYWHERE on the row lights the full pill (#214) — including the trailing
+   go-to-page overlay, which sits on top of the button and would otherwise steal the
+   button's own :hover and drop the fill. Keeps "hover = full background" as before.
+   background-COLOR (not the `background` shorthand): this selector outranks the
+   `.tree-vrow .nav-item-btn` clip rule, and the shorthand would reset background-clip
+   to border-box — erasing the 1px inter-row breather (the transparent-border inset). */
+.nav-item:hover > .nav-item-btn { background-color: var(--bg-hover); color: var(--text); }
+/* Open note / active surface: the quiet neutral grey pill it has always been — NO
+   accent (the open doc is the COMMON case; the reader already shows what's open, so
+   the tree stays calm). `--bg-hover`, the lightest highlight. Uses background-COLOR,
+   not the `background` shorthand: the shorthand would reset background-clip to
+   border-box and ERASE the 1px inter-row breather (same reason as the hover rule
+   above) — that regression is exactly why selection looked cramped. */
+.nav-item.active > .nav-item-btn {
+  background-color: var(--bg-hover); color: var(--text); font-weight: 500;
+}
+/* Multi-selected rows (#163/#229): a DENSER neutral grey (`--border-strong`) —
+   distinctly heavier than the open note's `--bg-hover`, so "in the set" reads apart
+   from "open" WITHOUT any accent tint (#103's neutral VS Code language holds). This
+   is the #229 fix: before, `.active` and `.selected` shared one grey and were
+   indistinguishable. Applies to notes AND folders — a folder gets a selection
+   highlight ONLY here (a plain folder click never selects; canon §3). Also
+   background-color, so the inter-row gap survives; toggling the open note into the
+   set is now visible — its light pill deepens to the set's grey. */
+.nav-item.selected > .nav-item-btn {
+  background-color: var(--border-strong); color: var(--text); font-weight: 500;
+}
+.nav-item.selected > .nav-item-btn.note-row { color: var(--text); }
+.nav-item.selected > .nav-item-btn svg { opacity: 0.9; }
+/* Open AND in the set (both at once): the set's deeper grey wins the fill, and a
+   NEUTRAL left border (the ::before) marks THIS row as the open one within the set —
+   so "both" reads apart from a plain selected row, still with no accent. The bar
+   lives in the button's padding box (position:absolute → inside the 1px transparent
+   border), so the inter-row gap is untouched (an inset box-shadow would bleed onto it). */
+.nav-item.active.selected > .nav-item-btn {
+  position: relative;
+  background-color: var(--border-strong);
+}
+.nav-item.active.selected > .nav-item-btn::before {
+  content: '';
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 2px;
+  background: var(--text-dim);
+  border-radius: var(--radius-xs);
+}
+
+/* `--row-fill` mirrors the row's CURRENT pill colour so the trailing go-to-page
+   overlay (.row-action, folder rows) can paint FROM it — the icon then continues the
+   row's real fill in every state, masking a long name's tail AND never punching a
+   lighter box over the denser selected grey. Kept in step with the .nav-item-btn
+   background rules above; ties resolve by source order, so selected (denser) is listed
+   last and wins over hover/active on a hovered selected row. */
+.nav-item { --row-fill: transparent; }
+.nav-item:hover,
+.nav-item.active { --row-fill: var(--bg-hover); }
+.nav-item.selected,
+.nav-item.active.selected { --row-fill: var(--border-strong); }
+.nav-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Inline go-to-page action on a folder row (#214): a quiet trailing icon that opens
+   the folder's page while the row body stays a toggle. It's a FULL-HEIGHT overlay
+   flush to the row's right edge (not a small floating chip — that read as a cropped
+   stub), so it fills the pill's corner cleanly. Transparent at rest; the row's hover
+   fill shows through it continuously, and hovering the icon itself adds a lighter wash
+   on top. Hidden until the row is hovered or the link is keyboard-focused (VS Code's
+   inline-action language). pointer-events off while hidden so it can't swallow a click. */
+.row-action {
+  position: absolute;
+  top: 1px; bottom: 1px; right: 0;   /* full row height, matching the pill's 1px inset */
+  width: 30px;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--text-dim);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;        /* aligns with the pill's right corners */
+  background-color: transparent;
+  pointer-events: none;
+  /* The FILL is INSTANT — no background transition — so it snaps to var(--row-fill) on the
+     SAME frame as the row pill (.nav-item-btn, also instant): the two surfaces light and
+     gutter as one, the #246 sync. The ICON's hide/reveal is the only animated part, moved
+     onto the <svg>'s own opacity (below). Before, the reveal rode the OVERLAY's element
+     opacity 0→1, which multiplied the background's own 0.12s fade — so the corner filled
+     over time and lagged the instantly-lit row (the #246 desync). */
+}
+/* The icon's opacity is the only thing that animates during the hover-fill reveal (#246):
+   hidden at rest, it fades in/out over 0.08s (VS Code inline-action reveal, #214) while the
+   FILLS around it snap instantly. Opacity lives HERE, on the glyph — not on the overlay — so
+   the overlay's background can stay instant and in lockstep with the pill. 0.85 is the
+   revealed dim. (The folder chevron rotate is a separate row animation, unrelated to #246.) */
+.row-action svg { opacity: 0; transition: opacity 0.08s; }
+/* Revealed on row hover / keyboard focus. Its background is the row's CURRENT fill
+   (var(--row-fill)) so the icon CONTINUES the pill in every state: it masks the tail
+   of a long, ellipsis-truncated folder name AND never punches a lighter box over the
+   denser selected grey. A hardcoded `--bg-hover` got BOTH wrong — it punched through a
+   selected row (its fill is `--border-strong`, the #229 bug) and, if dropped to
+   transparent, let the name tail collide with the glyph. --row-fill matches whatever
+   the pill is. Only hovering the icon itself adds a wash (below). CONSCIOUS minor: on
+   a PLAIN (unfilled) folder, keyboard-focusing the icon reveals it over a transparent
+   --row-fill, so a very long name's tail can show through — hover and every filled
+   state (active / selected) mask correctly; a solid backdrop here would mis-tint a
+   selected row, so it's left as-is. */
+.nav-item:hover .row-action,
+.row-action:focus-visible { pointer-events: auto; background-color: var(--row-fill); }
+/* Reveal the glyph itself (opacity is on the <svg>, decoupled from the fill above). */
+.nav-item:hover .row-action svg,
+.row-action:focus-visible svg { opacity: 0.85; }
+/* Icon's own hover: a lighter wash, mixed OVER the row's current fill so the delta
+   stays visible on the light --bg-hover AND the denser --border-strong alike (a
+   hardcoded --bg-hover base washed out against a selected folder's fill). Outranks the
+   reveal rule above so it wins while the row is hovered. */
+.nav-item:hover .row-action:hover { background-color: color-mix(in srgb, var(--text) 12%, var(--row-fill)); color: var(--text); }
+.row-action:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+/* Project-folder glyph (#13/#164): the briefcase replaces the folder icon in
+   place (left of the name) — the SHAPE is the only signal; no accent tint (it
+   inherits the row's icon colour, same as a plain folder) and no side badge or
+   row-geometry change (the row height stays pinned, .tree-vrow). */
+.project-icon { flex-shrink: 0; display: flex; align-items: center; }
+/* Skeleton parity: the shimmer bar is centred inside a real label's line box
+   (1lh of the inherited font), so a skeleton row's height equals a loaded
+   row's exactly — the listing lands without a jump. */
+.note-skeleton-label { height: 1lh; display: flex; align-items: center; }
+
+/* File leaves in the tree: a touch lighter than folders so structure reads first. */
+.nav-item-btn.note-row { font-weight: 400; }
+.nav-item-btn.note-row svg { opacity: 0.55; }
+.nav-item.active > .nav-item-btn.note-row { color: var(--text); font-weight: 500; }
+.nav-item.active > .nav-item-btn.note-row svg { opacity: 0.9; }
+
+/* ---- Virtualized tree (#64) -------------------------------------------- */
+/* The flat row list: container sized to the virtual total, rows translated to
+   their measured offsets. Sized for 10k+ notes — only the viewport mounts. */
+.tree-virtual { position: relative; width: 100%; }
+/* The windowed rows render in normal flow inside this one offset container (a
+   single fractional translateY), so adjacent rows abut at any zoom — see the
+   note in Sidebar.tsx (#68 item 7). */
+.tree-window { position: absolute; top: 0; left: 0; width: 100%; }
+/* Fixed row height — MUST equal EXPLORER_ROW_HEIGHT (the virtualizer's estimate)
+   in ExplorerVirtualRows.tsx. Pinning it in CSS (not letting it be content-driven) is what makes
+   the virtualizer's total === the rendered rows at any zoom/font, so the last row
+   never overruns and eats the section's bottom padding. The 13.5px text sits well
+   inside 29px (14px padding + 15px line); `overflow: hidden` clips any sub-pixel
+   spill so it can't push the next row. (#68 item 7) */
+.tree-vrow { width: 100%; height: 29px; line-height: 15px; overflow: hidden; }
+/* The row wrapper fills the whole fixed row so the hover/active/drop-target pill
+   covers the row cleanly (no gap at the row edges). */
+.tree-vrow .nav-item { height: 100%; }
+/* The pill spans the FULL row height so the whole row is the click target (#103),
+   but its BACKGROUND is inset 1px top/bottom via a transparent border + clip, so two
+   adjacent rounded pills get a 1px breather instead of touching — the border is part
+   of the hit area, so nothing becomes unclickable. `height: 100%` pins it to the
+   row's 29px (a <button>'s UA `line-height: normal` can't make it taller and shave the
+   rounded corner against the row's `overflow: hidden` — the #68 item 7 bug). `line-height:
+   18` (was 15) stops `.nav-label`'s `overflow: hidden` clipping descenders (g, p, y);
+   the icon+label are flex-centred, so none of this changes the 29px row height (the
+   virtualizer's pinned estimate). */
+.tree-vrow .nav-item-btn {
+  height: 100%;
+  line-height: 18px;
+  padding-top: 0;
+  padding-bottom: 0;
+  border-top: 1px solid transparent;
+  border-bottom: 1px solid transparent;
+  background-clip: padding-box;
+}
+
+/* ---- Drag-and-drop (move notes/folders in the tree) -------------------- */
+.nav-item-btn[draggable='true'] { cursor: pointer; }
+/* Dim the item being dragged (source feedback). */
+.nav-item.dragging { opacity: 0.4; }
+/* The drop target lights ONLY the target folder's own row — a neutral grey fill
+   + a solid grey OUTLINE (VS Code-style, #103). Hovering a child resolves the
+   target to its parent folder, so that folder's row lights, not the child — we no
+   longer wash the whole subtree per-row (the stacked rounded pills looked ragged).
+   The outline (not colour) is what makes the target unambiguous to aim at. */
+.nav-item.drop-target {
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+}
+.nav-item.drop-target > .nav-item-btn { color: var(--text); }
+/* A note that just landed at its new spot via an optimistic move (#94) — a brief
+   neutral wash that fades out, confirming "it moved here". Skipped for reduced motion. */
+@keyframes just-moved {
+  from { background: var(--bg-hover); }
+  to { background: transparent; }
+}
+.nav-item.just-moved > .nav-item-btn {
+  animation: just-moved 0.9s ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .nav-item.just-moved > .nav-item-btn { animation: none; }
+}
+/* Highlight the root zone (the whole Folders section) on drop — same neutral
+   fill + outline as a folder target, just at section scale. */
+.nav-section.drop-root {
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  border-radius: var(--radius-md);
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+}
+
+/* ---- Right-click context target + inline rename ------------------------ */
+/* The row whose context menu is open gets a subtle outline (VS Code-style). */
+.nav-item.context-target {
+  background: var(--bg-hover);
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+  border-radius: var(--radius-sm);
+}
+.rename-input {
+  flex: 1; min-width: 0;
+  padding: 1px 5px;
+  font: inherit; font-size: 13.5px;
+  color: var(--text);
+  background: var(--bg-elevated);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-xs);
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.chev-btn {
+  display: flex; align-items: center; justify-content: center;
+  width: 18px; height: 26px;
+  border: none; background: transparent; color: var(--text-faint);
+  flex-shrink: 0;
+}
+.chev-btn:hover { color: var(--text); }
+.chev-spacer { width: 18px; flex-shrink: 0; }
+.chev { display: flex; transition: transform 0.12s ease; }
+.chev.open { transform: rotate(90deg); }
+
+/* Space switcher (#16): a compact row between the brand and the search box. */
+/* Same 8px inset as the nav rows / tree below, so the switcher's hover fill aligns
+   with them. */
+.space-switcher { padding: 2px 8px 0; }
+.space-switcher-btn {
+  width: 100%;
+  font-weight: 600;
+  &.menu-open { background: var(--bg-hover); }
+}
+.space-switcher-chev { margin-left: auto; display: inline-flex; opacity: 0.55; transform: rotate(90deg); }

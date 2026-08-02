@@ -1,0 +1,513 @@
+# Notarium CI — GitLab side.
+#
+# This file is an ADAPTER, not the contract. What a gate actually runs lives in
+# package.json scripts, so a second provider can call the same commands without
+# reimplementing them in a second YAML that nobody diffs against this one. If a step
+# here is anything more interesting than `npm run <script>`, that is a smell: the
+# logic belongs in a repo script.
+#
+# Two lanes, deliberately different in cost and in what they promise:
+#
+#   lean      — the fast contract on the no-vector profile. What every change gets.
+#   extended  — the full-dependency, live-service, browser and image layers. Runs on
+#               the events that can change its answer — a release tag, a rehearsal
+#               tag, or a change landing on the default branch — and on demand
+#               anywhere else.
+#
+# STAGES ARE BARRIERS, and that is the whole reason the lean jobs share one. Split
+# across stages, a lint error would mean the tests never run and you would learn
+# about a type error only on the next push. Jobs that should report together sit
+# together; stages separate only real dependencies: code is green, THEN the built
+# image proves itself, THEN anything is published, THEN it is rolled out.
+#
+# `deploy` is declared and empty on purpose: rolling a build out is currently an
+# operator step rather than a job, and YAML that cannot run is not a head start.
+#
+# What the runner has to provide, and the rest of the reasoning: docs/ci.md
+
+workflow:
+  rules:
+    # One pipeline per change: the MR pipeline, not also a duplicate branch pipeline.
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+    # Two tag shapes carry meaning, and only these two: `vX.Y.Z` / `vX.Y.Z-rc.N` is a
+    # release, `ci/<label>` is a disposable rehearsal of the full gate. Any other tag
+    # is a bookmark and gets no pipeline — a bare `$CI_COMMIT_TAG` here would make
+    # every bookmark fire the 40-minute heavy lane.
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-rc\.\d+)?$/
+    - if: $CI_COMMIT_TAG =~ /^ci\//
+    - if: $CI_PIPELINE_SOURCE == "web"
+
+stages: [lean, extended, verify, release, deploy]
+
+default:
+  interruptible: true
+
+# npm's own cache, keyed by the lockfile. NOT node_modules — restoring a tree of
+# symlinked workspaces from a tarball is slower and less honest than `npm ci`.
+.npm-cache:
+  variables:
+    npm_config_cache: .npm
+  cache:
+    key:
+      files: [package-lock.json]
+    paths: [.npm]
+
+# dind over TLS. Needs /certs/client shared between this container and the service,
+# which is a runner-config property rather than a job one — see docs/ci.md. Only lanes
+# that BUILD images need it: the browser lane runs in the Playwright image directly,
+# because inside dind that image would be re-pulled on every run (2.3 GB).
+.dind:
+  image: docker:27-cli
+  services:
+    - name: docker:27-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: /certs
+    DOCKER_TLS_VERIFY: '1'
+    DOCKER_CERT_PATH: /certs/client
+
+# The heavy lanes build multi-gigabyte images. At full executor concurrency they would
+# peak at tens of gigabytes of transient layers; serialised, one at a time is bounded.
+.heavy:
+  resource_group: heavy
+
+# WHEN the extended lane runs, by EVENT — never on a timer. Its inputs are pinned (base
+# image by digest, dependencies by lockfile), so the same commit renders the same answer
+# a week later; what changes the answer is a change landing or a release being cut.
+#
+# The on-demand fallback is deliberately allow_failure: a BLOCKING manual job leaves
+# every pipeline sitting unfinished, waiting for a click nobody owes it.
+.extended-rules:
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-rc\.\d+)?$/
+    - if: $CI_COMMIT_TAG =~ /^ci\//
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - when: manual
+      allow_failure: true
+
+# --- lean --------------------------------------------------------------------
+# The verdicts a change gets share ONE stage, so a single push reports all of them. They
+# each pay their own `npm ci`, which the npm cache makes cheap; what that buys is that a
+# lint error no longer hides whether the tests pass.
+.lean:
+  stage: lean
+  extends: .npm-cache
+  # node:24, NOT node:24-slim: `npm test` drives the real Makefile in
+  # test/backup/makefile.test.ts, and slim ships no make — the suite fails there on an
+  # archive that was never produced.
+  image: node:24
+  before_script:
+    # Run UNPRIVILEGED. The data-root boot guard is covered by tests that chmod a
+    # directory to 0o500 and require the write to be refused — root ignores that, so as
+    # root the guard silently proves nothing. GitLab clones as root, hence the chown.
+    - chown -R node:node "$CI_PROJECT_DIR"
+    - su node -c 'npm run deps:lean'
+  after_script:
+    # Hand the checkout back: the build directory is per runner slot, not per job, so an
+    # ownership change outlives the job that needed it. A later job on the same slot
+    # would inherit a tree owned by uid 1000 while running as root, and git 2.35+ refuses
+    # such a repository outright ("detected dubious ownership").
+    - chown -R root:root "$CI_PROJECT_DIR" || true
+
+# Cheapest signal, and the one a contributor is most likely to trip. Kept as separate
+# lines so the log names the failing check rather than a shell chain.
+lean:static:
+  extends: .lean
+  script:
+    - su node -c 'npm run format:check'
+    - su node -c 'npm run canon:check'
+    - su node -c 'npm run meta-migrations:check'
+    - su node -c 'npm run lint'
+    - su node -c 'npm run typecheck'
+
+lean:unit:
+  extends: .lean
+  script:
+    - su node -c 'npm test'
+
+# Answers, in seconds, the one question whose answer otherwise arrives forty minutes
+# later: can this ref publish at all? The registry credential is a protected variable,
+# so on a tag that is not protected it does not exist — and without this job you learn
+# that only after the whole gate has run and you have already pressed the button.
+lean:release-preflight:
+  stage: lean
+  image: alpine:3
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-rc\.\d+)?$/
+  script:
+    - |
+      if [ -z "$DOCKERHUB_TOKEN" ]; then
+        echo "preflight: DOCKERHUB_TOKEN is not visible on this ref."
+        echo "preflight: it is a protected variable, so the tag pattern has to be protected too."
+        exit 1
+      fi
+      echo "preflight: release credential is present on this ref"
+
+# Proves the production bundle compiles. Independent of the suite — a change can break
+# exactly one of the two, and each should say so on its own.
+lean:build:
+  extends: .lean
+  script:
+    - su node -c 'npm run build'
+
+# --- extended ----------------------------------------------------------------
+# The full dependency profile is not optional here: the license corpus validates the
+# complete production tree, and the vector suites need the native stack. The Dockerfile's
+# `test` stage already is that environment, and building it proves the production build
+# on the way through `builder`.
+extended:unit:
+  stage: extended
+  extends: [.dind, .heavy, .extended-rules]
+  script:
+    - docker build --target test -t "notarium-test:$CI_COMMIT_SHORT_SHA" -f docker/Dockerfile .
+    # Makefile, scripts/ and README.md are kept OUT of the image on purpose — they are
+    # tooling and docs the product does not ship — but the suite needs all three: the
+    # backup tests drive the real Makefile, the release and seed tests import
+    # scripts/*.mjs, and the preview suite derives its headline from README.md rather
+    # than keeping a second copy of it. They go into the CONTAINER, never into the image.
+    # Under dind the daemon cannot see this checkout, so they travel over the API.
+    # Keep this list and the Makefile's in step.
+    - docker create --name "notarium-test-run-$CI_JOB_ID" --entrypoint npm "notarium-test:$CI_COMMIT_SHORT_SHA" run test:coverage
+    - docker cp ./Makefile "notarium-test-run-$CI_JOB_ID:/app/Makefile"
+    - docker cp ./scripts "notarium-test-run-$CI_JOB_ID:/app/scripts"
+    - docker cp ./README.md "notarium-test-run-$CI_JOB_ID:/app/README.md"
+    - docker start --attach "notarium-test-run-$CI_JOB_ID"
+  after_script:
+    - docker rm -f "notarium-test-run-$CI_JOB_ID" || true
+    - docker image rm -f "notarium-test:$CI_COMMIT_SHORT_SHA" || true
+
+# The live-dialect contracts. No dind: Postgres is an ordinary service on the job's
+# network, which is what the Makefile target builds a whole disposable Compose topology
+# to simulate locally.
+extended:postgres:
+  stage: extended
+  extends: [.npm-cache, .extended-rules]
+  image: node:24-slim
+  services:
+    - name: postgres:16-alpine
+      alias: postgres
+  variables:
+    POSTGRES_USER: notarium
+    POSTGRES_PASSWORD: notarium
+    POSTGRES_DB: notarium_test
+    TEST_PG_URL: postgres://notarium:notarium@postgres:5432/notarium_test
+  script:
+    - npm run deps:lean
+    # GitLab starts services but does not wait for them to be ready, and a suite that
+    # loses that race reads as a broken contract rather than a cold database. Poll the
+    # port with what the image already has instead of adding a client just to wait.
+    - |
+      node -e '
+        const net = require("node:net")
+        const deadline = Date.now() + 60_000
+        const attempt = () => {
+          const socket = net.connect(5432, "postgres")
+          socket.on("connect", () => { socket.end(); process.exit(0) })
+          socket.on("error", () => {
+            socket.destroy()
+            if (Date.now() > deadline) { console.error("postgres never accepted a connection"); process.exit(1) }
+            setTimeout(attempt, 500)
+          })
+        }
+        attempt()
+      '
+    - npm run test:pg
+
+# The pinned Playwright image IS the job image: the runner pulls it to its host once and
+# reuses it, and the render matches the baselines because the browser, fonts and system
+# libraries are the ones the image ships.
+extended:e2e:
+  stage: extended
+  extends: [.npm-cache, .extended-rules]
+  image: mcr.microsoft.com/playwright:v1.60.0-jammy
+  variables:
+    CI: '1'
+  script:
+    - npm run deps:lean
+    - npm run e2e
+  artifacts:
+    when: always
+    expire_in: 3 days
+    # Traces and screenshots of the running product. `all` would hand them to anyone who
+    # can read the repository, which is the wrong default once it is public.
+    access: developer
+    paths:
+      - playwright-report/
+      - test-results/
+
+# Visual regression against the canonical baselines in private object storage.
+#
+# The candidate slug carries the exact commit, which is what makes an approval expire by
+# construction: push a new commit and the approve job addresses a candidate that does not
+# exist, rather than silently blessing different pixels.
+#
+# Reader credentials are enough to compare. Publishing a candidate needs the writer, which
+# is a protected variable and therefore absent on ordinary branches — so the job degrades
+# honestly: it still fails on a difference, it just cannot offer a review page.
+extended:visual:
+  stage: extended
+  extends: [.npm-cache, .extended-rules]
+  image: mcr.microsoft.com/playwright:v1.60.0-jammy
+  variables:
+    CI: '1'
+    VISUAL_CANDIDATE: $CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
+    # What the run decided is read from Playwright's own report, not from the files it
+    # left behind: an attempt that PASSES writes no artefact, so a directory walk sees
+    # only the failed attempt of a flaky cell and publishes it as a change.
+    PLAYWRIGHT_JSON_OUTPUT_NAME: visual-report.json
+  # This job SUCCEEDS even when the pixels differ, and that is not laxity — the verdict
+  # lives in visual:gate below. GitLab hands a later stage the artefacts only of jobs
+  # that succeeded, and `needs:` on a failed job skips the dependant outright, so "the
+  # failing job publishes the candidate" is not expressible. Inverting it is: the job
+  # that renders and publishes succeeds at exactly that, and a separate job carries the
+  # pass/fail.
+  script:
+    - npm run deps:lean
+    - VISUAL_S3_KEY_ID="$VISUAL_S3_READ_KEY_ID" VISUAL_S3_SECRET="$VISUAL_S3_READ_SECRET"
+      node scripts/visualBaseline.mjs pull
+    - |
+      set +e
+      npx playwright test test/visual --reporter=list,json
+      set -e
+      if [ -n "$VISUAL_S3_WRITE_KEY_ID" ]; then
+        VISUAL_S3_KEY_ID="$VISUAL_S3_WRITE_KEY_ID" VISUAL_S3_SECRET="$VISUAL_S3_WRITE_SECRET" \
+          node scripts/visualBaseline.mjs publish \
+            --candidate "$VISUAL_CANDIDATE" --commit "$CI_COMMIT_SHA" --pipeline "$CI_PIPELINE_ID"
+      else
+        echo "visual: no writer credentials on this ref — comparison only, no candidate"
+        node scripts/visualBaseline.mjs verdict
+      fi
+  artifacts:
+    when: always
+    expire_in: 3 days
+    access: developer
+    reports:
+      dotenv: review.env
+    paths:
+      - playwright-report/
+      - test-results/
+
+# The verdict, and the only thing here that is allowed to be red. It reads what the
+# comparison published as dotenv variables, so it needs no artefacts, no image and no
+# credentials.
+#
+# TWO numbers, because they are two different verdicts. Pixels that moved are looked at
+# and accepted; a test that failed without producing a screenshot has nothing to accept
+# and is simply a red suite. Collapsing them would let a timeout pass for "no diffs".
+#
+# Two mechanisms, because they answer different halves:
+#
+#   rules  — WHERE the job appears. The same events as the comparison, so a merge request
+#            that only ran lean carries no visual verdict at all rather than a green one.
+#            Spelled out instead of extending .extended-rules: this job runs `always` and
+#            that rule set does not.
+#   needs  — WHETHER it can speak. Tied to the comparison, so a run that died before
+#            reporting skips the gate instead of reading an empty dotenv as zero.
+visual:gate:
+  stage: verify
+  image: node:24-slim
+  needs: ['extended:visual']
+  # `always`, not `on_success`: a red e2e in the same stage must not swallow the pixel
+  # verdict — the two report on different things.
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-rc\.\d+)?$/
+      when: always
+    - if: $CI_COMMIT_TAG =~ /^ci\//
+      when: always
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: always
+    - when: manual
+      allow_failure: true
+  script:
+    - |
+      if [ "${VISUAL_FAILURES:-0}" != "0" ]; then
+        echo "visual: $VISUAL_FAILURES test(s) failed without a screenshot — this is not a pixel change."
+        echo "visual: read extended:visual's log; accepting a baseline will not fix it."
+        exit 1
+      fi
+      if [ "${VISUAL_DIFFS:-0}" != "0" ]; then
+        echo "visual: $VISUAL_DIFFS cells differ from the accepted baseline."
+        echo "visual: review page — $VISUAL_REVIEW"
+        echo "visual: open it out of the bucket, and run visual:accept if the new rendering is right."
+        exit 1
+      fi
+      echo "visual: matches the accepted baseline"
+
+# Generates the FIRST baseline set, in the canonical image, on the runner that will be
+# checking it. Deliberately not seeded from a developer machine: doing it here means the
+# question "does this host render like the runner" never has to be asked.
+extended:visual-bootstrap:
+  stage: extended
+  extends: .npm-cache
+  image: mcr.microsoft.com/playwright:v1.60.0-jammy
+  # Offered only where a baseline may legitimately be born: the default branch, or a
+  # rehearsal tag standing in for it. This is the one button in the contour that REPLACES
+  # the canonical set rather than proposing a candidate for review.
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: true
+    - if: $CI_COMMIT_TAG =~ /^ci\//
+      when: manual
+      allow_failure: true
+  variables:
+    CI: '1'
+    VISUAL_CANDIDATE: $CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
+    VISUAL_S3_KEY_ID: $VISUAL_S3_WRITE_KEY_ID
+    VISUAL_S3_SECRET: $VISUAL_S3_WRITE_SECRET
+  script:
+    - npm run deps:lean
+    - npx playwright test test/visual --update-snapshots
+    - node scripts/visualBaseline.mjs publish
+      --candidate "$VISUAL_CANDIDATE" --commit "$CI_COMMIT_SHA" --pipeline "$CI_PIPELINE_ID" --bootstrap
+
+# --- verify ------------------------------------------------------------------
+# Where the built ARTEFACT proves itself, as opposed to the source. Its own stage because
+# the dependency is real: there is no point interrogating an image built from code whose
+# own suite is red.
+
+# The one privileged act in the whole visual lane, and it does nothing but move a pointer
+# at pixels that were rendered, uploaded and looked at earlier. No render, no recompute —
+# approving something other than what was reviewed is the failure this separation exists
+# to make impossible. It addresses the candidate by commit, so it cannot bless a newer
+# push by accident.
+visual:accept:
+  stage: verify
+  image: node:24-slim
+  when: manual
+  # `artifacts: false` because this job addresses the candidate by slug and reads nothing
+  # the comparison left behind.
+  needs:
+    - job: extended:visual
+      artifacts: false
+  variables:
+    VISUAL_CANDIDATE: $CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
+    VISUAL_S3_KEY_ID: $VISUAL_S3_WRITE_KEY_ID
+    VISUAL_S3_SECRET: $VISUAL_S3_WRITE_SECRET
+  script:
+    # No install: the protocol is two dependency-free modules over node's own crypto.
+    - node scripts/visualBaseline.mjs accept --candidate "$VISUAL_CANDIDATE"
+
+# Destructive backup → fresh-volume restore against the real runtime image. The smoke
+# driver is plain Node over the docker CLI, so the image only needs a node binary added
+# to the docker client.
+verify:backup-smoke:
+  stage: verify
+  extends: [.dind, .heavy, .extended-rules]
+  script:
+    - apk add --no-cache nodejs
+    - docker build --target runtime -t "notarium-backup-smoke:$CI_COMMIT_SHORT_SHA" -f docker/Dockerfile .
+    - BACKUP_SMOKE_IMAGE="notarium-backup-smoke:$CI_COMMIT_SHORT_SHA" node test/backup/smoke.mjs
+  after_script:
+    - docker image rm -f "notarium-backup-smoke:$CI_COMMIT_SHORT_SHA" || true
+
+# The release entrypoint's own drill: the real `scripts/releaseImage.mjs`, publishing a
+# pre-release into a throwaway registry. It needs no external credentials and publishes
+# nothing public, which is exactly why it can run on every extended pass — the parts it
+# covers (the immutability gate, the digest read-back, the version→latest ordering, the
+# live /api/about interrogation) would otherwise be met for the first time during a real
+# release.
+#
+# The driver owns the registry topology, because the driver is what knows where the
+# daemon is — see test/release/smoke.mjs. The registry has to stay addressable as
+# `localhost`: that is the one name both halves of the flow accept over plain HTTP, and
+# the client-side half (`buildx imagetools inspect`) has no --insecure flag at all.
+verify:release-smoke:
+  stage: verify
+  extends: [.dind, .heavy, .extended-rules]
+  script:
+    # git for `git archive` (the build context is the revision, never the checkout); npm
+    # because the release gate re-audits the EXPORTED dependency graph before it builds.
+    - apk add --no-cache nodejs npm git
+    # The build directory belongs to the runner slot and is walked by jobs running as
+    # different users, and git 2.35+ refuses a repository whose owner is not the current
+    # user. A lane that reads the revision has to say out loud that this directory is
+    # trusted — otherwise which slot it lands on decides whether it passes.
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
+    - node test/release/smoke.mjs
+
+# --- release -----------------------------------------------------------------
+# Publishing is a HUMAN act on a tree the gate has already passed. Being in this stage is
+# what enforces that: `release` runs after `verify`, so a red gate means the button is
+# never reachable — nothing has to cross-check "was this revision verified", because the
+# run that verifies it is the run that publishes it.
+#
+# The credential is a protected variable, so it does not exist on an unprotected ref by
+# construction. The lane checks for it explicitly anyway: an empty token would otherwise
+# reach `docker login` and fail with an authentication error, which reads like a wrong
+# password rather than "you are on the wrong ref".
+#
+# allow_failure: false is NOT redundant. A `when: manual` rule defaults to allowing
+# failure, and a release that fails while the pipeline stays green is exactly the wrong
+# way round.
+#
+# interruptible: false, against the global default. The window auto-cancel would land in
+# is the one scripts/releaseImage.mjs calls past the point of no return: killed between
+# the push and the record, a candidate is published whose digest exists nowhere, because
+# release.json is the only place it is written down.
+.release-lane:
+  stage: release
+  extends: [.dind, .heavy]
+  interruptible: false
+  before_script:
+    - apk add --no-cache nodejs npm git
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
+    - |
+      if [ -z "$DOCKERHUB_TOKEN" ]; then
+        echo "release: no Docker Hub credential here — DOCKERHUB_TOKEN is protected and this ref is not."
+        exit 1
+      fi
+    - echo "$DOCKERHUB_TOKEN" | docker login -u "${DOCKERHUB_USER:-docouno}" --password-stdin
+  after_script:
+    - docker logout || true
+  # The record carries the published tag and the digest the registry accepted. It is the
+  # artifact identity, and the only place it exists after the job log expires.
+  artifacts:
+    when: always
+    expire_in: 90 days
+    access: developer
+    paths:
+      - release.json
+
+# A ref raises AT MOST ONE of these two buttons, and that is a safety property, not
+# tidiness: offered side by side, the row above the one you wanted publishes a candidate
+# into the public registry under a number nobody decided to spend.
+release:rc:
+  extends: .release-lane
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: false
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+-rc\.\d+$/
+      when: manual
+      allow_failure: false
+  script:
+    - node scripts/releaseImage.mjs --prerelease --json | tee release.json
+
+# The release proper. A separate job rather than a flag on the one above, for the same
+# reason `make release` and `make release-rc` are separate targets: the two promise
+# different things — an immutable `:X.Y.Z` that moves `:latest` versus a candidate that
+# touches neither — and that difference must not hang on a typo in an argument.
+#
+# ONLY on a `vX.Y.Z` tag. The gate refuses unless the tag names exactly HEAD, so a branch
+# run could never pass — better to not offer the button than to offer one that always
+# fails. `-rc.N` is excluded for the mirror-image reason: a candidate tag names a
+# pre-release, and publishing it as the release would claim a version the gate never saw.
+#
+# GIT_DEPTH: 0, against the runner default. This lane resolves the tag locally — which
+# commit it names, and the build context exported from it with `git archive <tag>`. A
+# shallow fetch promises neither, and a squash root makes a full clone cost one commit.
+release:publish:
+  extends: .release-lane
+  variables:
+    GIT_DEPTH: 0
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/
+      when: manual
+      allow_failure: false
+  script:
+    - node scripts/releaseImage.mjs --json | tee release.json

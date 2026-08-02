@@ -1,0 +1,62 @@
+/* Graph search — the aside's "Search" tab (find / orient). A pinned head (field +
+   match count) over a scrolling result list. The section headers (.gf-section /
+   .gf-section-reset) are the shared graph-aside primitive (styles/shared.scss). */
+.gsearch { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.gsearch-head { flex: none; padding: 12px var(--gutter) 8px; display: flex; flex-direction: column; gap: 7px; }
+.gsearch-field {
+  display: flex; align-items: center; gap: 8px;
+  height: 36px; padding: 0 10px;
+  background: var(--bg); border: 1px solid var(--border);
+  border-radius: var(--radius-md); color: var(--text-faint);
+  transition: border-color 0.12s, box-shadow 0.12s;
+}
+.gsearch-field:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.gsearch-field input {
+  flex: 1; min-width: 0; border: none; background: transparent; outline: none;
+  color: var(--text); font-size: 13.5px;
+}
+.gsearch-field input::placeholder { color: var(--text-faint); }
+.gsearch-clear {
+  flex: none; display: inline-flex; align-items: center; justify-content: center;
+  width: 18px; height: 18px; padding: 0; border-radius: var(--radius-xs);
+  border: none; background: none; appearance: none;
+  color: var(--text-faint); cursor: pointer; transition: color 0.12s, background 0.12s;
+}
+.gsearch-clear:hover { color: var(--text); background: var(--bg-hover); }
+/* Empty / no-result state — centred, quietly. */
+.gsearch-empty {
+  flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 10px; padding: 24px; text-align: center; color: var(--text-faint);
+}
+.gsearch-empty p { margin: 0; font-size: 12.5px; line-height: 1.5; max-width: 200px; }
+
+/* The one scrolling body under the head, shared by the search-results and focus views. */
+.gsearch-body {
+  flex: 1; min-height: 0; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 6px; padding: 0 var(--gutter) 12px;
+}
+.gsearch-list {
+  list-style: none; margin: 0; padding: 0;
+  display: flex; flex-direction: column; gap: 1px;
+}
+.gsearch-result {
+  width: 100%; display: flex; align-items: center; gap: 9px;
+  padding: 6px 8px; border-radius: var(--radius-sm); cursor: pointer;
+  border: none; background: transparent; appearance: none; color: inherit;
+  text-align: left; transition: background 0.1s;
+}
+.gsearch-result:hover, .gsearch-result.active { background: var(--bg-hover); }
+.gsearch-result.picked { background: var(--accent-soft); }
+.gsearch-swatch { flex: none; width: 9px; height: 9px; border-radius: 50%; }
+.gsearch-text { display: flex; flex-direction: column; min-width: 0; gap: 1px; }
+.gsearch-title {
+  font-size: 13px; color: var(--text-dim);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.gsearch-result:hover .gsearch-title,
+.gsearch-result.active .gsearch-title,
+.gsearch-result.picked .gsearch-title { color: var(--text); }
+.gsearch-path {
+  font-size: 11px; color: var(--text-faint);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}

@@ -1,0 +1,12 @@
+{
+  "name": "@notarium/engine-vector",
+  "version": "0.1.0",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "type": "module",
+  "description": "Deps-only carrier for the OPTIONAL native vector stack (#200): @huggingface/transformers (+ its onnxruntime backend, ~660MB) and sqlite-vec. @notarium/engine loads these DYNAMICALLY, so it declares no static dependency on them — this workspace owns the declaration instead, which lets the default dev install skip the whole subtree by excluding this one workspace (make deps), while a vector profile (make deps-vector) or the Docker image installs it and npm hoists the packages to the root node_modules where the engine resolves them. Carries no code (like @notarium/desktop): its sole job is to make the heavy native stack an excludable install unit. Runtime degradation when absent is the engine's job (createNotariumStore → FTS).",
+  "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
+    "sqlite-vec": "^0.1.9"
+  }
+}

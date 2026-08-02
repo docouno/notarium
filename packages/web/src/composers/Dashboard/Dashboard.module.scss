@@ -1,0 +1,541 @@
+/* Home dashboard (#33, #216): a pill tab-bar (Activity / Projects / Health) over a
+   reference strip, with the active surface rendering in the router Outlet. Activity
+   is the heatmap + a GitLab-style "what changed" timeline; Projects and Health are
+   full-width list surfaces. Full-width inside the document content area; the pill
+   bar reflows to one column on narrow (container query). */
+
+.dash {
+  width: 100%;
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 20px 24px 56px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  container-type: inline-size;
+}
+
+/* ── header ──────────────────────────────────────────────────────────────── */
+.head {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.title {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--accent);
+  h1 { margin: 0; font-size: 21px; color: var(--text); }
+}
+
+/* ── section titles ────────────────────────────────────────────────────────
+   Shared uppercase eyebrow. Icons stay NEUTRAL — no per-card accent (scattered
+   accents read as noise); the label colour carries them. */
+.card-title,
+.feed-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0 0 12px;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  svg { color: var(--text-faint); }
+}
+.card-count {
+  margin-left: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-faint);
+  background: var(--bg-hover);
+  border-radius: var(--radius-pill);
+  padding: 1px 7px;
+}
+/* A one-line explainer under a section title (#216): what this repair queue means,
+   in plain words. Thin/faint so it informs without competing with the list. */
+.card-intro {
+  margin: -6px 0 14px;
+  max-width: 68ch;
+  font-size: 12.5px;
+  line-height: 1.5;
+  /* Greyer/quieter than --text-faint — muted toward the page bg so it informs
+     without pulling the eye off the list (both themes). */
+  color: color-mix(in srgb, var(--text-faint) 72%, var(--bg));
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.9em;
+    padding: 1px 5px;
+    border-radius: var(--radius-xs);
+    background: var(--bg-hover);
+    color: var(--text-dim);
+  }
+  em {
+    font-style: italic;
+    color: var(--text-dim);
+  }
+}
+
+/* The pill tab-bar (#216) now lives in the shared core/PillTabs (#243) — the same
+   "sections of a surface" nav the Agents sections use. DashboardTabs is a thin adapter
+   over it (`fill` layout). */
+
+/* ── reference strip ────────────────────────────────────────────────────────
+   The stats the pills don't carry (notes · tags · links) as a thin line under the
+   bar; "links" deep-links into the graph. */
+.refstrip {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap; // adaptive: on a narrow dash the toggle wraps below the stats,
+  column-gap: 18px; // never overflowing — the stats and toggle keep their own gaps.
+  row-gap: 6px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  /* Sit closer to the heatmap it heads than to the pills above: a touch more air
+     above (breathing room after the tab bar), tighter below (this row + the author
+     toggle read as the heatmap's header). Both add to the .dash flex gap (20px). */
+  margin-top: 8px;
+  margin-bottom: -8px;
+  /* Reserve the toggle's height ALWAYS, so the row is the same height whether the
+     toggle is present (Activity + others' activity) or not (other surfaces / solo /
+     still loading) — it never jumps in when `hasOtherAuthors` resolves (#218). */
+  min-height: 30px;
+}
+/* The Activity author toggle (#218) — pushed to the right edge of the reference row;
+   on a wrap it drops to its own line, still right-aligned. */
+.ref-toggle {
+  margin-left: auto;
+}
+/* Adaptive: on a narrow dash (same breakpoint the pills collapse at) the toggle goes
+   ICON-ONLY — the label span hides, leaving the Everyone/Mine glyphs (title tooltips
+   keep them legible). That shrinks it enough to sit inline with the stats instead of
+   wrapping, so the row keeps its single-line height on mobile too. `button span` is
+   the Segmented's label wrapper (its icon is an <svg>, untouched). */
+@container (max-width: 560px) {
+  .ref-toggle button span {
+    display: none;
+  }
+}
+.ref-item,
+.ref-link {
+  color: var(--text-dim);
+  text-decoration: none;
+  strong {
+    color: var(--text);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+}
+.ref-link:hover {
+  color: var(--text);
+  strong { color: var(--accent); }
+}
+
+/* A surface's own vertical rhythm (the Outlet renders ONE surface node, so it
+   owns the gap between its sections). */
+.surface {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+/* ── heatmap plate ─────────────────────────────────────────────────────────── */
+.heatmap-card {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 16px;
+}
+
+/* ── heatmap — always-SQUARE cells that fill the width ─────────────────────── */
+$gap: 3px;
+$dows: 30px;
+
+.heat-total {
+  margin-left: auto;
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 500;
+  color: var(--text-faint);
+}
+/* `visible`, NOT auto/hidden: the JS hook floors `--cell` to whole device px so the
+   fixed tracks fit without overflow (any remainder is left-hugged slack, not a scrollbar),
+   and a clipping context would chop the selected cell's outline on the right-edge column
+   (#33 fix). */
+.heat-scroll { overflow: visible; }
+/* Heatmap sizing (#219). Every week track and every cell shares ONE `--cell` edge
+   plus ONE `--gap`, so rows and columns land on a single regular lattice — no more
+   per-column `aspect-ratio` drift. `useDeviceSnappedGrid` (ActivityHeatmap.tsx) sets
+   `--cell`/`--gap` inline to whole DEVICE pixels, which is what actually keeps the
+   grid straight under fractional devicePixelRatio (OS scaling / browser zoom): CSS
+   can't see the effective scale, so a fluid fractional cell rounds unevenly per column.
+   The values below are the pre-JS FALLBACK — a fluid cell derived from the container's
+   own width (`cqw`): rows still line up (all cells share it), it just isn't device-snapped
+   until the hook runs. The container sits HERE (not on `.heat-grid`): `container-type` on
+   the flex:1 grid breaks its width (it inflates past the card). `--weeks` is set in JSX.
+   `100cqw` is the inner width, so subtract the DOW rail ($dows) and the inter-column gaps
+   before dividing — the tracks then sum to the grid's width (no overflow; the month header
+   shares the identical tracks). */
+.heat-inner {
+  width: 100%;
+  container-type: inline-size;
+  --cell: calc((100cqw - #{$dows} - #{$gap} * (var(--weeks) - 1)) / var(--weeks));
+  --gap: #{$gap};
+}
+
+.heat-months {
+  display: grid;
+  /* Same `--cell` tracks and `--gap` as .heat-grid, so month labels (anchored by
+     grid-column) stay dead-on their week columns (#33/#219) — identical by construction. */
+  grid-template-columns: repeat(var(--weeks), var(--cell));
+  column-gap: var(--gap);
+  margin-left: $dows;
+  margin-bottom: 6px;
+  height: 13px;
+  font-size: 10px;
+  color: var(--text-faint);
+}
+.heat-month { white-space: nowrap; padding-right: 6px; }
+
+.heat-body { display: flex; gap: 0; align-items: stretch; }
+.heat-dows {
+  display: grid;
+  grid-template-rows: repeat(7, 1fr);
+  width: $dows;
+  font-size: 9px;
+  color: var(--text-faint);
+  span { display: flex; align-items: center; }
+}
+.heat-grid {
+  /* `flex: 0 0 auto`, NOT `flex: 1`: the box must hug its columns, not stretch to the
+     full track area. Device-snapped `--cell`s (integer device px) can't tile an arbitrary
+     width exactly, so a remainder — up to (weeks-1) device px = (weeks-1)/dpr css px (~`weeks`
+     css px, ≈50px, at dpr 1), the accumulated per-column floor (see the hook) — is left over;
+     if the grid stretched, that slack would sit INSIDE the grid box on the right, and the
+     loading shimmer overlay (`inset: 0`) would sweep that empty strip past the last column
+     (#219). Hugging the columns keeps the overlay strictly over real cells; the slack falls
+     outside the grid box. */
+  flex: 0 0 auto;
+  display: grid;
+  /* Fixed `--cell` tracks (see .heat-inner), not `minmax(0,1fr)`: every column is the
+     same device-snapped width, so the whole grid is one regular lattice (#219). */
+  grid-template-columns: repeat(var(--weeks), var(--cell));
+  gap: var(--gap);
+  /* Skeleton loading (#218): the grid keeps its full geometry (built from the same
+     default window), so this is a colour state, not a layout swap. ONE shimmer sweeps
+     the whole grid — a single coherent sheen, not 370 per-cell animations — over the
+     muted cells. Data arrival drops [data-loading] and cells settle their colour. */
+  position: relative;
+  &[data-loading]::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(
+      100deg,
+      transparent 30%,
+      color-mix(in srgb, var(--text) 7%, transparent) 50%,
+      transparent 70%
+    );
+    background-size: 220% 100%;
+    animation: heat-shimmer 1.5s ease-in-out infinite;
+    pointer-events: none;
+  }
+  /* The grid is a FULL rectangle, but the first/last week columns are partial (they
+     depend on the day of week) — their `.heat-pad` gaps are empty. During loading those
+     pads paint the card background ABOVE the sweep (z-index), so the sheen never bleeds
+     over the empty corners; only the real cells shimmer. The `box-shadow` spreads that
+     cover by exactly one grid `$gap` all round, so the 3px gutters AROUND the empty pads
+     (below / to the sides) are covered too — the spread lands exactly on the neighbouring
+     cells' edges (gap == spread), so it never clips a real cell. */
+  &[data-loading] .heat-pad {
+    position: relative;
+    z-index: 1;
+    background: var(--bg);
+    box-shadow: 0 0 0 $gap var(--bg);
+  }
+}
+@keyframes heat-shimmer {
+  0% { background-position: 130% 0; }
+  100% { background-position: -30% 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .heat-grid[data-loading]::after { animation: none; }
+}
+/* A week is a column of 7 cells; every cell is a fixed `--cell` square (same edge
+   across all weeks — see .heat-inner), so rows line up perfectly and resizing scales
+   them uniformly, never distorts (#219). The vertical gap is the same device-snapped
+   `--gap`, so rows sit on the device grid too. */
+.heat-week { display: flex; flex-direction: column; gap: var(--gap); }
+
+.heat-cell {
+  width: 100%;
+  height: var(--cell);
+  border-radius: 2px;
+  padding: 0;
+  border: 1px solid color-mix(in srgb, var(--text) 6%, transparent);
+  background: var(--bg-hover);
+  cursor: pointer;
+  /* Smooth SETTLE (#218): a re-render that changes a cell's level (cold load fills in,
+     or the mine/all scope swaps the data) fades the colour instead of popping it — the
+     geometry never moves, so the only change the eye sees is a gentle recolour. */
+  transition: background-color 0.25s ease;
+  /* Increasing LUMINANCE = more activity; the top step goes brighter (toward
+     white) so levels 3 and 4 stay clearly distinct (#33). */
+  &[data-level='1'] { background: color-mix(in srgb, var(--accent) 26%, var(--bg-list)); }
+  &[data-level='2'] { background: color-mix(in srgb, var(--accent) 52%, var(--bg-list)); }
+  &[data-level='3'] { background: var(--accent); }
+  &[data-level='4'] { background: color-mix(in srgb, var(--accent) 55%, white); }
+  &:hover { outline: 1px solid var(--accent); outline-offset: 1px; }
+  &[data-selected] { outline: 2px solid var(--text); outline-offset: 1px; }
+  /* Skeleton cells (#218): inert muted squares — the single grid sweep above carries
+     the loading signal; the cell just holds its muted space (no pointer, no hover). */
+  &[data-skeleton] { cursor: default; &:hover { outline: none; } }
+}
+@media (prefers-reduced-motion: reduce) {
+  .heat-cell { transition: none; }
+}
+.heat-pad { width: 100%; height: var(--cell); }
+
+.heat-legend {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  margin: 10px 0 0 $dows;
+  font-size: 10px;
+  color: var(--text-faint);
+  /* Legend swatches are a fixed 11px (not the derived --cell); the height wins by
+     specificity over .heat-cell's `height: var(--cell)`. */
+  .heat-cell { width: 11px; height: 11px; flex: none; cursor: default; &:hover { outline: none; } }
+  span:first-child { margin-right: 2px; }
+  span:last-child { margin-left: 2px; }
+}
+
+/* Floating hover tooltip (#33) — a real styled tip, not a native `title`.
+   position:fixed off the cell's viewport rect; sits centred above it. */
+.heat-tip {
+  position: fixed;
+  transform: translate(-50%, calc(-100% - 8px));
+  z-index: 50;
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 6px 10px;
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--glass-drop);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.heat-tip-date { font-weight: 600; color: var(--text); }
+.heat-tip-body { color: var(--text-dim); }
+
+/* ── "what changed" — a GitLab-style activity timeline (no card) ───────────── */
+/* The empty / no-activity state gets a reserved, centred area so it isn't
+   squeezed flat between the heatmap above and the cards below (#33). */
+.feed-empty {
+  min-height: 180px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.feed-clear {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: var(--text-dim);
+  font-size: 11px;
+  text-transform: none;
+  letter-spacing: 0;
+  &:hover { color: var(--text); }
+}
+
+$spine: 13px; /* x of the timeline rail (= icon centre) */
+
+.timeline {
+  position: relative;
+  /* The vertical rail the icons sit on, from the first icon centre to the last. */
+  &::before {
+    content: '';
+    position: absolute;
+    left: $spine;
+    top: 16px;
+    bottom: 16px;
+    width: 2px;
+    background: var(--border);
+  }
+}
+.event {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 52px;
+  padding: 10px 10px 10px 36px; /* room for the absolute icon on the rail */
+  /* No row hover/rounding: the row isn't one click target anymore (#217) — its
+     links (folder crumbs, title) carry their own hover, so a full-row pill would
+     be a misleading affordance. */
+}
+.event-icon {
+  position: absolute;
+  left: calc(#{$spine} - 12px);
+  top: 50%;
+  transform: translateY(-50%);
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* Page-bg disc masks the rail behind it (the icon reads as a node). The glyph
+     keeps its semantic kind colour — that's meaning, not decoration. */
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  &[data-kind='created'] { color: var(--ok); }
+  &[data-kind='edited'] { color: var(--accent); }
+  &[data-kind='restored'] { color: var(--warning); }
+  &[data-kind='deleted'] { color: var(--danger); }
+}
+/* Two-line GitLab entry (#217): line one = location breadcrumb + title + time,
+   line two = the metadata. */
+.event-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.event-head {
+  display: flex;
+  align-items: baseline;
+  min-width: 0;
+  font-size: 13.5px;
+  line-height: 1.35;
+}
+/* The folder breadcrumb shrinks (ellipsis) far before the title does — 100× the
+   flex-shrink — so the note name stays readable when the row is cramped. */
+.event-crumbs {
+  flex: 0 100 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim);
+}
+.event-crumb-link {
+  color: var(--text-dim);
+  text-decoration: none;
+  &:hover {
+    color: var(--text);
+    text-decoration: underline;
+  }
+}
+.event-sep {
+  flex: none;
+  margin: 0 6px;
+  color: var(--text-faint);
+}
+.event-title {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-weight: 500;
+  text-decoration: none;
+  &:hover { text-decoration: underline; }
+}
+.event-date {
+  flex: none;
+  margin-left: auto;
+  padding-left: 10px;
+  color: var(--text-faint);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.event-meta {
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.event-verb { color: var(--text-dim); }
+.event-churn { color: var(--text-faint); font-variant-numeric: tabular-nums; }
+.event-by { color: var(--text-faint); }
+
+/* ── surface sections ──────────────────────────────────────────────────────── */
+/* Outline plates (border, no fill) — same treatment as the heatmap, so the whole
+   page reads flat rather than a stack of filled boxes (#33). A surface stacks
+   these full-width (Projects: one; Health: up to three). */
+.card {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 16px;
+}
+
+/* ── surface link lists (projects / broken / former-name / orphans) ───────── */
+.link-list { display: flex; flex-direction: column; }
+.link-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 6px;
+  border-radius: var(--radius-sm); /* the HOVER highlight stays rounded */
+  text-decoration: none;
+  color: inherit;
+  /* Divider = a straight full-width line (absolute, so the row's corner-radius
+     can't round its ends) — separators stay square while hover stays rounded. */
+  & + .link-row::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 0;
+    height: 1px;
+    background: var(--border);
+  }
+  &:hover { background: var(--bg-hover); }
+}
+/* Hide the dividers ABOVE and BELOW a hovered row, so the straight separator
+   doesn't poke past the row's rounded hover corners. */
+.link-row + .link-row:hover::before,
+.link-row:hover + .link-row::before {
+  background: transparent;
+}
+.link-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 13.5px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* The "→ target" tail on a grooming-health row (#100 phase 5): dim, so the source note
+   reads as primary and the resolved-to target as context. */
+.link-arrow { color: var(--text-faint); }
+.link-badge {
+  flex: none;
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: var(--radius-pill);
+  padding: 1px 7px;
+}
+.link-when { flex: none; color: var(--text-faint); font-size: 11.5px; white-space: nowrap; }
+.link-more { font-size: 11.5px; color: var(--text-faint); padding: 7px 6px 0; }

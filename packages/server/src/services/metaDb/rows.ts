@@ -1,0 +1,483 @@
+// Row↔record mappers shared by the SQLite and Postgres driver twins.
+
+import type {
+  ContextOrderEntryKind,
+  ContextOrderRecord,
+  ContextSetAttachmentRecord,
+  ContextSetItemRef,
+  ContextSetRecord,
+  ContextSetTargetKind,
+  FolderRecord,
+  JobRecord,
+  JobStatus,
+  OAuthAccessRecord,
+  OAuthRefreshRecord,
+  OAuthScope,
+  PatRecord,
+  ProjectRecord,
+  ProjectStatus,
+  RetrievalHit,
+  RetrievalLogRecord,
+  RetrievalTool,
+  ScopePinRecord,
+  SpaceRecord,
+  SpaceRole,
+  UserRecord,
+} from './types'
+
+/** A row of the `spaces` table. */
+export type SpaceRow = {
+  id: string
+  slug: string
+  notes_dir: string
+  display_name: string
+  aliases: string | null
+  created_at: string
+  archived_at?: string | null
+  archived_by?: string | null
+}
+
+export const spaceOfRow = (r: SpaceRow): SpaceRecord => ({
+  id: r.id,
+  slug: r.slug,
+  notesDir: r.notes_dir,
+  displayName: r.display_name,
+  aliases: parseAliases(r.aliases),
+  createdAt: r.created_at,
+  archivedAt: r.archived_at ?? null,
+  archivedBy: r.archived_by ?? null,
+})
+
+export type UserRow = {
+  username: string
+  display_name: string
+  password_hash: string | null
+  admin: number | boolean
+  disabled_at: string | null
+  created_at: string
+  personal_space: string | null
+}
+
+export const userOfRow = (r: UserRow): UserRecord => ({
+  username: r.username,
+  displayName: r.display_name,
+  passwordHash: r.password_hash,
+  admin: Boolean(r.admin),
+  disabledAt: r.disabled_at,
+  createdAt: r.created_at,
+  // Legacy rows lack this column → undefined despite the type; normalise to null.
+  personalSpace: r.personal_space ?? null,
+})
+
+export type PatRow = {
+  id: string
+  username: string
+  name: string
+  secret_hash: string
+  scope: string
+  spaces: string | null
+  expires_at: string | null
+  last_used_at: string | null
+  revoked_at: string | null
+  created_at: string
+}
+
+export const patOfRow = (r: PatRow): PatRecord => ({
+  id: r.id,
+  username: r.username,
+  name: r.name,
+  secretHash: r.secret_hash,
+  scope: r.scope as PatRecord['scope'],
+  spaces: r.spaces == null ? null : (JSON.parse(r.spaces) as string[]),
+  expiresAt: r.expires_at,
+  lastUsedAt: r.last_used_at,
+  revokedAt: r.revoked_at,
+  createdAt: r.created_at,
+})
+
+export type SpaceRoleRow = { space: string; role: SpaceRole }
+
+/** A row of the `folders` table (projects and plain folders, discriminated by `type`).
+ *  canon: docs/projects.md#model */
+export type ProjectRow = {
+  id: string
+  space: string
+  path: string
+  type: string
+  slug: string
+  aliases: string | null
+  path_aliases: string | null
+  display_name: string
+  status: string
+  last_seen: string
+  created_at: string
+}
+
+export const projectOfRow = (r: ProjectRow): ProjectRecord => ({
+  id: r.id,
+  space: r.space,
+  path: r.path,
+  slug: r.slug,
+  aliases: parseAliases(r.aliases),
+  pathAliases: parseAliases(r.path_aliases),
+  displayName: r.display_name,
+  status: r.status as ProjectStatus,
+  lastSeen: r.last_seen,
+  createdAt: r.created_at,
+})
+
+/** The handle columns (slug/aliases/display_name/status) are inert for a plain folder. */
+export const folderIdentityOfRow = (r: ProjectRow): FolderRecord => ({
+  id: r.id,
+  space: r.space,
+  path: r.path,
+  pathAliases: parseAliases(r.path_aliases),
+  lastSeen: r.last_seen,
+  createdAt: r.created_at,
+})
+
+/** Parse a JSON string-array column; NULL/absent/malformed → [] (defensive: we only write valid). */
+export const parseAliases = (raw: string | null): string[] => {
+  if (!raw) {
+    return []
+  }
+  try {
+    const v = JSON.parse(raw)
+    return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []
+  } catch {
+    return []
+  }
+}
+
+// ── context sets rows ─────────────────────────────────────────────────
+
+export type ContextSetRow = {
+  id: string
+  home_space: string
+  name: string
+  items: string | null
+  created_at: string
+}
+
+export type ContextSetAttachmentRow = {
+  set_id: string
+  target_kind: string
+  target_id: string
+  target_space: string
+  created_at: string
+}
+
+/** Parse the `items` JSON column to {space, noteId} refs; malformed entries dropped
+ *  (defensive: a hand-edited DB or future schema shift must not crash a session). */
+export const parseContextSetItems = (raw: string | null): ContextSetItemRef[] => {
+  if (!raw) {
+    return []
+  }
+  try {
+    const v = JSON.parse(raw)
+
+    if (!Array.isArray(v)) {
+      return []
+    }
+
+    return v.flatMap((x) =>
+      x &&
+      typeof x === 'object' &&
+      typeof (x as ContextSetItemRef).space === 'string' &&
+      typeof (x as ContextSetItemRef).noteId === 'string'
+        ? [{ space: (x as ContextSetItemRef).space, noteId: (x as ContextSetItemRef).noteId }]
+        : [],
+    )
+  } catch {
+    return []
+  }
+}
+
+/** Reorder items to `noteIds`, SLOT-PRESERVING: only items named in `noteIds` are permuted
+ *  (in request order) into their own slots; any item NOT named keeps its ORIGINAL slot — so a
+ *  partial-view reorder never shoves a deduped-hidden or concurrently-added member to the tail
+ *  (an append-to-tail scheme would silently relocate it across every attached scope). */
+export const orderItems = (
+  items: readonly ContextSetItemRef[],
+  noteIds: readonly string[],
+): ContextSetItemRef[] => {
+  const byId = new Map(items.map((it) => [it.noteId, it]))
+  const named = new Set<string>()
+  const queue: ContextSetItemRef[] = []
+
+  for (const id of noteIds) {
+    const it = byId.get(id)
+
+    if (it && !named.has(id)) {
+      named.add(id)
+      queue.push(it)
+    }
+  }
+  let qi = 0
+  return items.map((it) => (named.has(it.noteId) ? queue[qi++] : it))
+}
+
+export const contextSetOfRow = (r: ContextSetRow): ContextSetRecord => ({
+  id: r.id,
+  homeSpace: r.home_space,
+  name: r.name,
+  items: parseContextSetItems(r.items),
+  createdAt: r.created_at,
+})
+
+export const contextSetAttachmentOfRow = (
+  r: ContextSetAttachmentRow,
+): ContextSetAttachmentRecord => ({
+  setId: r.set_id,
+  targetKind: r.target_kind as ContextSetTargetKind,
+  targetId: r.target_id,
+  targetSpace: r.target_space,
+  createdAt: r.created_at,
+})
+
+// ── scope pins rows ───────────────────────────────────────────────────
+
+export type ScopePinRow = {
+  target_kind: string
+  target_id: string
+  target_space: string
+  note_space: string
+  note_id: string
+  created_at: string
+}
+
+export const scopePinOfRow = (r: ScopePinRow): ScopePinRecord => ({
+  targetKind: r.target_kind as ContextSetTargetKind,
+  targetId: r.target_id,
+  targetSpace: r.target_space,
+  noteSpace: r.note_space,
+  noteId: r.note_id,
+  createdAt: r.created_at,
+})
+
+// ── context order rows ────────────────────────────────────────────────
+
+export type ContextOrderRow = {
+  target_kind: string
+  target_id: string
+  target_space: string
+  entry_kind: string
+  entry_ref: string
+  rank: number
+}
+
+export const contextOrderOfRow = (r: ContextOrderRow): ContextOrderRecord => ({
+  targetKind: r.target_kind as ContextSetTargetKind,
+  targetId: r.target_id,
+  targetSpace: r.target_space,
+  entryKind: r.entry_kind as ContextOrderEntryKind,
+  entryRef: r.entry_ref,
+  rank: r.rank,
+})
+
+/** Dedup a context-order sequence by (entryKind, entryRef), first occurrence wins: those
+ *  columns are the PK, so a duplicate would collide on INSERT — drop it before writing. */
+export const dedupOrderEntries = <T extends { entryKind: ContextOrderEntryKind; entryRef: string }>(
+  entries: readonly T[],
+): T[] => {
+  const seen = new Set<string>()
+  return entries.filter((e) =>
+    seen.has(`${e.entryKind}:${e.entryRef}`)
+      ? false
+      : (seen.add(`${e.entryKind}:${e.entryRef}`), true),
+  )
+}
+
+// ── OAuth rows ─────────────────────────────────────────────────────────
+
+export type OAuthAccessRow = {
+  id: string
+  token_hash: string
+  username: string
+  client_id: string
+  scope: string
+  /** Space-id allowlist; NULL = all grants (not none). */
+  spaces: string | null
+  expires_at: string
+  refresh_id: string | null
+  revoked_at: string | null
+  created_at: string
+  last_used_at: string | null
+}
+
+export const accessOfRow = (r: OAuthAccessRow): OAuthAccessRecord => ({
+  id: r.id,
+  tokenHash: r.token_hash,
+  username: r.username,
+  clientId: r.client_id,
+  scope: r.scope as OAuthScope,
+  spaces: r.spaces == null ? null : (JSON.parse(r.spaces) as string[]),
+  expiresAt: r.expires_at,
+  refreshId: r.refresh_id,
+  revokedAt: r.revoked_at,
+  createdAt: r.created_at,
+  lastUsedAt: r.last_used_at,
+})
+
+export type OAuthRefreshRow = {
+  id: string
+  token_hash: string
+  username: string
+  client_id: string
+  scope: string
+  /** Space-id allowlist; NULL = all grants (not none). */
+  spaces: string | null
+  expires_at: string
+  rotated_to: string | null
+  revoked_at: string | null
+  created_at: string
+}
+
+export const refreshOfRow = (r: OAuthRefreshRow): OAuthRefreshRecord => ({
+  id: r.id,
+  tokenHash: r.token_hash,
+  username: r.username,
+  clientId: r.client_id,
+  scope: r.scope as OAuthScope,
+  spaces: r.spaces == null ? null : (JSON.parse(r.spaces) as string[]),
+  expiresAt: r.expires_at,
+  rotatedTo: r.rotated_to,
+  revokedAt: r.revoked_at,
+  createdAt: r.created_at,
+})
+
+// ── job rows ─────────────────────────────────────────────────
+
+/** A row of the `jobs` table. `artifact_bytes` is INTEGER on sqlite but BIGINT on pg, and
+ *  node-pg hands a BIGINT back as a STRING — hence the Number() coercion (a GB archive stays
+ *  within Number's safe-integer range). canon: docs/jobs.md#model */
+export type JobRow = {
+  id: string
+  space: string
+  kind: string
+  status: string
+  principal: string
+  params: string | null
+  progress_done: number
+  progress_total: number | null
+  phase: string | null
+  attempts: number
+  max_attempts: number
+  run_at: string
+  locked_at: string | null
+  locked_by: string | null
+  artifact_ref: string | null
+  artifact_bytes: number | string | null
+  artifact_name: string | null
+  result: string | null
+  error: string | null
+  created_at: string
+  updated_at: string
+  started_at: string | null
+  completed_at: string | null
+  expires_at: string | null
+}
+
+/** Defensive JSON decode for a `params`/`result` column — null/absent/malformed → null
+ *  (a poisoned row must not crash a list). */
+const parseJson = (raw: string | null): unknown => {
+  if (raw == null) {
+    return null
+  }
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return null
+  }
+}
+
+export const jobOfRow = (r: JobRow): JobRecord => ({
+  id: r.id,
+  space: r.space,
+  kind: r.kind,
+  status: r.status as JobStatus,
+  principal: r.principal,
+  params: parseJson(r.params),
+  progressDone: Number(r.progress_done),
+  progressTotal: r.progress_total == null ? null : Number(r.progress_total),
+  phase: r.phase,
+  attempts: Number(r.attempts),
+  maxAttempts: Number(r.max_attempts),
+  runAt: r.run_at,
+  lockedAt: r.locked_at,
+  lockedBy: r.locked_by,
+  artifactRef: r.artifact_ref,
+  artifactBytes: r.artifact_bytes == null ? null : Number(r.artifact_bytes),
+  artifactName: r.artifact_name,
+  result: parseJson(r.result),
+  error: r.error,
+  createdAt: r.created_at,
+  updatedAt: r.updated_at,
+  startedAt: r.started_at,
+  completedAt: r.completed_at,
+  expiresAt: r.expires_at,
+})
+
+/** A raw `agent_retrievals` row. */
+export type RetrievalRow = {
+  id: number | bigint | string
+  owner: string
+  principal: string
+  agent: string | null
+  tool: string
+  query: string
+  project: string | null
+  class_filter: string | null
+  result_count: number | string
+  top_score: number | string | null
+  hits: string | null
+  created_at: string
+}
+
+/** Defensive decode of the `hits` JSON array; a poisoned/absent value yields [], shapeless
+ *  entries dropped (a bad row can't crash the history list). */
+const parseHits = (raw: string | null): RetrievalHit[] => {
+  const parsed = parseJson(raw)
+
+  if (!Array.isArray(parsed)) {
+    return []
+  }
+  const out: RetrievalHit[] = []
+
+  for (const h of parsed) {
+    if (!h || typeof h !== 'object') {
+      continue
+    }
+    const noteId = (h as { noteId?: unknown }).noteId
+
+    if (typeof noteId !== 'string') {
+      continue
+    }
+    const title = (h as { title?: unknown }).title
+    const score = (h as { score?: unknown }).score
+    const cls = (h as { class?: unknown }).class
+    out.push({
+      noteId,
+      ...(typeof title === 'string' ? { title } : {}),
+      ...(typeof score === 'number' ? { score } : {}),
+      ...(typeof cls === 'string' ? { class: cls } : {}),
+    })
+  }
+
+  return out
+}
+
+export const retrievalOfRow = (r: RetrievalRow): RetrievalLogRecord => ({
+  id: String(r.id),
+  owner: r.owner,
+  principal: r.principal,
+  agent: r.agent,
+  tool: r.tool as RetrievalTool,
+  query: r.query,
+  project: r.project,
+  classFilter: r.class_filter,
+  resultCount: Number(r.result_count),
+  topScore: r.top_score == null ? null : Number(r.top_score),
+  hits: parseHits(r.hits),
+  createdAt: r.created_at,
+})

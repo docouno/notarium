@@ -1,0 +1,44 @@
+/* Shared folder INCLUSION filter (Graph · Feed facet, #93/#109). One primitive: the
+   mark + row show SELECTION (membership in the filter), not visibility — nothing
+   selected = no filter = everything shown. A selected row is accented. Rows indent
+   by --depth; a chevron (or a fixed-width spacer for leaves) keeps names aligned. */
+.ftree { display: flex; flex-direction: column; }
+.ftree-row {
+  position: relative; display: flex; align-items: center;
+  padding-left: calc(var(--depth, 0) * 13px);
+}
+.ftree-chev {
+  flex: none; width: 18px; height: 30px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: none; background: transparent; cursor: pointer; color: var(--text-faint);
+}
+.ftree-chev:hover { color: var(--text); }
+.ftree-chev svg { transition: transform 0.12s; }
+.ftree-chev svg.open { transform: rotate(90deg); }
+.ftree-main {
+  flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px;
+  border: none; background: transparent; cursor: pointer; text-align: left;
+  padding: 6px 8px; border-radius: var(--radius-sm); font-size: 13px; color: var(--text-dim);
+}
+.ftree-main:hover { background: var(--bg-hover); color: var(--text); }
+.ftree-mark { display: inline-flex; flex: none; }
+.ftree-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ftree-count { font-size: 12px; color: var(--text-faint); flex: none; }
+
+/* The swatch IS the on/off control: filled when SELECTED, a hollow border when not
+   — no row background, the mark alone carries the state. `--c` is the folder's group
+   hue on the Graph (colour axis) and a neutral grey on the Feed/Memory surface, so
+   the same filled/border reads with or without colour. No native checkbox
+   (theme-proof) and no glyph (legible on any hue). */
+.ftree-swatch {
+  width: 12px; height: 12px; border-radius: var(--radius-xs); flex: none;
+  background: transparent;
+  box-shadow: inset 0 0 0 1.5px var(--c);
+  opacity: 0.75;
+}
+.ftree-row.on .ftree-swatch {
+  background: var(--c);
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.2);
+  opacity: 1;
+}
+.ftree-row.on .ftree-main { color: var(--text); }

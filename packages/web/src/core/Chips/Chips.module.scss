@@ -1,0 +1,90 @@
+// Chip — the shared pill primitive (#13): a small rounded label, optionally with
+// a leading glyph, that ELLIPSISES when its text is too long. One place owns the
+// pill shape + truncation so the Feed tags and the Memory source/handle tags
+// (and any future chip) can't drift. Colour is a variant; surfaces may override
+// via a passed className (the base sets neutral).
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  min-width: 0;
+  max-width: 100%;
+  padding: 1px 7px;
+  border-radius: var(--radius-pill);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-faint);
+  background: var(--bg-hover);
+
+  svg {
+    flex: none;
+  }
+}
+
+// The label truncates; the glyph never shrinks (flex:none above).
+.label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.accent {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+// Read tag chip (#204): neutral by default, but the tint derives from one
+// custom property so future per-tag colours can set only `--tag-color`.
+.tag-chip {
+  --tag-color: var(--text-faint);
+  gap: 3px;
+  padding: 2px 9px;
+  font-size: 12px;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--tag-color) 16%, transparent);
+  text-decoration: none;
+}
+
+a.tag-chip { cursor: pointer; }
+a.tag-chip:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--tag-color) 26%, transparent);
+}
+
+.tag-hash {
+  flex: none;
+  color: var(--tag-color);
+  opacity: 0.9;
+  font-weight: 600;
+}
+
+.removable-tag-chip {
+  padding-right: 4px;
+}
+
+.tag-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 18px;
+  height: 18px;
+  margin-left: 1px;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--tag-color);
+  cursor: pointer;
+  opacity: 0.72;
+}
+
+.tag-remove svg {
+  flex-shrink: 0;
+}
+
+.tag-remove:hover {
+  opacity: 1;
+  color: var(--text);
+  background: color-mix(in srgb, var(--tag-color) 22%, transparent);
+}

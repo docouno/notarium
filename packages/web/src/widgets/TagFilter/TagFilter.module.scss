@@ -1,0 +1,134 @@
+/* The shared tag PANE (#109) — hierarchical chips + search, used in the Feed aside
+   and the Graph filters. Chips wrap compactly (no scroll-in-scroll), a parent's ▾
+   reveals its children as an indented sub-row, search jumps to any tag, top-N caps
+   the cloud. Inclusion model: a selected chip is accented (the app's one filter
+   language). `.padded` self-pads on the --gutter for the Feed aside; without it the
+   host (the Graph's padded .gf body) supplies the inset. */
+.tag-filter {
+  display: flex;
+  flex-direction: column;
+}
+
+/* Section head — mirrors the graph's .gf-section by default; .padded matches the
+   Feed FolderFilter's gutter-padded head so the two facets line up. */
+.head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 8px 0 2px;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+  font-weight: 600;
+}
+.padded .head { margin: 0; padding: 12px var(--gutter) 6px; font-size: 11px; }
+
+/* Search — a quiet inline field; clears with the × on the right. */
+.search {
+  position: relative;
+  display: flex;
+  align-items: center;
+  margin: 2px 0 6px;
+}
+.padded .search { margin: 2px var(--gutter) 6px; }
+.search-icon { position: absolute; left: 7px; color: var(--text-faint); pointer-events: none; }
+.search-input {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 22px 5px 24px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-hover);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+}
+.search-input::placeholder { color: var(--text-faint); }
+.search-input:focus { outline: none; border-color: color-mix(in srgb, var(--accent) 50%, var(--border)); }
+.search-clear {
+  position: absolute; right: 4px;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 18px; height: 18px; border: none; border-radius: var(--radius-xs);
+  background: transparent; color: var(--text-faint); cursor: pointer;
+}
+.search-clear:hover { color: var(--text); background: var(--bg-hover); }
+
+/* The chip cloud — wraps; the panel's own scroll handles overflow. */
+.cloud {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding-bottom: 8px;
+}
+.padded .cloud { padding-left: var(--gutter); padding-right: var(--gutter); padding-bottom: 12px; }
+
+/* One tag chip = a pill with a main toggle button + (for parents) a ▾ expander,
+   joined into a single pill by the wrapper. Neutral + color-ready like the note
+   chips: the unselected fill is a soft tint of `--tag-color` (a future per-tag hue),
+   hover deepens the SAME tone; SELECTED switches to the accent (the app's filter
+   selection state, independent of the tag's own colour). */
+.chip {
+  --tag-color: var(--text-faint);
+  display: inline-flex;
+  align-items: stretch;
+  max-width: 100%;
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--tag-color) 14%, transparent);
+  border: 1px solid transparent;
+}
+.chip:not(.chip-on):hover { background: color-mix(in srgb, var(--tag-color) 24%, transparent); }
+.chip-main {
+  display: inline-flex; align-items: center; gap: 5px; min-width: 0;
+  padding: 3px 8px; border: none; background: transparent; cursor: pointer;
+  border-radius: var(--radius-pill);
+  font: inherit; font-size: 11.5px; line-height: 1.2; color: var(--text-dim);
+}
+.chip-parent .chip-main { border-radius: var(--radius-pill) 0 0 var(--radius-pill); padding-right: 5px; }
+.chip-main:hover { color: var(--text); }
+.hash { flex: none; color: var(--tag-color); opacity: 0.9; font-weight: 600; }
+.name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.count { flex: none; font-size: 11px; color: var(--text-faint); }
+
+.chip-exp {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 20px; border: none; background: transparent; cursor: pointer;
+  color: var(--text-faint); border-radius: 0 var(--radius-pill) var(--radius-pill) 0;
+  border-left: 1px solid var(--border);
+}
+.chip-exp:hover { color: var(--text); background: var(--bg-hover); }
+.chip-exp svg { transition: transform 0.12s; }
+.chip-exp-open svg { transform: rotate(90deg); }
+
+/* Selected chip — accented (the inclusion mark), matching the graph's old tag-pick
+   and the active feed filter. */
+.chip-on {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 34%, transparent);
+}
+.chip-on:hover { background: color-mix(in srgb, var(--accent) 26%, transparent); }
+.chip-on .chip-main { color: var(--text); }
+.chip-on .hash { color: var(--accent); opacity: 1; }
+.chip-on .chip-exp { border-left-color: color-mix(in srgb, var(--accent) 30%, transparent); }
+
+/* An expanded parent's children: a labelled, indented sub-row beneath the cloud. */
+.sub {
+  padding-left: calc(8px + var(--depth, 0) * 12px);
+}
+.padded .sub { padding-left: calc(var(--gutter) + 8px + var(--depth, 0) * 12px); padding-right: var(--gutter); }
+.sub-head {
+  display: flex; align-items: center; gap: 3px;
+  font-size: 11px; color: var(--text-faint); margin: 0 0 4px;
+}
+.sub-branch { color: var(--text-faint); }
+
+/* "show N more / less" — a quiet inline pill in the cloud flow. */
+.more {
+  border: 1px dashed var(--border); background: transparent; cursor: pointer;
+  padding: 3px 9px; border-radius: var(--radius-pill);
+  font: inherit; font-size: 11px; color: var(--text-faint);
+}
+.more:hover { color: var(--text); border-color: var(--text-faint); }
+
+.empty { font-size: 12px; color: var(--text-faint); padding: 2px 0 10px; }
+.padded .empty { padding: 2px var(--gutter) 12px; }

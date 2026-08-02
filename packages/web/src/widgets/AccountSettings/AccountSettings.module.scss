@@ -1,0 +1,198 @@
+/* Account settings (#10, #28) — settings-page tabs (Password + API tokens), now
+   composed from SettingsSection / SecretReveal / EmptyState; this module owns
+   what's left: the forms and the token table. */
+
+/* A vertical form body inside a section (the section header is above it). */
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* Submit row — the action sits at the right edge under the fields. */
+.form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.field-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+
+  > * {
+    flex: 1 1 160px;
+    min-width: 0;
+  }
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+
+  > span {
+    font-size: 11px;
+    font-weight: 550;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-faint);
+  }
+
+  input[type='password'],
+  input[type='text'],
+  input:not([type]) {
+    padding: 7px 10px;
+    font: inherit;
+    font-size: 13px;
+    color: var(--text);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    outline: none;
+
+    &:focus {
+      border-color: var(--accent);
+    }
+  }
+}
+
+/* The title line shared by the create + edit forms (and the connections edit
+   form) — a consistent header so every inline form reads the same way. */
+.form-header {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.create-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px;
+  background: var(--bg-list);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  /* Drive the field grid off the FORM's own width, not the viewport — the sidebar
+     can collapse and resize the content area on its own. */
+  container: pat-form / inline-size;
+}
+
+/* The create-token field grid, responsive in three steps:
+   - narrowest          : one column, every field on its own row
+   - ≥ 360px (form width): Name spans the top, Scope + Expires share the row below
+   - ≥ 540px            : three columns — Name | Scope | Expires */
+.pat-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 12px;
+}
+
+@container pat-form (min-width: 360px) {
+  .pat-grid {
+    grid-template-columns: auto auto;
+  }
+
+  .pat-grid > :first-child {
+    grid-column: 1 / -1; /* Name on its own full-width row above the two controls */
+  }
+}
+
+@container pat-form (min-width: 540px) {
+  .pat-grid {
+    grid-template-columns: minmax(0, 1fr) auto auto;
+  }
+
+  .pat-grid > :first-child {
+    grid-column: auto;
+  }
+}
+
+/* The edit form has only two fields (Name + Scope). Reusing .pat-grid's three-column
+   template left an empty trailing column whose gap pulled the row 12px short of the
+   actions row, so the Save button and the field row had different right edges. A
+   dedicated two-column grid (Name flexes, Scope sits at the right edge) fills the
+   full width and lines the row up with Save. */
+.pat-grid-edit {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 12px;
+}
+
+@container pat-form (min-width: 360px) {
+  .pat-grid-edit {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+}
+
+/* A field whose control sizes to its content (segmented pills, a switch) instead
+   of being stretched to the column width by the row's flex layout. In a field-row
+   it also opts out of the equal-flex sizing: it keeps its natural width and wraps
+   as a whole block to the next line when the row runs out of room — so a control
+   like the Expires pills never gets squeezed narrow enough to break its labels. */
+.field-control {
+  align-items: flex-start;
+  flex: 0 0 auto;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+
+  th {
+    padding: 6px 8px;
+    text-align: left;
+    font-size: 10.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-faint);
+    border-bottom: 1px solid var(--border);
+  }
+
+  td {
+    padding: 7px 8px;
+    color: var(--text-dim);
+    border-bottom: 1px solid var(--border);
+    vertical-align: middle;
+  }
+}
+
+.cell-name {
+  color: var(--text);
+  font-weight: 550;
+}
+
+.cell-actions {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.badge {
+  display: inline-block;
+  padding: 1px 7px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+  background: var(--bg-hover);
+  border-radius: var(--radius-pill);
+}
+
+.badge-accent {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.error {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--danger);
+}
+
+.ok {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}

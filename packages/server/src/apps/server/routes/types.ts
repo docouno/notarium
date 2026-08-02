@@ -1,0 +1,48 @@
+import type { ArtifactStore } from '../../../libs/artifactStore'
+import type { BuildInfo } from '../../../libs/buildInfo'
+import type { HostInfo } from '../../../libs/hostInfo'
+import type { ImportStagingStore } from '../../../libs/importStaging'
+import type { AuthService } from '../../../services/auth'
+import type {
+  ContextOrderPersistence,
+  ContextSetsPersistence,
+  FavoritesPersistence,
+  FolderIdentityPersistence,
+  JobsPersistence,
+  ProjectsPersistence,
+  RetrievalLogPersistence,
+  ScopePinsPersistence,
+  SpacesPersistence,
+} from '../../../services/metaDb'
+import type { MarkerStore } from '../../../services/projects'
+import type { SpaceManager } from '../../../services/spaces'
+
+/** Dependency-injection options for the API routes; optional deps are honest
+ *  capability degradation (P5) — a meta-DB-less / FS-less host omits them and the
+ *  matching routes 404 or fall back. canon: docs/architecture.md#p5 */
+export type ApiRoutesOptions = {
+  spaces: SpaceManager
+  auth: AuthService
+  projects?: ProjectsPersistence
+  folders?: FolderIdentityPersistence
+  favorites?: FavoritesPersistence
+  contextSets?: ContextSetsPersistence
+  scopePins?: ScopePinsPersistence
+  contextOrder?: ContextOrderPersistence
+  retrievalLog?: RetrievalLogPersistence
+  markerStore?: MarkerStore
+  spacesPersistence?: SpacesPersistence
+  about?: HostInfo
+  /** This build's identity. Absent ⇒ the bundle's own inlined identity, which is
+   *  what production always wants; injectable so a harness can serve the released
+   *  shape (a real commit and source link) without being a released build.
+   *  canon: docs/release.md#identity */
+  build?: BuildInfo
+  jobs?: JobsPersistence
+  /** Paired with `jobs` — both present or neither. */
+  artifacts?: ArtifactStore
+  /** Paired with `jobs`. */
+  staging?: ImportStagingStore
+  /** Nudge the runner to claim immediately after enqueue; absent ⇒ next poll tick. */
+  wakeJobs?: () => void
+}

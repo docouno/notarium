@@ -1,0 +1,86 @@
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+// The two fields share a row on a wide panel and wrap to a stack on a narrow one
+// (`flex: 1 1 16rem` — grow to fill, shrink, wrap once each would fall below ~16rem).
+.fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1 1 16rem;
+  min-width: 0;
+}
+
+.label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.hint {
+  font-size: 12.5px;
+  color: var(--text-faint);
+  line-height: 1.45;
+  transition: color 0.15s ease;
+
+  code {
+    font-family: var(--font-mono, ui-monospace, monospace);
+    color: var(--text);
+  }
+}
+
+// A rejected character: the hint shifts to the soft warning amber (never the red
+// error tone) to explain why the keystroke was skipped — informational, not alarming.
+.hint-blocked {
+  color: var(--warning);
+}
+
+.input {
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+  padding: 9px 12px;
+
+  &:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+}
+
+// The slug is a URL handle, not prose — render it monospace like the project handles.
+.input-slug {
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+
+.aliases {
+  font-size: 11.5px;
+  color: var(--text-faint);
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+
+// Save sits under the fields, right-aligned (mirrors the Profile/Account submit rows).
+.form-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+// Danger zone (#110): the destructive action, right-aligned (mirrors the General
+// section's Save button so the two action rows line up down the right edge).
+.danger-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  justify-content: flex-end;
+}

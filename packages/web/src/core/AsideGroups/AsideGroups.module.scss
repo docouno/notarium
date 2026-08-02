@@ -1,0 +1,128 @@
+/* The right aside as a vertical stack of tabbed groups (#35). Container owns width
+   + left-edge resize; each group owns a tab strip, a scrolling body, and (unless
+   it's the last, flexing group) a bottom resize handle with a corner grip. */
+.aside {
+  position: relative;
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  height: 100%;
+  border-left: 1px solid var(--border);
+  background: var(--bg-list);
+}
+.width-resize {
+  position: absolute; left: -3px; top: 0; bottom: 0; width: 6px;
+  cursor: col-resize; z-index: 7;
+}
+.width-resize::after {
+  content: ''; position: absolute; top: 0; bottom: 0; left: 50%;
+  width: 2px; transform: translateX(-50%);
+  background: var(--accent); opacity: 0; transition: opacity 0.12s;
+}
+.width-resize:hover::after { opacity: 0.5; }
+
+.stack { display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: hidden; }
+
+.group {
+  position: relative;
+  display: flex; flex-direction: column;
+  min-height: 0; min-width: 0;
+  overflow: hidden;
+}
+.group:not(:last-child) { border-bottom: 1px solid var(--border); }
+
+/* The head FLOATS over its group body (absolute) so the body scrolls under its
+   glass; the body re-claims the band via padding-top. Material + bottom edge come
+   from the shared `.glass` classes (added in AsideGroups.tsx). */
+.group-head {
+  position: absolute; top: 0; left: 0; right: 0; z-index: 5;
+  height: var(--chrome-h); min-height: var(--chrome-h);
+  /* Tone the glass to the aside surface (--bg-list) so heads don't read whiter
+     than the bodies they float over. */
+  --glass-bg: color-mix(in srgb, var(--bg-list) 72%, transparent);
+  --glass-bg-opaque: var(--bg-list);
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  /* Gutter MINUS the tab pad: each tab/the toggle adds --tab-pad back, so the first
+     tab's text and the toggle's edge both land on the gutter (matching the topbar
+     and the panel body) — the underline just gets wider than the text. */
+  padding: 0 calc(var(--gutter) - var(--tab-pad));
+}
+
+/* Tab strip — text buttons with an active underline on the head's bottom border.
+   No inter-tab gap: each tab's --tab-pad gives the visual spacing AND keeps the hit
+   areas touching (no dead space between tabs). Overflows horizontally if a group
+   holds many tabs, but the scrollbar chrome is hidden (Linux/GTK draws a thick
+   always-on bar otherwise) — scroll still works. */
+.tabs {
+  display: flex; align-items: stretch; gap: 0; height: 100%; min-width: 0;
+  overflow-x: auto; overflow-y: hidden;
+  scrollbar-width: none; -ms-overflow-style: none;
+}
+.tabs::-webkit-scrollbar { display: none; }
+.tab {
+  position: relative; display: inline-flex; align-items: center; gap: 5px;
+  padding: 0 var(--tab-pad); border: none; background: none; cursor: pointer; white-space: nowrap;
+  font-size: 13px; font-weight: 500; color: var(--text-faint);
+  transition: color 0.12s;
+}
+.tab:hover { color: var(--text-dim); }
+.tab.active { color: var(--text); font-weight: 600; }
+.tab.active::after {
+  content: ''; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px;
+  background: var(--accent); border-radius: 2px 2px 0 0;
+}
+.badge {
+  font-size: 11px; font-weight: 600; line-height: 1;
+  padding: 1px 5px; border-radius: var(--radius-md);
+  color: var(--text-faint); background: var(--bg-elevated);
+}
+.tab.active .badge { color: var(--accent); }
+
+/* Holds the panel toggle (collapse) in the first group's head. The margin adds the
+   tab pad back on the right, so the toggle's edge lands on the gutter — same x as the
+   topbar toggle, so it doesn't jump when the panel opens/closes. */
+.group-actions { display: flex; align-items: center; gap: 2px; flex: 0 0 auto; margin-right: var(--tab-pad); }
+
+/* padding-top reclaims the floating head's band so the first content isn't hidden;
+   --sb-inset-top keeps the scrollbar thumb out from under that same glass head (#176). */
+.group-body {
+  flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column;
+  padding-top: var(--chrome-h);
+  --sb-inset-top: var(--chrome-h);
+}
+
+/* Bottom resize handle — straddles the group's border like the graph's vertical
+   one; the corner grip sits over its left end and adds the width axis. */
+.group-resize {
+  position: absolute; left: 0; right: 0; bottom: -3px; height: 6px;
+  cursor: row-resize; z-index: 5;
+}
+.group-resize::after {
+  content: ''; position: absolute; left: 0; right: 0; top: 50%;
+  height: 2px; transform: translateY(-50%);
+  background: var(--accent); opacity: 0; transition: opacity 0.12s;
+}
+.group-resize:hover::after { opacity: 0.5; }
+/* Corner grip: resizes width + this group's height. The hit area straddles the
+   border like the divider, but its indicator sits just INSIDE the clip box — the
+   group is overflow:hidden, so a mark below the border (as the divider's centred
+   line is at the border) gets clipped, which is why the corner used to look dead on
+   hover. Hovering it lights both the corner mark and the divider line (the two-axis
+   affordance). It's ordered before .group-resize so the sibling selector reaches. */
+.group-corner {
+  position: absolute; left: 0; bottom: -4px; width: 16px; height: 14px;
+  cursor: nwse-resize; z-index: 6;
+}
+.group-corner::after {
+  content: ''; position: absolute; left: 3px; bottom: 8px; width: 8px; height: 8px;
+  border-left: 2px solid var(--accent); border-bottom: 2px solid var(--accent);
+  border-bottom-left-radius: 2px; opacity: 0; transition: opacity 0.12s;
+}
+.group-corner:hover::after { opacity: 0.9; }
+/* Hovering the corner lights BOTH axes it resizes: the divider line (this group's
+   bottom, via the sibling) and the aside's left edge along its full height (width,
+   via :has() up to the container) — so the affordance shows everything the drag
+   will move, not just the bottom. */
+.group-corner:hover ~ .group-resize::after { opacity: 0.5; }
+.aside:has(.group-corner:hover) .width-resize::after { opacity: 0.5; }

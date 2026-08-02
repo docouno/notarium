@@ -1,0 +1,63 @@
+/* The editor splits into siblings of the page's scroll container (NOT one `.doc`)
+   so the bottom status bar can span the full PAGE width while its content — the
+   whole document — stays in a centered 740px column (#115 follow-up):
+     body-col    centered editor / preview
+     status-bar  full-bleed glass strip floating at the window bottom → word/char/time
+   There is no separate title column since #156 — the title is the document's
+   leading `# H1`, edited inline in the body. Formatting is contextual (#119): a
+   floating bar over the selection + the `/` slash menu, both rendered over the
+   editor — there's no top toolbar strip. The status bar shows only while editing
+   (Preview is a clean rendered view) and stays glued to the window bottom even at
+   max scroll (it's the LAST scroll child, so sticky bottom:0 never detaches). */
+
+/* Centered text column — same width/top inset as the reader's `.doc`, so the body
+   doesn't jump between reading and editing.
+   flex:1 so it fills the editing flex-column (DocumentLayout .editing-scroll) and
+   pushes the bottom status bar to the window bottom on short notes; basis auto +
+   no-shrink so a long note keeps its full height and overflows into scroll. */
+.body-col { width: 100%; max-width: var(--doc-width); margin: 0 auto; padding: 44px 0 16vh; flex: 1 0 auto; }
+
+.editor-body { min-height: 50vh; }
+
+/* The status bar is CHROME, not content — so it floats at the bottom of the main
+   column exactly like the topbar floats at the top, instead of riding inside the
+   scroll flow. position:absolute with its containing block = PageFrame's `.frame`
+   (the one position:relative ancestor, OUTSIDE the scroll container) buys two things
+   a sticky scroll-child couldn't: it spans the FULL main width — OVER the scrollbar
+   gutter, so the scrollbar passes under it just like under the topbar (it no longer
+   stops short at the scroller's content edge) — and it stays glued to the window
+   bottom without the flex-column push. Frosted material + top edge come from the
+   shared `.glass`/`.glass-edge-top` classes (added in JSX); here it's only geometry. */
+.status-bar {
+  position: absolute; left: 0; right: 0; bottom: 0; z-index: 3;
+  /* Fixed height (no vertical padding) so the left toggles can be full-height flush
+     cells — see .bar-controls. --gutter (NOT --content-gutter) on the sides: the left
+     toggle cells line up with the topbar's panel-toggle box (same 12px inset), and the
+     right-pinned stats sit at the same inset as the topbar's right controls. Height is
+     the shared --editor-statusbar-h token (#231): the same value the editor reserves
+     below the caret, so the bar and its scroll reservation can never drift. */
+  height: var(--editor-statusbar-h); padding: 0 var(--gutter);
+}
+
+/* Status bar layout: writing-aid toggles pinned LEFT, stats pinned RIGHT (the
+   familiar editor status-bar placement), spanning the full page width. `stretch` so
+   the toggle cells fill the bar height; the stats re-center themselves. */
+.bar-inner {
+  display: flex; align-items: stretch;
+  justify-content: space-between;
+  height: 100%; font-size: 12.5px; color: var(--text-dim); user-select: none;
+}
+/* The right cluster — words · chars · reading time (vertically centered). */
+.stats { display: flex; align-items: center; gap: 8px; }
+/* The left cluster — focus / typewriter toggles (#118). Full-height, FLUSH (no gap)
+   square CELLS rather than little pills: in a slim status bar that reads cleaner and
+   gives the 14px glyph the bar's full height to breathe, without growing the bar. The
+   two-class selector outweighs IconToggle's own single-class 32px/7px-radius base. */
+.bar-controls { display: flex; }
+.bar-controls .stat-toggle { width: 30px; height: 100%; border-radius: 0; }
+.status-bar .dot { color: var(--text-faint); }
+.stat-tag {
+  font-size: 11px; font-weight: 600; letter-spacing: 0.02em; text-transform: uppercase;
+  color: var(--accent); background: var(--accent-soft);
+  padding: 1px 7px; border-radius: var(--radius-pill);
+}

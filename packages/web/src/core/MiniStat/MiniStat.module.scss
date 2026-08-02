@@ -1,0 +1,19 @@
+/* Mini-stat: a "big number + label" tile, with an optional muted "/total" when a
+   count is narrowed (e.g. by filters). `MiniStats` is the row that wraps them — a
+   query container so the tiles can reflow at narrow widths rather than spill past
+   the panel edge. Some callers (Feed aside) supply their own padded row instead
+   and drop bare <MiniStat> tiles into it. */
+.mini-stats { display: flex; gap: 8px; flex-wrap: wrap; container-type: inline-size; }
+.mini-stat {
+  flex: 1 1 72px; min-width: 0; display: flex; flex-direction: column; gap: 2px;
+  padding: 12px; border-radius: var(--radius-md); background: var(--bg-hover);
+}
+/* Below a comfortable width the primary (first) tile takes the full width on top
+   and the rest sit below it — rather than three cramped tiles across. */
+@container (max-width: 330px) {
+  .mini-stat:first-child { flex-basis: 100%; }
+}
+.mini-stat-num { font-size: 22px; font-weight: 600; color: var(--text); }
+/* Trailing "/total" — muted context, not a competing number. */
+.mini-stat-of { font-size: 13px; font-weight: 500; color: var(--text-faint); }
+.mini-stat-label { font-size: 12px; color: var(--text-faint); }

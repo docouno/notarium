@@ -1,0 +1,119 @@
+/* Note-history timeline (#12): fills the whole aside body (the History tab).
+   The list is a size container so rows restack when the aside is squeezed. */
+.timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px;
+  container-type: inline-size;
+}
+
+.count {
+  padding: 4px 10px 8px;
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+/* Two columns: the version name + date on the left, who + change size on the
+   right (right-aligned). Auto-flow fills row-wise — version, who, when, stats. */
+.item {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  column-gap: 12px;
+  row-gap: 3px;
+  align-items: baseline;
+  text-align: left;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: none;
+  cursor: pointer;
+  color: var(--text);
+  font: inherit;
+}
+.item:hover { background: var(--bg-hover); }
+.itemActive,
+.itemActive:hover { background: var(--accent-soft); }
+
+/* Version name (primary), with the kind badge tucked beside it. */
+.version {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.kind {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.kind-write { color: var(--accent-2); }
+.kind-external { color: var(--warning); }
+.kind-restore { color: var(--accent-2); }
+.kind-delete { color: var(--danger); }
+
+.itemWho {
+  justify-self: end;
+  text-align: right;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.itemWhen {
+  font-size: 11px;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+.itemTitle {
+  justify-self: end;
+  max-width: 100%;
+  font-size: 12px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.itemStats {
+  justify-self: end;
+  display: flex;
+  gap: 8px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.added { color: var(--ins, #3fb950); }
+.removed { color: var(--danger); }
+.noChange { color: var(--text-faint); }
+
+/* Squeezed aside: drop to a single column so the rows stop fighting for width;
+   the right-aligned who/stats fall in under the version name, left-aligned. */
+@container (max-width: 290px) {
+  .item { grid-template-columns: 1fr; }
+  .itemWho,
+  .itemTitle,
+  .itemStats { justify-self: start; text-align: left; }
+}
+
+.error {
+  padding: 12px 10px;
+  color: var(--danger);
+  font-size: 13px;
+}
+
+/* First-load skeleton row: mirrors .item's two-column geometry. */
+.skeletonItem {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  column-gap: 12px;
+  align-items: center;
+  padding: 8px 10px;
+}

@@ -1,0 +1,49 @@
+// The deleted-note read-only view (#79): a sticky banner over the note's last
+// state, matching the revision-history banner's rhythm.
+
+.view {
+  position: relative;
+}
+
+.banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.info {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 12.5px;
+  color: var(--text-dim);
+
+  svg {
+    flex: none;
+    color: var(--warning, #c98a00);
+  }
+}
+
+.dot {
+  opacity: 0.55;
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
+// An honest gap (no captured body) — a calm note in the reader column.
+.gap {
+  max-width: 65ch;
+  margin: 40px auto;
+  padding: 0 var(--content-gutter);
+  color: var(--text-faint);
+  font-size: 14px;
+  line-height: 1.6;
+  text-align: center;
+}

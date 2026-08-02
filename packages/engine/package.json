@@ -1,0 +1,17 @@
+{
+  "name": "@notarium/engine",
+  "version": "0.1.0",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "type": "module",
+  "description": "NotariumStore: the canonical KnowledgeStore engine (#69) — markdown files as truth, a derived SQLite index (FTS5) behind async SQL/file seams; desktop and cloud differ only in which adapters are plugged in (P9 profiles)",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@notarium/core": "*"
+  }
+}

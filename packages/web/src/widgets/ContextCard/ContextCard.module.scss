@@ -1,0 +1,83 @@
+// The context card's note-card semantics — title / summary / details / ⋮ menu / muted
+// fade. The card CHROME and the disclosure toggle live in the shared `DisclosureCard`
+// primitive (core/DisclosureCard), unified with the Audit log (#243).
+.title {
+  flex: 1;
+  min-width: 0;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+// The ⋮ menu button — a zone of the same surface (only the directly-hovered button
+// gets a soft tint over the card's hover fill, no hard divider).
+.more {
+  flex: none;
+  width: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: var(--text-faint);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+
+  &:hover {
+    background: color-mix(in srgb, var(--text) 8%, transparent);
+    color: var(--text);
+  }
+
+  &:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+}
+
+// ── revealed detail (on expand) — aligned under the header's 12px inset ──
+.body {
+  padding: 0 12px 9px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.summary {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--text-dim);
+}
+
+.details {
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+// muted memory: fade the title (and its revealed detail) — never a colour fill.
+.muted {
+  .title,
+  .summary,
+  .details {
+    opacity: 0.5;
+  }
+}
+
+// ── #12 provenance line (CardProvenance), shown in the expanded detail ──
+.prov {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-faint);
+
+  svg {
+    flex: none;
+  }
+}
+
+.dot {
+  opacity: 0.6;
+}

@@ -1,0 +1,16 @@
+/* Segmented control — a row of mutually-exclusive pill buttons. `block` stretches
+   it full-width with equal segments (filter facets). */
+.seg { display: inline-flex; background: var(--bg-hover); border-radius: var(--radius-md); padding: 2px; gap: 2px; }
+.seg.block { display: flex; }
+.seg.block .seg-btn { flex: 1; justify-content: center; }
+.seg-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  border: none; background: transparent; cursor: pointer;
+  padding: 5px 10px; border-radius: var(--radius-sm); font-size: 13px;
+  white-space: nowrap; /* a multi-word label ("30 days") must never break across lines */
+  color: var(--text-faint);
+}
+.seg-btn:hover { color: var(--text); }
+.seg-btn.on { background: var(--bg); color: var(--accent); box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08); }
+.seg-btn:disabled { cursor: not-allowed; opacity: 0.5; }
+.seg-btn:disabled:hover { color: var(--text-faint); }

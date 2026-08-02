@@ -1,0 +1,18 @@
+/* Document-page topbar bits that ride in PageFrame's slots. The breadcrumb (the
+   `topbarLeft` slot) is the shared Breadcrumbs component; what's left here is the
+   separator between document actions and view controls. The frame chrome itself
+   (topbar, content gutter) lives in PageFrame. */
+/* Splits document actions from the view controls (panel toggle). */
+.action-sep { width: 1px; align-self: stretch; margin: 8px 2px; background: var(--border); }
+
+/* Editing only: make the scroll area a flex column so the editor body (.body-col,
+   flex:1) stretches to fill a short note and the bottom status bar lands at the
+   window bottom rather than floating mid-screen. Still scrolls + sticks when the
+   note overflows. */
+.editing-scroll { display: flex; flex-direction: column; }
+/* The glass status bar floats over the scroller's bottom ONLY while actually editing
+   (EditorBody renders it under `!preview`). Inset the scrollbar thumb clear of it so the
+   bar isn't half-hidden under the strip (#176) — but ONLY when the strip exists: Preview
+   hides the status bar, so this class is dropped there to avoid a phantom bottom inset.
+   Top inset comes from .content-scroll (the topbar band). */
+.editor-status-inset { --sb-inset-bottom: var(--editor-statusbar-h); }

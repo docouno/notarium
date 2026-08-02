@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <!-- Notarium brand mark: the IconBrain glyph (src/core/Icons) in white on the
+       accent purple (#6d4ee0, tokens.scss). Placeholder identity for the PWA icon
+       set (#40) — coherent with the in-app brand; swap for the real branding/
+       mascot when #14/#92 land. This file is BOTH the SVG favicon shipped to the
+       browser AND the single source the icon set is generated from
+       (pwa-assets.config.ts → `npm run pwa:assets -w @notarium/web`). The brain is
+       centred at ~47% height so it stays inside the maskable safe zone. -->
+  <rect width="512" height="512" rx="112" fill="#6d4ee0"/>
+  <g transform="translate(100 96.75) scale(13)" fill="none" stroke="#ffffff" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M9 3a3 3 0 0 0-3 3 3 3 0 0 0-2 5 3 3 0 0 0 1 5 3 3 0 0 0 5 1.5V5.5A3 3 0 0 0 9 3Z"/>
+    <path d="M15 3a3 3 0 0 1 3 3 3 3 0 0 1 2 5 3 3 0 0 1-1 5 3 3 0 0 1-5 1.5V5.5A3 3 0 0 1 15 3Z"/>
+  </g>
+</svg>

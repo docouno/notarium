@@ -1,0 +1,26 @@
+/* The shared explorer-tree lifecycle skin (#220). These three containers mirror the
+ * spacing the file tree used before the unification (Sidebar.module.scss:
+ * .tree-skeleton / .list-error / .rail-empty), so folding every tree onto TreeState
+ * is a pure de-duplication — the file tree looks unchanged, the memory tree and the
+ * filter now match it. */
+
+.skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  padding: 8px 10px;
+}
+
+.skeleton-row {
+  display: flex;
+}
+
+/* A cold-load error: the compact panel banner (Notice), inset like a tree row. */
+.error {
+  padding: 4px 8px;
+}
+
+/* The loaded-empty placeholder — hosts a bare <EmptyState>. */
+.empty {
+  padding: 10px;
+}

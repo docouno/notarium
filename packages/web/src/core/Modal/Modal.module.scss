@@ -1,0 +1,56 @@
+/* Base modal: a dimmed overlay with a centred panel. The dim + blur sit on their
+   own layer behind the panel (see Modal.tsx) so the panel's box-shadow stays out
+   of the backdrop-filter compositing group, which would otherwise band it. */
+.modal-overlay {
+  position: fixed; inset: 0; z-index: var(--z-modal);
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px;
+  animation: modal-overlay-in 40ms ease-out;
+}
+.modal-backdrop {
+  position: absolute; inset: 0;
+  /* Dim + blur are knobs (defaults unchanged for every dialog): a consumer that
+     wants the page to read THROUGH it (glass over content, e.g. Spotlight) lightens
+     --modal-backdrop-dim / drops --modal-backdrop-blur via the overlayClassName. */
+  background: var(--modal-backdrop-dim, var(--backdrop-dim));
+  backdrop-filter: blur(var(--modal-backdrop-blur, 8px));
+  -webkit-backdrop-filter: blur(var(--modal-backdrop-blur, 8px));
+  pointer-events: none;
+}
+/* Sizing system: the panel width comes from a preset token (never from the
+   content — a child can fill up to the cap but not stretch it), and the panel
+   is a viewport-capped flex column so dialog bodies scroll INSIDE it instead
+   of growing past the screen. Consumers pick a preset via the `size` prop. */
+.modal-panel {
+  --modal-width: 420px; /* sm — the default */
+  position: relative; z-index: 1;
+  width: 100%; max-width: var(--modal-width);
+  max-height: 100%; /* the overlay's padding is the viewport gutter */
+  display: flex; flex-direction: column;
+  min-height: 0;
+  /* The frosted fill comes from the shared `.glass` class (added in Modal.tsx) — it
+     refracts the dimmed, blurred app behind it for depth. Kept nearly opaque so a
+     dialog's form stays fully readable; the panel keeps its own crisp rim + drop and
+     adds the lit top edge. */
+  --glass-bg: color-mix(in srgb, var(--bg-elevated) 92%, transparent);
+  --glass-bg-opaque: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow:
+    inset 0 1px 0 var(--glass-highlight),
+    0 2px 6px rgba(0, 0, 0, 0.3),
+    0 16px 36px -8px rgba(0, 0, 0, 0.4);
+  outline: none;
+  animation: modal-panel-in 0.14s cubic-bezier(0.2, 0.8, 0.3, 1);
+}
+.size-sm { --modal-width: 420px; }
+.size-md { --modal-width: 560px; }
+.size-lg { --modal-width: 760px; }
+/* xl — workbench dialogs (the note history's timeline + diff, #12): diff wants
+   width, so take most of the viewport but keep the overlay gutter visible. */
+.size-xl { --modal-width: min(1100px, 100%); }
+@keyframes modal-overlay-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes modal-panel-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}

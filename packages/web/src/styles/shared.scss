@@ -1,0 +1,43 @@
+/* Cross-cutting structural & utility classes deliberately shared by 2+ components
+   and not worth their own component. Kept global (plain class strings in JSX) so a
+   single rule serves every consumer. Component-private styles live in co-located
+   *.module.scss; this file is the small, explicit shared layer. */
+
+/* Document container — the reader (NoteReader). The editor (EditorBody) mirrors
+   its 740px width and 44px title inset in its own centered columns so a note's
+   title/width doesn't shift between read and edit. */
+.doc { max-width: var(--doc-width); margin: 0 auto; padding: 44px 0 16vh; }
+
+/* Main column (column 3 frame) — DocumentLayout and the graph page share it. */
+.main { flex: 1; display: flex; flex-direction: column; min-width: 0; height: 100%; }
+
+/* The old global `.banner` error plashka is gone (#65): errors now have owners —
+   the Notice primitive in the sidebar (list), StateView on the note page, and
+   toasts for actions. */
+
+/* Generic centred loading text. */
+.loading { padding: 60px; text-align: center; color: var(--text-faint); }
+
+/* Graph-aside section header — shared by the Filters tab (GraphView) and the
+   Search tab (GraphSearch), which live in the same aside but are different
+   levels (composer vs widget), so the shared header is global, not a module. */
+.gf-section {
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--text-faint); margin: 8px 0 2px;
+}
+/* Reset "×" — fixed slot in the section header (never shifts), faded + inert when
+   there's nothing to reset. */
+.gf-section-reset {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; margin: -4px 0; border-radius: var(--radius-xs);
+  border: none; background: transparent; color: var(--text-faint); cursor: pointer;
+  transition: opacity 0.1s, color 0.1s, background 0.1s;
+}
+.gf-section-reset:hover { color: var(--text); background: var(--bg-hover); }
+.gf-section-reset:disabled { opacity: 0; pointer-events: none; }
+
+@media (max-width: 900px) {
+  /* Horizontal gutter is owned by .content-scroll now; only trim the top space. */
+  .doc { padding: 28px 0 16vh; }
+}

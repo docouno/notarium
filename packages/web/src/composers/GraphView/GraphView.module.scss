@@ -1,0 +1,48 @@
+/* Graph view = canvas (flex:1) + a collapsible filters aside, like the doc view.
+   The aside section headers (.gf-section) and stat tiles (<MiniStat>) are shared
+   primitives; the filters panel body (.gf) and canvas overlays live here. */
+.graph-view { display: flex; flex: 1; min-height: 0; min-width: 0; }
+
+.graph-wrap { position: relative; flex: 1; min-width: 0; min-height: 0; overflow: hidden; }
+/* Graph load-failure notice (#65) — floats over the canvas, top-left. */
+.graph-error { position: absolute; top: 16px; left: 16px; right: 16px; z-index: 6; max-width: 420px; }
+.graph-overlay {
+  /* top aligns the chips' vertical centre with the doc-view topbar toggle
+     (~25.5px) so the sidebar toggle doesn't visually jump between views. left is
+     the shared --gutter (not a literal), matching the topbar's left toggle on
+     every other page, so the rail toggle sits at the same x across views. */
+  position: absolute; top: 9.5px; left: var(--gutter); z-index: 5;
+  display: flex; align-items: center; gap: 10px;
+  pointer-events: none;
+}
+/* Filters panel toggle, docked top-right opposite the left chips, on the --gutter
+   (token, not a literal) — same x as the bottom-right zoom column and as the panel
+   toggle in the topbar/aside header on other pages. */
+.graph-overlay-right { position: absolute; top: 9.5px; right: var(--gutter); z-index: 5; }
+
+/* Graph filters aside body — content inset is the shared --gutter (not a literal),
+   so it matches every other aside's content edge. */
+.gf { display: flex; flex-direction: column; gap: 6px; padding: var(--gutter); }
+.gf .muted { color: var(--text-faint); }
+
+/* The specific-tag pane (#109 part C) is now the shared <TagFilter> widget — the
+   same hierarchical-chips + search the Feed aside uses — so the graph no longer
+   carries its own chip styles. */
+
+/* Read-model warm-up chip (#62): a quiet floating status over the canvas while
+   the server is still scanning — bottom-centre so it reads as "about the data",
+   not a control. */
+/* Frosted material + rim + drop come from the shared `.glass`/`.glass-float`
+   classes (added in JSX) so the chip refracts the canvas behind it; here it's the
+   pill geometry + a small drop + the opaque fallback. */
+.sync-chip {
+  position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%); z-index: 5;
+  padding: 4px 12px; border-radius: var(--radius-pill);
+  /* Floats over the (busy) canvas: the more-opaque float fill + full-contrast text
+     (--text) keep the status message legible at the worst moment (#72 a11y review). */
+  --glass-bg: var(--glass-menu-bg);
+  --glass-bg-opaque: var(--bg-elevated);
+  --glass-drop: 0 2px 8px rgba(0, 0, 0, 0.08);
+  color: var(--text); font-size: 12px; white-space: nowrap;
+  pointer-events: none;
+}

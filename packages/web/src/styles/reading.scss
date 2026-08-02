@@ -1,0 +1,85 @@
+/* Reading typography (#27) — the font + size of the RENDERED markdown body
+   (`.markdown`: reader, the editor's Preview, history, the Settings sample) and
+   the WYSIWYM editor. Two orthogonal runtime knobs, mirroring the theme rail:
+   `data-reading-font` / `data-reading-size` on <html> map to --reading-font /
+   --reading-size (defaults in tokens.scss); markdown.scss/wysiwym-source.scss
+   consume them. ChromeProvider sets the attrs; AppearanceTab drives them.
+
+   The @font-face rules are GENERATED into reading-faces.scss (run
+   scripts/gen-reading-faces.mjs). Self-hosted woff2, split by subset (latin /
+   latin-ext / cyrillic / greek / vietnamese) via unicode-range → the browser
+   fetches only the subset a note uses, only for the active family, lazily; the
+   PWA runtime-caches each file (vite.config). This file holds only the preset
+   mappings + the size scale.
+
+   Multilingual: the bundled subsets cover ~all European scripts (incl. Russian,
+   Greek, Vietnamese, Latin-ext). Scripts we don't bundle (CJK, Arabic, Hebrew,
+   Indic) fall through to the OS font — every stack ends in a system family + the
+   generic keyword, and no @font-face is declared for those ranges, so the browser
+   resolves them from the platform font automatically (the GitHub/Notion pattern).
+   JetBrains Mono additionally backs --font-mono (tokens.scss). */
+
+/* ── Sans ─────────────────────────────────────────────────────────────────── */
+:root[data-reading-font='inter'] {
+  --reading-font: 'Inter', var(--font-system);
+}
+:root[data-reading-font='open-sans'] {
+  --reading-font: 'Open Sans', var(--font-system);
+}
+:root[data-reading-font='roboto'] {
+  --reading-font: 'Roboto', var(--font-system);
+}
+:root[data-reading-font='source-sans'] {
+  --reading-font: 'Source Sans 3', var(--font-system);
+}
+:root[data-reading-font='noto-sans'] {
+  --reading-font: 'Noto Sans', var(--font-system);
+}
+
+/* ── Serif (Georgia = the system serif preset, no web font) ─────────────────── */
+:root[data-reading-font='serif'] {
+  --reading-font: Georgia, 'Times New Roman', Times, serif;
+}
+:root[data-reading-font='lora'] {
+  --reading-font: 'Lora', Georgia, 'Times New Roman', serif;
+}
+:root[data-reading-font='literata'] {
+  --reading-font: 'Literata', Georgia, 'Times New Roman', serif;
+}
+:root[data-reading-font='merriweather'] {
+  --reading-font: 'Merriweather', Georgia, 'Times New Roman', serif;
+}
+:root[data-reading-font='source-serif'] {
+  --reading-font: 'Source Serif 4', Georgia, 'Times New Roman', serif;
+}
+:root[data-reading-font='noto-serif'] {
+  --reading-font: 'Noto Serif', Georgia, 'Times New Roman', serif;
+}
+
+/* ── Mono (JetBrains Mono IS --font-mono — the default code font) ───────────── */
+:root[data-reading-font='mono'] {
+  --reading-font: var(--font-mono);
+}
+:root[data-reading-font='fira-code'] {
+  --reading-font: 'Fira Code', var(--font-mono);
+}
+:root[data-reading-font='cascadia'] {
+  --reading-font: 'Cascadia Code', var(--font-mono);
+}
+
+/* Reading size — one base px that the em scale (markdown.scss /
+   wysiwym-source.scss) multiplies through, so a single knob grows the whole
+   rhythm. History diffs consume --reading-diff-size, a compact derivative of
+   this same base. 'm' equals the :root default; listed for a complete mapping. */
+:root[data-reading-size='s'] {
+  --reading-size: 15.5px;
+}
+:root[data-reading-size='m'] {
+  --reading-size: 17px;
+}
+:root[data-reading-size='l'] {
+  --reading-size: 19px;
+}
+:root[data-reading-size='xl'] {
+  --reading-size: 21px;
+}

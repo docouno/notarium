@@ -1,0 +1,68 @@
+# Dev overlay — live reload, no image rebuild on every edit.
+#
+#   make dev       # build once, then edit on the host and see changes live
+#   make logs      # follow Vite + server output
+#   make down      # stop it
+#
+# How it works: reuse the Dockerfile's `builder` stage (full node_modules for the
+# container platform), bind-mount only the editable source over it, and run
+# `npm run dev` inside. Vite serves the SPA on the published port with HMR; the
+# Fastify API runs on an internal port and Vite proxies /api to it. Editing
+# packages/web/ or server/ on the host reloads automatically.
+#
+# Written for access through an HTTPS dev tunnel: the published port stays 3000
+# and the HMR websocket targets :443. On plain localhost, unset HMR_CLIENT_PORT.
+
+services:
+  notarium:
+    build:
+      target: builder
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    # Dev runs the source supervisor, not an appliance subcommand.
+    entrypoint: []
+    command: npm run dev
+    environment:
+      HOME: /tmp
+      npm_config_cache: /tmp/.npm
+      # Vite takes the published port; the API sits behind it on an internal one.
+      VITE_PORT: ${PORT:-3000}
+      PORT: 3001
+      API_TARGET: http://localhost:3001
+      # Keep Vite's optimizer cache off packages/web/node_modules. The full web
+      # package is bind-mounted below so Vite can write config temp files beside
+      # vite.config.js, but package-local host node_modules must not participate
+      # in container module resolution.
+      VITE_CACHE_DIR: /tmp/.vite/web
+      # When the published port is reached through an HTTPS tunnel, the HMR
+      # websocket must target :443 rather than the server port — otherwise live
+      # reload silently fails to connect. Override if you tunnel on another port.
+      HMR_CLIENT_PORT: ${HMR_CLIENT_PORT:-443}
+      # Poll the bind mount so file changes are detected reliably across the
+      # host→container boundary.
+      CHOKIDAR_USEPOLLING: "true"
+      # Vector/hybrid search default for the DEV stand (#200). The code default is
+      # `on`, but the default host install (`make deps`) omits the ~660MB native
+      # vector stack — so on a no-vector checkout an `on` here would build an embedder,
+      # fail to load vec0/onnx, and log a degradation error per space on boot. Default
+      # the dev overlay to `off` so the lightweight stand is cleanly FTS-only. For
+      # vector work: `make deps-vector` to install the stack, then set VECTOR_SEARCH=on
+      # in .env (it wins via ${VECTOR_SEARCH:-off}).
+      VECTOR_SEARCH: ${VECTOR_SEARCH:-off}
+    volumes:
+      # Keep dev runtime resolution identical to host checks: each checkout owns its
+      # own npm workspace links, while npm's download cache can still be shared.
+      - ../node_modules:/app/node_modules
+      # Vite bundles its config into a temporary sibling file
+      # (`vite.config.js.timestamp-*.mjs`). Mount the whole package directory so
+      # that write lands on the host-owned checkout instead of the read-only
+      # image layer.
+      - ../packages/web:/app/packages/web
+      # Hide package-local host caches/deps from Node's resolver; workspace deps
+      # must come from the per-checkout root /app/node_modules mount above.
+      - /app/packages/web/node_modules
+      - ../scripts:/app/scripts
+      - ../packages/server/src:/app/packages/server/src
+      - ../packages/core/src:/app/packages/core/src
+      - ../packages/engine/src:/app/packages/engine/src
+      - ../packages/engine-memory/src:/app/packages/engine-memory/src
+      - ../packages/contract/src:/app/packages/contract/src

@@ -1,0 +1,8 @@
+{
+  "name": "@notarium/desktop",
+  "version": "0.1.0",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "type": "module",
+  "description": "Placeholder for the Electron shell (P9 host map): core in the main process, engine-lite over InMemoryStore derivations + fs/persistence/FTS. Empty on MVP by design — see docs/architecture.md (Desktop vs Cloud)."
+}

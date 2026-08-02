@@ -1,0 +1,49 @@
+/* The shared search field shell (#190) — ported verbatim from the Trash's old
+   inline `.search` so every search surface reads identically. Width is the
+   caller's (a topbar field vs a toolbar filter want different sizes). */
+.field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  color: var(--text-faint);
+
+  &:focus-within {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 20%, transparent);
+  }
+}
+
+.icon {
+  flex: none;
+}
+
+.input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+
+  &::placeholder {
+    color: var(--text-faint);
+  }
+}
+
+.clear {
+  display: inline-flex;
+  border: 0;
+  background: transparent;
+  color: var(--text-faint);
+  cursor: pointer;
+  padding: 0;
+
+  &:hover {
+    color: var(--text);
+  }
+}

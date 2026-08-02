@@ -1,0 +1,60 @@
+/* The action, continuing the SettingsSection rhythm (a divider with the same air)
+   so the Download button doesn't float free of the option sections above. */
+.footer {
+  padding-top: 22px;
+  border-top: 1px solid var(--border);
+}
+
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+/* Async-export progress (#105): a slim determinate bar (the %, when the note
+   total is known) with a status line + cancel below it. */
+.progress {
+  margin-bottom: 18px;
+}
+
+.bar {
+  height: 6px;
+  border-radius: var(--radius-pill);
+  background: var(--border);
+  overflow: hidden;
+}
+
+.fill {
+  height: 100%;
+  border-radius: var(--radius-pill);
+  background: var(--accent, #4f7cff);
+  transition: width 0.3s ease;
+
+  &[data-indeterminate='true'] {
+    animation: export-indeterminate 1.1s ease-in-out infinite;
+  }
+}
+
+@keyframes export-indeterminate {
+  0% {
+    margin-left: 0;
+    width: 15%;
+  }
+  50% {
+    margin-left: 42%;
+    width: 35%;
+  }
+  100% {
+    margin-left: 100%;
+    width: 15%;
+  }
+}
+
+.status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 8px;
+  font-size: 13px;
+  color: var(--text-muted, #888);
+}

@@ -1,0 +1,1051 @@
+// The `.notariummeta` marker subsystem (#13 I0c): the tolerant parser, the
+// engine-managed marker store over a real localFs tree, the write-through
+// mark-as-project core-op, and the boot-scan that rebuilds the registry from
+// on-disk markers. These exercise the REAL filesystem walk (dotfile handling,
+// index-isolation, the `.notarium/` skip) — the one piece the e2e fake (no FS)
+// can't cover.
+
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { createLocalFsFiles } from '@notarium/engine'
+import {
+  createMarkerStore,
+  ensureFolderIdentity,
+  finalizeFolderMove,
+  type MarkerScan,
+  type MarkerStore,
+  markFolderAsProject,
+  parseMarker,
+  type ProjectRecord,
+  recordFolderRename,
+  renameProjectSlug,
+  scanProjectsAtBoot,
+  serializeMarker,
+  unmarkProject,
+} from '@notarium/server'
+
+import { InMemoryFolders } from '../fake-server/folders'
+import { InMemoryProjects } from '../fake-server/projects'
+
+const VALID_ID = 'Ab3xK9_qZ2mN' // 12 chars, freshNoteId shape
+const now = () => new Date('2026-06-18T00:00:00.000Z')
+
+let dir: string
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), 'notarium-proj-'))
+})
+afterEach(() => {
+  rmSync(dir, { recursive: true, force: true })
+})
+
+const writeMarkerFile = (folderPath: string, body: Record<string, unknown>) => {
+  const target = folderPath ? join(dir, folderPath) : dir
+  mkdirSync(target, { recursive: true })
+  writeFileSync(join(target, '.notariummeta'), JSON.stringify(body))
+}
+
+/** A markerStore whose scan returns a fixed result — lets a test drive the
+ *  `complete` flag (a real FS can't reproduce a transient read error as root). */
+const stubMarkerStore = (scan: MarkerScan): MarkerStore => ({
+  available: () => true,
+  write: async () => {},
+  read: async () => null,
+  remove: async () => {},
+  folderExists: async () => true,
+  scan: async () => scan,
+})
+
+describe('parseMarker (#13)', () => {
+  it('accepts a well-formed marker and reads every field', () => {
+    expect(
+      parseMarker(
+        JSON.stringify({
+          id: VALID_ID,
+          slug: 'billing',
+          displayName: 'Billing',
+          status: 'archived',
+        }),
+      ),
+    ).toEqual({
+      id: VALID_ID,
+      slug: 'billing',
+      displayName: 'Billing',
+      status: 'archived',
+    })
+  })
+
+  it('tolerates unknown/future keys (additive evolution — no migration; color is v-next, not wired in v1)', () => {
+    const f = parseMarker(JSON.stringify({ id: VALID_ID, futureField: 42, color: '#fff' }))
+    expect(f).toEqual({ id: VALID_ID }) // unknown keys ignored, never half-carried
+  })
+
+  it('fail-closes on broken JSON / missing or malformed id (folder treated as unmarked)', () => {
+    expect(parseMarker('{not json')).toBeNull()
+    expect(parseMarker(JSON.stringify({ displayName: 'no id' }))).toBeNull()
+    expect(parseMarker(JSON.stringify({ id: 'too-short' }))).toBeNull()
+    expect(parseMarker(JSON.stringify({ id: 12345 }))).toBeNull()
+  })
+
+  it('drops a malformed slug rather than trusting it (re-derived later)', () => {
+    expect(parseMarker(JSON.stringify({ id: VALID_ID, slug: 'Bad Slug!' }))?.slug).toBeUndefined()
+  })
+
+  it('round-trips through serializeMarker', () => {
+    const fields = {
+      id: VALID_ID,
+      slug: 'billing',
+      displayName: 'Billing',
+      status: 'active' as const,
+    }
+    expect(parseMarker(serializeMarker(fields))).toEqual(fields)
+  })
+
+  it('round-trips a folder marker (#100 phase 3): type + RAW pathAliases (cyrillic dirs survive)', () => {
+    // The engine stores directories VERBATIM (a cyrillic `Космос`, not a slug), so
+    // pathAliases are raw paths — only a sanity gate (no `..`, no leading slash),
+    // NOT a slug check (which would drop them). Caught live on a dev stand.
+    const fields = { id: VALID_ID, type: 'folder' as const, pathAliases: ['Космос', 'old/sub dir'] }
+    expect(parseMarker(serializeMarker(fields))).toEqual(fields)
+    // A project marker omits `type` (the file-format default) → it round-trips bare.
+    expect(serializeMarker({ id: VALID_ID, slug: 'x' })).not.toMatch(/"type"/)
+    // Traversal / leading-slash path aliases are dropped, never trusted.
+    const dirty = parseMarker(
+      JSON.stringify({
+        id: VALID_ID,
+        type: 'folder',
+        pathAliases: ['ok', '../esc', '/abs', 'a//b', 'ok'],
+      }),
+    )
+    expect(dirty?.pathAliases).toEqual(['ok'])
+  })
+
+  it('round-trips aliases (#100 phase 2): well-formed past slugs survive, malformed/dup are dropped', () => {
+    // Past handle slugs travel in the marker (Fork A) so old `space/<slug>` survives
+    // an external re-clone. Only slug-shaped entries are trusted; dups collapse.
+    const fields = {
+      id: VALID_ID,
+      slug: 'guides',
+      aliases: ['docs', 'handbook'],
+      displayName: 'Guides',
+    }
+    expect(parseMarker(serializeMarker(fields))).toEqual(fields)
+    const dirty = parseMarker(
+      JSON.stringify({ id: VALID_ID, slug: 'guides', aliases: ['docs', 'Bad Slug!', 'docs', 42] }),
+    )
+    expect(dirty?.aliases).toEqual(['docs']) // malformed + dup dropped, never trusted blind
+    // An empty aliases array is omitted on serialize (no noise in the committed marker).
+    expect(serializeMarker({ id: VALID_ID, slug: 'x', aliases: [] })).not.toMatch(/aliases/)
+  })
+})
+
+describe('markerStore over a real tree (#13)', () => {
+  it('writes/reads the sibling dotfile and finds it on scan (root + nested), skipping dot-dirs', async () => {
+    const store = createMarkerStore(() => dir)
+    await store.write('s', 'docs', serializeMarker({ id: VALID_ID, slug: 'docs' }))
+    expect(parseMarker((await store.read('s', 'docs')) ?? '')?.id).toBe(VALID_ID)
+    // A marker under the agent-mount (.notarium) and another dot-dir must NOT be enumerated.
+    writeMarkerFile('.notarium/memory', { id: 'ZZZZZZZZZZZZ' })
+    writeMarkerFile('', { id: 'RootRootRoot' })
+    const { hits, complete } = await store.scan('s')
+    expect(hits.map((h) => h.folderPath).sort()).toEqual(['', 'docs'])
+    expect(complete).toBe(true) // a clean walk → safe to prune on
+  })
+
+  it('refuses to write a marker under a dot namespace (mount-boundary belt #78), normalising backslashes', async () => {
+    const store = createMarkerStore(() => dir)
+    await expect(store.write('s', '.notarium/memory', '{}')).rejects.toThrow(/dot namespace/)
+    await expect(store.write('s', 'foo\\.notarium\\memory', '{}')).rejects.toThrow(/dot namespace/)
+  })
+
+  it('a written marker is STRUCTURALLY INVISIBLE to the note index (#78): localFs.scan returns the .md, never the marker', async () => {
+    const store = createMarkerStore(() => dir)
+    mkdirSync(join(dir, 'docs'), { recursive: true })
+    writeFileSync(join(dir, 'docs', 'real-note.md'), '# Real note\n')
+    await store.write('s', 'docs', serializeMarker({ id: VALID_ID, slug: 'docs' }))
+    const indexed = (await createLocalFsFiles(dir).scan()).map((f) => f.path)
+    expect(indexed).toContain('docs/real-note.md')
+    expect(indexed.some((p) => p.endsWith('.notariummeta'))).toBe(false)
+  })
+
+  it('folderExists is false for a regular file (you cannot mark a file as a project)', async () => {
+    const store = createMarkerStore(() => dir)
+    writeFileSync(join(dir, 'README.md'), '# readme\n')
+    expect(await store.folderExists('s', 'README.md')).toBe(false)
+    expect(await store.folderExists('s', '')).toBe(true) // the space root is a dir
+    mkdirSync(join(dir, 'docs'), { recursive: true })
+    expect(await store.folderExists('s', 'docs')).toBe(true)
+  })
+
+  it('has no capability for a space without a notes dir (honest degradation)', () => {
+    const store = createMarkerStore(() => null)
+    expect(store.available('s')).toBe(false)
+  })
+
+  it('a SYMLINKED marker (not a regular file) is not enumerated AND marks the scan incomplete (no prune on it)', async () => {
+    const store = createMarkerStore(() => dir)
+    mkdirSync(join(dir, 'p'), { recursive: true })
+    writeFileSync(join(dir, 'target.json'), serializeMarker({ id: VALID_ID, slug: 'p' }))
+    symlinkSync(join(dir, 'target.json'), join(dir, 'p', '.notariummeta'))
+    const { hits, complete } = await store.scan('s')
+    expect(hits.some((h) => h.folderPath === 'p')).toBe(false) // lstat-style dirent → not a regular file
+    expect(complete).toBe(false) // unclassifiable marker → lower bound → reconcile must not prune
+  })
+})
+
+describe('markFolderAsProject (#13)', () => {
+  it('mints an id + slug, writes a real marker, upserts the registry row', async () => {
+    const projects = new InMemoryProjects()
+    const markerStore = createMarkerStore(() => dir)
+    const rec = await markFolderAsProject(
+      { projects, markerStore, now },
+      {
+        space: 's',
+        folderPath: 'docs',
+        displayName: 'Docs',
+      },
+    )
+    expect(rec.slug).toBe('docs')
+    expect(rec.id).toMatch(/^[A-Za-z0-9_-]{12}$/)
+    expect(await projects.getByHandle('s', 'docs')).toMatchObject({ id: rec.id, path: 'docs' })
+    // The marker landed on disk and carries id+slug (Fork A).
+    const onDisk = parseMarker(readFileSync(join(dir, 'docs', '.notariummeta'), 'utf8'))
+    expect(onDisk).toMatchObject({ id: rec.id, slug: 'docs', displayName: 'Docs' })
+  })
+
+  it('is idempotent: a re-mark reuses the marker id+createdAt, no duplicate', async () => {
+    const projects = new InMemoryProjects()
+    const markerStore = createMarkerStore(() => dir)
+    const first = await markFolderAsProject(
+      { projects, markerStore, now },
+      { space: 's', folderPath: 'docs' },
+    )
+    const again = await markFolderAsProject(
+      { projects, markerStore, now: () => new Date('2027-01-01T00:00:00.000Z') },
+      { space: 's', folderPath: 'docs' },
+    )
+    expect(again.id).toBe(first.id)
+    expect(again.createdAt).toBe(first.createdAt) // mint moment preserved
+    expect((await projects.listForSpace('s')).length).toBe(1)
+  })
+
+  it('suffixes a colliding slug -2/-3 (the I0c trap)', async () => {
+    const projects = new InMemoryProjects()
+    const markerStore = createMarkerStore(() => dir)
+    const a = await markFolderAsProject(
+      { projects, markerStore, now },
+      { space: 's', folderPath: 'a', displayName: 'Docs' },
+    )
+    const b = await markFolderAsProject(
+      { projects, markerStore, now },
+      { space: 's', folderPath: 'b', displayName: 'Docs' },
+    )
+    const c = await markFolderAsProject(
+      { projects, markerStore, now },
+      { space: 's', folderPath: 'c', displayName: 'Docs' },
+    )
+    expect([a.slug, b.slug, c.slug]).toEqual(['docs', 'docs-2', 'docs-3'])
+  })
+
+  it('runs registry-only without a marker store (the e2e fake)', async () => {
+    const projects = new InMemoryProjects()
+    const rec = await markFolderAsProject(
+      { projects, now },
+      { space: 's', folderPath: 'docs', displayName: 'Docs' },
+    )
+    expect(rec.slug).toBe('docs')
+    expect(await projects.getById(rec.id)).toBeTruthy()
+  })
+
+  it('marking a COPIED folder mints a FRESH id — never steals the original (Fork B re-mint on write)', async () => {
+    const projects = new InMemoryProjects()
+    const markerStore = createMarkerStore(() => dir)
+    const orig = await markFolderAsProject(
+      { projects, markerStore, now },
+      { space: 's', folderPath: 'a', displayName: 'Proj' },
+    )
+    // Simulate `cp -r a b`: the copy carries the original's marker verbatim.
+    writeMarkerFile('b', { id: orig.id, slug: orig.slug, displayName: 'Proj' })
+    const copy = await markFolderAsProject(
+      { projects, markerStore, now },
+      { space: 's', folderPath: 'b', displayName: 'Proj' },
+    )
+    expect(copy.id).not.toBe(orig.id) // fresh id
+    expect(copy.slug).toBe('proj-2') // fresh slug, suffixed for uniqueness
+    // The original is untouched (still owns its id at its path).
+    expect(await projects.getById(orig.id)).toMatchObject({ path: 'a', slug: 'proj' })
+  })
+
+  it('heals a divergent marker: the row already at the path wins, the marker is rewritten to match', async () => {
+    const projects = new InMemoryProjects()
+    const markerStore = createMarkerStore(() => dir)
+    const rec = await markFolderAsProject(
+      { projects, markerStore, now },
+      { space: 's', folderPath: 'p', displayName: 'P' },
+    )
+    // A hand-edit puts a bogus (but well-formed) id in the marker.
+    writeMarkerFile('p', { id: 'ZZZZZZZZZZZZ', slug: 'bogus' })
+    const again = await markFolderAsProject(
+      { projects, markerStore, now },
+      { space: 's', folderPath: 'p' },
+    )
+    expect(again.id).toBe(rec.id) // the path-row wins, no fork
+    expect(parseMarker(readFileSync(join(dir, 'p', '.notariummeta'), 'utf8'))?.id).toBe(rec.id) // marker healed
+  })
+})
+
+describe('ensureFolderIdentity (#212 — the page-create lazy-mint path)', () => {
+  const deps = () => {
+    const projects = new InMemoryProjects()
+    const folders = new InMemoryFolders(projects)
+    const markerStore = createMarkerStore(() => dir)
+    return { projects, folders, markerStore, now }
+  }
+
+  it('mints a fresh type=folder identity for an unidentified folder + writes the marker', async () => {
+    const d = deps()
+    const id = await ensureFolderIdentity(d, { space: 's', folderPath: 'docs' })
+    expect(id).toMatch(/^[A-Za-z0-9_-]{12}$/)
+    expect(await d.folders.byPath('s', 'docs')).toMatchObject({ id, path: 'docs' })
+    const onDisk = parseMarker(readFileSync(join(dir, 'docs', '.notariummeta'), 'utf8'))
+    expect(onDisk).toMatchObject({ id, type: 'folder' })
+  })
+
+  it('is idempotent + returns a PROJECT id unchanged when the folder is already a project', async () => {
+    const d = deps()
+    const proj = await markFolderAsProject(d, {
+      space: 's',
+      folderPath: 'docs',
+      displayName: 'Docs',
+    })
+    const id = await ensureFolderIdentity(d, { space: 's', folderPath: 'docs' })
+    expect(id).toBe(proj.id) // a project IS an identified folder — its id is the folder id
+    expect(await d.folders.byPath('s', 'docs')).toBeNull() // no second (folder-type) row minted
+    // Idempotent for a plain folder too.
+    const a = await ensureFolderIdentity(d, { space: 's', folderPath: 'guides' })
+    const b = await ensureFolderIdentity(d, { space: 's', folderPath: 'guides' })
+    expect(a).toBe(b)
+  })
+
+  it('reuses a FREE folder marker id (a clone whose registry row was lost)', async () => {
+    const d = deps()
+    writeMarkerFile('docs', { id: VALID_ID, type: 'folder', pathAliases: ['old'] })
+    const id = await ensureFolderIdentity(d, { space: 's', folderPath: 'docs' })
+    expect(id).toBe(VALID_ID) // adopted, not re-minted
+    expect(await d.folders.byPath('s', 'docs')).toMatchObject({
+      id: VALID_ID,
+      pathAliases: ['old'],
+    })
+  })
+
+  it('REGRESSION (#212 P2): NEVER clobbers a PROJECT marker whose registry row is missing', async () => {
+    const d = deps()
+    // A project marker on disk (fresh clone / lost row) — no registry row yet.
+    writeMarkerFile('docs', {
+      id: VALID_ID,
+      slug: 'billing',
+      displayName: 'Billing',
+      status: 'active',
+    })
+    const id = await ensureFolderIdentity(d, { space: 's', folderPath: 'docs' })
+    expect(id).toBe(VALID_ID) // the project id IS the folder id
+    // The marker is UNTOUCHED — boot reconcile still rebuilds the project from it.
+    const onDisk = parseMarker(readFileSync(join(dir, 'docs', '.notariummeta'), 'utf8'))
+    expect(onDisk).toMatchObject({ id: VALID_ID, slug: 'billing', displayName: 'Billing' })
+    expect(onDisk?.type).toBeUndefined() // still a project marker, NOT downgraded to folder
+    expect(await d.folders.byPath('s', 'docs')).toBeNull() // no folder-type row written
+  })
+
+  it('preserves a co-located SPACE facet (#100 phase 4) when it does write a folder marker', async () => {
+    const d = deps()
+    // A space root whose root project was unmarked: the marker carries ONLY the space
+    // facet (no folder/project id). Creating a page there must keep the space identity.
+    writeMarkerFile('', { space: { id: 'SpAcE1234567', slug: 's' } })
+    const id = await ensureFolderIdentity(d, { space: 's', folderPath: '' })
+    expect(id).toMatch(/^[A-Za-z0-9_-]{12}$/)
+    const onDisk = parseMarker(readFileSync(join(dir, '.notariummeta'), 'utf8'))
+    expect(onDisk).toMatchObject({ id, type: 'folder', space: { id: 'SpAcE1234567', slug: 's' } })
+  })
+
+  it('a COPIED project folder (marker id OWNED by a live project elsewhere) gets a FRESH id (Fork-B)', async () => {
+    const d = deps()
+    const orig = await markFolderAsProject(d, { space: 's', folderPath: 'a', displayName: 'Proj' })
+    // `cp -r a b`: the copy carries the original's project marker verbatim (its id is LIVE).
+    writeMarkerFile('b', { id: orig.id, slug: orig.slug, displayName: 'Proj' })
+    const id = await ensureFolderIdentity(d, { space: 's', folderPath: 'b' })
+    expect(id).not.toBe(orig.id) // never hand out — or resolve a page onto — the original's id
+    expect(id).toMatch(/^[A-Za-z0-9_-]{12}$/)
+    expect(await d.projects.getById(orig.id)).toMatchObject({ path: 'a' }) // original untouched
+    expect(await d.folders.byPath('s', 'b')).toMatchObject({ id }) // the copy re-identified as a plain folder
+  })
+})
+
+describe('unmarkProject (#13)', () => {
+  it('removes the marker file + the registry row; re-mark mints a fresh id', async () => {
+    const projects = new InMemoryProjects()
+    const markerStore = createMarkerStore(() => dir)
+    const rec = await markFolderAsProject(
+      { projects, markerStore, now },
+      { space: 's', folderPath: 'docs', displayName: 'Docs' },
+    )
+    const ok = await unmarkProject({ projects, markerStore, now }, { space: 's', id: rec.id })
+    expect(ok).toBe(true)
+    expect(await projects.getById(rec.id)).toBeNull()
+    expect(await markerStore.read('s', 'docs')).toBeNull() // marker file gone
+    // A fresh mark of the same folder gets a NEW id (the old identity was dropped).
+    const again = await markFolderAsProject(
+      { projects, markerStore, now },
+      { space: 's', folderPath: 'docs', displayName: 'Docs' },
+    )
+    expect(again.id).not.toBe(rec.id)
+  })
+
+  it('is anti-enumeration: an id in another space (or unknown) is not unmarked', async () => {
+    const projects = new InMemoryProjects()
+    const markerStore = createMarkerStore(() => dir)
+    const rec = await markFolderAsProject(
+      { projects, markerStore, now },
+      { space: 's', folderPath: 'docs' },
+    )
+    expect(
+      await unmarkProject({ projects, markerStore, now }, { space: 'other', id: rec.id }),
+    ).toBe(false)
+    expect(await unmarkProject({ projects, markerStore, now }, { space: 's', id: 'nope' })).toBe(
+      false,
+    )
+    expect(await projects.getById(rec.id)).toBeTruthy() // untouched
+  })
+})
+
+describe('space facet preservation (#100 phase 4 — closeout seam)', () => {
+  // The space-ROOT `.notariummeta` carries BOTH the root project identity AND the
+  // space-identity facet (#100 phase 4). A project-side write/unmark of the root must
+  // NEVER strip the space facet (the marker.ts invariant) — else the on-disk space
+  // identity (Fork A, re-clone durability) is lost until the next boot heal. This
+  // is the seam between the phase 2/phase 3 project writers and the phase 4 facet, uncovered until
+  // #100 closed out.
+  const SPACE_ID = 'Sp4ceX9_qZ2m' // 12 chars, freshNoteId shape
+
+  const seedSpaceFacet = async (
+    markerStore: MarkerStore,
+    facet: { id: string; slug: string; aliases?: string[] },
+  ) => {
+    const existing = parseMarker((await markerStore.read('s', '')) ?? '') ?? {}
+    await markerStore.write('s', '', serializeMarker({ ...existing, space: facet }))
+  }
+
+  it('unmark of the ROOT project keeps the space facet (strips only project fields)', async () => {
+    const projects = new InMemoryProjects()
+    const markerStore = createMarkerStore(() => dir)
+    const root = await markFolderAsProject(
+      { projects, markerStore, now },
+      { space: 's', folderPath: '', displayName: 'My Space' },
+    )
+    await seedSpaceFacet(markerStore, { id: SPACE_ID, slug: 'my-space', aliases: ['old-space'] })
+    expect(await unmarkProject({ projects, markerStore, now }, { space: 's', id: root.id })).toBe(
+      true,
+    )
+    const after = parseMarker((await markerStore.read('s', '')) ?? '')
+    expect(after?.space).toEqual({ id: SPACE_ID, slug: 'my-space', aliases: ['old-space'] })
+    expect(after?.id).toBeUndefined() // project identity gone…
+    expect(after?.slug).toBeUndefined() // …but the marker SURVIVES carrying the space facet
+  })
+
+  it('re-mark / displayName-rename of the ROOT project keeps the space facet', async () => {
+    const projects = new InMemoryProjects()
+    const markerStore = createMarkerStore(() => dir)
+    const root = await markFolderAsProject(
+      { projects, markerStore, now },
+      { space: 's', folderPath: '', displayName: 'My Space' },
+    )
+    await seedSpaceFacet(markerStore, { id: SPACE_ID, slug: 'my-space' })
+    // A re-mark (POST /projects on the root — e.g. a displayName tweak).
+    await markFolderAsProject(
+      { projects, markerStore, now },
+      { space: 's', folderPath: '', displayName: 'Renamed' },
+    )
+    let m = parseMarker((await markerStore.read('s', '')) ?? '')
+    expect(m?.space).toEqual({ id: SPACE_ID, slug: 'my-space' })
+    expect(m?.displayName).toBe('Renamed') // project facet still updated
+    // A displayName-only rename (PATCH /projects/:id on the root — a slug rename is 400).
+    await renameProjectSlug(
+      { projects, markerStore, now },
+      { space: 's', id: root.id, displayName: 'Again' },
+    )
+    m = parseMarker((await markerStore.read('s', '')) ?? '')
+    expect(m?.space).toEqual({ id: SPACE_ID, slug: 'my-space' })
+    expect(m?.displayName).toBe('Again')
+  })
+
+  it('a NON-root unmark still removes the whole marker (no space facet to preserve)', async () => {
+    const projects = new InMemoryProjects()
+    const markerStore = createMarkerStore(() => dir)
+    const rec = await markFolderAsProject(
+      { projects, markerStore, now },
+      { space: 's', folderPath: 'docs', displayName: 'Docs' },
+    )
+    expect(await unmarkProject({ projects, markerStore, now }, { space: 's', id: rec.id })).toBe(
+      true,
+    )
+    expect(await markerStore.read('s', 'docs')).toBeNull()
+  })
+})
+
+describe('renameProjectSlug (#100 phase 2)', () => {
+  it('renames the slug → old slug joins aliases (registry + on-disk marker), id/path stable', async () => {
+    const projects = new InMemoryProjects()
+    const markerStore = createMarkerStore(() => dir)
+    const rec = await markFolderAsProject(
+      { projects, markerStore, now },
+      { space: 's', folderPath: 'docs', displayName: 'Docs' },
+    )
+    const res = await renameProjectSlug(
+      { projects, markerStore, now },
+      { space: 's', id: rec.id, slug: 'guides' },
+    )
+    expect(res.ok).toBe(true)
+    const row = (await projects.getById(rec.id))!
+    expect(row).toMatchObject({ id: rec.id, path: 'docs', slug: 'guides', aliases: ['docs'] })
+    // Truth travels: the on-disk marker carries the new slug + the alias history.
+    expect(parseMarker((await markerStore.read('s', 'docs')) ?? '')).toMatchObject({
+      slug: 'guides',
+      aliases: ['docs'],
+    })
+    // Resolution layer: the old current-slug handle is now free of a CURRENT holder.
+    expect(await projects.getByHandle('s', 'guides')).toMatchObject({ id: rec.id })
+    expect(await projects.getByHandle('s', 'docs')).toBeNull() // 'docs' is an alias, not current
+  })
+
+  it('A→B→A never self-aliases the current name (idempotent — reuses the note alias algebra)', async () => {
+    const projects = new InMemoryProjects()
+    const rec = await markFolderAsProject(
+      { projects, now },
+      { space: 's', folderPath: 'docs', displayName: 'Docs' },
+    )
+    await renameProjectSlug({ projects, now }, { space: 's', id: rec.id, slug: 'guides' })
+    await renameProjectSlug({ projects, now }, { space: 's', id: rec.id, slug: 'docs' })
+    const row = (await projects.getById(rec.id))!
+    expect(row.slug).toBe('docs')
+    // 'docs' is current again → NOT in its own aliases (no self-shadowing). 'guides'
+    // stays a valid past handle (it was real for a while — `team/guides` still
+    // resolves), exactly the note A→B→A semantics (#100 phase 0).
+    expect(row.aliases).not.toContain('docs')
+    expect(row.aliases).toEqual(['guides'])
+  })
+
+  it('rejects a slug already held by another LIVE project (409 — explicit rename is not suffixed)', async () => {
+    const projects = new InMemoryProjects()
+    await markFolderAsProject(
+      { projects, now },
+      { space: 's', folderPath: 'docs', displayName: 'Docs' },
+    )
+    const b = await markFolderAsProject(
+      { projects, now },
+      { space: 's', folderPath: 'handbook', displayName: 'Handbook' },
+    )
+    const res = await renameProjectSlug({ projects, now }, { space: 's', id: b.id, slug: 'docs' })
+    expect(res).toEqual({ ok: false, code: 'collision' })
+    expect((await projects.getById(b.id))!.slug).toBe('handbook') // unchanged
+  })
+
+  it('rejects renaming the ROOT project’s slug (its handle is the space slug — #100 phase 4)', async () => {
+    const projects = new InMemoryProjects()
+    const root = await markFolderAsProject(
+      { projects, now },
+      { space: 's', folderPath: '', displayName: 'Root' },
+    )
+    expect(
+      await renameProjectSlug({ projects, now }, { space: 's', id: root.id, slug: 'x' }),
+    ).toEqual({
+      ok: false,
+      code: 'root',
+    })
+  })
+
+  it('anti-enumeration: an id in another space (or unknown) is not_found', async () => {
+    const projects = new InMemoryProjects()
+    const rec = await markFolderAsProject({ projects, now }, { space: 's', folderPath: 'docs' })
+    expect(
+      await renameProjectSlug({ projects, now }, { space: 'other', id: rec.id, slug: 'x' }),
+    ).toEqual({
+      ok: false,
+      code: 'not_found',
+    })
+    expect(
+      await renameProjectSlug({ projects, now }, { space: 's', id: 'nope', slug: 'x' }),
+    ).toEqual({
+      ok: false,
+      code: 'not_found',
+    })
+  })
+
+  it('displayName-only update touches no slug/alias; an empty-after-slugify slug is invalid', async () => {
+    const projects = new InMemoryProjects()
+    const rec = await markFolderAsProject(
+      { projects, now },
+      { space: 's', folderPath: 'docs', displayName: 'Docs' },
+    )
+    const r1 = await renameProjectSlug(
+      { projects, now },
+      { space: 's', id: rec.id, displayName: 'Documentation' },
+    )
+    expect(r1.ok).toBe(true)
+    expect(await projects.getById(rec.id)).toMatchObject({
+      slug: 'docs',
+      displayName: 'Documentation',
+      aliases: [],
+    })
+    // A slug that slugifies to nothing (only punctuation) is rejected, not stored empty.
+    expect(
+      await renameProjectSlug({ projects, now }, { space: 's', id: rec.id, slug: '!!!' }),
+    ).toEqual({
+      ok: false,
+      code: 'invalid',
+    })
+  })
+})
+
+describe('scanProjectsAtBoot (#13)', () => {
+  it('rebuilds the registry from on-disk markers (durability: lost table / fresh clone)', async () => {
+    writeMarkerFile('', { id: 'RootRootRoot', slug: 'root', displayName: 'Root' })
+    writeMarkerFile('billing', { id: VALID_ID, slug: 'billing', displayName: 'Billing' })
+    const projects = new InMemoryProjects()
+    const markerStore = createMarkerStore(() => dir)
+    await scanProjectsAtBoot({ projects, markerStore, now }, ['s'])
+    const rows = await projects.listForSpace('s')
+    expect(rows.map((r) => `${r.path}:${r.slug}:${r.id}`).sort()).toEqual([
+      ':root:RootRootRoot',
+      'billing:billing:Ab3xK9_qZ2mN',
+    ])
+  })
+
+  it('is idempotent across re-runs (preserves createdAt, no churn)', async () => {
+    writeMarkerFile('billing', { id: VALID_ID, slug: 'billing' })
+    const projects = new InMemoryProjects()
+    const markerStore = createMarkerStore(() => dir)
+    await scanProjectsAtBoot({ projects, markerStore, now }, ['s'])
+    const firstSeen = (await projects.getById(VALID_ID))!.createdAt
+    await scanProjectsAtBoot(
+      { projects, markerStore, now: () => new Date('2027-01-01T00:00:00.000Z') },
+      ['s'],
+    )
+    expect((await projects.getById(VALID_ID))!.createdAt).toBe(firstSeen)
+    expect((await projects.listForSpace('s')).length).toBe(1)
+  })
+
+  it('scans a personal domain like any other space (#13: personal holds projects too)', async () => {
+    // Reversal of the old «personal never gets a row» invariant — boot-scan is now
+    // space-agnostic, so a marker in the personal domain rebuilds its row normally.
+    writeMarkerFile('', { id: VALID_ID, slug: 'root' })
+    const projects = new InMemoryProjects()
+    const markerStore = createMarkerStore(() => dir)
+    await scanProjectsAtBoot({ projects, markerStore, now }, ['alice-personal'])
+    expect(
+      (await projects.listForSpace('alice-personal')).map((r) => `${r.path}:${r.slug}`),
+    ).toEqual([':root'])
+  })
+
+  it('ignores broken markers (fail-closed)', async () => {
+    mkdirSync(join(dir, 'bad'), { recursive: true })
+    writeFileSync(join(dir, 'bad', '.notariummeta'), '{not json')
+    const projects = new InMemoryProjects()
+    const markerStore = createMarkerStore(() => dir)
+    await scanProjectsAtBoot({ projects, markerStore, now }, ['s'])
+    expect((await projects.listForSpace('s')).length).toBe(0)
+  })
+
+  it('collapses a copied folder (same id at two paths) to ONE row — first path wins, deterministically', async () => {
+    writeMarkerFile('a', { id: VALID_ID, slug: 'proj' })
+    writeMarkerFile('b', { id: VALID_ID, slug: 'proj' }) // a copy carrying the same id
+    const projects = new InMemoryProjects()
+    const markerStore = createMarkerStore(() => dir)
+    await scanProjectsAtBoot({ projects, markerStore, now }, ['s'])
+    const rows = await projects.listForSpace('s')
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({ id: VALID_ID, path: 'a' }) // sorted: 'a' before 'b'
+  })
+
+  it('suffixes colliding DERIVED slugs at boot (two folders → one slug must not crash the upsert)', async () => {
+    writeMarkerFile('a', { id: 'AAAAAAAAAAAA', displayName: 'Docs' }) // no slug → derive
+    writeMarkerFile('b', { id: 'BBBBBBBBBBBB', displayName: 'Docs' })
+    const projects = new InMemoryProjects()
+    const markerStore = createMarkerStore(() => dir)
+    await scanProjectsAtBoot({ projects, markerStore, now }, ['s'])
+    const bySlug = (await projects.listForSpace('s')).map((r) => `${r.path}:${r.slug}`).sort()
+    expect(bySlug).toEqual(['a:docs', 'b:docs-2']) // deterministic (scan sorted by path)
+  })
+
+  it('one space failing does not abort the rest (per-space resilience)', async () => {
+    writeMarkerFile('ok', { id: VALID_ID, slug: 'ok' })
+    const projects = new InMemoryProjects()
+    const real = createMarkerStore(() => dir)
+    // The marker scan throws for the FIRST space — the second must still rebuild
+    // (the per-space try/catch isolates the failure).
+    let calls = 0
+    const flaky: MarkerStore = {
+      ...real,
+      scan: async (space) => {
+        calls++
+        if (calls === 1) {
+          throw new Error('marker scan failed at boot')
+        }
+
+        return real.scan(space)
+      },
+    }
+    await scanProjectsAtBoot({ projects, markerStore: flaky, now }, ['boom', 's'])
+    expect((await projects.getByHandle('s', 'ok'))?.path).toBe('ok') // 's' rebuilt despite 'boom' failing
+  })
+})
+
+describe('reconcile — external changes survive a rescan (#13 I3)', () => {
+  it('re-adopts an externally-moved folder: the marker at the new path updates the row by id', async () => {
+    // Mark 'old', then simulate `mv old new` outside us (the marker travels).
+    const projects = new InMemoryProjects()
+    const markerStore = createMarkerStore(() => dir)
+    const rec = await markFolderAsProject(
+      { projects, markerStore, now },
+      { space: 's', folderPath: 'old', displayName: 'P' },
+    )
+    rmSync(join(dir, 'old'), { recursive: true, force: true })
+    writeMarkerFile('new', { id: rec.id, slug: rec.slug, displayName: 'P' })
+    await scanProjectsAtBoot({ projects, markerStore, now }, ['s'])
+    const rows = await projects.listForSpace('s')
+    expect(rows).toHaveLength(1) // ONE row, re-adopted (not a stale + a new one)
+    expect(rows[0]).toMatchObject({ id: rec.id, slug: rec.slug, path: 'new' }) // id+slug stable, path moved
+  })
+
+  it('adopts the marker’s aliases on a cold rebuild (#100 phase 2 re-clone durability)', async () => {
+    // A repo cloned with a committed marker that already carries past slugs (the
+    // project was renamed before): a fresh meta-DB must reconstruct the alias
+    // history from the marker, so old `space/<old-slug>` handles keep resolving.
+    writeMarkerFile('guides', {
+      id: VALID_ID,
+      slug: 'guides',
+      aliases: ['docs', 'handbook'],
+      displayName: 'Guides',
+    })
+    const projects = new InMemoryProjects()
+    const markerStore = createMarkerStore(() => dir)
+    await scanProjectsAtBoot({ projects, markerStore, now }, ['s'])
+    expect(await projects.getById(VALID_ID)).toMatchObject({
+      slug: 'guides',
+      aliases: ['docs', 'handbook'],
+    })
+  })
+
+  it('heals an external marker slug-edit: the marker slug wins, the displaced registry slug → alias (#100 phase 2)', async () => {
+    // Slug is mutable now (phase 2), so the marker is its truth. Someone hand-edits the
+    // marker slug (git) WITHOUT recording the old one in aliases → boot adopts the
+    // new slug AND folds the displaced registry slug into the history, so the old
+    // `space/docs` handle is not silently lost.
+    const projects = new InMemoryProjects()
+    const markerStore = createMarkerStore(() => dir)
+    const rec = await markFolderAsProject(
+      { projects, markerStore, now },
+      { space: 's', folderPath: 'p', displayName: 'Docs' },
+    )
+    expect(rec.slug).toBe('docs')
+    writeMarkerFile('p', { id: rec.id, slug: 'guides', displayName: 'Docs' }) // external slug edit, no alias
+    await scanProjectsAtBoot({ projects, markerStore, now }, ['s'])
+    expect(await projects.getById(rec.id)).toMatchObject({ slug: 'guides', aliases: ['docs'] })
+  })
+
+  it('prunes a row whose marker vanished externally (folder/marker deleted off our routes)', async () => {
+    const projects = new InMemoryProjects()
+    const markerStore = createMarkerStore(() => dir)
+    await markFolderAsProject(
+      { projects, markerStore, now },
+      { space: 's', folderPath: 'gone', displayName: 'Gone' },
+    )
+    await markFolderAsProject(
+      { projects, markerStore, now },
+      { space: 's', folderPath: 'stays', displayName: 'Stays' },
+    )
+    expect((await projects.listForSpace('s')).length).toBe(2)
+    rmSync(join(dir, 'gone'), { recursive: true, force: true }) // external delete
+    await scanProjectsAtBoot({ projects, markerStore, now }, ['s'])
+    const rows = await projects.listForSpace('s')
+    expect(rows.map((r) => r.path)).toEqual(['stays']) // 'gone' pruned, 'stays' kept
+  })
+
+  it('does NOT prune on an INCOMPLETE scan (a transient read error must not nuke live rows)', async () => {
+    // A row exists, but the scan reports complete:false (e.g. a dir was unreadable)
+    // — pruning on a lower-bound hit set would wrongly delete a live project.
+    const projects = new InMemoryProjects()
+    await projects.upsert({
+      id: VALID_ID,
+      space: 's',
+      path: 'live',
+      slug: 'live',
+      aliases: [],
+      pathAliases: [],
+      displayName: 'Live',
+      status: 'active',
+      lastSeen: now().toISOString(),
+      createdAt: now().toISOString(),
+    })
+    const stub = stubMarkerStore({ hits: [], complete: false })
+    await scanProjectsAtBoot({ projects, markerStore: stub, now }, ['s'])
+    expect((await projects.getById(VALID_ID))?.path).toBe('live') // survived the partial scan
+  })
+
+  it('DOES prune on a COMPLETE empty scan (every marker was genuinely removed)', async () => {
+    const projects = new InMemoryProjects()
+    await projects.upsert({
+      id: VALID_ID,
+      space: 's',
+      path: 'gone',
+      slug: 'gone',
+      aliases: [],
+      pathAliases: [],
+      displayName: 'Gone',
+      status: 'active',
+      lastSeen: now().toISOString(),
+      createdAt: now().toISOString(),
+    })
+    const stub = stubMarkerStore({ hits: [], complete: true })
+    await scanProjectsAtBoot({ projects, markerStore: stub, now }, ['s'])
+    expect(await projects.getById(VALID_ID)).toBeNull() // complete scan, no marker → pruned
+  })
+
+  it('does NOT prune a row whose marker became CORRUPT (readable but unparseable ≠ absent)', async () => {
+    const projects = new InMemoryProjects()
+    const markerStore = createMarkerStore(() => dir)
+    const rec = await markFolderAsProject(
+      { projects, markerStore, now },
+      { space: 's', folderPath: 'p', displayName: 'P' },
+    )
+    // An external edit corrupts the marker (a stray byte / git conflict marker).
+    writeFileSync(join(dir, 'p', '.notariummeta'), '{ broken <<<<<<< json')
+    await scanProjectsAtBoot({ projects, markerStore, now }, ['s'])
+    expect(await projects.getById(rec.id)).toBeTruthy() // a parse failure suppresses prune — the project survives
+  })
+
+  it('a marker whose id is OWNED BY ANOTHER SPACE is a cross-space copy — the row never migrates (#16)', async () => {
+    const projects = new InMemoryProjects()
+    const markerStore = createMarkerStore((space) => join(dir, space)) // per-space subtrees
+    // Space A owns the project; space B's tree holds a COPY carrying A's id (a backup
+    // restored into the wrong space, or a cross-space `cp -r`).
+    const recA = await markFolderAsProject(
+      { projects, markerStore, now },
+      { space: 'A', folderPath: 'proj', displayName: 'P' },
+    )
+    mkdirSync(join(dir, 'B', 'copy'), { recursive: true })
+    writeFileSync(
+      join(dir, 'B', 'copy', '.notariummeta'),
+      serializeMarker({ id: recA.id, slug: recA.slug, displayName: 'P' }),
+    )
+    // Both scan orders must converge to the same answer (A keeps the row, B gets none).
+    for (const order of [
+      ['A', 'B'],
+      ['B', 'A'],
+    ] as const) {
+      await scanProjectsAtBoot({ projects, markerStore, now }, order)
+      expect(await projects.getById(recA.id)).toMatchObject({ space: 'A', path: 'proj' }) // never crosses to B
+      expect((await projects.listForSpace('B')).length).toBe(0) // copy is row-less, no migration
+    }
+  })
+})
+
+describe('recordFolderRename + folder boot reconcile (#100 phase 3)', () => {
+  const make = () => {
+    const projects = new InMemoryProjects()
+    const folders = new InMemoryFolders(projects)
+    return { projects, folders }
+  }
+
+  // Mirror the /move-folder handler: re-prefix the rows (table-wide), THEN record.
+  const move = async (
+    deps: ReturnType<typeof make>,
+    space: string,
+    oldPath: string,
+    newPath: string,
+  ) => {
+    await deps.projects.renamePrefix(space, oldPath, newPath)
+    await recordFolderRename({ ...deps, now }, { space, oldPath, newPath })
+  }
+
+  it('does not run dependent path-history after a best-effort re-prefix failure', async () => {
+    const deps = make()
+    await ensureFolderIdentity({ ...deps, now }, { space: 's', folderPath: 'docs' })
+    const original = await deps.folders.byPath('s', 'docs')
+    const failure = new Error('registry unavailable')
+    vi.spyOn(deps.projects, 'renamePrefix').mockRejectedValueOnce(failure)
+    const onError = vi.fn()
+
+    await finalizeFolderMove(
+      { ...deps, now, onError },
+      { space: 's', oldPath: 'docs', newPath: 'guides' },
+    )
+
+    expect(onError).toHaveBeenCalledWith('renamePrefix', failure)
+    expect(await deps.folders.byPath('s', 'docs')).toEqual(original)
+    expect(await deps.folders.byPath('s', 'guides')).toBeNull()
+  })
+
+  it('lazily mints a folder identity on first rename, recording the old path', async () => {
+    const deps = make()
+    await move(deps, 's', 'docs', 'guides')
+    const rows = await deps.folders.listForSpace('s')
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({ space: 's', path: 'guides', pathAliases: ['docs'] })
+    expect(rows[0].id).toMatch(/^[A-Za-z0-9_-]{12}$/) // a real freshNoteId
+  })
+
+  it('accumulates past paths across chained renames; A→B→A leaves no self-alias', async () => {
+    const deps = make()
+    await move(deps, 's', 'a', 'b')
+    await move(deps, 's', 'b', 'c')
+    let row = (await deps.folders.listForSpace('s'))[0]
+    expect(row.path).toBe('c')
+    expect(row.pathAliases).toEqual(['a', 'b'])
+    // c → a (back to the first path): 'a' drops out of the history (idempotent).
+    await move(deps, 's', 'c', 'a')
+    row = (await deps.folders.listForSpace('s'))[0]
+    expect(row.path).toBe('a')
+    expect(row.pathAliases).toEqual(['b', 'c'])
+  })
+
+  it('a moved PROJECT folder grows its path-history without minting a separate identity', async () => {
+    const deps = make()
+    await deps.projects.upsert({
+      id: VALID_ID,
+      space: 's',
+      path: 'work',
+      slug: 'work',
+      aliases: [],
+      pathAliases: [],
+      displayName: 'Work',
+      status: 'active',
+      lastSeen: now().toISOString(),
+      createdAt: now().toISOString(),
+    })
+    await move(deps, 's', 'work', 'projects/work')
+    expect(await deps.projects.getById(VALID_ID)).toMatchObject({
+      path: 'projects/work',
+      slug: 'work',
+      pathAliases: ['work'], // handle untouched, path-history grew
+    })
+    expect(await deps.folders.listForSpace('s')).toHaveLength(0) // no parallel folder row
+  })
+
+  it('a root move (→ space rename, #100 phase 4) and an unchanged path are no-ops', async () => {
+    const deps = make()
+    await recordFolderRename({ ...deps, now }, { space: 's', oldPath: '', newPath: 'x' })
+    await recordFolderRename({ ...deps, now }, { space: 's', oldPath: 'x', newPath: 'x' })
+    expect(await deps.folders.listForSpace('s')).toHaveLength(0)
+  })
+
+  it('boot reconciles a type:"folder" marker as a folder identity, NOT a project', async () => {
+    writeMarkerFile('archive', { id: VALID_ID, type: 'folder', pathAliases: ['old-notes'] })
+    const { projects, folders } = make()
+    const markerStore = createMarkerStore(() => dir)
+    await scanProjectsAtBoot({ projects, folders, markerStore, now }, ['s'])
+    expect(await folders.listForSpace('s')).toEqual([
+      expect.objectContaining({ id: VALID_ID, path: 'archive', pathAliases: ['old-notes'] }),
+    ])
+    expect(await projects.listForSpace('s')).toHaveLength(0) // the handle layer ignores it
+  })
+
+  it('boot heals a folder path displaced by an external move into the alias history', async () => {
+    const { projects, folders } = make()
+    await folders.upsert({
+      id: VALID_ID,
+      space: 's',
+      path: 'a',
+      pathAliases: [],
+      lastSeen: now().toISOString(),
+      createdAt: now().toISOString(),
+    })
+    writeMarkerFile('b', { id: VALID_ID, type: 'folder' }) // marker now sits at 'b'
+    const markerStore = createMarkerStore(() => dir)
+    await scanProjectsAtBoot({ projects, folders, markerStore, now }, ['s'])
+    const row = (await folders.listForSpace('s'))[0]
+    expect(row.path).toBe('b')
+    expect(row.pathAliases).toEqual(['a']) // [[a/note]] keeps resolving
+  })
+
+  // Marking a folder that ALREADY has a folder-identity must ADOPT
+  // its id (flip type in place), not mint a second row colliding on UNIQUE(space,path).
+  it('mark-as-project ADOPTS an existing folder-identity at the path (no double row / no 500)', async () => {
+    const deps = make()
+    await move(deps, 's', 'docs', 'guides') // lazily mints a folder-identity at 'guides'
+    const folderRow = (await deps.folders.listForSpace('s'))[0]
+    const proj = await markFolderAsProject(
+      { ...deps, now },
+      { space: 's', folderPath: 'guides', displayName: 'Guides' },
+    )
+    expect(proj.id).toBe(folderRow.id) // adopted the folder id, not a fresh mint
+    expect(proj.pathAliases).toEqual(['docs']) // path-history carried onto the project
+    expect(await deps.folders.listForSpace('s')).toHaveLength(0) // folder row flipped to project
+    expect((await deps.projects.listForSpace('s')).find((r) => r.path === 'guides')?.id).toBe(
+      folderRow.id,
+    )
+  })
+
+  // A rename before the registry was rebuilt must REUSE the on-disk
+  // folder marker's id + history, not orphan the established identity.
+  it('recordFolderRename REUSES an on-disk folder marker when the registry row is lost (durability)', async () => {
+    const { projects, folders } = make()
+    const markerStore = createMarkerStore(() => dir)
+    // The marker traveled to the post-move path 'c' (fs.rename), but the registry row
+    // is gone (fresh clone / lost table / boot-scan not yet run for this space).
+    writeMarkerFile('c', { id: VALID_ID, type: 'folder', pathAliases: ['a'] })
+    await recordFolderRename(
+      { projects, folders, markerStore, now },
+      { space: 's', oldPath: 'b', newPath: 'c' },
+    )
+    const row = (await folders.listForSpace('s'))[0]
+    expect(row.id).toBe(VALID_ID) // reused the established id, not a fresh mint
+    expect(row.pathAliases).toEqual(['a', 'b']) // marker history ∪ this move's old path
+  })
+
+  it('recordFolderRename leaves a PROJECT marker untouched (boot reconcile owns it — no clobber)', async () => {
+    const { projects, folders } = make()
+    const markerStore = createMarkerStore(() => dir)
+    writeMarkerFile('c', { id: VALID_ID, slug: 'proj' }) // a project marker (no type), lost row
+    await recordFolderRename(
+      { projects, folders, markerStore, now },
+      { space: 's', oldPath: 'b', newPath: 'c' },
+    )
+    expect(await folders.listForSpace('s')).toHaveLength(0) // no folder minted over it
+    const raw = JSON.parse(readFileSync(join(dir, 'c', '.notariummeta'), 'utf8'))
+    expect(raw).toMatchObject({ id: VALID_ID, slug: 'proj' }) // intact, not overwritten
+    expect(raw.type).toBeUndefined()
+  })
+})
+
+describe('InMemoryProjects.renamePrefix mirrors the SQL drivers (#13 I3 fake fidelity)', () => {
+  const row = (id: string, space: string, path: string, slug: string): ProjectRecord => ({
+    id,
+    space,
+    path,
+    slug,
+    aliases: [],
+    pathAliases: [],
+    displayName: slug,
+    status: 'active',
+    lastSeen: '2026-06-18T00:00:00Z',
+    createdAt: '2026-06-18T00:00:00Z',
+  })
+
+  it('re-prefixes folder + descendants; segment-boundary, space-scoped, astral-safe', async () => {
+    const p = new InMemoryProjects()
+    await p.upsert(row('p1', 'team', 'docs', 'docs'))
+    await p.upsert(row('p2', 'team', 'docs/sub', 'sub')) // descendant
+    await p.upsert(row('p3', 'team', 'docsx', 'docsx')) // boundary trap
+    await p.upsert(row('p4', 'ops', 'docs', 'opsdocs')) // other space
+    await p.upsert(row('p5', 'team', '📁', 'emoji')) // astral folder name
+    await p.upsert(row('p6', 'team', '📁/inner', 'emojisub')) // astral descendant
+    await p.renamePrefix('team', 'docs', 'archive/docs')
+    await p.renamePrefix('team', '📁', 'arch/📁')
+    expect((await p.getById('p1'))?.path).toBe('archive/docs')
+    expect((await p.getById('p2'))?.path).toBe('archive/docs/sub')
+    expect((await p.getById('p3'))?.path).toBe('docsx') // `docs` never catches `docsx`
+    expect((await p.getById('p4'))?.path).toBe('docs') // other space untouched
+    expect((await p.getById('p5'))?.path).toBe('arch/📁')
+    expect((await p.getById('p6'))?.path).toBe('arch/📁/inner') // descendant follows past the astral char
+  })
+})

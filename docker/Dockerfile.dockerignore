@@ -1,0 +1,35 @@
+# Keep the build context small and secrets out of the image.
+node_modules
+dist
+.git
+.gitignore
+.env
+*.log
+# Gitignored scratch space some checkouts keep beside the sources — never image
+# content, and it can be large enough to slow the build context down on its own.
+.docs-local
+
+# Host STATE, never image content (#101). `COPY . .` in the builder would bake a
+# developer's `.data/meta.db` — password hashes and all — into a layer, and the
+# boot guard would then find that dead copy at /app/.data and refuse to start.
+# `docker/` below already covers `docker/volumes/`.
+.data
+
+# Test/build output that only ever flows the other way. `make save` drops its
+# tarball at the repo root, and it is the image — copying it back in is circular.
+coverage
+test-results
+playwright-report
+notarium-*.tar.gz
+test/visual/**/*.png
+
+# Tooling/docs that the image doesn't need. Only the image-native operator CLI
+# from `docker/` is runtime content; compose files, host volumes and this build
+# metadata stay outside the context.
+Makefile
+docker/*
+!docker/notarium-cli
+scripts
+README.md
+# Keep LICENSE / NOTICE / COMMERCIAL-LICENSE.md / THIRD_PARTY_NOTICES.md in the
+# build context: the runtime stage copies the corpus for an image recipient.

@@ -1,0 +1,28 @@
+/* Chrome toggle button — one component, two skins. `ghost` sits on a bar (topbar /
+   aside header); `chip` floats over bare content (graph canvas) as an elevated
+   plashka. `active` = a neutral "pressed" fill while the panel it controls is open. */
+.icon-toggle {
+  display: inline-flex; align-items: center; justify-content: center;
+  flex: 0 0 auto; width: 32px; height: 32px;
+  border-radius: var(--radius-sm); cursor: pointer;
+  color: var(--text-dim);
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.icon-toggle--ghost { border: 1px solid transparent; background: transparent; }
+.icon-toggle--ghost:hover { background: var(--bg-hover); color: var(--text); }
+.icon-toggle--ghost.active { background: var(--bg-hover); color: var(--text); }
+/* The frosted material + rim + drop come from the shared `.glass`/`.glass-float`
+   classes (added in IconToggle.tsx); here it's just the chip geometry + a small
+   drop (--glass-drop) and the opaque fallback surface. */
+.icon-toggle--chip {
+  pointer-events: auto; border-radius: var(--radius-md);
+  /* Floats over the (busy) canvas: the more-opaque float fill + a FULL-contrast icon
+     (--text, not the bars' --text-dim) keep it legible over arbitrary nodes even at
+     the worst scroll moment (#72 a11y review). */
+  --glass-bg: var(--glass-menu-bg);
+  --glass-bg-opaque: var(--bg-elevated);
+  --glass-drop: var(--shadow);
+  color: var(--text);
+}
+.icon-toggle--chip:hover { background: var(--bg-hover); color: var(--text); }
+.icon-toggle--chip.active { background: var(--bg-hover); color: var(--text); border-color: var(--border-strong); }

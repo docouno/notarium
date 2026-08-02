@@ -1,0 +1,69 @@
+/* Inspector panels hosted inside aside groups (#35): the local graph square and
+   the two link lists (Backlinks / Links). Each fills its group's body — height is
+   the group's, not the panel's. */
+
+/* Graph panel — fills the group body; the canvas clips itself (.graph-canvas). */
+.graph-panel { position: relative; flex: 1; min-height: 0; width: 100%; }
+
+/* "Open in graph" — top-right on the --gutter (token, not a literal), 32px like the
+   zoom buttons below it, so the local graph's right rail (locate over zoom) reads as
+   one vertical line — same as the full graph page. */
+.graph-locate {
+  position: absolute; right: var(--gutter); top: var(--gutter); z-index: 6;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 32px; height: 32px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border); background: var(--bg-elevated);
+  color: var(--text-dim); box-shadow: var(--shadow);
+  transition: background 0.12s, color 0.12s;
+}
+.graph-locate:hover { background: var(--bg-hover); color: var(--text); }
+
+/* Depth control, docked over the graph bottom-left on the --gutter (mirrors the zoom
+   bottom-right). */
+.graph-depth { position: absolute; left: var(--gutter); bottom: var(--gutter); z-index: 6; }
+.depth-toggle {
+  display: inline-flex; gap: 2px; padding: 2px;
+  background: var(--bg-elevated); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); box-shadow: var(--shadow);
+}
+.depth-toggle button {
+  border: none; appearance: none;
+  width: 24px; height: 22px; border-radius: var(--radius-xs);
+  font-size: 12px; font-weight: 600; line-height: 1;
+  color: var(--text-dim); background: transparent;
+  transition: background 0.12s, color 0.12s;
+}
+.depth-toggle button:hover { color: var(--text); }
+.depth-toggle button.on { background: var(--bg-elevated); color: var(--accent); box-shadow: var(--shadow); }
+
+.graph-empty {
+  display: flex; align-items: center; justify-content: center;
+  height: 100%; padding: 0 var(--gutter); text-align: center;
+  font-size: 13px; color: var(--text-faint);
+}
+
+/* First-load shimmer for the graph square: a central node ringed by satellites. */
+.graph-skeleton { position: absolute; inset: 0; }
+.skel-node {
+  position: absolute; top: 50%; left: 50%;
+  width: 46px; height: 46px; transform: translate(-50%, -50%);
+}
+.skel-sat { position: absolute; }
+.skel-sat1 { width: 24px; height: 24px; top: 26%; left: 30%; }
+.skel-sat2 { width: 16px; height: 16px; top: 34%; left: 66%; }
+.skel-sat3 { width: 28px; height: 28px; top: 64%; left: 56%; }
+
+/* Link lists (Backlinks / Links) — identical rows, body order for Links, title
+   order for Backlinks (see useNoteGraph). */
+.link-empty { padding: 8px var(--gutter) 12px; }
+.link-list { list-style: none; margin: 0; padding: 8px var(--gutter) 12px; }
+.link {
+  display: flex; flex-direction: column; gap: 1px; width: 100%;
+  padding: 7px 8px; border: none; border-radius: var(--radius-sm);
+  background: transparent; text-align: left; cursor: pointer;
+}
+.link:hover { background: var(--bg-hover); }
+.link[data-ghost] { opacity: 0.78; }
+.link[data-ghost] .link-title { font-style: italic; }
+.link-type { font-size: 11px; color: var(--text-faint); }
+.link-title { font-size: 13px; color: var(--text); line-height: 1.3; }

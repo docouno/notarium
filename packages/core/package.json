@@ -1,0 +1,27 @@
+{
+  "name": "@notarium/core",
+  "version": "0.1.0",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "type": "module",
+  "description": "Notarium domain core: KnowledgeStore port, pure services and libs. Host-agnostic — no node/fs/HTTP/React (P9)",
+  "exports": {
+    ".": "./src/index.ts",
+    "./force-model": "./src/libs/forceModel/index.ts",
+    "./markdown": "./src/libs/markdown/index.ts",
+    "./slug": "./src/libs/slug/index.ts",
+    "./tags": "./src/libs/tags/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "d3-force": "^3.0.0",
+    "diff": "^9.0.0",
+    "graphology": "^0.26.0",
+    "graphology-communities-louvain": "^2.0.2"
+  },
+  "devDependencies": {
+    "@types/d3-force": "^3.0.10"
+  }
+}

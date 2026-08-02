@@ -1,0 +1,11 @@
+/* Runtime access-loss takeover (#111): a full-viewport screen that REPLACES the
+   whole app chrome when the active space is confirmed gone. It deliberately owns
+   the viewport (not just the content column) — the sidebar/tree belong to the
+   dead space too, so leaving them visible would be a half-broken shell. Mirrors
+   the auth screens' full-screen framing; StateView centres within it. */
+.takeover {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}

@@ -1,0 +1,1 @@
+export { DeletedNoteView } from './DeletedNoteView'

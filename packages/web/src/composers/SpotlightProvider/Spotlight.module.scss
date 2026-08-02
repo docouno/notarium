@@ -1,0 +1,175 @@
+/* Spotlight quick-switcher (#31). Built on core/Modal — this owns only the inner
+   layout. The panel pins near the top (switcher idiom) instead of the modal's
+   vertical centre via align-self; head (input) and foot (key hints) are fixed, the
+   results body scrolls. */
+
+.panel {
+  /* The overlay centres its child; a switcher reads better pinned high. align-self
+     overrides the overlay's align-items:center for THIS panel only — no Modal change. */
+  align-self: flex-start;
+  margin-top: 12vh;
+}
+
+/* Let the page read THROUGH behind the switcher — otherwise the Modal's default
+   backdrop (8px blur + a 45% dim) pre-blurs the whole scene into a flat sheet, and
+   the panel's own frost has nothing to refract, so the glass never "reads". Lighten
+   the dim and nearly drop the backdrop blur (knobs the Modal exposes); the panel's
+   own deep blur (below) does the diffusing, now over visible content. */
+.overlay {
+  --modal-backdrop-dim: color-mix(in srgb, var(--backdrop-dim) 40%, transparent);
+  --modal-backdrop-blur: 2px;
+}
+
+/* Heavily frosted glass. Modal pins `--glass-bg` near-opaque (92%) so forms stay
+   readable; a switcher is a floating chrome surface over a backdrop that's ALREADY
+   dimmed + blurred (Modal's .modal-backdrop), so the contrast floor is held there —
+   the panel itself can go properly see-through. Push the #72 glass KNOBS (no bespoke
+   material, no new class): a thinner translucent fill off --bg-elevated + a deep blur
+   + a touch more saturation. The compound `.panel.glass` selector outranks Modal's
+   `.modal-panel { --glass-bg }`, so the override sticks regardless of CSS source order
+   (same specificity trick as .icon-btn.rail-logo). */
+.panel:global(.glass) {
+  --glass-bg: color-mix(in srgb, var(--bg-elevated) 55%, transparent);
+  --glass-blur: 26px;
+  --glass-saturate: 200%;
+}
+
+.spotlight {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 16px;
+  height: 52px;
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+.head-icon { color: var(--text-faint); flex: 0 0 auto; }
+.input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 16px;
+  line-height: 1.2;
+}
+.input::placeholder { color: var(--text-faint); }
+
+.body {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: 46vh;
+  overflow-y: auto;
+  padding: 6px;
+}
+
+.section + .section { margin-top: 4px; }
+.section-label {
+  padding: 6px 10px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  color: var(--text);
+}
+/* Keyboard + hover share one highlight (aria-selected is the source of truth) so
+   the selected row never disagrees with what Enter will open. */
+.row-active { background: var(--accent-soft); }
+
+.row-icon { color: var(--text-faint); flex: 0 0 auto; margin-top: 2px; }
+.row-active .row-icon { color: var(--accent); }
+
+.row-text { min-width: 0; flex: 1; }
+.row-title {
+  font-size: 13.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.row-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  margin-top: 1px;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+.row-meta-date,
+.row-meta-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.row-meta-date {
+  flex: 0 0 auto;
+}
+.row-meta-path {
+  flex: 1 1 auto;
+}
+.row-meta-type {
+  flex: 0 0 auto;
+}
+.row-meta-sep {
+  flex: 0 0 auto;
+}
+.row-sub {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Match highlight (computed client-side — the backend has no offsets). */
+.row mark {
+  background: transparent;
+  color: var(--accent);
+  font-weight: 600;
+}
+.row-active mark { color: var(--accent-2); }
+
+.skeleton { padding: 6px 4px; }
+.skeleton-row { padding: 7px 10px; }
+
+.foot {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  align-items: center;
+  padding: 8px 14px;
+  border-top: 1px solid var(--border);
+  flex: 0 0 auto;
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+.hint { display: inline-flex; align-items: center; gap: 4px; }
+.hint kbd {
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1;
+  padding: 2px 5px;
+  border: 1px solid var(--border-strong);
+  border-bottom-width: 2px;
+  border-radius: var(--radius-xs);
+  background: var(--bg-elevated);
+  color: var(--text-dim);
+}

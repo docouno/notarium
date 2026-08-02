@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Notarium</title>
+    <meta name="description" content="Self-hosted, AI-agent-native knowledge base." />
+    <!-- Icons (#40): committed under public/, generated from favicon.svg. The
+         <link rel="manifest"> is injected by vite-plugin-pwa. -->
+    <link rel="icon" href="/favicon.ico" sizes="48x48" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon-180x180.png" />
+    <!-- Preload the default UI font (Inter, #27) so the first paint already has it
+         — no chrome-wide flash from the system fallback swapping to Inter. Latin
+         subset only (the UI chrome is Latin); Cyrillic/other UI text swaps in. The
+         `crossorigin` is required to match the @font-face's CORS-anonymous fetch,
+         or the browser double-loads it. -->
+    <link rel="preload" href="/fonts/inter-latin-normal.woff2" as="font" type="font/woff2" crossorigin />
+    <!-- Initial value for first paint (default-dark, matches tokens.scss --bg);
+         ChromeProvider rewrites it to the active theme's background at runtime. -->
+    <meta name="theme-color" content="#151517" />
+    <!-- Standalone polish: run chrome-less on install, keep the brand title.
+         status-bar-style 'black' = opaque bar, NOT 'black-translucent' — the
+         translucent style overlays content under the status bar, which needs
+         env(safe-area-inset) padding the shell doesn't have yet (edge-to-edge is
+         the adaptive pass, #26). 'black' keeps the standalone non-overlapping. -->
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+    <meta name="apple-mobile-web-app-title" content="Notarium" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

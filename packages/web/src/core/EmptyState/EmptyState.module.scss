@@ -1,0 +1,64 @@
+/* Empty-block placeholder (#28). `.empty` is the shared layout; `.card`/`.bare`
+   are the two skins (see EmptyState.tsx for when each applies). */
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 7px;
+}
+
+.icon {
+  display: flex;
+  margin-bottom: 2px;
+  color: var(--text-faint);
+}
+
+.title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.hint {
+  max-width: 340px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+
+.action {
+  margin-top: 6px;
+}
+
+/* Card skin: a dashed, muted block — empty reads as a fillable state of a panel
+   that sits among other content (settings section, feed canvas). */
+.card {
+  padding: 28px 20px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--bg-list);
+}
+
+/* Bare skin (#68): no frame — for when the panel itself is the border. Centred
+   (horizontally via auto margins, which flex parents honour too; vertically by a
+   full-height parent) and width-capped so the text doesn't span the whole panel.
+   Smaller type, since these live in tight aside/rail panels. */
+.bare {
+  gap: 5px;
+  padding: 20px 16px;
+  max-width: min(75%, 300px);
+  margin-inline: auto;
+
+  .icon {
+    margin-bottom: 0;
+  }
+
+  .title {
+    font-size: 12.5px;
+  }
+
+  .hint {
+    font-size: 12px;
+  }
+}

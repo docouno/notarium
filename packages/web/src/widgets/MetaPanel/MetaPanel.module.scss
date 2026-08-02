@@ -1,0 +1,33 @@
+/* Read-only note metadata for the reading-mode inspector (#35) — the counterpart
+   to EditorMeta. Same field rhythm (label over value), values rendered as plain
+   text / pills / chips rather than inputs. */
+.meta-panel { display: flex; flex-direction: column; gap: 16px; padding: 12px var(--gutter); }
+.field { display: flex; flex-direction: column; gap: 6px; }
+.label {
+  font-size: 11px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.05em; color: var(--text-faint);
+}
+.value { font-size: 13px; color: var(--text); min-width: 0; }
+.muted { color: var(--text-faint); }
+
+.folder {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-family: var(--font-mono); color: var(--text); word-break: break-all;
+}
+.folder svg { color: var(--text-faint); flex-shrink: 0; }
+
+.pill {
+  display: inline-block; padding: 2px 8px; border-radius: var(--radius-sm);
+  background: var(--bg-elevated); border: 1px solid var(--border);
+  font-size: 12px; color: var(--text-dim);
+}
+
+.tags { display: flex; flex-wrap: wrap; gap: 6px; }
+
+/* Any remaining frontmatter, dumped as key/value so nothing the note carries is
+   hidden. Separated from the promoted fields by a rule. */
+.extra {
+  display: flex; flex-direction: column; gap: 12px;
+  padding-top: 14px; border-top: 1px solid var(--border);
+}
+.extra-value { font-family: var(--font-mono); font-size: 12px; color: var(--text-dim); word-break: break-word; }

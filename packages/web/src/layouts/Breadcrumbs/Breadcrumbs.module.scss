@@ -1,0 +1,41 @@
+/* Shared topbar breadcrumb (#28) — rides in PageFrame's left slot. */
+.crumbs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-dim);
+}
+
+.crumb {
+  white-space: nowrap;
+}
+
+.current {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* A clickable ancestor crumb (#214): inherits the dim trail colour, brightens on
+   hover/focus — a quiet link, not a loud one (the trail is chrome, not content). */
+.link {
+  color: inherit;
+  text-decoration: none;
+  border-radius: var(--radius-xs);
+}
+.link:hover {
+  color: var(--text);
+  text-decoration: underline;
+}
+.link:focus-visible {
+  /* Inset ring (negative offset): the leading crumb sits at x=0 inside
+     `.crumbs { overflow: hidden }`, so an OUTward ring would be clipped on the left. */
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.sep {
+  margin: 0 6px;
+  color: var(--text-faint);
+}

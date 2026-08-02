@@ -1,0 +1,133 @@
+/* Revision view (#12): replaces the reader in the main content column while a
+   revision is selected. The banner (a StickyBar) bleeds to the column edges —
+   the scroll container pads content with --content-gutter/--gutter, so the
+   negative margins put the strip flush against the topbar's full width while
+   its own --gutter padding keeps the controls on the topbar's rhythm. */
+.view {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+}
+
+/* Holds the controls row; `align-items: stretch` lets that row own the full
+   strip width (so the actions can sit at the far right). A size container so
+   the controls restack when the content column is squeezed between both asides
+   (a narrow "mobile" middle). */
+.banner {
+  margin: 0 calc(-1 * var(--gutter)) 0 calc(-1 * var(--content-gutter));
+  flex-direction: column;
+  align-items: stretch;
+  container-type: inline-size;
+}
+
+/* Mode switch on the left, actions on the right; the actions wrap under the
+   switch when the column is too narrow to hold both. */
+.bannerControls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.bannerActions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+/* Stands in for the restore button on the latest revision (nothing to roll
+   back to) — a quiet state note, not an action. */
+.currentNote {
+  align-self: center;
+  font-size: 13px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+/* Narrow middle column (both asides expanded): the toggle and the actions each
+   take their own full-width row, and the toggle stretches to fill it with equal
+   segments rather than sitting as a small pill on a wide empty line. */
+@container (max-width: 480px) {
+  .bannerControls {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .bannerControls .bannerSeg {
+    display: flex;
+  }
+  .bannerControls .bannerSeg > button {
+    flex: 1;
+  }
+  .bannerActions {
+    justify-content: space-between;
+  }
+}
+
+/* Word-level source diff laid out line-by-line: a line-number gutter on the
+   left, the changed lines highlighted (so a one-character edit is findable),
+   word-level additions/removals tinted inside — never color-only (ins/del
+   semantics survive themes). */
+.diff {
+  --diff-gutter: 3ch;
+  max-width: 860px;
+  margin: 0 auto;
+  width: 100%;
+  padding: 20px 0 120px;
+  font-family: var(--font-mono);
+  font-size: var(--reading-diff-size);
+  line-height: 1.65;
+}
+.line {
+  display: grid;
+  grid-template-columns: var(--diff-gutter) 1fr;
+  column-gap: 16px;
+}
+/* No row fill — a changed line is flagged only in the gutter (an accent bar at
+   the left edge + the accent-coloured number). Quiet when the whole file
+   changes, still findable for a one-word edit (the gutter cue plus the tinted
+   word inside). */
+.lineChanged {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.gutter {
+  text-align: right;
+  color: var(--text-faint);
+  user-select: none;
+  -webkit-user-select: none;
+  font-variant-numeric: tabular-nums;
+}
+.lineChanged .gutter {
+  color: var(--accent);
+}
+.lineText {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.diff ins {
+  text-decoration: none;
+  background: rgba(63, 185, 80, 0.22);
+  border-radius: 2px;
+}
+.diff del {
+  background: rgba(229, 72, 77, 0.18);
+  border-radius: 2px;
+}
+
+.rendered {
+  max-width: 740px;
+  margin: 0 auto;
+  width: 100%;
+  padding: 20px 0 120px;
+}
+
+.gap {
+  padding: 18px 0;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+/* Body-load shimmer: paragraph runs spaced like rendered prose. */
+.skeletonBody {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}

@@ -1,0 +1,35 @@
+{
+  "name": "notarium",
+  "version": "0.1.0",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "description": "Companion CLI for Notarium — the self-hosted, AI-agent-native knowledge workspace. The workspace itself ships as a Docker image.",
+  "keywords": [
+    "notarium",
+    "knowledge-base",
+    "knowledge-graph",
+    "markdown",
+    "mcp",
+    "ai-agents",
+    "self-hosted"
+  ],
+  "homepage": "https://notarium.ai",
+  "bin": {
+    "notarium": "dist/main.js"
+  },
+  "files": [
+    "dist",
+    "NOTICE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsup",
+    "prepublishOnly": "npm run build",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "tsup": "^8.5.0"
+  }
+}

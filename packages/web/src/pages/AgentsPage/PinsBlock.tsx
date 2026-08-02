@@ -1,0 +1,371 @@
+import { useMemo } from 'react'
+import type { ContextOrderEntry, ContextPin, ContextSetView, Preview } from '@notarium/contract'
+import { Button } from '../../core/Button'
+import { Chip } from '../../core/Chips'
+import { type MenuItem } from '../../core/ContextMenu'
+import { EmptyState } from '../../core/EmptyState'
+import { IconExternal, IconMinus, IconPin, IconPinOff, IconPlus, IconTrash } from '../../core/Icons'
+import { type ReorderHandle, useReorder } from '../../libs/dnd/reorder'
+import { ContextCard } from '../../widgets/ContextCard'
+import { StatusBadge, TokenMeter } from './ContextMeters'
+import { CardListSkeleton } from './ContextSkeletons'
+import { parseEntryKey, pinKey, setKey } from './helpers/contextOrder'
+import { pinsTrimmed } from './helpers/contextTrim'
+import { formatTokens } from './helpers/format'
+import styles from './ContextPage.module.scss'
+
+export const PinEmptyState = ({
+  title,
+  hint,
+  onAdd,
+  testId,
+}: {
+  title: string
+  hint: string
+  onAdd: () => void
+  testId: string
+}) => (
+  <EmptyState
+    icon={<IconPin size={24} />}
+    title={title}
+    hint={hint}
+    action={
+      <Button onClick={onAdd} data-testid={testId}>
+        <IconPlus size={13} /> Add pinned note
+      </Button>
+    }
+    testId={`${testId}-empty`}
+  />
+)
+
+/** One pinned always-load note. Row: title (+ a home-space chip when it is a CROSS-SPACE
+ *  pin #209) + weight meter; expands to snippet + meta (reading length · tags). Menu:
+ *  open note · unpin. `onUnpin` gets the pin's space so the caller routes a same-space
+ *  pin to the `always-load` tag and a cross-space one to the scope-pin registry. */
+export const PinRow = ({
+  pin,
+  preview,
+  scale,
+  onOpen,
+  onUnpin,
+  reorder,
+}: {
+  pin: ContextPin
+  preview?: Preview | null
+  scale: number
+  onOpen: (id: string) => void
+  onUnpin: (noteId: string, space?: string) => void
+  reorder?: ReorderHandle
+}) => {
+  const meta: string[] = []
+
+  if (!pin.loaded) {
+    meta.push('Over the token budget')
+  }
+  if (preview?.words) {
+    meta.push(`${preview.words} ${preview.words === 1 ? 'word' : 'words'}`)
+  }
+  // `always-load` is the pin's own marker tag, not content — keep it out of the meta.
+  const tags = (preview?.tags ?? []).filter((t) => t !== 'always-load')
+
+  if (tags.length) {
+    meta.push(tags.map((t) => `#${t}`).join(' '))
+  }
+  // Unpinning is REVERSIBLE — a neutral "Unpin", named + iconed the SAME on pins and sets
+  // (never a scary "remove"/"delete"). Only a destructive set delete is red (#209 UX r5).
+  const menu: MenuItem[] = [
+    { label: 'Open note', icon: <IconExternal size={15} />, onClick: () => onOpen(pin.noteId) },
+    { divider: true },
+    {
+      label: 'Unpin',
+      icon: <IconPinOff size={15} />,
+      onClick: () => onUnpin(pin.noteId, pin.space),
+    },
+  ]
+  return (
+    <ContextCard
+      title={
+        <span className={styles.itemTitle}>
+          <span className={styles.itemName}>{pin.title}</span>
+          <span className={styles.itemBadges}>
+            {pin.space && <Chip>{pin.space}</Chip>}
+            {!pin.loaded && <StatusBadge state="trimmed" />}
+          </span>
+          <TokenMeter tokens={pin.tokens} scale={scale} trimmed={!pin.loaded} />
+        </span>
+      }
+      summary={preview?.snippet}
+      details={meta.length ? meta.join(' · ') : undefined}
+      menu={menu}
+      reorder={reorder}
+      testId="context-pin-row"
+    />
+  )
+}
+
+/** One member note of a set as seen INSIDE the expanded set (#209): the same expandable card
+ *  as a pin (title + home-space chip + weight meter → expands to its preview). The row menu
+ *  opens the note or removes it FROM THE SET — a reversible, per-item trim (neutral, distinct
+ *  from unpinning the whole set). A note the viewer can't reach never reaches this list. */
+export const SetItemRow = ({
+  item,
+  preview,
+  scale,
+  onOpen,
+  onRemove,
+  reorder,
+}: {
+  item: ContextSetView['items'][number]
+  preview?: Preview | null
+  scale: number
+  onOpen: (id: string) => void
+  onRemove: () => void
+  reorder?: ReorderHandle
+}) => (
+  <ContextCard
+    title={
+      <span className={styles.itemTitle}>
+        <span className={styles.itemName}>{item.title || 'Untitled'}</span>
+        <span className={styles.itemBadges}>
+          <Chip>{item.space}</Chip>
+          {!item.loaded && <StatusBadge state="trimmed" />}
+        </span>
+        <TokenMeter tokens={item.tokens} scale={scale} trimmed={!item.loaded} />
+      </span>
+    }
+    summary={preview?.snippet}
+    menu={[
+      { label: 'Open note', icon: <IconExternal size={15} />, onClick: () => onOpen(item.noteId) },
+      { divider: true },
+      // Reversible (the note can be re-added) → neutral. Scoped to "from set" so it never
+      // reads as deleting the note itself, and named apart from the set's own "Unpin".
+      { label: 'Remove from set', icon: <IconMinus size={15} />, onClick: onRemove },
+    ]}
+    reorder={reorder}
+    testId="context-set-item"
+  />
+)
+
+/** A context set AS A PIN-LIST ROW (#209): an expandable card badged `Set` that reveals its
+ *  member notes (each itself expandable, each removable from its own menu) — progressive
+ *  disclosure, no separate manager. Weight = the sum of its loaded items against the scope
+ *  budget. The row menu adds notes, unpins the set from this scope, or deletes it everywhere. */
+export const SetRow = ({
+  set,
+  previews,
+  scale,
+  onOpen,
+  onAddNotes,
+  onDetach,
+  onDelete,
+  onRemoveItem,
+  onReorderItems,
+  reorder,
+}: {
+  set: ContextSetView
+  previews: Record<string, Preview | null>
+  scale: number
+  onOpen: (id: string) => void
+  onAddNotes: (set: ContextSetView) => void
+  onDetach: (set: ContextSetView) => void
+  onDelete: (set: ContextSetView) => void
+  onRemoveItem: (set: ContextSetView, noteId: string) => void
+  onReorderItems: (set: ContextSetView, noteIds: string[]) => void
+  reorder?: ReorderHandle
+}) => {
+  const total = set.items.reduce((s, i) => s + i.tokens, 0)
+  const trimmed = set.items.some((i) => !i.loaded)
+  // The set's OWN item order (#210) — a separate reorder list nested inside the expanded set.
+  // Its `drag` is isolated from the outer pin+set list (each useReorder owns its own state),
+  // so dragging a member never nudges the set among the pins. <2 items ⇒ inert.
+  const itemKeys = set.items.map((i) => i.noteId)
+  const { handleFor: itemHandle, listProps: itemListProps } = useReorder(
+    itemKeys,
+    (next) => onReorderItems(set, next),
+    itemKeys.length < 2,
+  )
+  return (
+    <ContextCard
+      title={
+        <span className={styles.itemTitle}>
+          <span className={styles.itemName}>{set.name}</span>
+          <span className={styles.itemBadges}>
+            <Chip variant="accent">Set · {set.items.length}</Chip>
+            {trimmed && <StatusBadge state="trimmed" />}
+          </span>
+          <TokenMeter tokens={total} scale={scale} trimmed={trimmed} />
+        </span>
+      }
+      details={
+        <div className={styles.list} {...itemListProps}>
+          {set.items.length === 0 ? (
+            <p className={styles.blockCaption}>
+              No notes to show — items in spaces you can’t access are hidden.
+            </p>
+          ) : (
+            set.items.map((item) => (
+              <SetItemRow
+                key={item.noteId}
+                item={item}
+                preview={previews[item.noteId]}
+                scale={scale}
+                onOpen={onOpen}
+                onRemove={() => onRemoveItem(set, item.noteId)}
+                reorder={itemHandle(item.noteId)}
+              />
+            ))
+          )}
+        </div>
+      }
+      menu={[
+        // "Add notes" opens the add-picker for this set; per-item removal lives on each member
+        // row. "Unpin" is the reversible detach from this scope — named like a pin's. The
+        // destructive Delete is set off by a divider and confirmed (in the handler).
+        { label: 'Add notes', icon: <IconPlus size={15} />, onClick: () => onAddNotes(set) },
+        { label: 'Unpin', icon: <IconPinOff size={15} />, onClick: () => onDetach(set) },
+        { divider: true },
+        {
+          label: 'Delete set',
+          icon: <IconTrash size={15} />,
+          danger: true,
+          onClick: () => onDelete(set),
+        },
+      ]}
+      reorder={reorder}
+      testId="context-set-row"
+    />
+  )
+}
+
+/** The Pinned block (#165/#208/#209): the always-load notes AND context sets in ONE
+ *  list — a set is a badged, expandable row (its notes nest inside). Add via [+] (the
+ *  one multi-select picker: pin notes or build a set); unpin / manage via the row menu. */
+export const PinsBlock = ({
+  pins,
+  sets,
+  previews,
+  scale,
+  onAdd,
+  onOpen,
+  onUnpin,
+  onAddNotesToSet,
+  onDetachSet,
+  onDeleteSet,
+  onRemoveItem,
+  onReorder,
+  onReorderSetItems,
+  emptyHint,
+  addTestId,
+  listTestId,
+}: {
+  pins: ContextPin[] | null
+  sets: ContextSetView[] | null
+  previews: Record<string, Preview | null>
+  scale: number
+  onAdd: () => void
+  onOpen: (id: string) => void
+  onUnpin: (id: string, space?: string) => void
+  onAddNotesToSet: (set: ContextSetView) => void
+  onDetachSet: (set: ContextSetView) => void
+  onDeleteSet: (set: ContextSetView) => void
+  onRemoveItem: (set: ContextSetView, noteId: string) => void
+  /** Persist a new pin+set order for this scope (#210) — the whole sequence, kind+ref. */
+  onReorder: (entries: ContextOrderEntry[]) => void
+  /** Persist a new item order inside a set (#210). */
+  onReorderSetItems: (set: ContextSetView, noteIds: string[]) => void
+  emptyHint: string
+  addTestId: string
+  listTestId: string
+}) => {
+  const trimmedTokens = pins ? pinsTrimmed(pins) : 0
+  const empty = pins != null && pins.length === 0 && (sets == null || sets.length === 0)
+  // Pins AND sets in ONE list, ordered by the server-curated `order` (#210): they share the
+  // rank space, so a set can sit above a pin. Rendered as one DnD-reorderable list; the drag
+  // keys are the server's order refs (`pin:<id>` / `set:<id>`), so a drop maps straight back.
+  const entries = useMemo<
+    Array<{ key: string; order: number; pin?: ContextPin; set?: ContextSetView }>
+  >(
+    () =>
+      [
+        ...(pins ?? []).map((p) => ({ key: pinKey(p.noteId), order: p.order, pin: p })),
+        ...(sets ?? []).map((s) => ({ key: setKey(s.id), order: s.order, set: s })),
+      ].sort((a, b) => a.order - b.order),
+    [pins, sets],
+  )
+  const keys = entries.map((e) => e.key)
+  const { handleFor, listProps } = useReorder(
+    keys,
+    (next) => onReorder(next.map(parseEntryKey)),
+    keys.length < 2,
+  )
+  return (
+    <div className={styles.block}>
+      <div className={styles.blockHead}>
+        <IconPin size={13} />
+        <span>Pinned</span>
+        {!empty && (
+          <div className={styles.blockActions}>
+            <Button
+              variant="ghost"
+              icon
+              aria-label="Add to context"
+              title="Pin notes or build a set"
+              onClick={onAdd}
+              data-testid={addTestId}
+            >
+              <IconPlus size={14} />
+            </Button>
+          </div>
+        )}
+      </div>
+      {!pins ? (
+        <CardListSkeleton rows={4} />
+      ) : empty ? (
+        <PinEmptyState
+          title="Nothing pinned yet"
+          hint={emptyHint}
+          onAdd={onAdd}
+          testId={addTestId}
+        />
+      ) : (
+        <>
+          {trimmedTokens > 0 && (
+            <p className={styles.blockCaption}>
+              <span className={styles.trimmedText}>≈{formatTokens(trimmedTokens)} trimmed</span> —
+              over the token budget
+            </p>
+          )}
+          <div className={styles.list} data-testid={listTestId} {...listProps}>
+            {entries.map((e) =>
+              e.pin ? (
+                <PinRow
+                  key={e.key}
+                  pin={e.pin}
+                  preview={previews[e.pin.noteId]}
+                  scale={scale}
+                  onOpen={onOpen}
+                  onUnpin={onUnpin}
+                  reorder={handleFor(e.key)}
+                />
+              ) : e.set ? (
+                <SetRow
+                  key={e.key}
+                  set={e.set}
+                  previews={previews}
+                  scale={scale}
+                  onOpen={onOpen}
+                  onAddNotes={onAddNotesToSet}
+                  onDetach={onDetachSet}
+                  onDelete={onDeleteSet}
+                  onRemoveItem={onRemoveItem}
+                  onReorderItems={onReorderSetItems}
+                  reorder={handleFor(e.key)}
+                />
+              ) : null,
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  )
+}

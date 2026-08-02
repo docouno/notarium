@@ -1,0 +1,41 @@
+// The class-visibility policy matrix (#74 §2 / #78) — the single source of truth
+// every discovery surface consults. This locks the exact policy ROWS against
+// silent drift: the `profile` row (#159) flipped userSearch true→false mid-review
+// precisely because nothing pinned it, so pin it (and the scope derivations) here.
+
+import { describe, expect, it } from 'vitest'
+import { CLASS_POLICY, classesForScope, isVisibleOn, NOTE_CLASSES } from '@notarium/core'
+
+describe('class visibility policy (#78)', () => {
+  it('the profile class (#159) is hidden from EVERY discovery surface', () => {
+    expect(CLASS_POLICY.profile).toEqual({
+      index: true,
+      graph: false,
+      feed: false,
+      tree: false,
+      userSearch: false,
+      agentRecall: false,
+      versioned: true,
+      replicate: true,
+    })
+    // Every read-facing surface answers false for the profile.
+    for (const surface of ['feed', 'tree', 'userSearch', 'graph', 'agentRecall'] as const) {
+      expect(isVisibleOn(surface, 'profile')).toBe(false)
+    }
+  })
+
+  it('profile is admitted only by the `all` scope, never user/agentRecall', () => {
+    expect(classesForScope('user').has('profile')).toBe(false)
+    expect(classesForScope('agentRecall').has('profile')).toBe(false)
+    expect(classesForScope('all').has('profile')).toBe(true)
+    // Sanity: the visible default class IS in the user scope.
+    expect(classesForScope('user').has('user-doc')).toBe(true)
+  })
+
+  it('the registry includes profile and agent-memory stays recall-visible', () => {
+    expect(NOTE_CLASSES).toContain('profile')
+    // Guard the contrast that makes profile distinct from memory: agent-memory is
+    // recall-visible, profile is not.
+    expect(classesForScope('agentRecall').has('agent-memory')).toBe(true)
+  })
+})

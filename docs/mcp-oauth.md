@@ -1,0 +1,75 @@
+# MCP OAuth — connecting a connector from the web UI
+
+Canon for the MCP gateway's OAuth facade (#96). The decisions were fixed on 2026-06-20 on top of a reconnaissance of the spec's current state (primary sources: `claude.com/docs/connectors/building/authentication`, `modelcontextprotocol.io/specification/2025-11-25`, `developers.openai.com/apps-sdk`). The foundation is the MCP gateway (#21, [mcp-gateway.md](mcp-gateway.md)) and auth (#10, [auth.md](auth.md)). This is a **new channel for obtaining a token**, not a new authorization: the internal `can()` and the tools themselves are untouched.
+
+## Why
+
+The **claude.ai** web UI (web/desktop/mobile) and **chatgpt.com**, when adding a "custom connector," accept **only the OAuth flow** — there is no field to paste a Bearer/API key, and tokens in the URL are forbidden (`static_bearer` as of 2026-06-20 is still "not supported," `client_credentials` is rejected). PAT connection (#21) works for the Claude API / Claude Code / config clients, but not for browser-based adding. Without OAuth a user cannot connect a self-hosted Notarium to claude.ai from the browser — the key "AI-agent-native PKM" scenario.
+
+## Mode fork
+
+- **`AUTH_MODE=none`** (desktop/dev/trusted intranet) → **authless connector**: `/mcp` runs as SYSTEM without a token, and claude.ai/ChatGPT add a no-auth server "out of the box." The facade is not needed and is not registered. Caveat: an authless server is public — whoever knows the URL can call it; acceptable only for single-user / demo / trusted-network use.
+- **`AUTH_MODE=password`** (default, multi-user) → **thin OAuth facade**, where Notarium = its own minimal Authorization Server. Active when a meta-DB (token storage) is present.
+
+**Notarium is its own AS, not an RS with delegation**: the self-host owns the users (#10), there is nowhere to delegate to. The facade is thin because login/sessions/principal already exist — `/authorize` reuses the session cookie, `/token` mints a token that maps to a principal. RS-only with an external IdP (RFC 9728 `authorization_servers` pointing outward) is a future OIDC seam (#10 "deliberately later," the EMA/zero-touch direction), not the default.
+
+## Surfaces
+
+Registered OUTSIDE `/api` and BEFORE the SPA fallback (like `/mcp`): `installAuthz` guards only `/api`, so discovery/flow authenticate themselves.
+
+- `GET /.well-known/oauth-protected-resource` — RFC 9728 PRM: `resource=<base>/mcp`, `authorization_servers=[<base>]`, `scopes_supported`.
+- `GET /.well-known/oauth-authorization-server` — RFC 8414 ASM: endpoints, `code_challenge_methods_supported:["S256"]`, `token_endpoint_auth_methods_supported:["none"]`, `client_id_metadata_document_supported:true`.
+- `POST /mcp` without a token (password) → **401 + `WWW-Authenticate: Bearer resource_metadata="<base>/.well-known/oauth-protected-resource", scope="read write"`** — the entry point into the flow.
+- `GET /oauth/authorize` — consent page (server-rendered HTML; if a session cookie is present — an immediate consent with a **space picker** #181 "All spaces" + checkboxes, otherwise a login form). `POST /oauth/authorize` — approve/deny + inline login → redirect `redirect_uri?code=…&state=…`. For inline login the flow is **two-step** (#181): the first POST logs in and re-renders the consent WITH the picker (spaces are known only after login), the second Authorize mints the code with the selection; for an already-logged-in user — a single step. The selection is stored on `oauth_auth_codes.spaces` and is inherited by access/refresh at issuance.
+- `POST /oauth/token` (form-encoded) — `authorization_code` (verify PKCE S256, single-use code) and `refresh_token` (rotation). Issues an `access_token` (+`refresh_token` with `offline_access`).
+- `POST /oauth/register` — DCR (RFC 7591) fallback.
+- `POST /oauth/revoke` — RFC 7009; powers the connector's "disconnect" (tears down the principal's live SSE).
+- `PATCH /api/me/connections/:id` (self, #162 scope, #181 spaces) — changing the connection level `read↔write` AND/OR per-space narrowing WITHOUT re-consent. `id` = client id (as with disconnect); patches scope+spaces on ALL of the application's live tokens (access AND refresh), so the new ceiling AND the narrowing survive the hourly rotation (`refresh` mints the next family from the refresh row's scope+spaces). Takes effect from the next call (the principal is rebuilt on every request); `dropSse` is a belt. `spaces` is validated against membership (as with PAT create/patch), `spaces:null` widens back to all grants.
+
+## Client registration: CIMD-first + DCR
+
+The 2025-11-25 spec prefers **CIMD** (Client ID Metadata Documents), but deployed connector compatibility still requires **DCR**. Discovery therefore continues to advertise `registration_endpoint`; unapproved registrations are bounded without changing that wire contract or requiring existing integrations to reconnect.
+
+- **CIMD**: `client_id` = the https URL of the client's metadata document. We fetch it (SSRF guard: https only, no loopback/private/link-local, one 8s DNS+fetch budget, 64KB limit, `redirect:'error'`), validate the self-reference (`client_id` in the document == URL) and `redirect_uris`, and cache it in `oauth_clients`. Concurrent resolves of the same URL are coalesced.
+- **DCR**: `POST /oauth/register` mints a `client_id` from `redirect_uris`, with the same response shape as before these limits were introduced. The route has a 64 KiB body, at most 32 redirects and 4096 characters per redirect URI. These new metadata-size limits are deliberately DCR-only: activated CIMD clients retain their previous validation envelope on cache refresh.
+
+Both paths create a **pending** client first. New DCR/CIMD admissions share a budget of 10 attempts / 15 minutes / canonical client IP and at most 2 concurrent registration/metadata operations. Activated CIMD refreshes stay outside this new fail-fast policy and use two separate refresh slots plus a bounded 16-request wait lane: ordinary overlap waits without a new 429, while overflow fails closed with retryable 503 instead of accepting stale redirect metadata or building an unbounded queue. Together with per-client coalescing and the 8s fetch budget, this bounds public work. Pending rows have a single atomic global quota of 100 and are opportunistically garbage-collected after 24 hours. Successful human consent sets `activated_at` before issuing the authorization code; activated rows are outside this quota and are never removed by pending GC. Existing owned deployments were backfilled before the SQL-baseline boundary, so their established Claude/ChatGPT/other connections remain activated.
+
+## Token identity
+
+The `access_token` (`nto_<id>_<secret>`, the secret is a sha256 in the DB, like a PAT) is validated by **the same checkpoint** `authService.authenticate()` as a PAT/session — one token→principal path, not two. Principal: `id=oauth:<user>:<tokenId>`, `scope=read|write` (NEVER `manage` — management actions are above `write`, the same boundary as with a PAT: a leaked connector token will not issue a token and will not grant access), `spaces` — per-space narrowing (#181): a list of space stable-ids, `null` = all of the user's grants (like an un-narrowed PAT). The narrowing is intersected with live membership on every check (revoking a grant instantly narrows the connector too). The space selection is made on the consent screen (multi-select, "All spaces" by default) and edited in Settings → Connected apps; the axis is orthogonal to OAuth scope (we do NOT echo it into the `scope` string of the token response, just as PAT narrowing ⟂ scope). The agent picks the space/project via tool arguments — `/mcp` is host-level, one issuer per host (multi-space does not complicate PRM/issuer).
+
+The `refresh_token` (`ntr_…`) — `offline_access`, rotation on use (`rotated_to` catches replay). Attribution in the journal (#12): `oauth:<user>:<tokenId>` → `describeAuthor` returns `agent` (connector), privacy is as with a PAT.
+
+## Storage (meta-DB)
+
+`oauth_clients` (CIMD cache / DCR registry, `redirect_uris` allowlist, `activated_at` lifecycle), `oauth_auth_codes` (sha256, PKCE challenge, single-use via an atomic claim, TTL ~60s), `oauth_access_tokens` (TTL ~1h), `oauth_refresh_tokens` (TTL ~60d, rotation). All secrets are hashes only. The facet is optional: a none-mode / meta-DB-less host does not have it (the authless path). Access, refresh and code rows carry a `spaces` column (JSON stable-id, like `pats.spaces`): the code carries the selection from consent to mint, access/refresh keep it through rotation; `NULL` = all spaces.
+
+## Config
+
+- `PUBLIC_BASE_URL` — the canonical origin for `issuer`/`resource` (stability behind a proxy). Not set → the existing derivation from `x-forwarded-proto`/`x-forwarded-host`.
+- `TRUST_PROXY` — comma-separated IP/CIDR allowlist of direct reverse proxies for canonical client-IP resolution. Unset means `X-Forwarded-For` cannot affect login or new OAuth client admission (DCR + pending CIMD); host/protocol forwarding remains backward-compatible.
+- Platform callbacks (known, entered as the client's redirect_uris): Claude `https://claude.ai/api/mcp/auth_callback` (+ loopback for Claude Code, RFC 8252); ChatGPT `https://chatgpt.com/connector/oauth/{id}`.
+
+## Security
+
+PKCE S256 is mandatory (verify base64url(SHA256(verifier)), constant-time comparison); the code is validated and burned by an atomic claim ONLY after the client/redirect/PKCE check (an invalid exchange does not burn the code). `redirect_uri` — an exact match against the client's allowlist (no prefixes — open redirect). Refresh rotation is an atomic CAS (`claimRefreshRotation`): a concurrent refresh does not spawn two token families. Revoke cascades (access→its refresh; refresh→all its access) and tears down SSE; Disconnect in the UI hits the client and pulls the refresh tokens directly (an application with an expired access but a live refresh is visible and gets revoked). Management is unreachable (scope ≤ write). The anti-enumeration/sanitize layers of #21/#10 are not weakened.
+
+**Operator boundaries (deployment):**
+- **issuer/base-URL and client IP.** Without `PUBLIC_BASE_URL`, issuer/discovery retain the existing `X-Forwarded-Proto/Host` derivation, so released connector setups do not change behavior. The proxy MUST overwrite those headers rather than pass client-supplied values through. Separately, raw `X-Forwarded-For` is never accepted for rate limits: only Fastify's `req.ip` is used, and it consults XFF only when the direct peer matches the narrow `TRUST_PROXY` allowlist.
+- **CIMD SSRF.** The client-metadata fetch is protected: https only, the host is resolved and private/loopback/link-local/metadata addresses (incl. IPv4-mapped/NAT64/compat IPv6 forms) are rejected, `redirect:'error'`, one wall-clock timeout across DNS validation + fetch, and a response-size limit. RESIDUAL: the global `fetch` re-resolves the host itself (DNS-rebinding TOCTOU; pinning the IP would require an undici dispatcher — against P9 — and breaks TLS-SNI). Literal SSRF (without DNS) is fully closed; against rebinding the production boundary is **egress filtering at the network edge** (block metadata-IP / private ranges).
+
+## Tests
+
+- `test/unit/oauth.test.ts` — PKCE (RFC 7636 vector), token formats, CIMD SSRF guard.
+- `test/unit/oauthService.test.ts` + `test/unit/metaDb.test.ts` — DCR/CIMD admission concurrency and coalescing, atomic pending quota/GC, and activation preservation.
+- `test/integration/pgOAuth.test.ts` — the opt-in real-PostgreSQL cross-pool quota and activation contract (`TEST_PG_URL=…`).
+- `test/fake-server/oauth.test.ts` — the full flow over the production `buildApp`: discovery (including DCR compatibility), 401 challenge, register→authorize→token, inline login, PKCE mismatch, single-use code, redirect allowlist, deny, refresh rotation, revoke→disconnect, token→principal through the checkpoint, proxy spoofing, DCR bounds, the cross-surface scrypt ceiling, **changing the connection level (lower/raise live + durable through rotation + owner-only)**, none-mode without the facade.
+
+## Deliberate caveats
+
+- **ChatGPT Deep Research / Company Knowledge** requires **specifically the `search`+`fetch` tools** with OpenAI's concrete signatures. A regular ChatGPT connector (the same OAuth + our tools) works by virtue of the facade; but the exact Deep Research contract is **version-dependent and diverges between sources** (`{results:[{id,title,url}]}` vs `{ids:[…]}`; `text` vs `content`; `url` present/absent), the "Company knowledge compatibility" canon is behind a bot block, and the shape conflicts with our semantic `search` (`noteId/snippet`). Decision: finalize the `fetch`/`search` shaping **on a live check against ChatGPT** (the chosen verification path), rather than guessing a conflicting contract and cluttering the Claude surface with a duplicating `fetch`. Until then — Notarium is added to ChatGPT as a regular connector.
+- **Connected-apps UI** (Settings → Connected apps): the list of connections (one row per application, with a Spaces column), changing the level read↔write (#162), per-space narrowing (#181, the form as with a PAT — "All spaces" + checkboxes) and revocation — done. The space selection is also on the consent screen at connect time (for inline login — the standard two-step login→consent).
+- **Partial-auth** (Claude experimental) — we are not building this in.
+- The single-instance auth invariant (#10) extends to the facade as well (in-memory login rate-limit on the consent login; HA — a shared store).
+- **TOCTOU of a rights change vs refresh rotation (#162/#181).** `updateConnection` takes a snapshot of the live access+refresh rows and patches them; a concurrent refresh rotation that read the refresh row BEFORE the patch will mint a new family from the old scope+spaces AFTER the snapshot — and it will slip past the patch (it may silently remain at the old level/scope). The window is a millisecond-scale interleaving of a rare owner PATCH and the hourly rotation; the same class of lock-free TOCTOU as the mutable scope of #162 (the spaces axis rides the same mechanism, adding no new risk), and it self-heals with a repeated PATCH. Full closure requires a lock/transaction over the shared #162 mechanism — out of scope for #181 (a deliberate caveat).

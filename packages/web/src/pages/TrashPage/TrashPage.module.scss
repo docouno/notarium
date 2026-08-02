@@ -1,0 +1,491 @@
+// The Trash page (#79): a full-height manager — top chrome (breadcrumb + search +
+// the select-all toolbar), a virtualized scroll list of deleted notes, and a bottom
+// action bar (the destructive action lives at the END of the flow, after you've
+// picked rows). Rows are NOT links wholesale: only the title opens the deleted note
+// read-only; the checkbox + restore are their own hit targets.
+//
+// Chrome material (#72): the top chrome and the footer FLOAT over the scrolling list
+// as frosted glass (the shared `.glass` / `.glass-edge-*` utilities, added in JSX) —
+// the list scrolls UNDER them, same as every other fixed bar in the app. So this file
+// owns only the geometry (the floating position, the band insets); the frosted fill +
+// lit edge come from the shared material, no custom backgrounds here.
+
+// Content column cap: the toolbar/list/footer centre at this width on wide screens
+// (a list at full ultra-wide width reads badly), while the bars' borders still span
+// edge-to-edge. The centring is a max() padding so it falls back to the gutters on
+// narrow viewports.
+$content-max: 920px;
+
+// The inset from a band's edge to its CONTENTS — i.e. the hover pill's breathing on every
+// side, AND the same distance the toolbar's select-all / tabs and the footer's action sit
+// inside their band. One value, shared by every band, so the checkboxes, the kind glyph,
+// the tabs and Restore all line up on one column and breathe identically. Bump it here to
+// loosen the whole page in one place — keep ROW_H (TrashPage.tsx) in sync: it's the body's
+// two text lines (16 + 2 gap + 14) plus 2× this (the row hugs the body, so this is also
+// the vertical breathing top AND bottom).
+$pill-pad: 12px;
+
+// Every band — the select-all toolbar, the scroll list, the footer — insets to the SAME
+// chrome gutter (--gutter, the inset the topbar's toggle box uses), symmetric and centre-
+// capped. This is the BAND edge: the hover pill, the toolbar/footer borders. The CONTENT
+// line — checkboxes, kind glyph, tabs, Restore — is one $pill-pad further in, applied
+// INSIDE each band: for a row it's the row's own padding (which IS the pill's breathing);
+// for the toolbar/footer it's a margin on their edge groups. So band edge = --gutter,
+// content = --gutter + $pill-pad, by construction — no bleed, no negative margins.
+@mixin band-inset {
+  padding-left: max(var(--gutter), calc((100% - #{$content-max}) / 2));
+  padding-right: max(var(--gutter), calc((100% - #{$content-max}) / 2));
+}
+
+// The list (.scroll) reserves the scrollbar gutter on its right (scrollbar-gutter:
+// stable), so its rows end one scrollbar-width INSIDE the panel edge. A fixed bar
+// above/below it (the control line, the footer) doesn't scroll, so without the same
+// reservation its right-edge content (the tabs, the action button) would overhang the
+// rows by exactly that width. Reserve the matching gutter here so every right edge —
+// tabs, Restore, the hover pill, the footer button — lines up on ONE column. (The
+// gutter only materialises on a scroll container, hence the overflow.)
+@mixin match-scrollbar-gutter {
+  overflow: auto;
+  scrollbar-gutter: stable;
+}
+
+// The page root is the positioning context for the floating chrome. The list (.scroll)
+// is the only in-flow child, so it fills the frame; the top chrome + footer overlay it.
+.page {
+  position: relative;
+}
+
+// The floating top chrome (#72): the topbar row + the optional select-all toolbar as ONE
+// frosted band over the list. Absolute (out of flow) so the list scrolls under it; the
+// frosted fill + bottom lit edge come from `.glass`/`.glass-edge-bottom` (added in JSX).
+// Its live height is measured (TrashPage.tsx) and reserved as the scroll's padding-top.
+.topChrome {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 5;
+}
+
+// ── topbar — three zones so the search sits dead-centre (left: toggle +
+//    breadcrumb, centre: search, right: balance) ──
+.topbar {
+  height: var(--chrome-h);
+  min-height: var(--chrome-h);
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 8px;
+  padding: 0 var(--gutter);
+  // PIXEL-PARITY with every other page's topbar (PageFrame): there the topbar carries
+  // `glass-edge-bottom` directly, so its 1px border shrinks the content box to
+  // (--chrome-h − 1) and the collapse toggle / breadcrumb centre at that. Here the
+  // frosted edge sits on the .topChrome wrapper, not this row — so without this the
+  // content box would be a full --chrome-h and the toggle would sit 0.5px lower than on
+  // other pages (it "jumps" on navigation). This transparent hairline reproduces the
+  // exact same content box; the VISIBLE divider to the toolbar is the toolbar's own
+  // scroll-lifted border-top (#247) — absent at rest, rising with the glass — and when
+  // the toolbar is absent the band's edge is the .topChrome's glass-edge-bottom.
+  border-bottom: 1px solid transparent;
+}
+
+.topbarLeft {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.topbarCenter {
+  display: flex;
+  justify-content: center;
+  min-width: 0;
+}
+
+.topbarRight {
+  min-width: 0;
+}
+
+// Just the sizing — the field chrome (border, focus ring, clear button) lives in
+// the shared core/SearchField shell (#190), so Trash reads identically to the
+// cross-cutting search while staying a local filter. Width matches the topbar
+// OmniSearch (`.omni`) so the two bars line up.
+.search {
+  width: 320px;
+  max-width: 42vw;
+}
+
+// ── select-all toolbar ──
+// The control line: select-all (left) + the kind filter tabs (right), on ONE row.
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  // STATIC height whether the tabs are present or not. The select-all side (checkbox +
+  // text) is shorter than a tab pill, so a bare row was ~30px and grew to ~33px the
+  // moment the tabs appeared — the row "jumped". Pin the floor to the tallest content (a
+  // tab pill, see .tab's pinned line-height) + the 6px breathing, so both states render
+  // identically and the chrome never reflows when the trash finishes loading.
+  min-height: 34px;
+  padding-top: 6px;
+  padding-bottom: 6px;
+  @include band-inset;
+  @include match-scrollbar-gutter; // align the band edge with the list's (it reserves a scrollbar)
+  // The divider to the topbar above RIDES THE SCROLL GLASS (#247): it fades to nothing
+  // at the very top (glass at rest — a hard hairline there was pure noise, a line
+  // splitting the band with no depth behind it) and rises to the full `--border` as the
+  // list scrolls under the chrome — appearing in step with the glass frost. `--glass-lift`
+  // (0→1) is written by useScrollGlass onto the .topChrome wrapper and inherits down here.
+  border-top: 1px solid color-mix(in srgb, var(--border) calc(var(--glass-lift, 0) * 100%), transparent);
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+.toolbar-left {
+  display: flex;
+  align-items: center;
+  gap: 12px; // same checkbox→text rhythm as a row, so the column lines up
+  min-width: 0;
+  margin-left: $pill-pad; // content line: one glyph-inset inside the band, == a row's pill padding
+}
+
+// The checkbox sits at the content line (left gutter), same as the title column, the
+// tabs and the toolbar's "select all" — one left column, no cell-centring offset.
+.check {
+  flex: none;
+  display: flex;
+  align-items: center;
+}
+
+.selectAllText {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  padding: 0;
+
+  &:hover {
+    color: var(--text);
+  }
+}
+
+.linkBtn {
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 0;
+
+  &:hover {
+    text-decoration: underline;
+  }
+}
+
+.allNote {
+  color: var(--text-faint);
+}
+
+// ── scroll list (the virtualizer's scroll element) ──
+// The ONLY in-flow child, so it fills the frame; the floating top chrome + footer
+// overlay it. Its vertical padding is set INLINE (TrashPage.tsx) = the measured chrome
+// height + a little breathing, so the first/last rows clear the frosted bars they scroll
+// under. That padding only shifts the list visually; rows are placed by their true
+// virtual `start`, and the offset the virtualizer's range calc is off by stays far
+// inside the overscan window (no row ever drops out). Horizontal inset + scrollbar
+// gutter stay here so the rows line up column-for-column with the bars above/below.
+.scroll {
+  flex: 1;
+  overflow-y: auto;
+  @include band-inset;
+  scrollbar-gutter: stable;
+}
+
+.states {
+  padding: 20px $pill-pad; // sit on the content line, like a row's contents
+}
+
+.list {
+  position: relative;
+}
+
+.row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  box-sizing: border-box;
+  border-radius: var(--radius-md);
+
+  // The row IS the band's content column (its box = the hover/selection pill), and the
+  // contents sit $pill-pad inside it — so the pill breathes by that inset on every side
+  // WITHOUT extending past its own box. That inset lands the checkbox on the content line
+  // (band edge + $pill-pad) and Restore on the mirror line, in column with the toolbar's
+  // select-all/tabs and the footer. No negative margins, no bleed: the pill never reaches
+  // past the row. (Vertical breathing is the body's matching $pill-pad padding-block.)
+  padding-inline: $pill-pad;
+
+  &:hover {
+    background: var(--bg-hover);
+  }
+
+  // The divider is a straight pseudo-line — NOT a border on the rounded box (which
+  // would curve at the corners). It spans the CONTENT column (checkbox line → Restore
+  // line) — inset from the row/pill edge by the same glyph-inset the contents are — so
+  // the rule lines up with the contents, not with the pill's rounded edge.
+  &::after {
+    content: '';
+    position: absolute;
+    left: $pill-pad;
+    right: $pill-pad;
+    bottom: 0;
+    height: 1px;
+    background: var(--border);
+  }
+
+  &:hover::after {
+    opacity: 0;
+  }
+}
+
+// The logical last row has nothing below it in the list — drop its divider.
+.rowLast::after {
+  display: none;
+}
+
+// The note title + meta (a link to the deleted-note read-only view).
+.body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  // Vertical padding is the pill's vertical breathing — the SAME glyph-inset as the
+  // horizontal one, so the pill is inset equally on all four sides (with ROW_H hugging
+  // the body). Horizontal spacing to the checkbox / Restore is the row's own gap.
+  padding-block: $pill-pad;
+  color: inherit;
+  text-decoration: none;
+  cursor: pointer;
+
+  &:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+    border-radius: var(--radius-sm);
+  }
+}
+
+// Fixed height so the row's height is deterministic for the virtualizer: a memory/
+// external Chip (~18px) or the kind glyph must NOT grow this line past the title's own
+// 16px box — they just centre within it (any 1–2px spilling into the row's padding is
+// invisible). Without this, ROW_H (= 2×$pill-pad + 16 title + 2 gap + 14 meta = 56) would
+// be wrong on chip rows and the virtualizer (which places rows by index×ROW_H) overlaps.
+.titleRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  height: 16px;
+}
+
+.title {
+  min-width: 0;
+  font-size: 14px;
+  line-height: 16px; // pin the line-box so ROW_H math holds across fonts (not UA `normal`)
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tagExternal {
+  flex: none;
+  background: color-mix(in srgb, var(--warning, #c98a00) 16%, transparent);
+  color: var(--warning, #c98a00);
+}
+
+// Agent-memory note in the trash (#102 phase 3): the unified trash holds notes AND the
+// agent's own memory — flag the memory rows so a human reads them at a glance.
+.tagMemory {
+  flex: none;
+  background: color-mix(in srgb, var(--accent, #7a5cff) 14%, transparent);
+  color: var(--accent, #7a5cff);
+}
+
+.meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  line-height: 14px; // pin the line-box so ROW_H math holds across fonts (not UA `normal`)
+  color: var(--text-faint);
+  min-width: 0;
+
+  svg {
+    flex: none;
+  }
+}
+
+.path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 32ch;
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+}
+
+.dot {
+  opacity: 0.6;
+}
+
+// ── floating bottom action bar (#72): frosted glass over the list's tail, the
+//    destructive action at the end of the flow. Absolute (out of flow) so the list
+//    scrolls under it; its frosted fill + top lit edge come from `.glass`/
+//    `.glass-edge-top` (added in JSX). Live height measured → scroll padding-bottom. ──
+.footer {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding-top: 10px;
+  padding-bottom: 10px;
+  @include band-inset;
+  @include match-scrollbar-gutter; // align the band edge with the list's (it reserves a scrollbar)
+}
+
+.footerInfo {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--text-dim);
+  margin-left: $pill-pad; // content line: same as .toolbar-left
+  flex: 1 1 240px;
+  min-width: 0;
+}
+
+// The footer's right action (Empty / Delete N) — pulled to the content line so its right
+// edge sits in column with Restore and the tabs (mirror of .tabs / a row's pill padding).
+.footerActions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-right: $pill-pad;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+
+  .footerAction {
+    margin-right: 0;
+  }
+}
+
+.footerAction {
+  margin-right: $pill-pad;
+}
+
+@media (max-width: 720px) {
+  .footer {
+    align-items: stretch;
+  }
+
+  .footerInfo {
+    flex-basis: 100%;
+    margin-right: $pill-pad;
+  }
+
+  .footerActions,
+  .footerAction {
+    width: 100%;
+  }
+}
+
+// ── empty / muted ──
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 6px;
+  padding: 56px 16px;
+  color: var(--text-faint);
+
+  svg {
+    color: var(--accent);
+    opacity: 0.7;
+  }
+}
+
+.emptyTitle {
+  margin: 4px 0 0;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+
+.muted {
+  color: var(--text-faint);
+  font-size: 13px;
+  line-height: 1.5;
+  max-width: 56ch;
+  margin: 0 auto;
+}
+
+// ── the kind filter (#110): All | Notes | Spaces, an inline segmented control on the
+//    RIGHT of the control line (not a separate strip). A tab shows only when both
+//    kinds have content, so this is purely a filter between them. ──
+.tabs {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-right: $pill-pad; // content line: mirror of .toolbar-left, == a row's pill padding
+}
+
+.tab {
+  border: 0;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 13px;
+  line-height: 15px; // pin the pill height (3+15+3 = 21px) so the toolbar's min-height holds across fonts
+  font-weight: 500;
+  cursor: pointer;
+  padding: 3px 9px;
+  border-radius: var(--radius-sm);
+
+  &:hover {
+    color: var(--text);
+    background: var(--bg-hover);
+  }
+}
+
+.tab-active {
+  color: var(--accent);
+  background: var(--bg-active);
+
+  &:hover {
+    color: var(--accent);
+    background: var(--bg-active);
+  }
+}
+
+// ── the kind glyph (#110): a leading icon (note = document, space = workspace) so a
+//    mixed `All` view reads at a glance, while every row keeps the SAME shape. It lives
+//    INSIDE the title row (it's the title's own type glyph), so the titleRow's 8px gap
+//    spaces it to the title — no negative margin, no separate flex column to align. ──
+.kind {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-faint);
+}

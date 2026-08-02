@@ -1,0 +1,204 @@
+/* "WYSIWYM" editing surface (#116, named #180). Active only in WYSIWYM mode, on
+   `.cm-host--wysiwym`. The inline styling (heading sizes, bold/italic, inline code,
+   dimmed markers, link colour) is done in JS by a HighlightStyle (see
+   core/CodeEditor/wysiwymSource.ts) — it injects its own token classes, so there's
+   no CSS for those here. Nothing is hidden: the raw markdown markers stay visible,
+   so the line length never changes and the caret never makes text jump.
+
+   This file covers what a HighlightStyle CAN'T do — the per-line block rhythm and
+   the whole-line backgrounds — plus the prose base font. The classes come from the
+   `blockLayout` StateField. Values mirror styles/markdown.scss (the reading view)
+   so the WYSIWYM surface ≈ the rendered note. */
+
+.cm-host--wysiwym {
+  /* Prose base, tracking the reading view (.markdown): WYSIWYM is "what you see is
+     what you mean", so it honours the reading-typography knobs (#27) — same font
+     AND size as the reader. The em-based heading sizes in wysiwymSource.ts then
+     scale off this base, so the Reading size control grows WYSIWYM too. The
+     source-mode CM theme sets a mono `.cm-content` on the same --reading-size; this
+     extra class wins specificity to swap the family + give a roomier line-height. */
+  .cm-editor .cm-content {
+    font-family: var(--reading-font);
+    font-size: var(--reading-size);
+    line-height: 1.8;
+    /* Softened body (#189), tracking the reading view. Headings/strong/inline-code
+       are pinned to full --text in wysiwymSource.ts (richHighlight), so the same
+       body-vs-heading hierarchy reads here as in the rendered note. */
+    color: var(--reading-text);
+  }
+
+  /* No active-line highlight in WYSIWYM mode. It's a code-editor affordance (the
+     caret already marks the line) and in this prose view it only DID harm: the
+     fill spans a block's whole top-padding, so a tight heading (big padding) lit a
+     big band while a blank-separated one (small padding, the gap is the blank line
+     above) lit a small one — exposing that the two reach the same gap by different
+     means. Off → the surface reads as prose, and the spacing looks uniform.
+     (Source/raw mode keeps the highlight; this only scopes to `--wysiwym`.) */
+  .cm-activeLine { background-color: transparent; }
+
+  /* Block rhythm. The gap above a block is supplied by EITHER a blank source line
+     OR — when blocks sit tight, no blank between (valid markdown) — a top padding,
+     never both, so the spacing reads the same whether or not the author left blank
+     lines. Padding (not margin) keeps CM6's per-line heightmap honest. */
+
+  /* The generic tight inter-block gap (paragraphs, lists). ≈ the reader's 14px
+     paragraph margin. */
+  .cm-line.cm-md-gap { padding-top: 0.9em; }
+  /* External gap ABOVE a tight backdrop block, hung on the PREVIOUS (un-tinted)
+     line as padding-below — so the quote/code tint doesn't swallow it. */
+  .cm-line.cm-md-gap-below { padding-bottom: 0.9em; }
+
+  /* Headings lead the eye with a bigger gap than a paragraph. Two variants per
+     level: `…t` (tight, no blank above) carries the WHOLE gap ≈ the reader's
+     heading margin; `…b` (a blank line already sits above) adds only the remainder
+     on top of that ~22px blank, so both cases land near the rendered spacing. */
+  .cm-line.cm-md-h1t { padding-top: 1.8em; }
+  .cm-line.cm-md-h1b { padding-top: 0.6em; }
+  /* H2 carries the reader's underline (markdown.scss). The rule itself is drawn in
+     the backdrop layer (below the selection — a box-shadow here would sit above it
+     and tint a selection); this line only reserves the space for it. */
+  .cm-line.cm-md-h2t,
+  .cm-line.cm-md-h2b { padding-bottom: 0.2em; }
+  .cm-line.cm-md-h2t { padding-top: 2.3em; }
+  .cm-line.cm-md-h2b { padding-top: 1em; }
+  .cm-line.cm-md-h3t { padding-top: 1.8em; }
+  .cm-line.cm-md-h3b { padding-top: 0.7em; }
+  .cm-line.cm-md-h4t { padding-top: 1.5em; }
+  .cm-line.cm-md-h4b { padding-top: 0.5em; }
+  .cm-line.cm-md-h5t { padding-top: 1.3em; }
+  .cm-line.cm-md-h5b { padding-top: 0.45em; }
+  .cm-line.cm-md-h6t { padding-top: 1.2em; }
+  .cm-line.cm-md-h6b { padding-top: 0.4em; }
+
+  /* A blank source line is the inter-block gap when the author left one. Tightened
+     from a full text line so the rhythm reads "designed", but kept clearly TALLER
+     than the caret (~17px) so the caret always fits its own line — collapsing it
+     below the caret height made the caret overflow into the next line and flash a
+     scrollbar (the "jump when the caret moves to a new line" bug). */
+  .cm-line.cm-md-blank { line-height: 1.4; }
+
+  /* Horizontal rule: keep the `---` source (dimmed). The actual divider line is
+     drawn in the backdrop layer (below the selection), not as a line background,
+     so a selection over the rule reads uniformly (see the layer block below). */
+  .cm-line.cm-md-hr { color: var(--text-faint); }
+
+  /* Blockquote lines (from the blockLayout field). Rail + dim text + inset. The
+     FILL is no longer a line background — it's drawn in the backdrop layer below
+     the selection (see `.cm-md-backdrops` below) so the selection isn't tinted by
+     it. The rail and padding stay on the line (they sit at the edge / set the
+     text inset and don't overlap the selection). */
+  .cm-line.cm-md-blockquote {
+    border-left: 3px solid var(--border-strong);
+    padding-left: 1em; /* matches the reader's 16px blockquote padding */
+    color: var(--text-dim);
+  }
+  /* Symmetric INTERNAL padding for the quote box: top on the run's first line,
+     bottom on its last (a one-line quote gets both). The backdrop fill spans the
+     whole line box incl. this padding; the external gap stays outside it (a blank
+     line or cm-md-gap-below). */
+  .cm-line.cm-md-blockquote-top { padding-top: 0.55em; }
+  .cm-line.cm-md-blockquote-bottom { padding-bottom: 0.6em; }
+
+  /* Callout (#117): a `> [!type]` blockquote tints its rail by the callout's look.
+     The `callout-<look>` class (shared with the reading view, styles/callouts.scss)
+     supplies --callout-color; `cm-md-callout` is the hook. Only the rail recolours —
+     the `[!type]` marker and the box stay, since WYSIWYM always shows source.
+     The full rich box (icon/title/tint) lives in the reader & Preview.
+     Selector intentionally names BOTH classes (.cm-md-blockquote.cm-md-callout,
+     0,3,0) so it beats the plain `.cm-line.cm-md-blockquote` rail/colour (0,2,0) by
+     SPECIFICITY, not source order — a callout line always carries both classes. */
+  .cm-line.cm-md-blockquote.cm-md-callout {
+    border-left-color: var(--callout-color);
+    /* Body prose picks up a hint of the type hue (= reading view, callouts.scss),
+       so Edit ≈ Preview. The `>` markers stay faint and `[!type]` keeps its full
+       type colour — both are token/!important spans that override this line colour. */
+    color: color-mix(in srgb, var(--callout-color) 30%, var(--text));
+  }
+
+  /* Fenced / indented code lines: the mono font + horizontal inset for the text.
+     The box itself (a full 1px border, like the reading view's <pre>, NOT a quote-
+     style left rail) is drawn on the FILL in the backdrop layer below — see
+     `.cm-md-code-fill`. The fence markers inherit the line font. */
+  .cm-line.cm-md-code {
+    font-family: var(--font-mono);
+    font-size: 0.8125em;
+    padding-left: 0.8em;
+    padding-right: 0.8em;
+  }
+  .cm-line.cm-md-code-top { padding-top: 0.55em; }
+  .cm-line.cm-md-code-bottom { padding-bottom: 0.6em; }
+
+  /* Block backdrops, drawn as a LAYER below the selection layer (wysiwymSource.ts).
+     Solid fills (no longer translucent — they no longer need to let a selection
+     show through, since the selection now paints ON TOP of them), matching the
+     reading view's --bg-list quote/code surfaces. */
+  .cm-md-backdrops {
+    .cm-md-quote-fill { background: var(--bg-list); border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
+    /* Code block = a full bordered box, matching the reading view's <pre>
+       (markdown.scss: --bg-list fill, 1px --border, 8px radius) rather than a
+       quote-style left rail. box-sizing:border-box (base.scss) keeps the 1px border
+       inside the marker rect, so it hugs the run's bounding box exactly. */
+    .cm-md-code-fill { background: var(--bg-list); border: 1px solid var(--border); border-radius: var(--radius-md); }
+    /* Callout fill — per-type tint, same formula as the reading view (callouts.scss).
+       The marker also carries the `callout-<look>` class, which sets --callout-color
+       (wysiwymSource.ts backdropRuns); this reads it. Still below the selection layer,
+       so an opaque selection stays uniform over the tint. */
+    .cm-md-callout-fill { background: color-mix(in srgb, var(--callout-color, var(--text-dim)) 7%, var(--bg-list)); border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
+    /* Inline code pill — same fill as the reading view, but drawn here (below the
+       selection) rather than as a token background, so a selection over it stays
+       uniform. Hugs the code text (forRange). */
+    .cm-md-inlinecode { background: var(--bg-hover); border-radius: var(--radius-xs); }
+    /* 1px rules, positioned by the layer (wysiwymSource.ts): the HR divider sits on
+       the dim `---` glyphs (text centre), the h2 underline at the heading's bottom.
+       Both use --border to match the reading view's <hr>/h2 borders (markdown.scss). */
+    .cm-md-hr-rule,
+    .cm-md-h2-underline { background: var(--border); }
+  }
+
+  /* Inline code sized 0.86em (≈ the reading view), applied per-node by inlineMarks —
+     NOT on the shared monospace tag, which also styles fenced code and would shrink
+     it twice. font-size inherits to the inner mono token, so no descendant rule. */
+  .cm-md-ic { font-size: 0.86em; }
+
+  /* Destination-less brackets `[x]`/`[*]`/`[foo]` — markdown parses them as a Link
+     node, so `t.link` paints the inside accent (looks clickable, and clashes with a
+     `[x]` task marker which renders plain). The bareLinkPlain plugin wraps such
+     non-links in `.cm-md-plainlink`; repaint them — and their inner highlight
+     tokens (`*` descendant) — as plain text. `!important` beats the token's own
+     colour class. Real links (with a URL) aren't wrapped, so they keep the accent. */
+  .cm-md-plainlink,
+  .cm-md-plainlink * { color: var(--text) !important; }
+
+  /* Completed GFM task `- [x]` (from the inlineMarks plugin): the `[x]` marker takes
+     the accent (primary, theme-driven — not a hard-coded colour), the task text is
+     struck through and dimmed — so a done item is obvious at a glance. Unchecked
+     `[ ]` stays neutral. */
+  .cm-md-task-done-mark { color: var(--accent) !important; font-weight: 600; }
+  .cm-md-task-done-text,
+  .cm-md-task-done-text * { color: var(--text-dim) !important; text-decoration: line-through; }
+
+  /* Callout head `[!type]` (#117): coloured by the callout's look. The line carries
+     the `callout-<look>` class, so --callout-color is inherited here; the plain-link
+     repaint is suppressed for this Link (wysiwymSource.ts), so this is the only colour
+     on `[!type]`. !important beats the (non-important) syntax-highlight marker dim,
+     and the descendant `*` reaches the nested highlight tokens (`[`/`]`). */
+  .cm-md-callout-head,
+  .cm-md-callout-head * { color: var(--callout-color) !important; font-weight: 600; }
+
+  /* A real link inside a callout — type colour, not the global accent (= reading
+     view). !important beats the (non-important) richHighlight link/url token colour;
+     the descendant `*` reaches the `[text](url)` token spans. */
+  .cm-md-callout-link,
+  .cm-md-callout-link * { color: var(--callout-color) !important; }
+
+  /* Opaque selection in WYSIWYM mode. With backdrops in a layer below the selection,
+     a translucent selection would still pick up the backdrop colour through itself;
+     an opaque fill (the accent flattened onto the page bg — visually identical to
+     the translucent one over bare text) reads the SAME over a backdrop as over
+     plain text. Scoped to WYSIWYM only — Source/raw mode keeps the translucent
+     selection (it has no backdrops to clash with). The editor theme's rule
+     (CodeEditor.tsx) is `.cm-focused .cm-selectionBackground` !important = (0,3,0);
+     the `.cm-scroller` here makes this (0,4,0) so it wins by SPECIFICITY, not by
+     source order (which a bundler/style-injection change could flip). */
+  .cm-scroller .cm-selectionLayer .cm-selectionBackground { background: var(--cm-selection-solid) !important; }
+}

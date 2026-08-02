@@ -1,0 +1,1 @@
+export { trustProxyFromEnv } from './trustProxy'

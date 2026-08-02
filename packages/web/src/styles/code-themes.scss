@@ -1,0 +1,219 @@
+/* Code syntax-highlighting themes (#115).
+ *
+ * highlight.js emits class-based markup (`<span class="hljs-keyword">…`); this
+ * file colours those classes. The colours come from a small set of role tokens
+ * (`--hl-*`) so the class→colour MAPPING is written once and each preset only
+ * redefines the tokens — a theme switch is one attribute flip, zero re-highlight.
+ *
+ * Two axes, independent:
+ *   data-code-theme  the preset (github | atom-one | nord | solarized | dracula |
+ *                    monokai | gruvbox | tokyo-night | catppuccin)
+ *   data-theme       the app's light/dark — each preset ships BOTH variants so
+ *                    code stays legible whichever way the app is themed.
+ * Default (no/`github` preset) lives on the bare :root so a block is coloured
+ * even before ChromeProvider sets the attribute.
+ *
+ * The code BLOCK background is deliberately NOT themed here — it stays the app's
+ * --bg-list (see markdown.scss) so a fenced block always sits in the page rather
+ * than punching a contrasting panel. Only the syntax token colours change. */
+
+/* ── class → role mapping (written once) ─────────────────────────────────── */
+.markdown .hljs { color: var(--hl-text); background: transparent; }
+
+.markdown {
+  .hljs-comment, .hljs-quote { color: var(--hl-comment); font-style: italic; }
+  .hljs-keyword, .hljs-selector-tag, .hljs-literal, .hljs-section,
+  .hljs-doctag, .hljs-meta .hljs-keyword { color: var(--hl-keyword); }
+  .hljs-built_in, .hljs-type, .hljs-class .hljs-title, .hljs-builtin-name {
+    color: var(--hl-builtin);
+  }
+  .hljs-string, .hljs-regexp, .hljs-meta .hljs-string, .hljs-char.escape_ {
+    color: var(--hl-string);
+  }
+  .hljs-number { color: var(--hl-number); }
+  .hljs-title, .hljs-title.function_, .hljs-title.class_,
+  .hljs-function .hljs-title { color: var(--hl-function); }
+  .hljs-attr, .hljs-attribute, .hljs-variable, .hljs-template-variable,
+  .hljs-property, .hljs-params, .hljs-meta { color: var(--hl-variable); }
+  .hljs-name, .hljs-tag, .hljs-selector-id, .hljs-selector-class,
+  .hljs-selector-attr, .hljs-selector-pseudo { color: var(--hl-tag); }
+  .hljs-symbol, .hljs-bullet, .hljs-link, .hljs-meta .hljs-keyword + * {
+    color: var(--hl-symbol);
+  }
+  .hljs-deletion { color: var(--hl-deletion); }
+  .hljs-addition { color: var(--hl-addition); }
+  .hljs-emphasis { font-style: italic; }
+  .hljs-strong { font-weight: 700; }
+}
+
+/* ── presets: tokens only ────────────────────────────────────────────────── */
+
+/* GitHub — also the default (bare :root), so unset/`github` both resolve here. */
+:root, :root[data-code-theme='github'] {
+  --hl-text: #24292e;     --hl-comment: #6a737d;
+  --hl-keyword: #d73a49;  --hl-builtin: #e36209;
+  --hl-string: #032f62;   --hl-number: #005cc5;
+  --hl-function: #6f42c1; --hl-variable: #005cc5;
+  --hl-tag: #22863a;      --hl-symbol: #032f62;
+  --hl-addition: #22863a; --hl-deletion: #b31d28;
+}
+:root[data-theme='dark'], :root[data-theme='dark'][data-code-theme='github'] {
+  --hl-text: #c9d1d9;     --hl-comment: #8b949e;
+  --hl-keyword: #ff7b72;  --hl-builtin: #ffa657;
+  --hl-string: #a5d6ff;   --hl-number: #79c0ff;
+  --hl-function: #d2a8ff; --hl-variable: #79c0ff;
+  --hl-tag: #7ee787;      --hl-symbol: #a5d6ff;
+  --hl-addition: #aff5b4; --hl-deletion: #ffdcd7;
+}
+
+/* Atom One */
+:root[data-code-theme='atom-one'] {
+  --hl-text: #383a42;     --hl-comment: #a0a1a7;
+  --hl-keyword: #a626a4;  --hl-builtin: #c18401;
+  --hl-string: #50a14f;   --hl-number: #986801;
+  --hl-function: #4078f2; --hl-variable: #e45649;
+  --hl-tag: #e45649;      --hl-symbol: #0184bb;
+  --hl-addition: #50a14f; --hl-deletion: #e45649;
+}
+:root[data-theme='dark'][data-code-theme='atom-one'] {
+  --hl-text: #abb2bf;     --hl-comment: #5c6370;
+  --hl-keyword: #c678dd;  --hl-builtin: #e6c07b;
+  --hl-string: #98c379;   --hl-number: #d19a66;
+  --hl-function: #61afef; --hl-variable: #e06c75;
+  --hl-tag: #e06c75;      --hl-symbol: #56b6c2;
+  --hl-addition: #98c379; --hl-deletion: #e06c75;
+}
+
+/* Nord — dark is canonical; light is a Polar-Night-on-Snow approximation with
+   the Frost/Aurora inks darkened for contrast on a light background. */
+:root[data-code-theme='nord'] {
+  --hl-text: #2e3440;     --hl-comment: #6f7787;
+  --hl-keyword: #5e81ac;  --hl-builtin: #287271;
+  --hl-string: #6a8a4f;   --hl-number: #9d5ba8;
+  --hl-function: #2e6f86; --hl-variable: #43505f;
+  --hl-tag: #5e81ac;      --hl-symbol: #2e6f86;
+  --hl-addition: #6a8a4f; --hl-deletion: #bf616a;
+}
+:root[data-theme='dark'][data-code-theme='nord'] {
+  --hl-text: #d8dee9;     --hl-comment: #616e88;
+  --hl-keyword: #81a1c1;  --hl-builtin: #8fbcbb;
+  --hl-string: #a3be8c;   --hl-number: #b48ead;
+  --hl-function: #88c0d0; --hl-variable: #d8dee9;
+  --hl-tag: #81a1c1;      --hl-symbol: #88c0d0;
+  --hl-addition: #a3be8c; --hl-deletion: #bf616a;
+}
+
+/* Solarized — accent hues are background-independent, so light/dark differ only
+   in the base text + comment tone. */
+:root[data-code-theme='solarized'] {
+  --hl-text: #657b83;     --hl-comment: #93a1a1;
+  --hl-keyword: #859900;  --hl-builtin: #b58900;
+  --hl-string: #2aa198;   --hl-number: #d33682;
+  --hl-function: #268bd2; --hl-variable: #268bd2;
+  --hl-tag: #268bd2;      --hl-symbol: #2aa198;
+  --hl-addition: #859900; --hl-deletion: #dc322f;
+}
+:root[data-theme='dark'][data-code-theme='solarized'] {
+  --hl-text: #839496;     --hl-comment: #586e75;
+  --hl-keyword: #859900;  --hl-builtin: #b58900;
+  --hl-string: #2aa198;   --hl-number: #d33682;
+  --hl-function: #268bd2; --hl-variable: #268bd2;
+  --hl-tag: #268bd2;      --hl-symbol: #2aa198;
+  --hl-addition: #859900; --hl-deletion: #dc322f;
+}
+
+/* Dracula — dark is canonical; light darkens the neons for white-bg contrast. */
+:root[data-code-theme='dracula'] {
+  --hl-text: #282a36;     --hl-comment: #6272a4;
+  --hl-keyword: #d6336c;  --hl-builtin: #1a8fb3;
+  --hl-string: #9a6700;   --hl-number: #7c4dca;
+  --hl-function: #1f9d57; --hl-variable: #b54708;
+  --hl-tag: #d6336c;      --hl-symbol: #1a8fb3;
+  --hl-addition: #1f9d57; --hl-deletion: #c92a2a;
+}
+:root[data-theme='dark'][data-code-theme='dracula'] {
+  --hl-text: #f8f8f2;     --hl-comment: #6272a4;
+  --hl-keyword: #ff79c6;  --hl-builtin: #8be9fd;
+  --hl-string: #f1fa8c;   --hl-number: #bd93f9;
+  --hl-function: #50fa7b; --hl-variable: #ffb86c;
+  --hl-tag: #ff79c6;      --hl-symbol: #8be9fd;
+  --hl-addition: #50fa7b; --hl-deletion: #ff5555;
+}
+
+/* Monokai — the "One Dark Pro Monokai Darker" variation (One Dark's soft palette
+   with a Monokai-style role assignment: red keywords, green functions, yellow
+   strings, orange params, cyan types). Dark is canonical; light is a darkened
+   approximation for white-bg contrast (the upstream theme ships dark only). */
+:root[data-code-theme='monokai'] {
+  --hl-text: #383a42;     --hl-comment: #9095a0;
+  --hl-keyword: #d23c54;  --hl-builtin: #1a7b8c;
+  --hl-string: #8a6d00;   --hl-number: #8e44ad;
+  --hl-function: #4e8a2a; --hl-variable: #b8730a;
+  --hl-tag: #d23c54;      --hl-symbol: #1a7b8c;
+  --hl-addition: #4e8a2a; --hl-deletion: #c0392b;
+}
+:root[data-theme='dark'][data-code-theme='monokai'] {
+  --hl-text: #abb2bf;     --hl-comment: #5c6370;
+  --hl-keyword: #e06c75;  --hl-builtin: #56b6c2;
+  --hl-string: #e5c07b;   --hl-number: #c678dd;
+  --hl-function: #98c379; --hl-variable: #d19a66;
+  --hl-tag: #e06c75;      --hl-symbol: #56b6c2;
+  --hl-addition: #98c379; --hl-deletion: #e06c75;
+}
+
+/* Gruvbox — ships native light AND dark palettes (retro warm), so both variants are
+   authentic rather than approximated. */
+:root[data-code-theme='gruvbox'] {
+  --hl-text: #3c3836;     --hl-comment: #928374;
+  --hl-keyword: #9d0006;  --hl-builtin: #b57614;
+  --hl-string: #79740e;   --hl-number: #8f3f71;
+  --hl-function: #427b58; --hl-variable: #076678;
+  --hl-tag: #427b58;      --hl-symbol: #076678;
+  --hl-addition: #79740e; --hl-deletion: #9d0006;
+}
+:root[data-theme='dark'][data-code-theme='gruvbox'] {
+  --hl-text: #ebdbb2;     --hl-comment: #928374;
+  --hl-keyword: #fb4934;  --hl-builtin: #fabd2f;
+  --hl-string: #b8bb26;   --hl-number: #d3869b;
+  --hl-function: #8ec07c; --hl-variable: #83a598;
+  --hl-tag: #8ec07c;      --hl-symbol: #83a598;
+  --hl-addition: #b8bb26; --hl-deletion: #fb4934;
+}
+
+/* Tokyo Night — dark canonical; light is the official "Day" companion palette. */
+:root[data-code-theme='tokyo-night'] {
+  --hl-text: #343b58;     --hl-comment: #848cb5;
+  --hl-keyword: #9854f1;  --hl-builtin: #007197;
+  --hl-string: #587539;   --hl-number: #b15c00;
+  --hl-function: #2e7de9; --hl-variable: #8c6c3e;
+  --hl-tag: #f52a65;      --hl-symbol: #007197;
+  --hl-addition: #587539; --hl-deletion: #f52a65;
+}
+:root[data-theme='dark'][data-code-theme='tokyo-night'] {
+  --hl-text: #c0caf5;     --hl-comment: #565f89;
+  --hl-keyword: #bb9af7;  --hl-builtin: #2ac3de;
+  --hl-string: #9ece6a;   --hl-number: #ff9e64;
+  --hl-function: #7aa2f7; --hl-variable: #e0af68;
+  --hl-tag: #f7768e;      --hl-symbol: #7dcfff;
+  --hl-addition: #9ece6a; --hl-deletion: #f7768e;
+}
+
+/* Catppuccin — Mocha (dark) is the official palette; Latte (light) too, but its
+   yellow/peach (#df8e1d/#fe640b) only hit ~2.5–2.8:1 on our brighter --bg-list, so
+   --hl-builtin/--hl-number are nudged darker to clear 3.5:1 while staying in family. */
+:root[data-code-theme='catppuccin'] {
+  --hl-text: #4c4f69;     --hl-comment: #8c8fa1;
+  --hl-keyword: #8839ef;  --hl-builtin: #b3760c;
+  --hl-string: #40a02b;   --hl-number: #e0540a;
+  --hl-function: #1e66f5; --hl-variable: #e64553;
+  --hl-tag: #d20f39;      --hl-symbol: #179299;
+  --hl-addition: #40a02b; --hl-deletion: #d20f39;
+}
+:root[data-theme='dark'][data-code-theme='catppuccin'] {
+  --hl-text: #cdd6f4;     --hl-comment: #9399b2;
+  --hl-keyword: #cba6f7;  --hl-builtin: #f9e2af;
+  --hl-string: #a6e3a1;   --hl-number: #fab387;
+  --hl-function: #89b4fa; --hl-variable: #eba0ac;
+  --hl-tag: #f38ba8;      --hl-symbol: #94e2d5;
+  --hl-addition: #a6e3a1; --hl-deletion: #f38ba8;
+}

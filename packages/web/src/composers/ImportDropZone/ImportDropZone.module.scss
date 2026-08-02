@@ -1,0 +1,72 @@
+// The content (reader) drop zone (#223): the WHOLE reader lights so it reads as one
+// drop target (the tree lights its own folder row instead — Sidebar). `pointer-
+// events: none` keeps it transparent to the drag so `elementFromPoint` / the drop
+// reach the content beneath. A centred card names the target folder.
+.zone {
+  position: fixed;
+  z-index: 55;
+  pointer-events: none;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px dashed var(--border-strong);
+  border-radius: var(--radius-lg);
+  // Neutral grey wash matching the tree's drop highlight — the same `--text` tint
+  // as the tree's `.drop-root`, at a slightly lower alpha since the reader (`--bg`)
+  // is a lighter surface than the rail, so an identical alpha would read lighter.
+  background: color-mix(in srgb, var(--text) 5.5%, transparent);
+  // A little more frost than a plain wash — lifts the card off the content and
+  // reads clearly as "this whole area is the drop target".
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  animation: import-zone-in 120ms ease-out;
+}
+
+// The centred label: a solid panel over the wash naming where the file will land.
+.card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  max-width: min(70vw, 420px);
+  padding: 20px 34px;
+  border-radius: var(--radius-lg);
+  text-align: center;
+  color: var(--text);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow);
+}
+
+.icon {
+  font-size: 26px;
+  line-height: 1;
+  color: var(--accent);
+}
+
+.title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.sub {
+  font-size: 13px;
+  color: var(--text-dim);
+
+  strong {
+    color: var(--text);
+    font-weight: 600;
+    word-break: break-word;
+  }
+}
+
+@keyframes import-zone-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}

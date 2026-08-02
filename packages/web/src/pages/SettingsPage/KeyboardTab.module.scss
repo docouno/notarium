@@ -1,0 +1,138 @@
+/* Settings → Keyboard (#30). Preset picker + a rebindable row per action. The
+   keycap chips match the cheat sheet / Spotlight hint style for one look. */
+
+.preset-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+}
+.override-note {
+  font-size: 12.5px;
+  color: var(--text-faint);
+}
+
+.list { display: flex; flex-direction: column; }
+
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--border);
+  &:last-child { border-bottom: none; }
+}
+.row-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.row-label { font-size: 13.5px; color: var(--text); }
+.row-hint { font-size: 12px; color: var(--text-faint); }
+.conflict { font-size: 11.5px; color: var(--danger, #e5484d); }
+
+.row-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+/* Chips + the "+" recorder, right-aligned and wrapping UP — the "+" is the last item,
+   so it marks the right edge of the column; wrapped chips align to it, never past it.
+   The reset button lives outside this group (see row-controls). */
+.bindings {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* A bound shortcut: the keycaps ARE the surface (one layer, no chip-on-a-chip) with a
+   quiet remove × beside them that brightens on hover. */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+.chip-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--text-faint);
+  opacity: 0.55;
+  cursor: pointer;
+  &:hover { opacity: 1; background: var(--bg-hover); color: var(--text-dim); }
+}
+
+/* Add-a-shortcut: a small ghost "+" that becomes an accent pill while recording. */
+.add {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 24px;
+  min-width: 24px;
+  padding: 0 6px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-faint);
+  cursor: pointer;
+  transition: border-color 80ms ease, background-color 80ms ease, color 80ms ease;
+  &:hover { border-color: var(--text-faint); color: var(--text-dim); }
+  &[data-recording] {
+    border-style: solid;
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+}
+.recording-hint { font-size: 11.5px; color: var(--accent); white-space: nowrap; }
+.recording-error { font-size: 11.5px; color: var(--danger, #e5484d); white-space: nowrap; }
+
+/* A chord the browser reserves (Cmd+W/N/T…) — won't fire in a tab. Amber nudge. */
+.reserved {
+  font-size: 11px;
+  line-height: 1;
+  color: var(--warning, #d8a200);
+  cursor: help;
+}
+
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-faint);
+  cursor: pointer;
+  &:hover:not(:disabled) { background: var(--bg-hover); color: var(--text-dim); }
+  &:disabled { opacity: 0.35; cursor: default; }
+}
+
+.keys { display: inline-flex; align-items: center; gap: 4px; }
+.step { display: inline-flex; align-items: center; gap: 4px; }
+.then { font-size: 10.5px; color: var(--text-faint); }
+.kbd {
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1;
+  padding: 2px 6px;
+  border: 1px solid var(--border-strong);
+  border-bottom-width: 2px;
+  border-radius: var(--radius-xs);
+  background: var(--bg-list);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.unbound { font-size: 12px; color: var(--text-faint); }

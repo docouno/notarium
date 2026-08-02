@@ -1,0 +1,112 @@
+// Shared disclosure-card chrome (#165/#243) — extracted from the context constructor's
+// card so the agent Audit log reads identically. A bordered, slightly-raised surface
+// (`--bg-elevated`) whose header row is the toggle. `overflow:hidden` + the radius round
+// the revealed body's corners for free; hover lifts the WHOLE card as one surface.
+.card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  overflow: hidden;
+  transition: border-color 0.12s ease, background 0.12s ease;
+
+  &:hover {
+    border-color: var(--border-strong);
+    background: var(--bg-hover);
+  }
+}
+
+// An EXPANDED card holds nested content. Freeze its fill to the base surface while open
+// (no hover tint) so an inner card / link can light on hover WITHOUT the outer one
+// lighting too (otherwise it's "hover-in-hover", a muddy tint over a tint). Open also
+// firms the border so the row still reads as active — a deliberate colour shift.
+.card[data-expanded] {
+  background: var(--bg-elevated);
+  border-color: var(--border-strong);
+
+  &:hover {
+    background: var(--bg-elevated);
+  }
+}
+
+// ── reorder (#210): the card is a drag handle for list reordering ──
+// The whole card drags (like a tree row); the grip is the affordance. A drop lands BETWEEN
+// rows — the target card shows an inset accent line at its top (drop-before) or bottom
+// (drop-after). Inset shadow, not a pseudo-element, so `overflow:hidden` never clips it.
+.reorderable {
+  // A subtle hint the row is grabbable even before hovering the grip.
+  .grip { cursor: grab; }
+}
+
+.dragging {
+  opacity: 0.45;
+}
+
+.card[data-drop='before'] {
+  box-shadow: inset 0 3px 0 -1px var(--accent);
+}
+
+.card[data-drop='after'] {
+  box-shadow: inset 0 -3px 0 -1px var(--accent);
+}
+
+// The leading drag-handle glyph — faint until the row (or it) is hovered, so it stays
+// quiet in a dense list but is discoverable.
+.grip {
+  flex: none;
+  display: flex;
+  align-items: center;
+  padding-left: 6px;
+  margin-right: -4px;
+  color: var(--text-faint);
+  opacity: 0.5;
+  transition: opacity 0.12s ease, color 0.12s ease;
+}
+
+.card:hover .grip {
+  opacity: 1;
+  color: var(--text-muted);
+}
+
+// ── header — the always-visible one-line row ──
+.header {
+  display: flex;
+  align-items: stretch;
+  min-height: 38px;
+}
+
+// The row IS the disclosure trigger (the big target); the caret just mirrors the state.
+.trigger {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 12px;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+// An inert header (nothing to reveal) has no caret and no pointer affordance.
+.trigger:not([aria-expanded]) {
+  cursor: default;
+}
+
+// When a trailing aside (⋮) owns the right edge, the trigger yields its right padding
+// to it so the header still reads as one surface.
+.trigger-aside {
+  padding-right: 6px;
+}
+
+.caret {
+  flex: none;
+  color: var(--text-faint);
+  transition: transform 0.12s ease;
+}
+
+.caret-open {
+  transform: rotate(90deg);
+}

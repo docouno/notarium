@@ -1,0 +1,266 @@
+#!/bin/sh
+set -eu
+
+invoked_as="${0##*/}"
+
+case "$invoked_as" in
+  backup | restore | admin | version | healthcheck)
+    set -- "$invoked_as" "$@"
+    ;;
+esac
+
+usage() {
+  cat <<'EOF'
+Notarium server CLI
+
+Usage:
+  notarium <command> [options]
+
+Commands:
+  start          Run the Notarium server in the foreground
+  backup         Stream an online backup to stdout
+  backup verify  Verify a backup from stdin without restoring it
+  restore        Restore a backup from stdin into an empty data root
+  admin          Recover accounts and manage emergency access
+  healthcheck    Check the local server health endpoint
+  version        Print version and build information
+  help           Show this help or help for one command
+
+The production image runs `notarium start` by default.
+Short container commands are also installed for operational use:
+  docker exec notarium backup
+  docker exec -it notarium admin list
+
+Use the backup runbook's owner-only, no-clobber publication snippet when writing
+the ZIP to a host file; a bare shell redirect can leave a partial-looking backup.
+EOF
+}
+
+start_usage() {
+  cat <<'EOF'
+Usage: notarium start
+
+Run the Notarium server in the foreground. Configuration comes from environment
+variables; Docker or another process supervisor owns stop and restart.
+EOF
+}
+
+backup_usage() {
+  cat <<'EOF'
+Usage:
+  notarium backup [--output FILE] [--quiet-ms N] [--max-attempts N]
+  notarium backup verify [--input FILE]
+
+Without --output, backup writes only the ZIP payload to stdout and sends progress
+to stderr. `backup verify` reads a ZIP from stdin by default, validates every
+entry/checksum plus SQLite integrity, prints a JSON summary, and changes no data.
+Online backup requires the `notarium start` process in the same container so it
+can briefly checkpoint write-behind state without stopping HTTP reads.
+EOF
+}
+
+restore_usage() {
+  cat <<'EOF'
+Usage: notarium restore [--input FILE]
+
+Read a backup ZIP from stdin by default, verify it, and install it into a fresh,
+empty DATA_DIR. Restore never merges with or overwrites an existing instance.
+EOF
+}
+
+admin_usage() {
+  cat <<'EOF'
+Usage:
+  notarium admin list
+  notarium admin passwd <username> [--password PW | --random]
+  notarium admin create-admin <username> [--password PW | --random] [--display NAME]
+  notarium admin grant <username> <space> <owner|writer|reader>
+
+Emergency, out-of-band account recovery against the configured metadata DB.
+EOF
+}
+
+healthcheck_usage() {
+  cat <<'EOF'
+Usage: notarium healthcheck
+
+Exit successfully only when the local Notarium /api/health endpoint is healthy.
+EOF
+}
+
+# `version` takes at most `--json`. Shared by the command and its `--version`
+# alias so the two cannot drift into accepting different things.
+version_args_guard() {
+  if [ "$#" -eq 0 ]; then
+    return 0
+  fi
+  if [ "$#" -eq 1 ] && [ "$1" = "--json" ]; then
+    return 0
+  fi
+  # Name every argument, not just the first: with `--json --json` or a typo after a
+  # valid flag, reporting "$1" points at the one argument that was fine.
+  echo "notarium version: unexpected arguments: $*" >&2
+  version_usage >&2
+  exit 2
+}
+
+version_usage() {
+  cat <<'EOF'
+Usage: notarium version [--json]
+
+Print the Notarium version, commit, image build time and source revision link.
+With --json, print the same identity as one JSON object for scripts.
+EOF
+}
+
+command_help() {
+  case "${1:-}" in
+    start)
+      start_usage
+      ;;
+    backup)
+      backup_usage
+      ;;
+    restore)
+      restore_usage
+      ;;
+    admin)
+      admin_usage
+      ;;
+    healthcheck)
+      healthcheck_usage
+      ;;
+    version)
+      version_usage
+      ;;
+    "" | help)
+      usage
+      ;;
+    *)
+      echo "notarium: unknown command '$1'" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+wants_help() {
+  for argument in "$@"; do
+    case "$argument" in
+      -h | --help)
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+run_entry() {
+  entry="$1"
+  source="$2"
+  shift 2
+
+  if [ "${NODE_ENV:-}" != "production" ] && [ -x /app/node_modules/.bin/tsx ] && [ -f "/app/packages/server/src/apps/server/$source" ]; then
+    exec /app/node_modules/.bin/tsx "/app/packages/server/src/apps/server/$source" "$@"
+  fi
+  if [ -f "/app/packages/server/dist/$entry.js" ]; then
+    exec node "/app/packages/server/dist/$entry.js" "$@"
+  fi
+  if [ -x /app/node_modules/.bin/tsx ] && [ -f "/app/packages/server/src/apps/server/$source" ]; then
+    exec /app/node_modules/.bin/tsx "/app/packages/server/src/apps/server/$source" "$@"
+  fi
+
+  echo "notarium: command '$entry' is not available in this image" >&2
+  exit 127
+}
+
+command_name="${1:-help}"
+if [ "$#" -gt 0 ]; then
+  shift
+fi
+
+case "$command_name" in
+  help | -h | --help)
+    command_help "${1:-}"
+    ;;
+  -v | -V | --version)
+    # Same contract as `notarium version`, including --json: an alias that quietly
+    # ignored the flag would hand a script human prose it cannot parse. (The
+    # dispatch above already shifted the alias off, so "$@" is the arguments.)
+    version_args_guard "$@"
+    run_entry version commands/version/main.ts "$@"
+    ;;
+  start)
+    if [ "${1:-}" = "help" ] || wants_help "$@"; then
+      start_usage
+      exit 0
+    fi
+    if [ "$#" -ne 0 ]; then
+      echo "notarium start: unexpected argument '$1'" >&2
+      start_usage >&2
+      exit 2
+    fi
+    run_entry main main.ts
+    ;;
+  backup)
+    if [ "${1:-}" = "help" ] || wants_help "$@"; then
+      backup_usage
+      exit 0
+    fi
+    run_entry backup commands/backup/main.ts "$@"
+    ;;
+  restore)
+    if [ "${1:-}" = "help" ] || wants_help "$@"; then
+      restore_usage
+      exit 0
+    fi
+    run_entry restore commands/restore/main.ts "$@"
+    ;;
+  admin)
+    if [ -z "${1:-}" ] || [ "${1:-}" = "help" ] || wants_help "$@"; then
+      admin_usage
+      exit 0
+    fi
+    run_entry admin commands/admin/main.ts "$@"
+    ;;
+  healthcheck)
+    if [ "${1:-}" = "help" ] || wants_help "$@"; then
+      healthcheck_usage
+      exit 0
+    fi
+    if [ "$#" -ne 0 ]; then
+      echo "notarium healthcheck: unexpected argument '$1'" >&2
+      healthcheck_usage >&2
+      exit 2
+    fi
+    exec node -e '
+      const port = process.env.PORT || "3000";
+      fetch(`http://127.0.0.1:${port}/api/health`, {
+        signal: AbortSignal.timeout(4000),
+      })
+        .then(async (response) => {
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          const body = await response.json();
+          if (body?.ok !== true) throw new Error("unexpected health response");
+          console.log("ok");
+        })
+        .catch((error) => {
+          console.error(`healthcheck failed: ${error.message}`);
+          process.exitCode = 1;
+        });
+    '
+    ;;
+  version)
+    if [ "${1:-}" = "help" ] || wants_help "$@"; then
+      version_usage
+      exit 0
+    fi
+    version_args_guard "$@"
+    run_entry version commands/version/main.ts "$@"
+    ;;
+  *)
+    echo "notarium: unknown command '$command_name'" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

@@ -1,0 +1,94 @@
+/* Global reset + app shell + scrollbars. Element selectors and the root layout
+   frame are inherently global; the CodeMirror mount (.cm-host) stays global too
+   since CodeMirror renders its own (.cm-*) DOM into it. */
+
+* { box-sizing: border-box; }
+
+html, body, #root { height: 100%; margin: 0; }
+
+body {
+  font-family: var(--font-sans);
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+button { font-family: inherit; cursor: pointer; }
+
+.app { display: flex; height: 100%; overflow: hidden; }
+
+/* CodeMirror mount point (the editor renders its own .cm-* DOM inside). */
+.cm-host { min-height: 50vh; }
+
+/* ---- Scrollbars (#176) ---------------------------------------------------
+   ONE global recipe (scrollbars are inherently global — #59): a translucent thumb
+   that auto-hides when idle and insets to sit strictly BETWEEN the glass chrome
+   bands (#72), never in the blind zone under them. WebKit-first by design (the thumb
+   pseudo is WebKit's); Firefox degrades to a thin native bar (bottom of this block).
+
+   Two CSS vars drive it, both defaulting to the plain always-on behaviour so an
+   untouched scroller looks exactly as before — a surface opts in by setting them:
+     --sb-op            thumb opacity 0→1, written per animation frame by
+                        useAutoHideScrollbars. Unset (default 1) = always visible.
+     --sb-inset-top/    transparent end-caps that shrink the thumb's TRAVEL by the
+     --sb-inset-bottom  height of the glass band above/below the scroller, so the bar
+                        lands in the gap. Unset (default 0px) = full travel. Set in the
+                        scroller's own SCSS, one source with its padding-top. */
+
+::-webkit-scrollbar { width: 11px; height: 11px; }
+::-webkit-scrollbar-track { background: transparent; }
+/* 3px transparent border + padding-box clip float a ~5px thumb in the 11px lane. The
+   colour is multiplied by --sb-op for the fade (WebKit ignores `transition` on this
+   pseudo — the opacity is animated in JS frame-for-frame instead). */
+::-webkit-scrollbar-thumb {
+  background-color: color-mix(in srgb, var(--scrollbar-thumb) calc(var(--sb-op, 1) * 100%), transparent);
+  border-radius: var(--radius-md);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background-color: color-mix(in srgb, var(--scrollbar-thumb-hover) calc(var(--sb-op, 1) * 100%), transparent);
+}
+
+/* The --sb-* vars are ordinary (inheriting) custom properties, but the inset and the
+   fade must touch ONLY the scroller that opts in — a nested scroller (a popup list
+   inside an inset surface, e.g. the editor's combo menu or the CodeMirror autocomplete)
+   must NOT inherit its ancestor's inset (phantom button caps) or its fade. Reset them on
+   every element so a value a surface sets applies to THAT element's own scrollbar (its
+   ::-webkit-scrollbar pseudo reads it directly), while descendants fall back to these
+   defaults instead of inheriting. NB: @property{inherits:false} is the WRONG tool here —
+   it would starve the ::-webkit-scrollbar pseudos, which read the value BY inheritance
+   from their originating element. */
+* { --sb-op: 1; --sb-inset-top: 0px; --sb-inset-bottom: 0px; }
+
+/* Inset the thumb between the glass bands via transparent scrollbar-BUTTONS: a button
+   reserves space at the track end, so the thumb physically can't travel into the band.
+   The native bar leaves the blind zone with NO change to the content, the scroll
+   container or the virtualiser — the content still slides under the glass, only the
+   thumb's reach is clipped. Caps are 0px (invisible, no effect) unless a surface sets
+   --sb-inset-*. Single-button model: only the two OUTER caps carry height; the inner
+   double-button pair (and every horizontal button) stays off. */
+::-webkit-scrollbar-button { display: none; }
+::-webkit-scrollbar-button:vertical:start:decrement {
+  display: block; height: var(--sb-inset-top, 0px); background: transparent;
+}
+::-webkit-scrollbar-button:vertical:end:increment {
+  display: block; height: var(--sb-inset-bottom, 0px); background: transparent;
+}
+
+/* a11y: reduce-motion opts out of the fade — the bar just stays visible (thin). The
+   controller also no-ops under this setting; pin it here too so --sb-op can't strand a
+   bar mid-fade if the query flips at runtime. */
+@media (prefers-reduced-motion: reduce) {
+  ::-webkit-scrollbar-thumb { background-color: var(--scrollbar-thumb); }
+  ::-webkit-scrollbar-thumb:hover { background-color: var(--scrollbar-thumb-hover); }
+}
+
+/* Firefox has no ::-webkit-scrollbar pseudo → no opacity fade and no button inset are
+   possible; give it a thin native bar in the same colours (honest WebKit-first
+   degradation, #176). Chrome understands these standard props too, so gate them behind
+   "no webkit pseudo" to avoid double-styling the same bar. */
+@supports not selector(::-webkit-scrollbar) {
+  html { scrollbar-width: thin; scrollbar-color: var(--scrollbar-thumb) transparent; }
+}

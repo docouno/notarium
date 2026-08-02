@@ -1,0 +1,9 @@
+/* The agent-memory audit in the explorer (#165). The ROWS reuse the file tree's
+ * classes (Sidebar.module.scss) so they look identical; the loading/empty skin is
+ * the shared TreeState (#220). This file only styles the per-axis inline failure
+ * row — a partial failure (one axis couldn't load) stays a muted row under its axis
+ * rather than blanking the whole tree. No horizontal padding: rows align with the
+ * file tree (the 8px inset lives on .rail-scroll). */
+.failed-row {
+  color: var(--text-faint);
+}

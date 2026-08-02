@@ -1,0 +1,52 @@
+# Spotlight quick-switcher (#31)
+
+Spotlight is the centred, keyboard-first overlay for jumping to a note by name (VS Code Quick Open). Since #190 it is THE quick-jump surface: the rail no longer hosts a Search **view** — the activity strip's Search icon and the `/` hotkey both open Spotlight, and the cross-cutting **OmniSearch** field in the topbar (Home/Feed) shares the same suggestion data. The split is **jump vs search**: Spotlight/OmniSearch suggestions jump to a note (ranked hybrid backend, #81); the Feed's `?q=` is the detailed, filterable search (see `docs/feed-page.md`). Read this before touching the overlay, the hotkey, the OmniSearch field, or the recently-opened MRU.
+
+## Surfaces (#190)
+
+Three entry points, **one data layer** (`composers/search/useNoteSuggestions` — debounced `api.searchGet` + the MRU∪recently-modified recents pool):
+
+- **Spotlight** — the centred overlay. Opens on **Cmd/Ctrl+P**, on the rail **Search icon** (`rail-search`), and on the **`/` hotkey** (`search.focus`, #30). A transient jump-to-note switcher.
+- **Topbar OmniSearch** (`composers/OmniSearch`) — a field **anchored to the topbar's TRUE centre** on every document page (Home, Feed, note, files), so it never drifts page to page however wide the breadcrumb or actions are. The topbar is a 3-column grid `minmax(0,1fr) auto minmax(0,1fr)` (`PageFrame`): equal side tracks ⇒ the centre `auto` cell (the search) is bar-centred; the breadcrumb truncates within its track. The inline field is a **wide-screen affordance**: `PageFrame` measures the bar's inner width and shows the search only at/above `SEARCH_MIN_BAR` (≈ a 1600px window with the sidebar open) — below it the field is **dropped entirely** (no shrunk field, no icon). That's not a loss of access: search stays one move away via the rail Search icon (always in the strip), Cmd+P and `/` — the inline field is pure large-monitor convenience. Tied to the BAR width, not the viewport, so collapsing the sidebar (more room) brings it back at a smaller window. Proper responsive layout is a separate task; this is the honest interim cut (an in-topbar collapse-to-icon was tried and rejected — it duplicated the rail icon and read awkwardly on narrow bars). Typing drops a suggestion popover (same data as Spotlight) for quick-jump; the top **"Search … in Feed"** row (and a bare Enter) hands off to the Feed with `?q=` applied. On the Feed the field reflects/drives the live `q` in place; elsewhere it navigates to `/s/<space>/feed?q=…`. The shared input shell is `core/SearchField` (the Trash's local filter reuses it, so they read identically — its function stays local). `data-testid`: `omni-search` (input), `omni-submit` (the search-in-Feed row), `omni-result` (a note suggestion).
+- **Feed `?q=`** — NOT a quick-jump: the corpus search with folder/tag filters, grouping and the date histogram (`docs/feed-page.md`). Lexical membership (`q` narrows, date `sort` orders), composing with the other filter axes.
+
+The old rail Search **view** (`panelView==='search'`, `SearchProvider`, `rail-search-input`/`search-idle`/`search-empty`) is **gone** — folded into the above.
+
+## Behaviour
+
+- **Open:** **Cmd/Ctrl+P** (toggle), the rail **Search icon**, or the **`/` hotkey** — all three land on this overlay (#190). Not Cmd+K, which the editor owns via the browser-shortcut suppression in `App.tsx`. The hotkey toggles and `preventDefault`s the browser print dialog.
+  - It matches the **physical key** (`e.code === 'KeyP'`), not the character (`e.key`): on a non-Latin layout (RU etc.) the P key yields 'з', so an `e.key` test would miss while the browser's print still fired. The listener is **capture-phase on `window`** so a focused editor/input can't swallow the press before it reaches us.
+- **Empty query → Recent:** recently-OPENED notes first (a per-space MRU in localStorage), backfilled with the space's recently-MODIFIED notes from the server. A quick-switcher's headline move is jumping back to where you just were — "recently modified" alone can't express that.
+- **Typing → Notes:** debounced (160 ms) `api.searchGet`, the hybrid backend (#81: lexical + vector + graph, honest FTS-only degrade). Each keystroke aborts the prior request so an out-of-order answer never clobbers the live query. Matches are highlighted in the title and snippet.
+- **Row context:** Spotlight rows use a compact meta-line to disambiguate same-titled notes: the note's **authored `createdAt`** when known, else its real `modifiedAt`, plus the parent folder path. The date rides the shared search-wire (#188), so the jump surfaces never need an extra notes fetch just to label results.
+- **Type badge:** when a suggestion carries a meaningful decorative note type (`frontmatter.type` / `noteType`), the right edge of the meta-line shows it. The default `note` stays hidden, so a homogeneous base doesn't get noisy badges.
+- **Keyboard:** ↑/↓ move the selection (wrapping, scroll-into-view), Enter opens, **Cmd/Ctrl+Enter** opens in a new tab (#29), Escape closes. Mouse hover mirrors the keyboard selection (`aria-selected` is the single source of truth), click opens.
+- **Open = navigate** to the canonical `/n/<id>/<slug>` (built with `effectiveSlug`); the router's unsaved-edits blocker covers the transition. New-tab uses `window.open` on the same route.
+- **States:** in-flight shimmer, "No matches" for a fruitless query, "Search your notes" hint when the recents are empty.
+- **Scope:** the active space only (#16) — the search channel is per-space by construction. Cross-space is a later step.
+
+## Key files
+
+- `packages/web/src/composers/SpotlightProvider/SpotlightProvider.tsx` — owns the open state; mounts the modal. Sits inside `SpaceProvider` (needs the space) and the router (it navigates). The `useSpotlight()` api (`open`/`close`/`toggle`) is the entry point for every trigger — the Cmd+P hotkey, the rail Search icon, the `/` hotkey.
+- `packages/web/src/composers/SpotlightProvider/Spotlight.tsx` — the overlay: input, sectioned results, selection + keyboard. Built on `core/Modal` (portal, backdrop, Escape, focus-trap, scroll-lock).
+- `packages/web/src/composers/search/useNoteSuggestions.ts` — the **shared** search+recents data layer (#190), consumed by both Spotlight and the topbar OmniSearch.
+- `packages/web/src/composers/OmniSearch/` — the topbar field + suggestion popover (jump) + Enter→Feed hand-off (search); `core/SearchField` is its shared input shell (also the Trash's local filter).
+- `packages/web/src/libs/recentNotes/` — the per-space recently-opened MRU. Pushed from `NotesProvider.fetchNote` (the single open chokepoint — tree click, deep link and Spotlight all funnel through it), keyed by the note's REAL space. Older localStorage rows without date fields are normalised on load and backfilled from `notesGet(sort:'modified')`, so adding meta-line dates never breaks existing recents (#188).
+- `packages/web/src/libs/highlight/` — client-side match highlight (the backend returns plain-text snippets with no offsets, so matches are recomputed by tokenising the query; React-escaped, never `dangerouslySetInnerHTML`).
+
+## Extensibility — command palette (decision #1)
+
+v1 is a NOTE switcher. The result model is a list of sections of `SpotlightItem`s, where the item carries `kind: 'note'`. A command-palette layer (New note, Toggle theme, Open settings… — coordinated with #30) is a second section of `kind: 'command'` items with a `run()` handler, NOT a reshape of this surface. Deliberately not combined yet — the seam is in the data model, the UI stays a note switcher.
+
+## Gotchas
+
+- **Top-pinned, not centred.** `core/Modal` centres its panel; a switcher reads better high. The panel overrides `align-self: flex-start` + `margin-top` — no Modal change needed (the only properties the modal doesn't already set, so no cascade fight).
+- **Glass over content.** The look is a frosted panel over the *visible* page, not a dark sheet. Two coordinated knobs, both DS-token tunes (no bespoke material): the panel pushes the #72 glass knobs (`--glass-bg` thinner, `--glass-blur` deep, `--glass-saturate` up) via the compound `.panel.glass` selector to outrank Modal's near-opaque dialog default; the overlay lightens `--modal-backdrop-dim` and nearly drops `--modal-backdrop-blur` (Modal exposes these with defaults, so every other dialog is unchanged). The backdrop blur had to come DOWN — at the dialog default it pre-blurs the whole scene flat, leaving the panel's frost nothing to refract.
+- **Escape is the modal's, not the input's.** `core/Modal` binds Escape at the window level; the input doesn't re-handle it (a two-step clear-then-close would fight the modal's listener across the React-portal boundary — left out on purpose).
+- **`searchGet` takes an `AbortSignal`** (added for this, mirrors `noteGet`/`noteResolve`) so the debounce can cancel superseded requests.
+- **Recents are best-effort.** A blocked/garbage localStorage yields no recents, never a crash; the empty state still works from the server backfill.
+
+## Tests
+
+- `test/e2e/spotlight.spec.ts` — open (hotkey), Recent, search + highlight, arrow nav, Enter (canonical URL), Cmd/Ctrl+Enter new tab, MRU promote, no-match + Escape.
+- `test/unit/recentNotes.test.ts`, `test/unit/highlightMatch.test.ts` — the pure MRU + highlight logic.

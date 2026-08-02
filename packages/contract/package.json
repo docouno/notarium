@@ -1,0 +1,23 @@
+{
+  "name": "@notarium/contract",
+  "version": "0.1.0",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "type": "module",
+  "description": "Executable contract for the /api/* wire format: zod schemas + inferred types",
+  "exports": {
+    ".": "./src/index.ts",
+    "./enums": "./src/consts/index.ts",
+    "./events": "./src/consts/events.ts",
+    "./http": "./src/consts/http.ts",
+    "./query": "./src/consts/queryKeys.ts",
+    "./time": "./src/consts/time.ts",
+    "./tools": "./src/schemas/tools/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "zod": "^3.23.8"
+  }
+}

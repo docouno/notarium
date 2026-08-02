@@ -1,0 +1,88 @@
+/* The `?` cheat sheet (#30). Built on core/Modal (size lg) — this owns only the
+   inner layout: a header, a masonry-ish two-column grid of sections, and a footer
+   hint. kbd chips match the Spotlight hint style for one keycap look across the app. */
+
+.head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 20px 12px;
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+.title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+.customise {
+  font-size: 12.5px;
+  color: var(--accent);
+  text-decoration: none;
+  &:hover { text-decoration: underline; }
+}
+
+.grid {
+  padding: 8px 20px 4px;
+  overflow-y: auto;
+  /* Sections flow into columns; each stays whole (no mid-section break). */
+  columns: 2;
+  column-gap: 32px;
+}
+.section {
+  break-inside: avoid;
+  margin-bottom: 18px;
+  display: inline-block; /* belt-and-suspenders for column break-inside */
+  width: 100%;
+}
+.section-title {
+  margin: 0 0 6px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+}
+.rows { margin: 0; }
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 28px;
+  padding: 3px 0;
+}
+.label {
+  font-size: 13px;
+  color: var(--text-dim);
+  min-width: 0;
+}
+.binding { flex: 0 0 auto; }
+
+.keys { display: inline-flex; align-items: center; gap: 4px; }
+.step { display: inline-flex; align-items: center; gap: 4px; }
+.then { font-size: 10.5px; color: var(--text-faint); }
+.kbd {
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1;
+  padding: 2px 6px;
+  border: 1px solid var(--border-strong);
+  border-bottom-width: 2px;
+  border-radius: var(--radius-xs);
+  background: var(--bg-elevated);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.unbound { color: var(--text-faint); font-size: 12px; }
+
+.foot {
+  margin: 0;
+  padding: 10px 20px 14px;
+  border-top: 1px solid var(--border);
+  font-size: 11.5px;
+  color: var(--text-faint);
+  flex: 0 0 auto;
+}

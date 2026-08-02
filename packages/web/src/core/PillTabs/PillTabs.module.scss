@@ -1,0 +1,86 @@
+/* ── pill tab-bar (#216/#243) ───────────────────────────────────────────────
+   A permanent row of outline plates switching between the sub-surfaces of one
+   place; the active one is accent-lit. Default is content-width, left-aligned
+   (section tabs); `.fill` stretches to equal columns (the dashboard's metric plates). */
+.tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+/* Full-width equal columns — the dashboard's plate row. auto-fit keeps it equal for
+   any pill count; the dash is an inline-size container, so it reflows to one column
+   when narrow (the same breakpoint the old bespoke bar used). */
+.fill {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(0, 1fr));
+  gap: 12px;
+}
+@container (max-width: 560px) {
+  .fill {
+    grid-template-columns: 1fr;
+  }
+}
+.pill {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  text-decoration: none;
+  color: inherit;
+  transition: border-color 0.12s, background 0.12s;
+  /* Hover is JUST a grey wash — it never touches the border, so it can't override
+     the active pill's stronger outline (a hovered active pill keeps reading active). */
+  &:hover {
+    background: var(--bg-hover);
+  }
+}
+/* Active = a brighter neutral OUTLINE, no fill, no accent — the outline alone marks
+   the current surface (a heavy accent plate read as too loud). One neutral step past
+   --border-strong on the greyscale ramp: --text-faint is lighter in dark, darker in
+   light, so the active pill stands out in BOTH themes without a custom colour. */
+.pill-active {
+  border-color: var(--text-faint);
+}
+.pill-icon {
+  display: inline-flex;
+  flex: none;
+  color: var(--text-faint);
+}
+.pill-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.pill-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+.pill-metric {
+  font-size: 12px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Severity dot on a pill label (Health goes danger when links are broken). */
+.pill-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  &[data-severity='danger'] {
+    background: var(--danger);
+  }
+  &[data-severity='warn'] {
+    background: var(--warning);
+  }
+}

@@ -1,0 +1,45 @@
+# Test runner — the official Playwright image (browsers + system deps + node
+# pre-installed), so E2E and visual baselines render IDENTICALLY on any machine
+# and in CI. This is the canonical environment visual snapshots are generated and
+# checked against — never trust a baseline produced on a dev host (fonts differ).
+#
+# Image tag is pinned to the @playwright/test version in package.json — bump both
+# together. The repo is bind-mounted, so the host's node_modules (same linux/amd64
+# platform) and source are reused; results/baselines write straight back to the repo.
+#
+#   npm run e2e:docker     # behaviour journeys (CI parity; `npm run e2e` = host)
+#   npm run visual         # visual matrix (always runs here — no host variant)
+#   npm run visual:update  # (re)generate baselines
+name: notarium-test
+
+services:
+  pw:
+    image: mcr.microsoft.com/playwright:v1.60.0-jammy
+    working_dir: /app
+    ipc: host # chromium needs a large /dev/shm; host IPC avoids crashes
+    # Run as the host user so files written into the bind mount (baselines,
+    # reports) are owned by the host, not root. The npm:docker scripts export
+    # HOST_UID/HOST_GID; HOME is redirected to a writable dir for the npm cache.
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    environment:
+      HOME: /tmp
+      npm_config_cache: /tmp/.npm
+    volumes:
+      - ..:/app
+    command: npx playwright test test/visual
+
+  # Live-dialect contract target for the meta-DB. It is deliberately NOT a
+  # dependency of `pw`: ordinary e2e/visual runs stay one-container and cheap.
+  # `make test-pg` starts it explicitly, waits for health, runs Vitest on this
+  # private network, then removes the database volume.
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: notarium
+      POSTGRES_PASSWORD: notarium
+      POSTGRES_DB: notarium_test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notarium -d notarium_test"]
+      interval: 1s
+      timeout: 5s
+      retries: 30

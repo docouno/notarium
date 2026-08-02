@@ -1,0 +1,73 @@
+/* Note metadata fields, hosted by the right aside while editing: folder combobox,
+   type and tags. */
+.editor-meta { display: flex; flex-direction: column; gap: 16px; padding: 12px var(--gutter); }
+.meta-field { display: flex; flex-direction: column; gap: 6px; }
+.meta-label {
+  font-size: 11px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.05em; color: var(--text-faint);
+}
+.meta-type {
+  height: 32px; padding: 0 10px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--bg-elevated); color: var(--text);
+  font-size: 13px; font-family: var(--font-mono); outline: none;
+}
+.meta-type:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+
+/* Folder combobox */
+.folder-combo {
+  position: relative; width: 100%;
+  display: flex; align-items: center; height: 32px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--bg-elevated); padding: 0 6px 0 9px;
+}
+.folder-combo:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.folder-combo.is-disabled { opacity: 0.6; }
+.folder-combo-icon { display: flex; color: var(--text-faint); flex-shrink: 0; }
+.folder-combo input {
+  flex: 1; min-width: 0; height: 100%;
+  border: none; outline: none; background: transparent;
+  color: var(--text); font-size: 13px; font-family: var(--font-mono);
+  padding: 0 6px;
+}
+.folder-combo input::placeholder { color: var(--text-faint); }
+.folder-combo-toggle {
+  display: flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; border-radius: var(--radius-xs);
+  border: none; background: transparent; color: var(--text-faint); cursor: pointer;
+}
+.folder-combo-toggle:hover { background: var(--bg-hover); color: var(--text-dim); }
+
+.combo-menu {
+  position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 30;
+  max-height: 260px; overflow-y: auto;
+  background: var(--bg-elevated); border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md); padding: 5px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
+}
+.combo-item {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 6px 9px; border: none; border-radius: var(--radius-sm);
+  background: transparent; color: var(--text); cursor: pointer;
+  font-size: 13px; font-family: var(--font-mono); text-align: left;
+}
+.combo-item:hover { background: var(--bg-hover); }
+.combo-item.active { color: var(--accent); }
+.combo-item-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.combo-item-label.muted { color: var(--text-dim); }
+.combo-item.combo-create { color: var(--accent); font-family: var(--font-sans); }
+.combo-item.combo-create .combo-item-label { font-size: 12.5px; }
+
+/* Tag input */
+.tag-input {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  min-height: 32px; padding: 4px 8px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--bg-elevated); cursor: text;
+}
+.tag-input:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.tag-input input {
+  flex: 1; min-width: 90px; height: 22px;
+  border: none; outline: none; background: transparent;
+  color: var(--text); font-size: 13px; font-family: var(--font-mono);
+}
+.tag-input input::placeholder { color: var(--text-faint); }

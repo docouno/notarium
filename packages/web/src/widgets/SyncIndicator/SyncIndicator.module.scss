@@ -1,0 +1,124 @@
+/* Sync status (#60, #28): the square sync button beside the user name and its
+   click-opened detail card. The glyph itself stays neutral; a small corner badge
+   carries the at-a-glance signal — a solid accent dot while the engine works
+   (scan / sync / semantic-index backfill #199), a warn/danger dot when it falls
+   behind its poll cadence — and is absent when synced and on cadence. */
+.sync-btn {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  flex-shrink: 0;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.sync-btn:hover,
+.sync-btn.open { background: var(--bg-hover); }
+
+/* The glyph is neutral; it only spins while work is in flight. */
+.glyph { flex-shrink: 0; color: var(--text-dim); }
+.spin { animation: sync-spin 1.6s linear infinite; }
+@keyframes sync-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Corner staleness dot: hidden while polls land on cadence, warning once the
+   engine has missed a couple of poll cycles, danger once it's been silent for
+   many (thresholds relative to the poll interval — see staleDot). The ring
+   (box-shadow) cuts it out from whatever surface its host sits on: the rail
+   strip by default, the elevated avatar disc when the avatar carries it (#112) —
+   the host overrides `--badge-ring` so the cut-out matches its own background. */
+.badge {
+  position: absolute;
+  right: 3px;
+  bottom: 3px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  box-shadow: 0 0 0 2px var(--badge-ring, var(--bg-rail));
+}
+.badge.warn { background: var(--warning); }
+.badge.danger { background: var(--danger); }
+/* Working pip (#199): while the engine is actively scanning / syncing / building
+   the semantic index, the corner shows a solid ACCENT dot so the avatar visibly
+   differs from idle — the at-a-glance "something is happening" the card explains.
+   Solid (not pulsing) so it reads exactly as clean as the warn/danger dots — same
+   size, ring and cut-out, only the colour differs. Staleness (warn/danger) still
+   wins the corner: it's a problem, not progress. */
+.badge.working { background: var(--accent); }
+
+/* —— detail card —— The card OWNS its own typography (.details) so it renders
+   identically wherever it's mounted: the standalone popover box (.popover) for
+   the no-auth sync glyph, or the ContextMenu header for the auth avatar dropdown
+   (#112). The popover only provides the floating box; the menu header brings its
+   own box, so size/colour must not live on the box. */
+.details {
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+/* Frosted material + rim + drop come from the shared `.glass`/`.glass-float`
+   classes (added in JSX) — same recipe as ContextMenu, so every dropdown reads
+   identically; nearly opaque for readability over arbitrary content. */
+.popover {
+  position: fixed;
+  z-index: var(--z-menu);
+  width: 252px;
+  padding: 12px 13px;
+  --glass-bg: var(--glass-menu-bg);
+  --glass-bg-opaque: var(--bg-elevated);
+  --glass-border: var(--glass-menu-border);
+  --glass-drop: var(--glass-menu-drop);
+  border-radius: var(--radius-md);
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 11px;
+}
+.head-dot {
+  width: 8px;
+  height: 8px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
+.head-dot.ok { background: var(--ok); }
+.head-dot.error { background: var(--warning); }
+.head-dot.busy,
+.head-dot.scanning,
+.head-dot.embedding,
+.head-dot.connecting { background: var(--accent); }
+.head-label { font-size: 13px; font-weight: 600; color: var(--text); }
+
+/* Two-column facts: label left, value right, neither wrapping mid-phrase. */
+.grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px 14px;
+  margin: 0;
+}
+.grid dt { color: var(--text-faint); white-space: nowrap; }
+.grid dd {
+  margin: 0;
+  color: var(--text);
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* "Last check" carries the SAME staleness scale as the button's corner badge, so
+   a lit badge is explained right here (#98 item 1): the time goes coloured once the
+   engine falls behind its poll cadence; neutral while it's on cadence. The colour
+   alone makes the link — the badge lives on the icon, not repeated on the row. */
+.grid dd.stale.warn { color: var(--warning); }
+.grid dd.stale.danger { color: var(--danger); }
+
+.hint { margin-top: 9px; color: var(--text-faint); word-break: break-word; }

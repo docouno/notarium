@@ -1,0 +1,8 @@
+export { SettingsPage } from './SettingsPage'
+export { AppearanceTab } from './AppearanceTab'
+export { KeyboardTab } from './KeyboardTab'
+export { AboutTab } from './AboutTab'
+export { ProfileTab } from './ProfileTab'
+export { AccountTab } from './AccountTab'
+export { ConnectedAppsTab } from './ConnectedAppsTab'
+export { UsersTab } from './UsersTab'

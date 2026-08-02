@@ -1,0 +1,118 @@
+// Domain constants for the KnowledgeStore port.
+
+/** The default space handle a store serves when the host wires none — the
+ *  single-space fallback (the composition root normally passes a real space).
+ *  One source so the read-model and the identity registry can't drift. */
+export const DEFAULT_SPACE = 'main'
+
+/** A note's CLASS: the policy-bearing kind of a note — the class
+ *  registry (v1). Class is mount-derived and enforced there, never a per-file
+ *  choice; the policy matrix that hangs off each class lives in the visibility
+ *  module (visibility/policy.ts). Reserved-but-not-v1: `chat`,
+ *  `encrypted-note` (per-note, security milestone).
+ *  canon: docs/note-model.md#note-classes */
+export const NOTE_CLASS = {
+  userDoc: 'user-doc',
+  attachment: 'attachment',
+  derived: 'derived',
+  agentMemory: 'agent-memory',
+  profile: 'profile',
+} as const
+
+/** Machine-readable error reasons the store's engines put on `StoreError.reason`
+ *  for the wire envelope. Hosts still map the boolean flags to transport
+ *  codes; this vocabulary only names the machine-readable cause. The contract
+ *  package carries no matching const source (only an inline
+ *  `z.literal('version_conflict')`), so there is no cross-package drift gate. */
+export const STORE_ERROR_REASON = {
+  noteNotFound: 'note_not_found',
+  noteAlreadyExists: 'note_already_exists',
+  versionTokenRequired: 'version_token_required',
+  versionConflict: 'version_conflict',
+  revisionNotFound: 'revision_not_found',
+  revisionHasNoContent: 'revision_has_no_content',
+  noteNotInTrash: 'note_not_in_trash',
+  revisionsUnavailable: 'revisions_unavailable',
+} as const
+
+/** The visibility SCOPE a discovery surface reads under. `user` is the
+ *  default (user-visible classes only); callers opt INTO hidden classes explicitly
+ *  with `agentRecall` (adds agent-memory, the recall path) or `all` (the
+ *  unfiltered population).
+ *  canon: docs/note-model.md#note-classes */
+export const READ_SCOPE = {
+  user: 'user',
+  agentRecall: 'agentRecall',
+  all: 'all',
+} as const
+
+/** The delta-sync SCAN phase. */
+export const SCAN_PHASE = {
+  cold: 'cold',
+  notes: 'notes',
+  graph: 'graph',
+  ready: 'ready',
+  error: 'error',
+} as const
+
+/** How a wikilink RESOLVED to its target. */
+export const RESOLVED_VIA = {
+  current: 'current',
+  slug: 'slug',
+  noteAlias: 'note-alias',
+  folderAlias: 'folder-alias',
+} as const
+
+/** The list-layer SORT axis. */
+export const NOTE_SORT = {
+  created: 'created',
+  modified: 'modified',
+  title: 'title',
+} as const
+
+/** The DATE axis a range filter runs on. */
+export const DATE_FIELD = {
+  created: 'created',
+  modified: 'modified',
+} as const
+
+/** The histogram BUCKET granularity. */
+export const BUCKET_GRAN = {
+  day: 'day',
+  week: 'week',
+  month: 'month',
+} as const
+
+/** The KIND of state a journaled revision records.
+ *  canon: docs/note-history.md#model */
+export const REVISION_KIND = {
+  /** A save through us (the CAS write path). */
+  write: 'write',
+  /** A state the delta sync observed arriving from outside (or the pre-edit
+   *  baseline captured by the first journaled write of a note). A null
+   *  contentHash marks an honest gap: we saw the change but couldn't read the
+   *  body. */
+  external: 'external',
+  /** A journaled revision written back over the live note (rollback). */
+  restore: 'restore',
+  /** A merge of two concurrent sides — reserved for the P3/P6 ladder; the schema
+   *  keeps both parents (baseRevisionId + theirRevisionId) and the merging
+   *  principal so that flow lands without a migration. */
+  merge: 'merge',
+  /** The note disappeared (deleted through us or externally). Carries the last
+   *  known content hash so an undelete flow can resurrect from the journal. */
+  delete: 'delete',
+} as const
+
+/** Folder-scope depth. */
+export const DEPTH = { subtree: 'subtree', direct: 'direct' } as const
+
+export type Depth = (typeof DEPTH)[keyof typeof DEPTH]
+export type RevisionKind = (typeof REVISION_KIND)[keyof typeof REVISION_KIND]
+export type NoteClass = (typeof NOTE_CLASS)[keyof typeof NOTE_CLASS]
+export type ReadScope = (typeof READ_SCOPE)[keyof typeof READ_SCOPE]
+export type ScanPhase = (typeof SCAN_PHASE)[keyof typeof SCAN_PHASE]
+export type ResolvedVia = (typeof RESOLVED_VIA)[keyof typeof RESOLVED_VIA]
+export type NoteSort = (typeof NOTE_SORT)[keyof typeof NOTE_SORT]
+export type DateField = (typeof DATE_FIELD)[keyof typeof DATE_FIELD]
+export type BucketGran = (typeof BUCKET_GRAN)[keyof typeof BUCKET_GRAN]
