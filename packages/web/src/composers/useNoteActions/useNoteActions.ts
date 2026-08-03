@@ -334,11 +334,15 @@ export const useNoteActions = () => {
 
   // Duplicate a note: copy its content into a new "<title> copy" in the same
   // folder, then open the copy. Guarded: discarding an active draft is confirmed.
+  // Duplicating twice is ordinary, so the server picks the next free name
+  // ("… copy 2") instead of refusing — the one create in the UI that WANTS to
+  // step aside. canon: docs/note-model.md#create-collisions
   const duplicateNote = guarded(async (target: NoteView) => {
     try {
       const full = await api.noteGet(target.id)
       const newTitle = `${target.title} copy`
       const saved = await api.noteSave(space, {
+        ifExists: 'uniquify',
         // Body-first title (#156): the copy's title is its leading `# H1`. Prepend it
         // to the source's (H1-less) body so the create derives "<title> copy".
         content: full.content ? `# ${newTitle}\n\n${full.content}` : `# ${newTitle}`,

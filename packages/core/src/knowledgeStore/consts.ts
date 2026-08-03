@@ -35,6 +35,20 @@ export const STORE_ERROR_REASON = {
   revisionsUnavailable: 'revisions_unavailable',
 } as const
 
+/** What a CREATE does when a note already occupies its destination path.
+ *  `fail` is the DEFAULT — an unset policy never clobbers; only `overwrite`
+ *  permits replacing another note's bytes, and it stays host-internal (the wire
+ *  offers `fail`/`uniquify` only).
+ *  canon: docs/note-model.md#create-collisions */
+export const IF_EXISTS = {
+  /** Refuse with `noteAlreadyExists`. */
+  fail: 'fail',
+  /** Land beside it under the next free name (`Plans` → `Plans 2`). */
+  uniquify: 'uniquify',
+  /** Upsert onto the occupied path — idempotent re-import only. */
+  overwrite: 'overwrite',
+} as const
+
 /** The visibility SCOPE a discovery surface reads under. `user` is the
  *  default (user-visible classes only); callers opt INTO hidden classes explicitly
  *  with `agentRecall` (adds agent-memory, the recall path) or `all` (the
@@ -108,6 +122,7 @@ export const REVISION_KIND = {
 export const DEPTH = { subtree: 'subtree', direct: 'direct' } as const
 
 export type Depth = (typeof DEPTH)[keyof typeof DEPTH]
+export type IfExists = (typeof IF_EXISTS)[keyof typeof IF_EXISTS]
 export type RevisionKind = (typeof REVISION_KIND)[keyof typeof REVISION_KIND]
 export type NoteClass = (typeof NOTE_CLASS)[keyof typeof NOTE_CLASS]
 export type ReadScope = (typeof READ_SCOPE)[keyof typeof READ_SCOPE]

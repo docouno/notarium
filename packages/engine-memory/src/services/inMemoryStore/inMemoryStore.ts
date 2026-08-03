@@ -42,6 +42,7 @@ import {
   effectiveSlug,
   enrichGraph,
   FOLDER_PAGE_BASENAME,
+  IF_EXISTS,
   isFolderPageNote,
   liveSyncStatus,
   makeSnippet,
@@ -747,6 +748,13 @@ export class InMemoryStore implements KnowledgeStore {
       // to slug(title) — mirrors the notarium engine. Folder pages stay `index`.
       const fileBase = isFolderPageNote(prev.filePath) ? FOLDER_PAGE_BASENAME : fileName || title
       const filePath = fileIn(dir, fileBase)
+
+      // Rename-in-place must never swallow a different note already at the
+      // destination — the real engine's guard, mirrored so the fake can't pass a
+      // scenario production refuses. canon: docs/note-model.md#create-collisions
+      if (filePath !== prev.filePath && this.indexByPath(filePath) !== -1) {
+        throw moveFailed('a note already lives at the destination')
+      }
       const newSlug = slugFor(prev.slug)
       // Alias-history (#100): a title OR slug change records the old name(s) so
       // inbound [[Old Title]] / [[old-slug]] keep resolving — mirrors the real
@@ -782,16 +790,11 @@ export class InMemoryStore implements KnowledgeStore {
       }
     }
     const filePath = fileIn(norm(directory ?? ''), fileName || title)
-    // Upsert by path: a tokenless create landing on an existing slug stays
-    // last-write-wins on purpose — that is a bare last-write-wins engine's
-    // semantic, and the CAS scope (#50) is updates only. Deliberate carve-out, not an oversight.
     const existing = this.indexByPath(filePath)
 
-    // ...UNLESS the create opted out of clobbering (`ifExists:'fail'`, #21): an
-    // intent-create (remember_about_project, a fresh memory category) must be
-    // additive, so a same-titled note is a tool error, not a silent overwrite —
-    // identical to the real engine (notariumStore). P3: no silent data loss.
-    if (existing !== -1 && ifExists === 'fail') {
+    // Create-collision policy, mirroring notariumStore: refuse unless the caller
+    // explicitly asked to clobber. canon: docs/note-model.md#create-collisions
+    if (existing !== -1 && ifExists !== IF_EXISTS.overwrite) {
       throw noteAlreadyExists(title)
     }
     if (existing !== -1) {

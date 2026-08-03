@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -18,6 +18,9 @@ type Harness = {
   inner: KnowledgeStore
   revisions: InMemoryRevisionPersistence
   store: CachedStore
+  /** The engine's on-disk root — only a filesystem-backed leg has one, and only a
+   *  test that plants a file behind the index needs it. */
+  notesDir?: string
   close: () => Promise<void>
 }
 
@@ -307,6 +310,7 @@ const createNotariumHarness = async (): Promise<Harness> => {
     inner,
     revisions,
     store,
+    notesDir,
     close: async () => {
       store.stop()
       await store.settle()
@@ -1256,6 +1260,10 @@ for (const [name, createHarness] of variants) {
         directory: 'moved',
         content: 'contender-after-save',
       })
+      // Settled up front, not at the assertion: the contender now REJECTS, and it may
+      // do so several awaits before we look — an unhandled-rejection report in between
+      // would fail the run for a rejection the test is about to inspect.
+      const outcomes = Promise.allSettled([save, contender])
 
       moveGate.release()
       await folderMove
@@ -1263,8 +1271,14 @@ for (const [name, createHarness] of variants) {
       await nextTurn()
       expect(write).toHaveBeenCalledOnce()
       firstWriteGate.release()
-      const [saveResult, contenderResult] = await Promise.allSettled([save, contender])
-      expect(contenderResult.status).toBe('fulfilled')
+      const [saveResult, contenderResult] = await outcomes
+      // Revalidation is what makes the contender see the POST-move world: it finds Alpha
+      // already at the destination and refuses, instead of being admitted against the
+      // stale pre-move claim and inheriting Alpha's file.
+      expect(contenderResult.status).toBe('rejected')
+      if (contenderResult.status === 'rejected') {
+        expect(contenderResult.reason).toMatchObject({ reason: 'note_already_exists' })
+      }
       if (saveResult.status === 'rejected') {
         expect(saveResult.reason).toMatchObject({ reason: 'version_conflict' })
       }
@@ -1273,7 +1287,9 @@ for (const [name, createHarness] of variants) {
         (note) => note.filePath === 'moved/alpha.md',
       )
       expect(atDestination).toHaveLength(1)
-      expect((await store.read(atDestination[0].id!)).content).toBe('contender-after-save')
+      expect((await store.read(atDestination[0].id!)).content).toBe(
+        saveResult.status === 'fulfilled' ? 'alpha-after-move' : 'alpha-v1',
+      )
     })
 
     it('claims a folder page edit by its structural index.md destination', async () => {
@@ -1683,3 +1699,144 @@ for (const [name, createHarness] of variants) {
     })
   })
 }
+
+// canon: docs/note-model.md#create-collisions
+for (const [name, createHarness] of variants) {
+  describe(`CachedStore create collisions — ${name}`, () => {
+    let harness: Harness | undefined
+
+    afterEach(async () => {
+      await harness?.close()
+      harness = undefined
+    })
+
+    const setup = async () => {
+      harness = await createHarness()
+      const plans = await harness.store.write({
+        title: 'Plans',
+        directory: 'work',
+        content: 'the body that must survive',
+      })
+
+      return { ...harness, plans: plans.id! }
+    }
+
+    it('refuses by default and names the occupant so the caller can open it', async () => {
+      const { store, plans } = await setup()
+
+      await expect(
+        store.write({ title: 'Plans', directory: 'work', content: 'intruder' }),
+      ).rejects.toMatchObject({
+        reason: 'note_already_exists',
+        existing: { id: plans, title: 'Plans', filePath: 'work/plans.md' },
+      })
+      expect((await store.read(plans)).content).toBe('the body that must survive')
+    })
+
+    it('uniquify counts up past every taken name and answers the title it got', async () => {
+      const { store, plans } = await setup()
+      const second = await store.write({
+        title: 'Plans',
+        directory: 'work',
+        content: 'b',
+        ifExists: 'uniquify',
+      })
+      const third = await store.write({
+        title: 'Plans',
+        directory: 'work',
+        content: 'c',
+        ifExists: 'uniquify',
+      })
+
+      expect([second.title, third.title]).toEqual(['Plans 2', 'Plans 3'])
+      expect([second.filePath, third.filePath]).toEqual(['work/plans-2.md', 'work/plans-3.md'])
+      expect(new Set([plans, second.id, third.id]).size).toBe(3)
+      expect((await store.read(plans)).content).toBe('the body that must survive')
+    })
+
+    it('uniquify counts the PINNED basename, not the title, when a fileName was given', async () => {
+      const { store } = await setup()
+      await store.write({ title: 'Fixed', directory: 'work', content: 'a', fileName: 'pinned' })
+      const second = await store.write({
+        title: 'Fixed',
+        directory: 'work',
+        content: 'b',
+        fileName: 'pinned',
+        ifExists: 'uniquify',
+      })
+
+      // Counting the title would have re-derived the same pinned path forever.
+      expect(second.filePath).toBe('work/pinned-2.md')
+      expect(second.title).toBe('Fixed')
+    })
+
+    it('an exhausted name series still names the occupant, and stops offering a free name', async () => {
+      const { store, plans } = await setup()
+
+      // Fill the whole series the counter walks, so uniquify has nowhere left to land.
+      for (let n = 2; n <= 50; n++) {
+        await store.write({ title: `Plans ${n}`, directory: 'work', content: 'x' })
+      }
+
+      // The plain refusal keeps naming the occupant but has no free name to preview —
+      // that pair is how a caller learns a retry cannot help.
+      const refusal = await store
+        .write({ title: 'Plans', directory: 'work', content: 'mine' })
+        .catch((e) => e)
+      expect(refusal).toMatchObject({ reason: 'note_already_exists', existing: { id: plans } })
+      expect(refusal.suggestedTitle).toBeUndefined()
+
+      // And the retry that ignores that hint fails the same way rather than silently
+      // landing somewhere unexpected — still naming the note the caller can open.
+      const exhausted = await store
+        .write({ title: 'Plans', directory: 'work', content: 'mine', ifExists: 'uniquify' })
+        .catch((e) => e)
+      expect(exhausted).toMatchObject({ reason: 'note_already_exists', existing: { id: plans } })
+      expect((await store.read(plans)).content).toBe('the body that must survive')
+    })
+
+    it('concurrent uniquify creates of one title never share a destination', async () => {
+      const { store } = await setup()
+      const results = await Promise.all(
+        ['b', 'c', 'd'].map((body) =>
+          store.write({ title: 'Plans', directory: 'work', content: body, ifExists: 'uniquify' }),
+        ),
+      )
+
+      expect(new Set(results.map((r) => r.filePath)).size).toBe(3)
+      expect(new Set(results.map((r) => r.id)).size).toBe(3)
+      expect((await store.list()).filter((n) => n.filePath.startsWith('work/plans')).length).toBe(4)
+    })
+  })
+}
+
+describe('CachedStore create collisions — files the index has not seen', () => {
+  let harness: Harness | undefined
+
+  afterEach(async () => {
+    await harness?.close()
+    harness = undefined
+  })
+
+  it('refuses on disk truth alone (no occupant to name), and uniquify steps past it', async () => {
+    harness = await createNotariumHarness()
+    const { store, notesDir } = harness
+    // A file that exists on disk but not in the read-model — the case only the
+    // engine can see, and the reason its refusal is the arbiter rather than a belt.
+    mkdirSync(join(notesDir!, 'work'), { recursive: true })
+    writeFileSync(join(notesDir!, 'work', 'plans.md'), '# Plans\n\nunindexed body\n')
+
+    await expect(
+      store.write({ title: 'Plans', directory: 'work', content: 'intruder' }),
+    ).rejects.toMatchObject({ reason: 'note_already_exists', existing: undefined })
+    expect(await readFile(join(notesDir!, 'work', 'plans.md'), 'utf8')).toContain('unindexed body')
+
+    const beside = await store.write({
+      title: 'Plans',
+      directory: 'work',
+      content: 'mine',
+      ifExists: 'uniquify',
+    })
+    expect(beside.filePath).toBe('work/plans-2.md')
+  })
+})

@@ -59,6 +59,8 @@ Graceful shutdown first closes mutation admission, wakes cold waiters fail-close
 
 A mutation patches the snapshot optimistically in the same call. Delta-poll catches up external changes: the engine's inventory only knows the day, so a fresh `modifiedAt` is taken from the poll clock (the change happened on our watch) while an old day comes from the engine (an edit made while we were down) — an "honest modifiedAt". A note's title is a projection of its body's H1: `promoteBodyTitle` normalizes them consistently across every engine and the client.
 
+Create-collision policy is resolved HERE rather than in the engines ([note-model.md](note-model.md#create-collisions)). The read-model refuses from its snapshot, which is the only layer that knows the occupant's identity, so the error can name the note to open; the engines refuse from disk truth underneath and stay the arbiter. `uniquify` needs both: the free name is chosen from the snapshot **before** the storage claim — so the checkpoint fences the path actually written, and the stable-claim retry above re-derives it if a queued move shifted the destination — while an engine refusal (a file the index never saw, or a concurrent peer that won the same name) drives a retry onto the next one. Each attempt is a fresh claim, which is what keeps concurrent duplicates from agreeing on a destination.
+
 ## Cooperativeness under load <a id="cooperative"></a>
 
 Three subsystems damp storms on the shared SSE bus by reading LAZILY / coalescing instead of fanning out one event per subscriber:

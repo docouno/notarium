@@ -14,6 +14,7 @@ import {
   GraphResponseSchema,
   MoveResponseSchema,
   NoteDetailResponseSchema,
+  NoteExistsResponseSchema,
   NotesResponseSchema,
   PreviewsResponseSchema,
   RemoveResponseSchema,
@@ -506,6 +507,71 @@ describe('journey — create a note', () => {
   it('body-first: a create with neither title nor derivable first line is rejected (#156)', async () => {
     const res = await post('/api/s/main/notes', { directory: 'demo', content: '   ' })
     expect(res.statusCode).toBe(400)
+  })
+
+  // canon: docs/note-model.md#create-collisions
+  it('a taken title is a 409 naming the occupant, and the occupant keeps its bytes', async () => {
+    const first = await post('/api/s/main/notes', {
+      directory: 'demo',
+      content: '# Plans\n\nthe body that must survive',
+    })
+    expect(first.statusCode).toBe(200)
+
+    const clash = await post('/api/s/main/notes', {
+      directory: 'demo',
+      content: '# Plans\n\nsomething else entirely',
+    })
+    expect(clash.statusCode).toBe(409)
+    expect(NoteExistsResponseSchema.safeParse(clash.json()).success).toBe(true)
+    // The occupant is named, so the client can offer to open it rather than making
+    // the user hunt for the note they were told about.
+    expect(clash.json().existing).toMatchObject({
+      id: first.json().id,
+      title: 'Plans',
+      filePath: 'demo/plans.md',
+    })
+    expect((await get('/api/note?id=' + first.json().id)).content).toContain(
+      'the body that must survive',
+    )
+    // The refusal also previews the name a uniquify retry would take, so the client can
+    // offer it by name instead of "some free name".
+    expect(clash.json().suggestedTitle).toBe('Plans 2')
+  })
+
+  it('ifExists:uniquify lands beside the occupant and reports the name it got', async () => {
+    const first = await post('/api/s/main/notes', { directory: 'demo', content: '# Plans\n\na' })
+    const second = await post('/api/s/main/notes', {
+      directory: 'demo',
+      content: '# Plans\n\nb',
+      ifExists: 'uniquify',
+    })
+    const third = await post('/api/s/main/notes', {
+      directory: 'demo',
+      content: '# Plans\n\nc',
+      ifExists: 'uniquify',
+    })
+
+    expect([second.statusCode, third.statusCode]).toEqual([200, 200])
+    expect(second.json().title).toBe('Plans 2')
+    expect(third.json().title).toBe('Plans 3')
+    expect([second.json().filePath, third.json().filePath]).toEqual([
+      'demo/plans-2.md',
+      'demo/plans-3.md',
+    ])
+    // Three distinct notes: nobody inherited anybody's identity.
+    expect(new Set([first.json().id, second.json().id, third.json().id]).size).toBe(3)
+    expect((await get('/api/note?id=' + first.json().id)).content).toContain('a')
+  })
+
+  it('`overwrite` is unreachable from a client — the wire enum admits fail/uniquify only', async () => {
+    await post('/api/s/main/notes', { directory: 'demo', content: '# Plans\n\noriginal' })
+    const res = await post('/api/s/main/notes', {
+      directory: 'demo',
+      content: '# Plans\n\nclobber attempt',
+      ifExists: 'overwrite',
+    })
+    expect(res.statusCode).toBe(400)
+    expect(res.json().reason).toBe('validation')
   })
 })
 

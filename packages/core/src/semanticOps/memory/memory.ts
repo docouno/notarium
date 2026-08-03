@@ -81,8 +81,8 @@ const remember = async (
 
     if (!existing?.id) {
       // Mint the note. `directory` is mount-relative (the engine prepends the prefix
-      // once). `ifExists:'fail'` keeps the create additive: no clobbering a same-titled
-      // user-doc, and a concurrent same-category first-touch collides honestly.
+      // once). A concurrent same-category first-touch collides honestly and is caught
+      // below rather than clobbering the winner.
       try {
         const created = await store.write({
           title: input.category,
@@ -90,7 +90,6 @@ const remember = async (
           targetClass: NOTE_CLASS.agentMemory,
           directory: subdir || undefined,
           summary: input.summary,
-          ifExists: 'fail',
           principal: input.principal,
         })
         return await withEcho(created, input.observation, 'created', summaryUpdated)

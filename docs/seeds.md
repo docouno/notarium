@@ -103,6 +103,7 @@ and for `security` — it parses the sanitized HTML into a live DOM and checks t
 | `graph-load` | scalable linked communities: 300 nodes / ~900 links per scale unit; `SCALE=10` reproduces the 3k/9k cold-enrichment workload (#195/#284) | graph, scale |
 | `search-corpus` | a spotlight corpus: same-named notes, content/path-match, tag case-fold (#188/#204) | search, content |
 | `external-edits` | a direct same-size, mtime-preserving markdown rewrite: search marker + graph edge must self-heal on server boot/poll (#267) | search, graph, content |
+| `name-collisions` | the states that flow from "a title picks the file name": a folder primed for the refusal dialog, an already-uniquified `Retro`/`Retro 2`/`Retro 3` family, the same title in two folders, and a folder page whose reserved `index.md` deliberately does not collide — [note-model.md](note-model.md#create-collisions) | identity, structure |
 
 **Content / reader:**
 
@@ -293,6 +294,13 @@ needed):
   fine: anything unmentioned falls to the default tail (self-healing). The `agent-context`
   case places `Frontend Canon` at the TOP of personal + project (the exact story of the
   issue «I drag a set to the top»).
+- **A markdown file the index has never seen is not seedable.** The create-collision
+  refusal has two layers, and the engine's (disk truth, no occupant identity to name —
+  [note-model.md](note-model.md#create-collisions)) needs a file that exists on disk while
+  being absent from the index. That state cannot survive `make seed`: the server's boot scan
+  indexes any planted file before the first request, so it would arrive on the stand as an
+  ordinary note and prove nothing. It is covered where it does survive — the filesystem leg
+  of `test/unit/cachedStoreMutations.test.ts`, which plants the file under a live store.
 - **The honesty test requires `jsdom`** (in isolation, via a docblock) — the only place
   with a DOM in the suite; everything else is node-only.
 - **Favorites (#42/#245) are seeded only by the REAL applier.** The `favorites`

@@ -3,7 +3,9 @@
    ghost buttons whose menu/panel is open (no accent — neutral fill). */
 .btn {
   display: inline-flex; align-items: center; gap: 6px;
-  height: 32px; padding: 0 13px;
+  /* The height is FIXED, so a wrapped label has nowhere to go and spills out of
+     its own box — a label never breaks; a row that runs out of width wraps. */
+  height: 32px; padding: 0 13px; white-space: nowrap;
   border-radius: var(--radius-sm);
   border: 1px solid var(--border-strong);
   background: var(--bg-elevated);

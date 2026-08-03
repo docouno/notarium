@@ -52,6 +52,7 @@ import {
   effectiveSlug,
   FOLDER_PAGE_BASENAME,
   type FolderAlias,
+  IF_EXISTS,
   isFolderPageNote,
   liveSyncStatus,
   nextAliasesMulti,
@@ -2526,12 +2527,12 @@ export class NotariumStore implements KnowledgeStore {
     const destRel = this.relIn(mount, dest)
     const existingRaw = await mount.files.read(destRel)
 
-    // Create-collision policy (#21): a plain create upserts onto an occupied
-    // path on purpose (the rename guard above only fences RENAMES). An
-    // intent-create that asked not to clobber (`ifExists:'fail'`) must refuse a
-    // same-titled note rather than silently replace its body — disk truth
-    // (existingRaw) catches an unindexed external file too. P3: no silent loss.
-    if (ifExists === 'fail' && !sourceRow && existingRaw != null) {
+    // Create-collision policy: refuse unless the caller explicitly asked to
+    // clobber — the rename guard above only fences RENAMES, so this is what keeps a
+    // create from replacing a stranger's body. Disk truth (existingRaw) catches an
+    // unindexed external file the index never saw.
+    // canon: docs/note-model.md#create-collisions
+    if (ifExists !== IF_EXISTS.overwrite && !sourceRow && existingRaw != null) {
       throw noteAlreadyExists(title)
     }
     // The slug to persist (#100 phase 1, lazy): cleaned + kept only when it diverges

@@ -236,7 +236,7 @@ export const foldersRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
     if (hasAuthoredTitleInput && !deriveNoteTitle(body.data.content ?? '', body.data.title)) {
       return missing(reply, 'title')
     }
-    // `ifExists:'fail'` is the race backstop behind the existence pre-check above.
+    // The create's own refusal is the race backstop behind the existence pre-check above.
     // `targetClass:'user-doc'` is hard-wired: a page is shared knowledge, never memory.
     // canon: docs/note-model.md#note-classes
     const title = body.data.title ?? (body.data.content === undefined ? name : '')
@@ -257,7 +257,6 @@ export const foldersRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
           createdAt: body.data.createdAt ? new Date(body.data.createdAt).toISOString() : undefined,
           fileName: FOLDER_PAGE_BASENAME,
           targetClass: NOTE_CLASS.userDoc,
-          ifExists: 'fail',
           principal: principalId(req),
         },
         {

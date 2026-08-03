@@ -9,7 +9,7 @@ import { dirname, join } from 'node:path'
 import { AUTH_MODE } from '@notarium/contract'
 import { HTTP_STATUS } from '@notarium/contract/http'
 import { STORE_ERROR_REASON } from '@notarium/core'
-import type { ConflictNote, InteractiveSignal } from '@notarium/core'
+import type { ConflictNote, ExistingNote, InteractiveSignal } from '@notarium/core'
 
 import type { ArtifactStore } from '../../libs/artifactStore'
 import type { BuildInfo } from '../../libs/buildInfo'
@@ -247,6 +247,8 @@ export const buildApp = async ({
         isNotFound?: boolean
         isConflict?: boolean
         current?: ConflictNote
+        existing?: ExistingNote
+        suggestedTitle?: string
         reason?: string
       },
       req,
@@ -289,6 +291,17 @@ export const buildApp = async ({
           error: err.message,
           reason: STORE_ERROR_REASON.versionConflict,
           current: err.current ? conflictToWire(err.current) : undefined,
+        })
+      }
+      // A create refused because the destination is taken is a state conflict, not a
+      // malformed request — same 409 the folder and folder-page name clashes answer
+      // with. canon: docs/note-model.md#create-collisions
+      if (err.reason === STORE_ERROR_REASON.noteAlreadyExists) {
+        return reply.code(HTTP_STATUS.CONFLICT).send({
+          error: err.message,
+          reason: STORE_ERROR_REASON.noteAlreadyExists,
+          existing: err.existing,
+          suggestedTitle: err.suggestedTitle,
         })
       }
       reply

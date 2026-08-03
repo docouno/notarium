@@ -1,4 +1,9 @@
-import type { ImportSummary, Job, NoteDetail as WireNoteDetail } from '@notarium/contract'
+import type {
+  ImportSummary,
+  Job,
+  NoteExistsResponse,
+  NoteDetail as WireNoteDetail,
+} from '@notarium/contract'
 import { HTTP_STATUS } from '@notarium/contract/http'
 import { noteDetailView, type NoteDetailView } from '../../libs/wire'
 
@@ -27,6 +32,13 @@ export class ApiError extends Error {
   status?: number
   reason?: string
   current?: NoteDetailView
+  /** The note holding the destination of a refused create (`note_already_exists`,
+   *  the create-collision twin of `current`). Absent when the server caught the
+   *  collision on disk truth alone and has no note to name. */
+  existing?: NoteExistsResponse['existing']
+  /** The name a "save under a free name" retry would take — a preview the collision
+   *  dialog offers by name; the save reports what it actually got. */
+  suggestedTitle?: string
   /** Field-level causes of a `reason: 'validation'` 400 — present so a form can
    *  point at the offending field; the generic message is the lead issue. */
   issues?: { path: string; message: string }[]
@@ -110,6 +122,14 @@ export const req = async <T>(path: string, opts: RequestInit = {}): Promise<T> =
     }
     if (err.reason === 'version_conflict' && data.current) {
       err.current = noteDetailView(data.current as WireNoteDetail)
+    }
+    if (err.reason === 'note_already_exists') {
+      if (data.existing) {
+        err.existing = data.existing as NoteExistsResponse['existing']
+      }
+      if (typeof data.suggestedTitle === 'string') {
+        err.suggestedTitle = data.suggestedTitle
+      }
     }
     if (Array.isArray(data.issues)) {
       err.issues = data.issues as { path: string; message: string }[]

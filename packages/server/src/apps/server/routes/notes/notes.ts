@@ -128,6 +128,7 @@ export const notesRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
       ok: true,
       id: r.id,
       filePath: r.filePath,
+      title: r.title,
       versionToken: r.versionToken,
     })
   })

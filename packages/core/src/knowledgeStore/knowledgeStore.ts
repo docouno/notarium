@@ -6,6 +6,7 @@ import {
   type BucketGran,
   type DateField,
   type Depth,
+  type IfExists,
   type NoteClass,
   type NoteSort,
   type ReadScope,
@@ -298,6 +299,12 @@ export type NoteContent = {
 /** The live note riding a version conflict: the CAS arbiter always knows the id and fresh token. */
 export type ConflictNote = NoteContent & { id: string; versionToken: string }
 
+/** The note occupying a refused create's destination, riding `noteAlreadyExists` so the
+ *  caller can offer "open that one" instead of making the user hunt for it. Absent when the
+ *  collision was caught by an engine's DISK truth — an unindexed file has no note identity
+ *  to name (honest degradation, P5). */
+export type ExistingNote = { id: string; title: string; filePath: string }
+
 /** One file in a base export: a note's path and its bytes AS THEY LIVE ON DISK (the full
  *  frontmatter+body file, round-trippable) — not the parsed read() view. `path` carries the mount
  *  prefix for a hidden mount included under scope `all`. */
@@ -369,10 +376,12 @@ export type WriteInput = {
   /** The note-id being edited in place — triggers move-then-write so a title/folder change renames
    *  rather than duplicating. Absent = create. */
   originalId?: string
-  /** Create-collision policy. A plain create UPSERTS onto an existing slug(title) path (a UI
-   *  re-save inherits the id, identical retries collapse). `'fail'` throws `noteAlreadyExists`
-   *  instead — the intent-create tools set it so the write is genuinely additive. Ignored on edits. */
-  ifExists?: 'fail'
+  /** Create-collision policy, DEFAULT `fail`: an unset policy never clobbers, so a create
+   *  channel is safe before anyone remembers to think about it. `uniquify` is resolved above the
+   *  engines (they see it as `fail` and the read-model retries onto the next free name).
+   *  Ignored on edits — those are id-addressed and CAS-proven.
+   *  canon: docs/note-model.md#create-collisions */
+  ifExists?: IfExists
   /** The version the editor read. REQUIRED with originalId (CAS). */
   versionToken?: string
   /** Identity materialization channel: when set the engine writes it into frontmatter
@@ -406,6 +415,9 @@ export type WriteInput = {
 export type WriteResult = {
   id?: string
   filePath?: string
+  /** The title the note was actually stored under. Diverges from the request only when a
+   *  `uniquify` create had to step aside, which is exactly when a caller must not assume. */
+  title?: string
   /** The class the note was actually written as (from its mount) — the authoritative value the
    *  read-model stamps into the snapshot. */
   class?: NoteClass

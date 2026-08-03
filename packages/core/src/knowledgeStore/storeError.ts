@@ -1,5 +1,5 @@
 import { STORE_ERROR_REASON } from './consts'
-import type { ConflictNote } from './knowledgeStore'
+import type { ConflictNote, ExistingNote } from './knowledgeStore'
 
 /**
  * Error vocabulary between engines and hosts. Hosts map the flags to transport
@@ -23,6 +23,14 @@ export class StoreError extends Error {
   /** The live note (id + fresh versionToken) riding the conflict to the 409
    *  envelope, so the loser sees the other side instead of losing it. */
   current?: ConflictNote
+  /** The note already sitting at a refused create's destination — same idea as
+   *  `current`, for `noteAlreadyExists`. */
+  existing?: ExistingNote
+  /** The title an `ifExists:'uniquify'` retry would land on — a preview for the
+   *  caller's "save as …" offer, not a reservation: a racing writer can take it, and
+   *  the save then answers the name it actually got. Absent BESIDE a known `existing`
+   *  means the whole series is taken and retrying cannot help. */
+  suggestedTitle?: string
   /** Machine-readable cause for the wire envelope, e.g. "engine_unreachable". */
   reason?: string
 }
@@ -36,18 +44,28 @@ export const noteNotFound = (id: string): StoreError => {
   return err
 }
 
-/** A create that must NOT clobber (`ifExists:'fail'`) found a note already
- *  living at its slug(title) destination. The plain create path UPSERTS by path
- *  on purpose (UI re-save, retry-dedup) — but an intent-create from an agent
- *  (`remember_about_project`, a fresh `remember_about_user` category) must be
- *  additive, never silently overwrite a same-titled note. The caller's mistake:
- *  edit the existing note or pick another title. */
-export const noteAlreadyExists = (title: string): StoreError => {
+/** A create found a note already living at its slug(title) destination and
+ *  refused rather than replace its bytes — the default for every create channel.
+ *  The caller's move: edit that note, pick another title, or ask for
+ *  `ifExists:'uniquify'`. `details` are what only the read-model can supply — the
+ *  occupant's identity and the name a uniquify retry would take — so a refusal from
+ *  an engine's disk truth simply carries neither. */
+export const noteAlreadyExists = (
+  title: string,
+  details?: { existing?: ExistingNote; suggestedTitle?: string },
+): StoreError => {
   const err = new StoreError(
     `a note titled "${title}" already exists here — edit it instead of creating a duplicate, or use a different title`,
   )
   err.isToolError = true
   err.reason = STORE_ERROR_REASON.noteAlreadyExists
+  if (details?.existing) {
+    err.existing = details.existing
+  }
+  if (details?.suggestedTitle) {
+    err.suggestedTitle = details.suggestedTitle
+  }
+
   return err
 }
 

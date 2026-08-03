@@ -10,6 +10,8 @@ There is no separate "Title" field. **A note's title is its leading `# H1`**, wh
 
 Under the hood the title is a **projection of the body**: it is derived on save at the single write checkpoint and materialized onward (frontmatter `title:`, journal #12, read-model, slug, file name) exactly as before — so search/graph/history/rename work as they did. On disk and in read mode there is exactly one title: a duplicate leading `# title` is stripped on write (the same checkpoint closes the agent-h1-duplicate bug — #156).
 
+Because the title also picks the file name, typing one that a sibling already uses is a real collision, and a NEW note's save is refused rather than landing on that file. The draft stays in the editor and the dialog offers the three honest ways out — keep editing, save under a free name, open the note that is already there. canon: [note-model.md](note-model.md#create-collisions).
+
 ## The mode triad: Source / WYSIWYM / WYSIWYG
 
 The names define the axis of difference — "how visible the markup is and how rendered the text is":

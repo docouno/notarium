@@ -9,6 +9,7 @@
 // what hit write(); `onWrite` injects a transient CAS conflict to test the retry.
 
 import {
+  IF_EXISTS,
   type KnowledgeStore,
   NOTE_CLASS,
   noteAlreadyExists,
@@ -139,10 +140,10 @@ export const memStore = (
       const dir = norm(input.directory)
       const filePath = (dir ? `${dir}/` : '') + `${slugify(input.title)}.md`
 
-      // Faithful to the real engine (notariumStore.ts:1339): an intent-create that
-      // asked not to clobber refuses a same-path note rather than silently replacing
-      // it — so the concurrent-first-touch retry path is exercisable.
-      if (input.ifExists === 'fail' && rows.some((r) => r.filePath === filePath)) {
+      // Faithful to the real engines: a create refuses an occupied path unless it
+      // explicitly asked to clobber — so the concurrent-first-touch retry path is
+      // exercisable. canon: docs/note-model.md#create-collisions
+      if (input.ifExists !== IF_EXISTS.overwrite && rows.some((r) => r.filePath === filePath)) {
         throw noteAlreadyExists(input.title)
       }
       // Id stable per (dir, title) — a root and a subdir note of the same title are

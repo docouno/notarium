@@ -1,4 +1,5 @@
 import type {
+  ExistingNote,
   MoveInput,
   MutationOptions,
   NoteClass,
@@ -12,7 +13,7 @@ import {
   versionConflict,
   versionTokenRequired,
 } from '../../../knowledgeStore'
-import { REVISION_KIND } from '../../../knowledgeStore'
+import { IF_EXISTS, REVISION_KIND, STORE_ERROR_REASON } from '../../../knowledgeStore'
 import { nextAliasesMulti } from '../../../libs/aliases'
 import { freshNoteId } from '../../../libs/id'
 import { promoteBodyTitle, stripFrontmatter, stripTitleHeading } from '../../../libs/markdown'
@@ -39,6 +40,13 @@ const normAuthoredDate = (v?: string): string | undefined => {
   const t = Date.parse(v)
   return Number.isNaN(t) ? undefined : new Date(t).toISOString()
 }
+
+/** How far `uniquify` will count before giving up and surfacing the collision. A
+ *  folder holding fifty "Plans N" is a user problem, not a naming one. */
+const UNIQUIFY_LIMIT = 50
+
+const isCollision = (err: unknown): boolean =>
+  (err as { reason?: string }).reason === STORE_ERROR_REASON.noteAlreadyExists
 
 /** The read-model write path: the ONE chokepoint every mutation funnels
  *  through (REST/MCP/import/e2e fake) — title-as-projection, soft-slug, fair id/path/prefix
@@ -106,6 +114,12 @@ export class WriteEngine {
           : { ...input, title: promoted.title }
     }
 
+    return input.ifExists === IF_EXISTS.uniquify && !input.originalId
+      ? this.writeUniquified(input, opts)
+      : this.writeOnce(input, opts)
+  }
+
+  private writeOnce(input: WriteInput, opts?: MutationOptions): Promise<WriteResult> {
     return this.mutations.runStable(
       () => this.writeClaim(input),
       async () => {
@@ -115,6 +129,88 @@ export class WriteEngine {
         return result
       },
     )
+  }
+
+  /** `uniquify`: land beside the occupant under the next free name instead of
+   *  refusing. The name is picked from the snapshot BEFORE the fence so the
+   *  mutation claims the path it will really write; the engine's own refusal is
+   *  still the arbiter (it sees disk truth, including files the index never
+   *  indexed), and each retry re-claims from scratch. A retry re-enters the whole
+   *  checkpoint, so `opts.prepare` runs once per attempt — this policy is for plain
+   *  creates, not for one carrying an effectful preparation. */
+  /** The `<name>`, `<name> 2`, `<name> 3` … series a uniquify create walks. The name
+   *  that drives the destination FILE is counted: an explicit fileName pins the
+   *  basename, so counting the title would re-derive the same path forever. */
+  private nameSeries(input: WriteInput): (n: number) => WriteInput {
+    const pinned = Boolean(input.fileName)
+    const base = pinned ? input.fileName! : input.title
+
+    return (n: number): WriteInput => {
+      const name = n === 1 ? base : `${base} ${n}`
+      return pinned ? { ...input, fileName: name } : { ...input, title: name }
+    }
+  }
+
+  private async writeUniquified(input: WriteInput, opts?: MutationOptions): Promise<WriteResult> {
+    const nth = this.nameSeries(input)
+
+    for (
+      let n = this.firstFreeName(nth, 1);
+      n <= UNIQUIFY_LIMIT;
+      n = this.firstFreeName(nth, n + 1)
+    ) {
+      try {
+        return await this.writeOnce(nth(n), opts)
+      } catch (err) {
+        if (!isCollision(err)) {
+          throw err
+        }
+      }
+    }
+
+    // The series ran out. Name the occupant of the destination the caller ASKED for —
+    // it is what the caller can still act on, and dropping it would leave a second
+    // refusal poorer than the first. No suggestion rides along: there is none, and its
+    // absence beside a named occupant is how a caller tells "stop offering this".
+    throw noteAlreadyExists(input.title, {
+      existing: this.occupantOf(this.predictedPath(nth(1)), input.id),
+    })
+  }
+
+  /** The title a uniquify retry of this refused create would land on — a preview for
+   *  the caller's offer. Undefined when the basename is pinned (the title would not
+   *  move, so there is nothing to name) or the whole series is taken. */
+  private suggestedTitleFor(input: WriteInput): string | undefined {
+    if (input.fileName) {
+      return undefined
+    }
+    const nth = this.nameSeries(input)
+    const n = this.firstFreeName(nth, 2)
+
+    return n <= UNIQUIFY_LIMIT ? nth(n).title : undefined
+  }
+
+  /** The lowest `n >= from` whose destination no LIVE snapshot note occupies. */
+  private firstFreeName(nth: (n: number) => WriteInput, from: number): number {
+    for (let n = from; n <= UNIQUIFY_LIMIT; n++) {
+      if (!this.occupantOf(this.predictedPath(nth(n)))) {
+        return n
+      }
+    }
+
+    return UNIQUIFY_LIMIT + 1
+  }
+
+  /** The note already living at a create's destination, or undefined. Snapshot-only:
+   *  an unindexed file on disk is the engine's to catch. */
+  private occupantOf(path: string, exceptId?: string): ExistingNote | undefined {
+    for (const [id, meta] of this.host.snap.notes) {
+      if (meta.filePath === path && id !== exceptId) {
+        return { id, title: meta.title, filePath: meta.filePath }
+      }
+    }
+
+    return undefined
   }
 
   private writeClaim(input: WriteInput) {
@@ -134,14 +230,18 @@ export class WriteEngine {
     const currentPath = input.originalId ? this.pathFor(input.originalId) : undefined
     const predictedPath = this.predictedPath(input, currentPath)
 
-    if (
-      input.ifExists === 'fail' &&
-      !input.originalId &&
-      [...this.host.snap.notes].some(
-        ([otherId, meta]) => meta.filePath === predictedPath && otherId !== input.id,
-      )
-    ) {
-      throw noteAlreadyExists(input.title)
+    if (!input.originalId && input.ifExists !== IF_EXISTS.overwrite) {
+      const occupant = this.occupantOf(predictedPath, input.id)
+
+      // Read-model truth, ahead of the engine's own disk check: only here is the
+      // occupant's IDENTITY known — and the free name a retry would take — so the
+      // refusal can offer both instead of leaving the caller to hunt and guess.
+      if (occupant) {
+        throw noteAlreadyExists(input.title, {
+          existing: occupant,
+          suggestedTitle: this.suggestedTitleFor(input),
+        })
+      }
     }
     if (this.host.inner.capabilities.identity) {
       // The engine is its own registry — it settles the id, and (CAS-capable
@@ -159,7 +259,7 @@ export class WriteEngine {
         this.host.reconcileSoon()
       }
       this.journalWrite(input, result.id ?? input.originalId, baseline, undefined, result.class)
-      return result
+      return { ...result, title: input.title }
     }
     // Identity is settled BEFORE the engine call so the very same write
     // materializes the id into the file's frontmatter: an edited note keeps
@@ -226,6 +326,7 @@ export class WriteEngine {
     return {
       ...result,
       id,
+      title: input.title,
       versionToken: computeVersionToken(after?.content ?? this.normalizedInput(input)),
     }
   }

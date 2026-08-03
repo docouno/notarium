@@ -17,6 +17,8 @@
  *  - RESOLVED_VIA: core carries an extra `current` axis; contract deliberately
  *    omits it because `current` never crosses the graph-health wire. Not an
  *    identical copy — guarded as a subset relationship below, not by toEqual.
+ *  - IF_EXISTS: contract omits core's `overwrite` on purpose — see the subset
+ *    gate below; that omission is the poka-yoke, not drift.
  *  - STORE_ERROR_REASON: exists only in core; contract has no matching const
  *    source (only an inline `z.literal('version_conflict')`), so there is no
  *    cross-package pair to gate. Skipped here.
@@ -27,6 +29,7 @@ import {
   BUCKET_GRAN as ContractBucketGran,
   DATE_FIELD as ContractDateField,
   DEPTH as ContractDepth,
+  IF_EXISTS as ContractIfExists,
   NOTE_CLASS as ContractNoteClass,
   NOTE_SORT as ContractNoteSort,
   RESOLVED_VIA as ContractResolvedVia,
@@ -41,6 +44,7 @@ import {
   DATE_FIELD as CoreDateField,
   DEPTH as CoreDepth,
   EDIT_OPERATION as CoreEditOperation,
+  IF_EXISTS as CoreIfExists,
   NOTE_CLASS as CoreNoteClass,
   NOTE_SORT as CoreNoteSort,
   RESOLVED_VIA as CoreResolvedVia,
@@ -94,6 +98,23 @@ describe('enum drift across the P8 core/contract seam', () => {
     it('keeps core-only `current` off the contract wire', () => {
       expect(CoreResolvedVia).toHaveProperty('current')
       expect(ContractResolvedVia).not.toHaveProperty('current')
+    })
+  })
+
+  // IF_EXISTS is the same shape of deliberate subset, and here the omission is a
+  // SECURITY property rather than tidiness: `overwrite` is the one policy that lets a
+  // create replace another note's bytes, so it must stay unreachable from any client.
+  // canon: docs/note-model.md#create-collisions
+  describe('IF_EXISTS (contract is a deliberate subset of core)', () => {
+    it('agrees on the value of every key it does expose', () => {
+      for (const [key, value] of Object.entries(ContractIfExists)) {
+        expect(CoreIfExists[key as keyof typeof CoreIfExists]).toBe(value)
+      }
+    })
+
+    it('keeps `overwrite` off the wire — host-internal only', () => {
+      expect(CoreIfExists).toHaveProperty('overwrite')
+      expect(ContractIfExists).not.toHaveProperty('overwrite')
     })
   })
 })

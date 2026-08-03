@@ -12,6 +12,7 @@
 import type {
   Author,
   CreateNoteRequest,
+  IfExists,
   Preview,
   SaveResponse,
   TreeFolder,
@@ -271,6 +272,10 @@ export type SaveInput = {
   originalId?: string
   /** The version the editor read. REQUIRED with originalId (#50, P3). */
   versionToken?: string
+  /** Create only: what to do when the folder already holds this title. Absent =
+   *  refuse (the server default); 'uniquify' asks for the next free name — what
+   *  Duplicate wants and the collision dialog's "save as …" retries with. */
+  ifExists?: IfExists
 }
 
 export const createInputToWire = (i: SaveInput): CreateNoteRequest => ({
@@ -280,6 +285,7 @@ export const createInputToWire = (i: SaveInput): CreateNoteRequest => ({
   tags: i.tags,
   slug: i.slug,
   createdAt: i.createdAt,
+  ifExists: i.ifExists,
 })
 
 export const updateInputToWire = (i: SaveInput): UpdateNoteRequest => ({
@@ -298,11 +304,14 @@ export const updateInputToWire = (i: SaveInput): UpdateNoteRequest => ({
 export type SaveResultView = {
   id: string
   filePath?: string
+  /** The title the note landed under — what a `uniquify` create reports back. */
+  title?: string
   versionToken: string
 }
 
 export const saveResultView = (r: SaveResponse): SaveResultView => ({
   id: r.id,
   filePath: r.filePath,
+  title: r.title,
   versionToken: r.versionToken,
 })

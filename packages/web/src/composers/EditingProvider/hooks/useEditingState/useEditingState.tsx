@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useBlocker, useLocation, useNavigate } from 'react-router'
 import { HTTP_STATUS } from '@notarium/contract/http'
-import { DEFAULT_NOTE_TYPE } from '@notarium/core'
+import { DEFAULT_NOTE_TYPE, STORE_ERROR_REASON } from '@notarium/core'
 import { useDialog } from '../../../../core/Dialog'
 import { useToast } from '../../../../core/Toast'
 import {
@@ -19,6 +19,16 @@ import { useSpace } from '../../../SpaceProvider'
 import type { EditingContextValue, Ghost } from '../../types'
 import { type Draft, useNoteDraft } from '../../useNoteDraft'
 import styles from '../../EditingProvider.module.scss'
+
+/** Whether a note title is short enough to name inside a button label. Titles are
+ *  user-authored and unbounded, a button label never wraps, and a dialog row that
+ *  cannot shrink pushes the label out of the panel on a phone — so a long title is
+ *  DROPPED from the label rather than cut: truncation would only trade the overflow
+ *  for a severed grapheme, and the name it was meant to preview is reported by the
+ *  toast once the save lands anyway. Full-width scripts are counted double — the
+ *  budget is rendered width, which is what actually overflows, not character count. */
+const fitsInLabel = (title: string): boolean =>
+  [...title].reduce((width, ch) => width + (ch.codePointAt(0)! > 0x2e7f ? 2 : 1), 0) <= 24
 
 export const useEditingState = (): EditingContextValue => {
   const { space, canWrite } = useSpace()
@@ -306,6 +316,70 @@ export const useEditingState = (): EditingContextValue => {
     [choice, alert, openNote, refreshFolders, setDraft, space],
   )
 
+  // The create-collision flow: the folder already holds a note under this title
+  // and the server refused rather than replace its body. Like the CAS conflict
+  // below, NOTHING is lost at this point — the draft is untouched in the editor;
+  // this dialog only decides what happens next. Answers the SaveInput to retry
+  // with, or null to stay put. `existing` is absent when the collision was caught
+  // on disk truth alone, and the "open it" way out honestly disappears with it.
+  const resolveCreateCollision = useCallback(
+    async (err: ApiError, payload: SaveInput): Promise<SaveInput | null> => {
+      const taken = err.existing
+      // A named occupant with NO free name offered means the whole `<title> N` series
+      // is taken: retrying with uniquify would only reproduce this dialog, so the
+      // option is dropped rather than dangled. Without an occupant the refusal came
+      // from disk truth, where uniquify still steps past the file it cannot name.
+      const canFreeName = !taken || Boolean(err.suggestedTitle)
+      const keepEditing = { value: 'cancel', label: 'Keep editing' }
+      const openExisting = taken ? [{ value: 'open', label: 'Open the existing note' }] : []
+      const saveFree = canFreeName
+        ? [
+            {
+              value: 'uniquify',
+              // Name the free title the server picked; the generic wording covers both
+              // a refusal from disk truth (no suggestion at all) and a title too long
+              // to sit in a label.
+              label:
+                err.suggestedTitle && fitsInLabel(err.suggestedTitle)
+                  ? `Save as “${err.suggestedTitle}”`
+                  : 'Save under a free name',
+              variant: 'primary' as const,
+            },
+          ]
+        : []
+      const picked = await choice({
+        // Three actions, one of them carrying a note title — they do not fit the
+        // default panel on one row, and a stacked row of buttons reads worse here
+        // than a wider panel.
+        size: 'md',
+        title: 'A note with this name already exists here',
+        message: taken
+          ? `“${taken.title}” already lives in this folder. Your text is untouched — nothing has been overwritten.`
+          : 'This folder already holds a file under this name. Your text is untouched — nothing has been overwritten.',
+        // The dialog focuses its LAST option (core/Dialog), and a save shortcut leaves
+        // the keyboard on it — so the trailing slot is always a SAFE action. Opening
+        // the existing note is the one branch that drops the draft; it never sits there.
+        options: canFreeName
+          ? [keepEditing, ...openExisting, ...saveFree]
+          : [...openExisting, keepEditing],
+      })
+
+      if (picked === 'uniquify') {
+        return { ...payload, ifExists: 'uniquify' }
+      }
+      // Leaving for the existing note drops the draft, so it goes through the same
+      // discard confirmation every other "leave a dirty draft" path uses — the
+      // dialog above promised the text was safe.
+      if (picked === 'open' && taken && (await ensureCanLeaveDraft())) {
+        setDraft(null)
+        await openNote(taken.id)
+      }
+
+      return null
+    },
+    [choice, ensureCanLeaveDraft, openNote, setDraft],
+  )
+
   const saveDraft = useCallback(
     async (payload: SaveInput) => {
       // Root guard (#111): if the role was downgraded to reader mid-edit, the save
@@ -365,11 +439,29 @@ export const useEditingState = (): EditingContextValue => {
           // reader just refreshes in place.
           await reloadNote()
         } else {
+          // A uniquify retry lands under a name the user did not type — say which,
+          // so the rename they consented to is still visible.
+          if (payload.ifExists && saved.title) {
+            toast.success(`Saved as “${saved.title}”.`)
+          }
           await openNote(saved.id)
         }
       } catch (e) {
         if (e instanceof ApiError && e.status === HTTP_STATUS.CONFLICT && e.current) {
           await resolveConflict(e.current, payload)
+          return
+        }
+        if (
+          e instanceof ApiError &&
+          e.status === HTTP_STATUS.CONFLICT &&
+          e.reason === STORE_ERROR_REASON.noteAlreadyExists
+        ) {
+          const retry = await resolveCreateCollision(e, payload)
+
+          if (retry) {
+            await saveDraft(retry)
+          }
+
           return
         }
         // A failed save keeps the draft in the editor (nothing lost) and reports
@@ -380,8 +472,9 @@ export const useEditingState = (): EditingContextValue => {
         setSaving(false)
       }
       // resolveConflict is declared after this callback (it retries via
-      // saveDraft — mutual recursion), but the closure captures this render's
-      // binding, so the reference is always the in-sync one.
+      // saveDraft — mutual recursion), and the uniquify retry above re-enters
+      // saveDraft itself; both closures capture this render's binding, so the
+      // reference is always the in-sync one.
     },
     [
       note,
@@ -392,6 +485,7 @@ export const useEditingState = (): EditingContextValue => {
       reloadNote,
       toast,
       setDraft,
+      resolveCreateCollision,
       resolveFolderPageMaterializeConflict,
     ],
   )

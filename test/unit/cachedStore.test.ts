@@ -6,7 +6,12 @@
 
 import { describe, expect, it, vi } from 'vitest'
 import type { StoreEvent } from '@notarium/contract'
-import { CachedStore, InMemoryRevisionPersistence, type StoreDelta } from '@notarium/core'
+import {
+  CachedStore,
+  IF_EXISTS,
+  InMemoryRevisionPersistence,
+  type StoreDelta,
+} from '@notarium/core'
 import { InMemoryStore, type StoreSnapshot } from '@notarium/engine-memory'
 
 const FIXTURE: StoreSnapshot = {
@@ -601,8 +606,15 @@ describe('CachedStore — preview cache (#64)', () => {
     const { store } = await make(inner)
 
     expect((await store.preview('demo/carbon')).snippet).toBe('plain')
-    // the body changes behind our back (delta reports it, with or without content)
-    await inner.write({ title: 'Carbon', directory: 'demo', content: 'rewritten' })
+    // the body changes behind our back (delta reports it, with or without content).
+    // `overwrite` is how an out-of-band rewrite is spelled at the engine port — a
+    // create that names no policy refuses an occupied path.
+    await inner.write({
+      title: 'Carbon',
+      directory: 'demo',
+      content: 'rewritten',
+      ifExists: IF_EXISTS.overwrite,
+    })
     const meta = (await inner.list()).find((n) => n.filePath === 'demo/carbon.md')!
     next = {
       cursor: 'c2',

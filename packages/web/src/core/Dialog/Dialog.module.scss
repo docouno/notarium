@@ -4,7 +4,9 @@
 .dialog { padding: 22px 22px 18px; display: flex; flex-direction: column; min-height: 0; }
 .dialog-title { flex-shrink: 0; margin: 0 0 8px; font-size: 16px; font-weight: 650; letter-spacing: -0.01em; color: var(--text); }
 .dialog-message { margin: 0; min-height: 0; overflow: auto; font-size: 13.5px; line-height: 1.5; color: var(--text-dim); }
-.dialog-actions { flex-shrink: 0; display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+/* Actions wrap as whole buttons (their labels never break): a choice dialog whose
+   options outgrow the panel stacks into right-aligned rows instead of squashing. */
+.dialog-actions { flex-shrink: 0; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 20px; }
 .dialog-input {
   flex-shrink: 0;
   margin-top: 12px;

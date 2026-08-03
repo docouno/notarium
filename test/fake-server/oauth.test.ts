@@ -1003,13 +1003,16 @@ describe('per-space narrowing (#181)', () => {
   }
 
   /** A write through the OAuth bearer to a space — 200 when the space is in reach,
-   *  404 (anti-enumeration) when the narrowing excludes it. */
+   *  404 (anti-enumeration) when the narrowing excludes it. Each probe writes its OWN
+   *  note: this asks whether the token reaches the space, and a repeat title would
+   *  answer 409 (the create-collision refusal) about something else entirely. */
+  let probe = 0
   const writeSpace = (bearer: string, slug: string) =>
     app.inject({
       method: 'POST',
       url: `/api/s/${slug}/notes`,
       headers: { authorization: `Bearer ${bearer}` },
-      payload: { title: 'Via OAuth', content: 'x' },
+      payload: { title: `Via OAuth ${++probe}`, content: 'x' },
     })
 
   const patchConn = (clientId: string, cookie: string, body: Record<string, unknown>) =>

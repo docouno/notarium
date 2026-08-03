@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { IF_EXISTS } from '../../consts/notes'
 import { AuthorSchema, IsoTimestampSchema, NoteClassSchema, SpaceSlugSchema } from '../primitives'
 import { noteWriteFields } from './_fields'
 
@@ -54,7 +55,13 @@ export const NoteDetailResponseSchema = z.object({
   restorable: z.boolean().optional(),
 })
 
-export const CreateNoteRequestSchema = z.object(noteWriteFields)
+export const CreateNoteRequestSchema = z.object({
+  ...noteWriteFields,
+  /** What to do when the folder already holds a note with this title. Absent =
+   *  `fail`: no client can make a create replace someone else's bytes.
+   *  canon: docs/note-model.md#create-collisions */
+  ifExists: z.enum([IF_EXISTS.fail, IF_EXISTS.uniquify]).optional(),
+})
 
 export const UpdateNoteRequestSchema = z.object({
   ...noteWriteFields,
@@ -72,6 +79,10 @@ export const SaveResponseSchema = z.object({
    *  renames: equals originalId when one was sent. */
   id: z.string(),
   filePath: z.string().optional(),
+  /** The title the note actually landed under — the server derives it from the body,
+   *  and an `ifExists:'uniquify'` create may have stepped aside to a free one, so the
+   *  saver cannot assume it got what it sent. */
+  title: z.string().optional(),
   /** Version of the note as just written — lets a client (or agent) chain a
    *  follow-up save without an interim read. */
   versionToken: z.string(),
@@ -90,6 +101,22 @@ export const ConflictResponseSchema = z.object({
   error: z.string(),
   reason: z.literal('version_conflict'),
   current: NoteDetailResponseSchema,
+})
+
+/** 409 envelope for a create the server refused because a note already holds the
+ *  destination — the same "nothing was overwritten, here is the other side" shape as
+ *  the CAS conflict above. `existing` names the occupant so the client can offer to
+ *  open it; absent when the collision was caught by disk truth (an unindexed file has
+ *  no identity to name). Re-sending with `ifExists: 'uniquify'` is the explicit
+ *  "put mine beside it" move. */
+export const NoteExistsResponseSchema = z.object({
+  error: z.string(),
+  reason: z.literal('note_already_exists'),
+  existing: z.object({ id: z.string(), title: z.string(), filePath: z.string() }).optional(),
+  /** The title an `ifExists:'uniquify'` retry would take, so the client can offer it by
+   *  name. A PREVIEW, not a reservation — a racing writer can take it first, and the
+   *  save answers with the name it actually got. */
+  suggestedTitle: z.string().optional(),
 })
 
 export const RemoveResponseSchema = z.object({
@@ -135,6 +162,8 @@ export type SaveResponse = z.infer<typeof SaveResponseSchema>
 export type RestoredNote = z.infer<typeof RestoredNoteSchema>
 
 export type ConflictResponse = z.infer<typeof ConflictResponseSchema>
+
+export type NoteExistsResponse = z.infer<typeof NoteExistsResponseSchema>
 
 export type RemoveResponse = z.infer<typeof RemoveResponseSchema>
 

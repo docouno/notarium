@@ -41,3 +41,55 @@ _(#13, 2026-06-17: the name `remember_about_project` was RECLAIMED for memory; t
 
 #### Tags as a navigation axis (#109)
 A tag is a **navigation axis**, not just a string in the frontmatter. The canonical normalization function is `core/libs/tags` `foldTag` (one across all engines and the client, like `slugify`): **case-insensitive** (`ML`/`ml`/`Ml` — one tag) and **hierarchical** by `/` (segments are trim+lowercase, empties collapse: `Work / Projects` ≡ `work/projects`). Folding happens **only on read/match** — the frontmatter is not rewritten (the original case is stored and shown in the chip; the resolution/grouping key is the folded one). The match is **hierarchical** (`noteHasTag`): a query for the parent `ml` catches descendants `ml/nlp`, `ml/nlp/bert` (a subtree cascade, like folders), but NOT a same-named tag across a segment boundary (`ml` ≠ `mlops`). Where the axis lives: **the read-model snapshot** — the engine returns `tags` on `NoteMeta` (the `notes.tags` column already existed, is FTS-indexed for full-text; for navigation it is NOT an engine table), so the window/histogram/facet/graph are computed over the snapshot under the single visibility checkpoint #78 (agent-memory tags are not exposed on the default surface). The filter (`NotesQuery.tags`) is **OR/union** over the set (the unified model "you added a value → you see more", the same as the folder facet; within a facet it's OR, between facets folder ∧ tag is AND), the contract is an array (a repeatable query-key), the UI multi-selects tags. A future "narrow"/AND mode — a UI toggle over the same array. The `GET /api/s/:space/tags` facet returns a tree of nodes (a flat list of paths+counts, the client nests them like folders) — `count` = subtree population, `direct` = exactly this tag; the shaper is shared — `core/libs/tags` `buildTagFacet` (the same one on the server and in the graph on the client). **The axis UI (feed+graph unified):** the tag-facet = **hierarchical chips + search + top-N** (NOT a tree — on a real base it's too long; NOT a flat cloud — it loses the hierarchy). The interaction model is **inclusion** (as in the whole application): by default nothing is selected, a click on a chip adds a tag (highlighted in accent), a parent chip `▾` expands its children below the cloud, the header × resets; the active filter is read in the aside, **no chips above the content**. On a note's page tags = neutral chips (ready for a per-tag color), clickable → `?tag=`. The canon — recap #109.
+
+## Create collisions: a name is taken <a id="create-collisions"></a>
+
+A note's storage path is derived, not chosen: `slug(title).md` inside its folder, one formula
+shared by every engine. So two creates of the same title in one folder aim at the same file —
+and for a long time the second one simply won, silently. The write was a `createOrReplace`
+wearing a `create`'s name: the victim's body was gone from the live note, and — because the id
+is bound to the path — the newcomer also inherited its `notarium-id`, and with it the URL,
+the inbound links, the favorites, the pins and the creation date. Only the channels that had
+remembered to opt into a guard were safe.
+
+**The default is now refuse.** `WriteInput.ifExists` names the policy and applies to creates
+only (an edit is id-addressed and CAS-proven, and rename-onto-occupied has always been fenced
+in the engines):
+
+| policy | what it does | who asks for it |
+|---|---|---|
+| `fail` (**default**) | throws `noteAlreadyExists` | everything, by simply not asking |
+| `uniquify` | lands beside the occupant as `<title> 2`, `3`, … | Duplicate, and the editor's "save under a free name" |
+| `overwrite` | upserts onto the occupied path | **import only** — and it is not on the wire |
+
+`overwrite` is deliberately absent from `CreateNoteRequest`: replacing another note's bytes is
+a host-internal capability, so no client can reach it however it composes a request. Its one
+caller is the importer, whose idempotency rests on a deterministic `fileName` — a re-import
+must land on the same file ([import.md](import.md#idempotency-dedup-on-re-import)).
+
+**The fence is the PATH, not the title** — the path is what would be clobbered. A title is
+still not unique in a folder, and deliberately so: a note whose basename diverges from
+`slug(title)` — an imported file keyed by source-id, a note created outside Notarium, a
+`fileName`-pinned write — does not collide with a same-titled newcomer, and the two live
+side by side. Which one an ambiguous `[[Title]]` resolves to is the resolver's question
+(current > slug > alias, above), not this one.
+
+**Two layers refuse, and they see different things.** The read-model checks its snapshot and
+knows the occupant's identity, so the error carries `existing` (id + title + path) and the UI
+can offer "open that one". The engine checks **disk truth** underneath, which also catches a
+file the index has never seen — there the occupant has no identity to name and `existing` is
+absent, so the affordance honestly disappears ([P5](architecture.md#p5)) rather than guessing.
+
+`uniquify` is resolved **above** the engines, in the read-model: it picks the first free name
+from the snapshot *before* claiming the mutation fence — so the fence guards the path actually
+written — and treats the engine's refusal as the arbiter, retrying onto the next name. That is
+what makes concurrent duplicates and unindexed files come out right without the engines
+learning a third policy. When the create pins an explicit `fileName`, the counter walks the
+**basename**; counting the title would re-derive the same pinned path forever.
+
+**What the refusal is not.** It is not a lost save: the draft is untouched and the transport
+answers `409` with `reason: note_already_exists` — the same "nothing was overwritten, here is
+the other side" shape as the CAS conflict ([contract.md](contract.md#cas)), and the same status
+the folder and folder-page name clashes already used. The editor turns it into a choice —
+keep editing / save under a free name / open the existing note — because a collision usually
+means the user forgot the note exists, and the useful answer is to show it to them.

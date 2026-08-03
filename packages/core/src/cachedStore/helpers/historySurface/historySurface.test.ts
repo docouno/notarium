@@ -140,7 +140,11 @@ describe('HistorySurface restore/purge guards', () => {
       reason: 'note_already_exists',
     })
     expect(calls.writes).toHaveLength(1)
-    expect(calls.writes[0]).toMatchObject({ id: 'n1', ifExists: 'fail' })
+    // A restore is an ordinary create as far as collisions go: it names no policy and
+    // therefore inherits the never-clobber default, rather than reviving the note over
+    // whatever took its path.
+    expect(calls.writes[0]).toMatchObject({ id: 'n1' })
+    expect(calls.writes[0].ifExists).toBeUndefined()
   })
 
   it('restoreFromTrash revives the id at its last folder, writes via the CAS path, and heals aliases', async () => {

@@ -242,6 +242,9 @@ export const createToDomain = (body: CreateNoteRequest, principal: string): Writ
   slug: body.slug,
   // Absent stays absent — a normal save never touches `created`.
   createdAt: isoOrUndefined(body.createdAt),
+  // Passed through as the client sent it: the wire enum admits only fail/uniquify,
+  // and the domain's own default is fail — no route can widen that.
+  ifExists: body.ifExists,
   principal,
 })
 

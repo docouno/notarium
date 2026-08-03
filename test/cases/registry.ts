@@ -14,6 +14,7 @@ import { importThread } from './cases/importThread'
 import { jobs } from './cases/jobs'
 import { longDocument } from './cases/longDocument'
 import { multiSpace } from './cases/multiSpace'
+import { nameCollisions } from './cases/nameCollisions'
 import { noteClasses } from './cases/noteClasses'
 import { readerShowcase } from './cases/readerShowcase'
 import { scrollbars } from './cases/scrollbars'
@@ -48,6 +49,7 @@ export const CASES: readonly CaseSpec[] = [
   graphLoad,
   searchCorpus,
   externalEdits,
+  nameCollisions,
   // content / reader
   readerShowcase,
   longDocument,

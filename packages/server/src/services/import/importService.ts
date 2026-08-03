@@ -4,6 +4,8 @@
 
 import { NOTE_CLASS } from '@notarium/contract'
 import {
+  IF_EXISTS,
+  type IfExists,
   IMPORT_SOURCE,
   type ImportFormat,
   type ImportNote,
@@ -46,7 +48,7 @@ const toWriteInput = (
   n: ImportNote,
   directory: string,
   principal: string,
-  opts: { targetClass?: 'agent-memory'; ifExists?: 'fail' },
+  opts: { targetClass?: 'agent-memory'; ifExists: IfExists },
 ): WriteInput => ({
   title: n.title,
   content: n.body,
@@ -179,9 +181,13 @@ export const runImport = async ({
           summary.errors.push({ title: note.title, error: `unsafe directory: ${dirRaw}` })
           return
         }
+        // The ONE place a create is allowed to clobber, and it is stated out loud:
+        // idempotency rests on the deterministic fileName, so a re-import must land on
+        // the SAME file. `skipExisting` is the user's opt-out.
+        // canon: docs/import.md#idempotency-dedup-on-re-import
         const input = toWriteInput(note, dir, principal, {
           targetClass: toSpaceMemory ? NOTE_CLASS.agentMemory : undefined,
-          ifExists: skipExisting ? 'fail' : undefined,
+          ifExists: skipExisting ? IF_EXISTS.fail : IF_EXISTS.overwrite,
         })
 
         try {

@@ -126,15 +126,11 @@ const createOneNote = async (
         // Class is HARD-WIRED (poka-yoke): shared knowledge → user-doc, never agent-set.
         // canon: docs/note-model.md#note-classes
         targetClass: NOTE_CLASS.userDoc,
-        // ifExists:'fail' — create must never silently overwrite a same-titled note.
-        // The plain path upserts by slug(title) (UI re-save/dedup); an agent picking a
-        // generic title would clobber, so refuse the collision → guide to edit_note.
-        ifExists: 'fail',
         principal: ctx.principal.id,
       })
       // Integrity echo hashes the body the agent SENT (a transport check, NOT a
-      // read-back — stored bytes differ: title stripped, links folded). ifExists:'fail'
-      // makes the outcome always 'created' on the live path.
+      // read-back — stored bytes differ: title stripped, links folded). A create
+      // never clobbers, so the outcome is always 'created' on the live path.
       return {
         noteId: r.id ?? '',
         versionToken: r.versionToken ?? '',

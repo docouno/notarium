@@ -132,7 +132,6 @@ export const writeProfileNote = async (
           // keeps the note in its mount), so we set the hidden profile mount
           // only here on first save.
           targetClass: PROFILE_NOTE_CLASS,
-          ifExists: 'fail',
           principal: input.principal,
         })
         return { noteId: res.id ?? null, versionToken: res.versionToken ?? null }

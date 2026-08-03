@@ -12,7 +12,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 import { SyncStatusSchema } from '@notarium/contract'
-import type { KnowledgeStore, NoteMeta } from '@notarium/core'
+import { IF_EXISTS, type KnowledgeStore, type NoteMeta, STORE_ERROR_REASON } from '@notarium/core'
 
 export type StoreFactory = () => Promise<{
   store: KnowledgeStore
@@ -152,14 +152,16 @@ export const describeKnowledgeStoreContract = (
       expect(n!.createdAt).toBe(CREATED)
       const firstId = n!.id
 
-      // Re-import the SAME note (same fileName): overwrites the same file — no
-      // duplicate — and an identity-capable surface keeps the id (idempotent).
+      // Re-import the SAME note (same fileName): `overwrite` — the one policy that
+      // lets a create replace an occupied path — lands on the same file with no
+      // duplicate, and an identity-capable surface keeps the id (idempotent).
       await store.write({
         title: 'Imported Note',
         directory: dir,
         content: 'imported body v2',
         fileName: FN,
         createdAt: CREATED,
+        ifExists: IF_EXISTS.overwrite,
       })
       const atPath = (await store.list()).filter((m) => m.filePath === path)
       expect(atPath).toHaveLength(1)
@@ -169,6 +171,36 @@ export const describeKnowledgeStoreContract = (
       }
 
       await store.remove(idOf(atPath[0]))
+    })
+
+    it('refuses a create onto an occupied path unless it asked to overwrite — the default is never clobber', async () => {
+      const first = await store.write({
+        title: 'Contract Occupied',
+        directory: dir,
+        content: 'the body that must survive',
+      })
+      const path = first.filePath!
+
+      // No policy = refuse. The victim's bytes are untouched, so a second writer
+      // cannot silently inherit its file (and its identity).
+      await expect(
+        store.write({ title: 'Contract Occupied', directory: dir, content: 'intruder' }),
+      ).rejects.toMatchObject({ reason: STORE_ERROR_REASON.noteAlreadyExists, isToolError: true })
+      // Spelling out `fail` is the same thing, not a stricter one.
+      await expect(
+        store.write({
+          title: 'Contract Occupied',
+          directory: dir,
+          content: 'intruder',
+          ifExists: IF_EXISTS.fail,
+        }),
+      ).rejects.toMatchObject({ reason: STORE_ERROR_REASON.noteAlreadyExists })
+      expect(
+        (await store.read(idOf(byTitle(await store.list(), 'Contract Occupied')!))).content,
+      ).toBe('the body that must survive')
+      expect((await store.list()).filter((m) => m.filePath === path)).toHaveLength(1)
+
+      await store.remove(idOf(byTitle(await store.list(), 'Contract Occupied')!))
     })
 
     it('honours an explicit fileName on edit (opt-in basename), keeps a note put on a same-basename touch, folder pages keep index.md', async () => {

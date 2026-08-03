@@ -52,6 +52,7 @@ import {
   MuteNoteRequestSchema,
   MuteNoteResponseSchema,
   NoteDetailResponseSchema,
+  NoteExistsResponseSchema,
   PinNoteRequestSchema,
   PinNoteResponseSchema,
   RemoveResponseSchema,
@@ -131,7 +132,11 @@ export const contract = {
   note: { response: NoteDetailResponseSchema },
   previews: { request: PreviewsRequestSchema, response: PreviewsResponseSchema },
   search: { response: SearchResponseSchema },
-  create: { request: CreateNoteRequestSchema, response: SaveResponseSchema },
+  create: {
+    request: CreateNoteRequestSchema,
+    response: SaveResponseSchema,
+    conflict: NoteExistsResponseSchema,
+  },
   update: {
     request: UpdateNoteRequestSchema,
     response: SaveResponseSchema,

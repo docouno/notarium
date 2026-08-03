@@ -245,7 +245,6 @@ export class HistorySurface {
       directory: dir,
       id, // force the same note-id into the frontmatter
       targetClass: (tomb.class ?? undefined) as NoteClass | undefined,
-      ifExists: 'fail', // belt: refuse an unindexed on-disk file at the path too
       principal: opts?.principal,
       journal: { kind: REVISION_KIND.restore, sourceRevisionId: tomb.id },
     })
