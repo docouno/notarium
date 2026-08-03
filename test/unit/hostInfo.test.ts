@@ -8,7 +8,7 @@ import { hostInfoFrom } from '../../packages/server/src/libs/hostInfo'
 
 describe('hostInfoFrom (#97)', () => {
   it('reports FTS-only when no embedder is wired', () => {
-    const h = hostInfoFrom({ authMode: 'none', spaces: [{ slug: 'main' }] })
+    const h = hostInfoFrom({ authMode: 'none', metaDbFlavour: 'none', spaces: [{ slug: 'main' }] })
     expect(h.search).toEqual({
       vector: false,
       embedderId: null,
@@ -22,6 +22,7 @@ describe('hostInfoFrom (#97)', () => {
       embedder: { id: 'Xenova/bge-m3@q8', dimensions: 1024 },
       // undefined tuning ⇒ the engine default (wGraph 0.5) engages
       authMode: 'password',
+      metaDbFlavour: 'sqlite',
       spaces: [],
     })
     expect(h.search).toEqual({
@@ -37,28 +38,37 @@ describe('hostInfoFrom (#97)', () => {
       embedder: { id: 'm', dimensions: 8 },
       searchTuning: { wGraph: 0 },
       authMode: 'none',
+      metaDbFlavour: 'sqlite',
       spaces: [],
     })
     expect(h.search.graphBoost).toBe(false)
   })
 
   it('keeps graphBoost inert without an embedder even if the tuning leaves it on', () => {
-    const h = hostInfoFrom({ searchTuning: undefined, authMode: 'none', spaces: [] })
+    const h = hostInfoFrom({
+      searchTuning: undefined,
+      authMode: 'none',
+      metaDbFlavour: 'none',
+      spaces: [],
+    })
     expect(h.search.graphBoost).toBe(false)
   })
 
-  it('detects the meta-DB kind from the URL scheme (both postgres spellings)', () => {
-    const mk = (metaDbUrl?: string) =>
-      hostInfoFrom({ authMode: 'none', spaces: [], metaDbUrl }).deployment.metaDb
-    expect(mk('sqlite:.data/meta.db')).toBe('sqlite')
-    expect(mk('postgres://u@h/db')).toBe('postgres')
-    expect(mk('postgresql://u@h/db')).toBe('postgres')
-    expect(mk(undefined)).toBe('none')
+  it('publishes the flavour the composition root classified, under the wire name', () => {
+    // It no longer reads a URL at all — `metaDbFlavourOf` owns that, with its own
+    // cases. What is left to pin here is the rename across the boundary: the input is
+    // `metaDbFlavour`, the wire field stays `deployment.metaDb`.
+    const mk = (metaDbFlavour: 'sqlite' | 'postgres' | 'none') =>
+      hostInfoFrom({ authMode: 'none', metaDbFlavour, spaces: [] }).deployment.metaDb
+    expect(mk('sqlite')).toBe('sqlite')
+    expect(mk('postgres')).toBe('postgres')
+    expect(mk('none')).toBe('none')
   })
 
   it('maps per-space engines, defaulting an unset engine to notarium', () => {
     const h = hostInfoFrom({
       authMode: 'none',
+      metaDbFlavour: 'none',
       spaces: [{ slug: 'a', engine: 'notarium' }, { slug: 'b' }],
     })
     expect(h.deployment.engines).toEqual([
@@ -68,6 +78,9 @@ describe('hostInfoFrom (#97)', () => {
   })
 
   it('passes the auth mode through', () => {
-    expect(hostInfoFrom({ authMode: 'password', spaces: [] }).deployment.authMode).toBe('password')
+    expect(
+      hostInfoFrom({ authMode: 'password', metaDbFlavour: 'sqlite', spaces: [] }).deployment
+        .authMode,
+    ).toBe('password')
   })
 })

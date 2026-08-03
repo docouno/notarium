@@ -8,7 +8,13 @@ import { createEmbedPool, createLocalOnnxEmbedder, type Embedder } from '@notari
 import { backupControlSocketFromEnv } from '../../libs/backupControl'
 import { loadEnv } from '../../libs/env'
 import { trustProxyFromEnv } from '../../libs/trustProxy'
-import { dataPathsFromEnv, describeDataPaths, ensureDataRoot, legacyMetaDbAt } from './dataPaths'
+import {
+  type DataPaths,
+  dataPathsFromEnv,
+  describeDataPaths,
+  ensureDataRoot,
+  legacyMetaDbAt,
+} from './dataPaths'
 import { graphSearchTuning } from './searchTuningEnv'
 import { createServer } from './server'
 import { spacesFromEnv } from './spacesFromEnv'
@@ -26,8 +32,17 @@ const SYNC_POLL_SECONDS = Number(process.env.SYNC_POLL_SECONDS ?? 120)
 const SPACE_IDLE_EVICT_SECONDS = Number(process.env.SPACE_IDLE_EVICT_SECONDS ?? 0)
 // The ONE data root and everything derived from it. No path is a required env —
 // unset DATA_DIR lands on a writable default (/data in the image, an XDG dir on a
-// host). canon: docs/architecture.md#data-root
-const dataPaths = dataPathsFromEnv(process.env)
+// host). A value it refuses to read (an unusable home, an unknown META_DB_URL
+// scheme) is an operator-fixable config error: report the message, not a stack.
+// canon: docs/architecture.md#data-root
+const dataPaths = ((): DataPaths => {
+  try {
+    return dataPathsFromEnv(process.env)
+  } catch (err) {
+    console.error(`\n[notarium] ${(err as Error).message}\n`)
+    process.exit(1)
+  }
+})()
 // Auth mode; 'none' is a single-principal opt-out (desktop, dev, trusted intranet).
 // canon: docs/auth.md#modes
 const AUTH_MODE = (process.env.AUTH_MODE ?? 'password') as 'password' | 'none'
@@ -197,6 +212,9 @@ try {
   process.exit(1)
 }
 
+// A composition refusal (an in-memory meta-DB under password mode, say) is an
+// operator-fixable config error like the ones above — lead with the message. The
+// error itself still follows, so a genuine defect keeps its stack.
 const app = await createServer({
   spaces,
   adoptLegacyInto,
@@ -218,6 +236,10 @@ const app = await createServer({
   publicBaseUrl: process.env.PUBLIC_BASE_URL?.trim() || undefined,
   trustProxy: TRUST_PROXY || undefined,
   backupControlSocket: backupControlSocketFromEnv(),
+}).catch((err: unknown) => {
+  console.error(`\n[notarium] ${(err as Error).message}\n`)
+  console.error(err)
+  process.exit(1)
 })
 
 let closing = false

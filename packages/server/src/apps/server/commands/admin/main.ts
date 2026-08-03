@@ -5,8 +5,6 @@
 // canon: docs/auth.md#access-recovery-admin-cli
 
 import { randomBytes } from 'node:crypto'
-import { existsSync } from 'node:fs'
-import { dirname, isAbsolute, resolve as resolvePath } from 'node:path'
 import { createInterface } from 'node:readline'
 
 import { AUTH_MODE, SPACE_ROLE } from '@notarium/contract'
@@ -15,80 +13,14 @@ import { parseCommandLine, type ParsedCommandLine } from '../../../../libs/comma
 import { loadEnv } from '../../../../libs/env'
 import { createAuthService } from '../../../../services/auth'
 import type { SpaceRole } from '../../../../services/authz'
-import { createMetaDb, sqlitePathOf } from '../../../../services/metaDb'
-import { dataPathsFromEnv } from '../../dataPaths'
+import { createMetaDb, describeMetaDbUrl } from '../../../../services/metaDb'
+import { resolveMetaDbUrl } from './resolveMetaDbUrl'
 
 loadEnv()
 
 const die = (msg: string): never => {
   console.error(`error: ${msg}`)
   process.exit(1)
-}
-
-/** Resolves the server's meta-DB on the HOST. The implicit host default
- *  (~/.local/share/notarium/meta.db) is tried LAST on purpose: any bare
- *  `npm run server` materialises it, so preferring it would aim recovery at a
- *  throwaway DB while the real stand sits one directory up. For a sqlite target
- *  the file MUST already exist — the CLI never creates one (a silent empty DB is
- *  exactly how a misaimed run reads as "no users"). */
-const resolveMetaDbUrl = (): string => {
-  const explicit = process.env.META_DB_URL?.trim()
-
-  if (explicit) {
-    if (explicit.startsWith('postgres')) {
-      return explicit
-    }
-    const path = sqlitePathOf(explicit) ?? explicit
-    const abs = isAbsolute(path) ? path : resolvePath(process.cwd(), path)
-
-    if (!existsSync(abs)) {
-      die(`META_DB_URL points at ${abs}, which does not exist — refusing to create an empty DB`)
-    }
-
-    return `sqlite:${abs}`
-  }
-  // A NAMED root — the server would use it, so `admin` must too. Only when
-  // DATA_DIR is explicitly set; its implicit default is deferred to last resort.
-  const named = process.env.DATA_DIR?.trim()
-    ? sqlitePathOf(dataPathsFromEnv(process.env).metaDbUrl)
-    : null
-
-  if (named && existsSync(named)) {
-    return `sqlite:${named}`
-  }
-  let dir = process.cwd()
-
-  for (;;) {
-    for (const rel of [
-      'docker/volumes/data/meta.db',
-      'docker/volumes/notarium-state/meta.db',
-      '.data/meta.db',
-    ]) {
-      const candidate = resolvePath(dir, rel)
-
-      if (existsSync(candidate)) {
-        return `sqlite:${candidate}`
-      }
-    }
-    const parent = dirname(dir)
-
-    if (parent === dir) {
-      break
-    }
-    dir = parent
-  }
-  const implicit = sqlitePathOf(dataPathsFromEnv(process.env).metaDbUrl)
-
-  if (implicit && existsSync(implicit)) {
-    return `sqlite:${implicit}`
-  }
-
-  return die(
-    'could not find a meta-DB. Point DATA_DIR at the data root, e.g.\n' +
-      '  DATA_DIR="$(git rev-parse --show-toplevel)/docker/volumes/data" \\\n' +
-      '    npm -w @notarium/server run admin -- list\n' +
-      'or set META_DB_URL explicitly (external Postgres, or a meta.db outside the root).',
-  )
 }
 
 const randomPassword = (): string => randomBytes(12).toString('base64url')
@@ -163,10 +95,18 @@ const main = async (): Promise<void> => {
   if (parsed.has('password') && parsed.has('random')) {
     die('choose exactly one of --password or --random')
   }
-  const metaDbUrl = resolveMetaDbUrl()
+  const metaDbUrl = ((): string => {
+    try {
+      return resolveMetaDbUrl(process.env, process.cwd())
+    } catch (err) {
+      return die((err as Error).message)
+    }
+  })()
+  // Always say which DB we touched — a wrong target is the one real footgun. The
+  // password is masked: this line lands in scrollback and CI logs.
+  const shownUrl = describeMetaDbUrl(metaDbUrl)
 
-  // Always say which DB we touched — a wrong target is the one real footgun.
-  console.error(`meta-db: ${metaDbUrl}`)
+  console.error(`meta-db: ${shownUrl}`)
   const metaDb = createMetaDb(metaDbUrl)
   // The service owns hashing + session-kill semantics; the CLI just drives it.
   const auth = createAuthService({ mode: AUTH_MODE.password, persistence: metaDb.auth })
@@ -264,7 +204,7 @@ const main = async (): Promise<void> => {
             '  create-admin <username> [...]             create an admin (locked-out recovery)',
             '  grant <username> <space> <role>           set space membership',
             '',
-            `meta-db: ${metaDbUrl}`,
+            `meta-db: ${shownUrl}`,
           ].join('\n'),
         )
     }

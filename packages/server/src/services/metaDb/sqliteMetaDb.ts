@@ -20,6 +20,7 @@ import { createRetrievalLogFacet } from './drivers/sqlite/retrievalLog'
 import { createRevisionsFacet } from './drivers/sqlite/revisions'
 import { createScopePinsFacet } from './drivers/sqlite/scopePins'
 import { createSpacesFacet } from './drivers/sqlite/spaces'
+import { IN_MEMORY_DB } from './metaDbUrl'
 import { runSqliteMigrations } from './migrations'
 import type { MetaDb } from './types'
 
@@ -47,7 +48,7 @@ export class SqliteMetaDb implements MetaDb {
   private ensureInit(): Promise<void> {
     if (!this.initPromise) {
       this.initPromise = Promise.resolve().then(() => {
-        if (this.path !== ':memory:') {
+        if (this.path !== IN_MEMORY_DB) {
           mkdirSync(dirname(this.path), { recursive: true })
         }
         this.db = new DatabaseSync(this.path)

@@ -1,4 +1,12 @@
-export { createMetaDb, sqlitePathOf } from './metaDb'
+export { createMetaDb } from './metaDb'
+export {
+  assertNotConnectionString,
+  describeMetaDbUrl,
+  IN_MEMORY_DB,
+  META_DB_TARGET_KIND,
+  metaDbFlavourOf,
+  metaDbTargetOf,
+} from './metaDbUrl'
 export { SqliteMetaDb } from './sqliteMetaDb'
 export { PgMetaDb } from './pgMetaDb'
 export type {

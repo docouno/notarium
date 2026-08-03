@@ -8,10 +8,13 @@ import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { isAbsolute, join, resolve, sep } from 'node:path'
 
-import { sqlitePathOf } from '../../services/metaDb'
+import {
+  assertNotConnectionString,
+  IN_MEMORY_DB,
+  META_DB_TARGET_KIND,
+  metaDbTargetOf,
+} from '../../services/metaDb'
 
-/** SQLite's sentinel for a non-file database — never a directory to create. */
-const IN_MEMORY_DB = ':memory:'
 const IMPORT_STAGING_SUBDIR = 'imports'
 
 export type DataPaths = {
@@ -53,22 +56,29 @@ const defaultDataDir = (env: NodeJS.ProcessEnv): string => {
   return join(home, '.local', 'share', 'notarium')
 }
 
-/** Canonicalise META_DB_URL to one canonical form. `createMetaDb` accepts three
- *  inputs — `postgres://…`, `sqlite:<path>`, and a BARE path — so a simple prefix
- *  test misreads `META_DB_URL=/state/meta.db`; classify with the driver's own predicate. */
+/** Canonicalise META_DB_URL to one canonical form. The host's ONE env edge for it,
+ *  so a value the classifier refuses stops HERE, before anything derives a path from
+ *  it. */
 export const metaDbUrlFromEnv = (raw: string | undefined, dataDir: string): string => {
   const trimmed = raw?.trim()
 
   if (!trimmed) {
     return `sqlite:${join(dataDir, 'meta.db')}`
   }
-  const sqlitePath = sqlitePathOf(trimmed)
+  const target = metaDbTargetOf(trimmed)
 
-  if (sqlitePath === null) {
-    return trimmed
+  if (target.kind === META_DB_TARGET_KIND.postgres) {
+    return target.url
   }
+  // Only a value that classified as a PATH can be a connection string in disguise —
+  // a recognised scheme carries its credentials to the driver, where they belong. The
+  // PATH is what gets tested, never the raw value: our own `sqlite:` colon would pair
+  // with an '@' in a relative path and refuse an ordinary root.
+  assertNotConnectionString(target.kind === META_DB_TARGET_KIND.memory ? '' : target.path)
 
-  return sqlitePath === IN_MEMORY_DB ? `sqlite:${IN_MEMORY_DB}` : `sqlite:${resolve(sqlitePath)}`
+  return target.kind === META_DB_TARGET_KIND.memory
+    ? `sqlite:${IN_MEMORY_DB}`
+    : `sqlite:${resolve(target.path)}`
 }
 
 export const dataPathsFromEnv = (env: NodeJS.ProcessEnv): DataPaths => {
@@ -94,9 +104,9 @@ const usedDirs = (
   paths: DataPaths,
   spacesRoot: string | undefined,
 ): Array<{ dir: string; label: string }> => {
-  // null ⇒ Postgres, `:memory:` ⇒ no file — neither has a directory to create.
-  const sqlitePath = sqlitePathOf(paths.metaDbUrl)
-  const metaDbDir = sqlitePath && sqlitePath !== IN_MEMORY_DB ? resolve(sqlitePath, '..') : null
+  // Postgres and `:memory:` have no directory to create — only a file target does.
+  const target = metaDbTargetOf(paths.metaDbUrl)
+  const metaDbDir = target.kind === META_DB_TARGET_KIND.file ? resolve(target.path, '..') : null
 
   return [
     ...(metaDbDir ? [{ dir: metaDbDir, label: 'meta-DB dir' }] : []),
@@ -125,9 +135,9 @@ export const legacyMetaDbAt = (env: NodeJS.ProcessEnv, paths: DataPaths): string
   if (env.META_DB_URL?.trim()) {
     return null
   }
-  const ours = sqlitePathOf(paths.metaDbUrl)
+  const ours = metaDbTargetOf(paths.metaDbUrl)
 
-  if (!ours || ours === IN_MEMORY_DB || existsSync(ours)) {
+  if (ours.kind !== META_DB_TARGET_KIND.file || existsSync(ours.path)) {
     return null
   }
 

@@ -42,6 +42,7 @@ import {
   createMarkerStore,
   createMetaDb,
   dataPathsFromEnv,
+  describeMetaDbUrl,
   ensureFolderIdentity,
   hashPassword,
   healSpaceMarker,
@@ -161,7 +162,7 @@ const run = async (): Promise<void> => {
   // CASE may be a single case or a comma-list to COMBINE (feed-scroll,trash-mixed).
   const world: CaseWorld = buildCasesWorld(caseName, { seed, scale, now: nowIso })
   console.log(`seed: case=${caseName} scale=${scale} seed=${seed} now=${nowIso}`)
-  console.log(`seed: spacesRoot=${spacesRoot} metaDb=${metaDbUrl}`)
+  console.log(`seed: spacesRoot=${spacesRoot} metaDb=${describeMetaDbUrl(metaDbUrl)}`)
 
   const metaDb = createMetaDb(metaDbUrl)
 

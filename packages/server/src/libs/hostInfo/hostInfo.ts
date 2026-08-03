@@ -1,4 +1,4 @@
-import { META_DB } from '@notarium/contract'
+import type { MetaDb } from '@notarium/contract'
 
 /** /api/about diagnostics the composition root knows but a request handler can't
  *  compute: effective search capability + deployment shape. */
@@ -11,7 +11,7 @@ export type HostInfo = {
   }
   deployment: {
     authMode: 'password' | 'none'
-    metaDb: 'sqlite' | 'postgres' | 'none'
+    metaDb: MetaDb
     engines: { slug: string; engine: 'notarium' }[]
   }
 }
@@ -22,10 +22,13 @@ export const hostInfoFrom = (opts: {
   embedder?: { id: string; dimensions: number }
   searchTuning?: { wGraph?: number }
   authMode: 'password' | 'none'
-  metaDbUrl?: string
+  /** Which driver backs this host, already classified by the composition root
+   *  (`services/metaDb`) — never re-derived from a URL here, where a second reading
+   *  of the scheme would drift from the driver's own. */
+  metaDbFlavour: MetaDb
   spaces: { slug: string; engine?: 'notarium' }[]
 }): HostInfo => {
-  const { embedder, searchTuning, authMode, metaDbUrl, spaces } = opts
+  const { embedder, searchTuning, authMode, metaDbFlavour, spaces } = opts
   return {
     search: {
       vector: Boolean(embedder),
@@ -37,11 +40,7 @@ export const hostInfoFrom = (opts: {
     },
     deployment: {
       authMode,
-      metaDb: metaDbUrl?.startsWith('postgres')
-        ? META_DB.postgres
-        : metaDbUrl?.startsWith('sqlite')
-          ? META_DB.sqlite
-          : META_DB.none,
+      metaDb: metaDbFlavour,
       engines: spaces.map((s) => ({ slug: s.slug, engine: s.engine ?? 'notarium' })),
     },
   }

@@ -493,6 +493,7 @@ export const createApp = async (
   // how the app authenticates).
   const about = hostInfoFrom({
     authMode: fixture.auth ? 'password' : 'none',
+    metaDbFlavour: 'none',
     spaces: defs.map((d) => ({ slug: d.slug, engine: 'notarium' as const })),
   })
   // The durable job layer: the fake wires the REAL runner over an

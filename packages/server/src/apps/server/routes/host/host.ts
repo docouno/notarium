@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify'
 
-import { AUTH_MODE, ConfigSchema, HostAboutResponseSchema } from '@notarium/contract'
+import { AUTH_MODE, ConfigSchema, HostAboutResponseSchema, META_DB } from '@notarium/contract'
 
 import { buildInfo } from '../../../../libs/buildInfo'
 import { hostInfoFrom } from '../../../../libs/hostInfo'
@@ -12,7 +12,13 @@ export const hostRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
   const buildIdentity = build ?? buildInfo
 
   // Absent on a bare buildApp → synthesize an FTS/none default so the wire shape still answers.
-  const hostInfo = about ?? hostInfoFrom({ authMode: AUTH_MODE.none, spaces: spaces.list() })
+  const hostInfo =
+    about ??
+    hostInfoFrom({
+      authMode: AUTH_MODE.none,
+      metaDbFlavour: META_DB.none,
+      spaces: spaces.list(),
+    })
   // Engine labels come from the boot snapshot; runtime-minted spaces aren't in it → default 'notarium'.
   const engineBySlug = new Map(hostInfo.deployment.engines.map((e) => [e.slug, e.engine]))
 

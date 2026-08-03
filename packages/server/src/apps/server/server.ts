@@ -22,7 +22,13 @@ import { createFsImportStagingStore } from '../../libs/importStaging'
 import { createMutationGate } from '../../libs/mutationGate'
 import { notesDirReader } from '../../libs/notesDir'
 import { type AuthMode, createAuthService } from '../../services/auth'
-import { createMetaDb, type SpaceRecord } from '../../services/metaDb'
+import {
+  createMetaDb,
+  META_DB_TARGET_KIND,
+  metaDbFlavourOf,
+  metaDbTargetOf,
+  type SpaceRecord,
+} from '../../services/metaDb'
 import {
   createMarkerStore,
   discoverSpaceFolders,
@@ -108,8 +114,8 @@ export type CreateServerOptions = {
   idleEvictMs?: number
   /** Meta-DB URL (sqlite:<path> | postgres://…). Empty ⇒ identity/journal run
    *  ephemeral (note-ids regenerate per process, history lives only for the
-   *  process) — honest degradation (P5). Auth does NOT degrade: 'password' without
-   *  a meta-DB refuses to boot. */
+   *  process) — honest degradation (P5). Auth does NOT degrade: 'password' refuses to
+   *  boot without a meta-DB, and on one that cannot outlive the process. */
   metaDbUrl?: string
   /** How this host authenticates: 'password' (default) or 'none' (single-principal
    *  opt-out). canon: docs/auth.md#modes */
@@ -175,6 +181,17 @@ export const createServer = async ({
   backgroundDripMs,
   backupControlSocket,
 }: CreateServerOptions): Promise<FastifyInstance> => {
+  // Present is not durable: an in-memory meta-DB forgets every account on restart.
+  // canon: docs/architecture.md#data-root
+  if (
+    (authMode ?? AUTH_MODE.password) === AUTH_MODE.password &&
+    metaDbUrl &&
+    metaDbTargetOf(metaDbUrl).kind === META_DB_TARGET_KIND.memory
+  ) {
+    throw new Error(
+      'AUTH_MODE=password needs a durable meta-DB, and META_DB_URL names an in-memory one — point it at a file or a postgres:// URL, or opt out explicitly with AUTH_MODE=none',
+    )
+  }
   const metaDb = metaDbUrl ? createMetaDb(metaDbUrl) : undefined
   const mutationGate = createMutationGate()
   // The ONE process-global cooperative scheduler — a single instance gates all
@@ -437,7 +454,7 @@ export const createServer = async ({
     embedder,
     searchTuning,
     authMode: authMode ?? AUTH_MODE.password,
-    metaDbUrl,
+    metaDbFlavour: metaDbFlavourOf(metaDbUrl),
     spaces,
   })
   const app = await buildApp({

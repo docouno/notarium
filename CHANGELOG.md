@@ -4,6 +4,21 @@ All notable changes to Notarium are recorded in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows [semantic versioning](https://semver.org/). One version number covers the whole repository — the image, the npm CLI and every workspace move in lockstep, so `notarium@X.Y.Z` and the `X.Y.Z` image are always the same revision and there is no compatibility matrix to guess at.
 
+## [Unreleased]
+
+### Fixed
+
+- **A misspelt `META_DB_URL` no longer opens an empty database.** Every tool now classifies the URL the same way, in one place: `postgres://…`/`postgresql://…` (scheme case-insensitive), `sqlite:<path>`, `sqlite::memory:`, or a plain file path. Anything else — `postgress://…`, `mysql://…`, a bare `sqlite:`, or a connection string that lost its scheme and carries a credential (`host=db password=…`, `//user:pw@host/db`) — is refused with a message instead of being read as a filename, which previously started the server on a fresh empty database (re-opening the public first-run screen while the real data sat untouched) and made `admin` report "no users". A path that merely looks Postgres-shaped, such as `postgres-backup/meta.db`, stays a path.
+- **The recovery CLI no longer creates the database it was pointed at.** `admin` refuses a `META_DB_URL` whose file is missing, empty or not a file at all — a bare `touch meta.db` used to pass — and refuses `sqlite::memory:`, rather than answering from a database it just made. (A Postgres `META_DB_URL` is still bootstrapped on connect, as the server does.)
+
+### Changed
+
+- **`AUTH_MODE=password` refuses to start on an in-memory meta-DB.** Such a host forgets every account on restart and re-opens first-run setup to whoever loads it first; use a file or Postgres, or opt out with `AUTH_MODE=none`.
+
+### Security
+
+- **A Postgres password is no longer printed where Notarium reports which database it is using** (the `admin` banner, the seeder, boot errors). A SQLite path is still named in full — that is the one you need when recovery opens the wrong file — while a `postgres://…` URL is named by its scheme alone, and a value that carries a credential where a path belongs is refused before anything prints it. Previously the whole URL was printed verbatim; rotate the credential if such a line reached a shared log. Your driver still names host, database and user in its own connection error.
+
 ## [0.1.0] — 2026-08-02
 
 The first public release. Notarium is a self-hosted knowledge base on plain Markdown, equally open to a person (web editor, REST) and to an AI agent (a built-in MCP endpoint): an agent's edits are versioned, bound by the same permissions, and signed with who made them, exactly like edits from the interface. Free and open source under [AGPL-3.0-only](LICENSE), with a separate [commercial license](COMMERCIAL-LICENSE.md) for productizing Notarium itself.

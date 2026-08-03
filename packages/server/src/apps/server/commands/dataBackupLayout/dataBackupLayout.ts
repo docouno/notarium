@@ -9,7 +9,7 @@ import {
   DEFAULT_MAX_BACKUP_ENTRIES,
   DEFAULT_MAX_BACKUP_METADATA_BYTES,
 } from '../../../../libs/dataBackup'
-import { sqlitePathOf } from '../../../../services/metaDb'
+import { META_DB_TARGET_KIND, metaDbTargetOf } from '../../../../services/metaDb'
 import { dataPathsFromEnv } from '../../dataPaths'
 
 const canonicalPath = (path: string, expected: string, label: string): void => {
@@ -23,13 +23,13 @@ const canonicalPath = (path: string, expected: string, label: string): void => {
 /** Fail closed instead of publishing an archive that silently omits external state. */
 export const backupLayoutFromEnv = (env: NodeJS.ProcessEnv = process.env): BackupLayout => {
   const paths = dataPathsFromEnv(env)
-  const metaDbPath = sqlitePathOf(paths.metaDbUrl)
+  const metaDb = metaDbTargetOf(paths.metaDbUrl)
   const spacesDir = resolve(env.SPACES_ROOT?.trim() || paths.defaultSpacesRoot)
 
-  if (!metaDbPath || metaDbPath === ':memory:') {
+  if (metaDb.kind !== META_DB_TARGET_KIND.file) {
     throw new Error('online backup requires the canonical file-backed SQLite meta-DB')
   }
-  const resolvedMetaDb = resolve(metaDbPath)
+  const resolvedMetaDb = resolve(metaDb.path)
   const expectedMetaDb = join(paths.dataDir, 'meta.db')
 
   if (resolvedMetaDb !== expectedMetaDb) {

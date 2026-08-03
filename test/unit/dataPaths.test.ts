@@ -19,7 +19,6 @@ import {
   legacyMetaDbAt,
   metaDbUrlFromEnv,
 } from '../../packages/server/src/apps/server/dataPaths'
-import { sqlitePathOf } from '../../packages/server/src/services/metaDb'
 
 const env = (o: Record<string, string | undefined>): NodeJS.ProcessEnv => o as NodeJS.ProcessEnv
 
@@ -108,19 +107,6 @@ describe('dataPathsFromEnv (#101)', () => {
   })
 })
 
-describe('sqlitePathOf — the ONE meta-DB URL classifier', () => {
-  it('reads all three forms createMetaDb accepts, including the bare path', () => {
-    expect(sqlitePathOf('sqlite:/data/meta.db')).toBe('/data/meta.db')
-    expect(sqlitePathOf('postgres://h/db')).toBeNull()
-    expect(sqlitePathOf('postgresql://h/db')).toBeNull()
-    // A bare value is a sqlite FILE to createMetaDb, so anything deciding "is there
-    // a directory to create and probe" must read it the same way.
-    expect(sqlitePathOf('/state/meta.db')).toBe('/state/meta.db')
-    // SQLite's sentinel, not a path — passed through for the caller to recognise.
-    expect(sqlitePathOf('sqlite::memory:')).toBe(':memory:')
-  })
-})
-
 describe('metaDbUrlFromEnv — canonical form at the env edge (#101)', () => {
   it('canonicalises a bare path to sqlite:<absolute>', () => {
     // The desync this closes: createMetaDb accepts a bare path as sqlite, so a
@@ -145,6 +131,43 @@ describe('metaDbUrlFromEnv — canonical form at the env edge (#101)', () => {
     // resolve(':memory:') would yield <cwd>/:memory: — a real directory probed and
     // created in whatever cwd started the process.
     expect(metaDbUrlFromEnv('sqlite::memory:', '/data')).toBe('sqlite::memory:')
+  })
+
+  it('refuses a connection string wearing a path, and only then', () => {
+    // The last shape of the original defect: `host=db password=…` taken as a path is a
+    // directory NAMED AFTER THE CREDENTIAL, created on disk and printed by whatever
+    // reports paths. Order matters — the check runs only on a value that classified as
+    // a PATH, or it would reject the very Postgres URLs it is protecting.
+    expect(metaDbUrlFromEnv('postgres://u:hunter2@h/db', '/data')).toBe('postgres://u:hunter2@h/db')
+    expect(metaDbUrlFromEnv('postgresql://u:p@ss@h/db?sslmode=require', '/data')).toBe(
+      'postgresql://u:p@ss@h/db?sslmode=require',
+    )
+    for (const raw of [
+      'host=db user=u password=hunter2',
+      '//u:hunter2@h/db',
+      'postgres//u:pw@h/db',
+    ]) {
+      expect(() => metaDbUrlFromEnv(raw, '/data')).toThrow(/looks like a connection string/)
+    }
+    // And an ordinary root still resolves, at-signs and colons included.
+    expect(metaDbUrlFromEnv('/home/ann@corp.example/meta.db', '/data')).toBe(
+      'sqlite:/home/ann@corp.example/meta.db',
+    )
+  })
+
+  it('stops a misspelt scheme HERE rather than booting on an empty database', () => {
+    // The env edge is the one place a malformed META_DB_URL can still be refused. Let
+    // it through and it becomes a filename: the host creates that file, starts green
+    // on a database with zero users, and a password host re-opens the PUBLIC
+    // first-run screen — the takeover legacyMetaDbAt guards, except that guard stands
+    // down exactly when META_DB_URL is set. The password would also land in the
+    // directory name and the boot banner.
+    expect(() => metaDbUrlFromEnv('postgress://u:pw@h/db', '/data')).toThrow(
+      /unsupported meta-DB URL scheme/,
+    )
+    expect(() => dataPathsFromEnv(env({ DATA_DIR: '/data', META_DB_URL: 'mysql://h/db' }))).toThrow(
+      /unsupported meta-DB URL scheme/,
+    )
   })
 })
 
