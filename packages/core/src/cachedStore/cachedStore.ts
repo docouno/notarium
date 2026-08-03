@@ -12,6 +12,7 @@ import type {
   Graph,
   GraphHealth,
   KnowledgeStore,
+  ListOptions,
   MoveInput,
   MutationOptions,
   NoteContent,
@@ -19,7 +20,6 @@ import type {
   Preview,
   ReadOptions,
   ReadScope,
-  ReadSurfaceOptions,
   RestoreInput,
   ScanPhase,
   SearchOptions,
@@ -879,16 +879,22 @@ export class CachedStore implements KnowledgeStore {
     }
   }
 
-  async list(opts?: ReadSurfaceOptions): Promise<NoteMeta[]> {
+  async list(opts?: ListOptions): Promise<NoteMeta[]> {
     await this.ensureNotes()
     const scope: ReadScope = opts?.scope ?? READ_SCOPE.user
     const admitted = classesForScope(scope)
+    const requested = opts?.classes == null ? undefined : new Set(opts.classes)
+
+    if (requested?.size === 0) {
+      return []
+    }
     // Project-subtree narrowing rides alongside the class axis: a project
     // handle resolves to `pathPrefix`, and the list scopes to that subtree here, in
     // the read-model query (absent = the whole space).
     const prefix = opts?.pathPrefix
     const visible = (n: NoteMeta): boolean =>
       admitted.has(n.class ?? DEFAULT_NOTE_CLASS) &&
+      (requested === undefined || requested.has(n.class ?? DEFAULT_NOTE_CLASS)) &&
       (prefix === undefined || isPathUnder(n.filePath, prefix))
 
     // The list-driven user surfaces (Feed/tree/buckets) all slice this, so the
@@ -898,11 +904,40 @@ export class CachedStore implements KnowledgeStore {
     // attachment, which the engine never indexes as a note row); when an
     // attachment-style indexed class appears, the Feed must additionally filter
     // by isVisibleOn('feed', class).
-    if (this.isServingLive) {
-      return (await this.inner.list()).filter(visible)
+    const fromSnapshot = (): NoteMeta[] => [...this.snap.notes.values()].filter(visible)
+    const projectEngineRows = (rows: readonly NoteMeta[], preferSnapshot: boolean): NoteMeta[] =>
+      rows.map((meta) => {
+        // An identity-capable engine owns its id. A bare engine speaks storage
+        // paths, so adopt the same provisional/durable registry identity the
+        // boot inventory uses. A healthy selective read prefers the snapshot's
+        // richer projection; error-mode passthrough keeps fresh engine metadata.
+        const adopted = this.adoptMeta(meta)
+        return preferSnapshot ? (this.snap.notes.get(adopted.id) ?? adopted) : adopted
+      })
+
+    const servingLive = this.isServingLive
+
+    if (servingLive || requested) {
+      try {
+        const classes = requested ? [...requested] : opts?.classes
+        return projectEngineRows(await this.inner.list({ classes }), !servingLive).filter(visible)
+      } catch (err) {
+        // A graph-only boot failure and a transient derived-index failure both
+        // leave a complete authoritative inventory behind. Preserve the
+        // read-model's soft degradation: the exceptional path may pay O(N),
+        // while the healthy selective path remains indexed by class.
+        if (this.mutationInventoryReady) {
+          console.error(
+            '[cached-store] selective list failed; serving snapshot:',
+            (err as Error).message,
+          )
+          return fromSnapshot()
+        }
+        throw err
+      }
     }
 
-    return [...this.snap.notes.values()].filter(visible)
+    return fromSnapshot()
   }
 
   async graph(): Promise<Graph> {
@@ -1372,6 +1407,10 @@ export class CachedStore implements KnowledgeStore {
 
   revisions(noteId: string, opts: { offset: number; limit: number }) {
     return this.trash.revisions(noteId, opts)
+  }
+
+  latestRevisions(noteIds: readonly string[]) {
+    return this.trash.latestRevisions(noteIds)
   }
 
   revision(noteId: string, revisionId: string) {

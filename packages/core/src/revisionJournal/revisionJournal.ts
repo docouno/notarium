@@ -147,6 +147,14 @@ export class RevisionJournal {
     return this.persistence.latestFor(noteId)
   }
 
+  /** Newest rows for a set of notes after settling only those notes' queued appends. */
+  async latestForMany(noteIds: readonly string[]): Promise<Map<string, Revision>> {
+    await this.ensureInit()
+    const ids = [...new Set(noteIds)]
+    await Promise.all(ids.map((noteId) => this.drain(noteId)))
+    return this.persistence.latestForMany(ids)
+  }
+
   /** One revision with its blob, scope-checked against the note id — a
    *  revision is addressable only through its own note. */
   async detail(noteId: string, revisionId: string): Promise<RevisionDetail | null> {

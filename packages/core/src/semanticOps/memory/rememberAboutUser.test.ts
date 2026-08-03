@@ -178,6 +178,7 @@ describe('buildMemoryIndex', () => {
       summary: 'UI prefs',
       tokens: expect.any(Number),
       muted: false,
+      modifiedAt: null,
     })
     expect(prefs.tokens).toBeGreaterThan(0)
     // No summary recorded → derive one from the content (spec §4 "none → derive").
@@ -185,6 +186,8 @@ describe('buildMemoryIndex', () => {
     expect(work.summary).toContain('shipping the gateway')
     // user-doc never appears in the memory index.
     expect(index.some((e) => e.noteId === 'doc-x')).toBe(false)
+    expect(store.listCalls).toEqual([{ scope: 'agentRecall', classes: ['agent-memory'] }])
+    expect(store.readIds.sort()).toEqual(['mem-prefs', 'mem-work'])
   })
 
   it('the default (root) index EXCLUDES project memory in subdirs (#13)', async () => {

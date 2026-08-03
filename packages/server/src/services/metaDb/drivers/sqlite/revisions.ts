@@ -268,6 +268,31 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
       .get(noteId) as RevisionRow | undefined
     return row ? revisionOfRow(row) : null
   },
+  latestForMany: async (noteIds) => {
+    await ctx.ensureInit()
+    const ids = [...new Set(noteIds)]
+
+    if (!ids.length) {
+      return new Map()
+    }
+    // Keep the set in one bound value rather than one placeholder per id:
+    // SQLite's host-variable ceiling is finite (32,766 in our runtime), while
+    // the port deliberately accepts an unbounded set. json_each is already a
+    // required capability of this driver and lets the revision index seek each id
+    // without turning a wide category list into "too many SQL variables".
+    const rows = ctx.required
+      .prepare(
+        `SELECT revisions.* FROM note_revisions AS revisions
+           JOIN (
+             SELECT note_id, MAX(id) AS id
+             FROM note_revisions
+             WHERE note_id IN (SELECT value FROM json_each(?))
+             GROUP BY note_id
+           ) AS latest ON latest.id = revisions.id`,
+      )
+      .all(JSON.stringify(ids)) as RevisionRow[]
+    return new Map(rows.map((row) => [row.note_id, revisionOfRow(row)]))
+  },
   listTrashed: async (space, { offset, limit, q }, excludeClasses = []) => {
     await ctx.ensureInit()
     const db = ctx.required

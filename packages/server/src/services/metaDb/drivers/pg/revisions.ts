@@ -322,6 +322,23 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
     )
     return res.rows[0] ? revisionOfRow(res.rows[0] as RevisionRow) : null
   },
+  latestForMany: async (noteIds) => {
+    await ctx.ensureInit()
+    const ids = [...new Set(noteIds)]
+
+    if (!ids.length) {
+      return new Map()
+    }
+    const result = await ctx.required.query(
+      `SELECT DISTINCT ON (note_id) *
+         FROM note_revisions
+        WHERE note_id = ANY($1::text[])
+        ORDER BY note_id, id DESC`,
+      [ids],
+    )
+    const revisions = (result.rows as RevisionRow[]).map(revisionOfRow)
+    return new Map(revisions.map((revision) => [revision.noteId, revision]))
+  },
   listTrashed: async (space, { offset, limit, q }, excludeClasses = []) => {
     await ctx.ensureInit()
     // Class filter runs BEFORE the per-note collapse (inside the subquery); title search AFTER it.

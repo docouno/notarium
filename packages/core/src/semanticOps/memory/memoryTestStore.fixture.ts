@@ -11,6 +11,7 @@
 import {
   IF_EXISTS,
   type KnowledgeStore,
+  type ListOptions,
   NOTE_CLASS,
   noteAlreadyExists,
   type NoteClass,
@@ -38,7 +39,12 @@ export type MemRow = {
   filePath?: string
 }
 
-export type MemStore = KnowledgeStore & { rows: MemRow[]; writes: WriteInput[] }
+export type MemStore = KnowledgeStore & {
+  rows: MemRow[]
+  writes: WriteInput[]
+  listCalls: Array<ListOptions | undefined>
+  readIds: string[]
+}
 
 const norm = (d: string | undefined): string => (!d || d === '/' ? '' : d.replace(/^\/+|\/+$/g, ''))
 
@@ -48,6 +54,8 @@ export const memStore = (
 ): MemStore => {
   const rows = seed.map((r) => ({ ...r }))
   const writes: WriteInput[] = []
+  const listCalls: Array<ListOptions | undefined> = []
+  const readIds: string[] = []
   let writeCount = 0
 
   const fmOf = (r: MemRow): Record<string, unknown> => {
@@ -75,6 +83,8 @@ export const memStore = (
   const store = {
     rows,
     writes,
+    listCalls,
+    readIds,
     capabilities: {
       fts: true,
       vector: false,
@@ -87,16 +97,22 @@ export const memStore = (
       visibility: false,
       watch: false,
     },
-    list: async (): Promise<NoteMeta[]> =>
-      rows.map((r) => ({
-        id: r.id,
-        title: r.title,
-        class: r.class,
-        filePath: pathOf(r),
-        modifiedAt: null,
-        createdAt: null,
-      })),
+    list: async (opts?: ListOptions): Promise<NoteMeta[]> => {
+      listCalls.push(opts)
+      const classes = opts?.classes == null ? null : new Set(opts.classes)
+      return rows
+        .filter((r) => classes == null || classes.has(r.class))
+        .map((r) => ({
+          id: r.id,
+          title: r.title,
+          class: r.class,
+          filePath: pathOf(r),
+          modifiedAt: null,
+          createdAt: null,
+        }))
+    },
     read: async (id: string): Promise<NoteContent> => {
+      readIds.push(id)
       const r = rows.find((x) => x.id === id)
 
       if (!r) {

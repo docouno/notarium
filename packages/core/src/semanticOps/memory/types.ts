@@ -54,4 +54,6 @@ export type MemoryIndexEntry = {
   summary: string
   tokens: number
   muted: boolean
+  /** Engine metadata fallback for hosts without a revision journal. */
+  modifiedAt: string | null
 }

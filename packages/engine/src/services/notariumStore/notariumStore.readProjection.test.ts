@@ -108,6 +108,48 @@ describe('NotariumStore read/reconcile projection (#222)', () => {
     }
   })
 
+  it('pushes semantic class narrowing into the indexed metadata query', async () => {
+    const root = await fs.mkdtemp(join(tmpdir(), 'nstore-proj-'))
+    const memoryRoot = join(root, '.notarium/memory')
+    await fs.mkdir(memoryRoot, { recursive: true })
+    const store = createNotariumStore({
+      mounts: [
+        { class: 'user-doc', dir: root },
+        { class: 'agent-memory', dir: memoryRoot, prefix: '.notarium/memory' },
+      ],
+    })
+
+    try {
+      await write(root, 'doc.md', '# Ordinary note\n\nbody')
+      await write(memoryRoot, 'memory.md', '# Memory\n\nsummary')
+      await store.changes(null)
+      const spy = spyQueries(store)
+
+      const rows = await store.list({ classes: ['agent-memory'] })
+
+      expect(rows.map((row) => row.filePath)).toEqual(['.notarium/memory/memory.md'])
+      const query = spy.queries.find((candidate) =>
+        /FROM notes WHERE class IN \(\?\)/i.test(candidate),
+      )
+      expect(query, 'class filter must be part of the engine query').toBeTruthy()
+      expect(query).not.toMatch(/SELECT \*/i)
+      expect(query).not.toMatch(/\bbody\b/i)
+      const sql = (
+        store as unknown as {
+          sql: { all: <T>(query: string, params?: unknown[]) => Promise<T[]> }
+        }
+      ).sql
+      const plan = await sql.all<{ detail: string }>(
+        'EXPLAIN QUERY PLAN SELECT path FROM notes WHERE class IN (?) ORDER BY path',
+        ['agent-memory'],
+      )
+      expect(plan.some((step) => step.detail.includes('idx_notes_class'))).toBe(true)
+    } finally {
+      await store.stop()
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('the boot seed is inventory-only (no upserts); bodies ride ONLY the delta', async () => {
     const root = await fs.mkdtemp(join(tmpdir(), 'nstore-proj-'))
     const store = createNotariumStore({ notesDir: root })

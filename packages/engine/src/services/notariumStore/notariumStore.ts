@@ -23,6 +23,7 @@ import type {
   GraphHealth,
   GraphLink,
   KnowledgeStore,
+  ListOptions,
   MoveInput,
   NoteChange,
   NoteClass,
@@ -1773,13 +1774,22 @@ export class NotariumStore implements KnowledgeStore {
   // A bare engine materializes `class` but does NOT enforce visibility: the
   // ReadScope the port allows here is ignored (the param is omitted, like read's
   // ReadOptions) — the read-model is the visibility chokepoint (#78).
-  async list(): Promise<NoteMeta[]> {
+  async list(opts?: ListOptions): Promise<NoteMeta[]> {
     await this.ensureReady()
+    const classes = opts?.classes == null ? undefined : [...new Set(opts.classes)]
+
+    if (classes?.length === 0) {
+      return []
+    }
     // Meta-only projection (#222): list() feeds Feed/tree/buckets, all of which
     // slice metadata — never the body. `SELECT *` here materialized every note's
     // body just to throw it away in metaOf.
+    // A class-narrowed list rides idx_notes_class, so a tiny typed mount costs
+    // O(mount rows), not O(the whole corpus). Scope remains a read-model concern.
+    const where = classes ? ` WHERE class IN (${classes.map(() => '?').join(',')})` : ''
     const rows = await this.sql.all<NoteMetaRow>(
-      `SELECT ${NOTE_META_COLS} FROM notes ORDER BY path`,
+      `SELECT ${NOTE_META_COLS} FROM notes${where} ORDER BY path`,
+      classes,
     )
     return rows.map((r) => this.metaOf(r))
   }

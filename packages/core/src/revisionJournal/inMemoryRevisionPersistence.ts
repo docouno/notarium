@@ -186,6 +186,21 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
     return null
   }
 
+  async latestForMany(noteIds: readonly string[]): Promise<Map<string, Revision>> {
+    const wanted = new Set(noteIds)
+    const out = new Map<string, Revision>()
+
+    for (let i = this.revisions.length - 1; i >= 0 && out.size < wanted.size; i--) {
+      const revision = this.revisions[i]
+
+      if (wanted.has(revision.noteId) && !out.has(revision.noteId)) {
+        out.set(revision.noteId, revision)
+      }
+    }
+
+    return out
+  }
+
   async activityByDay(
     space: string,
     {

@@ -6,7 +6,7 @@ The home of the core's canon prose. Code in `packages/core/src/*` links here via
 
 ## Read-model decorator (#60) <a id="read-model"></a>
 
-`CachedStore` wraps any `KnowledgeStore` and serves `list/recent/graph` from an **in-memory snapshot** instead of hitting the engine on every request. The snapshot is derived state ([P2](architecture.md#p2)): rebuilt from scratch by the boot scan, nothing in it is a second source of truth. It is kept fresh three ways:
+`CachedStore` wraps any `KnowledgeStore` and normally serves `list/recent/graph` from an **in-memory snapshot** instead of hitting the engine on every request. A class-selective `list({ classes })` is the deliberate exception: it asks the engine's derived class index for the small candidate set, then projects those rows through snapshot identity/metadata and the requested `ReadScope`. A failed selective query falls back to filtering the authoritative snapshot (O(all notes), but only on the degraded path); an engine-passthrough read after a boot error uses the same identity projection. The snapshot is derived state ([P2](architecture.md#p2)): rebuilt from scratch by the boot scan, nothing in it is a second source of truth. It is kept fresh three ways:
 
 - **write-through** — mutations through us patch the snapshot in the same call;
 - **read-refresh** — reading a note re-derives its edges from the live body (#35 MVP slice: the body is the arbiter over the engine's relation index);

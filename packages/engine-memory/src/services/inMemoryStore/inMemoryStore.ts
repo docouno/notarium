@@ -15,6 +15,7 @@ import type {
   GraphHealth,
   GraphLink,
   KnowledgeStore,
+  ListOptions,
   MoveInput,
   NoteClass,
   NoteContent,
@@ -318,8 +319,11 @@ export class InMemoryStore implements KnowledgeStore {
 
   // ── reads ───────────────────────────────────────────────────────────────────
 
-  async list(): Promise<NoteMeta[]> {
-    return this.notes.map((n) => this.metaOf(n))
+  async list(opts?: ListOptions): Promise<NoteMeta[]> {
+    const classes = opts?.classes == null ? null : new Set(opts.classes)
+    return this.notes
+      .filter((n) => classes == null || classes.has(n.class))
+      .map((n) => this.metaOf(n))
   }
 
   /** The snapshot metadata view — mirrors the real engine's metaOf, incl. the tag

@@ -57,7 +57,10 @@ const findMemoryNote = async (
   mountPrefix: string,
 ): Promise<NoteMeta | undefined> => {
   const want = slugify(category)
-  const metas = await store.list({ scope: READ_SCOPE.agentRecall })
+  const metas = await store.list({
+    scope: READ_SCOPE.agentRecall,
+    classes: [NOTE_CLASS.agentMemory],
+  })
   return metas.find(
     (m) =>
       m.class === NOTE_CLASS.agentMemory &&
@@ -167,7 +170,10 @@ export const buildMemoryIndex = async (
 ): Promise<MemoryIndexEntry[]> => {
   const subdir = opts.subdir ?? ''
   const mountPrefix = opts.mountPrefix ?? AGENT_MEMORY_MOUNT
-  const metas = await store.list({ scope: READ_SCOPE.agentRecall })
+  const metas = await store.list({
+    scope: READ_SCOPE.agentRecall,
+    classes: [NOTE_CLASS.agentMemory],
+  })
   const out: MemoryIndexEntry[] = []
 
   for (const m of metas) {
@@ -188,6 +194,7 @@ export const buildMemoryIndex = async (
       // The eager profile carries the summary, not the body, so token cost = summary weight.
       tokens: estimateTokens(summary),
       muted: isMutedFlag(note.frontmatter?.muted),
+      modifiedAt: m.modifiedAt ?? null,
     })
   }
 

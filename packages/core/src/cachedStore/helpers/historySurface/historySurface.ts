@@ -58,6 +58,10 @@ export class HistorySurface {
     return this.host.journal.list(noteId, opts)
   }
 
+  latestRevisions(noteIds: readonly string[]): Promise<Map<string, Revision>> {
+    return this.host.journal.latestForMany(noteIds)
+  }
+
   async revision(noteId: string, revisionId: string): Promise<RevisionDetail | null> {
     return this.host.journal.detail(noteId, revisionId)
   }

@@ -3,11 +3,11 @@
 // path must not leak ghost titles from inside agent-memory bodies; and the
 // status count must report only the user-visible population.
 
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { CachedStore } from '@notarium/core'
+import { buildMemoryIndex, CachedStore } from '@notarium/core'
 import { createNotariumStore } from '@notarium/engine'
 import { InMemoryStore } from '@notarium/engine-memory'
 
@@ -113,6 +113,157 @@ describe('CachedStore visibility hardening (#78 review)', () => {
     const status = await store.syncStatus()
     expect(status.counts?.notes).toBe(1) // only the user-doc, not the agent-memory
     expect((await store.list({ scope: 'all' })).length).toBe(2)
+  })
+
+  it('pushes class narrowing into the engine, then restores read-model metadata', async () => {
+    const inner = new InMemoryStore({
+      space: 'main',
+      now: '2026-06-14T00:00:00.000Z',
+      notes: [
+        { id: 'fake-doc', title: 'Doc', filePath: 'doc.md', content: 'x' },
+        {
+          id: 'fake-mem',
+          title: 'Mem',
+          class: 'agent-memory',
+          filePath: '.notarium/memory/m.md',
+          content: 'y',
+        },
+      ],
+    })
+    const list = vi.spyOn(inner, 'list')
+    const store = new CachedStore({ inner, pollIntervalMs: 0 })
+    cleanups.push(() => store.stop())
+    await store.start()
+    list.mockClear()
+
+    const rows = await store.list({ scope: 'agentRecall', classes: ['agent-memory'] })
+
+    expect(list).toHaveBeenCalledOnce()
+    expect(list).toHaveBeenCalledWith({ classes: ['agent-memory'] })
+    expect(rows.map((row) => row.id)).toEqual(['fake-mem'])
+  })
+
+  it('keeps ReadScope authoritative over a selective engine candidate set', async () => {
+    const inner = new InMemoryStore({
+      space: 'main',
+      now: '2026-06-14T00:00:00.000Z',
+      notes: [
+        { id: 'fake-doc', title: 'Doc', filePath: 'doc.md', content: 'x' },
+        {
+          id: 'fake-mem',
+          title: 'Mem',
+          class: 'agent-memory',
+          filePath: '.notarium/memory/m.md',
+          content: 'y',
+        },
+      ],
+    })
+    const store = new CachedStore({ inner, pollIntervalMs: 0 })
+    cleanups.push(() => store.stop())
+    await store.start()
+
+    await expect(store.list({ scope: 'user', classes: ['agent-memory'] })).resolves.toEqual([])
+  })
+
+  it('projects bare-engine identity after a graph-only boot failure', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'nt-memory-list-error-'))
+    const memoryDir = join(dir, '.notarium/memory')
+    mkdirSync(memoryDir, { recursive: true })
+    writeFileSync(join(dir, 'doc.md'), '# Document\n\nBody')
+    writeFileSync(
+      join(memoryDir, 'workflow.md'),
+      '---\nsummary: Degraded memory.\n---\n# workflow\n\nBody',
+    )
+    const inner = createNotariumStore({
+      mounts: [
+        { class: 'user-doc', dir },
+        { class: 'agent-memory', dir: memoryDir, prefix: '.notarium/memory' },
+      ],
+    })
+    vi.spyOn(inner, 'graph').mockRejectedValue(new Error('derived graph unavailable'))
+    const store = new CachedStore({ inner, pollIntervalMs: 0 })
+    cleanups.push(async () => {
+      store.stop()
+      await store.settle()
+      rmSync(dir, { recursive: true, force: true })
+    })
+    await store.start()
+
+    expect((await store.syncStatus()).scan.phase).toBe('error')
+    await expect(buildMemoryIndex(store)).resolves.toMatchObject([
+      { category: 'workflow', summary: 'Degraded memory.' },
+    ])
+  })
+
+  it('keeps fresh engine metadata authoritative during graph-only degradation', async () => {
+    const inner = new InMemoryStore({
+      space: 'main',
+      now: '2026-06-14T00:00:00.000Z',
+      notes: [
+        {
+          id: 'fake-mem',
+          title: 'Memory before',
+          class: 'agent-memory',
+          filePath: '.notarium/memory/memory-before.md',
+          content: 'before',
+        },
+      ],
+    })
+    vi.spyOn(inner, 'graph').mockRejectedValue(new Error('derived graph unavailable'))
+    const store = new CachedStore({ inner, pollIntervalMs: 0 })
+    cleanups.push(() => store.stop())
+    await store.start()
+    const before = await inner.read('fake-mem')
+    await inner.write({
+      originalId: 'fake-mem',
+      versionToken: before.versionToken,
+      title: 'Memory after',
+      content: 'after',
+    })
+
+    await expect(
+      store.list({ scope: 'agentRecall', classes: ['agent-memory'] }),
+    ).resolves.toMatchObject([
+      {
+        id: 'fake-mem',
+        title: 'Memory after',
+        filePath: '.notarium/memory/memory-after.md',
+      },
+    ])
+  })
+
+  it('falls back to the authoritative snapshot when the selective query fails', async () => {
+    const inner = new InMemoryStore({
+      space: 'main',
+      now: '2026-06-14T00:00:00.000Z',
+      notes: [
+        { id: 'fake-doc', title: 'Doc', filePath: 'doc.md', content: 'x' },
+        {
+          id: 'fake-mem',
+          title: 'Mem',
+          class: 'agent-memory',
+          filePath: '.notarium/memory/m.md',
+          content: 'y',
+        },
+      ],
+    })
+    const store = new CachedStore({ inner, pollIntervalMs: 0 })
+    cleanups.push(() => store.stop())
+    await store.start()
+    vi.spyOn(inner, 'list').mockRejectedValueOnce(new Error('derived list unavailable'))
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    try {
+      await expect(
+        store.list({ scope: 'agentRecall', classes: ['agent-memory'] }),
+      ).resolves.toMatchObject([{ id: 'fake-mem', class: 'agent-memory' }])
+      expect(error).toHaveBeenCalledWith(
+        '[cached-store] selective list failed; serving snapshot:',
+        'derived list unavailable',
+      )
+    } finally {
+      error.mockRestore()
+    }
   })
 })
 

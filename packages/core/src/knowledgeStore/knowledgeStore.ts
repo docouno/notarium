@@ -119,6 +119,9 @@ export type RevisionPersistence = {
   purgeNotes(noteIds: readonly string[]): Promise<void>
   /** The newest revision of a note — the dedup/chaining anchor. */
   latestFor(noteId: string): Promise<Revision | null>
+  /** The newest revision for each requested note. Missing ids are omitted. A set-oriented
+   *  read so provenance lists never issue one persistence query per row. */
+  latestForMany(noteIds: readonly string[]): Promise<Map<string, Revision>>
   /** Day-bucketed activity, aggregated IN the driver (never shipping a year of rows). Synthetic
    *  pre-edit baselines (an `external` row that is a note's first entry, baseRevisionId = null)
    *  are EXCLUDED — counting them would double a pre-existing note's first edit. */
@@ -211,6 +214,12 @@ export type ReadSurfaceOptions = {
    *  read-model query next to the ReadScope axis, so a project-scoped list/recall stays correct
    *  under limits/budget. */
   pathPrefix?: string
+}
+
+export type ListOptions = ReadSurfaceOptions & {
+  /** Candidate narrowing by semantic class. This is an optimization, NOT a visibility bypass:
+   *  the read-model still intersects it with `scope`. Engines may push it into their class index. */
+  classes?: readonly NoteClass[]
 }
 
 /** What the underlying engine can do. Features degrade by capability instead of breaking.
@@ -653,7 +662,7 @@ export type MutationOptions = {
 
 export type KnowledgeStore = {
   /** Every note's metadata; `opts.scope` applies class-visibility (ReadScope). */
-  list(opts?: ReadSurfaceOptions): Promise<NoteMeta[]>
+  list(opts?: ListOptions): Promise<NoteMeta[]>
   /** The directory channel: every visible folder path, INCLUDING empty ones the note index can't
    *  see. A SEPARATE channel from list(). Optional (absent ⇒ the tree shows only note-backed folders). */
   listDirs?(): Promise<string[]>
@@ -700,6 +709,9 @@ export type KnowledgeStore = {
     noteId: string,
     opts: { offset: number; limit: number },
   ): Promise<{ items: Revision[]; total: number }>
+  /** Newest journal row per requested note. A read-model concern; absent means provenance
+   *  decoration degrades to metadata without falling back to an N+1 query loop. */
+  latestRevisions?(noteIds: readonly string[]): Promise<Map<string, Revision>>
   /** One revision with its content (null content = an honest external gap). */
   revision?(noteId: string, revisionId: string): Promise<RevisionDetail | null>
   /** Per-token delta (see RevisionPersistence.listBySpaceSince). A read-model concern; a bare

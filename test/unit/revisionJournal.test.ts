@@ -1094,6 +1094,27 @@ const makeWith = async (persistence: InMemoryRevisionPersistence) => {
 }
 
 describe('revision journal (#12) — read-after-write on a fire-and-forget append (#238)', () => {
+  it('settles requested notes and reads their heads through one persistence batch', async () => {
+    const persistence = new SlowRevisionPersistence(30)
+    const latestForMany = vi.spyOn(persistence, 'latestForMany')
+    const store = await makeWith(persistence)
+    const note = await store.write({
+      title: 'Beryllium',
+      directory: 'demo',
+      content: 'fresh body',
+      principal: 'user:bob',
+    })
+
+    // No settle(): the write has returned, but its journal append is still in
+    // the delayed per-note queue. The batch surface must drain it before reading.
+    const latest = await store.latestRevisions([note.id!, note.id!])
+
+    expect(latest.get(note.id!)?.principal).toBe('user:bob')
+    expect(latestForMany).toHaveBeenCalledOnce()
+    expect(latestForMany).toHaveBeenCalledWith([note.id!])
+    await store.settle()
+  })
+
   it('a still-pending human write wins over the SETTLED agent revision — the exact #238 mis-attribution', async () => {
     // The precise #238 shape: an agent creates/edits a note (PAT) and that revision
     // FULLY SETTLES; then a human edits the SAME note through the UI. The human append

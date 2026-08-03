@@ -123,6 +123,7 @@ and for `security` — it parses the sanitized HTML into a live DOM and checks t
 | Case | About | Axes |
 |---|---|---|
 | `agent-context` | pins + personal/project memory + projects of varying density (#165); **heavy pins over budget + a `Budget Lab` space for all token-budget cases #208** (personal-trim, fits / squeeze / dominant / no-pins — nesting the personal set into project Q's budget); **cross-space context set #209** (`Frontend Canon` in the `Conventions` space, connected to project Product OS + personal) **+ cross-space loose pin #209** (`Security Baseline` from `Conventions`, pinned directly into Product OS + personal) — both resolve cross-space; **retrieval audit #243** (search/recall/get_note history: hits + a recurrent vocabulary-mismatch miss + frequent queries) | agent-memory, agent-audit, structure, note-classes, scale |
+| `memory-perf` | 2700 ordinary notes + 4 personal-memory categories + 1 project-partition sentinel; reproduces memory-mount scaling, partition isolation, and graph-inert memory links | agent-memory, note-classes, scale |
 | `import-thread` | one rich imported thread | import, content |
 | `import` | a multi-format layout (claude/chatgpt/memory-json) + backdated dates-as-data → Feed year-spread (#11/#223) | import, content, activity |
 

@@ -13,6 +13,7 @@ import { importLayout } from './cases/importLayout'
 import { importThread } from './cases/importThread'
 import { jobs } from './cases/jobs'
 import { longDocument } from './cases/longDocument'
+import { memoryPerf } from './cases/memoryPerf'
 import { multiSpace } from './cases/multiSpace'
 import { nameCollisions } from './cases/nameCollisions'
 import { noteClasses } from './cases/noteClasses'
@@ -55,6 +56,7 @@ export const CASES: readonly CaseSpec[] = [
   longDocument,
   // agent memory / context
   agentContext,
+  memoryPerf,
   // import
   importThread,
   importLayout,

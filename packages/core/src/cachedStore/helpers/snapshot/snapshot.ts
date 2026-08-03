@@ -117,6 +117,13 @@ export class Snapshot {
     content: string,
     opts?: { index?: LinkIndex; deferReresolve?: boolean },
   ): boolean {
+    // A hidden source can never contribute to the user graph. Bail out before
+    // buildIndex(): deriving an agent-memory body would otherwise rebuild the
+    // O(user corpus) link index on every memory read, despite discarding that
+    // source at graph shape time. Also heal any stale pre-invariant edge bucket.
+    if (!this.isGraphVisibleId(sourceId)) {
+      return this.edgesBySource.delete(sourceId)
+    }
     // Index only graph-visible notes: a [[link]] to an agent-memory title must
     // ghost, never resolve into the hidden note. Folder path-aliases
     // let `[[oldpath/note]]` retarget after a folder rename.

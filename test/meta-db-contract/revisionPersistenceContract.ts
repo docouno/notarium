@@ -78,6 +78,11 @@ export const describeRevisionPersistenceContract = (
       expect(await persistence.get(second.id)).toEqual(second)
       expect(await persistence.latestFor('note-a')).toEqual(second)
       expect(await persistence.latestFor('missing')).toBeNull()
+      const latest = await persistence.latestForMany(['note-a', 'note-shared', 'missing', 'note-a'])
+      expect(latest.get('note-a')).toEqual(second)
+      expect(latest.get('note-shared')?.title).toBe('Shared blob')
+      expect(latest.has('missing')).toBe(false)
+      expect(await persistence.latestForMany([])).toEqual(new Map())
       expect(await persistence.content('hash-a')).toBe('body-a')
       expect(await persistence.content('hash-b')).toBe('body-b')
       expect(await persistence.content('missing')).toBeNull()
@@ -88,6 +93,24 @@ export const describeRevisionPersistenceContract = (
         items: [first],
         total: 2,
       })
+    })
+
+    it('accepts a latest-row set wider than SQLite host-variable limits', async () => {
+      const present = await persistence.append(
+        revision({ noteId: 'wide-present', contentHash: 'wide-hash', title: 'Wide present' }),
+        'wide body',
+      )
+      // 32,767 exceeds the MAX_VARIABLE_NUMBER of the SQLite runtime used by
+      // production. The port is unbounded, so every driver must treat this as
+      // one set rather than one SQL placeholder per requested note.
+      const ids = Array.from({ length: 32_767 }, (_, index) => `wide-missing-${index}`)
+      ids[16_384] = 'wide-present'
+      ids.push('wide-present') // duplicate semantics stay set-like at the same boundary
+
+      const latest = await persistence.latestForMany(ids)
+
+      expect([...latest.keys()]).toEqual(['wide-present'])
+      expect(latest.get('wide-present')).toEqual(present)
     })
 
     it('collapses deltas after class filtering and computes total/max over the filtered world', async () => {

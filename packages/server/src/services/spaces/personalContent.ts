@@ -43,27 +43,22 @@ export const listMemoryCategories = async (
     return []
   }
 
-  // modifiedAt fallback for a bare engine with no journal: the meta date.
-  const metaById = new Map(
-    (await store.list({ scope: READ_SCOPE.agentRecall })).map((m) => [m.id, m] as const),
-  )
+  const latestById = store.latestRevisions
+    ? await store.latestRevisions(index.map((entry) => entry.noteId))
+    : new Map()
 
   const out: Array<Omit<MemoryCategory, 'author'>> = []
 
   for (const entry of index) {
-    let modifiedAt = metaById.get(entry.noteId)?.modifiedAt ?? null
+    let modifiedAt = entry.modifiedAt
     let principal: string | null = null
     let kind: MemoryCategory['kind'] = null
+    const latest = latestById.get(entry.noteId)
 
-    if (store.revisions) {
-      const { items } = await store.revisions(entry.noteId, { offset: 0, limit: 1 })
-      const latest = items[0]
-
-      if (latest) {
-        principal = latest.principal
-        kind = latest.kind
-        modifiedAt = latest.createdAt
-      }
+    if (latest) {
+      principal = latest.principal
+      kind = latest.kind
+      modifiedAt = latest.createdAt
     }
     out.push({
       noteId: entry.noteId,
