@@ -184,7 +184,8 @@ describeVector('NotariumStore concurrent embed backfill', () => {
 
     try {
       store.suspendBackground()
-      await store.write({ title: 'Alpha', content: 'alpha unique body' })
+      const alpha = await store.write({ title: 'Alpha', content: 'alpha unique body' })
+      const alphaPath = alpha.filePath!
       await store.write({ title: 'Beta', content: 'beta unique body' })
       store.resumeBackground()
       // Both notes reach the gated embed (2 in flight).
@@ -193,7 +194,8 @@ describeVector('NotariumStore concurrent embed backfill', () => {
       }
       expect(state.gates.length).toBe(2)
       // Re-enqueue Alpha while its embed is still in flight (same content still re-enqueues).
-      await store.write({ title: 'Alpha', content: 'alpha unique body' })
+      // An edit by path, not a second create: the latter is refused onto an occupied path (#274).
+      await store.write({ title: 'Alpha', content: 'alpha unique body', originalId: alphaPath })
       // Free Beta's slot so the loop refills: it MUST skip the in-flight Alpha, not launch a
       // second concurrent Alpha embed. Give it several turns to (mis)behave.
       releaseGateFor(state, 'beta')

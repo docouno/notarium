@@ -154,3 +154,55 @@ describe('createLocalOnnxEmbedder', () => {
     expect(onOpts?.session_options?.enableCpuMemArena).toBe(true)
   })
 })
+
+// The signal a composition root asks before building an embedder (#317). It has to
+// answer from the tree, because everything else about this module is deliberately
+// lazy: construction never touches the package, so a hollow embedder built over a
+// missing install boots green and advertises capabilities.vector it cannot serve.
+// Before #317 the absent sqlite-vec made vec0 refuse and the engine dropped the
+// embedder; vec0 now ships in every profile, so nothing else is left to notice.
+describe('localEmbedderAvailable', () => {
+  // Drive the real resolver both ways rather than asserting today's install: this
+  // file runs on BOTH profiles, and the answer differs between them by design.
+  const withResolution = async (resolvable: boolean): Promise<boolean> => {
+    // The CommonJS Module object, not the ESM namespace: the namespace's bindings are
+    // read-only, and the resolver we need to steer is a property of the real module.
+    const { createRequire } = await import('node:module')
+    const mod = createRequire(import.meta.url)('node:module') as {
+      _resolveFilename: (request: string, ...rest: unknown[]) => string
+    }
+    const real = mod._resolveFilename
+
+    mod._resolveFilename = function (request: string, ...rest: unknown[]) {
+      if (request === '@huggingface/transformers') {
+        if (!resolvable) {
+          throw new Error("Cannot find package '@huggingface/transformers'")
+        }
+
+        return '/fake/transformers/index.js'
+      }
+
+      return real.call(this, request, ...rest)
+    }
+    try {
+      // A fresh module instance per probe: the real one caches, and the cache is
+      // correct in production (an install cannot appear mid-process) but would make
+      // the second case here read the first case's answer.
+      vi.resetModules()
+
+      const fresh = await import('./localOnnxEmbedder')
+
+      return fresh.localEmbedderAvailable()
+    } finally {
+      mod._resolveFilename = real
+    }
+  }
+
+  it('reports false where the embedder package cannot be resolved', async () => {
+    expect(await withResolution(false)).toBe(false)
+  })
+
+  it('reports true where it can', async () => {
+    expect(await withResolution(true)).toBe(true)
+  })
+})

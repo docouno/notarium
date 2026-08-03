@@ -11,7 +11,7 @@
   "author": "Sergey Padurets",
   "scripts": {
     "deps:lean": "npm ci --include-workspace-root --workspace=notarium --workspace=@notarium/contract --workspace=@notarium/core --workspace=@notarium/desktop --workspace=@notarium/engine --workspace=@notarium/engine-memory --workspace=@notarium/server --workspace=@notarium/web --prefer-offline --no-audit --fund=false",
-    "deps:full": "npm ci --prefer-offline --no-audit --fund=false",
+    "deps:full": "ONNXRUNTIME_NODE_INSTALL=skip npm ci --prefer-offline --no-audit --fund=false",
     "dev": "concurrently -k -n server,web -c blue,magenta \"PORT=${API_PORT:-3001} tsx watch packages/server/src/apps/server/main.ts\" \"npm run dev -w @notarium/web\"",
     "dev:tunnel": "VITE_PORT=${PORT:-3000} HMR_CLIENT_PORT=443 npm run dev",
     "server": "tsx packages/server/src/apps/server/main.ts",

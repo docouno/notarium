@@ -8,7 +8,10 @@
 #
 # Two lanes, deliberately different in cost and in what they promise:
 #
-#   lean      — the fast contract on the no-vector profile. What every change gets.
+#   lean      — the fast contract on the no-embedder profile. What every change gets.
+#               It DOES exercise vec0: the extension installs in every profile, and a
+#               red vector suite here is a real answer about the change, not an
+#               environment artefact (#317).
 #   extended  — the full-dependency, live-service, browser and image layers. Runs on
 #               the events that can change its answer — a release tag, a rehearsal
 #               tag, or a change landing on the default branch — and on demand
@@ -156,9 +159,11 @@ lean:build:
 
 # --- extended ----------------------------------------------------------------
 # The full dependency profile is not optional here: the license corpus validates the
-# complete production tree, and the vector suites need the native stack. The Dockerfile's
-# `test` stage already is that environment, and building it proves the production build
-# on the way through `builder`.
+# complete production tree, so it reads manifests that only arrive with the embedder
+# carrier. That is the whole of it since #317 — the vector suites moved into the lean
+# lane, because a gate closed on every lean run reports on `main` instead of on the
+# change. The Dockerfile's `test` stage already is that environment, and building it
+# proves the production build on the way through `builder`.
 extended:unit:
   stage: extended
   extends: [.dind, .heavy, .extended-rules]

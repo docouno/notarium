@@ -304,14 +304,21 @@ test('expanding a folder BELOW the open note does NOT move the scroll (symmetry 
   await expect(active).toBeVisible()
   await setScrollTop(page, 0) // active note near the top, in view
 
-  // Collapse then expand a folder BELOW the active note (area-05). This never moved
-  // the scroll even before the fix (a below reflow leaves activeIndex untouched) —
-  // lock it so a future change can't regress the symmetric half.
-  await folderTwisty(page, 'area-05').click()
-  await folderTwisty(page, 'area-05').click()
-  await expect(
-    page.locator('[data-testid="tree-note"][data-id="fake-area-05-note-1"]'),
-  ).toBeVisible()
+  // Collapse then expand the nearest folder BELOW the active note. Wait for its
+  // listing first: otherwise lazy listings above a farther target can push that
+  // target outside the viewport between setup and click, and Playwright's click
+  // actionability will scroll to it — measuring the test driver, not the reflow.
+  const belowNote = page.locator('[data-testid="tree-note"][data-id="fake-area-02-note-1"]')
+  await expect(belowNote).toBeVisible()
+  const belowFolder = folderTwisty(page, 'area-02')
+  await expect(belowFolder).toBeInViewport()
+
+  // This never moved the scroll even before the fix (a below reflow leaves
+  // activeIndex untouched) — lock it so a future change can't regress the
+  // symmetric half.
+  await belowFolder.click()
+  await belowFolder.click()
+  await expect(belowNote).toBeVisible()
   await expect.poll(() => scrollTopOf(page)).toBe(0)
   await expect(active).toBeInViewport()
 })

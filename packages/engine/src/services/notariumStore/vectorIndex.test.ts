@@ -158,12 +158,14 @@ describeVector('NotariumStore vector indexing', () => {
     })
 
     try {
-      await store.write({ title: 'Stable', content: 'unchanging prose.' })
+      const filePath = await writePath(store, { title: 'Stable', content: 'unchanging prose.' })
       await store.whenVectorsSettled()
       const afterFirst = counter.textCount
       expect(afterFirst).toBe(1)
-      // Re-save identical content (a plain upsert): same content_hash → skip.
-      await store.write({ title: 'Stable', content: 'unchanging prose.' })
+      // Re-save identical content onto the SAME note: same content_hash → skip. Addressed by
+      // originalId because a second create onto an occupied path is refused (#274) — a touch
+      // is an edit, which is also how every channel that re-saves reaches the engine.
+      await store.write({ title: 'Stable', content: 'unchanging prose.', originalId: filePath })
       await store.whenVectorsSettled()
       expect(counter.textCount).toBe(afterFirst) // no new embed
       expect(await vecCount(sql)).toBe(1)
@@ -963,8 +965,9 @@ describeVector('NotariumStore vector indexing', () => {
         [fp],
       )
       expect(r!.e).toBe(r!.c)
-      // Touch identical content (a plain upsert): same hash → no re-embed.
-      await store.write({ title: 'Multi', content: 'alpha\n---\nbeta' })
+      // Touch identical content on the same note (an edit — see the single-chunk case):
+      // same hash → no re-embed.
+      await store.write({ title: 'Multi', content: 'alpha\n---\nbeta', originalId: fp })
       await store.whenVectorsSettled()
       expect(counter.textCount).toBe(2)
       expect(await vecCount(sql)).toBe(2)

@@ -1,7 +1,7 @@
 # Notarium — single entry point for everything Docker.
 #
 # `make` runs the containerised stack; for host work use the npm scripts directly
-# (`npm install`, `npm run dev`, `npm run build`) — they are not proxied here on
+# (`npm run deps:lean`, `npm run dev`, `npm run build`) — they are not proxied here on
 # purpose.
 #
 #   make            # list targets
@@ -38,17 +38,29 @@ HOST_GID   ?= $(shell id -g)
 # provider has to reach the same two commands — one definition, or the lean workspace
 # list silently forks between this file and a YAML nobody diffs.
 #
-# Default install is NO-VECTOR: every workspace EXCEPT the deps-only carrier
-# @notarium/engine-vector, so the ~660MB onnxruntime/transformers/sqlite-vec subtree
-# is never downloaded into this checkout (about 60% of node_modules). npm has no
+# Default install is NO-EMBEDDER: every workspace EXCEPT the deps-only carrier
+# @notarium/engine-vector, so the ~360MB onnxruntime/transformers subtree is never
+# downloaded into this checkout. npm has no
 # per-package omit and `--omit=optional` is too blunt (it also strips the platform
 # binaries esbuild/rollup/sharp/the eslint resolver need); excluding one whole
-# workspace is the clean, deterministic lever. `make deps-vector` (and the Docker
-# image's plain `npm ci`) install the carrier too, and npm hoists the vector stack
-# to the root node_modules where the engine resolves it. A no-vector checkout
+# workspace is the clean, deterministic lever. `make deps-vector` and both Docker
+# install stages call `deps:full`, which installs the carrier too and hoists the embedder
+# to the root node_modules where the engine resolves it. A no-embedder checkout
 # degrades to FTS at runtime — pair it with VECTOR_SEARCH=off (the dev overlay
 # default). Keep `deps:lean`'s list in sync with the workspaces under packages/
 # (minus engine-vector) when a package is added or removed.
+#
+# That full profile is CPU-only by product contract. onnxruntime-node otherwise runs a
+# postinstall download for ~302MB of unused CUDA/TensorRT providers from a NuGet CDN;
+# `deps:full` sets the upstream ONNXRUNTIME_NODE_INSTALL=skip switch so installs depend
+# on the lockfile's registry artifacts only. Keep every full-install caller on that
+# script — a bare `npm ci` silently reintroduces both dead weight and a second host.
+#
+# vec0 itself (sqlite-vec, 200KB) is an ordinary @notarium/engine dependency and
+# ships in BOTH profiles — it costs nothing, and excluding it used to close the
+# vec0 gate on every default run, so 47 tests that need no embedder at all (a
+# deterministic mock stands in for one) went unexercised until a change reached
+# main (#317).
 
 # --- layered compose command ------------------------------------------------
 DIR  := docker
@@ -124,14 +136,22 @@ migration-check:
 	  exit 2; \
 	fi
 
-deps: ## Install npm dependencies for this checkout (no-vector by default) when missing or stale
-	@if node -e 'const fs = require("fs"); const path = require("path"); const root = process.cwd(); const packages = ["contract", "core", "desktop", "engine", "engine-memory", "server", "web"]; const bin = path.join(root, "node_modules", ".bin", "tsc"); if (!fs.existsSync(bin)) process.exit(1); for (const pkg of packages) { const link = path.join(root, "node_modules", "@notarium", pkg); const expected = path.join(root, "packages", pkg); if (!fs.existsSync(link) || fs.realpathSync(link) !== expected) process.exit(1); } const cli = path.join(root, "node_modules", "notarium"); if (!fs.existsSync(cli) || fs.realpathSync(cli) !== path.join(root, "packages", "cli")) process.exit(1);' 2>/dev/null; then \
+# The freshness probe checks workspace LINKS, not the lockfile — a full `npm ci` on
+# every `make dev` would cost a minute for nothing. The price is that a dependency
+# added to a manifest is invisible to it, so a checkout that installed before the
+# change keeps a tree without the new package and this target cheerfully reports ok.
+# `sqlite-vec` is therefore probed by name (#317): it arrived as a new @notarium/engine
+# dependency, and a checkout that silently lacks it closes the vec0 gate and skips 47
+# suites under a message that blames the platform. Probe the package the gate actually
+# loads, not the manifest — a hoisted tree is what the gate sees.
+deps: ## Install npm dependencies for this checkout (embedder excluded) when missing or stale
+	@if node -e 'const fs = require("fs"); const path = require("path"); const root = process.cwd(); const packages = ["contract", "core", "desktop", "engine", "engine-memory", "server", "web"]; const bin = path.join(root, "node_modules", ".bin", "tsc"); if (!fs.existsSync(bin)) process.exit(1); for (const pkg of packages) { const link = path.join(root, "node_modules", "@notarium", pkg); const expected = path.join(root, "packages", pkg); if (!fs.existsSync(link) || fs.realpathSync(link) !== expected) process.exit(1); } const cli = path.join(root, "node_modules", "notarium"); if (!fs.existsSync(cli) || fs.realpathSync(cli) !== path.join(root, "packages", "cli")) process.exit(1); if (!fs.existsSync(path.join(root, "node_modules", "sqlite-vec", "package.json"))) process.exit(1);' 2>/dev/null; then \
 	  echo "deps: node_modules ok"; \
 	else \
 	  npm run deps:lean; \
 	fi
 
-deps-vector: ## Install deps INCLUDING the optional native vector stack — for vector/hybrid-search work
+deps-vector: ## Install deps INCLUDING the optional CPU embedder (~360MB) — for embedding work and the license corpus
 	npm run deps:full
 
 doctor: deps prepare ## Validate host deps, dev compose, and container runtime assumptions
@@ -166,9 +186,9 @@ sh: ## Open a shell inside the notarium container
 	$(COMPOSE_DEV) exec notarium /bin/sh
 
 # --- complete build + unit coverage -----------------------------------------
-# Coverage needs the full dependency profile: a default host checkout omits
-# sqlite-vec, which honestly skips the vector suite and cannot reach the engine
-# ratchet. The test image is glibc + every workspace dependency, proves the
+# Coverage needs the full dependency profile: a default host checkout omits the
+# embedder carrier, so the license corpus cannot read the native manifests it
+# validates. The test image is glibc + every workspace dependency, proves the
 # production build on its way through the builder stage, then drops to the
 # unprivileged node user. It leaves the live dev stand's bind-mounted node_modules
 # untouched. Makefile, scripts/ and README.md are test inputs excluded from the

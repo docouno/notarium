@@ -12,6 +12,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@notarium/core": "*"
+    "@notarium/core": "*",
+    "sqlite-vec": "^0.1.9"
   }
 }

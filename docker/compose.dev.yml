@@ -41,12 +41,12 @@ services:
       # host→container boundary.
       CHOKIDAR_USEPOLLING: "true"
       # Vector/hybrid search default for the DEV stand (#200). The code default is
-      # `on`, but the default host install (`make deps`) omits the ~660MB native
-      # vector stack — so on a no-vector checkout an `on` here would build an embedder,
-      # fail to load vec0/onnx, and log a degradation error per space on boot. Default
-      # the dev overlay to `off` so the lightweight stand is cleanly FTS-only. For
-      # vector work: `make deps-vector` to install the stack, then set VECTOR_SEARCH=on
-      # in .env (it wins via ${VECTOR_SEARCH:-off}).
+      # `on`, but the default host install (`make deps`) omits the ~360MB embedder — so
+      # on a lean checkout an `on` here buys nothing: the composition root finds no
+      # embedder, says so once, and serves FTS anyway (#317). Default the dev overlay
+      # to `off` so the lightweight stand is cleanly FTS-only without that line. For
+      # embedding work: `make deps-vector` to install the stack, then set
+      # VECTOR_SEARCH=on in .env (it wins via ${VECTOR_SEARCH:-off}).
       VECTOR_SEARCH: ${VECTOR_SEARCH:-off}
     volumes:
       # Keep dev runtime resolution identical to host checks: each checkout owns its

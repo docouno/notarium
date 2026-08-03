@@ -17,6 +17,7 @@ export {
 export {
   createEmbedPool,
   createLocalOnnxEmbedder,
+  localEmbedderAvailable,
   type Embedder,
   type EmbedKind,
   type EmbedPoolOptions,

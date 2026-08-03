@@ -32,10 +32,17 @@ export const createNodeSqliteDriver = (
   const db = opts.vec ? new DatabaseSync(path, { allowExtension: true }) : new DatabaseSync(path)
 
   if (opts.vec) {
-    // sqlite-vec is an OPTIONAL native dependency, require'd lazily ONLY when the
-    // vector channel is requested — so a host that never enables it (and never
-    // installed the platform binary, e.g. the alpine dev image today) still loads
-    // this driver without the package present. node:sqlite gates extension loading
+    // sqlite-vec is require'd lazily, ONLY when the vector channel is requested — so a
+    // host that cannot dlopen the extension still loads this driver and degrades
+    // instead of failing to boot. The package itself is an ordinary dependency and
+    // always present (#317; the excludable install unit is the embedder), so what is
+    // conditional here is the PLATFORM: the prebuilt binaries are glibc-only. Every
+    // environment this repo ships — dev (node:24-slim), both CI lanes, the published
+    // image — is glibc, so no REAL host in the contour takes this branch; a musl host
+    // is a legitimate deployment we support by degrading, not one we run on.
+    // vectorGate.test.ts drives it with a forced resolver failure, which proves the
+    // gate classifies the two failures apart but not that a musl host truly degrades.
+    // node:sqlite gates extension loading
     // twice (allowExtension in the ctor AND an explicit enable); sqlite-vec.load()
     // then calls db.loadExtension(vec0.so). Re-disable right after so nothing but
     // our trusted bundled binary can ever load (#76 second perimeter).

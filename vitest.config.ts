@@ -51,6 +51,23 @@ export default defineConfig({
       // `*.fixture.ts` is test scaffolding, not shipped code — the canon counts it as a
       // concern file, and measuring it would hold product thresholds against branches
       // only the other install profile ever takes.
+      //
+      // The Postgres driver half is excluded for the same reason one step further out:
+      // NOTHING in this run can execute it. Its contracts live in `npm run test:pg`
+      // against a live database (CI's own `extended:postgres` job), which this run skips
+      // wholesale, so every function in that subtree is a structural zero rather than a
+      // gap someone could close. Counting them made the server threshold measure how
+      // much Postgres code exists instead of how well the code under test is covered —
+      // and it moved without anyone writing an untested line. V8 compiles lazily, so an
+      // uninstantiated driver counts as one wrapper function; `metaDb.test.ts` reaches
+      // `new PgMetaDb(...)` through `createMetaDb('postgres://…')`, the facade methods
+      // materialise, and each one lands as an uncovered function it was not before.
+      // That silent shift is what took server functions from 87.5% to 77.65%. The
+      // tradeoff, stated plainly: this subtree now has no ratchet of its own. It never
+      // had one — only a share of the group aggregate, which is a floor that moves when
+      // unrelated server code is added or tested, and which said nothing about whether
+      // a Postgres driver was covered. What is lost is that indirect pull; what is
+      // gained is a number that means what it says about the code the run can execute.
       exclude: [
         '**/*.{test,spec}.ts',
         '**/*.fixture.ts',
@@ -58,19 +75,30 @@ export default defineConfig({
         '**/index.ts',
         '**/types.ts',
         '**/consts.ts',
+        'packages/server/src/services/metaDb/drivers/pg/**',
+        'packages/server/src/services/metaDb/pgMetaDb.ts',
+        'packages/server/src/services/metaDb/migrations/runPgMigrations.ts',
       ],
       reporter: ['text-summary', 'json-summary', 'html'],
       reportsDirectory: './coverage',
       // Ratchet floors from the 2026-07-11 baseline (measured lines/branches/funcs):
-      // contract 100/100/100 · core 94/88/99 · engine 88/87/97 · engine-memory 94/88/95
-      // · server 73/78/89. Set just under measured so decomposition can't silently
-      // drop coverage; raise as the vertical pass converts integration→unit tests.
+      // contract 100/100/100 · core 94/88/99 · engine 88/87/97 · engine-memory 94/88/95.
+      // Set just under measured so decomposition can't silently drop coverage; raise as
+      // the vertical pass converts integration→unit tests.
+      //
+      // Server is re-baselined at 2026-08-04 (82/79/90 measured) because #317 changed
+      // its measurement BASIS, not its quality: dropping the unexecutable Postgres
+      // subtree removed ~2100 lines and ~160 functions from the denominator, so the old
+      // 70/74/86 floors — set just under a number computed over that subtree — stopped
+      // binding on the code that remains. Leaving them would have kept a ratchet that
+      // ratchets nothing: thousands of untested lines could land under an unchanged
+      // green floor, which is precisely the failure #317 exists to close.
       thresholds: {
         'packages/contract/src/**': { lines: 97, statements: 97, functions: 97, branches: 95 },
         'packages/core/src/**': { lines: 91, statements: 91, functions: 96, branches: 85 },
         'packages/engine/src/**': { lines: 84, statements: 84, functions: 95, branches: 84 },
         'packages/engine-memory/src/**': { lines: 90, statements: 90, functions: 92, branches: 85 },
-        'packages/server/src/**': { lines: 70, statements: 70, functions: 86, branches: 74 },
+        'packages/server/src/**': { lines: 81, statements: 81, functions: 89, branches: 78 },
       },
     },
   },

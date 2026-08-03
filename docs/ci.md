@@ -53,9 +53,17 @@ act instead.
 
 **The full dependency profile is not optional in the extended lane.** Since the
 license corpus validates the complete production tree, `test/release/licenseCorpus.test.ts`
-is red on a lean install; the vector suites need the native stack. `deps:lean` and
+cannot run on a lean install: it reads manifests that only arrive with the embedder
+carrier, so its gate stays closed there. The vec0 suites, by contrast, moved back into
+the lean lane in #317 — a gate closed on every lean run is a gate that reports on `main`
+instead of on the change (#274 reached `main` that way). What the lean lane still cannot
+answer is exactly two things, and both have their own extended job: that license corpus,
+and the live-Postgres dialect contracts behind `extended:postgres`. `deps:lean` and
 `deps:full` are npm scripts precisely so the Makefile, this pipeline and the future
 public gate cannot drift apart on what "install" means.
+The full script is also the single CPU-only install contract: it disables
+onnxruntime-node's default CUDA/TensorRT postinstall download, which the product cannot
+use and which would otherwise add a second package host to the extended gate.
 
 **Publishing is a human decision on a tree the gate has already passed — but not a
 human command.** Both release jobs are manual and sit in a later stage than `verify`,

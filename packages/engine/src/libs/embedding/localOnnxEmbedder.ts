@@ -9,6 +9,7 @@
 // never pays for the model. `id` folds model + quantization into the index key
 // (P13): change either and the vector space changes → rebuild.
 
+import { createRequire } from 'node:module'
 import { availableParallelism } from 'node:os'
 
 import type { Embedder, EmbedKind } from './types'
@@ -51,6 +52,32 @@ type TransformersModule = {
 // `: string` (not the narrowed literal) is load-bearing: it keeps `import()` below
 // unresolved-by-tsc so the module stays optional at the type layer too.
 const TRANSFORMERS_MODULE: string = '@huggingface/transformers'
+
+/** Is the optional embedder stack installed in THIS tree? A composition root must ask
+ *  before it builds an embedder, because construction here is deliberately cheap and
+ *  lazy: the model is fetched on first embed(), so a hollow embedder built over a
+ *  missing package looks healthy until the first note is indexed — and by then the
+ *  store has already advertised `capabilities.vector` (#317).
+ *
+ *  Resolution, not a load: `require.resolve` answers "is the package on disk" without
+ *  paying the ~360MB stack's initialisation. Cached because an install cannot appear
+ *  mid-process. This is the DIRECT signal for the FTS degradation; until #317 the
+ *  degradation rode on `sqlite-vec` being absent from the same carrier, which stopped
+ *  being true when vec0 moved into every profile. */
+let embedderResolvable: boolean | undefined
+
+export const localEmbedderAvailable = (): boolean => {
+  if (embedderResolvable === undefined) {
+    try {
+      createRequire(import.meta.url).resolve(TRANSFORMERS_MODULE)
+      embedderResolvable = true
+    } catch {
+      embedderResolvable = false
+    }
+  }
+
+  return embedderResolvable
+}
 
 export type LocalOnnxEmbedderOptions = {
   /** HF model id (transformers.js-compatible ONNX). Default Xenova/bge-m3. */

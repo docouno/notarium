@@ -65,7 +65,7 @@ in packages/web/public/licenses/THIRD_PARTY_NOTICES.txt.
 | base64-js | 1.5.1 | MIT |
 | body-parser | 2.3.0 | MIT |
 | boolean | 3.2.0 | MIT |
-| brace-expansion | 5.0.8 | MIT |
+| brace-expansion | 5.0.9 | MIT |
 | buffer | 6.0.3 | MIT |
 | buffer-crc32 | 1.0.0 | MIT |
 | bytes | 3.1.2 | MIT |
@@ -118,8 +118,8 @@ in packages/web/public/licenses/THIRD_PARTY_NOTICES.txt.
 | fast-fifo | 1.3.2 | MIT |
 | fast-json-stringify | 7.0.1 | MIT |
 | fast-querystring | 1.1.2 | MIT |
-| fast-uri | 3.1.4 | BSD-3-Clause |
-| fast-uri | 4.1.1 | BSD-3-Clause |
+| fast-uri | 3.1.5 | BSD-3-Clause |
+| fast-uri | 4.1.2 | BSD-3-Clause |
 | fastify | 5.10.0 | MIT |
 | fastify-plugin | 6.0.0 | MIT |
 | fastq | 1.20.1 | ISC |
@@ -4314,7 +4314,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 ---
 
-## brace-expansion  5.0.8  —  MIT
+## brace-expansion  5.0.9  —  MIT
 https://github.com/juliangruber/brace-expansion
 
 ### LICENSE
@@ -6488,7 +6488,7 @@ DEALINGS IN THE SOFTWARE.
 
 ---
 
-## fast-uri  3.1.4  —  BSD-3-Clause
+## fast-uri  3.1.5  —  BSD-3-Clause
 Vincent Le Goff <vince.legoff@gmail.com> (https://github.com/zekth) · https://github.com/fastify/fast-uri
 
 ### LICENSE
@@ -6528,7 +6528,7 @@ The complete list of contributors can be found at:
 
 ---
 
-## fast-uri  4.1.1  —  BSD-3-Clause
+## fast-uri  4.1.2  —  BSD-3-Clause
 Vincent Le Goff <vince.legoff@gmail.com> (https://github.com/zekth) · https://github.com/fastify/fast-uri
 
 ### LICENSE

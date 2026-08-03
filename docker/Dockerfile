@@ -49,19 +49,22 @@ COPY packages/core/package.json packages/core/
 COPY packages/desktop/package.json packages/desktop/
 COPY packages/engine/package.json packages/engine/
 COPY packages/engine-memory/package.json packages/engine-memory/
-# @notarium/engine-vector is the deps-only carrier for the vector stack (sqlite-vec,
-# @huggingface/transformers + onnxruntime, ~660MB). The engine loads these
-# DYNAMICALLY and declares no static dep on them — this carrier owns the declaration.
-# The image ships the FULL install (a plain `npm ci` over ALL workspaces) so an
-# operator can flip `-e VECTOR_SEARCH=on` without rebuilding; npm hoists the vector
-# packages to the root node_modules where the engine resolves them at runtime. Its
-# manifest MUST be present before `npm ci` or the carrier's deps never install. (The
-# lightweight host profile instead runs `make deps`, which excludes this one
-# workspace — see the Makefile.)
+# @notarium/engine-vector is the deps-only carrier for the embedder
+# (@huggingface/transformers + CPU-only onnxruntime, ~360MB). The engine loads it DYNAMICALLY
+# and declares no static dep on it — this carrier owns the declaration. vec0 itself
+# (sqlite-vec) is NOT here: it is an ordinary @notarium/engine dependency and arrives
+# with that workspace either way. The image ships the FULL profile through the
+# canonical `deps:full` script so an operator can flip `-e VECTOR_SEARCH=on` without
+# rebuilding; npm hoists the embedder to the root node_modules where the engine
+# resolves it at runtime. That script also disables onnxruntime-node's unused
+# CUDA/TensorRT postinstall download; a bare `npm ci` would add ~302MB and a NuGet CDN
+# dependency to this gate. The carrier manifest MUST be present before the install or
+# its deps never arrive. (The lightweight host profile instead runs `make deps`, which
+# excludes this one workspace — see the Makefile.)
 COPY packages/engine-vector/package.json packages/engine-vector/
 COPY packages/server/package.json packages/server/
 COPY packages/web/package.json packages/web/
-RUN npm ci
+RUN npm run deps:full
 
 # Bundle the SPA (vite → packages/web/dist) and the server (tsup →
 # packages/server/dist, workspace TS inlined).
@@ -127,15 +130,17 @@ COPY packages/core/package.json packages/core/
 COPY packages/desktop/package.json packages/desktop/
 COPY packages/engine/package.json packages/engine/
 COPY packages/engine-memory/package.json packages/engine-memory/
-# @notarium/engine-vector carries the vector stack (sqlite-vec, @huggingface/transformers)
-# as its regular `dependencies`, so `--omit=dev` still installs them (only dev
-# deps are dropped) — but only if this workspace's manifest is present before `npm ci`.
-# npm hoists the vector packages to the root node_modules where the bundled server
-# loads them at runtime when VECTOR_SEARCH=on.
+# @notarium/engine-vector carries the embedder (@huggingface/transformers + its
+# onnxruntime backend) as its regular `dependencies`, so `--omit=dev` still installs
+# them (only dev deps are dropped) — but only if this workspace's manifest is present
+# before the canonical `deps:full` install. npm hoists the CPU-only embedder to the root
+# node_modules where the bundled server loads it at runtime when VECTOR_SEARCH=on. vec0
+# (sqlite-vec) rides
+# @notarium/engine's own dependencies and needs no carrier.
 COPY packages/engine-vector/package.json packages/engine-vector/
 COPY packages/server/package.json packages/server/
 COPY packages/web/package.json packages/web/
-RUN npm ci --omit=dev && npm cache clean --force
+RUN npm run deps:full -- --omit=dev && npm cache clean --force
 
 # The bundled server + the built SPA. No .env — config comes from the environment.
 COPY --from=builder /app/packages/server/dist ./packages/server/dist

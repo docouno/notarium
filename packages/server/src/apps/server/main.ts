@@ -3,7 +3,12 @@
 import { availableParallelism } from 'node:os'
 import { dirname, join } from 'node:path'
 
-import { createEmbedPool, createLocalOnnxEmbedder, type Embedder } from '@notarium/engine'
+import {
+  createEmbedPool,
+  createLocalOnnxEmbedder,
+  type Embedder,
+  localEmbedderAvailable,
+} from '@notarium/engine'
 
 import { backupControlSocketFromEnv } from '../../libs/backupControl'
 import { loadEnv } from '../../libs/env'
@@ -53,8 +58,10 @@ if (AUTH_MODE !== 'password' && AUTH_MODE !== 'none') {
 }
 // Vector/hybrid search: on by default; VECTOR_SEARCH=off runs FTS-only (no model
 // loaded). One shared local ONNX embedder is built here at the composition root,
-// fetched lazily on the first background embed; where native deps can't load (musl)
-// the engine degrades to FTS. EMBED_MODEL and EMBED_DIMENSIONS go TOGETHER — a
+// fetched lazily on the first background embed. Two things can still take the
+// capability away, and both degrade rather than fail: the embedder not being
+// installed (checked below) and vec0's native binary not loading on this platform
+// (checked by the engine). EMBED_MODEL and EMBED_DIMENSIONS go TOGETHER — a
 // width mismatch fails closed (vec0 insert rejects, note stays FTS-only) rather
 // than corrupting the index. Changing the model re-embeds the corpus (index
 // self-rebuilds on embedder-id drift). An asymmetric model (e5) also needs
@@ -117,9 +124,23 @@ const embedderOpts = {
 // Build the worker-pool embedder; degrade to a SINGLE in-process embedder if the
 // pool can't stand up — honest degradation (P13): a broken pool costs throughput,
 // not correctness, and must not crash-loop the boot. canon: docs/architecture.md#p13
+//
+// Build NOTHING when the optional stack is not installed, and say so once. Asking
+// here rather than letting the engine find out is what keeps `capabilities.vector`
+// honest: embedder construction is lazy by design (the model loads on first embed),
+// so a hollow embedder over a missing package boots green, advertises vector/hybrid
+// to the UI and to agents, and only fails one note at a time afterwards. Until #317
+// this could not happen — the same carrier also held sqlite-vec, so vec0 refused to
+// load and createNotariumStore dropped the embedder. vec0 ships in every profile now,
+// so the check has to name the thing it actually depends on. canon: docs/search.md
 let embedder: Embedder | undefined
 
-if (VECTOR_SEARCH) {
+if (VECTOR_SEARCH && !localEmbedderAvailable()) {
+  console.error(
+    '[notarium] vector search requested but the embedder is not installed — running FTS-only.',
+    'Install it with `make deps-vector`, or set VECTOR_SEARCH=off to silence this.',
+  )
+} else if (VECTOR_SEARCH) {
   try {
     embedder = createEmbedPool({
       ...embedderOpts,

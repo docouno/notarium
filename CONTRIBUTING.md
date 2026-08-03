@@ -12,30 +12,32 @@ npm workspaces, nine packages:
 | `@notarium/contract` | The executable wire contract for `/api/*` and the MCP tools: zod schemas plus inferred types, one source of truth. |
 | `@notarium/core` | The host-agnostic domain core: the `KnowledgeStore` port, the read model, and pure services (identity, journal, visibility, graph). No Node, fs, HTTP or React. |
 | `@notarium/engine` | `NotariumStore` — the canonical in-process engine: markdown as truth plus a derived SQLite/FTS5 index. |
-| `@notarium/engine-vector` | The optional native vector stack (`onnxruntime` + `sqlite-vec`). Separated precisely so a default install does not pull ~660 MB of binaries. |
+| `@notarium/engine-vector` | The optional CPU embedder (`@huggingface/transformers` + `onnxruntime`). Separated precisely so a default install does not pull ~360 MB of binaries. The `vec0` extension is not here — it is an ordinary engine dependency and installs everywhere. |
 | `@notarium/engine-memory` | `InMemoryStore` — a reference implementation of the port and an executable spec for deterministic tests. |
 | `@notarium/server` | The Fastify host: REST over `KnowledgeStore`, the SPA static files, the MCP gateway, and the admin CLI. |
 | `@notarium/web` | The React SPA (Vite): CodeMirror 6, the graph, virtualization. |
 | `@notarium/desktop` | A stub Electron shell — empty at MVP, no code yet. |
 
-The split that trips people up first is `engine` vs `engine-vector`: semantic search needs the native stack *installed* **and** `VECTOR_SEARCH=on`. `make deps` deliberately skips the native stack; `make deps-vector` and the Docker image include it. With `on` but no stack, search degrades to full-text rather than failing.
+The split that trips people up first is `engine` vs `engine-vector`: semantic search needs the embedder *installed* **and** `VECTOR_SEARCH=on`. `make deps` deliberately skips the embedder; `make deps-vector` and the Docker image include it. With `on` but no embedder, the server says so once at boot and serves full-text rather than failing. The `vec0` extension is not part of that split — it installs either way, so the vector test suites run on a default checkout.
 
 ## Working on the host
 
 Node 24 is expected.
 
 ```bash
-npm run deps:lean      # or `npm install` — see the note below
+npm run deps:lean      # default: no embedder
 npm run dev            # → http://localhost:3000
 npm run dev:tunnel     # the same behind an HTTPS tunnel (see ALLOWED_HOSTS below)
 npm run server         # one Fastify process → http://localhost:3000
 npm run build && npm start
 ```
 
-A bare `npm install` installs every workspace, and that includes `engine-vector` — so it
-pulls the ~660 MB native stack this file says a default install skips. `deps:lean` is the
-default install the split was made for; `npm run deps:full` (or `make deps-vector`) adds
-the native stack when you actually need semantic search.
+`deps:lean` is the default install the split was made for; `npm run deps:full` (or
+`make deps-vector`) adds the ~360 MB embedder when you actually need semantic search.
+Use that script rather than a bare `npm ci`: onnxruntime-node otherwise downloads
+another ~302 MB of CUDA/TensorRT providers from NuGet during postinstall, while
+Notarium's embedder has no GPU execution-provider path. When changing a manifest with
+`npm install`, set `ONNXRUNTIME_NODE_INSTALL=skip` for the same reason.
 
 **The app answers on `3000` in every mode** — in production that is Fastify itself, in dev it is Vite with the backend behind the proxy on `3001`, so the URL you open never changes. `npm run dev` moves them with `VITE_PORT` and `API_PORT`; `npm run server` and `npm start` use `PORT`. `dev:tunnel` is the exception and takes the web port from `PORT` (it has to hand the same number to the HMR client, so it sets `VITE_PORT` itself).
 
@@ -56,7 +58,7 @@ npm run e2e            # Playwright; e2e:docker / visual run in a container
 
 `package.json` is the authoritative list of scripts.
 
-`npm test` skipping tests is expected, and the run tells you why — the last line names each closed gate and the command that opens it. Those suites need the optional native vector stack or a live database; `make checkup` runs every one of them. See [dev-environment.md](docs/dev-environment.md#invariants).
+`npm test` skipping tests is expected, and the run tells you why — the last line names each closed gate, and whether you can do anything about it. A gate that names a command wants an install (a live database, the optional embedder, or — on a checkout older than the change that made `sqlite-vec` universal — a plain `npm run deps:lean`); `make checkup` opens every one of them. A gate that names a platform instead is a verdict, not a chore: `vec0`'s prebuilt binary is glibc-only, so on musl those suites cannot run here at all. See [dev-environment.md](docs/dev-environment.md#invariants).
 
 ## Working in Docker
 
@@ -67,7 +69,7 @@ npm run e2e            # Playwright; e2e:docker / visual run in a container
 | `make dev` | dev stack with HMR |
 | `make up` / `down` | prod image locally / stop and remove |
 | `make logs` / `ps` / `sh` | logs / status / a shell in the container |
-| `make deps` / `deps-vector` | install dependencies without / with the native vector stack |
+| `make deps` / `deps-vector` | install dependencies without / with the ~360 MB CPU embedder |
 | `make test-coverage` | production build + full coverage, including native vector and permission tests, in an isolated unprivileged Docker stage |
 | `make checkup` | every portable code gate: static checks, full containerized coverage/build, live Postgres, backup smoke, container-native e2e; visual is also compared when its external baselines are present |
 | `make test-pg` | ephemeral Postgres + live meta-DB contracts/migrations |

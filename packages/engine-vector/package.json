@@ -4,9 +4,8 @@
   "license": "AGPL-3.0-only",
   "private": true,
   "type": "module",
-  "description": "Deps-only carrier for the OPTIONAL native vector stack (#200): @huggingface/transformers (+ its onnxruntime backend, ~660MB) and sqlite-vec. @notarium/engine loads these DYNAMICALLY, so it declares no static dependency on them — this workspace owns the declaration instead, which lets the default dev install skip the whole subtree by excluding this one workspace (make deps), while a vector profile (make deps-vector) or the Docker image installs it and npm hoists the packages to the root node_modules where the engine resolves them. Carries no code (like @notarium/desktop): its sole job is to make the heavy native stack an excludable install unit. Runtime degradation when absent is the engine's job (createNotariumStore → FTS).",
+  "description": "Deps-only carrier for the OPTIONAL CPU embedder (#200): @huggingface/transformers and its onnxruntime backend, ~360MB — the whole reason an excludable install unit exists. @notarium/engine loads it DYNAMICALLY, so it declares no static dependency on it; this workspace owns the declaration instead, which lets the default dev install skip the subtree by excluding this one workspace (make deps), while a vector profile (make deps-vector) or the Docker image installs it and npm hoists it to the root node_modules where the engine resolves it. sqlite-vec is deliberately NOT here: at 200KB it costs nothing to install always, and keeping it out of the default profile closed the vec0 gate on every lean run — 47 tests that only need a mock embedder (#317). Carries no code (like @notarium/desktop). Degradation when absent belongs to the COMPOSITION ROOT, which asks localEmbedderAvailable() before it builds an embedder (#317): the engine's own FTS fallback fires only where vec0 cannot load, and since vec0 now ships everywhere it no longer notices a missing embedder. A root that skips the check advertises capabilities.vector while every embed fails.",
   "dependencies": {
-    "@huggingface/transformers": "^4.2.0",
-    "sqlite-vec": "^0.1.9"
+    "@huggingface/transformers": "^4.2.0"
   }
 }
