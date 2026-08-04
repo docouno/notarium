@@ -1,5 +1,6 @@
 // Markdown rendering for the read/bootstrap tools: the prose projection of each tool's structured payload.
 import {
+  type AgentSession,
   type DeltaEntry,
   type FolderEntry,
   type ListNotesItem,
@@ -7,6 +8,7 @@ import {
   type ProjectSummary,
   type Provenance,
   type RecentActivityItem,
+  type RecentAgentSession,
   RESPONSE_FORMAT,
   type SearchHit,
   type ToolHelp,
@@ -15,6 +17,8 @@ import {
 import { renderProvenance } from '../provenance'
 
 type SessionStructured = {
+  session?: AgentSession
+  recentSessions?: RecentAgentSession[]
   profile: {
     memory: Array<{ noteId: string; category: string; summary: string }>
     alwaysLoad: Array<{ noteId: string; title: string }>
@@ -37,6 +41,21 @@ export const renderSession = (
   format: 'concise' | 'detailed',
 ): string => {
   const lines: string[] = []
+
+  if (s.session) {
+    // Deliberately the FIRST line: this survives aggressive context truncation and
+    // makes the model carry the stable episode id into every subsequent tool call.
+    lines.push(s.session.hint)
+  } else if (s.recentSessions !== undefined) {
+    lines.push('More than one session has that name; call start_session again with one id:')
+  }
+  if (s.recentSessions?.length) {
+    for (const recent of s.recentSessions) {
+      lines.push(
+        `- ${recent.name} — ${recent.id} (${recent.active ? 'active' : 'sleeping'}, ${recent.calls} calls)`,
+      )
+    }
+  }
 
   if (s.profile.memory.length) {
     lines.push('**What I remember about you:**')

@@ -7,6 +7,13 @@
       "checksum": "sha256:ff03f95db56c4f6d150679aa642b2235584808dc061acb5479d0a36cc0eeb806",
       "sqlite": "sqlite/0000_baseline.sql",
       "postgres": "postgres/0000_baseline.sql"
+    },
+    {
+      "version": 1,
+      "name": "agent_sessions",
+      "checksum": "sha256:56e2fce960d7930d2d0479e1f74b18df7502cedd0456e3465843ba8551a0fa55",
+      "sqlite": "sqlite/0001_agent_sessions.sql",
+      "postgres": "postgres/0001_agent_sessions.sql"
     }
   ]
 }

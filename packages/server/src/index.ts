@@ -18,6 +18,7 @@ export {
 } from './libs/tokens'
 export * from './services/auth'
 export * from './services/authz'
+export * from './services/agentSessions'
 export * from './apps/server/consumers'
 export * from './libs/artifactStore'
 export * from './libs/importStaging'

@@ -18,13 +18,13 @@ Why a gateway and not "just give the agent the engine." Direct access to the sto
 The names/descriptions the agent sees in `tools/list` are static and live in [descriptions.ts](../packages/server/src/services/mcp/descriptions.ts). A summary:
 
 **Bootstrap**
-- `start_session` — call it **first** in a new session. In one round-trip: the user profile (always-load), the accessible projects and, with a `project` hint, a **compact index** of the project (a note count + top-level folders — the full enumeration via `list_notes`), the delta of changes since the last visit (each entry marked project/space/path — to tell your own project from a neighboring one in a shared space) and `knownValues` (a category/tag vocabulary already in use in the project — reuse it, do not spawn synonyms; the `relations` axis was removed in phase 4 — the v1 graph is mono-typed, the real relation vocabulary = #66). Idempotent; `acknowledge:false` peeks at the delta without moving the cursor. The acknowledged cursor only advances: a slower, older concurrent response cannot rewind the next delta window. Not calling it just means less context: the other tools work on their own. Curating WHAT lands in `profile.alwaysLoad`/`project.alwaysLoad` — the Agents → Context section ([docs/projects.md](projects.md#init-context-curation)): manual pins in place (`always-load`), **context sets + cross-space loose pins** (#209 — reusable cross-space references attached to a scope; their reader-accessible items/notes fold into the same always-load) and muting memory.
+- `start_session` — call it **first** in a new session. It opens/resumes an agent episode and returns `session.id`; retain that id and pass it as the top-level `session` argument on every later session-aware tool. In one round-trip it also returns the user profile (always-load), accessible projects and, with a `project` hint, a **compact index** of the project (a note count + top-level folders — enumerate via `list_notes`), the delta of changes since the last visit and `knownValues`. `acknowledge:false` peeks at the delta without moving the cursor. The acknowledged cursor only advances: a slower, older concurrent response cannot rewind the next delta window. Not calling it just means less context: the other tools work on their own. Curating WHAT lands in `profile.alwaysLoad`/`project.alwaysLoad` — the Agents → Context section ([docs/projects.md](projects.md#init-context-curation)): manual pins in place (`always-load`), **context sets + cross-space loose pins** and muting memory.
 - `whoami` — who I am and what I may do (principal-id, the read|write ceiling, project memberships) + the engine's `capabilities` (`vector`/`trash`/`revisions`) — so as not to probe blindly.
 - `get_my_projects` — the list of accessible projects with their slugs (for the `project` argument — do not guess the slug). The personal domain is **not** in the list (it is implied by the token).
 
 **Discover / navigate**
 - `list_notes` — `ls` of the knowledge base: the direct notes and subfolders of a folder (deterministic, paginated). `project` picks a space and narrows to it; `path` is a **space-relative** folder (take the `path` from a `folders` entry / a hit verbatim, do not construct it) — without it, the project root. `tag` filters by a tag. Returns `items` (direct notes: id/title/path/tags) + `folders` (direct subfolders with a subtree count) + an honest `total`; page with `cursor`/`nextCursor`. Lists the user-visible notes (not agent-memory — for it use `search`).
-- `recent_activity` — the most recently edited notes (absolute freshness from the journal #12) — "what was touched lately, needs a review." This is **not** the delta from `start_session` (that one is per-session, "since your last visit"). `project` narrows it; without it, the freshest across the whole reach. Each entry: who (`principal` — human/agent), how (`kind`), where (`path`/`project`), when (`modifiedAt`). `truncated:true` — there was more.
+- `recent_activity` — the most recently edited notes (absolute freshness from the journal) — "what was touched lately, needs a review." This is **not** the delta from `start_session` (that one is the agent's "since your last visit" cursor and is not yet episode-scoped). `project` narrows it; without it, the freshest across the whole reach. Each entry: who (`principal` — human/agent), how (`kind`), where (`path`/`project`), when (`modifiedAt`). `truncated:true` — there was more.
 
 **Read / recall**
 - `search` — hybrid search (semantics + lexical via RRF, #81) over the reachable knowledge, with an honest degradation to FTS when the vector channel is unavailable. **It also covers the agent's own agent-memory** (#102): "search before writing" now dedupes memory too (the only class without title-collision dedup) — **always search before writing**. `project` narrows it to a project (its notes + its memory); without it, the whole reachable scope plus the personal domain. `class` filters by kind (`agent-memory` — only memory, `user-doc` — exclude it). Returns ranked snippets with a `score` and `path` (where it lives), not full notes.
@@ -52,12 +52,41 @@ The names/descriptions the agent sees in `tools/list` are static and live in [de
 
 ## Working conventions <a id="conventions"></a>
 
-- **Order.** `start_session` → (need a project?) `get_my_projects` → survey the structure with `list_notes`/`recent_activity` → `search`/`recall` before writing → `create_note`/`remember_about_*`/`edit_note`/`link`.
+- **Order.** `start_session` → retain its `session.id` → pass it to every later tool → (need a project?) survey the structure with `list_notes`/`recent_activity` → `search`/`recall` before writing → `create_note`/`remember_about_*`/`edit_note`/`link`.
 - **Identity is the note-id, not the path.** The id is stable across rename/move; pass exactly it into `get_note`/`edit_note`/`link`, not the title and not the path.
 - **CAS on writes.** `edit_note` requires the `versionToken` from a fresh `get_note`; a concurrent edit → `versionConflict` (the tool does not overwrite silently — the agent re-reads and retries).
 - **Personal domain ⟂ project.** The agent's memory — about the user (`remember_about_user`) and about a project (`remember_about_project`) — always lands in agent-memory (hidden from discovery, visible to the user in a separate section). Shared knowledge (`create_note`) goes to the named project (class `user-doc`). The agent does not decide "where" — the tool does.
 - **Memory = one file per category = just a note.** `remember_about_user(observation, category)` appends to the category's file; `category` is a label ("preferences"), **not a path**. `summary` feeds the derived profile index. To correct/delete a single recorded fact — `edit_note` by `noteId` (which `remember_*` returns): `findReplace` of the fact's text (an empty `content` to remove) or `replace` of the whole category. There is **no** separate "observation addressing" by id — memory is edited with the same word-based modes as any note (#102 phase 3).
 - **Honest truncation.** Bundles (`start_session`, `recall`) under a budget set `truncated:true` — top up via `search`/`get_note`.
+
+## Agent episodes <a id="agent-sessions"></a>
+
+An episode belongs to the authenticated **username**, not to one PAT/OAuth token. `owner` is an
+internal persistence key derived from that authenticated username; the agent never sends it. Its id is
+`ses_` plus twelve URL-safe characters. `start_session.session` addresses either `{id}` or a
+non-unique human `{name}`: no name match creates; one sleeping match resumes; one active match
+forks with `parentId`; multiple matches return up to ten matching retained choices and require an id. Names
+are sanitized before they return to the agent. The first Markdown response line carries the id
+instruction so it survives compact clients.
+
+With no address, `start_session` resumes the exact one active episode when that choice is unique.
+With zero active episodes it creates an auto-named personal/project episode (`named:false`). With
+two or more it also creates a fresh auto-named episode, but returns the recent alternatives so the
+agent can explicitly switch by id instead of guessing.
+
+Every tool except `whoami` and `get_my_projects` is session-aware. On an ordinary call an explicit
+id is owner-checked and touched; an unknown or foreign id is a tool error. With no id, the gateway
+attaches only when exactly one active episode exists — the exact-one decision and touch are one
+atomic persistence operation. Batch tools bind once at the top level, never once per item.
+
+Active means seen in the last two hours. Rows are retained for thirty days. General recent choices
+cover the last 24 hours; same-name ambiguity returns the matching retained rows even when older,
+so it is always resolvable. Both are capped at ten. There is deliberately no close operation. The
+transport's stateless HTTP session remains unchanged: this is a transport-independent core
+service carried through `Ctx.session`, ready for future chat callers. A host without a meta-DB
+degrades honestly: `start_session` omits the session fields and other tools silently ignore the
+argument. Episode-scoped bookmarks/delta and retrieval audit attribution are intentionally
+deferred; this change only provides the durable binding they can build on.
 
 ## Security (why the set is exactly this) <a id="security"></a>
 

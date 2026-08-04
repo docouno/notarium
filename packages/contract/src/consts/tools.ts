@@ -22,3 +22,11 @@ export const WRITE_OUTCOME = {
 } as const
 
 export type WriteOutcome = (typeof WRITE_OUTCOME)[keyof typeof WRITE_OUTCOME]
+
+export const AGENT_SESSION_STATE = {
+  new: 'new',
+  resumed: 'resumed',
+  forked: 'forked',
+} as const
+
+export type AgentSessionState = (typeof AGENT_SESSION_STATE)[keyof typeof AGENT_SESSION_STATE]

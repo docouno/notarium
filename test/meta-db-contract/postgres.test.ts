@@ -8,6 +8,7 @@ import {
   REVISION_LOCK_STRIPE_MASK,
 } from '../../packages/server/src/services/metaDb/drivers/pg/revisionLocks'
 import { PgMetaDb } from '../../packages/server/src/services/metaDb/pgMetaDb'
+import { describeAgentSessionsContract } from './agentSessionsContract'
 import { describeGatewayStateContract } from './gatewayStateContract'
 import { createPostgresTestSchema, describePostgres } from './postgresHarness'
 import { describeRevisionPersistenceContract } from './revisionPersistenceContract'
@@ -177,6 +178,11 @@ describePostgres('live Postgres driver', () => {
   describeGatewayStateContract('Postgres', async () => {
     const testSchema = await createPostgresTestSchema('gateway_contract')
     return { persistence: testSchema.db.gateway, teardown: testSchema.teardown }
+  })
+
+  describeAgentSessionsContract('Postgres', async () => {
+    const testSchema = await createPostgresTestSchema('agent_sessions_contract')
+    return { persistence: testSchema.db.sessions, teardown: testSchema.teardown }
   })
 
   describeRevisionPersistenceContract('Postgres', async () => {

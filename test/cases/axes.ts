@@ -18,6 +18,7 @@ export type Axis =
   | 'graph'
   | 'agent-memory'
   | 'agent-audit'
+  | 'agent-sessions'
   | 'note-classes'
   | 'import'
   | 'jobs'
@@ -100,6 +101,12 @@ export const AXES: readonly AxisInfo[] = [
     title: 'Agent retrieval audit',
     surfaces: ['agents-audit'],
     refs: ['#243', 'projects.md', 'mcp-gateway.md'],
+  },
+  {
+    axis: 'agent-sessions',
+    title: 'Agent sessions / episode binding',
+    surfaces: ['mcp-start-session', 'mcp-tool-binding'],
+    refs: ['mcp-gateway.md'],
   },
   {
     axis: 'note-classes',

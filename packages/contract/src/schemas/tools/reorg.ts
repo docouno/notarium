@@ -1,12 +1,13 @@
 import { z } from 'zod'
 import { NoteClassSchema, SpaceSlugSchema } from '../primitives'
-import { locationFields } from './_fields'
+import { locationFields, sessionField } from './_fields'
 import { ProjectHandleSchema, ProjectIdSchema, RefSchema } from './primitives'
 
 /** Tool `delete_note`: move a note to the trash — the agent's one destructive tool,
  *  reversible by construction (only the USER restores/purges).
  *  canon: docs/mcp-gateway.md#tools */
 export const DeleteNoteInputSchema = z.object({
+  ...sessionField,
   ref: RefSchema,
 })
 
@@ -22,6 +23,7 @@ export const DeleteNoteOutputSchema = z.object({
  *  inbound links survive). `toFolder` is a SPACE-relative `folders` path — feed one
  *  back, never hand-built. canon: docs/architecture.md#p7 */
 export const MoveNoteInputSchema = z.object({
+  ...sessionField,
   ref: RefSchema,
   toFolder: z.string(),
 })
@@ -37,6 +39,7 @@ export const MoveNoteOutputSchema = z.object({
  *  survive, LINK-SAFE (the old title becomes a resolving alias). No `versionToken`
  *  needed — a concurrent edit is still caught. canon: docs/architecture.md#p7 */
 export const RenameNoteInputSchema = z.object({
+  ...sessionField,
   ref: RefSchema,
   title: z.string().min(1),
 })
@@ -55,6 +58,7 @@ export const RenameNoteOutputSchema = z.object({
  *  SPACE-relative `folders` paths; `project?` selects the space.
  *  canon: docs/architecture.md#p7 */
 export const MoveFolderInputSchema = z.object({
+  ...sessionField,
   folder: z.string().min(1),
   toFolder: z.string(),
   project: ProjectHandleSchema.optional(),
@@ -64,6 +68,7 @@ export const MoveFolderInputSchema = z.object({
  *  folder is a marked PROJECT, its files move but the HANDLE does not (use
  *  rename_project). canon: docs/architecture.md#p7 */
 export const RenameFolderInputSchema = z.object({
+  ...sessionField,
   folder: z.string().min(1),
   name: z.string().min(1),
   project: ProjectHandleSchema.optional(),
@@ -80,6 +85,7 @@ export const FolderReorgOutputSchema = z.object({
  *  one), LINK-SAFE (the old handle stays a resolving alias). A ROOT project's handle
  *  is its space name and can't be changed here. canon: docs/architecture.md#p7 */
 export const RenameProjectInputSchema = z.object({
+  ...sessionField,
   project: ProjectHandleSchema,
   slug: z.string().min(1).optional(),
   displayName: z.string().min(1).optional(),

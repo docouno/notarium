@@ -1,7 +1,9 @@
 import { z } from 'zod'
+import { AGENT_SESSION_STATE } from '../../consts/tools'
+import { enumValues } from '../../libs/enumValues'
 import { IsoTimestampSchema, RevisionKindSchema } from '../primitives'
 import { PatScopeSchema } from '../rest/pats'
-import { locationFields } from './_fields'
+import { AgentSessionIdSchema, locationFields } from './_fields'
 import {
   CapabilitiesSchema,
   FolderEntrySchema,
@@ -36,6 +38,17 @@ export const StartSessionInputSchema = z.object({
   project: ProjectHandleSchema.optional(),
   /** Free-form task hint; no v1 effect. */
   task: z.string().optional(),
+  /** Address an existing session by id, or open/resume/fork by a non-unique name.
+   * Exactly one key avoids silently accepting a stale id/name pair. */
+  session: z
+    .object({
+      id: AgentSessionIdSchema.optional(),
+      name: z.string().trim().min(1).max(160).optional(),
+    })
+    .refine((value) => Number(value.id !== undefined) + Number(value.name !== undefined) === 1, {
+      message: 'provide exactly one of id or name',
+    })
+    .optional(),
   /** Whether to advance lastSeen[token, project]. Default true; `false` = peek the
    *  delta without moving the bookmark (keeps the tool idempotent). */
   acknowledge: z.boolean().default(true),
@@ -75,10 +88,31 @@ export const DeltaSchema = z.object({
  *  models that skipped the server `instructions`. */
 export const ToolHelpSchema = z.object({ name: z.string(), summary: z.string() })
 
+export const AgentSessionSchema = z.object({
+  id: AgentSessionIdSchema,
+  name: z.string(),
+  named: z.boolean(),
+  state: z.enum(enumValues(AGENT_SESSION_STATE)),
+  parentId: AgentSessionIdSchema.optional(),
+  hint: z.string(),
+})
+
+export const RecentAgentSessionSchema = z.object({
+  id: AgentSessionIdSchema,
+  name: z.string(),
+  lastActiveAt: IsoTimestampSchema,
+  active: z.boolean(),
+  calls: z.number().int().nonnegative(),
+})
+
 /** Tool `start_session`: server-side composition of the 4–5 discovery calls; the
  *  `project` sub-bundle rides only when a project hint was given.
  *  canon: docs/mcp-gateway.md#tools */
 export const StartSessionOutputSchema = z.object({
+  /** Absent on a host without the sessions capability, or when a non-unique name
+   * needs an explicit id choice from recentSessions. */
+  session: AgentSessionSchema.optional(),
+  recentSessions: z.array(RecentAgentSessionSchema).optional(),
   profile: SessionProfileSchema,
   projects: z.array(ProjectSummarySchema),
   project: z
@@ -124,5 +158,9 @@ export type DeltaEntry = z.infer<typeof DeltaEntrySchema>
 export type Delta = z.infer<typeof DeltaSchema>
 
 export type ToolHelp = z.infer<typeof ToolHelpSchema>
+
+export type AgentSession = z.infer<typeof AgentSessionSchema>
+
+export type RecentAgentSession = z.infer<typeof RecentAgentSessionSchema>
 
 export type StartSessionOutput = z.infer<typeof StartSessionOutputSchema>

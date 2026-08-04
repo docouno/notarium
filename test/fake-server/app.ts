@@ -25,6 +25,7 @@ import {
 } from '@notarium/core'
 import { InMemoryStore, type StoreSnapshot } from '@notarium/engine-memory'
 import {
+  type AgentSessionRecord,
   buildApp,
   createAuthService,
   createExportHandler,
@@ -48,6 +49,7 @@ import {
   SqliteMetaDb,
 } from '@notarium/server'
 
+import { InMemoryAgentSessions } from './agentSessions'
 import { InMemoryAuthPersistence } from './authPersistence'
 import { InMemoryContextOrder } from './contextOrder'
 import { InMemoryContextSets } from './contextSets'
@@ -141,10 +143,13 @@ export type Fixture = {
   projects?: ProjectFixture[]
   capabilities?: { spaceCreate?: boolean }
   auth?: AuthFixture
+  agentSessions?: AgentSessionRecord[]
   /** Omit the durable job layer from buildApp — reproduces a none-mode host
    *  with no meta-DB backing jobs, so the async-export routes 404 and the client falls
    *  back to the synchronous streaming export (the capability-degradation tier). */
   noJobs?: boolean
+  /** Omit the agent-session persistence facet to exercise P5 degradation. */
+  noAgentSessions?: boolean
   /** Serve the identity of a RELEASED image instead of this unbundled run's
    *  honest nulls — the About tab shows a source link only for a real release, and
    *  that branch is otherwise unreachable outside a published artifact.
@@ -292,6 +297,8 @@ export const createApp = async (
   const contextSets = new InMemoryContextSets()
   const scopePins = new InMemoryScopePins()
   const contextOrder = new InMemoryContextOrder()
+  const agentSessions = new InMemoryAgentSessions()
+  agentSessions.seed(fixture.agentSessions ?? [])
   // The space registry: a minimal in-memory SpacesPersistence so the REAL
   // SpaceManager mints an opaque space_id (id ≠ slug) instead of collapsing
   // id ≡ slug — the prerequisite for e2e to see the wire's id→slug projection seam.
@@ -554,6 +561,7 @@ export const createApp = async (
   const app = await buildApp({
     spaces: manager,
     auth,
+    sessions: fixture.noAgentSessions ? undefined : agentSessions,
     gatewayState,
     retrievalLog,
     projects,
@@ -649,6 +657,7 @@ export const createApp = async (
     await seedActivityForFixture(next)
     await seedAuth(next.auth)
     gatewayState.clear()
+    agentSessions.seed(next.agentSessions ?? [])
     retrievalLog.clear()
     oauthDb.clear()
     projects.seed(projectRecords(next, idOf))

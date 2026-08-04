@@ -2,6 +2,7 @@ import { compareEvents } from './generators'
 import { getCase } from './registry'
 import { makeRng } from './rng'
 import type {
+  AgentSessionDecl,
   CaseEvent,
   CaseWorld,
   ConnectedAppDecl,
@@ -93,6 +94,7 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
   const pendingOAuthClients = new Map<string, PendingOAuthClientDecl>()
   const favorites = new Map<string, FavoriteDecl>()
   const retrievals: RetrievalDecl[] = []
+  const agentSessions: AgentSessionDecl[] = []
   const jobs: JobDecl[] = []
   const durableImports: DurableImportDecl[] = []
   const externalRewrites: ExternalRewriteDecl[] = []
@@ -219,6 +221,15 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
     for (const r of world.retrievals ?? []) {
       retrievals.push({ ...r, hits: r.hits?.map((h) => ({ ...h, note: `${name}:${h.note}` })) })
     }
+    // Session and parent refs are logical ids too: namespace both so independent
+    // cases can use friendly names such as `active` without colliding.
+    for (const session of world.agentSessions ?? []) {
+      agentSessions.push({
+        ...session,
+        ref: `${name}:${session.ref}`,
+        ...(session.parentRef ? { parentRef: `${name}:${session.parentRef}` } : {}),
+      })
+    }
     // Jobs carry no logical note handles — they address a SPACE, and spaces merge by
     // slug WITHOUT namespacing (see above), so a job's `space` resolves unchanged in a
     // combined world and the decls concatenate verbatim (#105/#101).
@@ -256,6 +267,7 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
     events,
     favorites: favorites.size ? [...favorites.values()] : undefined,
     ...(retrievals.length ? { retrievals } : {}),
+    ...(agentSessions.length ? { agentSessions } : {}),
     ...(jobs.length ? { jobs } : {}),
     ...(durableImports.length ? { durableImports } : {}),
     ...(externalRewrites.length ? { externalRewrites } : {}),

@@ -44,7 +44,7 @@ space-id — the consistency invariants from the task statement fall out «for f
 2. **Cases** (`test/cases/cases/`) — they **compose** fragments + structure + activity
    (they do not inline content). Reader cases are built FROM the corpus and auto-grow
    together with it.
-3. **Axes + coverage matrix** (`axes.ts`, `coverage.ts`) — 15 product axes, each tied to
+3. **Axes + coverage matrix** (`axes.ts`, `coverage.ts`) — 18 product axes, each tied to
    surfaces + a canon doc; cases tag `axes`. `make seed-coverage` prints the matrix; the
    coverage test fails on a gap.
 4. **Appliers** — `caseToFixture` (fake) and `scripts/seed.ts` (real). The case model is
@@ -123,15 +123,17 @@ and for `security` — it parses the sanitized HTML into a live DOM and checks t
 | Case | About | Axes |
 |---|---|---|
 | `agent-context` | pins + personal/project memory + projects of varying density (#165); **heavy pins over budget + a `Budget Lab` space for all token-budget cases #208** (personal-trim, fits / squeeze / dominant / no-pins — nesting the personal set into project Q's budget); **cross-space context set #209** (`Frontend Canon` in the `Conventions` space, connected to project Product OS + personal) **+ cross-space loose pin #209** (`Security Baseline` from `Conventions`, pinned directly into Product OS + personal) — both resolve cross-space; **retrieval audit #243** (search/recall/get_note history: hits + a recurrent vocabulary-mismatch miss + frequent queries) | agent-memory, agent-audit, structure, note-classes, scale |
+| `agent-sessions` | durable MCP episodes: active fork siblings with the same name, sleeping + automatic sessions, a hostile label for output sanitisation, and an expired retention probe | agent-sessions, auth |
 | `memory-perf` | 2700 ordinary notes + 4 personal-memory categories + 1 project-partition sentinel; reproduces memory-mount scaling, partition isolation, and graph-inert memory links | agent-memory, note-classes, scale |
 | `import-thread` | one rich imported thread | import, content |
 | `import` | a multi-format layout (claude/chatgpt/memory-json) + backdated dates-as-data → Feed year-spread (#11/#223) | import, content, activity |
 
 ## Axes and coverage
 
-15 axes (`axes.ts`): `content`, `structure`, `folder-page`, `activity`, `history`,
+18 axes (`axes.ts`): `content`, `structure`, `folder-page`, `activity`, `history`,
 `trash`, `identity`, `search`, `graph`, `agent-memory`, `note-classes`, `import`,
-`scale`, `auth`, `agent-audit`. Each is tied to surfaces + canon docs.
+`jobs`, `scale`, `auth`, `favorites`, `agent-audit`, `agent-sessions`. Each is tied to
+surfaces + canon docs.
 
 ```
 make seed-coverage      # axis×case + feature×fragment matrix + gaps

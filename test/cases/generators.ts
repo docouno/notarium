@@ -1,4 +1,5 @@
 import type {
+  AgentSessionDecl,
   CaseEvent,
   CaseNoteClass,
   CaseWorld,
@@ -166,6 +167,7 @@ export class WorldBuilder {
   private readonly pendingOAuthClients: PendingOAuthClientDecl[] = []
   private readonly favorites: FavoriteDecl[] = []
   private readonly retrievals: RetrievalDecl[] = []
+  private readonly agentSessions: AgentSessionDecl[] = []
   private readonly jobs: JobDecl[] = []
   private readonly durableImports: DurableImportDecl[] = []
   private readonly externalRewrites: ExternalRewriteDecl[] = []
@@ -304,6 +306,12 @@ export class WorldBuilder {
     return this
   }
 
+  /** Declare one durable agent episode. */
+  agentSession(decl: AgentSessionDecl): this {
+    this.agentSessions.push(decl)
+    return this
+  }
+
   /** Declare a durable job (#105) — an export's history row and, when it succeeded with
    *  a live TTL, a REAL archive written under `<DATA_DIR>/jobs` by the production handler
    *  (#101). Real applier only; see JobDecl. */
@@ -345,6 +353,7 @@ export class WorldBuilder {
       events: [...this.events].sort(compareEvents),
       favorites: this.favorites.length ? this.favorites : undefined,
       ...(this.retrievals.length ? { retrievals: this.retrievals } : {}),
+      ...(this.agentSessions.length ? { agentSessions: this.agentSessions } : {}),
       ...(this.jobs.length ? { jobs: this.jobs } : {}),
       ...(this.durableImports.length ? { durableImports: this.durableImports } : {}),
       ...(this.externalRewrites.length ? { externalRewrites: this.externalRewrites } : {}),

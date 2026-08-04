@@ -1,5 +1,6 @@
 import { diffStats, stripFrontmatter, stripTitleHeading } from '@notarium/core'
 import { deterministicNoteId, type NoteSnapshot } from '@notarium/engine-memory'
+import type { AgentSessionRecord } from '@notarium/server'
 import type {
   ActivityFixture,
   AuthFixture,
@@ -8,6 +9,7 @@ import type {
   SpaceFixture,
 } from '../fake-server/app'
 import { compareEvents, normDate } from './generators'
+import { agentSessionId } from './sessionIds'
 import type { CaseEvent, CaseWorld } from './types'
 
 // The FAKE projection of a case (#175): reduce the neutral timeline to the fake
@@ -242,5 +244,18 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
       }
     : undefined
 
-  return { now: world.now, spaces, projects, auth }
+  const now = Date.parse(world.now)
+  const defaultOwner = world.auth?.users[0]?.username ?? 'system'
+  const agentSessions: AgentSessionRecord[] | undefined = world.agentSessions?.map((session) => ({
+    id: agentSessionId(session.ref),
+    owner: session.owner ?? defaultOwner,
+    name: session.name,
+    named: session.named ?? true,
+    parentId: session.parentRef ? agentSessionId(session.parentRef) : null,
+    createdAt: new Date(now - session.createdDaysAgo * 86_400_000).toISOString(),
+    lastSeenAt: new Date(now - session.lastSeenDaysAgo * 86_400_000).toISOString(),
+    calls: session.calls,
+  }))
+
+  return { now: world.now, spaces, projects, auth, agentSessions }
 }

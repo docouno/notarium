@@ -494,6 +494,55 @@ export type GatewayStatePersistence = {
   dedupPrune(beforeIso: string): Promise<void>
 }
 
+// ── Agent work sessions facet ──────────────────────────────────
+
+/** One owner-scoped work episode. Activity is derived from lastSeenAt; no stored
+ * status can drift. `named=false` marks a server-generated display name. */
+export type AgentSessionRecord = {
+  id: string
+  owner: string
+  name: string
+  named: boolean
+  parentId: string | null
+  createdAt: string
+  lastSeenAt: string
+  calls: number
+}
+
+/** Atomic outcome of starting a named session. The persistence layer owns the
+ * whole observe-and-decide sequence so concurrent starts cannot both resume a
+ * sleeping row or both create unrelated roots. */
+export type AgentSessionNamedStart =
+  | { kind: 'ambiguous'; matches: AgentSessionRecord[] }
+  | { kind: 'new' | 'resumed' | 'forked'; record: AgentSessionRecord }
+
+/** Durable storage for agent work sessions. Policy (2h active / 30d retention,
+ * resume vs fork) lives in the transport-independent agentSessions service.
+ * `inferActiveAndTouch` and `startNamed` are deliberately atomic: their
+ * observe-and-update decisions must remain one linearizable operation. */
+export type AgentSessionsPersistence = {
+  insert(session: AgentSessionRecord): Promise<void>
+  touch(
+    owner: string,
+    id: string,
+    lastSeenAt: string,
+    retainedSince: string,
+  ): Promise<AgentSessionRecord | null>
+  inferActiveAndTouch(
+    owner: string,
+    activeSince: string,
+    lastSeenAt: string,
+  ): Promise<AgentSessionRecord | null>
+  startNamed(
+    candidate: AgentSessionRecord,
+    activeSince: string,
+    retainedSince: string,
+    limit: number,
+  ): Promise<AgentSessionNamedStart>
+  listRecent(owner: string, since: string, limit: number): Promise<AgentSessionRecord[]>
+  prune(before: string): Promise<void>
+}
+
 // ── OAuth facet records ────────────────────────────────────────────────
 
 /** How a client got its id: 'dcr' (RFC 7591 Dynamic Client Registration — we
@@ -794,6 +843,8 @@ export type MetaDb = {
   spaces: SpacesPersistence
   auth: AuthPersistence
   gateway: GatewayStatePersistence
+  /** Owner-scoped/cross-space; retained independently of any one project or space. */
+  sessions: AgentSessionsPersistence
   projects: ProjectsPersistence
   /** `type='folder'` rows of the same table as `projects`, not a separate tenant. */
   folders: FolderIdentityPersistence

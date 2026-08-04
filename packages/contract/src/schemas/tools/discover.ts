@@ -1,11 +1,12 @@
 import { z } from 'zod'
 import { IsoTimestampSchema, RevisionKindSchema } from '../primitives'
-import { locationFields } from './_fields'
+import { locationFields, sessionField } from './_fields'
 import { FolderEntrySchema, ProjectHandleSchema } from './primitives'
 
 /** Tool `list_notes`: `ls` a folder — its direct notes + subfolders, paginated.
  *  canon: docs/mcp-gateway.md#tools */
 export const ListNotesInputSchema = z.object({
+  ...sessionField,
   project: ProjectHandleSchema.optional(),
   /** A SPACE-relative folder to list (copy a `folders` entry's `path` back); omit =
    *  the project/personal root. */
@@ -39,6 +40,7 @@ export const ListNotesOutputSchema = z.object({
 /** Tool `recent_activity`: the most recently-changed notes (absolute freshness),
  *  distinct from start_session's per-session delta. canon: docs/mcp-gateway.md#tools */
 export const RecentActivityInputSchema = z.object({
+  ...sessionField,
   /** With it, narrows to that project (best-effort label filter — the journal isn't
    *  path-indexed, so `truncated` when the window under-fills). */
   project: ProjectHandleSchema.optional(),

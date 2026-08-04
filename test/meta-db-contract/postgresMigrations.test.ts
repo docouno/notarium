@@ -20,6 +20,9 @@ type LedgerRow = {
 
 describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
   const schemas: PostgresTestSchema[] = []
+  const migrations = loadMetaMigrations()
+  const nextMigrationVersion = migrations.length
+  const appliedVersions = migrations.map(({ version }) => version)
 
   afterEach(async () => {
     while (schemas.length) {
@@ -68,11 +71,11 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
         },
       ])
       const firstLedger = await ledger(testSchema)
-      expect(firstLedger).toHaveLength(1)
+      expect(firstLedger).toHaveLength(migrations.length)
       expect(firstLedger[0]).toMatchObject({
         version: 0,
         name: 'baseline',
-        checksum: loadMetaMigrations()[0].checksum,
+        checksum: migrations[0].checksum,
       })
 
       await reopened.identity.init()
@@ -194,7 +197,7 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
 
     await testSchema.admin.query(`DROP TABLE ${identifier}.meta_schema`)
     await testSchema.db.identity.init()
-    expect(await ledger(testSchema)).toHaveLength(1)
+    expect(await ledger(testSchema)).toHaveLength(migrations.length)
 
     await testSchema.db.close()
     const activity = await testSchema.admin.query(
@@ -266,24 +269,24 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
     },
     {
       label: 'a version gap',
-      sql: 'UPDATE meta_migrations SET version = 1',
+      sql: 'DELETE FROM meta_migrations WHERE version = 0',
       message: /expected version 0, found 1/,
     },
     {
       label: 'name drift',
-      sql: "UPDATE meta_migrations SET name = 'rewritten_baseline'",
+      sql: "UPDATE meta_migrations SET name = 'rewritten_baseline' WHERE version = 0",
       message: /name mismatch/,
     },
     {
       label: 'checksum drift',
-      sql: `UPDATE meta_migrations SET checksum = 'sha256:${'0'.repeat(64)}'`,
+      sql: `UPDATE meta_migrations SET checksum = 'sha256:${'0'.repeat(64)}' WHERE version = 0`,
       message: /checksum mismatch/,
     },
     {
       label: 'an unknown future migration',
       sql: `INSERT INTO meta_migrations (version, name, checksum, applied_at)
-            VALUES (1, 'future', 'sha256:${'1'.repeat(64)}', '2099-01-01T00:00:00.000Z')`,
-      message: /unknown future migration 1/,
+            VALUES (${nextMigrationVersion}, 'future', 'sha256:${'1'.repeat(64)}', '2099-01-01T00:00:00.000Z')`,
+      message: new RegExp(`unknown future migration ${nextMigrationVersion}`),
     },
   ])('fails closed on $label', async ({ sql, message }) => {
     const testSchema = await createSchema('migration_drift')
@@ -313,7 +316,6 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
     const testSchema = await createSchema('migration_retry')
     await testSchema.db.identity.init()
     await testSchema.db.close()
-    const baseline = loadMetaMigrations()[0]
     const pool = new pg.Pool({ connectionString: testSchema.scopedUrl })
     const client = await pool.connect()
 
@@ -321,14 +323,16 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
       const brokenSql = `CREATE TABLE migration_probe (value TEXT);
         SELECT * FROM missing_table`
       const broken: MetaMigration = {
-        version: 1,
+        version: nextMigrationVersion,
         name: 'add_probe',
         checksum: checksumMigrationPair('SELECT broken', brokenSql),
         sqlite: 'SELECT broken',
         postgres: brokenSql,
       }
-      await expect(runPgMigrations(client, [baseline, broken])).rejects.toThrow(/missing_table/)
-      expect((await ledger(testSchema)).map(({ version }) => version)).toEqual([0])
+      await expect(runPgMigrations(client, [...migrations, broken])).rejects.toThrow(
+        /missing_table/,
+      )
+      expect((await ledger(testSchema)).map(({ version }) => version)).toEqual(appliedVersions)
       expect(
         await testSchema.admin.query(
           `SELECT to_regclass('${testSchema.schema}.migration_probe') AS probe`,
@@ -337,14 +341,17 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
 
       const repairedSql = 'CREATE TABLE migration_probe (value TEXT)'
       const repaired: MetaMigration = {
-        version: 1,
+        version: nextMigrationVersion,
         name: 'add_probe',
         checksum: checksumMigrationPair('SELECT repaired', repairedSql),
         sqlite: 'SELECT repaired',
         postgres: repairedSql,
       }
-      await runPgMigrations(client, [baseline, repaired])
-      expect((await ledger(testSchema)).map(({ version }) => version)).toEqual([0, 1])
+      await runPgMigrations(client, [...migrations, repaired])
+      expect((await ledger(testSchema)).map(({ version }) => version)).toEqual([
+        ...appliedVersions,
+        nextMigrationVersion,
+      ])
     } finally {
       client.release()
       await pool.end()
@@ -355,12 +362,11 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
     const testSchema = await createSchema('migration_transaction_escape')
     await testSchema.db.identity.init()
     await testSchema.db.close()
-    const baseline = loadMetaMigrations()[0]
     const escapingSql = `CREATE TABLE escaped_transaction (value TEXT);
       COMMIT;
       SELECT * FROM missing_table`
     const escaping: MetaMigration = {
-      version: 1,
+      version: nextMigrationVersion,
       name: 'escape_transaction',
       checksum: checksumMigrationPair('SELECT escape', escapingSql),
       sqlite: 'SELECT escape',
@@ -370,10 +376,10 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
     const client = await pool.connect()
 
     try {
-      await expect(runPgMigrations(client, [baseline, escaping])).rejects.toThrow(
+      await expect(runPgMigrations(client, [...migrations, escaping])).rejects.toThrow(
         /EXECUTE of transaction commands is not implemented/,
       )
-      expect((await ledger(testSchema)).map(({ version }) => version)).toEqual([0])
+      expect((await ledger(testSchema)).map(({ version }) => version)).toEqual(appliedVersions)
       expect(
         await testSchema.admin.query(
           `SELECT to_regclass('${testSchema.schema}.escaped_transaction') AS escaped`,
@@ -389,10 +395,9 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
     const testSchema = await createSchema('migration_pending_race')
     await testSchema.db.identity.init()
     await testSchema.db.close()
-    const baseline = loadMetaMigrations()[0]
     const sql = 'CREATE TABLE concurrent_probe (value TEXT)'
     const pending: MetaMigration = {
-      version: 1,
+      version: nextMigrationVersion,
       name: 'add_concurrent_probe',
       checksum: checksumMigrationPair('SELECT probe', sql),
       sqlite: 'SELECT probe',
@@ -404,10 +409,13 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
 
     try {
       await Promise.all([
-        runPgMigrations(first, [baseline, pending]),
-        runPgMigrations(second, [baseline, pending]),
+        runPgMigrations(first, [...migrations, pending]),
+        runPgMigrations(second, [...migrations, pending]),
       ])
-      expect((await ledger(testSchema)).map(({ version }) => version)).toEqual([0, 1])
+      expect((await ledger(testSchema)).map(({ version }) => version)).toEqual([
+        ...appliedVersions,
+        nextMigrationVersion,
+      ])
     } finally {
       first.release()
       second.release()

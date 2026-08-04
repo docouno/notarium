@@ -1,4 +1,5 @@
 import { agentContext } from './cases/agentContext'
+import { agentSessions } from './cases/agentSessions'
 import { dashboardActivity } from './cases/dashboardActivity'
 import { demo } from './cases/demo'
 import { explorerScroll } from './cases/explorerScroll'
@@ -56,6 +57,7 @@ export const CASES: readonly CaseSpec[] = [
   longDocument,
   // agent memory / context
   agentContext,
+  agentSessions,
   memoryPerf,
   // import
   importThread,

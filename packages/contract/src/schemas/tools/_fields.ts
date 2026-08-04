@@ -15,3 +15,13 @@ export const locationFields = {
   project: ProjectHandleSchema.optional(),
   path: z.string().optional(),
 }
+
+/** A server-minted agent-work episode id. The long behavioural instructions live
+ * on start_session; repeating them on every tool would bloat tools/list. */
+export const AgentSessionIdSchema = z.string().regex(/^ses_[A-Za-z0-9_-]{12}$/)
+
+/** Every auditable/delta-relevant tool carries this field. Batch tools attach once
+ * at the outer call, never per item. whoami/get_my_projects deliberately omit it. */
+export const sessionField = {
+  session: AgentSessionIdSchema.describe('the sessionId from start_session').optional(),
+}

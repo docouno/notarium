@@ -1,0 +1,166 @@
+import type {
+  AgentSessionNamedStart,
+  AgentSessionRecord,
+  AgentSessionsPersistence,
+} from '@notarium/server'
+
+const clone = (record: AgentSessionRecord): AgentSessionRecord => ({ ...record })
+
+/** In-memory executable twin of the durable agent-sessions facet. Every method is
+ * synchronous up to its resolved Promise, so inferActiveAndTouch keeps the same
+ * exact-one atomic observation as a single SQL statement. */
+export class InMemoryAgentSessions implements AgentSessionsPersistence {
+  private readonly records = new Map<string, AgentSessionRecord>()
+
+  clear(): void {
+    this.records.clear()
+  }
+
+  seed(records: readonly AgentSessionRecord[]): void {
+    this.clear()
+    const pending = new Map(records.map((record) => [record.id, record]))
+
+    if (pending.size !== records.length) {
+      throw new Error('duplicate agent session id in seed')
+    }
+
+    while (pending.size > 0) {
+      let inserted = false
+
+      for (const [id, record] of pending) {
+        if (!record.parentId || this.records.has(record.parentId)) {
+          this.insertChecked(record)
+          pending.delete(id)
+          inserted = true
+        }
+      }
+
+      if (!inserted) {
+        const record = pending.values().next().value as AgentSessionRecord
+        throw new Error(`no such parent agent session: ${record.parentId}`)
+      }
+    }
+  }
+
+  async insert(session: AgentSessionRecord): Promise<void> {
+    this.insertChecked(session)
+  }
+
+  private insertChecked(session: AgentSessionRecord): void {
+    if (this.records.has(session.id)) {
+      throw new Error(`duplicate agent session id: ${session.id}`)
+    }
+    if (
+      session.parentId &&
+      ![...this.records.values()].some(
+        (candidate) => candidate.id === session.parentId && candidate.owner === session.owner,
+      )
+    ) {
+      throw new Error(`no such parent agent session: ${session.parentId}`)
+    }
+    this.records.set(session.id, clone(session))
+  }
+
+  async touch(
+    owner: string,
+    id: string,
+    lastSeenAt: string,
+    retainedSince: string,
+  ): Promise<AgentSessionRecord | null> {
+    const record = this.records.get(id)
+
+    if (!record || record.owner !== owner || record.lastSeenAt < retainedSince) {
+      return null
+    }
+    record.lastSeenAt = record.lastSeenAt > lastSeenAt ? record.lastSeenAt : lastSeenAt
+    record.calls += 1
+    return clone(record)
+  }
+
+  async inferActiveAndTouch(
+    owner: string,
+    activeSince: string,
+    lastSeenAt: string,
+  ): Promise<AgentSessionRecord | null> {
+    const active = [...this.records.values()].filter(
+      (record) => record.owner === owner && record.lastSeenAt >= activeSince,
+    )
+
+    if (active.length !== 1) {
+      return null
+    }
+    const record = active[0]
+    record.lastSeenAt = record.lastSeenAt > lastSeenAt ? record.lastSeenAt : lastSeenAt
+    record.calls += 1
+    return clone(record)
+  }
+
+  async startNamed(
+    candidate: AgentSessionRecord,
+    activeSince: string,
+    retainedSince: string,
+    limit: number,
+  ): Promise<AgentSessionNamedStart> {
+    const matches = this.list(candidate.owner, retainedSince, limit + 1, candidate.name)
+
+    if (matches.length > 1) {
+      return { kind: 'ambiguous', matches: matches.slice(0, limit) }
+    }
+
+    const match = matches[0]
+
+    if (!match) {
+      this.insertChecked(candidate)
+      return { kind: 'new', record: clone(candidate) }
+    }
+
+    if (match.lastSeenAt >= activeSince) {
+      const fork = { ...candidate, parentId: match.id }
+      this.insertChecked(fork)
+      return { kind: 'forked', record: clone(fork) }
+    }
+
+    const stored = this.records.get(match.id)!
+    stored.lastSeenAt =
+      stored.lastSeenAt > candidate.lastSeenAt ? stored.lastSeenAt : candidate.lastSeenAt
+    stored.calls += 1
+    return { kind: 'resumed', record: clone(stored) }
+  }
+
+  async listRecent(owner: string, since: string, limit: number): Promise<AgentSessionRecord[]> {
+    return this.list(owner, since, limit)
+  }
+
+  async prune(before: string): Promise<void> {
+    const removed = new Set<string>()
+
+    for (const [id, record] of this.records) {
+      if (record.lastSeenAt < before) {
+        this.records.delete(id)
+        removed.add(id)
+      }
+    }
+    // Mirrors ON DELETE SET NULL on the durable self-reference.
+    for (const record of this.records.values()) {
+      if (record.parentId && removed.has(record.parentId)) {
+        record.parentId = null
+      }
+    }
+  }
+
+  private list(owner: string, since: string, limit: number, name?: string): AgentSessionRecord[] {
+    return [...this.records.values()]
+      .filter(
+        (record) =>
+          record.owner === owner &&
+          record.lastSeenAt >= since &&
+          (name == null || record.name === name),
+      )
+      .sort(
+        (left, right) =>
+          right.lastSeenAt.localeCompare(left.lastSeenAt) || right.id.localeCompare(left.id),
+      )
+      .slice(0, limit)
+      .map(clone)
+  }
+}

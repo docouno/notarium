@@ -2,6 +2,7 @@ import { z } from 'zod'
 import { EDIT_OPERATION, WRITE_OUTCOME } from '../../consts/tools'
 import { enumValues } from '../../libs/enumValues'
 import { IsoTimestampSchema, SpaceSlugSchema } from '../primitives'
+import { sessionField } from './_fields'
 import { ProjectHandleSchema, RefSchema } from './primitives'
 
 /** CAS + idempotency mixin for the create/edit tools (`link` takes neither —
@@ -14,6 +15,7 @@ const casFields = {
 /** Tool `remember_about_user`: record a durable fact into the user's personal
  *  agent-memory. canon: docs/note-model.md#agent-memory */
 export const RememberAboutUserInputSchema = z.object({
+  ...sessionField,
   observation: z.string().min(1),
   category: z.string().default('general'),
   summary: z.string().optional(),
@@ -31,6 +33,7 @@ export const InlineLinkSchema = z.object({
 /** Tool `create_note`: create a `user-doc` KB note in a project — the agent picks
  *  neither space nor class. canon: docs/mcp-gateway.md#tools */
 export const CreateNoteInputSchema = z.object({
+  ...sessionField,
   project: ProjectHandleSchema,
   title: z.string().optional(),
   body: z.string(),
@@ -47,12 +50,14 @@ export const CreateNoteInputSchema = z.object({
  *  (hoisted to the batch) and `versionToken` (a create is additive). */
 export const CreateNoteItemSchema = CreateNoteInputSchema.omit({
   project: true,
+  session: true,
   versionToken: true,
 })
 
 /** Tool `create_notes`: best-effort batch create in one project (per-item
  *  success/failure, never a rollback). canon: docs/mcp-gateway.md#tools */
 export const CreateNotesInputSchema = z.object({
+  ...sessionField,
   project: ProjectHandleSchema,
   notes: z.array(CreateNoteItemSchema).min(1).max(50),
 })
@@ -90,6 +95,7 @@ export const LinkItemSchema = z.object({
 /** Tool `link_many`: best-effort batch of typed links in one call.
  *  canon: docs/mcp-gateway.md#tools */
 export const LinkManyInputSchema = z.object({
+  ...sessionField,
   links: z.array(LinkItemSchema).min(1).max(100),
 })
 
@@ -109,6 +115,7 @@ export const LinkManyOutputSchema = z.object({
 /** Tool `remember_about_project`: record a durable fact into the project's
  *  agent-memory. canon: docs/note-model.md#agent-memory */
 export const RememberAboutProjectInputSchema = z.object({
+  ...sessionField,
   project: ProjectHandleSchema,
   observation: z.string().min(1),
   category: z.string().default('general'),
@@ -122,6 +129,7 @@ export const EditOperationSchema = z.enum(enumValues(EDIT_OPERATION))
  *  covers all modes — the edit op enforces the pairing.
  *  canon: docs/mcp-gateway.md#tools */
 export const EditNoteInputSchema = z.object({
+  ...sessionField,
   ref: RefSchema,
   operation: EditOperationSchema,
   content: z.string(),
@@ -133,6 +141,7 @@ export const EditNoteInputSchema = z.object({
 /** Tool `link`: create a typed wikilink between two notes in the same space
  *  (`to` note-id XOR `toTitle` forward-ref). canon: docs/note-model.md#note-ontology */
 export const LinkInputSchema = z.object({
+  ...sessionField,
   from: RefSchema,
   to: RefSchema.optional(),
   toTitle: z.string().min(1).optional(),

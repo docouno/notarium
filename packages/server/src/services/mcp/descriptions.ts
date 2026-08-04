@@ -27,11 +27,12 @@ export type ToolMeta = {
 export const TOOL_META = {
   start_session: {
     description:
-      "Call this FIRST in a new session. Idempotent and safe to call again. Loads, in one round-trip, what you would otherwise discover in several calls: the user's always-load profile (a digest of their agent-memory plus pinned notes), the project workspaces you can reach, and — when you pass a `project` hint — that project's compact index (its note COUNT and top-level folders — enumerate the notes with list_notes), its pinned always-load notes (curated FOR this project), what changed in it since you last looked (the delta; each entry labelled with its project/path so a sibling project's churn in a shared space is distinguishable), and `knownValues` (the relation/category/tag vocabulary already in use in that project — REUSE these instead of coining synonyms). Not calling it just means less context; every other tool works on its own. `acknowledge:false` peeks at the delta without advancing your \"last seen\" marker. Large bundles are truncated honestly (`truncated:true`) — fall back to list_notes/search for the rest.",
+      'Call this FIRST in a new session. When the host supports agent episodes, it opens or resumes one and returns `session.id`; KEEP a returned id and pass it as the top-level `session` argument on every later tool call. Address by id to resume exactly, or by a non-unique human name: a sleeping match resumes, an active match forks, and ambiguous matches return matching choices. Loads, in one round-trip, what you would otherwise discover in several calls: the user\'s always-load profile, reachable projects, and — with a `project` hint — its compact index, pinned notes, delta and known vocabulary. `acknowledge:false` peeks at the delta without advancing your "last seen" marker. Large bundles are truncated honestly (`truncated:true`) — fall back to list_notes/search for the rest.',
     annotations: {
       title: 'Start session',
-      readOnlyHint: true,
-      idempotentHint: true,
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
       openWorldHint: false,
     },
   },
@@ -256,7 +257,7 @@ export const SERVER_INFO = { name: 'notarium', version: '0.8.0' } as const
 /** The server `instructions` text (returned in `initialize`) — the main lever on
  *  call ordering; keep it a STATIC literal (no note content) and under ~200 words. */
 export const SERVER_INSTRUCTIONS = [
-  'Notarium is your knowledge workspace. Call `start_session` first in a new session to load your profile, your projects, and what changed since you last looked — every other tool also works on its own.',
+  'Call `start_session` first. When it returns `session.id`, retain that id and pass it as the top-level `session` argument on every subsequent tool call. Notarium is your knowledge workspace; the bootstrap also loads your profile, projects, and what changed since you last looked.',
   'Search before you write: `search` finds existing notes — and now your own agent-memory too — so you do not create duplicates. To browse structure use `list_notes` (an `ls` of a folder) and `recent_activity` (the latest changes).',
   'Three kinds of writing: `remember_about_user` and `remember_about_project` record durable facts into private memory (about the user / about a project); `create_note` adds shared, user-visible knowledge to a project. The agent never picks where memory goes — its location is fixed. Migrating or importing many notes? Use `create_notes` and `link_many` (batch, best-effort per item) instead of one call each.',
   'Change a note with `edit_note`, addressed by words — a heading or an exact snippet, never line numbers; memory is just a note, corrected the same way. Reorganize, all `verb_entity`: a note with `move_note` (to another folder) / `rename_note` (its title); a whole folder with `move_folder` / `rename_folder` (by its `path` from list_notes); a project with `rename_project` (its handle/name) — renames are link-safe (old names keep resolving). Remove a whole note with `delete_note`: it is reversible — the note goes to the trash and the user can restore it. Connect notes with `link` — `toTitle` forward-references a note not created yet.',

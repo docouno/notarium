@@ -278,6 +278,32 @@ describe('seed catalog (#175)', () => {
     expect(w.auth?.connectedApps?.some((app) => app.appName === 'Claude')).toBe(true)
   })
 
+  it('agent-sessions carries active, forked, sleeping, automatic and expired episodes', () => {
+    const world = buildCaseWorld('agent-sessions', { now: DEFAULT_NOW })
+    const sessions = world.agentSessions ?? []
+    expect(sessions).toHaveLength(6)
+    expect(sessions.find((session) => session.parentRef)?.parentRef).toBe('review-root')
+    expect(sessions.some((session) => session.named === false)).toBe(true)
+    expect(sessions.some((session) => session.lastSeenDaysAgo > 30)).toBe(true)
+
+    const fixture = caseToFixture(world)
+    expect(fixture.agentSessions).toHaveLength(6)
+    expect(
+      fixture.agentSessions?.every((session) => /^ses_[A-Za-z0-9_-]{12}$/.test(session.id)),
+    ).toBe(true)
+    const fork = fixture.agentSessions?.find((session) => session.parentId)
+    expect(fixture.agentSessions?.some((session) => session.id === fork?.parentId)).toBe(true)
+  })
+
+  it('combining cases namespaces agent-session refs and their parent chain', () => {
+    const combined = buildCasesWorld('agent-sessions,multi-space', { now: DEFAULT_NOW })
+    const fork = combined.agentSessions?.find((session) => session.ref.endsWith('review-fork'))
+    expect(fork).toMatchObject({
+      ref: 'agent-sessions:review-fork',
+      parentRef: 'agent-sessions:review-root',
+    })
+  })
+
   it('multi-space carries an unapproved OAuth registration', () => {
     const pending = buildCaseWorld('multi-space', { now: DEFAULT_NOW }).auth?.pendingOAuthClients
     expect(pending).toEqual([

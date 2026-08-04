@@ -14,9 +14,11 @@ import {
 } from '@notarium/contract/tools'
 import { slugify } from '@notarium/core'
 
+import { type AgentSessions, type BoundAgentSession, createAgentSessions } from '../agentSessions'
 import { type AuthService } from '../auth'
 import { type Action, can, type Principal, scopeAllows } from '../authz'
 import type {
+  AgentSessionsPersistence,
   ContextOrderPersistence,
   ContextSetsPersistence,
   FolderIdentityPersistence,
@@ -56,6 +58,9 @@ import { handleStartSession } from './tools/session'
 export type GatewayDeps = {
   spaces: SpaceManager
   auth: AuthService
+  /** Durable, owner-scoped agent episodes. Absent means the whole session feature
+   *  degrades away: start_session emits no session and regular calls ignore it. */
+  sessions?: AgentSessionsPersistence
   /** Per-token gateway state: start_session bookmarks + write dedup.
    *  Absent → no delta cursor, no retry-dedup (honest degradation). */
   gatewayState?: GatewayStatePersistence
@@ -125,6 +130,11 @@ export type Ctx = {
   scopePins?: ScopePinsPersistence
   contextOrder?: ContextOrderPersistence
   gatewayState?: GatewayStatePersistence
+  agentSessions?: AgentSessions
+  /** Stable session owner: username in password mode, `system` in none mode. */
+  sessionOwner: string | null
+  /** Episode attached to this call. start_session fills it after opening one. */
+  session?: BoundAgentSession
   now(): Date
   /** Peek the personal-domain slug; NEVER provisions (a read surface must not mint
    *  a space). none-mode → the host's first space. */
@@ -166,6 +176,9 @@ const errorResult = (text: string): ToolResult => ({
 export const createGateway = (deps: GatewayDeps): McpGateway => {
   const store = createStoreAccess(deps.spaces)
   const now = deps.now ?? (() => new Date())
+  const agentSessions = deps.sessions
+    ? createAgentSessions({ persistence: deps.sessions, now })
+    : undefined
 
   const ctxFor = (principal: Principal): Ctx => {
     // Both return the STABLE space id — the gateway addresses stores/meta-DB by id;
@@ -195,6 +208,8 @@ export const createGateway = (deps: GatewayDeps): McpGateway => {
       scopePins: deps.scopePins,
       contextOrder: deps.contextOrder,
       gatewayState: deps.gatewayState,
+      agentSessions,
+      sessionOwner: principal.username ?? (principal.system ? 'system' : null),
       now,
       personalSpace,
       ensurePersonalDomain: () =>
@@ -343,7 +358,19 @@ export const createGateway = (deps: GatewayDeps): McpGateway => {
         )
       }
       try {
-        const { markdown, structured } = await handler(ctxFor(principal), parsed.data)
+        const ctx = ctxFor(principal)
+
+        if (
+          agentSessions &&
+          ctx.sessionOwner &&
+          name !== 'start_session' &&
+          name !== 'whoami' &&
+          name !== 'get_my_projects'
+        ) {
+          const sessionId = (parsed.data as { session?: string }).session
+          ctx.session = (await agentSessions.attach(ctx.sessionOwner, sessionId)) ?? undefined
+        }
+        const { markdown, structured } = await handler(ctx, parsed.data)
         // Validate the machine payload against the contract before it leaves (P9
         // boundary discipline): a drift fails loudly here, never silently corrupts
         // the agent's context.

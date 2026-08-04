@@ -16,6 +16,7 @@ import { type Principal, SYSTEM_PRINCIPAL } from '../../../../services/authz'
 import { SERVER_INFO, SERVER_INSTRUCTIONS } from '../../../../services/mcp/descriptions'
 import { createGateway, type McpGateway } from '../../../../services/mcp/gateway'
 import type {
+  AgentSessionsPersistence,
   ContextOrderPersistence,
   ContextSetsPersistence,
   FolderIdentityPersistence,
@@ -31,6 +32,7 @@ import { baseUrlOf, wwwAuthenticateChallenge } from '../oauth'
 export type McpOptions = {
   spaces: SpaceManager
   auth: AuthService
+  sessions?: AgentSessionsPersistence
   gatewayState?: GatewayStatePersistence
   /** Absent ⇒ no retrieval audit capture (P5 honest degradation).
    *  canon: docs/projects.md#audit-auditing-the-runtime-retrieval-243-mem-audita */
@@ -95,6 +97,7 @@ export const registerMcp = async (
   {
     spaces,
     auth,
+    sessions,
     gatewayState,
     retrievalLog,
     projects,
@@ -112,6 +115,7 @@ export const registerMcp = async (
   const gateway = createGateway({
     spaces,
     auth,
+    sessions,
     gatewayState,
     retrievalLog,
     projects,

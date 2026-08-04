@@ -1,6 +1,6 @@
 import { z } from 'zod'
 import { IsoTimestampSchema, NoteClassSchema } from '../primitives'
-import { locationFields } from './_fields'
+import { locationFields, sessionField } from './_fields'
 import {
   ProjectHandleSchema,
   ProvenanceSchema,
@@ -12,6 +12,7 @@ import {
 /** Tool `search`: hybrid ranked search over reachable knowledge, incl. the agent's
  *  own memory. canon: docs/mcp-gateway.md#tools */
 export const SearchInputSchema = z.object({
+  ...sessionField,
   query: z.string().min(1),
   project: ProjectHandleSchema.optional(),
   /** `agent-memory` = only memory, `user-doc` = exclude it, omit = every visible
@@ -38,6 +39,7 @@ export const SearchOutputSchema = z.object({ results: z.array(SearchHitSchema) }
 /** Tool `get_note`: a full note by ref (note-id or in-space wiki-ref).
  *  canon: docs/mcp-gateway.md#tools */
 export const GetNoteInputSchema = z.object({
+  ...sessionField,
   ref: RefSchema,
   responseFormat: ResponseFormatSchema.default(RESPONSE_FORMAT.detailed),
 })
@@ -82,6 +84,7 @@ export const GetNoteOutputSchema = z.object({
 /** Tool `recall`: assemble a token-budgeted context bundle around a query (seed
  *  notes + their graph neighbours). canon: docs/mcp-gateway.md#tools */
 export const RecallInputSchema = z.object({
+  ...sessionField,
   query: z.string().min(1),
   project: ProjectHandleSchema.optional(),
   /** Token cap on the whole assembled bundle. */

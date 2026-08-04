@@ -1,9 +1,16 @@
 // start_session: the agent bootstrap bundle — profile/always-load, per-project index + delta, known-values vocabulary.
 // canon: docs/mcp-gateway.md#tools · docs/projects.md#init-context-curation
 import { CONTEXT_KIND } from '@notarium/contract'
-import { type DeltaEntry, type FolderEntry, type StartSessionInput } from '@notarium/contract/tools'
+import {
+  type AgentSession,
+  type DeltaEntry,
+  type FolderEntry,
+  type RecentAgentSession,
+  type StartSessionInput,
+} from '@notarium/contract/tools'
 import { buildMemoryIndex, isPathUnder, READ_SCOPE, treeChildren } from '@notarium/core'
 
+import { AGENT_SESSION_IDLE_MS } from '../../../agentSessions'
 import { type ProjectRecord } from '../../../metaDb'
 import {
   type CuratedPin,
@@ -32,6 +39,15 @@ const INDEX_FOLDERS_LIMIT = 50
 /** Known-values caps: the start_session vocabulary, kept compact. */
 const KNOWN_CATEGORIES_LIMIT = 50
 const KNOWN_TAGS_LIMIT = 50
+
+/** Session names are agent-supplied labels, so normalise control characters and
+ * defang prompt-control pseudo-tags before storage and every wire projection. */
+const safeSessionName = (name: string): string =>
+  sanitizeText(name)
+    // eslint-disable-next-line no-control-regex -- labels cannot carry line/control boundaries
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .trim()
+    .slice(0, 160) || 'session'
 
 /** The eager always-load profile: loaded agent-memory summaries + always-load pins.
  *  canon: docs/note-model.md#agent-memory */
@@ -341,10 +357,29 @@ const buildKnownValues = async (
 }
 
 export const handleStartSession: Handler = async (ctx, rawArgs) => {
-  const { project, acknowledge, responseFormat } = rawArgs as StartSessionInput
+  const {
+    project,
+    session: sessionRequest,
+    acknowledge,
+    responseFormat,
+  } = rawArgs as StartSessionInput
   // A project hint is a handle: resolve collapses existence + reachability into one
   // 404-semantic error (anti-enumeration).
   const hinted = project !== undefined ? await ctx.resolveProject(project) : undefined
+  const now = ctx.now()
+  const opened =
+    ctx.agentSessions && ctx.sessionOwner
+      ? await ctx.agentSessions.start(
+          ctx.sessionOwner,
+          sessionRequest?.id
+            ? { id: sessionRequest.id }
+            : sessionRequest?.name
+              ? { name: safeSessionName(sessionRequest.name) }
+              : undefined,
+          `${hinted ? handleOf(hinted, ctx.spaces.slugOf(hinted.space) ?? hinted.space) : 'personal'} · ${now.toISOString().slice(0, 16).replace('T', ' ')}`,
+        )
+      : undefined
+  ctx.session = opened?.session
   const projects = await ctx.readableProjects()
   const {
     profile,
@@ -355,7 +390,28 @@ export const handleStartSession: Handler = async (ctx, rawArgs) => {
   // Fold bundle-internal `indexTruncated` into the top-level signal, then drop it.
   const truncated = curationTruncated || Boolean(bundle?.indexTruncated)
 
+  const session: AgentSession | undefined = opened?.session
+    ? {
+        id: opened.session.record.id,
+        name: safeSessionName(opened.session.record.name),
+        named: opened.session.record.named,
+        state: opened.session.state,
+        ...(opened.session.record.parentId ? { parentId: opened.session.record.parentId } : {}),
+        hint: `Keep this session id and pass session: "${opened.session.record.id}" on every subsequent tool call.`,
+      }
+    : undefined
+  const recentSessions: RecentAgentSession[] | undefined = opened?.recentSessions?.map(
+    (record) => ({
+      id: record.id,
+      name: safeSessionName(record.name),
+      lastActiveAt: record.lastSeenAt,
+      active: record.lastSeenAt >= new Date(now.getTime() - AGENT_SESSION_IDLE_MS).toISOString(),
+      calls: record.calls,
+    }),
+  )
   const structured = {
+    ...(session ? { session } : {}),
+    ...(recentSessions ? { recentSessions } : {}),
     profile,
     projects: projects.map((p) => ({ ...p, displayName: sanitizeText(p.displayName) })),
     ...(bundle

@@ -18,6 +18,7 @@ import { createRetrievalLogFacet } from './drivers/pg/retrievalLog'
 import { lockRevisionKeys } from './drivers/pg/revisionLocks'
 import { createRevisionsFacet } from './drivers/pg/revisions'
 import { createScopePinsFacet } from './drivers/pg/scopePins'
+import { createSessionsFacet } from './drivers/pg/sessions'
 import { createSpacesFacet } from './drivers/pg/spaces'
 import { runPgMigrations } from './migrations'
 import { spaceOfRow, type SpaceRow } from './rows'
@@ -292,6 +293,8 @@ export class PgMetaDb implements MetaDb {
   readonly auth = createAuthFacet(this.ctx)
 
   readonly gateway = createGatewayFacet(this.ctx)
+
+  readonly sessions = createSessionsFacet(this.ctx)
 
   readonly oauth = createOAuthFacet(this.ctx)
 

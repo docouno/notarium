@@ -462,6 +462,7 @@ export const createServer = async ({
     spaces: manager,
     auth,
     scheduler,
+    sessions: metaDb?.sessions,
     gatewayState: metaDb?.gateway,
     retrievalLog: metaDb?.retrievalLog,
     projects: metaDb?.projects,

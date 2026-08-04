@@ -2,12 +2,18 @@ import { describe, expect, it } from 'vitest'
 
 import { InMemoryRevisionPersistence, type RevisionInput } from '@notarium/core'
 
+import { InMemoryAgentSessions } from '../fake-server/agentSessions'
 import { InMemoryGatewayState } from '../fake-server/gatewayState'
+import { describeAgentSessionsContract } from './agentSessionsContract'
 import { describeGatewayStateContract } from './gatewayStateContract'
 import { describeRevisionPersistenceContract } from './revisionPersistenceContract'
 
 describeGatewayStateContract('in-memory twin', async () => ({
   persistence: new InMemoryGatewayState(),
+}))
+
+describeAgentSessionsContract('in-memory twin', async () => ({
+  persistence: new InMemoryAgentSessions(),
 }))
 
 describeRevisionPersistenceContract('in-memory twin', async () => ({

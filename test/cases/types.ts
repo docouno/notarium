@@ -137,6 +137,21 @@ export type RetrievalDecl = {
   daysAgo: number
 }
 
+/** One durable agent episode. Session ids are derived deterministically from
+ * `ref` by both seed projections; `parentRef` preserves fork ancestry. */
+export type AgentSessionDecl = {
+  ref: string
+  /** Username owner; defaults to the primary seed owner. */
+  owner?: string
+  name: string
+  /** False for the automatic project/time label; defaults to true. */
+  named?: boolean
+  parentRef?: string
+  createdDaysAgo: number
+  lastSeenDaysAgo: number
+  calls: number
+}
+
 /** One durable job (#105) a case declares — a meta-DB row PLUS, for a finished
  *  export, a real archive in the artifact store under `<DATA_DIR>/jobs` (#101). Like
  *  connectedApps/retrievals it is a REAL-applier-only side-channel (the fake
@@ -326,6 +341,8 @@ export type CaseWorld = {
   /** Agent-retrieval audit rows (#243) — a meta-DB-only side-channel written by the real
    *  applier after the timeline replays (so `hits` note-ids resolve). Absent = none. */
   retrievals?: RetrievalDecl[]
+  /** Durable agent episodes, projected to both the fake and real meta-DB. */
+  agentSessions?: AgentSessionDecl[]
   /** Durable job rows + their artifacts (#105) — real applier only, written after the
    *  timeline replays (a seeded export archives the notes it just seeded). Absent = none. */
   jobs?: JobDecl[]

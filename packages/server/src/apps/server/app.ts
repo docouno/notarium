@@ -18,6 +18,7 @@ import type { ImportStagingStore } from '../../libs/importStaging'
 import type { MutationGate, MutationRelease } from '../../libs/mutationGate'
 import { AuthError, type AuthService, createAuthService } from '../../services/auth'
 import type {
+  AgentSessionsPersistence,
   ContextOrderPersistence,
   ContextSetsPersistence,
   FavoritesPersistence,
@@ -46,6 +47,7 @@ import { conflictToWire } from './routes/wire'
 export type BuildAppOptions = {
   spaces: SpaceManager
   auth?: AuthService
+  sessions?: AgentSessionsPersistence
   gatewayState?: GatewayStatePersistence
   projects?: ProjectsPersistence
   folders?: FolderIdentityPersistence
@@ -84,6 +86,7 @@ export type BuildAppOptions = {
 export const buildApp = async ({
   spaces,
   auth,
+  sessions,
   gatewayState,
   retrievalLog,
   projects,
@@ -352,6 +355,7 @@ export const buildApp = async ({
   await registerMcp(app, {
     spaces,
     auth: authService,
+    sessions,
     gatewayState,
     retrievalLog,
     projects,

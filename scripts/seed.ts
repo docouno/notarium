@@ -58,6 +58,7 @@ import {
 import { buildCasesWorld, listCases } from '../test/cases'
 import type { CaseWorld, UserDecl } from '../test/cases'
 import { normDate } from '../test/cases/generators'
+import { agentSessionId } from '../test/cases/sessionIds'
 import { seedDurableImports } from './seedDurableImports'
 import { applySeedExternalRewrites } from './seedExternalRewrites'
 import { makeOwnerRemap } from './seedOwner'
@@ -419,6 +420,38 @@ const run = async (): Promise<void> => {
       activatedAt: null,
     })
     pendingOAuthClients++
+  }
+
+  // 3c. Durable agent episodes. Parent refs form a small DAG; resolve it
+  // topologically so a combined case need not depend on declaration order.
+  let agentSessions = 0
+  const pendingSessions = [...(world.agentSessions ?? [])]
+  const insertedSessionRefs = new Set<string>()
+
+  while (pendingSessions.length) {
+    const index = pendingSessions.findIndex(
+      (session) => !session.parentRef || insertedSessionRefs.has(session.parentRef),
+    )
+
+    if (index < 0) {
+      throw new Error(
+        `agent sessions contain a missing or cyclic parent: ${pendingSessions.map((s) => s.ref).join(', ')}`,
+      )
+    }
+    const [session] = pendingSessions.splice(index, 1)
+    const owner = session.owner ? asUser(session.owner) : primary.username
+    await metaDb.sessions.insert({
+      id: agentSessionId(session.ref),
+      owner,
+      name: session.name,
+      named: session.named ?? true,
+      parentId: session.parentRef ? agentSessionId(session.parentRef) : null,
+      createdAt: daysAgoIso(session.createdDaysAgo),
+      lastSeenAt: daysAgoIso(session.lastSeenDaysAgo),
+      calls: session.calls,
+    })
+    insertedSessionRefs.add(session.ref)
+    agentSessions++
   }
 
   // 4. Replay the timeline. Group by space and replay each space's events in date
@@ -1033,6 +1066,7 @@ const run = async (): Promise<void> => {
           contextOrders,
           connectedApps,
           pendingOAuthClients,
+          agentSessions,
           favorites,
           retrievals,
           jobs,

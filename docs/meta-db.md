@@ -4,6 +4,8 @@ The meta-DB contains state that cannot be reconstructed from Markdown alone:
 stable identities, revision history and blobs, accounts and credentials,
 memberships, durable jobs, OAuth state, and user curation. Its SQLite and
 PostgreSQL drivers therefore share one forward-only, checksummed schema history.
+Durable owner-scoped agent episodes live here too (`agent_sessions`, added by
+`0001_agent_sessions`); they are not reconstructible from note files.
 The derived per-space search/index database has a different recovery contract:
 it may be discarded and rebuilt, so its migration mechanism is deliberately not
 unified with this one.
@@ -16,7 +18,9 @@ Migration assets live under
 ```text
 manifest.json
 sqlite/0000_baseline.sql
+sqlite/0001_agent_sessions.sql
 postgres/0000_baseline.sql
+postgres/0001_agent_sessions.sql
 ```
 
 Every manifest entry has one contiguous integer version, one snake-case name,

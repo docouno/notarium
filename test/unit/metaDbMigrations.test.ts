@@ -27,6 +27,9 @@ const sourceDirectory = fileURLToPath(
 describe('meta-DB migration assets and SQLite runner', () => {
   const databases: DatabaseSync[] = []
   const directories: string[] = []
+  const migrations = loadMetaMigrations()
+  const nextMigrationVersion = migrations.length
+  const appliedVersions = migrations.map(({ version }) => version)
 
   afterEach(() => {
     while (databases.length) {
@@ -55,15 +58,14 @@ describe('meta-DB migration assets and SQLite runner', () => {
       .prepare('SELECT version, name, checksum, applied_at FROM meta_migrations ORDER BY version')
       .all() as LedgerRow[]
 
-  it('loads one checksummed dialect pair as the clean baseline', () => {
-    const migrations = loadMetaMigrations()
-
-    expect(migrations).toHaveLength(1)
-    expect(migrations[0]).toMatchObject({
-      version: 0,
-      name: 'baseline',
-      checksum: checksumMigrationPair(migrations[0].sqlite, migrations[0].postgres),
-    })
+  it('loads the current checksummed dialect pairs from a clean baseline', () => {
+    expect(migrations.map(({ version, name }) => ({ version, name }))).toEqual([
+      { version: 0, name: 'baseline' },
+      { version: 1, name: 'agent_sessions' },
+    ])
+    for (const migration of migrations) {
+      expect(migration.checksum).toBe(checksumMigrationPair(migration.sqlite, migration.postgres))
+    }
   })
 
   it('creates the complete current SQLite schema and an immutable ledger row atomically', () => {
@@ -71,13 +73,15 @@ describe('meta-DB migration assets and SQLite runner', () => {
     runSqliteMigrations(db)
 
     const rows = ledger(db)
-    expect(rows).toHaveLength(1)
+    expect(rows).toHaveLength(migrations.length)
     expect(rows[0]).toMatchObject({
       version: 0,
       name: 'baseline',
-      checksum: loadMetaMigrations()[0].checksum,
+      checksum: migrations[0].checksum,
     })
-    expect(Number.isNaN(Date.parse(rows[0].applied_at))).toBe(false)
+    for (const row of rows) {
+      expect(Number.isNaN(Date.parse(row.applied_at))).toBe(false)
+    }
 
     const counts = Object.fromEntries(
       (
@@ -93,7 +97,7 @@ describe('meta-DB migration assets and SQLite runner', () => {
           .all() as Array<{ type: string; count: number }>
       ).map(({ type, count }) => [type, count]),
     )
-    expect(counts).toEqual({ index: 28, table: 24, trigger: 1 })
+    expect(counts).toEqual({ index: 31, table: 25, trigger: 1 })
     expect(
       db.prepare("SELECT 1 FROM sqlite_schema WHERE name = 'meta_schema'").get(),
     ).toBeUndefined()
@@ -134,19 +138,21 @@ describe('meta-DB migration assets and SQLite runner', () => {
     },
     {
       label: 'a version gap',
-      mutate: (db: DatabaseSync) => db.exec('UPDATE meta_migrations SET version = 1'),
+      mutate: (db: DatabaseSync) => db.exec('DELETE FROM meta_migrations WHERE version = 0'),
       message: /expected version 0, found 1/,
     },
     {
       label: 'name drift',
       mutate: (db: DatabaseSync) =>
-        db.exec("UPDATE meta_migrations SET name = 'rewritten_baseline'"),
+        db.exec("UPDATE meta_migrations SET name = 'rewritten_baseline' WHERE version = 0"),
       message: /name mismatch/,
     },
     {
       label: 'checksum drift',
       mutate: (db: DatabaseSync) =>
-        db.exec(`UPDATE meta_migrations SET checksum = 'sha256:${'0'.repeat(64)}'`),
+        db.exec(
+          `UPDATE meta_migrations SET checksum = 'sha256:${'0'.repeat(64)}' WHERE version = 0`,
+        ),
       message: /checksum mismatch/,
     },
     {
@@ -154,9 +160,9 @@ describe('meta-DB migration assets and SQLite runner', () => {
       mutate: (db: DatabaseSync) =>
         db.exec(
           `INSERT INTO meta_migrations (version, name, checksum, applied_at)
-           VALUES (1, 'future', 'sha256:${'1'.repeat(64)}', '2099-01-01T00:00:00.000Z')`,
+           VALUES (${nextMigrationVersion}, 'future', 'sha256:${'1'.repeat(64)}', '2099-01-01T00:00:00.000Z')`,
         ),
-      message: /unknown future migration 1/,
+      message: new RegExp(`unknown future migration ${nextMigrationVersion}`),
     },
   ])('fails closed on $label', ({ mutate, message }) => {
     const db = database()
@@ -176,36 +182,38 @@ describe('meta-DB migration assets and SQLite runner', () => {
 
   it('rolls back failed SQL with its ledger stamp and remains retryable after repair', () => {
     const db = database()
-    const baseline = loadMetaMigrations()[0]
     runSqliteMigrations(db)
 
     const brokenSql = `CREATE TABLE migration_probe (value TEXT);
       INSERT INTO missing_table (value) VALUES ('never')`
     const broken: MetaMigration = {
-      version: 1,
+      version: nextMigrationVersion,
       name: 'add_probe',
       checksum: checksumMigrationPair(brokenSql, 'SELECT broken'),
       sqlite: brokenSql,
       postgres: 'SELECT broken',
     }
 
-    expect(() => runSqliteMigrations(db, [baseline, broken])).toThrow(/missing_table/)
-    expect(ledger(db).map(({ version }) => version)).toEqual([0])
+    expect(() => runSqliteMigrations(db, [...migrations, broken])).toThrow(/missing_table/)
+    expect(ledger(db).map(({ version }) => version)).toEqual(appliedVersions)
     expect(
       db.prepare("SELECT 1 FROM sqlite_schema WHERE name = 'migration_probe'").get(),
     ).toBeUndefined()
 
     const repairedSql = 'CREATE TABLE migration_probe (value TEXT)'
     const repaired: MetaMigration = {
-      version: 1,
+      version: nextMigrationVersion,
       name: 'add_probe',
       checksum: checksumMigrationPair(repairedSql, 'SELECT repaired'),
       sqlite: repairedSql,
       postgres: 'SELECT repaired',
     }
-    runSqliteMigrations(db, [baseline, repaired])
+    runSqliteMigrations(db, [...migrations, repaired])
 
-    expect(ledger(db).map(({ version }) => version)).toEqual([0, 1])
+    expect(ledger(db).map(({ version }) => version)).toEqual([
+      ...appliedVersions,
+      nextMigrationVersion,
+    ])
     expect(
       db.prepare("SELECT type FROM sqlite_schema WHERE name = 'migration_probe'").get(),
     ).toEqual({ type: 'table' })
@@ -213,22 +221,21 @@ describe('meta-DB migration assets and SQLite runner', () => {
 
   it('rejects transaction control inside SQLite assets without escaping the owned transaction', () => {
     const db = database()
-    const baseline = loadMetaMigrations()[0]
     runSqliteMigrations(db)
     const escapingSql = `CREATE TABLE escaped_transaction (value TEXT);
       COMMIT;
       INSERT INTO missing_table (value) VALUES ('never')`
     const escaping: MetaMigration = {
-      version: 1,
+      version: nextMigrationVersion,
       name: 'escape_transaction',
       checksum: checksumMigrationPair(escapingSql, 'SELECT escape'),
       sqlite: escapingSql,
       postgres: 'SELECT escape',
     }
 
-    expect(() => runSqliteMigrations(db, [baseline, escaping])).toThrow(/not authorized/)
+    expect(() => runSqliteMigrations(db, [...migrations, escaping])).toThrow(/not authorized/)
     expect(db.isTransaction).toBe(false)
-    expect(ledger(db).map(({ version }) => version)).toEqual([0])
+    expect(ledger(db).map(({ version }) => version)).toEqual(appliedVersions)
     expect(
       db.prepare("SELECT 1 FROM sqlite_schema WHERE name = 'escaped_transaction'").get(),
     ).toBeUndefined()
@@ -236,22 +243,21 @@ describe('meta-DB migration assets and SQLite runner', () => {
 
   it('preserves the original error when SQLite rolls back the transaction itself', () => {
     const db = database()
-    const baseline = loadMetaMigrations()[0]
     runSqliteMigrations(db)
     const rollingBackSql = `CREATE TABLE rollback_probe (value TEXT UNIQUE);
       INSERT INTO rollback_probe (value) VALUES ('duplicate');
       INSERT OR ROLLBACK INTO rollback_probe (value) VALUES ('duplicate')`
     const rollingBack: MetaMigration = {
-      version: 1,
+      version: nextMigrationVersion,
       name: 'rollback_transaction',
       checksum: checksumMigrationPair(rollingBackSql, 'SELECT rollback'),
       sqlite: rollingBackSql,
       postgres: 'SELECT rollback',
     }
 
-    expect(() => runSqliteMigrations(db, [baseline, rollingBack])).toThrow(/UNIQUE constraint/)
+    expect(() => runSqliteMigrations(db, [...migrations, rollingBack])).toThrow(/UNIQUE constraint/)
     expect(db.isTransaction).toBe(false)
-    expect(ledger(db).map(({ version }) => version)).toEqual([0])
+    expect(ledger(db).map(({ version }) => version)).toEqual(appliedVersions)
     expect(
       db.prepare("SELECT 1 FROM sqlite_schema WHERE name = 'rollback_probe'").get(),
     ).toBeUndefined()
@@ -300,16 +306,16 @@ describe('meta-DB migration assets and SQLite runner', () => {
       migrations: Array<Record<string, unknown>>
     }
     manifest.migrations.push({
-      version: 1,
+      version: nextMigrationVersion,
       name: 'baseline',
       checksum: `sha256:${'0'.repeat(64)}`,
-      sqlite: 'sqlite/0001_baseline.sql',
-      postgres: 'postgres/0001_baseline.sql',
+      sqlite: `sqlite/${String(nextMigrationVersion).padStart(4, '0')}_baseline.sql`,
+      postgres: `postgres/${String(nextMigrationVersion).padStart(4, '0')}_baseline.sql`,
     })
     writeFileSync(manifestPath, JSON.stringify(manifest))
 
     expect(() => loadMetaMigrationsFromDirectory(directory)).toThrow(
-      /migration 1 duplicates name baseline/,
+      new RegExp(`migration ${nextMigrationVersion} duplicates name baseline`),
     )
   })
 })

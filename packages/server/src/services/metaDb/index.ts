@@ -10,6 +10,9 @@ export {
 export { SqliteMetaDb } from './sqliteMetaDb'
 export { PgMetaDb } from './pgMetaDb'
 export type {
+  AgentSessionRecord,
+  AgentSessionNamedStart,
+  AgentSessionsPersistence,
   AuthPersistence,
   ContextOrderEntryKind,
   ContextOrderPersistence,
