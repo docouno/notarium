@@ -197,8 +197,9 @@ const curateAgentContext = async (
 }
 
 /** The per-project sub-bundle (project hint only): a capped subtree index + the
- *  delta (journal) since this token last looked; `acknowledge:false` peeks without
- *  moving the cursor. canon: docs/note-history.md#model
+ *  delta (journal) since the bound episode or unbound owner last looked;
+ *  `acknowledge:false` peeks without moving the cursor.
+ *  canon: docs/note-history.md#model
  *
  *  The delta CURSOR is keyed by the stable PROJECT id, not the space slug: sibling
  *  projects share a space, so a space-keyed cursor would let acking project A empty
@@ -252,9 +253,26 @@ const buildProjectBundle = async (
 
   // Journal-backed; a bare engine without it degrades to an empty delta (P5).
   const cursorKey = hinted.id
-  const cursor = ctx.gatewayState
-    ? await ctx.gatewayState.bookmarkGet(ctx.principal.id, cursorKey)
+  const cursorScope = ctx.sessionOwner
+    ? {
+        owner: ctx.sessionOwner,
+        ...(ctx.session
+          ? {
+              session: {
+                id: ctx.session.record.id,
+                parentId: ctx.session.record.parentId,
+              },
+            }
+          : {}),
+      }
     : null
+  // A peek still materialises a session cursor. Without that frozen NULL/value,
+  // another episode could advance the fallback between two peeks and consume the
+  // change this session has not acknowledged.
+  const cursor =
+    ctx.agentDeltaCursors && cursorScope
+      ? await ctx.agentDeltaCursors.getOrInit(cursorScope, cursorKey, ctx.now().toISOString())
+      : null
   let changes: DeltaEntry[] = []
   let total = 0
   let truncated = false
@@ -285,15 +303,10 @@ const buildProjectBundle = async (
       }
     })
   }
-  // Advance the bookmark over the WHOLE window (past the truncated cut): the acked
+  // Advance the cursor over the WHOLE window (past the truncated cut): the acked
   // cursor is the high-water mark, not just what fit.
-  if (acknowledge && maxRevId && ctx.gatewayState) {
-    await ctx.gatewayState.bookmarkSet(
-      ctx.principal.id,
-      cursorKey,
-      maxRevId,
-      ctx.now().toISOString(),
-    )
+  if (acknowledge && maxRevId && ctx.agentDeltaCursors && cursorScope) {
+    await ctx.agentDeltaCursors.advance(cursorScope, cursorKey, maxRevId, ctx.now().toISOString())
   }
   const knownValues = await buildKnownValues(store, hinted, visible)
   return {

@@ -6,14 +6,27 @@ import type {
 
 const clone = (record: AgentSessionRecord): AgentSessionRecord => ({ ...record })
 
+type AgentSessionLifecycleView = {
+  replaceSessions(sessions: readonly string[]): void
+  upsertSession(session: string): void
+  deleteSessions(sessions: ReadonlySet<string>): void
+}
+
 /** In-memory executable twin of the durable agent-sessions facet. Every method is
  * synchronous up to its resolved Promise, so inferActiveAndTouch keeps the same
  * exact-one atomic observation as a single SQL statement. */
 export class InMemoryAgentSessions implements AgentSessionsPersistence {
   private readonly records = new Map<string, AgentSessionRecord>()
+  private lifecycleView?: AgentSessionLifecycleView
+
+  attachLifecycle(view: AgentSessionLifecycleView): void {
+    this.lifecycleView = view
+    view.replaceSessions([...this.records.keys()])
+  }
 
   clear(): void {
     this.records.clear()
+    this.lifecycleView?.replaceSessions([])
   }
 
   seed(records: readonly AgentSessionRecord[]): void {
@@ -59,6 +72,7 @@ export class InMemoryAgentSessions implements AgentSessionsPersistence {
       throw new Error(`no such parent agent session: ${session.parentId}`)
     }
     this.records.set(session.id, clone(session))
+    this.lifecycleView?.upsertSession(session.id)
   }
 
   async touch(
@@ -146,6 +160,7 @@ export class InMemoryAgentSessions implements AgentSessionsPersistence {
         record.parentId = null
       }
     }
+    this.lifecycleView?.deleteSessions(removed)
   }
 
   private list(owner: string, since: string, limit: number, name?: string): AgentSessionRecord[] {

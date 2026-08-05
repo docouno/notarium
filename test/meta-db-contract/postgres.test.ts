@@ -8,6 +8,7 @@ import {
   REVISION_LOCK_STRIPE_MASK,
 } from '../../packages/server/src/services/metaDb/drivers/pg/revisionLocks'
 import { PgMetaDb } from '../../packages/server/src/services/metaDb/pgMetaDb'
+import { describeAgentDeltaCursorsContract } from './agentDeltaCursorsContract'
 import { describeAgentSessionsContract } from './agentSessionsContract'
 import { describeGatewayStateContract } from './gatewayStateContract'
 import { createPostgresTestSchema, describePostgres } from './postgresHarness'
@@ -46,6 +47,7 @@ const waitForAdvisoryWaiters = async (
 
 const waitForTupleLockWaiter = async (
   testSchema: Awaited<ReturnType<typeof createPostgresTestSchema>>,
+  expected = 1,
 ): Promise<void> => {
   const deadline = Date.now() + 5_000
 
@@ -59,12 +61,12 @@ const waitForTupleLockWaiter = async (
       [testSchema.schema],
     )
 
-    if (Number(result.rows[0].n) >= 1) {
+    if (Number(result.rows[0].n) >= expected) {
       return
     }
     await new Promise((resolveWait) => setTimeout(resolveWait, 20))
   }
-  throw new Error('timed out waiting for a legacy/modern CAS tuple-lock waiter')
+  throw new Error(`timed out waiting for ${expected} non-advisory lock waiter(s)`)
 }
 
 const withTimeout = async <T>(promise: Promise<T>, timeoutMs: number): Promise<T> => {
@@ -180,6 +182,17 @@ describePostgres('live Postgres driver', () => {
     return { persistence: testSchema.db.gateway, teardown: testSchema.teardown }
   })
 
+  describeAgentDeltaCursorsContract('Postgres', async () => {
+    const testSchema = await createPostgresTestSchema('agent_delta_cursors_contract')
+    return {
+      persistence: testSchema.db.agentDeltaCursors,
+      sessions: testSchema.db.sessions,
+      projects: testSchema.db.projects,
+      folders: testSchema.db.folders,
+      teardown: testSchema.teardown,
+    }
+  })
+
   describeAgentSessionsContract('Postgres', async () => {
     const testSchema = await createPostgresTestSchema('agent_sessions_contract')
     return { persistence: testSchema.db.sessions, teardown: testSchema.teardown }
@@ -188,6 +201,362 @@ describePostgres('live Postgres driver', () => {
   describeRevisionPersistenceContract('Postgres', async () => {
     const testSchema = await createPostgresTestSchema('revision_contract')
     return { persistence: testSchema.db.revisions, teardown: testSchema.teardown }
+  })
+
+  it('rejects a cursor insert queued behind project deletion', async () => {
+    const testSchema = await createPostgresTestSchema('agent_cursor_project_race')
+    const blockerPool = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const blocker = await blockerPool.connect()
+    let deleteTask: Promise<void> | undefined
+    let advanceTask: Promise<void> | undefined
+
+    try {
+      await testSchema.db.projects.upsert({
+        id: 'project-race',
+        space: 'space-a',
+        path: 'race',
+        slug: 'race',
+        aliases: [],
+        pathAliases: [],
+        displayName: 'Race',
+        status: 'active',
+        lastSeen: '2026-08-04T10:00:00Z',
+        createdAt: '2026-08-04T10:00:00Z',
+      })
+      await blocker.query('BEGIN')
+      await blocker.query('SELECT id FROM folders WHERE id = $1 FOR UPDATE', ['project-race'])
+
+      deleteTask = testSchema.db.projects.delete('project-race')
+      await waitForTupleLockWaiter(testSchema)
+      advanceTask = testSchema.db.agentDeltaCursors.advance(
+        { owner: 'alice' },
+        'project-race',
+        '42',
+        '2026-08-04T10:01:00Z',
+      )
+      await blocker.query('COMMIT')
+
+      await deleteTask
+      await expect(advanceTask).rejects.toThrow(/foreign key/i)
+      expect(
+        await testSchema.db.agentDeltaCursors.getOrInit(
+          { owner: 'alice' },
+          'project-race',
+          '2026-08-04T10:02:00Z',
+        ),
+      ).toBeNull()
+    } finally {
+      await blocker.query('ROLLBACK').catch(() => {})
+      await Promise.allSettled([deleteTask, advanceTask].filter((task) => task != null))
+      blocker.release()
+      await blockerPool.end()
+      await testSchema.teardown()
+    }
+  })
+
+  it('rejects a cursor insert queued behind a project-to-folder type flip', async () => {
+    const testSchema = await createPostgresTestSchema('agent_cursor_project_retype_race')
+    const blockerPool = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const blocker = await blockerPool.connect()
+    let retypeTask: Promise<void> | undefined
+    let advanceTask: Promise<void> | undefined
+
+    try {
+      await testSchema.db.projects.upsert({
+        id: 'project-retype-race',
+        space: 'space-a',
+        path: 'race',
+        slug: 'race',
+        aliases: [],
+        pathAliases: [],
+        displayName: 'Race',
+        status: 'active',
+        lastSeen: '2026-08-04T10:00:00Z',
+        createdAt: '2026-08-04T10:00:00Z',
+      })
+      await blocker.query('BEGIN')
+      await blocker.query('SELECT id FROM folders WHERE id = $1 FOR UPDATE', [
+        'project-retype-race',
+      ])
+
+      retypeTask = testSchema.db.folders.upsert({
+        id: 'project-retype-race',
+        space: 'space-a',
+        path: 'race',
+        pathAliases: [],
+        lastSeen: '2026-08-04T10:01:00Z',
+        createdAt: '2026-08-04T10:00:00Z',
+      })
+      await waitForTupleLockWaiter(testSchema)
+      advanceTask = testSchema.db.agentDeltaCursors.advance(
+        { owner: 'alice' },
+        'project-retype-race',
+        '42',
+        '2026-08-04T10:02:00Z',
+      )
+      await blocker.query('COMMIT')
+
+      await retypeTask
+      await expect(advanceTask).rejects.toThrow(/foreign key/i)
+      expect(await testSchema.db.projects.getById('project-retype-race')).toBeNull()
+      expect(await testSchema.db.folders.getById('project-retype-race')).not.toBeNull()
+      expect(
+        await testSchema.db.agentDeltaCursors.getOrInit(
+          { owner: 'alice' },
+          'project-retype-race',
+          '2026-08-04T10:03:00Z',
+        ),
+      ).toBeNull()
+    } finally {
+      await blocker.query('ROLLBACK').catch(() => {})
+      await Promise.allSettled([retypeTask, advanceTask].filter((task) => task != null))
+      blocker.release()
+      await blockerPool.end()
+      await testSchema.teardown()
+    }
+  })
+
+  it('orders a session advance before a concurrent project retype without deadlock', async () => {
+    const testSchema = await createPostgresTestSchema('agent_cursor_session_retype_order')
+    const blockerPool = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const blocker = await blockerPool.connect()
+    let advanceTask: Promise<void> | undefined
+    let retypeTask: Promise<void> | undefined
+
+    try {
+      const projectId = 'project-session-retype-order'
+      const sessionId = 'ses_aaaaaaaaaaaa'
+      await testSchema.db.projects.upsert({
+        id: projectId,
+        space: 'space-a',
+        path: 'session-race',
+        slug: 'session-race',
+        aliases: [],
+        pathAliases: [],
+        displayName: 'Session race',
+        status: 'active',
+        lastSeen: '2026-08-04T10:00:00Z',
+        createdAt: '2026-08-04T10:00:00Z',
+      })
+      await testSchema.db.sessions.insert({
+        id: sessionId,
+        owner: 'alice',
+        name: 'race',
+        named: true,
+        parentId: null,
+        createdAt: '2026-08-04T10:00:00Z',
+        lastSeenAt: '2026-08-04T10:00:00Z',
+        calls: 1,
+      })
+      // The owner row exists while the session row does not: getOrInit can leave
+      // exactly this shape when a concurrent retype removes the materialised row
+      // before the response acknowledges its revision window.
+      await testSchema.db.agentDeltaCursors.advance(
+        { owner: 'alice' },
+        projectId,
+        '10',
+        '2026-08-04T10:01:00Z',
+      )
+
+      await blocker.query('BEGIN')
+      await blocker.query(
+        'SELECT owner FROM mcp_delta_owner_cursors WHERE owner = $1 AND project = $2 FOR UPDATE',
+        ['alice', projectId],
+      )
+
+      advanceTask = testSchema.db.agentDeltaCursors.advance(
+        { owner: 'alice', session: { id: sessionId, parentId: null } },
+        projectId,
+        '42',
+        '2026-08-04T10:02:00Z',
+      )
+      await waitForTupleLockWaiter(testSchema)
+
+      retypeTask = testSchema.db.folders.upsert({
+        id: projectId,
+        space: 'space-a',
+        path: 'session-race',
+        pathAliases: [],
+        lastSeen: '2026-08-04T10:03:00Z',
+        createdAt: '2026-08-04T10:00:00Z',
+      })
+      await waitForTupleLockWaiter(testSchema, 2)
+      await blocker.query('COMMIT')
+
+      await withTimeout(Promise.all([advanceTask, retypeTask]), 5_000)
+      expect(await testSchema.db.projects.getById(projectId)).toBeNull()
+      expect(await testSchema.db.folders.getById(projectId)).not.toBeNull()
+      expect(
+        await testSchema.db.agentDeltaCursors.getOrInit(
+          { owner: 'alice' },
+          projectId,
+          '2026-08-04T10:04:00Z',
+        ),
+      ).toBeNull()
+    } finally {
+      await blocker.query('ROLLBACK').catch(() => {})
+      await Promise.allSettled([advanceTask, retypeTask].filter((task) => task != null))
+      blocker.release()
+      await blockerPool.end()
+      await testSchema.teardown()
+    }
+  })
+
+  it('orders a space purge before a concurrent session advance without deadlock', async () => {
+    const testSchema = await createPostgresTestSchema('agent_cursor_session_purge_order')
+    const blockerPool = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const blocker = await blockerPool.connect()
+    let purgeTask: Promise<void> | undefined
+    let advanceTask: Promise<void> | undefined
+    const spaceId = 'space-session-purge-order'
+    const projectId = 'project-session-purge-order'
+    const sessionId = 'ses_aaaaaaaaaaaa'
+
+    try {
+      await testSchema.db.spaces.upsert({
+        id: spaceId,
+        slug: 'session-purge',
+        displayName: 'Session purge',
+        notesDir: 'session-purge',
+        aliases: [],
+        createdAt: '2026-08-04T10:00:00Z',
+        archivedAt: '2026-08-04T11:00:00Z',
+        archivedBy: 'user:admin',
+      })
+      await testSchema.db.projects.upsert({
+        id: projectId,
+        space: spaceId,
+        path: '',
+        slug: 'session-purge',
+        aliases: [],
+        pathAliases: [],
+        displayName: 'Session purge',
+        status: 'active',
+        lastSeen: '2026-08-04T10:00:00Z',
+        createdAt: '2026-08-04T10:00:00Z',
+      })
+      await testSchema.db.sessions.insert({
+        id: sessionId,
+        owner: 'alice',
+        name: 'purge race',
+        named: true,
+        parentId: null,
+        createdAt: '2026-08-04T10:00:00Z',
+        lastSeenAt: '2026-08-04T10:00:00Z',
+        calls: 1,
+      })
+      const scope = { owner: 'alice', session: { id: sessionId, parentId: null } }
+      await testSchema.db.agentDeltaCursors.advance(scope, projectId, '10', '2026-08-04T10:01:00Z')
+
+      await blocker.query('BEGIN')
+      await blocker.query(
+        `SELECT session_id FROM mcp_delta_session_cursors
+          WHERE session_id = $1 AND project = $2 FOR UPDATE`,
+        [sessionId, projectId],
+      )
+
+      purgeTask = testSchema.db.purgeSpace(spaceId)
+      await waitForTupleLockWaiter(testSchema)
+      advanceTask = testSchema.db.agentDeltaCursors.advance(
+        scope,
+        projectId,
+        '42',
+        '2026-08-04T10:02:00Z',
+      )
+      await waitForTupleLockWaiter(testSchema, 2)
+      await blocker.query('COMMIT')
+
+      await withTimeout(purgeTask, 5_000)
+      await expect(withTimeout(advanceTask, 5_000)).rejects.toThrow(/foreign key/i)
+      expect(await testSchema.db.projects.getById(projectId)).toBeNull()
+      expect(
+        await testSchema.db.agentDeltaCursors.getOrInit(
+          { owner: 'alice' },
+          projectId,
+          '2026-08-04T10:03:00Z',
+        ),
+      ).toBeNull()
+    } finally {
+      await blocker.query('ROLLBACK').catch(() => {})
+      await Promise.allSettled([purgeTask, advanceTask].filter((task) => task != null))
+      blocker.release()
+      await blockerPool.end()
+      await testSchema.teardown()
+    }
+  })
+
+  it('purges only legacy bookmark handles that unambiguously belong to the space', async () => {
+    const testSchema = await createPostgresTestSchema('legacy_bookmark_purge')
+    const inspect = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const victim = 'space-legacy-gone'
+    const keep = 'space-legacy-keep'
+
+    try {
+      await testSchema.db.spaces.upsert({
+        id: victim,
+        slug: 'gone',
+        displayName: 'Gone',
+        notesDir: 'gone',
+        aliases: ['retired-gone', 'shared-retired'],
+        createdAt: '2026-08-04T10:00:00Z',
+        archivedAt: '2026-08-04T11:00:00Z',
+        archivedBy: 'user:admin',
+      })
+      await testSchema.db.spaces.upsert({
+        id: keep,
+        slug: 'keep',
+        displayName: 'Keep',
+        notesDir: 'keep',
+        aliases: ['shared-retired'],
+        createdAt: '2026-08-04T10:00:00Z',
+        archivedAt: null,
+        archivedBy: null,
+      })
+      for (const [id, space, slug] of [
+        ['project-legacy-gone', victim, 'gone'],
+        ['project-legacy-keep', keep, 'keep'],
+      ]) {
+        await testSchema.db.projects.upsert({
+          id,
+          space,
+          path: '',
+          slug,
+          aliases: [],
+          pathAliases: [],
+          displayName: slug,
+          status: 'active',
+          lastSeen: '2026-08-04T10:00:00Z',
+          createdAt: '2026-08-04T10:00:00Z',
+        })
+      }
+      const legacyKeys = [
+        victim,
+        'project-legacy-gone',
+        'gone',
+        'retired-gone',
+        keep,
+        'project-legacy-keep',
+        'shared-retired',
+      ]
+      await inspect.query(
+        `INSERT INTO mcp_bookmarks (principal_id, space, last_rev, updated_at)
+         SELECT 'pat:alice:legacy', legacy_key, '1', '2026-08-04T10:00:00Z'
+           FROM unnest($1::text[]) AS legacy_key`,
+        [legacyKeys],
+      )
+
+      await testSchema.db.purgeSpace(victim)
+
+      const remaining = await inspect.query<{ space: string }>(
+        'SELECT space FROM mcp_bookmarks ORDER BY space',
+      )
+      expect(remaining.rows.map(({ space }) => space)).toEqual(
+        [keep, 'project-legacy-keep', 'shared-retired'].sort(),
+      )
+    } finally {
+      await inspect.end()
+      await testSchema.teardown()
+    }
   })
 
   it('atomically grants only while a stable space id exists and is active', async () => {

@@ -24,15 +24,28 @@ export type FolderTableView = {
   pathHolder(space: string, path: string): string | undefined
 }
 
+type ProjectLifecycleView = {
+  replaceProjects(projects: readonly string[]): void
+  upsertProject(project: string): void
+  deleteProject(project: string): void
+}
+
 export class InMemoryProjects implements ProjectsPersistence {
   private rows = new Map<string, ProjectRecord>() // id → row
 
   private foldersView?: FolderTableView
+  private lifecycleView?: ProjectLifecycleView
   attachFolders(view: FolderTableView): void {
     this.foldersView = view
   }
+  attachLifecycle(view: ProjectLifecycleView): void {
+    this.lifecycleView = view
+    view.replaceProjects([...this.rows.keys()])
+  }
   removeById(id: string): void {
-    this.rows.delete(id)
+    if (this.rows.delete(id)) {
+      this.lifecycleView?.deleteProject(id)
+    }
   }
   pathHolder(space: string, path: string): string | undefined {
     for (const r of this.rows.values()) {
@@ -46,6 +59,7 @@ export class InMemoryProjects implements ProjectsPersistence {
 
   clear(): void {
     this.rows.clear()
+    this.lifecycleView?.replaceProjects([])
   }
 
   /** Replace the whole registry from a fixture (reset re-seeds). */
@@ -54,13 +68,14 @@ export class InMemoryProjects implements ProjectsPersistence {
     for (const r of records) {
       this.rows.set(r.id, { ...r })
     }
+    this.lifecycleView?.replaceProjects([...this.rows.keys()])
   }
 
   async upsert(p: ProjectRecord): Promise<void> {
     // A re-upsert by an id the FOLDER facet holds = the real `ON CONFLICT(id)`
     // flipping that one row's type to 'project' (#100 phase 3 mark-as-project of an
-    // identified folder). Move it between Maps so no duplicate row survives.
-    this.foldersView?.removeById(p.id)
+    // identified folder). Validate first so a rejected SQL-equivalent statement
+    // cannot partially remove the old folder row in the split-Map fake.
     // Mirror the real drivers' UNIQUE(space,slug)/(space,path) indexes: a DIFFERENT
     // id claiming the same handle/path is a constraint violation, not a silent
     // overwrite. Without this the fake would pass where sqlite/pg throw — exactly
@@ -83,10 +98,12 @@ export class InMemoryProjects implements ProjectsPersistence {
     if (folderHolder && folderHolder !== p.id) {
       throw new Error(`UNIQUE constraint failed: folders(space, path) = (${p.space}, ${p.path})`)
     }
+    this.foldersView?.removeById(p.id)
     const existing = this.rows.get(p.id)
     // Preserve the original created_at (mint moment) on a re-upsert, like the
     // real drivers (a confirming scan refreshes the derived fields only).
     this.rows.set(p.id, { ...p, createdAt: existing?.createdAt ?? p.createdAt })
+    this.lifecycleView?.upsertProject(p.id)
   }
   async getById(id: string): Promise<ProjectRecord | null> {
     const r = this.rows.get(id)
@@ -127,7 +144,7 @@ export class InMemoryProjects implements ProjectsPersistence {
       .map((r) => ({ ...r }))
   }
   async delete(id: string): Promise<void> {
-    this.rows.delete(id)
+    this.removeById(id)
   }
   async renamePrefix(space: string, oldPrefix: string, newPrefix: string): Promise<void> {
     if (oldPrefix === newPrefix) {

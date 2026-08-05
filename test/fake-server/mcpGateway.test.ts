@@ -3880,7 +3880,7 @@ describe('start_session (#21 stage 9)', () => {
     expect(titles).not.toContain('Profile')
   })
 
-  it('project sub-bundle: index + per-token delta of what changed since last looked', async () => {
+  it('project sub-bundle: index + per-session delta of what changed since last looked', async () => {
     const bearer = await patFor('alice', 'alice-password-1', 'write')
     // Seeded notes are NOT journaled, so the team journal starts empty.
     const before = session(await callTool(port, 'start_session', { project: 'team' }, bearer))
@@ -3919,7 +3919,7 @@ describe('start_session (#21 stage 9)', () => {
     expect(Array.isArray(after.project?.knownValues?.tags)).toBe(true)
   })
 
-  it('acknowledge advances the bookmark; acknowledge:false peeks without moving it', async () => {
+  it('acknowledge advances the session cursor; acknowledge:false peeks without moving it', async () => {
     const bearer = await patFor('alice', 'alice-password-1', 'write')
     const w = await callTool(
       port,
@@ -3935,7 +3935,7 @@ describe('start_session (#21 stage 9)', () => {
     )
     expect(peek.project?.delta.changes.some((c) => c.noteId === id)).toBe(true)
 
-    // A second peek STILL shows it (the bookmark didn't move).
+    // A second peek STILL shows it (the cursor didn't move).
     const peek2 = session(
       await callTool(port, 'start_session', { project: 'team', acknowledge: false }, bearer),
     )
@@ -3946,6 +3946,182 @@ describe('start_session (#21 stage 9)', () => {
     // Now it is no longer in the delta.
     const after = session(await callTool(port, 'start_session', { project: 'team' }, bearer))
     expect(after.project?.delta.total).toBe(0)
+  })
+
+  it('keeps independent delta positions for two sessions under the same PAT', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const a = session(
+      await callTool(
+        port,
+        'start_session',
+        { project: 'team', session: { name: 'delta agent a' } },
+        bearer,
+      ),
+    )
+    const b = session(
+      await callTool(
+        port,
+        'start_session',
+        { project: 'team', session: { name: 'delta agent b' } },
+        bearer,
+      ),
+    )
+    const written = await callTool(
+      port,
+      'create_note',
+      {
+        project: 'team',
+        title: 'Independent delta probe',
+        body: 'both sessions must see this',
+        session: a.session?.id,
+      },
+      bearer,
+    )
+    const noteId = structured(written).noteId as string
+
+    const seenByA = session(
+      await callTool(
+        port,
+        'start_session',
+        { project: 'team', session: { id: a.session?.id } },
+        bearer,
+      ),
+    )
+    expect(seenByA.project?.delta.changes.map((change) => change.noteId)).toContain(noteId)
+
+    // A advanced the owner fallback, but B froze its own cursor before the write.
+    const seenByB = session(
+      await callTool(
+        port,
+        'start_session',
+        { project: 'team', session: { id: b.session?.id } },
+        bearer,
+      ),
+    )
+    expect(seenByB.project?.delta.changes.map((change) => change.noteId)).toContain(noteId)
+    const bAfterAck = session(
+      await callTool(
+        port,
+        'start_session',
+        { project: 'team', session: { id: b.session?.id } },
+        bearer,
+      ),
+    )
+    expect(bAfterAck.project?.delta.total).toBe(0)
+
+    // A genuinely new root starts from what the owner has already acknowledged.
+    const fresh = session(
+      await callTool(
+        port,
+        'start_session',
+        { project: 'team', session: { name: 'delta agent c' } },
+        bearer,
+      ),
+    )
+    expect(fresh.project?.delta.total).toBe(0)
+  })
+
+  it('uses and advances the owner fallback when a named session is ambiguous', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const name = 'ambiguous delta owner'
+    const parent = session(
+      await callTool(port, 'start_session', { project: 'team', session: { name } }, bearer),
+    )
+    const fork = session(
+      await callTool(port, 'start_session', { project: 'team', session: { name } }, bearer),
+    )
+    expect(fork.session).toMatchObject({ state: 'forked', parentId: parent.session?.id })
+
+    const written = await callTool(
+      port,
+      'create_note',
+      {
+        project: 'team',
+        title: 'Ambiguous fallback probe',
+        body: 'an unbound start_session still owns a durable delta position',
+        session: parent.session?.id,
+      },
+      bearer,
+    )
+    const noteId = structured(written).noteId as string
+
+    const ambiguous = session(
+      await callTool(port, 'start_session', { project: 'team', session: { name } }, bearer),
+    )
+    expect(ambiguous.session).toBeUndefined()
+    expect(ambiguous.recentSessions).toHaveLength(2)
+    expect(ambiguous.project?.delta.changes.map((change) => change.noteId)).toContain(noteId)
+
+    // The unbound acknowledge moved the owner fallback. A genuinely new root
+    // starts there and does not replay the change.
+    const fresh = session(
+      await callTool(
+        port,
+        'start_session',
+        { project: 'team', session: { name: 'after ambiguous fallback' } },
+        bearer,
+      ),
+    )
+    expect(fresh.project?.delta.total).toBe(0)
+  })
+
+  it('starts a fork from its parent cursor rather than a newer owner fallback', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const parent = session(
+      await callTool(
+        port,
+        'start_session',
+        { project: 'team', session: { name: 'fork cursor' } },
+        bearer,
+      ),
+    )
+    const first = await callTool(
+      port,
+      'create_note',
+      {
+        project: 'team',
+        title: 'Parent unseen first',
+        body: 'first',
+        session: parent.session?.id,
+      },
+      bearer,
+    )
+    const firstId = structured(first).noteId as string
+
+    // Another root acknowledges the first change and advances the fallback past it.
+    const other = session(
+      await callTool(
+        port,
+        'start_session',
+        { project: 'team', session: { name: 'other cursor' } },
+        bearer,
+      ),
+    )
+    expect(other.project?.delta.changes.map((change) => change.noteId)).toContain(firstId)
+
+    const second = await callTool(
+      port,
+      'create_note',
+      {
+        project: 'team',
+        title: 'Parent unseen second',
+        body: 'second',
+        session: parent.session?.id,
+      },
+      bearer,
+    )
+    const secondId = structured(second).noteId as string
+    const fork = session(
+      await callTool(
+        port,
+        'start_session',
+        { project: 'team', session: { name: 'fork cursor' } },
+        bearer,
+      ),
+    )
+    expect(fork.session).toMatchObject({ state: 'forked', parentId: parent.session?.id })
+    const forkIds = fork.project?.delta.changes.map((change) => change.noteId) ?? []
+    expect(forkIds).toEqual(expect.arrayContaining([firstId, secondId]))
   })
 
   it('a project hint the token cannot reach is a 404-semantic tool error', async () => {
@@ -3976,7 +4152,7 @@ describe('start_session (#21 stage 9)', () => {
 })
 
 describe('start_session delta is keyed per PROJECT, not per space (#13)', () => {
-  // Two projects in ONE space (team). Before #13 the delta bookmark was keyed by
+  // Two projects in ONE space (team). Before #13 the delta cursor was keyed by
   // space (1 project == 1 space), so visiting one project would advance the
   // SHARED cursor and empty a sibling's delta. Now the cursor is the stable
   // project id, so each project tracks its own position over the whole-space delta.

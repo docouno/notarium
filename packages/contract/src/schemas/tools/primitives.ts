@@ -78,7 +78,7 @@ export const WriteResultSchema = z.object({
 /** What this host's engine can do (`whoami.capabilities`) — declared so an
  *  agent tailors its plan without probing: `vector` (semantic search, vs FTS
  *  only), `trash` (delete is recoverable here), `revisions` (history /
- *  provenance / per-token delta are available). */
+ *  provenance / cursor-based delta are available). */
 export const CapabilitiesSchema = z.object({
   vector: z.boolean(),
   trash: z.boolean(),

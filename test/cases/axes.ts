@@ -104,8 +104,8 @@ export const AXES: readonly AxisInfo[] = [
   },
   {
     axis: 'agent-sessions',
-    title: 'Agent sessions / episode binding',
-    surfaces: ['mcp-start-session', 'mcp-tool-binding'],
+    title: 'Agent sessions / episode state',
+    surfaces: ['mcp-start-session', 'mcp-tool-binding', 'mcp-session-delta'],
     refs: ['mcp-gateway.md'],
   },
   {

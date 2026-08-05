@@ -1,4 +1,5 @@
 import { SqliteMetaDb } from '../../packages/server/src/services/metaDb/sqliteMetaDb'
+import { describeAgentDeltaCursorsContract } from './agentDeltaCursorsContract'
 import { describeAgentSessionsContract } from './agentSessionsContract'
 import { describeGatewayStateContract } from './gatewayStateContract'
 import { describeRevisionPersistenceContract } from './revisionPersistenceContract'
@@ -6,6 +7,17 @@ import { describeRevisionPersistenceContract } from './revisionPersistenceContra
 describeGatewayStateContract('SQLite', async () => {
   const db = new SqliteMetaDb(':memory:')
   return { persistence: db.gateway, teardown: () => db.close() }
+})
+
+describeAgentDeltaCursorsContract('SQLite', async () => {
+  const db = new SqliteMetaDb(':memory:')
+  return {
+    persistence: db.agentDeltaCursors,
+    sessions: db.sessions,
+    projects: db.projects,
+    folders: db.folders,
+    teardown: () => db.close(),
+  }
 })
 
 describeAgentSessionsContract('SQLite', async () => {

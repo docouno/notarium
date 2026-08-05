@@ -92,6 +92,65 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
     }
   })
 
+  it('migrates credential bookmarks to the furthest owner fallback per project', async () => {
+    const testSchema = await createSchema('migration_agent_delta_cursors')
+    const pool = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const client = await pool.connect()
+
+    try {
+      await runPgMigrations(client, migrations.slice(0, 1))
+      await client.query(`
+        INSERT INTO spaces (id, slug, notes_dir, display_name, aliases, created_at)
+        VALUES
+          ('legacy-space-id', 'legacy-space-slug', 'legacy', 'Legacy', '["retired-space-slug"]', '2026-08-04'),
+          ('collision-space-id', 'ambiguous-key', 'collision', 'Collision', NULL, '2026-08-04');
+        INSERT INTO folders
+          (id, space, path, slug, display_name, status, last_seen, created_at, type)
+        VALUES
+          ('project-a', 'space-a', 'a', 'project-a', 'Project A', 'active', 'x', 'x', 'project'),
+          ('project-b', 'space-a', 'b', 'project-b', 'Project B', 'active', 'x', 'x', 'project'),
+          ('project-root', 'legacy-space-id', '', 'root', 'Root', 'active', 'x', 'x', 'project'),
+          ('ambiguous-key', 'space-a', 'ambiguous', 'ambiguous', 'Ambiguous', 'active', 'x', 'x', 'project'),
+          ('collision-root', 'collision-space-id', '', 'collision', 'Collision', 'active', 'x', 'x', 'project')
+      `)
+      await client.query(
+        `INSERT INTO mcp_bookmarks (principal_id, space, last_rev, updated_at)
+         VALUES
+           ('pat:alice:pat-a', 'project-a', '11', '2026-08-04T10:00:00Z'),
+           ('oauth:alice:oauth-a', 'project-a', '44', '2026-08-04T10:01:00Z'),
+           ('pat:alice:pat-a', 'project-b', '22', '2026-08-04T10:02:00Z'),
+           ('pat:bob:pat-b', 'project-a', '33', '2026-08-04T10:03:00Z'),
+           ('ui', 'project-a', '55', '2026-08-04T10:04:00Z'),
+           ('pat:carol:pat-c', 'legacy-space-id', '66', '2026-08-04T10:05:00Z'),
+           ('pat:dora:pat-d', 'legacy-space-slug', '77', '2026-08-04T10:06:00Z'),
+           ('pat:erin:pat-e', 'retired-space-slug', '78', '2026-08-04T10:06:30Z'),
+           ('unknown', 'project-a', '99', '2026-08-04T10:05:00Z'),
+           ('pat:eve:pat-e', 'ambiguous-key', '88', '2026-08-04T10:07:00Z'),
+           ('pat:frank:pat-f', 'missing-project', '89', '2026-08-04T10:08:00Z')`,
+      )
+
+      await runPgMigrations(client, migrations)
+
+      const result = await client.query(
+        `SELECT owner, project, last_rev
+           FROM mcp_delta_owner_cursors
+          ORDER BY owner, project`,
+      )
+      expect(result.rows).toEqual([
+        { owner: 'alice', project: 'project-a', last_rev: '44' },
+        { owner: 'alice', project: 'project-b', last_rev: '22' },
+        { owner: 'bob', project: 'project-a', last_rev: '33' },
+        { owner: 'carol', project: 'project-root', last_rev: '66' },
+        { owner: 'dora', project: 'project-root', last_rev: '77' },
+        { owner: 'erin', project: 'project-root', last_rev: '78' },
+        { owner: 'system', project: 'project-a', last_rev: '55' },
+      ])
+    } finally {
+      client.release()
+      await pool.end()
+    }
+  })
+
   it('retires the migration backend before the application pool serves queries', async () => {
     const testSchema = await createSchema('migration_session_isolation')
 

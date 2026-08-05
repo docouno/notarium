@@ -18,6 +18,7 @@ import { type AgentSessions, type BoundAgentSession, createAgentSessions } from 
 import { type AuthService } from '../auth'
 import { type Action, can, type Principal, scopeAllows } from '../authz'
 import type {
+  AgentDeltaCursorsPersistence,
   AgentSessionsPersistence,
   ContextOrderPersistence,
   ContextSetsPersistence,
@@ -61,8 +62,9 @@ export type GatewayDeps = {
   /** Durable, owner-scoped agent episodes. Absent means the whole session feature
    *  degrades away: start_session emits no session and regular calls ignore it. */
   sessions?: AgentSessionsPersistence
-  /** Per-token gateway state: start_session bookmarks + write dedup.
-   *  Absent → no delta cursor, no retry-dedup (honest degradation). */
+  /** Owner fallback + per-episode/project delta positions. */
+  agentDeltaCursors?: AgentDeltaCursorsPersistence
+  /** Per-token write-retry dedup state. Absent → no retry-dedup. */
   gatewayState?: GatewayStatePersistence
   /** Agent-retrieval audit log: read-tool calls (search/recall/get_note) appended
    *  fire-and-forget. Absent → no capture (honest degradation). */
@@ -88,7 +90,7 @@ export type GatewayDeps = {
   /** Per-scope context-order overlay (order = load priority). Absent → the default
    *  sequence (pins then sets). */
   contextOrder?: ContextOrderPersistence
-  /** Clock — injectable for tests (stamps dedup/bookmark rows, computes dedup windows). */
+  /** Clock — injectable for tests (stamps dedup/cursor rows, computes dedup windows). */
   now?: () => Date
 }
 
@@ -129,6 +131,7 @@ export type Ctx = {
   contextSets?: ContextSetsPersistence
   scopePins?: ScopePinsPersistence
   contextOrder?: ContextOrderPersistence
+  agentDeltaCursors?: AgentDeltaCursorsPersistence
   gatewayState?: GatewayStatePersistence
   agentSessions?: AgentSessions
   /** Stable session owner: username in password mode, `system` in none mode. */
@@ -207,6 +210,7 @@ export const createGateway = (deps: GatewayDeps): McpGateway => {
       contextSets: deps.contextSets,
       scopePins: deps.scopePins,
       contextOrder: deps.contextOrder,
+      agentDeltaCursors: deps.agentDeltaCursors,
       gatewayState: deps.gatewayState,
       agentSessions,
       sessionOwner: principal.username ?? (principal.system ? 'system' : null),

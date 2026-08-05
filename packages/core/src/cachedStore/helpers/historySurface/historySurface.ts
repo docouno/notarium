@@ -66,7 +66,7 @@ export class HistorySurface {
     return this.host.journal.detail(noteId, revisionId)
   }
 
-  /** The per-token delta (start_session): what changed in this space after a
+  /** The cursor-based delta (start_session): what changed in this space after a
    *  revision-id cursor, collapsed to one entry per note. CLASS-SCOPED here at the
    *  read-model chokepoint exactly like the discovery surfaces: it excludes
    *  the classes NOT admitted by scope:'user' (agent-memory, …) — the same set the

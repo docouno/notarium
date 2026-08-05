@@ -94,8 +94,8 @@ export type RevisionPersistence = {
     noteId: string,
     opts: { offset: number; limit: number },
   ): Promise<{ items: Revision[]; total: number }>
-  /** Per-token delta: what changed in `space` after `sinceRevId` (null = from the start),
-   *  COLLAPSED to one entry per note, newest-first, capped at `limit`. `maxRevId` = the bookmark
+  /** Cursor-based delta: what changed in `space` after `sinceRevId` (null = from the start),
+   *  COLLAPSED to one entry per note, newest-first, capped at `limit`. `maxRevId` = the cursor
    *  to advance on acknowledge (null = nothing changed). The cursor is a revision id, not a
    *  timestamp — two states in the same millisecond never confuse it. */
   listBySpaceSince(
@@ -714,7 +714,7 @@ export type KnowledgeStore = {
   latestRevisions?(noteIds: readonly string[]): Promise<Map<string, Revision>>
   /** One revision with its content (null content = an honest external gap). */
   revision?(noteId: string, revisionId: string): Promise<RevisionDetail | null>
-  /** Per-token delta (see RevisionPersistence.listBySpaceSince). A read-model concern; a bare
+  /** Cursor-based delta (see RevisionPersistence.listBySpaceSince). A read-model concern; a bare
    *  engine doesn't answer and the gateway degrades honestly. */
   revisionsSince?(
     sinceRevId: string | null,

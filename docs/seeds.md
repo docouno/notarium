@@ -123,7 +123,7 @@ and for `security` — it parses the sanitized HTML into a live DOM and checks t
 | Case | About | Axes |
 |---|---|---|
 | `agent-context` | pins + personal/project memory + projects of varying density (#165); **heavy pins over budget + a `Budget Lab` space for all token-budget cases #208** (personal-trim, fits / squeeze / dominant / no-pins — nesting the personal set into project Q's budget); **cross-space context set #209** (`Frontend Canon` in the `Conventions` space, connected to project Product OS + personal) **+ cross-space loose pin #209** (`Security Baseline` from `Conventions`, pinned directly into Product OS + personal) — both resolve cross-space; **retrieval audit #243** (search/recall/get_note history: hits + a recurrent vocabulary-mismatch miss + frequent queries) | agent-memory, agent-audit, structure, note-classes, scale |
-| `agent-sessions` | durable MCP episodes: active fork siblings with the same name, sleeping + automatic sessions, a hostile label for output sanitisation, and an expired retention probe | agent-sessions, auth |
+| `agent-sessions` | durable MCP episodes: active fork siblings with the same name, sleeping + automatic sessions, a hostile label for output sanitisation, an expired retention probe, a second-owner episode, and distinct root/fork/owner delta positions over one project history | agent-sessions, auth, history |
 | `memory-perf` | 2700 ordinary notes + 4 personal-memory categories + 1 project-partition sentinel; reproduces memory-mount scaling, partition isolation, and graph-inert memory links | agent-memory, note-classes, scale |
 | `import-thread` | one rich imported thread | import, content |
 | `import` | a multi-format layout (claude/chatgpt/memory-json) + backdated dates-as-data → Feed year-spread (#11/#223) | import, content, activity |
@@ -255,9 +255,13 @@ needed):
   `restore`→`store.restoreFromTrash` (an honest `kind:'restore'` revision), an
   `externalRewrite`→a same-size/mtime direct markdown write after the timeline, an
   `archived` space→`manager.archive` after the seed (moves to Trash→Spaces, data intact).
-  Zero edits to production code.
+  Agent delta cursors resolve their declarative `throughNote` anchor to the real latest
+  revision id only after the timeline exists, then advance through the production meta-DB
+  persistence. Zero edits to production code.
 - **Fake** (`caseToFixture`): a fold of the timeline → `Fixture` (a snapshot of live
   notes + activity rows); a note whose last op is `delete` — only a tombstone row.
+  Meta-DB-only delta cursor declarations are intentionally real-applier-only; the fake has
+  no revision ids to which their semantic anchors could honestly resolve.
 
 ## Deliberate caveats
 

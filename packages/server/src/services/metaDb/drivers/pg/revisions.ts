@@ -172,7 +172,7 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
     const exFilter = exParams.length
       ? ` AND (class IS NULL OR class NOT IN (${exParams.join(',')}))`
       : ''
-    // One statement = one MVCC snapshot for page, total, and bookmark cursor.
+    // One statement = one MVCC snapshot for page, total, and cursor high-water mark.
     // The aggregate is the left side so even LIMIT 0 / an empty window returns
     // one metadata row; a null page.id is filtered before row conversion.
     const result = await ctx.required.query(

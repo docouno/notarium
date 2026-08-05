@@ -38,7 +38,8 @@ export const ListNotesOutputSchema = z.object({
 })
 
 /** Tool `recent_activity`: the most recently-changed notes (absolute freshness),
- *  distinct from start_session's per-session delta. canon: docs/mcp-gateway.md#tools */
+ * distinct from start_session's bound-session or unbound-owner delta.
+ * canon: docs/mcp-gateway.md#tools */
 export const RecentActivityInputSchema = z.object({
   ...sessionField,
   /** With it, narrows to that project (best-effort label filter — the journal isn't

@@ -61,7 +61,7 @@ import { normDate } from '../test/cases/generators'
 import { agentSessionId } from '../test/cases/sessionIds'
 import { seedDurableImports } from './seedDurableImports'
 import { applySeedExternalRewrites } from './seedExternalRewrites'
-import { makeOwnerRemap } from './seedOwner'
+import { makeOwnerRemap, resolveSeedAgentDeltaCursorOwner } from './seedOwner'
 
 const PROFILE_MOUNT = '.notarium/profile'
 
@@ -593,6 +593,73 @@ const run = async (): Promise<void> => {
     }
   }
 
+  // 4b. Owner/session delta positions. Cursor declarations name a journalled
+  // note rather than a driver-specific numeric revision; resolve that semantic
+  // anchor only after the real timeline has minted both note and revision ids.
+  let agentDeltaCursors = 0
+  const sessionByRef = new Map((world.agentSessions ?? []).map((session) => [session.ref, session]))
+
+  for (const cursor of world.agentDeltaCursors ?? []) {
+    const note = live.get(cursor.throughNote)
+
+    if (!note) {
+      throw new Error(`agent delta cursor references unknown note: ${cursor.throughNote}`)
+    }
+    if (note.spaceSlug !== cursor.project.space) {
+      throw new Error(
+        `agent delta cursor anchor ${cursor.throughNote} belongs to space ${note.spaceSlug}, ` +
+          `not project space ${cursor.project.space}`,
+      )
+    }
+    const revision = (await metaDb.revisions.listByNote(note.id, { offset: 0, limit: 1 })).items[0]
+
+    if (!revision) {
+      throw new Error(`agent delta cursor note has no journal revision: ${cursor.throughNote}`)
+    }
+    const spaceId = idOf.get(cursor.project.space)
+    const project = spaceId
+      ? (await metaDb.projects.listForSpace(spaceId)).find(
+          (candidate) => candidate.path === cursor.project.path,
+        )
+      : undefined
+
+    if (!project) {
+      throw new Error(
+        `agent delta cursor references unknown project: ${cursor.project.space}/${cursor.project.path}`,
+      )
+    }
+    const declaredSession = cursor.sessionRef ? sessionByRef.get(cursor.sessionRef) : undefined
+
+    if (cursor.sessionRef && !declaredSession) {
+      throw new Error(`agent delta cursor references unknown session: ${cursor.sessionRef}`)
+    }
+    const owner = resolveSeedAgentDeltaCursorOwner({
+      cursorOwner: cursor.owner,
+      sessionOwner: declaredSession ? (declaredSession.owner ?? primary.username) : undefined,
+      fallbackOwner: primary.username,
+      asUser,
+    })
+    await metaDb.agentDeltaCursors.advance(
+      {
+        owner,
+        ...(cursor.sessionRef
+          ? {
+              session: {
+                id: agentSessionId(cursor.sessionRef),
+                parentId: declaredSession?.parentRef
+                  ? agentSessionId(declaredSession.parentRef)
+                  : null,
+              },
+            }
+          : {}),
+      },
+      project.id,
+      revision.id,
+      t,
+    )
+    agentDeltaCursors++
+  }
+
   // 5. Context sets (#209): named cross-space collections attached to scopes. Applied
   //    AFTER the timeline so each item's LOGICAL note id resolves to its real id + space
   //    via `live`. Real-stand only (the fake fixture has no stable note ids to reference).
@@ -1067,6 +1134,7 @@ const run = async (): Promise<void> => {
           connectedApps,
           pendingOAuthClients,
           agentSessions,
+          agentDeltaCursors,
           favorites,
           retrievals,
           jobs,

@@ -18,6 +18,7 @@ import type { ImportStagingStore } from '../../libs/importStaging'
 import type { MutationGate, MutationRelease } from '../../libs/mutationGate'
 import { AuthError, type AuthService, createAuthService } from '../../services/auth'
 import type {
+  AgentDeltaCursorsPersistence,
   AgentSessionsPersistence,
   ContextOrderPersistence,
   ContextSetsPersistence,
@@ -48,6 +49,7 @@ export type BuildAppOptions = {
   spaces: SpaceManager
   auth?: AuthService
   sessions?: AgentSessionsPersistence
+  agentDeltaCursors?: AgentDeltaCursorsPersistence
   gatewayState?: GatewayStatePersistence
   projects?: ProjectsPersistence
   folders?: FolderIdentityPersistence
@@ -87,6 +89,7 @@ export const buildApp = async ({
   spaces,
   auth,
   sessions,
+  agentDeltaCursors,
   gatewayState,
   retrievalLog,
   projects,
@@ -356,6 +359,7 @@ export const buildApp = async ({
     spaces,
     auth: authService,
     sessions,
+    agentDeltaCursors,
     gatewayState,
     retrievalLog,
     projects,

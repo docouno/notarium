@@ -5,6 +5,7 @@ import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
+import { createAgentDeltaCursorsFacet } from './drivers/sqlite/agentDeltaCursors'
 import { createAuthFacet } from './drivers/sqlite/auth'
 import type { SqliteDriverCtx } from './drivers/sqlite/context'
 import { createContextOrderFacet } from './drivers/sqlite/contextOrder'
@@ -203,6 +204,54 @@ export class SqliteMetaDb implements MetaDb {
         }
       }
       db.prepare('DELETE FROM note_identity WHERE space = ?').run(spaceId)
+      // Legacy rows may carry a space/project id, current slug, or retired space
+      // alias. Ids are authoritative; resolve textual history only when all live
+      // namespaces identify exactly one project, so purge cannot steal an
+      // ambiguous bookmark from a surviving space.
+      db.prepare(
+        `WITH candidates AS (
+           SELECT bookmarks.space AS legacy_key, folders.id AS project
+             FROM mcp_bookmarks AS bookmarks
+             JOIN folders ON folders.id = bookmarks.space AND folders.type = 'project'
+           UNION
+           SELECT bookmarks.space AS legacy_key, folders.id AS project
+             FROM mcp_bookmarks AS bookmarks
+             JOIN folders
+               ON folders.space = bookmarks.space
+              AND folders.path = ''
+              AND folders.type = 'project'
+           UNION
+           SELECT bookmarks.space AS legacy_key, folders.id AS project
+             FROM mcp_bookmarks AS bookmarks
+             JOIN spaces
+               ON spaces.slug = bookmarks.space
+               OR EXISTS (
+                 SELECT 1 FROM json_each(COALESCE(spaces.aliases, '[]'))
+                  WHERE value = bookmarks.space
+               )
+             JOIN folders
+               ON folders.space = spaces.id
+              AND folders.path = ''
+              AND folders.type = 'project'
+         ), uniquely_resolved AS (
+           SELECT legacy_key, MIN(project) AS project
+             FROM candidates
+            GROUP BY legacy_key
+           HAVING COUNT(DISTINCT project) = 1
+         )
+         DELETE FROM mcp_bookmarks
+          WHERE space = ?
+             OR space IN (SELECT id FROM folders WHERE space = ? AND type = 'project')
+             OR space IN (
+               SELECT legacy_key
+                 FROM uniquely_resolved
+                WHERE project IN (
+                  SELECT id FROM folders WHERE space = ? AND type = 'project'
+                )
+             )`,
+      ).run(spaceId, spaceId, spaceId)
+      // The type-aware project FK cascades both cursor tables from this parent
+      // delete. Keeping cleanup parent-first matches concurrent session advance.
       db.prepare('DELETE FROM folders WHERE space = ?').run(spaceId)
       db.prepare('DELETE FROM favorites WHERE space = ?').run(spaceId)
       db.prepare(
@@ -214,7 +263,6 @@ export class SqliteMetaDb implements MetaDb {
       db.prepare('DELETE FROM context_scope_pins WHERE target_space = ?').run(spaceId)
       db.prepare('DELETE FROM context_order WHERE target_space = ?').run(spaceId)
       db.prepare('DELETE FROM space_members WHERE space = ?').run(spaceId)
-      db.prepare('DELETE FROM mcp_bookmarks WHERE space = ?').run(spaceId)
       // On-disk artifacts these jobs pointed at are NOT swept here — the runner's
       // TTL GC owns the artifact filesystem. canon: docs/jobs.md#artifacts
       db.prepare('DELETE FROM jobs WHERE space = ?').run(spaceId)
@@ -269,6 +317,8 @@ export class SqliteMetaDb implements MetaDb {
   // ── MCP gateway state facet ─────────────────────────────────────────
 
   readonly gateway = createGatewayFacet(this.ctx)
+
+  readonly agentDeltaCursors = createAgentDeltaCursorsFacet(this.ctx)
 
   readonly sessions = createSessionsFacet(this.ctx)
 

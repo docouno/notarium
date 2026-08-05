@@ -63,12 +63,19 @@ export class InMemoryFolders implements FolderIdentityPersistence, FolderTableVi
     // The one-table cross-type invariants (#100 phase 3): an id the PROJECT facet holds
     // flips to 'folder' here (move it between Maps); a DIFFERENT id at this path is
     // a global UNIQUE(space,path) violation.
-    this.projects.removeById(f.id)
     const projectHolder = this.projects.pathHolder(f.space, f.path)
+    const folderHolder = this.pathHolder(f.space, f.path)
 
     if (projectHolder && projectHolder !== f.id) {
       throw new Error(`UNIQUE constraint failed: folders(space, path) = (${f.space}, ${f.path})`)
     }
+    if (folderHolder && folderHolder !== f.id) {
+      throw new Error(`UNIQUE constraint failed: folders(space, path) = (${f.space}, ${f.path})`)
+    }
+
+    // Match one SQL statement's atomicity: validate every constraint before the
+    // cross-type move and its project-lifecycle cascade become observable.
+    this.projects.removeById(f.id)
     const existing = this.rows.get(f.id)
     this.rows.set(f.id, { ...f, createdAt: existing?.createdAt ?? f.createdAt })
   }

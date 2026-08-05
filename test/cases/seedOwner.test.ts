@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { makeOwnerRemap } from '../../scripts/seedOwner'
+import { makeOwnerRemap, resolveSeedAgentDeltaCursorOwner } from '../../scripts/seedOwner'
 
 // The catalog authors primary content as `sergey`; the real applier renames it to the
 // init user (SEED_USER, default `admin`) so the default login IS the content author —
@@ -31,5 +31,37 @@ describe('owner remap (sergey → SEED_USER)', () => {
   it('does not partial-match a different user that contains the owner name', () => {
     expect(asUser('sergey2')).toBe('sergey2')
     expect(remapPrincipal('user:sergey2')).toBe('user:sergey2')
+  })
+
+  it('derives a cursor owner from its bound non-primary session', () => {
+    expect(
+      resolveSeedAgentDeltaCursorOwner({
+        sessionOwner: 'bob',
+        fallbackOwner: 'admin',
+        asUser,
+      }),
+    ).toBe('bob')
+  })
+
+  it('rejects an explicit cursor owner that differs from its session owner', () => {
+    expect(() =>
+      resolveSeedAgentDeltaCursorOwner({
+        cursorOwner: 'sergey',
+        sessionOwner: 'bob',
+        fallbackOwner: 'admin',
+        asUser,
+      }),
+    ).toThrow('cursor owner admin does not match session owner bob')
+  })
+
+  it('compares owners after applying the catalog-owner remap', () => {
+    expect(
+      resolveSeedAgentDeltaCursorOwner({
+        cursorOwner: 'sergey',
+        sessionOwner: 'admin',
+        fallbackOwner: 'admin',
+        asUser,
+      }),
+    ).toBe('admin')
   })
 })

@@ -49,8 +49,9 @@ export const StartSessionInputSchema = z.object({
       message: 'provide exactly one of id or name',
     })
     .optional(),
-  /** Whether to advance lastSeen[token, project]. Default true; `false` = peek the
-   *  delta without moving the bookmark (keeps the tool idempotent). */
+  /** Whether to advance the bound `(session, project)` cursor plus its owner
+   *  fallback, or just the owner fallback when no session binds. Default true;
+   *  `false` = peek. A bound session's starting position is still materialised. */
   acknowledge: z.boolean().default(true),
   responseFormat: ResponseFormatSchema.default(RESPONSE_FORMAT.concise),
 })
@@ -63,10 +64,10 @@ export const SessionProfileSchema = z.object({
   alwaysLoad: z.array(z.object({ noteId: z.string(), title: z.string() })),
 })
 
-/** One change since the principal last looked. `locationFields` is the per-entry
- *  disambiguator so a `project`-hinted agent tells its own changes from a sibling
- *  project's in a shared space (the delta is the space revision stream, not
- *  path-indexed). */
+/** One change since the bound session (or unbound owner fallback) last looked.
+ *  `locationFields` is the per-entry disambiguator so a `project`-hinted agent
+ *  tells its own changes from a sibling project's in a shared space (the delta
+ *  is the space revision stream, not path-indexed). */
 export const DeltaEntrySchema = z.object({
   noteId: z.string(),
   title: z.string(),
@@ -76,8 +77,9 @@ export const DeltaEntrySchema = z.object({
   modifiedAt: IsoTimestampSchema,
 })
 
-/** The per-token, per-project delta. `total` is the full change count;
- *  `changes` is the budgeted window with `truncated` when it didn't all fit. */
+/** The bound-session/project delta, or the owner/project fallback when no session
+ *  binds. `total` is the full change count; `changes` is the budgeted window with
+ *  `truncated` when it didn't all fit. */
 export const DeltaSchema = z.object({
   changes: z.array(DeltaEntrySchema),
   total: z.number(),

@@ -278,21 +278,47 @@ describe('seed catalog (#175)', () => {
     expect(w.auth?.connectedApps?.some((app) => app.appName === 'Claude')).toBe(true)
   })
 
-  it('agent-sessions carries active, forked, sleeping, automatic and expired episodes', () => {
+  it('agent-sessions carries episodes plus divergent owner/root/fork delta positions', () => {
     const world = buildCaseWorld('agent-sessions', { now: DEFAULT_NOW })
     const sessions = world.agentSessions ?? []
-    expect(sessions).toHaveLength(6)
+    expect(sessions).toHaveLength(7)
     expect(sessions.find((session) => session.parentRef)?.parentRef).toBe('review-root')
     expect(sessions.some((session) => session.named === false)).toBe(true)
     expect(sessions.some((session) => session.lastSeenDaysAgo > 30)).toBe(true)
+    expect(world.agentDeltaCursors).toEqual([
+      expect.objectContaining({ sessionRef: 'review-root' }),
+      expect.objectContaining({ sessionRef: 'review-fork' }),
+      expect.not.objectContaining({ sessionRef: expect.anything() }),
+      expect.objectContaining({ sessionRef: 'bob-review' }),
+    ])
+    expect(sessions.find((session) => session.ref === 'bob-review')?.owner).toBe('bob')
+    expect(
+      world.agentDeltaCursors?.find((cursor) => cursor.sessionRef === 'bob-review')?.owner,
+    ).toBeUndefined()
+    expect(world.projects).toContainEqual(expect.objectContaining({ space: 'main', path: '' }))
 
     const fixture = caseToFixture(world)
-    expect(fixture.agentSessions).toHaveLength(6)
+    expect(fixture.agentSessions).toHaveLength(7)
     expect(
       fixture.agentSessions?.every((session) => /^ses_[A-Za-z0-9_-]{12}$/.test(session.id)),
     ).toBe(true)
     const fork = fixture.agentSessions?.find((session) => session.parentId)
     expect(fixture.agentSessions?.some((session) => session.id === fork?.parentId)).toBe(true)
+  })
+
+  it('rejects a delta cursor anchored in another project revision stream', () => {
+    const world = buildCaseWorld('agent-sessions', { now: DEFAULT_NOW })
+    const cursors = world.agentDeltaCursors ?? []
+    const invalid: CaseWorld = {
+      ...world,
+      agentDeltaCursors: [
+        { ...cursors[0], project: { ...cursors[0].project, space: 'another-space' } },
+      ],
+    }
+
+    expect(() => mergeWorlds([{ name: 'invalid', world: invalid }])).toThrow(
+      /belongs to space main, not project space another-space/,
+    )
   })
 
   it('combining cases namespaces agent-session refs and their parent chain', () => {
@@ -301,6 +327,12 @@ describe('seed catalog (#175)', () => {
     expect(fork).toMatchObject({
       ref: 'agent-sessions:review-fork',
       parentRef: 'agent-sessions:review-root',
+    })
+    expect(
+      combined.agentDeltaCursors?.find((cursor) => cursor.sessionRef?.endsWith('review-fork')),
+    ).toMatchObject({
+      sessionRef: 'agent-sessions:review-fork',
+      throughNote: expect.stringMatching(/^agent-sessions:/),
     })
   })
 

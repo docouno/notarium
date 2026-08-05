@@ -161,7 +161,7 @@ export const MeAgentContextResponseSchema = z.object({
  *  PERSONAL background embeds into the `Q` remainder — same notes as /api/me/agent-context
  *  but `loaded` recomputed against the smaller budget. About-project memory stays
  *  recall-on-demand, OFF this budget. Plus the read-only AUTO index. `space:read`;
- *  anti-enumeration 404 like its memory twin. Preview NEVER advances the delta cursor (peek). */
+ *  anti-enumeration 404 like its memory twin. Preview does not call MCP delta persistence. */
 export const ProjectAgentContextResponseSchema = z.object({
   /** The project's curated pins, loaded-first under `Q`. */
   pins: z.array(ContextPinSchema),

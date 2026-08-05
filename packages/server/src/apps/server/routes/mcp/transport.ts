@@ -16,6 +16,7 @@ import { type Principal, SYSTEM_PRINCIPAL } from '../../../../services/authz'
 import { SERVER_INFO, SERVER_INSTRUCTIONS } from '../../../../services/mcp/descriptions'
 import { createGateway, type McpGateway } from '../../../../services/mcp/gateway'
 import type {
+  AgentDeltaCursorsPersistence,
   AgentSessionsPersistence,
   ContextOrderPersistence,
   ContextSetsPersistence,
@@ -33,6 +34,7 @@ export type McpOptions = {
   spaces: SpaceManager
   auth: AuthService
   sessions?: AgentSessionsPersistence
+  agentDeltaCursors?: AgentDeltaCursorsPersistence
   gatewayState?: GatewayStatePersistence
   /** Absent ⇒ no retrieval audit capture (P5 honest degradation).
    *  canon: docs/projects.md#audit-auditing-the-runtime-retrieval-243-mem-audita */
@@ -55,7 +57,7 @@ export type McpOptions = {
    *  would never balance. Absent ⇒ uncounted. canon: docs/core.md#cooperative */
   scheduler?: InteractiveSignal
   /** Tool calls enter the online-backup barrier because read tools may persist
-   *  session bookmarks or retrieval-audit rows too. */
+   *  session delta cursors or retrieval-audit rows too. */
   mutationGate?: MutationGate
 }
 
@@ -98,6 +100,7 @@ export const registerMcp = async (
     spaces,
     auth,
     sessions,
+    agentDeltaCursors,
     gatewayState,
     retrievalLog,
     projects,
@@ -116,6 +119,7 @@ export const registerMcp = async (
     spaces,
     auth,
     sessions,
+    agentDeltaCursors,
     gatewayState,
     retrievalLog,
     projects,

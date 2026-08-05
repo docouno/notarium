@@ -463,6 +463,7 @@ export const createServer = async ({
     auth,
     scheduler,
     sessions: metaDb?.sessions,
+    agentDeltaCursors: metaDb?.agentDeltaCursors,
     gatewayState: metaDb?.gateway,
     retrievalLog: metaDb?.retrievalLog,
     projects: metaDb?.projects,

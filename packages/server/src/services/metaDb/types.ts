@@ -473,16 +473,10 @@ export type AuthPersistence = {
  *  back instead of writing a duplicate. */
 export type DedupResult = { noteId: string; versionToken: string }
 
-/** The MCP gateway's per-token state: start_session's delta bookmark and
- *  write-retry idempotency. Pure persistence — the windowing/scope policy lives
- *  in the gateway. OPTIONAL on a host (a meta-DB-less none-mode host degrades:
- *  no bookmark, no dedup), like the journal. */
+/** The MCP gateway's write-retry idempotency state. Pure persistence — the
+ *  windowing/scope policy lives in the gateway. OPTIONAL on a host (a
+ *  meta-DB-less none-mode host has no dedup), like the journal. */
 export type GatewayStatePersistence = {
-  /** The delta cursor (a revision id) for this principal+space, or null when the
-   *  token has never acknowledged this space. */
-  bookmarkGet(principalId: string, space: string): Promise<string | null>
-  /** Advance (upsert) the delta cursor. */
-  bookmarkSet(principalId: string, space: string, lastRev: string, updatedAt: string): Promise<void>
   /** A prior write's outcome for (scope, key) when it is still inside the window
    *  (createdAt > sinceIso), else null. */
   dedupGet(scope: string, key: string, sinceIso: string): Promise<DedupResult | null>
@@ -492,6 +486,34 @@ export type GatewayStatePersistence = {
   /** Drop dedup rows older than `beforeIso` — bounds the table; the gateway
    *  calls it opportunistically. */
   dedupPrune(beforeIso: string): Promise<void>
+}
+
+// ── Agent delta cursors facet ──────────────────────────────────
+
+/** The owner fallback, optionally narrowed to one durable work episode. A fork
+ * carries its parent so first project-touch can copy the parent's independent
+ * position instead of a newer owner fallback. */
+export type AgentDeltaCursorScope = {
+  owner: string
+  session?: { id: string; parentId: string | null }
+}
+
+/** Durable positions in each project's space-wide revision stream. A session
+ * cursor is materialised on first project-touch even for a peek, freezing its
+ * independent window. `advance` moves the session and owner fallback together,
+ * monotonically and atomically. */
+export type AgentDeltaCursorsPersistence = {
+  getOrInit(
+    scope: AgentDeltaCursorScope,
+    project: string,
+    initializedAt: string,
+  ): Promise<string | null>
+  advance(
+    scope: AgentDeltaCursorScope,
+    project: string,
+    lastRev: string,
+    updatedAt: string,
+  ): Promise<void>
 }
 
 // ── Agent work sessions facet ──────────────────────────────────
@@ -843,6 +865,8 @@ export type MetaDb = {
   spaces: SpacesPersistence
   auth: AuthPersistence
   gateway: GatewayStatePersistence
+  /** Owner fallback + per-session/project delta positions. */
+  agentDeltaCursors: AgentDeltaCursorsPersistence
   /** Owner-scoped/cross-space; retained independently of any one project or space. */
   sessions: AgentSessionsPersistence
   projects: ProjectsPersistence
@@ -870,7 +894,8 @@ export type MetaDb = {
   ): Promise<GrantMemberToActiveSpaceResult>
   /** Erase one space's rows across every facet in a single transaction (journal with
    *  CAS-blob GC, identity, folders/projects, favorites, sets, pins, order, memberships,
-   *  bookmarks) + scrub its id from every `pats.spaces` (an emptied PAT stays `[]` =
+   *  delta cursors and inert legacy bookmarks) + scrub its id from every `pats.spaces`
+   *  (an emptied PAT stays `[]` =
    *  no access, never widened — fail-closed). On-disk artefacts are removed by the
    *  composition root, not here (this layer owns no filesystem). Irreversible. */
   purgeSpace(spaceId: string): Promise<void>

@@ -2,8 +2,12 @@ import { describe, expect, it } from 'vitest'
 
 import { InMemoryRevisionPersistence, type RevisionInput } from '@notarium/core'
 
+import { InMemoryAgentDeltaCursors } from '../fake-server/agentDeltaCursors'
 import { InMemoryAgentSessions } from '../fake-server/agentSessions'
+import { InMemoryFolders } from '../fake-server/folders'
 import { InMemoryGatewayState } from '../fake-server/gatewayState'
+import { InMemoryProjects } from '../fake-server/projects'
+import { describeAgentDeltaCursorsContract } from './agentDeltaCursorsContract'
 import { describeAgentSessionsContract } from './agentSessionsContract'
 import { describeGatewayStateContract } from './gatewayStateContract'
 import { describeRevisionPersistenceContract } from './revisionPersistenceContract'
@@ -11,6 +15,16 @@ import { describeRevisionPersistenceContract } from './revisionPersistenceContra
 describeGatewayStateContract('in-memory twin', async () => ({
   persistence: new InMemoryGatewayState(),
 }))
+
+describeAgentDeltaCursorsContract('in-memory twin', async () => {
+  const persistence = new InMemoryAgentDeltaCursors()
+  const projects = new InMemoryProjects()
+  const folders = new InMemoryFolders(projects)
+  const sessions = new InMemoryAgentSessions()
+  projects.attachLifecycle(persistence)
+  sessions.attachLifecycle(persistence)
+  return { persistence, sessions, projects, folders }
+})
 
 describeAgentSessionsContract('in-memory twin', async () => ({
   persistence: new InMemoryAgentSessions(),

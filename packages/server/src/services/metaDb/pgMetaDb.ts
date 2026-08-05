@@ -3,6 +3,7 @@
 
 import pg from 'pg'
 
+import { createAgentDeltaCursorsFacet } from './drivers/pg/agentDeltaCursors'
 import { createAuthFacet } from './drivers/pg/auth'
 import type { PgDriverCtx } from './drivers/pg/context'
 import { createContextOrderFacet } from './drivers/pg/contextOrder'
@@ -239,6 +240,56 @@ export class PgMetaDb implements MetaDb {
         }
       }
       await client.query('DELETE FROM note_identity WHERE space = $1', [spaceId])
+      // Legacy rows may carry a space/project id, current slug, or retired space
+      // alias. Ids are authoritative; textual history is purged only when every
+      // live namespace resolves it to one project (fail closed on collisions).
+      await client.query(
+        `WITH candidates AS (
+           SELECT bookmarks.space AS legacy_key, folders.id AS project
+             FROM mcp_bookmarks AS bookmarks
+             JOIN folders ON folders.id = bookmarks.space AND folders.type = 'project'
+           UNION
+           SELECT bookmarks.space AS legacy_key, folders.id AS project
+             FROM mcp_bookmarks AS bookmarks
+             JOIN folders
+               ON folders.space = bookmarks.space
+              AND folders.path = ''
+              AND folders.type = 'project'
+           UNION
+           SELECT bookmarks.space AS legacy_key, folders.id AS project
+             FROM mcp_bookmarks AS bookmarks
+             JOIN spaces
+               ON spaces.slug = bookmarks.space
+               OR EXISTS (
+                 SELECT 1
+                   FROM jsonb_array_elements_text(COALESCE(spaces.aliases, '[]')::jsonb)
+                        AS alias(value)
+                  WHERE alias.value = bookmarks.space
+               )
+             JOIN folders
+               ON folders.space = spaces.id
+              AND folders.path = ''
+              AND folders.type = 'project'
+         ), uniquely_resolved AS (
+           SELECT legacy_key, MIN(project) AS project
+             FROM candidates
+            GROUP BY legacy_key
+           HAVING COUNT(DISTINCT project) = 1
+         )
+         DELETE FROM mcp_bookmarks
+          WHERE space = $1
+             OR space IN (SELECT id FROM folders WHERE space = $1 AND type = 'project')
+             OR space IN (
+               SELECT legacy_key
+                 FROM uniquely_resolved
+                WHERE project IN (
+                  SELECT id FROM folders WHERE space = $1 AND type = 'project'
+                )
+             )`,
+        [spaceId],
+      )
+      // The project FK cascades both cursor tables from this parent delete. This
+      // preserves the parent-first order used by concurrent session advance.
       await client.query('DELETE FROM folders WHERE space = $1', [spaceId])
       await client.query('DELETE FROM favorites WHERE space = $1', [spaceId])
       await client.query(
@@ -250,7 +301,6 @@ export class PgMetaDb implements MetaDb {
       await client.query('DELETE FROM context_scope_pins WHERE target_space = $1', [spaceId])
       await client.query('DELETE FROM context_order WHERE target_space = $1', [spaceId])
       await client.query('DELETE FROM space_members WHERE space = $1', [spaceId])
-      await client.query('DELETE FROM mcp_bookmarks WHERE space = $1', [spaceId])
       // Job rows only; on-disk artifacts are swept by the runner's TTL GC (this layer owns no filesystem).
       await client.query('DELETE FROM jobs WHERE space = $1', [spaceId])
       // Defensive — a personal space is never purged (the caller refuses it).
@@ -293,6 +343,8 @@ export class PgMetaDb implements MetaDb {
   readonly auth = createAuthFacet(this.ctx)
 
   readonly gateway = createGatewayFacet(this.ctx)
+
+  readonly agentDeltaCursors = createAgentDeltaCursorsFacet(this.ctx)
 
   readonly sessions = createSessionsFacet(this.ctx)
 

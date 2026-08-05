@@ -61,7 +61,7 @@ export class RevisionJournal {
     return this.persistence.listByNote(noteId, opts)
   }
 
-  /** The per-token delta (start_session) for THIS journal's space: notes
+  /** The cursor-based delta (start_session) for THIS journal's space: notes
    *  changed after revision `sinceRevId` (null = from the start), collapsed to
    *  one entry per note, newest-first, capped at `limit`. See
    *  RevisionPersistence.listBySpaceSince. */

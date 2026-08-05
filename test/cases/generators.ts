@@ -1,4 +1,5 @@
 import type {
+  AgentDeltaCursorDecl,
   AgentSessionDecl,
   CaseEvent,
   CaseNoteClass,
@@ -168,6 +169,7 @@ export class WorldBuilder {
   private readonly favorites: FavoriteDecl[] = []
   private readonly retrievals: RetrievalDecl[] = []
   private readonly agentSessions: AgentSessionDecl[] = []
+  private readonly agentDeltaCursors: AgentDeltaCursorDecl[] = []
   private readonly jobs: JobDecl[] = []
   private readonly durableImports: DurableImportDecl[] = []
   private readonly externalRewrites: ExternalRewriteDecl[] = []
@@ -312,6 +314,12 @@ export class WorldBuilder {
     return this
   }
 
+  /** Declare an owner fallback or one episode's project delta position. */
+  agentDeltaCursor(decl: AgentDeltaCursorDecl): this {
+    this.agentDeltaCursors.push(decl)
+    return this
+  }
+
   /** Declare a durable job (#105) — an export's history row and, when it succeeded with
    *  a live TTL, a REAL archive written under `<DATA_DIR>/jobs` by the production handler
    *  (#101). Real applier only; see JobDecl. */
@@ -354,6 +362,7 @@ export class WorldBuilder {
       favorites: this.favorites.length ? this.favorites : undefined,
       ...(this.retrievals.length ? { retrievals: this.retrievals } : {}),
       ...(this.agentSessions.length ? { agentSessions: this.agentSessions } : {}),
+      ...(this.agentDeltaCursors.length ? { agentDeltaCursors: this.agentDeltaCursors } : {}),
       ...(this.jobs.length ? { jobs: this.jobs } : {}),
       ...(this.durableImports.length ? { durableImports: this.durableImports } : {}),
       ...(this.externalRewrites.length ? { externalRewrites: this.externalRewrites } : {}),

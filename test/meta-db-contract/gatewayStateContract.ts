@@ -1,6 +1,6 @@
 // One executable contract for the MCP gateway persistence port. The in-memory
 // fake is the reference twin; SQLite and Postgres must expose the same observable
-// bookmark/idempotency semantics.
+// write-retry idempotency semantics.
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
@@ -28,22 +28,6 @@ export const describeGatewayStateContract = (
 
     afterEach(async () => {
       await teardown?.()
-    })
-
-    it('round-trips and advances bookmarks without regressing or leaking scope', async () => {
-      expect(await persistence.bookmarkGet('pat:alice:one', 'space-a')).toBeNull()
-
-      await persistence.bookmarkSet('pat:alice:one', 'space-a', '11', '2026-06-12T10:00:00.000Z')
-      await persistence.bookmarkSet('pat:alice:one', 'space-b', '22', '2026-06-12T10:01:00.000Z')
-      await persistence.bookmarkSet('pat:bob:two', 'space-a', '33', '2026-06-12T10:02:00.000Z')
-      await persistence.bookmarkSet('pat:alice:one', 'space-a', '44', '2026-06-12T10:03:00.000Z')
-      // An older concurrent session may finish last. "Advance" is monotonic:
-      // a stale acknowledgement must never rewind the next delta window.
-      await persistence.bookmarkSet('pat:alice:one', 'space-a', '12', '2026-06-12T10:04:00.000Z')
-
-      expect(await persistence.bookmarkGet('pat:alice:one', 'space-a')).toBe('44')
-      expect(await persistence.bookmarkGet('pat:alice:one', 'space-b')).toBe('22')
-      expect(await persistence.bookmarkGet('pat:bob:two', 'space-a')).toBe('33')
     })
 
     it('uses strict dedup window/prune boundaries and upserts one scope+key in place', async () => {

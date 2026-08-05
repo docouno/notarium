@@ -10,6 +10,8 @@ export {
 export { SqliteMetaDb } from './sqliteMetaDb'
 export { PgMetaDb } from './pgMetaDb'
 export type {
+  AgentDeltaCursorScope,
+  AgentDeltaCursorsPersistence,
   AgentSessionRecord,
   AgentSessionNamedStart,
   AgentSessionsPersistence,

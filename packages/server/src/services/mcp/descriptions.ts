@@ -27,7 +27,7 @@ export type ToolMeta = {
 export const TOOL_META = {
   start_session: {
     description:
-      'Call this FIRST in a new session. When the host supports agent episodes, it opens or resumes one and returns `session.id`; KEEP a returned id and pass it as the top-level `session` argument on every later tool call. Address by id to resume exactly, or by a non-unique human name: a sleeping match resumes, an active match forks, and ambiguous matches return matching choices. Loads, in one round-trip, what you would otherwise discover in several calls: the user\'s always-load profile, reachable projects, and — with a `project` hint — its compact index, pinned notes, delta and known vocabulary. `acknowledge:false` peeks at the delta without advancing your "last seen" marker. Large bundles are truncated honestly (`truncated:true`) — fall back to list_notes/search for the rest.',
+      "Call this FIRST in a new session. When the host supports agent episodes, it opens or resumes one and may return `session.id`; KEEP a returned id and pass it as the top-level `session` argument on every later tool call. Address by id to resume exactly, or by a non-unique human name: a sleeping match resumes, an active match forks, and ambiguous matches return matching choices without binding a session. Loads, in one round-trip, what you would otherwise discover in several calls: the user's always-load profile, reachable projects, and — with a `project` hint — its compact index, pinned notes, delta and known vocabulary. When a session is returned, its first project touch makes the delta position independent: another session under the same credential cannot advance it. Without a bound session, the delta uses the owner fallback. `acknowledge:false` peeks without advancing and still freezes a bound session's starting position. Large bundles are truncated honestly (`truncated:true`) — fall back to list_notes/search for the rest.",
     annotations: {
       title: 'Start session',
       readOnlyHint: false,
@@ -68,7 +68,7 @@ export const TOOL_META = {
   },
   recent_activity: {
     description:
-      'Show the most recently changed notes — absolute freshness ("what was touched lately, I should review it"), drawn from the history journal. This is NOT the same as start_session\'s delta: the delta is per-session ("since YOU last looked"), this is the latest changes regardless of who you are. `project` (a handle) narrows to that project; omit it for the latest across everything you can reach. `limit` caps how many. Each entry reports who changed it (`principal` — a person or an agent), how (`kind`), where (`path`/`project`), and when (`modifiedAt`). `truncated:true` means there was more than fit.',
+      'Show the most recently changed notes — absolute freshness ("what was touched lately, I should review it"), drawn from the history journal. This is NOT the same as start_session\'s delta: that delta follows one bound durable session, or the owner fallback when no session is bound. recent_activity ignores either cursor and shows the latest changes regardless of the caller. `project` (a handle) narrows to that project; omit it for the latest across everything you can reach. `limit` caps how many. Each entry reports who changed it (`principal` — a person or an agent), how (`kind`), where (`path`/`project`), and when (`modifiedAt`). `truncated:true` means there was more than fit.',
     annotations: {
       title: 'Recent activity',
       readOnlyHint: true,

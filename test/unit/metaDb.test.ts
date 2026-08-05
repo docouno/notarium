@@ -253,13 +253,31 @@ describe('SqliteMetaDb', () => {
     })
 
     it('purgeSpace erases every child place + the row, scrubs PATs, spares other spaces (#110)', async () => {
-      const db = make()
+      const dir = mkdtempSync(join(tmpdir(), 'notarium-purge-'))
+      cleanups.push(() => rmSync(dir, { recursive: true, force: true }))
+      const path = join(dir, 'meta.sqlite')
+      const db = make(path)
+      const inspect = new DatabaseSync(path)
+      cleanups.push(() => inspect.close())
       const victim = 'spc-gone-0001'
       const keep = 'spc-keep-0002'
       await db.spaces.upsert(
-        sp({ id: victim, slug: 'gone', notesDir: 'gone', archivedAt: '2026-06-23T12:00:00Z' }),
+        sp({
+          id: victim,
+          slug: 'gone',
+          notesDir: 'gone',
+          aliases: ['retired-gone', 'shared-retired'],
+          archivedAt: '2026-06-23T12:00:00Z',
+        }),
       )
-      await db.spaces.upsert(sp({ id: keep, slug: 'keep', notesDir: 'keep' }))
+      await db.spaces.upsert(
+        sp({
+          id: keep,
+          slug: 'keep',
+          notesDir: 'keep',
+          aliases: ['shared-retired'],
+        }),
+      )
       // Seed rows across the child places for BOTH spaces (only the victim's go).
       await db.identity.upsertMany([
         {
@@ -392,6 +410,62 @@ describe('SqliteMetaDb', () => {
       await db.contextOrder.setOrder('personal', keep, keep, [
         { entryKind: 'pin', entryRef: 'n-gone' },
       ])
+      await db.projects.upsert({
+        id: 'project-gone',
+        space: victim,
+        path: '',
+        slug: 'gone',
+        aliases: [],
+        pathAliases: [],
+        displayName: 'Gone',
+        status: 'active',
+        lastSeen: 'x',
+        createdAt: 'x',
+      })
+      await db.projects.upsert({
+        id: 'project-keep',
+        space: keep,
+        path: '',
+        slug: 'keep',
+        aliases: [],
+        pathAliases: [],
+        displayName: 'Keep',
+        status: 'active',
+        lastSeen: 'x',
+        createdAt: 'x',
+      })
+      await db.sessions.insert({
+        id: 'ses_aaaaaaaaaaaa',
+        owner: 'al',
+        name: 'purge probe',
+        named: true,
+        parentId: null,
+        createdAt: 'x',
+        lastSeenAt: 'x',
+        calls: 1,
+      })
+      const sessionCursor = {
+        owner: 'al',
+        session: { id: 'ses_aaaaaaaaaaaa', parentId: null },
+      }
+      await db.agentDeltaCursors.advance(sessionCursor, 'project-gone', '77', 'x')
+      await db.agentDeltaCursors.advance(sessionCursor, 'project-keep', '88', 'x')
+      const putLegacyBookmark = inspect.prepare(
+        `INSERT INTO mcp_bookmarks (principal_id, space, last_rev, updated_at)
+         VALUES ('pat:al:legacy', ?, '1', 'x')`,
+      )
+
+      for (const legacyKey of [
+        victim,
+        'project-gone',
+        'gone',
+        'retired-gone',
+        keep,
+        'project-keep',
+        'shared-retired',
+      ]) {
+        putLegacyBookmark.run(legacyKey)
+      }
 
       await db.purgeSpace(victim)
 
@@ -421,6 +495,28 @@ describe('SqliteMetaDb', () => {
       // mixed one keeps the survivor — NEVER widened to null/all (fail-closed, v14 rule).
       expect((await db.auth.getPat('p-both'))?.spaces).toEqual([keep])
       expect((await db.auth.getPat('p-only'))?.spaces).toEqual([])
+      // Project cursor partitions follow the purged project while the sibling
+      // project's session and owner positions survive unchanged.
+      expect(await db.agentDeltaCursors.getOrInit({ owner: 'al' }, 'project-gone', 'y')).toBeNull()
+      expect(
+        inspect
+          .prepare(
+            `SELECT
+               (SELECT COUNT(*) FROM mcp_delta_owner_cursors WHERE project = ?) AS owners,
+               (SELECT COUNT(*) FROM mcp_delta_session_cursors WHERE project = ?) AS sessions`,
+          )
+          .get('project-gone', 'project-gone'),
+      ).toEqual({ owners: 0, sessions: 0 })
+      expect(await db.agentDeltaCursors.getOrInit({ owner: 'al' }, 'project-keep', 'y')).toBe('88')
+      expect(await db.agentDeltaCursors.getOrInit(sessionCursor, 'project-keep', 'y')).toBe('88')
+      // Direct victim ids plus its unambiguous current/retired handles are scrubbed.
+      // A handle shared with the surviving space remains inert rather than being guessed.
+      expect(
+        inspect
+          .prepare('SELECT space FROM mcp_bookmarks ORDER BY space')
+          .all()
+          .map((row) => (row as { space: string }).space),
+      ).toEqual([keep, 'project-keep', 'shared-retired'].sort())
       // Context sets: the victim-homed set is gone; the keep-homed set survives, but its
       // attachment to the (now-purged) victim target was cascaded away.
       expect(await db.contextSets.getSet('set-gone')).toBeNull()
@@ -1495,21 +1591,6 @@ describe('SqliteMetaDb', () => {
   })
 
   describe('gateway state facet (#21, v8)', () => {
-    it('bookmarks round-trip per (principal, space) and upsert in place', async () => {
-      const db = make()
-      expect(await db.gateway.bookmarkGet('pat:alice:1', 'team')).toBeNull()
-
-      await db.gateway.bookmarkSet('pat:alice:1', 'team', '42', '2026-06-14T00:00:00Z')
-      expect(await db.gateway.bookmarkGet('pat:alice:1', 'team')).toBe('42')
-      // Distinct per principal and per space.
-      expect(await db.gateway.bookmarkGet('pat:bob:1', 'team')).toBeNull()
-      expect(await db.gateway.bookmarkGet('pat:alice:1', 'main')).toBeNull()
-
-      // Advancing overwrites in place (no duplicate row).
-      await db.gateway.bookmarkSet('pat:alice:1', 'team', '99', '2026-06-14T01:00:00Z')
-      expect(await db.gateway.bookmarkGet('pat:alice:1', 'team')).toBe('99')
-    })
-
     it('dedup get/put windows by createdAt and prunes old rows', async () => {
       const db = make()
       const result = { noteId: 'n-1', versionToken: 'v-1' }

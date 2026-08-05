@@ -2,6 +2,7 @@ import { compareEvents } from './generators'
 import { getCase } from './registry'
 import { makeRng } from './rng'
 import type {
+  AgentDeltaCursorDecl,
   AgentSessionDecl,
   CaseEvent,
   CaseWorld,
@@ -40,6 +41,27 @@ export type BuildOptions = {
   locale?: string
 }
 
+const validateAgentDeltaCursorAnchors = (world: CaseWorld): CaseWorld => {
+  const noteSpaces = new Map(
+    world.events
+      .filter((event): event is Extract<CaseEvent, { op: 'create' }> => event.op === 'create')
+      .map((event) => [event.noteId, event.space]),
+  )
+
+  for (const cursor of world.agentDeltaCursors ?? []) {
+    const noteSpace = noteSpaces.get(cursor.throughNote)
+
+    if (noteSpace && noteSpace !== cursor.project.space) {
+      throw new Error(
+        `agent delta cursor anchor ${cursor.throughNote} belongs to space ${noteSpace}, ` +
+          `not project space ${cursor.project.space}`,
+      )
+    }
+  }
+
+  return world
+}
+
 /** Resolve a case name + options into its CaseWorld — the ONE builder both
  *  appliers call, so the fake and the real stand get the identical world for a
  *  given (name, seed, scale, now). */
@@ -52,7 +74,9 @@ export const buildCaseWorld = (name: string, opts: BuildOptions = {}): CaseWorld
     throw new Error(`invalid now: "${opts.now}"`)
   }
 
-  return spec.build({ rng, scale: opts.scale ?? 1, now, locale: opts.locale })
+  return validateAgentDeltaCursorAnchors(
+    spec.build({ rng, scale: opts.scale ?? 1, now, locale: opts.locale }),
+  )
 }
 
 /** Build ONE OR MANY cases: a comma-separated `spec` combines several catalog
@@ -95,6 +119,7 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
   const favorites = new Map<string, FavoriteDecl>()
   const retrievals: RetrievalDecl[] = []
   const agentSessions: AgentSessionDecl[] = []
+  const agentDeltaCursors: AgentDeltaCursorDecl[] = []
   const jobs: JobDecl[] = []
   const durableImports: DurableImportDecl[] = []
   const externalRewrites: ExternalRewriteDecl[] = []
@@ -230,6 +255,15 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
         ...(session.parentRef ? { parentRef: `${name}:${session.parentRef}` } : {}),
       })
     }
+    // Cursor declarations reference both a session and a journalled note by logical
+    // id; namespace both exactly like their source declarations.
+    for (const cursor of world.agentDeltaCursors ?? []) {
+      agentDeltaCursors.push({
+        ...cursor,
+        ...(cursor.sessionRef ? { sessionRef: `${name}:${cursor.sessionRef}` } : {}),
+        throughNote: `${name}:${cursor.throughNote}`,
+      })
+    }
     // Jobs carry no logical note handles — they address a SPACE, and spaces merge by
     // slug WITHOUT namespacing (see above), so a job's `space` resolves unchanged in a
     // combined world and the decls concatenate verbatim (#105/#101).
@@ -247,7 +281,7 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
   }
 
   events.sort(compareEvents)
-  return {
+  return validateAgentDeltaCursorAnchors({
     now: parts[0].world.now,
     spaces: [...spaces.values()],
     projects: projects.size ? [...projects.values()] : undefined,
@@ -268,8 +302,9 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
     favorites: favorites.size ? [...favorites.values()] : undefined,
     ...(retrievals.length ? { retrievals } : {}),
     ...(agentSessions.length ? { agentSessions } : {}),
+    ...(agentDeltaCursors.length ? { agentDeltaCursors } : {}),
     ...(jobs.length ? { jobs } : {}),
     ...(durableImports.length ? { durableImports } : {}),
     ...(externalRewrites.length ? { externalRewrites } : {}),
-  }
+  })
 }

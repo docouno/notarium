@@ -416,7 +416,7 @@ export class WriteEngine {
     baseline?: { content: string; title: string; tags?: string[]; slug?: string | null },
     afterContent?: string,
     /** The written note's class, from the engine's WriteResult (mount-
-     *  derived, authoritative). Recorded so the per-token delta can class-scope
+     *  derived, authoritative). Recorded so the cursor-based delta can class-scope
      *  . Falls back to the create intent / the snapshot; the journal
      *  carries it forward on later body-less revisions. */
     cls?: string | null,

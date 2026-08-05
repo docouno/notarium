@@ -18,13 +18,13 @@ Why a gateway and not "just give the agent the engine." Direct access to the sto
 The names/descriptions the agent sees in `tools/list` are static and live in [descriptions.ts](../packages/server/src/services/mcp/descriptions.ts). A summary:
 
 **Bootstrap**
-- `start_session` — call it **first** in a new session. It opens/resumes an agent episode and returns `session.id`; retain that id and pass it as the top-level `session` argument on every later session-aware tool. In one round-trip it also returns the user profile (always-load), accessible projects and, with a `project` hint, a **compact index** of the project (a note count + top-level folders — enumerate via `list_notes`), the delta of changes since the last visit and `knownValues`. `acknowledge:false` peeks at the delta without moving the cursor. The acknowledged cursor only advances: a slower, older concurrent response cannot rewind the next delta window. Not calling it just means less context: the other tools work on their own. Curating WHAT lands in `profile.alwaysLoad`/`project.alwaysLoad` — the Agents → Context section ([docs/projects.md](projects.md#init-context-curation)): manual pins in place (`always-load`), **context sets + cross-space loose pins** and muting memory.
+- `start_session` — call it **first** in a new session. It opens/resumes an agent episode and, when one episode binds unambiguously, returns `session.id`; retain that id and pass it as the top-level `session` argument on every later session-aware tool. In one round-trip it also returns the user profile (always-load), accessible projects and, with a `project` hint, a **compact index** of the project (a note count + top-level folders — enumerate via `list_notes`), the bound episode's own delta of changes since its last visit and `knownValues`. Without a bound episode (including ambiguous name matching), the delta follows the owner fallback. `acknowledge:false` peeks without advancing but still freezes a bound episode's independent starting position. An acknowledge advances the bound episode plus its owner fallback, or only that fallback when no episode binds; every write is monotonic, so a slower, older concurrent response cannot rewind the next delta window. Not calling it just means less context: the other tools work on their own. Curating WHAT lands in `profile.alwaysLoad`/`project.alwaysLoad` — the Agents → Context section ([docs/projects.md](projects.md#init-context-curation)): manual pins in place (`always-load`), **context sets + cross-space loose pins** and muting memory.
 - `whoami` — who I am and what I may do (principal-id, the read|write ceiling, project memberships) + the engine's `capabilities` (`vector`/`trash`/`revisions`) — so as not to probe blindly.
 - `get_my_projects` — the list of accessible projects with their slugs (for the `project` argument — do not guess the slug). The personal domain is **not** in the list (it is implied by the token).
 
 **Discover / navigate**
 - `list_notes` — `ls` of the knowledge base: the direct notes and subfolders of a folder (deterministic, paginated). `project` picks a space and narrows to it; `path` is a **space-relative** folder (take the `path` from a `folders` entry / a hit verbatim, do not construct it) — without it, the project root. `tag` filters by a tag. Returns `items` (direct notes: id/title/path/tags) + `folders` (direct subfolders with a subtree count) + an honest `total`; page with `cursor`/`nextCursor`. Lists the user-visible notes (not agent-memory — for it use `search`).
-- `recent_activity` — the most recently edited notes (absolute freshness from the journal) — "what was touched lately, needs a review." This is **not** the delta from `start_session` (that one is the agent's "since your last visit" cursor and is not yet episode-scoped). `project` narrows it; without it, the freshest across the whole reach. Each entry: who (`principal` — human/agent), how (`kind`), where (`path`/`project`), when (`modifiedAt`). `truncated:true` — there was more.
+- `recent_activity` — the most recently edited notes (absolute freshness from the journal) — "what was touched lately, needs a review." This is **not** the delta from `start_session`: that delta follows a bound episode cursor, or the owner fallback when no episode binds; `recent_activity` ignores either cursor and always shows the latest changes. `project` narrows it; without it, the freshest across the whole reach. Each entry: who (`principal` — human/agent), how (`kind`), where (`path`/`project`), when (`modifiedAt`). `truncated:true` — there was more.
 
 **Read / recall**
 - `search` — hybrid search (semantics + lexical via RRF, #81) over the reachable knowledge, with an honest degradation to FTS when the vector channel is unavailable. **It also covers the agent's own agent-memory** (#102): "search before writing" now dedupes memory too (the only class without title-collision dedup) — **always search before writing**. `project` narrows it to a project (its notes + its memory); without it, the whole reachable scope plus the personal domain. `class` filters by kind (`agent-memory` — only memory, `user-doc` — exclude it). Returns ranked snippets with a `score` and `path` (where it lives), not full notes.
@@ -85,8 +85,25 @@ so it is always resolvable. Both are capped at ten. There is deliberately no clo
 transport's stateless HTTP session remains unchanged: this is a transport-independent core
 service carried through `Ctx.session`, ready for future chat callers. A host without a meta-DB
 degrades honestly: `start_session` omits the session fields and other tools silently ignore the
-argument. Episode-scoped bookmarks/delta and retrieval audit attribution are intentionally
-deferred; this change only provides the durable binding they can build on.
+argument.
+
+### Delta positions
+
+When an episode binds, the `start_session` delta is scoped by `(session.id, project.id)`. Its first
+call materializes an independent position even for `acknowledge:false`, so one episode can never
+consume another one's window. A new root episode starts at the owner's latest acknowledged
+position for that project; it does not replay changes already consumed by a previous episode. A
+fork inherits the parent episode's materialized position instead, falling back to the owner
+position only when the parent has never touched the project. Restoring an existing episode
+continues from its own position. A call that binds no episode uses the owner/project fallback.
+
+With a bound episode, acknowledging advances its position and the owner fallback in one meta-DB
+transaction. Both writes are monotonic, so an older concurrent response cannot rewind either
+cursor. Without a bound episode, only the owner-scoped fallback advances. The revision stream
+itself remains space-wide: project selection chooses a cursor partition, not a narrower journal
+query. Session positions cascade with their retained episode row; owner fallbacks survive episode
+retention and are removed with their project. This state is meta-DB-only and does not violate the
+Markdown source-of-truth boundary.
 
 ## Security (why the set is exactly this) <a id="security"></a>
 

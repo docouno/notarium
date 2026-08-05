@@ -49,6 +49,7 @@ import {
   SqliteMetaDb,
 } from '@notarium/server'
 
+import { InMemoryAgentDeltaCursors } from './agentDeltaCursors'
 import { InMemoryAgentSessions } from './agentSessions'
 import { InMemoryAuthPersistence } from './authPersistence'
 import { InMemoryContextOrder } from './contextOrder'
@@ -299,6 +300,9 @@ export const createApp = async (
   const contextOrder = new InMemoryContextOrder()
   const agentSessions = new InMemoryAgentSessions()
   agentSessions.seed(fixture.agentSessions ?? [])
+  const agentDeltaCursors = new InMemoryAgentDeltaCursors()
+  projects.attachLifecycle(agentDeltaCursors)
+  agentSessions.attachLifecycle(agentDeltaCursors)
   // The space registry: a minimal in-memory SpacesPersistence so the REAL
   // SpaceManager mints an opaque space_id (id ≠ slug) instead of collapsing
   // id ≡ slug — the prerequisite for e2e to see the wire's id→slug projection seam.
@@ -509,8 +513,8 @@ export const createApp = async (
   }
   await seedAuth(fixture.auth)
 
-  // The MCP gateway's per-token state: start_session delta bookmarks
-  // and write-retry dedup, over an in-memory twin the harness resets.
+  // MCP durable state: per-session/project delta cursors plus write-retry dedup,
+  // over in-memory twins the harness resets.
   const gatewayState = new InMemoryGatewayState()
   const retrievalLog = new InMemoryRetrievalLog()
 
@@ -562,6 +566,7 @@ export const createApp = async (
     spaces: manager,
     auth,
     sessions: fixture.noAgentSessions ? undefined : agentSessions,
+    agentDeltaCursors,
     gatewayState,
     retrievalLog,
     projects,
@@ -657,6 +662,7 @@ export const createApp = async (
     await seedActivityForFixture(next)
     await seedAuth(next.auth)
     gatewayState.clear()
+    agentDeltaCursors.clear()
     agentSessions.seed(next.agentSessions ?? [])
     retrievalLog.clear()
     oauthDb.clear()

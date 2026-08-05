@@ -97,7 +97,7 @@ describe('meta-DB migration assets and SQLite runner', () => {
           .all() as Array<{ type: string; count: number }>
       ).map(({ type, count }) => [type, count]),
     )
-    expect(counts).toEqual({ index: 31, table: 25, trigger: 1 })
+    expect(counts).toEqual({ index: 34, table: 27, trigger: 2 })
     expect(
       db.prepare("SELECT 1 FROM sqlite_schema WHERE name = 'meta_schema'").get(),
     ).toBeUndefined()
@@ -112,6 +112,86 @@ describe('meta-DB migration assets and SQLite runner', () => {
     runSqliteMigrations(db)
 
     expect(ledger(db)).toEqual(before)
+  })
+
+  it('migrates credential bookmarks to the furthest owner fallback per project', () => {
+    const db = database()
+    runSqliteMigrations(db, migrations.slice(0, 1))
+    db.exec(`
+      INSERT INTO spaces (id, slug, notes_dir, display_name, aliases, created_at)
+      VALUES
+        ('legacy-space-id', 'legacy-space-slug', 'legacy', 'Legacy', '["retired-space-slug"]', '2026-08-04'),
+        ('collision-space-id', 'ambiguous-key', 'collision', 'Collision', NULL, '2026-08-04');
+      INSERT INTO folders
+        (id, space, path, slug, display_name, status, last_seen, created_at, type)
+      VALUES
+        ('project-a', 'space-a', 'a', 'project-a', 'Project A', 'active', 'x', 'x', 'project'),
+        ('project-b', 'space-a', 'b', 'project-b', 'Project B', 'active', 'x', 'x', 'project'),
+        ('project-root', 'legacy-space-id', '', 'root', 'Root', 'active', 'x', 'x', 'project'),
+        ('ambiguous-key', 'space-a', 'ambiguous', 'ambiguous', 'Ambiguous', 'active', 'x', 'x', 'project'),
+        ('collision-root', 'collision-space-id', '', 'collision', 'Collision', 'active', 'x', 'x', 'project');
+    `)
+    const insert = db.prepare(
+      `INSERT INTO mcp_bookmarks (principal_id, space, last_rev, updated_at)
+       VALUES (?, ?, ?, ?)`,
+    )
+    insert.run('pat:alice:pat-a', 'project-a', '11', '2026-08-04T10:00:00Z')
+    insert.run('oauth:alice:oauth-a', 'project-a', '44', '2026-08-04T10:01:00Z')
+    insert.run('pat:alice:pat-a', 'project-b', '22', '2026-08-04T10:02:00Z')
+    insert.run('pat:bob:pat-b', 'project-a', '33', '2026-08-04T10:03:00Z')
+    insert.run('ui', 'project-a', '55', '2026-08-04T10:04:00Z')
+    insert.run('pat:carol:pat-c', 'legacy-space-id', '66', '2026-08-04T10:05:00Z')
+    insert.run('pat:dora:pat-d', 'legacy-space-slug', '77', '2026-08-04T10:06:00Z')
+    insert.run('pat:erin:pat-e', 'retired-space-slug', '78', '2026-08-04T10:06:30Z')
+    insert.run('unknown', 'project-a', '99', '2026-08-04T10:05:00Z')
+    insert.run('pat:eve:pat-e', 'ambiguous-key', '88', '2026-08-04T10:07:00Z')
+    insert.run('pat:frank:pat-f', 'missing-project', '89', '2026-08-04T10:08:00Z')
+
+    runSqliteMigrations(db)
+
+    expect(
+      db
+        .prepare(
+          'SELECT owner, project, last_rev FROM mcp_delta_owner_cursors ORDER BY owner, project',
+        )
+        .all(),
+    ).toEqual([
+      { owner: 'alice', project: 'project-a', last_rev: '44' },
+      { owner: 'alice', project: 'project-b', last_rev: '22' },
+      { owner: 'bob', project: 'project-a', last_rev: '33' },
+      { owner: 'carol', project: 'project-root', last_rev: '66' },
+      { owner: 'dora', project: 'project-root', last_rev: '77' },
+      { owner: 'erin', project: 'project-root', last_rev: '78' },
+      { owner: 'system', project: 'project-a', last_rev: '55' },
+    ])
+  })
+
+  it('cascades session delta positions when retention removes their episode', () => {
+    const db = database()
+    runSqliteMigrations(db)
+    db.exec(`
+      INSERT INTO folders
+        (id, space, path, slug, display_name, status, last_seen, created_at, type)
+      VALUES
+        ('project-a', 'space-a', 'a', 'project-a', 'Project A', 'active', 'x', 'x', 'project');
+      INSERT INTO agent_sessions
+        (id, owner, name, named, parent_id, created_at, last_seen_at, calls)
+      VALUES
+        ('ses_aaaaaaaaaaaa', 'alice', 'retention probe', 1, NULL, '2026-08-01', '2026-08-01', 1);
+      INSERT INTO mcp_delta_session_cursors
+        (session_id, project, last_rev, updated_at)
+      VALUES
+        ('ses_aaaaaaaaaaaa', 'project-a', '42', '2026-08-04');
+      DELETE FROM agent_sessions WHERE id = 'ses_aaaaaaaaaaaa';
+    `)
+
+    expect(
+      (
+        db.prepare('SELECT COUNT(*) AS count FROM mcp_delta_session_cursors').get() as {
+          count: number
+        }
+      ).count,
+    ).toBe(0)
   })
 
   it('rejects a legacy or otherwise untracked database before mutating it', () => {

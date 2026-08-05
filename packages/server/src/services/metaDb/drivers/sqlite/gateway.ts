@@ -2,24 +2,6 @@ import type { GatewayStatePersistence } from '../../types'
 import type { SqliteDriverCtx } from './context'
 
 export const createGatewayFacet = (ctx: SqliteDriverCtx): GatewayStatePersistence => ({
-  bookmarkGet: async (principalId, space) => {
-    await ctx.ensureInit()
-    const r = ctx.required
-      .prepare('SELECT last_rev FROM mcp_bookmarks WHERE principal_id = ? AND space = ?')
-      .get(principalId, space) as { last_rev: string } | undefined
-    return r?.last_rev ?? null
-  },
-  bookmarkSet: async (principalId, space, lastRev, updatedAt) => {
-    await ctx.ensureInit()
-    ctx.required
-      .prepare(
-        `INSERT INTO mcp_bookmarks (principal_id, space, last_rev, updated_at) VALUES (?, ?, ?, ?)
-           ON CONFLICT(principal_id, space) DO UPDATE
-             SET last_rev = excluded.last_rev, updated_at = excluded.updated_at
-           WHERE CAST(mcp_bookmarks.last_rev AS INTEGER) < CAST(excluded.last_rev AS INTEGER)`,
-      )
-      .run(principalId, space, lastRev, updatedAt)
-  },
   dedupGet: async (scope, key, sinceIso) => {
     await ctx.ensureInit()
     const r = ctx.required

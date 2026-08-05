@@ -152,6 +152,18 @@ export type AgentSessionDecl = {
   calls: number
 }
 
+/** One durable delta position. `throughNote` resolves to that note's latest
+ * journal revision in the cursor project's space-wide stream after replay;
+ * absent sessionRef = owner fallback, present = one episode's cursor. */
+export type AgentDeltaCursorDecl = {
+  /** Username owner. Omit to inherit a bound session's owner, or the primary seed
+   *  owner when unbound; an explicit value must match a bound session. */
+  owner?: string
+  sessionRef?: string
+  project: { space: string; path: string }
+  throughNote: string
+}
+
 /** One durable job (#105) a case declares — a meta-DB row PLUS, for a finished
  *  export, a real archive in the artifact store under `<DATA_DIR>/jobs` (#101). Like
  *  connectedApps/retrievals it is a REAL-applier-only side-channel (the fake
@@ -343,6 +355,8 @@ export type CaseWorld = {
   retrievals?: RetrievalDecl[]
   /** Durable agent episodes, projected to both the fake and real meta-DB. */
   agentSessions?: AgentSessionDecl[]
+  /** Owner/session delta positions, resolved against real journal revisions. */
+  agentDeltaCursors?: AgentDeltaCursorDecl[]
   /** Durable job rows + their artifacts (#105) — real applier only, written after the
    *  timeline replays (a seeded export archives the notes it just seeded). Absent = none. */
   jobs?: JobDecl[]
