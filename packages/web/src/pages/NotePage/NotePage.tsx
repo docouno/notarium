@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router'
 import { NOTE_CLASS } from '@notarium/contract/enums'
 import { directoryOf, isFolderPageNote } from '@notarium/core'
@@ -32,16 +32,7 @@ import styles from './NotePage.module.scss'
 // (#65) instead of a blank page. A failed open keeps its own /n/<id> URL, so the
 // state shows here and the browser back button returns where the user came from.
 export const NotePage = () => {
-  const { mode, note, noteError, knownNotes, navigating, openNote, reloadNote, tree } = useNotes()
-  // Folder path-history (#100 phase 3): each moved folder's current ← past paths, so a
-  // path-form `[[oldpath/note]]` in the body resolves after a folder rename.
-  const folderAliases = useMemo(
-    () =>
-      (tree?.folders ?? [])
-        .filter((f) => f.aliases?.length)
-        .flatMap((f) => f.aliases!.map((alias) => ({ current: f.path, alias }))),
-    [tree],
-  )
+  const { mode, note, noteError, knownNotes, navigating, openNote, reloadNote } = useNotes()
   const { openOrCreateFromWiki } = useEditing()
   const { space, canWrite } = useSpace()
   const { confirm } = useDialog()
@@ -172,7 +163,6 @@ export const NotePage = () => {
     <NoteReader
       note={note}
       notes={knownNotes}
-      folderAliases={folderAliases}
       onOpenWikiLink={openNote}
       // A link the session cache can't resolve: ask the server, then open it
       // (real but unloaded) or offer to create it (a genuine ghost — #65

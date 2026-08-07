@@ -14,6 +14,7 @@ import { dropPreviews } from '../../services/previews'
 import { useAuth } from '../AuthProvider'
 import { useSpaceAccess } from '../SpaceAccessProvider'
 import { useSpace } from '../SpaceProvider'
+import { advanceConnectionRevisions, advanceObservationEpoch } from './connectionRevision'
 
 // The app's single server-push subscription (#60): one EventSource feeds every
 // consumer — the sidebar sync indicator reads `status`, NotesProvider rides
@@ -43,6 +44,13 @@ export type SyncContextValue = {
   /** Raw event tap for consumers with their own reaction logic. Returns the
    *  unsubscribe. Listeners fire after `status` state is updated. */
   subscribe: (listener: Listener) => () => void
+  /** Successful SSE connections, including transparent browser reconnects. A
+   *  consumer includes the value in snapshot requests so missed `changed`
+   *  frames are reconciled by the first response from the new connection. */
+  connectionRevision: number
+  /** Monotonic truth epoch advanced synchronously before every changed frame
+   *  and on every reconnect. Requests capture it before they start. */
+  observationEpoch: () => number
   /** Bumps on every server `members` event for the active space (#121-follow-up):
    *  a space-level membership change (add/remove/role). The members tab folds this
    *  into its reload key so an open list re-fetches live for ANY viewer. */
@@ -72,6 +80,9 @@ export const SyncProvider = ({ children }: { children: ReactNode }) => {
   const { verify } = useSpaceAccess()
   const [status, setStatus] = useState<SyncStatus | null>(null)
   const [membersRev, setMembersRev] = useState(0)
+  const [connectionRevision, setConnectionRevision] = useState(0)
+  const connectionRevisionRef = useRef(0)
+  const observationEpochRef = useRef(0)
   const listeners = useRef(new Set<Listener>())
   const changes = useRef<Array<{ at: number; count: number }>>([])
 
@@ -90,6 +101,7 @@ export const SyncProvider = ({ children }: { children: ReactNode }) => {
       if (event.type === STORE_EVENT.STATUS) {
         setStatus(event.status)
       } else if (event.type === STORE_EVENT.CHANGED) {
+        observationEpochRef.current = advanceObservationEpoch(observationEpochRef.current)
         const now = Date.now()
         changes.current.push({ at: now, count: event.upserts.length + event.removed.length })
         while (changes.current.length && changes.current[0].at < now - RATE_WINDOW_MS) {
@@ -153,8 +165,19 @@ export const SyncProvider = ({ children }: { children: ReactNode }) => {
       void refresh()
     }
 
+    const onOpen = () => {
+      const revisions = advanceConnectionRevisions({
+        connectionRevision: connectionRevisionRef.current,
+        observationEpoch: observationEpochRef.current,
+      })
+
+      connectionRevisionRef.current = revisions.connectionRevision
+      observationEpochRef.current = revisions.observationEpoch
+      setConnectionRevision(revisions.connectionRevision)
+    }
+
     const open = () => {
-      unsub = api.events(space, onEvent, onError, onAccess, onMembers, onRename)
+      unsub = api.events(space, onEvent, onError, onAccess, onMembers, onRename, onOpen)
     }
     open()
 
@@ -187,8 +210,19 @@ export const SyncProvider = ({ children }: { children: ReactNode }) => {
     return sum
   }, [])
 
+  const observationEpoch = useCallback(() => observationEpochRef.current, [])
+
   return (
-    <SyncContext.Provider value={{ status, changedLastMinute, subscribe, membersRev }}>
+    <SyncContext.Provider
+      value={{
+        status,
+        changedLastMinute,
+        subscribe,
+        connectionRevision,
+        observationEpoch,
+        membersRev,
+      }}
+    >
       {children}
     </SyncContext.Provider>
   )

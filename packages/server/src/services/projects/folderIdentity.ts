@@ -90,7 +90,7 @@ const writeFolderMarkerFor = (
   // never strips the space identity.
   spaceFacet?: SpaceMarkerFacet,
 ): Promise<void> =>
-  markerStore.write(
+  (markerStore.writeExisting ?? markerStore.write)(
     space,
     folderPath,
     serializeMarker({
@@ -121,9 +121,10 @@ export type FinalizeFolderMoveDeps = {
 /** Apply host-owned registry/path-history updates for a physical folder move.
  *  Pass this operation as the store move's `finalize` callback so the source
  *  and destination prefix claims remain held until derived state catches up.
- *  Each update is best-effort, but path-history runs only after its dependent
- *  re-prefix succeeds. The on-disk marker remains authoritative and boot
- *  reconcile can heal a transient registry failure.
+ *  The caller first runs ensureFolderIdentity as the move's `prepare`: even a
+ *  previously plain folder then carries its old path + identity in the marker
+ *  that travels with the physical rename. Each update here is best-effort, but
+ *  boot reconciliation can recover the post-rename crash window from that marker.
  */
 export const finalizeFolderMove = async (
   deps: FinalizeFolderMoveDeps,

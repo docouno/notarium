@@ -3,7 +3,7 @@
 // canon: docs/projects.md#reconcile-the-row-lifecycle-fork-b-lazy-i3-implemented-cadence-boot-only-2026-06-18 · docs/architecture.md#p2
 
 import { PROJECT_STATUS } from '@notarium/contract'
-import { nextAliasesMulti, nextPathAliasesMulti, slugify } from '@notarium/core'
+import { nextAliasesMulti, nextPathAliasesMulti } from '@notarium/core'
 
 import type { FolderIdentityPersistence, ProjectsPersistence } from '../metaDb'
 import { parseMarker } from './marker'
@@ -84,7 +84,7 @@ export const scanProjectsAtBoot = async (
           // stays the uniqueness arbiter within a single boot pass.
           const preferred =
             fields.slug || existing?.slug || fields.displayName || lastSegment(folderPath) || space
-          const slug = await mintSlug(projects, space, slugify(preferred) || preferred, id)
+          const slug = await mintSlug(projects, space, preferred, id)
           const aliases = nextAliasesMulti(
             [...(fields.aliases ?? []), ...(existing?.aliases ?? [])],
             existing && existing.slug !== slug ? [existing.slug] : [],

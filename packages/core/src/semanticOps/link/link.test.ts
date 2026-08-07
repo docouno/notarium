@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import type { KnowledgeStore, NoteContent, WriteInput, WriteResult } from '../../knowledgeStore'
-import { parseWikilinks } from '../../libs/markdown'
+import { encodeWikilinkIdentity, parseWikilinks } from '../../libs/markdown'
 import { computeVersionToken } from '../../libs/versionToken'
 import { applyLink, applyLinks, hasLink, linkNotes, linkNotesMany } from './link'
 
@@ -42,6 +42,15 @@ describe('applyLink', () => {
   it('the materialized line is a wikilink the graph parser sees', () => {
     const next = applyLink('prose', { toTitle: 'Carbon', relation: 'depends_on' })
     expect(parseWikilinks(next)).toContain('Carbon')
+  })
+
+  it('rejects relation/target text that could materialize extra wikilinks', () => {
+    expect(() => applyLink('', { toTitle: 'Carbon', relation: 'rel [[Injected]]' })).toThrow(
+      /relation/,
+    )
+    expect(() => applyLink('', { toTitle: 'Carbon]] [[Injected', relation: 'depends_on' })).toThrow(
+      /target/,
+    )
   })
 })
 
@@ -95,6 +104,48 @@ describe('hasLink', () => {
   it('strips an alias/fragment from the matched target', () => {
     expect(hasLink('- depends_on [[Carbon|the element]]', 'depends_on', 'Carbon')).toBe(true)
     expect(hasLink('- depends_on [[Carbon#intro]]', 'depends_on', 'Carbon')).toBe(true)
+  })
+
+  it('dedupes an identity-preserving target with a human-readable alias', () => {
+    const address = encodeWikilinkIdentity('abc123')
+    expect(
+      hasLink(`- depends_on [[${address}|Old Title]]`, 'depends_on', `${address}|New Title`),
+    ).toBe(true)
+  })
+
+  it('compares identity-preserving targets exactly, including case', () => {
+    const upper = encodeWikilinkIdentity('A')
+    const lower = encodeWikilinkIdentity('a')
+    const body = `- depends_on [[${upper}|upper]]`
+    expect(hasLink(body, 'depends_on', `${lower}|lower`)).toBe(false)
+    expect(applyLink(body, { toTitle: `${lower}|lower`, relation: 'depends_on' })).toContain(
+      `[[${lower}|lower]]`,
+    )
+  })
+
+  it('dedupes a legacy plain exact id against its canonical envelope', () => {
+    const body = '- depends_on [[fake-target]]'
+    const address = encodeWikilinkIdentity('fake-target')
+    expect(hasLink(body, 'depends_on', `${address}|Target`)).toBe(true)
+    expect(applyLink(body, { toTitle: `${address}|Target`, relation: 'depends_on' })).toBe(body)
+  })
+
+  it('does not suppress a human forward target behind a stale identity envelope', () => {
+    const address = encodeWikilinkIdentity('Future')
+    const body = `- depends_on [[${address}|Deleted]]`
+
+    expect(hasLink(body, 'depends_on', 'Future')).toBe(false)
+    expect(applyLink(body, { toTitle: 'Future', relation: 'depends_on' })).toBe(
+      `${body}\n- depends_on [[Future]]`,
+    )
+  })
+
+  it('keeps malformed reserved targets exact instead of case-folding them', () => {
+    const body = '- depends_on [[notarium-id:%ZZ]]'
+    expect(hasLink(body, 'depends_on', 'notarium-id:%zz')).toBe(false)
+    expect(applyLink(body, { toTitle: 'notarium-id:%zz', relation: 'depends_on' })).toContain(
+      '[[notarium-id:%zz]]',
+    )
   })
 })
 
@@ -211,6 +262,23 @@ describe('linkNotes', () => {
 })
 
 describe('linkNotesMany (#102: several edges, one write)', () => {
+  it('rejects a self-link when a provisional source resolves to the target durable id', async () => {
+    const store = fakeStore('intro')
+
+    await expect(
+      linkNotesMany(store, {
+        fromId: 'provisional-source',
+        links: [
+          {
+            toTitle: `${encodeWikilinkIdentity('from-1')}|From Note`,
+            relation: 'links_to',
+          },
+        ],
+      }),
+    ).rejects.toThrow(/cannot be linked to itself/i)
+    expect(store.writes).toHaveLength(0)
+  })
+
   it('materializes all edges from a note in a SINGLE CAS write', async () => {
     const store = fakeStore('intro')
     const r = await linkNotesMany(store, {
@@ -253,5 +321,64 @@ describe('linkNotesMany (#102: several edges, one write)', () => {
     await linkNotes(store, { fromId: 'from-1', toTitle: 'Carbon', relation: 'depends_on' })
     expect(store.body).toBe('intro\n\n- depends_on [[Carbon]]')
     expect(store.writes).toHaveLength(1)
+  })
+})
+
+// #296 — a target with nothing sluggable in it is still a distinct target. On the bare
+// slug every such name shared the empty key, so a second `link` found the first one's
+// line, reported the edge as already present, and never wrote it.
+describe('typed links to a letterless target', () => {
+  it('does not mistake one letterless target for another', () => {
+    expect(hasLink('- links-to [[🎉🎉]]', 'links-to', '🎉🎉')).toBe(true)
+    expect(hasLink('- links-to [[🎉🎉]]', 'links-to', '✨✨')).toBe(false)
+  })
+
+  it('writes BOTH edges instead of collapsing them onto one line', () => {
+    const body = applyLinks('', [
+      { relation: 'links-to', toTitle: '🎉🎉' },
+      { relation: 'links-to', toTitle: '✨✨' },
+    ])
+    expect(body).toContain('[[🎉🎉]]')
+    expect(body).toContain('[[✨✨]]')
+  })
+})
+
+// #296 — the same defect one rung up: a PATH-form target must key the way the resolver
+// keys it. `nameKey` flattens the path, so targets `resolveLink` sends to different
+// notes shared one key here — and the second `link` call reported success for an edge
+// it never wrote. Every case below is a pair of targets the resolver keeps apart.
+describe('typed links to a path-form target', () => {
+  it('keeps two path-form targets apart when only the last segment differs', () => {
+    expect(hasLink('- links-to [[journal/🎉]]', 'links-to', 'journal/🎉')).toBe(true)
+    expect(hasLink('- links-to [[journal/🎉]]', 'links-to', 'journal/✨')).toBe(false)
+    // …and apart from the FOLDER itself, which is the key the flat form handed them.
+    expect(hasLink('- links-to [[journal/🎉]]', 'links-to', 'journal')).toBe(false)
+  })
+
+  it('keeps a path-form target apart from the flat name it slugs to', () => {
+    // Pure ASCII: the path axis was conflated for every alphabet, not just unromanisable
+    // ones. `journal/notes.md` and `journal-notes.md` are two notes that coexist.
+    expect(hasLink('- links-to [[journal/notes]]', 'links-to', 'journal-notes')).toBe(false)
+  })
+
+  it('still dedupes the same target written in a different case', () => {
+    expect(hasLink('- links-to [[Journal/Notes]]', 'links-to', 'journal/notes')).toBe(true)
+  })
+
+  it('keeps two targets apart when the path key empties BOTH', () => {
+    // A blank last segment names nothing, so the path key alone is '' for both — and
+    // an empty key matching an empty key is exactly how a second edge goes missing.
+    // This is the pin on `linkKey`'s raw rung: without it, this flips to `true`.
+    expect(hasLink('- links-to [[journal/]]', 'links-to', 'archive/')).toBe(false)
+    expect(hasLink('- links-to [[journal/]]', 'links-to', 'journal/')).toBe(true)
+  })
+
+  it('writes every distinct path-form edge', () => {
+    const body = applyLinks('', [
+      { relation: 'links-to', toTitle: 'journal/🎉' },
+      { relation: 'links-to', toTitle: 'journal/✨' },
+      { relation: 'links-to', toTitle: 'journal' },
+    ])
+    expect(body.split('\n')).toHaveLength(3)
   })
 })

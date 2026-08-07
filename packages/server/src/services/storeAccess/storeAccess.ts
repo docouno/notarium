@@ -29,6 +29,14 @@ import {
 /** A note's resolved, access-checked store and its registry-assigned space id. */
 export type NoteAccess = { store: SpaceStore; space: string }
 
+/** A live note resolved through the registry and then re-read from its owning store.
+ *  `noteId` is the authoritative identity returned by the read-model; during a cold
+ *  identity sweep it may differ from the provisional id the caller supplied. */
+export type LiveNoteAccess = NoteAccess & {
+  noteId: string
+  note: Awaited<ReturnType<SpaceStore['read']>>
+}
+
 export type StoreAccess = {
   /** Space id (already resolved from the URL slug) → live store; throws the typed
    *  not-found (→ 404) for an unknown id (anti-enumeration). */
@@ -65,6 +73,30 @@ export const createStoreAccess = (spaces: SpaceManager): StoreAccess => ({
   },
 })
 
+/** Resolve, authorise and read a live note in one shared identity chokepoint.
+ *  Persistence producers must store `noteId`, never the caller's possibly
+ *  provisional address. Unknown, inaccessible, vanished and tombstoned notes all
+ *  collapse to null (the same anti-enumeration contract as noteStore). */
+export const readNoteAccess = async (
+  access: StoreAccess,
+  principal: Principal,
+  id: string,
+  action: Action,
+): Promise<LiveNoteAccess | null> => {
+  const hit = await access.noteStore(principal, id, action)
+
+  if (!hit) {
+    return null
+  }
+  const note = await hit.store.read(id).catch(() => null)
+
+  if (!note || note.deleted) {
+    return null
+  }
+
+  return { ...hit, noteId: note.id ?? id, note }
+}
+
 /** Deps for a scope-curation resolve; the cross-space registries are absent on a
  *  meta-DB-less host. */
 type ScopeResolveDeps = {
@@ -81,20 +113,16 @@ type ScopeResolveDeps = {
  *  canon: docs/architecture.md#p5 */
 const scopeNoteReader =
   (deps: ScopeResolveDeps, principal: Principal) => async (noteId: string) => {
-    const hit = await deps.store.noteStore(principal, noteId, 'note:read')
+    const hit = await readNoteAccess(deps.store, principal, noteId, 'note:read')
 
     if (!hit) {
       return null
     }
-    const note = await hit.store.read(noteId).catch(() => null)
-
-    if (!note || note.deleted) {
-      return null
-    }
 
     return {
-      content: note.content ?? '',
-      title: note.title ?? '',
+      noteId: hit.noteId,
+      content: hit.note.content ?? '',
+      title: hit.note.title ?? '',
       spaceSlug: deps.spaces.slugOf(hit.space) ?? hit.space,
     }
   }

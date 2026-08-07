@@ -43,9 +43,12 @@ import type {
 } from '@notarium/core'
 import {
   aggregateGraphHealth,
+  basenameOf,
+  boundNameToBytes,
   buildLinkIndex,
   classesForScope,
   collectPreviews,
+  decodeWikilinkIdentity,
   DEFAULT_NOTE_TYPE,
   deriveNoteEdges,
   derivePreview,
@@ -53,19 +56,37 @@ import {
   effectiveSlug,
   FOLDER_PAGE_BASENAME,
   type FolderAlias,
+  freshNoteId,
   IF_EXISTS,
+  isCanonicalSafeRelativeAddress,
+  isDurableScalar,
+  isDurableText,
   isFolderPageNote,
+  isLegacyImportDestination,
+  isPortableMoveDestination,
+  isPortableRelativeDestination,
+  isValidNoteId,
+  isVisibleOn,
+  isWikilinkIdentityTarget,
   liveSyncStatus,
   nextAliasesMulti,
+  normalizeWikilinkTarget,
   normTags,
+  NOTE_BASENAME_MAX_BYTES,
   noteAlreadyExists,
+  noteFileBase,
+  noteFilePath,
   noteNotFound,
+  registerLinkIdentity,
+  resolveLink,
   sha256Hex,
   shapeGraph,
-  slugify,
-  slugifyPath,
+  sluggedNoteName,
   storedSlug,
   StoreError,
+  SURFACE,
+  uniqueSlug,
+  UNNAMED_NOTE_FILENAME,
 } from '@notarium/core'
 
 import { type Chunker, createHeadingChunker } from '../../libs/chunking'
@@ -100,14 +121,23 @@ import type { EngineMount, NotariumStoreOptions, NoteRow, SearchTuning } from '.
  *  for nothing — O(corpus bytes) of loop-blocking work that stalls every other space.
  *  Bodies are fetched only where genuinely used: the delta's changed upserts and the
  *  graph's wikilink derivation. */
-const NOTE_META_COLS = 'path, title, class, created_at, modified_at, aliases, slug, tags'
+const NOTE_META_COLS = 'path, title, class, created_at, modified_at, id_claim, aliases, slug, tags'
 type NoteMetaRow = Pick<
   NoteRow,
-  'path' | 'title' | 'class' | 'created_at' | 'modified_at' | 'aliases' | 'slug' | 'tags'
+  | 'path'
+  | 'title'
+  | 'class'
+  | 'created_at'
+  | 'modified_at'
+  | 'id_claim'
+  | 'aliases'
+  | 'slug'
+  | 'tags'
 >
 type ReconcileRow = Pick<NoteRow, 'path' | 'class' | 'mtime_ms' | 'size' | 'seq'> & {
   rowid: number
   change_token: string | null
+  source_hash: string | null
 }
 
 /** In-memory undirected wikilink adjacency for the graph search channel (#81 Stage
@@ -166,17 +196,6 @@ const computeHubs = (degree: Map<string, number>, pct: number, total: number): S
   }
 
   return hubs
-}
-
-/** The mount-relative on-disk path for a (title, directory) pair — uses the same
- *  slugified-filename formula, so two writers to one base agree on paths. */
-const notePath = (title: string, directory?: string, fileName?: string): string => {
-  const dir = !directory || directory === '/' ? '' : directory.replace(/^\/+|\/+$/g, '')
-  // An explicit fileName (import #11) overrides the slug(title) default — slugged
-  // anyway so a hand-passed name can't escape the mount or carry path separators.
-  const base = fileName ? slugify(fileName) || slugify(title) : slugify(title)
-  const file = `${base}.md`
-  return dir ? `${dir}/${file}` : file
 }
 
 const moveFailed = (detail: string): StoreError => {
@@ -410,6 +429,8 @@ export class NotariumStore implements KnowledgeStore {
    *  `[[oldpath/note]]` resolves to a renamed folder's note even when the filename
    *  is ambiguous. Empty until fed; a refeed marks the graph dirty for a rebuild. */
   private folderAliases: FolderAlias[] = []
+  private linkIdentities = new Map<string, string>()
+  private linkIdentitiesConfigured = false
 
   /** The vector channel (#81), null when disabled. `vecReady` mirrors it but is
    *  cleared if the boot schema build proves vec0 absent — embedNote checks it,
@@ -625,6 +646,61 @@ export class NotariumStore implements KnowledgeStore {
   /** Mount-relative path → the space-relative index path. */
   private fullIn(m: EngineMount, rel: string): string {
     return m.prefix ? `${m.prefix}/${rel}` : rel
+  }
+
+  /** Refuse a directory spelling that the medium maps onto an existing RAW
+   *  folder with another spelling. Otherwise LocalFS can write into physical
+   *  `Empty/` while the derived index records `empty/`, splitting one note across
+   *  two path identities until the next scan. New raw-distinct directories remain
+   *  legal on a medium that actually distinguishes them. */
+  private async assertDirectorySpelling(mount: EngineMount, directory: string): Promise<void> {
+    if (!directory) {
+      return
+    }
+    const actual = new Set(await mount.files.listDirs())
+    const parts = directory.split('/')
+
+    for (let length = 1; length <= parts.length; length++) {
+      const prefix = parts.slice(0, length).join('/')
+
+      if (actual.has(prefix)) {
+        continue
+      }
+      if (await mount.files.dirExists(prefix)) {
+        throw writeFailed('directory spelling does not match storage')
+      }
+      // Once an ancestor truly does not exist, no deeper child can exist either.
+      break
+    }
+  }
+
+  /** Move a note file without ever replacing a different destination pathname.
+   *  A same-entry alternate spelling is the case/NFC-only rename exception; every
+   *  absent destination must be claimed by the adapter's atomic no-replace primitive. */
+  private async renameFileNoReplace(mount: EngineMount, from: string, to: string): Promise<void> {
+    const occupied = await mount.files.exists(to)
+    const sameSourceEntry =
+      occupied && mount.files.sameEntry ? await mount.files.sameEntry(from, to) : false
+
+    if (sameSourceEntry) {
+      if (!mount.files.renameIfAbsent) {
+        throw moveFailed('storage cannot rename a note without replacing a race')
+      }
+      if (!(await mount.files.renameIfAbsent(from, to))) {
+        throw moveFailed('a note already lives at the destination')
+      }
+
+      return
+    }
+    if (occupied) {
+      throw moveFailed('a note already lives at the destination')
+    }
+    if (!mount.files.renameIfAbsent) {
+      throw moveFailed('storage cannot move a note without replacing a concurrent destination')
+    }
+    if (!(await mount.files.renameIfAbsent(from, to))) {
+      throw moveFailed('a note already lives at the destination')
+    }
   }
 
   /** Schema + first full scan, once. Brings the on-disk index up to the current
@@ -1361,6 +1437,24 @@ export class NotariumStore implements KnowledgeStore {
       .then((row) => row?.source_hash)
   }
 
+  private indexedSourceHash(path: string, expectedSeq: number): Promise<string | undefined> {
+    if (!this.fingerprintsReady) {
+      return Promise.resolve(undefined)
+    }
+
+    return this.sql
+      .get<{ source_hash: string }>(
+        `SELECT file_fingerprints.source_hash
+           FROM notes
+           JOIN file_fingerprints ON file_fingerprints.note_rowid = notes.rowid
+          WHERE notes.path = ? COLLATE BINARY
+            AND notes.seq = ?
+            AND file_fingerprints.note_seq = notes.seq`,
+        [path, expectedSeq],
+      )
+      .then((fingerprint) => fingerprint?.source_hash)
+  }
+
   /** Run one cursor-sensitive DB slot after every earlier slot settles. The tail
    *  itself never rejects, so a failed operation always releases the next waiter. */
   private async withPublicationGate<T>(operation: () => Promise<T>): Promise<T> {
@@ -1419,6 +1513,32 @@ export class NotariumStore implements KnowledgeStore {
     )
   }
 
+  /** Recover a missing current fingerprint only when the exact indexed row still
+   *  describes the bytes the mutation just read. This closes the crash window
+   *  between publishing `notes` and its derived fingerprint without weakening
+   *  the external-edit fence: a mismatching projection is never adopted. */
+  private async verifiedIndexedSourceHash(row: NoteRow, raw: string): Promise<string | undefined> {
+    const indexed = await this.indexedSourceHash(row.path, row.seq)
+
+    if (indexed || !this.fingerprintsReady) {
+      return indexed
+    }
+    const materialized = await this.sql.get<NoteRow & { rowid: number }>(
+      `SELECT rowid AS rowid, * FROM notes WHERE path = ? COLLATE BINARY AND seq = ?`,
+      [row.path, row.seq],
+    )
+
+    if (!materialized || !this.materializedRowMatches(materialized, row.class, row.path, raw)) {
+      return undefined
+    }
+    const sourceHash = await sha256Hex(raw)
+
+    await this.recordFingerprint(materialized.rowid, materialized.seq, sourceHash, undefined)
+    return (await this.sourceFingerprint(materialized.rowid, materialized.seq)) === sourceHash
+      ? sourceHash
+      : undefined
+  }
+
   /** Content verification after a stat/watcher/sweep candidate was selected.
    *  A matching raw hash only refreshes the cheap token. A legacy row with no
    *  fingerprint adopts the hash if its materialized projection already matches;
@@ -1458,6 +1578,109 @@ export class NotariumStore implements KnowledgeStore {
     await this.upsertRow(fullPath, cls, stat, raw, sourceHash)
   }
 
+  /** One-shot heal for notes written before the name formula had an id rung (#296):
+   *  a title with nothing sluggable in it landed on `<dir>/.md`, a dot-file the scan
+   *  used to hide — so the file lived on while the note read as externally deleted.
+   *  Renames each onto the name it would get today, IN PLACE (identity is the
+   *  `notarium-id` in the frontmatter, P7, so the note keeps its URL, links and
+   *  history), before this same pass reconciles — the tombstone never happens.
+   *
+   *  Best-effort by construction: a heal that cannot pick a free name, or whose rename
+   *  loses a race, leaves the entry alone and the file is still indexed (visible under
+   *  its odd name beats a tombstone over a live file). Mutates `scanned` so the
+   *  reconcile below sees the healed path.
+   */
+  private async healUnnamedFiles(
+    scanned: Array<{ mount: EngineMount; entry: FileStat; fullPath: string }>,
+  ): Promise<void> {
+    const unnamed = scanned.filter(({ entry }) => basenameOf(entry.path) === UNNAMED_NOTE_FILENAME)
+
+    if (!unnamed.length) {
+      return
+    }
+    const taken = new Set(scanned.map(({ fullPath }) => fullPath))
+
+    for (const item of unnamed) {
+      const { mount, entry } = item
+      const raw = await mount.files.read(entry.path)
+
+      if (raw == null) {
+        continue // vanished mid-heal — the next scan reconverges
+      }
+      const parsed = parseNoteFile(raw, entry.path)
+
+      // Production writes that suffered the old empty-name bug already carried the
+      // stable id claim minted by the read-model. An arbitrary user-owned `.md`
+      // without that proof is a hidden file, not ours to rename or index.
+      if (!parsed.idClaim) {
+        const at = scanned.indexOf(item)
+
+        if (at !== -1) {
+          scanned.splice(at, 1)
+        }
+        continue
+      }
+      const dir = directoryOf(entry.path)
+      // `parseNoteFile` falls back to the FILE NAME for a note carrying neither a
+      // `title:` nor an `# H1` — and this file's name is empty, so that fallback hands
+      // back the path itself (`journal/.md`). Naming the healed file after that would
+      // stamp `journal-md.md` on a note whose title is not a title at all; an untitled
+      // note has nothing to be named after but its id.
+      const titled = parsed.title === entry.path || parsed.title === UNNAMED_NOTE_FILENAME
+      const title = titled ? '' : parsed.title
+      // The id fallback only fires when the title has no letters at all; a CJK/Hebrew
+      // title now names its own file. Each collision-series candidate is byte-bounded
+      // from its WHOLE spelling; ordinary valid names reserve no hypothetical suffix.
+      const base = noteFileBase(title, undefined, parsed.idClaim ?? undefined)
+      const pathFor = (name: string): string => (dir ? `${dir}/${name}.md` : `${name}.md`)
+      const bounded = (name: string): string => boundNameToBytes(name, NOTE_BASENAME_MAX_BYTES)
+
+      // A check followed by ordinary rename is still an overwrite race. Only an
+      // adapter's atomic no-replace primitive may heal automatically; on a collision
+      // (including a directory invisible to scan) claim the next series member now,
+      // rather than waiting forever on the same candidate next boot.
+      if (!mount.files.renameIfAbsent) {
+        continue
+      }
+      for (let attempt = 0; attempt < 10_000; attempt++) {
+        // Always let the adapter try the canonical first name once. `taken` may
+        // contain OUR hard-link publication from a process interruption; only the
+        // adapter can distinguish that recoverable same-inode state from a rival.
+        const rawName =
+          attempt === 0
+            ? base
+            : uniqueSlug(base, (cand) => !taken.has(this.fullIn(mount, pathFor(bounded(cand)))), {
+                maxLength: Number.MAX_SAFE_INTEGER,
+              })
+        const rel = pathFor(bounded(rawName))
+        const full = this.fullIn(mount, rel)
+        let moved = false
+
+        try {
+          moved = await mount.files.renameIfAbsent(entry.path, rel)
+        } catch {
+          break // vanished source or permission wall — next scan reconverges
+        }
+        if (!moved) {
+          taken.add(full)
+          continue
+        }
+        const stat = await mount.files.stat(rel)
+
+        // The move already succeeded, so the old path is known dead even when one
+        // best-effort stat loses a transient race. Preserve the scan's size/times as
+        // a fallback but drop its stale change token; reconcile will source-verify the
+        // bytes at the NEW path in this same pass instead of hiding the note until the
+        // next poll.
+        taken.delete(item.fullPath)
+        taken.add(full)
+        item.entry = stat ?? { ...item.entry, path: rel, changeToken: undefined }
+        item.fullPath = full
+        break
+      }
+    }
+  }
+
   private async doRescan(): Promise<void> {
     this.scanning = true
     const forcedPaths = new Set(this.forcedReadPaths)
@@ -1470,12 +1693,15 @@ export class NotariumStore implements KnowledgeStore {
             `SELECT notes.rowid AS rowid, notes.path, notes.class, notes.mtime_ms, notes.size,
                     notes.seq,
                     CASE WHEN file_fingerprints.note_seq = notes.seq
-                         THEN file_fingerprints.change_token ELSE NULL END AS change_token
+                         THEN file_fingerprints.change_token ELSE NULL END AS change_token,
+                    CASE WHEN file_fingerprints.note_seq = notes.seq
+                         THEN file_fingerprints.source_hash ELSE NULL END AS source_hash
              FROM notes
              LEFT JOIN file_fingerprints ON file_fingerprints.note_rowid = notes.rowid`,
           )
         : await this.sql.all<ReconcileRow>(
-            `SELECT rowid, path, class, mtime_ms, size, seq, NULL AS change_token
+            `SELECT rowid, path, class, mtime_ms, size, seq,
+                    NULL AS change_token, NULL AS source_hash
              FROM notes`,
           )
       const known = new Map(rows.map((r) => [r.path, r]))
@@ -1496,6 +1722,7 @@ export class NotariumStore implements KnowledgeStore {
           scanned.push({ mount, entry, fullPath: this.fullIn(mount, entry.path) })
         }
       }
+      await this.healUnnamedFiles(scanned)
       const sweep = await this.planIntegritySweep()
 
       for (const { mount, entry, fullPath } of scanned) {
@@ -1511,6 +1738,11 @@ export class NotariumStore implements KnowledgeStore {
           row.mtime_ms !== entry.mtimeMs ||
           row.size !== entry.size ||
           tokenChanged ||
+          // A migrated row or a crash between row publication and fingerprint
+          // publication has no trustworthy delete/edit baseline. Source-verify it
+          // once now even when stat metadata is unchanged; reconcileScannedFile
+          // adopts the hash only when every materialized projection agrees.
+          (this.fingerprintsReady && row.source_hash == null) ||
           forcedPaths.has(fullPath) ||
           sweep.paths.has(fullPath)
 
@@ -1677,8 +1909,87 @@ export class NotariumStore implements KnowledgeStore {
    *  ALIAS-history (#100 phase 0). Each is its OWN pass (collision rule current > slug
    *  > alias, mirroring buildLinkIndex), so a custom slug never out-resolves another
    *  live note's title and an old name never shadows a live note. */
-  private async resolveRow(rawId: string): Promise<NoteRow | undefined> {
-    const candidates = rawId.endsWith('.md') ? [rawId] : [`${rawId}.md`, rawId]
+  private async resolveRow(
+    rawId: string,
+    identityOnly = false,
+    storageOnly = false,
+  ): Promise<NoteRow | undefined> {
+    if (storageOnly) {
+      return this.sql.get<NoteRow>(`SELECT * FROM notes WHERE path = ?`, [rawId])
+    }
+    const identityEnvelope = isWikilinkIdentityTarget(rawId)
+
+    if (identityEnvelope && !identityOnly) {
+      const rawRegisteredPath = this.linkIdentitiesConfigured
+        ? this.linkIdentities.get(rawId)
+        : undefined
+      const byRawId = rawRegisteredPath
+        ? await this.sql.get<NoteRow>(`SELECT * FROM notes WHERE path = ?`, [rawRegisteredPath])
+        : !this.linkIdentitiesConfigured
+          ? await this.sql.get<NoteRow>(
+              `SELECT * FROM notes WHERE id_claim = ? ORDER BY path LIMIT 1`,
+              [rawId],
+            )
+          : undefined
+
+      if (byRawId) {
+        return byRawId
+      }
+    }
+    // Ordinary `read(list().filePath)` is an exact storage lookup, including for
+    // legacy POSIX names in the now-reserved envelope namespace. Authored links
+    // opt into identity-only resolution through ReadOptions so a filename decoy
+    // can never capture a stable-id target.
+    if (identityEnvelope && !identityOnly) {
+      const byExactEnvelopePath = await this.sql.get<NoteRow>(
+        `SELECT * FROM notes WHERE path = ?`,
+        [rawId],
+      )
+
+      if (byExactEnvelopePath) {
+        return byExactEnvelopePath
+      }
+    }
+    const envelopedId = decodeWikilinkIdentity(rawId)
+    const identity = identityEnvelope ? envelopedId : rawId
+    const registeredPath =
+      identity != null && this.linkIdentitiesConfigured
+        ? this.linkIdentities.get(identity)
+        : undefined
+    const byId = registeredPath
+      ? await this.sql.get<NoteRow>(`SELECT * FROM notes WHERE path = ?`, [registeredPath])
+      : identity != null && !this.linkIdentitiesConfigured
+        ? await this.sql.get<NoteRow>(
+            `SELECT * FROM notes WHERE id_claim = ? ORDER BY path LIMIT 1`,
+            [identity],
+          )
+        : undefined
+
+    if (byId) {
+      return byId
+    }
+    // A reserved identity target is never a human path/name. On a stale/missing id,
+    // stop here so a literal file named like the envelope cannot capture the link.
+    if (identityEnvelope) {
+      return undefined
+    }
+    // Preserve the storage contract first: every literal filePath returned by
+    // list() must be readable even when its legal filename contains wikilink
+    // syntax (`#` / `|`). The HTTP wiki-ref boundary normalizes before store.read.
+    const byExactPath = await this.sql.get<NoteRow>(`SELECT * FROM notes WHERE path = ?`, [rawId])
+
+    if (byExactPath) {
+      return byExactPath
+    }
+    // Human convenience/reference resolution starts only after the exact raw
+    // storage-key axis, so `Foo#section` targets Foo while `Foo#section.md` can
+    // still be addressed internally as a literal listed path.
+    const humanTarget = normalizeWikilinkTarget(rawId)
+
+    if (!humanTarget) {
+      return undefined
+    }
+    const candidates = [`${humanTarget}.md`, humanTarget]
 
     for (const p of candidates) {
       const row = await this.sql.get<NoteRow>(`SELECT * FROM notes WHERE path = ?`, [p])
@@ -1687,65 +1998,26 @@ export class NotariumStore implements KnowledgeStore {
         return row
       }
     }
-    const byTitle = await this.sql.get<NoteRow>(
-      // ORDER BY path: a deterministic tie-break when two live notes share a title
-      // (else SQLite's LIMIT 1 picks an arbitrary row, diverging from buildLinkIndex).
-      `SELECT * FROM notes WHERE title = ? COLLATE NOCASE ORDER BY path LIMIT 1`,
-      [rawId],
+    // The graph, direct reader and client all answer the same name algebra. Building
+    // the shared index here avoids another hand-copied pass order; exact storage paths
+    // above remain the identity fast path.
+    const all = await this.sql.all<NoteMetaRow>(`SELECT ${NOTE_META_COLS} FROM notes ORDER BY path`)
+    const currentFolders = await this.mountForClass(undefined).files.listDirs()
+    const index = buildLinkIndex(
+      all.map((r) => this.metaOf(r)),
+      this.folderAliases,
+      undefined,
+      currentFolders,
     )
 
-    if (byTitle) {
-      return byTitle
-    }
-    const want = slugifyPath(rawId.replace(/\.md$/, ''))
+    this.registerLinkIdentities(index, all)
+    const resolved = resolveLink(humanTarget, index)
 
-    if (!want) {
-      return undefined
-    }
-    const last = want.split('/').pop() || want
-    const all = await this.sql.all<Pick<NoteRow, 'path' | 'title' | 'aliases' | 'slug'>>(
-      `SELECT path, title, aliases, slug FROM notes ORDER BY path`,
-    )
-    const pathSlug = (r: { path: string }): string => slugifyPath(r.path.replace(/\.md$/, ''))
-    // FOLDER-ALIAS full-path rewrites: an old folder path → its current path
-    // (#100 phase 3). Kept SEPARATE from the literal `want` so the literal current path
-    // keeps STRICT priority over a historical folder-alias — mirroring buildLinkIndex
-    // (Pass 1 current names > Pass 3 folder-alias: a live note at the exact path wins,
-    // the alias only fills a FREE key). Collapsing them into one set would let folder-
-    // name alphabetics decide the tie (`newproj` < `oldproj`), out-resolving a live
-    // literal note. The rewrite still ranks ABOVE the bare last-segment — else an
-    // ambiguous filename sibling out-resolves the disambiguating path-form link (the
-    // #125 bug: the graph resolved [[oldpath/note]] via the alias while this direct
-    // read fell through to a tezka sibling — graph/navigation rassinkhron). The engine
-    // is fed its space's folder path-history by the read-model (setFolderAliases); a
-    // bare engine/fake gets none, so it stays folder-alias-blind — the last-segment
-    // fallback still covers the unambiguous case.
-    const aliasPaths: string[] = []
-
-    for (const fa of this.folderAliases) {
-      const a = slugifyPath(fa.alias)
-      const cur = slugifyPath(fa.current)
-
-      if (a && a !== cur && (want === a || want.startsWith(a + '/'))) {
-        aliasPaths.push(cur + want.slice(a.length))
-      }
-    }
-    // Each channel its OWN pass (literal full-path > folder-alias full-path > bare
-    // filename > bare title > slug > alias, mirroring resolveWiki / buildLinkIndex):
-    // a flat OR would let row order decide, diverging from buildLinkIndex.
-    const hit =
-      all.find((r) => pathSlug(r) === want) ??
-      all.find((r) => aliasPaths.includes(pathSlug(r))) ??
-      all.find((r) => slugify(pathSlug(r).split('/').pop() || '') === last) ??
-      all.find((r) => slugify(r.title) === last) ??
-      all.find((r) => (r.slug ? slugify(r.slug) === last : false)) ??
-      all.find((r) => parseJsonArray(r.aliases).some((a) => slugify(a) === last))
-
-    if (!hit) {
+    if (resolved.ghost) {
       return undefined
     }
 
-    return this.sql.get<NoteRow>(`SELECT * FROM notes WHERE path = ?`, [hit.path])
+    return this.sql.get<NoteRow>(`SELECT * FROM notes WHERE path = ?`, [resolved.targetId])
   }
 
   private metaOf(
@@ -1808,13 +2080,23 @@ export class NotariumStore implements KnowledgeStore {
    *  so it never collides with a sub-mount namespace. */
   async makeDir(path: string): Promise<void> {
     await this.ensureReady()
+    const existingDirs = new Set(await this.listDirs())
+
+    if (!isPortableRelativeDestination(path, (prefix) => existingDirs.has(prefix))) {
+      throw moveFailed('folder path contains an invalid durable string')
+    }
     const clean = path.replace(/^\/+|\/+$/g, '')
 
     if (!clean) {
       return
     }
     const mount = this.mountForPath(clean)
-    await mount.files.makeDir(this.relIn(mount, clean))
+    const rel = this.relIn(mount, clean)
+    await this.assertDirectorySpelling(mount, directoryOf(rel))
+    if (!(await mount.files.makeDir(rel))) {
+      throw moveFailed('a folder with that name already exists')
+    }
+    this.invalidateGraphCache()
   }
 
   /** Delete a folder subtree (#97 folder delete): remove its on-disk tree (any
@@ -1823,14 +2105,32 @@ export class NotariumStore implements KnowledgeStore {
    *  usually just empty dir shells + markers; this is the wholesale cleanup. */
   async removeDir(path: string): Promise<void> {
     await this.ensureReady()
+    if (!isCanonicalSafeRelativeAddress(path)) {
+      throw moveFailed('folder path contains an invalid durable string')
+    }
     const clean = path.replace(/^\/+|\/+$/g, '')
 
     if (!clean) {
       return
     }
     const mount = this.mountForPath(clean)
-    await mount.files.removeDir(this.relIn(mount, clean))
-    await this.sql.run(`DELETE FROM notes WHERE path = ? OR path LIKE ?`, [clean, `${clean}/%`])
+    const rel = this.relIn(mount, clean)
+
+    // Destructive directory sources are RAW identities. On an insensitive medium
+    // `docs` may reach a physical `Docs`, while the BINARY index/journal only know
+    // `Docs`; accepting that alternate spelling would delete bytes without victims.
+    if (!(await mount.files.listDirs()).includes(rel)) {
+      return
+    }
+    await mount.files.removeDir(rel)
+    const prefix = `${clean}/`
+
+    await this.sql.run(
+      `DELETE FROM notes
+       WHERE path = ? COLLATE BINARY
+          OR substr(path, 1, length(?)) = ? COLLATE BINARY`,
+      [clean, prefix, prefix],
+    )
     this.invalidateGraphCache() // removing notes can change the wikilink graph (#81 Stage 4b)
     // Dropping a whole subtree (a project, a deep folder) can free a lot of index
     // pages at runtime — the one bulk-free path that isn't a boot teardown or an
@@ -1875,11 +2175,11 @@ export class NotariumStore implements KnowledgeStore {
   /** Serve the note from disk — the file is the truth, the index only finds
    *  it. A row whose file is gone (external delete since the last poll) is an
    *  honest miss, and the stale row is dropped on the spot. */
-  // ReadOptions are scheduling hints for engines that serialize remote calls —
-  // a local read has nothing to reorder, so the signature honestly omits them.
-  async read(rawId: string): Promise<NoteContent> {
+  // Most ReadOptions are scheduling hints for engines that serialize remote calls;
+  // this local engine only consumes the identity-axis discriminator.
+  async read(rawId: string, opts?: ReadOptions): Promise<NoteContent> {
     await this.ensureReady()
-    const row = await this.resolveRow(rawId)
+    const row = await this.resolveRow(rawId, opts?.identityOnly, opts?.storageOnly)
 
     if (!row) {
       throw noteNotFound(rawId)
@@ -2111,7 +2411,11 @@ export class NotariumStore implements KnowledgeStore {
         // Seeds = the top fused fts+vec hits (query-relevant notes only, #81 Stage
         // 4a: seeding from non-relevant notes is pure noise).
         const seeds = [...byPath.values()]
-          .filter((r) => r.base > 0)
+          // The bare engine indexes every class, but the USER graph channel must
+          // never let a hidden hit influence a visible result. A final CachedStore
+          // class filter is too late: a hidden seed can already have boosted its
+          // visible neighbour into the page, leaking that the hidden body matched.
+          .filter((r) => r.base > 0 && isVisibleOn(SURFACE.graph, r.class))
           .sort((a, b) => b.base - a.base || a.path.localeCompare(b.path))
           .slice(0, t.graphSeedS)
         // The graph channel is a 1-hop EXPANSION: it scores the FRONTIER (notes one
@@ -2313,6 +2617,49 @@ export class NotariumStore implements KnowledgeStore {
     this.graphDirty = true
   }
 
+  setLinkIdentities(identities: ReadonlyArray<{ id: string; path: string }>): void {
+    const next = new Map(identities.map(({ id, path }) => [id, path]))
+
+    if (
+      this.linkIdentitiesConfigured &&
+      next.size === this.linkIdentities.size &&
+      [...next].every(([id, path]) => this.linkIdentities.get(id) === path)
+    ) {
+      return
+    }
+    this.linkIdentitiesConfigured = true
+    this.linkIdentities = next
+    this.graphDirty = true
+  }
+
+  /** Register exact id addresses onto a path-keyed bare-engine link index. Once an
+   *  identity owner feeds the authoritative registry, raw copied frontmatter claims
+   *  are no longer allowed to compete with it. */
+  private registerLinkIdentities(
+    index: ReturnType<typeof buildLinkIndex>,
+    rows: ReadonlyArray<Pick<NoteRow, 'path' | 'id_claim'>>,
+  ): void {
+    if (this.linkIdentitiesConfigured) {
+      const admittedPaths = new Set(rows.map((row) => row.path))
+
+      for (const [id, path] of this.linkIdentities) {
+        // `rows` is the caller's resolver population. graph() deliberately passes
+        // only graph-visible rows; admitting a hidden authoritative id here would
+        // resolve the edge to a private path and lose its non-creatable ghost.
+        if (admittedPaths.has(path)) {
+          registerLinkIdentity(index, id, path)
+        }
+      }
+
+      return
+    }
+    for (const row of rows) {
+      if (row.id_claim) {
+        registerLinkIdentity(index, row.id_claim, row.path)
+      }
+    }
+  }
+
   /** Rebuild the undirected wikilink adjacency from the current note set, reusing the
    *  SAME core derivation graph() uses (one parser, one ghost algebra — slug/rename/
    *  ghost resolution stays canonical, not reimplemented in SQL). Node ids are storage
@@ -2329,6 +2676,7 @@ export class NotariumStore implements KnowledgeStore {
         path: string
         title: string
         class: NoteClass
+        id_claim: string | null
         aliases: string
         slug: string | null
         body: string
@@ -2337,9 +2685,10 @@ export class NotariumStore implements KnowledgeStore {
         // tie-break (two live notes sharing a slugified name) is stable run-to-run
         // and matches list()/changes() — an unordered SELECT let the boot graph and a
         // read-refresh disagree on which same-named note an edge points at (#100).
-        `SELECT path, title, class, aliases, slug, body FROM notes ORDER BY path`,
+        `SELECT path, title, class, id_claim, aliases, slug, body FROM notes ORDER BY path`,
       )
-      const metas = rows.map((r) =>
+      const graphRows = rows.filter((row) => isVisibleOn(SURFACE.graph, row.class))
+      const metas = graphRows.map((r) =>
         this.metaOf({
           path: r.path,
           title: r.title,
@@ -2350,8 +2699,11 @@ export class NotariumStore implements KnowledgeStore {
           created_at: null,
         }),
       )
-      const index = buildLinkIndex(metas, this.folderAliases)
-      const realIds = new Set(rows.map((r) => r.path))
+      const currentFolders = await this.mountForClass(undefined).files.listDirs()
+      const index = buildLinkIndex(metas, this.folderAliases, undefined, currentFolders)
+
+      this.registerLinkIdentities(index, graphRows)
+      const realIds = new Set(graphRows.map((r) => r.path))
       const adj = new Map<string, Set<string>>()
 
       const link = (a: string, b: string): void => {
@@ -2372,7 +2724,7 @@ export class NotariumStore implements KnowledgeStore {
       // mutation mid-rebuild re-marks it and the next ensureGraphAdjacency refreshes.
       const coopYield = this.coopYielder()
 
-      for (const row of rows) {
+      for (const row of graphRows) {
         const { edges } = deriveNoteEdges(row.path, row.body, index, this.relationType)
 
         for (const e of edges) {
@@ -2408,11 +2760,16 @@ export class NotariumStore implements KnowledgeStore {
       `SELECT ${NOTE_META_COLS}, body FROM notes ORDER BY path`,
     )
     const metas = rows.map((r) => this.metaOf(r))
+    const graphRows = rows.filter((row) => isVisibleOn(SURFACE.graph, row.class))
+    const graphMetas = graphRows.map((row) => this.metaOf(row))
     // A provenance map (#100 phase 5) so each edge records HOW its [[wikilink]] resolved
     // (current name / custom slug / former note name / former folder path). It rides
     // the FRESH derivation only; the read-model's incremental cache never gets it.
     const provenance = new Map<string, ResolvedVia>()
-    const index = buildLinkIndex(metas, this.folderAliases, provenance)
+    const currentFolders = await this.mountForClass(undefined).files.listDirs()
+    const index = buildLinkIndex(graphMetas, this.folderAliases, provenance, currentFolders)
+
+    this.registerLinkIdentities(index, graphRows)
     const edgesBySource = new Map<string, GraphLink[]>()
     const ghosts = new Map<string, GhostStub>()
     // Cooperative fairness break (#222): deriving edges re-parses every note body for
@@ -2421,7 +2778,7 @@ export class NotariumStore implements KnowledgeStore {
     // can't monopolize the shared loop.
     const coopYield = this.coopYielder()
 
-    for (const row of rows) {
+    for (const row of graphRows) {
       const { edges, ghosts: stubs } = deriveNoteEdges(
         row.path,
         row.body,
@@ -2454,8 +2811,9 @@ export class NotariumStore implements KnowledgeStore {
 
   // ── mutations ───────────────────────────────────────────────────────────────
 
-  /** Create or update; with originalId — rename-in-place (#8): move the file
-   *  to the title/directory-derived path, then overwrite it. Frontmatter is
+  /** Create or update; with originalId — rename-in-place (#8) only when the title,
+   *  folder or explicit fileName changes; a content save preserves the current path.
+   *  Frontmatter is
    *  merged, never regenerated (the notarium-id claim and foreign keys
    *  survive); the id parameter is the identity materialization channel.
    *  The destination MOUNT is chosen by `targetClass` on create (default
@@ -2471,17 +2829,33 @@ export class NotariumStore implements KnowledgeStore {
     summary,
     muted,
     originalId,
+    identityOnly,
     id,
     targetClass,
     ifExists,
     fileName,
+    legacyImportRoot,
     createdAt,
   }: WriteInput): Promise<WriteResult> {
     await this.ensureReady()
+    const scalarInputs = [title, directory, noteType, slug, summary, fileName, createdAt]
+    const tagInputs = Array.isArray(tags) ? tags : tags != null ? [tags] : []
+
+    if (
+      scalarInputs.some((value) => value != null && !isDurableScalar(value)) ||
+      tagInputs.some((value) => !isDurableScalar(value)) ||
+      !isDurableText(content) ||
+      (id != null && !isValidNoteId(id)) ||
+      (originalId != null &&
+        !isValidNoteId(originalId) &&
+        decodeWikilinkIdentity(originalId) == null)
+    ) {
+      throw writeFailed('input contains an invalid durable string')
+    }
     let sourceRow: NoteRow | undefined
 
     if (originalId) {
-      const row = await this.resolveRow(originalId)
+      const row = await this.resolveRow(originalId, identityOnly)
 
       // A dead reference falls through to a plain create at the destination —
       // a bare engine's behaviour; the CAS layer above is what turns
@@ -2498,16 +2872,64 @@ export class NotariumStore implements KnowledgeStore {
     // (the restore path passes none) keep the note in its CURRENT folder — the
     // source's mount-relative dir — rather than moving it to the mount root (#78).
     const dir = directory ?? (sourceRow ? directoryOf(this.relIn(mount, sourceRow.path)) : '')
-    // fileName overrides slug(title) on a CREATE (import #11). On an EDIT it is now
-    // ALSO honoured (opt-in): a caller that hands the note's CURRENT basename keeps the
-    // file in place instead of renaming it to slug(title) — a metadata-only touch
-    // (pin/mute #165) must not move a note whose basename diverges from its title (a
-    // seeded/imported file). A normal save omits it and keeps the title-derived rename
-    // semantics. Folder-page edits stay pinned to the reserved `index.md` basename.
+    const existingDirs = new Set(await mount.files.listDirs())
+
+    const validDirectory =
+      legacyImportRoot !== undefined
+        ? !sourceRow &&
+          Boolean(fileName) &&
+          isLegacyImportDestination(dir, legacyImportRoot, (prefix) => existingDirs.has(prefix))
+        : isPortableRelativeDestination(dir, (prefix) => existingDirs.has(prefix))
+
+    if (!validDirectory) {
+      throw writeFailed('directory must be safe with portable new components')
+    }
+    await this.assertDirectorySpelling(mount, dir)
+    // fileName overrides slug(title) on a CREATE (import #11) and is honoured on an
+    // EDIT as explicit storage intent. A save with no title/folder/fileName change
+    // preserves the current basename below, including seeded/imported files.
+    // Folder-page edits stay pinned to the reserved `index.md` basename.
     const sourceRel = sourceRow ? this.relIn(mount, sourceRow.path) : ''
     const preservedFileName =
       sourceRow && isFolderPageNote(sourceRel) ? FOLDER_PAGE_BASENAME : fileName
-    const dest = this.fullIn(mount, notePath(title, dir, preservedFileName))
+    // The id joins the name formula as its LAST rung: a title with no sluggable
+    // character at all (emoji only) names its file after the NOTE instead of writing
+    // the dot-file `.md` (#296). An edit keeps the note's own id; a create takes the
+    // one the read-model settled. A BARE engine has no registry above it, so it mints
+    // its own here — otherwise every such note would pile onto `note.md` and the
+    // second create would be refused as a duplicate. Minted only in that case, so an
+    // ordinary bare create still writes no `notarium-id` it did not ask for; and the
+    // id MUST reach the file, or the next rename would mint a different one and the
+    // note would walk from name to name.
+    const mintedNameId =
+      !sourceRow && !id && !sluggedNoteName(title, preservedFileName) ? freshNoteId() : undefined
+    const noteId = id ?? mintedNameId
+    // A save with the same title and effective directory carries no move intent.
+    // Preserve the current basename verbatim — especially a recovered legacy `.md`
+    // or deterministic importer pin. This also keeps an ordinary content save away
+    // from the overwrite-capable rename path; only an explicit title/folder/fileName
+    // change may move storage.
+    const preserveCurrentPath =
+      sourceRow != null &&
+      title === sourceRow.title &&
+      fileName == null &&
+      dir === directoryOf(sourceRel)
+    // The id the READ-MODEL settled comes first, and the file's own claim is only the
+    // fallback: the mutation fence (`WriteEngine.predictedPath`) predicts with that same
+    // settled id, so reading the claim first would let the two disagree about the
+    // destination whenever a file carries an id the registry has re-keyed away from.
+    const dest = preserveCurrentPath
+      ? sourceRow!.path
+      : this.fullIn(
+          mount,
+          noteFilePath(
+            title,
+            dir,
+            preservedFileName,
+            noteId ?? sourceRow?.id_claim ?? undefined,
+            legacyImportRoot !== undefined,
+          ),
+        )
 
     // Class integrity (#78): the dest MUST live in the mount we resolved. A
     // stray directory like '.notarium/memory' on a user-doc write would otherwise
@@ -2519,8 +2941,9 @@ export class NotariumStore implements KnowledgeStore {
       throw writeFailed('directory is outside the writable mount')
     }
     const sourcePath = sourceRow?.path
+    const renameSource = sourcePath && sourcePath !== dest ? sourcePath : undefined
 
-    if (sourcePath && sourcePath !== dest) {
+    if (renameSource) {
       // Rename-in-place must never silently swallow a different note that
       // already lives at the destination (P3: no silent data loss).
       const occupied = await this.sql.get<{ path: string }>(
@@ -2531,19 +2954,38 @@ export class NotariumStore implements KnowledgeStore {
       if (occupied) {
         throw moveFailed('a note already lives at the destination')
       }
-      await mount.files.rename(this.relIn(mount, sourcePath), this.relIn(mount, dest))
-      await this.sql.run(`DELETE FROM notes WHERE path = ?`, [sourcePath])
     }
     const destRel = this.relIn(mount, dest)
-    const existingRaw = await mount.files.read(destRel)
+    const createWithoutOverwrite = ifExists !== IF_EXISTS.overwrite && !sourceRow
 
     // Create-collision policy: refuse unless the caller explicitly asked to
     // clobber — the rename guard above only fences RENAMES, so this is what keeps a
     // create from replacing a stranger's body. Disk truth (existingRaw) catches an
     // unindexed external file the index never saw.
     // canon: docs/note-model.md#create-collisions
-    if (ifExists !== IF_EXISTS.overwrite && !sourceRow && existingRaw != null) {
+    // Check pathname occupancy BEFORE reading it: a symlink/FIFO/device is already
+    // a conclusive refusal and must never be followed or blocked on merely to learn
+    // that it is occupied. writeIfAbsent below remains the final race arbiter.
+    if (createWithoutOverwrite && (await mount.files.exists(destRel))) {
       throw noteAlreadyExists(title)
+    }
+    const existingRaw = await mount.files.read(renameSource ? sourceRel : destRel)
+
+    if (createWithoutOverwrite && existingRaw != null) {
+      throw noteAlreadyExists(title)
+    }
+    if (sourceRow) {
+      if (existingRaw == null) {
+        throw writeFailed('note changed during write')
+      }
+      const indexedHash = await this.verifiedIndexedSourceHash(sourceRow, existingRaw)
+
+      // The index version read by resolveRow is the CAS baseline. Reading the
+      // filesystem later must not silently adopt an external replacement as the
+      // bytes our edit is allowed to replace.
+      if (!indexedHash || (await sha256Hex(existingRaw)) !== indexedHash) {
+        throw writeFailed('note changed during write')
+      }
     }
     // The slug to persist (#100 phase 1, lazy): cleaned + kept only when it diverges
     // from slug(title). undefined = not addressed (slug stays as the file has it),
@@ -2578,23 +3020,58 @@ export class NotariumStore implements KnowledgeStore {
       slug: slugChannel,
       summary,
       muted,
-      id,
+      id: noteId,
       createdAt,
       body: content,
       existingRaw,
     })
-    await mount.files.write(destRel, bytes)
+
+    if (renameSource) {
+      if (!mount.files.replaceIfAbsent) {
+        throw moveFailed('storage cannot publish a renamed note without replacing a race')
+      }
+      if (!(await mount.files.replaceIfAbsent(sourceRel, destRel, existingRaw!, bytes))) {
+        throw moveFailed('a note already lives at the destination')
+      }
+      await this.sql.run(`DELETE FROM notes WHERE path = ? AND seq = ?`, [
+        renameSource,
+        sourceRow!.seq,
+      ])
+    } else if (sourceRow) {
+      if (!mount.files.replaceIfAbsent) {
+        throw writeFailed('storage cannot update a note without replacing a race')
+      }
+      if (!(await mount.files.replaceIfAbsent(sourceRel, destRel, existingRaw!, bytes))) {
+        throw writeFailed('note changed during write')
+      }
+    } else if (createWithoutOverwrite) {
+      if (!mount.files.writeIfAbsent) {
+        throw writeFailed('storage cannot create a note without replacing a race')
+      }
+      if (!(await mount.files.writeIfAbsent(destRel, bytes))) {
+        throw noteAlreadyExists(title)
+      }
+    } else {
+      await mount.files.write(destRel, bytes)
+    }
     await this.reindexPath(dest)
     // The authoritative class (the mount we landed in) — lets the read-model
     // stamp the snapshot without optimistically guessing (#78).
-    return { id, filePath: dest, class: mount.class }
+    return { id: noteId, filePath: dest, class: mount.class }
   }
 
   /** Move a note (id channel) or a whole folder (path channel, isDirectory).
    *  Same failure surface as every engine: "# Move Failed" as a tool error.
    *  Moves stay within a mount (no cross-mount/class change in v1). */
-  async move({ id, destinationPath, isDirectory = false }: MoveInput): Promise<void> {
+  async move({ id, destinationPath, isDirectory = false, identityOnly }: MoveInput): Promise<void> {
     await this.ensureReady()
+    if (
+      (!isDirectory && !isValidNoteId(id) && decodeWikilinkIdentity(id) == null) ||
+      !isDurableScalar(destinationPath) ||
+      (isDirectory && !isCanonicalSafeRelativeAddress(id))
+    ) {
+      throw moveFailed('path or identity contains an invalid durable string')
+    }
     this.invalidateGraphCache() // a rename shifts node ids in the wikilink graph (#81 Stage 4b)
     if (isDirectory) {
       const src = id.replace(/^\/+|\/+$/g, '')
@@ -2607,24 +3084,62 @@ export class NotariumStore implements KnowledgeStore {
         throw moveFailed('cannot move a folder into itself')
       }
       const mount = this.mountForPath(src)
+      const existingDirs = new Set(await mount.files.listDirs())
+
+      if (
+        !isPortableMoveDestination(destinationPath, src, (prefix) =>
+          existingDirs.has(this.relIn(mount, prefix)),
+        )
+      ) {
+        throw moveFailed('destination must be safe with portable new components')
+      }
 
       if (this.mountForPath(dest) !== mount) {
         throw moveFailed('cannot move a folder across mounts')
       }
-      const occupied = await this.sql.get<{ path: string }>(
-        `SELECT path FROM notes WHERE path LIKE ? LIMIT 1`,
-        [`${dest}/%`],
+      if (!(await mount.files.listDirs()).includes(this.relIn(mount, src))) {
+        throw moveFailed('folder source spelling does not match storage')
+      }
+      const sourcePrefix = `${src}/`
+      const destinationPrefix = `${dest}/`
+      const rows = await this.sql.all<Pick<NoteRow, 'path'>>(
+        `SELECT path FROM notes
+         WHERE path = ? COLLATE BINARY
+            OR substr(path, 1, length(?)) = ? COLLATE BINARY`,
+        [src, sourcePrefix, sourcePrefix],
       )
+      const occupied = await this.sql.get<{ path: string }>(
+        `SELECT path FROM notes
+         WHERE substr(path, 1, length(?)) = ? COLLATE BINARY
+         LIMIT 1`,
+        [destinationPrefix, destinationPrefix],
+      )
+      const sourceRel = this.relIn(mount, src)
+      const destinationRel = this.relIn(mount, dest)
+      const destinationOnDisk = await mount.files.dirExists(destinationRel)
+      const sameSourceDirectory =
+        destinationOnDisk && mount.files.sameEntry
+          ? await mount.files.sameEntry(sourceRel, destinationRel)
+          : false
+
+      // On an insensitive medium a non-existent descendant spelling can still
+      // have the source directory as an existing ancestor (`Docs` → `docs/sub`).
+      // Refuse that actual self-move while still permitting direct `Docs` → `docs`.
+      if (mount.files.sameEntry) {
+        for (let parent = directoryOf(destinationRel); parent; parent = directoryOf(parent)) {
+          if (await mount.files.sameEntry(sourceRel, parent)) {
+            throw moveFailed('cannot move a folder into itself')
+          }
+        }
+      }
+      await this.assertDirectorySpelling(mount, directoryOf(destinationRel))
 
       // Occupancy is the on-disk truth, not just the index (#97): an EMPTY folder
-      // at dest carries no notes but renameDir would still clobber it.
-      if (occupied || (await mount.files.dirExists(this.relIn(mount, dest)))) {
+      // at dest carries no notes but renameDir would still clobber it. The one
+      // exception is an alternate case/NFC spelling of the source entry itself.
+      if (occupied || (destinationOnDisk && !sameSourceDirectory)) {
         throw moveFailed('destination folder is occupied')
       }
-      const rows = await this.sql.all<Pick<NoteRow, 'path'>>(
-        `SELECT path FROM notes WHERE path = ? OR path LIKE ?`,
-        [src, `${src}/%`],
-      )
 
       // #97: a folder with no INDEXED notes (an empty project — only a
       // `.notariummeta` marker — or a freshly-created "New folder") is still a
@@ -2634,17 +3149,27 @@ export class NotariumStore implements KnowledgeStore {
       if (!rows.length && !(await mount.files.dirExists(this.relIn(mount, src)))) {
         throw moveFailed('folder not found')
       }
-      await mount.files.renameDir(this.relIn(mount, src), this.relIn(mount, dest))
+      if (!mount.files.renameDirIfAbsent) {
+        throw moveFailed('storage cannot move a folder without replacing a race')
+      }
+      if (!(await mount.files.renameDirIfAbsent(sourceRel, destinationRel))) {
+        throw moveFailed('destination folder is occupied')
+      }
       for (const r of rows) {
         const next = dest + r.path.slice(src.length)
         await this.publishWithSeq((seq) =>
           this.sql.run(`UPDATE notes SET path = ?, seq = ? WHERE path = ?`, [next, seq, r.path]),
         )
+        // A path-only UPDATE advances the row version, so its old source
+        // fingerprint is intentionally no longer valid. Re-materialize the moved
+        // path now; otherwise the first conditional delete after a move would fail
+        // closed despite the bytes being untouched.
+        await this.reindexPath(next)
       }
 
       return
     }
-    const row = await this.resolveRow(id)
+    const row = await this.resolveRow(id, identityOnly)
 
     if (!row) {
       throw moveFailed('note not found')
@@ -2653,35 +3178,70 @@ export class NotariumStore implements KnowledgeStore {
 
     if (dest !== row.path) {
       const mount = this.mountForPath(row.path)
+      const existingDirs = new Set(await mount.files.listDirs())
+
+      if (
+        !isPortableMoveDestination(dest, row.path, (prefix) =>
+          existingDirs.has(this.relIn(mount, prefix)),
+        )
+      ) {
+        throw moveFailed('destination must be safe with portable new components')
+      }
 
       if (this.mountForPath(dest) !== mount) {
         throw moveFailed('cannot move a note across mounts')
       }
+      await this.assertDirectorySpelling(mount, directoryOf(this.relIn(mount, dest)))
       const occupied = await this.sql.get<{ path: string }>(
         `SELECT path FROM notes WHERE path = ?`,
         [dest],
       )
 
-      if (occupied || (await mount.files.exists(this.relIn(mount, dest)))) {
+      if (occupied) {
         throw moveFailed('a note already lives at the destination')
       }
-      await mount.files.rename(this.relIn(mount, row.path), this.relIn(mount, dest))
+      await this.renameFileNoReplace(mount, this.relIn(mount, row.path), this.relIn(mount, dest))
       await this.publishWithSeq((seq) =>
         this.sql.run(`UPDATE notes SET path = ?, seq = ? WHERE path = ?`, [dest, seq, row.path]),
       )
+      await this.reindexPath(dest)
     }
   }
 
-  async remove(rawId: string): Promise<void> {
+  async remove(rawId: string, opts?: { identityOnly?: boolean }): Promise<void> {
     await this.ensureReady()
-    const row = await this.resolveRow(rawId)
+    const row = await this.resolveRow(rawId, opts?.identityOnly)
 
     if (!row) {
       return
     } // removing what's already gone is a no-op, every engine agrees
     const mount = this.mountForPath(row.path)
-    await mount.files.remove(this.relIn(mount, row.path))
-    await this.sql.run(`DELETE FROM notes WHERE path = ?`, [row.path])
+    const rel = this.relIn(mount, row.path)
+    const expected = await mount.files.read(rel)
+    const indexedHash =
+      expected == null ? undefined : await this.verifiedIndexedSourceHash(row, expected)
+
+    if (mount.files.removeIfUnchanged) {
+      if (expected == null && (await mount.files.exists(rel))) {
+        throw writeFailed('note changed during delete')
+      }
+      if (expected != null) {
+        if (!indexedHash || (await sha256Hex(expected)) !== indexedHash) {
+          throw writeFailed('note changed during delete')
+        }
+        if (!(await mount.files.removeIfUnchanged(rel, expected))) {
+          throw writeFailed('note changed during delete')
+        }
+      }
+    } else {
+      if (await mount.files.exists(rel)) {
+        throw writeFailed('storage cannot delete a note without replacing a race')
+      }
+    }
+    // The row resolved above is part of the delete claim. A concurrent reconcile
+    // may have published another version at the same path while filesystem awaits
+    // were in flight; never erase that newer index row by pathname alone.
+    await this.sql.run(`DELETE FROM notes WHERE path = ? AND seq = ?`, [row.path, row.seq])
     this.invalidateGraphCache() // a removed note can change the wikilink graph (#81 Stage 4b)
   }
 

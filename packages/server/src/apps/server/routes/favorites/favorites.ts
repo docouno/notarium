@@ -11,11 +11,28 @@ import {
 import { HTTP_STATUS } from '@notarium/contract/http'
 import { treeSummary } from '@notarium/core'
 
-import { safeRelPath } from '../../../../libs/relPath'
+import { safeRelAddress } from '../../../../libs/relPath'
 import { can } from '../../../../services/authz'
 import { ensureFolderIdentity, projectSummaryOf } from '../../../../services/projects'
+import type { SpaceStore } from '../../../../services/spaces'
 import { type ApiRouteCtx, authz, notFound, s, treeDirsFor } from '../_shared'
 import { noteToWire } from '../wire'
+
+/** Follow a phase-one provisional id through the read-model, then enforce the
+ *  user-list visibility gate on its authoritative successor. Read-before-list is
+ *  load-bearing: the sweep may have removed P from list while retaining P→D. */
+export const canonicalVisibleFavoriteNoteId = async (
+  store: Pick<SpaceStore, 'list' | 'read'>,
+  requestedId: string,
+): Promise<string | null> => {
+  const live = await store.read(requestedId).catch(() => null)
+
+  if (!live || live.deleted) {
+    return null
+  }
+  const canonicalId = live.id ?? requestedId
+  return (await store.list()).some((note) => note.id === canonicalId) ? canonicalId : null
+}
 
 export const favoritesRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
   const { favorites, favoriteOwner, spaceStoreFor, projects, folders, spaces, markerStore } = ctx
@@ -138,11 +155,15 @@ export const favoritesRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) =>
     let kind = body.data.kind
 
     if (kind === FAVORITE_ENTITY_KIND.note) {
-      const note = (await store.list()).find((n) => n.id === entityId)
+      // Read first: a phase-one UI may submit provisional P just after the sweep
+      // re-keyed the live inventory to D. CachedStore follows P→D; list no longer
+      // contains P, so validating the raw id against list first would transiently 404.
+      const canonicalId = await canonicalVisibleFavoriteNoteId(store, entityId)
 
-      if (!note) {
+      if (!canonicalId) {
         return notFound(reply)
       }
+      entityId = canonicalId
     } else if (kind === FAVORITE_ENTITY_KIND.project) {
       if (!projects) {
         return notFound(reply)
@@ -156,7 +177,7 @@ export const favoritesRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) =>
       if (!folders || !projects) {
         return notFound(reply)
       }
-      const safe = body.data.path != null ? safeRelPath(body.data.path) : undefined
+      const safe = body.data.path != null ? safeRelAddress(body.data.path) : undefined
 
       if (safe === null || (!entityId && !safe)) {
         return reply.code(HTTP_STATUS.BAD_REQUEST).send({ error: 'bad folder path' })
@@ -226,9 +247,19 @@ export const favoritesRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) =>
       if (!kind.success || !params.id) {
         return reply.code(HTTP_STATUS.BAD_REQUEST).send({ error: 'bad favorite target' })
       }
+      let entityId = params.id
+
+      if (kind.data === FAVORITE_ENTITY_KIND.note) {
+        const store = await spaceStoreFor(req)
+        const live = await store.read(entityId).catch(() => null)
+
+        if (live && !live.deleted) {
+          entityId = live.id ?? entityId
+        }
+      }
       // Remove by ENTITY id (kind-agnostic): a favorited folder later marked as a project is
       // stored kind='folder' but deleted as 'project' — its id is stable across the flip.
-      await favorites.removeByEntity(favoriteOwner(req), req.spaceId, params.id)
+      await favorites.removeByEntity(favoriteOwner(req), req.spaceId, entityId)
       return FavoriteMutationResponseSchema.parse({ ok: true })
     },
   )

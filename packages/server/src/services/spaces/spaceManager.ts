@@ -4,10 +4,11 @@
 // canon: docs/spaces.md#model · docs/spaces.md#server
 
 import {
+  asciiSlug,
   freshNoteId,
   type IdentityRecord,
+  noteFileBase,
   READ_SCOPE,
-  slugify,
   type StoreEvent,
 } from '@notarium/core'
 
@@ -34,6 +35,9 @@ type SpaceEntry = {
   store: SpaceStore | null
   lastAccess: number
   sseRefs: number
+  /** A meta-DB global-id lookup selected this live space. The next post-auth
+   * store handoff must wait for its authoritative duplicate-owner registry. */
+  identityReadyRequired: boolean
 }
 
 export class SpaceManager {
@@ -249,7 +253,7 @@ export class SpaceManager {
   /** Resolve a slug or past-slug alias → the stable id (current wins over alias);
    *  null on an unknown slug. */
   resolveId(slugOrAlias: string): string | null {
-    return this.bySlug.get(slugOrAlias) ?? this.bySlug.get(slugify(slugOrAlias)) ?? null
+    return this.bySlug.get(slugOrAlias) ?? this.bySlug.get(asciiSlug(slugOrAlias)) ?? null
   }
 
   /** Is this a config-pinned space (slug frozen by env — rename/archive refused)? */
@@ -298,7 +302,17 @@ export class SpaceManager {
       })
     }
 
-    return entry.storePromise
+    const store = await entry.storePromise
+
+    if (entry.identityReadyRequired) {
+      // resolveNote runs before resource auth. Defer the potentially expensive
+      // boot/readiness barrier to the later store() handoff so an inaccessible
+      // note cannot warm its space; a rejection keeps the latch set for retry.
+      await store.identityReady?.()
+      entry.identityReadyRequired = false
+    }
+
+    return store
   }
 
   /** Per-space SSE subscription; holds an eviction guard (sseRefs) for the socket's
@@ -332,7 +346,20 @@ export class SpaceManager {
 
     if (findById) {
       const rec: IdentityRecord | null = await findById(id)
-      return rec ? { space: rec.space, deletedAt: rec.deletedAt } : null
+
+      if (!rec) {
+        return null
+      }
+      // resolveNote precedes resource auth and archived routes deliberately
+      // remain resolvable. Arm only a known LIVE space; its later store() handoff
+      // waits for duplicate ownership without warming inaccessible/archived data.
+      const entry = this.entries.get(rec.space)
+
+      if (entry && !entry.rec.archivedAt) {
+        entry.identityReadyRequired = true
+      }
+
+      return { space: rec.space, deletedAt: rec.deletedAt }
     }
     for (const [spaceId, entry] of this.entries) {
       if (entry.rec.archivedAt) {
@@ -570,11 +597,16 @@ export class SpaceManager {
   /** A fresh record for a new space: an opaque id where a registry persists one,
    *  else the slug itself (a meta-DB-less host has id ≡ slug). */
   private recordForSlug(slug: string, displayName: string): SpaceRecord {
+    const id = this.metaDb ? freshNoteId() : slug
+
     return {
-      id: this.metaDb ? freshNoteId() : slug,
+      id,
       slug,
       displayName,
-      notesDir: slug,
+      // Handle syntax is URL-safe but still contains Windows device names.
+      // Physical runtime-space components use the shared portable-name fence;
+      // ordinary handles remain byte-for-byte unchanged.
+      notesDir: noteFileBase(slug, undefined, id),
       aliases: [],
       createdAt: this.now().toISOString(),
       archivedAt: null,
@@ -590,6 +622,7 @@ export class SpaceManager {
       store: null,
       lastAccess: 0,
       sseRefs: 0,
+      identityReadyRequired: false,
     })
     this.rebuildSlugIndex()
   }

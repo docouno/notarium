@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 
 import {
+  DurableDisplayNameSchema,
   OkResponseSchema,
   PatchSpaceRequestSchema,
   PurgeSpaceRequestSchema,
@@ -11,7 +12,7 @@ import {
   StatusResponseSchema,
 } from '@notarium/contract'
 import { HTTP_STATUS } from '@notarium/contract/http'
-import { freshNoteId, idToSlug, slugify, uniqueSlug } from '@notarium/core'
+import { asciiSlug, freshNoteId, idToSlug, uniqueSlug } from '@notarium/core'
 
 import { can } from '../../../../services/authz'
 import { recordSpaceRename } from '../../../../services/projects'
@@ -77,16 +78,26 @@ export const spacesRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
       return notFound(reply)
     }
     const body = (req.body || {}) as Record<string, unknown>
-    // Handle is DERIVED from the human name (slugify romanises any script); an explicit
-    // slug is only the derivation base, not the final handle.
-    const explicit = typeof body.slug === 'string' ? slugify(body.slug) : ''
-    const displayName =
+    // Handle is DERIVED from the human name; an explicit slug is only the derivation
+    // base, not the final handle. `asciiSlug` (not `slugify`) because a space handle is a
+    // URL segment pinned to `[a-z0-9_-]` by SpaceSlugSchema — it romanises what it can and
+    // yields '' otherwise, which is exactly what the id fallback below is for (#123/#296).
+    const explicit = typeof body.slug === 'string' ? asciiSlug(body.slug) : ''
+    const displayNameRaw =
       (typeof body.displayName === 'string' && body.displayName.trim()) || explicit
 
-    if (!displayName) {
+    if (!displayNameRaw) {
       return reply.code(HTTP_STATUS.BAD_REQUEST).send({ error: 'a name is required' })
     }
-    const base = explicit || slugify(displayName)
+    const displayNameResult = DurableDisplayNameSchema.safeParse(displayNameRaw)
+
+    if (!displayNameResult.success) {
+      return reply
+        .code(HTTP_STATUS.BAD_REQUEST)
+        .send({ error: displayNameResult.error.issues[0]?.message ?? 'bad display name' })
+    }
+    const displayName = displayNameResult.data
+    const base = explicit || asciiSlug(displayName)
     const free = (s: string) => !spaces.resolveId(s)
     // A derived handle is soft-suffixed on clash, never a 409 (409 is reserved for an
     // EXPLICIT rename); a name with no romanisable chars falls back to an id-shaped handle.

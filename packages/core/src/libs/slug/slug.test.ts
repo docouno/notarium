@@ -1,6 +1,19 @@
 import { describe, expect, it } from 'vitest'
 
-import { effectiveSlug, idToSlug, slugify, slugifyPath, storedSlug, uniqueSlug } from './slug'
+import { noteFileBase } from '../path'
+import {
+  asciiSlug,
+  effectiveSlug,
+  idToSlug,
+  legacyImportSlug,
+  linkKey,
+  nameKey,
+  namePathKey,
+  slugify,
+  slugifyPath,
+  storedSlug,
+  uniqueSlug,
+} from './slug'
 
 describe('slugify', () => {
   it('handles plain latin + camelCase', () => {
@@ -49,7 +62,13 @@ describe('slugify', () => {
       expect(slugify('Αθήνα Μύκονος')).toBe('athina-mykonos')
     })
 
-    it('scripts with no romaniser here → empty (the caller falls back to an id)', () => {
+    // #296 — the axis split. A name is a FILE NAME and a RESOLVE KEY, so a script we
+    // have no romaniser for keeps its own letters instead of being dropped: dropping
+    // is what wrote the dot-file `.md` and collapsed every non-Latin note onto one
+    // empty key. The handle axis (asciiSlug, below) keeps the old ASCII behaviour.
+    it('scripts with no romaniser here KEEP their letters — distinct, non-empty', () => {
+      const seen = new Set<string>()
+
       for (const s of [
         '你好世界',
         'こんにちは',
@@ -58,13 +77,46 @@ describe('slugify', () => {
         'שלום עולם',
         'สวัสดี',
       ]) {
-        expect(slugify(s)).toBe('')
+        const key = slugify(s)
+        expect(key).not.toBe('')
+        expect(seen.has(key)).toBe(false) // no two scripts share one key
+        seen.add(key)
       }
     })
 
-    it('mixed scripts keep the romanisable part, drop the rest', () => {
-      expect(slugify('Café 你好 Test')).toBe('cafe-test')
-      expect(slugify('🚀 Rocket')).toBe('rocket')
+    it('a name in one unromanisable script slugs to itself (file name = readable)', () => {
+      expect(slugify('第三季度规划')).toBe('第三季度规划')
+      expect(slugify('会議の議事録')).toBe('会議の議事録')
+      expect(slugify('תוכניות לרבעון')).toBe('תוכניות-לרבעון') // the space is a separator
+    })
+
+    it('recomposes to NFC — NFKD decomposes Hangul, and the jamo must not reach disk', () => {
+      const key = slugify('안녕하세요')
+      expect(key).toBe(key.normalize('NFC'))
+      expect(key).toBe('안녕하세요')
+    })
+
+    it('keeps combining marks — they carry the vowels in Thai/Hebrew', () => {
+      // Stripping marks like a Latin diacritic would mangle the word, not romanise it.
+      expect(slugify('แผนไตรมาส')).toBe('แผนไตรมาส')
+      expect(slugify('שָׁלוֹם')).toBe('שָׁלוֹם')
+    })
+
+    it('mixed scripts keep BOTH halves — the romanised and the kept', () => {
+      expect(slugify('Café 你好 Test')).toBe('cafe-你好-test')
+      expect(slugify('🚀 Rocket')).toBe('rocket') // an emoji is not a letter
+    })
+
+    it('collapses what a filesystem would refuse, so portability needs no ban-list', () => {
+      // `< > : " / \ | ? *`, control chars, the dot and the space are none of
+      // letter/digit/mark/underscore — a name can neither escape its directory nor
+      // grow a second extension.
+      expect(slugify('a/b\\c:d*e?f"g<h>i|j')).toBe('a-b-c-d-e-f-g-h-i-j')
+      expect(slugify('note.md')).toBe('note-md')
+      expect(slugify('第三季度/规划')).toBe('第三季度-规划')
+      expect(slugify('a\u0000b')).toBe('a-b') // a control char, written as an ESCAPE:
+      // a raw NUL in the source makes git treat this whole file as binary.
+      expect(slugify('a b')).toBe('a-b')
     })
 
     it('underscore is a legal handle character — preserved, never folded to a dash', () => {
@@ -72,10 +124,67 @@ describe('slugify', () => {
       expect(slugify('A_b C')).toBe('a_b-c')
     })
 
-    it('only-punctuation / whitespace / empty → empty', () => {
+    it('only-punctuation / whitespace / emoji / empty → empty (the id fallback case)', () => {
       expect(slugify('!!! ??? ...')).toBe('')
       expect(slugify('   ')).toBe('')
       expect(slugify('')).toBe('')
+      expect(slugify('🎉🎉')).toBe('')
+    })
+
+    it('an emoji carrying a variation selector is empty too, not one invisible char', () => {
+      // VS16 is a MARK by category, so the letter class would keep it: `❤️` slugged to
+      // the single zero-width U+FE0F — a file whose whole name is invisible, and one
+      // shared key for the entire family. That is the #296 defect wearing a new hat.
+      const family = ['❤️', '⚠️', '✔️', '☀️', '▶️', '☑️', '✏️']
+
+      for (const s of family) {
+        expect(slugify(s)).toBe('')
+      }
+      // …and the id rung names their files, so two of them never collide.
+      expect(noteFileBase('❤️', undefined, 'AAAAAAAAAAAA')).toBe('aaaaaaaaaaaa')
+      expect(noteFileBase('⚠️', undefined, 'BBBBBBBBBBBB')).toBe('bbbbbbbbbbbb')
+    })
+
+    it('drops combining marks whose base character was discarded', () => {
+      // U+20E3 is the enclosing keycap mark. Its emoji/punctuation base is not a
+      // name character, so the mark must not survive by itself as one invisible
+      // filename shared by every keycap spelling.
+      expect(slugify('#️⃣')).toBe('')
+      expect(slugify('*️⃣')).toBe('')
+      expect(slugify('\u0301')).toBe('')
+    })
+
+    it('a CJK ideograph keeps its base when a variation selector picks a glyph', () => {
+      // VS17+ chooses a glyph variant; two visually identical ideographs must not take
+      // two different keys.
+      expect(slugify('\u9089\u{E0101}')).toBe(slugify('\u9089'))
+    })
+
+    // A slug is a case-INSENSITIVE key (and a file name on a case-insensitive
+    // filesystem). NFKD expands the compatibility block into UPPERCASE Latin, which the
+    // old ASCII class scrubbed and the wider one keeps — so the fold has to happen after
+    // the maps, not only before them.
+    it('is lowercase even where NFKD expands into capitals', () => {
+      expect(slugify('Notarium™')).toBe('notariumtm')
+      expect(slugify('㎒')).toBe('mhz')
+      expect(slugify('℡')).toBe('tel')
+      expect(slugify('㎒')).toBe(slugify('MHz')) // one name, one key
+      for (const s of ['Notarium™', '㎒', '℡', '℃', 'Ⅷ', 'ｱ', '第三季度规划', 'Привет']) {
+        expect(slugify(s)).toBe(slugify(s).toLowerCase())
+      }
+    })
+
+    it('is a FIXED POINT — slugify(slugify(x)) === slugify(x)', () => {
+      // `parseNoteFile` re-canonicalises a stored `slug:` on every read, so a second
+      // pass that changes the value would leave the read-model and the file disagreeing
+      // forever. NFKD expands these into UPPERCASE letters CHAR_MAP only knows in
+      // lowercase, so the fold has to happen before the second map pass, not after it.
+      for (const s of ['ϒ', 'ϓ', 'ᴭ', 'ℾ', 'ℿ', '㏀', '㎒', '™', 'Ω', 'Ёлка', '第三季度规划']) {
+        expect(slugify(slugify(s))).toBe(slugify(s))
+      }
+      expect(slugify('ϒ')).toBe('y') // romanised, not left as Greek upsilon
+      expect(slugify('ℾ')).toBe('g')
+      expect(slugify('㏀')).toBe('ko')
     })
 
     it('never collapses a non-latin title onto the empty key when WE can romanise it', () => {
@@ -86,6 +195,45 @@ describe('slugify', () => {
 
   it('slugs paths per segment', () => {
     expect(slugifyPath('archive/notes/Ёлочные-Игрушки')).toBe('archive/notes/iolochnye-igrushki')
+    expect(slugifyPath('journal/第三季度规划')).toBe('journal/第三季度规划')
+  })
+})
+
+describe('legacyImportSlug', () => {
+  it('freezes pre-#296 compatibility-expansion paths', () => {
+    expect(legacyImportSlug('㏀')).toBe('k')
+    expect(legacyImportSlug('㎒')).toBe('z')
+    expect(legacyImportSlug('™')).toBe('')
+    expect(legacyImportSlug('ϒ')).toBe('')
+    // New runtime handles intentionally use the corrected romaniser.
+    expect(asciiSlug('㎒')).toBe('mhz')
+  })
+})
+
+// The HANDLE axis (#123): a space/project handle is a URL segment under
+// SpaceSlugSchema, so it stays ASCII and yields '' for a script it cannot romanise —
+// that '' is what the caller's idToSlug fallback is for.
+describe('asciiSlug', () => {
+  it('romanises exactly as the name axis does, for everything it CAN romanise', () => {
+    for (const s of ['BookStack', 'Ёлка и Йогурт', 'Café Crème', 'Ελληνικά', 'my_cool_space']) {
+      expect(asciiSlug(s)).toBe(slugify(s))
+    }
+  })
+
+  it('yields the ASCII alphabet only — an unromanisable script degrades to empty', () => {
+    for (const s of ['你好世界', 'こんにちは', '안녕하세요', 'مرحبا', 'שלום', 'สวัสดี', '🎉']) {
+      expect(asciiSlug(s)).toBe('')
+    }
+    expect(asciiSlug('Café 你好 Test')).toBe('cafe-test')
+    expect(asciiSlug('第三季度 Plan')).toBe('plan')
+  })
+
+  it('every non-empty result is a valid SpaceSlug', () => {
+    const shape = /^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$/
+
+    for (const s of ['Łódź', 'Привіт Їжак', 'A_b C', '  Trailing --', 'Ω']) {
+      expect(asciiSlug(s)).toMatch(shape)
+    }
   })
 })
 
@@ -138,6 +286,49 @@ describe('effectiveSlug (#100)', () => {
     expect(effectiveSlug(null, 'My Title')).toBe('my-title')
     expect(effectiveSlug('', 'My Title')).toBe('my-title') // empty = implicit default
     expect(effectiveSlug(undefined, 'BookStack')).toBe('book-stack')
+  })
+})
+
+describe('nameKey (matching axis)', () => {
+  it('matches canonically equivalent spellings without renaming their stored slug', () => {
+    expect(nameKey('Ё')).toBe(nameKey('Е\u0308'))
+    expect(slugify('Ё')).not.toBe(slugify('Е\u0308')) // storage compatibility stays historical
+  })
+
+  it('uses a full case fold for multi-code-point Unicode casing', () => {
+    expect(nameKey('ᾠδή')).toBe(nameKey('ὨΙΔΉ'))
+  })
+
+  it('preserves the historical camelCase word boundary', () => {
+    expect(nameKey('BookStack')).toBe('book-stack')
+  })
+})
+
+// #296 — `linkKey` exists ONLY because neither other key is total for a link label.
+// Its raw rung is the whole difference from `namePathKey`, so pin the inputs that
+// reach it: delete `|| label.trim()…` and these are what go red.
+describe('linkKey (the label axis)', () => {
+  it('keeps two labels apart where namePathKey empties BOTH', () => {
+    // A blank last segment names nothing, so `namePathKey` is '' by design — but the
+    // two labels are still two distinct broken links, and one empty key would merge
+    // every such link in the corpus onto one node.
+    expect(namePathKey('journal/')).toBe('')
+    expect(namePathKey('archive/')).toBe('')
+    expect(linkKey('journal/')).not.toBe(linkKey('archive/'))
+    expect(linkKey('journal/')).toBeTruthy()
+  })
+
+  it('agrees with namePathKey wherever that names something', () => {
+    // The rung is a FALLBACK, not a second opinion: it must not shadow a real key,
+    // or a label would key differently here than in the index it is looked up in.
+    for (const label of ['journal/🎉', 'journal/notes', 'Journal Notes', '🎉🎉', 'привет']) {
+      expect(linkKey(label)).toBe(namePathKey(label))
+    }
+  })
+
+  it('is empty only for a label that is empty', () => {
+    expect(linkKey('   ')).toBe('')
+    expect(linkKey('')).toBe('')
   })
 })
 

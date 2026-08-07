@@ -14,7 +14,7 @@ import {
 import { HTTP_STATUS } from '@notarium/contract/http'
 import { bucketCounts, deriveNoteTitle, type NoteMeta, queryNotes, tagFacet } from '@notarium/core'
 
-import { safeRelPath } from '../../../../libs/relPath'
+import { safeRelAddress } from '../../../../libs/relPath'
 import type { SpaceStore } from '../../../../services/spaces'
 import { type ApiRouteCtx, authz, missing, s } from '../_shared'
 import { createToDomain, noteToWire } from '../wire'
@@ -115,7 +115,7 @@ export const notesRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
     let directory: string | undefined
 
     if (parsed.directory !== undefined) {
-      const safe = safeRelPath(parsed.directory)
+      const safe = safeRelAddress(parsed.directory)
 
       if (safe === null) {
         return reply.code(HTTP_STATUS.BAD_REQUEST).send({ error: 'bad directory path' })

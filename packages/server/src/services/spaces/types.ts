@@ -6,6 +6,9 @@ import type { SpaceMarkerFacet } from '../projects'
 /** A space's live store: the KnowledgeStore port + optional read-model lifecycle/bus. */
 export type SpaceStore = KnowledgeStore & {
   start?(): Promise<void>
+  /** Await the note-id registry checkpoint after a lazy boot. Global id routing
+   * uses this before handing the store to an ordinary read. */
+  identityReady?(): Promise<void>
   stop?(): void
   settle?(): Promise<void>
   checkpoint?(): Promise<void>

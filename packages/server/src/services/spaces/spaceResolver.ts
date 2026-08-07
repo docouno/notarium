@@ -1,4 +1,4 @@
-import { slugify } from '@notarium/core'
+import { asciiSlug } from '@notarium/core'
 
 import type { SpaceRecord } from '../metaDb'
 
@@ -18,7 +18,7 @@ export const buildSpaceSlugIndex = (records: readonly SpaceAddress[]): Map<strin
   }
   for (const record of records) {
     for (const alias of record.aliases) {
-      const key = slugify(alias)
+      const key = asciiSlug(alias)
 
       if (!key || index.has(key)) {
         continue
@@ -50,7 +50,7 @@ export const resolvableSpaceAliases = (records: readonly SpaceAddress[], id: str
   }
   const index = buildSpaceSlugIndex(records)
   return record.aliases.filter((alias) => {
-    const key = slugify(alias)
+    const key = asciiSlug(alias)
     return Boolean(key) && (index.get(alias) ?? index.get(key)) === id
   })
 }
@@ -69,7 +69,7 @@ export const resolveSpaceRecord = (
     return exact
   }
   const bySlug = buildSpaceSlugIndex(records)
-  const id = bySlug.get(reference) ?? bySlug.get(slugify(reference))
+  const id = bySlug.get(reference) ?? bySlug.get(asciiSlug(reference))
 
   return id ? (byId.get(id) ?? null) : null
 }

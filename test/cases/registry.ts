@@ -17,6 +17,7 @@ import { longDocument } from './cases/longDocument'
 import { memoryPerf } from './cases/memoryPerf'
 import { multiSpace } from './cases/multiSpace'
 import { nameCollisions } from './cases/nameCollisions'
+import { nonLatinNames } from './cases/nonLatinNames'
 import { noteClasses } from './cases/noteClasses'
 import { readerShowcase } from './cases/readerShowcase'
 import { scrollbars } from './cases/scrollbars'
@@ -52,6 +53,7 @@ export const CASES: readonly CaseSpec[] = [
   searchCorpus,
   externalEdits,
   nameCollisions,
+  nonLatinNames,
   // content / reader
   readerShowcase,
   longDocument,

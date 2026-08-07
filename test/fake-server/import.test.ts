@@ -407,6 +407,41 @@ describe('durable import (#191): POST /api/s/:space/import → job', () => {
     expect(paths).toContain('projects/acme-redesign/docs/brief.md')
   })
 
+  it('fails an in-run destination collision instead of silently overwriting the first note', async () => {
+    const colliding = JSON.stringify([
+      {
+        uuid: 'first-project',
+        name: 'Same Project',
+        prompt_template: 'FIRST PROMPT',
+        docs: [{ uuid: 'first-doc', filename: 'same.md', content: 'FIRST DOC' }],
+      },
+      {
+        uuid: 'second-project',
+        name: 'Same Project',
+        prompt_template: 'SECOND PROMPT',
+        docs: [{ uuid: 'second-doc', filename: 'same.md', content: 'SECOND DOC' }],
+      },
+    ])
+    const done = (await runImport('projects.json', colliding, 'application/json')).result!
+
+    expect(done.imported).toBe(2)
+    expect(done.failed).toBe(2)
+    expect(done.errors.every((error) => /destination collision/.test(error.error))).toBe(true)
+    const list = await notes()
+    expect(list).toHaveLength(2)
+    const contents = await Promise.all(
+      list.map(
+        async (note) =>
+          JSON.parse(
+            (await app.inject({ method: 'GET', url: `/api/s/main/note?ref=${note.id}` })).payload,
+          ).content,
+      ),
+    )
+    expect(contents.join('\n')).toContain('FIRST PROMPT')
+    expect(contents.join('\n')).toContain('FIRST DOC')
+    expect(contents.join('\n')).not.toContain('SECOND')
+  })
+
   it('imports the evolved Claude ZIP — per-file project/memory/design-chat + surfaces a skipped member (#113)', async () => {
     const zip = new AdmZip()
     zip.addFile('conversations.json', Buffer.from(CLAUDE_CONVERSATIONS)) // 2 conversations
@@ -468,6 +503,79 @@ describe('durable import (#191): POST /api/s/:space/import → job', () => {
     expect(job.result!.imported).toBe(2)
     const paths = (await notes()).map((n) => n.filePath)
     expect(paths.every((p) => p.startsWith('Archive/2024/conversations/claude/'))).toBe(true)
+  })
+
+  it('rejects an invalid import root instead of aliasing it to the space root', async () => {
+    for (const root of ['../escape', '.notarium/x', '/absolute']) {
+      const response = await importFile('spec.md', '# Spec', 'text/markdown', {
+        format: 'markdown',
+        root,
+      })
+
+      expect(response.statusCode).toBe(400)
+      expect(response.json()).toEqual({ error: 'bad import root' })
+    }
+
+    expect(await notes()).toHaveLength(0)
+  })
+
+  it('accepts an existing legacy POSIX-only folder as the import root', async () => {
+    await app.close()
+    app = await createApp({
+      ...fixture(),
+      spaces: [
+        {
+          slug: 'main',
+          displayName: 'Main',
+          notes: [{ title: 'Legacy', filePath: 'foo:bar/legacy.md', content: 'old' }],
+        },
+      ],
+    })
+
+    const job = await runImport('spec.md', '# Spec\n\nDetails.', 'text/markdown', {
+      format: 'markdown',
+      root: 'foo:bar',
+    })
+
+    expect(job.status).toBe('succeeded')
+    expect((await notes()).map((note) => note.filePath)).toContain('foo:bar/spec.md')
+  })
+
+  it('does not create a new POSIX-only folder through the import root', async () => {
+    const job = await runImport('spec.md', '# Spec\n\nDetails.', 'text/markdown', {
+      format: 'markdown',
+      root: 'foo:bar',
+    })
+
+    expect(job.status).toBe('succeeded')
+    expect(job.result).toMatchObject({ imported: 0, failed: 1 })
+    expect(await notes()).toHaveLength(0)
+  })
+
+  it('re-imports frozen Windows-device paths byte-for-byte without exposing them to public writes', async () => {
+    const project = JSON.stringify([
+      {
+        uuid: 'legacy-device-project',
+        name: 'CON',
+        docs: [{ uuid: 'legacy-device-doc', filename: 'NUL.md', content: 'v1' }],
+      },
+    ])
+    const first = await runImport('projects.json', project, 'application/json', {
+      format: 'claude-projects',
+    })
+
+    expect(first.result).toMatchObject({ imported: 1, failed: 0 })
+    expect((await notes()).map((note) => note.filePath)).toEqual(['projects/con/docs/nul.md'])
+
+    const second = await runImport(
+      'projects.json',
+      project.replace('v1', 'v2'),
+      'application/json',
+      { format: 'claude-projects' },
+    )
+
+    expect(second.result).toMatchObject({ imported: 1, failed: 0 })
+    expect((await notes()).map((note) => note.filePath)).toEqual(['projects/con/docs/nul.md'])
   })
 
   it('skipExisting skips notes that already exist instead of overwriting', async () => {

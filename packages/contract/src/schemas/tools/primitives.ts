@@ -2,6 +2,7 @@ import { z } from 'zod'
 import { RESPONSE_FORMAT, WRITE_OUTCOME } from '../../consts/tools'
 import { enumValues } from '../../libs/enumValues'
 import {
+  DurableNonEmptyScalarSchema,
   IsoTimestampSchema,
   ProjectStatusSchema,
   RevisionKindSchema,
@@ -19,7 +20,7 @@ export const ProjectIdSchema = z.string().min(1)
 
 /** A note reference: the internal note-id or a wiki-ref resolved WITHIN one space.
  *  Resolution failure is a 404 (unreachable ≡ nonexistent). */
-export const RefSchema = z.string().min(1)
+export const RefSchema = DurableNonEmptyScalarSchema
 /** Response verbosity on read tools. Default differs per tool: `concise`
  *  everywhere, `detailed` on get_note (you asked for a whole note — give the
  *  whole note). */

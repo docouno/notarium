@@ -11,6 +11,9 @@ export type BulkHost = {
   /** Make the buffered notes' ids durable BEFORE the coalesced `changed` announces
    *  them (the host's resolveNote reads the meta-DB). */
   flushIdentity: () => Promise<void>
+  /** Publish the latest snapshot id→path map to a path-keyed inner engine before
+   *  the same notes become observable. Synchronous by contract. */
+  syncLinkIdentities: () => void
   /** Broadcast the merged bulk `changed` to subscribers. */
   dispatchChanged: (upserts: string[], removed: string[], folders: string[]) => void
   /** Current folders of the given note-ids (recomputed fresh at flush time). */
@@ -19,4 +22,9 @@ export type BulkHost = {
   poll: () => void
   /** Kick the single graph re-enrichment suppressed during the burst. */
   refreshGraph: () => void
+  /** Publish one coalesced resolver-context rebuild before the bulk bracket
+   *  exposes its final state. */
+  flushGraphContext: () => Promise<void>
+  /** Release a deferred graph barrier when the store is torn down mid-bulk. */
+  abandonGraphContext: () => void
 }

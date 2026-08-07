@@ -5,15 +5,24 @@ import {
   type RenameFolderInput,
   type RenameProjectInput,
 } from '@notarium/contract/tools'
-import { READ_SCOPE } from '@notarium/core'
+import { isPathUnder, type KnowledgeStore, READ_SCOPE } from '@notarium/core'
 
-import { safeRelPath } from '../../../../libs/relPath'
+import { safeRelAddress, safeRelPath } from '../../../../libs/relPath'
 import { can } from '../../../authz'
-import { finalizeFolderMove, renameProjectSlug } from '../../../projects'
+import { ensureFolderIdentity, finalizeFolderMove, renameProjectSlug } from '../../../projects'
 import { type Ctx, type Handler, type Rendered, ToolFailure } from '../../gateway'
 import { wireSpace } from '../../helpers/dedup'
 import { handleOf } from '../../helpers/projectAddressing'
 import { sanitizeText } from '../../sanitize'
+
+const folderExistsIn = async (store: KnowledgeStore, path: string): Promise<boolean> => {
+  const [notes, dirs] = await Promise.all([
+    store.list({ scope: READ_SCOPE.all }),
+    store.listDirs?.() ?? Promise.resolve<string[]>([]),
+  ])
+
+  return dirs.includes(path) || notes.some((note) => isPathUnder(note.filePath, path))
+}
 
 /** Shared folder move/rename orchestration for move_folder / rename_folder.
  *  `src`/`dest` are space-relative, already safeRelPath-normalised and non-root —
@@ -59,23 +68,45 @@ const reorgFolder = async (
       markdown: `Folder is already at \`${opts.dest}\`.`,
     }
   }
-  await spaceStore.move(
-    { id: opts.src, destinationPath: opts.dest, isDirectory: true },
-    {
-      finalize: () =>
-        finalizeFolderMove(
+  const history = {
+    prepare: async () => {
+      const registered = ctx.projects
+        ? (await ctx.projects.listForSpace(space)).some((project) => project.path === opts.src)
+        : false
+
+      if (!registered && !(await folderExistsIn(spaceStore, opts.src))) {
+        throw new ToolFailure('no such folder, or you do not have access to it')
+      }
+      if (ctx.projects && ctx.folders) {
+        await ensureFolderIdentity(
           {
             projects: ctx.projects,
             folders: ctx.folders,
             markerStore: ctx.markerStore,
             now: ctx.now,
-            onError: (stage, err) =>
-              console.error(`[mcp] reorgFolder ${stage} ->`, (err as Error)?.message),
           },
-          { space, oldPath: opts.src, newPath: opts.dest },
-        ),
+          { space, folderPath: opts.src },
+        )
+      }
     },
-  )
+    ...(ctx.projects && ctx.folders
+      ? {
+          finalize: () =>
+            finalizeFolderMove(
+              {
+                projects: ctx.projects!,
+                folders: ctx.folders!,
+                markerStore: ctx.markerStore,
+                now: ctx.now,
+                onError: (stage, err) =>
+                  console.error(`[mcp] reorgFolder ${stage} ->`, (err as Error)?.message),
+              },
+              { space, oldPath: opts.src, newPath: opts.dest },
+            ),
+        }
+      : {}),
+  }
+  await spaceStore.move({ id: opts.src, destinationPath: opts.dest, isDirectory: true }, history)
 
   return {
     structured: { path: opts.dest, ...(wire ? { space: wire } : {}) },
@@ -88,7 +119,7 @@ export const handleMoveFolder: Handler = async (ctx, rawArgs) => {
   // Leading slash = "from the root" shorthand (list_notes paths carry none) — strip
   // before safeRelPath (which fails closed on traversal / the dot-namespace mount).
   // '' = the space root: not a movable folder (that would be a space rename, a human act).
-  const src = safeRelPath(folder.replace(/^\/+/, ''))
+  const src = safeRelAddress(folder.replace(/^\/+/, ''))
 
   if (src === null) {
     throw new ToolFailure('bad folder')
@@ -98,7 +129,7 @@ export const handleMoveFolder: Handler = async (ctx, rawArgs) => {
       'the space root is not a movable folder — renaming a space is a human action.',
     )
   }
-  const parent = safeRelPath(toFolder.replace(/^\/+/, ''))
+  const parent = safeRelAddress(toFolder.replace(/^\/+/, ''))
 
   if (parent === null) {
     throw new ToolFailure('bad destination folder')
@@ -110,7 +141,7 @@ export const handleMoveFolder: Handler = async (ctx, rawArgs) => {
 
 export const handleRenameFolder: Handler = async (ctx, rawArgs) => {
   const { folder, name, project } = rawArgs as RenameFolderInput
-  const src = safeRelPath(folder.replace(/^\/+/, ''))
+  const src = safeRelAddress(folder.replace(/^\/+/, ''))
 
   if (src === null) {
     throw new ToolFailure('bad folder')
@@ -120,7 +151,7 @@ export const handleRenameFolder: Handler = async (ctx, rawArgs) => {
       'the space root is not a renamable folder — renaming a space is a human action.',
     )
   }
-  if (name.includes('/')) {
+  if (name.includes('/') || name.includes('\\')) {
     throw new ToolFailure(
       "`name` is a folder name, not a path — use move_folder to change a folder's location.",
     )

@@ -10,11 +10,12 @@ import {
   type ImportFormat,
   type ImportNote,
   type KnowledgeStore,
+  noteFilePath,
   STORE_ERROR_REASON,
   type WriteInput,
 } from '@notarium/core'
 
-import { safeRelPath } from '../../libs/relPath'
+import { safeRelAddress } from '../../libs/relPath'
 import { streamImportFile } from './streamImport'
 
 export type ImportFileResult = {
@@ -47,6 +48,7 @@ export type MemoryMode = 'folder' | 'space' | 'skip'
 const toWriteInput = (
   n: ImportNote,
   directory: string,
+  root: string,
   principal: string,
   opts: { targetClass?: 'agent-memory'; ifExists: IfExists },
 ): WriteInput => ({
@@ -56,6 +58,7 @@ const toWriteInput = (
   noteType: n.noteType,
   tags: n.tags,
   fileName: n.fileName,
+  legacyImportRoot: root,
   // Only `created:` is threaded; `modified` is left to file mtime so it never goes
   // stale or fights the journal.
   // canon: docs/import.md#dates-as-data
@@ -151,6 +154,11 @@ export const runImport = async ({
   // above reach it; an arrow const would be in the TDZ when the try runs.
   // eslint-disable-next-line prefer-arrow-functions/prefer-arrow-functions
   async function runStream(): Promise<ImportSummary> {
+    // Re-import may intentionally overwrite a path from an EARLIER run, but two
+    // distinct records in this run must never overwrite each other silently. Keep
+    // the set across every streamed ZIP member; format-local checks cannot see a
+    // collision produced by two separate files.
+    const writtenDestinations = new Set<string>()
     const metas = await streamImportFile({
       uploadPath,
       tempDir,
@@ -174,7 +182,9 @@ export const runImport = async ({
         const dirRaw = toSpaceMemory
           ? note.directory.replace(/^memory\//, '')
           : underRoot(root, note.directory)
-        const dir = safeRelPath(dirRaw)
+        // The root may be an existing legacy POSIX-only folder. The store owns
+        // the stateful check: every component it would create must be portable.
+        const dir = safeRelAddress(dirRaw)
 
         if (dir === null) {
           summary.failed++
@@ -185,10 +195,25 @@ export const runImport = async ({
         // idempotency rests on the deterministic fileName, so a re-import must land on
         // the SAME file. `skipExisting` is the user's opt-out.
         // canon: docs/import.md#idempotency-dedup-on-re-import
-        const input = toWriteInput(note, dir, principal, {
+        const importRoot = toSpaceMemory ? '' : (safeRelAddress(root) ?? root)
+        const input = toWriteInput(note, dir, importRoot, principal, {
           targetClass: toSpaceMemory ? NOTE_CLASS.agentMemory : undefined,
           ifExists: skipExisting ? IF_EXISTS.fail : IF_EXISTS.overwrite,
         })
+        const destinationKey = `${toSpaceMemory ? NOTE_CLASS.agentMemory : NOTE_CLASS.userDoc}:${noteFilePath(note.title, dir, note.fileName, undefined, true)}`
+
+        if (writtenDestinations.has(destinationKey)) {
+          summary.failed++
+          summary.errors.push({
+            title: note.title,
+            error: `import destination collision: ${destinationKey.slice(destinationKey.indexOf(':') + 1)}`,
+          })
+          return
+        }
+        // Reserve before the await. A store failure after physical publication is
+        // an uncertain outcome; allowing a later colliding record through would
+        // turn that uncertainty into a guaranteed overwrite.
+        writtenDestinations.add(destinationKey)
 
         try {
           const w = await store.write(input)

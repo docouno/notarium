@@ -285,6 +285,15 @@ needed):
   surfaces still worked (heatmap, feed) but every PER-NOTE lookup came back empty on
   a world that demonstrably had revisions. The id rule is imported from
   `@notarium/engine-memory`, not restated, so the two cannot drift.
+- **An emoji-only title is not seeded** (#296). Its file is named after the NOTE
+  (`<id>.md`), and the id rung is settled by the write itself — but a case declares
+  each note's path up front and the applier pins it as the write's `fileName`, so a
+  seeded path could not agree with it and the two appliers would disagree about a
+  state neither is wrong about. The `non-latin-names` case seeds every state that
+  DOES survive the round trip (five scripts in one folder, a uniquified pair,
+  cross-script links, a lone non-Latin ghost, a CJK folder); the id rung is covered
+  where it survives — the store contract on all four engine legs, and
+  `test/unit/cachedStoreMutations.test.ts`.
 - **The `attachment` / `derived` / `encrypted` classes are not seeded** — these are
   engine mounts for derived/encrypted data, not user content (a future iteration if
   needed). What is seeded: `user-doc` / `agent-memory` / `profile`.

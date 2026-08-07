@@ -16,6 +16,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
+import { noteFileBase } from '@notarium/core'
+
 import { createServer } from '../../packages/server/src/apps/server/server'
 import { serializeMarker } from '../../packages/server/src/services/projects'
 
@@ -137,6 +139,65 @@ describe('createServer — runtime space creation (#69)', () => {
     expect((await app.inject({ method: 'POST', url: '/api/spaces', payload: {} })).statusCode).toBe(
       400,
     )
+  })
+
+  it('rejects non-durable runtime display names before minting a space', async () => {
+    const app = await boot(['main'])
+    const loneSurrogate = String.fromCharCode(0xd800)
+
+    for (const displayName of ['bad\nname', `bad${loneSurrogate}`, 'x'.repeat(201)]) {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/spaces',
+        payload: { displayName },
+      })
+
+      expect(response.statusCode).toBe(400)
+    }
+
+    const listed = (await app.inject({ method: 'GET', url: '/api/spaces' })).json()
+    expect(listed.spaces.map((space: { slug: string }) => space.slug)).toEqual(['main'])
+  })
+
+  it('stores a Windows-device handle under a portable physical directory and recovers it', async () => {
+    const app = await boot(['main'])
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/spaces',
+      payload: { displayName: 'CON' },
+    })
+
+    expect(created.statusCode).toBe(201)
+    expect(created.json().slug).toBe('con')
+    const physicalName = noteFileBase('con')
+    expect(physicalName).toMatch(/^~con-[a-f0-9]{24}$/)
+    expect((await stat(join(root, physicalName))).isDirectory()).toBe(true)
+    await expect(stat(join(root, 'con'))).rejects.toMatchObject({ code: 'ENOENT' })
+
+    await apps.splice(apps.indexOf(app), 1)[0].close()
+    const restarted = await boot(['main'])
+    const afterRestart = (await restarted.inject({ method: 'GET', url: '/api/spaces' })).json()
+    expect(afterRestart.spaces).toContainEqual(expect.objectContaining({ slug: 'con' }))
+    expect((await restarted.inject({ method: 'GET', url: '/api/s/con/notes' })).statusCode).toBe(
+      200,
+    )
+  })
+
+  it('rejects non-durable configured display names at the direct createServer boundary', async () => {
+    const loneSurrogate = String.fromCharCode(0xd800)
+
+    for (const displayName of ['bad\nname', `bad${loneSurrogate}`, 'x'.repeat(201)]) {
+      await expect(
+        createServer({
+          spaces: [{ slug: 'main', displayName, engine: 'notarium', notesDir: join(root, 'main') }],
+          authMode: 'none',
+          engineDataDir: join(root, 'engine'),
+          jobsDataDir: join(root, 'jobs'),
+          importStagingDir: join(root, 'jobs', 'imports'),
+          pollIntervalMs: 0,
+        }),
+      ).rejects.toThrow(/bad displayName for configured space "main"/)
+    }
   })
 
   it('adopts a re-cloned space folder by its marker id, bounding a hostile displayName (#126)', async () => {

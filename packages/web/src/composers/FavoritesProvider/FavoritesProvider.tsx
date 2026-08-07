@@ -53,7 +53,7 @@ const keyOf = (item: FavoriteItem): string => `${item.kind}:${item.id}`
 
 export const FavoritesProvider = ({ children }: { children: ReactNode }) => {
   const { space } = useSpace()
-  const sync = useSync()
+  const { subscribe, connectionRevision, observationEpoch } = useSync()
   const { remember } = useNotes()
   const [items, setItems] = useState<FavoriteItem[]>([])
   const [loading, setLoading] = useState(true)
@@ -77,6 +77,7 @@ export const FavoritesProvider = ({ children }: { children: ReactNode }) => {
   const reload = useCallback(
     async ({ background = false }: { background?: boolean } = {}) => {
       const seq = ++reqSeq.current
+      const observedAt = Math.max(connectionRevision, observationEpoch())
 
       if (!background) {
         setLoading(true)
@@ -92,6 +93,8 @@ export const FavoritesProvider = ({ children }: { children: ReactNode }) => {
           res.items
             .filter((it) => it.kind === FAVORITE_ENTITY_KIND.note)
             .map((it) => noteView(it.note)),
+          [],
+          observedAt,
         )
         setError(null)
         setLoaded(true) // this space has now completed a successful load (cold state over)
@@ -108,7 +111,7 @@ export const FavoritesProvider = ({ children }: { children: ReactNode }) => {
         }
       }
     },
-    [space, remember],
+    [space, remember, connectionRevision, observationEpoch],
   )
 
   useEffect(() => {
@@ -117,12 +120,12 @@ export const FavoritesProvider = ({ children }: { children: ReactNode }) => {
 
   useEffect(
     () =>
-      sync.subscribe((event) => {
+      subscribe((event) => {
         if (event.type === STORE_EVENT.CHANGED) {
           void reload({ background: true })
         }
       }),
-    [sync, reload],
+    [subscribe, reload],
   )
 
   const byKey = useMemo(() => new Map(items.map((it) => [keyOf(it), it])), [items])

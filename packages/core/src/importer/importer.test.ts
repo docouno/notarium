@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { detectFormat } from './detect'
+import { parseClaudeDesignChat } from './formats/claudeDesignChat'
 import { ImportError, parseImport } from './importer'
 
 // ── fixtures: minimal-but-real shapes of each export format ──────────────────
@@ -503,6 +504,28 @@ describe('memory-json', () => {
     expect(alice.body).toContain('- works at [[Acme]]')
     expect(warnings.join(' ')).toContain('skipped 1')
   })
+
+  it('keeps the legacy fallback path for unromanizable entity names', () => {
+    const data = JSON.stringify({
+      entities: [
+        { name: '名字', entityType: '类型', observations: ['first'] },
+        { name: '项目', entityType: '类型', observations: ['second'] },
+        { name: '名字', entityType: '类别', observations: ['replacement identity'] },
+      ],
+      relations: [],
+    })
+    const first = parseImport(data, 'memory-json').notes
+    const again = parseImport(data, 'memory-json').notes
+
+    expect(first).toHaveLength(2) // duplicate entity identity is last-write-wins in the source graph
+    expect(first.map((note) => `${note.directory}/${note.fileName}`)).toEqual([
+      'memory/entity/entity',
+      'memory/entity/entity',
+    ])
+    expect(first.map((note) => `${note.directory}/${note.fileName}`)).toEqual(
+      again.map((note) => `${note.directory}/${note.fileName}`),
+    )
+  })
 })
 
 // ── Claude projects ──────────────────────────────────────────────────────────
@@ -520,6 +543,46 @@ describe('claude projects', () => {
     expect(doc.directory).toBe('projects/acme-redesign/docs')
     expect(doc.title).toBe('brief')
     expect(doc.createdAt).toBe('2024-01-11T09:00:00.000Z')
+  })
+
+  it('bounds an overlong generated project directory without moving short paths', () => {
+    const name = 'A'.repeat(300)
+    const [note] = parseImport(
+      JSON.stringify([{ uuid: 'p-long', name, prompt_template: 'Keep me.' }]),
+      'claude-projects',
+    ).notes
+    const component = note.directory.split('/')[1]
+    expect(new TextEncoder().encode(component)).toHaveLength(255)
+    expect(component).toMatch(/-[a-f0-9]{24}$/)
+    expect(parseImport(CLAUDE_PROJECTS).notes[0].directory).toBe('projects/acme-redesign')
+  })
+
+  it('keeps the legacy fallback paths for unromanizable projects and docs', () => {
+    const data = JSON.stringify([
+      {
+        uuid: 'project-one',
+        name: '项目一',
+        prompt_template: 'first prompt',
+        docs: [{ uuid: 'doc-one', filename: '文档一.md', content: 'first doc' }],
+      },
+      {
+        uuid: 'project-two',
+        name: '项目二',
+        prompt_template: 'second prompt',
+        docs: [{ uuid: 'doc-two', filename: '文档二.md', content: 'second doc' }],
+      },
+    ])
+    const notes = parseImport(data, 'claude-projects').notes
+    const destinations = notes.map((note) => `${note.directory}/${note.fileName}`)
+
+    expect(notes).toHaveLength(4)
+    expect(destinations).toEqual([
+      'projects/project/prompt-template',
+      'projects/project/docs/doc',
+      'projects/project/prompt-template',
+      'projects/project/docs/doc',
+    ])
+    expect(destinations.filter((path) => path.endsWith('/prompt-template'))).toHaveLength(2)
   })
 })
 
@@ -606,6 +669,42 @@ describe('claude export — evolved layout (#113)', () => {
     expect(n.body.indexOf('need a landing page')).toBeLessThan(n.body.indexOf('here is a draft'))
   })
 
+  it('keeps the legacy project fallback for non-romanised design chats', () => {
+    const parsed = parseClaudeDesignChat([
+      {
+        uuid: 'chat-a',
+        title: 'A',
+        project: { uuid: 'project-a', name: '项目甲' },
+        messages: [{ role: 'user', content: 'alpha' }],
+      },
+      {
+        uuid: 'chat-b',
+        title: 'B',
+        project: { uuid: 'project-b', name: '项目乙' },
+        messages: [{ role: 'user', content: 'beta' }],
+      },
+    ])
+
+    expect(parsed.notes).toHaveLength(2)
+    expect(parsed.notes.map((note) => note.directory)).toEqual([
+      'design-chats/project',
+      'design-chats/project',
+    ])
+  })
+
+  it('bounds an overlong generated design-chat project directory', () => {
+    const data = JSON.stringify({
+      uuid: 'dc-long',
+      title: 'Design',
+      project: { name: 'B'.repeat(300) },
+      messages: [{ role: 'user', content: 'hello' }],
+    })
+    const [note] = parseImport(data, 'claude-design-chat').notes
+    const component = note.directory.split('/')[1]
+    expect(new TextEncoder().encode(component)).toHaveLength(255)
+    expect(component).toMatch(/-[a-f0-9]{24}$/)
+  })
+
   it('design chat: content as an ARRAY of text blocks is extracted', () => {
     const data = JSON.stringify({
       uuid: 'dc-2',
@@ -646,6 +745,24 @@ describe('claude export — evolved layout (#113)', () => {
     const [n] = parseImport(data).notes
     expect(n.title).toBe('Projects memory')
     expect(n.body).toContain('Acme redesign')
+  })
+
+  it('claude-memory bounds long account-keyed filenames deterministically without collisions', () => {
+    const key = `${'memory_key_'.repeat(32)}memory`
+    const data = JSON.stringify([
+      { [key]: 'first', account_uuid: 'account-a' },
+      { [key]: 'second', account_uuid: 'account-b' },
+    ])
+    const first = parseImport(data, 'claude-memory').notes.map((note) => note.fileName)
+    const second = parseImport(data, 'claude-memory').notes.map((note) => note.fileName)
+
+    expect(first).toHaveLength(2)
+    expect(new Set(first).size).toBe(2)
+    expect(second).toEqual(first)
+    for (const fileName of first) {
+      expect(new TextEncoder().encode(fileName).length).toBeLessThanOrEqual(252)
+      expect(fileName).toMatch(/-[a-f0-9]{24}$/)
+    }
   })
 
   // Idempotency for the new formats: re-parsing yields identical
@@ -806,6 +923,22 @@ describe('robustness fixes', () => {
     ])
     const fn = parseImport(data).notes[0].fileName
     expect(fn.length).toBeLessThan(120) // date(8)+'-'+slug(≤80)+'-'+hash(8)
+  })
+
+  it('a long NON-LATIN title is capped in BYTES, not characters', () => {
+    // A CJK title keeps its own letters now (#296) at three bytes each, and a pinned
+    // import fileName is deliberately never clipped downstream — so the byte budget has
+    // to be honoured HERE or the write hits ENAMETOOLONG.
+    const data = JSON.stringify([
+      {
+        uuid: 'cjk-long',
+        name: '第'.repeat(300),
+        created_at: '2024-01-01T00:00:00Z',
+        chat_messages: [{ sender: 'human', text: 'hi', created_at: '2024-01-01T00:00:00Z' }],
+      },
+    ])
+    const fn = parseImport(data).notes[0].fileName!
+    expect(new TextEncoder().encode(`${fn}.md`).length).toBeLessThanOrEqual(255)
   })
 
   it('two idless untitled conversations get distinct filenames (no collision)', () => {

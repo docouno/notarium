@@ -19,6 +19,8 @@ import {
   NoteDetailResponseSchema,
   NotesQuerySchema,
   NotesResponseSchema,
+  PatchProjectRequestSchema,
+  PatchSpaceRequestSchema,
   PinNoteRequestSchema,
   PinNoteResponseSchema,
   PreviewSchema,
@@ -58,6 +60,36 @@ describe('GET /api/config', () => {
   })
 })
 
+describe('durable write strings', () => {
+  it('rejects line-breaking scalars and malformed UTF-16 before storage', () => {
+    const lone = String.fromCharCode(0xd800)
+
+    expect(CreateNoteRequestSchema.safeParse({ title: 'a\nb', content: 'body' }).success).toBe(
+      false,
+    )
+    expect(CreateNoteRequestSchema.safeParse({ title: lone, content: 'body' }).success).toBe(false)
+    expect(CreateNoteRequestSchema.safeParse({ title: 'ok', content: `bad${lone}` }).success).toBe(
+      false,
+    )
+    expect(
+      UpdateNoteRequestSchema.safeParse({
+        title: 'ok',
+        originalId: `a${lone}`,
+        versionToken: 'v1:abc',
+      }).success,
+    ).toBe(false)
+  })
+
+  it('keeps ordinary Unicode scalars and multiline Markdown valid', () => {
+    expect(
+      CreateNoteRequestSchema.safeParse({
+        title: '第三季度规划 😀',
+        content: '# Заголовок\n\nТекст',
+      }).success,
+    ).toBe(true)
+  })
+})
+
 describe('spaces (#16)', () => {
   it('SpaceSlug pins the immutable URL-safe key', () => {
     expect(SpaceSlugSchema.safeParse('main').success).toBe(true)
@@ -76,6 +108,15 @@ describe('spaces (#16)', () => {
     ).toBe(true)
     // A freshly invited user can hold zero grants — the empty list is honest.
     expect(SpacesResponseSchema.safeParse({ spaces: [] }).success).toBe(true)
+  })
+  it('accepts only durable bounded display names on the persisted rename surface', () => {
+    const lone = String.fromCharCode(0xd800)
+
+    expect(PatchSpaceRequestSchema.safeParse({ displayName: '研究 🚀' }).success).toBe(true)
+    expect(PatchSpaceRequestSchema.safeParse({ displayName: '   ' }).success).toBe(false)
+    expect(PatchSpaceRequestSchema.safeParse({ displayName: 'bad\nname' }).success).toBe(false)
+    expect(PatchSpaceRequestSchema.safeParse({ displayName: `bad${lone}` }).success).toBe(false)
+    expect(PatchSpaceRequestSchema.safeParse({ displayName: 'x'.repeat(201) }).success).toBe(false)
   })
 })
 
@@ -263,6 +304,7 @@ describe('GET /api/graph', () => {
           degree: 1,
           target: 'b',
           prefillTitle: 'B',
+          creatable: true,
           sources: [{ id: 'fake-a', title: 'A', folder: '' }],
         },
       ],
@@ -485,15 +527,20 @@ describe('moves (#16 split: note move is id-addressed, folder move space-scoped)
 })
 
 describe('projects (#13: mark-as-project + list)', () => {
-  it('mark request addresses by folderPath (root = empty string); displayName optional but bounded', () => {
+  it('project writes accept only durable bounded display names', () => {
+    const lone = String.fromCharCode(0xd800)
+
     expect(
-      MarkProjectRequestSchema.safeParse({ folderPath: 'billing', displayName: 'Billing' }).success,
+      MarkProjectRequestSchema.safeParse({ folderPath: 'billing', displayName: '研发 🚀' }).success,
     ).toBe(true)
     expect(MarkProjectRequestSchema.safeParse({ folderPath: '' }).success).toBe(true) // mark the space root
     expect(MarkProjectRequestSchema.safeParse({ displayName: 'no path' }).success).toBe(false)
-    expect(
-      MarkProjectRequestSchema.safeParse({ folderPath: 'x', displayName: 'a'.repeat(201) }).success,
-    ).toBe(false) // bounded like siblings
+    for (const displayName of ['   ', 'bad\nname', `bad${lone}`, 'a'.repeat(201)]) {
+      expect(MarkProjectRequestSchema.safeParse({ folderPath: 'x', displayName }).success).toBe(
+        false,
+      )
+      expect(PatchProjectRequestSchema.safeParse({ displayName }).success).toBe(false)
+    }
   })
   it('the REST ProjectRow carries the bare slug + path on top of the agent-facing shape', () => {
     const row = {

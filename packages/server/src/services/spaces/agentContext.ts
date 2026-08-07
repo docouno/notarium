@@ -60,7 +60,9 @@ export type CuratedSet = {
  *  canon: docs/architecture.md#p5 */
 export const resolveContextSets = async (
   sets: readonly ContextSetRecord[],
-  read: (noteId: string) => Promise<{ content: string; title: string; spaceSlug: string } | null>,
+  read: (
+    noteId: string,
+  ) => Promise<{ noteId?: string; content: string; title: string; spaceSlug: string } | null>,
 ): Promise<WeighedSet[]> =>
   Promise.all(
     sets.map(async (set) => {
@@ -73,7 +75,7 @@ export const resolveContextSets = async (
           }
 
           return {
-            noteId: ref.noteId,
+            noteId: note.noteId ?? ref.noteId,
             title: note.title,
             tokens: estimateTokens(note.content),
             space: note.spaceSlug,
@@ -94,7 +96,9 @@ export const resolveContextSets = async (
  *  pin bucket; a note pinned twice still dedups by id in {@link budgetSequence}. */
 export const resolveScopePins = async (
   noteIds: readonly string[],
-  read: (noteId: string) => Promise<{ content: string; title: string; spaceSlug: string } | null>,
+  read: (
+    noteId: string,
+  ) => Promise<{ noteId?: string; content: string; title: string; spaceSlug: string } | null>,
 ): Promise<WeighedSetItem[]> => {
   const resolved = await Promise.all(
     noteIds.map(async (noteId) => {
@@ -105,7 +109,7 @@ export const resolveScopePins = async (
       }
 
       return {
-        noteId,
+        noteId: note.noteId ?? noteId,
         title: note.title,
         tokens: estimateTokens(note.content),
         space: note.spaceSlug,
@@ -131,11 +135,15 @@ export const weighAlwaysLoad = async (
     : all
   const tagged = inScope.filter((m) => (m.tags ?? []).includes(ALWAYS_LOAD_TAG))
   return Promise.all(
-    tagged.map(async (m) => ({
-      noteId: m.id as string,
-      title: m.title,
-      tokens: estimateTokens((await store.read(m.id as string)).content),
-    })),
+    tagged.map(async (m) => {
+      const note = await store.read(m.id as string)
+
+      return {
+        noteId: note.id ?? (m.id as string),
+        title: note.title ?? m.title,
+        tokens: estimateTokens(note.content),
+      }
+    }),
   )
 }
 
@@ -143,10 +151,15 @@ export const weighAlwaysLoad = async (
  *  Weight is 0 on purpose — a free lead, never counted against a scope budget. Null when
  *  the user never saved one. canon: docs/note-model.md#note-classes */
 export const personalProfilePin = async (store: KnowledgeStore): Promise<WeighedPin | null> => {
-  const note = (await store.list({ scope: READ_SCOPE.all })).find(
+  const meta = (await store.list({ scope: READ_SCOPE.all })).find(
     (m) => m.id != null && m.class === NOTE_CLASS.profile,
   )
-  return note ? { noteId: note.id as string, title: note.title, tokens: 0 } : null
+
+  if (!meta?.id) {
+    return null
+  }
+  const note = await store.read(meta.id)
+  return { noteId: note.id ?? meta.id, title: note.title ?? meta.title, tokens: 0 }
 }
 
 /** A scope's user-defined order: pin+set entries in rank order. Pins and sets share ONE
@@ -401,6 +414,7 @@ export const setNotePinned = async (
   principal?: string,
 ): Promise<{ pinned: boolean; changed: boolean }> => {
   const note = await store.read(id)
+  const noteId = note.id ?? id
   const tags = Array.isArray(note.frontmatter?.tags)
     ? (note.frontmatter.tags as unknown[]).filter((t): t is string => typeof t === 'string')
     : []
@@ -413,7 +427,7 @@ export const setNotePinned = async (
   await store.write({
     title: note.title ?? '',
     content: note.content,
-    originalId: id,
+    originalId: noteId,
     versionToken: note.versionToken ?? '',
     tags: nextTags,
     principal,
@@ -445,6 +459,7 @@ export const setNoteMuted = async (
   principal?: string,
 ): Promise<{ muted: boolean; changed: boolean }> => {
   const note = await store.read(id)
+  const noteId = note.id ?? id
   const was = note.frontmatter?.muted === true || note.frontmatter?.muted === 'true'
 
   if (was === muted) {
@@ -453,7 +468,7 @@ export const setNoteMuted = async (
   await store.write({
     title: note.title ?? '',
     content: note.content,
-    originalId: id,
+    originalId: noteId,
     versionToken: note.versionToken ?? '',
     muted,
     principal,

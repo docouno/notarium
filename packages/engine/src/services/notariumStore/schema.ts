@@ -256,6 +256,10 @@ const FILE_FINGERPRINT_VERSION_SCHEMA = `
 ALTER TABLE file_fingerprints ADD COLUMN note_seq INTEGER;
 `
 
+const NOTE_ID_CLAIM_INDEX_SCHEMA = `
+CREATE INDEX IF NOT EXISTS idx_notes_id_claim ON notes(id_claim);
+`
+
 /** The ladder. INDEX_MIGRATIONS[0] is the FROZEN baseline — the meta+notes+FTS schema
  *  as it shipped at legacy version '7' (note_type included). A fresh index replays it
  *  from 0; a legacy '7' index replays it too, but every statement is CREATE IF NOT
@@ -267,6 +271,7 @@ export const INDEX_MIGRATIONS: readonly IndexMigration[] = [
   { sql: SCHEMA },
   { sql: FILE_FINGERPRINT_SCHEMA },
   { sql: FILE_FINGERPRINT_VERSION_SCHEMA },
+  { sql: NOTE_ID_CLAIM_INDEX_SCHEMA },
 ]
 
 /** The current ladder length — the integer version an index converges to. */

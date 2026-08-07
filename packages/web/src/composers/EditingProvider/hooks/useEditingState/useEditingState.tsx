@@ -1,7 +1,12 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useBlocker, useLocation, useNavigate } from 'react-router'
 import { HTTP_STATUS } from '@notarium/contract/http'
-import { DEFAULT_NOTE_TYPE, STORE_ERROR_REASON } from '@notarium/core'
+import {
+  DEFAULT_NOTE_TYPE,
+  ghostForWikilinkTarget,
+  resolveFolderReference,
+  STORE_ERROR_REASON,
+} from '@notarium/core'
 import { useDialog } from '../../../../core/Dialog'
 import { useToast } from '../../../../core/Toast'
 import {
@@ -32,7 +37,8 @@ const fitsInLabel = (title: string): boolean =>
 
 export const useEditingState = (): EditingContextValue => {
   const { space, canWrite } = useSpace()
-  const { nav, note, clearReader, refreshFolders, openNote, reloadNote } = useNotes()
+  const { nav, note, clearReader, refreshFolders, openNote, reloadNote, tree } = useNotes()
+  const folders = useMemo(() => tree?.folders ?? [], [tree?.folders])
   const { confirm, alert, choice } = useDialog()
   const toast = useToast()
   const navigate = useNavigate()
@@ -147,6 +153,12 @@ export const useEditingState = (): EditingContextValue => {
       if (!ghost) {
         return
       }
+      // A stale/deleted stable identity is not a create intent: a newly minted note
+      // cannot acquire that id and therefore cannot close the original link.
+      if (ghost.creatable === false) {
+        toast.error('This note doesn’t exist.')
+        return
+      }
       // A reader can't turn a ghost into a note — answer honestly (the same toast
       // the wiki-link path gives) instead of a silent no-op, on every ghost-create
       // surface (inspector links, graph). #111 reader-gating.
@@ -158,14 +170,31 @@ export const useEditingState = (): EditingContextValue => {
         return
       }
       const sources = Array.isArray(ghost.sources) ? ghost.sources : []
-      const targetDir = ghost.target && ghost.target.includes('/') ? folderOf(ghost.target) : ''
+      const requestedTargetDir =
+        ghost.prefillDirectory ??
+        (ghost.target && ghost.target.includes('/') ? folderOf(ghost.target) : '')
+      const aliases = folders.flatMap((folder) =>
+        (folder.aliases ?? []).map((alias) => ({ current: folder.path, alias })),
+      )
+      const targetDir = requestedTargetDir
+        ? resolveFolderReference(
+            requestedTargetDir,
+            aliases,
+            folders.map((folder) => folder.path),
+          )
+        : ''
+
+      if (targetDir == null) {
+        toast.error('This note can’t be created in an ambiguous folder.')
+        return
+      }
       goNewDraft({
         title: ghost.prefillTitle || ghost.title || '',
         dir: targetDir || sources[0]?.folder || '',
         links: sources.map((s) => s.title).filter(Boolean),
       })
     },
-    [canWrite, ensureCanLeaveDraft, goNewDraft, toast],
+    [canWrite, ensureCanLeaveDraft, folders, goNewDraft, toast],
   )
 
   // Follow a [[wiki link]] the reader's session cache couldn't resolve. The cache
@@ -188,8 +217,12 @@ export const useEditingState = (): EditingContextValue => {
             return
           }
           await createFromGhost({
-            title: target.split('/').pop() || target,
-            target,
+            ...ghostForWikilinkTarget(target, {
+              aliases: folders.flatMap((folder) =>
+                (folder.aliases ?? []).map((alias) => ({ current: folder.path, alias })),
+              ),
+              currentPaths: folders.map((folder) => folder.path),
+            }),
             sources:
               note && note.id && note.filePath
                 ? [{ id: note.id, title: note.title || '', folder: folderOf(note.filePath) }]
@@ -200,7 +233,7 @@ export const useEditingState = (): EditingContextValue => {
         toast.error((e as Error).message)
       }
     },
-    [space, canWrite, openNote, createFromGhost, note, toast],
+    [space, canWrite, openNote, createFromGhost, note, toast, folders],
   )
 
   // The version the editor read, pinned when editing STARTS (#50). A ref, not
@@ -476,6 +509,9 @@ export const useEditingState = (): EditingContextValue => {
       // saveDraft itself; both closures capture this render's binding, so the
       // reference is always the in-sync one.
     },
+    // Mutual recursion keeps resolveConflict below saveDraft; adding it here
+    // would read its const binding in the temporal dead zone during render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [
       note,
       space,

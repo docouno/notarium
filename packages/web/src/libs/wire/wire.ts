@@ -206,6 +206,8 @@ export type GraphGhostNodeView = {
   degree: number
   target: string
   prefillTitle: string
+  prefillDirectory?: string
+  creatable: boolean
   sources?: Array<{ id?: string; title: string; folder: string }>
   x?: number
   y?: number
@@ -225,6 +227,8 @@ export const graphNodeView = (n: WireGraphNode): GraphNodeView =>
         degree: n.degree,
         target: n.target,
         prefillTitle: n.prefillTitle,
+        prefillDirectory: n.prefillDirectory,
+        creatable: n.creatable,
         sources: n.sources,
         x: n.x,
         y: n.y,

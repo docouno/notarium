@@ -36,9 +36,11 @@ export const syncApi = {
     onAccess?: () => void,
     onMembers?: () => void,
     onRename?: () => void,
+    onOpen?: () => void,
   ): (() => void) => {
     const es = new EventSource(`${sp(space)}/events`)
 
+    es.onopen = () => onOpen?.()
     es.onmessage = (m) => {
       try {
         onEvent(JSON.parse(m.data as string) as StoreEvent)

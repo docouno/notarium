@@ -5,7 +5,7 @@
 import { ZipArchive } from 'archiver'
 import { READ_SCOPE, type ReadScope, stripFrontmatter } from '@notarium/core'
 
-import { safeRelPath } from '../../../libs/relPath'
+import { safeRelAddress } from '../../../libs/relPath'
 import type { SpaceStore } from '../../../services/spaces'
 import { JobAbortedError, type JobHandler } from './jobRunner'
 
@@ -40,7 +40,7 @@ export const createExportHandler = (deps: ExportHandlerDeps): JobHandler => {
     let folder = ''
 
     if (params.folder) {
-      const safe = safeRelPath(params.folder)
+      const safe = safeRelAddress(params.folder)
 
       if (safe === null) {
         throw new Error('bad folder path')

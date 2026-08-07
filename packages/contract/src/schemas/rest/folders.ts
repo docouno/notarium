@@ -1,5 +1,10 @@
 import { z } from 'zod'
-import { SpaceSlugSchema } from '../primitives'
+import {
+  DurableAddressPathSchema,
+  DurableNonEmptyAddressPathSchema,
+  DurableNonEmptyPathSchema,
+  SpaceSlugSchema,
+} from '../primitives'
 import { noteWriteFields } from './_fields'
 
 // Plain (unmarked) folders are first-class: an empty folder is durable on-disk
@@ -13,7 +18,7 @@ export const CreateFolderRequestSchema = z.object({
   /** Relative folder path within the space; slashes nest (the last segment is
    *  the new folder's name). Must not be empty (the root always exists) and must
    *  not already exist (409). */
-  path: z.string().min(1),
+  path: DurableNonEmptyPathSchema,
 })
 
 /** POST /api/s/:space/folders/page — create a folder's page. Mints the
@@ -22,7 +27,7 @@ export const CreateFolderRequestSchema = z.object({
  *  let the UI materialise a virtual folder page on first Save with the user's body
  *  in a single revision. 409 if a page already exists. */
 export const CreateFolderPageRequestSchema = z.object({
-  folderPath: z.string(),
+  folderPath: DurableAddressPathSchema,
   title: noteWriteFields.title,
   content: noteWriteFields.content,
   noteType: noteWriteFields.noteType,
@@ -55,8 +60,8 @@ export const FolderResponseSchema = z.object({
 /** POST /api/folder/move — relocate a whole folder subtree: `path` is the source
  *  folder, `destinationPath` its new parent. Distinct from a single-note move. */
 export const MoveFolderRequestSchema = z.object({
-  path: z.string(),
-  destinationPath: z.string(),
+  path: DurableNonEmptyAddressPathSchema,
+  destinationPath: DurableAddressPathSchema,
 })
 
 export type CreateFolderRequest = z.infer<typeof CreateFolderRequestSchema>

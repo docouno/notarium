@@ -6,7 +6,7 @@
 import type { FastifyInstance } from 'fastify'
 import { mkdir, rm } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
-import { AUTH_MODE, NOTE_CLASS } from '@notarium/contract'
+import { AUTH_MODE, DurableDisplayNameSchema, NOTE_CLASS } from '@notarium/contract'
 import {
   AGENT_MEMORY_MOUNT,
   BackgroundScheduler,
@@ -181,6 +181,17 @@ export const createServer = async ({
   backgroundDripMs,
   backupControlSocket,
 }: CreateServerOptions): Promise<FastifyInstance> => {
+  // `createServer` is also a public composition boundary (tests and embedders call
+  // it without going through spacesFromEnv). Reject labels that could not be
+  // persisted by the registry/marker contract before opening DBs or touching disk.
+  for (const space of spaces) {
+    if (
+      space.displayName !== undefined &&
+      !DurableDisplayNameSchema.safeParse(space.displayName).success
+    ) {
+      throw new Error(`bad displayName for configured space "${space.slug}"`)
+    }
+  }
   // Present is not durable: an in-memory meta-DB forgets every account on restart.
   // canon: docs/architecture.md#data-root
   if (

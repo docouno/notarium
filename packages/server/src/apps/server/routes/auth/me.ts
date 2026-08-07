@@ -48,6 +48,7 @@ import {
   writeProfileNote,
 } from '../../../../services/spaces'
 import {
+  readNoteAccess,
   type StoreAccess,
   weighScopeContextSets,
   weighScopeOrder,
@@ -311,7 +312,7 @@ export const meRoutes = async (
     if (!body.success) {
       throw new AuthError(HTTP_STATUS.BAD_REQUEST, body.error.issues[0]?.message || 'bad request')
     }
-    const hit = await storeAccess.noteStore(req.principal, body.data.noteId, 'note:read')
+    const hit = await readNoteAccess(storeAccess, req.principal, body.data.noteId, 'note:read')
 
     if (!hit) {
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
@@ -322,7 +323,7 @@ export const meRoutes = async (
       targetId: slug,
       targetSpace: slug,
       noteSpace: hit.space,
-      noteId: body.data.noteId,
+      noteId: hit.noteId,
       createdAt: new Date().toISOString(),
     })
     return OkResponseSchema.parse({ ok: true })
@@ -339,11 +340,9 @@ export const meRoutes = async (
       const slug = await peekPersonalSpace({ auth, spaces }, req.principal)
 
       if (slug) {
-        await scopePins.removePin(
-          CONTEXT_KIND.personal,
-          slug,
-          (req.params as { noteId?: string }).noteId ?? '',
-        )
+        const requestedId = (req.params as { noteId?: string }).noteId ?? ''
+        const live = await readNoteAccess(storeAccess, req.principal, requestedId, 'note:read')
+        await scopePins.removePin(CONTEXT_KIND.personal, slug, live?.noteId ?? requestedId)
       }
 
       return OkResponseSchema.parse({ ok: true })
@@ -363,12 +362,16 @@ export const meRoutes = async (
       throw new AuthError(HTTP_STATUS.BAD_REQUEST, body.error.issues[0]?.message || 'bad request')
     }
     const slug = await ensurePersonalSpaceFor({ auth, spaces }, req.principal.username)
-    await contextOrder.setOrder(
-      CONTEXT_KIND.personal,
-      slug,
-      slug,
-      body.data.entries.map((e) => ({ entryKind: e.kind, entryRef: e.ref })),
+    const entries = await Promise.all(
+      body.data.entries.map(async (entry) => {
+        if (entry.kind !== 'pin') {
+          return { entryKind: entry.kind, entryRef: entry.ref }
+        }
+        const live = await readNoteAccess(storeAccess, req.principal, entry.ref, 'note:read')
+        return { entryKind: entry.kind, entryRef: live?.noteId ?? entry.ref }
+      }),
     )
+    await contextOrder.setOrder(CONTEXT_KIND.personal, slug, slug, entries)
     return OkResponseSchema.parse({ ok: true })
   })
 

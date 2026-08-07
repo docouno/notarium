@@ -14,9 +14,14 @@ import type {
   NoteMeta,
   ResolvedVia,
 } from '../knowledgeStore'
-import { RESOLVED_VIA } from '../knowledgeStore'
-import { parseWikilinks } from '../libs/markdown'
-import { deKebab, slugify, slugifyPath } from '../libs/slug'
+import { GRAPH_GHOST_TARGET, RESOLVED_VIA } from '../knowledgeStore'
+import {
+  decodeWikilinkIdentity,
+  isWikilinkIdentityTarget,
+  normalizeWikilinkTarget,
+  parseWikilinks,
+} from '../libs/markdown'
+import { deKebab, linkKey, nameKey, namePathKey } from '../libs/slug'
 import type { FolderAlias, GhostStub, GraphEdgeLike, LinkIndex } from './types'
 
 type GraphHealthSource = { id?: string; title: string; folder: string }
@@ -28,8 +33,145 @@ const compareGhostSources = (a: GraphHealthSource, b: GraphHealthSource): number
   compareHealthText(a.title, b.title) ||
   compareHealthText(a.id ?? '', b.id ?? '')
 
+const idIndexKey = (id: string): string => `\u0000id:${id}`
+const rawPathIndexKey = (path: string): string => `\u0000path:${path}`
+
+export type FolderResolveContext = {
+  aliases: readonly FolderAlias[]
+  currentPaths: readonly string[]
+}
+
+/** Folder context belongs to an index build but is not itself a link key. Keeping it
+ *  out of the Map prevents reserved metadata from participating in normal resolution. */
+const folderContextByIndex = new WeakMap<LinkIndex, FolderResolveContext>()
+
+const pathParts = (path: string): string[] => path.split('/').filter(Boolean)
+const prefixOf = (parts: readonly string[], length: number): string =>
+  parts.slice(0, length).join('/')
+
+/** Canonicalize a folder-shaped human reference using the same precedence as note
+ *  resolution: an exact live RAW path wins, then a unique key-equivalent live path,
+ *  then the longest historical alias. A tie between distinct current paths is unsafe
+ *  and returns null; an unknown path is returned unchanged. */
+export const resolveFolderReference = (
+  rawPath: string,
+  aliases: readonly FolderAlias[] = [],
+  currentPaths: readonly string[] = [],
+): string | null => {
+  if (!rawPath) {
+    return ''
+  }
+  const rawParts = pathParts(rawPath)
+
+  if (!rawParts.length) {
+    return rawPath
+  }
+  const currents = [...new Set(currentPaths.filter(Boolean))]
+  const currentSet = new Set(currents)
+  let currentClaim: { length: number; path: string } | { length: number; path: null } | undefined
+
+  // Find the most-specific live ancestor. Exact RAW wins a tie against an
+  // equivalent spelling, but not against a LONGER historical prefix: a live
+  // parent `old/` must not steal the retired child `old/sub→other`.
+  for (let length = rawParts.length; length > 0; length--) {
+    const rawPrefix = prefixOf(rawParts, length)
+
+    if (currentSet.has(rawPrefix)) {
+      currentClaim = { length, path: rawPath }
+      break
+    }
+    const key = namePathKey(rawPrefix)
+
+    if (!key) {
+      continue
+    }
+    const matches = currents.filter((path) => namePathKey(path) === key)
+
+    if (matches.length > 1) {
+      currentClaim = { length, path: null }
+      break
+    }
+    if (matches.length === 1) {
+      const suffix = rawParts.slice(length).join('/')
+      currentClaim = {
+        length,
+        path: suffix ? `${matches[0]}/${suffix}` : matches[0],
+      }
+      break
+    }
+  }
+
+  type AliasClaim = { aliasLength: number; current: string; exact: boolean }
+  const claims: AliasClaim[] = []
+
+  for (const pair of aliases) {
+    const aliasParts = pathParts(pair.alias)
+    const aliasKey = namePathKey(pair.alias)
+
+    if (
+      !aliasKey ||
+      aliasKey === namePathKey(pair.current) ||
+      aliasParts.length > rawParts.length
+    ) {
+      continue
+    }
+    const rawPrefix = prefixOf(rawParts, aliasParts.length)
+
+    if (namePathKey(rawPrefix) === aliasKey) {
+      claims.push({
+        aliasLength: aliasParts.length,
+        current: pair.current,
+        exact: rawPrefix === pair.alias,
+      })
+    }
+  }
+
+  const longest = claims.length ? Math.max(...claims.map((claim) => claim.aliasLength)) : 0
+
+  if (currentClaim && currentClaim.length >= longest) {
+    return currentClaim.path
+  }
+  if (!longest) {
+    return rawPath
+  }
+  const mostSpecific = claims.filter((claim) => claim.aliasLength === longest)
+  const exact = mostSpecific.filter((claim) => claim.exact)
+  const targets = new Set((exact.length ? exact : mostSpecific).map((claim) => claim.current))
+
+  if (targets.size !== 1) {
+    return null
+  }
+  const current = [...targets][0]!
+  const suffix = rawParts.slice(longest).join('/')
+  return suffix ? `${current}/${suffix}` : current
+}
+
+const currentFoldersOf = (notes: readonly NoteMeta[]): string[] => {
+  const folders = new Set<string>()
+
+  for (const note of notes) {
+    const parts = note.filePath.replace(/\.md$/i, '').split('/').slice(0, -1)
+
+    for (let length = 1; length <= parts.length; length++) {
+      folders.add(prefixOf(parts, length))
+    }
+  }
+
+  return [...folders]
+}
+
+/** Add an exact stable-id address without changing the graph node's own key. Bare
+ *  engines key nodes by path but still know the file's frontmatter id claim, so they
+ *  register `id → path`; read-model/client indexes naturally register `id → id`. */
+export const registerLinkIdentity = (index: LinkIndex, id: string, targetId: string): void => {
+  if (id && !index.has(idIndexKey(id))) {
+    index.set(idIndexKey(id), targetId)
+  }
+}
+
 /** Identity of an edge: same source, relation type and target. */
-export const edgeKey = (e: GraphEdgeLike): string => `${e.source}\u0000${e.type}\u0000${e.target}`
+export const edgeKey = (e: GraphEdgeLike): string =>
+  `${e.source}\u0000${e.type}\u0000${e.target}\u0000${e[GRAPH_GHOST_TARGET] ? 'ghost' : 'real'}`
 
 /** Drop duplicate edges, keeping first occurrence order stable. */
 export const dedupeEdges = <T extends GraphEdgeLike>(edges: T[]): T[] => {
@@ -59,25 +201,73 @@ export const buildLinkIndex = (
    *  key is claimed exactly once (passes 1.5–3 only fill FREE keys), so its
    *  provenance is unambiguous. */
   provenance?: Map<string, ResolvedVia>,
+  /** First-class directory inventory (empty folders included). Note-derived
+   *  ancestors are always added; callers with a directory channel provide the rest. */
+  currentFolders?: readonly string[],
 ): LinkIndex => {
   const index: LinkIndex = new Map()
-  const list = [...notes]
+  // Inventory order differs by adapter (SQL path order, insertion order, cache
+  // arrival). A collision must still choose one deterministic note everywhere.
+  const list = [...notes].sort((a, b) =>
+    a.filePath < b.filePath ? -1 : a.filePath > b.filePath ? 1 : 0,
+  )
+  const folderContext: FolderResolveContext = {
+    aliases: folderAliases ?? [],
+    currentPaths: [...new Set([...currentFoldersOf(list), ...(currentFolders ?? [])])],
+  }
+  folderContextByIndex.set(index, folderContext)
   const idOf = (n: NoteMeta): string => n.id ?? n.filePath // note-id or storage path (bare engine)
+
+  const claimCurrent = (key: string, id: string): void => {
+    if (!key || index.has(key)) {
+      return
+    }
+    index.set(key, id)
+    provenance?.set(key, RESOLVED_VIA.current)
+  }
+
+  // Exact RAW storage spelling is a current-name axis ahead of the normalized
+  // name key. Two files may legally differ only by case or Unicode composition;
+  // `[[foo]]` must then choose the literal `foo.md`, just like the engine's direct
+  // reader, while a non-exact spelling still follows the deterministic normalized
+  // collision rule below.
+  for (const n of list) {
+    const rawPath = n.filePath.replace(/\.md$/i, '')
+
+    if (!rawPath) {
+      continue
+    }
+    const key = rawPathIndexKey(rawPath)
+
+    if (!index.has(key)) {
+      index.set(key, idOf(n))
+      provenance?.set(key, RESOLVED_VIA.current)
+    }
+  }
+
+  for (const n of list) {
+    if (n.id) {
+      registerLinkIdentity(index, n.id, idOf(n))
+    }
+  }
 
   // Pass 1 — CURRENT names of EVERY note (path, filename, title). A live note's
   // own names always win, so no note can be shadowed by another's stale alias.
+  // An EMPTY key is never registered: it is not a name, and every note whose name
+  // slugs to nothing would otherwise share it — the whole non-Latin corpus resolving
+  // as one arbitrary note (#296). The later passes already guarded it; pass 1 did not.
+  // Axes are separate passes: literal path > filename > title. Interleaving them per
+  // note lets a later title overwrite an earlier filename and makes list order part of
+  // the product contract. First claimant in bytewise path order wins within an axis.
   for (const n of list) {
-    const id = idOf(n)
+    claimCurrent(namePathKey(n.filePath.replace(/\.md$/, '')), idOf(n))
+  }
+  for (const n of list) {
     const path = n.filePath.replace(/\.md$/, '')
-
-    for (const key of [
-      slugifyPath(path),
-      slugify(path.split('/').pop() || path),
-      slugify(n.title),
-    ]) {
-      index.set(key, id)
-      provenance?.set(key, RESOLVED_VIA.current)
-    }
+    claimCurrent(nameKey(path.split('/').pop() ?? ''), idOf(n))
+  }
+  for (const n of list) {
+    claimCurrent(nameKey(n.title), idOf(n))
   }
   // Pass 1.5 — CUSTOM slugs. A user-set `slug:` is a current resolve
   // name, so [[my-slug]] reaches its note. It fills only FREE keys (never shadows
@@ -88,7 +278,7 @@ export const buildLinkIndex = (
     if (!n.slug) {
       continue
     }
-    const key = slugify(n.slug)
+    const key = nameKey(n.slug)
 
     if (key && !index.has(key)) {
       index.set(key, idOf(n))
@@ -104,7 +294,7 @@ export const buildLinkIndex = (
     const id = idOf(n)
 
     for (const alias of n.aliases ?? []) {
-      const key = slugify(alias)
+      const key = nameKey(alias)
 
       if (key && !index.has(key)) {
         index.set(key, id)
@@ -119,29 +309,149 @@ export const buildLinkIndex = (
   // folder-alias) — fills only FREE keys, never shadowing a live note. A single
   // prefix-swap per (folder-alias, note); folder aliases are few (only renamed
   // folders), so the extra passes are cheap.
-  for (const fa of folderAliases ?? []) {
-    const cur = slugifyPath(fa.current)
-    const ali = slugifyPath(fa.alias)
+  const rawFolderAliasClaims = new Map<string, Set<string>>()
+  const folderAliasClaims = new Map<string, Set<string>>()
 
-    if (!ali || cur === ali) {
+  for (const fa of folderAliases ?? []) {
+    const aliasKey = namePathKey(fa.alias)
+
+    if (!aliasKey || aliasKey === namePathKey(fa.current)) {
       continue
     }
-    for (const n of list) {
-      const p = slugifyPath(n.filePath.replace(/\.md$/, ''))
 
-      if (p !== cur && !p.startsWith(cur + '/')) {
+    for (const n of list) {
+      const notePath = n.filePath.replace(/\.md$/i, '')
+
+      // Folder membership is RAW. `Inbox` and `inbox` can be two real directories
+      // on a case-sensitive medium; key-space membership made one history steal the
+      // other's notes.
+      if (notePath !== fa.current && !notePath.startsWith(fa.current + '/')) {
         continue
       }
-      const key = ali + p.slice(cur.length)
+      const candidate = fa.alias + notePath.slice(fa.current.length)
+      const candidateParts = candidate.split('/')
+      const candidateDir = candidateParts.slice(0, -1).join('/')
+      const actualDir = notePath.split('/').slice(0, -1).join('/')
+      const resolvedDir = resolveFolderReference(
+        candidateDir,
+        folderContext.aliases,
+        folderContext.currentPaths,
+      )
 
-      if (!index.has(key)) {
-        index.set(key, idOf(n))
-        provenance?.set(key, RESOLVED_VIA.folderAlias)
+      // Re-run the shared longest-prefix/live-first rule before claiming the key.
+      // A broad `old→new` must not claim `old/sub/note` when the more specific
+      // `old/sub→other` history says that authored path belongs under `other`.
+      if (resolvedDir !== actualDir) {
+        continue
+      }
+      const key = namePathKey(candidate)
+      const id = idOf(n)
+
+      if (key) {
+        const rawTargets = rawFolderAliasClaims.get(candidate) ?? new Set<string>()
+        rawTargets.add(id)
+        rawFolderAliasClaims.set(candidate, rawTargets)
+        const targets = folderAliasClaims.get(key) ?? new Set<string>()
+        targets.add(id)
+        folderAliasClaims.set(key, targets)
       }
     }
   }
 
+  // Exact RAW history has the same priority rung as exact RAW current paths and
+  // distinguishes `Old` from `old`. Aggregate before publishing so two folder
+  // identities claiming the SAME retired spelling fail closed instead of making
+  // the first alias-array entry win.
+  for (const [candidate, targets] of rawFolderAliasClaims) {
+    const key = rawPathIndexKey(candidate)
+
+    if (targets.size === 1 && !index.has(key)) {
+      index.set(key, [...targets][0]!)
+      provenance?.set(key, RESOLVED_VIA.folderAlias)
+    }
+  }
+  for (const [key, targets] of folderAliasClaims) {
+    if (targets.size === 1 && !index.has(key)) {
+      index.set(key, [...targets][0]!)
+      provenance?.set(key, RESOLVED_VIA.folderAlias)
+    }
+  }
+
   return index
+}
+
+/** Canonical unresolved-link payload shared by graph shaping and the reader's
+ *  server-miss create flow. A create intent is offered only when its prefill can
+ *  actually claim the missing last-segment key. */
+export const ghostForWikilinkTarget = (
+  label: string,
+  folderContext?: Partial<FolderResolveContext>,
+): GhostStub => {
+  const normalized = normalizeWikilinkTarget(label)
+  const identityEnvelope = isWikilinkIdentityTarget(normalized)
+  const envelopedId = decodeWikilinkIdentity(normalized)
+
+  if (identityEnvelope) {
+    return {
+      id: `ghost:${normalized}`,
+      title: envelopedId ?? normalized,
+      target: normalized,
+      prefillTitle: envelopedId ?? normalized,
+      creatable: false,
+    }
+  }
+  const path = namePathKey(normalized)
+  const last = path.split('/').pop() || ''
+  const target = linkKey(normalized)
+  const rawParts = normalized.replaceAll('\\', '/').split('/')
+  const rawDirectoryParts = rawParts.slice(0, -1)
+  let safeDirectory: string | null = ''
+
+  if (normalized.includes('\0') || normalized.replaceAll('\\', '/').startsWith('/')) {
+    safeDirectory = null
+  } else {
+    const clean: string[] = []
+
+    for (const segment of rawDirectoryParts) {
+      if (!segment || segment === '.') {
+        continue
+      }
+      if (segment === '..' || segment.startsWith('.')) {
+        safeDirectory = null
+        break
+      }
+      clean.push(segment)
+    }
+    if (safeDirectory !== null) {
+      safeDirectory = clean.join('/')
+    }
+  }
+  const prefillDirectory =
+    safeDirectory == null
+      ? null
+      : resolveFolderReference(safeDirectory, folderContext?.aliases, folderContext?.currentPaths)
+
+  if (!last || prefillDirectory == null) {
+    return {
+      id: `ghost:${target}`,
+      title: normalized || label.trim(),
+      target,
+      prefillTitle: '',
+      creatable: false,
+    }
+  }
+  const candidate = nameKey(normalized) === last ? normalized : deKebab(last)
+  const prefillTitle =
+    nameKey(candidate) === last ? candidate : (normalized.split('/').pop() ?? '').trim()
+
+  return {
+    id: `ghost:${target}`,
+    title: prefillTitle,
+    target,
+    prefillTitle,
+    ...(prefillDirectory ? { prefillDirectory } : {}),
+    creatable: nameKey(prefillTitle) === last,
+  }
 }
 
 /** Resolve one [[wikilink]] label against the index: the slugged full form
@@ -155,11 +465,39 @@ export const resolveLink = (
    *  `resolvedVia` — the axis that claimed the matched key. Omit it on the hot path. */
   provenance?: Map<string, ResolvedVia>,
 ): { targetId: string; ghost?: GhostStub; resolvedVia?: ResolvedVia } => {
-  const path = slugifyPath(label)
+  const normalized = normalizeWikilinkTarget(label)
+  const identityEnvelope = isWikilinkIdentityTarget(normalized)
+  const envelopedId = decodeWikilinkIdentity(normalized)
+  // Canonical resolver order is id-first. Plain ids remain supported when they
+  // contain no wikilink syntax; the reserved envelope makes this axis total.
+  const exactId = identityEnvelope ? envelopedId : normalized
+  const byId = exactId == null ? undefined : index.get(idIndexKey(exactId))
+
+  if (byId !== undefined) {
+    return { targetId: byId, resolvedVia: RESOLVED_VIA.current }
+  }
+  if (identityEnvelope) {
+    // The reserved namespace is identity-only. Never reinterpret a stale/deleted id
+    // as a human title or path: a decoy note whose name resembles the envelope must
+    // not capture the edge. Keep it as a distinct ghost for graph-health reporting.
+    const ghost = ghostForWikilinkTarget(normalized, folderContextByIndex.get(index))
+    return { targetId: ghost.id, ghost }
+  }
+  const exactPathKey = rawPathIndexKey(normalized)
+  const byExactPath = index.get(exactPathKey)
+
+  if (byExactPath !== undefined) {
+    return { targetId: byExactPath, resolvedVia: provenance?.get(exactPathKey) }
+  }
+  // `namePathKey` is total where `slugifyPath` is not: a label with nothing sluggable
+  // keys on its raw form (so `[[🎉🎉]]` reaches the note `buildLinkIndex` registered
+  // under the same form), and one whose LAST segment names nothing keys on '' rather
+  // than on the folder-shaped junk `docs/` that merged every such link into one ghost.
+  const path = namePathKey(normalized)
   const last = path.split('/').pop() || ''
   // Track WHICH key hit so provenance reads the right entry.
-  let hit = index.get(path)
   let matchedKey = path
+  let hit = path ? index.get(path) : undefined
 
   if (hit === undefined && path.includes('/')) {
     hit = index.get(last)
@@ -168,11 +506,17 @@ export const resolveLink = (
   if (hit !== undefined) {
     return { targetId: hit, resolvedVia: provenance?.get(matchedKey) }
   }
-  const prefillTitle = slugify(label) === last ? label.trim() : deKebab(last)
-  return {
-    targetId: `ghost:${path}`,
-    ghost: { id: `ghost:${path}`, title: prefillTitle, target: path, prefillTitle },
-  }
+  // The #25 invariant, ASSERTED rather than approximated: the prefill must key back to
+  // this ghost's `last`, or a note created from the ghost does not resolve the link that
+  // made it. De-kebabbing is the pretty form (`dir/missing-note` → "Missing Note") and
+  // the raw label is the exact one; the old test picked between them by comparing the
+  // WHOLE label's key against `last`, which is a proxy that lies on a path form: for
+  // `[[dir/🎉-🚀]]` it flattened to `dir`, took the de-kebab branch, and prefilled
+  // `🎉 🚀` — a title keyed `🎉 🚀`, so the ghost survived its own creation and offered
+  // to create the note again. Check the invariant itself and fall back to the label's
+  // last segment, which satisfies it by construction (`last` IS its `nameKey`).
+  const ghost = ghostForWikilinkTarget(normalized, folderContextByIndex.get(index))
+  return { targetId: ghost.id, ghost }
 }
 
 /** A note's outbound edges derived from its live body — the write-through /
@@ -202,13 +546,14 @@ export const deriveNoteEdges = (
   for (const label of parseWikilinks(content)) {
     const { targetId, ghost, resolvedVia } = resolveLink(label, index, provenance)
 
-    if (targetId === sourceId) {
+    if (!ghost && targetId === sourceId) {
       continue
     }
     const edge: GraphLink = {
       source: sourceId,
       target: targetId,
       type: relationType,
+      ...(ghost ? { [GRAPH_GHOST_TARGET]: true as const } : {}),
       ...(resolvedVia ? { resolvedVia } : {}),
     }
     const key = edgeKey(edge)
@@ -237,7 +582,7 @@ export const deriveNoteEdges = (
 const synthesizeGhost = (id: string): GhostStub => {
   const target = id.replace(/^ghost:/, '').replace(/\.md$/, '')
   const title = deKebab(target.split('/').pop() || target)
-  return { id, title, target, prefillTitle: title }
+  return { id, title, target, prefillTitle: title, creatable: true }
 }
 
 /** Assemble the domain Graph from the read-model's parts: live notes, per-source
@@ -268,6 +613,37 @@ export const shapeGraph = (
     })
   }
 
+  // Ghost ids are graph-internal node keys, while real note ids are opaque user data.
+  // The historical `ghost:<target>` spelling can therefore be a perfectly valid real
+  // id. Allocate a deterministic collision-free projection for every ghost target
+  // actually referenced by an edge; keep the familiar spelling when it is free.
+  const edgeBuckets = [...edgesBySource]
+  const ghostTargets = new Set<string>()
+  const occupiedNodeIds = new Set(nodes.keys())
+
+  for (const [, edges] of edgeBuckets) {
+    for (const edge of edges) {
+      if (edge[GRAPH_GHOST_TARGET]) {
+        ghostTargets.add(edge.target)
+      } else {
+        // An unmarked target owns its raw id even when its real note vanished and
+        // shapeGraph must synthesize a fallback node for it.
+        occupiedNodeIds.add(edge.target)
+      }
+    }
+  }
+  const ghostNodeIds = new Map<string, string>()
+
+  for (const rawId of [...ghostTargets].sort()) {
+    let graphId = rawId
+
+    while (occupiedNodeIds.has(graphId)) {
+      graphId = `ghost:${graphId}`
+    }
+    occupiedNodeIds.add(graphId)
+    ghostNodeIds.set(rawId, graphId)
+  }
+
   const links: GraphLink[] = []
   const seen = new Set<string>()
   const ghostSources = new Map<
@@ -275,46 +651,57 @@ export const shapeGraph = (
     Map<string, { id?: string; title: string; folder: string }>
   >()
 
-  for (const [sourceId, edges] of edgesBySource) {
+  for (const [sourceId, edges] of edgeBuckets) {
     const source = nodes.get(sourceId)
 
     if (!source || source.ghost) {
       continue
     } // stale: the source note is gone
     for (const e of edges) {
-      if (e.target === e.source) {
+      const isGhostTarget = e[GRAPH_GHOST_TARGET] === true
+      const targetId = isGhostTarget ? (ghostNodeIds.get(e.target) ?? e.target) : e.target
+      const publicEdge = { ...e }
+
+      delete publicEdge[GRAPH_GHOST_TARGET]
+      const shapedEdge = targetId === e.target ? publicEdge : { ...publicEdge, target: targetId }
+
+      if (shapedEdge.target === shapedEdge.source) {
         continue
       }
-      const key = edgeKey(e)
+      const key = edgeKey(shapedEdge)
 
       if (seen.has(key)) {
         continue
       }
-      let target = nodes.get(e.target)
+      let target = nodes.get(targetId)
 
       if (!target) {
-        const stub = ghosts.get(e.target) ?? synthesizeGhost(e.target)
+        const stub = isGhostTarget
+          ? (ghosts.get(e.target) ?? synthesizeGhost(e.target))
+          : synthesizeGhost(e.target)
         target = {
-          id: e.target,
+          id: targetId,
           title: stub.title,
           ghost: true,
           folder: '',
           degree: 0,
           target: stub.target,
           prefillTitle: stub.prefillTitle,
+          ...(stub.prefillDirectory ? { prefillDirectory: stub.prefillDirectory } : {}),
+          creatable: stub.creatable,
         }
-        nodes.set(e.target, target)
+        nodes.set(targetId, target)
       }
       seen.add(key)
-      links.push(e)
+      links.push(shapedEdge)
       source.degree++
       target.degree++
       if (target.ghost) {
-        if (!ghostSources.has(e.target)) {
-          ghostSources.set(e.target, new Map())
+        if (!ghostSources.has(targetId)) {
+          ghostSources.set(targetId, new Map())
         }
         const folder = source.filePath.split('/').slice(0, -1).join('/')
-        ghostSources.get(e.target)!.set(sourceId, { id: source.id, title: source.title, folder })
+        ghostSources.get(targetId)!.set(sourceId, { id: source.id, title: source.title, folder })
       }
     }
   }

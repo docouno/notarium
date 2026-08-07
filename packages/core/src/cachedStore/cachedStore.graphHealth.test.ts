@@ -74,6 +74,7 @@ describe('CachedStore.graphHealth path→id remap (#100)', () => {
           degree: 1,
           target: 'nowhere',
           prefillTitle: 'Nowhere',
+          creatable: true,
           sources: [{ id: 'hub.md', title: 'Hub', folder: '' }],
         },
       ],
@@ -189,6 +190,7 @@ describe('CachedStore.graphHealth path→id remap (#100)', () => {
           degree: 1,
           target: 'secret-codename',
           prefillTitle: 'Secret Codename',
+          creatable: true,
           sources: [{ id: '.notarium/memory/secret.md', title: 'Secret', folder: '.notarium' }],
         },
       ],
@@ -255,6 +257,7 @@ describe('CachedStore.graphHealth path→id remap (#100)', () => {
           degree: 2,
           target: 'shared',
           prefillTitle: 'Shared',
+          creatable: true,
           sources: [
             { id: 'pub.md', title: 'Public', folder: '' },
             { id: '.notarium/memory/secret.md', title: 'Secret', folder: '.notarium' },

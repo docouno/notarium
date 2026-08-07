@@ -49,19 +49,31 @@ export const LinkList = ({ kind, items, onOpen, onCreateFromGhost }: LinkListPro
 
   return (
     <ul className={styles.linkList} data-testid={copy.listTestId}>
-      {items.map(({ node, type }) => (
-        <li key={`${node.id}|${type}`}>
-          <button
-            className={styles.link}
-            data-ghost={node.ghost || undefined}
-            onClick={() => (node.ghost ? onCreateFromGhost?.(node) : onOpen(node.id))}
-            title={node.ghost ? 'Unresolved — click to create this note' : node.title}
-          >
-            <span className={styles.linkType}>{type}</span>
-            <span className={styles.linkTitle}>{node.title}</span>
-          </button>
-        </li>
-      ))}
+      {items.map(({ node, type }) => {
+        const creatable = node.ghost && node.creatable
+
+        return (
+          <li key={`${node.id}|${type}`}>
+            <button
+              className={styles.link}
+              data-ghost={node.ghost || undefined}
+              onClick={() =>
+                node.ghost ? creatable && onCreateFromGhost?.(node) : onOpen(node.id)
+              }
+              title={
+                node.ghost
+                  ? creatable
+                    ? 'Unresolved — click to create this note'
+                    : 'Deleted or unavailable note'
+                  : node.title
+              }
+            >
+              <span className={styles.linkType}>{type}</span>
+              <span className={styles.linkTitle}>{node.title}</span>
+            </button>
+          </li>
+        )
+      })}
     </ul>
   )
 }

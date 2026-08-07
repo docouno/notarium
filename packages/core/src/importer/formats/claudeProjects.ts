@@ -3,9 +3,8 @@
 // and, when present, its custom instructions (`prompt-template.md`). Docs keep
 // their content verbatim — they're already markdown the user authored.
 
-import { slugify } from '../../libs/slug'
 import { IMPORT_SOURCE } from '../consts'
-import { cappedSlug, toIso } from '../helpers/format'
+import { cappedSlug, importerDirectorySlug, toIso } from '../helpers/format'
 import type { ImportNote } from '../types'
 
 type ClaudeDoc = { uuid?: string; filename?: string; content?: string; created_at?: string }
@@ -22,7 +21,11 @@ type ClaudeProject = {
 export const claudeProjectToNotes = (proj: ClaudeProject, index = 0): ImportNote[] => {
   const notes: ImportNote[] = []
   const name = (proj?.name || '').trim() || `Project ${proj?.uuid || index + 1}`
-  const dir = `projects/${slugify(name) || 'project'}`
+  const dirSlug = importerDirectorySlug(name)
+  // Keep the historical fallback too: a new source-keyed path would duplicate
+  // an existing unromanised project on its first re-import. Collisions within
+  // one upload are rejected by the host's whole-run destination reservation.
+  const dir = `projects/${dirSlug || 'project'}`
   const projCreated = toIso(proj.created_at)
 
   if (proj.prompt_template && proj.prompt_template.trim()) {

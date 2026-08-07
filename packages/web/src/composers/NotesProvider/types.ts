@@ -30,7 +30,11 @@ export type NotesContextValue = {
   resolveKnown: (id: string) => NoteView | undefined
   /** Merge externally-fetched notes (Feed windows, graph nodes) into the
    *  resolution cache so navigate-first opens work from anywhere. */
-  remember: (notes: readonly NoteView[]) => void
+  remember: (
+    notes: readonly NoteView[],
+    replaces?: readonly string[],
+    observedAt?: number,
+  ) => NoteView[]
   /** Notes seen this session — the wiki-link resolution pool (best-effort by
    *  design: an unseen target still opens via the server resolver). */
   knownNotes: NoteView[]

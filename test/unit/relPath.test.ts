@@ -3,7 +3,7 @@
 
 import { describe, expect, it } from 'vitest'
 
-import { safeRelPath } from '../../packages/server/src/libs/relPath'
+import { safeRelAddress, safeRelPath } from '../../packages/server/src/libs/relPath'
 
 describe('safeRelPath', () => {
   it('normalises honest relative paths', () => {
@@ -30,5 +30,13 @@ describe('safeRelPath', () => {
     expect(safeRelPath('.git')).toBeNull()
     expect(safeRelPath('.obsidian/cache')).toBeNull()
     expect(safeRelPath('foo/.bar')).toBeNull() // dot-dir at any depth
+  })
+
+  it('keeps legacy POSIX names addressable without allowing them as new portable paths', () => {
+    expect(safeRelAddress('foo:bar/old')).toBe('foo:bar/old')
+    expect(safeRelAddress('foo\\bar/old')).toBe('foo\\bar/old')
+    expect(safeRelPath('foo:bar/old')).toBeNull()
+    expect(safeRelAddress('../foo:bar')).toBeNull()
+    expect(safeRelAddress('.notarium/foo:bar')).toBeNull()
   })
 })

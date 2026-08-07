@@ -5,7 +5,7 @@ import { ExportEnqueueRequestSchema, JobSchema } from '@notarium/contract'
 import { HTTP_STATUS } from '@notarium/contract/http'
 import { freshNoteId, READ_SCOPE, type ReadScope, stripFrontmatter } from '@notarium/core'
 
-import { safeRelPath } from '../../../../libs/relPath'
+import { safeRelAddress } from '../../../../libs/relPath'
 import { JOB_KIND_EXPORT, jobToWire } from '../../consumers'
 import { type ApiRouteCtx, authz, notFound, s } from '../_shared'
 
@@ -29,7 +29,7 @@ export const exportRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
       let folder = ''
 
       if (query.folder) {
-        const safe = safeRelPath(query.folder)
+        const safe = safeRelAddress(query.folder)
 
         if (safe === null) {
           return reply.code(HTTP_STATUS.BAD_REQUEST).send({ error: 'bad folder path' })
@@ -117,7 +117,7 @@ export const exportRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
     let folder: string | undefined
 
     if (body.data.folder) {
-      const safe = safeRelPath(body.data.folder)
+      const safe = safeRelAddress(body.data.folder)
 
       if (safe === null) {
         return reply.code(HTTP_STATUS.BAD_REQUEST).send({ error: 'bad folder path' })

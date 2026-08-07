@@ -24,12 +24,45 @@ import type {
   NotesContextValue,
   ReaderMode,
 } from '../../types'
+import {
+  beginHeldWindowReconciliation,
+  isLatestRequest,
+  markHeldWindowsReady,
+  observeHeldWindowConnection,
+} from './freshness'
+import {
+  isSeenObservationAccepted,
+  rememberSeenNotes,
+  removeSeenIds,
+  replaceSeenFolder,
+} from './seenRegistry'
+
+/** A cold phase-1 id may be superseded by the durable frontmatter id while its
+ *  read waits for boot. Only rewrite when the current route still addresses the
+ *  request that produced this response; an unrelated A→B navigation must never
+ *  be pulled back to the note whose response happened to finish. */
+export const rekeyedNoteRoute = (
+  pathname: string,
+  requestedId: string,
+  note: NoteDetailView,
+): string | null => {
+  if (!note.id || note.id === requestedId) {
+    return null
+  }
+  const route = parseAppPath(pathname)
+
+  if ((route.kind !== 'note' && route.kind !== 'memoryNote') || route.id !== requestedId) {
+    return null
+  }
+
+  return noteRouteForClass(note.id, note.class, effectiveSlug(note.slug, note.title || ''))
+}
 
 export const useNotesState = (): NotesContextValue => {
   const location = useLocation()
   const navigate = useNavigate()
   const { space, personalSpace, reportNoteSpace } = useSpace()
-  const { subscribe } = useSync()
+  const { subscribe, connectionRevision, observationEpoch } = useSync()
 
   const [tree, setTree] = useState<Tree | null>(null)
   const [treeLoaded, setTreeLoaded] = useState(false)
@@ -53,6 +86,10 @@ export const useNotesState = (): NotesContextValue => {
   // Refs mirror the latest values for the location effect, which must fire on
   // navigation only — not re-subscribe on every data change.
   const seenRef = useRef(seen)
+  /** IDs removed by server truth, stamped with their observation epoch. A
+   * response already in flight when the event landed must not put one back; a
+   * later upsert or a post-reconnect snapshot may reconcile it. */
+  const removedSeenIdsRef = useRef(new Map<string, number>())
   const treeRef = useRef(tree)
   const folderNotesRef = useRef(folderNotes)
   const activeIdRef = useRef<string | null>(null)
@@ -99,33 +136,83 @@ export const useNotesState = (): NotesContextValue => {
   const folderTree = useMemo(() => (tree ? nestFolders(tree.folders) : []), [tree])
   const folders = useMemo(() => (tree ? tree.folders.map((f) => f.path) : []), [tree])
   const knownNotes = useMemo(() => [...seen.values()], [seen])
+  const folderLoadSeq = useRef(new Map<string, number>())
+  const treeLoadSeq = useRef(0)
+  const heldWindowReconciliationRef = useRef(beginHeldWindowReconciliation(0))
+  const initializedSpaceRef = useRef(false)
+  const spaceBootSeq = useRef(0)
 
-  const remember = useCallback((notes: readonly NoteView[]) => {
-    if (!notes.length) {
-      return
-    }
-    setSeen((prev) => {
-      const next = new Map(prev)
-
-      for (const n of notes) {
-        if (n.id) {
-          next.set(n.id, n)
-        }
+  const remember = useCallback(
+    (notes: readonly NoteView[], replaces: readonly string[] = [], observedAt?: number) => {
+      if (!notes.length) {
+        return []
       }
+      const result = rememberSeenNotes(
+        seenRef.current,
+        notes,
+        removedSeenIdsRef.current,
+        replaces,
+        observedAt ?? observationEpoch(),
+      )
 
-      return next
-    })
-  }, [])
+      seenRef.current = result.seen
+      setSeen(result.seen)
+      return result.accepted
+    },
+    [observationEpoch],
+  )
+
+  /** Removed stable ids are no longer locally conclusive wikilink targets. Keep
+   *  the ref in lockstep with the state update so a click before the next React
+   *  render cannot route around the authoritative server resolver. */
+  const forget = useCallback(
+    (ids: readonly string[]) => {
+      if (!ids.length) {
+        return
+      }
+      const removed = new Set(ids)
+
+      const removalEpoch = observationEpoch()
+
+      for (const id of removed) {
+        removedSeenIdsRef.current.set(id, removalEpoch)
+      }
+      const nextSeen = removeSeenIds(seenRef.current, ids)
+      const nextFolders = new Map(folderNotesRef.current)
+
+      // A listing started before the event is older than this removal even if it
+      // answers before the coalesced refresh starts. Supersede every outstanding
+      // folder window so it cannot resurrect the deleted stable id.
+      for (const [folder, seq] of folderLoadSeq.current) {
+        folderLoadSeq.current.set(folder, seq + 1)
+      }
+      for (const [folder, notes] of nextFolders) {
+        nextFolders.set(
+          folder,
+          notes.filter((row) => !removed.has(row.id)),
+        )
+      }
+      seenRef.current = nextSeen
+      folderNotesRef.current = nextFolders
+      setSeen(nextSeen)
+      setFolderNotes(nextFolders)
+    },
+    [observationEpoch],
+  )
 
   const resolveKnown = useCallback((id: string) => seenRef.current.get(id), [])
 
   const loadTree = useCallback(async (): Promise<Tree | null> => {
     const forSpace = spaceRef.current
+    const sequence = ++treeLoadSeq.current
+    const request = { space: forSpace, sequence }
+    const isCurrent = () =>
+      isLatestRequest(request, { space: spaceRef.current, sequence: treeLoadSeq.current })
 
     try {
       const t = await api.treeGet(forSpace)
 
-      if (spaceRef.current !== forSpace) {
+      if (!isCurrent()) {
         return null
       }
       setTree(t)
@@ -134,7 +221,7 @@ export const useNotesState = (): NotesContextValue => {
       setListError(null)
       return t
     } catch (e) {
-      if (spaceRef.current !== forSpace) {
+      if (!isCurrent()) {
         return null
       }
       // An unreachable engine is a distinct, retryable state — name it instead
@@ -157,10 +244,10 @@ export const useNotesState = (): NotesContextValue => {
    *  same folder, and responses can land out of order — only the LATEST
    *  request's answer is applied, so a stale listing never overwrites a
    *  fresher one. */
-  const folderLoadSeq = useRef(new Map<string, number>())
   const loadFolder = useCallback(
     async (folder: string): Promise<void> => {
       const forSpace = spaceRef.current
+      const observedAt = observationEpoch()
       const seq = (folderLoadSeq.current.get(folder) ?? 0) + 1
       folderLoadSeq.current.set(folder, seq)
       try {
@@ -172,14 +259,31 @@ export const useNotesState = (): NotesContextValue => {
         if (folderLoadSeq.current.get(folder) !== seq) {
           return
         } // superseded mid-flight
-        remember(step.notes)
-        setFolderNotes((prev) => new Map(prev).set(folder, step.notes))
+        const previous = folderNotesRef.current.get(folder) ?? []
+        const observation = rememberSeenNotes(
+          seenRef.current,
+          step.notes,
+          removedSeenIdsRef.current,
+          [],
+          observedAt,
+        )
+
+        const nextSeen = replaceSeenFolder(observation.seen, previous, observation.accepted)
+        const nextFolders = new Map(folderNotesRef.current).set(folder, observation.accepted)
+
+        // Refs move with the accepted authoritative response, before React's
+        // render, so a same-tick wikilink click cannot use an id this empty
+        // folder response just proved was deleted.
+        seenRef.current = nextSeen
+        folderNotesRef.current = nextFolders
+        setSeen(nextSeen)
+        setFolderNotes(nextFolders)
       } catch {
         // a folder listing that failed simply stays unloaded; expand retries it
         foldersInFlight.current.delete(folder)
       }
     },
-    [remember],
+    [observationEpoch],
   )
 
   const ensureFolder = useCallback(
@@ -240,6 +344,22 @@ export const useNotesState = (): NotesContextValue => {
     },
     [loadTree, loadFolder, dirOfId],
   )
+
+  // The SSE endpoint does not replay frames missed before subscription or while
+  // disconnected. Every successful open — INCLUDING the first — therefore
+  // reloads every held authoritative window. Reader boot and stream open race;
+  // the second one claims the revision so the first open reloads exactly once.
+  useEffect(() => {
+    const decision = observeHeldWindowConnection(
+      heldWindowReconciliationRef.current,
+      connectionRevision,
+    )
+
+    heldWindowReconciliationRef.current = decision.state
+    if (decision.reload) {
+      void refreshData()
+    }
+  }, [connectionRevision, refreshData])
 
   /** Narrow post-mutation refresh (#94): reload the tree skeleton + only those
    *  of `folders` this session actually holds. Unloaded folders are skipped
@@ -344,59 +464,91 @@ export const useNotesState = (): NotesContextValue => {
       setLoading(true)
       setNoteError(null)
       try {
-        let n: NoteDetailView
+        // A removal may land while detail I/O is in flight. One rejected live
+        // answer is never published: repeat from the newer observation epoch so
+        // the authoritative deleted detail (or a post-restore live detail) can
+        // take over. A second rejection becomes an honest not-found state below,
+        // never a blank reader or an endlessly-retried request.
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const observedAt = observationEpoch()
+          let n: NoteDetailView
 
-        try {
-          n = await api.noteGet(id, ac.signal)
-        } catch (e) {
-          if (ac.signal.aborted) {
+          try {
+            n = await api.noteGet(id, ac.signal)
+          } catch (e) {
+            if (ac.signal.aborted) {
+              return null
+            } // superseded mid-flight
+            // Not a note-id → the wiki-resolver channel (#16): storage keys
+            // (titles/paths) resolve WITHIN the active space only — reference
+            // resolution never crosses the space boundary.
+            if ((e as { status?: number }).status !== HTTP_STATUS.NOT_FOUND) {
+              throw e
+            }
+            n = await api.noteResolve(spaceRef.current, id, ac.signal)
+          }
+          if (!isCurrent()) {
             return null
-          } // superseded mid-flight
-          // Not a note-id → the wiki-resolver channel (#16): storage keys
-          // (titles/paths) resolve WITHIN the active space only — reference
-          // resolution never crosses the space boundary.
-          if ((e as { status?: number }).status !== HTTP_STATUS.NOT_FOUND) {
-            throw e
-          }
-          n = await api.noteResolve(spaceRef.current, id, ac.signal)
-        }
-        if (!isCurrent()) {
-          return null
-        } // a newer open landed first — drop this answer
-        setNote(n)
-        setActiveId(n.id || id)
-        // A space-free note may land in another space than the chrome shows. User
-        // docs adopt their real space; project memory does too. Personal memory
-        // stays space-less in practice: it belongs to the Agents layer and must not
-        // yank the workspace away from the project the user is auditing.
-        const keepSourceSpace = preserveSpaceOnNoteOpenRef.current === spaceRef.current
+          } // a newer open landed first — drop this answer
+          const prevKnown = seenRef.current.get(n.id || id) ?? seenRef.current.get(id)
+          const known = asNote(n, prevKnown)
+          const admitted = isSeenObservationAccepted(
+            n.id || id,
+            n.deleted === true,
+            removedSeenIdsRef.current,
+            observedAt,
+            observationEpoch(),
+          )
 
-        if (
-          !keepSourceSpace &&
-          n.space &&
-          (n.class !== NOTE_CLASS.agentMemory || n.space !== personalSpace?.slug)
-        ) {
-          reportNoteSpace(n.space)
-        }
-        const prevKnown = seenRef.current.get(n.id || id) ?? seenRef.current.get(id)
-        const known = asNote(n, prevKnown)
-        const recent = asRecent(n, prevKnown)
-
-        if (known) {
-          setLastNote(known)
-          remember([known])
-          // The single open chokepoint (tree click, deep link, Spotlight all reach
-          // here) — record the note in its space's recently-opened MRU, the
-          // Spotlight's empty-state list (#31). Keyed by the note's REAL space (a
-          // space-free /n/<id> may resolve elsewhere than the chrome shows).
-          if (recent) {
-            pushRecentNote(n.space ?? spaceRef.current, recent)
+          if (!admitted || (!n.deleted && !known)) {
+            continue
           }
+          // Cache admission is the same tombstone barrier as every list/window.
+          // It runs BEFORE any reader, routing, MRU or space side effect.
+          if (known && !remember([known], known.id !== id ? [id] : [], observedAt).length) {
+            continue
+          }
+          const recent = asRecent(n, prevKnown)
+
+          setNote(n)
+          setActiveId(n.id || id)
+          // A space-free note may land in another space than the chrome shows. User
+          // docs adopt their real space; project memory does too. Personal memory
+          // stays space-less in practice: it belongs to the Agents layer and must not
+          // yank the workspace away from the project the user is auditing.
+          const keepSourceSpace = preserveSpaceOnNoteOpenRef.current === spaceRef.current
+
+          if (
+            !keepSourceSpace &&
+            n.space &&
+            (n.class !== NOTE_CLASS.agentMemory || n.space !== personalSpace?.slug)
+          ) {
+            reportNoteSpace(n.space)
+          }
+          if (known) {
+            setLastNote(known)
+            // The single open chokepoint (tree click, deep link, Spotlight all reach
+            // here) — record the note in its space's recently-opened MRU, the
+            // Spotlight's empty-state list (#31). Keyed by the note's REAL space (a
+            // space-free /n/<id> may resolve elsewhere than the chrome shows).
+            if (recent) {
+              pushRecentNote(n.space ?? spaceRef.current, recent)
+            }
+          }
+          // Opening a note moves the rail into its folder scope, so a stale 'feed'
+          // (or 'all') scope stops lighting up while a file is open.
+          setNav({ type: 'folder', folder: folderOf(n.filePath) })
+          const rekeyedRoute = rekeyedNoteRoute(window.location.pathname, id, n)
+
+          if (rekeyedRoute && rekeyedRoute !== window.location.pathname) {
+            navigate(rekeyedRoute, { replace: true, state: location.state })
+          }
+
+          return n
         }
-        // Opening a note moves the rail into its folder scope, so a stale 'feed'
-        // (or 'all') scope stops lighting up while a file is open.
-        setNav({ type: 'folder', folder: folderOf(n.filePath) })
-        return n
+        setNote(null)
+        setNoteError({ kind: 'notFound' })
+        return null
       } catch (e) {
         if (ac.signal.aborted || !isCurrent()) {
           return null
@@ -410,7 +562,7 @@ export const useNotesState = (): NotesContextValue => {
         }
       }
     },
-    [remember, reportNoteSpace, personalSpace?.slug],
+    [remember, reportNoteSpace, personalSpace?.slug, navigate, location.state, observationEpoch],
   )
 
   // Imperative open. Navigate-first (#60): when the resolution cache knows the
@@ -460,44 +612,80 @@ export const useNotesState = (): NotesContextValue => {
 
   // Re-fetch the open note IN PLACE (post-mutation: rename/move/save/restore keep
   // the id — and the URL — so the reader refreshes without re-routing). Unlike
-  // fetchNote, a failure here keeps the note as the user last saw it: a transient
-  // blip must not blank an open note (SSE 'changed' or the next action recovers).
+  // fetchNote, an ordinary transport failure keeps the last view. Once an
+  // authoritative epoch rejects that view, however, a failed retry clears it
+  // into the scoped error state instead of leaving known-stale live content.
   const reloadNote = useCallback(async () => {
     const id = activeIdRef.current
 
     if (!id) {
       return
     }
-    try {
-      const n = await api.noteGet(id)
+    let admissionRejected = false
 
-      // A navigation may have moved the reader on while this in-place refresh
-      // was in flight — don't let a stale reload clobber the newly-open note (#68).
-      if (activeIdRef.current !== id) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const observedAt = observationEpoch()
+
+      try {
+        const n = await api.noteGet(id)
+
+        // A navigation may have moved the reader on while this in-place refresh
+        // was in flight — don't let a stale reload clobber the newly-open note (#68).
+        if (activeIdRef.current !== id) {
+          return
+        }
+        const known = asNote(n)
+        const admitted = isSeenObservationAccepted(
+          n.id || id,
+          n.deleted === true,
+          removedSeenIdsRef.current,
+          observedAt,
+          observationEpoch(),
+        )
+
+        if (!admitted || (!n.deleted && !known)) {
+          admissionRejected = true
+          continue
+        }
+        if (known && !remember([known], [], observedAt).length) {
+          admissionRejected = true
+          continue
+        }
+        const keepSourceSpace = preserveSpaceOnNoteOpenRef.current === spaceRef.current
+
+        setNote(n)
+        setNoteError(null)
+        if (
+          !keepSourceSpace &&
+          n.space &&
+          (n.class !== NOTE_CLASS.agentMemory || n.space !== personalSpace?.slug)
+        ) {
+          reportNoteSpace(n.space)
+        }
+        if (known) {
+          setLastNote(known)
+        }
+
+        setNav({ type: 'folder', folder: folderOf(n.filePath) })
+        return
+      } catch (e) {
+        if (admissionRejected && activeIdRef.current === id) {
+          // We already know the displayed live snapshot is older than an
+          // authoritative removal. A failed retry must not leave that stale
+          // content on screen; show the scoped error with its normal Retry UI.
+          setNote(null)
+          setNoteError(classifyNoteError(e))
+        }
+
+        // An ordinary transient in-place refresh keeps the current note.
         return
       }
-      setNote(n)
-      setNoteError(null)
-      const keepSourceSpace = preserveSpaceOnNoteOpenRef.current === spaceRef.current
-
-      if (
-        !keepSourceSpace &&
-        n.space &&
-        (n.class !== NOTE_CLASS.agentMemory || n.space !== personalSpace?.slug)
-      ) {
-        reportNoteSpace(n.space)
-      }
-      const known = asNote(n)
-
-      if (known) {
-        setLastNote(known)
-        remember([known])
-      }
-      setNav({ type: 'folder', folder: folderOf(n.filePath) })
-    } catch {
-      // keep the current note; the refresh simply didn't land
     }
-  }, [remember, reportNoteSpace, personalSpace?.slug])
+    if (admissionRejected && activeIdRef.current === id) {
+      setNote(null)
+      setNoteError({ kind: 'notFound' })
+    }
+  }, [remember, reportNoteSpace, personalSpace?.slug, observationEpoch])
 
   // Apply a location to the reader/scope state. `/n/<id>/…` and `/m/<id>/…` resolve by id
   // only (the slug is decorative); `/files/<path>` is always a folder browse —
@@ -568,6 +756,18 @@ export const useNotesState = (): NotesContextValue => {
   // resolution cache, folder sequencing) belongs to ONE space — drop it all,
   // then load the new space's structure and re-apply the location.
   useEffect(() => {
+    const bootSequence = ++spaceBootSeq.current
+    // On the first mount revision zero is the snapshot/stream baseline, even if
+    // the EventSource opened before this child effect ran. On a space switch the
+    // currently-rendered revision belongs to the OLD space; wait for the new
+    // stream's later revision instead of reconciling against the wrong socket.
+    const baseline = initializedSpaceRef.current ? connectionRevision : 0
+
+    initializedSpaceRef.current = true
+    heldWindowReconciliationRef.current = observeHeldWindowConnection(
+      beginHeldWindowReconciliation(baseline),
+      connectionRevision,
+    ).state
     spaceRef.current = space
     readyRef.current = false
     treeFailedRef.current = false
@@ -576,6 +776,8 @@ export const useNotesState = (): NotesContextValue => {
     setTree(null)
     setTreeLoaded(false)
     setFolderNotes(new Map())
+    seenRef.current = new Map()
+    removedSeenIdsRef.current.clear()
     setSeen(new Map())
     // Tree (sidebar) and reader (the URL's target) are independent — boot them in
     // PARALLEL so the reader never waits on the tree. Serializing these was the
@@ -583,9 +785,20 @@ export const useNotesState = (): NotesContextValue => {
     // before applyLocation flipped to the note (#65 no-flicker). readyRef flips
     // after the initial applyLocation so the location effect doesn't double-fire.
     void loadTree()
-    void applyLocation(window.location.pathname).then(() => {
+    const finishBoot = () => {
+      if (spaceBootSeq.current !== bootSequence || spaceRef.current !== space) {
+        return
+      }
       readyRef.current = true
-    })
+      const decision = markHeldWindowsReady(heldWindowReconciliationRef.current)
+
+      heldWindowReconciliationRef.current = decision.state
+      if (decision.reload) {
+        void refreshData()
+      }
+    }
+
+    void applyLocation(window.location.pathname).then(finishBoot, finishBoot)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [space])
 
@@ -629,6 +842,7 @@ export const useNotesState = (): NotesContextValue => {
     let destFolders = new Set<string>()
     const off = subscribe((event) => {
       if (event.type === STORE_EVENT.CHANGED) {
+        forget(event.removed)
         if (!readyRef.current || treeFailedRef.current) {
           return
         }
@@ -675,7 +889,7 @@ export const useNotesState = (): NotesContextValue => {
         clearTimeout(timer)
       }
     }
-  }, [subscribe, loadTree, refreshData, applyLocation])
+  }, [subscribe, loadTree, refreshData, applyLocation, forget])
 
   const value: NotesContextValue = {
     tree,

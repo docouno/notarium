@@ -318,6 +318,12 @@ describe('input validation (poka-yoke + #50/#54 fields)', () => {
       true,
     )
     expect(RenameFolderInputSchema.safeParse({ folder: 'docs/old', name: '' }).success).toBe(false) // name non-empty
+    expect(RenameFolderInputSchema.safeParse({ folder: 'docs/old', name: 'a/b' }).success).toBe(
+      false,
+    )
+    expect(RenameFolderInputSchema.safeParse({ folder: 'docs/old', name: 'a\\b' }).success).toBe(
+      false,
+    )
     expect(RenameFolderInputSchema.safeParse({ folder: 'docs/old' }).success).toBe(false) // name required
     // Shared echo: the folder's new space-relative path + optional space.
     expect(FolderReorgOutputSchema.safeParse({ path: 'archive/old' }).success).toBe(true)
@@ -347,6 +353,13 @@ describe('input validation (poka-yoke + #50/#54 fields)', () => {
     expect(RenameProjectInputSchema.safeParse({ project: 'team/old', slug: '' }).success).toBe(
       false,
     ) // slug non-empty if present
+    const lone = String.fromCharCode(0xd800)
+
+    for (const displayName of ['   ', 'bad\nname', `bad${lone}`, 'x'.repeat(201)]) {
+      expect(RenameProjectInputSchema.safeParse({ project: 'team/old', displayName }).success).toBe(
+        false,
+      )
+    }
     expect(
       RenameProjectOutputSchema.safeParse({ id: 'p1', handle: 'team/new', displayName: 'New Name' })
         .success,

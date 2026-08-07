@@ -12,7 +12,7 @@ import {
   type ToolName,
   tools,
 } from '@notarium/contract/tools'
-import { slugify } from '@notarium/core'
+import { asciiSlug } from '@notarium/core'
 
 import { type AgentSessions, type BoundAgentSession, createAgentSessions } from '../agentSessions'
 import { type AuthService } from '../auth'
@@ -253,8 +253,8 @@ export const createGateway = (deps: GatewayDeps): McpGateway => {
         // Alias-history pass, consulted ONLY after the current-slug pass misses:
         // current > alias, so a stale alias never shadows a live project's current slug.
         const byAlias = (slug: string, rows: readonly ProjectRecord[]): ProjectRecord[] => {
-          const key = slugify(slug)
-          return key ? rows.filter((r) => r.aliases.some((a) => slugify(a) === key)) : []
+          const key = asciiSlug(slug)
+          return key ? rows.filter((r) => r.aliases.some((a) => asciiSlug(a) === key)) : []
         }
         const slash = handle.indexOf('/')
 
@@ -264,10 +264,10 @@ export const createGateway = (deps: GatewayDeps): McpGateway => {
           // project" (anti-enumeration).
           const spaceId = deps.spaces.resolveId(handle.slice(0, slash))
           // Slugify the input into the same space as stored slugs (mint/rename always
-          // slugify), so a non-normalised handle still hits the live current holder
+          // slug the handle axis), so a non-normalised handle still hits the live current holder
           // FIRST — else current > alias could be violated and a foreign project's
           // alias shadow it.
-          const slug = slugify(handle.slice(slash + 1))
+          const slug = asciiSlug(handle.slice(slash + 1))
 
           if (!spaceId || !reachable.includes(spaceId)) {
             throw new ToolFailure(`no such project: ${handle}`)
@@ -293,7 +293,7 @@ export const createGateway = (deps: GatewayDeps): McpGateway => {
         // project's handle collapses to just `<space>` — a reachable space whose root
         // is marked; gather both and dedup. Slug is normalised; the space/root check
         // stays on the raw token (a space slug is its own canonical form).
-        const bareSlug = slugify(handle)
+        const bareSlug = asciiSlug(handle)
         const bySlug = await projects.findBySlug(bareSlug, reachable)
         const bareSpaceId = deps.spaces.resolveId(handle)
         const root =

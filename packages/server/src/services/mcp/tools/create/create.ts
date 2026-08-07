@@ -11,7 +11,7 @@ import {
 } from '@notarium/contract/tools'
 import { applyLinks, deriveNoteTitle, type LinkSpec, sha256Hex } from '@notarium/core'
 
-import { safeRelPath } from '../../../../libs/relPath'
+import { safeRelAddress } from '../../../../libs/relPath'
 import { can } from '../../../authz'
 import { type ProjectRecord } from '../../../metaDb'
 import { type Ctx, type Handler, toolErrorMessage, ToolFailure } from '../../gateway'
@@ -77,7 +77,7 @@ const createOneNote = async (
   // path verbatim doesn't double the project prefix into a phantom folder. Strip a
   // leading slash (mirrors move_note) before safeRelPath, which fails closed on an
   // absolute path and rejects traversal/.notarium before the engine.
-  const rel = path ? safeRelPath(path.replace(/^\/+/, '')) : ''
+  const rel = path ? safeRelAddress(path.replace(/^\/+/, '')) : ''
 
   if (rel === null) {
     throw new ToolFailure(`"${path}" is not a valid folder path inside the project`)
@@ -88,7 +88,7 @@ const createOneNote = async (
   const underProject = rec.path !== '' && (rel === rec.path || rel.startsWith(`${rec.path}/`))
   // Re-vet the COMPOSED path (belt-and-suspenders against a corrupt rec.path).
   const joined = underProject ? rel : [rec.path, rel].filter(Boolean).join('/')
-  const safe = safeRelPath(joined)
+  const safe = safeRelAddress(joined)
 
   if (safe === null) {
     throw new ToolFailure(`"${path}" is not a valid folder path inside the project`)

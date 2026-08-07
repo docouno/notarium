@@ -18,9 +18,10 @@ import {
   isPathUnder,
   type KnowledgeStore,
   STORE_ERROR_REASON,
+  StoreError,
 } from '@notarium/core'
 
-import { safeRelPath } from '../../../../libs/relPath'
+import { safeRelAddress, safeRelPath } from '../../../../libs/relPath'
 import {
   ensureFolderIdentity,
   finalizeFolderMove,
@@ -56,27 +57,49 @@ export const foldersRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
         .code(HTTP_STATUS.BAD_REQUEST)
         .send({ error: body.error.issues[0]?.message || 'bad request' })
     }
-    const path = safeRelPath(body.data.path)
-    const destination = safeRelPath(body.data.destinationPath)
+    const path = safeRelAddress(body.data.path)
+    const destination = safeRelAddress(body.data.destinationPath)
 
     if (path === null || !path || destination === null) {
       return reply.code(HTTP_STATUS.BAD_REQUEST).send({ error: 'bad folder path' })
     }
     const store = await spaceStoreFor(req)
-    await store.move(moveFolderToDomain(path, destination), {
-      finalize: () =>
-        finalizeFolderMove(
-          {
-            projects,
-            folders,
-            markerStore,
-            now: () => new Date(),
-            onError: (stage, err) =>
-              req.log.error({ err }, `[folders] move finalize ${stage} failed`),
-          },
-          { space: req.spaceId, oldPath: path, newPath: destination },
-        ),
-    })
+    const history = {
+      prepare: async () => {
+        const registered = projects
+          ? (await projects.listForSpace(req.spaceId)).some((project) => project.path === path)
+          : false
+
+        if (!registered && !(await folderExistsIn(store, path))) {
+          const err = new StoreError('# Move Failed: folder not found')
+          err.isToolError = true
+          throw err
+        }
+        if (projects && folders) {
+          await ensureFolderIdentity(
+            { projects, folders, markerStore, now: () => new Date() },
+            { space: req.spaceId, folderPath: path },
+          )
+        }
+      },
+      ...(projects && folders
+        ? {
+            finalize: () =>
+              finalizeFolderMove(
+                {
+                  projects,
+                  folders,
+                  markerStore,
+                  now: () => new Date(),
+                  onError: (stage, err) =>
+                    req.log.error({ err }, `[folders] move finalize ${stage} failed`),
+                },
+                { space: req.spaceId, oldPath: path, newPath: destination },
+              ),
+          }
+        : {}),
+    }
+    await store.move(moveFolderToDomain(path, destination), history)
 
     return MoveResponseSchema.parse({ ok: true })
   })
@@ -118,7 +141,7 @@ export const foldersRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
         },
       })
     } catch (err) {
-      if (err === collision) {
+      if (err === collision || (err as { isToolError?: boolean }).isToolError) {
         return reply
           .code(HTTP_STATUS.CONFLICT)
           .send({ error: 'a folder with that name already exists' })
@@ -132,7 +155,7 @@ export const foldersRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
   // Delete a whole folder subtree (fenced note tombstones + dirs, then derived registries).
   // Idempotent: a missing folder deletes nothing and still answers ok.
   app.delete(s('/folders'), { config: authz('space:write', 'space') }, async (req, reply) => {
-    const path = safeRelPath((req.query as { path?: string }).path ?? '')
+    const path = safeRelAddress((req.query as { path?: string }).path ?? '')
 
     if (path === null || !path) {
       return reply.code(HTTP_STATUS.BAD_REQUEST).send({ error: 'bad folder path' })
@@ -208,7 +231,7 @@ export const foldersRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
       return notFound(reply)
     }
     // '' = the space root (a legal folder); otherwise a normalised relative path.
-    const folderPath = body.data.folderPath === '' ? '' : safeRelPath(body.data.folderPath)
+    const folderPath = body.data.folderPath === '' ? '' : safeRelAddress(body.data.folderPath)
 
     if (folderPath === null) {
       return reply.code(HTTP_STATUS.BAD_REQUEST).send({ error: 'bad folder path' })

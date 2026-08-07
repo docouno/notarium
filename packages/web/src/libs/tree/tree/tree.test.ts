@@ -122,9 +122,69 @@ describe('canonicalFolderPath (#100 phase 3 — old folder URL → current path 
     ).toBe('Орбита/Спутник')
   })
 
+  // #296 — the CONSUMING half of the folder path-history. The producer (`nextPathAliases`)
+  // retires `📥` into the history because `namePathKey('📥')` is non-empty, and every
+  // wikilink surface resolves `[[📥/note]]` after the rename. This surface keyed on the
+  // bare slug, which is '' for such a name, so it dropped exactly those aliases: the link
+  // worked and the bookmark 404'd.
+  it('redirects a folder whose name has no romanisable letters', () => {
+    expect(canonicalFolderPath('📥', [f('Inbox', ['📥'])])).toBe('Inbox')
+    expect(canonicalFolderPath('第三季度', [f('Q3', ['第三季度'])])).toBe('Q3')
+  })
+
+  it('rewrites a descendant under such a folder, and keeps the RAW target', () => {
+    expect(canonicalFolderPath('📥/архив', [f('Inbox', ['📥']), f('Inbox/архив')])).toBe(
+      'Inbox/архив',
+    )
+  })
+
+  it('does not merge two letterless folder aliases onto one key', () => {
+    // Both alias keys are '' under the bare slug, so whichever folder came first
+    // answered for both — a bookmark to `📥` could land in `Archive`.
+    const folders = [f('Inbox', ['📥']), f('Archive', ['🗄️'])]
+    expect(canonicalFolderPath('📥', folders)).toBe('Inbox')
+    expect(canonicalFolderPath('🗄️', folders)).toBe('Archive')
+  })
+
   it('returns null for a live folder (no redirect) or an unknown path', () => {
     expect(canonicalFolderPath('Орбита', [f('Орбита', ['Космос'])])).toBeNull() // already current
     expect(canonicalFolderPath('nowhere', [f('a', ['b'])])).toBeNull()
+  })
+
+  it('redirects a key-equivalent stale spelling to the current raw path', () => {
+    expect(canonicalFolderPath('Inbox', [f('inbox')])).toBe('inbox')
+    expect(canonicalFolderPath('Cafe\u0301', [f('Café')])).toBe('Café')
+    expect(canonicalFolderPath('inbox', [f('inbox')])).toBeNull()
+  })
+
+  it('does not redirect either of two key-equivalent folders that both exist raw', () => {
+    expect(canonicalFolderPath('Inbox', [f('Inbox'), f('inbox')])).toBeNull()
+    expect(canonicalFolderPath('inbox', [f('inbox'), f('Inbox')])).toBeNull()
+  })
+
+  it('does not let an alias answer an ambiguous current-name key', () => {
+    const folders = [f('Inbox'), f('inbox'), f('Archive', ['INBOX'])]
+    expect(canonicalFolderPath('INBOX', folders)).toBeNull()
+    expect(canonicalFolderPath('INBOX', [...folders].reverse())).toBeNull()
+  })
+
+  it('does not choose between two folders that claim the same retired path', () => {
+    const folders = [f('Inbox', ['Old']), f('Archive', ['old'])]
+
+    expect(canonicalFolderPath('OLD', folders)).toBeNull()
+    expect(canonicalFolderPath('OLD', [...folders].reverse())).toBeNull()
+  })
+
+  it('falls back to a case/NFC-renamed parent for a missing descendant', () => {
+    expect(canonicalFolderPath('Inbox/gone', [f('inbox')])).toBe('inbox')
+    expect(canonicalFolderPath('Cafe\u0301/gone', [f('Café')])).toBe('Café')
+    expect(canonicalFolderPath('inbox/gone', [f('inbox')])).toBeNull()
+  })
+
+  it('does not choose between ambiguous current descendants by input order', () => {
+    const folders = [f('new', ['old']), f('new/Sub'), f('new/sub')]
+    expect(canonicalFolderPath('old/SUB', folders)).toBe('new')
+    expect(canonicalFolderPath('old/SUB', [...folders].reverse())).toBe('new')
   })
 
   it('never shadows a LIVE folder by another folder’s alias', () => {

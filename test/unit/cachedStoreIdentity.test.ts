@@ -205,6 +205,378 @@ describe('CachedStore + bare engine — identity (#51)', () => {
     })
   })
 
+  it('publishes an ordinary create only after its global identity route is durable', async () => {
+    const files = new Map<string, string>()
+    const bare = makeBareEngine(files)
+    const durable = new Map<string, IdentityRecord>()
+    const flushEntered = deferred()
+    const releaseFlush = deferred()
+    const persistence: IdentityPersistence = {
+      init: async () => {},
+      loadAll: async () => [],
+      upsertMany: async (records) => {
+        flushEntered.resolve()
+        await releaseFlush.promise
+        for (const record of records) {
+          durable.set(record.id, { ...record })
+        }
+      },
+      findById: async (id) => durable.get(id) ?? null,
+      close: async () => {},
+    }
+    const store = new CachedStore({
+      inner: bare.engine,
+      identityPersistence: persistence,
+      pollIntervalMs: 0,
+      relationType: 'links_to',
+      readBody: async (fp) => files.get(fp) ?? null,
+      now: () => new Date('2026-06-11T12:00:00Z'),
+    })
+    await store.start()
+    const published: Array<{ id: string; durable: boolean }> = []
+
+    store.subscribe((event) => {
+      if (event.type === 'changed') {
+        for (const id of event.upserts) {
+          published.push({ id, durable: durable.has(id) })
+        }
+      }
+    })
+    const writing = store.write({ title: 'Ordered Create', content: 'body' })
+
+    await flushEntered.promise
+    expect(published).toEqual([])
+    releaseFlush.resolve()
+    const result = await writing
+
+    expect(published).toEqual([{ id: result.id!, durable: true }])
+    store.stop()
+    await store.settle()
+  })
+
+  it('does not publish an ordinary create when identity durability fails', async () => {
+    const files = new Map<string, string>()
+    const bare = makeBareEngine(files)
+    const persistence: IdentityPersistence = {
+      init: async () => {},
+      loadAll: async () => [],
+      upsertMany: async () => {
+        throw new Error('meta db unavailable')
+      },
+      findById: async () => null,
+      close: async () => {},
+    }
+    const store = new CachedStore({
+      inner: bare.engine,
+      identityPersistence: persistence,
+      pollIntervalMs: 0,
+      relationType: 'links_to',
+      readBody: async (fp) => files.get(fp) ?? null,
+      now: () => new Date('2026-06-11T12:00:00Z'),
+    })
+    await store.start()
+    const events: StoreEvent[] = []
+
+    store.subscribe((event) => events.push(event))
+    await expect(store.write({ title: 'Unpublished Create', content: 'body' })).rejects.toThrow(
+      'meta db unavailable',
+    )
+
+    expect(events.filter((event) => event.type === 'changed')).toEqual([])
+    store.stop()
+    await store.settle()
+  })
+
+  it('blocks concurrent list and search from a create until its route is durable', async () => {
+    const files = new Map<string, string>()
+    const bare = makeBareEngine(files)
+    bare.engine.search = async () =>
+      [...files.keys()].map((filePath) => ({ filePath, title: 'Ordered Create', snippet: 'body' }))
+    const durable = new Map<string, IdentityRecord>()
+    const flushEntered = deferred()
+    const releaseFlush = deferred()
+    let gate = false
+    const persistence: IdentityPersistence = {
+      init: async () => {},
+      loadAll: async () => [],
+      upsertMany: async (records) => {
+        if (gate && records.some((record) => record.filePath === 'ordered-create.md')) {
+          gate = false
+          flushEntered.resolve()
+          await releaseFlush.promise
+        }
+        for (const record of records) {
+          durable.set(record.id, { ...record })
+        }
+      },
+      findById: async (id) => durable.get(id) ?? null,
+      close: async () => {},
+    }
+    const store = new CachedStore({
+      inner: bare.engine,
+      identityPersistence: persistence,
+      pollIntervalMs: 0,
+    })
+
+    await store.start()
+    gate = true
+    const writing = store.write({ title: 'Ordered Create', content: 'body' })
+
+    await flushEntered.promise
+    let listSettled = false
+    let searchSettled = false
+    let previewSettled = false
+    let historySettled = false
+    const pendingId = frontmatterValue(files.get('ordered-create.md')!, NOTE_ID_FRONTMATTER_KEY)!
+    const listing = store.list().then((notes) => {
+      listSettled = true
+      return notes
+    })
+    const searching = store.search('ordered').then((hits) => {
+      searchSettled = true
+      return hits
+    })
+    const previewing = store.preview(pendingId).then((preview) => {
+      previewSettled = true
+      return preview
+    })
+    const history = store.revisionsSince(null, 10).then((result) => {
+      historySettled = true
+      return result
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(listSettled).toBe(false)
+    expect(searchSettled).toBe(false)
+    expect(previewSettled).toBe(false)
+    expect(historySettled).toBe(false)
+    expect(durable.size).toBe(0)
+    releaseFlush.resolve()
+    const created = await writing
+
+    expect(await listing).toContainEqual(expect.objectContaining({ id: created.id }))
+    expect(await searching).toContainEqual(expect.objectContaining({ id: created.id }))
+    expect(await previewing).toMatchObject({ snippet: 'body' })
+    await history
+    expect(historySettled).toBe(true)
+    expect(durable.has(created.id!)).toBe(true)
+    store.stop()
+    await store.settle()
+  })
+
+  it('blocks the poll listDirs window until its provisional id is durable', async () => {
+    const files = new Map<string, string>()
+    const bare = makeBareEngine(files)
+    const durable = new Map<string, IdentityRecord>()
+    const persistence: IdentityPersistence = {
+      init: async () => {},
+      loadAll: async () => [],
+      upsertMany: async (records) => {
+        for (const record of records) {
+          durable.set(record.id, { ...record })
+        }
+      },
+      findById: async (id) => durable.get(id) ?? null,
+      close: async () => {},
+    }
+    const store = new CachedStore({
+      inner: bare.engine,
+      identityPersistence: persistence,
+      pollIntervalMs: 0,
+    })
+
+    await store.start()
+    files.set('external.md', '# external')
+    const dirsEntered = deferred()
+    const releaseDirs = deferred()
+
+    bare.engine.listDirs = async () => {
+      dirsEntered.resolve()
+      await releaseDirs.promise
+      return []
+    }
+    const reconciling = store.reconcile()
+
+    await dirsEntered.promise
+    let settled = false
+    const listing = store.list().then((notes) => {
+      settled = true
+      return notes
+    })
+
+    await Promise.resolve()
+    expect(settled).toBe(false)
+    expect(durable.size).toBe(0)
+    releaseDirs.resolve()
+    await reconciling
+    const external = (await listing).find((note) => note.filePath === 'external.md')
+
+    expect(external?.id).toBeTruthy()
+    expect(durable.has(external!.id!)).toBe(true)
+    store.stop()
+    await store.settle()
+  })
+
+  it('keeps a bulk-created id off list until an interactive durability flush completes', async () => {
+    const files = new Map<string, string>()
+    const bare = makeBareEngine(files)
+    const durable = new Map<string, IdentityRecord>()
+    const flushEntered = deferred()
+    const releaseFlush = deferred()
+    let gate = false
+    const persistence: IdentityPersistence = {
+      init: async () => {},
+      loadAll: async () => [],
+      upsertMany: async (records) => {
+        if (gate) {
+          gate = false
+          flushEntered.resolve()
+          await releaseFlush.promise
+        }
+        for (const record of records) {
+          durable.set(record.id, { ...record })
+        }
+      },
+      findById: async (id) => durable.get(id) ?? null,
+      close: async () => {},
+    }
+    const store = new CachedStore({
+      inner: bare.engine,
+      identityPersistence: persistence,
+      pollIntervalMs: 0,
+    })
+
+    await store.start()
+    store.beginBulk()
+    gate = true
+    const created = await store.write({ title: 'Bulk Pending', content: 'body' })
+    let settled = false
+    const listing = store.list().then((notes) => {
+      settled = true
+      return notes
+    })
+
+    await flushEntered.promise
+    expect(settled).toBe(false)
+    expect(durable.has(created.id!)).toBe(false)
+    releaseFlush.resolve()
+    expect(await listing).toContainEqual(expect.objectContaining({ id: created.id }))
+    expect(durable.has(created.id!)).toBe(true)
+    await store.endBulk()
+    store.stop()
+    await store.settle()
+  })
+
+  it('auto-retry publishes a repair for a create whose first durability flush failed', async () => {
+    const files = new Map<string, string>()
+    const bare = makeBareEngine(files)
+    const durable = new Map<string, IdentityRecord>()
+    let healthy = false
+    const persistence: IdentityPersistence = {
+      init: async () => {},
+      loadAll: async () => [],
+      upsertMany: async (records) => {
+        if (!healthy) {
+          throw new Error('meta down')
+        }
+        for (const record of records) {
+          durable.set(record.id, { ...record })
+        }
+      },
+      findById: async (id) => durable.get(id) ?? null,
+      close: async () => {},
+    }
+    const store = new CachedStore({
+      inner: bare.engine,
+      identityPersistence: persistence,
+      pollIntervalMs: 0,
+    })
+
+    await store.start()
+    const changed: StoreEvent[] = []
+
+    store.subscribe((event) => {
+      if (event.type === 'changed') {
+        changed.push(event)
+      }
+    })
+    await expect(store.write({ title: 'Repair Create', content: 'body' })).rejects.toThrow(
+      'meta down',
+    )
+    const id = frontmatterValue(files.get('repair-create.md')!, NOTE_ID_FRONTMATTER_KEY)!
+
+    expect(changed).toEqual([])
+    healthy = true
+    await vi.waitFor(() => expect(durable.has(id)).toBe(true), { timeout: 2_000 })
+    await vi.waitFor(
+      () =>
+        expect(changed).toContainEqual(
+          expect.objectContaining({ type: 'changed', upserts: expect.arrayContaining([id]) }),
+        ),
+      { timeout: 2_000 },
+    )
+    store.stop()
+    await store.settle()
+  })
+
+  it('auto-retry publishes a repair for a failed lazy provisional-to-durable rekey', async () => {
+    const durableId = 'durable-id-a1'
+    const raw = `---\n${NOTE_ID_FRONTMATTER_KEY}: ${durableId}\n---\n# a\n\nbody`
+    const files = new Map([['a.md', raw]])
+    const bare = makeBareEngine(files)
+    const durable = new Map<string, IdentityRecord>()
+    let rejectDurable = false
+    const persistence: IdentityPersistence = {
+      init: async () => {},
+      loadAll: async () => [],
+      upsertMany: async (records) => {
+        if (rejectDurable && records.some((record) => record.id === durableId)) {
+          throw new Error('meta down')
+        }
+        for (const record of records) {
+          durable.set(record.id, { ...record })
+        }
+      },
+      findById: async (id) => durable.get(id) ?? null,
+      close: async () => {},
+    }
+    const store = new CachedStore({
+      inner: bare.engine,
+      identityPersistence: persistence,
+      pollIntervalMs: 0,
+      // No readBody: force the P→D adoption through the lazy read path.
+    })
+
+    await store.start()
+    const provisionalId = (await store.list())[0].id!
+    const changed: StoreEvent[] = []
+
+    store.subscribe((event) => {
+      if (event.type === 'changed') {
+        changed.push(event)
+      }
+    })
+    rejectDurable = true
+    await expect(store.read(provisionalId)).rejects.toThrow('meta down')
+    expect(changed).toEqual([])
+
+    rejectDurable = false
+    await vi.waitFor(() => expect(durable.has(durableId)).toBe(true), { timeout: 2_000 })
+    await vi.waitFor(
+      () =>
+        expect(changed).toContainEqual(
+          expect.objectContaining({
+            type: 'changed',
+            upserts: expect.arrayContaining([durableId]),
+            removed: expect.arrayContaining([provisionalId]),
+          }),
+        ),
+      { timeout: 2_000 },
+    )
+    store.stop()
+    await store.settle()
+  })
+
   it('rename via originalId keeps the id; the engine is spoken to in storage keys', async () => {
     const { store, writes } = await make(new Map())
     const res = await store.write({ title: 'New Note', content: 'hi' })
@@ -1029,6 +1401,57 @@ describe('CachedStore + bare engine — identity (#51)', () => {
     expect(await store.list()).toMatchObject([{ id: durableId, filePath: 'a.md' }])
     await store.remove(durableId, { principal: 'test' })
     expect(await store.list()).toEqual([])
+  })
+
+  it('announces a lazy provisional-id rekey only after its global route is durable', async () => {
+    const durableId = 'durable-id-a1'
+    const raw = `---\n${NOTE_ID_FRONTMATTER_KEY}: ${durableId}\n---\n# a\n\nbody`
+    const files = new Map([['a.md', raw]])
+    const bare = makeBareEngine(files)
+    const { persistence, durable } = makeIdentityPersistence()
+    const persist = persistence.upsertMany.bind(persistence)
+    let rejectDurable = false
+
+    persistence.upsertMany = async (records) => {
+      if (rejectDurable && records.some((record) => record.id === durableId)) {
+        throw new Error('meta db unavailable')
+      }
+      await persist(records)
+    }
+    const store = new CachedStore({
+      inner: bare.engine,
+      identityPersistence: persistence,
+      pollIntervalMs: 0,
+      relationType: 'links_to',
+      // No raw-body capability: the frontmatter id is discovered lazily by read().
+      now: () => new Date('2026-06-11T12:00:00Z'),
+    })
+
+    await store.start()
+    const provisionalId = (await store.list())[0].id!
+    const changed: StoreEvent[] = []
+
+    store.subscribe((event) => {
+      if (event.type === 'changed') {
+        // The callback itself is the publication boundary: the global route must
+        // already answer by the time any client can observe the new id.
+        expect(durable.has(durableId)).toBe(true)
+        changed.push(event)
+      }
+    })
+    rejectDurable = true
+    await expect(store.read(provisionalId)).rejects.toThrow('meta db unavailable')
+    expect(durable.has(durableId)).toBe(false)
+    expect(changed).toEqual([])
+
+    rejectDurable = false
+    await expect(store.read(provisionalId)).resolves.toMatchObject({
+      id: durableId,
+      filePath: 'a.md',
+    })
+    expect(changed).toContainEqual(
+      expect.objectContaining({ type: 'changed', upserts: [durableId], removed: [provisionalId] }),
+    )
   })
 
   it.each([

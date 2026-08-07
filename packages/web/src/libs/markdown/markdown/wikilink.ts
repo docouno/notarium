@@ -13,21 +13,13 @@
 // code context is preserved for free, and the label is inline-parsed so `**bold**` /
 // `` `code` `` inside it still render. Render-only: the source bytes never change.
 import type { RendererThis, TokenizerAndRendererExtension, TokenizerThis, Tokens } from 'marked'
-
-// Non-greedy so the FIRST `]]` closes. Target = up to `|` or `]` (no pipe/bracket);
-// optional label = up to `]`. `[^\]]` in the label can't contain `]`, so a label can
-// never itself hold a complete `[[x]]` — no pathological nesting.
-//
-// Known limitation: the `|` separator is also GFM's table-cell delimiter, and this
-// extension runs AFTER the block-level table tokenizer has split a row on unescaped
-// `|`. So `| [[t|label]] |` bisects at the pipe. That is spec-correct (an unescaped
-// `|` in a cell IS a delimiter — GitHub/Obsidian split the same way); the canonical
-// fix is to escape it — `[[t\|label]]` — which stays in one cell and resolves here.
-const WIKI_LINK = /^\[\[([^\]|]+?)(?:\|([^\]]+?))?\]\]/
+import { normalizeWikilinkTarget, wikilinkPrefix } from '@notarium/core'
+import { slugify } from '@notarium/core/slug'
 
 type WikiLinkToken = Tokens.Generic & {
   type: 'wikiLink'
-  target: string
+  target?: string
+  fragment?: string
   tokens: Tokens.Generic[]
 }
 
@@ -68,17 +60,21 @@ export const wikiLinkExtension: TokenizerAndRendererExtension = {
     return i === -1 ? undefined : i
   },
   tokenizer(this: TokenizerThis, src: string) {
-    const m = WIKI_LINK.exec(src)
+    const match = wikilinkPrefix(src)
 
-    if (!m) {
+    if (!match) {
       return undefined
     }
-    const target = m[1].trim()
+    const { target, label } = match
+    const normalized = normalizeWikilinkTarget(target)
+    const localFragment = target.startsWith('#') ? slugify(target.slice(1)) || 'section' : undefined
 
-    if (!target) {
+    // A fragment-only wikilink is an in-page jump, not a missing note. Any other
+    // target that normalizes to no note address (`[[.md]]`) stays literal instead
+    // of becoming a dead #wiki anchor that can only produce REST 400.
+    if (!normalized && !localFragment) {
       return undefined
-    } // `[[ ]]` — no target; leave it literal, not a dead anchor
-    const label = (m[2] ?? m[1]).trim()
+    }
     // Inline-parse the visible label (so emphasis / inline code inside it render), then
     // strip anything that would nest an anchor or a raw tag inside the wiki anchor.
     //
@@ -98,11 +94,19 @@ export const wikiLinkExtension: TokenizerAndRendererExtension = {
       this.lexer.state.inLink = inLink
       this.lexer.state.inRawBlock = inRawBlock
     }
-    const token: WikiLinkToken = { type: 'wikiLink', raw: m[0], target, tokens }
+    const token: WikiLinkToken = {
+      type: 'wikiLink',
+      raw: match.raw,
+      ...(normalized ? { target } : { fragment: localFragment }),
+      tokens,
+    }
     return token
   },
   renderer(this: RendererThis, token: Tokens.Generic) {
     const t = token as WikiLinkToken
-    return `<a href="#wiki/${encodeURIComponent(t.target)}">${this.parser.parseInline(t.tokens)}</a>`
+    const href = t.fragment
+      ? `#${encodeURIComponent(t.fragment)}`
+      : `#wiki/${encodeURIComponent(t.target!)}`
+    return `<a href="${href}">${this.parser.parseInline(t.tokens)}</a>`
   },
 }

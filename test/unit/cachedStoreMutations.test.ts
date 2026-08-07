@@ -1,10 +1,20 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  promises as fsPromises,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   CachedStore,
+  encodeWikilinkIdentity,
+  idToSlug,
   InMemoryRevisionPersistence,
   type KnowledgeStore,
   type MoveInput,
@@ -722,6 +732,61 @@ describe('CachedStore mutation boot checkpoint', () => {
     }
   })
 
+  it('publishes idless link identities before releasing a queued phase-1 read', async () => {
+    const notesDir = mkdtempSync(join(tmpdir(), 'notarium-phase-read-'))
+    writeFileSync(join(notesDir, 'external.md'), '---\ntitle: External\n---\n\nidless body')
+    const inner = createNotariumStore({
+      mounts: [{ class: 'user-doc', dir: notesDir, prefix: '' }],
+    })
+    let store: CachedStore | undefined
+
+    try {
+      const listEntered = deferred()
+      const releaseList = deferred()
+      const list = inner.list.bind(inner)
+      let gated = true
+
+      inner.list = async () => {
+        const result = await list()
+
+        if (gated) {
+          gated = false
+          listEntered.resolve()
+          await releaseList.promise
+        }
+
+        return result
+      }
+      store = new CachedStore({
+        inner,
+        pollIntervalMs: 0,
+        readBody: (filePath) => readFile(join(notesDir, filePath), 'utf8'),
+      })
+      const boot = store.start()
+
+      await listEntered.promise
+      const phaseOneId = (await store.list()).find((note) => note.filePath === 'external.md')?.id
+
+      if (!phaseOneId) {
+        throw new Error('phase-1 note must be visible')
+      }
+      const reading = store.read(phaseOneId)
+
+      await nextTurn()
+      releaseList.resolve()
+      await boot
+      await expect(reading).resolves.toMatchObject({
+        id: phaseOneId,
+        filePath: 'external.md',
+        content: 'idless body',
+      })
+    } finally {
+      store?.stop()
+      await store?.settle()
+      rmSync(notesDir, { recursive: true, force: true })
+    }
+  })
+
   it('reads empty-folder truth from the engine until the directory cache is seeded', async () => {
     const inner = new InMemoryStore({ space: 'main', notes: [] })
     const revisions = new InMemoryRevisionPersistence()
@@ -743,6 +808,25 @@ describe('CachedStore mutation boot checkpoint', () => {
     release.resolve()
     await boot
     expect(await store.listDirs()).toContain('empty-project')
+    store.stop()
+    await store.settle()
+  })
+
+  it('reconciles external creation and deletion of an empty folder', async () => {
+    const inner = new InMemoryStore({ space: 'main', notes: [] })
+    const store = new CachedStore({ inner, pollIntervalMs: 0 })
+
+    await store.start()
+    expect(await store.listDirs()).toEqual([])
+
+    await inner.makeDir!('external-empty')
+    await store.reconcile()
+    expect(await store.listDirs()).toContain('external-empty')
+
+    await inner.removeDir!('external-empty')
+    await store.reconcile()
+    expect(await store.listDirs()).not.toContain('external-empty')
+
     store.stop()
     await store.settle()
   })
@@ -1082,6 +1166,111 @@ describe('CachedStore external identity checkpoint', () => {
 })
 
 describe('CachedStore reconcile ordering', () => {
+  it('re-derives folder-history winners on every local directory-context mutation', async () => {
+    const inner = new InMemoryStore({ space: 'main', notes: [] })
+    const store = new CachedStore({
+      inner,
+      pollIntervalMs: 0,
+      folderAliases: async () => [{ current: 'A', alias: 'Old' }],
+    })
+
+    await store.start()
+
+    try {
+      const target = await store.write({ title: 'Note', directory: 'A', content: 'target' })
+      const decoy = await store.write({ title: 'Note', directory: '0', content: 'decoy' })
+      const source = await store.write({ title: 'Source', content: '[[Old/Note]]' })
+      const targetOfSource = async () =>
+        (await store.graph()).links.find((link) => link.source === source.id)?.target
+
+      expect(await targetOfSource()).toBe(target.id)
+      await store.makeDir!('Old')
+      expect(await targetOfSource()).toBe(decoy.id)
+      await store.removeDir!('Old')
+      expect(await targetOfSource()).toBe(target.id)
+
+      await store.write({ title: 'Keep', directory: 'Old', content: 'body' })
+      expect(await targetOfSource()).toBe(decoy.id)
+    } finally {
+      store.stop()
+      await store.settle()
+    }
+  })
+
+  it('refreshes folder history before publishing an empty-folder move ghost', async () => {
+    const inner = new InMemoryStore({ space: 'main', notes: [] })
+    let aliases: Array<{ current: string; alias: string }> = []
+    await inner.makeDir!('old')
+    const store = new CachedStore({
+      inner,
+      pollIntervalMs: 0,
+      folderAliases: async () => aliases,
+    })
+
+    await store.start()
+
+    try {
+      await store.write({ title: 'Source', content: '[[old/Future]]' })
+      expect((await store.graph()).nodes).toContainEqual(
+        expect.objectContaining({ ghost: true, prefillDirectory: 'old' }),
+      )
+
+      await store.move(
+        { id: 'old', destinationPath: 'new', isDirectory: true },
+        {
+          finalize: async () => {
+            aliases = [{ current: 'new', alias: 'old' }]
+          },
+        },
+      )
+      expect((await store.graph()).nodes).toContainEqual(
+        expect.objectContaining({ ghost: true, prefillDirectory: 'new' }),
+      )
+    } finally {
+      store.stop()
+      await store.settle()
+    }
+  })
+
+  it('re-derives folder-history links when an external empty folder appears or vanishes', async () => {
+    const inner = new InMemoryStore({ space: 'main', notes: [] })
+    const store = new CachedStore({
+      inner,
+      pollIntervalMs: 0,
+      folderAliases: async () => [{ current: 'A', alias: 'Old' }],
+    })
+
+    await store.start()
+
+    try {
+      const target = await store.write({ title: 'Note', directory: 'A', content: 'target' })
+      const decoy = await store.write({ title: 'Note', directory: '0', content: 'decoy' })
+      const source = await store.write({ title: 'Source', content: '[[Old/Note]]' })
+      expect((await store.graph()).links).toContainEqual(
+        expect.objectContaining({ source: source.id, target: target.id }),
+      )
+
+      await inner.makeDir!('Old')
+      await store.reconcile()
+      const shadowed = await store.graph()
+      expect(shadowed.links).not.toContainEqual(
+        expect.objectContaining({ source: source.id, target: target.id }),
+      )
+      expect(shadowed.links).toContainEqual(
+        expect.objectContaining({ source: source.id, target: decoy.id }),
+      )
+
+      await inner.removeDir!('Old')
+      await store.reconcile()
+      expect((await store.graph()).links).toContainEqual(
+        expect.objectContaining({ source: source.id, target: target.id }),
+      )
+    } finally {
+      store.stop()
+      await store.settle()
+    }
+  })
+
   it('refreshes folder aliases only after an older folder finalizer releases its claim', async () => {
     const inner = new InMemoryStore({ space: 'main', notes: [] })
     let aliases: Array<{ current: string; alias: string }> = []
@@ -1122,12 +1311,94 @@ describe('CachedStore reconcile ordering', () => {
       expect(aliasReads).toBe(0)
       releaseFinalize.resolve()
       await Promise.all([moving, reconcile])
-      expect(aliasReads).toBe(1)
+      expect(aliasReads).toBeGreaterThanOrEqual(1)
     } finally {
       releaseFinalize.resolve()
       await Promise.allSettled([moving, reconcile].filter((task) => task !== undefined))
       store.stop()
       await store.settle()
+    }
+  })
+})
+
+describe('CachedStore graph transition publication', () => {
+  it('keeps graphHealth behind a production write until its stable source id is published', async () => {
+    const harness = await createNotariumHarness()
+
+    try {
+      const committed = deferred()
+      const release = deferred()
+      const write = harness.inner.write.bind(harness.inner)
+
+      harness.inner.write = async (input) => {
+        const result = await write(input)
+
+        if (input.id === 'stable-graph-source') {
+          committed.resolve()
+          await release.promise
+        }
+
+        return result
+      }
+      const writing = harness.store.write({
+        id: 'stable-graph-source',
+        title: 'Graph Source',
+        content: '[[Missing Graph Target]]',
+      })
+
+      await committed.promise
+      let settled = false
+      const health = harness.store.graphHealth().then((result) => {
+        settled = true
+        return result
+      })
+
+      await nextTurn()
+      expect(settled).toBe(false)
+      release.resolve()
+      await writing
+      expect((await health).ghosts).toContainEqual(
+        expect.objectContaining({
+          target: 'missing-graph-target',
+          sources: [expect.objectContaining({ id: 'stable-graph-source' })],
+        }),
+      )
+    } finally {
+      await harness.close()
+    }
+  })
+
+  it('keeps graphHealth behind a production delete until its stable tombstone is coherent', async () => {
+    const harness = await createNotariumHarness()
+
+    try {
+      const target = await harness.store.write({ title: 'Graph Victim', content: 'target' })
+      const address = encodeWikilinkIdentity(target.id!)
+
+      await harness.store.write({
+        title: 'Graph Source',
+        content: `[[${address}|Graph Victim]]`,
+      })
+      const gate = gateDeleteRevision(harness.revisions)
+      const deletion = harness.store.remove(target.id!, { principal: 'test' })
+
+      // inner.remove has completed; the awaited tombstone append is now gated.
+      // Neither fresh-graph surface may derive against that physical post-state
+      // while the snapshot/identity projection still describes the pre-state.
+      await gate.entered
+      let settled = false
+      const health = harness.store.graphHealth().then((result) => {
+        settled = true
+        return result
+      })
+
+      await nextTurn()
+      expect(settled).toBe(false)
+      gate.release()
+      await deletion
+      expect((await health).ghosts).toContainEqual(expect.objectContaining({ target: address }))
+    } finally {
+      await harness.close()
     }
   })
 })
@@ -1157,10 +1428,31 @@ for (const [name, createHarness] of variants) {
       return { ...harness, alpha: alpha.id!, beta: beta.id! }
     }
 
+    it('does not dispatch an alternate-spelling folder source to the engine', async () => {
+      const { inner, store } = await setup()
+      const move = vi.spyOn(inner, 'move')
+      const removeDir = vi.spyOn(inner, 'removeDir')
+
+      await expect(
+        store.move({ id: 'FROM', destinationPath: 'moved', isDirectory: true }),
+      ).rejects.toThrow(/source spelling/i)
+      await store.removeDir!('FROM')
+
+      expect(move).not.toHaveBeenCalled()
+      expect(removeDir).not.toHaveBeenCalled()
+      expect(await store.listDirs!()).toContain('from')
+    })
+
     it('orders a gated save before delete, so two successes cannot resurrect the note', async () => {
       const { inner, store, alpha } = await setup()
       const token = (await store.read(alpha)).versionToken
-      const gate = gateWrite(inner, (input) => input.originalId === alpha || input.id === alpha)
+      const gate = gateWrite(
+        inner,
+        (input) =>
+          input.originalId === alpha ||
+          input.originalId === encodeWikilinkIdentity(alpha) ||
+          input.id === alpha,
+      )
       const save = store.write({
         title: 'Alpha',
         content: 'alpha-v2',
@@ -1184,7 +1476,13 @@ for (const [name, createHarness] of variants) {
     it('orders a gated save before a note move and leaves one path with the saved body', async () => {
       const { inner, store, alpha } = await setup()
       const token = (await store.read(alpha)).versionToken
-      const gate = gateWrite(inner, (input) => input.originalId === alpha || input.id === alpha)
+      const gate = gateWrite(
+        inner,
+        (input) =>
+          input.originalId === alpha ||
+          input.originalId === encodeWikilinkIdentity(alpha) ||
+          input.id === alpha,
+      )
       const save = store.write({
         title: 'Alpha',
         content: 'alpha-v2',
@@ -1301,7 +1599,13 @@ for (const [name, createHarness] of variants) {
         content: 'page-v1',
       })
       const token = (await store.read(page.id!)).versionToken
-      const gate = gateWrite(inner, (input) => input.originalId === page.id || input.id === page.id)
+      const gate = gateWrite(
+        inner,
+        (input) =>
+          input.originalId === page.id ||
+          input.originalId === encodeWikilinkIdentity(page.id!) ||
+          input.id === page.id,
+      )
       const pageMove = store.write({
         title: 'Renamed cover',
         directory: 'page-destination',
@@ -1661,7 +1965,13 @@ for (const [name, createHarness] of variants) {
       const { inner, store, alpha, beta } = await setup()
       const alphaToken = (await store.read(alpha)).versionToken
       const betaToken = (await store.read(beta)).versionToken
-      const gate = gateWrite(inner, (input) => input.originalId === alpha || input.id === alpha)
+      const gate = gateWrite(
+        inner,
+        (input) =>
+          input.originalId === alpha ||
+          input.originalId === encodeWikilinkIdentity(alpha) ||
+          input.id === alpha,
+      )
       const write = vi.spyOn(inner, 'write')
       const alphaSave = store.write({
         title: 'Alpha',
@@ -1687,7 +1997,10 @@ for (const [name, createHarness] of variants) {
 
     it('does not serialize independent note deletions through the trash fence', async () => {
       const { inner, store, alpha, beta } = await setup()
-      const gate = gateRemove(inner, (id) => id === alpha || id === 'from/alpha.md')
+      const gate = gateRemove(
+        inner,
+        (id) => id === alpha || id === 'from/alpha.md' || id === encodeWikilinkIdentity(alpha),
+      )
       const alphaDelete = store.remove(alpha, { principal: 'test' })
       await gate.entered
       const betaDelete = store.remove(beta, { principal: 'test' })
@@ -1807,6 +2120,71 @@ for (const [name, createHarness] of variants) {
       expect(new Set(results.map((r) => r.id)).size).toBe(3)
       expect((await store.list()).filter((n) => n.filePath.startsWith('work/plans')).length).toBe(4)
     })
+
+    // #296 — two titles in a script we cannot romanise used to aim at ONE path
+    // (`work/.md`), so the second create was refused as a duplicate of a note whose
+    // title was visibly different, and `uniquify` "worked" onto the meaningless
+    // `work/2.md` (an ASCII counter digit was all that survived the slug).
+    it('two different non-Latin titles are two notes, not a collision', async () => {
+      const { store } = await setup()
+      const cjk = await store.write({ title: '第三季度规划', directory: 'work', content: 'q3' })
+      const heb = await store.write({ title: 'תוכניות לרבעון', directory: 'work', content: 'hb' })
+
+      expect(cjk.filePath).toBe('work/第三季度规划.md')
+      expect(heb.filePath).toBe('work/תוכניות-לרבעון.md')
+      expect((await store.read(cjk.id!)).content).toBe('q3')
+      expect((await store.read(heb.id!)).content).toBe('hb')
+    })
+
+    it('refuses a real non-Latin duplicate, and uniquify lands on a readable name', async () => {
+      const { store } = await setup()
+      const first = await store.write({ title: '第三季度规划', directory: 'work', content: 'q3' })
+
+      await expect(
+        store.write({ title: '第三季度规划', directory: 'work', content: 'intruder' }),
+      ).rejects.toMatchObject({
+        reason: 'note_already_exists',
+        existing: { id: first.id, title: '第三季度规划' },
+      })
+      const second = await store.write({
+        title: '第三季度规划',
+        directory: 'work',
+        content: 'b',
+        ifExists: 'uniquify',
+      })
+
+      expect(second.filePath).toBe('work/第三季度规划-2.md')
+      expect(second.title).toBe('第三季度规划 2')
+      expect((await store.read(first.id!)).content).toBe('q3')
+    })
+
+    it('names a file after the note when the title has no letters, and keeps two apart', async () => {
+      const { store } = await setup()
+      const a = await store.write({ title: '🎉🎉', directory: 'work', content: 'party' })
+      const b = await store.write({ title: '✨✨', directory: 'work', content: 'sparkle' })
+
+      // The id rung: `<id>.md`, never the dot-file `.md` the empty slug used to write.
+      // Through `idToSlug`, not the raw id — an id may open on a dash, and a slug does
+      // not (this assertion was flaky until an id actually did).
+      expect(a.filePath).toBe(`work/${idToSlug(a.id!)}.md`)
+      expect(b.filePath).not.toBe(a.filePath)
+      expect((await store.read(a.id!)).content).toBe('party')
+      expect((await store.read(b.id!)).content).toBe('sparkle')
+    })
+
+    it('an emoji-titled create does not inherit the id of a note titled "Note"', async () => {
+      // The id rung must be settled BEFORE the path is predicted. Predicting `note.md`
+      // first would look the path up in the identity registry and hand the newcomer
+      // the occupant's id — the identity theft #274 closed, through a new door.
+      const { store } = await setup()
+      const note = await store.write({ title: 'Note', directory: 'work', content: 'the real one' })
+      const emoji = await store.write({ title: '🎉', directory: 'work', content: 'party' })
+
+      expect(emoji.id).not.toBe(note.id)
+      expect(emoji.filePath).not.toBe(note.filePath)
+      expect((await store.read(note.id!)).content).toBe('the real one')
+      expect((await store.read(emoji.id!)).content).toBe('party')
+    })
   })
 }
 
@@ -1838,5 +2216,21 @@ describe('CachedStore create collisions — files the index has not seen', () =>
       ifExists: 'uniquify',
     })
     expect(beside.filePath).toBe('work/plans-2.md')
+  })
+
+  it('does not replace a dangling symlink that occupies the destination', async () => {
+    harness = await createNotariumHarness()
+    const { store, notesDir } = harness
+    const claimed = join(notesDir!, 'claimed.md')
+
+    symlinkSync('missing.md', claimed)
+    const readFileSpy = vi.spyOn(fsPromises, 'readFile')
+
+    await expect(store.write({ title: 'Claimed', content: 'intruder' })).rejects.toMatchObject({
+      reason: 'note_already_exists',
+    })
+    expect(readFileSpy).not.toHaveBeenCalledWith(claimed, 'utf8')
+    readFileSpy.mockRestore()
+    expect(lstatSync(claimed).isSymbolicLink()).toBe(true)
   })
 })

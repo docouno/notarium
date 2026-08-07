@@ -66,10 +66,10 @@ export const markdownFileToNote = (
     // ReDoS on attacker-controlled content (a long whitespace run + a trailing char).
     body: body.trimEnd(),
     directory: '',
-    // slug of the basename → idempotent per file. A non-romanisable basename
-    // (CJK / emoji / …) slugs to '' — fall back to a source-name hash, NOT a shared
-    // constant, so two differently-named such files get DISTINCT, stable paths
-    // instead of colliding on `note.md` (the second would be silently skipped).
+    // The storage key intentionally keeps the legacy ASCII algebra: changing an
+    // importer's deterministic path across an upgrade makes a re-import duplicate its
+    // own source. A basename outside that alphabet falls back to the raw source-name
+    // hash, so distinct files stay distinct while the note TITLE remains Unicode.
     fileName: cappedSlug(fallback) || `note-${shortHash(fileName)}`,
     createdAt,
     source: IMPORT_SOURCE.file,

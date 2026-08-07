@@ -9,6 +9,7 @@
 
 import {
   DEFAULT_NOTE_TYPE,
+  isValidNoteId,
   normAliases,
   normTags,
   NOTE_ID_FRONTMATTER_KEY,
@@ -172,7 +173,7 @@ export const parseNoteFile = (raw: string, path: string): ParsedNote => {
     tags: normTags(frontmatter.tags) ?? [],
     aliases: normAliases(frontmatter.aliases) ?? [],
     slug: fmSlug || null,
-    idClaim: typeof claim === 'string' && claim ? claim : null,
+    idClaim: typeof claim === 'string' && isValidNoteId(claim) ? claim : null,
     createdAt: fmDate(frontmatter.created),
     frontmatter,
     body: stripTitleHeading(afterFm.replace(/^\r?\n/, ''), title),

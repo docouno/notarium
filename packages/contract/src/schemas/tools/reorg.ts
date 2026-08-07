@@ -1,7 +1,19 @@
 import { z } from 'zod'
-import { NoteClassSchema, SpaceSlugSchema } from '../primitives'
+import {
+  DurableDisplayNameSchema,
+  DurableNonEmptyScalarSchema,
+  NoteClassSchema,
+  SpaceSlugSchema,
+} from '../primitives'
 import { locationFields, sessionField } from './_fields'
 import { ProjectHandleSchema, ProjectIdSchema, RefSchema } from './primitives'
+
+const FolderLeafSchema = DurableNonEmptyScalarSchema.refine(
+  (value) => !value.includes('/') && !value.includes('\\'),
+  {
+    message: '`name` is a folder name, not a path — use move_folder to change its location',
+  },
+)
 
 /** Tool `delete_note`: move a note to the trash — the agent's one destructive tool,
  *  reversible by construction (only the USER restores/purges).
@@ -25,7 +37,7 @@ export const DeleteNoteOutputSchema = z.object({
 export const MoveNoteInputSchema = z.object({
   ...sessionField,
   ref: RefSchema,
-  toFolder: z.string(),
+  toFolder: DurableNonEmptyScalarSchema.or(z.literal('')),
 })
 
 /** Confirms the move: id (unchanged) + the new location; `project` can change when
@@ -41,7 +53,7 @@ export const MoveNoteOutputSchema = z.object({
 export const RenameNoteInputSchema = z.object({
   ...sessionField,
   ref: RefSchema,
-  title: z.string().min(1),
+  title: DurableNonEmptyScalarSchema,
 })
 
 /** Confirms the rename: id, new `title`, a fresh `versionToken` and the new location
@@ -59,8 +71,8 @@ export const RenameNoteOutputSchema = z.object({
  *  canon: docs/architecture.md#p7 */
 export const MoveFolderInputSchema = z.object({
   ...sessionField,
-  folder: z.string().min(1),
-  toFolder: z.string(),
+  folder: DurableNonEmptyScalarSchema,
+  toFolder: DurableNonEmptyScalarSchema.or(z.literal('')),
   project: ProjectHandleSchema.optional(),
 })
 
@@ -69,8 +81,8 @@ export const MoveFolderInputSchema = z.object({
  *  rename_project). canon: docs/architecture.md#p7 */
 export const RenameFolderInputSchema = z.object({
   ...sessionField,
-  folder: z.string().min(1),
-  name: z.string().min(1),
+  folder: DurableNonEmptyScalarSchema,
+  name: FolderLeafSchema,
   project: ProjectHandleSchema.optional(),
 })
 
@@ -88,7 +100,7 @@ export const RenameProjectInputSchema = z.object({
   ...sessionField,
   project: ProjectHandleSchema,
   slug: z.string().min(1).optional(),
-  displayName: z.string().min(1).optional(),
+  displayName: DurableDisplayNameSchema.optional(),
 })
 
 /** Confirms a project rename: id (unchanged), new `handle`/`displayName`, and

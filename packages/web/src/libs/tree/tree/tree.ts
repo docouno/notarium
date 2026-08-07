@@ -1,4 +1,5 @@
-import { slugifyPath } from '@notarium/core/slug'
+import { resolveFolderReference } from '@notarium/core'
+import { namePathKey } from '@notarium/core/slug'
 
 import type { NoteView, TreeFolder } from '../../wire'
 
@@ -76,42 +77,46 @@ export const carryOpenKeys = (open: Set<string>, oldPath: string, newPath: strin
 // the folder-id; the server's /tree carries PAST paths (`aliases`) for moved
 // identified folders/projects, so a bookmark to `/files/<oldpath>` canonicalises
 // to the current path here — the folder twin of the note's stale-slug redirect. Prefix-aware: a
-// descendant of an old path (`a/sub` after `a`→`b`) redirects to `b/sub`. Matching
-// is in slug space (folders are stored slugified), so the returned path is valid.
+// descendant of an old path (`a/sub` after `a`→`b`) redirects to `b/sub`.
+//
+// Matching is in NAME-KEY space, not slug space: `namePathKey` is the key the producing
+// half uses (`nextPathAliases`) and the key every other consumer of this same history
+// uses — the graph's folder-alias pass, the engine's `resolveRow`, the reader's
+// `resolveWiki`. On `slugifyPath` this surface dropped exactly the aliases the others
+// keep: a folder named `📥` IS retired into the history, `[[📥/note]]` resolves
+// everywhere, and only a bookmark to `/files/📥` fell through to a 404 (#296).
+// Folder paths are stored RAW on disk, so a matched key is mapped back to a real path.
 export const canonicalFolderPath = (
   reqPath: string,
   folders: readonly TreeFolder[],
 ): string | null => {
-  const want = slugifyPath(reqPath)
+  const currentPaths = folders.map((folder) => folder.path)
+  const aliases = folders.flatMap((folder) =>
+    (folder.aliases ?? []).map((alias) => ({ current: folder.path, alias })),
+  )
+  const resolved = resolveFolderReference(reqPath, aliases, currentPaths)
 
-  if (!want) {
+  if (resolved == null || resolved === reqPath) {
     return null
   }
-  // slug → RAW path of every CURRENT folder. Directories are stored verbatim (a
-  // cyrillic `Орбита`, not its slug), so the redirect target must be a real RAW
-  // path — matching/mapping is done in slug space, then translated back.
-  const bySlug = new Map(folders.map((f) => [slugifyPath(f.path), f.path]))
 
-  if (bySlug.has(want)) {
-    return null
-  } // already a live folder (never shadowed by an alias)
-  for (const f of folders) {
-    for (const a of f.aliases ?? []) {
-      const alias = slugifyPath(a)
+  // The shared resolver returns the desired current subtree even when that
+  // descendant no longer exists. A URL must land on a real folder, so walk back
+  // to the longest unique current ancestor. Ambiguous descendants fall back to a
+  // unique parent instead of becoming input-order dependent.
+  const parts = resolved.split('/')
 
-      if (!alias) {
-        continue
-      }
-      if (want === alias) {
-        return f.path
-      }
-      if (want.startsWith(alias + '/')) {
-        // Descendant of an old path: rewrite the prefix in slug space, then map the
-        // result back to the real RAW folder; fall back to the renamed folder itself
-        // when that descendant no longer exists (a safe, existing target).
-        const targetSlug = slugifyPath(f.path) + want.slice(alias.length)
-        return bySlug.get(targetSlug) ?? f.path
-      }
+  for (let length = parts.length; length > 0; length--) {
+    const prefix = parts.slice(0, length).join('/')
+
+    if (currentPaths.includes(prefix)) {
+      return prefix
+    }
+    const key = namePathKey(prefix)
+    const matches = currentPaths.filter((path) => namePathKey(path) === key)
+
+    if (matches.length === 1) {
+      return matches[0]
     }
   }
 

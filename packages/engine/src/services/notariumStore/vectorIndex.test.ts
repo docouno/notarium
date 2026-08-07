@@ -1177,13 +1177,9 @@ describeVector('NotariumStore vector indexing', () => {
     }
   })
 
-  it('an OUT-OF-POOL agent-memory graph neighbour carries its class (leak guard)', async () => {
-    // The highest-stakes path: a user note links an agent-memory note that is NOT in
-    // the fts/vec pool — it reaches the page ONLY through the graph channel's
-    // out-of-pool fetch (GRAPH_NEIGHBOR_SQL). That fetch MUST carry the hidden class
-    // so the read-model can drop it; a class-less row fails the post-filter open and
-    // leaks agent-memory. poolSize=1 forces Secret Memo outside the pool; wGraph high
-    // so the boosted neighbour survives the pageSize-1 cut.
+  it('the user graph channel excludes an OUT-OF-POOL agent-memory neighbour', async () => {
+    // Visibility must hold inside the graph channel, not only in CachedStore's final
+    // row filter: a hidden neighbour must never be boosted into the candidate page.
     const table = {
       'Apex\n\na cat essay [[Secret Memo]]': [1, 0, 0, 0],
       cat: [1, 0, 0, 0],
@@ -1206,9 +1202,41 @@ describeVector('NotariumStore vector indexing', () => {
       await store.whenVectorsSettled()
       const hits = await store.search('cat', { pageSize: 1 })
       const memo = hits.find((h) => h.title === 'Secret Memo')
-      expect(memo).toBeTruthy() // reached the page ONLY via the out-of-pool graph fetch
-      expect(memo!.class).toBe('agent-memory') // GRAPH_NEIGHBOR_SQL carried the class
-      expect(memo!.snippet).toContain('private') // body-head (no fts/vec snippet) → the out-of-pool branch
+      expect(memo).toBeUndefined()
+    } finally {
+      await store.stop()
+    }
+  })
+
+  it('a hidden query hit cannot seed a visible graph result', async () => {
+    // Only Secret Memo matches the query and it links Visible. If hidden rows are
+    // admitted as seeds, Visible reaches the page solely through that private fact;
+    // filtering Secret Memo afterwards cannot undo the side channel.
+    const table = {
+      'Secret Memo\n\nzzultrasecret [[Visible]]': [1, 0, 0, 0],
+      'Visible\n\nordinary public body': [0, 1, 0, 0],
+      zzultrasecret: [1, 0, 0, 0],
+    }
+    const sql = createNodeSqliteDriver(':memory:', { vec: true })
+    const store = new NotariumStore({
+      mounts: [userMount(notesDir), agentMount(notesDir)],
+      sql,
+      embedder: mapEmbedder(table),
+      searchTuning: { poolSize: 1, wGraph: 5, graphSeedS: 1 },
+    })
+
+    try {
+      await store.write({ title: 'Visible', content: 'ordinary public body' })
+      await store.write({
+        title: 'Secret Memo',
+        content: 'zzultrasecret [[Visible]]',
+        targetClass: 'agent-memory',
+      })
+      await store.whenVectorsSettled()
+      const hits = await store.search('zzultrasecret', { pageSize: 1 })
+
+      expect(hits.find((h) => h.title === 'Secret Memo')?.class).toBe('agent-memory')
+      expect(hits.find((h) => h.title === 'Visible')).toBeUndefined()
     } finally {
       await store.stop()
     }

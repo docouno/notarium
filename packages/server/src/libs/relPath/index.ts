@@ -1,1 +1,1 @@
-export { safeRelPath } from './relPath'
+export { safeRelAddress, safeRelPath } from './relPath'

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { STORE_EVENT } from '@notarium/contract/events'
 import { SCAN_PHASE } from '@notarium/core'
 import type { GraphView as Graph, SyncStatus } from '../../../../libs/wire'
@@ -7,6 +7,7 @@ import { useNotes } from '../../../NotesProvider'
 import { useSpace } from '../../../SpaceProvider'
 import { useSync } from '../../../SyncProvider'
 import { REFETCH_MIN_MS } from '../../consts'
+import { filterObservedGraph } from './graphFreshness'
 
 /** Loads the space's graph and keeps it fresh. Owns `data`/`error`, seeds the
  *  resolution cache (#64) and rides the shared SSE channel (#60/#62): a `changed`
@@ -16,37 +17,46 @@ import { REFETCH_MIN_MS } from '../../consts'
 export const useGraphData = () => {
   const { space } = useSpace()
   const { remember } = useNotes()
-  const { status: syncStatus, subscribe } = useSync()
+  const { status: syncStatus, subscribe, connectionRevision, observationEpoch } = useSync()
   const [data, setData] = useState<Graph | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const requestSeq = useRef(0)
+
+  const loadGraph = useCallback(async () => {
+    const seq = ++requestSeq.current
+    const observedAt = Math.max(connectionRevision, observationEpoch())
+
+    try {
+      const graph = await api.graphGet(space)
+
+      if (requestSeq.current !== seq) {
+        return
+      }
+      const observed = graph.nodes
+        .filter((node) => !node.ghost)
+        .map((node) => ({
+          id: node.id,
+          title: node.title,
+          filePath: node.filePath,
+          modifiedAt: null,
+          createdAt: null,
+        }))
+      const accepted = remember(observed, [], observedAt)
+      const filtered = filterObservedGraph(graph, new Set(accepted.map((note) => note.id)))
+
+      setData(filtered)
+      setError(null)
+    } catch (e) {
+      if (requestSeq.current === seq) {
+        setError(e instanceof Error ? e.message : String(e))
+      }
+    }
+  }, [space, remember, connectionRevision, observationEpoch])
 
   useEffect(() => {
     setData(null) // a space switch must not show the previous space's graph
-    api
-      .graphGet(space)
-      .then(setData)
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
-  }, [space])
-
-  // Feed the resolution cache (#64): a node click stays navigate-first even
-  // for notes no listing has reported yet — the graph knows their identity.
-  useEffect(() => {
-    if (!data) {
-      return
-    }
-    remember(
-      data.nodes
-        .filter((n) => !n.ghost)
-        // Graph node ids ARE note-ids (#51).
-        .map((n) => ({
-          id: n.id,
-          title: n.title,
-          filePath: n.filePath,
-          modifiedAt: null,
-          createdAt: null,
-        })),
-    )
-  }, [data, remember])
+    void loadGraph()
+  }, [loadGraph])
 
   // Ride the server-push channel (#60/#62) through the app's shared SSE
   // subscription (SyncProvider — no second EventSource): during the warm-up
@@ -68,14 +78,9 @@ export const useGraphData = () => {
       timer = setTimeout(() => {
         timer = null
         lastAt = Date.now()
-        api
-          .graphGet(space)
-          .then((d) => {
-            if (!closed) {
-              setData(d)
-            }
-          })
-          .catch(() => {})
+        if (!closed) {
+          void loadGraph()
+        }
       }, wait)
     }
     // Seed from the status the shared stream already holds: the provider's
@@ -84,6 +89,9 @@ export const useGraphData = () => {
     let lastPhase: SyncStatus['scan']['phase'] | null = syncStatus?.scan.phase ?? null
     const off = subscribe((e) => {
       if (e.type === STORE_EVENT.CHANGED || e.type === STORE_EVENT.GRAPH) {
+        // Invalidate an older response immediately; the throttled request below
+        // is the only snapshot allowed to land for this server revision.
+        requestSeq.current++
         // `changed` brings fresh topology right away (the server serves it
         // stale-enriched, #60 SWR); `graph` follows when the background
         // communities+layout pass catches up — that fetch lands the settled
@@ -113,7 +121,7 @@ export const useGraphData = () => {
     // syncStatus is deliberately only a mount-time seed — tracking it would
     // tear down the subscription on every status frame.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [subscribe])
+  }, [subscribe, loadGraph])
 
   return { data, error, syncStatus }
 }

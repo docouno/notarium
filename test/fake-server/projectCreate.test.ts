@@ -56,6 +56,7 @@ const inMemoryMarkerStore = (): SeedableMarkerStore => {
 
 let app: FastifyInstance
 let markerStore: SeedableMarkerStore
+let teamId: string
 
 const listen = async (instance: FastifyInstance): Promise<number> => {
   await instance.listen({ port: 0, host: '127.0.0.1' })
@@ -84,7 +85,7 @@ beforeEach(async () => {
   const spaces = (
     await app.inject({ method: 'GET', url: '/api/spaces', headers: { cookie } })
   ).json().spaces as Array<{ id: string; slug: string }>
-  const teamId = spaces.find((s) => s.slug === 'team')!.id
+  teamId = spaces.find((s) => s.slug === 'team')!.id
   markerStore.seedFolder(teamId, 'docs')
 })
 
@@ -123,5 +124,18 @@ describe('POST /projects create guard (#13 C)', () => {
     const cookie = await loginCookie()
     expect((await mark(cookie, { folderPath: 'plans', create: true })).statusCode).toBe(201)
     expect((await mark(cookie, { folderPath: 'plans', create: true })).statusCode).toBe(409)
+  })
+
+  it('create rejects non-portable paths, while an existing legacy folder remains markable', async () => {
+    const cookie = await loginCookie()
+
+    for (const folderPath of ['CON', 'NUL', 'foo:bar']) {
+      expect((await mark(cookie, { folderPath, create: true })).statusCode).toBe(400)
+    }
+
+    markerStore.seedFolder(teamId, 'foo:bar')
+    const legacy = await mark(cookie, { folderPath: 'foo:bar', displayName: 'Legacy' })
+    expect(legacy.statusCode).toBe(201)
+    expect(legacy.json()).toMatchObject({ handle: 'team/legacy', path: 'foo:bar' })
   })
 })

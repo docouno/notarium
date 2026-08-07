@@ -3,9 +3,10 @@
 
 import type { KnowledgeStore, NoteMeta, WriteResult } from '../../knowledgeStore'
 import { NOTE_CLASS, READ_SCOPE, STORE_ERROR_REASON, versionConflict } from '../../knowledgeStore'
-import { sha256Hex } from '../../libs/hash'
+import { pathHash, sha256Hex } from '../../libs/hash'
 import { estimateTokens } from '../../libs/markdown'
-import { slugify } from '../../libs/slug'
+import { CLIPPED_NAME_TAG_BYTES, clipToBytes, NOTE_BASENAME_MAX_BYTES } from '../../libs/path'
+import { nameKey, slugify } from '../../libs/slug'
 import { normTags } from '../../libs/tags'
 import { makeSnippet } from '../../snippet'
 import { applyEdit, EDIT_OPERATION } from '../editNote'
@@ -47,6 +48,25 @@ const withEcho = async (
  *  as booleans on the fake — treat both truthy forms as muted. */
 export const isMutedFlag = (v: unknown): boolean => v === true || v === 'true'
 
+/** The file a memory CATEGORY lives in — deterministic per category, because the
+ *  find-or-append convergence needs two racing writers to aim at ONE path. The
+ *  category's own slug where it has one (so every existing memory file keeps its
+ *  name); a hash of its name key where it has none, since the name formula's id rung
+ *  would otherwise hand each racer a file of its own (#296). */
+const memoryFileName = (category: string): string => {
+  const categoryKey = nameKey(category)
+  const named = slugify(category) || `category-${pathHash(categoryKey)}`
+
+  // The formula never byte-clips an explicit fileName — that length is the caller's to
+  // own, and this is the caller. Owning it means clipping HERE: a long category in a
+  // script the name axis now keeps is 3 bytes per letter, and an unclipped pin turns a
+  // previously-writable category into a hard ENAMETOOLONG with no memory recorded at
+  // all. The tag keeps two categories that share a clipped prefix apart, exactly as
+  // the title rung does.
+  const clipped = clipToBytes(named, NOTE_BASENAME_MAX_BYTES - CLIPPED_NAME_TAG_BYTES)
+  return clipped === named ? named : `${clipped}-${pathHash(categoryKey)}`
+}
+
 /** Find the category note, scoped by class AND mount-dir so sibling projects'
  *  same-category notes never collide. A bare engine ignores `scope`, so these
  *  filters — not the list scope — are the real guard. */
@@ -56,7 +76,10 @@ const findMemoryNote = async (
   subdir: string,
   mountPrefix: string,
 ): Promise<NoteMeta | undefined> => {
-  const want = slugify(category)
+  // `nameKey`, the total name key (#296): a category is matched against a note TITLE,
+  // and on the bare slug two categories with no sluggable characters shared the empty
+  // key — the second one's observations were appended into the first one's note.
+  const want = nameKey(category)
   const metas = await store.list({
     scope: READ_SCOPE.agentRecall,
     classes: [NOTE_CLASS.agentMemory],
@@ -65,7 +88,7 @@ const findMemoryNote = async (
     (m) =>
       m.class === NOTE_CLASS.agentMemory &&
       m.id != null &&
-      slugify(m.title) === want &&
+      nameKey(m.title) === want &&
       memoryDirOf(m.filePath, mountPrefix) === subdir,
   )
 }
@@ -92,6 +115,12 @@ const remember = async (
           content: input.observation,
           targetClass: NOTE_CLASS.agentMemory,
           directory: subdir || undefined,
+          // PINNED to the category, never left to the name formula: the convergence
+          // this retry provides rests on a concurrent first-touch hitting the SAME
+          // path and being refused. With a letterless category the formula falls to
+          // its id rung, every racer mints a different id, nobody collides, and one
+          // category ends up with two notes (#296).
+          fileName: memoryFileName(input.category),
           summary: input.summary,
           principal: input.principal,
         })
@@ -130,6 +159,11 @@ const remember = async (
         title: note.title ?? input.category,
         content: next,
         originalId: id,
+        // The pin has to be RE-STATED on every write, not only on the create: an edit
+        // that omits it re-derives the basename from the title, and a letterless
+        // category lands back on the id rung — renaming the note off the pinned path
+        // and freeing it for a racer to create a second note of the same category.
+        fileName: memoryFileName(note.title ?? input.category),
         versionToken: token,
         summary: nextSummary,
         tags: normTags(note.frontmatter?.tags),
@@ -188,7 +222,7 @@ export const buildMemoryIndex = async (
       typeof note.frontmatter?.summary === 'string' ? note.frontmatter.summary.trim() : ''
     const summary = fmSummary || makeSnippet(note.content, 160)
     out.push({
-      noteId: m.id,
+      noteId: note.id ?? m.id,
       category: note.title ?? m.title,
       summary,
       // The eager profile carries the summary, not the body, so token cost = summary weight.

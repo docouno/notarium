@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
+import { NOTE_CLASS, READ_SCOPE } from '../../knowledgeStore'
 import { buildMemoryIndex, rememberAboutUser } from './memory'
 import { memStore } from './memoryTestStore.fixture'
 
@@ -156,6 +157,23 @@ describe('rememberAboutUser', () => {
 })
 
 describe('buildMemoryIndex', () => {
+  it('emits the authoritative id returned by a read of a provisional memory row', async () => {
+    const store = memStore([
+      {
+        id: 'provisional-id',
+        title: 'preferences',
+        class: 'agent-memory',
+        content: 'dark mode',
+      },
+    ])
+    const read = store.read.bind(store)
+
+    store.read = async (id, opts) => ({ ...(await read(id, opts)), id: 'durable-id' })
+    await expect(buildMemoryIndex(store)).resolves.toEqual([
+      expect.objectContaining({ noteId: 'durable-id' }),
+    ])
+  })
+
   it('one entry per agent-memory category, keyed off the summary frontmatter', async () => {
     const store = memStore([
       {
@@ -271,5 +289,91 @@ describe('buildMemoryIndex', () => {
     expect((await buildMemoryIndex(store, { subdir: 'proj-a' })).map((e) => e.noteId)).toEqual([
       'proj-mem',
     ])
+  })
+})
+
+// #296 — a category is matched against a note TITLE, so a category with nothing
+// sluggable in it used to share the empty key with every other: the second one's
+// observation was appended into the first one's note and no note of its own was made.
+describe('a letterless memory category', () => {
+  it('lands on a path derived from the CATEGORY, not on the id rung', async () => {
+    // Find-or-append converges because a concurrent first-touch aims at the SAME path
+    // and is refused there. Leave the path to the name formula and a letterless
+    // category falls to its id rung, where every racer mints a different id, nobody
+    // collides, and one category ends up with two notes. So the file name is pinned to
+    // the category: deterministic, and identical for every writer.
+    const store = memStore()
+    await rememberAboutUser(store, { category: '🎉', observation: 'first' })
+    // The SECOND call matters as much as the first: an append that stops pinning the
+    // name re-derives it, lands back on the id rung, and frees the pinned path — so the
+    // pin would hold for exactly one write.
+    await rememberAboutUser(store, { category: '🎉', observation: 'second' })
+    const [note] = await store.list({ scope: READ_SCOPE.agentRecall })
+    const path = note.filePath
+
+    expect(path).not.toMatch(/mem-/) // not the id rung
+    expect(path).toMatch(/^category-[a-f0-9]{24}\.md$/)
+
+    // A second writer that has not yet seen the note aims at the SAME file and is
+    // refused, which is what makes the retry converge instead of forking the category.
+    await expect(
+      store.write({
+        title: '🎉',
+        content: 'racer',
+        targetClass: NOTE_CLASS.agentMemory,
+        fileName: path.replace(/\.md$/, ''),
+      }),
+    ).rejects.toMatchObject({ reason: 'note_already_exists' })
+  })
+
+  it('gets its own note instead of appending into another one', async () => {
+    const store = memStore()
+    await rememberAboutUser(store, { category: '🎉', observation: 'party fact' })
+    await rememberAboutUser(store, { category: '✨', observation: 'sparkle fact' })
+
+    const index = await buildMemoryIndex(store)
+    const categories = index.map((entry) => entry.category).sort()
+
+    expect(categories).toEqual(['✨', '🎉'])
+  })
+
+  it('does not collide on distinct category keys that share the legacy 32-bit hash', async () => {
+    const store = memStore()
+    const first = '🎟🏃🎩🏒🏋🌈🏚🌢🍔🎣'
+    const second = '🍞🏜🏬🏇🎨🍞🍃🎴🌑🎚'
+
+    await rememberAboutUser(store, { category: first, observation: 'first fact' })
+    await rememberAboutUser(store, { category: second, observation: 'second fact' })
+
+    const memories = await store.list({ scope: READ_SCOPE.agentRecall })
+
+    expect(memories).toHaveLength(2)
+    expect(new Set(memories.map((note) => note.filePath)).size).toBe(2)
+  })
+})
+
+// The fixture models the engines, so its refusals have to look like theirs: refused
+// BEFORE anything is written, and shaped as a move failure rather than the
+// `note_already_exists` the create path retries on.
+describe('the memory fixture refuses a rename the engines refuse', () => {
+  it('leaves the note untouched when the destination is occupied', async () => {
+    const store = memStore([
+      { id: 'a', title: '🎉', class: NOTE_CLASS.agentMemory, content: 'old', filePath: 'other.md' },
+      {
+        id: 'b',
+        title: '✨',
+        class: NOTE_CLASS.agentMemory,
+        content: 'x',
+        filePath: 'category-6146299cd54818a0e659eb6a.md',
+      },
+    ])
+
+    await expect(
+      rememberAboutUser(store, { category: '🎉', observation: 'NEW' }),
+    ).rejects.toMatchObject({ isToolError: true })
+
+    // Half-applied is the thing to rule out: the body must not have moved on.
+    expect(store.rows.find((r) => r.id === 'a')!.content).toBe('old')
+    expect(store.rows.find((r) => r.id === 'a')!.filePath).toBe('other.md')
   })
 })

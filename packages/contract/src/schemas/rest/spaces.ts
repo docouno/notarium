@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { AuthorSchema, SpaceSlugSchema } from '../primitives'
+import { AuthorSchema, DurableDisplayNameSchema, SpaceSlugSchema } from '../primitives'
 
 export const SpaceSchema = z.object({
   /** Stable opaque identity — the client's rename-proof key. URLs use the
@@ -42,7 +42,7 @@ export const PurgeSpaceRequestSchema = z.object({
  *  canon: docs/architecture.md#p14 */
 export const PatchSpaceRequestSchema = z.object({
   slug: SpaceSlugSchema.optional(),
-  displayName: z.string().min(1).max(200).optional(),
+  displayName: DurableDisplayNameSchema.optional(),
 })
 
 export type Space = z.infer<typeof SpaceSchema>

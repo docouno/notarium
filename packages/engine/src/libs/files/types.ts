@@ -3,7 +3,9 @@
 // the user's folder, cloud v1 = the server volume); s3/seafile/webdav arrive
 // with the working-set milestone (#70), behind this same seam.
 // All paths are storage-relative POSIX ('dir/note.md'); the adapter owns
-// mapping them onto its medium and refusing escapes.
+// mapping them onto its medium and refusing lexical escapes. LocalFS v1 assumes
+// the configured vault directory topology itself is trusted (a symlinked parent
+// inside that root needs a separate containment hardening boundary).
 
 export type FileStat = {
   path: string
@@ -38,16 +40,47 @@ export type FileStore = {
    *  not promise fsync-level durability across sudden power loss. Creates parent
    *  directories. */
   write(path: string, content: string): Promise<void>
-  /** Move one file; creates the destination's parents, prunes emptied source
-   *  directories (the engine's tree shows folders only through the notes in
-   *  them — an empty leftover dir would be invisible anyway). */
+  /** Atomically publish complete bytes only when the pathname is absent. `false`
+   *  means another file, directory or symlink already owns it. Optional for media
+   *  without a no-replace create primitive. */
+  writeIfAbsent?(path: string, content: string): Promise<boolean>
+  /** Whether two path spellings currently name the same file or directory entry.
+   *  Used only to permit case/NFC-only renames on insensitive filesystems without
+   *  treating a symlink or distinct hardlink pathname as the source itself. */
+  sameEntry?(left: string, right: string): Promise<boolean>
+  /** Move one file with the medium's ordinary replacement semantics. Creates
+   *  destination parents; directories remain durable when the source empties. */
   rename(from: string, to: string): Promise<void>
+  /** Publish the source's exact bytes at the destination without overwriting,
+   *  then remove only the source version that was observed. Also handles two
+   *  spellings of the same medium entry. `false` means a different entry owns
+   *  the destination. */
+  renameIfAbsent?(from: string, to: string): Promise<boolean>
+  /** Atomically publish the FINAL bytes at an absent destination while moving a
+   *  source whose exact bytes were read by the caller. The adapter must never
+   *  overwrite either a racing destination or a replacement of the source.
+   *  `false` means another entry owns the destination. */
+  replaceIfAbsent?(
+    from: string,
+    to: string,
+    expectedSource: string,
+    content: string,
+  ): Promise<boolean>
   /** Move a whole directory subtree. */
   renameDir(from: string, to: string): Promise<void>
+  /** Atomically move a whole directory subtree only while the destination
+   * pathname is absent. `false` means another entry owns it; unsupported media
+   * omit the capability so callers fail closed instead of emulating a race. */
+  renameDirIfAbsent?(from: string, to: string): Promise<boolean>
   remove(path: string): Promise<void>
-  /** Create an empty directory (and any missing ancestors), idempotently — the
-   *  on-disk anchor for a "New folder" (#97). Durable: never auto-pruned. */
-  makeDir(path: string): Promise<void>
+  /** Remove only the exact regular-file version whose bytes the caller read.
+   *  `false` means the pathname was replaced or edited and remains intact;
+   *  an already-absent source counts as successfully removed. */
+  removeIfUnchanged?(path: string, expectedContent: string): Promise<boolean>
+  /** Create the durable on-disk anchor for a "New folder" (#97). Missing parents
+   *  are created, then the leaf is claimed atomically. `false` means a file or
+   *  directory already owns that exact medium pathname. */
+  makeDir(path: string): Promise<boolean>
   /** Delete a directory subtree wholesale (#97 folder delete): its notes,
    *  sibling markers and nested dirs. Idempotent (a missing dir is a no-op). */
   removeDir(path: string): Promise<void>

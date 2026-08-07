@@ -88,6 +88,20 @@ describe('spacesFromEnv (#99)', () => {
     ).toThrow(/bad space slug/)
   })
 
+  it('rejects non-durable SPACES_CONFIG display names', () => {
+    const loneSurrogate = String.fromCharCode(0xd800)
+
+    for (const displayName of ['bad\nname', `bad${loneSurrogate}`, 'x'.repeat(201)]) {
+      const config = JSON.stringify({
+        spaces: [{ slug: 'main', displayName, engine: 'notarium', notesDir: '/x' }],
+      })
+
+      expect(() => resolve({ SPACES_CONFIG: config }, 'password')).toThrow(
+        /bad displayName for space "main"/,
+      )
+    }
+  })
+
   it('ENGINE=notarium without NOTES_DIR is a loud boot error', () => {
     expect(() => resolve({ ENGINE: 'notarium' }, 'password')).toThrow(/NOTES_DIR/)
   })

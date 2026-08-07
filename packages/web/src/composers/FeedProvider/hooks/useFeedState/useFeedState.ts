@@ -30,6 +30,13 @@ import {
   setSortParam,
   toggleTagParam,
 } from './helpers/feedUrlParams'
+import {
+  feedPagesToRefresh,
+  type FeedWindowRequest,
+  filterRemovedFeedRows,
+  invalidatedFeedPages,
+  isCurrentFeedWindow,
+} from './helpers/feedWindowFreshness'
 
 // Feed page state, lifted out of the component so the page and its aside facets
 // share one instance (same folder filter, same data).
@@ -51,7 +58,7 @@ import {
 export const useFeedState = () => {
   const { space } = useSpace()
   const { folderTree, tree, remember, dirOfId } = useNotes()
-  const { subscribe } = useSync()
+  const { subscribe, connectionRevision, observationEpoch } = useSync()
   const [searchParams, setSearchParams] = useSearchParams()
   const favorites = useFavorites()
   const rawDateFrom = searchParams.get(FEED_URL_PARAMS.from) ?? ''
@@ -170,7 +177,11 @@ export const useFeedState = () => {
   const [error, setError] = useState<string | null>(null)
   const pagesRef = useRef(pages)
   const inflight = useRef(new Set<number>())
+  const pendingRefreshPages = useRef(new Set<number>())
   const queryRef = useRef('')
+  /** Same query, newer server truth: invalidates every response begun before a
+   * relevant changed event, independently of the query-key guard. */
+  const windowRevisionRef = useRef(0)
   useEffect(() => {
     pagesRef.current = pages
   }, [pages])
@@ -192,11 +203,13 @@ export const useFeedState = () => {
   // guards (`queryRef.current !== key`) are space-aware — without it an in-place
   // space switch (FeedProvider doesn't remount) could apply space-A's late window
   // into space-B and reopen the inflight-dedupe hole.
-  const queryKey = `${space}|${sort}|${includeList.join(' ')}|${tags.join(' ')}|${q}|${dateFrom}|${dateTo}|${favorite ? `fav:${favoriteNoteSig}` : ''}`
+  const queryKey = `${space}|conn:${connectionRevision}|${sort}|${includeList.join(' ')}|${tags.join(' ')}|${q}|${dateFrom}|${dateTo}|${favorite ? `fav:${favoriteNoteSig}` : ''}`
 
   const fetchPage = useCallback(
     async (page: number) => {
       const key = queryRef.current
+      const observedAt = observationEpoch()
+      const request: FeedWindowRequest = { queryKey: key, revision: windowRevisionRef.current }
 
       if (inflight.current.has(page)) {
         return
@@ -222,25 +235,31 @@ export const useFeedState = () => {
           ...(favorite ? { favorite: true } : {}),
         })
 
-        if (queryRef.current !== key) {
+        if (!isCurrentFeedWindow(request, queryRef.current, windowRevisionRef.current)) {
           return
         } // a stale window for a flipped query (folder/tag/q/sort)
         // Seed the session preview map BEFORE the notes render, then drop the
         // payload — previews live in one place (services/previews, with SSE
         // invalidation), not inside every held page and the seen-cache.
-        primePreviews(r.notes.flatMap((n) => (n.preview ? [[n.id, n.preview] as const] : [])))
-        r.notes = r.notes.map((n) => ({ ...n, preview: undefined }))
-        remember(r.notes)
+        const observed = r.notes.map((n) => ({ ...n, preview: undefined }))
+        const accepted = remember(observed, [], observedAt)
+
+        primePreviews(
+          r.notes
+            .filter((note) => accepted.some((candidate) => candidate.id === note.id))
+            .flatMap((n) => (n.preview ? [[n.id, n.preview] as const] : [])),
+        )
         setTotal(r.total)
         setError(null)
         setPages((prev) => {
           const next = new Map(prev)
-          next.set(page, r.notes)
+          next.set(page, accepted)
           evictFarPages(next, page)
+          pagesRef.current = next
           return next
         })
       } catch (e) {
-        if (queryRef.current === key) {
+        if (isCurrentFeedWindow(request, queryRef.current, windowRevisionRef.current)) {
           setError((e as Error).message)
         }
       } finally {
@@ -249,19 +268,22 @@ export const useFeedState = () => {
         // NEW query; a stale completion deleting that marker unconditionally would let a
         // duplicate fetch slip past the dedupe during the flip. The flip's clear()
         // already reclaims any stale marker, so skipping here leaks nothing.
-        if (queryRef.current === key) {
+        if (isCurrentFeedWindow(request, queryRef.current, windowRevisionRef.current)) {
           inflight.current.delete(page)
         }
       }
     },
-    [space, sort, includeList, tags, q, dateFrom, dateTo, favorite, remember],
+    [space, sort, includeList, tags, q, dateFrom, dateTo, favorite, remember, observationEpoch],
   )
 
   // Query flip: drop the window, refetch the head.
   useEffect(() => {
     queryRef.current = queryKey
+    windowRevisionRef.current++
     inflight.current.clear()
-    setPages(new Map())
+    pendingRefreshPages.current.clear()
+    pagesRef.current = new Map()
+    setPages(pagesRef.current)
     setTotal(null)
     void fetchPage(0)
   }, [queryKey, fetchPage])
@@ -393,12 +415,26 @@ export const useFeedState = () => {
           return
         }
       }
+      // Supersede same-query requests NOW, not after the coalesce timer. A page
+      // already in flight must neither land stale nor dedupe the fresh request.
+      for (const page of invalidatedFeedPages(pagesRef.current, inflight.current)) {
+        pendingRefreshPages.current.add(page)
+      }
+      windowRevisionRef.current++
+      inflight.current.clear()
+      const nextPages = filterRemovedFeedRows(pagesRef.current, event.removed)
+
+      pagesRef.current = nextPages
+      setPages(nextPages)
       if (timer) {
         return
       }
       timer = setTimeout(() => {
         timer = null
-        for (const p of pagesRef.current.keys()) {
+        const refreshPages = feedPagesToRefresh(pendingRefreshPages.current, pagesRef.current)
+
+        pendingRefreshPages.current.clear()
+        for (const p of refreshPages) {
           void fetchPage(p)
         }
         // The histogram AND the tag facet moved with the data — same sweep (~ms).

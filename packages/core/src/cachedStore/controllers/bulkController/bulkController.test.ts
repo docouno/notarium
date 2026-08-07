@@ -14,12 +14,15 @@ const makeHost = () => {
     suspendBackground: () => {},
     resumeBackground: () => {},
     flushIdentity: async () => {},
+    syncLinkIdentities: () => {},
     dispatchChanged: (upserts, removed, folders) => {
       dispatched.push({ upserts, removed, folders })
     },
     foldersOf: (ids) => ids.map((id) => `dir/${id}`),
     poll: () => {},
     refreshGraph: () => {},
+    flushGraphContext: async () => {},
+    abandonGraphContext: () => {},
   }
   return { host, dispatched }
 }
@@ -103,5 +106,97 @@ describe('BulkController coalescing', () => {
     await bulk.end() // outer: depth → 0, flush the merged window
     expect(dispatched).toHaveLength(1)
     expect([...dispatched[0].upserts].sort()).toEqual(['a', 'b'])
+  })
+
+  it('drains a write absorbed while the outer end is awaiting durability', async () => {
+    const { host, dispatched } = makeHost()
+    let flushes = 0
+    let releaseSecond!: () => void
+    const secondEntered = new Promise<void>((resolve) => {
+      host.flushIdentity = async () => {
+        flushes++
+        if (flushes === 1) {
+          resolve()
+          await new Promise<void>((done) => {
+            releaseSecond = done
+          })
+        }
+      }
+    })
+    const bulk = new BulkController(host)
+
+    bulk.begin()
+    bulk.absorb(['initial'], [])
+    const ending = bulk.end()
+
+    await secondEntered
+    bulk.absorb(['late'], [])
+    releaseSecond()
+    await ending
+
+    expect(dispatched.flatMap((event) => event.upserts)).toEqual(['initial', 'late'])
+    expect(bulk.isActive).toBe(false)
+  })
+
+  it('joins a timer batch already awaiting durability before end resolves', async () => {
+    const { host, dispatched } = makeHost()
+    let announce!: () => void
+    let release!: () => void
+    const entered = new Promise<void>((resolve) => {
+      announce = resolve
+    })
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let first = true
+
+    host.flushIdentity = async () => {
+      if (first) {
+        first = false
+        announce()
+        await blocked
+      }
+    }
+    const bulk = new BulkController(host)
+
+    bulk.begin()
+    bulk.absorb(['timer-batch'], [])
+    await vi.advanceTimersByTimeAsync(300)
+    await entered
+    let ended = false
+    const ending = bulk.end().then(() => {
+      ended = true
+    })
+
+    await Promise.resolve()
+    expect(ended).toBe(false)
+    expect(dispatched).toEqual([])
+    release()
+    await ending
+    expect(dispatched.flatMap((event) => event.upserts)).toEqual(['timer-batch'])
+    expect(bulk.isActive).toBe(false)
+  })
+
+  it('does not dispatch or lose a batch when identity durability fails', async () => {
+    const { host, dispatched } = makeHost()
+    let attempts = 0
+
+    host.flushIdentity = async () => {
+      attempts++
+      if (attempts === 1) {
+        throw new Error('meta db unavailable')
+      }
+    }
+    const bulk = new BulkController(host)
+
+    bulk.begin()
+    bulk.absorb(['durable-later'], [])
+    await expect(bulk.end()).rejects.toThrow('meta db unavailable')
+    expect(dispatched).toEqual([])
+    expect(bulk.isActive).toBe(true)
+
+    await bulk.end()
+    expect(dispatched.map((event) => event.upserts)).toEqual([['durable-later']])
+    expect(bulk.isActive).toBe(false)
   })
 })

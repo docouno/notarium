@@ -4,9 +4,8 @@
 // `content` is itself `{ role, content: <text> }` (the text nested one level), or
 // a bare string. One chat → one note, rendered like the other transcripts.
 
-import { slugify } from '../../libs/slug'
 import { IMPORT_SOURCE } from '../consts'
-import { convoFileName, stampOf, toIso } from '../helpers/format'
+import { convoFileName, importerDirectorySlug, stampOf, toIso } from '../helpers/format'
 import type { ImportNote } from '../types'
 
 type DesignBlock = { type?: string; text?: unknown }
@@ -79,7 +78,12 @@ export const claudeDesignChatToNote = (chat: DesignChat, index = 0): ImportNote 
     return null
   }
   const project = (chat.project?.name || '').trim()
-  const sub = project ? `/${slugify(project) || 'project'}` : ''
+  const projectSlug = importerDirectorySlug(project)
+  // Preserve the pre-#296 fallback exactly. Changing a deterministic import
+  // destination without source-provenance migration duplicates an existing
+  // CJK project on its first re-import; the run-level reservation fails closed
+  // when two records in one upload share this legacy path.
+  const sub = project ? `/${projectSlug || 'project'}` : ''
   const sourceId = chat.uuid || `${index}`
   return {
     title,

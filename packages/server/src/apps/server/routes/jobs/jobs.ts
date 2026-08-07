@@ -5,7 +5,7 @@ import { ImportResponseSchema, JobListResponseSchema, JobSchema } from '@notariu
 import { HTTP_STATUS } from '@notarium/contract/http'
 import { freshNoteId, IMPORT_FORMAT, ImportError, type ImportFormat } from '@notarium/core'
 
-import { safeRelPath } from '../../../../libs/relPath'
+import { safeRelAddress } from '../../../../libs/relPath'
 import { makeImportTempDir, runImport, saveUploadToTemp } from '../../../../services/import'
 import { JOB_KIND_EXPORT, JOB_KIND_IMPORT, jobToWire } from '../../consumers'
 import { type ApiRouteCtx, authz, notFound, parseRangeHeader, s } from '../_shared'
@@ -162,7 +162,13 @@ export const jobsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
         typeof fields[k]?.value === 'string' ? (fields[k]!.value as string) : undefined
       const format = asImportFormat(fields.format?.value)
       const rootRaw = fieldStr('root')
-      const root = rootRaw ? (safeRelPath(rootRaw) ?? '') : ''
+      // `root` may name an existing legacy POSIX-only folder. The engine applies
+      // the stricter portable-component rule if the import would create it.
+      const root = rootRaw ? safeRelAddress(rootRaw) : ''
+
+      if (root === null) {
+        return reply.code(HTTP_STATUS.BAD_REQUEST).send({ error: 'bad import root' })
+      }
       const skipExisting = fieldStr('skipExisting') === 'true'
       const memoryRaw = fieldStr('memory')
       const memoryMode = memoryRaw === 'space' || memoryRaw === 'skip' ? memoryRaw : 'folder'

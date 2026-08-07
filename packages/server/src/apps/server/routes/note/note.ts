@@ -26,6 +26,7 @@ import {
   FOLDER_PAGE_BASENAME,
   folderPageFilePath,
   isFolderPageNote,
+  normalizeWikilinkTarget,
   type Preview,
   revisionNotFound,
   revisionsUnavailable,
@@ -33,7 +34,7 @@ import {
 } from '@notarium/core'
 
 import { redactsKeyId, withAuthors } from '../../../../libs/authors'
-import { safeRelPath } from '../../../../libs/relPath'
+import { safeRelAddress } from '../../../../libs/relPath'
 import { can } from '../../../../services/authz'
 import { lastSegment } from '../../../../services/projects'
 import { setNoteMuted, setNotePinned } from '../../../../services/spaces'
@@ -52,7 +53,7 @@ export const noteRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
   // Wiki-link resolver: `ref` (path/title/permalink) resolves WITHIN this space
   // only, never crossing the boundary. canon: docs/spaces.md#model
   app.get(s('/note'), { config: authz('space:read', 'space') }, async (req, reply) => {
-    const ref = ((req.query as { ref?: string }).ref || '').trim()
+    const ref = normalizeWikilinkTarget(((req.query as { ref?: string }).ref || '').trim())
 
     if (!ref) {
       return missing(reply, 'ref')
@@ -60,7 +61,8 @@ export const noteRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
     const store = await spaceStoreFor(req)
     // Emit the CURRENT slug: the URL may carry a past-slug alias.
     const slug = spaces.slugOf(req.spaceId) ?? undefined
-    return NoteDetailResponseSchema.parse(noteDetailToWire(await store.read(ref), slug))
+    const detail = store.resolveWikilink ? await store.resolveWikilink(ref) : await store.read(ref)
+    return NoteDetailResponseSchema.parse(noteDetailToWire(detail, slug))
   })
 
   // ── id-addressed family (global) ───────────────────────────────────────────
@@ -215,7 +217,7 @@ export const noteRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
     let directory: string | undefined
 
     if (parsed.directory !== undefined) {
-      const safe = safeRelPath(parsed.directory)
+      const safe = safeRelAddress(parsed.directory)
 
       if (safe === null) {
         return reply.code(HTTP_STATUS.BAD_REQUEST).send({ error: 'bad directory path' })
@@ -229,7 +231,10 @@ export const noteRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
     }
     const live = await hit.store.read(parsed.originalId)
     const r = await hit.store.write({
-      ...updateToDomain({ ...parsed, directory }, principalId(req)),
+      ...updateToDomain(
+        { ...parsed, directory, originalId: live.id ?? parsed.originalId },
+        principalId(req),
+      ),
       // A folder page's identity is the reserved basename `index.md`, not its title —
       // preserve it on edit so saving the body doesn't demote it to a child note.
       ...(live.filePath && isFolderPageNote(live.filePath)
@@ -414,7 +419,7 @@ export const noteRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
     if (!body.success || !body.data.id || !body.data.destinationPath) {
       return missing(reply, 'id or destinationPath')
     }
-    const destination = safeRelPath(body.data.destinationPath)
+    const destination = safeRelAddress(body.data.destinationPath)
 
     if (destination === null) {
       return reply.code(HTTP_STATUS.BAD_REQUEST).send({ error: 'bad destination path' })

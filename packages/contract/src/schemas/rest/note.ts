@@ -1,6 +1,13 @@
 import { z } from 'zod'
 import { IF_EXISTS } from '../../consts/notes'
-import { AuthorSchema, IsoTimestampSchema, NoteClassSchema, SpaceSlugSchema } from '../primitives'
+import {
+  AuthorSchema,
+  DurableAddressPathSchema,
+  DurableNonEmptyScalarSchema,
+  IsoTimestampSchema,
+  NoteClassSchema,
+  SpaceSlugSchema,
+} from '../primitives'
 import { noteWriteFields } from './_fields'
 
 export const NoteDetailResponseSchema = z.object({
@@ -67,7 +74,7 @@ export const UpdateNoteRequestSchema = z.object({
   ...noteWriteFields,
   /** The note-id being edited in place — triggers move-then-write so a
    *  title/folder change renames rather than duplicating (the rename invariant). */
-  originalId: z.string(),
+  originalId: DurableNonEmptyScalarSchema,
   /** The version the editor read (see NoteDetailResponseSchema.versionToken): the
    *  writer must prove what it's overwriting. A stale token → 409 ConflictResponse. */
   versionToken: z.string(),
@@ -124,8 +131,8 @@ export const RemoveResponseSchema = z.object({
 })
 
 export const MoveRequestSchema = z.object({
-  id: z.string(),
-  destinationPath: z.string(),
+  id: DurableNonEmptyScalarSchema,
+  destinationPath: DurableAddressPathSchema,
 })
 
 export const MoveResponseSchema = z.object({

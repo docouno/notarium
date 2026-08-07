@@ -1,3 +1,5 @@
+import { normalizeSafeRelativeAddress, normalizeSafeRelativePath } from '@notarium/core'
+
 // Fail-closed untrusted-path guard on OUR boundary, before a path reaches an
 // engine. An engine may reject traversal too, but that is version behaviour not
 // a contract — this guard is what stops an engine swap (P8) opening a hole.
@@ -9,28 +11,11 @@
  *  write there would vanish on rescan or poison another mount's class.
  *  canon: docs/note-model.md#agent-memory */
 export const safeRelPath = (input: string): string | null => {
-  if (input.includes('\0')) {
-    return null
-  }
-  const raw = input.replaceAll('\\', '/')
+  return normalizeSafeRelativePath(input)
+}
 
-  if (raw.startsWith('/')) {
-    return null
-  }
-  const parts: string[] = []
-
-  for (const seg of raw.split('/')) {
-    if (!seg || seg === '.') {
-      continue
-    }
-    if (seg === '..') {
-      return null
-    }
-    if (seg.startsWith('.')) {
-      return null
-    }
-    parts.push(seg)
-  }
-
-  return parts.join('/')
+/** Address an existing public path, including legacy POSIX-only names. Creation
+ * still goes through `safeRelPath` or the engine's existing-parent-aware fence. */
+export const safeRelAddress = (input: string): string | null => {
+  return normalizeSafeRelativeAddress(input)
 }

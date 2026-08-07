@@ -1,7 +1,14 @@
 import { z } from 'zod'
 import { EDIT_OPERATION, WRITE_OUTCOME } from '../../consts/tools'
 import { enumValues } from '../../libs/enumValues'
-import { IsoTimestampSchema, SpaceSlugSchema } from '../primitives'
+import {
+  DurableNonEmptyScalarSchema,
+  DurableNonEmptyTextSchema,
+  DurableScalarSchema,
+  DurableTextSchema,
+  IsoTimestampSchema,
+  SpaceSlugSchema,
+} from '../primitives'
 import { sessionField } from './_fields'
 import { ProjectHandleSchema, RefSchema } from './primitives'
 
@@ -12,13 +19,19 @@ const casFields = {
   idempotencyKey: z.string().optional(),
 }
 
+/** A relation is rendered verbatim beside a wikilink. Brackets would turn one
+ * requested edge into additional Markdown links, so they are not label text. */
+// Semantic validation (blank/brackets) intentionally remains in the handler:
+// link_many is best-effort per item and its guiding errors are public contract.
+export const LinkRelationSchema = DurableNonEmptyScalarSchema
+
 /** Tool `remember_about_user`: record a durable fact into the user's personal
  *  agent-memory. canon: docs/note-model.md#agent-memory */
 export const RememberAboutUserInputSchema = z.object({
   ...sessionField,
-  observation: z.string().min(1),
-  category: z.string().default('general'),
-  summary: z.string().optional(),
+  observation: DurableNonEmptyTextSchema,
+  category: DurableScalarSchema.default('general'),
+  summary: DurableScalarSchema.optional(),
   ...casFields,
 })
 
@@ -26,8 +39,8 @@ export const RememberAboutUserInputSchema = z.object({
  *  `toTitle` (forward-ref by title). canon: docs/note-model.md#note-ontology */
 export const InlineLinkSchema = z.object({
   to: RefSchema.optional(),
-  toTitle: z.string().min(1).optional(),
-  relation: z.string().min(1),
+  toTitle: DurableNonEmptyScalarSchema.optional(),
+  relation: LinkRelationSchema,
 })
 
 /** Tool `create_note`: create a `user-doc` KB note in a project — the agent picks
@@ -35,14 +48,16 @@ export const InlineLinkSchema = z.object({
 export const CreateNoteInputSchema = z.object({
   ...sessionField,
   project: ProjectHandleSchema,
-  title: z.string().optional(),
-  body: z.string(),
-  path: z.string().optional(),
-  type: z.string().optional(),
-  tags: z.array(z.string()).optional(),
+  title: DurableScalarSchema.optional(),
+  body: DurableTextSchema,
+  // Structural path semantics stay in createOneNote so create_notes can fail one
+  // bad item without rejecting the whole batch at the transport boundary.
+  path: DurableScalarSchema.optional(),
+  type: DurableScalarSchema.optional(),
+  tags: z.array(DurableScalarSchema).optional(),
   links: z.array(InlineLinkSchema).optional(),
   createdAt: IsoTimestampSchema.optional(),
-  fileName: z.string().optional(),
+  fileName: DurableScalarSchema.optional(),
   ...casFields,
 })
 
@@ -88,8 +103,8 @@ export const CreateNotesOutputSchema = z.object({
 export const LinkItemSchema = z.object({
   from: RefSchema,
   to: RefSchema.optional(),
-  toTitle: z.string().min(1).optional(),
-  relation: z.string().min(1),
+  toTitle: DurableNonEmptyScalarSchema.optional(),
+  relation: LinkRelationSchema,
 })
 
 /** Tool `link_many`: best-effort batch of typed links in one call.
@@ -117,9 +132,9 @@ export const LinkManyOutputSchema = z.object({
 export const RememberAboutProjectInputSchema = z.object({
   ...sessionField,
   project: ProjectHandleSchema,
-  observation: z.string().min(1),
-  category: z.string().default('general'),
-  summary: z.string().optional(),
+  observation: DurableNonEmptyTextSchema,
+  category: DurableScalarSchema.default('general'),
+  summary: DurableScalarSchema.optional(),
   ...casFields,
 })
 /** The five word-based edit addressing modes. */
@@ -132,9 +147,9 @@ export const EditNoteInputSchema = z.object({
   ...sessionField,
   ref: RefSchema,
   operation: EditOperationSchema,
-  content: z.string(),
-  section: z.string().optional(),
-  find: z.string().optional(),
+  content: DurableTextSchema,
+  section: DurableScalarSchema.optional(),
+  find: DurableScalarSchema.optional(),
   ...casFields,
 })
 
@@ -144,8 +159,8 @@ export const LinkInputSchema = z.object({
   ...sessionField,
   from: RefSchema,
   to: RefSchema.optional(),
-  toTitle: z.string().min(1).optional(),
-  relation: z.string().min(1),
+  toTitle: DurableNonEmptyScalarSchema.optional(),
+  relation: LinkRelationSchema,
 })
 
 export const LinkOutputSchema = z.object({

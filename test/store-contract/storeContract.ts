@@ -12,7 +12,13 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 import { SyncStatusSchema } from '@notarium/contract'
-import { IF_EXISTS, type KnowledgeStore, type NoteMeta, STORE_ERROR_REASON } from '@notarium/core'
+import {
+  encodeWikilinkIdentity,
+  IF_EXISTS,
+  type KnowledgeStore,
+  type NoteMeta,
+  STORE_ERROR_REASON,
+} from '@notarium/core'
 
 export type StoreFactory = () => Promise<{
   store: KnowledgeStore
@@ -86,6 +92,32 @@ export const describeKnowledgeStoreContract = (
       ] as const) {
         expect(typeof c[key]).toBe('boolean')
       }
+    })
+
+    it('rejects strings that cannot round-trip through UTF-8 and frontmatter', async () => {
+      const lone = String.fromCharCode(0xd800)
+
+      await expect(
+        store.write({ title: `bad${lone}`, directory: dir, content: 'body' }),
+      ).rejects.toMatchObject({ isToolError: true })
+      await expect(
+        store.write({ id: 'a\nb', title: 'Bad id', directory: dir, content: 'body' }),
+      ).rejects.toMatchObject({ isToolError: true })
+      expect((await store.list()).some((note) => note.title.startsWith('bad'))).toBe(false)
+    })
+
+    it('rejects non-canonical or hidden write destinations at the store boundary', async () => {
+      for (const directory of [
+        `${dir}/.lost`,
+        `${dir}//duplicate`,
+        `${dir}\\backslash`,
+        `/absolute/${dir}`,
+      ]) {
+        await expect(
+          store.write({ title: 'Unsafe Destination', directory, content: 'must not land' }),
+        ).rejects.toMatchObject({ isToolError: true })
+      }
+      expect((await store.list()).some((note) => note.title === 'Unsafe Destination')).toBe(false)
     })
 
     it('write → list: both notes appear with full metadata', async () => {
@@ -173,6 +205,52 @@ export const describeKnowledgeStoreContract = (
       await store.remove(idOf(atPath[0]))
     })
 
+    it('bounds a public explicit fileName to one filesystem component', async () => {
+      const written = await store.write({
+        title: 'Contract Long Filename',
+        directory: dir,
+        content: 'long filename body',
+        fileName: '第'.repeat(100),
+      })
+      const basename = baseName(written.filePath!)
+
+      expect(new TextEncoder().encode(basename).length).toBeLessThanOrEqual(255)
+      expect((await store.read(written.id ?? written.filePath!)).content).toBe('long filename body')
+      await store.remove(written.id ?? written.filePath!)
+    })
+
+    it('keeps Windows device names portable publicly but preserves frozen importer paths', async () => {
+      const publicWrite = await store.write({
+        title: 'Public Device Name',
+        directory: dir,
+        content: 'public',
+        fileName: 'CON',
+      })
+
+      expect(baseName(publicWrite.filePath!)).toMatch(/^~con-[a-f0-9]+\.md$/)
+
+      const legacyDirectory = `${dir}/con`
+      const legacyInput = {
+        title: 'Legacy Import Device Name',
+        directory: legacyDirectory,
+        fileName: 'NUL',
+        legacyImportRoot: dir,
+        ifExists: IF_EXISTS.overwrite,
+      } as const
+      const first = await store.write({ ...legacyInput, content: 'v1' })
+      const second = await store.write({ ...legacyInput, content: 'v2' })
+
+      expect(first.filePath).toBe(`${legacyDirectory}/nul.md`)
+      expect(second.filePath).toBe(first.filePath)
+      expect((await store.list()).filter((note) => note.filePath === first.filePath)).toHaveLength(
+        1,
+      )
+      expect((await store.read(second.id ?? second.filePath!)).content).toBe('v2')
+
+      await store.remove(publicWrite.id ?? publicWrite.filePath!)
+      await store.remove(second.id ?? second.filePath!)
+    })
+
     it('refuses a create onto an occupied path unless it asked to overwrite — the default is never clobber', async () => {
       const first = await store.write({
         title: 'Contract Occupied',
@@ -201,6 +279,231 @@ export const describeKnowledgeStoreContract = (
       expect((await store.list()).filter((m) => m.filePath === path)).toHaveLength(1)
 
       await store.remove(idOf(byTitle(await store.list(), 'Contract Occupied')!))
+    })
+
+    // ── A title in a script we cannot romanise must still name a FILE (#296). It
+    //    used to slug to '' and land on `<dir>/.md` — a dot-file the scan hides, so
+    //    the note vanished on the next boot while its bytes sat on disk, and every
+    //    such title aimed at that ONE path, so the second create was refused as a
+    //    duplicate of a visibly different note.
+    it.each([
+      { script: 'Chinese', title: '第三季度规划', other: '会议纪要草稿' },
+      { script: 'Japanese', title: '会議の議事録', other: '設計メモ' },
+      { script: 'Hebrew', title: 'תוכניות לרבעון', other: 'סיכום פגישה' },
+      { script: 'Thai', title: 'แผนไตรมาส', other: 'บันทึกการประชุม' },
+    ])(
+      'names a file for a $script title, and two of them do not collide',
+      async ({ title, other }) => {
+        const a = await store.write({ title, directory: dir, content: 'first body' })
+        // The whole defect in one assertion: a basename, and not a dot-file.
+        const nameOf = (p: string) => p.slice(p.lastIndexOf('/') + 1)
+        expect(nameOf(a.filePath!)).not.toBe('.md')
+        expect(nameOf(a.filePath!).startsWith('.')).toBe(false)
+
+        // A DIFFERENT title in the same folder is a different note, not a collision.
+        const b = await store.write({ title: other, directory: dir, content: 'second body' })
+        expect(b.filePath).not.toBe(a.filePath)
+
+        const listed = await store.list()
+        expect(byTitle(listed, title)).toBeTruthy()
+        expect(byTitle(listed, other)).toBeTruthy()
+        expect((await store.read(idOf(byTitle(listed, title)!))).content).toBe('first body')
+        expect((await store.read(idOf(byTitle(listed, other)!))).content).toBe('second body')
+
+        await store.remove(idOf(byTitle(listed, title)!))
+        await store.remove(idOf(byTitle(listed, other)!))
+      },
+    )
+
+    it('names a file for a title with no letters at all (emoji), and keeps two apart', async () => {
+      // Nothing in the title can name a file, so the id rung does — the fallback the
+      // slug module has always promised and no caller implemented.
+      const a = await store.write({ title: '🎉🎉', directory: dir, content: 'party' })
+      const b = await store.write({ title: '✨✨', directory: dir, content: 'sparkle' })
+      const nameOf = (p: string) => p.slice(p.lastIndexOf('/') + 1)
+      expect(nameOf(a.filePath!)).not.toBe('.md')
+      expect(nameOf(a.filePath!).startsWith('.')).toBe(false)
+      expect(b.filePath).not.toBe(a.filePath)
+
+      const listed = await store.list()
+      expect((await store.read(idOf(byTitle(listed, '🎉🎉')!))).content).toBe('party')
+      expect((await store.read(idOf(byTitle(listed, '✨✨')!))).content).toBe('sparkle')
+
+      await store.remove(idOf(byTitle(listed, '🎉🎉')!))
+      await store.remove(idOf(byTitle(listed, '✨✨')!))
+    })
+
+    it('an unsluggable fileName falls back to the TITLE, not straight to the id', async () => {
+      // The name rungs are ordered `fileName -> title -> id`, and an engine that folds
+      // the first two together skips the middle one: a pinned fileName with nothing
+      // sluggable in it would land on the id here while another engine still names the
+      // file after a perfectly good title — two engines, two destinations, one write.
+      const written = await store.write({
+        title: 'Contract Fallback Title',
+        directory: dir,
+        content: 'body',
+        fileName: '🎉',
+      })
+      expect(written.filePath).toBe(`${dir}/contract-fallback-title.md`)
+
+      await store.remove(idOf(byTitle(await store.list(), 'Contract Fallback Title')!))
+    })
+
+    it('resolves a link to a note whose title has no letters at all', async () => {
+      // Its file is named after the id, so nothing about the PATH says '🎉🎉' — the
+      // title itself has to be a resolve key, or the note is unreachable by its own
+      // name while a ghost stands in for it.
+      await store.write({ title: '🎉🎉', directory: dir, content: 'party' })
+      await store.write({
+        title: 'Contract Emoji Linker',
+        directory: dir,
+        content: 'see [[🎉🎉]]',
+      })
+      const listed = await store.list()
+      // The graph keys nodes the way the READ MODEL does — note-id where the engine has
+      // one, storage path on a bare engine. A create's returned id is not that key: a
+      // bare engine mints one for the file NAME (the id rung) without becoming
+      // identity-capable, so ask the listing rather than the write result.
+      const targetNode = idOf(byTitle(listed, '🎉🎉')!)
+      const linkerId = idOf(byTitle(listed, 'Contract Emoji Linker')!)
+      const graph = await store.graph()
+
+      expect(graph.links.some((l) => l.source === linkerId && l.target === targetNode)).toBe(true)
+
+      await store.remove(idOf(byTitle(listed, '🎉🎉')!))
+      await store.remove(linkerId)
+    })
+
+    it('retires a letterless title into the alias history on rename', async () => {
+      // The name is keyed raw (its slug is empty), and the alias axis has to use the
+      // SAME key — keying on the bare slug drops such a name from the history, so every
+      // inbound [[🎉🎉]] would break silently the moment the note is renamed.
+      await store.write({ title: '🎉🎉', directory: dir, content: 'party' })
+      const listed = await store.list()
+      const noteRef = idOf(byTitle(listed, '🎉🎉')!)
+      await store.write({
+        originalId: noteRef,
+        title: 'Renamed Party',
+        content: 'party',
+        versionToken: store.capabilities.cas ? (await store.read(noteRef)).versionToken : undefined,
+      })
+      const after = await store.list()
+      const renamed = byTitle(after, 'Renamed Party')
+
+      expect(renamed).toBeTruthy()
+      expect((renamed!.aliases ?? []).some((a) => a.trim() === '🎉🎉')).toBe(true)
+
+      await store.remove(idOf(renamed!))
+    })
+
+    it('resolves a letterless name on EVERY surface, not only in the graph', async () => {
+      // The graph, the engine's own reference resolver and the client each keep a copy
+      // of this rule, and a name the branch made addressable has to reach the note on
+      // all of them: a link the graph draws as healthy, whose click 404s, sends the UI
+      // to offer CREATING the note it just linked to.
+      await store.write({ title: '🎉🎉', directory: dir, content: 'party' })
+      const created = byTitle(await store.list(), '🎉🎉')!
+
+      expect((await store.read('🎉🎉')).content).toBe('party')
+
+      // …and it keeps resolving once the name is retired into the alias history.
+      await store.write({
+        originalId: idOf(created),
+        title: 'Renamed Party',
+        content: 'party',
+        versionToken: store.capabilities.cas
+          ? (await store.read(idOf(created))).versionToken
+          : undefined,
+      })
+      expect((await store.read('🎉🎉')).content).toBe('party')
+
+      await store.remove(idOf(byTitle(await store.list(), 'Renamed Party')!))
+    })
+
+    it('keeps two unresolvable multi-segment labels as two distinct ghosts', async () => {
+      // Both slug to the bare separator '/', which is truthy — the guard has to test
+      // whether any SEGMENT survived, or every such ghost merges into one node. Each
+      // engine keeps its own copy of this resolution, so the contract pins both.
+      await store.write({
+        title: 'Contract Ghost Pair',
+        directory: dir,
+        content: 'see [[🎉/🚀]] and [[✨/💫]]',
+      })
+      const linkerId = idOf(byTitle(await store.list(), 'Contract Ghost Pair')!)
+      const graph = await store.graph()
+      const targets = graph.links.filter((l) => l.source === linkerId).map((l) => l.target)
+
+      expect(new Set(targets).size).toBe(2)
+      expect(targets).not.toContain('ghost:/')
+
+      await store.remove(linkerId)
+    })
+
+    // #296 — a label whose LAST segment names nothing is NOT a lookup key. `namePathKey`
+    // is empty for it by design, and both engines must decline to ask the index at all:
+    // a title like `!/` registers the raw key `!/` through `nameKey`'s fallback rung, so
+    // an engine that keys the lookup on the label's total form finds it while the other
+    // serves a ghost. That divergence is invisible in a suite where only one engine runs
+    // — the fake showed a healthy link for a link the shipped engine shows as broken,
+    // and offered to CREATE a note that already exists.
+    it('does not resolve a label whose last segment names nothing, on either engine', async () => {
+      await store.write({ title: '!/', directory: dir, content: 'a real note with an odd name' })
+      await store.write({
+        title: 'Contract Slash Linker',
+        directory: dir,
+        content: 'see [[!/]] and [[journal/]]',
+      })
+      const linkerId = idOf(byTitle(await store.list(), 'Contract Slash Linker')!)
+      const graph = await store.graph()
+      const targets = graph.links.filter((l) => l.source === linkerId).map((l) => l.target)
+
+      // Both are ghosts, and two DISTINCT ones — never a hit on the `!/` note.
+      expect(targets.every((t) => String(t).startsWith('ghost:'))).toBe(true)
+      expect(new Set(targets).size).toBe(2)
+
+      await store.remove(linkerId)
+      await store.remove(idOf(byTitle(await store.list(), '!/')!))
+    })
+
+    // #296 — the ghost's prefill must key BACK to the ghost's own last segment, or a note
+    // created from it re-ghosts and the reader offers to create it again, forever. The
+    // de-kebab that makes `dir/missing-note` read as "Missing Note" mangles a segment kept
+    // raw: `🎉-🚀` would become `🎉 🚀`, which keys somewhere else entirely.
+    it('prefills a path-form ghost with a title that keys back to it', async () => {
+      await store.write({
+        title: 'Contract Prefill Linker',
+        directory: dir,
+        content: 'see [[somewhere/🎉-🚀]]',
+      })
+      const linkerId = idOf(byTitle(await store.list(), 'Contract Prefill Linker')!)
+      const graph = await store.graph()
+      const ghost = graph.nodes.find((n) => n.ghost && String(n.id).includes('🎉'))
+
+      expect(ghost && 'prefillTitle' in ghost ? ghost.prefillTitle : undefined).toBe('🎉-🚀')
+
+      await store.remove(linkerId)
+    })
+
+    it('resolves a wikilink written in an unromanisable script to its note', async () => {
+      // Both labels used to slug to the empty key, so the whole non-Latin corpus
+      // shared one index entry and the graph showed one ghost for all of them.
+      const title = '第三季度规划'
+      const target = await store.write({ title, directory: dir, content: 'target body' })
+      await store.write({
+        title: 'Linker CJK',
+        directory: dir,
+        content: `points to [[${title}]].`,
+      })
+      const listed = await store.list()
+      const targetNode = target.id ?? idOf(byTitle(listed, title)!)
+      const linkerNode = idOf(byTitle(listed, 'Linker CJK')!)
+      const graph = await store.graph()
+
+      expect(graph.links.some((l) => l.source === linkerNode && l.target === targetNode)).toBe(true)
+      expect(graph.nodes.some((n) => n.id === 'ghost:')).toBe(false)
+
+      await store.remove(idOf(byTitle(listed, title)!))
+      await store.remove(linkerNode)
     })
 
     it('honours an explicit fileName on edit (opt-in basename), keeps a note put on a same-basename touch, folder pages keep index.md', async () => {
@@ -246,10 +549,9 @@ export const describeKnowledgeStoreContract = (
       await store.remove(slugged.id ?? slugged.filePath!)
 
       // (3) Load-bearing: a note whose basename DIVERGES from slug(title) (a seeded /
-      // imported file). A metadata-only touch (pin/mute) that hands the CURRENT basename keeps
-      // the file exactly in place AND preserves its id — the property that lets pin then unpin
-      // toggle without a rename-to-slug and the 'a note already lives at the destination'
-      // collision it used to cause. Runs against BOTH engines via this shared spec.
+      // imported file). A metadata/content touch with the same title+folder has NO
+      // move intent, even when it omits fileName; it keeps the path and id. Runs
+      // against BOTH engines via this shared spec.
       const seededPath = `${dir}/legacy-basename.md`
       const seeded = await store.write({
         title: 'Pinned Note Title',
@@ -278,10 +580,9 @@ export const describeKnowledgeStoreContract = (
         content: 'x',
         originalId: seededId,
         versionToken: await tokenFor(seededId),
-        fileName: 'legacy-basename',
         tags: [],
       })
-      expect(unpinned.filePath).toBe(seededPath) // reverse toggle stays put — no collision
+      expect(unpinned.filePath).toBe(seededPath) // omitted fileName still stays put
       await store.remove(unpinned.id ?? unpinned.filePath!)
 
       // (4) Folder-page carve-out unchanged: an index.md page ignores a divergent fileName on
@@ -528,6 +829,100 @@ export const describeKnowledgeStoreContract = (
       expect(g.nodes.some((n) => n.id === idOf(a))).toBe(true)
       expect(g.nodes.some((n) => n.id === idOf(b))).toBe(true)
       expect(g.links.some((l) => l.source === idOf(a) && l.target === idOf(b))).toBe(true)
+    })
+
+    it('resolves an ambiguous current title to the same note in graph and direct read', async () => {
+      const title = 'Contract Shared Title'
+      const first = await store.write({
+        title,
+        directory: `${dir}/a`,
+        content: 'first namesake',
+      })
+      const second = await store.write({
+        title,
+        directory: `${dir}/b`,
+        content: 'second namesake',
+      })
+      const linker = await store.write({
+        title: 'Contract Namesake Linker',
+        directory: dir,
+        content: `see [[${title}]]`,
+      })
+
+      const direct = await store.read(title)
+      const directId = direct.id ?? direct.filePath!
+      const linkerId = linker.id ?? linker.filePath!
+      const edge = (await store.graph()).links.find((l) => l.source === linkerId)
+
+      expect(edge?.target).toBe(directId)
+
+      await store.remove(linkerId)
+      await store.remove(first.id ?? first.filePath!)
+      await store.remove(second.id ?? second.filePath!)
+    })
+
+    it('an authored stable-id link keeps the selected namesake through rename', async () => {
+      if (!store.capabilities.identity) {
+        return
+      }
+      const title = 'Contract Identity Namesake'
+      const first = await store.write({ title, directory: `${dir}/id-a`, content: 'first' })
+      const selected = await store.write({ title, directory: `${dir}/id-b`, content: 'selected' })
+      const linker = await store.write({
+        title: 'Contract Identity Linker',
+        directory: dir,
+        content: `see [[${encodeWikilinkIdentity(selected.id!)}|${title}]]`,
+      })
+      const edgeToSelected = async () =>
+        (await store.graph()).links.some((l) => l.source === linker.id && l.target === selected.id)
+
+      expect(await edgeToSelected()).toBe(true)
+      await store.write({
+        originalId: selected.id,
+        title: 'Contract Renamed Identity',
+        content: 'selected',
+        versionToken: store.capabilities.cas
+          ? (await store.read(selected.id!)).versionToken
+          : undefined,
+      })
+      expect(await edgeToSelected()).toBe(true)
+
+      await store.remove(linker.id!)
+      await store.remove(first.id!)
+      await store.remove(selected.id!)
+    })
+
+    it('keeps a literal `.md` inside a noncanonical identity envelope opaque', async () => {
+      if (!store.capabilities.identity) {
+        return
+      }
+      const plain = await store.write({
+        id: 'contract-opaque-id',
+        title: 'Contract Plain Identity',
+        directory: dir,
+        content: 'plain',
+      })
+      const dotted = await store.write({
+        id: 'contract-opaque-id.md',
+        title: 'Contract Dotted Identity',
+        directory: dir,
+        content: 'dotted',
+      })
+      const address = 'notarium-id:contract-opaque-id.md'
+      const linker = await store.write({
+        title: 'Contract Opaque Identity Linker',
+        directory: dir,
+        content: `[[${address}|dotted]]`,
+      })
+
+      expect((await store.read(address)).id).toBe(dotted.id)
+      expect((await store.graph()).links).toContainEqual(
+        expect.objectContaining({ source: linker.id, target: dotted.id }),
+      )
+
+      await store.remove(linker.id!)
+      await store.remove(plain.id!)
+      await store.remove(dotted.id!)
     })
 
     it('write with originalId renames in place instead of duplicating, keeping the id', async () => {
@@ -1116,6 +1511,36 @@ export const describeKnowledgeStoreContract = (
         )
       })
 
+      it('rejects non-round-trippable folder and move paths', async () => {
+        if (!has()) {
+          return
+        }
+        const lone = String.fromCharCode(0xd800)
+
+        await expect(store.makeDir!(`${dir}/bad${lone}`)).rejects.toMatchObject({
+          isToolError: true,
+        })
+        await expect(
+          store.move({
+            id: `${dir}/source`,
+            destinationPath: `${dir}/bad\npath`,
+            isDirectory: true,
+          }),
+        ).rejects.toMatchObject({ isToolError: true })
+
+        for (const path of [`${dir}/.hidden`, `${dir}//duplicate`, `${dir}\\backslash`]) {
+          await expect(store.makeDir!(path)).rejects.toMatchObject({ isToolError: true })
+        }
+        await expect(store.removeDir!('.git')).rejects.toMatchObject({ isToolError: true })
+        await expect(
+          store.move({
+            id: `${dir}/source`,
+            destinationPath: `${dir}/.hidden`,
+            isDirectory: true,
+          }),
+        ).rejects.toMatchObject({ isToolError: true })
+      })
+
       it('a folder is NOT pruned when its last note leaves (never-prune)', async () => {
         if (!has()) {
           return
@@ -1156,6 +1581,24 @@ export const describeKnowledgeStoreContract = (
         const notes = await store.list()
         expect(notes.some((n) => n.filePath.startsWith(`${dir}/d-dst/`))).toBe(true)
         expect(notes.some((n) => n.filePath.startsWith(`${dir}/d-src/`))).toBe(false)
+      })
+
+      it('allows a case-only folder rename and relocates its notes exactly once', async () => {
+        if (!has()) {
+          return
+        }
+        const source = `${dir}/D-Case`
+        const destination = `${dir}/d-case`
+
+        await store.write({ title: 'D Case Child', content: 'x', directory: source })
+        await store.move({ id: source, destinationPath: destination, isDirectory: true })
+        const notes = (await store.list()).filter((note) => note.title === 'D Case Child')
+
+        expect(notes).toHaveLength(1)
+        expect(notes[0].filePath).toBe(`${destination}/d-case-child.md`)
+        expect(await store.listDirs!()).toContain(destination)
+        expect(await store.listDirs!()).not.toContain(source)
+        await store.removeDir!(destination)
       })
 
       it('removeDir deletes the whole subtree (its notes AND its dirs)', async () => {

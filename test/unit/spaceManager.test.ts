@@ -141,6 +141,50 @@ describe('SpaceManager', () => {
     expect(await manager.resolveNote('ghost')).toBeNull()
   })
 
+  it('resolves an archived identity without booting its unavailable store', async () => {
+    const archived: SpaceRecord = {
+      id: 'archived-space',
+      slug: 'archive',
+      displayName: 'Archive',
+      notesDir: 'archive',
+      aliases: [],
+      createdAt: '2026-06-11T00:00:00.000Z',
+      archivedAt: '2026-06-12T00:00:00.000Z',
+      archivedBy: 'user:tester',
+    }
+    const createStore = vi.fn(() => stubStore())
+    const metaDb = {
+      adoptLegacyRows: async () => {},
+      spaces: {
+        list: async () => [{ ...archived }],
+        getById: async (id: string) => (id === archived.id ? { ...archived } : null),
+        getBySlug: async (slug: string) => (slug === archived.slug ? { ...archived } : null),
+        upsert: async () => {},
+      },
+      identity: {
+        findById: async (id: string) =>
+          id === 'archived-note'
+            ? {
+                id,
+                filePath: 'note.md',
+                space: archived.id,
+                createdAt: null,
+                materialized: true,
+                deletedAt: null,
+              }
+            : null,
+      },
+    } as unknown as SpaceManagerOptions['metaDb']
+    const manager = new SpaceManager({ spaces: [], createStore, metaDb })
+
+    await manager.init()
+    await expect(manager.resolveNote('archived-note')).resolves.toEqual({
+      space: archived.id,
+      deletedAt: null,
+    })
+    expect(createStore).not.toHaveBeenCalled()
+  })
+
   it('capability spaceCreate reflects the wiring; create registers the space', async () => {
     const withoutCreate = new SpaceManager({
       spaces: [{ slug: 'a', displayName: 'A' }],

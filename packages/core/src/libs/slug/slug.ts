@@ -1,11 +1,24 @@
-// The slug algebra: a name/title → a URL-safe handle `[a-z0-9_-]`, also the key the
-// read-model resolves [[wikilinks]] against note identities with.
+// The slug algebra: a name/title → a handle, also the key the read-model resolves
+// [[wikilinks]] against note identities with.
 // canon: docs/note-model.md#note-ontology
 // The ONLY hard requirement is internal consistency — index keys and lookups go
 // through THIS function, so the exact byte form never leaks. Beyond that we aim for
 // readable handles across scripts: Latin (incl. accents), the full Cyrillic block and
-// Greek transliterate; everything else (CJK, Arabic, Hebrew, Thai, emoji) has no
-// romaniser here and slugs to '' — the caller falls back to an id-derived handle.
+// Greek ROMANISE; a script we have no romaniser for (CJK, Arabic, Hebrew, Thai) keeps
+// its own letters rather than being dropped.
+//
+// TWO axes, deliberately two functions (#296):
+//   • `slugify` — the NAME axis: a note's file name, its resolve key, its URL tail.
+//     Total by construction: every title with a letter or a digit in any script gets a
+//     distinct, non-empty handle. Dropping the unromanisable here is what used to send
+//     a CJK title to the path `.md` — a dot-file the scan hides — and collapse every
+//     non-Latin note onto one empty resolve key.
+//   • `asciiSlug` — the HANDLE axis: a space/project handle, which lives in a URL
+//     segment and is pinned to `[a-z0-9_-]` by `SpaceSlugSchema`. It romanises and
+//     returns '' when it cannot, and the caller falls back to `idToSlug` (#123).
+// The dangerous default is the one that silently loses a name, so the plain name is
+// the SAFE function: reaching for ASCII is explicit, and a slip there is caught by
+// the schema rather than by a user losing a note.
 //
 // Underscore is a legal handle character (it survives, never folded to a dash).
 
@@ -121,34 +134,166 @@ const mapChars = (s: string): string => s.replace(/./gu, (ch) => CHAR_MAP[ch] ??
  *  (café→cafe, Schön→schon, naïve→naive) and accented Greek into their base letters. */
 const stripDiacritics = (s: string): string => s.normalize('NFKD').replace(/[̀-ͯ]/g, '')
 
-/** Slug of a single label: camelCase split, lowercase, transliterate, then collapse
- *  anything outside `[a-z0-9_]` to a dash and trim separator edges. May return ''
- *  when the input has no romanisable characters (the caller falls back to an
- *  id-derived handle).
+/** camelCase split → lowercase → romanise what we have tables for. The shared
+ *  first half of both slug functions; they differ only in what survives after it.
  *
  *  The map is applied TWICE around NFKD on purpose. Pass 1 (before NFKD) lets the
  *  Cyrillic rules win where NFKD would otherwise strip meaning — ё→io (NFKD would
  *  decompose ё→е), й→i. Pass 2 (after NFKD) catches base letters NFKD freshly exposes
  *  — accented Greek (ά→NFKD→α→a) only reaches the Greek rules once its tonos is gone.
  *  Latin accents (café→cafe) are handled by NFKD itself either way. */
-export const slugify = (s: string): string => {
+const romanise = (s: string): string => {
   const lowered = String(s)
     .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
     .toLowerCase()
   // Fast path for pure-ASCII input (the common case): the maps and NFKD are no-ops on
   // ASCII, so skip them — slugify is hot (every title + every wikilink resolution pass).
-  const romanised = PRINTABLE_ASCII.test(lowered)
+  //
+  // The fold runs AGAIN between NFKD and the second map pass, and that placement is the
+  // point: NFKD expands the compatibility block into UPPERCASE letters (ϒ→Υ, ℾ→Γ, ㏀→kΩ),
+  // and CHAR_MAP is keyed lowercase — so without it those letters miss the romaniser and
+  // survive as Greek/Cyrillic. Folding only at the very end would hide that (the output
+  // merely looks lowercase) while `slugify(slugify(x)) !== slugify(x)`, which
+  // `parseNoteFile` relies on every time it re-canonicalises a stored `slug:`.
+  return PRINTABLE_ASCII.test(lowered)
     ? lowered
-    : mapChars(stripDiacritics(mapChars(lowered)))
-  return romanised.replace(/[^a-z0-9_]+/g, '-').replace(/^[-_]+|[-_]+$/g, '')
+    : mapChars(stripDiacritics(mapChars(lowered)).toLowerCase())
+}
+
+/** The pre-#296 ASCII storage algebra, frozen for deterministic importer paths.
+ *  Compatibility expansions exposed by NFKD used to keep only the lowercase ASCII
+ *  bytes already present before decomposition; the runtime romaniser intentionally
+ *  fixed that, but reusing it here would move old imports on the next run. */
+const legacyRomanise = (s: string): string => {
+  const lowered = String(s)
+    .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
+    .toLowerCase()
+  return PRINTABLE_ASCII.test(lowered) ? lowered : mapChars(stripDiacritics(mapChars(lowered)))
 }
 
 // Printable ASCII (space … ~). A title outside it (any letter ≥ U+0080, an emoji, a
 // stray control char) takes the transliteration path; everything common stays fast.
 const PRINTABLE_ASCII = /^[ -~]*$/
 
+/** Everything that is NOT a letter, a digit, a combining mark or an underscore —
+ *  collapsed to a dash. Marks are kept because in Thai/Hebrew/Devanagari they carry
+ *  the vowels; dropping them would mangle the word rather than transliterate it.
+ *  Filesystem portability falls out of this class rather than a separate ban-list:
+ *  `< > : " / \ | ? *`, control characters, the dot and the space are none of the
+ *  four, so a name can neither escape its directory nor grow a second extension. */
+const NOT_NAME_CHAR = /[^\p{L}\p{N}\p{M}_]+/gu
+
+/** Variation selectors, dropped BEFORE the class above sees them. They are marks by
+ *  category but they name nothing: VS16 is what makes `❤` render as an emoji, so
+ *  `❤️` would otherwise survive as the single INVISIBLE character U+FE0F — a file whose
+ *  whole name is zero-width, and one shared key for every emoji in that family (❤️ ⚠️
+ *  ✔️ ☀️ …), which is the very defect this module exists to remove. VS17+ selects a
+ *  CJK glyph variant, where dropping it leaves the base ideograph — also what a name
+ *  key wants, since two visually identical ideographs should not take two keys. */
+const VARIATION_SELECTOR = /[\uFE00-\uFE0F\u{E0100}-\u{E01EF}]/gu
+/** A mark names nothing without a kept letter/number before it. Emoji keycaps are
+ *  punctuation/emoji plus U+20E3; once the base is discarded, retaining the mark
+ *  alone creates one invisible filename shared by `#️⃣`, `*️⃣`, and friends. */
+const ORPHAN_MARKS = /(^|[^\p{L}\p{N}\p{M}])\p{M}+/gu
+/** The ASCII half of the same class — the handle axis, `SpaceSlugSchema`'s alphabet. */
+const NOT_ASCII_HANDLE_CHAR = /[^a-z0-9_]+/g
+
+const trimEdges = (s: string): string => s.replace(/^[-_]+|[-_]+$/g, '')
+
+/** Slug of a single NAME (title, wikilink label, path segment): camelCase split,
+ *  lowercase, romanise where we can, then collapse everything that is not a letter,
+ *  digit, mark or underscore to a dash and trim separator edges.
+ *
+ *  TOTAL for any name carrying a letter or a digit, in any script — that is the whole
+ *  point (#296). It still returns '' for a name made only of emoji, punctuation or
+ *  whitespace, which is where the caller falls back to an id-derived handle.
+ *
+ *  NFC on the way out: `romanise` runs NFKD to strip Latin diacritics, and NFKD also
+ *  decomposes Hangul syllables into jamo — without recomposing, the decomposed form
+ *  would be what lands on disk and in the index.
+ *
+ *  The case fold lives inside `romanise`, between NFKD and the second map pass — NOT
+ *  as a final pass here. NFKD expands the compatibility block into UPPERCASE letters
+ *  (™→TM, ㎒→MHz, ϒ→Υ) which the old `[^a-z0-9_]` class scrubbed and this wider one
+ *  keeps; folding there is what lets the romaniser see them AND what keeps a slug a
+ *  case-insensitive key, so `㎒` and `MHz` cannot take two resolve keys and two file
+ *  names a case-insensitive filesystem treats as one. */
+export const slugify = (s: string): string => {
+  const romanised = romanise(s).replace(VARIATION_SELECTOR, '').replace(ORPHAN_MARKS, '$1')
+  const collapsed = trimEdges(romanised.replace(NOT_NAME_CHAR, '-'))
+  return PRINTABLE_ASCII.test(collapsed) ? collapsed : collapsed.normalize('NFC')
+}
+
+/** Slug of a name restricted to the ASCII handle alphabet `[a-z0-9_-]` — the space /
+ *  project handle axis, where the value is a URL segment under `SpaceSlugSchema`.
+ *  Returns '' when the name has no romanisable characters at all; the caller falls
+ *  back to `idToSlug` and soft-suffixes with `uniqueSlug` (#123). Prefer `slugify`
+ *  unless the value really is a schema-pinned handle. */
+export const asciiSlug = (s: string): string =>
+  trimEdges(romanise(s).replace(NOT_ASCII_HANDLE_CHAR, '-'))
+
+/** Frozen legacy slug for persisted importer-owned paths only. New handles must use
+ *  `asciiSlug`; note names must use `slugify`. */
+export const legacyImportSlug = (s: string): string =>
+  trimEdges(legacyRomanise(s).replace(NOT_ASCII_HANDLE_CHAR, '-'))
+
 /** Slugify a path per segment ("Dir Name/Note" → "dir-name/note"). */
 export const slugifyPath = (p: string): string => p.split('/').map(slugify).join('/')
+
+/** The key a NOTE NAME is resolved, deduped and retired by — its slug, or the raw
+ *  NFC case-folded form when the name has nothing sluggable in it. TOTAL where `slugify`
+ *  is not: `[[🎉🎉]]` is a name a human writes and a note can answer to, so every
+ *  surface that matches names — the link index, the resolvers on both engines and the
+ *  client, the alias history, the read-model snapshot — keys on THIS, or one of them
+ *  silently loses a note the others can reach (#296).
+ *
+ *  Use `slugify` for a value that must be a slug (a URL tail, a file name, an anchor);
+ *  use this wherever two NAMES are compared.
+ *
+ *  The raw rung strips variation selectors for the same reason `slugify` does, and it
+ *  is the rung those names actually take: `❤️` and `❤` are one glyph in two legal
+ *  spellings, so keying them apart would file one category's observations under two
+ *  labels a human reads as one, and let a second typed link to the "same" target
+ *  through. */
+const foldNameForMatch = (name: string): string =>
+  name
+    .normalize('NFC')
+    // Preserve the historical ASCII camel boundary before full-ish Unicode folding.
+    .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
+    // JS has no caseFold primitive; upper→lower performs the multi-code-point folds
+    // plain lower misses (e.g. Greek prosgegrammeni) while remaining deterministic.
+    .toUpperCase()
+    .toLowerCase()
+    .normalize('NFC')
+
+export const nameKey = (name: string): string => {
+  const folded = foldNameForMatch(name)
+  return slugify(folded) || folded.replace(VARIATION_SELECTOR, '').trim()
+}
+
+/** `nameKey` per path segment. Empty when the LAST segment names nothing: `journal/`
+ *  (what a legacy `<dir>/.md` file slugs to) is not a name — registering it would hand
+ *  that note the key of its own FOLDER, and resolving it would merge every such broken
+ *  link onto one ghost titled after whichever came last. */
+export const namePathKey = (p: string): string => {
+  const keys = p.split('/').map(nameKey)
+  return keys[keys.length - 1] ? keys.join('/') : ''
+}
+
+/** The key a link LABEL is matched under — `namePathKey`, or the raw label when even
+ *  that is empty. TOTAL: distinct labels never share a key, which is what the two
+ *  callers need and what neither key alone gives. `namePathKey` is deliberately empty
+ *  for `journal/` (see above), and `nameKey` deliberately flattens a path — so keying a
+ *  label on either one alone merges labels the resolver keeps apart, and a surface that
+ *  asks "do we already have this target?" answers yes for a target it has never seen.
+ *
+ *  Not a fourth axis: it is `namePathKey` plus a raw rung, lifted to the whole label.
+ *  The raw rung does NOT strip variation selectors, unlike `nameKey`'s: a label that
+ *  reaches this rung at all is one `namePathKey` emptied, so stripping could only empty
+ *  it further — and an empty key is the one value that WOULD merge distinct labels.
+ *  Callers: `resolveLink`'s ghost target and the typed-link idempotency check, the two
+ *  places that key a label rather than a note's own name. */
+export const linkKey = (label: string): string => namePathKey(label) || label.trim().toLowerCase()
 
 /** A valid handle derived from an OPAQUE id — the fallback when a name has no
  *  romanisable characters (CJK/Arabic/…), so an entity always gets an addressable

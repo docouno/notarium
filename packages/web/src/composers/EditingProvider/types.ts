@@ -7,7 +7,9 @@ type GhostSource = { id?: string; title: string; folder: string }
 export type Ghost = {
   title?: string
   prefillTitle?: string
+  prefillDirectory?: string
   target?: string
+  creatable?: boolean
   sources?: GhostSource[]
 }
 

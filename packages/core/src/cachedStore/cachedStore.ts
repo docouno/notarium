@@ -5,7 +5,13 @@
 // never hangs (cheap inventory answers first, later sweeps fill dates and edges).
 // canon: docs/core.md#read-model · docs/core.md#phased-boot
 
-import { aggregateGraphHealth, type FolderAlias, shapeGraph } from '../graph'
+import {
+  aggregateGraphHealth,
+  buildLinkIndex,
+  type FolderAlias,
+  resolveLink,
+  shapeGraph,
+} from '../graph'
 import { IdentityRegistry } from '../identity'
 import type {
   ExportEntry,
@@ -40,8 +46,14 @@ import {
   StoreError,
 } from '../knowledgeStore'
 import type { AuthorFilter } from '../knowledgeStore'
-import { NOTE_ID_FRONTMATTER_KEY } from '../libs/id'
-import { frontmatterValue } from '../libs/markdown'
+import { isValidNoteId, NOTE_ID_FRONTMATTER_KEY } from '../libs/id'
+import {
+  decodeWikilinkIdentity,
+  encodeWikilinkIdentity,
+  frontmatterValue,
+  isWikilinkIdentityTarget,
+  normalizeWikilinkTarget,
+} from '../libs/markdown'
 import { directoryOf, isPathUnder } from '../libs/path'
 import { normTags } from '../libs/tags'
 import { computeVersionToken } from '../libs/versionToken'
@@ -61,6 +73,7 @@ import { WatchController } from './controllers/watchController'
 import { DirectoryIndex } from './helpers/directoryIndex'
 import { filterGraphForUser } from './helpers/filterGraph'
 import { HistorySurface } from './helpers/historySurface'
+import { supportsExactIdentityAddress } from './helpers/innerIdentity'
 import {
   MutationCoordinator,
   TRASH_MUTATION_PREFIX,
@@ -165,6 +178,30 @@ export class CachedStore implements KnowledgeStore {
    *  established stable mutation resources. Later graph/meta enrichment
    *  failures may degrade reads but do not erase those resources. */
   private mutationInventoryReady = false
+  /** Persisted duplicate ownership is required only at the host's global-id
+   * boundary. Ordinary reads may keep the documented soft degradation after a
+   * failed registry load, but identityReady() must fail closed rather than let a
+   * bare engine arbitrate duplicate frontmatter claims by file order. */
+  private identityLoadError: string | null = null
+  /** The sole load/retry flight. Registry load is a prerequisite of boot, so
+   *  no boot generation can arbitrate file claims against an empty map while
+   *  a retry is installing authoritative ownership. */
+  private identityLoadTask: Promise<void> | null = null
+  /** Snapshot rekeys may run ahead of the global id→space persistence write.
+   * Every public id-producing read waits until this revision is durable, so a
+   * transient meta-DB failure can never expose an id the next request cannot
+   * route back to this store. */
+  private identityPublicationRevision = 0
+  private durableIdentityPublicationRevision = 0
+  /** A revision says persistence still owes work; this barrier says a producer
+   *  may not have put that work in the registry yet. Public reads join both. */
+  private activeIdentityPublications = 0
+  private identityPublicationsSettled: Promise<void> = Promise.resolve()
+  private openIdentityPublicationsSettled: (() => void) | null = null
+  /** Earliest snapshot axis affected by a poll whose identity flush failed.
+   * Once durability recovers, one broad changed event repairs every client
+   * window the failed poll deliberately did not announce. */
+  private pendingIdentityChangeBefore: Set<string> | null = null
   /** Invalidates an older boot's graph completion when a newer authoritative
    *  rebuild wins the main checkpoint first. */
   private bootGeneration = 0
@@ -192,6 +229,7 @@ export class CachedStore implements KnowledgeStore {
   private pollDone: Promise<void> = Promise.resolve()
   private openPollDone: () => void = () => undefined
   private bootRetryDelayMs = 2_000
+  private identityRetryTimer: ReturnType<typeof setTimeout> | null = null
   private pollTimer: ReturnType<typeof setInterval> | null = null
   private reconcileTimer: ReturnType<typeof setTimeout> | null = null
   /** External-change watcher — owns the engine's watch handle + the
@@ -222,12 +260,24 @@ export class CachedStore implements KnowledgeStore {
    *  even while it is waiting behind a trash lease. */
   private readonly externalTasks = new Set<Promise<void>>()
   private listeners = new Set<StoreEventListener>()
+  private graphTransitions = 0
+  private graphTransitionDone: Promise<void> = Promise.resolve()
+  private openGraphTransition: (() => void) | null = null
+  /** setLinkIdentities replaces the whole authoritative map. Snapshot writes mark
+   *  it dirty; exact consumers and bulk broadcasts publish it lazily so a large
+   *  create-only import stays O(N), while mid-import interactive reads are exact. */
+  private innerLinkIdentitiesDirty = true
 
   /** Bulk-write mode, entered by a streaming import (beginBulk/endBulk) —
    *  coalesces `changed` broadcasts and yields background work (see
    *  {@link BulkController}). Its `isActive` is the mode flag emit/poll/graph-refresh
    *  consult. */
   private readonly bulk: BulkController
+  /** Directory/folder-alias changes can retarget old wikilinks. During a bulk
+   *  import coalesce that corpus-wide repair and keep graph reads behind one
+   *  transition barrier until the outer bracket drains. */
+  private readonly bulkGraphContextSources = new Set<string>()
+  private releaseBulkGraphTransition: (() => void) | null = null
   /** The write path — the CAS chokepoint + optimistic snapshot mirror +
    *  journal + trash tombstoning; the class delegates write/move/remove (see
    *  {@link WriteEngine}). */
@@ -253,7 +303,12 @@ export class CachedStore implements KnowledgeStore {
     if (inner.exportNotes) {
       this.exportNotes = (opts) => inner.exportNotes!(opts)
     }
-    this.identity = new IdentityRegistry({ persistence: identityPersistence, space, now })
+    this.identity = new IdentityRegistry({
+      persistence: identityPersistence,
+      space,
+      now,
+      requestFlush: () => this.flushIdentityPublication(),
+    })
     this.space = space ?? DEFAULT_SPACE
     this.journal = new RevisionJournal({
       persistence: revisionPersistence ?? new InMemoryRevisionPersistence(),
@@ -262,12 +317,20 @@ export class CachedStore implements KnowledgeStore {
     })
     this.pollIntervalMs = pollIntervalMs
     this.readBody = readBody
-    this.snap = new Snapshot(relationType)
+    this.snap = new Snapshot(relationType, () => this.dirs.list())
     this.previewCache = new PreviewCache({
       maxSize: previewCacheSize,
       readBody,
       getMeta: (id) => this.snap.notes.get(id),
-      innerPeek: (id) => this.inner.previewPeek(id),
+      innerPeek: (id) => {
+        const currentId = this.canonicalMutationId(id)
+
+        if (!supportsExactIdentityAddress(this.inner) || !this.snap.notes.has(currentId)) {
+          return null
+        }
+        this.syncInnerLinkIdentities()
+        return this.inner.previewPeek(currentId)
+      },
     })
     this.watcher = new WatchController({
       watch: inner.watch?.bind(inner),
@@ -294,7 +357,13 @@ export class CachedStore implements KnowledgeStore {
         // trash lease. Avoid reacquiring the phase gate while that scope owns
         // trash and an opposite read phase is already waiting.
         writeAdmitted: (input) => this.writeAdmitted(input),
-        emitChanged: (upserts, removed) => this.emit({ type: 'changed', upserts, removed }),
+        emitChanged: (upserts, removed) => {
+          this.markInnerLinkIdentitiesDirty()
+          if (!this.bulk.isActive) {
+            this.syncInnerLinkIdentities()
+          }
+          this.emit({ type: 'changed', upserts, removed })
+        },
         reloadHistoricalNames: () => this.reloadHistoricalNames(),
         reresolveGhostsFromIndex: () => this.snap.reresolveGhosts(this.snap.buildIndex()),
         beginBulk: () => this.beginBulk(),
@@ -308,12 +377,15 @@ export class CachedStore implements KnowledgeStore {
         (this.inner as { suspendBackground?: () => void }).suspendBackground?.(),
       resumeBackground: () =>
         (this.inner as { resumeBackground?: () => void }).resumeBackground?.(),
-      flushIdentity: () => this.identity.flush().catch(() => {}),
+      flushIdentity: () => this.flushIdentityPublication(),
+      syncLinkIdentities: () => this.syncInnerLinkIdentities(),
       dispatchChanged: (upserts, removed, folders) =>
         this.dispatch({ type: 'changed', upserts, removed, folders }),
       foldersOf: (ids) => this.foldersOf(ids),
       poll: () => void this.poll(),
       refreshGraph: () => this.graphCache.refreshSoon(),
+      flushGraphContext: () => this.flushBulkGraphContext(),
+      abandonGraphContext: () => this.abandonBulkGraphContext(),
     })
     this.writes = new WriteEngine(
       {
@@ -326,7 +398,21 @@ export class CachedStore implements KnowledgeStore {
         iso: () => this.iso(),
         reconcileSoon: () => this.reconcileSoon(),
         afterNotesReady: (patch) => this.afterNotesReady(patch),
+        rederiveSources: (sourceIds) => this.rederiveSourceEdges(sourceIds),
+        rederiveGraphContext: () => this.rederiveGraphContext(),
+        refreshFolderAliases: () => this.refreshFolderAliases(),
+        beginGraphTransition: () => this.beginGraphTransition(),
+        markInnerLinkIdentitiesDirty: () => this.markInnerLinkIdentitiesDirty(),
+        syncInnerLinkIdentities: () => this.syncInnerLinkIdentities(),
+        beginIdentityPublication: () => this.beginIdentityPublication(),
+        markIdentityPublicationPending: () => this.markIdentityPublicationPending(),
+        flushIdentityPublication: () => this.flushIdentityPublication(),
+        rememberIdentityRepair: (before) => this.rememberIdentityRepair(before),
         emitChanged: (upserts, removed) => {
+          this.markInnerLinkIdentitiesDirty()
+          if (!this.bulk.isActive) {
+            this.syncInnerLinkIdentities()
+          }
           this.invalidateExternalTransitions([...upserts, ...removed])
           this.lastChangeAt = this.iso()
           this.emit({ type: 'changed', upserts, removed })
@@ -350,12 +436,19 @@ export class CachedStore implements KnowledgeStore {
   /** Pull the latest folder path-history from the server registry into the cached
    *  list buildLinkIndex reads. Best-effort — a fetch error keeps the
    *  last good list (a stale folder-alias only delays a heal, never breaks one). */
-  private async refreshFolderAliases(): Promise<void> {
+  private async refreshFolderAliases(): Promise<boolean> {
     if (!this.folderAliasesPort) {
-      return
+      return false
     }
     try {
-      this.snap.folderAliases = await this.folderAliasesPort()
+      const next = await this.folderAliasesPort()
+      const before = new Set(
+        this.snap.folderAliases.map(({ current, alias }) => `${current}\u0000${alias}`),
+      )
+      const after = new Set(next.map(({ current, alias }) => `${current}\u0000${alias}`))
+      const changed = before.size !== after.size || [...after].some((claim) => !before.has(claim))
+
+      this.snap.folderAliases = next
       // Feed the engine too: its boot/rebuild graph then resolves a
       // path-form `[[oldpath/note]]` to a renamed folder's note even when the
       // filename is ambiguous — the read-model alone can only heal GHOSTS (it has
@@ -363,9 +456,75 @@ export class CachedStore implements KnowledgeStore {
       // engine must derive correctly at the source. No-op on an engine that can't
       // (the bare fake — folder identity is server-side, harmless there).
       this.inner.setFolderAliases?.(this.snap.folderAliases)
+      return changed
     } catch {
       // keep the last good list
+      return false
     }
+  }
+
+  /** Refresh the complete directory channel from storage. Notes contribute
+   *  their ancestors, while listDirs supplies the empty folders no note
+   *  inventory can reveal. Publish only a complete successful snapshot; on a
+   *  failed walk listDirs() falls back to the engine instead of trusting stale
+   *  cache state. */
+  private async refreshDirectoryInventory(): Promise<boolean> {
+    let stored: string[]
+
+    try {
+      stored = (await this.inner.listDirs?.()) ?? []
+    } catch (err) {
+      this.directoryInventoryReady = false
+      console.error('[cached-store] directory inventory failed:', (err as Error).message)
+      return false
+    }
+
+    const next = new DirectoryIndex()
+
+    for (const meta of this.snap.notes.values()) {
+      next.add(directoryOf(meta.filePath))
+    }
+    for (const dir of stored) {
+      next.add(dir)
+    }
+
+    const before = new Set(this.dirs.list())
+    const after = next.list()
+    const changed = before.size !== after.length || after.some((dir) => !before.has(dir))
+
+    if (changed) {
+      this.dirs.clear()
+      for (const dir of after) {
+        this.dirs.add(dir)
+      }
+    }
+    this.directoryInventoryReady = true
+    return changed
+  }
+
+  /** Feed the identity-owning snapshot into a path-keyed bare engine. Raw
+   *  frontmatter claims are only hints (external files may be unclaimed or copied);
+   *  this registry mapping is the authority for exact `[[note-id]]` resolution. */
+  private markInnerLinkIdentitiesDirty(): void {
+    if (this.inner.setLinkIdentities) {
+      this.innerLinkIdentitiesDirty = true
+    }
+  }
+
+  private syncInnerLinkIdentities(): void {
+    if (!this.inner.setLinkIdentities || !this.innerLinkIdentitiesDirty) {
+      return
+    }
+    // An empty/phase-1 snapshot is not an authoritative registry projection.
+    // Publishing it would disable the bare engine's frontmatter-id fallback and
+    // make the first cold-start exact read miss until the boot sweep finishes.
+    if (!this.mutationInventoryReady) {
+      return
+    }
+    this.inner.setLinkIdentities(
+      [...this.snap.notes].map(([id, meta]) => ({ id, path: meta.filePath })),
+    )
+    this.innerLinkIdentitiesDirty = false
   }
 
   get capabilities(): StoreCapabilities {
@@ -397,12 +556,10 @@ export class CachedStore implements KnowledgeStore {
     }
     this.started = true
     // The persisted registry loads before the boot scan so inventory adoption
-    // hands out the SAME ids as last run. A failed meta-DB degrades to an
-    // ephemeral registry (P2: losing meta is soft), never a dead store.
-    const boot = this.identity
-      .load()
-      .catch((err) => console.error('[cached-store] identity load failed:', (err as Error).message))
-      .then(() => this.bootScan())
+    // hands out the SAME ids as last run. On failure, keep non-identity engine
+    // degradation available but do not let an empty registry sweep/flush choose
+    // new owners over durable rows. identityReady()/poll retry this checkpoint.
+    const boot = this.loadIdentityAndBoot(false)
     this.bootTask = boot
 
     // Engage the external-change watcher BEFORE arming the periodic timer:
@@ -424,6 +581,100 @@ export class CachedStore implements KnowledgeStore {
     }
 
     return boot
+  }
+
+  private loadIdentityAndBoot(retry: boolean): Promise<void> {
+    if (this.identityLoadTask) {
+      return this.identityLoadTask
+    }
+    const task = (async () => {
+      try {
+        await this.identity.load()
+      } catch (err) {
+        this.failIdentityLoad(err)
+        return
+      }
+      if (this.stopped) {
+        return
+      }
+      if (this.identityRetryTimer) {
+        clearTimeout(this.identityRetryTimer)
+        this.identityRetryTimer = null
+      }
+      this.identityLoadError = null
+      if (retry) {
+        // A failed load never booted, but degraded name reads may have touched
+        // engine caches. Reset every read-model axis before the first
+        // authoritative generation; IdentityRegistry.load() itself installed a
+        // detached map atomically.
+        this.resetBarrier()
+        this.mutationInventoryReady = false
+        this.directoryInventoryReady = false
+        this.resetMutationBarrier()
+        this.snap.clear()
+        this.previewCache.clear()
+        this.graphCache.reset()
+        this.dirs.clear()
+        this.supersededIds.clear()
+        this.externalTransitions.clear()
+        this.cursor = null
+      }
+      await this.bootScan()
+    })()
+    const tracked = task.finally(() => {
+      if (this.identityLoadTask === tracked) {
+        this.identityLoadTask = null
+      }
+    })
+
+    this.identityLoadTask = tracked
+    this.bootTask = tracked
+    return tracked
+  }
+
+  private failIdentityLoad(err: unknown): void {
+    this.identityLoadError = (err as Error).message || String(err)
+    this.phase = SCAN_PHASE.error
+    this.scanError = this.identityLoadError
+    this.openNotesBarrier()
+    this.openMutationBarrier()
+    this.emitStatus()
+    console.error('[cached-store] identity load failed:', this.identityLoadError)
+    if (!this.stopped && !this.identityRetryTimer) {
+      const delay = this.bootRetryDelayMs
+
+      this.bootRetryDelayMs = Math.min(delay * 2, 30_000)
+      this.identityRetryTimer = setTimeout(() => {
+        this.identityRetryTimer = null
+        void this.poll()
+      }, delay)
+
+      this.identityRetryTimer.unref?.()
+    }
+  }
+
+  /** Wait until the persisted identity registry and the boot inventory's
+   * frontmatter reconciliation agree. SpaceManager calls this only after its
+   * global id registry selected this space: an ordinary path/title read keeps the
+   * cheap phase-1 behaviour, while the first id read after lazy boot/eviction can
+   * never reach a bare engine before setLinkIdentities has its authoritative map. */
+  async identityReady(): Promise<void> {
+    if (!this.started) {
+      void this.start()
+    }
+    await this.bootTask
+    if (this.identityLoadError) {
+      await this.loadIdentityAndBoot(true)
+    }
+    await this.ensureIdentityReady()
+    if (this.identityLoadError || !this.mutationInventoryReady || this.stopped) {
+      throw this.identityUnavailable()
+    }
+    try {
+      await this.ensureIdentityPublished()
+    } catch {
+      throw this.identityUnavailable()
+    }
   }
 
   /** The periodic reconcile cadence, derived so it can't drift from watchActive. Watched → the
@@ -457,6 +708,10 @@ export class CachedStore implements KnowledgeStore {
     }
     if (this.reconcileTimer) {
       clearTimeout(this.reconcileTimer)
+    }
+    if (this.identityRetryTimer) {
+      clearTimeout(this.identityRetryTimer)
+      this.identityRetryTimer = null
     }
     this.graphCache.dispose()
     if (this.indexProgressTimer) {
@@ -606,6 +861,11 @@ export class CachedStore implements KnowledgeStore {
         this.snap.notes.set(adopted.id, adopted)
       }
     }
+    // Phase one exposes provisional ids through list/tree. Global id routes
+    // resolve through persistence, not this process-local registry, so publish the
+    // barrier only after the whole inventory batch is routable. A failed flush
+    // leaves the scan in honest error mode instead of emitting ids that 404.
+    await this.identity.flush()
     this.phase = SCAN_PHASE.notes
     this.openNotesBarrier()
     this.emitStatus()
@@ -652,33 +912,28 @@ export class CachedStore implements KnowledgeStore {
       return false
     }
 
-    this.dirs.clear()
-    for (const meta of this.snap.notes.values()) {
-      this.dirs.add(directoryOf(meta.filePath))
-    }
-    try {
-      for (const d of (await this.inner.listDirs?.()) ?? []) {
-        this.dirs.add(d)
-      }
-      this.directoryInventoryReady = true
-    } catch (err) {
-      this.directoryInventoryReady = false
-      console.error('[cached-store] boot directory inventory failed:', (err as Error).message)
-    }
+    await this.refreshDirectoryInventory()
 
     if (generation !== this.bootGeneration || this.stopped) {
       return false
     }
 
+    // Reads/mutations released by the inventory barrier may immediately address
+    // an idless external note by the provisional/durable id settled above. Feed
+    // that final map into a path-keyed exact-address engine before waking them;
+    // waiting for the later graph phase leaves a deterministic not-found window.
+    this.mutationInventoryReady = true
+    this.markInnerLinkIdentitiesDirty()
+    this.syncInnerLinkIdentities()
     // Wake waiters while the global lease remains held. They canonicalize only
     // after this callback publishes the stable inventory and releases it.
-    this.mutationInventoryReady = true
     this.openMutationBarrier()
     this.emit({ type: 'changed', upserts: [...this.snap.notes.keys()], removed: [] })
     return true
   }
 
   private async finishBootGraphClaimed(generation: number): Promise<void> {
+    this.syncInnerLinkIdentities()
     const graph = await this.inner.graph()
 
     if (generation !== this.bootGeneration || this.stopped) {
@@ -758,49 +1013,61 @@ export class CachedStore implements KnowledgeStore {
     if (!this.readBody || !paths.length) {
       return { unresolvedPaths, rekeyed }
     }
+    let identityPublicationPending = false
     const CHUNK = 64
 
     for (let i = 0; i < paths.length; i += CHUNK) {
-      await Promise.all(
+      // Read the slow storage leg concurrently, then fold claims in the caller's
+      // deterministic inventory/path order. Adopting inside Promise callbacks made
+      // duplicate-claim ownership depend on filesystem completion timing.
+      const batch = await Promise.all(
         paths.slice(i, i + CHUNK).map(async (path) => {
-          let raw: string | null = null
-
           try {
-            raw = await this.readBody!(path)
+            return { path, raw: await this.readBody!(path) }
           } catch {
-            return
-          }
-          if (!raw) {
-            return
-          }
-          // A successful raw read is authoritative even when the file has no
-          // materialized claim. Failed/null reads stay unresolved so the
-          // observation falls back to an engine read before journaling.
-          unresolvedPaths.delete(path)
-          const claim = frontmatterValue(raw, NOTE_ID_FRONTMATTER_KEY)
-
-          if (!claim) {
-            return
-          }
-          const res = this.identity.adoptFileId(path, claim)
-
-          if (res.kind === 'duplicate') {
-            // A user-copied file: two files claiming one id. The original
-            // keeps it; this copy lives under its registry id until a save
-            // through us rewrites its frontmatter.
-            console.warn(
-              `[cached-store] duplicate ${NOTE_ID_FRONTMATTER_KEY} "${claim}" in ${path} (owned by ${res.ownerPath}) — keeping the copy's registry id`,
-            )
-          } else if (res.kind === 'adopted' && res.previousId) {
-            rekeyed.push([res.previousId, claim])
+            return { path, raw: null }
           }
         }),
       )
+
+      for (const { path, raw } of batch) {
+        if (raw == null) {
+          continue
+        }
+        // A successful raw read is authoritative even when the file has no
+        // materialized claim. Failed/null reads stay unresolved so the
+        // observation falls back to an engine read before journaling.
+        unresolvedPaths.delete(path)
+        const claim = frontmatterValue(raw, NOTE_ID_FRONTMATTER_KEY)
+
+        if (!claim || !isValidNoteId(claim)) {
+          continue
+        }
+        if (!identityPublicationPending) {
+          this.markIdentityPublicationPending()
+          identityPublicationPending = true
+        }
+        const res = this.identity.adoptFileId(path, claim)
+
+        if (res.kind === 'duplicate') {
+          // A user-copied file: two files claiming one id. The original
+          // keeps it; this copy lives under its registry id until a save
+          // through us rewrites its frontmatter.
+          console.warn(
+            `[cached-store] duplicate ${NOTE_ID_FRONTMATTER_KEY} "${claim}" in ${path} (owned by ${res.ownerPath}) — keeping the copy's registry id`,
+          )
+        } else if (res.kind === 'adopted' && res.previousId) {
+          rekeyed.push([res.previousId, claim])
+        }
+      }
     }
     for (const [oldId, newId] of rekeyed) {
       this.rekeySnapshot(oldId, newId)
     }
-    await this.identity.flush().catch(() => {})
+    if (identityPublicationPending) {
+      await this.flushIdentityPublication()
+    }
+
     return { unresolvedPaths, rekeyed }
   }
 
@@ -828,7 +1095,7 @@ export class CachedStore implements KnowledgeStore {
    *  edges are remapped onto our note-ids; ghost targets pass through. */
   private adoptGraph(graph: Graph): void {
     this.graphCache.resetBaseline()
-    this.snap.adoptEdgeBaseline(graph)
+    this.snap.adoptEdgeBaseline(graph, this.inner.capabilities.identity)
   }
 
   // ── reads ───────────────────────────────────────────────────────────────────
@@ -845,6 +1112,121 @@ export class CachedStore implements KnowledgeStore {
       return
     }
     await this.notesBarrier
+  }
+
+  private markIdentityPublicationPending(): void {
+    this.identityPublicationRevision++
+  }
+
+  /** Close the public-read side before a producer can publish identity-bearing
+   *  state. The producer marks a durable revision immediately before its first
+   *  synchronous registry/snapshot mutation, then releases this lease on every
+   *  success/failure path. */
+  private beginIdentityPublication(): () => void {
+    if (this.activeIdentityPublications++ === 0) {
+      this.identityPublicationsSettled = new Promise<void>((resolve) => {
+        this.openIdentityPublicationsSettled = resolve
+      })
+    }
+    let released = false
+
+    return () => {
+      if (released) {
+        return
+      }
+      released = true
+      this.activeIdentityPublications--
+      if (this.activeIdentityPublications === 0) {
+        this.openIdentityPublicationsSettled?.()
+        this.openIdentityPublicationsSettled = null
+        this.publishPendingIdentityRepair()
+      }
+    }
+  }
+
+  private rememberIdentityRepair(before: ReadonlySet<string>): void {
+    this.pendingIdentityChangeBefore ??= new Set(before)
+    for (const id of before) {
+      this.pendingIdentityChangeBefore.add(id)
+    }
+  }
+
+  private publishPendingIdentityRepair(): void {
+    if (
+      this.activeIdentityPublications !== 0 ||
+      !this.pendingIdentityChangeBefore ||
+      this.durableIdentityPublicationRevision < this.identityPublicationRevision
+    ) {
+      return
+    }
+    const before = this.pendingIdentityChangeBefore
+
+    this.pendingIdentityChangeBefore = null
+    const current = new Set(this.snap.notes.keys())
+
+    this.emit({
+      type: 'changed',
+      upserts: [...current],
+      removed: [...before].filter((id) => !current.has(id)),
+    })
+  }
+
+  /** Flush every identity mutation known at call time and advance the local
+   * publication fence only after persistence confirms it. IdentityRegistry
+   * retains failed dirty rows, so the next reader retries safely. */
+  private async flushIdentityPublication(): Promise<void> {
+    const revision = this.identityPublicationRevision
+
+    await this.identity.flush()
+    this.durableIdentityPublicationRevision = Math.max(
+      this.durableIdentityPublicationRevision,
+      revision,
+    )
+    this.publishPendingIdentityRepair()
+  }
+
+  private async ensureIdentityPublished(): Promise<void> {
+    for (;;) {
+      const barrier = this.identityPublicationsSettled
+
+      await barrier
+      if (barrier !== this.identityPublicationsSettled) {
+        continue
+      }
+      while (this.durableIdentityPublicationRevision < this.identityPublicationRevision) {
+        await this.flushIdentityPublication()
+        // A producer can start while persistence is awaiting. It may not have
+        // dirtied the registry yet, so never accept that flush as the final cut.
+        if (barrier !== this.identityPublicationsSettled) {
+          break
+        }
+      }
+      if (
+        barrier === this.identityPublicationsSettled &&
+        this.activeIdentityPublications === 0 &&
+        this.durableIdentityPublicationRevision >= this.identityPublicationRevision
+      ) {
+        return
+      }
+    }
+  }
+
+  /** Exact-id reads need the boot inventory's final frontmatter reconciliation,
+   *  while list/tree reads may keep serving from the earlier cheap phase. This
+   *  is not mutation admission: a failed boot opens the barrier and the live
+   *  engine fallback still gets a chance. */
+  private async ensureIdentityReady(): Promise<void> {
+    for (;;) {
+      if (this.mutationInventoryReady || this.phase === SCAN_PHASE.error || this.stopped) {
+        return
+      }
+      const barrier = this.mutationBarrier
+
+      await barrier
+      if (barrier === this.mutationBarrier) {
+        return
+      }
+    }
   }
 
   /** Mutations need stable inventory, metadata and durable ids, not merely a
@@ -879,7 +1261,27 @@ export class CachedStore implements KnowledgeStore {
     }
   }
 
+  private identityUnavailable(): StoreError {
+    const err = new StoreError('note identity registry is unavailable')
+
+    err.isUnavailable = true
+    err.reason = 'engine_unavailable'
+    return err
+  }
+
+  private async recoverIdentityForSurface(): Promise<void> {
+    // The load error can appear while a caller is waiting on the cold notes
+    // barrier. Check only after that barrier opens; checking before it creates
+    // the exact load-failure race this guard exists to close.
+    await this.ensureNotes()
+    if (!this.identityLoadError) {
+      return
+    }
+    await this.identityReady()
+  }
+
   async list(opts?: ListOptions): Promise<NoteMeta[]> {
+    await this.recoverIdentityForSurface()
     await this.ensureNotes()
     const scope: ReadScope = opts?.scope ?? READ_SCOPE.user
     const admitted = classesForScope(scope)
@@ -920,7 +1322,21 @@ export class CachedStore implements KnowledgeStore {
     if (servingLive || requested) {
       try {
         const classes = requested ? [...requested] : opts?.classes
-        return projectEngineRows(await this.inner.list({ classes }), !servingLive).filter(visible)
+        const projected = projectEngineRows(
+          await this.inner.list({ classes }),
+          !servingLive,
+        ).filter(visible)
+
+        // A degraded/selective live read may discover paths outside the snapshot.
+        // Do not expose their newly minted ids before global id→space resolution
+        // can route the very next request back to this store.
+        if (!this.inner.capabilities.identity) {
+          await this.flushIdentityPublication()
+        }
+
+        await this.ensureIdentityPublished()
+
+        return projected
       } catch (err) {
         // A graph-only boot failure and a transient derived-index failure both
         // leave a complete authoritative inventory behind. Preserve the
@@ -931,25 +1347,41 @@ export class CachedStore implements KnowledgeStore {
             '[cached-store] selective list failed; serving snapshot:',
             (err as Error).message,
           )
-          return fromSnapshot()
+          const projected = fromSnapshot()
+
+          await this.ensureIdentityPublished()
+          return projected
         }
         throw err
       }
     }
 
-    return fromSnapshot()
+    const projected = fromSnapshot()
+
+    await this.ensureIdentityPublished()
+    return projected
   }
 
   async graph(): Promise<Graph> {
+    await this.recoverIdentityForSurface()
     await this.ensureNotes()
-    // The graph is a user surface: agent-memory (and any non-graph class) is
-    // excluded as nodes AND link targets, always — there is no user scope
-    // that puts memory in the graph in v1, so this surface takes no scope.
-    if (this.isServingLive) {
-      return filterGraphForUser(await this.inner.graph())
-    }
+    return this.readAcrossStableGraphTransition(async () => {
+      // The graph is a user surface: agent-memory (and any non-graph class) is
+      // excluded as nodes AND link targets, always — there is no user scope
+      // that puts memory in the graph in v1, so this surface takes no scope.
+      if (this.isServingLive) {
+        this.syncInnerLinkIdentities()
+        const graph = this.remapBareGraph(filterGraphForUser(await this.inner.graph()))
 
-    return this.graphCache.read()
+        await this.flushIdentityPublication()
+        return graph
+      }
+
+      const graph = await this.graphCache.read()
+
+      await this.ensureIdentityPublished()
+      return graph
+    })
   }
 
   /** Read-only grooming health. Bypasses the incremental edge cache graph() serves (a cached
@@ -957,30 +1389,67 @@ export class CachedStore implements KnowledgeStore {
    *  undercount): folds the engine's FRESH derivation after the SAME hidden-class filter, so the
    *  metric is honest and visibility holds. One fresh derivation per call (a maintenance surface). */
   async graphHealth(): Promise<GraphHealth> {
+    await this.recoverIdentityForSurface()
     await this.ensureNotes()
-    const health = aggregateGraphHealth(filterGraphForUser(await this.inner.graph()))
-    // The engine is identity-agnostic: its graph keys real nodes by STORAGE
-    // PATH. Every other surface speaks note-ids, so adopt path→id here — the SAME remap
-    // the snapshot graph applies when it ingests the engine's links (a card link must
-    // navigate to /n/<id>, not /n/<path>). A note-id-keyed inner (the e2e fake / a bare
-    // engine with no registry) has no path to match, so idFor returns undefined and the
-    // id passes through; ghost ids (`ghost:…`) are synthetic, not paths — they pass too.
-    const idFor = (x: string): string => this.identity.idFor(x) ?? x
-    return {
-      ...health,
-      edges: health.edges.map((e) => ({
-        source: { id: idFor(e.source.id), title: e.source.title },
-        target: { id: idFor(e.target.id), title: e.target.title },
-        via: e.via,
-      })),
-      ghosts: health.ghosts.map((g) => ({
-        ...g,
-        sources: g.sources.map((s) => ({ ...s, id: s.id ? idFor(s.id) : s.id })),
-      })),
+    return this.readAcrossStableGraphTransition(async () => {
+      this.syncInnerLinkIdentities()
+      const graph = this.remapBareGraph(filterGraphForUser(await this.inner.graph()))
+
+      await this.flushIdentityPublication()
+      await this.ensureIdentityPublished()
+      return aggregateGraphHealth(graph)
+    })
+  }
+
+  /** Put a bare engine's live graph onto the same note-id axis as the snapshot.
+   *  Error-mode graph/health cannot return storage paths as ids: navigation and
+   *  backlinks consume them as durable resource identities. The registry may only
+   *  know provisional ids after a pre-inventory boot failure; those are still an
+   *  honest identity axis and re-key when a later exact read discovers a claim. */
+  private remapBareGraph(graph: Graph): Graph {
+    if (this.inner.capabilities.identity) {
+      return graph
     }
+    const ids = new Map<string, string>()
+
+    for (const node of graph.nodes) {
+      if (node.ghost) {
+        continue
+      }
+      const meta = this.adoptMeta({
+        title: node.title,
+        class: node.class,
+        filePath: node.filePath,
+        tags: node.tags,
+        modifiedAt: null,
+        createdAt: null,
+      })
+      ids.set(node.id, meta.id)
+    }
+    const idFor = (id: string): string => ids.get(id) ?? id
+    const links = graph.links.map((link) => ({
+      ...link,
+      source: idFor(link.source),
+      target: idFor(link.target),
+    }))
+    const nodes = graph.nodes.map((node) =>
+      node.ghost
+        ? {
+            ...node,
+            sources: node.sources?.map((source) => ({
+              ...source,
+              id: source.id ? idFor(source.id) : source.id,
+            })),
+          }
+        : { ...node, id: idFor(node.id) },
+    )
+    return { nodes, links }
   }
 
   async search(q: string, opts?: SearchOptions): Promise<SearchResult[]> {
+    await this.recoverIdentityForSurface()
+    await this.ensureNotes()
+    this.syncInnerLinkIdentities()
     const results = await this.inner.search(q, opts)
     // Search stays a passthrough (boundary) — but every hit must map onto a note-id (the wire
     // has no path channel). A hit the registry can't place is an engine-index artifact (or one poll
@@ -996,7 +1465,20 @@ export class CachedStore implements KnowledgeStore {
     const out: SearchResult[] = []
 
     for (const r of results) {
-      const id = r.id ?? (r.filePath ? this.identity.idFor(r.filePath) : undefined)
+      const id =
+        r.id ??
+        (r.filePath
+          ? (this.identity.idFor(r.filePath) ??
+            (this.isServingLive
+              ? this.adoptMeta({
+                  title: r.title ?? r.filePath,
+                  class: r.class,
+                  filePath: r.filePath,
+                  modifiedAt: r.modifiedAt ?? null,
+                  createdAt: r.createdAt ?? null,
+                }).id
+              : undefined))
+          : undefined)
 
       if (!id) {
         console.error(
@@ -1033,6 +1515,11 @@ export class CachedStore implements KnowledgeStore {
       })
     }
 
+    if (this.isServingLive && !this.inner.capabilities.identity) {
+      await this.flushIdentityPublication()
+    }
+
+    await this.ensureIdentityPublished()
     return out
   }
 
@@ -1042,7 +1529,272 @@ export class CachedStore implements KnowledgeStore {
    *  returned — opening a note heals its part of the graph (the engine's
    *  relation index may lag or lie). */
   async read(id: string, opts?: ReadOptions): Promise<NoteContent> {
-    return this.readInternal(id, opts, false)
+    await this.recoverIdentityForSurface()
+    const content = await this.readInternal(id, opts, false)
+
+    await this.ensureIdentityPublished()
+    return content
+  }
+
+  /** Resolve an authored wikilink on the user-graph namespace. Unlike read(), a
+   *  plain spelling is not permanently captured by a tombstoned stable id: only a
+   *  live graph-visible id wins directly, then the shared human-name index gets a
+   *  chance. Reserved identity envelopes remain exact and never fall back. */
+  async resolveWikilink(rawRef: string): Promise<NoteContent> {
+    const content = await this.resolveWikilinkInternal(rawRef)
+
+    await this.ensureIdentityPublished()
+    return content
+  }
+
+  private async resolveWikilinkInternal(rawRef: string): Promise<NoteContent> {
+    await this.ensureNotes()
+    const ref = normalizeWikilinkTarget(rawRef)
+
+    if (!ref) {
+      throw noteNotFound(rawRef)
+    }
+    if (this.identityLoadError) {
+      let exactIdentity = isWikilinkIdentityTarget(ref)
+
+      if (!exactIdentity) {
+        try {
+          exactIdentity = (await this.identity.persistedRecordFor(ref))?.space === this.space
+        } catch {
+          throw this.identityUnavailable()
+        }
+      }
+      if (exactIdentity) {
+        await this.identityReady()
+        // A successful retry rebuilt the snapshot; continue through the normal
+        // exact resolver below. A failed retry throws unavailable here.
+      } else {
+        return this.resolveHumanWithoutIdentity(rawRef, ref)
+      }
+    }
+    // A plain spelling may itself be a stable id. Do not choose a human-name
+    // target from the provisional phase-1 index and only then wait inside the
+    // exact read: the frontmatter sweep can re-key that decision underneath it.
+    await this.ensureIdentityReady()
+    if (this.isServingLive) {
+      return this.resolveLiveWikilink(rawRef, ref)
+    }
+    if (isWikilinkIdentityTarget(ref)) {
+      // The cheap inventory becomes readable before the frontmatter-id sweep is
+      // complete. An exact identity must wait for that authoritative map; otherwise
+      // the first cold-start click can miss a live materialized id deterministically.
+      const id = decodeWikilinkIdentity(ref)
+      const canonical = id == null ? null : this.canonicalMutationId(id)
+
+      // Exact identity changes name lookup semantics, not visibility. Wikilinks
+      // live on the user-graph namespace, where memory/profile stay private.
+      if (
+        canonical == null ||
+        !this.snap.notes.has(canonical) ||
+        !this.snap.isGraphVisibleId(canonical)
+      ) {
+        throw noteNotFound(rawRef)
+      }
+
+      return this.readInternal(ref, { identityOnly: true }, false)
+    }
+    const directId = this.canonicalMutationId(ref)
+    const direct = this.snap.notes.get(directId)
+
+    if (direct && this.snap.isGraphVisibleId(directId)) {
+      return this.readInternal(encodeWikilinkIdentity(directId), { identityOnly: true }, false)
+    }
+    const resolved = resolveLink(ref, this.snap.buildIndex())
+
+    if (resolved.ghost) {
+      throw noteNotFound(rawRef)
+    }
+
+    return this.readInternal(
+      encodeWikilinkIdentity(resolved.targetId),
+      { identityOnly: true },
+      false,
+    )
+  }
+
+  /** Identity-load degradation for the explicitly human scoped resolver.
+   *  Build a one-call path/name index from engine rows and read the selected
+   *  storage path exactly. No adoptMeta/finalizeRead call is allowed here: a
+   *  transient meta failure must not create dirty rows that can overwrite the
+   *  durable duplicate owner before retry. */
+  private async resolveHumanWithoutIdentity(rawRef: string, ref: string): Promise<NoteContent> {
+    const rows = (await this.inner.list({ scope: READ_SCOPE.all })).filter((meta) =>
+      isVisibleOn(SURFACE.graph, meta.class),
+    )
+    let currentFolders: string[] = []
+
+    try {
+      currentFolders = (await this.inner.listDirs?.()) ?? []
+    } catch {
+      // Note-derived ancestors are sufficient for note targets.
+    }
+    const localRows = rows.map((meta) => ({ ...meta, id: meta.id ?? meta.filePath }))
+    const resolved = resolveLink(
+      ref,
+      buildLinkIndex(localRows, this.snap.folderAliases, undefined, currentFolders),
+    )
+
+    if (resolved.ghost) {
+      throw noteNotFound(rawRef)
+    }
+    const selected = localRows.find((meta) => meta.id === resolved.targetId)
+
+    if (!selected) {
+      throw noteNotFound(rawRef)
+    }
+    const detail = await this.inner.read(selected.filePath, { storageOnly: true })
+
+    if (detail.filePath !== selected.filePath || !isVisibleOn(SURFACE.graph, detail.class)) {
+      throw noteNotFound(rawRef)
+    }
+    if (!detail.id) {
+      throw this.identityUnavailable()
+    }
+    let owner: Awaited<ReturnType<IdentityRegistry['persistedRecordFor']>>
+
+    try {
+      owner = await this.identity.persistedRecordFor(detail.id)
+    } catch {
+      throw this.identityUnavailable()
+    }
+    if (
+      !owner ||
+      owner.space !== this.space ||
+      owner.deletedAt != null ||
+      owner.filePath !== selected.filePath
+    ) {
+      throw this.identityUnavailable()
+    }
+
+    return {
+      ...detail,
+      // Point-probed above: useful scoped degradation without inventing a
+      // path-shaped id or mutating the unavailable full registry.
+      id: detail.id,
+      versionToken: detail.versionToken ?? computeVersionToken(detail.content),
+    }
+  }
+
+  /** Resolve against a fresh visible inventory when boot has degraded before it
+   *  could publish an authoritative snapshot. Exact-id probes stay on the identity
+   *  axis; human lookup is built only from graph-visible rows, so passthrough never
+   *  turns a hidden memory/profile namesake into a user wikilink target. */
+  private async resolveLiveWikilink(rawRef: string, ref: string): Promise<NoteContent> {
+    const readVisibleIdentity = async (id: string): Promise<NoteContent> => {
+      const expectedId = this.canonicalMutationId(id)
+      const detail = await this.readInternal(
+        encodeWikilinkIdentity(expectedId),
+        { identityOnly: true },
+        false,
+      )
+      const returnedId = detail.id ? this.canonicalMutationId(detail.id) : expectedId
+
+      if (returnedId !== expectedId || !isVisibleOn(SURFACE.graph, detail.class)) {
+        throw noteNotFound(rawRef)
+      }
+
+      return detail
+    }
+
+    if (isWikilinkIdentityTarget(ref)) {
+      const id = decodeWikilinkIdentity(ref)
+
+      if (id == null) {
+        throw noteNotFound(rawRef)
+      }
+
+      return readVisibleIdentity(this.canonicalMutationId(id))
+    }
+
+    // A live graph-visible stable id has the same priority as it does in the
+    // healthy snapshot path. A hidden exact hit deliberately falls through to
+    // human lookup, where a visible namesake may still win.
+    try {
+      return await readVisibleIdentity(this.canonicalMutationId(ref))
+    } catch (err) {
+      if (!(err as StoreError).isNotFound) {
+        throw err
+      }
+    }
+
+    // A live file read can be fresher than a degraded engine index. Feed those
+    // observed rows back into subsequent resolver decisions so a same-path
+    // replacement cannot satisfy the stale title/id that selected its predecessor.
+    const observed = new Map<string, NoteMeta & { id: string }>()
+
+    const selectLive = async (): Promise<NoteMeta & { id: string }> => {
+      const notes = (await this.inner.list({ scope: READ_SCOPE.all }))
+        .map((meta) => observed.get(meta.filePath) ?? this.adoptMeta(meta))
+        .filter((meta) => isVisibleOn(SURFACE.graph, meta.class))
+      let currentFolders: string[] = []
+
+      try {
+        currentFolders = (await this.inner.listDirs?.()) ?? []
+      } catch {
+        // Note-derived ancestors still make a complete index for note targets.
+      }
+      const resolved = resolveLink(
+        ref,
+        buildLinkIndex(notes, this.snap.folderAliases, undefined, currentFolders),
+      )
+
+      if (resolved.ghost) {
+        throw noteNotFound(rawRef)
+      }
+      const selected = notes.find((meta) => meta.id === resolved.targetId)
+
+      if (!selected) {
+        throw noteNotFound(rawRef)
+      }
+
+      return selected
+    }
+
+    // A path-keyed engine may not know a provisional registry id when boot
+    // failed before the frontmatter sweep. Prefer the exact id; on its miss read
+    // the selected live path and re-resolve once so a list/read replacement race
+    // cannot return a different note that merely occupied the same lookup slot.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const selected = await selectLive()
+
+      let detail: NoteContent
+
+      try {
+        detail = await readVisibleIdentity(selected.id)
+      } catch (err) {
+        if (!(err as StoreError).isNotFound) {
+          throw err
+        }
+        detail = await this.readInternal(selected.filePath, undefined, false)
+      }
+
+      if (detail.filePath !== selected.filePath || !isVisibleOn(SURFACE.graph, detail.class)) {
+        throw noteNotFound(rawRef)
+      }
+      observed.set(detail.filePath, {
+        id: detail.id ?? selected.id,
+        title: detail.title ?? selected.title,
+        class: detail.class,
+        filePath: detail.filePath,
+        ...(detail.slug ? { slug: detail.slug } : {}),
+        ...(detail.aliases?.length ? { aliases: detail.aliases } : {}),
+        modifiedAt: detail.modifiedAt ?? null,
+        createdAt: detail.createdAt ?? null,
+      })
+      const current = await selectLive()
+      const currentId = this.canonicalMutationId(current.id)
+      const returnedId = detail.id ? this.canonicalMutationId(detail.id) : currentId
+
+      if (current.filePath === detail.filePath && currentId === returnedId) {
+        return detail
+      }
+    }
+    throw noteNotFound(rawRef)
   }
 
   /** Same read finalization when the caller already owns the relevant main
@@ -1063,14 +1815,49 @@ export class CachedStore implements KnowledgeStore {
     effects?: ReadEffects,
     admissionHeld = false,
   ): Promise<NoteContent> {
-    const initialDirectId = this.canonicalMutationId(rawId)
+    const identityTarget = normalizeWikilinkTarget(rawId)
+    const identityEnvelopeSyntax = isWikilinkIdentityTarget(identityTarget)
+
+    if (identityEnvelopeSyntax) {
+      await this.ensureNotes()
+      await this.ensureIdentityReady()
+    }
+    const rawEnvelopeIdentityOwner =
+      identityEnvelopeSyntax &&
+      !opts?.identityOnly &&
+      (this.snap.notes.has(rawId) || this.identity.recordFor(rawId) !== undefined)
+        ? rawId
+        : undefined
+    // A public storage read must round-trip every literal path returned by list(),
+    // including a legacy root file whose name occupies the reserved envelope
+    // namespace. Authored links set identityOnly and deliberately skip this axis.
+    const exactEnvelopePathOwner =
+      identityEnvelopeSyntax && !opts?.identityOnly && rawEnvelopeIdentityOwner === undefined
+        ? (this.identity.idFor(rawId) ??
+          [...this.snap.notes].find(([, meta]) => meta.filePath === rawId)?.[0])
+        : undefined
+    const identityEnvelope =
+      identityEnvelopeSyntax &&
+      rawEnvelopeIdentityOwner === undefined &&
+      exactEnvelopePathOwner === undefined
+    const envelopedId = decodeWikilinkIdentity(identityTarget)
+
+    // The namespace is reserved even when its payload is malformed. Treating the
+    // literal spelling as an ordinary opaque id would make direct read open a note
+    // which graph resolution correctly keeps as a non-creatable tombstone.
+    if (identityEnvelope && envelopedId == null) {
+      throw noteNotFound(rawId)
+    }
+    const requestedId = identityEnvelope && envelopedId != null ? envelopedId : rawId
+    const initialDirectId = this.canonicalMutationId(requestedId)
     // A stable id keeps denoting that note even if its old path is reused. A
     // path/title/permalink is a resolver instead and is deliberately resolved
     // again after a preceding mutation has finished.
     const stableIdRequest =
-      initialDirectId !== rawId ||
-      this.snap.notes.has(initialDirectId) ||
-      this.identity.recordFor(initialDirectId) !== undefined
+      exactEnvelopePathOwner === undefined &&
+      (initialDirectId !== rawId ||
+        this.snap.notes.has(initialDirectId) ||
+        this.identity.recordFor(initialDirectId) !== undefined)
 
     const target = (): {
       id: string
@@ -1078,17 +1865,22 @@ export class CachedStore implements KnowledgeStore {
       storageKey: string
       needsGlobalClaim: boolean
     } => {
-      const directId = this.canonicalMutationId(rawId)
+      const directId = this.canonicalMutationId(requestedId)
       let owner: string | undefined
 
-      if (stableIdRequest) {
+      if (exactEnvelopePathOwner !== undefined) {
+        owner = exactEnvelopePathOwner
+      } else if (stableIdRequest) {
         owner = directId
       } else {
-        const matches = [...this.snap.notes].filter(
-          ([, meta]) => meta.filePath === rawId || meta.title === rawId,
-        )
+        // Exact path is an identity hint. A title is not: choosing a unique exact
+        // title here can bypass a higher-priority filename in the inner store and
+        // make CachedStore resolve a different note than graph/client. Name lookup
+        // belongs to the shared resolver below the cache.
+        const matches = [...this.snap.notes].filter(([, meta]) => meta.filePath === requestedId)
 
-        owner = this.identity.idFor(rawId) ?? (matches.length === 1 ? matches[0][0] : undefined)
+        owner =
+          this.identity.idFor(requestedId) ?? (matches.length === 1 ? matches[0][0] : undefined)
       }
       const id = this.canonicalMutationId(owner ?? directId)
       const path = this.identity.pathFor(id) ?? this.snap.notes.get(id)?.filePath
@@ -1096,7 +1888,7 @@ export class CachedStore implements KnowledgeStore {
       return {
         id,
         path,
-        storageKey: path ?? (owner ? id : rawId),
+        storageKey: path ?? (owner ? id : requestedId),
         needsGlobalClaim: owner === undefined && path === undefined,
       }
     }
@@ -1108,7 +1900,11 @@ export class CachedStore implements KnowledgeStore {
       // A bare engine has no id channel: handing a deleted stable id to its
       // generic resolver could open an unrelated note whose path/title/slug
       // happens to equal that id. Only the explicit trash view may answer it.
-      if (stableIdRequest && !this.inner.capabilities.identity && current.path === undefined) {
+      if (
+        stableIdRequest &&
+        !supportsExactIdentityAddress(this.inner) &&
+        current.path === undefined
+      ) {
         if (opts?.deletedView) {
           const gone = await this.trash.deletedNoteView(current.id)
 
@@ -1120,7 +1916,31 @@ export class CachedStore implements KnowledgeStore {
       }
 
       try {
-        detail = await this.inner.read(current.storageKey, opts)
+        // Preserve every RECOGNISED stable-id request all the way into an
+        // identity-capable engine, even when the public caller used the ordinary raw
+        // id form. Passing its snapshot path after an external delete would let the
+        // engine's human resolver fall through from that missing path onto a namesake.
+        const useAuthoritativePath =
+          stableIdRequest && current.path !== undefined && !this.inner.capabilities.identity
+        const innerKey = useAuthoritativePath
+          ? current.path!
+          : supportsExactIdentityAddress(this.inner) && stableIdRequest
+            ? identityEnvelope
+              ? identityTarget
+              : encodeWikilinkIdentity(current.id)
+            : current.storageKey
+
+        if (supportsExactIdentityAddress(this.inner) && stableIdRequest) {
+          this.syncInnerLinkIdentities()
+        }
+        detail = await this.inner.read(
+          innerKey,
+          useAuthoritativePath
+            ? { ...opts, identityOnly: false, storageOnly: true }
+            : supportsExactIdentityAddress(this.inner) && stableIdRequest
+              ? { ...opts, identityOnly: true }
+              : opts,
+        )
       } catch (err) {
         // A trashed note has no live file — serve its last journaled state so
         // the reader can open it by /n/<id> under a "deleted" banner instead of a
@@ -1136,13 +1956,20 @@ export class CachedStore implements KnowledgeStore {
         }
         throw err
       }
+      // A persisted registry path is the stable id's authoritative owner. A
+      // degraded inner resolver that crosses from that missing/ambiguous path to a
+      // duplicate claim or namesake must fail closed, never have finalizeRead stamp
+      // the requested id onto the wrong body.
+      if (stableIdRequest && current.path !== undefined && detail.filePath !== current.path) {
+        throw noteNotFound(current.id)
+      }
       const bodyClaim = detail.frontmatter?.[NOTE_ID_FRONTMATTER_KEY]
 
       if (
         claimedIds &&
         !this.inner.capabilities.identity &&
         typeof bodyClaim === 'string' &&
-        bodyClaim
+        isValidNoteId(bodyClaim)
       ) {
         const claimedId = this.canonicalMutationId(bodyClaim)
 
@@ -1158,10 +1985,54 @@ export class CachedStore implements KnowledgeStore {
       // the body, but must not patch identity/preview/edges outside the lease.
       const allowSideEffects = current.path === undefined || detail.filePath === current.path
 
-      return {
-        kind: 'complete',
-        content: this.finalizeRead(current.id, current.path, detail, allowSideEffects, effects),
+      // A direct read owns its event publication. Keep every snapshot side-effect
+      // buffered until the identity flush below succeeds; callers such as poll()
+      // pass their own accumulator and publish at their wider checkpoint.
+      const readEffects = effects ?? { rekeyed: [], changedIds: new Set<string>() }
+      const mayRekey =
+        !effects &&
+        !this.inner.capabilities.identity &&
+        typeof bodyClaim === 'string' &&
+        isValidNoteId(bodyClaim) &&
+        this.canonicalMutationId(bodyClaim) !== current.id
+      // Snapshotting the corpus is only needed on the rare lazy-adoption path,
+      // never on an ordinary hot read.
+      const identityBefore = mayRekey ? new Set(this.snap.notes.keys()) : undefined
+      const content = this.finalizeRead(
+        current.id,
+        current.path,
+        detail,
+        allowSideEffects,
+        readEffects,
+      )
+
+      // A lazy frontmatter adoption can re-key a phase-one provisional id. The
+      // returned durable id is immediately used by URL replacement and later API
+      // calls, whose global resolver reads persistence; settle it before exposure.
+      try {
+        if (!this.inner.capabilities.identity) {
+          await this.flushIdentityPublication()
+        }
+      } catch (err) {
+        // The snapshot already carries the new axis, but no client has heard it.
+        // Retain the pre-read population so the first later successful flush emits
+        // one broad repair; never announce an id its global route cannot resolve.
+        if (readEffects.rekeyed.length > 0 || readEffects.changedIds.size > 0) {
+          const before = identityBefore ?? new Set(this.snap.notes.keys())
+
+          this.pendingIdentityChangeBefore ??= before
+          for (const id of before) {
+            this.pendingIdentityChangeBefore.add(id)
+          }
+        }
+        throw err
       }
+
+      if (!effects) {
+        this.emitReadEffects(readEffects)
+      }
+
+      return { kind: 'complete', content }
     }
 
     const needsIdentityAdmission = !this.inner.capabilities.identity && !admissionHeld
@@ -1246,12 +2117,15 @@ export class CachedStore implements KnowledgeStore {
         // passing through may carry a frontmatter id the sweep never saw.
         const claim = detail.frontmatter?.[NOTE_ID_FRONTMATTER_KEY]
 
-        if (typeof claim === 'string' && claim) {
+        if (typeof claim === 'string' && isValidNoteId(claim)) {
           const res = this.identity.adoptFileId(detail.filePath, claim)
 
           if (res.kind === 'adopted') {
             if (res.previousId) {
+              this.markIdentityPublicationPending()
               this.rekeySnapshot(res.previousId, claim)
+              this.markInnerLinkIdentitiesDirty()
+              this.syncInnerLinkIdentities()
               if (effects) {
                 effects.rekeyed.push([res.previousId, claim])
               } else {
@@ -1297,6 +2171,26 @@ export class CachedStore implements KnowledgeStore {
     }
   }
 
+  /** Publish snapshot effects accumulated by one direct read. The caller invokes
+   * this only after identity durability succeeds, so an SSE consumer can route
+   * every upsert immediately. */
+  private emitReadEffects(effects: ReadEffects): void {
+    const rekeyedRemoved = new Set(effects.rekeyed.map(([oldId]) => oldId))
+    const upserts = [
+      ...new Set([
+        ...effects.rekeyed.map(([, newId]) => newId),
+        ...[...effects.changedIds].map((id) => this.canonicalMutationId(id)),
+      ]),
+    ].filter((id) => this.snap.notes.has(id))
+    const removed = [...rekeyedRemoved]
+
+    if (!upserts.length && !removed.length) {
+      return
+    }
+    this.lastChangeAt = this.iso()
+    this.emit({ type: 'changed', upserts, removed })
+  }
+
   private liveOwnerAtPath(filePath: string): string | undefined {
     return (
       this.identity.idFor(filePath) ??
@@ -1310,6 +2204,8 @@ export class CachedStore implements KnowledgeStore {
    *  note's id, so requests by title/path warm the same entry) when the host
    *  has no local files or the file read fails. */
   async preview(id: string, opts?: ReadOptions): Promise<Preview> {
+    await this.recoverIdentityForSurface()
+    await this.ensureIdentityPublished()
     const hit = this.previewPeek(id)
 
     if (hit) {
@@ -1328,11 +2224,16 @@ export class CachedStore implements KnowledgeStore {
     )
 
     if (fromFile) {
+      await this.ensureIdentityPublished()
       return fromFile
     }
     const detail = await this.read(id, opts)
     const key = detail.id || id
-    return this.previewCache.get(key) ?? derivePreview(detail.content, detail.frontmatter?.tags)
+    const preview =
+      this.previewCache.get(key) ?? derivePreview(detail.content, detail.frontmatter?.tags)
+
+    await this.ensureIdentityPublished()
+    return preview
   }
 
   /** One batch (POST /api/previews): warm hits answer inline, cold ones derive
@@ -1364,6 +2265,13 @@ export class CachedStore implements KnowledgeStore {
   /** Cache-only peek (the inline `?preview=1` decoration of a notes window):
    *  warm value or null, never an engine read. A hit refreshes LRU recency. */
   previewPeek(id: string): Preview | null {
+    if (
+      this.activeIdentityPublications !== 0 ||
+      this.durableIdentityPublicationRevision < this.identityPublicationRevision
+    ) {
+      return null
+    }
+
     return this.previewCache.peek(id)
   }
 
@@ -1401,24 +2309,202 @@ export class CachedStore implements KnowledgeStore {
     })
   }
 
+  /** Re-resolve every user-graph source after directory inventory or folder
+   *  aliases change. Hidden classes never participate in this resolver context,
+   *  so reading their bodies is both wasted work and a visibility footgun. A bulk
+   *  bracket defers the corpus pass and holds graph readers behind one transition
+   *  barrier; endBulk publishes exactly one coherent repair. */
+  private async rederiveGraphContext(): Promise<void> {
+    if (this.bulk.isActive) {
+      for (const id of this.snap.notes.keys()) {
+        if (this.snap.isGraphVisibleId(id)) {
+          this.bulkGraphContextSources.add(id)
+        }
+      }
+      if (this.bulkGraphContextSources.size) {
+        this.releaseBulkGraphTransition ??= this.beginGraphTransition()
+      }
+
+      return
+    }
+
+    await this.rederiveSourceEdges(
+      [...this.snap.notes.keys()].filter((id) => this.snap.isGraphVisibleId(id)),
+    )
+  }
+
+  private async flushBulkGraphContext(): Promise<void> {
+    if (!this.bulkGraphContextSources.size) {
+      return
+    }
+
+    try {
+      await this.mutations.run({ global: true }, async () => {
+        while (this.bulkGraphContextSources.size) {
+          const sourceIds = [...this.bulkGraphContextSources]
+          this.bulkGraphContextSources.clear()
+          await this.rederiveSourceEdges(sourceIds)
+        }
+      })
+    } catch (err) {
+      console.error('[cached-store] bulk graph-context rebuild failed:', (err as Error).message)
+      this.reconcileSoon()
+    } finally {
+      this.releaseBulkGraphTransition?.()
+      this.releaseBulkGraphTransition = null
+      this.bulkGraphContextSources.clear()
+    }
+  }
+
+  private abandonBulkGraphContext(): void {
+    this.bulkGraphContextSources.clear()
+    this.releaseBulkGraphTransition?.()
+    this.releaseBulkGraphTransition = null
+  }
+
+  /** Re-derive the selected source notes from their live bodies after a target
+   *  disappears. The edge cache is intentionally lossy (duplicate target edges are
+   *  collapsed), so it cannot reconstruct whether the author wrote a human forward
+   *  reference, a stable-id envelope, or both. A source-body read is the smallest
+   *  authoritative repair; if one cannot be read, repair only that source from the
+   *  engine's fresh graph so unrelated writers remain concurrent. */
+  private async rederiveSourceEdges(rawSourceIds: readonly string[]): Promise<void> {
+    const sourceIds = [
+      ...new Set(rawSourceIds.map((sourceId) => this.canonicalMutationId(sourceId))),
+    ].filter((sourceId) => this.snap.notes.has(sourceId))
+
+    if (!sourceIds.length) {
+      return
+    }
+    this.syncInnerLinkIdentities()
+    const index = this.snap.buildIndex()
+    const baselineSources: string[] = []
+
+    for (const sourceId of sourceIds) {
+      const meta = this.snap.notes.get(sourceId)
+
+      if (!meta) {
+        continue
+      }
+      const storageKey = supportsExactIdentityAddress(this.inner)
+        ? encodeWikilinkIdentity(sourceId)
+        : (this.identity.pathFor(sourceId) ?? meta.filePath)
+
+      try {
+        const detail = await this.inner.read(
+          storageKey,
+          supportsExactIdentityAddress(this.inner) ? { identityOnly: true } : undefined,
+        )
+
+        this.snap.patchNoteEdges(sourceId, detail.content, {
+          index,
+          deferReresolve: true,
+        })
+      } catch {
+        // Never retain an edge whose meaning changed with the vanished target.
+        // The fresh graph below can restore this bucket without guessing.
+        this.snap.edgesBySource.delete(sourceId)
+        baselineSources.push(sourceId)
+      }
+    }
+
+    if (!baselineSources.length) {
+      this.snap.reresolveGhosts(index)
+      return
+    }
+
+    try {
+      // The removed id must leave the bare engine's exact-link registry BEFORE it
+      // derives the fallback graph; otherwise a stable envelope still resolves to
+      // the vanished path and is downgraded to a creatable human ghost.
+      this.syncInnerLinkIdentities()
+      this.snap.adoptSourceEdgeBaseline(
+        await this.inner.graph(),
+        baselineSources,
+        this.inner.capabilities.identity,
+      )
+      this.snap.reresolveGhosts(this.snap.buildIndex())
+    } catch (err) {
+      console.error(
+        '[cached-store] graph re-derivation after target removal failed:',
+        (err as Error).message,
+      )
+      this.reconcileSoon()
+    }
+  }
+
+  /** A physical delete and its async inbound-edge re-derivation publish as one
+   *  graph transition. Concurrent transitions share the barrier; the last one
+   *  opens it. Snapshot reads are synchronous after their await, so a transition
+   *  cannot interleave between the barrier check and graph shaping. */
+  private beginGraphTransition(): () => void {
+    if (this.graphTransitions++ === 0) {
+      this.graphTransitionDone = new Promise<void>((resolve) => {
+        this.openGraphTransition = resolve
+      })
+    }
+    let released = false
+
+    return () => {
+      if (released) {
+        return
+      }
+      released = true
+      this.graphTransitions--
+      if (this.graphTransitions === 0) {
+        this.openGraphTransition?.()
+        this.openGraphTransition = null
+      }
+    }
+  }
+
+  /** Run an async fresh-graph read against one stable transition generation.
+   *  Waiting only once is insufficient: a delete can start while inner.graph()
+   *  itself is awaiting. In that case discard the hybrid result, join the new
+   *  barrier and retry from the coherent post-state. */
+  private async readAcrossStableGraphTransition<T>(read: () => Promise<T>): Promise<T> {
+    for (;;) {
+      const barrier = this.graphTransitionDone
+
+      await barrier
+      if (barrier !== this.graphTransitionDone) {
+        continue
+      }
+      const result = await read()
+
+      if (barrier === this.graphTransitionDone && this.graphTransitions === 0) {
+        return result
+      }
+    }
+  }
+
   // ── revision journal surface ──────────────────────────────────────────
 
   // ── history + trash — delegated to HistorySurface ────────────────────
 
+  private async readIdentitySurface<T>(read: () => Promise<T>): Promise<T> {
+    await this.recoverIdentityForSurface()
+    await this.ensureIdentityPublished()
+    const result = await read()
+
+    await this.ensureIdentityPublished()
+    return result
+  }
+
   revisions(noteId: string, opts: { offset: number; limit: number }) {
-    return this.trash.revisions(noteId, opts)
+    return this.readIdentitySurface(() => this.trash.revisions(noteId, opts))
   }
 
   latestRevisions(noteIds: readonly string[]) {
-    return this.trash.latestRevisions(noteIds)
+    return this.readIdentitySurface(() => this.trash.latestRevisions(noteIds))
   }
 
   revision(noteId: string, revisionId: string) {
-    return this.trash.revision(noteId, revisionId)
+    return this.readIdentitySurface(() => this.trash.revision(noteId, revisionId))
   }
 
   revisionsSince(sinceRevId: string | null, limit: number) {
-    return this.trash.revisionsSince(sinceRevId, limit)
+    return this.readIdentitySurface(() => this.trash.revisionsSince(sinceRevId, limit))
   }
 
   activity(opts: {
@@ -1428,7 +2514,7 @@ export class CachedStore implements KnowledgeStore {
     scope?: ReadScope
     author?: AuthorFilter
   }) {
-    return this.trash.activity(opts)
+    return this.readIdentitySurface(() => this.trash.activity(opts))
   }
 
   activityEvents(opts: {
@@ -1439,11 +2525,11 @@ export class CachedStore implements KnowledgeStore {
     scope?: ReadScope
     author?: AuthorFilter
   }) {
-    return this.trash.activityEvents(opts)
+    return this.readIdentitySurface(() => this.trash.activityEvents(opts))
   }
 
   activityByNote(opts: { from: string; to: string; scope?: ReadScope }) {
-    return this.trash.activityByNote(opts)
+    return this.readIdentitySurface(() => this.trash.activityByNote(opts))
   }
 
   restore(input: RestoreInput) {
@@ -1451,7 +2537,7 @@ export class CachedStore implements KnowledgeStore {
   }
 
   listTrashed(opts: { offset: number; limit: number; q?: string; scope?: ReadScope }) {
-    return this.trash.listTrashed(opts)
+    return this.readIdentitySurface(() => this.trash.listTrashed(opts))
   }
 
   restoreFromTrash(id: string, opts?: { principal?: string }) {
@@ -1615,9 +2701,17 @@ export class CachedStore implements KnowledgeStore {
       this.openPollDone = resolve
     })
     let releaseMutationAdmission: (() => void) | undefined
+    let releaseIdentityPublication: (() => void) | undefined
+    let identityBefore: Set<string> | null = null
 
     try {
       if (this.phase === SCAN_PHASE.error) {
+        if (this.identityLoadError) {
+          await this.loadIdentityAndBoot(true)
+          if (!strict || this.identityLoadError) {
+            return
+          }
+        }
         // A late graph failure did not invalidate the already-quiesced
         // inventory. Retry only enrichment: do not reblock writes or merge a
         // second full-list snapshot over admitted mutations.
@@ -1671,12 +2765,14 @@ export class CachedStore implements KnowledgeStore {
 
         return
       }
+      identityBefore = new Set(this.snap.notes.keys())
       const changed = await this.mutations.run({ global: true }, async () => {
         // Pull path-history only after the global claim has waited for an older
         // folder move's storage/finalize lease. Reading it before the claim can
         // cache the pre-move aliases and then apply the post-move delta with
         // stale resolution state.
-        await this.refreshFolderAliases()
+        const aliasesChanged = await this.refreshFolderAliases()
+
         if (this.stopped) {
           if (strict) {
             throw new Error('cannot checkpoint a stopped store')
@@ -1693,62 +2789,101 @@ export class CachedStore implements KnowledgeStore {
 
           return false
         }
-        const result = this.applyDelta(delta)
+        const releaseGraphTransition = this.beginGraphTransition()
 
-        this.cursor = delta.cursor
-        this.lastPollAt = this.iso()
-        // Do not admit a mutation or publish a changed event while an external
-        // file still has its provisional registry id. The frontmatter sweep
-        // and all journal/trash claims below use the final identity.
-        const identitySweep = await this.sweepFileIds(result.sweepPaths)
+        try {
+          // applyDelta is the first synchronous point that can put an external
+          // provisional id into the snapshot. Close the producer lease and
+          // register its durable cut before that mutation — in particular before
+          // the following listDirs await.
+          releaseIdentityPublication = this.beginIdentityPublication()
+          this.markIdentityPublicationPending()
+          const result = this.applyDelta(delta)
+          const directoriesChanged = await this.refreshDirectoryInventory()
 
-        const identityResolutions: Promise<void>[] = []
-        const readEffects: ReadEffects = { rekeyed: [], changedIds: new Set() }
-
-        for (const observation of result.externalObservations) {
-          const { identityResolution } = await this.admitExternalObservation(
-            observation,
-            identitySweep.unresolvedPaths.has(observation.filePath),
-            readEffects,
-          )
-
-          if (identityResolution) {
-            identityResolutions.push(identityResolution)
+          if (result.changed) {
+            this.markInnerLinkIdentitiesDirty()
           }
+
+          this.cursor = delta.cursor
+          this.lastPollAt = this.iso()
+          // The provisional post-delta axis is now complete. Make it durable
+          // before opening the listDirs window's producer lease; the slower
+          // body sweep may then expose this old-but-routable P while it reads,
+          // and closes a new revision synchronously if it actually adopts D.
+          await this.flushIdentityPublication()
+          releaseIdentityPublication()
+          releaseIdentityPublication = undefined
+          // Do not admit a mutation or publish a changed event while an external
+          // file still has its provisional registry id. The frontmatter sweep
+          // and all journal/trash claims below use the final identity.
+          const identitySweep = await this.sweepFileIds(result.sweepPaths)
+
+          const identityResolutions: Promise<void>[] = []
+          const readEffects: ReadEffects = { rekeyed: [], changedIds: new Set() }
+
+          for (const observation of result.externalObservations) {
+            const { identityResolution } = await this.admitExternalObservation(
+              observation,
+              identitySweep.unresolvedPaths.has(observation.filePath),
+              readEffects,
+            )
+
+            if (identityResolution) {
+              identityResolutions.push(identityResolution)
+            }
+          }
+          const rederiveSources =
+            directoriesChanged || aliasesChanged
+              ? [...this.snap.notes.keys()].filter((id) => this.snap.isGraphVisibleId(id))
+              : result.rederiveSources
+
+          if (rederiveSources.length) {
+            await this.rederiveSourceEdges(rederiveSources)
+          }
+          for (const [rawId, title, filePath] of result.removedTitles) {
+            this.scheduleExternalDelete(rawId, title, filePath, identityResolutions)
+          }
+
+          const rekeyed = [...identitySweep.rekeyed, ...readEffects.rekeyed]
+          const didChange =
+            result.changed ||
+            directoriesChanged ||
+            aliasesChanged ||
+            rekeyed.length > 0 ||
+            readEffects.changedIds.size > 0
+
+          if (didChange) {
+            this.markInnerLinkIdentitiesDirty()
+            this.syncInnerLinkIdentities()
+            const newlyAdded = new Set(result.newlyAdded)
+            const rekeyedRemoved = rekeyed
+              .map(([oldId]) => oldId)
+              .filter((oldId) => !newlyAdded.has(oldId))
+            const rekeyedRemovedSet = new Set(rekeyedRemoved)
+            const upserts = [
+              ...new Set([
+                ...result.upserted.map((id) => this.canonicalMutationId(id)),
+                ...rekeyed.map(([, newId]) => newId),
+                ...[...readEffects.changedIds].map((id) => this.canonicalMutationId(id)),
+              ]),
+            ].filter((id) => this.snap.notes.has(id))
+            const upsertSet = new Set(upserts)
+            const removed = [
+              ...new Set([
+                ...result.removed.map((id) => this.canonicalMutationId(id)),
+                ...rekeyedRemoved,
+              ]),
+            ].filter((id) => !upsertSet.has(id) || rekeyedRemovedSet.has(id))
+
+            this.lastChangeAt = this.iso()
+            this.emit({ type: 'changed', upserts, removed })
+          }
+
+          return didChange
+        } finally {
+          releaseGraphTransition()
         }
-        for (const [rawId, title, filePath] of result.removedTitles) {
-          this.scheduleExternalDelete(rawId, title, filePath, identityResolutions)
-        }
-
-        const rekeyed = [...identitySweep.rekeyed, ...readEffects.rekeyed]
-        const didChange = result.changed || rekeyed.length > 0 || readEffects.changedIds.size > 0
-
-        if (didChange) {
-          const newlyAdded = new Set(result.newlyAdded)
-          const rekeyedRemoved = rekeyed
-            .map(([oldId]) => oldId)
-            .filter((oldId) => !newlyAdded.has(oldId))
-          const rekeyedRemovedSet = new Set(rekeyedRemoved)
-          const upserts = [
-            ...new Set([
-              ...result.upserted.map((id) => this.canonicalMutationId(id)),
-              ...rekeyed.map(([, newId]) => newId),
-              ...[...readEffects.changedIds].map((id) => this.canonicalMutationId(id)),
-            ]),
-          ].filter((id) => this.snap.notes.has(id))
-          const upsertSet = new Set(upserts)
-          const removed = [
-            ...new Set([
-              ...result.removed.map((id) => this.canonicalMutationId(id)),
-              ...rekeyedRemoved,
-            ]),
-          ].filter((id) => !upsertSet.has(id) || rekeyedRemovedSet.has(id))
-
-          this.lastChangeAt = this.iso()
-          this.emit({ type: 'changed', upserts, removed })
-        }
-
-        return didChange
       })
 
       if (changed) {
@@ -1760,11 +2895,18 @@ export class CachedStore implements KnowledgeStore {
       }
       this.emitStatus()
     } catch (err) {
+      if (
+        identityBefore &&
+        this.durableIdentityPublicationRevision < this.identityPublicationRevision
+      ) {
+        this.rememberIdentityRepair(identityBefore)
+      }
       console.error('[cached-store] delta poll failed:', (err as Error).message)
       if (strict) {
         throw err
       }
     } finally {
+      releaseIdentityPublication?.()
       releaseMutationAdmission?.()
       this.polling = false
       this.openPollDone()
@@ -1783,6 +2925,7 @@ export class CachedStore implements KnowledgeStore {
     removedTitles: Array<[string, string, string]>
     externalObservations: ExternalObservation[]
     newlyAdded: string[]
+    rederiveSources: string[]
   } {
     const upserted = new Set<string>()
     const removed: string[] = []
@@ -1790,6 +2933,7 @@ export class CachedStore implements KnowledgeStore {
     const removedTitles: Array<[string, string, string]> = []
     const externalObservations: ExternalObservation[] = []
     const newlyAdded = new Set<string>()
+    const rederiveSources = new Set<string>()
 
     const inventory = new Map<string, NoteMeta & { id: string }>()
 
@@ -1800,6 +2944,9 @@ export class CachedStore implements KnowledgeStore {
     for (const [id, meta] of [...this.snap.notes]) {
       if (inventory.has(id)) {
         continue
+      }
+      for (const sourceId of this.snap.sourceIdsTargeting([id])) {
+        rederiveSources.add(sourceId)
       }
       this.snap.notes.delete(id)
       this.snap.edgesBySource.delete(id)
@@ -1879,6 +3026,11 @@ export class CachedStore implements KnowledgeStore {
       const transition = this.nextExternalTransition(id)
 
       if (typeof content === 'string') {
+        // A removal may have queued this source for a live-body re-derivation,
+        // but an explicit body in the same delta is newer and authoritative.
+        // Letting the later re-derive read the engine here can resurrect its
+        // pre-delta body and overwrite the edge patch we are about to apply.
+        rederiveSources.delete(id)
         if (this.snap.patchNoteEdges(id, content, { index: batchIndex, deferReresolve: true })) {
           upserted.add(id)
         }
@@ -1926,6 +3078,7 @@ export class CachedStore implements KnowledgeStore {
         removedTitles,
         externalObservations,
         newlyAdded: [...newlyAdded],
+        rederiveSources: [...rederiveSources],
       }
     }
 
@@ -1937,6 +3090,7 @@ export class CachedStore implements KnowledgeStore {
       removedTitles,
       externalObservations,
       newlyAdded: [...newlyAdded],
+      rederiveSources: [...rederiveSources],
     }
   }
 

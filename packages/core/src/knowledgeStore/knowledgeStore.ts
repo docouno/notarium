@@ -341,6 +341,14 @@ export type ReadOptions = {
   /** Opt IN to the trash deleted-view: reading a DELETED note returns its last state (flagged
    *  `deleted`) instead of not-found. OFF by default so discovery reads still miss a deleted note. */
   deletedView?: boolean
+  /** Internal resolver hint: a reserved identity envelope must stay on the identity
+   *  axis even when a legacy file has the same literal storage path. Authored-link
+   *  resolution sets this; ordinary storage reads keep listed file paths exact. */
+  identityOnly?: boolean
+  /** Internal storage-adapter hint: resolve this key as one exact file path, with no
+   *  id/title/slug fallback. The read-model uses it when its persisted registry
+   *  already names the authoritative owner of a stable id during degraded boot. */
+  storageOnly?: boolean
 }
 
 /** A note's Feed-card enrichment: snippet, first image, tags, word count, and a model-agnostic
@@ -385,6 +393,9 @@ export type WriteInput = {
   /** The note-id being edited in place — triggers move-then-write so a title/folder change renames
    *  rather than duplicating. Absent = create. */
   originalId?: string
+  /** Internal engine-boundary discriminator: originalId is a reserved identity
+   *  envelope, not a raw opaque id or storage key. */
+  identityOnly?: boolean
   /** Create-collision policy, DEFAULT `fail`: an unset policy never clobbers, so a create
    *  channel is safe before anyone remembers to think about it. `uniquify` is resolved above the
    *  engines (they see it as `fail` and the read-model retries onto the next free name).
@@ -411,6 +422,11 @@ export type WriteInput = {
    *  edits it PINS the basename (the pin/mute path that must not rename-to-slug and collide). Folder
    *  pages always keep `index.md`. */
   fileName?: string
+  /** Import provenance, host-internal. The selected root still obeys the normal
+   *  destination fence; parser-owned suffixes and the pinned filename retain
+   *  their frozen pre-portability spelling so an old POSIX import is not
+   *  duplicated on re-import. Never accepted from REST/MCP wire schemas. */
+  legacyImportRoot?: string
   /** Authored creation instant — the date-as-data axis. Three-state like tags/slug: `undefined`
    *  LEAVES `created:`, a string SETS/OVERWRITES; omitted = fall back to file birthtime. (No
    *  `modifiedAt` channel by design — `modified` always tracks the real mtime.) */
@@ -442,6 +458,8 @@ export type MoveInput = {
   id: string
   destinationPath: string
   isDirectory?: boolean
+  /** Internal engine-boundary discriminator for an enveloped note id. */
+  identityOnly?: boolean
 }
 
 /** The restore flow: write the journaled revision's state back through the CAS path (the
@@ -553,6 +571,10 @@ export type GraphGhostNode = {
   /** The normalised link target (our slug algebra): the key a future note's title must match. */
   target: string
   prefillTitle: string
+  /** Raw/current directory the create flow must use to close a path-form link. */
+  prefillDirectory?: string
+  /** False when the ghost is a missing stable identity, which cannot be recreated. */
+  creatable: boolean
   /** The notes pointing at the ghost — the create-from-ghost flow back-links each. `id` is absent
    *  only on a bare engine's graph. */
   sources?: Array<{ id?: string; title: string; folder: string }>
@@ -561,10 +583,15 @@ export type GraphGhostNode = {
 }
 
 export type GraphNode = GraphRealNode | GraphGhostNode
+/** Internal provenance carried only between derivation and graph shaping. A target
+ *  string alone cannot distinguish a synthetic ghost from a real opaque note id with
+ *  the same spelling. Symbols survive in-process object spreads but never reach JSON. */
+export const GRAPH_GHOST_TARGET = Symbol('notarium.graph.ghost-target')
 export type GraphLink = {
   source: string
   target: string
   type: string
+  [GRAPH_GHOST_TARGET]?: true
   /** How the wikilink resolved. Set ONLY on a FRESH derivation; the incremental snapshot omits it
    *  (a cached inbound edge isn't re-resolved when its target is renamed, so it would undercount). */
   resolvedVia?: ResolvedVia
@@ -673,11 +700,20 @@ export type KnowledgeStore = {
   /** Feed the engine current→past folder-path pairs so a path-form `[[oldpath/note]]` resolves to a
    *  renamed folder's note. A resolution HINT, not ownership; the bare engine stays alias-blind. */
   setFolderAliases?(aliases: ReadonlyArray<{ current: string; alias: string }>): void
+  /** Authoritative stable-id → storage-path hints from an identity-owning decorator.
+   *  A bare engine keys graph nodes by path but must still resolve authored `[[id]]`
+   *  exactly, including unclaimed external files and copied duplicate claims. */
+  setLinkIdentities?(identities: ReadonlyArray<{ id: string; path: string }>): void
   /** Stream every note file for a base export. `opts.scope` reuses the visibility axis (a user
    *  export never sweeps agent memory; `all` = full backup). Raw on-disk bytes. Optional. */
   exportNotes?(opts?: { scope?: ReadScope }): AsyncIterable<ExportEntry>
   /** `id` is a note-id first; engines also accept their storage keys so wiki-link resolution works. */
   read(id: string, opts?: ReadOptions): Promise<NoteContent>
+  /** Resolve an authored human wikilink on the user-graph namespace. A plain
+   *  spelling may fall through a dead stable-id tombstone to a live name; a
+   *  reserved identity envelope remains exact. Read-models implement the full
+   *  visibility-aware contract; hosts may fall back to read() only for legacy stores. */
+  resolveWikilink?(ref: string): Promise<NoteContent>
   /** A note's Feed-card preview. A port method so the engine owns serving it efficiently (the
    *  read-model caches with real invalidation); a bare engine derives it via `derivePreview`. */
   preview(id: string, opts?: ReadOptions): Promise<Preview>
@@ -694,7 +730,7 @@ export type KnowledgeStore = {
   write(input: WriteInput, opts?: MutationOptions): Promise<WriteResult>
   move(input: MoveInput, opts?: MutationOptions): Promise<void>
   /** `principal` is journal attribution — engines without a journal ignore it. */
-  remove(id: string, opts?: { principal?: string }): Promise<void>
+  remove(id: string, opts?: { principal?: string; identityOnly?: boolean }): Promise<void>
   /** Changes since `cursor` (null = establish one without history); an engine with no external
    *  change source returns empty upserts and its full inventory. */
   changes(cursor: string | null): Promise<StoreDelta>

@@ -12,10 +12,18 @@ import { describe, expect, it, vi } from 'vitest'
  *  scenario would. Fresh, because the real module probes once at import — correct in
  *  production (neither an install nor a platform changes mid-run) and useless here. */
 const gateUnder = async (failure: 'missing' | 'unloadable') => {
-  const mod = createRequire(import.meta.url)('node:module') as {
+  const localRequire = createRequire(import.meta.url)
+  const mod = localRequire('node:module') as {
     _resolveFilename: (request: string, ...rest: unknown[]) => string
   }
   const real = mod._resolveFilename
+  const resolvedVec = localRequire.resolve('sqlite-vec')
+  const cachedVec = localRequire.cache[resolvedVec]
+
+  // resetModules only clears Vitest's ESM graph. A prior vector suite may have
+  // populated Node's CJS require cache, in which case require('sqlite-vec')
+  // bypasses _resolveFilename entirely and this forced failure never fires.
+  delete localRequire.cache[resolvedVec]
 
   mod._resolveFilename = function (request: string, ...rest: unknown[]) {
     if (request === 'sqlite-vec') {
@@ -41,6 +49,11 @@ const gateUnder = async (failure: 'missing' | 'unloadable') => {
     return await import('./vectorGate.fixture')
   } finally {
     mod._resolveFilename = real
+    if (cachedVec) {
+      localRequire.cache[resolvedVec] = cachedVec
+    } else {
+      delete localRequire.cache[resolvedVec]
+    }
   }
 }
 

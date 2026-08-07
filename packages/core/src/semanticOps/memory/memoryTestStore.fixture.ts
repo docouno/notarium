@@ -20,7 +20,9 @@ import {
   type WriteInput,
   type WriteResult,
 } from '../../knowledgeStore'
-import { slugify } from '../../libs/slug'
+import { shortHash } from '../../libs/hash'
+import { directoryOf, noteFilePath } from '../../libs/path'
+import { asciiSlug, slugify } from '../../libs/slug'
 import { computeVersionToken } from '../../libs/versionToken'
 
 export type MemRow = {
@@ -74,6 +76,18 @@ export const memStore = (
     return fm
   }
   const pathOf = (r: MemRow): string => r.filePath ?? `${r.id}.md`
+
+  /** What both engines throw when a rename would land on an occupied path — a tool
+   *  error with no `reason`, NOT `note_already_exists`. The distinction matters: the
+   *  memory op retries a create on `note_already_exists`, so borrowing that reason here
+   *  would make the fixture drive a retry production never triggers. */
+  const moveFailed = (): Error => {
+    const e = new Error('# Move Failed: a note already lives at the destination') as Error & {
+      isToolError: boolean
+    }
+    e.isToolError = true
+    return e
+  }
 
   const conflict = (): Error => {
     const e = new Error('conflict') as Error & { isConflict: boolean }
@@ -139,6 +153,18 @@ export const memStore = (
         if (input.versionToken !== computeVersionToken(r.content)) {
           throw conflict()
         }
+        // Both real engines RE-DERIVE the basename on an edit, so a write that stops
+        // pinning a name moves the file. Modelling the path as create-time-permanent
+        // is what let a pin that lasted exactly one write look correct here.
+        const moved = noteFilePath(input.title, directoryOf(r.filePath ?? ''), input.fileName, r.id)
+
+        // A rename onto an OCCUPIED path is refused, exactly as both engines refuse it
+        // — and refused BEFORE anything is written, because they refuse before touching
+        // the file too. Committing the body first would model a half-applied write no
+        // engine can produce, which is the same class of lie the re-derivation removes.
+        if (moved !== r.filePath && rows.some((x) => x.id !== r.id && pathOf(x) === moved)) {
+          throw moveFailed()
+        }
         r.content = input.content ?? ''
         r.title = input.title
         if (input.summary !== undefined) {
@@ -150,11 +176,28 @@ export const memStore = (
         if (input.tags !== undefined) {
           r.tags = Array.isArray(input.tags) ? input.tags : [input.tags]
         }
+        r.filePath = moved
         writes.push(input)
         return { id: r.id, versionToken: computeVersionToken(r.content) }
       }
       const dir = norm(input.directory)
-      const filePath = (dir ? `${dir}/` : '') + `${slugify(input.title)}.md`
+      // Id stable per (dir, title). ASCII like a real `notarium-id` — the id rung of the
+      // name formula runs it through `idToSlug`, which strips non-ASCII, so a raw key
+      // here would collapse two letterless categories back onto one file. When the
+      // ASCII form loses information, a short hash restores distinctness; a name that
+      // romanises fully keeps exactly the id it always had.
+      const idBase = [dir, input.title].filter(Boolean).join(' ')
+      const idAscii = asciiSlug(idBase)
+      // "Lossless" needs the ASCII form to be non-empty AND equal: when BOTH forms are
+      // empty they are trivially equal, and taking that branch is what collapsed two
+      // letterless categories onto one id again.
+      const idLossless = Boolean(idAscii) && idAscii === slugify(idBase)
+      const id = `mem-${idLossless ? idAscii : `${idAscii ? `${idAscii}-` : ''}${shortHash(idBase)}`}`
+      // The shared name formula, not a copy of it (#296): a category in a script we
+      // cannot romanise must land on its own file here too, and one with no letters at
+      // all takes the formula's id rung — exactly as the real engines do, or this
+      // fixture would accept a collision they refuse.
+      const filePath = noteFilePath(input.title, dir, input.fileName, id)
 
       // Faithful to the real engines: a create refuses an occupied path unless it
       // explicitly asked to clobber — so the concurrent-first-touch retry path is
@@ -162,9 +205,6 @@ export const memStore = (
       if (input.ifExists !== IF_EXISTS.overwrite && rows.some((r) => r.filePath === filePath)) {
         throw noteAlreadyExists(input.title)
       }
-      // Id stable per (dir, title) — a root and a subdir note of the same title are
-      // distinct (mirrors the real engine deriving id from the full path).
-      const id = `mem-${slugify([dir, input.title].filter(Boolean).join(' '))}`
       rows.push({
         id,
         title: input.title,

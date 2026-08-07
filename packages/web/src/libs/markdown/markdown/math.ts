@@ -17,6 +17,7 @@
 // Render-only: the source bytes never change, so a note round-trips byte-for-byte.
 import katex from 'katex'
 import type { RendererThis, TokenizerAndRendererExtension, TokenizerThis, Tokens } from 'marked'
+import { matchMathBlock, matchMathInline, mathBlockStart, mathInlineStart } from '@notarium/core'
 
 // Render one TeX string to KaTeX HTML+MathML. `throwOnError:false` is the honest
 // fallback the issue requires: invalid TeX renders as its own source (in the error
@@ -52,9 +53,6 @@ type MathToken = Tokens.Generic & {
 //     A real TeX body never contains a literal `$$` / `\]`, so this only blocks the
 //     pathological case; the first closer now fails the whole match and the pair falls
 //     through to the inline tokenizer, which renders the two mid-flow display formulas.
-const BLOCK_DOLLAR = /^ {0,3}\$\$((?:(?!\n[ \t]*\n)(?!\$\$)[\s\S])+?)\$\$(?=[ \t]*(?:\n|$))/
-const BLOCK_BRACKET = /^ {0,3}\\\[((?:(?!\n[ \t]*\n)(?!\\\])[\s\S])+?)\\\](?=[ \t]*(?:\n|$))/
-
 const mathBlockExtension: TokenizerAndRendererExtension = {
   name: 'mathBlock',
   level: 'block',
@@ -63,23 +61,15 @@ const mathBlockExtension: TokenizerAndRendererExtension = {
   // and mis-fire on a mid-line opener (`x $$a$$` → torn paragraph). We therefore only look
   // for a newline-led opener and return the offset of the char AFTER the newline; a true
   // offset-0 opener needs no interrupt — the block tokenizer matches it directly.
-  start: (src: string) => {
-    const m = /\n {0,3}(?:\$\$|\\\[)/.exec(src)
-    return m ? m.index + 1 : undefined
-  },
+  start: mathBlockStart,
   tokenizer(this: TokenizerThis, src: string): MathToken | undefined {
-    const m = BLOCK_DOLLAR.exec(src) ?? BLOCK_BRACKET.exec(src)
+    const match = matchMathBlock(src)
 
-    if (!m) {
+    if (!match) {
       return undefined
     }
-    const tex = m[1].trim()
 
-    if (!tex) {
-      return undefined
-    } // empty `$$$$` / `\[\]` — not a formula, leave it literal
-
-    return { type: 'mathBlock', raw: m[0], tex, display: true }
+    return { type: 'mathBlock', ...match }
   },
   renderer(this: RendererThis, token: Tokens.Generic) {
     const t = token as MathToken
@@ -100,45 +90,14 @@ const mathBlockExtension: TokenizerAndRendererExtension = {
 // while "$x^2$" or "cost $c$ per unit" do. `$$…$$` and `\[…\]` in mid-sentence render in
 // display mode too (KaTeX's convention), so a pasted block formula inside a paragraph
 // still renders instead of leaking source.
-const INLINE_PAREN = /^\\\(([\s\S]+?)\\\)/
-const INLINE_BRACKET = /^\\\[([\s\S]+?)\\\]/
-const INLINE_DDOLLAR = /^\$\$(?!\$)([\s\S]+?)\$\$/
-const INLINE_DOLLAR =
-  /^\$(?![\s$])((?:\\.|[^\\\n$])*?(?:\\.|[^\\\n$]))\$(?=[\s?!.,:;)"'》」』？！。，：]|$)/
-
-const matchInline = (src: string): { tex: string; display: boolean; raw: string } | undefined => {
-  let m = INLINE_PAREN.exec(src)
-
-  if (m) {
-    return { tex: m[1].trim(), display: false, raw: m[0] }
-  }
-  m = INLINE_BRACKET.exec(src)
-  if (m) {
-    return { tex: m[1].trim(), display: true, raw: m[0] }
-  }
-  m = INLINE_DDOLLAR.exec(src)
-  if (m) {
-    return { tex: m[1].trim(), display: true, raw: m[0] }
-  }
-  m = INLINE_DOLLAR.exec(src)
-  if (m) {
-    return { tex: m[1].trim(), display: false, raw: m[0] }
-  }
-
-  return undefined
-}
-
 const mathInlineExtension: TokenizerAndRendererExtension = {
   name: 'mathInline',
   level: 'inline',
   // Point marked at the next possible opener so it splits the surrounding text token.
   // `$` covers $…$ and $$…$$; `\` covers \(…\) and \[…\].
-  start: (src: string) => {
-    const m = /\$|\\[([]/.exec(src)
-    return m ? m.index : undefined
-  },
+  start: mathInlineStart,
   tokenizer(this: TokenizerThis, src: string): MathToken | undefined {
-    const hit = matchInline(src)
+    const hit = matchMathInline(src)
 
     if (!hit || !hit.tex) {
       return undefined

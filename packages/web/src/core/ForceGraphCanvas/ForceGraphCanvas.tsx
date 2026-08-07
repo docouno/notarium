@@ -897,7 +897,10 @@ export const ForceGraphCanvas = ({
         return
       }
       if (n.ghost) {
-        onCreateFromGhost?.(n)
+        if (n.creatable) {
+          onCreateFromGhost?.(n)
+        }
+
         return
       }
       if (onFocus && n.id !== focusId) {
@@ -1037,7 +1040,9 @@ export const ForceGraphCanvas = ({
         linkLabel={(l) => l.type}
         nodeLabel={(n) => {
           if (n.ghost) {
-            return `${n.title} — missing · click to create`
+            return n.creatable
+              ? `${n.title} — missing · click to create`
+              : `${n.title} — deleted or unavailable`
           }
           const title = n.title || n.id
 
@@ -1054,7 +1059,7 @@ export const ForceGraphCanvas = ({
           // Real nodes open; ghosts are clickable too when a create handler is
           // wired (click → create the missing note). Otherwise a ghost is a dead
           // end and keeps the default cursor.
-          const clickable = n && (!n.ghost || onCreateFromGhost)
+          const clickable = n && (!n.ghost || (n.creatable && onCreateFromGhost))
 
           if (wrapRef.current) {
             wrapRef.current.style.cursor = clickable ? 'pointer' : 'default'

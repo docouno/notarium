@@ -44,6 +44,8 @@ export const GraphGhostNodeSchema = z.object({
   degree: z.number(),
   target: z.string(),
   prefillTitle: z.string(),
+  prefillDirectory: z.string().optional(),
+  creatable: z.boolean(),
   sources: z
     .array(z.object({ id: z.string().optional(), title: z.string(), folder: z.string() }))
     .optional(),

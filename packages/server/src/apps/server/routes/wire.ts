@@ -117,6 +117,8 @@ export const graphToWire = (g: Graph): { nodes: WireGraphNode[]; links: WireGrap
           degree: n.degree,
           target: n.target,
           prefillTitle: n.prefillTitle,
+          prefillDirectory: n.prefillDirectory,
+          creatable: n.creatable,
           sources: n.sources?.map((s) => ({ id: s.id, title: s.title, folder: s.folder })),
           x: n.x,
           y: n.y,

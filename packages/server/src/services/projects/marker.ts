@@ -7,6 +7,7 @@
 // index and safeRelPath fail-closes note routes at dot segments — no /api/* write reaches it.
 
 import { PROJECT_STATUS } from '@notarium/contract'
+import { isCanonicalSafeRelativeAddress, isDurableScalar } from '@notarium/core'
 import type { ProjectStatus } from '../metaDb'
 
 export const MARKER_FILENAME = '.notariummeta'
@@ -43,18 +44,18 @@ export type MarkerFields = {
 /** freshNoteId shape. Stricter than the identity scheme's idClaim (non-emptiness only):
  *  a malformed id is fail-closed here, not trusted. */
 const ID_RE = /^[A-Za-z0-9_-]{12}$/
-/** Handle slug shape — matches SpaceSlug / what `slugify`/`idToSlug` emit. */
+/** Handle slug shape — matches SpaceSlug / what `asciiSlug`/`idToSlug` emit. */
 const SLUG_RE = /^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$/
 
 /** Sanity gate for a folder path alias, NOT a slug check: the engine stores
  *  directories verbatim (raw, may be non-ASCII); the resolver slugifies on lookup.
  *  Rejects empty, over-long, absolute, and `.`/`..` traversal paths. */
 const isPathAlias = (s: string): boolean => {
-  if (!s || s.length > 1024 || s.startsWith('/') || s.endsWith('/')) {
+  if (!s || s.length > 1024 || !isCanonicalSafeRelativeAddress(s)) {
     return false
   }
-  const segs = s.split('/')
-  return segs.every((seg) => seg !== '' && seg !== '.' && seg !== '..')
+
+  return true
 }
 
 const cleanSlugList = (raw: unknown): string[] | undefined => {
@@ -150,7 +151,7 @@ export const parseMarker = (raw: string): MarkerFields | null => {
       fields.pathAliases = paths
     }
   }
-  if (typeof r.displayName === 'string' && r.displayName.trim()) {
+  if (typeof r.displayName === 'string' && isDurableScalar(r.displayName) && r.displayName.trim()) {
     fields.displayName = r.displayName.trim()
   }
   if (r.status === PROJECT_STATUS.active || r.status === PROJECT_STATUS.archived) {

@@ -1,21 +1,11 @@
 // Shared importer helpers — pure, deterministic.
 
-import { slugify } from '../../libs/slug'
+import { shortHash } from '../../libs/hash'
+import { boundNameToBytes, clipToBytes } from '../../libs/path'
+import { legacyImportSlug } from '../../libs/slug'
+import { IMPORT_DIRECTORY_MAX_BYTES, IMPORT_SLUG_MAX_BYTES } from '../consts'
 
-/** FNV-1a 32-bit → 8 base36 chars. A stable, short filename disambiguator keyed
- *  on the source id: two "Untitled" conversations get distinct files, and the
- *  SAME export re-imports to the SAME filename (idempotent). Not crypto — an
- *  identity tag in a path, so the cheap sync hash (no async WebCrypto) is right. */
-export const shortHash = (input: string): string => {
-  let h = 0x811c9dc5
-
-  for (let i = 0; i < input.length; i++) {
-    h ^= input.charCodeAt(i)
-    h = Math.imul(h, 0x01000193)
-  }
-
-  return (h >>> 0).toString(36).padStart(8, '0')
-}
+export { shortHash }
 
 /** A unix epoch (chatgpt float seconds, or ms) → ISO. < 1e11 is read as seconds
  *  (covers any plausible chat date; an ms value that small would be pre-1973). */
@@ -65,17 +55,31 @@ export const stampOf = (iso: string | null): string => {
   return iso.slice(0, 19).replace('T', ' ')
 }
 
-/** Slug capped to `max` chars so the final filename component stays well under
- *  the OS 255-byte limit (cyrillic/CJK expand under transliteration). May return
- *  '' — callers supply their own fallback. The hash suffix on a conversation
- *  filename guarantees uniqueness, so truncating the readable part is safe. */
+/** Slug capped so the final filename component stays under the OS 255-byte limit.
+ *  TWO caps, and both are load-bearing. The character cap is the historical one and
+ *  must not move: an imported file name is deterministic, and lengthening it would make
+ *  a re-import miss its own file and land a duplicate beside it instead of overwriting.
+ *  The BYTE cap remains an explicit part of the importer contract; its storage keys
+ *  intentionally stay on the legacy ASCII algebra, so a slug implementation upgrade
+ *  cannot move an old deterministic path. The shared `noteFileBase` bound is the final
+ *  filesystem backstop, but ordinary imported names already fit here byte-for-byte.
+ *
+ *  May return '' — callers supply their own fallback. Conversation names carry a
+ *  deterministic short hash; the streamed import guard arbitrates its rare collision. */
 export const cappedSlug = (s: string, max = 80): string =>
-  slugify(s).slice(0, max).replace(/-+$/, '')
+  clipToBytes(legacyImportSlug(s).slice(0, max), IMPORT_SLUG_MAX_BYTES).replace(/-+$/, '')
 
-/** Deterministic, collision-free filename (sans `.md`) for a conversation:
+/** A frozen-legacy-ASCII directory component with a final byte fence. Short
+ *  historical paths are unchanged; an overlong source name gets a hash of the WHOLE
+ *  slug so two names sharing the clipped prefix do not collapse onto one folder. */
+export const importerDirectorySlug = (s: string): string =>
+  boundNameToBytes(legacyImportSlug(s), IMPORT_DIRECTORY_MAX_BYTES)
+
+/** Deterministic filename (sans `.md`) for a conversation:
  *  `<YYYYMMDD>-<slug(title)>-<hash8(sourceId)>`. The date prefix groups
- *  chronologically, the source-id hash guarantees a re-import of the same export
- *  overwrites the same file and two same-titled chats never clash. */
+ *  chronologically and the source-id hash makes re-import idempotent. The 32-bit
+ *  suffix is not a proof of uniqueness; one streamed run fails closed if two
+ *  different source records still claim the same final storage key. */
 export const convoFileName = (title: string, iso: string | null, sourceId: string): string => {
   const date = datePrefix(iso)
   return `${date ? `${date}-` : ''}${cappedSlug(title) || 'untitled'}-${shortHash(sourceId)}`

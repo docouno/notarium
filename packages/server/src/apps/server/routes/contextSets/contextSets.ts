@@ -17,10 +17,11 @@ import { freshNoteId } from '@notarium/core'
 
 import { can } from '../../../../services/authz'
 import type { ContextSetRecord } from '../../../../services/metaDb'
+import { readNoteAccess } from '../../../../services/storeAccess'
 import { type ApiRouteCtx, authz, notFound, s } from '../_shared'
 
 export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
-  const { contextSets, projects, scopePins, contextOrder, spaces, auth, noteStore } = ctx
+  const { contextSets, projects, scopePins, contextOrder, spaces, auth } = ctx
 
   // ── context sets: named cross-space collections + scope attachments ──
   // canon: docs/projects.md#context-sets-209-reusable-cross-space-bundles
@@ -29,13 +30,12 @@ export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) 
   const describeContextSet = async (req: FastifyRequest, set: ContextSetRecord) => {
     const items = await Promise.all(
       set.items.map(async (ref) => {
-        const hit = await noteStore(req.principal, ref.noteId, 'note:read')
-        const note = hit ? await hit.store.read(ref.noteId).catch(() => null) : null
+        const hit = await readNoteAccess(ctx.storeAccess, req.principal, ref.noteId, 'note:read')
         return {
-          noteId: ref.noteId,
+          noteId: hit?.noteId ?? ref.noteId,
           // Null the space like the title — never leak the slug of a space the reader can't reach.
           space: hit ? (spaces.slugOf(hit.space) ?? hit.space) : null,
-          title: note && !note.deleted ? (note.title ?? '') : null,
+          title: hit ? (hit.note.title ?? '') : null,
         }
       }),
     )
@@ -178,13 +178,18 @@ export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) 
           .code(HTTP_STATUS.BAD_REQUEST)
           .send({ error: body.error.issues[0]?.message || 'bad request' })
       }
-      const hit = await noteStore(req.principal, body.data.noteId, 'note:read')
+      const hit = await readNoteAccess(
+        ctx.storeAccess,
+        req.principal,
+        body.data.noteId,
+        'note:read',
+      )
 
       if (!hit) {
         return notFound(reply)
       }
       // Atomic add, idempotent by noteId — no read-modify-write race.
-      const updated = await contextSets.addItem(id, { space: hit.space, noteId: body.data.noteId })
+      const updated = await contextSets.addItem(id, { space: hit.space, noteId: hit.noteId })
 
       if (!updated) {
         return notFound(reply)
@@ -207,7 +212,9 @@ export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) 
       if (!set || set.homeSpace !== req.spaceId) {
         return notFound(reply)
       }
-      const updated = await contextSets.removeItem(set.id, p.noteId ?? '')
+      const requestedId = p.noteId ?? ''
+      const live = await readNoteAccess(ctx.storeAccess, req.principal, requestedId, 'note:read')
+      const updated = await contextSets.removeItem(set.id, live?.noteId ?? requestedId)
 
       if (!updated) {
         return notFound(reply)
@@ -239,7 +246,13 @@ export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) 
           .code(HTTP_STATUS.BAD_REQUEST)
           .send({ error: body.error.issues[0]?.message || 'bad request' })
       }
-      const updated = await contextSets.reorderItems(id, body.data.noteIds)
+      const noteIds = await Promise.all(
+        body.data.noteIds.map(async (noteId) => {
+          const live = await readNoteAccess(ctx.storeAccess, req.principal, noteId, 'note:read')
+          return live?.noteId ?? noteId
+        }),
+      )
+      const updated = await contextSets.reorderItems(id, noteIds)
 
       if (!updated) {
         return notFound(reply)
@@ -327,7 +340,12 @@ export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) 
           .code(HTTP_STATUS.BAD_REQUEST)
           .send({ error: body.error.issues[0]?.message || 'bad request' })
       }
-      const hit = await noteStore(req.principal, body.data.noteId, 'note:read')
+      const hit = await readNoteAccess(
+        ctx.storeAccess,
+        req.principal,
+        body.data.noteId,
+        'note:read',
+      )
 
       if (!hit) {
         return notFound(reply)
@@ -337,7 +355,7 @@ export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) 
         targetId: proj.id,
         targetSpace: req.spaceId,
         noteSpace: hit.space,
-        noteId: body.data.noteId,
+        noteId: hit.noteId,
         createdAt: new Date().toISOString(),
       })
       return OkResponseSchema.parse({ ok: true })
@@ -357,7 +375,9 @@ export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) 
       if (!proj || proj.space !== req.spaceId) {
         return notFound(reply)
       }
-      await scopePins.removePin('project', proj.id, p.noteId ?? '')
+      const requestedId = p.noteId ?? ''
+      const live = await readNoteAccess(ctx.storeAccess, req.principal, requestedId, 'note:read')
+      await scopePins.removePin('project', proj.id, live?.noteId ?? requestedId)
       return OkResponseSchema.parse({ ok: true })
     },
   )
@@ -384,12 +404,16 @@ export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) 
           .code(HTTP_STATUS.BAD_REQUEST)
           .send({ error: body.error.issues[0]?.message || 'bad request' })
       }
-      await contextOrder.setOrder(
-        'project',
-        proj.id,
-        req.spaceId,
-        body.data.entries.map((e) => ({ entryKind: e.kind, entryRef: e.ref })),
+      const entries = await Promise.all(
+        body.data.entries.map(async (entry) => {
+          if (entry.kind !== 'pin') {
+            return { entryKind: entry.kind, entryRef: entry.ref }
+          }
+          const live = await readNoteAccess(ctx.storeAccess, req.principal, entry.ref, 'note:read')
+          return { entryKind: entry.kind, entryRef: live?.noteId ?? entry.ref }
+        }),
       )
+      await contextOrder.setOrder('project', proj.id, req.spaceId, entries)
       return OkResponseSchema.parse({ ok: true })
     },
   )

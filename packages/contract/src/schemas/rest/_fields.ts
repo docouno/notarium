@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { DurableAddressPathSchema, DurableScalarSchema, DurableTextSchema } from '../primitives'
 
 export const noteWriteFields = {
   /** Optional: a note's title is a PROJECTION of its body (the leading
@@ -6,18 +7,18 @@ export const noteWriteFields = {
    *  document's first line; the server derives it at the write chokepoint. A present
    *  value is still honoured as an explicit title (and a leading duplicate `# title`
    *  in the body is peeled off), but no client need send it. */
-  title: z.string().optional(),
-  content: z.string().optional(),
+  title: DurableScalarSchema.optional(),
+  content: DurableTextSchema.optional(),
   /** Untrusted storage path — the server normalises and rejects traversal
    *  (`..`/absolute) BEFORE the engine sees it (security spec). */
-  directory: z.string().optional(),
-  noteType: z.string().optional(),
-  tags: z.union([z.array(z.string()), z.string()]).optional(),
+  directory: DurableAddressPathSchema.optional(),
+  noteType: DurableScalarSchema.optional(),
+  tags: z.union([z.array(DurableScalarSchema), DurableScalarSchema]).optional(),
   /** The editable display slug the user typed — three-state like the
    *  domain WriteInput: absent LEAVES the file's `slug:` untouched, a string SETS
    *  it (cleaned + kept only when it diverges from slug(title)), `''` CLEARS a
    *  custom slug. The server passes it straight to WriteInput.slug. */
-  slug: z.string().optional(),
+  slug: DurableScalarSchema.optional(),
   /** Authored creation instant: the date-as-data axis the user edits in the
    *  metadata aside to correct historicity (an imported note, a migration). A FULL
    *  ISO-8601 datetime — this REST channel carries (and STRICTLY validates) minute

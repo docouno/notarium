@@ -2,7 +2,7 @@
 // title/slug) the resolver still honours — so a rename never breaks the inbound
 // [[Old Name]] links that point at it. Aliases live in the note's frontmatter
 // (`aliases:`, Obsidian-native — survives an external re-clone) and
-// in the derived index; the resolver registers slugify(alias) keys so an old
+// in the derived index; the resolver registers nameKey(alias) keys so an old
 // name resolves id-first → current name → alias-history (graph.ts buildLinkIndex).
 //
 // Stored RAW, not pre-slugified: the alias stays human-readable and Obsidian-
@@ -10,7 +10,7 @@
 // names. Dedup is BY SLUG (two raws that slug the same are redundant for
 // resolution), keeping the first raw form seen.
 
-import { slugify, slugifyPath } from '../slug'
+import { nameKey, namePathKey } from '../slug'
 
 /** Normalise a frontmatter `aliases:` value to a string array — a YAML list or
  *  a comma-separated string, mirroring normTags; anything else means none.
@@ -30,9 +30,9 @@ export const normAliases = (v: unknown): string[] | undefined => {
 }
 
 /** Dedupe raw names by a normalisation key, keeping the first raw form for each
- *  key and dropping anything that normalises to empty. The key is `slugify` for
- *  handle/title aliases (a single token) and `slugifyPath` for folder PATH
- *  aliases (`/` is a structural separator slugify would collapse). */
+ *  key and dropping anything that normalises to empty. The key is `nameKey` for
+ *  handle/title aliases (a single token) and `namePathKey` for folder PATH
+ *  aliases (`/` is a structural separator a bare name key would collapse). */
 const dedupeBy = (names: Iterable<string>, keyOf: (s: string) => string): string[] => {
   const out: string[] = []
   const seen = new Set<string>()
@@ -51,9 +51,11 @@ const dedupeBy = (names: Iterable<string>, keyOf: (s: string) => string): string
   return out
 }
 
-/** Dedupe raw names by their slug, keeping the first raw form for each slug and
- *  dropping anything that slugs to empty. */
-export const dedupeAliases = (names: Iterable<string>): string[] => dedupeBy(names, slugify)
+/** Dedupe raw names by their key, keeping the first raw form for each and dropping
+ *  anything that normalises to empty. Keyed by `nameKey`, the one the resolver uses:
+ *  on the bare slug a letterless past name would fall out of the history entirely, so
+ *  renaming a note titled `🎉🎉` would break every inbound link instead of retiring it. */
+export const dedupeAliases = (names: Iterable<string>): string[] => dedupeBy(names, nameKey)
 
 /** The alias set after renaming a target from `oldName` to `newName`: the old
  *  name joins the history, and the new (now-current) name is removed from it —
@@ -76,10 +78,10 @@ export const nextAliasesMulti = (
   existing: readonly string[] | undefined,
   oldNames: readonly string[],
   currentNames: readonly string[],
-): string[] => nextMultiBy(existing, oldNames, currentNames, slugify)
+): string[] => nextMultiBy(existing, oldNames, currentNames, nameKey)
 
 /** The shared core of nextAliases*, parameterised by the normalisation key —
- *  `slugify` for handle/title aliases, `slugifyPath` for folder PATH aliases. */
+ *  `nameKey` for handle/title aliases, `namePathKey` for folder PATH aliases. */
 const nextMultiBy = (
   existing: readonly string[] | undefined,
   oldNames: readonly string[],
@@ -94,20 +96,23 @@ const nextMultiBy = (
 
 /** nextAliases for folder PATH history: renaming/moving a folder from
  *  `oldPath` to `newPath` retires the old path so `[[oldPath/note]]` keeps
- *  resolving (the folder-alias pass of buildLinkIndex). Dedup is BY slugifyPath
- *  — paths are multi-segment, and the structural `/` must survive (slugify would
- *  collapse it, conflating `a/b` with `ab`). RAW paths, idempotent A→B→A. */
+ *  resolving (the folder-alias pass of buildLinkIndex). Dedup is BY `namePathKey` —
+ *  paths are multi-segment, so the structural `/` must survive (a bare name key would
+ *  collapse it, conflating `a/b` with `ab`), and it must be the SAME key the
+ *  folder-alias pass looks these up by: on `slugifyPath` a folder whose name has no
+ *  romanisable letters keys to '' and `dedupeBy` drops it, so renaming `📥` retired
+ *  nothing and every `[[📥/note]]` broke. RAW paths, idempotent A→B→A. */
 export const nextPathAliases = (
   existing: readonly string[] | undefined,
   oldPath: string,
   newPath: string,
-): string[] => nextMultiBy(existing, [oldPath], [newPath], slugifyPath)
+): string[] => nextMultiBy(existing, [oldPath], [newPath], namePathKey)
 
 /** nextPathAliases generalised to multiple old/current paths — the boot reconcile
  *  merges the marker's path-history ∪ the row's, and HEALS a path
- *  displaced by an external move by folding the old path in. Dedup by slugifyPath. */
+ *  displaced by an external move by folding the old path in. Same key. */
 export const nextPathAliasesMulti = (
   existing: readonly string[] | undefined,
   oldPaths: readonly string[],
   currentPaths: readonly string[],
-): string[] => nextMultiBy(existing, oldPaths, currentPaths, slugifyPath)
+): string[] => nextMultiBy(existing, oldPaths, currentPaths, namePathKey)

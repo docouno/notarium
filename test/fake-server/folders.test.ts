@@ -164,6 +164,19 @@ describe('mark-as-project slug (#97/1a)', () => {
 })
 
 describe('folder identity (#100 phase 3): rename → path-history + stable-URL data', () => {
+  it('a non-noop move of a missing folder fails without minting a ghost source', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/s/main/move-folder',
+      payload: { path: 'missing-source', destinationPath: 'moved-ghost' },
+    })
+
+    expect(res.statusCode).toBe(400)
+    const paths = (await treeFolders()).map((folder) => folder.path)
+    expect(paths).not.toContain('missing-source')
+    expect(paths).not.toContain('moved-ghost')
+  })
+
   it('a rename lazily mints an identity; /tree carries the old path as an alias', async () => {
     // 'docs' (holds Doc A) → 'guides'. A folder move is a rename to a sibling path.
     const res = await app.inject({

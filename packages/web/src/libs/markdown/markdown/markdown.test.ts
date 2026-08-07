@@ -86,9 +86,16 @@ describe('#235 heading ids', () => {
     expect(headingId).not.toContain('footnote')
   })
 
-  it('falls back to a "section" id when the text has no slug characters', () => {
-    // A CJK-only heading transliterates to '' → the fallback keeps it addressable.
-    expect(render('## 你好')).toContain('id="section"')
+  it('anchors a CJK heading on its own letters, keeping two of them distinct', () => {
+    // Before #296 both collapsed to the `section` fallback, so the second heading
+    // silently became `section-1` and neither anchor said what it pointed at.
+    expect(render('## 你好')).toContain('id="你好"')
+    expect(render('## 第三季度规划')).toContain('id="第三季度规划"')
+  })
+
+  it('falls back to a "section" id when the text has no letters at all', () => {
+    // An emoji is not a letter — the fallback is what keeps the heading addressable.
+    expect(render('## 🎉')).toContain('id="section"')
   })
 })
 
@@ -150,6 +157,13 @@ describe('#236 wikilink extension', () => {
 
   it('uses the label of a [[target|Label]] link and percent-encodes the target', () => {
     expect(render('[[home/index|Home]]')).toContain('<a href="#wiki/home%2Findex">Home</a>')
+  })
+
+  it('consumes the escaped alias separator inside a GFM table cell', () => {
+    const html = render('| Link |\n| --- |\n| [[Target\\|Label]] |')
+
+    expect(html).toContain('<a href="#wiki/Target">Label</a>')
+    expect(html).not.toContain('#wiki/Target%2F')
   })
 
   it('trims whitespace in target and label', () => {
@@ -231,6 +245,18 @@ describe('#236 wikilink extension', () => {
     expect(html).toContain('[[ ]]')
   })
 
+  it('renders a fragment-only wikilink as a local anchor, never a note action', () => {
+    const html = render('jump [[#Section Name]]')
+    expect(html).toContain('href="#section-name"')
+    expect(html).not.toContain('#wiki/')
+  })
+
+  it('leaves a suffix-only target literal instead of creating an empty note action', () => {
+    const html = render('broken [[.md]] target')
+    expect(html).toContain('[[.md]]')
+    expect(html).not.toContain('#wiki/')
+  })
+
   it('does not leak lexer state (unbalanced tag in a label) to the rest of the note', () => {
     // An unbalanced <a>/<code> in a label toggles the shared lexer's inLink/inRawBlock;
     // without a snapshot/restore it would corrupt inline parsing AFTER the wikilink.
@@ -248,6 +274,7 @@ describe('wikiLinkTarget (reader-side decode of a #wiki/ href)', () => {
     expect(wikiLinkTarget(null)).toBeNull()
     expect(wikiLinkTarget(undefined)).toBeNull()
     expect(wikiLinkTarget('https://example.com')).toBeNull()
+    expect(wikiLinkTarget('https://example.com/#wiki/Foo')).toBeNull()
   })
 
   it('round-trips the extension encoding (spaces, slashes, unicode)', () => {

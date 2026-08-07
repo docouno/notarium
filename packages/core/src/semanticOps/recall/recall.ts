@@ -298,7 +298,7 @@ export const recall = async (
       truncated = true
     }
     const source: RecallSourceItem = {
-      noteId: c.noteId,
+      noteId: note.id ?? c.noteId,
       title: note.title ?? '(untitled)',
       ...(c.isPersonal ? {} : { space: c.slug }),
       ...(project ? { project } : {}),

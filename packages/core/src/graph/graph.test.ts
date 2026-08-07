@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest'
 
-import type { Graph, GraphLink, NoteMeta, ResolvedVia } from '../knowledgeStore'
+import {
+  type Graph,
+  GRAPH_GHOST_TARGET,
+  type GraphLink,
+  type NoteMeta,
+  type ResolvedVia,
+} from '../knowledgeStore'
+import { encodeWikilinkIdentity } from '../libs/markdown'
 import {
   aggregateGraphHealth,
   buildLinkIndex,
@@ -50,8 +57,70 @@ describe('resolveLink', () => {
     expect(resolveLink('Book Stack', index).targetId).toBe('BookStack.md')
   })
 
+  it('prefers an exact raw path when current paths share a case/NFC name key', () => {
+    const collision = buildLinkIndex([
+      meta('Foo.md', 'Upper'),
+      meta('foo.md', 'Lower'),
+      meta('Café.md', 'Composed'),
+      meta('Cafe\u0301.md', 'Decomposed'),
+    ])
+
+    expect(resolveLink('Foo', collision).targetId).toBe('Foo.md')
+    expect(resolveLink('foo', collision).targetId).toBe('foo.md')
+    expect(resolveLink('Café', collision).targetId).toBe('Café.md')
+    expect(resolveLink('Cafe\u0301', collision).targetId).toBe('Cafe\u0301.md')
+  })
+
   it('falls back to the last path segment for a pathed link', () => {
     expect(resolveLink('elsewhere/Carbon', index).targetId).toBe('demo/Carbon.md')
+  })
+
+  it('normalizes a markdown extension and heading fragment before lookup', () => {
+    expect(resolveLink('Titanium.md', index).targetId).toBe('demo/Titanium.md')
+    expect(resolveLink('Titanium#properties', index).targetId).toBe('demo/Titanium.md')
+  })
+
+  it.each(['id#with|syntax', 'foo.md'])(
+    'resolves an enveloped exact stable id before human names: %s',
+    (id) => {
+      const notes = [{ ...meta('a.md', 'Alpha'), id }]
+      const byId = buildLinkIndex(notes)
+      expect(resolveLink(encodeWikilinkIdentity(id), byId).targetId).toBe(id)
+    },
+  )
+
+  it('keeps plain exact ids id-first when the syntax is unambiguous', () => {
+    const byId = buildLinkIndex([
+      { ...meta('a.md', 'Alpha'), id: 'stable-id' },
+      { ...meta('decoy.md', 'stable-id'), id: 'decoy-id' },
+    ])
+    expect(resolveLink('stable-id', byId).targetId).toBe('stable-id')
+  })
+
+  it('does not reinterpret a missing identity envelope as a human name', () => {
+    const id = 'missing'
+    const byName = buildLinkIndex([meta('decoy.md', encodeWikilinkIdentity(id))])
+    expect(resolveLink(encodeWikilinkIdentity(id), byName)).toMatchObject({
+      targetId: `ghost:${encodeWikilinkIdentity(id)}`,
+      ghost: { title: id, creatable: false },
+    })
+  })
+
+  it('does not reinterpret a malformed identity envelope as a human name', () => {
+    const malformed = 'notarium-id:%zz'
+    const byName = buildLinkIndex([meta('decoy.md', malformed)])
+    expect(resolveLink(malformed, byName)).toMatchObject({
+      targetId: `ghost:${malformed}`,
+      ghost: { creatable: false },
+    })
+  })
+
+  it('does not strip `.md` from an opaque identity payload', () => {
+    const byId = buildLinkIndex([
+      { ...meta('plain.md', 'Plain'), id: 'foo' },
+      { ...meta('dotted.md', 'Dotted'), id: 'foo.md' },
+    ])
+    expect(resolveLink('notarium-id:foo.md', byId).targetId).toBe('foo.md')
   })
 
   it('misses become ghosts whose prefill slugs back to the target (#25)', () => {
@@ -63,6 +132,17 @@ describe('resolveLink', () => {
   it('derives a readable prefill when the label cannot reproduce the slug', () => {
     const { ghost } = resolveLink('dir/missing-note', index)
     expect(ghost?.prefillTitle).toBe('Missing Note')
+  })
+
+  // #296 — the pin on `linkKey`'s raw rung, on the surface it was written for. A
+  // label whose LAST segment names nothing keys on '' by design, and two such labels
+  // are still two distinct missing notes: one empty key merged every broken link in
+  // the corpus into a single `ghost:` node, so the health list showed one row for many.
+  it('gives a ghost of its own to each label the path key empties', () => {
+    const a = resolveLink('journal/', index)
+    const b = resolveLink('archive/', index)
+    expect(a.targetId).not.toBe(b.targetId)
+    expect(a.targetId).not.toBe('ghost:')
   })
 })
 
@@ -172,6 +252,22 @@ describe('buildLinkIndex — folder path-aliases (#100)', () => {
     expect(resolveLink('demo/Carbon', index).targetId).toBe('demo/Carbon.md')
   })
 
+  it('does not choose between two folders that claim the same retired path', () => {
+    const notes = [meta('Inbox/Note.md', 'Inbox Note'), meta('Archive/Note.md', 'Archive Note')]
+    const aliases = [
+      { current: 'Inbox', alias: 'Old' },
+      { current: 'Archive', alias: 'old' },
+    ]
+
+    const forward = resolveLink('OLD/Note', buildLinkIndex(notes, aliases))
+    const reversed = resolveLink('OLD/Note', buildLinkIndex(notes, [...aliases].reverse()))
+
+    // With the ambiguous path-history axis withheld, the canonical last-segment
+    // fallback may still resolve — but it is the same deterministic current-name
+    // winner, never whichever alias pair arrived first.
+    expect(forward.targetId).toBe(reversed.targetId)
+  })
+
   it('no folder-aliases ⇒ identical to the plain index (the engine passes none)', () => {
     expect([...buildLinkIndex(NOTES).entries()]).toEqual([...buildLinkIndex(NOTES, []).entries()])
   })
@@ -189,7 +285,12 @@ describe('deriveNoteEdges', () => {
     )
     expect(edges).toEqual([
       { source: 'demo/Titanium.md', target: 'demo/Carbon.md', type: 'links-to' },
-      { source: 'demo/Titanium.md', target: 'ghost:nowhere', type: 'links-to' },
+      {
+        source: 'demo/Titanium.md',
+        target: 'ghost:nowhere',
+        type: 'links-to',
+        [GRAPH_GHOST_TARGET]: true,
+      },
     ])
     expect(ghosts.map((g) => g.id)).toEqual(['ghost:nowhere'])
   })
@@ -211,7 +312,13 @@ describe('shapeGraph', () => {
     const ghosts = new Map([
       [
         'ghost:missing',
-        { id: 'ghost:missing', title: 'Missing', target: 'missing', prefillTitle: 'Missing' },
+        {
+          id: 'ghost:missing',
+          title: 'Missing',
+          target: 'missing',
+          prefillTitle: 'Missing',
+          creatable: true,
+        },
       ],
     ])
     const g = shapeGraph(NOTES, edges, ghosts)
@@ -239,6 +346,56 @@ describe('shapeGraph', () => {
     const ghost = g.nodes.find((n) => n.id === 'demo/Removed.md')!
     expect(ghost.ghost).toBe(true)
     expect(ghost.title).toBe('Removed')
+  })
+
+  it('keeps a synthetic ghost distinct from a real opaque id with the same spelling', () => {
+    const metas: NoteMeta[] = [
+      { ...meta('source.md', 'Source'), id: 'source' },
+      { ...meta('unrelated.md', 'Unrelated'), id: 'ghost:missing' },
+    ]
+    const index = buildLinkIndex(metas)
+    const { edges, ghosts } = deriveNoteEdges('source', '[[missing]]', index, 'links-to')
+    const edgeBuckets: Iterable<[string, GraphLink[]]> = (function* () {
+      yield ['source', edges]
+    })()
+    const graph = shapeGraph(metas, edgeBuckets, new Map(ghosts.map((ghost) => [ghost.id, ghost])))
+    const edge = graph.links.find((candidate) => candidate.source === 'source')!
+    const target = graph.nodes.find((candidate) => candidate.id === edge.target)!
+    const unrelated = graph.nodes.find((candidate) => candidate.id === 'ghost:missing')!
+
+    expect(edge.target).not.toBe('ghost:missing')
+    expect(target).toMatchObject({ ghost: true, target: 'missing', creatable: true })
+    expect(unrelated).toMatchObject({ ghost: false, title: 'Unrelated', degree: 0 })
+  })
+
+  it('keeps real and ghost provenance when both share one raw target string', () => {
+    const opaqueId = 'ghost:missing'
+    const metas: NoteMeta[] = [
+      { ...meta('source.md', 'Source'), id: 'source' },
+      { ...meta('opaque.md', 'Opaque'), id: opaqueId },
+    ]
+    const index = buildLinkIndex(metas)
+    const { edges, ghosts } = deriveNoteEdges(
+      'source',
+      `[[${encodeWikilinkIdentity(opaqueId)}|Opaque]]\n[[missing]]`,
+      index,
+      'links-to',
+    )
+    const graph = shapeGraph(
+      metas,
+      new Map([['source', edges]]),
+      new Map(ghosts.map((ghost) => [ghost.id, ghost])),
+    )
+    const outgoing = graph.links.filter((edge) => edge.source === 'source')
+    const real = graph.nodes.find((node) => node.id === opaqueId)!
+    const ghost = graph.nodes.find(
+      (node) => node.ghost && node.target === 'missing' && node.id !== opaqueId,
+    )!
+
+    expect(outgoing).toHaveLength(2)
+    expect(outgoing.map((edge) => edge.target)).toEqual(expect.arrayContaining([real.id, ghost.id]))
+    expect(real).toMatchObject({ ghost: false, degree: 1 })
+    expect(ghost).toMatchObject({ ghost: true, degree: 1 })
   })
 
   it('skips self-loops and duplicate edges defensively', () => {
@@ -395,9 +552,24 @@ describe('aggregateGraphHealth (#100)', () => {
     const ghostMap = new Map([
       [
         'ghost:roadmap',
-        { id: 'ghost:roadmap', title: 'Roadmap', target: 'roadmap', prefillTitle: 'Roadmap' },
+        {
+          id: 'ghost:roadmap',
+          title: 'Roadmap',
+          target: 'roadmap',
+          prefillTitle: 'Roadmap',
+          creatable: true,
+        },
       ],
-      ['ghost:todo', { id: 'ghost:todo', title: 'Todo', target: 'todo', prefillTitle: 'Todo' }],
+      [
+        'ghost:todo',
+        {
+          id: 'ghost:todo',
+          title: 'Todo',
+          target: 'todo',
+          prefillTitle: 'Todo',
+          creatable: true,
+        },
+      ],
       [
         'ghost:random-typo',
         {
@@ -405,6 +577,7 @@ describe('aggregateGraphHealth (#100)', () => {
           title: 'Random typo',
           target: 'random-typo',
           prefillTitle: 'Random typo',
+          creatable: true,
         },
       ],
     ])
@@ -452,6 +625,7 @@ describe('aggregateGraphHealth (#100)', () => {
           degree: 1,
           target: 'beta',
           prefillTitle: 'Beta',
+          creatable: true,
           sources: [{ id: 's', title: 'Source', folder: '' }],
         },
         {
@@ -462,6 +636,7 @@ describe('aggregateGraphHealth (#100)', () => {
           degree: 1,
           target: 'alpha',
           prefillTitle: 'Alpha',
+          creatable: true,
           sources: [{ id: 's', title: 'Source', folder: '' }],
         },
       ],
@@ -488,5 +663,218 @@ describe('aggregateGraphHealth (#100)', () => {
       edges: [],
       ghosts: [],
     })
+  })
+})
+
+// #296 — names in a script the slug algebra cannot romanise. Every assertion here
+// fails on the pre-commit graph.ts: pass 1 registered the EMPTY key (so the whole
+// non-Latin corpus shared one index entry), its `|| path` basename fallback handed a
+// `<dir>/.md` note the key of its own FOLDER, and resolveLink keyed every unsluggable
+// ghost on '' (so all broken non-Latin links merged into one node).
+describe('non-Latin names in the resolver (#296)', () => {
+  it('resolves a CJK label to its own note, not to whichever came last', () => {
+    const metas = [
+      meta('journal/第三季度规划.md', '第三季度规划'),
+      meta('journal/会議の議事録.md', '会議の議事録'),
+    ]
+    const index = buildLinkIndex(metas)
+
+    expect(resolveLink('第三季度规划', index).targetId).toBe('journal/第三季度规划.md')
+    expect(resolveLink('会議の議事録', index).targetId).toBe('journal/会議の議事録.md')
+  })
+
+  it('never registers an empty key, so two unnameable notes do not share one', () => {
+    // Two notes whose titles have no letters at all. The EMPTY key is never claimed —
+    // that is what used to make the whole non-Latin corpus resolve as one note — and
+    // each still answers to its own raw name (asserted separately below).
+    const metas = [meta('journal/aaa.md', '🎉🎉'), meta('journal/bbb.md', '✨✨')]
+    const index = buildLinkIndex(metas)
+
+    expect(index.has('')).toBe(false)
+    expect(resolveLink('🎉🎉', index).targetId).not.toBe(resolveLink('✨✨', index).targetId)
+  })
+
+  it('keeps two broken non-Latin links as two distinct ghosts', () => {
+    const index = buildLinkIndex([meta('a.md', 'Alpha')])
+    const { edges, ghosts } = deriveNoteEdges(
+      'a.md',
+      'see [[缺失的笔记]] and [[遗失的另一篇]] and [[🎉/🚀]] and [[✨/💫]]',
+      index,
+      'links-to',
+    )
+
+    // Four missing notes, four ghosts — the multi-segment pair too: their slug is the
+    // bare separator '/', which is truthy and used to merge them back together.
+    expect(new Set(edges.map((e) => e.target)).size).toBe(4)
+    expect(new Set(ghosts.map((g) => g.id)).size).toBe(4)
+    expect(ghosts.some((g) => g.id === 'ghost:')).toBe(false)
+    expect(ghosts.some((g) => g.id === 'ghost:/')).toBe(false)
+  })
+
+  it('a note whose title slugs to nothing is still reachable by that title', () => {
+    // Skipping the empty key must not mean the note has NO key: a human writing
+    // [[🎉🎉]] means this note, and `resolveLink` falls back to the same raw form.
+    const index = buildLinkIndex([meta('journal/aaa.md', '🎉🎉'), meta('journal/bbb.md', '✨✨')])
+
+    expect(resolveLink('🎉🎉', index).targetId).toBe('journal/aaa.md')
+    expect(resolveLink('✨✨', index).targetId).toBe('journal/bbb.md')
+    expect(resolveLink('🚀', index).targetId).toBe('ghost:🚀') // still a ghost when absent
+  })
+
+  it('a legacy `<dir>/.md` note does not steal its own folder key', () => {
+    // Until the boot heal renames it, such a file is still scanned. `[[journal]]` must
+    // not resolve to it — that key belongs to the folder, not to a note inside it.
+    // Order matters: the legacy note is registered LAST, so if it were allowed to
+    // claim the folder key it would overwrite the page's — which is exactly what the
+    // `pop() || path` fallback did.
+    const index = buildLinkIndex([
+      meta('journal/index.md', 'Journal'),
+      meta('journal/.md', '第三季度规划'),
+    ])
+
+    expect(resolveLink('journal', index).targetId).toBe('journal/index.md')
+  })
+
+  it('rewrites a folder alias whose name has no romanisable letters', () => {
+    // Pass 3 keys the rewrite; if it uses a different key rule from pass 1, a folder
+    // like `📥` (an emoji inbox is an ordinary Obsidian convention) rewrites to a key
+    // no note carries, `[[old/note]]` falls through to the bare last segment, and a
+    // same-named sibling wins — the graph and the click-through then disagree.
+    const metas = [meta('📥/note.md', 'Real Note'), meta('decoy/note.md', 'The Decoy')]
+    const index = buildLinkIndex(metas, [{ current: '📥', alias: 'old' }])
+
+    expect(resolveLink('old/note', index).targetId).toBe('📥/note.md')
+  })
+
+  it('uses RAW current-folder membership when case-equivalent folders coexist', () => {
+    const metas = [meta('Inbox/Note.md', 'Upper'), meta('inbox/Note.md', 'Lower')]
+    const index = buildLinkIndex(metas, [{ current: 'inbox', alias: 'Old' }])
+
+    expect(resolveLink('Old/Note', index).targetId).toBe('inbox/Note.md')
+  })
+
+  it('uses exact RAW folder history before ambiguous key-equivalent histories', () => {
+    const metas = [
+      meta('Inbox/Note.md', 'Upper'),
+      meta('inbox/Note.md', 'Lower'),
+      meta('A/Note.md', 'Decoy'),
+    ]
+    const aliases = [
+      { current: 'Inbox', alias: 'Old' },
+      { current: 'inbox', alias: 'old' },
+    ]
+    const index = buildLinkIndex(metas, aliases)
+
+    expect(resolveLink('Old/Note', index).targetId).toBe('Inbox/Note.md')
+    expect(resolveLink('old/Note', index).targetId).toBe('inbox/Note.md')
+    expect(resolveLink('OLD/Note', index).targetId).toBe('A/Note.md')
+  })
+
+  it('uses the longest folder-history prefix independent of alias input order', () => {
+    const metas = [meta('new/sub/Note.md', 'Broad'), meta('other/Note.md', 'Specific')]
+    const aliases = [
+      { current: 'new', alias: 'old' },
+      { current: 'other', alias: 'old/sub' },
+    ]
+
+    expect(resolveLink('old/sub/Note', buildLinkIndex(metas, aliases)).targetId).toBe(
+      'other/Note.md',
+    )
+    expect(
+      resolveLink('old/sub/Note', buildLinkIndex(metas, [...aliases].reverse())).targetId,
+    ).toBe('other/Note.md')
+  })
+
+  it('lets a retired child path outrank a less-specific live parent', () => {
+    const metas = [
+      meta('other/Note.md', 'Target'),
+      meta('else/Note.md', 'Wrong'),
+      meta('old/Keep.md', 'Keep'),
+    ]
+    const index = buildLinkIndex(metas, [{ current: 'other', alias: 'old/sub' }])
+
+    expect(resolveLink('old/sub/Note', index).targetId).toBe('other/Note.md')
+  })
+
+  it('keeps a ghost create in the authored current folder and rewrites an old folder alias', () => {
+    const current = buildLinkIndex([meta('Café Folder/Existing.md', 'Existing')])
+    expect(resolveLink('Café Folder/Future', current).ghost).toMatchObject({
+      prefillTitle: 'Future',
+      prefillDirectory: 'Café Folder',
+      creatable: true,
+    })
+
+    const moved = buildLinkIndex(
+      [meta('new/Existing.md', 'Existing')],
+      [{ current: 'new', alias: 'old' }],
+    )
+    expect(resolveLink('old/Future', moved).ghost).toMatchObject({
+      prefillDirectory: 'new',
+      creatable: true,
+    })
+  })
+
+  it.each(['../Foo', 'a/../Foo', '.hidden/Foo'])(
+    'does not offer a create action for an unsafe directory intent: %s',
+    (label) => {
+      expect(resolveLink(label, buildLinkIndex([])).ghost).toMatchObject({ creatable: false })
+    },
+  )
+
+  it.each(['a/./Foo', 'a//Foo', 'a\\Foo'])(
+    'a safe canonicalized path ghost closes against its created note: %s',
+    (label) => {
+      const missing = resolveLink(label, buildLinkIndex([])).ghost
+      expect(missing).toMatchObject({ prefillDirectory: 'a', creatable: true })
+      const created = meta('a/foo.md', missing!.prefillTitle)
+      const decoy = meta('0/foo.md', missing!.prefillTitle)
+      expect(resolveLink(label, buildLinkIndex([decoy, created])).targetId).toBe('a/foo.md')
+    },
+  )
+
+  it("a ghost's prefill slugs BACK to its own target, raw label included", () => {
+    // #25: a note created from a ghost must resolve the very link that produced it. For
+    // a label keyed on its RAW form, de-kebabbing the prefill (`🎉-🚀` → `🎉 🚀`) keys the
+    // new note somewhere else, so the link re-ghosts the moment it is created.
+    const index = buildLinkIndex([])
+
+    for (const label of ['🎉-🚀', '--', '🎉🎉']) {
+      const { ghost } = resolveLink(label, index)
+      expect(ghost).toBeTruthy()
+      // The prefill, indexed as a title, lands exactly on the ghost's target.
+      const created = buildLinkIndex([meta('n.md', ghost!.prefillTitle)])
+      expect(resolveLink(label, created).targetId).toBe('n.md')
+    }
+  })
+
+  it.each(['journal/', '/', '.md'])(
+    'does not offer creation for a target with no addressable last segment: %s',
+    (label) => {
+      expect(resolveLink(label, buildLinkIndex([])).ghost).toMatchObject({
+        creatable: false,
+        prefillTitle: '',
+      })
+    },
+  )
+
+  it.each([
+    ['Future.md', 'Future', 'future'],
+    ['Future.md.md', 'Future', 'future'],
+    ['Future#section', 'Future', 'future'],
+    ['dir/Future.md#section', 'Future', 'dir/future'],
+  ])('normalizes create prefill and target for a server miss: %s', (label, title, target) => {
+    expect(resolveLink(label, buildLinkIndex([])).ghost).toMatchObject({
+      prefillTitle: title,
+      target,
+      creatable: true,
+    })
+  })
+
+  it('a case-folded compatibility character shares one key with its plain form', () => {
+    // NFKD expands ㎒ to UPPERCASE `MHz`; the resolve key is case-insensitive, so it
+    // must not become a second, distinct key for the same human name.
+    const index = buildLinkIndex([meta('a.md', 'MHz')])
+
+    expect(resolveLink('㎒', index).targetId).toBe('a.md')
   })
 })

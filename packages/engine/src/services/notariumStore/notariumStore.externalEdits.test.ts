@@ -704,4 +704,55 @@ describe('NotariumStore external edit convergence', () => {
     ).toBe(1)
     await db.close()
   })
+
+  it('source-verifies a missing current fingerprint even with the sweep disabled', async () => {
+    const root = await mkroot()
+    const dbRoot = await mkroot('notarium-missing-fingerprint-')
+    const indexDb = join(dbRoot, 'index.db')
+    let store = createNotariumStore({
+      notesDir: root,
+      indexDb,
+      integritySweepBatchSize: 0,
+    })
+
+    await store.write({ title: 'Probe', content: 'body' })
+    await store.stop()
+    const db = createNodeSqliteDriver(indexDb)
+    await db.run(`DELETE FROM file_fingerprints`)
+    await db.close()
+
+    store = createNotariumStore({ notesDir: root, indexDb, integritySweepBatchSize: 0 })
+    try {
+      expect((await store.list()).map((note) => note.filePath)).toEqual(['probe.md'])
+      await expect(store.remove('probe.md')).resolves.toBeUndefined()
+      expect(await store.list()).toEqual([])
+    } finally {
+      await store.stop()
+    }
+  })
+
+  it('adopts a missing current fingerprint for unchanged live edit and delete mutations', async () => {
+    const root = await mkroot()
+    const sql = createNodeSqliteDriver(':memory:')
+    const store = new NotariumStore({
+      mounts: userMount(createLocalFsFiles(root)),
+      sql,
+      integritySweepBatchSize: 0,
+    })
+
+    try {
+      await store.write({ title: 'Probe', content: 'before' })
+      await sql.run(`DELETE FROM file_fingerprints`)
+      await expect(
+        store.write({ title: 'Probe', content: 'after', originalId: 'probe.md' }),
+      ).resolves.toMatchObject({ filePath: 'probe.md' })
+      expect((await store.read('probe.md')).content).toBe('after')
+
+      await sql.run(`DELETE FROM file_fingerprints`)
+      await expect(store.remove('probe.md')).resolves.toBeUndefined()
+      await expect(store.read('probe.md')).rejects.toThrow('not found')
+    } finally {
+      await store.stop()
+    }
+  })
 })

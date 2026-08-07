@@ -4,7 +4,7 @@
 // canon: docs/projects.md#lifecycle · docs/projects.md#the-notariummeta-marker-schema-parser-pin
 
 import { PROJECT_STATUS } from '@notarium/contract'
-import { freshNoteId, nextAliases, slugify } from '@notarium/core'
+import { asciiSlug, freshNoteId, nextAliases } from '@notarium/core'
 
 import type { FolderIdentityPersistence, ProjectRecord, ProjectsPersistence } from '../metaDb'
 import { parseMarker, serializeMarker } from './marker'
@@ -186,7 +186,7 @@ export const renameProjectSlug = (
         if (current.path === '') {
           return { ok: false, code: 'root' }
         }
-        const next = slugify(input.slug)
+        const next = asciiSlug(input.slug)
 
         if (!next) {
           return { ok: false, code: 'invalid' }

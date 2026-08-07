@@ -1,12 +1,19 @@
 // Graph link tools (link / link_many) + the shared resolveLinkTitle resolver.
 // canon: docs/mcp-gateway.md#tools
 import { type BatchLinkResult, type LinkInput, type LinkManyInput } from '@notarium/contract/tools'
-import { linkNotes, linkNotesMany, type LinkSpec } from '@notarium/core'
+import {
+  encodeWikilinkIdentity,
+  isWikilinkIdentityTarget,
+  linkNotes,
+  linkNotesMany,
+  type LinkSpec,
+  normalizeWikilinkTarget,
+} from '@notarium/core'
 
 import { type Ctx, type Handler, toolErrorMessage, ToolFailure } from '../../gateway'
 import { sanitizeText } from '../../sanitize'
 
-/** Resolve a link target (`to` id OR `toTitle` forward-ref) to the `[[title]]` we
+/** Resolve a link target (`to` id OR `toTitle` forward-ref) to the wikilink target we
  *  materialize — the one chokepoint shared by link, link_many and inline links.
  *  `fromId` omitted (inline links, source has no id yet) skips the self-link guard.
  *  canon: docs/core.md#graph-derivation */
@@ -39,7 +46,46 @@ export const resolveLinkTitle = async (
   if (hasToTitle) {
     // Forward-ref: materialized unresolved; same-space by construction, so no
     // cross-space check here.
-    title = toTitle as string
+    title = (toTitle as string).trim()
+    if (!title) {
+      throw new ToolFailure('`toTitle` must name a non-empty future note.')
+    }
+    if (isWikilinkIdentityTarget(title)) {
+      throw new ToolFailure(
+        '`toTitle` cannot use the reserved `notarium-id:` namespace. Pass an existing note through `to`, or use an ordinary future title.',
+      )
+    }
+    // A forward title is useful only when the exact authored target is also the
+    // resolver address of the note create_note will later create. In particular,
+    // `.md` is storage syntax to the resolver but title text to nameKey, so accepting
+    // `Future.md` would report success while leaving an immortal ghost behind.
+    if (normalizeWikilinkTarget(title) !== title) {
+      throw new ToolFailure(
+        '`toTitle` cannot end in `.md` or otherwise normalize to a different wikilink target. Use the future note title without storage syntax.',
+      )
+    }
+    // A forward reference is allowed to miss, but it must not already resolve
+    // back to the source under any human address (title/path/slug/alias/plain id).
+    // Such a self-loop is discarded by graph derivation, so reporting a successful
+    // write would be a false edge. Existing-target `to` is guarded below.
+    if (opts.fromId) {
+      const store = await ctx.store.spaceStore(opts.fromSpace)
+
+      if (store.resolveWikilink) {
+        try {
+          const resolved = await store.resolveWikilink(title)
+
+          if ((resolved.id ?? title) === opts.fromId) {
+            throw new ToolFailure('a note cannot be linked to itself.')
+          }
+        } catch (err) {
+          if (!(err as { isNotFound?: boolean }).isNotFound) {
+            throw err
+          }
+          // An honest miss is the intended forward-reference case.
+        }
+      }
+    }
   } else {
     // A self-link makes no edge (the graph drops self-loops) — refuse it.
     if (opts.fromId && to === opts.fromId) {
@@ -60,13 +106,24 @@ export const resolveLinkTitle = async (
         'Cross-space links are not supported yet — both notes must be in the same space.',
       )
     }
-    title = (await hitTo.store.read(to as string)).title ?? (to as string)
+    const detail = await hitTo.store.read(to as string)
+    const targetId = detail.id ?? (to as string)
+
+    if (opts.fromId && targetId === opts.fromId) {
+      throw new ToolFailure('a note cannot be linked to itself.')
+    }
+    const display = detail.title ?? (to as string)
+    // Preserve the selected stable identity. Every resolver maps the id to its local
+    // node key (id in the read-model/client, storage path in the bare engine); the
+    // alias keeps authored Markdown readable and survives rename/namesake collisions.
+    const address = encodeWikilinkIdentity(targetId)
+    title = /[\]\r\n]/.test(display) ? address : `${address}|${display}`
   }
   // The wikilink target IS the title, so a title with a wikilink metacharacter would
   // resolve to the wrong note (or a ghost) — fail safe rather than link elsewhere.
-  if (/[[\]|#\r\n]/.test(title)) {
+  if (!hasTo && /[[\]|#/\r\n]/.test(title)) {
     throw new ToolFailure(
-      'The target note’s title contains a character that cannot be expressed as a wikilink (one of [ ] | #). Rename it to link automatically.',
+      'The target note’s title contains a character that cannot be expressed as a wikilink (one of [ ] | # /). Rename it to link automatically.',
     )
   }
 
@@ -81,22 +138,26 @@ export const handleLink: Handler = async (ctx, rawArgs) => {
   if (!hitFrom) {
     throw new ToolFailure('no such note to link from, or you do not have access to it')
   }
+  const source = await hitFrom.store.read(from)
+  const sourceId = source.id ?? from
   const title = await resolveLinkTitle(ctx, {
-    fromId: from,
+    fromId: sourceId,
     fromSpace: hitFrom.space,
     relation,
     to,
     toTitle,
   })
   const result = await linkNotes(hitFrom.store, {
-    fromId: from,
+    fromId: sourceId,
     toTitle: title,
     relation,
     principal: ctx.principal.id,
   })
   const structured = { ok: true as const, versionToken: result.versionToken ?? '' }
+  const aliasAt = title.indexOf('|')
+  const display = aliasAt === -1 ? title : title.slice(aliasAt + 1)
   const markdown =
-    `Linked note \`${result.id ?? from}\` → **${sanitizeText(title)}** ` +
+    `Linked note \`${result.id ?? from}\` → **${sanitizeText(display)}** ` +
     `(\`${sanitizeText(relation)}\`).`
   return { markdown, structured }
 }
@@ -127,6 +188,17 @@ export const handleLinkMany: Handler = async (ctx, rawArgs) => {
       }
       continue
     }
+    let sourceId: string
+
+    try {
+      const source = await hitFrom.store.read(from)
+      sourceId = source.id ?? from
+    } catch (err) {
+      for (const i of indices) {
+        fail(i, err)
+      }
+      continue
+    }
     const specs: LinkSpec[] = []
     const valid: number[] = []
 
@@ -135,7 +207,7 @@ export const handleLinkMany: Handler = async (ctx, rawArgs) => {
 
       try {
         const title = await resolveLinkTitle(ctx, {
-          fromId: from,
+          fromId: sourceId,
           fromSpace: hitFrom.space,
           relation: item.relation,
           to: item.to,
@@ -152,7 +224,7 @@ export const handleLinkMany: Handler = async (ctx, rawArgs) => {
     }
     try {
       const r = await linkNotesMany(hitFrom.store, {
-        fromId: from,
+        fromId: sourceId,
         links: specs,
         principal: ctx.principal.id,
       })

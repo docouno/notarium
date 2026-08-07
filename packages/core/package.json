@@ -19,7 +19,8 @@
     "d3-force": "^3.0.0",
     "diff": "^9.0.0",
     "graphology": "^0.26.0",
-    "graphology-communities-louvain": "^2.0.2"
+    "graphology-communities-louvain": "^2.0.2",
+    "marked": "^13.0.0"
   },
   "devDependencies": {
     "@types/d3-force": "^3.0.10"

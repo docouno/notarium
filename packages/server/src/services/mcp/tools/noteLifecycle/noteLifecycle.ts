@@ -9,7 +9,7 @@ import {
 } from '@notarium/contract/tools'
 import { editNote } from '@notarium/core'
 
-import { safeRelPath } from '../../../../libs/relPath'
+import { safeRelAddress } from '../../../../libs/relPath'
 import { type Handler, ToolFailure } from '../../gateway'
 import { dedupedWrite, wireSpace, writeEcho, type WriteRun } from '../../helpers/dedup'
 import { notePath, projectLabelForNote } from '../../helpers/projectAddressing'
@@ -124,7 +124,7 @@ export const handleMoveNote: Handler = async (ctx, rawArgs) => {
   // (else safeRelPath's absolute-path guard trips). safeRelPath then fails closed
   // on traversal / the `.notarium` dot-namespace — a user note can't reach the
   // agent-memory mount.
-  const folder = safeRelPath(toFolder.replace(/^\/+/, ''))
+  const folder = safeRelAddress(toFolder.replace(/^\/+/, ''))
 
   if (folder === null) {
     throw new ToolFailure('bad destination folder')

@@ -1,9 +1,9 @@
 import type { Fragment } from './types'
 
 // Headings + in-page anchors (#235). The renderer slugs the VISIBLE text via core
-// `slugify` (transliterates Cyrillic/Greek), disambiguates repeats GitHub-style,
-// and falls back to `section` when nothing slugs. Grounded in markdown.test.ts
-// (#235 heading ids).
+// `slugify` (romanises Cyrillic/Greek, keeps the letters of a script it cannot —
+// #296), disambiguates repeats GitHub-style, and falls back to `section` only when
+// the text has no letters at all. Grounded in markdown.test.ts (#235 heading ids).
 export const headingsFragments: Fragment[] = [
   {
     id: 'heading-levels',
@@ -54,11 +54,19 @@ export const headingsFragments: Fragment[] = [
     expect: { contains: ['id="install-guide-now"'], excludes: ['https-example', 'example-com'] },
   },
   {
-    id: 'heading-cjk-fallback',
+    id: 'heading-cjk',
     feature: 'headings',
-    exercises: 'a CJK-only heading has no latin slug → falls back to id="section"',
-    md: '## 你好',
-    refs: ['#235', 'markdown.test.ts'],
+    exercises: 'a CJK heading anchors on its OWN letters — two of them stay distinct',
+    md: '## 你好\n\n## 第三季度规划',
+    refs: ['#235', '#296', 'markdown.test.ts'],
+    expect: { contains: ['id="你好"', 'id="第三季度规划"'] },
+  },
+  {
+    id: 'heading-emoji-fallback',
+    feature: 'headings',
+    exercises: 'a heading with no letters at all (emoji) still gets an addressable id',
+    md: '## 🎉',
+    refs: ['#235', '#296', 'markdown.test.ts'],
     expect: { contains: ['id="section"'] },
   },
 ]

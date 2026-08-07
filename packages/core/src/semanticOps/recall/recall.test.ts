@@ -74,6 +74,7 @@ const ghost = (id: string): GraphGhostNode => ({
   degree: 0,
   target: id,
   prefillTitle: id,
+  creatable: true,
 })
 const graphOf = (
   nodes: Array<GraphRealNode | GraphGhostNode>,
@@ -250,6 +251,22 @@ const target = (slug: string, store: KnowledgeStore, isPersonal = false): Recall
 })
 
 describe('recall', () => {
+  it('emits the authoritative id returned by a read of a provisional seed', async () => {
+    const store = fakeStore([
+      { id: 'provisional-id', title: 'Target', content: 'identity marker', score: 1 },
+    ])
+    const read = store.read.bind(store)
+
+    store.read = async (id, opts) => ({ ...(await read(id, opts)), id: 'durable-id' })
+    const res = await recall([target('team', store)], {
+      query: 'identity marker',
+      budgetTokens: 100,
+      depth: 0,
+    })
+
+    expect(res.sources).toContainEqual(expect.objectContaining({ noteId: 'durable-id' }))
+  })
+
   it('assembles a context bundle from the FTS seeds, highest score first', async () => {
     const store = fakeStore([
       { id: 'a', title: 'Alpha', content: 'topic alpha', score: 2 },

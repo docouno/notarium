@@ -5,7 +5,16 @@
 // index-isolation, the `.notarium/` skip) — the one piece the e2e fake (no FS)
 // can't cover.
 
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import {
+  promises as fs,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -37,6 +46,7 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'notarium-proj-'))
 })
 afterEach(() => {
+  vi.restoreAllMocks()
   rmSync(dir, { recursive: true, force: true })
 })
 
@@ -102,6 +112,13 @@ describe('parseMarker (#13)', () => {
     expect(parseMarker(serializeMarker(fields))).toEqual(fields)
   })
 
+  it('round-trips a durable Unicode display name without changing code points', () => {
+    const displayName = '研发 e\u0301 🚀'
+    const fields = { id: VALID_ID, slug: 'research', displayName }
+
+    expect(parseMarker(serializeMarker(fields))?.displayName).toBe(displayName)
+  })
+
   it('round-trips a folder marker (#100 phase 3): type + RAW pathAliases (cyrillic dirs survive)', () => {
     // The engine stores directories VERBATIM (a cyrillic `Космос`, not a slug), so
     // pathAliases are raw paths — only a sanity gate (no `..`, no leading slash),
@@ -119,6 +136,21 @@ describe('parseMarker (#13)', () => {
       }),
     )
     expect(dirty?.pathAliases).toEqual(['ok'])
+  })
+
+  it('drops marker strings that JSON can decode but UTF-8/path scalars cannot preserve', () => {
+    const lone = String.fromCharCode(0xd800)
+    const marker = parseMarker(
+      JSON.stringify({
+        id: VALID_ID,
+        type: 'folder',
+        displayName: `bad${lone}`,
+        pathAliases: [`bad${lone}`, 'bad\0path', 'valid/Путь'],
+      }),
+    )
+
+    expect(marker?.displayName).toBeUndefined()
+    expect(marker?.pathAliases).toEqual(['valid/Путь'])
   })
 
   it('round-trips aliases (#100 phase 2): well-formed past slugs survive, malformed/dup are dropped', () => {
@@ -157,6 +189,60 @@ describe('markerStore over a real tree (#13)', () => {
     const store = createMarkerStore(() => dir)
     await expect(store.write('s', '.notarium/memory', '{}')).rejects.toThrow(/dot namespace/)
     await expect(store.write('s', 'foo\\.notarium\\memory', '{}')).rejects.toThrow(/dot namespace/)
+  })
+
+  it('does not overwrite a marker that races writeExisting publication', async () => {
+    const store = createMarkerStore(() => dir)
+    const folder = join(dir, 'docs')
+    const marker = join(folder, '.notariummeta')
+    const realLink = fs.link.bind(fs)
+    let injected = false
+
+    mkdirSync(folder, { recursive: true })
+    vi.spyOn(fs, 'link').mockImplementation(async (from, to) => {
+      if (!injected && String(to).endsWith('/.notariummeta')) {
+        injected = true
+        await fs.writeFile(marker, 'FOREIGN-MARKER')
+      }
+
+      return realLink(from, to)
+    })
+
+    await expect(store.writeExisting!('s', 'docs', 'INTENDED-MARKER')).rejects.toThrow()
+    expect(injected).toBe(true)
+    await expect(fs.readFile(marker, 'utf8')).resolves.toBe('FOREIGN-MARKER')
+  })
+
+  it('does not publish through a stale pathname when the marked folder is replaced', async () => {
+    const store = createMarkerStore(() => dir)
+    const source = join(dir, 'docs')
+    const moved = join(dir, 'moved')
+    const marker = join(source, '.notariummeta')
+    const realOpen = fs.open.bind(fs)
+    const realRename = fs.rename.bind(fs)
+    let injected = false
+    let foreignTemp = ''
+
+    mkdirSync(source, { recursive: true })
+    vi.spyOn(fs, 'open').mockImplementation(async (path, flags, ...args) => {
+      const handle = await realOpen(path, flags, ...args)
+
+      if (!injected && String(path).endsWith('.tmp')) {
+        injected = true
+        foreignTemp = join(source, String(path).split('/').at(-1) ?? 'foreign.tmp')
+        await realRename(source, moved)
+        await fs.mkdir(source)
+        await fs.writeFile(foreignTemp, 'FOREIGN-TEMP')
+      }
+
+      return handle
+    })
+
+    await expect(store.writeExisting!('s', 'docs', 'INTENDED-MARKER')).rejects.toThrow()
+    expect(injected).toBe(true)
+    await expect(fs.lstat(marker)).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(fs.readFile(foreignTemp, 'utf8')).resolves.toBe('FOREIGN-TEMP')
+    expect((await fs.readdir(moved)).filter((name) => name.endsWith('.tmp'))).toEqual([])
   })
 
   it('a written marker is STRUCTURALLY INVISIBLE to the note index (#78): localFs.scan returns the .md, never the marker', async () => {
@@ -305,6 +391,7 @@ describe('ensureFolderIdentity (#212 — the page-create lazy-mint path)', () =>
 
   it('mints a fresh type=folder identity for an unidentified folder + writes the marker', async () => {
     const d = deps()
+    mkdirSync(join(dir, 'docs'))
     const id = await ensureFolderIdentity(d, { space: 's', folderPath: 'docs' })
     expect(id).toMatch(/^[A-Za-z0-9_-]{12}$/)
     expect(await d.folders.byPath('s', 'docs')).toMatchObject({ id, path: 'docs' })
@@ -323,9 +410,20 @@ describe('ensureFolderIdentity (#212 — the page-create lazy-mint path)', () =>
     expect(id).toBe(proj.id) // a project IS an identified folder — its id is the folder id
     expect(await d.folders.byPath('s', 'docs')).toBeNull() // no second (folder-type) row minted
     // Idempotent for a plain folder too.
+    mkdirSync(join(dir, 'guides'))
     const a = await ensureFolderIdentity(d, { space: 's', folderPath: 'guides' })
     const b = await ensureFolderIdentity(d, { space: 's', folderPath: 'guides' })
     expect(a).toBe(b)
+  })
+
+  it('does not recreate a missing folder while preparing its identity', async () => {
+    const d = deps()
+
+    await expect(
+      ensureFolderIdentity(d, { space: 's', folderPath: 'missing' }),
+    ).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(await d.markerStore.folderExists('s', 'missing')).toBe(false)
+    expect(await d.folders.byPath('s', 'missing')).toBeNull()
   })
 
   it('reuses a FREE folder marker id (a clone whose registry row was lost)', async () => {
@@ -515,6 +613,43 @@ describe('renameProjectSlug (#100 phase 2)', () => {
     // Resolution layer: the old current-slug handle is now free of a CURRENT holder.
     expect(await projects.getByHandle('s', 'guides')).toMatchObject({ id: rec.id })
     expect(await projects.getByHandle('s', 'docs')).toBeNull() // 'docs' is an alias, not current
+  })
+
+  // The HANDLE axis stays ASCII while note names went Unicode (#296): a handle is a URL
+  // segment under SpaceSlugSchema, and it is minted through the same `asciiSlug` that
+  // resolution uses — mint and lookup have to agree, or a project becomes unreachable by
+  // the very handle the registry gave it.
+  it('keeps a project handle in the ASCII alphabet, whatever the folder is called', async () => {
+    const projects = new InMemoryProjects()
+    const rec = await markFolderAsProject(
+      { projects, now },
+      { space: 's', folderPath: '第三季度', displayName: '第三季度规划' },
+    )
+    expect(rec.slug).toMatch(/^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$/)
+    expect(await projects.getByHandle('s', rec.slug)).toMatchObject({ id: rec.id })
+
+    // A second one cannot take the same handle silently.
+    const other = await markFolderAsProject(
+      { projects, now },
+      { space: 's', folderPath: '会議', displayName: '会議の議事録' },
+    )
+    expect(other.slug).not.toBe(rec.slug)
+    expect(await projects.getByHandle('s', other.slug)).toMatchObject({ id: other.id })
+  })
+
+  it('refuses to rename a handle onto a non-ASCII slug', async () => {
+    const projects = new InMemoryProjects()
+    const rec = await markFolderAsProject(
+      { projects, now },
+      { space: 's', folderPath: 'docs', displayName: 'Docs' },
+    )
+    const res = await renameProjectSlug(
+      { projects, now },
+      { space: 's', id: rec.id, slug: '第三季度' },
+    )
+    // Nothing sluggable in the ASCII alphabet → not a handle; the old one still holds.
+    expect(res.ok).toBe(false)
+    expect((await projects.getById(rec.id))!.slug).toBe('docs')
   })
 
   it('A→B→A never self-aliases the current name (idempotent — reuses the note alias algebra)', async () => {
@@ -939,12 +1074,20 @@ describe('recordFolderRename + folder boot reconcile (#100 phase 3)', () => {
   })
 
   it('boot reconciles a type:"folder" marker as a folder identity, NOT a project', async () => {
-    writeMarkerFile('archive', { id: VALID_ID, type: 'folder', pathAliases: ['old-notes'] })
+    writeMarkerFile('archive', {
+      id: VALID_ID,
+      type: 'folder',
+      pathAliases: ['old-notes', 'foo:bar'],
+    })
     const { projects, folders } = make()
     const markerStore = createMarkerStore(() => dir)
     await scanProjectsAtBoot({ projects, folders, markerStore, now }, ['s'])
     expect(await folders.listForSpace('s')).toEqual([
-      expect.objectContaining({ id: VALID_ID, path: 'archive', pathAliases: ['old-notes'] }),
+      expect.objectContaining({
+        id: VALID_ID,
+        path: 'archive',
+        pathAliases: ['old-notes', 'foo:bar'],
+      }),
     ])
     expect(await projects.listForSpace('s')).toHaveLength(0) // the handle layer ignores it
   })
@@ -965,6 +1108,30 @@ describe('recordFolderRename + folder boot reconcile (#100 phase 3)', () => {
     const row = (await folders.listForSpace('s'))[0]
     expect(row.path).toBe('b')
     expect(row.pathAliases).toEqual(['a']) // [[a/note]] keeps resolving
+  })
+
+  it('boot recovers a crash after physical rename but before move finalization', async () => {
+    const { projects, folders } = make()
+    const markerStore = createMarkerStore(() => dir)
+    mkdirSync(join(dir, 'before'), { recursive: true })
+    const id = await ensureFolderIdentity(
+      { projects, folders, markerStore, now },
+      { space: 's', folderPath: 'before' },
+    )
+
+    // prepare() completed, the marker travelled with the atomic directory rename,
+    // then the process died before finalizeFolderMove could update derived rows.
+    renameSync(join(dir, 'before'), join(dir, 'after'))
+    await scanProjectsAtBoot({ projects, folders, markerStore, now }, ['s'])
+
+    expect(await folders.getById(id)).toMatchObject({
+      path: 'after',
+      pathAliases: ['before'],
+    })
+    expect(parseMarker(readFileSync(join(dir, 'after', '.notariummeta'), 'utf8'))).toMatchObject({
+      id,
+      type: 'folder',
+    })
   })
 
   // Marking a folder that ALREADY has a folder-identity must ADOPT

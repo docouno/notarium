@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { ProjectStatusSchema, SpaceSlugSchema } from '../primitives'
+import { DurableDisplayNameSchema, ProjectStatusSchema, SpaceSlugSchema } from '../primitives'
 
 // Mark a folder (or the space root, folderPath: '') as a project: server mints a
 // stable id + per-space-unique slug and writes a `.notariummeta` marker.
@@ -33,7 +33,7 @@ export const MarkProjectRequestSchema = z.object({
   folderPath: z.string(),
   /** Bounded — it lands in the marker file + registry row, so an unbounded value
    *  is storage amplification. */
-  displayName: z.string().min(1).max(200).optional(),
+  displayName: DurableDisplayNameSchema.optional(),
   /** Create a NEW empty project: mint the folder (the marker write
    *  mkdir's it) rather than marking an existing one. The folder must NOT
    *  already exist (409 if it does). Absent/false = mark an EXISTING folder
@@ -58,7 +58,7 @@ export const PatchProjectRequestSchema = z
      *  normalised; it must be unique in the space (409 otherwise). */
     slug: z.string().min(1).max(200).optional(),
     /** New human label, bounded. */
-    displayName: z.string().min(1).max(200).optional(),
+    displayName: DurableDisplayNameSchema.optional(),
   })
   .refine((b) => b.slug !== undefined || b.displayName !== undefined, {
     message: 'nothing to update (slug or displayName required)',

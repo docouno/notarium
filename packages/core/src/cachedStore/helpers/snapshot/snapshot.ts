@@ -3,13 +3,20 @@ import {
   deriveNoteEdges,
   edgeKey,
   type FolderAlias,
+  ghostForWikilinkTarget,
   type GhostStub,
   type LinkIndex,
   resolveLink,
 } from '../../../graph'
-import type { Graph, GraphLink, NoteMeta } from '../../../knowledgeStore'
+import {
+  type Graph,
+  GRAPH_GHOST_TARGET,
+  type GraphLink,
+  type NoteMeta,
+} from '../../../knowledgeStore'
 import { dedupeAliases } from '../../../libs/aliases'
-import { slugify } from '../../../libs/slug'
+import { parseWikilinks } from '../../../libs/markdown'
+import { nameKey } from '../../../libs/slug'
 import { isVisibleOn, SURFACE } from '../../../visibility'
 
 /** The read-model's derived state: notes by note-id, outbound edges by source
@@ -43,7 +50,10 @@ export class Snapshot {
 
   /** Edge type for body-derived links — matches what the engine's boot graph uses so
    *  patched and swept edges dedupe against each other. */
-  constructor(private readonly relationType: string) {}
+  constructor(
+    private readonly relationType: string,
+    private readonly currentFolders: () => readonly string[] = () => [],
+  ) {}
 
   /** The graph-visible slice of the snapshot — agent-memory (and any non-graph
    *  class) is neither a node nor a link target in the user graph. */
@@ -73,9 +83,12 @@ export class Snapshot {
     if (!past?.length) {
       return fileAliases
     } // no backfill for this note — keep file truth verbatim
-    const currentKey = slugify(title)
+    // `nameKey`, not `slugify`: the alias history keeps a letterless past name (a note
+    // titled `🎉🎉`), and filtering it here on the bare slug would drop exactly those —
+    // undoing one layer up what the history and the resolver agreed on.
+    const currentKey = nameKey(title)
     const merged = dedupeAliases([...(fileAliases ?? []), ...past]).filter(
-      (a) => slugify(a) !== currentKey,
+      (a) => nameKey(a) !== currentKey,
     )
     return merged.length ? merged : undefined
   }
@@ -83,7 +96,53 @@ export class Snapshot {
   /** The link index over the graph-visible notes + folder path-aliases — the
    *  resolve table [[wikilink]]s and ghost re-resolution consult. */
   buildIndex(): LinkIndex {
-    return buildLinkIndex(this.graphVisibleNotes(), this.folderAliases)
+    return buildLinkIndex(
+      this.graphVisibleNotes(),
+      this.folderAliases,
+      undefined,
+      this.currentFolders(),
+    )
+  }
+
+  /** Real note ids addressed by the authored body under the current resolver index.
+   *  A write claims these ids so it cannot introduce a new inbound edge while the
+   *  selected target is being deleted. Ghosts need no claim: no live resource owns
+   *  them yet. */
+  resolvedTargetIds(content: string): string[] {
+    const labels = parseWikilinks(content)
+
+    if (!labels.length) {
+      return []
+    }
+    const index = this.buildIndex()
+    const targets = new Set<string>()
+
+    for (const label of labels) {
+      const resolved = resolveLink(label, index)
+
+      if (!resolved.ghost) {
+        targets.add(resolved.targetId)
+      }
+    }
+
+    return [...targets]
+  }
+
+  /** Sources whose currently-derived edges reach any of `targetIds`. A real target
+   *  can have collapsed several authored intents (human name + stable envelope) into
+   *  one edge, so callers use this set to re-read the source bodies when the target
+   *  disappears instead of guessing a tombstone from the lossy edge projection. */
+  sourceIdsTargeting(targetIds: Iterable<string>): string[] {
+    const targets = new Set(targetIds)
+    const sources: string[] = []
+
+    for (const [sourceId, edges] of this.edgesBySource) {
+      if (edges.some((edge) => targets.has(edge.target))) {
+        sources.push(sourceId)
+      }
+    }
+
+    return sources
   }
 
   /** Move everything keyed under a superseded id to the note's real id (the edge
@@ -99,12 +158,14 @@ export class Snapshot {
       )
     }
     for (const [source, edges] of this.edgesBySource) {
-      if (!edges.some((e) => e.target === oldId)) {
+      if (!edges.some((e) => !e[GRAPH_GHOST_TARGET] && e.target === oldId)) {
         continue
       }
       this.edgesBySource.set(
         source,
-        edges.map((e) => (e.target === oldId ? { ...e, target: newId } : e)),
+        edges.map((e) =>
+          !e[GRAPH_GHOST_TARGET] && e.target === oldId ? { ...e, target: newId } : e,
+        ),
       )
     }
   }
@@ -164,21 +225,31 @@ export class Snapshot {
     for (const [ghostId, stub] of this.ghosts) {
       const { targetId, ghost } = resolveLink(stub.target, index)
 
-      if (!ghost && targetId !== ghostId) {
-        resolved.set(ghostId, targetId)
+      if (!ghost) {
         this.ghosts.delete(ghostId)
+        // Even when the real target happens to have the SAME raw id as the ghost,
+        // record the transition: the edge must still lose its ghost provenance.
+        resolved.set(ghostId, targetId)
       }
     }
     if (!resolved.size) {
       return false
     }
     for (const [source, edges] of this.edgesBySource) {
-      if (!edges.some((e) => resolved.has(e.target))) {
+      if (!edges.some((e) => e[GRAPH_GHOST_TARGET] && resolved.has(e.target))) {
         continue
       }
       this.edgesBySource.set(
         source,
-        edges.map((e) => (resolved.has(e.target) ? { ...e, target: resolved.get(e.target)! } : e)),
+        edges.map((e) => {
+          if (!e[GRAPH_GHOST_TARGET] || !resolved.has(e.target)) {
+            return e
+          }
+          const next = { ...e, target: resolved.get(e.target)! }
+
+          delete next[GRAPH_GHOST_TARGET]
+          return next
+        }),
       )
     }
 
@@ -189,23 +260,60 @@ export class Snapshot {
    *  and remember each ghost's prefill payload. Body-derived patches refine from
    *  here. The engine speaks storage ids (file paths) — its edges are remapped onto
    *  our note-ids; ghost targets pass through. */
-  adoptEdgeBaseline(graph: Graph): void {
+  adoptEdgeBaseline(graph: Graph, graphUsesIdentity: boolean): void {
     this.edgesBySource.clear()
-    const toId = new Map<string, string>()
+    this.adoptSourceEdgeBaseline(graph, this.notes.keys(), graphUsesIdentity)
+  }
 
-    for (const meta of this.notes.values()) {
-      if (!meta.id) {
-        continue
+  /** Repair only selected source buckets from an engine graph. A delete owns the
+   *  removed note and its known inbound sources, but deliberately does not stop
+   *  unrelated writers. Replacing the whole baseline from a graph captured during
+   *  that narrow lease could therefore erase a concurrent source patch. */
+  adoptSourceEdgeBaseline(
+    graph: Graph,
+    rawSourceIds: Iterable<string>,
+    graphUsesIdentity: boolean,
+  ): void {
+    const sourceIds = new Set(rawSourceIds)
+
+    for (const sourceId of sourceIds) {
+      this.edgesBySource.delete(sourceId)
+    }
+    const toId = new Map<string, string>()
+    const ghostIds = new Set(graph.nodes.filter((node) => node.ghost).map((node) => node.id))
+
+    if (!graphUsesIdentity) {
+      for (const meta of this.notes.values()) {
+        if (meta.id) {
+          toId.set(meta.filePath, meta.id)
+        }
       }
-      toId.set(meta.filePath, meta.id)
     }
     for (const raw of graph.links) {
+      const ghostTarget = ghostIds.has(raw.target)
+      // A bare engine graph may have observed a just-committed file before the
+      // read-model mutation published that file into this snapshot. Its real path
+      // cannot yet be converted to a stable id. Keep the edge as an explicitly
+      // re-resolvable path ghost; the following snapshot upsert then heals it.
+      // Leaving the raw path unmarked would make reresolveGhosts ignore it forever.
+      const temporarilyUnmapped = !graphUsesIdentity && !ghostTarget && !toId.has(raw.target)
+      const temporaryGhost = temporarilyUnmapped ? ghostForWikilinkTarget(raw.target) : undefined
       const link: GraphLink = {
         ...raw,
-        source: toId.get(raw.source) ?? raw.source,
-        target: toId.get(raw.target) ?? raw.target,
+        source: graphUsesIdentity ? raw.source : (toId.get(raw.source) ?? raw.source),
+        target:
+          temporaryGhost?.id ??
+          (graphUsesIdentity || ghostTarget ? raw.target : (toId.get(raw.target) ?? raw.target)),
+        ...(ghostTarget || temporaryGhost ? { [GRAPH_GHOST_TARGET]: true as const } : {}),
       }
 
+      if (temporaryGhost) {
+        this.ghosts.set(temporaryGhost.id, temporaryGhost)
+      }
+
+      if (!sourceIds.has(link.source)) {
+        continue
+      }
       // Don't adopt edges into/out of hidden-class notes (agent-memory): they'd
       // surface a memory note as a spurious ghost at shape time.
       if (!this.isGraphVisibleId(link.source) || !this.isGraphVisibleId(link.target)) {
@@ -228,6 +336,8 @@ export class Snapshot {
         title: node.title,
         target: node.target,
         prefillTitle: node.prefillTitle,
+        ...(node.prefillDirectory ? { prefillDirectory: node.prefillDirectory } : {}),
+        creatable: node.creatable,
       })
     }
   }

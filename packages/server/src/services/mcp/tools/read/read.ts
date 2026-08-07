@@ -28,7 +28,7 @@ import {
   treeChildren,
 } from '@notarium/core'
 
-import { safeRelPath } from '../../../../libs/relPath'
+import { safeRelAddress } from '../../../../libs/relPath'
 import { type ProjectRecord } from '../../../metaDb'
 import { type SpaceStore } from '../../../spaces'
 import { type Handler, ToolFailure } from '../../gateway'
@@ -336,7 +336,7 @@ export const handleListNotes: Handler = async (ctx, rawArgs) => {
   let folder = base
 
   if (path !== undefined) {
-    const safe = safeRelPath(path)
+    const safe = safeRelAddress(path)
 
     if (safe === null) {
       throw new ToolFailure(`"${path}" is not a valid folder path`)

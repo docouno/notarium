@@ -6,7 +6,7 @@
 
 import { DEFAULT_SPACE } from '../knowledgeStore'
 import type { IdentityPersistence, IdentityRecord } from '../knowledgeStore'
-import { freshNoteId } from '../libs/id'
+import { freshNoteId, isValidNoteId } from '../libs/id'
 import type { AdoptResult } from './types'
 
 const FLUSH_DELAY_MS = 500
@@ -21,6 +21,10 @@ export class IdentityRegistry {
    *  older batch can never commit after a newer one. */
   private flushTask: Promise<void> | null = null
   private persistence?: IdentityPersistence
+  /** Timer retries must cross the owning read-model's publication checkpoint.
+   *  Falling back to flush() keeps the registry useful as a standalone unit,
+   *  while CachedStore injects its durability + repair completion hook. */
+  private readonly requestFlush: () => Promise<void>
   private readonly now: () => Date
   /** The space this registry's engine serves. Today
    *  one registry = one space; multi-space wiring is deferred design work. */
@@ -30,10 +34,17 @@ export class IdentityRegistry {
     persistence,
     space = DEFAULT_SPACE,
     now = () => new Date(),
-  }: { persistence?: IdentityPersistence; space?: string; now?: () => Date } = {}) {
+    requestFlush,
+  }: {
+    persistence?: IdentityPersistence
+    space?: string
+    now?: () => Date
+    requestFlush?: () => Promise<void>
+  } = {}) {
     this.persistence = persistence
     this.space = space
     this.now = now
+    this.requestFlush = requestFlush ?? (() => this.flush())
   }
 
   /** Load the persisted registry — strictly this space's rows (the
@@ -45,8 +56,24 @@ export class IdentityRegistry {
     if (!this.persistence) {
       return
     }
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer)
+      this.flushTimer = null
+    }
     await this.persistence.init()
-    for (const rec of await this.persistence.loadAll(this.space)) {
+    const loadedByPath = new Map<string, IdentityRecord>()
+    const loadedById = new Map<string, IdentityRecord>()
+    const canonicalized: IdentityRecord[] = []
+
+    // Build a completely detached image. A retry after a failed load must
+    // never combine a partial/ephemeral ownership map with the authoritative
+    // rows it is about to install.
+    for (const raw of await this.persistence.loadAll(this.space)) {
+      const rec = { ...raw }
+
+      if (!isValidNoteId(rec.id)) {
+        continue
+      }
       // Legacy rows carry the engine's native timestamp form
       // ("+00:00" offset, microseconds) — canonicalise so one shape reaches
       // the wire; the write-behind flush makes it durable.
@@ -55,13 +82,20 @@ export class IdentityRegistry {
 
         if (!Number.isNaN(t)) {
           rec.createdAt = new Date(t).toISOString()
-          this.markDirty(rec)
+          canonicalized.push(rec)
         }
       }
-      this.byId.set(rec.id, rec)
+      loadedById.set(rec.id, rec)
       if (!rec.deletedAt) {
-        this.byPath.set(rec.filePath, rec)
+        loadedByPath.set(rec.filePath, rec)
       }
+    }
+    this.byPath = loadedByPath
+    this.byId = loadedById
+    this.dirty.clear()
+    this.dropped.clear()
+    for (const rec of canonicalized) {
+      this.markDirty(rec)
     }
   }
 
@@ -76,6 +110,13 @@ export class IdentityRegistry {
 
   recordFor(id: string): IdentityRecord | undefined {
     return this.byId.get(id)
+  }
+
+  /** Read-only authoritative probe used only while the full per-space load is
+   *  unavailable. It distinguishes a plain stable-id spelling from a human
+   *  name without installing or dirtying any registry state. */
+  async persistedRecordFor(id: string): Promise<IdentityRecord | null | undefined> {
+    return this.persistence?.findById ? this.persistence.findById(id) : undefined
   }
 
   /** Overwrite a record's persisted creation date. `ensure` only fills a
@@ -341,7 +382,9 @@ export class IdentityRegistry {
     }
     this.flushTimer = setTimeout(() => {
       this.flushTimer = null
-      this.flush().catch((err) => console.error('[identity] flush failed:', (err as Error).message))
+      this.requestFlush().catch((err) =>
+        console.error('[identity] flush failed:', (err as Error).message),
+      )
     }, FLUSH_DELAY_MS)
     this.flushTimer.unref?.()
   }

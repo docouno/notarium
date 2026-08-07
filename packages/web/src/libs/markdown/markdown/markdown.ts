@@ -114,7 +114,10 @@ marked.use({
     // inline tokens to text, but an inline EXTENSION token (marked-footnote's ref)
     // still renders its HTML, so strip tags before slugging — else `## Overview[^1]`
     // would slug the whole `<sup><a …>1</a></sup>` blob; stripped, it's `overview-1`.
-    // The id alphabet is `[a-z0-9_-]`, safe as a bare attribute value.
+    // The id alphabet is letters/digits/marks/underscore/dash since #296 — wider than
+    // ASCII, but still safe as a bare attribute value: a quote, `<` and `&` are none of
+    // those, so the slug class collapses them to a dash. Widen that class and this
+    // interpolation needs escaping.
     heading(token) {
       const inner = this.parser.parseInline(token.tokens)
       const plain = this.parser
@@ -182,12 +185,11 @@ export const wikiLinkTarget = (href: string | null | undefined): string | null =
     return null
   }
   const marker = '#wiki/'
-  const idx = href.indexOf(marker)
 
-  if (idx === -1) {
+  if (!href.startsWith(marker)) {
     return null
   }
-  const raw = href.slice(idx + marker.length)
+  const raw = href.slice(marker.length)
 
   try {
     return decodeURIComponent(raw)

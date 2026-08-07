@@ -329,6 +329,26 @@ describe('contract conformance over the seed fixture', () => {
     expect(byPath.id).toBe('fake-demo-carbon')
     expect(byPath.space).toBe('main')
   })
+  it('GET /api/s/:space/note?ref normalizes wikilink syntax before exact storage paths', async () => {
+    const fixture = loadFixture()
+    fixture.spaces[0].notes.push(
+      { id: 'plain', title: 'Plain', filePath: 'Foo.md', content: 'plain' },
+      { id: 'literal', title: 'Literal Hash', filePath: 'Foo#section.md', content: 'literal' },
+    )
+    const isolated = await createApp(fixture)
+
+    try {
+      const response = await isolated.inject({
+        method: 'GET',
+        url: '/api/s/main/note?ref=' + encodeURIComponent('Foo#section.md'),
+      })
+
+      expect(response.statusCode).toBe(200)
+      expect(response.json().id).toBe('plain')
+    } finally {
+      await isolated.close()
+    }
+  })
   it('GET /api/search', async () => {
     expect(SearchResponseSchema.safeParse(await get('/api/s/main/search?q=titanium')).success).toBe(
       true,

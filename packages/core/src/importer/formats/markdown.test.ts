@@ -55,16 +55,24 @@ describe('markdownFileToNote (#223)', () => {
     expect(n.body).toBe('Body')
   })
 
-  it('a non-romanisable basename gets a DISTINCT hashed filename, not a shared constant', () => {
-    // CJK / emoji / etc. slug to '' — they must NOT all collapse to the same
-    // `note.md` path (that would silently drop the second of two such files).
+  it('keeps the legacy hashed storage key for a non-romanisable basename', () => {
+    // Import storage identity must not change across a slug-alphabet upgrade:
+    // re-importing the same source has to overwrite/skip its old path, not duplicate it.
     const a = markdownFileToNote('content a', '笔记.md')
     const b = markdownFileToNote('content b', '日记.md')
+    expect(a.fileName).toBe('note-01qpbapg')
+    expect(b.fileName).toBe('note-00qyrh1f')
+    expect(a.title).toBe('笔记')
+  })
+
+  it('a basename with no letters at all still gets a DISTINCT, stable filename', () => {
+    // The hash fallback survives for the case that really has nothing to name a file
+    // with — two emoji-named drops must not land on one path.
+    const a = markdownFileToNote('content a', '🎉.md')
+    const b = markdownFileToNote('content b', '🚀.md')
     expect(a.fileName).toMatch(/^note-[a-z0-9]{8}$/)
     expect(b.fileName).toMatch(/^note-[a-z0-9]{8}$/)
-    expect(a.fileName).not.toBe(b.fileName) // distinct source names → distinct paths
-    // …but titles keep the original (non-Latin) name.
-    expect(a.title).toBe('笔记')
+    expect(a.fileName).not.toBe(b.fileName)
   })
 
   it('a long H1 line with trailing spaces titles cleanly (greedy capture + trim, no ReDoS)', () => {

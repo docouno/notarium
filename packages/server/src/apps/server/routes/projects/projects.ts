@@ -14,7 +14,7 @@ import {
 import { HTTP_STATUS } from '@notarium/contract/http'
 
 import { withAuthors } from '../../../../libs/authors'
-import { safeRelPath } from '../../../../libs/relPath'
+import { safeRelAddress, safeRelPath } from '../../../../libs/relPath'
 import {
   markFolderAsProject,
   projectSummaryOf,
@@ -55,7 +55,11 @@ export const projectsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => 
         .code(HTTP_STATUS.BAD_REQUEST)
         .send({ error: body.error.issues[0]?.message || 'bad request' })
     }
-    const safe = safeRelPath(body.data.folderPath)
+    // Existing legacy folders remain addressable, but `create:true` is a public
+    // creation capability and may materialize only portable components.
+    const safe = body.data.create
+      ? safeRelPath(body.data.folderPath)
+      : safeRelAddress(body.data.folderPath)
 
     if (safe === null) {
       return reply.code(HTTP_STATUS.BAD_REQUEST).send({ error: 'bad folder path' })

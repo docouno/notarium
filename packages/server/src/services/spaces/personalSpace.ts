@@ -2,7 +2,7 @@
 // agent-memory writes into. Idempotent, safe to call lazily on first touch.
 // canon: docs/projects.md#personal-domain-as-a-working-space-13-2026-06-20 · docs/note-model.md#agent-memory
 
-import { slugify, uniqueSlug } from '@notarium/core'
+import { asciiSlug, uniqueSlug } from '@notarium/core'
 
 import type { AuthService } from '../auth'
 import type { Principal } from '../authz'
@@ -18,7 +18,7 @@ const SLUG_MAX = 32
 
 /** SpaceSlug-safe slug base from a username; 'user' if it slugifies to empty. */
 const personalSlugBase = (username: string): string => {
-  const s = slugify(username).slice(0, SLUG_MAX).replace(/-+$/, '')
+  const s = asciiSlug(username).slice(0, SLUG_MAX).replace(/-+$/, '')
   return s || 'user'
 }
 

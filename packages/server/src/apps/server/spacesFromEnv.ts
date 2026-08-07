@@ -4,7 +4,7 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { AUTH_MODE, SpaceSlugSchema } from '@notarium/contract'
+import { AUTH_MODE, DurableDisplayNameSchema, SpaceSlugSchema } from '@notarium/contract'
 
 import type { SpaceConfig } from './server'
 
@@ -53,6 +53,13 @@ export const spacesFromEnv = (
         throw new Error(`SPACES_CONFIG: bad space slug "${s.slug}"`)
       }
       const engine = engineOf(s.engine, `SPACES_CONFIG: space "${s.slug}"`)
+
+      if (
+        s.displayName !== undefined &&
+        !DurableDisplayNameSchema.safeParse(s.displayName).success
+      ) {
+        throw new Error(`SPACES_CONFIG: bad displayName for space "${s.slug}"`)
+      }
 
       if (!s.notesDir) {
         throw new Error(`SPACES_CONFIG: space "${s.slug}" has no notesDir`)

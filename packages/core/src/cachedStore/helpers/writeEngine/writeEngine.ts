@@ -10,19 +10,36 @@ import type {
 import {
   noteAlreadyExists,
   noteNotFound,
+  StoreError,
   versionConflict,
   versionTokenRequired,
 } from '../../../knowledgeStore'
 import { IF_EXISTS, REVISION_KIND, STORE_ERROR_REASON } from '../../../knowledgeStore'
 import { nextAliasesMulti } from '../../../libs/aliases'
-import { freshNoteId } from '../../../libs/id'
-import { promoteBodyTitle, stripFrontmatter, stripTitleHeading } from '../../../libs/markdown'
-import { directoryOf, FOLDER_PAGE_BASENAME, isFolderPageNote } from '../../../libs/path'
-import { effectiveSlug, slugify, storedSlug } from '../../../libs/slug'
+import { freshNoteId, isDurableScalar, isDurableText, isValidNoteId } from '../../../libs/id'
+import {
+  encodeWikilinkIdentity,
+  promoteBodyTitle,
+  stripFrontmatter,
+  stripTitleHeading,
+} from '../../../libs/markdown'
+import {
+  directoryOf,
+  FOLDER_PAGE_BASENAME,
+  isCanonicalSafeRelativeAddress,
+  isFolderPageNote,
+  isLegacyImportDestination,
+  isPortableMoveDestination,
+  isPortableRelativeDestination,
+  noteFilePath,
+  sluggedNoteName,
+} from '../../../libs/path'
+import { effectiveSlug, storedSlug } from '../../../libs/slug'
 import { normTags } from '../../../libs/tags'
 import { computeVersionToken } from '../../../libs/versionToken'
 import { derivePreview } from '../../../snippet'
-import { DEFAULT_NOTE_CLASS } from '../../../visibility'
+import { DEFAULT_NOTE_CLASS, isVisibleOn, SURFACE } from '../../../visibility'
+import { supportsExactIdentityAddress } from '../innerIdentity'
 import {
   MutationCoordinator,
   TRASH_MUTATION_PREFIX,
@@ -47,6 +64,67 @@ const UNIQUIFY_LIMIT = 50
 
 const isCollision = (err: unknown): boolean =>
   (err as { reason?: string }).reason === STORE_ERROR_REASON.noteAlreadyExists
+
+const folderFailed = (detail: string): StoreError => {
+  const err = new StoreError(`# Folder Failed: ${detail}`)
+  err.isToolError = true
+  return err
+}
+
+const invalidWrite = (detail: string): StoreError => {
+  const err = new StoreError(`# Write Failed: ${detail}`)
+  err.isToolError = true
+  return err
+}
+
+const assertWriteText = (input: WriteInput): void => {
+  const scalars: Array<[string, string | undefined]> = [
+    ['title', input.title],
+    ['directory', input.directory],
+    ['note type', input.noteType],
+    ['slug', input.slug],
+    ['summary', input.summary],
+    ['file name', input.fileName],
+    ['created date', input.createdAt],
+  ]
+
+  for (const [name, value] of scalars) {
+    if (value != null && !isDurableScalar(value)) {
+      throw invalidWrite(`${name} must be a well-formed single-line string`)
+    }
+  }
+  for (const value of Array.isArray(input.tags)
+    ? input.tags
+    : input.tags != null
+      ? [input.tags]
+      : []) {
+    if (!isDurableScalar(value)) {
+      throw invalidWrite('tags must be well-formed single-line strings')
+    }
+  }
+  if (input.content != null && !isDurableText(input.content)) {
+    throw invalidWrite('content contains invalid Unicode or control characters')
+  }
+  for (const [name, value] of [
+    ['id', input.id],
+    ['original id', input.originalId],
+  ] as const) {
+    if (value != null && !isValidNoteId(value)) {
+      throw invalidWrite(`${name} must be a non-empty durable scalar`)
+    }
+  }
+}
+
+// Link-dependency claims use a path/prefix pair: deleting a target owns the prefix,
+// while each source write owns one child path. Therefore a delete conflicts with
+// every new inbound edge, but two independent sources linking the same popular note
+// remain parallel. The NUL namespace cannot collide with a valid storage path; the
+// length prefix + terminal NUL make arbitrary opaque ids/components unambiguous
+// without lossy encoding and keep MutationCoordinator's slash trim from changing them.
+const linkTargetPrefix = (targetId: string): string =>
+  `\u0000graph-target/${targetId.length}:${targetId}\u0000`
+const linkTargetPath = (targetId: string, sourceKey: string): string =>
+  `${linkTargetPrefix(targetId)}/${sourceKey.length}:${sourceKey}\u0000`
 
 /** The read-model write path: the ONE chokepoint every mutation funnels
  *  through (REST/MCP/import/e2e fake) — title-as-projection, soft-slug, fair id/path/prefix
@@ -112,6 +190,30 @@ export class WriteEngine {
         input.content !== undefined
           ? { ...input, title: promoted.title, content: promoted.body }
           : { ...input, title: promoted.title }
+    }
+    assertWriteText(input)
+    const directory = input.directory ?? ''
+    const legacyImport = input.legacyImportRoot !== undefined
+    const validDirectory = legacyImport
+      ? !input.originalId &&
+        Boolean(input.fileName) &&
+        isLegacyImportDestination(directory, input.legacyImportRoot!, (prefix) =>
+          this.host.dirs.has(prefix),
+        )
+      : isPortableRelativeDestination(directory, (prefix) => this.host.dirs.has(prefix))
+
+    if (!validDirectory) {
+      throw invalidWrite('directory must be a safe path with portable new components')
+    }
+
+    // A create whose name slugs to nothing (an emoji-only title) is named after the
+    // NOTE — so its id has to exist before anything predicts its path (#296). Minted
+    // here, once: the fence, the occupancy pre-check and both engines then agree on
+    // the destination. Leaving it to `writeClaimed` would predict `note.md`, and
+    // `identity.idFor` on that path would hand the newcomer the id of a note actually
+    // titled "Note" — the very identity theft #274 closed.
+    if (!input.originalId && !input.id && !sluggedNoteName(input.title, input.fileName)) {
+      input = { ...input, id: freshNoteId() }
     }
 
     return input.ifExists === IF_EXISTS.uniquify && !input.originalId
@@ -216,10 +318,31 @@ export class WriteEngine {
   private writeClaim(input: WriteInput) {
     const currentPath = input.originalId ? this.pathFor(input.originalId) : undefined
     const predictedPath = this.predictedPath(input, currentPath)
+    const sourceClass = input.originalId
+      ? this.host.snap.notes.get(input.originalId)?.class
+      : (input.targetClass ?? DEFAULT_NOTE_CLASS)
+    const linkedTargetIds =
+      input.content !== undefined && isVisibleOn(SURFACE.graph, sourceClass ?? DEFAULT_NOTE_CLASS)
+        ? this.host.snap.resolvedTargetIds(input.content)
+        : []
+    const sourceKey = input.originalId ?? input.id ?? predictedPath
+    const destinationDirectory = directoryOf(predictedPath)
+
+    if (
+      destinationDirectory &&
+      isVisibleOn(SURFACE.graph, sourceClass ?? DEFAULT_NOTE_CLASS) &&
+      !this.host.dirs.has(destinationDirectory)
+    ) {
+      return { global: true }
+    }
 
     return {
       noteIds: [input.originalId, input.id, this.host.identity.idFor(predictedPath)],
-      paths: [currentPath, predictedPath],
+      paths: [
+        currentPath,
+        predictedPath,
+        ...linkedTargetIds.map((targetId) => linkTargetPath(targetId, sourceKey)),
+      ],
     }
   }
 
@@ -251,24 +374,44 @@ export class WriteEngine {
       // edit of a note must capture the state it found) — a best-effort read,
       // racing writers are already fenced by the engine's own CAS.
       const baseline = input.originalId ? await this.baselineOf(input.originalId) : undefined
-      const result = await this.host.inner.write(input)
+      const releaseGraphTransition = this.host.beginGraphTransition()
 
-      if (result.id) {
-        this.host.afterNotesReady(() => this.applyWrite(input, result, result.id!))
-      } else {
-        this.host.reconcileSoon()
+      try {
+        const result = await this.host.inner.write({
+          ...input,
+          originalId: input.originalId ? this.innerNoteKey(input.originalId) : input.originalId,
+          identityOnly: Boolean(input.originalId),
+        })
+
+        if (result.id) {
+          let directoryChanged = false
+          this.host.afterNotesReady(() => {
+            directoryChanged = this.applyWrite(input, result, result.id!)
+          })
+          if (directoryChanged) {
+            await this.host.rederiveGraphContext()
+          }
+        } else {
+          this.host.reconcileSoon()
+        }
+        this.journalWrite(input, result.id ?? input.originalId, baseline, undefined, result.class)
+        return { ...result, title: input.title }
+      } finally {
+        releaseGraphTransition()
       }
-      this.journalWrite(input, result.id ?? input.originalId, baseline, undefined, result.class)
-      return { ...result, title: input.title }
     }
     // Identity is settled BEFORE the engine call so the very same write
     // materializes the id into the file's frontmatter: an edited note keeps
     // its id; a save that upserts onto an existing path (same title+folder)
     // inherits that path's id; only a genuinely new note mints one.
-    const originalRec = input.originalId
-      ? this.host.identity.recordFor(input.originalId)
-      : undefined
-    const originalPath = originalRec && !originalRec.deletedAt ? originalRec.filePath : undefined
+    const originalPath = input.originalId ? currentPath : undefined
+
+    // `originalId` is a stable identity at this layer, never a fresh human resolver.
+    // A bare engine has no identity namespace of its own; forwarding a missing id as
+    // a raw string would let its title/path resolver overwrite a namesake.
+    if (input.originalId && !originalPath) {
+      throw noteNotFound(input.originalId)
+    }
     const id = originalPath
       ? input.originalId!
       : (input.id ?? this.host.identity.idFor(predictedPath) ?? freshNoteId())
@@ -286,7 +429,14 @@ export class WriteEngine {
       if (!input.versionToken) {
         throw versionTokenRequired(input.originalId)
       }
-      live = await this.host.inner.read(storageKey!)
+      live = await this.host.inner.read(
+        this.innerNoteKey(input.originalId, storageKey),
+        supportsExactIdentityAddress(this.host.inner) ? { identityOnly: true } : undefined,
+      )
+
+      if (live.filePath !== storageKey) {
+        throw noteNotFound(input.originalId)
+      }
       const liveToken = computeVersionToken(live.content)
 
       if (liveToken !== input.versionToken) {
@@ -297,42 +447,116 @@ export class WriteEngine {
         })
       }
     }
-    const result = await this.host.inner.write({ ...input, originalId: storageKey, id })
-    this.host.afterNotesReady(() => this.applyWrite(input, result, id, originalPath))
-    // The post-write read serves double duty: the fresh token the save
-    // answers with (the engine merges frontmatter — input bytes are not
-    // authoritative) and the journaled after-state.
-    const after = await this.readAfterWrite(input, result, storageKey)
-    const baseline =
-      live && !(await this.hasHistory(id))
-        ? {
-            content: live.content,
-            title: live.title ?? input.title,
-            tags: normTags(live.frontmatter?.tags) ?? [],
-            // The note's pre-edit custom slug, so the baseline is slug-faithful too.
-            slug: live.slug ?? null,
-          }
-        : undefined
-    this.journalWrite(input, id, baseline, after?.content, result.class)
-    // Flush a fresh id before answering: a create's id may be resolved in the very next request,
-    // but global id→space resolution reads the meta-DB, not this write-behind registry, so a read
-    // that beat the flush would 404 a note that exists. Updates skip it (already durable). Bulk
-    // import skips the per-note flush (a starvation source) — broadcastBulk flushes the
-    // registry before each coalesced `changed` instead, so durability tracks visibility.
-    if (!input.originalId && !this.host.isBulkActive()) {
-      await this.host.identity.flush()
-    }
+    const releaseGraphTransition = this.host.beginGraphTransition()
+    const identityBefore = !input.originalId ? new Set(this.host.snap.notes.keys()) : undefined
+    const releaseIdentityPublication = !input.originalId
+      ? this.host.beginIdentityPublication()
+      : undefined
+    let identityPublicationPending = false
 
-    return {
-      ...result,
-      id,
-      title: input.title,
-      versionToken: computeVersionToken(after?.content ?? this.normalizedInput(input)),
+    try {
+      const result = await this.host.inner.write({
+        ...input,
+        originalId: input.originalId ? this.innerNoteKey(input.originalId, storageKey) : storageKey,
+        identityOnly: Boolean(input.originalId && supportsExactIdentityAddress(this.host.inner)),
+        id,
+      })
+      const publishAfterIdentityFlush = !input.originalId && !this.host.isBulkActive()
+      const removed: string[] = []
+      let directoryChanged = false
+      this.host.afterNotesReady(() => {
+        directoryChanged = this.applyWrite(
+          input,
+          result,
+          id,
+          originalPath,
+          !publishAfterIdentityFlush,
+          removed,
+        )
+      })
+      if (!input.originalId) {
+        // The lease was closed before inner.write. Register its durable cut
+        // immediately after the synchronous registry/snapshot patch, before
+        // any later await can let a reader or retry timer observe the new axis.
+        this.host.markIdentityPublicationPending()
+        identityPublicationPending = true
+        if (this.host.isBulkActive()) {
+          // Bulk durability is coalesced. Releasing the producer lease lets an
+          // interactive read force the pending revision durable mid-import;
+          // it never lets the revision itself disappear.
+          releaseIdentityPublication?.()
+        }
+      }
+      // Deferring the external CHANGED frame must not defer the decorator's
+      // own exact-id map. Graph-context re-derivation below addresses the just
+      // created note by id; without this local sync a path-keyed engine falls
+      // through to its expensive whole-graph fallback before durability lands.
+      if (publishAfterIdentityFlush) {
+        this.host.markInnerLinkIdentitiesDirty()
+        this.host.syncInnerLinkIdentities()
+      }
+      if (directoryChanged) {
+        await this.host.rederiveGraphContext()
+      }
+      // The post-write read serves double duty: the fresh token the save
+      // answers with (the engine merges frontmatter — input bytes are not
+      // authoritative) and the journaled after-state.
+      const after = await this.readAfterWrite(input, result, storageKey)
+      const baseline =
+        live && !(await this.hasHistory(id))
+          ? {
+              content: live.content,
+              title: live.title ?? input.title,
+              tags: normTags(live.frontmatter?.tags) ?? [],
+              // The note's pre-edit custom slug, so the baseline is slug-faithful too.
+              slug: live.slug ?? null,
+            }
+          : undefined
+      this.journalWrite(input, id, baseline, after?.content, result.class)
+      // Flush a fresh id before answering: a create's id may be resolved in the very next request,
+      // but global id→space resolution reads the meta-DB, not this write-behind registry, so a read
+      // that beat the flush would 404 a note that exists. Updates skip it (already durable). Bulk
+      // import skips the per-note flush (a starvation source) — broadcastBulk flushes the
+      // registry before each coalesced `changed` instead, so durability tracks visibility.
+      if (publishAfterIdentityFlush) {
+        await this.host.flushIdentityPublication()
+        if (result.filePath) {
+          this.host.emitChanged([id], removed)
+        }
+      }
+
+      return {
+        ...result,
+        id,
+        title: input.title,
+        versionToken: computeVersionToken(after?.content ?? this.normalizedInput(input)),
+      }
+    } catch (err) {
+      if (identityPublicationPending && identityBefore) {
+        this.host.rememberIdentityRepair(identityBefore)
+      }
+      throw err
+    } finally {
+      releaseIdentityPublication?.()
+      releaseGraphTransition()
     }
   }
 
   private pathFor(id: string): string | undefined {
     return this.host.identity.pathFor(id) ?? this.host.snap.notes.get(id)?.filePath
+  }
+
+  /** Exact note address at the inner-store boundary. Identity-capable engines also
+   *  expose human path/name resolution, so the reserved envelope plus an explicit
+   *  discriminator keeps mutations on the identity axis. Bare engines instead
+   *  require the registry-owned storage path. */
+  private innerNoteKey(noteId: string, storagePath?: string): string {
+    if (supportsExactIdentityAddress(this.host.inner)) {
+      this.host.syncInnerLinkIdentities()
+      return encodeWikilinkIdentity(noteId)
+    }
+
+    return storagePath ?? noteId
   }
 
   /** Mirror the engines' destination selection closely enough to fence the
@@ -345,15 +569,28 @@ export class WriteEngine {
     ).replace(/^\/+|\/+$/g, '')
     // Both engines keep a folder page on the structural `index.md` basename
     // even when an edit supplies another fileName. The fence must predict that
-    // exact destination too, not merely the ordinary notePath convention.
-    const fileBase =
-      currentPath && isFolderPageNote(currentPath)
-        ? FOLDER_PAGE_BASENAME
-        : input.fileName
-          ? slugify(input.fileName) || slugify(input.title)
-          : slugify(input.title)
+    // exact destination too, not merely the ordinary noteFilePath convention.
+    const fileName =
+      currentPath && isFolderPageNote(currentPath) ? FOLDER_PAGE_BASENAME : input.fileName
 
-    return (dir ? `${dir}/` : '') + `${fileBase}.md`
+    const currentMeta = input.originalId ? this.host.snap.notes.get(input.originalId) : undefined
+
+    if (
+      currentPath &&
+      currentMeta?.title === input.title &&
+      input.fileName == null &&
+      dir === directoryOf(currentPath)
+    ) {
+      return currentPath
+    }
+
+    return noteFilePath(
+      input.title,
+      dir,
+      fileName,
+      input.originalId ?? input.id,
+      input.legacyImportRoot !== undefined,
+    )
   }
 
   /** The note as the engine actually stored it — null when the read-back
@@ -364,7 +601,27 @@ export class WriteEngine {
     storageKey?: string,
   ): Promise<NoteContent | null> {
     try {
-      return await this.host.inner.read(result.filePath ?? storageKey ?? input.title)
+      const resultId = result.id ?? input.originalId
+      const exactPath = result.filePath ?? storageKey
+
+      // The write just returned this storage path while its mutation claim is
+      // still held. A bare engine can read it directly and verify the answer,
+      // avoiding a full id→path registry rebuild after every create in a bulk
+      // import. Interactive/stale-id operations still use the exact envelope.
+      if (!this.host.inner.capabilities.identity && exactPath) {
+        const detail = await this.host.inner.read(exactPath)
+
+        return detail.filePath === exactPath ? detail : null
+      }
+
+      const key = resultId ? this.innerNoteKey(resultId, exactPath) : (exactPath ?? input.title)
+
+      return await this.host.inner.read(
+        key,
+        supportsExactIdentityAddress(this.host.inner) && resultId
+          ? { identityOnly: true }
+          : undefined,
+      )
     } catch {
       return null
     }
@@ -394,7 +651,9 @@ export class WriteEngine {
       if (await this.host.journal.hasHistory(noteId)) {
         return undefined
       }
-      const live = await this.host.inner.read(noteId)
+      const live = await this.host.inner.read(this.innerNoteKey(noteId), {
+        identityOnly: supportsExactIdentityAddress(this.host.inner),
+      })
       return {
         content: live.content,
         title: live.title ?? '',
@@ -445,38 +704,89 @@ export class WriteEngine {
   }
 
   async move(input: MoveInput, opts?: MutationOptions): Promise<void> {
+    const currentPath = input.isDirectory ? input.id : this.pathFor(input.id)
+
+    if (
+      !isPortableMoveDestination(
+        input.destinationPath,
+        currentPath ?? '',
+        (prefix) => this.host.dirs.has(prefix) || prefix === currentPath,
+      ) ||
+      (input.isDirectory && !isCanonicalSafeRelativeAddress(input.id))
+    ) {
+      throw folderFailed('path must be a canonical public relative path')
+    }
     if (input.isDirectory) {
       return this.mutations.runStable(
-        () => ({
-          noteIds: this.noteIdsUnder(input.id, input.destinationPath),
-          prefixes: [input.id, input.destinationPath],
-        }),
+        () => ({ global: true }),
         async () => {
           await opts?.prepare?.()
-          await this.moveFolderClaimed(input)
-          await opts?.finalize?.()
+          const releaseGraphTransition = this.host.beginGraphTransition()
+
+          try {
+            const directoryChanged = await this.moveFolderClaimed(input)
+            await opts?.finalize?.()
+            const aliasesChanged = await this.host.refreshFolderAliases()
+
+            if (directoryChanged || aliasesChanged) {
+              await this.host.rederiveGraphContext()
+            }
+          } finally {
+            releaseGraphTransition()
+          }
         },
       )
     }
 
     return this.mutations.runStable(
-      () => ({
-        noteIds: [input.id],
-        paths: [this.pathFor(input.id), input.destinationPath],
-      }),
+      () =>
+        isVisibleOn(
+          SURFACE.graph,
+          this.host.snap.notes.get(input.id)?.class ?? DEFAULT_NOTE_CLASS,
+        ) &&
+        directoryOf(input.destinationPath) &&
+        !this.host.dirs.has(directoryOf(input.destinationPath))
+          ? { global: true }
+          : {
+              noteIds: [input.id],
+              paths: [this.pathFor(input.id), input.destinationPath],
+            },
       async () => {
         await opts?.prepare?.()
-        const currentPath = this.pathFor(input.id)
-        await this.host.inner.move({ ...input, id: currentPath ?? input.id })
-        this.host.afterNotesReady(() =>
-          this.applyNoteMove(input.id, input.destinationPath, currentPath),
-        )
-        await opts?.finalize?.()
+        const claimedPath = this.pathFor(input.id)
+
+        if (!this.host.inner.capabilities.identity && !claimedPath) {
+          throw noteNotFound(input.id)
+        }
+        const releaseGraphTransition = this.host.beginGraphTransition()
+
+        try {
+          await this.host.inner.move({
+            ...input,
+            id: this.innerNoteKey(input.id, claimedPath),
+            identityOnly: supportsExactIdentityAddress(this.host.inner),
+          })
+          let directoryChanged = false
+          this.host.afterNotesReady(() => {
+            directoryChanged = this.applyNoteMove(input.id, input.destinationPath, claimedPath)
+          })
+          if (directoryChanged) {
+            await this.host.rederiveGraphContext()
+          }
+          await opts?.finalize?.()
+        } finally {
+          releaseGraphTransition()
+        }
       },
     )
   }
 
-  private async moveFolderClaimed(input: MoveInput): Promise<void> {
+  private async moveFolderClaimed(input: MoveInput): Promise<boolean> {
+    const source = input.id.replace(/^\/+|\/+$/g, '')
+
+    if (!this.host.dirs.has(source) && this.host.dirs.hasEquivalent(source)) {
+      throw folderFailed('source spelling does not match the stored folder')
+    }
     await this.host.inner.move(input)
     // The ids of every note under the prefix follow their files — otherwise
     // a folder drag would orphan the whole subtree's identity.
@@ -484,18 +794,22 @@ export class WriteEngine {
     // Patch the snapshot SYNCHRONOUSLY: relocate the subtree's note paths
     // + re-key the directory channel, so /tree is consistent at once (a stale
     // `src` note path beside the fresh disk `dest` was the dup-on-rename bug).
-    this.host.afterNotesReady(() => this.applyDirMove(input.id, input.destinationPath))
+    let directoryChanged = false
+    this.host.afterNotesReady(() => {
+      directoryChanged = this.applyDirMove(input.id, input.destinationPath)
+    })
     // The engine does NOT rewrite other notes' bodies (no inbound-link rewrite
     // anywhere — that long-standing claim was a myth): path-form [[olddir/note]]
     // links into the moved subtree resolve through the alias layer once folder
     // identity lands. The delta poll just reconciles the snapshot.
     this.host.reconcileSoon()
+    return directoryChanged
   }
 
   async remove(id: string, opts?: { principal?: string }): Promise<void> {
     return this.trashMutations.run({ paths: [trashMutationPath(id)] }, () =>
       this.mutations.runStable(
-        () => ({ noteIds: [id], paths: [this.pathFor(id)] }),
+        () => this.removalClaim([id]),
         () => this.removeClaimed(id, opts),
       ),
     )
@@ -505,36 +819,75 @@ export class WriteEngine {
     if (!this.host.inner.makeDir) {
       return
     }
+    if (!isPortableRelativeDestination(path, (prefix) => this.host.dirs.has(prefix))) {
+      throw folderFailed('path must be safe with portable new components')
+    }
 
     return this.mutations.runStable(
-      () => ({ paths: [path] }),
+      () => ({ global: true }),
       async () => {
         await opts?.prepare?.()
-        await this.host.inner.makeDir!(path)
-        this.host.afterNotesReady(() => this.host.dirs.add(path.replace(/^\/+|\/+$/g, '')))
-        await opts?.finalize?.()
+        const clean = path.replace(/^\/+|\/+$/g, '')
+        const releaseGraphTransition = this.host.beginGraphTransition()
+
+        try {
+          await this.host.inner.makeDir!(path)
+          let directoryChanged = false
+          this.host.afterNotesReady(() => {
+            directoryChanged = this.host.dirs.add(clean)
+          })
+          if (directoryChanged) {
+            await this.host.rederiveGraphContext()
+            this.host.emitChanged([], [])
+          }
+          await opts?.finalize?.()
+        } finally {
+          releaseGraphTransition()
+        }
       },
     )
   }
 
   async removeDir(path: string, opts?: MutationOptions & { principal?: string }): Promise<void> {
+    if (!isCanonicalSafeRelativeAddress(path)) {
+      throw folderFailed('path must be a canonical public relative path')
+    }
+
     return this.trashMutations.run({ prefixes: [TRASH_MUTATION_PREFIX] }, () =>
       this.mutations.runStable(
-        () => ({ noteIds: this.noteIdsUnder(path), prefixes: [path] }),
+        () => ({ global: true }),
         async () => {
           await opts?.prepare?.()
-          // Re-read the snapshot after waiting: an earlier mutation may have moved a
-          // note into or out of this subtree. The prefix fence now keeps this set stable.
-          const victims = this.noteIdsUnder(path)
+          const clean = path.replace(/^\/+|\/+$/g, '')
 
-          for (const id of victims) {
-            await this.removeClaimed(id, opts)
+          if (!this.host.dirs.has(clean) && this.host.dirs.hasEquivalent(clean)) {
+            return
           }
-          if (this.host.inner.removeDir) {
-            await this.host.inner.removeDir(path)
-            this.host.afterNotesReady(() => this.host.dirs.removeSubtree(path))
+          const releaseGraphTransition = this.host.beginGraphTransition()
+
+          try {
+            // Re-read the snapshot after waiting: an earlier mutation may have moved a
+            // note into or out of this subtree. The prefix/source fence now keeps this set stable.
+            const victims = this.noteIdsUnder(path)
+
+            for (const id of victims) {
+              await this.removeClaimed(id, opts)
+            }
+            if (this.host.inner.removeDir) {
+              await this.host.inner.removeDir(path)
+              let directoryChanged = false
+              this.host.afterNotesReady(() => {
+                directoryChanged = this.host.dirs.removeSubtree(path)
+              })
+              if (directoryChanged) {
+                await this.host.rederiveGraphContext()
+                this.host.emitChanged([], [])
+              }
+            }
+            await opts?.finalize?.()
+          } finally {
+            releaseGraphTransition()
           }
-          await opts?.finalize?.()
         },
       ),
     )
@@ -555,9 +908,27 @@ export class WriteEngine {
     return ids
   }
 
+  /** A target removal writes the cached edge buckets of every current inbound
+   *  source. Claim those sources with the victims; writes that introduce a NEW
+   *  inbound edge claim the resolved target id in `writeClaim`, closing the phantom
+   *  window without serializing unrelated deletions. */
+  private removalClaim(targetIds: readonly string[]): {
+    noteIds: string[]
+    paths: string[]
+    prefixes: string[]
+  } {
+    const noteIds = [...new Set([...targetIds, ...this.host.snap.sourceIdsTargeting(targetIds)])]
+    const paths = noteIds
+      .map((id) => this.pathFor(id) ?? this.host.snap.notes.get(id)?.filePath)
+      .filter((path): path is string => path != null)
+
+    return { noteIds, paths, prefixes: targetIds.map(linkTargetPrefix) }
+  }
+
   private async removeClaimed(id: string, opts?: { principal?: string }): Promise<void> {
     const storagePath = this.pathFor(id)
     const meta = this.host.snap.notes.get(id)
+    const inboundSources = this.host.snap.sourceIdsTargeting([id])
 
     // A repeated/stale delete must not manufacture a fresh tombstone after a
     // successful permanent purge. The live snapshot/path binding is the
@@ -580,7 +951,9 @@ export class WriteEngine {
     let lastSlug: string | null | undefined
 
     try {
-      const live = await this.host.inner.read(storagePath ?? id)
+      const live = await this.host.inner.read(this.innerNoteKey(id, storagePath), {
+        identityOnly: supportsExactIdentityAddress(this.host.inner),
+      })
       lastContent = live.content
       lastTags = normTags(live.frontmatter?.tags) ?? undefined
       // Carry the class/title from the live read too: when the note isn't in the
@@ -597,52 +970,71 @@ export class WriteEngine {
     } catch {
       // no body to capture — restore falls back to the last known revision, if any
     }
-    await this.host.inner.remove(storagePath ?? id)
-    // Tombstone the id↔path binding so the trash can restore the note into
-    // its last folder. A bare engine's registry already holds it (storagePath);
-    // an identity-capable engine (the in-memory fake) doesn't populate this
-    // registry, so seed the binding from the snapshot path before tombstoning —
-    // otherwise restore would have no folder to aim at. Harmless for live reads:
-    // markDeleted drops it from byPath, so pathFor/idFor still ignore it; only
-    // recordFor (the trash's path source) sees the tombstone.
-    const lastPath = storagePath ?? meta?.filePath
+    const releaseGraphTransition = this.host.beginGraphTransition()
 
-    if (lastPath) {
-      if (!this.host.identity.recordFor(id)) {
-        this.host.identity.adoptFileId(lastPath, id)
+    try {
+      // From the first physical mutation through the tombstone, snapshot removal,
+      // exact-identity refresh and inbound re-derivation, no fresh graph surface
+      // may observe the inner engine and read-model on opposite sides.
+      await this.host.inner.remove(this.innerNoteKey(id, storagePath), {
+        identityOnly: supportsExactIdentityAddress(this.host.inner),
+      })
+      // Tombstone the id↔path binding so the trash can restore the note into
+      // its last folder. A bare engine's registry already holds it (storagePath);
+      // an identity-capable engine (the in-memory fake) doesn't populate this
+      // registry, so seed the binding from the snapshot path before tombstoning —
+      // otherwise restore would have no folder to aim at. Harmless for live reads:
+      // markDeleted drops it from byPath, so pathFor/idFor still ignore it; only
+      // recordFor (the trash's path source) sees the tombstone.
+      const lastPath = storagePath ?? meta?.filePath
+
+      if (lastPath) {
+        if (!this.host.identity.recordFor(id)) {
+          this.host.identity.adoptFileId(lastPath, id)
+        }
+        this.host.identity.markDeleted(lastPath)
       }
-      this.host.identity.markDeleted(lastPath)
+      // The tombstone revision: carries the final body (a blob in the CAS) so
+      // the undelete flow resurrects the exact last state. When the read above
+      // failed, content is null and the journal keeps the last known hash instead.
+      // AWAITED (not fire-and-forget like a save): the tombstone IS the trash entry,
+      // and the 'changed' emit + the response below tell clients "it's deleted" — a
+      // trash opened right after must already see it, not race the append. record()
+      // swallows its own errors, so this still never fails the delete (P2).
+      await this.host.journal.record({
+        noteId: id,
+        kind: REVISION_KIND.delete,
+        principal: opts?.principal ?? null,
+        content: lastContent,
+        title: meta?.title ?? lastTitle ?? '',
+        class: meta?.class ?? lastClass,
+        // Prefer the live snapshot's slug, fall back to the read; undefined (a
+        // cold-boot delete that read neither) carries the prior slug forward.
+        slug: meta?.slug ?? lastSlug,
+        tags: lastTags,
+      })
+      let snapshotRemoved = false
+
+      this.host.afterNotesReady(() => {
+        this.host.previewCache.delete(id)
+        if (!this.host.snap.notes.delete(id)) {
+          return
+        }
+        snapshotRemoved = true
+        this.host.snap.edgesBySource.delete(id)
+        this.host.markInnerLinkIdentitiesDirty()
+      })
+      if (snapshotRemoved) {
+        // A resolved edge has already collapsed its authored labels. Re-read every
+        // inbound source against the post-delete index so `[[Title]]` becomes a
+        // creatable human ghost, `[[notarium-id:…]]` becomes a tombstone, and a body
+        // containing both regains both distinct edges.
+        await this.host.rederiveSources(inboundSources)
+        this.host.emitChanged([], [id])
+      }
+    } finally {
+      releaseGraphTransition()
     }
-    // The tombstone revision: carries the final body (a blob in the CAS) so
-    // the undelete flow resurrects the exact last state. When the read above
-    // failed, content is null and the journal keeps the last known hash instead.
-    // AWAITED (not fire-and-forget like a save): the tombstone IS the trash entry,
-    // and the 'changed' emit + the response below tell clients "it's deleted" — a
-    // trash opened right after must already see it, not race the append. record()
-    // swallows its own errors, so this still never fails the delete (P2).
-    await this.host.journal.record({
-      noteId: id,
-      kind: REVISION_KIND.delete,
-      principal: opts?.principal ?? null,
-      content: lastContent,
-      title: meta?.title ?? lastTitle ?? '',
-      class: meta?.class ?? lastClass,
-      // Prefer the live snapshot's slug, fall back to the read; undefined (a
-      // cold-boot delete that read neither) carries the prior slug forward.
-      slug: meta?.slug ?? lastSlug,
-      tags: lastTags,
-    })
-    this.host.afterNotesReady(() => {
-      this.host.previewCache.delete(id)
-      if (!this.host.snap.notes.delete(id)) {
-        return
-      }
-      this.host.snap.edgesBySource.delete(id)
-      // Inbound edges stay: the engine keeps those relations and their target
-      // is now unresolved, so at shape time they become a ghost — same as a
-      // fresh boot scan would report.
-      this.host.emitChanged([], [id])
-    })
   }
 
   /** Snapshot patch for a FOLDER move: relocate every note under the src
@@ -652,7 +1044,7 @@ export class WriteEngine {
    *  (never-prune). No note BODY is touched (the engine never rewrites inbound
    *  links); path-form links into the subtree heal via the alias layer
    *  once folder identity lands. The delta poll just reconciles. */
-  private applyDirMove(src: string, dest: string): void {
+  private applyDirMove(src: string, dest: string): boolean {
     const prefix = `${src}/`
     const upserts: string[] = []
 
@@ -666,10 +1058,13 @@ export class WriteEngine {
         upserts.push(id)
       }
     }
-    this.host.dirs.moveSubtree(src, dest)
-    if (upserts.length) {
+    const directoryChanged = this.host.dirs.moveSubtree(src, dest)
+
+    if (upserts.length || directoryChanged) {
       this.host.emitChanged(upserts, [])
     }
+
+    return directoryChanged
   }
 
   private applyWrite(
@@ -677,11 +1072,13 @@ export class WriteEngine {
     result: WriteResult,
     id: string,
     originalPath?: string,
-  ): void {
+    publish = true,
+    removedOut?: string[],
+  ): boolean {
     if (!result.filePath) {
       // Engine didn't tell us where the note landed — let the feed catch up.
       this.host.reconcileSoon()
-      return
+      return false
     }
     const newPath = result.filePath
     const removed: string[] = []
@@ -779,12 +1176,20 @@ export class WriteEngine {
     // Write-through keeps the preview warm too: the very snippet the Feed will
     // ask for next is computed here, from data the save already carried.
     this.host.previewCache.set(id, derivePreview(input.content ?? '', input.tags))
+    const directoryChanged = this.host.dirs.add(directoryOf(newPath))
+    // Directory context is part of the resolver index, so add it before deriving
+    // even this note's own outbound edges.
     this.host.snap.patchNoteEdges(id, input.content ?? '')
-    this.host.dirs.add(directoryOf(newPath)) // the note's folder joins the channel
-    this.host.emitChanged([id], removed)
+    removedOut?.push(...removed)
+
+    if (publish) {
+      this.host.emitChanged([id], removed)
+    }
+
+    return directoryChanged
   }
 
-  private applyNoteMove(id: string, destinationPath: string, oldPath?: string): void {
+  private applyNoteMove(id: string, destinationPath: string, oldPath?: string): boolean {
     if (oldPath) {
       this.host.identity.rename(oldPath, destinationPath)
     }
@@ -792,7 +1197,7 @@ export class WriteEngine {
 
     if (!prev) {
       this.host.reconcileSoon()
-      return
+      return false
     }
     // The id IS the snapshot key, so a move is a metadata patch: no re-keying,
     // the preview and both edge directions stay put.
@@ -801,7 +1206,8 @@ export class WriteEngine {
       filePath: destinationPath,
       modifiedAt: this.host.iso(),
     })
-    this.host.dirs.add(directoryOf(destinationPath)) // dest folder joins; src lingers (never-prune)
+    const directoryChanged = this.host.dirs.add(directoryOf(destinationPath))
     this.host.emitChanged([id], [])
+    return directoryChanged
   }
 }

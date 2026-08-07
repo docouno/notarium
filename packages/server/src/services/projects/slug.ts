@@ -1,7 +1,7 @@
 // Slug helpers for the project registry.
 // canon: docs/projects.md#addressing
 
-import { slugify } from '@notarium/core'
+import { asciiSlug } from '@notarium/core'
 
 import type { ProjectsPersistence } from '../metaDb'
 
@@ -18,7 +18,10 @@ export const mintSlug = async (
   base: string,
   selfId: string,
 ): Promise<string> => {
-  const root = slugify(base) || 'project'
+  // `asciiSlug`, not `slugify`: a project handle is a URL/agent-facing segment in the
+  // same alphabet as a space handle, so a script we cannot romanise degrades to the
+  // generic base rather than putting its own letters into the handle (#296).
+  const root = asciiSlug(base) || 'project'
 
   for (let n = 1; ; n++) {
     const candidate = n === 1 ? root : `${root}-${n}`

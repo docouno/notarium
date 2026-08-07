@@ -19,6 +19,10 @@ export class BulkController {
   private depth = 0
   private buffer: { upserts: Set<string>; removed: Set<string> } | null = null
   private flushTimer: ReturnType<typeof setTimeout> | null = null
+  private generation = 0
+  /** Serializes timer and end-triggered broadcasts so end() also joins a batch
+   *  already detached by the timer but not durable/dispatched yet. */
+  private broadcastTail: Promise<void> = Promise.resolve()
 
   constructor(private readonly host: BulkHost) {}
 
@@ -32,6 +36,8 @@ export class BulkController {
    *  backfill (duck-typed — a vector-less engine has nothing to pause) and starts
    *  coalescing `changed`. */
   begin(): void {
+    const alreadyActive = this.buffer != null
+
     this.depth++
     // Mark busy on the PROCESS-GLOBAL scheduler, ONE enter per begin call
     // (balanced 1:1 by end's exit) so the count tracks depth exactly — a re-entrant
@@ -39,7 +45,10 @@ export class BulkController {
     // loop; this is what makes the import's shared-core burn slow the embed backfill
     // in OTHER spaces too.
     this.host.scheduler?.enterInteractive()
-    if (this.depth > 1) {
+    // A new outer bracket may start while the previous outer end is draining
+    // its detached batch. Reuse the still-active buffer/generation; replacing it
+    // here would orphan whichever batch the in-flight broadcast has not sent.
+    if (alreadyActive) {
       return
     }
     this.buffer = { upserts: new Set(), removed: new Set() }
@@ -61,19 +70,37 @@ export class BulkController {
     if (this.depth > 0) {
       return
     }
-    // Flush the coalesced tail: identity durable, then the final `changed`. A belt
-    // flushIdentity too (broadcast no-ops the dispatch on an empty buffer, but a
-    // dirty id with no pending event must still land).
-    await this.broadcast()
-    await this.host.flushIdentity()
-    // Re-entrancy guard: a concurrent import may have re-opened bulk while we awaited
-    // above (its begin ran in the gap, re-arming the buffer + suspend). Leave
-    // teardown to ITS end — resuming/polling now would stomp its suspend and run its
-    // catch-up under an active bulk.
-    if (this.depth > 0) {
-      return
+    try {
+      // Drain by DETACHED batches. Writes that finish while identity durability is
+      // awaiting land in the still-live buffer and force another pass; the final
+      // empty-check + close are synchronous, so no absorbed tail can disappear.
+      for (;;) {
+        // Directory/alias changes can invalidate old sources that were not themselves
+        // imported. Rebuild them once per drain pass, under the host's global mutation
+        // fence, instead of once for every new folder (quadratic on large imports).
+        await this.host.flushGraphContext()
+        await this.broadcast()
+        // Re-entrancy guard: a concurrent import may have re-opened bulk while we
+        // awaited above. It shares the active generation; leave teardown to its end.
+        if (this.depth > 0) {
+          return
+        }
+        if (this.buffer && (this.buffer.upserts.size || this.buffer.removed.size)) {
+          continue
+        }
+        this.buffer = null
+        break
+      }
+    } catch (err) {
+      // The outer end already balanced its begin. Re-open that one bracket so a
+      // caller can retry end() after persistence recovers; buffered events and
+      // the background suspension remain intact.
+      if (this.depth === 0 && this.buffer) {
+        this.depth = 1
+        this.host.scheduler?.enterInteractive()
+      }
+      throw err
     }
-    this.buffer = null
     this.host.resumeBackground()
     // One catch-up delta poll now the burst is over: advances the cursor past our
     // own write-through stream and reconciles anything that slipped (external edits
@@ -109,11 +136,13 @@ export class BulkController {
    *  and buffer so a late flush can't dispatch to torn-down listeners, and release
    *  any interactive marks still held so the global scheduler count returns to 0. */
   teardown(): void {
+    this.generation++
     if (this.flushTimer) {
       clearTimeout(this.flushTimer)
     }
     this.flushTimer = null
     this.buffer = null
+    this.host.abandonGraphContext()
     for (let i = 0; i < this.depth; i++) {
       this.host.scheduler?.exitInteractive()
     }
@@ -125,13 +154,69 @@ export class BulkController {
    *  client gets, and the host's resolveNote reads the meta-DB — without the flush
    *  first, a click on a just-imported note races to a 404 until the next settle. */
   private async broadcast(): Promise<void> {
-    await this.host.flushIdentity()
-    this.flush()
+    const task = this.broadcastTail.then(() => this.broadcastOne())
+
+    // A failed caller still observes its own error, while a later end/teardown
+    // can join a healthy tail instead of inheriting a permanently rejected chain.
+    this.broadcastTail = task.catch(() => {})
+    return task
   }
 
-  /** Broadcast the buffered bulk `changed` as one merged event. Folders are
-   *  recomputed fresh over the accumulated upserts at flush time. */
-  private flush(): void {
+  private async broadcastOne(): Promise<void> {
+    const generation = this.generation
+    const batch = this.takeBatch()
+
+    try {
+      this.host.syncLinkIdentities()
+      await this.host.flushIdentity()
+      if (batch && generation === this.generation) {
+        this.host.dispatchChanged(batch.upserts, batch.removed, this.host.foldersOf(batch.upserts))
+      }
+    } catch (err) {
+      if (batch && generation === this.generation) {
+        this.restoreBatch(batch)
+      }
+      throw err
+    }
+  }
+
+  /** Put a failed older batch back in front of any operations absorbed while
+   * durability was awaiting. Applying the newer net state last preserves
+   * upsert→remove and remove→upsert ordering for the same id. */
+  private restoreBatch(batch: { upserts: string[]; removed: string[] }): void {
+    const buf = this.buffer
+
+    if (!buf) {
+      return
+    }
+    const newer = { upserts: [...buf.upserts], removed: [...buf.removed] }
+
+    buf.upserts.clear()
+    buf.removed.clear()
+    this.mergeIntoBuffer(batch)
+    this.mergeIntoBuffer(newer)
+    this.scheduleFlush()
+  }
+
+  private mergeIntoBuffer(batch: { upserts: string[]; removed: string[] }): void {
+    const buf = this.buffer
+
+    if (!buf) {
+      return
+    }
+    for (const id of batch.upserts) {
+      buf.removed.delete(id)
+      buf.upserts.add(id)
+    }
+    for (const id of batch.removed) {
+      buf.upserts.delete(id)
+      buf.removed.add(id)
+    }
+  }
+
+  /** Atomically detach the current coalesced batch before any await. New writes
+   *  remain in the live buffer for the next timer/end drain. */
+  private takeBatch(): { upserts: string[]; removed: string[] } | null {
     if (this.flushTimer) {
       clearTimeout(this.flushTimer)
       this.flushTimer = null
@@ -139,13 +224,13 @@ export class BulkController {
     const buf = this.buffer
 
     if (!buf || (!buf.upserts.size && !buf.removed.size)) {
-      return
+      return null
     }
     const upserts = [...buf.upserts]
     const removed = [...buf.removed]
     buf.upserts.clear()
     buf.removed.clear()
-    this.host.dispatchChanged(upserts, removed, this.host.foldersOf(upserts))
+    return { upserts, removed }
   }
 
   private scheduleFlush(): void {
@@ -154,7 +239,7 @@ export class BulkController {
     }
     this.flushTimer = setTimeout(() => {
       this.flushTimer = null
-      void this.broadcast()
+      void this.broadcast().catch(() => {})
     }, BULK_EMIT_COALESCE_MS)
     this.flushTimer.unref?.()
   }

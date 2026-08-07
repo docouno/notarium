@@ -96,10 +96,9 @@ describeVector(
 
     // Stage 4b: the graph channel adds a NEW way for an agent-memory note to reach
     // user search — as a 1-hop neighbour of a user-doc hit, including one fetched from
-    // OUTSIDE the fts/vec pool (GRAPH_NEIGHBOR_SQL). It carries its class, so the
-    // read-model must still drop it. We prove BOTH halves: the bare engine surfaces it
-    // (so the user-scope absence is the post-filter, not the engine missing it), and
-    // the read-model drops it under user scope.
+    // OUTSIDE the fts/vec pool (GRAPH_NEIGHBOR_SQL). Visibility is now enforced at
+    // both layers: the engine must not add the hidden neighbour, and the read-model
+    // remains the public-scope backstop.
     it('an out-of-pool agent-memory graph neighbour never leaks into user search', async () => {
       const notesDir = mkdtempSync(join(tmpdir(), 'notarium-vec-vis-graph-'))
       const table = {
@@ -132,12 +131,11 @@ describeVector(
         })
         await inner.whenVectorsSettled()
 
-        // The BARE engine surfaces the out-of-pool agent-memory neighbour (no visibility
-        // enforcement) — so it genuinely reaches the read-model.
+        // The engine's graph expansion itself excludes hidden out-of-pool rows.
         const innerHits = await inner.search('cat', { pageSize: 1 })
-        expect(innerHits.some((h) => h.title === 'Secret Memo')).toBe(true)
+        expect(innerHits.some((h) => h.title === 'Secret Memo')).toBe(false)
 
-        // The read-model drops it under user scope — no leak, even via the graph channel.
+        // The public read-model also keeps the invariant as a boundary backstop.
         const userHits = await store.search('cat', { pageSize: 1 })
         expect(userHits.some((h) => h.title === 'Secret Memo')).toBe(false)
       } finally {

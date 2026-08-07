@@ -324,8 +324,17 @@ describe('CachedStore — write-through', () => {
     await store.remove(CARBON)
     expect((await store.list()).some((n) => n.id === CARBON)).toBe(false)
     const g = await store.graph()
-    const ghost = g.nodes.find((n) => n.id === CARBON)
-    expect(ghost?.ghost).toBe(true)
+    // The authored link is human (`[[Carbon]]`), not a stable identity
+    // envelope. Once its former target disappears it becomes a normal,
+    // creatable human ghost; retaining the deleted note-id would incorrectly
+    // turn it into an identity tombstone.
+    expect(g.links).toContainEqual({ source: TITANIUM, target: 'ghost:carbon', type: 'links_to' })
+    expect(g.nodes.find((n) => n.id === 'ghost:carbon')).toMatchObject({
+      ghost: true,
+      target: 'carbon',
+      prefillTitle: 'Carbon',
+      creatable: true,
+    })
     expect(events).toContainEqual({ type: 'changed', upserts: [], removed: [CARBON], folders: [] })
   })
 })
@@ -449,20 +458,24 @@ describe('CachedStore — graph SWR (#60)', () => {
 
       await vi.advanceTimersToNextTimerAsync()
       expect(events.filter((e) => e.type === 'graph')).toHaveLength(0)
-      let whileInFlight: Awaited<ReturnType<CachedStore['graph']>> | null = null
-      void store.graph().then((graph) => {
-        whileInFlight = graph
-      })
-      await Promise.resolve()
-      await Promise.resolve()
-      expect(whileInFlight).not.toBeNull()
-      expect(whileInFlight!.nodes.every((n) => n.x == null && n.y == null)).toBe(true)
+      // graph() must serve the current cold topology without waiting for the
+      // background enrichment. Await the API contract directly: counting a
+      // fixed number of promise jobs is scheduler-sensitive and says nothing
+      // about whether the enrichment timer was awaited.
+      const whileInFlight = await store.graph()
+      expect(whileInFlight.nodes.every((n) => n.x == null && n.y == null)).toBe(true)
 
-      await vi.runAllTimersAsync()
+      // Drive only this pass's finite cooperative yields. runAllTimersAsync()
+      // also follows unrelated recurring timers registered by earlier suites in
+      // a single-fork run and can trip Vitest's 10k infinite-loop guard.
+      for (let step = 0; step < 32 && events.every((e) => e.type !== 'graph'); step++) {
+        await vi.advanceTimersToNextTimerAsync()
+      }
       expect(events.filter((e) => e.type === 'graph')).toHaveLength(1)
       const settled = await store.graph()
       expect(settled).not.toBe(cold)
       expect(allPositioned(settled)).toBe(true)
+      await store.stop()
     } finally {
       vi.useRealTimers()
     }

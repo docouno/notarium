@@ -7,6 +7,7 @@ import type { MemoryCategory, Profile } from '@notarium/contract'
 import {
   buildMemoryIndex,
   type KnowledgeStore,
+  nameKey,
   READ_SCOPE,
   slugify,
   STORE_ERROR_REASON,
@@ -85,7 +86,7 @@ export const listMemoryCategories = async (
 const findProfileNote = async (store: KnowledgeStore) => {
   const metas = await store.list({ scope: READ_SCOPE.all })
   const candidates = metas.filter((m) => m.id != null && m.class === PROFILE_NOTE_CLASS)
-  return candidates.find((m) => slugify(m.title) === PROFILE_NOTE_SLUG) ?? candidates[0]
+  return candidates.find((m) => nameKey(m.title) === PROFILE_NOTE_SLUG) ?? candidates[0]
 }
 
 /** Read the curated profile note. null = never saved (the route returns an empty form, not a 404). */

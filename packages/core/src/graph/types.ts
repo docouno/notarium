@@ -4,10 +4,13 @@
 // carry only functions.
 // canon: docs/core.md#graph-derivation
 
+import type { GRAPH_GHOST_TARGET } from '../knowledgeStore'
+
 export type GraphEdgeLike = {
   source: string
   target: string
   type: string
+  [GRAPH_GHOST_TARGET]?: true
 }
 
 /** A ghost's identity + create-from-ghost prefill, as the read-model
@@ -17,9 +20,14 @@ export type GhostStub = {
   title: string
   target: string
   prefillTitle: string
+  /** Raw/current directory the create flow must use to close a path-form link. */
+  prefillDirectory?: string
+  /** False for a missing stable identity: minting a different note cannot close it. */
+  creatable: boolean
 }
 
-/** slug key → node id. Keys cover every way a [[wikilink]] names a note: the
+/** internal resolve key → node id. Keys cover the exact stable-id namespace plus
+ *  every way a [[wikilink]] names a note: the
  *  slugged full path, the slugged filename, the slugged title, the note's custom
  *  display slug, and — so a rename never breaks inbound links —
  *  the slug of each past name (alias). */

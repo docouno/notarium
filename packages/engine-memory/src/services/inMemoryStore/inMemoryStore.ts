@@ -11,6 +11,8 @@
 
 import type {
   ExportEntry,
+  FolderAlias,
+  GhostStub,
   Graph,
   GraphHealth,
   GraphLink,
@@ -33,28 +35,43 @@ import type {
 } from '@notarium/core'
 import {
   aggregateGraphHealth,
+  buildLinkIndex,
   classesForScope,
   collectPreviews,
   computeVersionToken,
+  decodeWikilinkIdentity,
   DEFAULT_NOTE_TYPE,
+  deriveNoteEdges,
   derivePreview,
   directoryOf,
-  edgeKey,
   effectiveSlug,
   enrichGraph,
   FOLDER_PAGE_BASENAME,
   IF_EXISTS,
+  isCanonicalSafeRelativeAddress,
+  isDurableScalar,
+  isDurableText,
   isFolderPageNote,
+  isLegacyImportDestination,
+  isPortableMoveDestination,
+  isPortableRelativeDestination,
+  isValidNoteId,
+  isVisibleOn,
+  isWikilinkIdentityTarget,
   liveSyncStatus,
   makeSnippet,
   nextAliasesMulti,
+  normalizeWikilinkTarget,
   normTags,
   NOTE_ID_FRONTMATTER_KEY,
   noteAlreadyExists,
   noteNotFound,
+  resolveLink,
+  shapeGraph,
   storedSlug,
   StoreError,
   stripTitleHeading,
+  SURFACE,
   versionConflict,
   versionTokenRequired,
 } from '@notarium/core'
@@ -63,7 +80,13 @@ import {
 // e2e fake reproduces the SAME slugs/links as the real engine — a cyrillic or
 // camelCase title no longer collapses to '' here while resolving correctly in
 // prod. The old divergent `helpers/slug.ts` is gone.
-import { deKebab, slugify as slug, slugifyPath } from '@notarium/core'
+import {
+  asciiSlug,
+  noteFileBase,
+  shortHash,
+  slugify as slug,
+  sluggedNoteName,
+} from '@notarium/core'
 import type { StoreSnapshot } from './types'
 
 type StoredNote = {
@@ -96,29 +119,6 @@ type StoredNote = {
   createdAt: string | null
 }
 
-type RealNode = {
-  id: string
-  title: string
-  filePath: string
-  folder: string
-  ghost: false
-  degree: number
-  class: NoteClass
-}
-
-type GhostNode = {
-  id: string
-  title: string
-  ghost: true
-  folder: ''
-  degree: number
-  target: string
-  prefillTitle: string
-  sources?: Array<{ id?: string; title: string; folder: string }>
-}
-
-const RE_WIKILINK = /\[\[([^\]]+)\]\]/g
-
 const stripMd = (p: string) => p.replace(/\.md$/, '')
 
 /** The id this store derives for a note at `filePath`, BEFORE collision suffixing
@@ -126,9 +126,28 @@ const stripMd = (p: string) => p.replace(/\.md$/, '')
  *  because seeders have to address a note the store hasn't created yet: the seed
  *  catalog's fake projection (#175) stamps journal rows with it so a seeded
  *  revision chain actually belongs to the note it describes. Sharing the function
- *  — rather than a copy of the rule — is what keeps the two from drifting. */
-export const deterministicNoteId = (filePath: string): string =>
-  'fake-' + slug(stripMd(filePath).replace(/\//g, ' '))
+ *  — rather than a copy of the rule — is what keeps the two from drifting.
+ *
+ *  `asciiSlug`, not the name slug: a real `notarium-id` is opaque ASCII, and this
+ *  store is the executable spec other engines are held to — a CJK path must not give
+ *  it an id shape production can never mint (#296).
+ *
+ *  But ASCII alone is not enough: `asciiSlug` DROPS an unromanisable segment, so five
+ *  CJK notes in one folder would all derive `fake-journal`. `deriveId`'s counter hides
+ *  that inside the store, while seeders stamp journal rows with the raw pre-suffix id
+ *  (toFixture) — every such note would then wear its neighbours' history. So when the
+ *  ASCII form has LOST information (it differs from the full name slug), a short hash
+ *  of the path restores injectivity. A path that romanises fully takes the ASCII form
+ *  unchanged, which is what keeps every existing seeded/e2e id stable. */
+export const deterministicNoteId = (filePath: string): string => {
+  const name = stripMd(filePath).replace(/\//g, ' ')
+  const ascii = asciiSlug(name)
+  // Non-empty AND equal: when both forms are empty they are trivially equal, and that
+  // branch would hand every letterless path the same bare prefix.
+  const lossless = Boolean(ascii) && ascii === slug(name)
+
+  return `fake-${lossless ? ascii : `${ascii ? `${ascii}-` : ''}${shortHash(name)}`}`
+}
 
 /** Minimal YAML-safe scalar for the fake's export reconstruction (#17): quote
  *  when the raw form would parse as something else. A trimmed-down twin of the
@@ -141,6 +160,12 @@ const fmScalar = (v: string): string =>
 
 const moveFailed = (detail: string): StoreError => {
   const err = new StoreError(`# Move Failed: ${detail}`)
+  err.isToolError = true
+  return err
+}
+
+const writeFailed = (detail: string): StoreError => {
+  const err = new StoreError(`# Write Failed: ${detail}`)
   err.isToolError = true
   return err
 }
@@ -182,6 +207,7 @@ export class InMemoryStore implements KnowledgeStore {
   // Always a SUPERSET of the note-derived dirs (every write seeds its ancestors),
   // so listDirs() = this set. Root ('') is never a member.
   private dirs = new Set<string>()
+  private folderAliases: FolderAlias[] = []
   private spaceName = 'main'
   private nowIso = ''
 
@@ -265,45 +291,69 @@ export class InMemoryStore implements KnowledgeStore {
 
   // ── identity helpers ────────────────────────────────────────────────────────
 
-  /** Resolve an incoming reference: the note-id first (THE identity), then the
-   *  storage key (path), then the wiki-link resolver channels the real engine's
-   *  resolveRow also accepts — title, then a custom slug, and last the ALIAS-
-   *  history (#100), each as its OWN pass (collision rule current > slug > alias,
-   *  mirroring buildLinkIndex): a custom slug never out-resolves another live
-   *  note's title, and an old name never shadows a live note. */
-  private findIndex(id: string): number {
-    const byId = this.notes.findIndex((n) => n.id === id)
+  /** Resolve an incoming reference: identity/path first, then the shared wiki-name
+   *  index. The fake must not carry a second implementation of pass priorities or
+   *  collision tie-breaks — those are exactly what the executable parity leg tests. */
+  private findIndex(id: string, identityOnly = false): number {
+    const identityEnvelope = isWikilinkIdentityTarget(id)
+
+    // The storage port is id-first and ids are fully opaque. A raw id may itself
+    // start with the envelope prefix; only authored-link resolution (`identityOnly`)
+    // suppresses this direct axis and decodes the transport syntax.
+    if (!identityOnly) {
+      const byRawId = this.notes.findIndex((n) => n.id === id)
+
+      if (byRawId !== -1) {
+        return byRawId
+      }
+    }
+    // `read(list().filePath)` is the storage axis. A legacy POSIX filename may
+    // literally occupy the now-reserved envelope namespace, so that exact path
+    // wins for an ordinary read. Authored-link resolution passes `identityOnly`
+    // through the read-model and keeps the namespace reserved instead.
+    if (identityEnvelope && !identityOnly) {
+      const byExactEnvelopePath = this.notes.findIndex((n) => n.filePath === id)
+
+      if (byExactEnvelopePath !== -1) {
+        return byExactEnvelopePath
+      }
+    }
+    const envelopedId = decodeWikilinkIdentity(id)
+    const identity = identityEnvelope ? envelopedId : id
+    const byId = identity == null ? -1 : this.notes.findIndex((n) => n.id === identity)
 
     if (byId !== -1) {
       return byId
     }
-    const byPath = this.indexByPath(id)
+    // The reserved envelope can only address an identity. Falling through to the
+    // human path/name axes would let a decoy filename capture a missing stable id.
+    if (identityEnvelope) {
+      return -1
+    }
+    // Preserve the storage contract: every literal filePath returned by list()
+    // must be readable even when its legal filename contains wikilink syntax
+    // (`#` / `|`). Human refs are normalized only after this exact raw axis.
+    const byPath = this.notes.findIndex((n) => n.filePath === id)
 
     if (byPath !== -1) {
       return byPath
     }
-    const last = slug(stripMd(id).split('/').pop() || stripMd(id))
-
-    if (!last) {
-      return -1
-    }
-    const byCurrent = this.notes.findIndex(
-      (n) =>
-        n.title.toLowerCase() === stripMd(id).toLowerCase() ||
-        slug(stripMd(n.filePath).split('/').pop() || '') === last ||
-        slug(n.title) === last,
+    const humanTarget = normalizeWikilinkTarget(id)
+    const resolved = resolveLink(
+      humanTarget,
+      buildLinkIndex(
+        this.notes.map((n) => this.metaOf(n)),
+        this.folderAliases,
+        undefined,
+        [...this.dirs],
+      ),
     )
 
-    if (byCurrent !== -1) {
-      return byCurrent
-    }
-    const bySlug = this.notes.findIndex((n) => (n.slug ? slug(n.slug) === last : false)) // #100 phase 1
-
-    if (bySlug !== -1) {
-      return bySlug
+    if (resolved.ghost) {
+      return -1
     }
 
-    return this.notes.findIndex((n) => n.aliases.some((a) => slug(a) === last))
+    return this.notes.findIndex((n) => n.id === resolved.targetId)
   }
 
   /** EXACT storage-path lookup (id-or-path identity), with NO title/slug/alias
@@ -342,8 +392,8 @@ export class InMemoryStore implements KnowledgeStore {
     }
   }
 
-  async read(rawId: string): Promise<NoteContent> {
-    const i = this.findIndex(rawId)
+  async read(rawId: string, opts?: ReadOptions): Promise<NoteContent> {
+    const i = this.findIndex(rawId, opts?.identityOnly)
 
     // A real miss throws, same as every engine (#65 layer 1) — silently
     // fabricating an empty note here used to hide the whole bug class from e2e.
@@ -504,165 +554,32 @@ export class InMemoryStore implements KnowledgeStore {
   /** Knowledge graph, derived from [[wiki links]] in note bodies. Unresolved
    *  targets become ghost nodes carrying the create-from-ghost prefill (#25). */
   async graph(): Promise<Graph> {
-    const nodes = new Map<string, RealNode | GhostNode>()
-    const bySlug = new Map<string, string>() // slug(lastSeg) | slug(title) → permalink
-    // Provenance per key (#100 phase 5), mirroring core buildLinkIndex's optional out-param:
-    // which axis claimed each key, so a resolved edge records HOW it resolved. Set in
-    // lockstep with bySlug so the two never drift (the seam #100 review keeps flagging).
-    const bySlugVia = new Map<string, ResolvedVia>()
+    const metas = this.notes.map((n) => this.metaOf(n))
+    const graphNotes = this.notes.filter((n) => isVisibleOn(SURFACE.graph, n.class))
+    const graphMetas = graphNotes.map((n) => this.metaOf(n))
+    const provenance = new Map<string, ResolvedVia>()
+    const index = buildLinkIndex(graphMetas, this.folderAliases, provenance, [...this.dirs])
+    const ghosts = new Map<string, GhostStub>()
+    const edgesBySource: Array<[string, GraphLink[]]> = graphNotes.map((n) => {
+      const derived = deriveNoteEdges(n.id, n.content, index, 'links_to', provenance)
 
-    for (const n of this.notes) {
-      const id = n.id
-      nodes.set(id, {
-        id,
-        title: n.title,
-        filePath: n.filePath,
-        folder: n.filePath.split('/')[0] || '',
-        ghost: false,
-        degree: 0,
-        class: n.class,
-      })
-      // Mirror core buildLinkIndex's key set EXACTLY (graph.ts): the slugged full
-      // path, the slugged last segment, and the slugged title — so path-form
-      // [[dir/note]] resolves here identically to the real engine, not just bare
-      // [[title]]. (The fake previously omitted the full-path key, diverging on
-      // path-form links — caught in #100 phase 0 review.)
-      const path = stripMd(n.filePath)
-
-      for (const key of [slugifyPath(path), slug(path.split('/').pop() || path), slug(n.title)]) {
-        bySlug.set(key, id)
-        bySlugVia.set(key, 'current')
+      for (const ghost of derived.ghosts) {
+        ghosts.set(ghost.id, ghost)
       }
-    }
-    // Custom slug keys (#100 phase 1) AFTER current names, BEFORE aliases (collision
-    // rule: current > slug > alias) — a [[my-slug]] reaches its note on a FREE key,
-    // never shadowing another live note's path/title. Mirrors core buildLinkIndex
-    // pass 1.5.
-    for (const n of this.notes) {
-      if (!n.slug) {
-        continue
-      }
-      const key = slug(n.slug)
 
-      if (key && !bySlug.has(key)) {
-        bySlug.set(key, n.id)
-        bySlugVia.set(key, 'slug')
-      }
-    }
-    // Alias keys (#100) AFTER every current name (incl. a custom slug) is claimed
-    // (collision rule: current > slug > alias) — so an [[Old Name]] resolves to the
-    // note it was renamed from, never shadowing a live note that now bears that
-    // name. Mirrors core buildLinkIndex's pass build.
-    for (const n of this.notes) {
-      for (const alias of n.aliases) {
-        const key = slug(alias)
+      return [n.id, derived.edges]
+    })
+    const graph = shapeGraph(metas, edgesBySource, ghosts)
 
-        if (key && !bySlug.has(key)) {
-          bySlug.set(key, n.id)
-          bySlugVia.set(key, 'note-alias')
-        }
-      }
-    }
-
-    const links: GraphLink[] = []
-    const seen = new Map<string, number>() // edge key → index in `links`
-    // Per-ghost set of source notes that reference it, keyed by ghost id →
-    // Map(sourceId → {id, title, folder}) so a note linking twice counts once.
-    const ghostSources = new Map<
-      string,
-      Map<string, { id?: string; title: string; folder: string }>
-    >()
-
-    for (const n of this.notes) {
-      const from = n.id
-      RE_WIKILINK.lastIndex = 0
-      for (let m = RE_WIKILINK.exec(n.content); m !== null; m = RE_WIKILINK.exec(n.content)) {
-        const label = m[1].split('|')[0].trim() // [[target|alias]] → target
-        // Resolve like core resolveLink: the slugged full form first ("dir/note"),
-        // then the bare last segment for a pathed link — so [[dir/note]] matches.
-        const s = slugifyPath(label)
-
-        if (!s) {
-          continue
-        }
-        const last = s.split('/').pop() || s
-        // Resolve AND record provenance off the SAME matched key (mirrors core
-        // resolveLink): full form first, then the bare last segment for a pathed link.
-        let targetId = bySlug.get(s)
-        let via: ResolvedVia | undefined = bySlugVia.get(s)
-
-        if (targetId === undefined && s.includes('/')) {
-          targetId = bySlug.get(last)
-          via = bySlugVia.get(last)
-        }
-        if (!targetId) {
-          via = undefined // a ghost (broken link) has no resolved axis
-          targetId = `ghost:${s}`
-          if (!nodes.has(targetId)) {
-            nodes.set(targetId, {
-              id: targetId,
-              title: deKebab(last), // last segment for a pathed ghost, like core
-              ghost: true,
-              folder: '',
-              degree: 0,
-              target: s,
-              // Prefill that is GUARANTEED to slug back to this ghost's target
-              // (#25), mirroring core resolveLink: the raw label when it already
-              // slugs to the last segment, else the de-kebabbed last segment — so
-              // a path-form [[dir/note]] prefills "Note" (indexed at `note`), not
-              // "dir/note" (which would index at `dir-note` and re-ghost).
-              prefillTitle: slug(label) === last ? label : deKebab(last),
-            })
-          }
-          if (!ghostSources.has(targetId)) {
-            ghostSources.set(targetId, new Map())
-          }
-          const folder = n.filePath.split('/').slice(0, -1).join('/')
-          ghostSources.get(targetId)!.set(from, { id: n.id, title: n.title, folder })
-        }
-        if (targetId === from) {
-          continue
-        }
-        const edge: GraphLink = {
-          source: from,
-          target: targetId,
-          type: 'links_to',
-          ...(via ? { resolvedVia: via } : {}),
-        }
-        const key = edgeKey(edge)
-        const at = seen.get(key)
-
-        if (at !== undefined) {
-          // Same source→target seen already: prefer a `current`-name resolution so
-          // staleNamed is deterministic regardless of in-body order (mirrors core
-          // deriveNoteEdges). Degree was counted on first sight — don't re-count.
-          const prev = links[at]
-
-          if (prev.resolvedVia && prev.resolvedVia !== 'current' && (!via || via === 'current')) {
-            links[at] = edge
-          }
-          continue
-        }
-        seen.set(key, links.length)
-        links.push(edge)
-        nodes.get(from)!.degree++
-        nodes.get(targetId)!.degree++
-      }
-    }
-    // Attach the collected sources to each ghost for the create-from-ghost prefill.
-    for (const [gid, srcMap] of ghostSources) {
-      const g = nodes.get(gid)
-
-      if (g && g.ghost) {
-        g.sources = [...srcMap.values()]
-      }
-    }
-    const graph: Graph = { nodes: [...nodes.values()], links }
     // The same enrichment the read-model cache applies (#62): communities +
     // settled positions, so the host serves one wire shape regardless of the
     // store behind it. Deterministic and synchronous — fixtures are tiny.
     await enrichGraph(graph, { yieldEvery: 0 })
     return graph
+  }
+
+  setFolderAliases(aliases: ReadonlyArray<FolderAlias>): void {
+    this.folderAliases = aliases.map((a) => ({ ...a }))
   }
 
   /** Read-only grooming health (#100 phase 5) over the fake's fresh graph (its links
@@ -689,13 +606,42 @@ export class InMemoryStore implements KnowledgeStore {
     summary,
     muted,
     originalId,
+    identityOnly,
     versionToken,
     id,
     targetClass,
     ifExists,
     fileName,
+    legacyImportRoot,
     createdAt,
   }: WriteInput): Promise<WriteResult> {
+    const scalarInputs = [title, directory, noteType, rawSlug, summary, fileName, createdAt]
+    const tagInputs = Array.isArray(tags) ? tags : tags != null ? [tags] : []
+
+    if (
+      scalarInputs.some((value) => value != null && !isDurableScalar(value)) ||
+      tagInputs.some((value) => !isDurableScalar(value)) ||
+      !isDurableText(content) ||
+      (id != null && !isValidNoteId(id)) ||
+      (originalId != null &&
+        !isValidNoteId(originalId) &&
+        decodeWikilinkIdentity(originalId) == null)
+    ) {
+      throw writeFailed('input contains an invalid durable string')
+    }
+    const requestedDirectory = directory ?? ''
+    const validDirectory =
+      legacyImportRoot !== undefined
+        ? !originalId &&
+          Boolean(fileName) &&
+          isLegacyImportDestination(requestedDirectory, legacyImportRoot, (prefix) =>
+            this.dirs.has(prefix),
+          )
+        : isPortableRelativeDestination(requestedDirectory, (prefix) => this.dirs.has(prefix))
+
+    if (!validDirectory) {
+      throw writeFailed('directory must be safe with portable new components')
+    }
     // Carry-forward semantics matching the real engine's serializeNoteFile: an
     // UNDEFINED field leaves the note's existing value untouched (the semantic
     // ops re-send what they read, #21 — a write that omitted them would wrongly
@@ -724,12 +670,20 @@ export class InMemoryStore implements KnowledgeStore {
     // an edit that hands an explicit fileName keeps that basename instead of re-deriving
     // it from slug(title) — see the edit branch below. Folder-page edits keep the reserved
     // `index.md` basename for every write path, so a body/title edit never turns the cover
-    // into an ordinary child note.
-    const fileIn = (d: string, base: string) => (d ? `${d}/` : '') + `${slug(base)}.md`
+    // into an ordinary child note. The path formula itself is CORE's (#296) — the fake
+    // shares it so a title the real engine can't slug (emoji-only → the id rung) lands on
+    // the same file here, and an e2e run can't pass a destination production refuses.
+    // title and fileName stay SEPARATE arguments: the formula's precedence is
+    // `fileName -> title -> id`, so folding them into one base here would skip the
+    // title rung — a create pinning a fileName that slugs to nothing (an emoji) would
+    // land on the id in the fake while production still names it after the title.
+    const fileIn = (d: string, noteTitle: string, base: string | undefined, noteId?: string) =>
+      (d ? `${d}/` : '') +
+      `${noteFileBase(noteTitle, base, noteId, legacyImportRoot !== undefined)}.md`
     const tokenOf = (n: StoredNote) => computeVersionToken(stripTitleHeading(n.content, n.title))
 
     if (originalId) {
-      const i = this.findIndex(originalId)
+      const i = this.findIndex(originalId, identityOnly)
 
       // A dead reference is an honest 404, never a silent re-create: the note
       // was deleted under the editor and resurrecting it would hide that.
@@ -750,8 +704,10 @@ export class InMemoryStore implements KnowledgeStore {
       // An explicit fileName is honoured on edit too (opt-in): a metadata touch that
       // hands the note's current basename keeps the file in place rather than renaming
       // to slug(title) — mirrors the notarium engine. Folder pages stay `index`.
-      const fileBase = isFolderPageNote(prev.filePath) ? FOLDER_PAGE_BASENAME : fileName || title
-      const filePath = fileIn(dir, fileBase)
+      const fileBase = isFolderPageNote(prev.filePath) ? FOLDER_PAGE_BASENAME : fileName
+      const preserveCurrentPath =
+        title === prev.title && fileName == null && dir === directoryOf(prev.filePath)
+      const filePath = preserveCurrentPath ? prev.filePath : fileIn(dir, title, fileBase, prev.id)
 
       // Rename-in-place must never swallow a different note already at the
       // destination — the real engine's guard, mirrored so the fake can't pass a
@@ -793,7 +749,18 @@ export class InMemoryStore implements KnowledgeStore {
         versionToken: tokenOf(this.notes[i]),
       }
     }
-    const filePath = fileIn(norm(directory ?? ''), fileName || title)
+    // Identity is settled BEFORE the path here, because the last rung of the path
+    // formula is the id itself (#296): deriving the id from the final path would be
+    // circular for a title with nothing sluggable in it. The id keeps riding on the
+    // path the TITLE alone implies — identical for every ordinary note, so seeded and
+    // e2e-hardcoded ids are untouched.
+    const createDir = norm(directory ?? '')
+    const newId =
+      id ||
+      this.deriveId(
+        (createDir ? `${createDir}/` : '') + `${sluggedNoteName(title, fileName) || 'note'}.md`,
+      )
+    const filePath = fileIn(createDir, title, fileName, newId)
     const existing = this.indexByPath(filePath)
 
     // Create-collision policy, mirroring notariumStore: refuse unless the caller
@@ -820,7 +787,6 @@ export class InMemoryStore implements KnowledgeStore {
         versionToken: tokenOf(this.notes[existing]),
       }
     }
-    const newId = id || this.deriveId(filePath)
     const fresh: StoredNote = {
       id: newId,
       title,
@@ -852,7 +818,21 @@ export class InMemoryStore implements KnowledgeStore {
 
   /** Move a note or a folder subtree. A failed move throws the same
    *  "# Move Failed" tool-error a bare engine surfaces (#6/#8). */
-  async move({ id, destinationPath, isDirectory = false }: MoveInput): Promise<void> {
+  async move({ id, destinationPath, isDirectory = false, identityOnly }: MoveInput): Promise<void> {
+    const currentPath = isDirectory ? id : this.notes[this.findIndex(id, identityOnly)]?.filePath
+
+    if (
+      !isDurableScalar(destinationPath) ||
+      !isPortableMoveDestination(
+        destinationPath,
+        currentPath ?? '',
+        (prefix) => this.dirs.has(prefix) || prefix === currentPath,
+      ) ||
+      (!isDirectory && !isValidNoteId(id) && decodeWikilinkIdentity(id) == null) ||
+      (isDirectory && !isCanonicalSafeRelativeAddress(id))
+    ) {
+      throw moveFailed('path or identity contains an invalid durable string')
+    }
     if (isDirectory) {
       const src = id
       // Occupancy is the directory channel's truth, not just notes (#97): an
@@ -888,7 +868,7 @@ export class InMemoryStore implements KnowledgeStore {
 
       return
     }
-    const i = this.findIndex(id)
+    const i = this.findIndex(id, identityOnly)
 
     if (i === -1) {
       throw moveFailed('note not found')
@@ -901,8 +881,8 @@ export class InMemoryStore implements KnowledgeStore {
     this.addDirs(destinationPath) // seed the new folder; the old lingers (#97)
   }
 
-  async remove(rawId: string): Promise<void> {
-    const i = this.findIndex(rawId)
+  async remove(rawId: string, opts?: { identityOnly?: boolean }): Promise<void> {
+    const i = this.findIndex(rawId, opts?.identityOnly)
 
     if (i !== -1) {
       this.notes.splice(i, 1)
@@ -918,10 +898,21 @@ export class InMemoryStore implements KnowledgeStore {
   }
 
   async makeDir(path: string): Promise<void> {
-    this.addDirPath(path.replace(/^\/+|\/+$/g, ''))
+    if (!isPortableRelativeDestination(path, (prefix) => this.dirs.has(prefix))) {
+      throw moveFailed('folder path contains an invalid durable string')
+    }
+    const clean = path.replace(/^\/+|\/+$/g, '')
+
+    if (this.dirs.has(clean)) {
+      throw moveFailed('a folder with that name already exists')
+    }
+    this.addDirPath(clean)
   }
 
   async removeDir(path: string): Promise<void> {
+    if (!isCanonicalSafeRelativeAddress(path)) {
+      throw moveFailed('folder path contains an invalid durable string')
+    }
     const clean = path.replace(/^\/+|\/+$/g, '')
 
     if (!clean) {

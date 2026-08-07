@@ -4,7 +4,7 @@
 // has no marker capability there (honest degradation, P5).
 // canon: docs/projects.md#the-notariummeta-marker-schema-parser-pin
 
-import { promises as fs } from 'node:fs'
+import { promises as fs, constants as fsConstants } from 'node:fs'
 import { join, relative, resolve, sep } from 'node:path'
 
 import { createLocalFsFiles } from '@notarium/engine'
@@ -89,6 +89,11 @@ export type MarkerStore = {
    *  ANY dot-segment path, so a marker can never land under `.notarium/*` (the
    *  second line after the host's safeRelPath). */
   write(space: string, folderPath: string, raw: string): Promise<void>
+  /** Same atomic write, but the folder must already exist and is never
+   *  provisioned. Move preparation uses this so an externally removed source
+   *  cannot be resurrected as a marker-only ghost. Optional for registry-only
+   *  test hosts; they have no physical folder to recreate. */
+  writeExisting?(space: string, folderPath: string, raw: string): Promise<void>
   /** The marker's bytes, or null when ABSENT. A transient error (EACCES/EIO/
    *  lock) THROWS — never mistake it for "unmarked", or a re-mint would
    *  overwrite a live marker. */
@@ -131,6 +136,87 @@ export const createMarkerStore = (notesDirFor: (space: string) => string | null)
     return full
   }
 
+  /** Atomic marker visibility without mkdir. The containing folder is the
+   *  subject being marked/identified and therefore a precondition, never an
+   *  output of this metadata write. */
+  const writeInExistingFolder = async (
+    rootAbs: string,
+    folderPath: string,
+    raw: string,
+  ): Promise<void> => {
+    const folderAbs = absIn(rootAbs, folderPath)
+    let folderHandle
+
+    if (process.platform !== 'linux') {
+      throw Object.assign(new Error('directory-anchored marker writes are unavailable'), {
+        code: 'ENOTSUP',
+      })
+    }
+    try {
+      folderHandle = await fs.open(
+        folderAbs,
+        fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY ?? 0) | (fsConstants.O_NOFOLLOW ?? 0),
+      )
+      const captured = await folderHandle.stat({ bigint: true })
+
+      if (!captured.isDirectory()) {
+        throw Object.assign(new Error('marker parent is not a directory'), { code: 'ENOTDIR' })
+      }
+
+      // `/proc/self/fd/N` resolves every relative operation through the opened
+      // directory inode. If the public folder is renamed/recreated midway, a
+      // temp or journal path can never be rebound into the replacement folder.
+      const anchored = createLocalFsFiles(`/proc/self/fd/${folderHandle.fd}`)
+      const before = await anchored.read(MARKER_FILENAME)
+      let written: boolean
+
+      if (before == null) {
+        if (!anchored.writeIfAbsent) {
+          throw Object.assign(new Error('atomic marker create is unavailable'), {
+            code: 'ENOTSUP',
+          })
+        }
+        written = await anchored.writeIfAbsent(MARKER_FILENAME, raw)
+      } else {
+        if (!anchored.replaceIfAbsent) {
+          throw Object.assign(new Error('atomic marker replace is unavailable'), {
+            code: 'ENOTSUP',
+          })
+        }
+        written = await anchored.replaceIfAbsent(MARKER_FILENAME, MARKER_FILENAME, before, raw)
+      }
+
+      if (!written) {
+        throw Object.assign(new Error('marker changed concurrently'), { code: 'ESTALE' })
+      }
+
+      const current = await fs.lstat(folderAbs, { bigint: true }).catch(() => null)
+      const parentUnchanged =
+        current?.isDirectory() && current.dev === captured.dev && current.ino === captured.ino
+
+      if (parentUnchanged) {
+        return
+      }
+
+      // The anchored update landed in the captured directory, never in its
+      // replacement. Roll it back with the same content-CAS before reporting a
+      // stale parent; a second writer wins rather than being overwritten.
+      const rolledBack =
+        before == null
+          ? await anchored.removeIfUnchanged?.(MARKER_FILENAME, raw)
+          : await anchored.replaceIfAbsent?.(MARKER_FILENAME, MARKER_FILENAME, raw, before)
+
+      if (!rolledBack) {
+        throw Object.assign(new Error('marker parent changed; rollback was not safe'), {
+          code: 'ESTALE',
+        })
+      }
+      throw Object.assign(new Error('marker parent changed concurrently'), { code: 'ESTALE' })
+    } finally {
+      await folderHandle?.close().catch(() => {})
+    }
+  }
+
   return {
     available: (space) => notesDirFor(space) !== null,
 
@@ -143,9 +229,21 @@ export const createMarkerStore = (notesDirFor: (space: string) => string | null)
       if (!dir) {
         throw new Error(`no marker storage for space ${space}`)
       }
-      // localFs.write is atomic (tmp+rename) — a crash mid-write can't leave a
-      // half-marker.
+      // General project/space provisioning retains the original mkdir-capable
+      // path. Move preparation calls writeExisting below.
       await createLocalFsFiles(dir).write(markerRelPath(folderPath), raw)
+    },
+
+    writeExisting: async (space, folderPath, raw) => {
+      if (hasDotSegment(folderPath)) {
+        throw new Error(`refusing to write a marker under a dot namespace: ${folderPath}`)
+      }
+      const rootAbs = rootFor(space)
+
+      if (!rootAbs) {
+        throw new Error(`no marker storage for space ${space}`)
+      }
+      await writeInExistingFolder(rootAbs, folderPath, raw)
     },
 
     read: async (space, folderPath) => {

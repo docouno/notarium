@@ -1,6 +1,17 @@
 import { describe, expect, it } from 'vitest'
+import type { KnowledgeStore, NoteClass, WriteInput } from '@notarium/core'
 
-import { curatePersonalScope, curateProjectScope, type WeighedSet } from './agentContext'
+import {
+  curatePersonalScope,
+  curateProjectScope,
+  personalProfilePin,
+  resolveContextSets,
+  resolveScopePins,
+  setNoteMuted,
+  setNotePinned,
+  weighAlwaysLoad,
+  type WeighedSet,
+} from './agentContext'
 
 // The scope-curation composition (#208/#209): one SINGLE budget over an ordered chain
 // — local pins, then attached SET items, then memory — with the flat curateBudget
@@ -32,6 +43,86 @@ const set = (id: string, ...items: Array<[string, number]>): WeighedSet => ({
 })
 
 const BIG = 1_000_000 // a budget nothing can exhaust
+
+const rekeyingStore = (noteClass: NoteClass = 'user-doc') => {
+  const writes: WriteInput[] = []
+  const store = {
+    list: async () => [
+      {
+        id: 'provisional-id',
+        title: 'Listed title',
+        class: noteClass,
+        filePath: 'listed.md',
+        tags: ['always-load'],
+        modifiedAt: null,
+        createdAt: null,
+      },
+    ],
+    read: async () => ({
+      id: 'durable-id',
+      title: 'Read title',
+      class: noteClass,
+      filePath: 'listed.md',
+      content: 'body',
+      frontmatter: { tags: [] },
+      versionToken: 'token',
+    }),
+    write: async (input: WriteInput) => {
+      writes.push(input)
+      return { id: 'durable-id', versionToken: 'next' }
+    },
+  } as unknown as KnowledgeStore
+  return { store, writes }
+}
+
+describe('agent-context identity producers', () => {
+  it('uses the authoritative read id for cross-space pins and set items', async () => {
+    const read = async () => ({
+      noteId: 'durable-id',
+      title: 'Target',
+      content: 'body',
+      spaceSlug: 'docs',
+    })
+
+    await expect(resolveScopePins(['provisional-id'], read)).resolves.toEqual([
+      expect.objectContaining({ noteId: 'durable-id' }),
+    ])
+    const [resolved] = await resolveContextSets(
+      [
+        {
+          id: 'set-id',
+          homeSpace: 'home',
+          name: 'Set',
+          items: [{ space: 'docs', noteId: 'provisional-id' }],
+          createdAt: '2026-08-05T00:00:00.000Z',
+        },
+      ],
+      read,
+    )
+    expect(resolved.items).toEqual([expect.objectContaining({ noteId: 'durable-id' })])
+  })
+
+  it('uses the authoritative read id for always-load and profile pins', async () => {
+    const tagged = rekeyingStore()
+    const profile = rekeyingStore('profile')
+
+    await expect(weighAlwaysLoad(tagged.store)).resolves.toEqual([
+      expect.objectContaining({ noteId: 'durable-id', title: 'Read title' }),
+    ])
+    await expect(personalProfilePin(profile.store)).resolves.toMatchObject({
+      noteId: 'durable-id',
+      title: 'Read title',
+    })
+  })
+
+  it('writes metadata toggles through the authoritative read id', async () => {
+    const { store, writes } = rekeyingStore()
+
+    await setNotePinned(store, 'provisional-id', true)
+    await setNoteMuted(store, 'provisional-id', true)
+    expect(writes.map((write) => write.originalId)).toEqual(['durable-id', 'durable-id'])
+  })
+})
 
 describe('curatePersonalScope (#208/#209)', () => {
   it('loads everything under budget; muted memory is off the budget but still listed (loaded:false)', () => {

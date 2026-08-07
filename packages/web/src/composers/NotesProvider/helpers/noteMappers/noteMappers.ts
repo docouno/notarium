@@ -5,7 +5,7 @@ import type { NoteDetailView, NoteView } from '../../../../libs/wire'
  *  `aliases` (#100) so a detail-opened note resolves inbound [[Old Name]] from
  *  this cache without a server round-trip — same alias channel the list serves. */
 export const asNote = (d: NoteDetailView, seed?: NoteView | null): NoteView | null =>
-  d.id && d.filePath
+  !d.deleted && d.id && d.filePath
     ? {
         id: d.id,
         title: d.title || '',
@@ -19,7 +19,7 @@ export const asNote = (d: NoteDetailView, seed?: NoteView | null): NoteView | nu
     : null
 
 export const asRecent = (d: NoteDetailView, seed?: NoteView | null): RecentNote | null =>
-  d.id && d.filePath
+  !d.deleted && d.id && d.filePath
     ? {
         id: d.id,
         title: d.title || '',

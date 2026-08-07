@@ -159,6 +159,7 @@ describe('orphansOf', () => {
         degree: 9,
         target: 'x',
         prefillTitle: 'X',
+        creatable: true,
       },
     ],
     links: [],

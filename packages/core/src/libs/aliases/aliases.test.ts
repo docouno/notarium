@@ -84,3 +84,26 @@ describe('nextPathAliases (#100 — folder paths, dedup by slugifyPath)', () => 
     expect(nextPathAliasesMulti(['p1', 'p0'], ['p2'], ['p3'])).toEqual(['p1', 'p0', 'p2'])
   })
 })
+
+// #296 — the folder path history is keyed by the SAME key its consumers look it up by.
+// On the bare path slug a folder whose name has no romanisable letters keys to '',
+// `dedupeBy` drops it, and renaming such a folder retires nothing: every inbound
+// `[[📥/note]]` breaks silently instead of surviving the rename.
+describe('folder path history for an unromanisable folder name', () => {
+  it('retires the old path when the folder was named in emoji', () => {
+    expect(nextPathAliases([], '📥', 'inbox')).toEqual(['📥'])
+  })
+
+  it('retires the old path when the NEW name is the unromanisable one', () => {
+    expect(nextPathAliases([], 'old', '📥')).toEqual(['old'])
+  })
+
+  it('still drops a path that is the current one (idempotent A→B→A)', () => {
+    expect(nextPathAliases(['📥'], 'inbox', '📥')).toEqual(['inbox'])
+  })
+
+  it('keeps the structural separator — `a/b` is not `ab`', () => {
+    expect(nextPathAliases([], 'a/b', 'c')).toEqual(['a/b'])
+    expect(nextPathAliases(['a/b'], 'x', 'ab')).toEqual(['a/b', 'x'])
+  })
+})

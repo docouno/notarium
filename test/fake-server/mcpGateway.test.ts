@@ -15,11 +15,13 @@
 import type { FastifyInstance } from 'fastify'
 import type { AddressInfo } from 'node:net'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { sha256Hex } from '@notarium/core'
+import { encodeWikilinkIdentity, sha256Hex } from '@notarium/core'
 
 import { createApp, type Fixture } from './app.js'
 
 const MARKER = 'zzmarker'
+const identityLink = (id: string, title: string): string =>
+  `[[${encodeWikilinkIdentity(id)}|${title}]]`
 
 /** Three spaces: alice's personal domain, a shared project, and a space alice
  *  cannot reach. Every note carries MARKER so one query fans out across them. */
@@ -2594,27 +2596,26 @@ describe('move_note / rename_note (#102 phase 5)', () => {
     expect((await noteOf(bearer, id)).title).toBe('After Name')
   })
 
-  it('rename is LINK-SAFE — inbound [[Old Title]] keep resolving via the alias (the AX №1 fix)', async () => {
+  it('rename is LINK-SAFE — a typed inbound link keeps the selected stable identity', async () => {
     const bearer = await patFor('alice', 'alice-password-1', 'write')
     const cookie = await loginCookie('alice', 'alice-password-1')
     const src = await seed(bearer, 'Citing Note')
     const dst = await seed(bearer, 'Old Heading')
     await callTool(port, 'link', { from: src.id, to: dst.id, relation: 'relates_to' }, bearer)
-    // The link materialized `[[Old Heading]]` in the source body and a graph edge.
+    // The link materialized the selected stable identity plus a readable alias.
     expect((await teamLinks(cookie)).some((l) => l.source === src.id && l.target === dst.id)).toBe(
       true,
     )
     // Rename the target. The OLD title goes into its alias-history (#100).
     const r = await callTool(port, 'rename_note', { ref: dst.id, title: 'New Heading' }, bearer)
     expect(isError(r)).toBe(false)
-    // The edge SURVIVES — `[[Old Heading]]` resolves to dst by its alias; no source
-    // body was rewritten (the resolver does the work, not a body edit).
+    // The edge SURVIVES without rewriting the source body.
     expect((await teamLinks(cookie)).some((l) => l.source === src.id && l.target === dst.id)).toBe(
       true,
     )
     expect(
       structured(await callTool(port, 'get_note', { ref: src.id }, bearer)).content as string,
-    ).toMatch(/\[\[Old Heading\]\]/)
+    ).toContain(identityLink(dst.id, 'Old Heading'))
   })
 
   it('renaming to the same title is a no-op success (no empty alias, current token echoed)', async () => {
@@ -2905,6 +2906,19 @@ describe('move_folder / rename_folder / rename_project (#102 phase 6)', () => {
     expect(text(r2)).toMatch(/no such folder/i)
   })
 
+  it('a non-noop move of a missing folder fails instead of creating a marker-only ghost', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const r = await callTool(
+      port,
+      'move_folder',
+      { project: 'team', folder: 'missing-source', toFolder: 'somewhere' },
+      bearer,
+    )
+
+    expect(isError(r)).toBe(true)
+    expect(text(r)).toMatch(/no such folder/i)
+  })
+
   it('moving a folder onto an occupied destination is an actionable error', async () => {
     const bearer = await patFor('alice', 'alice-password-1', 'write')
     await seed(bearer, 'Occ A', 'occparent/occ') // occupies occparent/occ/
@@ -2946,6 +2960,14 @@ describe('move_folder / rename_folder / rename_project (#102 phase 6)', () => {
     )
     expect(isError(r)).toBe(true)
     expect(text(r)).toMatch(/not a path|move_folder/i)
+
+    const backslash = await callTool(
+      port,
+      'rename_folder',
+      { project: 'team', folder: 'rndir', name: 'a\\b' },
+      bearer,
+    )
+    expect(isError(backslash)).toBe(true)
   })
 
   it('renaming a folder to its current name is a no-op', async () => {
@@ -3091,11 +3113,63 @@ describe('link (#21 stage 6)', () => {
     expect(typeof structured(r).versionToken).toBe('string')
 
     // The relation rides the body line, co-located with the wikilink (#66 form).
-    expect(await readContent(bearer, src.id)).toMatch(/- depends_on \[\[Link Target\]\]/)
+    expect(await readContent(bearer, src.id)).toContain(
+      `- depends_on ${identityLink(dst.id, 'Link Target')}`,
+    )
 
     // The graph resolves the [[wikilink]] into a real source→target edge.
     const links = await teamLinks(cookie)
     expect(links.some((l) => l.source === src.id && l.target === dst.id)).toBe(true)
+  })
+
+  it('keeps the selected namesake through rename instead of retargeting by title', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const cookie = await loginCookie('alice', 'alice-password-1')
+    const src = await seed(bearer, 'Namesake Source')
+    const first = structured(
+      await callTool(
+        port,
+        'create_note',
+        { project: 'team', path: 'one', title: 'Shared Name', body: 'first' },
+        bearer,
+      ),
+    ).noteId as string
+    const selected = structured(
+      await callTool(
+        port,
+        'create_note',
+        { project: 'team', path: 'two', title: 'Shared Name', body: 'selected' },
+        bearer,
+      ),
+    ).noteId as string
+
+    await callTool(port, 'link', { from: src.id, to: selected, relation: 'depends_on' }, bearer)
+    expect(await readContent(bearer, src.id)).toContain(identityLink(selected, 'Shared Name'))
+    expect(
+      (await teamLinks(cookie)).some((l) => l.source === src.id && l.target === selected),
+    ).toBe(true)
+    expect((await teamLinks(cookie)).some((l) => l.source === src.id && l.target === first)).toBe(
+      false,
+    )
+
+    await callTool(port, 'rename_note', { ref: selected, title: 'Selected Renamed' }, bearer)
+    const links = await teamLinks(cookie)
+    expect(links.some((l) => l.source === src.id && l.target === selected)).toBe(true)
+    expect(links.some((l) => l.source === src.id && l.target === first)).toBe(false)
+  })
+
+  it('reports an existing target title containing a pipe without truncating it', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const src = await seed(bearer, 'Pipe Source')
+    const dst = await seed(bearer, 'A|B')
+    const result = await callTool(
+      port,
+      'link',
+      { from: src.id, to: dst.id, relation: 'depends_on' },
+      bearer,
+    )
+    expect(text(result)).toContain('A|B')
+    expect(await readContent(bearer, src.id)).toContain(identityLink(dst.id, 'A|B'))
   })
 
   it('re-linking the same pair is an idempotent no-op (one line, not two)', async () => {
@@ -3111,7 +3185,7 @@ describe('link (#21 stage 6)', () => {
     )
     expect(isError(r2)).toBe(false)
     const body = await readContent(bearer, src.id)
-    expect(body.match(/\[\[Idem Target\]\]/g)).toHaveLength(1) // not duplicated
+    expect(body.split(identityLink(dst.id, 'Idem Target'))).toHaveLength(2) // one occurrence
   })
 
   it('a different relation to the same target is a distinct edge — it adds a second line', async () => {
@@ -3121,8 +3195,8 @@ describe('link (#21 stage 6)', () => {
     await callTool(port, 'link', { from: src.id, to: dst.id, relation: 'relates_to' }, bearer)
     await callTool(port, 'link', { from: src.id, to: dst.id, relation: 'depends_on' }, bearer)
     const body = await readContent(bearer, src.id)
-    expect(body).toMatch(/- relates_to \[\[Multi Target\]\]/)
-    expect(body).toMatch(/- depends_on \[\[Multi Target\]\]/)
+    expect(body).toContain(`- relates_to ${identityLink(dst.id, 'Multi Target')}`)
+    expect(body).toContain(`- depends_on ${identityLink(dst.id, 'Multi Target')}`)
   })
 
   it('a cross-space link is a guiding error (#66), never silently created', async () => {
@@ -3240,6 +3314,38 @@ describe('link (#21 stage 6)', () => {
     expect(links.some((l) => l.source === src.id && l.target === (dst.noteId as string))).toBe(true)
   })
 
+  it('rejects the reserved identity namespace as a forward title', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const src = await seed(bearer, 'Reserved Forward Source')
+    const r = await callTool(
+      port,
+      'link',
+      { from: src.id, toTitle: 'notarium-id:%zz', relation: 'depends_on' },
+      bearer,
+    )
+    expect(isError(r)).toBe(true)
+    expect(text(r)).toMatch(/reserved.*notarium-id/i)
+    expect(await readContent(bearer, src.id)).not.toContain('notarium-id:%zz')
+  })
+
+  it.each(['   ', 'Future.md'])(
+    'rejects a forward title that cannot resolve to its eventual note: %j',
+    async (toTitle) => {
+      const bearer = await patFor('alice', 'alice-password-1', 'write')
+      const src = await seed(bearer, `Unresolvable Forward ${JSON.stringify(toTitle)}`)
+      const before = await readContent(bearer, src.id)
+      const r = await callTool(
+        port,
+        'link',
+        { from: src.id, toTitle, relation: 'depends_on' },
+        bearer,
+      )
+
+      expect(isError(r)).toBe(true)
+      expect(await readContent(bearer, src.id)).toBe(before)
+    },
+  )
+
   it('rejects passing BOTH to and toTitle (exactly one target)', async () => {
     const bearer = await patFor('alice', 'alice-password-1', 'write')
     const src = await seed(bearer, 'OneTarget Source')
@@ -3292,7 +3398,7 @@ describe('create_note #102 phase 4 channels (links / createdAt / fileName / warn
     const srcId = structured(created).noteId as string
     const body = structured(await callTool(port, 'get_note', { ref: srcId }, bearer))
       .content as string
-    expect(body).toMatch(new RegExp(`- depends_on \\[\\[${targetTitle}\\]\\]`))
+    expect(body).toContain(`- depends_on ${identityLink(target, targetTitle)}`)
     expect(body).toMatch(/- relates_to \[\[Inline Forward Only\]\]/)
     // The resolved edge is in the graph.
     const res = await app.inject({ method: 'GET', url: '/api/s/team/graph', headers: { cookie } })
@@ -3634,7 +3740,7 @@ describe('link_many (#102 phase 4 batch)', () => {
     )
     expect((structured(r2).results as Array<Record<string, unknown>>)[0].ok).toBe(true)
     const body = structured(await callTool(port, 'get_note', { ref: a }, bearer)).content as string
-    expect(body.match(/\[\[LM5 Target\]\]/g)).toHaveLength(1) // not duplicated
+    expect(body.split(identityLink(b, 'LM5 Target'))).toHaveLength(2) // one occurrence
   })
 
   it('a whole group fails when its from-note is unreachable', async () => {

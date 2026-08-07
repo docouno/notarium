@@ -6,7 +6,8 @@
 // documents, so each blob becomes one note. Routed as `source: 'memory'`, so the
 // import's memory-destination option (folder / space / skip) governs it.
 
-import { slugify } from '../../libs/slug'
+import { boundNameToBytes, NOTE_BASENAME_MAX_BYTES } from '../../libs/path'
+import { legacyImportSlug } from '../../libs/slug'
 import { IMPORT_SOURCE } from '../consts'
 import { shortHash } from '../helpers/format'
 import type { ImportNote } from '../types'
@@ -33,13 +34,18 @@ export const claudeMemoryItemToNotes = (item: ClaudeMemoryItem): ImportNote[] =>
     if (!/_memory$/.test(key) || typeof value !== 'string' || !value.trim()) {
       continue
     }
+    const legacyName = `${legacyImportSlug(key) || 'memory'}${account ? `-${shortHash(account)}` : ''}`
+
     notes.push({
       title: titleOfKey(key),
       body: value.trim(),
       directory: 'memory/claude',
       tags: ['claude', 'memory'],
       noteType: 'memory',
-      fileName: `${slugify(key) || 'memory'}${account ? `-${shortHash(account)}` : ''}`,
+      // Historical in-range keys stay exact. An overlong component could never
+      // have existed on the supported 255-byte filesystems, so bound it with a
+      // whole-value hash instead of feeding ENAMETOOLONG into the stream.
+      fileName: boundNameToBytes(legacyName, NOTE_BASENAME_MAX_BYTES),
       source: IMPORT_SOURCE.memory,
     })
   }

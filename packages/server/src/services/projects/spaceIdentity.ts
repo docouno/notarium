@@ -2,7 +2,7 @@
 // with an alias rename-history and cross-host adoption from the root marker facet.
 // canon: docs/spaces.md#model · docs/spaces.md#server
 
-import { freshNoteId, nextAliases, slugify } from '@notarium/core'
+import { asciiSlug, freshNoteId, nextAliases } from '@notarium/core'
 
 import type { SpaceRecord, SpacesPersistence } from '../metaDb'
 import { parseMarker, serializeMarker, type SpaceMarkerFacet } from './marker'
@@ -81,7 +81,7 @@ export const recordSpaceRename = async (
   let aliases = rec.aliases
 
   if (input.slug !== undefined) {
-    const next = slugify(input.slug)
+    const next = asciiSlug(input.slug)
 
     if (!next) {
       return { code: 'invalid' }

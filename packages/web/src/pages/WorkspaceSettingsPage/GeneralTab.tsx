@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Navigate } from 'react-router'
-import { slugify } from '@notarium/core/slug'
+import { asciiSlug } from '@notarium/core/slug'
 import { useAuth } from '../../composers/AuthProvider'
 import { useSpace } from '../../composers/SpaceProvider'
 import { Button } from '../../core/Button'
@@ -87,9 +87,9 @@ export const GeneralTab = () => {
     return <Navigate to={workspaceSettingsRoute(space, 'members')} replace />
   }
 
-  // The canonical handle = the field run through slugify once more (drops any trailing
+  // The canonical handle = the field run through asciiSlug once more (drops any trailing
   // dash kept for typing). This is what we compare, preview and send.
-  const handleSlug = slugify(slug)
+  const handleSlug = asciiSlug(slug)
   const trimmedName = name.trim()
   const dirty = handleSlug !== active.slug || trimmedName !== active.displayName
   const canSave = !busy && dirty && handleSlug.length > 0 && trimmedName.length > 0

@@ -31,6 +31,16 @@ describe('parseNoteFile', () => {
     expect(parseNoteFile('# From Heading\n\nbody', 'dir/x.md').title).toBe('From Heading')
     expect(parseNoteFile('just prose', 'dir/some-note.md').title).toBe('some-note')
   })
+
+  it('ignores a non-durable identity but preserves a fully opaque prefix-shaped one', () => {
+    const lone = String.fromCharCode(0xd800)
+    const parsed = parseNoteFile(`---\nnotarium-id: bad${lone}\n---\n\nbody`, 'bad.md')
+
+    expect(parsed.idClaim).toBeNull()
+    expect(
+      parseNoteFile('---\nnotarium-id: notarium-id:foo\n---\n\nbody', 'reserved.md').idClaim,
+    ).toBe('notarium-id:foo')
+  })
 })
 
 describe('serializeNoteFile', () => {

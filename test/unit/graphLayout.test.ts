@@ -133,6 +133,7 @@ describe('enrichGraph', () => {
           degree: 1,
           target: 'missing',
           prefillTitle: 'missing',
+          creatable: true,
         },
       ],
       links: [...twoCliques().links, link('a1', 'ghost:missing')],
