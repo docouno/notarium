@@ -54,13 +54,14 @@ import {
   mintOAuthAccessToken,
   mintOAuthRefreshToken,
   renameProjectSlug,
+  roleContextTargetOf,
   sha256,
   SpaceManager,
   type SpaceRecord,
 } from '@notarium/server'
 
 import { buildCasesWorld, listCases } from '../test/cases'
-import type { CaseWorld, UserDecl } from '../test/cases'
+import type { CaseWorld, ContextSetAttachDecl, UserDecl } from '../test/cases'
 import { normDate } from '../test/cases/generators'
 import { agentSessionId } from '../test/cases/sessionIds'
 import { seedDurableImports } from './seedDurableImports'
@@ -424,6 +425,66 @@ const run = async (): Promise<void> => {
       })
     }
     agentRoles++
+  }
+
+  /** Resolve every seeded context facet through one scope-addressing seam. Role
+   * declarations address an exact owned placement, not the effective winner, so
+   * same-name Personal/Space/Project presets stay independently inspectable. */
+  const resolveContextTarget = async (
+    declaration: ContextSetAttachDecl,
+  ): Promise<{
+    targetKind: 'personal' | 'project' | 'role'
+    targetId: string
+    targetSpace: string
+  } | null> => {
+    if (declaration.kind === 'personal') {
+      const personalSlug = personalSpaceOf.get(asUser(declaration.user))
+      const personal = personalSlug ? idOf.get(personalSlug) : undefined
+
+      return personal ? { targetKind: 'personal', targetId: personal, targetSpace: personal } : null
+    }
+    if (declaration.kind === 'project') {
+      const space = idOf.get(declaration.space)
+      const project = projectRows.find(
+        (candidate) => candidate.space === space && candidate.path === declaration.path,
+      )
+
+      return project
+        ? { targetKind: 'project', targetId: project.id, targetSpace: project.space }
+        : null
+    }
+
+    const target = declaration.target
+    const location =
+      target.kind === 'personal'
+        ? (() => {
+            const username = target.user ? asUser(target.user) : primary.username
+            const personalSlug = personalSpaceOf.get(username)
+            const personal = personalSlug ? idOf.get(personalSlug) : undefined
+            return personal ? ({ scope: 'personal', space: personal } as const) : null
+          })()
+        : target.kind === 'space'
+          ? (() => {
+              const space = idOf.get(target.space)
+              return space ? ({ scope: 'space', space } as const) : null
+            })()
+          : (() => {
+              const space = idOf.get(target.space)
+              const project = projectRows.find(
+                (candidate) => candidate.space === space && candidate.path === target.path,
+              )
+              return project
+                ? ({ scope: 'project', space: project.space, projectId: project.id } as const)
+                : null
+            })()
+
+    if (!location || !(await roleService.loadAt(location, declaration.name, 1))) {
+      throw new Error(
+        `role context references a missing owned role: ${declaration.name} (${target.kind})`,
+      )
+    }
+    const roleTarget = roleContextTargetOf({ role: { name: declaration.name }, location })
+    return { targetKind: 'role', targetId: roleTarget.id, targetSpace: roleTarget.space }
   }
 
   // 3b. Connected OAuth apps (#181): mint an oauth client + a LIVE access + refresh
@@ -824,36 +885,10 @@ const run = async (): Promise<void> => {
     })
     contextSets++
     for (const a of set.attach ?? []) {
-      if (a.kind === 'personal') {
-        const personalSlug = personalSpaceOf.get(asUser(a.user))
-        const targetId = personalSlug ? idOf.get(personalSlug) : undefined
+      const target = await resolveContextTarget(a)
 
-        if (targetId) {
-          await metaDb.contextSets.attach({
-            setId,
-            targetKind: 'personal',
-            targetId,
-            targetSpace: targetId,
-            createdAt: t,
-          })
-        }
-      } else {
-        const spaceId = idOf.get(a.space)
-
-        if (!spaceId) {
-          continue
-        }
-        const proj = (await metaDb.projects.listForSpace(spaceId)).find((pr) => pr.path === a.path)
-
-        if (proj) {
-          await metaDb.contextSets.attach({
-            setId,
-            targetKind: 'project',
-            targetId: proj.id,
-            targetSpace: spaceId,
-            createdAt: t,
-          })
-        }
+      if (target) {
+        await metaDb.contextSets.attach({ setId, ...target, createdAt: t })
       }
     }
   }
@@ -873,42 +908,16 @@ const run = async (): Promise<void> => {
     if (!noteSpace) {
       continue
     }
-    const a = pin.attach
+    const target = await resolveContextTarget(pin.attach)
 
-    if (a.kind === 'personal') {
-      const personalSlug = personalSpaceOf.get(asUser(a.user))
-      const targetId = personalSlug ? idOf.get(personalSlug) : undefined
-
-      if (targetId) {
-        await metaDb.scopePins.addPin({
-          targetKind: 'personal',
-          targetId,
-          targetSpace: targetId,
-          noteSpace,
-          noteId: note.id,
-          createdAt: t,
-        })
-        scopePins++
-      }
-    } else {
-      const spaceId = idOf.get(a.space)
-
-      if (!spaceId) {
-        continue
-      }
-      const proj = (await metaDb.projects.listForSpace(spaceId)).find((pr) => pr.path === a.path)
-
-      if (proj) {
-        await metaDb.scopePins.addPin({
-          targetKind: 'project',
-          targetId: proj.id,
-          targetSpace: spaceId,
-          noteSpace,
-          noteId: note.id,
-          createdAt: t,
-        })
-        scopePins++
-      }
+    if (target) {
+      await metaDb.scopePins.addPin({
+        ...target,
+        noteSpace,
+        noteId: note.id,
+        createdAt: t,
+      })
+      scopePins++
     }
   }
 
@@ -919,23 +928,9 @@ const run = async (): Promise<void> => {
   let contextOrders = 0
 
   for (const ord of world.contextOrder ?? []) {
-    const scope = ord.scope
-    let targetId: string | undefined
-    let targetSpace: string | undefined
+    const target = await resolveContextTarget(ord.scope)
 
-    if (scope.kind === 'personal') {
-      const personalSlug = personalSpaceOf.get(asUser(scope.user))
-      targetId = personalSlug ? idOf.get(personalSlug) : undefined
-      targetSpace = targetId
-    } else {
-      const spaceId = idOf.get(scope.space)
-      const proj = spaceId
-        ? (await metaDb.projects.listForSpace(spaceId)).find((pr) => pr.path === scope.path)
-        : undefined
-      targetId = proj?.id
-      targetSpace = spaceId
-    }
-    if (!targetId || !targetSpace) {
+    if (!target) {
       continue
     }
     const entries: Array<{ entryKind: 'pin' | 'set'; entryRef: string }> = []
@@ -958,7 +953,12 @@ const run = async (): Promise<void> => {
     if (entries.length === 0) {
       continue
     }
-    await metaDb.contextOrder.setOrder(scope.kind, targetId, targetSpace, entries)
+    await metaDb.contextOrder.setOrder(
+      target.targetKind,
+      target.targetId,
+      target.targetSpace,
+      entries,
+    )
     contextOrders++
   }
 

@@ -4,7 +4,7 @@ import type { MemoryCategory } from '@notarium/contract'
 // ramp, #33): the ACTIVE band is the bright top step (toward white), every other band
 // the full accent — the selected part reads as "lit", the rest as background. The
 // bands keep a fixed order so selecting one never reshuffles the bar.
-export type ScopeKey = 'personal' | 'project'
+export type ScopeKey = 'personal' | 'project' | 'role'
 export type ProjectScope = {
   id: string
   slug: string

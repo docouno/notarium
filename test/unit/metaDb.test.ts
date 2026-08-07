@@ -592,13 +592,23 @@ describe('SqliteMetaDb', () => {
         targetSpace: 'spc-me',
         createdAt: 'x',
       })
+      await db.contextSets.attach({
+        setId: 'cs1',
+        targetKind: 'role',
+        targetId: 'project:proj-x:research',
+        targetSpace: 'spc-proj',
+        createdAt: 'x',
+      })
       expect((await db.contextSets.setsForTarget('project', 'proj-x')).map((s) => s.id)).toEqual([
         'cs1',
       ])
       expect((await db.contextSets.setsForTarget('personal', 'spc-me')).map((s) => s.id)).toEqual([
         'cs1',
       ])
-      expect(await db.contextSets.attachmentsForSet('cs1')).toHaveLength(2)
+      expect(
+        (await db.contextSets.setsForTarget('role', 'project:proj-x:research')).map((s) => s.id),
+      ).toEqual(['cs1'])
+      expect(await db.contextSets.attachmentsForSet('cs1')).toHaveLength(3)
 
       // attach upserts (no duplicate on the same target key).
       await db.contextSets.attach({
@@ -608,7 +618,7 @@ describe('SqliteMetaDb', () => {
         targetSpace: 'spc-proj',
         createdAt: 'y',
       })
-      expect(await db.contextSets.attachmentsForSet('cs1')).toHaveLength(2)
+      expect(await db.contextSets.attachmentsForSet('cs1')).toHaveLength(3)
       await db.contextSets.detach('cs1', 'project', 'proj-x')
       expect(await db.contextSets.setsForTarget('project', 'proj-x')).toEqual([])
 
@@ -687,6 +697,9 @@ describe('SqliteMetaDb', () => {
       await db.contextOrder.setOrder('project', 'proj-x', 'spc-proj', [
         { entryKind: 'pin', entryRef: 'n9' },
       ])
+      await db.contextOrder.setOrder('role', 'project:proj-x:research', 'spc-proj', [
+        { entryKind: 'set', entryRef: 'role-set' },
+      ])
 
       const rows = await db.contextOrder.orderForTarget('personal', 'spc-me')
       expect(rows.map((r) => [r.entryKind, r.entryRef, r.rank])).toEqual([
@@ -697,6 +710,11 @@ describe('SqliteMetaDb', () => {
       expect(
         (await db.contextOrder.orderForTarget('project', 'proj-x')).map((r) => r.entryRef),
       ).toEqual(['n9'])
+      expect(
+        (await db.contextOrder.orderForTarget('role', 'project:proj-x:research')).map(
+          (r) => r.entryRef,
+        ),
+      ).toEqual(['role-set'])
 
       // A re-order REPLACES the whole overlay (no stale rows, ranks re-densified).
       await db.contextOrder.setOrder('personal', 'spc-me', 'spc-me', [
@@ -768,6 +786,14 @@ describe('SqliteMetaDb', () => {
         noteId: 'n1',
         createdAt: 'x',
       })
+      await db.scopePins.addPin({
+        targetKind: 'role',
+        targetId: 'project:proj-x:research',
+        targetSpace: 'spc-proj',
+        noteSpace: 'spc-b',
+        noteId: 'n-role',
+        createdAt: 'x',
+      })
 
       expect((await db.scopePins.pinsForTarget('personal', 'spc-me')).map((p) => p.noteId)).toEqual(
         ['n1', 'n2'],
@@ -775,6 +801,9 @@ describe('SqliteMetaDb', () => {
       expect((await db.scopePins.pinsForTarget('project', 'proj-x')).map((p) => p.noteId)).toEqual([
         'n1',
       ])
+      expect(
+        (await db.scopePins.pinsForTarget('role', 'project:proj-x:research')).map((p) => p.noteId),
+      ).toEqual(['n-role'])
       expect((await db.scopePins.pinsForTarget('personal', 'spc-me'))[0].noteSpace).toBe('spc-a')
 
       // Re-pinning the SAME (scope, note) upserts — never a duplicate.
@@ -798,6 +827,9 @@ describe('SqliteMetaDb', () => {
       expect((await db.scopePins.pinsForTarget('project', 'proj-x')).map((p) => p.noteId)).toEqual([
         'n1',
       ])
+      expect(
+        (await db.scopePins.pinsForTarget('role', 'project:proj-x:research')).map((p) => p.noteId),
+      ).toEqual(['n-role'])
     })
   })
 

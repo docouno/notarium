@@ -157,6 +157,9 @@ export type Fixture = {
   noJobs?: boolean
   /** Omit the agent-session persistence facet to exercise P5 degradation. */
   noAgentSessions?: boolean
+  /** Keep owned roles but omit their reusable context facets to exercise independent
+   * P5 degradation of role presets. */
+  noContextFacets?: boolean
   /** Serve the identity of a RELEASED image instead of this unbundled run's
    *  honest nulls — the About tab shows a source link only for a real release, and
    *  that branch is otherwise unreachable outside a published artifact.
@@ -628,9 +631,9 @@ export const createApp = async (
     projects,
     folders,
     favorites,
-    contextSets,
-    scopePins,
-    contextOrder,
+    contextSets: fixture.noContextFacets ? undefined : contextSets,
+    scopePins: fixture.noContextFacets ? undefined : scopePins,
+    contextOrder: fixture.noContextFacets ? undefined : contextOrder,
     markerStore: opts.markerStore,
     // Omitted when the fixture opts out (noJobs) → the async routes 404, exercising the
     // capability-degradation tier the way a real meta-DB-less host does.

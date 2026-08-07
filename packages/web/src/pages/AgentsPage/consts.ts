@@ -4,6 +4,7 @@ import { STORAGE_KEYS } from '../../libs/storageKeys'
 export const CONTEXT_SCOPE_SPACE_KEY = STORAGE_KEYS.contextScopeSpacePrefix
 
 export const EMPTY_PERSONAL: MeAgentContext = {
+  roles: [],
   pins: [],
   memory: [],
   sets: [],
@@ -15,6 +16,7 @@ export const EMPTY_PERSONAL: MeAgentContext = {
 // state under the error notice — null is the LOADING sentinel (skeleton), so returning
 // null on error would strand the pane on a perpetual skeleton (#208 review).
 export const EMPTY_PROJECT: ProjectAgentContext = {
+  roles: [],
   pins: [],
   sets: [],
   projectLoadedTokens: 0,

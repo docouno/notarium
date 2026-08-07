@@ -1,6 +1,6 @@
 // start_session: the agent bootstrap bundle — profile/always-load, per-project index + delta, known-values vocabulary.
 // canon: docs/mcp-gateway.md#tools · docs/projects.md#init-context-curation
-import { CONTEXT_KIND, type RoleSummary } from '@notarium/contract'
+import { type RoleSummary } from '@notarium/contract'
 import {
   type AgentSession,
   type DeltaEntry,
@@ -13,24 +13,14 @@ import { buildMemoryIndex, isPathUnder, READ_SCOPE, treeChildren } from '@notari
 
 import { AGENT_SESSION_IDLE_MS } from '../../../agentSessions'
 import { type ProjectRecord } from '../../../metaDb'
-import {
-  type CuratedPin,
-  type CuratedSet,
-  curatePersonalScope,
-  curateProjectScope,
-  PERSONAL_TOKEN_BUDGET,
-  personalProfilePin,
-  PROJECT_TOKEN_BUDGET,
-  type SpaceStore,
-  weighAlwaysLoad,
-} from '../../../spaces'
-import { weighScopeContextSets, weighScopeOrder, weighScopePins } from '../../../storeAccess'
+import { type SpaceStore } from '../../../spaces'
 import { type Ctx, type Handler, ToolFailure, toolsHelpFor } from '../../gateway'
 import { handleOf, notePath, projectLabelForNote } from '../../helpers/projectAddressing'
 import { renderSession } from '../../helpers/render'
 import { curateRoleSummaries } from '../../helpers/roleSummaries'
 import { sanitizeText } from '../../sanitize'
 import { activateRole, assertRoleAvailable, roleContext, startSessionRoleSelector } from '../roles'
+import { curateAgentContext } from './agentContext'
 
 // ── start_session / dedup tuning ────────────────────────────────
 
@@ -53,153 +43,6 @@ const safeSessionName = (name: string): string =>
     .replace(/[\u0000-\u001f\u007f]/g, ' ')
     .trim()
     .slice(0, 160) || 'session'
-
-/** The eager always-load profile: loaded agent-memory summaries + always-load pins.
- *  canon: docs/note-model.md#agent-memory */
-type ProfileBundle = {
-  memory: Array<{ noteId: string; category: string; summary: string }>
-  alwaysLoad: Array<{ noteId: string; title: string }>
-}
-
-/** Flattens a scope's loaded pins + set items into ONE list in the user's load order.
- *  canon: docs/projects.md#context-sets-209-reusable-cross-space-bundles */
-const loadedAlwaysLoad = (
-  pins: CuratedPin[],
-  sets: CuratedSet[],
-): Array<{ noteId: string; title: string }> => {
-  const groups = [
-    ...pins.map((p) => ({
-      order: p.order,
-      items: p.loaded ? [{ noteId: p.noteId, title: sanitizeText(p.title) }] : [],
-    })),
-    ...sets.map((s) => ({
-      order: s.order,
-      items: s.items
-        .filter((it) => it.loaded)
-        .map((it) => ({ noteId: it.noteId, title: sanitizeText(it.title) })),
-    })),
-  ]
-  return groups.sort((a, b) => a.order - b.order).flatMap((g) => g.items)
-}
-
-/** Assemble the agent's `profile` payload; the reserved profile note leads the
- *  always-load, off-budget. */
-const profileFrom = (
-  pins: CuratedPin[],
-  sets: CuratedSet[],
-  memory: Array<{ noteId: string; category: string; summary: string; loaded: boolean }>,
-  profilePin: { noteId: string; title: string } | null,
-): ProfileBundle => {
-  const always = loadedAlwaysLoad(pins, sets)
-  return {
-    memory: memory
-      .filter((m) => m.loaded)
-      .map((m) => ({
-        noteId: m.noteId,
-        category: sanitizeText(m.category),
-        summary: sanitizeText(m.summary),
-      })),
-    alwaysLoad: profilePin
-      ? [{ noteId: profilePin.noteId, title: sanitizeText(profilePin.title) }, ...always]
-      : always,
-  }
-}
-
-/** Curate what the agent LOADS this session under the one-budget-per-scope model
- *  (personal alone, or project pins first then personal embedded in the remainder).
- */
-const curateAgentContext = async (
-  ctx: Ctx,
-  hinted?: ProjectRecord,
-): Promise<{
-  profile: ProfileBundle
-  projectAlwaysLoad?: Array<{ noteId: string; title: string }>
-  truncated: boolean
-}> => {
-  const personal = await ctx.personalSpace()
-  const personalStore = personal ? await ctx.spaces.store(personal) : null
-  const personalMem = personalStore ? await buildMemoryIndex(personalStore) : []
-  const profilePin = personalStore ? await personalProfilePin(personalStore) : null
-  const setDeps = {
-    store: ctx.store,
-    spaces: ctx.spaces,
-    contextSets: ctx.contextSets,
-    scopePins: ctx.scopePins,
-    contextOrder: ctx.contextOrder,
-  }
-  const personalPins = [
-    ...(personalStore ? await weighAlwaysLoad(personalStore) : []),
-    ...(personal
-      ? await weighScopePins(setDeps, ctx.principal, { kind: CONTEXT_KIND.personal, id: personal })
-      : []),
-  ]
-  const personalSets = personal
-    ? await weighScopeContextSets(setDeps, ctx.principal, {
-        kind: CONTEXT_KIND.personal,
-        id: personal,
-      })
-    : []
-  const personalOrder = personal
-    ? await weighScopeOrder(setDeps, { kind: CONTEXT_KIND.personal, id: personal })
-    : []
-  const setsTrimmed = (sets: CuratedSet[]) => sets.some((s) => s.items.some((it) => !it.loaded))
-
-  if (!hinted) {
-    const curated = curatePersonalScope(
-      personalPins,
-      personalSets,
-      personalMem,
-      PERSONAL_TOKEN_BUDGET,
-      personalOrder,
-    )
-    return {
-      profile: profileFrom(curated.pins, curated.sets, curated.memory, profilePin),
-      truncated:
-        curated.pins.some((p) => !p.loaded) ||
-        setsTrimmed(curated.sets) ||
-        curated.memory.some((m) => !m.muted && !m.loaded),
-    }
-  }
-
-  const projectStore = await ctx.spaces.store(hinted.space)
-  const projectPins = [
-    ...(await weighAlwaysLoad(projectStore, { pathPrefix: hinted.path })),
-    ...(await weighScopePins(setDeps, ctx.principal, {
-      kind: CONTEXT_KIND.project,
-      id: hinted.id,
-    })),
-  ]
-  const projectSets = await weighScopeContextSets(setDeps, ctx.principal, {
-    kind: CONTEXT_KIND.project,
-    id: hinted.id,
-  })
-  const projectOrder = await weighScopeOrder(setDeps, { kind: CONTEXT_KIND.project, id: hinted.id })
-  const curated = curateProjectScope(
-    projectPins,
-    projectSets,
-    personalPins,
-    personalSets,
-    personalMem,
-    PROJECT_TOKEN_BUDGET,
-    projectOrder,
-    personalOrder,
-  )
-  return {
-    profile: profileFrom(
-      curated.personal.pins,
-      curated.personal.sets,
-      curated.personal.memory,
-      profilePin,
-    ),
-    projectAlwaysLoad: loadedAlwaysLoad(curated.pins, curated.sets),
-    truncated:
-      curated.pins.some((p) => !p.loaded) ||
-      setsTrimmed(curated.sets) ||
-      curated.personal.pins.some((p) => !p.loaded) ||
-      setsTrimmed(curated.personal.sets) ||
-      curated.personal.memory.some((m) => !m.muted && !m.loaded),
-  }
-}
 
 /** The per-project sub-bundle (project hint only): a capped subtree index + the
  *  delta (journal) since the bound episode or unbound owner last looked;
@@ -421,15 +264,6 @@ export const handleStartSession: Handler = async (ctx, rawArgs) => {
         )
       : undefined
   ctx.session = opened?.session
-  const projects = await ctx.readableProjects()
-  const {
-    profile,
-    projectAlwaysLoad,
-    truncated: curationTruncated,
-  } = await curateAgentContext(ctx, hinted)
-  const bundle = hinted ? await buildProjectBundle(ctx, hinted, acknowledge) : undefined
-  const curatedRoles = curateRoleSummaries(effectiveRoles, ROLE_SUMMARIES_TOKEN_BUDGET)
-  const roles: RoleSummary[] = curatedRoles.roles
   // A resumed episode must rehydrate its saved prompt after client/model context
   // loss. Explicit same-role selection and implicit resume both include the body.
   const savedRole = opened?.session?.record.role
@@ -439,6 +273,16 @@ export const handleStartSession: Handler = async (ctx, rawArgs) => {
     : roleToHydrate && ctx.roles
       ? await ctx.roles.loadEffective(effectiveRoleContext, roleToHydrate, 4_000)
       : null
+  const projects = await ctx.readableProjects()
+  const {
+    profile,
+    projectAlwaysLoad,
+    roleContext: activeRoleContext,
+    truncated: curationTruncated,
+  } = await curateAgentContext(ctx, hinted, rolePackageToHydrate)
+  const bundle = hinted ? await buildProjectBundle(ctx, hinted, acknowledge) : undefined
+  const curatedRoles = curateRoleSummaries(effectiveRoles, ROLE_SUMMARIES_TOKEN_BUDGET)
+  const roles: RoleSummary[] = curatedRoles.roles
   const activeRole: UseRoleOutput | undefined =
     roleToHydrate && rolePackageToHydrate
       ? await activateRole(
@@ -448,6 +292,7 @@ export const handleStartSession: Handler = async (ctx, rawArgs) => {
           4_000,
           rolePackageToHydrate,
           effectiveRoleListing,
+          activeRoleContext,
         )
       : undefined
   // Fold bundle-internal `indexTruncated` into the top-level signal, then drop it.

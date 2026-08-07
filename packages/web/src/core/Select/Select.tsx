@@ -63,7 +63,7 @@ export const Select = <T extends string = string>({
         className={cx(styles.trigger, disabled && styles.disabled, className)}
         disabled={disabled}
         aria-label={ariaLabel}
-        aria-haspopup="listbox"
+        aria-haspopup="menu"
         aria-expanded={menu != null}
         data-testid={testId}
         onClick={() => (menu ? setMenu(null) : open())}

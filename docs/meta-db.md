@@ -45,6 +45,14 @@ longer written by the gateway.
 `NULL` is the base mode. Role package content remains file truth in `.notarium/skills`; the
 meta-DB stores only the episode's current selection.
 
+Role context presets reuse the baseline's existing `context_set_attachments`,
+`context_scope_pins`, and `context_order` tables with `target_kind='role'`. No new migration is
+required: `target_kind` is deliberately text without a closed SQL `CHECK`, and both drivers already
+key every facet by `(target_kind,target_id)`. The opaque role target id deterministically encodes
+the exact owned placement's scope, stable space/project owner id, and package name; `target_space`
+retains purge ownership. The application contract is the closed union
+`personal | project | role`, even though storage remains evolution-friendly text.
+
 Every manifest entry has one contiguous integer version, one snake-case name,
 one SQLite/PostgreSQL file pair, and one checksum over the exact pair of files.
 Versions are zero-padded sequence numbers, not timestamps. Concurrent branches

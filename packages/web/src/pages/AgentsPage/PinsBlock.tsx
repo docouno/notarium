@@ -19,20 +19,24 @@ export const PinEmptyState = ({
   hint,
   onAdd,
   testId,
+  editable = true,
 }: {
   title: string
   hint: string
   onAdd: () => void
   testId: string
+  editable?: boolean
 }) => (
   <EmptyState
     icon={<IconPin size={24} />}
     title={title}
     hint={hint}
     action={
-      <Button onClick={onAdd} data-testid={testId}>
-        <IconPlus size={13} /> Add pinned note
-      </Button>
+      editable ? (
+        <Button onClick={onAdd} data-testid={testId}>
+          <IconPlus size={13} /> Add pinned note
+        </Button>
+      ) : undefined
     }
     testId={`${testId}-empty`}
   />
@@ -49,6 +53,7 @@ export const PinRow = ({
   onOpen,
   onUnpin,
   reorder,
+  editable = true,
 }: {
   pin: ContextPin
   preview?: Preview | null
@@ -56,6 +61,7 @@ export const PinRow = ({
   onOpen: (id: string) => void
   onUnpin: (noteId: string, space?: string) => void
   reorder?: ReorderHandle
+  editable?: boolean
 }) => {
   const meta: string[] = []
 
@@ -75,12 +81,16 @@ export const PinRow = ({
   // (never a scary "remove"/"delete"). Only a destructive set delete is red (#209 UX r5).
   const menu: MenuItem[] = [
     { label: 'Open note', icon: <IconExternal size={15} />, onClick: () => onOpen(pin.noteId) },
-    { divider: true },
-    {
-      label: 'Unpin',
-      icon: <IconPinOff size={15} />,
-      onClick: () => onUnpin(pin.noteId, pin.space),
-    },
+    ...(editable
+      ? [
+          { divider: true } as const,
+          {
+            label: 'Unpin',
+            icon: <IconPinOff size={15} />,
+            onClick: () => onUnpin(pin.noteId, pin.space),
+          },
+        ]
+      : []),
   ]
   return (
     <ContextCard
@@ -114,6 +124,7 @@ export const SetItemRow = ({
   onOpen,
   onRemove,
   reorder,
+  editable = true,
 }: {
   item: ContextSetView['items'][number]
   preview?: Preview | null
@@ -121,6 +132,7 @@ export const SetItemRow = ({
   onOpen: (id: string) => void
   onRemove: () => void
   reorder?: ReorderHandle
+  editable?: boolean
 }) => (
   <ContextCard
     title={
@@ -136,10 +148,14 @@ export const SetItemRow = ({
     summary={preview?.snippet}
     menu={[
       { label: 'Open note', icon: <IconExternal size={15} />, onClick: () => onOpen(item.noteId) },
-      { divider: true },
-      // Reversible (the note can be re-added) → neutral. Scoped to "from set" so it never
-      // reads as deleting the note itself, and named apart from the set's own "Unpin".
-      { label: 'Remove from set', icon: <IconMinus size={15} />, onClick: onRemove },
+      ...(editable
+        ? [
+            { divider: true } as const,
+            // Reversible (the note can be re-added) → neutral. Scoped to "from set" so it never
+            // reads as deleting the note itself, and named apart from the set's own "Unpin".
+            { label: 'Remove from set', icon: <IconMinus size={15} />, onClick: onRemove },
+          ]
+        : []),
     ]}
     reorder={reorder}
     testId="context-set-item"
@@ -161,6 +177,7 @@ export const SetRow = ({
   onRemoveItem,
   onReorderItems,
   reorder,
+  editable = true,
 }: {
   set: ContextSetView
   previews: Record<string, Preview | null>
@@ -172,6 +189,7 @@ export const SetRow = ({
   onRemoveItem: (set: ContextSetView, noteId: string) => void
   onReorderItems: (set: ContextSetView, noteIds: string[]) => void
   reorder?: ReorderHandle
+  editable?: boolean
 }) => {
   const total = set.items.reduce((s, i) => s + i.tokens, 0)
   const trimmed = set.items.some((i) => !i.loaded)
@@ -182,7 +200,7 @@ export const SetRow = ({
   const { handleFor: itemHandle, listProps: itemListProps } = useReorder(
     itemKeys,
     (next) => onReorderItems(set, next),
-    itemKeys.length < 2,
+    !editable || itemKeys.length < 2,
   )
   return (
     <ContextCard
@@ -212,25 +230,34 @@ export const SetRow = ({
                 onOpen={onOpen}
                 onRemove={() => onRemoveItem(set, item.noteId)}
                 reorder={itemHandle(item.noteId)}
+                editable={editable}
               />
             ))
           )}
         </div>
       }
-      menu={[
-        // "Add notes" opens the add-picker for this set; per-item removal lives on each member
-        // row. "Unpin" is the reversible detach from this scope — named like a pin's. The
-        // destructive Delete is set off by a divider and confirmed (in the handler).
-        { label: 'Add notes', icon: <IconPlus size={15} />, onClick: () => onAddNotes(set) },
-        { label: 'Unpin', icon: <IconPinOff size={15} />, onClick: () => onDetach(set) },
-        { divider: true },
-        {
-          label: 'Delete set',
-          icon: <IconTrash size={15} />,
-          danger: true,
-          onClick: () => onDelete(set),
-        },
-      ]}
+      menu={
+        editable
+          ? [
+              // "Add notes" opens the add-picker for this set; per-item removal lives on each member
+              // row. "Unpin" is the reversible detach from this scope — named like a pin's. The
+              // destructive Delete is set off by a divider and confirmed (in the handler).
+              {
+                label: 'Add notes',
+                icon: <IconPlus size={15} />,
+                onClick: () => onAddNotes(set),
+              },
+              { label: 'Unpin', icon: <IconPinOff size={15} />, onClick: () => onDetach(set) },
+              { divider: true },
+              {
+                label: 'Delete set',
+                icon: <IconTrash size={15} />,
+                danger: true,
+                onClick: () => onDelete(set),
+              },
+            ]
+          : undefined
+      }
       reorder={reorder}
       testId="context-set-row"
     />
@@ -257,6 +284,7 @@ export const PinsBlock = ({
   emptyHint,
   addTestId,
   listTestId,
+  editable = true,
 }: {
   pins: ContextPin[] | null
   sets: ContextSetView[] | null
@@ -276,6 +304,7 @@ export const PinsBlock = ({
   emptyHint: string
   addTestId: string
   listTestId: string
+  editable?: boolean
 }) => {
   const trimmedTokens = pins ? pinsTrimmed(pins) : 0
   const empty = pins != null && pins.length === 0 && (sets == null || sets.length === 0)
@@ -296,14 +325,14 @@ export const PinsBlock = ({
   const { handleFor, listProps } = useReorder(
     keys,
     (next) => onReorder(next.map(parseEntryKey)),
-    keys.length < 2,
+    !editable || keys.length < 2,
   )
   return (
     <div className={styles.block}>
       <div className={styles.blockHead}>
         <IconPin size={13} />
         <span>Pinned</span>
-        {!empty && (
+        {!empty && editable && (
           <div className={styles.blockActions}>
             <Button
               variant="ghost"
@@ -326,6 +355,7 @@ export const PinsBlock = ({
           hint={emptyHint}
           onAdd={onAdd}
           testId={addTestId}
+          editable={editable}
         />
       ) : (
         <>
@@ -346,6 +376,7 @@ export const PinsBlock = ({
                   onOpen={onOpen}
                   onUnpin={onUnpin}
                   reorder={handleFor(e.key)}
+                  editable={editable}
                 />
               ) : e.set ? (
                 <SetRow
@@ -360,6 +391,7 @@ export const PinsBlock = ({
                   onRemoveItem={onRemoveItem}
                   onReorderItems={onReorderSetItems}
                   reorder={handleFor(e.key)}
+                  editable={editable}
                 />
               ) : null,
             )}

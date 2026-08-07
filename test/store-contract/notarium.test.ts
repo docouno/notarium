@@ -52,6 +52,37 @@ describeKnowledgeStoreContract('NotariumStore (localfs + sqlite)', async () => {
   }
 })
 
+describe('NotariumStore raw export convergence', () => {
+  it('skips a source that vanishes between inventory and read', async () => {
+    const notesDir = mkdtempSync(join(tmpdir(), 'notarium-export-vanish-'))
+    writeFileSync(join(notesDir, 'note.md'), '---\ntitle: Note\n---\n\nbody')
+    const base = createLocalFsFiles(notesDir)
+    let vanish = false
+    const files: FileStore = {
+      ...base,
+      read: async (path) => (vanish ? null : base.read(path)),
+    }
+    const store = new NotariumStore({
+      mounts: [{ class: 'user-doc', prefix: '', files }],
+      sql: createNodeSqliteDriver(':memory:'),
+    })
+
+    try {
+      await store.list()
+      vanish = true
+      const exported = []
+
+      for await (const entry of store.exportNotes!()) {
+        exported.push(entry)
+      }
+      expect(exported).toEqual([])
+    } finally {
+      await store.stop()
+      rmSync(notesDir, { recursive: true, force: true })
+    }
+  })
+})
+
 // #100 phase 3: the engine resolves a path-form [[oldpath/note]] to a RENAMED folder's
 // note even when the filename is ambiguous — but ONLY once the read-model feeds it
 // the folder path-history (the engine never reads the `.notariummeta` markers).

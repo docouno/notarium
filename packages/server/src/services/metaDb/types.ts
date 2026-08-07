@@ -158,9 +158,9 @@ export type ContextSetRecord = {
   createdAt: string
 }
 
-export type ContextSetTargetKind = 'personal' | 'project'
+export type ContextSetTargetKind = 'personal' | 'project' | 'role'
 
-/** Attaches a set to a scope (personal space or project, by stable id). `targetSpace`
+/** Attaches a set to a scope (personal space, project or owned role placement, by stable id). `targetSpace`
  *  is denormalized so `purgeSpace` drops a space's rows with one indexed delete. */
 export type ContextSetAttachmentRecord = {
   setId: string
@@ -200,7 +200,7 @@ export type ContextSetsPersistence = {
  *  the case a tag can't express. */
 export type ScopePinRecord = {
   targetKind: ContextSetTargetKind
-  /** Personal space id (personal) or project id (project) — stable across rename/move. */
+  /** Personal space id, project id, or a stable owned-role placement key. */
   targetId: string
   /** Scope's space; denormalized so a space purge drops its pins with one indexed delete. */
   targetSpace: string
@@ -231,7 +231,7 @@ export type ContextOrderEntryKind = 'pin' | 'set'
  *  is ignored; a member with no rank sorts last. */
 export type ContextOrderRecord = {
   targetKind: ContextSetTargetKind
-  /** Personal space id (personal) or project id (project) — stable across rename/move. */
+  /** Personal space id, project id, or a stable owned-role placement key. */
   targetId: string
   /** Scope's space; denormalized for a one-indexed-delete space purge. */
   targetSpace: string

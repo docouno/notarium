@@ -1,10 +1,11 @@
 import { z } from 'zod'
 import { CONTEXT_ENTRY_KIND, CONTEXT_KIND } from '../../../consts/context'
+import { ROLE_SCOPE } from '../../../consts/primitives'
 import { enumValues } from '../../../libs/enumValues'
 import { MemoryCategorySchema } from './memory'
+import { EffectiveRoleSummarySchema, RoleNameSchema } from './roles'
 
-/** Where a context set is attached — the owner's `personal` session or a `project`'s
- *  sessions for all its members. */
+/** Where a context facet is attached: base Personal/Project or one exact owned role. */
 export const ContextKindSchema = z.enum(enumValues(CONTEXT_KIND))
 
 /** A scope's ordered sequence entry kind — a `pin` (a note) or a `set`. */
@@ -51,9 +52,8 @@ export const ContextSetRefSchema = z.object({
   title: z.string().nullable(),
 })
 
-/** Where a set is attached (its scope binding). `personal` = the owner's personal
- *  session; `project` = a project's sessions for all its members. `label` is a
- *  display handle (the project handle, or "Personal"). */
+/** Where a set is attached (its scope binding). `label` is a per-reader safe display
+ * handle for Personal, Project, or an exact owned role placement. */
 export const ContextSetAttachmentSchema = z.object({
   kind: ContextKindSchema,
   id: z.string(),
@@ -100,6 +100,44 @@ export const ContextSetViewSchema = z.object({
   order: z.number().int(),
 })
 
+const RoleContextFieldsSchema = {
+  pins: z.array(ContextPinSchema),
+  sets: z.array(ContextSetViewSchema),
+  loadedTokens: z.number().int(),
+}
+
+/** The exact owned role placement selected by the effective-role resolver, plus its
+ * role-only context layer after joint session-budget curation. Personal placements do
+ * not reveal the private personal-space slug; shared placements carry the location the
+ * constructor needs for set ownership and pin labels. */
+export const RoleContextViewSchema = z.discriminatedUnion('scope', [
+  EffectiveRoleSummarySchema.extend({
+    scope: z.literal(ROLE_SCOPE.personal),
+    ...RoleContextFieldsSchema,
+  }),
+  EffectiveRoleSummarySchema.extend({
+    scope: z.literal(ROLE_SCOPE.space),
+    space: z.string(),
+    ...RoleContextFieldsSchema,
+  }),
+  EffectiveRoleSummarySchema.extend({
+    scope: z.literal(ROLE_SCOPE.project),
+    space: z.string(),
+    project: z.string(),
+    ...RoleContextFieldsSchema,
+  }),
+])
+
+/** Optional selector on a context preview. An unavailable/stale name degrades to the
+ * base preview while `roles` still carries the current bounded choices. */
+export const AgentContextQuerySchema = z.object({ role: RoleNameSchema.optional() }).strict()
+
+/** Select the same effective role placement for role-context mutations. A project id is
+ * an internal REST address (not an outward MCP project handle); omitted = personal mode. */
+export const RoleContextTargetQuerySchema = z
+  .object({ projectId: z.string().min(1).optional() })
+  .strict()
+
 /** One entry of a scope's ordered pin+set sequence: kind + stable ref (a pin's note
  *  id / a set's id). A reorder PUT carries the WHOLE new sequence — the server replaces the
  *  order overlay atomically (rank = array index), so a partial write can't leave a torn
@@ -139,6 +177,12 @@ export const ContextPinRequestSchema = z.object({ space: z.string(), noteId: z.s
  *  ONE budget, not a per-channel split. Memory AUDIT stays at /api/me/memory. Read-only;
  *  `self:read`. */
 export const MeAgentContextResponseSchema = z.object({
+  /** Effective roles in personal mode. The catalog is never included. */
+  roles: z.array(EffectiveRoleSummarySchema),
+  rolesTruncated: z.boolean().optional(),
+  /** Present only when the requested role is currently effective. Its layer is loaded
+   * before Personal under the same `P` budget. */
+  role: RoleContextViewSchema.optional(),
   /** Curated pins, loaded-first under `P` (a bloated pin over the budget = loaded:false). */
   pins: z.array(ContextPinSchema),
   /** Eager memory categories, loaded after the pins under the same `P` budget. */
@@ -163,6 +207,12 @@ export const MeAgentContextResponseSchema = z.object({
  *  recall-on-demand, OFF this budget. Plus the read-only AUTO index. `space:read`;
  *  anti-enumeration 404 like its memory twin. Preview does not call MCP delta persistence. */
 export const ProjectAgentContextResponseSchema = z.object({
+  /** Effective roles for this project (`Project > Space > Personal`). */
+  roles: z.array(EffectiveRoleSummarySchema),
+  rolesTruncated: z.boolean().optional(),
+  /** Present only when the requested role is effective here. Loaded before Project and
+   * Personal under the same `Q` budget. */
+  role: RoleContextViewSchema.optional(),
   /** The project's curated pins, loaded-first under `Q`. */
   pins: z.array(ContextPinSchema),
   /** The project's attached context sets, loaded after the project pins,
@@ -208,6 +258,12 @@ export type ContextSetResponse = z.infer<typeof ContextSetResponseSchema>
 export type ContextSetItem = z.infer<typeof ContextSetItemSchema>
 
 export type ContextSetView = z.infer<typeof ContextSetViewSchema>
+
+export type RoleContextView = z.infer<typeof RoleContextViewSchema>
+
+export type AgentContextQuery = z.infer<typeof AgentContextQuerySchema>
+
+export type RoleContextTargetQuery = z.infer<typeof RoleContextTargetQuerySchema>
 
 export type ContextSetCreateRequest = z.infer<typeof ContextSetCreateRequestSchema>
 

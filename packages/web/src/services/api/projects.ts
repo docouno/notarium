@@ -42,8 +42,8 @@ export const projectsApi = {
     ).then((d) => d.categories),
   /** The PROJECT agent-context preview (#165): capped alwaysLoad for the agent,
    *  full pins[] for the UI, plus the read-only auto index. */
-  projectAgentContextGet: (space: string, projectId: string) =>
+  projectAgentContextGet: (space: string, projectId: string, role?: string) =>
     req<ProjectAgentContext>(
-      `${sp(space)}/projects/${encodeURIComponent(projectId)}/agent-context`,
+      `${sp(space)}/projects/${encodeURIComponent(projectId)}/agent-context${role ? `?role=${encodeURIComponent(role)}` : ''}`,
     ),
 }

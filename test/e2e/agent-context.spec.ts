@@ -80,6 +80,13 @@ const WORLD = {
           class: 'user-doc',
           content: '# Scratch\n\nnotes',
         },
+        {
+          id: 'fake-grooming',
+          title: 'Grooming Checklist',
+          filePath: 'grooming.md',
+          class: 'user-doc',
+          content: '# Grooming Checklist\n\nvalidate the pain',
+        },
         // Two about-user memory categories: one loaded, one muted.
         {
           id: 'fake-language',
@@ -105,6 +112,11 @@ const WORLD = {
     { space: 'main', path: 'docs', slug: 'docs', displayName: 'Docs', aliases: ['old-docs'] },
     { space: 'main', path: 'specs', slug: 'specs', displayName: 'Specs' },
   ],
+  agentRoles: [
+    { name: 'research', target: { kind: 'personal', user: 'sam' } },
+    { name: 'grooming', target: { kind: 'personal', user: 'sam' } },
+    { name: 'research', target: { kind: 'project', space: 'main', path: 'docs' } },
+  ],
   auth: {
     users: [
       {
@@ -113,9 +125,15 @@ const WORLD = {
         displayName: 'Sam',
         personalSpace: 'sam-personal',
       },
+      {
+        username: 'robin',
+        password: 'robin-password-1',
+        displayName: 'Robin',
+      },
     ],
     members: [
       { space: 'main', username: 'sam', role: 'owner' },
+      { space: 'main', username: 'robin', role: 'reader' },
       { space: 'sam-personal', username: 'sam', role: 'owner' },
     ],
   },
@@ -238,6 +256,146 @@ test('a project route focuses the project; the Personal tab switches to it inlin
   await expect(page.getByTestId('context-profile')).toBeVisible()
   await expect(page.getByTestId('context-project')).toHaveCount(0)
   await expect(page).toHaveURL(/\/agents\/context\/docs$/)
+})
+
+test('an effective role is a separate first context band with an independent preset', async ({
+  page,
+}) => {
+  await login(page, 'sam', 'sam-password-1')
+  const personalPin = await page.request.put('/api/me/agent-roles/research/context-pins', {
+    data: { space: 'sam-personal', noteId: 'fake-scratch' },
+  })
+  expect(personalPin.ok()).toBe(true)
+  const projectPin = await page.request.put(
+    '/api/me/agent-roles/research/context-pins?projectId=proj-main-docs',
+    { data: { space: 'main', noteId: 'fake-project-scratch' } },
+  )
+  expect(projectPin.ok()).toBe(true)
+
+  await page.goto('/agents/context/personal')
+  await page.getByTestId('context-role-selector').click()
+  await page.getByRole('menuitemradio', { name: 'research · Personal' }).click()
+  await expect(page).toHaveURL(/\/agents\/context\/personal\?role=research$/)
+  await expect(page.getByTestId('context-role')).toBeVisible()
+  await expect(page.getByTestId('context-role-pins')).toContainText('Scratch')
+  await expect(page.getByTestId('context-aggregate-role')).toBeVisible()
+  const aggregate = page.getByTestId('context-aggregate')
+  const total = Number(await aggregate.getAttribute('data-total-loaded-tokens'))
+  const roleLoaded = Number(
+    await page.getByTestId('context-aggregate-role').getAttribute('data-loaded-tokens'),
+  )
+  const personalLoaded = Number(
+    await page.getByTestId('context-aggregate-personal').getAttribute('data-loaded-tokens'),
+  )
+  expect(roleLoaded + personalLoaded).toBe(total)
+
+  // The Context route is space-less, so enter the project through its space first;
+  // this also keeps the test independent from another test's remembered active space.
+  await page.goto('/s/main')
+  await page.getByRole('link', { name: 'Agents' }).click()
+  await page.getByRole('link', { name: 'Docs' }).click()
+  await page.getByTestId('context-role-selector').click()
+  await page.getByRole('menuitemradio', { name: 'research · Project' }).click()
+  await expect(page).toHaveURL(/\/agents\/context\/docs\?role=research$/)
+  await expect(page.getByTestId('context-role')).toBeVisible()
+  await expect(page.getByTestId('context-role-pins')).toContainText('Project Scratch')
+  await expect(
+    page.getByTestId('context-role-pins').getByText('Scratch', { exact: true }),
+  ).toHaveCount(0)
+
+  // A role is an orthogonal context axis: scope navigation preserves the selection
+  // and resolves the same name against the destination's exact placement.
+  await page.getByTestId('context-scope-tab-personal').click()
+  await expect(page).toHaveURL(/\/agents\/context\/personal\?role=research$/)
+  await expect(page.getByTestId('context-role-pins')).toContainText('Scratch')
+  await expect(page.getByTestId('context-role-pins')).not.toContainText('Project Scratch')
+  await page.getByTestId('context-scope-tab-docs').click()
+  await expect(page).toHaveURL(/\/agents\/context\/docs\?role=research$/)
+  await expect(page.getByTestId('context-role-pins')).toContainText('Project Scratch')
+
+  await page.goto('/agents/context/proj-main-docs?role=research')
+  await expect(page).toHaveURL(/\/agents\/context\/docs\?role=research$/)
+  await expect(page.getByTestId('context-role-pins')).toContainText('Project Scratch')
+  await page.getByTestId('context-aggregate-personal').click()
+  await expect(page.getByTestId('context-profile')).toBeVisible()
+
+  await page.getByTestId('context-role-selector').click()
+  await page.getByRole('menuitemradio', { name: 'Base context' }).click()
+  await expect(page).toHaveURL(/\/agents\/context\/docs$/)
+  await expect(page.getByTestId('context-role')).toHaveCount(0)
+  await expect(page.getByTestId('context-project')).toBeVisible()
+})
+
+test('role switching rejects stale responses and an unavailable bookmark normalizes to Base', async ({
+  page,
+}) => {
+  await login(page, 'sam', 'sam-password-1')
+  for (const [role, noteId] of [
+    ['research', 'fake-scratch'],
+    ['grooming', 'fake-grooming'],
+  ] as const) {
+    expect(
+      (
+        await page.request.put(`/api/me/agent-roles/${role}/context-pins`, {
+          data: { space: 'sam-personal', noteId },
+        })
+      ).ok(),
+    ).toBe(true)
+  }
+  await page.route('**/api/me/agent-context?role=research', async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    await route.continue()
+  })
+
+  await page.goto('/agents/context/personal')
+  await page.getByTestId('context-role-selector').click()
+  await page.getByRole('menuitemradio', { name: 'research · Personal' }).click()
+  await page.getByTestId('context-role-selector').click()
+  await page.getByRole('menuitemradio', { name: 'grooming · Personal' }).click()
+  await expect(page).toHaveURL(/\?role=grooming$/)
+  await expect(page.getByTestId('context-role-pins')).toContainText('Grooming Checklist')
+  await expect(page.getByTestId('context-role-pins')).not.toContainText('Scratch')
+  await page.waitForTimeout(400)
+  await expect(page.getByTestId('context-role-pins')).toContainText('Grooming Checklist')
+
+  await page.goto('/agents/context/personal?role=removed-role')
+  await expect(page).toHaveURL(/\/agents\/context\/personal$/)
+  await expect(page.getByTestId('context-profile')).toBeVisible()
+  await expect(page.getByTestId('context-role')).toHaveCount(0)
+})
+
+test('a failed role preview exposes no base mutation surface', async ({ page }) => {
+  await login(page, 'sam', 'sam-password-1')
+  await page.route('**/api/s/main/projects/*/agent-context?role=research', async (route) => {
+    await route.fulfill({ status: 503, body: 'temporarily unavailable' })
+  })
+
+  await page.goto('/s/main')
+  await page.getByRole('link', { name: 'Agents' }).click()
+  await page.getByRole('link', { name: 'Docs' }).click()
+  await page.getByTestId('context-role-selector').click()
+  await page.getByRole('menuitemradio', { name: 'research · Project' }).click()
+  await expect(page.getByTestId('context-error')).toContainText('Couldn’t load project context')
+  await expect(page).toHaveURL(/\/agents\/context\/docs\?role=research$/)
+  await expect(page.getByTestId('context-profile')).toHaveCount(0)
+  await expect(page.getByTestId('context-project')).toHaveCount(0)
+  await expect(page.getByTestId('context-role')).toHaveCount(0)
+  await expect(page.getByTestId('context-add-personal-pin')).toHaveCount(0)
+  await expect(page.getByTestId('context-add-project-pin')).toHaveCount(0)
+  await expect(page.getByTestId('context-add-role-pin')).toHaveCount(0)
+})
+
+test('a reader can inspect a shared role preset without write affordances', async ({ page }) => {
+  await login(page, 'robin', 'robin-password-1')
+  await page.goto('/s/main')
+  await page.getByRole('link', { name: 'Agents' }).click()
+  await page.getByRole('link', { name: 'Docs' }).click()
+  await page.getByTestId('context-role-selector').click()
+  await page.getByRole('menuitemradio', { name: 'research · Project' }).click()
+
+  await expect(page.getByTestId('context-role')).toBeVisible()
+  await expect(page.getByTestId('context-role-readonly')).toBeVisible()
+  await expect(page.getByTestId('context-add-role-pin')).toHaveCount(0)
 })
 
 test('project context shows, adds, and removes project pins', async ({ page }) => {

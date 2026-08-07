@@ -58,6 +58,15 @@ An active named episode fork inherits its parent's selected role; a brand-new ep
 base mode. Resolution is repeated on hydration, so the inherited name may pick a newer narrower
 owned fork in the new project context.
 
+Each owned role placement may also carry a context preset: ordered pins and context sets stored in
+the meta-DB against `(placement scope, stable owner id, role name)`. The preset belongs to the owned
+copy; a catalog template has none and is never effective before Add. Same-name Personal, Space, and
+Project copies therefore keep independent presets, and the exact placement selected for the role
+body selects the preset too. At session load it is the most-specific layer under the existing
+Personal/Project budget (`Role → Project → Personal`), not a separate allowance. It adds no grants
+and no role-scoped memory, delta, or index. Without a meta-DB the file-first role package and its
+instructions still work; only the preset and durable session selection degrade away (P5).
+
 ### agent-memory: structure and behavior <a id="agent-memory"></a>
 - **File-per-category, not file-per-observation** (against micro-files): `remember_about_user(observation, category)` appends into the category file; new categories = new files.
 - **The index is derived (P11/P13)**: assembled by us from the `summary` frontmatter-field of each memory file; not edited by hand; rebuilt by a full-rescan (#69, P2). eager (the index is loaded into the `start_session` bundle) / lazy (the files themselves are pulled in by `recall`).

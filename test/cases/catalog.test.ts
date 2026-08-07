@@ -325,6 +325,7 @@ describe('seed catalog (#175)', () => {
     expect(world.agentRoles).toEqual([
       { name: 'grooming', target: { kind: 'personal', user: 'bob' } },
       { name: 'research', target: { kind: 'personal', user: 'maya' } },
+      { name: 'grooming', target: { kind: 'personal', user: 'maya' } },
       { name: 'research', target: { kind: 'space', space: 'team' } },
       { name: 'research', target: { kind: 'project', space: 'team', path: 'other' } },
       { name: 'research', target: { kind: 'project', space: 'maya-home', path: 'work' } },
@@ -335,6 +336,11 @@ describe('seed catalog (#175)', () => {
     expect(world.agentSessions?.some((session) => session.owner === 'bob')).toBe(false)
     expect(world.spaces.some((space) => space.personalFor === 'fresh')).toBe(false)
     expect(world.auth?.members.some((member) => member.username === 'fresh')).toBe(false)
+    expect(world.auth?.members).toContainEqual({
+      space: 'team',
+      username: 'robin',
+      role: 'reader',
+    })
 
     const fixture = caseToFixture(world)
     expect(fixture.agentRoles).toEqual(world.agentRoles)

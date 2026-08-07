@@ -178,6 +178,59 @@ const rawAppendWithoutApplicationLocks = async (
 }
 
 describePostgres('live Postgres driver', () => {
+  it('round-trips a role target through all three reusable context facets', async () => {
+    const testSchema = await createPostgresTestSchema('role_context_facets')
+    const target = 'project:project%3Aone:research'
+
+    try {
+      await testSchema.db.contextSets.createSet({
+        id: 'role-set',
+        homeSpace: 'space-home',
+        name: 'Role set',
+        items: [{ space: 'space-note', noteId: 'set-note' }],
+        createdAt: '2026-08-07T00:00:00Z',
+      })
+      await testSchema.db.contextSets.attach({
+        setId: 'role-set',
+        targetKind: 'role',
+        targetId: target,
+        targetSpace: 'space-project',
+        createdAt: '2026-08-07T00:00:00Z',
+      })
+      await testSchema.db.scopePins.addPin({
+        targetKind: 'role',
+        targetId: target,
+        targetSpace: 'space-project',
+        noteSpace: 'space-note',
+        noteId: 'role-pin',
+        createdAt: '2026-08-07T00:00:00Z',
+      })
+      await testSchema.db.contextOrder.setOrder('role', target, 'space-project', [
+        { entryKind: 'set', entryRef: 'role-set' },
+        { entryKind: 'pin', entryRef: 'role-pin' },
+      ])
+
+      expect(
+        (await testSchema.db.contextSets.setsForTarget('role', target)).map((set) => set.id),
+      ).toEqual(['role-set'])
+      expect(
+        (await testSchema.db.scopePins.pinsForTarget('role', target)).map((pin) => pin.noteId),
+      ).toEqual(['role-pin'])
+      expect(
+        (await testSchema.db.contextOrder.orderForTarget('role', target)).map((entry) => [
+          entry.entryKind,
+          entry.entryRef,
+          entry.rank,
+        ]),
+      ).toEqual([
+        ['set', 'role-set', 0],
+        ['pin', 'role-pin', 1],
+      ])
+    } finally {
+      await testSchema.teardown()
+    }
+  })
+
   describeGatewayStateContract('Postgres', async () => {
     const testSchema = await createPostgresTestSchema('gateway_contract')
     return { persistence: testSchema.db.gateway, teardown: testSchema.teardown }

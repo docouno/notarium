@@ -17,7 +17,8 @@ export const contextApi = {
   // ── context constructor (#165): preview + pin/mute curation ────────────────
   /** The PERSONAL agent-context preview: capped alwaysLoad for the agent and
    *  full pins[] for the UI (memory is meMemoryGet). */
-  meAgentContextGet: () => req<MeAgentContext>('/api/me/agent-context'),
+  meAgentContextGet: (role?: string) =>
+    req<MeAgentContext>(`/api/me/agent-context${role ? `?role=${encodeURIComponent(role)}` : ''}`),
   /** The agent-retrieval audit (#243): the viewer's own agent search/recall/get_note
    *  history (newest-first, windowed) + whole-history aggregates. `tool` narrows to one
    *  tool; `filter='misses'` keeps only the zero-result calls. */
@@ -156,6 +157,17 @@ export const contextApi = {
     req<{ ok: true }>(`/api/me/context-sets/${encodeURIComponent(id)}`, { method: 'PUT' }),
   contextSetDetachPersonal: (id: string) =>
     req<{ ok: true }>(`/api/me/context-sets/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  /** Attach/detach against the exact effective owned role in personal or project mode. */
+  contextSetAttachRole: (role: string, id: string, projectId?: string) =>
+    req<{ ok: true }>(
+      `/api/me/agent-roles/${encodeURIComponent(role)}/context-sets/${encodeURIComponent(id)}${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''}`,
+      { method: 'PUT' },
+    ),
+  contextSetDetachRole: (role: string, id: string, projectId?: string) =>
+    req<{ ok: true }>(
+      `/api/me/agent-roles/${encodeURIComponent(role)}/context-sets/${encodeURIComponent(id)}${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''}`,
+      { method: 'DELETE' },
+    ),
 
   // ── cross-space pins (#209): a note pinned into a scope from ANOTHER space (the
   // loose sibling of a set). Same-space pins use notePin (the always-load tag). ──
@@ -178,6 +190,17 @@ export const contextApi = {
       `${sp(space)}/projects/${encodeURIComponent(projectId)}/context-pins/${encodeURIComponent(noteId)}`,
       { method: 'DELETE' },
     ),
+  /** Role pins always use the role registry, including notes in the role's own space. */
+  contextPinAttachRole: (role: string, noteSpace: string, noteId: string, projectId?: string) =>
+    req<{ ok: true }>(
+      `/api/me/agent-roles/${encodeURIComponent(role)}/context-pins${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''}`,
+      { method: 'PUT', body: JSON.stringify({ space: noteSpace, noteId }) },
+    ),
+  contextPinDetachRole: (role: string, noteId: string, projectId?: string) =>
+    req<{ ok: true }>(
+      `/api/me/agent-roles/${encodeURIComponent(role)}/context-pins/${encodeURIComponent(noteId)}${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''}`,
+      { method: 'DELETE' },
+    ),
 
   // ── context order (#210): the user's pin+set order per scope (order = load priority),
   // plus a set's own item order (a property of the set, shared across attach points). ──
@@ -193,6 +216,11 @@ export const contextApi = {
       method: 'PUT',
       body: JSON.stringify({ entries }),
     }),
+  contextOrderRole: (role: string, entries: ContextOrderEntry[], projectId?: string) =>
+    req<{ ok: true }>(
+      `/api/me/agent-roles/${encodeURIComponent(role)}/context-order${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''}`,
+      { method: 'PUT', body: JSON.stringify({ entries }) },
+    ),
   /** Reorder a set's items to `noteIds` (a home-space write; `space` = the set's home). */
   contextSetItemsOrder: (space: string, id: string, noteIds: string[]) =>
     req<ContextSetResponse>(`${sp(space)}/context-sets/${encodeURIComponent(id)}/order`, {

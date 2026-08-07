@@ -10,6 +10,7 @@ import {
   AddAgentRoleResponseSchema,
   AgentAuditQuerySchema,
   AgentAuditResponseSchema,
+  AgentContextQuerySchema,
   AgentRoleDetailParamsSchema,
   AgentRoleDetailQuerySchema,
   AgentRoleDetailResponseSchema,
@@ -60,6 +61,7 @@ import {
   RoleAlreadyExistsError,
   RoleDependencyConflictError,
   type RolesService,
+  weighRoleContext,
 } from '../../../../services/roles'
 import {
   curatePersonalScope,
@@ -357,10 +359,12 @@ export const meRoutes = async (
   // peek (no personal-space mint).
   // canon: docs/projects.md#init-context-curation-165-a-idinit-context-curationa
   app.get('/api/me/agent-context', { config: authz('self:read', 'host') }, async (req) => {
+    const query = AgentContextQuerySchema.parse(req.query)
     const slug = await peekPersonalSpace({ auth, spaces }, req.principal)
 
     if (!slug) {
       return MeAgentContextResponseSchema.parse({
+        roles: [],
         pins: [],
         memory: [],
         sets: [],
@@ -374,21 +378,44 @@ export const meRoutes = async (
     // flags match the bundle exactly (never modified-sorted). Sets and cross-space
     // pins resolve under THIS reader — honest degradation (P5).
     const resolveDeps = { store: storeAccess, spaces, contextSets, scopePins, contextOrder }
-    const [tagPins, loosePins, memory, sets, order] = await Promise.all([
+    const roleResolveContext = { personalSpace: slug }
+    const [tagPins, loosePins, memory, sets, order, roleListing, selectedRole] = await Promise.all([
       weighAlwaysLoad(store),
       weighScopePins(resolveDeps, req.principal, { kind: CONTEXT_KIND.personal, id: slug }),
       listMemoryCategories(store, '', { order: 'eager' }),
       weighScopeContextSets(resolveDeps, req.principal, { kind: CONTEXT_KIND.personal, id: slug }),
       weighScopeOrder(resolveDeps, { kind: CONTEXT_KIND.personal, id: slug }),
+      roles
+        ? roles.listEffective(roleResolveContext)
+        : Promise.resolve({ roles: [], truncated: false }),
+      query.role && roles
+        ? roles.resolveEffective(roleResolveContext, query.role)
+        : Promise.resolve(null),
     ])
+    const roleContext = selectedRole
+      ? await weighRoleContext(resolveDeps, req.principal, selectedRole)
+      : undefined
     const curated = curatePersonalScope(
       [...tagPins, ...loosePins],
       sets,
       memory,
       PERSONAL_TOKEN_BUDGET,
       order,
+      roleContext,
     )
+    const roleView =
+      selectedRole && curated.role
+        ? {
+            ...selectedRole.role,
+            pins: curated.role.pins,
+            sets: curated.role.sets,
+            loadedTokens: curated.role.loadedTokens,
+          }
+        : undefined
     return MeAgentContextResponseSchema.parse({
+      roles: roleListing.roles,
+      ...(roleListing.truncated ? { rolesTruncated: true } : {}),
+      ...(roleView ? { role: roleView } : {}),
       pins: curated.pins,
       memory: await withAuthors(curated.memory, req.principal.username, auth.describeAuthor),
       sets: curated.sets,

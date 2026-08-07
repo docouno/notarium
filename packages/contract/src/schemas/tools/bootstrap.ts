@@ -13,6 +13,7 @@ import {
   RESPONSE_FORMAT,
   ResponseFormatSchema,
 } from './primitives'
+import { UseRoleOutputSchema } from './roles'
 
 export const WhoamiInputSchema = z.object({})
 
@@ -127,23 +128,7 @@ export const StartSessionOutputSchema = z.object({
    * continue discovery with list_roles. */
   rolesTruncated: z.boolean().optional(),
   /** Full activation payload when start_session selected a role explicitly. */
-  activeRole: z
-    .object({
-      status: z.enum(['activated', 'already_active']),
-      role: EffectiveRoleSummarySchema,
-      instructions: z.string().optional(),
-      skills: z
-        .array(
-          z.object({
-            name: RoleNameSchema,
-            description: z.string(),
-            instructions: z.string(),
-          }),
-        )
-        .optional(),
-      truncated: z.boolean().optional(),
-    })
-    .optional(),
+  activeRole: UseRoleOutputSchema.optional(),
   projects: z.array(ProjectSummarySchema),
   project: z
     .object({

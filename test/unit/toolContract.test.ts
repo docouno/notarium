@@ -141,6 +141,41 @@ describe('role tool boundaries', () => {
       }).success,
     ).toBe(true)
   })
+
+  it('validates the role slice and full surviving base replacement', () => {
+    const role = { name: 'research', description: 'Research.', scope: 'project' }
+    const note = { noteId: 'note-a', title: 'A' }
+    const context = {
+      alwaysLoad: [note],
+      replacement: {
+        profile: {
+          memory: [{ noteId: 'memory-a', category: 'general', summary: 'Summary.' }],
+          alwaysLoad: [note],
+        },
+        project: { alwaysLoad: [] },
+      },
+      truncated: true,
+    }
+
+    expect(UseRoleOutputSchema.safeParse({ status: 'activated', role, context }).success).toBe(true)
+    expect(
+      UseRoleOutputSchema.safeParse({
+        status: 'already_active',
+        role: { ...role, scope: 'personal' },
+        context: {
+          alwaysLoad: [],
+          replacement: { profile: { memory: [], alwaysLoad: [] } },
+        },
+      }).success,
+    ).toBe(true)
+    expect(
+      UseRoleOutputSchema.safeParse({
+        status: 'activated',
+        role,
+        context: { ...context, alwaysLoad: [{ noteId: 'note-without-title' }] },
+      }).success,
+    ).toBe(false)
+  })
 })
 
 describe('input defaults (session-bootstrap §4, toolset-v1-spec §3)', () => {

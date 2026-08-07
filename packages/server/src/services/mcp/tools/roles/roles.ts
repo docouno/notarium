@@ -7,10 +7,11 @@ import type {
 } from '@notarium/contract/tools'
 
 import type { ProjectRecord } from '../../../metaDb'
-import type { EffectiveRoleContext, LoadedEffectiveRole } from '../../../roles'
+import { type EffectiveRoleContext, type LoadedEffectiveRole } from '../../../roles'
 import { type Ctx, type Handler, ToolFailure } from '../../gateway'
 import { renderRole } from '../../helpers/render'
 import { sanitizeText } from '../../sanitize'
+import { curateAgentContext, useRoleContextFrom } from '../session/agentContext'
 
 const selectorOf = (input: { role?: string; name?: string }, tool: string): string => {
   const count = Number(input.role !== undefined) + Number(input.name !== undefined)
@@ -77,6 +78,7 @@ export const activateRole = async (
   budgetTokens: number,
   preloaded?: LoadedEffectiveRole,
   knownListing?: { roles: RoleSummary[]; truncated: boolean },
+  precuratedContext?: UseRoleOutput['context'],
 ): Promise<UseRoleOutput> => {
   if (!ctx.roles) {
     throw new ToolFailure('roles are unavailable on this host')
@@ -88,8 +90,12 @@ export const activateRole = async (
     assertRoleAvailable(listing.roles, name, listing.truncated)
     throw new ToolFailure(`role "${name}" is not available in this scope`)
   }
+  const contextBundle =
+    precuratedContext ?? useRoleContextFrom(await curateAgentContext(ctx, context.project, loaded))
   let status: UseRoleOutput['status'] = 'activated'
 
+  // Resolve every fallible package/context dependency before changing durable episode
+  // state. A failed activation must never reappear as active on the next resume.
   if (ctx.agentSessions && ctx.session) {
     const set = await ctx.agentSessions.setRole(ctx.session, name)
     status = set.changed ? 'activated' : 'already_active'
@@ -104,6 +110,7 @@ export const activateRole = async (
       description: sanitizeText(skill.description),
       instructions: sanitizeText(skill.instructions),
     })),
+    context: contextBundle,
     ...(loaded.truncated ? { truncated: true } : {}),
   }
 }

@@ -43,7 +43,7 @@ import {
   SPACE_PREFIX,
   spaceRoute,
 } from './libs/routing/routePaths'
-import { AgentsChrome, ContextPage } from './pages/AgentsPage'
+import { AgentsChrome } from './pages/AgentsPage'
 import { FeedPage } from './pages/FeedPage'
 import { FilesPage } from './pages/FilesPage'
 import { FolderPage } from './pages/FolderPage'
@@ -196,7 +196,14 @@ const router = createBrowserRouter([
         children: [
           { index: true, element: <Navigate to={agentContextRoute()} replace /> },
           { path: 'context', element: <Navigate to={agentContextRoute()} replace /> },
-          { path: 'context/:scope', element: <ContextPage /> },
+          {
+            path: 'context/:scope',
+            lazy: async () => {
+              const { ContextPage } = await import('./pages/AgentsPage/ContextPage')
+
+              return { Component: ContextPage }
+            },
+          },
           {
             path: 'sessions',
             lazy: async () => {

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   AddAgentRoleRequestSchema,
   AddAgentRoleResponseSchema,
+  AgentContextQuerySchema,
   AgentRoleDetailRequestSchema,
   AgentRoleDetailResponseSchema,
   BucketsQuerySchema,
@@ -10,6 +11,8 @@ import {
   ConflictResponseSchema,
   contract,
   CreateNoteRequestSchema,
+  DurablePathSchema,
+  DurableScalarSchema,
   ErrorResponseSchema,
   GraphNodeSchema,
   GraphResponseSchema,
@@ -36,6 +39,8 @@ import {
   ProjectsResponseSchema,
   RestoreSpacesRequestSchema,
   RestoreSpacesResponseSchema,
+  RoleContextTargetQuerySchema,
+  RoleContextViewSchema,
   SaveResponseSchema,
   SearchResponseSchema,
   SpaceSlugSchema,
@@ -67,19 +72,23 @@ describe('GET /api/config', () => {
 
 describe('durable write strings', () => {
   it('rejects line-breaking scalars and malformed UTF-16 before storage', () => {
-    const lone = String.fromCharCode(0xd800)
+    const loneHigh = String.fromCharCode(0xd800)
+    const loneLow = String.fromCharCode(0xdc00)
 
     expect(CreateNoteRequestSchema.safeParse({ title: 'a\nb', content: 'body' }).success).toBe(
       false,
     )
-    expect(CreateNoteRequestSchema.safeParse({ title: lone, content: 'body' }).success).toBe(false)
-    expect(CreateNoteRequestSchema.safeParse({ title: 'ok', content: `bad${lone}` }).success).toBe(
+    expect(CreateNoteRequestSchema.safeParse({ title: loneHigh, content: 'body' }).success).toBe(
       false,
     )
     expect(
+      CreateNoteRequestSchema.safeParse({ title: 'ok', content: `bad${loneHigh}` }).success,
+    ).toBe(false)
+    expect(DurableScalarSchema.safeParse(loneLow).success).toBe(false)
+    expect(
       UpdateNoteRequestSchema.safeParse({
         title: 'ok',
-        originalId: `a${lone}`,
+        originalId: `a${loneHigh}`,
         versionToken: 'v1:abc',
       }).success,
     ).toBe(false)
@@ -92,6 +101,18 @@ describe('durable write strings', () => {
         content: '# Заголовок\n\nТекст',
       }).success,
     ).toBe(true)
+  })
+
+  it('accepts portable path components in every UTF-8 width and fences private paths', () => {
+    for (const path of ['ascii/note.md', 'é/note.md', '研/note.md', '🚀/note.md']) {
+      expect(DurablePathSchema.safeParse(path).success).toBe(true)
+    }
+    // Empty and current-directory segments are harmless normalisation forms.
+    expect(DurablePathSchema.safeParse('docs//./note.md').success).toBe(true)
+
+    for (const path of ['/absolute', '../escape', '.hidden/note.md', 'bad:name.md']) {
+      expect(DurablePathSchema.safeParse(path).success).toBe(false)
+    }
   })
 })
 
@@ -582,6 +603,52 @@ describe('agent context constructor (#165)', () => {
     expect(contract.muteNote.request).toBe(MuteNoteRequestSchema)
     expect(contract.muteNote.response).toBe(MuteNoteResponseSchema)
   })
+
+  it('selects previews by a bounded role name and mutations by a non-empty project id', () => {
+    expect(AgentContextQuerySchema.safeParse({}).success).toBe(true)
+    expect(AgentContextQuerySchema.safeParse({ role: 'research' }).success).toBe(true)
+    expect(AgentContextQuerySchema.safeParse({ role: 'Research' }).success).toBe(false)
+    expect(
+      AgentContextQuerySchema.safeParse({ role: 'research', projectId: 'wrong-axis' }).success,
+    ).toBe(false)
+
+    expect(RoleContextTargetQuerySchema.safeParse({}).success).toBe(true)
+    expect(RoleContextTargetQuerySchema.safeParse({ projectId: 'project-docs' }).success).toBe(true)
+    expect(RoleContextTargetQuerySchema.safeParse({ projectId: '' }).success).toBe(false)
+    expect(
+      RoleContextTargetQuerySchema.safeParse({ projectId: 'project-docs', role: 'research' })
+        .success,
+    ).toBe(false)
+  })
+
+  it('validates every exact owned-role placement in a context preview', () => {
+    const fields = {
+      name: 'research',
+      description: 'Research.',
+      pins: [{ noteId: 'note-a', title: 'A', loaded: true, tokens: 12, order: 0 }],
+      sets: [],
+      loadedTokens: 12,
+    }
+
+    expect(RoleContextViewSchema.safeParse({ ...fields, scope: 'personal' }).success).toBe(true)
+    expect(
+      RoleContextViewSchema.safeParse({ ...fields, scope: 'space', space: 'team' }).success,
+    ).toBe(true)
+    expect(
+      RoleContextViewSchema.safeParse({
+        ...fields,
+        scope: 'project',
+        space: 'team',
+        project: 'team/docs',
+      }).success,
+    ).toBe(true)
+
+    expect(RoleContextViewSchema.safeParse({ ...fields, scope: 'space' }).success).toBe(false)
+    expect(
+      RoleContextViewSchema.safeParse({ ...fields, scope: 'project', space: 'team' }).success,
+    ).toBe(false)
+    expect(RoleContextViewSchema.safeParse({ ...fields, scope: 'catalog' }).success).toBe(false)
+  })
 })
 
 describe('agent roles', () => {
@@ -598,5 +665,28 @@ describe('agent roles', () => {
       AgentRoleDetailRequestSchema.safeParse({ name: 'research', scope: 'catalog' }).success,
     ).toBe(true)
     expect(AgentRoleDetailRequestSchema.safeParse({ name: 'research' }).success).toBe(false)
+  })
+
+  it('requires a project only for an exact project placement', () => {
+    expect(
+      AddAgentRoleRequestSchema.safeParse({ name: 'research', scope: 'personal' }).success,
+    ).toBe(true)
+    expect(
+      AddAgentRoleRequestSchema.safeParse({
+        name: 'research',
+        scope: 'project',
+        project: 'team/docs',
+      }).success,
+    ).toBe(true)
+    expect(
+      AddAgentRoleRequestSchema.safeParse({ name: 'research', scope: 'project' }).success,
+    ).toBe(false)
+    expect(
+      AddAgentRoleRequestSchema.safeParse({
+        name: 'research',
+        scope: 'personal',
+        project: 'team/docs',
+      }).success,
+    ).toBe(false)
   })
 })

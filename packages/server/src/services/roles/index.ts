@@ -1,4 +1,5 @@
 export * from './catalog'
+export * from './context'
 export * from './errors'
 export * from './library'
 export * from './roles'

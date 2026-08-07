@@ -54,6 +54,40 @@ export type CuratedSet = {
   items: Array<WeighedSetItem & { loaded: boolean; order: number }>
 }
 
+export type RoleScopeInput = {
+  pins: WeighedPin[]
+  sets: WeighedSet[]
+  order?: ScopeOrder
+}
+
+export type CuratedRoleScope = {
+  pins: CuratedPin[]
+  sets: CuratedSet[]
+  loadedTokens: number
+}
+
+/** Flatten one curated layer into the exact note refs sent to an agent, preserving the
+ * user's group order and the order inside each set. */
+export const loadedContextNotes = (
+  pins: CuratedPin[],
+  sets: CuratedSet[],
+): Array<{ noteId: string; title: string }> => {
+  const groups = [
+    ...pins.map((pin) => ({
+      order: pin.order,
+      items: pin.loaded ? [{ noteId: pin.noteId, title: pin.title }] : [],
+    })),
+    ...sets.map((set) => ({
+      order: set.order,
+      items: set.items
+        .filter((item) => item.loaded)
+        .map((item) => ({ noteId: item.noteId, title: item.title })),
+    })),
+  ]
+
+  return groups.sort((left, right) => left.order - right.order).flatMap((group) => group.items)
+}
+
 /** Resolve + weigh a scope's context sets under ONE reader, honest degradation: `read`
  *  returns null (reader can't reach the item's space, or the note is gone) → that item
  *  DROPS, the set stands. An empty set is KEPT so the pult can still show it.
@@ -296,6 +330,62 @@ const rebucket = (
 const sumLoaded = (arr: ReadonlyArray<{ loaded: boolean; tokens: number }>) =>
   arr.reduce((s, x) => s + (x.loaded ? x.tokens : 0), 0)
 
+type ScopeLayer = {
+  pins: WeighedPin[]
+  sets: WeighedSet[]
+  order: ScopeOrder
+}
+
+type CuratedLayer = {
+  pins: CuratedPin[]
+  sets: CuratedSet[]
+  loadedTokens: number
+}
+
+/** Curate an arbitrary specific→general layer sequence under one envelope. This is the
+ * structural primitive behind Personal, Project→Personal and Role→Project→Personal;
+ * dedup and strict-prefix trimming happen once across the whole live session. */
+const curateLayers = <M extends CuratableMemory>(
+  layers: ScopeLayer[],
+  memory: M[],
+  budget: number,
+): {
+  layers: CuratedLayer[]
+  memory: Array<M & { loaded: boolean }>
+  loadedTokens: number
+  totalTokens: number
+} => {
+  const groups = layers.map((layer, index) =>
+    orderGroups(layer.pins, `layer-${index}-pin`, layer.sets, `layer-${index}-set`, layer.order),
+  )
+  const result = budgetSequence(
+    groups.flatMap((layer) => layer.flatMap((group) => group.entries)),
+    memory,
+    budget,
+  )
+  const curated = layers.map((layer, index): CuratedLayer => {
+    const rebucketed = rebucket(
+      result.entries,
+      groups[index],
+      `layer-${index}-pin`,
+      `layer-${index}-set`,
+      layer.sets,
+    )
+
+    return {
+      ...rebucketed,
+      loadedTokens: sumLoaded([...rebucketed.pins, ...rebucketed.sets.flatMap((set) => set.items)]),
+    }
+  })
+
+  return {
+    layers: curated,
+    memory: result.memory,
+    loadedTokens: result.loadedTokens,
+    totalTokens: result.totalTokens,
+  }
+}
+
 /** Curate a PERSONAL scope: pins + set items in the user's ORDER, then the eager memory
  *  summaries, deduped and trimmed to the SINGLE budget. The order is also the load
  *  PRIORITY — a higher entry survives the trim. */
@@ -305,26 +395,33 @@ export const curatePersonalScope = <M extends CuratableMemory>(
   memory: M[],
   budget: number,
   order: ScopeOrder = [],
+  role?: RoleScopeInput,
 ): {
   pins: CuratedPin[]
   sets: CuratedSet[]
+  role?: CuratedRoleScope
   memory: Array<M & { loaded: boolean }>
   loadedTokens: number
   totalTokens: number
 } => {
-  const groups = orderGroups(pins, 'pin', sets, 'set', order)
-  const res = budgetSequence(
-    groups.flatMap((g) => g.entries),
+  const result = curateLayers(
+    [
+      ...(role ? [{ pins: role.pins, sets: role.sets, order: role.order ?? [] }] : []),
+      { pins, sets, order },
+    ],
     memory,
     budget,
   )
-  const { pins: pinsOut, sets: setsOut } = rebucket(res.entries, groups, 'pin', 'set', sets)
+  const roleLayer = role ? result.layers[0] : undefined
+  const personalLayer = result.layers[role ? 1 : 0]
+
   return {
-    pins: pinsOut,
-    sets: setsOut,
-    memory: res.memory,
-    loadedTokens: res.loadedTokens,
-    totalTokens: res.totalTokens,
+    pins: personalLayer.pins,
+    sets: personalLayer.sets,
+    ...(roleLayer ? { role: roleLayer } : {}),
+    memory: result.memory,
+    loadedTokens: result.loadedTokens,
+    totalTokens: result.totalTokens,
   }
 }
 
@@ -342,9 +439,11 @@ export const curateProjectScope = <M extends CuratableMemory>(
   budget: number,
   projectOrder: ScopeOrder = [],
   personalOrder: ScopeOrder = [],
+  role?: RoleScopeInput,
 ): {
   pins: CuratedPin[]
   sets: CuratedSet[]
+  role?: CuratedRoleScope
   projectLoadedTokens: number
   personal: {
     pins: CuratedPin[]
@@ -355,38 +454,33 @@ export const curateProjectScope = <M extends CuratableMemory>(
   loadedTokens: number
   totalTokens: number
 } => {
-  const projGroups = orderGroups(projectPins, 'projectPin', projectSets, 'projectSet', projectOrder)
-  const persGroups = orderGroups(
-    personalPins,
-    'personalPin',
-    personalSets,
-    'personalSet',
-    personalOrder,
-  )
-  const res = budgetSequence(
-    [...projGroups, ...persGroups].flatMap((g) => g.entries),
+  const result = curateLayers(
+    [
+      ...(role ? [{ pins: role.pins, sets: role.sets, order: role.order ?? [] }] : []),
+      { pins: projectPins, sets: projectSets, order: projectOrder },
+      { pins: personalPins, sets: personalSets, order: personalOrder },
+    ],
     personalMemory,
     budget,
   )
-  const project = rebucket(res.entries, projGroups, 'projectPin', 'projectSet', projectSets)
-  const personal = rebucket(res.entries, persGroups, 'personalPin', 'personalSet', personalSets)
-  const projectItems = [...project.pins, ...project.sets.flatMap((s) => s.items)]
-  const personalItems = [...personal.pins, ...personal.sets.flatMap((s) => s.items)]
-  const projectLoadedTokens = sumLoaded(projectItems)
+  const roleLayer = role ? result.layers[0] : undefined
+  const project = result.layers[role ? 1 : 0]
+  const personal = result.layers[role ? 2 : 1]
   const personalLoadedTokens =
-    sumLoaded(personalItems) + sumLoaded(res.memory.filter((m) => !m.muted))
+    personal.loadedTokens + sumLoaded(result.memory.filter((item) => !item.muted))
   return {
     pins: project.pins,
     sets: project.sets,
-    projectLoadedTokens,
+    ...(roleLayer ? { role: roleLayer } : {}),
+    projectLoadedTokens: project.loadedTokens,
     personal: {
       pins: personal.pins,
       sets: personal.sets,
-      memory: res.memory,
+      memory: result.memory,
       loadedTokens: personalLoadedTokens,
     },
-    loadedTokens: res.loadedTokens,
-    totalTokens: res.totalTokens,
+    loadedTokens: result.loadedTokens,
+    totalTokens: result.totalTokens,
   }
 }
 

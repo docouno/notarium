@@ -11,17 +11,60 @@ import {
   ContextSetResponseSchema,
   ContextSetsResponseSchema,
   OkResponseSchema,
+  RoleContextTargetQuerySchema,
+  RoleNameSchema,
 } from '@notarium/contract'
 import { HTTP_STATUS } from '@notarium/contract/http'
 import { freshNoteId } from '@notarium/core'
 
 import { can } from '../../../../services/authz'
 import type { ContextSetRecord } from '../../../../services/metaDb'
+import {
+  parseRoleContextTarget,
+  type ResolvedEffectiveRole,
+  roleContextTargetOf,
+} from '../../../../services/roles'
+import { peekPersonalSpace } from '../../../../services/spaces'
 import { readNoteAccess } from '../../../../services/storeAccess'
 import { type ApiRouteCtx, authz, notFound, s } from '../_shared'
 
 export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
-  const { contextSets, projects, scopePins, contextOrder, spaces, auth } = ctx
+  const { contextSets, projects, scopePins, contextOrder, spaces, auth, roles } = ctx
+
+  /** Resolve mutations through the same effective-role precedence as REST preview and
+   * MCP activation. `projectId` selects project mode; omitted means personal mode. */
+  const resolveRoleTarget = async (
+    req: FastifyRequest,
+    name: string,
+  ): Promise<ResolvedEffectiveRole | null> => {
+    if (!roles) {
+      return null
+    }
+    const roleName = RoleNameSchema.safeParse(name)
+
+    if (!roleName.success) {
+      return null
+    }
+    const query = RoleContextTargetQuerySchema.parse(req.query)
+    const personalSpace = await peekPersonalSpace({ auth, spaces }, req.principal)
+    const project =
+      query.projectId && projects ? await projects.getById(query.projectId) : undefined
+
+    if (
+      query.projectId &&
+      (!project || !can(req.principal, 'space:read', { space: project.space }))
+    ) {
+      return null
+    }
+
+    return roles.resolveEffective({ personalSpace, ...(project ? { project } : {}) }, roleName.data)
+  }
+
+  /** A personal role is owned by the caller. Shared placements retain their space's
+   * writer gate: selecting a role never expands the caller's rights. */
+  const canWriteRole = (req: FastifyRequest, role: ResolvedEffectiveRole): boolean =>
+    role.location.scope === 'personal' ||
+    can(req.principal, 'space:write', { space: role.location.space })
 
   // ── context sets: named cross-space collections + scope attachments ──
   // canon: docs/projects.md#context-sets-209-reusable-cross-space-bundles
@@ -51,6 +94,56 @@ export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) 
             }
 
             return { kind: CONTEXT_KIND.personal, id: a.targetId, label: 'Personal' }
+          }
+          if (a.targetKind === CONTEXT_KIND.role) {
+            const target = parseRoleContextTarget(a.targetId)
+
+            if (!target) {
+              return null
+            }
+            if (target.scope === 'personal') {
+              if (
+                target.ownerId !== a.targetSpace ||
+                !can(req.principal, 'space:read', { space: target.ownerId })
+              ) {
+                return null
+              }
+
+              return {
+                kind: CONTEXT_KIND.role,
+                id: a.targetId,
+                label: `Role · ${target.name} · Personal`,
+              }
+            }
+            if (target.scope === 'space') {
+              if (
+                target.ownerId !== a.targetSpace ||
+                !can(req.principal, 'space:read', { space: target.ownerId })
+              ) {
+                return null
+              }
+
+              return {
+                kind: CONTEXT_KIND.role,
+                id: a.targetId,
+                label: `Role · ${target.name} · ${spaces.slugOf(target.ownerId) ?? target.ownerId}`,
+              }
+            }
+            const project = projects ? await projects.getById(target.ownerId) : null
+
+            if (
+              !project ||
+              project.space !== a.targetSpace ||
+              !can(req.principal, 'space:read', { space: project.space })
+            ) {
+              return null
+            }
+
+            return {
+              kind: CONTEXT_KIND.role,
+              id: a.targetId,
+              label: `Role · ${target.name} · ${spaces.slugOf(project.space) ?? project.space}/${project.slug}`,
+            }
           }
           const proj = projects ? await projects.getById(a.targetId) : null
 
@@ -414,6 +507,179 @@ export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) 
         }),
       )
       await contextOrder.setOrder('project', proj.id, req.spaceId, entries)
+      return OkResponseSchema.parse({ ok: true })
+    },
+  )
+
+  // ── role presets: the same context facets, keyed by one exact owned placement ──
+
+  app.put(
+    '/api/me/agent-roles/:name/context-sets/:id',
+    { config: authz('self:manage', 'host') },
+    async (req, reply) => {
+      if (!contextSets) {
+        return notFound(reply)
+      }
+      const p = req.params as { name?: string; id?: string }
+      const role = await resolveRoleTarget(req, p.name ?? '')
+
+      if (!role) {
+        return notFound(reply)
+      }
+      if (!canWriteRole(req, role)) {
+        return reply.code(HTTP_STATUS.FORBIDDEN).send({ error: 'forbidden' })
+      }
+      const set = await contextSets.getSet(p.id ?? '')
+
+      if (!set || !can(req.principal, 'space:read', { space: set.homeSpace })) {
+        return notFound(reply)
+      }
+      if (role.location.scope !== 'personal' && (await auth.isPersonalSpace(set.homeSpace))) {
+        return reply.code(HTTP_STATUS.BAD_REQUEST).send({
+          error:
+            'a personal set cannot be attached to a shared role — move it to a shared space first',
+        })
+      }
+      const target = roleContextTargetOf(role)
+      await contextSets.attach({
+        setId: set.id,
+        targetKind: CONTEXT_KIND.role,
+        targetId: target.id,
+        targetSpace: target.space,
+        createdAt: new Date().toISOString(),
+      })
+      return OkResponseSchema.parse({ ok: true })
+    },
+  )
+
+  app.delete(
+    '/api/me/agent-roles/:name/context-sets/:id',
+    { config: authz('self:manage', 'host') },
+    async (req, reply) => {
+      if (!contextSets) {
+        return notFound(reply)
+      }
+      const p = req.params as { name?: string; id?: string }
+      const role = await resolveRoleTarget(req, p.name ?? '')
+
+      if (!role) {
+        return notFound(reply)
+      }
+      if (!canWriteRole(req, role)) {
+        return reply.code(HTTP_STATUS.FORBIDDEN).send({ error: 'forbidden' })
+      }
+      await contextSets.detach(p.id ?? '', CONTEXT_KIND.role, roleContextTargetOf(role).id)
+      return OkResponseSchema.parse({ ok: true })
+    },
+  )
+
+  app.put(
+    '/api/me/agent-roles/:name/context-pins',
+    { config: authz('self:manage', 'host') },
+    async (req, reply) => {
+      if (!scopePins) {
+        return notFound(reply)
+      }
+      const p = req.params as { name?: string }
+      const role = await resolveRoleTarget(req, p.name ?? '')
+
+      if (!role) {
+        return notFound(reply)
+      }
+      if (!canWriteRole(req, role)) {
+        return reply.code(HTTP_STATUS.FORBIDDEN).send({ error: 'forbidden' })
+      }
+      const body = ContextPinRequestSchema.safeParse(req.body ?? {})
+
+      if (!body.success) {
+        return reply
+          .code(HTTP_STATUS.BAD_REQUEST)
+          .send({ error: body.error.issues[0]?.message || 'bad request' })
+      }
+      const hit = await readNoteAccess(
+        ctx.storeAccess,
+        req.principal,
+        body.data.noteId,
+        'note:read',
+      )
+
+      if (!hit) {
+        return notFound(reply)
+      }
+      const target = roleContextTargetOf(role)
+      await scopePins.addPin({
+        targetKind: CONTEXT_KIND.role,
+        targetId: target.id,
+        targetSpace: target.space,
+        noteSpace: hit.space,
+        noteId: hit.noteId,
+        createdAt: new Date().toISOString(),
+      })
+      return OkResponseSchema.parse({ ok: true })
+    },
+  )
+
+  app.delete(
+    '/api/me/agent-roles/:name/context-pins/:noteId',
+    { config: authz('self:manage', 'host') },
+    async (req, reply) => {
+      if (!scopePins) {
+        return notFound(reply)
+      }
+      const p = req.params as { name?: string; noteId?: string }
+      const role = await resolveRoleTarget(req, p.name ?? '')
+
+      if (!role) {
+        return notFound(reply)
+      }
+      if (!canWriteRole(req, role)) {
+        return reply.code(HTTP_STATUS.FORBIDDEN).send({ error: 'forbidden' })
+      }
+      const requestedId = p.noteId ?? ''
+      const live = await readNoteAccess(ctx.storeAccess, req.principal, requestedId, 'note:read')
+      await scopePins.removePin(
+        CONTEXT_KIND.role,
+        roleContextTargetOf(role).id,
+        live?.noteId ?? requestedId,
+      )
+      return OkResponseSchema.parse({ ok: true })
+    },
+  )
+
+  app.put(
+    '/api/me/agent-roles/:name/context-order',
+    { config: authz('self:manage', 'host') },
+    async (req, reply) => {
+      if (!contextOrder) {
+        return notFound(reply)
+      }
+      const p = req.params as { name?: string }
+      const role = await resolveRoleTarget(req, p.name ?? '')
+
+      if (!role) {
+        return notFound(reply)
+      }
+      if (!canWriteRole(req, role)) {
+        return reply.code(HTTP_STATUS.FORBIDDEN).send({ error: 'forbidden' })
+      }
+      const body = ContextOrderRequestSchema.safeParse(req.body ?? {})
+
+      if (!body.success) {
+        return reply
+          .code(HTTP_STATUS.BAD_REQUEST)
+          .send({ error: body.error.issues[0]?.message || 'bad request' })
+      }
+      const entries = await Promise.all(
+        body.data.entries.map(async (entry) => {
+          if (entry.kind !== 'pin') {
+            return { entryKind: entry.kind, entryRef: entry.ref }
+          }
+          const live = await readNoteAccess(ctx.storeAccess, req.principal, entry.ref, 'note:read')
+          return { entryKind: entry.kind, entryRef: live?.noteId ?? entry.ref }
+        }),
+      )
+      const target = roleContextTargetOf(role)
+      await contextOrder.setOrder(CONTEXT_KIND.role, target.id, target.space, entries)
       return OkResponseSchema.parse({ ok: true })
     },
   )

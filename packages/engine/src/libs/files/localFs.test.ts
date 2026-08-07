@@ -348,6 +348,16 @@ describe('localFs remove errors (#262)', () => {
 })
 
 describe('localFs raw export', () => {
+  const exportedPaths = async (files: ReturnType<typeof createLocalFsFiles>) => {
+    const paths: string[] = []
+
+    for await (const entry of files.exportFiles!()) {
+      paths.push(entry.path)
+    }
+
+    return paths
+  }
+
   it('excludes atomic install staging trees at project depth but preserves other dot resources', async () => {
     const root = await mkroot()
     const files = createLocalFsFiles(root)
@@ -389,6 +399,47 @@ describe('localFs raw export', () => {
       '_projects/cHJvamVjdA/ready/SKILL.md',
       '_projects/cHJvamVjdA/ready/assets/.draft.install-550e8400-e29b-41d4-a716-446655440000/resource.bin',
     ])
+  })
+
+  it('skips a directory or file that vanishes during the export walk', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+    await fs.writeFile(join(root, 'note.md'), 'body')
+
+    vi.spyOn(fs, 'readdir').mockRejectedValueOnce(errno('ENOENT'))
+    await expect(exportedPaths(files)).resolves.toEqual([])
+    vi.restoreAllMocks()
+
+    vi.spyOn(fs, 'readFile').mockRejectedValueOnce(errno('ENOENT'))
+    await expect(exportedPaths(files)).resolves.toEqual([])
+  })
+
+  it('propagates a directory read failure that is not a concurrent removal', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+    const denied = errno('EACCES')
+    vi.spyOn(fs, 'readdir').mockRejectedValueOnce(denied)
+
+    await expect(exportedPaths(files)).rejects.toBe(denied)
+  })
+
+  it('propagates a file read failure that is not a concurrent removal', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+    const denied = errno('EACCES')
+    await fs.writeFile(join(root, 'note.md'), 'body')
+    vi.spyOn(fs, 'readFile').mockRejectedValueOnce(denied)
+
+    await expect(exportedPaths(files)).rejects.toBe(denied)
+  })
+})
+
+describe('localFs lexical containment', () => {
+  it('rejects a read that escapes the storage root', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+
+    await expect(files.read('../outside.md')).rejects.toThrow(/path escapes the storage root/)
   })
 })
 

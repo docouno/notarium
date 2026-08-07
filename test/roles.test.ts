@@ -1,13 +1,17 @@
 import { Buffer } from 'node:buffer'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
+import type { Ctx } from '../packages/server/src/services/mcp/gateway'
+import { activateRole } from '../packages/server/src/services/mcp/tools/roles'
 import {
   createInMemoryRoleLibrary,
   createRolesService,
   loadBuiltinRoleCatalog,
   packageRevision,
+  parseRoleContextTarget,
   parseSkillFile,
   RoleAlreadyExistsError,
+  roleContextTargetOf,
   RoleDependencyConflictError,
   type SkillPackage,
   withBuiltinProvenance,
@@ -33,6 +37,56 @@ const skillPkg = (name: string, description: string, body = ''): SkillPackage =>
 })
 
 describe('role catalog and owned libraries', () => {
+  it('does not persist a session role when context assembly fails', async () => {
+    const setRole = vi.fn()
+    const contextFailure = new Error('context store unavailable')
+    const ctx = {
+      roles: {},
+      agentSessions: { setRole },
+      session: {},
+      personalSpace: () => Promise.reject(contextFailure),
+    } as unknown as Ctx
+
+    await expect(
+      activateRole(ctx, { personalSpace: 'personal' }, 'research', 4_000, {
+        role: {
+          name: 'research',
+          description: 'Research.',
+          instructions: 'Research carefully.',
+          scope: 'personal',
+        },
+        skills: [],
+        truncated: false,
+        location: { scope: 'personal', space: 'personal' },
+      }),
+    ).rejects.toBe(contextFailure)
+    expect(setRole).not.toHaveBeenCalled()
+  })
+
+  it('derives one reversible stable context target per exact owned placement', () => {
+    const personal = roleContextTargetOf({
+      role: { name: 'research' },
+      location: { scope: 'personal', space: 'space:one' },
+    })
+    const project = roleContextTargetOf({
+      role: { name: 'research' },
+      location: { scope: 'project', space: 'shared', projectId: 'project:one' },
+    })
+
+    expect(personal.id).not.toBe(project.id)
+    expect(parseRoleContextTarget(personal.id)).toEqual({
+      scope: 'personal',
+      ownerId: 'space:one',
+      name: 'research',
+    })
+    expect(parseRoleContextTarget(project.id)).toEqual({
+      scope: 'project',
+      ownerId: 'project:one',
+      name: 'research',
+    })
+    expect(parseRoleContextTarget('project:broken')).toBeNull()
+  })
+
   it('keeps built-ins discovery-only until Add copies a role and its linked skill', async () => {
     const library = createInMemoryRoleLibrary()
     const roles = createRolesService({ catalog: loadBuiltinRoleCatalog, library })
@@ -66,6 +120,7 @@ describe('role catalog and owned libraries', () => {
     })
     expect(await roles.loadEffective(context, 'grooming', 4_000)).toMatchObject({
       role: { name: 'grooming' },
+      location: { scope: 'personal', space: 'space-personal' },
       skills: [{ name: 'grooming-evidence' }],
       truncated: false,
     })
@@ -115,6 +170,7 @@ describe('role catalog and owned libraries', () => {
         description: 'Project wording.',
         instructions: 'Project rules win.',
       },
+      location: project,
     })
     expect(await roles.loadAt(personal, 'grooming', 4_000)).toMatchObject({
       role: { scope: 'personal', instructions: expect.not.stringContaining('Project rules win.') },

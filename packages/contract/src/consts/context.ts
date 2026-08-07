@@ -1,6 +1,7 @@
 export const CONTEXT_KIND = {
   personal: 'personal',
   project: 'project',
+  role: 'role',
 } as const
 
 export const CONTEXT_ENTRY_KIND = {

@@ -333,6 +333,51 @@ describe('curateProjectScope (#208/#209)', () => {
   })
 })
 
+describe('role-first context curation (#308)', () => {
+  it('loads Role → Project → Personal under one budget and deduplicates to the role', () => {
+    const r = curateProjectScope(
+      [pin('shared', 5), pin('project', 5)],
+      [],
+      [pin('personal', 5)],
+      [],
+      [mem('memory', 5)],
+      16,
+      [],
+      [],
+      { pins: [pin('role', 5), pin('shared', 5)], sets: [] },
+    )
+
+    expect(r.role?.pins.map((item) => [item.noteId, item.loaded])).toEqual([
+      ['role', true],
+      ['shared', true],
+    ])
+    expect(r.pins.map((item) => [item.noteId, item.loaded])).toEqual([['project', true]])
+    expect(r.personal.pins.map((item) => [item.noteId, item.loaded])).toEqual([['personal', false]])
+    expect(r.personal.memory.map((item) => [item.noteId, item.loaded])).toEqual([['memory', false]])
+    expect(r.loadedTokens).toBe(15)
+    expect(r.totalTokens).toBe(25)
+  })
+
+  it('keeps role order independent and applies a strict prefix', () => {
+    const role = {
+      pins: [pin('first', 8), pin('second', 8)],
+      sets: [set('role-set', ['set-note', 8])],
+      order: [
+        { kind: 'set' as const, ref: 'role-set' },
+        { kind: 'pin' as const, ref: 'second' },
+        { kind: 'pin' as const, ref: 'first' },
+      ],
+    }
+    const combined = curatePersonalScope([], [], [], 17, [], role)
+
+    expect(combined.role?.sets[0].items[0].loaded).toBe(true)
+    expect(combined.role?.pins.map((item) => [item.noteId, item.loaded])).toEqual([
+      ['second', true],
+      ['first', false],
+    ])
+  })
+})
+
 describe('order overlay (#210)', () => {
   it('default (no overlay): pins keep insertion order, THEN sets — dense 0-based positions', () => {
     const r = curatePersonalScope([pin('p1', 5), pin('p2', 5)], [set('s', ['a', 5])], [], BIG)

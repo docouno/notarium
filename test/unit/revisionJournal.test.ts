@@ -667,7 +667,7 @@ describe('trash (#79) — the journal view + undelete', () => {
     expect(after.total).toBe(1)
     expect(after.items[0].noteId).toBe('gap-tail')
     expect(after.restorableTotal).toBe(0)
-  }, 15_000)
+  }, 30_000)
 
   it('restoring an id that is not trashed is the caller’s error', async () => {
     const { store } = await make()

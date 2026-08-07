@@ -21,7 +21,8 @@ The names/descriptions the agent sees in `tools/list` are static and live in [de
 - `start_session` — call it **first** in a new session. It opens/resumes an agent episode and, when one episode binds unambiguously, returns `session.id`; retain that id and pass it as the top-level `session` argument on every later session-aware tool. In one round-trip it also returns the user profile (always-load), accessible projects and, with a `project` hint, a **compact index** of the project (a note count + top-level folders — enumerate via `list_notes`), the bound episode's own delta of changes since its last visit and `knownValues`. Without a bound episode (including ambiguous name matching), the delta follows the owner fallback. `acknowledge:false` peeks without advancing but still freezes a bound episode's independent starting position. An acknowledge advances the bound episode plus its owner fallback, or only that fallback when no episode binds; every write is monotonic, so a slower, older concurrent response cannot rewind the next delta window. Not calling it just means less context: the other tools work on their own. Curating WHAT lands in `profile.alwaysLoad`/`project.alwaysLoad` — the Agents → Context section ([docs/projects.md](projects.md#init-context-curation)): manual pins in place (`always-load`), **context sets + cross-space loose pins** and muting memory.
   Its `roles` section contains only compact summaries from libraries the human explicitly owns;
   the packaged catalog is never effective by itself. Pass `role` (`name` is a compatibility alias)
-  to activate one in the same call.
+  to activate one in the same call. Its exact owned placement also selects the role context preset;
+  `activeRole.context.alwaysLoad` carries the role-only loaded refs before the base context.
 - `list_roles` — page through the complete bounded inventory of effective roles after
   `start_session.rolesTruncated:true`, or whenever its compact first page is insufficient. It
   accepts the same project hint and returns only owned Personal/Space/Project roles, never catalog
@@ -30,7 +31,10 @@ The names/descriptions the agent sees in `tools/list` are static and live in [de
   `budgetTokens`. Use the same project handle as `start_session` so
   `Project > Space > Personal` precedence resolves identically. Repeating the selected name is an
   idempotent success, but resolves and reloads the effective package because a narrower fork may
-  now win; an unknown or catalog-only name reports the roles actually available.
+  now win; an unknown or catalog-only name reports the roles actually available. `context` returns
+  the same role-only always-load slice plus `replacement`, the complete surviving base profile and
+  optional project slice. It replaces the base from `start_session`; omitted refs were evicted by
+  the role-first shared-budget scan.
 - `whoami` — who I am and what I may do (principal-id, the read|write ceiling, project memberships) + the engine's `capabilities` (`vector`/`trash`/`revisions`) — so as not to probe blindly.
 - `get_my_projects` — the list of accessible projects with their slugs (for the `project` argument — do not guess the slug). The personal domain is **not** in the list (it is implied by the token).
 
@@ -110,6 +114,15 @@ intentionally the role **name**, not a snapshot of one fork: resolution is repea
 project hint of each bootstrap/activation. A session that moves from Project to Personal may
 therefore load the same-name Personal fork; callers retain and resend the project handle when the
 project-specific role must continue.
+
+The selected owned placement also resolves an optional context preset from the three meta-DB
+facets (`contextSets`, `scopePins`, `contextOrder`). Curation is one strict-prefix scan:
+`Role → Project → Personal` under `Q`, or `Role → Personal` under `P`; there is no role budget.
+`start_session.activeRole.context` exposes the role slice beside the already re-curated top-level
+base bundle. A later `use_role.context` exposes that role slice plus `replacement`, the full
+surviving base after joint dedup/trim; callers replace the earlier base rather than append another
+P/Q allowance. A resumed session rehydrates both instructions and preset. A host without those
+meta-DB facets returns an empty preset while the role package remains usable.
 
 ### Delta positions
 

@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify'
 
 import {
+  AgentContextQuerySchema,
   CONTEXT_KIND,
   MarkProjectRequestSchema,
   PatchProjectRequestSchema,
@@ -21,6 +22,7 @@ import {
   renameProjectSlug,
   unmarkProject,
 } from '../../../../services/projects'
+import { weighRoleContext } from '../../../../services/roles'
 import {
   curateProjectScope,
   listMemoryCategories,
@@ -38,7 +40,7 @@ import { type ApiRouteCtx, authz, notFound, s } from '../_shared'
 
 export const projectsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
   const { projects, markerStore, folders, spaces, spaceStoreFor } = ctx
-  const { storeAccess, contextSets, scopePins, contextOrder, auth } = ctx
+  const { storeAccess, contextSets, scopePins, contextOrder, auth, roles } = ctx
 
   // Mark a folder (or space root, folderPath: '') as a project: write-through the
   // `.notariummeta` marker + upsert the registry row. Idempotent; marking is
@@ -219,6 +221,7 @@ export const projectsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => 
       if (!rec || rec.space !== space) {
         return notFound(reply)
       }
+      const query = AgentContextQuerySchema.parse(req.query)
       const store = await spaceStoreFor(req)
       const resolveDeps = { store: storeAccess, spaces, contextSets, scopePins, contextOrder }
       const [projectTagPins, projectLoose, index, projectSets, projectOrder] = await Promise.all([
@@ -236,6 +239,7 @@ export const projectsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => 
       // domain) embeds nothing.
       const personalSlug = await peekPersonalSpace({ auth, spaces }, req.principal)
       const personalStore = personalSlug ? await spaces.store(personalSlug) : null
+      const roleResolveContext = { personalSpace: personalSlug, project: rec }
       const [personalTagPins, personalLoose, personalMemory, personalSets, personalOrder] =
         personalStore
           ? await Promise.all([
@@ -255,6 +259,17 @@ export const projectsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => 
               }),
             ])
           : [[], [], [], [], []]
+      const [roleListing, selectedRole] = await Promise.all([
+        roles
+          ? roles.listEffective(roleResolveContext)
+          : Promise.resolve({ roles: [], truncated: false }),
+        query.role && roles
+          ? roles.resolveEffective(roleResolveContext, query.role)
+          : Promise.resolve(null),
+      ])
+      const roleContext = selectedRole
+        ? await weighRoleContext(resolveDeps, req.principal, selectedRole)
+        : undefined
       const curated = curateProjectScope(
         projectPins,
         projectSets,
@@ -264,8 +279,38 @@ export const projectsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => 
         PROJECT_TOKEN_BUDGET,
         projectOrder,
         personalOrder,
+        roleContext,
       )
+      const roleView =
+        selectedRole && curated.role
+          ? selectedRole.location.scope === 'personal'
+            ? {
+                ...selectedRole.role,
+                pins: curated.role.pins,
+                sets: curated.role.sets,
+                loadedTokens: curated.role.loadedTokens,
+              }
+            : selectedRole.location.scope === 'space'
+              ? {
+                  ...selectedRole.role,
+                  space: spaces.slugOf(selectedRole.location.space) ?? selectedRole.location.space,
+                  pins: curated.role.pins,
+                  sets: curated.role.sets,
+                  loadedTokens: curated.role.loadedTokens,
+                }
+              : {
+                  ...selectedRole.role,
+                  space: spaces.slugOf(selectedRole.location.space) ?? selectedRole.location.space,
+                  project: projectSummaryOf(rec, spaces.slugOf(rec.space) ?? rec.space).handle,
+                  pins: curated.role.pins,
+                  sets: curated.role.sets,
+                  loadedTokens: curated.role.loadedTokens,
+                }
+          : undefined
       return ProjectAgentContextResponseSchema.parse({
+        roles: roleListing.roles,
+        ...(roleListing.truncated ? { rolesTruncated: true } : {}),
+        ...(roleView ? { role: roleView } : {}),
         pins: curated.pins,
         sets: curated.sets,
         projectLoadedTokens: curated.projectLoadedTokens,

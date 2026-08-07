@@ -1,5 +1,6 @@
 import { z } from 'zod'
 
+import { PinnedNoteSchema } from '../rest/agent/context'
 import { EffectiveRoleSummarySchema, RoleNameSchema } from '../rest/agent/roles'
 import { sessionField } from './_fields'
 import { ProjectHandleSchema } from './primitives'
@@ -49,11 +50,29 @@ export const LoadedRoleSkillSchema = z.object({
   instructions: z.string(),
 })
 
+const EffectiveBaseContextSchema = z.object({
+  profile: z.object({
+    memory: z.array(z.object({ noteId: z.string(), category: z.string(), summary: z.string() })),
+    alwaysLoad: z.array(PinnedNoteSchema),
+  }),
+  project: z.object({ alwaysLoad: z.array(PinnedNoteSchema) }).optional(),
+})
+
 export const UseRoleOutputSchema = z.object({
   status: z.enum(['activated', 'already_active']),
   role: EffectiveRoleSummarySchema,
   instructions: z.string().optional(),
   skills: z.array(LoadedRoleSkillSchema).optional(),
+  /** Exact role slice selected under the session's shared budget. Late activation also
+   * returns the full surviving base replacement: refs absent from it were evicted by the
+   * role-first curation and must no longer be treated as always-load. */
+  context: z
+    .object({
+      alwaysLoad: z.array(PinnedNoteSchema),
+      replacement: EffectiveBaseContextSchema.optional(),
+      truncated: z.boolean().optional(),
+    })
+    .optional(),
   truncated: z.boolean().optional(),
 })
 

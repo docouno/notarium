@@ -48,7 +48,7 @@ export const TOOL_META = {
   },
   use_role: {
     description:
-      'Activate one role already added to the current Personal/Space/Project scope and load its instructions plus linked skills. Use canonical `role`; `name` is a compatibility alias. Pass the same `project` handle used for start_session so project and space overrides resolve correctly. A repeated name is an idempotent already-active success but is resolved and loaded again because a narrower project or space fork may now win. A catalog-only or unknown role is not activated and returns the roles actually available; adding catalog templates is an explicit human action in Notarium.',
+      'Activate one role already added to the current Personal/Space/Project scope and load its instructions, linked skills, role context, and an authoritative replacement for the base context previously returned by start_session. Refs omitted from that replacement are evicted by the shared Role → Project → Personal budget. Use canonical `role`; `name` is a compatibility alias. Pass the same `project` handle used for start_session so project and space overrides resolve correctly. A repeated name is an idempotent already-active success but is resolved and loaded again because a narrower project or space fork may now win. A catalog-only or unknown role is not activated and returns the roles actually available; adding catalog templates is an explicit human action in Notarium.',
     annotations: {
       title: 'Use an added role',
       readOnlyHint: false,

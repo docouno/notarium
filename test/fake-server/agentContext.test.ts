@@ -77,6 +77,10 @@ const fixture = (): Fixture => ({
     { space: 'main', path: 'docs' },
     { space: 'other', path: 'secret' },
   ],
+  agentRoles: [
+    { name: 'research', target: { kind: 'personal', user: 'sam' } },
+    { name: 'research', target: { kind: 'project', space: 'main', path: 'docs' } },
+  ],
   auth: {
     users: [
       {
@@ -85,10 +89,16 @@ const fixture = (): Fixture => ({
         displayName: 'Sam',
         personalSpace: 'sam-personal',
       },
+      {
+        username: 'robin',
+        password: 'robin-password-1',
+        displayName: 'Robin',
+      },
       { username: 'mallory', password: 'mallory-password-1', displayName: 'Mallory' },
     ],
     members: [
       { space: 'main', username: 'sam', role: 'owner' },
+      { space: 'main', username: 'robin', role: 'reader' },
       { space: 'sam-personal', username: 'sam', role: 'owner' },
       { space: 'other', username: 'mallory', role: 'owner' },
     ],
@@ -163,6 +173,34 @@ const getJson = async (url: string, cookie: string) =>
   (await app.inject({ method: 'GET', url, headers: { cookie } })).json()
 const putJson = (url: string, body: unknown, cookie: string) =>
   app.inject({ method: 'PUT', url, headers: { cookie }, payload: body as Record<string, unknown> })
+const sendJson = (method: 'POST' | 'PUT' | 'DELETE', url: string, cookie: string, body?: unknown) =>
+  app.inject({
+    method,
+    url,
+    headers: { cookie },
+    payload: (body ?? {}) as Record<string, unknown>,
+  })
+
+const makeSet = async (
+  cookie: string,
+  homeSpace: string,
+  name: string,
+  items: Array<[string, string]>,
+): Promise<string> => {
+  const created = await sendJson('POST', `/api/s/${homeSpace}/context-sets`, cookie, { name })
+  expect(created.statusCode).toBe(200)
+  const id = created.json().set.id as string
+
+  for (const [space, noteId] of items) {
+    const added = await sendJson('POST', `/api/s/${homeSpace}/context-sets/${id}/items`, cookie, {
+      space,
+      noteId,
+    })
+    expect(added.statusCode).toBe(200)
+  }
+
+  return id
+}
 
 describe('agent-context pult (#165): preview', () => {
   it('PERSONAL agent-context lists the personal-domain always-load pins, not plain notes', async () => {
@@ -392,6 +430,326 @@ describe('agent-context pult (#165): preview', () => {
         })
       ).statusCode,
     ).toBe(404)
+  })
+})
+
+describe('owned role context (#308)', () => {
+  it('keeps role sets and order on their exact placement, detaches, and guards ownership', async () => {
+    const cookie = await loginCookie('sam', 'sam-password-1')
+    const sharedSet = await makeSet(cookie, 'main', 'Role sources', [['main', 'fake-pin-docs']])
+    const personalSet = await makeSet(cookie, 'sam-personal', 'Private sources', [
+      ['sam-personal', 'fake-plain-me'],
+    ])
+
+    expect(
+      (
+        await putJson(
+          '/api/me/agent-roles/research/context-pins',
+          { space: 'sam-personal', noteId: 'fake-plain-me' },
+          cookie,
+        )
+      ).statusCode,
+    ).toBe(200)
+    expect(
+      (
+        await putJson(
+          '/api/me/agent-roles/research/context-pins?projectId=proj-main-docs',
+          { space: 'main', noteId: 'fake-plain-docs' },
+          cookie,
+        )
+      ).statusCode,
+    ).toBe(200)
+    expect(
+      (await sendJson('PUT', `/api/me/agent-roles/research/context-sets/${sharedSet}`, cookie))
+        .statusCode,
+    ).toBe(200)
+    expect(
+      (
+        await sendJson(
+          'PUT',
+          `/api/me/agent-roles/research/context-sets/${sharedSet}?projectId=proj-main-docs`,
+          cookie,
+        )
+      ).statusCode,
+    ).toBe(200)
+
+    expect(
+      (
+        await putJson(
+          '/api/me/agent-roles/research/context-order',
+          {
+            entries: [
+              { kind: 'set', ref: sharedSet },
+              { kind: 'pin', ref: 'fake-plain-me' },
+            ],
+          },
+          cookie,
+        )
+      ).statusCode,
+    ).toBe(200)
+    expect(
+      (
+        await putJson(
+          '/api/me/agent-roles/research/context-order?projectId=proj-main-docs',
+          {
+            entries: [
+              { kind: 'pin', ref: 'fake-plain-docs' },
+              { kind: 'set', ref: sharedSet },
+            ],
+          },
+          cookie,
+        )
+      ).statusCode,
+    ).toBe(200)
+
+    const personal = await getJson('/api/me/agent-context?role=research', cookie)
+    expect(personal.role).toMatchObject({
+      scope: 'personal',
+      pins: [expect.objectContaining({ noteId: 'fake-plain-me', order: 1 })],
+      sets: [
+        expect.objectContaining({
+          id: sharedSet,
+          order: 0,
+          items: [expect.objectContaining({ noteId: 'fake-pin-docs', loaded: true })],
+        }),
+      ],
+    })
+    const project = await getJson(
+      '/api/s/main/projects/proj-main-docs/agent-context?role=research',
+      cookie,
+    )
+    expect(project.role).toMatchObject({
+      scope: 'project',
+      pins: [expect.objectContaining({ noteId: 'fake-plain-docs', order: 0 })],
+      sets: [expect.objectContaining({ id: sharedSet, order: 1 })],
+    })
+
+    expect(
+      (
+        await sendJson(
+          'DELETE',
+          `/api/me/agent-roles/research/context-sets/${sharedSet}?projectId=proj-main-docs`,
+          cookie,
+        )
+      ).statusCode,
+    ).toBe(200)
+    const projectAfterDetach = await getJson(
+      '/api/s/main/projects/proj-main-docs/agent-context?role=research',
+      cookie,
+    )
+    expect(projectAfterDetach.role.sets).toEqual([])
+    const personalAfterDetach = await getJson('/api/me/agent-context?role=research', cookie)
+    expect(personalAfterDetach.role.sets).toEqual([
+      expect.objectContaining({ id: sharedSet, order: 0 }),
+    ])
+
+    const rejected = await sendJson(
+      'PUT',
+      `/api/me/agent-roles/research/context-sets/${personalSet}?projectId=proj-main-docs`,
+      cookie,
+    )
+    expect(rejected.statusCode).toBe(400)
+    expect(rejected.body).toContain('personal set cannot be attached to a shared role')
+  })
+
+  it('keeps same-name role placements independent and sends the effective preset through MCP', async () => {
+    const cookie = await loginCookie('sam', 'sam-password-1')
+    const bearer = await patFor('sam', 'sam-password-1')
+    const projects = await getJson('/api/s/main/projects', cookie)
+    const docs = (projects.projects as Array<{ id: string; slug: string }>).find(
+      (project) => project.slug === 'docs',
+    )!
+
+    expect(
+      (
+        await putJson(
+          '/api/me/agent-roles/research/context-pins',
+          { space: 'sam-personal', noteId: 'fake-plain-me' },
+          cookie,
+        )
+      ).statusCode,
+    ).toBe(200)
+    expect(
+      (
+        await putJson(
+          `/api/me/agent-roles/research/context-pins?projectId=${docs.id}`,
+          { space: 'main', noteId: 'fake-plain-docs' },
+          cookie,
+        )
+      ).statusCode,
+    ).toBe(200)
+
+    const base = await getJson('/api/me/agent-context', cookie)
+    expect(base.roles).toEqual([expect.objectContaining({ name: 'research', scope: 'personal' })])
+    expect(base.role).toBeUndefined()
+
+    const personal = await getJson('/api/me/agent-context?role=research', cookie)
+    expect(personal.role).toMatchObject({
+      name: 'research',
+      scope: 'personal',
+      pins: [expect.objectContaining({ noteId: 'fake-plain-me' })],
+    })
+    const project = await getJson(
+      `/api/s/main/projects/${docs.id}/agent-context?role=research`,
+      cookie,
+    )
+    expect(project.role).toMatchObject({
+      name: 'research',
+      scope: 'project',
+      pins: [expect.objectContaining({ noteId: 'fake-plain-docs' })],
+    })
+    expect(project.role.pins.map((pin: { noteId: string }) => pin.noteId)).not.toContain(
+      'fake-plain-me',
+    )
+
+    const started = structured(
+      await callTool(
+        'start_session',
+        { project: 'main/docs', role: 'research', responseFormat: 'detailed' },
+        bearer,
+      ),
+    )
+    expect(started.activeRole).toMatchObject({
+      role: { name: 'research', scope: 'project' },
+      context: { alwaysLoad: [{ noteId: 'fake-plain-docs', title: 'Docs Readme' }] },
+    })
+    expect(
+      (started.profile as { alwaysLoad: Array<{ noteId: string }> }).alwaysLoad,
+    ).toContainEqual(expect.objectContaining({ noteId: 'fake-pin-me' }))
+    expect(
+      (started.project as { alwaysLoad: Array<{ noteId: string }> }).alwaysLoad,
+    ).toContainEqual(expect.objectContaining({ noteId: 'fake-pin-docs' }))
+    const used = structured(
+      await callTool(
+        'use_role',
+        { project: 'main/docs', role: 'research', budgetTokens: 4_000 },
+        bearer,
+      ),
+    )
+    expect(used.context).toMatchObject({
+      alwaysLoad: (started.activeRole as { context: { alwaysLoad: Array<{ noteId: string }> } })
+        .context.alwaysLoad,
+      replacement: {
+        profile: started.profile,
+        project: {
+          alwaysLoad: (started.project as { alwaysLoad: Array<{ noteId: string }> }).alwaysLoad,
+        },
+      },
+    })
+  })
+
+  it('rejects an empty projectId instead of mutating the Personal role preset', async () => {
+    const cookie = await loginCookie('sam', 'sam-password-1')
+    const response = await putJson(
+      '/api/me/agent-roles/research/context-pins?projectId=',
+      { space: 'sam-personal', noteId: 'fake-plain-me' },
+      cookie,
+    )
+
+    expect(response.statusCode).toBe(400)
+    const preview = await getJson('/api/me/agent-context?role=research', cookie)
+    expect(preview.role.pins).toEqual([])
+  })
+
+  it('returns a full base replacement when late role activation evicts a bootstrap pin', async () => {
+    await app.close()
+    const f = fixture()
+    const personal = f.spaces.find((candidate) => candidate.slug === 'sam-personal')!
+    const baseTokens = Math.floor(PERSONAL_TOKEN_BUDGET * 0.5)
+    const roleTokens = Math.floor(PERSONAL_TOKEN_BUDGET * 0.75)
+    personal.notes.push(
+      {
+        id: 'fake-base-heavy',
+        title: 'Heavy base reference',
+        class: 'user-doc',
+        filePath: 'heavy-base.md',
+        tags: ['always-load'],
+        content: 'b'.repeat(baseTokens * 4),
+      },
+      {
+        id: 'fake-role-heavy',
+        title: 'Heavy role reference',
+        class: 'user-doc',
+        filePath: 'heavy-role.md',
+        content: 'r'.repeat(roleTokens * 4),
+      },
+    )
+    app = await createApp(f)
+    port = await listen(app)
+
+    const cookie = await loginCookie('sam', 'sam-password-1')
+    const bearer = await patFor('sam', 'sam-password-1')
+    expect(
+      (
+        await putJson(
+          '/api/me/agent-roles/research/context-pins',
+          { space: 'sam-personal', noteId: 'fake-role-heavy' },
+          cookie,
+        )
+      ).statusCode,
+    ).toBe(200)
+    const started = structured(await callTool('start_session', {}, bearer))
+    const sessionId = (started.session as { id: string }).id
+    expect(
+      (started.profile as { alwaysLoad: Array<{ noteId: string }> }).alwaysLoad.map(
+        (note) => note.noteId,
+      ),
+    ).toContain('fake-base-heavy')
+
+    const activated = structured(
+      await callTool('use_role', { role: 'research', session: sessionId }, bearer),
+    )
+    const context = activated.context as {
+      alwaysLoad: Array<{ noteId: string }>
+      replacement: { profile: { alwaysLoad: Array<{ noteId: string }> } }
+    }
+    expect(context.alwaysLoad.map((note) => note.noteId)).toContain('fake-role-heavy')
+    expect(context.replacement.profile.alwaysLoad.map((note) => note.noteId)).not.toContain(
+      'fake-base-heavy',
+    )
+  })
+
+  it('resolves a Space placement and degrades only its preset when context facets are absent', async () => {
+    await app.close()
+    const f = fixture()
+    f.projects!.push({ space: 'main', path: 'space-scope' })
+    f.agentRoles!.push({ name: 'research', target: { kind: 'space', space: 'main' } })
+    f.noContextFacets = true
+    app = await createApp(f)
+    port = await listen(app)
+
+    const bearer = await patFor('sam', 'sam-password-1')
+    const started = structured(
+      await callTool('start_session', { project: 'main/space-scope', role: 'research' }, bearer),
+    )
+    expect(started.activeRole).toMatchObject({
+      role: { name: 'research', scope: 'space' },
+      context: { alwaysLoad: [] },
+    })
+    const used = structured(
+      await callTool('use_role', { project: 'main/space-scope', role: 'research' }, bearer),
+    )
+    expect(used).toMatchObject({
+      role: { name: 'research', scope: 'space' },
+      instructions: expect.stringContaining('Research'),
+      context: { alwaysLoad: [], replacement: { profile: expect.any(Object) } },
+    })
+  })
+
+  it('does not let role selection expand a reader into a role-context writer', async () => {
+    const cookie = await loginCookie('robin', 'robin-password-1')
+    const response = await putJson(
+      '/api/me/agent-roles/research/context-pins?projectId=proj-main-docs',
+      { space: 'main', noteId: 'fake-plain-docs' },
+      cookie,
+    )
+
+    expect(response.statusCode).toBe(403)
+    const preview = await getJson(
+      '/api/s/main/projects/proj-main-docs/agent-context?role=research',
+      cookie,
+    )
+    expect(preview.role).toMatchObject({ name: 'research', scope: 'project', pins: [] })
   })
 })
 

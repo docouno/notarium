@@ -122,7 +122,7 @@ test('An active role name does not falsely mark both same-name forks active', as
   await expect(
     page.getByRole('button', { name: 'Add built-in research role', exact: true }),
   ).toBeVisible()
-  await expect(page.getByTestId('agents-tab-roles')).toContainText('4+ roles · research active')
+  await expect(page.getByTestId('agents-tab-roles')).toContainText('5+ roles · research active')
   await expect(page.getByText('Active session')).toHaveCount(0)
 })
 

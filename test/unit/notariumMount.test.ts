@@ -5,7 +5,7 @@
 // agent-memory poisoning, even if the host boundary were bypassed); legitimate
 // agent/user writes land in the right class.
 
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -36,6 +36,10 @@ const classOf = async (filePath: string) =>
   (await store.list()).find((n) => n.filePath === filePath)?.class
 
 describe('NotariumStore mounts & class (#78)', () => {
+  it('requires at least one physical mount', () => {
+    expect(() => createNotariumStore({})).toThrow(/requires `mounts` or `notesDir`/)
+  })
+
   it('materializes class from the target mount and places files on disk', async () => {
     const u = await store.write({ title: 'Doc', content: 'x', directory: 'notes' })
     const m = await store.write({ title: 'Pref', content: 'y', targetClass: 'agent-memory' })
@@ -129,6 +133,52 @@ describe('NotariumStore mounts & class (#78)', () => {
     } finally {
       await s2.stop()
       rmSync(d2, { recursive: true, force: true })
+    }
+  })
+
+  it('exports every skill resource as preserved bytes only in the all-files scope', async () => {
+    const skillDir = join(dir, '.roles-library')
+    const resource = Buffer.from([0, 255, 1])
+    mkdirSync(join(skillDir, 'research', 'assets'), { recursive: true })
+    writeFileSync(join(skillDir, 'research', 'SKILL.md'), '# Research')
+    writeFileSync(join(skillDir, 'research', 'assets', 'model.bin'), resource)
+    const exporting = createNotariumStore({
+      mounts: [
+        { class: 'user-doc', dir, prefix: '' },
+        { class: 'skill', dir: skillDir, prefix: '.roles-library' },
+      ],
+    })
+
+    try {
+      const userEntries = []
+
+      for await (const entry of exporting.exportNotes!()) {
+        userEntries.push(entry)
+      }
+      expect(userEntries).toEqual([])
+
+      const allEntries = []
+
+      for await (const entry of exporting.exportNotes!({ scope: 'all' })) {
+        allEntries.push(entry)
+      }
+      expect(allEntries).toHaveLength(2)
+      expect(allEntries).toEqual(
+        expect.arrayContaining([
+          {
+            path: '.roles-library/research/SKILL.md',
+            content: Buffer.from('# Research'),
+            preserveBytes: true,
+          },
+          {
+            path: '.roles-library/research/assets/model.bin',
+            content: resource,
+            preserveBytes: true,
+          },
+        ]),
+      )
+    } finally {
+      await exporting.stop()
     }
   })
 

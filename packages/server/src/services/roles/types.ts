@@ -36,6 +36,13 @@ export type LoadedRole = {
 }
 export type LoadedEffectiveRole = Omit<LoadedRole, 'role'> & {
   role: EffectiveRoleSummary & { instructions: string }
+  /** Exact owned placement whose package won `Project > Space > Personal`. */
+  location: RoleLocation
+}
+
+export type ResolvedEffectiveRole = {
+  role: EffectiveRoleSummary
+  location: RoleLocation
 }
 
 export type RoleInventoryEntry = RoleSummary & {
@@ -50,6 +57,10 @@ export type RolesService = {
   hasCatalog(name: string): Promise<boolean>
   listAt(location: RoleLocation): Promise<BoundedRoleList<RoleInventoryEntry>>
   listEffective(context: EffectiveRoleContext): Promise<BoundedRoleList<EffectiveRoleSummary>>
+  resolveEffective(
+    context: EffectiveRoleContext,
+    name: string,
+  ): Promise<ResolvedEffectiveRole | null>
   loadCatalog(name: string, budgetTokens: number): Promise<LoadedRole | null>
   loadAt(location: RoleLocation, name: string, budgetTokens: number): Promise<LoadedRole | null>
   loadEffective(

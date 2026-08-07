@@ -165,6 +165,38 @@ export const renderRole = (loaded: UseRoleOutput): string => {
   for (const skill of loaded.skills ?? []) {
     lines.push('', `## Linked skill: ${skill.name}`, '', skill.instructions)
   }
+  if (loaded.context?.alwaysLoad.length) {
+    lines.push('', '**Role context:**')
+    for (const note of loaded.context.alwaysLoad) {
+      lines.push(`- ${note.title} \`${note.noteId}\``)
+    }
+  }
+  if (loaded.context?.replacement) {
+    const { profile, project } = loaded.context.replacement
+    lines.push(
+      '',
+      '**Effective base context (replaces the base from `start_session`; omitted refs are evicted):**',
+    )
+    for (const memory of profile.memory) {
+      lines.push(`- memory _${memory.category}_: ${memory.summary}`)
+    }
+    for (const note of profile.alwaysLoad) {
+      lines.push(`- profile: ${note.title} \`${note.noteId}\``)
+    }
+    for (const note of project?.alwaysLoad ?? []) {
+      lines.push(`- project: ${note.title} \`${note.noteId}\``)
+    }
+    if (
+      profile.memory.length === 0 &&
+      profile.alwaysLoad.length === 0 &&
+      (project?.alwaysLoad.length ?? 0) === 0
+    ) {
+      lines.push('- _(empty)_')
+    }
+  }
+  if (loaded.context?.truncated) {
+    lines.push('', '_(effective context truncated by the shared session budget)_')
+  }
   if (loaded.truncated) {
     lines.push('', '_(role bundle truncated to the requested token budget)_')
   }

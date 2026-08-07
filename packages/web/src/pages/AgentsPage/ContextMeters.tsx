@@ -67,7 +67,12 @@ export const AggregateBar = ({
   const headroom = Math.max(0, budgetTokens - totalLoaded)
   const pct = (t: number) => `${(t / scale) * 100}%`
   return (
-    <div className={styles.aggregate} data-testid={testId}>
+    <div
+      className={styles.aggregate}
+      data-testid={testId}
+      data-total-loaded-tokens={totalLoaded}
+      data-budget-tokens={budgetTokens}
+    >
       <div className={styles.aggregateHead}>
         <span className={styles.aggregateTitle}>Context load</span>
         <span className={styles.aggregateValue}>
@@ -97,6 +102,7 @@ export const AggregateBar = ({
             type="button"
             role="tab"
             aria-selected={s.key === activeScope}
+            data-loaded-tokens={s.loaded}
             className={cx(styles.tab, s.key === activeScope && styles.tabActive)}
             onClick={() => onSelect(s.key)}
             data-testid={`${testId}-${s.key}`}

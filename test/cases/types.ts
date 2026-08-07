@@ -162,12 +162,14 @@ export type AgentSessionDecl = {
 
 /** One owned fork from the read-only built-in role catalog. The declaration
  * addresses product scopes; both seed appliers resolve them to stable ids. */
+export type AgentRoleTargetDecl =
+  | { kind: 'personal'; user?: string }
+  | { kind: 'space'; space: string }
+  | { kind: 'project'; space: string; path: string }
+
 export type AgentRoleDecl = {
   name: string
-  target:
-    | { kind: 'personal'; user?: string }
-    | { kind: 'space'; space: string }
-    | { kind: 'project'; space: string; path: string }
+  target: AgentRoleTargetDecl
 }
 
 /** One durable delta position. `throughNote` resolves to that note's latest
@@ -311,10 +313,13 @@ export type CaseEvent = (
   | { op: 'restore'; date: CaseDate; space: string; noteId: string; principal?: string }
 ) & { agentAudit?: AgentWriteAuditDecl }
 
-/** Where a seeded context set (#209) is attached: a user's personal scope, or a
- *  project (addressed by space slug + folder path, resolved to its id at apply). */
+/** Where seeded context facets attach: a user's Personal scope, a Project, or one exact
+ * owned role placement. Role targets deliberately reuse AgentRoleTargetDecl so a
+ * same-name Personal/Space/Project fork receives an independent preset. */
 export type ContextSetAttachDecl =
-  { kind: 'personal'; user: string } | { kind: 'project'; space: string; path: string }
+  | { kind: 'personal'; user: string }
+  | { kind: 'project'; space: string; path: string }
+  | { kind: 'role'; name: string; target: AgentRoleTargetDecl }
 
 /** A seeded context set (#209): a named cross-space collection of notes (referenced by
  *  their LOGICAL note ids from `b.note(...)`), homed in a space, attached to scopes.

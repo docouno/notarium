@@ -303,6 +303,22 @@ export const createRolesService = ({
       }
     },
 
+    resolveEffective: async (context, name) => {
+      const hit = await directOwnedPackage(locationsFor(context), name)
+
+      if (!hit?.parsed.skill.role) {
+        return null
+      }
+
+      return {
+        role: {
+          ...summaryOf(hit.parsed, hit.location.scope),
+          scope: hit.location.scope,
+        },
+        location: hit.location,
+      }
+    },
+
     loadCatalog: async (name, budgetTokens) => {
       const packages = await catalogPackages()
       const role = packages.find(({ skill }) => skill.role && skill.name === name)
@@ -366,7 +382,7 @@ export const createRolesService = ({
         return null
       }
 
-      return (await loadParsedRole(
+      const loaded = (await loadParsedRole(
         hit.parsed,
         hit.location.scope,
         async (skillName) => {
@@ -374,7 +390,9 @@ export const createRolesService = ({
           return dependencyHit?.parsed
         },
         budgetTokens,
-      )) as LoadedEffectiveRole
+      )) as Omit<LoadedEffectiveRole, 'location'>
+
+      return { ...loaded, location: hit.location }
     },
 
     addFromCatalog: async (name, location) => {
