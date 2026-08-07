@@ -33,6 +33,14 @@ export const makeOwnerRemap = (catalogOwner: string, ownerUser: string): OwnerRe
   return { asUser, remapPrincipal }
 }
 
+/** The convenience grant that makes a manual stand browsable must not punch
+ * through personal-domain isolation. Explicit case memberships remain explicit. */
+export const shouldAutoGrantSeedOwner = (input: {
+  personalFor?: string
+  primaryUsername: string
+  asUser: (name: string) => string
+}): boolean => !input.personalFor || input.asUser(input.personalFor) === input.primaryUsername
+
 export const resolveSeedAgentDeltaCursorOwner = (input: {
   cursorOwner?: string
   sessionOwner?: string

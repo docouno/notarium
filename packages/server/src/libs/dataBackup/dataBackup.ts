@@ -29,6 +29,7 @@ import { Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { type Entry, openPromise, type ZipFile } from 'yauzl'
 
+import { isAtomicInstallTempPath } from '@notarium/core'
 import { buildInfo } from '../buildInfo'
 import { publishArchive } from './archivePublication'
 
@@ -208,8 +209,39 @@ const syncTree = async (root: string): Promise<void> => {
   }
 }
 
-const transient = (archiveRoot: string, relPath: string, name: string): boolean =>
-  ATOMIC_NOTE_TEMP.test(name) ||
+const underRoleSkills = (archiveRoot: string, relPath: string): boolean => {
+  if (archiveRoot !== `${DATA}/spaces`) {
+    return false
+  }
+  const parts = relPath.split('/')
+  const mount = parts.indexOf('.notarium')
+
+  return mount === 1 && parts[mount + 1] === 'skills'
+}
+
+const roleInstallStagingDirectory = (
+  archiveRoot: string,
+  relPath: string,
+  name: string,
+  directory: boolean,
+): boolean => {
+  if (!directory || !underRoleSkills(archiveRoot, relPath)) {
+    return false
+  }
+  const parts = relPath.split('/')
+  const mount = parts.indexOf('.notarium')
+
+  return isAtomicInstallTempPath(parts.slice(mount + 2).join('/'))
+}
+
+const transient = (
+  archiveRoot: string,
+  relPath: string,
+  name: string,
+  directory: boolean,
+): boolean =>
+  (ATOMIC_NOTE_TEMP.test(name) && !underRoleSkills(archiveRoot, relPath)) ||
+  roleInstallStagingDirectory(archiveRoot, relPath, name, directory) ||
   (archiveRoot === `${DATA}/jobs` && (IMPORT_PART.test(relPath) || EXPORT_PART.test(relPath)))
 
 const retryableMutation = (err: unknown): boolean => {
@@ -340,6 +372,9 @@ const walk = async (
       if (!validArchivePath(`${archiveRoot}/${relPath}`)) {
         throw new Error(`source path cannot be represented safely in a backup: ${source}`)
       }
+      if (!includeTransient && transient(archiveRoot, relPath, entry.name, entry.isDirectory())) {
+        continue
+      }
       const sourceInfo = await lstat(source)
 
       if (sourceInfo.isSymbolicLink()) {
@@ -351,9 +386,6 @@ const walk = async (
       }
       if (!sourceInfo.isFile()) {
         throw new Error(`refusing to back up non-regular file: ${source}`)
-      }
-      if (!includeTransient && transient(archiveRoot, relPath, entry.name)) {
-        continue
       }
       const destination = copyRoot ? join(copyRoot, relPath) : source
       const handle = await open(source, constants.O_RDONLY | constants.O_NOFOLLOW)

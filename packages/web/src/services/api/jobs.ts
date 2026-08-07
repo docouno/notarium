@@ -8,7 +8,8 @@ export const jobsApi = {
    *  streams to disk) — never fetched into memory, so a large base never sits in
    *  the tab. `frontmatter:'strip'` drops the YAML block (a clean reading copy;
    *  default keeps the full file, incl. notarium-id → round-trippable); `scope:'all'`
-   *  adds the agent's private memory mount for a full backup (default: notes only). */
+   *  adds hidden agent-memory and complete role/skill package mounts to the space
+   *  export (default: notes only; accounts/history/jobs are never included). */
   exportUrl: (
     space: string,
     opts: { frontmatter?: 'keep' | 'strip'; scope?: 'user' | 'all'; folder?: string } = {},

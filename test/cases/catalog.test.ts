@@ -306,6 +306,30 @@ describe('seed catalog (#175)', () => {
     expect(fixture.agentSessions?.some((session) => session.id === fork?.parentId)).toBe(true)
   })
 
+  it('agent-roles keeps catalog-only, owned-idle, and owned-active states distinct', () => {
+    const world = buildCaseWorld('agent-roles', { now: DEFAULT_NOW })
+
+    expect(world.agentRoles).toEqual([
+      { name: 'grooming', target: { kind: 'personal', user: 'bob' } },
+      { name: 'research', target: { kind: 'personal', user: 'maya' } },
+      { name: 'research', target: { kind: 'space', space: 'team' } },
+      { name: 'research', target: { kind: 'project', space: 'team', path: 'other' } },
+      { name: 'research', target: { kind: 'project', space: 'maya-home', path: 'work' } },
+    ])
+    expect(world.agentSessions).toContainEqual(
+      expect.objectContaining({ owner: 'maya', role: 'research' }),
+    )
+    expect(world.agentSessions?.some((session) => session.owner === 'bob')).toBe(false)
+    expect(world.spaces.some((space) => space.personalFor === 'fresh')).toBe(false)
+    expect(world.auth?.members.some((member) => member.username === 'fresh')).toBe(false)
+
+    const fixture = caseToFixture(world)
+    expect(fixture.agentRoles).toEqual(world.agentRoles)
+    expect(fixture.agentSessions?.find((session) => session.owner === 'maya')?.role).toBe(
+      'research',
+    )
+  })
+
   it('rejects a delta cursor anchored in another project revision stream', () => {
     const world = buildCaseWorld('agent-sessions', { now: DEFAULT_NOW })
     const cursors = world.agentDeltaCursors ?? []

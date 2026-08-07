@@ -443,6 +443,7 @@ describe('SqliteMetaDb', () => {
         createdAt: 'x',
         lastSeenAt: 'x',
         calls: 1,
+        role: null,
       })
       const sessionCursor = {
         owner: 'al',

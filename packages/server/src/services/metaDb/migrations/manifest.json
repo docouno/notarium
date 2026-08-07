@@ -14,6 +14,13 @@
       "checksum": "sha256:74620f6e4195ac194358c12c078f698b05192c3a02678dc6f1ad0b6dad3849b0",
       "sqlite": "sqlite/0001_agent_sessions.sql",
       "postgres": "postgres/0001_agent_sessions.sql"
+    },
+    {
+      "version": 2,
+      "name": "agent_session_role",
+      "checksum": "sha256:f543adeacab17bad0aefeaa8d876e3432d762d5fc54020c67478c2c499976bb6",
+      "sqlite": "sqlite/0002_agent_session_role.sql",
+      "postgres": "postgres/0002_agent_session_role.sql"
     }
   ]
 }

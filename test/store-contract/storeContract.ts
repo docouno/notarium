@@ -14,6 +14,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { SyncStatusSchema } from '@notarium/contract'
 import {
   encodeWikilinkIdentity,
+  type ExportEntry,
   IF_EXISTS,
   type KnowledgeStore,
   type NoteMeta,
@@ -1617,12 +1618,12 @@ export const describeKnowledgeStoreContract = (
     // ── Base export: stream every note as its on-disk file (raw frontmatter
     //    + body), path = filePath. Optional on the port (an engine that can't
     //    enumerate files omits it); skipped when absent. `scope` reuses the
-    //    visibility axis: default `user` drops agent-memory, `all` is a full backup.
+    //    visibility axis: default `user` drops hidden agent state, `all` includes its mounts.
     describe('base export', () => {
       const canExport = () => typeof store.exportNotes === 'function'
 
       const collect = async (opts?: { scope?: 'user' | 'all' }) => {
-        const out: { path: string; content: string }[] = []
+        const out: ExportEntry[] = []
 
         for await (const e of store.exportNotes!(opts)) {
           out.push(e)
@@ -1645,8 +1646,10 @@ export const describeKnowledgeStoreContract = (
         expect(entry).toBeTruthy()
         // Body present, and the raw file form — a frontmatter block (round-trippable,
         // carrying the notarium-id), NOT the parsed read() view.
-        expect(entry!.content).toContain('unique-export-body-token')
-        expect(entry!.content.replace(/^\uFEFF/, '')).toMatch(/^---/)
+        expect(typeof entry!.content).toBe('string')
+        const content = entry!.content as string
+        expect(content).toContain('unique-export-body-token')
+        expect(content.replace(/^\uFEFF/, '')).toMatch(/^---/)
         await store.remove(idOf(meta))
       })
 

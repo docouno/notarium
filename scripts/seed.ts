@@ -39,17 +39,21 @@ import {
   createExportHandler,
   createFsArtifactStore,
   createFsImportStagingStore,
+  createFsRoleLibrary,
   createMarkerStore,
   createMetaDb,
+  createRolesService,
   dataPathsFromEnv,
   describeMetaDbUrl,
   ensureFolderIdentity,
   hashPassword,
   healSpaceMarker,
   JOB_KIND_EXPORT,
+  loadBuiltinRoleCatalog,
   markFolderAsProject,
   mintOAuthAccessToken,
   mintOAuthRefreshToken,
+  renameProjectSlug,
   sha256,
   SpaceManager,
   type SpaceRecord,
@@ -61,9 +65,14 @@ import { normDate } from '../test/cases/generators'
 import { agentSessionId } from '../test/cases/sessionIds'
 import { seedDurableImports } from './seedDurableImports'
 import { applySeedExternalRewrites } from './seedExternalRewrites'
-import { makeOwnerRemap, resolveSeedAgentDeltaCursorOwner } from './seedOwner'
+import {
+  makeOwnerRemap,
+  resolveSeedAgentDeltaCursorOwner,
+  shouldAutoGrantSeedOwner,
+} from './seedOwner'
 
 const PROFILE_MOUNT = '.notarium/profile'
+const SKILL_MOUNT = '.notarium/skills'
 
 /** The default notarium mount set — mirrors apps/server/server.ts defaultMounts
  *  (a tiny, stable copy so the dev seeder needs no server-internal import). */
@@ -71,6 +80,7 @@ const defaultMounts = (notesDir: string): MountConfig[] => [
   { class: 'user-doc', dir: notesDir, prefix: '' },
   { class: 'agent-memory', dir: join(notesDir, AGENT_MEMORY_MOUNT), prefix: AGENT_MEMORY_MOUNT },
   { class: 'profile', dir: join(notesDir, PROFILE_MOUNT), prefix: PROFILE_MOUNT },
+  { class: 'skill', dir: join(notesDir, SKILL_MOUNT), prefix: SKILL_MOUNT },
 ]
 
 /** The localfs body reader behind CachedStore's readBody (P5) — a tiny copy of
@@ -200,6 +210,7 @@ const run = async (): Promise<void> => {
       const dir = join(spacesRoot, rec.notesDir)
       await mkdir(join(dir, AGENT_MEMORY_MOUNT), { recursive: true })
       await mkdir(join(dir, PROFILE_MOUNT), { recursive: true })
+      await mkdir(join(dir, SKILL_MOUNT), { recursive: true })
       return rec.notesDir
     },
     spaceCreateEnabled: () => true,
@@ -281,14 +292,28 @@ const run = async (): Promise<void> => {
     if (!space) {
       throw new Error(`project references unknown space: ${p.space}`)
     }
-    await markFolderAsProject(
+    const marked = await markFolderAsProject(
       { projects: metaDb.projects, folders: metaDb.folders, markerStore, now: () => new Date() },
       { space, folderPath: p.path, displayName: p.displayName || p.slug || p.path },
     )
+
+    if (p.slug && p.slug !== marked.slug) {
+      const renamed = await renameProjectSlug(
+        { projects: metaDb.projects, folders: metaDb.folders, markerStore, now: () => new Date() },
+        { space, id: marked.id, slug: p.slug },
+      )
+
+      if (!renamed.ok) {
+        throw new Error(
+          `project ${p.space}/${p.path} could not use declared slug ${p.slug}: ${renamed.code}`,
+        )
+      }
+    }
   }
 
   // 3. Auth (#10): the case's users, else a default owner. The first user is the
-  //    reported login; ensure it owns every seeded space so the stand is browsable.
+  //    reported login; ordinary spaces stay browsable without opening foreign
+  //    personal domains.
   const users: UserDecl[] = world.auth?.users?.length
     ? world.auth.users.map((u) =>
         u.username === CATALOG_OWNER
@@ -333,12 +358,71 @@ const run = async (): Promise<void> => {
       await metaDb.auth.upsertMember(space, m.username, m.role, t)
     }
   }
-  // The primary owner must reach every seeded space (a case with no membership decl
-  // for a space, or none at all).
+  // The primary owner reaches every ordinary seeded space so a manual stand stays
+  // browsable, but never receives an implicit grant into another user's personal
+  // domain. The real product refuses such a second member too.
   for (const [slug, id] of idOf) {
-    if (!members.some((m) => m.space === slug && m.username === primary.username)) {
+    const declaration = world.spaces.find((space) => space.slug === slug)
+    const autoGrant = shouldAutoGrantSeedOwner({
+      personalFor: declaration?.personalFor,
+      primaryUsername: primary.username,
+      asUser,
+    })
+
+    if (autoGrant && !members.some((m) => m.space === slug && m.username === primary.username)) {
       await metaDb.auth.upsertMember(id, primary.username, 'owner', t)
     }
+  }
+
+  // 3a. Owned role forks. The catalog remains read-only; the seed exercises the
+  // same copy-on-Add service as REST instead of dropping ad-hoc fixture files.
+  const roleService = createRolesService({
+    catalog: loadBuiltinRoleCatalog,
+    library: createFsRoleLibrary({
+      rootForSpace: (space) => {
+        const notesDir = notesDirOf(space)
+        return notesDir ? join(notesDir, SKILL_MOUNT) : null
+      },
+    }),
+  })
+  const projectRows = await metaDb.projects.listForSpaces([...idOf.values()])
+  let agentRoles = 0
+
+  for (const declaration of world.agentRoles ?? []) {
+    const target = declaration.target
+
+    if (target.kind === 'personal') {
+      const username = target.user ? asUser(target.user) : primary.username
+      const personalSlug = personalSpaceOf.get(username)
+      const personal = personalSlug ? idOf.get(personalSlug) : null
+
+      if (!personal) {
+        throw new Error(`agent role ${declaration.name} has no personal space for ${username}`)
+      }
+      await roleService.addFromCatalog(declaration.name, { scope: 'personal', space: personal })
+    } else if (target.kind === 'space') {
+      const space = idOf.get(target.space)
+
+      if (!space) {
+        throw new Error(`agent role ${declaration.name} references an unknown space`)
+      }
+      await roleService.addFromCatalog(declaration.name, { scope: 'space', space })
+    } else {
+      const space = idOf.get(target.space)
+      const project = projectRows.find(
+        (candidate) => candidate.space === space && candidate.path === target.path,
+      )
+
+      if (!project) {
+        throw new Error(`agent role ${declaration.name} references an unknown project`)
+      }
+      await roleService.addFromCatalog(declaration.name, {
+        scope: 'project',
+        space: project.space,
+        projectId: project.id,
+      })
+    }
+    agentRoles++
   }
 
   // 3b. Connected OAuth apps (#181): mint an oauth client + a LIVE access + refresh
@@ -449,6 +533,7 @@ const run = async (): Promise<void> => {
       createdAt: daysAgoIso(session.createdDaysAgo),
       lastSeenAt: daysAgoIso(session.lastSeenDaysAgo),
       calls: session.calls,
+      role: session.role ?? null,
     })
     insertedSessionRefs.add(session.ref)
     agentSessions++
@@ -1134,6 +1219,7 @@ const run = async (): Promise<void> => {
           connectedApps,
           pendingOAuthClients,
           agentSessions,
+          agentRoles,
           agentDeltaCursors,
           favorites,
           retrievals,

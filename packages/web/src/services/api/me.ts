@@ -1,7 +1,11 @@
 import type {
+  AddAgentRoleRequest,
+  AgentRoleDetailQuery,
+  AgentRoleDetailResponse,
   ConnectionPatchRequest,
   ConnectionsResponse,
   Me,
+  MeAgentRolesResponse,
   MeMemory,
   PatCreateRequest,
   PatCreateResponse,
@@ -15,6 +19,23 @@ import { req } from './client'
 export const meApi = {
   // ── self-service (#10): /api/me ─────────────────────────────────────────────
   meGet: () => req<Me>('/api/me'),
+  agentRolesGet: () => req<MeAgentRolesResponse>('/api/me/agent-roles'),
+  agentRoleDetail: (name: string, query: AgentRoleDetailQuery) => {
+    const params = new URLSearchParams({ scope: query.scope })
+
+    if (query.scope === 'space') {
+      params.set('space', query.space)
+    } else if (query.scope === 'project') {
+      params.set('project', query.project)
+    }
+
+    return req<AgentRoleDetailResponse>(`/api/me/agent-roles/${encodeURIComponent(name)}?${params}`)
+  },
+  agentRoleAdd: (input: AddAgentRoleRequest) =>
+    req<{ role: MeAgentRolesResponse['roles'][number] }>('/api/me/agent-roles', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }).then((response) => response.role),
   passwordChange: (currentPassword: string, newPassword: string) =>
     req<{ ok: true }>('/api/me/password', {
       method: 'POST',

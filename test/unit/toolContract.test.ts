@@ -17,6 +17,7 @@ import {
   LinkOutputSchema,
   ListNotesInputSchema,
   ListNotesOutputSchema,
+  ListRolesOutputSchema,
   MoveFolderInputSchema,
   MoveNoteInputSchema,
   MoveNoteOutputSchema,
@@ -36,6 +37,7 @@ import {
   toolActions,
   toolNames,
   tools,
+  UseRoleOutputSchema,
   WhoamiOutputSchema,
   WriteResultSchema,
 } from '@notarium/contract/tools'
@@ -48,7 +50,7 @@ import {
 // transport (stage 3) and the e2e fake must satisfy exactly these.
 
 describe('tool registry', () => {
-  it('pins the v2 set of 21 tools, each with input + output schemas', () => {
+  it('pins the v2 set of 23 tools, each with input + output schemas', () => {
     expect(toolNames.sort()).toEqual(
       [
         'create_note',
@@ -60,6 +62,7 @@ describe('tool registry', () => {
         'link',
         'link_many',
         'list_notes',
+        'list_roles',
         'move_folder',
         'move_note',
         'recall',
@@ -71,6 +74,7 @@ describe('tool registry', () => {
         'rename_project',
         'search',
         'start_session',
+        'use_role',
         'whoami',
       ].sort(),
     )
@@ -96,6 +100,8 @@ describe('tool registry', () => {
     expect(toolActions.recall).toBe('space:read')
     expect(toolActions.whoami).toBe('self:read')
     expect(toolActions.get_my_projects).toBe('spaces:list')
+    expect(toolActions.list_roles).toBe('space:read')
+    expect(toolActions.use_role).toBe('space:read')
     expect(toolActions.remember_about_user).toBe('space:write')
     expect(toolActions.create_note).toBe('space:write')
     expect(toolActions.remember_about_project).toBe('space:write')
@@ -117,6 +123,23 @@ describe('tool registry', () => {
     expect(toolActions.move_folder).toBe('space:write')
     expect(toolActions.rename_folder).toBe('space:write')
     expect(toolActions.rename_project).toBe('space:write')
+  })
+})
+
+describe('role tool boundaries', () => {
+  it('accepts only installed scopes in agent-visible role outputs', () => {
+    const catalogRole = { name: 'grooming', description: 'Grooming.', scope: 'catalog' }
+
+    expect(ListRolesOutputSchema.safeParse({ roles: [catalogRole], total: 1 }).success).toBe(false)
+    expect(UseRoleOutputSchema.safeParse({ status: 'activated', role: catalogRole }).success).toBe(
+      false,
+    )
+    expect(
+      ListRolesOutputSchema.safeParse({
+        roles: [{ ...catalogRole, scope: 'personal' }],
+        total: 1,
+      }).success,
+    ).toBe(true)
   })
 })
 

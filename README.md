@@ -43,7 +43,7 @@ The same knowledge base in every shot: a self-hosted developer's notes about the
 
 **A web editor, not a viewer.** A tree that holds tens of thousands of notes, a CodeMirror 6 editor with a formatting toolbar and hotkeys, and a reading mode with GitHub-flavored Markdown, Mermaid diagrams and KaTeX math. `[[Wikilinks]]` are clickable, including "ghost" links that offer to create the note they point at.
 
-**One base for you and your agent.** A built-in `POST /mcp` endpoint with 21 intent-oriented tools. An agent's edits go through the same write path and the same permissions as yours — versioned, and signed with who made them.
+**One base for you and your agent.** A built-in `POST /mcp` endpoint with 23 intent-oriented tools. An agent's edits go through the same write path and the same permissions as yours — versioned, and signed with who made them.
 
 **Search in the core.** Full-text search always works; semantic search is opt-in and merges with it through RRF. Not a premium tier, not a separate subscription.
 

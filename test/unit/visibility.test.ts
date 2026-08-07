@@ -32,8 +32,27 @@ describe('class visibility policy (#78)', () => {
     expect(classesForScope('user').has('user-doc')).toBe(true)
   })
 
+  it('skill truth is retained but hidden from every generic discovery scope', () => {
+    expect(CLASS_POLICY.skill).toEqual({
+      index: true,
+      graph: false,
+      feed: false,
+      tree: false,
+      userSearch: false,
+      agentRecall: false,
+      versioned: true,
+      replicate: true,
+    })
+    for (const surface of ['feed', 'tree', 'userSearch', 'graph', 'agentRecall'] as const) {
+      expect(isVisibleOn(surface, 'skill')).toBe(false)
+    }
+    expect(classesForScope('user').has('skill')).toBe(false)
+    expect(classesForScope('agentRecall').has('skill')).toBe(false)
+    expect(classesForScope('all').has('skill')).toBe(true)
+  })
+
   it('the registry includes profile and agent-memory stays recall-visible', () => {
-    expect(NOTE_CLASSES).toContain('profile')
+    expect(NOTE_CLASSES).toEqual(expect.arrayContaining(['profile', 'skill']))
     // Guard the contrast that makes profile distinct from memory: agent-memory is
     // recall-visible, profile is not.
     expect(classesForScope('agentRecall').has('agent-memory')).toBe(true)

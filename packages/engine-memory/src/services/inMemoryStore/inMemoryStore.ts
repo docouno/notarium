@@ -465,8 +465,8 @@ export class InMemoryStore implements KnowledgeStore {
    *  byte-parity with NotariumStore (the fake is a behaviour spec, not a real
    *  file), but the contract holds: one entry per note, path = filePath, content
    *  = a parseable note file. `scope` reuses the visibility class set, exactly
-   *  like the real engine: `user` (default) drops agent-memory, `all` is the
-   *  full backup. */
+   *  like the real engine: `user` (default) drops hidden agent state, `all`
+   *  includes its in-memory mounts (not host/meta state). */
   async *exportNotes(opts?: { scope?: ReadScope }): AsyncIterable<ExportEntry> {
     const allowed = classesForScope(opts?.scope ?? 'user')
 

@@ -92,6 +92,33 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
     }
   })
 
+  it('adds a null role without losing an existing v1 session row', async () => {
+    const testSchema = await createSchema('migration_session_role')
+    const pool = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const client = await pool.connect()
+
+    try {
+      await runPgMigrations(client, migrations.slice(0, 2))
+      await client.query(
+        `INSERT INTO agent_sessions
+          (id, owner, name, named, parent_id, created_at, last_seen_at, calls)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        ['ses_existingv1aa', 'alice', 'Existing', true, null, 'created', 'seen', 7],
+      )
+
+      await runPgMigrations(client, migrations)
+
+      const result = await client.query(
+        'SELECT owner, name, calls, role FROM agent_sessions WHERE id = $1',
+        ['ses_existingv1aa'],
+      )
+      expect(result.rows).toEqual([{ owner: 'alice', name: 'Existing', calls: '7', role: null }])
+    } finally {
+      client.release()
+      await pool.end()
+    }
+  })
+
   it('migrates credential bookmarks to the furthest owner fallback per project', async () => {
     const testSchema = await createSchema('migration_agent_delta_cursors')
     const pool = new pg.Pool({ connectionString: testSchema.scopedUrl })

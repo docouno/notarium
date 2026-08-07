@@ -1,6 +1,6 @@
-import { IconHistory, IconScrollText } from '../../core/Icons'
+import { IconBot, IconHistory, IconScrollText } from '../../core/Icons'
 import { type PillTab, PillTabs } from '../../core/PillTabs'
-import { agentAuditRoute, agentContextRoute } from '../../libs/routing/routePaths'
+import { agentAuditRoute, agentContextRoute, agentRolesRoute } from '../../libs/routing/routePaths'
 import { useAgentsSummary } from './AgentsProvider'
 
 // The Agents section nav (#243): a permanent pill-bar switching the Agents surface's
@@ -11,13 +11,13 @@ import { useAgentsSummary } from './AgentsProvider'
 // so the bar reads as the surface's primary nav, not a bare toggle. Grows as Agents gains
 // sections (roles/tokens) — each a routed `/agents/<section>`, SHELL-ready.
 
-export type AgentsSection = 'context' | 'audit'
+export type AgentsSection = 'context' | 'roles' | 'audit'
 
 const fmtTokens = (n: number): string =>
   n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` : String(n)
 
 export const AgentsTabs = ({ active }: { active: AgentsSection }) => {
-  const { context, audit, loading } = useAgentsSummary()
+  const { context, audit, roles, loading } = useAgentsSummary()
 
   const contextMetric = context
     ? context.loadedTokens > 0
@@ -37,6 +37,19 @@ export const AgentsTabs = ({ active }: { active: AgentsSection }) => {
       ? '…'
       : undefined
 
+  const rolesCountMetric = roles
+    ? roles.truncated
+      ? roles.count
+        ? `${roles.count}+ roles`
+        : 'partial role count'
+      : `${roles.count} ${roles.count === 1 ? 'role' : 'roles'}${roles.count ? '' : ' added'}`
+    : undefined
+  const rolesMetric = roles
+    ? `${rolesCountMetric}${roles.activeRole ? ` · ${roles.activeRole} active` : ''}`
+    : loading
+      ? '…'
+      : undefined
+
   const tabs: PillTab[] = [
     {
       key: 'context',
@@ -45,6 +58,14 @@ export const AgentsTabs = ({ active }: { active: AgentsSection }) => {
       icon: <IconScrollText size={15} />,
       metric: contextMetric,
       testId: 'agents-tab-context',
+    },
+    {
+      key: 'roles',
+      to: agentRolesRoute(),
+      label: 'Roles',
+      icon: <IconBot size={15} />,
+      metric: rolesMetric,
+      testId: 'agents-tab-roles',
     },
     {
       key: 'audit',

@@ -3,6 +3,7 @@ import { getCase } from './registry'
 import { makeRng } from './rng'
 import type {
   AgentDeltaCursorDecl,
+  AgentRoleDecl,
   AgentSessionDecl,
   CaseEvent,
   CaseWorld,
@@ -119,6 +120,7 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
   const favorites = new Map<string, FavoriteDecl>()
   const retrievals: RetrievalDecl[] = []
   const agentSessions: AgentSessionDecl[] = []
+  const agentRoles = new Map<string, AgentRoleDecl>()
   const agentDeltaCursors: AgentDeltaCursorDecl[] = []
   const jobs: JobDecl[] = []
   const durableImports: DurableImportDecl[] = []
@@ -255,6 +257,19 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
         ...(session.parentRef ? { parentRef: `${name}:${session.parentRef}` } : {}),
       })
     }
+    for (const role of world.agentRoles ?? []) {
+      const target = role.target
+      const key =
+        target.kind === 'personal'
+          ? `personal\0${target.user ?? ''}\0${role.name}`
+          : target.kind === 'space'
+            ? `space\0${target.space}\0${role.name}`
+            : `project\0${target.space}\0${target.path}\0${role.name}`
+
+      if (!agentRoles.has(key)) {
+        agentRoles.set(key, role)
+      }
+    }
     // Cursor declarations reference both a session and a journalled note by logical
     // id; namespace both exactly like their source declarations.
     for (const cursor of world.agentDeltaCursors ?? []) {
@@ -302,6 +317,7 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
     favorites: favorites.size ? [...favorites.values()] : undefined,
     ...(retrievals.length ? { retrievals } : {}),
     ...(agentSessions.length ? { agentSessions } : {}),
+    ...(agentRoles.size ? { agentRoles: [...agentRoles.values()] } : {}),
     ...(agentDeltaCursors.length ? { agentDeltaCursors } : {}),
     ...(jobs.length ? { jobs } : {}),
     ...(durableImports.length ? { durableImports } : {}),

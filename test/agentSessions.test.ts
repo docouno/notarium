@@ -87,6 +87,7 @@ describe('agent sessions service', () => {
       state: AGENT_SESSION_STATE.new,
       record: { id: 'ses_bbbbbbbbbbbb', named: true, parentId: null },
     })
+    await sessions.setRole(named.session!, 'grooming')
     const fork = await sessions.start('alice', { name: 'work' }, 'unused')
     expect(fork.session).toMatchObject({
       state: AGENT_SESSION_STATE.forked,
@@ -94,6 +95,7 @@ describe('agent sessions service', () => {
         id: 'ses_cccccccccccc',
         parentId: 'ses_bbbbbbbbbbbb',
         name: 'work',
+        role: 'grooming',
       },
     })
     const ambiguous = await sessions.start('alice', { name: 'work' }, 'unused')
@@ -149,6 +151,7 @@ describe('agent sessions service', () => {
         createdAt: '2026-07-10T00:00:00.000Z',
         lastSeenAt: '2026-07-10T00:00:00.000Z',
         calls: 1,
+        role: null,
       },
       {
         id: 'ses_bbbbbbbbbbbb',
@@ -159,6 +162,7 @@ describe('agent sessions service', () => {
         createdAt: '2026-07-11T00:00:00.000Z',
         lastSeenAt: '2026-07-11T00:00:00.000Z',
         calls: 1,
+        role: null,
       },
       ...Array.from({ length: 10 }, (_, index) => ({
         id: `ses_recent0000${index}`,
@@ -169,6 +173,7 @@ describe('agent sessions service', () => {
         createdAt: `2026-08-04T0${index}:00:00.000Z`,
         lastSeenAt: `2026-08-04T0${index}:00:00.000Z`,
         calls: 1,
+        role: null,
       })),
     ])
     const sessions = createAgentSessions({
@@ -199,6 +204,7 @@ describe('agent sessions service', () => {
           createdAt: '2026-08-04T12:00:00.000Z',
           lastSeenAt: '2026-08-04T12:00:00.000Z',
           calls: 1,
+          role: null,
         },
         {
           id: 'ses_parent00000',
@@ -209,6 +215,7 @@ describe('agent sessions service', () => {
           createdAt: '2026-08-04T12:00:00.000Z',
           lastSeenAt: '2026-08-04T12:00:00.000Z',
           calls: 1,
+          role: null,
         },
       ]),
     ).toThrow(/parent agent session/)

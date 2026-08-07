@@ -25,6 +25,11 @@ export type FileStore = {
    *  source (P3) — cheap by design: stats only. The engine independently
    *  source-verifies a bounded rotating subset. */
   scan(): Promise<FileStat[]>
+  /** Every regular file under the root as raw bytes. A package/resource capability kept separate
+   *  from scan(): the knowledge index remains Markdown-only, while a full export can preserve
+   *  auxiliary files byte-for-byte. Paths are storage-relative POSIX. OPTIONAL: note-only or
+   *  remote adapters may omit it and keep the legacy Markdown export path. */
+  exportFiles?(): AsyncIterable<{ path: string; content: Uint8Array }>
   /** Every non-dot directory under the root, recursively (#97 directory channel).
    *  Space-relative POSIX paths, root ('') excluded. A SEPARATE walk from scan()
    *  — never mixed into the note FileStat[] (index = notes only, #78). This is

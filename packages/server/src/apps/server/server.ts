@@ -37,6 +37,11 @@ import {
   readRootMarker,
   scanProjectsAtBoot,
 } from '../../services/projects'
+import {
+  createFsRoleLibrary,
+  createRolesService,
+  loadBuiltinRoleCatalog,
+} from '../../services/roles'
 import { type DiscoveredSpace, SpaceManager } from '../../services/spaces'
 import { buildApp, webDist } from './app'
 import {
@@ -72,6 +77,10 @@ export const AGENT_MOUNT_PREFIX = AGENT_MEMORY_MOUNT
  *  canon: docs/note-model.md#note-classes */
 export const PROFILE_MOUNT_PREFIX = '.notarium/profile'
 
+/** Space-relative path of the writable Agent Skills library. Built-in catalog
+ * templates do NOT live here: Add copies one into this owned, hidden mount. */
+export const SKILL_MOUNT_PREFIX = '.notarium/skills'
+
 /** Default mount set for a notarium space. */
 export const defaultMounts = (notesDir: string): MountConfig[] => [
   { class: NOTE_CLASS.userDoc, dir: notesDir, prefix: '' },
@@ -85,7 +94,29 @@ export const defaultMounts = (notesDir: string): MountConfig[] => [
     dir: join(notesDir, PROFILE_MOUNT_PREFIX),
     prefix: PROFILE_MOUNT_PREFIX,
   },
+  {
+    class: NOTE_CLASS.skill,
+    dir: join(notesDir, SKILL_MOUNT_PREFIX),
+    prefix: SKILL_MOUNT_PREFIX,
+  },
 ]
+
+/** Resolve the exact mount set shared by the store and sidecar services. A
+ * configured class mount is authoritative, including its physical directory. */
+const mountsForConfig = (cfg: SpaceConfig, notesDir: string): MountConfig[] => {
+  const mounts = cfg.mounts ?? defaultMounts(notesDir)
+
+  return mounts.some((mount) => mount.class === NOTE_CLASS.skill)
+    ? mounts
+    : [
+        ...mounts,
+        {
+          class: NOTE_CLASS.skill,
+          dir: join(notesDir, SKILL_MOUNT_PREFIX),
+          prefix: SKILL_MOUNT_PREFIX,
+        },
+      ]
+}
 
 /** Clamp a marker-borne label: a hand-planted `.notariummeta` bypasses the wire's
  *  max(200), so a disk-read displayName is length-capped + stripped of control
@@ -371,9 +402,10 @@ export const createServer = async ({
               name = `${rec.notesDir}-${n}`
             }
           }
-          // Pre-create the hidden agent-mount so the space has its memory placement
-          // from creation.
+          // Pre-create hidden writable truth mounts. The role catalog itself is
+          // packaged read-only data and stays physically separate.
           await mkdir(join(spacesRoot, name, AGENT_MOUNT_PREFIX), { recursive: true })
+          await mkdir(join(spacesRoot, name, SKILL_MOUNT_PREFIX), { recursive: true })
           return name
         }
       : undefined,
@@ -387,8 +419,9 @@ export const createServer = async ({
         throw new Error(`space ${rec.slug}: the notarium engine needs notesDir`)
       }
       const notesDir = cfg.notesDir
+      const mounts = mountsForConfig(cfg, notesDir)
       const engine = createNotariumStore({
-        mounts: cfg.mounts ?? defaultMounts(cfg.notesDir),
+        mounts,
         // Keyed by the stable notes_dir, not the (mutable) slug — a rename never
         // moves the index DB.
         indexDb: cfg.indexDb || join(engineDataDir, `${rec.notesDir}.db`),
@@ -418,6 +451,21 @@ export const createServer = async ({
           : undefined,
       })
     },
+  })
+  const roles = createRolesService({
+    catalog: loadBuiltinRoleCatalog,
+    library: createFsRoleLibrary({
+      rootForSpace: (space) => {
+        const rec = manager.recOf(space)
+        const cfg = rec ? configForRec(rec) : undefined
+        const notesDir = cfg?.notesDir
+
+        return notesDir
+          ? (mountsForConfig(cfg, notesDir).find((mount) => mount.class === NOTE_CLASS.skill)
+              ?.dir ?? null)
+          : null
+      },
+    }),
   })
 
   // Late-bind the marker store's id → notes-dir resolution to the manager.
@@ -472,6 +520,7 @@ export const createServer = async ({
   const app = await buildApp({
     spaces: manager,
     auth,
+    roles,
     scheduler,
     sessions: metaDb?.sessions,
     agentDeltaCursors: metaDb?.agentDeltaCursors,

@@ -11,6 +11,7 @@ export const NOTE_CLASS = {
   derived: 'derived',
   agentMemory: 'agent-memory',
   profile: 'profile',
+  skill: 'skill',
 } as const
 
 export const REVISION_KIND = {
@@ -26,7 +27,15 @@ export const PROJECT_STATUS = {
   archived: 'archived',
 } as const
 
+export const ROLE_SCOPE = {
+  catalog: 'catalog',
+  personal: 'personal',
+  space: 'space',
+  project: 'project',
+} as const
+
 export type NoteClass = (typeof NOTE_CLASS)[keyof typeof NOTE_CLASS]
 export type AuthorKind = (typeof AUTHOR_KIND)[keyof typeof AUTHOR_KIND]
 export type RevisionKind = (typeof REVISION_KIND)[keyof typeof REVISION_KIND]
 export type ProjectStatus = (typeof PROJECT_STATUS)[keyof typeof PROJECT_STATUS]
+export type RoleScope = (typeof ROLE_SCOPE)[keyof typeof ROLE_SCOPE]

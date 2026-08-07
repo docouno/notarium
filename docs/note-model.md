@@ -17,7 +17,7 @@ and cannot remember whether the author wrote a human target, a stable envelope, 
 guessing from that projection would turn a creatable forward reference into a tombstone.
 
 ### Outward terminology
-`space` (domain, boundary #16) is an internal term, NOT exposed outward to the agent; the personal domain is implied from the PAT. **`project`** outward = the real addressable unit of work INSIDE a space (a marked folder-entity with the `.notariummeta` marker, #13), NOT a space. The handle = `(space, slug)` (the GitLab `group/project` model: `slug` is unique within a space, same-naming across spaces is disambiguated by the `space` field; the stable `id` is globally unique). The agent addresses a project by handle + relative path, the space is resolved behind the handle; the agent does NOT choose the space/class (poka-yoke). The model canon — [projects.md](projects.md). _(The former "outward-`project` = working space" and the double meaning of the term are canceled by #13: spaces stopped being called "project", real project-entities appeared; a reversal of #74-F3.)_
+`space` (domain, boundary #16) is an internal addressing term, NOT exposed outward to the agent; the personal domain is implied from the PAT. The one descriptive exception is an effective role summary with `scope: 'space'`: it reports why that owned role won, but carries no space selector and cannot choose placement or access. **`project`** outward = the real addressable unit of work INSIDE a space (a marked folder-entity with the `.notariummeta` marker, #13), NOT a space. The handle = `(space, slug)` (the GitLab `group/project` model: `slug` is unique within a space, same-naming across spaces is disambiguated by the `space` field; the stable `id` is globally unique). The agent addresses a project by handle + relative path, the space is resolved behind the handle; the agent does NOT choose the space/class (poka-yoke). The model canon — [projects.md](projects.md). _(The former "outward-`project` = working space" and the double meaning of the term are canceled by #13: spaces stopped being called "project", real project-entities appeared; a reversal of #74-F3.)_
 
 ### Classes and where intent-tools write <a id="note-classes"></a>
 | Class | Visibility | Who writes | Convention |
@@ -25,6 +25,7 @@ guessing from that projection would turn a creatable forward reference into a to
 | `user-doc` | tree/feed/search, freely organized by the user | user (UI) + `create_note` | default `type` + the project folder by handle; escape `path?`/`type?`/`tags?` |
 | `agent-memory` | personal domain + a project subdirectory (#13), as a separate section | `remember_about_user` + `remember_about_project` (memory about the user/project) | `category` → category-file; frontmatter `summary` → derived-index |
 | `profile` (#159) | HIDDEN from ALL discovery surfaces (tree/graph/feed/search); access only via Settings → Profile + the agent's `start_session` (by id) | `PUT /api/me/profile` (the user writes about themselves) | a singleton in the `.notarium/profile` mount; `type:person`, the `always-load` tag; human content, NOT agent memory (provenance — the user) |
+| `skill` (#307) | hidden from generic tree/graph/feed/search/recall; visible through Agents → Roles and role resolution only | the human `Add` flow (editing follows in #309) | valid Agent Skills packages in `.notarium/skills`; Personal/Space at the mount root, Project under reserved `_projects/<encoded-project-id>/`; Markdown members participate in current note versioning/replication, while auxiliary bytes are retained verbatim and included in `scope=all` export/data backup but remain outside the note journal |
 
 **The write-intent trio (#13)** — the agent does **not choose** the class/folder/space (poka-yoke), the tool imposes it:
 - `create_note` → class `user-doc` (knowledge into the project tree by handle `(space, slug)` + `path`);
@@ -32,6 +33,30 @@ guessing from that projection would turn a creatable forward reference into a to
 - `remember_about_project` → class `agent-memory` in the agent-mount subdirectory `.notarium/memory/<id>/` (memory about the project; writing is symmetric to `remember_about_user`, reading is space-membership-scoped, not self:read).
 
 _(#13, 2026-06-17: the name `remember_about_project` was RECLAIMED for memory; the former KB-write → `create_note`. The model — [projects.md](projects.md).)_
+
+### Roles and skills <a id="roles-and-skills"></a>
+
+A skill is a portable, bounded Agent Skills package: `<name>/SKILL.md` plus optional
+`scripts/`, `references/`, and `assets/`. Add copies every member: auxiliary files remain
+byte-identical, while `SKILL.md` is rewritten with immutable built-in provenance. The server never
+executes scripts, and role activation progressively loads only the Markdown instructions. A role is the
+same valid package with
+`metadata.notarium.kind: role`; `metadata.notarium.skills` links its supporting packages by wiki
+name. The packaged catalog is a separate read-only source. It is not a scope and is never loaded by
+an agent until a human explicitly copies a template into an owned library. Copying records origin
+and catalog revision, but produces an independent fork: no catalog update overwrites it.
+Agents → Roles exposes a read-only detail for both sources: the complete role instructions and
+the supporting skills loaded with it. The list description remains discovery metadata; it is not
+a substitute for the package body. Editing an owned fork is a separate capability (#309).
+
+Owned resolution is by package name: `Project > Space > Personal`. Personal means private to the
+user across projects; Space means shared inside one space; Project is the narrowest. There is no
+mutable global scope and no stored enable flag: presence in an owned scope means effective, while
+the one role selected in a durable agent episode is separately called active. No selection means
+base mode, not a synthetic base role.
+An active named episode fork inherits its parent's selected role; a brand-new episode starts in
+base mode. Resolution is repeated on hydration, so the inherited name may pick a newer narrower
+owned fork in the new project context.
 
 ### agent-memory: structure and behavior <a id="agent-memory"></a>
 - **File-per-category, not file-per-observation** (against micro-files): `remember_about_user(observation, category)` appends into the category file; new categories = new files.

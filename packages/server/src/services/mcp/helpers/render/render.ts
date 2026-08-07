@@ -1,4 +1,5 @@
 // Markdown rendering for the read/bootstrap tools: the prose projection of each tool's structured payload.
+import { type RoleSummary } from '@notarium/contract'
 import {
   type AgentSession,
   type DeltaEntry,
@@ -12,6 +13,7 @@ import {
   RESPONSE_FORMAT,
   type SearchHit,
   type ToolHelp,
+  type UseRoleOutput,
 } from '@notarium/contract/tools'
 
 import { renderProvenance } from '../provenance'
@@ -23,6 +25,9 @@ type SessionStructured = {
     memory: Array<{ noteId: string; category: string; summary: string }>
     alwaysLoad: Array<{ noteId: string; title: string }>
   }
+  roles: RoleSummary[]
+  rolesTruncated?: boolean
+  activeRole?: UseRoleOutput
   projects: ProjectSummary[]
   project?: {
     index: { noteCount: number; folders: FolderEntry[] }
@@ -68,6 +73,25 @@ export const renderSession = (
     for (const a of s.profile.alwaysLoad) {
       lines.push(`- ${a.title} \`${a.noteId}\``)
     }
+  }
+  if (s.roles.length) {
+    lines.push('', '**Available roles** (call `use_role` when one matches the work):')
+    for (const role of s.roles) {
+      lines.push(`- \`${role.name}\` (${role.scope}) — ${role.description}`)
+    }
+  } else if (s.rolesTruncated) {
+    lines.push('', 'No roles are visible in this bounded summary.')
+  } else {
+    lines.push('', 'No roles have been added in this scope; continue in the base mode.')
+  }
+  if (s.rolesTruncated) {
+    lines.push(
+      '',
+      '_(role summaries were abbreviated or omitted — use `list_roles` for the bounded inventory)_',
+    )
+  }
+  if (s.activeRole) {
+    lines.push('', renderRole(s.activeRole))
   }
   lines.push(
     '',
@@ -122,10 +146,30 @@ export const renderSession = (
     }
   }
   if (s.truncated) {
-    lines.push('', '_(profile truncated — use search/get_note for the rest)_')
+    lines.push(
+      '',
+      '_(note/profile context truncated — narrow by project; use list/search/get_note for the rest)_',
+    )
   }
 
   return lines.join('\n').trim() || 'Session ready.'
+}
+
+export const renderRole = (loaded: UseRoleOutput): string => {
+  const lines = [`# Active role: ${loaded.role.name}`, '', loaded.instructions ?? '']
+
+  if (loaded.status === 'already_active') {
+    lines.splice(1, 0, '', '_(already active; effective instructions reloaded)_')
+  }
+
+  for (const skill of loaded.skills ?? []) {
+    lines.push('', `## Linked skill: ${skill.name}`, '', skill.instructions)
+  }
+  if (loaded.truncated) {
+    lines.push('', '_(role bundle truncated to the requested token budget)_')
+  }
+
+  return lines.join('\n').trim()
 }
 
 /** Where a note lives, in prose: project handle, else space slug, else personal. */

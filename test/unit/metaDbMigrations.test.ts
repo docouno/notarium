@@ -62,6 +62,7 @@ describe('meta-DB migration assets and SQLite runner', () => {
     expect(migrations.map(({ version, name }) => ({ version, name }))).toEqual([
       { version: 0, name: 'baseline' },
       { version: 1, name: 'agent_sessions' },
+      { version: 2, name: 'agent_session_role' },
     ])
     for (const migration of migrations) {
       expect(migration.checksum).toBe(checksumMigrationPair(migration.sqlite, migration.postgres))
@@ -112,6 +113,24 @@ describe('meta-DB migration assets and SQLite runner', () => {
     runSqliteMigrations(db)
 
     expect(ledger(db)).toEqual(before)
+  })
+
+  it('adds a null role without losing an existing v1 session row', () => {
+    const db = database()
+    runSqliteMigrations(db, migrations.slice(0, 2))
+    db.prepare(
+      `INSERT INTO agent_sessions
+        (id, owner, name, named, parent_id, created_at, last_seen_at, calls)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run('ses_existingv1aa', 'alice', 'Existing', 1, null, 'created', 'seen', 7)
+
+    runSqliteMigrations(db)
+
+    expect(
+      db
+        .prepare('SELECT owner, name, calls, role FROM agent_sessions WHERE id = ?')
+        .get('ses_existingv1aa'),
+    ).toEqual({ owner: 'alice', name: 'Existing', calls: 7, role: null })
   })
 
   it('migrates credential bookmarks to the furthest owner fallback per project', () => {

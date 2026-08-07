@@ -3,8 +3,9 @@ import type { FastifyInstance } from 'fastify'
 
 import { ExportEnqueueRequestSchema, JobSchema } from '@notarium/contract'
 import { HTTP_STATUS } from '@notarium/contract/http'
-import { freshNoteId, READ_SCOPE, type ReadScope, stripFrontmatter } from '@notarium/core'
+import { freshNoteId, READ_SCOPE, type ReadScope } from '@notarium/core'
 
+import { exportEntryBody } from '../../../../libs/exportEntry'
 import { safeRelAddress } from '../../../../libs/relPath'
 import { JOB_KIND_EXPORT, jobToWire } from '../../consumers'
 import { type ApiRouteCtx, authz, notFound, s } from '../_shared'
@@ -75,8 +76,7 @@ export const exportRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
           if (folder && !entry.path.startsWith(prefix)) {
             continue
           }
-          const body = stripFm ? stripFrontmatter(entry.content).replace(/^\n+/, '') : entry.content
-          archive.append(body, { name: entry.path })
+          archive.append(exportEntryBody(entry, stripFm), { name: entry.path })
           // Backpressure: wait for the socket to drain before reading the next file,
           // so a slow download doesn't buffer the whole base in archiver's queue.
           if (reply.raw.writableNeedDrain) {

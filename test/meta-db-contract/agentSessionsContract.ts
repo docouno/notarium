@@ -24,6 +24,7 @@ const row = (
   createdAt: '2026-08-01T00:00:00.000Z',
   lastSeenAt,
   calls: 1,
+  role: null,
   ...over,
 })
 
@@ -119,6 +120,20 @@ export const describeAgentSessionsContract = (
           '2026-08-04T10:00:00.001Z',
         ),
       ).resolves.toBeNull()
+    })
+
+    it('sets a role atomically and reports idempotent repeats', async () => {
+      await persistence.insert(row('ses_aaaaaaaaaaaa', 'alice', '2026-08-04T10:00:00.000Z'))
+
+      await expect(persistence.setRole('bob', 'ses_aaaaaaaaaaaa', 'grooming')).resolves.toBeNull()
+      await expect(persistence.setRole('alice', 'ses_aaaaaaaaaaaa', 'grooming')).resolves.toEqual({
+        changed: true,
+        record: expect.objectContaining({ role: 'grooming' }),
+      })
+      await expect(persistence.setRole('alice', 'ses_aaaaaaaaaaaa', 'grooming')).resolves.toEqual({
+        changed: false,
+        record: expect.objectContaining({ role: 'grooming' }),
+      })
     })
 
     it('atomically infers and touches exactly one active session, never zero or two', async () => {

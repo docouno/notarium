@@ -17,6 +17,7 @@ export const NOTE_CLASS = {
   derived: 'derived',
   agentMemory: 'agent-memory',
   profile: 'profile',
+  skill: 'skill',
 } as const
 
 /** Machine-readable error reasons the store's engines put on `StoreError.reason`

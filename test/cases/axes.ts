@@ -19,6 +19,7 @@ export type Axis =
   | 'agent-memory'
   | 'agent-audit'
   | 'agent-sessions'
+  | 'agent-roles'
   | 'note-classes'
   | 'import'
   | 'jobs'
@@ -107,6 +108,12 @@ export const AXES: readonly AxisInfo[] = [
     title: 'Agent sessions / episode state',
     surfaces: ['mcp-start-session', 'mcp-tool-binding', 'mcp-session-delta'],
     refs: ['mcp-gateway.md'],
+  },
+  {
+    axis: 'agent-roles',
+    title: 'Agent role catalog / owned / active states',
+    surfaces: ['agents-roles', 'mcp-start-session', 'mcp-use-role'],
+    refs: ['#307', 'mcp-gateway.md'],
   },
   {
     axis: 'note-classes',

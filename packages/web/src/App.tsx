@@ -197,6 +197,14 @@ const router = createBrowserRouter([
           { index: true, element: <Navigate to={agentContextRoute()} replace /> },
           { path: 'context', element: <Navigate to={agentContextRoute()} replace /> },
           { path: 'context/:scope', element: <ContextPage /> },
+          {
+            path: 'roles',
+            lazy: async () => {
+              const { RolesPage } = await import('./pages/AgentsPage/RolesPage')
+
+              return { Component: RolesPage }
+            },
+          },
           // Audit (#243): the runtime-retrieval log, a sibling section to Context.
           { path: 'audit', element: <AuditPage /> },
           { path: 'session', element: <Navigate to={agentContextRoute()} replace /> },

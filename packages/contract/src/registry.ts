@@ -15,6 +15,13 @@ import {
 import { MeMemoryResponseSchema, ProjectMemoryResponseSchema } from './schemas/rest/agent/memory'
 import { ProfilePutRequestSchema, ProfileResponseSchema } from './schemas/rest/agent/profile'
 import {
+  AddAgentRoleRequestSchema,
+  AddAgentRoleResponseSchema,
+  AgentRoleDetailRequestSchema,
+  AgentRoleDetailResponseSchema,
+  MeAgentRolesResponseSchema,
+} from './schemas/rest/agent/roles'
+import {
   AcceptInviteRequestSchema,
   AuthSessionResponseSchema,
   InviteInfoRequestSchema,
@@ -201,6 +208,12 @@ export const contract = {
   meAgentContext: { response: MeAgentContextResponseSchema },
   projectAgentContext: { response: ProjectAgentContextResponseSchema },
   agentAudit: { request: AgentAuditQuerySchema, response: AgentAuditResponseSchema },
+  agentRoles: { response: MeAgentRolesResponseSchema },
+  agentRoleDetail: {
+    request: AgentRoleDetailRequestSchema,
+    response: AgentRoleDetailResponseSchema,
+  },
+  agentRoleAdd: { request: AddAgentRoleRequestSchema, response: AddAgentRoleResponseSchema },
   pinNote: { request: PinNoteRequestSchema, response: PinNoteResponseSchema },
   muteNote: { request: MuteNoteRequestSchema, response: MuteNoteResponseSchema },
   contextSets: { response: ContextSetsResponseSchema },

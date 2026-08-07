@@ -1,7 +1,7 @@
 import { AGENT_SESSION_STATE, type AgentSessionState } from '@notarium/contract'
 import { freshNoteId } from '@notarium/core'
 
-import type { AgentSessionRecord, AgentSessionsPersistence } from '../metaDb'
+import type { AgentSessionRecord, AgentSessionRoleSet, AgentSessionsPersistence } from '../metaDb'
 import {
   AGENT_SESSION_IDLE_MS,
   AGENT_SESSION_RECENT_LIMIT,
@@ -34,6 +34,8 @@ export type AgentSessions = {
     request: StartAgentSessionRequest | undefined,
     defaultName: string,
   ): Promise<AgentSessionStart>
+  /** Persist one selected role for the bound episode. */
+  setRole(session: BoundAgentSession, role: string): Promise<AgentSessionRoleSet>
 }
 
 export class NoSuchAgentSessionError extends Error {
@@ -77,6 +79,7 @@ export const createAgentSessions = ({
       createdAt: at,
       lastSeenAt: at,
       calls: 1,
+      role: null,
     }
     await persistence.insert(record)
     return { record, attach, state }
@@ -143,6 +146,7 @@ export const createAgentSessions = ({
             createdAt: at,
             lastSeenAt: at,
             calls: 1,
+            role: null,
           },
           activeSince,
           retainedSince,
@@ -188,6 +192,16 @@ export const createAgentSessions = ({
         session,
         ...(recentSessions ? { recentSessions } : {}),
       }
+    },
+
+    setRole: async (session, role) => {
+      const result = await persistence.setRole(session.record.owner, session.record.id, role)
+
+      if (!result) {
+        throw new NoSuchAgentSessionError()
+      }
+      session.record = result.record
+      return result
     },
   }
 }

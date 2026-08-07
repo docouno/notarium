@@ -347,6 +347,7 @@ describePostgres('live Postgres driver', () => {
         createdAt: '2026-08-04T10:00:00Z',
         lastSeenAt: '2026-08-04T10:00:00Z',
         calls: 1,
+        role: null,
       })
       // The owner row exists while the session row does not: getOrInit can leave
       // exactly this shape when a concurrent retype removes the materialised row
@@ -444,6 +445,7 @@ describePostgres('live Postgres driver', () => {
         createdAt: '2026-08-04T10:00:00Z',
         lastSeenAt: '2026-08-04T10:00:00Z',
         calls: 1,
+        role: null,
       })
       const scope = { owner: 'alice', session: { id: sessionId, parentId: null } }
       await testSchema.db.agentDeltaCursors.advance(scope, projectId, '10', '2026-08-04T10:01:00Z')

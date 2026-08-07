@@ -231,6 +231,9 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
   // logical→real id map); the fake e2e drives both surfaces through their REST API instead.
   // See docs/seeds.md.
 
+  const personalSpaceByUser = new Map(
+    world.spaces.flatMap((space) => (space.personalFor ? [[space.personalFor, space.slug]] : [])),
+  )
   const auth: AuthFixture | undefined = world.auth
     ? {
         users: world.auth.users.map((u) => ({
@@ -238,7 +241,7 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
           password: u.password,
           displayName: u.displayName,
           admin: u.admin,
-          personalSpace: u.personalSpace,
+          personalSpace: u.personalSpace ?? personalSpaceByUser.get(u.username),
         })),
         members: world.auth.members,
       }
@@ -255,7 +258,8 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
     createdAt: new Date(now - session.createdDaysAgo * 86_400_000).toISOString(),
     lastSeenAt: new Date(now - session.lastSeenDaysAgo * 86_400_000).toISOString(),
     calls: session.calls,
+    role: session.role ?? null,
   }))
 
-  return { now: world.now, spaces, projects, auth, agentSessions }
+  return { now: world.now, spaces, projects, auth, agentSessions, agentRoles: world.agentRoles }
 }

@@ -52,6 +52,42 @@ const fixture = async (): Promise<{
   await mkdir(join(data, 'jobs', 'imports'), { recursive: true })
   await mkdir(join(data, 'jobs', 'imports', 'main'), { recursive: true })
   await mkdir(join(data, 'spaces', 'main', 'draft.part'), { recursive: true })
+  await mkdir(
+    join(data, 'spaces', 'main', 'notes', '.draft.install-550e8400-e29b-41d4-a716-446655440000'),
+    { recursive: true },
+  )
+  await mkdir(
+    join(
+      data,
+      'spaces',
+      'main',
+      '.notarium',
+      'skills',
+      '_projects',
+      'cHJvamVjdA',
+      '.draft.install-550e8400-e29b-41d4-a716-446655440000',
+    ),
+    { recursive: true },
+  )
+  await mkdir(join(data, 'spaces', 'main', '.notarium', 'skills', '.draft.install-authored'), {
+    recursive: true,
+  })
+  await mkdir(join(data, 'spaces', 'main', '.notarium', 'skills', 'ready', 'assets'), {
+    recursive: true,
+  })
+  await mkdir(
+    join(
+      data,
+      'spaces',
+      'main',
+      '.notarium',
+      'skills',
+      'ready',
+      'assets',
+      '.draft.install-550e8400-e29b-41d4-a716-446655440000',
+    ),
+    { recursive: true },
+  )
   await mkdir(join(data, 'engine'), { recursive: true })
   await writeFile(join(data, 'spaces', 'main', 'note.md'), '# Before\n')
   await writeFile(
@@ -62,6 +98,62 @@ const fixture = async (): Promise<{
   await writeFile(join(data, 'jobs', 'imports', 'main', 'upload.import.part'), 'incomplete upload')
   await writeFile(join(data, 'spaces', 'main', 'model.part'), 'legitimate note attachment')
   await writeFile(join(data, 'spaces', 'main', 'draft.part', 'kept.md'), '# Kept\n')
+  await writeFile(
+    join(
+      data,
+      'spaces',
+      'main',
+      'notes',
+      '.draft.install-550e8400-e29b-41d4-a716-446655440000',
+      'important.md',
+    ),
+    '# Legitimate note\n',
+  )
+  await writeFile(
+    join(
+      data,
+      'spaces',
+      'main',
+      '.notarium',
+      'skills',
+      '_projects',
+      'cHJvamVjdA',
+      '.draft.install-550e8400-e29b-41d4-a716-446655440000',
+      'SKILL.md',
+    ),
+    'partial package',
+  )
+  await writeFile(
+    join(data, 'spaces', 'main', '.notarium', 'skills', '.draft.install-authored', 'kept.bin'),
+    'authored resource',
+  )
+  await writeFile(
+    join(
+      data,
+      'spaces',
+      'main',
+      '.notarium',
+      'skills',
+      'ready',
+      'assets',
+      '.12345678-1234-1234-1234-123456789abc.tmp',
+    ),
+    'authored package resource',
+  )
+  await writeFile(
+    join(
+      data,
+      'spaces',
+      'main',
+      '.notarium',
+      'skills',
+      'ready',
+      'assets',
+      '.draft.install-550e8400-e29b-41d4-a716-446655440000',
+      'resource.bin',
+    ),
+    'authored package directory',
+  )
   await utimes(
     join(data, 'spaces', 'main', 'note.md'),
     new Date('2020-01-02T03:04:05.000Z'),
@@ -112,10 +204,17 @@ describe('online data backup and restore', () => {
     expect(result.manifest.files.map((file) => file.path)).not.toContain(
       'data/spaces/main/.12345678-1234-1234-1234-123456789abc.tmp',
     )
+    expect(result.manifest.files.map((file) => file.path)).not.toContain(
+      'data/spaces/main/.notarium/skills/_projects/cHJvamVjdA/.draft.install-550e8400-e29b-41d4-a716-446655440000/SKILL.md',
+    )
     expect(result.manifest.files.map((file) => file.path)).toEqual(
       expect.arrayContaining([
         'data/spaces/main/model.part',
         'data/spaces/main/draft.part/kept.md',
+        'data/spaces/main/notes/.draft.install-550e8400-e29b-41d4-a716-446655440000/important.md',
+        'data/spaces/main/.notarium/skills/.draft.install-authored/kept.bin',
+        'data/spaces/main/.notarium/skills/ready/assets/.12345678-1234-1234-1234-123456789abc.tmp',
+        'data/spaces/main/.notarium/skills/ready/assets/.draft.install-550e8400-e29b-41d4-a716-446655440000/resource.bin',
       ]),
     )
 

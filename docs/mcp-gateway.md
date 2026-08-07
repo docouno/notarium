@@ -1,6 +1,6 @@
 # Notarium MCP gateway — the contract for agents (#21)
 
-The canon of the agent contract (#21). This is Notarium's **semantic MCP gateway**: one endpoint, twenty-one intent-oriented tools through which an AI agent reads and writes the knowledge base — instead of direct calls to the storage engine. The tool spec (names/signatures/rationale) — the toolset-v1 spec from the gateway tool-design spike; the note ontology (classes, what goes where) — [docs/note-model.md](note-model.md#note-ontology); the threat model — the agent-security threat model from that same spike. Here — how to use it.
+The canon of the agent contract (#21). This is Notarium's **semantic MCP gateway**: one endpoint, twenty-three intent-oriented tools through which an AI agent reads and writes the knowledge base — instead of direct calls to the storage engine. The tool spec (names/signatures/rationale) — the toolset-v1 spec from the gateway tool-design spike; the note ontology (classes, what goes where) — [docs/note-model.md](note-model.md#note-ontology); the threat model — the agent-security threat model from that same spike. Here — how to use it.
 
 Why a gateway and not "just give the agent the engine." Direct access to the storage engine hands the agent generic CRUD with no boundaries: no token scope, no provenance, no poka-yoke on class/visibility, and — most importantly — it assembles the "lethal trifecta" (private data × untrusted note content × an outbound channel). The gateway gives a narrow intent set where each axis of the trifecta is broken by construction (see "Security"). This is not a wrapper for convenience — it is a trust boundary.
 
@@ -13,12 +13,24 @@ Why a gateway and not "just give the agent the engine." Direct access to the sto
 - **`none` mode** (desktop/dev, an explicit operator opt-out): a single SYSTEM principal, no auth — same as REST there.
 - **`initialize`** returns the server `instructions` (the main lever for call order) — static text; note content is **never** mixed into it (anti tool-poisoning).
 
-## Twenty-one tools <a id="tools"></a>
+## Twenty-three tools <a id="tools"></a>
 
 The names/descriptions the agent sees in `tools/list` are static and live in [descriptions.ts](../packages/server/src/services/mcp/descriptions.ts). A summary:
 
 **Bootstrap**
 - `start_session` — call it **first** in a new session. It opens/resumes an agent episode and, when one episode binds unambiguously, returns `session.id`; retain that id and pass it as the top-level `session` argument on every later session-aware tool. In one round-trip it also returns the user profile (always-load), accessible projects and, with a `project` hint, a **compact index** of the project (a note count + top-level folders — enumerate via `list_notes`), the bound episode's own delta of changes since its last visit and `knownValues`. Without a bound episode (including ambiguous name matching), the delta follows the owner fallback. `acknowledge:false` peeks without advancing but still freezes a bound episode's independent starting position. An acknowledge advances the bound episode plus its owner fallback, or only that fallback when no episode binds; every write is monotonic, so a slower, older concurrent response cannot rewind the next delta window. Not calling it just means less context: the other tools work on their own. Curating WHAT lands in `profile.alwaysLoad`/`project.alwaysLoad` — the Agents → Context section ([docs/projects.md](projects.md#init-context-curation)): manual pins in place (`always-load`), **context sets + cross-space loose pins** and muting memory.
+  Its `roles` section contains only compact summaries from libraries the human explicitly owns;
+  the packaged catalog is never effective by itself. Pass `role` (`name` is a compatibility alias)
+  to activate one in the same call.
+- `list_roles` — page through the complete bounded inventory of effective roles after
+  `start_session.rolesTruncated:true`, or whenever its compact first page is insufficient. It
+  accepts the same project hint and returns only owned Personal/Space/Project roles, never catalog
+  templates. An underlying host/library cap is reported as `truncated:true` on this tool.
+- `use_role` — activate one effective role and load its instructions plus linked Agent Skills under
+  `budgetTokens`. Use the same project handle as `start_session` so
+  `Project > Space > Personal` precedence resolves identically. Repeating the selected name is an
+  idempotent success, but resolves and reloads the effective package because a narrower fork may
+  now win; an unknown or catalog-only name reports the roles actually available.
 - `whoami` — who I am and what I may do (principal-id, the read|write ceiling, project memberships) + the engine's `capabilities` (`vector`/`trash`/`revisions`) — so as not to probe blindly.
 - `get_my_projects` — the list of accessible projects with their slugs (for the `project` argument — do not guess the slug). The personal domain is **not** in the list (it is implied by the token).
 
@@ -52,7 +64,8 @@ The names/descriptions the agent sees in `tools/list` are static and live in [de
 
 ## Working conventions <a id="conventions"></a>
 
-- **Order.** `start_session` → retain its `session.id` → pass it to every later tool → (need a project?) survey the structure with `list_notes`/`recent_activity` → `search`/`recall` before writing → `create_note`/`remember_about_*`/`edit_note`/`link`.
+- **Order.** `start_session` (optionally with `role`) → retain its `session.id` → pass it to every later tool → page with `list_roles` if role summaries were abbreviated/omitted → when a listed role matches, `use_role` once → survey with `list_notes`/`recent_activity` → `search`/`recall` before writing → `create_note`/`remember_about_*`/`edit_note`/`link`.
+- **Loop guard.** A consecutive `search` or `recall` with identical arguments in one episode is rejected with an output-shaped empty `structuredContent` plus guidance to reuse the prior response's `noteId`/source ids through `get_note`. Change the arguments or use that result; another intervening **session-aware** call (including `start_session`) permits an intentional later refresh. The owner-only `whoami`/`get_my_projects` calls do not attach to or mutate an episode and therefore do not reset its guard.
 - **Identity is the note-id, not the path.** The id is stable across rename/move; pass exactly it into `get_note`/`edit_note`/`link`, not the title and not the path.
 - **CAS on writes.** `edit_note` requires the `versionToken` from a fresh `get_note`; a concurrent edit → `versionConflict` (the tool does not overwrite silently — the agent re-reads and retries).
 - **Personal domain ⟂ project.** The agent's memory — about the user (`remember_about_user`) and about a project (`remember_about_project`) — always lands in agent-memory (hidden from discovery, visible to the user in a separate section). Shared knowledge (`create_note`) goes to the named project (class `user-doc`). The agent does not decide "where" — the tool does.
@@ -87,6 +100,17 @@ service carried through `Ctx.session`, ready for future chat callers. A host wit
 degrades honestly: `start_session` omits the session fields and other tools silently ignore the
 argument.
 
+An episode stores at most one selected role name. `null` is the base mode; there is no synthetic
+base role. Selecting a role never changes grants or token scope. `use_role` writes the name only
+after resolving it from the effective owned library. A repeated name returns `already_active`, but
+still reloads the effective package: the same name may now resolve to a narrower Project/Space fork.
+`start_session` also reloads a resumed episode's still-effective saved role, so a fresh model
+context is not left with a durable role name but no role instructions. The durable selector is
+intentionally the role **name**, not a snapshot of one fork: resolution is repeated against the
+project hint of each bootstrap/activation. A session that moves from Project to Personal may
+therefore load the same-name Personal fork; callers retain and resend the project handle when the
+project-specific role must continue.
+
 ### Delta positions
 
 When an episode binds, the `start_session` delta is scoped by `(session.id, project.id)`. Its first
@@ -104,6 +128,34 @@ itself remains space-wide: project selection chooses a cursor partition, not a n
 query. Session positions cascade with their retained episode row; owner fallbacks survive episode
 retention and are removed with their project. This state is meta-DB-only and does not violate the
 Markdown source-of-truth boundary.
+
+## Roles and Agent Skills <a id="roles"></a>
+
+The packaged built-in catalog and writable libraries are separate sources. Catalog packages are
+read-only discovery templates and never participate in effective resolution. A bounded package is
+one valid `<name>/SKILL.md` plus optional `references/`, `scripts/`, and `assets/`; the human `Add`
+copies every package member into `.notarium/skills`, recording `notarium.origin` and
+`notarium.originRevision` in `SKILL.md`. Auxiliary package members remain byte-identical, while the
+manifest is deliberately rewritten with that provenance. The server never executes package scripts. Tool activation
+loads only the role and linked-skill instructions; resource delivery to clients remains a separate
+progressive-disclosure channel. Complete package bytes are nevertheless present in workspace
+`scope=all` export, so a client can download a ready Agent Skill without a converter. Export keeps
+the entire owned package byte-for-byte even when note frontmatter stripping is requested. The owned copy
+is never overwritten by a later catalog release.
+
+Owned scopes are Personal (private across projects), Space (shared in one space), and Project
+(stored under reserved `.notarium/skills/_projects/<encoded-project-id>/`). Same-name precedence is
+`Project > Space > Personal`. The first UI slice exposes Add to Personal and Project; Space remains
+an effective storage scope but has no separate Add action yet. There is deliberately no mutable
+server-global scope.
+
+Role discovery is bounded at both agent and settings surfaces. `start_session.roles` has a separate
+1,000-token summary budget and raises `rolesTruncated:true` when summaries were abbreviated,
+omitted, or an owned-library bound was reached; continue with paginated `list_roles`. Explicit
+activation still resolves any known effective name directly, outside the discovery window, and
+loads it through its own budget. The Roles settings response scans at most 128 placements, exposes
+at most 128 writable Project choices, and returns at most 512 owned entries, with
+`truncated:true` when the bounded view cannot cover the library.
 
 ## Security (why the set is exactly this) <a id="security"></a>
 

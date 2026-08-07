@@ -27,12 +27,33 @@ export type ToolMeta = {
 export const TOOL_META = {
   start_session: {
     description:
-      "Call this FIRST in a new session. When the host supports agent episodes, it opens or resumes one and may return `session.id`; KEEP a returned id and pass it as the top-level `session` argument on every later tool call. Address by id to resume exactly, or by a non-unique human name: a sleeping match resumes, an active match forks, and ambiguous matches return matching choices without binding a session. Loads, in one round-trip, what you would otherwise discover in several calls: the user's always-load profile, reachable projects, and — with a `project` hint — its compact index, pinned notes, delta and known vocabulary. When a session is returned, its first project touch makes the delta position independent: another session under the same credential cannot advance it. Without a bound session, the delta uses the owner fallback. `acknowledge:false` peeks without advancing and still freezes a bound session's starting position. Large bundles are truncated honestly (`truncated:true`) — fall back to list_notes/search for the rest.",
+      "Call this FIRST in a new session. When the host supports agent episodes, it opens or resumes one and may return `session.id`; KEEP a returned id and pass it as the top-level `session` argument on every later tool call. Address by id to resume exactly, or by a non-unique human name: a sleeping match resumes, an active match forks and inherits its selected role, and ambiguous matches return matching choices without binding a session. Loads the user's profile and only the roles they explicitly added — the built-in catalog is never enabled automatically. When one role clearly matches, call `use_role`; or pass canonical `role` here to receive and activate it in this same call (`name` is a compatibility alias). Resuming an episode reloads its saved effective role so a fresh model context receives the instructions again. With a `project` hint the response also carries its compact index, pinned notes, delta and vocabulary, and resolves Project > Space > Personal role overrides. `acknowledge:false` peeks without advancing. Large context bundles are truncated honestly (`truncated:true`) — fall back to list_notes/search; abbreviated or omitted role summaries use `rolesTruncated:true` and continue with `list_roles`.",
     annotations: {
       title: 'Start session',
       readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: false,
+      openWorldHint: false,
+    },
+  },
+  list_roles: {
+    description:
+      'Page through every role the human explicitly added and that is effective in the current Personal/Space/Project context. Use it when start_session reports rolesTruncated or when you need to discover beyond its compact role summaries. Pass the same project handle as start_session/use_role so Project > Space > Personal precedence matches. The built-in catalog is never listed because catalog availability does not make a role effective.',
+    annotations: {
+      title: 'List added roles',
+      readOnlyHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  use_role: {
+    description:
+      'Activate one role already added to the current Personal/Space/Project scope and load its instructions plus linked skills. Use canonical `role`; `name` is a compatibility alias. Pass the same `project` handle used for start_session so project and space overrides resolve correctly. A repeated name is an idempotent already-active success but is resolved and loaded again because a narrower project or space fork may now win. A catalog-only or unknown role is not activated and returns the roles actually available; adding catalog templates is an explicit human action in Notarium.',
+    annotations: {
+      title: 'Use an added role',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
       openWorldHint: false,
     },
   },
@@ -252,12 +273,12 @@ export const TOOL_META = {
 } as const satisfies Record<string, ToolMeta>
 
 /** The MCP `serverInfo` (returned in `initialize`). */
-export const SERVER_INFO = { name: 'notarium', version: '0.8.0' } as const
+export const SERVER_INFO = { name: 'notarium', version: '0.9.0' } as const
 
 /** The server `instructions` text (returned in `initialize`) — the main lever on
  *  call ordering; keep it a STATIC literal (no note content) and under ~200 words. */
 export const SERVER_INSTRUCTIONS = [
-  'Call `start_session` first. When it returns `session.id`, retain that id and pass it as the top-level `session` argument on every subsequent tool call. Notarium is your knowledge workspace; the bootstrap also loads your profile, projects, and what changed since you last looked.',
+  'Call `start_session` first. When it returns `session.id`, retain that id and pass it as the top-level `session` argument on every subsequent tool call. Notarium is your knowledge workspace; the bootstrap also loads your profile, projects, added roles, and what changed since you last looked.',
   'Search before you write: `search` finds existing notes — and now your own agent-memory too — so you do not create duplicates. To browse structure use `list_notes` (an `ls` of a folder) and `recent_activity` (the latest changes).',
   'Three kinds of writing: `remember_about_user` and `remember_about_project` record durable facts into private memory (about the user / about a project); `create_note` adds shared, user-visible knowledge to a project. The agent never picks where memory goes — its location is fixed. Migrating or importing many notes? Use `create_notes` and `link_many` (batch, best-effort per item) instead of one call each.',
   'Change a note with `edit_note`, addressed by words — a heading or an exact snippet, never line numbers; memory is just a note, corrected the same way. Reorganize, all `verb_entity`: a note with `move_note` (to another folder) / `rename_note` (its title); a whole folder with `move_folder` / `rename_folder` (by its `path` from list_notes); a project with `rename_project` (its handle/name) — renames are link-safe (old names keep resolving). Remove a whole note with `delete_note`: it is reversible — the note goes to the trash and the user can restore it. Connect notes with `link` — `toTitle` forward-references a note not created yet.',

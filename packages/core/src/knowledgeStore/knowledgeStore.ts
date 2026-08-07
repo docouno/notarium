@@ -314,12 +314,16 @@ export type ConflictNote = NoteContent & { id: string; versionToken: string }
  *  to name (honest degradation, P5). */
 export type ExistingNote = { id: string; title: string; filePath: string }
 
-/** One file in a base export: a note's path and its bytes AS THEY LIVE ON DISK (the full
- *  frontmatter+body file, round-trippable) — not the parsed read() view. `path` carries the mount
- *  prefix for a hidden mount included under scope `all`. */
+/** One file in a base export: its path and bytes AS THEY LIVE ON DISK — not the parsed read()
+ *  view. Markdown-backed stores may return strings; package/resource mounts return raw bytes so
+ *  arbitrary auxiliary files stay round-trippable. `path` carries the mount prefix for a hidden
+ *  mount included under scope `all`. */
 export type ExportEntry = {
   path: string
-  content: string
+  content: string | Uint8Array
+  /** Package/resource truth must bypass host presentation transforms even when
+   * its configured mount prefix is not the canonical default. */
+  preserveBytes?: boolean
 }
 
 export type SearchOptions = {
@@ -704,8 +708,9 @@ export type KnowledgeStore = {
    *  A bare engine keys graph nodes by path but must still resolve authored `[[id]]`
    *  exactly, including unclaimed external files and copied duplicate claims. */
   setLinkIdentities?(identities: ReadonlyArray<{ id: string; path: string }>): void
-  /** Stream every note file for a base export. `opts.scope` reuses the visibility axis (a user
-   *  export never sweeps agent memory; `all` = full backup). Raw on-disk bytes. Optional. */
+  /** Stream every source file for a base export. `opts.scope` reuses the visibility axis (a user
+   *  export never sweeps hidden agent state; `all` includes its mounts, but not host/meta state).
+   *  Raw on-disk bytes. Optional. */
   exportNotes?(opts?: { scope?: ReadScope }): AsyncIterable<ExportEntry>
   /** `id` is a note-id first; engines also accept their storage keys so wiki-link resolution works. */
   read(id: string, opts?: ReadOptions): Promise<NoteContent>

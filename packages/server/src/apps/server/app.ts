@@ -33,6 +33,7 @@ import type {
   SpacesPersistence,
 } from '../../services/metaDb'
 import type { MarkerStore } from '../../services/projects'
+import type { RolesService } from '../../services/roles'
 import type { SpaceManager } from '../../services/spaces'
 import { installAuthz } from './perimeter/authz'
 import { spaFallbackDecision, spaRequestDecision } from './perimeter/spaFallback'
@@ -49,6 +50,7 @@ export type BuildAppOptions = {
   spaces: SpaceManager
   auth?: AuthService
   sessions?: AgentSessionsPersistence
+  roles?: RolesService
   agentDeltaCursors?: AgentDeltaCursorsPersistence
   gatewayState?: GatewayStatePersistence
   projects?: ProjectsPersistence
@@ -89,6 +91,7 @@ export const buildApp = async ({
   spaces,
   auth,
   sessions,
+  roles,
   agentDeltaCursors,
   gatewayState,
   retrievalLog,
@@ -335,6 +338,8 @@ export const buildApp = async ({
     scopePins,
     contextOrder,
     retrievalLog,
+    sessions,
+    roles,
     markerStore,
     spacesPersistence,
     about,
@@ -358,6 +363,7 @@ export const buildApp = async ({
   await registerMcp(app, {
     spaces,
     auth: authService,
+    roles,
     sessions,
     agentDeltaCursors,
     gatewayState,

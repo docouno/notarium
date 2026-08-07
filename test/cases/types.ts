@@ -150,6 +150,18 @@ export type AgentSessionDecl = {
   createdDaysAgo: number
   lastSeenDaysAgo: number
   calls: number
+  /** Explicitly selected effective role; absent means the base mode. */
+  role?: string
+}
+
+/** One owned fork from the read-only built-in role catalog. The declaration
+ * addresses product scopes; both seed appliers resolve them to stable ids. */
+export type AgentRoleDecl = {
+  name: string
+  target:
+    | { kind: 'personal'; user?: string }
+    | { kind: 'space'; space: string }
+    | { kind: 'project'; space: string; path: string }
 }
 
 /** One durable delta position. `throughNote` resolves to that note's latest
@@ -355,6 +367,8 @@ export type CaseWorld = {
   retrievals?: RetrievalDecl[]
   /** Durable agent episodes, projected to both the fake and real meta-DB. */
   agentSessions?: AgentSessionDecl[]
+  /** Owned role packages copied from the built-in catalog. */
+  agentRoles?: AgentRoleDecl[]
   /** Owner/session delta positions, resolved against real journal revisions. */
   agentDeltaCursors?: AgentDeltaCursorDecl[]
   /** Durable job rows + their artifacts (#105) — real applier only, written after the

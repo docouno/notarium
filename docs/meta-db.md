@@ -5,7 +5,8 @@ stable identities, revision history and blobs, accounts and credentials,
 memberships, durable jobs, OAuth state, and user curation. Its SQLite and
 PostgreSQL drivers therefore share one forward-only, checksummed schema history.
 Durable owner-scoped agent episodes and their delta positions live here too
-(`agent_sessions`, `mcp_delta_owner_cursors`, `mcp_delta_session_cursors`); they
+(`agent_sessions`, including its selected role, `mcp_delta_owner_cursors`,
+`mcp_delta_session_cursors`); they
 are not reconstructible from note files. Session positions are deleted with the
 episode; owner fallbacks survive episode retention and are removed with their
 project.
@@ -22,8 +23,10 @@ Migration assets live under
 manifest.json
 sqlite/0000_baseline.sql
 sqlite/0001_agent_sessions.sql
+sqlite/0002_agent_session_role.sql
 postgres/0000_baseline.sql
 postgres/0001_agent_sessions.sql
+postgres/0002_agent_session_role.sql
 ```
 
 `0001_agent_sessions` introduces durable agent episodes and separates each
@@ -37,6 +40,10 @@ A legacy row migrates only when its scope resolves to exactly one project; unkno
 principals, missing scopes, and namespace collisions remain inert instead of being
 guessed. The old table stays for schema compatibility and inspection but is no
 longer written by the gateway.
+
+`0002_agent_session_role` adds the nullable selected role name to each durable episode.
+`NULL` is the base mode. Role package content remains file truth in `.notarium/skills`; the
+meta-DB stores only the episode's current selection.
 
 Every manifest entry has one contiguous integer version, one snake-case name,
 one SQLite/PostgreSQL file pair, and one checksum over the exact pair of files.

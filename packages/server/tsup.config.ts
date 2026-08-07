@@ -67,7 +67,7 @@ export default defineConfig({
   noExternal: [/^@notarium\//],
   esbuildPlugins: [
     {
-      name: 'copy-meta-db-migrations',
+      name: 'copy-runtime-assets',
       setup(build) {
         build.onEnd(({ errors }) => {
           if (errors.length) {
@@ -83,6 +83,12 @@ export default defineConfig({
           cpSync(new URL('postgres/', source), new URL('postgres/', destination), {
             recursive: true,
           })
+
+          const roleSource = new URL('./src/services/roles/catalog/', import.meta.url)
+          const roleDestination = new URL('./dist/role-catalog/', import.meta.url)
+          rmSync(roleDestination, { recursive: true, force: true })
+          mkdirSync(roleDestination, { recursive: true })
+          cpSync(roleSource, roleDestination, { recursive: true })
         })
       },
     },

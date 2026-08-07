@@ -4,6 +4,7 @@ import type { HostInfo } from '../../../libs/hostInfo'
 import type { ImportStagingStore } from '../../../libs/importStaging'
 import type { AuthService } from '../../../services/auth'
 import type {
+  AgentSessionsPersistence,
   ContextOrderPersistence,
   ContextSetsPersistence,
   FavoritesPersistence,
@@ -15,6 +16,7 @@ import type {
   SpacesPersistence,
 } from '../../../services/metaDb'
 import type { MarkerStore } from '../../../services/projects'
+import type { RolesService } from '../../../services/roles'
 import type { SpaceManager } from '../../../services/spaces'
 
 /** Dependency-injection options for the API routes; optional deps are honest
@@ -23,6 +25,8 @@ import type { SpaceManager } from '../../../services/spaces'
 export type ApiRoutesOptions = {
   spaces: SpaceManager
   auth: AuthService
+  roles?: RolesService
+  sessions?: AgentSessionsPersistence
   projects?: ProjectsPersistence
   folders?: FolderIdentityPersistence
   favorites?: FavoritesPersistence

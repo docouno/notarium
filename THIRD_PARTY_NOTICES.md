@@ -7,7 +7,7 @@ production packages and the optional vector native stack. First-party code is un
 the root LICENSE / NOTICE / COMMERCIAL-LICENSE.md. Browser-bundle notices live
 in packages/web/public/licenses/THIRD_PARTY_NOTICES.txt.
 
-279 components.
+280 components.
 
 | Package | Version | License |
 | --- | --- | --- |
@@ -285,6 +285,7 @@ in packages/web/public/licenses/THIRD_PARTY_NOTICES.txt.
 | which | 2.0.2 | ISC |
 | wrappy | 1.0.2 | ISC |
 | xtend | 4.0.2 | MIT |
+| yaml | 2.9.0 | ISC |
 | yauzl | 3.4.0 | MIT |
 | zip-stream | 7.0.5 | MIT |
 | zod | 3.25.76 | MIT |
@@ -25413,6 +25414,29 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
+````
+
+---
+
+## yaml  2.9.0  —  ISC
+Eemeli Aro <eemeli@gmail.com> · github:eemeli/yaml
+
+### LICENSE
+
+````text
+Copyright Eemeli Aro <eemeli@gmail.com>
+
+Permission to use, copy, modify, and/or distribute this software for any purpose
+with or without fee is hereby granted, provided that the above copyright notice
+and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
+FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS
+OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
+THIS SOFTWARE.
 ````
 
 ---

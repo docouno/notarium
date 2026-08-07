@@ -1,4 +1,5 @@
 import { agentContext } from './cases/agentContext'
+import { agentRoles } from './cases/agentRoles'
 import { agentSessions } from './cases/agentSessions'
 import { dashboardActivity } from './cases/dashboardActivity'
 import { demo } from './cases/demo'
@@ -59,6 +60,7 @@ export const CASES: readonly CaseSpec[] = [
   longDocument,
   // agent memory / context
   agentContext,
+  agentRoles,
   agentSessions,
   memoryPerf,
   // import

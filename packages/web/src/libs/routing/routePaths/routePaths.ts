@@ -188,6 +188,9 @@ export const agentContextRoute = (scope: string = DEFAULT_AGENT_CONTEXT_SCOPE): 
 /** The Agents → Audit section (#243): the agent-retrieval audit surface. */
 export const agentAuditRoute = (): string => agentsRoute('audit')
 
+/** The owned role library and discovery-only built-in catalog. */
+export const agentRolesRoute = (): string => agentsRoute('roles')
+
 /** The workspace (per-space) settings surface: `/s/<space>/management/<tab>` (#28).
  *  Members today; grows with the space's own settings. */
 export const workspaceSettingsRoute = (

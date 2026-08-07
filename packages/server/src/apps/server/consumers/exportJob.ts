@@ -3,8 +3,9 @@
 // canon: docs/export.md#async-export-via-the-jobs-layer-105 · docs/architecture.md#p1
 
 import { ZipArchive } from 'archiver'
-import { READ_SCOPE, type ReadScope, stripFrontmatter } from '@notarium/core'
+import { READ_SCOPE, type ReadScope } from '@notarium/core'
 
+import { exportEntryBody } from '../../../libs/exportEntry'
 import { safeRelAddress } from '../../../libs/relPath'
 import type { SpaceStore } from '../../../services/spaces'
 import { JobAbortedError, type JobHandler } from './jobRunner'
@@ -102,8 +103,7 @@ export const createExportHandler = (deps: ExportHandlerDeps): JobHandler => {
         if (folder && !entry.path.startsWith(prefix)) {
           continue
         }
-        const body = stripFm ? stripFrontmatter(entry.content).replace(/^\n+/, '') : entry.content
-        archive.append(body, { name: entry.path })
+        archive.append(exportEntryBody(entry, stripFm), { name: entry.path })
         done++
         // Backpressure to bound memory: wait for 'drain', raced against error/close/abort so it can never hang on a dead sink.
         if (sink.writableNeedDrain) {

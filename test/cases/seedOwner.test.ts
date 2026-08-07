@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest'
 
-import { makeOwnerRemap, resolveSeedAgentDeltaCursorOwner } from '../../scripts/seedOwner'
+import {
+  makeOwnerRemap,
+  resolveSeedAgentDeltaCursorOwner,
+  shouldAutoGrantSeedOwner,
+} from '../../scripts/seedOwner'
 
 // The catalog authors primary content as `sergey`; the real applier renames it to the
 // init user (SEED_USER, default `admin`) so the default login IS the content author —
@@ -31,6 +35,20 @@ describe('owner remap (sergey → SEED_USER)', () => {
   it('does not partial-match a different user that contains the owner name', () => {
     expect(asUser('sergey2')).toBe('sergey2')
     expect(remapPrincipal('user:sergey2')).toBe('user:sergey2')
+  })
+
+  it("auto-grants ordinary spaces but never another user's personal domain", () => {
+    expect(shouldAutoGrantSeedOwner({ primaryUsername: 'admin', asUser })).toBe(true)
+    expect(
+      shouldAutoGrantSeedOwner({
+        personalFor: 'sergey',
+        primaryUsername: 'admin',
+        asUser,
+      }),
+    ).toBe(true)
+    expect(shouldAutoGrantSeedOwner({ personalFor: 'bob', primaryUsername: 'admin', asUser })).toBe(
+      false,
+    )
   })
 
   it('derives a cursor owner from its bound non-primary session', () => {

@@ -69,6 +69,7 @@ const base = new Renderer()
 // document in the hooks.preprocess below (renderMarkdown is the one parse entry,
 // but resetting in the hook survives any future call site).
 let headingSlugs = new Set<string>()
+let headingDepthOffset = 0
 
 const headingSlug = (visibleText: string): string => {
   const slugBase = slugify(visibleText) || 'section'
@@ -123,7 +124,8 @@ marked.use({
       const plain = this.parser
         .parseInline(token.tokens, this.parser.textRenderer)
         .replace(/<[^>]*>/g, '')
-      return `<h${token.depth} id="${headingSlug(plain)}">${inner}</h${token.depth}>\n`
+      const depth = Math.min(6, token.depth + headingDepthOffset)
+      return `<h${depth} id="${headingSlug(plain)}">${inner}</h${depth}>\n`
     },
     // Images (#235): lazy-load below the fold and decode off the main thread. We
     // decorate marked's own <img> (which already escaped src/alt/title and ran
@@ -159,24 +161,62 @@ const stripLeadingFrontmatter = (md: string): string => {
   return /^\s*[\w-]+\s*:/.test(firstLine) ? md.slice(m[0].length) : md
 }
 
-export const renderMarkdown = (md = ''): string => {
+export type RenderMarkdownOptions = {
+  /** Embed a document below existing page headings without introducing a new h1. */
+  headingOffset?: number
+  /** Keep heading/footnote fragments unique when several documents share one DOM. */
+  idPrefix?: string
+}
+
+export const prefixDocumentFragments = (html: string, rawPrefix: string | undefined): string => {
+  const prefix = (rawPrefix ?? '').replace(/[^a-zA-Z0-9_-]/g, '-')
+
+  if (!prefix) {
+    return html
+  }
+  const ids = new Set([...html.matchAll(/\sid="([^"]+)"/g)].map((match) => match[1]))
+
+  return html
+    .replace(/\sid="([^"]+)"/g, (_match, id: string) => ` id="${prefix}${id}"`)
+    .replace(/\shref="#([^"]+)"/g, (match, id: string) =>
+      ids.has(id) ? ` href="#${prefix}${id}"` : match,
+    )
+    .replace(
+      /\s(aria-describedby|aria-labelledby)="([^"]+)"/g,
+      (_match, attribute: string, value: string) =>
+        ` ${attribute}="${value
+          .split(/\s+/)
+          .map((id) => (ids.has(id) ? `${prefix}${id}` : id))
+          .join(' ')}"`,
+    )
+}
+
+export const renderMarkdown = (md = '', options: RenderMarkdownOptions = {}): string => {
   const body = stripLeadingFrontmatter(md)
-  // gfm options are synchronous, so parse returns a string here (not a Promise).
-  // Wikilinks are handled by the inline extension registered above (not a pre-parse
-  // pass), so no string preprocessing wraps parse anymore.
-  const html = marked.parse(body) as string
-  // KaTeX (#237) emits `span.katex` (class + inline style) plus inline MathML for
-  // accessibility. DOMPurify's default allow-list already covers span/class/style and
-  // the core MathML tags, but NOT `<semantics>`/`<annotation>` (the TeX-source wrapper
-  // KaTeX nests in `.katex-mathml`). Allow-list those two so the MathML stays valid and
-  // the raw TeX doesn't surface as stray text via KEEP_CONTENT — the same targeted add
-  // mermaid does for foreignObject, not a loosening (both are inert container tags; JS /
-  // on*-handlers / javascript: are still stripped, and KaTeX runs with trust:false so no
-  // \href link is ever produced in the first place).
-  return DOMPurify.sanitize(html, {
-    ADD_ATTR: ['target', 'rel'],
-    ADD_TAGS: ['semantics', 'annotation'],
-  })
+  const previousOffset = headingDepthOffset
+  headingDepthOffset = Math.max(0, Math.min(5, Math.trunc(options.headingOffset ?? 0)))
+
+  try {
+    // gfm options are synchronous, so parse returns a string here (not a Promise).
+    // Wikilinks are handled by the inline extension registered above (not a pre-parse
+    // pass), so no string preprocessing wraps parse anymore.
+    const html = marked.parse(body) as string
+    // KaTeX (#237) emits `span.katex` (class + inline style) plus inline MathML for
+    // accessibility. DOMPurify's default allow-list already covers span/class/style and
+    // the core MathML tags, but NOT `<semantics>`/`<annotation>` (the TeX-source wrapper
+    // KaTeX nests in `.katex-mathml`). Allow-list those two so the MathML stays valid and
+    // the raw TeX doesn't surface as stray text via KEEP_CONTENT — the same targeted add
+    // mermaid does for foreignObject, not a loosening (both are inert container tags; JS /
+    // on*-handlers / javascript: are still stripped, and KaTeX runs with trust:false so no
+    // \href link is ever produced in the first place).
+    const sanitized = DOMPurify.sanitize(html, {
+      ADD_ATTR: ['target', 'rel'],
+      ADD_TAGS: ['semantics', 'annotation'],
+    })
+    return prefixDocumentFragments(sanitized, options.idPrefix)
+  } finally {
+    headingDepthOffset = previousOffset
+  }
 }
 
 // Pull the identifier out of a #wiki/ hash anchor click, or null if not a wikilink.

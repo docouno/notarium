@@ -129,7 +129,7 @@ export class InMemoryAgentSessions implements AgentSessionsPersistence {
     }
 
     if (match.lastSeenAt >= activeSince) {
-      const fork = { ...candidate, parentId: match.id }
+      const fork = { ...candidate, parentId: match.id, role: match.role }
       this.insertChecked(fork)
       return { kind: 'forked', record: clone(fork) }
     }
@@ -143,6 +143,17 @@ export class InMemoryAgentSessions implements AgentSessionsPersistence {
 
   async listRecent(owner: string, since: string, limit: number): Promise<AgentSessionRecord[]> {
     return this.list(owner, since, limit)
+  }
+
+  async setRole(owner: string, id: string, role: string) {
+    const record = this.records.get(id)
+
+    if (!record || record.owner !== owner) {
+      return null
+    }
+    const changed = record.role !== role
+    record.role = role
+    return { record: clone(record), changed }
   }
 
   async prune(before: string): Promise<void> {

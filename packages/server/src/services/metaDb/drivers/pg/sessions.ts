@@ -16,6 +16,7 @@ type AgentSessionRow = {
   created_at: string
   last_seen_at: string
   calls: number | string
+  role: string | null
 }
 
 const sessionOf = (row: AgentSessionRow): AgentSessionRecord => ({
@@ -27,9 +28,10 @@ const sessionOf = (row: AgentSessionRow): AgentSessionRecord => ({
   createdAt: row.created_at,
   lastSeenAt: row.last_seen_at,
   calls: Number(row.calls),
+  role: row.role,
 })
 
-const COLUMNS = 'id, owner, name, named, parent_id, created_at, last_seen_at, calls'
+const COLUMNS = 'id, owner, name, named, parent_id, created_at, last_seen_at, calls, role'
 
 type Queryable = Pick<pg.Pool, 'query'>
 
@@ -39,8 +41,8 @@ const insertSession = async (
 ): Promise<AgentSessionRecord> => {
   const result = await db.query(
     `INSERT INTO agent_sessions
-       (id, owner, name, named, parent_id, created_at, last_seen_at, calls)
-     SELECT $1, $2, $3, $4, $5, $6, $7, $8
+       (id, owner, name, named, parent_id, created_at, last_seen_at, calls, role)
+     SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9
       WHERE $5::text IS NULL
          OR EXISTS (
            SELECT 1 FROM agent_sessions
@@ -56,6 +58,7 @@ const insertSession = async (
       session.createdAt,
       session.lastSeenAt,
       session.calls,
+      session.role,
     ],
   )
   const row = result.rows[0] as AgentSessionRow | undefined
@@ -135,7 +138,11 @@ export const createSessionsFacet = (ctx: PgDriverCtx): AgentSessionsPersistence 
         } else if (match.last_seen_at >= activeSince) {
           result = {
             kind: 'forked',
-            record: await insertSession(client, { ...candidate, parentId: match.id }),
+            record: await insertSession(client, {
+              ...candidate,
+              parentId: match.id,
+              role: match.role,
+            }),
           }
         } else {
           const updated = await client.query(
@@ -170,6 +177,40 @@ export const createSessionsFacet = (ctx: PgDriverCtx): AgentSessionsPersistence 
       [owner, since, limit],
     )
     return (result.rows as AgentSessionRow[]).map(sessionOf)
+  },
+  setRole: async (owner, id, role) => {
+    await ctx.ensureInit()
+    const client = await ctx.required.connect()
+
+    try {
+      await client.query('BEGIN')
+      const selected = await client.query(
+        `SELECT ${COLUMNS} FROM agent_sessions WHERE owner = $1 AND id = $2 FOR UPDATE`,
+        [owner, id],
+      )
+      const before = selected.rows[0] as AgentSessionRow | undefined
+
+      if (!before) {
+        await client.query('COMMIT')
+        return null
+      }
+      const changed = before.role !== role
+      const row = changed
+        ? ((
+            await client.query(
+              `UPDATE agent_sessions SET role = $1 WHERE owner = $2 AND id = $3 RETURNING ${COLUMNS}`,
+              [role, owner, id],
+            )
+          ).rows[0] as AgentSessionRow)
+        : before
+      await client.query('COMMIT')
+      return { record: sessionOf(row), changed }
+    } catch (error) {
+      await client.query('ROLLBACK')
+      throw error
+    } finally {
+      client.release()
+    }
   },
   prune: async (before) => {
     await ctx.ensureInit()

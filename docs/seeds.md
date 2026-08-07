@@ -44,7 +44,7 @@ space-id — the consistency invariants from the task statement fall out «for f
 2. **Cases** (`test/cases/cases/`) — they **compose** fragments + structure + activity
    (they do not inline content). Reader cases are built FROM the corpus and auto-grow
    together with it.
-3. **Axes + coverage matrix** (`axes.ts`, `coverage.ts`) — 18 product axes, each tied to
+3. **Axes + coverage matrix** (`axes.ts`, `coverage.ts`) — 19 product axes, each tied to
    surfaces + a canon doc; cases tag `axes`. `make seed-coverage` prints the matrix; the
    coverage test fails on a gap.
 4. **Appliers** — `caseToFixture` (fake) and `scripts/seed.ts` (real). The case model is
@@ -124,15 +124,16 @@ and for `security` — it parses the sanitized HTML into a live DOM and checks t
 |---|---|---|
 | `agent-context` | pins + personal/project memory + projects of varying density (#165); **heavy pins over budget + a `Budget Lab` space for all token-budget cases #208** (personal-trim, fits / squeeze / dominant / no-pins — nesting the personal set into project Q's budget); **cross-space context set #209** (`Frontend Canon` in the `Conventions` space, connected to project Product OS + personal) **+ cross-space loose pin #209** (`Security Baseline` from `Conventions`, pinned directly into Product OS + personal) — both resolve cross-space; **retrieval audit #243** (search/recall/get_note history: hits + a recurrent vocabulary-mismatch miss + frequent queries) | agent-memory, agent-audit, structure, note-classes, scale |
 | `agent-sessions` | durable MCP episodes: active fork siblings with the same name, sleeping + automatic sessions, a hostile label for output sanitisation, an expired retention probe, a second-owner episode, and distinct root/fork/owner delta positions over one project history | agent-sessions, auth, history |
+| `agent-roles` | four principals keep the boundary visible: Fresh is catalog-only and proves rejected Add creates no Personal space; Bob owns an idle Personal fork; Maya owns same-name Personal + Space + Project forks (plus a second Project placement) with the narrowest role winning in an active episode; Sergey remains the browsable real-stand owner | agent-roles, agent-sessions, auth, structure |
 | `memory-perf` | 2700 ordinary notes + 4 personal-memory categories + 1 project-partition sentinel; reproduces memory-mount scaling, partition isolation, and graph-inert memory links | agent-memory, note-classes, scale |
 | `import-thread` | one rich imported thread | import, content |
 | `import` | a multi-format layout (claude/chatgpt/memory-json) + backdated dates-as-data → Feed year-spread (#11/#223) | import, content, activity |
 
 ## Axes and coverage
 
-18 axes (`axes.ts`): `content`, `structure`, `folder-page`, `activity`, `history`,
+19 axes (`axes.ts`): `content`, `structure`, `folder-page`, `activity`, `history`,
 `trash`, `identity`, `search`, `graph`, `agent-memory`, `note-classes`, `import`,
-`jobs`, `scale`, `auth`, `favorites`, `agent-audit`, `agent-sessions`. Each is tied to
+`jobs`, `scale`, `auth`, `favorites`, `agent-audit`, `agent-sessions`, `agent-roles`. Each is tied to
 surfaces + canon docs.
 
 ```
@@ -296,7 +297,7 @@ needed):
   `test/unit/cachedStoreMutations.test.ts`.
 - **The `attachment` / `derived` / `encrypted` classes are not seeded** — these are
   engine mounts for derived/encrypted data, not user content (a future iteration if
-  needed). What is seeded: `user-doc` / `agent-memory` / `profile`.
+  needed). What is seeded: `user-doc` / `agent-memory` / `profile` / `skill`.
 - **The fake does not express context sets (#209), cross-space loose pins (#209), and order (#210).**
   The fake's snapshot carries no stable note-id that a set item / scope pin / order entry
   refers to — so `world.contextSets`, `world.scopePins`, and `world.contextOrder` are

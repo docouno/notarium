@@ -5,6 +5,7 @@
 // propagate through the pipe to the sink) must reject the handler, NOT hang it forever
 // (the round-2 regression the sink-destroy-on-archive-error fix closes).
 
+import AdmZip from 'adm-zip'
 import { Writable } from 'node:stream'
 import { describe, expect, it } from 'vitest'
 
@@ -56,11 +57,14 @@ const memArtifacts = () => {
 
 /** A store whose exportNotes yields the given entries; `onFirst` fires as the walk
  *  starts (used to abort the run mid-walk). */
-const storeOf = (entries: Array<{ path: string; content: unknown }>, onFirst?: () => void) => ({
+const storeOf = (
+  entries: Array<{ path: string; content: unknown; preserveBytes?: boolean }>,
+  onFirst?: () => void,
+) => ({
   async *exportNotes() {
     onFirst?.()
     for (const e of entries) {
-      yield e as { path: string; content: string }
+      yield e as { path: string; content: string | Uint8Array; preserveBytes?: boolean }
     }
   },
 })
@@ -119,7 +123,7 @@ describe('createExportHandler (#105)', () => {
     const artifacts = memArtifacts()
     const store = storeOf([
       { path: 'docs/a.md', content: '# A\n\nbody' },
-      { path: 'root.md', content: '# Root\n\nbody' },
+      { path: 'assets/template.bin', content: Uint8Array.from([0, 1, 2, 255]) },
     ])
     const reports: Array<{ done: number; total?: number | null; phase?: string | null }> = []
     const { handler, ctx } = ctxOf(store, artifacts, { report: async (p) => void reports.push(p) })
@@ -129,9 +133,38 @@ describe('createExportHandler (#105)', () => {
     expect(out.result).toEqual({ count: 2 })
     // Published under the final ref; the temp part is gone (renamed away).
     expect(artifacts.files.has('S/j1.zip')).toBe(true)
+    const zip = new AdmZip(artifacts.files.get('S/j1.zip')!)
+    expect(zip.readAsText('docs/a.md')).toBe('# A\n\nbody')
+    expect(zip.readFile('assets/template.bin')).toEqual(Buffer.from([0, 1, 2, 255]))
     expect([...artifacts.files.keys()].some((k) => k.endsWith('.part'))).toBe(false)
     // The final report carries the REAL count as the total (100% for a narrowed export).
     expect(reports.at(-1)).toMatchObject({ done: 2, total: 2, phase: 'done' })
+  })
+
+  it('strips note frontmatter but preserves complete Agent Skill package bytes', async () => {
+    const artifacts = memArtifacts()
+    const note = '---\ntitle: Note\n---\n\n# Note\n'
+    const skill = '---\nname: role\ndescription: Role.\n---\n\n# Role\n'
+    const guide = '---\ntitle: Authored resource\n---\n\n# Guide\n'
+    const { handler, ctx } = ctxOf(
+      storeOf([
+        { path: 'note.md', content: note },
+        { path: '.roles-library/role/SKILL.md', content: skill, preserveBytes: true },
+        {
+          path: '.roles-library/role/references/guide.md',
+          content: guide,
+          preserveBytes: true,
+        },
+      ]),
+      artifacts,
+      { job: { params: { scope: 'all', frontmatter: 'strip' } } },
+    )
+
+    await handler(ctx)
+    const zip = new AdmZip(artifacts.files.get('S/j1.zip')!)
+    expect(zip.readAsText('note.md')).toBe('# Note\n')
+    expect(zip.readAsText('.roles-library/role/SKILL.md')).toBe(skill)
+    expect(zip.readAsText('.roles-library/role/references/guide.md')).toBe(guide)
   })
 
   it('an abort mid-walk removes only this run’s temp part and never publishes the ref', async () => {

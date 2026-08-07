@@ -33,7 +33,7 @@ import { treeRoutes } from './tree'
 import type { ApiRoutesOptions } from './types'
 
 export const apiRoutes = async (app: FastifyInstance, opts: ApiRoutesOptions) => {
-  const { spaces, auth, contextSets, scopePins, contextOrder, retrievalLog } = opts
+  const { spaces, auth, contextSets, scopePins, contextOrder, retrievalLog, roles, sessions } = opts
   const ctx = buildApiRouteCtx(opts)
 
   await app.register(authRoutes, {
@@ -44,6 +44,9 @@ export const apiRoutes = async (app: FastifyInstance, opts: ApiRoutesOptions) =>
     scopePins,
     contextOrder,
     retrievalLog,
+    projects: opts.projects,
+    roles,
+    sessions,
   })
 
   // Plain calls, NOT app.register: keeps every family in one plugin scope

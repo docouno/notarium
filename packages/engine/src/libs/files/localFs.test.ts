@@ -347,6 +347,51 @@ describe('localFs remove errors (#262)', () => {
   })
 })
 
+describe('localFs raw export', () => {
+  it('excludes atomic install staging trees at project depth but preserves other dot resources', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+    const project = join(root, '_projects', 'cHJvamVjdA')
+    const temp = join(project, '.draft.install-550e8400-e29b-41d4-a716-446655440000')
+    await fs.mkdir(join(project, 'ready'), { recursive: true })
+    await fs.mkdir(temp, { recursive: true })
+    await fs.mkdir(join(project, 'ready', '.authored'), { recursive: true })
+    await fs.mkdir(
+      join(project, 'ready', 'assets', '.draft.install-550e8400-e29b-41d4-a716-446655440000'),
+      { recursive: true },
+    )
+    await fs.writeFile(join(project, 'ready', 'SKILL.md'), 'published')
+    await fs.writeFile(join(project, 'ready', '.authored', 'resource.bin'), Buffer.from([0, 255]))
+    await fs.writeFile(
+      join(project, 'ready', '.draft.install-550e8400-e29b-41d4-a716-446655440000'),
+      'authored file',
+    )
+    await fs.writeFile(join(temp, 'SKILL.md'), 'partial')
+    await fs.writeFile(
+      join(
+        project,
+        'ready',
+        'assets',
+        '.draft.install-550e8400-e29b-41d4-a716-446655440000',
+        'resource.bin',
+      ),
+      'authored directory',
+    )
+    const exported = []
+
+    for await (const entry of files.exportFiles!()) {
+      exported.push(entry.path)
+    }
+
+    expect(exported.sort()).toEqual([
+      '_projects/cHJvamVjdA/ready/.authored/resource.bin',
+      '_projects/cHJvamVjdA/ready/.draft.install-550e8400-e29b-41d4-a716-446655440000',
+      '_projects/cHJvamVjdA/ready/SKILL.md',
+      '_projects/cHJvamVjdA/ready/assets/.draft.install-550e8400-e29b-41d4-a716-446655440000/resource.bin',
+    ])
+  })
+})
+
 describe('localFs pathname occupancy', () => {
   it('returns null for a FIFO without waiting for a writer', async () => {
     const root = await mkroot()

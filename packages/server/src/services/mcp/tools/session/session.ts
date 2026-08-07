@@ -1,12 +1,13 @@
 // start_session: the agent bootstrap bundle — profile/always-load, per-project index + delta, known-values vocabulary.
 // canon: docs/mcp-gateway.md#tools · docs/projects.md#init-context-curation
-import { CONTEXT_KIND } from '@notarium/contract'
+import { CONTEXT_KIND, type RoleSummary } from '@notarium/contract'
 import {
   type AgentSession,
   type DeltaEntry,
   type FolderEntry,
   type RecentAgentSession,
   type StartSessionInput,
+  type UseRoleOutput,
 } from '@notarium/contract/tools'
 import { buildMemoryIndex, isPathUnder, READ_SCOPE, treeChildren } from '@notarium/core'
 
@@ -24,10 +25,12 @@ import {
   weighAlwaysLoad,
 } from '../../../spaces'
 import { weighScopeContextSets, weighScopeOrder, weighScopePins } from '../../../storeAccess'
-import { type Ctx, type Handler, toolsHelpFor } from '../../gateway'
+import { type Ctx, type Handler, ToolFailure, toolsHelpFor } from '../../gateway'
 import { handleOf, notePath, projectLabelForNote } from '../../helpers/projectAddressing'
 import { renderSession } from '../../helpers/render'
+import { curateRoleSummaries } from '../../helpers/roleSummaries'
 import { sanitizeText } from '../../sanitize'
+import { activateRole, assertRoleAvailable, roleContext, startSessionRoleSelector } from '../roles'
 
 // ── start_session / dedup tuning ────────────────────────────────
 
@@ -39,6 +42,8 @@ const INDEX_FOLDERS_LIMIT = 50
 /** Known-values caps: the start_session vocabulary, kept compact. */
 const KNOWN_CATEGORIES_LIMIT = 50
 const KNOWN_TAGS_LIMIT = 50
+/** Compact first-page discovery budget; list_roles paginates the continuation. */
+const ROLE_SUMMARIES_TOKEN_BUDGET = 1_000
 
 /** Session names are agent-supplied labels, so normalise control characters and
  * defang prompt-control pseudo-tags before storage and every wire projection. */
@@ -372,13 +377,36 @@ const buildKnownValues = async (
 export const handleStartSession: Handler = async (ctx, rawArgs) => {
   const {
     project,
+    role,
+    name,
     session: sessionRequest,
     acknowledge,
     responseFormat,
   } = rawArgs as StartSessionInput
+  const selectedRole = startSessionRoleSelector({ role, name })
   // A project hint is a handle: resolve collapses existence + reachability into one
   // 404-semantic error (anti-enumeration).
   const hinted = project !== undefined ? await ctx.resolveProject(project) : undefined
+  const effectiveRoleContext = await roleContext(ctx, hinted)
+  const effectiveRoleListing = ctx.roles
+    ? await ctx.roles.listEffective(effectiveRoleContext)
+    : { roles: [], truncated: false }
+  const effectiveRoles = effectiveRoleListing.roles
+  const selectedRolePackage = selectedRole
+    ? await ctx.roles?.loadEffective(effectiveRoleContext, selectedRole, 4_000)
+    : undefined
+
+  if (selectedRole) {
+    if (!ctx.roles) {
+      throw new ToolFailure('roles are unavailable on this host')
+    }
+    // Reject unavailable/catalog-only selectors before opening or touching a
+    // durable session: an invalid bootstrap request must have no session side effect.
+    if (!selectedRolePackage) {
+      assertRoleAvailable(effectiveRoles, selectedRole, effectiveRoleListing.truncated)
+      throw new ToolFailure(`role "${selectedRole}" is not available in this scope`)
+    }
+  }
   const now = ctx.now()
   const opened =
     ctx.agentSessions && ctx.sessionOwner
@@ -400,6 +428,28 @@ export const handleStartSession: Handler = async (ctx, rawArgs) => {
     truncated: curationTruncated,
   } = await curateAgentContext(ctx, hinted)
   const bundle = hinted ? await buildProjectBundle(ctx, hinted, acknowledge) : undefined
+  const curatedRoles = curateRoleSummaries(effectiveRoles, ROLE_SUMMARIES_TOKEN_BUDGET)
+  const roles: RoleSummary[] = curatedRoles.roles
+  // A resumed episode must rehydrate its saved prompt after client/model context
+  // loss. Explicit same-role selection and implicit resume both include the body.
+  const savedRole = opened?.session?.record.role
+  const roleToHydrate = selectedRole ?? savedRole
+  const rolePackageToHydrate = selectedRolePackage
+    ? selectedRolePackage
+    : roleToHydrate && ctx.roles
+      ? await ctx.roles.loadEffective(effectiveRoleContext, roleToHydrate, 4_000)
+      : null
+  const activeRole: UseRoleOutput | undefined =
+    roleToHydrate && rolePackageToHydrate
+      ? await activateRole(
+          ctx,
+          effectiveRoleContext,
+          roleToHydrate,
+          4_000,
+          rolePackageToHydrate,
+          effectiveRoleListing,
+        )
+      : undefined
   // Fold bundle-internal `indexTruncated` into the top-level signal, then drop it.
   const truncated = curationTruncated || Boolean(bundle?.indexTruncated)
 
@@ -426,6 +476,9 @@ export const handleStartSession: Handler = async (ctx, rawArgs) => {
     ...(session ? { session } : {}),
     ...(recentSessions ? { recentSessions } : {}),
     profile,
+    roles,
+    ...(curatedRoles.truncated || effectiveRoleListing.truncated ? { rolesTruncated: true } : {}),
+    ...(activeRole ? { activeRole } : {}),
     projects: projects.map((p) => ({ ...p, displayName: sanitizeText(p.displayName) })),
     ...(bundle
       ? {

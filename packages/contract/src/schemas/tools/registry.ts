@@ -35,6 +35,12 @@ import {
   RenameProjectOutputSchema,
 } from './reorg'
 import {
+  ListRolesInputSchema,
+  ListRolesOutputSchema,
+  UseRoleInputSchema,
+  UseRoleOutputSchema,
+} from './roles'
+import {
   CreateNoteInputSchema,
   CreateNotesInputSchema,
   CreateNotesOutputSchema,
@@ -52,6 +58,8 @@ import {
  *  canon: docs/contract.md#registry */
 export const tools = {
   start_session: { input: StartSessionInputSchema, output: StartSessionOutputSchema },
+  list_roles: { input: ListRolesInputSchema, output: ListRolesOutputSchema },
+  use_role: { input: UseRoleInputSchema, output: UseRoleOutputSchema },
   whoami: { input: WhoamiInputSchema, output: WhoamiOutputSchema },
   get_my_projects: { input: GetMyProjectsInputSchema, output: GetMyProjectsOutputSchema },
   list_notes: { input: ListNotesInputSchema, output: ListNotesOutputSchema },
@@ -88,6 +96,8 @@ export const toolNames = Object.keys(tools) as ToolName[]
  *  canon: docs/architecture.md#p14 */
 export const toolActions = {
   start_session: 'space:read',
+  list_roles: 'space:read',
+  use_role: 'space:read',
   whoami: 'self:read',
   get_my_projects: 'spaces:list',
   list_notes: 'space:read',

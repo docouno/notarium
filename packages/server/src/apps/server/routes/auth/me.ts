@@ -6,14 +6,20 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify'
 
 import {
+  AddAgentRoleRequestSchema,
+  AddAgentRoleResponseSchema,
   AgentAuditQuerySchema,
   AgentAuditResponseSchema,
+  AgentRoleDetailParamsSchema,
+  AgentRoleDetailQuerySchema,
+  AgentRoleDetailResponseSchema,
   ConnectionPatchRequestSchema,
   ConnectionsResponseSchema,
   CONTEXT_KIND,
   ContextOrderRequestSchema,
   ContextPinRequestSchema,
   MeAgentContextResponseSchema,
+  MeAgentRolesResponseSchema,
   MeMemoryResponseSchema,
   MeSchema,
   OkResponseSchema,
@@ -24,18 +30,30 @@ import {
   PatsResponseSchema,
   ProfilePutRequestSchema,
   ProfileResponseSchema,
+  type RoleInventoryEntry,
 } from '@notarium/contract'
 import { HTTP_STATUS } from '@notarium/contract/http'
 
 import { withAuthors } from '../../../../libs/authors'
+import { AGENT_SESSION_IDLE_MS } from '../../../../services/agentSessions'
 import { AuthError, type AuthService } from '../../../../services/auth'
 import { can } from '../../../../services/authz'
+import { projectSummaryOf } from '../../../../services/mcp/helpers/projectAddressing'
 import type {
+  AgentSessionsPersistence,
   ContextOrderPersistence,
   ContextSetsPersistence,
+  ProjectsPersistence,
   RetrievalLogPersistence,
   ScopePinsPersistence,
 } from '../../../../services/metaDb'
+import {
+  CatalogRoleNotFoundError,
+  ROLE_SCOPE,
+  RoleAlreadyExistsError,
+  RoleDependencyConflictError,
+  type RolesService,
+} from '../../../../services/roles'
 import {
   curatePersonalScope,
   ensurePersonalSpaceFor,
@@ -56,6 +74,24 @@ import {
 } from '../../../../services/storeAccess'
 import { authz, setSessionCookie } from './_helpers'
 
+const ROLE_DETAIL_TOKEN_BUDGET = 65_536
+const ROLE_INVENTORY_LIMIT = 512
+const ROLE_INVENTORY_LOCATION_LIMIT = 128
+const ROLE_PROJECT_SUMMARY_LIMIT = 128
+
+const personalRoleForWire = (role: {
+  name: string
+  description: string
+  origin?: string
+  originRevision?: string
+}): RoleInventoryEntry => ({
+  name: role.name,
+  description: role.description,
+  scope: ROLE_SCOPE.personal,
+  ...(role.origin !== undefined ? { origin: role.origin } : {}),
+  ...(role.originRevision !== undefined ? { originRevision: role.originRevision } : {}),
+})
+
 export const meRoutes = async (
   app: FastifyInstance,
   {
@@ -66,6 +102,9 @@ export const meRoutes = async (
     scopePins,
     contextOrder,
     retrievalLog,
+    roles,
+    sessions,
+    projects: projectsForRoles,
   }: {
     spaces: SpaceManager
     auth: AuthService
@@ -74,6 +113,9 @@ export const meRoutes = async (
     scopePins?: ScopePinsPersistence
     contextOrder?: ContextOrderPersistence
     retrievalLog?: RetrievalLogPersistence
+    roles?: RolesService
+    sessions?: AgentSessionsPersistence
+    projects?: ProjectsPersistence
   },
 ) => {
   app.get('/api/me', { config: authz('self:read', 'host') }, async (req) => {
@@ -257,6 +299,257 @@ export const meRoutes = async (
       budgetTokens: PERSONAL_TOKEN_BUDGET,
     })
   })
+
+  // ── roles: packaged catalog is discovery-only; only owned copies are effective.
+  app.get('/api/me/agent-roles', { config: authz('self:read', 'host') }, async (req) => {
+    if (!roles) {
+      return MeAgentRolesResponseSchema.parse({
+        catalog: [],
+        roles: [],
+        projects: [],
+        activeRole: null,
+      })
+    }
+    const personal = await peekPersonalSpace({ auth, spaces }, req.principal)
+    const readableSpaces = spaces
+      .list()
+      .map((space) => space.id)
+      .filter((space) => can(req.principal, 'space:read', { space }))
+    const projects = await contextProjectsFor(readableSpaces)
+    const summaries = []
+    let writableProjectCount = 0
+
+    for (const project of projects) {
+      if (!can(req.principal, 'space:write', { space: project.space })) {
+        continue
+      }
+      writableProjectCount++
+      if (summaries.length < ROLE_PROJECT_SUMMARY_LIMIT) {
+        summaries.push(projectSummaryOf(project, spaces.slugOf(project.space) ?? project.space))
+      }
+    }
+    const personalLocations = [
+      ...(personal ? [{ location: { scope: ROLE_SCOPE.personal, space: personal } as const }] : []),
+    ]
+    const projectLocations = projects.map((project) => ({
+      location: {
+        scope: ROLE_SCOPE.project,
+        space: project.space,
+        projectId: project.id,
+      } as const,
+      project: projectSummaryOf(project, spaces.slugOf(project.space) ?? project.space).handle,
+    }))
+    const spaceLocations = [
+      ...readableSpaces
+        .filter((space) => space !== personal)
+        .map((space) => ({ location: { scope: ROLE_SCOPE.space, space } as const })),
+    ]
+    // Settings primarily creates Project forks. Keep those visible before the
+    // descriptive Space layer when a principal can read more locations than one
+    // bounded inventory request may scan.
+    const locations = [...personalLocations, ...projectLocations, ...spaceLocations].slice(
+      0,
+      ROLE_INVENTORY_LOCATION_LIMIT,
+    )
+    const inventory: RoleInventoryEntry[] = []
+    let inventoryTruncated =
+      personalLocations.length + projectLocations.length + spaceLocations.length >
+        ROLE_INVENTORY_LOCATION_LIMIT || writableProjectCount > ROLE_PROJECT_SUMMARY_LIMIT
+
+    for (const source of locations.slice(0, ROLE_INVENTORY_LOCATION_LIMIT)) {
+      const listing = await roles.listAt(source.location)
+      inventoryTruncated ||= listing.truncated
+      const entries = listing.roles.map((role): RoleInventoryEntry => {
+        if (role.scope === ROLE_SCOPE.personal) {
+          return personalRoleForWire(role)
+        }
+
+        return {
+          ...role,
+          space: spaces.slugOf(role.space) ?? role.space,
+          ...('project' in source ? { project: source.project } : {}),
+        } as RoleInventoryEntry
+      })
+      const remaining: number = ROLE_INVENTORY_LIMIT - inventory.length
+
+      if (entries.length > remaining) {
+        inventoryTruncated = true
+      }
+      inventory.push(...entries.slice(0, remaining))
+      if (inventory.length === ROLE_INVENTORY_LIMIT) {
+        inventoryTruncated ||= source !== locations.at(-1)
+        break
+      }
+    }
+    const owner = req.principal.username ?? (req.principal.system ? 'system' : null)
+    const active =
+      sessions && owner
+        ? await sessions.listRecent(
+            owner,
+            new Date(Date.now() - AGENT_SESSION_IDLE_MS).toISOString(),
+            2,
+          )
+        : []
+
+    return MeAgentRolesResponseSchema.parse({
+      catalog: await roles.listCatalog(),
+      roles: inventory,
+      projects: summaries,
+      activeRole: active.length === 1 ? active[0].role : null,
+      ...(inventoryTruncated ? { truncated: true } : {}),
+    })
+  })
+
+  // Read the exact catalog template or owned fork the card addresses. This is
+  // deliberately NOT effective-role resolution: two same-name forks at different
+  // scopes remain separately inspectable instead of the narrower one replacing the
+  // content the user clicked.
+  app.get('/api/me/agent-roles/:name', { config: authz('self:read', 'host') }, async (req) => {
+    if (!roles) {
+      throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+    }
+    const { name } = AgentRoleDetailParamsSchema.parse(req.params)
+    const query = AgentRoleDetailQuerySchema.parse(req.query)
+    let detail
+
+    if (query.scope === ROLE_SCOPE.catalog) {
+      detail = await roles.loadCatalog(name, ROLE_DETAIL_TOKEN_BUDGET)
+    } else if (query.scope === ROLE_SCOPE.personal) {
+      const personal = await peekPersonalSpace({ auth, spaces }, req.principal)
+
+      if (personal) {
+        detail = await roles.loadAt(
+          { scope: ROLE_SCOPE.personal, space: personal },
+          name,
+          ROLE_DETAIL_TOKEN_BUDGET,
+        )
+      }
+    } else if (query.scope === ROLE_SCOPE.space) {
+      const space = spaces.resolveId(query.space)
+
+      if (
+        space &&
+        can(req.principal, 'space:read', { space }) &&
+        !(await auth.isPersonalSpace(space))
+      ) {
+        detail = await roles.loadAt(
+          { scope: ROLE_SCOPE.space, space },
+          name,
+          ROLE_DETAIL_TOKEN_BUDGET,
+        )
+      }
+    } else {
+      const readableSpaces = spaces
+        .list()
+        .map((space) => space.id)
+        .filter((space) => can(req.principal, 'space:read', { space }))
+      const project = (await contextProjectsFor(readableSpaces)).find(
+        (entry) =>
+          projectSummaryOf(entry, spaces.slugOf(entry.space) ?? entry.space).handle ===
+          query.project,
+      )
+
+      if (project) {
+        detail = await roles.loadAt(
+          { scope: ROLE_SCOPE.project, space: project.space, projectId: project.id },
+          name,
+          ROLE_DETAIL_TOKEN_BUDGET,
+        )
+      }
+    }
+
+    if (!detail) {
+      throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+    }
+
+    return AgentRoleDetailResponseSchema.parse(detail)
+  })
+
+  app.post('/api/me/agent-roles', { config: authz('self:manage', 'host') }, async (req, reply) => {
+    if (!roles) {
+      throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+    }
+    const body = AddAgentRoleRequestSchema.parse(req.body ?? {})
+
+    // Validate the discovery-only source before a Personal add can lazily mint
+    // durable user state. A missing template is a pure 404.
+    if (!(await roles.hasCatalog(body.name))) {
+      throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+    }
+    let location
+
+    if (body.scope === ROLE_SCOPE.personal) {
+      if (!req.principal.username && !req.principal.system) {
+        throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+      }
+      const personal = req.principal.username
+        ? await ensurePersonalSpaceFor({ auth, spaces }, req.principal.username)
+        : spaces.list()[0]?.id
+
+      if (!personal) {
+        throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+      }
+      location = { scope: ROLE_SCOPE.personal, space: personal } as const
+    } else {
+      const readableSpaces = spaces
+        .list()
+        .map((space) => space.id)
+        .filter((space) => can(req.principal, 'space:read', { space }))
+      const projects = await contextProjectsFor(readableSpaces)
+      const project = projects.find(
+        (entry) =>
+          projectSummaryOf(entry, spaces.slugOf(entry.space) ?? entry.space).handle ===
+          body.project,
+      )
+
+      if (!project || !can(req.principal, 'space:write', { space: project.space })) {
+        throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+      }
+      location = {
+        scope: ROLE_SCOPE.project,
+        space: project.space,
+        projectId: project.id,
+      } as const
+    }
+    try {
+      const role = await roles.addFromCatalog(body.name, location)
+      const project = role.projectId && body.project ? { project: body.project } : {}
+      const wireRole =
+        role.scope === ROLE_SCOPE.personal
+          ? personalRoleForWire(role)
+          : {
+              ...role,
+              space: spaces.slugOf(role.space) ?? role.space,
+              ...project,
+            }
+      return reply.code(HTTP_STATUS.CREATED).send(
+        AddAgentRoleResponseSchema.parse({
+          role: wireRole,
+        }),
+      )
+    } catch (err) {
+      if (err instanceof RoleAlreadyExistsError) {
+        throw new AuthError(HTTP_STATUS.CONFLICT, err.message, 'role_exists')
+      }
+      if (err instanceof RoleDependencyConflictError) {
+        throw new AuthError(HTTP_STATUS.CONFLICT, err.message, 'role_dependency_conflict')
+      }
+      if (err instanceof CatalogRoleNotFoundError) {
+        throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+      }
+      throw err
+    }
+  })
+
+  const contextProjectsFor = async (readableSpaces: string[]) => {
+    if (!projectsForRoles || !readableSpaces.length) {
+      return []
+    }
+
+    return (await projectsForRoles.listForSpaces(readableSpaces)).filter(
+      (project) => project.status === 'active',
+    )
+  }
 
   // Attach a context set to MY personal scope. The receiver is only me, so no
   // personal/shared restriction (unlike a shared project). Mints the personal

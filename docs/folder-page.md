@@ -11,7 +11,7 @@
   (`packages/core/src/libs/path/path.ts`). This is an ordinary note: it lands for free in the
   graph/search/indexing, is edited/versioned by the standard note-reader — **zero bespoke**.
   Only its name gives it the meaning of "folder body".
-- **NOT in `.notarium/`.** That mount is for hidden service classes (agent-memory/profile,
+- **NOT in `.notarium/`.** That mount is for hidden service classes (agent-memory/profile/skill,
   `userSearch/graph/tree=false`, #78/P11). A folder page, on the contrary, MUST be in the graph/search/
   links, so it lives as a sibling in the folder itself (like the `.notariummeta` marker — deliberately
   not under `.notarium/`).

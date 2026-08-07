@@ -3,7 +3,7 @@
 // contract surface — the archive holds one entry per note at its filePath, the
 // raw on-disk file form (frontmatter + body, round-trippable); `frontmatter=strip`
 // cuts the YAML block; `scope` is the visibility axis (default `user` drops the
-// agent-memory mount, `all` is a full backup); `folder` narrows to a subtree; and
+// agent-memory mount, `all` includes hidden space-file mounts); `folder` narrows to a subtree; and
 // an unknown space 404s like every space-scoped route (anti-enumeration). The fake
 // reconstructs each file from its snapshot, so this asserts SHAPE, not byte-parity.
 
@@ -76,7 +76,7 @@ describe('base export (#17): GET /api/s/:space/export', () => {
     expect(files['docs/a.md']).toContain('notarium-id:')
   })
 
-  it('scope=all adds the agent-memory mount (full backup)', async () => {
+  it('scope=all adds the hidden agent-memory mount', async () => {
     const { files } = await exportZip('?scope=all')
     expect(Object.keys(files).sort()).toEqual(['.notarium/memory/m.md', 'docs/a.md', 'root.md'])
     expect(files['.notarium/memory/m.md']).toContain('private memory token')

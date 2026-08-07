@@ -9,11 +9,14 @@ import type { FastifyInstance } from 'fastify'
 
 import type { AuthService } from '../../../../services/auth'
 import type {
+  AgentSessionsPersistence,
   ContextOrderPersistence,
   ContextSetsPersistence,
+  ProjectsPersistence,
   RetrievalLogPersistence,
   ScopePinsPersistence,
 } from '../../../../services/metaDb'
+import type { RolesService } from '../../../../services/roles'
 import type { SpaceManager } from '../../../../services/spaces'
 import type { StoreAccess } from '../../../../services/storeAccess'
 import { authFlowRoutes } from './authFlow'
@@ -31,6 +34,9 @@ export const authRoutes = async (
     scopePins?: ScopePinsPersistence
     contextOrder?: ContextOrderPersistence
     retrievalLog?: RetrievalLogPersistence
+    roles?: RolesService
+    sessions?: AgentSessionsPersistence
+    projects?: ProjectsPersistence
   },
 ) => {
   // Family handlers just throw; AuthError → wire envelope mapping is centralized

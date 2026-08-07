@@ -9,7 +9,7 @@ import { describe, expect, it } from 'vitest'
 // and is exercised live.
 import './markdown'
 import { errText } from '../mermaid'
-import { wikiLinkTarget } from './markdown'
+import { prefixDocumentFragments, wikiLinkTarget } from './markdown'
 
 const render = (src: string): string => marked.parse(src) as string
 
@@ -96,6 +96,18 @@ describe('#235 heading ids', () => {
   it('falls back to a "section" id when the text has no letters at all', () => {
     // An emoji is not a letter — the fallback is what keeps the heading addressable.
     expect(render('## 🎉')).toContain('id="section"')
+  })
+})
+
+describe('document fragment prefixes', () => {
+  it('keeps a footnote ARIA IDREF bound to its prefixed label', () => {
+    const html = prefixDocumentFragments(render('Claim[^1]\n\n[^1]: Evidence.\n'), 'role-')
+    const ids = new Set([...html.matchAll(/\sid="([^"]+)"/g)].map((match) => match[1]))
+    const describedBy = /\saria-describedby="([^"]+)"/.exec(html)?.[1].split(/\s+/) ?? []
+
+    expect(describedBy.length).toBeGreaterThan(0)
+    expect(describedBy.every((id) => ids.has(id))).toBe(true)
+    expect(describedBy).toContain('role-footnote-label')
   })
 })
 

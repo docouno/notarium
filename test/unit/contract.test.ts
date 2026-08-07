@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
+  AddAgentRoleRequestSchema,
+  AddAgentRoleResponseSchema,
+  AgentRoleDetailRequestSchema,
+  AgentRoleDetailResponseSchema,
   BucketsQuerySchema,
   BucketsResponseSchema,
   ConfigSchema,
@@ -11,6 +15,7 @@ import {
   GraphResponseSchema,
   MarkProjectRequestSchema,
   MeAgentContextResponseSchema,
+  MeAgentRolesResponseSchema,
   MoveFolderRequestSchema,
   MoveRequestSchema,
   MoveResponseSchema,
@@ -576,5 +581,22 @@ describe('agent context constructor (#165)', () => {
     expect(contract.pinNote.response).toBe(PinNoteResponseSchema)
     expect(contract.muteNote.request).toBe(MuteNoteRequestSchema)
     expect(contract.muteNote.response).toBe(MuteNoteResponseSchema)
+  })
+})
+
+describe('agent roles', () => {
+  it('registers inventory, detail, and Add operations in the central REST contract', () => {
+    expect(contract.agentRoles.response).toBe(MeAgentRolesResponseSchema)
+    expect(contract.agentRoleDetail.request).toBe(AgentRoleDetailRequestSchema)
+    expect(contract.agentRoleDetail.response).toBe(AgentRoleDetailResponseSchema)
+    expect(contract.agentRoleAdd.request).toBe(AddAgentRoleRequestSchema)
+    expect(contract.agentRoleAdd.response).toBe(AddAgentRoleResponseSchema)
+  })
+
+  it('combines detail path params and query into one registry request schema', () => {
+    expect(
+      AgentRoleDetailRequestSchema.safeParse({ name: 'research', scope: 'catalog' }).success,
+    ).toBe(true)
+    expect(AgentRoleDetailRequestSchema.safeParse({ name: 'research' }).success).toBe(false)
   })
 })

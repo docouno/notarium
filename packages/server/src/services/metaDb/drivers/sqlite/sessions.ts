@@ -14,6 +14,7 @@ type AgentSessionRow = {
   created_at: string
   last_seen_at: string
   calls: number
+  role: string | null
 }
 
 const sessionOf = (row: AgentSessionRow): AgentSessionRecord => ({
@@ -25,16 +26,17 @@ const sessionOf = (row: AgentSessionRow): AgentSessionRecord => ({
   createdAt: row.created_at,
   lastSeenAt: row.last_seen_at,
   calls: row.calls,
+  role: row.role,
 })
 
-const COLUMNS = 'id, owner, name, named, parent_id, created_at, last_seen_at, calls'
+const COLUMNS = 'id, owner, name, named, parent_id, created_at, last_seen_at, calls, role'
 
 const insertSession = (ctx: SqliteDriverCtx, session: AgentSessionRecord): AgentSessionRecord => {
   const row = ctx.required
     .prepare(
       `INSERT INTO agent_sessions
-         (id, owner, name, named, parent_id, created_at, last_seen_at, calls)
-       SELECT ?, ?, ?, ?, ?, ?, ?, ?
+         (id, owner, name, named, parent_id, created_at, last_seen_at, calls, role)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
         WHERE ? IS NULL
            OR EXISTS (
              SELECT 1 FROM agent_sessions
@@ -51,6 +53,7 @@ const insertSession = (ctx: SqliteDriverCtx, session: AgentSessionRecord): Agent
       session.createdAt,
       session.lastSeenAt,
       session.calls,
+      session.role,
       session.parentId,
       session.parentId,
       session.owner,
@@ -124,7 +127,11 @@ export const createSessionsFacet = (ctx: SqliteDriverCtx): AgentSessionsPersiste
         } else if (match.last_seen_at >= activeSince) {
           result = {
             kind: 'forked',
-            record: insertSession(ctx, { ...candidate, parentId: match.id }),
+            record: insertSession(ctx, {
+              ...candidate,
+              parentId: match.id,
+              role: match.role,
+            }),
           }
         } else {
           const row = ctx.required
@@ -158,6 +165,35 @@ export const createSessionsFacet = (ctx: SqliteDriverCtx): AgentSessionsPersiste
       )
       .all(owner, since, limit) as AgentSessionRow[]
     return rows.map(sessionOf)
+  },
+  setRole: async (owner, id, role) => {
+    await ctx.ensureInit()
+    ctx.required.exec('BEGIN IMMEDIATE')
+    try {
+      const before = ctx.required
+        .prepare(`SELECT ${COLUMNS} FROM agent_sessions WHERE owner = ? AND id = ?`)
+        .get(owner, id) as AgentSessionRow | undefined
+
+      if (!before) {
+        ctx.required.exec('COMMIT')
+        return null
+      }
+      const changed = before.role !== role
+      const row = changed
+        ? (ctx.required
+            .prepare(
+              `UPDATE agent_sessions SET role = ? WHERE owner = ? AND id = ? RETURNING ${COLUMNS}`,
+            )
+            .get(role, owner, id) as AgentSessionRow)
+        : before
+      ctx.required.exec('COMMIT')
+      return { record: sessionOf(row), changed }
+    } catch (error) {
+      if (ctx.required.isTransaction) {
+        ctx.required.exec('ROLLBACK')
+      }
+      throw error
+    }
   },
   prune: async (before) => {
     await ctx.ensureInit()

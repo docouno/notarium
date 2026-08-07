@@ -32,12 +32,15 @@ import {
   createFsArtifactStore,
   createFsImportStagingStore,
   createImportHandler,
+  createInMemoryRoleLibrary,
   createJobRunner,
+  createRolesService,
   hashPassword,
   hostInfoFrom,
   JOB_KIND_EXPORT,
   JOB_KIND_IMPORT,
   jobToWire,
+  loadBuiltinRoleCatalog,
   type MarkerStore,
   markFolderAsProject,
   type MetaDb,
@@ -48,7 +51,7 @@ import {
   type SpaceRecord,
   SqliteMetaDb,
 } from '@notarium/server'
-
+import type { AgentRoleDecl } from '../cases/types'
 import { InMemoryAgentDeltaCursors } from './agentDeltaCursors'
 import { InMemoryAgentSessions } from './agentSessions'
 import { InMemoryAuthPersistence } from './authPersistence'
@@ -145,6 +148,7 @@ export type Fixture = {
   capabilities?: { spaceCreate?: boolean }
   auth?: AuthFixture
   agentSessions?: AgentSessionRecord[]
+  agentRoles?: AgentRoleDecl[]
   /** Omit the durable job layer from buildApp — reproduces a none-mode host
    *  with no meta-DB backing jobs, so the async-export routes 404 and the client falls
    *  back to the synchronous streaming export (the capability-degradation tier). */
@@ -445,6 +449,52 @@ export const createApp = async (
   // populate it is I0c). Registry-only here (no markerStore) — markFolderAsProject
   // upserts the row directly. AFTER init so space-slugs translate to their ids.
   projects.seed(projectRecords(fixture, idOf))
+  const roleLibrary = createInMemoryRoleLibrary()
+  const roles = createRolesService({ catalog: loadBuiltinRoleCatalog, library: roleLibrary })
+
+  const seedRoles = async (fx: Fixture): Promise<void> => {
+    roleLibrary.clear()
+
+    for (const declaration of fx.agentRoles ?? []) {
+      const target = declaration.target
+
+      if (target.kind === 'personal') {
+        const user = target.user
+          ? fx.auth?.users.find((candidate) => candidate.username === target.user)
+          : fx.auth?.users[0]
+        const personal = user?.personalSpace
+
+        if (!personal) {
+          throw new Error(`fixture personal role ${declaration.name} has no personal space`)
+        }
+        await roles.addFromCatalog(declaration.name, {
+          scope: 'personal',
+          space: idOf(personal),
+        })
+        continue
+      }
+      if (target.kind === 'space') {
+        await roles.addFromCatalog(declaration.name, {
+          scope: 'space',
+          space: idOf(target.space),
+        })
+        continue
+      }
+      const project = projectRecords(fx, idOf).find(
+        (candidate) => candidate.space === idOf(target.space) && candidate.path === target.path,
+      )
+
+      if (!project) {
+        throw new Error(`fixture role ${declaration.name} references an unknown project`)
+      }
+      await roles.addFromCatalog(declaration.name, {
+        scope: 'project',
+        space: project.space,
+        projectId: project.id,
+      })
+    }
+  }
+  await seedRoles(fixture)
   // Deterministic tests want every fixture space live before the first request — no
   // lazy-boot timing in the suite (now keyed + booted by the stable id).
   for (const rec of manager.list()) {
@@ -566,6 +616,7 @@ export const createApp = async (
     spaces: manager,
     auth,
     sessions: fixture.noAgentSessions ? undefined : agentSessions,
+    roles,
     agentDeltaCursors,
     gatewayState,
     retrievalLog,
@@ -667,6 +718,7 @@ export const createApp = async (
     retrievalLog.clear()
     oauthDb.clear()
     projects.seed(projectRecords(next, idOf))
+    await seedRoles(next)
     favorites.clear()
     contextSets.clear()
     scopePins.clear()

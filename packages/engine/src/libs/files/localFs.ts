@@ -18,8 +18,7 @@ import { promises as fs, constants as fsConstants, watch as fsWatch } from 'node
 import { dirname, join, relative, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
 
-import { clipToBytes, UNNAMED_NOTE_FILENAME } from '@notarium/core'
-
+import { clipToBytes, isAtomicInstallTempPath, UNNAMED_NOTE_FILENAME } from '@notarium/core'
 import type { FileStat, FileStore } from './types'
 
 /** Directory entries the scan never descends into: dotfiles hide editor/state
@@ -1478,6 +1477,51 @@ export const createLocalFsFiles = (root: string): FileStore => {
       }
       await walk(rootAbs)
       return out
+    },
+
+    async *exportFiles() {
+      const walk = async function* (
+        dirAbs: string,
+      ): AsyncIterable<{ path: string; content: Uint8Array }> {
+        let entries
+
+        try {
+          entries = await fs.readdir(dirAbs, { withFileTypes: true })
+        } catch (err) {
+          if (errnoCode(err) === 'ENOENT') {
+            return // vanished during export — the next snapshot reconverges
+          }
+          throw err
+        }
+        for (const entry of entries) {
+          // Atomic role installs can stage at the mount root or below a Project
+          // namespace. They are never published package truth and must not leak
+          // into a concurrent export. Other dot resources are preserved.
+          const full = join(dirAbs, entry.name)
+          const exportPath = toPosix(relative(rootAbs, full))
+
+          if (entry.isDirectory() && isAtomicInstallTempPath(exportPath)) {
+            continue
+          }
+
+          if (entry.isDirectory()) {
+            yield* walk(full)
+          } else if (entry.isFile()) {
+            try {
+              yield {
+                path: exportPath,
+                content: await fs.readFile(full),
+              }
+            } catch (err) {
+              if (errnoCode(err) !== 'ENOENT') {
+                throw err
+              }
+            }
+          }
+        }
+      }
+
+      yield* walk(rootAbs)
     },
 
     listDirs: async () => {

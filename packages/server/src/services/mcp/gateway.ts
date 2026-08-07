@@ -30,6 +30,7 @@ import type {
   ScopePinsPersistence,
 } from '../metaDb'
 import { type MarkerStore } from '../projects'
+import type { RolesService } from '../roles'
 import { ensurePersonalSpace, type SpaceManager } from '../spaces'
 import { createStoreAccess, type StoreAccess } from '../storeAccess'
 import { TOOL_META, type ToolAnnotations } from './descriptions'
@@ -54,11 +55,13 @@ import {
   handleRecentActivity,
   handleSearch,
 } from './tools/read'
+import { handleListRoles, handleUseRole } from './tools/roles'
 import { handleStartSession } from './tools/session'
 
 export type GatewayDeps = {
   spaces: SpaceManager
   auth: AuthService
+  roles?: RolesService
   /** Durable, owner-scoped agent episodes. Absent means the whole session feature
    *  degrades away: start_session emits no session and regular calls ignore it. */
   sessions?: AgentSessionsPersistence
@@ -134,6 +137,7 @@ export type Ctx = {
   agentDeltaCursors?: AgentDeltaCursorsPersistence
   gatewayState?: GatewayStatePersistence
   agentSessions?: AgentSessions
+  roles?: RolesService
   /** Stable session owner: username in password mode, `system` in none mode. */
   sessionOwner: string | null
   /** Episode attached to this call. start_session fills it after opening one. */
@@ -176,12 +180,51 @@ const errorResult = (text: string): ToolResult => ({
   isError: true,
 })
 
+const LOOP_GUARDED_TOOLS = new Set<ToolName>(['search', 'recall'])
+const LOOP_GUARD_MAX_SESSIONS = 2_048
+
+const loopGuardResult = (name: 'search' | 'recall'): ToolResult => {
+  const structured = name === 'search' ? { results: [] } : { context: '', sources: [] }
+  // Keep an error response output-shaped too: typed MCP clients must not lose
+  // their contract merely because the procedural safety rail refused a repeat.
+  const valid = tools[name].output.parse(structured)
+  return {
+    content: [
+      {
+        type: 'text',
+        text: `identical ${name} arguments already returned a result in this session — reuse the noteId/source noteIds from the previous response and call get_note, or change the arguments`,
+      },
+    ],
+    structuredContent: valid,
+    isError: true,
+  }
+}
+
+const stableJson = (value: unknown): string => {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableJson).join(',')}]`
+  }
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .filter(([key]) => key !== 'session')
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => `${JSON.stringify(key)}:${stableJson(entry)}`)
+      .join(',')}}`
+  }
+
+  return JSON.stringify(value)
+}
+
 export const createGateway = (deps: GatewayDeps): McpGateway => {
   const store = createStoreAccess(deps.spaces)
   const now = deps.now ?? (() => new Date())
   const agentSessions = deps.sessions
     ? createAgentSessions({ persistence: deps.sessions, now })
     : undefined
+  // A local safety rail against a model burning its turn budget on the exact
+  // same procedural call. It is deliberately consecutive-only: any other tool
+  // call clears the marker, so an intentional later refresh remains possible.
+  const lastProceduralBySession = new Map<string, string>()
 
   const ctxFor = (principal: Principal): Ctx => {
     // Both return the STABLE space id — the gateway addresses stores/meta-DB by id;
@@ -213,6 +256,7 @@ export const createGateway = (deps: GatewayDeps): McpGateway => {
       agentDeltaCursors: deps.agentDeltaCursors,
       gatewayState: deps.gatewayState,
       agentSessions,
+      roles: deps.roles,
       sessionOwner: principal.username ?? (principal.system ? 'system' : null),
       now,
       personalSpace,
@@ -363,6 +407,7 @@ export const createGateway = (deps: GatewayDeps): McpGateway => {
       }
       try {
         const ctx = ctxFor(principal)
+        let loopGuard: { session: string; signature: string } | undefined
 
         if (
           agentSessions &&
@@ -374,6 +419,18 @@ export const createGateway = (deps: GatewayDeps): McpGateway => {
           const sessionId = (parsed.data as { session?: string }).session
           ctx.session = (await agentSessions.attach(ctx.sessionOwner, sessionId)) ?? undefined
         }
+        if (ctx.session) {
+          if (LOOP_GUARDED_TOOLS.has(name as ToolName)) {
+            const signature = `${name}\0${stableJson(parsed.data)}`
+
+            if (lastProceduralBySession.get(ctx.session.record.id) === signature) {
+              return loopGuardResult(name as 'search' | 'recall')
+            }
+            loopGuard = { session: ctx.session.record.id, signature }
+          } else {
+            lastProceduralBySession.delete(ctx.session.record.id)
+          }
+        }
         const { markdown, structured } = await handler(ctx, parsed.data)
         // Validate the machine payload against the contract before it leaves (P9
         // boundary discipline): a drift fails loudly here, never silently corrupts
@@ -383,6 +440,19 @@ export const createGateway = (deps: GatewayDeps): McpGateway => {
         if (!out.success) {
           console.error(`[mcp] ${name} output drift ->`, out.error.issues[0]?.message)
           return errorResult('internal error: malformed tool response')
+        }
+        // start_session binds only inside its handler, after the pre-handler attach
+        // seam above. A successful bootstrap is still an intervening tool call and
+        // must clear a procedural marker left before compaction/reconnect.
+        if (name === 'start_session' && ctx.session) {
+          lastProceduralBySession.delete(ctx.session.record.id)
+        }
+        if (loopGuard) {
+          lastProceduralBySession.delete(loopGuard.session)
+          lastProceduralBySession.set(loopGuard.session, loopGuard.signature)
+          if (lastProceduralBySession.size > LOOP_GUARD_MAX_SESSIONS) {
+            lastProceduralBySession.delete(lastProceduralBySession.keys().next().value!)
+          }
         }
         // Retrieval audit: fire-and-forget AFTER the answer is built, so capture never
         // adds latency and a failed append never fails the call.
@@ -463,6 +533,8 @@ export const toolsHelpFor = (principal: Principal): ToolHelp[] =>
  *  canon: docs/mcp-gateway.md#tools */
 const HANDLERS: Partial<Record<ToolName, Handler>> = {
   start_session: handleStartSession,
+  list_roles: handleListRoles,
+  use_role: handleUseRole,
   whoami: handleWhoami,
   get_my_projects: handleGetMyProjects,
   list_notes: handleListNotes,

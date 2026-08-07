@@ -68,15 +68,23 @@ contains:
 
 - `data/meta.db`: accounts, sessions, memberships, stable identities, history
   and job state;
-- `data/spaces/`: Markdown truth, including agent-memory and project markers;
+- `data/spaces/`: workspace truth, including Markdown, agent-memory, project markers, and complete
+  binary role/skill packages;
 - `data/jobs/`: completed artifacts and durable import uploads;
 - `manifest.json`: format version, timestamp, exact directories, file sizes,
   mtimes and SHA-256 checksums.
 
 Only Notarium-owned incomplete files are omitted: dot-named atomic note temps,
+exact `.<role>.install-<uuid>` role-package staging directories at a Personal/Space library root or
+an exact `_projects/<encoded-project-id>/` library root,
 `jobs/imports/<space>/<job>.import.part`, and in-progress export artifact parts.
 Ordinary user files or directories ending in `.part` are legitimate and remain
 in the backup. `data/engine/` is derived and omitted; it rebuilds after restore.
+
+This image-native backup covers the canonical one-root layout under `SPACES_ROOT`,
+including its default `.notarium/skills` mounts. An embedded host that configures
+a physical mount outside that root owns that adapter's backup/restore capability;
+the online archive cannot discover arbitrary external storage from filesystem paths.
 
 Do not replace this with `cp /data/meta.db`: WAL mode means committed rows may
 still be in `meta.db-wal`, and independently copied files are not a point-in-time

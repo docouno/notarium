@@ -2,6 +2,7 @@ import { z } from 'zod'
 import { AGENT_SESSION_STATE } from '../../consts/tools'
 import { enumValues } from '../../libs/enumValues'
 import { IsoTimestampSchema, RevisionKindSchema } from '../primitives'
+import { EffectiveRoleSummarySchema, RoleNameSchema } from '../rest/agent/roles'
 import { PatScopeSchema } from '../rest/pats'
 import { AgentSessionIdSchema, locationFields } from './_fields'
 import {
@@ -38,6 +39,10 @@ export const StartSessionInputSchema = z.object({
   project: ProjectHandleSchema.optional(),
   /** Free-form task hint; no v1 effect. */
   task: z.string().optional(),
+  /** Canonical explicit role selector. `name` is a compatibility alias for
+   * schema-literal local clients; when given, the role body rides this response. */
+  role: RoleNameSchema.optional(),
+  name: RoleNameSchema.optional(),
   /** Address an existing session by id, or open/resume/fork by a non-unique name.
    * Exactly one key avoids silently accepting a stale id/name pair. */
   session: z
@@ -116,6 +121,29 @@ export const StartSessionOutputSchema = z.object({
   session: AgentSessionSchema.optional(),
   recentSessions: z.array(RecentAgentSessionSchema).optional(),
   profile: SessionProfileSchema,
+  /** Only user-added effective roles; the built-in catalog is never sent to an agent. */
+  roles: z.array(EffectiveRoleSummarySchema),
+  /** The compact first page omitted roles or an owned-library bound was reached;
+   * continue discovery with list_roles. */
+  rolesTruncated: z.boolean().optional(),
+  /** Full activation payload when start_session selected a role explicitly. */
+  activeRole: z
+    .object({
+      status: z.enum(['activated', 'already_active']),
+      role: EffectiveRoleSummarySchema,
+      instructions: z.string().optional(),
+      skills: z
+        .array(
+          z.object({
+            name: RoleNameSchema,
+            description: z.string(),
+            instructions: z.string(),
+          }),
+        )
+        .optional(),
+      truncated: z.boolean().optional(),
+    })
+    .optional(),
   projects: z.array(ProjectSummarySchema),
   project: z
     .object({

@@ -38,7 +38,7 @@ const fmtBytes = (n: number | null): string => {
 export const ExportTab = () => {
   const { space } = useSpace()
   const [keepFrontmatter, setKeepFrontmatter] = useState(true)
-  const [includeMemory, setIncludeMemory] = useState(false)
+  const [includeAgentState, setIncludeAgentState] = useState(false)
   const { job, error, busy, start, cancel, reset } = useExportJob(space)
   // Auto-download once when the artifact becomes ready (the expected end of the
   // flow); a manual "Download again" stays available afterwards. `sawBusy` gates it to
@@ -49,7 +49,7 @@ export const ExportTab = () => {
 
   const opts = {
     frontmatter: keepFrontmatter ? ('keep' as const) : ('strip' as const),
-    scope: includeMemory ? ('all' as const) : ('user' as const),
+    scope: includeAgentState ? ('all' as const) : ('user' as const),
   }
 
   const onExport = async () => {
@@ -113,16 +113,16 @@ export const ExportTab = () => {
       />
 
       <SettingsSection
-        title="Include agent memory"
-        description="Add this space's private agent memory for a full backup. Off exports only your notes."
-        htmlFor="export-include-memory"
+        title="Include agent state"
+        description="Add this space's private agent memory and complete installed role/skill packages. This remains a space export: accounts, grants, history, and jobs are not included. Off exports only your notes."
+        htmlFor="export-include-agent-state"
         action={
           <Switch
-            id="export-include-memory"
-            checked={includeMemory}
-            onChange={setIncludeMemory}
+            id="export-include-agent-state"
+            checked={includeAgentState}
+            onChange={setIncludeAgentState}
             disabled={busy}
-            data-testid="export-include-memory"
+            data-testid="export-include-agent-state"
           />
         }
       />

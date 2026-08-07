@@ -27,12 +27,14 @@ import type {
   ScopePinsPersistence,
 } from '../../../../services/metaDb'
 import type { MarkerStore } from '../../../../services/projects'
+import type { RolesService } from '../../../../services/roles'
 import type { SpaceManager } from '../../../../services/spaces'
 import { baseUrlOf, wwwAuthenticateChallenge } from '../oauth'
 
 export type McpOptions = {
   spaces: SpaceManager
   auth: AuthService
+  roles?: RolesService
   sessions?: AgentSessionsPersistence
   agentDeltaCursors?: AgentDeltaCursorsPersistence
   gatewayState?: GatewayStatePersistence
@@ -99,6 +101,7 @@ export const registerMcp = async (
   {
     spaces,
     auth,
+    roles,
     sessions,
     agentDeltaCursors,
     gatewayState,
@@ -118,6 +121,7 @@ export const registerMcp = async (
   const gateway = createGateway({
     spaces,
     auth,
+    roles,
     sessions,
     agentDeltaCursors,
     gatewayState,

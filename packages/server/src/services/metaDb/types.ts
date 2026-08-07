@@ -529,6 +529,13 @@ export type AgentSessionRecord = {
   createdAt: string
   lastSeenAt: string
   calls: number
+  /** Latest explicitly selected effective role, or null for the base mode. */
+  role: string | null
+}
+
+export type AgentSessionRoleSet = {
+  record: AgentSessionRecord
+  changed: boolean
 }
 
 /** Atomic outcome of starting a named session. The persistence layer owns the
@@ -562,6 +569,8 @@ export type AgentSessionsPersistence = {
     limit: number,
   ): Promise<AgentSessionNamedStart>
   listRecent(owner: string, since: string, limit: number): Promise<AgentSessionRecord[]>
+  /** Set the active role atomically; `changed=false` is the idempotent repeat. */
+  setRole(owner: string, id: string, role: string): Promise<AgentSessionRoleSet | null>
   prune(before: string): Promise<void>
 }
 

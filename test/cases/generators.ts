@@ -1,5 +1,6 @@
 import type {
   AgentDeltaCursorDecl,
+  AgentRoleDecl,
   AgentSessionDecl,
   CaseEvent,
   CaseNoteClass,
@@ -169,6 +170,7 @@ export class WorldBuilder {
   private readonly favorites: FavoriteDecl[] = []
   private readonly retrievals: RetrievalDecl[] = []
   private readonly agentSessions: AgentSessionDecl[] = []
+  private readonly agentRoles: AgentRoleDecl[] = []
   private readonly agentDeltaCursors: AgentDeltaCursorDecl[] = []
   private readonly jobs: JobDecl[] = []
   private readonly durableImports: DurableImportDecl[] = []
@@ -314,6 +316,12 @@ export class WorldBuilder {
     return this
   }
 
+  /** Copy a built-in role into an owned personal or project library. */
+  agentRole(decl: AgentRoleDecl): this {
+    this.agentRoles.push(decl)
+    return this
+  }
+
   /** Declare an owner fallback or one episode's project delta position. */
   agentDeltaCursor(decl: AgentDeltaCursorDecl): this {
     this.agentDeltaCursors.push(decl)
@@ -362,6 +370,7 @@ export class WorldBuilder {
       favorites: this.favorites.length ? this.favorites : undefined,
       ...(this.retrievals.length ? { retrievals: this.retrievals } : {}),
       ...(this.agentSessions.length ? { agentSessions: this.agentSessions } : {}),
+      ...(this.agentRoles.length ? { agentRoles: this.agentRoles } : {}),
       ...(this.agentDeltaCursors.length ? { agentDeltaCursors: this.agentDeltaCursors } : {}),
       ...(this.jobs.length ? { jobs: this.jobs } : {}),
       ...(this.durableImports.length ? { durableImports: this.durableImports } : {}),

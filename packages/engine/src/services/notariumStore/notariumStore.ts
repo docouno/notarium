@@ -2139,13 +2139,13 @@ export class NotariumStore implements KnowledgeStore {
     this.scheduleReclaim()
   }
 
-  /** Stream every note file for a base export (#17). Walks the on-disk truth
-   *  directly (scan + read per mount), NOT the index — the export ships the
-   *  user's actual files, raw bytes incl. the `notarium-id` frontmatter, so the
-   *  archive round-trips. `scope` reuses the visibility class set: `user`
+  /** Stream every source file for a base export (#17). Walks the on-disk truth
+   *  directly, NOT the index — the export ships the user's actual files, incl.
+   *  the `notarium-id` frontmatter and binary package resources, so the archive
+   *  round-trips. `scope` reuses the visibility class set: `user`
    *  (default) keeps only user-visible mounts — agent-memory's dot-namespaced
    *  mount falls out, so the personal memory never lands in a "my notes"
-   *  download; `all` is the full backup. Async + per-file so the host zips and
+   *  download; `all` is the full space-file export, not a host/meta backup. Async + per-file so the host zips and
    *  streams without holding the base in memory (P-scale headroom). Paths carry
    *  the mount prefix (a hidden mount's files surface as `.notarium/memory/...`
    *  under `all`). The engine doesn't enforce visibility (#78) — but export is a
@@ -2157,6 +2157,16 @@ export class NotariumStore implements KnowledgeStore {
 
     for (const mount of this.mounts) {
       if (!allowed.has(mount.class)) {
+        continue
+      }
+      if (mount.class === 'skill' && mount.files.exportFiles) {
+        for await (const entry of mount.files.exportFiles()) {
+          yield {
+            path: this.fullIn(mount, entry.path),
+            content: entry.content,
+            preserveBytes: true,
+          }
+        }
         continue
       }
       for (const entry of await mount.files.scan()) {

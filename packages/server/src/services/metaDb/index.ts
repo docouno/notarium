@@ -13,6 +13,7 @@ export type {
   AgentDeltaCursorScope,
   AgentDeltaCursorsPersistence,
   AgentSessionRecord,
+  AgentSessionRoleSet,
   AgentSessionNamedStart,
   AgentSessionsPersistence,
   AuthPersistence,

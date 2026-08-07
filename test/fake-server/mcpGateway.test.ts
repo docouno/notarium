@@ -233,10 +233,12 @@ describe('tools/list scope filter (#10/#21)', () => {
       'get_my_projects',
       'get_note',
       'list_notes',
+      'list_roles',
       'recall',
       'recent_activity',
       'search',
       'start_session',
+      'use_role',
       'whoami',
     ])
     expect(names).not.toContain('create_note')
@@ -266,6 +268,7 @@ describe('tools/list scope filter (#10/#21)', () => {
       'link',
       'link_many',
       'list_notes',
+      'list_roles',
       'move_folder',
       'move_note',
       'recall',
@@ -277,6 +280,7 @@ describe('tools/list scope filter (#10/#21)', () => {
       'rename_project',
       'search',
       'start_session',
+      'use_role',
       'whoami',
     ])
   })

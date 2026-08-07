@@ -6,9 +6,9 @@ import { NOTE_CLASS } from '../knowledgeStore'
 import type { NoteClass } from '../knowledgeStore'
 import type { ClassPolicy } from './types'
 
-/** The class registry v1 with its policy matrix. The notes-index only
- *  scans `.md`, so in practice only `user-doc` and `agent-memory` produce index
- *  rows today; `attachment` (non-md files) and `derived` (regenerable, app-data)
+/** The class registry v1 with its policy matrix. The notes-index scans `.md`, so
+ *  user-doc, agent-memory, profile, and Markdown skill members can produce rows;
+ *  `attachment` (non-md files) and `derived` (regenerable, app-data)
  *  carry their policies here for forward-compat and for surfaces that reason
  *  about them, but do not appear as note rows in v1 (conscious boundary). */
 export const CLASS_POLICY: Record<NoteClass, ClassPolicy> = {
@@ -67,6 +67,22 @@ export const CLASS_POLICY: Record<NoteClass, ClassPolicy> = {
     // Versioned + replicated like any user truth. Found by the personal layer
     // via an explicit `all`-scope read (invisible to every discovery scope by
     // design — see personalContent.findProfileNote / gateway.buildProfile).
+    index: true,
+    graph: false,
+    feed: false,
+    tree: false,
+    userSearch: false,
+    agentRecall: false,
+    versioned: true,
+    replicate: true,
+  },
+  [NOTE_CLASS.skill]: {
+    // Installed Agent Skills are file truth in the hidden skills mount. They are
+    // deliberately absent from every generic discovery surface: the dedicated
+    // Agents section and role service are the only catalog/library readers.
+    // These note policies apply to scanned Markdown members. Auxiliary package
+    // bytes stay outside the note journal but ride the package-aware all-scope
+    // export and data backup verbatim.
     index: true,
     graph: false,
     feed: false,

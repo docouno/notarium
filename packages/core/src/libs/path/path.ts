@@ -28,6 +28,24 @@ export const isFolderPageNote = (filePath: string): boolean =>
 export const folderPageFilePath = (folderPath: string): string =>
   folderPath ? `${folderPath}/${FOLDER_PAGE_FILENAME}` : FOLDER_PAGE_FILENAME
 
+/** Exact operation-owned staging directory name used while publishing a package. */
+export const isAtomicInstallTempName = (name: string): boolean =>
+  /^\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.install-[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(
+    name,
+  )
+
+/** A staging path is reserved only at a Personal/Space library root or at the
+ * exact `_projects/<encoded-id>` root. Same-looking package resources are data. */
+export const isAtomicInstallTempPath = (path: string): boolean => {
+  const parts = path.split('/')
+  const name = parts.at(-1) ?? ''
+
+  return (
+    isAtomicInstallTempName(name) &&
+    (parts.length === 1 || (parts.length === 3 && parts[0] === '_projects' && Boolean(parts[1])))
+  )
+}
+
 /** UTF-8 size of one code point — counted, not encoded: this runs per character of
  *  every title and core is bundled for the browser too, so no Buffer and no
  *  TextEncoder allocation per name. */
