@@ -13,6 +13,7 @@ import { safeRelAddress } from '../../../../libs/relPath'
 import { type Handler, ToolFailure } from '../../gateway'
 import { dedupedWrite, wireSpace, writeEcho, type WriteRun } from '../../helpers/dedup'
 import { notePath, projectLabelForNote } from '../../helpers/projectAddressing'
+import { writeAttributionOf } from '../../helpers/writeAttribution'
 import { sanitizeText } from '../../sanitize'
 
 export const handleEditNote: Handler = async (ctx, rawArgs) => {
@@ -44,7 +45,7 @@ export const handleEditNote: Handler = async (ctx, rawArgs) => {
         section,
         find,
         versionToken,
-        principal: ctx.principal.id,
+        ...writeAttributionOf(ctx),
       })
       return {
         noteId: r.id ?? '',
@@ -87,7 +88,7 @@ export const handleDeleteNote: Handler = async (ctx, rawArgs) => {
   )
   const path = notePath(note.filePath)
   // Soft-delete → the space trash (reversible). canon: docs/trash.md#model
-  await hit.store.remove(noteId, { principal: ctx.principal.id })
+  await hit.store.remove(noteId, writeAttributionOf(ctx))
   const structured: Record<string, unknown> = {
     noteId,
     title: sanitizeText(note.title ?? '(untitled)'),
@@ -197,7 +198,7 @@ export const handleRenameNote: Handler = async (ctx, rawArgs) => {
     title,
     content: note.content,
     versionToken: note.versionToken,
-    principal: ctx.principal.id,
+    ...writeAttributionOf(ctx),
   })
   const newPath = notePath(r.filePath)
   const projectHandle = labelFor(r.filePath)

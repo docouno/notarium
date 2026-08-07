@@ -19,6 +19,24 @@ CREATE INDEX idx_agent_sessions_owner_name_seen
 CREATE INDEX idx_agent_sessions_seen
   ON agent_sessions(last_seen_at);
 
+ALTER TABLE agent_retrievals ADD COLUMN session_id TEXT;
+ALTER TABLE agent_retrievals ADD COLUMN session_name TEXT;
+ALTER TABLE agent_retrievals ADD COLUMN session_attach TEXT
+  CHECK (session_attach IS NULL OR session_attach IN ('declared', 'inferred'));
+
+CREATE INDEX idx_agent_retrievals_owner_session_created
+  ON agent_retrievals(owner, session_id, created_at DESC);
+
+ALTER TABLE note_revisions ADD COLUMN agent_owner TEXT;
+ALTER TABLE note_revisions ADD COLUMN agent_name TEXT;
+ALTER TABLE note_revisions ADD COLUMN session_id TEXT;
+ALTER TABLE note_revisions ADD COLUMN session_name TEXT;
+ALTER TABLE note_revisions ADD COLUMN session_attach TEXT
+  CHECK (session_attach IS NULL OR session_attach IN ('declared', 'inferred'));
+
+CREATE INDEX idx_note_revisions_agent_session_created
+  ON note_revisions(agent_owner, session_id, created_at DESC);
+
 CREATE UNIQUE INDEX idx_folders_id_type
   ON folders(id, type);
 
@@ -76,13 +94,15 @@ CREATE TRIGGER trg_agent_delta_project_retype
 -- space id/slug to a project id. Principal ids have a stable grammar; resolve
 -- every live scope to a project and collapse one owner's credentials to the
 -- furthest revision. Unresolvable legacy rows remain inert in mcp_bookmarks.
+-- @system is deliberately outside the username grammar: an AUTH_MODE switch
+-- must not merge the authless host's cursor with a password user's state.
 -- Keep mcp_bookmarks inert for one compatibility window; current code never
 -- reads or writes it after this migration.
 WITH parsed AS (
   SELECT
     principal_id AS actor_key,
     CASE
-      WHEN principal_id = 'ui' THEN 'system'
+      WHEN principal_id = 'ui' THEN '@system'
       WHEN principal_id LIKE 'pat:%:%' THEN split_part(principal_id, ':', 2)
       WHEN principal_id LIKE 'oauth:%:%' THEN split_part(principal_id, ':', 2)
       ELSE NULL

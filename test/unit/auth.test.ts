@@ -7,6 +7,8 @@ import { describe, expect, it } from 'vitest'
 
 import {
   type Action,
+  AGENT_SYSTEM_OWNER,
+  agentOwnerOf,
   can,
   createAuthService,
   hashPassword,
@@ -213,6 +215,12 @@ const principal = (over: Partial<Principal>): Principal => ({
 })
 
 describe('can(): scopes(token) ∩ grants(principal), case by case', () => {
+  it('keeps the authless agent owner disjoint from every valid username', () => {
+    expect(agentOwnerOf(principal({ system: true, username: null }))).toBe(AGENT_SYSTEM_OWNER)
+    expect(agentOwnerOf(principal({ username: 'system' }))).toBe('system')
+    expect(AGENT_SYSTEM_OWNER).not.toMatch(/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/)
+  })
+
   it('system principal short-circuits everything (AUTH_MODE=none)', () => {
     const sys = principal({ system: true })
     const actions: Action[] = ['space:read', 'note:delete', 'users:manage', 'spaces:create']

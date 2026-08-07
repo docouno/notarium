@@ -1,6 +1,7 @@
 import pg from 'pg'
 import { afterEach, expect, it, vi } from 'vitest'
 
+import { AGENT_SYSTEM_OWNER } from '../../packages/server/src/services/authz'
 import {
   checksumMigrationPair,
   loadMetaMigrations,
@@ -164,13 +165,13 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
           ORDER BY owner, project`,
       )
       expect(result.rows).toEqual([
+        { owner: AGENT_SYSTEM_OWNER, project: 'project-a', last_rev: '55' },
         { owner: 'alice', project: 'project-a', last_rev: '44' },
         { owner: 'alice', project: 'project-b', last_rev: '22' },
         { owner: 'bob', project: 'project-a', last_rev: '33' },
         { owner: 'carol', project: 'project-root', last_rev: '66' },
         { owner: 'dora', project: 'project-root', last_rev: '77' },
         { owner: 'erin', project: 'project-root', last_rev: '78' },
-        { owner: 'system', project: 'project-a', last_rev: '55' },
       ])
     } finally {
       client.release()

@@ -8,6 +8,7 @@
 
 import type { FastifyInstance } from 'fastify'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { AGENT_SYSTEM_OWNER } from '@notarium/server'
 
 import { createApp, type Fixture } from './app.js'
 
@@ -54,6 +55,24 @@ const TWO: Fixture = {
     },
   ],
 }
+
+const AUDIT_SESSION_ID = 'ses_resetwrite01'
+const withAuditSession = (value: Fixture): Fixture => ({
+  ...value,
+  agentSessions: [
+    {
+      id: AUDIT_SESSION_ID,
+      owner: AGENT_SYSTEM_OWNER,
+      name: 'Reset write audit',
+      named: true,
+      parentId: null,
+      createdAt: '2026-06-10T10:00:00.000Z',
+      lastSeenAt: '2026-06-10T10:00:00.000Z',
+      calls: 1,
+      role: null,
+    },
+  ],
+})
 
 let app: FastifyInstance
 
@@ -145,5 +164,59 @@ describe('reset hook fixture swap (#127: opaque space ids)', () => {
     const workNotes = (await app.inject({ method: 'GET', url: '/api/s/work/notes' })).json()
       .notes as Array<{ title: string }>
     expect(workNotes.map((note) => note.title)).toEqual(['Work Note'])
+  })
+
+  it('drops captured writes when reset purges a dynamic space world', async () => {
+    await app.close()
+    let appendWorkRevision: ((space: string) => Promise<unknown>) | undefined
+    app = await createApp(withAuditSession(base()), {
+      configureWorld: ({ slug, revisions }) => {
+        if (slug === 'work') {
+          appendWorkRevision = (space) =>
+            revisions.append(
+              {
+                noteId: 'reset-audit-note',
+                space,
+                baseRevisionId: null,
+                theirRevisionId: null,
+                sourceRevisionId: null,
+                kind: 'write',
+                principal: 'ui',
+                contentHash: 'reset-audit-hash',
+                title: 'Reset audit note',
+                class: 'user-doc',
+                slug: null,
+                tags: [],
+                createdAt: '2026-06-10T11:00:00.000Z',
+                charsAdded: 1,
+                charsRemoved: 0,
+                agent: {
+                  owner: AGENT_SYSTEM_OWNER,
+                  agent: 'Test connector',
+                  session: {
+                    id: AUDIT_SESSION_ID,
+                    name: 'Reset write audit',
+                    attach: 'declared',
+                  },
+                },
+              },
+              'captured write',
+            )
+        }
+      },
+    })
+
+    expect((await reset(withAuditSession(TWO))).statusCode).toBe(200)
+    const work = (await spacesOf()).find((space) => space.slug === 'work')
+    expect(work).toBeTruthy()
+    expect(appendWorkRevision).toBeTypeOf('function')
+    await appendWorkRevision!(work!.id)
+
+    const detail = () =>
+      app.inject({ method: 'GET', url: `/api/me/agent-sessions/${AUDIT_SESSION_ID}` })
+    expect((await detail()).json()).toMatchObject({ total: 1 })
+
+    expect((await reset()).statusCode).toBe(200)
+    expect((await detail()).json()).toMatchObject({ total: 0, events: [] })
   })
 })

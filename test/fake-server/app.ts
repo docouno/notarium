@@ -19,7 +19,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   CachedStore,
-  InMemoryRevisionPersistence,
+  type InMemoryRevisionPersistence,
   type InteractiveSignal,
   sha256Hex,
 } from '@notarium/core'
@@ -54,6 +54,7 @@ import {
 import type { AgentRoleDecl } from '../cases/types'
 import { InMemoryAgentDeltaCursors } from './agentDeltaCursors'
 import { InMemoryAgentSessions } from './agentSessions'
+import { AuditedRevisionPersistence } from './auditedRevisionPersistence'
 import { InMemoryAuthPersistence } from './authPersistence'
 import { InMemoryContextOrder } from './contextOrder'
 import { InMemoryContextSets } from './contextSets'
@@ -64,6 +65,7 @@ import { InMemoryOAuthPersistence } from './oauthPersistence'
 import { InMemoryProjects } from './projects'
 import { InMemoryRetrievalLog } from './retrievalLog'
 import { InMemoryScopePins } from './scopePins'
+import { InMemorySessionAudit } from './sessionAudit'
 import { InMemorySpaces } from './spaces'
 
 /** A pre-dated journal revision (activity heatmap/feed). The fake's journal
@@ -303,6 +305,8 @@ export const createApp = async (
   const scopePins = new InMemoryScopePins()
   const contextOrder = new InMemoryContextOrder()
   const agentSessions = new InMemoryAgentSessions()
+  const retrievalLog = new InMemoryRetrievalLog()
+  const sessionAudit = new InMemorySessionAudit(agentSessions, retrievalLog)
   agentSessions.seed(fixture.agentSessions ?? [])
   const agentDeltaCursors = new InMemoryAgentDeltaCursors()
   projects.attachLifecycle(agentDeltaCursors)
@@ -316,7 +320,7 @@ export const createApp = async (
     // The engine + read-model address the space by its STABLE id, exactly
     // as production server.ts does — the slug only ever appears on the wire.
     const engine = new InMemoryStore({ space: rec.id, now: fixture.now, notes })
-    const revisions = new InMemoryRevisionPersistence()
+    const revisions = new AuditedRevisionPersistence(sessionAudit, rec.id)
     const store = new CachedStore({
       inner: engine,
       revisionPersistence: revisions,
@@ -390,6 +394,7 @@ export const createApp = async (
     // Permanent purge: drop the in-memory world (the on-disk analogue). The
     // registry row is removed by metaDbStub.purgeSpace above.
     onPurge: async (rec) => {
+      worlds.get(rec.id)?.revisions.clear()
       worlds.delete(rec.id)
     },
     spaceCreateEnabled: () => Boolean(fixture.capabilities?.spaceCreate),
@@ -566,7 +571,6 @@ export const createApp = async (
   // MCP durable state: per-session/project delta cursors plus write-retry dedup,
   // over in-memory twins the harness resets.
   const gatewayState = new InMemoryGatewayState()
-  const retrievalLog = new InMemoryRetrievalLog()
 
   // /api/about: the in-memory fake wires no embedder (honest FTS) and no
   // meta-DB; authMode follows the boot fixture, engines are the notarium-class
@@ -620,6 +624,7 @@ export const createApp = async (
     agentDeltaCursors,
     gatewayState,
     retrievalLog,
+    sessionAudit,
     projects,
     folders,
     favorites,
@@ -665,7 +670,9 @@ export const createApp = async (
       const rec = manager.recOf(id)
 
       if (!rec || !next.spaces.some((s) => s.slug === rec.slug)) {
+        const world = worlds.get(id)
         await manager.remove(id)
+        world?.revisions.clear()
         worlds.delete(id)
       }
     }

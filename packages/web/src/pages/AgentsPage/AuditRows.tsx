@@ -4,6 +4,7 @@ import type {
   AgentAuditQueryStat,
   AgentRetrievalEvent,
   AgentRetrievalTool,
+  AgentSessionRetrievalEvent,
 } from '@notarium/contract'
 import { AGENT_RETRIEVAL_TOOL, NOTE_CLASS } from '@notarium/contract/enums'
 import { Chip } from '../../core/Chips'
@@ -19,7 +20,7 @@ import {
 import { cx } from '../../libs/cx/cx'
 import { exactDateTime, timeAgo } from '../../libs/datetime'
 import { noteRouteForClass } from '../../libs/routing/routePaths'
-import styles from './AuditPage.module.scss'
+import styles from './SessionsPage.module.scss'
 
 export const TOOL_META: Record<AgentRetrievalTool, { label: string; icon: ReactNode }> = {
   search: { label: 'Search', icon: <IconSearch size={13} /> },
@@ -94,7 +95,11 @@ export const HitList = ({ event }: { event: AgentRetrievalEvent }) => {
   )
 }
 
-export const AuditRow = ({ event }: { event: AgentRetrievalEvent }) => {
+export const AuditRow = ({
+  event,
+}: {
+  event: AgentRetrievalEvent | AgentSessionRetrievalEvent
+}) => {
   const empty = event.tool !== AGENT_RETRIEVAL_TOOL.getNote && event.resultCount === 0
   // get_note's "query" is a raw note ref (an id) — show the opened note's title instead
   // when we captured it, so the row reads "Open <title>" not "Open <id>".
@@ -126,6 +131,9 @@ export const AuditRow = ({ event }: { event: AgentRetrievalEvent }) => {
               )}
               {event.classFilter && (
                 <Chip>{event.classFilter === NOTE_CLASS.agentMemory ? 'memory' : 'docs'}</Chip>
+              )}
+              {'sessionAttach' in event && event.sessionAttach && (
+                <Chip>{event.sessionAttach}</Chip>
               )}
               {/* Scope only shows when the call NARROWED to a project — the common whole-reach
                   fan-out is the default and would just be noise on every row. */}

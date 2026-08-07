@@ -10,6 +10,7 @@ import { can } from '../../../authz'
 import { type Handler, ToolFailure } from '../../gateway'
 import { dedupedWrite, wireSpace, writeEcho, type WriteRun } from '../../helpers/dedup'
 import { handleOf } from '../../helpers/projectAddressing'
+import { writeAttributionOf } from '../../helpers/writeAttribution'
 import { sanitizeText } from '../../sanitize'
 
 export const handleRememberUser: Handler = async (ctx, rawArgs) => {
@@ -56,7 +57,7 @@ export const handleRememberUser: Handler = async (ctx, rawArgs) => {
         category,
         summary,
         versionToken,
-        principal: ctx.principal.id,
+        ...writeAttributionOf(ctx),
       })
       return {
         noteId: r.id ?? '',
@@ -117,7 +118,7 @@ export const handleRememberProject: Handler = async (ctx, rawArgs) => {
         category,
         summary,
         versionToken,
-        principal: ctx.principal.id,
+        ...writeAttributionOf(ctx),
       })
       return {
         noteId: r.id ?? '',

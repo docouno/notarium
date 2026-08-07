@@ -67,6 +67,7 @@ import { seedDurableImports } from './seedDurableImports'
 import { applySeedExternalRewrites } from './seedExternalRewrites'
 import {
   makeOwnerRemap,
+  resolveSeedAgentActivityOwner,
   resolveSeedAgentDeltaCursorOwner,
   shouldAutoGrantSeedOwner,
 } from './seedOwner'
@@ -510,6 +511,7 @@ const run = async (): Promise<void> => {
   // topologically so a combined case need not depend on declaration order.
   let agentSessions = 0
   const pendingSessions = [...(world.agentSessions ?? [])]
+  const sessionByRef = new Map((world.agentSessions ?? []).map((session) => [session.ref, session]))
   const insertedSessionRefs = new Set<string>()
 
   while (pendingSessions.length) {
@@ -523,19 +525,26 @@ const run = async (): Promise<void> => {
       )
     }
     const [session] = pendingSessions.splice(index, 1)
+    insertedSessionRefs.add(session.ref)
+
+    if (session.retained === false) {
+      continue
+    }
     const owner = session.owner ? asUser(session.owner) : primary.username
     await metaDb.sessions.insert({
       id: agentSessionId(session.ref),
       owner,
       name: session.name,
       named: session.named ?? true,
-      parentId: session.parentRef ? agentSessionId(session.parentRef) : null,
+      parentId:
+        session.parentRef && sessionByRef.get(session.parentRef)?.retained !== false
+          ? agentSessionId(session.parentRef)
+          : null,
       createdAt: daysAgoIso(session.createdDaysAgo),
       lastSeenAt: daysAgoIso(session.lastSeenDaysAgo),
       calls: session.calls,
       role: session.role ?? null,
     })
-    insertedSessionRefs.add(session.ref)
     agentSessions++
   }
 
@@ -587,6 +596,38 @@ const run = async (): Promise<void> => {
 
     for (const e of spaceEvents) {
       clock = new Date(normDate(e.date))
+      const declaredSession = e.agentAudit?.sessionRef
+        ? sessionByRef.get(e.agentAudit.sessionRef)
+        : undefined
+
+      if (e.agentAudit?.sessionRef && !declaredSession) {
+        throw new Error(`agent write references unknown session: ${e.agentAudit.sessionRef}`)
+      }
+      const auditOwner = e.agentAudit
+        ? resolveSeedAgentActivityOwner({
+            kind: 'write',
+            activityOwner: e.agentAudit.owner,
+            sessionOwner: declaredSession ? (declaredSession.owner ?? primary.username) : undefined,
+            fallbackOwner: primary.username,
+            asUser,
+          })
+        : undefined
+      const agent = auditOwner
+        ? {
+            owner: auditOwner,
+            agent: e.agentAudit?.agent ?? null,
+            ...(declaredSession && e.agentAudit?.sessionRef
+              ? {
+                  session: {
+                    id: agentSessionId(e.agentAudit.sessionRef),
+                    name: declaredSession.name,
+                    attach: e.agentAudit.sessionAttach ?? ('declared' as const),
+                  },
+                }
+              : {}),
+          }
+        : undefined
+
       if (e.op === 'create') {
         const route = routeOf(e.path, e.class)
         const res = await store.write({
@@ -604,6 +645,7 @@ const run = async (): Promise<void> => {
           muted: e.muted,
           createdAt: normDate(e.date),
           principal: remapPrincipal(e.principal),
+          ...(agent ? { agent } : {}),
         })
         await store.settle?.()
         const id = res.id
@@ -644,6 +686,7 @@ const run = async (): Promise<void> => {
             originalId: prev.id,
             versionToken: prev.versionToken,
             principal: remapPrincipal(e.principal),
+            ...(agent ? { agent } : {}),
           })
           await store.settle?.()
           if (!res.versionToken) {
@@ -655,7 +698,10 @@ const run = async (): Promise<void> => {
           }
           edits++
         } else if (e.op === 'delete') {
-          await store.remove(prev.id, { principal: remapPrincipal(e.principal) })
+          await store.remove(prev.id, {
+            principal: remapPrincipal(e.principal),
+            ...(agent ? { agent } : {}),
+          })
           await store.settle?.()
           deletes++
         } else {
@@ -682,7 +728,6 @@ const run = async (): Promise<void> => {
   // note rather than a driver-specific numeric revision; resolve that semantic
   // anchor only after the real timeline has minted both note and revision ids.
   let agentDeltaCursors = 0
-  const sessionByRef = new Map((world.agentSessions ?? []).map((session) => [session.ref, session]))
 
   for (const cursor of world.agentDeltaCursors ?? []) {
     const note = live.get(cursor.throughNote)
@@ -984,14 +1029,25 @@ const run = async (): Promise<void> => {
   }
 
   // 5d. Agent retrieval audit (#243): a meta-DB-only side-channel (like connected apps) —
-  //     backdated retrieval-log rows so the /agents Audit surface has real history +
+  //     backdated retrieval-log rows so Agents → Sessions has real history +
   //     blind spots. Runs AFTER the replay so every hit's note id resolves via `live`.
   //     A retrieval with no resolvable hits is a zero-result MISS. Owner = the seed user
   //     (so /api/me/agent-audit shows it); principal remapped like every attribution.
   let retrievals = 0
 
   for (const r of world.retrievals ?? []) {
-    const owner = r.owner ? asUser(r.owner) : primary.username
+    const declaredSession = r.sessionRef ? sessionByRef.get(r.sessionRef) : undefined
+
+    if (r.sessionRef && !declaredSession) {
+      throw new Error(`retrieval references unknown session: ${r.sessionRef}`)
+    }
+    const owner = resolveSeedAgentActivityOwner({
+      kind: 'retrieval',
+      activityOwner: r.owner,
+      sessionOwner: declaredSession ? (declaredSession.owner ?? primary.username) : undefined,
+      fallbackOwner: primary.username,
+      asUser,
+    })
     const hits = (r.hits ?? []).flatMap((h) => {
       const note = live.get(h.note)
 
@@ -1022,6 +1078,9 @@ const run = async (): Promise<void> => {
       owner,
       principal,
       agent: r.agent ?? null,
+      sessionId: r.sessionRef ? agentSessionId(r.sessionRef) : null,
+      sessionName: declaredSession?.name ?? null,
+      sessionAttach: r.sessionRef ? (r.sessionAttach ?? 'declared') : null,
       tool: r.tool,
       query,
       project: r.project ?? null,

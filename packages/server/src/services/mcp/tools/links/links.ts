@@ -11,6 +11,7 @@ import {
 } from '@notarium/core'
 
 import { type Ctx, type Handler, toolErrorMessage, ToolFailure } from '../../gateway'
+import { writeAttributionOf } from '../../helpers/writeAttribution'
 import { sanitizeText } from '../../sanitize'
 
 /** Resolve a link target (`to` id OR `toTitle` forward-ref) to the wikilink target we
@@ -151,7 +152,7 @@ export const handleLink: Handler = async (ctx, rawArgs) => {
     fromId: sourceId,
     toTitle: title,
     relation,
-    principal: ctx.principal.id,
+    ...writeAttributionOf(ctx),
   })
   const structured = { ok: true as const, versionToken: result.versionToken ?? '' }
   const aliasAt = title.indexOf('|')
@@ -226,7 +227,7 @@ export const handleLinkMany: Handler = async (ctx, rawArgs) => {
       const r = await linkNotesMany(hitFrom.store, {
         fromId: sourceId,
         links: specs,
-        principal: ctx.principal.id,
+        ...writeAttributionOf(ctx),
       })
 
       for (const i of valid) {

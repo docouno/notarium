@@ -1,0 +1,1 @@
+export { writeAttributionOf } from './writeAttribution'

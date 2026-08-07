@@ -1,5 +1,6 @@
 // Row↔record mappers shared by the SQLite and Postgres driver twins.
 
+import { AGENT_SESSION_ATTACH } from '@notarium/core'
 import type {
   ContextOrderEntryKind,
   ContextOrderRecord,
@@ -424,6 +425,9 @@ export type RetrievalRow = {
   owner: string
   principal: string
   agent: string | null
+  session_id: string | null
+  session_name: string | null
+  session_attach: string | null
   tool: string
   query: string
   project: string | null
@@ -472,6 +476,13 @@ export const retrievalOfRow = (r: RetrievalRow): RetrievalLogRecord => ({
   owner: r.owner,
   principal: r.principal,
   agent: r.agent,
+  sessionId: r.session_id,
+  sessionName: r.session_name,
+  sessionAttach:
+    r.session_attach === AGENT_SESSION_ATTACH.declared ||
+    r.session_attach === AGENT_SESSION_ATTACH.inferred
+      ? r.session_attach
+      : null,
   tool: r.tool as RetrievalTool,
   query: r.query,
   project: r.project,

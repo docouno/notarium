@@ -22,6 +22,7 @@ export const QUERY_KEY = {
   beforeAt: 'beforeAt',
   beforeId: 'beforeId',
   aggregates: 'aggregates',
+  cursor: 'cursor',
   frontmatter: 'frontmatter',
   scope: 'scope',
 } as const

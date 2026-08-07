@@ -1,4 +1,10 @@
-import type { AuthorFilter, Revision, RevisionInput, RevisionPersistence } from '@notarium/core'
+import {
+  AGENT_SESSION_ATTACH,
+  type AuthorFilter,
+  type Revision,
+  type RevisionInput,
+  type RevisionPersistence,
+} from '@notarium/core'
 
 import type { SqliteDriverCtx } from './context'
 
@@ -11,6 +17,11 @@ type RevisionRow = {
   source_rev: number | bigint | null
   kind: string
   principal: string | null
+  agent_owner: string | null
+  agent_name: string | null
+  session_id: string | null
+  session_name: string | null
+  session_attach: string | null
   content_hash: string | null
   title: string
   class: string | null
@@ -30,6 +41,26 @@ const revisionOfRow = (r: RevisionRow): Revision => ({
   sourceRevisionId: r.source_rev == null ? null : String(r.source_rev),
   kind: r.kind as Revision['kind'],
   principal: r.principal,
+  ...(r.agent_owner
+    ? {
+        agent: {
+          owner: r.agent_owner,
+          agent: r.agent_name,
+          ...(r.session_id &&
+          r.session_name &&
+          (r.session_attach === AGENT_SESSION_ATTACH.declared ||
+            r.session_attach === AGENT_SESSION_ATTACH.inferred)
+            ? {
+                session: {
+                  id: r.session_id,
+                  name: r.session_name,
+                  attach: r.session_attach,
+                },
+              }
+            : {}),
+        },
+      }
+    : {}),
   contentHash: r.content_hash,
   title: r.title,
   class: r.class ?? null,
@@ -90,8 +121,8 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
       const res = db
         .prepare(
           `INSERT INTO note_revisions
-               (note_id, space, base_rev, their_rev, source_rev, kind, principal, content_hash, title, class, slug, tags, created_at, chars_added, chars_removed)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+               (note_id, space, base_rev, their_rev, source_rev, kind, principal, agent_owner, agent_name, session_id, session_name, session_attach, content_hash, title, class, slug, tags, created_at, chars_added, chars_removed)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           rev.noteId,
@@ -101,6 +132,11 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
           rev.sourceRevisionId == null ? null : Number(rev.sourceRevisionId),
           rev.kind,
           rev.principal,
+          rev.agent?.owner ?? null,
+          rev.agent?.agent ?? null,
+          rev.agent?.session?.id ?? null,
+          rev.agent?.session?.name ?? null,
+          rev.agent?.session?.attach ?? null,
           rev.contentHash,
           rev.title,
           rev.class,

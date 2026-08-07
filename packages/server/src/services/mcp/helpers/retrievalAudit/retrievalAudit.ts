@@ -1,6 +1,6 @@
 // Retrieval-audit capture: builds the fire-and-forget audit row for a
 // successful read-tool call.
-// canon: docs/projects.md#audit-auditing-the-runtime-retrieval-243-mem-audita
+// canon: docs/projects.md#sessions-auditing-agent-episodes-243-321-mem-audita
 import { AGENT_RETRIEVAL_TOOL } from '@notarium/contract'
 import {
   type GetNoteInput,
@@ -10,7 +10,8 @@ import {
   type ToolName,
 } from '@notarium/contract/tools'
 
-import { type Principal } from '../../../authz'
+import type { BoundAgentSession } from '../../../agentSessions'
+import { agentOwnerOf, type Principal } from '../../../authz'
 import { type RetrievalHit, type RetrievalLogInput } from '../../../metaDb'
 
 const RETRIEVAL_TOOLS = new Set<ToolName>(['search', 'get_note', 'recall'])
@@ -33,14 +34,20 @@ export const retrievalRowOf = (
   input: unknown,
   output: Record<string, unknown>,
   at: string,
+  session?: BoundAgentSession,
 ): RetrievalLogInput | null => {
-  if (!RETRIEVAL_TOOLS.has(name) || !principal.username) {
+  const owner = agentOwnerOf(principal)
+
+  if (!RETRIEVAL_TOOLS.has(name) || !owner) {
     return null
   }
   const base = {
-    owner: principal.username,
+    owner,
     principal: principal.id,
     agent: principal.label ?? null,
+    sessionId: session?.record.id ?? null,
+    sessionName: session?.record.name ?? null,
+    sessionAttach: session?.attach ?? null,
     createdAt: at,
   }
 

@@ -1,5 +1,7 @@
 // Domain types for the link semantic op.
 
+import type { AgentWriteAttribution } from '../../knowledgeStore'
+
 export type LinkInput = {
   /** The note-id to link FROM — the wikilink is materialized in its body. */
   fromId: string
@@ -11,6 +13,7 @@ export type LinkInput = {
   relation: string
   /** Journal attribution — the gateway stamps the agent's principal. */
   principal?: string
+  agent?: AgentWriteAttribution
 }
 
 /** One edge to materialize from a note's body — a (relation, target-title) pair.
@@ -25,4 +28,5 @@ export type LinkManyInput = {
   fromId: string
   links: LinkSpec[]
   principal?: string
+  agent?: AgentWriteAttribution
 }

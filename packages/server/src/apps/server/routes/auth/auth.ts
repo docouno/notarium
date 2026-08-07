@@ -9,6 +9,7 @@ import type { FastifyInstance } from 'fastify'
 
 import type { AuthService } from '../../../../services/auth'
 import type {
+  AgentSessionAuditPersistence,
   AgentSessionsPersistence,
   ContextOrderPersistence,
   ContextSetsPersistence,
@@ -34,6 +35,7 @@ export const authRoutes = async (
     scopePins?: ScopePinsPersistence
     contextOrder?: ContextOrderPersistence
     retrievalLog?: RetrievalLogPersistence
+    sessionAudit?: AgentSessionAuditPersistence
     roles?: RolesService
     sessions?: AgentSessionsPersistence
     projects?: ProjectsPersistence

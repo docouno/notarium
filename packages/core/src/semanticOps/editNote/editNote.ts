@@ -162,6 +162,7 @@ export const editNote = async (
     tags: normTags(note.frontmatter?.tags),
     noteType: typeof note.frontmatter?.type === 'string' ? note.frontmatter.type : undefined,
     principal: input.principal,
+    agent: input.agent,
   })
   // Integrity echo: hash the body THIS edit wrote (`next`). For
   // `replace` the agent can recompute it from its own `content`; for the surgical

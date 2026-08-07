@@ -1,10 +1,10 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import { Outlet, useLocation } from 'react-router'
-import type { AgentAudit, MeAgentContext, MeAgentRolesResponse } from '@notarium/contract'
+import type { AgentSessions, MeAgentContext, MeAgentRolesResponse } from '@notarium/contract'
 import { api } from '../../services/api'
 
 // The Agents chrome (#243): a data layer over ALL Agents sections. It loads the small
-// per-section summaries ONCE (personal context load + audit rollup) and hands them to the
+// per-section summaries ONCE (personal context load + session rollup) and hands them to the
 // section pill-bar, so each pill carries a live identity line (the tabs read poor
 // without one) and switching sections never re-flashes them (the provider
 // sits ABOVE the section routes, so it doesn't remount). No chrome of its own — it's a
@@ -16,13 +16,13 @@ export const RECURRING_MISS_MIN = 2
 
 type AgentsSummaryData = {
   context: { loadedTokens: number; pins: number; memory: number } | null
-  audit: { totalCalls: number; totalQueries: number; blindSpots: number } | null
+  sessions: { active: number; total: number } | null
   roles: { count: number; activeRole: string | null; truncated: boolean } | null
   loading: boolean
 }
 
 export type AgentsSummary = AgentsSummaryData & {
-  updateAudit: (audit: AgentAudit) => void
+  updateSessions: (sessions: AgentSessions) => void
   updateContext: (context: MeAgentContext) => void
   updateRoles: (roles: MeAgentRolesResponse) => void
 }
@@ -33,12 +33,9 @@ const contextSummaryOf = (ctx: MeAgentContext) => ({
   memory: ctx.memory.length,
 })
 
-// Aggregates ride the first page only (null on an appended page) — a summary is only ever
-// fed from a first-page 'all' response, but stay null-safe so a stray call can't throw.
-const auditSummaryOf = (audit: AgentAudit) => ({
-  totalCalls: audit.total,
-  totalQueries: audit.aggregates?.totalQueries ?? 0,
-  blindSpots: (audit.aggregates?.misses ?? []).filter((m) => m.misses >= RECURRING_MISS_MIN).length,
+const sessionsSummaryOf = (sessions: AgentSessions) => ({
+  active: sessions.active,
+  total: sessions.total,
 })
 
 const rolesSummaryOf = (roles: MeAgentRolesResponse) => ({
@@ -51,10 +48,10 @@ const noopUpdate = () => {}
 
 const AgentsSummaryContext = createContext<AgentsSummary>({
   context: null,
-  audit: null,
+  sessions: null,
   roles: null,
   loading: true,
-  updateAudit: noopUpdate,
+  updateSessions: noopUpdate,
   updateContext: noopUpdate,
   updateRoles: noopUpdate,
 })
@@ -67,14 +64,14 @@ export const AgentsChrome = () => {
   const landingPath = useRef(useLocation().pathname).current
   const [summary, setSummary] = useState<AgentsSummaryData>({
     context: null,
-    audit: null,
+    sessions: null,
     roles: null,
     loading: true,
   })
   const rolesVersion = useRef(0)
 
-  const updateAudit = useCallback((audit: AgentAudit) => {
-    setSummary((prev) => ({ ...prev, audit: auditSummaryOf(audit), loading: false }))
+  const updateSessions = useCallback((sessions: AgentSessions) => {
+    setSummary((prev) => ({ ...prev, sessions: sessionsSummaryOf(sessions), loading: false }))
   }, [])
 
   const updateContext = useCallback((context: MeAgentContext) => {
@@ -86,20 +83,21 @@ export const AgentsChrome = () => {
     setSummary((prev) => ({ ...prev, roles: rolesSummaryOf(roles), loading: false }))
   }, [])
 
-  // On landing, let Audit and Roles feed their own summary to avoid duplicate requests. Context
-  // is always fetched: it's cheap AND ContextPage feeds updateContext only from its PERSONAL
-  // scope, so a project-scope landing would otherwise leave the Context pill blank.
+  // The active overview feeds its own section summary. Direct session deep-links still need the
+  // one-row rollup; Context is always fetched because project scope does not update its metric.
   useEffect(() => {
-    const onAudit = landingPath.startsWith('/agents/audit')
+    const onSessionsOverview = /^\/agents\/sessions\/?$/.test(landingPath)
     const onRoles = landingPath.startsWith('/agents/roles')
     const requestedRolesVersion = rolesVersion.current
     let alive = true
 
     void (async () => {
-      const [ctx, roles, audit] = await Promise.all([
+      const [ctx, sessions, roles] = await Promise.all([
         api.meAgentContextGet().catch(() => null),
+        onSessionsOverview
+          ? Promise.resolve(undefined)
+          : api.agentSessionsGet({ limit: 1, aggregates: '0' }).catch(() => null),
         onRoles ? Promise.resolve(undefined) : api.agentRolesGet().catch(() => null),
-        onAudit ? Promise.resolve(undefined) : api.agentAuditGet({ limit: 1 }).catch(() => null),
       ])
 
       if (!alive) {
@@ -107,13 +105,14 @@ export const AgentsChrome = () => {
       }
       setSummary((prev) => ({
         context: ctx ? contextSummaryOf(ctx) : null,
+        sessions:
+          sessions === undefined ? prev.sessions : sessions ? sessionsSummaryOf(sessions) : null,
         roles:
           roles === undefined || rolesVersion.current !== requestedRolesVersion
             ? prev.roles
             : roles
               ? rolesSummaryOf(roles)
               : null,
-        audit: audit === undefined ? prev.audit : audit ? auditSummaryOf(audit) : null,
         loading: false,
       }))
     })()
@@ -124,7 +123,9 @@ export const AgentsChrome = () => {
   }, [landingPath])
 
   return (
-    <AgentsSummaryContext.Provider value={{ ...summary, updateAudit, updateContext, updateRoles }}>
+    <AgentsSummaryContext.Provider
+      value={{ ...summary, updateSessions, updateContext, updateRoles }}
+    >
       <Outlet />
     </AgentsSummaryContext.Provider>
   )

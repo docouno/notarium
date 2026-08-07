@@ -50,6 +50,15 @@ export const SYSTEM_PRINCIPAL: Principal = {
   system: true,
 }
 
+/** Stable owner key for self-scoped agent state. Password principals use their
+ * username; the trusted authless host uses a namespace that cannot be a valid
+ * username, so changing AUTH_MODE cannot expose one principal's history to the
+ * other. */
+export const AGENT_SYSTEM_OWNER = '@system'
+
+export const agentOwnerOf = (principal: Pick<Principal, 'username' | 'system'>): string | null =>
+  principal.system ? AGENT_SYSTEM_OWNER : principal.username
+
 const LEVEL = { read: 1, write: 2, manage: 3 } as const
 const ROLE = { reader: 1, writer: 2, owner: 3 } as const
 

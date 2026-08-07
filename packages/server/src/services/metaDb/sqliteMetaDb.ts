@@ -20,6 +20,7 @@ import { createProjectsFacet } from './drivers/sqlite/projects'
 import { createRetrievalLogFacet } from './drivers/sqlite/retrievalLog'
 import { createRevisionsFacet } from './drivers/sqlite/revisions'
 import { createScopePinsFacet } from './drivers/sqlite/scopePins'
+import { createSessionAuditFacet } from './drivers/sqlite/sessionAudit'
 import { createSessionsFacet } from './drivers/sqlite/sessions'
 import { createSpacesFacet } from './drivers/sqlite/spaces'
 import { IN_MEMORY_DB } from './metaDbUrl'
@@ -321,6 +322,8 @@ export class SqliteMetaDb implements MetaDb {
   readonly agentDeltaCursors = createAgentDeltaCursorsFacet(this.ctx)
 
   readonly sessions = createSessionsFacet(this.ctx)
+
+  readonly sessionAudit = createSessionAuditFacet(this.ctx)
 
   // ── OAuth facet ─────────────────────────────────────────────────────
 

@@ -16,7 +16,7 @@ import { asciiSlug } from '@notarium/core'
 
 import { type AgentSessions, type BoundAgentSession, createAgentSessions } from '../agentSessions'
 import { type AuthService } from '../auth'
-import { type Action, can, type Principal, scopeAllows } from '../authz'
+import { type Action, agentOwnerOf, can, type Principal, scopeAllows } from '../authz'
 import type {
   AgentDeltaCursorsPersistence,
   AgentSessionsPersistence,
@@ -138,7 +138,7 @@ export type Ctx = {
   gatewayState?: GatewayStatePersistence
   agentSessions?: AgentSessions
   roles?: RolesService
-  /** Stable session owner: username in password mode, `system` in none mode. */
+  /** Stable session owner: username in password mode, reserved `@system` in none mode. */
   sessionOwner: string | null
   /** Episode attached to this call. start_session fills it after opening one. */
   session?: BoundAgentSession
@@ -257,7 +257,7 @@ export const createGateway = (deps: GatewayDeps): McpGateway => {
       gatewayState: deps.gatewayState,
       agentSessions,
       roles: deps.roles,
-      sessionOwner: principal.username ?? (principal.system ? 'system' : null),
+      sessionOwner: agentOwnerOf(principal),
       now,
       personalSpace,
       ensurePersonalDomain: () =>
@@ -463,6 +463,7 @@ export const createGateway = (deps: GatewayDeps): McpGateway => {
             parsed.data,
             out.data as Record<string, unknown>,
             (deps.now?.() ?? new Date()).toISOString(),
+            ctx.session,
           )
 
           if (row) {

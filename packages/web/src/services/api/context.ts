@@ -1,6 +1,8 @@
 import type {
   AgentAudit,
   AgentRetrievalTool,
+  AgentSessionEvents,
+  AgentSessions,
   ContextOrderEntry,
   ContextSetResponse,
   ContextSetsResponse,
@@ -57,6 +59,43 @@ export const contextApi = {
     }
     const s = q.toString()
     return req<AgentAudit>(`/api/me/agent-audit${s ? `?${s}` : ''}`)
+  },
+  /** Session-first audit overview: retained + archived episodes, outside-session
+   *  gaps and the global retrieval insights kept from the former Audit page. */
+  agentSessionsGet: (params: { limit?: number; cursor?: string; aggregates?: '0' } = {}) => {
+    const q = new URLSearchParams()
+
+    if (params.limit !== undefined) {
+      q.set(QUERY_KEY.limit, String(params.limit))
+    }
+    if (params.cursor) {
+      q.set(QUERY_KEY.cursor, params.cursor)
+    }
+    if (params.aggregates) {
+      q.set(QUERY_KEY.aggregates, params.aggregates)
+    }
+    const s = q.toString()
+    return req<AgentSessions>(`/api/me/agent-sessions${s ? `?${s}` : ''}`)
+  },
+  agentSessionEventsGet: (
+    id: string,
+    params: { limit?: number; cursor?: string; filter?: 'reads' | 'writes' } = {},
+  ) => {
+    const q = new URLSearchParams()
+
+    if (params.limit !== undefined) {
+      q.set(QUERY_KEY.limit, String(params.limit))
+    }
+    if (params.cursor) {
+      q.set(QUERY_KEY.cursor, params.cursor)
+    }
+    if (params.filter) {
+      q.set(QUERY_KEY.filter, params.filter)
+    }
+    const s = q.toString()
+    return req<AgentSessionEvents>(
+      `/api/me/agent-sessions/${encodeURIComponent(id)}${s ? `?${s}` : ''}`,
+    )
   },
   /** Toggle a note's `always-load` membership (id-addressed). Pin/unpin = the
    *  «Pin to agent context» action and the Context constructor. */

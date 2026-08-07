@@ -1999,6 +1999,9 @@ describe('SqliteMetaDb', () => {
       owner: 'alice',
       principal: 'pat:alice:cli',
       agent: 'CLI',
+      sessionId: null,
+      sessionName: null,
+      sessionAttach: null,
       tool: 'search',
       query: 'q',
       project: null,
@@ -2132,6 +2135,178 @@ describe('SqliteMetaDb', () => {
         top: [],
         misses: [],
       })
+    })
+  })
+
+  describe('agent session audit read model (#321)', () => {
+    const ret = (
+      over: Partial<RetrievalLogInput> & Pick<RetrievalLogInput, 'createdAt'>,
+    ): RetrievalLogInput => ({
+      owner: 'alice',
+      principal: 'pat:alice:cli',
+      agent: 'CLI',
+      sessionId: null,
+      sessionName: null,
+      sessionAttach: null,
+      tool: 'search',
+      query: 'q',
+      project: null,
+      classFilter: null,
+      resultCount: 1,
+      topScore: 0.9,
+      hits: [],
+      ...over,
+    })
+
+    it('folds retained + archived episodes and exposes unbound gaps owner-safely', async () => {
+      const db = make()
+      await db.sessions.insert({
+        id: 'ses_live',
+        owner: 'alice',
+        name: 'Live review',
+        named: true,
+        parentId: null,
+        createdAt: '2026-07-01T00:00:00.000Z',
+        lastSeenAt: '2026-07-03T00:00:00.000Z',
+        calls: 7,
+        role: null,
+      })
+      await db.retrievalLog.append(
+        ret({
+          sessionId: 'ses_live',
+          sessionName: 'Live review',
+          sessionAttach: 'declared',
+          createdAt: '2026-07-02T00:00:00.000Z',
+        }),
+      )
+      await db.revisions.append(
+        revInput({
+          contentHash: 'session-write',
+          createdAt: '2026-07-03T00:00:00.000Z',
+          agent: {
+            owner: 'alice',
+            agent: 'CLI',
+            session: { id: 'ses_live', name: 'Live review', attach: 'inferred' },
+          },
+        }),
+        'session write',
+      )
+      // No lifecycle row: this episode survives solely through the capture-time label.
+      await db.retrievalLog.append(
+        ret({
+          sessionId: 'ses_archived',
+          sessionName: 'Archived review',
+          sessionAttach: 'declared',
+          createdAt: '2026-06-01T00:00:00.000Z',
+        }),
+      )
+      await db.retrievalLog.append(ret({ query: 'outside', createdAt: '2026-07-04T00:00:00.000Z' }))
+      await db.revisions.append(
+        revInput({
+          noteId: 'outside-note',
+          contentHash: 'outside-write',
+          createdAt: '2026-07-04T01:00:00.000Z',
+          agent: { owner: 'alice', agent: 'CLI' },
+        }),
+        'outside write',
+      )
+      await db.retrievalLog.append(
+        ret({ owner: 'bob', query: 'private', createdAt: '2026-07-05T00:00:00.000Z' }),
+      )
+
+      const overview = await db.sessionAudit.overview({
+        owner: 'alice',
+        activeSince: '2026-07-02T12:00:00.000Z',
+        limit: 10,
+      })
+      expect(overview.total).toBe(2)
+      expect(overview.active).toBe(1)
+      expect(overview.items.map((item) => item.id)).toEqual(['ses_live', 'ses_archived'])
+      expect(overview.items[0]).toMatchObject({
+        calls: 7,
+        reads: 1,
+        writes: 1,
+        retained: true,
+        active: true,
+      })
+      expect(overview.items[1]).toMatchObject({
+        name: 'Archived review',
+        calls: null,
+        reads: 1,
+        writes: 0,
+        retained: false,
+      })
+      expect(overview.outside).toMatchObject({ reads: 1, writes: 1 })
+      expect(
+        await db.sessionAudit.find('alice', 'ses_archived', '2026-07-02T12:00:00.000Z'),
+      ).toMatchObject({ retained: false, name: 'Archived review' })
+      expect(await db.sessionAudit.find('bob', 'ses_live', '2026-07-02T12:00:00.000Z')).toBeNull()
+    })
+
+    it('merges reads+writes newest-first with stable cross-source cursors and filters', async () => {
+      const db = make()
+      await db.sessions.insert({
+        id: 'ses_timeline',
+        owner: 'alice',
+        name: 'Timeline',
+        named: true,
+        parentId: null,
+        createdAt: '2026-07-01T00:00:00.000Z',
+        lastSeenAt: '2026-07-02T00:00:00.000Z',
+        calls: 3,
+        role: null,
+      })
+      await db.retrievalLog.append(
+        ret({
+          sessionId: 'ses_timeline',
+          sessionName: 'Timeline',
+          sessionAttach: 'declared',
+          query: 'older read',
+          createdAt: '2026-07-01T00:00:00.000Z',
+        }),
+      )
+      await db.revisions.append(
+        revInput({
+          contentHash: 'newer-write',
+          createdAt: '2026-07-02T00:00:00.000Z',
+          agent: {
+            owner: 'alice',
+            agent: 'CLI',
+            session: { id: 'ses_timeline', name: 'Timeline', attach: 'inferred' },
+          },
+        }),
+        'newer write',
+      )
+      const first = await db.sessionAudit.events({
+        owner: 'alice',
+        sessionId: 'ses_timeline',
+        limit: 1,
+      })
+      expect(first.total).toBe(2)
+      expect(first.hasMore).toBe(true)
+      expect(first.items[0].type).toBe('write')
+      const write = first.items[0]
+      expect(write.type).toBe('write')
+
+      if (write.type !== 'write') {
+        throw new Error('expected write')
+      }
+      const second = await db.sessionAudit.events({
+        owner: 'alice',
+        sessionId: 'ses_timeline',
+        limit: 1,
+        before: { at: write.at, source: 'write', id: write.id },
+      })
+      expect(second.items[0].type).toBe('retrieval')
+      expect(second.hasMore).toBe(false)
+      expect(
+        await db.sessionAudit.events({
+          owner: 'alice',
+          sessionId: 'ses_timeline',
+          type: 'write',
+          limit: 10,
+        }),
+      ).toMatchObject({ total: 1, hasMore: false })
     })
   })
 })

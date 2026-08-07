@@ -4919,3 +4919,289 @@ describe('retrieval audit capture (#243)', () => {
     }
   })
 })
+
+describe('session-first audit vertical (#321)', () => {
+  const opaque = (payload: Record<string, string>): string =>
+    Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')
+
+  it('carries one declared session through MCP reads/writes into the owner-scoped REST timeline', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const cookie = await loginCookie('alice', 'alice-password-1')
+    const bobCookie = await loginCookie('bob', 'bob-password-01')
+    const started = structured(
+      await callTool(port, 'start_session', { session: { name: 'Vertical review' } }, bearer),
+    ) as { session: { id: string } }
+    const sessionId = started.session.id
+
+    expect(
+      isError(await callTool(port, 'search', { query: MARKER, session: sessionId }, bearer)),
+    ).toBe(false)
+    const created = structured(
+      await callTool(
+        port,
+        'create_note',
+        { project: 'team', title: 'Session write target', body: 'v1', session: sessionId },
+        bearer,
+      ),
+    ) as { noteId: string }
+    expect(
+      isError(
+        await callTool(
+          port,
+          'edit_note',
+          { ref: created.noteId, operation: 'append', content: 'v2', session: sessionId },
+          bearer,
+        ),
+      ),
+    ).toBe(false)
+    expect(
+      isError(
+        await callTool(port, 'delete_note', { ref: created.noteId, session: sessionId }, bearer),
+      ),
+    ).toBe(false)
+
+    const overviewResponse = await app.inject({
+      method: 'GET',
+      url: '/api/me/agent-sessions',
+      headers: { cookie },
+    })
+    expect(overviewResponse.statusCode).toBe(200)
+    const overview = overviewResponse.json() as {
+      sessions: Array<{ id: string; reads: number; writes: number; calls: number }>
+      total: number
+      active: number
+      aggregates: unknown
+    }
+    expect(overview).toMatchObject({ total: 1, active: 1 })
+    expect(overview.sessions).toContainEqual(
+      expect.objectContaining({ id: sessionId, reads: 1, writes: 3, calls: 5 }),
+    )
+    expect(overview.aggregates).not.toBeNull()
+
+    const noAggregates = await app.inject({
+      method: 'GET',
+      url: '/api/me/agent-sessions?limit=1&aggregates=0',
+      headers: { cookie },
+    })
+    expect(noAggregates.statusCode).toBe(200)
+    expect((noAggregates.json() as { aggregates: unknown }).aggregates).toBeNull()
+
+    const detailResponse = await app.inject({
+      method: 'GET',
+      url: `/api/me/agent-sessions/${encodeURIComponent(sessionId)}`,
+      headers: { cookie },
+    })
+    expect(detailResponse.statusCode).toBe(200)
+    const detail = detailResponse.json() as {
+      target: { id: string }
+      total: number
+      events: Array<{
+        type: 'retrieval' | 'write'
+        revisionKind?: string
+        space?: string
+        sessionAttach: string | null
+      }>
+    }
+    expect(detail.target.id).toBe(sessionId)
+    expect(detail.total).toBe(4)
+    expect(detail.events.filter((event) => event.type === 'retrieval')).toHaveLength(1)
+    expect(detail.events.filter((event) => event.type === 'write')).toHaveLength(3)
+    expect(detail.events.every((event) => event.sessionAttach === 'declared')).toBe(true)
+    expect(detail.events).toContainEqual(
+      expect.objectContaining({ type: 'write', revisionKind: 'delete', space: 'team' }),
+    )
+
+    const firstPage = await app.inject({
+      method: 'GET',
+      url: `/api/me/agent-sessions/${encodeURIComponent(sessionId)}?limit=1`,
+      headers: { cookie },
+    })
+    const firstPageBody = firstPage.json() as {
+      events: Array<{ type: string; id: string }>
+      hasMore: boolean
+      nextCursor: string
+    }
+    expect(firstPageBody.hasMore).toBe(true)
+    const secondPage = await app.inject({
+      method: 'GET',
+      url: `/api/me/agent-sessions/${encodeURIComponent(sessionId)}?limit=1&cursor=${encodeURIComponent(firstPageBody.nextCursor)}`,
+      headers: { cookie },
+    })
+    expect(secondPage.statusCode).toBe(200)
+    expect((secondPage.json() as typeof firstPageBody).events[0]).not.toEqual(
+      firstPageBody.events[0],
+    )
+
+    const writesOnly = await app.inject({
+      method: 'GET',
+      url: `/api/me/agent-sessions/${encodeURIComponent(sessionId)}?filter=writes`,
+      headers: { cookie },
+    })
+    expect(writesOnly.statusCode).toBe(200)
+    expect(writesOnly.json()).toMatchObject({
+      total: 3,
+      events: [
+        expect.objectContaining({ type: 'write' }),
+        expect.objectContaining({ type: 'write' }),
+        expect.objectContaining({ type: 'write' }),
+      ],
+    })
+
+    const foreign = await app.inject({
+      method: 'GET',
+      url: `/api/me/agent-sessions/${encodeURIComponent(sessionId)}`,
+      headers: { cookie: bobCookie },
+    })
+    expect(foreign.statusCode).toBe(404)
+    const bobOverview = await app.inject({
+      method: 'GET',
+      url: '/api/me/agent-sessions',
+      headers: { cookie: bobCookie },
+    })
+    expect(bobOverview.json()).toMatchObject({ sessions: [], total: 0, active: 0 })
+  })
+
+  it('rejects malformed opaque cursors before either persistence driver sees them', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'read')
+    const cookie = await loginCookie('alice', 'alice-password-1')
+    const started = structured(
+      await callTool(port, 'start_session', { session: { name: 'Cursor review' } }, bearer),
+    ) as { session: { id: string } }
+    const sessionId = started.session.id
+    const invalidOverview = [
+      opaque({ at: 'not-a-date', id: sessionId }),
+      opaque({ at: '2026-07-01T00:00:00.000Z', id: 'x'.repeat(257) }),
+      opaque({ at: '2026-07-01T00:00:00.000Z', id: '\u0000' }),
+    ]
+    const invalidEvents = [
+      opaque({ at: 'not-a-date', source: 'write', id: '1' }),
+      opaque({ at: '2026-07-01T00:00:00.000Z', source: 'write', id: 'not-a-number' }),
+      opaque({
+        at: '2026-07-01T00:00:00.000Z',
+        source: 'retrieval',
+        id: '9223372036854775808',
+      }),
+    ]
+
+    for (const cursor of invalidOverview) {
+      const response = await app.inject({
+        method: 'GET',
+        url: `/api/me/agent-sessions?cursor=${encodeURIComponent(cursor)}`,
+        headers: { cookie },
+      })
+      expect(response.statusCode).toBe(400)
+    }
+    for (const cursor of invalidEvents) {
+      const response = await app.inject({
+        method: 'GET',
+        url: `/api/me/agent-sessions/${encodeURIComponent(sessionId)}?cursor=${encodeURIComponent(cursor)}`,
+        headers: { cookie },
+      })
+      expect(response.statusCode).toBe(400)
+    }
+
+    const invalidDetail = await app.inject({
+      method: 'GET',
+      url: '/api/me/agent-sessions/%00',
+      headers: { cookie },
+    })
+    expect(invalidDetail.statusCode).toBe(400)
+  })
+
+  it('keeps ambiguous unbound reads and writes in the explicit Outside bucket', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const cookie = await loginCookie('alice', 'alice-password-1')
+    const first = structured(
+      await callTool(port, 'start_session', { session: { name: 'Parallel review' } }, bearer),
+    ) as { session: { id: string } }
+    const second = structured(
+      await callTool(port, 'start_session', { session: { name: 'Parallel review' } }, bearer),
+    ) as { session: { id: string; parentId: string } }
+    expect(second.session.parentId).toBe(first.session.id)
+
+    expect(isError(await callTool(port, 'search', { query: MARKER }, bearer))).toBe(false)
+    expect(
+      isError(
+        await callTool(
+          port,
+          'create_note',
+          { project: 'team', title: 'Outside write', body: 'ambiguous session' },
+          bearer,
+        ),
+      ),
+    ).toBe(false)
+
+    const overview = await app.inject({
+      method: 'GET',
+      url: '/api/me/agent-sessions',
+      headers: { cookie },
+    })
+    expect(overview.statusCode).toBe(200)
+    expect(overview.json()).toMatchObject({
+      total: 2,
+      outside: { reads: 1, writes: 1 },
+    })
+    const outside = await app.inject({
+      method: 'GET',
+      url: '/api/me/agent-sessions/outside',
+      headers: { cookie },
+    })
+    expect(outside.statusCode).toBe(200)
+    expect(outside.json()).toMatchObject({
+      target: { kind: 'outside', reads: 1, writes: 1 },
+      total: 2,
+    })
+  })
+
+  it('uses the system owner consistently in AUTH_MODE=none', async () => {
+    const noneApp = await createApp({
+      spaces: [
+        {
+          slug: 'main',
+          notes: [
+            {
+              title: 'System note',
+              filePath: 'system-note.md',
+              content: `# System note\n\n${MARKER}`,
+              tags: [],
+            },
+          ],
+        },
+      ],
+      projects: [{ space: 'main', path: '' }],
+    })
+    const nonePort = await listen(noneApp)
+
+    try {
+      const started = structured(
+        await callTool(nonePort, 'start_session', { session: { name: 'System review' } }),
+      ) as { session: { id: string } }
+      const sessionId = started.session.id
+      expect(
+        isError(await callTool(nonePort, 'search', { query: MARKER, session: sessionId })),
+      ).toBe(false)
+      const systemWrite = await callTool(nonePort, 'create_note', {
+        project: 'main',
+        title: 'System session write',
+        body: 'written without auth',
+        session: sessionId,
+      })
+      expect(isError(systemWrite), text(systemWrite)).toBe(false)
+
+      const overview = await noneApp.inject({ method: 'GET', url: '/api/me/agent-sessions' })
+      expect(overview.statusCode).toBe(200)
+      expect(overview.json()).toMatchObject({
+        total: 1,
+        sessions: [expect.objectContaining({ id: sessionId, reads: 1, writes: 1 })],
+      })
+      const detail = await noneApp.inject({
+        method: 'GET',
+        url: `/api/me/agent-sessions/${encodeURIComponent(sessionId)}`,
+      })
+      expect(detail.statusCode).toBe(200)
+      expect(detail.json()).toMatchObject({ total: 2 })
+    } finally {
+      await noneApp.close()
+    }
+  })
+})

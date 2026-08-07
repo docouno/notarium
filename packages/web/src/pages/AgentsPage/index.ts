@@ -1,3 +1,4 @@
 export { ContextPage } from './ContextPage'
-export { AuditPage } from './AuditPage'
+export { SessionPage } from './SessionPage'
+export { SessionsPage } from './SessionsPage'
 export { AgentsChrome } from './AgentsProvider'

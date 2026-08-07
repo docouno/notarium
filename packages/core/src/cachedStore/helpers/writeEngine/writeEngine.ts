@@ -1,4 +1,5 @@
 import type {
+  AgentWriteAttribution,
   ExistingNote,
   MoveInput,
   MutationOptions,
@@ -693,6 +694,7 @@ export class WriteEngine {
       noteId,
       kind: input.journal?.kind ?? REVISION_KIND.write,
       principal: input.principal ?? null,
+      agent: input.agent,
       content: afterContent ?? this.normalizedInput(input),
       title: input.title,
       class: cls ?? input.targetClass ?? this.host.snap.notes.get(noteId)?.class ?? null,
@@ -806,7 +808,10 @@ export class WriteEngine {
     return directoryChanged
   }
 
-  async remove(id: string, opts?: { principal?: string }): Promise<void> {
+  async remove(
+    id: string,
+    opts?: { principal?: string; agent?: AgentWriteAttribution },
+  ): Promise<void> {
     return this.trashMutations.run({ paths: [trashMutationPath(id)] }, () =>
       this.mutations.runStable(
         () => this.removalClaim([id]),
@@ -848,7 +853,13 @@ export class WriteEngine {
     )
   }
 
-  async removeDir(path: string, opts?: MutationOptions & { principal?: string }): Promise<void> {
+  async removeDir(
+    path: string,
+    opts?: MutationOptions & {
+      principal?: string
+      agent?: AgentWriteAttribution
+    },
+  ): Promise<void> {
     if (!isCanonicalSafeRelativeAddress(path)) {
       throw folderFailed('path must be a canonical public relative path')
     }
@@ -925,7 +936,10 @@ export class WriteEngine {
     return { noteIds, paths, prefixes: targetIds.map(linkTargetPrefix) }
   }
 
-  private async removeClaimed(id: string, opts?: { principal?: string }): Promise<void> {
+  private async removeClaimed(
+    id: string,
+    opts?: { principal?: string; agent?: AgentWriteAttribution },
+  ): Promise<void> {
     const storagePath = this.pathFor(id)
     const meta = this.host.snap.notes.get(id)
     const inboundSources = this.host.snap.sourceIdsTargeting([id])
@@ -1005,6 +1019,7 @@ export class WriteEngine {
         noteId: id,
         kind: REVISION_KIND.delete,
         principal: opts?.principal ?? null,
+        agent: opts?.agent,
         content: lastContent,
         title: meta?.title ?? lastTitle ?? '',
         class: meta?.class ?? lastClass,

@@ -1,6 +1,6 @@
 // Domain types for the edit_note semantic op.
 
-import type { WriteResult } from '../../knowledgeStore'
+import type { AgentWriteAttribution, WriteResult } from '../../knowledgeStore'
 import type { EditOperation } from './consts'
 export type EditNoteInput = {
   /** The note-id to edit (the transport resolves a ref to this first). */
@@ -18,6 +18,7 @@ export type EditNoteInput = {
   versionToken?: string
   /** Journal attribution — the gateway stamps the agent's principal. */
   principal?: string
+  agent?: AgentWriteAttribution
 }
 
 /** An edit's result: the saved identity plus the transparency echo the

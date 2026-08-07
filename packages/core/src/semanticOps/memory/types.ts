@@ -1,6 +1,6 @@
 // Domain types for the agent-memory semantic ops.
 
-import type { WriteResult } from '../../knowledgeStore'
+import type { AgentWriteAttribution, WriteResult } from '../../knowledgeStore'
 
 /** The pure inputs shared by both memory intents (the gateway has already
  *  rejected a blank observation/category and resolved the target store). */
@@ -19,6 +19,7 @@ export type RememberInput = {
   versionToken?: string
   /** Journal attribution — the gateway stamps the agent's principal. */
   principal?: string
+  agent?: AgentWriteAttribution
 }
 
 /** The memory write outcome, enriching WriteResult with the transparency

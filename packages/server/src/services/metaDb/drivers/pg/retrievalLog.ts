@@ -13,13 +13,16 @@ export const createRetrievalLogFacet = (ctx: PgDriverCtx): RetrievalLogPersisten
     await ctx.ensureInit()
     const res = await ctx.required.query(
       `INSERT INTO agent_retrievals
-           (owner, principal, agent, tool, query, project, class_filter, result_count, top_score, hits, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+           (owner, principal, agent, session_id, session_name, session_attach, tool, query, project, class_filter, result_count, top_score, hits, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
          RETURNING id`,
       [
         input.owner,
         input.principal,
         input.agent,
+        input.sessionId,
+        input.sessionName,
+        input.sessionAttach,
         input.tool,
         input.query,
         input.project,
@@ -59,7 +62,7 @@ export const createRetrievalLogFacet = (ctx: PgDriverCtx): RetrievalLogPersisten
     const rowWhere = filters.join(' AND ')
     const [rows, count] = await Promise.all([
       ctx.required.query(
-        `SELECT id, owner, principal, agent, tool, query, project, class_filter, result_count, top_score, hits, created_at
+        `SELECT id, owner, principal, agent, session_id, session_name, session_attach, tool, query, project, class_filter, result_count, top_score, hits, created_at
            FROM agent_retrievals WHERE ${rowWhere}
            ORDER BY created_at DESC, id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
         [...params, q.limit + 1, q.offset],

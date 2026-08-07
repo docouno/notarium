@@ -43,7 +43,7 @@ import {
   SPACE_PREFIX,
   spaceRoute,
 } from './libs/routing/routePaths'
-import { AgentsChrome, AuditPage, ContextPage } from './pages/AgentsPage'
+import { AgentsChrome, ContextPage } from './pages/AgentsPage'
 import { FeedPage } from './pages/FeedPage'
 import { FilesPage } from './pages/FilesPage'
 import { FolderPage } from './pages/FolderPage'
@@ -198,6 +198,22 @@ const router = createBrowserRouter([
           { path: 'context', element: <Navigate to={agentContextRoute()} replace /> },
           { path: 'context/:scope', element: <ContextPage /> },
           {
+            path: 'sessions',
+            lazy: async () => {
+              const { SessionsPage } = await import('./pages/AgentsPage/SessionsPage')
+
+              return { Component: SessionsPage }
+            },
+          },
+          {
+            path: 'sessions/:id',
+            lazy: async () => {
+              const { SessionPage } = await import('./pages/AgentsPage/SessionPage')
+
+              return { Component: SessionPage }
+            },
+          },
+          {
             path: 'roles',
             lazy: async () => {
               const { RolesPage } = await import('./pages/AgentsPage/RolesPage')
@@ -205,10 +221,9 @@ const router = createBrowserRouter([
               return { Component: RolesPage }
             },
           },
-          // Audit (#243): the runtime-retrieval log, a sibling section to Context.
-          { path: 'audit', element: <AuditPage /> },
-          { path: 'session', element: <Navigate to={agentContextRoute()} replace /> },
-          { path: 'session/*', element: <Navigate to={agentContextRoute()} replace /> },
+          { path: 'audit', element: <Navigate to="/agents/sessions" replace /> },
+          { path: 'session', element: <Navigate to="/agents/sessions" replace /> },
+          { path: 'session/*', element: <Navigate to="/agents/sessions" replace /> },
         ],
       },
       {

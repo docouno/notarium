@@ -5,6 +5,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 
+import { AGENT_SYSTEM_OWNER } from '../../packages/server/src/services/authz'
 import {
   checksumMigrationPair,
   loadMetaMigrations,
@@ -98,7 +99,7 @@ describe('meta-DB migration assets and SQLite runner', () => {
           .all() as Array<{ type: string; count: number }>
       ).map(({ type, count }) => [type, count]),
     )
-    expect(counts).toEqual({ index: 34, table: 27, trigger: 2 })
+    expect(counts).toEqual({ index: 36, table: 27, trigger: 2 })
     expect(
       db.prepare("SELECT 1 FROM sqlite_schema WHERE name = 'meta_schema'").get(),
     ).toBeUndefined()
@@ -175,14 +176,63 @@ describe('meta-DB migration assets and SQLite runner', () => {
         )
         .all(),
     ).toEqual([
+      { owner: AGENT_SYSTEM_OWNER, project: 'project-a', last_rev: '55' },
       { owner: 'alice', project: 'project-a', last_rev: '44' },
       { owner: 'alice', project: 'project-b', last_rev: '22' },
       { owner: 'bob', project: 'project-a', last_rev: '33' },
       { owner: 'carol', project: 'project-root', last_rev: '66' },
       { owner: 'dora', project: 'project-root', last_rev: '77' },
       { owner: 'erin', project: 'project-root', last_rev: '78' },
-      { owner: 'system', project: 'project-a', last_rev: '55' },
     ])
+  })
+
+  it('preserves pre-session audit rows and leaves their new attribution snapshot null', () => {
+    const db = database()
+    runSqliteMigrations(db, migrations.slice(0, 1))
+    db.exec(`
+      INSERT INTO agent_retrievals
+        (owner, principal, agent, tool, query, result_count, hits, created_at)
+      VALUES
+        ('alice', 'pat:alice:legacy', 'Legacy CLI', 'search', 'old query', 0, '[]',
+         '2026-08-01T00:00:00.000Z');
+      INSERT INTO note_revisions
+        (note_id, space, kind, principal, title, tags, created_at)
+      VALUES
+        ('legacy-note', 'legacy-space', 'write', 'pat:alice:legacy', 'Legacy note', '[]',
+         '2026-08-01T00:00:00.000Z');
+    `)
+
+    runSqliteMigrations(db)
+
+    expect(
+      db
+        .prepare(
+          `SELECT owner, query, session_id, session_name, session_attach
+             FROM agent_retrievals WHERE query = 'old query'`,
+        )
+        .get(),
+    ).toEqual({
+      owner: 'alice',
+      query: 'old query',
+      session_id: null,
+      session_name: null,
+      session_attach: null,
+    })
+    expect(
+      db
+        .prepare(
+          `SELECT note_id, agent_owner, agent_name, session_id, session_name, session_attach
+             FROM note_revisions WHERE note_id = 'legacy-note'`,
+        )
+        .get(),
+    ).toEqual({
+      note_id: 'legacy-note',
+      agent_owner: null,
+      agent_name: null,
+      session_id: null,
+      session_name: null,
+      session_attach: null,
+    })
   })
 
   it('cascades session delta positions when retention removes their episode', () => {

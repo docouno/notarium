@@ -172,6 +172,7 @@ export const linkNotesMany = async (
         tags: normTags(from.frontmatter?.tags),
         noteType: typeof from.frontmatter?.type === 'string' ? from.frontmatter.type : undefined,
         principal: input.principal,
+        agent: input.agent,
       })
     } catch (err) {
       if ((err as { isConflict?: boolean }).isConflict && attempt < 2) {

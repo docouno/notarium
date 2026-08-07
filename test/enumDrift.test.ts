@@ -26,6 +26,7 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  AGENT_SESSION_ATTACH as ContractAgentSessionAttach,
   BUCKET_GRAN as ContractBucketGran,
   DATE_FIELD as ContractDateField,
   DEPTH as ContractDepth,
@@ -40,6 +41,7 @@ import {
 // not the `/api/*` wire barrel, so it resolves from a different entry point.
 import { EDIT_OPERATION as ContractEditOperation } from '@notarium/contract/tools'
 import {
+  AGENT_SESSION_ATTACH as CoreAgentSessionAttach,
   BUCKET_GRAN as CoreBucketGran,
   DATE_FIELD as CoreDateField,
   DEPTH as CoreDepth,
@@ -56,6 +58,7 @@ import {
 const identicalPairs: ReadonlyArray<
   [name: string, core: Record<string, string>, contract: Record<string, string>]
 > = [
+  ['AGENT_SESSION_ATTACH', CoreAgentSessionAttach, ContractAgentSessionAttach],
   ['SCAN_PHASE', CoreScanPhase, ContractScanPhase],
   ['REVISION_KIND', CoreRevisionKind, ContractRevisionKind],
   ['NOTE_SORT', CoreNoteSort, ContractNoteSort],

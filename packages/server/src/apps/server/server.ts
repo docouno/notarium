@@ -526,6 +526,7 @@ export const createServer = async ({
     agentDeltaCursors: metaDb?.agentDeltaCursors,
     gatewayState: metaDb?.gateway,
     retrievalLog: metaDb?.retrievalLog,
+    sessionAudit: metaDb?.sessionAudit,
     projects: metaDb?.projects,
     folders: metaDb?.folders,
     favorites: metaDb?.favorites,

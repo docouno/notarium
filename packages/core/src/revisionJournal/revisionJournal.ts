@@ -297,6 +297,7 @@ export class RevisionJournal {
       sourceRevisionId: input.sourceRevisionId ?? null,
       kind: input.kind,
       principal: input.principal,
+      agent: input.agent ?? null,
       contentHash:
         input.content != null
           ? await sha256Hex(input.content)

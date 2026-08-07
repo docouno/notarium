@@ -1,4 +1,4 @@
-import type { AgentRetrievalTool, MemoryCategory } from '@notarium/contract'
+import type { MemoryCategory } from '@notarium/contract'
 
 // The scale's TWO scopes (#208). Colour encodes SELECTION, not identity (heatmap
 // ramp, #33): the ACTIVE band is the bright top step (toward white), every other band
@@ -29,6 +29,3 @@ export type SetSave = { setId: string | null; name: string; items: PickedNote[];
  *  globally-unique id. Used for both pinning (same-space → tag, foreign → scope ref) and
  *  set items. */
 export type PickedNote = { space: string; noteId: string }
-
-// ── Audit (#243): AuditPage-local types ──────────────────────────────────────
-export type ToolFilter = 'all' | AgentRetrievalTool

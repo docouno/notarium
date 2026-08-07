@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   makeOwnerRemap,
+  resolveSeedAgentActivityOwner,
   resolveSeedAgentDeltaCursorOwner,
   shouldAutoGrantSeedOwner,
 } from '../../scripts/seedOwner'
@@ -81,5 +82,32 @@ describe('owner remap (sergey → SEED_USER)', () => {
         asUser,
       }),
     ).toBe('admin')
+  })
+
+  it('inherits a bound session owner for reads and writes', () => {
+    for (const kind of ['write', 'retrieval'] as const) {
+      expect(
+        resolveSeedAgentActivityOwner({
+          kind,
+          sessionOwner: 'sergey',
+          fallbackOwner: 'admin',
+          asUser,
+        }),
+      ).toBe('admin')
+    }
+  })
+
+  it('rejects hostile activity that assigns another owner to a bound session', () => {
+    for (const kind of ['write', 'retrieval'] as const) {
+      expect(() =>
+        resolveSeedAgentActivityOwner({
+          kind,
+          activityOwner: 'bob',
+          sessionOwner: 'sergey',
+          fallbackOwner: 'admin',
+          asUser,
+        }),
+      ).toThrow(`agent ${kind} owner bob does not match session owner admin`)
+    }
   })
 })

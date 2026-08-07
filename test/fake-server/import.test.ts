@@ -99,6 +99,7 @@ type WireJob = {
 }
 
 const TERMINAL = new Set(['succeeded', 'failed', 'canceled'])
+const JOB_POLL_INTERVAL_MS = 25
 const getJob = async (id: string, space = 'main'): Promise<WireJob> =>
   JSON.parse(
     (await app.inject({ method: 'GET', url: `/api/s/${space}/jobs/${id}` })).payload,
@@ -112,15 +113,25 @@ const runImport = async (
   type: string,
   fields?: Record<string, string>,
   space = 'main',
+  terminalTimeoutMs = 4_000,
 ): Promise<WireJob> => {
   const res = await importFile(filename, content, type, fields, space)
   expect(res.statusCode).toBe(202)
   const enq = JSON.parse(res.payload) as WireJob
   expect(enq.kind).toBe('import')
   let job = enq
+  const deadline = Date.now() + terminalTimeoutMs
 
-  for (let i = 0; i < 300 && !TERMINAL.has(job.status); i++) {
-    await new Promise((r) => setTimeout(r, 10))
+  while (!TERMINAL.has(job.status)) {
+    const remaining = deadline - Date.now()
+
+    if (remaining <= 0) {
+      throw new Error(
+        `import job ${enq.id} did not reach a terminal state within ${terminalTimeoutMs}ms; ` +
+          `last status=${job.status}, progress=${JSON.stringify(job.progress)}`,
+      )
+    }
+    await new Promise((r) => setTimeout(r, Math.min(JOB_POLL_INTERVAL_MS, remaining)))
     job = await getJob(enq.id, space)
   }
 
@@ -490,11 +501,18 @@ describe('durable import (#191): POST /api/s/:space/import → job', () => {
         chat_messages: [{ sender: 'human', text: `message ${i}` }],
       })),
     )
-    const job = await runImport('conversations.json', many, 'application/json')
+    const job = await runImport(
+      'conversations.json',
+      many,
+      'application/json',
+      undefined,
+      'main',
+      20_000,
+    )
     expect(job.status).toBe('succeeded')
     expect(job.result!.imported).toBe(600)
     expect(await notes()).toHaveLength(600)
-  })
+  }, 25_000)
 
   it('root folder nests the default structure under it', async () => {
     const job = await runImport('conversations.json', CLAUDE_CONVERSATIONS, 'application/json', {

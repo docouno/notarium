@@ -33,7 +33,17 @@ import { treeRoutes } from './tree'
 import type { ApiRoutesOptions } from './types'
 
 export const apiRoutes = async (app: FastifyInstance, opts: ApiRoutesOptions) => {
-  const { spaces, auth, contextSets, scopePins, contextOrder, retrievalLog, roles, sessions } = opts
+  const {
+    spaces,
+    auth,
+    contextSets,
+    scopePins,
+    contextOrder,
+    retrievalLog,
+    sessionAudit,
+    roles,
+    sessions,
+  } = opts
   const ctx = buildApiRouteCtx(opts)
 
   await app.register(authRoutes, {
@@ -44,6 +54,7 @@ export const apiRoutes = async (app: FastifyInstance, opts: ApiRoutesOptions) =>
     scopePins,
     contextOrder,
     retrievalLog,
+    sessionAudit,
     projects: opts.projects,
     roles,
     sessions,

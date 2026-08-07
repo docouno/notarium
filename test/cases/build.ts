@@ -217,6 +217,9 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
     }
     for (const e of world.events) {
       const noteId = `${name}:${e.noteId}` // namespace so two cases' n-1 never clash
+      const agentAudit = e.agentAudit?.sessionRef
+        ? { ...e.agentAudit, sessionRef: `${name}:${e.agentAudit.sessionRef}` }
+        : e.agentAudit
 
       if (e.op === 'create') {
         let path = e.path
@@ -225,9 +228,9 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
           path = suffixName(e.path, n)
         }
         takenPaths.add(`${e.space}\0${path}`)
-        events.push({ ...e, noteId, path })
+        events.push({ ...e, noteId, path, ...(agentAudit ? { agentAudit } : {}) })
       } else {
-        events.push({ ...e, noteId })
+        events.push({ ...e, noteId, ...(agentAudit ? { agentAudit } : {}) })
       }
     }
     // Favorites (#42/#245): a NOTE ref is a logical id — namespace it exactly like the
@@ -246,7 +249,11 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
     // Retrieval hits reference notes by logical id — namespace them the same way so a
     // combined case's audit rows resolve to the right notes (#243).
     for (const r of world.retrievals ?? []) {
-      retrievals.push({ ...r, hits: r.hits?.map((h) => ({ ...h, note: `${name}:${h.note}` })) })
+      retrievals.push({
+        ...r,
+        ...(r.sessionRef ? { sessionRef: `${name}:${r.sessionRef}` } : {}),
+        hits: r.hits?.map((h) => ({ ...h, note: `${name}:${h.note}` })),
+      })
     }
     // Session and parent refs are logical ids too: namespace both so independent
     // cases can use friendly names such as `active` without colliding.

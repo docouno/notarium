@@ -281,10 +281,23 @@ describe('seed catalog (#175)', () => {
   it('agent-sessions carries episodes plus divergent owner/root/fork delta positions', () => {
     const world = buildCaseWorld('agent-sessions', { now: DEFAULT_NOW })
     const sessions = world.agentSessions ?? []
-    expect(sessions).toHaveLength(7)
+    expect(sessions).toHaveLength(8)
     expect(sessions.find((session) => session.parentRef)?.parentRef).toBe('review-root')
     expect(sessions.some((session) => session.named === false)).toBe(true)
     expect(sessions.some((session) => session.lastSeenDaysAgo > 30)).toBe(true)
+    expect(sessions.some((session) => session.name.length === 160)).toBe(true)
+    expect(sessions.find((session) => session.ref === 'expired')?.retained).toBe(false)
+    expect(world.retrievals?.some((retrieval) => retrieval.sessionRef === 'expired')).toBe(true)
+    expect(world.events.some((event) => event.agentAudit?.sessionRef === 'expired')).toBe(true)
+    expect(
+      world.retrievals?.some(
+        (retrieval) =>
+          retrieval.sessionRef === 'hostile-label' && retrieval.query.includes('<script>'),
+      ),
+    ).toBe(true)
+    expect(world.events.some((event) => event.agentAudit && !event.agentAudit.sessionRef)).toBe(
+      true,
+    )
     expect(world.agentDeltaCursors).toEqual([
       expect.objectContaining({ sessionRef: 'review-root' }),
       expect.objectContaining({ sessionRef: 'review-fork' }),

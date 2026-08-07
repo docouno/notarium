@@ -185,8 +185,14 @@ export const agentsRoute = (tab: string = DEFAULT_AGENTS_TAB): string => `${AGEN
 export const agentContextRoute = (scope: string = DEFAULT_AGENT_CONTEXT_SCOPE): string =>
   `${agentsRoute('context')}/${encodeURIComponent(scope)}`
 
-/** The Agents → Audit section (#243): the agent-retrieval audit surface. */
+/** Legacy Agents → Audit route; the router redirects it to the session-first surface. */
 export const agentAuditRoute = (): string => agentsRoute('audit')
+
+/** The session-first agent audit. `outside` is the explicit unbound-event bucket. */
+export const agentSessionsRoute = (sessionId?: string): string =>
+  sessionId
+    ? `${agentsRoute('sessions')}/${encodeURIComponent(sessionId)}`
+    : agentsRoute('sessions')
 
 /** The owned role library and discovery-only built-in catalog. */
 export const agentRolesRoute = (): string => agentsRoute('roles')

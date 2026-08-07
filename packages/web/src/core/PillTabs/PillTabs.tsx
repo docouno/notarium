@@ -20,8 +20,7 @@ export type PillTab = {
   metric?: ReactNode
   /** A danger dot on the label (e.g. the dashboard Health pill when links are broken). */
   danger?: boolean
-  /** A softer attention dot (amber) — a signal that's a hint, not an error (e.g. the
-   *  Agents Audit pill when queries recur empty: worth a look, not necessarily wrong). */
+  /** A softer attention dot (amber) — a signal that's a hint, not an error. */
   warn?: boolean
   testId?: string
 }

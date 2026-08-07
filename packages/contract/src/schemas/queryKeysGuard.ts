@@ -7,6 +7,7 @@
 import type { QueryKey } from '../consts/queryKeys'
 import type { ActivityQuery } from './rest/activity'
 import type { AgentAuditQuery } from './rest/agent/audit'
+import type { AgentSessionEventsQuery, AgentSessionsQuery } from './rest/agent/sessions'
 import type { BucketsQuery, NotesQuery } from './rest/notes'
 import type { TrashQuery } from './rest/trash'
 
@@ -17,6 +18,8 @@ type WireQueryKey =
   | keyof BucketsQuery
   | keyof ActivityQuery
   | keyof AgentAuditQuery
+  | keyof AgentSessionsQuery
+  | keyof AgentSessionEventsQuery
   | keyof TrashQuery
   | 'frontmatter'
   | 'scope'

@@ -4,6 +4,7 @@ import type { HostInfo } from '../../../libs/hostInfo'
 import type { ImportStagingStore } from '../../../libs/importStaging'
 import type { AuthService } from '../../../services/auth'
 import type {
+  AgentSessionAuditPersistence,
   AgentSessionsPersistence,
   ContextOrderPersistence,
   ContextSetsPersistence,
@@ -34,6 +35,7 @@ export type ApiRoutesOptions = {
   scopePins?: ScopePinsPersistence
   contextOrder?: ContextOrderPersistence
   retrievalLog?: RetrievalLogPersistence
+  sessionAudit?: AgentSessionAuditPersistence
   markerStore?: MarkerStore
   spacesPersistence?: SpacesPersistence
   about?: HostInfo

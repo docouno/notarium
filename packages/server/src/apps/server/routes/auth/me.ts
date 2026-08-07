@@ -13,6 +13,10 @@ import {
   AgentRoleDetailParamsSchema,
   AgentRoleDetailQuerySchema,
   AgentRoleDetailResponseSchema,
+  AgentSessionEventsQuerySchema,
+  AgentSessionEventsResponseSchema,
+  AgentSessionsQuerySchema,
+  AgentSessionsResponseSchema,
   ConnectionPatchRequestSchema,
   ConnectionsResponseSchema,
   CONTEXT_KIND,
@@ -33,13 +37,16 @@ import {
   type RoleInventoryEntry,
 } from '@notarium/contract'
 import { HTTP_STATUS } from '@notarium/contract/http'
+import { AgentSessionIdSchema } from '@notarium/contract/tools'
 
 import { withAuthors } from '../../../../libs/authors'
 import { AGENT_SESSION_IDLE_MS } from '../../../../services/agentSessions'
 import { AuthError, type AuthService } from '../../../../services/auth'
-import { can } from '../../../../services/authz'
+import { agentOwnerOf, can } from '../../../../services/authz'
 import { projectSummaryOf } from '../../../../services/mcp/helpers/projectAddressing'
 import type {
+  AgentSessionAuditEvent,
+  AgentSessionAuditPersistence,
   AgentSessionsPersistence,
   ContextOrderPersistence,
   ContextSetsPersistence,
@@ -74,6 +81,95 @@ import {
 } from '../../../../services/storeAccess'
 import { authz, setSessionCookie } from './_helpers'
 
+const encodeAuditCursor = (value: Record<string, string>): string =>
+  Buffer.from(JSON.stringify(value), 'utf8').toString('base64url')
+
+const isCanonicalIsoInstant = (value: unknown): value is string => {
+  if (typeof value !== 'string') {
+    return false
+  }
+  const time = Date.parse(value)
+  return Number.isFinite(time) && new Date(time).toISOString() === value
+}
+
+const isPositiveSqliteInteger = (value: unknown): value is string => {
+  if (typeof value !== 'string' || !/^\d+$/.test(value)) {
+    return false
+  }
+  try {
+    const n = BigInt(value)
+    return n > 0n && n <= 9_223_372_036_854_775_807n
+  } catch {
+    return false
+  }
+}
+
+const decodeSummaryCursor = (raw: string | undefined): { at: string; id: string } | undefined => {
+  if (!raw) {
+    return undefined
+  }
+  try {
+    const value = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8')) as Record<
+      string,
+      unknown
+    >
+
+    if (isCanonicalIsoInstant(value.at) && AgentSessionIdSchema.safeParse(value.id).success) {
+      return { at: value.at, id: value.id as string }
+    }
+  } catch {
+    throw new AuthError(HTTP_STATUS.BAD_REQUEST, 'bad cursor')
+  }
+  throw new AuthError(HTTP_STATUS.BAD_REQUEST, 'bad cursor')
+}
+
+const decodeEventCursor = (
+  raw: string | undefined,
+): { at: string; source: 'retrieval' | 'write'; id: string } | undefined => {
+  if (!raw) {
+    return undefined
+  }
+  try {
+    const value = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8')) as Record<
+      string,
+      unknown
+    >
+
+    if (
+      isCanonicalIsoInstant(value.at) &&
+      isPositiveSqliteInteger(value.id) &&
+      (value.source === 'retrieval' || value.source === 'write')
+    ) {
+      return { at: value.at, id: value.id, source: value.source }
+    }
+  } catch {
+    throw new AuthError(HTTP_STATUS.BAD_REQUEST, 'bad cursor')
+  }
+  throw new AuthError(HTTP_STATUS.BAD_REQUEST, 'bad cursor')
+}
+
+const sessionEventToWire = (event: AgentSessionAuditEvent) => {
+  if (event.type === 'write') {
+    return event
+  }
+  const r = event.record
+  return {
+    type: 'retrieval' as const,
+    id: r.id,
+    at: r.createdAt,
+    tool: r.tool,
+    query: r.query,
+    project: r.project,
+    classFilter: r.classFilter,
+    resultCount: r.resultCount,
+    topScore: r.topScore,
+    hits: r.hits,
+    agent: r.agent,
+    principal: r.principal,
+    sessionAttach: r.sessionAttach,
+  }
+}
+
 const ROLE_DETAIL_TOKEN_BUDGET = 65_536
 const ROLE_INVENTORY_LIMIT = 512
 const ROLE_INVENTORY_LOCATION_LIMIT = 128
@@ -102,6 +198,7 @@ export const meRoutes = async (
     scopePins,
     contextOrder,
     retrievalLog,
+    sessionAudit,
     roles,
     sessions,
     projects: projectsForRoles,
@@ -113,6 +210,7 @@ export const meRoutes = async (
     scopePins?: ScopePinsPersistence
     contextOrder?: ContextOrderPersistence
     retrievalLog?: RetrievalLogPersistence
+    sessionAudit?: AgentSessionAuditPersistence
     roles?: RolesService
     sessions?: AgentSessionsPersistence
     projects?: ProjectsPersistence
@@ -668,12 +766,11 @@ export const meRoutes = async (
     return OkResponseSchema.parse({ ok: true })
   })
 
-  // The agent-retrieval audit feed. A meta-DB-less host (or a principal with no
-  // username, e.g. none-mode) has nothing captured → an honest empty audit, not
-  // an error.
-  // canon: docs/projects.md#audit-auditing-the-runtime-retrieval-243-mem-audita
+  // Compatibility feed for retrieval-only clients; the UI is session-first.
+  // A meta-DB-less host has nothing captured → an honest empty audit.
+  // canon: docs/projects.md#sessions-auditing-agent-episodes-243-321-mem-audita
   app.get('/api/me/agent-audit', { config: authz('self:read', 'host') }, async (req, reply) => {
-    const owner = req.principal.username
+    const owner = agentOwnerOf(req.principal)
 
     if (!retrievalLog || !owner) {
       return AgentAuditResponseSchema.parse({
@@ -736,6 +833,131 @@ export const meRoutes = async (
       aggregates,
     })
   })
+
+  // Retained lifecycle rows and archived audit snapshots are folded server-side;
+  // global retrieval insights ride only the first page unless explicitly skipped.
+  app.get('/api/me/agent-sessions', { config: authz('self:read', 'host') }, async (req, reply) => {
+    const q = AgentSessionsQuerySchema.safeParse(req.query)
+
+    if (!q.success) {
+      return reply.code(HTTP_STATUS.BAD_REQUEST).send({ error: q.error.issues[0]?.message })
+    }
+    const owner = agentOwnerOf(req.principal)
+    const includeAggregates = !q.data.cursor && q.data.aggregates !== '0'
+
+    if (!owner || !sessionAudit) {
+      return AgentSessionsResponseSchema.parse({
+        sessions: [],
+        total: 0,
+        active: 0,
+        outside: null,
+        hasMore: false,
+        nextCursor: null,
+        aggregates: includeAggregates
+          ? { totalQueries: 0, missCount: 0, top: [], misses: [] }
+          : null,
+      })
+    }
+    const activeSince = new Date(Date.now() - AGENT_SESSION_IDLE_MS).toISOString()
+    const [overview, aggregates] = await Promise.all([
+      sessionAudit.overview({
+        owner,
+        activeSince,
+        limit: q.data.limit,
+        before: decodeSummaryCursor(q.data.cursor),
+      }),
+      includeAggregates && retrievalLog
+        ? retrievalLog.aggregates(owner)
+        : Promise.resolve(
+            includeAggregates ? { totalQueries: 0, missCount: 0, top: [], misses: [] } : null,
+          ),
+    ])
+    const last = overview.hasMore ? overview.items.at(-1) : null
+    return AgentSessionsResponseSchema.parse({
+      sessions: overview.items,
+      total: overview.total,
+      active: overview.active,
+      outside: overview.outside,
+      hasMore: overview.hasMore,
+      nextCursor: last ? encodeAuditCursor({ at: last.lastSeenAt, id: last.id }) : null,
+      aggregates,
+    })
+  })
+
+  app.get(
+    '/api/me/agent-sessions/:id',
+    { config: authz('self:read', 'host') },
+    async (req, reply) => {
+      const q = AgentSessionEventsQuerySchema.safeParse(req.query)
+
+      if (!q.success) {
+        return reply.code(HTTP_STATUS.BAD_REQUEST).send({ error: q.error.issues[0]?.message })
+      }
+      const owner = agentOwnerOf(req.principal)
+
+      if (!owner || !sessionAudit) {
+        throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+      }
+      const id = (req.params as { id: string }).id
+      const outside = id === 'outside'
+
+      if (!outside && !AgentSessionIdSchema.safeParse(id).success) {
+        throw new AuthError(HTTP_STATUS.BAD_REQUEST, 'bad session id')
+      }
+      const activeSince = new Date(Date.now() - AGENT_SESSION_IDLE_MS).toISOString()
+      const [target, events] = await Promise.all([
+        outside
+          ? sessionAudit
+              .overview({ owner, activeSince, limit: 1 })
+              .then((result) =>
+                result.outside ? { kind: 'outside' as const, ...result.outside } : null,
+              )
+          : sessionAudit
+              .find(owner, id, activeSince)
+              .then((result) => (result ? { kind: 'session' as const, ...result } : null)),
+        sessionAudit.events({
+          owner,
+          sessionId: outside ? null : id,
+          type:
+            q.data.filter === 'reads'
+              ? 'retrieval'
+              : q.data.filter === 'writes'
+                ? 'write'
+                : undefined,
+          limit: q.data.limit,
+          before: decodeEventCursor(q.data.cursor),
+        }),
+      ])
+
+      if (!target) {
+        throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+      }
+      const last = events.hasMore ? events.items.at(-1) : null
+      const cursor = last
+        ? last.type === 'retrieval'
+          ? encodeAuditCursor({
+              at: last.record.createdAt,
+              source: 'retrieval',
+              id: last.record.id,
+            })
+          : encodeAuditCursor({ at: last.at, source: 'write', id: last.id })
+        : null
+      return AgentSessionEventsResponseSchema.parse({
+        target,
+        events: events.items.map((event) =>
+          event.type === 'write'
+            ? sessionEventToWire({
+                ...event,
+                space: spaces.slugOf(event.space) ?? event.space,
+              })
+            : sessionEventToWire(event),
+        ),
+        total: events.total,
+        hasMore: events.hasMore,
+        nextCursor: cursor,
+      })
+    },
+  )
 
   // Read the curated profile (always-load note + display name). 404 in 'none'
   // mode, like /api/me. Read does not mint.

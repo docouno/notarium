@@ -17,6 +17,7 @@ import { type ProjectRecord } from '../../../metaDb'
 import { type Ctx, type Handler, toolErrorMessage, ToolFailure } from '../../gateway'
 import { dedupedWrite, wireSpace, writeEcho, type WriteRun } from '../../helpers/dedup'
 import { handleOf } from '../../helpers/projectAddressing'
+import { writeAttributionOf } from '../../helpers/writeAttribution'
 import { sanitizeText } from '../../sanitize'
 import { resolveLinkTitle } from '../links'
 
@@ -126,7 +127,7 @@ const createOneNote = async (
         // Class is HARD-WIRED (poka-yoke): shared knowledge → user-doc, never agent-set.
         // canon: docs/note-model.md#note-classes
         targetClass: NOTE_CLASS.userDoc,
-        principal: ctx.principal.id,
+        ...writeAttributionOf(ctx),
       })
       // Integrity echo hashes the body the agent SENT (a transport check, NOT a
       // read-back — stored bytes differ: title stripped, links folded). A create

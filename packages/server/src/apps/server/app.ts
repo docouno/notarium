@@ -19,6 +19,7 @@ import type { MutationGate, MutationRelease } from '../../libs/mutationGate'
 import { AuthError, type AuthService, createAuthService } from '../../services/auth'
 import type {
   AgentDeltaCursorsPersistence,
+  AgentSessionAuditPersistence,
   AgentSessionsPersistence,
   ContextOrderPersistence,
   ContextSetsPersistence,
@@ -60,6 +61,7 @@ export type BuildAppOptions = {
   scopePins?: ScopePinsPersistence
   contextOrder?: ContextOrderPersistence
   retrievalLog?: RetrievalLogPersistence
+  sessionAudit?: AgentSessionAuditPersistence
   markerStore?: MarkerStore
   spacesPersistence?: SpacesPersistence
   spaDist?: string
@@ -95,6 +97,7 @@ export const buildApp = async ({
   agentDeltaCursors,
   gatewayState,
   retrievalLog,
+  sessionAudit,
   projects,
   folders,
   favorites,
@@ -338,6 +341,7 @@ export const buildApp = async ({
     scopePins,
     contextOrder,
     retrievalLog,
+    sessionAudit,
     sessions,
     roles,
     markerStore,

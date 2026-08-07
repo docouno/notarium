@@ -112,9 +112,10 @@ export type AuthDecl = {
  *  doesn't express it; see docs/seeds.md). `hits` reference seeded notes by their LOGICAL
  *  id (the handle WorldBuilder.note() returns); the applier resolves each to the note's real
  *  id/title/class AFTER the timeline replays. A retrieval with no hits is a zero-result MISS
- *  — the blind-spot signal the Audit surface headlines. */
+ *  — the blind-spot signal the Sessions overview headlines. */
 export type RetrievalDecl = {
-  /** The username whose audit this belongs to; defaults to the primary owner. */
+  /** The username whose audit this belongs to; defaults to the bound session owner or
+   * primary owner. When sessionRef is present, an explicit value must match it. */
   owner?: string
   /** The token that made the call (`pat:<name>:<id>` | `oauth:<appName>` shorthand for a
    *  declared connected app | `ui`), remapped to the seed user like every principal — the
@@ -123,6 +124,9 @@ export type RetrievalDecl = {
   /** Friendly agent name shown in the audit (a PAT name / connected-app name), e.g. "CLI".
    *  At runtime this is captured from the live token; a case supplies it directly. */
   agent?: string
+  /** Optional episode snapshot. Absent means this row belongs to Outside sessions. */
+  sessionRef?: string
+  sessionAttach?: 'declared' | 'inferred'
   tool: 'search' | 'recall' | 'get_note'
   /** The search/recall query, or the get_note ref. */
   query: string
@@ -150,6 +154,8 @@ export type AgentSessionDecl = {
   createdDaysAgo: number
   lastSeenDaysAgo: number
   calls: number
+  /** False seeds only durable audit snapshots, modelling a lifecycle row removed by GC. */
+  retained?: boolean
   /** Explicitly selected effective role; absent means the base mode. */
   role?: string
 }
@@ -257,7 +263,16 @@ export type ExternalRewriteDecl = {
  *  that correlates a note's create→edit→delete→restore across the timeline; the
  *  real applier maps it to the note's real `notarium-id` after the first create.
  *  Chronology is authored via `date` — the appliers sort by it. */
-export type CaseEvent =
+export type AgentWriteAuditDecl = {
+  /** Defaults to the bound session owner or primary owner; an explicit value must
+   * match a bound session. */
+  owner?: string
+  agent?: string
+  sessionRef?: string
+  sessionAttach?: 'declared' | 'inferred'
+}
+
+export type CaseEvent = (
   | {
       op: 'create'
       date: CaseDate
@@ -294,6 +309,7 @@ export type CaseEvent =
     }
   | { op: 'delete'; date: CaseDate; space: string; noteId: string; principal?: string }
   | { op: 'restore'; date: CaseDate; space: string; noteId: string; principal?: string }
+) & { agentAudit?: AgentWriteAuditDecl }
 
 /** Where a seeded context set (#209) is attached: a user's personal scope, or a
  *  project (addressed by space slug + folder path, resolved to its id at apply). */

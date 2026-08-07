@@ -19,6 +19,7 @@ import { createRetrievalLogFacet } from './drivers/pg/retrievalLog'
 import { lockRevisionKeys } from './drivers/pg/revisionLocks'
 import { createRevisionsFacet } from './drivers/pg/revisions'
 import { createScopePinsFacet } from './drivers/pg/scopePins'
+import { createSessionAuditFacet } from './drivers/pg/sessionAudit'
 import { createSessionsFacet } from './drivers/pg/sessions'
 import { createSpacesFacet } from './drivers/pg/spaces'
 import { runPgMigrations } from './migrations'
@@ -347,6 +348,8 @@ export class PgMetaDb implements MetaDb {
   readonly agentDeltaCursors = createAgentDeltaCursorsFacet(this.ctx)
 
   readonly sessions = createSessionsFacet(this.ctx)
+
+  readonly sessionAudit = createSessionAuditFacet(this.ctx)
 
   readonly oauth = createOAuthFacet(this.ctx)
 

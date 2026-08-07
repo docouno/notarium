@@ -3,6 +3,7 @@ import { describeAgentDeltaCursorsContract } from './agentDeltaCursorsContract'
 import { describeAgentSessionsContract } from './agentSessionsContract'
 import { describeGatewayStateContract } from './gatewayStateContract'
 import { describeRevisionPersistenceContract } from './revisionPersistenceContract'
+import { describeSessionAuditContract } from './sessionAuditContract'
 
 describeGatewayStateContract('SQLite', async () => {
   const db = new SqliteMetaDb(':memory:')
@@ -28,4 +29,15 @@ describeAgentSessionsContract('SQLite', async () => {
 describeRevisionPersistenceContract('SQLite', async () => {
   const db = new SqliteMetaDb(':memory:')
   return { persistence: db.revisions, teardown: () => db.close() }
+})
+
+describeSessionAuditContract('SQLite', async () => {
+  const db = new SqliteMetaDb(':memory:')
+  return {
+    audit: db.sessionAudit,
+    retrievals: db.retrievalLog,
+    revisions: db.revisions,
+    sessions: db.sessions,
+    teardown: () => db.close(),
+  }
 })

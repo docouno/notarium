@@ -2,6 +2,7 @@ import type {
   AgentDeltaCursorDecl,
   AgentRoleDecl,
   AgentSessionDecl,
+  AgentWriteAuditDecl,
   CaseEvent,
   CaseNoteClass,
   CaseWorld,
@@ -145,6 +146,8 @@ export type NoteDecl = {
   muted?: boolean
   pin?: boolean
   principal?: string
+  /** Agent/session attribution copied to every authored lifecycle event. */
+  agentAudit?: AgentWriteAuditDecl
   /** When the note first appears through us (create). */
   created: string
   /** Later edit instants — each a chained `edited` revision. */
@@ -256,6 +259,7 @@ export class WorldBuilder {
       muted: decl.muted,
       pin: decl.pin,
       principal: decl.principal,
+      agentAudit: decl.agentAudit,
     })
     for (const [i, date] of (decl.edits ?? []).entries()) {
       this.events.push({
@@ -265,6 +269,7 @@ export class WorldBuilder {
         noteId,
         content: [content, '', `_Edit ${i + 1}._`].join('\n'),
         principal: decl.principal,
+        agentAudit: decl.agentAudit,
       })
     }
     if (decl.deletedAt) {
@@ -274,6 +279,7 @@ export class WorldBuilder {
         space: decl.space,
         noteId,
         principal: decl.principal,
+        agentAudit: decl.agentAudit,
       })
     }
     if (decl.restoredAt) {
@@ -283,6 +289,7 @@ export class WorldBuilder {
         space: decl.space,
         noteId,
         principal: decl.principal,
+        agentAudit: decl.agentAudit,
       })
     }
 

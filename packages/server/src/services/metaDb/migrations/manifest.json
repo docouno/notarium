@@ -11,7 +11,7 @@
     {
       "version": 1,
       "name": "agent_sessions",
-      "checksum": "sha256:74620f6e4195ac194358c12c078f698b05192c3a02678dc6f1ad0b6dad3849b0",
+      "checksum": "sha256:0160a883e4a4e02183809ffc424fbf128c4558861022340b1debb641c498c8f0",
       "sqlite": "sqlite/0001_agent_sessions.sql",
       "postgres": "postgres/0001_agent_sessions.sql"
     },

@@ -123,6 +123,7 @@ const remember = async (
           fileName: memoryFileName(input.category),
           summary: input.summary,
           principal: input.principal,
+          agent: input.agent,
         })
         return await withEcho(created, input.observation, 'created', summaryUpdated)
       } catch (err) {
@@ -169,6 +170,7 @@ const remember = async (
         tags: normTags(note.frontmatter?.tags),
         noteType: typeof note.frontmatter?.type === 'string' ? note.frontmatter.type : undefined,
         principal: input.principal,
+        agent: input.agent,
       })
       return await withEcho(appended, next, 'appended', summaryUpdated)
     } catch (err) {

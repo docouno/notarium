@@ -2,7 +2,7 @@ import { DisclosureCardSkeleton } from '../../core/DisclosureCard'
 import { Skeleton } from '../../core/Skeleton'
 import { cx } from '../../libs/cx/cx'
 import { AGGREGATE_ROWS, STAT_WIDTHS } from './consts'
-import styles from './AuditPage.module.scss'
+import styles from './SessionsPage.module.scss'
 
 // ── loading skeletons ────────────────────────────────────────────────────────
 // Structural, NOT decorative: each placeholder mirrors the real element's box (a row

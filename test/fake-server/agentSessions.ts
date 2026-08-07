@@ -29,6 +29,11 @@ export class InMemoryAgentSessions implements AgentSessionsPersistence {
     this.lifecycleView?.replaceSessions([])
   }
 
+  /** Test read-model seam: immutable lifecycle snapshot for the session-audit twin. */
+  snapshot(): AgentSessionRecord[] {
+    return [...this.records.values()].map(clone)
+  }
+
   seed(records: readonly AgentSessionRecord[]): void {
     this.clear()
     const pending = new Map(records.map((record) => [record.id, record]))

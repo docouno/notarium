@@ -29,6 +29,9 @@ export type Revision = {
   kind: RevisionKind
   /** Writer attribution id: 'user:<name>', 'pat:<name>:<id>', or 'ui' (mode none); null = external. */
   principal: string | null
+  /** Agent-audit attribution captured with the write. Absent on legacy/human revisions so the
+   *  existing revision wire shape stays backwards-compatible. */
+  agent?: AgentWriteAttribution | null
   /** sha-256 of the content blob; null = body honestly unknown (external gap / lost delete state). */
   contentHash: string | null
   title: string
@@ -437,8 +440,30 @@ export type WriteInput = {
   createdAt?: string
   /** Journal attribution: 'pat:<user>:<id>' (agent), 'user:<name>' (human), 'ui' (mode none). */
   principal?: string
+  /** Host-built agent audit channel. It never crosses the note write wire: the owner
+   *  makes unbound writes auditable, while the session snapshot survives session GC. */
+  agent?: AgentWriteAttribution
   /** Journal channel for non-plain-save writes: the restore flow records kind 'restore'. */
   journal?: { kind: 'restore'; sourceRevisionId: string }
+}
+
+export const AGENT_SESSION_ATTACH = {
+  declared: 'declared',
+  inferred: 'inferred',
+} as const
+
+export type AgentSessionAttach = (typeof AGENT_SESSION_ATTACH)[keyof typeof AGENT_SESSION_ATTACH]
+
+export type AgentSessionAttribution = {
+  id: string
+  name: string
+  attach: AgentSessionAttach
+}
+
+export type AgentWriteAttribution = {
+  owner: string
+  agent: string | null
+  session?: AgentSessionAttribution
 }
 
 export type WriteResult = {
@@ -700,7 +725,10 @@ export type KnowledgeStore = {
   makeDir?(path: string, opts?: MutationOptions): Promise<void>
   /** Delete a folder subtree. A read-model-equipped store tombstones every child inside the same
    *  prefix mutation fence before removing the on-disk tree. */
-  removeDir?(path: string, opts?: MutationOptions & { principal?: string }): Promise<void>
+  removeDir?(
+    path: string,
+    opts?: MutationOptions & { principal?: string; agent?: AgentWriteAttribution },
+  ): Promise<void>
   /** Feed the engine current→past folder-path pairs so a path-form `[[oldpath/note]]` resolves to a
    *  renamed folder's note. A resolution HINT, not ownership; the bare engine stays alias-blind. */
   setFolderAliases?(aliases: ReadonlyArray<{ current: string; alias: string }>): void
@@ -735,7 +763,10 @@ export type KnowledgeStore = {
   write(input: WriteInput, opts?: MutationOptions): Promise<WriteResult>
   move(input: MoveInput, opts?: MutationOptions): Promise<void>
   /** `principal` is journal attribution — engines without a journal ignore it. */
-  remove(id: string, opts?: { principal?: string; identityOnly?: boolean }): Promise<void>
+  remove(
+    id: string,
+    opts?: { principal?: string; agent?: AgentWriteAttribution; identityOnly?: boolean },
+  ): Promise<void>
   /** Changes since `cursor` (null = establish one without history); an engine with no external
    *  change source returns empty upserts and its full inventory. */
   changes(cursor: string | null): Promise<StoreDelta>

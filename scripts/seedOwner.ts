@@ -56,3 +56,20 @@ export const resolveSeedAgentDeltaCursorOwner = (input: {
 
   return explicit ?? bound ?? input.fallbackOwner
 }
+
+export const resolveSeedAgentActivityOwner = (input: {
+  kind: 'write' | 'retrieval'
+  activityOwner?: string
+  sessionOwner?: string
+  fallbackOwner: string
+  asUser: (name: string) => string
+}): string => {
+  const explicit = input.activityOwner ? input.asUser(input.activityOwner) : undefined
+  const bound = input.sessionOwner ? input.asUser(input.sessionOwner) : undefined
+
+  if (explicit && bound && explicit !== bound) {
+    throw new Error(`agent ${input.kind} owner ${explicit} does not match session owner ${bound}`)
+  }
+
+  return bound ?? explicit ?? input.fallbackOwner
+}

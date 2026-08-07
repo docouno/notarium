@@ -1,5 +1,5 @@
 import { AGENT_SESSION_STATE, type AgentSessionState } from '@notarium/contract'
-import { freshNoteId } from '@notarium/core'
+import { AGENT_SESSION_ATTACH, type AgentSessionAttach, freshNoteId } from '@notarium/core'
 
 import type { AgentSessionRecord, AgentSessionRoleSet, AgentSessionsPersistence } from '../metaDb'
 import {
@@ -8,8 +8,6 @@ import {
   AGENT_SESSION_RECENT_MS,
   AGENT_SESSION_RETENTION_MS,
 } from './consts'
-
-export type AgentSessionAttach = 'declared' | 'inferred'
 
 export type BoundAgentSession = {
   record: AgentSessionRecord
@@ -105,7 +103,7 @@ export const createAgentSessions = ({
           throw new NoSuchAgentSessionError()
         }
 
-        return { record, attach: 'declared' }
+        return { record, attach: AGENT_SESSION_ATTACH.declared }
       }
 
       const record = await persistence.inferActiveAndTouch(
@@ -113,7 +111,7 @@ export const createAgentSessions = ({
         before(now, AGENT_SESSION_IDLE_MS),
         at,
       )
-      return record ? { record, attach: 'inferred' } : null
+      return record ? { record, attach: AGENT_SESSION_ATTACH.inferred } : null
     },
 
     start: async (owner, request, defaultName) => {
@@ -131,7 +129,11 @@ export const createAgentSessions = ({
         }
 
         return {
-          session: { record, attach: 'declared', state: AGENT_SESSION_STATE.resumed },
+          session: {
+            record,
+            attach: AGENT_SESSION_ATTACH.declared,
+            state: AGENT_SESSION_STATE.resumed,
+          },
         }
       }
 
@@ -160,7 +162,7 @@ export const createAgentSessions = ({
         return {
           session: {
             record: result.record,
-            attach: 'declared',
+            attach: AGENT_SESSION_ATTACH.declared,
             state: AGENT_SESSION_STATE[result.kind],
           },
         }
@@ -170,7 +172,11 @@ export const createAgentSessions = ({
 
       if (inferred) {
         return {
-          session: { record: inferred, attach: 'inferred', state: AGENT_SESSION_STATE.resumed },
+          session: {
+            record: inferred,
+            attach: AGENT_SESSION_ATTACH.inferred,
+            state: AGENT_SESSION_STATE.resumed,
+          },
         }
       }
 
@@ -185,7 +191,7 @@ export const createAgentSessions = ({
         false,
         null,
         at,
-        'inferred',
+        AGENT_SESSION_ATTACH.inferred,
         AGENT_SESSION_STATE.new,
       )
       return {

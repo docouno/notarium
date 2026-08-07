@@ -4,8 +4,8 @@ import type { CaseSpec } from '../types'
 export const agentSessions: CaseSpec = {
   name: 'agent-sessions',
   description:
-    'Durable MCP episodes and independent project delta positions: active fork siblings, owner fallback, a second owner, sleeping and automatic sessions, a hostile label, and an expired row.',
-  axes: ['agent-sessions', 'auth', 'history'],
+    'Durable MCP episodes and independent project delta positions: active fork siblings, owner fallback, a second owner, sleeping and automatic sessions, hostile/long labels, and an expired row.',
+  axes: ['agent-sessions', 'agent-audit', 'auth', 'history'],
   build: ({ now }) => {
     const b = new WorldBuilder(now)
     b.space({ slug: 'main', displayName: 'Main', personalFor: 'sergey' })
@@ -31,7 +31,7 @@ export const agentSessions: CaseSpec = {
       created: daysBefore(now, 0.3),
       principal: 'user:sergey',
     })
-    b.note({
+    const pendingForEveryone = b.note({
       space: 'main',
       path: 'sessions/pending-for-everyone.md',
       title: 'Pending for every session',
@@ -79,11 +79,19 @@ export const agentSessions: CaseSpec = {
       calls: 2,
     })
     b.agentSession({
+      ref: 'long-unbroken-label',
+      name: 'a'.repeat(160),
+      createdDaysAgo: 9,
+      lastSeenDaysAgo: 8,
+      calls: 1,
+    })
+    b.agentSession({
       ref: 'expired',
       name: 'expired retention probe',
       createdDaysAgo: 45,
       lastSeenDaysAgo: 31,
       calls: 1,
+      retained: false,
     })
     b.agentSession({
       ref: 'bob-review',
@@ -92,6 +100,137 @@ export const agentSessions: CaseSpec = {
       createdDaysAgo: 0.4,
       lastSeenDaysAgo: 0.04,
       calls: 4,
+    })
+
+    b.note({
+      space: 'main',
+      path: 'sessions/root-findings.md',
+      title: 'Migration findings',
+      content: '# Migration findings\n\nThe root session recorded its conclusion.',
+      created: daysBefore(now, 0.04),
+      principal: 'pat:CLI:seed',
+      agentAudit: {
+        sessionRef: 'review-root',
+        sessionAttach: 'declared',
+        agent: 'CLI',
+      },
+    })
+    b.note({
+      space: 'main',
+      path: 'sessions/fork-findings.md',
+      title: 'Fork findings',
+      content: '# Fork findings\n\nThe fork took a different path.',
+      created: daysBefore(now, 0.01),
+      principal: 'oauth:sergey:seed',
+      agentAudit: {
+        sessionRef: 'review-fork',
+        sessionAttach: 'inferred',
+        agent: 'Claude',
+      },
+    })
+    b.note({
+      space: 'main',
+      path: 'sessions/outside-session.md',
+      title: 'Unbound agent write',
+      content: '# Unbound agent write\n\nThis write deliberately has no session.',
+      created: daysBefore(now, 0.06),
+      principal: 'pat:CLI:seed',
+      agentAudit: { agent: 'CLI' },
+    })
+    b.note({
+      space: 'main',
+      path: 'sessions/archived-write.md',
+      title: 'Archived session write',
+      content: '# Archived session write\n\nThe lifecycle row was later collected.',
+      created: daysBefore(now, 31.05),
+      principal: 'pat:CLI:seed',
+      agentAudit: {
+        sessionRef: 'expired',
+        sessionAttach: 'declared',
+        agent: 'CLI',
+      },
+    })
+    b.note({
+      space: 'main',
+      path: 'sessions/bob-findings.md',
+      title: 'Bob private episode',
+      content: '# Bob private episode\n\nMust never appear in the primary owner audit.',
+      created: daysBefore(now, 0.06),
+      principal: 'pat:bob:seed',
+      agentAudit: { owner: 'bob', sessionRef: 'bob-review', agent: 'Bob CLI' },
+    })
+
+    const cli = { principal: 'pat:CLI:seed', agent: 'CLI' }
+    b.retrieval({
+      ...cli,
+      sessionRef: 'review-root',
+      sessionAttach: 'declared',
+      tool: 'search',
+      query: 'migration checklist',
+      hits: [{ note: acknowledgedByRoot, score: 0.91 }],
+      daysAgo: 0.05,
+    })
+    b.retrieval({
+      ...cli,
+      sessionRef: 'review-root',
+      sessionAttach: 'inferred',
+      tool: 'search',
+      query: 'legacy rollout guide',
+      hits: [],
+      daysAgo: 0.045,
+    })
+    b.retrieval({
+      ...cli,
+      sessionRef: 'review-fork',
+      sessionAttach: 'declared',
+      tool: 'search',
+      query: 'legacy rollout guide',
+      hits: [],
+      daysAgo: 0.012,
+    })
+    b.retrieval({
+      principal: 'oauth:Claude',
+      agent: 'Claude',
+      sessionRef: 'review-fork',
+      sessionAttach: 'declared',
+      tool: 'get_note',
+      query: pendingForEveryone,
+      hits: [{ note: pendingForEveryone }],
+      daysAgo: 0.009,
+    })
+    b.retrieval({
+      principal: 'pat:hostile:seed',
+      agent: '<img src=x onerror=alert(1)>',
+      sessionRef: 'hostile-label',
+      tool: 'recall',
+      query: '<script>alert("audit")</script>',
+      hits: [{ note: acknowledgedByFork }],
+      daysAgo: 0.11,
+    })
+    b.retrieval({
+      ...cli,
+      sessionRef: 'expired',
+      tool: 'search',
+      query: 'archived decision',
+      hits: [{ note: acknowledgedByRoot, score: 0.77 }],
+      daysAgo: 31.1,
+    })
+    b.retrieval({
+      ...cli,
+      tool: 'recall',
+      query: 'unbound context',
+      hits: [{ note: acknowledgedByFork }],
+      daysAgo: 0.055,
+    })
+    b.retrieval({
+      owner: 'bob',
+      principal: 'pat:bob:seed',
+      agent: 'Bob CLI',
+      sessionRef: 'bob-review',
+      tool: 'search',
+      query: 'bob only',
+      hits: [{ note: acknowledgedByRoot, score: 0.88 }],
+      daysAgo: 0.05,
     })
 
     // Three deliberately divergent positions over the same project journal:

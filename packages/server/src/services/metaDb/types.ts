@@ -1,4 +1,9 @@
-import type { IdentityPersistence, RevisionPersistence } from '@notarium/core'
+import type {
+  AgentSessionAttach,
+  IdentityPersistence,
+  RevisionKind,
+  RevisionPersistence,
+} from '@notarium/core'
 
 /** Derived space registry row; the `.notariummeta` marker is the source of truth.
  *  canon: docs/spaces.md#model · docs/architecture.md#p7 */
@@ -274,6 +279,10 @@ export type RetrievalLogRecord = {
   /** Friendly name of the acting agent — the PAT's name or the connected app's,
    *  captured at write time (robust against token rotation). null for an unnamed principal. */
   agent: string | null
+  /** Bound episode snapshot. Nulls mean the call happened outside a session. */
+  sessionId: string | null
+  sessionName: string | null
+  sessionAttach: AgentSessionAttach | null
   tool: RetrievalTool
   query: string
   project: string | null
@@ -322,7 +331,7 @@ export type RetrievalAggregates = {
 
 /** The agent-retrieval audit facet: an append-only, owner-scoped log written
  *  fire-and-forget by the MCP gateway on every read-tool call, read back by the
- *  /agents Audit surface. Owner-keyed and cross-space (a search fans out) — so it is
+ *  Agents → Sessions surface. Owner-keyed and cross-space (a search fans out) — so it is
  *  NOT swept by purgeSpace, exactly like the per-user oauth facet. */
 export type RetrievalLogPersistence = {
   append(input: RetrievalLogInput): Promise<RetrievalLogRecord>
@@ -572,6 +581,87 @@ export type AgentSessionsPersistence = {
   /** Set the active role atomically; `changed=false` is the idempotent repeat. */
   setRole(owner: string, id: string, role: string): Promise<AgentSessionRoleSet | null>
   prune(before: string): Promise<void>
+}
+
+// ── Owner session audit read model ─────────────────────────────
+
+export type AgentSessionAuditSummary = {
+  id: string
+  name: string
+  named: boolean | null
+  parentId: string | null
+  createdAt: string
+  lastSeenAt: string
+  /** null after the retained lifecycle row has been GC'd. */
+  calls: number | null
+  reads: number
+  writes: number
+  retained: boolean
+  active: boolean
+}
+
+export type AgentSessionAuditOutside = {
+  reads: number
+  writes: number
+  lastSeenAt: string
+}
+
+export type AgentSessionAuditSummaryCursor = { at: string; id: string }
+export type AgentSessionAuditEventCursor = {
+  at: string
+  source: 'retrieval' | 'write'
+  id: string
+}
+
+export type AgentSessionAuditRetrievalEvent = {
+  type: 'retrieval'
+  record: RetrievalLogRecord
+}
+
+export type AgentSessionAuditWriteEvent = {
+  type: 'write'
+  id: string
+  at: string
+  principal: string | null
+  agent: string | null
+  sessionAttach: AgentSessionAttach | null
+  noteId: string
+  space: string
+  title: string
+  class: string | null
+  revisionKind: RevisionKind
+}
+
+export type AgentSessionAuditEvent = AgentSessionAuditRetrievalEvent | AgentSessionAuditWriteEvent
+
+/** Cross-space, self-scoped read model over retained sessions plus the two durable
+ * audit sources. It owns no writes and keeps archived session snapshots visible. */
+export type AgentSessionAuditPersistence = {
+  overview(q: {
+    owner: string
+    activeSince: string
+    limit: number
+    before?: AgentSessionAuditSummaryCursor
+  }): Promise<{
+    items: AgentSessionAuditSummary[]
+    total: number
+    active: number
+    outside: AgentSessionAuditOutside | null
+    hasMore: boolean
+  }>
+  find(
+    owner: string,
+    sessionId: string,
+    activeSince: string,
+  ): Promise<AgentSessionAuditSummary | null>
+  events(q: {
+    owner: string
+    /** null addresses the explicit Outside sessions bucket. */
+    sessionId: string | null
+    type?: 'retrieval' | 'write'
+    limit: number
+    before?: AgentSessionAuditEventCursor
+  }): Promise<{ items: AgentSessionAuditEvent[]; total: number; hasMore: boolean }>
 }
 
 // ── OAuth facet records ────────────────────────────────────────────────
@@ -878,6 +968,7 @@ export type MetaDb = {
   agentDeltaCursors: AgentDeltaCursorsPersistence
   /** Owner-scoped/cross-space; retained independently of any one project or space. */
   sessions: AgentSessionsPersistence
+  sessionAudit: AgentSessionAuditPersistence
   projects: ProjectsPersistence
   /** `type='folder'` rows of the same table as `projects`, not a separate tenant. */
   folders: FolderIdentityPersistence

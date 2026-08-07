@@ -22,6 +22,12 @@ import {
   MeAgentRolesResponseSchema,
 } from './schemas/rest/agent/roles'
 import {
+  AgentSessionEventsQuerySchema,
+  AgentSessionEventsResponseSchema,
+  AgentSessionsQuerySchema,
+  AgentSessionsResponseSchema,
+} from './schemas/rest/agent/sessions'
+import {
   AcceptInviteRequestSchema,
   AuthSessionResponseSchema,
   InviteInfoRequestSchema,
@@ -208,6 +214,11 @@ export const contract = {
   meAgentContext: { response: MeAgentContextResponseSchema },
   projectAgentContext: { response: ProjectAgentContextResponseSchema },
   agentAudit: { request: AgentAuditQuerySchema, response: AgentAuditResponseSchema },
+  agentSessions: { request: AgentSessionsQuerySchema, response: AgentSessionsResponseSchema },
+  agentSessionEvents: {
+    request: AgentSessionEventsQuerySchema,
+    response: AgentSessionEventsResponseSchema,
+  },
   agentRoles: { response: MeAgentRolesResponseSchema },
   agentRoleDetail: {
     request: AgentRoleDetailRequestSchema,

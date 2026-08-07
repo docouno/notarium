@@ -6,7 +6,7 @@
 // (Revision, RevisionKind, Activity*, AuthorFilter) is the port's — imported up.
 // canon: docs/note-history.md#model · docs/architecture.md#p2
 
-import type { RevisionKind, RevisionPersistence } from '../knowledgeStore'
+import type { AgentWriteAttribution, RevisionKind, RevisionPersistence } from '../knowledgeStore'
 
 export type JournalRecordInput = {
   noteId: string
@@ -14,6 +14,8 @@ export type JournalRecordInput = {
   /** Server-built attribution id: 'user:<name>' | 'pat:<name>:<id>' (gateway)
    *  | 'ui' (AUTH_MODE=none) | null (external states have nobody to name). */
   principal: string | null
+  /** Agent owner + optional session snapshot. External/human states omit it. */
+  agent?: AgentWriteAttribution
   /** The body at this state, normalized the way read() serves it (the same
    *  view the version token hashes — restore round-trips through the CAS
    *  path). null = honestly unknown (an external gap). */

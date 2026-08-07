@@ -21,6 +21,11 @@ export class InMemoryRetrievalLog implements RetrievalLogPersistence {
     this.seq = 0
   }
 
+  /** Test read-model seam: immutable retrieval snapshot for the session-audit twin. */
+  snapshot(): RetrievalLogRecord[] {
+    return this.rows.map((row) => ({ ...row, hits: [...row.hits] }))
+  }
+
   async append(input: RetrievalLogInput): Promise<RetrievalLogRecord> {
     const row: RetrievalLogRecord = { ...input, hits: [...input.hits], id: String(++this.seq) }
     this.rows.push(row)

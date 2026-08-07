@@ -29,7 +29,7 @@ export const SettingsLayout = ({
   trail: Crumb[]
   spaceLess?: boolean
   /** Tab groups (the left scope rail), rendered with a divider between them. Omit for a
-   *  surface with no secondary axis (Agents → Audit): the panel then spans full width. */
+   *  surface with no secondary axis (Agents → Sessions): the panel then spans full width. */
   groups?: SettingsTab[][]
   /** Map a tab id to its route (so the same layout serves both settings homes). */
   routeFor?: (tabId: string) => string
@@ -37,7 +37,7 @@ export const SettingsLayout = ({
   activeId?: string
   onSelect?: (tabId: string) => void
   /** A section pill-bar (#243) rendered above the body — the surface's own top-level
-   *  sub-nav (the Agents Context | Audit sections). Orthogonal to the left scope rail. */
+   *  sub-nav (the Agents Context | Sessions sections). Orthogonal to the left scope rail. */
   sectionTabs?: ReactNode
   children?: ReactNode
   testIdPrefix?: string

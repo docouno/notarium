@@ -14,6 +14,7 @@ import {
 } from '../graph'
 import { IdentityRegistry } from '../identity'
 import type {
+  AgentWriteAttribution,
   ExportEntry,
   Graph,
   GraphHealth,
@@ -2620,7 +2621,13 @@ export class CachedStore implements KnowledgeStore {
     )
   }
 
-  remove(id: string, opts?: { principal?: string }): Promise<void> {
+  remove(
+    id: string,
+    opts?: {
+      principal?: string
+      agent?: AgentWriteAttribution
+    },
+  ): Promise<void> {
     return this.runMutation(() => this.writes.remove(this.canonicalMutationId(id), opts))
   }
 

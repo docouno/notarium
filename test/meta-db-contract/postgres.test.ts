@@ -13,6 +13,7 @@ import { describeAgentSessionsContract } from './agentSessionsContract'
 import { describeGatewayStateContract } from './gatewayStateContract'
 import { createPostgresTestSchema, describePostgres } from './postgresHarness'
 import { describeRevisionPersistenceContract } from './revisionPersistenceContract'
+import { describeSessionAuditContract } from './sessionAuditContract'
 
 const advisoryWaiterCount = async (
   testSchema: Awaited<ReturnType<typeof createPostgresTestSchema>>,
@@ -201,6 +202,17 @@ describePostgres('live Postgres driver', () => {
   describeRevisionPersistenceContract('Postgres', async () => {
     const testSchema = await createPostgresTestSchema('revision_contract')
     return { persistence: testSchema.db.revisions, teardown: testSchema.teardown }
+  })
+
+  describeSessionAuditContract('Postgres', async () => {
+    const testSchema = await createPostgresTestSchema('session_audit_contract')
+    return {
+      audit: testSchema.db.sessionAudit,
+      retrievals: testSchema.db.retrievalLog,
+      revisions: testSchema.db.revisions,
+      sessions: testSchema.db.sessions,
+      teardown: testSchema.teardown,
+    }
   })
 
   it('rejects a cursor insert queued behind project deletion', async () => {

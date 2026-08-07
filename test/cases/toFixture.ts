@@ -1,6 +1,6 @@
 import { diffStats, stripFrontmatter, stripTitleHeading } from '@notarium/core'
 import { deterministicNoteId, type NoteSnapshot } from '@notarium/engine-memory'
-import type { AgentSessionRecord } from '@notarium/server'
+import { AGENT_SYSTEM_OWNER, type AgentSessionRecord } from '@notarium/server'
 import type {
   ActivityFixture,
   AuthFixture,
@@ -248,18 +248,25 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
     : undefined
 
   const now = Date.parse(world.now)
-  const defaultOwner = world.auth?.users[0]?.username ?? 'system'
-  const agentSessions: AgentSessionRecord[] | undefined = world.agentSessions?.map((session) => ({
-    id: agentSessionId(session.ref),
-    owner: session.owner ?? defaultOwner,
-    name: session.name,
-    named: session.named ?? true,
-    parentId: session.parentRef ? agentSessionId(session.parentRef) : null,
-    createdAt: new Date(now - session.createdDaysAgo * 86_400_000).toISOString(),
-    lastSeenAt: new Date(now - session.lastSeenDaysAgo * 86_400_000).toISOString(),
-    calls: session.calls,
-    role: session.role ?? null,
-  }))
+  const defaultOwner = world.auth?.users[0]?.username ?? AGENT_SYSTEM_OWNER
+  const agentSessions: AgentSessionRecord[] | undefined = world.agentSessions
+    ?.filter((session) => session.retained !== false)
+    .map((session) => ({
+      id: agentSessionId(session.ref),
+      owner: session.owner ?? defaultOwner,
+      name: session.name,
+      named: session.named ?? true,
+      parentId:
+        session.parentRef &&
+        world.agentSessions?.find((candidate) => candidate.ref === session.parentRef)?.retained !==
+          false
+          ? agentSessionId(session.parentRef)
+          : null,
+      createdAt: new Date(now - session.createdDaysAgo * 86_400_000).toISOString(),
+      lastSeenAt: new Date(now - session.lastSeenDaysAgo * 86_400_000).toISOString(),
+      calls: session.calls,
+      role: session.role ?? null,
+    }))
 
   return { now: world.now, spaces, projects, auth, agentSessions, agentRoles: world.agentRoles }
 }
