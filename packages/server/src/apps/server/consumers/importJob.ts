@@ -20,6 +20,9 @@ export type ImportParams = {
   root?: string
   skipExisting?: boolean
   memoryMode?: 'folder' | 'space' | 'skip'
+  /** The dropped file's own mtime (ISO), validated at the route — the creation
+   *  date a `markdown` note falls back to. canon: docs/import.md#dates-as-data */
+  sourceModifiedAt?: string
 }
 
 export type ImportHandlerDeps = {
@@ -54,6 +57,7 @@ export const createImportHandler =
         root: params.root,
         skipExisting: params.skipExisting,
         memoryMode: params.memoryMode,
+        sourceModifiedAt: params.sourceModifiedAt,
         signal,
         // total stays null — a ZIP's note count is unknown upfront (indeterminate bar).
         // report() heartbeats and throws JobAbortedError on cancel/reap, so a cancel

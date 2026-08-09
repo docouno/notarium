@@ -57,8 +57,10 @@ import {
   FOLDER_PAGE_BASENAME,
   type FolderAlias,
   freshNoteId,
+  FrontmatterLimitError,
   IF_EXISTS,
   isCanonicalSafeRelativeAddress,
+  isDurableFrontmatter,
   isDurableScalar,
   isDurableText,
   isFolderPageNote,
@@ -1607,7 +1609,16 @@ export class NotariumStore implements KnowledgeStore {
       if (raw == null) {
         continue // vanished mid-heal — the next scan reconverges
       }
-      const parsed = parseNoteFile(raw, entry.path)
+      let parsed: ReturnType<typeof parseNoteFile>
+
+      try {
+        parsed = parseNoteFile(raw, entry.path)
+      } catch (err) {
+        if (err instanceof FrontmatterLimitError) {
+          continue
+        }
+        throw err
+      }
 
       // Production writes that suffered the old empty-name bug already carried the
       // stable id claim minted by the read-model. An arbitrary user-owned `.md`
@@ -1754,7 +1765,17 @@ export class NotariumStore implements KnowledgeStore {
         if (raw == null) {
           continue
         } // vanished between scan and read — next poll converges
-        await this.reconcileScannedFile(row, fullPath, mount.class, entry, raw)
+        try {
+          await this.reconcileScannedFile(row, fullPath, mount.class, entry, raw)
+        } catch (err) {
+          // An oversized metadata block belongs to this one file. Keep scanning
+          // healthy siblings and retry the bad path on a later rescan; unrelated
+          // parser, SQL and filesystem failures must still abort the pass.
+          if (err instanceof FrontmatterLimitError) {
+            continue
+          }
+          throw err
+        }
       }
       for (const row of rows) {
         if (!seen.has(row.path)) {
@@ -2846,6 +2867,7 @@ export class NotariumStore implements KnowledgeStore {
     fileName,
     legacyImportRoot,
     createdAt,
+    frontmatter,
   }: WriteInput): Promise<WriteResult> {
     await this.ensureReady()
     const scalarInputs = [title, directory, noteType, slug, summary, fileName, createdAt]
@@ -2855,6 +2877,7 @@ export class NotariumStore implements KnowledgeStore {
       scalarInputs.some((value) => value != null && !isDurableScalar(value)) ||
       tagInputs.some((value) => !isDurableScalar(value)) ||
       !isDurableText(content) ||
+      !isDurableFrontmatter(frontmatter) ||
       (id != null && !isValidNoteId(id)) ||
       (originalId != null &&
         !isValidNoteId(originalId) &&
@@ -3032,6 +3055,7 @@ export class NotariumStore implements KnowledgeStore {
       muted,
       id: noteId,
       createdAt,
+      frontmatter,
       body: content,
       existingRaw,
     })

@@ -296,6 +296,14 @@ export type CaseEvent = (
       /** Pin the note: adds the #165 `always-load` tag (the pult's local context pin) AND a
        *  #42 favorite. The tag is what the agent-context pult renders as a Pinned row. */
       pin?: boolean
+      /** Frontmatter the note ARRIVED with, as bare YAML lines without the `---`
+       *  fences (#280) — an imported file's own keys, which Notarium keeps because
+       *  they are the author's data. The two appliers reach it by their own routes:
+       *  the REAL one through the production `WriteInput.frontmatter` channel, the
+       *  FAKE one through `NoteSnapshot.frontmatter` → `InMemoryStore.load` (a
+       *  fixture is a snapshot, not a replayed write). Both must land the SAME note.
+       *  canon: docs/seeds.md */
+      frontmatter?: string
       /** Journal attribution (#12): `user:<name>` | `pat:<name>:<id>` | `ui`. */
       principal?: string
     }

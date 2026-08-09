@@ -10,6 +10,7 @@ import { describe, expect, it, vi } from 'vitest'
 import type { StoreEvent } from '@notarium/contract'
 import {
   CachedStore,
+  FRONTMATTER_BYTE_CAP,
   frontmatterValue,
   type IdentityPersistence,
   type IdentityRecord,
@@ -167,6 +168,29 @@ describe('CachedStore + bare engine — identity (#51)', () => {
     expect(a?.id).toBe('durable-id-a1') // the file's claim IS the id
     expect(b?.id).toMatch(NOTE_ID_RE) // minted by the registry
     expect(b?.id).not.toBe(a?.id)
+  })
+
+  it('isolates an oversized raw identity claim without blocking boot or unrelated writes', async () => {
+    const oversizedClaim = 'AAAAAAAAAAAA'
+    const { store } = await make(
+      new Map([
+        [
+          'demo/oversized.md',
+          `---\n${NOTE_ID_FRONTMATTER_KEY}: ${oversizedClaim}\nopaque: ${'x'.repeat(FRONTMATTER_BYTE_CAP)}\n---\nbody`,
+        ],
+        ['demo/healthy.md', '# healthy\n\nbody'],
+      ]),
+    )
+
+    expect((await store.syncStatus()).scan.phase).toBe('ready')
+    expect((await store.list()).find((note) => note.filePath === 'demo/oversized.md')?.id).not.toBe(
+      oversizedClaim,
+    )
+
+    const created = await store.write({ title: 'Independent', content: 'body' })
+
+    expect(created.id).toMatch(NOTE_ID_RE)
+    expect((await store.list()).some((note) => note.filePath === 'independent.md')).toBe(true)
   })
 
   it('write settles the id first and hands it to the engine for materialization', async () => {

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
+import { FRONTMATTER_BYTE_CAP } from '../libs/markdown'
 import { detectFormat } from './detect'
 import { parseClaudeDesignChat } from './formats/claudeDesignChat'
 import { ImportError, parseImport } from './importer'
@@ -985,5 +986,11 @@ describe('robustness fixes', () => {
 describe('errors', () => {
   it('throws ImportError on unrecognised input', () => {
     expect(() => parseImport('garbage')).toThrow(ImportError)
+  })
+
+  it('keeps a forced markdown frontmatter limit failure terminal', () => {
+    const raw = `---\nx: ${'a'.repeat(FRONTMATTER_BYTE_CAP)}\n---\nbody`
+
+    expect(() => parseImport(raw, 'markdown', 'oversized.md')).toThrow(ImportError)
   })
 })

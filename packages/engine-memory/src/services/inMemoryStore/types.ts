@@ -35,6 +35,12 @@ export type NoteSnapshot = {
    *  profile/audit split (muted categories stay in the audit but drop from the
    *  eager profile). Served back in read().frontmatter.muted. */
   muted?: boolean
+  /** Frontmatter the note ARRIVED with that this store models no field for
+   *  (#280) — an imported file's own keys, as raw YAML lines WITHOUT the `---`
+   *  fences (`author: Sergey\nmeta:\n  source: obsidian`). Seed it to exercise
+   *  what an imported note keeps; served back through read().frontmatter and the
+   *  export reconstruction. */
+  frontmatter?: string
 }
 
 export type StoreSnapshot = {

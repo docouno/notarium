@@ -3,6 +3,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 
+import { FRONTMATTER_BYTE_CAP } from '@notarium/core'
+
 import type { FileStore } from '../../libs/files'
 import { createLocalFsFiles } from '../../libs/files'
 import { createNodeSqliteDriver } from '../../libs/sql'
@@ -188,6 +190,31 @@ describe('boot heal for unnamed note files (#296)', () => {
       expect(await namesIn(root, 'journal')).toEqual(['.md'])
       expect(await namesIn(root, '')).toContain('.md')
       expect(await fs.readFile(join(root, 'journal', '.md'), 'utf8')).toContain('plain body')
+    } finally {
+      await store.stop()
+    }
+  })
+
+  it('skips an oversized unnamed file and still reconciles its healthy sibling', async () => {
+    const root = await mkroot()
+    const oversized = [
+      '---',
+      `pad: ${'a'.repeat(FRONTMATTER_BYTE_CAP)}`,
+      'notarium-id: OVERSIZED001',
+      'title: Must not heal',
+      '---',
+      '',
+      '# Must not heal',
+    ].join('\n')
+
+    await fs.writeFile(join(root, '.md'), oversized)
+    await fs.writeFile(join(root, 'healthy.md'), '# Healthy\n\nbody')
+    const store = createHealingTestStore(root)
+
+    try {
+      expect((await store.list()).map((note) => note.filePath)).toEqual(['healthy.md'])
+      expect(await fs.readFile(join(root, '.md'), 'utf8')).toBe(oversized)
+      expect((await store.read('healthy.md')).content).toBe('body')
     } finally {
       await store.stop()
     }

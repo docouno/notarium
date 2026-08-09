@@ -1,3 +1,97 @@
+export type AtxH1Line = {
+  /** Heading text after removing an optional CommonMark closing `#` sequence. */
+  title: string
+  /** Heading text before removing the closing sequence; used to recognise our own `# ${title}`. */
+  rawTitle: string
+}
+
+const isHorizontalSpace = (char: string): boolean => char === ' ' || char === '\t'
+
+export type PhysicalLineSpan = {
+  /** Inclusive start of the physical line's content. */
+  start: number
+  /** Exclusive end of its content, before the line terminator. */
+  end: number
+  /** Start of the following line, after CRLF/lone CR/LF/U+2028/U+2029. */
+  next: number
+}
+
+/** Find one physical text line without allocating a split array or normalising
+ *  its terminator. Markdown arrives from archives authored on more than the LF
+ *  happy path: CR-only files and JavaScript's other two line separators must not
+ *  fuse a heading with its body. Exported for the engine's legacy anywhere-H1
+ *  scan so both title readers share the exact same boundary rule. */
+export const nextPhysicalLineSpan = (text: string, start = 0): PhysicalLineSpan | null => {
+  if (start < 0 || start >= text.length) {
+    return null
+  }
+  let end = start
+
+  while (
+    end < text.length &&
+    text[end] !== '\n' &&
+    text[end] !== '\r' &&
+    text[end] !== '\u2028' &&
+    text[end] !== '\u2029'
+  ) {
+    end++
+  }
+  let next = end
+
+  if (end < text.length) {
+    next = end + (text[end] === '\r' && text[end + 1] === '\n' ? 2 : 1)
+  }
+
+  return { start, end, next }
+}
+
+/** Parse one physical Markdown line as an ATX H1 in a single pass.
+ *
+ *  CommonMark permits 0–3 leading spaces, but a tab or four spaces starts an
+ *  indented-code shape for our purposes. Only H1 is accepted. A closing `#` run
+ *  is decoration iff it is separated from the content by horizontal whitespace;
+ *  `# C#` therefore remains titled "C#". */
+export const parseAtxH1Line = (line: string): AtxH1Line | null => {
+  let end = line.endsWith('\r') ? line.length - 1 : line.length
+  let i = 0
+
+  while (i < end && line[i] === ' ' && i < 4) {
+    i++
+  }
+  if (i > 3 || line[i] !== '#') {
+    return null
+  }
+  i++
+  if (i < end && !isHorizontalSpace(line[i])) {
+    return null // `#title` and `## title` are not H1 title lines
+  }
+  while (i < end && isHorizontalSpace(line[i])) {
+    i++
+  }
+  const contentStart = i
+
+  while (end > contentStart && isHorizontalSpace(line[end - 1])) {
+    end--
+  }
+  const rawTitle = line.slice(contentStart, end)
+  let closingStart = end
+
+  while (closingStart > contentStart && line[closingStart - 1] === '#') {
+    closingStart--
+  }
+  if (
+    closingStart < end &&
+    (closingStart === contentStart || isHorizontalSpace(line[closingStart - 1]))
+  ) {
+    end = closingStart
+    while (end > contentStart && isHorizontalSpace(line[end - 1])) {
+      end--
+    }
+  }
+
+  return { title: line.slice(contentStart, end), rawTitle }
+}
+
 /** Normalise a stored body for the UI: drop leading blank lines and a leading `# <title>` H1 —
  *  but ONLY when it merely repeats the note title (the title reaches the UI as a separate field).
  *  A first heading that does NOT match the title is kept; dropping the blanks avoids compounding
@@ -6,22 +100,33 @@ export const stripTitleHeading = (content: string, title?: string): string => {
   if (!content) {
     return content || ''
   }
-  const lines = content.split('\n')
-  let i = 0
+  let start = 0
+  let line = nextPhysicalLineSpan(content, start)
 
-  while (i < lines.length && lines[i].trim() === '') {
-    i++
+  while (line && content.slice(line.start, line.end).trim() === '') {
+    start = line.next
+    line = nextPhysicalLineSpan(content, start)
   } // leading blank lines
-  const m = lines[i] && lines[i].match(/^#\s+(.+?)\s*$/)
+  const heading = line
+    ? parseAtxH1Line(content.slice(line.start, line.end).replace(/^\uFEFF/, ''))
+    : null
+  const expectedTitle = title == null ? '' : String(title).trim()
+  const carriesTitle = heading
+    ? expectedTitle
+      ? heading.title === expectedTitle || heading.rawTitle === expectedTitle
+      : Boolean(heading.title || heading.rawTitle)
+    : false
 
-  if (m && (!title || m[1].trim() === String(title).trim())) {
-    i++
-    if (i < lines.length && lines[i].trim() === '') {
-      i++
+  if (carriesTitle) {
+    start = line!.next
+    const blank = nextPhysicalLineSpan(content, start)
+
+    if (blank && content.slice(blank.start, blank.end).trim() === '') {
+      start = blank.next
     } // one blank line after the heading
   }
 
-  return lines.slice(i).join('\n')
+  return content.slice(start)
 }
 
 /** A block that opens the body and CANNOT be a title line — peeling it would corrupt the block
@@ -30,40 +135,46 @@ export const stripTitleHeading = (content: string, title?: string): string => {
 const STRUCTURAL_BLOCK_START =
   /^\s*(?:```|~~~|#|>|\||[-*+]\s|\d+[.)]\s|<|(?:-{3,}|\*{3,}|_{3,}|={3,})\s*$)/
 
-/** Derive a note's title from its body (a projection, not an independent field) and split the
- *  title line off the stored body — the write chokepoint runs this. canon: docs/core.md#write-through
- *  Precedence (FIRST non-blank line): (1) an EXPLICIT title always wins; (2) else a leading `# H1`;
- *  (3) else that first line IF plain prose (Bear-style) — "plain" excludes anything peeling would
- *  corrupt (code fence, list, blockquote, table, heading ≥H2, thematic break, HTML, indented code,
- *  reference def); a setext heading (prose + `===`/`---` underline) counts and is peeled with its
- *  underline. The leading line is REMOVED only when it genuinely CARRIES the title: an `# H1` equal
- *  to the title, or a plain line promoted with no explicit title — never a differing heading, nor a
- *  plain line that merely coincides with an explicit title. Leading inline frontmatter is preserved. */
-export const promoteBodyTitle = (
-  content: string,
-  explicit?: string,
-): { title: string; body: string } => {
-  const src = content ?? ''
+/** The shared read of a body's opening: where the prose starts, and which of the three
+ *  title-carrying shapes (ATX `# H1` / setext / plain first line) it is. ONE scan, two
+ *  consumers — `promoteBodyTitle` (the write chokepoint) and `headingTitle` (the importer) —
+ *  so "what counts as a title line" is decided in exactly one place. */
+const scanOpening = (
+  src: string,
+): {
+  /** A leading inline-frontmatter block, carried through untouched. */
+  fm: string
+  /** Body after the leading inline-frontmatter block. */
+  rest: string
+  /** First non-blank physical line and the line below it. */
+  opening: PhysicalLineSpan | null
+  following: PhysicalLineSpan | null
+  first: string
+  h1: AtxH1Line | null
+  setext: boolean
+  plain: boolean
+} => {
   // Carry a leading inline-frontmatter block through untouched — the title lives
   // in the markdown body below it, and serializeNoteFile folds this block into the
   // file's own frontmatter.
   const fm = /^\uFEFF?\s*---\r?\n[\s\S]*?\r?\n---\r?\n?/.exec(src)?.[0] ?? ''
   const rest = src.slice(fm.length)
-  const lines = rest.split('\n')
-  let i = 0
+  let start = 0
+  let opening = nextPhysicalLineSpan(rest, start)
 
-  while (i < lines.length && lines[i].trim() === '') {
-    i++
+  while (opening && rest.slice(opening.start, opening.end).trim() === '') {
+    start = opening.next
+    opening = nextPhysicalLineSpan(rest, start)
   } // skip leading blanks
   // De-BOM the first line for detection (a BOM survives when there's no frontmatter
   // for the fm regex to eat it); the strip below drops the whole raw line anyway.
-  const first = (lines[i] ?? '').replace(/^\uFEFF/, '')
-  const next = lines[i + 1] ?? '' // the line under the first — decides setext / table
-  const ex = explicit?.trim()
-  // An ATX H1 at column 0 — the form the engine serializes (`# title`) and the reader
-  // strips. Drop an optional closing `#` sequence (CommonMark: `# Title #` ⇒ "Title")
-  // so the derived title is clean and the dedup still matches. h2–h6 are structural.
-  const h1 = /^#\s+(.+?)(?:\s+#+)?\s*$/.exec(first)
+  const first = (opening ? rest.slice(opening.start, opening.end) : '').replace(/^\uFEFF/, '')
+  const following = opening ? nextPhysicalLineSpan(rest, opening.next) : null
+  const next = following ? rest.slice(following.start, following.end) : ''
+  // CommonMark ATX H1: 0–3 leading spaces are allowed. The shared physical-line
+  // parser keeps this scan, stripTitleHeading and the engine's legacy anywhere-H1
+  // fallback on the same linear rule.
+  const h1 = parseAtxH1Line(first)
   // Is the first line plain PROSE (a paragraph)? — the only kind whose peel corrupts
   // no block: not a STRUCTURAL_BLOCK_START, not indented code (≥4 spaces / tab, which
   // the regex's `^\s*` would otherwise mask), not a link/footnote reference def. Both
@@ -81,14 +192,55 @@ export const promoteBodyTitle = (
   // A table header whose delimiter row sits on the next line is structure, not a title.
   const tableDelimiterNext = /\|/.test(next) && /^[\s|:-]*-[\s|:-]*$/.test(next)
   const plain = !h1 && !setext && firstIsProse && !tableDelimiterNext
+  return { fm, rest, opening, following, first, h1, setext, plain }
+}
+
+/** The title the body's leading HEADING declares — an ATX `# H1` or a setext underline — or
+ *  '' when the body opens with anything else. The heading-only subset of promoteBodyTitle's
+ *  precedence, for the caller whose next fallback is BETTER than Bear-style prose promotion:
+ *  the importer, where a file opening with prose is titled by its FILE NAME (an Obsidian
+ *  note's name IS its title). canon: docs/import.md#drag-and-drop-of-text-files-223 */
+export const headingTitle = (content: string): string => {
+  const { first, h1, setext } = scanOpening(content ?? '')
+
+  if (h1) {
+    return h1.title
+  }
+
+  return setext ? first.trim() : ''
+}
+
+/** Derive a note's title from its body (a projection, not an independent field) and split the
+ *  title line off the stored body — the write chokepoint runs this. canon: docs/core.md#write-through
+ *  Precedence (FIRST non-blank line): (1) an EXPLICIT title always wins; (2) else a leading `# H1`;
+ *  (3) else that first line IF plain prose (Bear-style) — "plain" excludes anything peeling would
+ *  corrupt (code fence, list, blockquote, table, heading ≥H2, thematic break, HTML, indented code,
+ *  reference def); a setext heading (prose + `===`/`---` underline) counts and is peeled with its
+ *  underline. The leading line is REMOVED only when it genuinely CARRIES the title: an `# H1` equal
+ *  to the title, or a plain line promoted with no explicit title — never a differing heading, nor a
+ *  plain line that merely coincides with an explicit title. Leading inline frontmatter is preserved. */
+export const promoteBodyTitle = (
+  content: string,
+  explicit?: string,
+): { title: string; body: string } => {
+  const src = content ?? ''
+  const { fm, rest, opening, following, first, h1, setext, plain } = scanOpening(src)
+  const ex = explicit?.trim()
   let title = ex || ''
   let strip = 0 // leading lines to peel: 1 (h1 / plain), 2 (setext line + underline)
 
-  if (h1) {
-    title = ex || h1[1].trim()
-    if (h1[1].trim() === title) {
+  if (h1 && (ex || h1.title)) {
+    title = ex || h1.title
+    // Dedup: peel the H1 iff it carries the title. Two ways it can, and both are
+    // needed. The parsed text is the usual one. The RAW line matters because the
+    // capture drops a CommonMark closing `#` run while the title keeps it: for a
+    // title like `Sprint review #` the storage heading `# Sprint review #` is
+    // exactly what our own serializer emits, yet the parsed forms differ — so the
+    // heading survived, the write path added its own, and every export→import
+    // cycle stacked one more copy.
+    if (h1.title === title || h1.rawTitle === title) {
       strip = 1
-    } // dedup: peel the H1 iff it equals the title
+    }
   } else if (setext) {
     title = ex || first.trim()
     if (first.trim() === title) {
@@ -103,12 +255,14 @@ export const promoteBodyTitle = (
     }
   }
   if (strip) {
-    i += strip
-    if (i < lines.length && lines[i].trim() === '') {
-      i++
+    let bodyStart = strip === 2 ? following!.next : opening!.next
+    const blank = nextPhysicalLineSpan(rest, bodyStart)
+
+    if (blank && rest.slice(blank.start, blank.end).trim() === '') {
+      bodyStart = blank.next
     } // one blank line after it
 
-    return { title, body: fm + lines.slice(i).join('\n') }
+    return { title, body: fm + rest.slice(bodyStart) }
   }
 
   return { title, body: src }

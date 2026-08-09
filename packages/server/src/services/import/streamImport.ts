@@ -67,6 +67,12 @@ export type StreamImportArgs = {
   /** Cooperative cancel; checked before each ZIP member so a canceled import stops
    *  promptly. canon: docs/import.md#durable-import-via-the-jobs-layer-191 */
   signal?: AbortSignal
+  /** The dropped file's own timestamp (its mtime, threaded from the browser's
+   *  `File.lastModified`) — the creation date a `markdown` note falls back to when
+   *  its frontmatter names none. Ignored by every other format: an AI export dates
+   *  each note from the conversation itself, and an archive's mtime says nothing
+   *  about the notes inside it. canon: docs/import.md#dates-as-data */
+  sourceModifiedAt?: string
 }
 
 let tmpSeq = 0
@@ -295,6 +301,7 @@ const processTextFile = async (
   path: string,
   file: string,
   onNote: StreamImportArgs['onNote'],
+  sourceModifiedAt?: string,
 ): Promise<ImportFileMeta> => {
   const { size } = await fs.stat(path)
 
@@ -307,7 +314,10 @@ const processTextFile = async (
     )
   }
   const raw = await fs.readFile(path, 'utf8')
-  await onNote(markdownFileToNote(raw, file), { file, format: IMPORT_FORMAT.markdown })
+  await onNote(markdownFileToNote(raw, file, sourceModifiedAt), {
+    file,
+    format: IMPORT_FORMAT.markdown,
+  })
   return { file, format: IMPORT_FORMAT.markdown, warnings: [] }
 }
 
@@ -334,9 +344,10 @@ const processMember = async (
   file: string,
   forced: ImportFormat | undefined,
   onNote: StreamImportArgs['onNote'],
+  sourceModifiedAt?: string,
 ): Promise<ImportFileMeta | null> => {
   if (forced === IMPORT_FORMAT.markdown) {
-    return processTextFile(path, file, onNote)
+    return processTextFile(path, file, onNote, sourceModifiedAt)
   }
   const full = await peekStart(path)
   const first = full.trimStart()[0]
@@ -474,6 +485,7 @@ export const streamImportFile = async ({
   format,
   onNote,
   signal,
+  sourceModifiedAt,
 }: StreamImportArgs): Promise<ImportFileMeta[]> => {
   const files: ImportFileMeta[] = []
 
@@ -496,7 +508,16 @@ export const streamImportFile = async ({
       }
     })
   } else {
-    const meta = await processMember(uploadPath, filename || 'upload', format, onNote)
+    // The upload IS the dropped file here, so its mtime describes this note. Inside
+    // a ZIP it would not (the archive's own timestamp), which is why the branch
+    // above never threads it.
+    const meta = await processMember(
+      uploadPath,
+      filename || 'upload',
+      format,
+      onNote,
+      sourceModifiedAt,
+    )
 
     if (meta) {
       files.push(meta)

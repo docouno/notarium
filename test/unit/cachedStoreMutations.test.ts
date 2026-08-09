@@ -347,6 +347,34 @@ describe('CachedStore mutation capability honesty', () => {
   })
 })
 
+describe('CachedStore write ingress', () => {
+  it('rejects invalid carried frontmatter before it reaches the inner engine', async () => {
+    const h = await createMemoryHarness()
+
+    try {
+      const innerWrite = vi.spyOn(h.inner, 'write')
+
+      await expect(
+        h.store.write({
+          title: 'Poisoned import',
+          content: 'body',
+          frontmatter: [{ key: 'author', lines: ['author: safe\0poison'] }],
+        }),
+      ).rejects.toThrow('frontmatter contains invalid raw lines')
+      await expect(
+        h.store.write({
+          title: 'Document marker import',
+          content: 'body',
+          frontmatter: [{ key: null, lines: ['...'] }],
+        }),
+      ).rejects.toThrow('frontmatter contains invalid raw lines')
+      expect(innerWrite).not.toHaveBeenCalled()
+    } finally {
+      await h.close()
+    }
+  })
+})
+
 describe('CachedStore lifecycle quiescence', () => {
   it('checkpoint joins an active poll and drains the external journal tail it creates', async () => {
     const inner = new InMemoryStore({ space: 'main', notes: [] })

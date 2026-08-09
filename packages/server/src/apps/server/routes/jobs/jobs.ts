@@ -22,6 +22,24 @@ const IMPORT_FORMATS = new Set<string>([
 const asImportFormat = (v: unknown): ImportFormat | undefined =>
   typeof v === 'string' && IMPORT_FORMATS.has(v) ? (v as ImportFormat) : undefined
 
+/** The dropped file's mtime, as the browser reports it (`File.lastModified`, epoch
+ *  ms) → ISO. Untrusted, so it is fenced on both sides: 0 (the browser's "unknown")
+ *  and anything in the FUTURE are dropped — a note created tomorrow is not a
+ *  chronology, it is a broken clock, and it would sit at the top of the Feed
+ *  forever. A small skew is allowed for a client clock running slightly ahead.
+ *  canon: docs/import.md#dates-as-data */
+const CLOCK_SKEW_MS = 5 * 60 * 1000
+
+const sourceModifiedIso = (raw: string | undefined): string | undefined => {
+  const ms = Number(raw)
+
+  if (!raw || !Number.isFinite(ms) || ms <= 0 || ms > Date.now() + CLOCK_SKEW_MS) {
+    return undefined
+  }
+
+  return new Date(ms).toISOString()
+}
+
 export const jobsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
   const { jobs, artifacts, staging, wakeJobs, spaceStoreFor, principalId } = ctx
 
@@ -172,6 +190,7 @@ export const jobsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
       const skipExisting = fieldStr('skipExisting') === 'true'
       const memoryRaw = fieldStr('memory')
       const memoryMode = memoryRaw === 'space' || memoryRaw === 'skip' ? memoryRaw : 'folder'
+      const sourceModifiedAt = sourceModifiedIso(fieldStr('lastModified'))
 
       if (jobs && staging) {
         const jobId = freshNoteId()
@@ -198,7 +217,15 @@ export const jobsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
             space: req.spaceId,
             kind: JOB_KIND_IMPORT,
             principal: principalId(req),
-            params: { uploadRef, filename: file.filename, format, root, skipExisting, memoryMode },
+            params: {
+              uploadRef,
+              filename: file.filename,
+              format,
+              root,
+              skipExisting,
+              memoryMode,
+              sourceModifiedAt,
+            },
             // ZIP note count is unknown upfront (a stream) → indeterminate bar; handler reports live count.
             progressTotal: null,
             createdAt: new Date().toISOString(),
@@ -251,6 +278,7 @@ export const jobsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
           root,
           skipExisting,
           memoryMode,
+          sourceModifiedAt,
           onProgress: (imported) => {
             writeLine({ type: 'progress', imported })
           },

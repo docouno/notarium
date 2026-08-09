@@ -57,6 +57,9 @@ const toWriteInput = (
   directory,
   noteType: n.noteType,
   tags: n.tags,
+  // The source file's own frontmatter, carried verbatim (#280) — merged under our
+  // typed fields by the write path. canon: docs/import.md#drag-and-drop-of-text-files-223
+  frontmatter: n.frontmatter,
   fileName: n.fileName,
   legacyImportRoot: root,
   // Only `created:` is threaded; `modified` is left to file mtime so it never goes
@@ -87,6 +90,11 @@ export type RunImportArgs = {
   root?: string
   skipExisting?: boolean
   memoryMode?: MemoryMode
+  /** The dropped file's own mtime (from the browser's `File.lastModified`) — the
+   *  creation date a `markdown` note falls back to when its frontmatter names none,
+   *  so a dragged-in archive keeps its chronology instead of piling onto today.
+   *  canon: docs/import.md#dates-as-data */
+  sourceModifiedAt?: string
   /** Running imported count, fired every `progressEvery` notes — keeps a long
    *  import alive against the endpoint idle-timeout. */
   onProgress?: (imported: number) => void | Promise<void>
@@ -114,6 +122,7 @@ export const runImport = async ({
   root = '',
   skipExisting = false,
   memoryMode = 'folder',
+  sourceModifiedAt,
   onProgress,
   settle,
   progressEvery = 200,
@@ -165,6 +174,7 @@ export const runImport = async ({
       filename,
       format,
       signal,
+      sourceModifiedAt,
       onNote: async (note, ctx) => {
         // Cancel check BEFORE the write's try/catch, so an abort propagates (stops the
         // stream) instead of being counted as a per-note failure.

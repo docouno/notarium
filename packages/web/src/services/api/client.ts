@@ -223,6 +223,11 @@ export const importStart = async (
     root?: string
     skipExisting?: boolean
     memory?: 'folder' | 'space' | 'skip'
+    /** Send the dropped file's own mtime (`File.lastModified`) so a `markdown`
+     *  import can date the note by the FILE when its frontmatter names no date —
+     *  otherwise a dragged-in archive piles onto today.
+     *  canon: docs/import.md#dates-as-data */
+    sendLastModified?: boolean
   } = {},
   signal?: AbortSignal,
 ): Promise<
@@ -242,6 +247,9 @@ export const importStart = async (
   }
   if (opts.memory) {
     form.append('memory', opts.memory)
+  }
+  if (opts.sendLastModified && file.lastModified) {
+    form.append('lastModified', String(file.lastModified))
   }
   form.append('file', file)
   const res = await fetch(`${sp(space)}/import`, { method: 'POST', body: form, signal })

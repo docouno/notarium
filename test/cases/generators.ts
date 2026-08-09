@@ -148,6 +148,15 @@ export type NoteDecl = {
   principal?: string
   /** Agent/session attribution copied to every authored lifecycle event. */
   agentAudit?: AgentWriteAuditDecl
+  /** Frontmatter the note ARRIVED with, as bare YAML lines without the `---`
+   *  fences (#280) — what an IMPORTED file carried and Notarium kept because it
+   *  is the author's data, not ours (`author: Sergey\nmeta:\n  source: obsidian`).
+   *  The two appliers reach it by their own routes — the REAL one through the
+   *  production `WriteInput.frontmatter` channel, the FAKE one through
+   *  `NoteSnapshot.frontmatter` → `InMemoryStore.load` (a fixture is a snapshot,
+   *  not a replayed write). Both must land the SAME note, so a typed field derived
+   *  from these keys has to be derived on both sides. canon: docs/seeds.md */
+  frontmatter?: string
   /** When the note first appears through us (create). */
   created: string
   /** Later edit instants — each a chained `edited` revision. */
@@ -258,6 +267,7 @@ export class WorldBuilder {
       summary: decl.summary,
       muted: decl.muted,
       pin: decl.pin,
+      frontmatter: decl.frontmatter,
       principal: decl.principal,
       agentAudit: decl.agentAudit,
     })

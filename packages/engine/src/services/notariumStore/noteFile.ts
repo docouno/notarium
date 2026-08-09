@@ -1,107 +1,38 @@
 // One note file, both directions: parse (file → index row / read() view) and
-// serialize (write() input → file bytes). The line-based frontmatter handling
-// mirrors core/libs/markdown's honesty contract — top-level scalars and block
-// lists are understood, anything fancier passes through VERBATIM (preserved on
-// rewrite, absent from the parsed object). Preservation is the point: a write
-// merges into the existing block instead of regenerating it, so keys we don't
-// know (a user's own fields) survive our edits — a last-write-wins merge
-// semantic, which is what lets two writers share one base (#69).
+// serialize (write() input → file bytes). The frontmatter primitives come from
+// core (`libs/markdown/frontmatter`) — ONE line-based reader for the whole
+// product, shared with the importer: top-level scalars and block lists are
+// understood, anything fancier passes through VERBATIM (preserved on rewrite,
+// absent from the parsed object). Preservation is the point: a write merges into
+// the existing block instead of regenerating it, so keys we don't know (a user's
+// own fields) survive our edits — a last-write-wins merge semantic, which is what
+// lets two writers share one base (#69), and what lets an IMPORTED file keep the
+// frontmatter its author wrote (#280).
 
 import {
+  CREATED_FALLBACK_FRONTMATTER_KEY,
   DEFAULT_NOTE_TYPE,
+  type FrontmatterEntry,
+  frontmatterEntryOf,
+  frontmatterEntryValue,
+  frontmatterHasYamlNodeReferences,
+  FrontmatterLimitError,
+  frontmatterListEntry,
+  frontmatterScalarEntry,
   isValidNoteId,
+  isWithinFrontmatterByteCap,
+  nextPhysicalLineSpan,
   normAliases,
   normTags,
   NOTE_ID_FRONTMATTER_KEY,
+  parseFrontmatterBlock,
+  singleLine,
   slugify,
   stripTitleHeading,
-  unquoteScalar,
 } from '@notarium/core'
 
-/** One frontmatter entry as raw lines. `key` is null for passthrough lines the
- *  parser doesn't model (nested maps, comments) — they re-emit verbatim. */
-type FmEntry = { key: string | null; lines: string[] }
-
-const FM_OPEN = /^\uFEFF?---\r?\n/
-const KEY_LINE = /^([A-Za-z0-9_][A-Za-z0-9_.-]*)\s*:\s*(.*)$/
-// Indentation is optional: flush-left `- item` is exactly the YAML our own
-// serializer writes \u2014 requiring leading whitespace silently dropped every
-// real tag list (caught live on the stand).
-const LIST_ITEM = /^\s*-\s+(.*)$/
-
-// Symmetric with fmScalar (#113): stripping the wrapping quotes must also REVERSE
-// the escaping the serializer applied, or the round-trip mangles the value (a title
-// like `"Gameverse"` came back as `\"Gameverse\"`). The canonical inverse lives in
-// core/libs/markdown as unquoteScalar — shared so the engine and the read-model
-// snippet path read identical bytes identically (the bug was two divergent copies).
-const unquote = unquoteScalar
-
-type FmBlock = { entries: FmEntry[]; bodyStart: number }
-
-/** Split a document's leading frontmatter into entries; null when there is
- *  none. bodyStart points right after the closing delimiter line. */
-export const parseFmBlock = (raw: string): FmBlock | null => {
-  const open = FM_OPEN.exec(raw)
-
-  if (!open) {
-    return null
-  }
-  const rest = raw.slice(open[0].length)
-  const close = /^---(?:\r?\n|$)/m.exec(rest)
-
-  if (!close) {
-    return null
-  }
-  const block = rest.slice(0, close.index)
-  const bodyStart = open[0].length + close.index + close[0].length
-  const entries: FmEntry[] = []
-
-  for (const line of block.split(/\r?\n/)) {
-    if (line === '' && entries.length === 0) {
-      continue
-    }
-    const kv = KEY_LINE.exec(line)
-
-    if (kv) {
-      entries.push({ key: kv[1], lines: [line] })
-    } else if (entries.length && (LIST_ITEM.test(line) || /^\s/.test(line))) {
-      entries[entries.length - 1].lines.push(line) // continuation of the entry
-    } else if (line !== '') {
-      entries.push({ key: null, lines: [line] }) // passthrough
-    }
-  }
-
-  // A trailing empty line inside the block belongs to nobody — drop it.
-  return { entries, bodyStart }
-}
-
-/** An entry's value: scalar string, block list, or null (passthrough/empty). */
-const valueOf = (e: FmEntry): string | string[] | null => {
-  if (!e.key) {
-    return null
-  }
-  const inline = e.lines[0].slice(e.lines[0].indexOf(':') + 1).trim()
-
-  if (inline) {
-    const flow = /^\[(.*)\]$/.exec(inline)
-
-    if (flow) {
-      return flow[1].split(',').map(unquote).filter(Boolean)
-    }
-
-    return unquote(inline)
-  }
-  const items = e.lines
-    .slice(1)
-    .map((l) => LIST_ITEM.exec(l)?.[1])
-    .filter((v): v is string => v != null)
-
-  if (items.length) {
-    return items.map(unquote).filter(Boolean)
-  }
-
-  return null
-}
+const YAML_NODE_REFERENCE_WRITE_ERROR =
+  'frontmatter with YAML anchors or aliases is not supported by writes'
 
 /** A frontmatter date → ISO-8601 UTC, or null when absent/unparseable. The file
  *  is the creation date's source of truth (#11 import / round-trip): a `created:`
@@ -140,8 +71,72 @@ export type ParsedNote = {
   body: string
 }
 
+/** Preserve the engine's legacy title semantics exactly: unlike the importer, a
+ *  COLUMN-ZERO H1 anywhere in a frontmatter-less body may title an on-disk note,
+ *  and a trailing `#` run remains part of that legacy title. Changing either rule
+ *  would retitle existing files during an index pass. The shared physical-line
+ *  parser removes the old quadratic regex; its raw projection retains those two
+ *  deliberate legacy differences. */
+const legacyWhitespace = (char: string): boolean => /\s/.test(char)
+const legacyLineTerminator = (char: string): boolean =>
+  char === '\n' || char === '\r' || char === '\u2028' || char === '\u2029'
+
+const anywhereH1Title = (content: string): string => {
+  let start = 0
+  let line = nextPhysicalLineSpan(content, start)
+
+  while (line) {
+    // Compatibility with the old `/^#\s+(.+?)\s*$/m` reader: JavaScript `\s`
+    // includes NBSP/em-space and crosses physical lines, so a bare `#` followed
+    // by prose on the next line historically titled the note from that prose.
+    // Scan that exact capture algebra linearly rather than delegating to the
+    // CommonMark parser, whose horizontal-space rule is intentionally narrower.
+    if (content[line.start] === '#') {
+      const firstWhitespace = line.start + 1
+      let valueStart = firstWhitespace
+      let lastDotWhitespace = -1
+
+      if (valueStart < content.length && legacyWhitespace(content[valueStart])) {
+        while (valueStart < content.length && legacyWhitespace(content[valueStart])) {
+          if (!legacyLineTerminator(content[valueStart])) {
+            lastDotWhitespace = valueStart
+          }
+          valueStart++
+        }
+        // When the remainder is whitespace-only, greedy `\s+` leaves the final
+        // dot-compatible whitespace for `(.+?)` (provided it consumed at least
+        // one earlier whitespace). Preserve that odd, observable legacy title.
+        if (valueStart === content.length) {
+          if (lastDotWhitespace > firstWhitespace) {
+            return content[lastDotWhitespace]
+          }
+          start = line.next
+          line = nextPhysicalLineSpan(content, start)
+          continue
+        }
+        let valueEnd = valueStart
+
+        while (valueEnd < content.length && !legacyLineTerminator(content[valueEnd])) {
+          valueEnd++
+        }
+        let trimmedEnd = valueEnd
+
+        while (trimmedEnd > valueStart && legacyWhitespace(content[trimmedEnd - 1])) {
+          trimmedEnd--
+        }
+
+        return content.slice(valueStart, trimmedEnd)
+      }
+    }
+    start = line.next
+    line = nextPhysicalLineSpan(content, start)
+  }
+
+  return ''
+}
+
 export const parseNoteFile = (raw: string, path: string): ParsedNote => {
-  const fm = parseFmBlock(raw)
+  const fm = parseFrontmatterBlock(raw)
   const afterFm = fm ? raw.slice(fm.bodyStart) : raw
   const frontmatter: Record<string, unknown> = {}
 
@@ -149,16 +144,22 @@ export const parseNoteFile = (raw: string, path: string): ParsedNote => {
     if (!e.key) {
       continue
     }
-    const v = valueOf(e)
+    const v = frontmatterEntryValue(e)
 
     if (v != null) {
       frontmatter[e.key] = v
+    } else {
+      // Frontmatter is last-wins even when the last duplicate is a shape this
+      // deliberately-small reader cannot model. Leaving the earlier readable
+      // projection in place would resurrect a value the file replaced with a
+      // nested/map/annotated form.
+      delete frontmatter[e.key]
     }
   }
   const fmTitle = typeof frontmatter.title === 'string' ? frontmatter.title : ''
-  const h1 = /^#\s+(.+?)\s*$/m.exec(afterFm)
+  const h1Title = anywhereH1Title(afterFm)
   const fileName = path.split('/').pop()?.replace(/\.md$/, '') || path
-  const title = fmTitle || h1?.[1] || fileName
+  const title = fmTitle || h1Title || fileName
   const claim = frontmatter[NOTE_ID_FRONTMATTER_KEY]
   // Canonicalise the frontmatter slug to URL form (#100 phase 1): our writes already
   // slugify it, but an externally-authored `slug: My Custom Slug` is normalised
@@ -174,33 +175,11 @@ export const parseNoteFile = (raw: string, path: string): ParsedNote => {
     aliases: normAliases(frontmatter.aliases) ?? [],
     slug: fmSlug || null,
     idClaim: typeof claim === 'string' && isValidNoteId(claim) ? claim : null,
-    createdAt: fmDate(frontmatter.created),
+    createdAt: fmDate(frontmatter.created) ?? fmDate(frontmatter[CREATED_FALLBACK_FRONTMATTER_KEY]),
     frontmatter,
     body: stripTitleHeading(afterFm.replace(/^\r?\n/, ''), title),
   }
 }
-
-/** YAML-safe scalar for the values we emit: quote when the raw form would
- *  parse as something else (leading/trailing space, a colon-space, #, quotes, or a
- *  leading YAML indicator). A real YAML parser must read back what we wrote — this is
- *  load-bearing for interop now that #156 lets ARBITRARY first-line prose become a
- *  `title`: a title opening with a flow indicator (`[[wiki]]` → `[`, `{a}` → `{`,
- *  `, leading` → `,`) would otherwise emit `title: [[wiki]]`, which a strict YAML
- *  reader (Obsidian, exporters) parses as a nested flow collection, not a string. */
-const fmScalar = (v: string): string =>
-  /(^\s|\s$|: |#|^["'&*?|>%@`![\]{},-]|: *$)/.test(v) || v === ''
-    ? `"${v.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
-    : v
-
-const scalarEntry = (key: string, v: string): FmEntry => ({
-  key,
-  lines: [`${key}: ${fmScalar(v)}`],
-})
-
-const listEntry = (key: string, items: string[]): FmEntry => ({
-  key,
-  lines: [`${key}:`, ...items.map((t) => `- ${fmScalar(t)}`)],
-})
 
 export type SerializeInput = {
   title: string
@@ -232,6 +211,13 @@ export type SerializeInput = {
    *  Import (#11) and the agent `create_note` (#21) SET it on create; the UI EDITs it
    *  deliberately on an existing note (#186). (No `modified` — it tracks the real mtime.) */
   createdAt?: string
+  /** Frontmatter the note ARRIVES with, carried verbatim (#280): an imported
+   *  file's own keys, entry by entry. Merged BELOW the existing file's block and
+   *  ABOVE our typed fields — so a re-import can refresh a foreign key, while
+   *  title/tags/created stay ours to decide. The importer strips the keys it lifts
+   *  into typed channels and the `notarium-id` claim, so this never smuggles in an
+   *  identity. */
+  frontmatter?: readonly FrontmatterEntry[]
   /** The body the editor saved (may itself open with a frontmatter block —
    *  merged into the file's). */
   body: string
@@ -239,8 +225,9 @@ export type SerializeInput = {
   existingRaw?: string | null
 }
 
-/** Build the file: existing frontmatter ∪ body's inline frontmatter ∪ our
- *  fields (ours win), then the storage-format `# title` heading and the body. */
+/** Build the file: existing frontmatter ∪ the imported note's own ∪ the body's
+ *  inline frontmatter ∪ our fields (ours win), then the storage-format `# title`
+ *  heading and the body. */
 export const serializeNoteFile = ({
   title,
   noteType,
@@ -251,33 +238,115 @@ export const serializeNoteFile = ({
   muted,
   id,
   createdAt,
+  frontmatter,
   body,
   existingRaw,
 }: SerializeInput): string => {
-  const entries: FmEntry[] = existingRaw ? (parseFmBlock(existingRaw)?.entries ?? []) : []
+  const existingEntries: FrontmatterEntry[] =
+    existingRaw != null ? (parseFrontmatterBlock(existingRaw)?.entries ?? []) : []
+  // Inline frontmatter riding the body is another incoming metadata channel. Parse
+  // it before the safety gate so a caller cannot bypass the raw-entry check by
+  // placing `&anchor` / `*alias` in `body` instead of WriteInput.frontmatter.
+  let cleanBody = body
+  const inline = parseFrontmatterBlock(body)
 
-  const put = (entry: FmEntry): void => {
-    const i = entries.findIndex((e) => e.key === entry.key)
+  // Anchors and aliases are order-dependent, while this serializer merges by key
+  // and always replaces at least `title`. Refuse them on every incoming channel,
+  // fresh write included. An existing file may predate this restriction; any
+  // mutation of such a file is refused too so its dependency order cannot change.
+  // This happens before candidate bytes are built, therefore the caller publishes
+  // nothing.
+  if (
+    frontmatterHasYamlNodeReferences(frontmatter) ||
+    frontmatterHasYamlNodeReferences(inline?.entries) ||
+    (existingRaw != null && frontmatterHasYamlNodeReferences(existingEntries))
+  ) {
+    throw new Error(YAML_NODE_REFERENCE_WRITE_ERROR)
+  }
+  const entries = existingEntries
+  const incomingCreated = frontmatter && frontmatterEntryOf(frontmatter, 'created')
+  const preserveUnreadableCreated = Boolean(
+    createdAt && incomingCreated && fmDate(frontmatterEntryValue(incomingCreated)) === null,
+  )
+  // Positions are tombstoned instead of repeatedly splicing/scanning the array.
+  // A large imported block may contain tens of thousands of distinct authored
+  // keys, so `findIndex` per entry turns one upload into quadratic event-loop work.
+  const live = entries.map(() => true)
+  const positions = new Map<string, number[]>()
 
-    if (i === -1) {
-      entries.push(entry)
-    } else {
-      entries[i] = entry
+  for (let i = 0; i < entries.length; i++) {
+    const key = entries[i].key
+
+    if (key) {
+      const found = positions.get(key)
+
+      if (found) {
+        found.push(i)
+      } else {
+        positions.set(key, [i])
+      }
     }
   }
 
   const drop = (key: string): void => {
-    const i = entries.findIndex((e) => e.key === key)
+    for (const i of positions.get(key) ?? []) {
+      live[i] = false
+    }
+    positions.delete(key)
+  }
 
-    if (i !== -1) {
-      entries.splice(i, 1)
+  const put = (entry: FrontmatterEntry): void => {
+    const key = entry.key
+
+    if (!key) {
+      return
+    }
+    const occupied = positions.get(key)
+
+    if (occupied?.length) {
+      // Replace at the first live occurrence: this preserves the key's anchor
+      // among surrounding authored fields/comments while collapsing every later
+      // duplicate. Repeated puts keep using that same slot; only a genuinely new
+      // key appends.
+      const [anchor, ...duplicates] = occupied
+      entries[anchor] = entry
+      live[anchor] = true
+      for (const i of duplicates) {
+        live[i] = false
+      }
+      positions.set(key, [anchor])
+      return
+    }
+    const appended = entries.push(entry) - 1
+    live.push(true)
+    positions.set(key, [appended])
+  }
+
+  // An imported file's own frontmatter (#280) merges next: below anything the
+  // occupied file already had, above our typed fields. Keyless passthrough lines
+  // (a YAML comment) cannot be `put` — there is no key to match them on — and
+  // dropping them would silently eat a line of the author's file, so they are kept
+  // and moved to the FRONT of the block below. Front, not back: a keyless line that
+  // is indented or starts with `- ` re-reads as a CONTINUATION of whatever key
+  // precedes it, so appending one after our own keys let it swallow `created:` or
+  // `notarium-id:`. At the top of the block there is nothing for it to attach to.
+  const keyless: FrontmatterEntry[] = []
+  const existingKeyless = new Set(
+    entries.filter((entry) => !entry.key).map((entry) => entry.lines[0]),
+  )
+
+  for (const e of frontmatter ?? []) {
+    if (e.key) {
+      put(e)
+    } else if (!existingKeyless.has(e.lines[0])) {
+      // Do not add this line to `existingKeyless`: two identical comments in the
+      // SAME source are two authored lines and both survive. Only an already
+      // occupied file suppresses a repeated line on a later re-import.
+      keyless.push(e)
     }
   }
 
-  // Inline frontmatter riding the body merges in first (ours below override).
-  let cleanBody = body
-  const inline = parseFmBlock(body)
-
+  // Inline frontmatter riding the body merges in next (ours below override).
   if (inline) {
     for (const e of inline.entries) {
       if (e.key) {
@@ -287,17 +356,17 @@ export const serializeNoteFile = ({
     cleanBody = body.slice(inline.bodyStart).replace(/^\r?\n/, '')
   }
 
-  put(scalarEntry('title', title))
+  put(frontmatterScalarEntry('title', title))
   if (noteType !== undefined) {
     if (noteType && noteType !== DEFAULT_NOTE_TYPE) {
-      put(scalarEntry('type', noteType))
+      put(frontmatterScalarEntry('type', noteType))
     } else {
       drop('type')
     }
   }
   if (tags !== undefined) {
     if (tags.length) {
-      put(listEntry('tags', tags))
+      put(frontmatterListEntry('tags', tags))
     } else {
       drop('tags')
     }
@@ -306,7 +375,7 @@ export const serializeNoteFile = ({
   // block as a passthrough entry; a set replaces it; [] drops it.
   if (aliases !== undefined) {
     if (aliases.length) {
-      put(listEntry('aliases', aliases))
+      put(frontmatterListEntry('aliases', aliases))
     } else {
       drop('aliases')
     }
@@ -316,7 +385,7 @@ export const serializeNoteFile = ({
   // implicit slug(title) default stays out of the file).
   if (slug !== undefined) {
     if (slug) {
-      put(scalarEntry('slug', slug))
+      put(frontmatterScalarEntry('slug', slug))
     } else {
       drop('slug')
     }
@@ -325,7 +394,7 @@ export const serializeNoteFile = ({
   // sets/overwrites it (an empty string drops it — an explicit clear).
   if (summary !== undefined) {
     if (summary) {
-      put(scalarEntry('summary', summary))
+      put(frontmatterScalarEntry('summary', summary))
     } else {
       drop('summary')
     }
@@ -334,25 +403,45 @@ export const serializeNoteFile = ({
   // true writes `muted: true`, false clears it (an explicit un-mute).
   if (muted !== undefined) {
     if (muted) {
-      put(scalarEntry('muted', 'true'))
+      put(frontmatterScalarEntry('muted', 'true'))
     } else {
       drop('muted')
     }
   }
   if (id) {
-    put(scalarEntry(NOTE_ID_FRONTMATTER_KEY, id))
+    put(frontmatterScalarEntry(NOTE_ID_FRONTMATTER_KEY, id))
   }
   // Dates-as-data (#11/#186): write `created:` whenever a value is provided —
-  // SET/overwrite, so an authored date edit (the metadata aside) lands and a
-  // re-import re-stamps the same value harmlessly. Absent leaves the file's date
-  // alone (a normal body save never restamps it; the index then keeps using the
-  // existing `created:` or the file birthtime). `modified` is never written: it
-  // tracks the file's real mtime (no staleness, no journal fight).
+  // SET/overwrite, so an authored date edit lands and a re-import re-stamps the
+  // same value harmlessly. One preservation exception: an incoming unreadable
+  // authored `created:` remains byte-lines, while its resolved source-mtime uses
+  // our distinct reserved key. Duplicate YAML keys would not be valid YAML. A
+  // later explicit date edit has no incoming carry and collapses both back to the
+  // normal `created:` key. Absent leaves the file's date alone; `modified` always
+  // tracks the file's real mtime.
   if (createdAt) {
-    put(scalarEntry('created', createdAt))
+    if (preserveUnreadableCreated) {
+      put(frontmatterScalarEntry(CREATED_FALLBACK_FRONTMATTER_KEY, createdAt))
+    } else {
+      drop(CREATED_FALLBACK_FRONTMATTER_KEY)
+      put(frontmatterScalarEntry('created', createdAt))
+    }
   }
 
-  const fmLines = entries.flatMap((e) => e.lines)
-  const head = `---\n${fmLines.join('\n')}\n---\n\n# ${title}\n`
+  const fmLines = [...keyless, ...entries.filter((_, index) => live[index])].flatMap((e) => e.lines)
+  const frontmatterPayload = `${fmLines.join('\n')}\n`
+
+  // Check the exact bytes that will sit between the fences, including the final
+  // line break. Otherwise a near-cap existing block can accept one more typed
+  // field, write bytes that our own parser rejects, and only discover the damage
+  // after the atomic file replacement has already happened.
+  if (!isWithinFrontmatterByteCap(frontmatterPayload)) {
+    throw new FrontmatterLimitError()
+  }
+  // The heading repeats the title, so it must repeat the SAME string the frontmatter
+  // states — `singleLine`, not the raw value. Writing the raw one let a title with a
+  // line terminator disagree with its own `title:`, and a heading that does not match
+  // the title is never stripped on read: one stray copy stayed in the body forever.
+  const head = `---\n${frontmatterPayload}---\n\n# ${singleLine(title)}\n`
   return cleanBody ? `${head}\n${cleanBody}` : head
 }

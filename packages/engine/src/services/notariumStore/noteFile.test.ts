@@ -1,6 +1,17 @@
 import { describe, expect, it } from 'vitest'
 
+import {
+  FRONTMATTER_BYTE_CAP,
+  frontmatterEntryValue,
+  FrontmatterLimitError,
+  markdownFileToNote,
+  parseFrontmatterBlock,
+} from '@notarium/core'
+
 import { parseNoteFile, serializeNoteFile } from './noteFile'
+
+const YAML_NODE_REFERENCE_WRITE_ERROR =
+  'frontmatter with YAML anchors or aliases is not supported by writes'
 
 const BM_FILE = `---
 title: Engine Live Probe
@@ -32,6 +43,63 @@ describe('parseNoteFile', () => {
     expect(parseNoteFile('just prose', 'dir/some-note.md').title).toBe('some-note')
   })
 
+  it('keeps the deliberate legacy column-zero/anywhere H1 fallback exactly', () => {
+    const raw = 'lead paragraph\n\n# Legacy Title ###\n\nbody'
+    const parsed = parseNoteFile(raw, 'dir/fallback.md')
+
+    expect(parsed.title).toBe('Legacy Title ###')
+    // Title discovery is deliberately anywhere; body stripping is deliberately
+    // opening-only, so the later heading remains authored content.
+    expect(parsed.body).toBe(raw)
+  })
+
+  it('keeps the old JavaScript-whitespace capture around a legacy H1 title', () => {
+    expect(parseNoteFile('#\u00a0\u2003Unicode title\u2003\u00a0', 'fallback.md').title).toBe(
+      'Unicode title',
+    )
+    expect(parseNoteFile('# Unicode title\u00a0\u2003', 'fallback.md').title).toBe('Unicode title')
+    // The old greedy `\s+` + non-empty capture left the final whitespace as the
+    // title when at least two dot-compatible whitespace characters followed `#`.
+    expect(parseNoteFile('# \u00a0', 'fallback.md').title).toBe('\u00a0')
+  })
+
+  it('finds the legacy anywhere H1 across CR-only physical lines without rewriting bytes', () => {
+    const raw = 'lead paragraph\r# CR title\rbody'
+    const parsed = parseNoteFile(raw, 'dir/fallback.md')
+
+    expect(parsed.title).toBe('CR title')
+    expect(parsed.body).toBe(raw)
+  })
+
+  it('finds the legacy anywhere H1 across Unicode line separators without rewriting bytes', () => {
+    for (const separator of ['\u2028', '\u2029']) {
+      const raw = `lead paragraph${separator}# Unicode title${separator}body`
+      const parsed = parseNoteFile(raw, 'dir/fallback.md')
+
+      expect(parsed.title).toBe('Unicode title')
+      expect(parsed.body).toBe(raw)
+    }
+  })
+
+  it('keeps the legacy cross-line bare-H1 fallback', () => {
+    expect(parseNoteFile('#\nReal title\nbody', 'fallback.md').title).toBe('Real title')
+  })
+
+  it('does not read indented code or a leading-tab line as the legacy H1 fallback', () => {
+    expect(parseNoteFile('   # heading\nbody', 'dir/three-spaces.md').title).toBe('three-spaces')
+    expect(parseNoteFile('    # code\nbody', 'dir/four-spaces.md').title).toBe('four-spaces')
+    expect(parseNoteFile('\t# code\nbody', 'dir/tab.md').title).toBe('tab')
+  })
+
+  it('scales across many physical-line near misses before the anywhere H1', () => {
+    const raw = `${'    # indented code\n'.repeat(20_000)}# Actual ###\nbody`
+    const started = Date.now()
+    const parsed = parseNoteFile(raw, 'dir/fallback.md')
+
+    expect(parsed.title).toBe('Actual ###')
+    expect(Date.now() - started).toBeLessThan(500)
+  })
+
   it('ignores a non-durable identity but preserves a fully opaque prefix-shaped one', () => {
     const lone = String.fromCharCode(0xd800)
     const parsed = parseNoteFile(`---\nnotarium-id: bad${lone}\n---\n\nbody`, 'bad.md')
@@ -40,6 +108,53 @@ describe('parseNoteFile', () => {
     expect(
       parseNoteFile('---\nnotarium-id: notarium-id:foo\n---\n\nbody', 'reserved.md').idClaim,
     ).toBe('notarium-id:foo')
+  })
+
+  it('lets an unreadable last duplicate clear every earlier readable projection', () => {
+    const raw = [
+      '---',
+      'title: Stale title',
+      'title:',
+      '  locale: New title',
+      'type: person',
+      'type:',
+      '  kind: event',
+      'tags: [stale]',
+      'tags:',
+      '  source: nested',
+      'aliases: [Old Name]',
+      'aliases:',
+      '  locale: en',
+      'slug: stale-slug',
+      'slug:',
+      '  generated: false',
+      'created: 1999-01-01',
+      'created:',
+      '  source: legacy',
+      'notarium-id: AAAAAAAAAAAA',
+      'notarium-id:',
+      '  source: legacy',
+      '---',
+      '# Live heading',
+      '',
+      'body',
+    ].join('\n')
+    const parsed = parseNoteFile(raw, 'fallback.md')
+
+    expect(parsed.title).toBe('Live heading')
+    expect(parsed.noteType).toBeNull()
+    expect(parsed.tags).toEqual([])
+    expect(parsed.aliases).toEqual([])
+    expect(parsed.slug).toBeNull()
+    expect(parsed.createdAt).toBeNull()
+    expect(parsed.idClaim).toBeNull()
+    expect(parsed.frontmatter).not.toHaveProperty('title')
+    expect(parsed.frontmatter).not.toHaveProperty('type')
+    expect(parsed.frontmatter).not.toHaveProperty('tags')
+    expect(parsed.frontmatter).not.toHaveProperty('aliases')
+    expect(parsed.frontmatter).not.toHaveProperty('slug')
+    expect(parsed.frontmatter).not.toHaveProperty('created')
+    expect(parsed.frontmatter).not.toHaveProperty('notarium-id')
   })
 })
 
@@ -149,5 +264,494 @@ describe('serializeNoteFile', () => {
     // '' → an explicit clear back to the implicit default.
     const cleared = serializeNoteFile({ title: 'T', slug: '', body: 'b', existingRaw: withSlug })
     expect(parseNoteFile(cleared, 't.md').slug).toBeNull()
+  })
+})
+
+// The frontmatter an IMPORTED file arrives with (#280): merged under our typed
+// fields, over the file's existing block. The file stays the author's.
+describe('serializeNoteFile — carried frontmatter', () => {
+  const carried = (raw: string) => parseFrontmatterBlock(raw)!.entries
+
+  it('writes the author’s keys into the file and reads them back', () => {
+    const out = serializeNoteFile({
+      title: 'Vault Note',
+      id: 'id-9',
+      frontmatter: carried('---\nauthor: Sergey\nrating: 5\n---\n'),
+      body: 'b',
+    })
+    const p = parseNoteFile(out, 'vault-note.md')
+    expect(p.frontmatter.author).toBe('Sergey')
+    expect(p.frontmatter.rating).toBe('5')
+    expect(p.title).toBe('Vault Note')
+  })
+
+  it('keeps a nested map and a comment verbatim — unmodelled is not deletable', () => {
+    const out = serializeNoteFile({
+      title: 'T',
+      frontmatter: carried('---\n# a comment\nmeta:\n  source: obsidian\n  rating: 5\n---\n'),
+      body: 'b',
+    })
+    expect(out).toContain('# a comment')
+    expect(out).toContain('meta:\n  source: obsidian\n  rating: 5')
+  })
+
+  it('keeps comments between continuation lines inside their authored entry', () => {
+    const source = [
+      '---',
+      'tags:',
+      '- one',
+      '# keep the next list item',
+      '- two',
+      'meta:',
+      '  a: 1',
+      '# keep the next mapping field',
+      '  b: 2',
+      '---',
+      'body',
+    ].join('\n')
+    const note = markdownFileToNote(source, 'commented.md')
+    const out = serializeNoteFile({
+      title: note.title,
+      tags: note.tags,
+      frontmatter: note.frontmatter,
+      body: note.body,
+    })
+    const entries = parseFrontmatterBlock(out)!.entries
+
+    expect(entries.find((entry) => entry.key === 'tags')?.lines).toEqual([
+      'tags:',
+      '- one',
+      '# keep the next list item',
+      '- two',
+    ])
+    expect(entries.find((entry) => entry.key === 'meta')?.lines).toEqual([
+      'meta:',
+      '  a: 1',
+      '# keep the next mapping field',
+      '  b: 2',
+    ])
+  })
+
+  it('a keyless carried line goes to the FRONT — it must not swallow the key above it', () => {
+    // An indented or `- ` keyless line re-reads as a CONTINUATION of whatever key
+    // precedes it. Appended after ours, it turned `created:`/`notarium-id:` into
+    // multi-line entries and their values were lost on the next read.
+    const first = serializeNoteFile({
+      title: 'T',
+      id: 'id-1',
+      createdAt: '2020-01-02T00:00:00.000Z',
+      body: 'b',
+    })
+    const out = serializeNoteFile({
+      title: 'T',
+      id: 'id-1',
+      createdAt: '2020-01-02T00:00:00.000Z',
+      frontmatter: carried('---\n  indented: 1\n---\n'),
+      body: 'b',
+      existingRaw: first,
+    })
+    const p = parseNoteFile(out, 't.md')
+    expect(p.idClaim).toBe('id-1')
+    expect(p.createdAt).toBe('2020-01-02T00:00:00.000Z')
+    expect(out).toContain('  indented: 1') // …and the author's line is still there
+  })
+
+  it('our typed fields WIN over a carried key of the same name', () => {
+    const out = serializeNoteFile({
+      title: 'Ours',
+      tags: ['ours'],
+      createdAt: '2020-01-01T00:00:00.000Z',
+      frontmatter: carried('---\ntitle: Theirs\ntags: [theirs]\ncreated: 1999-01-01\n---\n'),
+      body: 'b',
+    })
+    const p = parseNoteFile(out, 't.md')
+    expect(p.title).toBe('Ours')
+    expect(p.tags).toEqual(['ours'])
+    expect(p.createdAt).toBe('2020-01-01T00:00:00.000Z')
+    expect(out.match(/^title:/gm)).toHaveLength(1) // not asserted twice
+  })
+
+  it('an `aliases:`/`slug:` the author wrote becomes live metadata (#100 keys, carried)', () => {
+    const out = serializeNoteFile({
+      title: 'Vault Note',
+      frontmatter: carried('---\naliases: [Old Name]\nslug: my-slug\n---\n'),
+      body: 'b',
+    })
+    const p = parseNoteFile(out, 'vault-note.md')
+    expect(p.aliases).toEqual(['Old Name'])
+    expect(p.slug).toBe('my-slug')
+  })
+
+  it('refreshes a carried key over the occupied file, keeping the file’s other keys', () => {
+    // A re-import of an edited source: the author's key updates, ours stay ours.
+    const first = serializeNoteFile({
+      title: 'T',
+      id: 'id-1',
+      frontmatter: carried('---\nauthor: Old\nkept: yes\n---\n'),
+      body: 'b',
+    })
+    const second = serializeNoteFile({
+      title: 'T',
+      id: 'id-1',
+      frontmatter: carried('---\nauthor: New\n---\n'),
+      body: 'b2',
+      existingRaw: first,
+    })
+    const p = parseNoteFile(second, 't.md')
+    expect(p.frontmatter.author).toBe('New')
+    expect(p.frontmatter.kept).toBe('yes') // untouched by this write
+    expect(p.idClaim).toBe('id-1')
+  })
+
+  it.each([
+    ['anchor definition', 'anchorKey: &x value'],
+    ['alias node', 'copy: *x'],
+    ['foreign duplicate', 'author: &x old\ncopy: *x\nauthor: new'],
+    ['lifted duplicate', 'tags: &x [old]\ncopy: *x\ntags: [new]'],
+    ['date duplicate', 'created: &x old\ncopy: *x\ncreated: 2020-01-01'],
+  ])('rejects YAML node references on a fresh file (%s)', (_label, yaml) => {
+    expect(() =>
+      serializeNoteFile({
+        title: 'T',
+        frontmatter: carried(`---\n${yaml}\n---\n`),
+        body: 'body',
+      }),
+    ).toThrowError(new Error(YAML_NODE_REFERENCE_WRITE_ERROR))
+  })
+
+  it('rejects leading inline-frontmatter references on fresh and existing writes', () => {
+    const inline = '---\nanchorKey: &x value\ncopy: *x\n---\nnew body'
+    const existingRaw = serializeNoteFile({ title: 'T', body: 'old body' })
+
+    expect(() => serializeNoteFile({ title: 'T', body: inline })).toThrowError(
+      new Error(YAML_NODE_REFERENCE_WRITE_ERROR),
+    )
+    expect(() => serializeNoteFile({ title: 'T', body: inline, existingRaw })).toThrowError(
+      new Error(YAML_NODE_REFERENCE_WRITE_ERROR),
+    )
+    expect(parseNoteFile(existingRaw, 't.md').body).toBe('old body')
+  })
+
+  it('allows plain, quoted and block-scalar ampersands that are not YAML node references', () => {
+    const source = carried(
+      '---\nplain: A&B and literal *alias\nquoted: "&anchor and *alias"\ncode: |\n  &anchor-looking text\n  *alias-looking text\n---\n',
+    )
+    const first = serializeNoteFile({ title: 'T', frontmatter: source, body: 'old body' })
+
+    expect(() =>
+      serializeNoteFile({ title: 'T', body: 'new body', existingRaw: first }),
+    ).not.toThrow()
+    expect(first).toContain('plain: A&B and literal *alias')
+    expect(first).toContain('quoted: "&anchor and *alias"')
+    expect(first).toContain('code: |\n  &anchor-looking text\n  *alias-looking text')
+  })
+
+  it('rejects anchor/alias carry on overwrite without changing the old file', () => {
+    const existingRaw = serializeNoteFile({
+      title: 'T',
+      frontmatter: carried('---\ncopy: old\nanchorKey: old\n---\n'),
+      body: 'old body',
+    })
+    const incoming = carried('---\nanchorKey: &x new\ncopy: *x\n---\n')
+
+    expect(() =>
+      serializeNoteFile({
+        title: 'T',
+        frontmatter: incoming,
+        body: 'new body',
+        existingRaw,
+      }),
+    ).toThrowError(new Error(YAML_NODE_REFERENCE_WRITE_ERROR))
+    const old = parseNoteFile(existingRaw, 't.md')
+
+    expect(old.frontmatter.copy).toBe('old')
+    expect(old.frontmatter.anchorKey).toBe('old')
+    expect(old.body).toBe('old body')
+  })
+
+  it('rejects an ordinary write when the existing file contains anchor dependencies', () => {
+    const existingRaw = '---\ntitle: T\ntags: &x [a]\ncopy: *x\n---\n\n# T\n\nold body'
+
+    expect(() =>
+      serializeNoteFile({
+        title: 'T',
+        tags: ['new'],
+        body: 'new body',
+        existingRaw,
+      }),
+    ).toThrowError(new Error(YAML_NODE_REFERENCE_WRITE_ERROR))
+    expect(existingRaw).toContain('tags: &x [a]\ncopy: *x')
+    expect(parseNoteFile(existingRaw, 't.md').body).toBe('old body')
+  })
+
+  it('collapses every occupied duplicate when a key is set or cleared', () => {
+    const existingRaw = [
+      '---',
+      'title: Old first',
+      'title: Old LAST',
+      'author: Old first',
+      'author: Old LAST',
+      'tags: [old-first]',
+      'tags: [old-last]',
+      'slug: first',
+      'slug: last',
+      '---',
+      '',
+      '# Old LAST',
+      '',
+      'body',
+    ].join('\n')
+    const out = serializeNoteFile({
+      title: 'New Title',
+      tags: ['new'],
+      slug: '',
+      frontmatter: carried('---\nauthor: New\n---\n'),
+      body: 'body',
+      existingRaw,
+    })
+    const parsed = parseNoteFile(out, 'note.md')
+
+    expect(parsed.title).toBe('New Title')
+    expect(parsed.tags).toEqual(['new'])
+    expect(parsed.slug).toBeNull()
+    expect(parsed.frontmatter.author).toBe('New')
+    expect(out.match(/^title:/gm)).toHaveLength(1)
+    expect(out.match(/^tags:/gm)).toHaveLength(1)
+    expect(out.match(/^author:/gm)).toHaveLength(1)
+    expect(out.match(/^slug:/gm)).toBeNull()
+  })
+
+  it('replaces a key at its first occupied anchor while tombstoning later duplicates', () => {
+    const existingRaw = [
+      '---',
+      'alpha: first',
+      'author: Old first',
+      'between: stays between',
+      'author: Old last',
+      'omega: last',
+      '---',
+      '',
+      '# T',
+      '',
+      'body',
+    ].join('\n')
+    const out = serializeNoteFile({
+      title: 'T',
+      frontmatter: carried('---\nauthor: New\n---\n'),
+      body: 'body',
+      existingRaw,
+    })
+    const keys = parseFrontmatterBlock(out)!
+      .entries.map((entry) => entry.key)
+      .filter((key): key is string => key != null)
+
+    expect(keys).toEqual(['alpha', 'author', 'between', 'omega', 'title'])
+    expect(out.match(/^author:/gm)).toEqual(['author:'])
+    expect(parseNoteFile(out, 't.md').frontmatter.author).toBe('New')
+  })
+
+  it('rejects the final emitted payload when typed fields push it over the metadata cap', () => {
+    const existingRaw = `---\npad: ${'a'.repeat(FRONTMATTER_BYTE_CAP - 8)}\n---\n\n# T\n`
+
+    expect(parseFrontmatterBlock(existingRaw)).not.toBeNull()
+    expect(() => serializeNoteFile({ title: 'T', body: 'body', existingRaw })).toThrow(
+      FrontmatterLimitError,
+    )
+  })
+
+  it('merges a large carried block in linear time', () => {
+    // Stay below the product's 64 KiB metadata ceiling while retaining enough
+    // distinct keys to expose a per-key full-array scan.
+    const frontmatter = Array.from({ length: 2_500 }, (_, i) => ({
+      key: `foreign-${i}`,
+      lines: [`foreign-${i}: value`],
+    }))
+    const started = Date.now()
+    const out = serializeNoteFile({ title: 'T', frontmatter, body: 'b' })
+
+    expect(out).toContain('foreign-2499: value')
+    expect(Date.now() - started).toBeLessThan(1_500)
+  })
+
+  it('preserves an unreadable authored created while keeping the resolved mtime', () => {
+    const mtime = '2019-05-05T10:00:00.000Z'
+    const note = markdownFileToNote('---\ncreated: someday\nauthor: S\n---\nbody', 'a.md', mtime)
+    const out = serializeNoteFile({
+      title: note.title,
+      body: note.body,
+      frontmatter: note.frontmatter,
+      createdAt: note.createdAt,
+    })
+
+    expect(out).toContain('created: someday')
+    expect(out).toContain(`notarium-created: ${mtime}`)
+    expect(parseNoteFile(out, 'a.md').createdAt).toBe(mtime)
+
+    const explicitlyCorrected = serializeNoteFile({
+      title: note.title,
+      body: note.body,
+      createdAt: '2020-01-02T00:00:00.000Z',
+      existingRaw: out,
+    })
+    expect(explicitlyCorrected).not.toContain('created: someday')
+    expect(explicitlyCorrected).not.toContain('notarium-created:')
+    expect(parseNoteFile(explicitlyCorrected, 'a.md').createdAt).toBe('2020-01-02T00:00:00.000Z')
+  })
+})
+
+// A PROPERTY test over the whole file round-trip, added after review rounds kept
+// finding one more hand-crafted frontmatter shape that broke it (a lone CR, a
+// whitespace-only line, an indented keyless line, a closing `#` run, a block
+// scalar…). Enumerating cases by hand is the wrong shape of work for a parser:
+// what actually has to hold is an INVARIANT, so this asserts the invariant over a
+// generated corpus of nasty shapes instead.
+//
+//   1. what we write, we read back — for every field we model;
+//   2. blank raw lines are never invented; when continuation ownership proves they
+//      belong to an authored entry, that entry survives byte-for-byte. Our own
+//      scalar fields remain single-line and cannot escape their key or the `---`
+//      block;
+//   3. serialize∘parse is a FIXPOINT — a file must not keep changing on re-saves.
+//
+// Deterministic (a seeded LCG, no Math.random) so a failure is reproducible, and
+// small enough not to starve a parallel worker.
+describe('serializeNoteFile ∘ parseNoteFile — round-trip invariants (property)', () => {
+  const LINES = [
+    'author: Sergey',
+    'layout: post',
+    '# a comment',
+    '  indented: 1',
+    '- stray item',
+    ' ',
+    '\t',
+    'meta:',
+    '  source: obsidian',
+    'empty:',
+    'flow: [a, b]',
+    'block: |',
+    '  one',
+    '  two',
+    'folded: >',
+    '  wrapped here',
+    'date: 2016-11-17',
+    'cssclasses: [wide]',
+  ]
+  const TITLES = [
+    'Plain',
+    'A: B',
+    'Sprint review #',
+    'Title ##',
+    '"Gameverse"',
+    'Договор',
+    '[[wiki]]',
+    'Two\nLines',
+    'a\rb',
+    '  padded  ',
+    '#',
+    'C#',
+  ]
+  const TAGS = [[], ['a'], ['работа', '2025'], ['#hash'], ['a: b']]
+
+  it('holds over a generated corpus of hostile frontmatter shapes', () => {
+    let seed = 0x2802_2026
+
+    const rnd = (n: number) => {
+      seed = (seed * 1664525 + 1013904223) >>> 0
+      return seed % n
+    }
+
+    for (let i = 0; i < 3000; i++) {
+      const block = Array.from({ length: rnd(5) + 1 }, () => LINES[rnd(LINES.length)]).join('\n')
+      const carriedEntries = parseFrontmatterBlock(`---\n${block}\n---\n`)?.entries ?? []
+      const title = TITLES[rnd(TITLES.length)]
+      const tags = TAGS[rnd(TAGS.length)]
+      const input = {
+        title,
+        tags,
+        id: 'idAAAAAAAAAA',
+        createdAt: '2019-04-01T00:00:00.000Z',
+        frontmatter: carriedEntries,
+        body: 'Body line.',
+      }
+      const file = serializeNoteFile(input)
+      const parsed = parseNoteFile(file, 'note.md')
+      const where = `case ${i} · title=${JSON.stringify(title)} · block=${JSON.stringify(block)}`
+
+      // (1) every modelled field survives. The ONE thing a scalar cannot store is a
+      // line break, so the title is compared against the emitter's own collapse —
+      // edge whitespace is preserved (by quoting), only terminators fold.
+      const expectedTitle = /[\r\n]/.test(title)
+        ? title
+            .split(/\r\n|[\r\n]/)
+            .map((l) => l.trim())
+            .filter(Boolean)
+            .join(' ')
+        : title
+      expect([where, parsed.title]).toEqual([where, expectedTitle])
+      expect([where, parsed.tags]).toEqual([where, tags])
+      expect([where, parsed.idClaim]).toEqual([where, 'idAAAAAAAAAA'])
+      expect([where, parsed.createdAt]).toEqual([where, '2019-04-01T00:00:00.000Z'])
+
+      const emitted = parseFrontmatterBlock(file)!
+
+      // (2a) A blank line can be semantic block-scalar content, or preserved raw
+      // spacing inside a multiline entry once a later continuation proves its
+      // ownership. It must always come from one exact authored entry; the serializer
+      // must neither invent it nor splice it into another key.
+      for (const e of emitted.entries) {
+        if (e.lines.some((line) => line.trim() === '')) {
+          const hasExactSource = carriedEntries.some(
+            (source) => source.key === e.key && source.lines.join('\n') === e.lines.join('\n'),
+          )
+
+          expect([where, e.key, hasExactSource]).toEqual([where, e.key, true])
+        }
+      }
+
+      // (2) Every scalar field WE emit stays on one line, so nothing can escape its
+      // key and terminate the block early. Author-owned multiline entries are carry.
+      for (const key of ['title', 'notarium-id', 'created', 'tags']) {
+        const e = emitted.entries.find((x) => x.key === key)
+
+        if (e && key !== 'tags') {
+          expect([where, key, e.lines.length]).toEqual([where, key, 1])
+        }
+      }
+
+      // (3) every AUTHOR key we could read before the write is still readable after
+      // it, with the same value. This is the one that catches a silent deletion —
+      // whatever we do to our own fields, the author's data may not change meaning.
+      // Keyed by the LAST occurrence: the merge is last-wins (so is YAML's), so a
+      // source that states a key twice is judged by the copy that survives.
+      const OURS = new Set(['title', 'tags', 'notarium-id', 'created'])
+      const lastOf = new Map<string, (typeof carriedEntries)[number]>()
+
+      for (const e of carriedEntries) {
+        if (e.key && !OURS.has(e.key)) {
+          lastOf.set(e.key, e)
+        }
+      }
+      for (const [key, e] of lastOf) {
+        const before = frontmatterEntryValue(e)
+
+        if (before != null) {
+          expect([where, key, parsed.frontmatter[key]]).toEqual([where, key, before])
+        }
+      }
+
+      // (4) a re-save is a fixpoint — the file must stop changing.
+      const again = serializeNoteFile({ ...input, frontmatter: undefined, existingRaw: file })
+      expect([where, again]).toEqual([where, file])
+      expect([where, parseNoteFile(again, 'note.md').title]).toEqual([where, parsed.title])
+
+      // (5) the IMPORT leg: dropping our own exported file back in must reproduce the
+      // same note and must not stack another copy of the storage heading.
+      // (`.trim()` because the write chokepoint trims every title, so edge
+      // whitespace is not a state a note can actually be in — the importer agreeing
+      // with promoteBodyTitle here is the correct reading, not a divergence.)
+      const reimported = markdownFileToNote(file, 'note.md')
+      expect([where, reimported.title]).toEqual([where, parsed.title.trim()])
+      expect([where, reimported.body.startsWith('# ')]).toEqual([where, false])
+    }
   })
 })

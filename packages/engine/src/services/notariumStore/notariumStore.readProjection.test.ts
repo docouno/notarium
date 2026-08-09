@@ -3,6 +3,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 
+import { FRONTMATTER_BYTE_CAP, FrontmatterLimitError, parseFrontmatterBlock } from '@notarium/core'
+
 import { createNotariumStore } from './createNotariumStore'
 
 // #222: the read/reconcile path must project only the columns each surface uses —
@@ -232,6 +234,47 @@ describe('NotariumStore read/reconcile projection (#222)', () => {
       expect(
         delta.upserts.every((u) => typeof u.content === 'string' && u.content.length > 0),
       ).toBe(true)
+    } finally {
+      await store.stop()
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects a final over-cap frontmatter payload before mutating the source file', async () => {
+    const root = await fs.mkdtemp(join(tmpdir(), 'nstore-proj-'))
+    const store = createNotariumStore({ notesDir: root })
+    const before = `---\npad: ${'a'.repeat(FRONTMATTER_BYTE_CAP - 8)}\n---\n\n# T\n\nbefore`
+
+    try {
+      await write(root, 'near.md', before)
+      await store.list()
+
+      await expect(
+        store.write({ originalId: 'near.md', title: 'T', content: 'after' }),
+      ).rejects.toBeInstanceOf(FrontmatterLimitError)
+      expect(await fs.readFile(join(root, 'near.md'), 'utf8')).toBe(before)
+      expect((await store.read('near.md')).content).toBe('before')
+    } finally {
+      await store.stop()
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('resolves createdAt for an ordinary create without inventing authored date metadata', async () => {
+    const root = await fs.mkdtemp(join(tmpdir(), 'nstore-proj-'))
+    const store = createNotariumStore({ notesDir: root })
+
+    try {
+      const result = await store.write({ title: 'Fresh note', content: 'body' })
+      const detail = await store.read(result.filePath!)
+      const raw = await fs.readFile(join(root, result.filePath!), 'utf8')
+      const keys = parseFrontmatterBlock(raw)!.entries.map((entry) => entry.key)
+
+      expect(detail.createdAt).toMatch(/^\d{4}-\d\d-\d\dT/)
+      expect(detail.frontmatter).not.toHaveProperty('created')
+      expect(detail.frontmatter).not.toHaveProperty('notarium-created')
+      expect(keys).not.toContain('created')
+      expect(keys).not.toContain('notarium-created')
     } finally {
       await store.stop()
       await fs.rm(root, { recursive: true, force: true })

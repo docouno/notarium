@@ -12,6 +12,7 @@
 import type {
   ExportEntry,
   FolderAlias,
+  FrontmatterEntry,
   GhostStub,
   Graph,
   GraphHealth,
@@ -39,6 +40,7 @@ import {
   classesForScope,
   collectPreviews,
   computeVersionToken,
+  CREATED_FALLBACK_FRONTMATTER_KEY,
   decodeWikilinkIdentity,
   DEFAULT_NOTE_TYPE,
   deriveNoteEdges,
@@ -47,8 +49,12 @@ import {
   effectiveSlug,
   enrichGraph,
   FOLDER_PAGE_BASENAME,
+  frontmatterEntryValue,
+  frontmatterHasYamlNodeReferences,
+  frontmatterScalar,
   IF_EXISTS,
   isCanonicalSafeRelativeAddress,
+  isDurableFrontmatter,
   isDurableScalar,
   isDurableText,
   isFolderPageNote,
@@ -58,14 +64,18 @@ import {
   isValidNoteId,
   isVisibleOn,
   isWikilinkIdentityTarget,
+  isWithinFrontmatterByteCap,
   liveSyncStatus,
   makeSnippet,
   nextAliasesMulti,
+  normAliases,
   normalizeWikilinkTarget,
   normTags,
   NOTE_ID_FRONTMATTER_KEY,
   noteAlreadyExists,
   noteNotFound,
+  parseFrontmatterBlock,
+  parseFrontmatterLines,
   resolveLink,
   shapeGraph,
   storedSlug,
@@ -88,6 +98,9 @@ import {
   sluggedNoteName,
 } from '@notarium/core'
 import type { StoreSnapshot } from './types'
+
+const YAML_NODE_REFERENCE_WRITE_ERROR =
+  'frontmatter with YAML anchors or aliases is not supported by writes'
 
 type StoredNote = {
   id: string
@@ -115,8 +128,18 @@ type StoredNote = {
    *  read().frontmatter.muted. undefined/false = the category loads into the
    *  profile; true = the human muted it (audit-only). */
   muted?: boolean
+  /** Frontmatter the note ARRIVED with that this store models no field for
+   *  (#280) — an imported file's own keys, kept as raw entries. The real engine
+   *  keeps them by merging into the file's block; the fake has no file, so it
+   *  carries them here and serves them back through read().frontmatter and the
+   *  export reconstruction — the same keys, the same place. */
+  carried?: FrontmatterEntry[]
   modifiedAt: string | null
   createdAt: string | null
+  /** Whether the resolved creation date owns a typed YAML projection. Raw
+   *  `created:` remains in `carried` and needs no second emission; a store-clock
+   *  fallback has no authored claim at all. */
+  createdProjected: boolean
 }
 
 const stripMd = (p: string) => p.replace(/\.md$/, '')
@@ -149,14 +172,164 @@ export const deterministicNoteId = (filePath: string): string => {
   return `fake-${lossless ? ascii : `${ascii ? `${ascii}-` : ''}${shortHash(name)}`}`
 }
 
-/** Minimal YAML-safe scalar for the fake's export reconstruction (#17): quote
- *  when the raw form would parse as something else. A trimmed-down twin of the
- *  engine's serializeNoteFile fmScalar — enough to keep a title with a colon
- *  re-parseable, not a full YAML emitter (the fake is a behaviour spec). */
-const fmScalar = (v: string): string =>
-  /(^\s|\s$|: |#|^["'&*?|>%@`!-]|: *$)/.test(v) || v === ''
-    ? `"${v.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
-    : v
+/** YAML-safe scalar for the fake's export reconstruction (#17) — core's emitter,
+ *  the SAME one the real engine serializes files with. It used to be a
+ *  trimmed-down twin here; sharing it is what keeps the two stands from quoting
+ *  an exotic title differently. */
+const fmScalar = frontmatterScalar
+
+const carriedEntry = (
+  carried: readonly FrontmatterEntry[] | undefined,
+  key: string,
+): FrontmatterEntry | undefined => {
+  for (let i = (carried?.length ?? 0) - 1; i >= 0; i--) {
+    if (carried![i].key === key) {
+      return carried![i]
+    }
+  }
+
+  return undefined
+}
+
+type CarriedField<T> = { present: boolean; value: T }
+
+const carriedField = <T>(
+  carried: readonly FrontmatterEntry[] | undefined,
+  key: string,
+  project: (value: unknown) => T,
+): CarriedField<T> => {
+  const entry = carriedEntry(carried, key)
+  return {
+    present: entry !== undefined,
+    value: project(entry ? frontmatterEntryValue(entry) : undefined),
+  }
+}
+
+const cloneEntry = (entry: FrontmatterEntry): FrontmatterEntry => ({
+  key: entry.key,
+  lines: [...entry.lines],
+})
+
+/** Mirror serializeNoteFile's existing ∪ incoming merge in a store that has no
+ *  file to merge into. Linear in the number of entries: incoming keyed entries
+ *  replace and collapse every old duplicate (the last incoming value wins),
+ *  absent keys carry forward, and keyless entries dedupe only against the
+ *  pre-existing file. Two identical comments in ONE source are authored twice and
+ *  survive; sending that same source again does not append two more. */
+const mergeCarried = (
+  existing: readonly FrontmatterEntry[] | undefined,
+  incoming: readonly FrontmatterEntry[] | undefined,
+): FrontmatterEntry[] | undefined => {
+  if (incoming === undefined) {
+    return existing?.map(cloneEntry)
+  }
+  const incomingByKey = new Map<string, FrontmatterEntry>()
+  const incomingKeyOrder: string[] = []
+  const preExistingKeyless = new Set(
+    (existing ?? []).filter((entry) => entry.key === null).map((entry) => entry.lines[0]),
+  )
+  const newKeyless: FrontmatterEntry[] = []
+
+  for (const raw of incoming) {
+    const entry = cloneEntry(raw)
+
+    if (entry.key !== null) {
+      if (!incomingByKey.has(entry.key)) {
+        incomingKeyOrder.push(entry.key)
+      }
+      incomingByKey.set(entry.key, entry) // duplicate inside the source: last wins
+    } else if (!preExistingKeyless.has(entry.lines[0])) {
+      newKeyless.push(entry) // do NOT dedupe two identical lines from this source
+    }
+  }
+
+  const entries: FrontmatterEntry[] = []
+  const placed = new Set<string>()
+
+  for (const raw of existing ?? []) {
+    if (raw.key !== null && incomingByKey.has(raw.key)) {
+      if (!placed.has(raw.key)) {
+        entries.push(incomingByKey.get(raw.key)!)
+        placed.add(raw.key)
+      }
+      continue // collapse every later existing duplicate of an incoming key
+    }
+    entries.push(cloneEntry(raw))
+  }
+  for (const key of incomingKeyOrder) {
+    if (!placed.has(key)) {
+      entries.push(incomingByKey.get(key)!)
+    }
+  }
+
+  const merged = [...newKeyless, ...entries]
+  return merged.length ? merged : undefined
+}
+
+const withoutCarriedKey = (
+  carried: FrontmatterEntry[] | undefined,
+  key: string,
+): FrontmatterEntry[] | undefined => {
+  const next = carried?.filter((entry) => entry.key !== key)
+  return next?.length ? next : undefined
+}
+
+const frontmatterDate = (value: unknown): string | null => {
+  if (typeof value !== 'string' || !value.trim()) {
+    return null
+  }
+  const date = new Date(value.trim())
+  return Number.isNaN(date.getTime()) ? null : date.toISOString()
+}
+
+const carriedCreated = (carried: readonly FrontmatterEntry[] | undefined) => {
+  const authored = carriedField(carried, 'created', frontmatterDate)
+  const fallback = carriedField(carried, CREATED_FALLBACK_FRONTMATTER_KEY, frontmatterDate)
+
+  return {
+    present: authored.present || fallback.present,
+    value: authored.value ?? fallback.value,
+    /** The author's `created:` is present but cannot provide a date. Keep it raw;
+     *  the resolved mtime/date then needs the reserved sibling key. */
+    conflict: authored.present && authored.value === null,
+  }
+}
+
+/** The typed fields the real engine RE-DERIVES from a file's frontmatter when it
+ *  reads it back (parseNoteFile): imported aliases/slug/tags/type and the fake's
+ *  summary/muted projections are live because the keys land in the FILE. The fake
+ *  has no file to re-read, so it derives the same projections off the carried
+ *  entries itself — otherwise an imported alias would resolve on one stand and
+ *  not the other (docs/import.md).
+ *
+ *  Both entry points must run it, and that is the whole reason it is a function:
+ *  `write()` (a live import) and `load()` (a seeded fixture) produce the same note
+ *  from the same keys. Skipping it on either side is silent DATA LOSS, not just a
+ *  divergence — the export reconstruction drops a carried line whenever the typed
+ *  field is about to re-emit it, so an underived field means the key is gone. */
+const carriedTyped = (carried: readonly FrontmatterEntry[] | undefined) => {
+  const createdAt = carriedCreated(carried)
+
+  return {
+    aliases: carriedField(carried, 'aliases', (value) => normAliases(value) ?? []),
+    slug: carriedField(
+      carried,
+      'slug',
+      (value) => (typeof value === 'string' ? slug(value) : '') || undefined,
+    ),
+    tags: carriedField(carried, 'tags', (value) => normTags(value) ?? []),
+    noteType: carriedField(carried, 'type', (value) =>
+      typeof value === 'string' && value.trim() ? value.trim() : DEFAULT_NOTE_TYPE,
+    ),
+    summary: carriedField(carried, 'summary', (value) =>
+      typeof value === 'string' && value ? value : undefined,
+    ),
+    muted: carriedField(carried, 'muted', (value) =>
+      value === true || value === 'true' ? true : undefined,
+    ),
+    createdAt,
+  }
+}
 
 const moveFailed = (detail: string): StoreError => {
   const err = new StoreError(`# Move Failed: ${detail}`)
@@ -226,21 +399,110 @@ export class InMemoryStore implements KnowledgeStore {
     const next: StoredNote[] = []
 
     for (const n of snapshot.notes) {
-      next.push({
+      // #280: an imported note's own keys, authored as bare YAML lines. The typed
+      // fields the file's frontmatter would give the real engine are derived here,
+      // exactly as write() derives them — a seeded imported note and a live-imported
+      // one must be the same note.
+      if (n.frontmatter !== undefined && typeof n.frontmatter !== 'string') {
+        throw writeFailed('snapshot frontmatter contains an invalid durable string')
+      }
+      const withinByteCap = n.frontmatter === undefined || isWithinFrontmatterByteCap(n.frontmatter)
+      const hasBareFence = Boolean(
+        withinByteCap && n.frontmatter && /(?:^|\n)---[ \t]*(?=\r?(?:\n|$))/.test(n.frontmatter),
+      )
+      const parsedCarried =
+        withinByteCap && n.frontmatter ? parseFrontmatterLines(n.frontmatter) : undefined
+
+      // load() is a bare-engine ingress just like write(): fixture text is parsed
+      // into the same raw-entry channel and must pass the same durability/shape
+      // fence. Check the bare source delimiter too — parseFrontmatterLines would
+      // otherwise treat an injected `---` as its wrapper's early close and hide
+      // every poisoned line after it from the entry validator.
+      if (!withinByteCap || hasBareFence || !isDurableFrontmatter(parsedCarried)) {
+        throw writeFailed('snapshot frontmatter contains an invalid durable string')
+      }
+      // A real file is normalised by serialize/parse before it reaches the live
+      // view. Mirror that on fixtures too: duplicate keyed entries collapse with
+      // the last authored value winning, including an unreadable last shape.
+      // Existing reference-bearing files are the exception: writes refuse them,
+      // while read/export must preserve their ordered anchor graph. Collapsing a
+      // duplicate or removing an explicit snapshot field's raw owner can leave a
+      // later alias dangling, so clone these entries without normalising them.
+      const hasYamlNodeReferences = frontmatterHasYamlNodeReferences(parsedCarried)
+      const importedCarried = hasYamlNodeReferences
+        ? parsedCarried?.map(cloneEntry)
+        : mergeCarried(undefined, parsedCarried)
+      // Explicit snapshot fields model the serializer's final typed puts/drops.
+      // Remove every raw shadow even for clears, or a later export/write would
+      // revive the value the typed channel deliberately removed.
+      const snapshotOwnedKeys = new Set(
+        [
+          ['type', n.noteType],
+          ['tags', n.tags],
+          ['aliases', n.aliases],
+          ['slug', n.slug],
+          ['summary', n.summary],
+          ['muted', n.muted],
+        ]
+          .filter(([, value]) => value !== undefined)
+          .map(([key]) => key as string),
+      )
+      let carried = hasYamlNodeReferences
+        ? importedCarried
+        : importedCarried?.filter((entry) => !entry.key || !snapshotOwnedKeys.has(entry.key))
+
+      if (n.createdAt != null && !hasYamlNodeReferences) {
+        // A concrete snapshot date is the serializer's final typed write. It
+        // replaces a readable raw `created:` and every old fallback. The one
+        // exception mirrors noteFile: an unreadable authored `created:` remains
+        // verbatim and the resolved date is projected under the reserved key.
+        if (!carriedCreated(carried).conflict) {
+          carried = withoutCarriedKey(carried, 'created')
+        }
+        carried = withoutCarriedKey(carried, CREATED_FALLBACK_FRONTMATTER_KEY)
+      }
+      const fromCarry = carriedTyped(carried)
+      const candidate: StoredNote = {
         id: n.id || this.deriveId(n.filePath, (id) => next.some((m) => m.id === id)),
         title: n.title,
         class: n.class ?? 'user-doc',
         filePath: n.filePath,
         modifiedAt: n.modifiedAt ?? null,
-        createdAt: n.createdAt ?? null,
+        createdAt: n.createdAt ?? (fromCarry.createdAt.present ? fromCarry.createdAt.value : null),
+        createdProjected: n.createdAt != null,
         content: n.content || '',
-        noteType: n.noteType || DEFAULT_NOTE_TYPE,
-        tags: n.tags || [],
-        aliases: n.aliases || [],
-        slug: n.slug || undefined, // #100 phase 1: custom slug only
-        summary: n.summary,
-        muted: n.muted || undefined, // #165: only the truthy flag rides
-      })
+        noteType:
+          n.noteType !== undefined
+            ? n.noteType && n.noteType !== DEFAULT_NOTE_TYPE
+              ? n.noteType
+              : DEFAULT_NOTE_TYPE
+            : fromCarry.noteType.present
+              ? fromCarry.noteType.value
+              : DEFAULT_NOTE_TYPE,
+        tags: n.tags ?? (fromCarry.tags.present ? fromCarry.tags.value : []),
+        aliases: n.aliases ?? (fromCarry.aliases.present ? fromCarry.aliases.value : []),
+        slug:
+          n.slug !== undefined
+            ? n.slug || undefined
+            : fromCarry.slug.present
+              ? fromCarry.slug.value
+              : undefined, // #100 phase 1: custom slug only
+        summary:
+          n.summary !== undefined
+            ? n.summary || undefined
+            : fromCarry.summary.present
+              ? fromCarry.summary.value
+              : undefined,
+        muted:
+          n.muted !== undefined
+            ? n.muted || undefined
+            : fromCarry.muted.present
+              ? fromCarry.muted.value
+              : undefined, // #165: only the truthy flag rides
+        carried,
+      }
+      this.assertExportable(candidate)
+      next.push(candidate)
     }
     this.notes = next
     // A re-seed is a clean slate: no lingering/explicit empty dirs, just the
@@ -415,6 +677,30 @@ export class InMemoryStore implements KnowledgeStore {
     // real engine, where read() strips frontmatter before the token.
     const frontmatter: Record<string, unknown> = {}
 
+    // The author's own keys first (#280) — ours below override, exactly the order
+    // serializeNoteFile merges them in, so the same note reads back the same map
+    // on both engines. The note's OWN identity and title are never the carry's to
+    // state: the real engine's put() replaces them by key, so a carried copy could
+    // never win there either.
+    for (const e of n.carried ?? []) {
+      if (
+        !e.key ||
+        e.key === 'title' ||
+        e.key === NOTE_ID_FRONTMATTER_KEY ||
+        e.key === CREATED_FALLBACK_FRONTMATTER_KEY
+      ) {
+        continue
+      }
+      const v = frontmatterEntryValue(e)
+
+      if (v != null) {
+        frontmatter[e.key] = v
+      } else {
+        // YAML and the importer are last-wins. An unsupported final occurrence
+        // must clear a readable earlier projection instead of resurrecting it.
+        delete frontmatter[e.key]
+      }
+    }
     if (n.noteType && n.noteType !== DEFAULT_NOTE_TYPE) {
       frontmatter.type = n.noteType
     }
@@ -439,6 +725,10 @@ export class InMemoryStore implements KnowledgeStore {
     // same way it runs against prod (no fake↔prod type drift).
     if (n.muted) {
       frontmatter.muted = 'true'
+    }
+    if (n.createdAt && n.createdProjected) {
+      const created = carriedCreated(n.carried)
+      frontmatter[created.conflict ? CREATED_FALLBACK_FRONTMATTER_KEY : 'created'] = n.createdAt
     }
 
     return {
@@ -481,28 +771,99 @@ export class InMemoryStore implements KnowledgeStore {
   /** Reconstruct a note's file bytes from the snapshot (#17 export). */
   private fileBytesOf(n: StoredNote): string {
     const body = stripTitleHeading(n.content, n.title)
-    const lines = [`${NOTE_ID_FRONTMATTER_KEY}: ${n.id}`, `title: ${fmScalar(n.title)}`]
+    // A readable carried entry is still the authored owner of its key. Its typed
+    // projection powers list/read/resolution, but must not rewrite the raw YAML on
+    // export: besides losing the author's shape, canonical block expansion can
+    // turn a compact, valid sub-limit flow collection into an oversized payload.
+    // Explicit typed channels already remove their key from `carried`, at which
+    // point the canonical projection below becomes the owner and is emitted.
+    const isCarried = (key: string): boolean => carriedEntry(n.carried, key) !== undefined
+    // Existing external files may contain anchors even though all mutations of
+    // them are refused below. Export is read-only and must not delete an anchored
+    // system entry: doing so would leave its aliases dangling. Where the raw carry
+    // already owns a system key, keep that entry; otherwise fill the key normally.
+    const hasYamlNodeReferences = frontmatterHasYamlNodeReferences(n.carried)
+    const preservesReferencedKey = (key: string): boolean => hasYamlNodeReferences && isCarried(key)
+    // The TYPED fields, collected before anything is emitted — because the carry is
+    // then filtered by the keys these actually occupy. That mirrors the real
+    // serializer, whose `put` replaces an entry BY KEY: a key we emit must appear
+    // once, and a key we do NOT emit (an empty `tags:`, an `aliases:` whose shape
+    // carriedTyped could not read) must keep the author's own lines rather than
+    // vanish. Deriving the filter from the emitted set — instead of a hand-kept
+    // list — is what stops the next typed field from silently reintroducing either
+    // a duplicate line or a deletion (#280, both caught in review).
+    const typed: Array<{ key: string; lines: string[] }> = []
 
-    if (n.noteType && n.noteType !== DEFAULT_NOTE_TYPE) {
-      lines.push(`type: ${fmScalar(n.noteType)}`)
+    if (!isCarried('type') && n.noteType && n.noteType !== DEFAULT_NOTE_TYPE) {
+      typed.push({ key: 'type', lines: [`type: ${fmScalar(n.noteType)}`] })
     }
-    if (n.tags.length) {
-      lines.push('tags:', ...n.tags.map((t) => `- ${fmScalar(t)}`))
+    if (!isCarried('tags') && n.tags.length) {
+      typed.push({ key: 'tags', lines: ['tags:', ...n.tags.map((t) => `- ${fmScalar(t)}`)] })
     }
-    if (n.aliases.length) {
-      lines.push('aliases:', ...n.aliases.map((a) => `- ${fmScalar(a)}`))
+    if (!isCarried('aliases') && n.aliases.length) {
+      typed.push({
+        key: 'aliases',
+        lines: ['aliases:', ...n.aliases.map((a) => `- ${fmScalar(a)}`)],
+      })
     }
-    if (n.slug) {
-      lines.push(`slug: ${fmScalar(n.slug)}`)
+    if (!isCarried('slug') && n.slug) {
+      typed.push({ key: 'slug', lines: [`slug: ${fmScalar(n.slug)}`] })
     }
-    if (n.summary) {
-      lines.push(`summary: ${fmScalar(n.summary)}`)
+    if (!isCarried('summary') && n.summary) {
+      typed.push({ key: 'summary', lines: [`summary: ${fmScalar(n.summary)}`] })
     }
-    if (n.muted) {
-      lines.push('muted: true')
+    if (!isCarried('muted') && n.muted) {
+      typed.push({ key: 'muted', lines: ['muted: true'] })
     }
-    const head = `---\n${lines.join('\n')}\n---\n\n# ${n.title}\n`
+    if (n.createdAt && n.createdProjected) {
+      const created = carriedCreated(n.carried)
+      const key = created.conflict ? CREATED_FALLBACK_FRONTMATTER_KEY : 'created'
+
+      if (!isCarried(key)) {
+        typed.push({ key, lines: [`${key}: ${fmScalar(n.createdAt)}`] })
+      }
+    }
+    // EVERY key this reconstruction writes — including the normally unconditional
+    // system keys. Deriving the filter from anything narrower is how a carried
+    // `title:` got emitted a second time, after ours and therefore won a re-read.
+    const emitted = new Set([
+      ...(preservesReferencedKey(NOTE_ID_FRONTMATTER_KEY) ? [] : [NOTE_ID_FRONTMATTER_KEY]),
+      ...(preservesReferencedKey(CREATED_FALLBACK_FRONTMATTER_KEY)
+        ? []
+        : [CREATED_FALLBACK_FRONTMATTER_KEY]),
+      ...(preservesReferencedKey('title') ? [] : ['title']),
+      ...typed.map((e) => e.key),
+    ])
+    // The author's own keys ride along verbatim (#280) — an export of an imported
+    // note must give the file back with the frontmatter it came in with.
+    const carried = (n.carried ?? []).filter((e) => !e.key || !emitted.has(e.key))
+    const keylessLines = carried.filter((e) => !e.key).flatMap((e) => e.lines)
+    const carriedLines = carried.filter((e) => e.key).flatMap((e) => e.lines)
+    const lines = [
+      // Same safety rule as serializeNoteFile: an indented/`- ` passthrough at
+      // the back would become the preceding typed key's continuation on re-read.
+      ...keylessLines,
+      ...(preservesReferencedKey(NOTE_ID_FRONTMATTER_KEY)
+        ? []
+        : [`${NOTE_ID_FRONTMATTER_KEY}: ${n.id}`]),
+      ...(preservesReferencedKey('title') ? [] : [`title: ${fmScalar(n.title)}`]),
+      ...carriedLines,
+      ...typed.flatMap((e) => e.lines),
+    ]
+    const payload = lines.join('\n')
+
+    if (!isWithinFrontmatterByteCap(`${payload}\n`)) {
+      throw writeFailed('frontmatter exceeds the 64 KiB limit')
+    }
+    const head = `---\n${payload}\n---\n\n# ${n.title}\n`
     return body ? `${head}\n${body}` : head
+  }
+
+  /** Validate a candidate's complete reconstructed YAML before it can replace
+   *  live state. Carry alone may fit the cap while title/id/typed metadata push
+   *  the final file over it; export-time rejection would be too late. */
+  private assertExportable(n: StoredNote): void {
+    this.fileBytesOf(n)
   }
 
   /** Derived live from the in-memory body — this store IS its own cache. */
@@ -614,6 +975,7 @@ export class InMemoryStore implements KnowledgeStore {
     fileName,
     legacyImportRoot,
     createdAt,
+    frontmatter,
   }: WriteInput): Promise<WriteResult> {
     const scalarInputs = [title, directory, noteType, rawSlug, summary, fileName, createdAt]
     const tagInputs = Array.isArray(tags) ? tags : tags != null ? [tags] : []
@@ -622,6 +984,7 @@ export class InMemoryStore implements KnowledgeStore {
       scalarInputs.some((value) => value != null && !isDurableScalar(value)) ||
       tagInputs.some((value) => !isDurableScalar(value)) ||
       !isDurableText(content) ||
+      !isDurableFrontmatter(frontmatter) ||
       (id != null && !isValidNoteId(id)) ||
       (originalId != null &&
         !isValidNoteId(originalId) &&
@@ -642,29 +1005,129 @@ export class InMemoryStore implements KnowledgeStore {
     if (!validDirectory) {
       throw writeFailed('directory must be safe with portable new components')
     }
+    // Keep this lazy: collision and CAS errors are the caller's primary contract
+    // and must win before the semantic frontmatter refusal. The real serializer
+    // also treats a leading frontmatter block in `body` as incoming metadata, so
+    // the fake must reject references there even though it need not implement the
+    // real engine's general inline-frontmatter merge for this safety fence.
+    const incomingHasYamlNodeReferences = (): boolean =>
+      frontmatterHasYamlNodeReferences(frontmatter) ||
+      frontmatterHasYamlNodeReferences(parseFrontmatterBlock(content)?.entries)
     // Carry-forward semantics matching the real engine's serializeNoteFile: an
     // UNDEFINED field leaves the note's existing value untouched (the semantic
     // ops re-send what they read, #21 — a write that omitted them would wrongly
     // clear them); a provided value sets it. `tags: []` still clears (an explicit
     // empty), and `summary: ''` clears too — mirroring serializeNoteFile's
     // drop-on-empty so the two engines read back identically.
-    const tagsFor = (prev: string[]): string[] =>
-      tags === undefined ? prev : (normTags(tags) ?? [])
-    const summaryFor = (prev: string | undefined): string | undefined =>
-      summary === undefined ? prev : summary || undefined
+    const summaryFor = (
+      prev: string | undefined,
+      carried: ReturnType<typeof carriedTyped>,
+    ): string | undefined =>
+      summary !== undefined
+        ? summary || undefined
+        : carried.summary.present
+          ? carried.summary.value
+          : prev
     // The muted opt-out (#165), tags/summary-parity: undefined carries the note's
     // existing flag forward (a write that omitted it would wrongly un-mute), true
     // sets it, false clears it (an explicit un-mute drops the frontmatter entry).
-    const mutedFor = (prev: boolean | undefined): boolean | undefined =>
-      muted === undefined ? prev : muted || undefined
+    const mutedFor = (
+      prev: boolean | undefined,
+      carried: ReturnType<typeof carriedTyped>,
+    ): boolean | undefined =>
+      muted !== undefined ? muted || undefined : carried.muted.present ? carried.muted.value : prev
 
-    // The note's stored slug after this write (#100 phase 1): storedSlug cleans + keeps
-    // it only when it diverges from slug(title); undefined leaves prev untouched,
-    // '' clears back to the implicit default. Mirrors the real engine's slugChannel.
-    const slugFor = (prev: string | undefined): string | undefined => {
-      const ch = storedSlug(rawSlug, title)
-      return ch === undefined ? prev : ch || undefined
+    const createdAtFor = (
+      prev: string | null,
+      carried: ReturnType<typeof carriedTyped>,
+    ): string | null =>
+      createdAt !== undefined
+        ? createdAt
+        : carried.createdAt.present
+          ? (carried.createdAt.value ?? prev)
+          : prev
+
+    const carriedStateFor = (prev: FrontmatterEntry[] | undefined) => {
+      const merged = mergeCarried(prev, frontmatter)
+      return { merged, typed: carriedTyped(merged) }
     }
+    const preserveIncomingUnreadableCreated =
+      createdAt !== undefined && carriedCreated(frontmatter).conflict
+
+    const createdProjectionFor = (previous: boolean): boolean => {
+      if (createdAt !== undefined) {
+        return true
+      }
+      // An incoming raw date replaces an earlier typed date exactly as it does in
+      // the real serializer. It remains byte-lines in carry; canonical projection
+      // resumes only after a later explicit createdAt write.
+      if (frontmatter !== undefined && carriedCreated(frontmatter).present) {
+        return false
+      }
+
+      return previous
+    }
+
+    const carriedAfterTypedChannels = (
+      merged: FrontmatterEntry[] | undefined,
+      aliasesOwned: boolean,
+    ): FrontmatterEntry[] | undefined => {
+      let carried = merged
+
+      // The real serializer's typed puts/drops happen LAST. Once one replaced a
+      // carried key, the old raw entry is gone from the file and must not lurk in
+      // the fake only to reappear after a later clear.
+      if (noteType !== undefined) {
+        carried = withoutCarriedKey(carried, 'type')
+      }
+      if (tags !== undefined) {
+        carried = withoutCarriedKey(carried, 'tags')
+      }
+      if (rawSlug !== undefined) {
+        carried = withoutCarriedKey(carried, 'slug')
+      }
+      if (aliasesOwned) {
+        carried = withoutCarriedKey(carried, 'aliases')
+      }
+      if (summary !== undefined) {
+        carried = withoutCarriedKey(carried, 'summary')
+      }
+      if (muted !== undefined) {
+        carried = withoutCarriedKey(carried, 'muted')
+      }
+      if (createdAt !== undefined) {
+        if (!preserveIncomingUnreadableCreated) {
+          carried = withoutCarriedKey(carried, 'created')
+        }
+        carried = withoutCarriedKey(carried, CREATED_FALLBACK_FRONTMATTER_KEY)
+      }
+
+      return carried
+    }
+    const noteTypeFor = (prev: string, carried: ReturnType<typeof carriedTyped>): string =>
+      noteType !== undefined
+        ? noteType && noteType !== DEFAULT_NOTE_TYPE
+          ? noteType
+          : DEFAULT_NOTE_TYPE
+        : carried.noteType.present
+          ? carried.noteType.value
+          : prev
+    const tagsFor = (prev: string[], carried: ReturnType<typeof carriedTyped>): string[] =>
+      tags !== undefined ? (normTags(tags) ?? []) : carried.tags.present ? carried.tags.value : prev
+
+    const slugFor = (
+      prev: string | undefined,
+      carried: ReturnType<typeof carriedTyped>,
+    ): string | undefined => {
+      const channel = storedSlug(rawSlug, title)
+      return channel !== undefined
+        ? channel || undefined
+        : carried.slug.present
+          ? carried.slug.value
+          : prev
+    }
+    const aliasesFor = (prev: string[], carried: ReturnType<typeof carriedTyped>): string[] =>
+      carried.aliases.present ? carried.aliases.value : prev
     const norm = (d: string) => (!d || d === '/' ? '' : d.replace(/^\/+|\/+$/g, ''))
     // fileName (import #11) overrides slug(title) on create AND, opt-in, on edit (#209):
     // an edit that hands an explicit fileName keeps that basename instead of re-deriving
@@ -715,32 +1178,46 @@ export class InMemoryStore implements KnowledgeStore {
       if (filePath !== prev.filePath && this.indexByPath(filePath) !== -1) {
         throw moveFailed('a note already lives at the destination')
       }
-      const newSlug = slugFor(prev.slug)
+      if (incomingHasYamlNodeReferences() || frontmatterHasYamlNodeReferences(prev.carried)) {
+        throw new Error(YAML_NODE_REFERENCE_WRITE_ERROR)
+      }
+      const carriedState = carriedStateFor(prev.carried)
+      const newSlug = slugFor(prev.slug, carriedState.typed)
       // Alias-history (#100): a title OR slug change records the old name(s) so
       // inbound [[Old Title]] / [[old-slug]] keep resolving — mirrors the real
       // engine's write() (effective-slug comparison; nextAliasesMulti dedups).
       const prevEffSlug = effectiveSlug(prev.slug, prev.title)
-      const newEffSlug = effectiveSlug(newSlug, title)
-      this.notes[i] = {
+      // A raw carried slug is re-read only AFTER the real serializer has made its
+      // alias-history decision. Only the explicit slug channel participates in
+      // that decision; the final stored projection still comes from the carry.
+      const slugChannel = storedSlug(rawSlug, title)
+      const renameSlug = slugChannel === undefined ? prev.slug : newSlug
+      const newEffSlug = effectiveSlug(renameSlug, title)
+      const renamed = prev.title !== title || prevEffSlug !== newEffSlug
+      const nextAliases = renamed
+        ? nextAliasesMulti(prev.aliases, [prev.title, prevEffSlug], [title, newEffSlug])
+        : aliasesFor(prev.aliases, carriedState.typed)
+      const candidate: StoredNote = {
         ...prev,
         title,
         content,
-        noteType: noteType || prev.noteType,
-        tags: tagsFor(prev.tags),
-        aliases:
-          prev.title !== title || prevEffSlug !== newEffSlug
-            ? nextAliasesMulti(prev.aliases, [prev.title, prevEffSlug], [title, newEffSlug])
-            : prev.aliases,
+        noteType: noteTypeFor(prev.noteType, carriedState.typed),
+        tags: tagsFor(prev.tags, carriedState.typed),
+        aliases: nextAliases,
         slug: newSlug,
-        summary: summaryFor(prev.summary),
-        muted: mutedFor(prev.muted),
+        summary: summaryFor(prev.summary, carriedState.typed),
+        muted: mutedFor(prev.muted, carriedState.typed),
+        carried: carriedAfterTypedChannels(carriedState.merged, renamed),
         filePath,
         modifiedAt: this.nowIso,
         // Authored date edit (#186): a provided `createdAt` overwrites; undefined
         // keeps the note's existing birth date (carry-forward, mirrors the real
         // engine's serializeNoteFile SET-on-provided). `modified` always stamps now.
-        createdAt: createdAt ?? prev.createdAt,
+        createdAt: createdAtFor(prev.createdAt, carriedState.typed),
+        createdProjected: createdProjectionFor(prev.createdProjected),
       }
+      this.assertExportable(candidate)
+      this.notes[i] = candidate
       this.addDirs(filePath) // a folder change seeds the new dir (#97); the old lingers
       return {
         id: this.notes[i].id,
@@ -768,18 +1245,33 @@ export class InMemoryStore implements KnowledgeStore {
     if (existing !== -1 && ifExists !== IF_EXISTS.overwrite) {
       throw noteAlreadyExists(title)
     }
+    if (incomingHasYamlNodeReferences()) {
+      throw new Error(YAML_NODE_REFERENCE_WRITE_ERROR)
+    }
     if (existing !== -1) {
-      this.notes[existing] = {
-        ...this.notes[existing],
+      const prev = this.notes[existing]
+
+      if (frontmatterHasYamlNodeReferences(prev.carried)) {
+        throw new Error(YAML_NODE_REFERENCE_WRITE_ERROR)
+      }
+      const carriedState = carriedStateFor(prev.carried)
+      const candidate: StoredNote = {
+        ...prev,
         title,
         content,
-        noteType: noteType || this.notes[existing].noteType,
-        tags: tagsFor(this.notes[existing].tags),
-        slug: slugFor(this.notes[existing].slug),
-        summary: summaryFor(this.notes[existing].summary),
-        muted: mutedFor(this.notes[existing].muted),
+        noteType: noteTypeFor(prev.noteType, carriedState.typed),
+        tags: tagsFor(prev.tags, carriedState.typed),
+        aliases: aliasesFor(prev.aliases, carriedState.typed),
+        slug: slugFor(prev.slug, carriedState.typed),
+        summary: summaryFor(prev.summary, carriedState.typed),
+        muted: mutedFor(prev.muted, carriedState.typed),
+        carried: carriedAfterTypedChannels(carriedState.merged, false),
+        createdAt: createdAtFor(prev.createdAt, carriedState.typed),
+        createdProjected: createdProjectionFor(prev.createdProjected),
         modifiedAt: this.nowIso,
       }
+      this.assertExportable(candidate)
+      this.notes[existing] = candidate
       return {
         id: this.notes[existing].id,
         filePath,
@@ -787,6 +1279,7 @@ export class InMemoryStore implements KnowledgeStore {
         versionToken: tokenOf(this.notes[existing]),
       }
     }
+    const carriedState = carriedStateFor(undefined)
     const fresh: StoredNote = {
       id: newId,
       title,
@@ -795,17 +1288,22 @@ export class InMemoryStore implements KnowledgeStore {
       class: targetClass ?? 'user-doc',
       filePath,
       content,
-      noteType: noteType || DEFAULT_NOTE_TYPE,
-      tags: tagsFor([]),
-      aliases: [],
-      slug: slugFor(undefined),
-      summary: summaryFor(undefined),
-      muted: mutedFor(undefined),
+      noteType: noteTypeFor(DEFAULT_NOTE_TYPE, carriedState.typed),
+      tags: tagsFor([], carriedState.typed),
+      // An imported file's own `aliases:`/`slug:` are live from the first write —
+      // the real engine gets that by re-reading the file, the fake derives it here.
+      aliases: aliasesFor([], carriedState.typed),
+      slug: slugFor(undefined, carriedState.typed),
+      summary: summaryFor(undefined, carriedState.typed),
+      muted: mutedFor(undefined, carriedState.typed),
+      carried: carriedAfterTypedChannels(carriedState.merged, false),
       // Dates-as-data (#11): an import threads the original `createdAt` (the real
       // engine's `created:`-over-birthtime rule); `modified` always stamps now.
       modifiedAt: this.nowIso,
-      createdAt: createdAt ?? this.nowIso,
+      createdAt: createdAtFor(null, carriedState.typed) ?? this.nowIso,
+      createdProjected: createdAt !== undefined,
     }
+    this.assertExportable(fresh)
     this.notes.push(fresh)
     this.addDirs(filePath) // seed the note's folder into the directory channel (#97)
     return {

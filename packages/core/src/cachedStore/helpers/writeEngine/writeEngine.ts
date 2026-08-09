@@ -16,10 +16,13 @@ import {
   versionTokenRequired,
 } from '../../../knowledgeStore'
 import { IF_EXISTS, REVISION_KIND, STORE_ERROR_REASON } from '../../../knowledgeStore'
-import { nextAliasesMulti } from '../../../libs/aliases'
+import { nextAliasesMulti, normAliases } from '../../../libs/aliases'
 import { freshNoteId, isDurableScalar, isDurableText, isValidNoteId } from '../../../libs/id'
 import {
   encodeWikilinkIdentity,
+  frontmatterEntryOf,
+  frontmatterEntryValue,
+  isDurableFrontmatter,
   promoteBodyTitle,
   stripFrontmatter,
   stripTitleHeading,
@@ -35,7 +38,7 @@ import {
   noteFilePath,
   sluggedNoteName,
 } from '../../../libs/path'
-import { effectiveSlug, storedSlug } from '../../../libs/slug'
+import { effectiveSlug, slugify, storedSlug } from '../../../libs/slug'
 import { normTags } from '../../../libs/tags'
 import { computeVersionToken } from '../../../libs/versionToken'
 import { derivePreview } from '../../../snippet'
@@ -105,6 +108,9 @@ const assertWriteText = (input: WriteInput): void => {
   }
   if (input.content != null && !isDurableText(input.content)) {
     throw invalidWrite('content contains invalid Unicode or control characters')
+  }
+  if (input.frontmatter != null && !isDurableFrontmatter(input.frontmatter)) {
+    throw invalidWrite('frontmatter contains invalid raw lines')
   }
   for (const [name, value] of [
     ['id', input.id],
@@ -1150,22 +1156,50 @@ export class WriteEngine {
       this.host.identity.setCreatedAt(id, authoredCreatedAt)
     }
     const rec = this.host.identity.recordFor(id)
-    // The slug this write lands the note on, optimistic mirror of the
-    // engine: storedSlug cleans + keeps it only when custom; undefined leaves the
-    // prior slug, '' clears it. The delta poll re-reads the file's `slug:` after.
+    // Imported raw frontmatter merges above the occupied file and below typed
+    // channels. Project its final duplicate here too: the engine re-reads these
+    // values from the serialized file before the write returns, so the optimistic
+    // snapshot must not wait for a later delta to expose (or clear) them.
+    const incomingAliases = input.frontmatter
+      ? frontmatterEntryOf(input.frontmatter, 'aliases')
+      : undefined
+    const incomingSlug = input.frontmatter
+      ? frontmatterEntryOf(input.frontmatter, 'slug')
+      : undefined
+    const incomingSlugValue = incomingSlug && frontmatterEntryValue(incomingSlug)
+    const carriedAliases =
+      incomingAliases !== undefined
+        ? (normAliases(frontmatterEntryValue(incomingAliases)) ?? [])
+        : prev?.aliases
+    const carriedSlug =
+      incomingSlug !== undefined
+        ? typeof incomingSlugValue === 'string'
+          ? slugify(incomingSlugValue) || undefined
+          : undefined
+        : prev?.slug
+    // The typed slug channel is serialized last: undefined leaves the merged raw
+    // value, while a value sets it and '' clears it.
     const slugCh = storedSlug(input.slug, input.title)
-    const slug = slugCh === undefined ? prev?.slug : slugCh || undefined
+    const slug = slugCh === undefined ? carriedSlug : slugCh || undefined
     // Alias-history, optimistic mirror of the engine's write: a rename
     // (the title OR the effective slug changed) records the old name(s) so the
     // snapshot graph resolves inbound [[Old Title]] / [[old-slug]] at once, before
     // the delta poll re-reads the file. nextAliasesMulti dedups + drops the now-
     // current names (A→B→A leaves no stale self-alias).
     const prevEffSlug = prev ? effectiveSlug(prev.slug, prev.title) : undefined
-    const newEffSlug = effectiveSlug(slug, input.title)
+    // The real engine decides alias history from the addressed source row and
+    // explicit slug channel before raw incoming frontmatter is re-read. A create
+    // overwrite is not an identity rename, and an incoming raw slug alone does
+    // not retire the prior slug.
+    const renameSlug = slugCh === undefined ? prev?.slug : slug
+    const newEffSlug = effectiveSlug(renameSlug, input.title)
+    const renamed = Boolean(
+      input.originalId && prev && (prev.title !== input.title || prevEffSlug !== newEffSlug),
+    )
     const aliases =
-      prev && (prev.title !== input.title || prevEffSlug !== newEffSlug)
+      renamed && prev
         ? nextAliasesMulti(prev.aliases, [prev.title, prevEffSlug!], [input.title, newEffSlug])
-        : prev?.aliases
+        : carriedAliases
     // Tags on the optimistic snapshot: the just-saved note is tag-filterable
     // immediately, without waiting for the delta poll. Mirror the engine's write
     // semantics — `undefined` LEAVES the prior tags, a value SETS them, `[]` clears.
@@ -1186,7 +1220,9 @@ export class WriteEngine {
       // (an import seed, OR an authored date edit) — it WINS so the optimistic
       // snapshot matches what the rescan reads back from the file's `created:`. Absent:
       // keep the note's existing date (first-seen pin survives a plain body save).
-      createdAt: authoredCreatedAt ?? prev?.createdAt ?? rec?.createdAt ?? this.host.iso(),
+      createdAt:
+        authoredCreatedAt ??
+        (prev !== undefined ? prev.createdAt : (rec?.createdAt ?? this.host.iso())),
     })
     // Write-through keeps the preview warm too: the very snippet the Feed will
     // ask for next is computed here, from data the save already carried.

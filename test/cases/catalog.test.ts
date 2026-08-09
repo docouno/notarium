@@ -5,8 +5,10 @@ import {
   computeCommunities,
   deriveNoteEdges,
   type NoteMeta,
+  parseFrontmatterLines,
   shapeGraph,
 } from '@notarium/core'
+import { InMemoryStore } from '@notarium/engine-memory'
 
 import { buildCasesWorld, buildCaseWorld, DEFAULT_NOW, mergeWorlds } from './build'
 import { normDate } from './generators'
@@ -511,6 +513,144 @@ describe('seed catalog (#175)', () => {
       expect(mem.length).toBeGreaterThan(0)
       expect(mem.every((n) => typeof n.summary === 'string')).toBe(true)
       expect(mem.some((n) => n.muted === true)).toBe(true)
+    })
+
+    it('preserves absent event tags so imported carried tags are derived by the fake store', async () => {
+      const date = '2025-04-03T02:01:00.000Z'
+      const world: CaseWorld = {
+        now: date,
+        spaces: [{ slug: 'main' }],
+        events: [
+          {
+            op: 'create',
+            date,
+            space: 'main',
+            noteId: 'carried-tags',
+            path: 'carried-tags.md',
+            title: 'Carried tags',
+            content: 'body',
+            frontmatter: 'tags: [from-carry]\nauthor: S',
+          },
+        ],
+      }
+      const fixture = caseToFixture(world)
+      const snapshot = fixture.spaces[0].notes[0]
+      expect(snapshot.tags).toBeUndefined()
+
+      const store = new InMemoryStore({
+        space: fixture.spaces[0].slug,
+        now: fixture.now,
+        notes: fixture.spaces[0].notes,
+      })
+      const view = await store.read((await store.list())[0].id!)
+      expect(view.frontmatter.tags).toEqual(['from-carry'])
+    })
+
+    it('folds source aliases into rename history without losing either alias', async () => {
+      const created = '2025-04-03T02:01:00.000Z'
+      const renamed = '2025-04-04T02:01:00.000Z'
+      const world: CaseWorld = {
+        now: renamed,
+        spaces: [{ slug: 'main' }],
+        events: [
+          {
+            op: 'create',
+            date: created,
+            space: 'main',
+            noteId: 'carried-aliases',
+            path: 'carried-aliases.md',
+            title: 'Original',
+            content: 'body',
+            frontmatter: 'aliases: [Source Alias]\nauthor: S',
+          },
+          {
+            op: 'edit',
+            date: renamed,
+            space: 'main',
+            noteId: 'carried-aliases',
+            title: 'Renamed',
+          },
+        ],
+      }
+      const fixture = caseToFixture(world)
+      const snapshot = fixture.spaces[0].notes[0]
+      expect(snapshot.aliases).toEqual(['Source Alias', 'Original'])
+
+      const store = new InMemoryStore({
+        space: fixture.spaces[0].slug,
+        now: fixture.now,
+        notes: fixture.spaces[0].notes,
+      })
+      expect((await store.read('Source Alias')).title).toBe('Renamed')
+      expect((await store.read('Original')).title).toBe('Renamed')
+    })
+
+    it('does not retire a carried custom slug that remains current after a title rename', async () => {
+      const created = '2025-04-03T02:01:00.000Z'
+      const renamed = '2025-04-04T02:01:00.000Z'
+      const frontmatter = 'slug: old\nauthor: S'
+      const world: CaseWorld = {
+        now: renamed,
+        spaces: [{ slug: 'main' }],
+        events: [
+          {
+            op: 'create',
+            date: created,
+            space: 'main',
+            noteId: 'carried-slug',
+            path: 'old.md',
+            title: 'Old',
+            content: 'body',
+            frontmatter,
+          },
+          {
+            op: 'edit',
+            date: renamed,
+            space: 'main',
+            noteId: 'carried-slug',
+            title: 'New',
+          },
+        ],
+      }
+      const fixture = caseToFixture(world)
+      const snapshot = fixture.spaces[0].notes[0]
+      expect(snapshot.aliases).toEqual([])
+
+      const loaded = new InMemoryStore({
+        space: fixture.spaces[0].slug,
+        now: fixture.now,
+        notes: fixture.spaces[0].notes,
+      })
+      const live = new InMemoryStore({ space: 'main', now: created, notes: [] })
+      const createdLive = await live.write({
+        title: 'Old',
+        content: 'body',
+        fileName: 'old',
+        frontmatter: parseFrontmatterLines(frontmatter),
+      })
+      await live.write({
+        title: 'New',
+        content: 'body',
+        originalId: createdLive.id,
+        versionToken: createdLive.versionToken,
+      })
+
+      const namingView = async (store: InMemoryStore) => {
+        const view = await store.read('old')
+        return {
+          title: view.title,
+          slug: view.slug,
+          aliases: view.aliases,
+          frontmatterAliases: view.frontmatter.aliases,
+        }
+      }
+      expect(await namingView(loaded)).toEqual(await namingView(live))
+      expect(await namingView(loaded)).toEqual({
+        title: 'New',
+        slug: 'old',
+        aliases: undefined,
+        frontmatterAliases: undefined,
+      })
     })
 
     it('projects rename alias-history so a former title still resolves (#100)', () => {

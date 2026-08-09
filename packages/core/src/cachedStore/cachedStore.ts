@@ -51,6 +51,7 @@ import { isValidNoteId, NOTE_ID_FRONTMATTER_KEY } from '../libs/id'
 import {
   decodeWikilinkIdentity,
   encodeWikilinkIdentity,
+  FrontmatterLimitError,
   frontmatterValue,
   isWikilinkIdentityTarget,
   normalizeWikilinkTarget,
@@ -1035,11 +1036,20 @@ export class CachedStore implements KnowledgeStore {
         if (raw == null) {
           continue
         }
+        let claim: string | null
+
+        try {
+          claim = frontmatterValue(raw, NOTE_ID_FRONTMATTER_KEY)
+        } catch (err) {
+          if (err instanceof FrontmatterLimitError) {
+            continue
+          }
+          throw err
+        }
         // A successful raw read is authoritative even when the file has no
         // materialized claim. Failed/null reads stay unresolved so the
         // observation falls back to an engine read before journaling.
         unresolvedPaths.delete(path)
-        const claim = frontmatterValue(raw, NOTE_ID_FRONTMATTER_KEY)
 
         if (!claim || !isValidNoteId(claim)) {
           continue

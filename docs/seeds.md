@@ -127,7 +127,7 @@ and for `security` — it parses the sanitized HTML into a live DOM and checks t
 | `agent-roles` | five principals keep the boundary visible: Fresh is catalog-only; Bob owns an idle Personal fork; Maya owns switchable Personal `research`/`grooming` presets plus same-name Research Space + two Project forks; Robin can inspect the Team role read-only. Base Personal/Project pins remain visible, each placement has a distinct role pin, the Team Project role adds a set plus an oversized tail that trims under the shared `Role → Project → Personal` budget, and an active episode rehydrates `research`; Sergey remains the browsable real-stand owner | agent-roles, agent-sessions, auth, structure, scale |
 | `memory-perf` | 2700 ordinary notes + 4 personal-memory categories + 1 project-partition sentinel; reproduces memory-mount scaling, partition isolation, and graph-inert memory links | agent-memory, note-classes, scale |
 | `import-thread` | one rich imported thread | import, content |
-| `import` | a multi-format layout (claude/chatgpt/memory-json) + backdated dates-as-data → Feed year-spread (#11/#223) | import, content, activity |
+| `import` | a multi-format layout (claude/chatgpt/memory-json) + backdated dates-as-data → Feed year-spread (#11/#223); plus `dropped/` — the states of a dragged-in `.md` archive whose OWN frontmatter was lifted (#280): authored tags + date, an Obsidian note titled by its file name with `aliases:` and plugin keys kept, a Jekyll post whose `title:` beats a differing body `# H1`, and a frontmatter-less note dated by the file's mtime | import, content, activity |
 
 ## Axes and coverage
 
@@ -240,6 +240,18 @@ needed):
 | `SEED_DISPLAY_NAME` | `Admin` | display name |
 
 ## Extensibility (contract)
+
+A note declaration also carries **`frontmatter`** — the keys an IMPORTED file arrived with,
+authored as bare YAML lines without the `---` fences (#280) — so a seeded "imported note"
+keeps its author's keys instead of a seeder-only imitation of the outcome. The two appliers
+reach it by their own routes, as everywhere else: the REAL one through the production
+`WriteInput.frontmatter` channel (`scripts/seed.ts` → `store.write` → the file's own block),
+the FAKE one through `NoteSnapshot.frontmatter` → `InMemoryStore.load` (a fixture is a
+snapshot, not a replayed write). Both must land the same note, and the fake's load derives the
+same typed projections from the final carry as its write does (`type`/`tags`/`aliases`/`slug`/
+`summary`/`muted`). Explicit fixture fields have the serializer's final priority, including
+empty clears, and remove their raw shadow so it cannot reappear on export. Skipping either rule
+would make the fake disagree with the real file after import (pinned by `inMemoryStore.test.ts`).
 
 - **+content edge case** → add a `Fragment` to `corpus/<feature>.ts`. It flows on its own
   into the reader cases + the coverage matrix + the honesty test.

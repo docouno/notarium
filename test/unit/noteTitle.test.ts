@@ -6,7 +6,44 @@
 // (the dedup that closes the duplicate-h1 bug).
 
 import { describe, expect, it } from 'vitest'
-import { deriveNoteTitle, promoteBodyTitle } from '@notarium/core'
+import {
+  deriveNoteTitle,
+  headingTitle,
+  parseAtxH1Line,
+  promoteBodyTitle,
+  stripTitleHeading,
+} from '@notarium/core'
+
+describe('parseAtxH1Line — shared linear physical-line parser', () => {
+  it('accepts CommonMark H1 indentation and strips an optional closing hash run', () => {
+    expect(parseAtxH1Line('# Title')).toEqual({ title: 'Title', rawTitle: 'Title' })
+    expect(parseAtxH1Line('   # Title ###  \r')).toEqual({
+      title: 'Title',
+      rawTitle: 'Title ###',
+    })
+    expect(parseAtxH1Line('#\tTabbed')).toEqual({ title: 'Tabbed', rawTitle: 'Tabbed' })
+    expect(parseAtxH1Line('# C#')).toEqual({ title: 'C#', rawTitle: 'C#' })
+    expect(parseAtxH1Line('# ')).toEqual({ title: '', rawTitle: '' })
+  })
+
+  it('rejects indented code, a leading tab, H2 and a missing marker separator', () => {
+    expect(parseAtxH1Line('    # code')).toBeNull()
+    expect(parseAtxH1Line('\t# code')).toBeNull()
+    expect(parseAtxH1Line('## Section')).toBeNull()
+    expect(parseAtxH1Line('#No separator')).toBeNull()
+  })
+
+  it('stays linear on a large closing-hash near miss', () => {
+    const width = 20_000
+    const line = `# Title ${' '.repeat(width)}${'#'.repeat(width)}x`
+    const started = Date.now()
+    const parsed = parseAtxH1Line(line)
+
+    expect(parsed?.title.length).toBe(6 + width * 2 + 1)
+    expect(parsed?.title.endsWith('x')).toBe(true)
+    expect(Date.now() - started).toBeLessThan(500)
+  })
+})
 
 describe('promoteBodyTitle — title derivation', () => {
   it('takes the leading # H1 as the title and strips it from the body (body-first)', () => {
@@ -62,6 +99,17 @@ describe('promoteBodyTitle — title derivation', () => {
   it('CRLF: strips the H1 title line, preserves the body line endings', () => {
     expect(promoteBodyTitle('# Title\r\n\r\na\r\nb')).toEqual({ title: 'Title', body: 'a\r\nb' })
   })
+
+  it.each(['\r', '\u2028', '\u2029'])(
+    'treats %j as a physical line without normalising the body',
+    (sep) => {
+      const body = `# Title${sep}${sep}first${sep}second`
+
+      expect(headingTitle(body)).toBe('Title')
+      expect(promoteBodyTitle(body)).toEqual({ title: 'Title', body: `first${sep}second` })
+      expect(stripTitleHeading(body, 'Title')).toBe(`first${sep}second`)
+    },
+  )
 
   it('a BOM before the H1 still derives the title', () => {
     expect(promoteBodyTitle('\uFEFF# Title\n\nx')).toEqual({ title: 'Title', body: 'x' })
@@ -178,6 +226,59 @@ describe('promoteBodyTitle — never corrupts a structural / coinciding first li
     expect(promoteBodyTitle('# Title ###\n\nbody')).toEqual({ title: 'Title', body: 'body' })
     // dedup still fires for the closing-sequence form against an explicit title
     expect(promoteBodyTitle('# Title #\n\nbody', 'Title')).toEqual({ title: 'Title', body: 'body' })
+  })
+
+  it('shares 0–3-space ATX handling across derive, strip and heading-only reads', () => {
+    const body = '   # Title ###\n\nbody'
+
+    expect(headingTitle(body)).toBe('Title')
+    expect(promoteBodyTitle(body)).toEqual({ title: 'Title', body: 'body' })
+    expect(stripTitleHeading(body, 'Title')).toBe('body')
+
+    for (const structural of ['    # Title\n\nbody', '\t# Title\n\nbody']) {
+      expect(headingTitle(structural)).toBe('')
+      expect(promoteBodyTitle(structural)).toEqual({ title: '', body: structural })
+      expect(stripTitleHeading(structural, 'Title')).toBe(structural)
+    }
+  })
+
+  it('deduplicates our serialized heading when the actual title ends in `#`', () => {
+    const body = '# Sprint review #\n\nbody'
+
+    expect(promoteBodyTitle(body, 'Sprint review #')).toEqual({
+      title: 'Sprint review #',
+      body: 'body',
+    })
+    expect(stripTitleHeading(body, 'Sprint review #')).toBe('body')
+  })
+})
+
+// The heading-only subset promoteBodyTitle and the importer share (#280): the
+// importer's next fallback is the FILE NAME, so it must not take a prose first
+// line the way the editor's Bear promotion does.
+describe('headingTitle — what the body’s LEADING HEADING declares', () => {
+  it('reads an ATX H1 and a setext heading', () => {
+    expect(headingTitle('# My Note\n\nbody')).toBe('My Note')
+    expect(headingTitle('\n\n#   Padded  \n\nbody')).toBe('Padded')
+    expect(headingTitle('# Title #\n\nbody')).toBe('Title')
+    expect(headingTitle('My Title\n========\n\nbody')).toBe('My Title')
+  })
+
+  it('is EMPTY for a body that merely opens with prose — that is where they differ', () => {
+    expect(headingTitle('Buy milk\nand eggs')).toBe('')
+    expect(promoteBodyTitle('Buy milk\nand eggs').title).toBe('Buy milk')
+  })
+
+  it('is empty for structural openings and an empty body', () => {
+    expect(headingTitle('## Section\n\ntext')).toBe('')
+    expect(headingTitle('- item\n- other')).toBe('')
+    expect(headingTitle('```\ncode\n```')).toBe('')
+    expect(headingTitle('')).toBe('')
+    expect(headingTitle('# ')).toBe('')
+  })
+
+  it('looks past a leading frontmatter block, like promoteBodyTitle does', () => {
+    expect(headingTitle('---\ntype: note\n---\n# Title\n\nx')).toBe('Title')
   })
 })
 

@@ -1,4 +1,15 @@
-import { diffStats, stripFrontmatter, stripTitleHeading } from '@notarium/core'
+import {
+  diffStats,
+  effectiveSlug,
+  frontmatterEntryOf,
+  frontmatterEntryValue,
+  nextAliasesMulti,
+  normAliases,
+  parseFrontmatterLines,
+  slugify,
+  stripFrontmatter,
+  stripTitleHeading,
+} from '@notarium/core'
 import { deterministicNoteId, type NoteSnapshot } from '@notarium/engine-memory'
 import { AGENT_SYSTEM_OWNER, type AgentSessionRecord } from '@notarium/server'
 import type {
@@ -26,11 +37,15 @@ type NoteState = {
   path: string
   title: string
   content: string
-  tags: string[]
+  tags?: string[]
   noteType?: string
   class?: string
   summary?: string
   muted?: boolean
+  /** The author's own frontmatter, as bare YAML lines (#280). */
+  frontmatter?: string
+  /** Normalised custom slug derived from the author's carried `slug:`. */
+  slug?: string
   createdAt: string
   modifiedAt: string
   deleted: boolean
@@ -39,6 +54,26 @@ type NoteState = {
    *  appends the alias on the rename write). Without this the fake turned every renamed
    *  note's old title into an unintended ghost. */
   aliases: string[]
+  /** A rename makes aliases a typed serializer output. Before that, source
+   *  `aliases:` stays in the raw carry so its authored shape is preserved. */
+  aliasesOwned: boolean
+}
+
+const carriedNames = (
+  frontmatter: string | undefined,
+): { aliases: string[]; slug: string | undefined } => {
+  if (!frontmatter) {
+    return { aliases: [], slug: undefined }
+  }
+  const entries = parseFrontmatterLines(frontmatter)
+  const aliasesEntry = frontmatterEntryOf(entries, 'aliases')
+  const slugEntry = frontmatterEntryOf(entries, 'slug')
+  const slugValue = slugEntry && frontmatterEntryValue(slugEntry)
+
+  return {
+    aliases: normAliases(aliasesEntry && frontmatterEntryValue(aliasesEntry)) ?? [],
+    slug: (typeof slugValue === 'string' ? slugify(slugValue) : '') || undefined,
+  }
 }
 
 const kindOf = (op: CaseEvent['op']): NonNullable<ActivityFixture['kind']> =>
@@ -101,20 +136,24 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
     const before = cur ? journalBody(cur.content, cur.title) : ''
 
     if (e.op === 'create') {
+      const names = carriedNames(e.frontmatter)
       notes.set(e.noteId, {
         space: e.space,
         path: e.path,
         title: e.title,
         content: e.content,
-        tags: e.tags ?? [],
+        tags: e.tags,
         noteType: e.noteType,
         class: e.class && e.class !== 'user-doc' ? e.class : undefined,
         summary: e.summary,
         muted: e.muted,
+        frontmatter: e.frontmatter,
+        slug: names.slug,
         createdAt: normDate(e.date),
         modifiedAt: normDate(e.date),
         deleted: false,
-        aliases: [],
+        aliases: names.aliases,
+        aliasesOwned: false,
       })
     } else if (cur) {
       if (e.op === 'edit') {
@@ -122,7 +161,17 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
           cur.content = e.content
         }
         if (e.title !== undefined && e.title !== cur.title) {
-          cur.aliases.push(cur.title) // a rename → the former title stays a resolvable alias (#100)
+          // Start from aliases the imported file itself supplied. The real seed
+          // applier reads those from the file before computing rename history;
+          // dropping them here made the same catalog resolve differently in e2e.
+          const previousSlug = effectiveSlug(cur.slug, cur.title)
+          const nextSlug = effectiveSlug(cur.slug, e.title)
+          cur.aliases = nextAliasesMulti(
+            cur.aliases,
+            [cur.title, previousSlug],
+            [e.title, nextSlug],
+          )
+          cur.aliasesOwned = true
           cur.title = e.title
         }
         if (e.tags !== undefined) {
@@ -203,7 +252,8 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
         class: n.class as NoteSnapshot['class'],
         summary: n.summary,
         muted: n.muted,
-        aliases: n.aliases.length ? n.aliases : undefined,
+        frontmatter: n.frontmatter,
+        aliases: n.aliasesOwned ? n.aliases : undefined,
         createdAt: n.createdAt,
         modifiedAt: n.modifiedAt,
       }))

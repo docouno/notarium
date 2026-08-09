@@ -2,6 +2,7 @@
 // via the host's thin transport mappers (docs/contract.md#mappers).
 // canon: docs/architecture.md#p8
 
+import type { FrontmatterEntry } from '../libs/markdown'
 import {
   type BucketGran,
   type DateField,
@@ -438,6 +439,13 @@ export type WriteInput = {
    *  LEAVES `created:`, a string SETS/OVERWRITES; omitted = fall back to file birthtime. (No
    *  `modifiedAt` channel by design — `modified` always tracks the real mtime.) */
   createdAt?: string
+  /** Frontmatter the note ARRIVES with, host-internal (never on the wire): an imported file's
+   *  own keys, carried verbatim as raw entries so an unmodelled one (a nested map, a plugin's
+   *  field) survives (#280). Merged UNDER our typed fields — title/tags/created stay ours to
+   *  decide — and over nothing on a create. The importer strips the keys it lifts and any
+   *  `notarium-id` claim, so this cannot smuggle in an identity.
+   *  canon: docs/import.md#drag-and-drop-of-text-files-223 */
+  frontmatter?: readonly FrontmatterEntry[]
   /** Journal attribution: 'pat:<user>:<id>' (agent), 'user:<name>' (human), 'ui' (mode none). */
   principal?: string
   /** Host-built agent audit channel. It never crosses the note write wire: the owner

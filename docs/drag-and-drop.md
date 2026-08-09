@@ -560,10 +560,13 @@ a **durable import job** (`202 + Job`, tracked to terminal via `pollJobToTermina
 on a host with no job layer it answers with the synchronous NDJSON stream. Both drive
 to the same `ImportSummary`. So a drop is durable, cancelable and restart-surviving for
 free, and there is ONE import path, not two. The only DnD-specific addition on the core
-is the **`markdown` format** (`core/services/import/markdown.ts`) — a plain `.md`/`.txt`
+is the **`markdown` format** (`core/importer/formats/markdown.ts`) — a plain `.md`/`.txt`
 → one note — FORCED by the client (the extension is the signal; a markdown body can
-start with `{`/`[`, so content-detection would misfire). That format benefits every
-import surface, including a `.md` dropped into the Settings tab. See [import.md](import.md).
+start with `{`/`[`, so content-detection would misfire). That format is used by OS-file
+DnD and by programmatic callers that explicitly send `format=markdown`; the Settings
+import picker remains ZIP/JSON-only. The dropped file's own frontmatter is lifted rather
+than stripped, and its mtime dates the note when the frontmatter names no date (#280).
+See [import.md](import.md).
 
 - **Each dropped file is its own import** (#191 stages one upload per job), so a
   multi-file drop is N imports whose summaries `useFileImport` folds together for the
@@ -596,6 +599,10 @@ import surface, including a `.md` dropped into the Settings tab. See [import.md]
       folder; with a note open, in the reader → the note's folder (`test/e2e/import-dnd.spec.ts`).
 - [ ] A single-file drop opens the imported note; a multi-file drop imports all, opens none.
 - [ ] `markdown` import rides the durable job AND the sync fallback, returns `created[]`
-      (`test/fake-server/import.test.ts`); `markdownFileToNote` unit (`…/import/markdown.test.ts`):
-      H1 > filename title; frontmatter stripped; deterministic per-basename filename; BOM tolerated.
+      (`test/fake-server/import.test.ts`); `markdownFileToNote` unit (`…/importer/formats/markdown.test.ts`):
+      title `title:` > `# H1` > filename; the file's own frontmatter lifted (tags/date/type) and
+      supported plain-key entries carried as raw lines while unsupported YAML structure is rejected
+      visibly (#280); deterministic per-basename filename; BOM tolerated.
+- [ ] A drop sends the file's `lastModified`, so a frontmatter-less note is dated by the FILE,
+      not by the import moment ([import.md](import.md#dates-as-data)).
 - [ ] An internal tree move still works with the file-drag handling added (payloads disjoint).

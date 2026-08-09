@@ -32,6 +32,7 @@ import {
   freshNoteId,
   type MountConfig,
   type NoteClass,
+  parseFrontmatterLines,
 } from '@notarium/core'
 import { createNotariumStore } from '@notarium/engine'
 import {
@@ -704,6 +705,10 @@ const run = async (): Promise<void> => {
           targetClass: route.targetClass,
           summary: e.summary,
           muted: e.muted,
+          // The author's own frontmatter (#280) — the SAME write channel the
+          // importer uses, so a seeded "imported note" carries its keys the way a
+          // really-dropped file does rather than by a seeder-only shortcut.
+          frontmatter: e.frontmatter ? parseFrontmatterLines(e.frontmatter) : undefined,
           createdAt: normDate(e.date),
           principal: remapPrincipal(e.principal),
           ...(agent ? { agent } : {}),

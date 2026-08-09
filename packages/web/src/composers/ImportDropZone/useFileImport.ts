@@ -80,6 +80,10 @@ export const useFileImport = (): ImportFiles => {
               format: IMPORT_FORMAT.markdown,
               root: folder,
               skipExisting: true,
+              // The file's own mtime dates the note when its frontmatter names no
+              // date (#280) — drag in an archive and it keeps its chronology
+              // instead of landing on the Feed as one heap of "today".
+              sendLastModified: true,
             })
             let summary: ImportSummary
 
@@ -101,6 +105,15 @@ export const useFileImport = (): ImportFiles => {
             imported += summary.imported
             skipped += summary.skipped
             failed += summary.failed
+            const summaryError = summary.errors.at(-1)?.error
+
+            if (summaryError) {
+              // A per-note write failure is still a successfully completed import
+              // JOB: its exact cause rides the summary rather than `job.error`.
+              // Keep the last one so an all-failed drop does not collapse a useful
+              // durable/sync rejection into the generic "Import failed" toast.
+              lastError = summaryError
+            }
             if (!firstCreated && summary.created?.[0]) {
               firstCreated = summary.created[0]
             }

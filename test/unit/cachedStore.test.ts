@@ -10,6 +10,7 @@ import {
   CachedStore,
   IF_EXISTS,
   InMemoryRevisionPersistence,
+  parseFrontmatterLines,
   type StoreDelta,
 } from '@notarium/core'
 import { InMemoryStore, type StoreSnapshot } from '@notarium/engine-memory'
@@ -246,6 +247,139 @@ describe('CachedStore — write-through', () => {
     expect(await editDate('2018-06-15T00:00:00+03:00')).toBe('2018-06-14T21:00:00.000Z')
     // Garbage is rejected — the snapshot keeps the prior (normalised) date, no poison.
     expect(await editDate('not-a-date')).toBe('2018-06-14T21:00:00.000Z')
+  })
+
+  it('preserves an explicit unknown creation date through edit and create-overwrite', async () => {
+    const inner = new InMemoryStore({
+      space: 'main',
+      now: '2026-06-10T12:00:00.000Z',
+      notes: [
+        { title: 'Edited', filePath: 'edited.md', content: 'old', createdAt: null },
+        { title: 'Overwritten', filePath: 'overwritten.md', content: 'old', createdAt: null },
+      ],
+    })
+    const { store } = await make(inner)
+    const edited = await store.read('fake-edited')
+
+    await store.write({
+      originalId: 'fake-edited',
+      title: 'Edited',
+      content: 'new',
+      versionToken: edited.versionToken,
+    })
+    await store.write({
+      title: 'Overwritten',
+      content: 'new',
+      fileName: 'overwritten',
+      ifExists: IF_EXISTS.overwrite,
+    })
+
+    const cached = new Map((await store.list()).map((note) => [note.id, note.createdAt]))
+    const durable = new Map((await inner.list()).map((note) => [note.id, note.createdAt]))
+
+    expect(cached.get('fake-edited')).toBeNull()
+    expect(cached.get('fake-overwritten')).toBeNull()
+    expect(durable.get('fake-edited')).toBeNull()
+    expect(durable.get('fake-overwritten')).toBeNull()
+
+    await store.reconcile()
+    const reconciled = new Map((await store.list()).map((note) => [note.id, note.createdAt]))
+    expect(reconciled.get('fake-edited')).toBeNull()
+    expect(reconciled.get('fake-overwritten')).toBeNull()
+  })
+
+  it('projects last-wins imported aliases and slug before the bulk catch-up poll', async () => {
+    const inner = new InMemoryStore({
+      space: 'main',
+      now: '2026-06-10T12:00:00.000Z',
+      notes: [],
+    })
+    const { store } = await make(inner)
+
+    store.beginBulk()
+    const result = await store.write({
+      title: 'Imported',
+      content: 'body',
+      fileName: 'imported',
+      ifExists: IF_EXISTS.overwrite,
+      frontmatter: parseFrontmatterLines(
+        'aliases: [Earlier Alias]\naliases: [Imported Alias]\nslug: earlier\nslug: Raw Slug',
+      ),
+    })
+    const during = (await store.list()).find((note) => note.id === result.id)
+
+    expect(during).toMatchObject({ aliases: ['Imported Alias'], slug: 'raw-slug' })
+    await store.endBulk()
+    expect((await store.list()).find((note) => note.id === result.id)).toMatchObject({
+      aliases: ['Imported Alias'],
+      slug: 'raw-slug',
+    })
+  })
+
+  it('clears stale projections when an overwrite carries unreadable aliases and slug', async () => {
+    const inner = new InMemoryStore({
+      space: 'main',
+      now: '2026-06-10T12:00:00.000Z',
+      notes: [
+        {
+          title: 'Imported',
+          filePath: 'imported.md',
+          content: 'old',
+          frontmatter: 'aliases: [Old Alias]\nslug: old-slug',
+        },
+      ],
+    })
+    const { store } = await make(inner)
+
+    store.beginBulk()
+    const result = await store.write({
+      title: 'Imported',
+      content: 'new',
+      fileName: 'imported',
+      ifExists: IF_EXISTS.overwrite,
+      frontmatter: parseFrontmatterLines(
+        'aliases: [New Alias]\naliases:\n  locale: [Unreadable]\nslug: new-slug\nslug: [unreadable]',
+      ),
+    })
+    const during = (await store.list()).find((note) => note.id === result.id)
+
+    expect(during?.aliases).toBeUndefined()
+    expect(during?.slug).toBeUndefined()
+    await store.endBulk()
+    const after = (await store.list()).find((note) => note.id === result.id)
+    expect(after?.aliases).toBeUndefined()
+    expect(after?.slug).toBeUndefined()
+  })
+
+  it('applies typed slug and rename aliases after incoming raw projections', async () => {
+    const inner = new InMemoryStore({
+      space: 'main',
+      now: '2026-06-10T12:00:00.000Z',
+      notes: [
+        {
+          title: 'Original',
+          filePath: 'original.md',
+          content: 'old',
+          frontmatter: 'aliases: [Seed Alias]\nslug: old-slug',
+        },
+      ],
+    })
+    const { store } = await make(inner)
+    const original = await store.read('fake-original')
+
+    await store.write({
+      originalId: 'fake-original',
+      title: 'Renamed',
+      content: 'new',
+      fileName: 'original',
+      versionToken: original.versionToken,
+      slug: 'Typed Next',
+      frontmatter: parseFrontmatterLines('aliases: [Incoming Alias]\nslug: Raw Next'),
+    })
+    const renamed = (await store.list()).find((note) => note.id === 'fake-original')
+
+    expect(renamed?.aliases).toEqual(['Seed Alias', 'Original', 'old-slug'])
+    expect(renamed?.slug).toBe('typed-next')
   })
 
   it('a new note resolves ghosts that were waiting for it', async () => {

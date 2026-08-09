@@ -40,7 +40,7 @@ const folderSel = (path: string) => `[data-testid="tree-folder"][data-path="${pa
 const dropTextFiles = async (
   page: Page,
   targetSel: string,
-  files: Array<{ name: string; content: string; type?: string }>,
+  files: Array<{ name: string; content: string; type?: string; lastModified?: number }>,
 ) => {
   await page.evaluate(
     ({ targetSel: sel, files: fs }) => {
@@ -56,7 +56,14 @@ const dropTextFiles = async (
       const dt = new DataTransfer()
 
       for (const f of fs) {
-        dt.items.add(new File([f.content], f.name, { type: f.type ?? 'text/markdown' }))
+        dt.items.add(
+          new File([f.content], f.name, {
+            type: f.type ?? 'text/markdown',
+            // The file's own mtime — the date a frontmatter-less note falls back to
+            // (#280). A real OS drag carries it; here we set it explicitly.
+            ...(f.lastModified ? { lastModified: f.lastModified } : {}),
+          }),
+        )
       }
       const fire = (type: string) =>
         at.dispatchEvent(
@@ -182,6 +189,83 @@ test('re-dropping a same-named file WARNS (yellow), never a green "done" (#223)'
   const warn = page.getByTestId('toast').filter({ hasText: 'already exist' })
   await expect(warn).toBeVisible()
   await expect(warn).toHaveAttribute('data-variant', 'warning')
+})
+
+test('an all-failed drop shows the exact durable summary error (#280)', async ({
+  page,
+  baseURL,
+}) => {
+  await page.request.post(`${baseURL}/api/__test/reset`, { data: { fixture: FIXTURE } })
+  await page.goto('/s/main')
+  await waitForAppReady(page)
+
+  // The write boundary rejects the carried control byte per-note. The durable job
+  // itself therefore SUCCEEDS with `{failed:1, errors:[...]}`; the client must read
+  // that summary instead of looking only at the terminal job error.
+  await dropTextFiles(page, 'main', [
+    { name: 'poisoned.md', content: '---\nauthor: safe\0poison\n---\nBody.' },
+  ])
+
+  const error = page
+    .getByTestId('toast')
+    .filter({ hasText: 'frontmatter contains invalid raw lines' })
+  await expect(error).toBeVisible()
+  await expect(error).toHaveAttribute('data-variant', 'error')
+  await expect(treeNote(page, 'poisoned')).toHaveCount(0)
+})
+
+// #280 — the dropped file's own frontmatter is the user's data. This is the ONLY
+// place the client leg is exercised end to end: a real browser `File` carries the
+// mtime, and `useFileImport` has to put it on the wire for a frontmatter-less note
+// to be dated by the FILE rather than by the import moment.
+test('a dropped file keeps its own title, tags and date (#280)', async ({ page, baseURL }) => {
+  await page.request.post(`${baseURL}/api/__test/reset`, { data: { fixture: FIXTURE } })
+  await page.goto('/s/main')
+  await waitForAppReady(page)
+
+  await dropTextFiles(page, 'main', [
+    {
+      name: 'dogovor.md',
+      content:
+        '---\ntitle: Договор\ntags: [работа, 2025]\ncreated: 2025-03-14\nauthor: Sergey\n---\n# Черновик\n\nТело.',
+    },
+  ])
+
+  // Titled by the frontmatter, NOT by the file name — and the differing H1 stays.
+  await expect(treeNote(page, 'Договор')).toBeVisible()
+  const note = await page.request
+    .get(`${baseURL}/api/s/main/notes?limit=50`)
+    .then((r) => r.json())
+    .then((d) => d.notes.find((n: { filePath: string }) => n.filePath === 'dogovor.md'))
+  expect(note.title).toBe('Договор')
+  expect(note.createdAt).toBe('2025-03-14T00:00:00.000Z')
+  const detail = await page.request
+    .get(`${baseURL}/api/s/main/note?ref=${note.id}`)
+    .then((r) => r.json())
+  expect(detail.frontmatter.tags).toEqual(['работа', '2025'])
+  expect(detail.frontmatter.author).toBe('Sergey')
+  expect(detail.content).toContain('# Черновик')
+})
+
+test('a frontmatter-less drop is dated by the FILE, not by the import moment (#280)', async ({
+  page,
+  baseURL,
+}) => {
+  await page.request.post(`${baseURL}/api/__test/reset`, { data: { fixture: FIXTURE } })
+  await page.goto('/s/main')
+  await waitForAppReady(page)
+  const mtime = Date.UTC(2019, 4, 5, 10)
+
+  await dropTextFiles(page, 'main', [
+    { name: 'old note.md', content: '# Old note\n\nbody', lastModified: mtime },
+  ])
+
+  await expect(treeNote(page, 'Old note')).toBeVisible()
+  const created = await page.request
+    .get(`${baseURL}/api/s/main/notes?limit=50`)
+    .then((r) => r.json())
+    .then((d) => d.notes.find((n: { filePath: string }) => n.filePath === 'old-note.md')?.createdAt)
+  expect(created).toBe(new Date(mtime).toISOString())
 })
 
 test('drop several files at once → all imported in one go (#223 multi-file)', async ({

@@ -5,6 +5,7 @@
 import { IMPORT_FORMAT } from './consts'
 import type { ImportFormat } from './consts'
 import { detectFormat } from './detect'
+import { ImportError } from './errors'
 import { parseChatGpt } from './formats/chatgpt'
 import { parseClaudeConversations } from './formats/claudeConversations'
 import { parseClaudeDesignChat } from './formats/claudeDesignChat'
@@ -14,7 +15,7 @@ import { markdownFileToNote } from './formats/markdown'
 import { parseMemoryJson } from './formats/memoryJson'
 import type { ImportParseResult } from './types'
 
-export class ImportError extends Error {}
+export { ImportError } from './errors'
 
 /** Parse one export file. `format` forces a parser; omitted = auto-detect.
  *  `fileName` names the source (the markdown format uses it for the title

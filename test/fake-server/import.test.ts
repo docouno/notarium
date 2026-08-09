@@ -14,6 +14,8 @@ import AdmZip from 'adm-zip'
 import type { FastifyInstance } from 'fastify'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
+import { FRONTMATTER_BYTE_CAP } from '@notarium/core'
+
 import { createApp, type Fixture } from './app.js'
 
 const fixture = (): Fixture => ({
@@ -30,6 +32,11 @@ afterEach(async () => {
 })
 
 const BOUNDARY = '----notariumtestboundary'
+const OVERSIZED_FRONTMATTER = `---\nauthor: ${'a'.repeat(FRONTMATTER_BYTE_CAP)}\n---\nBody.\n`
+const FRONTMATTER_LIMIT_REASON = 'oversized.md: frontmatter exceeds the 64 KiB limit'
+const YAML_NODE_REFERENCE_WRITE_ERROR =
+  'frontmatter with YAML anchors or aliases is not supported by writes'
+const ANCHORED_MARKDOWN = '---\nanchorKey: &source anchored\ncopy: *source\n---\nNew body.\n'
 
 /** Build a minimal multipart/form-data body with one file field (+ optional
  *  text fields) — avoids a form-data dependency. */
@@ -157,6 +164,7 @@ type ImportLine = {
   failed?: number
   error?: string
   files?: FileResult[]
+  errors?: Array<{ title?: string; error: string }>
   created?: string[]
 }
 const ndjson = (payload: string) => {
@@ -680,10 +688,107 @@ describe('durable import (#191): POST /api/s/:space/import → job', () => {
     expect(list[0].filePath).toBe('todo-list.md')
   })
 
-  it('strips a leading YAML frontmatter block from a dropped file', async () => {
+  // ── the dropped file's own frontmatter is its own data (#280) ──
+
+  it('lifts title, tags and the creation date out of a dropped file’s frontmatter', async () => {
+    await runImport(
+      'dogovor.md',
+      '---\ntitle: Договор\ntags: [работа, 2025]\ncreated: 2025-03-14\n---\n\nТело договора.\n',
+      'text/markdown',
+      { format: 'markdown' },
+    )
+    const list = await notes()
+    expect(list[0].title).toBe('Договор')
+    expect(list[0].createdAt).toBe('2025-03-14T00:00:00.000Z')
+    const detail = JSON.parse(
+      (await app.inject({ method: 'GET', url: `/api/s/main/note?ref=${list[0].id}` })).payload,
+    )
+    expect(detail.frontmatter.tags).toEqual(['работа', '2025'])
+    expect(detail.content).toContain('Тело договора.')
+    // The block itself never leaks into the body — it became metadata, not text.
+    expect(detail.content).not.toContain('---')
+  })
+
+  it('keeps the keys it does not model — an imported file is still the author’s file', async () => {
+    await runImport(
+      'obsidian.md',
+      '---\ntitle: Vault Note\naliases: [Old Name]\nauthor: Sergey\nmeta:\n  source: obsidian\n---\nBody.\n',
+      'text/markdown',
+      { format: 'markdown' },
+    )
+    const list = await notes()
+    const detail = JSON.parse(
+      (await app.inject({ method: 'GET', url: `/api/s/main/note?ref=${list[0].id}` })).payload,
+    )
+    expect(list[0].title).toBe('Vault Note')
+    expect(detail.frontmatter.author).toBe('Sergey')
+    // `aliases:` is re-derived into the alias history, so inbound [[Old Name]] resolve.
+    expect(detail.frontmatter.aliases).toEqual(['Old Name'])
+    // A nested map is honestly ABSENT from the parsed frontmatter (we model no
+    // shape for it) yet must still be in the FILE — "we don't understand it" is not
+    // a licence to delete it. The export is where the file itself is observable.
+    const zip = new AdmZip(
+      (await app.inject({ method: 'GET', url: '/api/s/main/export' })).rawPayload,
+    )
+    const file = zip.getEntry('obsidian.md')!.getData().toString('utf8')
+    expect(file).toContain('meta:\n  source: obsidian')
+    expect(file).toContain('author: Sergey')
+    expect(file).toContain('title: Vault Note')
+  })
+
+  it('rejects non-durable bytes hidden in carried frontmatter', async () => {
+    const job = await runImport(
+      'poisoned.md',
+      '---\nauthor: safe\0poison\n---\nBody.\n',
+      'text/markdown',
+      { format: 'markdown' },
+    )
+
+    expect(job.status).toBe('succeeded')
+    expect(job.result).toMatchObject({ imported: 0, failed: 1 })
+    expect(await notes()).toHaveLength(0)
+  })
+
+  it('fails oversized frontmatter terminally with the exact source-file reason', async () => {
+    const job = await runImport('oversized.md', OVERSIZED_FRONTMATTER, 'text/markdown', {
+      format: 'markdown',
+    })
+
+    expect(job.status).toBe('failed')
+    expect(job.error).toBe(FRONTMATTER_LIMIT_REASON)
+    expect(job.result).toBeNull()
+    expect(await notes()).toHaveLength(0)
+  })
+
+  it('refreshes present foreign keys without deleting absent ones on re-import', async () => {
+    await runImport(
+      'shared.md',
+      '---\ntitle: Shared\nauthor: Old\nkept: yes\n---\nFirst.\n',
+      'text/markdown',
+      { format: 'markdown' },
+    )
+    const second = await runImport(
+      'shared.md',
+      '---\ntitle: Shared\nauthor: New\n---\nSecond.\n',
+      'text/markdown',
+      { format: 'markdown' },
+    )
+
+    expect(second.result).toMatchObject({ imported: 1, failed: 0 })
+    expect(await notes()).toHaveLength(1)
+    const note = (await notes())[0]
+    const detail = JSON.parse(
+      (await app.inject({ method: 'GET', url: `/api/s/main/note?ref=${note.id}` })).payload,
+    )
+    expect(detail.frontmatter.author).toBe('New')
+    expect(detail.frontmatter.kept).toBe('yes')
+    expect(detail.content).toContain('Second.')
+  })
+
+  it('a frontmatter title wins over a differing H1, which stays in the body', async () => {
     await runImport(
       'exported.md',
-      '---\ntitle: Ignored\ntags: [a]\n---\n# Real Title\n\nContent.\n',
+      '---\ntitle: Real Title\ntags: [a]\n---\n# Draft heading\n\nContent.\n',
       'text/markdown',
       { format: 'markdown' },
     )
@@ -692,8 +797,36 @@ describe('durable import (#191): POST /api/s/:space/import → job', () => {
       (await app.inject({ method: 'GET', url: `/api/s/main/note?ref=${list[0].id}` })).payload,
     )
     expect(list[0].title).toBe('Real Title')
-    expect(detail.content).not.toContain('title: Ignored')
+    expect(detail.content).toContain('# Draft heading') // nothing is dropped
     expect(detail.content).toContain('Content.')
+  })
+
+  it('dates a frontmatter-less drop by the file’s own mtime, not by the import moment', async () => {
+    const mtime = Date.UTC(2019, 4, 5, 10)
+    await runImport('old note.md', '# Old note\n\nBody.\n', 'text/markdown', {
+      format: 'markdown',
+      lastModified: String(mtime),
+    })
+    expect((await notes())[0].createdAt).toBe(new Date(mtime).toISOString())
+  })
+
+  it('ignores an implausible mtime — a future date would pin the note atop the Feed', async () => {
+    const future = Date.now() + 365 * 24 * 3600 * 1000
+    await runImport('skewed.md', '# Skewed\n\nBody.\n', 'text/markdown', {
+      format: 'markdown',
+      lastModified: String(future),
+    })
+    const createdAt = (await notes())[0].createdAt
+    expect(createdAt).not.toBe(new Date(future).toISOString())
+    expect(new Date(createdAt!).getTime()).toBeLessThanOrEqual(Date.now() + 1000)
+  })
+
+  it('an authored date beats the file mtime', async () => {
+    await runImport('dated.md', '---\ncreated: 2011-02-03\n---\nBody.\n', 'text/markdown', {
+      format: 'markdown',
+      lastModified: String(Date.UTC(2019, 4, 5)),
+    })
+    expect((await notes())[0].createdAt).toBe('2011-02-03T00:00:00.000Z')
   })
 
   it('drops the file into the target folder via root (#223 — where it was dropped)', async () => {
@@ -714,6 +847,39 @@ describe('durable import (#191): POST /api/s/:space/import → job', () => {
     expect(job.result!.imported).toBe(0)
     expect(job.result!.skipped).toBe(1)
     expect(await notes()).toHaveLength(1) // same path, not duplicated
+  })
+
+  it('checks skipExisting before refusing YAML references, but rejects a fresh write', async () => {
+    await runImport('anchored.md', '# Existing\n\nOriginal body.', 'text/markdown', {
+      format: 'markdown',
+    })
+    const existing = (await notes())[0]
+    const skipped = await runImport('anchored.md', ANCHORED_MARKDOWN, 'text/markdown', {
+      format: 'markdown',
+      skipExisting: 'true',
+    })
+
+    expect(skipped.status).toBe('succeeded')
+    expect(skipped.result).toMatchObject({ imported: 0, skipped: 1, failed: 0, errors: [] })
+    const unchanged = JSON.parse(
+      (await app.inject({ method: 'GET', url: `/api/s/main/note?ref=${existing.id}` })).payload,
+    )
+    expect(unchanged.content).toContain('Original body.')
+    expect(unchanged.content).not.toContain('New body.')
+
+    const refused = await runImport('fresh-anchored.md', ANCHORED_MARKDOWN, 'text/markdown', {
+      format: 'markdown',
+      skipExisting: 'true',
+    })
+
+    expect(refused.status).toBe('succeeded')
+    expect(refused.result).toMatchObject({
+      imported: 0,
+      skipped: 0,
+      failed: 1,
+      errors: [{ title: 'fresh-anchored', error: YAML_NODE_REFERENCE_WRITE_ERROR }],
+    })
+    expect(await notes()).toEqual([existing])
   })
 
   it('rejects a non-multipart request', async () => {
@@ -763,6 +929,21 @@ describe('import degradation (#191): a none-mode host falls back to the synchron
     expect(error?.error).toMatch(/recognised/i)
   })
 
+  it('surfaces oversized frontmatter with the same exact reason in sync mode', async () => {
+    const res = await syncApp.inject({
+      method: 'POST',
+      url: '/api/s/main/import',
+      ...multipart('oversized.md', OVERSIZED_FRONTMATTER, 'text/markdown', {
+        format: 'markdown',
+      }),
+    })
+
+    expect(res.statusCode).toBe(200)
+    const { done, error } = ndjson(res.payload)
+    expect(done).toBeUndefined()
+    expect(error?.error).toBe(FRONTMATTER_LIMIT_REASON)
+  })
+
   it('a dropped markdown file imports via the sync fallback too (#223)', async () => {
     const res = await syncApp.inject({
       method: 'POST',
@@ -778,5 +959,92 @@ describe('import degradation (#191): a none-mode host falls back to the synchron
     ).notes
     expect(list[0].title).toBe('Hello')
     expect(list[0].filePath).toBe('hello.md')
+  })
+
+  it('the frontmatter lift and the mtime date work on the fallback too (#280)', async () => {
+    // Degradation is by CAPABILITY (no job layer), never by behaviour: a none-mode
+    // host must not quietly import worse notes than a durable one.
+    const mtime = Date.UTC(2019, 4, 5, 10)
+    const res = await syncApp.inject({
+      method: 'POST',
+      url: '/api/s/main/import',
+      ...multipart(
+        'vault.md',
+        '---\ntitle: Vault\ntags: [a]\nauthor: S\n---\nbody',
+        'text/markdown',
+        {
+          format: 'markdown',
+          lastModified: String(mtime),
+        },
+      ),
+    })
+    expect(res.statusCode).toBe(200)
+    expect(ndjson(res.payload).done!.imported).toBe(1)
+    const list = JSON.parse(
+      (await syncApp.inject({ method: 'GET', url: '/api/s/main/notes?limit=1000' })).payload,
+    ).notes
+    expect(list[0].title).toBe('Vault')
+    expect(list[0].createdAt).toBe(new Date(mtime).toISOString())
+    const detail = JSON.parse(
+      (await syncApp.inject({ method: 'GET', url: `/api/s/main/note?ref=${list[0].id}` })).payload,
+    )
+    expect(detail.frontmatter.tags).toEqual(['a'])
+    expect(detail.frontmatter.author).toBe('S')
+  })
+
+  it('checks skipExisting before YAML-reference refusal in the sync fallback too', async () => {
+    const first = await syncApp.inject({
+      method: 'POST',
+      url: '/api/s/main/import',
+      ...multipart('anchored.md', '# Existing\n\nOriginal body.', 'text/markdown', {
+        format: 'markdown',
+      }),
+    })
+    expect(ndjson(first.payload).done).toMatchObject({ imported: 1, failed: 0 })
+    const existing = JSON.parse(
+      (await syncApp.inject({ method: 'GET', url: '/api/s/main/notes?limit=1000' })).payload,
+    ).notes[0] as { id: string; filePath: string }
+    const skipped = await syncApp.inject({
+      method: 'POST',
+      url: '/api/s/main/import',
+      ...multipart('anchored.md', ANCHORED_MARKDOWN, 'text/markdown', {
+        format: 'markdown',
+        skipExisting: 'true',
+      }),
+    })
+
+    expect(ndjson(skipped.payload).done).toMatchObject({
+      imported: 0,
+      skipped: 1,
+      failed: 0,
+      errors: [],
+    })
+    const unchanged = JSON.parse(
+      (await syncApp.inject({ method: 'GET', url: `/api/s/main/note?ref=${existing.id}` })).payload,
+    )
+    expect(unchanged.content).toContain('Original body.')
+    expect(unchanged.content).not.toContain('New body.')
+
+    const refused = await syncApp.inject({
+      method: 'POST',
+      url: '/api/s/main/import',
+      ...multipart('fresh-anchored.md', ANCHORED_MARKDOWN, 'text/markdown', {
+        format: 'markdown',
+        skipExisting: 'true',
+      }),
+    })
+    const refusedResult = ndjson(refused.payload)
+
+    expect(refusedResult.error).toBeUndefined()
+    expect(refusedResult.done).toMatchObject({
+      imported: 0,
+      skipped: 0,
+      failed: 1,
+      errors: [{ title: 'fresh-anchored', error: YAML_NODE_REFERENCE_WRITE_ERROR }],
+    })
+    const after = JSON.parse(
+      (await syncApp.inject({ method: 'GET', url: '/api/s/main/notes?limit=1000' })).payload,
+    ).notes as Array<{ id: string; filePath: string }>
+    expect(after).toEqual([existing])
   })
 })
