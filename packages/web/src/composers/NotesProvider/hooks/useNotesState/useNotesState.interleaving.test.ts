@@ -1,12 +1,17 @@
 // @vitest-environment jsdom
 
 import { act, createElement } from 'react'
+import type { DependencyList, EffectCallback } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { STORE_EVENT } from '@notarium/contract/events'
 
-import type { NoteDetailView, Tree } from '../../../../libs/wire'
+import type { NoteDetailView, NoteView, Tree, TreeChildrenView } from '../../../../libs/wire'
 import type { NotesContextValue } from '../../types'
+
+type ReactModule = Record<string, unknown> & {
+  useEffect: (effect: EffectCallback, deps?: DependencyList) => void
+}
 
 const harness = vi.hoisted(() => ({
   api: {
@@ -21,7 +26,26 @@ const harness = vi.hoisted(() => ({
   location: { pathname: '/', state: null as unknown },
   navigate: vi.fn(),
   reportNoteSpace: vi.fn(),
+  cacheMirrorEffects: [] as Array<() => void | (() => void)>,
 }))
+
+vi.mock('react', async (importOriginal) => {
+  const actual = await importOriginal<ReactModule>()
+
+  const useEffect: ReactModule['useEffect'] = (effect, deps) => {
+    // The removed implementation mirrored cache state back into refs from two
+    // passive effects. Hold those effects so the test can deterministically
+    // replay an older render after a newer folder response has committed.
+    if (deps?.length === 1 && deps[0] instanceof Map) {
+      harness.cacheMirrorEffects.push(effect)
+      return
+    }
+
+    return actual.useEffect(effect, deps)
+  }
+
+  return { ...actual, useEffect }
+})
 
 vi.mock('../../../../services/api', () => ({ api: harness.api }))
 vi.mock('../../../SpaceProvider', () => ({
@@ -71,6 +95,21 @@ const deferred = <T>() => {
 const tree = (path: string): Tree => ({
   folders: [{ path, name: path, count: 0, direct: 0 }],
   stats: { total: 0, root: 0, week: 0 },
+})
+
+const listedNote = (folder: string): NoteView => ({
+  id: `id-${folder}`,
+  title: `Note ${folder}`,
+  filePath: `${folder}/note.md`,
+  class: 'user-doc',
+  modifiedAt: null,
+  createdAt: null,
+})
+
+const listing = (folder: string): TreeChildrenView => ({
+  folders: [],
+  notes: [listedNote(folder)],
+  total: 1,
 })
 
 const detail = (deleted = false): NoteDetailView => ({
@@ -130,6 +169,7 @@ describe('useNotesState interleavings', () => {
     harness.location.state = null
     harness.navigate.mockReset()
     harness.reportNoteSpace.mockReset()
+    harness.cacheMirrorEffects.length = 0
     container = document.createElement('div')
     document.body.append(container)
     root = createRoot(container)
@@ -211,6 +251,80 @@ describe('useNotesState interleavings', () => {
 
     expect(state.tree?.folders[0]?.path).toBe('new')
     expect(state.listError).toBeNull()
+  })
+
+  it('does not let an older render roll back an accepted folder listing', async () => {
+    const folders = ['one', 'two', 'three']
+    const requests = new Map(folders.map((folder) => [folder, deferred<TreeChildrenView>()]))
+
+    harness.api.treeChildrenGet.mockImplementation(
+      (_space: string, folder: string) => requests.get(folder)?.promise,
+    )
+    render()
+    await settle()
+    harness.cacheMirrorEffects.length = 0
+
+    act(() => {
+      for (const folder of folders) {
+        state.ensureFolder(folder)
+      }
+    })
+    await act(async () => {
+      requests.get('one')?.resolve(listing('one'))
+      await Promise.resolve()
+    })
+    const staleMirrorEffects = harness.cacheMirrorEffects.splice(0)
+
+    await act(async () => {
+      requests.get('two')?.resolve(listing('two'))
+      await Promise.resolve()
+      for (const effect of staleMirrorEffects) {
+        effect()
+      }
+      requests.get('three')?.resolve(listing('three'))
+      await Promise.resolve()
+    })
+
+    expect(state.knownNotes.map((note) => note.id).sort()).toEqual(
+      folders.map((folder) => `id-${folder}`).sort(),
+    )
+  })
+
+  it('updates cache-owner refs before React flushes a local move', async () => {
+    const from = deferred<TreeChildrenView>()
+    const to = deferred<TreeChildrenView>()
+
+    harness.api.treeChildrenGet.mockImplementation((_space: string, folder: string) =>
+      folder === 'from' ? from.promise : to.promise,
+    )
+    render()
+    await settle()
+
+    await act(async () => {
+      state.ensureFolder('from')
+      state.ensureFolder('to')
+      from.resolve(listing('from'))
+      to.resolve(listing('to'))
+      await Promise.resolve()
+    })
+
+    act(() => {
+      const previous = state.applyLocalMove('id-from', 'from', 'to', 'to/moved.md')
+
+      expect(previous?.filePath).toBe('from/note.md')
+      // Async callbacks resolve through the mutable cache owner before React
+      // publishes its render projection. The old state-only move left this ref
+      // stale until a passive effect and fails this assertion.
+      expect(state.resolveKnown('id-from')?.filePath).toBe('to/moved.md')
+    })
+
+    expect(state.notesIn('from')?.map((note) => note.id)).toEqual([])
+    expect(
+      state
+        .notesIn('to')
+        ?.map((note) => note.id)
+        .sort(),
+    ).toEqual(['id-from', 'id-to'])
   })
 
   it('retries D@0 after removed@1 without publishing the late live response', async () => {

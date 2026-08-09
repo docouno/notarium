@@ -83,8 +83,10 @@ export const useNotesState = (): NotesContextValue => {
   const [movedId, setMovedId] = useState<string | null>(null)
   const movedTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  // Refs mirror the latest values for the location effect, which must fire on
-  // navigation only — not re-subscribe on every data change.
+  // Refs expose the current cache values to async callbacks without making
+  // those callbacks depend on render timing. `seen` and `folderNotes` are
+  // committed through the helpers below: mirroring them back from an effect
+  // would let an older render roll a newer async result back.
   const seenRef = useRef(seen)
   /** IDs removed by server truth, stamped with their observation epoch. A
    * response already in flight when the event landed must not put one back; a
@@ -112,15 +114,18 @@ export const useNotesState = (): NotesContextValue => {
   const noteLoadSeq = useRef(0)
   const noteAbort = useRef<AbortController | null>(null)
 
-  useEffect(() => {
-    seenRef.current = seen
-  }, [seen])
+  const commitSeen = useCallback((next: Map<string, NoteView>) => {
+    seenRef.current = next
+    setSeen(next)
+  }, [])
+  const commitFolderNotes = useCallback((next: Map<string, NoteView[]>) => {
+    folderNotesRef.current = next
+    setFolderNotes(next)
+  }, [])
+
   useEffect(() => {
     treeRef.current = tree
   }, [tree])
-  useEffect(() => {
-    folderNotesRef.current = folderNotes
-  }, [folderNotes])
   useEffect(() => {
     activeIdRef.current = activeId
   }, [activeId])
@@ -155,11 +160,10 @@ export const useNotesState = (): NotesContextValue => {
         observedAt ?? observationEpoch(),
       )
 
-      seenRef.current = result.seen
-      setSeen(result.seen)
+      commitSeen(result.seen)
       return result.accepted
     },
-    [observationEpoch],
+    [commitSeen, observationEpoch],
   )
 
   /** Removed stable ids are no longer locally conclusive wikilink targets. Keep
@@ -192,12 +196,10 @@ export const useNotesState = (): NotesContextValue => {
           notes.filter((row) => !removed.has(row.id)),
         )
       }
-      seenRef.current = nextSeen
-      folderNotesRef.current = nextFolders
-      setSeen(nextSeen)
-      setFolderNotes(nextFolders)
+      commitSeen(nextSeen)
+      commitFolderNotes(nextFolders)
     },
-    [observationEpoch],
+    [commitFolderNotes, commitSeen, observationEpoch],
   )
 
   const resolveKnown = useCallback((id: string) => seenRef.current.get(id), [])
@@ -274,16 +276,14 @@ export const useNotesState = (): NotesContextValue => {
         // Refs move with the accepted authoritative response, before React's
         // render, so a same-tick wikilink click cannot use an id this empty
         // folder response just proved was deleted.
-        seenRef.current = nextSeen
-        folderNotesRef.current = nextFolders
-        setSeen(nextSeen)
-        setFolderNotes(nextFolders)
+        commitSeen(nextSeen)
+        commitFolderNotes(nextFolders)
       } catch {
         // a folder listing that failed simply stays unloaded; expand retries it
         foldersInFlight.current.delete(folder)
       }
     },
-    [observationEpoch],
+    [commitFolderNotes, commitSeen, observationEpoch],
   )
 
   const ensureFolder = useCallback(
@@ -392,30 +392,28 @@ export const useNotesState = (): NotesContextValue => {
       const moved: NoteView = { ...prev, filePath: newFilePath }
       folderLoadSeq.current.set(fromFolder, (folderLoadSeq.current.get(fromFolder) ?? 0) + 1)
       folderLoadSeq.current.set(toFolder, (folderLoadSeq.current.get(toFolder) ?? 0) + 1)
-      setFolderNotes((prevMap) => {
-        const next = new Map(prevMap)
-        const from = next.get(fromFolder)
+      const nextFolders = new Map(folderNotesRef.current)
+      const from = nextFolders.get(fromFolder)
 
-        if (from) {
-          next.set(
-            fromFolder,
-            from.filter((n) => n.id !== id),
-          )
-        }
-        const to = next.get(toFolder)
+      if (from) {
+        nextFolders.set(
+          fromFolder,
+          from.filter((n) => n.id !== id),
+        )
+      }
+      const to = nextFolders.get(toFolder)
 
-        if (to) {
-          // Title order mirrors the server's `sort=title` listing so the
-          // optimistic row lands where the refetch will confirm it.
-          const merged = to.filter((n) => n.id !== id)
-          merged.push(moved)
-          merged.sort((a, b) => (a.title || '').localeCompare(b.title || ''))
-          next.set(toFolder, merged)
-        }
+      if (to) {
+        // Title order mirrors the server's `sort=title` listing so the
+        // optimistic row lands where the refetch will confirm it.
+        const merged = to.filter((n) => n.id !== id)
+        merged.push(moved)
+        merged.sort((a, b) => (a.title || '').localeCompare(b.title || ''))
+        nextFolders.set(toFolder, merged)
+      }
 
-        return next
-      })
-      setSeen((prevMap) => new Map(prevMap).set(id, moved))
+      commitFolderNotes(nextFolders)
+      commitSeen(new Map(seenRef.current).set(id, moved))
       setMovedId(id)
       if (movedTimer.current) {
         clearTimeout(movedTimer.current)
@@ -423,7 +421,7 @@ export const useNotesState = (): NotesContextValue => {
       movedTimer.current = setTimeout(() => setMovedId(null), MOVED_PULSE_MS)
       return prev
     },
-    [],
+    [commitFolderNotes, commitSeen],
   )
 
   useEffect(
@@ -775,10 +773,9 @@ export const useNotesState = (): NotesContextValue => {
     foldersInFlight.current.clear()
     setTree(null)
     setTreeLoaded(false)
-    setFolderNotes(new Map())
-    seenRef.current = new Map()
+    commitFolderNotes(new Map())
     removedSeenIdsRef.current.clear()
-    setSeen(new Map())
+    commitSeen(new Map())
     // Tree (sidebar) and reader (the URL's target) are independent — boot them in
     // PARALLEL so the reader never waits on the tree. Serializing these was the
     // source of the boot flash: the home Splash showed for the WHOLE loadTree

@@ -552,7 +552,7 @@ test('agent context and note routes canonicalize legacy forms', async ({ page })
   await page.goto('/agents/context')
   await expect(page).toHaveURL(/\/agents\/context\/personal$/)
   await page.goto('/agents/session')
-  await expect(page).toHaveURL(/\/agents\/context\/personal$/)
+  await expect(page).toHaveURL(/\/agents\/sessions$/)
 
   await page.goto('/s/main')
   await expect(page.getByTestId('space-switcher')).toContainText('Main')
