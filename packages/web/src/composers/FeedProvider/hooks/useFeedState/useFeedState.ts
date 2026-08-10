@@ -394,8 +394,7 @@ export const useFeedState = () => {
   }, [fetchTags])
 
   // SSE freshness: refetch the held window when a change touches our scope.
-  // upserts/removed are the "does this concern me" filter — a note changing in
-  // a folder outside the current filter is a skip, not a refetch.
+  // canon: docs/feed-page.md#data-flow
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | null = null
     const off = subscribe((event) => {
@@ -404,11 +403,13 @@ export const useFeedState = () => {
       }
       if (selected.size > 0) {
         // A change concerns us when it touches a VISIBLE note — i.e. one that sits
-        // under a selected subtree (the inclusion filter is on).
+        // under a selected subtree (the inclusion filter is on), by its old
+        // location OR by the one the event reports.
         const touches = changeTouchesSelection(
           selected,
           [...event.upserts, ...event.removed],
           dirOfId,
+          event.folders,
         )
 
         if (!touches) {

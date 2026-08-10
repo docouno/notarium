@@ -1,19 +1,16 @@
 import { folderShown } from '../../../../../../libs/tree/tree'
 
-/** Does any changed id (upserted/removed) fall under the selected-folder scope?
- *  The "does this SSE change concern me" filter for the current inclusion set. */
+/** Tests cached old and server-truth current locations. Optional `folders`
+ *  tolerates raw legacy SSE frames. @see docs/feed-page.md#data-flow */
 export const changeTouchesSelection = (
   selected: ReadonlySet<string>,
   ids: string[],
   dirOfId: (id: string) => string | null,
+  folders?: readonly string[],
 ): boolean =>
   ids.some((id) => {
     const dir = dirOfId(id)
 
     // null = an id the session can't place — assume it may be visible.
-    if (dir === null) {
-      return true
-    }
-
-    return folderShown(selected, dir)
-  })
+    return dir === null || folderShown(selected, dir)
+  }) || (folders ?? []).some((dir) => folderShown(selected, dir))
