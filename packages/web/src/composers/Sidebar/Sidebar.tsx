@@ -84,6 +84,7 @@ import { flattenTree } from './helpers/explorerRows'
 import { favoriteBranchPaths, favoriteNoteFolders, favoriteTreeView } from './helpers/favoritesView'
 import { dirOfPath, pathInside } from './helpers/paths'
 import { loadRecent, loadScope } from './helpers/scopeStorage'
+import { seedTopLevel } from './helpers/seedTopLevel'
 import { useFolderExport } from './hooks/useFolderExport'
 import { usePanelChrome } from './hooks/usePanelChrome'
 import { useTreeSelection } from './hooks/useTreeSelection'
@@ -421,6 +422,14 @@ export const Sidebar = () => {
     [favoriteBranches, favoriteNotesByFolder, notesIn],
   )
   const scopedNotesIn = effectiveScope.kind === 'favorites' ? favoriteNotesIn : notesIn
+  const topLevelPaths = useMemo(() => folderTree.map((node) => node.path), [folderTree])
+  // Child layout effects must never observe the first skeleton before its root
+  // union: a folder-page reveal could otherwise settle against that shorter tree.
+  const renderedOpenSet = useMemo(
+    () =>
+      seeded.current || topLevelPaths.length === 0 ? openSet : seedTopLevel(openSet, topLevelPaths),
+    [openSet, topLevelPaths],
+  )
 
   // Recently-focused projects for the dropdown (#164): resolve the MRU ids against
   // the live registry (dropping any that were unmarked/deleted, and the root), cap 5.
@@ -457,7 +466,7 @@ export const Sidebar = () => {
     }
     const walk = (nodes: readonly SkeletonNode[]) => {
       for (const node of nodes) {
-        if (!openSet.has(node.path)) {
+        if (!renderedOpenSet.has(node.path)) {
           continue
         }
         if (node.direct > 0) {
@@ -467,7 +476,7 @@ export const Sidebar = () => {
       }
     }
     walk(view.roots)
-  }, [treeLoaded, view, openSet, ensureFolder])
+  }, [treeLoaded, view, renderedOpenSet, ensureFolder])
 
   // Favorites is still the explorer, just filtered: reveal the chains that make
   // favorited leaves/folders visible when ENTERING the scope or when the favorite
@@ -988,11 +997,11 @@ export const Sidebar = () => {
         view.roots,
         view.rootCount > 0 ? scopedNotesIn(view.rootFolder) : null,
         view.rootCount,
-        openSet,
+        renderedOpenSet,
         scopedNotesIn,
         view.rootFolder,
       ),
-    [view, scopedNotesIn, openSet],
+    [view, scopedNotesIn, renderedOpenSet],
   )
   // Expose the current rows to the click-time shift-range (onSelect reads this
   // ref rather than depending on treeRows).
@@ -1142,22 +1151,16 @@ export const Sidebar = () => {
   // reveal so the tree expands to the open/moved note or a deep-linked folder.
   const browseFolder = browsing && !memoryNoteOpen && nav.type === 'folder' ? nav.folder : null
 
-  // Auto-expand top-level folders the FIRST time the skeleton arrives, then latch
-  // (#98 item 2). We still skip the expand if openSet is already populated — a
-  // deep-link reveal may have opened a buried chain before the skeleton landed,
-  // and clobbering it with just the top level would collapse the linked note's
-  // ancestors. Either way we mark `seeded`, so a later "Collapse all" (openSet →
-  // empty) is honoured instead of snapping every folder back open.
+  // The first skeleton unions every root into the open set, then latches so a later
+  // Collapse all remains sticky.
+  // canon: docs/drag-and-drop.md#5-reveal-expand-the-tree-to-the-active-item
   useEffect(() => {
-    if (seeded.current || !folderTree.length) {
+    if (seeded.current || topLevelPaths.length === 0) {
       return
     }
-    if (openSet.size === 0) {
-      setOpenSet(new Set(folderTree.map((n) => n.path)))
-    }
+    setOpenSet((prev) => seedTopLevel(prev, topLevelPaths))
     seeded.current = true
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [folderTree])
+  }, [topLevelPaths])
 
   // Self-heal openSet against the server-authoritative skeleton (#97): the tree
   // carries EVERY folder (the directory channel loads atomically, never partially),
@@ -1453,7 +1456,7 @@ export const Sidebar = () => {
                       aria-label="Collapse all folders"
                       data-testid="collapse-all"
                       onClick={collapseAll}
-                      disabled={!treeLoaded || openSet.size === 0}
+                      disabled={!treeLoaded || renderedOpenSet.size === 0}
                     >
                       <IconCollapse size={16} />
                     </button>
@@ -1540,7 +1543,7 @@ export const Sidebar = () => {
                   activeFolderPath={treeActiveFolderPath}
                   movedId={movedId}
                   onOpen={openNote}
-                  openSet={openSet}
+                  openSet={renderedOpenSet}
                   toggle={toggle}
                   dnd={dnd}
                   tree={treeApi}

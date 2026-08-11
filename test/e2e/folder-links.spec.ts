@@ -86,6 +86,55 @@ test('a folder row has a go-to-page action that navigates without toggling', asy
   )
 })
 
+test('a nested folder page opens its chain and the rest of the top level', async ({ page }) => {
+  await page.goto('/s/main/files/archive/2020')
+  await waitForAppReady(page)
+
+  // Folder-page reveal opens ancestors, not the targeted folder itself.
+  await expect(page.locator('[data-testid="tree-folder"][data-path="archive"]')).toHaveAttribute(
+    'aria-expanded',
+    'true',
+  )
+  await expect(page.locator('[data-testid="tree-folder"][data-path="archive/2020"]')).toBeVisible()
+
+  // First-load seeding also expands the unrelated top-level branch.
+  await expect(page.locator('[data-testid="tree-folder"][data-path="demo"]')).toHaveAttribute(
+    'aria-expanded',
+    'true',
+  )
+  await expect(page.locator('[data-testid="tree-note"][data-id="fake-demo-carbon"]')).toBeVisible()
+})
+
+test('a late nested folder page stays revealed after the first root union', async ({ page }) => {
+  const responses = await Promise.all(
+    Array.from({ length: 10 }, (_folderValue, folder) =>
+      Array.from({ length: 5 }, (_noteValue, note) =>
+        page.request.post('/api/s/main/notes', {
+          data: {
+            title: `Area ${folder + 1} note ${note + 1}`,
+            directory: `area-${String(folder + 1).padStart(2, '0')}`,
+            content: `# Area ${folder + 1} note ${note + 1}`,
+          },
+        }),
+      ),
+    ).flat(),
+  )
+
+  expect(responses.every((response) => response.ok())).toBe(true)
+  const created = await page.request.post('/api/s/main/folders', {
+    data: { path: 'zz-bottom/deep' },
+  })
+
+  expect(created.ok()).toBe(true)
+  await page.goto('/s/main/files/zz-bottom/deep')
+  await waitForAppReady(page)
+
+  const target = page.locator('[data-testid="tree-folder"][data-path="zz-bottom/deep"]')
+
+  await expect(target).toHaveAttribute('aria-current', 'page')
+  await expect(target).toBeInViewport()
+})
+
 test('the folder whose page is the current surface is highlighted in the tree', async ({
   page,
 }) => {

@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { STORE_EVENT } from '@notarium/contract/events'
 
 import type { NoteDetailView, NoteView, Tree, TreeChildrenView } from '../../../../libs/wire'
+import { FOLDER_RETRY_DELAYS_MS } from '../../consts'
 import type { NotesContextValue } from '../../types'
 
 type ReactModule = Record<string, unknown> & {
@@ -26,6 +27,7 @@ const harness = vi.hoisted(() => ({
   location: { pathname: '/', state: null as unknown },
   navigate: vi.fn(),
   reportNoteSpace: vi.fn(),
+  space: 'work',
   cacheMirrorEffects: [] as Array<() => void | (() => void)>,
 }))
 
@@ -50,7 +52,7 @@ vi.mock('react', async (importOriginal) => {
 vi.mock('../../../../services/api', () => ({ api: harness.api }))
 vi.mock('../../../SpaceProvider', () => ({
   useSpace: () => ({
-    space: 'work',
+    space: harness.space,
     personalSpace: null,
     reportNoteSpace: harness.reportNoteSpace,
   }),
@@ -169,6 +171,7 @@ describe('useNotesState interleavings', () => {
     harness.location.state = null
     harness.navigate.mockReset()
     harness.reportNoteSpace.mockReset()
+    harness.space = 'work'
     harness.cacheMirrorEffects.length = 0
     container = document.createElement('div')
     document.body.append(container)
@@ -177,6 +180,7 @@ describe('useNotesState interleavings', () => {
 
   afterEach(async () => {
     await act(async () => root.unmount())
+    vi.useRealTimers()
     container.remove()
   })
 
@@ -288,6 +292,166 @@ describe('useNotesState interleavings', () => {
     expect(state.knownNotes.map((note) => note.id).sort()).toEqual(
       folders.map((folder) => `id-${folder}`).sort(),
     )
+  })
+
+  it('retries an initial listing invalidated without a successor', async () => {
+    vi.useFakeTimers()
+    const first = deferred<TreeChildrenView>()
+    const second = deferred<TreeChildrenView>()
+
+    harness.api.treeChildrenGet
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise)
+    render()
+    await settle()
+
+    act(() => state.ensureFolder('held'))
+    await emitChanged([], ['unrelated-removal'])
+    await act(async () => first.resolve(listing('held')))
+    expect(state.notesIn('held')).toBeNull()
+
+    await act(async () => vi.advanceTimersByTimeAsync(FOLDER_RETRY_DELAYS_MS[0]))
+    expect(harness.api.treeChildrenGet).toHaveBeenCalledTimes(2)
+    await act(async () => second.resolve(listing('held')))
+    expect(state.notesIn('held')?.map((note) => note.id)).toEqual(['id-held'])
+  })
+
+  it('starts a fresh lifecycle when the terminal listing is invalidated', async () => {
+    vi.useFakeTimers()
+    const final = deferred<TreeChildrenView>()
+
+    harness.api.treeChildrenGet
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockReturnValueOnce(final.promise)
+      .mockResolvedValueOnce(listing('held'))
+    render()
+    await settle()
+
+    act(() => state.ensureFolder('held'))
+    await settle()
+    await act(async () => vi.advanceTimersByTimeAsync(FOLDER_RETRY_DELAYS_MS[0]))
+    await act(async () => vi.advanceTimersByTimeAsync(FOLDER_RETRY_DELAYS_MS[1]))
+    expect(harness.api.treeChildrenGet).toHaveBeenCalledTimes(3)
+
+    await emitChanged([], ['unrelated-removal'])
+    await act(async () => vi.advanceTimersByTimeAsync(1))
+    act(() => state.ensureFolder('held'))
+    await act(async () => final.resolve(listing('held')))
+    await settle()
+
+    expect(harness.api.treeChildrenGet).toHaveBeenCalledTimes(4)
+    expect(state.notesIn('held')?.map((note) => note.id)).toEqual(['id-held'])
+  })
+
+  it('starts a fresh lifecycle when the rejected terminal listing is invalidated', async () => {
+    vi.useFakeTimers()
+    const final = deferred<TreeChildrenView>()
+
+    harness.api.treeChildrenGet
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockReturnValueOnce(final.promise)
+      .mockResolvedValueOnce(listing('held'))
+    render()
+    await settle()
+
+    act(() => state.ensureFolder('held'))
+    await settle()
+    await act(async () => vi.advanceTimersByTimeAsync(FOLDER_RETRY_DELAYS_MS[0]))
+    await act(async () => vi.advanceTimersByTimeAsync(FOLDER_RETRY_DELAYS_MS[1]))
+    expect(harness.api.treeChildrenGet).toHaveBeenCalledTimes(3)
+
+    await emitChanged([], ['unrelated-removal'])
+    await act(async () => vi.advanceTimersByTimeAsync(1))
+    act(() => state.ensureFolder('held'))
+    await act(async () => final.reject(new Error('stale offline')))
+    await settle()
+
+    expect(harness.api.treeChildrenGet).toHaveBeenCalledTimes(4)
+    expect(state.notesIn('held')?.map((note) => note.id)).toEqual(['id-held'])
+  })
+
+  it('runs the named initial-listing schedule to an empty timer queue', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(0)
+    const attemptedAt: number[] = []
+
+    harness.api.treeChildrenGet.mockImplementation(async () => {
+      attemptedAt.push(Date.now())
+      throw new Error('offline')
+    })
+    render()
+    await settle()
+
+    act(() => state.ensureFolder('missing'))
+    await act(async () => vi.runAllTimersAsync())
+    const expectedAt = [0]
+
+    for (const delay of FOLDER_RETRY_DELAYS_MS) {
+      expectedAt.push(expectedAt.at(-1)! + delay)
+    }
+    expect(FOLDER_RETRY_DELAYS_MS).toHaveLength(2)
+    expect(attemptedAt).toEqual(expectedAt)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('releases an exhausted initial-listing owner for a later lifecycle', async () => {
+    vi.useFakeTimers()
+    harness.api.treeChildrenGet.mockRejectedValue(new Error('offline'))
+    render()
+    await settle()
+
+    act(() => state.ensureFolder('missing'))
+    await act(async () => vi.runAllTimersAsync())
+    expect(harness.api.treeChildrenGet).toHaveBeenCalledTimes(3)
+
+    harness.api.treeChildrenGet.mockResolvedValueOnce(listing('missing'))
+    act(() => state.ensureFolder('missing'))
+    await settle()
+
+    expect(harness.api.treeChildrenGet).toHaveBeenCalledTimes(4)
+    expect(state.notesIn('missing')?.map((note) => note.id)).toEqual(['id-missing'])
+  })
+
+  it('does not let an old A lifecycle commit into or release a new A lifecycle', async () => {
+    const oldA = deferred<TreeChildrenView>()
+    const newA = deferred<TreeChildrenView>()
+
+    harness.api.treeChildrenGet.mockReturnValueOnce(oldA.promise).mockReturnValueOnce(newA.promise)
+    render()
+    await settle()
+    act(() => state.ensureFolder('shared'))
+
+    harness.space = 'other'
+    render()
+    await settle()
+    harness.space = 'work'
+    render()
+    await settle()
+    act(() => state.ensureFolder('shared'))
+    expect(harness.api.treeChildrenGet).toHaveBeenCalledTimes(2)
+
+    await act(async () => oldA.resolve(listing('shared')))
+    expect(state.notesIn('shared')).toBeNull()
+    act(() => state.ensureFolder('shared'))
+    expect(harness.api.treeChildrenGet).toHaveBeenCalledTimes(2)
+
+    await act(async () => newA.resolve(listing('shared')))
+    expect(state.notesIn('shared')?.map((note) => note.id)).toEqual(['id-shared'])
+  })
+
+  it('does not retry an initial listing after unmount', async () => {
+    vi.useFakeTimers()
+    harness.api.treeChildrenGet.mockRejectedValue(new Error('offline'))
+    render()
+    await settle()
+    act(() => state.ensureFolder('orphaned'))
+    await settle()
+
+    await act(async () => root.unmount())
+    await act(async () => vi.runAllTimersAsync())
+    expect(harness.api.treeChildrenGet).toHaveBeenCalledOnce()
   })
 
   it('updates cache-owner refs before React flushes a local move', async () => {

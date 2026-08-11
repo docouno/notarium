@@ -1,4 +1,4 @@
-import { expect, test } from './fixtures'
+import { expect, type Page, test } from './fixtures'
 
 // #68.1 — a deep link must reveal + scroll + activate the note in the tree.
 // Opening /n/<id> cold should expand the folder chain down to the note, scroll
@@ -45,6 +45,13 @@ const DEEP_FIXTURE = {
     },
   ],
 }
+
+// `toBeInViewport()` is vacuous when the whole tree fits; positive scroll proves
+// that reveal actually moved the rail.
+const expectRailScrolled = (page: Page) =>
+  expect
+    .poll(() => page.getByTestId('rail-scroll').evaluate((el: HTMLElement) => el.scrollTop))
+    .toBeGreaterThan(0)
 
 // #161 — sync (refresh-tree) re-reveals the ACTIVE note. A deep link reveals on
 // open, but once the note is already active the reveal effect won't re-fire on
@@ -100,6 +107,7 @@ test('sync re-scrolls to the active note, clearing the glass head, after the rai
   const row = page.locator('[data-testid="tree-note"][data-id="fake-area-08-projects-2020-buried"]')
   await expect(row).toBeVisible()
   await expect(row).toBeInViewport() // deep-link scrolled it into view
+  await expectRailScrolled(page)
 
   // Scroll the rail to the bottom — the mid-list note virtualizes out (it's far
   // above the overscan window), so its row unmounts. The chain stays expanded.
@@ -112,6 +120,7 @@ test('sync re-scrolls to the active note, clearing the glass head, after the rai
   await page.getByTestId('refresh-tree').click()
   await expect(row).toBeVisible()
   await expect(row).toBeInViewport()
+  await expectRailScrolled(page)
   await expect(row).toHaveAttribute('aria-current', 'page')
 
   // …and it sits BELOW the floating glass head, not hidden under it (#161): the
@@ -181,6 +190,7 @@ test('deep-link reveals, scrolls to, and activates a deeply nested note', async 
   const row = page.locator('[data-testid="tree-note"][data-id="fake-area-08-projects-2020-buried"]')
   await expect(row).toBeVisible()
   await expect(row).toBeInViewport()
+  await expectRailScrolled(page)
   await expect(row).toHaveAttribute('aria-current', 'page')
 
   // …and it lands near the TOP (with a little context above it), not pinned to
@@ -209,6 +219,7 @@ test('deep-link to the tree’s LAST note still reveals + activates it (at the b
   const row = page.locator('[data-testid="tree-note"][data-id="fake-area-20-note-2"]')
   await expect(row).toBeVisible()
   await expect(row).toBeInViewport()
+  await expectRailScrolled(page)
   await expect(row).toHaveAttribute('aria-current', 'page')
 
   // It sits LOW (terminal item can't reach the top) — and that's fine.

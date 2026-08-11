@@ -13,7 +13,7 @@ import type { NoteDetailView, NoteView, Tree } from '../../../../libs/wire'
 import { api } from '../../../../services/api'
 import { useSpace } from '../../../SpaceProvider'
 import { CHANGED_COALESCE_MS, useSync } from '../../../SyncProvider'
-import { MOVED_PULSE_MS } from '../../consts'
+import { FOLDER_RETRY_DELAYS_MS, MOVED_PULSE_MS } from '../../consts'
 import { classifyNoteError } from '../../helpers/classifyNoteError'
 import { initialReaderState } from '../../helpers/initialReaderState'
 import { asNote, asRecent } from '../../helpers/noteMappers'
@@ -36,6 +36,8 @@ import {
   removeSeenIds,
   replaceSeenFolder,
 } from './seenRegistry'
+
+type FolderLoadOutcome = 'settled' | 'failed' | 'invalidated'
 
 /** A cold phase-1 id may be superseded by the durable frontmatter id while its
  *  read waits for boot. Only rewrite when the current route still addresses the
@@ -106,6 +108,8 @@ export const useNotesState = (): NotesContextValue => {
   // a space switch are dropped — an out-of-order listing from the previous
   // space must never seed the new one's maps.
   const spaceRef = useRef(space)
+  // Invalidates folder responses and retry delays on every switch or unmount.
+  const spaceGenerationRef = useRef(0)
   // Open-note sequencing (#68): a fast burst of file switches fires several
   // fetchNote calls; their responses can land out of order, and the OLDEST
   // (slowest) answer used to win and yank the reader back. A monotonic token
@@ -239,28 +243,36 @@ export const useNotesState = (): NotesContextValue => {
     }
   }, [])
 
-  /** Fetch one folder's direct listing into the cache (and the seen registry).
-   *  GET /api/tree/children IS the lazy tree's contract (#64) — title order
-   *  and step semantics live server-side, /api/notes stays a pure listing.
-   *  Per-folder sequencing: a refresh sweep may race an expand fetch of the
-   *  same folder, and responses can land out of order — only the LATEST
-   *  request's answer is applied, so a stale listing never overwrites a
-   *  fresher one. */
+  /** Fetch a direct listing and publish only the current per-folder request.
+   *  Distinguishes fetch failure from invalidation so a terminal stale response can start fresh.
+   *  @see docs/drag-and-drop.md#2-the-tree-shows-folders-and-files-obsidian-style */
   const loadFolder = useCallback(
-    async (folder: string): Promise<void> => {
+    async (folder: string): Promise<FolderLoadOutcome> => {
       const forSpace = spaceRef.current
+      const forGeneration = spaceGenerationRef.current
       const observedAt = observationEpoch()
       const seq = (folderLoadSeq.current.get(folder) ?? 0) + 1
       folderLoadSeq.current.set(folder, seq)
-      try {
-        const step = await api.treeChildrenGet(forSpace, folder)
-
-        if (spaceRef.current !== forSpace) {
-          return
+      const supersededOutcome = (): FolderLoadOutcome | null => {
+        if (spaceRef.current !== forSpace || spaceGenerationRef.current !== forGeneration) {
+          return 'settled'
         } // a switch landed mid-flight
         if (folderLoadSeq.current.get(folder) !== seq) {
-          return
+          // A loaded cache means another owner or an optimistic mutation supplied
+          // usable data. An initial listing invalidated without data must be retried.
+          return folderNotesRef.current.has(folder) ? 'settled' : 'invalidated'
         } // superseded mid-flight
+
+        return null
+      }
+
+      try {
+        const step = await api.treeChildrenGet(forSpace, folder)
+        const superseded = supersededOutcome()
+
+        if (superseded) {
+          return superseded
+        }
         const previous = folderNotesRef.current.get(folder) ?? []
         const observation = rememberSeenNotes(
           seenRef.current,
@@ -278,21 +290,51 @@ export const useNotesState = (): NotesContextValue => {
         // folder response just proved was deleted.
         commitSeen(nextSeen)
         commitFolderNotes(nextFolders)
+
+        return 'settled'
       } catch {
-        // a folder listing that failed simply stays unloaded; expand retries it
-        foldersInFlight.current.delete(folder)
+        return supersededOutcome() ?? 'failed'
       }
     },
     [commitFolderNotes, commitSeen, observationEpoch],
   )
 
+  /** Pursue an initial folder listing with one in-flight owner for the whole chain.
+   *  @see docs/drag-and-drop.md#2-the-tree-shows-folders-and-files-obsidian-style */
   const ensureFolder = useCallback(
     (folder: string) => {
       if (folderNotesRef.current.has(folder) || foldersInFlight.current.has(folder)) {
         return
       }
+      const forSpace = spaceRef.current
+      const forGeneration = spaceGenerationRef.current
       foldersInFlight.current.add(folder)
-      void loadFolder(folder).finally(() => foldersInFlight.current.delete(folder))
+
+      const pursue = async () => {
+        for (;;) {
+          for (const delay of FOLDER_RETRY_DELAYS_MS) {
+            if ((await loadFolder(folder)) === 'settled') {
+              return
+            }
+            await new Promise((resolve) => setTimeout(resolve, delay))
+            if (spaceRef.current !== forSpace || spaceGenerationRef.current !== forGeneration) {
+              return
+            }
+          }
+          if ((await loadFolder(folder)) !== 'invalidated') {
+            return
+          }
+          if (spaceRef.current !== forSpace || spaceGenerationRef.current !== forGeneration) {
+            return
+          }
+        }
+      }
+
+      void pursue().finally(() => {
+        if (spaceRef.current === forSpace && spaceGenerationRef.current === forGeneration) {
+          foldersInFlight.current.delete(folder)
+        }
+      })
     },
     [loadFolder],
   )
@@ -755,6 +797,7 @@ export const useNotesState = (): NotesContextValue => {
   // then load the new space's structure and re-apply the location.
   useEffect(() => {
     const bootSequence = ++spaceBootSeq.current
+    const generation = ++spaceGenerationRef.current
     // On the first mount revision zero is the snapshot/stream baseline, even if
     // the EventSource opened before this child effect ran. On a space switch the
     // currently-rendered revision belongs to the OLD space; wait for the new
@@ -796,6 +839,11 @@ export const useNotesState = (): NotesContextValue => {
     }
 
     void applyLocation(window.location.pathname).then(finishBoot, finishBoot)
+    return () => {
+      if (spaceGenerationRef.current === generation) {
+        spaceGenerationRef.current += 1
+      }
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [space])
 

@@ -12,6 +12,10 @@ import { expect, type Page, test } from './fixtures'
 // A deep tree: ten foldable folders (area-01…area-10, five notes each) with the
 // target note buried in a bottom folder below them all. Enough rows to virtualize
 // and scroll well past the fold, with many folders ABOVE the open note to toggle.
+const AREA_COUNT = 10
+const NOTES_PER_AREA = 5
+const ROWS_PER_AREA = NOTES_PER_AREA + 1
+
 const DEEP_TREE = {
   now: '2026-06-10T12:00:00.000Z',
   spaces: [
@@ -19,8 +23,8 @@ const DEEP_TREE = {
       slug: 'main',
       displayName: 'Main',
       notes: [
-        ...Array.from({ length: 10 }, (_, f) =>
-          Array.from({ length: 5 }, (_n, n) => ({
+        ...Array.from({ length: AREA_COUNT }, (_, f) =>
+          Array.from({ length: NOTES_PER_AREA }, (_n, n) => ({
             title: `Note ${String(f + 1).padStart(2, '0')}-${n + 1}`,
             filePath: `area-${String(f + 1).padStart(2, '0')}/note-${n + 1}.md`,
             modifiedAt: '2026-06-08T00:00:00.000Z',
@@ -45,6 +49,7 @@ const DEEP_TREE = {
 }
 
 const BURIED = 'fake-zz-bottom-buried'
+const folderRowIndex = (area: number) => (area - 1) * ROWS_PER_AREA
 const railScroll = (page: Page) => page.getByTestId('rail-scroll')
 const scrollTopOf = (page: Page) => railScroll(page).evaluate((el: HTMLElement) => el.scrollTop)
 const setScrollTop = (page: Page, top: number) =>
@@ -56,19 +61,107 @@ const setScrollTop = (page: Page, top: number) =>
 const folderTwisty = (page: Page, path: string) =>
   page.locator(`[data-testid="tree-folder"][data-path="${path}"] button`).first()
 
+// Arm before navigation. This bounds transport only; callers keep the DOM and
+// scroll assertions that prove React reconciliation and reveal.
+const folderListingFinished = (page: Page, path: string): Promise<void> =>
+  page
+    .waitForResponse((response) => {
+      const url = new URL(response.url())
+
+      return (
+        response.request().method() === 'GET' &&
+        response.ok() &&
+        url.pathname.endsWith('/tree/children') &&
+        url.searchParams.get('path') === path
+      )
+    })
+    .then(async (response) => {
+      const error = await response.finished()
+
+      if (error) {
+        throw error
+      }
+    })
+
+// The list geometry the component itself works in: the virtualizer's `scrollMargin`
+// (the list's offset inside the scroll pane) and the floating head that overlays the
+// pane's top edge. Both are read from the DOM the same way the component derives
+// them, so a computed scrollTop lands on exactly the row we mean.
+const listGeometry = (page: Page) =>
+  railScroll(page).evaluate((sc: HTMLElement) => {
+    const box = sc.querySelector('[role="tree"]')!
+    const head = document.querySelector('[data-testid="panel-head"]')!
+    const row = box.querySelector<HTMLElement>('[data-index]')
+
+    if (!row) {
+      throw new Error('Explorer geometry requires a mounted virtual row')
+    }
+
+    return {
+      margin: box.getBoundingClientRect().top - sc.getBoundingClientRect().top + sc.scrollTop,
+      headH: head.getBoundingClientRect().height,
+      clientHeight: sc.clientHeight,
+      rowH: row.getBoundingClientRect().height,
+    }
+  })
+
+// Visibility alone is vacuous when the whole tree fits. These cases require both
+// the active row in view and positive rail movement.
+const expectRevealSettledAtBottom = async (page: Page, listingFinished: Promise<void>) => {
+  await listingFinished
+  const buried = page.locator(`[data-testid="tree-note"][data-id="${BURIED}"]`)
+
+  await expect(buried).toBeVisible()
+  await expect(buried).toBeInViewport()
+  await expect.poll(() => scrollTopOf(page)).toBeGreaterThan(0)
+}
+
 // A short viewport so the buried note reliably falls outside it once we scroll to
 // the top — the condition under which the old bug force-scrolled it back.
 test.use({ viewport: { width: 1280, height: 520 } })
+
+test('a deep link expands the top level even when the tree skeleton lands last', async ({
+  page,
+  baseURL,
+}) => {
+  await page.request.post(`${baseURL}/api/__test/reset`, { data: { fixture: DEEP_TREE } })
+
+  // A response event precedes body parsing and React commit. Hold the skeleton until
+  // the reader title proves the note-side state has rendered.
+  const readerTitle = page.getByRole('heading', { name: 'Buried Note', level: 1 })
+  await page.route('**/api/s/*/tree', async (route) => {
+    await readerTitle.waitFor({ state: 'visible' })
+    await route.continue()
+  })
+
+  const listingFinished = folderListingFinished(page, 'zz-bottom')
+  await page.goto(`/n/${BURIED}`)
+  await listingFinished
+
+  // Settle reveal, then return to the top before reading virtualized folder rows.
+  const buried = page.locator(`[data-testid="tree-note"][data-id="${BURIED}"]`)
+  await expect(buried).toBeVisible() // true in BOTH worlds
+  await setScrollTop(page, 0)
+
+  // Both roots must be expanded in the deliberately inverted arrival order.
+  for (const path of ['area-01', 'area-02']) {
+    await expect(page.locator(`[data-testid="tree-folder"][data-path="${path}"]`)).toHaveAttribute(
+      'aria-expanded',
+      'true',
+    )
+  }
+})
 
 test('expanding a folder above the open note does NOT move the scroll (#242)', async ({
   page,
   baseURL,
 }) => {
   await page.request.post(`${baseURL}/api/__test/reset`, { data: { fixture: DEEP_TREE } })
+  const listingFinished = folderListingFinished(page, 'zz-bottom')
   await page.goto(`/n/${BURIED}`)
 
   const buried = page.locator(`[data-testid="tree-note"][data-id="${BURIED}"]`)
-  await expect(buried).toBeVisible() // deep-link revealed it at the bottom
+  await expectRevealSettledAtBottom(page, listingFinished) // deep-link revealed it at the bottom
 
   // Scroll to the top: the buried note virtualizes out (it's far below the fold).
   await setScrollTop(page, 0)
@@ -101,9 +194,10 @@ test('collapsing a folder above the open note does NOT move the scroll (#242)', 
   baseURL,
 }) => {
   await page.request.post(`${baseURL}/api/__test/reset`, { data: { fixture: DEEP_TREE } })
+  const listingFinished = folderListingFinished(page, 'zz-bottom')
   await page.goto(`/n/${BURIED}`)
   const buried = page.locator(`[data-testid="tree-note"][data-id="${BURIED}"]`)
-  await expect(buried).toBeVisible()
+  await expectRevealSettledAtBottom(page, listingFinished)
 
   // Scroll to the top: the buried note virtualizes out, the top folders show.
   await setScrollTop(page, 0)
@@ -137,92 +231,58 @@ test('anchoring: a reflow ABOVE the viewport shifts scrollTop to hold the visibl
   // scrollTop by exactly the reflowed block height. This test drives that path (the
   // four tests above sit at scrollTop 0, where the re-pin is a no-op).
   await page.request.post(`${baseURL}/api/__test/reset`, { data: { fixture: DEEP_TREE } })
+  const listingFinished = folderListingFinished(page, 'zz-bottom')
   await page.goto(`/n/${BURIED}`)
-  await expect(page.locator(`[data-testid="tree-note"][data-id="${BURIED}"]`)).toBeVisible()
+  await expectRevealSettledAtBottom(page, listingFinished)
 
   // area-01's listing lazy-loads on view (#64) — force it in so collapsing area-01
   // later removes a KNOWN 5 rows, not 0 skeleton rows. Scroll it into view and wait
   // for its last note; the loaded rows stay counted after we scroll away.
   await setScrollTop(page, 0)
-  await expect(
-    page.locator('[data-testid="tree-note"][data-id="fake-area-01-note-5"]'),
-  ).toBeVisible()
+  const area01LastNote = page.locator('[data-testid="tree-note"][data-id="fake-area-01-note-5"]')
+  await expect(area01LastNote).toBeVisible()
 
-  const ROW_H = 29
-  const measured = await railScroll(page).evaluate(async (sc: HTMLElement, rowH: number) => {
-    const raf = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)))
-    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
-    // The anchor the component pins is the row crossing the GLASS LINE (the top of the
-    // unobscured list, `scrollTop + headH`) — NOT y>=0. Measure it from the floating
-    // panel head so we match the component's own reference, then position so that row
-    // is area-02's header: that puts ALL of area-01 above the anchor line (collapsing
-    // it is a pure above-anchor reflow) while area-01 stays mounted (overscan) for the
-    // raw click, and the anchor (area-02) survives the collapse.
-    const head = document.querySelector('[data-testid="panel-head"]')
-    const glassLine =
-      sc.getBoundingClientRect().top + (head ? head.getBoundingClientRect().height : 0)
-    const rowAtGlass = () =>
-      [...sc.querySelectorAll('[data-testid="tree-folder"],[data-testid="tree-note"]')].find(
-        (el) => {
-          const r = el.getBoundingClientRect()
-          return r.top <= glassLine + 1 && r.bottom > glassLine + 1
-        },
-      )
-    let atGlass = null
+  // The anchor the component pins is the row crossing the GLASS LINE (the top of the
+  // UNOBSCURED list, `scrollTop + headH`) — not y >= 0. Put area-02's header there:
+  // that leaves ALL of area-01 above the anchor line, so collapsing it is a pure
+  // above-anchor reflow, while area-01 stays mounted (overscan) for the raw click and
+  // the anchor itself survives the collapse. The position is COMPUTED from the same
+  // geometry the component uses — row height is pinned in CSS and every row exists
+  // from the first paint — so there is nothing to hunt for. Aim at the row's MIDDLE:
+  // the component floors the glass line into a row index, and a half-row of slack
+  // makes that floor immune to sub-pixel rounding of the scrollTop we set.
+  const { margin, headH, rowH } = await listGeometry(page)
+  const anchorTop = Math.round(margin + folderRowIndex(2) * rowH + rowH / 2 - headH)
+  await setScrollTop(page, anchorTop)
 
-    for (let st = rowH; st <= 1000; st += 12) {
-      sc.scrollTop = st
-      await raf()
-      await sleep(30)
-      const el = rowAtGlass()
+  const area01Row = page.locator('[data-testid="tree-folder"][data-path="area-01"]')
+  const area02Row = page.locator('[data-testid="tree-folder"][data-path="area-02"]')
+  // Preconditions, as observable conditions rather than a settling delay: the rail is
+  // parked where we put it, area-01 is still mounted, and it sits entirely above the
+  // anchor row.
+  await expect.poll(() => scrollTopOf(page)).toBe(anchorTop)
+  await expect(area01Row).toBeAttached()
+  const before = {
+    scrollTop: anchorTop,
+    area01Y: (await area01Row.boundingBox())!.y,
+    area02Y: (await area02Row.boundingBox())!.y,
+  }
+  expect(before.area01Y).toBeLessThan(before.area02Y)
 
-      if (
-        el &&
-        el.getAttribute('data-path') === 'area-02' &&
-        sc.querySelector('[data-testid="tree-folder"][data-path="area-01"]')
-      ) {
-        atGlass = 'area-02'
-        break
-      }
-    }
-    const area01 = sc.querySelector('[data-testid="tree-folder"][data-path="area-01"]')
-    const area02 = sc.querySelector('[data-testid="tree-folder"][data-path="area-02"]')
-    const before = {
-      scrollTop: sc.scrollTop,
-      atGlass,
-      area01Mounted: !!area01,
-      area01Y: area01 ? Math.round(area01.getBoundingClientRect().top) : null,
-      area02Y: area02 ? Math.round(area02.getBoundingClientRect().top) : null,
-    }
+  // THE ACTION, as a raw DOM click — Playwright's .click() would auto-scroll area-01
+  // into view and measure the test driver instead of the reflow.
+  await area01Row.evaluate((el: HTMLElement) => el.querySelector('button')?.click())
+  // The reflow is DONE when area-01's notes are gone from the tree — an observable
+  // condition, not a timer.
+  await expect(area01LastNote).toHaveCount(0)
 
-    if (!atGlass || !area01) {
-      return { before, scrollTopAfter: sc.scrollTop, area02YAfter: null }
-    }
-    // Raw DOM click (NOT Playwright .click(), which would auto-scroll it into view).
-    area01.querySelector<HTMLElement>('button')?.click()
-    for (let i = 0; i < 8; i++) {
-      await raf()
-    }
-    await sleep(150)
-    const area02Now = sc.querySelector('[data-testid="tree-folder"][data-path="area-02"]')
-    return {
-      before,
-      scrollTopAfter: sc.scrollTop,
-      area02YAfter: area02Now ? Math.round(area02Now.getBoundingClientRect().top) : null,
-    }
-  }, ROW_H)
-
-  // Preconditions: area-02 is the row on the glass line, area-01 is mounted AND scrolled
-  // entirely above the anchor line (its header off the top).
-  expect(measured.before.atGlass).toBe('area-02')
-  expect(measured.before.area01Mounted).toBe(true)
-  expect(measured.before.area01Y!).toBeLessThan(measured.before.area02Y!)
-  // The payload: 5 notes removed above the anchor → scrollTop drops by EXACTLY one block…
-  expect(measured.before.scrollTop - measured.scrollTopAfter).toBe(5 * ROW_H)
+  // The payload: 5 notes removed above the anchor → scrollTop drops by EXACTLY one
+  // block…
+  await expect.poll(() => scrollTopOf(page)).toBe(before.scrollTop - NOTES_PER_AREA * rowH)
   // …and the anchor row (area-02) the user was looking at did NOT move on screen. Both
   // fail flat if the anchoring branch is deleted (scrollTop stays, area-02 jumps up
   // ~145px) or its offset math drifts.
-  expect(measured.area02YAfter).toBe(measured.before.area02Y)
+  expect((await area02Row.boundingBox())!.y).toBeCloseTo(before.area02Y, 0)
   await expect(page.locator(`[data-testid="tree-note"][data-id="${BURIED}"]`)).toHaveCount(0)
 })
 
@@ -235,62 +295,99 @@ test('reveal-on-open scrolls an OFF-SCREEN newly-opened note into view (latch re
   // core of the latch. So the click target must start OFF-SCREEN, and be clicked raw
   // (Playwright's .click() would auto-scroll it into view and mask a broken re-arm).
   await page.request.post(`${baseURL}/api/__test/reset`, { data: { fixture: DEEP_TREE } })
+  const listingFinished = folderListingFinished(page, 'zz-bottom')
   await page.goto(`/n/${BURIED}`)
-  await expect(page.locator(`[data-testid="tree-note"][data-id="${BURIED}"]`)).toBeVisible()
+  await expectRevealSettledAtBottom(page, listingFinished)
 
-  const r = await railScroll(page).evaluate(async (sc: HTMLElement) => {
-    const raf = () => new Promise((res) => requestAnimationFrame(() => requestAnimationFrame(res)))
-    const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms))
-    // A mid position: the folders here are loaded and there are notes mounted just BELOW
-    // the fold (react-virtual overscan) — off-screen but clickable.
-    sc.scrollTop = 260
-    await raf()
-    await sleep(250)
-    const bottom = sc.getBoundingClientRect().bottom
-    const target = [...sc.querySelectorAll('[data-testid="tree-note"]')]
-      .map((el) => ({ id: el.getAttribute('data-id'), top: el.getBoundingClientRect().top }))
-      .filter((n) => n.top > bottom) // strictly below the visible band
-      .sort((a, b) => a.top - b.top)[0]
+  // Park mid-tree — plenty of rows above and below, and the rows just past the fold
+  // are mounted by overscan: off-screen, yet clickable without Playwright scrolling
+  // them into view first.
+  const { margin, headH, clientHeight, rowH } = await listGeometry(page)
+  const midTop = Math.round(margin + folderRowIndex(4) * rowH - headH)
+  await setScrollTop(page, midTop)
+  await expect.poll(() => scrollTopOf(page)).toBe(midTop)
 
-    if (!target) {
-      return { found: false }
-    }
-    const beforeScroll = sc.scrollTop
-    // Raw DOM click — opens the note without Playwright's actionability auto-scroll.
-    sc.querySelector<HTMLElement>(`[data-testid="tree-note"][data-id="${target.id}"]`)?.click()
-    let box = null
+  // The first row strictly below the visible band. Each fixture block starts with
+  // a folder header; step over it, because this scenario needs a note to open.
+  const firstBelow = Math.floor((midTop + clientHeight - margin) / rowH) + 1
+  const targetIndex = firstBelow % ROWS_PER_AREA === 0 ? firstBelow + 1 : firstBelow
+  const targetId = `fake-area-${String(Math.floor(targetIndex / ROWS_PER_AREA) + 1).padStart(2, '0')}-note-${targetIndex % ROWS_PER_AREA}`
+  const target = page.locator(`[data-testid="tree-note"][data-id="${targetId}"]`)
 
-    for (let i = 0; i < 40; i++) {
-      await raf()
-      await sleep(50)
-      const el = sc.querySelector(`[data-testid="tree-note"][data-id="${target.id}"]`)
-      box = el ? el.getBoundingClientRect() : null
-      if (
-        box &&
-        box.top >= 0 &&
-        box.bottom <= sc.getBoundingClientRect().bottom &&
-        el?.getAttribute('aria-current') === 'page'
-      ) {
-        break
-      }
-    }
-    const vh = sc.getBoundingClientRect().bottom
-    return {
-      found: true,
-      id: target.id,
-      beforeScroll,
-      afterScroll: sc.scrollTop,
-      inViewport: !!box && box.top >= 0 && box.bottom <= vh,
-    }
-  })
-
-  expect(r.found).toBe(true)
-  expect(r.afterScroll).not.toBe(r.beforeScroll) // the reveal actually scrolled (re-arm fired)
-  expect(r.inViewport).toBe(true) // the off-screen note was brought into view
-  await expect(page.locator(`[data-testid="tree-note"][data-id="${r.id}"]`)).toHaveAttribute(
-    'aria-current',
-    'page',
+  const railBottom = await railScroll(page).evaluate(
+    (sc: HTMLElement) => sc.getBoundingClientRect().bottom,
   )
+  await expect(target).toBeAttached() // mounted by overscan…
+  expect((await target.boundingBox())!.y).toBeGreaterThan(railBottom) // …but off-screen
+
+  // Raw DOM click — opens the note without Playwright's actionability auto-scroll.
+  await target.evaluate((el: HTMLElement) => el.click())
+
+  await expect(target).toHaveAttribute('aria-current', 'page')
+  await expect.poll(() => scrollTopOf(page)).not.toBe(midTop) // the reveal really scrolled
+  // …and it brought the off-screen row fully into the visible band.
+  const box = (await target.boundingBox())!
+  expect(box.y).toBeGreaterThanOrEqual(0)
+  expect(box.y + box.height).toBeLessThanOrEqual(railBottom)
+})
+
+test('a dropped listing is retried twice, then reveal completes', async ({ page, baseURL }) => {
+  await page.request.post(`${baseURL}/api/__test/reset`, { data: { fixture: DEEP_TREE } })
+
+  const reconciliationMarker = 'retry-reconciliation-marker'
+  let treeResponses = 0
+  await page.route(
+    (url) => url.pathname.endsWith('/tree'),
+    async (route) => {
+      const response = await route.fetch()
+      const tree = await response.json()
+
+      treeResponses += 1
+      tree.folders.push({
+        path: reconciliationMarker,
+        name: reconciliationMarker,
+        count: treeResponses === 1 ? 0 : 1,
+        direct: treeResponses === 1 ? 0 : 1,
+      })
+      await route.fulfill({ response, json: tree })
+    },
+  )
+  let reconciliationReady!: () => void
+  const reconciliationApplied = new Promise<void>((resolve) => {
+    reconciliationReady = resolve
+  })
+  await page.route(
+    (url) =>
+      url.pathname.endsWith('/tree/children') &&
+      url.searchParams.get('path') === reconciliationMarker,
+    async (route) => {
+      await route.fulfill({ json: { folders: [], notes: [], total: 0 } })
+      reconciliationReady()
+    },
+  )
+  let attempts = 0
+  await page.route(
+    (url) =>
+      url.pathname.endsWith('/tree/children') && url.searchParams.get('path') === 'zz-bottom',
+    async (route) => {
+      attempts += 1
+      if (attempts === 1) {
+        // The marker listing can start only after the second tree response has
+        // committed and Sidebar's passive lazy-listing effect has run.
+        await reconciliationApplied
+      }
+
+      return attempts <= 2 ? route.abort() : route.continue()
+    },
+  )
+
+  await page.goto(`/n/${BURIED}`)
+
+  const buried = page.locator(`[data-testid="tree-note"][data-id="${BURIED}"]`)
+  await expect(buried).toBeVisible()
+  await expect(buried).toBeInViewport()
+  await expect(buried).toHaveAttribute('aria-current', 'page')
+  expect(attempts).toBe(3)
 })
 
 test('expanding a folder BELOW the open note does NOT move the scroll (symmetry lock)', async ({
@@ -303,6 +400,9 @@ test('expanding a folder BELOW the open note does NOT move the scroll (symmetry 
   const active = page.locator('[data-testid="tree-note"][data-id="fake-area-01-note-1"]')
   await expect(active).toBeVisible()
   await setScrollTop(page, 0) // active note near the top, in view
+  // The bottom folder being unmounted proves the tree grew past the fold; this
+  // active note sits near the top, so reveal movement cannot prove that premise.
+  await expect(page.locator('[data-testid="tree-folder"][data-path="zz-bottom"]')).toHaveCount(0)
 
   // Collapse then expand the nearest folder BELOW the active note. Wait for its
   // listing first: otherwise lazy listings above a farther target can push that
