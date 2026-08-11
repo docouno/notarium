@@ -7,7 +7,7 @@ export {
   type NotariumStoreOptions,
   type SearchTuning,
 } from './services/notariumStore'
-export { createLocalFsFiles, type FileStat, type FileStore } from './libs/files'
+export { createLocalFsFiles, renameNoReplace, type FileStat, type FileStore } from './libs/files'
 export {
   createNodeSqliteDriver,
   type NodeSqliteDriverOptions,

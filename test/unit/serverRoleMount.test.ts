@@ -3,9 +3,10 @@ import type { FastifyInstance } from 'fastify'
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect } from 'vitest'
 
 import { createServer } from '../../packages/server/src/apps/server/server'
+import { itAtomicPublish } from '../role-library-contract/atomicPublishGate'
 
 let root: string
 let app: FastifyInstance | undefined
@@ -21,7 +22,7 @@ afterEach(async () => {
 })
 
 describe('createServer — configured role mount', () => {
-  it('reads and writes roles through the configured skill directory', async () => {
+  itAtomicPublish('reads and writes roles through the configured skill directory', async () => {
     const notesDir = join(root, 'notes')
     const skillDir = join(root, 'custom-skill-library')
     app = await createServer({

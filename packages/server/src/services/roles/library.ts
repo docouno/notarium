@@ -1,7 +1,9 @@
 import { randomUUID } from 'node:crypto'
-import { lstat, mkdir, open, opendir, rename, rm, writeFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { lstat, mkdir, open, opendir, rm, writeFile } from 'node:fs/promises'
+import { dirname, join, relative as relativePath } from 'node:path'
 
+import { renameNoReplace } from '@notarium/engine'
+import { isReclaimableInstallStaging } from './installStaging'
 import { MAX_SKILL_FILE_BYTES, MAX_SKILL_MANIFEST_BYTES } from './skillFile'
 import type { RoleLocation } from './types'
 
@@ -12,6 +14,11 @@ const MAX_PACKAGE_DEPTH = 16
 const MAX_LIBRARY_ENTRIES = 1_024
 const MAX_LIBRARY_PACKAGES = 256
 const MAX_LIBRARY_BYTES = 64 * 1024 * 1024
+// The same window the two age-only sweeps of this repo use, and a stricter bound
+// than theirs: they sweep a file whose mtime advances on every write, while a
+// staging DIRECTORY's mtime freezes at its last top-level entry — so this bounds
+// an install's whole wall-clock time, not its idle time.
+const STALE_INSTALL_MS = 60 * 60 * 1_000
 const PACKAGE_NAME = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/
 
 export type SkillPackage = {
@@ -88,6 +95,21 @@ const packageRoot = (libraryRoot: string, location: RoleLocation): string =>
   location.scope === 'project'
     ? join(libraryRoot, '_projects', projectDirectory(location.projectId!))
     : libraryRoot
+
+const assertRealDirectory = async (path: string, missingAllowed: boolean): Promise<void> => {
+  try {
+    const info = await lstat(path)
+
+    if (!info.isDirectory() || info.isSymbolicLink()) {
+      throw new Error(`role library path must be a real directory: ${path}`)
+    }
+  } catch (err) {
+    if (missingAllowed && (err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return
+    }
+    throw err
+  }
+}
 
 const readBoundedFile = async (path: string, remaining: number): Promise<Uint8Array> => {
   const handle = await open(path, 'r')
@@ -245,17 +267,119 @@ export const createFsRoleLibrary = ({
 }: {
   rootForSpace(space: string): string | null
 }): RoleLibrary => {
-  const rootOf = (location: RoleLocation): string => {
-    const root = rootForSpace(location.space)
+  const rootsOf = (location: RoleLocation): { mount: string; root: string } => {
+    const mount = rootForSpace(location.space)
 
-    if (!root) {
+    if (!mount) {
       throw new Error('role library is unavailable for this space')
     }
     if (location.scope === 'project' && !location.projectId) {
       throw new Error('project role location requires projectId')
     }
 
-    return packageRoot(root, location)
+    return { mount, root: packageRoot(mount, location) }
+  }
+  const rootOf = (location: RoleLocation): string => rootsOf(location).root
+  type SweepState = { running?: Promise<void>; cleanUntil: number }
+  const sweeps = new Map<string, SweepState>()
+
+  const prepareRoot = async (
+    location: RoleLocation,
+    mount: string,
+    root: string,
+  ): Promise<void> => {
+    if (location.scope !== 'project') {
+      await mkdir(root, { recursive: true })
+      return
+    }
+
+    // The configured mount itself may intentionally be a symlink, but the two
+    // namespaces owned by the library must not redirect sweeping or publication.
+    const projectsRoot = join(mount, '_projects')
+
+    await assertRealDirectory(projectsRoot, true)
+    await assertRealDirectory(root, true)
+    await mkdir(root, { recursive: true })
+    await assertRealDirectory(projectsRoot, false)
+    await assertRealDirectory(root, false)
+  }
+
+  /** One non-recursive pass over a library root, removing staging directories no
+   *  live install can still own. Returns whether anything was spared for being
+   *  young. A failure on one entry never stops the rest: an undeletable leftover
+   *  (EACCES after a restore under a foreign uid, EBUSY on a mounted path) would
+   *  otherwise block the reclaim of every other one forever. */
+  const reclaimStaleStaging = async (mount: string, root: string): Promise<boolean> => {
+    let entries = 0
+    let spared = false
+
+    for await (const entry of await opendir(root)) {
+      entries++
+      if (entries > MAX_LIBRARY_ENTRIES) {
+        break
+      }
+      const path = join(root, entry.name)
+
+      try {
+        // Dirent is only a snapshot from when the root was opened. A restore or
+        // sync can replace that pathname before cleanup reaches it, so the
+        // destructive type decision must use the object that is current now.
+        const info = await lstat(path)
+
+        if (!isReclaimableInstallStaging(relativePath(mount, path), info.isDirectory())) {
+          continue
+        }
+        if (Date.now() - info.mtimeMs < STALE_INSTALL_MS) {
+          spared = true
+          continue
+        }
+        await rm(path, { recursive: true, force: true })
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+          continue // a concurrent install finished with its own staging
+        }
+        console.warn(
+          `[roles] ignoring unreclaimable staging ${entry.name}:`,
+          (err as Error).message,
+        )
+      }
+    }
+
+    return spared
+  }
+
+  /** Reclaim orphaned staging lazily without walking once per dependency. An
+   *  in-flight promise deduplicates concurrent installs. A clean result is cached
+   *  only for the stale window: staging may appear later after another process
+   *  dies or this process fails to clean its own temp, and by the time that new
+   *  entry can be reclaimable the cache must have expired. A young entry clears
+   *  the cache immediately so the next install can observe it crossing the age
+   *  threshold. A failed pass is throttled for one window rather than retried on
+   *  every package publication forever. */
+  const sweepStaleStaging = (mount: string, root: string): Promise<void> => {
+    const state = sweeps.get(root) ?? { cleanUntil: 0 }
+
+    if (state.running) {
+      return state.running
+    }
+    if (state.cleanUntil > Date.now()) {
+      return Promise.resolve()
+    }
+    const sweep = reclaimStaleStaging(mount, root)
+      .then((spared) => {
+        state.cleanUntil = spared ? 0 : Date.now() + STALE_INSTALL_MS
+      })
+      .catch((err: Error) => {
+        state.cleanUntil = Date.now() + STALE_INSTALL_MS
+        console.warn(`[roles] failed to sweep install staging in ${root}:`, err.message)
+      })
+      .finally(() => {
+        state.running = undefined
+      })
+
+    state.running = sweep
+    sweeps.set(root, state)
+    return sweep
   }
 
   return {
@@ -381,30 +505,36 @@ export const createFsRoleLibrary = ({
     },
     putIfAbsent: async (location, pkg) => {
       validateSkillPackage(pkg)
-      const root = rootOf(location)
-      await mkdir(root, { recursive: true })
+      const { mount, root } = rootsOf(location)
+      await prepareRoot(location, mount, root)
+      await sweepStaleStaging(mount, root)
       const target = join(root, pkg.name)
       const temp = join(root, `.${pkg.name}.install-${randomUUID()}`)
       await mkdir(temp, { recursive: false })
 
       try {
-        for (const [relative, content] of pkg.files) {
-          const parts = relative.split('/')
-          const file = join(temp, ...parts)
-          await mkdir(dirname(file), { recursive: true })
-          await writeFile(file, content, { flag: 'wx' })
+        for (const [file, content] of pkg.files) {
+          const path = join(temp, ...file.split('/'))
+          await mkdir(dirname(path), { recursive: true })
+          await writeFile(path, content, { flag: 'wx' })
         }
-        try {
-          await rename(temp, target)
-          return true
-        } catch (err) {
-          if (['EEXIST', 'ENOTEMPTY'].includes((err as NodeJS.ErrnoException).code ?? '')) {
-            return false
-          }
-          throw err
-        }
+
+        // The arbiter is the primitive, in one atomic filesystem operation: an
+        // occupied pathname of ANY shape is a conflict, never a replacement.
+        // Its errors — an unavailable capability included — travel out as they
+        // are; there is no fallback to a raceable rename on any branch.
+        return await renameNoReplace(temp, target)
       } finally {
-        await rm(temp, { recursive: true, force: true })
+        // On the conflict branch the staging really is still there, so this rm
+        // does work — and a read-only volume or an EACCES must not turn a
+        // defined `false` into a 500.
+        await rm(temp, { recursive: true, force: true }).catch((err: Error) => {
+          // This process just created a possible orphan after the last sweep.
+          // Drop the clean cache so a later install keeps checking it until it
+          // ages into the reclaimable window.
+          sweeps.delete(root)
+          console.warn(`[roles] failed to remove install staging ${temp}:`, err.message)
+        })
       }
     },
   }

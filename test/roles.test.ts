@@ -13,6 +13,7 @@ import {
   RoleAlreadyExistsError,
   roleContextTargetOf,
   RoleDependencyConflictError,
+  type RoleLibrary,
   type SkillPackage,
   withBuiltinProvenance,
 } from '../packages/server/src/services/roles'
@@ -178,6 +179,71 @@ describe('role catalog and owned libraries', () => {
     expect(await roles.loadAt(project, 'grooming', 4_000)).toMatchObject({
       role: { scope: 'project', instructions: 'Project rules win.' },
     })
+  })
+
+  it('maps a role publication race after the precheck to already-exists', async () => {
+    const delegate = createInMemoryRoleLibrary()
+    let rolePrechecks = 0
+    let releasePrechecks!: () => void
+    const bothPrechecked = new Promise<void>((resolve) => {
+      releasePrechecks = resolve
+    })
+    const observed: boolean[] = []
+    const library: RoleLibrary = {
+      ...delegate,
+      exists: async (location, name) => {
+        const occupied = await delegate.exists(location, name)
+
+        if (name === 'grooming' && rolePrechecks < 2) {
+          observed.push(occupied)
+          rolePrechecks++
+          if (rolePrechecks === 2) {
+            releasePrechecks()
+          }
+          await bothPrechecked
+        }
+
+        return occupied
+      },
+    }
+    const roles = createRolesService({ catalog: loadBuiltinRoleCatalog, library })
+    const location = { scope: 'personal' as const, space: 'personal' }
+    const results = await Promise.allSettled([
+      roles.addFromCatalog('grooming', location),
+      roles.addFromCatalog('grooming', location),
+    ])
+    const fulfilled = results.filter((result) => result.status === 'fulfilled')
+    const rejected = results.filter(
+      (result): result is PromiseRejectedResult => result.status === 'rejected',
+    )
+
+    // Both requests crossed the cheap precheck while the role name was free;
+    // the filesystem-equivalent putIfAbsent race is therefore the only arbiter.
+    expect(observed).toEqual([false, false])
+    expect(fulfilled).toHaveLength(1)
+    expect(rejected).toHaveLength(1)
+    expect(rejected[0]!.reason).toBeInstanceOf(RoleAlreadyExistsError)
+    expect(await library.get(location, 'grooming')).not.toBeNull()
+  })
+
+  it('reuses a byte-identical linked skill an interrupted install already left', async () => {
+    const library = createInMemoryRoleLibrary()
+    const roles = createRolesService({ catalog: loadBuiltinRoleCatalog, library })
+    const personal = { scope: 'personal' as const, space: 'personal' }
+    const project = { scope: 'project' as const, space: 'personal', projectId: 'project-a' }
+
+    // Exactly what a crashed Add leaves: the linked skill published with the
+    // owned bytes it would get again, and the role target still free. Forking it
+    // once through a complete Add is the only way to name those bytes.
+    await roles.addFromCatalog('grooming', personal)
+    const dependency = (await library.get(personal, 'grooming-evidence'))!
+
+    expect(await library.putIfAbsent(project, dependency)).toBe(true)
+    await expect(roles.addFromCatalog('grooming', project)).resolves.toMatchObject({
+      name: 'grooming',
+      scope: 'project',
+    })
+    expect(await library.get(project, 'grooming-evidence')).toEqual(dependency)
   })
 
   it('rejects a linked-skill collision instead of binding a role to different bytes', async () => {

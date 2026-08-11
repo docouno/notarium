@@ -76,7 +76,8 @@ contains:
 
 Only Notarium-owned incomplete files are omitted: dot-named atomic note temps,
 exact `.<role>.install-<uuid>` role-package staging directories at a Personal/Space library root or
-an exact `_projects/<encoded-project-id>/` library root,
+an exact `_projects/<encoded-project-id>/` library root (one orphaned by a process death is reclaimed
+by the next install into that same library root, once it is more than an hour old),
 `jobs/imports/<space>/<job>.import.part`, and in-progress export artifact parts.
 Ordinary user files or directories ending in `.part` are legitimate and remain
 in the backup. `data/engine/` is derived and omitted; it rebuilds after restore.

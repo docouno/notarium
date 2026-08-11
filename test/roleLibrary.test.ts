@@ -12,6 +12,7 @@ import {
   RoleAlreadyExistsError,
   RoleDependencyConflictError,
 } from '../packages/server/src/services/roles'
+import { itAtomicPublish } from './role-library-contract/atomicPublishGate'
 
 let root: string
 const location = { scope: 'personal' as const, space: 'personal' }
@@ -155,34 +156,37 @@ describe('filesystem role library bounds', () => {
     ).rejects.toThrow(/invalid Agent Skill package path/)
   })
 
-  it('keeps project roots separate from a same-named Personal or Space package', async () => {
-    const library = createFsRoleLibrary({ rootForSpace: () => root })
-    const projectId = 'project-root'
-    const project = { scope: 'project' as const, space: 'personal', projectId }
-    const packageOf = (name: string) => ({
-      name,
-      files: new Map([
-        ['SKILL.md', Buffer.from(`---\nname: ${name}\ndescription: ${name}.\n---\n`)],
-      ]),
-    })
+  itAtomicPublish(
+    'keeps project roots separate from a same-named Personal or Space package',
+    async () => {
+      const library = createFsRoleLibrary({ rootForSpace: () => root })
+      const projectId = 'project-root'
+      const project = { scope: 'project' as const, space: 'personal', projectId }
+      const packageOf = (name: string) => ({
+        name,
+        files: new Map([
+          ['SKILL.md', Buffer.from(`---\nname: ${name}\ndescription: ${name}.\n---\n`)],
+        ]),
+      })
 
-    await expect(library.putIfAbsent(location, packageOf(projectId))).resolves.toBe(true)
-    await expect(library.putIfAbsent(project, packageOf('project-role'))).resolves.toBe(true)
+      await expect(library.putIfAbsent(location, packageOf(projectId))).resolves.toBe(true)
+      await expect(library.putIfAbsent(project, packageOf('project-role'))).resolves.toBe(true)
 
-    await expect(library.get(location, projectId)).resolves.toMatchObject({ name: projectId })
-    await expect(library.get(project, 'project-role')).resolves.toMatchObject({
-      name: 'project-role',
-    })
-    await expect(library.listManifests(location)).resolves.toEqual({
-      packages: [expect.objectContaining({ name: projectId })],
-      truncated: false,
-    })
-    await expect(library.listManifests(project)).resolves.toEqual({
-      packages: [expect.objectContaining({ name: 'project-role' })],
-      truncated: false,
-    })
-    expect((await createLocalFsFiles(root).scan()).map((entry) => entry.path)).toContain(
-      `_projects/${Buffer.from(projectId).toString('base64url')}/project-role/SKILL.md`,
-    )
-  })
+      await expect(library.get(location, projectId)).resolves.toMatchObject({ name: projectId })
+      await expect(library.get(project, 'project-role')).resolves.toMatchObject({
+        name: 'project-role',
+      })
+      await expect(library.listManifests(location)).resolves.toEqual({
+        packages: [expect.objectContaining({ name: projectId })],
+        truncated: false,
+      })
+      await expect(library.listManifests(project)).resolves.toEqual({
+        packages: [expect.objectContaining({ name: 'project-role' })],
+        truncated: false,
+      })
+      expect((await createLocalFsFiles(root).scan()).map((entry) => entry.path)).toContain(
+        `_projects/${Buffer.from(projectId).toString('base64url')}/project-role/SKILL.md`,
+      )
+    },
+  )
 })

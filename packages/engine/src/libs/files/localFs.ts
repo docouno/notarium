@@ -12,13 +12,12 @@
 // the note-derived tree matched the index; the directory
 // channel replaces that — the tree shows real on-disk folders now.)
 
-import { execFile } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { promises as fs, constants as fsConstants, watch as fsWatch } from 'node:fs'
 import { dirname, join, relative, resolve, sep } from 'node:path'
-import { promisify } from 'node:util'
 
 import { clipToBytes, isAtomicInstallTempPath, UNNAMED_NOTE_FILENAME } from '@notarium/core'
+import { renameNoReplace } from './renameNoReplace'
 import type { FileStat, FileStore } from './types'
 
 /** Directory entries the scan never descends into: dotfiles hide editor/state
@@ -78,69 +77,6 @@ type FsMoveOperation = {
   intent: FsMoveIntent
   source: string
   target: string
-}
-
-const execFileAsync = promisify(execFile)
-
-/** Linux syscall numbers are ABI, not kernel-version dependent. Keep the
- * supported set deliberately small: an unknown runtime must fail closed rather
- * than emulate RENAME_NOREPLACE with a check-then-rename sequence. */
-const RENAMEAT2_SYSCALL: Partial<Record<NodeJS.Architecture, number>> = {
-  arm64: 276,
-  x64: 316,
-}
-const PERL_RENAME_NOREPLACE = String.raw`
-  use strict;
-  use warnings;
-  my ($nr, $from, $to) = @ARGV;
-  my $result = syscall(0 + $nr, -100, $from, -100, $to, 1);
-  exit 0 if $result == 0;
-  print STDERR 0 + $!;
-  exit 1;
-`
-
-/** Call renameat2(RENAME_NOREPLACE) directly. GNU mv is intentionally not a
- * capability boundary: its portability layer may fall back to a raceable
- * lstat+rename implementation when the syscall or filesystem is unsupported. */
-const renameNoReplaceNative = async (source: string, target: string): Promise<boolean> => {
-  const syscall = process.platform === 'linux' ? RENAMEAT2_SYSCALL[process.arch] : undefined
-
-  if (syscall === undefined) {
-    throw Object.assign(new Error('atomic no-replace rename is unavailable'), {
-      code: 'ENOTSUP',
-    })
-  }
-
-  try {
-    await execFileAsync('/usr/bin/perl', [
-      '-e',
-      PERL_RENAME_NOREPLACE,
-      String(syscall),
-      source,
-      target,
-    ])
-    return true
-  } catch (err) {
-    const nativeErrno = Number((err as { stderr?: string }).stderr?.trim())
-
-    if (nativeErrno === 17) {
-      return false
-    }
-    const code =
-      nativeErrno === 2
-        ? 'ENOENT'
-        : nativeErrno === 18
-          ? 'EXDEV'
-          : [22, 38, 95].includes(nativeErrno)
-            ? 'ENOTSUP'
-            : 'EIO'
-
-    throw Object.assign(new Error('atomic no-replace rename failed'), {
-      cause: err,
-      code,
-      errno: Number.isFinite(nativeErrno) ? nativeErrno : undefined,
-    })
-  }
 }
 
 type RootLockState = { tail: Promise<void>; pending: number }
@@ -785,7 +721,7 @@ export const createLocalFsFiles = (root: string): FileStore => {
     }
 
     try {
-      if (await renameNoReplaceNative(captured, publicPath)) {
+      if (await renameNoReplace(captured, publicPath)) {
         return {}
       }
     } catch (err) {
@@ -829,7 +765,7 @@ export const createLocalFsFiles = (root: string): FileStore => {
       const candidate =
         attempt === 0 ? stable : join(dirname(publicPath), recoveryName('entry', false))
 
-      if (await renameNoReplaceNative(captured, candidate)) {
+      if (await renameNoReplace(captured, candidate)) {
         return { recovery: candidate }
       }
     }
@@ -1724,7 +1660,7 @@ export const createLocalFsFiles = (root: string): FileStore => {
             code: 'ENOTSUP',
           })
         }
-        const moved = await renameNoReplaceNative(source, target)
+        const moved = await renameNoReplace(source, target)
 
         if (!moved) {
           return false

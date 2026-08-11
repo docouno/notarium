@@ -291,11 +291,14 @@ proof: two distinct hardlink names share them, and a POSIX rename between those 
 no-op that would leave the old note behind. Symlinks and hardlink aliases are therefore
 occupants, not alternate spellings of the source.
 
-Directory moves use the same no-replace rule. On the supported Linux runtime LocalFS
-delegates the one namespace transition to GNU `mv -n`, whose coreutils implementation uses
-`renameat2(RENAME_NOREPLACE)`; source and destination parent are verified on one filesystem
-so no copy fallback is possible. Unsupported runtimes fail with `ENOTSUP` rather than use a
-check-then-rename approximation. A case/NFC-only spelling change of the same directory entry
+Directory moves use the same no-replace rule, through the one primitive the engine exposes
+for it. On the supported Linux runtime that primitive calls `renameat2(RENAME_NOREPLACE)`
+directly rather than through GNU `mv -n`, whose portability layer may fall back to a raceable
+check-then-rename; source and destination parent are verified on one filesystem so no copy
+fallback is possible. Runtimes without the syscall — another platform, an unmapped
+architecture, a filesystem or kernel that refuses it, or an interpreter that cannot be
+executed — fail with `ENOTSUP` rather than use a check-then-rename approximation. The role
+library publishes an owned package with the same primitive. A case/NFC-only spelling change of the same directory entry
 uses the direct atomic rename exception and verifies the source inode afterwards.
 
 `uniquify` is resolved **above** the engines, in the read-model: it picks the first free name

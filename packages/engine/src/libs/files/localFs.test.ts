@@ -8,6 +8,10 @@ import { createLocalFsFiles } from './localFs'
 
 const roots: string[] = []
 
+const itProcess = (name: string, test: () => Promise<void>): void => {
+  it(name, test, 15_000)
+}
+
 const mkroot = async (): Promise<string> => {
   const root = await fs.mkdtemp(join(tmpdir(), 'notarium-localfs-'))
   roots.push(root)
@@ -649,55 +653,64 @@ describe('localFs pathname occupancy', () => {
     expect(after.mtimeNs).toBe(before.mtimeNs)
   })
 
-  it('finishes a pure rename after the process stops between publication and detach', async () => {
-    const root = await mkroot()
-    const source = join(root, 'source.md')
-    const target = join(root, 'target.md')
+  itProcess(
+    'finishes a pure rename after the process stops between publication and detach',
+    async () => {
+      const root = await mkroot()
+      const source = join(root, 'source.md')
+      const target = join(root, 'target.md')
 
-    await fs.writeFile(source, 'source', { mode: 0o600 })
-    const before = await fs.stat(source, { bigint: true })
-    crashMove(root, 'rename', 'after-publication')
+      await fs.writeFile(source, 'source', { mode: 0o600 })
+      const before = await fs.stat(source, { bigint: true })
+      crashMove(root, 'rename', 'after-publication')
 
-    // The interrupted public state is deliberately redundant but lossless.
-    await expect(fs.readFile(source, 'utf8')).resolves.toBe('source')
-    await expect(fs.readFile(target, 'utf8')).resolves.toBe('source')
+      // The interrupted public state is deliberately redundant but lossless.
+      await expect(fs.readFile(source, 'utf8')).resolves.toBe('source')
+      await expect(fs.readFile(target, 'utf8')).resolves.toBe('source')
 
-    const recovered = createLocalFsFiles(root)
-    await expect(recovered.scan()).resolves.toEqual([
-      expect.objectContaining({ path: 'target.md' }),
-    ])
-    await expect(recovered.read('source.md')).resolves.toBeNull()
-    await expect(recovered.read('target.md')).resolves.toBe('source')
-    expect((await fs.stat(target, { bigint: true })).ino).toBe(before.ino)
-    expect(await fs.readdir(root)).toEqual(['target.md'])
-  })
+      const recovered = createLocalFsFiles(root)
+      await expect(recovered.scan()).resolves.toEqual([
+        expect.objectContaining({ path: 'target.md' }),
+      ])
+      await expect(recovered.read('source.md')).resolves.toBeNull()
+      await expect(recovered.read('target.md')).resolves.toBe('source')
+      expect((await fs.stat(target, { bigint: true })).ino).toBe(before.ino)
+      expect(await fs.readdir(root)).toEqual(['target.md'])
+    },
+  )
 
-  it('restarts recovery itself after a second process stops during source detach', async () => {
-    const root = await mkroot()
+  itProcess(
+    'restarts recovery itself after a second process stops during source detach',
+    async () => {
+      const root = await mkroot()
 
-    await fs.writeFile(join(root, 'source.md'), 'source')
-    crashMove(root, 'rename', 'after-publication')
-    crashRecoveryAfterDetach(root)
+      await fs.writeFile(join(root, 'source.md'), 'source')
+      crashMove(root, 'rename', 'after-publication')
+      crashRecoveryAfterDetach(root)
 
-    const recovered = createLocalFsFiles(root)
-    await expect(recovered.read('source.md')).resolves.toBeNull()
-    await expect(recovered.read('target.md')).resolves.toBe('source')
-    expect(await fs.readdir(root)).toEqual(['target.md'])
-  })
+      const recovered = createLocalFsFiles(root)
+      await expect(recovered.read('source.md')).resolves.toBeNull()
+      await expect(recovered.read('target.md')).resolves.toBe('source')
+      expect(await fs.readdir(root)).toEqual(['target.md'])
+    },
+  )
 
-  it('finishes a replace after the process stops with final target and live source', async () => {
-    const root = await mkroot()
+  itProcess(
+    'finishes a replace after the process stops with final target and live source',
+    async () => {
+      const root = await mkroot()
 
-    await fs.writeFile(join(root, 'source.md'), 'source')
-    crashMove(root, 'replace', 'after-publication')
+      await fs.writeFile(join(root, 'source.md'), 'source')
+      crashMove(root, 'replace', 'after-publication')
 
-    const recovered = createLocalFsFiles(root)
-    await expect(recovered.read('target.md')).resolves.toBe('app-final')
-    await expect(recovered.read('source.md')).resolves.toBeNull()
-    expect(await fs.readdir(root)).toEqual(['target.md'])
-  })
+      const recovered = createLocalFsFiles(root)
+      await expect(recovered.read('target.md')).resolves.toBe('app-final')
+      await expect(recovered.read('source.md')).resolves.toBeNull()
+      expect(await fs.readdir(root)).toEqual(['target.md'])
+    },
+  )
 
-  it('rolls back a prepared operation stopped before target publication', async () => {
+  itProcess('rolls back a prepared operation stopped before target publication', async () => {
     const root = await mkroot()
 
     await fs.writeFile(join(root, 'source.md'), 'source')
@@ -709,7 +722,7 @@ describe('localFs pathname occupancy', () => {
     expect(await fs.readdir(root)).toEqual(['source.md'])
   })
 
-  it('rolls forward a same-path replace stopped in the hidden-only window', async () => {
+  itProcess('rolls forward a same-path replace stopped in the hidden-only window', async () => {
     const root = await mkroot()
 
     await fs.writeFile(join(root, 'source.md'), 'source')
@@ -721,7 +734,7 @@ describe('localFs pathname occupancy', () => {
     expect(await fs.readdir(root)).toEqual(['source.md'])
   })
 
-  it('preserves a foreign target that replaces an interrupted publication', async () => {
+  itProcess('preserves a foreign target that replaces an interrupted publication', async () => {
     const root = await mkroot()
     const target = join(root, 'target.md')
 
@@ -737,58 +750,98 @@ describe('localFs pathname occupancy', () => {
     expect((await fs.readdir(root)).sort()).toEqual(['source.md', 'target.md'])
   })
 
-  it('surfaces original bytes when a foreign source replaces an interrupted move', async () => {
-    const root = await mkroot()
-    const source = join(root, 'source.md')
+  itProcess(
+    'surfaces original bytes when a foreign source replaces an interrupted move',
+    async () => {
+      const root = await mkroot()
+      const source = join(root, 'source.md')
 
-    await fs.writeFile(source, 'source')
-    crashMove(root, 'replace', 'after-publication')
-    await fs.writeFile(join(root, 'external.md'), 'external-source')
-    await fs.rename(join(root, 'external.md'), source)
+      await fs.writeFile(source, 'source')
+      crashMove(root, 'replace', 'after-publication')
+      await fs.writeFile(join(root, 'external.md'), 'external-source')
+      await fs.rename(join(root, 'external.md'), source)
 
-    const recovered = createLocalFsFiles(root)
-    await recovered.scan()
-    const entries = (await fs.readdir(root)).sort()
-    const recovery = entries.find((entry) => entry.startsWith('source.recovered-'))
+      const recovered = createLocalFsFiles(root)
+      await recovered.scan()
+      const entries = (await fs.readdir(root)).sort()
+      const recovery = entries.find((entry) => entry.startsWith('source.recovered-'))
 
-    await expect(recovered.read('source.md')).resolves.toBe('external-source')
-    await expect(recovered.read('target.md')).resolves.toBeNull()
-    expect(recovery).toBeDefined()
-    await expect(fs.readFile(join(root, recovery!), 'utf8')).resolves.toBe('source')
-    expect(entries).not.toContain('.notarium-fs-ops')
-  })
+      await expect(recovered.read('source.md')).resolves.toBe('external-source')
+      await expect(recovered.read('target.md')).resolves.toBeNull()
+      expect(recovery).toBeDefined()
+      await expect(fs.readFile(join(root, recovery!), 'utf8')).resolves.toBe('source')
+      expect(entries).not.toContain('.notarium-fs-ops')
+    },
+  )
 
-  it('preserves a foreign source captured into the journal when recovery restarts', async () => {
-    const root = await mkroot()
+  itProcess(
+    'preserves a foreign source captured into the journal when recovery restarts',
+    async () => {
+      const root = await mkroot()
 
-    crashAfterCapturingForeign(root, 'detached-source')
+      crashAfterCapturingForeign(root, 'detached-source')
 
-    await expect(createLocalFsFiles(root).scan()).resolves.toEqual(expect.any(Array))
-    // A second adapter must observe a fully converged namespace, not depend on
-    // process-local recovery state left by the first pass.
-    await expect(createLocalFsFiles(root).scan()).resolves.toEqual(expect.any(Array))
-    await expect(fs.readFile(join(root, 'source.md'), 'utf8')).resolves.toBe('FOREIGN-SOURCE')
-    await expect(fs.lstat(join(root, 'target.md'))).rejects.toMatchObject({ code: 'ENOENT' })
+      await expect(createLocalFsFiles(root).scan()).resolves.toEqual(expect.any(Array))
+      // A second adapter must observe a fully converged namespace, not depend on
+      // process-local recovery state left by the first pass.
+      await expect(createLocalFsFiles(root).scan()).resolves.toEqual(expect.any(Array))
+      await expect(fs.readFile(join(root, 'source.md'), 'utf8')).resolves.toBe('FOREIGN-SOURCE')
+      await expect(fs.lstat(join(root, 'target.md'))).rejects.toMatchObject({ code: 'ENOENT' })
 
-    const entries = (await fs.readdir(root)).sort()
-    const recovery = entries.find((entry) => entry.startsWith('source.recovered-'))
+      const entries = (await fs.readdir(root)).sort()
+      const recovery = entries.find((entry) => entry.startsWith('source.recovered-'))
 
-    expect(recovery).toBeDefined()
-    await expect(fs.readFile(join(root, recovery!), 'utf8')).resolves.toBe('original')
-    expect(entries).not.toContain('.notarium-fs-ops')
-  })
+      expect(recovery).toBeDefined()
+      await expect(fs.readFile(join(root, recovery!), 'utf8')).resolves.toBe('original')
+      expect(entries).not.toContain('.notarium-fs-ops')
+    },
+  )
 
-  it('restores a foreign target captured into the journal and converges across restarts', async () => {
-    const root = await mkroot()
+  itProcess(
+    'restores a foreign target captured into the journal and converges across restarts',
+    async () => {
+      const root = await mkroot()
 
-    crashAfterCapturingForeign(root, 'detached-target')
+      crashAfterCapturingForeign(root, 'detached-target')
 
-    await expect(createLocalFsFiles(root).scan()).resolves.toEqual(expect.any(Array))
-    await expect(createLocalFsFiles(root).scan()).resolves.toEqual(expect.any(Array))
-    await expect(fs.readFile(join(root, 'source.md'), 'utf8')).resolves.toBe('original')
-    await expect(fs.readFile(join(root, 'target.md'), 'utf8')).resolves.toBe('FOREIGN-TARGET')
-    expect(await fs.readdir(root)).toEqual(['source.md', 'target.md'])
-  })
+      await expect(createLocalFsFiles(root).scan()).resolves.toEqual(expect.any(Array))
+      await expect(createLocalFsFiles(root).scan()).resolves.toEqual(expect.any(Array))
+      await expect(fs.readFile(join(root, 'source.md'), 'utf8')).resolves.toBe('original')
+      await expect(fs.readFile(join(root, 'target.md'), 'utf8')).resolves.toBe('FOREIGN-TARGET')
+      expect(await fs.readdir(root)).toEqual(['source.md', 'target.md'])
+    },
+  )
+
+  itProcess(
+    'restores a captured regular file through the portable link when renameat2 is unavailable',
+    async () => {
+      const root = await mkroot()
+      const actualArch = process.arch
+
+      crashAfterCapturingForeign(root, 'detached-target')
+      const link = vi.spyOn(fs, 'link')
+
+      Object.defineProperty(process, 'arch', {
+        configurable: true,
+        value: 'unsupported-audit-arch',
+      })
+      try {
+        await expect(createLocalFsFiles(root).scan()).resolves.toEqual(expect.any(Array))
+      } finally {
+        Object.defineProperty(process, 'arch', { configurable: true, value: actualArch })
+      }
+
+      expect(
+        link.mock.calls.some(
+          ([from, to]) =>
+            String(from).endsWith('/detached-target') && String(to) === join(root, 'target.md'),
+        ),
+      ).toBe(true)
+      await expect(fs.readFile(join(root, 'source.md'), 'utf8')).resolves.toBe('original')
+      await expect(fs.readFile(join(root, 'target.md'), 'utf8')).resolves.toBe('FOREIGN-TARGET')
+      expect(await fs.readdir(root)).toEqual(['source.md', 'target.md'])
+    },
+  )
 
   it('does not recover another LocalFS instance while its root operation is live', async () => {
     const root = await mkroot()

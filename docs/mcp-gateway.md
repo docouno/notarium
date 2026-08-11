@@ -154,13 +154,17 @@ loads only the role and linked-skill instructions; resource delivery to clients 
 progressive-disclosure channel. Complete package bytes are nevertheless present in workspace
 `scope=all` export, so a client can download a ready Agent Skill without a converter. Export keeps
 the entire owned package byte-for-byte even when note frontmatter stripping is requested. The owned copy
-is never overwritten by a later catalog release.
+is never overwritten by a later catalog release. Add publishes a package into its library atomically, so
+an occupied target — a complete package, an empty or partially restored directory, a file, a symlink — is
+reported as a conflict and left byte-for-byte intact, never replaced.
 
 Owned scopes are Personal (private across projects), Space (shared in one space), and Project
 (stored under reserved `.notarium/skills/_projects/<encoded-project-id>/`). Same-name precedence is
 `Project > Space > Personal`. The first UI slice exposes Add to Personal and Project; Space remains
 an effective storage scope but has no separate Add action yet. There is deliberately no mutable
-server-global scope.
+server-global scope. The configured library mount may itself be a symlink, but its library-owned
+`_projects` namespace and encoded Project root must be real directories; Add fails before sweeping or
+writing a package if either path is a symlink or another entry type.
 
 Role discovery is bounded at both agent and settings surfaces. `start_session.roles` has a separate
 1,000-token summary budget and raises `rolesTruncated:true` when summaries were abbreviated,
