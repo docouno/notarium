@@ -482,9 +482,7 @@ export type AuthPersistence = {
  *  back instead of writing a duplicate. */
 export type DedupResult = { noteId: string; versionToken: string }
 
-/** The MCP gateway's write-retry idempotency state. Pure persistence — the
- *  windowing/scope policy lives in the gateway. OPTIONAL on a host (a
- *  meta-DB-less none-mode host has no dedup), like the journal. */
+/** Durable MCP write-replay state; simultaneous single-flight is gateway-local. */
 export type GatewayStatePersistence = {
   /** A prior write's outcome for (scope, key) when it is still inside the window
    *  (createdAt > sinceIso), else null. */

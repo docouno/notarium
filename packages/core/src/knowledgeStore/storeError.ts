@@ -89,6 +89,22 @@ export const versionConflict = (current: ConflictNote): StoreError => {
   return err
 }
 
+/** A bounded category append did not converge; `current` is one coherent live snapshot.
+ *  @see docs/note-model.md#agent-memory */
+export const memoryConvergenceExhausted = (
+  category: string,
+  foreignCommits: number,
+  current: ConflictNote,
+): StoreError => {
+  const err = new StoreError(
+    `memory category "${category}" is being rewritten concurrently — nothing was recorded after ${foreignCommits} intervening commit(s)`,
+  )
+  err.isConflict = true
+  err.reason = STORE_ERROR_REASON.memoryConvergenceExhausted
+  err.current = current
+  return err
+}
+
 /** A revision reference that resolves to nothing under the given note —
  *  unknown id, or a revision that belongs to another note. */
 export const revisionNotFound = (revisionId: string): StoreError => {

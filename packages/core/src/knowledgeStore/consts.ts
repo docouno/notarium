@@ -34,6 +34,7 @@ export const STORE_ERROR_REASON = {
   revisionHasNoContent: 'revision_has_no_content',
   noteNotInTrash: 'note_not_in_trash',
   revisionsUnavailable: 'revisions_unavailable',
+  memoryConvergenceExhausted: 'memory_convergence_exhausted',
 } as const
 
 /** What a CREATE does when a note already occupies its destination path.

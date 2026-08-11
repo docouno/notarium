@@ -10,8 +10,10 @@ import {
   estimateTokens,
   isPathUnder,
   type KnowledgeStore,
+  memoryDirOf,
   READ_SCOPE,
   treeChildren,
+  withMemoryCategoryFence,
 } from '@notarium/core'
 
 import type { ContextSetRecord } from '../metaDb'
@@ -543,31 +545,50 @@ const pinFileName = (filePath: string | undefined): string | undefined => {
   return basenameOf(filePath).replace(/\.md$/, '')
 }
 
-/** Toggle the `muted` flag on a memory note (mute/unmute): the human opt-out that keeps a
- *  category in the audit but drops it from the agent's eager profile. Narrow, CAS-guarded
- *  metadata edit, body untouched. canon: docs/projects.md#memory-two-axes */
+/** Toggle memory opt-out. The first read derives the fence key; the second supplies the
+ *  entire CAS payload. Conflicts are not retried.
+ *  canon: docs/projects.md#memory-two-axes · docs/note-model.md#agent-memory */
 export const setNoteMuted = async (
   store: KnowledgeStore,
   id: string,
   muted: boolean,
   principal?: string,
 ): Promise<{ muted: boolean; changed: boolean }> => {
-  const note = await store.read(id)
-  const noteId = note.id ?? id
-  const was = note.frontmatter?.muted === true || note.frontmatter?.muted === 'true'
+  const keyed = await store.read(id)
 
-  if (was === muted) {
-    return { muted, changed: false }
+  // No path, no partition: `?? ''` would aim the key at the about-user root, missing
+  // rememberAboutProject's fence and falsely serialising rememberAboutUser's.
+  if (!keyed.filePath || !keyed.title) {
+    const err = new Error(`cannot resolve the memory category of note ${id}`) as Error & {
+      isToolError: boolean
+    }
+
+    err.isToolError = true
+    throw err
   }
-  await store.write({
-    title: note.title ?? '',
-    content: note.content,
-    originalId: noteId,
-    versionToken: note.versionToken ?? '',
-    muted,
-    principal,
-    // A mute toggle is a metadata touch — keep the file's basename (see setNotePinned).
-    fileName: pinFileName(note.filePath),
-  })
-  return { muted, changed: true }
+
+  return withMemoryCategoryFence(
+    store,
+    { subdir: memoryDirOf(keyed.filePath), category: keyed.title },
+    async () => {
+      const note = await store.read(id)
+      const noteId = note.id ?? id
+      const was = note.frontmatter?.muted === true || note.frontmatter?.muted === 'true'
+
+      if (was === muted) {
+        return { muted, changed: false }
+      }
+      await store.write({
+        title: note.title ?? '',
+        content: note.content,
+        originalId: noteId,
+        versionToken: note.versionToken ?? '',
+        muted,
+        principal,
+        // A mute toggle is a metadata touch — keep the file's basename (see setNotePinned).
+        fileName: pinFileName(note.filePath),
+      })
+      return { muted, changed: true }
+    },
+  )
 }

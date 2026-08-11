@@ -21,13 +21,10 @@ import {
   REVISION_KIND,
   type RevisionDetail,
 } from '../../../knowledgeStore'
+import { MutationCoordinator } from '../../../libs/mutationCoordinator'
 import { directoryOf } from '../../../libs/path'
 import { classesForScope, NOTE_CLASSES } from '../../../visibility'
-import {
-  MutationCoordinator,
-  TRASH_MUTATION_PREFIX,
-  trashMutationPath,
-} from '../mutationCoordinator'
+import { TRASH_MUTATION_PREFIX, trashMutationPath } from '../../consts'
 import type { HistoryHost } from './types'
 
 /** Scan window for the "select all N" trash sweeps (restore/purge): the count is

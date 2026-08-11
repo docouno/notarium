@@ -12,7 +12,7 @@ import {
   type ToolName,
   tools,
 } from '@notarium/contract/tools'
-import { asciiSlug } from '@notarium/core'
+import { asciiSlug, STORE_ERROR_REASON } from '@notarium/core'
 
 import { type AgentSessions, type BoundAgentSession, createAgentSessions } from '../agentSessions'
 import { type AuthService } from '../auth'
@@ -22,6 +22,7 @@ import type {
   AgentSessionsPersistence,
   ContextOrderPersistence,
   ContextSetsPersistence,
+  DedupResult,
   FolderIdentityPersistence,
   GatewayStatePersistence,
   ProjectRecord,
@@ -67,7 +68,7 @@ export type GatewayDeps = {
   sessions?: AgentSessionsPersistence
   /** Owner fallback + per-episode/project delta positions. */
   agentDeltaCursors?: AgentDeltaCursorsPersistence
-  /** Per-token write-retry dedup state. Absent → no retry-dedup. */
+  /** Durable replay state. Absent leaves only simultaneous in-process single-flight. */
   gatewayState?: GatewayStatePersistence
   /** Agent-retrieval audit log: read-tool calls (search/recall/get_note) appended
    *  fire-and-forget. Absent → no capture (honest degradation). */
@@ -136,6 +137,8 @@ export type Ctx = {
   contextOrder?: ContextOrderPersistence
   agentDeltaCursors?: AgentDeltaCursorsPersistence
   gatewayState?: GatewayStatePersistence
+  /** App-level active writes keyed by scope and idempotency key. */
+  idempotencyInFlight?: Map<string, Promise<{ result: DedupResult; wasHit: boolean }>>
   agentSessions?: AgentSessions
   roles?: RolesService
   /** Stable session owner: username in password mode, reserved `@system` in none mode. */
@@ -225,6 +228,8 @@ export const createGateway = (deps: GatewayDeps): McpGateway => {
   // same procedural call. It is deliberately consecutive-only: any other tool
   // call clears the marker, so an intentional later refresh remains possible.
   const lastProceduralBySession = new Map<string, string>()
+  // App-scoped: a module-level map would couple independent gateway instances.
+  const idempotencyInFlight = new Map<string, Promise<{ result: DedupResult; wasHit: boolean }>>()
 
   const ctxFor = (principal: Principal): Ctx => {
     // Both return the STABLE space id — the gateway addresses stores/meta-DB by id;
@@ -255,6 +260,7 @@ export const createGateway = (deps: GatewayDeps): McpGateway => {
       contextOrder: deps.contextOrder,
       agentDeltaCursors: deps.agentDeltaCursors,
       gatewayState: deps.gatewayState,
+      idempotencyInFlight,
       agentSessions,
       roles: deps.roles,
       sessionOwner: agentOwnerOf(principal),
@@ -496,9 +502,14 @@ export const toolErrorMessage = (err: unknown, name: string): string => {
     isConflict?: boolean
     isNotFound?: boolean
     isToolError?: boolean
+    reason?: string
     message?: string
   }
 
+  // This reason is emitted only for a remember call without a caller-owned token.
+  if (e.reason === STORE_ERROR_REASON.memoryConvergenceExhausted) {
+    return `${e.message || 'that memory category is being rewritten concurrently'} — nothing was written. Repeat the same call.`
+  }
   if (e.isConflict) {
     return 'This note changed since you last read it. Re-read it with get_note to get the current versionToken, then retry.'
   }

@@ -8,8 +8,9 @@ import { describe, expect, it } from 'vitest'
 
 import type { IdentityRegistry } from '../../../identity'
 import { noteAlreadyExists, type WriteInput, type WriteResult } from '../../../knowledgeStore'
+import { MutationCoordinator } from '../../../libs/mutationCoordinator'
 import type { RevisionJournal } from '../../../revisionJournal'
-import { MutationCoordinator, trashMutationPath } from '../mutationCoordinator'
+import { trashMutationPath } from '../../consts'
 import { HistorySurface } from './historySurface'
 import type { HistoryHost } from './types'
 

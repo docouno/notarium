@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest'
 
-import { NOTE_CLASS, READ_SCOPE } from '../../knowledgeStore'
+import { type ConflictNote, NOTE_CLASS, READ_SCOPE } from '../../knowledgeStore'
+import { computeVersionToken } from '../../libs/versionToken'
+import { EXTERNAL_CONFLICT_BUDGET, NO_PROGRESS_BUDGET } from './consts'
 import { buildMemoryIndex, rememberAboutUser } from './memory'
-import { memStore } from './memoryTestStore.fixture'
+import { type MemRow, memStore } from './memoryTestStore.fixture'
 
 describe('rememberAboutUser', () => {
   it('mints an agent-memory note for a new category, wiring class + summary', async () => {
@@ -113,6 +115,18 @@ describe('rememberAboutUser', () => {
       rememberAboutUser(store, { observation: 'b', category: 'c', versionToken: 'stale' }),
     ).rejects.toMatchObject({ isConflict: true })
     expect(store.writes).toHaveLength(0)
+  })
+
+  it('treats an explicitly empty caller versionToken as stale, not as absent', async () => {
+    const store = memStore([
+      { id: 'mem-c', title: 'c', class: 'agent-memory', content: 'a', filePath: 'c.md' },
+    ])
+
+    await expect(
+      rememberAboutUser(store, { observation: 'blind', category: 'c', versionToken: '' }),
+    ).rejects.toMatchObject({ isConflict: true })
+    expect(store.writes).toHaveLength(0)
+    expect(store.rows[0].content).toBe('a')
   })
 
   it('retries a lost CAS race internally when it owns the token (no caller guard)', async () => {
@@ -375,5 +389,288 @@ describe('the memory fixture refuses a rename the engines refuse', () => {
     // Half-applied is the thing to rule out: the body must not have moved on.
     expect(store.rows.find((r) => r.id === 'a')!.content).toBe('old')
     expect(store.rows.find((r) => r.id === 'a')!.filePath).toBe('other.md')
+  })
+})
+
+// The convergence contract (#341): concurrent remembers of ONE category converge —
+// every accepted observation lands exactly once — while other categories stay
+// parallel. Direct calls under Promise.all are racy in the fixture WITHOUT the fence
+// (baseline: 3 of 16 succeeded, the rest threw version_conflict), so these need no
+// interleaving seam; the two that gate retry MECHANICS instead of the defect are
+// marked and name the wrong implementation they are red on.
+describe('memory append convergence', () => {
+  /** What a CAS-refusing engine throws. `current` is optional on purpose: both real
+   *  engines ride the live token on the error, the fixture does not — and the
+   *  progress test has to cover both sources. */
+  const casConflict = (current?: ConflictNote): Error => {
+    const err = new Error('conflict') as Error & {
+      isConflict: boolean
+      current?: ConflictNote
+    }
+
+    err.isConflict = true
+    if (current) {
+      err.current = current
+    }
+
+    return err
+  }
+
+  const seeded = (over: Partial<MemRow> = {}): MemRow[] => [
+    {
+      id: 'mem-notes',
+      title: 'notes',
+      class: NOTE_CLASS.agentMemory,
+      content: 'seed',
+      ...over,
+    },
+  ]
+
+  /** The body's paragraphs, sorted — comparing the SET pins "every observation, each
+   *  exactly once, and nothing else" in one assertion. Substring counting would not:
+   *  `obs-1` also occurs inside `obs-10`. */
+  const paragraphs = (body: string): string[] => body.split('\n\n').sort()
+
+  const observations = (count: number): string[] =>
+    Array.from({ length: count }, (_, i) => `obs-${i}`)
+
+  const concurrently = (
+    store: ReturnType<typeof memStore>,
+    count: number,
+    category: (i: number) => string = () => 'notes',
+  ) =>
+    Promise.all(
+      observations(count).map((observation, i) =>
+        rememberAboutUser(store, { observation, category: category(i) }),
+      ),
+    )
+
+  it('lands all 16 concurrent observations of one category in one note, exactly once', async () => {
+    const store = memStore()
+    const results = await concurrently(store, 16)
+
+    expect(store.rows).toHaveLength(1)
+    expect(paragraphs(store.rows[0].content)).toEqual(observations(16).sort())
+    expect(results.filter((r) => r.outcome === 'created')).toHaveLength(1)
+    expect(results.filter((r) => r.outcome === 'appended')).toHaveLength(15)
+  })
+
+  it('appends all 16 onto an existing category without disturbing its body', async () => {
+    const store = memStore(seeded())
+    const results = await concurrently(store, 16)
+
+    expect(store.rows).toHaveLength(1)
+    expect(store.rows[0].content.split('\n\n')[0]).toBe('seed')
+    expect(results.every((r) => r.outcome === 'appended')).toBe(true)
+    expect(paragraphs(store.rows[0].content)).toEqual(['seed', ...observations(16)].sort())
+  })
+
+  // MECHANICS GATE, not a defect gate — green on main, red on a fence that claims
+  // `{ global: true }` or a prefix instead of the single category key: there the held
+  // writer of `c0` would hold every other category's writer behind it too.
+  it('keeps other categories running while one category writer is held', async () => {
+    const store = memStore()
+    const held = { resolve: (): void => {} }
+    const release = new Promise<void>((resolve) => {
+      held.resolve = resolve
+    })
+    const write = store.write
+
+    store.write = async (input) => {
+      if (input.title === 'c0') {
+        await release
+      }
+
+      return write(input)
+    }
+    const calls = observations(8).map((observation, i) =>
+      rememberAboutUser(store, { observation, category: `c${i}` }),
+    )
+    // The seven unrelated writers must SETTLE while c0 is still parked in write().
+    const others = await Promise.all(calls.slice(1))
+
+    expect(others).toHaveLength(7)
+    held.resolve()
+    await calls[0]
+    expect(store.rows).toHaveLength(8)
+  })
+
+  it('fails an explicit stale caller token fast, without writing, under concurrency', async () => {
+    const store = memStore(seeded())
+    const settled = await Promise.allSettled([
+      ...observations(8).map((observation) =>
+        rememberAboutUser(store, { observation, category: 'notes' }),
+      ),
+      rememberAboutUser(store, {
+        observation: 'stale-token-observation',
+        category: 'notes',
+        versionToken: 'stale',
+      }),
+    ])
+
+    expect(settled.slice(0, 8).every((r) => r.status === 'fulfilled')).toBe(true)
+    const loser = settled[8]
+
+    expect(loser.status).toBe('rejected')
+    expect((loser as PromiseRejectedResult).reason).toMatchObject({ isConflict: true })
+    // The observable that survives a re-run: its observation is nowhere in the body.
+    expect(store.rows[0].content).not.toContain('stale-token-observation')
+  })
+
+  // MECHANICS GATE, not a defect gate — red on ONE shared attempt counter: there the
+  // productive-retry budget pays for a conflict that can never converge, and the op
+  // either gives up early or spins.
+  it('gives up with a named reason when a conflict makes no progress', async () => {
+    let attempts = 0
+    const store = memStore(seeded(), (input) => {
+      if (input.originalId) {
+        attempts += 1
+        // Body untouched → the live token still equals the one we failed on.
+        throw casConflict()
+      }
+    })
+
+    await expect(
+      rememberAboutUser(store, { observation: 'obs', category: 'notes' }),
+    ).rejects.toMatchObject({ reason: 'memory_convergence_exhausted', isConflict: true })
+    expect(attempts).toBe(NO_PROGRESS_BUDGET + 1)
+  })
+
+  it('keeps summary, tags and type intact under 8 concurrent appends', async () => {
+    const store = memStore(
+      seeded({ summary: 'kept', tags: ['memory', 'pinned'], type: 'memory-note' }),
+    )
+    const results = await concurrently(store, 8)
+
+    expect(store.rows[0].summary).toBe('kept')
+    expect(store.rows[0].tags).toEqual(['memory', 'pinned'])
+    expect(store.rows[0].type).toBe('memory-note')
+    expect(results.every((r) => r.summaryUpdated === false)).toBe(true)
+    expect(paragraphs(store.rows[0].content)).toEqual(['seed', ...observations(8)].sort())
+  })
+
+  it('applies the one concurrent summary overwrite and reports it on that call alone', async () => {
+    const store = memStore(seeded({ summary: 'kept' }))
+    const results = await Promise.all(
+      observations(8).map((observation, i) =>
+        rememberAboutUser(store, {
+          observation,
+          category: 'notes',
+          summary: i === 3 ? 'fresh' : undefined,
+        }),
+      ),
+    )
+
+    expect(store.rows[0].summary).toBe('fresh')
+    expect(results[3].summaryUpdated).toBe(true)
+    expect(results.filter((r) => r.summaryUpdated)).toHaveLength(1)
+  })
+
+  it('converges a letterless category onto its single hashed file', async () => {
+    const store = memStore()
+
+    await concurrently(store, 16, () => '🎉')
+
+    expect(store.rows).toHaveLength(1)
+    expect(store.rows[0].filePath).toMatch(/^category-[0-9a-f]+\.md$/)
+    expect(paragraphs(store.rows[0].content)).toEqual(observations(16).sort())
+  })
+
+  it('converges two spellings the find treats as one category into one note', async () => {
+    const store = memStore()
+
+    // `ᾳ` and `ΑΙ` share the name KEY (`ai`) but not the slug (`a` vs `ai`) — a fence
+    // keyed on the file name would let them run in parallel and mint two notes (#296).
+    await concurrently(store, 16, (i) => (i % 2 ? 'ᾳ' : 'ΑΙ'))
+
+    expect(store.rows).toHaveLength(1)
+    expect(paragraphs(store.rows[0].content)).toEqual(observations(16).sort())
+  })
+
+  it('retries productively while a foreign writer keeps committing', async () => {
+    // Three, not one or two: the pre-fix budget allowed three passes, so a smaller
+    // number is green without the fix and proves nothing.
+    const foreign = 3
+    let injected = 0
+    const store = memStore(seeded(), (input) => {
+      if (input.originalId && injected < foreign) {
+        injected += 1
+        // A commit by somebody else, THEN the refusal our write gets for it.
+        store.rows[0].content = `${store.rows[0].content}\n\nforeign-${injected}`
+        throw casConflict()
+      }
+    })
+
+    const r = await rememberAboutUser(store, { observation: 'obs', category: 'notes' })
+
+    expect(r.outcome).toBe('appended')
+    expect(store.rows[0].content).toBe('seed\n\nforeign-1\n\nforeign-2\n\nforeign-3\n\nobs')
+    // Every retry re-FINDS the category (it never re-targets the note id), so the
+    // list runs once per pass: the initial one plus one per conflict.
+    expect(store.listCalls).toHaveLength(foreign + 1)
+  })
+
+  it('reads the live token off the error when the engine rides one', async () => {
+    const foreign = 3
+    let injected = 0
+    const store = memStore(seeded(), (input) => {
+      if (input.originalId && injected < foreign) {
+        injected += 1
+        store.rows[0].content = `${store.rows[0].content}\n\nforeign-${injected}`
+        throw casConflict({
+          id: store.rows[0].id,
+          title: store.rows[0].title,
+          class: store.rows[0].class,
+          content: store.rows[0].content,
+          frontmatter: {},
+          filePath: store.rows[0].filePath,
+          versionToken: computeVersionToken(store.rows[0].content),
+        })
+      }
+    })
+
+    const r = await rememberAboutUser(store, { observation: 'obs', category: 'notes' })
+
+    expect(r.outcome).toBe('appended')
+    // One read per pass and no more: `err.current` answered the progress question, so
+    // the re-read fallback never ran (it would add one read per conflict).
+    expect(store.readIds).toHaveLength(foreign + 1)
+  })
+
+  it('gives up with a named reason when foreign commits outlast the budget', async () => {
+    let attempts = 0
+    const store = memStore(seeded(), (input) => {
+      if (input.originalId) {
+        attempts += 1
+        store.rows[0].content = `${store.rows[0].content}\n\nforeign-${attempts}`
+        throw casConflict({
+          id: store.rows[0].id,
+          title: store.rows[0].title,
+          class: store.rows[0].class,
+          content: store.rows[0].content,
+          frontmatter: {},
+          filePath: store.rows[0].filePath,
+          versionToken: computeVersionToken(store.rows[0].content),
+        })
+      }
+    })
+
+    const failure = await rememberAboutUser(store, { observation: 'obs', category: 'notes' }).then(
+      () => undefined,
+      (err: unknown) => err,
+    )
+
+    expect(failure).toMatchObject({
+      reason: 'memory_convergence_exhausted',
+      isConflict: true,
+      // The count is the point: it separates this from the no-progress exhaustion.
+      message: expect.stringContaining(`${EXTERNAL_CONFLICT_BUDGET + 1} intervening commit`),
+      current: {
+        content: store.rows[0].content,
+        versionToken: computeVersionToken(store.rows[0].content),
+      },
+    })
+    expect(attempts).toBe(EXTERNAL_CONFLICT_BUDGET + 1)
+    expect(store.rows[0].content).not.toContain('obs')
   })
 })

@@ -1,16 +1,28 @@
 // Agent-memory writes: remember_about_user / remember_about_project.
 // canon: docs/note-model.md#agent-memory
 
-import type { KnowledgeStore, NoteMeta, WriteResult } from '../../knowledgeStore'
-import { NOTE_CLASS, READ_SCOPE, STORE_ERROR_REASON, versionConflict } from '../../knowledgeStore'
+import type { ConflictNote, KnowledgeStore, NoteMeta, WriteResult } from '../../knowledgeStore'
+import {
+  memoryConvergenceExhausted,
+  NOTE_CLASS,
+  READ_SCOPE,
+  STORE_ERROR_REASON,
+  versionConflict,
+} from '../../knowledgeStore'
 import { pathHash, sha256Hex } from '../../libs/hash'
 import { estimateTokens } from '../../libs/markdown'
+import { MutationCoordinator } from '../../libs/mutationCoordinator'
 import { CLIPPED_NAME_TAG_BYTES, clipToBytes, NOTE_BASENAME_MAX_BYTES } from '../../libs/path'
 import { nameKey, slugify } from '../../libs/slug'
 import { normTags } from '../../libs/tags'
 import { makeSnippet } from '../../snippet'
 import { applyEdit, EDIT_OPERATION } from '../editNote'
-import { AGENT_MEMORY_MOUNT } from './consts'
+import {
+  AGENT_MEMORY_MOUNT,
+  CREATE_RACE_BUDGET,
+  EXTERNAL_CONFLICT_BUDGET,
+  NO_PROGRESS_BUDGET,
+} from './consts'
 import type {
   MemoryIndexEntry,
   RememberAboutProjectInput,
@@ -30,6 +42,28 @@ export const memoryDirOf = (filePath: string, mountPrefix: string = AGENT_MEMORY
   const slash = rel.lastIndexOf('/')
   return slash >= 0 ? rel.slice(0, slash) : ''
 }
+
+/** A store instance owns one category-fence queue. */
+const fences = new WeakMap<KnowledgeStore, MutationCoordinator>()
+
+const fenceOf = (store: KnowledgeStore): MutationCoordinator => {
+  const held = fences.get(store)
+
+  if (held) {
+    return held
+  }
+  const fresh = new MutationCoordinator()
+
+  fences.set(store, fresh)
+  return fresh
+}
+
+/** Run one category's full read-modify-write window under its partitioned name-key claim. */
+export const withMemoryCategoryFence = <T>(
+  store: KnowledgeStore,
+  key: { subdir: string; category: string },
+  task: () => Promise<T>,
+): Promise<T> => fenceOf(store).run({ paths: [`${key.subdir}\0${nameKey(key.category)}`] }, task)
 
 const withEcho = async (
   r: WriteResult,
@@ -93,16 +127,38 @@ const findMemoryNote = async (
   )
 }
 
-/** Find-or-create the category note in `subdir`, then append (CAS, with an internal
- *  retry for a self-owned lost race). */
-const remember = async (
+/** Return one coherent live snapshot after a refused CAS. */
+const liveConflictAfter = async (
+  store: KnowledgeStore,
+  err: unknown,
+  id: string,
+): Promise<ConflictNote> => {
+  const carried = (err as { current?: ConflictNote }).current
+
+  if (carried) {
+    return carried
+  }
+  const current = await store.read(id)
+
+  return {
+    ...current,
+    id: current.id ?? id,
+    versionToken: current.versionToken ?? '',
+  }
+}
+
+/** Find-or-create the category note in `subdir`, then append by CAS under its fence. */
+const appendObservation = async (
   store: KnowledgeStore,
   input: RememberInput & { subdir: string; mountPrefix: string },
 ): Promise<RememberResult> => {
   const { subdir, mountPrefix } = input
   const summaryUpdated = input.summary !== undefined
+  let createRaces = 0
+  let noProgress = 0
+  let foreignCommits = 0
 
-  for (let attempt = 0; ; attempt++) {
+  for (;;) {
     const existing = await findMemoryNote(store, input.category, subdir, mountPrefix)
 
     if (!existing?.id) {
@@ -127,21 +183,27 @@ const remember = async (
         })
         return await withEcho(created, input.observation, 'created', summaryUpdated)
       } catch (err) {
-        // Lost the create race → retry: the re-find now sees the winner and appends.
-        if (
-          (err as { reason?: string }).reason === STORE_ERROR_REASON.noteAlreadyExists &&
-          attempt < 2
-        ) {
-          continue
+        if ((err as { reason?: string }).reason !== STORE_ERROR_REASON.noteAlreadyExists) {
+          throw err
         }
-        throw err
+        // Lost the create race → retry: the re-find now sees the winner and appends.
+        // Its own budget, because the two rungs of the name formula can put two
+        // DIFFERENT categories on one file, and that one never resolves (see consts).
+        createRaces += 1
+
+        if (createRaces > CREATE_RACE_BUDGET) {
+          throw err
+        }
+        continue
       }
     }
     const note = await store.read(existing.id)
     const id = note.id ?? existing.id
     const token = note.versionToken ?? ''
 
-    if (input.versionToken && input.versionToken !== token) {
+    const hasCallerToken = input.versionToken !== undefined
+
+    if (hasCallerToken && input.versionToken !== token) {
       throw versionConflict({ ...note, id, versionToken: token })
     }
     const next = applyEdit(note.content, {
@@ -174,14 +236,39 @@ const remember = async (
       })
       return await withEcho(appended, next, 'appended', summaryUpdated)
     } catch (err) {
-      // We own the token → a lost CAS race is ours to retry.
-      if (!input.versionToken && (err as { isConflict?: boolean }).isConflict && attempt < 2) {
+      // Caller-owned tokens and non-CAS failures are never retried here.
+      if (hasCallerToken || !(err as { isConflict?: boolean }).isConflict) {
+        throw err
+      }
+      const live = await liveConflictAfter(store, err, id)
+
+      if (live.versionToken !== token) {
+        // Token progress makes the retry productive: the next append derives from the live body.
+        foreignCommits += 1
+
+        if (foreignCommits > EXTERNAL_CONFLICT_BUDGET) {
+          throw memoryConvergenceExhausted(input.category, foreignCommits, live)
+        }
         continue
       }
-      throw err
+      // Without token progress, repeating the same CAS cannot converge.
+      noProgress += 1
+
+      if (noProgress > NO_PROGRESS_BUDGET) {
+        throw memoryConvergenceExhausted(input.category, foreignCommits, live)
+      }
     }
   }
 }
+
+/** Fence caller-token checks together with the write they guard. */
+const remember = (
+  store: KnowledgeStore,
+  input: RememberInput & { subdir: string; mountPrefix: string },
+): Promise<RememberResult> =>
+  withMemoryCategoryFence(store, { subdir: input.subdir, category: input.category }, () =>
+    appendObservation(store, input),
+  )
 
 export const rememberAboutUser = (
   store: KnowledgeStore,

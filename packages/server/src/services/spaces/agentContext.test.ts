@@ -122,6 +122,45 @@ describe('agent-context identity producers', () => {
     await setNoteMuted(store, 'provisional-id', true)
     expect(writes.map((write) => write.originalId)).toEqual(['durable-id', 'durable-id'])
   })
+
+  it('refuses a mute it cannot place in a memory partition instead of guessing one', async () => {
+    // A pathless note leaves the fence key underivable, and the tempting `?? ''`
+    // default is a WRONG key, not a missing one: it aims at the about-user root.
+    const store = {
+      read: async () => ({ id: 'x', title: 'Read title', class: 'agent-memory', content: 'b' }),
+      write: async () => ({ id: 'x', versionToken: 'next' }),
+    } as unknown as KnowledgeStore
+
+    await expect(setNoteMuted(store, 'x', true)).rejects.toMatchObject({ isToolError: true })
+  })
+
+  it('propagates a mute CAS conflict after one write attempt instead of retrying', async () => {
+    let reads = 0
+    let writes = 0
+    const conflict = Object.assign(new Error('conflict'), { isConflict: true })
+    const store = {
+      read: async () => {
+        reads += 1
+        return {
+          id: 'memory-id',
+          title: 'general',
+          class: 'agent-memory',
+          filePath: '.notarium/memory/project-id/general.md',
+          content: 'body',
+          frontmatter: {},
+          versionToken: 'token',
+        }
+      },
+      write: async () => {
+        writes += 1
+        throw conflict
+      },
+    } as unknown as KnowledgeStore
+
+    await expect(setNoteMuted(store, 'memory-id', true)).rejects.toBe(conflict)
+    expect(reads).toBe(2)
+    expect(writes).toBe(1)
+  })
 })
 
 describe('curatePersonalScope (#208/#209)', () => {

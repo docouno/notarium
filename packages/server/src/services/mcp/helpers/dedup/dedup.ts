@@ -11,46 +11,70 @@ const DEDUP_IDEM_TTL_MS = 24 * 60 * 60 * 1000
 
 // ── write-retry dedup ───────────────────────────────────────────
 
-/** Run a write through the idempotency layer. Only a SUCCESSFUL write is recorded
- *  (validation/authz errors before this), so a dedup hit implies the original was
- *  authorized; without gatewayState it's a pass-through (honest degradation, P5).
- *  Deliberately NO content-hash fallback: a hash tight enough not to false-merge two
- *  distinct notes only ever matches what the path-upsert already collapses (inert);
- *  idempotencyKey is the non-redundant case — it collapses a retry the model RE-TITLED,
- *  which path-upsert can't. */
+/** Collapse simultaneous and durable replays of one successful write.
+ *  Without gateway state, only the simultaneous in-process branch remains.
+ *  @see docs/mcp-gateway.md#limits */
 export const dedupedWrite = async <T extends DedupResult>(
   ctx: Ctx,
   keys: { toolName: ToolName; idempotencyKey?: string; scopeKey?: string },
   run: () => Promise<T>,
 ): Promise<{ result: T | DedupResult; wasHit: boolean }> => {
   const gs = ctx.gatewayState
+  const idempotencyKey = keys.idempotencyKey
 
-  if (!gs || !keys.idempotencyKey) {
+  if (!idempotencyKey) {
     return { result: await run(), wasHit: false }
   }
-  const nowMs = ctx.now().getTime()
   // `scopeKey` namespaces dedup per target (e.g. project id): the same
   // idempotencyKey reused across two projects must NOT replay the first's note
   // (that would silently skip the second write).
   const scope = `idem:${ctx.principal.id}:${keys.toolName}${keys.scopeKey ? `:${keys.scopeKey}` : ''}`
-  const hit = await gs.dedupGet(
-    scope,
-    keys.idempotencyKey,
-    new Date(nowMs - DEDUP_IDEM_TTL_MS).toISOString(),
-  )
+  const inFlight = ctx.idempotencyInFlight
+  const flightKey = `${scope}\0${idempotencyKey}`
+  const running = inFlight?.get(flightKey)
 
-  if (hit) {
-    return { result: hit, wasHit: true }
+  if (running) {
+    // Its outcome IS ours. `wasHit` is forced true: whatever the runner was, we
+    // performed no write — the same shape a sequential replay answers with.
+    return { result: (await running).result, wasHit: true }
   }
-  const result = await run()
-  await gs.dedupPut(
-    scope,
-    keys.idempotencyKey,
-    { noteId: result.noteId, versionToken: result.versionToken },
-    new Date(nowMs).toISOString(),
-  )
-  await gs.dedupPrune(new Date(nowMs - DEDUP_IDEM_TTL_MS).toISOString())
-  return { result, wasHit: false }
+  const attempt = (async (): Promise<{ result: DedupResult; wasHit: boolean }> => {
+    const nowMs = ctx.now().getTime()
+    const hit = gs
+      ? await gs.dedupGet(scope, idempotencyKey, new Date(nowMs - DEDUP_IDEM_TTL_MS).toISOString())
+      : null
+
+    if (hit) {
+      return { result: hit, wasHit: true }
+    }
+    const result = await run()
+
+    if (gs) {
+      await gs.dedupPut(
+        scope,
+        idempotencyKey,
+        { noteId: result.noteId, versionToken: result.versionToken },
+        new Date(nowMs).toISOString(),
+      )
+      await gs.dedupPrune(new Date(nowMs - DEDUP_IDEM_TTL_MS).toISOString())
+    }
+
+    return { result, wasHit: false }
+  })()
+
+  // Registered with NO await between the lookup above and this line — an await there
+  // is exactly the window being closed.
+  inFlight?.set(flightKey, attempt)
+  try {
+    // `wasHit` comes out of the attempt, never a constant: a SEQUENTIAL replay lands
+    // here too (the key is off the map by then) and is a hit through the table, which
+    // is what makes its answer `outcome: 'skipped'`.
+    return await attempt
+  } finally {
+    if (inFlight?.get(flightKey) === attempt) {
+      inFlight.delete(flightKey)
+    }
+  }
 }
 
 /** In-process result of a write run(): dedup-stable identity + the transparency

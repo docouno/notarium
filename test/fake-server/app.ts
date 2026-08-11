@@ -157,6 +157,10 @@ export type Fixture = {
   noJobs?: boolean
   /** Omit the agent-session persistence facet to exercise P5 degradation. */
   noAgentSessions?: boolean
+  /** Omit the gateway-state facet — a host with no meta-DB behind idempotencyKey.
+   *  The DURABLE half of the dedup degrades away (a replay arriving later writes
+   *  again); the in-process single-flight does not depend on it. */
+  noGatewayState?: boolean
   /** Keep owned roles but omit their reusable context facets to exercise independent
    * P5 degradation of role presets. */
   noContextFacets?: boolean
@@ -625,7 +629,7 @@ export const createApp = async (
     sessions: fixture.noAgentSessions ? undefined : agentSessions,
     roles,
     agentDeltaCursors,
-    gatewayState,
+    gatewayState: fixture.noGatewayState ? undefined : gatewayState,
     retrievalLog,
     sessionAudit,
     projects,

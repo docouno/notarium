@@ -23,12 +23,6 @@ type Lease = {
   retry: (claim: Claim) => Promise<Lease>
 }
 
-/** A separate namespace for transitions of the journal-backed trash view.
- *  Per-note paths keep independent deletes concurrent; the prefix is claimed
- *  only by bulk "all" scans and folder deletes that must freeze membership. */
-export const TRASH_MUTATION_PREFIX = '\0trash'
-export const trashMutationPath = (noteId: string): string => `${TRASH_MUTATION_PREFIX}/${noteId}`
-
 const cleanPath = (path: string): string => path.replace(/^\/+|\/+$/g, '')
 
 const values = (
@@ -126,8 +120,8 @@ const conflicts = (a: Claim, b: Claim): boolean => {
   return false
 }
 
-/** A fair per-process fence for note and folder mutations. Conflicting claims
- *  keep arrival order; unrelated claims can run in parallel. */
+/** Fair per-process fence: conflicting claims keep arrival order; unrelated claims run in parallel.
+ *  @see docs/core.md#write-through */
 export class MutationCoordinator {
   private readonly active = new Set<Waiter>()
   private waiting: Waiter[] = []

@@ -982,3 +982,157 @@ describe('agent-context pult (#165): mute / unmute', () => {
     expect(res.body).toContain('only agent-memory')
   })
 })
+
+describe('mute under the memory-category fence (#341)', () => {
+  const deferred = (): { promise: Promise<void>; resolve: () => void } => {
+    let resolve!: () => void
+    const promise = new Promise<void>((r) => {
+      resolve = r
+    })
+
+    return { promise, resolve }
+  }
+
+  /** Park a target read until another writer commits. The route guard is read #1;
+   *  mute's pre-fence key read is #2. Parking its write would deadlock the fixed tree. */
+  const parkingMuteOnRead = async (
+    nth: number,
+  ): Promise<{ arm: (noteId: string) => void; parked: Promise<void>; release: () => void }> => {
+    await app.close()
+    const parked = deferred()
+    const committed = deferred()
+    let target = ''
+    let armed = false
+    let reads = 0
+
+    app = await createApp(fixture(), {
+      configureWorld: ({ slug, store }) => {
+        if (slug !== 'main') {
+          return
+        }
+        const read = store.read.bind(store)
+        const write = store.write.bind(store)
+
+        store.read = async (id, opts) => {
+          const note = await read(id, opts)
+
+          if (armed && id === target) {
+            reads += 1
+
+            if (reads === nth) {
+              armed = false
+              parked.resolve()
+              await committed.promise
+            }
+          }
+
+          return note
+        }
+        store.write = async (input, opts) => {
+          const result = await write(input, opts)
+
+          if (input.originalId === target) {
+            committed.resolve()
+          }
+
+          return result
+        }
+      },
+    })
+    port = await listen(app)
+
+    return {
+      arm: (noteId: string) => {
+        target = noteId
+        armed = true
+      },
+      parked: parked.promise,
+      release: committed.resolve,
+    }
+  }
+
+  const seedCategory = async (
+    bearer: string,
+    category: string,
+    observation: string,
+  ): Promise<string> => {
+    const r = await callTool(
+      'remember_about_project',
+      { project: 'main/docs', observation, category },
+      bearer,
+    )
+
+    expect(r.result?.isError).toBeFalsy()
+    return structured(r).noteId as string
+  }
+
+  it('mute survives a remember that commits while it waits', async () => {
+    const seam = await parkingMuteOnRead(2)
+    const bearer = await patFor('sam', 'sam-password-1')
+    const cookie = await loginCookie('sam', 'sam-password-1')
+    const noteId = await seedCategory(bearer, 'ops', 'seed')
+
+    seam.arm(noteId)
+    const muting = putJson('/api/note/mute', { id: noteId, muted: true }, cookie)
+
+    await seam.parked
+    // This commit makes the parked mute's pre-fence token stale.
+    const remembered = await callTool(
+      'remember_about_project',
+      { project: 'main/docs', observation: 'obs-0', category: 'ops' },
+      bearer,
+    )
+
+    expect(remembered.result?.isError).toBeFalsy()
+    const res = await muting
+
+    expect(res.statusCode).toBe(200)
+    expect(res.json().muted).toBe(true)
+  })
+
+  it('keeps the observation committed while mute waited', async () => {
+    const seam = await parkingMuteOnRead(2)
+    const bearer = await patFor('sam', 'sam-password-1')
+    const cookie = await loginCookie('sam', 'sam-password-1')
+    const noteId = await seedCategory(bearer, 'ops', 'seed')
+
+    seam.arm(noteId)
+    const muting = putJson('/api/note/mute', { id: noteId, muted: true }, cookie)
+
+    await seam.parked
+    await callTool(
+      'remember_about_project',
+      { project: 'main/docs', observation: 'obs-0', category: 'ops' },
+      bearer,
+    )
+    await muting
+
+    // Guards against token #2 paired with body #1, which would erase obs-0.
+    const note = await getJson(`/api/note?id=${encodeURIComponent(noteId)}`, cookie)
+
+    expect(note.content).toBe('seed\n\nobs-0')
+    expect(note.frontmatter.muted).toBe('true')
+  })
+
+  // A global or prefix claim blocks this unrelated write behind the held mute.
+  it('does not hold up another category while it owns the fence', async () => {
+    const seam = await parkingMuteOnRead(3)
+    const bearer = await patFor('sam', 'sam-password-1')
+    const cookie = await loginCookie('sam', 'sam-password-1')
+    const noteId = await seedCategory(bearer, 'ops', 'seed')
+
+    seam.arm(noteId)
+    const muting = putJson('/api/note/mute', { id: noteId, muted: true }, cookie)
+
+    await seam.parked
+    const other = await callTool(
+      'remember_about_project',
+      { project: 'main/docs', observation: 'unrelated', category: 'people' },
+      bearer,
+    )
+
+    expect(other.result?.isError).toBeFalsy()
+    seam.release()
+    expect((await muting).statusCode).toBe(200)
+  })
+})

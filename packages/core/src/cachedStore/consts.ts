@@ -1,9 +1,8 @@
-// Read-model timing constants: the debounce/coalesce cadences the
-// decorator runs its background loops on. Consumed only by the orchestrator
-// (cachedStore.ts); a collaborator that needs a cadence gets it as a constructor
-// argument (these are the defaults passed in), while watch/bulk keep their own
-// module-local consts. The "why this duration" prose stays here with the value.
-// canon: docs/core.md#cooperative
+// Read-model mutation namespace and background-loop cadences.
+// canon: docs/core.md#write-through · docs/core.md#cooperative
+
+export const TRASH_MUTATION_PREFIX = '\0trash'
+export const trashMutationPath = (noteId: string): string => `${TRASH_MUTATION_PREFIX}/${noteId}`
 
 export const RECONCILE_DELAY_MS = 1_500
 

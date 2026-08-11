@@ -35,6 +35,9 @@ export type MemRow = {
    *  YAML-true STRING 'true' (mirroring the real engine's non-coercing parser). */
   muted?: boolean
   tags?: string[]
+  /** The note's `type` frontmatter — carried forward by an append exactly like tags,
+   *  so it has to survive a round trip here or that carry-forward is untestable. */
+  type?: string
   /** Space-relative path. Defaults to the root `<id>.md`; seed an explicit one
    *  (e.g. `proj-a/general.md` or `.notarium/memory/proj-a/general.md`) to place a
    *  note in a mount subdirectory for the directory-scoped find tests. */
@@ -68,6 +71,9 @@ export const memStore = (
     }
     if (r.summary !== undefined) {
       fm.summary = r.summary
+    }
+    if (r.type !== undefined) {
+      fm.type = r.type
     }
     if (r.muted) {
       fm.muted = 'true'
@@ -176,6 +182,9 @@ export const memStore = (
         if (input.tags !== undefined) {
           r.tags = Array.isArray(input.tags) ? input.tags : [input.tags]
         }
+        if (input.noteType !== undefined) {
+          r.type = input.noteType
+        }
         r.filePath = moved
         writes.push(input)
         return { id: r.id, versionToken: computeVersionToken(r.content) }
@@ -213,6 +222,7 @@ export const memStore = (
         summary: input.summary,
         muted: input.muted || undefined,
         tags: Array.isArray(input.tags) ? input.tags : input.tags ? [input.tags] : undefined,
+        type: input.noteType,
         filePath,
       })
       writes.push(input)

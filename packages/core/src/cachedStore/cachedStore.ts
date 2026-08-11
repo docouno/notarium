@@ -56,6 +56,7 @@ import {
   isWikilinkIdentityTarget,
   normalizeWikilinkTarget,
 } from '../libs/markdown'
+import { MutationCoordinator } from '../libs/mutationCoordinator'
 import { directoryOf, isPathUnder } from '../libs/path'
 import { normTags } from '../libs/tags'
 import { computeVersionToken } from '../libs/versionToken'
@@ -69,6 +70,8 @@ import {
   INDEX_PROGRESS_THROTTLE_MS,
   RECONCILE_DELAY_MS,
   RESPONSIVE_POLL_MS,
+  TRASH_MUTATION_PREFIX,
+  trashMutationPath,
 } from './consts'
 import { BulkController } from './controllers/bulkController'
 import { WatchController } from './controllers/watchController'
@@ -76,11 +79,6 @@ import { DirectoryIndex } from './helpers/directoryIndex'
 import { filterGraphForUser } from './helpers/filterGraph'
 import { HistorySurface } from './helpers/historySurface'
 import { supportsExactIdentityAddress } from './helpers/innerIdentity'
-import {
-  MutationCoordinator,
-  TRASH_MUTATION_PREFIX,
-  trashMutationPath,
-} from './helpers/mutationCoordinator'
 import { PhaseGate } from './helpers/phaseGate'
 import { Snapshot } from './helpers/snapshot'
 import { WriteEngine } from './helpers/writeEngine'

@@ -4,6 +4,9 @@ import { memoryDirOf, rememberAboutProject } from './memory'
 import { memStore } from './memoryTestStore.fixture'
 
 describe('rememberAboutProject', () => {
+  const observations = Array.from({ length: 16 }, (_, i) => `obs-${i}`)
+  const paragraphs = (body: string): string[] => body.split('\n\n').sort()
+
   it('mints an agent-memory note in the project subdir, wiring class + mount-relative directory', async () => {
     const store = memStore()
     const r = await rememberAboutProject(store, {
@@ -173,6 +176,84 @@ describe('rememberAboutProject', () => {
     const memory = store.rows.filter((r) => r.class === 'agent-memory')
     expect(memory).toHaveLength(1)
     expect(memory[0].content).toBe('winner fact\n\nloser fact')
+  })
+
+  it('lands 16 concurrent observations of one project category exactly once', async () => {
+    const store = memStore()
+    const results = await Promise.all(
+      observations.map((observation) =>
+        rememberAboutProject(store, { projectId: 'projAAA', observation, category: 'general' }),
+      ),
+    )
+
+    expect(store.rows).toHaveLength(1)
+    expect(store.rows[0].filePath).toBe('projAAA/general.md')
+    expect(paragraphs(store.rows[0].content)).toEqual([...observations].sort())
+    expect(results.filter((result) => result.outcome === 'created')).toHaveLength(1)
+    expect(results.filter((result) => result.outcome === 'appended')).toHaveLength(15)
+  })
+
+  it('keeps concurrent observations in their two project partitions', async () => {
+    const store = memStore()
+
+    await Promise.all(
+      observations.map((observation, index) =>
+        rememberAboutProject(store, {
+          projectId: index % 2 === 0 ? 'projAAA' : 'projBBB',
+          observation,
+          category: 'general',
+        }),
+      ),
+    )
+
+    expect(store.rows).toHaveLength(2)
+    expect(
+      paragraphs(store.rows.find((row) => row.filePath === 'projAAA/general.md')!.content),
+    ).toEqual(observations.filter((_, index) => index % 2 === 0).sort())
+    expect(
+      paragraphs(store.rows.find((row) => row.filePath === 'projBBB/general.md')!.content),
+    ).toEqual(observations.filter((_, index) => index % 2 === 1).sort())
+  })
+
+  // Mechanics gate: a fence key that drops `subdir` blocks projBBB behind projAAA.
+  it('does not hold one project partition behind another with the same category', async () => {
+    const store = memStore()
+
+    let markArrived = (): void => {}
+
+    let releaseHeld = (): void => {}
+    const arrived = new Promise<void>((resolve) => {
+      markArrived = resolve
+    })
+    const release = new Promise<void>((resolve) => {
+      releaseHeld = resolve
+    })
+    const write = store.write
+
+    store.write = async (input) => {
+      if (input.directory === 'projAAA') {
+        markArrived()
+        await release
+      }
+
+      return write(input)
+    }
+    const held = rememberAboutProject(store, {
+      projectId: 'projAAA',
+      observation: 'A',
+      category: 'general',
+    })
+
+    await arrived
+    await expect(
+      rememberAboutProject(store, {
+        projectId: 'projBBB',
+        observation: 'B',
+        category: 'general',
+      }),
+    ).resolves.toMatchObject({ outcome: 'created' })
+    releaseHeld()
+    await held
   })
 })
 

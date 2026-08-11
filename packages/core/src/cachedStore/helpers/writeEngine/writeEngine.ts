@@ -27,6 +27,7 @@ import {
   stripFrontmatter,
   stripTitleHeading,
 } from '../../../libs/markdown'
+import { MutationCoordinator } from '../../../libs/mutationCoordinator'
 import {
   directoryOf,
   FOLDER_PAGE_BASENAME,
@@ -43,12 +44,8 @@ import { normTags } from '../../../libs/tags'
 import { computeVersionToken } from '../../../libs/versionToken'
 import { derivePreview } from '../../../snippet'
 import { DEFAULT_NOTE_CLASS, isVisibleOn, SURFACE } from '../../../visibility'
+import { TRASH_MUTATION_PREFIX, trashMutationPath } from '../../consts'
 import { supportsExactIdentityAddress } from '../innerIdentity'
-import {
-  MutationCoordinator,
-  TRASH_MUTATION_PREFIX,
-  trashMutationPath,
-} from '../mutationCoordinator'
 import type { WriteHost } from './types'
 
 /** Normalise an authored createdAt to the canonical ISO instant the engine

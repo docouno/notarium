@@ -16,6 +16,7 @@ import type { FastifyInstance } from 'fastify'
 import type { AddressInfo } from 'node:net'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { encodeWikilinkIdentity, sha256Hex } from '@notarium/core'
+import type { MutationGate } from '@notarium/server'
 
 import { createApp, type Fixture } from './app.js'
 
@@ -5203,5 +5204,225 @@ describe('session-first audit vertical (#321)', () => {
     } finally {
       await noneApp.close()
     }
+  })
+})
+
+// Simultaneous idempotencyKey (#341). The dedup TABLE collapses only a repeat that
+// arrives after the first one recorded — between its get and its put two twins both
+// miss and both write. These run over the production buildApp with a rendezvous at
+// the REQUEST DOOR: a plain Promise.all is not enough (in a fresh app per test the
+// table wins 10 runs in 12, i.e. green before the fix), and a barrier down at
+// store.write is worse — after the fix only ONE participant reaches the store, so a
+// barrier waiting for two never opens.
+describe('simultaneous idempotencyKey (#341)', () => {
+  /** A MutationGate stub that parks the next `hold(n)` tool calls at the door and
+   *  admits them together. The seam is the gate the transport already wraps every
+   *  tools/call in, so it holds ABOVE anything the fix serialises. */
+  const rendezvous = () => {
+    let need = 0
+    let arrived = 0
+    let open = deferred()
+    let full = deferred()
+
+    return {
+      gate: {
+        enter: async () => () => {},
+        run: async <T>(task: () => Promise<T>): Promise<T> => {
+          if (need === 0) {
+            return task()
+          }
+          arrived += 1
+          if (arrived === need) {
+            full.resolve()
+          }
+          await open.promise
+
+          return task()
+        },
+        checkpoint: (task: () => Promise<void>) => {
+          const settlement = task()
+
+          return Object.assign(settlement, { settlement })
+        },
+      } as MutationGate,
+      hold: (n: number): void => {
+        need = n
+        arrived = 0
+        open = deferred()
+        full = deferred()
+      },
+      admitAll: async (): Promise<void> => {
+        await full.promise
+        need = 0
+        open.resolve()
+      },
+    }
+  }
+
+  let seam: ReturnType<typeof rendezvous>
+
+  const boot = async (over: Partial<Fixture> = {}): Promise<string> => {
+    await app.close()
+    seam = rendezvous()
+    app = await createApp({ ...fixture(), ...over }, { mutationGate: seam.gate })
+    port = await listen(app)
+    return patFor('alice', 'alice-password-1', 'write')
+  }
+
+  /** Fire `calls` together and let them past the door only once all have arrived. */
+  const together = async (calls: Array<Promise<Rpc>>): Promise<Rpc[]> => {
+    seam.hold(calls.length)
+    const settled = Promise.all(calls)
+
+    await seam.admitAll()
+    return settled
+  }
+
+  const bodyOf = async (bearer: string, noteId: string): Promise<string> =>
+    structured(await callTool(port, 'get_note', { ref: noteId }, bearer)).content as string
+
+  it('collapses two simultaneous remember_about_project calls into one write', async () => {
+    const bearer = await boot()
+    const call = (): Promise<Rpc> =>
+      callTool(
+        port,
+        'remember_about_project',
+        {
+          project: 'team',
+          observation: 'only once',
+          category: 'decisions',
+          idempotencyKey: 'sim-proj',
+        },
+        bearer,
+      )
+    const [a, b] = await together([call(), call()])
+
+    expect(isError(a)).toBe(false)
+    expect(isError(b)).toBe(false)
+    expect(structured(a).noteId).toBe(structured(b).noteId)
+    expect([structured(a).outcome, structured(b).outcome].filter((o) => o === 'skipped')).toEqual([
+      'skipped',
+    ])
+    expect(await bodyOf(bearer, structured(a).noteId as string)).toBe('only once')
+  })
+
+  it('collapses two simultaneous remember_about_user calls into one write', async () => {
+    const bearer = await boot()
+    const call = (): Promise<Rpc> =>
+      callTool(
+        port,
+        'remember_about_user',
+        { observation: 'only once', category: 'prefs', idempotencyKey: 'sim-user' },
+        bearer,
+      )
+    const [a, b] = await together([call(), call()])
+
+    expect(isError(a)).toBe(false)
+    expect(isError(b)).toBe(false)
+    expect(structured(a).noteId).toBe(structured(b).noteId)
+    expect([structured(a).outcome, structured(b).outcome].filter((o) => o === 'skipped')).toEqual([
+      'skipped',
+    ])
+    expect(await bodyOf(bearer, structured(a).noteId as string)).toBe('only once')
+  })
+
+  it('collapses two simultaneous create_note calls into one note', async () => {
+    const bearer = await boot()
+    const call = (): Promise<Rpc> =>
+      callTool(
+        port,
+        'create_note',
+        { project: 'team', title: 'Simultaneous', body: 'body', idempotencyKey: 'sim-create' },
+        bearer,
+      )
+    const [a, b] = await together([call(), call()])
+
+    // Without single-flight the loser doesn't merely duplicate — it collides, and the
+    // agent is told its own retry hit an existing note.
+    expect(isError(a)).toBe(false)
+    expect(isError(b)).toBe(false)
+    expect(structured(a).noteId).toBe(structured(b).noteId)
+    expect([structured(a).outcome, structured(b).outcome].filter((o) => o === 'skipped')).toEqual([
+      'skipped',
+    ])
+    const listed = structured(await callTool(port, 'list_notes', { project: 'team' }, bearer))
+      .items as Array<{ title: string }>
+
+    expect(listed.filter((n) => n.title === 'Simultaneous')).toHaveLength(1)
+  })
+
+  it('collapses two simultaneous edit_note appends into one', async () => {
+    const bearer = await boot()
+    const seeded = structured(
+      await callTool(
+        port,
+        'create_note',
+        { project: 'team', title: 'Sim Edit', body: 'base' },
+        bearer,
+      ),
+    )
+    const id = seeded.noteId as string
+    const call = (): Promise<Rpc> =>
+      callTool(
+        port,
+        'edit_note',
+        { ref: id, operation: 'append', content: 'once', idempotencyKey: 'sim-edit' },
+        bearer,
+      )
+    const [a, b] = await together([call(), call()])
+
+    // `skipped` is the observable, not the body: without the fix the two reads both
+    // land before the first write, so the loser answers version_conflict — a DIFFERENT
+    // failure from the double append, and the body alone cannot tell them apart.
+    expect(isError(a)).toBe(false)
+    expect(isError(b)).toBe(false)
+    expect([structured(a).outcome, structured(b).outcome].filter((o) => o === 'skipped')).toEqual([
+      'skipped',
+    ])
+    expect(await bodyOf(bearer, id)).toBe('base\n\nonce')
+  })
+
+  // MECHANICS GATE: red on an implementation that drops `scopeKey` from the key —
+  // there the second project's write is skipped and it is handed the first's noteId.
+  it('does not collapse one key across two projects', async () => {
+    const bearer = await boot({
+      projects: [
+        { space: 'team', path: '', slug: 'team', displayName: 'Team' },
+        { space: 'team', path: 'sub', slug: 'sub', displayName: 'Sub' },
+      ],
+    })
+    const call = (project: string, observation: string): Promise<Rpc> =>
+      callTool(
+        port,
+        'remember_about_project',
+        { project, observation, category: 'general', idempotencyKey: 'cross-project' },
+        bearer,
+      )
+    const [a, b] = await together([call('team/team', 'A'), call('team/sub', 'B')])
+
+    expect(structured(a).noteId).not.toBe(structured(b).noteId)
+    expect(await bodyOf(bearer, structured(b).noteId as string)).toBe('B')
+  })
+
+  it('holds without a meta-DB, and says so: simultaneous collapses, a later replay does not', async () => {
+    const bearer = await boot({ noGatewayState: true })
+    const call = (): Promise<Rpc> =>
+      callTool(
+        port,
+        'remember_about_user',
+        { observation: 'once', category: 'prefs', idempotencyKey: 'nogs' },
+        bearer,
+      )
+    const [a, b] = await together([call(), call()])
+
+    expect(structured(a).noteId).toBe(structured(b).noteId)
+    expect([structured(a).outcome, structured(b).outcome].filter((o) => o === 'skipped')).toEqual([
+      'skipped',
+    ])
+    expect(await bodyOf(bearer, structured(a).noteId as string)).toBe('once')
+    // The honest boundary: without the durable table a replay that arrives LATER has
+    // nothing to hit, so it appends again.
+    await call()
+    expect(await bodyOf(bearer, structured(a).noteId as string)).toBe('once\n\nonce')
   })
 })
