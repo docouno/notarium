@@ -209,10 +209,17 @@ The browser inventory has one deliberate manual edge. Dependencies bundled from
 explicitly in `FRONTEND_ROOTS` in `scripts/gen-licenses.mjs`; they cannot be
 derived from production manifests alone. When adding, updating or removing a
 bundled devDependency, Vite/PWA plugin or build transform, make a production build
-with source maps (`npm run build -w @notarium/web -- --sourcemap`), compare the
-packages represented in the emitted bundle with the browser corpus, and update
+with source maps (`npm exec -w @notarium/web -- vite build --sourcemap`), compare
+the packages represented in the emitted bundle with the browser corpus, and update
 `FRONTEND_ROOTS` before regenerating. An ordinary package bump that does not
 change that build-time inventory needs only the commands above.
+
+Vite is called directly there rather than through `npm run build -w @notarium/web`
+because that script chains the [bundle-size gate](pwa.md#bundle-size) after Vite, and
+npm appends a `--` flag to the end of the whole chain — so `--sourcemap` would reach the
+gate instead of Vite, silently emitting no maps. The consequence is that this one
+diagnostic build is not size-checked; rebuild normally afterwards rather than leaving an
+ungated `dist` behind.
 
 ```bash
 npm run release <patch|minor|major|x.y.z>   # bump the lockstep version, fold the

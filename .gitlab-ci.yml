@@ -150,8 +150,8 @@ lean:release-preflight:
       fi
       echo "preflight: release credential is present on this ref"
 
-# Proves the production bundle compiles. Independent of the suite — a change can break
-# exactly one of the two, and each should say so on its own.
+# Proves the production bundle compiles and stays within its per-chunk budget. Independent
+# of the suite — a change can break exactly one of the two, and each should say so on its own.
 lean:build:
   extends: .lean
   script:
@@ -169,16 +169,19 @@ extended:unit:
   extends: [.dind, .heavy, .extended-rules]
   script:
     - docker build --target test -t "notarium-test:$CI_COMMIT_SHORT_SHA" -f docker/Dockerfile .
-    # Makefile, scripts/ and README.md are kept OUT of the image on purpose — they are
-    # tooling and docs the product does not ship — but the suite needs all three: the
-    # backup tests drive the real Makefile, the release and seed tests import
-    # scripts/*.mjs, and the preview suite derives its headline from README.md rather
-    # than keeping a second copy of it. They go into the CONTAINER, never into the image.
-    # Under dind the daemon cannot see this checkout, so they travel over the API.
-    # Keep this list and the Makefile's in step.
+    # Makefile, README.md and all of scripts/ bar the SPA size gate are kept OUT of the
+    # image on purpose — they are tooling and docs the product does not ship — but the
+    # suite needs all three: the backup tests drive the real Makefile, the release and
+    # seed tests import scripts/*.mjs, and the preview suite derives its headline from
+    # README.md rather than keeping a second copy of it. They go into the CONTAINER,
+    # never into the image. Under dind the daemon cannot see this checkout, so they
+    # travel over the API. Keep this list and the Makefile's in step.
+    # Hence `scripts/.`, which copies the CONTENTS: `/app/scripts` already exists (it
+    # holds that one gate script), and a bare `./scripts` would land inside it as
+    # `/app/scripts/scripts`.
     - docker create --name "notarium-test-run-$CI_JOB_ID" --entrypoint npm "notarium-test:$CI_COMMIT_SHORT_SHA" run test:coverage
     - docker cp ./Makefile "notarium-test-run-$CI_JOB_ID:/app/Makefile"
-    - docker cp ./scripts "notarium-test-run-$CI_JOB_ID:/app/scripts"
+    - docker cp ./scripts/. "notarium-test-run-$CI_JOB_ID:/app/scripts"
     - docker cp ./README.md "notarium-test-run-$CI_JOB_ID:/app/README.md"
     - docker start --attach "notarium-test-run-$CI_JOB_ID"
   after_script:

@@ -191,11 +191,12 @@ sh: ## Open a shell inside the notarium container
 # validates. The test image is glibc + every workspace dependency, proves the
 # production build on its way through the builder stage, then drops to the
 # unprivileged node user. It leaves the live dev stand's bind-mounted node_modules
-# untouched. Makefile, scripts/ and README.md are test inputs excluded from the
-# production image context (the backup suite drives the real Makefile, the release
-# and seed tests import scripts/*.mjs, the preview suite reads the README's banner
-# copy), so mount only those read-only. The CI job hands the same three over with
-# `docker cp` because under dind the daemon cannot see this checkout — keep the two
+# untouched. Makefile, README.md and all of scripts/ bar the SPA size gate are test
+# inputs excluded from the production image context (the backup suite drives the real
+# Makefile, the release and seed tests import scripts/*.mjs, the preview suite reads the
+# README's banner copy), so mount only those read-only — the bind over /app/scripts
+# covers that one gate script the image does carry. The CI job hands the same three over
+# with `docker cp` because under dind the daemon cannot see this checkout — keep the two
 # lists in step.
 test-coverage: ## Build and run full coverage (including native vector tests) in Docker
 	@set -eu; \

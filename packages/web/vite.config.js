@@ -77,6 +77,83 @@ const hmrClientPort = process.env.HMR_CLIENT_PORT
 // verified live against a production build instead.
 const pwaDisabled = process.env.VITE_PWA === 'off'
 
+// Workbox's per-file precache wall, at Workbox's own default value rather than a choice
+// of ours — it is spelled out only because the size contract is anchored to it.
+// canon: docs/pwa.md#bundle-size
+const PRECACHE_MAX_FILE_BYTES = 2 * 1024 * 1024
+
+// Synchronous heavyweight vendor families, split out of the application entry. A name is
+// matched exactly unless it ends in `-`, which matches a package-name prefix.
+// canon: docs/pwa.md#bundle-size
+const CHUNK_FAMILIES = {
+  editor: [
+    'codemirror',
+    '@codemirror/autocomplete',
+    '@codemirror/commands',
+    '@codemirror/lang-css',
+    '@codemirror/lang-html',
+    '@codemirror/lang-javascript',
+    '@codemirror/lang-markdown',
+    '@codemirror/language',
+    '@codemirror/language-data',
+    '@codemirror/search',
+    '@codemirror/state',
+    '@codemirror/view',
+    '@lezer/common',
+    '@lezer/css',
+    '@lezer/highlight',
+    '@lezer/html',
+    '@lezer/javascript',
+    '@lezer/lr',
+    '@lezer/markdown',
+  ],
+  'markdown-math': ['katex'],
+  'syntax-highlighting': ['highlight.js'],
+  graph: [
+    'bezier-js',
+    'd3-array',
+    'd3-drag',
+    'd3-force-3d',
+    'd3-scale',
+    'd3-scale-chromatic',
+    'd3-selection',
+    'd3-zoom',
+    'force-graph',
+    'graphology',
+    'graphology-',
+    'kapsule',
+    'react-force-graph-2d',
+    'react-kapsule',
+    'tinycolor2',
+  ],
+}
+
+// The LAST `node_modules/` wins, so a nested copy (`a/node_modules/b`) counts as b.
+// Rollup hands ids in host form, hence the separator normalisation.
+const packageOf = (moduleId) => {
+  const id = moduleId.replace(/\\/g, '/')
+  const at = id.lastIndexOf('/node_modules/')
+
+  if (at === -1) {
+    return null
+  }
+  const [scope, scoped] = id.slice(at + '/node_modules/'.length).split('/')
+
+  return scope.startsWith('@') ? `${scope}/${scoped}` : scope
+}
+
+const manualChunks = (moduleId) => {
+  const pkg = packageOf(moduleId)
+
+  return pkg
+    ? Object.keys(CHUNK_FAMILIES).find((chunk) =>
+        CHUNK_FAMILIES[chunk].some((name) =>
+          name.endsWith('-') ? pkg.startsWith(name) : pkg === name,
+        ),
+      )
+    : undefined
+}
+
 export default defineConfig({
   // In Docker dev, packages/web is bind-mounted as a writable directory so Vite can
   // emit its temporary bundled config next to vite.config.js. Keep the optimizer cache
@@ -117,6 +194,7 @@ export default defineConfig({
         ],
       },
       workbox: {
+        maximumFileSizeToCacheInBytes: PRECACHE_MAX_FILE_BYTES,
         globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
         // Reading-view fonts load on demand (only the chosen preset's subset
         // is fetched), so they must NOT be swept into the install-time precache —
@@ -240,5 +318,8 @@ export default defineConfig({
   },
   build: {
     outDir: 'dist',
+    rollupOptions: {
+      output: { manualChunks },
+    },
   },
 })

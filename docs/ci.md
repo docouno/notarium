@@ -27,6 +27,12 @@ next push — the serial fix-push-discover loop the split exists to kill. Jobs t
 should report together sit together; stages separate only real dependencies: the code
 is green, *then* the built image proves itself, *then* anything is published.
 
+**`lean:build` proves more than "it compiles".** The job is one `npm run build`, and the web
+workspace's build script runs `scripts/checkWebBundleBudget.mjs` after Vite, so a generated JS
+chunk over the [per-chunk budget](pwa.md#bundle-size) turns the lane red without a job, a stage
+or a line of YAML of its own. Same red locally, in the image builder and in the Playwright
+build, because all four call that one script — which is the adapter rule applied literally.
+
 **The extended lane runs on events, never on a timer.** Its inputs are pinned — the
 base image by digest, dependencies by lockfile — so the same commit a week later
 renders the same answer, and a scheduled run would re-verify an unchanged input. What

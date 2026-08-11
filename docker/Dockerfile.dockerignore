@@ -30,6 +30,9 @@ Makefile
 docker/*
 !docker/notarium-cli
 scripts
+# …except the SPA size gate, which hangs off the web workspace's own build script:
+# without it in the context the builder's `npm run build` cannot complete at all.
+!scripts/checkWebBundleBudget.mjs
 README.md
 # Keep LICENSE / NOTICE / COMMERCIAL-LICENSE.md / THIRD_PARTY_NOTICES.md in the
 # build context: the runtime stage copies the corpus for an image recipient.
