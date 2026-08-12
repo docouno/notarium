@@ -4,7 +4,13 @@
 // and the presentational NoteHistory widget can speak these shapes without
 // crossing the layer rules (widgets never import services).
 
-import type { Author, NoteRevision, NoteRevisionDetail, RevisionKind } from '@notarium/contract'
+import type {
+  Author,
+  NoteRevision,
+  NoteRevisionDetail,
+  RevisionKind,
+  RevisionUnavailableReason,
+} from '@notarium/contract'
 
 export type RevisionView = {
   revisionId: string
@@ -27,6 +33,10 @@ export type RevisionView = {
   /** "+N −M" counters vs the chain parent; null = unknown (gap/legacy row). */
   charsAdded: number | null
   charsRemoved: number | null
+  /** Set when the server WITHHELD this row rather than failed to capture it
+   *  (#327). Without it a gap is indistinguishable from a real unsigned
+   *  external edit, and the UI words it as one. */
+  unavailableReason: RevisionUnavailableReason | null
 }
 
 export type RevisionDetailView = RevisionView & {
@@ -47,6 +57,7 @@ export const revisionView = (r: NoteRevision): RevisionView => ({
   title: r.title,
   charsAdded: r.charsAdded,
   charsRemoved: r.charsRemoved,
+  unavailableReason: r.unavailableReason ?? null,
 })
 
 export const revisionDetailView = (r: NoteRevisionDetail): RevisionDetailView => ({

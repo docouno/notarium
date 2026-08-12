@@ -44,6 +44,7 @@ import {
   noteDetailToWire,
   revisionDetailToWire,
   revisionToWire,
+  unattributedIfGap,
   updateToDomain,
 } from '../wire'
 
@@ -329,11 +330,9 @@ export const noteRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
       offset: q.data.offset,
       limit: q.data.limit,
     })
-    const revisions = await withAuthors(
-      items.map(revisionToWire),
-      req.principal.username,
-      auth.describeAuthor,
-    )
+    const revisions = (
+      await withAuthors(items.map(revisionToWire), req.principal.username, auth.describeAuthor)
+    ).map(unattributedIfGap)
     return NoteRevisionsResponseSchema.parse({ revisions, total })
   })
 
@@ -358,11 +357,13 @@ export const noteRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
     }
     const author = await auth.describeAuthor(detail.principal, req.principal.username)
     // Redact a foreign agent's key id (privacy), matching withAuthors.
-    return NoteRevisionDetailResponseSchema.parse({
-      ...revisionDetailToWire(detail),
-      principal: redactsKeyId(author) ? null : detail.principal,
-      author,
-    })
+    return NoteRevisionDetailResponseSchema.parse(
+      unattributedIfGap({
+        ...revisionDetailToWire(detail),
+        principal: redactsKeyId(author) ? null : detail.principal,
+        author,
+      }),
+    )
   })
 
   // Restore = a save whose body is taken from the revision, not the client (no

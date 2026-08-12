@@ -25,12 +25,16 @@ const KIND_ICON: Record<ActivityEventKind, typeof IconPlus> = {
   edited: IconEdit,
   restored: IconHistory,
   deleted: IconTrash,
+  // A gap is a moment, not an action: the clock is the honest glyph, and it gets
+  // no colour of its own — nothing about it is attributable (#327).
+  unavailable: IconClock,
 }
 const KIND_VERB: Record<ActivityEventKind, string> = {
   created: 'Created',
   edited: 'Edited',
   restored: 'Restored',
   deleted: 'Deleted',
+  unavailable: 'Unavailable',
 }
 
 // Per-row [title, meta] shimmer widths for the loading feed (#218) — varied so the
@@ -60,7 +64,8 @@ const EventRow = ({
       ? `+${ev.charsAdded} −${ev.charsRemoved}`
       : null
   // Show the actor only when it isn't the viewer (a shared space) — keeps the
-  // common single-user feed clean (no "you · you · you").
+  // common single-user feed clean (no "you · you · you"). A journal gap (#327)
+  // arrives with `author: null`, so it drops out here without a rule of its own.
   const byOther = ev.author && !ev.author.mine ? author.text : null
   // The note's location as clickable breadcrumb segments (empty for a root note or
   // a deleted one whose path we no longer resolve — then just the title shows).

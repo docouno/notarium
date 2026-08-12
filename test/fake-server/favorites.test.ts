@@ -182,7 +182,7 @@ describe('favorites (#42)', () => {
     const folderId = await favoriteThenMark()
 
     // Re-favoriting the now-project must NOT create a second row alongside the stored
-    // 'folder' row — PUT clears any prior row for the id (any kind) before adding.
+    // 'folder' row — `add` clears the entity's other kinds inside its own transaction.
     const rePut = await app.inject({
       method: 'PUT',
       url: '/api/s/main/favorites',

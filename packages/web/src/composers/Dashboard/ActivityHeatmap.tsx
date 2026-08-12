@@ -9,7 +9,12 @@ import {
 import type { ActivityResponse } from '@notarium/contract'
 import { IconClock } from '../../core/Icons'
 import { Skeleton } from '../../core/Skeleton'
-import { buildHeatmap, defaultActivityWindow, type HeatCell } from '../../libs/activity'
+import {
+  activityBreakdown,
+  buildHeatmap,
+  defaultActivityWindow,
+  heatCellLabel,
+} from '../../libs/activity'
 import styles from './Dashboard.module.scss'
 
 // The contribution heatmap (#33): GitHub-style week columns, intensity 0–4 from
@@ -47,21 +52,6 @@ import styles from './Dashboard.module.scss'
 
 const WEEKDAYS = ['', 'Mon', '', 'Wed', '', 'Fri', ''] // GitHub shows alternating
 
-const cellLabel = (c: HeatCell): string => {
-  if (!c.date) {
-    return ''
-  }
-  if (c.total === 0) {
-    return `${c.date} · no activity`
-  }
-  const parts = [
-    c.created && `${c.created} created`,
-    c.edited && `${c.edited} edited`,
-    c.deleted && `${c.deleted} deleted`,
-  ].filter(Boolean)
-  return `${c.date} · ${c.total} ${c.total === 1 ? 'change' : 'changes'} (${parts.join(', ')})`
-}
-
 type Tip = {
   x: number
   y: number
@@ -70,6 +60,7 @@ type Tip = {
   created: number
   edited: number
   deleted: number
+  unavailable: number
 }
 
 /** Size the heatmap's cell + inter-cell gap to a whole number of DEVICE pixels (#219).
@@ -189,16 +180,11 @@ export const ActivityHeatmap = ({
       created: Number(d.created),
       edited: Number(d.edited),
       deleted: Number(d.deleted),
+      unavailable: Number(d.unavailable),
     })
   }
 
-  const tipParts = tip
-    ? [
-        tip.created && `${tip.created} created`,
-        tip.edited && `${tip.edited} edited`,
-        tip.deleted && `${tip.deleted} deleted`,
-      ].filter(Boolean)
-    : []
+  const tipParts = tip ? activityBreakdown(tip) : []
 
   return (
     <section
@@ -267,7 +253,8 @@ export const ActivityHeatmap = ({
                         data-created={loading ? undefined : cell.created}
                         data-edited={loading ? undefined : cell.edited}
                         data-deleted={loading ? undefined : cell.deleted}
-                        aria-label={loading ? undefined : cellLabel(cell)}
+                        data-unavailable={loading ? undefined : cell.unavailable}
+                        aria-label={loading ? undefined : heatCellLabel(cell)}
                         aria-hidden={loading || undefined}
                         disabled={loading || undefined}
                         onClick={loading ? undefined : () => onSelectDay(cell.date as string)}

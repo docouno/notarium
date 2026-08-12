@@ -112,6 +112,7 @@ export const createSessionsFacet = (ctx: PgDriverCtx): AgentSessionsPersistence 
 
     try {
       await client.query('BEGIN')
+      // eslint-disable-next-line no-restricted-syntax -- outside the note-identity hierarchy: one agent session's name, no tier below it
       await client.query('SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))', [
         `agent-session:${candidate.owner}`,
         candidate.name,
@@ -185,6 +186,7 @@ export const createSessionsFacet = (ctx: PgDriverCtx): AgentSessionsPersistence 
     try {
       await client.query('BEGIN')
       const selected = await client.query(
+        // eslint-disable-next-line no-restricted-syntax -- outside the note-identity hierarchy: one agent session row, no tier below it
         `SELECT ${COLUMNS} FROM agent_sessions WHERE owner = $1 AND id = $2 FOR UPDATE`,
         [owner, id],
       )

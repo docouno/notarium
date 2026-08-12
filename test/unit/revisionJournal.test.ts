@@ -8,7 +8,7 @@
 // through the CAS path — a stale token 409s and journals nothing.
 
 import { describe, expect, it, vi } from 'vitest'
-import { CachedStore, InMemoryRevisionPersistence, sha256Hex } from '@notarium/core'
+import { CachedStore, InMemoryRevisionPersistence, revisionGapOf, sha256Hex } from '@notarium/core'
 import type { Revision, RevisionInput, StoreDelta } from '@notarium/core'
 import { InMemoryStore, type StoreSnapshot } from '@notarium/engine-memory'
 
@@ -114,6 +114,100 @@ describe('revision journal (#12) — write-through', () => {
     const revs = await timeline(store, res.id!)
     expect(revs.map((r) => r.kind)).toEqual(['write'])
     expect(revs[0].baseRevisionId).toBeNull()
+  })
+
+  // The role of an entry is decided ONCE, by the writer, and stored on the row. Four
+  // consumers used to infer it from `kind='external' AND base_rev IS NULL`, and that
+  // shape stopped meaning "first entry" when quarantine arrived (#327).
+  describe('entry role — the writer decides, nobody infers', () => {
+    it('stamps origin for a note born through us, and change for its next state', async () => {
+      const { store, persistence } = await make()
+      const res = await store.write({
+        title: 'Fresh',
+        directory: 'demo',
+        content: 'fresh body',
+        principal: 'ui',
+      })
+
+      await store.settle()
+      const created = await store.read(res.id!)
+
+      await store.write({
+        title: 'Fresh',
+        directory: 'demo',
+        content: 'fresher body',
+        originalId: res.id!,
+        versionToken: created.versionToken,
+        principal: 'ui',
+      })
+      await store.settle()
+      const revs = await persistence.listByNote('main', res.id!, { offset: 0, limit: 10 })
+
+      expect(revs.items.map((r) => r.entryRole)).toEqual(['change', 'origin'])
+    })
+
+    it('stamps baseline for a first sighting, and for the pre-edit state it captures', async () => {
+      const { store, persistence } = await make()
+      // A note that already existed: the first journaled write captures what it
+      // found (baseline) and then its own state (change).
+      const { versionToken } = await store.read(TITANIUM)
+
+      await store.write({
+        title: 'Titanium',
+        directory: 'demo',
+        content: 'edited body',
+        tags: ['metal'],
+        originalId: TITANIUM,
+        versionToken,
+        principal: 'ui',
+      })
+      await store.settle()
+
+      expect(
+        (await persistence.listByNote('main', TITANIUM, { offset: 0, limit: 10 })).items.map(
+          (r) => r.entryRole,
+        ),
+      ).toEqual(['change', 'baseline'])
+    })
+
+    it('calls the first edit after a quarantine a change, not an origin', async () => {
+      // The whole reason the role is written rather than read: after a quarantine the
+      // note has NO trusted latest, so `latestFor` says "never seen" while
+      // `hasAnyFor` — trusted and quarantined — says "there is a past". Asking the
+      // wrong one announces a birth that never happened.
+      const { store, persistence } = await make()
+      const res = await store.write({
+        title: 'Contaminated',
+        directory: 'demo',
+        content: 'first body',
+        principal: 'ui',
+      })
+
+      await store.settle()
+      const [first] = (await persistence.listByNote('main', res.id!, { offset: 0, limit: 10 }))
+        .items
+
+      persistence.quarantineForTest([first.id])
+      expect(await persistence.latestFor('main', res.id!)).toBeNull()
+      expect(await persistence.hasAnyFor('main', res.id!)).toBe(true)
+
+      const reread = await store.read(res.id!)
+
+      await store.write({
+        title: 'Contaminated',
+        directory: 'demo',
+        content: 'body after the repair',
+        originalId: res.id!,
+        versionToken: reread.versionToken,
+        principal: 'ui',
+      })
+      await store.settle()
+      const after = await persistence.listByNote('main', res.id!, { offset: 0, limit: 10 })
+
+      expect(after.items[0].entryRole).toBe('change')
+      // And no second "baseline" was invented over a past that exists.
+      expect(after.items.map((r) => r.entryRole)).toEqual(['change', 'origin'])
+    })
   })
 
   it('a no-op save journals nothing; a title-only rename IS a revision', async () => {
@@ -467,6 +561,7 @@ describe('revision journal (#12) — delete and restore', () => {
         theirRevisionId: null,
         sourceRevisionId: null,
         kind: 'external',
+        entryRole: 'baseline',
         principal: null,
         contentHash: null,
         title: 'Titanium',
@@ -576,6 +671,7 @@ describe('trash (#79) — the journal view + undelete', () => {
         theirRevisionId: null,
         sourceRevisionId: null,
         kind: 'delete',
+        entryRole: 'change',
         principal: null,
         contentHash: null,
         title: 'Gap note',
@@ -639,6 +735,7 @@ describe('trash (#79) — the journal view + undelete', () => {
         theirRevisionId: null,
         sourceRevisionId: null,
         kind: 'delete',
+        entryRole: 'change',
         principal: null,
         contentHash: null,
         title: 'Gap tail',
@@ -1111,7 +1208,7 @@ describe('revision journal (#12) — read-after-write on a fire-and-forget appen
 
     expect(latest.get(note.id!)?.principal).toBe('user:bob')
     expect(latestForMany).toHaveBeenCalledOnce()
-    expect(latestForMany).toHaveBeenCalledWith([note.id!])
+    expect(latestForMany).toHaveBeenCalledWith(expect.any(String), [note.id!])
     await store.settle()
   })
 
@@ -1186,5 +1283,93 @@ describe('revision journal (#12) — read-after-write on a fire-and-forget appen
     expect((await store.revisions(TITANIUM, { offset: 0, limit: 1 })).items[0].principal).toBe(
       'user:alice',
     )
+  })
+})
+
+describe('gap shaping (#327) — what a contaminated row is allowed to say', () => {
+  // `revisionGapOf` is the ONE place a contaminated row becomes a served row, for
+  // all three drivers. Asserted whole rather than field by field: a field added to
+  // `Revision` later has to be decided here too, and an assertion listing only
+  // today's fields would pass while leaking it. canon: docs/note-history.md#model
+  it('withholds every field that could attribute or reconstruct the state', () => {
+    const contaminated: Revision = {
+      id: '42',
+      noteId: 'X',
+      space: 'alpha',
+      baseRevisionId: '41',
+      theirRevisionId: '40',
+      sourceRevisionId: '39',
+      kind: 'merge',
+      entryRole: 'change',
+      principal: 'user:someone',
+      agent: {
+        owner: 'someone',
+        agent: 'claude',
+        session: { id: 'sess-1', name: 'Morning', attach: 'declared' },
+      },
+      contentHash: 'sha-of-another-space',
+      title: 'Their title',
+      slug: 'their-slug',
+      class: 'user-doc',
+      tags: ['theirs'],
+      createdAt: '2026-06-12T10:00:00.000Z',
+      charsAdded: 5,
+      charsRemoved: 2,
+    }
+
+    expect(revisionGapOf(contaminated)).toEqual({
+      // Its place in the stream survives — that is what keeps cursors, totals,
+      // pages and session linkage exact.
+      id: '42',
+      noteId: 'X',
+      space: 'alpha',
+      kind: 'merge',
+      // The role is structural, like `kind`: it says where the entry stands in the
+      // note's life, not what the note contained. Quarantine hides payload.
+      entryRole: 'change',
+      createdAt: '2026-06-12T10:00:00.000Z',
+      // Everything else is withheld, and nothing is invented in its place.
+      baseRevisionId: null,
+      theirRevisionId: null,
+      sourceRevisionId: null,
+      principal: null,
+      agent: null,
+      contentHash: null,
+      title: 'Unavailable revision',
+      class: null,
+      slug: null,
+      tags: [],
+      charsAdded: null,
+      charsRemoved: null,
+      unavailableReason: 'identity-conflict',
+    })
+  })
+
+  it('does not alias the row it sanitizes', () => {
+    // The drivers map rows in place; a shared tags array would let a later
+    // consumer push a withheld tag back into the served row.
+    const row: Revision = {
+      id: '1',
+      noteId: 'X',
+      space: 'alpha',
+      baseRevisionId: null,
+      theirRevisionId: null,
+      sourceRevisionId: null,
+      kind: 'write',
+      entryRole: 'origin',
+      principal: 'ui',
+      contentHash: null,
+      title: 'Shared',
+      slug: null,
+      class: null,
+      tags: ['keep'],
+      createdAt: '2026-06-12T10:00:00.000Z',
+      charsAdded: null,
+      charsRemoved: null,
+    }
+
+    revisionGapOf(row).tags.push('leaked')
+
+    expect(row.tags).toEqual(['keep'])
   })
 })

@@ -2,10 +2,12 @@ import { describe, expect, it } from 'vitest'
 import type { ActivityDay } from '@notarium/contract'
 import type { GraphView } from '../wire'
 import {
+  activityBreakdown,
   buildHeatmap,
   dayRangeUtc,
   defaultActivityWindow,
   folderCrumbs,
+  heatCellLabel,
   levelOf,
   localDayOf,
   orphanCountOf,
@@ -17,6 +19,7 @@ const day = (date: string, total: number, parts: Partial<ActivityDay> = {}): Act
   created: parts.created ?? total,
   edited: parts.edited ?? 0,
   deleted: parts.deleted ?? 0,
+  unavailable: parts.unavailable ?? 0,
   total,
 })
 
@@ -201,5 +204,82 @@ describe('folderCrumbs', () => {
       { name: 'a', path: 'a' },
       { name: 'b', path: 'a/b' },
     ])
+  })
+})
+
+describe('journal gaps in the heatmap (#327)', () => {
+  it('counts an unavailable day as activity without attributing it to a kind', () => {
+    const from = '2026-06-01T00:00:00.000Z'
+    const to = '2026-06-08T00:00:00.000Z'
+    const hm = buildHeatmap([day('2026-06-03', 3, { created: 1, unavailable: 2 })], from, to, 0)
+    const cell = hm.weeks.flat().find((c) => c.date === '2026-06-03')!
+
+    expect(cell).toMatchObject({ total: 3, created: 1, edited: 0, deleted: 0, unavailable: 2 })
+    // Intensity is the day's whole activity: a gap is real work, just unreadable.
+    expect(cell.level).toBeGreaterThan(0)
+    expect(hm.totalEvents).toBe(3)
+  })
+
+  it('draws a day made of gaps ALONE as a lit cell, not as an empty one', () => {
+    // The mixed day above cannot see this: it is lit by its `created` count either
+    // way. Only a day with nothing but gaps proves the gap reaches the intensity.
+    const hm = buildHeatmap(
+      [day('2026-06-03', 2, { created: 0, unavailable: 2 })],
+      '2026-06-01T00:00:00.000Z',
+      '2026-06-08T00:00:00.000Z',
+      0,
+    )
+    const cell = hm.weeks.flat().find((c) => c.date === '2026-06-03')!
+
+    expect(cell).toMatchObject({ total: 2, created: 0, edited: 0, deleted: 0, unavailable: 2 })
+    expect(cell.level).toBeGreaterThan(0)
+    expect(hm.totalEvents).toBe(2)
+    expect(heatCellLabel(cell)).toBe('2026-06-03 · 2 changes (2 unavailable)')
+  })
+
+  it('names the gap in the accessible label and the tooltip, pluralized with the rest', () => {
+    const cell = {
+      date: '2026-06-03',
+      total: 4,
+      created: 1,
+      edited: 0,
+      deleted: 1,
+      unavailable: 2,
+      level: 2 as const,
+    }
+
+    expect(activityBreakdown(cell)).toEqual(['1 created', '1 deleted', '2 unavailable'])
+    expect(heatCellLabel(cell)).toBe('2026-06-03 · 4 changes (1 created, 1 deleted, 2 unavailable)')
+    // A day with ONLY gaps still reads as activity, never as "no activity".
+    expect(
+      heatCellLabel({
+        date: '2026-06-04',
+        total: 1,
+        created: 0,
+        edited: 0,
+        deleted: 0,
+        unavailable: 1,
+        level: 1,
+      }),
+    ).toBe('2026-06-04 · 1 change (1 unavailable)')
+    expect(
+      heatCellLabel({
+        date: '2026-06-05',
+        total: 0,
+        created: 0,
+        edited: 0,
+        deleted: 0,
+        unavailable: 0,
+        level: 0,
+      }),
+    ).toBe('2026-06-05 · no activity')
+  })
+
+  it('gives every generated empty cell an explicit zero gap count', () => {
+    const hm = buildHeatmap([], '2026-06-01T00:00:00.000Z', '2026-06-08T00:00:00.000Z', 0)
+
+    for (const cell of hm.weeks.flat()) {
+      expect(cell.unavailable).toBe(0)
+    }
   })
 })

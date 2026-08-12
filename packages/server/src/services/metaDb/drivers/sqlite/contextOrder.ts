@@ -1,6 +1,8 @@
+import { referenceIdentityConflict } from '../../identityRefs'
 import { contextOrderOfRow, type ContextOrderRow, dedupOrderEntries } from '../../rows'
 import type { ContextOrderPersistence, ContextSetTargetKind } from '../../types'
 import type { SqliteDriverCtx } from './context'
+import { isRetiredIdentity, resolveLiveIdentityForWrite } from './liveIdentity'
 
 export const createContextOrderFacet = (ctx: SqliteDriverCtx): ContextOrderPersistence => ({
   orderForTarget: async (targetKind: ContextSetTargetKind, targetId: string) => {
@@ -19,10 +21,31 @@ export const createContextOrderFacet = (ctx: SqliteDriverCtx): ContextOrderPersi
   // separate pooled connections.)
   setOrder: async (targetKind, targetId, targetSpace, entries) => {
     await ctx.ensureInit()
-    const rows = dedupOrderEntries(entries)
     const db = ctx.required
-    db.exec('BEGIN')
+    db.exec('BEGIN IMMEDIATE')
     try {
+      const membership = db.prepare(
+        'SELECT note_space FROM context_scope_pins WHERE target_kind = ? AND target_id = ? AND note_id = ?',
+      )
+      const canonical = entries.map((e) => {
+        if (e.entryKind !== 'pin') {
+          return e
+        }
+        const pin = membership.get(targetKind, targetId, e.entryRef) as
+          { note_space: string } | undefined
+
+        if (pin) {
+          return { ...e, entryRef: resolveLiveIdentityForWrite(db, pin.note_space, e.entryRef) }
+        }
+        if (isRetiredIdentity(db, e.entryRef)) {
+          throw referenceIdentityConflict(e.entryRef)
+        }
+
+        // A stale non-member: it ranks nothing, exactly as before.
+        return e
+      })
+      const rows = dedupOrderEntries(canonical)
+
       db.prepare('DELETE FROM context_order WHERE target_kind = ? AND target_id = ?').run(
         targetKind,
         targetId,

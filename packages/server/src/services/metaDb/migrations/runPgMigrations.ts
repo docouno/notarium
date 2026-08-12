@@ -144,6 +144,7 @@ export const runPgMigrations = async (
     const schema = await pinPostgresSchema(client)
     pinnedSchema = schema
     await client.query(
+      // eslint-disable-next-line no-restricted-syntax -- outside the note-identity hierarchy: startup runs on a dedicated client, before the pool exists
       `SELECT pg_advisory_xact_lock(
          hashtext(current_database()),
          hashtext($1::text)

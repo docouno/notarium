@@ -7,6 +7,7 @@ import type {
   Author,
   CreateNoteRequest,
   MoveRequest,
+  RevisionUnavailableReason,
   UpdateNoteRequest,
   ActivityEvent as WireActivityEvent,
   GraphHealth as WireGraphHealth,
@@ -19,7 +20,7 @@ import type {
   SearchResult as WireSearchResult,
   TrashItem as WireTrashItem,
 } from '@notarium/contract'
-import { RESOLVED_VIA } from '@notarium/core'
+import { RESOLVED_VIA, REVISION_ENTRY_ROLE } from '@notarium/core'
 import type {
   ConflictNote,
   Graph,
@@ -176,6 +177,7 @@ export const revisionToWire = (r: Revision): Omit<WireRevision, 'author'> => ({
   theirRev: r.theirRevisionId,
   sourceRev: r.sourceRevisionId,
   title: r.title,
+  ...(r.unavailableReason ? { unavailableReason: r.unavailableReason } : {}),
   charsAdded: r.charsAdded,
   charsRemoved: r.charsRemoved,
 })
@@ -189,13 +191,15 @@ export const revisionDetailToWire = (r: RevisionDetail): Omit<WireRevisionDetail
 /** The dashboard "what changed" display kind derived from a journal revision.
  *  canon: docs/dashboard.md#activity-source-the-revision-journal-12 */
 const activityEventKindOf = (r: Revision): ActivityEventKind =>
-  r.kind === REVISION_KIND.delete
-    ? ACTIVITY_EVENT_KIND.deleted
-    : r.kind === REVISION_KIND.restore
-      ? ACTIVITY_EVENT_KIND.restored
-      : r.baseRevisionId == null
-        ? ACTIVITY_EVENT_KIND.created
-        : ACTIVITY_EVENT_KIND.edited
+  r.unavailableReason
+    ? ACTIVITY_EVENT_KIND.unavailable
+    : r.kind === REVISION_KIND.delete
+      ? ACTIVITY_EVENT_KIND.deleted
+      : r.kind === REVISION_KIND.restore
+        ? ACTIVITY_EVENT_KIND.restored
+        : r.entryRole === REVISION_ENTRY_ROLE.origin
+          ? ACTIVITY_EVENT_KIND.created
+          : ACTIVITY_EVENT_KIND.edited
 
 /** One activity event, minus `author` (filled at the route, redacting a foreign
  *  agent's key id) and `path` (journal rows carry no filePath — the route joins
@@ -209,7 +213,18 @@ export const activityEventToWire = (r: Revision): Omit<WireActivityEvent, 'autho
   principal: r.principal,
   charsAdded: r.charsAdded,
   charsRemoved: r.charsRemoved,
+  ...(r.unavailableReason ? { unavailableReason: r.unavailableReason } : {}),
 })
+
+/** Strip the resolved author from a journal GAP. A null principal ordinarily means
+ *  "an external edit with no signer", which `describeAuthor` renders as such — honest
+ *  for a real external state, a lie for a row whose writer is simply withheld (#327). */
+export const unattributedIfGap = <
+  T extends { author: Author; unavailableReason?: RevisionUnavailableReason },
+>(
+  row: T,
+): Omit<T, 'author'> & { author: Author | null } =>
+  row.unavailableReason ? { ...row, author: null } : row
 
 /** One trash row. `external` is computed from the RAW principal (before redaction),
  *  so only a principal-LESS delete reads external — a foreign agent's delete stays

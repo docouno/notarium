@@ -12,7 +12,7 @@ import {
   resolveLink,
   shapeGraph,
 } from '../graph'
-import { IdentityRegistry } from '../identity'
+import { type AdoptResult, IdentityRegistry } from '../identity'
 import type {
   AgentWriteAttribution,
   ExportEntry,
@@ -115,6 +115,27 @@ type ReadEffects = {
   changedIds: Set<string>
 }
 
+/** Claims whose arbitration/convergence has not completed, keyed by storage path. */
+type UnsettledClaims = Map<string, string>
+
+/** What one trip through the arbiter left behind. `previousId` is the id the path
+ *  carried BEFORE arbitration, not the one the LAST settlement retired: convergence
+ *  may re-arbitrate an external rewrite, and a chain M → X → Z still has to be
+ *  re-keyed from M, because M is what the snapshot is keyed by. */
+type SettledClaim = {
+  outcome: AdoptResult
+  /** Non-null only when arbitration actually moved the path off `previousId`. */
+  previousId: string | null
+  settledId: string | null
+}
+
+/** Bounded re-arbitration rounds for one path: an external writer rewriting the
+ *  claim in a tight loop must fail closed rather than spin forever. */
+const IDENTITY_CONVERGENCE_ATTEMPTS = 8
+
+/** Linear step between re-arbitration rounds for one path (round N waits N × this). */
+const IDENTITY_CONVERGENCE_BACKOFF_MS = 25
+
 export class CachedStore implements KnowledgeStore {
   private readonly inner: KnowledgeStore
 
@@ -131,6 +152,11 @@ export class CachedStore implements KnowledgeStore {
    *  column), so a trash op by raw note-id must verify the tombstone's `space` matches — else a
    *  caller could restore/purge another space's note. */
   private readonly space: string
+
+  /** Whether ids are arbitrated against shared persistence. `false` is the honest
+   *  process-local mode (P5): ids live for this process only, so no claim can be
+   *  refused and no file ever has to be brought onto a different id. */
+  private readonly arbitratesIdentity: boolean
 
   /** The identity registry (P7): note-id ↔ filePath, first-seen created
    *  dates, materialization state. The snapshot below keys on ITS ids, so a
@@ -204,6 +230,13 @@ export class CachedStore implements KnowledgeStore {
    * Once durability recovers, one broad changed event repairs every client
    * window the failed poll deliberately did not announce. */
   private pendingIdentityChangeBefore: Set<string> | null = null
+  /** Frontmatter claims the global arbiter has not answered yet — a failed
+   *  settlement keeps the identity publication fence shut until it succeeds. */
+  private readonly unsettledClaims: UnsettledClaims = new Map()
+  /** The drain in flight, so a second surface JOINS it instead of stepping past.
+   *  A boolean here would be a silent skip: the joiner publishes while the claims
+   *  it is about to serve are still unsettled. */
+  private drainingClaims: Promise<void> | null = null
   /** Invalidates an older boot's graph completion when a newer authoritative
    *  rebuild wins the main checkpoint first. */
   private bootGeneration = 0
@@ -305,11 +338,30 @@ export class CachedStore implements KnowledgeStore {
     if (inner.exportNotes) {
       this.exportNotes = (opts) => inner.exportNotes!(opts)
     }
+    this.arbitratesIdentity = identityPersistence != null
     this.identity = new IdentityRegistry({
       persistence: identityPersistence,
       space,
       now,
       requestFlush: () => this.flushIdentityPublication(),
+      // A minted id that turned out to be another space's is reminted by the
+      // registry itself, and the READ MODEL follows it here: the snapshot, the
+      // preview cache and the graph edges. The JOURNAL does not — moving history
+      // between ids is a settlement's job, inside its transaction, where the
+      // contamination closure is computed (`rekeyAndQuarantineRevisions`). Since
+      // #327 arbitration precedes every map mutation, so the registry only ever
+      // holds ids a settlement already decided and this path is a defensive one;
+      // a refusal reaching it would leave the note's timeline under the refused
+      // spelling. canon: docs/core.md#identity
+      onRemint: (previousId, nextId) => {
+        this.markIdentityPublicationPending()
+        // Same repair the settlement path records: the refused spelling was already
+        // published, so the event that announces the new id has to retire the old
+        // one — a subscriber that never hears it keeps a note under a dead id.
+        this.rememberIdentityRepair(new Set([previousId]))
+        this.rekeySnapshot(previousId, nextId)
+        this.markInnerLinkIdentitiesDirty()
+      },
     })
     this.space = space ?? DEFAULT_SPACE
     this.journal = new RevisionJournal({
@@ -1058,28 +1110,232 @@ export class CachedStore implements KnowledgeStore {
           this.markIdentityPublicationPending()
           identityPublicationPending = true
         }
-        const res = this.identity.adoptFileId(path, claim)
+        const res = await this.settleClaimAtPath(path, claim)
 
-        if (res.kind === 'duplicate') {
+        // Whether the path MOVED and what the arbiter's last word was are two
+        // independent facts, and only the first decides a re-key. Gating the re-key
+        // on the verdict drops it whenever an earlier hop already moved the path and
+        // a later one ended in `duplicate` — the snapshot then keeps serving an id
+        // the settlement has tombstoned, and every poll after that mints another.
+        //
+        // Applied HERE rather than after the loop, because the pair cannot be
+        // recovered later: it is read off the path before and after the settlement,
+        // and a throw on any LATER path would leave the registry already moved — a
+        // retry then sees no movement at all and the snapshot keeps a tombstoned id
+        // for good. The publication fence is shut for the whole sweep, so moving the
+        // snapshot early is not observable.
+        if (res.previousId && res.settledId) {
+          rekeyed.push([res.previousId, res.settledId])
+          this.rekeySnapshot(res.previousId, res.settledId)
+        }
+        if (res.outcome.kind === 'duplicate') {
           // A user-copied file: two files claiming one id. The original
           // keeps it; this copy lives under its registry id until a save
           // through us rewrites its frontmatter.
           console.warn(
-            `[cached-store] duplicate ${NOTE_ID_FRONTMATTER_KEY} "${claim}" in ${path} (owned by ${res.ownerPath}) — keeping the copy's registry id`,
+            `[cached-store] duplicate ${NOTE_ID_FRONTMATTER_KEY} "${claim}" in ${path} (owned by ${res.outcome.ownerPath}) — keeping the copy's registry id`,
           )
-        } else if (res.kind === 'adopted' && res.previousId) {
-          rekeyed.push([res.previousId, claim])
         }
       }
-    }
-    for (const [oldId, newId] of rekeyed) {
-      this.rekeySnapshot(oldId, newId)
     }
     if (identityPublicationPending) {
       await this.flushIdentityPublication()
     }
 
     return { unresolvedPaths, rekeyed }
+  }
+
+  /** The ONE road from an observed frontmatter claim to a published identity:
+   *  arbitrate it globally, then bring the file and the exact index onto the
+   *  authoritative id. Every channel that can see a claim — the boot sweep, the
+   *  delta preflight and the lazy read — goes through here, so a losing claimant
+   *  can never reach a reader while its bytes still name another space's note.
+   *  canon: docs/core.md#identity */
+  private async settleClaimAtPath(filePath: string, observedId: string): Promise<SettledClaim> {
+    // Outstanding while the arbiter is being asked. A failure leaves it behind
+    // and the publication fence stays shut: serving this path would hand a
+    // reader an id whose durable owner is still unknown.
+    const retrying = this.unsettledClaims.has(filePath)
+
+    this.unsettledClaims.set(filePath, observedId)
+    // Journal appends are queued per note and fired and forgotten. Settle them
+    // BEFORE the transaction re-keys their chains, or an append already in the
+    // queue lands under the id the settlement just retired.
+    const currentId = this.identity.idFor(filePath) ?? null
+
+    await Promise.all([
+      this.journal.drain(observedId),
+      ...(currentId ? [this.journal.drain(currentId)] : []),
+    ])
+
+    const settled = await this.identity.settleFileClaim(filePath, observedId)
+    // A refused claim has to be rewritten; an accepted one only has to be PROVEN
+    // (a crash between the index row and its fingerprint is the case that pays
+    // for it). A no-op and a duplicate change nothing on disk, so neither is
+    // worth a stat/read of every file on every boot.
+    //
+    // A RETRY converges whatever the verdict is. The arbiter's transaction commits
+    // before convergence runs, so the attempt whose convergence threw left a
+    // materialized row behind — and the registry's fast path answers `noop` from
+    // that row for good. Reading the verdict alone would make "fails closed until
+    // it is proven" a one-shot promise: the second read publishes bytes no proof
+    // ever looked at.
+    const outcome =
+      this.arbitratesIdentity &&
+      (settled.kind === 'foreign-owner' ||
+        settled.kind === 'adopted' ||
+        (retrying && settled.kind !== 'duplicate'))
+        ? await this.convergeClaimAtPath(filePath, observedId, settled)
+        : settled
+
+    this.unsettledClaims.delete(filePath)
+    const settledId = this.identity.idFor(filePath) ?? null
+
+    // Read the move off the path, not off the outcome: re-arbitration can leave a
+    // `foreign-owner` verdict on a path whose id nonetheless moved, and it can end
+    // an `adopted` chain whose last hop retired an id the snapshot never held.
+    return {
+      outcome,
+      previousId: currentId && settledId && currentId !== settledId ? currentId : null,
+      settledId,
+    }
+  }
+
+  /** Bring the file onto the id the arbiter left this path with, and prove the
+   *  exact index describes those bytes — all before the caller may publish. An
+   *  external writer that lands mid-flight is not overwritten: its claim goes
+   *  back through the arbiter, and convergence continues onto whatever THAT
+   *  settlement leaves behind. canon: docs/core.md#identity */
+  private async convergeClaimAtPath(
+    filePath: string,
+    observedId: string,
+    settled: AdoptResult,
+  ): Promise<AdoptResult> {
+    const materialize = this.inner.materializeIdentityAtPath?.bind(this.inner)
+
+    if (!materialize) {
+      // Honest degradation (P5): the arbiter's answer stands, the file keeps its
+      // stale claim until a save through us rewrites it.
+      if (settled.kind === 'foreign-owner') {
+        console.warn(
+          `[cached-store] ${NOTE_ID_FRONTMATTER_KEY} "${observedId}" in ${filePath} belongs to space ${settled.ownerSpace}; this engine cannot rewrite it, so the note keeps "${settled.currentId}"`,
+        )
+      }
+
+      return settled
+    }
+    let outcome = settled
+    let expected: string | null = observedId
+    let targetId = this.targetIdFor(filePath, settled)
+
+    for (let attempt = 0; attempt < IDENTITY_CONVERGENCE_ATTEMPTS; attempt++) {
+      if (attempt) {
+        // Back off between rounds. Every round is a re-arbitration plus a fresh
+        // stat/read/hash, and it runs under the boot barrier or the global mutation
+        // claim: spinning them back-to-back against a writer in a tight loop
+        // starves the very writer we are waiting to settle down.
+        await this.pause(IDENTITY_CONVERGENCE_BACKOFF_MS * attempt)
+      }
+      const result = await materialize({ filePath, expectedClaimId: expected, targetId })
+
+      if (result.status === 'materialized') {
+        this.identity.markMaterialized(targetId)
+        return outcome
+      }
+      if (result.status === 'vanished') {
+        // The file left the path while we were converging. The arbiter committed
+        // BEFORE this, so doing nothing would leave a LIVE durable row claiming a
+        // path with no bytes — and a real file elsewhere holding that id would
+        // then lose the arbitration to a ghost, until a restart. Tombstone it:
+        // that is exactly what convergence just learned, and it is reversible —
+        // a later sighting resurrects the id at whatever path carries it.
+        this.identity.markDeleted(filePath)
+        return outcome
+      }
+      expected = result.observedId
+      if (result.observedId == null) {
+        // The file lost its claim entirely: nothing to arbitrate, just write the
+        // identity this path already owns back into it.
+        continue
+      }
+      const next = await this.identity.settleFileClaim(filePath, result.observedId)
+
+      if (next.kind === 'duplicate') {
+        // A copy of a live same-space note: the existing duplicate contract
+        // forbids an eager rewrite, so convergence stops here by design.
+        return next
+      }
+      outcome = next
+      targetId = this.targetIdFor(filePath, next)
+    }
+
+    throw new StoreError(`identity convergence did not settle at ${filePath}`)
+  }
+
+  /** A bounded wait that never holds the process open. */
+  private pause(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      setTimeout(resolve, ms).unref?.()
+    })
+  }
+
+  /** The id the path must end up carrying after a settlement: its own on a
+   *  refusal, otherwise whatever the registry now binds to the path. */
+  private targetIdFor(filePath: string, settled: AdoptResult): string {
+    if (settled.kind === 'foreign-owner') {
+      return settled.currentId
+    }
+    const current = this.identity.idFor(filePath)
+
+    if (!current) {
+      throw new StoreError(`identity convergence has no current id for ${filePath}`)
+    }
+
+    return current
+  }
+
+  /** Re-ask the arbiter about every claim whose settlement failed. It runs on
+   *  the identity publication fence, so a reader either gets the settled
+   *  identity or the same honest persistence error the producer got — and the
+   *  first read after the meta-DB recovers is what repairs the snapshot. */
+  private async drainUnsettledClaims(): Promise<void> {
+    // Join a drain already in flight — never step past it. Returning early here
+    // would let this surface open its publication fence while the very claims the
+    // drain is settling are still outstanding: the id it publishes can be a
+    // tombstone a millisecond later, and the fence exists to make that impossible.
+    if (this.drainingClaims) {
+      return this.drainingClaims
+    }
+    if (!this.unsettledClaims.size) {
+      return
+    }
+    // A settlement re-keys the snapshot and rewrites a file, so it belongs under
+    // the mutation claim wherever it is reached from — a read surface's tail, the
+    // write-behind timer, the delta applier. Taking the claim HERE is what makes
+    // that true of every caller instead of only the ones that remembered; the
+    // claim is not re-entrant, so a caller already inside one just proceeds.
+    if (!this.mutations.holds()) {
+      return this.mutations.run({ global: true }, () => this.drainUnsettledClaims())
+    }
+    const drain = (async () => {
+      for (const [filePath, observedId] of [...this.unsettledClaims]) {
+        const settled = await this.settleClaimAtPath(filePath, observedId)
+
+        if (settled.previousId && settled.settledId) {
+          this.rememberIdentityRepair(new Set([settled.previousId]))
+          this.rekeySnapshot(settled.previousId, settled.settledId)
+          this.markInnerLinkIdentitiesDirty()
+          this.syncInnerLinkIdentities()
+        }
+      }
+    })()
+
+    this.drainingClaims = drain
+    try {
+      await drain
+    } finally {
+      this.drainingClaims = null
+    }
   }
 
   /** Move everything keyed under a superseded id to the note's real id. */
@@ -1188,6 +1444,7 @@ export class CachedStore implements KnowledgeStore {
   private async flushIdentityPublication(): Promise<void> {
     const revision = this.identityPublicationRevision
 
+    await this.drainUnsettledClaims()
     await this.identity.flush()
     this.durableIdentityPublicationRevision = Math.max(
       this.durableIdentityPublicationRevision,
@@ -1285,10 +1542,17 @@ export class CachedStore implements KnowledgeStore {
     // barrier. Check only after that barrier opens; checking before it creates
     // the exact load-failure race this guard exists to close.
     await this.ensureNotes()
-    if (!this.identityLoadError) {
-      return
+    if (this.identityLoadError) {
+      await this.identityReady()
     }
-    await this.identityReady()
+    // A claim the arbiter could not answer is the other way this layer's
+    // identity can be behind the files. Retry it, so the reader gets either the
+    // settled identity or the same honest persistence error — never a provisional
+    // id of unknown ownership. The claim the re-key needs is taken by the drain
+    // itself, which is what makes every other entry into it safe as well.
+    if (this.unsettledClaims.size) {
+      await this.flushIdentityPublication()
+    }
   }
 
   async list(opts?: ListOptions): Promise<NoteMeta[]> {
@@ -2009,7 +2273,7 @@ export class CachedStore implements KnowledgeStore {
       // Snapshotting the corpus is only needed on the rare lazy-adoption path,
       // never on an ordinary hot read.
       const identityBefore = mayRekey ? new Set(this.snap.notes.keys()) : undefined
-      const content = this.finalizeRead(
+      const content = await this.finalizeRead(
         current.id,
         current.path,
         detail,
@@ -2100,13 +2364,13 @@ export class CachedStore implements KnowledgeStore {
     }
   }
 
-  private finalizeRead(
+  private async finalizeRead(
     id: string,
     expectedPath: string | undefined,
     detail: NoteContent,
     allowSideEffects = true,
     effects?: ReadEffects,
-  ): NoteContent {
+  ): Promise<NoteContent> {
     // Only an identity-capable engine owns its returned id. A bare engine may
     // parse the frontmatter claim into detail.id as a convenience, but the
     // decorator must still adopt/rekey its registry before exposing that id.
@@ -2129,22 +2393,23 @@ export class CachedStore implements KnowledgeStore {
         const claim = detail.frontmatter?.[NOTE_ID_FRONTMATTER_KEY]
 
         if (typeof claim === 'string' && isValidNoteId(claim)) {
-          const res = this.identity.adoptFileId(detail.filePath, claim)
+          const res = await this.settleClaimAtPath(detail.filePath, claim)
+          const settledId = res.settledId ?? claim
 
-          if (res.kind === 'adopted') {
-            if (res.previousId) {
-              this.markIdentityPublicationPending()
-              this.rekeySnapshot(res.previousId, claim)
-              this.markInnerLinkIdentitiesDirty()
-              this.syncInnerLinkIdentities()
-              if (effects) {
-                effects.rekeyed.push([res.previousId, claim])
-              } else {
-                this.lastChangeAt = this.iso()
-                this.emit({ type: 'changed', upserts: [claim], removed: [res.previousId] })
-              }
+          if (res.previousId) {
+            this.markIdentityPublicationPending()
+            this.rekeySnapshot(res.previousId, settledId)
+            this.markInnerLinkIdentitiesDirty()
+            this.syncInnerLinkIdentities()
+            if (effects) {
+              effects.rekeyed.push([res.previousId, settledId])
+            } else {
+              this.lastChangeAt = this.iso()
+              this.emit({ type: 'changed', upserts: [settledId], removed: [res.previousId] })
             }
-            rec = this.identity.recordFor(claim) ?? rec
+          }
+          if (res.settledId) {
+            rec = this.identity.recordFor(res.settledId) ?? rec
           }
         }
         sourceId = rec?.id
@@ -2828,8 +3093,6 @@ export class CachedStore implements KnowledgeStore {
             this.markInnerLinkIdentitiesDirty()
           }
 
-          this.cursor = delta.cursor
-          this.lastPollAt = this.iso()
           // The provisional post-delta axis is now complete. Make it durable
           // before opening the listDirs window's producer lease; the slower
           // body sweep may then expose this old-but-routable P while it reads,
@@ -2841,6 +3104,14 @@ export class CachedStore implements KnowledgeStore {
           // file still has its provisional registry id. The frontmatter sweep
           // and all journal/trash claims below use the final identity.
           const identitySweep = await this.sweepFileIds(result.sweepPaths)
+
+          // Only now, with this delta's identities settled, may the cursor move.
+          // Advancing it earlier loses the delta outright when the flush or the
+          // sweep throws: `changes()` would never offer these paths again, and an
+          // external file carrying a durable claim would keep serving under the
+          // provisional id it was minted with. canon: docs/core.md#identity
+          this.cursor = delta.cursor
+          this.lastPollAt = this.iso()
 
           const identityResolutions: Promise<void>[] = []
           const readEffects: ReadEffects = { rekeyed: [], changedIds: new Set() }

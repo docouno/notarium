@@ -1,5 +1,9 @@
 import { z } from 'zod'
-import { IsoTimestampSchema, RevisionKindSchema } from '../primitives'
+import {
+  IsoTimestampSchema,
+  RevisionKindSchema,
+  RevisionUnavailableReasonSchema,
+} from '../primitives'
 import { locationFields, sessionField } from './_fields'
 import { FolderEntrySchema, ProjectHandleSchema } from './primitives'
 
@@ -57,6 +61,8 @@ export const RecentActivityItemSchema = z.object({
   kind: RevisionKindSchema,
   principal: z.string().nullable(),
   modifiedAt: IsoTimestampSchema,
+  /** A journal GAP — see `RevisionUnavailableReasonSchema`. */
+  unavailableReason: RevisionUnavailableReasonSchema.optional(),
 })
 
 /** `truncated` = there were more recent changes than `limit` returned. No `total`:

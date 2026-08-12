@@ -1,19 +1,34 @@
 import { scopePinOfRow, type ScopePinRow } from '../../rows'
 import type { ContextSetTargetKind, ScopePinRecord, ScopePinsPersistence } from '../../types'
 import type { PgDriverCtx } from './context'
+import { enterIdentityTierForReferences } from './liveIdentity'
 
 export const createScopePinsFacet = (ctx: PgDriverCtx): ScopePinsPersistence => ({
   addPin: async (r: ScopePinRecord) => {
     await ctx.ensureInit()
-    await ctx.required.query(
-      `INSERT INTO context_scope_pins (target_kind, target_id, target_space, note_space, note_id, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         ON CONFLICT (target_kind, target_id, note_id) DO UPDATE SET
-           target_space = EXCLUDED.target_space,
-           note_space = EXCLUDED.note_space,
-           created_at = EXCLUDED.created_at`,
-      [r.targetKind, r.targetId, r.targetSpace, r.noteSpace, r.noteId, r.createdAt],
-    )
+    const client = await ctx.required.connect()
+
+    try {
+      await client.query('BEGIN')
+      const identity = await enterIdentityTierForReferences(client, [r.noteId])
+      const noteId = identity.canonical(r.noteSpace, r.noteId)
+
+      await client.query(
+        `INSERT INTO context_scope_pins (target_kind, target_id, target_space, note_space, note_id, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           ON CONFLICT (target_kind, target_id, note_id) DO UPDATE SET
+             target_space = EXCLUDED.target_space,
+             note_space = EXCLUDED.note_space,
+             created_at = EXCLUDED.created_at`,
+        [r.targetKind, r.targetId, r.targetSpace, r.noteSpace, noteId, r.createdAt],
+      )
+      await client.query('COMMIT')
+    } catch (err) {
+      await client.query('ROLLBACK')
+      throw err
+    } finally {
+      client.release()
+    }
   },
   removePin: async (targetKind: ContextSetTargetKind, targetId: string, noteId: string) => {
     await ctx.ensureInit()

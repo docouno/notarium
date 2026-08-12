@@ -21,6 +21,7 @@ import {
   CachedStore,
   type InMemoryRevisionPersistence,
   type InteractiveSignal,
+  REVISION_ENTRY_ROLE,
   sha256Hex,
 } from '@notarium/core'
 import { InMemoryStore, type StoreSnapshot } from '@notarium/engine-memory'
@@ -92,6 +93,11 @@ export type ActivityFixture = {
    *  revision view and the Changes diff both fetch by `contentHash`. Omit for a
    *  row that only needs to exist as activity. */
   content?: string
+  /** Seed this row as a journal GAP — the state a cross-space id collision leaves
+   *  behind (#327). The fake's journal cannot DECIDE a quarantine (that closure
+   *  lives in the meta-DB's settlement transaction), so the fixture names the row
+   *  and the twin serves it with the drivers' effective-field semantics. */
+  unavailable?: boolean
 }
 
 export type SpaceFixture = {
@@ -236,6 +242,16 @@ const seedActivity = async (
     // previous row of the SAME note.
     const baseRevisionId =
       kind === 'created' || kind === 'baseline' ? null : (lastRevisionOf.get(noteId) ?? '0')
+    // The role is a WRITTEN column now, so this second writer stamps it too — its
+    // public contract (`kind`) already says exactly which of the three each fixture
+    // row is. Leaving it to a default would classify every fake-stand row, and the
+    // e2e and demo screenshots that stand on them, by a field nobody set.
+    const entryRole =
+      kind === 'baseline'
+        ? REVISION_ENTRY_ROLE.baseline
+        : kind === 'created'
+          ? REVISION_ENTRY_ROLE.origin
+          : REVISION_ENTRY_ROLE.change
     // Content-address the seeded body the same way a live write does, so the blob
     // lands under the hash the reader will ask for.
     const contentHash = e.content != null ? await sha256Hex(e.content) : null
@@ -247,6 +263,7 @@ const seedActivity = async (
         theirRevisionId: null,
         sourceRevisionId: null,
         kind: journalKind,
+        entryRole,
         principal: e.principal ?? 'ui',
         contentHash,
         title: e.title ?? `Activity ${i}`,
@@ -259,6 +276,10 @@ const seedActivity = async (
       },
       e.content ?? null,
     )
+
+    if (e.unavailable) {
+      revisions.quarantineForTest([appended.id])
+    }
     lastRevisionOf.set(noteId, appended.id)
   }
 }

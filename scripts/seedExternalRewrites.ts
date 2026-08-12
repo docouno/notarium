@@ -21,6 +21,25 @@ export type SeedExternalRewrite = {
   replacements: Array<{ from: string; to: string }>
 }
 
+/** A cross-space id collision expressed as an external rewrite (#327). The direction is
+ *  the whole seed: the CLAIMANT's file is the one edited, and what lands in it is the
+ *  OWNER's id. Flipped, the rewrite looks for an id the file does not contain — the
+ *  applier finds no occurrence, the stand comes up with two ordinary notes, and every
+ *  check downstream passes while reproducing nothing. */
+export const identityClaimRewrite = (
+  claim: { note: string; claimFrom: string },
+  idOf: (handle: string) => string | undefined,
+): { note: string; replacements: Array<{ from: string; to: string }> } => {
+  const claimantId = idOf(claim.note)
+  const ownerId = idOf(claim.claimFrom)
+
+  if (!claimantId || !ownerId) {
+    throw new Error(`external identity claim references unknown note ${claim.note}`)
+  }
+
+  return { note: claim.note, replacements: [{ from: claimantId, to: ownerId }] }
+}
+
 /** Apply seed-declared external edits through the physical filesystem seam.
  *
  *  The file is rewritten in place and its original timestamps are restored. The

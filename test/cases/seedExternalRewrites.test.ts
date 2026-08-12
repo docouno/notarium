@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { applySeedExternalRewrites } from '../../scripts/seedExternalRewrites'
+import { applySeedExternalRewrites, identityClaimRewrite } from '../../scripts/seedExternalRewrites'
 
 const roots: string[] = []
 
@@ -36,6 +36,27 @@ describe('applySeedExternalRewrites', () => {
     expect(after.mtimeMs).toBe(before.mtimeMs)
     expect(after.ino).toBe(before.ino)
     expect(after.ctimeMs).not.toBe(before.ctimeMs)
+  })
+
+  it('writes the OWNER’s id into the CLAIMANT’s file, never the other way round', async () => {
+    const ids = new Map([
+      ['copy', 'claimant0001'],
+      ['original', 'owner0000001'],
+    ])
+    const rewrite = identityClaimRewrite({ note: 'copy', claimFrom: 'original' }, (handle) =>
+      ids.get(handle),
+    )
+
+    // The seeded collision IS this direction: the copy's file starts naming the
+    // original's id. Flip the pair and the applier searches for an id the file never
+    // held — nothing is planted, and the stand reproduces no collision at all.
+    expect(rewrite).toEqual({
+      note: 'copy',
+      replacements: [{ from: 'claimant0001', to: 'owner0000001' }],
+    })
+    expect(() =>
+      identityClaimRewrite({ note: 'copy', claimFrom: 'ghost' }, (h) => ids.get(h)),
+    ).toThrow('unknown note')
   })
 
   it('rejects replacements that do not preserve UTF-8 byte length', async () => {

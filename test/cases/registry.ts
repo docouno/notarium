@@ -11,6 +11,7 @@ import { folderPage } from './cases/folderPage'
 import { graph } from './cases/graph'
 import { graphLoad } from './cases/graphLoad'
 import { historyRich } from './cases/historyRich'
+import { identityCollision } from './cases/identityCollision'
 import { importLayout } from './cases/importLayout'
 import { importThread } from './cases/importThread'
 import { jobs } from './cases/jobs'
@@ -53,6 +54,7 @@ export const CASES: readonly CaseSpec[] = [
   graphLoad,
   searchCorpus,
   externalEdits,
+  identityCollision,
   nameCollisions,
   nonLatinNames,
   // content / reader

@@ -159,6 +159,14 @@ export default defineConfig({
   // emit its temporary bundled config next to vite.config.js. Keep the optimizer cache
   // relocatable so the container does not need package-local node_modules from host.
   cacheDir: process.env.VITE_CACHE_DIR || 'node_modules/.vite',
+  resolve: {
+    alias: {
+      // core has one barrel and it re-exports the server-side mutation fence, so the
+      // SPA graph contains a `node:async_hooks` import it can never satisfy. Resolve
+      // it to a shim that throws if anything actually reaches for it (#327).
+      'node:async_hooks': fileURLToPath(new URL('./src/shims/asyncHooks.ts', import.meta.url)),
+    },
+  },
   plugins: [
     react(),
     VitePWA({

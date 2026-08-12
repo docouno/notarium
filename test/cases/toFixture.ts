@@ -209,6 +209,10 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
       // Churn stamped the way the journal stamps it for this op, so the "+N −M" on
       // the feed is a measurement rather than a decoration.
       ...churn(e.op, before, state ? journalBody(state.content, state.title) : ''),
+      // A row the settlement quarantined: the fake serves it with the drivers'
+      // effective-field semantics, so the stand shows a real gap rather than a
+      // drawing of one.
+      ...(e.op === 'edit' && e.unavailable ? { unavailable: true } : {}),
     })
     activityBySpace.set(e.space, rows)
   }
@@ -234,6 +238,18 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
         )
       }
       note.content = `${parts[0]}${to}${parts[1]}`
+    }
+  }
+
+  // A cross-space id collision (#327) is deliberately NOT projected: the fake has
+  // no arbiter, so it can only show the CONVERGED end state — two notes with two
+  // distinct ids, which is exactly what the fixture already carries. Only the real
+  // stand can plant the collision and prove the repair.
+  for (const claim of world.externalIdentityClaims ?? []) {
+    for (const handle of [claim.note, claim.claimFrom]) {
+      if (!notes.has(handle)) {
+        throw new Error(`external identity claim references unknown note ${handle}`)
+      }
     }
   }
 

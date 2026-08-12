@@ -184,8 +184,8 @@ export class SqliteMetaDb implements MetaDb {
     db.exec('BEGIN')
     try {
       db.prepare(
-        "INSERT OR IGNORE INTO revision_purge_fences (kind, entity_id) VALUES ('space', ?)",
-      ).run(spaceId)
+        "INSERT OR IGNORE INTO revision_purge_fences (kind, entity_id, space) VALUES ('space', ?, ?)",
+      ).run(spaceId, spaceId)
       // Blobs are content-addressed and shared across spaces: drop a blob only
       // when its last referrer leaves.
       const hashes = (

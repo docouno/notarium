@@ -13,6 +13,8 @@ import type {
   ContextSetTargetKind,
 } from '../../types'
 import type { PgDriverCtx } from './context'
+import { enterIdentityTierForReferences } from './liveIdentity'
+import { lockContextSetRow } from './lockOrder'
 
 export const createContextSetsFacet = (ctx: PgDriverCtx): ContextSetsPersistence => ({
   createSet: async (r: ContextSetRecord) => {
@@ -51,11 +53,12 @@ export const createContextSetsFacet = (ctx: PgDriverCtx): ContextSetsPersistence
 
     try {
       await client.query('BEGIN')
-      const res = await client.query(
-        'SELECT id, home_space, name, items, created_at FROM context_sets WHERE id = $1 FOR UPDATE',
-        [id],
-      )
-      const row = res.rows[0] as ContextSetRow | undefined
+      // Identity row before the set row — the settlement's order. Locking the set
+      // first and reaching for identity second deadlocks against a settlement that
+      // holds identity and is reaching for this very set (#327).
+      const identity = await enterIdentityTierForReferences(client, [ref.noteId])
+      const noteId = identity.canonical(ref.space, ref.noteId)
+      const { row } = await lockContextSetRow(client, id)
 
       if (!row) {
         await client.query('ROLLBACK')
@@ -63,11 +66,11 @@ export const createContextSetsFacet = (ctx: PgDriverCtx): ContextSetsPersistence
       }
       const rec = contextSetOfRow(row)
 
-      if (rec.items.some((r) => r.noteId === ref.noteId)) {
+      if (rec.items.some((r) => r.noteId === noteId)) {
         await client.query('COMMIT')
         return rec
       }
-      const items = [...rec.items, ref]
+      const items = [...rec.items, { ...ref, noteId }]
       await client.query('UPDATE context_sets SET items = $1 WHERE id = $2', [
         JSON.stringify(items),
         id,
@@ -87,11 +90,7 @@ export const createContextSetsFacet = (ctx: PgDriverCtx): ContextSetsPersistence
 
     try {
       await client.query('BEGIN')
-      const res = await client.query(
-        'SELECT id, home_space, name, items, created_at FROM context_sets WHERE id = $1 FOR UPDATE',
-        [id],
-      )
-      const row = res.rows[0] as ContextSetRow | undefined
+      const { row } = await lockContextSetRow(client, id)
 
       if (!row) {
         await client.query('ROLLBACK')
@@ -121,11 +120,7 @@ export const createContextSetsFacet = (ctx: PgDriverCtx): ContextSetsPersistence
 
     try {
       await client.query('BEGIN')
-      const res = await client.query(
-        'SELECT id, home_space, name, items, created_at FROM context_sets WHERE id = $1 FOR UPDATE',
-        [id],
-      )
-      const row = res.rows[0] as ContextSetRow | undefined
+      const { row } = await lockContextSetRow(client, id)
 
       if (!row) {
         await client.query('ROLLBACK')

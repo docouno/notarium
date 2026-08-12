@@ -13,6 +13,7 @@ import type {
   ContextSetTargetKind,
 } from '../../types'
 import type { SqliteDriverCtx } from './context'
+import { resolveLiveIdentityForWrite } from './liveIdentity'
 
 export const createContextSetsFacet = (ctx: SqliteDriverCtx): ContextSetsPersistence => ({
   createSet: async (r: ContextSetRecord) => {
@@ -47,23 +48,36 @@ export const createContextSetsFacet = (ctx: SqliteDriverCtx): ContextSetsPersist
   // loop, so a concurrent read-mutate-write can't interleave — no lost update.
   addItem: async (id: string, ref: ContextSetItemRef) => {
     await ctx.ensureInit()
-    const row = ctx.required
-      .prepare('SELECT id, home_space, name, items, created_at FROM context_sets WHERE id = ?')
-      .get(id) as ContextSetRow | undefined
+    const db = ctx.required
 
-    if (!row) {
-      return null
-    }
-    const rec = contextSetOfRow(row)
+    // IMMEDIATE so the identity revalidation and the membership write land as
+    // one writer — a settlement between them would add a retired id to the set.
+    db.exec('BEGIN IMMEDIATE')
+    try {
+      const row = db
+        .prepare('SELECT id, home_space, name, items, created_at FROM context_sets WHERE id = ?')
+        .get(id) as ContextSetRow | undefined
 
-    if (rec.items.some((r) => r.noteId === ref.noteId)) {
-      return rec
+      if (!row) {
+        db.exec('COMMIT')
+        return null
+      }
+      const rec = contextSetOfRow(row)
+      const noteId = resolveLiveIdentityForWrite(db, ref.space, ref.noteId)
+
+      if (rec.items.some((r) => r.noteId === noteId)) {
+        db.exec('COMMIT')
+        return rec
+      }
+      const items = [...rec.items, { ...ref, noteId }]
+
+      db.prepare('UPDATE context_sets SET items = ? WHERE id = ?').run(JSON.stringify(items), id)
+      db.exec('COMMIT')
+      return { ...rec, items }
+    } catch (err) {
+      db.exec('ROLLBACK')
+      throw err
     }
-    const items = [...rec.items, ref]
-    ctx.required
-      .prepare('UPDATE context_sets SET items = ? WHERE id = ?')
-      .run(JSON.stringify(items), id)
-    return { ...rec, items }
   },
   removeItem: async (id: string, noteId: string) => {
     await ctx.ensureInit()

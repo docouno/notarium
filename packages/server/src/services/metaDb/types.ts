@@ -3,6 +3,7 @@ import type {
   IdentityPersistence,
   RevisionKind,
   RevisionPersistence,
+  RevisionUnavailableReason,
 } from '@notarium/core'
 
 /** Derived space registry row; the `.notariummeta` marker is the source of truth.
@@ -134,10 +135,16 @@ export type FavoritesPersistence = {
   list(owner: string, space: string): Promise<FavoriteRecord[]>
   ids(owner: string, space: string, kind: FavoriteEntityKind): Promise<string[]>
   has(owner: string, space: string, kind: FavoriteEntityKind, entityId: string): Promise<boolean>
-  add(record: FavoriteRecord): Promise<void>
+  /** Returns the record as STORED: a note id is canonicalized inside the write
+   *  transaction, so it may differ from the one the caller passed (#327). The same
+   *  transaction drops the entity's rows of OTHER kinds, so re-favoriting after a
+   *  folder→project flip replaces the stale row instead of coexisting with it —
+   *  a clear issued outside it would target the pre-canonical id. */
+  add(record: FavoriteRecord): Promise<FavoriteRecord>
   remove(owner: string, space: string, kind: FavoriteEntityKind, entityId: string): Promise<void>
-  /** Remove every favorite row for this stable id in this owner/space. Used when a
-   *  plain folder favorite is later surfaced as a project with the same id. */
+  /** Remove every favorite row for this stable id in this owner/space, whatever its
+   *  kind — an unfavorite addresses the entity, and a favorited folder is deleted
+   *  as the project it has since become. */
   removeByEntity(owner: string, space: string, entityId: string): Promise<void>
 }
 
@@ -625,6 +632,8 @@ export type AgentSessionAuditWriteEvent = {
   sessionAttach: AgentSessionAttach | null
   noteId: string
   space: string
+  /** A journal GAP — see `Revision.unavailableReason`. The write still counts. */
+  unavailableReason?: RevisionUnavailableReason
   title: string
   class: string | null
   revisionKind: RevisionKind

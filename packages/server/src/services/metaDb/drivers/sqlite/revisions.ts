@@ -2,10 +2,20 @@ import {
   AGENT_SESSION_ATTACH,
   type AuthorFilter,
   type Revision,
+  REVISION_INTEGRITY,
+  revisionGapOf,
   type RevisionInput,
   type RevisionPersistence,
 } from '@notarium/core'
 
+import {
+  effectiveAuthorClause,
+  effectiveClassClause,
+  notSyntheticBaselineClause,
+  ORIGIN_ONLY,
+  QUARANTINED,
+  TRUSTED_ONLY,
+} from '../../revisionProjection'
 import type { SqliteDriverCtx } from './context'
 
 type RevisionRow = {
@@ -30,9 +40,20 @@ type RevisionRow = {
   created_at: string
   chars_added: number | bigint | null
   chars_removed: number | bigint | null
+  integrity: string | null
+  entry_role: string
 }
 
-const revisionOfRow = (r: RevisionRow): Revision => ({
+/** The ONE place a stored row becomes a served row. A contaminated chain is
+ *  handed out as a gap here, so no consumer can accidentally read a raw column
+ *  off it; the QUERIES above must still classify and filter on effective values,
+ *  which is what `revisionProjection` encodes. canon: docs/core.md#identity */
+const revisionOfRow = (r: RevisionRow): Revision =>
+  r.integrity === REVISION_INTEGRITY.quarantined
+    ? revisionGapOf(rawRevisionOfRow(r))
+    : rawRevisionOfRow(r)
+
+const rawRevisionOfRow = (r: RevisionRow): Revision => ({
   id: String(r.id),
   noteId: r.note_id,
   space: r.space,
@@ -40,6 +61,7 @@ const revisionOfRow = (r: RevisionRow): Revision => ({
   theirRevisionId: r.their_rev == null ? null : String(r.their_rev),
   sourceRevisionId: r.source_rev == null ? null : String(r.source_rev),
   kind: r.kind as Revision['kind'],
+  entryRole: r.entry_role as Revision['entryRole'],
   principal: r.principal,
   ...(r.agent_owner
     ? {
@@ -71,9 +93,9 @@ const revisionOfRow = (r: RevisionRow): Revision => ({
   charsRemoved: r.chars_removed == null ? null : Number(r.chars_removed),
 })
 
-/** Author-scope predicate as `?` SQL. A present-but-empty filter → ` AND 0`
- *  (matches nothing, not everything). Usernames carry no LIKE wildcard, so no
- *  ESCAPE is needed. */
+/** Author-scope predicate as `?` SQL. A present-but-empty filter matches nothing,
+ *  not everything — `effectiveAuthorClause` encodes that. Usernames carry no LIKE
+ *  wildcard, so no ESCAPE is needed. */
 const authorClauseSqlite = (author?: AuthorFilter): { clause: string; params: string[] } => {
   if (!author) {
     return { clause: '', params: [] }
@@ -90,8 +112,12 @@ const authorClauseSqlite = (author?: AuthorFilter): { clause: string; params: st
     params.push(`${p}%`)
   }
 
-  return { clause: parts.length ? ` AND (${parts.join(' OR ')})` : ' AND 0', params }
+  return { clause: effectiveAuthorClause(parts), params }
 }
+
+/** Class exclusion over the effective class — see `revisionProjection`. */
+const classFilterSqlite = (excludeClasses: readonly string[]): string =>
+  effectiveClassClause(excludeClasses.map(() => '?'))
 
 export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence => ({
   init: () => ctx.ensureInit(),
@@ -104,10 +130,10 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
         .prepare(
           `SELECT kind FROM revision_purge_fences
             WHERE (kind = 'space' AND entity_id = ?)
-               OR (kind = 'note' AND entity_id = ?)
+               OR (kind = 'note' AND entity_id = ? AND space IN ('', ?))
             LIMIT 1`,
         )
-        .get(rev.space, rev.noteId) as { kind: string } | undefined
+        .get(rev.space, rev.noteId, rev.space) as { kind: string } | undefined
 
       if (fence) {
         throw new Error(`revision target was permanently purged: ${fence.kind}`)
@@ -121,8 +147,8 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
       const res = db
         .prepare(
           `INSERT INTO note_revisions
-               (note_id, space, base_rev, their_rev, source_rev, kind, principal, agent_owner, agent_name, session_id, session_name, session_attach, content_hash, title, class, slug, tags, created_at, chars_added, chars_removed)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+               (note_id, space, base_rev, their_rev, source_rev, kind, entry_role, principal, agent_owner, agent_name, session_id, session_name, session_attach, content_hash, title, class, slug, tags, created_at, chars_added, chars_removed, integrity)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           rev.noteId,
@@ -131,6 +157,7 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
           rev.theirRevisionId == null ? null : Number(rev.theirRevisionId),
           rev.sourceRevisionId == null ? null : Number(rev.sourceRevisionId),
           rev.kind,
+          rev.entryRole,
           rev.principal,
           rev.agent?.owner ?? null,
           rev.agent?.agent ?? null,
@@ -145,6 +172,7 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
           rev.createdAt,
           rev.charsAdded,
           rev.charsRemoved,
+          REVISION_INTEGRITY.trusted,
         )
       db.exec('COMMIT')
       return { ...rev, tags: [...rev.tags], id: String(res.lastInsertRowid) }
@@ -153,18 +181,20 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
       throw err
     }
   },
-  listByNote: async (noteId, { offset, limit }) => {
+  listByNote: async (space, noteId, { offset, limit }) => {
     await ctx.ensureInit()
     const db = ctx.required
     const items = (
       db
-        .prepare('SELECT * FROM note_revisions WHERE note_id = ? ORDER BY id DESC LIMIT ? OFFSET ?')
-        .all(noteId, limit, offset) as RevisionRow[]
+        .prepare(
+          'SELECT * FROM note_revisions WHERE space = ? AND note_id = ? ORDER BY id DESC LIMIT ? OFFSET ?',
+        )
+        .all(space, noteId, limit, offset) as RevisionRow[]
     ).map(revisionOfRow)
     const total = (
-      db.prepare('SELECT COUNT(*) AS n FROM note_revisions WHERE note_id = ?').get(noteId) as {
-        n: number
-      }
+      db
+        .prepare('SELECT COUNT(*) AS n FROM note_revisions WHERE space = ? AND note_id = ?')
+        .get(space, noteId) as { n: number }
     ).n
     return { items, total }
   },
@@ -174,9 +204,7 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
     const since = sinceRevId == null ? 0 : Number(sinceRevId)
     // Exclude hidden classes INSIDE the query so the window, the distinct total
     // and the max id are all post-filter; a null class is kept.
-    const exFilter = excludeClasses.length
-      ? ` AND (class IS NULL OR class NOT IN (${excludeClasses.map(() => '?').join(',')}))`
-      : ''
+    const exFilter = classFilterSqlite(excludeClasses)
     const exArgs = [...excludeClasses]
     const items = (
       db
@@ -198,23 +226,24 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
   activityByDay: async (space, { from, to, tzOffsetMinutes, excludeClasses = [], author }) => {
     await ctx.ensureInit()
     const db = ctx.required
-    const exFilter = excludeClasses.length
-      ? ` AND (class IS NULL OR class NOT IN (${excludeClasses.map(() => '?').join(',')}))`
-      : ''
+    const exFilter = classFilterSqlite(excludeClasses)
     const au = authorClauseSqlite(author)
-    // Exclude the synthetic pre-edit baseline (`external` with no chain parent)
-    // so a pre-existing note's first edit isn't double-counted.
-    // canon: docs/note-history.md#model
+    // Exclude the rows the writer marked `baseline` so a pre-existing note's first
+    // edit isn't double-counted. A gap is NEVER suppressed by that rule — quarantine
+    // does not change a row's role, so the immunity comes from the QUARANTINED
+    // disjunct in the predicate, not from a missing parent.
+    // canon: docs/note-history.md#model · docs/dashboard.md
     const shift = `${tzOffsetMinutes >= 0 ? '+' : ''}${tzOffsetMinutes} minutes`
     const rows = db
       .prepare(
         `SELECT date(created_at, ?) AS day,
-                  SUM(CASE WHEN kind = 'delete' THEN 1 ELSE 0 END) AS deleted,
-                  SUM(CASE WHEN kind <> 'delete' AND base_rev IS NULL THEN 1 ELSE 0 END) AS created,
-                  SUM(CASE WHEN kind <> 'delete' AND base_rev IS NOT NULL THEN 1 ELSE 0 END) AS edited
+                  SUM(CASE WHEN ${QUARANTINED} THEN 1 ELSE 0 END) AS unavailable,
+                  SUM(CASE WHEN ${TRUSTED_ONLY} AND kind = 'delete' THEN 1 ELSE 0 END) AS deleted,
+                  SUM(CASE WHEN ${TRUSTED_ONLY} AND kind <> 'delete' AND ${ORIGIN_ONLY} THEN 1 ELSE 0 END) AS created,
+                  SUM(CASE WHEN ${TRUSTED_ONLY} AND kind <> 'delete' AND NOT (${ORIGIN_ONLY}) THEN 1 ELSE 0 END) AS edited
              FROM note_revisions
             WHERE space = ? AND created_at >= ? AND created_at < ?
-              AND NOT (kind = 'external' AND base_rev IS NULL)${exFilter}${au.clause}
+              AND ${notSyntheticBaselineClause}${exFilter}${au.clause}
             GROUP BY day ORDER BY day ASC`,
       )
       .all(shift, space, from, to, ...excludeClasses, ...au.params) as Array<{
@@ -222,18 +251,20 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
       created: number
       edited: number
       deleted: number
+      unavailable: number
     }>
     return rows.map((r) => ({
       date: r.day,
       created: r.created,
       edited: r.edited,
       deleted: r.deleted,
+      unavailable: r.unavailable,
     }))
   },
   activityEvents: async (space, { from, to, offset, limit, excludeClasses = [], author }) => {
     await ctx.ensureInit()
     const db = ctx.required
-    const where = ['space = ?', "NOT (kind = 'external' AND base_rev IS NULL)"]
+    const where = ['space = ?', notSyntheticBaselineClause]
     const args: string[] = [space]
 
     if (from != null) {
@@ -245,7 +276,7 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
       args.push(to)
     }
     if (excludeClasses.length) {
-      where.push(`(class IS NULL OR class NOT IN (${excludeClasses.map(() => '?').join(',')}))`)
+      where.push(classFilterSqlite(excludeClasses).replace(/^ AND /, ''))
       args.push(...excludeClasses)
     }
     if (author) {
@@ -269,15 +300,13 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
   },
   activityByNote: async (space, { from, to, excludeClasses = [] }) => {
     await ctx.ensureInit()
-    const exFilter = excludeClasses.length
-      ? ` AND (class IS NULL OR class NOT IN (${excludeClasses.map(() => '?').join(',')}))`
-      : ''
+    const exFilter = classFilterSqlite(excludeClasses)
     const rows = ctx.required
       .prepare(
         `SELECT note_id, COUNT(*) AS n, MAX(created_at) AS last
              FROM note_revisions
             WHERE space = ? AND created_at >= ? AND created_at < ?
-              AND NOT (kind = 'external' AND base_rev IS NULL)${exFilter}
+              AND ${notSyntheticBaselineClause}${exFilter}
             GROUP BY note_id`,
       )
       .all(space, from, to, ...excludeClasses) as Array<{
@@ -287,24 +316,34 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
     }>
     return rows.map((r) => ({ noteId: r.note_id, count: r.n, lastAt: r.last }))
   },
-  get: async (revisionId) => {
+  get: async (space, revisionId) => {
     await ctx.ensureInit()
     if (!/^\d+$/.test(revisionId)) {
       return null
     }
     const row = ctx.required
-      .prepare('SELECT * FROM note_revisions WHERE id = ?')
-      .get(Number(revisionId)) as RevisionRow | undefined
+      .prepare('SELECT * FROM note_revisions WHERE space = ? AND id = ?')
+      .get(space, Number(revisionId)) as RevisionRow | undefined
     return row ? revisionOfRow(row) : null
   },
-  latestFor: async (noteId) => {
+  hasAnyFor: async (space, noteId) => {
+    await ctx.ensureInit()
+    return Boolean(
+      ctx.required
+        .prepare('SELECT 1 FROM note_revisions WHERE space = ? AND note_id = ? LIMIT 1')
+        .get(space, noteId),
+    )
+  },
+  latestFor: async (space, noteId) => {
     await ctx.ensureInit()
     const row = ctx.required
-      .prepare('SELECT * FROM note_revisions WHERE note_id = ? ORDER BY id DESC LIMIT 1')
-      .get(noteId) as RevisionRow | undefined
+      .prepare(
+        `SELECT * FROM note_revisions WHERE space = ? AND note_id = ? AND ${TRUSTED_ONLY} ORDER BY id DESC LIMIT 1`,
+      )
+      .get(space, noteId) as RevisionRow | undefined
     return row ? revisionOfRow(row) : null
   },
-  latestForMany: async (noteIds) => {
+  latestForMany: async (space, noteIds) => {
     await ctx.ensureInit()
     const ids = [...new Set(noteIds)]
 
@@ -322,11 +361,11 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
            JOIN (
              SELECT note_id, MAX(id) AS id
              FROM note_revisions
-             WHERE note_id IN (SELECT value FROM json_each(?))
+             WHERE space = ? AND note_id IN (SELECT value FROM json_each(?)) AND ${TRUSTED_ONLY}
              GROUP BY note_id
            ) AS latest ON latest.id = revisions.id`,
       )
-      .all(JSON.stringify(ids)) as RevisionRow[]
+      .all(space, JSON.stringify(ids)) as RevisionRow[]
     return new Map(rows.map((row) => [row.note_id, revisionOfRow(row)]))
   },
   listTrashed: async (space, { offset, limit, q }, excludeClasses = []) => {
@@ -334,9 +373,7 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
     const db = ctx.required
     // Drop hidden classes BEFORE the per-note collapse, so a hidden class can't
     // become the surviving newest row or skew the total; a null class is kept.
-    const exFilter = excludeClasses.length
-      ? ` AND (class IS NULL OR class NOT IN (${excludeClasses.map(() => '?').join(',')}))`
-      : ''
+    const exFilter = classFilterSqlite(excludeClasses)
     const exArgs = [...excludeClasses]
     // Title search runs AFTER the collapse (title lives on the surviving tombstone
     // row); LIKE wildcards in the needle are escaped so a literal %/_ can't match-all.
@@ -351,7 +388,7 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
         .prepare(
           `SELECT * FROM (
                SELECT *, ROW_NUMBER() OVER (PARTITION BY note_id ORDER BY id DESC) AS rn
-               FROM note_revisions WHERE space = ?${exFilter}
+               FROM note_revisions WHERE space = ? AND ${TRUSTED_ONLY}${exFilter}
              ) WHERE rn = 1 AND kind = 'delete'${qFilter} ORDER BY id DESC LIMIT ? OFFSET ?`,
         )
         .all(space, ...exArgs, ...qArgs, limit, offset) as RevisionRow[]
@@ -361,7 +398,7 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
         .prepare(
           `SELECT COUNT(*) AS n FROM (
                SELECT note_id, kind, title, ROW_NUMBER() OVER (PARTITION BY note_id ORDER BY id DESC) AS rn
-               FROM note_revisions WHERE space = ?${exFilter}
+               FROM note_revisions WHERE space = ? AND ${TRUSTED_ONLY}${exFilter}
              ) WHERE rn = 1 AND kind = 'delete'${qFilter}`,
         )
         .get(space, ...exArgs, ...qArgs) as { n: number }
@@ -371,14 +408,14 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
         .prepare(
           `SELECT COUNT(*) AS n FROM (
                SELECT note_id, kind, title, content_hash, ROW_NUMBER() OVER (PARTITION BY note_id ORDER BY id DESC) AS rn
-               FROM note_revisions WHERE space = ?${exFilter}
+               FROM note_revisions WHERE space = ? AND ${TRUSTED_ONLY}${exFilter}
              ) WHERE rn = 1 AND kind = 'delete' AND content_hash IS NOT NULL${qFilter}`,
         )
         .get(space, ...exArgs, ...qArgs) as { n: number }
     ).n
     return { items, total, restorableTotal }
   },
-  purgeNotes: async (noteIds) => {
+  purgeNotes: async (space, noteIds) => {
     await ctx.ensureInit()
     if (!noteIds.length) {
       return
@@ -387,12 +424,14 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
     const CHUNK = 400 // keep the IN-list well under SQLite's variable cap
     db.exec('BEGIN')
     try {
+      // The fence is scoped exactly like the DELETE below it.
+      // canon: docs/meta-db.md#source-of-truth
       const fenceNote = db.prepare(
-        "INSERT OR IGNORE INTO revision_purge_fences (kind, entity_id) VALUES ('note', ?)",
+        "INSERT OR IGNORE INTO revision_purge_fences (kind, entity_id, space) VALUES ('note', ?, ?)",
       )
 
       for (const noteId of new Set(noteIds)) {
-        fenceNote.run(noteId)
+        fenceNote.run(noteId, space)
       }
       const stillUsed = db.prepare('SELECT 1 FROM note_revisions WHERE content_hash = ? LIMIT 1')
       const dropBlob = db.prepare('DELETE FROM revision_blobs WHERE hash = ?')
@@ -403,11 +442,14 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
         const hashes = (
           db
             .prepare(
-              `SELECT DISTINCT content_hash AS h FROM note_revisions WHERE note_id IN (${ph}) AND content_hash IS NOT NULL`,
+              `SELECT DISTINCT content_hash AS h FROM note_revisions WHERE space = ? AND note_id IN (${ph}) AND content_hash IS NOT NULL`,
             )
-            .all(...batch) as Array<{ h: string }>
+            .all(space, ...batch) as Array<{ h: string }>
         ).map((r) => r.h)
-        db.prepare(`DELETE FROM note_revisions WHERE note_id IN (${ph})`).run(...batch)
+        db.prepare(`DELETE FROM note_revisions WHERE space = ? AND note_id IN (${ph})`).run(
+          space,
+          ...batch,
+        )
         // GC each blob whose last referrer just went away (the CAS is shared).
         for (const h of hashes) {
           if (!stillUsed.get(h)) {
@@ -427,7 +469,7 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
     // the other columns from that max row — the newest revision per note.
     const rows = ctx.required
       .prepare(
-        'SELECT note_id, created_at, MAX(id) FROM note_revisions WHERE space = ? GROUP BY note_id',
+        `SELECT note_id, created_at, MAX(id) FROM note_revisions WHERE space = ? AND ${TRUSTED_ONLY} GROUP BY note_id`,
       )
       .all(space) as Array<{ note_id: string; created_at: string }>
     return new Map(rows.map((r) => [r.note_id, r.created_at]))
@@ -435,7 +477,9 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
   historicalNames: async (space) => {
     await ctx.ensureInit()
     const rows = ctx.required
-      .prepare("SELECT DISTINCT note_id, title FROM note_revisions WHERE space = ? AND title <> ''")
+      .prepare(
+        `SELECT DISTINCT note_id, title FROM note_revisions WHERE space = ? AND ${TRUSTED_ONLY} AND title <> ''`,
+      )
       .all(space) as Array<{ note_id: string; title: string }>
     const map = new Map<string, string[]>()
 

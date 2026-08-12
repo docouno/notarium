@@ -1083,7 +1083,7 @@ export class WriteEngine {
 
       if (lastPath) {
         if (!this.host.identity.recordFor(id)) {
-          this.host.identity.adoptFileId(lastPath, id)
+          this.host.identity.bindOwnedId(lastPath, id)
         }
         this.host.identity.markDeleted(lastPath)
       }
@@ -1199,7 +1199,7 @@ export class WriteEngine {
         removed.push(pathOwner)
       }
       if (pathOwner !== id) {
-        this.host.identity.adoptFileId(newPath, id, input.createdAt)
+        this.host.identity.bindOwnedId(newPath, id, input.createdAt)
       }
       // The engine wrote the id into the file's frontmatter with this call.
       this.host.identity.markMaterialized(id)

@@ -931,6 +931,7 @@ describe('CachedStore — alias backfill from the journal (#100)', () => {
         theirRevisionId: null,
         sourceRevisionId: null,
         kind: 'write',
+        entryRole: 'origin',
         principal: 'ui',
         contentHash: null,
         title: 'Королёв',

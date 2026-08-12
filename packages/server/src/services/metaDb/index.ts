@@ -7,6 +7,7 @@ export {
   metaDbFlavourOf,
   metaDbTargetOf,
 } from './metaDbUrl'
+export { auditWriteGapOf } from './rows'
 export { SqliteMetaDb } from './sqliteMetaDb'
 export { PgMetaDb } from './pgMetaDb'
 export type {

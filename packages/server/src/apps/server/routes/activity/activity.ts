@@ -15,7 +15,7 @@ import { revisionsUnavailable } from '@notarium/core'
 
 import { minePrincipalFilter, withAuthors } from '../../../../libs/authors'
 import { type ApiRouteCtx, authz, folderOf, s } from '../_shared'
-import { activityEventToWire } from '../wire'
+import { activityEventToWire, unattributedIfGap } from '../wire'
 
 export const activityRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
   const { spaceStoreFor, projects, auth } = ctx
@@ -57,11 +57,17 @@ export const activityRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => 
           })
         : Promise.resolve(null),
     ])
-    const totalOf = (ds: typeof days) =>
+    // Gaps count as activity (they ARE activity) but never as anyone's: they
+    // carry no principal, so the mine/everyone comparison uses the attributed
+    // buckets only — a gap alone must not claim "someone else was here".
+    const attributedOf = (ds: typeof days) =>
       ds.reduce((acc, d) => acc + d.created + d.edited + d.deleted, 0)
-    const hasOtherAuthors = mineDays != null && totalOf(days) > totalOf(mineDays)
+    const hasOtherAuthors = mineDays != null && attributedOf(days) > attributedOf(mineDays)
     return ActivityResponseSchema.parse({
-      days: days.map((d) => ({ ...d, total: d.created + d.edited + d.deleted })),
+      days: days.map((d) => ({
+        ...d,
+        total: d.created + d.edited + d.deleted + d.unavailable,
+      })),
       from,
       to,
       hasOtherAuthors,
@@ -108,14 +114,16 @@ export const activityRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => 
         pathByNote.set(n.id, folderOf(n.filePath))
       }
     }
-    const events = await withAuthors(
-      items.map((r) => ({
-        ...activityEventToWire(r),
-        path: pathByNote.get(r.noteId) ?? null,
-      })),
-      req.principal.username,
-      auth.describeAuthor,
-    )
+    const events = (
+      await withAuthors(
+        items.map((r) => ({
+          ...activityEventToWire(r),
+          path: pathByNote.get(r.noteId) ?? null,
+        })),
+        req.principal.username,
+        auth.describeAuthor,
+      )
+    ).map(unattributedIfGap)
     return ActivityEventsResponseSchema.parse({ events, total })
   })
 

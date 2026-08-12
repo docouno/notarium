@@ -301,7 +301,7 @@ export const buildApp = async ({
         // Error envelopes cross the domain↔wire seam too. canon: docs/contract.md#mappers
         return reply.code(HTTP_STATUS.CONFLICT).send({
           error: err.message,
-          reason: STORE_ERROR_REASON.versionConflict,
+          reason: err.reason || STORE_ERROR_REASON.versionConflict,
           current: err.current ? conflictToWire(err.current) : undefined,
         })
       }

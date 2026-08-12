@@ -1,7 +1,16 @@
 import type { PoolClient } from 'pg'
 
+import type { LockHold, LockLevel } from './lockOrder'
+
 export type RevisionLockNamespace = 'blob' | 'note' | 'space'
 export type RevisionLockMode = 'exclusive' | 'shared'
+
+/** The stripe namespaces are three separate levels, taken in this order. */
+const LEVEL_OF_NAMESPACE: Readonly<Record<RevisionLockNamespace, LockLevel>> = {
+  space: 'L3s',
+  note: 'L3n',
+  blob: 'L3b',
+}
 
 // Bound whole-space/batch purge lock cardinality independently of note count.
 // Space ids remain exact (one lock); high-cardinality note/blob keys share
@@ -17,22 +26,24 @@ export const lockRevisionKeys = async (
   namespace: RevisionLockNamespace,
   keys: readonly string[],
   mode: RevisionLockMode = 'exclusive',
-): Promise<void> => {
+): Promise<{ lock: LockHold }> => {
   const lockFunction = mode === 'shared' ? 'pg_advisory_xact_lock_shared' : 'pg_advisory_xact_lock'
-  const uniqueKeys = [...new Set(keys)]
+  const uniqueKeys = [...new Set(keys)].sort()
+  const level = LEVEL_OF_NAMESPACE[namespace]
+  const taken = { lock: { level, scope: 'keys' as const, declared: uniqueKeys, held: uniqueKeys } }
 
   if (!uniqueKeys.length) {
-    return
+    return taken
   }
   if (namespace === 'space') {
-    for (const key of uniqueKeys.sort()) {
+    for (const key of uniqueKeys) {
       await client.query(`SELECT ${lockFunction}(hashtext($1), hashtext($2))`, [
         `notarium:revision:${namespace}`,
         key,
       ])
     }
 
-    return
+    return taken
   }
 
   const stripeRows = await client.query(
@@ -48,4 +59,6 @@ export const lockRevisionKeys = async (
       stripe,
     ])
   }
+
+  return taken
 }

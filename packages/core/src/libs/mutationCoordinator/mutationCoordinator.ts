@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
+
 export type MutationClaim = {
   global?: boolean
   noteIds?: Iterable<string | null | undefined>
@@ -126,12 +128,23 @@ export class MutationCoordinator {
   private readonly active = new Set<Waiter>()
   private waiting: Waiter[] = []
   private nextTicket = 0
+  /** Tracks, per async call chain, whether a lease of THIS coordinator is already
+   *  held. Claims are not re-entrant and the queue is fair, so a task that takes
+   *  one while holding another can wait forever behind a waiter that wants what it
+   *  holds. Work that must run claimed but can be reached from either side asks
+   *  `holds()` instead of guessing from its call site. */
+  private readonly leased = new AsyncLocalStorage<true>()
+
+  /** Whether the caller is already running inside one of this coordinator's leases. */
+  holds(): boolean {
+    return this.leased.getStore() === true
+  }
 
   async run<T>(claim: MutationClaim, task: () => Promise<T>): Promise<T> {
     const lease = await this.acquire(normalizeClaim(claim))
 
     try {
-      return await task()
+      return await this.leased.run(true, task)
     } finally {
       lease.release()
     }
@@ -163,7 +176,7 @@ export class MutationCoordinator {
         continue
       }
       try {
-        return await task()
+        return await this.leased.run(true, task)
       } finally {
         lease.release()
       }

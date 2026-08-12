@@ -42,13 +42,15 @@ const REC_B: IdentityRecord = {
   deletedAt: '2026-06-01T00:00:00Z',
 }
 
+const REV_SPACE = 'main'
 const revInput = (over: Partial<RevisionInput> = {}): RevisionInput => ({
   noteId: 'note-1',
-  space: 'main',
+  space: REV_SPACE,
   baseRevisionId: null,
   theirRevisionId: null,
   sourceRevisionId: null,
   kind: 'write',
+  entryRole: 'origin',
   principal: 'ui',
   contentHash: 'hash-1',
   title: 'Note one',
@@ -76,11 +78,11 @@ describe('SqliteMetaDb', () => {
   }
 
   describe('identity facet (#51)', () => {
-    it('upsertMany → loadAll round-trips records exactly (:memory:)', async () => {
+    it('claimMany → loadAll round-trips records exactly (:memory:)', async () => {
       const db = make()
       expect(await db.identity.loadAll('main')).toEqual([])
 
-      await db.identity.upsertMany([REC_A, REC_B])
+      await db.identity.claimMany([REC_A, REC_B])
       // loadAll is space-scoped (#16): each registry sees only its own rows.
       expect(await db.identity.loadAll('main')).toEqual([REC_A])
       expect(await db.identity.loadAll('work')).toEqual([REC_B]) // null createdAt + tombstone survive
@@ -91,8 +93,8 @@ describe('SqliteMetaDb', () => {
 
     it('an id conflict updates the row in place — no duplicates, last write wins', async () => {
       const db = make()
-      await db.identity.upsertMany([REC_A])
-      await db.identity.upsertMany([
+      await db.identity.claimMany([REC_A])
+      await db.identity.claimMany([
         {
           ...REC_A,
           filePath: 'archive/a.md',
@@ -118,7 +120,7 @@ describe('SqliteMetaDb', () => {
       const first = new SqliteMetaDb(path)
       await first.identity.init()
       await first.identity.init() // second init on the same instance must not throw either
-      await first.identity.upsertMany([REC_A])
+      await first.identity.claimMany([REC_A])
       await first.close()
 
       const second = make(path)
@@ -279,7 +281,7 @@ describe('SqliteMetaDb', () => {
         }),
       )
       // Seed rows across the child places for BOTH spaces (only the victim's go).
-      await db.identity.upsertMany([
+      await db.identity.claimMany([
         {
           id: 'n-gone',
           filePath: 'a.md',
@@ -477,8 +479,8 @@ describe('SqliteMetaDb', () => {
       expect((await db.identity.loadAll(keep)).map((r) => r.id)).toEqual(['n-keep'])
       // The victim's journal is gone; the kept space's revision (and the SHARED blob it
       // still references) survives — CAS GC drops a blob only when its LAST referrer goes.
-      expect(await db.revisions.latestFor('n-gone')).toBeNull()
-      expect((await db.revisions.latestFor('n-keep'))?.contentHash).toBe('sh1')
+      expect(await db.revisions.latestFor(victim, 'n-gone')).toBeNull()
+      expect((await db.revisions.latestFor(keep, 'n-keep'))?.contentHash).toBe('sh1')
       expect(await db.revisions.content('sh1')).toBe('shared body')
       await expect(
         db.revisions.append(
@@ -1052,6 +1054,39 @@ describe('SqliteMetaDb', () => {
       ...over,
     })
 
+    it('unfavorites through the id the client still holds after a settlement', async () => {
+      // The route resolves the note before it calls, exactly as it does for `add` —
+      // and a settlement can commit in between, taking the favourite with it onto the
+      // successor id. Removing only the id the caller named leaves the row on screen
+      // after an unfavorite that answered ok (#327).
+      const db = make()
+      const record = {
+        id: 'old-id',
+        filePath: 'a.md',
+        space: 'team',
+        createdAt: null,
+        materialized: true,
+        deletedAt: null,
+      }
+      await db.identity.claimMany([record])
+      await db.favorites.add(fav({ entityId: 'old-id' }))
+      await db.identity.settleFileClaim({
+        space: 'team',
+        filePath: 'a.md',
+        current: record,
+        observedId: 'new-id',
+        at: '2026-06-23T11:00:00.000Z',
+      })
+
+      // The settlement moved the reference with the identity …
+      expect(await db.favorites.ids('user:al', 'team', 'note')).toEqual(['new-id'])
+
+      // … and the client, holding the pre-settlement id, can still drop it.
+      await db.favorites.removeByEntity('user:al', 'team', 'old-id')
+
+      expect(await db.favorites.list('user:al', 'team')).toEqual([])
+    })
+
     it('round-trips note/folder/project rows scoped by owner + space + kind', async () => {
       const db = make()
       await db.favorites.add(fav({ entityId: 'n1', createdAt: '2026-06-23T10:00:00.000Z' }))
@@ -1082,7 +1117,7 @@ describe('SqliteMetaDb', () => {
       expect(await db.favorites.has('user:bob', 'team', 'project', 'p1')).toBe(true)
     })
 
-    it('upserts the same target, orders ranked rows first, and removes by entity id', async () => {
+    it('upserts a target, ranks first, replaces a kind flip, removes by entity id', async () => {
       const db = make()
       await db.favorites.add(fav({ entityId: 'n-unranked', createdAt: '2026-06-23T10:00:00.000Z' }))
       await db.favorites.add(
@@ -1101,10 +1136,14 @@ describe('SqliteMetaDb', () => {
         'n-rank2',
       ])
 
+      // A favorited folder later surfaced as a project keeps ONE row: `add` clears the
+      // entity's other kinds inside the transaction that knows its canonical id (#327).
       await db.favorites.add(fav({ kind: 'folder', entityId: 'shared-id' }))
       await db.favorites.add(fav({ kind: 'project', entityId: 'shared-id' }))
-      await db.favorites.removeByEntity('user:al', 'team', 'shared-id')
       expect(await db.favorites.has('user:al', 'team', 'folder', 'shared-id')).toBe(false)
+      expect(await db.favorites.has('user:al', 'team', 'project', 'shared-id')).toBe(true)
+
+      await db.favorites.removeByEntity('user:al', 'team', 'shared-id')
       expect(await db.favorites.has('user:al', 'team', 'project', 'shared-id')).toBe(false)
     })
   })
@@ -1161,21 +1200,21 @@ describe('SqliteMetaDb', () => {
         'body two',
       )
       expect(Number(r2.id)).toBeGreaterThan(Number(r1.id))
-      expect(await db.revisions.get(r1.id)).toEqual({ ...revInput(), id: r1.id })
-      expect(await db.revisions.get('999999')).toBeNull()
-      expect(await db.revisions.get('not-a-rowid')).toBeNull()
-      expect(await db.revisions.latestFor('note-1')).toEqual(r2)
-      expect(await db.revisions.latestFor('nobody')).toBeNull()
+      expect(await db.revisions.get(REV_SPACE, r1.id)).toEqual({ ...revInput(), id: r1.id })
+      expect(await db.revisions.get(REV_SPACE, '999999')).toBeNull()
+      expect(await db.revisions.get(REV_SPACE, 'not-a-rowid')).toBeNull()
+      expect(await db.revisions.latestFor(REV_SPACE, 'note-1')).toEqual(r2)
+      expect(await db.revisions.latestFor(REV_SPACE, 'nobody')).toBeNull()
     })
 
     it('the custom slug column round-trips (#124), null is the default', async () => {
       const db = make()
       const custom = await db.revisions.append(revInput({ noteId: 's1', slug: 'my-custom' }), 'a')
       const plain = await db.revisions.append(revInput({ noteId: 's2', slug: null }), 'b')
-      expect((await db.revisions.get(custom.id))?.slug).toBe('my-custom')
-      expect((await db.revisions.get(plain.id))?.slug).toBeNull()
+      expect((await db.revisions.get(REV_SPACE, custom.id))?.slug).toBe('my-custom')
+      expect((await db.revisions.get(REV_SPACE, plain.id))?.slug).toBeNull()
       // latestFor / listByNote serve the same column (one mapper for all reads).
-      expect((await db.revisions.latestFor('s1'))?.slug).toBe('my-custom')
+      expect((await db.revisions.latestFor(REV_SPACE, 's1'))?.slug).toBe('my-custom')
     })
 
     it('blobs are content-addressed: one hash stores once, restore copies are free', async () => {
@@ -1199,7 +1238,7 @@ describe('SqliteMetaDb', () => {
       }
       await db.revisions.append(revInput({ noteId: 'other' }), 'noise')
 
-      const page = await db.revisions.listByNote('note-1', { offset: 1, limit: 2 })
+      const page = await db.revisions.listByNote(REV_SPACE, 'note-1', { offset: 1, limit: 2 })
       expect(page.total).toBe(5)
       expect(page.items.map((r) => r.contentHash)).toEqual(['h4', 'h3'])
     })
@@ -1299,18 +1338,21 @@ describe('SqliteMetaDb', () => {
       })
       await seed(db, 'a', {
         kind: 'write',
+        entryRole: 'change',
         baseRevisionId: '1',
         createdAt: '2026-06-10T11:00:00.000Z',
         title: 'A',
       })
       await seed(db, 'b', {
         kind: 'write',
+        entryRole: 'change',
         baseRevisionId: '2',
         createdAt: '2026-06-12T09:00:00.000Z',
         title: 'B',
       })
       await seed(db, 'c', {
         kind: 'delete',
+        entryRole: 'change',
         baseRevisionId: '3',
         createdAt: '2026-06-12T12:00:00.000Z',
         title: 'C',
@@ -1318,6 +1360,7 @@ describe('SqliteMetaDb', () => {
       // A synthetic pre-edit baseline (external/no-parent) — must NOT count.
       await seed(db, 'd', {
         kind: 'external',
+        entryRole: 'baseline',
         baseRevisionId: null,
         createdAt: '2026-06-12T08:00:00.000Z',
         title: 'D',
@@ -1336,6 +1379,7 @@ describe('SqliteMetaDb', () => {
       const db = make()
       await seed(db, 'a', {
         kind: 'write',
+        entryRole: 'change',
         baseRevisionId: '1',
         createdAt: '2026-06-10T23:30:00.000Z',
       })
@@ -1357,12 +1401,14 @@ describe('SqliteMetaDb', () => {
       const db = make()
       await seed(db, 'mem', {
         kind: 'write',
+        entryRole: 'change',
         baseRevisionId: '1',
         class: 'agent-memory',
         createdAt: '2026-06-10T10:00:00.000Z',
       })
       await seed(db, 'doc', {
         kind: 'write',
+        entryRole: 'change',
         baseRevisionId: '2',
         class: null,
         createdAt: '2026-06-10T11:00:00.000Z',
@@ -1373,7 +1419,9 @@ describe('SqliteMetaDb', () => {
         tzOffsetMinutes: 0,
         excludeClasses: ['agent-memory'],
       })
-      expect(days).toEqual([{ date: '2026-06-10', created: 0, edited: 1, deleted: 0 }])
+      expect(days).toEqual([
+        { date: '2026-06-10', created: 0, edited: 1, deleted: 0, unavailable: 0 },
+      ])
     })
 
     it('activityEvents: newest first, windowable, baseline excluded', async () => {
@@ -1386,12 +1434,14 @@ describe('SqliteMetaDb', () => {
       })
       await seed(db, 'base', {
         kind: 'external',
+        entryRole: 'baseline',
         baseRevisionId: null,
         createdAt: '2026-06-11T10:00:00.000Z',
         title: 'Base',
       })
       await seed(db, 'b', {
         kind: 'write',
+        entryRole: 'change',
         baseRevisionId: '1',
         createdAt: '2026-06-12T10:00:00.000Z',
         title: 'B',
@@ -1413,21 +1463,25 @@ describe('SqliteMetaDb', () => {
       const db = make()
       await seed(db, 'a', {
         kind: 'write',
+        entryRole: 'change',
         baseRevisionId: '1',
         createdAt: '2026-06-10T10:00:00.000Z',
       })
       await seed(db, 'a', {
         kind: 'write',
+        entryRole: 'change',
         baseRevisionId: '2',
         createdAt: '2026-06-11T10:00:00.000Z',
       })
       await seed(db, 'b', {
         kind: 'write',
+        entryRole: 'change',
         baseRevisionId: '1',
         createdAt: '2026-06-10T10:00:00.000Z',
       })
       await seed(db, 'base', {
         kind: 'external',
+        entryRole: 'baseline',
         baseRevisionId: null,
         createdAt: '2026-06-10T10:00:00.000Z',
       })
@@ -1447,30 +1501,35 @@ describe('SqliteMetaDb', () => {
       // `ui` row (attributed to whoever looks). An external state (no principal).
       await seed(db, 'a', {
         kind: 'write',
+        entryRole: 'change',
         baseRevisionId: '1',
         principal: 'user:alice',
         createdAt: '2026-06-10T10:00:00.000Z',
       })
       await seed(db, 'b', {
         kind: 'write',
+        entryRole: 'change',
         baseRevisionId: '2',
         principal: 'pat:alice:KEY-9',
         createdAt: '2026-06-10T11:00:00.000Z',
       })
       await seed(db, 'c', {
         kind: 'write',
+        entryRole: 'change',
         baseRevisionId: '3',
         principal: 'user:bob',
         createdAt: '2026-06-10T12:00:00.000Z',
       })
       await seed(db, 'd', {
         kind: 'write',
+        entryRole: 'change',
         baseRevisionId: '4',
         principal: 'ui',
         createdAt: '2026-06-10T13:00:00.000Z',
       })
       await seed(db, 'e', {
         kind: 'external',
+        entryRole: 'change',
         baseRevisionId: '5',
         principal: null,
         createdAt: '2026-06-10T14:00:00.000Z',
@@ -1482,20 +1541,25 @@ describe('SqliteMetaDb', () => {
       }
       // Everyone: all five counted (external kept — it carries a chain parent).
       const all = await db.revisions.activityByDay('main', window)
-      expect(all).toEqual([{ date: '2026-06-10', created: 0, edited: 5, deleted: 0 }])
+      expect(all).toEqual([
+        { date: '2026-06-10', created: 0, edited: 5, deleted: 0, unavailable: 0 },
+      ])
       // Alice's lens: her user session + her pat (any key id) + the legacy `ui` — bob
       // and the authorless external drop.
       const mine = await db.revisions.activityByDay('main', {
         ...window,
         author: { exact: ['ui', 'user:alice'], prefixes: ['pat:alice:', 'oauth:alice:'] },
       })
-      expect(mine).toEqual([{ date: '2026-06-10', created: 0, edited: 3, deleted: 0 }])
+      expect(mine).toEqual([
+        { date: '2026-06-10', created: 0, edited: 3, deleted: 0, unavailable: 0 },
+      ])
     })
 
     it('author filter scopes activityEvents + its total (#218)', async () => {
       const db = make()
       await seed(db, 'a', {
         kind: 'write',
+        entryRole: 'change',
         baseRevisionId: '1',
         principal: 'user:alice',
         createdAt: '2026-06-10T10:00:00.000Z',
@@ -1503,6 +1567,7 @@ describe('SqliteMetaDb', () => {
       })
       await seed(db, 'b', {
         kind: 'write',
+        entryRole: 'change',
         baseRevisionId: '2',
         principal: 'pat:alice:KEY-9',
         createdAt: '2026-06-11T10:00:00.000Z',
@@ -1510,6 +1575,7 @@ describe('SqliteMetaDb', () => {
       })
       await seed(db, 'c', {
         kind: 'write',
+        entryRole: 'change',
         baseRevisionId: '3',
         principal: 'user:bob',
         createdAt: '2026-06-12T10:00:00.000Z',
@@ -1528,6 +1594,7 @@ describe('SqliteMetaDb', () => {
       const db = make()
       await seed(db, 'a', {
         kind: 'write',
+        entryRole: 'change',
         baseRevisionId: '1',
         principal: 'user:alice',
         createdAt: '2026-06-10T10:00:00.000Z',
@@ -1612,14 +1679,14 @@ describe('SqliteMetaDb', () => {
       await db.revisions.append(revInput({ noteId: 'b', contentHash: 'shared' }), 'shared body')
       await db.revisions.append(revInput({ noteId: 'b', contentHash: 'solo' }), 'solo body')
 
-      await db.revisions.purgeNotes(['b'])
-      expect(await db.revisions.listByNote('b', { offset: 0, limit: 10 })).toEqual({
+      await db.revisions.purgeNotes(REV_SPACE, ['b'])
+      expect(await db.revisions.listByNote(REV_SPACE, 'b', { offset: 0, limit: 10 })).toEqual({
         items: [],
         total: 0,
       })
       expect(await db.revisions.content('solo')).toBeNull() // orphan blob GC'd
       expect(await db.revisions.content('shared')).toBe('shared body') // shared blob kept (note-a refs it)
-      expect(await db.revisions.latestFor('a')).toBeTruthy() // note-a intact
+      expect(await db.revisions.latestFor(REV_SPACE, 'a')).toBeTruthy() // note-a intact
     })
   })
 

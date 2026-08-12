@@ -85,6 +85,37 @@ describe('seed catalog (#175)', () => {
     }
   })
 
+  it.each(NAMES)('"%s": a seeded identity claim names two live notes in two spaces', (name) => {
+    const w = buildCaseWorld(name, { scale: 0.1 })
+    const created = new Set(w.events.filter((e) => e.op === 'create').map((e) => e.noteId))
+    const live = new Set<string>()
+
+    for (const event of w.events) {
+      if (event.op === 'create' || event.op === 'restore') {
+        live.add(event.noteId)
+      } else if (event.op === 'delete') {
+        live.delete(event.noteId)
+      }
+    }
+
+    // The seeded collision is only a collision if the two notes live in DIFFERENT
+    // spaces — a same-space pair reproduces the existing duplicate contract, not
+    // #327, and the catalog would still be green while the stand seeds the wrong bug.
+    for (const claim of w.externalIdentityClaims ?? []) {
+      expect(created.has(claim.note)).toBe(true)
+      expect(live.has(claim.note)).toBe(true)
+      expect(created.has(claim.claimFrom)).toBe(true)
+      expect(live.has(claim.claimFrom)).toBe(true)
+      expect(claim.note).not.toBe(claim.claimFrom)
+
+      const spaceOf = (handle: string): string | undefined =>
+        w.events.find((e) => e.noteId === handle && e.op === 'create')?.space
+
+      expect(spaceOf(claim.note)).toBeTruthy()
+      expect(spaceOf(claim.note)).not.toBe(spaceOf(claim.claimFrom))
+    }
+  })
+
   // The real applier replays op-by-op through `store.write`/`remove`/`restoreFromTrash`.
   // A delete must be a note's TERMINAL event (an `edit` after a `delete` = `store.write`
   // on a removed note → "note not found" crash), and a delete may not sort BEFORE its own

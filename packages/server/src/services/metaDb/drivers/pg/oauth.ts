@@ -39,6 +39,7 @@ export const createOAuthFacet = (ctx: PgDriverCtx): OAuthPersistence => ({
       await db.query('BEGIN')
       // Serialize the count+insert decision across every server process. A plain
       // SELECT count under READ COMMITTED lets two registrations claim the last slot.
+      // eslint-disable-next-line no-restricted-syntax -- outside the note-identity hierarchy: the OAuth client table has no tier
       await db.query('LOCK TABLE oauth_clients IN SHARE ROW EXCLUSIVE MODE')
       await db.query(
         `DELETE FROM oauth_clients oc

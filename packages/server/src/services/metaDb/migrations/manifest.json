@@ -21,6 +21,27 @@
       "checksum": "sha256:f543adeacab17bad0aefeaa8d876e3432d762d5fc54020c67478c2c499976bb6",
       "sqlite": "sqlite/0002_agent_session_role.sql",
       "postgres": "postgres/0002_agent_session_role.sql"
+    },
+    {
+      "version": 3,
+      "name": "revision_integrity",
+      "checksum": "sha256:e3633d18d00181fff489615db64719bcc297bd0e02e8eab092b0d58da2eefdd0",
+      "sqlite": "sqlite/0003_revision_integrity.sql",
+      "postgres": "postgres/0003_revision_integrity.sql"
+    },
+    {
+      "version": 4,
+      "name": "scoped_purge_fences",
+      "checksum": "sha256:598342c63f8a9bf97a8bc58f98cc405f3296e303083a8357a80b99a913bbfc0f",
+      "sqlite": "sqlite/0004_scoped_purge_fences.sql",
+      "postgres": "postgres/0004_scoped_purge_fences.sql"
+    },
+    {
+      "version": 5,
+      "name": "revision_entry_role",
+      "checksum": "sha256:b9daaf10a822910e8033f547cfc0f0ecc0bc040478aa0d741f9be2fe96c5ad6f",
+      "sqlite": "sqlite/0005_revision_entry_role.sql",
+      "postgres": "postgres/0005_revision_entry_role.sql"
     }
   ]
 }

@@ -11,6 +11,7 @@ import type {
   ContextOrderDecl,
   ContextSetDecl,
   DurableImportDecl,
+  ExternalIdentityClaimDecl,
   ExternalRewriteDecl,
   FavoriteDecl,
   JobDecl,
@@ -125,6 +126,7 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
   const jobs: JobDecl[] = []
   const durableImports: DurableImportDecl[] = []
   const externalRewrites: ExternalRewriteDecl[] = []
+  const externalIdentityClaims: ExternalIdentityClaimDecl[] = []
   const events: CaseEvent[] = []
   const takenPaths = new Set<string>()
   let hasAuth = false
@@ -295,8 +297,14 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
     for (const durableImport of world.durableImports ?? []) {
       durableImports.push(durableImport)
     }
-    // External rewrites reference logical note handles, so namespace them exactly
-    // like timeline events and retrieval hits.
+    // External claims and rewrites reference logical note handles, so namespace them
+    // exactly like timeline events and retrieval hits.
+    for (const claim of world.externalIdentityClaims ?? []) {
+      externalIdentityClaims.push({
+        note: `${name}:${claim.note}`,
+        claimFrom: `${name}:${claim.claimFrom}`,
+      })
+    }
     for (const rewrite of world.externalRewrites ?? []) {
       externalRewrites.push({ ...rewrite, note: `${name}:${rewrite.note}` })
     }
@@ -329,5 +337,6 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
     ...(jobs.length ? { jobs } : {}),
     ...(durableImports.length ? { durableImports } : {}),
     ...(externalRewrites.length ? { externalRewrites } : {}),
+    ...(externalIdentityClaims.length ? { externalIdentityClaims } : {}),
   })
 }

@@ -55,6 +55,9 @@ export type HeatCell = {
   created: number
   edited: number
   deleted: number
+  /** Journal gaps (#327): activity that happened but whose kind is withheld. Part
+   *  of `total` (and therefore of the intensity), never of any author's share. */
+  unavailable: number
   level: HeatLevel
 }
 
@@ -67,7 +70,15 @@ export type Heatmap = {
   totalEvents: number
 }
 
-const EMPTY_CELL: HeatCell = { date: null, total: 0, created: 0, edited: 0, deleted: 0, level: 0 }
+const EMPTY_CELL: HeatCell = {
+  date: null,
+  total: 0,
+  created: 0,
+  edited: 0,
+  deleted: 0,
+  unavailable: 0,
+  level: 0,
+}
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
@@ -129,7 +140,7 @@ export const buildHeatmap = (
       week.push(
         hit
           ? { ...hit, level: levelOf(hit.total, maxTotal) }
-          : { date, total: 0, created: 0, edited: 0, deleted: 0, level: 0 },
+          : { date, total: 0, created: 0, edited: 0, deleted: 0, unavailable: 0, level: 0 },
       )
     }
     // Month label: tag the column where a new month's FIRST day lands.
@@ -144,6 +155,34 @@ export const buildHeatmap = (
   }
 
   return { weeks, months, maxTotal, totalEvents }
+}
+
+/** The day's counted activity, spelled out for a tooltip or a screen reader. A
+ *  journal gap is NAMED rather than folded into a kind it cannot be: it happened,
+ *  and what it was is withheld (#327). */
+export const activityBreakdown = (c: {
+  created: number
+  edited: number
+  deleted: number
+  unavailable: number
+}): string[] =>
+  [
+    c.created && `${c.created} created`,
+    c.edited && `${c.edited} edited`,
+    c.deleted && `${c.deleted} deleted`,
+    c.unavailable && `${c.unavailable} unavailable`,
+  ].filter((part): part is string => Boolean(part))
+
+/** One heat cell's accessible name. Empty for a padding cell. */
+export const heatCellLabel = (c: HeatCell): string => {
+  if (!c.date) {
+    return ''
+  }
+  if (c.total === 0) {
+    return `${c.date} · no activity`
+  }
+
+  return `${c.date} · ${c.total} ${c.total === 1 ? 'change' : 'changes'} (${activityBreakdown(c).join(', ')})`
 }
 
 /** Real notes with no links — degree-0, non-ghost. The single source of the orphan

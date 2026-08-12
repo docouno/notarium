@@ -100,6 +100,7 @@ export const createAgentDeltaCursorsFacet = (ctx: PgDriverCtx): AgentDeltaCursor
       // session child can deadlock a retype trigger that already owns the parent
       // row and is waiting to delete that owner child.
       await client.query(
+        // eslint-disable-next-line no-restricted-syntax -- outside the note-identity hierarchy: the project parent row, ordered against retype/delete only
         "SELECT id FROM folders WHERE id = $1 AND type = 'project' FOR KEY SHARE",
         [project],
       )

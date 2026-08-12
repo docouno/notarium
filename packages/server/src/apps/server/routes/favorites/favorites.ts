@@ -226,11 +226,13 @@ export const favoritesRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) =>
       createdAt: new Date().toISOString(),
       rank: null,
     }
-    // Clear any prior row for this id (any kind) before adding, so re-favoriting after a
-    // folder→project flip REPLACES the stale 'folder' row instead of coexisting with it.
-    await favorites.removeByEntity(record.owner, space, entityId)
-    await favorites.add(record)
-    const [item] = await favoriteItemsFor(req, [record])
+    // `add` canonicalizes the id and clears the entity's prior rows of other kinds
+    // inside its own transaction — a settlement may have committed since the
+    // pre-resolve above, and only the transaction knows which id the clear must
+    // target. Echo what was STORED, or the client starts its next request from an
+    // id the row no longer carries (#327).
+    const stored = await favorites.add(record)
+    const [item] = await favoriteItemsFor(req, [stored])
     return FavoriteMutationResponseSchema.parse({ ok: true, ...(item ? { item } : {}) })
   })
 

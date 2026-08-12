@@ -64,6 +64,9 @@ describe('meta-DB migration assets and SQLite runner', () => {
       { version: 0, name: 'baseline' },
       { version: 1, name: 'agent_sessions' },
       { version: 2, name: 'agent_session_role' },
+      { version: 3, name: 'revision_integrity' },
+      { version: 4, name: 'scoped_purge_fences' },
+      { version: 5, name: 'revision_entry_role' },
     ])
     for (const migration of migrations) {
       expect(migration.checksum).toBe(checksumMigrationPair(migration.sqlite, migration.postgres))
@@ -99,7 +102,7 @@ describe('meta-DB migration assets and SQLite runner', () => {
           .all() as Array<{ type: string; count: number }>
       ).map(({ type, count }) => [type, count]),
     )
-    expect(counts).toEqual({ index: 36, table: 27, trigger: 2 })
+    expect(counts).toEqual({ index: 41, table: 27, trigger: 3 })
     expect(
       db.prepare("SELECT 1 FROM sqlite_schema WHERE name = 'meta_schema'").get(),
     ).toBeUndefined()
@@ -132,6 +135,105 @@ describe('meta-DB migration assets and SQLite runner', () => {
         .prepare('SELECT owner, name, calls, role FROM agent_sessions WHERE id = ?')
         .get('ses_existingv1aa'),
     ).toEqual({ owner: 'alice', name: 'Existing', calls: 7, role: null })
+  })
+
+  it('keeps a pre-#327 purge fence global while scoping every new one', () => {
+    // The fence used to be keyed by note id alone while the DELETE beside it was
+    // already space-scoped, so one space's trash-emptying permanently silenced a
+    // colliding id in ANOTHER space. Scoping it cannot be retroactive: a purge
+    // already decided must not be re-opened by an upgrade.
+    const db = database()
+    runSqliteMigrations(db, migrations.slice(0, 4))
+    db.prepare(`INSERT INTO revision_purge_fences (kind, entity_id) VALUES ('note', ?)`).run(
+      'legacy-note',
+    )
+
+    runSqliteMigrations(db)
+
+    expect(db.prepare('SELECT kind, entity_id, space FROM revision_purge_fences').all()).toEqual([
+      { kind: 'note', entity_id: 'legacy-note', space: '' },
+    ])
+
+    const append = db.prepare(
+      `INSERT INTO note_revisions
+         (note_id, space, kind, principal, title, tags, created_at, integrity)
+       VALUES (?, ?, 'write', 'ui', 'T', '[]', 'now', 'trusted')`,
+    )
+
+    // The legacy fence stays GLOBAL: it was decided when ids were not yet global,
+    // so it cannot be narrowed to a space nobody recorded.
+    expect(() => append.run('legacy-note', 'alpha')).toThrow(/permanently purged/)
+    expect(() => append.run('legacy-note', 'beta')).toThrow(/permanently purged/)
+
+    // A fence written AFTER the upgrade binds only its own space.
+    db.prepare(
+      `INSERT INTO revision_purge_fences (kind, entity_id, space) VALUES ('note', ?, ?)`,
+    ).run('shared-note', 'alpha')
+    expect(() => append.run('shared-note', 'alpha')).toThrow(/permanently purged/)
+    expect(() => append.run('shared-note', 'beta')).not.toThrow()
+  })
+
+  it('backfills the entry role by class, and leaves a cross-space legacy first row alone', () => {
+    // Four populations, and the third is the reason the backfill keeps
+    // `base_rev IS NULL`: before #327 the chain was keyed by note id ALONE, across
+    // spaces, so a note's FIRST row here can carry a parent that lives elsewhere.
+    // Calling it a baseline would drop it out of Activity at migration time — before
+    // any settlement, where no quarantine fixture would ever look.
+    const db = database()
+
+    runSqliteMigrations(db, migrations.slice(0, 5))
+    const append = db.prepare(
+      `INSERT INTO note_revisions
+         (note_id, space, base_rev, kind, principal, title, tags, created_at, integrity)
+       VALUES (?, ?, ?, ?, 'ui', 'T', '[]', ?, 'trusted')`,
+    )
+
+    append.run('seen-first', 'alpha', null, 'external', '2026-06-10T10:00:00.000Z')
+    append.run('seen-first', 'alpha', 1, 'write', '2026-06-10T11:00:00.000Z')
+    append.run('born-here', 'alpha', null, 'write', '2026-06-10T12:00:00.000Z')
+    append.run('chained-elsewhere', 'alpha', 999, 'write', '2026-06-10T13:00:00.000Z')
+    // Same note id in another space — the collision the task is named after. Each
+    // space's first row is judged on its own.
+    append.run('seen-first', 'beta', null, 'write', '2026-06-10T14:00:00.000Z')
+
+    runSqliteMigrations(db)
+
+    expect(
+      db
+        .prepare('SELECT note_id, space, base_rev, entry_role FROM note_revisions ORDER BY id')
+        .all(),
+    ).toEqual([
+      { note_id: 'seen-first', space: 'alpha', base_rev: null, entry_role: 'baseline' },
+      { note_id: 'seen-first', space: 'alpha', base_rev: 1, entry_role: 'change' },
+      { note_id: 'born-here', space: 'alpha', base_rev: null, entry_role: 'origin' },
+      { note_id: 'chained-elsewhere', space: 'alpha', base_rev: 999, entry_role: 'change' },
+      { note_id: 'seen-first', space: 'beta', base_rev: null, entry_role: 'origin' },
+    ])
+    // And the column refuses a fourth role, in the dialect that has no enum type.
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO note_revisions
+             (note_id, space, kind, principal, title, tags, created_at, integrity, entry_role)
+           VALUES ('x', 'alpha', 'write', 'ui', 'T', '[]', 'now', 'trusted', 'first')`,
+        )
+        .run(),
+    ).toThrow(/CHECK constraint failed/)
+  })
+
+  it('refuses a spaceless fence from a pre-#327 writer instead of ignoring it', () => {
+    // NOT NULL cannot carry this alone: that writer is INSERT OR IGNORE, so the violation
+    // is swallowed and its purge commits the DELETE with no fence at all — permissive,
+    // which is the opposite of what an irreversible fence may degrade to.
+    const db = database()
+    runSqliteMigrations(db)
+
+    expect(() =>
+      db
+        .prepare(`INSERT OR IGNORE INTO revision_purge_fences (kind, entity_id) VALUES ('note', ?)`)
+        .run('old-writer-note'),
+    ).toThrow(/purge fence requires a space/)
+    expect(db.prepare('SELECT count(*) AS n FROM revision_purge_fences').get()).toEqual({ n: 0 })
   })
 
   it('migrates credential bookmarks to the furthest owner fallback per project', () => {

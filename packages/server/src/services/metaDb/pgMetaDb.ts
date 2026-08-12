@@ -13,6 +13,11 @@ import { createFoldersFacet } from './drivers/pg/folders'
 import { createGatewayFacet } from './drivers/pg/gateway'
 import { createIdentityFacet } from './drivers/pg/identity'
 import { createJobsFacet } from './drivers/pg/jobs'
+import {
+  lockContextOrderScopesOfSpace,
+  lockRevisionWideScan,
+  lockSpaceIdentityRows,
+} from './drivers/pg/lockOrder'
 import { createOAuthFacet } from './drivers/pg/oauth'
 import { createProjectsFacet } from './drivers/pg/projects'
 import { createRetrievalLogFacet } from './drivers/pg/retrievalLog'
@@ -168,6 +173,7 @@ export class PgMetaDb implements MetaDb {
       // The row lock serializes this decision with archive/rename and with purge's
       // matching lock. If grant wins, a later purge removes the new membership;
       // if purge/archive wins, this transaction refuses without writing.
+      // eslint-disable-next-line no-restricted-syntax -- outside the note-identity hierarchy: the space row, shared only with purge's matching lock
       const result = await client.query('SELECT * FROM spaces WHERE id = $1 FOR UPDATE', [spaceId])
       const row = result.rows[0] as SpaceRow | undefined
 
@@ -203,14 +209,37 @@ export class PgMetaDb implements MetaDb {
     try {
       await client.query('BEGIN')
       await client.query("SELECT set_config('notarium.revision_purge_protocol', 'v26', true)")
+      // Level by level, top down — an identity settlement enters at identity and walks
+      // down to the revision locks, so a purge that enters anywhere below and reaches
+      // back up makes the two a cycle. See `drivers/pg/lockOrder`.
+      await lockSpaceIdentityRows(client, spaceId)
+      await client.query('DELETE FROM note_identity WHERE space = $1', [spaceId])
+      await client.query('DELETE FROM favorites WHERE space = $1', [spaceId])
+      await client.query(
+        'DELETE FROM context_set_attachments WHERE target_space = $1 OR set_id IN (SELECT id FROM context_sets WHERE home_space = $1)',
+        [spaceId],
+      )
+      await client.query('DELETE FROM context_sets WHERE home_space = $1', [spaceId])
+      // Drop pins whose SCOPE lived here; a pin to a NOTE here degrades at resolve (no eager sweep).
+      await client.query('DELETE FROM context_scope_pins WHERE target_space = $1', [spaceId])
+      // The overlay is rewritten DELETE-then-INSERT by `setOrder` and by a settlement,
+      // both under the per-scope advisory lock. Deleting it without taking that lock is
+      // not an ordering slip but a missing lock — the one thing no ordering rule sees.
+      // Deriving the scope set is part of taking the lock, so it lives in `lockOrder`.
+      await lockContextOrderScopesOfSpace(client, spaceId)
+      await client.query('DELETE FROM context_order WHERE target_space = $1', [spaceId])
+      // Its notes and blobs are read from rows this transaction locks as it goes,
+      // so tier 3 cannot be entered in one sorted pass — take the wide-scan mutex.
+      await lockRevisionWideScan(client)
       await lockRevisionKeys(client, 'space', [spaceId])
       // Serialize child cleanup with recovery grant. Without this early row lock,
       // purge could delete memberships, wait on the final space delete, then leave
       // a concurrent late grant orphaned after passing the cleanup point.
+      // eslint-disable-next-line no-restricted-syntax -- outside the note-identity hierarchy: the space row, shared only with grant's matching lock
       await client.query('SELECT id FROM spaces WHERE id = $1 FOR UPDATE', [spaceId])
       await client.query(
-        `INSERT INTO revision_purge_fences (kind, entity_id) VALUES ('space', $1)
-         ON CONFLICT (kind, entity_id) DO NOTHING`,
+        `INSERT INTO revision_purge_fences (kind, entity_id, space) VALUES ('space', $1, $1)
+         ON CONFLICT (kind, entity_id, space) DO NOTHING`,
         [spaceId],
       )
       const notesRes = await client.query(
@@ -240,7 +269,6 @@ export class PgMetaDb implements MetaDb {
           await client.query('DELETE FROM revision_blobs WHERE hash = $1', [h])
         }
       }
-      await client.query('DELETE FROM note_identity WHERE space = $1', [spaceId])
       // Legacy rows may carry a space/project id, current slug, or retired space
       // alias. Ids are authoritative; textual history is purged only when every
       // live namespace resolves it to one project (fail closed on collisions).
@@ -292,15 +320,6 @@ export class PgMetaDb implements MetaDb {
       // The project FK cascades both cursor tables from this parent delete. This
       // preserves the parent-first order used by concurrent session advance.
       await client.query('DELETE FROM folders WHERE space = $1', [spaceId])
-      await client.query('DELETE FROM favorites WHERE space = $1', [spaceId])
-      await client.query(
-        'DELETE FROM context_set_attachments WHERE target_space = $1 OR set_id IN (SELECT id FROM context_sets WHERE home_space = $1)',
-        [spaceId],
-      )
-      await client.query('DELETE FROM context_sets WHERE home_space = $1', [spaceId])
-      // Drop pins whose SCOPE lived here; a pin to a NOTE here degrades at resolve (no eager sweep).
-      await client.query('DELETE FROM context_scope_pins WHERE target_space = $1', [spaceId])
-      await client.query('DELETE FROM context_order WHERE target_space = $1', [spaceId])
       await client.query('DELETE FROM space_members WHERE space = $1', [spaceId])
       // Job rows only; on-disk artifacts are swept by the runner's TTL GC (this layer owns no filesystem).
       await client.query('DELETE FROM jobs WHERE space = $1', [spaceId])

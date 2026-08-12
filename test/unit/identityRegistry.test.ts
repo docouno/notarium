@@ -8,6 +8,8 @@
 import { describe, expect, it } from 'vitest'
 import { type IdentityPersistence, type IdentityRecord, IdentityRegistry } from '@notarium/core'
 
+import { InMemoryIdentity } from '../fake-server/identity'
+
 const NOW = '2026-06-11T12:00:00.000Z'
 const makeRegistry = (persistence?: IdentityPersistence) =>
   new IdentityRegistry({ persistence, now: () => new Date(NOW) })
@@ -22,24 +24,242 @@ const deferred = () => {
   return { promise, resolve, reject }
 }
 
-/** In-memory persistence double: records every upsert batch for inspection.
- *  Space-filters loadAll like the real drivers (#16). */
+/** In-memory persistence double: the shared twin, plus the claim log the
+ *  write-behind assertions read. Space-filters loadAll like the real drivers (#16). */
 const fakePersistence = (seed: IdentityRecord[] = []) => {
-  const upserted: IdentityRecord[] = []
-  const loadedFor: string[] = []
-  const persistence: IdentityPersistence = {
-    init: async () => {},
-    loadAll: async (space) => {
-      loadedFor.push(space)
-      return seed.filter((r) => r.space === space)
-    },
-    upsertMany: async (records) => {
-      upserted.push(...records.map((r) => ({ ...r })))
-    },
-    close: async () => {},
-  }
-  return { persistence, upserted, loadedFor }
+  const persistence = new InMemoryIdentity(seed)
+  return { persistence, upserted: persistence.claimed, loadedFor: persistence.loadedFor }
 }
+
+/** A minimal hand-rolled double for the write-behind ORDERING tests: they need to
+ *  hold one batch open, which the shared twin deliberately cannot do. */
+const claimLane = (
+  claim: (records: readonly IdentityRecord[]) => Promise<void>,
+): IdentityPersistence => ({
+  init: async () => {},
+  loadAll: async () => [],
+  claimMany: async (records) => {
+    await claim(records)
+    return records.map((record) => ({ id: record.id, status: 'claimed' as const }))
+  },
+  settleFileClaim: async () => {
+    throw new Error('these tests never settle a file claim')
+  },
+  close: async () => {},
+})
+
+describe('IdentityRegistry — a minted id another space already owns', () => {
+  // 72 bits make this astronomically unlikely, which is exactly why it needs a
+  // test: the branch is otherwise never executed by anything, and what it prevents
+  // — a note quietly keeping an id whose durable owner is elsewhere — is the whole
+  // point of the arbiter.
+  it('re-mints an id the flush finds foreign and tells the read-model to re-key it', async () => {
+    const batches: IdentityRecord[][] = []
+    const remints: Array<[string, string]> = []
+    const persistence: IdentityPersistence = {
+      init: async () => {},
+      loadAll: async () => [],
+      claimMany: async (records) => {
+        batches.push(records.map((r) => ({ ...r })))
+
+        return records.map((r) =>
+          batches.length === 1
+            ? { id: r.id, status: 'foreign-owner' as const, owner: { ...r, space: 'other' } }
+            : { id: r.id, status: 'claimed' as const },
+        )
+      },
+      settleFileClaim: async () => {
+        throw new Error('this test never settles a file claim')
+      },
+      close: async () => {},
+    }
+    const reg = new IdentityRegistry({
+      persistence,
+      now: () => new Date(NOW),
+      onRemint: (previousId, nextId) => remints.push([previousId, nextId]),
+    })
+    const minted = reg.ensure('demo/a.md').id
+
+    await reg.flush()
+
+    const next = reg.idFor('demo/a.md')!
+
+    expect(next).not.toBe(minted)
+    expect(next).toMatch(/^[A-Za-z0-9_-]{12}$/)
+    // The read-model is told, so everything filed under the refused spelling moves.
+    expect(remints).toEqual([[minted, next]])
+    // The refused spelling is not ours and is not kept as one of our records.
+    expect(reg.recordFor(minted)).toBeUndefined()
+    expect(reg.pathFor(minted)).toBeUndefined()
+    // …and the fresh id is still owed to persistence.
+    await reg.flush()
+    expect(batches.at(-1)!.map((r) => r.id)).toEqual([next])
+  })
+})
+
+describe('IdentityRegistry — settlement vs unflushed local state', () => {
+  // The arbiter answers WHO owns an id, not when the note was born. Its answer is
+  // read from a row that predates any edit still sitting here unflushed, so an
+  // authored date change (#186) must survive being installed over — otherwise the
+  // next read of the file, which settles the very same id, silently rolls it back.
+  it('keeps an unflushed authored createdAt when the same id is settled again', async () => {
+    const { persistence } = fakePersistence()
+    const reg = makeRegistry(persistence)
+
+    await reg.settleFileClaim('demo/a.md', 'file-claim-id')
+    await reg.flush()
+    expect((await persistence.findById('file-claim-id'))?.createdAt).toBe(NOW)
+
+    const authored = '2019-03-14T00:00:00.000Z'
+
+    reg.setCreatedAt('file-claim-id', authored)
+    // A read of the file inside the write-behind window: same path, same claim.
+    await reg.settleFileClaim('demo/a.md', 'file-claim-id')
+
+    expect(reg.recordFor('file-claim-id')?.createdAt).toBe(authored)
+    // …and it is still owed to persistence, so the flush that follows writes it.
+    await reg.flush()
+    expect((await persistence.findById('file-claim-id'))?.createdAt).toBe(authored)
+  })
+})
+
+describe('IdentityRegistry — a local mutation inside the settlement window', () => {
+  // The lane serializes ASYNC operations. `rename` and `markDeleted` are
+  // synchronous, so they land inside a settlement's await — and what they record
+  // postdates the aggregate's answer. Installing the answer over them would roll
+  // back a fact the process has already acted on.
+  /** The shared twin with ONE seam: the settlement is held open, so a synchronous
+   *  local call can be placed inside the transaction window on purpose. */
+  const heldSettlement = () => {
+    const store = new InMemoryIdentity()
+    const open = deferred()
+    const release = deferred()
+    const persistence: IdentityPersistence = {
+      init: () => store.init(),
+      loadAll: (space) => store.loadAll(space),
+      claimMany: (records) => store.claimMany(records),
+      findById: (id) => store.findById(id),
+      settleFileClaim: async (claim) => {
+        open.resolve()
+        await release.promise
+        return store.settleFileClaim(claim)
+      },
+      close: () => store.close(),
+    }
+    return { persistence, store, open: open.promise, release: release.resolve }
+  }
+
+  it('keeps a delete that raced the settlement, tombstone and all', async () => {
+    const { persistence, open, release } = heldSettlement()
+    const reg = makeRegistry(persistence)
+    const settling = reg.settleFileClaim('demo/a.md', 'file-claim-id')
+
+    await open // the aggregate is mid-transaction
+    expect(reg.markDeleted('demo/a.md')).toBeDefined()
+    release()
+    await settling
+
+    // The note is gone: no live path resolves to it…
+    expect(reg.idFor('demo/a.md')).toBeUndefined()
+    // …and the tombstone is real, not a record the install quietly revived.
+    expect(reg.recordFor('file-claim-id')?.deletedAt).toBe(NOW)
+  })
+
+  it('keeps a rename that raced the settlement — one live path, not two', async () => {
+    const { persistence, open, release } = heldSettlement()
+    const reg = makeRegistry(persistence)
+    const settling = reg.settleFileClaim('demo/a.md', 'file-claim-id')
+
+    await open
+    reg.rename('demo/a.md', 'demo/b.md')
+    release()
+    await settling
+
+    expect(reg.idFor('demo/b.md')).toBe('file-claim-id')
+    // The old path must not still route to the same id: two live bindings on one
+    // note is exactly what the read-model cannot represent.
+    expect(reg.idFor('demo/a.md')).toBeUndefined()
+    expect(reg.recordFor('file-claim-id')?.filePath).toBe('demo/b.md')
+  })
+
+  it('holds the lane: a second settlement cannot open while the first is in flight', async () => {
+    // What the lane is FOR. Two settlements arbitrate the same table and each
+    // installs into the same maps from a snapshot it took before its await — run
+    // them concurrently and the second commits over the first's answer.
+    const { persistence, open, release } = heldSettlement()
+    const entered: string[] = []
+    const counting: IdentityPersistence = {
+      ...persistence,
+      settleFileClaim: (claim) => {
+        entered.push(claim.filePath)
+        return persistence.settleFileClaim(claim)
+      },
+    }
+    const reg = makeRegistry(counting)
+    const first = reg.settleFileClaim('demo/a.md', 'first-claim1')
+    const second = reg.settleFileClaim('demo/b.md', 'secondclaim')
+
+    await open
+    expect(entered).toEqual(['demo/a.md'])
+
+    release()
+    await Promise.all([first, second])
+    expect(entered).toEqual(['demo/a.md', 'demo/b.md'])
+  })
+
+  it('holds the lane against a FLUSH, so no batch commits across a settlement', async () => {
+    // The other half of what the lane is for, and the reachable one: the publication
+    // fence calls `identity.flush()` outside any mutation claim, so a batch can be
+    // snapshotted while a settlement is mid-transaction. Outside the lane that batch
+    // writes the PRE-settlement record after the transaction retired it — the retired
+    // id is durable and live again at the same path.
+    const { persistence, store, open, release } = heldSettlement()
+    const claimed: string[][] = []
+    const counting: IdentityPersistence = {
+      ...persistence,
+      claimMany: (records) => {
+        claimed.push(records.map((r) => r.id))
+        return persistence.claimMany(records)
+      },
+    }
+    const reg = makeRegistry(counting)
+    const auto = reg.ensure('demo/a.md').id
+    const settling = reg.settleFileClaim('demo/a.md', 'file-claim-id')
+
+    await open // the aggregate is mid-transaction, deciding that id's fate
+    const flushing = reg.flush()
+    await new Promise((tick) => setTimeout(tick, 0))
+
+    // Nothing may reach persistence while the settlement owns the lane.
+    expect(claimed).toEqual([])
+
+    release()
+    await Promise.all([settling, flushing])
+
+    // The superseded id was never written back over the tombstone the settlement
+    // transaction wrote for it, and the path carries the settled one.
+    expect(claimed.flat()).not.toContain(auto)
+    expect(await store.findById(auto)).toMatchObject({ deletedAt: NOW })
+    expect((await store.findById('file-claim-id'))?.filePath).toBe('demo/a.md')
+    expect(reg.idFor('demo/a.md')).toBe('file-claim-id')
+  })
+
+  it('still owes the raced fact to persistence', async () => {
+    const { persistence, store, open, release } = heldSettlement()
+    const reg = makeRegistry(persistence)
+    const settling = reg.settleFileClaim('demo/a.md', 'file-claim-id')
+
+    await open
+    reg.rename('demo/a.md', 'demo/b.md')
+    release()
+    await settling
+    // The settlement made the row durable at the OLD path; only a still-dirty
+    // record makes the write-behind carry the move across.
+    await reg.flush()
+
+    expect((await store.findById('file-claim-id'))?.filePath).toBe('demo/b.md')
+  })
+})
 
 describe('IdentityRegistry — ensure', () => {
   it('mints a 12-char id on first sight and returns the same record afterwards', () => {
@@ -102,20 +322,20 @@ describe('IdentityRegistry — setCreatedAt (#186 authored date edit)', () => {
   })
 })
 
-describe('IdentityRegistry — adoptFileId', () => {
-  it('noop when the file claims the id the path already has (marks it materialized)', () => {
+describe('IdentityRegistry — settleFileClaim (no shared persistence)', () => {
+  it('noop when the file claims the id the path already has (marks it materialized)', async () => {
     const reg = makeRegistry()
     const rec = reg.ensure('demo/a.md')
     expect(rec.materialized).toBe(false)
-    expect(reg.adoptFileId('demo/a.md', rec.id)).toEqual({ kind: 'noop' })
+    expect(await reg.settleFileClaim('demo/a.md', rec.id)).toEqual({ kind: 'noop' })
     expect(reg.recordFor(rec.id)?.materialized).toBe(true)
   })
 
-  it('a frontmatter claim beats the path’s auto-id', () => {
+  it('a frontmatter claim beats the path’s auto-id', async () => {
     const reg = makeRegistry()
     const auto = reg.ensure('demo/a.md', '2026-01-01T00:00:00Z')
-    const res = reg.adoptFileId('demo/a.md', 'file-claim-id')
-    expect(res).toEqual({ kind: 'adopted', previousId: auto.id })
+    const res = await reg.settleFileClaim('demo/a.md', 'file-claim-id')
+    expect(res).toEqual({ kind: 'adopted' })
     expect(reg.idFor('demo/a.md')).toBe('file-claim-id')
     expect(reg.pathFor(auto.id)).toBeUndefined() // the superseded auto-id is gone
     // the path's first-seen date follows the note, not the id
@@ -123,12 +343,12 @@ describe('IdentityRegistry — adoptFileId', () => {
     expect(reg.recordFor('file-claim-id')?.materialized).toBe(true)
   })
 
-  it('a claim already owned by another LIVE path is a duplicate — the copy keeps its own id', () => {
+  it('a claim already owned by another LIVE path is a duplicate — the copy keeps its own id', async () => {
     const reg = makeRegistry()
     reg.ensure('demo/original.md')
-    reg.adoptFileId('demo/original.md', 'shared-id')
+    await reg.settleFileClaim('demo/original.md', 'shared-id')
     const copyAuto = reg.ensure('demo/copy.md')
-    expect(reg.adoptFileId('demo/copy.md', 'shared-id')).toEqual({
+    expect(await reg.settleFileClaim('demo/copy.md', 'shared-id')).toEqual({
       kind: 'duplicate',
       ownerPath: 'demo/original.md',
     })
@@ -136,14 +356,14 @@ describe('IdentityRegistry — adoptFileId', () => {
     expect(reg.pathFor('shared-id')).toBe('demo/original.md')
   })
 
-  it('a tombstoned id resurrects on a new path — the external-move channel', () => {
+  it('a tombstoned id resurrects on a new path — the external-move channel', async () => {
     const reg = makeRegistry()
     reg.ensure('old/place.md', '2026-01-01T00:00:00Z')
-    reg.adoptFileId('old/place.md', 'durable-id')
+    await reg.settleFileClaim('old/place.md', 'durable-id')
     expect(reg.markDeleted('old/place.md')).toBe('durable-id')
     expect(reg.pathFor('durable-id')).toBeUndefined()
 
-    const res = reg.adoptFileId('new/place.md', 'durable-id')
+    const res = await reg.settleFileClaim('new/place.md', 'durable-id')
     expect(res.kind).toBe('adopted')
     expect(reg.pathFor('durable-id')).toBe('new/place.md')
     // the resurrected record keeps the tombstone's first-seen date
@@ -232,27 +452,106 @@ describe('IdentityRegistry — persistence', () => {
     expect(reg.recordFor('dead-id-00001')?.deletedAt).toBe('2026-06-01T00:00:00Z')
   })
 
-  it('flush() delivers dirty records — including the tombstone of an auto-id superseded by adoption', async () => {
+  it('persists materialization, so a boot re-adopts the id instead of re-minting', async () => {
     const { persistence, upserted } = fakePersistence()
     const reg = makeRegistry(persistence)
     const auto = reg.ensure('demo/a.md')
-    reg.adoptFileId('demo/a.md', 'file-claim-id')
-    await reg.flush()
 
-    const byId = new Map(upserted.map((r) => [r.id, r]))
-    expect(byId.get('file-claim-id')).toMatchObject({
+    await reg.flush()
+    expect(persistence.rows.get(auto.id)).toMatchObject({ materialized: false })
+
+    // The write path has just put this id into the file's frontmatter. Until that
+    // fact is DURABLE the next boot reads an unmaterialized row, treats the file's
+    // claim as unproven and settles all over again.
+    reg.markMaterialized(auto.id)
+    expect(reg.recordFor(auto.id)?.materialized).toBe(true)
+    await reg.flush()
+    expect(persistence.rows.get(auto.id)).toMatchObject({ materialized: true })
+
+    // Idempotent: a second call has nothing to write, so it does not queue a batch.
+    const batches = upserted.length
+    reg.markMaterialized(auto.id)
+    await reg.flush()
+    expect(upserted.length).toBe(batches)
+  })
+
+  it('settles the claim and its predecessor’s tombstone in ONE durable step', async () => {
+    const { persistence, upserted } = fakePersistence()
+    const reg = makeRegistry(persistence)
+    const auto = reg.ensure('demo/a.md')
+    await reg.settleFileClaim('demo/a.md', 'file-claim-id')
+
+    expect(persistence.rows.get('file-claim-id')).toMatchObject({
       filePath: 'demo/a.md',
       materialized: true,
       deletedAt: null,
     })
-    // The superseded auto-id is no longer reachable via the registry, but its
-    // tombstone still rides the flush — persistence must not resurrect it.
-    expect(byId.get(auto.id)).toMatchObject({ deletedAt: NOW })
+    // The superseded auto-id is retired by the settlement itself — a later
+    // write-behind batch must not resurrect it as a live row.
+    expect(persistence.rows.get(auto.id)).toMatchObject({ deletedAt: NOW })
 
-    // flush is drain-once: nothing left dirty afterwards
     upserted.length = 0
     await reg.flush()
     expect(upserted).toEqual([])
+    expect(persistence.rows.get(auto.id)).toMatchObject({ deletedAt: NOW })
+  })
+
+  it('does not answer from a row persistence has never seen', async () => {
+    // The fast path skips the aggregate because the record it holds WAS the row the
+    // transaction would read. A dirty record is precisely the case where it was not:
+    // this one is materialized locally and not yet flushed, so answering `noop` would
+    // call an id settled that no arbiter has ever been asked about.
+    const { persistence } = fakePersistence()
+    const asked: string[] = []
+    const settleFileClaim = persistence.settleFileClaim.bind(persistence)
+
+    persistence.settleFileClaim = async (claim) => {
+      asked.push(claim.observedId)
+      return settleFileClaim(claim)
+    }
+    const reg = makeRegistry(persistence)
+
+    reg.bindOwnedId('demo/a.md', 'local-claim1')
+    expect(await reg.settleFileClaim('demo/a.md', 'local-claim1')).toEqual({ kind: 'noop' })
+    expect(asked).toEqual(['local-claim1'])
+
+    // Once it IS durable and clean, the same call costs no transaction.
+    await reg.flush()
+    asked.length = 0
+
+    expect(await reg.settleFileClaim('demo/a.md', 'local-claim1')).toEqual({ kind: 'noop' })
+    expect(asked).toEqual([])
+  })
+
+  it('leaves a copied file its own id — and still owes that row to persistence', async () => {
+    // `duplicate-path-owner` is a DISTINCT outcome for a reason: nothing moved, so
+    // there is no authoritative row to install and the claimant's own freshly minted
+    // record is still unwritten. Treating it like `accepted` clears its dirt against
+    // a row the transaction never wrote, and the copy is re-minted after a restart.
+    const { persistence } = fakePersistence()
+    const reg = makeRegistry(persistence)
+
+    await reg.settleFileClaim('demo/original.md', 'shared-claim')
+    await reg.flush()
+
+    // The user copies the file: the same frontmatter claim now sits at a second path.
+    const copyId = reg.ensure('demo/copy.md').id
+
+    expect(await reg.settleFileClaim('demo/copy.md', 'shared-claim')).toEqual({
+      kind: 'duplicate',
+      ownerPath: 'demo/original.md',
+    })
+    expect(reg.idFor('demo/copy.md')).toBe(copyId)
+    expect(reg.idFor('demo/original.md')).toBe('shared-claim')
+
+    await reg.flush()
+
+    expect(await persistence.findById(copyId)).toMatchObject({ filePath: 'demo/copy.md' })
+    // …and the original is untouched by the refusal.
+    expect(await persistence.findById('shared-claim')).toMatchObject({
+      filePath: 'demo/original.md',
+      deletedAt: null,
+    })
   })
 
   it('serializes overlapping flushes so an older batch cannot overwrite a newer path', async () => {
@@ -260,22 +559,17 @@ describe('IdentityRegistry — persistence', () => {
     const releaseFirst = deferred()
     const persisted = new Map<string, IdentityRecord>()
     const batches: IdentityRecord[][] = []
-    const persistence: IdentityPersistence = {
-      init: async () => {},
-      loadAll: async () => [],
-      upsertMany: async (records) => {
-        const batch = records.map((record) => ({ ...record }))
-        batches.push(batch)
-        if (batches.length === 1) {
-          firstEntered.resolve()
-          await releaseFirst.promise
-        }
-        for (const record of batch) {
-          persisted.set(record.id, record)
-        }
-      },
-      close: async () => {},
-    }
+    const persistence = claimLane(async (records) => {
+      const batch = records.map((record) => ({ ...record }))
+      batches.push(batch)
+      if (batches.length === 1) {
+        firstEntered.resolve()
+        await releaseFirst.promise
+      }
+      for (const record of batch) {
+        persisted.set(record.id, record)
+      }
+    })
     const reg = makeRegistry(persistence)
     const rec = reg.ensure('demo/a.md')
     const older = reg.flush()
@@ -299,32 +593,27 @@ describe('IdentityRegistry — persistence', () => {
     const attempted: IdentityRecord[][] = []
     let releaseFirst!: () => void
     let lateFlush!: Promise<void>
-    const persistence: IdentityPersistence = {
-      init: async () => {},
-      loadAll: async () => [],
-      upsertMany: (records) => {
-        attempted.push(records.map((record) => ({ ...record })))
-        if (attempted.length > 1) {
-          return Promise.resolve()
-        }
+    const persistence = claimLane((records) => {
+      attempted.push(records.map((record) => ({ ...record })))
+      if (attempted.length > 1) {
+        return Promise.resolve()
+      }
 
-        return new Promise<void>((resolve) => {
-          releaseFirst = () => {
-            // Resolving queues flushDirty's continuation first. This microtask
-            // then lands after it observed an empty set, but before the tracked
-            // tail's finally handler runs.
-            resolve()
-            queueMicrotask(() => {
-              reg.rename('demo/a.md', 'archive/a.md')
-              lateFlush = reg.flush()
-              lateStarted.resolve()
-            })
-          }
-          firstEntered.resolve()
-        })
-      },
-      close: async () => {},
-    }
+      return new Promise<void>((resolve) => {
+        releaseFirst = () => {
+          // Resolving queues the batch's continuation first. This microtask then
+          // lands after it observed an empty set, but before the tracked tail's
+          // finally handler runs.
+          resolve()
+          queueMicrotask(() => {
+            reg.rename('demo/a.md', 'archive/a.md')
+            lateFlush = reg.flush()
+            lateStarted.resolve()
+          })
+        }
+        firstEntered.resolve()
+      })
+    })
 
     const reg = makeRegistry(persistence)
     reg.ensure('demo/a.md')
@@ -346,22 +635,17 @@ describe('IdentityRegistry — persistence', () => {
     const failFirst = deferred()
     const persisted = new Map<string, IdentityRecord>()
     const attempted: IdentityRecord[][] = []
-    const persistence: IdentityPersistence = {
-      init: async () => {},
-      loadAll: async () => [],
-      upsertMany: async (records) => {
-        const batch = records.map((record) => ({ ...record }))
-        attempted.push(batch)
-        if (attempted.length === 1) {
-          firstEntered.resolve()
-          await failFirst.promise
-        }
-        for (const record of batch) {
-          persisted.set(record.id, record)
-        }
-      },
-      close: async () => {},
-    }
+    const persistence = claimLane(async (records) => {
+      const batch = records.map((record) => ({ ...record }))
+      attempted.push(batch)
+      if (attempted.length === 1) {
+        firstEntered.resolve()
+        await failFirst.promise
+      }
+      for (const record of batch) {
+        persisted.set(record.id, record)
+      }
+    })
     const reg = makeRegistry(persistence)
     const rec = reg.ensure('demo/a.md')
     const failed = reg.flush()
@@ -383,16 +667,11 @@ describe('IdentityRegistry — persistence', () => {
     const entered = deferred()
     const release = deferred()
     let writes = 0
-    const persistence: IdentityPersistence = {
-      init: async () => {},
-      loadAll: async () => [],
-      upsertMany: async () => {
-        writes++
-        entered.resolve()
-        await release.promise
-      },
-      close: async () => {},
-    }
+    const persistence = claimLane(async () => {
+      writes++
+      entered.resolve()
+      await release.promise
+    })
     const reg = makeRegistry(persistence)
 
     reg.ensure('demo/a.md')
@@ -413,10 +692,10 @@ describe('IdentityRegistry — persistence', () => {
 })
 
 describe('IdentityRegistry — space (#16 groundwork)', () => {
-  it('stamps its space on every record it mints or adopts', () => {
+  it('stamps its space on every record it mints or adopts', async () => {
     const reg = new IdentityRegistry({ space: 'work', now: () => new Date(NOW) })
     expect(reg.ensure('demo/a.md').space).toBe('work')
-    reg.adoptFileId('demo/b.md', 'file-claim-id')
+    await reg.settleFileClaim('demo/b.md', 'file-claim-id')
     expect(reg.recordFor('file-claim-id')?.space).toBe('work')
   })
 

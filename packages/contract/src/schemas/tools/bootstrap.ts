@@ -1,7 +1,11 @@
 import { z } from 'zod'
 import { AGENT_SESSION_STATE } from '../../consts/tools'
 import { enumValues } from '../../libs/enumValues'
-import { IsoTimestampSchema, RevisionKindSchema } from '../primitives'
+import {
+  IsoTimestampSchema,
+  RevisionKindSchema,
+  RevisionUnavailableReasonSchema,
+} from '../primitives'
 import { EffectiveRoleSummarySchema, RoleNameSchema } from '../rest/agent/roles'
 import { PatScopeSchema } from '../rest/pats'
 import { AgentSessionIdSchema, locationFields } from './_fields'
@@ -81,6 +85,9 @@ export const DeltaEntrySchema = z.object({
   principal: z.string().nullable(),
   ...locationFields,
   modifiedAt: IsoTimestampSchema,
+  /** A journal GAP — see `RevisionUnavailableReasonSchema`. It still holds its place
+   *  in the cursor, the total and the page. */
+  unavailableReason: RevisionUnavailableReasonSchema.optional(),
 })
 
 /** The bound-session/project delta, or the owner/project fallback when no session

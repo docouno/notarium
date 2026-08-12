@@ -12,8 +12,6 @@ import {
   CachedStore,
   FRONTMATTER_BYTE_CAP,
   frontmatterValue,
-  type IdentityPersistence,
-  type IdentityRecord,
   InMemoryRevisionPersistence,
   type KnowledgeStore,
   liveSyncStatus,
@@ -23,6 +21,8 @@ import {
   upsertFrontmatterKey,
   type WriteInput,
 } from '@notarium/core'
+
+import { InMemoryIdentity } from '../fake-server/identity'
 
 const permalinkOf = (fp: string) => `main/${fp.replace(/\.md$/, '')}`
 const NOTE_ID_RE = /^[A-Za-z0-9_-]{12}$/
@@ -139,19 +139,30 @@ const make = async (files: Map<string, string>) => {
  *  meta-DB's stand-in. `findById` reads THIS durable map, exactly like
  *  SpaceManager.resolveNote reads the DB and not the in-memory registry. */
 const makeIdentityPersistence = () => {
-  const durable = new Map<string, IdentityRecord>()
-  const persistence: IdentityPersistence = {
-    init: async () => {},
-    loadAll: async () => [],
-    upsertMany: async (records) => {
-      for (const r of records) {
-        durable.set(r.id, { ...r })
-      }
-    },
-    findById: async (id) => durable.get(id) ?? null,
-    close: async () => {},
+  const persistence = new InMemoryIdentity()
+  return { persistence, durable: persistence.rows }
+}
+
+/** Wrap a twin so one identity write can be held open or made to fail. Both
+ *  channels are covered on purpose: a minted id becomes durable through
+ *  claimMany, an observed frontmatter claim through settleFileClaim. */
+const gateIdentity = (
+  persistence: InMemoryIdentity,
+  gate: (ids: readonly string[]) => Promise<void>,
+): InMemoryIdentity => {
+  const claimMany = persistence.claimMany.bind(persistence)
+  const settleFileClaim = persistence.settleFileClaim.bind(persistence)
+
+  persistence.claimMany = async (records) => {
+    await gate(records.map((record) => record.id))
+    return claimMany(records)
   }
-  return { persistence, durable }
+  persistence.settleFileClaim = async (claim) => {
+    await gate([claim.observedId])
+    return settleFileClaim(claim)
+  }
+
+  return persistence
 }
 
 describe('CachedStore + bare engine — identity (#51)', () => {
@@ -232,22 +243,15 @@ describe('CachedStore + bare engine — identity (#51)', () => {
   it('publishes an ordinary create only after its global identity route is durable', async () => {
     const files = new Map<string, string>()
     const bare = makeBareEngine(files)
-    const durable = new Map<string, IdentityRecord>()
+    const persistence = new InMemoryIdentity()
+    const durable = persistence.rows
     const flushEntered = deferred()
     const releaseFlush = deferred()
-    const persistence: IdentityPersistence = {
-      init: async () => {},
-      loadAll: async () => [],
-      upsertMany: async (records) => {
-        flushEntered.resolve()
-        await releaseFlush.promise
-        for (const record of records) {
-          durable.set(record.id, { ...record })
-        }
-      },
-      findById: async (id) => durable.get(id) ?? null,
-      close: async () => {},
-    }
+
+    gateIdentity(persistence, async () => {
+      flushEntered.resolve()
+      await releaseFlush.promise
+    })
     const store = new CachedStore({
       inner: bare.engine,
       identityPersistence: persistence,
@@ -281,15 +285,9 @@ describe('CachedStore + bare engine — identity (#51)', () => {
   it('does not publish an ordinary create when identity durability fails', async () => {
     const files = new Map<string, string>()
     const bare = makeBareEngine(files)
-    const persistence: IdentityPersistence = {
-      init: async () => {},
-      loadAll: async () => [],
-      upsertMany: async () => {
-        throw new Error('meta db unavailable')
-      },
-      findById: async () => null,
-      close: async () => {},
-    }
+    const persistence = gateIdentity(new InMemoryIdentity(), async () => {
+      throw new Error('meta db unavailable')
+    })
     const store = new CachedStore({
       inner: bare.engine,
       identityPersistence: persistence,
@@ -316,25 +314,21 @@ describe('CachedStore + bare engine — identity (#51)', () => {
     const bare = makeBareEngine(files)
     bare.engine.search = async () =>
       [...files.keys()].map((filePath) => ({ filePath, title: 'Ordered Create', snippet: 'body' }))
-    const durable = new Map<string, IdentityRecord>()
+    const persistence = new InMemoryIdentity()
+    const durable = persistence.rows
     const flushEntered = deferred()
     const releaseFlush = deferred()
     let gate = false
-    const persistence: IdentityPersistence = {
-      init: async () => {},
-      loadAll: async () => [],
-      upsertMany: async (records) => {
-        if (gate && records.some((record) => record.filePath === 'ordered-create.md')) {
-          gate = false
-          flushEntered.resolve()
-          await releaseFlush.promise
-        }
-        for (const record of records) {
-          durable.set(record.id, { ...record })
-        }
-      },
-      findById: async (id) => durable.get(id) ?? null,
-      close: async () => {},
+    const claimMany = persistence.claimMany.bind(persistence)
+
+    persistence.claimMany = async (records) => {
+      if (gate && records.some((record) => record.filePath === 'ordered-create.md')) {
+        gate = false
+        flushEntered.resolve()
+        await releaseFlush.promise
+      }
+
+      return claimMany(records)
     }
     const store = new CachedStore({
       inner: bare.engine,
@@ -391,18 +385,8 @@ describe('CachedStore + bare engine — identity (#51)', () => {
   it('blocks the poll listDirs window until its provisional id is durable', async () => {
     const files = new Map<string, string>()
     const bare = makeBareEngine(files)
-    const durable = new Map<string, IdentityRecord>()
-    const persistence: IdentityPersistence = {
-      init: async () => {},
-      loadAll: async () => [],
-      upsertMany: async (records) => {
-        for (const record of records) {
-          durable.set(record.id, { ...record })
-        }
-      },
-      findById: async (id) => durable.get(id) ?? null,
-      close: async () => {},
-    }
+    const persistence = new InMemoryIdentity()
+    const durable = persistence.rows
     const store = new CachedStore({
       inner: bare.engine,
       identityPersistence: persistence,
@@ -444,26 +428,19 @@ describe('CachedStore + bare engine — identity (#51)', () => {
   it('keeps a bulk-created id off list until an interactive durability flush completes', async () => {
     const files = new Map<string, string>()
     const bare = makeBareEngine(files)
-    const durable = new Map<string, IdentityRecord>()
+    const persistence = new InMemoryIdentity()
+    const durable = persistence.rows
     const flushEntered = deferred()
     const releaseFlush = deferred()
     let gate = false
-    const persistence: IdentityPersistence = {
-      init: async () => {},
-      loadAll: async () => [],
-      upsertMany: async (records) => {
-        if (gate) {
-          gate = false
-          flushEntered.resolve()
-          await releaseFlush.promise
-        }
-        for (const record of records) {
-          durable.set(record.id, { ...record })
-        }
-      },
-      findById: async (id) => durable.get(id) ?? null,
-      close: async () => {},
-    }
+
+    gateIdentity(persistence, async () => {
+      if (gate) {
+        gate = false
+        flushEntered.resolve()
+        await releaseFlush.promise
+      }
+    })
     const store = new CachedStore({
       inner: bare.engine,
       identityPersistence: persistence,
@@ -494,22 +471,15 @@ describe('CachedStore + bare engine — identity (#51)', () => {
   it('auto-retry publishes a repair for a create whose first durability flush failed', async () => {
     const files = new Map<string, string>()
     const bare = makeBareEngine(files)
-    const durable = new Map<string, IdentityRecord>()
+    const persistence = new InMemoryIdentity()
+    const durable = persistence.rows
     let healthy = false
-    const persistence: IdentityPersistence = {
-      init: async () => {},
-      loadAll: async () => [],
-      upsertMany: async (records) => {
-        if (!healthy) {
-          throw new Error('meta down')
-        }
-        for (const record of records) {
-          durable.set(record.id, { ...record })
-        }
-      },
-      findById: async (id) => durable.get(id) ?? null,
-      close: async () => {},
-    }
+
+    gateIdentity(persistence, async () => {
+      if (!healthy) {
+        throw new Error('meta down')
+      }
+    })
     const store = new CachedStore({
       inner: bare.engine,
       identityPersistence: persistence,
@@ -543,26 +513,22 @@ describe('CachedStore + bare engine — identity (#51)', () => {
     await store.settle()
   })
 
-  it('auto-retry publishes a repair for a failed lazy provisional-to-durable rekey', async () => {
+  it('a failed lazy claim settlement changes nothing; the next read adopts (#327)', async () => {
     const durableId = 'durable-id-a1'
     const raw = `---\n${NOTE_ID_FRONTMATTER_KEY}: ${durableId}\n---\n# a\n\nbody`
     const files = new Map([['a.md', raw]])
     const bare = makeBareEngine(files)
-    const durable = new Map<string, IdentityRecord>()
+    const persistence = new InMemoryIdentity()
+    const durable = persistence.rows
+    const settleFileClaim = persistence.settleFileClaim.bind(persistence)
     let rejectDurable = false
-    const persistence: IdentityPersistence = {
-      init: async () => {},
-      loadAll: async () => [],
-      upsertMany: async (records) => {
-        if (rejectDurable && records.some((record) => record.id === durableId)) {
-          throw new Error('meta down')
-        }
-        for (const record of records) {
-          durable.set(record.id, { ...record })
-        }
-      },
-      findById: async (id) => durable.get(id) ?? null,
-      close: async () => {},
+
+    persistence.settleFileClaim = async (claim) => {
+      if (rejectDurable && claim.observedId === durableId) {
+        throw new Error('meta down')
+      }
+
+      return settleFileClaim(claim)
     }
     const store = new CachedStore({
       inner: bare.engine,
@@ -581,21 +547,27 @@ describe('CachedStore + bare engine — identity (#51)', () => {
       }
     })
     rejectDurable = true
+    // Arbitration precedes every map mutation, so a refused settlement leaves
+    // NOTHING half-adopted — no snapshot rekey to repair, no event to withhold.
     await expect(store.read(provisionalId)).rejects.toThrow('meta down')
     expect(changed).toEqual([])
+    expect(durable.has(durableId)).toBe(false)
+    // The fence stays shut while the claim is unanswered: a surface would
+    // otherwise serve a provisional id whose durable owner is still unknown.
+    await expect(store.list()).rejects.toThrow('meta down')
 
     rejectDurable = false
-    await vi.waitFor(() => expect(durable.has(durableId)).toBe(true), { timeout: 2_000 })
-    await vi.waitFor(
-      () =>
-        expect(changed).toContainEqual(
-          expect.objectContaining({
-            type: 'changed',
-            upserts: expect.arrayContaining([durableId]),
-            removed: expect.arrayContaining([provisionalId]),
-          }),
-        ),
-      { timeout: 2_000 },
+    await expect(store.read(provisionalId)).resolves.toMatchObject({
+      id: durableId,
+      filePath: 'a.md',
+    })
+    expect(durable.has(durableId)).toBe(true)
+    expect(changed).toContainEqual(
+      expect.objectContaining({
+        type: 'changed',
+        upserts: expect.arrayContaining([durableId]),
+        removed: expect.arrayContaining([provisionalId]),
+      }),
     )
     store.stop()
     await store.settle()
@@ -1134,14 +1106,14 @@ describe('CachedStore + bare engine — identity (#51)', () => {
     const revisionGet = revisions.get.bind(revisions)
     let gateRestore = true
 
-    revisions.get = async (revisionId) => {
+    revisions.get = async (space, revisionId) => {
       if (gateRestore) {
         gateRestore = false
         restoreEntered.resolve()
         await releaseRestore.promise
       }
 
-      return revisionGet(revisionId)
+      return revisionGet(space, revisionId)
     }
     const read = bare.engine.read.bind(bare.engine)
     let failInlineExternalRead = true
@@ -1427,20 +1399,265 @@ describe('CachedStore + bare engine — identity (#51)', () => {
     expect(await store.list()).toEqual([])
   })
 
+  it('retires the refused spelling to subscribers when a minted id turns out to be foreign', async () => {
+    // The registry re-mints an id another space durably owns and hands the read-model
+    // both spellings. The old one was already published, so the event that announces
+    // the new id must retire it — otherwise a client keeps a note under an id that
+    // resolves to nothing, and only a reload clears it.
+    const files = new Map<string, string>()
+    const bare = makeBareEngine(files)
+    const persistence = new InMemoryIdentity()
+    const claimMany = persistence.claimMany.bind(persistence)
+    let refuseNext = false
+
+    const refused: string[] = []
+
+    persistence.claimMany = async (records) => {
+      if (!refuseNext) {
+        return claimMany(records)
+      }
+      refuseNext = false
+      refused.push(...records.map((r) => r.id))
+
+      return records.map((r) => ({
+        id: r.id,
+        status: 'foreign-owner' as const,
+        owner: { ...r, space: 'other' },
+      }))
+    }
+    const store = new CachedStore({
+      inner: bare.engine,
+      identityPersistence: persistence,
+      pollIntervalMs: 0,
+      relationType: 'links_to',
+      readBody: async (fp) => files.get(fp) ?? null,
+      now: () => new Date('2026-06-11T12:00:00Z'),
+    })
+
+    await store.start()
+    const events: StoreEvent[] = []
+
+    store.subscribe((event) => events.push(event))
+    // The flush that claims this note's freshly minted id is the one that learns the
+    // id is another space's.
+    refuseNext = true
+    files.set('a.md', '# a\n\nbody')
+    await store.checkpoint()
+
+    const reminted = (await store.list())[0].id!
+
+    // The read-model followed the registry: the note is published under the id that
+    // survived, the refused spelling never reached a subscriber, and it still resolves
+    // to the note rather than 404ing a client that raced the repair.
+    expect(refused).toHaveLength(1)
+    expect(refused[0]).not.toBe(reminted)
+    expect(await store.read(refused[0])).toMatchObject({ id: reminted })
+    expect(
+      events.some((event) => event.type === 'changed' && event.upserts.includes(reminted)),
+    ).toBe(true)
+    expect(
+      events.every((event) => event.type !== 'changed' || !event.upserts.includes(refused[0])),
+    ).toBe(true)
+  })
+
+  it('drains an unsettled claim under the mutation claim, whichever side reaches it (#327)', async () => {
+    // The drain re-keys the snapshot and can rewrite a file, so it belongs under the
+    // global mutation claim — and it takes that claim ITSELF rather than trusting each
+    // entry point to remember. This pins the unclaimed side: a read surface recovers
+    // identity here, and while it does, no mutation may start alongside it.
+    const durableId = 'durable-id-d1'
+    const raw = `---\n${NOTE_ID_FRONTMATTER_KEY}: ${durableId}\n---\n# d\n\nbody`
+    const files = new Map([['d.md', raw]])
+    const bare = makeBareEngine(files)
+    let failSettlement = false
+    let held: ReturnType<typeof deferred> | null = null
+    let announceEntry: (() => void) | null = null
+    const persistence = gateIdentity(new InMemoryIdentity(), async (ids) => {
+      if (!ids.includes(durableId)) {
+        return
+      }
+      if (failSettlement) {
+        throw new Error('meta down')
+      }
+      if (held) {
+        announceEntry?.()
+        await held.promise
+      }
+    })
+    const store = new CachedStore({
+      inner: bare.engine,
+      identityPersistence: persistence,
+      pollIntervalMs: 0,
+    })
+
+    await store.start()
+    const provisionalId = (await store.list())[0].id!
+
+    failSettlement = true
+    await expect(store.read(provisionalId)).rejects.toThrow('meta down')
+    failSettlement = false
+
+    held = deferred()
+    const entered = new Promise<void>((resolve) => {
+      announceEntry = resolve
+    })
+    const recovering = store.list()
+
+    await entered
+    const writing = store.write({ title: 'other', content: 'x' })
+
+    await new Promise((tick) => setTimeout(tick, 20))
+    expect(bare.writes).toEqual([])
+
+    held.resolve()
+    await recovering
+    await writing
+    expect(bare.writes).toHaveLength(1)
+    store.stop()
+    await store.settle()
+  })
+
+  it('re-enters the drain from a caller already holding the claim (#327)', async () => {
+    // The other side of the same rule. The claim is NOT re-entrant and its queue is
+    // fair, so a drain that took it unconditionally would queue behind the very
+    // caller that reached it and never return. The read below is that caller: it
+    // adopts a frontmatter id under its own claim, and the assertion is simply that
+    // it finishes.
+    const durableId = 'durable-id-e1'
+    const raw = `---\n${NOTE_ID_FRONTMATTER_KEY}: ${durableId}\n---\n# e\n\nbody`
+    const files = new Map([['e.md', raw]])
+    const bare = makeBareEngine(files)
+    let failSettlement = false
+    const persistence = gateIdentity(new InMemoryIdentity(), async (ids) => {
+      if (failSettlement && ids.includes(durableId)) {
+        throw new Error('meta down')
+      }
+    })
+    const store = new CachedStore({
+      inner: bare.engine,
+      identityPersistence: persistence,
+      pollIntervalMs: 0,
+    })
+
+    await store.start()
+    const provisionalId = (await store.list())[0].id!
+
+    failSettlement = true
+    await expect(store.read(provisionalId)).rejects.toThrow('meta down')
+    failSettlement = false
+
+    // A deadline, not a hang: the failure mode this guards against is waiting
+    // forever, and a suite that hangs reports nothing.
+    await expect(
+      Promise.race([
+        store.read(provisionalId),
+        new Promise((_, fail) =>
+          setTimeout(() => fail(new Error('the drain queued behind its own caller')), 2_000),
+        ),
+      ]),
+    ).resolves.toMatchObject({ id: durableId, filePath: 'e.md' })
+    store.stop()
+    await store.settle()
+  })
+
+  it('settles the queue of the id it is about to retire, not only the observed claim', async () => {
+    // The settlement transaction re-keys the note's journal chain onto the winning
+    // id. An append still queued under the id it retires would land AFTER that
+    // move — stranded on a tombstone, invisible to the note it belongs to. Draining
+    // the observed claim alone does not reach it: that queue is keyed by the id the
+    // path carries NOW.
+    const durableId = 'durable-id-a1'
+    const body = (text: string) => `# a\n\n${text}`
+    const files = new Map([['a.md', body('body')]])
+    const bare = makeBareEngine(files)
+    const changes = bare.engine.changes.bind(bare.engine)
+
+    // The fake engine reports no upserts of its own; every poll after boot hands
+    // the inventory over so an external edit is seen.
+    bare.engine.changes = async (cursor) => {
+      const delta = await changes(cursor)
+
+      return cursor === null
+        ? delta
+        : { ...delta, upserts: delta.inventory.map((meta) => ({ meta })) }
+    }
+    const { persistence } = makeIdentityPersistence()
+    const revisions = new InMemoryRevisionPersistence()
+    const store = new CachedStore({
+      inner: bare.engine,
+      identityPersistence: persistence,
+      revisionPersistence: revisions,
+      pollIntervalMs: 0,
+      relationType: 'links_to',
+      readBody: async (fp) => files.get(fp) ?? null,
+      now: () => new Date('2026-06-11T12:00:00Z'),
+    })
+
+    await store.start()
+    const autoId = (await store.list())[0].id!
+
+    // Hold the note's queued append open …
+    const order: string[] = []
+    const appendEntered = deferred()
+    const releaseAppend = deferred()
+    const append = revisions.append.bind(revisions)
+
+    revisions.append = async (rev, content) => {
+      appendEntered.resolve()
+      await releaseAppend.promise
+      const stored = await append(rev, content)
+
+      order.push(`append:${rev.noteId}`)
+      return stored
+    }
+    // A save through us: it journals fire-and-forget and releases the note's
+    // mutation claim, so nothing but the drain stands between that queue and the
+    // settlement.
+    await store.write({ id: autoId, title: 'a', content: body('edited here') })
+    await appendEntered.promise
+
+    // … and only then let the file claim an id, which retires the one that queue
+    // belongs to.
+    const settleFileClaim = persistence.settleFileClaim.bind(persistence)
+
+    persistence.settleFileClaim = async (claim) => {
+      order.push(`settle:${claim.observedId}`)
+      return settleFileClaim(claim)
+    }
+    files.set('a.md', `---\n${NOTE_ID_FRONTMATTER_KEY}: ${durableId}\n---\n${body('edited here')}`)
+    const reconciling = store.reconcile()
+
+    await new Promise((tick) => setTimeout(tick, 20))
+    expect(order).toEqual([])
+
+    releaseAppend.resolve()
+    await reconciling
+    await store.settle()
+
+    // The append is on the RETIRED id's chain, so it has to land before the
+    // transaction that moves that chain — after it, the row is stranded on a
+    // tombstone. (The state journaled under the winning id afterwards is the
+    // ordinary external append, and it follows.)
+    expect(order.lastIndexOf(`append:${autoId}`)).toBeLessThan(order.indexOf(`settle:${durableId}`))
+    expect(order.slice(0, 2)).toEqual([`append:${autoId}`, `settle:${durableId}`])
+    expect((await store.list())[0].id).toBe(durableId)
+  })
+
   it('announces a lazy provisional-id rekey only after its global route is durable', async () => {
     const durableId = 'durable-id-a1'
     const raw = `---\n${NOTE_ID_FRONTMATTER_KEY}: ${durableId}\n---\n# a\n\nbody`
     const files = new Map([['a.md', raw]])
     const bare = makeBareEngine(files)
     const { persistence, durable } = makeIdentityPersistence()
-    const persist = persistence.upsertMany.bind(persistence)
+    const settleFileClaim = persistence.settleFileClaim.bind(persistence)
     let rejectDurable = false
 
-    persistence.upsertMany = async (records) => {
-      if (rejectDurable && records.some((record) => record.id === durableId)) {
+    persistence.settleFileClaim = async (claim) => {
+      if (rejectDurable && claim.observedId === durableId) {
         throw new Error('meta db unavailable')
       }
-      await persist(records)
+
+      return settleFileClaim(claim)
     }
     const store = new CachedStore({
       inner: bare.engine,

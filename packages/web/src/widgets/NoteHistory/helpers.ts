@@ -1,5 +1,10 @@
 import { diffWordsWithSpace } from 'diff'
+import { REVISION_KIND } from '@notarium/contract/enums'
 import type { RevisionView } from '../../libs/revisions'
+
+/** What a WITHHELD row (#327) is labelled instead of its kind. The dashboard feed
+ *  says the same word for the same fact (`ActivityFeed`'s `unavailable` verb). */
+export const UNAVAILABLE_LABEL = 'Unavailable'
 
 export const KIND_LABEL: Record<RevisionView['kind'], string> = {
   write: 'Edited',
@@ -7,6 +12,31 @@ export const KIND_LABEL: Record<RevisionView['kind'], string> = {
   restore: 'Restored',
   merge: 'Merged',
   delete: 'Deleted',
+}
+
+/** What one timeline row says about a revision: the action, and the writer beside
+ *  it. A withheld row (#327) gets NEITHER — the server did not fail to capture it,
+ *  it refused to attribute it, so its `author: null` must not be worded as "outside
+ *  Notarium", the phrase a genuine unsigned external edit earns.
+ *  canon: docs/note-history.md#model
+ *
+ *  `sourceVersion` = the version number of a restore's source when that revision is
+ *  in the loaded window; out of window the row stays a plain "Restored". */
+export const historyRowLabels = (
+  r: RevisionView,
+  sourceVersion: number | undefined,
+  authorText: string,
+): { kind: string; who: string; gap: boolean } => {
+  if (r.unavailableReason != null) {
+    return { kind: UNAVAILABLE_LABEL, who: '', gap: true }
+  }
+  const kind =
+    r.kind === REVISION_KIND.restore && sourceVersion != null
+      ? `Restored from v${sourceVersion}`
+      : KIND_LABEL[r.kind]
+  const bodyless = r.contentHash == null && r.kind !== REVISION_KIND.delete
+
+  return { kind, who: bodyless ? `${authorText} · body unknown` : authorText, gap: false }
 }
 
 export type DiffSegment = { value: string; kind: 'ctx' | 'add' | 'del' }

@@ -30,6 +30,7 @@ const storeFixture = (withBatch = true) => {
     theirRevisionId: null,
     sourceRevisionId: null,
     kind: 'write',
+    entryRole: 'change',
     principal: 'pat:sergey:agent',
     contentHash: 'hash',
     title: 'communication',

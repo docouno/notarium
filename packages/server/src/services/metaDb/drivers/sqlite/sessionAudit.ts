@@ -1,11 +1,5 @@
-import { AGENT_SESSION_ATTACH, type RevisionKind } from '@notarium/core'
-
-import { retrievalOfRow, type RetrievalRow } from '../../rows'
-import type {
-  AgentSessionAuditEvent,
-  AgentSessionAuditPersistence,
-  AgentSessionAuditSummary,
-} from '../../types'
+import { auditEventOfRow, type AuditEventRow } from '../../rows'
+import type { AgentSessionAuditPersistence, AgentSessionAuditSummary } from '../../types'
 import type { SqliteDriverCtx } from './context'
 
 type SummaryRow = {
@@ -94,47 +88,13 @@ const SUMMARY_CTES = `
     SELECT COUNT(*) AS total_rows, COALESCE(SUM(active), 0) AS active_rows FROM combined
   )`
 
-type EventRow = RetrievalRow & {
-  event_type: 'retrieval' | 'write'
-  source_rank: number
-  note_id: string | null
-  space: string | null
-  revision_kind: string | null
-  revision_title: string | null
-  revision_class: string | null
-}
-
-const eventOf = (r: EventRow): AgentSessionAuditEvent => {
-  if (r.event_type === 'retrieval') {
-    return { type: 'retrieval', record: retrievalOfRow(r) }
-  }
-
-  return {
-    type: 'write',
-    id: String(r.id),
-    at: r.created_at,
-    principal: r.principal,
-    agent: r.agent,
-    sessionAttach:
-      r.session_attach === AGENT_SESSION_ATTACH.declared ||
-      r.session_attach === AGENT_SESSION_ATTACH.inferred
-        ? r.session_attach
-        : null,
-    noteId: r.note_id ?? '',
-    space: r.space ?? '',
-    title: r.revision_title ?? '',
-    class: r.revision_class,
-    revisionKind: r.revision_kind as RevisionKind,
-  }
-}
-
 const EVENTS_CTE = `
   WITH events AS (
     SELECT 'retrieval' AS event_type, 1 AS source_rank,
            id, owner, principal, agent, session_id, session_name, session_attach,
            tool, query, project, class_filter, result_count, top_score, hits, created_at,
            NULL AS note_id, NULL AS space, NULL AS revision_kind,
-           NULL AS revision_title, NULL AS revision_class
+           NULL AS revision_title, NULL AS revision_class, NULL AS revision_integrity
       FROM agent_retrievals
      WHERE owner = ? AND ((? IS NULL AND session_id IS NULL) OR session_id = ?)
     UNION ALL
@@ -143,7 +103,8 @@ const EVENTS_CTE = `
            session_id, session_name, session_attach,
            NULL AS tool, '' AS query, NULL AS project, NULL AS class_filter,
            0 AS result_count, NULL AS top_score, NULL AS hits, created_at,
-           note_id, space, kind AS revision_kind, title AS revision_title, class AS revision_class
+           note_id, space, kind AS revision_kind, title AS revision_title, class AS revision_class,
+           integrity AS revision_integrity
       FROM note_revisions
      WHERE agent_owner = ? AND ((? IS NULL AND session_id IS NULL) OR session_id = ?)
   )`
@@ -247,9 +208,9 @@ export const createSessionAuditFacet = (ctx: SqliteDriverCtx): AgentSessionAudit
         `${EVENTS_CTE} SELECT * FROM events ${rowWhere}
           ORDER BY created_at DESC, source_rank DESC, id DESC LIMIT ?`,
       )
-      .all(...params) as EventRow[]
+      .all(...params) as AuditEventRow[]
     return {
-      items: rows.slice(0, limit).map(eventOf),
+      items: rows.slice(0, limit).map(auditEventOfRow),
       total: Number(count.n),
       hasMore: rows.length > limit,
     }

@@ -18,23 +18,11 @@ import { createNotariumStore } from '@notarium/engine'
 import type { SpaceRecord } from '../../packages/server/src/services/metaDb'
 import { SpaceManager } from '../../packages/server/src/services/spaces'
 import type { SpaceManagerOptions } from '../../packages/server/src/services/spaces'
+import { InMemoryIdentity } from '../fake-server/identity'
 
 describe('CachedStore(NotariumStore) — authoritative link identities', () => {
-  const persistedIdentity = (records: IdentityRecord[]): IdentityPersistence => {
-    const rows = new Map(records.map((record) => [record.id, { ...record }]))
-
-    return {
-      init: async () => {},
-      loadAll: async () => [...rows.values()].map((record) => ({ ...record })),
-      upsertMany: async (next) => {
-        for (const record of next) {
-          rows.set(record.id, { ...record })
-        }
-      },
-      findById: async (id) => rows.get(id) ?? null,
-      close: async () => {},
-    }
-  }
+  const persistedIdentity = (records: IdentityRecord[]): IdentityPersistence =>
+    new InMemoryIdentity(records)
 
   it('waits for cold identity reconciliation before resolving a plain stable id', async () => {
     const root = mkdtempSync(join(tmpdir(), 'notarium-cached-cold-resolve-'))
@@ -132,15 +120,12 @@ describe('CachedStore(NotariumStore) — authoritative link identities', () => {
       materialized: true,
       deletedAt: null,
     }
-    const identityPersistence: IdentityPersistence = {
-      init: async () => {},
-      loadAll: async () => {
-        await identityLoad
-        return [{ ...owner }]
-      },
-      upsertMany: async () => {},
-      findById: async (id) => (id === owner.id ? { ...owner } : null),
-      close: async () => {},
+    const identityPersistence = new InMemoryIdentity([owner])
+    const loadAll = identityPersistence.loadAll.bind(identityPersistence)
+
+    identityPersistence.loadAll = async (space) => {
+      await identityLoad
+      return loadAll(space)
     }
     const inner = createNotariumStore({ notesDir: root })
     const innerRead = inner.read.bind(inner)
@@ -232,14 +217,10 @@ describe('CachedStore(NotariumStore) — authoritative link identities', () => {
       materialized: true,
       deletedAt: null,
     }
-    const identityPersistence: IdentityPersistence = {
-      init: async () => {},
-      loadAll: async () => {
-        throw new Error('identity registry unavailable')
-      },
-      upsertMany: async () => {},
-      findById: async (id) => (id === owner.id ? { ...owner } : null),
-      close: async () => {},
+    const identityPersistence = new InMemoryIdentity([owner])
+
+    identityPersistence.loadAll = async () => {
+      throw new Error('identity registry unavailable')
     }
     const inner = createNotariumStore({ notesDir: root })
     const innerRead = inner.read.bind(inner)
@@ -318,25 +299,18 @@ describe('CachedStore(NotariumStore) — authoritative link identities', () => {
       materialized: true,
       deletedAt: null,
     }
-    const rows = new Map([[owner.id, { ...owner }]])
+    const identityPersistence = new InMemoryIdentity([owner])
+    const rows = identityPersistence.rows
+    const loadAll = identityPersistence.loadAll.bind(identityPersistence)
     let loads = 0
-    const identityPersistence: IdentityPersistence = {
-      init: async () => {},
-      loadAll: async () => {
-        loads++
-        if (loads === 1) {
-          throw new Error('transient select failure')
-        }
 
-        return [...rows.values()].map((record) => ({ ...record }))
-      },
-      upsertMany: async (records) => {
-        for (const record of records) {
-          rows.set(record.id, { ...record })
-        }
-      },
-      findById: async (id) => rows.get(id) ?? null,
-      close: async () => {},
+    identityPersistence.loadAll = async (space) => {
+      loads++
+      if (loads === 1) {
+        throw new Error('transient select failure')
+      }
+
+      return loadAll(space)
     }
     const store = new CachedStore({
       inner: createNotariumStore({ notesDir: root }),
@@ -380,19 +354,11 @@ describe('CachedStore(NotariumStore) — authoritative link identities', () => {
       materialized: true,
       deletedAt: null,
     }
-    const rows = new Map([[owner.id, { ...owner }]])
-    const identityPersistence: IdentityPersistence = {
-      init: async () => {},
-      loadAll: async () => {
-        throw new Error('identity registry unavailable')
-      },
-      upsertMany: async (records) => {
-        for (const record of records) {
-          rows.set(record.id, { ...record })
-        }
-      },
-      findById: async (id) => rows.get(id) ?? null,
-      close: async () => {},
+    const identityPersistence = new InMemoryIdentity([owner])
+    const rows = identityPersistence.rows
+
+    identityPersistence.loadAll = async () => {
+      throw new Error('identity registry unavailable')
     }
     const inner = createNotariumStore({ notesDir: root })
     const innerRead = inner.read.bind(inner)
@@ -606,21 +572,25 @@ describe('CachedStore(NotariumStore) — authoritative link identities', () => {
 
   it('does not publish a poll rekey until its global identity route is durable', async () => {
     const root = mkdtempSync(join(tmpdir(), 'notarium-cached-poll-durability-'))
-    const durable = new Map<string, IdentityRecord>()
+    const identityPersistence = new InMemoryIdentity()
+    const durable = identityPersistence.rows
+    const claimMany = identityPersistence.claimMany.bind(identityPersistence)
+    const settleFileClaim = identityPersistence.settleFileClaim.bind(identityPersistence)
     let rejectDurableId = false
-    const identityPersistence: IdentityPersistence = {
-      init: async () => {},
-      loadAll: async () => [...durable.values()].map((record) => ({ ...record })),
-      upsertMany: async (records) => {
-        if (rejectDurableId && records.some((record) => record.id === 'external-durable-id')) {
-          throw new Error('meta db unavailable')
-        }
-        for (const record of records) {
-          durable.set(record.id, { ...record })
-        }
-      },
-      findById: async (id) => durable.get(id) ?? null,
-      close: async () => {},
+
+    identityPersistence.claimMany = async (records) => {
+      if (rejectDurableId && records.some((record) => record.id === 'external-durable-id')) {
+        throw new Error('meta db unavailable')
+      }
+
+      return claimMany(records)
+    }
+    identityPersistence.settleFileClaim = async (claim) => {
+      if (rejectDurableId && claim.observedId === 'external-durable-id') {
+        throw new Error('meta db unavailable')
+      }
+
+      return settleFileClaim(claim)
     }
     const inner = createNotariumStore({ notesDir: root })
     const store = new CachedStore({

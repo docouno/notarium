@@ -18,6 +18,7 @@ export const createAuthFacet = (ctx: PgDriverCtx): AuthPersistence => ({
       await client.query('BEGIN')
       // Both load-bearing: the advisory lock serializes concurrent setups so the NOT EXISTS guard can't race two first-run inserts.
       // canon: docs/auth.md#deployment-the-single-instance-invariant
+      // eslint-disable-next-line no-restricted-syntax -- outside the note-identity hierarchy: first-run setup, no tier below it
       await client.query('SELECT pg_advisory_xact_lock($1)', [SETUP_LOCK_KEY])
       const res = await client.query(
         `INSERT INTO users (username, display_name, password_hash, admin, disabled_at, created_at, personal_space)

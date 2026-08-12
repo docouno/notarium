@@ -1,7 +1,7 @@
 import { z } from 'zod'
 import { AGENT_SESSION_ATTACH } from '../../../consts/audit'
 import { enumValues } from '../../../libs/enumValues'
-import { RevisionKindSchema } from '../../primitives'
+import { RevisionKindSchema, RevisionUnavailableReasonSchema } from '../../primitives'
 import { AgentAuditAggregatesSchema, AgentRetrievalEventSchema } from './audit'
 
 export const AgentSessionAttachSchema = z.enum(enumValues(AGENT_SESSION_ATTACH))
@@ -71,6 +71,9 @@ export const AgentSessionWriteEventSchema = z.object({
   title: z.string(),
   class: z.string().nullable(),
   revisionKind: RevisionKindSchema,
+  /** A journal GAP — see `RevisionUnavailableReasonSchema`. The write still counts
+   *  and keeps its place in the session's timeline. */
+  unavailableReason: RevisionUnavailableReasonSchema.optional(),
 })
 
 export const AgentSessionEventSchema = z.discriminatedUnion('type', [

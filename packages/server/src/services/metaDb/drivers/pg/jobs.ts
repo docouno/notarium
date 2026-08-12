@@ -32,6 +32,7 @@ export const createJobsFacet = (ctx: PgDriverCtx): JobsPersistence => ({
       return null
     }
     const res = await ctx.required.query(
+      // eslint-disable-next-line no-restricted-syntax -- outside the note-identity hierarchy: a single-statement queue claim, holding nothing else
       `UPDATE jobs SET
            status = 'running',
            locked_by = $1,

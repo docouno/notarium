@@ -35,6 +35,7 @@ import {
   NOTE_SORT as ContractNoteSort,
   RESOLVED_VIA as ContractResolvedVia,
   REVISION_KIND as ContractRevisionKind,
+  REVISION_UNAVAILABLE_REASON as ContractRevisionUnavailableReason,
   SCAN_PHASE as ContractScanPhase,
 } from '@notarium/contract'
 // EDIT_OPERATION lives on contract's `./tools` subpath (the MCP tool surface),
@@ -51,6 +52,7 @@ import {
   NOTE_SORT as CoreNoteSort,
   RESOLVED_VIA as CoreResolvedVia,
   REVISION_KIND as CoreRevisionKind,
+  REVISION_UNAVAILABLE_REASON as CoreRevisionUnavailableReason,
   SCAN_PHASE as CoreScanPhase,
 } from '@notarium/core'
 
@@ -61,6 +63,7 @@ const identicalPairs: ReadonlyArray<
   ['AGENT_SESSION_ATTACH', CoreAgentSessionAttach, ContractAgentSessionAttach],
   ['SCAN_PHASE', CoreScanPhase, ContractScanPhase],
   ['REVISION_KIND', CoreRevisionKind, ContractRevisionKind],
+  ['REVISION_UNAVAILABLE_REASON', CoreRevisionUnavailableReason, ContractRevisionUnavailableReason],
   ['NOTE_SORT', CoreNoteSort, ContractNoteSort],
   ['BUCKET_GRAN', CoreBucketGran, ContractBucketGran],
   ['DATE_FIELD', CoreDateField, ContractDateField],

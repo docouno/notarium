@@ -207,4 +207,45 @@ describe('MutationCoordinator', () => {
       'released',
     )
   })
+
+  // Claims are not re-entrant and the queue is fair, so a task that takes one
+  // while holding another can wait forever behind a waiter that wants what it
+  // holds. Work reachable from BOTH a claimed and an unclaimed caller — the
+  // identity drain — has to be able to tell the two apart at run time.
+  it('reports whether the caller already holds a lease', async () => {
+    const coordinator = new MutationCoordinator()
+
+    expect(coordinator.holds()).toBe(false)
+    await coordinator.run({ noteIds: ['a'] }, async () => {
+      expect(coordinator.holds()).toBe(true)
+      // Across an await, and inside a nested async call — the whole chain counts.
+      await Promise.resolve()
+      await (async () => expect(coordinator.holds()).toBe(true))()
+    })
+    expect(coordinator.holds()).toBe(false)
+
+    // A lease held by SOMEONE ELSE is not this caller's lease: answering yes
+    // there would send an unclaimed drain through under a stranger's claim.
+    let outside: boolean | undefined
+    const holding = coordinator.run({ noteIds: ['b'] }, async () => {
+      outside = await Promise.resolve().then(() => coordinator.holds())
+      await new Promise((done) => setTimeout(done, 5))
+    })
+
+    expect(coordinator.holds()).toBe(false)
+    await holding
+    expect(outside).toBe(true)
+  })
+
+  it('reports a runStable lease the same way', async () => {
+    const coordinator = new MutationCoordinator()
+
+    await coordinator.runStable(
+      () => ({ noteIds: ['a'] }),
+      async () => {
+        expect(coordinator.holds()).toBe(true)
+      },
+    )
+    expect(coordinator.holds()).toBe(false)
+  })
 })

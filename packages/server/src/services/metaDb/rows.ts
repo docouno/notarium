@@ -1,7 +1,14 @@
 // Row↔record mappers shared by the SQLite and Postgres driver twins.
 
-import { AGENT_SESSION_ATTACH } from '@notarium/core'
+import {
+  AGENT_SESSION_ATTACH,
+  REVISION_INTEGRITY,
+  REVISION_UNAVAILABLE_REASON,
+  REVISION_UNAVAILABLE_TITLE,
+  type RevisionKind,
+} from '@notarium/core'
 import type {
+  AgentSessionAuditEvent,
   ContextOrderEntryKind,
   ContextOrderRecord,
   ContextSetAttachmentRecord,
@@ -492,3 +499,57 @@ export const retrievalOfRow = (r: RetrievalRow): RetrievalLogRecord => ({
   hits: parseHits(r.hits),
   createdAt: r.created_at,
 })
+
+/** A raw session-audit event row: a retrieval, or a `note_revisions` write joined
+ *  into the same stream (the write-only columns are NULL on a retrieval row). */
+export type AuditEventRow = RetrievalRow & {
+  event_type: 'retrieval' | 'write'
+  source_rank: number
+  note_id: string | null
+  space: string | null
+  revision_kind: string | null
+  revision_title: string | null
+  revision_class: string | null
+  revision_integrity: string | null
+}
+
+type AuditWriteEvent = Extract<AgentSessionAuditEvent, { type: 'write' }>
+
+/** Serve a contaminated write as a GAP — the session audit's twin of `revisionGapOf`,
+ *  written once because the audit's shape is not a `Revision`. The write still
+ *  HAPPENED in this session: its linkage, time and revision kind stay exact so counts,
+ *  cursors and pages do not shift. What it was, and who is behind it, is withheld
+ *  (#327). canon: docs/core.md#identity */
+export const auditWriteGapOf = (e: AuditWriteEvent): AuditWriteEvent => ({
+  ...e,
+  principal: null,
+  agent: null,
+  title: REVISION_UNAVAILABLE_TITLE,
+  class: null,
+  unavailableReason: REVISION_UNAVAILABLE_REASON.identityConflict,
+})
+
+/** The ONE place a stored audit row becomes a served event, for both driver twins. */
+export const auditEventOfRow = (r: AuditEventRow): AgentSessionAuditEvent => {
+  if (r.event_type === 'retrieval') {
+    return { type: 'retrieval', record: retrievalOfRow(r) }
+  }
+  const write: AuditWriteEvent = {
+    type: 'write',
+    id: String(r.id),
+    at: r.created_at,
+    principal: r.principal,
+    agent: r.agent,
+    sessionAttach:
+      r.session_attach === AGENT_SESSION_ATTACH.declared ||
+      r.session_attach === AGENT_SESSION_ATTACH.inferred
+        ? r.session_attach
+        : null,
+    noteId: r.note_id ?? '',
+    space: r.space ?? '',
+    title: r.revision_title ?? '',
+    class: r.revision_class,
+    revisionKind: r.revision_kind as RevisionKind,
+  }
+  return r.revision_integrity === REVISION_INTEGRITY.quarantined ? auditWriteGapOf(write) : write
+}

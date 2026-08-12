@@ -261,6 +261,23 @@ export type ExternalRewriteDecl = {
   replacements: Array<{ from: string; to: string }>
 }
 
+/** One CROSS-SPACE id collision written straight onto disk after the production
+ *  write timeline (#327): `note`'s `notarium-id` frontmatter is replaced with the
+ *  id `claimFrom` actually got, so two spaces' files claim one id — the shape a
+ *  copied vault folder produces, and the one that used to make ownership depend
+ *  on the poll order. Real applier only: the ids are not known until the timeline
+ *  has run, and both are the same length, so the rewrite preserves size + mtime
+ *  exactly like ExternalRewriteDecl.
+ *
+ *  The FAKE stand shows the converged end state (two distinct ids) and does not
+ *  simulate the race — a fixture has no arbiter to run.  */
+export type ExternalIdentityClaimDecl = {
+  /** The claimant: the file whose frontmatter is overwritten. */
+  note: string
+  /** The note whose durable id the claimant will (wrongly) claim. */
+  claimFrom: string
+}
+
 /** One operation on a note, at a chosen instant. `noteId` is a LOGICAL handle
  *  that correlates a note's create→edit→delete→restore across the timeline; the
  *  real applier maps it to the note's real `notarium-id` after the first create.
@@ -316,6 +333,12 @@ export type CaseEvent = (
       title?: string
       tags?: string[]
       principal?: string
+      /** Seed this revision as a journal GAP (#327) — the state a settled
+       *  cross-space collision leaves behind. Only the FAKE stand can honour it: a
+       *  quarantine is decided inside the real meta-DB's settlement transaction, so
+       *  the real applier replays an ordinary edit and lets the arbiter reach the
+       *  same row itself. canon: docs/seeds.md */
+      unavailable?: boolean
     }
   | { op: 'delete'; date: CaseDate; space: string; noteId: string; principal?: string }
   | { op: 'restore'; date: CaseDate; space: string; noteId: string; principal?: string }
@@ -407,6 +430,8 @@ export type CaseWorld = {
   durableImports?: DurableImportDecl[]
   /** Same-size, mtime-preserving direct file rewrites (#267). */
   externalRewrites?: ExternalRewriteDecl[]
+  /** Cross-space `notarium-id` collisions planted on disk (#327), real applier only. */
+  externalIdentityClaims?: ExternalIdentityClaimDecl[]
 }
 
 /** What a case's `build` receives: a seeded RNG (reproducible), a scale knob

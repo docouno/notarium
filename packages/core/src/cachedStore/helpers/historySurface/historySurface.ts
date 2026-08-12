@@ -67,9 +67,11 @@ export class HistorySurface {
    *  revision-id cursor, collapsed to one entry per note. CLASS-SCOPED here at the
    *  read-model chokepoint exactly like the discovery surfaces: it excludes
    *  the classes NOT admitted by scope:'user' (agent-memory, …) — the same set the
-   *  index (list({scope:'user'})) carries — so a hidden-class note can never
-   *  surface in the delta regardless of which space it is computed over (a
-   *  personal domain, a project agent-mount). The journal filters IN the query, so
+   *  index (list({scope:'user'})) carries — so a hidden-class note's CONTENT can
+   *  never surface in the delta regardless of which space it is computed over (a
+   *  personal domain, a project agent-mount). A journal GAP is the one entry that
+   *  survives the class filter: its class is withheld, so there is no raw column to
+   *  filter on and nothing readable to leak (#327). The journal filters IN the query, so
    *  `total` and the acknowledge cursor (`maxRevId`) stay accurate. A bare engine
    *  lacks the journal (the wire surface degrades). */
   async revisionsSince(

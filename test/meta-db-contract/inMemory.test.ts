@@ -4,11 +4,13 @@ import { InMemoryRevisionPersistence, type RevisionInput } from '@notarium/core'
 
 import { InMemoryAgentDeltaCursors } from '../fake-server/agentDeltaCursors'
 import { InMemoryAgentSessions } from '../fake-server/agentSessions'
+import { InMemoryFavorites } from '../fake-server/favorites'
 import { InMemoryFolders } from '../fake-server/folders'
 import { InMemoryGatewayState } from '../fake-server/gatewayState'
 import { InMemoryProjects } from '../fake-server/projects'
 import { describeAgentDeltaCursorsContract } from './agentDeltaCursorsContract'
 import { describeAgentSessionsContract } from './agentSessionsContract'
+import { describeFavoritesContract } from './favoritesContract'
 import { describeGatewayStateContract } from './gatewayStateContract'
 import { describeRevisionPersistenceContract } from './revisionPersistenceContract'
 
@@ -30,9 +32,17 @@ describeAgentSessionsContract('in-memory twin', async () => ({
   persistence: new InMemoryAgentSessions(),
 }))
 
-describeRevisionPersistenceContract('in-memory twin', async () => ({
-  persistence: new InMemoryRevisionPersistence(),
-}))
+describeFavoritesContract('in-memory twin', async () => ({ persistence: new InMemoryFavorites() }))
+
+describeRevisionPersistenceContract('in-memory twin', async () => {
+  const persistence = new InMemoryRevisionPersistence()
+  return {
+    persistence,
+    quarantine: async (revisionIds) => {
+      persistence.quarantineForTest(revisionIds)
+    },
+  }
+})
 
 describe('in-memory revision test reset', () => {
   it('clear removes terminal fences before the next fake-server seed', async () => {
@@ -44,6 +54,7 @@ describe('in-memory revision test reset', () => {
       theirRevisionId: null,
       sourceRevisionId: null,
       kind: 'write',
+      entryRole: 'origin',
       principal: 'ui',
       contentHash: 'reseeded-hash',
       title: 'Reseeded',
@@ -56,7 +67,7 @@ describe('in-memory revision test reset', () => {
     }
 
     await persistence.append(input, 'before reset')
-    await persistence.purgeNotes([input.noteId])
+    await persistence.purgeNotes(input.space, [input.noteId])
     await expect(persistence.append(input, 'late')).rejects.toThrow(/permanently purged/)
 
     persistence.clear()

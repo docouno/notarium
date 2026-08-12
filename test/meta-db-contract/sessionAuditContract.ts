@@ -45,6 +45,7 @@ const revision = (over: Partial<RevisionInput> = {}): RevisionInput => ({
   theirRevisionId: null,
   sourceRevisionId: null,
   kind: 'write',
+  entryRole: 'origin',
   principal: 'pat:alice:cli',
   contentHash: 'audit-write-hash',
   title: 'Changed note',

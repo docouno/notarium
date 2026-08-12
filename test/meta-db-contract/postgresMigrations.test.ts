@@ -61,7 +61,7 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
 
     try {
       await Promise.all([testSchema.db.identity.init(), peer.identity.init()])
-      await testSchema.db.identity.upsertMany([
+      await testSchema.db.identity.claimMany([
         {
           id: 'id-concurrent',
           filePath: 'concurrent.md',
@@ -114,6 +114,106 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
         ['ses_existingv1aa'],
       )
       expect(result.rows).toEqual([{ owner: 'alice', name: 'Existing', calls: '7', role: null }])
+    } finally {
+      client.release()
+      await pool.end()
+    }
+  })
+
+  it('backfills the entry role by class, and leaves a cross-space legacy first row alone', async () => {
+    // Twin of the SQLite case in test/unit/metaDbMigrations.test.ts. Same text in both
+    // assets on purpose: the backfill defines a rule, and two spellings of one rule
+    // drift. The third row is why `base_rev IS NULL` survives in it — pre-#327 the
+    // chain ignored the space, so a note's first row here can point at another one.
+    const testSchema = await createSchema('migration_entry_role')
+    const pool = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const client = await pool.connect()
+
+    try {
+      await runPgMigrations(client, migrations.slice(0, 5))
+      const append = (noteId: string, space: string, baseRev: number | null, kind: string) =>
+        client.query(
+          `INSERT INTO note_revisions
+             (note_id, space, base_rev, kind, principal, title, tags, created_at, integrity)
+           VALUES ($1, $2, $3, $4, 'ui', 'T', '[]', '2026-06-10T10:00:00.000Z', 'trusted')`,
+          [noteId, space, baseRev, kind],
+        )
+
+      await append('seen-first', 'alpha', null, 'external')
+      await append('seen-first', 'alpha', 1, 'write')
+      await append('born-here', 'alpha', null, 'write')
+      await append('chained-elsewhere', 'alpha', 999, 'write')
+      await append('seen-first', 'beta', null, 'write')
+
+      await runPgMigrations(client, migrations)
+
+      const result = await client.query(
+        'SELECT note_id, space, base_rev::int AS base_rev, entry_role FROM note_revisions ORDER BY id',
+      )
+
+      expect(result.rows).toEqual([
+        { note_id: 'seen-first', space: 'alpha', base_rev: null, entry_role: 'baseline' },
+        { note_id: 'seen-first', space: 'alpha', base_rev: 1, entry_role: 'change' },
+        { note_id: 'born-here', space: 'alpha', base_rev: null, entry_role: 'origin' },
+        { note_id: 'chained-elsewhere', space: 'alpha', base_rev: 999, entry_role: 'change' },
+        { note_id: 'seen-first', space: 'beta', base_rev: null, entry_role: 'origin' },
+      ])
+      await expect(
+        client.query(
+          `INSERT INTO note_revisions
+             (note_id, space, kind, principal, title, tags, created_at, integrity, entry_role)
+           VALUES ('x', 'alpha', 'write', 'ui', 'T', '[]', 'now', 'trusted', 'first')`,
+        ),
+      ).rejects.toThrow(/check constraint/i)
+    } finally {
+      client.release()
+      await pool.end()
+    }
+  })
+
+  it('keeps a pre-#327 purge fence global while scoping every new one', async () => {
+    // Twin of the SQLite case in test/unit/metaDbMigrations.test.ts: the fence used to be
+    // keyed by note id alone while the DELETE beside it was already space-scoped, so one
+    // space's trash-emptying permanently silenced a colliding id in ANOTHER space. Scoping
+    // it cannot be retroactive: a purge already decided must not be re-opened by an upgrade.
+    const testSchema = await createSchema('migration_scoped_fences')
+    const pool = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const client = await pool.connect()
+
+    try {
+      await runPgMigrations(client, migrations.slice(0, 4))
+      await client.query(
+        `INSERT INTO revision_purge_fences (kind, entity_id) VALUES ('note', $1)`,
+        ['legacy-note'],
+      )
+
+      await runPgMigrations(client, migrations)
+
+      const fences = await client.query(
+        'SELECT kind, entity_id, space FROM revision_purge_fences ORDER BY entity_id',
+      )
+      expect(fences.rows).toEqual([{ kind: 'note', entity_id: 'legacy-note', space: '' }])
+
+      const append = (noteId: string, space: string): Promise<unknown> =>
+        client.query(
+          `INSERT INTO note_revisions
+             (note_id, space, kind, principal, title, tags, created_at, integrity)
+           VALUES ($1, $2, 'write', 'ui', 'T', '[]', 'now', 'trusted')`,
+          [noteId, space],
+        )
+
+      // The legacy fence stays GLOBAL: it was decided when ids were not yet global, so it
+      // cannot be narrowed to a space nobody recorded.
+      await expect(append('legacy-note', 'alpha')).rejects.toThrow(/permanently purged/)
+      await expect(append('legacy-note', 'beta')).rejects.toThrow(/permanently purged/)
+
+      // A fence written AFTER the upgrade binds only its own space.
+      await client.query(
+        `INSERT INTO revision_purge_fences (kind, entity_id, space) VALUES ('note', $1, $2)`,
+        ['shared-note', 'alpha'],
+      )
+      await expect(append('shared-note', 'alpha')).rejects.toThrow(/permanently purged/)
+      await expect(append('shared-note', 'beta')).resolves.toBeDefined()
     } finally {
       client.release()
       await pool.end()
@@ -521,7 +621,7 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
 
     try {
       await initial.identity.init()
-      await initial.identity.upsertMany([
+      await initial.identity.claimMany([
         {
           id: 'id-before-search-path-shift',
           filePath: 'before.md',
@@ -559,7 +659,7 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
     const db = new PgMetaDb(shiftedUrl.toString())
 
     try {
-      await db.identity.upsertMany([
+      await db.identity.claimMany([
         {
           id: 'real-row',
           filePath: 'real.md',

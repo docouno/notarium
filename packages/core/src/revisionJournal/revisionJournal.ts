@@ -8,8 +8,10 @@ import {
   type ActivityNoteCount,
   type AuthorFilter,
   type Revision,
+  REVISION_ENTRY_ROLE,
   REVISION_KIND,
   type RevisionDetail,
+  type RevisionEntryRole,
   type RevisionInput,
   type RevisionPersistence,
 } from '../knowledgeStore'
@@ -58,7 +60,7 @@ export class RevisionJournal {
     opts: { offset: number; limit: number },
   ): Promise<{ items: Revision[]; total: number }> {
     await this.ensureInit()
-    return this.persistence.listByNote(noteId, opts)
+    return this.persistence.listByNote(this.space, noteId, opts)
   }
 
   /** The cursor-based delta (start_session) for THIS journal's space: notes
@@ -130,21 +132,23 @@ export class RevisionJournal {
   async purge(noteIds: readonly string[]): Promise<void> {
     await this.ensureInit()
     await this.drain()
-    return this.persistence.purgeNotes(noteIds)
+    return this.persistence.purgeNotes(this.space, noteIds)
   }
 
   /** Whether the note has any journaled state — what gates the pre-edit
-   *  baseline capture in the store's write path. */
+   *  baseline capture in the store's write path. A quarantined chain COUNTS: the
+   *  note has a history, it just cannot be read, and capturing a fresh
+   *  "baseline" over it would invent one (#327). */
   async hasHistory(noteId: string): Promise<boolean> {
     await this.ensureInit()
-    return (await this.persistence.latestFor(noteId)) != null
+    return this.persistence.hasAnyFor(this.space, noteId)
   }
 
   /** The note's newest revision — what tells the trash whether the note is
    *  currently deleted (newest is a delete-tombstone) or live again. */
   async latestFor(noteId: string): Promise<Revision | null> {
     await this.ensureInit()
-    return this.persistence.latestFor(noteId)
+    return this.persistence.latestFor(this.space, noteId)
   }
 
   /** Newest rows for a set of notes after settling only those notes' queued appends. */
@@ -152,14 +156,14 @@ export class RevisionJournal {
     await this.ensureInit()
     const ids = [...new Set(noteIds)]
     await Promise.all(ids.map((noteId) => this.drain(noteId)))
-    return this.persistence.latestForMany(ids)
+    return this.persistence.latestForMany(this.space, ids)
   }
 
   /** One revision with its blob, scope-checked against the note id — a
    *  revision is addressable only through its own note. */
   async detail(noteId: string, revisionId: string): Promise<RevisionDetail | null> {
     await this.ensureInit()
-    const rev = await this.persistence.get(revisionId)
+    const rev = await this.persistence.get(this.space, revisionId)
 
     if (!rev || rev.noteId !== noteId) {
       return null
@@ -200,7 +204,7 @@ export class RevisionJournal {
 
   private async append(input: JournalRecordInput): Promise<Revision | null> {
     await this.ensureInit()
-    let latest = await this.persistence.latestFor(input.noteId)
+    let latest = await this.persistence.latestFor(this.space, input.noteId)
 
     // The pre-edit baseline: the very first journaled write of a note captures
     // the state it found (the CAS verify-read had the body in hand anyway).
@@ -218,12 +222,12 @@ export class RevisionJournal {
         // — so restoring the baseline brings its custom slug back too.
         slug: input.baseline.slug,
       }
-      const baselineRev = await this.revisionOf(baselineInput, null)
+      const baselineRev = await this.revisionOf(baselineInput, null, REVISION_ENTRY_ROLE.baseline)
       await this.stampStats(baselineRev, baselineInput, null)
       latest = await this.persistence.append(baselineRev, input.baseline.content)
     }
 
-    const rev = await this.revisionOf(input, latest)
+    const rev = await this.revisionOf(input, latest, await this.roleOf(input, latest))
 
     if (input.kind === REVISION_KIND.delete) {
       // A delete journals once; the tombstone keeps the last known hash so an
@@ -284,9 +288,34 @@ export class RevisionJournal {
     }
   }
 
+  /** What this entry IS in the note's life. The WRITER decides it here, once, and
+   *  stores it on the row; no reader ever infers it again.
+   *
+   *  The question is "does the journal hold ANY row for this note", and it is
+   *  `hasAnyFor` — trusted AND quarantined — not `latestFor`, which is trusted-only.
+   *  The two diverged the moment this task's quarantine landed: after it, a note with
+   *  a contaminated past has no trusted latest, and calling its next edit an `origin`
+   *  would announce a birth that never happened. The query costs one round trip once
+   *  in a note's life: it is asked only when there is no trusted latest at all. */
+  private async roleOf(
+    input: JournalRecordInput,
+    latest: Revision | null,
+  ): Promise<RevisionEntryRole> {
+    if (latest || (await this.persistence.hasAnyFor(this.space, input.noteId))) {
+      return REVISION_ENTRY_ROLE.change
+    }
+
+    // First entry ever. Arriving from outside makes it a first sighting of a note
+    // that already existed; arriving through us makes it the note's origin.
+    return input.kind === REVISION_KIND.external
+      ? REVISION_ENTRY_ROLE.baseline
+      : REVISION_ENTRY_ROLE.origin
+  }
+
   private async revisionOf(
     input: JournalRecordInput,
     latest: Revision | null,
+    entryRole: RevisionEntryRole,
   ): Promise<RevisionInput> {
     const carriedTags = input.tags ?? latest?.tags ?? []
     return {
@@ -296,6 +325,7 @@ export class RevisionJournal {
       theirRevisionId: null,
       sourceRevisionId: input.sourceRevisionId ?? null,
       kind: input.kind,
+      entryRole,
       principal: input.principal,
       agent: input.agent ?? null,
       contentHash:

@@ -66,7 +66,7 @@ import type { CaseWorld, ContextSetAttachDecl, UserDecl } from '../test/cases'
 import { normDate } from '../test/cases/generators'
 import { agentSessionId } from '../test/cases/sessionIds'
 import { seedDurableImports } from './seedDurableImports'
-import { applySeedExternalRewrites } from './seedExternalRewrites'
+import { applySeedExternalRewrites, identityClaimRewrite } from './seedExternalRewrites'
 import {
   makeOwnerRemap,
   resolveSeedAgentActivityOwner,
@@ -817,7 +817,14 @@ const run = async (): Promise<void> => {
           `not project space ${cursor.project.space}`,
       )
     }
-    const revision = (await metaDb.revisions.listByNote(note.id, { offset: 0, limit: 1 })).items[0]
+    const cursorSpaceId = idOf.get(cursor.project.space)
+
+    if (!cursorSpaceId) {
+      throw new Error(`agent delta cursor references unknown space: ${cursor.project.space}`)
+    }
+    const revision = (
+      await metaDb.revisions.listByNote(cursorSpaceId, note.id, { offset: 0, limit: 1 })
+    ).items[0]
 
     if (!revision) {
       throw new Error(`agent delta cursor note has no journal revision: ${cursor.throughNote}`)
@@ -1220,8 +1227,14 @@ const run = async (): Promise<void> => {
   //    no store API, same size, restored mtime. Watch + polling are disabled in
   //    this seed process, so the restarted production server must reconcile the
   //    changed cheap token/source hash and repair list/search/graph itself.
+  // A cross-space id collision is an external rewrite whose replacement is only
+  // knowable after the timeline ran: both ids are minted by the production write
+  // path, and both are the same length, so size and mtime survive (#327).
+  const identityClaims = (world.externalIdentityClaims ?? []).map((claim) =>
+    identityClaimRewrite(claim, (handle) => live.get(handle)?.id),
+  )
   const externalRewrites = await applySeedExternalRewrites(
-    (world.externalRewrites ?? []).map((rewrite) => {
+    [...(world.externalRewrites ?? []), ...identityClaims].map((rewrite) => {
       const note = live.get(rewrite.note)
 
       if (!note) {

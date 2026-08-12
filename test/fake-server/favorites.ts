@@ -52,8 +52,21 @@ export class InMemoryFavorites implements FavoritesPersistence {
     return this.rows.has(this.key(owner, space, kind, entityId))
   }
 
-  async add(record: FavoriteRecord): Promise<void> {
+  async add(record: FavoriteRecord): Promise<FavoriteRecord> {
+    // Same entity under another kind is REPLACED, as in both drivers: a favorited
+    // folder later surfaced as a project keeps one row, not two.
+    for (const [key, row] of this.rows) {
+      if (
+        row.owner === record.owner &&
+        row.space === record.space &&
+        row.entityId === record.entityId &&
+        row.kind !== record.kind
+      ) {
+        this.rows.delete(key)
+      }
+    }
     this.rows.set(this.key(record.owner, record.space, record.kind, record.entityId), { ...record })
+    return { ...record }
   }
 
   async remove(

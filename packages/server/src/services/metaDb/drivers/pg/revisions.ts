@@ -2,11 +2,22 @@ import {
   AGENT_SESSION_ATTACH,
   type AuthorFilter,
   type Revision,
+  REVISION_INTEGRITY,
+  revisionGapOf,
   type RevisionInput,
   type RevisionPersistence,
 } from '@notarium/core'
 
+import {
+  effectiveAuthorClause,
+  effectiveClassClause,
+  notSyntheticBaselineClause,
+  ORIGIN_ONLY,
+  QUARANTINED,
+  TRUSTED_ONLY,
+} from '../../revisionProjection'
 import type { PgDriverCtx } from './context'
+import { lockRevisionWideScan } from './lockOrder'
 import { lockRevisionKeys } from './revisionLocks'
 
 type RevisionRow = {
@@ -31,6 +42,8 @@ type RevisionRow = {
   created_at: string
   chars_added: string | number | null
   chars_removed: string | number | null
+  integrity: string | null
+  entry_role: string
 }
 
 type RevisionDeltaRow = RevisionRow & {
@@ -38,7 +51,15 @@ type RevisionDeltaRow = RevisionRow & {
   contract_total: string | number
 }
 
-const revisionOfRow = (r: RevisionRow): Revision => ({
+/** The ONE place a stored row becomes a served row — the SQLite twin's rule: a
+ *  contaminated chain is handed out as a gap here, and the queries below classify
+ *  and filter on effective values so no raw column leaks through a predicate. */
+const revisionOfRow = (r: RevisionRow): Revision =>
+  r.integrity === REVISION_INTEGRITY.quarantined
+    ? revisionGapOf(rawRevisionOfRow(r))
+    : rawRevisionOfRow(r)
+
+const rawRevisionOfRow = (r: RevisionRow): Revision => ({
   id: String(r.id),
   noteId: r.note_id,
   space: r.space,
@@ -46,6 +67,7 @@ const revisionOfRow = (r: RevisionRow): Revision => ({
   theirRevisionId: r.their_rev == null ? null : String(r.their_rev),
   sourceRevisionId: r.source_rev == null ? null : String(r.source_rev),
   kind: r.kind as Revision['kind'],
+  entryRole: r.entry_role as Revision['entryRole'],
   principal: r.principal,
   ...(r.agent_owner
     ? {
@@ -97,8 +119,17 @@ const authorClausePg = (author: AuthorFilter | undefined, params: unknown[]): st
     parts.push(`principal LIKE $${params.length}`)
   }
 
-  return parts.length ? ` AND (${parts.join(' OR ')})` : ' AND false'
+  return effectiveAuthorClause(parts)
 }
+
+/** Class exclusion over the effective class — see `revisionProjection`. */
+const classFilterPg = (excludeClasses: readonly string[], params: unknown[]): string =>
+  effectiveClassClause(
+    excludeClasses.map((c) => {
+      params.push(c)
+      return `$${params.length}`
+    }),
+  )
 
 export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => ({
   init: () => ctx.ensureInit(),
@@ -139,7 +170,7 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
       const fence = await client.query(
         `SELECT kind FROM revision_purge_fences
           WHERE (kind = 'space' AND entity_id = $1)
-             OR (kind = 'note' AND entity_id = $2)
+             OR (kind = 'note' AND entity_id = $2 AND space IN ('', $1))
           LIMIT 1`,
         [rev.space, rev.noteId],
       )
@@ -149,8 +180,8 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
       }
       const res = await client.query(
         `INSERT INTO note_revisions
-             (note_id, space, base_rev, their_rev, source_rev, kind, principal, agent_owner, agent_name, session_id, session_name, session_attach, content_hash, title, class, slug, tags, created_at, chars_added, chars_removed)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+             (note_id, space, base_rev, their_rev, source_rev, kind, entry_role, principal, agent_owner, agent_name, session_id, session_name, session_attach, content_hash, title, class, slug, tags, created_at, chars_added, chars_removed, integrity)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
            RETURNING id`,
         [
           rev.noteId,
@@ -159,6 +190,7 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
           rev.theirRevisionId,
           rev.sourceRevisionId,
           rev.kind,
+          rev.entryRole,
           rev.principal,
           rev.agent?.owner ?? null,
           rev.agent?.agent ?? null,
@@ -173,6 +205,7 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
           rev.createdAt,
           rev.charsAdded,
           rev.charsRemoved,
+          REVISION_INTEGRITY.trusted,
         ],
       )
       await client.query('COMMIT')
@@ -184,14 +217,17 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
       client.release()
     }
   },
-  listByNote: async (noteId, { offset, limit }) => {
+  listByNote: async (space, noteId, { offset, limit }) => {
     await ctx.ensureInit()
     const [rows, count] = await Promise.all([
       ctx.required.query(
-        'SELECT * FROM note_revisions WHERE note_id = $1 ORDER BY id DESC LIMIT $2 OFFSET $3',
-        [noteId, limit, offset],
+        'SELECT * FROM note_revisions WHERE space = $1 AND note_id = $2 ORDER BY id DESC LIMIT $3 OFFSET $4',
+        [space, noteId, limit, offset],
       ),
-      ctx.required.query('SELECT COUNT(*) AS n FROM note_revisions WHERE note_id = $1', [noteId]),
+      ctx.required.query(
+        'SELECT COUNT(*) AS n FROM note_revisions WHERE space = $1 AND note_id = $2',
+        [space, noteId],
+      ),
     ])
     return {
       items: (rows.rows as RevisionRow[]).map(revisionOfRow),
@@ -204,10 +240,7 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
     // loses precision above 2^53 and can replay an acknowledged revision.
     const since = sinceRevId ?? '0'
     // Class filter runs in-SQL so window, distinct total and max id stay post-filter and consistent.
-    const exParams = excludeClasses.map((_, i) => `$${i + 3}`)
-    const exFilter = exParams.length
-      ? ` AND (class IS NULL OR class NOT IN (${exParams.join(',')}))`
-      : ''
+    const exFilter = effectiveClassClause(excludeClasses.map((_, i) => `$${i + 3}`))
     // One statement = one MVCC snapshot for page, total, and cursor high-water mark.
     // The aggregate is the left side so even LIMIT 0 / an empty window returns
     // one metadata row; a null page.id is filtered before row conversion.
@@ -243,40 +276,45 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
   activityByDay: async (space, { from, to, tzOffsetMinutes, excludeClasses = [], author }) => {
     await ctx.ensureInit()
     // created_at is ISO TEXT (cast ::timestamptz).
-    // Exclude the synthetic pre-edit baseline (external + base_rev NULL) so a first edit isn't double-counted.
+    // Exclude the rows the writer marked `baseline` so a first edit isn't double-counted.
     const params: unknown[] = [tzOffsetMinutes, space, from, to]
-    const exFilter = excludeClasses.length
-      ? ` AND (class IS NULL OR class NOT IN (${excludeClasses
-          .map((c) => {
-            params.push(c)
-            return `$${params.length}`
-          })
-          .join(',')}))`
-      : ''
+    const exFilter = classFilterPg(excludeClasses, params)
     const auFilter = authorClausePg(author, params)
+    // A gap is immune to the baseline suppression through the QUARANTINED disjunct,
+    // not through a missing parent: quarantine leaves the role alone, so a
+    // contaminated baseline still emits — as its own `unavailable` bucket.
+    // canon: docs/dashboard.md
     const res = await ctx.required.query(
       `SELECT to_char((created_at::timestamptz AT TIME ZONE 'UTC') + make_interval(mins => $1), 'YYYY-MM-DD') AS day,
-                SUM(CASE WHEN kind = 'delete' THEN 1 ELSE 0 END) AS deleted,
-                SUM(CASE WHEN kind <> 'delete' AND base_rev IS NULL THEN 1 ELSE 0 END) AS created,
-                SUM(CASE WHEN kind <> 'delete' AND base_rev IS NOT NULL THEN 1 ELSE 0 END) AS edited
+                SUM(CASE WHEN ${QUARANTINED} THEN 1 ELSE 0 END) AS unavailable,
+                SUM(CASE WHEN ${TRUSTED_ONLY} AND kind = 'delete' THEN 1 ELSE 0 END) AS deleted,
+                SUM(CASE WHEN ${TRUSTED_ONLY} AND kind <> 'delete' AND ${ORIGIN_ONLY} THEN 1 ELSE 0 END) AS created,
+                SUM(CASE WHEN ${TRUSTED_ONLY} AND kind <> 'delete' AND NOT (${ORIGIN_ONLY}) THEN 1 ELSE 0 END) AS edited
            FROM note_revisions
           WHERE space = $2 AND created_at >= $3 AND created_at < $4
-            AND NOT (kind = 'external' AND base_rev IS NULL)${exFilter}${auFilter}
+            AND ${notSyntheticBaselineClause}${exFilter}${auFilter}
           GROUP BY 1 ORDER BY 1 ASC`,
       params,
     )
     return (
-      res.rows as Array<{ day: string; created: string; edited: string; deleted: string }>
+      res.rows as Array<{
+        day: string
+        created: string
+        edited: string
+        deleted: string
+        unavailable: string
+      }>
     ).map((r) => ({
       date: r.day,
       created: Number(r.created),
       edited: Number(r.edited),
       deleted: Number(r.deleted),
+      unavailable: Number(r.unavailable),
     }))
   },
   activityEvents: async (space, { from, to, offset, limit, excludeClasses = [], author }) => {
     await ctx.ensureInit()
-    const where = ['space = $1', "NOT (kind = 'external' AND base_rev IS NULL)"]
+    const where = ['space = $1', notSyntheticBaselineClause]
     const params: unknown[] = [space]
 
     if (from != null) {
@@ -288,11 +326,7 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
       where.push(`created_at < $${params.length}`)
     }
     if (excludeClasses.length) {
-      const exParams = excludeClasses.map((c) => {
-        params.push(c)
-        return `$${params.length}`
-      })
-      where.push(`(class IS NULL OR class NOT IN (${exParams.join(',')}))`)
+      where.push(classFilterPg(excludeClasses, params).replace(/^ AND /, ''))
     }
     if (author) {
       // authorClausePg yields a leading ' AND '; strip it (this list is AND-joined), and push its
@@ -320,19 +354,12 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
   activityByNote: async (space, { from, to, excludeClasses = [] }) => {
     await ctx.ensureInit()
     const params: unknown[] = [space, from, to]
-    const exFilter = excludeClasses.length
-      ? ` AND (class IS NULL OR class NOT IN (${excludeClasses
-          .map((c) => {
-            params.push(c)
-            return `$${params.length}`
-          })
-          .join(',')}))`
-      : ''
+    const exFilter = classFilterPg(excludeClasses, params)
     const res = await ctx.required.query(
       `SELECT note_id, COUNT(*) AS n, MAX(created_at) AS last
            FROM note_revisions
           WHERE space = $1 AND created_at >= $2 AND created_at < $3
-            AND NOT (kind = 'external' AND base_rev IS NULL)${exFilter}
+            AND ${notSyntheticBaselineClause}${exFilter}
           GROUP BY note_id`,
       params,
     )
@@ -342,23 +369,34 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
       lastAt: r.last,
     }))
   },
-  get: async (revisionId) => {
+  get: async (space, revisionId) => {
     await ctx.ensureInit()
     if (!/^\d+$/.test(revisionId)) {
       return null
     }
-    const res = await ctx.required.query('SELECT * FROM note_revisions WHERE id = $1', [revisionId])
-    return res.rows[0] ? revisionOfRow(res.rows[0] as RevisionRow) : null
-  },
-  latestFor: async (noteId) => {
-    await ctx.ensureInit()
     const res = await ctx.required.query(
-      'SELECT * FROM note_revisions WHERE note_id = $1 ORDER BY id DESC LIMIT 1',
-      [noteId],
+      'SELECT * FROM note_revisions WHERE space = $1 AND id = $2',
+      [space, revisionId],
     )
     return res.rows[0] ? revisionOfRow(res.rows[0] as RevisionRow) : null
   },
-  latestForMany: async (noteIds) => {
+  hasAnyFor: async (space, noteId) => {
+    await ctx.ensureInit()
+    const res = await ctx.required.query(
+      'SELECT 1 FROM note_revisions WHERE space = $1 AND note_id = $2 LIMIT 1',
+      [space, noteId],
+    )
+    return res.rows.length > 0
+  },
+  latestFor: async (space, noteId) => {
+    await ctx.ensureInit()
+    const res = await ctx.required.query(
+      `SELECT * FROM note_revisions WHERE space = $1 AND note_id = $2 AND ${TRUSTED_ONLY} ORDER BY id DESC LIMIT 1`,
+      [space, noteId],
+    )
+    return res.rows[0] ? revisionOfRow(res.rows[0] as RevisionRow) : null
+  },
+  latestForMany: async (space, noteIds) => {
     await ctx.ensureInit()
     const ids = [...new Set(noteIds)]
 
@@ -368,9 +406,9 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
     const result = await ctx.required.query(
       `SELECT DISTINCT ON (note_id) *
          FROM note_revisions
-        WHERE note_id = ANY($1::text[])
+        WHERE space = $1 AND note_id = ANY($2::text[]) AND ${TRUSTED_ONLY}
         ORDER BY note_id, id DESC`,
-      [ids],
+      [space, ids],
     )
     const revisions = (result.rows as RevisionRow[]).map(revisionOfRow)
     return new Map(revisions.map((revision) => [revision.noteId, revision]))
@@ -379,13 +417,7 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
     await ctx.ensureInit()
     // Class filter runs BEFORE the per-note collapse (inside the subquery); title search AFTER it.
     const params: unknown[] = [space]
-    const exParams = excludeClasses.map((c) => {
-      params.push(c)
-      return `$${params.length}`
-    })
-    const exFilter = exParams.length
-      ? ` AND (class IS NULL OR class NOT IN (${exParams.join(',')}))`
-      : ''
+    const exFilter = classFilterPg(excludeClasses, params)
     const needle = q?.trim().toLowerCase()
     let qFilter = ''
 
@@ -402,21 +434,21 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
       ctx.required.query(
         `SELECT * FROM (
              SELECT *, ROW_NUMBER() OVER (PARTITION BY note_id ORDER BY id DESC) AS rn
-             FROM note_revisions WHERE space = $1${exFilter}
+             FROM note_revisions WHERE space = $1 AND ${TRUSTED_ONLY}${exFilter}
            ) t WHERE rn = 1 AND kind = 'delete'${qFilter} ORDER BY id DESC LIMIT ${limitParam} OFFSET ${offsetParam}`,
         params,
       ),
       ctx.required.query(
         `SELECT COUNT(*) AS n FROM (
              SELECT note_id, kind, title, ROW_NUMBER() OVER (PARTITION BY note_id ORDER BY id DESC) AS rn
-             FROM note_revisions WHERE space = $1${exFilter}
+             FROM note_revisions WHERE space = $1 AND ${TRUSTED_ONLY}${exFilter}
            ) t WHERE rn = 1 AND kind = 'delete'${qFilter}`,
         totalParams,
       ),
       ctx.required.query(
         `SELECT COUNT(*) AS n FROM (
              SELECT note_id, kind, title, content_hash, ROW_NUMBER() OVER (PARTITION BY note_id ORDER BY id DESC) AS rn
-             FROM note_revisions WHERE space = $1${exFilter}
+             FROM note_revisions WHERE space = $1 AND ${TRUSTED_ONLY}${exFilter}
            ) t WHERE rn = 1 AND kind = 'delete' AND content_hash IS NOT NULL${qFilter}`,
         totalParams,
       ),
@@ -427,7 +459,7 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
       restorableTotal: Number((restAgg.rows[0] as { n: string | number }).n),
     }
   },
-  purgeNotes: async (noteIds) => {
+  purgeNotes: async (space, noteIds) => {
     await ctx.ensureInit()
     if (!noteIds.length) {
       return
@@ -439,24 +471,31 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
       await client.query('BEGIN')
       await client.query("SELECT set_config('notarium.revision_purge_protocol', 'v26', true)")
       // Serialize cross-replica appends and purges for the same notes first,
-      // then their shared CAS hashes. Sorted acquisition keeps overlapping
-      // batch purges deadlock-free.
+      // then their shared CAS hashes. The blob set is read from rows this
+      // transaction has already locked, so the tier cannot be entered in one
+      // sorted pass and the wide-scan mutex supplies the order instead.
+      await lockRevisionWideScan(client)
       await lockRevisionKeys(client, 'note', ids)
+      // The fence is scoped exactly like the DELETE below it.
+      // canon: docs/meta-db.md#source-of-truth
       await client.query(
-        `INSERT INTO revision_purge_fences (kind, entity_id)
-         SELECT 'note', value FROM unnest($1::text[]) AS input(value)
-         ON CONFLICT (kind, entity_id) DO NOTHING`,
-        [ids],
+        `INSERT INTO revision_purge_fences (kind, entity_id, space)
+         SELECT 'note', value, $2 FROM unnest($1::text[]) AS input(value)
+         ON CONFLICT (kind, entity_id, space) DO NOTHING`,
+        [ids, space],
       )
       // pg arrays take any list size in one param — no chunking needed.
       const hashesRes = await client.query(
-        'SELECT DISTINCT content_hash AS h FROM note_revisions WHERE note_id = ANY($1) AND content_hash IS NOT NULL',
-        [ids],
+        'SELECT DISTINCT content_hash AS h FROM note_revisions WHERE space = $1 AND note_id = ANY($2) AND content_hash IS NOT NULL',
+        [space, ids],
       )
       const hashes = (hashesRes.rows as Array<{ h: string }>).map(({ h }) => h).sort()
 
       await lockRevisionKeys(client, 'blob', hashes)
-      await client.query('DELETE FROM note_revisions WHERE note_id = ANY($1)', [ids])
+      await client.query('DELETE FROM note_revisions WHERE space = $1 AND note_id = ANY($2)', [
+        space,
+        ids,
+      ])
       // GC each blob whose last referrer just went away (the CAS is shared).
       for (const h of hashes) {
         const used = await client.query(
@@ -479,7 +518,7 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
   latestTimestamps: async (space) => {
     await ctx.ensureInit()
     const res = await ctx.required.query(
-      'SELECT DISTINCT ON (note_id) note_id, created_at FROM note_revisions WHERE space = $1 ORDER BY note_id, id DESC',
+      `SELECT DISTINCT ON (note_id) note_id, created_at FROM note_revisions WHERE space = $1 AND ${TRUSTED_ONLY} ORDER BY note_id, id DESC`,
       [space],
     )
     const rows = res.rows as Array<{ note_id: string; created_at: string }>
@@ -488,7 +527,7 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
   historicalNames: async (space) => {
     await ctx.ensureInit()
     const res = await ctx.required.query(
-      "SELECT DISTINCT note_id, title FROM note_revisions WHERE space = $1 AND title <> ''",
+      `SELECT DISTINCT note_id, title FROM note_revisions WHERE space = $1 AND ${TRUSTED_ONLY} AND title <> ''`,
       [space],
     )
     const rows = res.rows as Array<{ note_id: string; title: string }>

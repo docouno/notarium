@@ -1,7 +1,7 @@
 import { z } from 'zod'
 import { ACTIVITY_EVENT_KIND } from '../../consts/activity'
 import { enumValues } from '../../libs/enumValues'
-import { AuthorSchema } from '../primitives'
+import { AuthorSchema, RevisionUnavailableReasonSchema } from '../primitives'
 
 /** GET /api/s/<slug>/activity query: a day-bucketed window for the heatmap.
  *  `from`/`to` are ISO instants (half-open [from, to)); both optional —
@@ -24,7 +24,8 @@ export const ActivityQuerySchema = z.object({
 /** One day of the heatmap. `date` is the local YYYY-MM-DD (under the query's
  *  `tz`). `created` = notes that first appeared through us that day; `edited` =
  *  later states (our saves, restores, detected external edits); `deleted` =
- *  delete-tombstones. `total` = created + edited + deleted (the intensity). Only
+ *  delete-tombstones. `total` = created + edited + deleted + unavailable (the
+ *  intensity — a gap IS activity, so a day made only of gaps still lights up). Only
  *  days with at least one counted event are present — the client lays out the
  *  full empty grid and fills these in. */
 export const ActivityDaySchema = z.object({
@@ -32,6 +33,9 @@ export const ActivityDaySchema = z.object({
   created: z.number().int(),
   edited: z.number().int(),
   deleted: z.number().int(),
+  /** Journal gaps (#327): counted activity that cannot be classified as created,
+   *  edited or deleted without reading a withheld payload. Part of `total`. */
+  unavailable: z.number().int(),
   total: z.number().int(),
 })
 
@@ -44,17 +48,22 @@ export const ActivityResponseSchema = z.object({
   /** Does the window hold activity by someone OTHER than the viewer? The honest
    *  gate for the "mine / everyone" toggle: it earns its place only when there's a
    *  distinction to draw. Computed server-side on the unscoped (everyone) request by
-   *  comparing the full total against the viewer's own; always `false` on an
-   *  author-scoped request or a single-principal host (mode 'none'), where it's moot. */
+   *  comparing the ATTRIBUTED buckets against the viewer's own — a journal gap is
+   *  activity that belongs to nobody, so it must not claim someone else was here
+   *  (#327). Always `false` on an author-scoped request or a single-principal host
+   *  (mode 'none'), where it's moot. */
   hasOtherAuthors: z.boolean(),
 })
 
-/** A display kind for an activity event, derived from the journal `kind` + chain
- *  position: `created` (a write with no parent — the note's first appearance
- *  through us), `edited` (a later write/external edit), `restored` (a rollback),
- *  `deleted` (a tombstone). Moves are NOT here — a pure folder move keeps title/
- *  body/tags so the journal dedups it (no revision); the feed is honest about
- *  what the journal records. */
+/** A display kind for an activity event, derived from the journal `kind` + the entry
+ *  ROLE the writer stored on the row: `created` (`entry_role = 'origin'` — the note's
+ *  first appearance through us; not "a write with no parent", which stopped meaning
+ *  that once a quarantine could leave a note parentless, #327), `edited` (a later
+ *  write/external edit), `restored` (a rollback),
+ *  `deleted` (a tombstone), `unavailable` (a journal gap — the event happened but
+ *  its state is withheld, #327). Moves are NOT here — a pure folder move keeps
+ *  title/body/tags so the journal dedups it (no revision); the feed is honest
+ *  about what the journal records. */
 export const ActivityEventKindSchema = z.enum(enumValues(ACTIVITY_EVENT_KIND))
 
 /** GET /api/s/<slug>/activity/events query: a window over the space's revision
@@ -94,6 +103,8 @@ export const ActivityEventSchema = z.object({
   author: AuthorSchema.nullable(),
   charsAdded: z.number().nullable(),
   charsRemoved: z.number().nullable(),
+  /** A journal GAP — see `RevisionUnavailableReasonSchema`. */
+  unavailableReason: RevisionUnavailableReasonSchema.optional(),
 })
 
 export const ActivityEventsResponseSchema = z.object({

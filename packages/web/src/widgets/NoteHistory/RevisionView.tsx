@@ -197,9 +197,14 @@ export const RevisionView = ({
 
       {revision.contentHash == null ? (
         <div className={styles.gap} data-testid="history-gap">
-          {revision.kind === REVISION_KIND.delete
-            ? 'The note was deleted at this point.'
-            : 'An external change was detected here, but its content could not be captured.'}
+          {revision.unavailableReason != null
+            ? // WITHHELD, not uncaptured (#327): the server refused to attribute or
+              // reconstruct this state, so naming a cause it didn't claim would be
+              // the same invention as calling its writer external.
+              'This point is unavailable: the note’s identity was in doubt here, so nothing about the change can be shown.'
+            : revision.kind === REVISION_KIND.delete
+              ? 'The note was deleted at this point.'
+              : 'An external change was detected here, but its content could not be captured.'}
         </div>
       ) : view === 'diff' ? (
         <div

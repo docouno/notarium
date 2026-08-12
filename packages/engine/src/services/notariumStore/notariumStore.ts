@@ -58,6 +58,8 @@ import {
   type FolderAlias,
   freshNoteId,
   FrontmatterLimitError,
+  type IdentityMaterialization,
+  type IdentityMaterializationInput,
   IF_EXISTS,
   isCanonicalSafeRelativeAddress,
   isDurableFrontmatter,
@@ -75,6 +77,7 @@ import {
   normalizeWikilinkTarget,
   normTags,
   NOTE_BASENAME_MAX_BYTES,
+  NOTE_ID_FRONTMATTER_KEY,
   noteAlreadyExists,
   noteFileBase,
   noteFilePath,
@@ -89,6 +92,7 @@ import {
   SURFACE,
   uniqueSlug,
   UNNAMED_NOTE_FILENAME,
+  upsertFrontmatterKey,
 } from '@notarium/core'
 
 import { type Chunker, createHeadingChunker } from '../../libs/chunking'
@@ -158,6 +162,20 @@ type GraphAdjacency = {
    *  of the linked subset. */
   total: number
 }
+
+/** Bounded retries for the exact stat→read→stat observation and for the whole
+ *  convergence loop: a path someone rewrites in a tight loop must fail closed
+ *  rather than spin. */
+const STABLE_SNAPSHOT_ATTEMPTS = 8
+const MATERIALIZE_ATTEMPTS = 8
+
+/** Same file version: content verification is still the arbiter, this only says
+ *  the medium has not published a new generation at that pathname. */
+const sameFileGeneration = (left: FileStat, right: FileStat): boolean =>
+  left.path === right.path &&
+  left.mtimeMs === right.mtimeMs &&
+  left.size === right.size &&
+  left.changeToken === right.changeToken
 
 /** The global hub blacklist for the graph channel (#81 Stage 4a research): the top
  *  `pct` of the corpus by degree are too generic to carry relevance (hub-flooding) →
@@ -1903,6 +1921,156 @@ export class NotariumStore implements KnowledgeStore {
         this.enqueueEmbed(BigInt(published.rowid))
       }
     }
+  }
+
+  /** One EXACT observation of a file: `stat → read → stat`. `stat` and `read` are
+   *  separate storage calls, so a single pair proves nothing — a body that changed
+   *  between them would be indexed against the wrong generation. Atomic rename
+   *  guarantees each read is COMPLETE, not that it is still current. */
+  private async stableSnapshot(
+    mount: EngineMount,
+    rel: string,
+  ): Promise<{ raw: string; hash: string; stat: FileStat } | null> {
+    for (let attempt = 0; attempt < STABLE_SNAPSHOT_ATTEMPTS; attempt++) {
+      const before = await mount.files.stat(rel)
+
+      if (!before) {
+        return null
+      }
+      const raw = await mount.files.read(rel)
+
+      if (raw == null) {
+        return null
+      }
+      const after = await mount.files.stat(rel)
+
+      if (after && sameFileGeneration(before, after)) {
+        return { raw, hash: await sha256Hex(raw), stat: after }
+      }
+    }
+
+    throw writeFailed('storage kept changing while the note was being observed')
+  }
+
+  /** Prove the exact index row describes `snapshot`, repairing at most once. This
+   *  is a PREDICATE, not a refresh: an unconditional `reindexPath` would publish a
+   *  seq (`upsertRow`) and every consumer would see a phantom external edit on a
+   *  file that never changed. `reconcileScannedFile` already encodes the three
+   *  cases — fresh row (no seq), missing fingerprint over a matching projection
+   *  (adopt at the same seq), stale row (one upsert). */
+  private async proveIndexedIdentity(
+    fullPath: string,
+    cls: NoteClass,
+    targetId: string,
+    snapshot: { raw: string; hash: string; stat: FileStat },
+  ): Promise<boolean> {
+    const row = await this.sql.get<NoteRow & { rowid: number }>(
+      `SELECT rowid AS rowid, * FROM notes WHERE path = ? COLLATE BINARY`,
+      [fullPath],
+    )
+
+    await this.reconcileScannedFile(
+      row
+        ? {
+            rowid: row.rowid,
+            path: row.path,
+            class: row.class,
+            mtime_ms: row.mtime_ms,
+            size: row.size,
+            seq: row.seq,
+            change_token: null,
+            source_hash: null,
+          }
+        : undefined,
+      fullPath,
+      cls,
+      snapshot.stat,
+      snapshot.raw,
+    )
+
+    const proven = await this.sql.get<NoteRow & { rowid: number }>(
+      `SELECT rowid AS rowid, * FROM notes WHERE path = ? COLLATE BINARY`,
+      [fullPath],
+    )
+
+    return (
+      proven != null &&
+      proven.id_claim === targetId &&
+      proven.class === cls &&
+      proven.mtime_ms === snapshot.stat.mtimeMs &&
+      proven.size === snapshot.stat.size &&
+      (await this.sourceFingerprint(proven.rowid, proven.seq)) === snapshot.hash
+    )
+  }
+
+  /** Bring ONE path onto `targetId` and prove it, without ever publishing an
+   *  unproven state (#327). The loop is the point: a body edit landing between the
+   *  read and the proof is reconciled HERE, before the caller may publish, while an
+   *  edit strictly after the final observation is simply the next external change.
+   *  canon: docs/core.md#identity */
+  async materializeIdentityAtPath({
+    filePath,
+    expectedClaimId,
+    targetId,
+  }: IdentityMaterializationInput): Promise<IdentityMaterialization> {
+    await this.ensureReady()
+    if (!isValidNoteId(targetId) || !isDurableScalar(filePath)) {
+      throw writeFailed('identity materialization needs a durable path and id')
+    }
+    const mount = this.mountForPath(filePath)
+    const rel = this.relIn(mount, filePath)
+    let expected = expectedClaimId
+
+    for (let attempt = 0; attempt < MATERIALIZE_ATTEMPTS; attempt++) {
+      const snapshot = await this.stableSnapshot(mount, rel)
+
+      if (!snapshot) {
+        return { status: 'vanished' }
+      }
+      const actual = parseNoteFile(snapshot.raw, filePath).idClaim
+
+      if (actual !== targetId) {
+        // Only the caller's own observation may be replaced. Anything else on
+        // disk is an external writer who must go through the arbiter first.
+        if (actual !== expected) {
+          return { status: 'claim-changed', observedId: actual }
+        }
+        if (!mount.files.replaceIfAbsent) {
+          throw writeFailed('storage cannot rewrite an identity claim without replacing a race')
+        }
+        const next = upsertFrontmatterKey(snapshot.raw, NOTE_ID_FRONTMATTER_KEY, targetId)
+
+        if (!(await mount.files.replaceIfAbsent(rel, rel, snapshot.raw, next))) {
+          // Someone replaced the file between the snapshot and the swap. That is
+          // exactly what the loop exists for: re-observe and classify the winner
+          // instead of turning a transient race into a terminal failure.
+          continue
+        }
+        expected = targetId
+        continue
+      }
+      const proven = await this.proveIndexedIdentity(filePath, mount.class, targetId, snapshot)
+      // The linearization point: only an observation taken AFTER the proof can
+      // say whether what was proven is still what storage holds.
+      const final = await this.stableSnapshot(mount, rel)
+
+      if (!final) {
+        return { status: 'vanished' }
+      }
+      if (proven && final.hash === snapshot.hash && sameFileGeneration(final.stat, snapshot.stat)) {
+        return { status: 'materialized' }
+      }
+      const finalClaim = parseNoteFile(final.raw, filePath).idClaim
+
+      if (finalClaim !== null && finalClaim !== targetId) {
+        return { status: 'claim-changed', observedId: finalClaim }
+      }
+      // Same id, different bytes (or a lost claim): no re-arbitration is owed —
+      // reconcile the new generation and prove it, still behind the fence.
+      expected = finalClaim
+    }
+
+    throw writeFailed('identity materialization did not converge')
   }
 
   /** Refresh one index path from disk (post-mutation write-through). */

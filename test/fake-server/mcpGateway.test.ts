@@ -4745,6 +4745,128 @@ describe('navigation — list_notes / recent_activity / get_note links (#102 pha
     expect(titles).toContain('Alice Pref')
   })
 
+  it('recent_activity — a journal gap is scoped by the project filter like any row (#327)', async () => {
+    // The project narrow is a POST-filter over an over-fetched window, and a gap's
+    // own fields say nothing about where it lives — the subtree decision comes from
+    // the read-model join, exactly as for a trusted row. A gap that skipped the
+    // filter would carry another project's activity into this project's answer.
+    const note = (title: string, filePath: string) => ({
+      title,
+      filePath,
+      modifiedAt: '2026-06-10T00:00:00.000Z',
+      createdAt: '2026-06-10T00:00:00.000Z',
+      tags: [] as string[],
+      content: `# ${title}`,
+    })
+    const gapApp = await createApp({
+      now: '2026-06-25T12:00:00.000Z',
+      spaces: [
+        {
+          slug: 'main',
+          notes: [note('Inside', 'docs/inside.md'), note('Outside', 'other/outside.md')],
+          activity: [
+            {
+              date: '2026-06-11',
+              kind: 'edited',
+              title: 'Inside Secret',
+              noteId: 'fake-docs-inside',
+              unavailable: true,
+            },
+            {
+              date: '2026-06-12',
+              kind: 'edited',
+              title: 'Outside Secret',
+              noteId: 'fake-other-outside',
+              unavailable: true,
+            },
+          ],
+        },
+      ],
+      // A NON-root project, so "inside the subtree" is a real question.
+      projects: [{ space: 'main', path: 'docs', slug: 'docs' }],
+    })
+    const gapPort = await listen(gapApp)
+
+    try {
+      const r = structured(await callTool(gapPort, 'recent_activity', { project: 'main/docs' }))
+      const items = r.items as Array<{ noteId: string; title: string; unavailableReason?: string }>
+
+      expect(items.map((i) => i.noteId)).toEqual(['fake-docs-inside'])
+      // …and what surfaces is the gap, not the row it withholds.
+      expect(items[0]).toMatchObject({
+        title: 'Unavailable revision',
+        unavailableReason: 'identity-conflict',
+        principal: null,
+      })
+    } finally {
+      await gapApp.close()
+    }
+  })
+
+  it('recent_activity — a row with no current path survives at the ROOT project only (#327)', async () => {
+    // The other half of the project narrow: a row whose note the read-model can no
+    // longer place (purged, or a gap whose id was re-keyed away) has no subtree to be
+    // inside. A non-root project must drop it — claiming it would be a guess — while
+    // the root project covers the whole space and dropping it there loses real activity.
+    const gapApp = await createApp({
+      now: '2026-06-25T12:00:00.000Z',
+      spaces: [
+        {
+          slug: 'main',
+          notes: [
+            {
+              title: 'Inside',
+              filePath: 'docs/inside.md',
+              modifiedAt: '2026-06-10T00:00:00.000Z',
+              createdAt: '2026-06-10T00:00:00.000Z',
+              tags: [],
+              content: '# Inside',
+            },
+          ],
+          activity: [
+            {
+              date: '2026-06-12',
+              kind: 'edited',
+              title: 'Placeless Secret',
+              noteId: 'fake-placeless',
+              unavailable: true,
+            },
+          ],
+        },
+      ],
+      projects: [
+        { space: 'main', path: '', slug: 'main' },
+        { space: 'main', path: 'docs', slug: 'docs' },
+      ],
+    })
+    const gapPort = await listen(gapApp)
+
+    try {
+      const atRoot = structured(
+        await callTool(gapPort, 'recent_activity', { project: 'main/main' }),
+      )
+
+      expect(
+        (atRoot.items as Array<{ noteId: string; path?: string }>).map((i) => i.noteId),
+      ).toContain('fake-placeless')
+      expect(
+        (atRoot.items as Array<{ noteId: string; path?: string }>).find(
+          (i) => i.noteId === 'fake-placeless',
+        ),
+      ).not.toHaveProperty('path')
+
+      const inSubtree = structured(
+        await callTool(gapPort, 'recent_activity', { project: 'main/docs' }),
+      )
+
+      expect((inSubtree.items as Array<{ noteId: string }>).map((i) => i.noteId)).not.toContain(
+        'fake-placeless',
+      )
+    } finally {
+      await gapApp.close()
+    }
+  })
+
   it('recent_activity without a project fans across reachable spaces, newest-first', async () => {
     const bearer = await patFor('alice', 'alice-password-1', 'write')
     const older = structured(

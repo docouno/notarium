@@ -2,13 +2,22 @@
 // ephemeral identity registry — a host without a meta-DB still journals, the
 // history just lives for the process lifetime (honest degradation, P5). Also
 // the e2e fake's journal and the reference implementation unit tests pin.
+//
+// It never DECIDES a quarantine: the integrity graph is closed inside the meta-DB
+// aggregate's settlement transaction, and a host with no shared persistence makes
+// no global identity promise to contaminate in the first place (#327). It does
+// SERVE the axis, through a test-only injection — otherwise every consumer above
+// it (REST, MCP, the session audit) would have no way to see a gap at all, and
+// their gap contracts would be untestable rather than merely untested.
 
 import {
   type ActivityDayCount,
   type ActivityNoteCount,
   type AuthorFilter,
   type Revision,
+  REVISION_ENTRY_ROLE,
   REVISION_KIND,
+  revisionGapOf,
   type RevisionInput,
   type RevisionPersistence,
 } from '../knowledgeStore'
@@ -24,15 +33,14 @@ export const localDayOf = (iso: string, tzOffsetMinutes: number): string => {
   return `${y}-${m}-${d}`
 }
 
-/** A revision that does NOT count as activity: a synthetic pre-edit
- *  baseline / first-sighting — an `external` row that is a note's very first
- *  journal entry (no chain parent). Counting it would double a pre-existing
- *  note's first edit (the baseline + the write share a day). The SQL drivers
- *  encode the same predicate as `NOT (kind = 'external' AND base_rev IS NULL)`. */
-export const isSyntheticBaseline = (r: {
-  kind: Revision['kind']
-  baseRevisionId: string | null
-}): boolean => r.kind === REVISION_KIND.external && r.baseRevisionId == null
+/** A revision that does NOT count as activity: a synthetic pre-edit baseline or a
+ *  first sighting. It is READ off the row — the writer stamped it — because the shape
+ *  it used to be inferred from (`external` with no chain parent) stopped meaning
+ *  "first entry" once a contaminated chain could leave a note with no trusted parent
+ *  at all (#327). The SQL drivers encode the same predicate as
+ *  `entry_role <> 'baseline'`. */
+export const isSyntheticBaseline = (r: { entryRole: Revision['entryRole'] }): boolean =>
+  r.entryRole === REVISION_ENTRY_ROLE.baseline
 
 /** The reference implementation of an AuthorFilter — the exact predicate the
  *  SQL drivers encode as `principal IN (…exact) OR principal LIKE prefix || '%'`. A
@@ -50,13 +58,46 @@ export const matchesAuthor = (principal: string | null, f: AuthorFilter): boolea
 export class InMemoryRevisionPersistence implements RevisionPersistence {
   private revisions: Revision[] = []
   private blobs = new Map<string, string>()
-  private purgedNoteIds = new Set<string>()
+  /** Permanent note fences, keyed `space\u0000noteId` — scoped exactly like the
+   *  purge itself, so one space's purge cannot silence a colliding id in another. */
+  private purgedNotes = new Set<string>()
+  /** Revision ids served as a gap. Ids come from one monotonic counter, so they
+   *  are unique without a space key and are never reused after a purge. */
+  private quarantined = new Set<string>()
   private nextId = 1
+
+  /** Whether this row's payload can still be believed — the twin of the drivers'
+   *  `integrity` column. The queries below must classify, filter and count on the
+   *  EFFECTIVE values, which is what the three predicates under it encode. */
+  private isGap(r: Revision): boolean {
+    return this.quarantined.has(r.id)
+  }
+
+  /** The ONE place a stored row becomes a served row (`revisionOfRow` in the drivers). */
+  private serve = (r: Revision): Revision => (this.isGap(r) ? revisionGapOf(r) : r)
+
+  /** Class exclusion on the EFFECTIVE class: a gap's class is null, so a hidden-class
+   *  filter never excludes it and its real class is never consulted. */
+  private classAllows(r: Revision, excludeClasses: readonly string[]): boolean {
+    return this.isGap(r) || r.class == null || !excludeClasses.includes(r.class)
+  }
+
+  /** Author scope on the EFFECTIVE principal: a gap belongs to nobody, so no filter
+   *  ever matches it — not `mine`, not anyone else's. */
+  private authorAllows(r: Revision, author?: AuthorFilter): boolean {
+    return author == null || (!this.isGap(r) && matchesAuthor(r.principal, author))
+  }
+
+  /** Synthetic-baseline suppression on effective fields: a gap has no readable
+   *  parent, so the predicate cannot apply — it always emits. */
+  private countsAsActivity(r: Revision): boolean {
+    return this.isGap(r) || !isSyntheticBaseline(r)
+  }
 
   async init(): Promise<void> {}
 
   async append(rev: RevisionInput, content: string | null): Promise<Revision> {
-    if (this.purgedNoteIds.has(rev.noteId)) {
+    if (this.purgedNotes.has(`${rev.space}\u0000${rev.noteId}`)) {
       throw new Error('revision target was permanently purged: note')
     }
     if (rev.contentHash != null && content != null && !this.blobs.has(rev.contentHash)) {
@@ -68,12 +109,13 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
   }
 
   async listByNote(
+    space: string,
     noteId: string,
     { offset, limit }: { offset: number; limit: number },
   ): Promise<{ items: Revision[]; total: number }> {
     // Append order IS the timeline; ids are monotonic by construction.
-    const all = this.revisions.filter((r) => r.noteId === noteId).reverse()
-    return { items: all.slice(offset, offset + limit), total: all.length }
+    const all = this.revisions.filter((r) => r.space === space && r.noteId === noteId).reverse()
+    return { items: all.slice(offset, offset + limit).map(this.serve), total: all.length }
   }
 
   async listBySpaceSince(
@@ -84,10 +126,7 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
   ): Promise<{ items: Revision[]; total: number; maxRevId: string | null }> {
     const since = sinceRevId == null ? 0 : Number(sinceRevId)
     const after = this.revisions.filter(
-      (r) =>
-        r.space === space &&
-        Number(r.id) > since &&
-        !(r.class != null && excludeClasses.includes(r.class)),
+      (r) => r.space === space && Number(r.id) > since && this.classAllows(r, excludeClasses),
     )
 
     if (!after.length) {
@@ -112,11 +151,13 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
     const items = [...newestByNote.values()]
       .sort((a, b) => Number(b.id) - Number(a.id))
       .slice(0, limit)
+      .map(this.serve)
     return { items, total: newestByNote.size, maxRevId: String(maxId) }
   }
 
-  async get(revisionId: string): Promise<Revision | null> {
-    return this.revisions.find((r) => r.id === revisionId) ?? null
+  async get(space: string, revisionId: string): Promise<Revision | null> {
+    const row = this.revisions.find((r) => r.space === space && r.id === revisionId)
+    return row ? this.serve(row) : null
   }
 
   async listTrashed(
@@ -129,7 +170,9 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
     const newestByNote = new Map<string, Revision>()
 
     for (const r of this.revisions) {
-      if (r.space !== space) {
+      // Trash is a TRUSTED view: a gap withholds the kind's meaning, so a
+      // quarantined row neither becomes a tombstone nor hides the one below it.
+      if (r.space !== space || this.isGap(r)) {
         continue
       }
       if (r.class != null && excludeClasses.includes(r.class)) {
@@ -153,47 +196,62 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
     }
   }
 
-  async purgeNotes(noteIds: readonly string[]): Promise<void> {
+  async purgeNotes(space: string, noteIds: readonly string[]): Promise<void> {
     const ids = new Set(noteIds)
 
     if (!ids.size) {
       return
     }
     for (const id of ids) {
-      this.purgedNoteIds.add(id)
+      this.purgedNotes.add(`${space}\u0000${id}`)
     }
-    const removed = this.revisions.filter((r) => ids.has(r.noteId))
-    this.revisions = this.revisions.filter((r) => !ids.has(r.noteId))
+    const scoped = (r: Revision): boolean => r.space === space && ids.has(r.noteId)
+    const removed = this.revisions.filter(scoped)
+    this.revisions = this.revisions.filter((r) => !scoped(r))
     // GC blobs no surviving revision references (the CAS is shared by hash).
     const surviving = new Set(
       this.revisions.map((r) => r.contentHash).filter((h): h is string => h != null),
     )
 
     for (const r of removed) {
+      this.quarantined.delete(r.id)
       if (r.contentHash && !surviving.has(r.contentHash)) {
         this.blobs.delete(r.contentHash)
       }
     }
   }
 
-  async latestFor(noteId: string): Promise<Revision | null> {
+  async hasAnyFor(space: string, noteId: string): Promise<boolean> {
+    return this.revisions.some((r) => r.space === space && r.noteId === noteId)
+  }
+
+  // The operational latest is the newest TRUSTED state: a gap has no payload to
+  // resume from, so it is skipped rather than served as the head of the chain.
+  async latestFor(space: string, noteId: string): Promise<Revision | null> {
     for (let i = this.revisions.length - 1; i >= 0; i--) {
-      if (this.revisions[i].noteId === noteId) {
-        return this.revisions[i]
+      const revision = this.revisions[i]
+
+      if (revision.space === space && revision.noteId === noteId && !this.isGap(revision)) {
+        return revision
       }
     }
 
     return null
   }
 
-  async latestForMany(noteIds: readonly string[]): Promise<Map<string, Revision>> {
+  async latestForMany(space: string, noteIds: readonly string[]): Promise<Map<string, Revision>> {
     const wanted = new Set(noteIds)
     const out = new Map<string, Revision>()
 
     for (let i = this.revisions.length - 1; i >= 0 && out.size < wanted.size; i--) {
       const revision = this.revisions[i]
 
-      if (wanted.has(revision.noteId) && !out.has(revision.noteId)) {
+      if (
+        revision.space === space &&
+        wanted.has(revision.noteId) &&
+        !out.has(revision.noteId) &&
+        !this.isGap(revision)
+      ) {
         out.set(revision.noteId, revision)
       }
     }
@@ -225,13 +283,13 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
       if (r.space !== space) {
         continue
       }
-      if (isSyntheticBaseline(r)) {
+      if (!this.countsAsActivity(r)) {
         continue
       }
-      if (r.class != null && excludeClasses.includes(r.class)) {
+      if (!this.classAllows(r, excludeClasses)) {
         continue
       }
-      if (author && !matchesAuthor(r.principal, author)) {
+      if (!this.authorAllows(r, author)) {
         continue
       }
       const t = Date.parse(r.createdAt)
@@ -243,12 +301,16 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
       let bucket = byDay.get(date)
 
       if (!bucket) {
-        bucket = { date, created: 0, edited: 0, deleted: 0 }
+        bucket = { date, created: 0, edited: 0, deleted: 0, unavailable: 0 }
         byDay.set(date, bucket)
       }
-      if (r.kind === REVISION_KIND.delete) {
+      // A gap is real activity whose KIND cannot be classified without reading a
+      // payload the row withholds — its own bucket, never guessed from raw columns.
+      if (this.isGap(r)) {
+        bucket.unavailable++
+      } else if (r.kind === REVISION_KIND.delete) {
         bucket.deleted++
-      } else if (r.baseRevisionId == null) {
+      } else if (r.entryRole === REVISION_ENTRY_ROLE.origin) {
         bucket.created++
       } else {
         bucket.edited++
@@ -282,13 +344,13 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
       if (r.space !== space) {
         return false
       }
-      if (isSyntheticBaseline(r)) {
+      if (!this.countsAsActivity(r)) {
         return false
       }
-      if (r.class != null && excludeClasses.includes(r.class)) {
+      if (!this.classAllows(r, excludeClasses)) {
         return false
       }
-      if (author && !matchesAuthor(r.principal, author)) {
+      if (!this.authorAllows(r, author)) {
         return false
       }
       const t = Date.parse(r.createdAt)
@@ -296,7 +358,7 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
     })
     // Append order IS id order — newest first.
     const sorted = matched.sort((a, b) => Number(b.id) - Number(a.id))
-    return { items: sorted.slice(offset, offset + limit), total: sorted.length }
+    return { items: sorted.slice(offset, offset + limit).map(this.serve), total: sorted.length }
   }
 
   async activityByNote(
@@ -315,10 +377,10 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
       if (r.space !== space) {
         continue
       }
-      if (isSyntheticBaseline(r)) {
+      if (!this.countsAsActivity(r)) {
         continue
       }
-      if (r.class != null && excludeClasses.includes(r.class)) {
+      if (!this.classAllows(r, excludeClasses)) {
         continue
       }
       const t = Date.parse(r.createdAt)
@@ -346,7 +408,7 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
 
     // Append order IS the timeline — later rows overwrite earlier ones.
     for (const r of this.revisions) {
-      if (r.space === space) {
+      if (r.space === space && !this.isGap(r)) {
         map.set(r.noteId, r.createdAt)
       }
     }
@@ -358,7 +420,8 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
     const map = new Map<string, string[]>()
 
     for (const r of this.revisions) {
-      if (r.space !== space || !r.title) {
+      // A gap's title is withheld, so it contributes no historical name.
+      if (r.space !== space || !r.title || this.isGap(r)) {
         continue
       }
       const list = map.get(r.noteId)
@@ -379,11 +442,22 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
 
   async close(): Promise<void> {}
 
+  /** Test-only: serve these rows as gaps from now on. The twin does NOT arbitrate
+   *  — which rows a collision contaminates is decided by the meta-DB's settlement
+   *  closure, and nothing here can compute it. The caller names the rows; this
+   *  class only owes them the same effective-field semantics the drivers give. */
+  quarantineForTest(revisionIds: readonly string[]): void {
+    for (const id of revisionIds) {
+      this.quarantined.add(id)
+    }
+  }
+
   /** Test-only: back to an empty journal (the e2e fake's reset). */
   clear(): void {
     this.revisions = []
     this.blobs.clear()
-    this.purgedNoteIds.clear()
+    this.purgedNotes.clear()
+    this.quarantined.clear()
     this.nextId = 1
   }
 }

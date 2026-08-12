@@ -12,7 +12,11 @@ import {
   type NoteSort,
   type ReadScope,
   type ResolvedVia,
+  REVISION_UNAVAILABLE_REASON,
+  REVISION_UNAVAILABLE_TITLE,
+  type RevisionEntryRole,
   type RevisionKind,
+  type RevisionUnavailableReason,
   type ScanPhase,
 } from './consts'
 export type Revision = {
@@ -28,6 +32,13 @@ export type Revision = {
   /** Which revision a restore wrote back (kind 'restore' only). */
   sourceRevisionId: string | null
   kind: RevisionKind
+  /** What this entry IS in the note's life, decided by the WRITER at append and
+   *  never inferred on read. Required, and deliberately not optional: the gap
+   *  constructor below builds a Revision literally, so the compiler is what proves a
+   *  gap keeps its role, and every direct constructor of a `RevisionInput` has to
+   *  name one. The only default lives in SQL, for the mixed-version window (#327).
+   *  canon: docs/note-history.md#model */
+  entryRole: RevisionEntryRole
   /** Writer attribution id: 'user:<name>', 'pat:<name>:<id>', or 'ui' (mode none); null = external. */
   principal: string | null
   /** Agent-audit attribution captured with the write. Absent on legacy/human revisions so the
@@ -50,6 +61,12 @@ export type Revision = {
   /** Char add/remove vs the chain parent (word-segmented), computed at append. null = unknown. */
   charsAdded: number | null
   charsRemoved: number | null
+  /** Why this entry is a GAP rather than a state. Present only on a sanitized row: its payload,
+   *  edges and attribution are withheld because the note's identity was contaminated by a
+   *  cross-space collision, so nothing about it can be attributed honestly (#327). A trusted row
+   *  omits the field entirely — the wire shape is additive.
+   *  canon: docs/note-history.md#model · docs/core.md#identity */
+  unavailableReason?: RevisionUnavailableReason
 }
 
 export type RevisionDetail = Revision & {
@@ -59,12 +76,14 @@ export type RevisionDetail = Revision & {
 
 /** One day of the activity heatmap. `date` is the LOCAL YYYY-MM-DD (shifted east by the query
  *  tz); `created` = a note's first appearance through us, `deleted` = a tombstone, `edited` =
- *  every other counted state. */
+ *  every other counted state, `unavailable` = a journal gap (#327) — real activity whose kind
+ *  cannot be classified without reading a payload the row withholds. */
 export type ActivityDayCount = {
   date: string
   created: number
   edited: number
   deleted: number
+  unavailable: number
 }
 
 export type ActivityNoteCount = {
@@ -87,14 +106,47 @@ export type AuthorFilter = {
 
 export type RevisionInput = Omit<Revision, 'id'>
 
+/** Serve a contaminated row as a GAP. What survives is exactly what stays true
+ *  when a note's identity is in doubt: the revision's place in the stream (its
+ *  id, note, space, kind and time) — which is what keeps cursors, totals and
+ *  session linkage exact. Everything that could attribute or reconstruct the
+ *  state is withheld, and nothing is invented in its place: no neutral author,
+ *  no reconstructed parent, no alias. canon: docs/core.md#identity */
+export const revisionGapOf = (row: Revision): Revision => ({
+  id: row.id,
+  noteId: row.noteId,
+  space: row.space,
+  kind: row.kind,
+  // The role is structural, like `kind` and `createdAt`: it says where the entry
+  // stands, not what the note contained. Quarantine hides payload, not position.
+  entryRole: row.entryRole,
+  createdAt: row.createdAt,
+  baseRevisionId: null,
+  theirRevisionId: null,
+  sourceRevisionId: null,
+  principal: null,
+  agent: null,
+  contentHash: null,
+  title: REVISION_UNAVAILABLE_TITLE,
+  class: null,
+  slug: null,
+  tags: [],
+  charsAdded: null,
+  charsRemoved: null,
+  unavailableReason: REVISION_UNAVAILABLE_REASON.identityConflict,
+})
+
 /** Persistence port of the journal — the meta-DB drivers implement it; core ships an in-memory
  *  twin for hosts without a meta-DB (history for the process lifetime). */
 export type RevisionPersistence = {
   init(): Promise<void>
   /** Append one revision, storing `content` content-addressed by contentHash. Returns it with its id. */
   append(rev: RevisionInput, content: string | null): Promise<Revision>
-  /** A note's timeline window, newest first, with the total before slicing. */
+  /** A note's timeline window, newest first, with the total before slicing. Note-addressed reads
+   *  are SPACE-scoped: note ids are globally unique, but the journal is shared across spaces and a
+   *  contaminated legacy chain must never be readable through a sibling space (#327). */
   listByNote(
+    space: string,
     noteId: string,
     opts: { offset: number; limit: number },
   ): Promise<{ items: Revision[]; total: number }>
@@ -109,7 +161,7 @@ export type RevisionPersistence = {
     /** Classes to EXCLUDE before the collapse (so list/total/maxRevId stay accurate). */
     excludeClasses?: readonly string[],
   ): Promise<{ items: Revision[]; total: number; maxRevId: string | null }>
-  get(revisionId: string): Promise<Revision | null>
+  get(space: string, revisionId: string): Promise<Revision | null>
   /** The trash view: notes whose NEWEST revision is a delete-tombstone, newest-deleted first,
    *  windowed. Each item IS the tombstone (createdAt = deletion time, principal = who deleted,
    *  contentHash = the body to resurrect). */
@@ -118,17 +170,27 @@ export type RevisionPersistence = {
     opts: { offset: number; limit: number; q?: string },
     excludeClasses?: readonly string[],
   ): Promise<{ items: Revision[]; total: number; restorableTotal: number }>
-  /** Permanently erase notes: drop EVERY revision of each id, then GC blobs no surviving revision
-   *  references (the CAS is shared). */
-  purgeNotes(noteIds: readonly string[]): Promise<void>
-  /** The newest revision of a note — the dedup/chaining anchor. */
-  latestFor(noteId: string): Promise<Revision | null>
-  /** The newest revision for each requested note. Missing ids are omitted. A set-oriented
-   *  read so provenance lists never issue one persistence query per row. */
-  latestForMany(noteIds: readonly string[]): Promise<Map<string, Revision>>
-  /** Day-bucketed activity, aggregated IN the driver (never shipping a year of rows). Synthetic
-   *  pre-edit baselines (an `external` row that is a note's first entry, baseRevisionId = null)
-   *  are EXCLUDED — counting them would double a pre-existing note's first edit. */
+  /** Permanently erase this space's notes: drop EVERY revision of each id in it, then GC blobs no
+   *  surviving revision references (the CAS is shared). */
+  purgeNotes(space: string, noteIds: readonly string[]): Promise<void>
+  /** Whether the note has ANY journaled row, trusted or quarantined — the existence question the
+   *  write path asks before capturing a pre-edit baseline, and the one it stamps `entryRole`
+   *  from. A note whose only history is a gap has a history; capturing a fresh "baseline" over it
+   *  would invent one, and calling its next edit an `origin` would invent a birth. */
+  hasAnyFor(space: string, noteId: string): Promise<boolean>
+  /** The newest TRUSTED revision of a note — the dedup/chaining anchor. A gap is never a chain
+   *  parent, a tombstone or a restore source: those would all reconstruct state from a row whose
+   *  payload is withheld. */
+  latestFor(space: string, noteId: string): Promise<Revision | null>
+  /** The newest TRUSTED revision for each requested note — {@link latestFor} in bulk, and
+   *  withholding a gap for the same reason: newer quarantined rows are skipped, and a note
+   *  whose history is gaps only is omitted like an unknown id. A set-oriented read so
+   *  provenance lists never issue one persistence query per row. */
+  latestForMany(space: string, noteIds: readonly string[]): Promise<Map<string, Revision>>
+  /** Day-bucketed activity, aggregated IN the driver (never shipping a year of rows). Rows the
+   *  writer marked `entryRole: 'baseline'` are EXCLUDED — counting them would double a
+   *  pre-existing note's first edit. `created` is `entryRole: 'origin'`, not "has no parent":
+   *  after a quarantine the next real edit has no trusted parent either. */
   activityByDay(
     space: string,
     opts: {
@@ -187,6 +249,63 @@ export type IdentityRecord = {
   deletedAt: string | null
 }
 
+/** What a batch claim did to ONE record. A row whose id already belongs to a DIFFERENT space is
+ *  refused, never stolen — the registry remints and the caller re-keys. */
+export type IdentityClaimOutcome =
+  { id: string; status: 'claimed' } | { id: string; status: 'foreign-owner'; owner: IdentityRecord }
+
+/** One file's frontmatter id claim, put to the GLOBAL registry for arbitration. */
+export type IdentityFileClaim = {
+  space: string
+  /** Engine-relative storage path whose claim is being settled. */
+  filePath: string
+  /** The claimant's live record for `filePath` — the identity this settlement transitions FROM. */
+  current: IdentityRecord
+  /** The `notarium-id` the file on disk carries. */
+  observedId: string
+  /** The settlement instant (ISO-8601 UTC) — a tombstone's `deletedAt` and a brand-new row's
+   *  birth date. Supplied by the caller so the drivers keep no clock of their own. */
+  at: string
+}
+
+/** The three outcomes of a file-claim settlement. They are DISTINCT on purpose: collapsing
+ *  `duplicate-path-owner` into `accepted` would let a copied file take the original's id.
+ *  canon: docs/core.md#identity */
+export type IdentityFileSettlement =
+  /** The claim is the path's authoritative identity now (the id was free, tombstoned, or already
+   *  this very path's). `retiredId` is the superseded identity, tombstoned in the same transaction. */
+  | { status: 'accepted'; record: IdentityRecord; retiredId?: string }
+  /** The id durably belongs to ANOTHER space. The owner is untouched; the claimant keeps `record`
+   *  and its references were re-pointed onto it in the same transaction. */
+  | { status: 'foreign-owner'; owner: IdentityRecord; record: IdentityRecord }
+  /** A live note of the SAME space already holds the id at another path — a user-copied file.
+   *  Nothing moves: owner, claimant and every reference stay exactly as they were. */
+  | { status: 'duplicate-path-owner'; owner: IdentityRecord; record: IdentityRecord }
+
+export type IdentityMaterializationInput = {
+  /** Engine-relative storage path being converged. */
+  filePath: string
+  /** The claim the caller last OBSERVED in those bytes (`null` = the file carried none). Anything
+   *  else on disk means an external writer got there first, and the caller must re-arbitrate. */
+  expectedClaimId: string | null
+  /** The id this path must end up carrying. */
+  targetId: string
+}
+
+/** What one convergence attempt achieved. There is no "probably": `materialized` is claimed only
+ *  after a FINAL stable observation of storage still matches the bytes the index was proven
+ *  against, so an external edit is either reconciled before publication or belongs to the next
+ *  one. canon: docs/core.md#identity */
+export type IdentityMaterialization =
+  | { status: 'materialized' }
+  /** The bytes name something other than the caller expected — re-arbitrate from `observedId`. */
+  | { status: 'claim-changed'; observedId: string | null }
+  /** The file is gone from this path. Nothing is left to converge and nothing is left to
+   *  defend, so this is a terminal SUCCESS for the caller, not a race to retry: a settlement
+   *  that has already committed stands, and the next scan removes the note. A racing
+   *  replacement is NOT this — that one is re-observed inside the loop. */
+  | { status: 'vanished' }
+
 /** Driven port: identity persistence — the drivers implement it, the read-model's IdentityRegistry
  *  consumes it. Losing it degrades softly. canon: docs/core.md#identity · docs/architecture.md#p2 */
 export type IdentityPersistence = {
@@ -194,8 +313,13 @@ export type IdentityPersistence = {
   /** Every record of ONE space — a per-space registry must never ingest a sibling's rows (same
    *  file_path in two spaces is normal; loading both would cross-wire identities). */
   loadAll(space: string): Promise<IdentityRecord[]>
-  /** Idempotent batch upsert by id (last write wins). */
-  upsertMany(records: readonly IdentityRecord[]): Promise<void>
+  /** Idempotent batch claim by id. A row is written only while the id is free or already this
+   *  space's — an id owned elsewhere comes back as `foreign-owner` instead of changing owners. */
+  claimMany(records: readonly IdentityRecord[]): Promise<IdentityClaimOutcome[]>
+  /** Arbitrate one file's frontmatter claim against the global registry and carry out the whole
+   *  transition — identity rows, this space's references and its revision history — in ONE
+   *  transaction. The authoritative outcome is what the registry commits to its maps. */
+  settleFileClaim(claim: IdentityFileClaim): Promise<IdentityFileSettlement>
   /** Point lookup across ALL spaces — the resolver behind the space-free surfaces. Optional: a
    *  host without it falls back to asking each live store. */
   findById?(id: string): Promise<IdentityRecord | null>
@@ -756,6 +880,11 @@ export type KnowledgeStore = {
    *  A bare engine keys graph nodes by path but must still resolve authored `[[id]]`
    *  exactly, including unclaimed external files and copied duplicate claims. */
   setLinkIdentities?(identities: ReadonlyArray<{ id: string; path: string }>): void
+  /** Bring ONE storage path onto `targetId` and PROVE the exact index row describes those very
+   *  bytes — the convergence behind the global id arbiter (#327). OPTIONAL: without it a losing
+   *  claimant's file keeps naming another space's note until someone saves through us (honest
+   *  degradation, P5). canon: docs/core.md#identity */
+  materializeIdentityAtPath?(input: IdentityMaterializationInput): Promise<IdentityMaterialization>
   /** Stream every source file for a base export. `opts.scope` reuses the visibility axis (a user
    *  export never sweeps hidden agent state; `all` includes its mounts, but not host/meta state).
    *  Raw on-disk bytes. Optional. */

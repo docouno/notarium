@@ -85,6 +85,39 @@ describe('seed catalog → fake backend (#175)', () => {
     }
   })
 
+  it('identity-collision: the settled gap reaches the stand as an unavailable event', async () => {
+    // The case seeds what a settlement LEAVES behind, so the surfaces built for it
+    // (#327) can be seen on a stand rather than only in a unit test: a contaminated
+    // revision served as a gap, and the ordinary edit that follows it. The pair is
+    // the point — telling them apart needs the role the writer stored, because both
+    // sit on a note whose trusted past is gone.
+    const world = buildCaseWorld('identity-collision', { now: DEFAULT_NOW })
+    const app = await createApp(caseToFixture(world))
+
+    try {
+      const events = await json(app, '/api/s/archive/activity/events?limit=50')
+      const kinds = events.events.map((e: { kind: string }) => e.kind)
+
+      expect(kinds).toContain('unavailable')
+      expect(kinds).toContain('edited')
+      const gap = events.events.find((e: { kind: string }) => e.kind === 'unavailable')
+
+      // Neutral, and attributed to nobody — the gap contract, on a real stand.
+      expect(gap).toMatchObject({ title: 'Unavailable revision', author: null })
+      expect(gap.charsAdded).toBeNull()
+      const days = await json(
+        app,
+        '/api/s/archive/activity?from=2026-06-01T00:00:00.000Z&to=2026-07-02T00:00:00.000Z&tz=0',
+      )
+
+      expect(
+        days.days.reduce((n: number, d: { unavailable: number }) => n + d.unavailable, 0),
+      ).toBe(1)
+    } finally {
+      await app.close()
+    }
+  })
+
   it('feed-scroll: backdated creates land on many heatmap days (an honest journal)', async () => {
     const world = buildCaseWorld('feed-scroll', { scale: 0.2, now: DEFAULT_NOW })
     const app = await createApp(caseToFixture(world))

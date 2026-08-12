@@ -772,6 +772,188 @@ describe('activity (#33)', () => {
   })
   const aget = async (url: string) => (await actApp.inject({ method: 'GET', url })).json()
 
+  // ── the journal gap on the wire (#327) ───────────────────────────────────
+  // A cross-space id collision leaves rows whose payload cannot be believed. The
+  // driver contract pins what the QUERIES do with them; these pin what the ROUTES
+  // do — a different set of predicates, each of which could read a raw column and
+  // still look right. canon: docs/core.md#identity · docs/note-history.md#model
+  const gapFixture: Fixture = {
+    now: '2026-06-25T12:00:00.000Z',
+    spaces: [
+      {
+        slug: 'main',
+        displayName: 'Main',
+        // A real note in the read-model, so the per-note history handles resolve
+        // (fake ids are `fake-<slugged-path>`).
+        notes: [
+          {
+            title: 'Shared',
+            filePath: 'shared.md',
+            modifiedAt: '2026-06-10T00:00:00.000Z',
+            createdAt: '2026-06-10T00:00:00.000Z',
+            tags: [],
+            content: '# Shared',
+          },
+        ],
+        activity: [
+          {
+            date: '2026-06-10',
+            kind: 'edited',
+            title: 'Mine',
+            principal: 'ui',
+            noteId: 'fake-shared',
+          },
+          // Raw columns a leak would surface: a real title, a real class, a real
+          // author — and a KIND the classifier must refuse to guess.
+          {
+            date: '2026-06-11',
+            kind: 'edited',
+            title: 'Their Secret Note',
+            principal: 'user:bob',
+            class: 'user-doc',
+            noteId: 'fake-shared',
+            unavailable: true,
+          },
+        ],
+      },
+    ],
+  }
+  const GAP_WINDOW = 'from=2026-06-01T00:00:00.000Z&to=2026-06-20T00:00:00.000Z&tz=0'
+
+  it('GET /activity — a gap is its own bucket, counts in total, and claims no author', async () => {
+    const a = await createApp(gapFixture)
+    const r = (await a.inject({ method: 'GET', url: `/api/s/main/activity?${GAP_WINDOW}` })).json()
+
+    expect(ActivityResponseSchema.safeParse(r).success).toBe(true)
+    const byDate = Object.fromEntries(r.days.map((d: { date: string }) => [d.date, d]))
+    // Never classified from raw columns: not `edited`, even though the row is one.
+    expect(byDate['2026-06-11']).toMatchObject({
+      created: 0,
+      edited: 0,
+      deleted: 0,
+      unavailable: 1,
+    })
+    // …and `total` is the day's whole activity, or the heatmap shows an empty cell
+    // on a day something demonstrably happened.
+    expect(byDate['2026-06-11'].total).toBe(1)
+  })
+
+  it('GET /activity — a gap alone never turns the mine/everyone gate on (#327)', async () => {
+    // The gate asks "was anyone ELSE here". A gap carries no principal, so it is
+    // activity that belongs to nobody: counting it as another author's would show
+    // a toggle whose "everyone" view is identical to "mine".
+    const fx: Fixture = {
+      ...gapFixture,
+      auth: {
+        users: [{ username: 'alice', password: 'alice-password-1', displayName: 'Alice' }],
+        members: [{ space: 'main', username: 'alice', role: 'owner' }],
+      },
+      spaces: [
+        {
+          ...gapFixture.spaces[0],
+          activity: [
+            { date: '2026-06-10', kind: 'edited', title: 'Mine', principal: 'user:alice' },
+            {
+              date: '2026-06-11',
+              kind: 'edited',
+              title: 'Their Secret Note',
+              principal: 'user:bob',
+              unavailable: true,
+            },
+          ],
+        },
+      ],
+    }
+    const a = await createApp(fx)
+    const login = await a.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      payload: { username: 'alice', password: 'alice-password-1' },
+    })
+    const cookie = (login.headers['set-cookie'] as string).split(';')[0]
+    const all = (
+      await a.inject({
+        method: 'GET',
+        url: `/api/s/main/activity?${GAP_WINDOW}`,
+        headers: { cookie },
+      })
+    ).json()
+
+    expect(all.hasOtherAuthors).toBe(false)
+    // The gap is still IN the window — the flag is false because it is unattributed,
+    // not because the row was dropped.
+    expect(all.days.reduce((s: number, d: { total: number }) => s + d.total, 0)).toBe(2)
+    // And an author scope cannot adopt it either.
+    const mine = (
+      await a.inject({
+        method: 'GET',
+        url: `/api/s/main/activity?${GAP_WINDOW}&author=mine`,
+        headers: { cookie },
+      })
+    ).json()
+
+    expect(mine.days.reduce((s: number, d: { unavailable: number }) => s + d.unavailable, 0)).toBe(
+      0,
+    )
+  })
+
+  it('GET /activity/events + note history — a gap is unattributed on every surface', async () => {
+    const a = await createApp(gapFixture)
+    const feed = (
+      await a.inject({ method: 'GET', url: `/api/s/main/activity/events?${GAP_WINDOW}` })
+    ).json()
+    const gap = feed.events.find(
+      (e: { unavailableReason?: string }) => e.unavailableReason === 'identity-conflict',
+    )
+
+    expect(gap).toBeDefined()
+    expect(gap).toMatchObject({
+      kind: 'unavailable',
+      // The one label a gap carries: not the note's title, and not '' — every
+      // surface renders an empty string as "Untitled".
+      title: 'Unavailable revision',
+      principal: null,
+      // A null principal ordinarily reads as "an external edit with no signer";
+      // for a row whose writer is merely withheld that is a lie.
+      author: null,
+    })
+    // The trusted row beside it keeps everything.
+    expect(feed.events.find((e: { title: string }) => e.title === 'Mine')).toMatchObject({
+      kind: 'edited',
+      principal: 'ui',
+    })
+
+    // The same row through the note's own history, list and detail — one object
+    // must not answer differently on two handles.
+    const list = (
+      await a.inject({ method: 'GET', url: '/api/note/revisions?id=fake-shared' })
+    ).json()
+    const listed = list.revisions.find(
+      (r: { unavailableReason?: string }) => r.unavailableReason === 'identity-conflict',
+    )
+
+    expect(listed).toMatchObject({
+      title: 'Unavailable revision',
+      author: null,
+      principal: null,
+      contentHash: null,
+      baseRev: null,
+    })
+    const detail = (
+      await a.inject({
+        method: 'GET',
+        url: `/api/note/revision?id=fake-shared&revisionId=${listed.revisionId}`,
+      })
+    ).json()
+
+    expect(detail).toMatchObject({
+      unavailableReason: 'identity-conflict',
+      title: 'Unavailable revision',
+      author: null,
+      content: null,
+    })
+  })
+
   it('GET /activity — day buckets, baseline + hidden class excluded', async () => {
     const r = await aget(
       '/api/s/main/activity?from=2026-06-01T00:00:00.000Z&to=2026-06-20T00:00:00.000Z&tz=0',
@@ -891,7 +1073,9 @@ describe('activity (#33)', () => {
       await a.inject({ method: 'GET', url: `/api/s/main/activity?${win}&author=mine` })
     ).json()
     expect(ActivityResponseSchema.safeParse(mine).success).toBe(true)
-    expect(mine.days).toEqual([{ date: '2026-06-10', created: 1, edited: 1, deleted: 0, total: 2 }])
+    expect(mine.days).toEqual([
+      { date: '2026-06-10', created: 1, edited: 1, deleted: 0, unavailable: 0, total: 2 },
+    ])
     // The feed follows the same lens (total is post-filter).
     const ev = (
       await a.inject({ method: 'GET', url: '/api/s/main/activity/events?author=mine' })

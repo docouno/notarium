@@ -24,9 +24,15 @@ manifest.json
 sqlite/0000_baseline.sql
 sqlite/0001_agent_sessions.sql
 sqlite/0002_agent_session_role.sql
+sqlite/0003_revision_integrity.sql
+sqlite/0004_scoped_purge_fences.sql
+sqlite/0005_revision_entry_role.sql
 postgres/0000_baseline.sql
 postgres/0001_agent_sessions.sql
 postgres/0002_agent_session_role.sql
+postgres/0003_revision_integrity.sql
+postgres/0004_scoped_purge_fences.sql
+postgres/0005_revision_entry_role.sql
 ```
 
 `0001_agent_sessions` introduces durable agent episodes and separates each
@@ -44,6 +50,55 @@ longer written by the gateway.
 `0002_agent_session_role` adds the nullable selected role name to each durable episode.
 `NULL` is the base mode. Role package content remains file truth in `.notarium/skills`; the
 meta-DB stores only the episode's current selection.
+
+`0003_revision_integrity` adds the `integrity` axis to `note_revisions`. Existing rows
+become `trusted`: they predate the global arbiter, so nothing has contaminated them yet.
+A row turns `quarantined` only inside a settlement transaction, and every query then has
+to classify, filter and count on the EFFECTIVE fields rather than the stored ones — see
+[note-history.md](note-history.md#model).
+
+`0004_scoped_purge_fences` scopes the permanent purge fence to a space. Before it, the
+fence was keyed by note id alone, while the DELETE beside it was already space-scoped:
+one space emptying its trash permanently silenced the journal of a COLLIDING id in
+another, with no way to undo it. The migration adds `space` to `revision_purge_fences`,
+puts it in the primary key, and rewrites the insert trigger to `space IN ('', NEW.space)`.
+Legacy rows carry `space = ''` and stay GLOBAL: a purge decided before #327 cannot be
+un-decided from here, and pretending otherwise would resurrect a journal the user
+irreversibly erased. The new column is NOT NULL with no default in either dialect, so a
+writer that omits the space does not silently write a global one. NOT NULL alone does not
+carry that in SQLite: the pre-#327 writer is `INSERT OR IGNORE`, which swallows the
+violation and would commit its purge with no fence at all — the permissive opposite. SQLite
+therefore also gets a `BEFORE INSERT` guard, whose `RAISE(ABORT)` the statement's `OR
+IGNORE` cannot suppress. In PostgreSQL that writer fails one step earlier, on its `ON
+CONFLICT (kind, entity_id)`, which matches no constraint once the primary key moves. Either
+way a purge attempted from an old process during a mixed-version window errors instead of
+permanently silencing a colliding id it never knew about. That break is the deliberate half:
+this fence is the one write in the schema that cannot be undone afterwards. It also
+adds the indexes the quarantine closure walks (`base_rev`, `their_rev`, `source_rev`) and
+the one the pin re-key seeks (`context_scope_pins(note_space, note_id)`); without them a
+settlement of a long-lived note ran a full journal scan per revision, inside the
+transaction that holds every other meta-DB write.
+
+`0005_revision_entry_role` adds `entry_role` to `note_revisions` — what an entry IS in
+its note's life, written by the writer instead of inferred by each reader (see
+[note-history.md](note-history.md#model)). The backfill classifies the first row of each
+`(space, note_id)` — `baseline` when it is `external`, `origin` otherwise — and keeps the
+`base_rev IS NULL` conjunct byte-for-byte from the predicate it replaces: pre-#327 the
+chain was keyed by note id alone across spaces, so a legacy first row CAN carry a parent,
+and calling it a baseline would drop it out of Activity at migration time. It is written
+as a set (`MIN(id) … GROUP BY space, note_id`), not as a correlated subquery: measured on
+`node:sqlite`, the correlated form is quadratic in the space's journal (199 ms over 24k
+rows, 15.5 s over 200k) against 55 ms and 562 ms for this one; PostgreSQL plans the same
+text with an index subplan (185 ms / 2.0 s). The SQLite asset alone also creates
+`idx_note_revisions_space_note`: `space` and `note_id` lead two different indexes, and
+with no `sqlite_stat1` the planner walks the space's whole journal — `hasAnyFor` measured
+0.565 ms/call over 24k rows against 0.0034 ms with the index, and the writer asks it once
+per note. PostgreSQL needs no such index (`hasAnyFor` already seeks), so it does not get
+one; asymmetric dialect assets are precedented by `0004`. The column is `NOT NULL DEFAULT
+'change'` for the mixed-version window, which accepts two permanent consequences for rows
+written by an old process during it: its synthetic baselines count as edits, and a note
+BORN in that window reads as `edited` forever — inferring the role on read afterwards is
+exactly what this column abolishes.
 
 Role context presets reuse the baseline's existing `context_set_attachments`,
 `context_scope_pins`, and `context_order` tables with `target_kind='role'`. No new migration is

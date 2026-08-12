@@ -181,6 +181,7 @@ describe('reset hook fixture swap (#127: opaque space ids)', () => {
                 theirRevisionId: null,
                 sourceRevisionId: null,
                 kind: 'write',
+                entryRole: 'origin',
                 principal: 'ui',
                 contentHash: 'reset-audit-hash',
                 title: 'Reset audit note',

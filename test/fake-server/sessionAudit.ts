@@ -1,8 +1,9 @@
 import type { Revision } from '@notarium/core'
-import type {
-  AgentSessionAuditEvent,
-  AgentSessionAuditPersistence,
-  AgentSessionAuditSummary,
+import {
+  type AgentSessionAuditEvent,
+  type AgentSessionAuditPersistence,
+  type AgentSessionAuditSummary,
+  auditWriteGapOf,
 } from '@notarium/server'
 
 import type { InMemoryAgentSessions } from './agentSessions'
@@ -12,6 +13,9 @@ type AuditWrite = Extract<AgentSessionAuditEvent, { type: 'write' }> & {
   owner: string
   sessionId: string | null
   sessionName: string | null
+  /** The journal row this tap mirrors, so a later quarantine of that row reaches
+   *  the audit too — the SQL drivers read one row and see `integrity` directly. */
+  revisionId: string
 }
 
 type AuditGroup = {
@@ -32,6 +36,7 @@ const byNewest = (left: { at: string; source: number; id: string }, right: typeo
  * pinned separately by the shared SQLite/PostgreSQL persistence contract. */
 export class InMemorySessionAudit implements AgentSessionAuditPersistence {
   private writes: AuditWrite[] = []
+  private quarantined = new Set<string>()
   private nextWriteId = 0
 
   constructor(
@@ -48,6 +53,7 @@ export class InMemorySessionAudit implements AgentSessionAuditPersistence {
     this.writes.push({
       type: 'write',
       id: String(++this.nextWriteId),
+      revisionId: revision.id,
       at: revision.createdAt,
       owner: attribution.owner,
       agent: attribution.agent,
@@ -63,7 +69,20 @@ export class InMemorySessionAudit implements AgentSessionAuditPersistence {
     })
   }
 
+  /** The journal quarantined these rows — the audit mirrors the same rows, so the
+   *  write events built from them become gaps too. */
+  quarantineRevisions(revisionIds: readonly string[]): void {
+    for (const id of revisionIds) {
+      this.quarantined.add(id)
+    }
+  }
+
   clearWritesForSpace(space: string): void {
+    for (const write of this.writes) {
+      if (write.space === space) {
+        this.quarantined.delete(write.revisionId)
+      }
+    }
     this.writes = this.writes.filter((write) => write.space !== space)
   }
 
@@ -214,8 +233,8 @@ export class InMemorySessionAudit implements AgentSessionAuditPersistence {
         (row) =>
           row.owner === owner && row.sessionId === sessionId && (type == null || type === 'write'),
       )
-      .map((row) => ({
-        event: {
+      .map((row) => {
+        const event = {
           type: row.type,
           id: row.id,
           at: row.at,
@@ -227,11 +246,14 @@ export class InMemorySessionAudit implements AgentSessionAuditPersistence {
           title: row.title,
           class: row.class,
           revisionKind: row.revisionKind,
-        },
-        at: row.at,
-        source: 0,
-        id: row.id,
-      }))
+        }
+        return {
+          event: this.quarantined.has(row.revisionId) ? auditWriteGapOf(event) : event,
+          at: row.at,
+          source: 0,
+          id: row.id,
+        }
+      })
     const all = [...retrievals, ...writes].sort(byNewest)
     const rank = before?.source === 'retrieval' ? 1 : 0
     const matched = before

@@ -18,6 +18,13 @@ export class AuditedRevisionPersistence extends InMemoryRevisionPersistence {
     return stored
   }
 
+  /** One row, one integrity — the SQL drivers read `integrity` off the very row the
+   *  audit stream selects, so the tap must learn about a quarantine, not diverge. */
+  override quarantineForTest(revisionIds: readonly string[]): void {
+    super.quarantineForTest(revisionIds)
+    this.audit.quarantineRevisions(revisionIds)
+  }
+
   override clear(): void {
     super.clear()
     this.audit.clearWritesForSpace(this.space)

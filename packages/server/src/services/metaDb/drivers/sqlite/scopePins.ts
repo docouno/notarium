@@ -1,20 +1,30 @@
 import { scopePinOfRow, type ScopePinRow } from '../../rows'
 import type { ContextSetTargetKind, ScopePinRecord, ScopePinsPersistence } from '../../types'
 import type { SqliteDriverCtx } from './context'
+import { resolveLiveIdentityForWrite } from './liveIdentity'
 
 export const createScopePinsFacet = (ctx: SqliteDriverCtx): ScopePinsPersistence => ({
   addPin: async (r: ScopePinRecord) => {
     await ctx.ensureInit()
-    ctx.required
-      .prepare(
+    const db = ctx.required
+
+    db.exec('BEGIN IMMEDIATE')
+    try {
+      const noteId = resolveLiveIdentityForWrite(db, r.noteSpace, r.noteId)
+
+      db.prepare(
         `INSERT INTO context_scope_pins (target_kind, target_id, target_space, note_space, note_id, created_at)
            VALUES (?, ?, ?, ?, ?, ?)
            ON CONFLICT(target_kind, target_id, note_id) DO UPDATE SET
              target_space = excluded.target_space,
              note_space = excluded.note_space,
              created_at = excluded.created_at`,
-      )
-      .run(r.targetKind, r.targetId, r.targetSpace, r.noteSpace, r.noteId, r.createdAt)
+      ).run(r.targetKind, r.targetId, r.targetSpace, r.noteSpace, noteId, r.createdAt)
+      db.exec('COMMIT')
+    } catch (err) {
+      db.exec('ROLLBACK')
+      throw err
+    }
   },
   removePin: async (targetKind: ContextSetTargetKind, targetId: string, noteId: string) => {
     await ctx.ensureInit()

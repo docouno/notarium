@@ -35,6 +35,8 @@ export const STORE_ERROR_REASON = {
   noteNotInTrash: 'note_not_in_trash',
   revisionsUnavailable: 'revisions_unavailable',
   memoryConvergenceExhausted: 'memory_convergence_exhausted',
+  /** A reference write lost a race with an identity settlement — retryable (#327). */
+  referenceIdentityConflict: 'reference_identity_conflict',
 } as const
 
 /** What a CREATE does when a note already occupies its destination path.
@@ -120,12 +122,45 @@ export const REVISION_KIND = {
   delete: 'delete',
 } as const
 
+/** Whether a journaled row can still be believed. `quarantined` is set when a
+ *  cross-space id collision contaminated the note's chain (#327): the row keeps
+ *  its structural place — id, note, space, kind, time — and nothing else is
+ *  served from it. canon: docs/note-history.md#model · docs/core.md#identity */
+export const REVISION_INTEGRITY = { trusted: 'trusted', quarantined: 'quarantined' } as const
+
+/** What a journal entry IS in the life of its note, decided by the writer at append
+ *  and stored on the row. No consumer infers it: the approximation everyone used to
+ *  share (`kind='external' AND base_rev IS NULL`) stopped meaning "first entry" the
+ *  moment quarantine arrived — after it, a note has no trusted parent either (#327).
+ *  canon: docs/note-history.md#model */
+export const REVISION_ENTRY_ROLE = {
+  /** The note appeared through us — its first journaled state, written by us. */
+  origin: 'origin',
+  /** A synthetic pre-edit state, or the first sighting of a note that already
+   *  existed outside. Real history, but not activity: counting it would double a
+   *  pre-existing note's first edit. */
+  baseline: 'baseline',
+  /** Every later state of a note that already has journal entries. */
+  change: 'change',
+} as const
+
+/** Why a journal entry is served as a GAP. One value today; the field exists so a
+ *  future reason is an additive wire change rather than a new shape. */
+export const REVISION_UNAVAILABLE_REASON = { identityConflict: 'identity-conflict' } as const
+
+/** The one label a gap carries. Not the note's title — that is withheld — and not
+ *  an empty string either, which every surface would render as "Untitled". */
+export const REVISION_UNAVAILABLE_TITLE = 'Unavailable revision'
+
 /** Folder-scope depth. */
 export const DEPTH = { subtree: 'subtree', direct: 'direct' } as const
 
 export type Depth = (typeof DEPTH)[keyof typeof DEPTH]
 export type IfExists = (typeof IF_EXISTS)[keyof typeof IF_EXISTS]
 export type RevisionKind = (typeof REVISION_KIND)[keyof typeof REVISION_KIND]
+export type RevisionEntryRole = (typeof REVISION_ENTRY_ROLE)[keyof typeof REVISION_ENTRY_ROLE]
+export type RevisionUnavailableReason =
+  (typeof REVISION_UNAVAILABLE_REASON)[keyof typeof REVISION_UNAVAILABLE_REASON]
 export type NoteClass = (typeof NOTE_CLASS)[keyof typeof NOTE_CLASS]
 export type ReadScope = (typeof READ_SCOPE)[keyof typeof READ_SCOPE]
 export type ScanPhase = (typeof SCAN_PHASE)[keyof typeof SCAN_PHASE]

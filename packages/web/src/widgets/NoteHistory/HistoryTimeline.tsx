@@ -5,7 +5,6 @@
 // contract. Props-driven, transport via the host-wired source port.
 
 import { useCallback, useEffect, useState } from 'react'
-import { REVISION_KIND } from '@notarium/contract/enums'
 import { Button } from '../../core/Button'
 import { EmptyState } from '../../core/EmptyState'
 import { IconHistory } from '../../core/Icons'
@@ -14,7 +13,7 @@ import { authorLabel } from '../../libs/author'
 import { cx } from '../../libs/cx/cx'
 import { exactDateTime, timeAgo } from '../../libs/datetime'
 import type { NoteHistorySource, RevisionView } from '../../libs/revisions'
-import { KIND_LABEL } from './helpers'
+import { historyRowLabels } from './helpers'
 import styles from './HistoryTimeline.module.scss'
 
 const PAGE = 50
@@ -117,13 +116,12 @@ export const HistoryTimeline = ({
         />
       )}
       {revisions.map((r, i) => {
-        // A restore names its source when that revision is in the loaded window
-        // ("Restored from v3"); out of window it stays a plain "Restored".
         const sourceVersion = r.sourceRevisionId ? versionByRev.get(r.sourceRevisionId) : undefined
-        const kindLabel =
-          r.kind === REVISION_KIND.restore && sourceVersion != null
-            ? `Restored from v${sourceVersion}`
-            : KIND_LABEL[r.kind]
+        const {
+          kind: kindLabel,
+          who,
+          gap,
+        } = historyRowLabels(r, sourceVersion, authorLabel(r.author).text)
         return (
           <button
             key={r.revisionId}
@@ -138,6 +136,7 @@ export const HistoryTimeline = ({
             }
             data-testid="history-item"
             data-kind={r.kind}
+            data-unavailable={gap || undefined}
           >
             {/* Left: the version name. Auto-numbered v1..vN (v1 = oldest); the
               array is newest-first and contiguous from the top, so index i is
@@ -145,13 +144,11 @@ export const HistoryTimeline = ({
               older pages load. `r.name` overrides it once rename ships. */}
             <span className={styles.version}>
               {r.name ?? `v${total - i}`}
-              <span className={cx(styles.kind, styles[`kind-${r.kind}`])}>{kindLabel}</span>
+              {/* A gap gets no colour of its own — nothing about it is attributable. */}
+              <span className={cx(styles.kind, !gap && styles[`kind-${r.kind}`])}>{kindLabel}</span>
             </span>
             {/* Right: who made the change, and how big it was. */}
-            <span className={styles.itemWho}>
-              {authorLabel(r.author).text}
-              {r.contentHash == null && r.kind !== REVISION_KIND.delete && ' · body unknown'}
-            </span>
+            <span className={styles.itemWho}>{who}</span>
             <span className={styles.itemWhen} title={exactDateTime(r.createdAt)}>
               {timeAgo(r.createdAt)}
             </span>

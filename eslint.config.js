@@ -135,6 +135,55 @@ export default tseslint.config(
       ],
     },
   },
+  // ── Postgres lock order, layer 0: a tiered lock is taken through a helper ────
+  // The meta-DB's lock hierarchy is stated in ONE module
+  // (services/metaDb/drivers/pg/lockOrder.ts, with the revision stripes in
+  // revisionLocks.ts) and checked by test/meta-db-contract/pgLockOrder.test.ts. That
+  // check can only recognize a lock it can name, so the locks have to come from a
+  // finite surface: 15 of the 21 tiered lock statements used to be inline
+  // `client.query`, in 15 shapes, two of them assembled by interpolation and carrying
+  // no text at all. This rule is what makes the surface finite (#327).
+  //
+  // The selector matches the CALLED MEMBER `.query`, not a receiver named `client`:
+  // half the driver goes through `ctx.required.query`, and a rule keyed to a variable
+  // name would leave a hole in its own foundation.
+  //
+  // A non-tiered lock (the setup mutex, the jobs queue, an OAuth client table, a
+  // session row, a spaces row) is exempt where it stands, with the reason inline —
+  // it is outside the hierarchy, so it constrains nothing and no helper owns it.
+  //
+  // A narrow `files` block REPLACES `no-restricted-syntax` wholesale for the files it
+  // matches, so the repo-wide `TSEnumDeclaration` ban above is repeated here.
+  {
+    files: [
+      'packages/server/src/services/metaDb/drivers/pg/**/*.ts',
+      'packages/server/src/services/metaDb/pgMetaDb.ts',
+      'packages/server/src/services/metaDb/migrations/runPgMigrations.ts',
+    ],
+    ignores: [
+      'packages/server/src/services/metaDb/drivers/pg/lockOrder.ts',
+      'packages/server/src/services/metaDb/drivers/pg/revisionLocks.ts',
+    ],
+    rules: {
+      'no-restricted-syntax': [
+        'error',
+        { selector: 'TSEnumDeclaration', message: 'Use objects with `as const` instead of enum' },
+        {
+          selector:
+            "CallExpression[callee.property.name='query'] > Literal[value=/FOR\\s+(NO\\s+KEY\\s+)?UPDATE|FOR\\s+(KEY\\s+)?SHARE|pg_advisory|LOCK\\s+TABLE/i]",
+          message:
+            'Take a tiered lock through drivers/pg/lockOrder (or revisionLocks) — the order is stated and checked there, and a lock taken here is invisible to both (#327).',
+        },
+        {
+          selector:
+            "CallExpression[callee.property.name='query'] > TemplateLiteral > TemplateElement[value.raw=/FOR\\s+(NO\\s+KEY\\s+)?UPDATE|FOR\\s+(KEY\\s+)?SHARE|pg_advisory|LOCK\\s+TABLE/i]",
+          message:
+            'Take a tiered lock through drivers/pg/lockOrder (or revisionLocks) — the order is stated and checked there, and a lock taken here is invisible to both (#327).',
+        },
+      ],
+    },
+  },
+
   {
     files: ['packages/*/src/**/*.{ts,tsx}', 'test/**/*.ts'],
     // d.ts: declaration merging (interface Window) is impossible without interface.

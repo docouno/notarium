@@ -1,5 +1,11 @@
 import { z } from 'zod'
-import { AUTHOR_KIND, NOTE_CLASS, PROJECT_STATUS, REVISION_KIND } from '../consts/primitives'
+import {
+  AUTHOR_KIND,
+  NOTE_CLASS,
+  PROJECT_STATUS,
+  REVISION_KIND,
+  REVISION_UNAVAILABLE_REASON,
+} from '../consts/primitives'
 import { enumValues } from '../libs/enumValues'
 
 const isWellFormedUnicode = (value: string): boolean => {
@@ -182,6 +188,11 @@ export const AuthorSchema = z.object({
 export type Author = z.infer<typeof AuthorSchema>
 
 export const RevisionKindSchema = z.enum(enumValues(REVISION_KIND))
+/** A journal GAP marker (#327). Present ONLY on a sanitized entry: its payload,
+ *  attribution and chain links are withheld because a cross-space id collision
+ *  contaminated the note's history. Every surface that can carry a revision
+ *  carries this field optionally, so the addition is backwards-compatible. */
+export const RevisionUnavailableReasonSchema = z.enum(enumValues(REVISION_UNAVAILABLE_REASON))
 /** Project lifecycle: active projects fill the default lists; archived ones stay
  *  addressable but drop out (archive-not-delete — agent delete does not exist, C1). */
 export const ProjectStatusSchema = z.enum(enumValues(PROJECT_STATUS))

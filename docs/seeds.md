@@ -103,6 +103,7 @@ and for `security` — it parses the sanitized HTML into a live DOM and checks t
 | `graph-load` | scalable linked communities: 300 nodes / ~900 links per scale unit; `SCALE=10` reproduces the 3k/9k cold-enrichment workload (#195/#284) | graph, scale |
 | `search-corpus` | a spotlight corpus: same-named notes, content/path-match, tag case-fold (#188/#204) | search, content |
 | `external-edits` | a direct same-size, mtime-preserving markdown rewrite: search marker + graph edge must self-heal on server boot/poll (#267) | search, graph, content |
+| `identity-collision` | one `notarium-id` planted in two spaces on disk: the arbiter must leave a single durable owner and re-mint the loser on the next boot (#327) | identity, structure, history |
 | `name-collisions` | the states that flow from "a title picks the file name": a folder primed for the refusal dialog, an already-uniquified `Retro`/`Retro 2`/`Retro 3` family, the same title in two folders, and a folder page whose reserved `index.md` deliberately does not collide — [note-model.md](note-model.md#create-collisions) | identity, structure |
 
 **Content / reader:**
@@ -167,6 +168,34 @@ from **the same resolver as the server** (`dataPathsFromEnv`, [a single data-roo
 not from its own copy: it writes exactly the files that the stand later reads, so a
 divergence would seed one stand but bring up another.
 The default login for the stand is **`admin` / `admin`** (see «Login» below).
+
+### The `identity-collision` filesystem seam (#327)
+
+The same shape as `external-edits`, for the other bug that only exists outside the
+store: two spaces whose files claim ONE `notarium-id` — what copying a vault folder
+produces. It cannot be a timeline `edit` either; a write through the store would just
+mint a second id. The real applier writes both notes normally, then replaces the
+claimant's `notarium-id` frontmatter with the id the owner actually got
+(`externalIdentityClaims`, resolved after replay because neither id exists before it).
+Both ids are 12 chars, so the rewrite rides the same size + mtime-preserving helper.
+The stand then boots onto a live collision, and the arbiter has to settle one owner,
+converge the claimant's file onto its own id and keep that answer across polls
+([identity](core.md#identity)).
+
+The FAKE stand does not project the collision: it has no arbiter to run, so it can
+only show the converged end state — two notes with two distinct ids, which is what the
+fixture already carries. Only the real stand exercises the repair.
+
+What the fake CAN show is what the repair leaves behind. The claimant's timeline
+carries a revision marked `unavailable` — a journal **gap** (#327) — followed by an
+ordinary edit, so the Activity surfaces built for that state (the neutral feed row,
+the `unavailable` heatmap bucket) are visible on a stand instead of only in a unit
+test. The flag lives on the `edit` event and is honoured by the FAKE applier alone: a
+quarantine is decided inside the real meta-DB's settlement transaction, so the real
+applier replays an ordinary edit and lets the arbiter reach that row itself. The pair
+of rows is deliberate — the gap and the edit AFTER it sit on a note whose trusted past
+is gone, and telling them apart is exactly what the stored entry role does
+([note-history](note-history.md#model)).
 
 ### The `external-edits` filesystem seam (#267)
 

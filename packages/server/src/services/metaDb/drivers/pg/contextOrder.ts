@@ -1,20 +1,9 @@
+import { referenceIdentityConflict } from '../../identityRefs'
 import { contextOrderOfRow, type ContextOrderRow, dedupOrderEntries } from '../../rows'
 import type { ContextOrderPersistence, ContextSetTargetKind } from '../../types'
 import type { PgDriverCtx } from './context'
-
-/** Namespaces the two-arg per-scope reorder lock so it can never alias the single-arg SETUP_LOCK_KEY. */
-const CONTEXT_ORDER_LOCK_NS = 0x6374_4f72 // 'ctOr'
-
-/** Keys the per-scope advisory lock; a hash collision merely serializes two unrelated scopes, never a correctness issue. */
-const hash32 = (s: string): number => {
-  let h = 0
-
-  for (let i = 0; i < s.length; i++) {
-    h = (Math.imul(31, h) + s.charCodeAt(i)) | 0
-  }
-
-  return h
-}
+import { enterIdentityTierForReferences } from './liveIdentity'
+import { lockContextOrderScopes, lockScopePinsInScope } from './lockOrder'
 
 export const createContextOrderFacet = (ctx: PgDriverCtx): ContextOrderPersistence => ({
   orderForTarget: async (targetKind: ContextSetTargetKind, targetId: string) => {
@@ -29,15 +18,42 @@ export const createContextOrderFacet = (ctx: PgDriverCtx): ContextOrderPersisten
   // DELETE-then-INSERT txns miss each other's committed rows (READ COMMITTED) → PK unique_violation.
   setOrder: async (targetKind, targetId, targetSpace, entries) => {
     await ctx.ensureInit()
-    const rows = dedupOrderEntries(entries)
     const client = await ctx.required.connect()
 
     try {
       await client.query('BEGIN')
-      await client.query('SELECT pg_advisory_xact_lock($1, $2)', [
-        CONTEXT_ORDER_LOCK_NS,
-        hash32(`${targetKind}:${targetId}`),
-      ])
+      const pinRefs = entries.filter((e) => e.entryKind === 'pin').map((e) => e.entryRef)
+      // Tier 1 before tier 2, and the WHOLE list in one entry per level — see
+      // `lockOrder`. The settlement enters at identity and reaches this scope's
+      // advisory lock later; taking them the other way round is the deadlock this
+      // order exists to prevent, and resolving entry by entry re-enters tier 1 in the
+      // client's order, which is the same deadlock against another reorder.
+      const identity = await enterIdentityTierForReferences(client, pinRefs)
+      // The membership rows (tier 2d) come BEFORE the scope advisory (tier 2e), and
+      // they are what carries each entry's home space: a scope's space says nothing
+      // about where a pinned note lives.
+      const { rows: pins } = await lockScopePinsInScope(client, targetKind, targetId, pinRefs)
+      const spaceOfPin = new Map(pins.map((pin) => [pin.note_id, pin.note_space]))
+      const canonical = entries.map((entry) => {
+        if (entry.entryKind !== 'pin') {
+          return entry
+        }
+        const noteSpace = spaceOfPin.get(entry.entryRef)
+
+        if (noteSpace != null) {
+          return { ...entry, entryRef: identity.canonical(noteSpace, entry.entryRef) }
+        }
+        if (identity.isRetired(entry.entryRef)) {
+          throw referenceIdentityConflict(entry.entryRef)
+        }
+
+        // A stale non-member: it ranks nothing, exactly as before.
+        return entry
+      })
+
+      await lockContextOrderScopes(client, [{ targetKind, targetId }])
+      const rows = dedupOrderEntries(canonical)
+
       await client.query('DELETE FROM context_order WHERE target_kind = $1 AND target_id = $2', [
         targetKind,
         targetId,

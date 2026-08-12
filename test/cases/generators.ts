@@ -10,6 +10,7 @@ import type {
   ContextOrderDecl,
   ContextSetDecl,
   DurableImportDecl,
+  ExternalIdentityClaimDecl,
   ExternalRewriteDecl,
   FavoriteDecl,
   JobDecl,
@@ -187,6 +188,7 @@ export class WorldBuilder {
   private readonly jobs: JobDecl[] = []
   private readonly durableImports: DurableImportDecl[] = []
   private readonly externalRewrites: ExternalRewriteDecl[] = []
+  private readonly externalIdentityClaims: ExternalIdentityClaimDecl[] = []
   private readonly events: CaseEvent[] = []
   private hasAuth = false
   private idSeq = 0
@@ -365,6 +367,12 @@ export class WorldBuilder {
     return this
   }
 
+  /** Plant a cross-space `notarium-id` collision on disk (#327). */
+  externalIdentityClaim(decl: ExternalIdentityClaimDecl): this {
+    this.externalIdentityClaims.push(decl)
+    return this
+  }
+
   build(): CaseWorld {
     return {
       now: this.now.toISOString(),
@@ -392,6 +400,9 @@ export class WorldBuilder {
       ...(this.jobs.length ? { jobs: this.jobs } : {}),
       ...(this.durableImports.length ? { durableImports: this.durableImports } : {}),
       ...(this.externalRewrites.length ? { externalRewrites: this.externalRewrites } : {}),
+      ...(this.externalIdentityClaims.length
+        ? { externalIdentityClaims: this.externalIdentityClaims }
+        : {}),
     }
   }
 

@@ -146,7 +146,11 @@ const buildProjectBundle = async (
         principal: r.principal,
         ...(hinted.space === personal ? {} : { space: hintedSlug }),
         ...(projectHandle ? { project: projectHandle } : {}),
+        // A gap keeps its place in this space-wide stream. Its CURRENT authorized
+        // location may still be labelled — the journal never stored a historical
+        // path, and a missing one is an absent label, never a filter (#327).
         ...(path ? { path } : {}),
+        ...(r.unavailableReason ? { unavailableReason: r.unavailableReason } : {}),
         modifiedAt: r.createdAt,
       }
     })

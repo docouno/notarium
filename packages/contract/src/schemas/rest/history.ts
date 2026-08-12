@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { AuthorSchema, RevisionKindSchema } from '../primitives'
+import { AuthorSchema, RevisionKindSchema, RevisionUnavailableReasonSchema } from '../primitives'
 
 /** One row of a note's timeline. `revisionId` is opaque and orders the
  *  timeline (newest first as served). `createdAt` here is a FULL ISO
@@ -30,6 +30,8 @@ export const NoteRevisionSchema = z.object({
    *  oversized diff, pre-stats row). */
   charsAdded: z.number().nullable(),
   charsRemoved: z.number().nullable(),
+  /** A journal GAP — see `RevisionUnavailableReasonSchema`. */
+  unavailableReason: RevisionUnavailableReasonSchema.optional(),
 })
 
 /** GET /api/note/revisions query: a window over the note's timeline, newest

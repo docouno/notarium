@@ -146,14 +146,14 @@ const gatePurge = (revisions: InMemoryRevisionPersistence) => {
   const purge = revisions.purgeNotes.bind(revisions)
   let armed = true
 
-  revisions.purgeNotes = async (ids) => {
+  revisions.purgeNotes = async (space, ids) => {
     if (armed) {
       armed = false
       entered.resolve()
       await release.promise
     }
 
-    return purge(ids)
+    return purge(space, ids)
   }
 
   return { entered: entered.promise, release: release.resolve }
@@ -241,14 +241,14 @@ const gateRevisionGet = (revisions: InMemoryRevisionPersistence) => {
   const get = revisions.get.bind(revisions)
   let armed = true
 
-  revisions.get = async (revisionId) => {
+  revisions.get = async (space, revisionId) => {
     if (armed) {
       armed = false
       entered.resolve()
       await release.promise
     }
 
-    return get(revisionId)
+    return get(space, revisionId)
   }
 
   return { entered: entered.promise, release: release.resolve }

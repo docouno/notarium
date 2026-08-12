@@ -10,7 +10,9 @@ import {
 import { PgMetaDb } from '../../packages/server/src/services/metaDb/pgMetaDb'
 import { describeAgentDeltaCursorsContract } from './agentDeltaCursorsContract'
 import { describeAgentSessionsContract } from './agentSessionsContract'
+import { describeFavoritesContract } from './favoritesContract'
 import { describeGatewayStateContract } from './gatewayStateContract'
+import { describeIdentityPersistenceContract } from './identityPersistenceContract'
 import { createPostgresTestSchema, describePostgres } from './postgresHarness'
 import { describeRevisionPersistenceContract } from './revisionPersistenceContract'
 import { describeSessionAuditContract } from './sessionAuditContract'
@@ -115,6 +117,7 @@ const revision = (noteId: string, over: Partial<RevisionInput> = {}): RevisionIn
   theirRevisionId: null,
   sourceRevisionId: null,
   kind: 'write',
+  entryRole: 'origin',
   principal: 'ui',
   contentHash: `${noteId}-hash`,
   title: noteId,
@@ -252,9 +255,94 @@ describePostgres('live Postgres driver', () => {
     return { persistence: testSchema.db.sessions, teardown: testSchema.teardown }
   })
 
+  describeFavoritesContract('Postgres', async () => {
+    const testSchema = await createPostgresTestSchema('favorites_contract')
+    return { persistence: testSchema.db.favorites, teardown: testSchema.teardown }
+  })
+
+  it('unfavorites through the id the client still holds after a settlement', async () => {
+    // Twin of the SQLite case in test/unit/metaDb.test.ts: the route resolves the note
+    // before it calls, and a settlement can commit in between, taking the favourite
+    // onto the successor id. Removing only the named id leaves the row on screen after
+    // an unfavorite that answered ok.
+    const testSchema = await createPostgresTestSchema('favorites_settlement')
+    const record = {
+      id: 'old-id',
+      filePath: 'a.md',
+      space: 'team',
+      createdAt: null,
+      materialized: true,
+      deletedAt: null,
+    }
+
+    try {
+      await testSchema.db.identity.claimMany([record])
+      await testSchema.db.favorites.add({
+        owner: 'user:al',
+        space: 'team',
+        kind: 'note',
+        entityId: 'old-id',
+        createdAt: '2026-06-23T10:00:00.000Z',
+        rank: null,
+      })
+      await testSchema.db.identity.settleFileClaim({
+        space: 'team',
+        filePath: 'a.md',
+        current: record,
+        observedId: 'new-id',
+        at: '2026-06-23T11:00:00.000Z',
+      })
+
+      expect(await testSchema.db.favorites.ids('user:al', 'team', 'note')).toEqual(['new-id'])
+
+      await testSchema.db.favorites.removeByEntity('user:al', 'team', 'old-id')
+
+      expect(await testSchema.db.favorites.list('user:al', 'team')).toEqual([])
+    } finally {
+      await testSchema.teardown()
+    }
+  })
+
   describeRevisionPersistenceContract('Postgres', async () => {
     const testSchema = await createPostgresTestSchema('revision_contract')
-    return { persistence: testSchema.db.revisions, teardown: testSchema.teardown }
+    return {
+      persistence: testSchema.db.revisions,
+      // Written the way the identity aggregate's settlement transaction leaves it —
+      // the revision port has no way to decide a quarantine.
+      quarantine: async (revisionIds) => {
+        await testSchema.admin.query(
+          `UPDATE "${testSchema.schema.replaceAll('"', '""')}".note_revisions
+              SET integrity = 'quarantined'
+            WHERE id = ANY($1::bigint[])`,
+          [revisionIds],
+        )
+      },
+      teardown: testSchema.teardown,
+    }
+  })
+
+  // Two pools onto ONE schema: the arbitration contract is about independent
+  // sessions racing for an id, so a single connection would prove nothing.
+  describeIdentityPersistenceContract('Postgres', async () => {
+    const testSchema = await createPostgresTestSchema('identity_contract')
+    const peer = new PgMetaDb(testSchema.scopedUrl)
+
+    return {
+      alpha: testSchema.db,
+      beta: peer,
+      // The port cannot produce a payload it refuses to read back; write it the
+      // way a hand edit or an older schema would have.
+      corruptContextSetItems: async (setId, raw) => {
+        await testSchema.admin.query(
+          `UPDATE "${testSchema.schema.replaceAll('"', '""')}".context_sets SET items = $1 WHERE id = $2`,
+          [raw, setId],
+        )
+      },
+      teardown: async () => {
+        await peer.close()
+        await testSchema.teardown()
+      },
+    }
   })
 
   describeSessionAuditContract('Postgres', async () => {
@@ -265,6 +353,247 @@ describePostgres('live Postgres driver', () => {
       revisions: testSchema.db.revisions,
       sessions: testSchema.db.sessions,
       teardown: testSchema.teardown,
+    }
+  })
+
+  // Both lock-order races the #327 review found, forced deterministically rather than
+  // hoped for. A settlement enters at tier 1 (identity) and reaches tier 2 (the scope
+  // advisory) and tier 3 (revision stripes) later; the two peers below used to enter
+  // at tier 2 and tier 3 and reach for identity afterwards, which is a cycle. Parking
+  // the settlement on a favourites row holds it between the tiers so the interleaving
+  // is not left to chance. canon: drivers/pg/lockOrder
+  const seedForSettlement = async (
+    testSchema: Awaited<ReturnType<typeof createPostgresTestSchema>>,
+  ): Promise<void> => {
+    await testSchema.db.identity.claimMany([
+      {
+        id: 'X',
+        filePath: 'owned.md',
+        space: 'alpha',
+        createdAt: null,
+        materialized: true,
+        deletedAt: null,
+      },
+      // The claimant's own durable row: without it there is no tuple for a peer to
+      // block on, and the race the test means to force never forms.
+      {
+        id: 'beta-auto-01',
+        filePath: 'copy.md',
+        space: 'beta',
+        createdAt: null,
+        materialized: false,
+        deletedAt: null,
+      },
+    ])
+    // A claimant favourite gives the settlement a tier-2 row to park on.
+    await testSchema.db.favorites.add({
+      owner: 'user:beta',
+      space: 'beta',
+      kind: 'note',
+      entityId: 'beta-auto-01',
+      createdAt: '2026-06-12T10:00:00.000Z',
+      rank: null,
+    })
+  }
+
+  const settleForeignClaim = (
+    testSchema: Awaited<ReturnType<typeof createPostgresTestSchema>>,
+  ): Promise<unknown> =>
+    testSchema.db.identity.settleFileClaim({
+      space: 'beta',
+      filePath: 'copy.md',
+      current: {
+        id: 'beta-auto-01',
+        filePath: 'copy.md',
+        space: 'beta',
+        createdAt: null,
+        materialized: false,
+        deletedAt: null,
+      },
+      observedId: 'X',
+      at: '2026-06-12T10:00:00.000Z',
+    })
+
+  it('orders a scope reorder behind a settlement holding the same identity', async () => {
+    const testSchema = await createPostgresTestSchema('identity_reorder_order')
+    const blockerPool = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const blocker = await blockerPool.connect()
+    let settleTask: Promise<unknown> | undefined
+    let reorderTask: Promise<unknown> | undefined
+
+    try {
+      // Pinned under the OBSERVED id BEFORE the owner claims it — the legacy shape a
+      // collision leaves behind, and the reference a foreign-owner settlement migrates
+      // (and therefore the scope whose advisory lock it reaches for). Pinning after the
+      // claim is impossible by design: `addPin` refuses a foreign id.
+      await testSchema.db.scopePins.addPin({
+        targetKind: 'project',
+        targetId: 'scope-1',
+        targetSpace: 'beta',
+        noteSpace: 'beta',
+        noteId: 'X',
+        createdAt: '2026-06-12T10:00:00.000Z',
+      })
+      await seedForSettlement(testSchema)
+
+      // Park the settlement AFTER its identity rows, before it reaches the scope.
+      await blocker.query('BEGIN')
+      await blocker.query(
+        `SELECT owner FROM favorites WHERE owner = $1 AND space = $2 AND kind = 'note' AND entity_id = $3 FOR UPDATE`,
+        ['user:beta', 'beta', 'beta-auto-01'],
+      )
+
+      settleTask = settleForeignClaim(testSchema)
+      await waitForTupleLockWaiter(testSchema)
+
+      reorderTask = testSchema.db.contextOrder.setOrder('project', 'scope-1', 'beta', [
+        { entryKind: 'pin', entryRef: 'beta-auto-01' },
+      ])
+      await waitForTupleLockWaiter(testSchema, 2)
+      await blocker.query('COMMIT')
+
+      // Neither may be chosen as a deadlock victim: the reorder waits at tier 1 for
+      // the settlement it can never be ahead of.
+      await withTimeout(Promise.all([settleTask, reorderTask]), 5_000)
+      expect(await testSchema.db.identity.findById!('X')).toMatchObject({ space: 'alpha' })
+      expect(
+        (await testSchema.db.contextOrder.orderForTarget('project', 'scope-1')).map(
+          (entry) => entry.entryRef,
+        ),
+      ).toEqual(['beta-auto-01'])
+    } finally {
+      await blocker.query('ROLLBACK').catch(() => {})
+      await Promise.allSettled([settleTask, reorderTask].filter((task) => task != null))
+      blocker.release()
+      await blockerPool.end()
+      await testSchema.teardown()
+    }
+  })
+
+  it('orders a whole-space purge behind a settlement holding the same identity', async () => {
+    const testSchema = await createPostgresTestSchema('identity_purge_order')
+    const blockerPool = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const blocker = await blockerPool.connect()
+    let settleTask: Promise<unknown> | undefined
+    let purgeTask: Promise<void> | undefined
+
+    try {
+      await seedForSettlement(testSchema)
+      await testSchema.db.spaces.upsert({
+        id: 'beta',
+        slug: 'beta',
+        notesDir: 'beta',
+        displayName: 'Beta',
+        aliases: [],
+        createdAt: '2026-06-12T10:00:00.000Z',
+        archivedAt: null,
+        archivedBy: null,
+      })
+      // A journal for the claimant id, so the settlement actually reaches the
+      // revision tier the purge also wants.
+      await testSchema.db.revisions.append(
+        {
+          noteId: 'X',
+          space: 'beta',
+          baseRevisionId: null,
+          theirRevisionId: null,
+          sourceRevisionId: null,
+          kind: 'write',
+          entryRole: 'origin',
+          principal: 'user:beta',
+          contentHash: null,
+          title: 'Copy',
+          class: 'user-doc',
+          slug: null,
+          tags: [],
+          createdAt: '2026-06-12T10:00:00.000Z',
+          charsAdded: null,
+          charsRemoved: null,
+        } satisfies RevisionInput,
+        null,
+      )
+
+      await blocker.query('BEGIN')
+      await blocker.query(
+        `SELECT owner FROM favorites WHERE owner = $1 AND space = $2 AND kind = 'note' AND entity_id = $3 FOR UPDATE`,
+        ['user:beta', 'beta', 'beta-auto-01'],
+      )
+
+      settleTask = settleForeignClaim(testSchema)
+      await waitForTupleLockWaiter(testSchema)
+
+      purgeTask = testSchema.db.purgeSpace('beta')
+      await waitForTupleLockWaiter(testSchema, 2)
+      await blocker.query('COMMIT')
+
+      await withTimeout(Promise.all([settleTask, purgeTask]), 5_000)
+      expect(await testSchema.db.identity.findById!('X')).toMatchObject({ space: 'alpha' })
+    } finally {
+      await blocker.query('ROLLBACK').catch(() => {})
+      await Promise.allSettled([settleTask, purgeTask].filter((task) => task != null))
+      blocker.release()
+      await blockerPool.end()
+      await testSchema.teardown()
+    }
+  })
+
+  it('enters the revision tier through the wide-scan mutex when its keys are unknown', async () => {
+    const testSchema = await createPostgresTestSchema('identity_wide_scan_order')
+    const blockerPool = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const blocker = await blockerPool.connect()
+    let settleTask: Promise<unknown> | undefined
+    let settled = false
+
+    try {
+      await seedForSettlement(testSchema)
+      // A journal for the claimant, so the settlement really walks a contamination
+      // closure — the one tier-3 key set that is discovered instead of being known.
+      await testSchema.db.revisions.append(
+        {
+          noteId: 'beta-auto-01',
+          space: 'beta',
+          baseRevisionId: null,
+          theirRevisionId: null,
+          sourceRevisionId: null,
+          kind: 'write',
+          entryRole: 'origin',
+          principal: 'user:beta',
+          contentHash: null,
+          title: 'Copy',
+          class: 'user-doc',
+          slug: null,
+          tags: [],
+          createdAt: '2026-06-12T10:00:00.000Z',
+          charsAdded: null,
+          charsRemoved: null,
+        } satisfies RevisionInput,
+        null,
+      )
+
+      // Another wide scan already in flight. Sorting within a tier is what keeps it
+      // deadlock-free, and a closure that grows as it is walked cannot sort its keys
+      // up front — so the settlement has to wait its turn here rather than start
+      // taking note stripes in an order only this run knows.
+      await blocker.query('BEGIN')
+      await blocker.query(`SELECT pg_advisory_xact_lock(hashtext('notarium:revision:wide'), 0)`)
+
+      settleTask = settleForeignClaim(testSchema).then((result) => {
+        settled = true
+        return result
+      })
+      await new Promise((resolve) => setTimeout(resolve, 250))
+      expect(settled).toBe(false)
+
+      await blocker.query('COMMIT')
+      await withTimeout(settleTask, 5_000)
+      expect(settled).toBe(true)
+      expect(await testSchema.db.identity.findById!('X')).toMatchObject({ space: 'alpha' })
+    } finally {
+      await blocker.query('ROLLBACK').catch(() => {})
+      await Promise.allSettled([settleTask].filter((task) => task != null))
+      blocker.release()
+      await blockerPool.end()
+      await testSchema.teardown()
     }
   })
 
@@ -893,7 +1222,7 @@ describePostgres('live Postgres driver', () => {
         .finally(() => {
           appendSettled = true
         })
-      purgeTask = testSchema.db.revisions.purgeNotes(['purged']).finally(() => {
+      purgeTask = testSchema.db.revisions.purgeNotes('space-a', ['purged']).finally(() => {
         purgeSettled = true
       })
 
@@ -904,7 +1233,7 @@ describePostgres('live Postgres driver', () => {
       await Promise.all([appendTask, purgeTask])
 
       expect(await testSchema.db.revisions.content('shared-race-hash')).toBe('shared')
-      expect(await testSchema.db.revisions.latestFor('survivor')).not.toBeNull()
+      expect(await testSchema.db.revisions.latestFor('space-a', 'survivor')).not.toBeNull()
     } finally {
       await locker.query('ROLLBACK').catch(() => {})
       await Promise.allSettled([appendTask, purgeTask].filter((task) => task != null))
@@ -927,7 +1256,7 @@ describePostgres('live Postgres driver', () => {
       await locker.query('BEGIN')
       await lockRevisionStripe(locker, 'blob', 'terminal-note-race-hash')
 
-      purgeTask = testSchema.db.revisions.purgeNotes(['terminal-note-race'])
+      purgeTask = testSchema.db.revisions.purgeNotes('space-a', ['terminal-note-race'])
       await waitForAdvisoryWaiters(testSchema, 1)
       appendTask = testSchema.db.revisions.append(input, 'late body')
       const appendRejection = expect(appendTask).rejects.toThrow(
@@ -938,7 +1267,7 @@ describePostgres('live Postgres driver', () => {
       await locker.query('COMMIT')
       await purgeTask
       await appendRejection
-      expect(await testSchema.db.revisions.latestFor('terminal-note-race')).toBeNull()
+      expect(await testSchema.db.revisions.latestFor('space-a', 'terminal-note-race')).toBeNull()
       expect(await testSchema.db.revisions.content('terminal-note-race-hash')).toBeNull()
     } finally {
       await locker.query('ROLLBACK').catch(() => {})
@@ -987,8 +1316,8 @@ describePostgres('live Postgres driver', () => {
       releaseLegacy?.()
       await withTimeout(Promise.all([legacyTask, modernTask]), 5_000)
 
-      expect(await testSchema.db.revisions.latestFor('legacy-new-hash')).not.toBeNull()
-      expect(await testSchema.db.revisions.latestFor('modern-new-hash')).not.toBeNull()
+      expect(await testSchema.db.revisions.latestFor('space-a', 'legacy-new-hash')).not.toBeNull()
+      expect(await testSchema.db.revisions.latestFor('space-b', 'modern-new-hash')).not.toBeNull()
       expect(await testSchema.db.revisions.content(sharedHash)).toBe('shared new body')
     } finally {
       releaseLegacy?.()
@@ -1014,11 +1343,11 @@ describePostgres('live Postgres driver', () => {
       await expect(
         legacyPool.query('DELETE FROM note_revisions WHERE note_id = $1', [input.noteId]),
       ).rejects.toThrow(/revision purge requires a fenced writer/)
-      expect(await testSchema.db.revisions.latestFor(input.noteId)).not.toBeNull()
+      expect(await testSchema.db.revisions.latestFor('space-a', input.noteId)).not.toBeNull()
       await locker.query('BEGIN')
       await lockRevisionStripe(locker, 'blob', 'legacy-terminal-race-hash')
 
-      purgeTask = testSchema.db.revisions.purgeNotes(['legacy-terminal-race'])
+      purgeTask = testSchema.db.revisions.purgeNotes('space-a', ['legacy-terminal-race'])
       await waitForAdvisoryWaiters(testSchema, 1)
       legacyTask = rawAppendWithoutApplicationLocks(legacyPool, input, 'late legacy body')
       const legacyRejection = expect(legacyTask).rejects.toThrow(
@@ -1029,7 +1358,7 @@ describePostgres('live Postgres driver', () => {
       await locker.query('COMMIT')
       await purgeTask
       await legacyRejection
-      expect(await testSchema.db.revisions.latestFor('legacy-terminal-race')).toBeNull()
+      expect(await testSchema.db.revisions.latestFor('space-a', 'legacy-terminal-race')).toBeNull()
       expect(await testSchema.db.revisions.content('legacy-terminal-race-hash')).toBeNull()
 
       const spaceInput = revision('legacy-space-terminal', {
@@ -1041,7 +1370,7 @@ describePostgres('live Postgres driver', () => {
       await expect(
         rawAppendWithoutApplicationLocks(legacyPool, spaceInput, 'late space body'),
       ).rejects.toThrow(/revision target was permanently purged: space/)
-      expect(await testSchema.db.revisions.latestFor('legacy-space-terminal')).toBeNull()
+      expect(await testSchema.db.revisions.latestFor('space-b', 'legacy-space-terminal')).toBeNull()
     } finally {
       await locker.query('ROLLBACK').catch(() => {})
       await Promise.allSettled([legacyTask, purgeTask].filter((task) => task != null))
@@ -1086,8 +1415,8 @@ describePostgres('live Postgres driver', () => {
       await locker.query('COMMIT')
       await Promise.all([blockedAppend, purgeTask])
 
-      expect(await testSchema.db.revisions.latestFor('blocked-in-space')).toBeNull()
-      expect(await testSchema.db.revisions.latestFor(independentNote)).toBeNull()
+      expect(await testSchema.db.revisions.latestFor('space-a', 'blocked-in-space')).toBeNull()
+      expect(await testSchema.db.revisions.latestFor('space-a', independentNote)).toBeNull()
     } finally {
       await locker.query('ROLLBACK').catch(() => {})
       await Promise.allSettled([blockedAppend, purgeTask].filter((task) => task != null))
@@ -1120,8 +1449,8 @@ describePostgres('live Postgres driver', () => {
       await locker.query('COMMIT')
       await purgeTask
       await appendRejection
-      expect(await testSchema.db.revisions.latestFor('space-terminal-seed')).toBeNull()
-      expect(await testSchema.db.revisions.latestFor('late-in-purged-space')).toBeNull()
+      expect(await testSchema.db.revisions.latestFor('space-a', 'space-terminal-seed')).toBeNull()
+      expect(await testSchema.db.revisions.latestFor('space-a', 'late-in-purged-space')).toBeNull()
     } finally {
       await locker.query('ROLLBACK').catch(() => {})
       await Promise.allSettled([appendTask, purgeTask].filter((task) => task != null))
@@ -1162,8 +1491,8 @@ describePostgres('live Postgres driver', () => {
       expect(await testSchema.db.revisions.content('shared-space-race-hash')).toBe(
         'shared across spaces',
       )
-      expect(await testSchema.db.revisions.latestFor('surviving-space')).not.toBeNull()
-      expect(await testSchema.db.revisions.latestFor('purged-space')).toBeNull()
+      expect(await testSchema.db.revisions.latestFor('space-b', 'surviving-space')).not.toBeNull()
+      expect(await testSchema.db.revisions.latestFor('space-a', 'purged-space')).toBeNull()
     } finally {
       await locker.query('ROLLBACK').catch(() => {})
       await Promise.allSettled([appendTask, purgeTask].filter((task) => task != null))
@@ -1215,7 +1544,7 @@ describePostgres('live Postgres driver', () => {
       if (!outcome.ok) {
         throw outcome.error
       }
-      expect(await testSchema.db.revisions.latestFor(survivorNote)).not.toBeNull()
+      expect(await testSchema.db.revisions.latestFor('space-b', survivorNote)).not.toBeNull()
       expect(await testSchema.db.revisions.content(sharedHash)).toBe('reassert body')
     } finally {
       await locker.query('ROLLBACK').catch(() => {})

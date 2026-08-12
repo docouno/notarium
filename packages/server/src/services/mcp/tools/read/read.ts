@@ -445,6 +445,7 @@ export const handleRecentActivity: Handler = async (ctx, rawArgs) => {
           ...(p ? { path: p } : {}),
           kind: r.kind,
           principal: r.principal,
+          ...(r.unavailableReason ? { unavailableReason: r.unavailableReason } : {}),
           modifiedAt: r.createdAt,
         },
       })
