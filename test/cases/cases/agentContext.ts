@@ -146,7 +146,23 @@ export const agentContext: CaseSpec = {
       })
     }
 
-    // Atlas / Product OS: 12 pinned runbooks + working notes + project memory.
+    // The project's folder page is an ordinary same-space pin (#311). It makes the
+    // exact boundary visible in the reader action, picker and Context row: unpin it
+    // in the reader, then find it again as "Folder overview · product" in the picker.
+    b.note({
+      space: 'atlas',
+      path: 'product/index.md',
+      title: 'Product OS overview',
+      noteType: 'project-overview',
+      tags: ['product', 'overview'],
+      pin: true,
+      content: '# Product OS overview\n\nThe operating context for the Product OS project.',
+      created: daysBefore(now, 32, 9),
+      principal: 'user:sergey',
+    })
+
+    // Atlas / Product OS: its pinned overview + 12 pinned runbooks, working notes
+    // and project memory.
     for (let i = 1; i <= s(12); i++) {
       b.note({
         space: 'atlas',

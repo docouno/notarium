@@ -97,7 +97,8 @@ export const PinRow = ({
       title={
         <span className={styles.itemTitle}>
           <span className={styles.itemName}>{pin.title}</span>
-          <span className={styles.itemBadges}>
+          <span className={styles.itemBadges} data-testid="context-item-badges">
+            {pin.folderOverview && <Chip>Folder overview</Chip>}
             {pin.space && <Chip>{pin.space}</Chip>}
             {!pin.loaded && <StatusBadge state="trimmed" />}
           </span>
@@ -138,7 +139,8 @@ export const SetItemRow = ({
     title={
       <span className={styles.itemTitle}>
         <span className={styles.itemName}>{item.title || 'Untitled'}</span>
-        <span className={styles.itemBadges}>
+        <span className={styles.itemBadges} data-testid="context-item-badges">
+          {item.folderOverview && <Chip>Folder overview</Chip>}
           <Chip>{item.space}</Chip>
           {!item.loaded && <StatusBadge state="trimmed" />}
         </span>

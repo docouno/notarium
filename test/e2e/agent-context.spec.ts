@@ -25,6 +25,14 @@ const WORLD = {
           content: '# Project Deploy\n\nproject context',
         },
         {
+          id: 'fake-project-overview',
+          title: 'Docs overview',
+          filePath: 'docs/index.md',
+          class: 'user-doc',
+          tags: ['always-load'],
+          content: '# Docs overview\n\nproject introduction',
+        },
+        {
           id: 'fake-project-scratch',
           title: 'Project Scratch',
           filePath: 'docs/project-scratch.md',
@@ -86,6 +94,20 @@ const WORLD = {
           filePath: 'grooming.md',
           class: 'user-doc',
           content: '# Grooming Checklist\n\nvalidate the pain',
+        },
+        {
+          id: 'fake-personal-overview-root',
+          title: 'Overview',
+          filePath: 'index.md',
+          class: 'user-doc',
+          content: '# Overview\n\nworkspace introduction',
+        },
+        {
+          id: 'fake-personal-overview-nested',
+          title: 'Overview',
+          filePath: 'guides/index.md',
+          class: 'user-doc',
+          content: '# Overview\n\nguides introduction',
         },
         // Two about-user memory categories: one loaded, one muted.
         {
@@ -216,6 +238,104 @@ test('a note’s ⋮ menu offers «Pin to agent context» where a pin has a targ
   await expect(page.getByRole('heading', { name: 'Deploy Runbook' })).toBeVisible()
   await page.getByRole('button', { name: 'More actions' }).click()
   await expect(page.getByRole('menuitemradio', { name: 'Unpin from agent context' })).toBeVisible()
+})
+
+test('folder overview actions and picker rows name the note boundary explicitly', async ({
+  page,
+}) => {
+  await login(page, 'sam', 'sam-password-1')
+
+  await page.goto('/n/fake-project-overview')
+  await expect(page.getByRole('heading', { name: 'Docs overview' })).toBeVisible()
+  await page.getByRole('button', { name: 'More actions' }).click()
+  await expect(
+    page.getByRole('menuitemradio', { name: 'Unpin folder overview from agent context' }),
+  ).toBeVisible()
+  await page
+    .getByRole('menuitemradio', { name: 'Unpin folder overview from agent context' })
+    .click()
+  await page.getByRole('button', { name: 'More actions' }).click()
+  await expect(
+    page.getByRole('menuitemradio', { name: 'Pin folder overview to agent context' }),
+  ).toBeVisible()
+
+  await page.goto('/agents/context/personal')
+  await page.getByTestId('context-add-personal-pin').click()
+  await page.getByPlaceholder('Search notes…').fill('Overview')
+  const root = page
+    .getByTestId('pin-picker-item')
+    .filter({ hasText: 'Folder overview · workspace root' })
+  const nested = page.getByTestId('pin-picker-item').filter({ hasText: 'Folder overview · guides' })
+  await expect(root).toBeVisible()
+  await expect(nested).toBeVisible()
+  await expect(
+    root.getByRole('checkbox', { name: 'Overview · Folder overview · workspace root' }),
+  ).toBeVisible()
+  await expect(
+    nested.getByRole('checkbox', { name: 'Overview · Folder overview · guides' }),
+  ).toBeVisible()
+  await expect(root).not.toContainText('index')
+  await expect(nested).not.toContainText('index')
+})
+
+test('direct pins and context-set items keep the title and show a Folder overview chip', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 820, height: 900 })
+  await login(page, 'sam', 'sam-password-1')
+
+  const created = await page.request.post('/api/s/sam-personal/context-sets', {
+    data: { name: 'Overview set' },
+  })
+  expect(created.ok()).toBe(true)
+  const setId = ((await created.json()) as { set: { id: string } }).set.id
+  expect(
+    (
+      await page.request.post(`/api/s/sam-personal/context-sets/${setId}/items`, {
+        data: { space: 'sam-personal', noteId: 'fake-personal-overview-nested' },
+      })
+    ).ok(),
+  ).toBe(true)
+  expect((await page.request.put(`/api/me/context-sets/${setId}`)).ok()).toBe(true)
+
+  await page.goto('/agents/context/personal')
+  const setRow = page.getByTestId('context-set-row').filter({ hasText: 'Overview set' })
+  await expect(setRow).toBeVisible()
+  await setRow.getByTestId('context-set-row-row').click()
+  const item = page.getByTestId('context-set-item').filter({ hasText: 'Overview' })
+  await expect(item).toContainText('Overview')
+  await expect(item).toContainText('Folder overview')
+  const badgeRow = item.getByTestId('context-item-badges')
+  const badgeRowBox = await badgeRow.boundingBox()
+  expect(badgeRowBox).not.toBeNull()
+  for (const label of ['Folder overview', 'sam-personal']) {
+    const badge = item.getByText(label, { exact: true })
+    await expect(badge).toBeVisible()
+    const badgeBox = await badge.boundingBox()
+    expect(badgeBox).not.toBeNull()
+    expect(badgeBox!.x).toBeGreaterThanOrEqual(badgeRowBox!.x - 0.5)
+    expect(badgeBox!.x + badgeBox!.width).toBeLessThanOrEqual(
+      badgeRowBox!.x + badgeRowBox!.width + 0.5,
+    )
+  }
+
+  await page.goto('/s/main')
+  await page.getByRole('link', { name: 'Agents' }).click()
+  await page.getByRole('link', { name: 'Docs' }).click()
+  const direct = page
+    .getByTestId('context-project')
+    .getByTestId('context-pin-row')
+    .filter({ hasText: 'Docs overview' })
+  await expect(direct).toContainText('Docs overview')
+  await expect(direct).toContainText('Folder overview')
+  const directTitle = direct.getByText('Docs overview', { exact: true })
+  await expect(directTitle).toBeVisible()
+  const titleGeometry = await directTitle.evaluate((element) => ({
+    clientWidth: element.clientWidth,
+    scrollWidth: element.scrollWidth,
+  }))
+  expect(titleGeometry.clientWidth).toBeGreaterThan(0)
+  expect(titleGeometry.scrollWidth).toBeGreaterThan(0)
 })
 
 test('a project route focuses the project; the Personal tab switches to it inline (#208)', async ({

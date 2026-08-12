@@ -35,12 +35,14 @@ export {
   type FinalizeFolderMoveDeps,
   type RecordFolderRenameDeps,
 } from './folderIdentity'
+export { acquireMarkPrefixLock, withMarkLock } from './markLock'
 export {
   markFolderAsProject,
   renameProjectSlug,
   unmarkProject,
   type MarkFolderDeps,
   type MarkFolderInput,
+  type MarkFolderResult,
   type RenameProjectResult,
 } from './markProject'
 export { projectHandleOf, projectSummaryOf } from './projection'

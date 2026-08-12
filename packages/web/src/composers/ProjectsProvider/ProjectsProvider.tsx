@@ -53,9 +53,9 @@ export type ProjectsContextValue = {
   /** Mark a folder ('' = the space root) as a project — write-through marker +
    *  registry row (idempotent). Refreshes the list and returns the row. */
   mark: (folderPath: string, displayName?: string) => Promise<ProjectRow>
-  /** Create a NEW empty project (#13 C): mint a fresh folder named `name` (the
-   *  marker write mkdir's it) + register it. Throws if the folder already
-   *  exists. Refreshes the list and returns the row. */
+  /** Create a NEW empty project (#13 C): mint a fresh store-owned folder named
+   *  `name`, then register its marker. Throws if the folder already exists.
+   *  Refreshes the list and returns the row. */
   create: (name: string) => Promise<ProjectRow>
   /** Unmark a project by id (removes the marker + the row). Refreshes the list. */
   unmark: (id: string) => Promise<void>
@@ -157,7 +157,7 @@ export const ProjectsProvider = ({ children }: { children: ReactNode }) => {
       // it as displayName: the server derives BOTH the displayName and the slug
       // from the folder's LAST segment, so `test/sub` yields slug `sub` anchored
       // on the target folder (not `test-sub` from slugifying the whole path).
-      // create=true mkdir's the folder via the marker write.
+      // create=true materializes the directory before publishing its marker.
       const row = await api.markProject(space, folderPath, undefined, true)
       setProjects((prev) => [
         ...(prev ?? []).filter((p) => p.id !== row.id && p.path !== row.path),

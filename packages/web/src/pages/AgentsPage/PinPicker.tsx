@@ -1,6 +1,7 @@
 import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 import type { ContextSet } from '@notarium/contract'
 import { NOTE_SORT } from '@notarium/contract/enums'
+import { directoryOf, isFolderPageNote } from '@notarium/core'
 import { Button } from '../../core/Button'
 import { Checkbox } from '../../core/Checkbox'
 import { ContextMenu, type MenuItem } from '../../core/ContextMenu'
@@ -364,21 +365,32 @@ export const PinPicker = ({
               ) : (
                 candidates.map((n) => {
                   const on = checked.has(n.id)
+                  const folderOverview = !!n.filePath && isFolderPageNote(n.filePath)
+                  const folderPath = folderOverview
+                    ? directoryOf(n.filePath!) || 'workspace root'
+                    : null
+                  const title = n.title || 'Untitled'
                   return (
                     <li key={n.id} data-testid="pin-picker-item">
                       <Checkbox
                         className={cx(styles.pickerRow, on && styles.pickerRowChecked)}
                         checked={on}
                         onChange={() => toggle(n)}
-                        aria-label={n.title || 'Untitled'}
+                        aria-label={
+                          folderOverview ? `${title} · Folder overview · ${folderPath}` : title
+                        }
                         label={
                           <span className={styles.pickerItemText}>
-                            <span className={styles.pickerItemTitle}>{n.title || 'Untitled'}</span>
-                            {n.filePath && (
+                            <span className={styles.pickerItemTitle}>{title}</span>
+                            {folderOverview ? (
+                              <span className={styles.pickerItemPath}>
+                                Folder overview · {folderPath}
+                              </span>
+                            ) : n.filePath ? (
                               <span className={styles.pickerItemPath}>
                                 {n.filePath.replace(/\.md$/, '')}
                               </span>
-                            )}
+                            ) : null}
                           </span>
                         }
                       />

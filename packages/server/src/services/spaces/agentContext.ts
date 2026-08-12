@@ -8,6 +8,7 @@ import {
   basenameOf,
   curateBudget,
   estimateTokens,
+  isFolderPageNote,
   isPathUnder,
   type KnowledgeStore,
   memoryDirOf,
@@ -18,6 +19,7 @@ import {
 
 import type { ContextSetRecord } from '../metaDb'
 import { ALWAYS_LOAD_TAG } from './personalContent'
+import type { SpaceStore } from './types'
 
 /** Token budgets — ONE per SCOPE, not per channel: a scope's whole eager cost (pins +
  *  memory + embedded personal) is weighed against a SINGLE envelope. `SCOPE_ITEM_CAP` is
@@ -31,7 +33,13 @@ export const SCOPE_ITEM_CAP = 250
  *  has, so `tokens` is the whole note, not a summary). `space` is set ONLY for a
  *  CROSS-SPACE pin (pinned in from another space, resolved per-reader); a same-space
  *  tag pin omits it. */
-export type WeighedPin = { noteId: string; title: string; tokens: number; space?: string }
+export type WeighedPin = {
+  noteId: string
+  title: string
+  tokens: number
+  space?: string
+  folderOverview?: true
+}
 /** A pin with the curation verdict: `loaded=false` = still pinned but over the scope's
  *  single token budget (the pult dims it, the agent won't load it). `order` = 0-based
  *  position in the scope's user-ordered pin+set list. */
@@ -96,9 +104,13 @@ export const loadedContextNotes = (
  *  canon: docs/architecture.md#p5 */
 export const resolveContextSets = async (
   sets: readonly ContextSetRecord[],
-  read: (
-    noteId: string,
-  ) => Promise<{ noteId?: string; content: string; title: string; spaceSlug: string } | null>,
+  read: (noteId: string) => Promise<{
+    noteId?: string
+    content: string
+    title: string
+    spaceSlug: string
+    filePath: string
+  } | null>,
 ): Promise<WeighedSet[]> =>
   Promise.all(
     sets.map(async (set) => {
@@ -115,6 +127,7 @@ export const resolveContextSets = async (
             title: note.title,
             tokens: estimateTokens(note.content),
             space: note.spaceSlug,
+            ...(isFolderPageNote(note.filePath) ? { folderOverview: true as const } : {}),
           }
         }),
       )
@@ -132,9 +145,13 @@ export const resolveContextSets = async (
  *  pin bucket; a note pinned twice still dedups by id in {@link budgetSequence}. */
 export const resolveScopePins = async (
   noteIds: readonly string[],
-  read: (
-    noteId: string,
-  ) => Promise<{ noteId?: string; content: string; title: string; spaceSlug: string } | null>,
+  read: (noteId: string) => Promise<{
+    noteId?: string
+    content: string
+    title: string
+    spaceSlug: string
+    filePath: string
+  } | null>,
 ): Promise<WeighedSetItem[]> => {
   const resolved = await Promise.all(
     noteIds.map(async (noteId) => {
@@ -149,6 +166,7 @@ export const resolveScopePins = async (
         title: note.title,
         tokens: estimateTokens(note.content),
         space: note.spaceSlug,
+        ...(isFolderPageNote(note.filePath) ? { folderOverview: true as const } : {}),
       }
     }),
   )
@@ -178,6 +196,9 @@ export const weighAlwaysLoad = async (
         noteId: note.id ?? (m.id as string),
         title: note.title ?? m.title,
         tokens: estimateTokens(note.content),
+        ...(note.filePath && isFolderPageNote(note.filePath)
+          ? { folderOverview: true as const }
+          : {}),
       }
     }),
   )
@@ -309,6 +330,7 @@ const rebucket = (
       loaded: e.loaded,
       order: pinPos.get(e.noteId) ?? 0,
       ...(e.space ? { space: e.space } : {}),
+      ...(e.folderOverview ? { folderOverview: true as const } : {}),
     }))
   const setsOut = sets.map((s, i) => ({
     id: s.id,
@@ -324,6 +346,7 @@ const rebucket = (
         space: e.space,
         loaded: e.loaded,
         order: idx,
+        ...(e.folderOverview ? { folderOverview: true as const } : {}),
       })),
   }))
   return { pins, sets: setsOut }
@@ -499,41 +522,126 @@ export const projectIndexSummary = async (
   return { noteCount: visible.length, folderCount: childFolders.length }
 }
 
-/** Toggle the `always-load` tag on a note (pin/unpin): a narrow, CAS-guarded metadata
- *  edit — re-save the current body with the tag set changed (the engine carries the other
- *  frontmatter forward as passthrough). `changed:false` = already in the desired state, a
- *  no-op so the audit isn't churned. canon: docs/contract.md#cas */
-export const setNotePinned = async (
-  store: KnowledgeStore,
+type PinMutationStore = Pick<SpaceStore, 'mutateTags' | 'read'>
+
+/** Manual pin/unpin and lifecycle auto-pin share one process-local FIFO per note.
+ * A conditional lifecycle task reserves invocation order before resolving
+ * identity, then waits for the lock-owned project transition outcome. */
+const pinMutationTails = new WeakMap<object, Map<string, Promise<void>>>()
+const pinReservationTails = new WeakMap<object, Promise<void>>()
+
+const enqueuePinMutation = <T>(
+  store: PinMutationStore,
+  id: string,
+  operation: () => Promise<T>,
+): Promise<T> => {
+  let storeTails = pinMutationTails.get(store)
+
+  if (!storeTails) {
+    storeTails = new Map()
+    pinMutationTails.set(store, storeTails)
+  }
+  const previous = storeTails.get(id) ?? Promise.resolve()
+  const result = previous.then(operation, operation)
+  const tail = result.then(
+    () => {},
+    () => {},
+  )
+  storeTails.set(id, tail)
+  void tail.then(() => {
+    if (storeTails?.get(id) === tail) {
+      storeTails.delete(id)
+    }
+  })
+  return result
+}
+
+const applyPinnedDelta = async (
+  store: PinMutationStore,
   id: string,
   pinned: boolean,
   principal?: string,
 ): Promise<{ pinned: boolean; changed: boolean }> => {
-  const note = await store.read(id)
-  const noteId = note.id ?? id
-  const tags = Array.isArray(note.frontmatter?.tags)
-    ? (note.frontmatter.tags as unknown[]).filter((t): t is string => typeof t === 'string')
-    : []
-  const has = tags.includes(ALWAYS_LOAD_TAG)
-
-  if (has === pinned) {
-    return { pinned, changed: false }
-  }
-  const nextTags = pinned ? [...tags, ALWAYS_LOAD_TAG] : tags.filter((t) => t !== ALWAYS_LOAD_TAG)
-  await store.write({
-    title: note.title ?? '',
-    content: note.content,
-    originalId: noteId,
-    versionToken: note.versionToken ?? '',
-    tags: nextTags,
+  const result = await store.mutateTags({
+    id,
+    ...(pinned ? { add: [ALWAYS_LOAD_TAG] } : { remove: [ALWAYS_LOAD_TAG] }),
     principal,
-    // Keep the note's CURRENT basename — a pin toggle is a metadata touch, it must NOT
-    // rename the file to slug(title) (a seeded/imported note whose basename diverges
-    // from its title would otherwise MOVE, and the reverse toggle would then collide).
-    fileName: pinFileName(note.filePath),
   })
-  return { pinned, changed: true }
+  return { pinned, changed: result.changed }
 }
+
+/** Resolve a possibly provisional boot id before choosing the process-local FIFO
+ * key. CachedStore also canonicalizes inside mutateTags, but doing it only there
+ * is too late: provisional and durable spellings would reserve different queues. */
+const authoritativePinId = async (store: PinMutationStore, id: string): Promise<string> => {
+  const note = await store.read(id)
+  return note.id ?? id
+}
+
+/** Preserve invocation order before identity resolution yields. The short
+ * per-store reservation lane serializes only authoritative reads + insertion
+ * into the durable-id FIFO; the mutations themselves keep per-note concurrency.
+ * This closes P→D rekey races without turning every pin write into a global lock. */
+const reservePinMutation = <T>(
+  store: PinMutationStore,
+  id: string,
+  operation: (authoritativeId: string) => Promise<T>,
+): Promise<T> => {
+  let resolveCompletion!: (value: T | PromiseLike<T>) => void
+  let rejectCompletion!: (reason?: unknown) => void
+  const completion = new Promise<T>((resolve, reject) => {
+    resolveCompletion = resolve
+    rejectCompletion = reject
+  })
+  const previous = pinReservationTails.get(store) ?? Promise.resolve()
+  const reservation = previous.then(async () => {
+    try {
+      const authoritativeId = await authoritativePinId(store, id)
+      const result = enqueuePinMutation(store, authoritativeId, () => operation(authoritativeId))
+      void result.then(resolveCompletion, rejectCompletion)
+    } catch (err) {
+      rejectCompletion(err)
+    }
+  })
+  const tail = reservation.then(
+    () => {},
+    () => {},
+  )
+
+  pinReservationTails.set(store, tail)
+  void tail.then(() => {
+    if (pinReservationTails.get(store) === tail) {
+      pinReservationTails.delete(store)
+    }
+  })
+  return completion
+}
+
+/** Toggle `always-load` through the shared per-note FIFO. */
+export const setNotePinned = (
+  store: PinMutationStore,
+  id: string,
+  pinned: boolean,
+  principal?: string,
+): Promise<{ pinned: boolean; changed: boolean }> =>
+  reservePinMutation(store, id, (authoritativeId) =>
+    applyPinnedDelta(store, authoritativeId, pinned, principal),
+  )
+
+/** Reserve an auto-pin in the same FIFO before a project mark. The gate may wait
+ * for the mark lock, but no note mutation claim is held while it does. */
+export const enqueueConditionalNotePin = (
+  store: PinMutationStore,
+  id: string,
+  transition: Promise<boolean>,
+  principal?: string,
+): { completion: Promise<{ pinned: boolean; changed: boolean }> } => ({
+  completion: reservePinMutation(store, id, async (authoritativeId) =>
+    (await transition)
+      ? applyPinnedDelta(store, authoritativeId, true, principal)
+      : { pinned: true, changed: false },
+  ),
+})
 
 /** The note's current storage basename (sans `.md`) to hand back to `store.write` so a
  *  metadata-only edit keeps the file in place; undefined when the path is unknown. */

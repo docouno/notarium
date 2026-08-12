@@ -124,6 +124,7 @@ const scopeNoteReader =
       content: hit.note.content ?? '',
       title: hit.note.title ?? '',
       spaceSlug: deps.spaces.slugOf(hit.space) ?? hit.space,
+      filePath: hit.note.filePath ?? '',
     }
   }
 

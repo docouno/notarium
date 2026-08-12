@@ -1,10 +1,17 @@
-import type { KnowledgeStore, StoreEvent } from '@notarium/core'
+import type {
+  KnowledgeStore,
+  StoreEvent,
+  TagMutationInput,
+  TagMutationResult,
+} from '@notarium/core'
 
 import type { MetaDb, SpaceRecord } from '../metaDb'
 import type { SpaceMarkerFacet } from '../projects'
 
 /** A space's live store: the KnowledgeStore port + optional read-model lifecycle/bus. */
 export type SpaceStore = KnowledgeStore & {
+  /** Host-internal metadata delta owned by CachedStore's note mutation fence. */
+  mutateTags(input: TagMutationInput): Promise<TagMutationResult>
   start?(): Promise<void>
   /** Await the note-id registry checkpoint after a lazy boot. Global id routing
    * uses this before handing the store to an ordinary read. */

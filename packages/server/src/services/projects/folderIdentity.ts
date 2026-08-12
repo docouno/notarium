@@ -90,7 +90,7 @@ const writeFolderMarkerFor = (
   // never strips the space identity.
   spaceFacet?: SpaceMarkerFacet,
 ): Promise<void> =>
-  (markerStore.writeExisting ?? markerStore.write)(
+  markerStore.write(
     space,
     folderPath,
     serializeMarker({

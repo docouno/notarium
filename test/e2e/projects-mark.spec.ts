@@ -64,6 +64,22 @@ test('create a new empty project from the + menu — it shows as an empty projec
   await expect(roadmap).toBeVisible()
   await expect(roadmap.getByTestId('project-badge')).toBeVisible()
 
+  // The project directory was admitted through the same store-backed channel as
+  // an ordinary folder, so its first page can materialize immediately — no
+  // restart/reconcile and no marker-only ghost in between.
+  await roadmap.click({ button: 'right' })
+  await page.getByRole('menuitemradio', { name: 'Open page' }).click()
+  await expect(page.getByTestId('virtual-folder-page')).toBeVisible()
+  await page.getByRole('button', { name: 'Edit', exact: true }).click()
+  const editor = page.locator('.cm-content')
+  await editor.fill('# Roadmap\n\nThe project overview.')
+  await page.getByRole('button', { name: 'Save' }).click()
+  await expect(page).toHaveURL(/\/n\/.+\/roadmap$/)
+  await page.getByRole('button', { name: 'More actions' }).click()
+  await expect(
+    page.getByRole('menuitemradio', { name: 'Unpin folder overview from agent context' }),
+  ).toBeVisible()
+
   // One source of truth — the space-management Projects list shows it too.
   await page.goto('/s/main/management/projects')
   await expect(page.getByTestId('projects-list')).toContainText('main/roadmap')

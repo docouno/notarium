@@ -18,6 +18,7 @@ export {
   type CuratableMemory,
   curatePersonalScope,
   curateProjectScope,
+  enqueueConditionalNotePin,
   loadedContextNotes,
   type CuratedPin,
   type CuratedSet,

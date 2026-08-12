@@ -27,18 +27,22 @@ export type MarkFolderInput = {
   displayName?: string
 }
 
+/** Project row plus the lifecycle fact decided inside the mark lock. Only a
+ * freshly inserted active row is a transition; idempotent/healing marks are not. */
+export type MarkFolderResult = ProjectRecord & { createdActive: boolean }
+
 /** Mark a folder (or the space root) as a project; returns the registry record. Idempotent.
  *  canon: docs/projects.md#reconcile-the-row-lifecycle-fork-b-lazy-i3-implemented-cadence-boot-only-2026-06-18 */
 export const markFolderAsProject = (
   deps: MarkFolderDeps,
   input: MarkFolderInput,
-): Promise<ProjectRecord> =>
+): Promise<MarkFolderResult> =>
   withMarkLock(`${input.space}\0${input.folderPath}`, () => markFolderInner(deps, input))
 
 const markFolderInner = async (
   deps: MarkFolderDeps,
   input: MarkFolderInput,
-): Promise<ProjectRecord> => {
+): Promise<MarkFolderResult> => {
   const { projects, folders, markerStore } = deps
   const { space, folderPath } = input
   const nowIso = deps.now().toISOString()
@@ -55,7 +59,7 @@ const markFolderInner = async (
       await writeMarkerFor(markerStore, space, folderPath, record)
     }
     await projects.upsert(record)
-    return record
+    return { ...record, createdActive: false }
   }
 
   // 2. No project row here yet — the marker may carry a reusable id+slug.
@@ -100,12 +104,12 @@ const markFolderInner = async (
     const winner = (await projects.listForSpace(space)).find((r) => r.path === folderPath)
 
     if (winner) {
-      return winner
+      return { ...winner, createdActive: false }
     }
     throw err
   }
 
-  return record
+  return { ...record, createdActive: true }
 }
 
 /** Unmark a project by id (a human act; no agent container-delete, C1).

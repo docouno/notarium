@@ -20,6 +20,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createLocalFsFiles } from '@notarium/engine'
 import {
+  acquireMarkPrefixLock,
   createMarkerStore,
   ensureFolderIdentity,
   finalizeFolderMove,
@@ -33,6 +34,7 @@ import {
   scanProjectsAtBoot,
   serializeMarker,
   unmarkProject,
+  withMarkLock,
 } from '@notarium/server'
 
 import { InMemoryFolders } from '../fake-server/folders'
@@ -175,6 +177,7 @@ describe('parseMarker (#13)', () => {
 describe('markerStore over a real tree (#13)', () => {
   it('writes/reads the sibling dotfile and finds it on scan (root + nested), skipping dot-dirs', async () => {
     const store = createMarkerStore(() => dir)
+    mkdirSync(join(dir, 'docs'), { recursive: true })
     await store.write('s', 'docs', serializeMarker({ id: VALID_ID, slug: 'docs' }))
     expect(parseMarker((await store.read('s', 'docs')) ?? '')?.id).toBe(VALID_ID)
     // A marker under the agent-mount (.notarium) and another dot-dir must NOT be enumerated.
@@ -185,13 +188,22 @@ describe('markerStore over a real tree (#13)', () => {
     expect(complete).toBe(true) // a clean walk → safe to prune on
   })
 
+  it('never provisions a missing user directory as a marker side effect', async () => {
+    const store = createMarkerStore(() => dir)
+
+    await expect(
+      store.write('s', 'missing', serializeMarker({ id: VALID_ID, slug: 'missing' })),
+    ).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(fs.lstat(join(dir, 'missing'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
   it('refuses to write a marker under a dot namespace (mount-boundary belt #78), normalising backslashes', async () => {
     const store = createMarkerStore(() => dir)
     await expect(store.write('s', '.notarium/memory', '{}')).rejects.toThrow(/dot namespace/)
     await expect(store.write('s', 'foo\\.notarium\\memory', '{}')).rejects.toThrow(/dot namespace/)
   })
 
-  it('does not overwrite a marker that races writeExisting publication', async () => {
+  it('does not overwrite a marker that races publication', async () => {
     const store = createMarkerStore(() => dir)
     const folder = join(dir, 'docs')
     const marker = join(folder, '.notariummeta')
@@ -208,7 +220,7 @@ describe('markerStore over a real tree (#13)', () => {
       return realLink(from, to)
     })
 
-    await expect(store.writeExisting!('s', 'docs', 'INTENDED-MARKER')).rejects.toThrow()
+    await expect(store.write('s', 'docs', 'INTENDED-MARKER')).rejects.toThrow()
     expect(injected).toBe(true)
     await expect(fs.readFile(marker, 'utf8')).resolves.toBe('FOREIGN-MARKER')
   })
@@ -238,7 +250,7 @@ describe('markerStore over a real tree (#13)', () => {
       return handle
     })
 
-    await expect(store.writeExisting!('s', 'docs', 'INTENDED-MARKER')).rejects.toThrow()
+    await expect(store.write('s', 'docs', 'INTENDED-MARKER')).rejects.toThrow()
     expect(injected).toBe(true)
     await expect(fs.lstat(marker)).rejects.toMatchObject({ code: 'ENOENT' })
     await expect(fs.readFile(foreignTemp, 'utf8')).resolves.toBe('FOREIGN-TEMP')
@@ -281,9 +293,48 @@ describe('markerStore over a real tree (#13)', () => {
 })
 
 describe('markFolderAsProject (#13)', () => {
+  it('fences every child mark behind a held folder-delete prefix', async () => {
+    let openChild!: () => void
+    const childGate = new Promise<void>((resolve) => {
+      openChild = resolve
+    })
+    let openChildEntered!: () => void
+    const childEntered = new Promise<void>((resolve) => {
+      openChildEntered = resolve
+    })
+    const child = withMarkLock('s\0tree/child', async () => {
+      openChildEntered()
+      await childGate
+    })
+
+    await childEntered
+    let prefixEntered = false
+    const prefix = acquireMarkPrefixLock('s\0tree').then((release) => {
+      prefixEntered = true
+      return release
+    })
+    await Promise.resolve()
+    expect(prefixEntered).toBe(false)
+
+    openChild()
+    await child
+    const releasePrefix = await prefix
+    let laterChildEntered = false
+    const laterChild = withMarkLock('s\0tree/later', async () => {
+      laterChildEntered = true
+    })
+    await Promise.resolve()
+    expect(laterChildEntered).toBe(false)
+
+    await releasePrefix()
+    await laterChild
+    expect(laterChildEntered).toBe(true)
+  })
+
   it('mints an id + slug, writes a real marker, upserts the registry row', async () => {
     const projects = new InMemoryProjects()
     const markerStore = createMarkerStore(() => dir)
+    mkdirSync(join(dir, 'docs'))
     const rec = await markFolderAsProject(
       { projects, markerStore, now },
       {
@@ -292,6 +343,7 @@ describe('markFolderAsProject (#13)', () => {
         displayName: 'Docs',
       },
     )
+    expect(rec.createdActive).toBe(true)
     expect(rec.slug).toBe('docs')
     expect(rec.id).toMatch(/^[A-Za-z0-9_-]{12}$/)
     expect(await projects.getByHandle('s', 'docs')).toMatchObject({ id: rec.id, path: 'docs' })
@@ -303,6 +355,7 @@ describe('markFolderAsProject (#13)', () => {
   it('is idempotent: a re-mark reuses the marker id+createdAt, no duplicate', async () => {
     const projects = new InMemoryProjects()
     const markerStore = createMarkerStore(() => dir)
+    mkdirSync(join(dir, 'docs'))
     const first = await markFolderAsProject(
       { projects, markerStore, now },
       { space: 's', folderPath: 'docs' },
@@ -311,14 +364,39 @@ describe('markFolderAsProject (#13)', () => {
       { projects, markerStore, now: () => new Date('2027-01-01T00:00:00.000Z') },
       { space: 's', folderPath: 'docs' },
     )
+    expect(first.createdActive).toBe(true)
+    expect(again.createdActive).toBe(false)
     expect(again.id).toBe(first.id)
     expect(again.createdAt).toBe(first.createdAt) // mint moment preserved
     expect((await projects.listForSpace('s')).length).toBe(1)
   })
 
+  it('owns the transition outcome inside the mark lock for concurrent marks', async () => {
+    const projects = new InMemoryProjects()
+    const markerStore = createMarkerStore(() => dir)
+    mkdirSync(join(dir, 'docs'))
+    const [first, second] = await Promise.all([
+      markFolderAsProject(
+        { projects, markerStore, now },
+        { space: 's', folderPath: 'docs', displayName: 'Docs' },
+      ),
+      markFolderAsProject(
+        { projects, markerStore, now },
+        { space: 's', folderPath: 'docs', displayName: 'Docs' },
+      ),
+    ])
+
+    expect([first.createdActive, second.createdActive].sort()).toEqual([false, true])
+    expect(first.id).toBe(second.id)
+  })
+
   it('suffixes a colliding slug -2/-3 (the I0c trap)', async () => {
     const projects = new InMemoryProjects()
     const markerStore = createMarkerStore(() => dir)
+
+    for (const path of ['a', 'b', 'c']) {
+      mkdirSync(join(dir, path))
+    }
     const a = await markFolderAsProject(
       { projects, markerStore, now },
       { space: 's', folderPath: 'a', displayName: 'Docs' },
@@ -347,6 +425,7 @@ describe('markFolderAsProject (#13)', () => {
   it('marking a COPIED folder mints a FRESH id — never steals the original (Fork B re-mint on write)', async () => {
     const projects = new InMemoryProjects()
     const markerStore = createMarkerStore(() => dir)
+    mkdirSync(join(dir, 'a'))
     const orig = await markFolderAsProject(
       { projects, markerStore, now },
       { space: 's', folderPath: 'a', displayName: 'Proj' },
@@ -366,6 +445,7 @@ describe('markFolderAsProject (#13)', () => {
   it('heals a divergent marker: the row already at the path wins, the marker is rewritten to match', async () => {
     const projects = new InMemoryProjects()
     const markerStore = createMarkerStore(() => dir)
+    mkdirSync(join(dir, 'p'))
     const rec = await markFolderAsProject(
       { projects, markerStore, now },
       { space: 's', folderPath: 'p', displayName: 'P' },
@@ -401,6 +481,7 @@ describe('ensureFolderIdentity (#212 — the page-create lazy-mint path)', () =>
 
   it('is idempotent + returns a PROJECT id unchanged when the folder is already a project', async () => {
     const d = deps()
+    mkdirSync(join(dir, 'docs'))
     const proj = await markFolderAsProject(d, {
       space: 's',
       folderPath: 'docs',
@@ -468,6 +549,7 @@ describe('ensureFolderIdentity (#212 — the page-create lazy-mint path)', () =>
 
   it('a COPIED project folder (marker id OWNED by a live project elsewhere) gets a FRESH id (Fork-B)', async () => {
     const d = deps()
+    mkdirSync(join(dir, 'a'))
     const orig = await markFolderAsProject(d, { space: 's', folderPath: 'a', displayName: 'Proj' })
     // `cp -r a b`: the copy carries the original's project marker verbatim (its id is LIVE).
     writeMarkerFile('b', { id: orig.id, slug: orig.slug, displayName: 'Proj' })
@@ -483,6 +565,7 @@ describe('unmarkProject (#13)', () => {
   it('removes the marker file + the registry row; re-mark mints a fresh id', async () => {
     const projects = new InMemoryProjects()
     const markerStore = createMarkerStore(() => dir)
+    mkdirSync(join(dir, 'docs'))
     const rec = await markFolderAsProject(
       { projects, markerStore, now },
       { space: 's', folderPath: 'docs', displayName: 'Docs' },
@@ -502,6 +585,7 @@ describe('unmarkProject (#13)', () => {
   it('is anti-enumeration: an id in another space (or unknown) is not unmarked', async () => {
     const projects = new InMemoryProjects()
     const markerStore = createMarkerStore(() => dir)
+    mkdirSync(join(dir, 'docs'))
     const rec = await markFolderAsProject(
       { projects, markerStore, now },
       { space: 's', folderPath: 'docs' },
@@ -579,6 +663,7 @@ describe('space facet preservation (#100 phase 4 — closeout seam)', () => {
   it('a NON-root unmark still removes the whole marker (no space facet to preserve)', async () => {
     const projects = new InMemoryProjects()
     const markerStore = createMarkerStore(() => dir)
+    mkdirSync(join(dir, 'docs'))
     const rec = await markFolderAsProject(
       { projects, markerStore, now },
       { space: 's', folderPath: 'docs', displayName: 'Docs' },
@@ -594,6 +679,7 @@ describe('renameProjectSlug (#100 phase 2)', () => {
   it('renames the slug → old slug joins aliases (registry + on-disk marker), id/path stable', async () => {
     const projects = new InMemoryProjects()
     const markerStore = createMarkerStore(() => dir)
+    mkdirSync(join(dir, 'docs'))
     const rec = await markFolderAsProject(
       { projects, markerStore, now },
       { space: 's', folderPath: 'docs', displayName: 'Docs' },
@@ -839,6 +925,7 @@ describe('reconcile — external changes survive a rescan (#13 I3)', () => {
     // Mark 'old', then simulate `mv old new` outside us (the marker travels).
     const projects = new InMemoryProjects()
     const markerStore = createMarkerStore(() => dir)
+    mkdirSync(join(dir, 'old'))
     const rec = await markFolderAsProject(
       { projects, markerStore, now },
       { space: 's', folderPath: 'old', displayName: 'P' },
@@ -877,6 +964,7 @@ describe('reconcile — external changes survive a rescan (#13 I3)', () => {
     // `space/docs` handle is not silently lost.
     const projects = new InMemoryProjects()
     const markerStore = createMarkerStore(() => dir)
+    mkdirSync(join(dir, 'p'))
     const rec = await markFolderAsProject(
       { projects, markerStore, now },
       { space: 's', folderPath: 'p', displayName: 'Docs' },
@@ -890,6 +978,8 @@ describe('reconcile — external changes survive a rescan (#13 I3)', () => {
   it('prunes a row whose marker vanished externally (folder/marker deleted off our routes)', async () => {
     const projects = new InMemoryProjects()
     const markerStore = createMarkerStore(() => dir)
+    mkdirSync(join(dir, 'gone'))
+    mkdirSync(join(dir, 'stays'))
     await markFolderAsProject(
       { projects, markerStore, now },
       { space: 's', folderPath: 'gone', displayName: 'Gone' },
@@ -948,6 +1038,7 @@ describe('reconcile — external changes survive a rescan (#13 I3)', () => {
   it('does NOT prune a row whose marker became CORRUPT (readable but unparseable ≠ absent)', async () => {
     const projects = new InMemoryProjects()
     const markerStore = createMarkerStore(() => dir)
+    mkdirSync(join(dir, 'p'))
     const rec = await markFolderAsProject(
       { projects, markerStore, now },
       { space: 's', folderPath: 'p', displayName: 'P' },
@@ -961,6 +1052,7 @@ describe('reconcile — external changes survive a rescan (#13 I3)', () => {
   it('a marker whose id is OWNED BY ANOTHER SPACE is a cross-space copy — the row never migrates (#16)', async () => {
     const projects = new InMemoryProjects()
     const markerStore = createMarkerStore((space) => join(dir, space)) // per-space subtrees
+    mkdirSync(join(dir, 'A', 'proj'), { recursive: true })
     // Space A owns the project; space B's tree holds a COPY carrying A's id (a backup
     // restored into the wrong space, or a cross-space `cp -r`).
     const recA = await markFolderAsProject(

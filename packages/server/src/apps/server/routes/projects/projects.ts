@@ -13,6 +13,7 @@ import {
   RemoveResponseSchema,
 } from '@notarium/contract'
 import { HTTP_STATUS } from '@notarium/contract/http'
+import { folderPageFilePath } from '@notarium/core'
 
 import { withAuthors } from '../../../../libs/authors'
 import { safeRelAddress, safeRelPath } from '../../../../libs/relPath'
@@ -25,6 +26,7 @@ import {
 import { weighRoleContext } from '../../../../services/roles'
 import {
   curateProjectScope,
+  enqueueConditionalNotePin,
   listMemoryCategories,
   peekPersonalSpace,
   PROJECT_TOKEN_BUDGET,
@@ -39,7 +41,7 @@ import {
 import { type ApiRouteCtx, authz, notFound, s } from '../_shared'
 
 export const projectsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
-  const { projects, markerStore, folders, spaces, spaceStoreFor } = ctx
+  const { projects, markerStore, folders, spaces, spaceStoreFor, principalId } = ctx
   const { storeAccess, contextSets, scopePins, contextOrder, auth, roles } = ctx
 
   // Mark a folder (or space root, folderPath: '') as a project: write-through the
@@ -74,8 +76,8 @@ export const projectsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => 
       }
       const exists = await markerStore.folderExists(space, safe)
 
-      // `create` mkdir's the folder (must NOT exist yet); a plain mark addresses
-      // an EXISTING folder (must exist).
+      // `create` addresses a fresh path that the space store materializes below;
+      // a plain mark addresses an EXISTING folder.
       if (body.data.create) {
         if (exists) {
           return reply
@@ -86,10 +88,71 @@ export const projectsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => 
         return reply.code(HTTP_STATUS.BAD_REQUEST).send({ error: 'no such folder' })
       }
     }
-    const record = await markFolderAsProject(
-      { projects, folders, markerStore, now: () => new Date() },
-      { space, folderPath: safe, displayName: body.data.displayName },
+    const store = await spaceStoreFor(req)
+
+    if (body.data.create) {
+      if (!store.makeDir) {
+        return notFound(reply)
+      }
+      try {
+        // The space store is the sole owner of user-visible directories: it
+        // updates the engine and CachedStore's directory index atomically. The
+        // marker write below is metadata-only and requires this folder to exist.
+        await store.makeDir(safe)
+      } catch (err) {
+        if ((err as { isToolError?: boolean }).isToolError) {
+          return reply
+            .code(HTTP_STATUS.CONFLICT)
+            .send({ error: 'a folder with that name already exists' })
+        }
+        throw err
+      }
+    }
+    const pageFile = folderPageFilePath(safe)
+    const page = (await store.list()).find((note) => note.id && note.filePath === pageFile)
+    let openTransition!: (created: boolean) => void
+    const transition = new Promise<boolean>((resolve) => {
+      openTransition = resolve
+    })
+    const autoPin = page?.id
+      ? enqueueConditionalNotePin(store, page.id, transition, principalId(req))
+      : null
+    // The authoritative reservation read may fail while the primary mark is still
+    // doing marker/DB I/O. Observe it NOW so Node never sees a temporarily unhandled
+    // rejection; keep the error as data for the lifecycle-specific log below.
+    const autoPinOutcome = autoPin?.completion.then(
+      () => ({ ok: true as const }),
+      (error: unknown) => ({ ok: false as const, error }),
     )
+    let record
+
+    try {
+      record = await markFolderAsProject(
+        { projects, folders, markerStore, now: () => new Date() },
+        { space, folderPath: safe, displayName: body.data.displayName },
+      )
+    } catch (err) {
+      openTransition(false)
+      const pinOutcome = await autoPinOutcome
+
+      if (pinOutcome && !pinOutcome.ok) {
+        req.log.error(
+          { err: pinOutcome.error, noteId: page?.id },
+          '[projects] project overview auto-pin cleanup failed after mark error',
+        )
+      }
+      throw err
+    }
+    openTransition(record.createdActive)
+    const pinOutcome = await autoPinOutcome
+
+    if (pinOutcome && !pinOutcome.ok) {
+      req.log.error(
+        { err: pinOutcome.error, noteId: page?.id },
+        '[projects] project overview auto-pin failed after mark',
+      )
+    }
+
     return reply
       .code(HTTP_STATUS.CREATED)
       .send(ProjectRowSchema.parse(projectSummaryOf(record, spaces.slugOf(space) ?? '')))

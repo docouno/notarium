@@ -278,6 +278,16 @@ describe('seed catalog (#175)', () => {
       retrievals.filter((r) => r.query === 'deploy prod checklist' && (r.hits ?? []).length === 0),
     ).toHaveLength(3)
     expect(w.auth?.connectedApps?.some((app) => app.appName === 'Claude')).toBe(true)
+
+    const overview = w.events.find(
+      (event) => event.op === 'create' && event.path === 'product/index.md',
+    )
+    expect(overview).toEqual(
+      expect.objectContaining({
+        title: 'Product OS overview',
+        pin: true,
+      }),
+    )
   })
 
   it('agent-sessions carries episodes plus divergent owner/root/fork delta positions', () => {

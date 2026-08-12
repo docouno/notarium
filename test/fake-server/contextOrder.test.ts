@@ -28,7 +28,13 @@ const fixture = (): Fixture => ({
       slug: 'conventions',
       displayName: 'Conventions',
       notes: [
-        { id: 'c1', title: 'Conv One', class: 'user-doc', filePath: 'c1.md', content: 'conv one' },
+        {
+          id: 'c1',
+          title: 'Conv One',
+          class: 'user-doc',
+          filePath: 'guides/index.md',
+          content: 'conv one',
+        },
         { id: 'c2', title: 'Conv Two', class: 'user-doc', filePath: 'c2.md', content: 'conv two' },
         {
           id: 'c3',
@@ -217,6 +223,40 @@ describe('context order (#210)', () => {
     const session = await startSession(bearer, {})
     const profile = session.profile as { alwaysLoad: Array<{ noteId: string }> }
     expect(profile.alwaysLoad.map((n) => n.noteId)).toEqual(['c1', 'c2', 'h2', 'h1'])
+  })
+
+  it('keeps the overview marker when an ordered set wins dedup against a loose pin', async () => {
+    const cookie = await loginCookie('sam', 'sam-password-1')
+    const setId = await makeSet(cookie, 'conventions', 'Canon', [['conventions', 'c1']])
+    expect((await send('PUT', `/api/me/context-sets/${setId}`, cookie)).statusCode).toBe(200)
+    expect(
+      (
+        await send('PUT', '/api/me/context-pins', cookie, {
+          space: 'conventions',
+          noteId: 'c1',
+        })
+      ).statusCode,
+    ).toBe(200)
+    expect(
+      (
+        await send('PUT', '/api/me/context-order', cookie, {
+          entries: [
+            { kind: 'set', ref: setId },
+            { kind: 'pin', ref: 'c1' },
+          ],
+        })
+      ).statusCode,
+    ).toBe(200)
+
+    const ctx = await getJson('/api/me/agent-context', cookie)
+    expect((ctx.pins as PinView[]).some((pin) => pin.noteId === 'c1')).toBe(false)
+    expect(
+      (
+        ctx.sets as Array<{
+          items: Array<{ noteId: string; folderOverview?: true }>
+        }>
+      )[0].items,
+    ).toEqual([expect.objectContaining({ noteId: 'c1', folderOverview: true })])
   })
 
   it('reorders the ITEMS inside a set (a home-space write) — the item order follows on the wire', async () => {

@@ -724,6 +724,18 @@ export type MutationOptions = {
   finalize?: () => void | Promise<void>
 }
 
+/** Host-only exact tag delta. Unlike a whole-document save, it reads live metadata
+ * inside the note mutation fence and changes only the named tag values. */
+export type TagMutationInput = {
+  id: string
+  add?: readonly string[]
+  remove?: readonly string[]
+  principal?: string
+  agent?: AgentWriteAttribution
+}
+
+export type TagMutationResult = { changed: boolean; tags: string[] }
+
 export type KnowledgeStore = {
   /** Every note's metadata; `opts.scope` applies class-visibility (ReadScope). */
   list(opts?: ListOptions): Promise<NoteMeta[]>

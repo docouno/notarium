@@ -5,6 +5,8 @@ import type {
   MutationOptions,
   NoteClass,
   NoteContent,
+  TagMutationInput,
+  TagMutationResult,
   WriteInput,
   WriteResult,
 } from '../../../knowledgeStore'
@@ -29,6 +31,7 @@ import {
 } from '../../../libs/markdown'
 import { MutationCoordinator } from '../../../libs/mutationCoordinator'
 import {
+  basenameOf,
   directoryOf,
   FOLDER_PAGE_BASENAME,
   isCanonicalSafeRelativeAddress,
@@ -146,6 +149,79 @@ export class WriteEngine {
   ) {
     this.mutations = coordinators.mutations ?? new MutationCoordinator()
     this.trashMutations = coordinators.trashMutations ?? new MutationCoordinator()
+  }
+
+  /** Apply an exact tag delta under the same note/path claim as ordinary writes.
+   * The live read and the inner write both happen inside this method's one claim;
+   * callers must not wrap it in another store mutation. */
+  mutateTags(input: TagMutationInput): Promise<TagMutationResult> {
+    const add = [...new Set(input.add ?? [])]
+    const remove = new Set(input.remove ?? [])
+
+    for (const tag of [...add, ...remove]) {
+      if (!isDurableScalar(tag)) {
+        throw invalidWrite('tags must be well-formed single-line strings')
+      }
+    }
+
+    return this.mutations.runStable(
+      () => ({ noteIds: [input.id], paths: [this.pathFor(input.id)] }),
+      async () => {
+        const storagePath = this.pathFor(input.id)
+
+        if (!storagePath) {
+          throw noteNotFound(input.id)
+        }
+        const live = await this.host.inner.read(
+          this.innerNoteKey(input.id, storagePath),
+          supportsExactIdentityAddress(this.host.inner) ? { identityOnly: true } : undefined,
+        )
+
+        if (live.filePath !== storagePath) {
+          throw noteNotFound(input.id)
+        }
+        const current = (normTags(live.frontmatter?.tags) ?? []).filter(
+          (tag): tag is string => typeof tag === 'string',
+        )
+        const addSet = new Set(add)
+        const seenAdded = new Set<string>()
+        const tags = current.filter((tag) => {
+          if (remove.has(tag)) {
+            return false
+          }
+          if (!addSet.has(tag)) {
+            return true
+          }
+          if (seenAdded.has(tag)) {
+            return false
+          }
+          seenAdded.add(tag)
+          return true
+        })
+
+        for (const tag of add) {
+          if (!remove.has(tag) && !seenAdded.has(tag)) {
+            tags.push(tag)
+            seenAdded.add(tag)
+          }
+        }
+        if (tags.length === current.length && tags.every((tag, index) => tag === current[index])) {
+          return { changed: false, tags }
+        }
+
+        await this.writeClaimed({
+          title: live.title ?? '',
+          content: live.content,
+          originalId: live.id ?? input.id,
+          versionToken: live.versionToken ?? computeVersionToken(live.content),
+          tags,
+          principal: input.principal,
+          agent: input.agent,
+          fileName: basenameOf(storagePath).replace(/\.md$/, ''),
+        })
+        return { changed: true, tags }
+      },
+    )
   }
 
   /** Soft slug uniqueness: when a save sets a CUSTOM slug, keep public

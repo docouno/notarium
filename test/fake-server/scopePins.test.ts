@@ -29,6 +29,13 @@ const fixture = (): Fixture => ({
           filePath: 'security.md',
           content: 'lock it down',
         },
+        {
+          id: 'conv-overview',
+          title: 'Conventions',
+          class: 'user-doc',
+          filePath: 'handbook/index.md',
+          content: 'how this folder fits together',
+        },
       ],
     },
     {
@@ -174,6 +181,7 @@ describe('scope pins (#209)', () => {
     expect(sec?.loaded).toBe(true)
     // The cross-space pin carries its HOME space (the UI shows a chip); a same-space pin wouldn't.
     expect(sec?.space).toBe('conventions')
+    expect(sec).not.toHaveProperty('folderOverview')
 
     // start_session(project) folds the loaded pin into project.alwaysLoad (one curation).
     const ss = await startSession(bearer, { project: 'product/web' })
@@ -181,6 +189,36 @@ describe('scope pins (#209)', () => {
       (p) => p.noteId,
     )
     expect(always).toContain('conv-sec')
+  })
+
+  it('classifies a readable foreign index.md on the REST preview without changing the MCP ref', async () => {
+    const cookie = await loginCookie('sam', 'sam-password-1')
+    const bearer = await patFor(cookie)
+    expect(
+      (
+        await send('PUT', `/api/s/product/projects/${PROJECT}/context-pins`, cookie, {
+          space: 'conventions',
+          noteId: 'conv-overview',
+        })
+      ).statusCode,
+    ).toBe(200)
+
+    const ctx = await getJson(`/api/s/product/projects/${PROJECT}/agent-context`, cookie)
+    expect(
+      (ctx.pins as Array<PinWire & { folderOverview?: true }>).find(
+        (pin) => pin.noteId === 'conv-overview',
+      ),
+    ).toMatchObject({
+      noteId: 'conv-overview',
+      space: 'conventions',
+      folderOverview: true,
+    })
+
+    const ss = await startSession(bearer, { project: 'product/web' })
+    const overview = (ss.project as { alwaysLoad: Array<Record<string, unknown>> }).alwaysLoad.find(
+      (note) => note.noteId === 'conv-overview',
+    )
+    expect(overview).toEqual({ noteId: 'conv-overview', title: 'Conventions' })
   })
 
   it('DEGRADES per reader: a project member who cannot reach the note’s home space never sees the pin', async () => {

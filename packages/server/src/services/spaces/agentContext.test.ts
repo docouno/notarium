@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import type { KnowledgeStore, NoteClass, WriteInput } from '@notarium/core'
+import type { KnowledgeStore, NoteClass, TagMutationInput, WriteInput } from '@notarium/core'
 
 import {
   curatePersonalScope,
   curateProjectScope,
+  enqueueConditionalNotePin,
   personalProfilePin,
   resolveContextSets,
   resolveScopePins,
@@ -46,6 +47,7 @@ const BIG = 1_000_000 // a budget nothing can exhaust
 
 const rekeyingStore = (noteClass: NoteClass = 'user-doc') => {
   const writes: WriteInput[] = []
+  const tagMutations: TagMutationInput[] = []
   const store = {
     list: async () => [
       {
@@ -71,8 +73,12 @@ const rekeyingStore = (noteClass: NoteClass = 'user-doc') => {
       writes.push(input)
       return { id: 'durable-id', versionToken: 'next' }
     },
+    mutateTags: async (input: TagMutationInput) => {
+      tagMutations.push(input)
+      return { changed: true, tags: [...(input.add ?? [])] }
+    },
   } as unknown as KnowledgeStore
-  return { store, writes }
+  return { store, writes, tagMutations }
 }
 
 describe('agent-context identity producers', () => {
@@ -82,10 +88,11 @@ describe('agent-context identity producers', () => {
       title: 'Target',
       content: 'body',
       spaceSlug: 'docs',
+      filePath: 'handbook/index.md',
     })
 
     await expect(resolveScopePins(['provisional-id'], read)).resolves.toEqual([
-      expect.objectContaining({ noteId: 'durable-id' }),
+      expect.objectContaining({ noteId: 'durable-id', folderOverview: true }),
     ])
     const [resolved] = await resolveContextSets(
       [
@@ -99,7 +106,9 @@ describe('agent-context identity producers', () => {
       ],
       read,
     )
-    expect(resolved.items).toEqual([expect.objectContaining({ noteId: 'durable-id' })])
+    expect(resolved.items).toEqual([
+      expect.objectContaining({ noteId: 'durable-id', folderOverview: true }),
+    ])
   })
 
   it('uses the authoritative read id for always-load and profile pins', async () => {
@@ -115,12 +124,15 @@ describe('agent-context identity producers', () => {
     })
   })
 
-  it('writes metadata toggles through the authoritative read id', async () => {
-    const { store, writes } = rekeyingStore()
+  it('routes pin toggles through the atomic tag port while mute keeps its CAS path', async () => {
+    const { store, writes, tagMutations } = rekeyingStore()
 
-    await setNotePinned(store, 'provisional-id', true)
+    await setNotePinned(store as never, 'provisional-id', true)
     await setNoteMuted(store, 'provisional-id', true)
-    expect(writes.map((write) => write.originalId)).toEqual(['durable-id', 'durable-id'])
+    expect(tagMutations).toEqual([
+      expect.objectContaining({ id: 'durable-id', add: ['always-load'] }),
+    ])
+    expect(writes.map((write) => write.originalId)).toEqual(['durable-id'])
   })
 
   it('refuses a mute it cannot place in a memory partition instead of guessing one', async () => {
@@ -160,6 +172,149 @@ describe('agent-context identity producers', () => {
     await expect(setNoteMuted(store, 'memory-id', true)).rejects.toBe(conflict)
     expect(reads).toBe(2)
     expect(writes).toBe(1)
+  })
+})
+
+describe('pin mutation FIFO', () => {
+  it('runs a later manual unpin after a delayed conditional auto-pin', async () => {
+    let openTransition!: (created: boolean) => void
+    const transition = new Promise<boolean>((resolve) => {
+      openTransition = resolve
+    })
+    let releaseAdd!: () => void
+    const addBlocked = new Promise<void>((resolve) => {
+      releaseAdd = resolve
+    })
+    let addEntered!: () => void
+    const sawAdd = new Promise<void>((resolve) => {
+      addEntered = resolve
+    })
+    const calls: TagMutationInput[] = []
+    const store = {
+      read: async (id: string) => ({ id, title: 'Overview', class: 'user-doc', content: '' }),
+      mutateTags: async (input: TagMutationInput) => {
+        calls.push(input)
+        if (input.add?.includes('always-load')) {
+          addEntered()
+          await addBlocked
+        }
+
+        return { changed: true, tags: [] }
+      },
+    }
+
+    const automatic = enqueueConditionalNotePin(store as never, 'overview', transition)
+    const manual = setNotePinned(store as never, 'overview', false)
+    openTransition(true)
+    await sawAdd
+    expect(calls).toHaveLength(1)
+    releaseAdd()
+    await Promise.all([automatic.completion, manual])
+    expect(calls.map((input) => ({ add: input.add, remove: input.remove }))).toEqual([
+      { add: ['always-load'], remove: undefined },
+      { add: undefined, remove: ['always-load'] },
+    ])
+  })
+
+  it('reserves before a slow provisional read so a later durable unpin stays last', async () => {
+    let openTransition!: (created: boolean) => void
+    const transition = new Promise<boolean>((resolve) => {
+      openTransition = resolve
+    })
+    let openReadEntered!: () => void
+    const readEntered = new Promise<void>((resolve) => {
+      openReadEntered = resolve
+    })
+    let openReadRelease!: () => void
+    const readRelease = new Promise<void>((resolve) => {
+      openReadRelease = resolve
+    })
+    const calls: TagMutationInput[] = []
+    const store = {
+      read: async (id: string) => {
+        if (id === 'provisional-overview') {
+          openReadEntered()
+          await readRelease
+        }
+
+        return {
+          id: 'durable-overview',
+          title: 'Overview',
+          class: 'user-doc',
+          content: '',
+        }
+      },
+      mutateTags: async (input: TagMutationInput) => {
+        calls.push(input)
+        return { changed: true, tags: [] }
+      },
+    }
+
+    const automatic = enqueueConditionalNotePin(store as never, 'provisional-overview', transition)
+    await readEntered
+    const manual = setNotePinned(store as never, 'durable-overview', false)
+    openTransition(true)
+    openReadRelease()
+    await Promise.all([automatic.completion, manual])
+
+    expect(calls.map((input) => ({ id: input.id, add: input.add, remove: input.remove }))).toEqual([
+      { id: 'durable-overview', add: ['always-load'], remove: undefined },
+      { id: 'durable-overview', add: undefined, remove: ['always-load'] },
+    ])
+  })
+
+  it('serializes identity reservation without blocking a different note mutation', async () => {
+    let openTransition!: (created: boolean) => void
+    const transition = new Promise<boolean>((resolve) => {
+      openTransition = resolve
+    })
+    const calls: string[] = []
+    const store = {
+      read: async (id: string) => ({ id, title: id, class: 'user-doc', content: '' }),
+      mutateTags: async (input: TagMutationInput) => {
+        calls.push(input.id)
+        return { changed: true, tags: [] }
+      },
+    }
+
+    const waiting = enqueueConditionalNotePin(store as never, 'waiting', transition)
+    await expect(setNotePinned(store as never, 'independent', true)).resolves.toEqual({
+      pinned: true,
+      changed: true,
+    })
+    expect(calls).toEqual(['independent'])
+    openTransition(false)
+    await expect(waiting.completion).resolves.toEqual({ pinned: true, changed: false })
+  })
+
+  it('a false transition is a no-op and a failed task does not poison the tail', async () => {
+    const calls: TagMutationInput[] = []
+    let fail = true
+    const store = {
+      read: async (id: string) => ({ id, title: 'Overview', class: 'user-doc', content: '' }),
+      mutateTags: async (input: TagMutationInput) => {
+        calls.push(input)
+        if (fail) {
+          fail = false
+          throw new Error('first failed')
+        }
+
+        return { changed: true, tags: [] }
+      },
+    }
+
+    const conditional = enqueueConditionalNotePin(
+      store as never,
+      'overview',
+      Promise.resolve(false),
+    )
+    await expect(conditional.completion).resolves.toEqual({ pinned: true, changed: false })
+    await expect(setNotePinned(store as never, 'overview', true)).rejects.toThrow('first failed')
+    await expect(setNotePinned(store as never, 'overview', false)).resolves.toEqual({
+      pinned: false,
+      changed: true,
+    })
+    expect(calls).toHaveLength(2)
   })
 })
 
@@ -247,6 +402,33 @@ describe('curatePersonalScope (#208/#209)', () => {
     // total = pin a (10) + set b (10), NOT counted twice.
     expect(r.totalTokens).toBe(20)
     expect(r.loadedTokens).toBe(20)
+  })
+
+  it('keeps a folder-overview marker when an ordered set wins pin/set dedup', () => {
+    const markedSet: WeighedSet = {
+      id: 'overview-set',
+      name: 'Overview set',
+      homeSpace: 'sp',
+      items: [
+        {
+          noteId: 'overview',
+          title: 'Product',
+          tokens: 10,
+          space: 'sp',
+          folderOverview: true,
+        },
+      ],
+    }
+    const r = curatePersonalScope([pin('overview', 10)], [markedSet], [], BIG, [
+      { kind: 'set', ref: 'overview-set' },
+      { kind: 'pin', ref: 'overview' },
+    ])
+
+    expect(r.pins).toEqual([])
+    expect(r.sets[0].items).toEqual([
+      expect.objectContaining({ noteId: 'overview', folderOverview: true }),
+    ])
+    expect(r.totalTokens).toBe(10)
   })
 
   it('DEDUP across two sets: the same note in set A and set B survives only in A (first wins)', () => {

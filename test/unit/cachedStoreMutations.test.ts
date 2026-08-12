@@ -375,6 +375,71 @@ describe('CachedStore write ingress', () => {
   })
 })
 
+describe.each(variants)('CachedStore atomic tag delta — %s', (_name, createHarness) => {
+  it('normalises scalar tags, changes only the exact tag, and skips a no-op write', async () => {
+    const h = await createHarness()
+
+    try {
+      const created = await h.store.write({
+        title: 'Overview',
+        content: 'body',
+        tags: 'guide, always-load, always-load',
+        frontmatter: [{ key: 'plugin', lines: ['plugin: keep-me'] }],
+      })
+      const noteId = created.id!
+      const write = vi.spyOn(h.inner, 'write')
+
+      await expect(h.store.mutateTags({ id: noteId, add: ['always-load'] })).resolves.toEqual({
+        changed: true,
+        tags: ['guide', 'always-load'],
+      })
+      expect(write).toHaveBeenCalledTimes(1)
+      const after = await h.store.read(noteId)
+      expect(after.frontmatter.tags).toEqual(['guide', 'always-load'])
+      expect(after.frontmatter.plugin).toBe('keep-me')
+
+      await expect(h.store.mutateTags({ id: noteId, add: ['always-load'] })).resolves.toEqual({
+        changed: false,
+        tags: ['guide', 'always-load'],
+      })
+      expect(write).toHaveBeenCalledTimes(1)
+    } finally {
+      await h.close()
+    }
+  })
+
+  it('reads live tags after an earlier whole-note write releases the same note fence', async () => {
+    const h = await createHarness()
+
+    try {
+      const created = await h.store.write({ title: 'Race', content: 'before', tags: ['old'] })
+      const noteId = created.id!
+      const before = await h.store.read(noteId)
+      const gate = gateWrite(
+        h.inner,
+        (input) => input.originalId != null && input.tags?.includes('new') === true,
+      )
+      const fullWrite = h.store.write({
+        title: 'Race',
+        content: 'after',
+        originalId: noteId,
+        versionToken: before.versionToken,
+        tags: ['new'],
+      })
+      await gate.entered
+      const delta = h.store.mutateTags({ id: noteId, add: ['always-load'] })
+
+      gate.release()
+      await Promise.all([fullWrite, delta])
+      const after = await h.store.read(noteId)
+      expect(after.content).toBe('after')
+      expect(after.frontmatter.tags).toEqual(['new', 'always-load'])
+    } finally {
+      await h.close()
+    }
+  })
+})
+
 describe('CachedStore lifecycle quiescence', () => {
   it('checkpoint joins an active poll and drains the external journal tail it creates', async () => {
     const inner = new InMemoryStore({ space: 'main', notes: [] })

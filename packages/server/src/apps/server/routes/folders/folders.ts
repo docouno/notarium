@@ -8,6 +8,7 @@ import {
   MoveResponseSchema,
   NOTE_CLASS,
   OkResponseSchema,
+  PROJECT_STATUS,
   RemoveResponseSchema,
 } from '@notarium/contract'
 import { HTTP_STATUS } from '@notarium/contract/http'
@@ -17,17 +18,19 @@ import {
   folderPageFilePath,
   isPathUnder,
   type KnowledgeStore,
+  normTags,
   STORE_ERROR_REASON,
   StoreError,
 } from '@notarium/core'
 
 import { safeRelAddress, safeRelPath } from '../../../../libs/relPath'
 import {
+  acquireMarkPrefixLock,
   ensureFolderIdentity,
   finalizeFolderMove,
   lastSegment,
-  unmarkProject,
 } from '../../../../services/projects'
+import { ALWAYS_LOAD_TAG, setNotePinned } from '../../../../services/spaces'
 import { type ApiRouteCtx, authz, missing, notFound, s } from '../_shared'
 import { moveFolderToDomain } from '../wire'
 
@@ -167,49 +170,74 @@ export const foldersRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
       return notFound(reply)
     }
 
-    await store.removeDir(path, {
-      principal: principalId(req),
-      finalize: async () => {
-        // Clean only while the core still owns the folder prefix. Otherwise a
-        // concurrent B→path move/page-create could land fresh rows that this old
-        // delete would mistake for its victims.
-        if (projects) {
-          await (async () => {
-            const under = (await projects.listForSpace(space)).filter(
-              (r) => r.path === path || r.path.startsWith(`${path}/`),
-            )
+    let releaseProjectLifecycle: (() => Promise<void>) | undefined
 
-            for (const r of under) {
-              await unmarkProject(
-                { projects, markerStore, now: () => new Date() },
-                { space, id: r.id },
-              ).catch((err) =>
-                req.log.error({ err }, '[folders] unmark under deleted folder failed'),
+    try {
+      await store.removeDir(path, {
+        principal: principalId(req),
+        prepare: async () => {
+          // Core owns the physical prefix fence. Reserve the matching project/folder
+          // lifecycle prefix only after entering it, preserving the established
+          // core → host ordering used by page-create and folder-move prepares.
+          if (projects || folders) {
+            releaseProjectLifecycle = await acquireMarkPrefixLock(`${space}\0${path}`)
+          }
+        },
+        finalize: async () => {
+          // Clean only while the core still owns the folder prefix. Otherwise a
+          // concurrent B→path move/page-create could land fresh rows that this old
+          // delete would mistake for its victims. The host lifecycle prefix is held
+          // too, so a mark that published its marker before this delete must publish
+          // its row before this snapshot; no active registry ghost can land after it.
+          if (projects) {
+            await (async () => {
+              const under = (await projects.listForSpace(space)).filter(
+                (r) => r.path === path || r.path.startsWith(`${path}/`),
               )
-            }
-          })().catch((err) =>
-            req.log.error({ err }, '[folders] project cleanup under deleted folder failed'),
-          )
-        }
-        if (folders) {
-          await (async () => {
-            const under = (await folders.listForSpace(space)).filter(
-              (r) => r.path === path || r.path.startsWith(`${path}/`),
-            )
 
-            for (const r of under) {
-              await folders
-                .delete(r.id)
-                .catch((err) =>
-                  req.log.error({ err }, '[folders] delete under deleted folder failed'),
-                )
-            }
-          })().catch((err) =>
-            req.log.error({ err }, '[folders] identity cleanup under deleted folder failed'),
-          )
-        }
-      },
-    })
+              for (const r of under) {
+                // The physical subtree (including its markers) is already gone and
+                // this callback owns the encompassing lifecycle prefix. Re-entering
+                // the exact mark lock through unmarkProject would self-deadlock.
+                if (markerStore) {
+                  await markerStore
+                    .remove(space, r.path)
+                    .catch((err) =>
+                      req.log.error({ err }, '[folders] remove marker under deleted folder failed'),
+                    )
+                }
+                await projects
+                  .delete(r.id)
+                  .catch((err) =>
+                    req.log.error({ err }, '[folders] unmark under deleted folder failed'),
+                  )
+              }
+            })().catch((err) =>
+              req.log.error({ err }, '[folders] project cleanup under deleted folder failed'),
+            )
+          }
+          if (folders) {
+            await (async () => {
+              const under = (await folders.listForSpace(space)).filter(
+                (r) => r.path === path || r.path.startsWith(`${path}/`),
+              )
+
+              for (const r of under) {
+                await folders
+                  .delete(r.id)
+                  .catch((err) =>
+                    req.log.error({ err }, '[folders] delete under deleted folder failed'),
+                  )
+              }
+            })().catch((err) =>
+              req.log.error({ err }, '[folders] identity cleanup under deleted folder failed'),
+            )
+          }
+        },
+      })
+    } finally {
+      await releaseProjectLifecycle?.()
+    }
 
     return RemoveResponseSchema.parse({ ok: true })
   })
@@ -264,6 +292,18 @@ export const foldersRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
     // canon: docs/note-model.md#note-classes
     const title = body.data.title ?? (body.data.content === undefined ? name : '')
     const content = body.data.content ?? `# ${body.data.title ?? name}\n`
+    const activeAtSnapshot = (await projects.listForSpace(space)).some(
+      (project) => project.path === folderPath && project.status === PROJECT_STATUS.active,
+    )
+    const authoredTags = normTags(body.data.tags) ?? []
+    const tags = activeAtSnapshot
+      ? [
+          ...authoredTags.filter((tag, index) =>
+            tag === ALWAYS_LOAD_TAG ? authoredTags.indexOf(tag) === index : true,
+          ),
+          ...(authoredTags.includes(ALWAYS_LOAD_TAG) ? [] : [ALWAYS_LOAD_TAG]),
+        ]
+      : body.data.tags
     let folderId = ''
     let r
     const folderMissing = new Error('folder disappeared before page creation')
@@ -275,7 +315,7 @@ export const foldersRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
           content,
           directory: folderPath || undefined,
           noteType: body.data.noteType,
-          tags: body.data.tags,
+          tags,
           slug: body.data.slug,
           createdAt: body.data.createdAt ? new Date(body.data.createdAt).toISOString() : undefined,
           fileName: FOLDER_PAGE_BASENAME,
@@ -309,6 +349,21 @@ export const foldersRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
         return reply.code(HTTP_STATUS.CONFLICT).send({ error: 'this folder already has a page' })
       }
       throw err
+    }
+
+    if (!activeAtSnapshot && r.id) {
+      const activeAfterCreate = (await projects.listForSpace(space)).some(
+        (project) => project.path === folderPath && project.status === PROJECT_STATUS.active,
+      )
+
+      if (activeAfterCreate) {
+        await setNotePinned(store, r.id, true, principalId(req)).catch((err) =>
+          req.log.error(
+            { err, noteId: r.id },
+            '[folders] project overview auto-pin failed after page create',
+          ),
+        )
+      }
     }
 
     return reply.code(HTTP_STATUS.CREATED).send(

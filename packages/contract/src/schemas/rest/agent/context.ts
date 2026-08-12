@@ -21,6 +21,9 @@ export const PinnedNoteSchema = z.object({ noteId: z.string(), title: z.string()
 export const ContextPinSchema = PinnedNoteSchema.extend({
   loaded: z.boolean(),
   tokens: z.number(),
+  /** Derived from the access-resolved storage path. `true` means this one note is a
+   *  folder's `index.md` overview; it never means the folder contents are included. */
+  folderOverview: z.literal(true).optional(),
   /** Home space slug — present ONLY for a CROSS-SPACE pin, resolved per-reader
    *  with honest degradation if unreachable (like a set ref).
    *  Absent for a same-space pin (the location-bound `always-load` tag). Drives the

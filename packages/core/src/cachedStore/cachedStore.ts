@@ -35,6 +35,8 @@ import type {
   StoreDelta,
   StoreEvent,
   SyncStatus,
+  TagMutationInput,
+  TagMutationResult,
   WriteInput,
   WriteResult,
 } from '../knowledgeStore'
@@ -2572,6 +2574,12 @@ export class CachedStore implements KnowledgeStore {
 
   write(input: WriteInput, opts?: MutationOptions): Promise<WriteResult> {
     return this.runMutation(() => this.writes.write(this.canonicalWriteInput(input), opts))
+  }
+
+  mutateTags(input: TagMutationInput): Promise<TagMutationResult> {
+    return this.runMutation(() =>
+      this.writes.mutateTags({ ...input, id: this.canonicalMutationId(input.id) }),
+    )
   }
 
   private writeAdmitted(input: WriteInput, opts?: MutationOptions): Promise<WriteResult> {

@@ -11,6 +11,16 @@
   (`packages/core/src/libs/path/path.ts`). This is an ordinary note: it lands for free in the
   graph/search/indexing, is edited/versioned by the standard note-reader — **zero bespoke**.
   Only its name gives it the meaning of "folder body".
+- **A project overview is still that ordinary note.** When the folder is an active project and
+  its page exists, the first lifecycle transition that brings those two facts together adds the
+  ordinary same-space `always-load` tag to `index.md`: either the project's first page save or the
+  first mark of a folder whose page already exists. Marking does not materialize a missing page.
+  Manual Unpin is respected by later edits and repeated marks; `unmark → mark` starts a new project
+  lifecycle and pins the existing overview again. The UI calls this one note a `Folder overview`;
+  the tag does not mean that the folder's children are loaded. Auto-pin is a post-primary,
+  best-effort metadata step: once page creation or project marking has succeeded, a tag-write
+  failure is logged but does not roll that lifecycle operation back. An idempotent repeated mark
+  does not retry it; `unmark → mark` opens the next lifecycle transition.
 - **NOT in `.notarium/`.** That mount is for hidden service classes (agent-memory/profile/skill,
   `userSearch/graph/tree=false`, #78/P11). A folder page, on the contrary, MUST be in the graph/search/
   links, so it lives as a sibling in the folder itself (like the `.notariummeta` marker — deliberately
@@ -55,7 +65,8 @@
 - Editing an already-materialized page preserves the reserved basename `index.md`;
   a heading inside the body does not turn the cover note into an ordinary `<title>.md`.
 - **We do not spawn empty `index.md`**: opening a folder, viewing the summary, or cancelling a clean draft
-  writes neither a cover note nor a folder marker.
+  writes neither a cover note nor a folder marker. Marking the folder as a project also does not
+  create a page just to provide agent context.
 
 ## Children summary under the body (#213)
 

@@ -34,9 +34,9 @@ export const MarkProjectRequestSchema = z.object({
   /** Bounded — it lands in the marker file + registry row, so an unbounded value
    *  is storage amplification. */
   displayName: DurableDisplayNameSchema.optional(),
-  /** Create a NEW empty project: mint the folder (the marker write
-   *  mkdir's it) rather than marking an existing one. The folder must NOT
-   *  already exist (409 if it does). Absent/false = mark an EXISTING folder
+  /** Create a NEW empty project: mint the folder through the space store before
+   *  publishing its marker rather than marking an existing one. The folder must
+   *  NOT already exist (409 if it does). Absent/false = mark an EXISTING folder
    *  (the folder must exist), the original behaviour. */
   create: z.boolean().optional(),
 })

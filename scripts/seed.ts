@@ -283,9 +283,10 @@ const run = async (): Promise<void> => {
     }
   }
 
-  // 2. Mark declared (non-root) projects — writes the .notariummeta marker so the
-  //    project survives the server's boot scan (scanProjectsAtBoot rebuilds from
-  //    markers), plus the registry row.
+  // 2. Materialize declared project directories through the same store-owned
+  //    channel as runtime `create:true`, then publish their marker + registry row.
+  //    Projects precede the note replay, so they must not rely on a future note
+  //    write (or on MarkerStore) to create their directory.
   for (const p of world.projects ?? []) {
     if (!p.path) {
       continue
@@ -294,6 +295,15 @@ const run = async (): Promise<void> => {
 
     if (!space) {
       throw new Error(`project references unknown space: ${p.space}`)
+    }
+    const projectStore = await manager.store(space)
+    const dirs = (await projectStore.listDirs?.()) ?? []
+
+    if (!dirs.includes(p.path)) {
+      if (!projectStore.makeDir) {
+        throw new Error(`space store cannot create project directory: ${p.space}/${p.path}`)
+      }
+      await projectStore.makeDir(p.path)
     }
     const marked = await markFolderAsProject(
       { projects: metaDb.projects, folders: metaDb.folders, markerStore, now: () => new Date() },

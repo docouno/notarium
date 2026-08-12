@@ -37,6 +37,13 @@ const fixture = (): Fixture => ({
           filePath: 'api.md',
           content: 'rest first',
         },
+        {
+          id: 'conv-overview',
+          title: 'Conventions',
+          class: 'user-doc',
+          filePath: 'handbook/index.md',
+          content: 'how this folder fits together',
+        },
       ],
     },
     {
@@ -218,6 +225,25 @@ describe('context sets (#209)', () => {
     )
     expect(always).toContain('conv-a')
     expect(always).toContain('conv-b')
+  })
+
+  it('marks a readable folder overview carried by a context set', async () => {
+    const cookie = await loginCookie('sam', 'sam-password-1')
+    const setId = await makeSet(cookie, 'conventions', 'Overview', [
+      ['conventions', 'conv-overview'],
+    ])
+    expect(
+      (await send('PUT', `/api/s/product/projects/${PROJECT}/context-sets/${setId}`, cookie))
+        .statusCode,
+    ).toBe(200)
+
+    const ctx = await getJson(`/api/s/product/projects/${PROJECT}/agent-context`, cookie)
+    const item = (
+      ctx.sets as Array<{
+        items: Array<{ noteId: string; folderOverview?: true }>
+      }>
+    )[0].items[0]
+    expect(item).toMatchObject({ noteId: 'conv-overview', folderOverview: true })
   })
 
   it('DEGRADES per reader: a member of the project but NOT the set’s home space gets the set with its items dropped', async () => {

@@ -365,6 +365,38 @@
   }
 }
 
+// A long semantic badge must not consume the title's whole column. Below the
+// width where name + badges + meter can honestly coexist, keep the title and
+// meter on the first line and move badges to their own visible row.
+@container contextList (max-width: 320px) {
+  .itemTitle {
+    grid-template-areas:
+      'name meter value'
+      'badges badges badges';
+    grid-template-columns: minmax(48px, 1fr) var(--meter-bar-w) var(--meter-num-w);
+    row-gap: 4px;
+  }
+
+  .itemName {
+    grid-area: name;
+  }
+
+  .itemBadges {
+    grid-area: badges;
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    row-gap: 4px;
+  }
+
+  .meterTrack {
+    grid-area: meter;
+  }
+
+  .meterValue {
+    grid-area: value;
+  }
+}
+
 .statusBadge {
   flex: none;
   padding: 1px 6px;

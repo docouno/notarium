@@ -85,15 +85,11 @@ export type MarkerScan = { hits: MarkerHit[]; complete: boolean }
 
 export type MarkerStore = {
   available(space: string): boolean
-  /** Write-through a marker at `folderPath`. Mount-boundary guard (P8): refuses
+  /** Write-through a marker at an EXISTING `folderPath`; marker metadata never
+   *  provisions a user-visible directory. Mount-boundary guard (P8): refuses
    *  ANY dot-segment path, so a marker can never land under `.notarium/*` (the
    *  second line after the host's safeRelPath). */
   write(space: string, folderPath: string, raw: string): Promise<void>
-  /** Same atomic write, but the folder must already exist and is never
-   *  provisioned. Move preparation uses this so an externally removed source
-   *  cannot be resurrected as a marker-only ghost. Optional for registry-only
-   *  test hosts; they have no physical folder to recreate. */
-  writeExisting?(space: string, folderPath: string, raw: string): Promise<void>
   /** The marker's bytes, or null when ABSENT. A transient error (EACCES/EIO/
    *  lock) THROWS — never mistake it for "unmarked", or a re-mint would
    *  overwrite a live marker. */
@@ -221,20 +217,6 @@ export const createMarkerStore = (notesDirFor: (space: string) => string | null)
     available: (space) => notesDirFor(space) !== null,
 
     write: async (space, folderPath, raw) => {
-      if (hasDotSegment(folderPath)) {
-        throw new Error(`refusing to write a marker under a dot namespace: ${folderPath}`)
-      }
-      const dir = notesDirFor(space)
-
-      if (!dir) {
-        throw new Error(`no marker storage for space ${space}`)
-      }
-      // General project/space provisioning retains the original mkdir-capable
-      // path. Move preparation calls writeExisting below.
-      await createLocalFsFiles(dir).write(markerRelPath(folderPath), raw)
-    },
-
-    writeExisting: async (space, folderPath, raw) => {
       if (hasDotSegment(folderPath)) {
         throw new Error(`refusing to write a marker under a dot namespace: ${folderPath}`)
       }
