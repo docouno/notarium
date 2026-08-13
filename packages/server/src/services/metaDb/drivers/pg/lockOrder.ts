@@ -121,9 +121,11 @@ export type IdentityRow = {
   created_at: string | null
   materialized: boolean
   deleted_at: string | null
+  address_revision: string | number
 }
 
-export const IDENTITY_COLUMNS = 'id, file_path, space, created_at, materialized, deleted_at'
+export const IDENTITY_COLUMNS =
+  'id, file_path, space, created_at, materialized, deleted_at, address_revision'
 
 /** An unlocked read needs no transaction, so the pool itself can run it. */
 export type Queryable = Pick<PoolClient, 'query'>
@@ -208,6 +210,91 @@ export const lockSpaceIdentityRows = async (
   const ids = (res.rows as Array<{ id: string }>).map((row) => row.id)
 
   return { lock: hold('L1', ids, ids, 'range'), ids }
+}
+
+// ── causal row locks (outside the tier index) ───────────────────────────────
+// These rows are serialized by the causal advisory plan, but their row locks
+// still live here so every PostgreSQL lock remains visible to the same finite
+// surface. They do not acquire a LockLevel and therefore do not participate in
+// the L1→L3 observer; callers must take any identity tier before their causal plan.
+
+export const lockSpaceLifecycleRow = async <T>(
+  client: PoolClient,
+  space: string,
+  mode: 'share' | 'update' = 'update',
+): Promise<T | undefined> => {
+  const result = await client.query(
+    mode === 'share'
+      ? 'SELECT * FROM space_lifecycle WHERE space = $1 FOR SHARE'
+      : 'SELECT * FROM space_lifecycle WHERE space = $1 FOR UPDATE',
+    [space],
+  )
+
+  return result.rows[0] as T | undefined
+}
+
+export const lockRestoreOperationRow = async <T>(
+  client: PoolClient,
+  operationId: string,
+  mode: 'share' | 'update' = 'update',
+): Promise<T | undefined> => {
+  const result = await client.query(
+    mode === 'share'
+      ? 'SELECT * FROM restore_operations WHERE id = $1 FOR SHARE'
+      : 'SELECT * FROM restore_operations WHERE id = $1 FOR UPDATE',
+    [operationId],
+  )
+
+  return result.rows[0] as T | undefined
+}
+
+export const lockRestoreParentRow = async (
+  client: PoolClient,
+  operationId: string,
+  space: string,
+): Promise<boolean> => {
+  const result = await client.query(
+    `SELECT id FROM restore_operations
+      WHERE id = $1 AND space = $2
+        AND endpoint = 'trash-restore-many'
+        AND phase NOT IN ('succeeded', 'rejected')
+      FOR SHARE`,
+    [operationId, space],
+  )
+
+  return result.rows.length > 0
+}
+
+export const lockOwnerProofRow = async <T>(
+  client: PoolClient,
+  noteId: string,
+): Promise<T | undefined> => {
+  const result = await client.query(
+    'SELECT * FROM note_owner_proofs WHERE note_id = $1 FOR UPDATE',
+    [noteId],
+  )
+
+  return result.rows[0] as T | undefined
+}
+
+export const lockInstallationGenerationRow = async <T>(
+  client: PoolClient,
+): Promise<T | undefined> => {
+  const result = await client.query(
+    'SELECT * FROM installation_generation WHERE singleton = 1 FOR UPDATE',
+  )
+
+  return result.rows[0] as T | undefined
+}
+
+export const lockBackupGenerationFreezeRow = async <T>(
+  client: PoolClient,
+): Promise<T | undefined> => {
+  const result = await client.query(
+    'SELECT * FROM backup_generation_freeze WHERE singleton = 1 FOR UPDATE',
+  )
+
+  return result.rows[0] as T | undefined
 }
 
 // ── L2a · favorites ──────────────────────────────────────────────────────────

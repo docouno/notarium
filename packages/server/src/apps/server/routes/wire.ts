@@ -20,7 +20,16 @@ import type {
   SearchResult as WireSearchResult,
   TrashItem as WireTrashItem,
 } from '@notarium/contract'
-import { RESOLVED_VIA, REVISION_ENTRY_ROLE } from '@notarium/core'
+import {
+  DOCUMENT_STATE_FORMAT,
+  documentSourceText,
+  RESOLVED_VIA,
+  REVISION_ENTRY_ROLE,
+  REVISION_RESTORE_AVAILABILITY,
+  revisionRestoreAvailability,
+} from '@notarium/core'
+
+type WithoutAuthor<T> = T extends unknown ? Omit<T, 'author'> : never
 import type {
   ConflictNote,
   Graph,
@@ -58,28 +67,50 @@ export const noteDetailToWire = (
   d: NoteContent,
   space?: string,
   deletedBy?: Author | null,
-): Omit<WireNoteDetail, 'id' | 'versionToken'> & { id?: string; versionToken?: string } => ({
-  id: d.id,
-  space,
-  title: d.title,
-  class: d.class,
-  filePath: d.filePath,
-  content: d.content,
-  frontmatter: d.frontmatter,
-  ...(d.slug ? { slug: d.slug } : {}),
-  ...(d.aliases?.length ? { aliases: d.aliases } : {}),
-  ...(d.modifiedAt != null ? { modifiedAt: d.modifiedAt } : {}),
-  ...(d.createdAt != null ? { createdAt: d.createdAt } : {}),
-  versionToken: d.versionToken,
-  ...(d.deleted
-    ? {
-        deleted: true,
-        deletedAt: d.deletedAt,
-        deletedBy: deletedBy ?? null,
-        restorable: d.restorable,
-      }
-    : {}),
-})
+  strictRestoreAvailable = true,
+): Omit<WireNoteDetail, 'id' | 'versionToken'> & { id?: string; versionToken?: string } => {
+  const opaqueSource =
+    d.deleted && d.documentState?.format === DOCUMENT_STATE_FORMAT.opaque
+      ? documentSourceText(d.documentState)
+      : undefined
+
+  return {
+    id: d.id,
+    space,
+    title: d.title,
+    class: d.class,
+    filePath: d.filePath,
+    content: d.content,
+    frontmatter: d.frontmatter,
+    ...(d.slug ? { slug: d.slug } : {}),
+    ...(d.aliases?.length ? { aliases: d.aliases } : {}),
+    ...(d.modifiedAt != null ? { modifiedAt: d.modifiedAt } : {}),
+    ...(d.createdAt != null ? { createdAt: d.createdAt } : {}),
+    versionToken: d.versionToken,
+    ...(d.deleted
+      ? {
+          deleted: true,
+          deletedAt: d.deletedAt,
+          deletedBy: deletedBy ?? null,
+          restorable: d.restorable,
+          restoreAvailability:
+            !strictRestoreAvailable &&
+            (d.restoreAvailability === REVISION_RESTORE_AVAILABILITY.full ||
+              d.restoreAvailability === REVISION_RESTORE_AVAILABILITY.partial)
+              ? 'capability-unavailable'
+              : d.restoreAvailability,
+          ...(d.documentState?.format === DOCUMENT_STATE_FORMAT.opaque
+            ? {
+                source: {
+                  encoding: opaqueSource == null ? ('base64' as const) : ('utf8' as const),
+                  data: opaqueSource ?? Buffer.from(d.documentState.source).toString('base64'),
+                },
+              }
+            : {}),
+        }
+      : {}),
+  }
+}
 
 export const conflictToWire = (c: ConflictNote): WireNoteDetail => ({
   id: c.id,
@@ -166,13 +197,31 @@ export const graphHealthToWire = (h: GraphHealth): WireGraphHealth => ({
 
 // `author` is resolved at the route (needs the viewer + pat registry for privacy
 // filtering), so the pure mapper omits it.
-export const revisionToWire = (r: Revision): Omit<WireRevision, 'author'> => ({
+const restoreAvailabilityToWire = (
+  revision: Revision,
+  strictRestoreAvailable: boolean,
+): WireRevision['restoreAvailability'] => {
+  const availability = revisionRestoreAvailability(revision)
+
+  return !strictRestoreAvailable &&
+    (availability === REVISION_RESTORE_AVAILABILITY.full ||
+      availability === REVISION_RESTORE_AVAILABILITY.partial)
+    ? 'capability-unavailable'
+    : availability
+}
+
+export const revisionToWire = (
+  r: Revision,
+  strictRestoreAvailable = true,
+): Omit<WireRevision, 'author'> => ({
   revisionId: r.id,
   noteId: r.noteId,
   kind: r.kind,
   principal: r.principal,
   createdAt: r.createdAt,
   contentHash: r.contentHash,
+  stateFormat: r.stateFormat,
+  restoreAvailability: restoreAvailabilityToWire(r, strictRestoreAvailable),
   baseRev: r.baseRevisionId,
   theirRev: r.theirRevisionId,
   sourceRev: r.sourceRevisionId,
@@ -182,11 +231,43 @@ export const revisionToWire = (r: Revision): Omit<WireRevision, 'author'> => ({
   charsRemoved: r.charsRemoved,
 })
 
-export const revisionDetailToWire = (r: RevisionDetail): Omit<WireRevisionDetail, 'author'> => ({
-  ...revisionToWire(r),
-  content: r.content,
-  tags: r.tags,
-})
+export const revisionDetailToWire = (
+  r: RevisionDetail,
+  strictRestoreAvailable = true,
+): WithoutAuthor<WireRevisionDetail> => {
+  const base = { ...revisionToWire(r, strictRestoreAvailable), tags: r.tags }
+
+  if (r.contentHash == null) {
+    return { ...base, contentMode: 'gap', content: null, snapshot: null }
+  }
+  if (r.documentState?.format === DOCUMENT_STATE_FORMAT.opaque) {
+    const text = documentSourceText(r.documentState)
+
+    return {
+      ...base,
+      contentMode: 'source',
+      content: null,
+      snapshot: null,
+      source: {
+        encoding: text == null ? 'base64' : 'utf8',
+        data: text ?? Buffer.from(r.documentState.source).toString('base64'),
+      },
+    }
+  }
+  if (r.content == null) {
+    throw new Error(`revision ${r.id} has content bytes but no readable projection`)
+  }
+
+  return {
+    ...base,
+    contentMode: 'markdown',
+    content: r.content,
+    snapshot:
+      r.documentState == null
+        ? (r.logicalState?.markdown ?? null)
+        : documentSourceText(r.documentState),
+  }
+}
 
 /** The dashboard "what changed" display kind derived from a journal revision.
  *  canon: docs/dashboard.md#activity-source-the-revision-journal-12 */
@@ -229,7 +310,11 @@ export const unattributedIfGap = <
 /** One trash row. `external` is computed from the RAW principal (before redaction),
  *  so only a principal-LESS delete reads external — a foreign agent's delete stays
  *  attributed via deletedBy. */
-export const trashItemToWire = (e: TrashEntry, author: Author | null): WireTrashItem => ({
+export const trashItemToWire = (
+  e: TrashEntry,
+  author: Author | null,
+  strictRestoreAvailable = true,
+): WireTrashItem => ({
   noteId: e.noteId,
   title: e.title,
   filePath: e.filePath,
@@ -239,7 +324,16 @@ export const trashItemToWire = (e: TrashEntry, author: Author | null): WireTrash
   external: e.principal === null,
   // Recoverable iff a body blob exists; an external delete we never read shows in
   // the trash but can't be resurrected (P5).
-  restorable: e.contentHash != null,
+  restorable:
+    e.restoreAvailability === REVISION_RESTORE_AVAILABILITY.full ||
+    e.restoreAvailability === REVISION_RESTORE_AVAILABILITY.partial,
+  restoreAvailability:
+    !strictRestoreAvailable &&
+    (e.restoreAvailability === REVISION_RESTORE_AVAILABILITY.full ||
+      e.restoreAvailability === REVISION_RESTORE_AVAILABILITY.partial)
+      ? 'capability-unavailable'
+      : e.restoreAvailability,
+  stateFormat: e.stateFormat,
   revisionId: e.revisionId,
 })
 
@@ -292,3 +386,4 @@ export const moveFolderToDomain = (path: string, destinationPath: string): MoveI
   destinationPath,
   isDirectory: true,
 })
+import { Buffer } from 'node:buffer'

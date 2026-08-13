@@ -27,6 +27,7 @@ import type {
 
 const REC_A: IdentityRecord = {
   id: 'id-aaaaaaaa01',
+  addressRevision: 1,
   filePath: 'demo/a.md',
   space: 'main',
   createdAt: '2026-01-01T00:00:00Z',
@@ -35,6 +36,7 @@ const REC_A: IdentityRecord = {
 }
 const REC_B: IdentityRecord = {
   id: 'id-bbbbbbbb01',
+  addressRevision: 1,
   filePath: 'demo/b.md',
   space: 'work',
   createdAt: null,
@@ -53,6 +55,7 @@ const revInput = (over: Partial<RevisionInput> = {}): RevisionInput => ({
   entryRole: 'origin',
   principal: 'ui',
   contentHash: 'hash-1',
+  stateFormat: null,
   title: 'Note one',
   class: null,
   slug: null,
@@ -106,9 +109,44 @@ describe('SqliteMetaDb', () => {
       expect(rows).toHaveLength(1)
       expect(rows[0]).toEqual({
         ...REC_A,
+        addressRevision: 2,
         filePath: 'archive/a.md',
         materialized: false,
         deletedAt: '2026-06-02T00:00:00Z',
+      })
+    })
+
+    it('keeps one live owner per space path and revisions address changes', async () => {
+      const db = make()
+      await db.identity.claimMany([REC_A])
+      await expect(
+        db.identity.claimMany([
+          {
+            ...REC_B,
+            space: REC_A.space,
+            filePath: REC_A.filePath,
+            deletedAt: null,
+          },
+        ]),
+      ).rejects.toThrow(/unique/i)
+
+      await db.identity.claimMany([{ ...REC_A, deletedAt: '2026-06-03T00:00:00Z' }])
+      await db.identity.claimMany([
+        {
+          ...REC_B,
+          space: REC_A.space,
+          filePath: REC_A.filePath,
+          deletedAt: null,
+        },
+      ])
+
+      expect(await db.identity.findById!(REC_A.id)).toMatchObject({
+        addressRevision: 2,
+        deletedAt: '2026-06-03T00:00:00Z',
+      })
+      expect(await db.identity.findById!(REC_B.id)).toMatchObject({
+        addressRevision: 1,
+        deletedAt: null,
       })
     })
 
@@ -269,7 +307,6 @@ describe('SqliteMetaDb', () => {
           slug: 'gone',
           notesDir: 'gone',
           aliases: ['retired-gone', 'shared-retired'],
-          archivedAt: '2026-06-23T12:00:00Z',
         }),
       )
       await db.spaces.upsert(
@@ -469,6 +506,18 @@ describe('SqliteMetaDb', () => {
       ]) {
         putLegacyBookmark.run(legacyKey)
       }
+
+      // Child rows were written while the space was active. Archive only after seeding:
+      // the lifecycle gate intentionally rejects new space-owned writes after closing.
+      await db.spaces.upsert(
+        sp({
+          id: victim,
+          slug: 'gone',
+          notesDir: 'gone',
+          aliases: ['retired-gone', 'shared-retired'],
+          archivedAt: '2026-06-23T12:00:00Z',
+        }),
+      )
 
       await db.purgeSpace(victim)
 
@@ -1200,7 +1249,12 @@ describe('SqliteMetaDb', () => {
         'body two',
       )
       expect(Number(r2.id)).toBeGreaterThan(Number(r1.id))
-      expect(await db.revisions.get(REV_SPACE, r1.id)).toEqual({ ...revInput(), id: r1.id })
+      expect(await db.revisions.get(REV_SPACE, r1.id)).toEqual({
+        ...revInput(),
+        id: r1.id,
+        semanticFingerprint: null,
+        restoreSafety: null,
+      })
       expect(await db.revisions.get(REV_SPACE, '999999')).toBeNull()
       expect(await db.revisions.get(REV_SPACE, 'not-a-rowid')).toBeNull()
       expect(await db.revisions.latestFor(REV_SPACE, 'note-1')).toEqual(r2)
@@ -1671,6 +1725,58 @@ describe('SqliteMetaDb', () => {
       const pct = await db.revisions.listTrashed('main', { offset: 0, limit: 50, q: '%' })
       expect(pct.total).toBe(1)
       expect(pct.items[0].noteId).toBe('pct')
+    })
+
+    it('listTrashed: recovery availability filters the whole window and counts partial copies', async () => {
+      fresh()
+      await tomb('full', {
+        title: 'Complete copy',
+        contentHash: 'full-hash',
+        stateFormat: 'markdown-v2',
+        restoreSafety: 'safe',
+      })
+      await tomb('partial', {
+        title: 'Older copy',
+        contentHash: 'partial-hash',
+        stateFormat: null,
+        restoreSafety: null,
+      })
+      await tomb('blocked', {
+        title: 'Protected source',
+        contentHash: 'blocked-hash',
+        stateFormat: 'markdown-v2',
+        restoreSafety: 'blocked',
+      })
+      await tomb('opaque', {
+        title: 'Source only',
+        contentHash: 'opaque-hash',
+        stateFormat: 'opaque-v1',
+        restoreSafety: null,
+      })
+      await tomb('gap', { title: 'Deletion record', contentHash: null })
+
+      const all = await db.revisions.listTrashed('main', { offset: 0, limit: 50 })
+      expect(all).toMatchObject({ total: 5, restorableTotal: 2, partialTotal: 1 })
+
+      const restorable = await db.revisions.listTrashed('main', {
+        offset: 0,
+        limit: 50,
+        availability: 'restorable',
+      })
+      expect(restorable).toMatchObject({ total: 2, restorableTotal: 2, partialTotal: 1 })
+      expect(new Set(restorable.items.map((item) => item.noteId))).toEqual(
+        new Set(['full', 'partial']),
+      )
+
+      const unavailable = await db.revisions.listTrashed('main', {
+        offset: 0,
+        limit: 50,
+        availability: 'unavailable',
+      })
+      expect(unavailable).toMatchObject({ total: 3, restorableTotal: 0, partialTotal: 0 })
+      expect(new Set(unavailable.items.map((item) => item.noteId))).toEqual(
+        new Set(['blocked', 'opaque', 'gap']),
+      )
     })
 
     it('purgeNotes: drops a note’s rows + GCs orphan blobs, but keeps a blob a survivor still references', async () => {

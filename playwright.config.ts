@@ -21,6 +21,7 @@ const AUTH_SPECS = [
   '**/e2e/space-create.spec.ts',
   '**/e2e/space-rename.spec.ts',
 ]
+const REAL_STACK_SPECS = '**/e2e-real/**'
 
 const PORT = Number(process.env.E2E_PORT || 8788)
 // The auth suite's own fake (#10): the fake's auth MODE follows its boot
@@ -34,6 +35,9 @@ export default defineConfig({
   // Behaviour journeys (test/e2e) + the visual matrix (test/visual). Only *.spec.ts
   // — the unit layer is *.test.ts under vitest and must not load here.
   testMatch: '**/*.spec.ts',
+  // The production-stack restore proof has its own server and config. A CLI path
+  // of `test/e2e` also prefix-matches `test/e2e-real`, so fence it explicitly.
+  testIgnore: REAL_STACK_SPECS,
   // Serial: the fake backend is one shared in-memory store, re-seeded before each
   // test (see test/e2e/fixtures.ts). Parallel workers would mutate it under each
   // other. The suite is small, so serial is cheap.
@@ -47,7 +51,13 @@ export default defineConfig({
     trace: 'on-first-retry',
   },
   projects: [
-    { name: 'chromium', use: { ...devices['Desktop Chrome'] }, testIgnore: AUTH_SPECS },
+    {
+      name: 'chromium',
+      use: { ...devices['Desktop Chrome'] },
+      // Project-level filters replace the top-level filter, so repeat the
+      // production-stack fence beside the auth split.
+      testIgnore: [...AUTH_SPECS, REAL_STACK_SPECS],
+    },
     // Password-mode journeys (#10/#13) against the auth-booted fake (AUTH_PORT):
     // the login gate + the personal layer (a signed-in user's profile/memory).
     {

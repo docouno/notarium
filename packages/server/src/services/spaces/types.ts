@@ -1,4 +1,5 @@
 import type {
+  IdentityRecord,
   KnowledgeStore,
   StoreEvent,
   TagMutationInput,
@@ -19,6 +20,10 @@ export type SpaceStore = KnowledgeStore & {
   stop?(): void
   settle?(): Promise<void>
   checkpoint?(): Promise<void>
+  /** Re-read committed physical truth into this process-local projection. */
+  reconcile?(): Promise<void>
+  /** Install an identity row committed by a cross-system terminal transaction. */
+  adoptCausalIdentity?(record: IdentityRecord): void | Promise<void>
   subscribe?(listener: (event: StoreEvent) => void): () => void
 }
 
@@ -73,6 +78,14 @@ export type SpaceManagerOptions = {
    *  Best-effort: a filesystem blip must never wedge the purge (rows are already
    *  gone, orphaned files are harmless). */
   onPurge?: (rec: SpaceRecord) => Promise<void>
+  /** Close fresh physical admission and wait for work accepted before the durable
+   * lifecycle fence. Idempotent; the authority remains closed until reopen. */
+  closeResourceAdmission?: (space: string, deadlineMs: number) => Promise<void>
+  /** Reopen a previously archived space's process-local physical authority. */
+  reopenResourceAdmission?: (space: string) => void
+  /** Bound one archive drain attempt. Timeout leaves the durable `closing` phase
+   * in place so startup or a later request can resume it. */
+  lifecycleDrainMs?: number
   /** Read a config space's root `.notariummeta` `space` facet so init() can adopt
    *  its marker-borne id into an empty registry. Absent ⇒ no adoption: provision
    *  mints a fresh id. */

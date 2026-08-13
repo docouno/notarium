@@ -40,6 +40,16 @@ describeKnowledgeStoreContract('NotariumStore (localfs + sqlite)', async () => {
         dir: join(notesDir, '.notarium/memory'),
         prefix: '.notarium/memory',
       },
+      {
+        class: 'profile',
+        dir: join(notesDir, '.notarium/profile'),
+        prefix: '.notarium/profile',
+      },
+      {
+        class: 'skill',
+        dir: join(notesDir, '.notarium/skills'),
+        prefix: '.notarium/skills',
+      },
     ],
   })
   return {

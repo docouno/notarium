@@ -39,6 +39,13 @@ export const PG_TRANSACTIONS: readonly PgTransaction[] = [
   { id: 'agentDeltaCursors.advance', levels: [] },
   { id: 'oauth.upsertPendingClient', levels: [] },
   { id: 'pgMetaDb.grantMemberToActiveSpace', levels: [] },
+  { id: 'causalOutbox.append', levels: [] },
+  { id: 'installationGeneration.acquireBackupFreeze', levels: [] },
+  { id: 'installationGeneration.compareAndSet', levels: [] },
+  { id: 'installationGeneration.renewBackupFreeze', levels: [] },
+  { id: 'restoreOperations.transition', levels: [] },
+  { id: 'restoreTerminal.finalize', levels: [] },
+  { id: 'spaceLifecycle.transition', levels: [] },
 
   // Reference writers: identity first, then their own facet.
   { id: 'favorites.add', levels: ['L1', 'L2a'] },
@@ -52,6 +59,7 @@ export const PG_TRANSACTIONS: readonly PgTransaction[] = [
 
   // Identity itself.
   { id: 'identity.claimMany', levels: ['L1'] },
+  { id: 'ownerProofs.adopt', levels: ['L1'] },
   {
     // Takes the mutex through the quarantine closure, and re-enters L3t for the
     // target note's own rows — which the closure, by construction, never contains.
@@ -62,6 +70,12 @@ export const PG_TRANSACTIONS: readonly PgTransaction[] = [
 
   // Revisions.
   { id: 'revisions.append', levels: ['L3t', 'L3s', 'L3n', 'L3b', 'L3t'], exempt: 'append-cas' },
+  { id: 'restoreOperations.accept', levels: ['L3n'] },
+  {
+    id: 'restoreTerminal.commit',
+    levels: ['L1', 'L3t', 'L3s', 'L3n', 'L3b', 'L3t'],
+    exempt: 'append-cas',
+  },
   {
     id: 'revisions.purgeNotes',
     levels: ['L3m', 'L3n', 'L3t', 'L3b', 'L3t'],

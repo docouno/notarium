@@ -19,7 +19,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   CachedStore,
+  InMemoryRestoreOperationPersistence,
   type InMemoryRevisionPersistence,
+  InMemorySpaceLifecyclePersistence,
   type InteractiveSignal,
   REVISION_ENTRY_ROLE,
   sha256Hex,
@@ -87,12 +89,18 @@ export type ActivityFixture = {
   class?: string
   charsAdded?: number
   charsRemoved?: number
-  /** The note's body AS OF this revision. Seeded into the blob table (keyed by
-   *  its sha-256, exactly like a live write), which is what makes a seeded chain
-   *  readable rather than a list of "body unknown" rows: the history panel's
-   *  revision view and the Changes diff both fetch by `contentHash`. Omit for a
-   *  row that only needs to exist as activity. */
+  /** Body projection as of this revision. Current-format rows additionally
+   * provide `snapshot`; body-only content without one intentionally models legacy. */
   content?: string
+  /** Complete canonical logical state for current-format seeded rows. Omission
+   * deliberately creates a legacy body-only row. */
+  snapshot?: string
+  /** Byte-safe state blob for exact/opaque named cases. Base64 keeps reset
+   * fixtures JSON-stable. When present it wins over snapshot/content. */
+  stateBlobBase64?: string
+  stateFormat?: 'markdown-v1' | 'markdown-v2' | 'skill-markdown-v1' | 'opaque-v1' | null
+  restoreSafety?: 'safe' | 'blocked' | 'unknown' | null
+  semanticFingerprint?: string | null
   /** Seed this row as a journal GAP — the state a cross-space id collision leaves
    *  behind (#327). The fake's journal cannot DECIDE a quarantine (that closure
    *  lives in the meta-DB's settlement transaction), so the fixture names the row
@@ -254,7 +262,10 @@ const seedActivity = async (
           : REVISION_ENTRY_ROLE.change
     // Content-address the seeded body the same way a live write does, so the blob
     // lands under the hash the reader will ask for.
-    const contentHash = e.content != null ? await sha256Hex(e.content) : null
+    const blob = e.stateBlobBase64
+      ? Uint8Array.from(Buffer.from(e.stateBlobBase64, 'base64'))
+      : (e.snapshot ?? e.content)
+    const contentHash = blob != null ? await sha256Hex(blob) : null
     const appended = await revisions.append(
       {
         noteId,
@@ -266,6 +277,9 @@ const seedActivity = async (
         entryRole,
         principal: e.principal ?? 'ui',
         contentHash,
+        semanticFingerprint: e.semanticFingerprint ?? null,
+        restoreSafety: e.restoreSafety ?? null,
+        stateFormat: e.stateFormat ?? (e.snapshot != null ? 'markdown-v1' : null),
         title: e.title ?? `Activity ${i}`,
         slug: null,
         class: e.class ?? null,
@@ -274,7 +288,7 @@ const seedActivity = async (
         charsAdded: e.charsAdded ?? null,
         charsRemoved: e.charsRemoved ?? null,
       },
-      e.content ?? null,
+      blob ?? null,
     )
 
     if (e.unavailable) {
@@ -387,10 +401,21 @@ export const createApp = async (
   // FUTURE read of another facet must extend this stub (else a runtime NPE): keep it in
   // lockstep with spaceManager.ts's read sites (`spaces`, `identity.findById`,
   // `adoptLegacyRows`).
-  const metaDbStub: Pick<MetaDb, 'spaces' | 'adoptLegacyRows' | 'purgeSpace'> & {
+  const spaceLifecycle = new InMemorySpaceLifecyclePersistence()
+  const restoreOperations = new InMemoryRestoreOperationPersistence(spaceLifecycle)
+  const metaDbStub: Pick<
+    MetaDb,
+    'spaces' | 'spaceLifecycle' | 'restoreOperations' | 'jobs' | 'adoptLegacyRows' | 'purgeSpace'
+  > & {
     identity: { findById: undefined }
   } = {
     spaces: spacesRegistry,
+    spaceLifecycle,
+    restoreOperations,
+    jobs: {
+      list: async () => [],
+      cancel: async () => false,
+    } as unknown as MetaDb['jobs'],
     identity: { findById: undefined },
     adoptLegacyRows: async () => {},
     // Permanent purge: drop the registry row (id↔slug gone). The on-disk +

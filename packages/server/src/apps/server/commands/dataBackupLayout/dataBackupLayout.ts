@@ -50,6 +50,7 @@ export const backupLayoutFromEnv = (env: NodeJS.ProcessEnv = process.env): Backu
     metaDbPath: resolvedMetaDb,
     spacesDir,
     jobsDir: paths.jobsDataDir,
+    keyringDir: join(paths.dataDir, 'replay-keyring'),
   }
 }
 

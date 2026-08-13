@@ -15,6 +15,7 @@ describe('backupLayoutFromEnv', () => {
       metaDbPath: '/data/meta.db',
       spacesDir: '/data/spaces',
       jobsDir: '/data/jobs',
+      keyringDir: '/data/replay-keyring',
     })
   })
 

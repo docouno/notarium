@@ -55,8 +55,8 @@ test('footer frosts on the first frame when content is under it, flat only at th
   await expect(page.getByTestId('trash-row').first()).toBeVisible()
   await setScrollTop(page, 0) // plenty of content sits below the footer once it appears
 
-  // Pick the first row → the footer mounts over content. Its glass must already be full:
-  // before the fix `--glass-lift` was never written on mount and the footer paused flat.
+  // Pick the first row → the pre-measured footer becomes visible over content. Its glass
+  // must already be full; it must not pause flat until another scroll event arrives.
   await page.getByTestId('trash-row-check').first().check({ force: true })
   await expect(page.getByTestId('trash-footer')).toBeVisible()
   expect(await glassLift(page, 'trash-footer')).toBeGreaterThan(0.9)
@@ -64,6 +64,49 @@ test('footer frosts on the first frame when content is under it, flat only at th
   // Scroll to the very end: nothing remains under the footer, so it goes flat.
   await setScrollTop(page, 10_000)
   await expect.poll(() => glassLift(page, 'trash-footer')).toBeLessThan(0.1)
+
+  // Flat glass is safe only when the final row visibly clears the floating action bar.
+  // Keep a full content gap there; otherwise the transparent footer reads as if it were
+  // laid directly over the row even though the scroll position is technically at rest.
+  const bottomGap = async () => {
+    const last = await page.getByTestId('trash-row').last().boundingBox()
+    const footer = await page.getByTestId('trash-footer').boundingBox()
+
+    return last && footer ? footer.y - (last.y + last.height) : -1
+  }
+  await expect.poll(bottomGap).toBeGreaterThanOrEqual(23)
+})
+
+test('footer space is reserved before selection, so showing it does not jump the scroll', async ({
+  page,
+}) => {
+  await page.goto('/s/main/trash')
+  const scroll = trashScroll(page)
+  await expect(page.getByTestId('trash-row').first()).toBeVisible()
+  await setScrollTop(page, 10_000)
+
+  const metrics = () =>
+    scroll.evaluate((element) => {
+      const list = element.querySelector<HTMLElement>('[data-testid="trash-list"]')
+
+      return {
+        scrollHeight: element.scrollHeight,
+        scrollTop: element.scrollTop,
+        listTop: list!.getBoundingClientRect().top,
+      }
+    })
+  const before = await metrics()
+
+  await page.getByTestId('trash-row-check').last().check({ force: true })
+  await expect(page.getByTestId('trash-footer')).toBeVisible()
+  const after = await metrics()
+
+  expect(after.scrollHeight).toBe(before.scrollHeight)
+  expect(after.scrollTop).toBe(before.scrollTop)
+  // Compare the stable virtual-list coordinate, not the last mounted row: the
+  // virtualizer may swap its overscan window one frame after scrollTo without any
+  // user-visible movement, so "last DOM row" is not a stable content anchor.
+  expect(after.listTop).toBe(before.listTop)
 })
 
 // Alpha of a computed colour — handles `color(srgb r g b / a)`, `rgb(a)`, `transparent`.

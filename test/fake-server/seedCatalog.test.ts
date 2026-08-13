@@ -22,13 +22,10 @@ describe('seed catalog → fake backend (#175)', () => {
     try {
       const trash = await json(app, '/api/s/main/trash')
       expect(trash.total).toBe(9) // 5 standalone + 3 folder + 1 project
-      // Every tombstone is RESTORABLE, matching the real stand (#256): the fake
-      // projection stamps each seeded revision with the body it carried, so a
-      // delete row keeps the note's last known content — exactly what the real
-      // applier's `store.remove` captures. This assertion used to pin the opposite
-      // (0 restorable) as a documented fake-projection gap; seeding the blobs is
-      // what closed it, and pinning the parity is what keeps it closed.
-      expect(trash.restorableTotal).toBe(9)
+      // The fake retains every tombstone body but has no durable strict-publish
+      // authority. The aggregate follows the public capability predicate instead
+      // of advertising a bulk action that can only return 503.
+      expect(trash.restorableTotal).toBe(0)
       const notes = await json(app, '/api/s/main/notes')
       const created = world.events.filter((e) => e.op === 'create').length
       const deleted = world.events.filter((e) => e.op === 'delete').length
@@ -37,6 +34,52 @@ describe('seed catalog → fake backend (#175)', () => {
       expect(notes.notes.length).toBe(created - deleted + restored)
       // The deleted-then-restored note specifically comes back (not just the count).
       expect(notes.notes.some((n: { title: string }) => n.title === 'Recovered draft')).toBe(true)
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('restore-states projects exact/blocked/legacy/gap/opaque semantics from one catalog', async () => {
+    const world = buildCaseWorld('restore-states', { now: DEFAULT_NOW })
+    const fixture = caseToFixture(world)
+    fixture.auth = undefined
+    const activity = fixture.spaces.find((space) => space.slug === 'main')?.activity ?? []
+    const app = await createApp(fixture)
+
+    try {
+      const trash = await json(app, '/api/s/main/trash')
+      const availability = new Map(
+        trash.items.map((item: { title: string; restoreAvailability: string }) => [
+          item.title,
+          item.restoreAvailability,
+        ]),
+      )
+
+      expect(availability.get('Exact restorable deletion')).toBe('capability-unavailable')
+      expect(availability.get('Blocked owner anchor')).toBe('blocked')
+      expect(availability.get('Legacy partial snapshot')).toBe('capability-unavailable')
+      expect(availability.get('Honest content gap')).toBe('gap')
+      expect(availability.get('Opaque UTF-8 source')).toBe('opaque')
+      expect(availability.get('Opaque binary source')).toBe('opaque')
+
+      const exactId = deterministicNoteId('restore/exact-unicode.md')
+      const revisions = await json(app, `/api/note/revisions?id=${exactId}`)
+      const exact = await json(
+        app,
+        `/api/note/revision?id=${exactId}&revisionId=${revisions.revisions[0].revisionId}`,
+      )
+      expect(exact).toMatchObject({
+        contentMode: 'markdown',
+        stateFormat: 'markdown-v2',
+        restoreAvailability: 'capability-unavailable',
+      })
+      expect(exact.snapshot).toContain('# authored comment\r\n')
+      expect(exact.snapshot).toContain('café Ω')
+
+      const opaqueRows = activity.filter((row) => row.stateFormat === 'opaque-v1')
+      expect(opaqueRows).toHaveLength(3)
+      expect(opaqueRows.some((row) => row.title === 'Invalid direct skill')).toBe(true)
+      expect(opaqueRows.every((row) => Boolean(row.stateBlobBase64))).toBe(true)
     } finally {
       await app.close()
     }
@@ -80,6 +123,44 @@ describe('seed catalog → fake backend (#175)', () => {
       const tomb = revs.revisions.find((r: { kind: string }) => r.kind === 'delete')
       expect(tomb.charsAdded).toBe(0)
       expect(tomb.charsRemoved).toBeGreaterThan(0)
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('history-rich seeds a full metadata-only revision, not a body-only decoration', async () => {
+    const world = buildCaseWorld('history-rich', { now: DEFAULT_NOW })
+    const fixture = caseToFixture(world)
+    // This contract probes the seed projection and history wire, not auth; keep
+    // the case's multi-author principals but serve it in the authless test host.
+    fixture.auth = undefined
+    const app = await createApp(fixture)
+
+    try {
+      const id = deterministicNoteId('releases/release-notes.md')
+      const revs = await json(app, `/api/note/revisions?id=${id}`)
+      expect(revs.revisions).toHaveLength(8)
+      expect(
+        revs.revisions.every(
+          (revision: { stateFormat: string | null }) => revision.stateFormat === 'markdown-v1',
+        ),
+      ).toBe(true)
+
+      // Day-22 is the fifth chronological state → fourth in an eight-row
+      // newest-first window. Its body is unchanged; only authored FM moved.
+      const metadata = revs.revisions[3]
+      const parent = revs.revisions[4]
+      const [metadataDetail, parentDetail] = await Promise.all([
+        json(app, `/api/note/revision?id=${id}&revisionId=${metadata.revisionId}`),
+        json(app, `/api/note/revision?id=${id}&revisionId=${parent.revisionId}`),
+      ])
+      expect(metadataDetail.content).toBe(parentDetail.content)
+      expect(metadataDetail.snapshot).toContain('review-status: reviewed')
+      expect(metadataDetail.snapshot).toContain('tags: [release, reviewed]')
+      expect(parentDetail.snapshot).toContain('review-status: draft')
+      expect(metadata.charsAdded + metadata.charsRemoved).toBeGreaterThan(0)
+      const note = await json(app, `/api/note?id=${id}`)
+      expect(note.frontmatter.tags).toEqual(['release', 'reviewed'])
     } finally {
       await app.close()
     }

@@ -146,14 +146,14 @@ const gatePurge = (revisions: InMemoryRevisionPersistence) => {
   const purge = revisions.purgeNotes.bind(revisions)
   let armed = true
 
-  revisions.purgeNotes = async (space, ids) => {
+  revisions.purgeNotes = async (space, ids, expectedLatest) => {
     if (armed) {
       armed = false
       entered.resolve()
       await release.promise
     }
 
-    return purge(space, ids)
+    return purge(space, ids, expectedLatest)
   }
 
   return { entered: entered.promise, release: release.resolve }

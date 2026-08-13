@@ -9,6 +9,7 @@ import {
   SpaceSlugSchema,
 } from '../primitives'
 import { noteWriteFields } from './_fields'
+import { LiteralSourceSchema, RestoreAvailabilitySchema } from './history'
 
 export const NoteDetailResponseSchema = z.object({
   id: z.string(),
@@ -57,9 +58,17 @@ export const NoteDetailResponseSchema = z.object({
   deletedAt: z.string().optional(),
   /** Who deleted it, resolved + privacy-filtered; null = an external delete. */
   deletedBy: AuthorSchema.nullable().optional(),
-  /** Whether the last body is recoverable (a blob is in the CAS) — the banner's
-   *  Restore is disabled when false (an honest gap). */
+  /** Whether historical content is available for the read-only preview. This is
+   *  deliberately NOT restore eligibility: opaque or unsafe source can still be
+   *  inspected even though publishing it back would be refused. */
   restorable: z.boolean().optional(),
+  /** Authoritative restore eligibility for a deleted note. Present on deleted
+   *  responses; absent on live notes. */
+  restoreAvailability: RestoreAvailabilitySchema.optional(),
+  /** Exact opaque source for a deleted note. UTF-8 is literal text; arbitrary
+   * bytes are base64. When present, clients must not pass `content` through a
+   * Markdown renderer. */
+  source: LiteralSourceSchema.optional(),
 })
 
 export const CreateNoteRequestSchema = z.object({

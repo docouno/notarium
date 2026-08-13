@@ -14,6 +14,7 @@ import { IconDocPage, IconSync, IconX } from '../../core/Icons'
 import { Skeleton, SkeletonText } from '../../core/Skeleton'
 import { StateView } from '../../core/StateView'
 import { useToast } from '../../core/Toast'
+import { PARTIAL_RESTORE_CONFIRMATION } from '../../libs/revisions/revisions'
 import {
   feedRoute,
   feedTagRoute,
@@ -114,10 +115,23 @@ export const NotePage = () => {
         canManage={canWrite}
         busy={trashBusy}
         onRestore={() => {
-          setTrashBusy(true)
           void (async () => {
+            if (note.restoreAvailability === 'partial') {
+              const ok = await confirm(PARTIAL_RESTORE_CONFIRMATION)
+
+              if (!ok) {
+                return
+              }
+            }
+            setTrashBusy(true)
             try {
-              await api.trashRestore(space, note.id)
+              const { revisions } = await api.revisionsGet(note.id, { limit: 1 })
+              const tombstone = revisions[0]
+
+              if (!tombstone) {
+                throw new Error('Deleted note has no restore revision')
+              }
+              await api.trashRestore(space, note.id, tombstone.revisionId)
               await reloadNote() // now live → the normal reader takes over
             } catch (e) {
               toast.error((e as Error).message)

@@ -5,7 +5,13 @@
 // user's personal space is the one removal refuses.
 
 import { describe, expect, it, vi } from 'vitest'
-import type { KnowledgeStore, SyncStatus } from '@notarium/core'
+import {
+  InMemoryRestoreOperationPersistence,
+  InMemorySpaceLifecyclePersistence,
+  type KnowledgeStore,
+  SPACE_LIFECYCLE_PHASE,
+  type SyncStatus,
+} from '@notarium/core'
 
 import type { SpaceRecord } from '../../packages/server/src/services/metaDb'
 import { SpaceManager } from '../../packages/server/src/services/spaces'
@@ -16,12 +22,35 @@ import type { SpaceManagerOptions, SpaceStore } from '../../packages/server/src/
 // adopter. The fresh-provision detection (#97) reads spaces.list().
 const fakeMetaDb = () => {
   const rows = new Map<string, SpaceRecord>() // keyed by the opaque id (#100 phase 4)
+  const spaceLifecycle = new InMemorySpaceLifecyclePersistence()
+  const restoreOperations = new InMemoryRestoreOperationPersistence(spaceLifecycle)
   return {
     adoptLegacyRows: async () => {},
     // Permanent purge (#110): the real driver wipes every child table + the spaces row
     // transactionally; the fake only needs to drop the registry row.
     purgeSpace: async (id: string) => {
+      const blocker = (await restoreOperations.listRecoverable(id))[0]
+
+      if (blocker) {
+        throw new Error(`space purge blocked by restore operation: ${blocker.id}`)
+      }
       rows.delete(id)
+      const transitioned = await spaceLifecycle.transition({
+        space: id,
+        expectedPhases: [SPACE_LIFECYCLE_PHASE.purgeIntent],
+        phase: SPACE_LIFECYCLE_PHASE.metadataCleaned,
+        changedAt: 'purged',
+      })
+
+      if (transitioned.status !== 'transitioned') {
+        throw new Error(`fake purge lifecycle mismatch: ${id}`)
+      }
+    },
+    restoreOperations,
+    spaceLifecycle,
+    jobs: {
+      list: async () => [],
+      cancel: async () => true,
     },
     spaces: {
       list: async () => [...rows.values()],
@@ -29,6 +58,11 @@ const fakeMetaDb = () => {
       getBySlug: async (slug: string) => [...rows.values()].find((r) => r.slug === slug) ?? null,
       upsert: async (rec: SpaceRecord) => {
         rows.set(rec.id, { ...rec })
+        await spaceLifecycle.ensure(
+          rec.id,
+          rec.archivedAt ? SPACE_LIFECYCLE_PHASE.archived : SPACE_LIFECYCLE_PHASE.active,
+          rec.archivedAt ?? rec.createdAt,
+        )
       },
     },
   } as unknown as SpaceManagerOptions['metaDb']
@@ -153,8 +187,12 @@ describe('SpaceManager', () => {
       archivedBy: 'user:tester',
     }
     const createStore = vi.fn(() => stubStore())
+    const spaceLifecycle = new InMemorySpaceLifecyclePersistence()
+    const restoreOperations = new InMemoryRestoreOperationPersistence(spaceLifecycle)
     const metaDb = {
       adoptLegacyRows: async () => {},
+      restoreOperations,
+      spaceLifecycle,
       spaces: {
         list: async () => [{ ...archived }],
         getById: async (id: string) => (id === archived.id ? { ...archived } : null),
@@ -260,6 +298,110 @@ describe('SpaceManager', () => {
     await expect(manager.store(rec.id)).resolves.toBeTruthy()
   })
 
+  it('keeps a timed-out archive durably closing and resumes the drain', async () => {
+    const metaDb = fakeMetaDb()
+    const store = stubStore()
+    let busy = true
+    const reopened: string[] = []
+    const manager = new SpaceManager({
+      spaces: [],
+      createStore: () => store,
+      createSpace: async () => {},
+      metaDb,
+      lifecycleDrainMs: 5,
+      closeResourceAdmission: async () => {
+        if (busy) {
+          throw Object.assign(new Error('active lease deadline exceeded'), { code: 'DEADLINE' })
+        }
+      },
+      reopenResourceAdmission: (space) => reopened.push(space),
+    })
+    await manager.init()
+    const rec = await manager.create({ slug: 'work', displayName: 'Work' })
+    await manager.store(rec.id)
+
+    await expect(manager.archive(rec.id, 'user:tester')).rejects.toMatchObject({
+      reason: 'space_busy',
+    })
+    expect(await metaDb!.spaceLifecycle.get(rec.id)).toMatchObject({ phase: 'closing' })
+    expect(manager.list()).toEqual([])
+    await expect(manager.store(rec.id)).rejects.toMatchObject({ isNotFound: true })
+
+    busy = false
+    await expect(manager.archive(rec.id, 'user:other')).resolves.toMatchObject({
+      archivedBy: 'user:tester',
+    })
+    expect(store.stop).toHaveBeenCalled()
+    expect(store.settle).toHaveBeenCalled()
+    await manager.restore(rec.id)
+    expect(reopened).toEqual([rec.id])
+  })
+
+  it('retains a stopped store when settlement fails so closing can retry it', async () => {
+    const metaDb = fakeMetaDb()
+    const store = stubStore()
+    let attempt = 0
+
+    store.settle = vi.fn(async () => {
+      if (attempt++ === 0) {
+        throw new Error('journal flush unavailable')
+      }
+    })
+    const manager = new SpaceManager({
+      spaces: [],
+      createStore: () => store,
+      createSpace: async () => {},
+      metaDb,
+    })
+    await manager.init()
+    const rec = await manager.create({ slug: 'work', displayName: 'Work' })
+    await manager.store(rec.id)
+
+    await expect(manager.archive(rec.id)).rejects.toThrow('journal flush unavailable')
+    expect(await metaDb!.spaceLifecycle.get(rec.id)).toMatchObject({ phase: 'closing' })
+    await expect(manager.archive(rec.id)).resolves.toMatchObject({ id: rec.id })
+    expect(store.settle).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps closing pinned until an accepted restore operation is terminal', async () => {
+    const metaDb = fakeMetaDb()
+    const manager = new SpaceManager({
+      spaces: [],
+      createStore: () => stubStore(),
+      createSpace: async () => {},
+      metaDb,
+    })
+    await manager.init()
+    const rec = await manager.create({ slug: 'work', displayName: 'Work' })
+    await metaDb!.restoreOperations.accept({
+      id: 'restore-a',
+      space: rec.id,
+      noteId: 'note-a',
+      endpoint: 'history-restore',
+      actorDigest: 'actor-a',
+      idempotencyDigest: 'key-a',
+      requestFingerprint: 'request-a',
+      stageBinding: 'stage-a',
+      sourceRevisionId: 'revision-a',
+      targetPath: 'note.md',
+      preparedEvidence: '{"kind":"accepted"}',
+      createdAt: '2026-08-11T00:00:00.000Z',
+    })
+
+    await expect(manager.archive(rec.id)).rejects.toMatchObject({ reason: 'space_busy' })
+    await metaDb!.restoreOperations.transition({
+      id: 'restore-a',
+      expectedPhases: ['staged'],
+      phase: 'rejected',
+      updatedAt: '2026-08-11T00:01:00.000Z',
+      failureCode: 'archive-won',
+    })
+    await manager.resumeLifecycle(rec.id)
+
+    expect(manager.listArchived()).toEqual([expect.objectContaining({ id: rec.id })])
+    expect(await metaDb!.spaceLifecycle.get(rec.id)).toMatchObject({ phase: 'archived' })
+  })
+
   it('archive refuses a personal and a config-pinned space (#110)', async () => {
     const metaDb = fakeMetaDb()
     const manager: SpaceManager = new SpaceManager({
@@ -302,6 +444,57 @@ describe('SpaceManager', () => {
     expect(manager.listArchived()).toEqual([])
     expect(manager.resolveId('old')).toBeNull() // slug freed
     expect(await metaDb!.spaces.getById(rec.id)).toBeNull() // registry row gone
+  })
+
+  it('resumes physical purge from its manifest before disk discovery on restart', async () => {
+    const metaDb = fakeMetaDb()
+    let cleanupAttempts = 0
+    const first = new SpaceManager({
+      spaces: [],
+      createStore: () => stubStore(),
+      createSpace: async () => {},
+      metaDb,
+      onPurge: async () => {
+        cleanupAttempts++
+        throw new Error('filesystem unavailable')
+      },
+    })
+    await first.init()
+    const rec = await first.create({ slug: 'old', displayName: 'Old' })
+    await first.archive(rec.id, 'user:tester')
+
+    await expect(first.purge(rec.id)).rejects.toThrow('filesystem unavailable')
+    expect(await metaDb!.spaces.getById(rec.id)).toBeNull()
+    expect(await metaDb!.spaceLifecycle.get(rec.id)).toMatchObject({
+      phase: 'metadata-cleaned',
+      cleanupManifest: expect.stringContaining(rec.notesDir),
+    })
+
+    const discovered = vi.fn(async () => [
+      {
+        id: rec.id,
+        slug: rec.slug,
+        aliases: rec.aliases,
+        notesDir: rec.notesDir,
+        displayName: rec.displayName,
+      },
+    ])
+    const restarted = new SpaceManager({
+      spaces: [],
+      createStore: () => stubStore(),
+      metaDb,
+      discoverDiskSpaces: discovered,
+      onPurge: async (manifestRecord) => {
+        cleanupAttempts++
+        expect(manifestRecord).toMatchObject({ id: rec.id, notesDir: rec.notesDir })
+      },
+    })
+    await restarted.init()
+
+    expect(discovered).toHaveBeenCalledTimes(1)
+    expect(restarted.resolveId(rec.slug)).toBeNull()
+    expect(await metaDb!.spaceLifecycle.get(rec.id)).toMatchObject({ phase: 'purged' })
+    expect(cleanupAttempts).toBe(2)
   })
 
   it('onProvision fires once for a config space on its FIRST boot, never again (#97 auto-mark root)', async () => {
@@ -552,10 +745,14 @@ describe('SpaceManager', () => {
 
   it('adopts pre-#16 legacy rows only when a target is configured (#99)', async () => {
     const adopted: string[] = []
+    const spaceLifecycle = new InMemorySpaceLifecyclePersistence()
+    const restoreOperations = new InMemoryRestoreOperationPersistence(spaceLifecycle)
     const metaDb = {
       adoptLegacyRows: async (slug: string) => {
         adopted.push(slug)
       },
+      restoreOperations,
+      spaceLifecycle,
       spaces: {
         list: async () => [],
         getById: async () => null,

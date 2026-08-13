@@ -31,6 +31,7 @@ import { noteDetailView, type NoteDetailView } from '../../libs/wire'
 export class ApiError extends Error {
   status?: number
   reason?: string
+  operationId?: string
   current?: NoteDetailView
   /** The note holding the destination of a refused create (`note_already_exists`,
    *  the create-collision twin of `current`). Absent when the server caught the
@@ -119,6 +120,9 @@ export const req = async <T>(path: string, opts: RequestInit = {}): Promise<T> =
     err.status = res.status
     if (typeof data.reason === 'string') {
       err.reason = data.reason
+    }
+    if (typeof data.operationId === 'string') {
+      err.operationId = data.operationId
     }
     if (err.reason === 'version_conflict' && data.current) {
       err.current = noteDetailView(data.current as WireNoteDetail)

@@ -17,6 +17,7 @@ import {
   PreviewsResponseSchema,
   RemoveResponseSchema,
   RestoreRequestSchema,
+  RestoreResponseSchema,
   SaveResponseSchema,
   UpdateNoteRequestSchema,
 } from '@notarium/contract'
@@ -49,7 +50,16 @@ import {
 } from '../wire'
 
 export const noteRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
-  const { spaceStoreFor, noteStore, spaces, projects, folders, auth, principalId } = ctx
+  const {
+    spaceStoreFor,
+    noteStore,
+    spaces,
+    projects,
+    folders,
+    auth,
+    principalId,
+    restoreCoordinator,
+  } = ctx
 
   // Wiki-link resolver: `ref` (path/title/permalink) resolves WITHIN this space
   // only, never crossing the boundary. canon: docs/spaces.md#model
@@ -94,7 +104,12 @@ export const noteRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
         : await auth.describeAuthor(detail.deletedByPrincipal, req.principal.username)
       : undefined
     return NoteDetailResponseSchema.parse(
-      noteDetailToWire(detail, spaces.slugOf(hit.space) ?? undefined, deletedBy),
+      noteDetailToWire(
+        detail,
+        spaces.slugOf(hit.space) ?? undefined,
+        deletedBy,
+        restoreCoordinator != null,
+      ),
     )
   })
 
@@ -331,7 +346,11 @@ export const noteRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
       limit: q.data.limit,
     })
     const revisions = (
-      await withAuthors(items.map(revisionToWire), req.principal.username, auth.describeAuthor)
+      await withAuthors(
+        items.map((revision) => revisionToWire(revision, restoreCoordinator != null)),
+        req.principal.username,
+        auth.describeAuthor,
+      )
     ).map(unattributedIfGap)
     return NoteRevisionsResponseSchema.parse({ revisions, total })
   })
@@ -359,45 +378,74 @@ export const noteRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
     // Redact a foreign agent's key id (privacy), matching withAuthors.
     return NoteRevisionDetailResponseSchema.parse(
       unattributedIfGap({
-        ...revisionDetailToWire(detail),
+        ...revisionDetailToWire(detail, restoreCoordinator != null),
         principal: redactsKeyId(author) ? null : detail.principal,
         author,
       }),
     )
   })
 
-  // Restore = a save whose body is taken from the revision, not the client (no
-  // smuggling content under a `restore` record), pushed through the same CAS path.
-  // canon: docs/note-history.md#how-its-written
-  app.post('/api/note/restore', { config: authz('note:write', 'note') }, async (req, reply) => {
-    const body = RestoreRequestSchema.safeParse(req.body)
+  // Strict single-note restore: durable idempotency + physical staging + one
+  // terminal metadata commit. Retry is the same POST; there is no status endpoint.
+  app.post(
+    '/api/note/restore',
+    { config: authz('note:write', 'note-replay') },
+    async (req, reply) => {
+      const body = RestoreRequestSchema.safeParse(req.body)
 
-    if (!body.success) {
-      return reply
-        .code(HTTP_STATUS.BAD_REQUEST)
-        .send({ error: body.error.issues[0]?.message || 'bad request' })
-    }
-    const hit = await noteStore(req.principal, body.data.id, 'note:write')
+      if (!body.success) {
+        return reply
+          .code(HTTP_STATUS.BAD_REQUEST)
+          .send({ error: body.error.issues[0]?.message || 'bad request' })
+      }
+      if (!restoreCoordinator) {
+        return reply.code(HTTP_STATUS.SERVICE_UNAVAILABLE).send(
+          RestoreResponseSchema.parse({
+            status: 'busy',
+            error: 'restore unavailable',
+            reason: 'strict-restore-unavailable',
+          }),
+        )
+      }
+      const result = await restoreCoordinator.execute({
+        mode: 'history',
+        principal: req.principal,
+        noteId: body.data.id,
+        revisionId: body.data.revisionId,
+        versionToken: body.data.versionToken,
+        idempotencyKey: body.data.idempotencyKey,
+      })
 
-    if (!hit) {
-      return notFound(reply)
-    }
-    if (!hit.store.restore) {
-      throw revisionsUnavailable()
-    }
-    const r = await hit.store.restore({
-      id: body.data.id,
-      revisionId: body.data.revisionId,
-      versionToken: body.data.versionToken,
-      principal: principalId(req),
-    })
-    return SaveResponseSchema.parse({
-      ok: true,
-      id: r.id,
-      filePath: r.filePath,
-      versionToken: r.versionToken,
-    })
-  })
+      if (
+        result.status === 'not-found' ||
+        (result.status === 'busy' && result.reason === 'space-not-active')
+      ) {
+        return notFound(reply)
+      }
+      const wire =
+        result.status === 'succeeded'
+          ? { ...result, id: result.noteId, noteId: undefined }
+          : result.status === 'conflict'
+            ? { ...result, error: 'restore conflict' }
+            : result.status === 'not-restorable'
+              ? { ...result, error: 'revision is not restorable' }
+              : result.status === 'busy'
+                ? { ...result, error: 'restore unavailable' }
+                : result
+      const status =
+        result.status === 'succeeded'
+          ? HTTP_STATUS.OK
+          : result.status === 'pending'
+            ? HTTP_STATUS.ACCEPTED
+            : result.status === 'conflict'
+              ? HTTP_STATUS.CONFLICT
+              : result.status === 'not-restorable'
+                ? HTTP_STATUS.UNPROCESSABLE_ENTITY
+                : HTTP_STATUS.SERVICE_UNAVAILABLE
+
+      return reply.code(status).send(RestoreResponseSchema.parse(wire))
+    },
+  )
 
   app.delete('/api/note', { config: authz('note:delete', 'note') }, async (req, reply) => {
     const { id } = req.query as { id?: string }

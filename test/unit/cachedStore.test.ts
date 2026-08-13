@@ -521,19 +521,20 @@ describe('CachedStore — delta reconcile', () => {
   it('applies upserts with content and removals from the inventory diff', async () => {
     const { inner, script } = makeScripted()
     const { store } = await make(inner)
+    const live = await inner.read(TITANIUM)
 
-    const inventory = [
-      {
-        // The identity-capable engine reports the stable note-id with every
-        // meta — that id, not the path, is what the snapshot diff keys on.
-        id: TITANIUM,
-        title: 'Titanium Mk2', // externally renamed
-        filePath: 'demo/titanium.md',
-        modifiedAt: '2026-06-11T00:00:00.000Z',
-        createdAt: null,
-      },
-      // Carbon is gone from the inventory → external delete
-    ]
+    // Keep the scripted delta and exact engine read consistent: current-format
+    // provenance chases the changed note once for raw authored frontmatter.
+    await inner.write({
+      title: 'Titanium Mk2',
+      content: 'rewired to [[Brand New]]',
+      originalId: TITANIUM,
+      versionToken: live.versionToken,
+      preservePath: true,
+    })
+    await inner.remove(CARBON)
+    const inventory = await inner.list()
+
     script.nextDelta = {
       cursor: 'c2',
       inventory,

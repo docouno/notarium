@@ -52,7 +52,7 @@ export const spacesRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
     if (e.reason === 'unsupported') {
       return notFound(reply)
     }
-    if (e.reason === 'not_archived') {
+    if (e.reason === 'not_archived' || e.reason === 'space_busy') {
       return reply.code(HTTP_STATUS.CONFLICT).send({ error: (err as Error).message })
     }
     if (e.reason === 'personal_space' || e.reason === 'config_pinned') {

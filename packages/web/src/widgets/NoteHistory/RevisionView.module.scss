@@ -119,9 +119,33 @@
   padding: 20px 0 120px;
 }
 
+.source {
+  max-width: 860px;
+  margin: 0 auto;
+  width: 100%;
+  padding: 20px 0 120px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--font-mono);
+  font-size: var(--reading-diff-size);
+  line-height: 1.65;
+}
+
 .gap {
   padding: 18px 0;
   color: var(--text-dim);
+  font-size: 13px;
+}
+
+.partial {
+  max-width: 860px;
+  width: 100%;
+  margin: 16px auto 0;
+  padding: 10px 12px;
+  border: 1px solid var(--warning-border, var(--border));
+  border-radius: 6px;
+  color: var(--text-dim);
+  background: var(--warning-bg, var(--surface-raised));
   font-size: 13px;
 }
 

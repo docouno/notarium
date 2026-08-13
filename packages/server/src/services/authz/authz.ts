@@ -36,7 +36,9 @@ export type Principal = {
   label?: string | null
 }
 
-export type AuthzConfig = { public: true } | { action: Action; resource: 'space' | 'note' | 'host' }
+export type AuthzConfig =
+  | { public: true }
+  | { action: Action; resource: 'space' | 'space-replay' | 'note' | 'note-replay' | 'host' }
 
 /** The single all-access principal of AUTH_MODE=none (also the e2e fake's default).
  *  id stays 'ui' for backward-compatible journal attribution. canon: docs/auth.md#modes */

@@ -3,6 +3,7 @@ import { IconClock, IconTrash } from '../../core/Icons'
 import { StickyBar } from '../../core/StickyBar'
 import { authorLabel } from '../../libs/author'
 import { absoluteDate } from '../../libs/datetime'
+import { recoveryPresentation } from '../../libs/revisions/revisions'
 import type { NoteDetailView, NoteView } from '../../libs/wire'
 import { NoteReader } from '../NoteReader'
 import styles from './DeletedNoteView.module.scss'
@@ -42,6 +43,12 @@ export const DeletedNoteView = ({
   canManage = true,
 }: DeletedNoteViewProps) => {
   const who = authorLabel(note.deletedBy) // null deletedBy → "outside Notarium"
+  // Old servers exposed only the content-presence boolean. Fail closed when the
+  // authoritative predicate is absent: readable historical bytes are not proof
+  // that publishing them is safe.
+  const restoreAvailability = note.restoreAvailability ?? (note.restorable ? 'unknown' : 'gap')
+  const canRestore = restoreAvailability === 'full' || restoreAvailability === 'partial'
+  const recovery = recoveryPresentation(restoreAvailability)
   return (
     <div className={styles.view} data-testid="deleted-note-view">
       <StickyBar className={styles.banner} data-testid="deleted-banner">
@@ -59,11 +66,10 @@ export const DeletedNoteView = ({
             <Button
               variant="warning"
               onClick={onRestore}
-              disabled={busy || !note.restorable}
+              disabled={busy || !canRestore}
               title={
-                note.restorable
-                  ? undefined
-                  : 'Deleted outside Notarium before its content was captured — nothing to restore'
+                (!canRestore ? recovery.reason : undefined) ??
+                (restoreAvailability === 'partial' ? recovery.reason : undefined)
               }
               data-testid="deleted-restore"
             >
@@ -76,7 +82,22 @@ export const DeletedNoteView = ({
         )}
       </StickyBar>
 
-      {note.restorable ? (
+      {!canRestore && note.restorable ? (
+        <div className={styles.unavailable} data-testid="deleted-restore-unavailable">
+          <strong>{recovery.label}.</strong> {recovery.reason}
+        </div>
+      ) : null}
+
+      {note.source ? (
+        <pre
+          className={styles.source}
+          tabIndex={0}
+          aria-label="Deleted note source"
+          data-testid="deleted-source"
+        >
+          {note.source.encoding === 'base64' ? `base64\n${note.source.data}` : note.source.data}
+        </pre>
+      ) : note.restorable ? (
         <NoteReader
           note={note}
           notes={notes}
@@ -85,8 +106,7 @@ export const DeletedNoteView = ({
         />
       ) : (
         <div className={styles.gap} data-testid="deleted-gap">
-          This note was deleted outside Notarium before its content could be captured — there’s
-          nothing left to show or restore.
+          <strong>{recovery.label}.</strong> {recovery.reason}
         </div>
       )}
     </div>

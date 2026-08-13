@@ -1,15 +1,17 @@
 import { Link } from 'react-router'
 import { Button } from '../../core/Button'
 import { Checkbox } from '../../core/Checkbox'
-import { Chip } from '../../core/Chips'
 import {
+  IconAlertTriangle,
   IconBotMessage,
   IconClock,
   IconDoc,
   IconExternal,
+  IconEye,
   IconRefresh,
   IconUser,
   IconWorkspace,
+  IconX,
 } from '../../core/Icons'
 import { authorLabel } from '../../libs/author'
 import { cx } from '../../libs/cx/cx'
@@ -28,6 +30,7 @@ export const TrashRow = ({
   isLast,
   onToggle,
   onRestore,
+  onExplain,
 }: {
   entry: TrashEntry
   selectable: boolean
@@ -37,40 +40,32 @@ export const TrashRow = ({
   isLast: boolean
   onToggle: (on: boolean) => void
   onRestore: () => void
+  onExplain: () => void
 }) => {
   const who = authorLabel(entry.who) // null → "outside Notarium"
   const checkId = entry.kind === 'space' ? 'trash-space-check' : 'trash-row-check'
   const restoreId = entry.kind === 'space' ? 'trash-space-restore' : 'trash-restore'
+  const kindTitle =
+    entry.kind === 'space'
+      ? 'A deleted space'
+      : entry.memory
+        ? "An agent-memory note — the agent's private memory"
+        : 'A deleted note'
   const body = (
     <>
       <div className={styles.titleRow}>
-        <span
-          className={styles.kind}
-          title={entry.kind === 'space' ? 'A deleted space' : 'A deleted note'}
-        >
-          {entry.kind === 'space' ? <IconWorkspace size={14} /> : <IconDoc size={14} />}
+        <span className={styles.kind} title={kindTitle}>
+          {entry.kind === 'space' ? (
+            <IconWorkspace size={14} />
+          ) : entry.memory ? (
+            <IconBotMessage size={14} />
+          ) : (
+            <IconDoc size={14} />
+          )}
         </span>
         <span className={styles.title} title={entry.title}>
           {entry.title}
         </span>
-        {entry.memory && (
-          <Chip
-            icon={<IconBotMessage size={11} />}
-            className={styles.tagMemory}
-            title="An agent-memory note — the agent's private memory, deleted here"
-          >
-            memory
-          </Chip>
-        )}
-        {entry.external && (
-          <Chip
-            icon={<IconExternal size={11} />}
-            className={styles.tagExternal}
-            title="Removed outside Notarium — the journal caught it"
-          >
-            outside Notarium
-          </Chip>
-        )}
       </div>
       <span className={styles.meta}>
         {entry.pathText && (
@@ -81,8 +76,17 @@ export const TrashRow = ({
             <span className={styles.dot}>·</span>
           </>
         )}
-        {who.agent ? <IconBotMessage size={12} /> : <IconUser size={12} />}
-        <span>{who.text}</span>
+        {entry.external ? (
+          <>
+            <IconExternal size={12} />
+            <span>removed outside Notarium</span>
+          </>
+        ) : (
+          <>
+            {who.agent ? <IconBotMessage size={12} /> : <IconUser size={12} />}
+            <span>{who.text}</span>
+          </>
+        )}
         {entry.date && (
           <>
             <span className={styles.dot}>·</span>
@@ -117,13 +121,35 @@ export const TrashRow = ({
       ) : (
         <div className={styles.body}>{body}</div>
       )}
-      {selectable && (
+      {entry.recovery.kind !== 'complete' && entry.recovery.kind !== 'host-unavailable' && (
+        <button
+          type="button"
+          className={cx(
+            styles.recoveryStatus,
+            entry.recovery.kind === 'partial' ? styles.recoveryPartial : styles.recoveryUnavailable,
+          )}
+          title={entry.recovery.reason}
+          aria-label={`${entry.recovery.label}. ${entry.recovery.reason}`}
+          onClick={onExplain}
+          data-testid="trash-recovery-status"
+        >
+          {entry.recovery.kind === 'partial' ? (
+            <IconAlertTriangle size={13} />
+          ) : entry.recovery.kind === 'record-only' ? (
+            <IconX size={13} />
+          ) : (
+            <IconEye size={13} />
+          )}
+          <span>{entry.recovery.label}</span>
+        </button>
+      )}
+      {selectable && entry.restorable && (
         <Button
           variant="ghost"
           icon
           onClick={onRestore}
-          disabled={disabled || busy || !entry.restorable}
-          title={entry.restoreTitle}
+          disabled={disabled || busy}
+          title={entry.recovery.reason}
           data-testid={restoreId}
         >
           <IconRefresh size={15} />

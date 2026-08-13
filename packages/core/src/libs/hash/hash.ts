@@ -4,8 +4,9 @@
 // collision there would serve the wrong history. WebCrypto so the same code
 // runs in node hosts and the browser (P9).
 
-export const sha256Hex = async (text: string): Promise<string> => {
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+export const sha256Hex = async (content: string | Uint8Array): Promise<string> => {
+  const bytes = typeof content === 'string' ? new TextEncoder().encode(content) : content
+  const digest = await crypto.subtle.digest('SHA-256', Uint8Array.from(bytes).buffer)
   let hex = ''
 
   for (const byte of new Uint8Array(digest)) {

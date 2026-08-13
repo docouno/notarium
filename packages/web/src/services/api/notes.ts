@@ -29,6 +29,7 @@ import {
 } from '../../libs/wire'
 import { req, sp } from './client'
 import { notesQs } from './query'
+import { strictRestore } from './restore'
 import type { BucketsQueryParams, NotesQueryParams } from './types'
 
 export const notesApi = {
@@ -176,9 +177,10 @@ export const notesApi = {
   // from the revision; the versionToken is the same CAS proof a save carries,
   // so a stale one 409s with `current` exactly like noteSave.
   noteRestore: (id: string, revisionId: string, versionToken: string) =>
-    req<SaveResponse>('/api/note/restore', {
-      method: 'POST',
-      body: JSON.stringify({ id, revisionId, versionToken }),
+    strictRestore('/api/note/restore', `history:${id}:${revisionId}`, {
+      id,
+      revisionId,
+      versionToken,
     }).then(saveResultView),
   noteRemove: (id: string) =>
     req<RemoveResponse>(`/api/note?id=${encodeURIComponent(id)}`, { method: 'DELETE' }),

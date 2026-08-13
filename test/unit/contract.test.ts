@@ -37,6 +37,7 @@ import {
   ProjectAgentContextResponseSchema,
   ProjectRowSchema,
   ProjectsResponseSchema,
+  RestoreResponseSchema,
   RestoreSpacesRequestSchema,
   RestoreSpacesResponseSchema,
   RoleContextTargetQuerySchema,
@@ -497,25 +498,95 @@ describe('POST /api/note — 409 conflict envelope (#50)', () => {
   })
 })
 
+describe('POST /api/note/restore — typed conflict reasons', () => {
+  const conflict = {
+    status: 'conflict',
+    error: 'restore conflict',
+    operationId: 'restore-op',
+  }
+
+  it('accepts the coordinator canonical stale-CAS reason and rejects spelling drift', () => {
+    expect(
+      RestoreResponseSchema.safeParse({ ...conflict, reason: 'version-conflict' }).success,
+    ).toBe(true)
+    expect(
+      RestoreResponseSchema.safeParse({ ...conflict, reason: 'version_conflict' }).success,
+    ).toBe(false)
+  })
+})
+
 describe('trash bulk restore (#184)', () => {
   it('note batch request accepts explicit ids OR all+q (the existing select-all-N path)', () => {
-    expect(TrashRestoreManyRequestSchema.safeParse({ ids: ['fake-a'] }).success).toBe(true)
     expect(
-      TrashRestoreManyRequestSchema.safeParse({ all: true, q: 'carbon', onlyRestorable: true })
+      TrashRestoreManyRequestSchema.safeParse({ ids: ['fake-a'], idempotencyKey: 'bulk-1' })
         .success,
+    ).toBe(true)
+    expect(
+      TrashRestoreManyRequestSchema.safeParse({
+        all: true,
+        q: 'carbon',
+        onlyRestorable: true,
+        idempotencyKey: 'bulk-2',
+      }).success,
     ).toBe(true)
     expect(TrashRestoreManyRequestSchema.safeParse({}).success).toBe(false)
     expect(TrashRestoreManyRequestSchema.safeParse({ ids: [] }).success).toBe(false)
   })
 
-  it('note batch response carries restored rows plus per-id failures', () => {
+  it('note batch response carries one stable terminal outcome per frozen item', () => {
     expect(
       TrashRestoreManyResponseSchema.safeParse({
-        ok: true,
-        restored: [{ id: 'fake-a', filePath: 'demo/a.md', versionToken: 'v1:x' }],
-        failed: [{ id: 'fake-b', error: 'gone', reason: 'note_not_in_trash' }],
+        status: 'completed',
+        operationId: 'bulk-op',
+        items: [
+          {
+            id: 'fake-a',
+            revisionId: 'tomb-a',
+            status: 'succeeded',
+            operationId: 'child-a',
+            restoredRevisionId: 'restored-a',
+            filePath: 'demo/a.md',
+            versionToken: 'v3:x',
+          },
+          {
+            id: 'fake-b',
+            revisionId: null,
+            status: 'conflict',
+            reason: 'note_not_in_trash',
+          },
+        ],
+        counts: {
+          total: 2,
+          queued: 0,
+          pending: 0,
+          succeeded: 1,
+          conflict: 1,
+          notRestorable: 0,
+        },
       }).success,
     ).toBe(true)
+    expect(
+      TrashRestoreManyResponseSchema.safeParse({
+        status: 'completed',
+        operationId: 'bulk-op',
+        items: [
+          {
+            id: 'fake-b',
+            revisionId: null,
+            status: 'conflict',
+            reason: 'note-not-in-trash',
+          },
+        ],
+        counts: {
+          total: 1,
+          queued: 0,
+          pending: 0,
+          succeeded: 0,
+          conflict: 1,
+          notRestorable: 0,
+        },
+      }).success,
+    ).toBe(false)
   })
 
   it('space batch restore addresses archived spaces by id and reports best-effort outcomes', () => {

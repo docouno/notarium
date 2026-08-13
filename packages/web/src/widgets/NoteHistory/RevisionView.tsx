@@ -38,6 +38,13 @@ type RevisionViewProps = {
   onRestored: () => void
 }
 
+const isPartialState = (
+  revision: Pick<Revision, 'contentHash' | 'stateFormat'> | undefined,
+): boolean =>
+  revision != null &&
+  revision.contentHash != null &&
+  (revision.stateFormat == null || revision.stateFormat === 'markdown-v1')
+
 // While a revision body (or its diff base) is being fetched: paragraph-shaped
 // shimmer in the body column, instead of a "Loading…" line (#68 item 5).
 const RevisionSkeleton = () => (
@@ -97,16 +104,30 @@ export const RevisionView = ({
 
   const detail = detailsRef.current.get(revision.revisionId)
   const baseDetail = baseId ? detailsRef.current.get(baseId) : undefined
+  const baseLoaded = !baseId || detailsRef.current.has(baseId)
+  const activeView = detail?.contentMode === 'source' ? 'content' : view
+  const comparisonIsGap = Boolean(baseId && baseLoaded && baseDetail?.contentMode === 'gap')
+  const comparisonIsSource = Boolean(baseId && baseLoaded && baseDetail?.contentMode === 'source')
 
   const diffRows = useMemo(() => {
-    if (!detail || detail.content == null) {
+    if (!detail || detail.contentMode !== 'markdown') {
       return null
     }
-    if (baseId && baseDetail?.content == null) {
+    if (baseId && baseDetail?.contentMode !== 'markdown') {
       return null
-    } // base is a gap/loading
+    }
 
-    return buildDiffRows(baseId ? (baseDetail?.content ?? '') : '', detail.content)
+    const completeComparison = detail.snapshot != null && (!baseId || baseDetail?.snapshot != null)
+    const before = completeComparison
+      ? baseId
+        ? (baseDetail?.snapshot ?? '')
+        : ''
+      : baseId
+        ? (baseDetail?.content ?? '')
+        : ''
+    const after = completeComparison ? (detail.snapshot ?? '') : detail.content
+
+    return buildDiffRows(before, after)
   }, [detail, baseDetail, baseId])
 
   // Rendered content of the revision + post-render enhancements (#235: copy buttons
@@ -114,15 +135,35 @@ export const RevisionView = ({
   // tab is showing (the ref exists), so we gate its dep on `view` — switching tabs
   // doesn't change the html itself.
   const contentRef = useRef<HTMLDivElement>(null)
-  const contentHtml = useMemo(() => (detail ? renderMarkdown(detail.content ?? '') : ''), [detail])
-  useMarkdownEnhance(contentRef, view === 'content' ? contentHtml : '')
+  const contentHtml = useMemo(
+    () => (detail?.contentMode === 'markdown' ? renderMarkdown(detail.content) : ''),
+    [detail],
+  )
+  useMarkdownEnhance(contentRef, activeView === 'content' ? contentHtml : '')
 
-  const canRestore = restorable && revision.contentHash != null && !isLatest && !restoring
+  const canRestore =
+    restorable &&
+    (revision.restoreAvailability === 'full' || revision.restoreAvailability === 'partial') &&
+    !isLatest &&
+    !restoring
+  // Intrinsic state completeness and host restore capability are independent.
+  // A none/fake host maps an otherwise restorable legacy row to
+  // capability-unavailable, but it must remain visibly partial.
+  const selectedIsPartial = isPartialState(revision)
+  const comparisonIsPartial =
+    !selectedIsPartial &&
+    revision.contentHash != null &&
+    baseId != null &&
+    isPartialState(baseDetail)
+  const selectedUnavailable =
+    revision.restoreAvailability !== 'full' && revision.restoreAvailability !== 'partial'
 
   const restore = async () => {
     const ok = await confirm({
       title: 'Restore this version?',
-      message: `The note will be set back to its state from ${exactDateTime(revision.createdAt)}. The current state stays in the history.`,
+      message: selectedIsPartial
+        ? `This is a legacy partial snapshot from ${exactDateTime(revision.createdAt)}. Its body and captured fixed fields will be restored; other current frontmatter will stay unchanged. The current state stays in the history.`
+        : `The note will be set back to its complete state from ${exactDateTime(revision.createdAt)}. The current state stays in the history.`,
       confirmLabel: 'Restore',
     })
 
@@ -138,7 +179,7 @@ export const RevisionView = ({
       await alert({
         title: 'Restore failed',
         message:
-          err.reason === 'version_conflict'
+          err.reason === 'version-conflict'
             ? 'The note changed while you were looking at its history. Review the latest state and try again.'
             : err.message,
         danger: true,
@@ -157,13 +198,17 @@ export const RevisionView = ({
         <div className={styles.bannerControls}>
           <Segmented
             className={styles.bannerSeg}
-            value={view}
+            value={activeView}
             onChange={setView}
             ariaLabel="Revision view"
-            options={[
-              { value: 'diff', label: 'Changes' },
-              { value: 'content', label: 'Content' },
-            ]}
+            options={
+              detail?.contentMode === 'source'
+                ? [{ value: 'content', label: 'Content' }]
+                : [
+                    { value: 'diff', label: 'Changes' },
+                    { value: 'content', label: 'Content' },
+                  ]
+            }
           />
           <div className={styles.bannerActions}>
             {/* The latest revision is already the live note — nothing to restore,
@@ -181,7 +226,11 @@ export const RevisionView = ({
                 title={
                   revision.contentHash == null
                     ? 'The journal has no body for this state'
-                    : undefined
+                    : selectedUnavailable
+                      ? `This state is ${revision.restoreAvailability} and cannot be restored safely`
+                      : selectedIsPartial
+                        ? 'Legacy partial snapshot: unknown frontmatter stays current'
+                        : undefined
                 }
                 data-testid="history-restore"
               >
@@ -195,6 +244,38 @@ export const RevisionView = ({
         </div>
       </StickyBar>
 
+      {selectedIsPartial || comparisonIsPartial ? (
+        <div className={styles.partial} data-testid="history-partial">
+          {selectedIsPartial
+            ? 'Legacy partial snapshot: this version contains the body and fixed fields only. Restoring it keeps other current frontmatter unchanged.'
+            : 'This change is compared with a legacy partial snapshot, so Changes can compare note bodies only.'}
+        </div>
+      ) : null}
+
+      {comparisonIsGap ? (
+        <div className={styles.gap} data-testid="history-comparison-gap">
+          Changes cannot be compared because the parent revision content was not captured.
+        </div>
+      ) : null}
+
+      {comparisonIsSource ? (
+        <div className={styles.gap} data-testid="history-comparison-source">
+          Changes cannot be compared because the parent revision is opaque source data.
+        </div>
+      ) : null}
+
+      {selectedUnavailable && revision.contentHash != null ? (
+        <div className={styles.partial} data-testid="history-unavailable">
+          {revision.restoreAvailability === 'opaque'
+            ? 'This revision is opaque source data. It can be inspected as plain source but not rendered or restored.'
+            : revision.restoreAvailability === 'blocked'
+              ? 'Restore is blocked because authored YAML depends on a runtime-owned field.'
+              : revision.restoreAvailability === 'capability-unavailable'
+                ? 'This server cannot provide crash-safe single-note restore.'
+                : 'Restore safety could not be proven for this revision.'}
+        </div>
+      ) : null}
+
       {revision.contentHash == null ? (
         <div className={styles.gap} data-testid="history-gap">
           {revision.unavailableReason != null
@@ -206,7 +287,13 @@ export const RevisionView = ({
               ? 'The note was deleted at this point.'
               : 'An external change was detected here, but its content could not be captured.'}
         </div>
-      ) : view === 'diff' ? (
+      ) : detail?.contentMode === 'source' && activeView === 'content' ? (
+        <pre className={styles.source} data-testid="history-source">
+          {detail.source?.encoding === 'base64'
+            ? `base64\n${detail.source.data}`
+            : detail.source?.data}
+        </pre>
+      ) : activeView === 'diff' ? (
         <div
           className={styles.diff}
           data-testid="history-diff"
@@ -241,11 +328,11 @@ export const RevisionView = ({
                 </span>
               </div>
             ))
-          ) : (
+          ) : comparisonIsGap || comparisonIsSource || detail?.contentMode === 'source' ? null : (
             <RevisionSkeleton />
           )}
         </div>
-      ) : detail ? (
+      ) : detail?.contentMode === 'markdown' ? (
         <div
           ref={contentRef}
           className={cx('markdown', styles.rendered)}

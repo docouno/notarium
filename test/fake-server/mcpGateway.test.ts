@@ -2299,7 +2299,13 @@ describe('delete (#102 phase 3)', () => {
       .noteId as string
 
   type TrashBody = {
-    items: Array<{ noteId: string; class?: string; restorable: boolean }>
+    items: Array<{
+      noteId: string
+      revisionId: string
+      class?: string
+      restorable: boolean
+      restoreAvailability: string
+    }>
     total: number
   }
   const trashOf = async (bearer: string, space = 'team'): Promise<TrashBody> =>
@@ -2325,26 +2331,38 @@ describe('delete (#102 phase 3)', () => {
     expect(isError(await callTool(port, 'get_note', { ref: id }, bearer))).toBe(true)
   })
 
-  it('the delete is REVERSIBLE — it shows in the trash and the HUMAN restores it', async () => {
+  it('the delete remains visible while the fake reports strict restore unavailable', async () => {
     const bearer = await patFor('alice', 'alice-password-1', 'write')
     const id = await seed(bearer, 'Bring Back', 'precious')
     await callTool(port, 'delete_note', { ref: id }, bearer)
     const row = (await trashOf(bearer)).items.find((i) => i.noteId === id)
     expect(row).toBeTruthy()
     expect(row?.restorable).toBe(true)
+    expect(row?.restoreAvailability).toBe('capability-unavailable')
     // Restore is the human's: the agent's TOOLSET has no restore tool (it only
-    // deletes), so reversibility is exercised through the UI. Drive it the human
-    // way — a session cookie, not the agent's PAT.
+    // deletes), so reversibility is exercised through the UI. The in-memory fake
+    // deliberately cannot promise crash-safe single restore; it rejects that
+    // command honestly; the production-server suite owns the durable round-trip.
     const cookie = await loginCookie('alice', 'alice-password-1')
-    const restore = await app.inject({
+    const strictRestore = await app.inject({
       method: 'POST',
       url: '/api/s/team/trash/restore',
       headers: { cookie },
-      payload: { id },
+      payload: { id, revisionId: row?.revisionId, idempotencyKey: 'fake-team-restore' },
     })
-    expect(restore.statusCode).toBe(200)
-    expect(restore.json().id).toBe(id) // SAME note-id (#51)
-    expect(isError(await callTool(port, 'get_note', { ref: id }, bearer))).toBe(false) // live again
+    expect(strictRestore.statusCode).toBe(503)
+    const restore = await app.inject({
+      method: 'POST',
+      url: '/api/s/team/trash/restore-many',
+      headers: { cookie },
+      payload: { ids: [id], idempotencyKey: 'fake-team-bulk-restore' },
+    })
+    expect(restore.statusCode, restore.body).toBe(503)
+    expect(restore.json()).toMatchObject({
+      status: 'busy',
+      reason: 'strict-restore-unavailable',
+    })
+    expect(isError(await callTool(port, 'get_note', { ref: id }, bearer))).toBe(true)
   })
 
   it('deleting twice is a 404-semantic tool error (already in the trash)', async () => {
@@ -2356,7 +2374,7 @@ describe('delete (#102 phase 3)', () => {
     expect(text(second)).toMatch(/no such note/i)
   })
 
-  it('a deleted MEMORY note surfaces in the unified trash flagged as memory, and is restorable', async () => {
+  it('a deleted MEMORY note surfaces in the unified trash with honest restore capability', async () => {
     const bearer = await patFor('alice', 'alice-password-1', 'write')
     // Memory lands in alice's personal domain, which she owns (write).
     const memId = structured(
@@ -2377,23 +2395,19 @@ describe('delete (#102 phase 3)', () => {
     expect(row).toBeTruthy()
     expect(row?.class).toBe('agent-memory')
     expect(row?.restorable).toBe(true)
+    expect(row?.restoreAvailability).toBe('capability-unavailable')
 
-    // ROUND-TRIP (engine-divergent zone — #79 identity asymmetry): the human
-    // restores the memory note and it comes back LIVE with its SAME id and its
-    // class still agent-memory (a regression would resurrect it under a new id or
-    // relabel it). Restore is the human path (session cookie).
+    // The fake cannot make the crash-safety promise and therefore must not expose
+    // the old non-durable batch as a back door around strict restore.
     const cookie = await loginCookie('alice', 'alice-password-1')
     const restore = await app.inject({
       method: 'POST',
-      url: '/api/s/alice-personal/trash/restore',
+      url: '/api/s/alice-personal/trash/restore-many',
       headers: { cookie },
-      payload: { id: memId },
+      payload: { ids: [memId], idempotencyKey: 'fake-memory-bulk-restore' },
     })
-    expect(restore.statusCode).toBe(200)
-    expect(restore.json().id).toBe(memId)
-    const back = await callTool(port, 'get_note', { ref: memId }, bearer)
-    expect(isError(back)).toBe(false)
-    expect(structured(back).class).toBe('agent-memory')
+    expect(restore.statusCode, restore.body).toBe(503)
+    expect(isError(await callTool(port, 'get_note', { ref: memId }, bearer))).toBe(true)
   })
 
   it('"empty trash" purges what the unified trash SHOWS — including deleted memory (#102 phase 3 scope parity)', async () => {

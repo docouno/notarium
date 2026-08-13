@@ -16,6 +16,7 @@ import type {
   ScopePinsPersistence,
   SpacesPersistence,
 } from '../../../services/metaDb'
+import type { BulkRestoreCoordinator, RestoreCoordinator } from '../../../services/noteRestore'
 import type { MarkerStore } from '../../../services/projects'
 import type { RolesService } from '../../../services/roles'
 import type { SpaceManager } from '../../../services/spaces'
@@ -51,4 +52,8 @@ export type ApiRoutesOptions = {
   staging?: ImportStagingStore
   /** Nudge the runner to claim immediately after enqueue; absent ⇒ next poll tick. */
   wakeJobs?: () => void
+  /** Strict single-note restore; absent is honest 503 capability degradation. */
+  restoreCoordinator?: RestoreCoordinator
+  /** Resumable strict trash bulk; absent is honest 503 degradation. */
+  bulkRestoreCoordinator?: BulkRestoreCoordinator
 }

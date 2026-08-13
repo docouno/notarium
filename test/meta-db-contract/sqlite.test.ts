@@ -6,11 +6,13 @@ import { DatabaseSync } from 'node:sqlite'
 import { SqliteMetaDb } from '../../packages/server/src/services/metaDb/sqliteMetaDb'
 import { describeAgentDeltaCursorsContract } from './agentDeltaCursorsContract'
 import { describeAgentSessionsContract } from './agentSessionsContract'
+import { describeCausalMetadataContract } from './causalMetadataContract'
 import { describeFavoritesContract } from './favoritesContract'
 import { describeGatewayStateContract } from './gatewayStateContract'
 import { describeIdentityPersistenceContract } from './identityPersistenceContract'
 import { describeRevisionPersistenceContract } from './revisionPersistenceContract'
 import { describeSessionAuditContract } from './sessionAuditContract'
+import { describeSpaceLifecycleWriterContract } from './spaceLifecycleWriterContract'
 
 describeGatewayStateContract('SQLite', async () => {
   const db = new SqliteMetaDb(':memory:')
@@ -66,6 +68,37 @@ describeRevisionPersistenceContract('SQLite', async () => {
       rmSync(dir, { recursive: true, force: true })
     },
   }
+})
+
+describeCausalMetadataContract('SQLite', async () => {
+  const db = new SqliteMetaDb(':memory:')
+  return {
+    operations: db.restoreOperations,
+    lifecycle: db.spaceLifecycle,
+    outbox: db.causalOutbox,
+    installation: db.installationGeneration,
+    ownerProofs: db.ownerProofs,
+    revisions: db.revisions,
+    terminal: db.restoreTerminal,
+    setAddress: async (noteId, space, revision) => {
+      await db.identity.claimMany([
+        {
+          id: noteId,
+          filePath: `address-${revision}.md`,
+          space,
+          createdAt: null,
+          materialized: true,
+          deletedAt: null,
+        },
+      ])
+    },
+    teardown: () => db.close(),
+  }
+})
+
+describeSpaceLifecycleWriterContract('SQLite', async () => {
+  const db = new SqliteMetaDb(':memory:')
+  return { db, teardown: () => db.close() }
 })
 
 describeSessionAuditContract('SQLite', async () => {

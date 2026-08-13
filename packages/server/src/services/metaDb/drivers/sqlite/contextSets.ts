@@ -134,13 +134,15 @@ export const createContextSetsFacet = (ctx: SqliteDriverCtx): ContextSetsPersist
     await ctx.ensureInit()
     ctx.required
       .prepare(
-        `INSERT INTO context_set_attachments (set_id, target_kind, target_id, target_space, created_at)
-           VALUES (?, ?, ?, ?, ?)
+        `INSERT INTO context_set_attachments
+          (set_id, target_kind, target_id, target_space, created_at, home_space)
+         SELECT ?, ?, ?, ?, ?, home_space FROM context_sets WHERE id = ?
            ON CONFLICT(set_id, target_kind, target_id) DO UPDATE SET
              target_space = excluded.target_space,
-             created_at = excluded.created_at`,
+             created_at = excluded.created_at,
+             home_space = excluded.home_space`,
       )
-      .run(r.setId, r.targetKind, r.targetId, r.targetSpace, r.createdAt)
+      .run(r.setId, r.targetKind, r.targetId, r.targetSpace, r.createdAt, r.setId)
   },
   detach: async (setId: string, targetKind: ContextSetTargetKind, targetId: string) => {
     await ctx.ensureInit()

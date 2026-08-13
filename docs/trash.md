@@ -1,46 +1,151 @@
 # Trash for deleted notes (#79) <a id="model"></a>
 
-Trash is a safety net for data: a deleted note does not disappear forever, but lands in a list from which it can be restored or permanently deleted. This is not a separate storage, but a **view over the revision journal** (#12): a note is "in trash" when its most recent journal revision is a delete-tombstone. Any restore/save on top makes the newest revision a non-delete, and the note automatically leaves the trash. This approach gives us, for free, recovery even of external deletions — the journal catches an `rm` done outside of us as well.
+Trash is a view over the revision journal: a note is in trash when its newest
+revision is a delete tombstone. Restore appends a newer live state and the row leaves
+the view; permanent purge conditionally erases its history. Whole spaces share the
+same user-facing Trash but retain their separate registry-level archive mechanism;
+see [spaces.md](spaces.md#deleting-a-space--soft-archive-110).
 
-> **Trash is a single place for everything deleted (#110).** Trash = ONE point where everything deleted piles up: notes AND whole spaces (a foundation for future entities). The UI is tabs **`All | Notes | Spaces` with a SHARED search** (search is always visible; notes — server-side by title, spaces — client-side by name/slug); `All` is a single virtualized list (spaces on top, notes below). Tabs appear when `capabilities.spaceCreate`, the space list is host-level (visible from any space). Under the hood these are TWO mechanics, but for the user it is a single "Trash": we do NOT show the word "archive"; both show "deleted by <who>" (#13). Notes — per-note, view-over-journal (restore into their space). A space — space-level, a marker in the space registry: restore returns the space **as a whole** (with all of its trash and history inside), permanent purge uses the same `purgeNotes` GC logic for journal+blobs, but across the entire space. The space-level canon is [docs/spaces.md](spaces.md) §"Deleting a space".
+## Delete state
 
-## Model
+`remove()` exact-reads before deletion and stores a byte-safe `DocumentState` in the
+tombstone even when the note was never saved through Notarium. If that read fails, it
+may reuse an already-known exact state; otherwise `contentHash: null` is an honest gap.
+The tombstone append is awaited before `changed` because it is the durable trash row.
+External remove/add observations share the same per-note fence, so a move cannot leave
+a stale delete on top.
 
-A deletion is journaled as a `kind: 'delete'` revision. To make the trash a working net rather than a showcase, `remove()` performs a **read-before-delete**: it reads the note body BEFORE deletion and places it into the tombstone (a blob in the CAS keyed by sha-256), even if the note never passed through us via a save. A read failure degrades honestly — the tombstone stores the last known hash from the journal, and in its absence `contentHash: null` (honest gap: shown in the trash, but not restorable). The delete append is **awaited**, not fire-and-forget: the tombstone IS the trash record, it must land before the `'changed'` emit, otherwise the trash opened right after a deletion races with the write. External live/delete observations wait until frontmatter identity reconciliation, then use the same durable-id per-note trash fence as local delete/restore/purge and revalidate a monotonic transition token after waiting; a delayed content chase cannot hide a newer tombstone, a quiet inventory refresh cannot erase a real observation, and an external re-add cancels its queued stale delete.
-
-The note's last path (where to restore it) lives in the identity registry (#51): `markDeleted` keeps a record in `byId` with `filePath` and sets `deletedAt`. For an engine that maintains identity on its own (the in-memory fake), `remove()` back-fills this binding from the snapshot so the restore path exists there too.
+The last path lives in the identity registry. `markDeleted` retains the id→path/class
+binding with `deletedAt`, allowing undelete and deleted-note routing without treating
+the removed file as live.
 
 ## Querying the trash
 
-A new persistence method `listTrashed(space, {offset, limit, q?}, excludeClasses)` (sqlite + pg + in-memory twin): for each note of the space the most recent revision is taken (window function `ROW_NUMBER() OVER (PARTITION BY note_id ORDER BY id DESC)`), those whose revision is `kind = 'delete'` are kept, newest-deleted first, a window + an honest `total`. The class scope is the same read-model visibility checkpoint (#78) as `list`/`listBySpaceSince`: the `user` default excludes agent-memory and other hidden classes BEFORE the collapse, so a hidden note never shows up in the trash and does not skew the total. `all` shows everything (agent/diagnostics). `q` is a search over **title** (case-insensitive substring, LIKE wildcards escaped), applied AFTER the collapse (title on the surviving tombstone) and scoping both the window and the `total` — so search scales beyond a single page. Title-only: the journal is path-free (P7), the last path is a join with the identity registry that search does not reach; title is what one searches a note by.
+`listTrashed(space, {offset, limit, q?, availability?}, excludeClasses)` collapses the journal to the
+newest revision per note, keeps deletes, applies the same class-visibility checkpoint
+as ordinary listing, filters title by escaped case-insensitive substring and returns
+newest-deleted first. `availability=restorable|unavailable` is evaluated before the
+window, so search, pagination, Select-all-N, Restore and permanent deletion address the
+same population. `total`, `restorableTotal` and `partialTotal` describe the complete
+filtered population, not the page. `restoreAvailable` reports the host capability
+separately from intrinsic item state.
+
+Every row exposes both compatibility `restorable` (a blob exists) and the authoritative
+`restoreAvailability`:
+
+- `full` — exact Markdown/skill source proved safe;
+- `partial` — former `markdown-v1` or legacy body-only compatibility state;
+- `opaque`, `gap`, `blocked`, `unknown` — visible history but no safe restore;
+- `capability-unavailable` — state could be restored, but this host has no strict
+  restore coordinator.
+
+Only `full` and `partial` enter `restorableTotal`; `partialTotal` is the subset that
+requires a lossy-copy warning. If strict durable bulk restore is unavailable, both
+aggregates are zero and an otherwise recoverable row becomes `capability-unavailable`.
+No row is silently called restorable merely because bytes exist.
 
 ## Restore
 
-`restoreFromTrash(id)` resurrects the note **preserving the note-id**: it takes the tombstone (`latestFor`), reads the body from the CAS, and writes through the same write path with `id` (forcing `notarium-id` in the frontmatter), `targetClass` from the tombstone (restore into the original mount), and `directory` from the last path. Delete, restore and permanent purge share a narrow trash-namespace fence from tombstone validation through write/purge completion, so two successful operations cannot resurrect a note whose body/history the purge already erased. Per-note claims remain independent; bulk `all` restore/purge and folder delete claim the namespace prefix, freezing trash membership across pagination. The write path claims the forced id plus the destination path, then checks the live snapshot and engine storage for a collision before touching identity; if a different note already lives there, restore fails with `noteAlreadyExists` (409, naming the occupant — the same refusal every create now shares, [note-model.md](note-model.md#create-collisions)) — no silent overwrite (P3), and no dangling revived binding on failure. A successful restore writes a `kind: 'restore'` revision with `sourceRev = id` of the tombstone and drains the journal, so a client refetch is guaranteed to see the note out of the trash. The identity tombstone is resurrected by the successful write's same frontmatter-claim that handles an external move. **A custom slug is restored:** the tombstone carries a `slug` column, and restore re-sets it through the `slug` write channel (`null` → default `slug(title)`), so incoming `[[old-slug]]` resolve again instead of being re-ghosted. After restore the journal is re-read into `pastNames` and aliases are re-merged (`reloadHistoricalNames`) — a note renamed+deleted+restored within ONE session re-derives the old title into an alias immediately, without a reboot.
+`POST /api/s/:space/trash/restore` accepts `{id, revisionId, idempotencyKey}`. The
+selected revision must still be the current tombstone. The persisted coordinator
+stages/publishes through the resource authority and completes metadata through the
+same terminal transaction as history restore, preserving note-id, class and complete
+last path. A collision never overwrites another note. Exact states rebind only
+receipt-proven storage owners; legacy rows restore their known body/fixed fields;
+unsafe and opaque states fail before publication.
+
+The operation returns `succeeded` (200), `pending` (202), `conflict` (409),
+`not-restorable` (422), or pre-accept `busy` (503). Repeating the same principal,
+idempotency key and request resumes/replays it. Reusing a key for a changed request is
+a conflict. Accepted operations carry an id and can recover after process exit.
+
+Restore and purge meet at the journal/head fence: restore-first makes a stale purge
+skip; purge-first makes restore terminally fail. A published file whose terminal
+transaction cannot yet commit remains owned by recovery, not exposed as success.
+
+## Durable bulk restore
+
+`POST /api/s/:space/trash/restore-many` accepts one of:
+
+- `{ids, idempotencyKey}` — normalize/deduplicate while preserving explicit order;
+- `{all:true, q?, onlyRestorable?, idempotencyKey}` — select the server-side filtered
+  population without enumerating a page.
+
+Acceptance freezes one ordered evidence roster `(noteId, tombstoneRevisionId)` in a
+durable parent restore operation. Pagination, new deletes and later query drift cannot
+change it. Every item executes the strict single-note protocol under a deterministic
+child idempotency key and names its parent. Admission is bounded (25 active children
+per resume) and the identical POST advances the remaining queue; startup recovery does
+the same. A space in `closing` rejects fresh restore parents but admits already-accepted
+children, and cannot finish archive while the parent is nonterminal.
+
+The response is the complete frozen roster, one item each, in stable order:
+`queued | pending | succeeded | conflict | not-restorable`, plus exact counts. Parent
+status is `running` (202) until every child is terminal, then `completed` (200). A
+changed payload under the same parent key is `idempotency-conflict` (409); `busy` (503)
+is only a pre-accept capability/admission failure. Item failures do not roll back
+successful strict children, but they are durable terminal evidence rather than a lost
+best-effort response.
+
+The web client retains the parent key across transport ambiguity and repeats the same
+POST until `completed`. It never treats `running` as a partial success. The fake/none
+tier deliberately has no durable coordinator: rows say `capability-unavailable`, the
+aggregate is zero and restore endpoints answer 503 instead of simulating weaker safety.
 
 ## Permanent deletion
 
+`purgeTrash({ids})` or `purgeTrash({all:true,q?,availability?})` irreversibly deletes every revision
+for each selected note and garbage-collects blobs with no remaining references. Each
+candidate carries the selected tombstone id; SQLite/PostgreSQL compare it with the
+latest row under the append/purge lock. Notes changed or restored meanwhile are
+skipped. The empty identity tombstone may remain for routing/audit shape, but contains
+no note content. Automatic retention belongs to durable scheduled jobs (#105).
 `purgeTrash({ids})` (an explicit set — multi-select / a single note) or `purgeTrash({all:true, q?})` (`Select all N` — all trashed within the scope under the `q` filter, paginated) irreversibly erase via `purgeNotes(space, noteIds)`: they delete ALL of the note's journal rows and GC the blobs that no remaining revision references (the CAS is shared by hash — a blob is dropped only when its last referent leaves), in one transaction in both drivers. For `{ids}`, each id is checked `latestFor=delete` before deletion — this is a load-bearing guard: `purgeNotes` wipes the note's entire journal, and a stale/foreign id must not take down the history of a LIVE note. The identity tombstone (an empty id→path row, `deletedAt`) remains — it carries no content, while all the real history and blobs are erased; this is "permanent deletion" in essence. The permanent fence the purge leaves behind is scoped to THIS space (#327): a colliding id in another space keeps its own journal and can still be appended to, while a re-appearing file here is refused rather than quietly starting a second history under a purged id. Auto-retention (auto-purge after N days) is deliberately NOT here: durable scheduled GC is a consumer of the durable job layer (#105); #79 has only an explicit user action.
 
 ## Opening a deleted note
 
-A deleted note opens at the link `/n/<id>` like a normal one — but read-only, under an "in trash" banner (#79). The deleted-view is **opt-in** via `ReadOptions.deletedView`: when the engine returns not-found, `CachedStore.read` returns the last state from the journal ONLY if the caller passed the flag; otherwise — an honest rethrow of not-found. Only note-open sets the flag (`GET /api/note` sends `{deletedView:true}`); discovery reads (preview/previews, delta body-chase) and wiki-resolve (`/api/s/:space/note?ref`) do NOT pass the flag, so they miss on a deleted note rather than resurrecting its snippet on the Feed/cards/as a wiki target (a round 2 regression). When the flag is present and the most recent revision = delete, read returns the body from the CAS with the flags `deleted/deletedAt/deletedByPrincipal/restorable` (a genuinely-unknown id is still 404). On `GET /api/note` the server resolves `deletedBy` (a privacy-filtered Author #13) for the banner. An honest-gap (`restorable:false`, the body did not pass through us) is shown by the banner without content. The global id→space resolve for a deleted note works via the meta-DB identity registry (`findById` sees the tombstone) — this is the prod path; the in-memory fake does not express it (its `resolveNote` iterates over live listings), so the HTTP resolve of a deleted note is tested live, while `read` behavior is tested with a unit test.
+A deleted note opens at `/n/<id>` read-only via `ReadOptions.deletedView`; normal
+listing and wiki resolution still treat it as absent. Markdown states project their
+historical content, opaque state is literal source, and gaps have no preview.
+
+The UI at `/s/:space/trash` is a unified virtualized Notes/Spaces list with
+action-neutral selection: a checkbox selects an item for either Restore or Delete
+forever, never an implicit restore-only subset. The footer names the split (`N selected ·
+R can restore · U unavailable`) and `Restore R available` sends only the recoverable
+subset; the user never has to find and exclude unavailable rows. When the command
+finishes, deliberately skipped rows are cleared from selection instead of leaving a
+dead `Restore 0` footer, and the result states how many remain in Trash.
+
+Rows translate integrity states into recovery outcomes: full rows carry the ordinary
+Restore action, partial rows expose `Partial restore`, opaque/blocked/unknown rows expose
+`Source only`, and gaps expose `No copy`. The latter statuses are clickable
+explanations, not disabled icon tooltips. Host-level strict-restore absence is one page
+banner rather than a repeated row error. `All items | Can restore | Can’t restore` is a
+server-backed filter independent from the `All | Notes | Spaces` kind filter. A partial
+single or bulk restore requires an explicit warning. Bulk note restore uses the durable
+parent protocol above, while whole-space restore remains its registry-level best-effort
+batch. Purge remains separately confirmed and irreversible. Updates arrive through SSE
+`changed`.
 
 ## Wire and UI
 
-The endpoints are space-scoped (#16), under `/api/s/:space/trash` (list and purge carry the space; a deleted note is resolved by id separately via read):
-- `GET /api/s/:space/trash?offset&limit&q` (`space:read`) → `{ items, total }`; each item carries `noteId`, `title`, `filePath` (the last folder), `deletedAt`, `deletedBy` (resolved, a privacy-filtered Author #13 from the raw principal BEFORE redaction), `external` (the principal was null), `restorable` (whether a blob exists), `revisionId`.
-- `POST /api/s/:space/trash/restore {id}` (`space:write`) → `SaveResponse`.
-- `POST /api/s/:space/trash/restore-many { ids? | all?, q? }` (`space:write`) → `{ ok, restored[], failed[] }`. Best-effort batch restore (#184): either an explicit set of ids from the loaded multi-select, or a server-side sweep `all:true,q?` for the already-existing `Select all N` beyond-page path. Not transactional: successes are restored immediately, problematic ids are returned in `failed` with `reason/error` so the UI keeps them selected and honestly shows a summary.
-- `POST /api/s/:space/trash/purge {ids? | all?, q?}` (`space:write`) → `{ ok, purged }`. `{ids}` — multi-select / a single note; `{all:true, q?}` — `Select all N` without enumerating ids on the client (scaling beyond the page).
-- `GET /api/note?id=<deleted-id>` (id-addressed) → `NoteDetail` with `deleted:true` + the last state (see "Opening a deleted note").
-
-The UI is a separate page `/s/:space/trash` (like Feed/Graph), entered via an icon in the activity-strip of the left rail (#103). A virtualized (`@tanstack/react-virtual`) list with **windowed on-scroll loading** and **server-side search** (debounced) — it scales to a large trash. A row = a checkbox on the left + content (a title-link to the read-only deleted note) + a quick per-row Restore; multi-select lives in a **sticky bottom bar** that appears only after a selection: the safe `Restore N` next to the danger `Delete N forever`. Without a selection the footer does not offer purge: permanent deletion begins only through an explicit selection of rows or `Select all N` (#183). Bulk restore (#184) is best-effort: successes disappear from the list immediately, partial-success goes through a summary-toast, problematic rows stay selected; the `Select all N` beyond-page path is restored by the server-side `all:true,q?`, not by a client fan-out. External deletions are marked "outside Notarium"; an honest-gap (`restorable:false`) makes restore unavailable. A deleted note opened at `/n/<id>` is read-only under a full-content-width `StickyBar` banner (Restore / Delete forever), with Edit/the kebab hidden (the banner owns the mode, like history #12). Updates come over SSE `changed` (a coalesced refetch).
+- `GET /api/s/:space/trash?offset&limit&q&availability` →
+  `{items,total,restorableTotal,partialTotal,restoreAvailable}`.
+- `POST /api/s/:space/trash/restore` → strict single restore response.
+- `POST /api/s/:space/trash/restore-many` → durable parent progress/terminal response.
+- `POST /api/s/:space/trash/purge` → `{ok:true,purged}`.
+- `GET /api/note?id=<deleted-id>` → deleted `NoteDetail` when explicitly resolved.
+  It carries content-preview `restorable` separately from authoritative
+  `restoreAvailability`, so opaque/blocked source stays inspectable without exposing
+  an action the restore coordinator will refuse.
 
 ## Deliberate boundaries
 
-- Restorability depends on the meta-DB (like all history #12): without the journal the trash lives for the life of the process — an honest capability degradation (`capabilities.trash`), not a hard dependency.
-- Restore into the original folder is exact for the prod backend (notariumStore, where identity maintains the read-model durably); identity-capable engines restore by the last path from the back-filled tombstone.
-- A restore-path collision (a live note with a DIFFERENT id at the target path) is guarded inside the common write checkpoint, before identity revival. The snapshot check covers both engine compositions; `ifExists:'fail'` remains the disk-truth backstop for an unindexed external file.
-- The slug and **rename aliases** are restored (old titles live in the journal). A custom alias hand-written into the frontmatter `aliases:` that was NEVER a title is not carried by the journal (the body is stripped, there is no separate column for aliases) → it is lost on restore. A narrow caveat, overlapping with the grooming of the reverse-index (phase 5/#122); promoting aliases into a column = a new engine write channel, deliberately deferred.
-- **Spaces in the trash are not paginated (#110).** Two channels of a different nature: notes — server-side pagination + server-side search (`listTrashed` offset/limit/q, scaling to thousands), spaces — a host-level list loaded **in full** into `SpaceProvider` (boot `GET /api/spaces/archived`), searched client-side. Therefore the `All|Notes|Spaces` tab filter is purely front-end, and this is correct for any number of notes: the `Spaces` tab shows all spaces regardless of how many pages of notes are loaded (spaces are a separate complete set, and in `All` they go on top, not "beneath" the notes). A deliberate limit: the spaces channel rests on the assumption that "a principal has units-to-tens of archived spaces" (a space is a heavy, rare entity). If hundreds are ever needed — this channel will have to be paginated on the server the same way as notes (list + offset/limit + server-side `q`); for now it is a deliberate trade-off, not a bug.
+- History/trash require the journal; strict restore additionally requires causal
+  metadata, installation replay keys and a resource authority.
+- Restore uses the complete tombstone path. Missing destination folders may be
+  recreated by the authority; a different live note at that path is always a conflict.
+- Current exact rows preserve authored aliases, slug, comments, ordering, whitespace
+  and arbitrary plugin frontmatter. Only compatibility rows are partial.
+- Notes are server-paginated; archived spaces remain a separate complete host-level
+  list under the current product assumption that a principal has few of them.

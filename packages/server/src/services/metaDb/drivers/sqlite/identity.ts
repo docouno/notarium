@@ -17,9 +17,11 @@ type IdentityRow = {
   created_at: string | null
   materialized: number
   deleted_at: string | null
+  address_revision: number | bigint
 }
 
-const SELECT_COLUMNS = 'id, file_path, space, created_at, materialized, deleted_at'
+const SELECT_COLUMNS =
+  'id, file_path, space, created_at, materialized, deleted_at, address_revision'
 
 const recordOfRow = (r: IdentityRow): IdentityRecord => ({
   id: r.id,
@@ -28,6 +30,7 @@ const recordOfRow = (r: IdentityRow): IdentityRecord => ({
   createdAt: r.created_at,
   materialized: r.materialized !== 0,
   deletedAt: r.deleted_at,
+  addressRevision: Number(r.address_revision),
 })
 
 /** Upsert one row WITHOUT ever changing its space. The space guard is the whole
@@ -36,6 +39,10 @@ const recordOfRow = (r: IdentityRow): IdentityRecord => ({
 const UPSERT_SQL = `INSERT INTO note_identity (id, file_path, space, created_at, materialized, deleted_at)
      VALUES (?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
+       address_revision = note_identity.address_revision + CASE
+         WHEN note_identity.file_path IS NOT excluded.file_path
+           OR note_identity.deleted_at IS NOT excluded.deleted_at
+         THEN 1 ELSE 0 END,
        file_path = excluded.file_path,
        created_at = excluded.created_at,
        materialized = excluded.materialized,
@@ -148,6 +155,20 @@ export const createIdentityFacet = (ctx: SqliteDriverCtx): IdentityPersistence =
           deletedAt: null,
         }
 
+        if (current.id !== observedId) {
+          // The causal migration enforces one live identity per space/path. Retire
+          // the claimant before reviving its observed id; the transaction keeps the
+          // swap atomic, while the opposite order violates that invariant halfway
+          // through the statement sequence.
+          upsert.run(
+            current.id,
+            current.filePath,
+            space,
+            current.createdAt,
+            current.materialized ? 1 : 0,
+            at,
+          )
+        }
         upsert.run(
           record.id,
           record.filePath,
@@ -159,16 +180,6 @@ export const createIdentityFacet = (ctx: SqliteDriverCtx): IdentityPersistence =
         if (current.id === observedId) {
           return { status: 'accepted', record }
         }
-        // The superseded identity is retired in the SAME transaction: an
-        // interrupted settlement must never leave two live rows for one path.
-        upsert.run(
-          current.id,
-          current.filePath,
-          space,
-          current.createdAt,
-          current.materialized ? 1 : 0,
-          at,
-        )
         rekeyReferences(db, { space, fromId: current.id, toId: record.id })
         rekeyAndQuarantineRevisions(db, { space, fromId: current.id, toId: record.id })
 

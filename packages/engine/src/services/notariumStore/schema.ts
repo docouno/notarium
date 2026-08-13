@@ -196,10 +196,12 @@ DROP TABLE IF EXISTS note_vectors;
 export const TEARDOWN = `
 DROP TRIGGER IF EXISTS notes_vec_ad;
 DROP TRIGGER IF EXISTS notes_fingerprint_ad;
+DROP TRIGGER IF EXISTS notes_document_proof_ad;
 DROP TRIGGER IF EXISTS notes_ai;
 DROP TRIGGER IF EXISTS notes_ad;
 DROP TRIGGER IF EXISTS notes_au;
 DROP TABLE IF EXISTS file_fingerprints;
+DROP TABLE IF EXISTS document_proofs;
 DROP TABLE IF EXISTS notes_fts;
 DROP TABLE IF EXISTS notes;
 DROP TABLE IF EXISTS meta;
@@ -260,6 +262,19 @@ const NOTE_ID_CLAIM_INDEX_SCHEMA = `
 CREATE INDEX IF NOT EXISTS idx_notes_id_claim ON notes(id_claim);
 `
 
+const DOCUMENT_PROOF_SCHEMA = `
+CREATE TABLE IF NOT EXISTS document_proofs (
+  note_rowid INTEGER PRIMARY KEY,
+  source_hash TEXT NOT NULL,
+  proof_json  TEXT NOT NULL,
+  receipt_id  TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS notes_document_proof_ad AFTER DELETE ON notes BEGIN
+  DELETE FROM document_proofs WHERE note_rowid = old.rowid;
+END;
+`
+
 /** The ladder. INDEX_MIGRATIONS[0] is the FROZEN baseline — the meta+notes+FTS schema
  *  as it shipped at legacy version '7' (note_type included). A fresh index replays it
  *  from 0; a legacy '7' index replays it too, but every statement is CREATE IF NOT
@@ -272,6 +287,7 @@ export const INDEX_MIGRATIONS: readonly IndexMigration[] = [
   { sql: FILE_FINGERPRINT_SCHEMA },
   { sql: FILE_FINGERPRINT_VERSION_SCHEMA },
   { sql: NOTE_ID_CLAIM_INDEX_SCHEMA },
+  { sql: DOCUMENT_PROOF_SCHEMA },
 ]
 
 /** The current ladder length — the integer version an index converges to. */

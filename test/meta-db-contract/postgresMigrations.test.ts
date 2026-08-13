@@ -120,6 +120,37 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
     }
   })
 
+  it('adds the revision snapshot marker without relabelling legacy body blobs', async () => {
+    const testSchema = await createSchema('migration_revision_state')
+    const pool = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const client = await pool.connect()
+
+    try {
+      await runPgMigrations(client, migrations.slice(0, 6))
+      await client.query('INSERT INTO revision_blobs (hash, content) VALUES ($1, $2)', [
+        'legacy-hash',
+        'legacy body',
+      ])
+      await client.query(
+        `INSERT INTO note_revisions
+          (note_id, space, kind, title, tags, content_hash, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        ['legacy-state', 'main', 'write', 'Legacy', '[]', 'legacy-hash', '2026-08-01'],
+      )
+
+      await runPgMigrations(client, migrations)
+
+      const result = await client.query(
+        'SELECT content_hash, snapshot_format FROM note_revisions WHERE note_id = $1',
+        ['legacy-state'],
+      )
+      expect(result.rows).toEqual([{ content_hash: 'legacy-hash', snapshot_format: null }])
+    } finally {
+      client.release()
+      await pool.end()
+    }
+  })
+
   it('backfills the entry role by class, and leaves a cross-space legacy first row alone', async () => {
     // Twin of the SQLite case in test/unit/metaDbMigrations.test.ts. Same text in both
     // assets on purpose: the backfill defines a rule, and two spellings of one rule
@@ -166,6 +197,40 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
         ),
       ).rejects.toThrow(/check constraint/i)
     } finally {
+      client.release()
+      await pool.end()
+    }
+  })
+
+  it('rejects the previous unconditional purge protocol after the CAS migration', async () => {
+    const testSchema = await createSchema('migration_revision_purge_cas')
+    const pool = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const client = await pool.connect()
+
+    try {
+      await runPgMigrations(client, migrations.slice(0, 7))
+      await client.query(
+        `INSERT INTO note_revisions (note_id, space, kind, title, tags, created_at)
+         VALUES ('rolling-purge', 'main', 'delete', 'Rolling purge', '[]', '2026-08-09')`,
+      )
+      await runPgMigrations(client, migrations)
+
+      await client.query('BEGIN')
+      await client.query("SELECT set_config('notarium.revision_purge_protocol', 'v26', true)")
+      await expect(
+        client.query("DELETE FROM note_revisions WHERE note_id = 'rolling-purge'"),
+      ).rejects.toThrow(/revision purge requires a fenced writer/)
+      await client.query('ROLLBACK')
+
+      await client.query('BEGIN')
+      await client.query("SELECT set_config('notarium.revision_purge_protocol', 'v27', true)")
+      await client.query("DELETE FROM note_revisions WHERE note_id = 'rolling-purge'")
+      await client.query('COMMIT')
+      expect(
+        await client.query("SELECT 1 FROM note_revisions WHERE note_id = 'rolling-purge'"),
+      ).toMatchObject({ rowCount: 0 })
+    } finally {
+      await client.query('ROLLBACK').catch(() => {})
       client.release()
       await pool.end()
     }

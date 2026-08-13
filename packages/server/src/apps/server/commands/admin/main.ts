@@ -13,7 +13,13 @@ import { parseCommandLine, type ParsedCommandLine } from '../../../../libs/comma
 import { loadEnv } from '../../../../libs/env'
 import { createAuthService } from '../../../../services/auth'
 import type { SpaceRole } from '../../../../services/authz'
+import {
+  InstallationReplayKey,
+  ReplayKeyring,
+  replayKeyringConfigFromEnv,
+} from '../../../../services/installationReplayKey'
 import { createMetaDb, describeMetaDbUrl } from '../../../../services/metaDb'
+import { dataPathsFromEnv } from '../../dataPaths'
 import { normalizeAdminArguments } from './arguments'
 import { grantSpaceMember } from './grant'
 import { resolveMetaDbUrl } from './resolveMetaDbUrl'
@@ -75,6 +81,8 @@ const main = async (): Promise<void> => {
     password: 'value',
     random: 'boolean',
     display: 'value',
+    'expected-key-id': 'value',
+    apply: 'boolean',
   })
   const [command, ...rest] = parsed.positionals
   const allowedByCommand: Record<string, readonly string[]> = {
@@ -82,6 +90,7 @@ const main = async (): Promise<void> => {
     passwd: ['password', 'random'],
     'create-admin': ['password', 'random', 'display'],
     grant: [],
+    'recover-replay-key': ['expected-key-id', 'apply'],
   }
 
   if (command && !Object.hasOwn(allowedByCommand, command)) {
@@ -200,6 +209,46 @@ const main = async (): Promise<void> => {
         break
       }
 
+      case 'recover-replay-key': {
+        if (rest.length > 0) {
+          die('usage: recover-replay-key --expected-key-id <stable-id> [--apply]')
+        }
+        const expectedKeyId =
+          parsed.value('expected-key-id') ??
+          die('usage: recover-replay-key --expected-key-id <stable-id> [--apply]')
+        const config = (() => {
+          try {
+            return replayKeyringConfigFromEnv(
+              dataPathsFromEnv(process.env).dataDir,
+              metaDbUrl,
+              process.env,
+            )
+          } catch (err) {
+            return die((err as Error).message)
+          }
+        })()
+        const recovery = new InstallationReplayKey({
+          persistence: metaDb.installationGeneration,
+          keyring: new ReplayKeyring(config.path),
+          topology: config.topology,
+        })
+        const result = await recovery
+          .recoverMissingExternal({ expectedKeyId, apply: parsed.has('apply') })
+          .catch((err) => die((err as Error).message))
+
+        if (!result.applied) {
+          console.log(
+            `dry-run: stable ${result.previousKeyId} at generation ${result.generation} is eligible for complete-loss recovery`,
+          )
+          console.log('stop every serving process, recheck the topology, then repeat with --apply')
+        } else {
+          console.log(
+            `✓ replay key recovered: ${result.previousKeyId} → ${result.activeKeyId} (generation ${result.generation})`,
+          )
+        }
+        break
+      }
+
       default:
         console.log(
           [
@@ -209,6 +258,7 @@ const main = async (): Promise<void> => {
             '  passwd <username> [--password|--random]   set a password (revokes sessions)',
             '  create-admin <username> [...]             create an admin (locked-out recovery)',
             '  grant <username> <space> <role>           set space membership',
+            '  recover-replay-key --expected-key-id ID   dry-run shared-keyring recovery',
             '',
             `meta-db: ${shownUrl}`,
           ].join('\n'),

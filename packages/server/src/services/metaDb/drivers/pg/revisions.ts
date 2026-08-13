@@ -1,9 +1,14 @@
 import {
   AGENT_SESSION_ATTACH,
   type AuthorFilter,
+  CAUSAL_BARRIER_KIND,
+  DOCUMENT_STATE_FORMAT,
+  LOGICAL_NOTE_STATE_FORMAT,
   type Revision,
   REVISION_INTEGRITY,
+  type RevisionBlob,
   revisionGapOf,
+  RevisionHeadConflictError,
   type RevisionInput,
   type RevisionPersistence,
 } from '@notarium/core'
@@ -16,6 +21,7 @@ import {
   QUARANTINED,
   TRUSTED_ONLY,
 } from '../../revisionProjection'
+import { lockCausalBarriers } from './causalBarriers'
 import type { PgDriverCtx } from './context'
 import { lockRevisionWideScan } from './lockOrder'
 import { lockRevisionKeys } from './revisionLocks'
@@ -35,6 +41,10 @@ type RevisionRow = {
   session_name: string | null
   session_attach: string | null
   content_hash: string | null
+  semantic_fingerprint: string | null
+  restore_safety: Revision['restoreSafety']
+  snapshot_format: string | null
+  document_format: string | null
   title: string
   class: string | null
   slug: string | null
@@ -90,6 +100,9 @@ const rawRevisionOfRow = (r: RevisionRow): Revision => ({
       }
     : {}),
   contentHash: r.content_hash,
+  semanticFingerprint: r.semantic_fingerprint,
+  restoreSafety: r.restore_safety,
+  stateFormat: (r.document_format ?? r.snapshot_format) as Revision['stateFormat'],
   title: r.title,
   class: r.class ?? null,
   slug: r.slug ?? null,
@@ -133,7 +146,7 @@ const classFilterPg = (excludeClasses: readonly string[], params: unknown[]): st
 
 export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => ({
   init: () => ctx.ensureInit(),
-  append: async (rev: RevisionInput, content: string | null) => {
+  append: async (rev: RevisionInput, content: RevisionBlob | null) => {
     await ctx.ensureInit()
     const client = await ctx.required.connect()
 
@@ -146,9 +159,20 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
         // unique tuple without forming tuple-lock ↔ advisory-lock deadlocks.
         await client.query(
           'INSERT INTO revision_blobs (hash, content) VALUES ($1, $2) ON CONFLICT (hash) DO NOTHING',
-          [rev.contentHash, content],
+          [
+            rev.contentHash,
+            typeof content === 'string' ? Buffer.from(content, 'utf8') : Buffer.from(content),
+          ],
         )
       }
+      // Lifecycle is the first logical barrier in the global causal order. Take
+      // it before the legacy revision lock family so purge cannot hold lifecycle
+      // exclusively while waiting for an append's shared revision-space lock.
+      await lockCausalBarriers(
+        client,
+        [{ kind: CAUSAL_BARRIER_KIND.spaceLifecycle, space: rev.space, key: rev.space }],
+        () => 'shared',
+      )
       // Appends in one space may proceed concurrently; whole-space purge takes
       // the matching exclusive lock before enumerating notes and blobs.
       await lockRevisionKeys(client, 'space', [rev.space], 'shared')
@@ -163,7 +187,10 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
           // stripes. Reassert our retained bytes under the GC lock.
           await client.query(
             'INSERT INTO revision_blobs (hash, content) VALUES ($1, $2) ON CONFLICT (hash) DO NOTHING',
-            [rev.contentHash, content],
+            [
+              rev.contentHash,
+              typeof content === 'string' ? Buffer.from(content, 'utf8') : Buffer.from(content),
+            ],
           )
         }
       }
@@ -178,10 +205,50 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
       if (fence.rows.length) {
         throw new Error(`revision target was permanently purged: ${fence.rows[0].kind}`)
       }
+      const headResult = await client.query(
+        `SELECT revisions.*
+           FROM revision_heads AS heads
+           JOIN note_revisions AS revisions ON revisions.id = heads.revision_id
+          WHERE heads.space = $1 AND heads.note_id = $2`,
+        [rev.space, rev.noteId],
+      )
+      const headRow = headResult.rows[0] as RevisionRow | undefined
+      const head = headRow ? revisionOfRow(headRow) : null
+
+      if (
+        rev.expectedHeadRevisionId !== undefined &&
+        (head?.id ?? null) !== rev.expectedHeadRevisionId
+      ) {
+        throw new RevisionHeadConflictError(
+          rev.noteId,
+          rev.expectedHeadRevisionId,
+          head?.id ?? null,
+        )
+      }
+      if (
+        rev.expectedHeadRevisionId !== undefined &&
+        rev.baseRevisionId !== rev.expectedHeadRevisionId
+      ) {
+        throw new Error('revision base must equal the expected head')
+      }
+      const lifecycle = rev.kind === 'delete' ? 'deleted' : 'live'
+      const headLifecycle = head?.kind === 'delete' ? 'deleted' : 'live'
+
+      if (
+        rev.allowSemanticNoop === true &&
+        rev.semanticFingerprint != null &&
+        head?.semanticFingerprint === rev.semanticFingerprint &&
+        headLifecycle === lifecycle
+      ) {
+        // The deadlock-safe CAS order may have tentatively inserted the blob
+        // before note locks. A semantic no-op must roll that write back.
+        await client.query('ROLLBACK')
+        return head
+      }
       const res = await client.query(
         `INSERT INTO note_revisions
-             (note_id, space, base_rev, their_rev, source_rev, kind, entry_role, principal, agent_owner, agent_name, session_id, session_name, session_attach, content_hash, title, class, slug, tags, created_at, chars_added, chars_removed, integrity)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+             (note_id, space, base_rev, their_rev, source_rev, kind, entry_role, principal, agent_owner, agent_name, session_id, session_name, session_attach, content_hash, semantic_fingerprint, restore_safety, snapshot_format, document_format, title, class, slug, tags, created_at, chars_added, chars_removed, integrity)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
            RETURNING id`,
         [
           rev.noteId,
@@ -198,6 +265,14 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
           rev.agent?.session?.name ?? null,
           rev.agent?.session?.attach ?? null,
           rev.contentHash,
+          rev.semanticFingerprint ?? null,
+          rev.restoreSafety ?? null,
+          rev.stateFormat === LOGICAL_NOTE_STATE_FORMAT ? rev.stateFormat : null,
+          rev.stateFormat === DOCUMENT_STATE_FORMAT.markdown ||
+          rev.stateFormat === DOCUMENT_STATE_FORMAT.skill ||
+          rev.stateFormat === DOCUMENT_STATE_FORMAT.opaque
+            ? rev.stateFormat
+            : null,
           rev.title,
           rev.class,
           rev.slug,
@@ -208,8 +283,28 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
           REVISION_INTEGRITY.trusted,
         ],
       )
+      await client.query(
+        `INSERT INTO revision_heads
+         (note_id, space, revision_id, semantic_fingerprint, lifecycle)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (space, note_id) DO UPDATE SET
+           revision_id = EXCLUDED.revision_id,
+           semantic_fingerprint = EXCLUDED.semantic_fingerprint,
+           lifecycle = EXCLUDED.lifecycle`,
+        [rev.noteId, rev.space, res.rows[0].id, rev.semanticFingerprint ?? null, lifecycle],
+      )
       await client.query('COMMIT')
-      return { ...rev, tags: [...rev.tags], id: String(res.rows[0].id) }
+      const stored = { ...rev }
+      delete stored.allowSemanticNoop
+      delete stored.expectedHeadRevisionId
+      return {
+        ...stored,
+        semanticFingerprint: rev.semanticFingerprint ?? null,
+        restoreSafety: rev.restoreSafety ?? null,
+        stateFormat: rev.stateFormat ?? null,
+        tags: [...rev.tags],
+        id: String(res.rows[0].id),
+      }
     } catch (err) {
       await client.query('ROLLBACK')
       throw err
@@ -413,9 +508,9 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
     const revisions = (result.rows as RevisionRow[]).map(revisionOfRow)
     return new Map(revisions.map((revision) => [revision.noteId, revision]))
   },
-  listTrashed: async (space, { offset, limit, q }, excludeClasses = []) => {
+  listTrashed: async (space, { offset, limit, q, availability }, excludeClasses = []) => {
     await ctx.ensureInit()
-    // Class filter runs BEFORE the per-note collapse (inside the subquery); title search AFTER it.
+    // Class is immutable; filter the authoritative head row directly.
     const params: unknown[] = [space]
     const exFilter = classFilterPg(excludeClasses, params)
     const needle = q?.trim().toLowerCase()
@@ -425,31 +520,60 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
       params.push(`%${needle.replace(/[\\%_]/g, (c) => '\\' + c)}%`)
       qFilter = ` AND LOWER(title) LIKE $${params.length} ESCAPE '\\'`
     }
+    const restorableExpr = `CASE WHEN revisions.content_hash IS NOT NULL
+      AND (
+        revisions.document_format IS NULL
+        OR (
+          revisions.document_format <> 'opaque-v1'
+          AND revisions.restore_safety = 'safe'
+        )
+      ) THEN 1 ELSE 0 END`
+    const availabilityFilter =
+      availability === 'restorable'
+        ? ` AND (${restorableExpr}) = 1`
+        : availability === 'unavailable'
+          ? ` AND (${restorableExpr}) = 0`
+          : ''
     const totalParams = [...params] // window + total share everything but limit/offset
     params.push(limit)
     const limitParam = `$${params.length}`
     params.push(offset)
     const offsetParam = `$${params.length}`
-    const [rows, agg, restAgg] = await Promise.all([
+    const [rows, agg, restAgg, partialAgg] = await Promise.all([
       ctx.required.query(
         `SELECT * FROM (
              SELECT *, ROW_NUMBER() OVER (PARTITION BY note_id ORDER BY id DESC) AS rn
              FROM note_revisions WHERE space = $1 AND ${TRUSTED_ONLY}${exFilter}
-           ) t WHERE rn = 1 AND kind = 'delete'${qFilter} ORDER BY id DESC LIMIT ${limitParam} OFFSET ${offsetParam}`,
+           ) AS revisions
+          WHERE rn = 1 AND kind = 'delete'${qFilter}${availabilityFilter}
+          ORDER BY id DESC LIMIT ${limitParam} OFFSET ${offsetParam}`,
         params,
       ),
       ctx.required.query(
         `SELECT COUNT(*) AS n FROM (
-             SELECT note_id, kind, title, ROW_NUMBER() OVER (PARTITION BY note_id ORDER BY id DESC) AS rn
+             SELECT *, ROW_NUMBER() OVER (PARTITION BY note_id ORDER BY id DESC) AS rn
              FROM note_revisions WHERE space = $1 AND ${TRUSTED_ONLY}${exFilter}
-           ) t WHERE rn = 1 AND kind = 'delete'${qFilter}`,
+           ) AS revisions
+          WHERE rn = 1 AND kind = 'delete'${qFilter}${availabilityFilter}`,
         totalParams,
       ),
       ctx.required.query(
         `SELECT COUNT(*) AS n FROM (
-             SELECT note_id, kind, title, content_hash, ROW_NUMBER() OVER (PARTITION BY note_id ORDER BY id DESC) AS rn
+             SELECT *, ROW_NUMBER() OVER (PARTITION BY note_id ORDER BY id DESC) AS rn
              FROM note_revisions WHERE space = $1 AND ${TRUSTED_ONLY}${exFilter}
-           ) t WHERE rn = 1 AND kind = 'delete' AND content_hash IS NOT NULL${qFilter}`,
+           ) AS revisions
+          WHERE rn = 1 AND kind = 'delete'
+            AND (${restorableExpr}) = 1${qFilter}${availabilityFilter}`,
+        totalParams,
+      ),
+      ctx.required.query(
+        `SELECT COUNT(*) AS n FROM (
+             SELECT *, ROW_NUMBER() OVER (PARTITION BY note_id ORDER BY id DESC) AS rn
+             FROM note_revisions WHERE space = $1 AND ${TRUSTED_ONLY}${exFilter}
+           ) AS revisions
+          WHERE rn = 1 AND kind = 'delete'
+            AND revisions.content_hash IS NOT NULL
+            AND revisions.document_format IS NULL${qFilter}${availabilityFilter}`,
         totalParams,
       ),
     ])
@@ -457,25 +581,59 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
       items: (rows.rows as RevisionRow[]).map(revisionOfRow),
       total: Number((agg.rows[0] as { n: string | number }).n),
       restorableTotal: Number((restAgg.rows[0] as { n: string | number }).n),
+      partialTotal: Number((partialAgg.rows[0] as { n: string | number }).n),
     }
   },
-  purgeNotes: async (space, noteIds) => {
+  purgeNotes: async (space, noteIds, expectedLatest) => {
     await ctx.ensureInit()
     if (!noteIds.length) {
-      return
+      return []
     }
-    const ids = [...noteIds]
+    const candidates = [...new Set(noteIds)]
     const client = await ctx.required.connect()
+    let ids: string[] = []
 
     try {
       await client.query('BEGIN')
-      await client.query("SELECT set_config('notarium.revision_purge_protocol', 'v26', true)")
+      await client.query("SELECT set_config('notarium.revision_purge_protocol', 'v27', true)")
       // Serialize cross-replica appends and purges for the same notes first,
       // then their shared CAS hashes. The blob set is read from rows this
       // transaction has already locked, so the tier cannot be entered in one
       // sorted pass and the wide-scan mutex supplies the order instead.
       await lockRevisionWideScan(client)
-      await lockRevisionKeys(client, 'note', ids)
+      await lockRevisionKeys(client, 'note', candidates)
+      if (expectedLatest) {
+        const latest = await client.query(
+          `SELECT note_id, revision_id AS id
+             FROM revision_heads
+            WHERE space = $1 AND note_id = ANY($2)`,
+          [space, candidates],
+        )
+        const latestByNote = new Map(
+          (latest.rows as Array<{ note_id: string; id: string | number | bigint }>).map((row) => [
+            row.note_id,
+            String(row.id),
+          ]),
+        )
+        ids = candidates.filter((noteId) => {
+          const expected = expectedLatest.get(noteId)
+          return expected !== undefined && latestByNote.get(noteId) === expected
+        })
+      } else {
+        ids = candidates
+      }
+      const pinned = await client.query(
+        `SELECT DISTINCT pins.note_id
+          FROM restore_operation_notes AS pins
+           JOIN restore_operations AS operations ON operations.id = pins.operation_id
+          WHERE pins.space = $1 AND pins.note_id = ANY($2)
+            AND operations.phase NOT IN ('succeeded', 'rejected')`,
+        [space, ids],
+      )
+      const protectedIds = new Set(
+        (pinned.rows as Array<{ note_id: string }>).map((row) => row.note_id),
+      )
+      ids = ids.filter((noteId) => !protectedIds.has(noteId))
       // The fence is scoped exactly like the DELETE below it.
       // canon: docs/meta-db.md#source-of-truth
       await client.query(
@@ -492,6 +650,10 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
       const hashes = (hashesRes.rows as Array<{ h: string }>).map(({ h }) => h).sort()
 
       await lockRevisionKeys(client, 'blob', hashes)
+      await client.query('DELETE FROM revision_heads WHERE space = $1 AND note_id = ANY($2)', [
+        space,
+        ids,
+      ])
       await client.query('DELETE FROM note_revisions WHERE space = $1 AND note_id = ANY($2)', [
         space,
         ids,
@@ -514,6 +676,8 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
     } finally {
       client.release()
     }
+
+    return ids
   },
   latestTimestamps: async (space) => {
     await ctx.ensureInit()
@@ -547,10 +711,23 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
   },
   content: async (contentHash) => {
     await ctx.ensureInit()
-    const res = await ctx.required.query('SELECT content FROM revision_blobs WHERE hash = $1', [
-      contentHash,
-    ])
-    return res.rows[0]?.content ?? null
+    const res = await ctx.required.query(
+      `SELECT b.content,
+              EXISTS (
+                SELECT 1 FROM note_revisions r
+                 WHERE r.content_hash = b.hash AND r.document_format IS NOT NULL
+              ) AS document
+         FROM revision_blobs b
+        WHERE b.hash = $1`,
+      [contentHash],
+    )
+    const row = res.rows[0] as { content: Uint8Array; document: boolean } | undefined
+
+    if (!row) {
+      return null
+    }
+
+    return row.document ? Uint8Array.from(row.content) : Buffer.from(row.content).toString('utf8')
   },
   close: () => ctx.close(),
 })

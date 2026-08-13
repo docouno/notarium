@@ -17,7 +17,7 @@ import type { Axis } from './axes'
 
 /** A note's model class (#74/#78). Mirrors core's NoteClass as a plain string so
  *  the catalog stays dependency-light (both appliers translate it). */
-export type CaseNoteClass = 'user-doc' | 'agent-memory' | 'profile'
+export type CaseNoteClass = 'user-doc' | 'agent-memory' | 'profile' | 'skill'
 
 /** A date as an ISO instant OR a `YYYY-MM-DD` (interpreted at noon UTC). The
  *  generators emit ISO instants; hand-authored cases may use either. */
@@ -261,6 +261,36 @@ export type ExternalRewriteDecl = {
   replacements: Array<{ from: string; to: string }>
 }
 
+/** One deliberately-authored journal state layered on a timeline note after its
+ * ordinary lifecycle. This is the neutral seed seam for restore/read edge cases
+ * that a normal write cannot produce (gap, legacy body-only, opaque bytes or a
+ * receipt-bound exact source). Both appliers materialize the same codec bytes. */
+export type RevisionStateDecl = {
+  /** Logical note handle returned by WorldBuilder.note(). */
+  note: string
+  date: CaseDate
+  kind?: 'write' | 'delete'
+  principal?: string
+  title?: string
+  state:
+    | { kind: 'gap' }
+    | { kind: 'legacy'; content: string }
+    | {
+        kind: 'document'
+        source: { encoding: 'utf8' | 'base64'; data: string }
+        role?: 'generic' | 'skill-root' | 'skill-auxiliary' | 'opaque'
+        pathFallbackTitle?: string | null
+        skillDirectoryName?: string
+        /** Claims are bound to deterministic synthetic receipt evidence; values
+         * alone never manufacture ownership proof. */
+        ownerClaims?: Array<{
+          key: 'notarium-id' | 'notarium-created'
+          ownership: 'value' | 'entry'
+        }>
+        generatedContainer?: boolean
+      }
+}
+
 /** One CROSS-SPACE id collision written straight onto disk after the production
  *  write timeline (#327): `note`'s `notarium-id` frontmatter is replaced with the
  *  id `claimFrom` actually got, so two spaces' files claim one id — the shape a
@@ -332,6 +362,9 @@ export type CaseEvent = (
       content?: string
       title?: string
       tags?: string[]
+      /** Raw authored frontmatter patch, using the same merge channel as an
+       * external/imported Markdown edit. Enables metadata-only history states. */
+      frontmatter?: string
       principal?: string
       /** Seed this revision as a journal GAP (#327) — the state a settled
        *  cross-space collision leaves behind. Only the FAKE stand can honour it: a
@@ -430,6 +463,8 @@ export type CaseWorld = {
   durableImports?: DurableImportDecl[]
   /** Same-size, mtime-preserving direct file rewrites (#267). */
   externalRewrites?: ExternalRewriteDecl[]
+  /** Exact/legacy/gap/opaque journal states shared by fake and real appliers. */
+  revisionStates?: RevisionStateDecl[]
   /** Cross-space `notarium-id` collisions planted on disk (#327), real applier only. */
   externalIdentityClaims?: ExternalIdentityClaimDecl[]
 }

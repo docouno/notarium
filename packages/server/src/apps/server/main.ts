@@ -13,6 +13,7 @@ import {
 import { backupControlSocketFromEnv } from '../../libs/backupControl'
 import { loadEnv } from '../../libs/env'
 import { trustProxyFromEnv } from '../../libs/trustProxy'
+import { replayKeyringConfigFromEnv } from '../../services/installationReplayKey'
 import {
   type DataPaths,
   dataPathsFromEnv,
@@ -43,6 +44,14 @@ const SPACE_IDLE_EVICT_SECONDS = Number(process.env.SPACE_IDLE_EVICT_SECONDS ?? 
 const dataPaths = ((): DataPaths => {
   try {
     return dataPathsFromEnv(process.env)
+  } catch (err) {
+    console.error(`\n[notarium] ${(err as Error).message}\n`)
+    process.exit(1)
+  }
+})()
+const replayKeyring = (() => {
+  try {
+    return replayKeyringConfigFromEnv(dataPaths.dataDir, dataPaths.metaDbUrl, process.env)
   } catch (err) {
     console.error(`\n[notarium] ${(err as Error).message}\n`)
     process.exit(1)
@@ -257,6 +266,7 @@ const app = await createServer({
   publicBaseUrl: process.env.PUBLIC_BASE_URL?.trim() || undefined,
   trustProxy: TRUST_PROXY || undefined,
   backupControlSocket: backupControlSocketFromEnv(),
+  replayKeyring,
 }).catch((err: unknown) => {
   console.error(`\n[notarium] ${(err as Error).message}\n`)
   console.error(err)

@@ -92,7 +92,9 @@ and for `security` — it parses the sanitized HTML into a live DOM and checks t
 | `trash-empty` | trash zero-state (#79) | trash |
 | `trash-mixed` | deleted notes + folder + project + a **deleted-then-restored** note (#79/#184) | trash, history |
 | `trash-long` | a large composite trash: a long list of deleted notes (scale) beyond the viewport — scroll-glass chrome (#185/#247) + deleted spaces (the Notes/Spaces toggle), a deleted folder, a note from a project, restored | trash, history, scale |
-| `history-rich` | a deep revision chain, 2 authors, rename (#203/#160) | history, identity |
+| `trash-recovery` | realistic recovery queue: many exact copies, one older partial copy, source-only and record-only rows, an archived space, a live path collision; `SCALE=5` crosses Select-all-N pagination | trash, history, scale |
+| `history-rich` | a deep revision chain, 2 authors, rename, raw plugin frontmatter and a metadata-only revision visible in Changes (#203/#160) | history, identity |
+| `restore-states` | exact CRLF/comments/Unicode + receipt-owned fields in live history and a safe deleted state, blocked YAML-owner coupling, legacy partial, honest gap, opaque UTF-8/binary and valid/invalid direct `SKILL.md` states (#275) | history, trash, note-classes |
 
 **Graph / identity / search:**
 
@@ -270,7 +272,7 @@ needed):
 
 ## Extensibility (contract)
 
-A note declaration also carries **`frontmatter`** — the keys an IMPORTED file arrived with,
+A note declaration and an explicit timeline `edit` can carry **`frontmatter`** — the keys an IMPORTED/external Markdown file arrived with,
 authored as bare YAML lines without the `---` fences (#280) — so a seeded "imported note"
 keeps its author's keys instead of a seeder-only imitation of the outcome. The two appliers
 reach it by their own routes, as everywhere else: the REAL one through the production
@@ -281,6 +283,24 @@ same typed projections from the final carry as its write does (`type`/`tags`/`al
 `summary`/`muted`). Explicit fixture fields have the serializer's final priority, including
 empty clears, and remove their raw shadow so it cannot reappear on export. Skipping either rule
 would make the fake disagree with the real file after import (pinned by `inMemoryStore.test.ts`).
+
+Ordinary seeded history remains a readable compatibility projection: the fake writes a
+complete canonical `markdown-v1` snapshot and hashes/diffs that snapshot, not only the
+body, while the real write/read-back produces the current byte-safe format. `history-rich`
+contains one body-stable raw edit that changes
+`review-status: draft → reviewed` and `tags: [release] → [release, reviewed]`; this keeps
+metadata-only CAS/history/diff and raw-to-typed projection parity reproducible on both appliers. Low-level `ActivityFixture`
+may omit `snapshot`; that omission intentionally creates a legacy body-only row for UI/API
+compatibility tests and is never treated as a current full revision.
+
+States that cannot honestly pass through a normal authoring write use the neutral
+`revisionStates` declaration. It names a timeline note and an authored date, then chooses
+`gap`, legacy body-only, or byte source (`utf8|base64`) plus document role/path fallback,
+skill directory and synthetic receipt-bound owner claims. Both appliers call the same
+`DocumentState` analyzer/codec, including exact `{{noteId}}`, `{{path}}` and `{{createdAt}}`
+token substitution. Duplicate `(note,date)` declarations must be byte-identical;
+incompatible duplicates fail, and combined cases namespace note dependencies while
+preserving declaration order.
 
 - **+content edge case** → add a `Fragment` to `corpus/<feature>.ts`. It flows on its own
   into the reader cases + the coverage matrix + the honesty test.
@@ -297,11 +317,16 @@ would make the fake disagree with the real file after import (pinned by `inMemor
   `restore`→`store.restoreFromTrash` (an honest `kind:'restore'` revision), an
   `externalRewrite`→a same-size/mtime direct markdown write after the timeline, an
   `archived` space→`manager.archive` after the seed (moves to Trash→Spaces, data intact).
+  Declared `revisionStates` are appended through the production revision persistence after
+  the ordinary timeline, with the real note id, expected-head CAS, encoded bytes, semantic
+  fingerprint and persisted restore safety.
   Agent delta cursors resolve their declarative `throughNote` anchor to the real latest
   revision id only after the timeline exists, then advance through the production meta-DB
   persistence. Zero edits to production code.
 - **Fake** (`caseToFixture`): a fold of the timeline → `Fixture` (a snapshot of live
   notes + activity rows); a note whose last op is `delete` — only a tombstone row.
+  Declared `revisionStates` become the same encoded bytes (base64 only as the fixture
+  carrier), format/fingerprint/safety and gap marker in the in-memory journal.
   Meta-DB-only delta cursor declarations are intentionally real-applier-only; the fake has
   no revision ids to which their semantic anchors could honestly resolve.
 
@@ -310,17 +335,18 @@ would make the fake disagree with the real file after import (pinned by `inMemor
 - **The fake does not express space-archive.** In the fake's projection an archived
   space sits as LIVE (there is no field in `SpaceFixture`). On the REAL stand it is
   honest (the seeder calls `manager.archive`). Verified live.
-  - *Restorable* used to be listed here too — it no longer is (#256). The fake
+  - *Blob readability* used to be listed here too — it no longer is (#256). The fake
     projection now stamps every seeded revision with the body it carried and
     content-addresses it into the blob table, exactly like a live write, so a
-    tombstone keeps the note's last known content and the trash is restorable on
-    both appliers. Two things fall out of the same change: a seeded revision chain
+    tombstone keeps the note's last known content. Two things fall out of the same change: a seeded revision chain
     is READABLE (the history panel's revision view and the Changes diff fetch by
     `contentHash` — before this they showed "body unknown"), and each row carries
     real `charsAdded`/`charsRemoved` rather than null — stamped the way the journal
     stamps them PER OP: `diffStats` against the chain parent for a write, and for a
     tombstone the journal's own rule (`0` / the removed body's length), not a diff
-    of the body against itself.
+    of the body against itself. Strict restore durability itself is intentionally absent
+    in the fake tier: public rows report `capability-unavailable`, `restorableTotal=0`,
+    and restore endpoints answer 503 rather than simulating a weaker success.
 - **Fake activity rows are keyed to the note they describe.** The projection stamps
   each row with `deterministicNoteId(path)` — the id the in-memory store derives for
   that path — not the catalog's logical handle (#256). With the handle the aggregate

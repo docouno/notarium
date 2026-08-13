@@ -8,6 +8,17 @@ The `KnowledgeStore` port carries an optional `exportNotes(opts?): AsyncIterable
 
 `NotariumStore` traverses its mounts directly. Note-only mounts use `scan()` + `read()`; package/resource mounts may expose `exportFiles()` to stream every regular file as raw bytes without changing the Markdown-only knowledge index. Entries from a skill mount carry a preservation bit, so package bytes bypass note-oriented presentation transforms even when an embedded host configures a non-default mount prefix. `scope` reuses the visibility axis (#78): the default `user` keeps only user-visible classes — the dot-namespaced agent-memory and skill mounts drop out, and "download my notes" does not scoop up private agent state; `all` is a full **space export** (all mounts, with paths carrying the mount prefix), including complete installed Agent Skills packages under `.notarium/skills` by default. It is not a disaster backup of accounts, grants, history or jobs. The bare engine does not enforce visibility for list/search/graph (the read-model does that), but export is a deliberate bulk read that bypasses the read-model snapshot, so it applies scope itself. For export, `CachedStore` is a pure passthrough to the engine (the source-of-truth files are read, not a derived snapshot); the method is assigned only when the engine carries it, so `store.exportNotes` is falsy exactly when the engine cannot do it — the signal on which the host returns a 404.
 
+Adapter-owned recovery state is never an authored space resource. In particular,
+LocalFS excludes `.notarium-fs-ops/` from `exportFiles()` even for `scope=all`;
+the system disaster backup preserves that namespace together with causal metadata
+instead (see [backup.md](backup.md)).
+
+Revision blobs are also outside the user-export contract. History `contentMode:source`
+is an inspection surface for one retained opaque state, not a download/export channel;
+an export carries current authored files only. Importing that ZIP therefore creates or
+updates current notes through normal writes—it does not replay historical ids, receipts,
+restore operations or journal order.
+
 `InMemoryStore` (the engine of the e2e fake) has no files and reconstructs the file from the snapshot (frontmatter `notarium-id`/`title`/`tags`/`summary` + `# title` + body) — this mirrors the FORM that the real engine returns, not byte-for-byte identity: the fake is a specification of behavior, and the contract holds (one entry per note, `path` = `filePath`, `content` a parseable file).
 
 The parameters are shared across both paths: `frontmatter=keep|strip` (`keep`, the default, ships each file as is; `strip` cuts the YAML block from ordinary note `.md` entries only — a clean copy for reading, lossy, losing the `notarium-id` and the tags; every member of a skill package, including `SKILL.md` and Markdown resources, remains byte-identical so the package stays valid; non-Markdown bytes are never decoded or transformed), `scope=user|all` (`user`, the default — only the user's notes; `all` adds hidden agent-memory and complete skill-package mounts), `folder=<path>` (narrow down to a subtree; the path is untrusted and is normalized by `safeRelPath`).

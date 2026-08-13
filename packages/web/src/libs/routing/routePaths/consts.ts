@@ -93,4 +93,6 @@ export const FEED_URL_PARAMS = {
 export const TRASH_URL_PARAMS = {
   /** Which sub-view (all / notes / spaces); absent = 'all'. */
   tab: 'tab',
+  /** Recovery outcome filter; absent = every deleted item. */
+  availability: 'availability',
 } as const

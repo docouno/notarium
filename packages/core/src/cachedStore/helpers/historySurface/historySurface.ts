@@ -4,6 +4,7 @@ import type {
   NoteContent,
   ReadScope,
   RestoreInput,
+  TrashAvailabilityFilter,
   TrashEntry,
   WriteResult,
 } from '../../../knowledgeStore'
@@ -20,9 +21,12 @@ import {
   type Revision,
   REVISION_KIND,
   type RevisionDetail,
+  revisionRestoreAvailability,
 } from '../../../knowledgeStore'
+import { normAliases } from '../../../libs/aliases'
+import { frontmatterEntryValue, parseLogicalNoteState } from '../../../libs/markdown'
 import { MutationCoordinator } from '../../../libs/mutationCoordinator'
-import { directoryOf } from '../../../libs/path'
+import { slugify } from '../../../libs/slug'
 import { classesForScope, NOTE_CLASSES } from '../../../visibility'
 import { TRASH_MUTATION_PREFIX, trashMutationPath } from '../../consts'
 import type { HistoryHost } from './types'
@@ -155,18 +159,31 @@ export class HistorySurface {
     if (rev.content == null) {
       throw revisionHasNoContent(input.revisionId)
     }
+    const state = rev.logicalState ? parseLogicalNoteState(rev.logicalState) : null
     // No directory: restore keeps the note where it lives — passing directoryOf(filePath) would be
-    // space-relative and double-prefix a note in a prefixed mount (e.g. agent-memory). A title
-    // change is still an in-folder rename. The revision's CUSTOM slug travels back too (a
-    // journal column now): a rollback re-sets that revision's slug so inbound [[old-slug]] resolve
-    // again. NON-destructive: a string SETS it, null (no custom slug / a legacy row) LEAVES the
-    // live slug untouched — a rollback never silently clears one.
+    // space-relative and double-prefix a note in a prefixed mount (e.g. agent-memory). preservePath
+    // is stronger than the ordinary rename path: rolling the historical title back must not move
+    // the current file. Complete rows replace the WHOLE authored frontmatter set atomically. A
+    // legacy row has only the old fixed projections, so it deliberately keeps unknown live fields.
     const result = await this.host.write({
-      title: rev.title,
-      content: rev.content,
-      tags: rev.tags,
-      slug: rev.slug ?? undefined,
+      title: state?.title ?? rev.title,
+      content: state?.body ?? rev.content,
+      ...(state
+        ? {
+            frontmatter: state.frontmatter,
+            frontmatterMode: 'replace' as const,
+          }
+        : {
+            tags: rev.tags,
+            // Legacy rows still know the old fixed slug projection. null is a
+            // definitive historical clear, not an unknown channel to carry live.
+            slug: rev.slug ?? '',
+            // Aliases were not captured by legacy rows. Suppress ordinary
+            // rename-history synthesis so the live authored entry survives raw.
+            preserveAliases: true,
+          }),
       originalId: input.id,
+      preservePath: true,
       versionToken: input.versionToken,
       principal: input.principal,
       journal: { kind: REVISION_KIND.restore, sourceRevisionId: rev.id },
@@ -183,11 +200,17 @@ export class HistorySurface {
     offset: number
     limit: number
     q?: string
+    availability?: TrashAvailabilityFilter
     scope?: ReadScope
-  }): Promise<{ items: TrashEntry[]; total: number; restorableTotal: number }> {
+  }): Promise<{
+    items: TrashEntry[]
+    total: number
+    restorableTotal: number
+    partialTotal: number
+  }> {
     const excludeClasses = this.hiddenClassesFor(opts.scope ?? READ_SCOPE.user)
-    const { items, total, restorableTotal } = await this.host.journal.listTrashed(
-      { offset: opts.offset, limit: opts.limit, q: opts.q },
+    const { items, total, restorableTotal, partialTotal } = await this.host.journal.listTrashed(
+      { offset: opts.offset, limit: opts.limit, q: opts.q, availability: opts.availability },
       excludeClasses,
     )
     const entries: TrashEntry[] = items.map((rev) => ({
@@ -201,8 +224,10 @@ export class HistorySurface {
       principal: rev.principal,
       revisionId: rev.id,
       contentHash: rev.contentHash,
+      restoreAvailability: revisionRestoreAvailability(rev),
+      stateFormat: rev.stateFormat,
     }))
-    return { items: entries, total, restorableTotal }
+    return { items: entries, total, restorableTotal, partialTotal }
   }
 
   async restoreFromTrash(id: string, opts?: { principal?: string }): Promise<WriteResult> {
@@ -232,20 +257,25 @@ export class HistorySurface {
       throw revisionHasNoContent(tomb.id)
     }
 
-    // Aim restore at the note's last folder (from the identity tombstone).
-    // WriteEngine claims the destination path, checks collisions, and revives
+    const state = detail.logicalState ? parseLogicalNoteState(detail.logicalState) : null
+    // Aim restore at the note's complete last path (from the identity tombstone).
+    // WriteEngine claims that exact destination, checks collisions, and revives
     // the forced id inside the same mutation checkpoint.
     const lastPath = this.host.identity.recordFor(id)?.filePath
-    const dir = (lastPath ? directoryOf(lastPath) : '').replace(/^\/+|\/+$/g, '')
     const result = await this.host.writeAdmitted({
-      title: tomb.title,
-      content: detail.content,
-      tags: tomb.tags,
-      // The note's custom slug at deletion, re-set from the tombstone so an
-      // undelete keeps its [[old-slug]] resolving instead of dropping to slug(title).
-      // null (legacy / no custom slug) → '' = the title default.
-      slug: tomb.slug ?? '',
-      directory: dir,
+      title: state?.title ?? tomb.title,
+      content: state?.body ?? detail.content,
+      ...(state
+        ? {
+            frontmatter: state.frontmatter,
+            frontmatterMode: 'replace' as const,
+          }
+        : {
+            tags: tomb.tags,
+            // Legacy rows only: the fixed custom slug column is all we have.
+            slug: tomb.slug ?? '',
+          }),
+      restorePath: lastPath,
       id, // force the same note-id into the frontmatter
       targetClass: (tomb.class ?? undefined) as NoteClass | undefined,
       principal: opts?.principal,
@@ -312,14 +342,16 @@ export class HistorySurface {
 
       for (;;) {
         const { items } = await this.host.journal.listTrashed(
-          { offset: scanOffset, limit: PAGE, q: opts.q },
+          {
+            offset: scanOffset,
+            limit: PAGE,
+            q: opts.q,
+            availability: opts.onlyRestorable ? 'restorable' : undefined,
+          },
           excludeClasses,
         )
 
         for (const r of items) {
-          if (opts.onlyRestorable && r.contentHash == null) {
-            continue
-          }
           ids.push(r.noteId)
         }
         scanOffset += items.length
@@ -361,6 +393,7 @@ export class HistorySurface {
     ids?: readonly string[]
     all?: boolean
     q?: string
+    availability?: TrashAvailabilityFilter
     scope?: ReadScope
   }): Promise<{ purged: number }> {
     if (!opts.ids?.length && !opts.all) {
@@ -377,6 +410,7 @@ export class HistorySurface {
     ids?: readonly string[]
     all?: boolean
     q?: string
+    availability?: TrashAvailabilityFilter
     scope?: ReadScope
   }): Promise<{ purged: number }> {
     let ids: string[]
@@ -391,7 +425,7 @@ export class HistorySurface {
 
       for (;;) {
         const { items } = await this.host.journal.listTrashed(
-          { offset: ids.length, limit: PAGE, q: opts.q },
+          { offset: ids.length, limit: PAGE, q: opts.q, availability: opts.availability },
           excludeClasses,
         )
 
@@ -410,28 +444,29 @@ export class HistorySurface {
     }
     // Revalidate under the trash fence. purgeNotes erases a note's whole
     // journal, so a stale selection must never purge a restored note.
-    const purgable: string[] = []
+    const purgable = new Map<string, string>()
 
     for (const id of ids) {
       const tomb = await this.host.journal.latestFor(id)
 
       if (tomb && tomb.kind === REVISION_KIND.delete && tomb.space === this.host.space) {
-        purgable.push(id)
+        purgable.set(id, tomb.id)
       }
     }
-    if (!purgable.length) {
+    if (!purgable.size) {
       return { purged: 0 }
     }
-    await this.host.journal.purge(purgable)
-    return { purged: purgable.length }
+    const purged = await this.host.journal.purge([...purgable.keys()], purgable)
+    return { purged: purged.length }
   }
 
   /** The read-only last state of a DELETED note for the reader's "deleted"
-   *  banner: title/body/tags from the delete-tombstone + its CAS blob. null when
+   *  banner: full logical state from a current tombstone, partial projections from legacy. null when
    *  the note isn't actually trashed (newest revision isn't a delete) or there is
-   *  no journal — the caller then rethrows the real not-found. `restorable` is
-   *  false for an honest gap (no body blob); `versionToken` is empty (no live note
-   *  to save against — the reader hides editing). */
+   *  no journal — the caller then rethrows the real not-found. `restorable` only
+   *  describes whether historical content can be inspected; restoreAvailability
+   *  is the authoritative publication predicate. `versionToken` is empty (no live
+   *  note to save against — the reader hides editing). */
   async deletedNoteView(id: string): Promise<NoteContent | null> {
     let tomb: Revision | null
 
@@ -447,18 +482,48 @@ export class HistorySurface {
       tomb.contentHash != null
         ? await this.host.journal.detail(id, tomb.id).catch(() => null)
         : null
+    const state = detail?.logicalState ? parseLogicalNoteState(detail.logicalState) : null
+    const frontmatter: Record<string, unknown> = {}
+
+    for (const entry of state?.frontmatter ?? []) {
+      if (!entry.key) {
+        continue
+      }
+      const value = frontmatterEntryValue(entry)
+
+      if (value == null) {
+        delete frontmatter[entry.key]
+      } else {
+        frontmatter[entry.key] = value
+      }
+    }
+    if (!state) {
+      frontmatter.tags = tomb.tags
+      if (tomb.slug) {
+        frontmatter.slug = tomb.slug
+      }
+    }
+    const aliases = normAliases(frontmatter.aliases)
+    const slug =
+      typeof frontmatter.slug === 'string' ? slugify(frontmatter.slug) || undefined : undefined
+
     return {
       id,
-      title: tomb.title,
+      title: state?.title ?? tomb.title,
       class: (tomb.class ?? undefined) as NoteClass | undefined,
       filePath: this.host.identity.recordFor(id)?.filePath ?? undefined,
-      content: detail?.content ?? '',
-      frontmatter: { tags: tomb.tags },
+      content: state?.body ?? detail?.content ?? '',
+      frontmatter,
+      logicalState: detail?.logicalState ?? undefined,
+      documentState: detail?.documentState ?? undefined,
+      ...(aliases?.length ? { aliases } : {}),
+      ...(slug ? { slug } : {}),
       versionToken: '',
       deleted: true,
       deletedAt: tomb.createdAt,
       deletedByPrincipal: tomb.principal,
       restorable: tomb.contentHash != null,
+      restoreAvailability: revisionRestoreAvailability(tomb),
     }
   }
 

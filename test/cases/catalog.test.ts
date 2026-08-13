@@ -157,6 +157,35 @@ describe('seed catalog (#175)', () => {
     }
   })
 
+  it('trash-recovery keeps availability states and a runtime path conflict distinct', () => {
+    const world = buildCaseWorld('trash-recovery', { now: DEFAULT_NOW })
+    const createdAtPath = world.events.filter(
+      (event) => event.op === 'create' && event.path === 'shared/weekly-status.md',
+    )
+    const states = world.revisionStates ?? []
+
+    expect(createdAtPath).toHaveLength(2)
+    expect(states.map((revision) => revision.state.kind)).toEqual([
+      'legacy',
+      'document',
+      'document',
+      'gap',
+    ])
+    expect(
+      world.events.find(
+        (event) => event.op === 'create' && event.path === 'imports/imported-helper-source.md',
+      ),
+    ).toBeDefined()
+    expect(
+      world.events.filter(
+        (event) => event.op === 'create' && event.path.startsWith('recoverable/meeting-note-'),
+      ),
+    ).toHaveLength(24)
+    expect(world.spaces).toContainEqual(
+      expect.objectContaining({ slug: 'closed-project', archived: true }),
+    )
+  })
+
   it.each(NAMES)('"%s": every event references a declared space', (name) => {
     const w = buildCaseWorld(name, { scale: 0.1 })
     const spaces = new Set(w.spaces.map((s) => s.slug))

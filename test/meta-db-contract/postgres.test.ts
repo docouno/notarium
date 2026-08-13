@@ -10,12 +10,14 @@ import {
 import { PgMetaDb } from '../../packages/server/src/services/metaDb/pgMetaDb'
 import { describeAgentDeltaCursorsContract } from './agentDeltaCursorsContract'
 import { describeAgentSessionsContract } from './agentSessionsContract'
+import { describeCausalMetadataContract } from './causalMetadataContract'
 import { describeFavoritesContract } from './favoritesContract'
 import { describeGatewayStateContract } from './gatewayStateContract'
 import { describeIdentityPersistenceContract } from './identityPersistenceContract'
 import { createPostgresTestSchema, describePostgres } from './postgresHarness'
 import { describeRevisionPersistenceContract } from './revisionPersistenceContract'
 import { describeSessionAuditContract } from './sessionAuditContract'
+import { describeSpaceLifecycleWriterContract } from './spaceLifecycleWriterContract'
 
 const advisoryWaiterCount = async (
   testSchema: Awaited<ReturnType<typeof createPostgresTestSchema>>,
@@ -120,6 +122,7 @@ const revision = (noteId: string, over: Partial<RevisionInput> = {}): RevisionIn
   entryRole: 'origin',
   principal: 'ui',
   contentHash: `${noteId}-hash`,
+  stateFormat: null,
   title: noteId,
   class: 'user-doc',
   slug: null,
@@ -181,6 +184,11 @@ const rawAppendWithoutApplicationLocks = async (
 }
 
 describePostgres('live Postgres driver', () => {
+  describeSpaceLifecycleWriterContract('Postgres', async () => {
+    const testSchema = await createPostgresTestSchema('space_lifecycle_writers')
+    return { db: testSchema.db, teardown: () => testSchema.teardown() }
+  })
+
   it('round-trips a role target through all three reusable context facets', async () => {
     const testSchema = await createPostgresTestSchema('role_context_facets')
     const target = 'project:project%3Aone:research'
@@ -342,6 +350,32 @@ describePostgres('live Postgres driver', () => {
         await peer.close()
         await testSchema.teardown()
       },
+    }
+  })
+
+  describeCausalMetadataContract('Postgres', async () => {
+    const testSchema = await createPostgresTestSchema('causal_metadata_contract')
+    return {
+      operations: testSchema.db.restoreOperations,
+      lifecycle: testSchema.db.spaceLifecycle,
+      outbox: testSchema.db.causalOutbox,
+      installation: testSchema.db.installationGeneration,
+      ownerProofs: testSchema.db.ownerProofs,
+      revisions: testSchema.db.revisions,
+      terminal: testSchema.db.restoreTerminal,
+      setAddress: async (noteId, space, addressRevision) => {
+        await testSchema.db.identity.claimMany([
+          {
+            id: noteId,
+            filePath: `address-${addressRevision}.md`,
+            space,
+            createdAt: null,
+            materialized: true,
+            deletedAt: null,
+          },
+        ])
+      },
+      teardown: testSchema.teardown,
     }
   })
 
@@ -815,8 +849,8 @@ describePostgres('live Postgres driver', () => {
         notesDir: 'session-purge',
         aliases: [],
         createdAt: '2026-08-04T10:00:00Z',
-        archivedAt: '2026-08-04T11:00:00Z',
-        archivedBy: 'user:admin',
+        archivedAt: null,
+        archivedBy: null,
       })
       await testSchema.db.projects.upsert({
         id: projectId,
@@ -843,6 +877,23 @@ describePostgres('live Postgres driver', () => {
       })
       const scope = { owner: 'alice', session: { id: sessionId, parentId: null } }
       await testSchema.db.agentDeltaCursors.advance(scope, projectId, '10', '2026-08-04T10:01:00Z')
+      await testSchema.db.spaces.upsert({
+        id: spaceId,
+        slug: 'session-purge',
+        displayName: 'Session purge',
+        notesDir: 'session-purge',
+        aliases: [],
+        createdAt: '2026-08-04T10:00:00Z',
+        archivedAt: '2026-08-04T11:00:00Z',
+        archivedBy: 'user:admin',
+      })
+      await testSchema.db.spaceLifecycle.transition({
+        space: spaceId,
+        expectedPhases: ['active'],
+        phase: 'archived',
+        changedAt: '2026-08-04T11:00:00Z',
+        changedBy: 'user:admin',
+      })
 
       await blocker.query('BEGIN')
       await blocker.query(
@@ -895,8 +946,8 @@ describePostgres('live Postgres driver', () => {
         notesDir: 'gone',
         aliases: ['retired-gone', 'shared-retired'],
         createdAt: '2026-08-04T10:00:00Z',
-        archivedAt: '2026-08-04T11:00:00Z',
-        archivedBy: 'user:admin',
+        archivedAt: null,
+        archivedBy: null,
       })
       await testSchema.db.spaces.upsert({
         id: keep,
@@ -940,6 +991,23 @@ describePostgres('live Postgres driver', () => {
            FROM unnest($1::text[]) AS legacy_key`,
         [legacyKeys],
       )
+      await testSchema.db.spaces.upsert({
+        id: victim,
+        slug: 'gone',
+        displayName: 'Gone',
+        notesDir: 'gone',
+        aliases: ['retired-gone', 'shared-retired'],
+        createdAt: '2026-08-04T10:00:00Z',
+        archivedAt: '2026-08-04T11:00:00Z',
+        archivedBy: 'user:admin',
+      })
+      await testSchema.db.spaceLifecycle.transition({
+        space: victim,
+        expectedPhases: ['active'],
+        phase: 'archived',
+        changedAt: '2026-08-04T11:00:00Z',
+        changedBy: 'user:admin',
+      })
 
       await testSchema.db.purgeSpace(victim)
 

@@ -28,7 +28,7 @@ type CrashPhase = 'before-publication' | 'after-publication' | 'after-detach'
  *  so the bytes left behind are exactly what an abrupt process stop would leave. */
 const crashMove = (
   root: string,
-  kind: 'rename' | 'replace',
+  kind: 'rename' | 'replace' | 'replace-entry',
   phase: CrashPhase,
   samePath = false,
 ): void => {
@@ -62,6 +62,15 @@ const crashMove = (
     const files = createLocalFsFiles(root)
     if (${JSON.stringify(kind)} === 'rename') {
       await files.renameIfAbsent('source.md', ${samePath ? "'source.md'" : "'target.md'"})
+    } else if (${JSON.stringify(kind)} === 'replace-entry') {
+      const observed = await files.observe('source.md')
+      if (observed.kind !== 'occupied') throw new Error('expected an occupied entry')
+      await files.publish({
+        kind: 'put',
+        path: 'source.md',
+        content: new TextEncoder().encode('app-final'),
+        expected: observed.claim,
+      })
     } else {
       await files.replaceIfAbsent(
         'source.md',
@@ -381,6 +390,8 @@ describe('localFs raw export', () => {
       'authored file',
     )
     await fs.writeFile(join(temp, 'SKILL.md'), 'partial')
+    await fs.mkdir(join(root, '.notarium-fs-ops', 'strict-private'), { recursive: true })
+    await fs.writeFile(join(root, '.notarium-fs-ops', 'strict-private', 'candidate'), 'private')
     await fs.writeFile(
       join(
         project,
@@ -734,6 +745,22 @@ describe('localFs pathname occupancy', () => {
     expect(await fs.readdir(root)).toEqual(['source.md'])
   })
 
+  it('rolls forward an occupied-entry replace stopped in the hidden-only window', async () => {
+    if (process.platform === 'win32') {
+      return
+    }
+    const root = await mkroot()
+    const source = join(root, 'source.md')
+    execFileSync('mkfifo', [source])
+    crashMove(root, 'replace-entry', 'after-detach', true)
+    await expect(fs.lstat(source)).rejects.toMatchObject({ code: 'ENOENT' })
+
+    const recovered = createLocalFsFiles(root)
+    await expect(recovered.read('source.md')).resolves.toBe('app-final')
+    expect((await fs.lstat(source)).isFile()).toBe(true)
+    expect(await fs.readdir(root)).toEqual(['source.md'])
+  })
+
   itProcess('preserves a foreign target that replaces an interrupted publication', async () => {
     const root = await mkroot()
     const target = join(root, 'target.md')
@@ -1005,6 +1032,39 @@ describe('localFs pathname occupancy', () => {
     expect(await fs.readdir(root)).toEqual(['source.md'])
   })
 
+  it('binds publication-claim verification to conditional remove', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+    const source = join(root, 'source.md')
+    const external = join(root, 'external.md')
+    const realRename = fs.rename.bind(fs)
+    let injected = false
+
+    await fs.writeFile(source, 'same bytes')
+    const observation = await files.observe!('source.md')
+
+    if (observation.kind !== 'present') {
+      throw new Error('expected present source observation')
+    }
+    await fs.writeFile(external, 'same bytes')
+    const externalInode = (await fs.stat(external, { bigint: true })).ino
+    vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+      if (!injected && String(from) === source && String(to).includes('.notarium-move-')) {
+        injected = true
+        await realRename(external, source)
+      }
+
+      return realRename(from, to)
+    })
+
+    await expect(
+      files.removeIfClaimed!('source.md', 'same bytes', observation.claim),
+    ).resolves.toBe(false)
+    expect(injected).toBe(true)
+    expect((await fs.stat(source, { bigint: true })).ino).toBe(externalInode)
+    await expect(files.read('source.md')).resolves.toBe('same bytes')
+  })
+
   it('bounds a visible recovery name for a maximum-length legal source basename', async () => {
     const root = await mkroot()
     const files = createLocalFsFiles(root)
@@ -1203,5 +1263,407 @@ describe('localFs pathname occupancy', () => {
     await expect(files.sameEntry!('source.md', 'source.md')).resolves.toBe(true)
     await expect(files.sameEntry!('source.md', 'same-entry.md')).resolves.toBe(false)
     await expect(files.sameEntry!('source.md', 'symlink.md')).resolves.toBe(false)
+  })
+
+  it('observes exact bytes, claim and mtime from one regular-file sample', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+    const source = Uint8Array.of(0xff, 0x00, 0x0d, 0x0a)
+
+    await fs.writeFile(join(root, 'opaque.bin'), source)
+    const first = await files.observe!('opaque.bin')
+
+    expect(first).toMatchObject({
+      kind: 'present',
+      claim: { kind: 'present' },
+      mtimeMs: expect.any(Number),
+    })
+    expect(first.kind === 'present' ? first.bytes : null).toEqual(source)
+
+    await fs.writeFile(join(root, 'opaque.bin'), Uint8Array.of(0xfe))
+    const second = await files.observe!('opaque.bin')
+
+    expect(second.kind).toBe('present')
+    expect(second.kind === 'present' && first.kind === 'present' && second.claim).not.toEqual(
+      first.kind === 'present' ? first.claim : null,
+    )
+  })
+
+  it('keeps absent and occupied non-regular observations distinct', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+
+    await expect(files.observe!('missing.md')).resolves.toMatchObject({
+      kind: 'absent',
+      claim: { kind: 'absent' },
+      mtimeMs: null,
+    })
+    await fs.symlink('missing.md', join(root, 'occupied.md'))
+    await expect(files.observe!('occupied.md')).resolves.toMatchObject({
+      kind: 'occupied',
+      claim: { kind: 'present' },
+      entryType: 'symlink',
+      mtimeMs: expect.any(Number),
+    })
+  })
+
+  it('publishes byte-safe creates and updates with operation-owned proof transitions', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+    const absent = await files.observe!('opaque.bin')
+
+    expect(absent.kind).toBe('absent')
+    if (absent.kind !== 'absent') {
+      return
+    }
+    const created = await files.publish!({
+      kind: 'put',
+      path: 'opaque.bin',
+      content: Uint8Array.of(0xff, 0x00),
+      expected: absent.claim,
+    })
+
+    expect(created).toMatchObject({
+      status: 'published',
+      candidateHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+      transitions: [
+        expect.objectContaining({
+          path: 'opaque.bin',
+          before: absent.claim,
+          mtimeMs: expect.any(Number),
+        }),
+      ],
+    })
+    const first = await files.observe!('opaque.bin')
+    expect(first.kind).toBe('present')
+    if (first.kind !== 'present') {
+      return
+    }
+    expect(created.status === 'published' ? created.transitions[0].after : null).toEqual(
+      first.claim,
+    )
+
+    const updated = await files.publish!({
+      kind: 'put',
+      path: 'opaque.bin',
+      content: Uint8Array.of(0xfe, 0x0d, 0x0a),
+      expected: first.claim,
+    })
+
+    expect(updated.status).toBe('published')
+    await expect(fs.readFile(join(root, 'opaque.bin'))).resolves.toEqual(
+      Buffer.from([0xfe, 0x0d, 0x0a]),
+    )
+  })
+
+  it('rejects stale publication claims without changing bytes', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+    await fs.writeFile(join(root, 'note.md'), 'first')
+    const first = await files.observe!('note.md')
+
+    expect(first.kind).toBe('present')
+    if (first.kind !== 'present') {
+      return
+    }
+    await fs.writeFile(join(root, 'note.md'), 'external')
+    await expect(
+      files.publish!({
+        kind: 'put',
+        path: 'note.md',
+        content: new TextEncoder().encode('ours'),
+        expected: first.claim,
+      }),
+    ).resolves.toEqual({ status: 'conflict' })
+    await expect(fs.readFile(join(root, 'note.md'), 'utf8')).resolves.toBe('external')
+  })
+
+  it('publishes a move against the complete source/target claim set', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+    await fs.writeFile(join(root, 'source.md'), Uint8Array.of(0xff))
+    const source = await files.observe!('source.md')
+    const target = await files.observe!('target.md')
+
+    expect(source.kind).toBe('present')
+    expect(target.kind).toBe('absent')
+    if (source.kind !== 'present' || target.kind !== 'absent') {
+      return
+    }
+    const result = await files.publish!({
+      kind: 'move-put',
+      sourcePath: 'source.md',
+      targetPath: 'target.md',
+      content: Uint8Array.of(0xfe),
+      expectedSource: source.claim,
+      expectedTarget: target.claim,
+    })
+
+    expect(result).toMatchObject({
+      status: 'published',
+      transitions: [
+        {
+          path: 'source.md',
+          before: source.claim,
+          after: expect.objectContaining({ kind: 'absent' }),
+          mtimeMs: null,
+        },
+        {
+          path: 'target.md',
+          before: target.claim,
+          after: expect.objectContaining({ kind: 'present' }),
+          mtimeMs: expect.any(Number),
+        },
+      ],
+    })
+    await expect(fs.lstat(join(root, 'source.md'))).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(fs.readFile(join(root, 'target.md'))).resolves.toEqual(Buffer.from([0xfe]))
+  })
+
+  it('atomically publishes one aggregate package proof', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+    const absent = await files.observe!('demo')
+
+    expect(absent.kind).toBe('absent')
+    if (absent.kind !== 'absent') {
+      return
+    }
+    const result = await files.publishPackageIfAbsent!({
+      rootPath: 'demo',
+      files: [
+        { path: 'SKILL.md', content: new TextEncoder().encode('manifest') },
+        { path: 'assets/icon.bin', content: Uint8Array.of(0xff, 0x00) },
+      ],
+      expectedRoot: absent.claim,
+    })
+
+    expect(result).toMatchObject({
+      status: 'published',
+      candidateHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+      transitions: expect.arrayContaining([
+        expect.objectContaining({ path: 'demo', before: absent.claim }),
+        expect.objectContaining({
+          path: 'demo/SKILL.md',
+          before: expect.objectContaining({ kind: 'absent' }),
+        }),
+        expect.objectContaining({
+          path: 'demo/assets/icon.bin',
+          before: expect.objectContaining({ kind: 'absent' }),
+        }),
+      ]),
+    })
+    await expect(fs.readFile(join(root, 'demo', 'assets', 'icon.bin'))).resolves.toEqual(
+      Buffer.from([0xff, 0x00]),
+    )
+    await expect(
+      files.publishPackageIfAbsent!({
+        rootPath: 'demo',
+        files: [{ path: 'SKILL.md', content: new TextEncoder().encode('rival') }],
+        expectedRoot: absent.claim,
+      }),
+    ).resolves.toEqual({ status: 'conflict' })
+  })
+})
+
+describe('localFs restart-durable strict publication', () => {
+  const stagedAbsent = async (root: string, operationId = 'restore-op') => {
+    const files = createLocalFsFiles(root)
+    const observed = await files.observe!('note.md')
+
+    expect(observed.kind).toBe('absent')
+    if (observed.kind !== 'absent') {
+      throw new Error('expected an absent target')
+    }
+    const result = await files.strictPublication!.stage({
+      operationId,
+      binding: 'binding-a',
+      path: 'note.md',
+      content: new TextEncoder().encode('candidate'),
+      expected: observed.claim,
+    })
+
+    expect(result).toMatchObject({ status: 'accepted', state: { status: 'staged' } })
+    return files
+  }
+
+  it('keeps an immutable idempotent stage and revalidates its durable receipt across reopen', async () => {
+    const root = await mkroot()
+    const files = await stagedAbsent(root)
+
+    await expect(
+      createLocalFsFiles(root).strictPublication!.inspect('restore-op', 'binding-a'),
+    ).resolves.toMatchObject({ status: 'staged', stage: { candidateHash: expect.any(String) } })
+    await expect(
+      files.strictPublication!.stage({
+        operationId: 'restore-op',
+        binding: 'binding-a',
+        path: 'note.md',
+        content: new TextEncoder().encode('different'),
+        expected: { kind: 'absent', value: 'different' },
+      }),
+    ).resolves.toEqual({ status: 'idempotency-conflict' })
+
+    const published = await files.strictPublication!.publish('restore-op', 'binding-a')
+
+    expect(published).toMatchObject({
+      status: 'published',
+      receipt: {
+        restartDurable: true,
+        transitions: [
+          {
+            path: 'note.md',
+            before: expect.objectContaining({ kind: 'absent' }),
+            after: expect.objectContaining({ kind: 'present' }),
+          },
+        ],
+      },
+    })
+    if (published.status !== 'published') {
+      throw new Error('expected strict publication')
+    }
+    await fs.writeFile(join(root, 'note.md'), 'external in-place edit')
+    await expect(
+      createLocalFsFiles(root).strictPublication!.inspect('restore-op', 'binding-a'),
+    ).resolves.toMatchObject({
+      status: 'failed-recoverable',
+      reason: 'published candidate no longer owns the public pathname',
+    })
+    await expect(files.strictPublication!.discard('restore-op', 'binding-a')).resolves.toBe(true)
+    await expect(fs.readFile(join(root, 'note.md'), 'utf8')).resolves.toBe('external in-place edit')
+  })
+
+  it('rejects a durable receipt after an atomic foreign replacement', async () => {
+    const root = await mkroot()
+    const files = await stagedAbsent(root, 'replaced-receipt')
+
+    await expect(
+      files.strictPublication!.publish('replaced-receipt', 'binding-a'),
+    ).resolves.toMatchObject({ status: 'published' })
+    const foreign = join(root, 'foreign.md')
+    await fs.writeFile(foreign, 'candidate')
+    await fs.rename(foreign, join(root, 'note.md'))
+
+    await expect(
+      createLocalFsFiles(root).strictPublication!.inspect('replaced-receipt', 'binding-a'),
+    ).resolves.toMatchObject({
+      status: 'failed-recoverable',
+      reason: 'published candidate no longer owns the public pathname',
+    })
+  })
+
+  it('recovers a lost acknowledgement from private publication evidence', async () => {
+    const root = await mkroot()
+    const files = await stagedAbsent(root, 'lost-ack')
+    const realLink = fs.link.bind(fs)
+
+    vi.spyOn(fs, 'link').mockImplementation(async (source, target) => {
+      if (String(target).endsWith('/receipt.json')) {
+        throw errno('EIO')
+      }
+
+      return realLink(source, target)
+    })
+    await expect(files.strictPublication!.publish('lost-ack', 'binding-a')).rejects.toMatchObject({
+      code: 'EIO',
+    })
+    vi.restoreAllMocks()
+
+    const resumed = await createLocalFsFiles(root).strictPublication!.publish(
+      'lost-ack',
+      'binding-a',
+    )
+
+    expect(resumed).toMatchObject({ status: 'published', receipt: { restartDurable: true } })
+    await expect(fs.readFile(join(root, 'note.md'), 'utf8')).resolves.toBe('candidate')
+  })
+
+  it('replaces a claimed file while preserving its open incarnation as recovery evidence', async () => {
+    const root = await mkroot()
+    await fs.writeFile(join(root, 'note.md'), 'original')
+    const files = createLocalFsFiles(root)
+    const observed = await files.observe!('note.md')
+
+    expect(observed.kind).toBe('present')
+    if (observed.kind !== 'present') {
+      return
+    }
+    const openOriginal = await fs.open(join(root, 'note.md'), 'r')
+
+    try {
+      await files.strictPublication!.stage({
+        operationId: 'replace-op',
+        binding: 'binding-a',
+        path: 'note.md',
+        content: new TextEncoder().encode('restored'),
+        expected: observed.claim,
+      })
+      const published = await files.strictPublication!.publish('replace-op', 'binding-a')
+
+      expect(published.status).toBe('published')
+      await expect(fs.readFile(join(root, 'note.md'), 'utf8')).resolves.toBe('restored')
+      await expect(openOriginal.readFile({ encoding: 'utf8' })).resolves.toBe('original')
+      const [stageDir] = await fs.readdir(join(root, '.notarium-fs-ops'))
+      await expect(
+        fs.readFile(join(root, '.notarium-fs-ops', stageDir!, 'original-snapshot'), 'utf8'),
+      ).resolves.toBe('original')
+    } finally {
+      await openOriginal.close()
+    }
+  })
+
+  it('never overwrites an external creator after detaching the claimed source', async () => {
+    const root = await mkroot()
+    await fs.writeFile(join(root, 'note.md'), 'original')
+    const files = createLocalFsFiles(root)
+    const observed = await files.observe!('note.md')
+
+    expect(observed.kind).toBe('present')
+    if (observed.kind !== 'present') {
+      return
+    }
+    await files.strictPublication!.stage({
+      operationId: 'racing-creator',
+      binding: 'binding-a',
+      path: 'note.md',
+      content: new TextEncoder().encode('restored'),
+      expected: observed.claim,
+    })
+    const realLink = fs.link.bind(fs)
+
+    vi.spyOn(fs, 'link').mockImplementation(async (source, target) => {
+      if (String(source).endsWith('/publication') && String(target) === join(root, 'note.md')) {
+        await fs.writeFile(target, 'external', { flag: 'wx' })
+      }
+
+      return realLink(source, target)
+    })
+    const result = await files.strictPublication!.publish('racing-creator', 'binding-a')
+
+    expect(result).toMatchObject({
+      status: 'failed-recoverable',
+      recoveryPaths: expect.arrayContaining([
+        expect.stringContaining('original-snapshot'),
+        expect.stringContaining('detached-original'),
+      ]),
+    })
+    await expect(fs.readFile(join(root, 'note.md'), 'utf8')).resolves.toBe('external')
+    await expect(files.strictPublication!.discard('racing-creator', 'binding-a')).resolves.toBe(
+      false,
+    )
+  })
+
+  it('quarantines a corrupt stage instead of guessing its recovery state', async () => {
+    const root = await mkroot()
+    const files = await stagedAbsent(root, 'corrupt-op')
+    const [stageDir] = await fs.readdir(join(root, '.notarium-fs-ops'))
+    await fs.writeFile(join(root, '.notarium-fs-ops', stageDir!, 'header.json'), '{}')
+
+    await expect(files.strictPublication!.inspect('corrupt-op', 'binding-a')).rejects.toMatchObject(
+      { code: 'STRICT_STAGE_CORRUPT' },
+    )
+    expect(await fs.readdir(join(root, '.notarium-fs-ops'))).toEqual([
+      expect.stringMatching(/^quarantine-/),
+    ])
   })
 })

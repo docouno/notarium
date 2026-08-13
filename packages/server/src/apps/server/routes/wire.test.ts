@@ -1,70 +1,186 @@
 import { describe, expect, it } from 'vitest'
-import type { GraphHealth } from '@notarium/core'
 
-import { graphHealthToWire } from './wire'
+import { NoteDetailResponseSchema, NoteRevisionDetailResponseSchema } from '@notarium/contract'
+import {
+  analyzeDocumentState,
+  type NoteContent,
+  type RevisionDetail,
+  sha256Hex,
+} from '@notarium/core'
 
-// graphHealthToWire caps the edge ROW list so a huge base never ships thousands of
-// rows to a summary card — but the headline counts stay exact, and former-name edges
-// (the card's content) must never be starved out of the cap by slug alternates.
+import { noteDetailToWire, revisionDetailToWire } from './wire'
 
-const edge = (
-  id: number,
-  via: GraphHealth['edges'][number]['via'],
-): GraphHealth['edges'][number] => ({
-  source: { id: `s${id}`, title: `S${id}` },
-  target: { id: `t${id}`, title: `T${id}` },
-  via,
+const baseRevision = (overrides: Partial<RevisionDetail> = {}): RevisionDetail => ({
+  id: 'revision-1',
+  noteId: 'note-1',
+  space: 'space-1',
+  baseRevisionId: null,
+  theirRevisionId: null,
+  sourceRevisionId: null,
+  kind: 'write',
+  entryRole: 'origin',
+  principal: 'ui',
+  contentHash: 'hash',
+  semanticFingerprint: null,
+  restoreSafety: null,
+  stateFormat: null,
+  title: 'State',
+  slug: null,
+  class: 'user-doc',
+  tags: [],
+  createdAt: '2026-08-12T00:00:00.000Z',
+  charsAdded: null,
+  charsRemoved: null,
+  content: 'body\n',
+  logicalState: null,
+  documentState: null,
+  ...overrides,
 })
 
-describe('graphHealthToWire (#100 phase 5)', () => {
-  it('keeps headline counts exact while capping the edge list, sorting former-name edges first', () => {
-    // 120 slug edges ahead of 30 note-alias edges: a naive head-slice would ship
-    // 100 slug rows and DROP every stale edge the card actually renders.
-    const slugs = Array.from({ length: 120 }, (_, i) => edge(i, 'slug'))
-    const stale = Array.from({ length: 30 }, (_, i) => edge(1000 + i, 'note-alias'))
-    const h: GraphHealth = {
-      totalLinks: 400,
-      staleNamed: 30,
-      via: { slug: 120, noteAlias: 30, folderAlias: 0 },
-      edges: [...slugs, ...stale],
-      ghosts: [],
-    }
-    const wire = graphHealthToWire(h)
-
-    // Counts reflect the FULL graph, untouched by the cap.
-    expect(wire.staleNamed).toBe(30)
-    expect(wire.via).toEqual({ slug: 120, noteAlias: 30, folderAlias: 0 })
-    // The row list is capped…
-    expect(wire.edges).toHaveLength(100)
-    // …but ALL 30 former-name edges survived (sorted ahead of slug alternates).
-    expect(wire.edges.filter((e) => e.via === 'note-alias')).toHaveLength(30)
+const parseWire = (revision: RevisionDetail, strictRestoreAvailable = true) =>
+  NoteRevisionDetailResponseSchema.parse({
+    ...revisionDetailToWire(revision, strictRestoreAvailable),
+    author: null,
   })
 
-  it('passes a small graph through verbatim (no truncation, order preserved)', () => {
-    const h: GraphHealth = {
-      totalLinks: 3,
-      staleNamed: 1,
-      via: { slug: 1, noteAlias: 1, folderAlias: 0 },
-      edges: [edge(1, 'note-alias'), edge(2, 'slug')],
-      ghosts: [
-        {
-          id: 'ghost:x',
-          title: 'X',
-          target: 'x',
-          refCount: 1,
-          sources: [{ id: 's9', title: 'S9', folder: '' }],
-        },
-      ],
-    }
-    const wire = graphHealthToWire(h)
-    expect(wire.edges).toHaveLength(2)
-    expect(wire.edges[0].via).toBe('note-alias') // stale-first ordering is stable
-    expect(wire.ghosts[0]).toEqual({
-      id: 'ghost:x',
-      title: 'X',
-      target: 'x',
-      refCount: 1,
-      sources: [{ id: 's9', title: 'S9', folder: '' }],
+describe('revision detail wire', () => {
+  it('serves exact authored Markdown separately from its readable body', async () => {
+    const source = new TextEncoder().encode(
+      '---\n# authored comment\ntitle: Historical\nplugin: keep\n---\nbody  \n',
+    )
+    const state = analyzeDocumentState({ source, pathFallbackTitle: 'state' })
+    const wire = parseWire(
+      baseRevision({
+        contentHash: await sha256Hex(source),
+        semanticFingerprint: state.semanticFingerprint,
+        restoreSafety: state.restoreSafety.status,
+        stateFormat: state.format,
+        content: state.projection?.body ?? null,
+        documentState: state,
+      }),
+    )
+
+    expect(wire).toMatchObject({
+      contentMode: 'markdown',
+      content: 'body  \n',
+      snapshot: new TextDecoder().decode(source),
+      restoreAvailability: 'full',
+      stateFormat: 'markdown-v2',
     })
+  })
+
+  it('serves opaque source as bytes and never as Markdown content', async () => {
+    const source = Uint8Array.from([0xff, 0x00, 0xfe, 0x61])
+    const state = analyzeDocumentState({ source, pathFallbackTitle: 'opaque' })
+    const wire = parseWire(
+      baseRevision({
+        contentHash: await sha256Hex(source),
+        semanticFingerprint: state.semanticFingerprint,
+        restoreSafety: state.restoreSafety.status,
+        stateFormat: state.format,
+        content: null,
+        documentState: state,
+      }),
+    )
+
+    expect(wire).toEqual(
+      expect.objectContaining({
+        contentMode: 'source',
+        content: null,
+        snapshot: null,
+        source: { encoding: 'base64', data: Buffer.from(source).toString('base64') },
+        restoreAvailability: 'opaque',
+        stateFormat: 'opaque-v1',
+      }),
+    )
+  })
+
+  it('distinguishes an honest gap from missing strict-restore capability', () => {
+    const gap = parseWire(
+      baseRevision({ contentHash: null, content: null, stateFormat: null, restoreSafety: null }),
+    )
+    const legacyWithoutCapability = parseWire(baseRevision(), false)
+
+    expect(gap).toMatchObject({
+      contentMode: 'gap',
+      content: null,
+      snapshot: null,
+      restoreAvailability: 'gap',
+    })
+    expect(legacyWithoutCapability).toMatchObject({
+      contentMode: 'markdown',
+      restoreAvailability: 'capability-unavailable',
+    })
+  })
+})
+
+describe('deleted note detail wire', () => {
+  const deleted = (restoreAvailability: NonNullable<NoteContent['restoreAvailability']>) =>
+    ({
+      id: 'note-1',
+      title: 'Deleted state',
+      content: 'inspectable bytes',
+      frontmatter: {},
+      versionToken: '',
+      deleted: true,
+      deletedAt: '2026-08-12T00:00:00.000Z',
+      deletedByPrincipal: 'ui',
+      restorable: true,
+      restoreAvailability,
+    }) satisfies NoteContent
+
+  it('keeps inspectable bytes separate from intrinsically blocked restore', () => {
+    const wire = NoteDetailResponseSchema.parse(
+      noteDetailToWire(deleted('blocked'), 'main', null, true),
+    )
+
+    expect(wire).toMatchObject({
+      deleted: true,
+      restorable: true,
+      restoreAvailability: 'blocked',
+    })
+  })
+
+  it('projects missing strict publication capability without hiding the preview', () => {
+    const wire = NoteDetailResponseSchema.parse(
+      noteDetailToWire(deleted('full'), 'main', null, false),
+    )
+
+    expect(wire).toMatchObject({
+      deleted: true,
+      restorable: true,
+      restoreAvailability: 'capability-unavailable',
+    })
+  })
+
+  it.each([
+    {
+      name: 'literal UTF-8',
+      source: new TextEncoder().encode(
+        '---\nname: another-package\ndescription: mismatch\n---\n# literal **source**\n',
+      ),
+      expected: {
+        encoding: 'utf8' as const,
+        data: '---\nname: another-package\ndescription: mismatch\n---\n# literal **source**\n',
+      },
+    },
+    {
+      name: 'base64 for arbitrary bytes',
+      source: Uint8Array.from([0xff, 0x00, 0xfe, 0x61]),
+      expected: { encoding: 'base64' as const, data: '/wD+YQ==' },
+    },
+  ])('serves opaque deleted $name outside Markdown content', ({ source, expected }) => {
+    const documentState = analyzeDocumentState({
+      source,
+      role: 'skill-root',
+      pathFallbackTitle: 'opaque',
+      skillDirectoryName: 'opaque',
+    })
+    const wire = NoteDetailResponseSchema.parse(
+      noteDetailToWire({ ...deleted('opaque'), content: '', documentState }, 'main', null, true),
+    )
+
+    expect(documentState.format).toBe('opaque-v1')
+    expect(wire).toMatchObject({ content: '', source: expected, restoreAvailability: 'opaque' })
   })
 })

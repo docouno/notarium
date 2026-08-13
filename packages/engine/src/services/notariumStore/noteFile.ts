@@ -66,6 +66,10 @@ export type ParsedNote = {
   /** Parsed top-level frontmatter (scalars + lists); unmodelled lines are
    *  honestly absent here (but preserved by serializeNoteFile). */
   frontmatter: Record<string, unknown>
+  /** Exact raw entries behind the projection above. Consumers that protect or
+   * version the whole logical note must use these rather than reverse-engineer
+   * YAML from the deliberately-small Record view. */
+  frontmatterEntries: FrontmatterEntry[]
   /** The body as read() serves it: frontmatter split off, the storage-format
    *  title heading stripped. */
   body: string
@@ -177,6 +181,7 @@ export const parseNoteFile = (raw: string, path: string): ParsedNote => {
     idClaim: typeof claim === 'string' && isValidNoteId(claim) ? claim : null,
     createdAt: fmDate(frontmatter.created) ?? fmDate(frontmatter[CREATED_FALLBACK_FRONTMATTER_KEY]),
     frontmatter,
+    frontmatterEntries: fm?.entries ?? [],
     body: stripTitleHeading(afterFm.replace(/^\r?\n/, ''), title),
   }
 }
@@ -218,6 +223,9 @@ export type SerializeInput = {
    *  into typed channels and the `notarium-id` claim, so this never smuggles in an
    *  identity. */
   frontmatter?: readonly FrontmatterEntry[]
+  /** Full-state restore: incoming entries replace the authored set rather than
+   * merge under the live file. System title/id are still materialized below. */
+  frontmatterMode?: 'replace'
   /** The body the editor saved (may itself open with a frontmatter block —
    *  merged into the file's). */
   body: string
@@ -239,16 +247,24 @@ export const serializeNoteFile = ({
   id,
   createdAt,
   frontmatter,
+  frontmatterMode,
   body,
   existingRaw,
 }: SerializeInput): string => {
-  const existingEntries: FrontmatterEntry[] =
-    existingRaw != null ? (parseFrontmatterBlock(existingRaw)?.entries ?? []) : []
+  const replacing = frontmatterMode === 'replace'
+  const existingEntries: FrontmatterEntry[] = replacing
+    ? (frontmatter ?? []).map((entry) => ({ key: entry.key, lines: [...entry.lines] }))
+    : existingRaw != null
+      ? (parseFrontmatterBlock(existingRaw)?.entries ?? [])
+      : []
   // Inline frontmatter riding the body is another incoming metadata channel. Parse
   // it before the safety gate so a caller cannot bypass the raw-entry check by
   // placing `&anchor` / `*alias` in `body` instead of WriteInput.frontmatter.
   let cleanBody = body
-  const inline = parseFrontmatterBlock(body)
+  // A full-state restore already split its canonical snapshot into authored
+  // frontmatter and body. Reinterpreting a leading fenced block in that body
+  // would hoist user prose into metadata and make restore destructive.
+  const inline = replacing ? null : parseFrontmatterBlock(body)
 
   // Anchors and aliases are order-dependent, while this serializer merges by key
   // and always replaces at least `title`. Refuse them on every incoming channel,
@@ -257,9 +273,9 @@ export const serializeNoteFile = ({
   // This happens before candidate bytes are built, therefore the caller publishes
   // nothing.
   if (
-    frontmatterHasYamlNodeReferences(frontmatter) ||
+    (!replacing && frontmatterHasYamlNodeReferences(frontmatter)) ||
     frontmatterHasYamlNodeReferences(inline?.entries) ||
-    (existingRaw != null && frontmatterHasYamlNodeReferences(existingEntries))
+    (!replacing && existingRaw != null && frontmatterHasYamlNodeReferences(existingEntries))
   ) {
     throw new Error(YAML_NODE_REFERENCE_WRITE_ERROR)
   }
@@ -335,14 +351,16 @@ export const serializeNoteFile = ({
     entries.filter((entry) => !entry.key).map((entry) => entry.lines[0]),
   )
 
-  for (const e of frontmatter ?? []) {
-    if (e.key) {
-      put(e)
-    } else if (!existingKeyless.has(e.lines[0])) {
-      // Do not add this line to `existingKeyless`: two identical comments in the
-      // SAME source are two authored lines and both survive. Only an already
-      // occupied file suppresses a repeated line on a later re-import.
-      keyless.push(e)
+  if (!replacing) {
+    for (const e of frontmatter ?? []) {
+      if (e.key) {
+        put(e)
+      } else if (!existingKeyless.has(e.lines[0])) {
+        // Do not add this line to `existingKeyless`: two identical comments in the
+        // SAME source are two authored lines and both survive. Only an already
+        // occupied file suppresses a repeated line on a later re-import.
+        keyless.push(e)
+      }
     }
   }
 

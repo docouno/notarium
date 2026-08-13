@@ -1,13 +1,13 @@
 import type {
-  SaveResponse,
+  TrashAvailabilityFilter,
   TrashItem,
   TrashPurgeResponse,
   TrashResponse,
-  TrashRestoreManyResponse,
 } from '@notarium/contract'
 import { QUERY_KEY } from '@notarium/contract/query'
 import { saveResultView } from '../../libs/wire'
 import { req, sp } from './client'
+import { strictBulkRestore, strictRestore } from './restore'
 
 export const trashApi = {
   // ── trash (#79) — a view over the journal, space-scoped ─────────────────────
@@ -16,8 +16,19 @@ export const trashApi = {
    *  already camelCase domain shapes (#54). */
   trashGet: (
     space: string,
-    params: { offset?: number; limit?: number; q?: string } = {},
-  ): Promise<{ items: TrashItem[]; total: number; restorableTotal: number }> => {
+    params: {
+      offset?: number
+      limit?: number
+      q?: string
+      availability?: TrashAvailabilityFilter
+    } = {},
+  ): Promise<{
+    items: TrashItem[]
+    total: number
+    restorableTotal: number
+    partialTotal: number
+    restoreAvailable: boolean
+  }> => {
     const qs = new URLSearchParams()
 
     if (params.offset != null) {
@@ -29,30 +40,51 @@ export const trashApi = {
     if (params.q) {
       qs.set(QUERY_KEY.q, params.q)
     }
+    if (params.availability) {
+      qs.set(QUERY_KEY.availability, params.availability)
+    }
     const s = qs.toString()
     return req<TrashResponse>(`${sp(space)}/trash${s ? `?${s}` : ''}`)
   },
-  /** Resurrect a trashed note (same note-id, last folder). 409s on a path clash
-   *  (`note_already_exists`) — no silent clobber. */
-  trashRestore: (space: string, id: string) =>
-    req<SaveResponse>(`${sp(space)}/trash/restore`, {
-      method: 'POST',
-      body: JSON.stringify({ id }),
+  /** Resurrect a trashed note (same note-id, last folder). A path clash returns
+   *  `physical-target-changed` — no silent clobber. */
+  trashRestore: (space: string, id: string, revisionId: string) =>
+    strictRestore(`${sp(space)}/trash/restore`, `trash:${space}:${id}:${revisionId}`, {
+      id,
+      revisionId,
     }).then(saveResultView),
-  /** Best-effort batch undelete of trashed notes (#184): one space-scoped round-
-   *  trip for a multi-select, returning restored notes plus per-id failures. */
+  /** Resume a durable ordered roster. Every child uses strict single-note
+   * restore; a repeated click/network retry replays the same parent command. */
   trashRestoreMany: (
     space: string,
     body: { ids?: string[]; all?: boolean; q?: string; onlyRestorable?: boolean },
-  ) =>
-    req<TrashRestoreManyResponse>(`${sp(space)}/trash/restore-many`, {
-      method: 'POST',
-      body: JSON.stringify(body),
-    }),
+  ) => {
+    const normalized = body.ids?.length
+      ? { ids: [...new Set(body.ids)] }
+      : {
+          all: true,
+          ...(body.q?.trim() ? { q: body.q.trim() } : {}),
+          ...(body.onlyRestorable ? { onlyRestorable: true } : {}),
+        }
+
+    return strictBulkRestore(
+      `${sp(space)}/trash/restore-many`,
+      `trash-bulk:${space}:${JSON.stringify(normalized)}`,
+      normalized,
+    )
+  },
   /** Permanently erase trashed notes (journal rows + blobs). `{ ids }` = an explicit
    *  set / one note; `{ all: true, q? }` = the filtered "Select all N" path.
    *  Irreversible. */
-  trashPurge: (space: string, body: { ids?: string[]; all?: boolean; q?: string }) =>
+  trashPurge: (
+    space: string,
+    body: {
+      ids?: string[]
+      all?: boolean
+      q?: string
+      availability?: TrashAvailabilityFilter
+    },
+  ) =>
     req<TrashPurgeResponse>(`${sp(space)}/trash/purge`, {
       method: 'POST',
       body: JSON.stringify(body),

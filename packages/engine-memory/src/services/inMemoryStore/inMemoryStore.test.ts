@@ -1,7 +1,13 @@
 import { describe, expect, it } from 'vitest'
 import { parse as parseYaml } from 'yaml'
 
-import { FRONTMATTER_BYTE_CAP, parseFrontmatterLines } from '@notarium/core'
+import {
+  DOCUMENT_ROLE,
+  DOCUMENT_STATE_FORMAT,
+  documentStateVersionToken,
+  FRONTMATTER_BYTE_CAP,
+  parseFrontmatterLines,
+} from '@notarium/core'
 
 import { deterministicNoteId, InMemoryStore } from './inMemoryStore'
 
@@ -12,6 +18,154 @@ const exportText = (content: string | Uint8Array): string =>
   typeof content === 'string' ? content : new TextDecoder().decode(content)
 
 const frontmatter = (yaml: string) => parseFrontmatterLines(yaml)
+
+describe('InMemoryStore document-state parity', () => {
+  it('serves the same analyzer-owned state and CAS token shape as the real engine', async () => {
+    const store = new InMemoryStore({
+      space: 'main',
+      notes: [{ id: 'exact', title: 'Exact', filePath: 'exact.md', content: 'body' }],
+    })
+    const detail = await store.read('exact')
+
+    expect(detail.documentState?.projection).toMatchObject({ title: 'Exact', body: 'body' })
+    expect(detail.versionToken).toBe(documentStateVersionToken(detail.documentState!))
+    expect(detail.versionToken).toMatch(/^v3:/)
+  })
+
+  it('excludes the materialized owner id from the authored CAS identity', async () => {
+    const first = new InMemoryStore({
+      space: 'main',
+      notes: [{ id: 'runtime-a', title: 'Exact', filePath: 'same.md', content: 'body' }],
+    })
+    const second = new InMemoryStore({
+      space: 'main',
+      notes: [{ id: 'runtime-b', title: 'Exact', filePath: 'same.md', content: 'body' }],
+    })
+    const a = await first.read('runtime-a')
+    const b = await second.read('runtime-b')
+
+    expect(a.documentState?.provenance.claims).toEqual([
+      expect.objectContaining({ key: 'notarium-id', ownership: 'entry' }),
+    ])
+    expect(b.documentState?.provenance.claims).toEqual([
+      expect.objectContaining({ key: 'notarium-id', ownership: 'entry' }),
+    ])
+    expect(a.versionToken).toBe(b.versionToken)
+  })
+
+  it('only classifies a linked skill resource under a valid direct skill root', async () => {
+    const valid = new InMemoryStore({
+      space: 'main',
+      notes: [
+        {
+          id: 'root',
+          title: 'demo',
+          class: 'skill',
+          filePath: 'skills/demo/SKILL.md',
+          content: 'Instructions',
+          frontmatter: 'name: demo\ndescription: Demo skill',
+        },
+        {
+          id: 'helper',
+          title: 'Helper',
+          class: 'skill',
+          filePath: 'skills/demo/references/helper.md',
+          content: 'Reference',
+        },
+        {
+          id: 'nested-skill-name',
+          title: 'Nested SKILL',
+          class: 'skill',
+          filePath: 'skills/demo/references/SKILL.md',
+          content: 'Nested reference',
+        },
+        {
+          id: 'project-root',
+          title: 'demo',
+          class: 'skill',
+          filePath: 'skills/_projects/project-a/demo/SKILL.md',
+          content: 'Instructions',
+          frontmatter: 'name: demo\ndescription: Project demo skill',
+        },
+        {
+          id: 'project-nested-skill-name',
+          title: 'Nested project SKILL',
+          class: 'skill',
+          filePath: 'skills/_projects/project-a/demo/references/SKILL.md',
+          content: 'Nested project reference',
+        },
+      ],
+    })
+    const missing = new InMemoryStore({
+      space: 'main',
+      notes: [
+        {
+          id: 'helper',
+          title: 'Helper',
+          class: 'skill',
+          filePath: 'skills/demo/references/helper.md',
+          content: 'Reference',
+        },
+      ],
+    })
+    const invalid = new InMemoryStore({
+      space: 'main',
+      notes: [
+        {
+          id: 'root',
+          title: 'other',
+          class: 'skill',
+          filePath: 'skills/demo/SKILL.md',
+          content: 'Instructions',
+          frontmatter: 'name: other\ndescription: Wrong directory',
+        },
+        {
+          id: 'helper',
+          title: 'Helper',
+          class: 'skill',
+          filePath: 'skills/demo/references/helper.md',
+          content: 'Reference',
+        },
+      ],
+    })
+    const ancestorOnly = new InMemoryStore({
+      space: 'main',
+      notes: [
+        {
+          id: 'ancestor-root',
+          title: 'skills',
+          class: 'skill',
+          filePath: 'skills/SKILL.md',
+          content: 'Instructions',
+          frontmatter: 'name: skills\ndescription: Ancestor package',
+        },
+        {
+          id: 'nested-helper',
+          title: 'Nested helper',
+          class: 'skill',
+          filePath: 'skills/demo/references/helper.md',
+          content: 'Reference',
+        },
+      ],
+    })
+
+    expect((await valid.read('helper')).documentState).toMatchObject({
+      format: DOCUMENT_STATE_FORMAT.markdown,
+      role: DOCUMENT_ROLE.skillAuxiliary,
+    })
+    expect((await valid.read('nested-skill-name')).documentState?.role).toBe(
+      DOCUMENT_ROLE.skillAuxiliary,
+    )
+    expect((await valid.read('project-nested-skill-name')).documentState?.role).toBe(
+      DOCUMENT_ROLE.skillAuxiliary,
+    )
+    expect((await missing.read('helper')).documentState?.role).toBe(DOCUMENT_ROLE.generic)
+    expect((await invalid.read('helper')).documentState?.role).toBe(DOCUMENT_ROLE.generic)
+    expect((await ancestorOnly.read('nested-helper')).documentState?.role).toBe(
+      DOCUMENT_ROLE.generic,
+    )
+  })
+})
 
 // The fake's graph() resolver must mirror core buildLinkIndex/resolveLink (#18
 // one-spec-many-engines): path-form [[dir/note]] resolves, and a MISS yields a
@@ -141,6 +295,57 @@ describe('InMemoryStore legacy move destinations', () => {
     await expect(
       store.move({ id: 'legacy-note', destinationPath: 'archive/other:bad.md' }),
     ).rejects.toMatchObject({ isToolError: true })
+  })
+})
+
+describe('InMemoryStore conditional remove', () => {
+  it('does not remove a state newer than the supplied token', async () => {
+    const store = new InMemoryStore({ space: 'main', notes: [] })
+    const created = await store.write({ title: 'Conditional', content: 'first' })
+
+    await store.write({
+      title: 'Conditional',
+      content: 'newer',
+      originalId: created.id,
+      versionToken: created.versionToken,
+    })
+    await expect(
+      store.remove(created.id!, { identityOnly: true, versionToken: created.versionToken }),
+    ).rejects.toThrow(/note changed during delete/)
+    expect((await store.read(created.id!, { identityOnly: true })).content).toBe('newer')
+  })
+
+  it('does not remove a same-state replacement with an older physical claim', async () => {
+    const store = new InMemoryStore({
+      space: 'main',
+      now: '2026-08-12T00:00:00.000Z',
+      notes: [],
+    })
+    const first = await store.write({ title: 'Same', content: 'body' })
+    const replacement = await store.write({
+      title: 'Same',
+      content: 'body',
+      ifExists: 'overwrite',
+    })
+
+    expect(replacement.versionToken).toBe(first.versionToken)
+    expect(replacement.physicalWriteClaim).not.toEqual(first.physicalWriteClaim)
+    await expect(
+      store.remove(first.id!, {
+        identityOnly: true,
+        versionToken: first.versionToken,
+        physicalWriteClaim: first.physicalWriteClaim,
+      }),
+    ).rejects.toThrow(/note changed during delete/)
+    expect((await store.read(first.id!, { identityOnly: true })).content).toBe('body')
+
+    await store.remove(replacement.id!, {
+      identityOnly: true,
+      physicalWriteClaim: replacement.physicalWriteClaim,
+    })
+    await expect(store.read(replacement.id!, { identityOnly: true })).rejects.toThrow(
+      /note not found/,
+    )
   })
 })
 
@@ -549,6 +754,21 @@ describe('InMemoryStore — carried frontmatter merges like the real file serial
     expect(await store.list()).toHaveLength(1)
   })
 
+  it('keeps a leading fenced YAML-reference example as body during full-state replace', async () => {
+    const store = new InMemoryStore({ space: 'main', notes: [] })
+    const body = '---\nanchorKey: &x value\ncopy: *x\n---\nactual body'
+
+    const created = await store.write({
+      title: 'Restored',
+      fileName: 'restored',
+      content: body,
+      frontmatter: frontmatter('custom: exact'),
+      frontmatterMode: 'replace',
+    })
+
+    expect((await store.read(created.id!)).content).toBe(body)
+  })
+
   it('allows plain, quoted and block-scalar ampersands that are not YAML node references', async () => {
     const store = new InMemoryStore({ space: 'main', notes: [] })
     const safe = frontmatter(
@@ -913,6 +1133,42 @@ describe('InMemoryStore — carried frontmatter merges like the real file serial
     expect(file.indexOf('# one comment')).toBeLessThan(file.indexOf('notarium-id:'))
   })
 
+  it('keeps comments in their authored position between custom keys', async () => {
+    const store = new InMemoryStore({
+      space: 'main',
+      notes: [
+        {
+          title: 'Ordered',
+          filePath: 'ordered.md',
+          content: 'body',
+          frontmatter: 'first: one\n# middle\nsecond: two',
+        },
+      ],
+    })
+    const state = (await store.read('fake-ordered')).logicalState!.markdown
+
+    expect(state).toContain('first: one\n# middle\nsecond: two')
+  })
+
+  it('keeps duplicate custom fixture keys in the exact logical state', async () => {
+    const store = new InMemoryStore({
+      space: 'main',
+      notes: [
+        {
+          title: 'Duplicates',
+          filePath: 'duplicates.md',
+          content: 'body',
+          frontmatter: 'plugin: first\n# between\nplugin: second',
+        },
+      ],
+    })
+    const note = (await store.list())[0]
+
+    expect((await store.read(note.id!)).logicalState?.markdown).toContain(
+      'plugin: first\n# between\nplugin: second',
+    )
+  })
+
   it('preserves identical keyless lines authored twice in one source without multiplying them on re-import', async () => {
     const store = new InMemoryStore({ space: 'main', notes: [] })
     const incoming = [
@@ -970,7 +1226,7 @@ describe('InMemoryStore — carried frontmatter merges like the real file serial
     expect(file).not.toContain('Old last')
   })
 
-  it('a seeded unreadable last duplicate clears stale live projections and collapses on export', async () => {
+  it('a seeded unreadable last duplicate clears projections without rewriting fixture bytes', async () => {
     const store = new InMemoryStore({
       space: 'main',
       notes: [
@@ -991,10 +1247,10 @@ describe('InMemoryStore — carried frontmatter merges like the real file serial
     expect(meta.tags).toBeUndefined()
     expect(view.frontmatter.aliases).toBeUndefined()
     expect(view.frontmatter.tags).toBeUndefined()
-    expect(file.match(/^aliases:/gm)).toHaveLength(1)
-    expect(file.match(/^tags:/gm)).toHaveLength(1)
-    expect(file).not.toContain('Stale Alias')
-    expect(file).not.toContain('[stale]')
+    expect(file.match(/^aliases:/gm)).toHaveLength(2)
+    expect(file.match(/^tags:/gm)).toHaveLength(2)
+    expect(file).toContain('aliases: [Stale Alias]\naliases:\n  locale: [Current]')
+    expect(file).toContain('tags: [stale]\ntags:\n  group: current')
   })
 
   it('an overwrite clears stale typed projections when replacement keys become unreadable', async () => {

@@ -94,4 +94,24 @@ export const rekeyAndQuarantineRevisions = (
       demote.run(Number(id))
     }
   }
+  const affected = new Map<string, { space: string; noteId: string }>()
+
+  for (const row of closure.values()) {
+    affected.set(`${row.space}\u0000${row.note_id}`, { space: row.space, noteId: row.note_id })
+  }
+  affected.set(`${space}\u0000${toId}`, { space, noteId: toId })
+  const dropHead = db.prepare('DELETE FROM revision_heads WHERE space = ? AND note_id = ?')
+  const restoreHead = db.prepare(
+    `INSERT INTO revision_heads (space, note_id, revision_id, semantic_fingerprint, lifecycle)
+     SELECT space, note_id, id, semantic_fingerprint,
+            CASE WHEN kind = 'delete' THEN 'deleted' ELSE 'live' END
+       FROM note_revisions
+      WHERE space = ? AND note_id = ? AND integrity = 'trusted'
+      ORDER BY id DESC LIMIT 1`,
+  )
+
+  for (const pair of affected.values()) {
+    dropHead.run(pair.space, pair.noteId)
+    restoreHead.run(pair.space, pair.noteId)
+  }
 }

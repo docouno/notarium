@@ -7,7 +7,11 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 
-import { backupControlSocketFromEnv, requestBackupCheckpoint } from '../../../../libs/backupControl'
+import {
+  backupControlSocketFromEnv,
+  requestBackupCheckpoint,
+  requestBackupGenerationCut,
+} from '../../../../libs/backupControl'
 import { parseCommandLine } from '../../../../libs/commandLine'
 import {
   createBackupInputLimiter,
@@ -66,6 +70,7 @@ const create = async (): Promise<void> => {
       quietMs: positiveInteger('quiet-ms', parsed.value('quiet-ms'), 750, 0),
       maxAttempts: positiveInteger('max-attempts', parsed.value('max-attempts'), 12, 1),
       checkpoint: () => requestBackupCheckpoint(backupControlSocketFromEnv()),
+      generationCut: () => requestBackupGenerationCut(backupControlSocketFromEnv()),
       ...runtime,
       onAttempt: (attempt) => console.error(`backup: consistency attempt ${attempt}`),
     })

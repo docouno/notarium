@@ -25,6 +25,7 @@ export const QUERY_KEY = {
   cursor: 'cursor',
   frontmatter: 'frontmatter',
   scope: 'scope',
+  availability: 'availability',
 } as const
 
 export type QueryKey = (typeof QUERY_KEY)[keyof typeof QUERY_KEY]

@@ -12,8 +12,15 @@ import {
   BackgroundScheduler,
   CachedStore,
   type MountConfig,
+  READ_SCOPE,
 } from '@notarium/core'
-import { createNotariumStore, type Embedder, type SearchTuning } from '@notarium/engine'
+import {
+  createNotariumStore,
+  type Embedder,
+  ensureNotariumResourceAuthority,
+  type SearchTuning,
+  SpaceResourceAuthorityRegistry,
+} from '@notarium/engine'
 
 import { createFsArtifactStore } from '../../libs/artifactStore'
 import { createBackupControl } from '../../libs/backupControl'
@@ -22,6 +29,12 @@ import { createFsImportStagingStore } from '../../libs/importStaging'
 import { createMutationGate } from '../../libs/mutationGate'
 import { notesDirReader } from '../../libs/notesDir'
 import { type AuthMode, createAuthService } from '../../services/auth'
+import { CausalOutboxProjector, causalReplicaId } from '../../services/causalOutboxProjector'
+import {
+  InstallationReplayKey,
+  ReplayKeyring,
+  type ReplayKeyringConfig,
+} from '../../services/installationReplayKey'
 import {
   createMetaDb,
   META_DB_TARGET_KIND,
@@ -29,6 +42,7 @@ import {
   metaDbTargetOf,
   type SpaceRecord,
 } from '../../services/metaDb'
+import { BulkRestoreCoordinator, RestoreCoordinator } from '../../services/noteRestore'
 import {
   createMarkerStore,
   discoverSpaceFolders,
@@ -191,6 +205,9 @@ export type CreateServerOptions = {
   /** Local Unix socket exposed only inside the container for online-backup
    *  checkpoints. Unset in tests/embedded hosts. */
   backupControlSocket?: string
+  /** Installation-wide HMAC keyring. The process entry always supplies it;
+   *  embedded/test hosts may omit it until they enable durable restore replay. */
+  replayKeyring?: ReplayKeyringConfig
 }
 
 export const createServer = async ({
@@ -211,6 +228,7 @@ export const createServer = async ({
   backgroundQuietMs,
   backgroundDripMs,
   backupControlSocket,
+  replayKeyring,
 }: CreateServerOptions): Promise<FastifyInstance> => {
   // `createServer` is also a public composition boundary (tests and embedders call
   // it without going through spacesFromEnv). Reject labels that could not be
@@ -235,6 +253,14 @@ export const createServer = async ({
     )
   }
   const metaDb = metaDbUrl ? createMetaDb(metaDbUrl) : undefined
+  const installationReplayKey =
+    metaDb && replayKeyring
+      ? new InstallationReplayKey({
+          persistence: metaDb.installationGeneration,
+          keyring: new ReplayKeyring(replayKeyring.path),
+          topology: replayKeyring.topology,
+        })
+      : undefined
   const mutationGate = createMutationGate()
   // The ONE process-global cooperative scheduler — a single instance gates all
   // spaces, so embed backfill and graph enrichment yield to every space's traffic.
@@ -242,6 +268,7 @@ export const createServer = async ({
     quietMs: backgroundQuietMs,
     dripMs: backgroundDripMs,
   })
+  const resourceAuthorities = new SpaceResourceAuthorityRegistry()
   // 'password' without a meta-DB is a boot error, not a degraded mode — accepting
   // logins into a store that forgets them is worse than refusing to start. The
   // OAuth facet joins the SAME service so its tokens validate at one chokepoint.
@@ -311,12 +338,17 @@ export const createServer = async ({
     isPersonalSpace: (id) => auth.isPersonalSpace(id),
     metaDb,
     onProvision: autoMarkRoot,
+    closeResourceAdmission: async (space, deadlineMs) => {
+      await resourceAuthorities.get(space)?.closeAdmission({ deadlineMs })
+    },
+    reopenResourceAdmission: (space) => resourceAuthorities.get(space)?.reopenAdmission(),
     // Purge the FS half of a purged space: notes dir under SPACES_ROOT (incl. the
     // hidden agent-mount) + the derived engine index (+ WAL/SHM). Meta-DB rows are
     // wiped separately (atomically) by metaDb.purgeSpace. The startsWith guard keeps
     // a stray config space's operator-managed dir untouched.
     onPurge: spacesRoot
       ? async (rec) => {
+          resourceAuthorities.remove(rec.id)
           const cfg = configForRec(rec)
           const root = resolve(spacesRoot)
           const dir = cfg?.notesDir ? resolve(cfg.notesDir) : null
@@ -421,6 +453,8 @@ export const createServer = async ({
       const notesDir = cfg.notesDir
       const mounts = mountsForConfig(cfg, notesDir)
       const engine = createNotariumStore({
+        spaceId: rec.id,
+        resourceAuthorityRegistry: resourceAuthorities,
         mounts,
         // Keyed by the stable notes_dir, not the (mutable) slug — a rename never
         // moves the index DB.
@@ -452,9 +486,82 @@ export const createServer = async ({
       })
     },
   })
+  const causalOutboxProjector = metaDb
+    ? new CausalOutboxProjector({
+        outbox: metaDb.causalOutbox,
+        subscriberId: await causalReplicaId(engineDataDir),
+        project: ({ space, resourceId }) => manager.reconcileCausalProjection(space, resourceId),
+      })
+    : undefined
+
+  const authorityForSpace = async (space: string) => {
+    const rec = manager.recOf(space)
+    const cfg = rec ? configForRec(rec) : undefined
+
+    if (!rec || !cfg?.notesDir) {
+      return null
+    }
+
+    return ensureNotariumResourceAuthority({
+      spaceId: rec.id,
+      resourceAuthorityRegistry: resourceAuthorities,
+      mounts: mountsForConfig(cfg, cfg.notesDir),
+    })
+  }
+  const restoreCoordinator =
+    metaDb && installationReplayKey
+      ? new RestoreCoordinator({
+          metaDb,
+          replayKey: installationReplayKey,
+          spaces: manager,
+          authorityForSpace,
+          wakeOutbox: causalOutboxProjector ? () => causalOutboxProjector.wake() : undefined,
+        })
+      : undefined
+  const bulkRestoreCoordinator =
+    metaDb && installationReplayKey && restoreCoordinator
+      ? new BulkRestoreCoordinator({
+          metaDb,
+          replayKey: installationReplayKey,
+          single: restoreCoordinator,
+          spaces: manager,
+          rosterForSelection: async ({ space, selection }) => {
+            const store = await manager.store(space)
+
+            if (!store.listTrashed) {
+              throw new Error('trash roster unavailable')
+            }
+
+            return (
+              await store.listTrashed({
+                offset: 0,
+                limit: 2_147_483_647,
+                q: selection.mode === 'all' ? (selection.q ?? undefined) : undefined,
+                availability:
+                  selection.mode === 'all' && selection.onlyRestorable ? 'restorable' : undefined,
+                scope: READ_SCOPE.agentRecall,
+              })
+            ).items
+          },
+        })
+      : undefined
   const roles = createRolesService({
     catalog: loadBuiltinRoleCatalog,
     library: createFsRoleLibrary({
+      authorityForSpace: async (space) => {
+        await manager.store(space)
+        return resourceAuthorities.get(space) ?? null
+      },
+      resourcePrefixForSpace: (space) => {
+        const rec = manager.recOf(space)
+        const cfg = rec ? configForRec(rec) : undefined
+        const notesDir = cfg?.notesDir
+
+        return notesDir
+          ? (mountsForConfig(cfg, notesDir).find((mount) => mount.class === NOTE_CLASS.skill)
+              ?.prefix ?? null)
+          : null
+      },
       rootForSpace: (space) => {
         const rec = manager.recOf(space)
         const cfg = rec ? configForRec(rec) : undefined
@@ -544,6 +651,8 @@ export const createServer = async ({
     staging,
     wakeJobs: jobRunner ? () => jobRunner.wake() : undefined,
     mutationGate,
+    restoreCoordinator,
+    bulkRestoreCoordinator,
     // OAuth connector facade: active in 'password' mode with a meta-DB backing the
     // token store; none-mode hosts serve the authless connector (no token to mint).
     // canon: docs/mcp-oauth.md#mode-fork
@@ -552,16 +661,29 @@ export const createServer = async ({
     trustProxy,
   })
   const backupControl = backupControlSocket
-    ? createBackupControl(backupControlSocket, (signal) =>
-        mutationGate.checkpoint(() => manager.checkpointAll(), { signal }),
+    ? createBackupControl(
+        backupControlSocket,
+        (signal) => mutationGate.checkpoint(() => manager.checkpointAll(), { signal }),
+        undefined,
+        metaDb?.installationGeneration,
       )
     : undefined
   // Spaces boot lazily on first touch (nothing is pre-warmed); requests mid-scan
   // get the phase-1 inventory within seconds. canon: docs/core.md#phased-boot
   app.addHook('onReady', async () => {
+    // Installation recovery precedes lifecycle replay and disk discovery: no
+    // watcher or public mutation may observe an ambiguous replay-key generation.
+    await installationReplayKey?.bootstrap()
     // init provisions config spaces AND recovers runtime spaces from the registry —
     // runtime spaces live only in the registry, so without this they'd vanish on restart.
     await manager.init()
+    // Accepted restores pin lifecycle work. Resolve their durable state before
+    // the outbox/projected read models and public handlers are admitted.
+    await restoreCoordinator?.recover()
+    await bulkRestoreCoordinator?.recover()
+    // Terminal metadata is already committed; repair this replica's derived
+    // snapshots before public admission, then keep polling for peer commits.
+    await causalOutboxProjector?.start()
     // Boot rule: a space with no members gets owner rows for every active admin;
     // curated membership is never touched.
     await auth.ensureOwners(manager.list().map((s) => s.id))
@@ -595,6 +717,7 @@ export const createServer = async ({
   })
   app.addHook('onClose', async () => {
     await backupControl?.close().catch(() => {})
+    await causalOutboxProjector?.stop().catch(() => {})
     // Stop the job runner FIRST: abort in-flight handlers and release their
     // jobs back to pending, before the space stores it reads from are torn down.
     await jobRunner?.stop().catch(() => {})

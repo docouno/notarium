@@ -1,0 +1,6 @@
+export * from './inMemoryCausalOutboxPersistence'
+export * from './inMemoryInstallationGenerationPersistence'
+export * from './inMemoryOwnerProofPersistence'
+export * from './inMemoryRestoreOperationPersistence'
+export * from './inMemoryRestoreTerminalPersistence'
+export * from './inMemorySpaceLifecyclePersistence'

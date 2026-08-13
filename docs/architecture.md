@@ -124,6 +124,7 @@ Everything Notarium writes lives under **one root** — `DATA_DIR`. Every intern
 ```
 DATA_DIR/            # /data in the image; $XDG_DATA_HOME/notarium (or ~/.local/share/notarium) on a host
 ├── meta.db          # #51 identity, #12 journal, #16 spaces, #10 auth — non-rebuildable (P2)
+├── replay-keyring/  # installation HMAC keys + active generation pointer — non-rebuildable
 ├── engine/<slug>.db # derived FTS5+graph+vector indexes (P2) — delete → reindex
 ├── jobs/            # export artifacts (P11) + jobs/imports — durable import staging
 └── spaces/<slug>/   # the user's .md — truth (P1)
@@ -138,6 +139,15 @@ Hence three invariants:
 - **`spacesRoot` is not just a path but a capability gate** (`spaceCreate`, purge). Therefore the default `<DATA_DIR>/spaces` applies **only** in the zero-config branch ([`spacesFromEnv.ts`](../packages/server/src/apps/server/spacesFromEnv.ts)): a host with an explicit topology (`SPACES_CONFIG` / legacy `ENGINE`+`NOTES_DIR`) asked for static and must not silently get space creation and deletion over a root it did not name.
 
 Overrides remain — as an operator's choice, not as a requirement: `META_DB_URL=postgres://…` (shared state), `SPACES_ROOT` (the notes live elsewhere — class A: "where YOUR notes are"), `ENGINE_DATA_DIR`/`JOBS_DATA_DIR` (derived data on another disk). The trap was the default, not the presence of a handle.
+
+The replay keyring follows the metadata topology. Canonical file SQLite uses
+`<DATA_DIR>/replay-keyring` with no setting and can replace a completely lost
+keyring because the database and files share one local failure domain. Any
+external meta-DB topology must set `NOTARIUM_REPLAY_KEYRING_DIR` to one absolute,
+durable path shared by every serving process. A stable database witness with a
+missing external keyring is ambiguous and stops boot before space discovery;
+copying per-replica keys or silently minting a replacement would split replay
+identity across servers.
 
 **`META_DB_URL` is classified in exactly one place** ([`services/metaDb/metaDbUrl.ts`](../packages/server/src/services/metaDb/metaDbUrl.ts)): `postgres://…` / `postgresql://…` (scheme case-insensitive, per RFC 3986), `sqlite:<path>`, `sqlite::memory:`, or a bare file path. **Any other scheme is a boot error, not a filename** — and that strictness is the point, not pedantry. A lenient classifier reads `postgress://…` as a relative path, so the host creates that file, starts green on an empty database, and a password host re-opens the **public** first-run screen: the first visitor becomes owner while the real data sits intact and unread (the takeover [`legacyMetaDbAt`](../packages/server/src/apps/server/dataPaths.ts) guards — except that guard stands down precisely when `META_DB_URL` is set). The connection password would also become a directory name and appear in the boot banner. A bare path stays a path, so a directory called `postgres-backup/` is never mistaken for a server, a URL naming no database at all (`sqlite:`) is refused rather than resolved against the cwd, and so is a connection string that lost its scheme (`host=db password=…`, `//user:pw@host/db`) — taken as a path it would become a directory named after the credential, created on disk and printed by anything that reports paths. Everything that asks "Postgres or a file, and which file" — the boot resolver, the write-probe, the online-backup layout gate, `/api/about`, the admin CLI — asks that one classifier, so no two of them can read the same URL differently. What each does with a correctly classified target stays its own policy: the admin CLI additionally turns down `sqlite::memory:` (nothing to recover in it), and `AUTH_MODE=password` refuses it at boot — a meta-DB that forgets every user on restart hands out the first-run screen again, so "present" is not "durable". Wherever a meta-DB URL is printed, a SQLite target is named by its path and anything else by its scheme alone, so a Postgres password is not quoted back into a log. The env edge additionally refuses a credential-carrying value where a path belongs, because such a directory name would also reach messages Notarium does not format — an fs error naming the path it failed on.
 

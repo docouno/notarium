@@ -10,6 +10,8 @@ const row = (over: Partial<RevisionView> = {}): RevisionView => ({
   author: { kind: 'user', mine: true, name: 'me' },
   createdAt: '2026-08-11T10:00:00.000Z',
   contentHash: 'abc',
+  stateFormat: 'markdown-v2',
+  restoreAvailability: 'full',
   baseRevisionId: '6',
   sourceRevisionId: null,
   title: 'Carbon',

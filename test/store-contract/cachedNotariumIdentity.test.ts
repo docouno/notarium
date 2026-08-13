@@ -13,6 +13,8 @@ import {
   encodeWikilinkIdentity,
   type IdentityPersistence,
   type IdentityRecord,
+  InMemoryRestoreOperationPersistence,
+  InMemorySpaceLifecyclePersistence,
 } from '@notarium/core'
 import { createNotariumStore } from '@notarium/engine'
 import type { SpaceRecord } from '../../packages/server/src/services/metaDb'
@@ -152,8 +154,11 @@ describe('CachedStore(NotariumStore) — authoritative link identities', () => {
       archivedAt: null,
       archivedBy: null,
     }
+    const spaceLifecycle = new InMemorySpaceLifecyclePersistence()
     const metaDb = {
       adoptLegacyRows: async () => {},
+      spaceLifecycle,
+      restoreOperations: new InMemoryRestoreOperationPersistence(spaceLifecycle),
       spaces: {
         list: async () => [{ ...space }],
         getById: async (id: string) => (id === space.id ? { ...space } : null),
@@ -247,8 +252,11 @@ describe('CachedStore(NotariumStore) — authoritative link identities', () => {
       archivedAt: null,
       archivedBy: null,
     }
+    const spaceLifecycle = new InMemorySpaceLifecyclePersistence()
     const metaDb = {
       adoptLegacyRows: async () => {},
+      spaceLifecycle,
+      restoreOperations: new InMemoryRestoreOperationPersistence(spaceLifecycle),
       spaces: {
         list: async () => [{ ...space }],
         getById: async (id: string) => (id === space.id ? { ...space } : null),

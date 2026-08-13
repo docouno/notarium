@@ -146,4 +146,32 @@ export const rekeyAndQuarantineRevisions = async (
       )
     }
   }
+  const affected = new Map<string, { space: string; noteId: string }>()
+
+  for (const row of closure.values()) {
+    affected.set(`${row.space}\u0000${row.note_id}`, { space: row.space, noteId: row.note_id })
+  }
+  affected.set(`${space}\u0000${toId}`, { space, noteId: toId })
+  const pairs = [...affected.values()]
+  const spaces = pairs.map((pair) => pair.space)
+  const notes = pairs.map((pair) => pair.noteId)
+
+  await client.query(
+    `DELETE FROM revision_heads AS heads
+      USING unnest($1::text[], $2::text[]) AS affected(space, note_id)
+      WHERE heads.space = affected.space AND heads.note_id = affected.note_id`,
+    [spaces, notes],
+  )
+  await client.query(
+    `INSERT INTO revision_heads (space, note_id, revision_id, semantic_fingerprint, lifecycle)
+     SELECT DISTINCT ON (revisions.space, revisions.note_id)
+            revisions.space, revisions.note_id, revisions.id, revisions.semantic_fingerprint,
+            CASE WHEN revisions.kind = 'delete' THEN 'deleted' ELSE 'live' END
+       FROM note_revisions AS revisions
+       JOIN unnest($1::text[], $2::text[]) AS affected(space, note_id)
+         ON affected.space = revisions.space AND affected.note_id = revisions.note_id
+      WHERE revisions.integrity = 'trusted'
+      ORDER BY revisions.space, revisions.note_id, revisions.id DESC`,
+    [spaces, notes],
+  )
 }

@@ -8,7 +8,18 @@
 // through the CAS path — a stale token 409s and journals nothing.
 
 import { describe, expect, it, vi } from 'vitest'
-import { CachedStore, InMemoryRevisionPersistence, revisionGapOf, sha256Hex } from '@notarium/core'
+import {
+  analyzeDocumentState,
+  bindStorageOwnerProof,
+  CachedStore,
+  encodeDocumentState,
+  InMemoryRevisionPersistence,
+  logicalNoteState,
+  parseFrontmatterLines,
+  revisionGapOf,
+  RevisionJournal,
+  sha256Hex,
+} from '@notarium/core'
 import type { Revision, RevisionInput, StoreDelta } from '@notarium/core'
 import { InMemoryStore, type StoreSnapshot } from '@notarium/engine-memory'
 
@@ -73,6 +84,71 @@ const timeline = async (store: CachedStore, id: string) =>
   (await store.revisions(id, { offset: 0, limit: 100 })).items
 
 describe('revision journal (#12) — write-through', () => {
+  it('a required restore keeps its provenance over an identical external observer row', async () => {
+    const persistence = new InMemoryRevisionPersistence()
+    const journal = new RevisionJournal({ persistence, space: 'main' })
+    const logicalState = logicalNoteState({ title: 'Observed restore', body: 'same state' })
+    const state = {
+      noteId: 'observed-restore',
+      principal: null,
+      content: 'same state',
+      logicalState,
+      title: 'Observed restore',
+      class: 'user-doc',
+      tags: [] as string[],
+      slug: null,
+    }
+    const deleted = await journal.record({ ...state, kind: 'delete' })
+
+    await journal.record({ ...state, kind: 'external' })
+    const restored = await journal.recordRequired({
+      ...state,
+      kind: 'restore',
+      principal: 'ui',
+      sourceRevisionId: deleted!.id,
+    })
+    const rows = await journal.list('observed-restore', { offset: 0, limit: 10 })
+
+    expect(restored).toMatchObject({
+      kind: 'restore',
+      principal: 'ui',
+      sourceRevisionId: deleted!.id,
+    })
+    expect(rows.items.map((revision) => revision.kind)).toEqual(['restore', 'external', 'delete'])
+  })
+
+  it('deduplicates receipt lineage and proven owner-value churn by semantic fingerprint', async () => {
+    const persistence = new InMemoryRevisionPersistence()
+    const journal = new RevisionJournal({ persistence, space: 'main' })
+
+    const stateOf = (id: string, receipt: string) => {
+      const source = new TextEncoder().encode(`---\nnotarium-id: ${id}\ntitle: Stable\n---\nbody`)
+      const proof = bindStorageOwnerProof({
+        source,
+        owners: [{ key: 'notarium-id', ownership: 'value' }],
+        evidence: { kind: 'mutation-receipt', id: receipt },
+      })
+      return analyzeDocumentState({ source, ownerProof: proof, pathFallbackTitle: 'stable' })
+    }
+    const first = stateOf('one', 'receipt-a')
+    const equivalent = stateOf('two', 'receipt-b')
+    const input = {
+      noteId: 'fingerprint-dedup',
+      kind: 'external' as const,
+      principal: null,
+      content: 'body',
+      title: 'Stable',
+      class: 'user-doc',
+      tags: [] as string[],
+      slug: null,
+    }
+
+    expect(first.semanticFingerprint).toBe(equivalent.semanticFingerprint)
+    expect(await journal.record({ ...input, documentState: first })).not.toBeNull()
+    expect(await journal.record({ ...input, documentState: equivalent })).toBeNull()
+    expect((await journal.list(input.noteId, { offset: 0, limit: 10 })).total).toBe(1)
+  })
+
   it("the first edit journals the found state as an 'external' baseline, then the write", async () => {
     const { store } = await make()
     const { versionToken } = await store.read(TITANIUM)
@@ -92,7 +168,12 @@ describe('revision journal (#12) — write-through', () => {
     const [write, baseline] = revs
     expect(baseline.principal).toBeNull()
     expect(baseline.baseRevisionId).toBeNull()
-    expect(baseline.contentHash).toBe(await sha256Hex('original body'))
+    const baselineDetail = await store.revision(TITANIUM, baseline.id)
+    expect(baseline.stateFormat).toBe('markdown-v2')
+    expect(baselineDetail?.logicalState).not.toBeNull()
+    expect(baseline.contentHash).toBe(
+      await sha256Hex(encodeDocumentState(baselineDetail!.documentState!)),
+    )
     expect(write.principal).toBe('ui')
     expect(write.baseRevisionId).toBe(baseline.id) // the chain
     expect(write.title).toBe('Titanium')
@@ -100,6 +181,7 @@ describe('revision journal (#12) — write-through', () => {
     // The blob round-trips through the detail surface.
     const detail = await store.revision(TITANIUM, write.id)
     expect(detail?.content).toBe('edited body')
+    expect(detail?.logicalState?.markdown).toContain('tags:\n- metal')
   })
 
   it('a brand-new note journals one write revision, no baseline', async () => {
@@ -289,7 +371,8 @@ describe('revision journal (#12) — external states from the delta', () => {
     const revs = await timeline(store, TITANIUM)
     expect(revs.map((r) => r.kind)).toEqual(['external'])
     expect(revs[0].principal).toBeNull()
-    expect(revs[0].contentHash).toBe(await sha256Hex('changed outside'))
+    const detail = await store.revision(TITANIUM, revs[0].id)
+    expect(revs[0].contentHash).toBe(await sha256Hex(encodeDocumentState(detail!.documentState!)))
 
     // The next poll re-reports the same state (a reindex echo) — deduped.
     setDelta({
@@ -302,6 +385,99 @@ describe('revision journal (#12) — external states from the delta', () => {
     expect(await timeline(store, TITANIUM)).toHaveLength(1)
   })
 
+  it('journals every row projection from the same exact state as its document blob', async () => {
+    const { inner, store, setDelta } = await withScriptedDelta()
+    const stateA = (await inner.list()).find((note) => note.id === TITANIUM)!
+    const live = await inner.read(TITANIUM)
+
+    await inner.write({
+      title: 'State B',
+      content: 'B-body',
+      tags: ['B-tag'],
+      slug: 'custom-b',
+      originalId: TITANIUM,
+      versionToken: live.versionToken,
+      preservePath: true,
+    })
+    setDelta({
+      cursor: 'mixed-a-b',
+      inventory: await inner.list(),
+      upserts: [
+        {
+          meta: { ...stateA, title: 'State A', slug: 'custom-a' },
+          content: 'A-body',
+          tags: ['A-tag'],
+        },
+      ],
+    })
+    await store.reconcile()
+    await store.settle()
+
+    const revision = (await timeline(store, TITANIUM))[0]
+    const detail = await store.revision(TITANIUM, revision.id)
+
+    expect(revision).toMatchObject({
+      title: 'State B',
+      slug: 'custom-b',
+      tags: ['B-tag'],
+    })
+    expect(detail).toMatchObject({ content: 'B-body' })
+    expect(detail?.documentState?.projection?.body).toBe('B-body')
+  })
+
+  it('captures an exact metadata-only external state with one changed-note read and no quiet reads', async () => {
+    const { inner, store, setDelta } = await withScriptedDelta()
+    const stale = await store.read(TITANIUM)
+    const live = await inner.read(TITANIUM)
+    const liveTitle = live.title ?? 'Titanium'
+
+    await inner.write({
+      title: liveTitle,
+      content: live.content,
+      frontmatter: parseFrontmatterLines('custom: changed-outside\nplugin:\n  nested: yes'),
+      originalId: TITANIUM,
+      versionToken: live.versionToken,
+    })
+    const meta = (await inner.list()).find((note) => note.id === TITANIUM)!
+    const read = inner.read.bind(inner)
+    let exactReads = 0
+
+    inner.read = async (id, opts) => {
+      exactReads += 1
+      return read(id, opts)
+    }
+    // Even when a cheap delta supplies the unchanged BODY, it cannot supply raw
+    // authored FM. The read-model must chase exactly this changed note once.
+    setDelta({
+      cursor: 'metadata-2',
+      inventory: await inner.list(),
+      upserts: [{ meta, content: live.content, tags: ['metal'] }],
+    })
+    await store.reconcile()
+    await store.settle()
+
+    expect(exactReads).toBe(1)
+    const revision = (await timeline(store, TITANIUM))[0]
+    const detail = await store.revision(TITANIUM, revision.id)
+    expect(revision.stateFormat).toBe('markdown-v2')
+    expect(detail?.content).toBe(live.content)
+    expect(detail?.logicalState?.markdown).toContain('custom: changed-outside')
+
+    setDelta({ cursor: 'metadata-3', inventory: await inner.list(), upserts: [] })
+    await store.reconcile()
+    await store.settle()
+    expect(exactReads).toBe(1)
+
+    await expect(
+      store.write({
+        title: liveTitle,
+        content: live.content,
+        originalId: TITANIUM,
+        versionToken: stale.versionToken,
+      }),
+    ).rejects.toMatchObject({ reason: 'version_conflict' })
+  })
+
   it('an upsert without content chases the body in the background; a failed read leaves an honest gap marker', async () => {
     const { inner, store, setDelta } = await withScriptedDelta()
     const meta = (await inner.list()).find((n) => n.id === TITANIUM)!
@@ -312,7 +488,9 @@ describe('revision journal (#12) — external states from the delta', () => {
     await vi.waitFor(async () => {
       expect((await timeline(store, TITANIUM)).map((r) => r.kind)).toEqual(['external'])
     })
-    expect((await timeline(store, TITANIUM))[0].contentHash).toBe(await sha256Hex('original body'))
+    const first = (await timeline(store, TITANIUM))[0]
+    const detail = await store.revision(TITANIUM, first.id)
+    expect(first.contentHash).toBe(await sha256Hex(encodeDocumentState(detail!.documentState!)))
 
     // 2) the engine can't serve the body → the gap is explicit, not silent.
     const realRead = inner.read.bind(inner)
@@ -328,7 +506,8 @@ describe('revision journal (#12) — external states from the delta', () => {
     setDelta({
       cursor: 'c3',
       inventory: await inner.list(),
-      upserts: [{ meta: { ...meta, title: 'Titanium' } }],
+      // Even a cheap body cannot stand in for the missing raw authored FM.
+      upserts: [{ meta: { ...meta, title: 'Titanium' }, content: 'cheap but incomplete' }],
     })
     await store.reconcile()
     await vi.waitFor(async () => {
@@ -358,7 +537,8 @@ describe('revision journal (#12) — external states from the delta', () => {
     const revs = await timeline(store, TITANIUM)
     expect(revs.map((r) => r.kind)).toEqual(['delete', 'external'])
     expect(revs[0].principal).toBeNull()
-    expect(revs[0].contentHash).toBe(await sha256Hex('original body'))
+    const detail = await store.revision(TITANIUM, revs[0].id)
+    expect(revs[0].contentHash).toBe(await sha256Hex(encodeDocumentState(detail!.documentState!)))
   })
 
   it('holds an external live transition behind a bulk trash-prefix mutation', async () => {
@@ -522,8 +702,159 @@ describe('revision journal (#12) — delete and restore', () => {
     const after = await store.read(TITANIUM)
     expect(after.content).toBe('original body')
     expect(after.title).toBe('Titanium')
-    // Content-addressing: the restored state reuses the baseline's blob hash.
-    expect(revs[0].contentHash).toBe(baseline.contentHash)
+    // The compatibility store restore may normalize physical/provenance shape;
+    // its authored logical state is still the requested historical state.
+    expect(after.logicalState).toEqual(first.logicalState)
+  })
+
+  it('restores the complete authored state atomically without moving the live file', async () => {
+    const richFixture: StoreSnapshot = {
+      ...FIXTURE,
+      notes: FIXTURE.notes.map((note) => ({
+        ...note,
+        frontmatter: 'custom: before\n# authored comment\nplugin:\n  nested: yes',
+      })),
+    }
+    const { store } = await make(new InMemoryStore(richFixture))
+    const initial = await store.read(TITANIUM)
+
+    await store.write({
+      title: 'Titanium v2',
+      content: initial.content,
+      frontmatter: parseFrontmatterLines(
+        'custom: after\naliases:\n- historical-name\nplugin:\n  nested: no',
+      ),
+      frontmatterMode: 'replace',
+      tags: ['new'],
+      slug: 'changed-slug',
+      originalId: TITANIUM,
+      versionToken: initial.versionToken,
+      principal: 'ui',
+    })
+    await store.settle()
+
+    // A metadata-only change advances the same CAS token as a body change.
+    await expect(
+      store.write({
+        title: 'Titanium v2',
+        content: initial.content,
+        originalId: TITANIUM,
+        versionToken: initial.versionToken,
+      }),
+    ).rejects.toMatchObject({ reason: 'version_conflict' })
+
+    // Revision list rows intentionally carry only the format marker; detail owns
+    // the snapshot blob.
+    const baselineRow = (await timeline(store, TITANIUM)).find(
+      (revision) => revision.kind === 'external',
+    )!
+    const live = await store.read(TITANIUM)
+    expect(live.filePath).toBe('demo/titanium-v2.md')
+
+    await store.restore({
+      id: TITANIUM,
+      revisionId: baselineRow.id,
+      versionToken: live.versionToken!,
+      principal: 'ui',
+    })
+    const restored = await store.read(TITANIUM)
+
+    expect(restored.title).toBe('Titanium')
+    expect(restored.filePath).toBe(live.filePath)
+    expect(restored.logicalState?.markdown).toBe(initial.logicalState?.markdown)
+    expect(restored.frontmatter).toMatchObject({ custom: 'before', tags: ['metal'] })
+    expect(restored.frontmatter).not.toHaveProperty('aliases')
+    const restoredMeta = (await store.list()).find((note) => note.id === TITANIUM)!
+    expect(restoredMeta).toMatchObject({ title: 'Titanium', tags: ['metal'] })
+    expect(restoredMeta.slug).toBeUndefined()
+    expect(restoredMeta.aliases).toBeUndefined()
+  })
+
+  it('keeps legacy body-only rows explicitly partial and leaves unknown live metadata alone', async () => {
+    const richFixture: StoreSnapshot = {
+      ...FIXTURE,
+      notes: FIXTURE.notes.map((note) => ({
+        ...note,
+        frontmatter: 'custom: live\nslug: current-slug\naliases: [kept-alias] # authored',
+      })),
+    }
+    const { store, persistence } = await make(new InMemoryStore(richFixture))
+    const legacyBody = 'legacy body only'
+    const legacy = await persistence.append(
+      {
+        noteId: TITANIUM,
+        space: 'main',
+        baseRevisionId: null,
+        theirRevisionId: null,
+        sourceRevisionId: null,
+        kind: 'external',
+        entryRole: 'baseline',
+        principal: null,
+        contentHash: await sha256Hex(legacyBody),
+        title: 'Legacy title',
+        class: 'user-doc',
+        slug: null,
+        tags: ['legacy'],
+        createdAt: '2026-06-12T11:00:00Z',
+        charsAdded: null,
+        charsRemoved: null,
+      },
+      legacyBody,
+    )
+    const detail = await store.revision(TITANIUM, legacy.id)
+    expect(detail).toMatchObject({ stateFormat: null, logicalState: null, content: legacyBody })
+    const live = await store.read(TITANIUM)
+
+    await store.restore({
+      id: TITANIUM,
+      revisionId: legacy.id,
+      versionToken: live.versionToken!,
+      principal: 'ui',
+    })
+    const restored = await store.read(TITANIUM)
+
+    expect(restored.title).toBe('Legacy title')
+    expect(restored.content).toBe(legacyBody)
+    expect(restored.filePath).toBe(live.filePath)
+    expect(restored.frontmatter).toMatchObject({ custom: 'live', tags: ['legacy'] })
+    expect(restored.logicalState?.markdown).toContain('aliases: [kept-alias] # authored')
+    const restoredMeta = (await store.list()).find((note) => note.id === TITANIUM)!
+    expect(restoredMeta.slug).toBeUndefined()
+    expect(restoredMeta.aliases).toBeUndefined()
+  })
+
+  it('records an honest gap and fails when the exact post-write read fails', async () => {
+    const inner = new InMemoryStore({
+      ...FIXTURE,
+      notes: FIXTURE.notes.map((note) => ({ ...note, frontmatter: 'custom: kept' })),
+    })
+    const { store } = await make(inner)
+    const current = await store.read(TITANIUM)
+    const read = inner.read.bind(inner)
+    let calls = 0
+
+    vi.spyOn(inner, 'read').mockImplementation(async (...args) => {
+      calls++
+      if (calls === 2) {
+        throw new Error('injected post-write read failure')
+      }
+
+      return read(...args)
+    })
+
+    await expect(
+      store.write({
+        title: 'Titanium',
+        content: 'edited body',
+        originalId: TITANIUM,
+        versionToken: current.versionToken,
+      }),
+    ).rejects.toThrow('post-write exact read failed')
+    await store.settle()
+
+    const newest = (await timeline(store, TITANIUM))[0]
+    expect(newest).toMatchObject({ kind: 'write', contentHash: null, stateFormat: null })
+    expect((await store.read(TITANIUM)).frontmatter.custom).toBe('kept')
   })
 
   it('restore with a stale token 409s through the CAS path and journals nothing new', async () => {
@@ -620,6 +951,28 @@ describe('trash (#79) — the journal view + undelete', () => {
     expect((await timeline(store, TITANIUM))[0].kind).toBe('restore')
     const { total } = await store.listTrashed!({ offset: 0, limit: 50 })
     expect(total).toBe(0)
+  })
+
+  it('delete and undelete preserve the complete authored snapshot', async () => {
+    const richFixture: StoreSnapshot = {
+      ...FIXTURE,
+      notes: FIXTURE.notes.map((note) => ({
+        ...note,
+        frontmatter: 'custom: exact\n# survives trash\nplugin:\n  nested: yes',
+      })),
+    }
+    const { store } = await make(new InMemoryStore(richFixture))
+    const before = await store.read(TITANIUM)
+
+    await store.remove(TITANIUM, { principal: 'ui' })
+    await store.settle()
+    const deleted = await store.read(TITANIUM, { deletedView: true })
+    expect(deleted.logicalState?.markdown).toBe(before.logicalState?.markdown)
+    expect(deleted.frontmatter).toMatchObject({ custom: 'exact', tags: ['metal'] })
+
+    await store.restoreFromTrash!(TITANIUM, { principal: 'ui' })
+    const restored = await store.read(TITANIUM)
+    expect(restored.logicalState?.markdown).toBe(before.logicalState?.markdown)
   })
 
   it('restoreTrash is best-effort: restores what it can and reports stale ids per item (#184)', async () => {
@@ -830,6 +1183,7 @@ describe('trash (#79) — the journal view + undelete', () => {
     const view = await store.read(TITANIUM, { deletedView: true })
     expect(view.deleted).toBe(true)
     expect(view.restorable).toBe(true)
+    expect(view.restoreAvailability).toBe('full')
     expect(view.content).toBe('original body') // last body, from the CAS
     expect(view.deletedByPrincipal).toBe('ui')
     // ...but a DISCOVERY read (preview/previews) must still miss on a deleted note,
@@ -837,6 +1191,89 @@ describe('trash (#79) — the journal view + undelete', () => {
     await expect(store.read(TITANIUM)).rejects.toBeTruthy()
     // a genuinely-unknown id throws even with the opt-in (no fake deleted view)
     await expect(store.read('no-such-note', { deletedView: true })).rejects.toBeTruthy()
+  })
+
+  it.each([
+    {
+      id: 'opaque-utf8-deleted',
+      source: new TextEncoder().encode(
+        '---\nname: another-package\ndescription: mismatch\n---\nLiteral source.\n',
+      ),
+    },
+    { id: 'opaque-bytes-deleted', source: Uint8Array.from([0xff, 0x00, 0xfe, 0x61]) },
+  ])('keeps exact document source in the deleted view for $id', async ({ id, source }) => {
+    const { store, persistence } = await make()
+    const documentState = analyzeDocumentState({
+      source,
+      role: 'skill-root',
+      pathFallbackTitle: 'opaque',
+      skillDirectoryName: 'opaque',
+    })
+    const blob = encodeDocumentState(documentState)
+
+    await persistence.append(
+      {
+        noteId: id,
+        space: 'main',
+        baseRevisionId: null,
+        theirRevisionId: null,
+        sourceRevisionId: null,
+        kind: 'delete',
+        entryRole: 'change',
+        principal: 'ui',
+        contentHash: await sha256Hex(blob),
+        semanticFingerprint: documentState.semanticFingerprint,
+        restoreSafety: documentState.restoreSafety.status,
+        stateFormat: documentState.format,
+        title: 'Opaque deleted',
+        class: 'user-doc',
+        slug: null,
+        tags: [],
+        createdAt: '2026-06-12T11:00:00Z',
+        charsAdded: null,
+        charsRemoved: null,
+      },
+      blob,
+    )
+
+    const view = await store.read(id, { deletedView: true })
+
+    expect(view.content).toBe('')
+    expect(view.restoreAvailability).toBe('opaque')
+    expect(view.documentState?.format).toBe('opaque-v1')
+    expect(view.documentState?.source).toEqual(source)
+  })
+
+  it('a legacy deleted view projects its known custom slug', async () => {
+    const { store, persistence } = await make()
+    const content = 'legacy deleted body'
+
+    await persistence.append(
+      {
+        noteId: 'legacy-deleted-note',
+        space: 'main',
+        baseRevisionId: null,
+        theirRevisionId: null,
+        sourceRevisionId: null,
+        kind: 'delete',
+        entryRole: 'change',
+        principal: 'ui',
+        contentHash: await sha256Hex(content),
+        title: 'Legacy deleted',
+        class: 'user-doc',
+        slug: 'known-custom-slug',
+        tags: ['legacy'],
+        createdAt: '2026-06-12T11:00:00Z',
+        charsAdded: null,
+        charsRemoved: null,
+      },
+      content,
+    )
+
+    const view = await store.read('legacy-deleted-note', { deletedView: true })
+
+    expect(view.slug).toBe('known-custom-slug')
+    expect(view.frontmatter).toMatchObject({ slug: 'known-custom-slug', tags: ['legacy'] })
   })
 
   it('hidden classes never surface in the user trash (#78), but scope:all sees them', async () => {
@@ -910,6 +1347,62 @@ describe('trash (#79) — the journal view + undelete', () => {
 })
 
 describe('journal slug-fidelity (#124) — a custom slug survives restore', () => {
+  it('restores the complete tombstone path instead of deriving a basename from title', async () => {
+    const inner = new InMemoryStore({
+      space: 'main',
+      now: '2026-06-10T12:00:00.000Z',
+      notes: [
+        {
+          title: 'Human Title',
+          filePath: 'imports/opaque-source.md',
+          content: 'imported body',
+        },
+      ],
+    })
+    const { store } = await make(inner)
+    const note = (await store.list())[0]
+
+    await store.remove(note.id!)
+    await store.settle()
+    await store.restoreFromTrash!(note.id!)
+    await store.settle()
+
+    expect((await store.list()).find((item) => item.id === note.id)?.filePath).toBe(
+      'imports/opaque-source.md',
+    )
+  })
+
+  it('restores canonical hidden class mounts at their exact tombstone paths', async () => {
+    const fixtures = [
+      ['memory-id', 'agent-memory', '.notarium/memory/category/exact.md'],
+      ['profile-id', 'profile', '.notarium/profile/exact.md'],
+      ['skill-id', 'skill', '.notarium/skills/pkg/guide.md'],
+    ] as const
+    const inner = new InMemoryStore({
+      space: 'main',
+      now: '2026-06-10T12:00:00.000Z',
+      notes: fixtures.map(([id, cls, filePath]) => ({
+        id,
+        class: cls,
+        title: `${cls} exact`,
+        filePath,
+        content: `${cls} body`,
+      })),
+    })
+    const { store } = await make(inner)
+
+    for (const [id, cls, filePath] of fixtures) {
+      await store.remove(id)
+      await store.settle()
+      await store.restoreFromTrash!(id)
+      await store.settle()
+      expect((await store.list({ scope: 'all' })).find((note) => note.id === id)).toMatchObject({
+        class: cls,
+        filePath,
+      })
+    }
+  })
+
   it('the slug is journaled on write, carried on the delete tombstone, and re-set on restore', async () => {
     const { store } = await make()
     const first = await store.read(TITANIUM)
@@ -1041,6 +1534,24 @@ describe('journal slug-fidelity (#124) — a custom slug survives restore', () =
     expect((await store.list()).find((n) => n.id === TITANIUM)!.slug).toBe('keep-me')
   })
 
+  it('projects tags from the exact after-state when a body-only write omits the channel', async () => {
+    const { store } = await make()
+    const first = await store.read(TITANIUM)
+
+    await store.write({
+      title: 'Titanium',
+      content: 'body-only edit',
+      originalId: TITANIUM,
+      versionToken: first.versionToken,
+    })
+    await store.settle()
+
+    const latest = (await timeline(store, TITANIUM))[0]
+    const detail = await store.revision(TITANIUM, latest.id)
+    expect(latest.tags).toEqual(['metal'])
+    expect(detail?.logicalState?.markdown).toContain('tags:\n- metal')
+  })
+
   it('a slug-only change records a revision (slug is in the dedup key)', async () => {
     const { store } = await make()
     const first = await store.read(TITANIUM)
@@ -1069,7 +1580,7 @@ describe('journal slug-fidelity (#124) — a custom slug survives restore', () =
     expect(after[0].slug).toBe('slug-two')
   })
 
-  it('a history rollback re-sets a recorded slug but never silently clears a live one', async () => {
+  it('a history rollback re-sets a recorded slug and a full baseline clears it', async () => {
     const { store } = await make()
     const first = await store.read(TITANIUM)
     // The baseline of the fixture note carries no custom slug (slug null).
@@ -1101,8 +1612,8 @@ describe('journal slug-fidelity (#124) — a custom slug survives restore', () =
     await store.settle()
     expect((await store.list()).find((n) => n.id === TITANIUM)!.slug).toBe('slug-a')
 
-    // Now roll back to the baseline (no recorded slug, null) → the live slug is LEFT
-    // untouched (a rollback never silently clears a slug the timeline doesn't show).
+    // Now roll back to the complete baseline (no slug in its authored state) →
+    // the live custom slug is cleared rather than leaking across full restore.
     const baseline = (await timeline(store, TITANIUM)).find((r) => r.kind === 'external')!
     expect(baseline.slug).toBeNull()
     const live2 = await store.read(TITANIUM)
@@ -1112,7 +1623,186 @@ describe('journal slug-fidelity (#124) — a custom slug survives restore', () =
       versionToken: live2.versionToken!,
     })
     await store.settle()
-    expect((await store.list()).find((n) => n.id === TITANIUM)!.slug).toBe('slug-a')
+    expect((await store.list()).find((n) => n.id === TITANIUM)!.slug).toBeUndefined()
+  })
+})
+
+describe('trash restore/purge cross-instance ordering', () => {
+  const pair = async () => {
+    const inner = new InMemoryStore(FIXTURE)
+    const persistence = new InMemoryRevisionPersistence()
+    const createStore = () =>
+      new CachedStore({
+        inner,
+        revisionPersistence: persistence,
+        space: 'main',
+        pollIntervalMs: 0,
+        relationType: 'links_to',
+        now: () => new Date('2026-06-12T12:00:00Z'),
+      })
+    const restoreStore = createStore()
+    const purgeStore = createStore()
+
+    await restoreStore.start()
+    await purgeStore.start()
+    await restoreStore.remove(TITANIUM)
+    await restoreStore.settle()
+    return { inner, persistence, restoreStore, purgeStore }
+  }
+
+  it('purge-first rejects restore and compensates the already-written live file', async () => {
+    const { inner, persistence, restoreStore, purgeStore } = await pair()
+    const entered = deferred()
+    const release = deferred()
+    const append = persistence.append.bind(persistence)
+
+    persistence.append = async (revision, content) => {
+      if (revision.kind === 'restore') {
+        entered.resolve()
+        await release.promise
+      }
+
+      return append(revision, content)
+    }
+
+    const restoring = restoreStore.restoreFromTrash!(TITANIUM)
+    await entered.promise
+    await expect(purgeStore.purgeTrash!({ ids: [TITANIUM] })).resolves.toEqual({ purged: 1 })
+    release.resolve()
+    await expect(restoring).rejects.toThrow(/revision target was permanently purged/)
+
+    expect((await inner.list()).some((note) => note.id === TITANIUM)).toBe(false)
+    expect((await restoreStore.list({ scope: 'all' })).some((note) => note.id === TITANIUM)).toBe(
+      false,
+    )
+    expect(await persistence.latestFor('main', TITANIUM)).toBeNull()
+  })
+
+  it('keeps the physical restore when the required journal commit loses its acknowledgement', async () => {
+    const { inner, persistence, restoreStore } = await pair()
+    const append = persistence.append.bind(persistence)
+
+    persistence.append = async (revision, content) => {
+      const stored = await append(revision, content)
+
+      if (revision.kind === 'restore') {
+        throw new Error('simulated lost ACK after commit')
+      }
+
+      return stored
+    }
+
+    await expect(restoreStore.restoreFromTrash!(TITANIUM)).rejects.toThrow(
+      'simulated lost ACK after commit',
+    )
+    expect((await inner.list()).some((note) => note.id === TITANIUM)).toBe(true)
+    expect(await persistence.latestFor('main', TITANIUM)).toMatchObject({
+      kind: 'restore',
+      sourceRevisionId: expect.any(String),
+    })
+  })
+
+  it('never compensates a foreign same-state physical replacement', async () => {
+    const { inner, persistence, restoreStore } = await pair()
+    const append = persistence.append.bind(persistence)
+    let replacementInstalled = false
+
+    persistence.append = async (revision, content) => {
+      if (revision.kind === 'restore') {
+        inner.load(FIXTURE)
+        replacementInstalled = true
+        throw new Error('injected required append rejection')
+      }
+
+      return append(revision, content)
+    }
+
+    await expect(restoreStore.restoreFromTrash!(TITANIUM)).rejects.toThrow(
+      /live restore could not be rolled back/,
+    )
+    expect(replacementInstalled).toBe(true)
+    expect((await inner.list()).some((note) => note.id === TITANIUM)).toBe(true)
+  })
+
+  it('an exact read-back failure rejects trash restore and compensates the live file', async () => {
+    const { inner, persistence, restoreStore } = await pair()
+    const write = inner.write.bind(inner)
+    const read = inner.read.bind(inner)
+    let failReadBack = false
+
+    inner.write = async (input) => {
+      const result = await write(input)
+      failReadBack = true
+      return result
+    }
+    inner.read = async (...args) => {
+      if (failReadBack) {
+        failReadBack = false
+        throw new Error('injected post-write read failure')
+      }
+
+      return read(...args)
+    }
+
+    await expect(restoreStore.restoreFromTrash!(TITANIUM)).rejects.toThrow(
+      'post-write exact read failed',
+    )
+
+    expect((await inner.list()).some((note) => note.id === TITANIUM)).toBe(false)
+    expect((await restoreStore.list({ scope: 'all' })).some((note) => note.id === TITANIUM)).toBe(
+      false,
+    )
+    expect((await persistence.latestFor('main', TITANIUM))?.kind).toBe('delete')
+  })
+
+  it('keeps a committed identity-engine restore when later snapshot publication fails', async () => {
+    const { inner, persistence, restoreStore } = await pair()
+    const internals = restoreStore as unknown as {
+      afterNotesReady(fn: () => void): void
+    }
+    const afterNotesReady = internals.afterNotesReady.bind(restoreStore)
+    let failAfterPublish = true
+
+    internals.afterNotesReady = (fn) => {
+      afterNotesReady(fn)
+      if (failAfterPublish) {
+        failAfterPublish = false
+        throw new Error('injected post-append snapshot failure')
+      }
+    }
+
+    await expect(restoreStore.restoreFromTrash!(TITANIUM)).rejects.toThrow(
+      'injected post-append snapshot failure',
+    )
+
+    expect((await inner.list()).some((note) => note.id === TITANIUM)).toBe(true)
+    expect((await restoreStore.list({ scope: 'all' })).some((note) => note.id === TITANIUM)).toBe(
+      true,
+    )
+    expect((await persistence.latestFor('main', TITANIUM))?.kind).toBe('restore')
+    expect((await restoreStore.listTrashed!({ offset: 0, limit: 10 })).total).toBe(0)
+  })
+
+  it('restore-append-first makes a stale purge selection skip the now-live note', async () => {
+    const { inner, persistence, restoreStore, purgeStore } = await pair()
+    const entered = deferred()
+    const release = deferred()
+    const purgeNotes = persistence.purgeNotes.bind(persistence)
+
+    persistence.purgeNotes = async (space, ids, expectedLatest) => {
+      entered.resolve()
+      await release.promise
+      return purgeNotes(space, ids, expectedLatest)
+    }
+
+    const purging = purgeStore.purgeTrash!({ ids: [TITANIUM] })
+    await entered.promise
+    await expect(restoreStore.restoreFromTrash!(TITANIUM)).resolves.toMatchObject({ id: TITANIUM })
+    release.resolve()
+    await expect(purging).resolves.toEqual({ purged: 0 })
+
+    expect((await inner.list()).some((note) => note.id === TITANIUM)).toBe(true)
+    expect((await persistence.latestFor('main', TITANIUM))?.kind).toBe('restore')
   })
 })
 
@@ -1308,6 +1998,9 @@ describe('gap shaping (#327) — what a contaminated row is allowed to say', () 
         session: { id: 'sess-1', name: 'Morning', attach: 'declared' },
       },
       contentHash: 'sha-of-another-space',
+      semanticFingerprint: 'contaminated-fingerprint',
+      stateFormat: 'markdown-v2',
+      restoreSafety: 'safe',
       title: 'Their title',
       slug: 'their-slug',
       class: 'user-doc',
@@ -1335,6 +2028,9 @@ describe('gap shaping (#327) — what a contaminated row is allowed to say', () 
       principal: null,
       agent: null,
       contentHash: null,
+      semanticFingerprint: null,
+      stateFormat: null,
+      restoreSafety: null,
       title: 'Unavailable revision',
       class: null,
       slug: null,
@@ -1359,6 +2055,9 @@ describe('gap shaping (#327) — what a contaminated row is allowed to say', () 
       entryRole: 'origin',
       principal: 'ui',
       contentHash: null,
+      semanticFingerprint: null,
+      stateFormat: null,
+      restoreSafety: null,
       title: 'Shared',
       slug: null,
       class: null,

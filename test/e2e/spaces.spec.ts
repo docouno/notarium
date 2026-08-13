@@ -286,7 +286,10 @@ test('bulk delete handles a mixed selection of a deleted note and a deleted spac
   await expect(page.getByRole('menuitemradio', { name: 'Scratch Space' })).toHaveCount(0)
 })
 
-test('bulk restore several deleted notes from the footer (#184)', async ({ page, baseURL }) => {
+test('fake bulk restore keeps non-durable note rows selected but ineligible (#184)', async ({
+  page,
+  baseURL,
+}) => {
   const alpha = await createNote(page, baseURL!, 'Alpha Restore')
   const beta = await createNote(page, baseURL!, 'Beta Restore')
   await deleteNote(page, baseURL!, alpha.id)
@@ -295,19 +298,25 @@ test('bulk restore several deleted notes from the footer (#184)', async ({ page,
   await page.goto('/s/main/trash?tab=notes')
   await expect(page.getByTestId('trash-row')).toHaveCount(2)
   await page.getByTestId('trash-select-all').check({ force: true })
-  await expect(page.getByTestId('trash-restore-selected')).toContainText('Restore 2')
-  await page.getByTestId('trash-restore-selected').click()
+  const restore = page.getByTestId('trash-restore-selected')
+  await expect(restore).toContainText('Restore 0 available')
+  await expect(restore).toBeDisabled()
+  await expect(page.getByTestId('trash-selection-breakdown')).toHaveText(
+    '0 can restore · 2 unavailable',
+  )
+  await expect(page.getByTestId('trash-restore-unavailable')).toContainText(
+    'Note restore is unavailable on this server',
+  )
 
-  await expect(page.getByTestId('trash-empty-state')).toContainText('Trash is empty')
   expect(
     (await page.request.get(`${baseURL}/api/note?id=${encodeURIComponent(alpha.id)}`)).ok(),
-  ).toBeTruthy()
+  ).toBeFalsy()
   expect(
     (await page.request.get(`${baseURL}/api/note?id=${encodeURIComponent(beta.id)}`)).ok(),
-  ).toBeTruthy()
+  ).toBeFalsy()
 })
 
-test('bulk restore uses the real Select-all-N path beyond one page (#184)', async ({
+test('fake Select-all-N preserves the full roster without claiming notes are restorable (#184)', async ({
   page,
   baseURL,
 }) => {
@@ -321,12 +330,11 @@ test('bulk restore uses the real Select-all-N path beyond one page (#184)', asyn
   await expect(page.getByTestId('trash-select-all-n')).toContainText('Select all 101')
   await page.getByTestId('trash-select-all-n').click()
   await expect(page.getByText('All 101 selected')).toBeVisible()
-  await expect(page.getByTestId('trash-restore-selected')).toContainText('Restore 101')
-  await page.getByTestId('trash-restore-selected').click()
-  await expect(page.getByTestId('trash-empty-state')).toContainText('Trash is empty')
+  await expect(page.getByTestId('trash-restore-selected')).toContainText('Restore 0 available')
+  await expect(page.getByTestId('trash-restore-selected')).toBeDisabled()
 })
 
-test('bulk restore handles a mixed selection of a deleted note and a deleted space (#184)', async ({
+test('mixed bulk restore restores the durable space and leaves the fake-only note (#184)', async ({
   page,
   baseURL,
 }) => {
@@ -343,13 +351,14 @@ test('bulk restore handles a mixed selection of a deleted note and a deleted spa
   await expect(page.getByTestId('trash-space-row')).toContainText('Scratch Space')
   await page.getByTestId('trash-row-check').check({ force: true })
   await page.getByTestId('trash-space-check').check({ force: true })
-  await expect(page.getByTestId('trash-restore-selected')).toContainText('Restore 2')
+  await expect(page.getByTestId('trash-restore-selected')).toContainText('Restore 1 available')
   await page.getByTestId('trash-restore-selected').click()
 
-  await expect(page.getByTestId('trash-empty-state')).toContainText('Trash is empty')
+  await expect(page.getByTestId('trash-row')).toContainText('Mixed Restore')
+  await expect(page.getByTestId('trash-space-row')).toHaveCount(0)
   expect(
     (await page.request.get(`${baseURL}/api/note?id=${encodeURIComponent(note.id)}`)).ok(),
-  ).toBeTruthy()
+  ).toBeFalsy()
   await page.getByTestId('space-switcher').click()
   await expect(page.getByRole('menuitemradio', { name: 'Scratch Space' })).toBeVisible()
 })

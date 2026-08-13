@@ -1,4 +1,5 @@
 import type { Author } from '@notarium/contract'
+import type { RecoveryPresentation } from '../../libs/revisions/revisions'
 
 // The Trash holds ONE kind of thing: a deleted ITEM. A note and a whole space are
 // both items — same row, same checkbox, same Restore, same bulk delete. The only
@@ -16,7 +17,7 @@ export type TrashEntry = {
   memory?: boolean
   external?: boolean
   restorable: boolean
-  restoreTitle: string
+  recovery: RecoveryPresentation
 }
 
 export type BatchFailure = {

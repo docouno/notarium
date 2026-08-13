@@ -3,18 +3,33 @@ import { describe, expect, it } from 'vitest'
 import { NOTE_BASENAME_MAX_BYTES } from './consts'
 import {
   hasPortablePathComponents,
+  isCanonicalInternalRelativeAddress,
   isCanonicalSafeRelativeAddress,
   isCanonicalSafeRelativePath,
   isPortableMoveDestination,
   isPortablePathComponent,
   isPortableRelativeDestination,
+  isSkillPackageRootPath,
   normalizeSafeRelativePath,
   noteFileBase,
   noteFilePath,
+  skillPackagePathOf,
   sluggedNoteName,
 } from './path'
 
 const utf8Bytes = (s: string): number => new TextEncoder().encode(s).length
+
+describe('skill package paths', () => {
+  it('keeps nested resources under the canonical personal or project package root', () => {
+    expect(skillPackagePathOf('review/references/guide.md')).toBe('review')
+    expect(skillPackagePathOf('_projects/project-a/review/references/guide.md')).toBe(
+      '_projects/project-a/review',
+    )
+    expect(isSkillPackageRootPath('review/SKILL.md')).toBe(true)
+    expect(isSkillPackageRootPath('review/references/SKILL.md')).toBe(false)
+    expect(isSkillPackageRootPath('_projects/project-a/review/SKILL.md')).toBe(true)
+  })
+})
 
 // The ONE formula both engines, the read-model's path fence and the boot heal share.
 // Its whole job is that no title can produce a name the storage layer loses (#296).
@@ -180,6 +195,20 @@ describe('portable relative paths', () => {
     expect(isCanonicalSafeRelativePath('a\\b')).toBe(false)
     expect(isCanonicalSafeRelativeAddress('foo:bar/legacy')).toBe(true)
     expect(isCanonicalSafeRelativePath('foo:bar/legacy')).toBe(false)
+  })
+
+  it('admits trusted hidden mount paths without admitting ambiguous traversal', () => {
+    expect(isCanonicalInternalRelativeAddress('.notarium/memory/category/note.md')).toBe(true)
+    for (const path of [
+      '/absolute.md',
+      '../escape.md',
+      '.notarium//note.md',
+      '.notarium/./note.md',
+      '.notarium/memory/../note.md',
+      '.notarium\\memory\\note.md',
+    ]) {
+      expect(isCanonicalInternalRelativeAddress(path)).toBe(false)
+    }
   })
 
   it('allows a portable new child inside an existing legacy directory', () => {

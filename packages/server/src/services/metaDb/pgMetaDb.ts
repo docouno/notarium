@@ -3,8 +3,12 @@
 
 import pg from 'pg'
 
+import { CAUSAL_BARRIER_KIND } from '@notarium/core'
+
 import { createAgentDeltaCursorsFacet } from './drivers/pg/agentDeltaCursors'
 import { createAuthFacet } from './drivers/pg/auth'
+import { lockCausalBarriers } from './drivers/pg/causalBarriers'
+import { createCausalOutboxFacet } from './drivers/pg/causalOutbox'
 import type { PgDriverCtx } from './drivers/pg/context'
 import { createContextOrderFacet } from './drivers/pg/contextOrder'
 import { createContextSetsFacet } from './drivers/pg/contextSets'
@@ -12,6 +16,7 @@ import { createFavoritesFacet } from './drivers/pg/favorites'
 import { createFoldersFacet } from './drivers/pg/folders'
 import { createGatewayFacet } from './drivers/pg/gateway'
 import { createIdentityFacet } from './drivers/pg/identity'
+import { createInstallationGenerationFacet } from './drivers/pg/installationGeneration'
 import { createJobsFacet } from './drivers/pg/jobs'
 import {
   lockContextOrderScopesOfSpace,
@@ -19,13 +24,17 @@ import {
   lockSpaceIdentityRows,
 } from './drivers/pg/lockOrder'
 import { createOAuthFacet } from './drivers/pg/oauth'
+import { createOwnerProofsFacet } from './drivers/pg/ownerProofs'
 import { createProjectsFacet } from './drivers/pg/projects'
+import { createRestoreOperationsFacet } from './drivers/pg/restoreOperations'
+import { createRestoreTerminalFacet } from './drivers/pg/restoreTerminal'
 import { createRetrievalLogFacet } from './drivers/pg/retrievalLog'
 import { lockRevisionKeys } from './drivers/pg/revisionLocks'
 import { createRevisionsFacet } from './drivers/pg/revisions'
 import { createScopePinsFacet } from './drivers/pg/scopePins'
 import { createSessionAuditFacet } from './drivers/pg/sessionAudit'
 import { createSessionsFacet } from './drivers/pg/sessions'
+import { createSpaceLifecycleFacet } from './drivers/pg/spaceLifecycle'
 import { createSpacesFacet } from './drivers/pg/spaces'
 import { runPgMigrations } from './migrations'
 import { spaceOfRow, type SpaceRow } from './rows'
@@ -148,6 +157,18 @@ export class PgMetaDb implements MetaDb {
 
   readonly identity = createIdentityFacet(this.ctx)
 
+  readonly restoreOperations = createRestoreOperationsFacet(this.ctx)
+
+  readonly restoreTerminal = createRestoreTerminalFacet(this.ctx)
+
+  readonly spaceLifecycle = createSpaceLifecycleFacet(this.ctx)
+
+  readonly causalOutbox = createCausalOutboxFacet(this.ctx)
+
+  readonly installationGeneration = createInstallationGenerationFacet(this.ctx)
+
+  readonly ownerProofs = createOwnerProofsFacet(this.ctx)
+
   readonly spaces = createSpacesFacet(this.ctx)
 
   async adoptLegacyRows(legacySlug: string): Promise<void> {
@@ -208,11 +229,50 @@ export class PgMetaDb implements MetaDb {
 
     try {
       await client.query('BEGIN')
-      await client.query("SELECT set_config('notarium.revision_purge_protocol', 'v26', true)")
-      // Level by level, top down — an identity settlement enters at identity and walks
-      // down to the revision locks, so a purge that enters anywhere below and reaches
-      // back up makes the two a cycle. See `drivers/pg/lockOrder`.
+      await client.query("SELECT set_config('notarium.revision_purge_protocol', 'v27', true)")
+      // Enter at identity before the causal/revision tiers: ordinary identity
+      // settlement uses the same order, so purge cannot form a cross-layer cycle.
       await lockSpaceIdentityRows(client, spaceId)
+      await lockCausalBarriers(client, [
+        { kind: CAUSAL_BARRIER_KIND.spaceLifecycle, space: spaceId, key: spaceId },
+      ])
+      const current = await client.query('SELECT phase FROM space_lifecycle WHERE space = $1', [
+        spaceId,
+      ])
+      const currentPhase = current.rows[0]?.phase as string | undefined
+
+      if (
+        currentPhase === 'metadata-cleaned' ||
+        currentPhase === 'physical-cleaned' ||
+        currentPhase === 'purged'
+      ) {
+        await client.query('COMMIT')
+        return
+      }
+      const lifecycleAt = new Date().toISOString()
+
+      if (currentPhase !== 'purge-intent') {
+        await client.query(
+          `INSERT INTO space_lifecycle
+            (space, phase, generation, cleanup_manifest, changed_at, changed_by)
+           VALUES ($1, 'purge-intent', 1, NULL, $2, NULL)
+           ON CONFLICT (space) DO UPDATE SET
+             phase = 'purge-intent',
+             generation = space_lifecycle.generation + 1,
+             changed_at = EXCLUDED.changed_at`,
+          [spaceId, lifecycleAt],
+        )
+      }
+      const blocker = await client.query(
+        `SELECT id FROM restore_operations
+          WHERE space = $1 AND phase NOT IN ('succeeded', 'rejected')
+          LIMIT 1`,
+        [spaceId],
+      )
+
+      if (blocker.rows.length) {
+        throw new Error(`space purge blocked by restore operation: ${blocker.rows[0].id}`)
+      }
       await client.query('DELETE FROM note_identity WHERE space = $1', [spaceId])
       await client.query('DELETE FROM favorites WHERE space = $1', [spaceId])
       await client.query(
@@ -258,6 +318,7 @@ export class PgMetaDb implements MetaDb {
       )
       const hashes = (hashesRes.rows as Array<{ h: string }>).map(({ h }) => h)
       await lockRevisionKeys(client, 'blob', hashes)
+      await client.query('DELETE FROM revision_heads WHERE space = $1', [spaceId])
       await client.query('DELETE FROM note_revisions WHERE space = $1', [spaceId])
       for (const h of hashes) {
         const used = await client.query(
@@ -269,6 +330,10 @@ export class PgMetaDb implements MetaDb {
           await client.query('DELETE FROM revision_blobs WHERE hash = $1', [h])
         }
       }
+      await client.query('DELETE FROM owner_proof_receipts WHERE space = $1', [spaceId])
+      await client.query('DELETE FROM note_owner_proofs WHERE space = $1', [spaceId])
+      await client.query('DELETE FROM restore_operations WHERE space = $1', [spaceId])
+      await client.query('DELETE FROM causal_outbox WHERE space = $1', [spaceId])
       // Legacy rows may carry a space/project id, current slug, or retired space
       // alias. Ids are authoritative; textual history is purged only when every
       // live namespace resolves it to one project (fail closed on collisions).
@@ -336,7 +401,27 @@ export class PgMetaDb implements MetaDb {
          ) WHERE spaces IS NOT NULL`,
         [spaceId],
       )
+      for (const table of [
+        'oauth_auth_codes',
+        'oauth_access_tokens',
+        'oauth_refresh_tokens',
+      ] as const) {
+        await client.query(
+          `UPDATE ${table} SET spaces = (
+             SELECT to_json(COALESCE(array_agg(entry.value), ARRAY[]::text[]))::text
+               FROM json_array_elements_text(${table}.spaces::json) AS entry(value)
+              WHERE entry.value <> $1
+           ) WHERE spaces IS NOT NULL`,
+          [spaceId],
+        )
+      }
       await client.query('DELETE FROM spaces WHERE id = $1', [spaceId])
+      await client.query(
+        `UPDATE space_lifecycle SET
+           phase = 'metadata-cleaned', generation = generation + 1, changed_at = $2
+         WHERE space = $1`,
+        [spaceId, new Date().toISOString()],
+      )
       await client.query('COMMIT')
     } catch (err) {
       await client.query('ROLLBACK')

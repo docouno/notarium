@@ -7,6 +7,7 @@
 // canon: docs/note-history.md#model · docs/architecture.md#p2
 
 import type { AgentWriteAttribution, RevisionKind, RevisionPersistence } from '../knowledgeStore'
+import type { DocumentState, LogicalNoteState } from '../libs/markdown'
 
 export type JournalRecordInput = {
   noteId: string
@@ -20,6 +21,11 @@ export type JournalRecordInput = {
    *  view the version token hashes — restore round-trips through the CAS
    *  path). null = honestly unknown (an external gap). */
   content: string | null
+  /** The complete canonical state. Omitted/null is reserved for honest gaps and
+   * compatibility tests/legacy writers; production writes provide it whenever
+   * the live note was readable. */
+  logicalState?: LogicalNoteState | null
+  documentState?: DocumentState | null
   title: string
   /** The note's model class for class-scoped delta queries. undefined =
    *  unknown here — the journal carries the prior revision's class forward (a
@@ -38,7 +44,14 @@ export type JournalRecordInput = {
   /** The pre-write state, journaled as an 'external' baseline when this is the
    *  note's first journaled revision — so even the first edit has a "before"
    *  to diff against and roll back to. */
-  baseline?: { content: string; title: string; tags?: string[]; slug?: string | null }
+  baseline?: {
+    content: string
+    logicalState?: LogicalNoteState | null
+    documentState?: DocumentState | null
+    title: string
+    tags?: string[]
+    slug?: string | null
+  }
 }
 
 export type JournalOptions = {

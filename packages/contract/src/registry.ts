@@ -55,6 +55,7 @@ import {
   NoteRevisionsQuerySchema,
   NoteRevisionsResponseSchema,
   RestoreRequestSchema,
+  RestoreResponseSchema,
 } from './schemas/rest/history'
 import { ConfigSchema, HostAboutResponseSchema } from './schemas/rest/host'
 import {
@@ -159,12 +160,11 @@ export const contract = {
   revision: { response: NoteRevisionDetailResponseSchema },
   restore: {
     request: RestoreRequestSchema,
-    response: SaveResponseSchema,
-    conflict: ConflictResponseSchema,
+    response: RestoreResponseSchema,
   },
   remove: { response: RemoveResponseSchema },
   trash: { request: TrashQuerySchema, response: TrashResponseSchema },
-  trashRestore: { request: TrashRestoreRequestSchema, response: SaveResponseSchema },
+  trashRestore: { request: TrashRestoreRequestSchema, response: RestoreResponseSchema },
   trashRestoreMany: {
     request: TrashRestoreManyRequestSchema,
     response: TrashRestoreManyResponseSchema,

@@ -29,6 +29,7 @@ const revision = (over: Partial<RevisionInput> = {}): RevisionInput => ({
   entryRole: 'origin',
   principal: 'ui',
   contentHash: 'hash-a',
+  stateFormat: null,
   title: 'Alpha',
   class: 'user-doc',
   slug: null,
@@ -142,6 +143,135 @@ export const describeRevisionPersistenceContract = (
         items: [first],
         total: 2,
       })
+    })
+
+    it('round-trips the full-state marker while normalizing legacy omission to null', async () => {
+      const legacy = await persistence.append(
+        revision({ noteId: 'legacy-state', contentHash: 'legacy-state-hash' }),
+        'legacy body',
+      )
+      const full = await persistence.append(
+        revision({
+          noteId: 'full-state',
+          contentHash: 'full-state-hash',
+          stateFormat: 'markdown-v1',
+        }),
+        '---\ntitle: Full state\ncustom: exact\n---\nbody',
+      )
+
+      expect(legacy.stateFormat).toBeNull()
+      expect((await persistence.get('space-a', legacy.id))?.stateFormat).toBeNull()
+      expect(full.stateFormat).toBe('markdown-v1')
+      expect((await persistence.latestFor('space-a', 'full-state'))?.stateFormat).toBe(
+        'markdown-v1',
+      )
+      expect(await persistence.content('full-state-hash')).toContain('custom: exact')
+    })
+
+    it('round-trips byte-safe document formats without sharing mutable buffers', async () => {
+      const source = Uint8Array.from([0x4e, 0x44, 0x53, 0x31, 0, 0xff, 0x80, 0x0d, 0x0a])
+      const stored = await persistence.append(
+        revision({
+          noteId: 'byte-safe-state',
+          contentHash: 'byte-safe-state-hash',
+          stateFormat: 'opaque-v1',
+        }),
+        source,
+      )
+
+      source[0] = 0
+      const firstRead = await persistence.content('byte-safe-state-hash')
+      expect(stored.stateFormat).toBe('opaque-v1')
+      expect((await persistence.get('space-a', stored.id))?.stateFormat).toBe('opaque-v1')
+      expect(firstRead).toEqual(
+        Uint8Array.from([0x4e, 0x44, 0x53, 0x31, 0, 0xff, 0x80, 0x0d, 0x0a]),
+      )
+
+      if (firstRead instanceof Uint8Array) {
+        firstRead[1] = 0
+      }
+      expect(await persistence.content('byte-safe-state-hash')).toEqual(
+        Uint8Array.from([0x4e, 0x44, 0x53, 0x31, 0, 0xff, 0x80, 0x0d, 0x0a]),
+      )
+    })
+
+    it('CASes one authoritative head and no-ops only equal semantic lifecycle', async () => {
+      const first = await persistence.append(
+        revision({
+          noteId: 'causal-head',
+          contentHash: 'causal-head-a',
+          semanticFingerprint: 'semantic-a',
+          expectedHeadRevisionId: null,
+          allowSemanticNoop: true,
+        }),
+        'state-a',
+      )
+      const noOp = await persistence.append(
+        revision({
+          noteId: 'causal-head',
+          baseRevisionId: first.id,
+          contentHash: 'causal-head-noop',
+          semanticFingerprint: 'semantic-a',
+          expectedHeadRevisionId: first.id,
+          allowSemanticNoop: true,
+        }),
+        'state-that-must-not-land',
+      )
+
+      expect(noOp).toEqual(first)
+      expect(await persistence.content('causal-head-noop')).toBeNull()
+      expect(
+        await persistence.listByNote('space-a', 'causal-head', { offset: 0, limit: 10 }),
+      ).toEqual({
+        items: [first],
+        total: 1,
+      })
+
+      const candidates = ['semantic-b', 'semantic-c'].map((semanticFingerprint, index) =>
+        persistence.append(
+          revision({
+            noteId: 'causal-head',
+            baseRevisionId: first.id,
+            contentHash: `causal-head-${index + 2}`,
+            semanticFingerprint,
+            expectedHeadRevisionId: first.id,
+            allowSemanticNoop: true,
+          }),
+          `state-${index + 2}`,
+        ),
+      )
+      const settled = await Promise.allSettled(candidates)
+      const winners = settled.filter(
+        (result): result is PromiseFulfilledResult<Awaited<(typeof candidates)[number]>> =>
+          result.status === 'fulfilled',
+      )
+      const conflicts = settled.filter((result) => result.status === 'rejected')
+
+      expect(winners).toHaveLength(1)
+      expect(conflicts).toHaveLength(1)
+      expect((conflicts[0] as PromiseRejectedResult).reason).toMatchObject({
+        code: 'revision_head_conflict',
+        currentRevisionId: winners[0].value.id,
+        expectedRevisionId: first.id,
+      })
+      expect(await persistence.latestFor('space-a', 'causal-head')).toEqual(winners[0].value)
+
+      const tombstone = await persistence.append(
+        revision({
+          noteId: 'causal-head',
+          baseRevisionId: winners[0].value.id,
+          kind: 'delete',
+          contentHash: winners[0].value.contentHash,
+          semanticFingerprint: winners[0].value.semanticFingerprint,
+          expectedHeadRevisionId: winners[0].value.id,
+          allowSemanticNoop: true,
+        }),
+        null,
+      )
+      expect(tombstone.id).not.toBe(winners[0].value.id)
+      expect((await persistence.listTrashed('space-a', { offset: 0, limit: 10 })).items).toEqual([
+        tombstone,
+      ])
     })
 
     it('accepts a latest-row set wider than SQLite host-variable limits', async () => {
@@ -343,6 +473,81 @@ export const describeRevisionPersistenceContract = (
       expect(literalWildcard.items.map((item) => item.id)).toEqual([deleted.id])
     })
 
+    it('filters the complete trash population by recovery outcome with partial counts', async () => {
+      const states: Array<Partial<RevisionInput> & { noteId: string }> = [
+        {
+          noteId: 'restore-full',
+          title: 'Complete copy',
+          contentHash: 'restore-full-hash',
+          stateFormat: 'markdown-v2',
+          restoreSafety: 'safe',
+        },
+        {
+          noteId: 'restore-partial',
+          title: 'Older copy',
+          contentHash: 'restore-partial-hash',
+          stateFormat: null,
+          restoreSafety: null,
+        },
+        {
+          noteId: 'restore-blocked',
+          title: 'Protected source',
+          contentHash: 'restore-blocked-hash',
+          stateFormat: 'markdown-v2',
+          restoreSafety: 'blocked',
+        },
+        {
+          noteId: 'restore-opaque',
+          title: 'Source only',
+          contentHash: 'restore-opaque-hash',
+          stateFormat: 'opaque-v1',
+          restoreSafety: null,
+        },
+        {
+          noteId: 'restore-gap',
+          title: 'Deletion record',
+          contentHash: null,
+          stateFormat: null,
+          restoreSafety: null,
+        },
+      ]
+
+      for (const [index, state] of states.entries()) {
+        await persistence.append(
+          revision({
+            ...state,
+            kind: 'delete',
+            createdAt: `2026-06-12T11:0${index}:00.000Z`,
+          }),
+          state.contentHash == null ? null : `state-${index}`,
+        )
+      }
+
+      expect(await persistence.listTrashed('space-a', { offset: 0, limit: 10 })).toMatchObject({
+        total: 5,
+        restorableTotal: 2,
+        partialTotal: 1,
+      })
+      const restorable = await persistence.listTrashed('space-a', {
+        offset: 0,
+        limit: 10,
+        availability: 'restorable',
+      })
+      expect(restorable).toMatchObject({ total: 2, restorableTotal: 2, partialTotal: 1 })
+      expect(new Set(restorable.items.map((item) => item.noteId))).toEqual(
+        new Set(['restore-full', 'restore-partial']),
+      )
+      const unavailable = await persistence.listTrashed('space-a', {
+        offset: 0,
+        limit: 10,
+        availability: 'unavailable',
+      })
+      expect(unavailable).toMatchObject({ total: 3, restorableTotal: 0, partialTotal: 0 })
+      expect(new Set(unavailable.items.map((item) => item.noteId))).toEqual(
+        new Set(['restore-blocked', 'restore-opaque', 'restore-gap']),
+      )
+    })
+
     it('purges whole note histories and GCs only blobs with no surviving referrer', async () => {
       await persistence.append(revision(), 'shared')
       await persistence.append(
@@ -425,6 +630,60 @@ export const describeRevisionPersistenceContract = (
       )
       expect(await persistence.latestFor('space-a', 'terminal-note')).toBeNull()
       expect(await persistence.content('terminal-hash')).toBeNull()
+    })
+
+    it('compare-and-purge skips a tombstone whose latest revision changed', async () => {
+      const noteId = 'conditional-purge'
+      const tombstone = await persistence.append(
+        revision({
+          noteId,
+          kind: 'delete',
+          contentHash: 'conditional-delete-hash',
+          title: 'Conditional',
+        }),
+        'deleted state',
+      )
+      const selected = new Map([[noteId, tombstone.id]])
+      const restored = await persistence.append(
+        revision({
+          noteId,
+          kind: 'restore',
+          baseRevisionId: tombstone.id,
+          sourceRevisionId: tombstone.id,
+          contentHash: 'conditional-restore-hash',
+          title: 'Conditional',
+        }),
+        'restored state',
+      )
+      const matchingId = 'conditional-purge-match'
+      const matching = await persistence.append(
+        revision({
+          noteId: matchingId,
+          kind: 'delete',
+          contentHash: 'conditional-match-hash',
+          title: 'Conditional match',
+        }),
+        'matching deleted state',
+      )
+
+      expect(
+        await persistence.purgeNotes(
+          'space-a',
+          [noteId, matchingId],
+          new Map([...selected, [matchingId, matching.id]]),
+        ),
+      ).toEqual([matchingId])
+      expect((await persistence.latestFor('space-a', noteId))?.id).toBe(restored.id)
+      expect(await persistence.latestFor('space-a', matchingId)).toBeNull()
+      expect(
+        await persistence.purgeNotes('space-a', [noteId], new Map([[noteId, restored.id]])),
+      ).toEqual([noteId])
+      await expect(
+        persistence.append(
+          revision({ noteId, contentHash: 'conditional-late-hash', title: 'Conditional' }),
+          'late state',
+        ),
+      ).rejects.toThrow(/revision target was permanently purged/)
     })
 
     it('aggregates activity with timezone, class, baseline, range, and author semantics', async () => {

@@ -33,6 +33,7 @@ import type {
   ScopePinsPersistence,
   SpacesPersistence,
 } from '../../services/metaDb'
+import type { BulkRestoreCoordinator, RestoreCoordinator } from '../../services/noteRestore'
 import type { MarkerStore } from '../../services/projects'
 import type { RolesService } from '../../services/roles'
 import type { SpaceManager } from '../../services/spaces'
@@ -87,6 +88,8 @@ export type BuildAppOptions = {
   /** Process-local online-backup barrier. Only mutating HTTP requests enter it;
    *  reads stay available while a checkpoint briefly drains writes. */
   mutationGate?: MutationGate
+  restoreCoordinator?: RestoreCoordinator
+  bulkRestoreCoordinator?: BulkRestoreCoordinator
 }
 
 export const buildApp = async ({
@@ -118,6 +121,8 @@ export const buildApp = async ({
   staging,
   wakeJobs,
   mutationGate,
+  restoreCoordinator,
+  bulkRestoreCoordinator,
 }: BuildAppOptions): Promise<FastifyInstance> => {
   const app = Fastify({ bodyLimit: 4 * 1024 * 1024, trustProxy: trustProxy ?? false })
   const authService = auth ?? createAuthService({ mode: AUTH_MODE.none })
@@ -244,10 +249,15 @@ export const buildApp = async ({
   // can()'s deny, INCLUDING mutation routes (rename, projects CRUD) that bypass
   // spaces.store(); DELETE archive still works because the space is live when it resolves.
   // canon: docs/auth.md#model · docs/spaces.md#deleting-a-space-soft-archive-110
-  installAuthz(app, authService, (slug) => {
-    const id = spaces.resolveId(slug)
-    return id && !spaces.recOf(id)?.archivedAt ? id : null
-  })
+  installAuthz(
+    app,
+    authService,
+    (slug) => {
+      const id = spaces.resolveId(slug)
+      return id && !spaces.recOf(id)?.archivedAt ? id : null
+    },
+    (slug) => spaces.resolveId(slug),
+  )
 
   // Thrown errors → JSON envelopes; the 409 conflict carries the live note (CAS loser
   // gets the other side, nothing overwritten). canon: docs/contract.md#cas
@@ -352,6 +362,8 @@ export const buildApp = async ({
     artifacts,
     staging,
     wakeJobs,
+    restoreCoordinator,
+    bulkRestoreCoordinator,
   })
 
   // The OAuth connector facade (discovery + flow endpoints), registered BEFORE the SPA

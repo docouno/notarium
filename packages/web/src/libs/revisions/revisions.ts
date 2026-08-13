@@ -23,6 +23,8 @@ export type RevisionView = {
   createdAt: string
   /** null = an honest gap: the journal saw the change but has no body. */
   contentHash: string | null
+  stateFormat: NoteRevision['stateFormat']
+  restoreAvailability: NoteRevision['restoreAvailability']
   baseRevisionId: string | null
   sourceRevisionId: string | null
   title: string
@@ -39,10 +41,25 @@ export type RevisionView = {
   unavailableReason: RevisionUnavailableReason | null
 }
 
-export type RevisionDetailView = RevisionView & {
-  content: string | null
-  tags: string[]
-}
+type RevisionDetailBaseView = RevisionView & { tags: string[] }
+
+export type RevisionDetailView =
+  | (RevisionDetailBaseView & {
+      contentMode: 'markdown'
+      content: string
+      snapshot: string | null
+    })
+  | (RevisionDetailBaseView & {
+      contentMode: 'source'
+      content: null
+      snapshot: null
+      source: { encoding: 'utf8' | 'base64'; data: string }
+    })
+  | (RevisionDetailBaseView & {
+      contentMode: 'gap'
+      content: null
+      snapshot: null
+    })
 
 export const revisionView = (r: NoteRevision): RevisionView => ({
   revisionId: r.revisionId,
@@ -52,6 +69,8 @@ export const revisionView = (r: NoteRevision): RevisionView => ({
   author: r.author,
   createdAt: r.createdAt,
   contentHash: r.contentHash,
+  stateFormat: r.stateFormat,
+  restoreAvailability: r.restoreAvailability,
   baseRevisionId: r.baseRev,
   sourceRevisionId: r.sourceRev,
   title: r.title,
@@ -60,11 +79,85 @@ export const revisionView = (r: NoteRevision): RevisionView => ({
   unavailableReason: r.unavailableReason ?? null,
 })
 
-export const revisionDetailView = (r: NoteRevisionDetail): RevisionDetailView => ({
-  ...revisionView(r),
-  content: r.content,
-  tags: r.tags,
-})
+export const revisionDetailView = (r: NoteRevisionDetail): RevisionDetailView => {
+  const base = { ...revisionView(r), tags: r.tags }
+
+  return r.contentMode === 'source'
+    ? { ...base, contentMode: r.contentMode, content: null, snapshot: null, source: r.source }
+    : r.contentMode === 'markdown'
+      ? { ...base, contentMode: r.contentMode, content: r.content, snapshot: r.snapshot }
+      : { ...base, contentMode: r.contentMode, content: null, snapshot: null }
+}
+
+export type RecoveryPresentation = {
+  kind: 'complete' | 'partial' | 'source-only' | 'record-only' | 'host-unavailable'
+  label: string
+  reason: string
+}
+
+export const PARTIAL_RESTORE_CONFIRMATION = {
+  title: 'Restore this partial copy?',
+  message:
+    'The note body and known fields will be restored, but metadata that was never captured cannot be recovered.',
+  confirmLabel: 'Restore partial copy',
+} as const
+
+/** User-facing recovery outcomes. The wire keeps the precise integrity enum;
+ * product surfaces speak in terms of what the person can still recover. */
+export const recoveryPresentation = (
+  availability: NoteRevision['restoreAvailability'],
+): RecoveryPresentation => {
+  switch (availability) {
+    case 'full':
+      return {
+        kind: 'complete',
+        label: 'Ready to restore',
+        reason: 'A complete deleted copy is available.',
+      }
+    case 'partial':
+      return {
+        kind: 'partial',
+        label: 'Partial restore',
+        reason:
+          'This older copy contains the note body and known fields, but metadata that was never captured cannot be recovered.',
+      }
+    case 'opaque':
+      return {
+        kind: 'source-only',
+        label: 'Source only',
+        reason:
+          'The original source can still be inspected, but Notarium cannot safely recreate it as a live note.',
+      }
+    case 'blocked':
+      return {
+        kind: 'source-only',
+        label: 'Source only',
+        reason:
+          'The deleted copy refers to protected system identity. Its contents can be inspected, but it cannot be recreated safely.',
+      }
+    case 'unknown':
+      return {
+        kind: 'source-only',
+        label: 'Source only',
+        reason:
+          'A deleted copy is available to inspect, but Notarium could not prove that recreating it would be safe.',
+      }
+    case 'gap':
+      return {
+        kind: 'record-only',
+        label: 'No copy',
+        reason:
+          'Notarium recorded the deletion, but the note content was never captured. There is no copy to restore.',
+      }
+    case 'capability-unavailable':
+      return {
+        kind: 'host-unavailable',
+        label: 'Restore unavailable',
+        reason:
+          'This server can show deleted copies, but it cannot publish them with crash-safe restore.',
+      }
+  }
+}
 
 /** The widget's data port: the host wires it to the transport (the api
  *  service today, anything else tomorrow — the widget is host-agnostic). */
@@ -76,6 +169,6 @@ export type NoteHistorySource = {
   detail: (revisionId: string) => Promise<RevisionDetailView>
   /** Roll the note back to this revision. The host owns the CAS handshake
    *  (fresh token + the restore call); a conflict rejects with
-   *  `reason: 'version_conflict'`. */
+   *  `reason: 'version-conflict'`. */
   restore: (revisionId: string) => Promise<void>
 }

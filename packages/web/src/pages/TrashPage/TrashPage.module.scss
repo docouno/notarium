@@ -139,7 +139,8 @@ $pill-pad: 12px;
   // splitting the band with no depth behind it) and rises to the full `--border` as the
   // list scrolls under the chrome — appearing in step with the glass frost. `--glass-lift`
   // (0→1) is written by useScrollGlass onto the .topChrome wrapper and inherits down here.
-  border-top: 1px solid color-mix(in srgb, var(--border) calc(var(--glass-lift, 0) * 100%), transparent);
+  border-top: 1px solid
+    color-mix(in srgb, var(--border) calc(var(--glass-lift, 0) * 100%), transparent);
   font-size: 13px;
   color: var(--text-dim);
 }
@@ -193,11 +194,11 @@ $pill-pad: 12px;
 // ── scroll list (the virtualizer's scroll element) ──
 // The ONLY in-flow child, so it fills the frame; the floating top chrome + footer
 // overlay it. Its vertical padding is set INLINE (TrashPage.tsx) = the measured chrome
-// height + a little breathing, so the first/last rows clear the frosted bars they scroll
-// under. That padding only shifts the list visually; rows are placed by their true
-// virtual `start`, and the offset the virtualizer's range calc is off by stays far
-// inside the overscan window (no row ever drops out). Horizontal inset + scrollbar
-// gutter stay here so the rows line up column-for-column with the bars above/below.
+// height + breathing, so the first/last rows clear the frosted bars they scroll under.
+// The virtualizer receives that same top inset as `scrollMargin`; its range calculations
+// therefore use the real row coordinates rather than relying on overscan to hide an
+// offset mismatch. Horizontal inset + scrollbar gutter stay here so the rows line up
+// column-for-column with the bars above/below.
 .scroll {
   flex: 1;
   overflow-y: auto;
@@ -211,6 +212,16 @@ $pill-pad: 12px;
 
 .list {
   position: relative;
+}
+
+// Same positioning model as Feed: every mounted virtual row owns its exact transform.
+// Keeping rows out of normal flow avoids moving and relaying out one large wrapper as
+// the virtual window changes, and makes every rendered index independent of its peers.
+.virtualRow {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
 }
 
 .row {
@@ -279,11 +290,9 @@ $pill-pad: 12px;
   }
 }
 
-// Fixed height so the row's height is deterministic for the virtualizer: a memory/
-// external Chip (~18px) or the kind glyph must NOT grow this line past the title's own
-// 16px box — they just centre within it (any 1–2px spilling into the row's padding is
-// invisible). Without this, ROW_H (= 2×$pill-pad + 16 title + 2 gap + 14 meta = 56) would
-// be wrong on chip rows and the virtualizer (which places rows by index×ROW_H) overlaps.
+// Fixed height so the row's height is deterministic for the virtualizer. Without this,
+// ROW_H (= 2×$pill-pad + 16 title + 2 gap + 14 meta = 56) would be wrong and the
+// virtualizer (which places rows by index×ROW_H) would overlap neighbouring rows.
 .titleRow {
   display: flex;
   align-items: center;
@@ -303,18 +312,38 @@ $pill-pad: 12px;
   white-space: nowrap;
 }
 
-.tagExternal {
+.recoveryStatus {
   flex: none;
-  background: color-mix(in srgb, var(--warning, #c98a00) 16%, transparent);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  padding: 4px;
+  font: inherit;
+  font-size: 12px;
+  line-height: 14px;
+  cursor: pointer;
+
+  &:hover,
+  &:focus-visible {
+    background: var(--bg-hover);
+    color: var(--text);
+  }
+
+  &:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+}
+
+.recoveryPartial {
   color: var(--warning, #c98a00);
 }
 
-// Agent-memory note in the trash (#102 phase 3): the unified trash holds notes AND the
-// agent's own memory — flag the memory rows so a human reads them at a glance.
-.tagMemory {
-  flex: none;
-  background: color-mix(in srgb, var(--accent, #7a5cff) 14%, transparent);
-  color: var(--accent, #7a5cff);
+.recoveryUnavailable {
+  color: var(--text-faint);
 }
 
 .meta {
@@ -347,7 +376,9 @@ $pill-pad: 12px;
 // ── floating bottom action bar (#72): frosted glass over the list's tail, the
 //    destructive action at the end of the flow. Absolute (out of flow) so the list
 //    scrolls under it; its frosted fill + top lit edge come from `.glass`/
-//    `.glass-edge-top` (added in JSX). Live height measured → scroll padding-bottom. ──
+//    `.glass-edge-top` (added in JSX). It stays mounted but invisible without a
+//    selection, so its live height is reserved in scroll padding BEFORE it appears —
+//    selecting a row must not change the scroll range or move the viewport. ──
 .footer {
   position: absolute;
   bottom: 0;
@@ -365,6 +396,11 @@ $pill-pad: 12px;
   @include match-scrollbar-gutter; // align the band edge with the list's (it reserves a scrollbar)
 }
 
+.footerHidden {
+  visibility: hidden;
+  pointer-events: none;
+}
+
 .footerInfo {
   display: inline-flex;
   align-items: center;
@@ -374,6 +410,10 @@ $pill-pad: 12px;
   margin-left: $pill-pad; // content line: same as .toolbar-left
   flex: 1 1 240px;
   min-width: 0;
+}
+
+.footerBreakdown {
+  color: var(--text-faint);
 }
 
 // The footer's right action (Empty / Delete N) — pulled to the content line so its right
@@ -408,6 +448,17 @@ $pill-pad: 12px;
   .footerActions,
   .footerAction {
     width: 100%;
+  }
+
+  .toolbar {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .filters {
+    width: 100%;
+    margin-left: $pill-pad;
+    overflow-x: auto;
   }
 }
 
@@ -449,7 +500,31 @@ $pill-pad: 12px;
   display: flex;
   align-items: center;
   gap: 2px;
-  margin-right: $pill-pad; // content line: mirror of .toolbar-left, == a row's pill padding
+  margin-right: 0;
+}
+
+.filters {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-right: $pill-pad;
+}
+
+.filters .tabs + .tabs {
+  padding-left: 8px;
+  border-left: 1px solid var(--border);
+}
+
+.capabilityBanner {
+  margin: 4px $pill-pad 10px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--warning, #c98a00) 36%, var(--border));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--warning, #c98a00) 9%, transparent);
+  color: var(--text-dim);
+  font-size: 13px;
+  line-height: 1.45;
 }
 
 .tab {

@@ -22,9 +22,11 @@ import { nameCollisions } from './cases/nameCollisions'
 import { nonLatinNames } from './cases/nonLatinNames'
 import { noteClasses } from './cases/noteClasses'
 import { readerShowcase } from './cases/readerShowcase'
+import { restoreStates } from './cases/restoreStates'
 import { scrollbars } from './cases/scrollbars'
 import { searchCorpus } from './cases/searchCorpus'
 import { trashEmpty, trashLong, trashMixed } from './cases/trash'
+import { trashRecovery } from './cases/trashRecovery'
 import { wikiWeb } from './cases/wikiWeb'
 import type { CaseSpec } from './types'
 
@@ -47,7 +49,9 @@ export const CASES: readonly CaseSpec[] = [
   trashEmpty,
   trashMixed,
   trashLong,
+  trashRecovery,
   historyRich,
+  restoreStates,
   // graph / identity / search
   wikiWeb,
   graph,

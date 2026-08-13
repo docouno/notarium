@@ -4,6 +4,9 @@ The meta-DB contains state that cannot be reconstructed from Markdown alone:
 stable identities, revision history and blobs, accounts and credentials,
 memberships, durable jobs, OAuth state, and user curation. Its SQLite and
 PostgreSQL drivers therefore share one forward-only, checksummed schema history.
+Authoritative revision heads, restore-operation evidence, space lifecycle,
+receipt-backed owner proofs, installation generation, and the causal outbox live
+in the same repository; filesystem bytes remain under the resource authority.
 Durable owner-scoped agent episodes and their delta positions live here too
 (`agent_sessions`, including its selected role, `mcp_delta_owner_cursors`,
 `mcp_delta_session_cursors`); they
@@ -27,12 +30,18 @@ sqlite/0002_agent_session_role.sql
 sqlite/0003_revision_integrity.sql
 sqlite/0004_scoped_purge_fences.sql
 sqlite/0005_revision_entry_role.sql
+sqlite/0006_revision_state.sql
+sqlite/0007_revision_purge_cas.sql
+sqlite/0008_causal_metadata.sql
 postgres/0000_baseline.sql
 postgres/0001_agent_sessions.sql
 postgres/0002_agent_session_role.sql
 postgres/0003_revision_integrity.sql
 postgres/0004_scoped_purge_fences.sql
 postgres/0005_revision_entry_role.sql
+postgres/0006_revision_state.sql
+postgres/0007_revision_purge_cas.sql
+postgres/0008_causal_metadata.sql
 ```
 
 `0001_agent_sessions` introduces durable agent episodes and separates each
@@ -51,6 +60,61 @@ longer written by the gateway.
 `NULL` is the base mode. Role package content remains file truth in `.notarium/skills`; the
 meta-DB stores only the episode's current selection.
 
+`0006_revision_state` adds nullable `note_revisions.snapshot_format`. Its original
+complete rows use `markdown-v1`; existing rows remain `NULL` and are read as legacy
+body-only snapshots. Later byte-safe formats are additive per row. The migration
+never guesses or rewrites missing metadata.
+
+`0007_revision_purge_cas` advances the PostgreSQL fenced-writer protocol to the
+compare-and-purge generation and adds the byte-safe document-state format. A
+rolling peer using the previous unconditional purge protocol is rejected after
+migration. PostgreSQL converts CAS blobs to `BYTEA`; SQLite preserves its dynamic
+TEXT/BLOB distinction. SQLite serializes append and latest-row compare-and-purge
+with an immediate write transaction.
+
+`0008_causal_metadata` adds the authoritative head, live address revision,
+owner-proof receipts, restore operations, space lifecycle, causal outbox, and
+the witnessed installation generation plus its bounded backup-freeze lease. It
+also persists `note_revisions.semantic_fingerprint` and `restore_safety`, so exact
+source identity and eligibility survive restart instead of being recomputed from a
+possibly newer parser.
+Key transitions and freeze acquire/renew/release serialize on the same
+installation barrier; a crashed producer's expired lease is removed before
+startup recovery. Lifecycle triggers reject delayed space-owned producers
+after closing in both dialects. PostgreSQL uses the shared ordered advisory-lock
+namespace; SQLite uses the matching immediate transaction boundary. Purge retains
+a hidden lifecycle tombstone and immutable cleanup manifest after deleting the
+ordinary registry row, so startup can finish physical cleanup before disk discovery.
+
+Strict restore completion uses the `restoreTerminal` persistence facet rather
+than composing the ordinary facets in application code. One transaction binds
+the accepted operation's prepared evidence and physical receipt to the current
+revision head, identity/address revision, lifecycle, and owner-proof revision;
+then it appends the restore revision/blob, updates the live identity and
+receipt-backed proof, stores the terminal operation result, and appends the
+outbox event. A retry of an already succeeded operation returns the stored
+result without adding a second revision or event. PostgreSQL takes the complete
+causal barrier plan in the global order (installation, lifecycle, note,
+address, proof, operation, blob, outbox) and also joins the legacy revision-GC
+locks; ordinary identity writers join the same address barriers.
+
+Durable bulk restore reuses `restore_operations`: one parent row stores the normalized
+selection and frozen ordered item roster in prepared evidence; each accepted item is a
+normal strict child with a deterministic replay key. Evidence updates use compare-and-
+swap (`expectedPreparedEvidence`) so two resumptions cannot lose a child result. A
+nonterminal parent is a lifecycle blocker. While a space is `closing`, persistence
+rejects fresh restore admission but permits a deterministic child whose validated
+parent was accepted before closing; this lets the bounded roster drain without opening
+a fresh mutation channel.
+
+The causal outbox is a durable projection-repair queue, not a payload transport.
+Each replica rereads committed file/metadata truth and runs its local store
+reconcile before acknowledging an event. Startup drains it strictly after space
+lifecycle recovery and before public admission; a projection failure therefore
+leaves the row pending and fails startup closed. Runtime delivery is at-least-once:
+local commits wake the worker and peer commits are found by polling. An inactive
+space has no live projection to repair and its next activation cold-boots from
+truth, so its event can be acknowledged without warming archived data.
 `0003_revision_integrity` adds the `integrity` axis to `note_revisions`. Existing rows
 become `trusted`: they predate the global arbiter, so nothing has contaminated them yet.
 A row turns `quarantined` only inside a settlement transaction, and every query then has

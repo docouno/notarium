@@ -3,6 +3,7 @@ import type { BackgroundGate, NoteClass } from '@notarium/core'
 import type { Chunker } from '../../libs/chunking'
 import type { Embedder } from '../../libs/embedding'
 import type { FileStore } from '../../libs/files'
+import type { SpaceResourceAuthority } from '../../libs/resourceAuthority'
 import type { SqlDriver } from '../../libs/sql'
 import type { IndexMigration } from './schema'
 
@@ -26,6 +27,10 @@ export type NotariumStoreOptions = {
    *  notes-mount (user-doc, prefix ''); further mounts (agent-mount) are hidden
    *  typed placements in the same space. Must be non-empty. */
   mounts: EngineMount[]
+  /** One physical-byte/admission authority shared by every mount and sidecar in
+   * this space. Optional only for low-level tests that construct the engine
+   * directly; production composition always supplies it. */
+  resourceAuthority?: SpaceResourceAuthority
   /** Index driver (P9 seam): where the derived index lives. */
   sql: SqlDriver
   /** Edge type for derived wikilink edges. MUST match the read-model's

@@ -153,6 +153,13 @@ export const IconCheck = (p: IconProps) => (
     <path d="M20 6 9 17l-5-5" />
   </S>
 )
+export const IconAlertTriangle = (p: IconProps) => (
+  <S {...p}>
+    <path d="m21.73 18-8-14a2 2 0 0 0-3.46 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" />
+    <path d="M12 9v4" />
+    <path d="M12 17h.01" />
+  </S>
+)
 export const IconStar = (p: IconProps) => (
   <S {...p}>
     <path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2L12 17.3l-5.6 2.9 1.1-6.2L3 9.6l6.2-.9z" />

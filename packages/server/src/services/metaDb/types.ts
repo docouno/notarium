@@ -1,9 +1,15 @@
 import type {
   AgentSessionAttach,
+  CausalOutboxPersistence,
   IdentityPersistence,
+  InstallationGenerationPersistence,
+  OwnerProofPersistence,
+  RestoreOperationPersistence,
+  RestoreTerminalPersistence,
   RevisionKind,
   RevisionPersistence,
   RevisionUnavailableReason,
+  SpaceLifecyclePersistence,
 } from '@notarium/core'
 
 /** Derived space registry row; the `.notariummeta` marker is the source of truth.
@@ -968,6 +974,12 @@ export type JobsPersistence = {
 export type MetaDb = {
   identity: IdentityPersistence
   revisions: RevisionPersistence
+  restoreOperations: RestoreOperationPersistence
+  restoreTerminal: RestoreTerminalPersistence
+  spaceLifecycle: SpaceLifecyclePersistence
+  causalOutbox: CausalOutboxPersistence
+  installationGeneration: InstallationGenerationPersistence
+  ownerProofs: OwnerProofPersistence
   spaces: SpacesPersistence
   auth: AuthPersistence
   gateway: GatewayStatePersistence

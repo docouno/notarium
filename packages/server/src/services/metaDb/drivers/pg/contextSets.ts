@@ -160,11 +160,13 @@ export const createContextSetsFacet = (ctx: PgDriverCtx): ContextSetsPersistence
   attach: async (r: ContextSetAttachmentRecord) => {
     await ctx.ensureInit()
     await ctx.required.query(
-      `INSERT INTO context_set_attachments (set_id, target_kind, target_id, target_space, created_at)
-         VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO context_set_attachments
+        (set_id, target_kind, target_id, target_space, created_at, home_space)
+       SELECT $1, $2, $3, $4, $5, home_space FROM context_sets WHERE id = $1
          ON CONFLICT (set_id, target_kind, target_id) DO UPDATE SET
            target_space = EXCLUDED.target_space,
-           created_at = EXCLUDED.created_at`,
+           created_at = EXCLUDED.created_at,
+           home_space = EXCLUDED.home_space`,
       [r.setId, r.targetKind, r.targetId, r.targetSpace, r.createdAt],
     )
   },

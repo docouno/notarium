@@ -1,6 +1,24 @@
 import { describe, expect, it } from 'vitest'
 import type { NoteRevision } from '@notarium/contract'
-import { revisionDetailView, revisionView } from './revisions'
+import { recoveryPresentation, revisionDetailView, revisionView } from './revisions'
+
+describe('recoveryPresentation', () => {
+  it.each([
+    ['full', 'complete', 'Ready to restore'],
+    ['partial', 'partial', 'Partial restore'],
+    ['opaque', 'source-only', 'Source only'],
+    ['blocked', 'source-only', 'Source only'],
+    ['unknown', 'source-only', 'Source only'],
+    ['gap', 'record-only', 'No copy'],
+    ['capability-unavailable', 'host-unavailable', 'Restore unavailable'],
+  ] as Array<[NoteRevision['restoreAvailability'], string, string]>)(
+    '%s is a user outcome, not an internal enum',
+    (availability, kind, label) => {
+      expect(recoveryPresentation(availability)).toMatchObject({ kind, label })
+      expect(recoveryPresentation(availability).reason.length).toBeGreaterThan(20)
+    },
+  )
+})
 
 const wire = (over: Partial<NoteRevision> = {}): NoteRevision => ({
   revisionId: '7',
@@ -10,6 +28,8 @@ const wire = (over: Partial<NoteRevision> = {}): NoteRevision => ({
   author: null,
   createdAt: '2026-08-11T10:00:00.000Z',
   contentHash: null,
+  stateFormat: null,
+  restoreAvailability: 'gap',
   baseRev: null,
   theirRev: null,
   sourceRev: null,
@@ -33,7 +53,9 @@ describe('revisionView', () => {
   it('keeps the detail view a superset of the row', () => {
     const detail = revisionDetailView({
       ...wire({ unavailableReason: 'identity-conflict' }),
+      contentMode: 'gap',
       content: null,
+      snapshot: null,
       tags: [],
     })
 

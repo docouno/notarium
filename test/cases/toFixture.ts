@@ -1,8 +1,13 @@
 import {
+  DEFAULT_NOTE_TYPE,
   diffStats,
   effectiveSlug,
+  type FrontmatterEntry,
   frontmatterEntryOf,
   frontmatterEntryValue,
+  frontmatterListEntry,
+  frontmatterScalarEntry,
+  logicalNoteState,
   nextAliasesMulti,
   normAliases,
   parseFrontmatterLines,
@@ -20,6 +25,7 @@ import type {
   SpaceFixture,
 } from '../fake-server/app'
 import { compareEvents, normDate } from './generators'
+import { materializeRevisionState } from './revisionStates'
 import { agentSessionId } from './sessionIds'
 import type { CaseEvent, CaseWorld } from './types'
 
@@ -75,6 +81,129 @@ const carriedNames = (
     slug: (typeof slugValue === 'string' ? slugify(slugValue) : '') || undefined,
   }
 }
+
+const mergeFrontmatter = (existing: string | undefined, incoming: string): string => {
+  const entries = parseFrontmatterLines(existing ?? '')
+  const incomingEntries = parseFrontmatterLines(incoming)
+  const keyed = new Map<string, FrontmatterEntry>()
+
+  for (const entry of incomingEntries) {
+    if (entry.key) {
+      keyed.set(entry.key, entry)
+    }
+  }
+  const placed = new Set<string>()
+  const existingKeyless = new Set(
+    entries.filter((entry) => !entry.key).map((entry) => entry.lines[0]),
+  )
+  const merged: FrontmatterEntry[] = incomingEntries
+    .filter((entry) => !entry.key && !existingKeyless.has(entry.lines[0]))
+    .map((entry) => ({ key: entry.key, lines: [...entry.lines] }))
+
+  for (const entry of entries) {
+    if (entry.key && keyed.has(entry.key)) {
+      if (!placed.has(entry.key)) {
+        const replacement = keyed.get(entry.key)!
+        merged.push({ key: replacement.key, lines: [...replacement.lines] })
+        placed.add(entry.key)
+      }
+    } else {
+      merged.push({ key: entry.key, lines: [...entry.lines] })
+    }
+  }
+  for (const entry of incomingEntries) {
+    if (entry.key && !placed.has(entry.key)) {
+      merged.push({ key: entry.key, lines: [...entry.lines] })
+      placed.add(entry.key)
+    }
+  }
+
+  return merged.flatMap((entry) => entry.lines).join('\n')
+}
+
+/** Reconstruct the same authored frontmatter the fake store will expose after
+ * typed serializer channels win over imported/raw entries. */
+const stateFrontmatter = (state: NoteState): FrontmatterEntry[] => {
+  const entries = parseFrontmatterLines(state.frontmatter ?? '').map((entry) => ({
+    key: entry.key,
+    lines: [...entry.lines],
+  }))
+  const positions = (key: string) =>
+    entries.flatMap((entry, index) => (entry.key === key ? [index] : []))
+
+  const drop = (key: string) => {
+    for (const index of positions(key).reverse()) {
+      entries.splice(index, 1)
+    }
+  }
+
+  const put = (entry: FrontmatterEntry) => {
+    const indexes = positions(entry.key!)
+
+    if (!indexes.length) {
+      entries.push(entry)
+      return
+    }
+    entries[indexes[0]] = entry
+    for (const index of indexes.slice(1).reverse()) {
+      entries.splice(index, 1)
+    }
+  }
+
+  if (state.noteType !== undefined) {
+    if (state.noteType && state.noteType !== DEFAULT_NOTE_TYPE) {
+      put(frontmatterScalarEntry('type', state.noteType))
+    } else {
+      drop('type')
+    }
+  }
+  if (state.tags !== undefined) {
+    if (state.tags.length) {
+      put(frontmatterListEntry('tags', state.tags))
+    } else {
+      drop('tags')
+    }
+  }
+  if (state.aliasesOwned) {
+    if (state.aliases.length) {
+      put(frontmatterListEntry('aliases', state.aliases))
+    } else {
+      drop('aliases')
+    }
+  }
+  if (state.summary !== undefined) {
+    if (state.summary) {
+      put(frontmatterScalarEntry('summary', state.summary))
+    } else {
+      drop('summary')
+    }
+  }
+  if (state.muted !== undefined) {
+    if (state.muted) {
+      put(frontmatterScalarEntry('muted', 'true'))
+    } else {
+      drop('muted')
+    }
+  }
+  const authoredCreated = frontmatterEntryOf(entries, 'created')
+  const authoredValue = authoredCreated && frontmatterEntryValue(authoredCreated)
+
+  if (
+    !authoredCreated ||
+    (typeof authoredValue === 'string' && !Number.isNaN(Date.parse(authoredValue)))
+  ) {
+    put(frontmatterScalarEntry('created', state.createdAt))
+  }
+
+  return entries
+}
+
+const journalState = (state: NoteState): string =>
+  logicalNoteState({
+    title: state.title,
+    body: journalBody(state.content, state.title),
+    frontmatter: stateFrontmatter(state),
+  }).markdown
 
 const kindOf = (op: CaseEvent['op']): NonNullable<ActivityFixture['kind']> =>
   op === 'create'
@@ -133,7 +262,7 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
     // normalised content, which is what the churn counters are measured against
     // (`create` has no parent, so ''). Normalised with the PARENT's title, before
     // any rename this event carries is applied below.
-    const before = cur ? journalBody(cur.content, cur.title) : ''
+    const before = cur ? journalState(cur) : ''
 
     if (e.op === 'create') {
       const names = carriedNames(e.frontmatter)
@@ -142,7 +271,7 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
         path: e.path,
         title: e.title,
         content: e.content,
-        tags: e.tags,
+        tags: e.pin ? [...(e.tags ?? []), 'always-load'] : e.tags,
         noteType: e.noteType,
         class: e.class && e.class !== 'user-doc' ? e.class : undefined,
         summary: e.summary,
@@ -177,6 +306,35 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
         if (e.tags !== undefined) {
           cur.tags = e.tags
         }
+        if (e.frontmatter !== undefined) {
+          const patchedKeys = new Set(
+            parseFrontmatterLines(e.frontmatter).flatMap((entry) => (entry.key ? [entry.key] : [])),
+          )
+          cur.frontmatter = mergeFrontmatter(cur.frontmatter, e.frontmatter)
+          const names = carriedNames(cur.frontmatter)
+          cur.slug = names.slug
+          if (patchedKeys.has('aliases')) {
+            cur.aliasesOwned = false
+          }
+          if (!cur.aliasesOwned) {
+            cur.aliases = names.aliases
+          }
+          // Raw metadata owns these keys on the real replay path. Clear any
+          // older explicit fixture projection so InMemoryStore derives the new
+          // typed view from the merged authored entry instead of overwriting it.
+          if (patchedKeys.has('tags') && e.tags === undefined) {
+            cur.tags = undefined
+          }
+          if (patchedKeys.has('type')) {
+            cur.noteType = undefined
+          }
+          if (patchedKeys.has('summary')) {
+            cur.summary = undefined
+          }
+          if (patchedKeys.has('muted')) {
+            cur.muted = undefined
+          }
+        }
       }
       cur.deleted = e.op === 'delete'
       cur.modifiedAt = normDate(e.date)
@@ -206,15 +364,55 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
       // with what a live write would have stored. A `delete` row carries the body
       // the note had when it died, exactly like the real applier's tombstone.
       content: state ? journalBody(state.content, state.title) : undefined,
+      snapshot: state ? journalState(state) : undefined,
       // Churn stamped the way the journal stamps it for this op, so the "+N −M" on
       // the feed is a measurement rather than a decoration.
-      ...churn(e.op, before, state ? journalBody(state.content, state.title) : ''),
+      ...churn(e.op, before, state ? journalState(state) : ''),
+      ...churn(e.op, before, state ? journalState(state) : ''),
       // A row the settlement quarantined: the fake serves it with the drivers'
       // effective-field semantics, so the stand shows a real gap rather than a
       // drawing of one.
       ...(e.op === 'edit' && e.unavailable ? { unavailable: true } : {}),
     })
     activityBySpace.set(e.space, rows)
+  }
+
+  for (const declaration of world.revisionStates ?? []) {
+    const state = notes.get(declaration.note)
+
+    if (!state) {
+      throw new Error(`revision state references unknown note ${declaration.note}`)
+    }
+    const noteId = deterministicNoteId(state.path)
+    const materialized = materializeRevisionState(declaration, {
+      noteId,
+      path: state.path,
+      createdAt: state.createdAt,
+      title: state.title,
+    })
+    const rows = activityBySpace.get(state.space) ?? []
+    const blob = materialized.blob
+
+    rows.push({
+      date: normDate(declaration.date),
+      kind: declaration.kind === 'delete' ? 'deleted' : 'edited',
+      title: materialized.title,
+      noteId,
+      class: state.class,
+      principal: declaration.principal,
+      ...(materialized.content != null ? { content: materialized.content } : {}),
+      ...(blob != null
+        ? {
+            stateBlobBase64: Buffer.from(
+              typeof blob === 'string' ? new TextEncoder().encode(blob) : blob,
+            ).toString('base64'),
+          }
+        : {}),
+      stateFormat: materialized.stateFormat,
+      restoreSafety: materialized.restoreSafety,
+      semanticFingerprint: materialized.semanticFingerprint,
+    })
+    activityBySpace.set(state.space, rows)
   }
 
   // A real seed performs these replacements directly on disk after replay. The

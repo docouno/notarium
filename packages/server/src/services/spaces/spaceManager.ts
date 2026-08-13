@@ -9,16 +9,20 @@ import {
   type IdentityRecord,
   noteFileBase,
   READ_SCOPE,
+  SPACE_LIFECYCLE_PHASE,
+  type SpaceLifecyclePhase,
   type StoreEvent,
 } from '@notarium/core'
 
 import type { SpaceRecord } from '../metaDb'
 import { provisionSpaceIdentity } from '../projects/spaceIdentity'
 import { spaceNotFound } from './errors'
+import { decodeSpaceCleanupManifest, encodeSpaceCleanupManifest } from './spaceCleanupManifest'
 import { buildSpaceSlugIndex, resolvableSpaceAliases } from './spaceResolver'
 import type { SpaceDef, SpaceManagerOptions, SpaceStore } from './types'
 
 const EVICT_SWEEP_MS = 60_000
+const DEFAULT_LIFECYCLE_DRAIN_MS = 30_000
 
 /** Space-lifecycle error; the wire layer maps `reason` to an HTTP status. */
 const spaceError = (message: string, reason: string): Error & { reason: string } => {
@@ -29,6 +33,7 @@ const spaceError = (message: string, reason: string): Error & { reason: string }
 
 type SpaceEntry = {
   rec: SpaceRecord
+  lifecycle: SpaceLifecyclePhase
   /** Config-pinned (slug frozen by env, rename/archive refused) vs runtime-minted. */
   config: boolean
   storePromise: Promise<SpaceStore> | null
@@ -51,11 +56,14 @@ export class SpaceManager {
   private readonly metaDb?: SpaceManagerOptions['metaDb']
   private readonly onProvision?: SpaceManagerOptions['onProvision']
   private readonly onPurge?: SpaceManagerOptions['onPurge']
+  private readonly closeResourceAdmission?: SpaceManagerOptions['closeResourceAdmission']
+  private readonly reopenResourceAdmission?: SpaceManagerOptions['reopenResourceAdmission']
   private readonly readSpaceFacet?: SpaceManagerOptions['readSpaceFacet']
   private readonly discoverDiskSpaces?: SpaceManagerOptions['discoverDiskSpaces']
   private readonly adoptLegacyInto?: string
   private readonly isPersonalSpace?: SpaceManagerOptions['isPersonalSpace']
   private readonly idleEvictMs: number
+  private readonly lifecycleDrainMs: number
   private readonly now: () => Date
   private evictTimer: ReturnType<typeof setInterval> | null = null
   private readonly settling = new Set<Promise<void>>()
@@ -69,11 +77,14 @@ export class SpaceManager {
     metaDb,
     onProvision,
     onPurge,
+    closeResourceAdmission,
+    reopenResourceAdmission,
     readSpaceFacet,
     discoverDiskSpaces,
     adoptLegacyInto,
     isPersonalSpace,
     idleEvictMs = 0,
+    lifecycleDrainMs = DEFAULT_LIFECYCLE_DRAIN_MS,
     now = () => new Date(),
   }: SpaceManagerOptions) {
     // With a meta-DB, entries are built in init() (the opaque id needs an async
@@ -85,11 +96,17 @@ export class SpaceManager {
     this.metaDb = metaDb
     this.onProvision = onProvision
     this.onPurge = onPurge
+    this.closeResourceAdmission = closeResourceAdmission
+    this.reopenResourceAdmission = reopenResourceAdmission
     this.readSpaceFacet = readSpaceFacet
     this.discoverDiskSpaces = discoverDiskSpaces
     this.adoptLegacyInto = adoptLegacyInto
     this.isPersonalSpace = isPersonalSpace
     this.idleEvictMs = idleEvictMs
+    if (!Number.isFinite(lifecycleDrainMs) || lifecycleDrainMs < 0) {
+      throw new Error('lifecycleDrainMs must be a non-negative number')
+    }
+    this.lifecycleDrainMs = lifecycleDrainMs
     this.now = now
     // meta-DB-less (e2e fake / none-mode): id ≡ slug, no async resolve, so register
     // synchronously — callers expect list()/has()/store() to work before init().
@@ -121,6 +138,10 @@ export class SpaceManager {
    *  start the eviction sweep. */
   async init(): Promise<void> {
     if (this.metaDb) {
+      // Durable lifecycle recovery runs before disk discovery. A leftover purged
+      // marker is cleanup input, never a new registry candidate.
+      await this.metaDb.spaceLifecycle.init()
+      await this.recoverLifecycleSagas()
       // adoptDiscovered runs BEFORE provision/recovery so re-cloned runtime folders
       // keep their marker-borne id instead of minting fresh.
       await this.adoptDiscovered()
@@ -136,7 +157,8 @@ export class SpaceManager {
           { spaces: this.metaDb.spaces, now: this.now },
           { slug: def.slug, displayName: def.displayName, markerFacet },
         )
-        this.register(rec, true)
+        const lifecycle = await this.lifecycleForRecord(rec)
+        this.register(rec, true, lifecycle)
         if (!known.has(def.slug)) {
           await this.provision(rec)
         }
@@ -147,7 +169,8 @@ export class SpaceManager {
         if (configSlugs.has(rec.slug) || this.entries.has(rec.id)) {
           continue
         }
-        this.register(rec, false)
+        const lifecycle = await this.lifecycleForRecord(rec)
+        this.register(rec, false, lifecycle)
       }
       // Adopt legacy rows AFTER spaces exist (adoptLegacyRows resolves legacy slug →
       // id). Idempotent; a no-op on modern deploys.
@@ -159,6 +182,243 @@ export class SpaceManager {
       this.evictTimer = setInterval(() => this.evictIdle(), EVICT_SWEEP_MS)
       this.evictTimer.unref?.()
     }
+  }
+
+  /** Resume registry-owned lifecycle work without exposing the space through the
+   * served registry. Busy accepted restore operations keep `closing`/`purge-intent`
+   * durable for the later recovery coordinator. */
+  private async recoverLifecycleSagas(): Promise<void> {
+    if (!this.metaDb) {
+      return
+    }
+    for (const lifecycle of await this.metaDb.spaceLifecycle.listUnfinished()) {
+      try {
+        await this.resumeLifecycle(lifecycle.space)
+      } catch (error) {
+        if ((error as { reason?: string }).reason === 'space_busy') {
+          console.warn(`[spaces] lifecycle ${lifecycle.space} remains ${lifecycle.phase}`)
+          continue
+        }
+        throw error
+      }
+    }
+  }
+
+  /** Recovery hook for startup and for the restore coordinator after it settles
+   * an operation that pinned closing/purge. */
+  async resumeLifecycle(space: string): Promise<void> {
+    if (!this.metaDb) {
+      return
+    }
+    const lifecycle = await this.metaDb.spaceLifecycle.get(space)
+
+    if (!lifecycle) {
+      return
+    }
+    if (lifecycle.phase === SPACE_LIFECYCLE_PHASE.closing) {
+      const rec = await this.metaDb.spaces.getById(space)
+
+      if (!rec) {
+        throw new Error(`closing space is missing its registry row: ${space}`)
+      }
+      await this.completeArchive(rec, lifecycle.changedBy)
+      return
+    }
+    if (
+      lifecycle.phase === SPACE_LIFECYCLE_PHASE.purgeIntent ||
+      lifecycle.phase === SPACE_LIFECYCLE_PHASE.metadataCleaned ||
+      lifecycle.phase === SPACE_LIFECYCLE_PHASE.physicalCleaned
+    ) {
+      await this.completePurge(space)
+    }
+  }
+
+  private async lifecycleForRecord(rec: SpaceRecord): Promise<SpaceLifecyclePhase> {
+    const db = this.metaDb!
+    let lifecycle = await db.spaceLifecycle.ensure(
+      rec.id,
+      rec.archivedAt ? SPACE_LIFECYCLE_PHASE.archived : SPACE_LIFECYCLE_PHASE.active,
+      rec.archivedAt ?? rec.createdAt,
+    )
+
+    // Repair only the two safe commit-order cuts. Archive writes the row while
+    // lifecycle is closing; restore clears the row before reopening lifecycle.
+    if (rec.archivedAt && lifecycle.phase === SPACE_LIFECYCLE_PHASE.active) {
+      const closing = await db.spaceLifecycle.transition({
+        space: rec.id,
+        expectedPhases: [SPACE_LIFECYCLE_PHASE.active],
+        phase: SPACE_LIFECYCLE_PHASE.closing,
+        changedAt: rec.archivedAt,
+        changedBy: rec.archivedBy,
+      })
+      lifecycle =
+        closing.status === 'transitioned' || closing.status === 'phase-conflict'
+          ? closing.lifecycle
+          : lifecycle
+      if (lifecycle.phase === SPACE_LIFECYCLE_PHASE.closing) {
+        const archived = await db.spaceLifecycle.transition({
+          space: rec.id,
+          expectedPhases: [SPACE_LIFECYCLE_PHASE.closing],
+          phase: SPACE_LIFECYCLE_PHASE.archived,
+          changedAt: rec.archivedAt,
+          changedBy: rec.archivedBy,
+        })
+
+        if (archived.status === 'transitioned' || archived.status === 'phase-conflict') {
+          lifecycle = archived.lifecycle
+        }
+      }
+    } else if (!rec.archivedAt && lifecycle.phase === SPACE_LIFECYCLE_PHASE.archived) {
+      const active = await db.spaceLifecycle.transition({
+        space: rec.id,
+        expectedPhases: [SPACE_LIFECYCLE_PHASE.archived],
+        phase: SPACE_LIFECYCLE_PHASE.active,
+        changedAt: this.now().toISOString(),
+      })
+
+      if (active.status === 'transitioned' || active.status === 'phase-conflict') {
+        lifecycle = active.lifecycle
+      }
+    }
+
+    return lifecycle.phase
+  }
+
+  private async completeArchive(rec: SpaceRecord, changedBy: string | null): Promise<SpaceRecord> {
+    const db = this.metaDb!
+    const now = this.now().toISOString()
+    const jobs = await db.jobs.list(rec.id, { statuses: ['pending', 'running'] })
+
+    await Promise.all(jobs.map((job) => db.jobs.cancel(job.id, now)))
+
+    try {
+      await this.closeResourceAdmission?.(rec.id, this.lifecycleDrainMs)
+    } catch (cause) {
+      const error = spaceError(
+        'space still has active resource operations',
+        'space_busy',
+      ) as Error & {
+        cause?: unknown
+      }
+      error.cause = cause
+      throw error
+    }
+    const blockers = await db.restoreOperations.listRecoverable(rec.id)
+
+    if (blockers.length) {
+      throw spaceError(
+        `space lifecycle is pinned by restore operation ${blockers[0].id}`,
+        'space_busy',
+      )
+    }
+    const entry = this.entries.get(rec.id)
+
+    if (entry) {
+      await this.evictStoreAndSettle(entry, 'archive')
+    }
+    const archivedAt = rec.archivedAt ?? this.now().toISOString()
+    const archived: SpaceRecord = {
+      ...rec,
+      archivedAt,
+      archivedBy: rec.archivedAt ? rec.archivedBy : changedBy,
+    }
+
+    await db.spaces.upsert(archived)
+    const transition = await db.spaceLifecycle.transition({
+      space: rec.id,
+      expectedPhases: [SPACE_LIFECYCLE_PHASE.closing],
+      phase: SPACE_LIFECYCLE_PHASE.archived,
+      changedAt: archivedAt,
+      changedBy: archived.archivedBy,
+    })
+
+    if (
+      transition.status !== 'transitioned' &&
+      !(
+        transition.status === 'phase-conflict' &&
+        transition.lifecycle.phase === SPACE_LIFECYCLE_PHASE.archived
+      )
+    ) {
+      throw new Error(`space archive lifecycle changed concurrently: ${rec.id}`)
+    }
+    if (entry) {
+      entry.rec = archived
+      entry.lifecycle = SPACE_LIFECYCLE_PHASE.archived
+    }
+
+    return archived
+  }
+
+  private async completePurge(space: string): Promise<SpaceRecord> {
+    const db = this.metaDb!
+    let lifecycle = await db.spaceLifecycle.get(space)
+
+    if (!lifecycle) {
+      throw new Error(`purging space is missing lifecycle state: ${space}`)
+    }
+    if (lifecycle.phase === SPACE_LIFECYCLE_PHASE.purgeIntent) {
+      const blockers = await db.restoreOperations.listRecoverable(space)
+
+      if (blockers.length) {
+        throw spaceError(
+          `space purge is pinned by restore operation ${blockers[0].id}`,
+          'space_busy',
+        )
+      }
+      await db.purgeSpace(space)
+      const cleaned = await db.spaceLifecycle.get(space)
+
+      if (!cleaned) {
+        throw new Error(`purging space lost lifecycle state: ${space}`)
+      }
+      lifecycle = cleaned
+    }
+    const manifest = decodeSpaceCleanupManifest(lifecycle.cleanupManifest)
+
+    if (manifest.space.id !== space) {
+      throw new Error(`space cleanup manifest id mismatch: ${space}`)
+    }
+    if (lifecycle.phase === SPACE_LIFECYCLE_PHASE.metadataCleaned) {
+      await this.onPurge?.(manifest.space)
+      const physical = await db.spaceLifecycle.transition({
+        space,
+        expectedPhases: [SPACE_LIFECYCLE_PHASE.metadataCleaned],
+        phase: SPACE_LIFECYCLE_PHASE.physicalCleaned,
+        changedAt: this.now().toISOString(),
+      })
+
+      if (physical.status === 'transitioned') {
+        lifecycle = physical.lifecycle
+      } else if (
+        physical.status === 'phase-conflict' &&
+        (physical.lifecycle.phase === SPACE_LIFECYCLE_PHASE.physicalCleaned ||
+          physical.lifecycle.phase === SPACE_LIFECYCLE_PHASE.purged)
+      ) {
+        lifecycle = physical.lifecycle
+      } else {
+        throw new Error(`space physical cleanup lifecycle changed concurrently: ${space}`)
+      }
+    }
+    if (lifecycle.phase === SPACE_LIFECYCLE_PHASE.physicalCleaned) {
+      const purged = await db.spaceLifecycle.transition({
+        space,
+        expectedPhases: [SPACE_LIFECYCLE_PHASE.physicalCleaned],
+        phase: SPACE_LIFECYCLE_PHASE.purged,
+        changedAt: this.now().toISOString(),
+      })
+
+      if (
+        purged.status !== 'transitioned' &&
+        !(
+          purged.status === 'phase-conflict' &&
+          purged.lifecycle.phase === SPACE_LIFECYCLE_PHASE.purged
+        )
+      ) {
+        throw new Error(`space purge lifecycle changed concurrently: ${space}`)
+      }
+    }
+
+    return manifest.space
   }
 
   /** Adopt re-cloned runtime space folders by seeding their marker-borne id into
@@ -185,6 +445,14 @@ export class SpaceManager {
 
     for (const d of discovered) {
       if (knownDirs.has(d.notesDir)) {
+        continue
+      }
+      const lifecycle = await this.metaDb.spaceLifecycle.get(d.id)
+
+      if (lifecycle && lifecycle.phase !== SPACE_LIFECYCLE_PHASE.active) {
+        console.warn(
+          `[spaces] disk space ${d.notesDir}: marker id ${d.id} is fenced by lifecycle ${lifecycle.phase} — skipping adoption`,
+        )
         continue
       }
       const holder = await this.metaDb.spaces.getById(d.id)
@@ -224,12 +492,16 @@ export class SpaceManager {
   /** Every SERVED space's record; archived spaces are excluded (registered but not
    *  served). canon: docs/spaces.md#deleting-a-space-soft-archive-110 */
   list(): SpaceRecord[] {
-    return [...this.entries.values()].filter((e) => !e.rec.archivedAt).map((e) => e.rec)
+    return [...this.entries.values()]
+      .filter((entry) => entry.lifecycle === SPACE_LIFECYCLE_PHASE.active)
+      .map((entry) => entry.rec)
   }
 
   /** Every ARCHIVED space's record; membership-filtering is the caller's job. */
   listArchived(): SpaceRecord[] {
-    return [...this.entries.values()].filter((e) => e.rec.archivedAt).map((e) => e.rec)
+    return [...this.entries.values()]
+      .filter((entry) => entry.lifecycle === SPACE_LIFECYCLE_PHASE.archived)
+      .map((entry) => entry.rec)
   }
 
   recOf(id: string): SpaceRecord | undefined {
@@ -271,7 +543,7 @@ export class SpaceManager {
     const entry = this.entries.get(id)
 
     // Archived space: fail-closed 404 (data intact for restore).
-    if (!entry || entry.rec.archivedAt) {
+    if (!entry || entry.lifecycle !== SPACE_LIFECYCLE_PHASE.active) {
       throw spaceNotFound(id)
     }
     entry.lastAccess = Date.now()
@@ -283,9 +555,8 @@ export class SpaceManager {
           // Evicted/archived WHILE booting: a concurrent archive()/idle-eviction nulled
           // storePromise. Don't install this now-stale store — it would leak a started
           // store on an archived space and double-open its .db on restore. Tear it down.
-          if (entry.storePromise !== booting || entry.rec.archivedAt) {
+          if (entry.storePromise !== booting || entry.lifecycle !== SPACE_LIFECYCLE_PHASE.active) {
             store.stop?.()
-            this.trackSettle(store, 'stale boot')
             return store
           }
           entry.store = store
@@ -313,6 +584,36 @@ export class SpaceManager {
     }
 
     return store
+  }
+
+  /** Outbox recovery for this replica. An inactive space has no live projection
+   * to repair; its next activation cold-boots from physical truth. */
+  async reconcileCausalProjection(space: string, resourceId?: string): Promise<void> {
+    const entry = this.entries.get(space)
+
+    if (!entry || entry.lifecycle !== SPACE_LIFECYCLE_PHASE.active) {
+      return
+    }
+    const store = await this.store(space)
+
+    if (!store.reconcile) {
+      throw new Error(`space ${space} cannot reconcile causal outbox events`)
+    }
+    const findById = this.metaDb?.identity.findById
+
+    if (findById) {
+      const noteIds = resourceId ? [resourceId] : []
+
+      for (const noteId of noteIds) {
+        const identity = await findById(noteId)
+
+        if (identity) {
+          await store.adoptCausalIdentity?.(identity)
+        }
+      }
+    }
+    await store.identityReady?.()
+    await store.reconcile()
   }
 
   /** Per-space SSE subscription; holds an eviction guard (sseRefs) for the socket's
@@ -355,14 +656,14 @@ export class SpaceManager {
       // waits for duplicate ownership without warming inaccessible/archived data.
       const entry = this.entries.get(rec.space)
 
-      if (entry && !entry.rec.archivedAt) {
+      if (entry?.lifecycle === SPACE_LIFECYCLE_PHASE.active) {
         entry.identityReadyRequired = true
       }
 
       return { space: rec.space, deletedAt: rec.deletedAt }
     }
     for (const [spaceId, entry] of this.entries) {
-      if (entry.rec.archivedAt) {
+      if (entry.lifecycle !== SPACE_LIFECYCLE_PHASE.active) {
         continue
       }
       const store = await this.store(spaceId)
@@ -421,7 +722,8 @@ export class SpaceManager {
         (typeof actualDir === 'string' && actualDir ? actualDir : seed.notesDir),
     }
     await this.metaDb?.spaces.upsert(rec)
-    this.register(rec, false)
+    await this.metaDb?.spaceLifecycle.ensure(rec.id, SPACE_LIFECYCLE_PHASE.active, rec.createdAt)
+    this.register(rec, false, SPACE_LIFECYCLE_PHASE.active)
     if (!existing) {
       await this.provision(rec)
     }
@@ -454,10 +756,7 @@ export class SpaceManager {
     }
     this.entries.delete(id)
     this.rebuildSlugIndex()
-    if (entry.store) {
-      entry.store.stop?.()
-      await entry.store.settle?.()
-    }
+    await this.evictStore(entry, 'remove')
   }
 
   /** Archive a space (soft-delete): mark it archived, evict its live store; it stops
@@ -476,19 +775,26 @@ export class SpaceManager {
     }
     const entry = this.entries.get(id)
 
-    if (!entry || entry.rec.archivedAt) {
+    if (!entry || entry.lifecycle === SPACE_LIFECYCLE_PHASE.archived) {
       throw spaceNotFound(id)
     }
-    // archivedBy = raw actor attribution; resolved to an Author on the wire.
-    const rec: SpaceRecord = {
-      ...entry.rec,
-      archivedAt: this.now().toISOString(),
-      archivedBy: by ?? null,
+    if (entry.lifecycle !== SPACE_LIFECYCLE_PHASE.closing) {
+      const transition = await this.metaDb.spaceLifecycle.transition({
+        space: id,
+        expectedPhases: [SPACE_LIFECYCLE_PHASE.active],
+        phase: SPACE_LIFECYCLE_PHASE.closing,
+        changedAt: this.now().toISOString(),
+        changedBy: by ?? null,
+      })
+
+      if (transition.status !== 'transitioned') {
+        throw spaceError('space lifecycle changed concurrently', 'space_busy')
+      }
+      entry.lifecycle = SPACE_LIFECYCLE_PHASE.closing
     }
-    await this.metaDb.spaces.upsert(rec)
-    entry.rec = rec
-    this.evictStore(entry)
-    return rec
+
+    const lifecycle = await this.metaDb.spaceLifecycle.get(id)
+    return this.completeArchive(entry.rec, lifecycle?.changedBy ?? by ?? null)
   }
 
   /** Restore an archived space: clear the mark; the store boots lazily on next
@@ -499,12 +805,31 @@ export class SpaceManager {
     }
     const entry = this.entries.get(id)
 
-    if (!entry || !entry.rec.archivedAt) {
+    if (!entry || entry.lifecycle !== SPACE_LIFECYCLE_PHASE.archived || !entry.rec.archivedAt) {
       throw spaceNotFound(id)
     }
     const rec: SpaceRecord = { ...entry.rec, archivedAt: null, archivedBy: null }
+
+    this.reopenResourceAdmission?.(id)
     await this.metaDb.spaces.upsert(rec)
+    const transition = await this.metaDb.spaceLifecycle.transition({
+      space: id,
+      expectedPhases: [SPACE_LIFECYCLE_PHASE.archived],
+      phase: SPACE_LIFECYCLE_PHASE.active,
+      changedAt: this.now().toISOString(),
+    })
+
+    if (
+      transition.status !== 'transitioned' &&
+      !(
+        transition.status === 'phase-conflict' &&
+        transition.lifecycle.phase === SPACE_LIFECYCLE_PHASE.active
+      )
+    ) {
+      throw spaceError('space lifecycle changed concurrently', 'space_busy')
+    }
     entry.rec = rec
+    entry.lifecycle = SPACE_LIFECYCLE_PHASE.active
     return rec
   }
 
@@ -524,32 +849,68 @@ export class SpaceManager {
     if (!entry) {
       throw spaceNotFound(id)
     }
-    if (!entry.rec.archivedAt) {
+    if (
+      entry.lifecycle !== SPACE_LIFECYCLE_PHASE.archived &&
+      entry.lifecycle !== SPACE_LIFECYCLE_PHASE.purgeIntent &&
+      entry.lifecycle !== SPACE_LIFECYCLE_PHASE.metadataCleaned &&
+      entry.lifecycle !== SPACE_LIFECYCLE_PHASE.physicalCleaned
+    ) {
       throw spaceError('archive the space before purging it', 'not_archived')
     }
-    const rec = entry.rec
-    this.evictStore(entry)
-    await this.metaDb.purgeSpace(id)
-    try {
-      await this.onPurge?.(rec)
-    } catch (err) {
-      // Registry rows are already gone; orphaned files are harmless and reclaimable —
-      // never wedge the purge on cleanup.
-      console.error(`[spaces] purge on-disk cleanup ${rec.slug} ->`, (err as Error).message)
+    if (entry.lifecycle === SPACE_LIFECYCLE_PHASE.archived) {
+      const transition = await this.metaDb.spaceLifecycle.transition({
+        space: id,
+        expectedPhases: [SPACE_LIFECYCLE_PHASE.archived],
+        phase: SPACE_LIFECYCLE_PHASE.purgeIntent,
+        changedAt: this.now().toISOString(),
+        cleanupManifest: encodeSpaceCleanupManifest(entry.rec),
+      })
+
+      if (transition.status !== 'transitioned') {
+        throw spaceError('space purge lifecycle changed concurrently', 'space_busy')
+      }
+      entry.lifecycle = SPACE_LIFECYCLE_PHASE.purgeIntent
     }
+    await this.evictStoreAndSettle(entry, 'purge')
+    await this.completePurge(id)
     this.entries.delete(id)
     this.rebuildSlugIndex()
   }
 
   /** Stop + settle + drop the live store while KEEPING the entry (so the slug stays
    *  reserved). Idempotent — a no-op when nothing is booted. */
-  private evictStore(entry: SpaceEntry): void {
+  private evictStore(entry: SpaceEntry, operation = 'evict'): Promise<void> {
+    const booting = entry.storePromise
     const store = entry.store
     entry.store = null
     entry.storePromise = null
     if (store) {
       store.stop?.()
-      this.trackSettle(store, 'archive')
+      return this.trackSettle(store, operation)
+    }
+
+    return booting
+      ? booting.then(
+          (booted) => this.trackSettle(booted, operation),
+          () => undefined,
+        )
+      : Promise.resolve()
+  }
+
+  private async evictStoreAndSettle(entry: SpaceEntry, operation: string): Promise<void> {
+    const store = entry.store
+    const booting = entry.storePromise
+
+    try {
+      await this.evictStore(entry, operation)
+    } catch (error) {
+      const retryable = store ?? (await booting?.catch(() => null))
+
+      if (retryable && !entry.store && !entry.storePromise) {
+        entry.store = retryable
+        entry.storePromise = Promise.resolve(retryable)
+      }
+      throw error
     }
   }
 
@@ -614,9 +975,16 @@ export class SpaceManager {
     }
   }
 
-  private register(rec: SpaceRecord, config: boolean): void {
+  private register(
+    rec: SpaceRecord,
+    config: boolean,
+    lifecycle: SpaceLifecyclePhase = rec.archivedAt
+      ? SPACE_LIFECYCLE_PHASE.archived
+      : SPACE_LIFECYCLE_PHASE.active,
+  ): void {
     this.entries.set(rec.id, {
       rec,
+      lifecycle,
       config,
       storePromise: null,
       store: null,
@@ -652,17 +1020,21 @@ export class SpaceManager {
       entry.store = null
       entry.storePromise = null
       store.stop?.()
-      this.trackSettle(store, 'evict')
+      void this.trackSettle(store, 'evict')
     }
   }
 
-  private trackSettle(store: SpaceStore, operation: string): void {
-    const task = Promise.resolve(store.settle?.()).then(
-      () => undefined,
-      (err) => console.error(`[spaces] ${operation} settle ->`, (err as Error).message),
-    )
+  private trackSettle(store: SpaceStore, operation: string): Promise<void> {
+    const task = Promise.resolve(store.settle?.())
     this.settling.add(task)
-    void task.finally(() => this.settling.delete(task))
+    void task.then(
+      () => this.settling.delete(task),
+      (err) => {
+        this.settling.delete(task)
+        console.error(`[spaces] ${operation} settle ->`, (err as Error).message)
+      },
+    )
+    return task
   }
 
   private async drainSettling(): Promise<void> {

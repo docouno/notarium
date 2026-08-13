@@ -18,6 +18,7 @@ import type {
   ExportEntry,
   Graph,
   GraphHealth,
+  IdentityRecord,
   KnowledgeStore,
   ListOptions,
   MoveInput,
@@ -37,6 +38,7 @@ import type {
   SyncStatus,
   TagMutationInput,
   TagMutationResult,
+  TrashAvailabilityFilter,
   WriteInput,
   WriteResult,
 } from '../knowledgeStore'
@@ -51,17 +53,21 @@ import {
 import type { AuthorFilter } from '../knowledgeStore'
 import { isValidNoteId, NOTE_ID_FRONTMATTER_KEY } from '../libs/id'
 import {
+  analyzeDocumentState,
   decodeWikilinkIdentity,
+  type DocumentState,
+  documentStateVersionToken,
   encodeWikilinkIdentity,
   FrontmatterLimitError,
   frontmatterValue,
   isWikilinkIdentityTarget,
+  type LogicalNoteState,
+  logicalNoteStateFromProjection,
   normalizeWikilinkTarget,
 } from '../libs/markdown'
 import { MutationCoordinator } from '../libs/mutationCoordinator'
 import { directoryOf, isPathUnder } from '../libs/path'
 import { normTags } from '../libs/tags'
-import { computeVersionToken } from '../libs/versionToken'
 import { InMemoryRevisionPersistence, RevisionJournal } from '../revisionJournal'
 import { derivePreview } from '../snippet'
 import { classesForScope, DEFAULT_NOTE_CLASS, isVisibleOn, SURFACE } from '../visibility'
@@ -115,6 +121,39 @@ type ReadEffects = {
   changedIds: Set<string>
 }
 
+const exactLogicalState = (
+  note: Pick<NoteContent, 'title' | 'content' | 'frontmatter' | 'logicalState'>,
+) =>
+  note.logicalState ??
+  logicalNoteStateFromProjection({
+    title: note.title,
+    body: note.content,
+    frontmatter: note.frontmatter,
+  })
+
+const exactDocumentState = (
+  note: Pick<NoteContent, 'title' | 'content' | 'frontmatter' | 'logicalState' | 'documentState'>,
+): DocumentState =>
+  note.documentState ??
+  analyzeDocumentState({
+    source: new TextEncoder().encode(exactLogicalState(note).markdown),
+    pathFallbackTitle: note.title ?? null,
+  })
+
+const exactVersionToken = (
+  note: Pick<NoteContent, 'title' | 'content' | 'frontmatter' | 'logicalState' | 'documentState'>,
+): string => documentStateVersionToken(exactDocumentState(note))
+
+const exactObservedMeta = (note: NoteContent, fallback: NoteMeta): NoteMeta => ({
+  ...fallback,
+  title: note.title ?? fallback.title,
+  class: note.class ?? fallback.class,
+  filePath: note.filePath ?? fallback.filePath,
+  // Presence and absence are both projections of the exact state. Assigning
+  // undefined deliberately clears a slug sampled by an earlier delta.
+  slug: note.slug,
+})
+
 /** Claims whose arbitration/convergence has not completed, keyed by storage path. */
 type UnsettledClaims = Map<string, string>
 
@@ -138,6 +177,11 @@ const IDENTITY_CONVERGENCE_BACKOFF_MS = 25
 
 export class CachedStore implements KnowledgeStore {
   private readonly inner: KnowledgeStore
+
+  /** Project one identity row committed outside the ordinary write engine. */
+  adoptCausalIdentity(record: IdentityRecord): void {
+    this.identity.adoptPersisted(record)
+  }
 
   /** Base export: a PURE passthrough — export reads raw on-disk files, never this layer's
    *  snapshot. Assigned ONLY when the engine can export, so a falsy `exportNotes` is the signal the
@@ -1951,7 +1995,7 @@ export class CachedStore implements KnowledgeStore {
       // Point-probed above: useful scoped degradation without inventing a
       // path-shaped id or mutating the unavailable full registry.
       id: detail.id,
-      versionToken: detail.versionToken ?? computeVersionToken(detail.content),
+      versionToken: detail.versionToken ?? exactVersionToken(detail),
     }
   }
 
@@ -2437,13 +2481,13 @@ export class CachedStore implements KnowledgeStore {
       }
     }
 
-    // The version token rides every read: what the editor will echo back
-    // on save. A CAS-enforcing inner store already answered it; for a bare
-    // engine we hash the body as served — same normalisation both sides.
+    // The version token rides every read: what the editor will echo back on
+    // save. Repository engines attach the exact lossless logical state; the
+    // projection fallback keeps capability-thin test/third-party stores usable.
     return {
       ...detail,
       id: sourceId,
-      versionToken: detail.versionToken ?? computeVersionToken(detail.content),
+      versionToken: detail.versionToken ?? exactVersionToken(detail),
     }
   }
 
@@ -2812,7 +2856,13 @@ export class CachedStore implements KnowledgeStore {
     return this.trash.restore(input)
   }
 
-  listTrashed(opts: { offset: number; limit: number; q?: string; scope?: ReadScope }) {
+  listTrashed(opts: {
+    offset: number
+    limit: number
+    q?: string
+    availability?: TrashAvailabilityFilter
+    scope?: ReadScope
+  }) {
     return this.readIdentitySurface(() => this.trash.listTrashed(opts))
   }
 
@@ -2831,7 +2881,13 @@ export class CachedStore implements KnowledgeStore {
     return this.runMutationScope(() => this.trash.restoreTrash(opts))
   }
 
-  purgeTrash(opts: { ids?: readonly string[]; all?: boolean; q?: string; scope?: ReadScope }) {
+  purgeTrash(opts: {
+    ids?: readonly string[]
+    all?: boolean
+    q?: string
+    availability?: TrashAvailabilityFilter
+    scope?: ReadScope
+  }) {
     return this.trash.purgeTrash(opts)
   }
 
@@ -3396,6 +3452,9 @@ export class CachedStore implements KnowledgeStore {
     let title = observation.title
     let content = observation.content
     let tags = observation.tags
+    let logicalState: LogicalNoteState | undefined
+    let documentState: DocumentState | undefined
+    let exactMeta: NoteMeta | undefined
     let identityUnresolved = false
 
     // If the raw-body sweep could not materialize this identity, read once
@@ -3418,8 +3477,13 @@ export class CachedStore implements KnowledgeStore {
         )
 
         title = detail.title ?? title
-        content ??= detail.content
-        tags ??= normTags(detail.frontmatter?.tags) ?? undefined
+        // The exact read is one coherent state B. Never combine its raw document
+        // with cheap delta projections sampled from an earlier state A.
+        content = detail.content
+        tags = normTags(detail.frontmatter?.tags) ?? undefined
+        logicalState = exactLogicalState(detail)
+        documentState = exactDocumentState(detail)
+        exactMeta = exactObservedMeta(detail, observation.meta)
       } catch {
         identityUnresolved = true
       }
@@ -3432,7 +3496,10 @@ export class CachedStore implements KnowledgeStore {
     ) {
       return {}
     }
-    const meta = { ...(this.snap.notes.get(noteId) ?? observation.meta), id: noteId }
+    const meta = {
+      ...(exactMeta ?? this.snap.notes.get(noteId) ?? observation.meta),
+      id: noteId,
+    }
 
     if (identityUnresolved) {
       return {
@@ -3446,12 +3513,30 @@ export class CachedStore implements KnowledgeStore {
         ),
       }
     }
-    if (content !== undefined) {
-      this.journalExternal(noteId, title, content, meta, observation.transition, tags)
+    if (documentState || logicalState) {
+      this.journalExternal(
+        noteId,
+        title,
+        content ?? '',
+        logicalState ?? null,
+        documentState ?? null,
+        meta,
+        observation.transition,
+        tags,
+      )
       return {}
     }
-    this.fetchExternalBody(noteId, title, meta, observation.transition)
-    return {}
+
+    return {
+      identityResolution: this.fetchExternalBody(
+        noteId,
+        title,
+        meta,
+        observation.transition,
+        content,
+        tags,
+      ),
+    }
   }
 
   private scheduleExternalDelete(
@@ -3483,6 +3568,7 @@ export class CachedStore implements KnowledgeStore {
               kind: REVISION_KIND.delete,
               principal: null,
               content: null,
+              logicalState: null,
               title,
             })
           }),
@@ -3495,6 +3581,8 @@ export class CachedStore implements KnowledgeStore {
     noteId: string,
     title: string,
     content: string | null,
+    logicalState: LogicalNoteState | null,
+    documentState: DocumentState | null,
     observed: NoteMeta,
     transition: number,
     tags?: string[],
@@ -3502,7 +3590,16 @@ export class CachedStore implements KnowledgeStore {
     this.trackExternalTask(
       this.trashMutations.run({ paths: [trashMutationPath(noteId)] }, () =>
         this.mutations.run({ noteIds: [noteId], paths: [observed.filePath] }, () =>
-          this.recordExternalClaimed(noteId, title, content, observed, transition, tags),
+          this.recordExternalClaimed(
+            noteId,
+            title,
+            content,
+            logicalState,
+            documentState,
+            observed,
+            transition,
+            tags,
+          ),
         ),
       ),
     )
@@ -3512,6 +3609,8 @@ export class CachedStore implements KnowledgeStore {
     noteId: string,
     title: string,
     content: string | null,
+    logicalState: LogicalNoteState | null,
+    documentState: DocumentState | null,
     observed: NoteMeta,
     transition: number,
     tags?: string[],
@@ -3534,6 +3633,8 @@ export class CachedStore implements KnowledgeStore {
       kind: REVISION_KIND.external,
       principal: null,
       content,
+      logicalState,
+      documentState,
       title,
       class: observed.class,
       // The observed snapshot entry is file-truth for this transition: record
@@ -3614,10 +3715,12 @@ export class CachedStore implements KnowledgeStore {
                       this.journalExternal(
                         finalId,
                         detail.title ?? title,
-                        preferredContent ?? detail.content,
-                        live,
+                        detail.content,
+                        exactLogicalState(detail),
+                        exactDocumentState(detail),
+                        exactObservedMeta(detail, live),
                         transition,
-                        preferredTags ?? normTags(detail.frontmatter?.tags) ?? undefined,
+                        normTags(detail.frontmatter?.tags) ?? undefined,
                       )
                     }
                   }
@@ -3628,16 +3731,23 @@ export class CachedStore implements KnowledgeStore {
                 await this.recordExternalClaimed(
                   currentId,
                   detail.title ?? title,
-                  preferredContent ?? detail.content,
-                  this.snap.notes.get(currentId) ?? observed,
+                  detail.content,
+                  exactLogicalState(detail),
+                  exactDocumentState(detail),
+                  exactObservedMeta(detail, this.snap.notes.get(currentId) ?? observed),
                   transition,
-                  preferredTags ?? normTags(detail.frontmatter?.tags) ?? undefined,
+                  normTags(detail.frontmatter?.tags) ?? undefined,
                 )
               } catch {
                 await this.recordExternalClaimed(
                   currentId,
                   title,
-                  preferredContent ?? null,
+                  // A cheap delta body is not a complete current-format state:
+                  // without the exact read we do not know authored frontmatter.
+                  // Record an honest gap instead of minting a new legacy row.
+                  null,
+                  null,
+                  null,
                   this.snap.notes.get(currentId) ?? observed,
                   transition,
                   preferredTags,

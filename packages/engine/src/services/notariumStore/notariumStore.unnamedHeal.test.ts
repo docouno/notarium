@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { FRONTMATTER_BYTE_CAP } from '@notarium/core'
+import { computeVersionToken, FRONTMATTER_BYTE_CAP } from '@notarium/core'
 
 import type { FileStore } from '../../libs/files'
 import { createLocalFsFiles } from '../../libs/files'
@@ -52,6 +52,50 @@ afterEach(async () => {
 })
 
 describe('boot heal for unnamed note files (#296)', () => {
+  it('does not conditionally remove a state newer than the supplied token', async () => {
+    const root = await mkroot()
+    const store = createHealingTestStore(root)
+
+    try {
+      const created = await store.write({ title: 'Conditional', content: 'first' })
+      const before = await store.read(created.filePath!)
+      const staleToken = computeVersionToken(before.logicalState!.markdown)
+
+      await store.write({
+        title: 'Conditional',
+        content: 'newer',
+        originalId: created.filePath,
+        preservePath: true,
+      })
+      await expect(store.remove(created.filePath!, { versionToken: staleToken })).rejects.toThrow(
+        /note changed during delete/,
+      )
+      expect((await store.read(created.filePath!)).content).toBe('newer')
+    } finally {
+      await store.stop()
+    }
+  })
+
+  it('accepts a trusted restore path for a recovered legacy `.md` basename', async () => {
+    const root = await mkroot()
+    await fs.mkdir(join(root, 'journal'), { recursive: true })
+    const store = createHealingTestStore(root)
+
+    try {
+      await expect(
+        store.write({
+          id: 'RESTOREPATH01',
+          title: 'Recovered',
+          content: 'restored body',
+          restorePath: 'journal/.md',
+        }),
+      ).resolves.toMatchObject({ filePath: 'journal/.md' })
+      expect(await fs.readFile(join(root, 'journal', '.md'), 'utf8')).toContain('restored body')
+    } finally {
+      await store.stop()
+    }
+  })
+
   it('heals the legacy file through LocalFS without losing its identity or body', async () => {
     const root = await mkroot()
     await writeUnnamed(root, 'journal', 'LOCALSAFE001', '第三季度规划', 'Still live.')

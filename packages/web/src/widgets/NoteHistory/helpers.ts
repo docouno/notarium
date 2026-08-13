@@ -35,8 +35,17 @@ export const historyRowLabels = (
       ? `Restored from v${sourceVersion}`
       : KIND_LABEL[r.kind]
   const bodyless = r.contentHash == null && r.kind !== REVISION_KIND.delete
+  const partial = r.stateFormat == null && r.contentHash != null
 
-  return { kind, who: bodyless ? `${authorText} · body unknown` : authorText, gap: false }
+  return {
+    kind,
+    who: bodyless
+      ? `${authorText} · body unknown`
+      : partial
+        ? `${authorText} · partial snapshot`
+        : authorText,
+    gap: false,
+  }
 }
 
 export type DiffSegment = { value: string; kind: 'ctx' | 'add' | 'del' }

@@ -18,6 +18,7 @@ import type {
   PendingOAuthClientDecl,
   ProjectDecl,
   RetrievalDecl,
+  RevisionStateDecl,
   Rng,
   ScopePinDecl,
   SpaceDecl,
@@ -188,6 +189,7 @@ export class WorldBuilder {
   private readonly jobs: JobDecl[] = []
   private readonly durableImports: DurableImportDecl[] = []
   private readonly externalRewrites: ExternalRewriteDecl[] = []
+  private readonly revisionStates: RevisionStateDecl[] = []
   private readonly externalIdentityClaims: ExternalIdentityClaimDecl[] = []
   private readonly events: CaseEvent[] = []
   private hasAuth = false
@@ -367,6 +369,23 @@ export class WorldBuilder {
     return this
   }
 
+  /** Add a journal state that cannot be authored through an ordinary note write. */
+  revisionState(decl: RevisionStateDecl): this {
+    const existing = this.revisionStates.find(
+      (candidate) => candidate.note === decl.note && candidate.date === decl.date,
+    )
+
+    if (existing && JSON.stringify(existing) !== JSON.stringify(decl)) {
+      throw new Error(`conflicting revision state for ${decl.note} at ${decl.date}`)
+    }
+
+    if (!existing) {
+      this.revisionStates.push(decl)
+    }
+
+    return this
+  }
+
   /** Plant a cross-space `notarium-id` collision on disk (#327). */
   externalIdentityClaim(decl: ExternalIdentityClaimDecl): this {
     this.externalIdentityClaims.push(decl)
@@ -400,6 +419,7 @@ export class WorldBuilder {
       ...(this.jobs.length ? { jobs: this.jobs } : {}),
       ...(this.durableImports.length ? { durableImports: this.durableImports } : {}),
       ...(this.externalRewrites.length ? { externalRewrites: this.externalRewrites } : {}),
+      ...(this.revisionStates.length ? { revisionStates: this.revisionStates } : {}),
       ...(this.externalIdentityClaims.length
         ? { externalIdentityClaims: this.externalIdentityClaims }
         : {}),

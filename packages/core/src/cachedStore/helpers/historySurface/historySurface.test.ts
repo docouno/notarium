@@ -82,6 +82,7 @@ const makeHost = (opts: {
     drain: async () => {},
     purge: async (ids: string[]) => {
       calls.purged.push(ids)
+      return ids
     },
     listTrashed: async (o: { offset: number; limit: number; q?: string }) => {
       calls.listTrashedQ.push(o.q)
@@ -148,7 +149,7 @@ describe('HistorySurface restore/purge guards', () => {
     expect(calls.writes[0].ifExists).toBeUndefined()
   })
 
-  it('restoreFromTrash revives the id at its last folder, writes via the CAS path, and heals aliases', async () => {
+  it('restoreFromTrash revives the id at its exact last path, writes via the CAS path, and heals aliases', async () => {
     const { trash, calls } = makeHost({
       seeds: {
         n1: { title: 'Note One', lastPath: 'sub/note-one.md', slug: 'custom', tags: ['t'] },
@@ -163,10 +164,11 @@ describe('HistorySurface restore/purge guards', () => {
       id: 'n1',
       title: 'Note One',
       content: 'body',
-      directory: 'sub',
+      restorePath: 'sub/note-one.md',
       slug: 'custom',
       principal: 'alice',
     })
+    expect(calls.writes[0].directory).toBeUndefined()
     expect(calls.writes[0].journal).toMatchObject({ kind: 'restore' })
     expect(calls.reload).toBe(1)
     expect(calls.emitChanged).toEqual([[['n1'], []]]) // reresolve moved an edge

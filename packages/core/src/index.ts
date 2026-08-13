@@ -1,6 +1,7 @@
 export * from './knowledgeStore'
 export * from './identity'
 export * from './revisionJournal'
+export * from './causalMetadata'
 export * from './listing'
 export * from './snippet'
 export * from './graph'

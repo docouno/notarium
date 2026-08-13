@@ -1421,7 +1421,9 @@ export const frontmatterScalarEntry = (key: string, v: string): FrontmatterEntry
 
 export const frontmatterListEntry = (key: string, items: readonly string[]): FrontmatterEntry => ({
   key,
-  lines: [`${key}:`, ...items.map((t) => `- ${frontmatterScalar(t)}`)],
+  lines: items.length
+    ? [`${key}:`, ...items.map((t) => `- ${frontmatterScalar(t)}`)]
+    : [`${key}: []`],
 })
 
 /** Set (or replace) one scalar key in a document's leading frontmatter block,

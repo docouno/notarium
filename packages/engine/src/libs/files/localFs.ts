@@ -13,12 +13,29 @@
 // channel replaces that — the tree shows real on-disk folders now.)
 
 import { createHash, randomUUID } from 'node:crypto'
-import { promises as fs, constants as fsConstants, watch as fsWatch } from 'node:fs'
-import { dirname, join, relative, resolve, sep } from 'node:path'
+import {
+  type BigIntStats,
+  promises as fs,
+  constants as fsConstants,
+  watch as fsWatch,
+} from 'node:fs'
+import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 
 import { clipToBytes, isAtomicInstallTempPath, UNNAMED_NOTE_FILENAME } from '@notarium/core'
 import { renameNoReplace } from './renameNoReplace'
-import type { FileStat, FileStore } from './types'
+import type {
+  FileClaim,
+  FileObservation,
+  FilePublicationResult,
+  FileStat,
+  FileStore,
+  FileStrictMutationReceipt,
+  FileStrictPublicationResult,
+  FileStrictStageHeader,
+  FileStrictStageRequest,
+  FileStrictStageResult,
+  FileStrictStageState,
+} from './types'
 
 /** Directory entries the scan never descends into: dotfiles hide editor/state
  *  dirs (.obsidian, .git — and our own tmp files are dot-named, so a mid-write
@@ -41,23 +58,50 @@ const hiddenPath = (rel: string | null): boolean =>
 const toPosix = (p: string) => p.split(sep).join('/')
 
 const TEMP_WRITE_ATTEMPTS = 8
+const OBSERVATION_ATTEMPTS = 3
 const MAX_PATH_COMPONENT_BYTES = 255
 const FS_OPS_DIR = '.notarium-fs-ops'
 const FS_OP_VERSION = 1
+const STRICT_STAGE_VERSION = 1
 const FS_OP_NAME = /^op-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const nsToMs = (ns: bigint): number => Number(ns / 1_000_000n) + Number(ns % 1_000_000n) / 1_000_000
 
 const errnoCode = (err: unknown): string | undefined =>
   typeof err === 'object' && err !== null ? (err as NodeJS.ErrnoException).code : undefined
 
-const sha256 = (content: string): string => createHash('sha256').update(content).digest('hex')
+const sha256Bytes = (content: Uint8Array): string =>
+  createHash('sha256').update(content).digest('hex')
+const bytesEqual = (left: Uint8Array, right: Uint8Array): boolean =>
+  left.byteLength === right.byteLength && left.every((value, index) => value === right[index])
+
+const packageCandidateHash = (
+  files: ReadonlyArray<{ path: string; content: Uint8Array }>,
+): string => {
+  const hash = createHash('sha256')
+
+  const frame = (content: Uint8Array): void => {
+    const length = Buffer.allocUnsafe(8)
+
+    length.writeBigUInt64BE(BigInt(content.byteLength))
+    hash.update(length)
+    hash.update(content)
+  }
+
+  for (const file of [...files].sort((left, right) => left.path.localeCompare(right.path))) {
+    frame(Buffer.from(file.path, 'utf8'))
+    frame(file.content)
+  }
+
+  return hash.digest('hex')
+}
 
 type FsMoveIntent = {
   version: typeof FS_OP_VERSION
-  kind: 'rename' | 'replace'
+  kind: 'rename' | 'replace' | 'replace-entry'
   source: string
   target: string
-  expectedSourceHash: string
+  expectedSourceHash: string | null
+  expectedSourceClaim?: string
   finalHash: string
   sameEntry: boolean
   legacySourceLinkedTarget: boolean
@@ -79,6 +123,27 @@ type FsMoveOperation = {
   target: string
 }
 
+type StrictStageDiskHeader = FileStrictStageHeader & {
+  version: typeof STRICT_STAGE_VERSION
+}
+
+type StrictStagePaths = {
+  dir: string
+  header: string
+  candidate: string
+  publication: string
+  publishing: string
+  receipt: string
+  failure: string
+  original: string
+  originalSnapshot: string
+  detachedOriginal: string
+}
+
+type StrictFailure = {
+  reason: string
+  recoveryPaths: string[]
+}
 type RootLockState = { tail: Promise<void>; pending: number }
 const rootLocks = new Map<string, RootLockState>()
 
@@ -121,7 +186,7 @@ const recoveryName = (stem: string, markdown: boolean): string => {
 /** Read only the exact regular pathname entry. A plain readFile follows symlinks
  *  and blocks opening a FIFO; neither is a note body the scanner can index. The
  *  opened-handle identity check closes the lstat→open replacement window. */
-const readRegular = async (path: string): Promise<string | null> => {
+const readRegularBytes = async (path: string): Promise<Uint8Array | null> => {
   let handle
 
   try {
@@ -140,7 +205,7 @@ const readRegular = async (path: string): Promise<string | null> => {
       return null
     }
 
-    return await handle.readFile({ encoding: 'utf8' })
+    return await handle.readFile()
   } catch {
     return null
   } finally {
@@ -148,11 +213,16 @@ const readRegular = async (path: string): Promise<string | null> => {
   }
 }
 
+const readRegular = async (path: string): Promise<string | null> => {
+  const bytes = await readRegularBytes(path)
+  return bytes == null ? null : Buffer.from(bytes).toString('utf8')
+}
+
 /** Publishable bytes in a temp file claimed by THIS operation. The random name
  *  makes a collision vanishingly unlikely; `wx` is the correctness boundary —
  *  the filesystem, not probability, proves that no concurrent writer owns it.
  *  An EEXIST file belongs to somebody else and must never be cleaned up here. */
-const writeTemp = async (dir: string, content: string): Promise<string> => {
+const writeTemp = async (dir: string, content: string | Uint8Array): Promise<string> => {
   let collision: unknown
 
   for (let attempt = 0; attempt < TEMP_WRITE_ATTEMPTS; attempt++) {
@@ -175,7 +245,11 @@ const writeTemp = async (dir: string, content: string): Promise<string> => {
     let failure: { error: unknown } | undefined
 
     try {
-      await handle.writeFile(content, 'utf8')
+      if (typeof content === 'string') {
+        await handle.writeFile(content, 'utf8')
+      } else {
+        await handle.writeFile(content)
+      }
     } catch (err) {
       failure = { error: err }
     }
@@ -250,6 +324,181 @@ export const createLocalFsFiles = (root: string): FileStore => {
     } catch {
       return null
     }
+  }
+
+  const absentFileClaim = (rel: string): { kind: 'absent'; value: string } => ({
+    kind: 'absent',
+    value: `localfs:absent:v1:${createHash('sha256')
+      .update(rootAbs)
+      .update('\0')
+      .update(rel)
+      .digest('hex')}`,
+  })
+
+  const absentClaim = (rel: string): FileObservation & { kind: 'absent' } => ({
+    kind: 'absent',
+    claim: absentFileClaim(rel),
+    mtimeMs: null,
+  })
+
+  const claimMatches = (left: FileClaim, right: FileClaim): boolean =>
+    left.kind === right.kind && left.value === right.value
+
+  const occupiedClaim = (stat: BigIntStats): { kind: 'present'; value: string } => ({
+    kind: 'present',
+    value: `localfs:entry:v1:${stat.dev}:${stat.ino}:${stat.ctimeNs}:${stat.mode}:${stat.size}`,
+  })
+
+  const presentProofFromStat = (
+    stat: BigIntStats,
+    bytes: Uint8Array,
+  ): {
+    claim: { kind: 'present'; value: string }
+    mtimeMs: number
+  } => {
+    if (!stat.isFile() || stat.isSymbolicLink() || Number(stat.size) !== bytes.byteLength) {
+      throw new Error('published artifact is not the expected regular file')
+    }
+
+    return {
+      claim: {
+        kind: 'present',
+        value: `localfs:present:v1:${stat.dev}:${stat.ino}:${stat.ctimeNs}:${stat.size}:${sha256Bytes(bytes)}`,
+      },
+      mtimeMs: nsToMs(stat.mtimeNs),
+    }
+  }
+
+  const claimInode = (
+    claim: FileClaim & { kind: 'present' },
+  ): { dev: bigint; ino: bigint } | null => {
+    const parts = claim.value.split(':')
+
+    if (parts.length !== 8 || parts.slice(0, 3).join(':') !== 'localfs:present:v1') {
+      return null
+    }
+    try {
+      return { dev: BigInt(parts[3]), ino: BigInt(parts[4]) }
+    } catch {
+      return null
+    }
+  }
+
+  const proofAfterOwnedCleanup = async (
+    artifact: string,
+    target: string,
+    bytes: Uint8Array,
+    cleanup: () => Promise<void>,
+  ): Promise<ReturnType<typeof presentProofFromStat>> => {
+    const owned = await fs.lstat(artifact, { bigint: true })
+
+    presentProofFromStat(owned, bytes)
+    await cleanup()
+    const published = await fs.lstat(target, { bigint: true })
+
+    if (published.dev !== owned.dev || published.ino !== owned.ino) {
+      throw staleMove()
+    }
+
+    return presentProofFromStat(published, bytes)
+  }
+
+  /** Capture bytes and physical metadata from one stable regular-file sample.
+   * The final pathname lstat is essential: a still-open descriptor can remain
+   * stable after another process has already replaced its directory entry. */
+  const observeRegular = async (
+    rel: string,
+    options?: { maxBytes?: number },
+  ): Promise<FileObservation> => {
+    const path = abs(rel)
+
+    for (let attempt = 0; attempt < OBSERVATION_ATTEMPTS; attempt++) {
+      let handle
+
+      try {
+        let before
+
+        try {
+          before = await fs.lstat(path, { bigint: true })
+        } catch (err) {
+          if (errnoCode(err) === 'ENOENT') {
+            return absentClaim(rel)
+          }
+          throw err
+        }
+        if (!before.isFile() || before.isSymbolicLink()) {
+          return {
+            kind: 'occupied',
+            claim: occupiedClaim(before),
+            entryType: before.isSymbolicLink()
+              ? 'symlink'
+              : before.isDirectory()
+                ? 'directory'
+                : 'other',
+            mtimeMs: nsToMs(before.mtimeNs),
+          }
+        }
+        if (options?.maxBytes != null && before.size > BigInt(options.maxBytes)) {
+          return { kind: 'unavailable', reason: 'too-large', mtimeMs: null }
+        }
+        try {
+          handle = await fs.open(
+            path,
+            fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | (fsConstants.O_NOFOLLOW ?? 0),
+          )
+        } catch (err) {
+          if (errnoCode(err) === 'ENOENT') {
+            continue
+          }
+          if (errnoCode(err) === 'ELOOP') {
+            return { kind: 'unavailable', reason: 'not-regular', mtimeMs: null }
+          }
+          throw err
+        }
+        const opened = await handle.stat({ bigint: true })
+        const sameVersion = (left: typeof opened, right: typeof opened): boolean =>
+          left.isFile() &&
+          right.isFile() &&
+          left.dev === right.dev &&
+          left.ino === right.ino &&
+          left.size === right.size &&
+          left.ctimeNs === right.ctimeNs &&
+          left.mtimeNs === right.mtimeNs
+
+        if (!sameVersion(before, opened)) {
+          continue
+        }
+        const bytes = new Uint8Array(await handle.readFile())
+        const after = await handle.stat({ bigint: true })
+        let pathAfter
+
+        try {
+          pathAfter = await fs.lstat(path, { bigint: true })
+        } catch (err) {
+          if (errnoCode(err) === 'ENOENT') {
+            continue
+          }
+          throw err
+        }
+        if (!sameVersion(opened, after) || !sameVersion(after, pathAfter)) {
+          continue
+        }
+
+        return {
+          kind: 'present',
+          bytes,
+          claim: {
+            kind: 'present',
+            value: `localfs:present:v1:${after.dev}:${after.ino}:${after.ctimeNs}:${after.size}:${sha256Bytes(bytes)}`,
+          },
+          mtimeMs: nsToMs(after.mtimeNs),
+        }
+      } finally {
+        await handle?.close().catch(() => {})
+      }
+    }
+
+    return { kind: 'unavailable', reason: 'unstable', mtimeMs: null }
   }
 
   const sameInode = async (left: string, right: string): Promise<boolean> => {
@@ -388,8 +637,8 @@ export const createLocalFsFiles = (root: string): FileStore => {
     kind: FsMoveIntent['kind'],
     source: string,
     target: string,
-    expectedSource: string,
-    finalContent: string,
+    expectedSource: Uint8Array,
+    finalContent: Uint8Array,
     sameEntry: boolean,
     legacySourceLinkedTarget = false,
   ): Promise<FsMoveOperation> => {
@@ -403,8 +652,8 @@ export const createLocalFsFiles = (root: string): FileStore => {
         kind,
         source: relativeStoragePath(source),
         target: relativeStoragePath(target),
-        expectedSourceHash: sha256(expectedSource),
-        finalHash: sha256(finalContent),
+        expectedSourceHash: sha256Bytes(expectedSource),
+        finalHash: sha256Bytes(finalContent),
         sameEntry,
         legacySourceLinkedTarget,
       }
@@ -428,7 +677,9 @@ export const createLocalFsFiles = (root: string): FileStore => {
       await writeMarker(operation.preparing)
       await fs.writeFile(operation.manifest, JSON.stringify(operation.intent), { flag: 'wx' })
       await fs.link(source, operation.sourceArtifact)
-      if ((await readRegular(operation.sourceArtifact)) !== expectedSource) {
+      const sourceArtifact = await readRegularBytes(operation.sourceArtifact)
+
+      if (sourceArtifact == null || !bytesEqual(sourceArtifact, expectedSource)) {
         throw staleMove()
       }
       if (kind === 'replace') {
@@ -453,12 +704,80 @@ export const createLocalFsFiles = (root: string): FileStore => {
           Number(sourceStat.mtimeNs) / 1_000_000_000,
         )
       }
-      if ((await readRegular(operation.finalArtifact)) !== finalContent) {
+      const finalArtifact = await readRegularBytes(operation.finalArtifact)
+
+      if (finalArtifact == null || !bytesEqual(finalArtifact, finalContent)) {
         throw staleMove()
       }
       // `active` is the durable permission to inspect/repair public paths. A
       // process stop before this rename leaves only preparation artifacts, which
       // recovery may discard because no public mutation was allowed yet.
+      await fs.rename(operation.preparing, operation.active)
+      return operation
+    } catch (err) {
+      await fs.rm(operation.dir, { recursive: true, force: true }).catch(() => {})
+      await fs.rmdir(opsRoot).catch(() => {})
+      throw err
+    }
+  }
+
+  const createEntryReplaceOperation = async (
+    source: string,
+    expectedSourceClaim: string,
+    finalContent: Uint8Array,
+  ): Promise<FsMoveOperation> => {
+    await fs.mkdir(opsRoot, { recursive: true })
+    let operation: FsMoveOperation | undefined
+
+    for (let attempt = 0; attempt < TEMP_WRITE_ATTEMPTS; attempt++) {
+      const id = `op-${randomUUID()}`
+      const intent: FsMoveIntent = {
+        version: FS_OP_VERSION,
+        kind: 'replace-entry',
+        source: relativeStoragePath(source),
+        target: relativeStoragePath(source),
+        expectedSourceHash: null,
+        expectedSourceClaim,
+        finalHash: sha256Bytes(finalContent),
+        sameEntry: true,
+        legacySourceLinkedTarget: false,
+      }
+      const candidate = operationPaths(id, intent)
+
+      try {
+        await fs.mkdir(candidate.dir)
+        operation = candidate
+        break
+      } catch (err) {
+        if (errnoCode(err) !== 'EEXIST') {
+          throw err
+        }
+      }
+    }
+    if (!operation) {
+      throw new Error('failed to claim a LocalFS entry-replace journal directory')
+    }
+
+    try {
+      await writeMarker(operation.preparing)
+      await fs.writeFile(operation.manifest, JSON.stringify(operation.intent), { flag: 'wx' })
+      const before = await fs.lstat(source, { bigint: true })
+
+      if (occupiedClaim(before).value !== expectedSourceClaim) {
+        throw staleMove()
+      }
+      await fs.link(source, operation.sourceArtifact)
+      const claimed = await fs.lstat(operation.sourceArtifact, { bigint: true })
+
+      if (claimed.dev !== before.dev || claimed.ino !== before.ino) {
+        throw staleMove()
+      }
+      await fs.writeFile(operation.finalArtifact, finalContent, { flag: 'wx' })
+      const finalArtifact = await readRegularBytes(operation.finalArtifact)
+
+      if (finalArtifact == null || !bytesEqual(finalArtifact, finalContent)) {
+        throw staleMove()
+      }
       await fs.rename(operation.preparing, operation.active)
       return operation
     } catch (err) {
@@ -475,15 +794,27 @@ export const createLocalFsFiles = (root: string): FileStore => {
       typeof value !== 'object' ||
       value === null ||
       (value as Partial<FsMoveIntent>).version !== FS_OP_VERSION ||
-      !['rename', 'replace'].includes(String((value as Partial<FsMoveIntent>).kind)) ||
+      !['rename', 'replace', 'replace-entry'].includes(
+        String((value as Partial<FsMoveIntent>).kind),
+      ) ||
       typeof (value as Partial<FsMoveIntent>).source !== 'string' ||
       typeof (value as Partial<FsMoveIntent>).target !== 'string' ||
-      !/^[0-9a-f]{64}$/.test(String((value as Partial<FsMoveIntent>).expectedSourceHash)) ||
       !/^[0-9a-f]{64}$/.test(String((value as Partial<FsMoveIntent>).finalHash)) ||
       typeof (value as Partial<FsMoveIntent>).sameEntry !== 'boolean' ||
       typeof (value as Partial<FsMoveIntent>).legacySourceLinkedTarget !== 'boolean'
     ) {
       throw new Error('invalid LocalFS move recovery intent')
+    }
+    const intent = value as FsMoveIntent
+
+    if (
+      (intent.kind === 'replace-entry' &&
+        (intent.expectedSourceHash !== null ||
+          typeof intent.expectedSourceClaim !== 'string' ||
+          !intent.expectedSourceClaim)) ||
+      (intent.kind !== 'replace-entry' && !/^[0-9a-f]{64}$/.test(String(intent.expectedSourceHash)))
+    ) {
+      throw new Error('invalid LocalFS move recovery source proof')
     }
 
     // The journal lives inside a user-visible vault and may be externally
@@ -497,7 +828,7 @@ export const createLocalFsFiles = (root: string): FileStore => {
       }
     }
 
-    return value as FsMoveIntent
+    return intent
   }
 
   const readMoveOperation = async (id: string): Promise<FsMoveOperation> => {
@@ -654,12 +985,17 @@ export const createLocalFsFiles = (root: string): FileStore => {
     operation.intent.kind === 'rename' ? operation.sourceArtifact : operation.finalArtifact
 
   const artifactMatches = async (path: string, expectedHash: string): Promise<boolean> => {
-    const content = await readRegular(path)
-    return content != null && sha256(content) === expectedHash
+    const content = await readRegularBytes(path)
+    return content != null && sha256Bytes(content) === expectedHash
   }
 
+  const sourceArtifactMatches = async (operation: FsMoveOperation): Promise<boolean> =>
+    operation.intent.expectedSourceHash == null
+      ? pathExists(operation.sourceArtifact)
+      : artifactMatches(operation.sourceArtifact, operation.intent.expectedSourceHash)
+
   const assertOperationArtifacts = async (operation: FsMoveOperation): Promise<void> => {
-    if (!(await artifactMatches(operation.sourceArtifact, operation.intent.expectedSourceHash))) {
+    if (!(await sourceArtifactMatches(operation))) {
       throw new Error(`LocalFS recovery source is missing or changed: ${operation.dir}`)
     }
     if (!(await artifactMatches(operation.finalArtifact, operation.intent.finalHash))) {
@@ -782,10 +1118,13 @@ export const createLocalFsFiles = (root: string): FileStore => {
     publicPath: string,
     claim: string,
     slot: string,
-    expectedHash: string,
+    expectedHash: string | null,
   ): Promise<StageResult> => {
     if (await pathExists(slot)) {
-      if ((await sameInode(slot, claim)) && (await artifactMatches(slot, expectedHash))) {
+      if (
+        (await sameInode(slot, claim)) &&
+        (expectedHash == null || (await artifactMatches(slot, expectedHash)))
+      ) {
         return { status: 'staged' }
       }
       throw new Error(`foreign entry occupies LocalFS recovery slot: ${slot}`)
@@ -805,7 +1144,10 @@ export const createLocalFsFiles = (root: string): FileStore => {
       }
       throw err
     }
-    if ((await sameInode(slot, claim)) && (await artifactMatches(slot, expectedHash))) {
+    if (
+      (await sameInode(slot, claim)) &&
+      (expectedHash == null || (await artifactMatches(slot, expectedHash)))
+    ) {
       return { status: 'staged' }
     }
     const restored = await restoreCapturedPath(operation, slot, publicPath)
@@ -878,7 +1220,10 @@ export const createLocalFsFiles = (root: string): FileStore => {
   const abortOperation = async (operation: FsMoveOperation): Promise<{ recovery?: string }> => {
     // When source and target are one medium entry, first take our FINAL inode out
     // of that shared pathname; only then can the original be restored no-replace.
-    if (operation.intent.sameEntry && operation.intent.kind === 'replace') {
+    if (
+      operation.intent.sameEntry &&
+      ['replace', 'replace-entry'].includes(operation.intent.kind)
+    ) {
       await removeOwnedTarget(operation)
       const restored = await restoreOriginal(operation)
       await resolveOperation(operation)
@@ -949,13 +1294,16 @@ export const createLocalFsFiles = (root: string): FileStore => {
     const preserveForeignSlot = async (
       slot: string,
       publicPath: string,
-      allowed: Array<{ artifact: string; hash: string }>,
+      allowed: Array<{ artifact: string; hash: string | null }>,
     ): Promise<void> => {
       if (!(await pathExists(slot))) {
         return
       }
       for (const owner of allowed) {
-        if ((await sameInode(slot, owner.artifact)) && (await artifactMatches(slot, owner.hash))) {
+        if (
+          (await sameInode(slot, owner.artifact)) &&
+          (owner.hash == null || (await artifactMatches(slot, owner.hash)))
+        ) {
           return
         }
       }
@@ -1190,12 +1538,76 @@ export const createLocalFsFiles = (root: string): FileStore => {
     })
   }
 
-  const replaceAbsent = async (
+  type ReplaceResult =
+    | { published: false }
+    | {
+        published: true
+        proof: ReturnType<typeof presentProofFromStat>
+      }
+
+  const replaceOccupiedBytes = async (
+    path: string,
+    expectedSourceClaim: string,
+    content: Uint8Array,
+  ): Promise<ReplaceResult> => {
+    const operation = await createEntryReplaceOperation(path, expectedSourceClaim, content)
+
+    try {
+      const detached = await stageOwnedPath(
+        operation,
+        path,
+        operation.sourceArtifact,
+        operation.detachedSource,
+        null,
+      )
+
+      if (detached.status !== 'staged') {
+        const restored = await abortOperation(operation)
+        throw staleMove(detached.recovery ?? restored.recovery)
+      }
+      let published: boolean
+
+      try {
+        published = await publishReservationTarget(operation)
+      } catch (err) {
+        const restored = await abortOperation(operation)
+
+        if (restored.recovery) {
+          throw staleMove(restored.recovery)
+        }
+        throw err
+      }
+      if (!published) {
+        const restored = await abortOperation(operation)
+
+        if (restored.recovery) {
+          throw staleMove(restored.recovery)
+        }
+
+        return { published: false }
+      }
+      if (!(await sameInode(path, operation.finalArtifact))) {
+        const restored = await abortOperation(operation)
+        throw staleMove(restored.recovery)
+      }
+      const proof = await proofAfterOwnedCleanup(operation.finalArtifact, path, content, () =>
+        resolveOperation(operation),
+      )
+      return { published: true, proof }
+    } catch (err) {
+      if (await pathExists(operation.active)) {
+        await abortOperation(operation)
+      }
+      throw err
+    }
+  }
+
+  const replaceAbsentBytes = async (
     source: string,
     target: string,
-    expectedSource: string,
-    content: string,
-  ): Promise<boolean> => {
+    expectedSource: Uint8Array,
+    content: Uint8Array,
+  ): Promise<ReplaceResult> => {
     await fs.mkdir(dirname(target), { recursive: true })
     const sameEntry = await sameEntryOnDisk(source, target)
     const operation = await createMoveOperation(
@@ -1240,12 +1652,12 @@ export const createLocalFsFiles = (root: string): FileStore => {
             throw staleMove(restored.recovery)
           }
 
-          return false
+          return { published: false }
         }
       } else {
         if (!(await publishReservationTarget(operation))) {
           await abortOperation(operation)
-          return false
+          return { published: false }
         }
         const detached = await stageOwnedPath(
           operation,
@@ -1264,8 +1676,10 @@ export const createLocalFsFiles = (root: string): FileStore => {
         const restored = await abortOperation(operation)
         throw staleMove(restored.recovery)
       }
-      await resolveOperation(operation)
-      return true
+      const proof = await proofAfterOwnedCleanup(operation.finalArtifact, target, content, () =>
+        resolveOperation(operation),
+      )
+      return { published: true, proof }
     } catch (err) {
       if (await pathExists(operation.active)) {
         await abortOperation(operation)
@@ -1293,8 +1707,8 @@ export const createLocalFsFiles = (root: string): FileStore => {
       'rename',
       source,
       target,
-      expectedSource,
-      expectedSource,
+      Buffer.from(expectedSource, 'utf8'),
+      Buffer.from(expectedSource, 'utf8'),
       sameEntry,
       legacySourceLinkedTarget,
     )
@@ -1374,6 +1788,656 @@ export const createLocalFsFiles = (root: string): FileStore => {
   }
   const ensureRecovered = (): Promise<void> => withStorageLock(ensureRecoveredUnlocked)
 
+  const strictStagePaths = (operationId: string): StrictStagePaths => {
+    const key = sha256Bytes(Buffer.from(operationId, 'utf8'))
+    const dir = join(opsRoot, `strict-${key}`)
+
+    return {
+      dir,
+      header: join(dir, 'header.json'),
+      candidate: join(dir, 'candidate'),
+      publication: join(dir, 'publication'),
+      publishing: join(dir, 'publishing'),
+      receipt: join(dir, 'receipt.json'),
+      failure: join(dir, 'failure.json'),
+      original: join(dir, 'original'),
+      originalSnapshot: join(dir, 'original-snapshot'),
+      detachedOriginal: join(dir, 'detached-original'),
+    }
+  }
+
+  const syncPath = async (path: string): Promise<void> => {
+    const handle = await fs.open(path, 'r')
+
+    try {
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+  }
+
+  const syncDirectory = syncPath
+
+  const writeDurableJson = async (
+    directory: string,
+    target: string,
+    value: unknown,
+  ): Promise<void> => {
+    const temp = join(directory, `.durable-${randomUUID()}`)
+    const handle = await fs.open(temp, 'wx', 0o600)
+
+    try {
+      await handle.writeFile(JSON.stringify(value))
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+    try {
+      await fs.link(temp, target)
+      await syncDirectory(directory)
+    } finally {
+      await fs.unlink(temp).catch(() => {})
+    }
+  }
+
+  const validStrictText = (value: unknown): value is string =>
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= 1024 &&
+    ![...value].some((character) => character.charCodeAt(0) <= 0x1f)
+
+  const parseStrictHeader = (raw: string, operationId: string): StrictStageDiskHeader => {
+    const value: unknown = JSON.parse(raw)
+
+    if (
+      typeof value !== 'object' ||
+      value === null ||
+      (value as Partial<StrictStageDiskHeader>).version !== STRICT_STAGE_VERSION ||
+      (value as Partial<StrictStageDiskHeader>).operationId !== operationId ||
+      !validStrictText((value as Partial<StrictStageDiskHeader>).binding) ||
+      !validStrictText((value as Partial<StrictStageDiskHeader>).path) ||
+      !/^[0-9a-f]{64}$/.test(String((value as Partial<StrictStageDiskHeader>).candidateHash))
+    ) {
+      throw new Error('invalid LocalFS strict stage header')
+    }
+    const expected = (value as Partial<StrictStageDiskHeader>).expected
+
+    if (
+      typeof expected !== 'object' ||
+      expected === null ||
+      !['present', 'absent'].includes(String(expected.kind)) ||
+      typeof expected.value !== 'string' ||
+      !expected.value
+    ) {
+      throw new Error('invalid LocalFS strict stage claim')
+    }
+    const header = value as StrictStageDiskHeader
+
+    if (relativeStoragePath(abs(header.path)) !== header.path) {
+      throw new Error('invalid LocalFS strict stage path')
+    }
+
+    return header
+  }
+
+  const parseStrictReceipt = (
+    raw: string,
+    stage: FileStrictStageHeader,
+  ): FileStrictMutationReceipt => {
+    const value: unknown = JSON.parse(raw)
+
+    if (
+      typeof value !== 'object' ||
+      value === null ||
+      (value as Partial<FileStrictMutationReceipt>).operationId !== stage.operationId ||
+      (value as Partial<FileStrictMutationReceipt>).binding !== stage.binding ||
+      !validStrictText((value as Partial<FileStrictMutationReceipt>).observationId) ||
+      !validStrictText((value as Partial<FileStrictMutationReceipt>).semanticEventTime) ||
+      (value as Partial<FileStrictMutationReceipt>).restartDurable !== true ||
+      (value as Partial<FileStrictMutationReceipt>).candidateHash !== stage.candidateHash ||
+      !Array.isArray((value as Partial<FileStrictMutationReceipt>).transitions) ||
+      (value as Partial<FileStrictMutationReceipt>).transitions?.length !== 1
+    ) {
+      throw new Error('invalid LocalFS strict publication receipt')
+    }
+    const receipt = value as FileStrictMutationReceipt
+    const [transition] = receipt.transitions
+
+    if (
+      transition.path !== stage.path ||
+      !claimMatches(transition.before, stage.expected) ||
+      transition.after.kind !== 'present' ||
+      (transition.mtimeMs !== null && !Number.isFinite(transition.mtimeMs))
+    ) {
+      throw new Error('invalid LocalFS strict publication proof')
+    }
+
+    return receipt
+  }
+
+  const parseStrictFailure = (raw: string): StrictFailure => {
+    const value: unknown = JSON.parse(raw)
+
+    if (
+      typeof value !== 'object' ||
+      value === null ||
+      !validStrictText((value as Partial<StrictFailure>).reason) ||
+      !Array.isArray((value as Partial<StrictFailure>).recoveryPaths) ||
+      !(value as Partial<StrictFailure>).recoveryPaths?.every(
+        (path) => typeof path === 'string' && path.startsWith(`${FS_OPS_DIR}/strict-`),
+      )
+    ) {
+      throw new Error('invalid LocalFS strict recovery failure')
+    }
+
+    return value as StrictFailure
+  }
+
+  const quarantineStrictStage = async (paths: StrictStagePaths, cause: unknown): Promise<never> => {
+    const quarantine = join(opsRoot, `quarantine-${randomUUID()}`)
+
+    try {
+      await fs.rename(paths.dir, quarantine)
+      await syncDirectory(opsRoot)
+    } catch (err) {
+      if (errnoCode(err) !== 'ENOENT') {
+        throw Object.assign(new Error(`cannot quarantine corrupt LocalFS strict stage`), {
+          code: 'STRICT_STAGE_CORRUPT',
+          cause: err,
+        })
+      }
+    }
+    throw Object.assign(new Error('corrupt LocalFS strict stage was quarantined'), {
+      code: 'STRICT_STAGE_CORRUPT',
+      cause,
+    })
+  }
+
+  const readStrictStage = async (operationId: string): Promise<FileStrictStageState> => {
+    const paths = strictStagePaths(operationId)
+    let rawHeader: string
+
+    try {
+      rawHeader = await fs.readFile(paths.header, 'utf8')
+    } catch (err) {
+      if (errnoCode(err) === 'ENOENT' && !(await pathExists(paths.dir))) {
+        return { status: 'missing' }
+      }
+
+      return quarantineStrictStage(paths, err)
+    }
+
+    try {
+      const diskHeader = parseStrictHeader(rawHeader, operationId)
+      const candidate = await readRegularBytes(paths.candidate)
+
+      if (candidate == null || sha256Bytes(candidate) !== diskHeader.candidateHash) {
+        throw new Error('LocalFS strict stage candidate is missing or changed')
+      }
+      const stage: FileStrictStageHeader = {
+        operationId: diskHeader.operationId,
+        binding: diskHeader.binding,
+        path: diskHeader.path,
+        expected: diskHeader.expected,
+        candidateHash: diskHeader.candidateHash,
+      }
+
+      if (await pathExists(paths.receipt)) {
+        const receipt = parseStrictReceipt(await fs.readFile(paths.receipt, 'utf8'), stage)
+        const transition = receipt.transitions.find(({ path }) => path === stage.path)
+        const current = await observeRegular(stage.path)
+
+        // A receipt proves what this operation published; it is not a lease on the
+        // public pathname. Recovery must bind that proof back to the pathname it is
+        // about before allowing the metadata half to become terminal. In
+        // particular, an atomic replace changes the inode claim and an in-place
+        // edit changes its hash/size claim even though receipt.json remains intact.
+        if (
+          !transition ||
+          current.kind !== 'present' ||
+          !claimMatches(current.claim, transition.after) ||
+          sha256Bytes(current.bytes) !== stage.candidateHash
+        ) {
+          const failed = await markStrictFailure(
+            paths,
+            stage,
+            'published candidate no longer owns the public pathname',
+          )
+
+          if (failed.status !== 'failed-recoverable') {
+            throw new Error('strict receipt revalidation produced an invalid state')
+          }
+
+          return failed
+        }
+
+        return {
+          status: 'published',
+          stage,
+          receipt,
+        }
+      }
+      if (await pathExists(paths.failure)) {
+        const failure = parseStrictFailure(await fs.readFile(paths.failure, 'utf8'))
+
+        return { status: 'failed-recoverable', stage, ...failure }
+      }
+
+      return {
+        status: (await pathExists(paths.publishing)) ? 'publishing' : 'staged',
+        stage,
+      }
+    } catch (err) {
+      return quarantineStrictStage(paths, err)
+    }
+  }
+
+  const assertStrictBinding = (
+    state: Exclude<FileStrictStageState, { status: 'missing' }>,
+    binding: string,
+  ): void => {
+    if (state.stage.binding !== binding) {
+      throw Object.assign(new Error('strict stage idempotency binding does not match'), {
+        code: 'STRICT_IDEMPOTENCY_CONFLICT',
+      })
+    }
+  }
+
+  const clearStrictPublishing = async (paths: StrictStagePaths): Promise<void> => {
+    await fs.unlink(paths.publishing).catch((err) => {
+      if (errnoCode(err) !== 'ENOENT') {
+        throw err
+      }
+    })
+    await syncDirectory(paths.dir)
+  }
+
+  const markStrictFailure = async (
+    paths: StrictStagePaths,
+    stage: FileStrictStageHeader,
+    reason: string,
+  ): Promise<FileStrictPublicationResult> => {
+    const recoveryPaths: string[] = []
+
+    for (const path of [paths.originalSnapshot, paths.original, paths.detachedOriginal]) {
+      if (await pathExists(path)) {
+        recoveryPaths.push(toPosix(relative(rootAbs, path)))
+      }
+    }
+    const failure = { reason, recoveryPaths }
+
+    if (!(await pathExists(paths.failure))) {
+      await writeDurableJson(paths.dir, paths.failure, failure)
+    }
+
+    return { status: 'failed-recoverable', stage, ...failure }
+  }
+
+  const persistStrictReceipt = async (
+    paths: StrictStagePaths,
+    stage: FileStrictStageHeader,
+    candidate: Uint8Array,
+  ): Promise<FileStrictPublicationResult> => {
+    const target = abs(stage.path)
+
+    const publishedBytes = await readRegularBytes(paths.publication)
+
+    if (
+      publishedBytes == null ||
+      !bytesEqual(publishedBytes, candidate) ||
+      !(await sameInode(target, paths.publication))
+    ) {
+      return markStrictFailure(
+        paths,
+        stage,
+        'published candidate no longer owns the public pathname',
+      )
+    }
+    const published = await fs.lstat(target, { bigint: true })
+    const proof = presentProofFromStat(published, candidate)
+    const receipt: FileStrictMutationReceipt = {
+      operationId: stage.operationId,
+      binding: stage.binding,
+      observationId: `strict:${sha256Bytes(Buffer.from(stage.operationId, 'utf8'))}`,
+      semanticEventTime: new Date().toISOString(),
+      restartDurable: true,
+      candidateHash: stage.candidateHash,
+      transitions: [
+        {
+          path: stage.path,
+          before: stage.expected,
+          after: proof.claim,
+          mtimeMs: proof.mtimeMs,
+        },
+      ],
+    }
+
+    if (!(await pathExists(paths.receipt))) {
+      await writeDurableJson(paths.dir, paths.receipt, receipt)
+    }
+
+    return { status: 'published', receipt }
+  }
+
+  const restoreStrictDetached = async (
+    paths: StrictStagePaths,
+    target: string,
+  ): Promise<boolean> => {
+    if (!(await pathExists(paths.detachedOriginal))) {
+      return true
+    }
+    if (await pathExists(target)) {
+      return sameInode(target, paths.detachedOriginal)
+    }
+    try {
+      if (await renameNoReplace(paths.detachedOriginal, target)) {
+        await syncDirectory(dirname(target))
+        await syncDirectory(paths.dir)
+        return true
+      }
+
+      return false
+    } catch (err) {
+      if (errnoCode(err) !== 'ENOTSUP') {
+        throw err
+      }
+    }
+    try {
+      await fs.link(paths.detachedOriginal, target)
+      await fs.unlink(paths.detachedOriginal)
+      await syncDirectory(dirname(target))
+      await syncDirectory(paths.dir)
+      return true
+    } catch (err) {
+      if (errnoCode(err) === 'EEXIST') {
+        return false
+      }
+      throw err
+    }
+  }
+
+  const publishStrictStage = async (
+    paths: StrictStagePaths,
+    stage: FileStrictStageHeader,
+  ): Promise<FileStrictPublicationResult> => {
+    const candidate = await readRegularBytes(paths.candidate)
+
+    if (candidate == null || sha256Bytes(candidate) !== stage.candidateHash) {
+      return quarantineStrictStage(paths, new Error('strict candidate changed before publish'))
+    }
+    const target = abs(stage.path)
+    await fs.mkdir(dirname(target), { recursive: true })
+
+    if (!(await pathExists(paths.publication))) {
+      await fs.copyFile(paths.candidate, paths.publication, fsConstants.COPYFILE_EXCL)
+      await syncPath(paths.publication)
+      await syncDirectory(paths.dir)
+    }
+    const publicationBytes = await readRegularBytes(paths.publication)
+
+    if (publicationBytes == null || !bytesEqual(publicationBytes, candidate)) {
+      return markStrictFailure(paths, stage, 'strict publication evidence changed')
+    }
+
+    if (await sameInode(target, paths.publication)) {
+      return persistStrictReceipt(paths, stage, candidate)
+    }
+
+    if (stage.expected.kind === 'absent') {
+      const current = await observeRegular(stage.path)
+
+      if (current.kind !== 'absent' || !claimMatches(current.claim, stage.expected)) {
+        await clearStrictPublishing(paths)
+        return { status: 'conflict', stage }
+      }
+      try {
+        await fs.link(paths.publication, target)
+      } catch (err) {
+        if (errnoCode(err) !== 'EEXIST') {
+          throw err
+        }
+        if (!(await sameInode(target, paths.publication))) {
+          await clearStrictPublishing(paths)
+          return { status: 'conflict', stage }
+        }
+      }
+      await syncPath(paths.publication)
+      await syncDirectory(dirname(target))
+      return persistStrictReceipt(paths, stage, candidate)
+    }
+
+    const expectedSource = /^localfs:present:v1:([^:]+):([^:]+):[^:]+:([^:]+):([0-9a-f]{64})$/.exec(
+      stage.expected.value,
+    )
+
+    if (!expectedSource) {
+      await clearStrictPublishing(paths)
+      return { status: 'conflict', stage }
+    }
+    const expectedDev = expectedSource[1]
+    const expectedIno = expectedSource[2]
+    const expectedSize = expectedSource[3]
+    const expectedHash = expectedSource[4]
+
+    if (!(await pathExists(paths.original))) {
+      const current = await observeRegular(stage.path)
+
+      if (current.kind !== 'present' || !claimMatches(current.claim, stage.expected)) {
+        await clearStrictPublishing(paths)
+        return { status: 'conflict', stage }
+      }
+      const before = await fs.lstat(target, { bigint: true })
+
+      if (!claimMatches(presentProofFromStat(before, current.bytes).claim, stage.expected)) {
+        await clearStrictPublishing(paths)
+        return { status: 'conflict', stage }
+      }
+      try {
+        await fs.link(target, paths.original)
+      } catch (err) {
+        if (errnoCode(err) !== 'EEXIST') {
+          throw err
+        }
+      }
+      const [original, publicEntry] = await Promise.all([
+        fs.lstat(paths.original, { bigint: true }),
+        fs.lstat(target, { bigint: true }).catch(() => null),
+      ])
+
+      if (
+        original.dev !== before.dev ||
+        original.ino !== before.ino ||
+        publicEntry == null ||
+        publicEntry.dev !== before.dev ||
+        publicEntry.ino !== before.ino
+      ) {
+        await fs.unlink(paths.original).catch(() => {})
+        await clearStrictPublishing(paths)
+        return { status: 'conflict', stage }
+      }
+      await syncPath(paths.original)
+      await syncDirectory(paths.dir)
+    }
+
+    const originalStat = await fs.lstat(paths.original, { bigint: true })
+    const originalBytes = await readRegularBytes(paths.original)
+
+    if (
+      originalStat.dev.toString() !== expectedDev ||
+      originalStat.ino.toString() !== expectedIno ||
+      originalStat.size.toString() !== expectedSize ||
+      originalBytes == null ||
+      sha256Bytes(originalBytes) !== expectedHash
+    ) {
+      if (await pathExists(paths.detachedOriginal)) {
+        return markStrictFailure(paths, stage, 'displaced source changed through an open handle')
+      }
+      await clearStrictPublishing(paths)
+      return { status: 'conflict', stage }
+    }
+    if (!(await pathExists(paths.originalSnapshot))) {
+      await fs.copyFile(paths.original, paths.originalSnapshot, fsConstants.COPYFILE_EXCL)
+      await syncPath(paths.originalSnapshot)
+      await syncDirectory(paths.dir)
+    }
+    const originalSnapshot = await readRegularBytes(paths.originalSnapshot)
+
+    if (originalSnapshot == null || sha256Bytes(originalSnapshot) !== expectedHash) {
+      return markStrictFailure(paths, stage, 'immutable original snapshot changed')
+    }
+
+    if (await sameInode(target, paths.publication)) {
+      return persistStrictReceipt(paths, stage, candidate)
+    }
+
+    if (!(await pathExists(paths.detachedOriginal))) {
+      if (!(await sameInode(target, paths.original))) {
+        await clearStrictPublishing(paths)
+        return { status: 'conflict', stage }
+      }
+      try {
+        await fs.rename(target, paths.detachedOriginal)
+      } catch (err) {
+        if (errnoCode(err) === 'ENOENT') {
+          return markStrictFailure(paths, stage, 'restore target changed during detach')
+        }
+        throw err
+      }
+      await syncDirectory(dirname(target))
+      await syncDirectory(paths.dir)
+
+      if (!(await sameInode(paths.detachedOriginal, paths.original))) {
+        if (!(await restoreStrictDetached(paths, target))) {
+          return markStrictFailure(paths, stage, 'foreign target was displaced during detach')
+        }
+        await clearStrictPublishing(paths)
+        return { status: 'conflict', stage }
+      }
+      const detachedBytes = await readRegularBytes(paths.detachedOriginal)
+
+      if (detachedBytes == null || !bytesEqual(detachedBytes, originalSnapshot)) {
+        if (!(await restoreStrictDetached(paths, target))) {
+          return markStrictFailure(
+            paths,
+            stage,
+            'changed source could not be restored after detach',
+          )
+        }
+        await clearStrictPublishing(paths)
+        return { status: 'conflict', stage }
+      }
+    }
+
+    if (await pathExists(target)) {
+      if (await sameInode(target, paths.publication)) {
+        return persistStrictReceipt(paths, stage, candidate)
+      }
+
+      return markStrictFailure(paths, stage, 'a racing writer occupied the detached target')
+    }
+    try {
+      await fs.link(paths.publication, target)
+    } catch (err) {
+      if (errnoCode(err) !== 'EEXIST') {
+        throw err
+      }
+      if (!(await sameInode(target, paths.publication))) {
+        return markStrictFailure(paths, stage, 'a racing writer won strict publication')
+      }
+    }
+    await syncPath(paths.publication)
+    await syncDirectory(dirname(target))
+    return persistStrictReceipt(paths, stage, candidate)
+  }
+
+  const stageStrictCandidate = async (
+    request: FileStrictStageRequest,
+  ): Promise<FileStrictStageResult> => {
+    if (!validStrictText(request.operationId) || !validStrictText(request.binding)) {
+      throw new Error('strict stage requires bounded operation and binding identifiers')
+    }
+    const canonicalPath = relativeStoragePath(abs(request.path))
+    const candidateHash = sha256Bytes(request.content)
+    const existing = await readStrictStage(request.operationId)
+
+    if (existing.status !== 'missing') {
+      const sameRequest =
+        existing.stage.binding === request.binding &&
+        existing.stage.path === canonicalPath &&
+        claimMatches(existing.stage.expected, request.expected) &&
+        existing.stage.candidateHash === candidateHash
+
+      return sameRequest
+        ? { status: 'accepted', created: false, state: existing }
+        : { status: 'idempotency-conflict' }
+    }
+    const paths = strictStagePaths(request.operationId)
+    const temp = join(opsRoot, `strict-preparing-${randomUUID()}`)
+    const diskHeader: StrictStageDiskHeader = {
+      version: STRICT_STAGE_VERSION,
+      operationId: request.operationId,
+      binding: request.binding,
+      path: canonicalPath,
+      expected: request.expected,
+      candidateHash,
+    }
+    const opsExisted = await pathExists(opsRoot)
+    await fs.mkdir(opsRoot, { recursive: true, mode: 0o700 })
+
+    if (!opsExisted) {
+      await syncDirectory(rootAbs)
+    }
+    await fs.mkdir(temp, { mode: 0o700 })
+
+    try {
+      const headerHandle = await fs.open(join(temp, 'header.json'), 'wx', 0o600)
+
+      try {
+        await headerHandle.writeFile(JSON.stringify(diskHeader))
+        await headerHandle.sync()
+      } finally {
+        await headerHandle.close()
+      }
+      const candidateHandle = await fs.open(join(temp, 'candidate'), 'wx', 0o600)
+
+      try {
+        await candidateHandle.writeFile(request.content)
+        await candidateHandle.sync()
+      } finally {
+        await candidateHandle.close()
+      }
+      await syncDirectory(temp)
+      if (!(await renameNoReplace(temp, paths.dir))) {
+        const raced = await readStrictStage(request.operationId)
+
+        if (raced.status === 'missing') {
+          throw new Error('strict stage publication lost without a visible winner')
+        }
+        const sameRequest =
+          raced.stage.binding === request.binding &&
+          raced.stage.path === canonicalPath &&
+          claimMatches(raced.stage.expected, request.expected) &&
+          raced.stage.candidateHash === candidateHash
+
+        return sameRequest
+          ? { status: 'accepted', created: false, state: raced }
+          : { status: 'idempotency-conflict' }
+      }
+      await syncDirectory(opsRoot)
+      const stage: FileStrictStageHeader = {
+        operationId: request.operationId,
+        binding: request.binding,
+        path: canonicalPath,
+        expected: request.expected,
+        candidateHash,
+      }
+
+      return { status: 'accepted', created: true, state: { status: 'staged', stage } }
+    } finally {
+      await fs.rm(temp, { recursive: true, force: true }).catch(() => {})
+    }
+  }
+
   return {
     scan: async () => {
       await ensureRecovered()
@@ -1436,7 +2500,10 @@ export const createLocalFsFiles = (root: string): FileStore => {
           const full = join(dirAbs, entry.name)
           const exportPath = toPosix(relative(rootAbs, full))
 
-          if (entry.isDirectory() && isAtomicInstallTempPath(exportPath)) {
+          if (
+            entry.isDirectory() &&
+            (exportPath === FS_OPS_DIR || isAtomicInstallTempPath(exportPath))
+          ) {
             continue
           }
 
@@ -1498,6 +2565,361 @@ export const createLocalFsFiles = (root: string): FileStore => {
     read: async (rel) => {
       await ensureRecovered()
       return readRegular(abs(rel))
+    },
+
+    readBytes: async (rel) => {
+      await ensureRecovered()
+      const observation = await observeRegular(rel)
+
+      return observation.kind === 'present' ? observation.bytes : null
+    },
+
+    observe: async (rel, options) => {
+      await ensureRecovered()
+      return observeRegular(rel, options)
+    },
+
+    publish: (request) =>
+      withStorageLock(async (): Promise<FilePublicationResult> => {
+        await ensureRecoveredUnlocked()
+        const candidateHash = sha256Bytes(request.content)
+
+        if (request.kind === 'put') {
+          const current = await observeRegular(request.path)
+
+          if (current.kind === 'unavailable') {
+            return { status: 'conflict' }
+          }
+          if (!claimMatches(request.expected, current.claim)) {
+            return { status: 'conflict' }
+          }
+          if (current.kind === 'absent') {
+            const target = abs(request.path)
+            const dir = dirname(target)
+            await fs.mkdir(dir, { recursive: true })
+            const tmp = await writeTemp(dir, request.content)
+
+            try {
+              try {
+                await fs.link(tmp, target)
+              } catch (err) {
+                if (errnoCode(err) === 'EEXIST') {
+                  return { status: 'conflict' }
+                }
+                throw err
+              }
+              const proof = await proofAfterOwnedCleanup(tmp, target, request.content, () =>
+                fs.unlink(tmp),
+              )
+
+              return {
+                status: 'published',
+                candidateHash,
+                transitions: [
+                  {
+                    path: request.path,
+                    before: current.claim,
+                    after: proof.claim,
+                    mtimeMs: proof.mtimeMs,
+                  },
+                ],
+              }
+            } finally {
+              await fs.unlink(tmp).catch(() => {})
+            }
+          }
+          if (current.kind === 'occupied') {
+            const replaced = await replaceOccupiedBytes(
+              abs(request.path),
+              current.claim.value,
+              request.content,
+            )
+
+            return replaced.published
+              ? {
+                  status: 'published',
+                  candidateHash,
+                  transitions: [
+                    {
+                      path: request.path,
+                      before: current.claim,
+                      after: replaced.proof.claim,
+                      mtimeMs: replaced.proof.mtimeMs,
+                    },
+                  ],
+                }
+              : { status: 'conflict' }
+          }
+          const replaced = await replaceAbsentBytes(
+            abs(request.path),
+            abs(request.path),
+            current.bytes,
+            request.content,
+          )
+
+          return replaced.published
+            ? {
+                status: 'published',
+                candidateHash,
+                transitions: [
+                  {
+                    path: request.path,
+                    before: current.claim,
+                    after: replaced.proof.claim,
+                    mtimeMs: replaced.proof.mtimeMs,
+                  },
+                ],
+              }
+            : { status: 'conflict' }
+        }
+
+        const [source, target] = await Promise.all([
+          observeRegular(request.sourcePath),
+          observeRegular(request.targetPath),
+        ])
+
+        if (
+          source.kind !== 'present' ||
+          target.kind !== 'absent' ||
+          !claimMatches(source.claim, request.expectedSource) ||
+          !claimMatches(target.claim, request.expectedTarget)
+        ) {
+          return { status: 'conflict' }
+        }
+        const replaced = await replaceAbsentBytes(
+          abs(request.sourcePath),
+          abs(request.targetPath),
+          source.bytes,
+          request.content,
+        )
+
+        return replaced.published
+          ? {
+              status: 'published',
+              candidateHash,
+              transitions: [
+                {
+                  path: request.sourcePath,
+                  before: source.claim,
+                  after: absentFileClaim(request.sourcePath),
+                  mtimeMs: null,
+                },
+                {
+                  path: request.targetPath,
+                  before: target.claim,
+                  after: replaced.proof.claim,
+                  mtimeMs: replaced.proof.mtimeMs,
+                },
+              ],
+            }
+          : { status: 'conflict' }
+      }),
+
+    publishPackageIfAbsent: (request) => {
+      const files = request.files.map((file) => ({
+        path: file.path,
+        content: Uint8Array.from(file.content),
+      }))
+      const expectedRoot = { ...request.expectedRoot }
+
+      return withStorageLock(async (): Promise<FilePublicationResult> => {
+        await ensureRecoveredUnlocked()
+        if (!files.length || new Set(files.map((file) => file.path)).size !== files.length) {
+          throw new Error('package publication requires unique resource paths')
+        }
+        for (const file of files) {
+          const parts = file.path.split('/')
+
+          if (
+            !file.path ||
+            file.path.includes('\\') ||
+            parts.some((part) => !part || part === '.' || part === '..')
+          ) {
+            throw new Error(`invalid package resource path: ${file.path}`)
+          }
+        }
+        const current = await observeRegular(request.rootPath)
+
+        if (
+          current.kind !== 'absent' ||
+          current.claim.kind !== expectedRoot.kind ||
+          current.claim.value !== expectedRoot.value
+        ) {
+          return { status: 'conflict' }
+        }
+        const target = abs(request.rootPath)
+        const parent = dirname(target)
+        await fs.mkdir(parent, { recursive: true })
+        const temp = join(parent, `.${basename(target)}.install-${randomUUID()}`)
+        await fs.mkdir(temp)
+
+        try {
+          for (const file of files) {
+            const staged = join(temp, ...file.path.split('/'))
+            await fs.mkdir(dirname(staged), { recursive: true })
+            await fs.writeFile(staged, file.content, { flag: 'wx' })
+          }
+          const stagedRoot = await fs.lstat(temp, { bigint: true })
+          const stagedFiles = new Map<string, BigIntStats>()
+
+          for (const file of files) {
+            stagedFiles.set(
+              file.path,
+              await fs.lstat(join(temp, ...file.path.split('/')), { bigint: true }),
+            )
+          }
+          if (!(await renameNoReplace(temp, target))) {
+            return { status: 'conflict' }
+          }
+          const publishedRoot = await fs.lstat(target, { bigint: true })
+
+          if (publishedRoot.dev !== stagedRoot.dev || publishedRoot.ino !== stagedRoot.ino) {
+            throw staleMove()
+          }
+          const transitions = [
+            {
+              path: request.rootPath,
+              before: current.claim,
+              after: occupiedClaim(publishedRoot),
+              mtimeMs: nsToMs(publishedRoot.mtimeNs),
+            },
+          ]
+
+          for (const file of files) {
+            const path = `${request.rootPath}/${file.path}`
+            const staged = stagedFiles.get(file.path)!
+            const published = await fs.lstat(abs(path), { bigint: true })
+
+            if (published.dev !== staged.dev || published.ino !== staged.ino) {
+              throw staleMove()
+            }
+            const proof = presentProofFromStat(published, file.content)
+            transitions.push({
+              path,
+              before: absentFileClaim(path),
+              after: proof.claim,
+              mtimeMs: proof.mtimeMs,
+            })
+          }
+
+          return {
+            status: 'published',
+            candidateHash: packageCandidateHash(files),
+            transitions,
+          }
+        } finally {
+          await fs.rm(temp, { recursive: true, force: true }).catch(() => {})
+        }
+      })
+    },
+
+    strictPublication: {
+      restartDurable: true,
+      stage: (request) => {
+        const captured: FileStrictStageRequest = {
+          ...request,
+          expected: { ...request.expected },
+          content: Uint8Array.from(request.content),
+        }
+
+        return withStorageLock(() => stageStrictCandidate(captured))
+      },
+      inspect: (operationId, binding) =>
+        withStorageLock(async () => {
+          const state = await readStrictStage(operationId)
+
+          if (state.status !== 'missing') {
+            assertStrictBinding(state, binding)
+          }
+
+          return state
+        }),
+      publish: (operationId, binding) =>
+        withStorageLock(async () => {
+          await ensureRecoveredUnlocked()
+          const state = await readStrictStage(operationId)
+
+          if (state.status === 'missing') {
+            throw Object.assign(new Error('strict stage is missing'), {
+              code: 'STRICT_STAGE_MISSING',
+            })
+          }
+          assertStrictBinding(state, binding)
+
+          if (state.status === 'published') {
+            return { status: 'published', receipt: state.receipt }
+          }
+          if (state.status === 'failed-recoverable') {
+            return state
+          }
+          const paths = strictStagePaths(operationId)
+
+          if (state.status === 'staged') {
+            await writeMarker(paths.publishing)
+            await syncDirectory(paths.dir)
+          }
+
+          return publishStrictStage(paths, state.stage)
+        }),
+      discard: (operationId, binding) =>
+        withStorageLock(async () => {
+          const paths = strictStagePaths(operationId)
+          let header: FileStrictStageHeader | null = null
+
+          try {
+            const disk = parseStrictHeader(await fs.readFile(paths.header, 'utf8'), operationId)
+            header = {
+              operationId: disk.operationId,
+              binding: disk.binding,
+              path: disk.path,
+              expected: disk.expected,
+              candidateHash: disk.candidateHash,
+            }
+          } catch (error) {
+            if (errnoCode(error) === 'ENOENT' && !(await pathExists(paths.dir))) {
+              return false
+            }
+            throw error
+          }
+
+          if (header.binding !== binding) {
+            throw Object.assign(new Error('strict stage idempotency binding does not match'), {
+              code: 'STRICT_IDEMPOTENCY_CONFLICT',
+            })
+          }
+
+          // A terminal DB record is the replay source of truth, so a caller may
+          // reclaim a published stage even if the public path was legitimately
+          // edited after success. Non-terminal stages still use the full state
+          // validation below and retain ambiguous recovery artifacts.
+          if (await pathExists(paths.receipt)) {
+            await fs.rm(paths.dir, { recursive: true, force: true })
+            await syncDirectory(opsRoot)
+            await fs.rmdir(opsRoot).catch((err) => {
+              if (!['ENOENT', 'ENOTEMPTY'].includes(errnoCode(err) ?? '')) {
+                throw err
+              }
+            })
+            return true
+          }
+          const state = await readStrictStage(operationId)
+
+          if (state.status === 'missing') {
+            return false
+          }
+          assertStrictBinding(state, binding)
+          if (state.status === 'publishing' || state.status === 'failed-recoverable') {
+            return false
+          }
+          await fs.rm(paths.dir, { recursive: true, force: true })
+          await syncDirectory(opsRoot)
+          await fs.rmdir(opsRoot).catch((err) => {
+            if (!['ENOENT', 'ENOTEMPTY'].includes(errnoCode(err) ?? '')) {
+              throw err
+            }
+          })
+          return true
+        }),
     },
 
     write: async (rel, content) => {
@@ -1576,7 +2998,14 @@ export const createLocalFsFiles = (root: string): FileStore => {
     replaceIfAbsent: (from, to, expectedSource, content) =>
       withStorageLock(async () => {
         await ensureRecoveredUnlocked()
-        return replaceAbsent(abs(from), abs(to), expectedSource, content)
+        return (
+          await replaceAbsentBytes(
+            abs(from),
+            abs(to),
+            Buffer.from(expectedSource, 'utf8'),
+            Buffer.from(content, 'utf8'),
+          )
+        ).published
       }),
 
     removeIfUnchanged: (rel, expectedContent) =>
@@ -1611,6 +3040,48 @@ export const createLocalFsFiles = (root: string): FileStore => {
           }
 
           return false
+        } finally {
+          await fs.unlink(sourceClaim).catch(() => {})
+        }
+      }),
+
+    removeIfClaimed: (rel, expectedContent, expectedClaim) =>
+      withStorageLock(async () => {
+        await ensureRecoveredUnlocked()
+        const observation = await observeRegular(rel)
+
+        if (
+          observation.kind !== 'present' ||
+          !claimMatches(observation.claim, expectedClaim) ||
+          new TextDecoder().decode(observation.bytes) !== expectedContent
+        ) {
+          return false
+        }
+        const expectedInode = claimInode(expectedClaim)
+
+        if (!expectedInode) {
+          return false
+        }
+        const source = abs(rel)
+        let sourceClaim: string
+
+        try {
+          sourceClaim = await claimSource(source)
+        } catch (error) {
+          if (errnoCode(error) === 'ENOENT') {
+            return false
+          }
+          throw error
+        }
+        try {
+          const claimed = await fs.lstat(sourceClaim, { bigint: true })
+
+          if (claimed.dev !== expectedInode.dev || claimed.ino !== expectedInode.ino) {
+            return false
+          }
+          const detached = await detachClaimedPath(source, sourceClaim, expectedContent)
+
+          return detached.status === 'removed'
         } finally {
           await fs.unlink(sourceClaim).catch(() => {})
         }

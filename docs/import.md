@@ -2,6 +2,13 @@
 
 Pull an existing knowledge base — claude.ai, ChatGPT, and MCP memory-server exports — into a space in a single upload. Import is the mirror of export (#17), inverted: export reads the engine's on-disk truth and streams it, import **parses on the host and writes through the port**. The parsers are pure (format → notes), and writing goes through the ordinary write-path (`store.write`) — no separate backend is needed, import works on any engine.
 
+Import authors current notes; it is not a history/recovery replay protocol. Every
+successful write is exact-read back into the normal byte-safe revision boundary and
+gets a fresh journal row/receipt. Imported archives cannot inject revision ids,
+restore-safety labels, owner proof, operation evidence or historical ordering. In the
+other direction, history's opaque `contentMode:source` is an inspection surface, not
+an import/export package format.
+
 ## Data path
 
 1. **Parsers are pure functions in `core`** (`importer/`): `string → ImportNote[]`, zero IO/store, fixture-testable. A normalized `ImportNote { title, body, directory, tags?, noteType?, createdAt?, frontmatter?, fileName, source }` (provenance via `tags`; raw authored metadata via `frontmatter`; `source` also governs the memory destination). The format is detected by content (`detectFormat`/`detectSingleObject`), not by file name (everyone ships a `conversations.json` file). The parsers cover these formats:

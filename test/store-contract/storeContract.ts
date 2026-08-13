@@ -17,7 +17,9 @@ import {
   type ExportEntry,
   IF_EXISTS,
   type KnowledgeStore,
+  type NoteClass,
   type NoteMeta,
+  parseFrontmatterLines,
   STORE_ERROR_REASON,
 } from '@notarium/core'
 
@@ -1191,6 +1193,34 @@ export const describeKnowledgeStoreContract = (
         expect(back.aliases ?? []).not.toContain('old-slug') // no stale self-alias
         await store.remove(id)
       })
+
+      it('legacy restore intent preserves authored aliases instead of synthesizing rename history', async () => {
+        const created = await store.write({
+          title: 'Legacy Alias Before',
+          directory: dir,
+          content: 'body',
+          frontmatter: parseFrontmatterLines('aliases: [kept-alias] # authored'),
+        })
+        const id = created.id ?? idOf(byTitle(await store.list(), 'Legacy Alias Before')!)
+
+        await store.write({
+          title: 'Legacy Alias After',
+          content: 'restored body',
+          originalId: id,
+          versionToken: await tokenFor(id),
+          preservePath: true,
+          preserveAliases: true,
+        })
+
+        const after = await store.read(id)
+        // The conservative projection deliberately does not parse a commented
+        // flow-list. The contract here is raw preservation and, equally, the
+        // absence of a generated rename alias replacing it.
+        expect(after.frontmatter.aliases).toBeUndefined()
+        expect(after.logicalState?.markdown).toContain('aliases: [kept-alias] # authored')
+        expect(byTitle(await store.list(), 'Legacy Alias After')?.aliases).toBeUndefined()
+        await store.remove(id)
+      })
     })
 
     it("ifExists:'fail' refuses a same-titled create instead of overwriting it", async () => {
@@ -1347,6 +1377,104 @@ export const describeKnowledgeStoreContract = (
         ).rejects.toMatchObject({ isNotFound: true })
         expect(byTitle(await store.list(), TITLE_C)).toBeFalsy()
       })
+    })
+
+    describe('versioned Markdown classes', () => {
+      const classes: NoteClass[] = ['user-doc', 'agent-memory', 'profile', 'skill']
+
+      for (const cls of classes) {
+        it(`${cls}: metadata-only CAS, journal and restore use the same full state`, async () => {
+          const title = `Contract State ${cls}`
+          await store.write({
+            title,
+            directory: dir,
+            content: 'stable body',
+            targetClass: cls,
+            frontmatter: parseFrontmatterLines('plugin-state: one\n# authored marker'),
+          })
+          const meta = byTitle(await store.list({ scope: 'all' }), title)!
+          const id = idOf(meta)
+
+          try {
+            const before = await store.read(id)
+            expect(before.class).toBe(cls)
+            expect(before.logicalState?.markdown).toContain('plugin-state: one')
+            expect(before.logicalState?.markdown).toContain('# authored marker')
+
+            const saved = await store.write({
+              title,
+              directory: dir,
+              content: before.content,
+              originalId: id,
+              versionToken: before.versionToken,
+              frontmatter: parseFrontmatterLines('plugin-state: two'),
+            })
+            const after = await store.read(id)
+
+            if (store.capabilities.cas) {
+              expect(after.versionToken).not.toBe(before.versionToken)
+              expect(saved.versionToken).toBe(after.versionToken)
+            }
+            expect(after.logicalState?.markdown).toContain('plugin-state: two')
+
+            if (store.capabilities.cas) {
+              await expect(
+                store.write({
+                  title,
+                  directory: dir,
+                  content: before.content,
+                  originalId: id,
+                  versionToken: before.versionToken,
+                  frontmatter: parseFrontmatterLines('plugin-state: stale'),
+                }),
+              ).rejects.toMatchObject({ isConflict: true, reason: 'version_conflict' })
+            }
+
+            if (
+              store.capabilities.revisions &&
+              store.revisions &&
+              store.revision &&
+              store.restore
+            ) {
+              const rows = await store.revisions(id, { offset: 0, limit: 10 })
+              expect(rows.items.length).toBeGreaterThanOrEqual(2)
+              expect(rows.items.every((row) => row.stateFormat === 'markdown-v2')).toBe(true)
+              expect(rows.items.every((row) => row.restoreSafety === 'safe')).toBe(true)
+              const original = rows.items.at(-1)!
+              const detail = await store.revision(id, original.id)
+              expect(detail?.logicalState?.markdown).toContain('plugin-state: one')
+
+              await store.restore({
+                id,
+                revisionId: original.id,
+                versionToken: after.versionToken!,
+              })
+              expect((await store.read(id)).logicalState?.markdown).toContain('plugin-state: one')
+            }
+
+            if (store.capabilities.trash && store.restoreFromTrash) {
+              const beforeTrash = await store.read(id)
+              await store.remove(id)
+              await store.restoreFromTrash(id)
+              const restored = await store.read(id)
+
+              expect(restored).toMatchObject({
+                id,
+                class: cls,
+                filePath: beforeTrash.filePath,
+                content: beforeTrash.content,
+              })
+              expect(restored.logicalState?.markdown).toBe(beforeTrash.logicalState?.markdown)
+            }
+          } finally {
+            const live = byTitle(await store.list({ scope: 'all' }), title)
+
+            if (live) {
+              await store.remove(idOf(live))
+            }
+          }
+        })
+      }
     })
 
     it('move relocates a note to a subdirectory, keeping the id', async () => {

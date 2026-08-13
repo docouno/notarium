@@ -122,6 +122,33 @@ export class IdentityRegistry {
     return this.byId.get(id)
   }
 
+  /** Install one row already committed by the causal metadata authority. This
+   * is not write-behind work: marking it dirty would race the authoritative
+   * terminal transaction with an older process-local image. */
+  adoptPersisted(record: IdentityRecord): void {
+    if (record.space !== this.space) {
+      throw new Error(`identity ${record.id} belongs to another space`)
+    }
+    const prior = this.byId.get(record.id)
+
+    if (prior && this.byPath.get(prior.filePath)?.id === prior.id) {
+      this.byPath.delete(prior.filePath)
+    }
+    const occupant = this.byPath.get(record.filePath)
+
+    if (occupant && occupant.id !== record.id) {
+      this.byId.delete(occupant.id)
+    }
+    const installed = { ...record }
+
+    this.byId.set(installed.id, installed)
+    if (installed.deletedAt == null) {
+      this.byPath.set(installed.filePath, installed)
+    }
+    this.dirty.delete(installed.id)
+    this.dropped.delete(installed.id)
+  }
+
   /** Read-only authoritative probe used only while the full per-space load is
    *  unavailable. It distinguishes a plain stable-id spelling from a human
    *  name without installing or dirtying any registry state. */

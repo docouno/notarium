@@ -80,7 +80,7 @@ export const parseRangeHeader = (
 
 export const authz = (
   action: Action,
-  resource: 'space' | 'note' | 'host',
+  resource: 'space' | 'space-replay' | 'note' | 'note-replay' | 'host',
 ): { authz: AuthzConfig } => ({
   authz: { action, resource },
 })

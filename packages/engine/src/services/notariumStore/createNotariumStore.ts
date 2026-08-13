@@ -8,11 +8,20 @@ import type { BackgroundGate, MountConfig } from '@notarium/core'
 import type { Chunker } from '../../libs/chunking'
 import type { Embedder } from '../../libs/embedding'
 import { createLocalFsFiles } from '../../libs/files'
+import {
+  SpaceResourceAuthority,
+  type SpaceResourceAuthorityRegistry,
+} from '../../libs/resourceAuthority'
 import { createNodeSqliteDriver, type SqlDriver } from '../../libs/sql'
 import { NotariumStore } from './notariumStore'
 import type { EngineMount, SearchTuning } from './types'
 
 export type CreateNotariumStoreOptions = {
+  /** Stable space identity used by the shared resource authority. */
+  spaceId?: string
+  /** Process-global authority registry. Production supplies one so lazy store
+   * eviction/reopen cannot create a second authority for the same roots. */
+  resourceAuthorityRegistry?: SpaceResourceAuthorityRegistry
   /** The space's typed mounts (#74/#78): each is a directory whose notes take
    *  one class. The FIRST is the notes-mount (user-doc) and the default write
    *  target. A mount's `prefix` is its space-relative namespace in the index
@@ -50,7 +59,46 @@ export type CreateNotariumStoreOptions = {
   integritySweepBatchSize?: number
 }
 
+const engineMountsOf = (configs: readonly MountConfig[]): EngineMount[] =>
+  configs.map((mount) => ({
+    class: mount.class,
+    prefix: mount.prefix ?? '',
+    files: createLocalFsFiles(mount.dir),
+  }))
+
+const authorityAdaptersOf = (
+  configs: readonly MountConfig[],
+  engineMounts: readonly EngineMount[],
+) =>
+  engineMounts.map((mount, index) => ({
+    id: `mount-${index}:${mount.class}`,
+    prefix: mount.prefix,
+    files: mount.files,
+    physicalRoot: configs[index].dir,
+  }))
+
+/** Register the physical authority without opening the derived SQLite index.
+ * Startup restore recovery needs disk truth for closing/archived spaces, while
+ * keeping the ordinary read model cold until a projection is actually needed. */
+export const ensureNotariumResourceAuthority = (input: {
+  spaceId: string
+  resourceAuthorityRegistry: SpaceResourceAuthorityRegistry
+  mounts: MountConfig[]
+}): SpaceResourceAuthority => {
+  if (!input.mounts.length) {
+    throw new Error('ensureNotariumResourceAuthority requires at least one mount')
+  }
+  const engineMounts = engineMountsOf(input.mounts)
+
+  return input.resourceAuthorityRegistry.getOrCreate(
+    input.spaceId,
+    authorityAdaptersOf(input.mounts, engineMounts),
+  )
+}
+
 export const createNotariumStore = ({
+  spaceId = 'default',
+  resourceAuthorityRegistry,
   mounts,
   notesDir,
   indexDb,
@@ -71,11 +119,11 @@ export const createNotariumStore = ({
   if (!configs.length) {
     throw new Error('createNotariumStore requires `mounts` or `notesDir`')
   }
-  const engineMounts: EngineMount[] = configs.map((m) => ({
-    class: m.class,
-    prefix: m.prefix ?? '',
-    files: createLocalFsFiles(m.dir),
-  }))
+  const engineMounts = engineMountsOf(configs)
+  const authorityAdapters = authorityAdaptersOf(configs, engineMounts)
+  const resourceAuthority = resourceAuthorityRegistry
+    ? resourceAuthorityRegistry.getOrCreate(spaceId, authorityAdapters)
+    : new SpaceResourceAuthority(spaceId, authorityAdapters)
   const dbPath = indexDb || ':memory:'
   // Pair the vec0 driver with the embedder, or degrade to FTS together: loading
   // the native vec0 extension can throw on a platform without the binary, and a
@@ -99,6 +147,7 @@ export const createNotariumStore = ({
 
   return new NotariumStore({
     mounts: engineMounts,
+    resourceAuthority,
     sql,
     relationType,
     embedder: resolvedEmbedder,

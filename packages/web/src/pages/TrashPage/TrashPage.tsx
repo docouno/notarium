@@ -1,7 +1,7 @@
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router'
-import type { Space, TrashItem } from '@notarium/contract'
+import type { Space, TrashAvailabilityFilter, TrashItem } from '@notarium/contract'
 import { NOTE_CLASS } from '@notarium/contract/enums'
 import { STORE_EVENT } from '@notarium/contract/events'
 import { useChrome } from '../../composers/ChromeProvider'
@@ -18,9 +18,10 @@ import { useToast } from '../../core/Toast'
 import { Breadcrumbs } from '../../layouts/Breadcrumbs'
 import { cx } from '../../libs/cx/cx'
 import { errorText } from '../../libs/errors'
+import { PARTIAL_RESTORE_CONFIRMATION, recoveryPresentation } from '../../libs/revisions/revisions'
 import { memoryNoteRoute, noteRoute, TRASH_URL_PARAMS } from '../../libs/routing/routePaths'
 import { api } from '../../services/api'
-import { PAGE, ROW_H } from './consts'
+import { BOTTOM_CONTENT_GAP, PAGE, RESTORE_REASONS, ROW_H, TOP_CONTENT_GAP } from './consts'
 import { restoreSummary } from './helpers/restoreSummary'
 import { useTrashChrome } from './hooks/useTrashChrome'
 import { TrashRow } from './TrashRow'
@@ -47,7 +48,7 @@ export const TrashPage = () => {
     reloadArchived,
   } = useSpace()
   const { subscribe } = useSync()
-  const { confirm } = useDialog()
+  const { confirm, alert } = useDialog()
   const { railOpen, toggleRail } = useChrome()
   const toast = useToast()
 
@@ -58,6 +59,9 @@ export const TrashPage = () => {
   const [searchParams, setSearchParams] = useSearchParams()
   const spacesEnabled = capabilities.spaceCreate
   const urlTab = searchParams.get(TRASH_URL_PARAMS.tab)
+  const urlAvailability = searchParams.get(TRASH_URL_PARAMS.availability)
+  const availability: 'all' | TrashAvailabilityFilter =
+    urlAvailability === 'restorable' || urlAvailability === 'unavailable' ? urlAvailability : 'all'
 
   const setTab = (next: 'all' | 'notes' | 'spaces') => {
     if (bulkBusy) {
@@ -68,12 +72,38 @@ export const TrashPage = () => {
     setSelected(new Set())
     setAllMatching(false)
     scrollRef.current?.scrollTo({ top: 0 })
-    setSearchParams(next === 'all' ? {} : { [TRASH_URL_PARAMS.tab]: next }, { replace: true })
+    const params = new URLSearchParams(searchParams)
+
+    if (next === 'all') {
+      params.delete(TRASH_URL_PARAMS.tab)
+    } else {
+      params.set(TRASH_URL_PARAMS.tab, next)
+    }
+    setSearchParams(params, { replace: true })
+  }
+
+  const setAvailability = (next: 'all' | TrashAvailabilityFilter) => {
+    if (bulkBusy || next === availability) {
+      return
+    }
+    setSelected(new Set())
+    setAllMatching(false)
+    scrollRef.current?.scrollTo({ top: 0 })
+    const params = new URLSearchParams(searchParams)
+
+    if (next === 'all') {
+      params.delete(TRASH_URL_PARAMS.availability)
+    } else {
+      params.set(TRASH_URL_PARAMS.availability, next)
+    }
+    setSearchParams(params, { replace: true })
   }
 
   const [items, setItems] = useState<TrashItem[]>([])
   const [total, setTotal] = useState(0)
   const [restorableTotal, setRestorableTotal] = useState(0)
+  const [partialTotal, setPartialTotal] = useState(0)
+  const [restoreAvailable, setRestoreAvailable] = useState(true)
   const [loaded, setLoaded] = useState(false)
   const [loadingMore, setLoadingMore] = useState(false)
   const [failed, setFailed] = useState(false)
@@ -118,7 +148,12 @@ export const TrashPage = () => {
     setSelected(new Set())
     setAllMatching(false)
     try {
-      const res = await api.trashGet(space, { offset: 0, limit: PAGE, q: q || undefined })
+      const res = await api.trashGet(space, {
+        offset: 0,
+        limit: PAGE,
+        q: q || undefined,
+        availability: availability === 'all' ? undefined : availability,
+      })
 
       if (my !== seq.current) {
         return
@@ -126,6 +161,8 @@ export const TrashPage = () => {
       setItems(res.items)
       setTotal(res.total)
       setRestorableTotal(res.restorableTotal)
+      setPartialTotal(res.partialTotal)
+      setRestoreAvailable(res.restoreAvailable)
       setLoaded(true)
       scrollRef.current?.scrollTo({ top: 0 })
     } catch {
@@ -135,10 +172,11 @@ export const TrashPage = () => {
       setItems([])
       setTotal(0)
       setRestorableTotal(0)
+      setPartialTotal(0)
       setLoaded(true)
       setFailed(true)
     }
-  }, [space, q])
+  }, [space, q, availability])
 
   // Reload on space / search change.
   useEffect(() => {
@@ -156,6 +194,7 @@ export const TrashPage = () => {
         offset: items.length,
         limit: PAGE,
         q: q || undefined,
+        availability: availability === 'all' ? undefined : availability,
       })
 
       if (my !== seq.current) {
@@ -164,6 +203,8 @@ export const TrashPage = () => {
       setItems((prev) => [...prev, ...res.items])
       setTotal(res.total)
       setRestorableTotal(res.restorableTotal)
+      setPartialTotal(res.partialTotal)
+      setRestoreAvailable(res.restoreAvailable)
       // A writable select-all-N selection should cover the freshly loaded rows too.
       if (effAllMatching) {
         setSelected((prev) => new Set([...prev, ...res.items.map((i) => i.noteId)]))
@@ -175,7 +216,7 @@ export const TrashPage = () => {
         setLoadingMore(false)
       }
     }
-  }, [space, q, items.length, total, loadingMore, loaded, effAllMatching])
+  }, [space, q, availability, items.length, total, loadingMore, loaded, effAllMatching])
 
   // Live freshness (#60): a delete/restore anywhere bumps the space's SSE stream; coalesce
   // a burst into one reload. But a reload clears the selection (reload() resets it), so in
@@ -218,6 +259,9 @@ export const TrashPage = () => {
     if (!showSpaces) {
       return []
     }
+    if (availability === 'unavailable') {
+      return []
+    }
     const needle = q.trim().toLowerCase()
 
     if (!needle) {
@@ -227,28 +271,12 @@ export const TrashPage = () => {
     return archivedSpaces.filter(
       (s) => s.displayName.toLowerCase().includes(needle) || s.slug.includes(needle),
     )
-  }, [showSpaces, archivedSpaces, q])
+  }, [showSpaces, archivedSpaces, q, availability])
 
-  // ONE virtualized list over both kinds: space rows first (few, fixed), then notes
-  // (windowed). An index < spaceRows.length is a space; the rest are notes.
+  // ONE list over both kinds: space rows first (few, fixed), then notes (windowed).
+  // The virtualizer itself is wired below, after the floating chrome has been measured.
   const spaceRows = filteredSpaces
   const noteRows = showNotes ? items : []
-  const virt = useVirtualizer({
-    count: spaceRows.length + noteRows.length,
-    getScrollElement: () => scrollRef.current,
-    estimateSize: () => ROW_H, // every deleted item is one fixed-height row
-    overscan: 10,
-  })
-  const vItems = virt.getVirtualItems()
-
-  // Infinite scroll: when the window reaches the tail (a note), pull the next page.
-  useEffect(() => {
-    const last = vItems[vItems.length - 1]
-
-    if (last && showNotes && last.index >= spaceRows.length + noteRows.length - 1) {
-      void loadMore()
-    }
-  }, [vItems, spaceRows.length, noteRows.length, showNotes, loadMore])
 
   // ── selection — notes AND deleted spaces share ONE model (identical mechanic to
   //    the notes manager: tick rows, then the bulk footer deletes them). One Set of
@@ -268,14 +296,19 @@ export const TrashPage = () => {
   const selSpaces = spaceRows.filter((s) => selected.has(s.id))
   const selectedNoteRows = noteRows.filter((i) => selected.has(i.noteId))
   const selectedRestorableNoteIds = selectedNoteRows
-    .filter((i) => i.restorable)
+    .filter((i) => i.restoreAvailability === 'full' || i.restoreAvailability === 'partial')
     .map((i) => i.noteId)
+  const selectedPartialNoteCount = selectedNoteRows.filter(
+    (item) => item.restoreAvailability === 'partial',
+  ).length
   const selNoteCount = effAllMatching
     ? total
     : selectableNoteIds.filter((id) => selected.has(id)).length
   const effectiveCount = selSpaces.length + selNoteCount
   const restorableCount =
     selSpaces.length + (effAllMatching ? restorableTotal : selectedRestorableNoteIds.length)
+  const partialCount = effAllMatching ? partialTotal : selectedPartialNoteCount
+  const unavailableCount = Math.max(0, effectiveCount - restorableCount)
 
   const toggleRow = (id: string, on: boolean) => {
     setAllMatching(false)
@@ -308,13 +341,23 @@ export const TrashPage = () => {
 
   // ── actions ──
   const restore = async (item: TrashItem) => {
+    if (item.restoreAvailability === 'partial') {
+      const ok = await confirm(PARTIAL_RESTORE_CONFIRMATION)
+
+      if (!ok) {
+        return
+      }
+    }
     setBusy(item.noteId)
     try {
-      await api.trashRestore(space, item.noteId)
+      await api.trashRestore(space, item.noteId, item.revisionId)
       setItems((prev) => prev.filter((i) => i.noteId !== item.noteId))
       setTotal((t) => Math.max(0, t - 1))
-      if (item.restorable) {
+      if (item.restoreAvailability === 'full' || item.restoreAvailability === 'partial') {
         setRestorableTotal((t) => Math.max(0, t - 1))
+      }
+      if (item.restoreAvailability === 'partial') {
+        setPartialTotal((t) => Math.max(0, t - 1))
       }
       setSelected((prev) => {
         const next = new Set(prev)
@@ -323,7 +366,7 @@ export const TrashPage = () => {
       })
       toast.success(`Restored “${item.title || 'Untitled'}”`)
     } catch (e) {
-      toast.error((e as Error).message)
+      toast.error(errorText(e, RESTORE_REASONS))
       void reload()
     } finally {
       setBusy(null)
@@ -333,6 +376,17 @@ export const TrashPage = () => {
   const restoreSelected = async () => {
     if (!effectiveCount || !restorableCount || bulkBusy) {
       return
+    }
+    if (partialCount > 0) {
+      const ok = await confirm({
+        title: `Restore ${restorableCount} available item${restorableCount === 1 ? '' : 's'}?`,
+        message: `${partialCount} selected ${partialCount === 1 ? 'item is an older partial copy. Its note body and known fields will be restored' : 'items are older partial copies. Their note bodies and known fields will be restored'}, but metadata that was never captured cannot be recovered.${unavailableCount > 0 ? ` ${unavailableCount} unavailable ${unavailableCount === 1 ? 'item' : 'items'} will remain in Trash.` : ''}`,
+        confirmLabel: `Restore ${restorableCount} available`,
+      })
+
+      if (!ok) {
+        return
+      }
     }
     const noteAttempted = showNotes
       ? effAllMatching
@@ -350,7 +404,7 @@ export const TrashPage = () => {
                 ? { all: true, q: q || undefined, onlyRestorable: true }
                 : { ids: selectedRestorableNoteIds },
             )
-          : { ok: true as const, restored: [], failed: [] }
+          : null
       const spaceResult =
         spaceIds.length > 0
           ? await api.restoreSpaces(spaceIds)
@@ -358,12 +412,23 @@ export const TrashPage = () => {
 
       const noteRemovedIds = new Set<string>()
 
-      for (const r of noteResult.restored) {
-        noteRemovedIds.add(r.id)
-      }
-      for (const f of noteResult.failed) {
-        if (f.reason === 'note_not_in_trash') {
-          noteRemovedIds.add(f.id)
+      const noteFailures: BatchFailure[] = []
+
+      for (const item of noteResult?.items ?? []) {
+        if (item.status === 'succeeded') {
+          noteRemovedIds.add(item.id)
+        } else if (item.status === 'conflict') {
+          if (item.reason === 'note_not_in_trash') {
+            noteRemovedIds.add(item.id)
+          } else {
+            noteFailures.push({ id: item.id, error: 'Restore conflict', reason: item.reason })
+          }
+        } else if (item.status === 'not-restorable') {
+          noteFailures.push({
+            id: item.id,
+            error: 'Revision is not restorable',
+            reason: item.reason,
+          })
         }
       }
       const noteRemovedCount = noteRemovedIds.size
@@ -381,30 +446,15 @@ export const TrashPage = () => {
         void reloadSpaces()
       }
 
-      setSelected((prev) => {
-        const next = new Set(prev)
+      const failures: BatchFailure[] = [...noteFailures, ...spaceResult.failed]
+      const restoredCount = (noteResult?.counts.succeeded ?? 0) + spaceResult.restored.length
+      const summary = restoreSummary(restorableCount, restoredCount, failures, unavailableCount)
 
-        for (const id of noteRemovedIds) {
-          next.delete(id)
-        }
-        for (const s of spaceResult.restored) {
-          next.delete(s.id)
-        }
-        for (const s of spaceResult.failed) {
-          if (s.reason === 'not_found') {
-            next.delete(s.id)
-          }
-        }
-
-        return next
-      })
-      if (effAllMatching) {
-        setAllMatching(Math.max(0, total - noteRemovedCount) > 0)
-      }
-
-      const failures: BatchFailure[] = [...noteResult.failed, ...spaceResult.failed]
-      const restoredCount = noteResult.restored.length + spaceResult.restored.length
-      const summary = restoreSummary(restorableCount, restoredCount, failures)
+      // A completed bulk gesture is over: successful rows disappear, while rows
+      // intentionally skipped as unavailable must not linger as a dead Restore 0
+      // selection. Runtime failures remain in Trash and are called out by summary.
+      clearSelection()
+      void reload()
 
       if (summary.tone === 'success') {
         toast.success(summary.text)
@@ -454,7 +504,11 @@ export const TrashPage = () => {
         await purgeSpace(s.id, s.slug)
       }
       if (effAllMatching) {
-        await api.trashPurge(space, { all: true, q: q || undefined })
+        await api.trashPurge(space, {
+          all: true,
+          q: q || undefined,
+          availability: availability === 'all' ? undefined : availability,
+        })
       } else if (noteIds.length) {
         await api.trashPurge(space, { ids: noteIds })
       }
@@ -513,6 +567,7 @@ export const TrashPage = () => {
   // irreversible purge starts only after the user selects rows / Select all N (#183).
   const showToolbar = allSelectable.length > 0
   const showFooter = selecting
+  const showAvailabilityFilter = availability !== 'all' || listCount > 0
 
   // The floating top chrome + footer measure themselves so the list pads exactly clear
   // of the frosted glass bands (#72/#185); the measured heights become the scroll padding.
@@ -521,6 +576,33 @@ export const TrashPage = () => {
     showTabs,
     showFooter,
   })
+  const topInset = topH + TOP_CONTENT_GAP
+  const bottomInset = footH + BOTTOM_CONTENT_GAP
+
+  // The scroll pane owns the physical chrome padding, while `scrollMargin` teaches
+  // the virtualizer where its first row actually begins inside that pane. Previously
+  // the two coordinate systems differed by the whole top chrome height; returning
+  // from a distant window could therefore evict the first recovery rows until reload.
+  const virt = useVirtualizer({
+    count: listCount,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: () => ROW_H,
+    overscan: 10,
+    scrollMargin: topInset,
+    scrollPaddingStart: topInset,
+    scrollPaddingEnd: bottomInset,
+  })
+  const vItems = virt.getVirtualItems()
+  const lastVirtualIndex = vItems[vItems.length - 1]?.index ?? -1
+
+  // Infinite scroll: when the window reaches the loaded tail, pull the next page.
+  // Depend on scalar indices, not the freshly allocated virtual-items array on every
+  // scroll frame; the effect now runs only when the visible range actually changes.
+  useEffect(() => {
+    if (lastVirtualIndex >= 0 && showNotes && lastVirtualIndex >= listCount - 1) {
+      void loadMore()
+    }
+  }, [lastVirtualIndex, listCount, showNotes, loadMore])
 
   return (
     <main className={cx('main', styles.page)}>
@@ -548,7 +630,7 @@ export const TrashPage = () => {
         {/* ONE control line: select-all on the left, the kind filter (tabs) on the
             right — no separate tab strip. Shows when there's anything to select OR to
             filter; each half renders on its own condition. */}
-        {(showToolbar || showTabs) && (
+        {(showToolbar || showTabs || showAvailabilityFilter) && (
           <div className={styles.toolbar}>
             <div className={styles.toolbarLeft}>
               {showToolbar && (
@@ -584,21 +666,51 @@ export const TrashPage = () => {
                 </>
               )}
             </div>
-            {showTabs && (
-              <div className={styles.tabs} role="tablist" aria-label="Trash sections">
-                {(['all', 'notes', 'spaces'] as const).map((t) => (
-                  <button
-                    key={t}
-                    className={cx(styles.tab, tab === t && styles.tabActive)}
-                    role="tab"
-                    aria-selected={tab === t}
-                    disabled={bulkBusy}
-                    onClick={() => setTab(t)}
-                    data-testid={`trash-tab-${t}`}
+            {(showAvailabilityFilter || showTabs) && (
+              <div className={styles.filters}>
+                {showAvailabilityFilter && (
+                  <div
+                    className={styles.tabs}
+                    role="tablist"
+                    aria-label="Recovery availability"
+                    data-testid="trash-availability-filter"
                   >
-                    {t === 'all' ? 'All' : t === 'notes' ? 'Notes' : 'Spaces'}
-                  </button>
-                ))}
+                    {(['all', 'restorable', 'unavailable'] as const).map((value) => (
+                      <button
+                        key={value}
+                        className={cx(styles.tab, availability === value && styles.tabActive)}
+                        role="tab"
+                        aria-selected={availability === value}
+                        disabled={bulkBusy}
+                        onClick={() => setAvailability(value)}
+                        data-testid={`trash-availability-${value}`}
+                      >
+                        {value === 'all'
+                          ? 'All items'
+                          : value === 'restorable'
+                            ? 'Can restore'
+                            : 'Can’t restore'}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {showTabs && (
+                  <div className={styles.tabs} role="tablist" aria-label="Trash sections">
+                    {(['all', 'notes', 'spaces'] as const).map((t) => (
+                      <button
+                        key={t}
+                        className={cx(styles.tab, tab === t && styles.tabActive)}
+                        role="tab"
+                        aria-selected={tab === t}
+                        disabled={bulkBusy}
+                        onClick={() => setTab(t)}
+                        data-testid={`trash-tab-${t}`}
+                      >
+                        {t === 'all' ? 'All' : t === 'notes' ? 'Notes' : 'Spaces'}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -613,12 +725,19 @@ export const TrashPage = () => {
         // chrome/footer heights (not the extra content padding) so the bar sits in the
         // gap, clear of both strips, while the list still scrolls under them.
         style={{
-          paddingTop: topH + 10,
-          paddingBottom: footH + 14,
+          paddingTop: topInset,
+          paddingBottom: bottomInset,
           ['--sb-inset-top' as string]: `${topH}px`,
-          ['--sb-inset-bottom' as string]: `${footH}px`,
+          ['--sb-inset-bottom' as string]: `${showFooter ? footH : 0}px`,
         }}
       >
+        {loaded && !failed && showNotes && !restoreAvailable && (
+          <div className={styles.capabilityBanner} data-testid="trash-restore-unavailable">
+            <strong>Note restore is unavailable on this server.</strong> Deleted copies remain
+            readable and can still be permanently deleted.
+            {spaceRows.length > 0 ? ' Deleted spaces can still be restored.' : ''}
+          </div>
+        )}
         {showSkeleton && (
           <div className={styles.states}>
             <SkeletonText lines={4} />
@@ -637,14 +756,26 @@ export const TrashPage = () => {
           <div className={styles.empty} data-testid="trash-empty-state">
             {tab === 'spaces' ? <IconArchive size={22} /> : <IconTrash size={22} />}
             <p className={styles.emptyTitle}>
-              {q ? 'Nothing matches' : tab === 'spaces' ? 'No deleted spaces' : 'Trash is empty'}
+              {q
+                ? 'Nothing matches'
+                : availability === 'restorable'
+                  ? 'No items can be restored'
+                  : availability === 'unavailable'
+                    ? 'No unavailable items'
+                    : tab === 'spaces'
+                      ? 'No deleted spaces'
+                      : 'Trash is empty'}
             </p>
             <p className={styles.muted}>
               {q
                 ? 'Nothing deleted matches your search.'
-                : tab === 'spaces'
-                  ? 'Deleting a space (from its Management → General) moves the whole space here — a safety net. It’s gone for good only when you permanently delete it.'
-                  : 'Deleted notes — and whole spaces — land here first: a safety net, including notes removed outside Notarium. Nothing is gone for good until you delete it permanently.'}
+                : availability === 'restorable'
+                  ? 'There are no deleted items with a recoverable copy in this view.'
+                  : availability === 'unavailable'
+                    ? 'Every deleted item in this view has a recoverable copy.'
+                    : tab === 'spaces'
+                      ? 'Deleting a space (from its Management → General) moves the whole space here — a safety net. It’s gone for good only when you permanently delete it.'
+                      : 'Deleted notes — and whole spaces — land here first: a safety net, including notes removed outside Notarium. Nothing is gone for good until you delete it permanently.'}
             </p>
           </div>
         )}
@@ -655,50 +786,61 @@ export const TrashPage = () => {
             style={{ height: virt.getTotalSize() }}
             data-testid="trash-list"
           >
-            <div style={{ transform: `translateY(${vItems[0]?.start ?? 0}px)` }}>
-              {vItems.map((v) => {
-                // ONE row for every deleted item — a space (index < spaceRows.length)
-                // or a note. Normalise to a TrashEntry, then render through TrashRow.
-                const isSpace = v.index < spaceRows.length
-                const s = isSpace ? spaceRows[v.index] : undefined
-                const n = isSpace ? undefined : noteRows[v.index - spaceRows.length]
+            {vItems.map((v) => {
+              // ONE row for every deleted item — a space (index < spaceRows.length)
+              // or a note. Normalise to a TrashEntry, then render through TrashRow.
+              const isSpace = v.index < spaceRows.length
+              const s = isSpace ? spaceRows[v.index] : undefined
+              const n = isSpace ? undefined : noteRows[v.index - spaceRows.length]
 
-                if (!isSpace && !n) {
-                  return null
-                }
-                const isLast = v.index === listCount - 1 && (!showNotes || items.length >= total)
-                const entry: TrashEntry = isSpace
-                  ? {
-                      kind: 'space',
-                      id: s!.id,
-                      title: s!.displayName,
-                      pathText: `/s/${s!.slug}`,
-                      who: s!.archivedBy ?? null,
-                      date: s!.archivedAt ?? null,
-                      restorable: true,
-                      restoreTitle: 'Restore',
-                    }
-                  : {
-                      kind: 'note',
-                      id: n!.noteId,
-                      title: n!.title || 'Untitled',
-                      href:
-                        n!.class === NOTE_CLASS.agentMemory
-                          ? (memoryNoteRoute(n!.noteId) ?? '#')
-                          : (noteRoute(n!.noteId) ?? '#'),
-                      pathText: n!.filePath,
-                      who: n!.deletedBy ?? null,
-                      date: n!.deletedAt,
-                      memory: n!.class === NOTE_CLASS.agentMemory,
-                      external: n!.external,
-                      restorable: n!.restorable,
-                      restoreTitle: n!.restorable
-                        ? 'Restore'
-                        : 'Deleted outside Notarium before its content was captured — nothing to restore',
-                    }
-                return (
+              if (!isSpace && !n) {
+                return null
+              }
+              const isLast = v.index === listCount - 1 && (!showNotes || items.length >= total)
+              const noteIsPartial =
+                n != null &&
+                n.restorable &&
+                (n.stateFormat == null || n.stateFormat === 'markdown-v1')
+              const entry: TrashEntry = isSpace
+                ? {
+                    kind: 'space',
+                    id: s!.id,
+                    title: s!.displayName,
+                    pathText: `/s/${s!.slug}`,
+                    who: s!.archivedBy ?? null,
+                    date: s!.archivedAt ?? null,
+                    restorable: true,
+                    recovery: recoveryPresentation('full'),
+                  }
+                : {
+                    kind: 'note',
+                    id: n!.noteId,
+                    title: n!.title || 'Untitled',
+                    href:
+                      n!.class === NOTE_CLASS.agentMemory
+                        ? (memoryNoteRoute(n!.noteId) ?? '#')
+                        : (noteRoute(n!.noteId) ?? '#'),
+                    pathText: n!.filePath,
+                    who: n!.deletedBy ?? null,
+                    date: n!.deletedAt,
+                    memory: n!.class === NOTE_CLASS.agentMemory,
+                    external: n!.external,
+                    restorable:
+                      n!.restoreAvailability === 'full' || n!.restoreAvailability === 'partial',
+                    recovery: recoveryPresentation(
+                      n!.restoreAvailability === 'capability-unavailable' && noteIsPartial
+                        ? 'partial'
+                        : n!.restoreAvailability,
+                    ),
+                  }
+              return (
+                <div
+                  key={`${entry.kind}-${entry.id}`}
+                  className={styles.virtualRow}
+                  data-index={v.index}
+                  style={{ transform: `translateY(${v.start - topInset}px)` }}
+                >
                   <TrashRow
-                    key={`${entry.kind}-${entry.id}`}
                     entry={entry}
                     isLast={isLast}
                     selectable={isSpace || canWrite}
@@ -709,53 +851,67 @@ export const TrashPage = () => {
                     disabled={bulkBusy}
                     onToggle={(on) => toggleRow(entry.id, on)}
                     onRestore={() => void (isSpace ? restoreSpaceRow(s!) : restore(n!))}
+                    onExplain={() =>
+                      void alert({
+                        title: entry.recovery.label,
+                        message: entry.recovery.reason,
+                      })
+                    }
                   />
-                )
-              })}
-            </div>
+                </div>
+              )
+            })}
           </div>
         )}
       </div>
 
-      {showFooter && (
-        <div
-          ref={footerRef}
-          className={cx(styles.footer, 'glass', 'glass-scroll', 'glass-edge-top')}
-          data-testid="trash-footer"
-        >
-          <span className={styles.footerInfo}>
-            {effectiveCount} selected
-            <button
-              className={styles.linkBtn}
-              onClick={clearSelection}
-              disabled={bulkBusy}
-              data-testid="trash-clear"
-            >
-              Clear
-            </button>
+      <div
+        ref={footerRef}
+        className={cx(
+          styles.footer,
+          !showFooter && styles.footerHidden,
+          'glass',
+          'glass-scroll',
+          'glass-edge-top',
+        )}
+        aria-hidden={!showFooter}
+        data-testid={showFooter ? 'trash-footer' : undefined}
+      >
+        <span className={styles.footerInfo}>
+          <span>{effectiveCount} selected</span>
+          <span className={styles.footerBreakdown} data-testid="trash-selection-breakdown">
+            {restorableCount} can restore · {unavailableCount} unavailable
           </span>
-          <div className={styles.footerActions}>
-            <Button
-              variant="warning"
-              className={styles.footerAction}
-              onClick={() => void restoreSelected()}
-              disabled={bulkBusy || restorableCount === 0}
-              data-testid="trash-restore-selected"
-            >
-              Restore {restorableCount}
-            </Button>
-            <Button
-              variant="danger"
-              className={styles.footerAction}
-              onClick={() => void deleteSelected()}
-              disabled={bulkBusy}
-              data-testid="trash-delete-selected"
-            >
-              Delete {effectiveCount} forever
-            </Button>
-          </div>
+          <button
+            className={styles.linkBtn}
+            onClick={clearSelection}
+            disabled={bulkBusy}
+            data-testid="trash-clear"
+          >
+            Clear
+          </button>
+        </span>
+        <div className={styles.footerActions}>
+          <Button
+            variant="warning"
+            className={styles.footerAction}
+            onClick={() => void restoreSelected()}
+            disabled={bulkBusy || restorableCount === 0}
+            data-testid="trash-restore-selected"
+          >
+            Restore {restorableCount} available
+          </Button>
+          <Button
+            variant="danger"
+            className={styles.footerAction}
+            onClick={() => void deleteSelected()}
+            disabled={bulkBusy}
+            data-testid="trash-delete-selected"
+          >
+            Delete {effectiveCount} forever
+          </Button>
         </div>
-      )}
+      </div>
     </main>
   )
 }

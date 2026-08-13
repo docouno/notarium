@@ -20,6 +20,154 @@ export type FileStat = {
   birthtimeMs: number | null
 }
 
+/** Adapter-opaque proof that one pathname was sampled in a particular state.
+ * Claims are meaningful only for the resource and adapter that returned them;
+ * callers compare the whole object and never parse `value`. Present and absent
+ * claims intentionally occupy different domains. */
+export type FileClaim = {
+  kind: 'present' | 'absent'
+  value: string
+}
+
+/** One stable physical sample. Bytes, claim and mtime are captured together —
+ * assembling them from separate read/stat calls would let a racing replacement
+ * produce a state that never existed on the medium. Non-regular entries are not
+ * absence: a symlink/directory still owns the pathname and must fail closed. */
+export type FileObservation =
+  | {
+      kind: 'present'
+      bytes: Uint8Array
+      claim: FileClaim & { kind: 'present' }
+      mtimeMs: number | null
+    }
+  | {
+      kind: 'absent'
+      claim: FileClaim & { kind: 'absent' }
+      mtimeMs: null
+    }
+  | {
+      kind: 'occupied'
+      claim: FileClaim & { kind: 'present' }
+      entryType: 'directory' | 'other' | 'symlink'
+      mtimeMs: number | null
+    }
+  | {
+      kind: 'unavailable'
+      reason: 'not-regular' | 'too-large' | 'unstable'
+      mtimeMs: null
+    }
+
+export type FilePublicationRequest =
+  | {
+      kind: 'put'
+      path: string
+      content: Uint8Array
+      expected: FileClaim
+    }
+  | {
+      kind: 'move-put'
+      sourcePath: string
+      targetPath: string
+      content: Uint8Array
+      expectedSource: FileClaim & { kind: 'present' }
+      expectedTarget: FileClaim & { kind: 'absent' }
+    }
+
+export type FilePackagePublicationRequest = {
+  rootPath: string
+  files: ReadonlyArray<{ path: string; content: Uint8Array }>
+  expectedRoot: FileClaim & { kind: 'absent' }
+}
+
+export type FileProofTransition = {
+  path: string
+  before: FileClaim
+  after: FileClaim
+  mtimeMs: number | null
+}
+
+export type FilePublicationResult =
+  | { status: 'conflict' }
+  | {
+      status: 'published'
+      candidateHash: string
+      transitions: FileProofTransition[]
+    }
+
+export type FileStrictStageRequest = {
+  /** Stable operation id chosen by the causal metadata layer. */
+  operationId: string
+  /** Privacy-safe actor/request binding. LocalFS treats it as opaque. */
+  binding: string
+  path: string
+  content: Uint8Array
+  expected: FileClaim
+}
+
+export type FileStrictStageHeader = {
+  operationId: string
+  binding: string
+  path: string
+  expected: FileClaim
+  candidateHash: string
+}
+
+export type FileStrictMutationReceipt = {
+  operationId: string
+  binding: string
+  observationId: string
+  semanticEventTime: string
+  restartDurable: true
+  candidateHash: string
+  transitions: FileProofTransition[]
+}
+
+export type FileStrictStageState =
+  | { status: 'missing' }
+  | {
+      status: 'staged' | 'publishing'
+      stage: FileStrictStageHeader
+    }
+  | {
+      status: 'published'
+      stage: FileStrictStageHeader
+      receipt: FileStrictMutationReceipt
+    }
+  | {
+      status: 'failed-recoverable'
+      stage: FileStrictStageHeader
+      reason: string
+      recoveryPaths: string[]
+    }
+
+export type FileStrictStageResult =
+  | {
+      status: 'accepted'
+      created: boolean
+      state: Exclude<FileStrictStageState, { status: 'missing' }>
+    }
+  | { status: 'idempotency-conflict' }
+
+export type FileStrictPublicationResult =
+  | { status: 'conflict'; stage: FileStrictStageHeader }
+  | { status: 'published'; receipt: FileStrictMutationReceipt }
+  | {
+      status: 'failed-recoverable'
+      stage: FileStrictStageHeader
+      reason: string
+      recoveryPaths: string[]
+    }
+
+export type FileStrictPublication = {
+  /** False is a valid capability answer for process-only adapters. */
+  readonly restartDurable: boolean
+  stage(request: FileStrictStageRequest): Promise<FileStrictStageResult>
+  inspect(operationId: string, binding: string): Promise<FileStrictStageState>
+  publish(operationId: string, binding: string): Promise<FileStrictPublicationResult>
+  /** Drop only a matching terminal/staged artifact after the metadata barrier. */
+  discard(operationId: string, binding: string): Promise<boolean>
+}
+
 export type FileStore = {
   /** Every note file under the root, recursively. The full-inventory truth
    *  source (P3) — cheap by design: stats only. The engine independently
@@ -40,6 +188,23 @@ export type FileStore = {
   /** null = the file is gone (a stat/read race with an external delete is a
    *  normal answer, not an error). */
   read(path: string): Promise<string | null>
+  /** Exact physical bytes from the same observation as read(). Optional only for legacy/remote
+   * adapters; callers that need opaque-source fidelity degrade explicitly when it is absent. */
+  readBytes?(path: string): Promise<Uint8Array | null>
+  /** Exact physical observation for provenance-sensitive operations. Unlike
+   * `readBytes`, this distinguishes absence from an occupied non-regular path
+   * and binds bytes/change claim/mtime to one stable adapter sample. */
+  observe?(path: string, options?: { maxBytes?: number }): Promise<FileObservation>
+  /** Atomically publish against adapter claims and return proof transitions
+   * derived inside that mutation operation. A conflict never mutates storage. */
+  publish?(request: FilePublicationRequest): Promise<FilePublicationResult>
+  /** Atomically install one absent package directory and return one aggregate
+   * proof set for its root and every submitted resource. */
+  publishPackageIfAbsent?(request: FilePackagePublicationRequest): Promise<FilePublicationResult>
+  /** Strict publication is a separate durable protocol from ordinary writes:
+   * the causal metadata layer stages first, prepares its row, then asks this
+   * capability to publish/resume and finally discards the recovery artifact. */
+  strictPublication?: FileStrictPublication
   /** Atomic visibility: an operation-owned temp file + rename (P3 — readers and
    *  a process crash mid-write must never leave a half-written note). This does
    *  not promise fsync-level durability across sudden power loss. Creates parent
@@ -82,6 +247,15 @@ export type FileStore = {
    *  `false` means the pathname was replaced or edited and remains intact;
    *  an already-absent source counts as successfully removed. */
   removeIfUnchanged?(path: string, expectedContent: string): Promise<boolean>
+  /** Remove only the exact adapter claim produced by an earlier publication.
+   *  The adapter must bind claim verification and pathname detachment into one
+   *  conditional operation; checking the claim in a caller and deleting later
+   *  would let a same-byte replacement win between those two steps. */
+  removeIfClaimed?(
+    path: string,
+    expectedContent: string,
+    expectedClaim: FileClaim & { kind: 'present' },
+  ): Promise<boolean>
   /** Create the durable on-disk anchor for a "New folder" (#97). Missing parents
    *  are created, then the leaf is claimed atomically. `false` means a file or
    *  directory already owns that exact medium pathname. */

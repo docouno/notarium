@@ -21,10 +21,15 @@ import { IF_EXISTS, REVISION_KIND, STORE_ERROR_REASON } from '../../../knowledge
 import { nextAliasesMulti, normAliases } from '../../../libs/aliases'
 import { freshNoteId, isDurableScalar, isDurableText, isValidNoteId } from '../../../libs/id'
 import {
+  analyzeDocumentState,
+  type DocumentState,
+  documentStateVersionToken,
   encodeWikilinkIdentity,
   frontmatterEntryOf,
   frontmatterEntryValue,
   isDurableFrontmatter,
+  type LogicalNoteState,
+  logicalNoteStateFromProjection,
   promoteBodyTitle,
   stripFrontmatter,
   stripTitleHeading,
@@ -34,6 +39,7 @@ import {
   basenameOf,
   directoryOf,
   FOLDER_PAGE_BASENAME,
+  isCanonicalInternalRelativeAddress,
   isCanonicalSafeRelativeAddress,
   isFolderPageNote,
   isLegacyImportDestination,
@@ -68,6 +74,29 @@ const UNIQUIFY_LIMIT = 50
 
 const isCollision = (err: unknown): boolean =>
   (err as { reason?: string }).reason === STORE_ERROR_REASON.noteAlreadyExists
+
+const exactLogicalState = (
+  note: Pick<NoteContent, 'title' | 'content' | 'frontmatter' | 'logicalState'>,
+) =>
+  note.logicalState ??
+  logicalNoteStateFromProjection({
+    title: note.title,
+    body: note.content,
+    frontmatter: note.frontmatter,
+  })
+
+const exactDocumentState = (
+  note: Pick<NoteContent, 'title' | 'content' | 'frontmatter' | 'logicalState' | 'documentState'>,
+): DocumentState =>
+  note.documentState ??
+  analyzeDocumentState({
+    source: new TextEncoder().encode(exactLogicalState(note).markdown),
+    pathFallbackTitle: note.title ?? null,
+  })
+
+const exactVersionToken = (
+  note: Pick<NoteContent, 'title' | 'content' | 'frontmatter' | 'logicalState' | 'documentState'>,
+): string => documentStateVersionToken(exactDocumentState(note))
 
 const folderFailed = (detail: string): StoreError => {
   const err = new StoreError(`# Folder Failed: ${detail}`)
@@ -111,6 +140,14 @@ const assertWriteText = (input: WriteInput): void => {
   }
   if (input.frontmatter != null && !isDurableFrontmatter(input.frontmatter)) {
     throw invalidWrite('frontmatter contains invalid raw lines')
+  }
+  if (
+    input.restorePath != null &&
+    (!isDurableText(input.restorePath) ||
+      !isCanonicalInternalRelativeAddress(input.restorePath) ||
+      !input.restorePath.endsWith('.md'))
+  ) {
+    throw invalidWrite('restore path must be a canonical Markdown file path')
   }
   for (const [name, value] of [
     ['id', input.id],
@@ -455,6 +492,11 @@ export class WriteEngine {
       // racing writers are already fenced by the engine's own CAS.
       const baseline = input.originalId ? await this.baselineOf(input.originalId) : undefined
       const releaseGraphTransition = this.host.beginGraphTransition()
+      const requiredTrashRestore =
+        input.journal?.kind === REVISION_KIND.restore && !input.originalId
+      let restoreResult: WriteResult | undefined
+      let restoreVersionToken: string | undefined
+      let trashRestoreJournalCommitted = false
 
       try {
         const result = await this.host.inner.write({
@@ -462,20 +504,84 @@ export class WriteEngine {
           originalId: input.originalId ? this.innerNoteKey(input.originalId) : input.originalId,
           identityOnly: Boolean(input.originalId),
         })
-
-        if (result.id) {
+        restoreResult = result
+        restoreVersionToken = result.versionToken
+        const publishWrite = async () => {
+          if (!result.id) {
+            this.host.reconcileSoon()
+            return
+          }
           let directoryChanged = false
+
           this.host.afterNotesReady(() => {
             directoryChanged = this.applyWrite(input, result, result.id!)
           })
           if (directoryChanged) {
             await this.host.rederiveGraphContext()
           }
-        } else {
+        }
+
+        if (!requiredTrashRestore) {
+          await publishWrite()
+        }
+        const after = await this.readAfterWrite(input, result)
+
+        if (requiredTrashRestore && !after) {
+          throw new Error('post-write exact read failed')
+        }
+        restoreVersionToken = after ? exactVersionToken(after) : undefined
+        await this.journalWrite(input, result.id ?? input.originalId, baseline, after, result.class)
+        trashRestoreJournalCommitted = requiredTrashRestore
+        if (!after) {
+          throw new Error('post-write exact read failed')
+        }
+        if (requiredTrashRestore) {
+          await publishWrite()
+        }
+
+        return { ...result, title: input.title }
+      } catch (err) {
+        let failure: unknown = err
+
+        if (
+          requiredTrashRestore &&
+          !trashRestoreJournalCommitted &&
+          restoreResult?.id &&
+          restoreVersionToken
+        ) {
+          const outcome = await this.requiredRestoreOutcome(
+            restoreResult.id,
+            input.journal!.sourceRevisionId,
+          )
+
+          if (outcome === 'committed') {
+            trashRestoreJournalCommitted = true
+          } else if (outcome === 'unknown') {
+            this.host.reconcileSoon()
+            failure = new AggregateError(
+              [err],
+              'trash restore journal outcome is unknown; physical state was preserved',
+            )
+          } else {
+            try {
+              await this.rollbackUnjournaledTrashRestore(
+                restoreResult.id,
+                restoreResult,
+                restoreVersionToken,
+              )
+            } catch (rollbackErr) {
+              this.host.reconcileSoon()
+              failure = new AggregateError(
+                [err, rollbackErr],
+                'trash restore journal failed and the live restore could not be rolled back',
+              )
+            }
+          }
+        }
+        if (trashRestoreJournalCommitted) {
           this.host.reconcileSoon()
         }
-        this.journalWrite(input, result.id ?? input.originalId, baseline, undefined, result.class)
-        return { ...result, title: input.title }
+        throw failure
       } finally {
         releaseGraphTransition()
       }
@@ -517,7 +623,7 @@ export class WriteEngine {
       if (live.filePath !== storageKey) {
         throw noteNotFound(input.originalId)
       }
-      const liveToken = computeVersionToken(live.content)
+      const liveToken = exactVersionToken(live)
 
       if (liveToken !== input.versionToken) {
         throw versionConflict({
@@ -533,6 +639,10 @@ export class WriteEngine {
       ? this.host.beginIdentityPublication()
       : undefined
     let identityPublicationPending = false
+    const requiredTrashRestore = input.journal?.kind === REVISION_KIND.restore && !input.originalId
+    let restoreResult: WriteResult | undefined
+    let restoreVersionToken: string | undefined
+    let trashRestoreJournalCommitted = false
 
     try {
       const result = await this.host.inner.write({
@@ -541,42 +651,52 @@ export class WriteEngine {
         identityOnly: Boolean(input.originalId && supportsExactIdentityAddress(this.host.inner)),
         id,
       })
+      restoreResult = result
+      restoreVersionToken = result.versionToken
       const publishAfterIdentityFlush = !input.originalId && !this.host.isBulkActive()
       const removed: string[] = []
-      let directoryChanged = false
-      this.host.afterNotesReady(() => {
-        directoryChanged = this.applyWrite(
-          input,
-          result,
-          id,
-          originalPath,
-          !publishAfterIdentityFlush,
-          removed,
-        )
-      })
-      if (!input.originalId) {
-        // The lease was closed before inner.write. Register its durable cut
-        // immediately after the synchronous registry/snapshot patch, before
-        // any later await can let a reader or retry timer observe the new axis.
-        this.host.markIdentityPublicationPending()
-        identityPublicationPending = true
-        if (this.host.isBulkActive()) {
-          // Bulk durability is coalesced. Releasing the producer lease lets an
-          // interactive read force the pending revision durable mid-import;
-          // it never lets the revision itself disappear.
-          releaseIdentityPublication?.()
+
+      const publishWrite = async () => {
+        let directoryChanged = false
+
+        this.host.afterNotesReady(() => {
+          directoryChanged = this.applyWrite(
+            input,
+            result,
+            id,
+            originalPath,
+            !publishAfterIdentityFlush,
+            removed,
+          )
+        })
+        if (!input.originalId) {
+          // The lease was closed before inner.write. Register its durable cut
+          // immediately after the synchronous registry/snapshot patch, before
+          // any later await can let a reader or retry timer observe the new axis.
+          this.host.markIdentityPublicationPending()
+          identityPublicationPending = true
+          if (this.host.isBulkActive()) {
+            // Bulk durability is coalesced. Releasing the producer lease lets an
+            // interactive read force the pending revision durable mid-import;
+            // it never lets the revision itself disappear.
+            releaseIdentityPublication?.()
+          }
+        }
+        // Deferring the external CHANGED frame must not defer the decorator's
+        // own exact-id map. Graph-context re-derivation below addresses the just
+        // created note by id; without this local sync a path-keyed engine falls
+        // through to its expensive whole-graph fallback before durability lands.
+        if (publishAfterIdentityFlush) {
+          this.host.markInnerLinkIdentitiesDirty()
+          this.host.syncInnerLinkIdentities()
+        }
+        if (directoryChanged) {
+          await this.host.rederiveGraphContext()
         }
       }
-      // Deferring the external CHANGED frame must not defer the decorator's
-      // own exact-id map. Graph-context re-derivation below addresses the just
-      // created note by id; without this local sync a path-keyed engine falls
-      // through to its expensive whole-graph fallback before durability lands.
-      if (publishAfterIdentityFlush) {
-        this.host.markInnerLinkIdentitiesDirty()
-        this.host.syncInnerLinkIdentities()
-      }
-      if (directoryChanged) {
-        await this.host.rederiveGraphContext()
+
+      if (!requiredTrashRestore) {
+        await publishWrite()
       }
       // The post-write read serves double duty: the fresh token the save
       // answers with (the engine merges frontmatter — input bytes are not
@@ -586,13 +706,27 @@ export class WriteEngine {
         live && !(await this.hasHistory(id))
           ? {
               content: live.content,
+              logicalState: exactLogicalState(live),
+              documentState: exactDocumentState(live),
               title: live.title ?? input.title,
               tags: normTags(live.frontmatter?.tags) ?? [],
               // The note's pre-edit custom slug, so the baseline is slug-faithful too.
               slug: live.slug ?? null,
             }
           : undefined
-      this.journalWrite(input, id, baseline, after?.content, result.class)
+
+      if (requiredTrashRestore && !after) {
+        throw new Error('post-write exact read failed')
+      }
+      restoreVersionToken = after ? exactVersionToken(after) : undefined
+      await this.journalWrite(input, id, baseline, after, result.class)
+      trashRestoreJournalCommitted = requiredTrashRestore
+      if (!after) {
+        throw new Error('post-write exact read failed')
+      }
+      if (requiredTrashRestore) {
+        await publishWrite()
+      }
       // Flush a fresh id before answering: a create's id may be resolved in the very next request,
       // but global id→space resolution reads the meta-DB, not this write-behind registry, so a read
       // that beat the flush would 404 a note that exists. Updates skip it (already durable). Bulk
@@ -609,13 +743,46 @@ export class WriteEngine {
         ...result,
         id,
         title: input.title,
-        versionToken: computeVersionToken(after?.content ?? this.normalizedInput(input)),
+        versionToken: exactVersionToken(after),
       }
     } catch (err) {
+      let failure: unknown = err
+
+      if (
+        requiredTrashRestore &&
+        !trashRestoreJournalCommitted &&
+        restoreResult &&
+        restoreVersionToken
+      ) {
+        const outcome = await this.requiredRestoreOutcome(id, input.journal!.sourceRevisionId)
+
+        if (outcome === 'committed') {
+          trashRestoreJournalCommitted = true
+        } else if (outcome === 'unknown') {
+          this.host.reconcileSoon()
+          failure = new AggregateError(
+            [err],
+            'trash restore journal outcome is unknown; physical state was preserved',
+          )
+        } else {
+          try {
+            await this.rollbackUnjournaledTrashRestore(id, restoreResult, restoreVersionToken)
+          } catch (rollbackErr) {
+            this.host.reconcileSoon()
+            failure = new AggregateError(
+              [err, rollbackErr],
+              'trash restore journal failed and the live restore could not be rolled back',
+            )
+          }
+        }
+      }
+      if (trashRestoreJournalCommitted) {
+        this.host.reconcileSoon()
+      }
       if (identityPublicationPending && identityBefore) {
         this.host.rememberIdentityRepair(identityBefore)
       }
-      throw err
+      throw failure
     } finally {
       releaseIdentityPublication?.()
       releaseGraphTransition()
@@ -642,6 +809,9 @@ export class WriteEngine {
   /** Mirror the engines' destination selection closely enough to fence the
    *  source/destination namespace before either engine performs its own checks. */
   private predictedPath(input: WriteInput, currentPath?: string): string {
+    if (input.restorePath) {
+      return input.restorePath
+    }
     const dir = (
       input.directory === undefined && currentPath
         ? directoryOf(currentPath)
@@ -657,9 +827,10 @@ export class WriteEngine {
 
     if (
       currentPath &&
-      currentMeta?.title === input.title &&
-      input.fileName == null &&
-      dir === directoryOf(currentPath)
+      (input.preservePath ||
+        (currentMeta?.title === input.title &&
+          input.fileName == null &&
+          dir === directoryOf(currentPath)))
     ) {
       return currentPath
     }
@@ -673,8 +844,9 @@ export class WriteEngine {
     )
   }
 
-  /** The note as the engine actually stored it — null when the read-back
-   *  fails (callers fall back to the normalised input). */
+  /** The note as the engine actually stored it — null when the read-back fails.
+   * Callers record an honest gap and fail the response: title/body input is not
+   * authoritative after an engine has merged or normalised frontmatter. */
   private async readAfterWrite(
     input: WriteInput,
     result: WriteResult,
@@ -724,9 +896,17 @@ export class WriteEngine {
   /** Pre-write state for the journal baseline, identity-capable-engine path
    *  (the bare-engine path reuses its CAS verify-read instead). Only the very
    *  first journaled edit of a note pays this read. */
-  private async baselineOf(
-    noteId: string,
-  ): Promise<{ content: string; title: string; tags: string[]; slug: string | null } | undefined> {
+  private async baselineOf(noteId: string): Promise<
+    | {
+        content: string
+        logicalState: LogicalNoteState
+        documentState: DocumentState
+        title: string
+        tags: string[]
+        slug: string | null
+      }
+    | undefined
+  > {
     try {
       if (await this.host.journal.hasHistory(noteId)) {
         return undefined
@@ -736,6 +916,8 @@ export class WriteEngine {
       })
       return {
         content: live.content,
+        logicalState: exactLogicalState(live),
+        documentState: exactDocumentState(live),
         title: live.title ?? '',
         tags: normTags(live.frontmatter?.tags) ?? [],
         // The custom slug the note already carried, so a restore of the baseline
@@ -747,21 +929,29 @@ export class WriteEngine {
     }
   }
 
-  /** Queue the write's journal revision (fire-and-forget — the journal never
-   *  fails a save). */
+  /** Queue the write's journal revision. Ordinary saves stay fire-and-forget;
+   * trash restore awaits the row because the permanent-purge decision is made
+   * against that exact journal state. */
   private journalWrite(
     input: WriteInput,
     noteId: string | undefined,
-    baseline?: { content: string; title: string; tags?: string[]; slug?: string | null },
-    afterContent?: string,
+    baseline?: {
+      content: string
+      logicalState: LogicalNoteState
+      documentState: DocumentState
+      title: string
+      tags?: string[]
+      slug?: string | null
+    },
+    after?: NoteContent | null,
     /** The written note's class, from the engine's WriteResult (mount-
      *  derived, authoritative). Recorded so the cursor-based delta can class-scope
      *  . Falls back to the create intent / the snapshot; the journal
      *  carries it forward on later body-less revisions. */
     cls?: string | null,
-  ): void {
+  ): Promise<void> {
     if (!noteId) {
-      return
+      return Promise.resolve()
     }
     // The custom slug this write records — the same storedSlug the snapshot
     // mirror (applyWrite) uses (input already softened by uniqueSlug at write()): an
@@ -769,19 +959,85 @@ export class WriteEngine {
     // forward; a clear/collapse-to-default ('') records null. (applyWrite carries the
     // snapshot's prior slug instead — same sequence, different store.)
     const slugCh = storedSlug(input.slug, input.title)
-    void this.host.journal.record({
+    const content = after?.content ?? null
+    const logicalState = after ? exactLogicalState(after) : null
+    const documentState = after ? exactDocumentState(after) : null
+
+    const record = {
       noteId,
       kind: input.journal?.kind ?? REVISION_KIND.write,
       principal: input.principal ?? null,
       agent: input.agent,
-      content: afterContent ?? this.normalizedInput(input),
-      title: input.title,
+      content,
+      logicalState,
+      documentState,
+      title: after?.title ?? input.title,
       class: cls ?? input.targetClass ?? this.host.snap.notes.get(noteId)?.class ?? null,
-      slug: slugCh === undefined ? undefined : slugCh || null,
-      tags: normTags(input.tags) ?? [],
+      slug: after ? (after.slug ?? null) : slugCh === undefined ? undefined : slugCh || null,
+      tags: after ? (normTags(after.frontmatter?.tags) ?? []) : undefined,
       sourceRevisionId: input.journal?.sourceRevisionId,
       baseline,
+    }
+
+    if (input.journal?.kind === REVISION_KIND.restore && !input.originalId) {
+      return this.host.journal.recordRequired(record).then(() => undefined)
+    }
+    void this.host.journal.record(record)
+    return Promise.resolve()
+  }
+
+  /** A trash restore writes a new file before its journal row can acquire the
+   * cross-replica persistence lock, while its read-model patch remains hidden.
+   * If permanent purge wins that lock, the required append fails and this
+   * conditionally compensates the physical write. */
+  private async rollbackUnjournaledTrashRestore(
+    id: string,
+    result: WriteResult,
+    versionToken: string,
+  ): Promise<void> {
+    const path = result.filePath ?? this.pathFor(id)
+    // The read-model deliberately has not published this restore yet, so its
+    // id→path hints still describe a tombstone. Address the engine by the exact
+    // path returned from the physical write; the identity envelope would sync
+    // those old hints and make a path-keyed engine miss the just-created row.
+    await this.host.inner.remove(path ?? this.innerNoteKey(id), {
+      identityOnly: path ? false : supportsExactIdentityAddress(this.host.inner),
+      versionToken,
+      physicalWriteClaim: result.physicalWriteClaim,
     })
+    if (path) {
+      if (!this.host.identity.recordFor(id)) {
+        this.host.identity.bindOwnedId(path, id)
+      }
+      this.host.identity.markDeleted(path)
+    }
+  }
+
+  /** A required append may commit and then lose its acknowledgement. The unique
+   * tombstone source id correlates the committed restore without trusting the
+   * rejected promise. Unknown journal availability preserves physical bytes. */
+  private async requiredRestoreOutcome(
+    noteId: string,
+    sourceRevisionId: string,
+  ): Promise<'committed' | 'not-committed' | 'unknown'> {
+    try {
+      // Cross-process writers are not serialized by this instance's queue. Do not
+      // cap the lookup to a recent page: the correlated restore may already have
+      // moved behind arbitrary externally appended revisions when the ACK is lost.
+      const { items } = await this.host.journal.list(noteId, {
+        offset: 0,
+        limit: 2_147_483_647,
+      })
+
+      return items.some(
+        (revision) =>
+          revision.kind === REVISION_KIND.restore && revision.sourceRevisionId === sourceRevisionId,
+      )
+        ? 'committed'
+        : 'not-committed'
+    } catch {
+      return 'unknown'
+    }
   }
 
   async move(input: MoveInput, opts?: MutationOptions): Promise<void> {
@@ -1036,6 +1292,8 @@ export class WriteEngine {
     // tombstone. A read failure (already gone, unreadable) degrades honestly — the
     // tombstone then keeps whatever hash the journal already had (maybe none).
     let lastContent: string | null = null
+    let lastLogicalState: LogicalNoteState | null = null
+    let lastDocumentState: DocumentState | null = null
     let lastTags: string[] | undefined
     let lastClass: NoteClass | undefined
     let lastTitle: string | undefined
@@ -1048,6 +1306,8 @@ export class WriteEngine {
         identityOnly: supportsExactIdentityAddress(this.host.inner),
       })
       lastContent = live.content
+      lastLogicalState = exactLogicalState(live)
+      lastDocumentState = exactDocumentState(live)
       lastTags = normTags(live.frontmatter?.tags) ?? undefined
       // Carry the class/title from the live read too: when the note isn't in the
       // snapshot (a delete during cold boot), meta is absent, and a null tombstone
@@ -1100,6 +1360,8 @@ export class WriteEngine {
         principal: opts?.principal ?? null,
         agent: opts?.agent,
         content: lastContent,
+        logicalState: lastLogicalState,
+        documentState: lastDocumentState,
         title: meta?.title ?? lastTitle ?? '',
         class: meta?.class ?? lastClass,
         // Prefer the live snapshot's slug, fall back to the read; undefined (a
@@ -1107,6 +1369,10 @@ export class WriteEngine {
         slug: meta?.slug ?? lastSlug,
         tags: lastTags,
       })
+      // Single-note restore resolves tombstones from the durable causal
+      // authority, not this process's warm registry. Publish the tombstone before
+      // delete returns so an immediate restore cannot observe the old live row.
+      await this.host.flushIdentityPublication()
       let snapshotRemoved = false
 
       this.host.afterNotesReady(() => {
@@ -1239,17 +1505,25 @@ export class WriteEngine {
     const incomingSlug = input.frontmatter
       ? frontmatterEntryOf(input.frontmatter, 'slug')
       : undefined
+    const incomingTags = input.frontmatter
+      ? frontmatterEntryOf(input.frontmatter, 'tags')
+      : undefined
     const incomingSlugValue = incomingSlug && frontmatterEntryValue(incomingSlug)
+    const replacing = input.frontmatterMode === 'replace'
     const carriedAliases =
       incomingAliases !== undefined
         ? (normAliases(frontmatterEntryValue(incomingAliases)) ?? [])
-        : prev?.aliases
+        : replacing
+          ? []
+          : prev?.aliases
     const carriedSlug =
       incomingSlug !== undefined
         ? typeof incomingSlugValue === 'string'
           ? slugify(incomingSlugValue) || undefined
           : undefined
-        : prev?.slug
+        : replacing
+          ? undefined
+          : prev?.slug
     // The typed slug channel is serialized last: undefined leaves the merged raw
     // value, while a value sets it and '' clears it.
     const slugCh = storedSlug(input.slug, input.title)
@@ -1267,7 +1541,11 @@ export class WriteEngine {
     const renameSlug = slugCh === undefined ? prev?.slug : slug
     const newEffSlug = effectiveSlug(renameSlug, input.title)
     const renamed = Boolean(
-      input.originalId && prev && (prev.title !== input.title || prevEffSlug !== newEffSlug),
+      !replacing &&
+      !input.preserveAliases &&
+      input.originalId &&
+      prev &&
+      (prev.title !== input.title || prevEffSlug !== newEffSlug),
     )
     const aliases =
       renamed && prev
@@ -1276,7 +1554,13 @@ export class WriteEngine {
     // Tags on the optimistic snapshot: the just-saved note is tag-filterable
     // immediately, without waiting for the delta poll. Mirror the engine's write
     // semantics — `undefined` LEAVES the prior tags, a value SETS them, `[]` clears.
-    const tags = input.tags === undefined ? prev?.tags : (normTags(input.tags) ?? [])
+    const carriedTags =
+      incomingTags !== undefined
+        ? (normTags(frontmatterEntryValue(incomingTags)) ?? [])
+        : replacing
+          ? []
+          : prev?.tags
+    const tags = input.tags === undefined ? carriedTags : (normTags(input.tags) ?? [])
     this.host.snap.notes.set(id, {
       id,
       title: input.title,

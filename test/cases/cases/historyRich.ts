@@ -28,13 +28,25 @@ export const historyRich: CaseSpec = {
       title: 'Release Notes',
       content: body(lines),
       tags: ['release'],
+      frontmatter: [
+        '# authored metadata must appear in Changes',
+        'review-status: draft',
+        'plugin:',
+        '  layout: release',
+      ].join('\n'),
       created: daysBefore(now, 42, 9),
       principal: 'user:sergey',
     })
 
     // A sequence of chained edits: each appends/rewrites, by alternating authors,
     // one of them a title change (a rename in the history).
-    const steps: Array<{ day: number; who: string; mutate: () => void; title?: string }> = [
+    const steps: Array<{
+      day: number
+      who: string
+      mutate: () => void
+      title?: string
+      frontmatter?: string
+    }> = [
       { day: 38, who: 'alex', mutate: () => lines.push('- Fixed a typo in the intro.') },
       {
         day: 33,
@@ -45,8 +57,9 @@ export const historyRich: CaseSpec = {
       {
         day: 22,
         who: 'sergey',
-        mutate: () =>
-          (lines[1] = '- A polished cut of the release notes, expanded and reorganised.'),
+        // Metadata-only: the body does not move, but CAS/history/diff must.
+        mutate: () => {},
+        frontmatter: 'review-status: reviewed\ntags: [release, reviewed]',
       },
       {
         day: 16,
@@ -65,7 +78,8 @@ export const historyRich: CaseSpec = {
         date: daysBefore(now, s.day, 11),
         space: 'main',
         noteId: id,
-        content: body(lines),
+        ...(s.frontmatter ? {} : { content: body(lines) }),
+        ...(s.frontmatter ? { frontmatter: s.frontmatter } : {}),
         principal: `user:${s.who}`,
       }
       b.event(s.title ? { ...ev, title: s.title } : ev)

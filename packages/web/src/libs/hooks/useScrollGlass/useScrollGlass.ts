@@ -50,7 +50,14 @@ export const liftFromMetrics = (
 export const useScrollGlass = (
   scrollRef: RefObject<HTMLElement | null>,
   barRef: RefObject<HTMLElement | null>,
-  opts: { span?: number; edge?: 'top' | 'bottom'; maxStep?: number } = {},
+  opts: {
+    span?: number
+    edge?: 'top' | 'bottom'
+    maxStep?: number
+    /** Re-snap the material before paint when a persistent bar changes visibility or
+     *  content regime without replacing its DOM element. */
+    snapKey?: string | number | boolean
+  } = {},
 ): void => {
   // Latest config in a ref so the long-lived listener/rAF closures read fresh values
   // without re-attaching. span = scrolled px that reach full glass; maxStep = max lift
@@ -62,6 +69,7 @@ export const useScrollGlass = (
   const current = useRef(0) // where it IS this frame (rate-limited toward target)
   const raf = useRef(0)
   const painted = useRef<HTMLElement | null>(null) // the bar element the lift was last written to
+  const snappedKey = useRef(opts.snapKey)
 
   // Read the live metrics off the scroll element and hand them to the pure lift math.
   const measure = (): number => liftFromMetrics(scrollRef.current, cfg.current, current.current)
@@ -110,22 +118,21 @@ export const useScrollGlass = (
   // DELIBERATELY no dependency array: adding one (e.g. [scrollRef]) would stop the
   // re-sync on those no-scroll content changes and strand a bottom-edge bar.
   //
-  // ON (RE)MOUNT of the bar, SNAP instead of easing. A conditional bar — the Trash
-  // footer, mounted only once a row is picked — appears OVER content already scrolled
-  // under it, so it must show its resting material on the FIRST paint, not fade in.
+  // ON (RE)MOUNT of the bar — or a caller-declared `snapKey` regime change — SNAP
+  // instead of easing. A bar can appear OVER content already scrolled under it, so it
+  // must show its resting material on the FIRST visible paint, not fade in.
   // Two reasons the plain re-sync leaves it flat: (1) an appearance is not a scroll
   // jump, so the maxStep easing (for wheel notches / scrollbar flings) doesn't belong;
-  // (2) more fundamentally, while the bar was unmounted `barRef` was null, so the rAF
-  // wrote `--glass-lift` to nothing — `current` reached its target with the property
-  // never set on THIS element, and since `current === target` on mount `kick()` starts
-  // no rAF, so it would stay unwritten (CSS falls back to 0 = flat) until the next
-  // scroll. So: when the bar element first appears (or swaps), snap `current` to the
-  // freshly measured target and WRITE the lift synchronously here, before paint.
+  // (2) while an element is absent or invisible, an eased intermediate value is not a
+  // meaningful visible state. So: when the element first appears/swaps, or `snapKey`
+  // says a persistent element became visible, snap `current` to the freshly measured
+  // target and WRITE the lift synchronously here, before paint.
   useLayoutEffect(() => {
     const el = barRef.current
 
-    if (el && el !== painted.current) {
+    if (el && (el !== painted.current || !Object.is(snappedKey.current, opts.snapKey))) {
       painted.current = el
+      snappedKey.current = opts.snapKey
       if (raf.current) {
         cancelAnimationFrame(raf.current)
         raf.current = 0
@@ -137,6 +144,7 @@ export const useScrollGlass = (
     }
     if (!el) {
       painted.current = null
+      snappedKey.current = opts.snapKey
     }
     kick()
   })

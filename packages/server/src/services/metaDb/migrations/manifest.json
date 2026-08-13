@@ -42,6 +42,27 @@
       "checksum": "sha256:b9daaf10a822910e8033f547cfc0f0ecc0bc040478aa0d741f9be2fe96c5ad6f",
       "sqlite": "sqlite/0005_revision_entry_role.sql",
       "postgres": "postgres/0005_revision_entry_role.sql"
+    },
+    {
+      "version": 6,
+      "name": "revision_state",
+      "checksum": "sha256:6a8a6674f919e2cfd9e5a977dddb0b72fab86a1fe27565e6d3be759de1e31d0e",
+      "sqlite": "sqlite/0006_revision_state.sql",
+      "postgres": "postgres/0006_revision_state.sql"
+    },
+    {
+      "version": 7,
+      "name": "revision_purge_cas",
+      "checksum": "sha256:bd513b21af35ec545b43aff07f2ed3f8026a0b909e7fac2e157ffb99be19b5ea",
+      "sqlite": "sqlite/0007_revision_purge_cas.sql",
+      "postgres": "postgres/0007_revision_purge_cas.sql"
+    },
+    {
+      "version": 8,
+      "name": "causal_metadata",
+      "checksum": "sha256:8106ed1cf62c81345cad5e9961e21451fd4c121717d95b2af9aeb087172cbba9",
+      "sqlite": "sqlite/0008_causal_metadata.sql",
+      "postgres": "postgres/0008_causal_metadata.sql"
     }
   ]
 }

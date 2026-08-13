@@ -33,6 +33,7 @@ import {
   type MountConfig,
   type NoteClass,
   parseFrontmatterLines,
+  sha256Hex,
 } from '@notarium/core'
 import { createNotariumStore } from '@notarium/engine'
 import {
@@ -64,6 +65,7 @@ import {
 import { buildCasesWorld, listCases } from '../test/cases'
 import type { CaseWorld, ContextSetAttachDecl, UserDecl } from '../test/cases'
 import { normDate } from '../test/cases/generators'
+import { materializeRevisionState } from '../test/cases/revisionStates'
 import { agentSessionId } from '../test/cases/sessionIds'
 import { seedDurableImports } from './seedDurableImports'
 import { applySeedExternalRewrites, identityClaimRewrite } from './seedExternalRewrites'
@@ -135,6 +137,10 @@ const routeOf = (path: string, cls: string | undefined): MountRoute => {
   if (cls === 'profile' && path.startsWith(`${PROFILE_MOUNT}/`)) {
     const rel = strip(PROFILE_MOUNT)
     return { targetClass: 'profile', directory: dirOf(rel), fileName: base(rel) }
+  }
+  if (cls === 'skill' && path.startsWith(`${SKILL_MOUNT}/`)) {
+    const rel = strip(SKILL_MOUNT)
+    return { targetClass: 'skill', directory: dirOf(rel), fileName: base(rel) }
   }
 
   return { directory: dirOf(path), fileName: base(path) }
@@ -638,6 +644,7 @@ const run = async (): Promise<void> => {
       versionToken: string
       class: string
       filePath: string
+      createdAt: string
     }
   >()
   let creates = 0
@@ -736,6 +743,7 @@ const run = async (): Promise<void> => {
           versionToken: res.versionToken,
           class: e.class ?? 'user-doc',
           filePath: e.path,
+          createdAt: normDate(e.date),
         })
         creates++
         if (e.pin) {
@@ -755,10 +763,12 @@ const run = async (): Promise<void> => {
           throw new Error(`event for unknown note ${e.noteId} (op ${e.op})`)
         }
         if (e.op === 'edit') {
+          const current = await store.read(prev.id)
           const res = await store.write({
             title: e.title ?? prev.title,
-            content: e.content,
+            content: e.content ?? current.content,
             tags: e.tags,
+            frontmatter: e.frontmatter ? parseFrontmatterLines(e.frontmatter) : undefined,
             originalId: prev.id,
             versionToken: prev.versionToken,
             principal: remapPrincipal(e.principal),
@@ -798,6 +808,59 @@ const run = async (): Promise<void> => {
         }
       }
     }
+  }
+
+  // 4a. Named restore/read edge states. These declarations intentionally bypass
+  // ordinary writes because gaps, legacy blobs and opaque sources cannot be
+  // truthfully produced through that API. Both seed appliers call the same codec
+  // materializer, then append through their real revision persistence.
+  for (const declaration of [...(world.revisionStates ?? [])].sort((left, right) =>
+    normDate(left.date).localeCompare(normDate(right.date)),
+  )) {
+    const note = live.get(declaration.note)
+
+    if (!note) {
+      throw new Error(`revision state references unknown note: ${declaration.note}`)
+    }
+    const space = idOf.get(note.spaceSlug)
+
+    if (!space) {
+      throw new Error(`revision state note has unknown space: ${note.spaceSlug}`)
+    }
+    const materialized = materializeRevisionState(declaration, {
+      noteId: note.id,
+      path: note.filePath,
+      createdAt: note.createdAt,
+      title: note.title,
+    })
+    const head = await metaDb.revisions.latestFor(space, note.id)
+    const blob = materialized.blob
+
+    await metaDb.revisions.append(
+      {
+        noteId: note.id,
+        space,
+        baseRevisionId: head?.id ?? null,
+        expectedHeadRevisionId: head?.id ?? null,
+        theirRevisionId: null,
+        sourceRevisionId: null,
+        kind: declaration.kind ?? 'write',
+        entryRole: 'change',
+        principal: remapPrincipal(declaration.principal) ?? null,
+        contentHash: blob == null ? null : await sha256Hex(blob),
+        semanticFingerprint: materialized.semanticFingerprint,
+        restoreSafety: materialized.restoreSafety,
+        stateFormat: materialized.stateFormat,
+        title: materialized.title,
+        class: note.class,
+        slug: null,
+        tags: [],
+        createdAt: normDate(declaration.date),
+        charsAdded: null,
+        charsRemoved: null,
+      },
+      blob,
+    )
   }
 
   // 4b. Owner/session delta positions. Cursor declarations name a journalled

@@ -7,6 +7,7 @@ import { DatabaseSync } from 'node:sqlite'
 
 import { createAgentDeltaCursorsFacet } from './drivers/sqlite/agentDeltaCursors'
 import { createAuthFacet } from './drivers/sqlite/auth'
+import { createCausalOutboxFacet } from './drivers/sqlite/causalOutbox'
 import type { SqliteDriverCtx } from './drivers/sqlite/context'
 import { createContextOrderFacet } from './drivers/sqlite/contextOrder'
 import { createContextSetsFacet } from './drivers/sqlite/contextSets'
@@ -14,14 +15,19 @@ import { createFavoritesFacet } from './drivers/sqlite/favorites'
 import { createFoldersFacet } from './drivers/sqlite/folders'
 import { createGatewayFacet } from './drivers/sqlite/gateway'
 import { createIdentityFacet } from './drivers/sqlite/identity'
+import { createInstallationGenerationFacet } from './drivers/sqlite/installationGeneration'
 import { createJobsFacet } from './drivers/sqlite/jobs'
 import { createOAuthFacet } from './drivers/sqlite/oauth'
+import { createOwnerProofsFacet } from './drivers/sqlite/ownerProofs'
 import { createProjectsFacet } from './drivers/sqlite/projects'
+import { createRestoreOperationsFacet } from './drivers/sqlite/restoreOperations'
+import { createRestoreTerminalFacet } from './drivers/sqlite/restoreTerminal'
 import { createRetrievalLogFacet } from './drivers/sqlite/retrievalLog'
 import { createRevisionsFacet } from './drivers/sqlite/revisions'
 import { createScopePinsFacet } from './drivers/sqlite/scopePins'
 import { createSessionAuditFacet } from './drivers/sqlite/sessionAudit'
 import { createSessionsFacet } from './drivers/sqlite/sessions'
+import { createSpaceLifecycleFacet } from './drivers/sqlite/spaceLifecycle'
 import { createSpacesFacet } from './drivers/sqlite/spaces'
 import { IN_MEMORY_DB } from './metaDbUrl'
 import { runSqliteMigrations } from './migrations'
@@ -126,6 +132,18 @@ export class SqliteMetaDb implements MetaDb {
 
   readonly identity = createIdentityFacet(this.ctx)
 
+  readonly restoreOperations = createRestoreOperationsFacet(this.ctx)
+
+  readonly restoreTerminal = createRestoreTerminalFacet(this.ctx)
+
+  readonly spaceLifecycle = createSpaceLifecycleFacet(this.ctx)
+
+  readonly causalOutbox = createCausalOutboxFacet(this.ctx)
+
+  readonly installationGeneration = createInstallationGenerationFacet(this.ctx)
+
+  readonly ownerProofs = createOwnerProofsFacet(this.ctx)
+
   // ── space registry facet ────────────────────────────────────────────
 
   readonly spaces = createSpacesFacet(this.ctx)
@@ -181,8 +199,44 @@ export class SqliteMetaDb implements MetaDb {
   async purgeSpace(spaceId: string): Promise<void> {
     await this.ensureInit()
     const db = this.required
-    db.exec('BEGIN')
+    db.exec('BEGIN IMMEDIATE')
     try {
+      const current = db
+        .prepare('SELECT phase FROM space_lifecycle WHERE space = ?')
+        .get(spaceId) as { phase: string } | undefined
+
+      if (
+        current?.phase === 'metadata-cleaned' ||
+        current?.phase === 'physical-cleaned' ||
+        current?.phase === 'purged'
+      ) {
+        db.exec('COMMIT')
+        return
+      }
+      const lifecycleAt = new Date().toISOString()
+
+      if (current?.phase !== 'purge-intent') {
+        db.prepare(
+          `INSERT INTO space_lifecycle
+            (space, phase, generation, cleanup_manifest, changed_at, changed_by)
+           VALUES (?, 'purge-intent', 1, NULL, ?, NULL)
+           ON CONFLICT(space) DO UPDATE SET
+             phase = 'purge-intent',
+             generation = space_lifecycle.generation + 1,
+             changed_at = excluded.changed_at`,
+        ).run(spaceId, lifecycleAt)
+      }
+      const blocker = db
+        .prepare(
+          `SELECT id FROM restore_operations
+            WHERE space = ? AND phase NOT IN ('succeeded', 'rejected')
+            LIMIT 1`,
+        )
+        .get(spaceId) as { id: string } | undefined
+
+      if (blocker) {
+        throw new Error(`space purge blocked by restore operation: ${blocker.id}`)
+      }
       db.prepare(
         "INSERT OR IGNORE INTO revision_purge_fences (kind, entity_id, space) VALUES ('space', ?, ?)",
       ).run(spaceId, spaceId)
@@ -195,6 +249,7 @@ export class SqliteMetaDb implements MetaDb {
           )
           .all(spaceId) as Array<{ h: string }>
       ).map((r) => r.h)
+      db.prepare('DELETE FROM revision_heads WHERE space = ?').run(spaceId)
       db.prepare('DELETE FROM note_revisions WHERE space = ?').run(spaceId)
       const stillUsed = db.prepare('SELECT 1 FROM note_revisions WHERE content_hash = ? LIMIT 1')
       const dropBlob = db.prepare('DELETE FROM revision_blobs WHERE hash = ?')
@@ -204,7 +259,11 @@ export class SqliteMetaDb implements MetaDb {
           dropBlob.run(h)
         }
       }
+      db.prepare('DELETE FROM owner_proof_receipts WHERE space = ?').run(spaceId)
+      db.prepare('DELETE FROM note_owner_proofs WHERE space = ?').run(spaceId)
       db.prepare('DELETE FROM note_identity WHERE space = ?').run(spaceId)
+      db.prepare('DELETE FROM restore_operations WHERE space = ?').run(spaceId)
+      db.prepare('DELETE FROM causal_outbox WHERE space = ?').run(spaceId)
       // Legacy rows may carry a space/project id, current slug, or retired space
       // alias. Ids are authoritative; resolve textual history only when all live
       // namespaces identify exactly one project, so purge cannot steal an
@@ -277,7 +336,25 @@ export class SqliteMetaDb implements MetaDb {
            SELECT json_group_array(j.value) FROM json_each(pats.spaces) j WHERE j.value != ?
          ) WHERE spaces IS NOT NULL`,
       ).run(spaceId)
+      for (const table of [
+        'oauth_auth_codes',
+        'oauth_access_tokens',
+        'oauth_refresh_tokens',
+      ] as const) {
+        db.prepare(
+          `UPDATE ${table} SET spaces = (
+             SELECT json_group_array(grant.value)
+               FROM json_each(${table}.spaces) AS grant
+              WHERE grant.value != ?
+           ) WHERE spaces IS NOT NULL`,
+        ).run(spaceId)
+      }
       db.prepare('DELETE FROM spaces WHERE id = ?').run(spaceId)
+      db.prepare(
+        `UPDATE space_lifecycle SET
+           phase = 'metadata-cleaned', generation = generation + 1, changed_at = ?
+         WHERE space = ?`,
+      ).run(new Date().toISOString(), spaceId)
       db.exec('COMMIT')
     } catch (err) {
       db.exec('ROLLBACK')

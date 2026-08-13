@@ -1,12 +1,14 @@
 import type { PoolClient } from 'pg'
-import type {
-  IdentityClaimOutcome,
-  IdentityFileClaim,
-  IdentityFileSettlement,
-  IdentityPersistence,
-  IdentityRecord,
+import {
+  CAUSAL_BARRIER_KIND,
+  type IdentityClaimOutcome,
+  type IdentityFileClaim,
+  type IdentityFileSettlement,
+  type IdentityPersistence,
+  type IdentityRecord,
 } from '@notarium/core'
 
+import { lockCausalBarriers } from './causalBarriers'
 import type { PgDriverCtx } from './context'
 import { rekeyReferences } from './identityRefs'
 import { IDENTITY_COLUMNS, type IdentityRow, lockIdentityRows, readIdentityRows } from './lockOrder'
@@ -19,6 +21,7 @@ const recordOfRow = (r: IdentityRow): IdentityRecord => ({
   createdAt: r.created_at,
   materialized: r.materialized,
   deletedAt: r.deleted_at,
+  addressRevision: Number(r.address_revision),
 })
 
 /** Upsert one row WITHOUT ever changing its space — the SQLite twin's guard,
@@ -26,6 +29,10 @@ const recordOfRow = (r: IdentityRow): IdentityRecord => ({
 const UPSERT_SQL = `INSERT INTO note_identity (id, file_path, space, created_at, materialized, deleted_at)
      VALUES ($1, $2, $3, $4, $5, $6)
      ON CONFLICT (id) DO UPDATE SET
+       address_revision = note_identity.address_revision + CASE
+         WHEN note_identity.file_path IS DISTINCT FROM EXCLUDED.file_path
+           OR note_identity.deleted_at IS DISTINCT FROM EXCLUDED.deleted_at
+         THEN 1 ELSE 0 END,
        file_path = EXCLUDED.file_path,
        created_at = EXCLUDED.created_at,
        materialized = EXCLUDED.materialized,
@@ -101,6 +108,19 @@ export const createIdentityFacet = (ctx: PgDriverCtx): IdentityPersistence => ({
         client,
         records.map((r) => r.id),
       )
+      await lockCausalBarriers(
+        client,
+        records.flatMap((record) => [
+          {
+            kind: CAUSAL_BARRIER_KIND.spaceLifecycle,
+            space: record.space,
+            key: record.space,
+          },
+          { kind: CAUSAL_BARRIER_KIND.address, space: record.space, key: record.id },
+          { kind: CAUSAL_BARRIER_KIND.address, space: record.space, key: record.filePath },
+        ]),
+        (kind) => (kind === CAUSAL_BARRIER_KIND.spaceLifecycle ? 'shared' : 'exclusive'),
+      )
       const byId = new Map(locked.map((row) => [row.id, row]))
       const outcomeById = new Map<string, IdentityClaimOutcome>()
       // BY ID, not in arrival order: the rows a batch CREATES are new keys, and two
@@ -157,6 +177,21 @@ export const createIdentityFacet = (ctx: PgDriverCtx): IdentityPersistence => ({
       // may touch, in ONE entry; the aggregate's reference/revision locks come after
       // them. Every write below stays inside this set.
       const { rows: held } = await lockIdentityRows(client, [current.id, observedId])
+      await lockCausalBarriers(
+        client,
+        [
+          {
+            kind: CAUSAL_BARRIER_KIND.spaceLifecycle,
+            space,
+            key: space,
+          },
+          { kind: CAUSAL_BARRIER_KIND.address, space, key: current.id },
+          { kind: CAUSAL_BARRIER_KIND.address, space, key: observedId },
+          { kind: CAUSAL_BARRIER_KIND.address, space, key: current.filePath },
+          { kind: CAUSAL_BARRIER_KIND.address, space, key: filePath },
+        ],
+        (kind) => (kind === CAUSAL_BARRIER_KIND.spaceLifecycle ? 'shared' : 'exclusive'),
+      )
       const present = new Set(held.map((row) => row.id))
 
       // A lock cannot hold a key that has no row, so the two rows this settlement can
@@ -166,7 +201,10 @@ export const createIdentityFacet = (ctx: PgDriverCtx): IdentityPersistence => ({
       // the branch that revives it (a foreign owner) and the one that retires it both
       // land on the same final state, and a refusal leaves a tombstone the next
       // write-behind flush makes live again.
-      if (current.id !== observedId && !present.has(current.id) && current.id < observedId) {
+      const currentHoisted =
+        current.id !== observedId && !present.has(current.id) && current.id < observedId
+
+      if (currentHoisted) {
         await client.query(
           `INSERT INTO note_identity (id, file_path, space, created_at, materialized, deleted_at)
              VALUES ($1, $2, $3, $4, $5, $6)
@@ -174,21 +212,35 @@ export const createIdentityFacet = (ctx: PgDriverCtx): IdentityPersistence => ({
           [current.id, current.filePath, space, current.createdAt ?? at, current.materialized, at],
         )
       }
+      const heldOwner = held.find((row) => row.id === observedId)
+      const currentRetiredBeforeClaim =
+        current.id !== observedId && !heldOwner && present.has(current.id)
+
+      if (currentRetiredBeforeClaim) {
+        // An absent observed id has to be claimed by INSERT, but its intended
+        // address is still occupied by the claimant. Make the address cut before
+        // that arbitration point; rollback restores it if another space wins the
+        // id, while the foreign-owner branch below revives it on a committed loss.
+        await upsertOwned(client, { ...current, space, deletedAt: at })
+      }
       // First committed claim wins an ABSENT id: the insert itself is the
       // arbitration point, and the loser blocks on the re-read below until the
       // winner commits, then sees the durable owner.
-      const inserted = await client.query(
-        `INSERT INTO note_identity (id, file_path, space, created_at, materialized, deleted_at)
-           VALUES ($1, $2, $3, $4, TRUE, NULL)
-           ON CONFLICT (id) DO NOTHING
-         RETURNING ${IDENTITY_COLUMNS}`,
-        [observedId, filePath, space, current.createdAt ?? at],
-      )
-      // Held since the entry above, so the re-read needs no second lock: a row that
-      // committed after it is one this transaction does not hold, and the guard on
-      // every write below is what refuses it.
+      const inserted = heldOwner
+        ? undefined
+        : await client.query(
+            `INSERT INTO note_identity (id, file_path, space, created_at, materialized, deleted_at)
+               VALUES ($1, $2, $3, $4, TRUE, NULL)
+               ON CONFLICT (id) DO NOTHING
+             RETURNING ${IDENTITY_COLUMNS}`,
+            [observedId, filePath, space, current.createdAt ?? at],
+          )
+      // Existing rows were held at entry. For an absent id the INSERT is its
+      // arbitration lock; a losing insert waits for the winner, then this read sees
+      // the durable owner and guarded writes below refuse any stale premise.
       const ownerRow =
-        (inserted.rows[0] as IdentityRow | undefined) ??
+        heldOwner ??
+        (inserted?.rows[0] as IdentityRow | undefined) ??
         (await readIdentityRows(client, [observedId]))[0]
       const settlement = await (async (): Promise<IdentityFileSettlement> => {
         if (ownerRow && ownerRow.space !== space) {
@@ -229,11 +281,20 @@ export const createIdentityFacet = (ctx: PgDriverCtx): IdentityPersistence => ({
           deletedAt: null,
         }
 
+        if (current.id !== observedId && present.has(current.id) && !currentRetiredBeforeClaim) {
+          // `idx_note_identity_live_space_path` makes the address cut explicit:
+          // retire the held claimant before reviving the observed id at its path.
+          // Both writes remain in this transaction, so readers see only either
+          // complete side of the swap.
+          await upsertOwned(client, { ...current, space, deletedAt: at })
+        }
         await upsertOwned(client, record)
         if (current.id === observedId) {
           return { status: 'accepted', record }
         }
-        await upsertOwned(client, { ...current, space, deletedAt: at })
+        if (!present.has(current.id) && !currentHoisted) {
+          await upsertOwned(client, { ...current, space, deletedAt: at })
+        }
         await rekeyReferences(client, { space, fromId: current.id, toId: record.id })
         await rekeyAndQuarantineRevisions(client, { space, fromId: current.id, toId: record.id })
 

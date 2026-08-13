@@ -47,8 +47,11 @@ default. It also installs short multicall commands such as `backup` and `admin`
 for `docker exec`. `backup` is a second operator-only process in the existing
 container: stdout is exclusively the ZIP; progress and summary go to stderr.
 
-A mode-0600 Unix socket inside the container lets that process request two short
-application checkpoints. Each checkpoint queues HTTP mutations, durable jobs
+A mode-0600 Unix socket inside the container first acquires a bounded durable
+installation-generation freeze, then lets that process request two short
+application checkpoints. The freeze blocks replay-key replacement without
+holding a database transaction during filesystem I/O; expiry makes a crashed
+backup producer recoverable. Each checkpoint queues HTTP mutations, durable jobs
 and MCP calls (nominally read-only tools can persist cursors/audit); ordinary
 HTTP reads remain available. It waits for active work, reconciles external note
 edits, drains identity/history write-behind, then releases the gate. SQLite's online backup
@@ -57,6 +60,11 @@ Markdown and durable job files are staged. A stage is accepted only when hashes,
 mtimes, exact directories and SQLite `data_version` remain stable through the
 final checkpoint/sample. Overlapping writes force a retry. Sustained churn exits
 non-zero without publishing an archive.
+
+The immutable stage is accepted only when its SQLite installation row, active
+key pointer, and exact key-file hash match the same generation bundle. A
+`publishing-active` key transition cannot be captured. The lease is revalidated
+around the bounded SQLite/tree cut and released before ZIP compression.
 
 A checkpoint has a five-second server-side deadline. If a long import/export or
 flush cannot drain in that window, the backup fails and queued writes are
@@ -71,8 +79,10 @@ contains:
 - `data/spaces/`: workspace truth, including Markdown, agent-memory, project markers, and complete
   binary role/skill packages;
 - `data/jobs/`: completed artifacts and durable import uploads;
+- `data/replay-keyring/`: immutable installation replay keys and the active
+  generation pointer;
 - `manifest.json`: format version, timestamp, exact directories, file sizes,
-  mtimes and SHA-256 checksums.
+  mtimes, SHA-256 checksums, and the witnessed installation generation.
 
 Only Notarium-owned incomplete files are omitted: dot-named atomic note temps,
 exact `.<role>.install-<uuid>` role-package staging directories at a Personal/Space library root or
@@ -80,7 +90,15 @@ an exact `_projects/<encoded-project-id>/` library root (one orphaned by a proce
 by the next install into that same library root, once it is more than an hour old),
 `jobs/imports/<space>/<job>.import.part`, and in-progress export artifact parts.
 Ordinary user files or directories ending in `.part` are legitimate and remain
-in the backup. `data/engine/` is derived and omitted; it rebuilds after restore.
+in the backup. The supported per-space `.notarium-fs-ops/` recovery namespace is
+preserved: an accepted restart-durable restore must travel with the matching
+meta-DB operation row. For bulk restore this includes the parent evidence roster,
+its strict children, receipts, lifecycle barrier and outbox state; copying only the
+published note bytes would lose the decision about whether they may become visible.
+Raw actors, idempotency keys and request payloads do not become backup secrets:
+persistence keeps only domain-separated HMACs/fingerprints. The recovery namespace
+remains private to recovery and is not part of a user space export. `data/engine/` is
+derived and omitted; it rebuilds after restore.
 
 This image-native backup covers the canonical one-root layout under `SPACES_ROOT`,
 including its default `.notarium/skills` mounts. An embedded host that configures
@@ -104,7 +122,8 @@ docker exec -i notarium backup verify < notarium-20260722.zip
 Success prints one JSON summary and exits zero. Verification rejects
 unsafe/duplicate paths, unexpected or unmanifested payloads, an inexact directory
 set, size/hash mismatches, malformed mtime metadata, resource-limit violations,
-and failed SQLite `integrity_check`. It does not read or change live `DATA_DIR`.
+failed SQLite `integrity_check`, and any DB/pointer/key generation mismatch. It
+does not read or change live `DATA_DIR`.
 
 Checksums detect accidental corruption; they do not authenticate an archive
 against an attacker who can replace payload and manifest together. Treat backup
@@ -147,7 +166,8 @@ installation. A process interruption during installation leaves an explicit
 marker; discard that disposable target and restore into a new empty one rather
 than resuming or merging.
 
-The restored meta-DB must carry a migration ledger accepted by the target build
+The restored meta-DB and replay keyring are validated as one finite generation
+matrix and installed together before startup. The meta-DB must carry a migration ledger accepted by the target build
 ([schema contract](meta-db.md#startup)). A non-empty pre-baseline database fails
 closed; restore does not guess its version or stamp it automatically. Upgrade
 and verify such an owned instance with its version-specific operator procedure
@@ -227,4 +247,5 @@ without `compose.dev.yml`; neither Make target is needed on a deployed host.
 The built-in command supports only the canonical single-root, file-backed SQLite
 layout. If `META_DB_URL` is Postgres or notes/jobs live outside `DATA_DIR`, it
 fails closed: use provider-native database and mount snapshots instead of a
-partial archive.
+partial archive. A future Postgres backup path must bind a provider/admin snapshot
+session to the same generation bundle; an ordinary filesystem copy is not one.

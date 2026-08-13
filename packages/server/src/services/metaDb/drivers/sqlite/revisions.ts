@@ -1,9 +1,13 @@
 import {
   AGENT_SESSION_ATTACH,
   type AuthorFilter,
+  DOCUMENT_STATE_FORMAT,
+  LOGICAL_NOTE_STATE_FORMAT,
   type Revision,
   REVISION_INTEGRITY,
+  type RevisionBlob,
   revisionGapOf,
+  RevisionHeadConflictError,
   type RevisionInput,
   type RevisionPersistence,
 } from '@notarium/core'
@@ -33,6 +37,10 @@ type RevisionRow = {
   session_name: string | null
   session_attach: string | null
   content_hash: string | null
+  semantic_fingerprint: string | null
+  restore_safety: Revision['restoreSafety']
+  snapshot_format: string | null
+  document_format: string | null
   title: string
   class: string | null
   slug: string | null
@@ -84,6 +92,9 @@ const rawRevisionOfRow = (r: RevisionRow): Revision => ({
       }
     : {}),
   contentHash: r.content_hash,
+  semanticFingerprint: r.semantic_fingerprint,
+  restoreSafety: r.restore_safety,
+  stateFormat: (r.document_format ?? r.snapshot_format) as Revision['stateFormat'],
   title: r.title,
   class: r.class ?? null,
   slug: r.slug ?? null,
@@ -121,10 +132,12 @@ const classFilterSqlite = (excludeClasses: readonly string[]): string =>
 
 export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence => ({
   init: () => ctx.ensureInit(),
-  append: async (rev: RevisionInput, content: string | null) => {
+  append: async (rev: RevisionInput, content: RevisionBlob | null) => {
     await ctx.ensureInit()
     const db = ctx.required
-    db.exec('BEGIN')
+    // Pair with conditional purge's BEGIN IMMEDIATE: fence-check + append and
+    // latest-compare + purge have a single cross-connection winner.
+    db.exec('BEGIN IMMEDIATE')
     try {
       const fence = db
         .prepare(
@@ -138,6 +151,44 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
       if (fence) {
         throw new Error(`revision target was permanently purged: ${fence.kind}`)
       }
+      const headRow = db
+        .prepare(
+          `SELECT revisions.*
+             FROM revision_heads AS heads
+             JOIN note_revisions AS revisions ON revisions.id = heads.revision_id
+            WHERE heads.space = ? AND heads.note_id = ?`,
+        )
+        .get(rev.space, rev.noteId) as RevisionRow | undefined
+      const head = headRow ? revisionOfRow(headRow) : null
+
+      if (
+        rev.expectedHeadRevisionId !== undefined &&
+        (head?.id ?? null) !== rev.expectedHeadRevisionId
+      ) {
+        throw new RevisionHeadConflictError(
+          rev.noteId,
+          rev.expectedHeadRevisionId,
+          head?.id ?? null,
+        )
+      }
+      if (
+        rev.expectedHeadRevisionId !== undefined &&
+        rev.baseRevisionId !== rev.expectedHeadRevisionId
+      ) {
+        throw new Error('revision base must equal the expected head')
+      }
+      const lifecycle = rev.kind === 'delete' ? 'deleted' : 'live'
+      const headLifecycle = head?.kind === 'delete' ? 'deleted' : 'live'
+
+      if (
+        rev.allowSemanticNoop === true &&
+        rev.semanticFingerprint != null &&
+        head?.semanticFingerprint === rev.semanticFingerprint &&
+        headLifecycle === lifecycle
+      ) {
+        db.exec('COMMIT')
+        return head
+      }
       if (rev.contentHash != null && content != null) {
         db.prepare('INSERT OR IGNORE INTO revision_blobs (hash, content) VALUES (?, ?)').run(
           rev.contentHash,
@@ -147,8 +198,8 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
       const res = db
         .prepare(
           `INSERT INTO note_revisions
-               (note_id, space, base_rev, their_rev, source_rev, kind, entry_role, principal, agent_owner, agent_name, session_id, session_name, session_attach, content_hash, title, class, slug, tags, created_at, chars_added, chars_removed, integrity)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+               (note_id, space, base_rev, their_rev, source_rev, kind, entry_role, principal, agent_owner, agent_name, session_id, session_name, session_attach, content_hash, semantic_fingerprint, restore_safety, snapshot_format, document_format, title, class, slug, tags, created_at, chars_added, chars_removed, integrity)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           rev.noteId,
@@ -165,6 +216,14 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
           rev.agent?.session?.name ?? null,
           rev.agent?.session?.attach ?? null,
           rev.contentHash,
+          rev.semanticFingerprint ?? null,
+          rev.restoreSafety ?? null,
+          rev.stateFormat === LOGICAL_NOTE_STATE_FORMAT ? rev.stateFormat : null,
+          rev.stateFormat === DOCUMENT_STATE_FORMAT.markdown ||
+            rev.stateFormat === DOCUMENT_STATE_FORMAT.skill ||
+            rev.stateFormat === DOCUMENT_STATE_FORMAT.opaque
+            ? rev.stateFormat
+            : null,
           rev.title,
           rev.class,
           rev.slug,
@@ -174,8 +233,27 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
           rev.charsRemoved,
           REVISION_INTEGRITY.trusted,
         )
+      db.prepare(
+        `INSERT INTO revision_heads
+          (note_id, space, revision_id, semantic_fingerprint, lifecycle)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(space, note_id) DO UPDATE SET
+           revision_id = excluded.revision_id,
+           semantic_fingerprint = excluded.semantic_fingerprint,
+           lifecycle = excluded.lifecycle`,
+      ).run(rev.noteId, rev.space, res.lastInsertRowid, rev.semanticFingerprint ?? null, lifecycle)
       db.exec('COMMIT')
-      return { ...rev, tags: [...rev.tags], id: String(res.lastInsertRowid) }
+      const stored = { ...rev }
+      delete stored.allowSemanticNoop
+      delete stored.expectedHeadRevisionId
+      return {
+        ...stored,
+        semanticFingerprint: rev.semanticFingerprint ?? null,
+        restoreSafety: rev.restoreSafety ?? null,
+        stateFormat: rev.stateFormat ?? null,
+        tags: [...rev.tags],
+        id: String(res.lastInsertRowid),
+      }
     } catch (err) {
       db.exec('ROLLBACK')
       throw err
@@ -368,7 +446,7 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
       .all(space, JSON.stringify(ids)) as RevisionRow[]
     return new Map(rows.map((row) => [row.note_id, revisionOfRow(row)]))
   },
-  listTrashed: async (space, { offset, limit, q }, excludeClasses = []) => {
+  listTrashed: async (space, { offset, limit, q, availability }, excludeClasses = []) => {
     await ctx.ensureInit()
     const db = ctx.required
     // Drop hidden classes BEFORE the per-note collapse, so a hidden class can't
@@ -380,6 +458,20 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
     const needle = q?.trim().toLowerCase()
     const qFilter = needle ? " AND lower_u(title) LIKE ? ESCAPE '\\'" : ''
     const qArgs = needle ? [`%${needle.replace(/[\\%_]/g, (c) => '\\' + c)}%`] : []
+    const restorableExpr = `CASE WHEN revisions.content_hash IS NOT NULL
+      AND (
+        revisions.document_format IS NULL
+        OR (
+          revisions.document_format <> 'opaque-v1'
+          AND revisions.restore_safety = 'safe'
+        )
+      ) THEN 1 ELSE 0 END`
+    const availabilityFilter =
+      availability === 'restorable'
+        ? ` AND (${restorableExpr}) = 1`
+        : availability === 'unavailable'
+          ? ` AND (${restorableExpr}) = 0`
+          : ''
     // Trash = notes whose newest revision is a delete-tombstone; a later
     // restore/save makes the newest a write, so the note drops out.
     // canon: docs/trash.md#model
@@ -389,7 +481,9 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
           `SELECT * FROM (
                SELECT *, ROW_NUMBER() OVER (PARTITION BY note_id ORDER BY id DESC) AS rn
                FROM note_revisions WHERE space = ? AND ${TRUSTED_ONLY}${exFilter}
-             ) WHERE rn = 1 AND kind = 'delete'${qFilter} ORDER BY id DESC LIMIT ? OFFSET ?`,
+             ) AS revisions
+            WHERE rn = 1 AND kind = 'delete'${qFilter}${availabilityFilter}
+            ORDER BY id DESC LIMIT ? OFFSET ?`,
         )
         .all(space, ...exArgs, ...qArgs, limit, offset) as RevisionRow[]
     ).map(revisionOfRow)
@@ -397,9 +491,10 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
       db
         .prepare(
           `SELECT COUNT(*) AS n FROM (
-               SELECT note_id, kind, title, ROW_NUMBER() OVER (PARTITION BY note_id ORDER BY id DESC) AS rn
+               SELECT *, ROW_NUMBER() OVER (PARTITION BY note_id ORDER BY id DESC) AS rn
                FROM note_revisions WHERE space = ? AND ${TRUSTED_ONLY}${exFilter}
-             ) WHERE rn = 1 AND kind = 'delete'${qFilter}`,
+             ) AS revisions
+            WHERE rn = 1 AND kind = 'delete'${qFilter}${availabilityFilter}`,
         )
         .get(space, ...exArgs, ...qArgs) as { n: number }
     ).n
@@ -407,37 +502,76 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
       db
         .prepare(
           `SELECT COUNT(*) AS n FROM (
-               SELECT note_id, kind, title, content_hash, ROW_NUMBER() OVER (PARTITION BY note_id ORDER BY id DESC) AS rn
+               SELECT *, ROW_NUMBER() OVER (PARTITION BY note_id ORDER BY id DESC) AS rn
                FROM note_revisions WHERE space = ? AND ${TRUSTED_ONLY}${exFilter}
-             ) WHERE rn = 1 AND kind = 'delete' AND content_hash IS NOT NULL${qFilter}`,
+             ) AS revisions
+            WHERE rn = 1 AND kind = 'delete'
+              AND (${restorableExpr}) = 1${qFilter}${availabilityFilter}`,
         )
         .get(space, ...exArgs, ...qArgs) as { n: number }
     ).n
-    return { items, total, restorableTotal }
+    const partialTotal = (
+      db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM (
+               SELECT *, ROW_NUMBER() OVER (PARTITION BY note_id ORDER BY id DESC) AS rn
+               FROM note_revisions WHERE space = ? AND ${TRUSTED_ONLY}${exFilter}
+             ) AS revisions
+            WHERE rn = 1 AND kind = 'delete'
+              AND revisions.content_hash IS NOT NULL
+              AND revisions.document_format IS NULL${qFilter}${availabilityFilter}`,
+        )
+        .get(space, ...exArgs, ...qArgs) as { n: number }
+    ).n
+    return { items, total, restorableTotal, partialTotal }
   },
-  purgeNotes: async (space, noteIds) => {
+  purgeNotes: async (space, noteIds, expectedLatest) => {
     await ctx.ensureInit()
     if (!noteIds.length) {
-      return
+      return []
     }
     const db = ctx.required
     const CHUNK = 400 // keep the IN-list well under SQLite's variable cap
-    db.exec('BEGIN')
+    // Acquire the writer slot before comparing latest ids: another connection's
+    // append may be before or after this transaction, never between compare/fence.
+    db.exec('BEGIN IMMEDIATE')
+    let ids: string[] = []
+
     try {
+      const candidates = [...new Set(noteIds)]
+      const latest = expectedLatest
+        ? db.prepare('SELECT revision_id AS id FROM revision_heads WHERE space = ? AND note_id = ?')
+        : null
+      ids = expectedLatest
+        ? candidates.filter((noteId) => {
+            const expected = expectedLatest.get(noteId)
+            const row = latest!.get(space, noteId) as { id: number | bigint } | undefined
+            return expected !== undefined && row != null && String(row.id) === expected
+          })
+        : candidates
+      const pinned = db.prepare(
+        `SELECT 1
+          FROM restore_operation_notes AS pins
+           JOIN restore_operations AS operations ON operations.id = pins.operation_id
+          WHERE pins.space = ? AND pins.note_id = ?
+            AND operations.phase NOT IN ('succeeded', 'rejected')
+          LIMIT 1`,
+      )
+      ids = ids.filter((noteId) => !pinned.get(space, noteId))
       // The fence is scoped exactly like the DELETE below it.
       // canon: docs/meta-db.md#source-of-truth
       const fenceNote = db.prepare(
         "INSERT OR IGNORE INTO revision_purge_fences (kind, entity_id, space) VALUES ('note', ?, ?)",
       )
 
-      for (const noteId of new Set(noteIds)) {
+      for (const noteId of ids) {
         fenceNote.run(noteId, space)
       }
       const stillUsed = db.prepare('SELECT 1 FROM note_revisions WHERE content_hash = ? LIMIT 1')
       const dropBlob = db.prepare('DELETE FROM revision_blobs WHERE hash = ?')
 
-      for (let i = 0; i < noteIds.length; i += CHUNK) {
-        const batch = noteIds.slice(i, i + CHUNK)
+      for (let i = 0; i < ids.length; i += CHUNK) {
+        const batch = ids.slice(i, i + CHUNK)
         const ph = batch.map(() => '?').join(',')
         const hashes = (
           db
@@ -446,6 +580,10 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
             )
             .all(space, ...batch) as Array<{ h: string }>
         ).map((r) => r.h)
+        db.prepare(`DELETE FROM revision_heads WHERE space = ? AND note_id IN (${ph})`).run(
+          space,
+          ...batch,
+        )
         db.prepare(`DELETE FROM note_revisions WHERE space = ? AND note_id IN (${ph})`).run(
           space,
           ...batch,
@@ -462,11 +600,11 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
       db.exec('ROLLBACK')
       throw err
     }
+
+    return ids
   },
   latestTimestamps: async (space) => {
     await ctx.ensureInit()
-    // Bare-column semantics: with MAX(id) in the select list, SQLite serves
-    // the other columns from that max row — the newest revision per note.
     const rows = ctx.required
       .prepare(
         `SELECT note_id, created_at, MAX(id) FROM note_revisions WHERE space = ? AND ${TRUSTED_ONLY} GROUP BY note_id`,
@@ -499,8 +637,9 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
     await ctx.ensureInit()
     const row = ctx.required
       .prepare('SELECT content FROM revision_blobs WHERE hash = ?')
-      .get(contentHash) as { content: string } | undefined
-    return row?.content ?? null
+      .get(contentHash) as { content: string | Uint8Array } | undefined
+    const content = row?.content
+    return content instanceof Uint8Array ? Uint8Array.from(content) : (content ?? null)
   },
   close: () => ctx.close(),
 })

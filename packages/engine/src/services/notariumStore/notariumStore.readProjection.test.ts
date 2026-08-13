@@ -110,6 +110,39 @@ describe('NotariumStore read/reconcile projection (#222)', () => {
     }
   })
 
+  it('read() analyzes the exact physical bytes instead of rebuilding a logical snapshot', async () => {
+    const root = await fs.mkdtemp(join(tmpdir(), 'nstore-proj-'))
+    const store = createNotariumStore({ notesDir: root })
+    const raw = [
+      '---\r',
+      '# authored\r',
+      'title: "Привет 🚀"\r',
+      'plugin: &base { answer: 42 }\r',
+      'copy: *base\r',
+      '---\r',
+      '\r',
+      '# Привет 🚀\r',
+      '\r',
+      'body\r',
+    ].join('\n')
+
+    try {
+      await fs.writeFile(join(root, 'exact.md'), Buffer.from(raw, 'utf8'))
+      await store.changes(null)
+      const detail = await store.read('exact.md')
+
+      expect(new TextDecoder().decode(detail.documentState?.source)).toBe(raw)
+      expect(detail.documentState?.projection).toMatchObject({
+        title: 'Привет 🚀',
+        body: 'body\r',
+      })
+      expect(detail.versionToken).toMatch(/^v3:/)
+    } finally {
+      await store.stop()
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('pushes semantic class narrowing into the indexed metadata query', async () => {
     const root = await fs.mkdtemp(join(tmpdir(), 'nstore-proj-'))
     const memoryRoot = join(root, '.notarium/memory')

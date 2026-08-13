@@ -49,6 +49,7 @@ export const installAuthz = (
   app: FastifyInstance,
   auth: AuthService,
   resolveSpaceId: (slug: string) => string | null,
+  resolveRetainedSpaceId: (slug: string) => string | null = resolveSpaceId,
 ): void => {
   app.decorateRequest('principal', null as unknown as Principal)
   app.decorateRequest('spaceId', '')
@@ -106,16 +107,21 @@ export const installAuthz = (
 
     // 'note' routes defer can() to the shared note-resolver — their space comes
     // from the identity registry, not the URL; authentication above still applies.
-    if (authz.resource === 'note') {
+    if (authz.resource === 'note' || authz.resource === 'note-replay') {
       return
     }
     // Resolve slug → stable id once; downstream handlers address the space by it.
     // Unknown slug → can() denies → 404 (anti-enumeration: "no such thing").
     let space: string | undefined
 
-    if (authz.resource === 'space') {
+    if (authz.resource === 'space' || authz.resource === 'space-replay') {
       const slug = (req.params as { space?: string }).space
-      space = (slug && resolveSpaceId(slug)) || undefined
+      space =
+        (slug &&
+          (authz.resource === 'space-replay'
+            ? resolveRetainedSpaceId(slug)
+            : resolveSpaceId(slug))) ||
+        undefined
       req.spaceId = space ?? ''
       // Hard 404 here for an unknown/archived slug is load-bearing: it stops routes
       // that bypass spaces.store() (rename, projects CRUD) from mutating a non-served

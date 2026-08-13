@@ -484,6 +484,52 @@ describe('serializeNoteFile — carried frontmatter', () => {
     expect(parseNoteFile(existingRaw, 't.md').body).toBe('old body')
   })
 
+  it('full-state replace restores an authored anchor graph and drops live-only metadata', () => {
+    const existingRaw = [
+      '---',
+      'title: Live',
+      'live-only: remove-me',
+      '---',
+      '',
+      '# Live',
+      '',
+      'live body',
+    ].join('\n')
+    const restored = carried(
+      ['---', 'anchorKey: &shared value', 'copy: *shared', '# exact comment', '---', ''].join('\n'),
+    )
+    const out = serializeNoteFile({
+      title: 'Historical',
+      id: 'note-restore-1',
+      frontmatter: restored,
+      frontmatterMode: 'replace',
+      body: 'historical body',
+      existingRaw,
+    })
+
+    expect(out).toContain('anchorKey: &shared value\ncopy: *shared\n# exact comment')
+    expect(out).not.toContain('live-only:')
+    expect(out).toContain('title: Historical')
+    expect(out).toContain('notarium-id: note-restore-1')
+  })
+
+  it('full-state replace keeps a leading frontmatter-like body block in the body', () => {
+    const body = ['---', 'body-key: body-value', '---', 'actual body'].join('\n')
+    const out = serializeNoteFile({
+      title: 'Historical',
+      id: 'note-restore-body',
+      frontmatter: carried('---\ncustom: kept\n---\n'),
+      frontmatterMode: 'replace',
+      body,
+      existingRaw: '---\ntitle: Live\n---\n\n# Live\n\nlive body',
+    })
+    const parsed = parseNoteFile(out, 'historical.md')
+
+    expect(parsed.body).toBe(body)
+    expect(parsed.frontmatter).toMatchObject({ custom: 'kept' })
+    expect(parsed.frontmatter).not.toHaveProperty('body-key')
+  })
+
   it('collapses every occupied duplicate when a key is set or cleared', () => {
     const existingRaw = [
       '---',

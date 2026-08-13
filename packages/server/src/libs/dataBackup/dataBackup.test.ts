@@ -38,6 +38,40 @@ const layoutFor = (dataDir: string): BackupLayout => ({
   jobsDir: join(dataDir, 'jobs'),
 })
 
+const replayKeyringFixture = async (
+  keyringDir: string,
+): Promise<{ keyId: string; hash: string }> => {
+  const secret = Buffer.alloc(32, 0x2a)
+  const keyId = `rk_${createHash('sha256')
+    .update('notarium-replay-key-id\0')
+    .update(secret)
+    .digest('hex')
+    .slice(0, 24)}`
+  const key = Buffer.from(
+    `${JSON.stringify({
+      format: 'notarium-replay-key',
+      formatVersion: 1,
+      keyId,
+      secret: secret.toString('base64url'),
+    })}\n`,
+  )
+  const hash = `sha256:${createHash('sha256').update(key).digest('hex')}`
+
+  await mkdir(join(keyringDir, 'keys'), { recursive: true })
+  await writeFile(join(keyringDir, 'keys', `${keyId}.json`), key)
+  await writeFile(
+    join(keyringDir, 'active.json'),
+    `${JSON.stringify({
+      format: 'notarium-replay-key-pointer',
+      formatVersion: 1,
+      generation: 1,
+      keyId,
+      keyHash: hash,
+    })}\n`,
+  )
+  return { keyId, hash }
+}
+
 const fixture = async (): Promise<{
   parent: string
   data: string
@@ -52,6 +86,9 @@ const fixture = async (): Promise<{
   await mkdir(join(data, 'jobs', 'imports'), { recursive: true })
   await mkdir(join(data, 'jobs', 'imports', 'main'), { recursive: true })
   await mkdir(join(data, 'spaces', 'main', 'draft.part'), { recursive: true })
+  await mkdir(join(data, 'spaces', 'main', '.notarium-fs-ops', 'strict-recovery'), {
+    recursive: true,
+  })
   await mkdir(
     join(data, 'spaces', 'main', 'notes', '.draft.install-550e8400-e29b-41d4-a716-446655440000'),
     { recursive: true },
@@ -98,6 +135,10 @@ const fixture = async (): Promise<{
   await writeFile(join(data, 'jobs', 'imports', 'main', 'upload.import.part'), 'incomplete upload')
   await writeFile(join(data, 'spaces', 'main', 'model.part'), 'legitimate note attachment')
   await writeFile(join(data, 'spaces', 'main', 'draft.part', 'kept.md'), '# Kept\n')
+  await writeFile(
+    join(data, 'spaces', 'main', '.notarium-fs-ops', 'strict-recovery', 'candidate'),
+    'restart-durable restore candidate',
+  )
   await writeFile(
     join(
       data,
@@ -211,6 +252,7 @@ describe('online data backup and restore', () => {
       expect.arrayContaining([
         'data/spaces/main/model.part',
         'data/spaces/main/draft.part/kept.md',
+        'data/spaces/main/.notarium-fs-ops/strict-recovery/candidate',
         'data/spaces/main/notes/.draft.install-550e8400-e29b-41d4-a716-446655440000/important.md',
         'data/spaces/main/.notarium/skills/.draft.install-authored/kept.bin',
         'data/spaces/main/.notarium/skills/ready/assets/.12345678-1234-1234-1234-123456789abc.tmp',
@@ -247,6 +289,12 @@ describe('online data backup and restore', () => {
       '# Kept\n',
     )
     expect(
+      await readFile(
+        join(restored, 'spaces', 'main', '.notarium-fs-ops', 'strict-recovery', 'candidate'),
+        'utf8',
+      ),
+    ).toBe('restart-durable restore candidate')
+    expect(
       Math.abs(
         Math.trunc((await stat(join(restored, 'spaces', 'main', 'note.md'))).mtimeMs) -
           Math.trunc((await stat(join(source.data, 'spaces', 'main', 'note.md'))).mtimeMs),
@@ -266,6 +314,86 @@ describe('online data backup and restore', () => {
       restoredDb.close()
       source.db.close()
     }
+  })
+
+  it('binds the SQLite snapshot and keyring to one stable installation generation', async () => {
+    const source = await fixture()
+    const keyringDir = join(source.data, 'replay-keyring')
+    const active = await replayKeyringFixture(keyringDir)
+    source.db.exec(`
+      CREATE TABLE installation_generation (
+        singleton INTEGER PRIMARY KEY,
+        generation INTEGER NOT NULL,
+        phase TEXT NOT NULL,
+        active_key_id TEXT,
+        active_hash TEXT,
+        candidate_key_id TEXT,
+        candidate_hash TEXT
+      )
+    `)
+    source.db
+      .prepare(
+        `INSERT INTO installation_generation
+          (singleton, generation, phase, active_key_id, active_hash,
+           candidate_key_id, candidate_hash)
+         VALUES (1, 1, 'active-installed', ?, ?, NULL, NULL)`,
+      )
+      .run(active.keyId, active.hash)
+    const bundle = {
+      generation: 1,
+      keyId: active.keyId,
+      activeHash: active.hash,
+      candidateKeyId: null,
+      candidateHash: null,
+    }
+    let renewals = 0
+    let releases = 0
+    const result = await createOnlineDataBackup({
+      layout: { ...layoutFor(source.data), keyringDir },
+      output: source.archive,
+      quietMs: 0,
+      checkpoint: async () => {},
+      generationCut: async () => ({
+        bundle,
+        renew: async () => {
+          renewals += 1
+        },
+        release: async () => {
+          releases += 1
+        },
+      }),
+    })
+
+    expect(result.manifest.installationGeneration).toEqual(bundle)
+    expect(result.manifest.files.map((file) => file.path)).toEqual(
+      expect.arrayContaining([
+        'data/replay-keyring/active.json',
+        `data/replay-keyring/keys/${active.keyId}.json`,
+      ]),
+    )
+    expect(renewals).toBeGreaterThanOrEqual(3)
+    expect(releases).toBe(1)
+    await expect(verifyDataBackup({ input: source.archive })).resolves.toMatchObject({
+      manifest: { installationGeneration: bundle },
+    })
+
+    const restored = join(source.parent, 'restored-generation')
+    await restoreDataBackup({ layout: layoutFor(restored), input: source.archive })
+    await expect(
+      readFile(join(restored, 'replay-keyring', 'active.json'), 'utf8'),
+    ).resolves.toContain(active.keyId)
+    const mismatched = join(source.parent, 'generation-mismatch.zip')
+    const zip = new AdmZip(source.archive)
+    const manifest = JSON.parse(zip.readAsText('manifest.json')) as {
+      installationGeneration: { activeHash: string }
+    }
+    manifest.installationGeneration.activeHash = `sha256:${'0'.repeat(64)}`
+    zip.updateFile('manifest.json', Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`))
+    zip.writeZip(mismatched)
+    await expect(verifyDataBackup({ input: mismatched })).rejects.toThrow(
+      /key does not match the generation bundle/,
+    )
+    source.db.close()
   })
 
   it('rejects a checksum-valid ZIP whose payload differs from the manifest', async () => {

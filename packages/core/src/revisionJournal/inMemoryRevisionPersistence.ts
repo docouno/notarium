@@ -14,13 +14,19 @@ import {
   type ActivityDayCount,
   type ActivityNoteCount,
   type AuthorFilter,
+  isRevisionRestorable,
   type Revision,
   REVISION_ENTRY_ROLE,
   REVISION_KIND,
+  REVISION_RESTORE_AVAILABILITY,
+  type RevisionBlob,
   revisionGapOf,
   type RevisionInput,
   type RevisionPersistence,
+  revisionRestoreAvailability,
+  type TrashAvailabilityFilter,
 } from '../knowledgeStore'
+import { RevisionHeadConflictError } from '../knowledgeStore/revisionHeadConflictError'
 
 /** The LOCAL calendar day of a UTC instant, shifted east by `tzOffsetMinutes`
  *  (the client's UTC offset, JS `-getTimezoneOffset()`), as YYYY-MM-DD. Shared
@@ -57,10 +63,11 @@ export const matchesAuthor = (principal: string | null, f: AuthorFilter): boolea
 
 export class InMemoryRevisionPersistence implements RevisionPersistence {
   private revisions: Revision[] = []
-  private blobs = new Map<string, string>()
+  private blobs = new Map<string, RevisionBlob>()
   /** Permanent note fences, keyed `space\u0000noteId` — scoped exactly like the
    *  purge itself, so one space's purge cannot silence a colliding id in another. */
   private purgedNotes = new Set<string>()
+  private purgePins = new Map<string, number>()
   /** Revision ids served as a gap. Ids come from one monotonic counter, so they
    *  are unique without a space key and are never reused after a purge. */
   private quarantined = new Set<string>()
@@ -96,16 +103,81 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
 
   async init(): Promise<void> {}
 
-  async append(rev: RevisionInput, content: string | null): Promise<Revision> {
+  protectFromPurge(space: string, noteIds: readonly string[]): void {
+    for (const noteId of new Set(noteIds)) {
+      const key = `${space}\u0000${noteId}`
+      this.purgePins.set(key, (this.purgePins.get(key) ?? 0) + 1)
+    }
+  }
+
+  releasePurgeProtection(space: string, noteIds: readonly string[]): void {
+    for (const noteId of new Set(noteIds)) {
+      const key = `${space}\u0000${noteId}`
+      const remaining = (this.purgePins.get(key) ?? 0) - 1
+
+      if (remaining > 0) {
+        this.purgePins.set(key, remaining)
+      } else {
+        this.purgePins.delete(key)
+      }
+    }
+  }
+
+  async append(rev: RevisionInput, content: RevisionBlob | null): Promise<Revision> {
+    return this.appendForRestoreTerminal(rev, content)
+  }
+
+  /** Synchronous aggregate seam used only by the in-memory restore terminal.
+   * Keeping the whole terminal transaction in one turn prevents another caller
+   * from observing or changing a half-applied journal/proof/operation state. */
+  appendForRestoreTerminal(rev: RevisionInput, content: RevisionBlob | null): Revision {
     if (this.purgedNotes.has(`${rev.space}\u0000${rev.noteId}`)) {
       throw new Error('revision target was permanently purged: note')
     }
-    if (rev.contentHash != null && content != null && !this.blobs.has(rev.contentHash)) {
-      this.blobs.set(rev.contentHash, content)
+    const head = this.latestTrusted(rev.space, rev.noteId)
+
+    if (
+      rev.expectedHeadRevisionId !== undefined &&
+      (head?.id ?? null) !== rev.expectedHeadRevisionId
+    ) {
+      throw new RevisionHeadConflictError(rev.noteId, rev.expectedHeadRevisionId, head?.id ?? null)
     }
-    const stored: Revision = { ...rev, tags: [...rev.tags], id: String(this.nextId++) }
+    if (
+      rev.expectedHeadRevisionId !== undefined &&
+      rev.baseRevisionId !== rev.expectedHeadRevisionId
+    ) {
+      throw new Error('revision base must equal the expected head')
+    }
+    const lifecycle = rev.kind === REVISION_KIND.delete ? 'deleted' : 'live'
+    const headLifecycle = head?.kind === REVISION_KIND.delete ? 'deleted' : 'live'
+
+    if (
+      rev.allowSemanticNoop === true &&
+      rev.semanticFingerprint != null &&
+      head?.semanticFingerprint === rev.semanticFingerprint &&
+      headLifecycle === lifecycle
+    ) {
+      return { ...head, tags: [...head.tags] }
+    }
+    if (rev.contentHash != null && content != null && !this.blobs.has(rev.contentHash)) {
+      this.blobs.set(
+        rev.contentHash,
+        typeof content === 'string' ? content : Uint8Array.from(content),
+      )
+    }
+    const storedInput = { ...rev }
+    delete storedInput.allowSemanticNoop
+    delete storedInput.expectedHeadRevisionId
+    const stored: Revision = {
+      ...storedInput,
+      semanticFingerprint: rev.semanticFingerprint ?? null,
+      stateFormat: rev.stateFormat ?? null,
+      restoreSafety: rev.restoreSafety ?? null,
+      tags: [...rev.tags],
+      id: String(this.nextId++),
+    }
     this.revisions.push(stored)
-    return stored
+    return { ...stored, tags: [...stored.tags] }
   }
 
   async listByNote(
@@ -156,15 +228,24 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
   }
 
   async get(space: string, revisionId: string): Promise<Revision | null> {
+    return this.getForRestoreTerminal(space, revisionId)
+  }
+
+  getForRestoreTerminal(space: string, revisionId: string): Revision | null {
     const row = this.revisions.find((r) => r.space === space && r.id === revisionId)
     return row ? this.serve(row) : null
   }
 
   async listTrashed(
     space: string,
-    { offset, limit, q }: { offset: number; limit: number; q?: string },
+    {
+      offset,
+      limit,
+      q,
+      availability,
+    }: { offset: number; limit: number; q?: string; availability?: TrashAvailabilityFilter },
     excludeClasses: readonly string[] = [],
-  ): Promise<{ items: Revision[]; total: number; restorableTotal: number }> {
+  ): Promise<{ items: Revision[]; total: number; restorableTotal: number; partialTotal: number }> {
     // Newest revision per note (excluded classes dropped BEFORE the collapse, so
     // a hidden class can't become "newest survivor" — mirrors the SQL drivers).
     const newestByNote = new Map<string, Revision>()
@@ -188,19 +269,52 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
     const tombstones = [...newestByNote.values()]
       .filter((r) => r.kind === REVISION_KIND.delete)
       .filter((r) => !needle || r.title.toLowerCase().includes(needle))
+      .filter(
+        (revision) =>
+          availability == null ||
+          (availability === 'restorable') === isRevisionRestorable(revision),
+      )
       .sort((a, b) => Number(b.id) - Number(a.id))
     return {
       items: tombstones.slice(offset, offset + limit),
       total: tombstones.length,
-      restorableTotal: tombstones.filter((r) => r.contentHash != null).length,
+      restorableTotal: tombstones.filter(isRevisionRestorable).length,
+      partialTotal: tombstones.filter(
+        (revision) =>
+          revisionRestoreAvailability(revision) === REVISION_RESTORE_AVAILABILITY.partial,
+      ).length,
     }
   }
 
-  async purgeNotes(space: string, noteIds: readonly string[]): Promise<void> {
-    const ids = new Set(noteIds)
+  async purgeNotes(
+    space: string,
+    noteIds: readonly string[],
+    expectedLatest?: ReadonlyMap<string, string>,
+  ): Promise<readonly string[]> {
+    const candidates = new Set(noteIds)
+
+    for (const noteId of candidates) {
+      if (this.purgePins.has(`${space}\u0000${noteId}`)) {
+        candidates.delete(noteId)
+      }
+    }
+
+    const ids = new Set(
+      expectedLatest
+        ? [...candidates].filter((noteId) => {
+            const expected = expectedLatest.get(noteId)
+
+            if (expected === undefined) {
+              return false
+            }
+
+            return this.latestTrusted(space, noteId)?.id === expected
+          })
+        : candidates,
+    )
 
     if (!ids.size) {
-      return
+      return []
     }
     for (const id of ids) {
       this.purgedNotes.add(`${space}\u0000${id}`)
@@ -219,6 +333,8 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
         this.blobs.delete(r.contentHash)
       }
     }
+
+    return [...ids]
   }
 
   async hasAnyFor(space: string, noteId: string): Promise<boolean> {
@@ -228,6 +344,48 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
   // The operational latest is the newest TRUSTED state: a gap has no payload to
   // resume from, so it is skipped rather than served as the head of the chain.
   async latestFor(space: string, noteId: string): Promise<Revision | null> {
+    return this.latestForRestoreTerminal(space, noteId)
+  }
+
+  latestForRestoreTerminal(space: string, noteId: string): Revision | null {
+    const revision = this.latestTrusted(space, noteId)
+    return revision ? { ...revision, tags: [...revision.tags] } : null
+  }
+
+  snapshotForRestoreTerminal() {
+    return {
+      revisions: this.revisions.map((revision) => ({ ...revision, tags: [...revision.tags] })),
+      blobs: new Map(
+        [...this.blobs].map(([hash, blob]) => [
+          hash,
+          blob instanceof Uint8Array ? Uint8Array.from(blob) : blob,
+        ]),
+      ),
+      purgedNotes: new Set(this.purgedNotes),
+      purgePins: new Map(this.purgePins),
+      quarantined: new Set(this.quarantined),
+      nextId: this.nextId,
+    }
+  }
+
+  restoreForRestoreTerminal(snapshot: ReturnType<this['snapshotForRestoreTerminal']>): void {
+    this.revisions = snapshot.revisions.map((revision) => ({
+      ...revision,
+      tags: [...revision.tags],
+    }))
+    this.blobs = new Map(
+      [...snapshot.blobs].map(([hash, blob]) => [
+        hash,
+        blob instanceof Uint8Array ? Uint8Array.from(blob) : blob,
+      ]),
+    )
+    this.purgedNotes = new Set(snapshot.purgedNotes)
+    this.purgePins = new Map(snapshot.purgePins)
+    this.quarantined = new Set(snapshot.quarantined)
+    this.nextId = snapshot.nextId
+  }
+
+  private latestTrusted(space: string, noteId: string): Revision | null {
     for (let i = this.revisions.length - 1; i >= 0; i--) {
       const revision = this.revisions[i]
 
@@ -243,7 +401,7 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
     const wanted = new Set(noteIds)
     const out = new Map<string, Revision>()
 
-    for (let i = this.revisions.length - 1; i >= 0 && out.size < wanted.size; i--) {
+    for (let i = this.revisions.length - 1; i >= 0; i--) {
       const revision = this.revisions[i]
 
       if (
@@ -252,7 +410,7 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
         !out.has(revision.noteId) &&
         !this.isGap(revision)
       ) {
-        out.set(revision.noteId, revision)
+        out.set(revision.noteId, { ...revision, tags: [...revision.tags] })
       }
     }
 
@@ -436,8 +594,9 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
     return map
   }
 
-  async content(contentHash: string): Promise<string | null> {
-    return this.blobs.get(contentHash) ?? null
+  async content(contentHash: string): Promise<RevisionBlob | null> {
+    const blob = this.blobs.get(contentHash)
+    return blob instanceof Uint8Array ? Uint8Array.from(blob) : (blob ?? null)
   }
 
   async close(): Promise<void> {}
@@ -458,6 +617,7 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
     this.blobs.clear()
     this.purgedNotes.clear()
     this.quarantined.clear()
+    this.purgePins.clear()
     this.nextId = 1
   }
 }

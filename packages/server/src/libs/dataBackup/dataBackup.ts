@@ -29,7 +29,7 @@ import { Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { type Entry, openPromise, type ZipFile } from 'yauzl'
 
-import { isAtomicInstallTempPath } from '@notarium/core'
+import { type BackupGenerationBundle, isAtomicInstallTempPath } from '@notarium/core'
 import { buildInfo } from '../buildInfo'
 import { publishArchive } from './archivePublication'
 
@@ -37,6 +37,7 @@ const FORMAT = 'notarium-backup'
 const FORMAT_VERSION = 1
 const DATA = 'data'
 const META_DB = `${DATA}/meta.db`
+const REPLAY_KEYRING = `${DATA}/replay-keyring`
 const MANIFEST = 'manifest.json'
 const ATOMIC_NOTE_TEMP = /^\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/i
 const IMPORT_PART = /^imports\/[^/]+\/[^/]+\.import\.part$/
@@ -66,6 +67,9 @@ export type BackupLayout = {
   metaDbPath: string
   spacesDir: string
   jobsDir: string
+  /** Present for generation-consistent backups. Optional keeps the reusable
+   *  library able to verify and restore pre-keyring archives. */
+  keyringDir?: string
 }
 
 export type BackupFile = {
@@ -84,6 +88,13 @@ export type BackupManifest = {
   files: BackupFile[]
   directories: string[]
   omitted: string[]
+  installationGeneration?: BackupGenerationBundle
+}
+
+export type BackupGenerationLease = {
+  bundle: BackupGenerationBundle
+  renew(): Promise<unknown>
+  release(): Promise<void>
 }
 
 export type CreateBackupOptions = {
@@ -93,6 +104,8 @@ export type CreateBackupOptions = {
   maxAttempts?: number
   /** Briefly fences live mutations and drains the server's write-behind state. */
   checkpoint: () => Promise<void>
+  /** Holds the registry/keyring generation while one immutable stage is built. */
+  generationCut?: () => Promise<BackupGenerationLease>
   scratchDir?: string
   maxArchiveBytes?: number
   maxArchiveEntries?: number
@@ -153,6 +166,21 @@ type ResourceBudget = ResourceLimits & {
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((done) => setTimeout(done, ms))
+
+const generationLeaseGuard = (lease: BackupGenerationLease) => {
+  let released = false
+
+  return {
+    assert: (): Promise<unknown> => lease.renew(),
+    release: async (): Promise<void> => {
+      if (released) {
+        return
+      }
+      released = true
+      await lease.release()
+    },
+  }
+}
 
 const under = (path: string, root: string): boolean => path === root || path.startsWith(root + sep)
 
@@ -467,9 +495,13 @@ const snapshotSource = async (
   const budget = resourceBudget(limits)
   reserveEntry(budget, `${DATA}/jobs`)
   reserveEntry(budget, `${DATA}/spaces`)
-  const [spacesResult, jobsResult] = await Promise.allSettled([
+  if (layout.keyringDir) {
+    reserveEntry(budget, REPLAY_KEYRING)
+  }
+  const [spacesResult, jobsResult, keyringResult] = await Promise.allSettled([
     walk(layout.spacesDir, `${DATA}/spaces`, budget),
     walk(layout.jobsDir, `${DATA}/jobs`, budget),
+    ...(layout.keyringDir ? [walk(layout.keyringDir, REPLAY_KEYRING, budget)] : []),
   ])
 
   if (spacesResult.status === 'rejected') {
@@ -478,16 +510,24 @@ const snapshotSource = async (
   if (jobsResult.status === 'rejected') {
     throw jobsResult.reason
   }
+  if (keyringResult?.status === 'rejected') {
+    throw keyringResult.reason
+  }
   const spaces = spacesResult.value
   const jobs = jobsResult.value
+  const keyring = keyringResult?.status === 'fulfilled' ? keyringResult.value : undefined
 
   return {
-    files: [...spaces.files, ...jobs.files].sort((a, b) => a.path.localeCompare(b.path)),
+    files: [...spaces.files, ...jobs.files, ...(keyring?.files ?? [])].sort((a, b) =>
+      a.path.localeCompare(b.path),
+    ),
     directories: [
       `${DATA}/jobs`,
       `${DATA}/spaces`,
+      ...(keyring ? [REPLAY_KEYRING] : []),
       ...spaces.directories,
       ...jobs.directories,
+      ...(keyring?.directories ?? []),
     ].sort(),
   }
 }
@@ -500,14 +540,21 @@ const copySource = async (
   await Promise.all([
     mkdir(join(stageData, 'spaces'), { recursive: true }),
     mkdir(join(stageData, 'jobs'), { recursive: true }),
+    ...(layout.keyringDir ? [mkdir(join(stageData, 'replay-keyring'), { recursive: true })] : []),
   ])
   reserveEntry(budget, `${DATA}/jobs`)
   reserveEntry(budget, `${DATA}/spaces`)
+  if (layout.keyringDir) {
+    reserveEntry(budget, REPLAY_KEYRING)
+  }
   // Await BOTH walkers even when one fails. Promise.all would reject early while
   // the sibling still writes into the stage, racing the attempt's cleanup.
-  const [spacesResult, jobsResult] = await Promise.allSettled([
+  const [spacesResult, jobsResult, keyringResult] = await Promise.allSettled([
     walk(layout.spacesDir, `${DATA}/spaces`, budget, join(stageData, 'spaces')),
     walk(layout.jobsDir, `${DATA}/jobs`, budget, join(stageData, 'jobs')),
+    ...(layout.keyringDir
+      ? [walk(layout.keyringDir, REPLAY_KEYRING, budget, join(stageData, 'replay-keyring'))]
+      : []),
   ])
 
   if (spacesResult.status === 'rejected') {
@@ -516,16 +563,24 @@ const copySource = async (
   if (jobsResult.status === 'rejected') {
     throw jobsResult.reason
   }
+  if (keyringResult?.status === 'rejected') {
+    throw keyringResult.reason
+  }
   const spaces = spacesResult.value
   const jobs = jobsResult.value
+  const keyring = keyringResult?.status === 'fulfilled' ? keyringResult.value : undefined
 
   return {
-    files: [...spaces.files, ...jobs.files].sort((a, b) => a.path.localeCompare(b.path)),
+    files: [...spaces.files, ...jobs.files, ...(keyring?.files ?? [])].sort((a, b) =>
+      a.path.localeCompare(b.path),
+    ),
     directories: [
       `${DATA}/jobs`,
       `${DATA}/spaces`,
+      ...(keyring ? [REPLAY_KEYRING] : []),
       ...spaces.directories,
       ...jobs.directories,
+      ...(keyring?.directories ?? []),
     ].sort(),
   }
 }
@@ -609,6 +664,7 @@ export const createOnlineDataBackup = async ({
   quietMs = 750,
   maxAttempts = 12,
   checkpoint,
+  generationCut,
   scratchDir,
   maxArchiveBytes,
   maxArchiveEntries,
@@ -622,6 +678,9 @@ export const createOnlineDataBackup = async ({
     maxAttempts < 1
   ) {
     throw new Error('quietMs must be >= 0 and maxAttempts must be >= 1')
+  }
+  if (Boolean(layout.keyringDir) !== Boolean(generationCut)) {
+    throw new Error('generation-consistent backup requires both keyringDir and generationCut')
   }
   const absoluteOutput = resolve(output)
   const dataInfo = await lstat(layout.dataDir)
@@ -650,12 +709,16 @@ export const createOnlineDataBackup = async ({
       const stage = join(work, `attempt-${attempt}`)
       const stageData = join(stage, DATA)
       const budget = resourceBudget(limits)
+      const lease = await generationCut?.()
+      const leaseGuard = lease ? generationLeaseGuard(lease) : undefined
 
       try {
+        await leaseGuard?.assert()
         await checkpoint()
         await mkdir(stageData, { recursive: true })
         const copied = await copySource(layout, stageData, budget)
         await sleep(quietMs)
+        await leaseGuard?.assert()
         const before = await snapshotSource(layout, limits)
         const versionBefore = dataVersion(sourceDb)
 
@@ -694,6 +757,7 @@ export const createOnlineDataBackup = async ({
           await rm(stage, { recursive: true, force: true })
           continue
         }
+        await leaseGuard?.assert()
 
         const dbStat = await stat(stagedDb)
 
@@ -716,6 +780,7 @@ export const createOnlineDataBackup = async ({
           ].sort((a, b) => a.path.localeCompare(b.path)),
           directories: copied.directories,
           omitted: [`${DATA}/engine`],
+          ...(lease ? { installationGeneration: lease.bundle } : {}),
         }
         const serializedManifest = JSON.stringify(manifest, null, 2) + '\n'
         const manifestBytes = Buffer.byteLength(serializedManifest)
@@ -724,6 +789,10 @@ export const createOnlineDataBackup = async ({
           throw new Error('backup manifest exceeds configured metadata limits')
         }
         reserveEntry(budget, MANIFEST, manifestBytes)
+        // The immutable stage now contains both sides of the witnessed cut. No
+        // generation lease is needed while CPU-only ZIP publication proceeds.
+        await leaseGuard?.assert()
+        await leaseGuard?.release()
         const bytes = await writeArchive(stage, absoluteOutput, manifest, serializedManifest, {
           scratchDir,
           ...limits,
@@ -736,6 +805,8 @@ export const createOnlineDataBackup = async ({
           continue
         }
         throw err
+      } finally {
+        await leaseGuard?.release().catch(() => {})
       }
     }
   } finally {
@@ -867,6 +938,21 @@ const parseManifest = async (stage: string, limits: ResourceLimits): Promise<Bac
   ) {
     throw new Error('unsupported or malformed Notarium backup manifest')
   }
+  const generation = value.installationGeneration
+
+  if (
+    generation !== undefined &&
+    (!Number.isSafeInteger(generation.generation) ||
+      generation.generation < 1 ||
+      typeof generation.keyId !== 'string' ||
+      !/^rk_[0-9a-f]{24}$/.test(generation.keyId) ||
+      typeof generation.activeHash !== 'string' ||
+      !/^sha256:[a-f0-9]{64}$/.test(generation.activeHash) ||
+      generation.candidateKeyId !== null ||
+      generation.candidateHash !== null)
+  ) {
+    throw new Error('backup contains a malformed or unstable installation generation')
+  }
   const seen = new Set<string>()
 
   for (const file of value.files) {
@@ -876,7 +962,8 @@ const parseManifest = async (stage: string, limits: ResourceLimits): Promise<Bac
       !validArchivePath(file.path) ||
       (file.path !== META_DB &&
         !file.path.startsWith(`${DATA}/spaces/`) &&
-        !file.path.startsWith(`${DATA}/jobs/`)) ||
+        !file.path.startsWith(`${DATA}/jobs/`) &&
+        !file.path.startsWith(`${REPLAY_KEYRING}/`)) ||
       typeof file.size !== 'number' ||
       !Number.isSafeInteger(file.size) ||
       file.size < 0 ||
@@ -899,8 +986,10 @@ const parseManifest = async (stage: string, limits: ResourceLimits): Promise<Bac
       !validArchivePath(directory) ||
       (directory !== `${DATA}/spaces` &&
         directory !== `${DATA}/jobs` &&
+        directory !== REPLAY_KEYRING &&
         !directory.startsWith(`${DATA}/spaces/`) &&
-        !directory.startsWith(`${DATA}/jobs/`)) ||
+        !directory.startsWith(`${DATA}/jobs/`) &&
+        !directory.startsWith(`${REPLAY_KEYRING}/`)) ||
       seen.has(directory) ||
       seenDirectories.has(directory)
     ) {
@@ -913,6 +1002,12 @@ const parseManifest = async (stage: string, limits: ResourceLimits): Promise<Bac
   }
   if (!seenDirectories.has(`${DATA}/spaces`) || !seenDirectories.has(`${DATA}/jobs`)) {
     throw new Error('backup does not contain the canonical data directories')
+  }
+  if (generation && !seenDirectories.has(REPLAY_KEYRING)) {
+    throw new Error('generation-consistent backup does not contain the replay keyring')
+  }
+  if (!generation && seenDirectories.has(REPLAY_KEYRING)) {
+    throw new Error('backup contains a replay keyring without a generation bundle')
   }
 
   return value as BackupManifest
@@ -952,6 +1047,102 @@ const verifyExtracted = async (
     )
   }
   assertIntegrity(join(stage, META_DB))
+  const generation = manifest.installationGeneration
+
+  if (generation) {
+    const keyPath = `${REPLAY_KEYRING}/keys/${generation.keyId}.json`
+    const key = manifest.files.find((file) => file.path === keyPath)
+
+    if (!key || `sha256:${key.sha256}` !== generation.activeHash) {
+      throw new Error('backup replay key does not match the generation bundle')
+    }
+    let keyPayload: { format?: unknown; formatVersion?: unknown; keyId?: unknown; secret?: unknown }
+
+    try {
+      keyPayload = JSON.parse(await readFile(join(stage, keyPath), 'utf8')) as typeof keyPayload
+    } catch {
+      throw new Error('backup active replay key is corrupt')
+    }
+    const secret =
+      typeof keyPayload.secret === 'string' ? Buffer.from(keyPayload.secret, 'base64url') : null
+    const derivedKeyId = secret
+      ? `rk_${createHash('sha256')
+          .update('notarium-replay-key-id\0')
+          .update(secret)
+          .digest('hex')
+          .slice(0, 24)}`
+      : null
+
+    if (
+      keyPayload.format !== 'notarium-replay-key' ||
+      keyPayload.formatVersion !== 1 ||
+      keyPayload.keyId !== generation.keyId ||
+      !secret ||
+      secret.length !== 32 ||
+      secret.toString('base64url') !== keyPayload.secret ||
+      derivedKeyId !== generation.keyId
+    ) {
+      throw new Error('backup active replay key is invalid')
+    }
+    const pointerPath = join(stage, REPLAY_KEYRING, 'active.json')
+    let pointer: {
+      format?: unknown
+      formatVersion?: unknown
+      generation?: unknown
+      keyId?: unknown
+      keyHash?: unknown
+    }
+
+    try {
+      pointer = JSON.parse(await readFile(pointerPath, 'utf8')) as typeof pointer
+    } catch {
+      throw new Error('backup active replay-key pointer is missing or corrupt')
+    }
+    if (
+      pointer.format !== 'notarium-replay-key-pointer' ||
+      pointer.formatVersion !== 1 ||
+      pointer.generation !== generation.generation ||
+      pointer.keyId !== generation.keyId ||
+      pointer.keyHash !== generation.activeHash
+    ) {
+      throw new Error('backup active replay-key pointer does not match the generation bundle')
+    }
+    const db = new DatabaseSync(join(stage, META_DB), { readOnly: true })
+
+    try {
+      const row = db
+        .prepare(
+          `SELECT generation, phase, active_key_id, active_hash,
+                  candidate_key_id, candidate_hash
+             FROM installation_generation
+            WHERE singleton = 1`,
+        )
+        .get() as
+        | {
+            generation: number
+            phase: string
+            active_key_id: string
+            active_hash: string
+            candidate_key_id: string | null
+            candidate_hash: string | null
+          }
+        | undefined
+
+      if (
+        !row ||
+        Number(row.generation) !== generation.generation ||
+        row.phase !== 'active-installed' ||
+        row.active_key_id !== generation.keyId ||
+        row.active_hash !== generation.activeHash ||
+        row.candidate_key_id !== null ||
+        row.candidate_hash !== null
+      ) {
+        throw new Error('backup meta-DB does not match the installation generation bundle')
+      }
+    } finally {
+      db.close()
+    }
+  }
 }
 
 /** Validate an archive without reading or mutating the configured data root. */
@@ -1058,11 +1249,17 @@ export const restoreDataBackup = async ({
     await verifyExtracted(stage, manifest, limits)
 
     const stagedData = join(stage, DATA)
+    const installNames = [
+      'meta.db',
+      'spaces',
+      'jobs',
+      ...(manifest.installationGeneration ? ['replay-keyring'] : []),
+    ]
 
-    for (const name of ['meta.db', 'spaces', 'jobs']) {
+    for (const name of installNames) {
       await installNoClobber(join(stagedData, name), join(layout.dataDir, name), installed)
     }
-    for (const name of ['meta.db', 'spaces', 'jobs']) {
+    for (const name of installNames) {
       await syncTree(join(layout.dataDir, name))
     }
     await syncDirectory(layout.dataDir)

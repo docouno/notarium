@@ -663,6 +663,47 @@ describe('CachedStore + bare engine — identity (#51)', () => {
       expect(files.get('note.md')).toContain(NOTE_ID_FRONTMATTER_KEY)
       expect(res.versionToken).toBe((await store.read(res.id!)).versionToken)
     })
+
+    it('fails instead of returning a fabricated token when the post-write exact read fails', async () => {
+      const { store, engine, files } = await make(new Map())
+      const created = await store.write({ title: 'Note', content: 'first body' })
+      const current = await store.read(created.id!)
+      const write = engine.write.bind(engine)
+      const read = engine.read.bind(engine)
+      let failReadBack = false
+
+      engine.write = async (input) => {
+        const result = await write(input)
+        failReadBack = true
+        return result
+      }
+      engine.read = async (id, opts) => {
+        if (failReadBack) {
+          failReadBack = false
+          throw new Error('injected read-back failure')
+        }
+
+        return read(id, opts)
+      }
+
+      await expect(
+        store.write({
+          title: 'Note',
+          content: 'physically stored body',
+          originalId: created.id!,
+          versionToken: current.versionToken,
+        }),
+      ).rejects.toThrow('post-write exact read failed')
+      await store.settle()
+
+      expect(files.get('note.md')).toContain('physically stored body')
+      expect((await store.revisions(created.id!, { offset: 0, limit: 10 })).items[0]).toMatchObject(
+        {
+          contentHash: null,
+          stateFormat: null,
+        },
+      )
+    })
   })
 
   it('an external move (delta remove+add, claim in the new file) resurrects the tombstoned id', async () => {
@@ -748,7 +789,7 @@ describe('CachedStore + bare engine — identity (#51)', () => {
       const page = await store.revisions(durableId, { offset: 0, limit: 10 })
 
       expect(page.items.map((revision) => revision.kind)).toEqual(['external'])
-      expect((await store.revision(durableId, page.items[0].id))?.content).toBe('# a\n\nbody')
+      expect((await store.revision(durableId, page.items[0].id))?.content).toBe('body')
       expect((await store.listTrashed({ offset: 0, limit: 10 })).total).toBe(0)
       expect(
         events
@@ -1775,7 +1816,7 @@ describe('CachedStore + bare engine — identity (#51)', () => {
     await expect(store.read(durableId)).rejects.toMatchObject({ reason: 'note_not_found' })
     await expect(store.read(durableId, { deletedView: true })).resolves.toMatchObject({
       id: durableId,
-      content: '# old\n\nold body',
+      content: 'old body',
     })
     expect(await store.list()).toEqual([])
   })

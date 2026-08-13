@@ -112,12 +112,16 @@ export type NoteDetailView = {
   versionToken: string
   /** Trash state (#79): set when this id resolved to a DELETED note (its last
    *  state, read-only) — the reader shows a "deleted" banner instead of 404.
-   *  `deletedBy` is the resolved, privacy-filtered author (null = external);
-   *  `restorable` is false for an honest gap. Absent on a live note. */
+   *  `deletedBy` is the resolved, privacy-filtered author (null = external).
+   *  `restorable` controls historical preview availability;
+   *  restoreAvailability controls publication. Absent on a live note. */
   deleted?: boolean
   deletedAt?: string
   deletedBy?: Author | null
   restorable?: boolean
+  restoreAvailability?: WireNoteDetail['restoreAvailability']
+  /** Literal opaque deleted source; never Markdown-rendered. */
+  source?: WireNoteDetail['source']
 }
 
 export const noteDetailView = (d: WireNoteDetail): NoteDetailView => ({
@@ -137,6 +141,8 @@ export const noteDetailView = (d: WireNoteDetail): NoteDetailView => ({
   deletedAt: d.deletedAt,
   deletedBy: d.deletedBy,
   restorable: d.restorable,
+  restoreAvailability: d.restoreAvailability,
+  source: d.source,
 })
 
 export type NotesPageView = { notes: NoteView[]; total: number }

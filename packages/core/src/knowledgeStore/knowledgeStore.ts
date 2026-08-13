@@ -2,7 +2,13 @@
 // via the host's thin transport mappers (docs/contract.md#mappers).
 // canon: docs/architecture.md#p8
 
-import type { FrontmatterEntry } from '../libs/markdown'
+import type {
+  DocumentState,
+  DocumentStateFormat,
+  FrontmatterEntry,
+  LogicalNoteState,
+  RestoreSafety,
+} from '../libs/markdown'
 import {
   type BucketGran,
   type DateField,
@@ -44,12 +50,21 @@ export type Revision = {
   /** Agent-audit attribution captured with the write. Absent on legacy/human revisions so the
    *  existing revision wire shape stays backwards-compatible. */
   agent?: AgentWriteAttribution | null
-  /** sha-256 of the content blob; null = body honestly unknown (external gap / lost delete state). */
+  /** sha-256 of the stored state blob; null = state honestly unknown (external gap / lost delete state). */
   contentHash: string | null
+  /** Versioned semantic identity of the complete state. It includes authored,
+   * safety, role/format and provenance-shape semantics while excluding proven
+   * runtime owner values and receipt lineage. null marks legacy/gap rows. */
+  semanticFingerprint: string | null
+  /** `markdown-v1` means the blob is a complete logical note snapshot. null is a
+   * legacy compatibility body-only row. This is per revision, not a deployment flag. */
+  stateFormat: LogicalNoteState['format'] | DocumentStateFormat | null
+  /** Persisted eligibility projection for exact document rows. Legacy/gap rows
+   * remain null and are classified from their format/content marker. */
+  restoreSafety: RestoreSafety['status'] | null
   title: string
-  /** The custom display slug at this revision, or null (the implicit slug(title)). A journal
-   *  column because the body blob is frontmatter-stripped — restore reads it back so a
-   *  rolled-back note keeps its slug instead of re-ghosting inbound links. */
+  /** Query projection of the custom display slug at this revision, or null for
+   * the implicit slug(title). Current snapshots also contain its raw authored form. */
   slug: string | null
   /** The note's class at append time, so the delta can be class-scoped (a hidden class never
    *  surfaces). Plain string (the journal stores a label); null = unknown. */
@@ -69,10 +84,62 @@ export type Revision = {
   unavailableReason?: RevisionUnavailableReason
 }
 
-export type RevisionDetail = Revision & {
-  /** The full body; null mirrors contentHash. */
-  content: string | null
+export const REVISION_RESTORE_AVAILABILITY = {
+  full: 'full',
+  partial: 'partial',
+  opaque: 'opaque',
+  gap: 'gap',
+  blocked: 'blocked',
+  unknown: 'unknown',
+} as const
+
+export type RevisionRestoreAvailability =
+  (typeof REVISION_RESTORE_AVAILABILITY)[keyof typeof REVISION_RESTORE_AVAILABILITY]
+
+export type TrashAvailabilityFilter = 'restorable' | 'unavailable'
+
+export const revisionRestoreAvailability = (
+  revision: Pick<Revision, 'contentHash' | 'restoreSafety' | 'stateFormat'>,
+): RevisionRestoreAvailability => {
+  if (revision.contentHash == null) {
+    return REVISION_RESTORE_AVAILABILITY.gap
+  }
+  if (revision.stateFormat === 'opaque-v1') {
+    return REVISION_RESTORE_AVAILABILITY.opaque
+  }
+  if (revision.stateFormat === 'markdown-v2' || revision.stateFormat === 'skill-markdown-v1') {
+    return revision.restoreSafety === 'safe'
+      ? REVISION_RESTORE_AVAILABILITY.full
+      : revision.restoreSafety === 'blocked'
+        ? REVISION_RESTORE_AVAILABILITY.blocked
+        : REVISION_RESTORE_AVAILABILITY.unknown
+  }
+
+  return REVISION_RESTORE_AVAILABILITY.partial
 }
+
+export const isRevisionRestorable = (
+  revision: Pick<Revision, 'contentHash' | 'restoreSafety' | 'stateFormat'>,
+): boolean => {
+  const availability = revisionRestoreAvailability(revision)
+
+  return (
+    availability === REVISION_RESTORE_AVAILABILITY.full ||
+    availability === REVISION_RESTORE_AVAILABILITY.partial
+  )
+}
+
+export type RevisionDetail = Revision & {
+  /** The normalized body projection; null mirrors contentHash. */
+  content: string | null
+  /** Complete state for new rows. null is the explicit legacy-partial marker. */
+  logicalState: LogicalNoteState | null
+  /** Exact byte-safe state for current full rows. Kept beside logicalState while markdown-v1
+   * remains a readable compatibility format. */
+  documentState: DocumentState | null
+}
+
+export type RevisionBlob = string | Uint8Array
 
 /** One day of the activity heatmap. `date` is the LOCAL YYYY-MM-DD (shifted east by the query
  *  tz); `created` = a note's first appearance through us, `deleted` = a tombstone, `edited` =
@@ -104,7 +171,22 @@ export type AuthorFilter = {
   prefixes: readonly string[]
 }
 
-export type RevisionInput = Omit<Revision, 'id'>
+export type RevisionInput = Omit<
+  Revision,
+  'id' | 'restoreSafety' | 'semanticFingerprint' | 'stateFormat'
+> & {
+  /** Optional on the persistence input so old/fixture writers naturally create
+   * explicit legacy rows; every driver normalizes omission to null on output. */
+  stateFormat?: Revision['stateFormat']
+  semanticFingerprint?: string | null
+  restoreSafety?: Revision['restoreSafety']
+  /** When present (including null), append is a head CAS. Omission is retained
+   * only for legacy/admin writers; production journal paths always provide it. */
+  expectedHeadRevisionId?: string | null
+  /** Return the existing head instead of appending when fingerprint+lifecycle
+   * are equal. Required causal events (restore) deliberately leave this false. */
+  allowSemanticNoop?: boolean
+}
 
 /** Serve a contaminated row as a GAP. What survives is exactly what stays true
  *  when a note's identity is in doubt: the revision's place in the stream (its
@@ -127,6 +209,9 @@ export const revisionGapOf = (row: Revision): Revision => ({
   principal: null,
   agent: null,
   contentHash: null,
+  semanticFingerprint: null,
+  stateFormat: null,
+  restoreSafety: null,
   title: REVISION_UNAVAILABLE_TITLE,
   class: null,
   slug: null,
@@ -141,7 +226,7 @@ export const revisionGapOf = (row: Revision): Revision => ({
 export type RevisionPersistence = {
   init(): Promise<void>
   /** Append one revision, storing `content` content-addressed by contentHash. Returns it with its id. */
-  append(rev: RevisionInput, content: string | null): Promise<Revision>
+  append(rev: RevisionInput, content: RevisionBlob | null): Promise<Revision>
   /** A note's timeline window, newest first, with the total before slicing. Note-addressed reads
    *  are SPACE-scoped: note ids are globally unique, but the journal is shared across spaces and a
    *  contaminated legacy chain must never be readable through a sibling space (#327). */
@@ -164,15 +249,21 @@ export type RevisionPersistence = {
   get(space: string, revisionId: string): Promise<Revision | null>
   /** The trash view: notes whose NEWEST revision is a delete-tombstone, newest-deleted first,
    *  windowed. Each item IS the tombstone (createdAt = deletion time, principal = who deleted,
-   *  contentHash = the body to resurrect). */
+   *  contentHash = the logical-state blob to resurrect). */
   listTrashed(
     space: string,
-    opts: { offset: number; limit: number; q?: string },
+    opts: { offset: number; limit: number; q?: string; availability?: TrashAvailabilityFilter },
     excludeClasses?: readonly string[],
-  ): Promise<{ items: Revision[]; total: number; restorableTotal: number }>
+  ): Promise<{ items: Revision[]; total: number; restorableTotal: number; partialTotal: number }>
   /** Permanently erase this space's notes: drop EVERY revision of each id in it, then GC blobs no
-   *  surviving revision references (the CAS is shared). */
-  purgeNotes(space: string, noteIds: readonly string[]): Promise<void>
+   *  surviving revision references (the CAS is shared). When `expectedLatest` is supplied, the
+   *  latest-row compare and purge happen under the driver's append/purge lock; stale candidates
+   *  are skipped. Returns the ids actually fenced and erased. */
+  purgeNotes(
+    space: string,
+    noteIds: readonly string[],
+    expectedLatest?: ReadonlyMap<string, string>,
+  ): Promise<readonly string[]>
   /** Whether the note has ANY journaled row, trusted or quarantined — the existence question the
    *  write path asks before capturing a pre-edit baseline, and the one it stamps `entryRole`
    *  from. A note whose only history is a gap has a history; capturing a fresh "baseline" over it
@@ -225,7 +316,7 @@ export type RevisionPersistence = {
    *  channel existed (their former titles live only in the journal). The caller filters out the
    *  current title. */
   historicalNames(space: string): Promise<Map<string, string[]>>
-  content(contentHash: string): Promise<string | null>
+  content(contentHash: string): Promise<RevisionBlob | null>
   close(): Promise<void>
 }
 
@@ -233,6 +324,9 @@ export type RevisionPersistence = {
  *  files (the meta-DB's first tenant). canon: docs/architecture.md#p7 */
 export type IdentityRecord = {
   id: string
+  /** DB-owned monotonic revision of the live/tombstoned address binding.
+   * Optional on write inputs and normalized by persistent drivers on reads. */
+  addressRevision?: number
   /** Engine-relative storage path (`dir/note.md`) the id currently binds to. */
   filePath: string
   /** The note's space (an immutable slug). Ids are globally unique, so this row is what maps
@@ -416,6 +510,13 @@ export type NoteContent = {
   filePath?: string
   content: string
   frontmatter: Record<string, unknown>
+  /** Exact logical Markdown state used internally by CAS/history. Optional only
+   * for compatibility with capability-thin third-party/test stores; repository
+   * engines always provide it. Ordinary transport mappers do not expose it. */
+  logicalState?: LogicalNoteState
+  /** Exact physical source plus analyzed authored/provenance state. Repository engines provide it;
+   * compatibility adapters may still expose only logicalState during migration. */
+  documentState?: DocumentState
   /** Same data as NoteMeta.slug; the editor reads it to prefill the slug field. */
   slug?: string
   /** Same data as NoteMeta.aliases, served so a client can round-trip them. */
@@ -426,11 +527,14 @@ export type NoteContent = {
   createdAt?: string | null
   versionToken?: string
   /** Trash state: set when read() resolved a DELETED note and served its last journaled state
-   *  instead of not-found. `restorable` is false for an honest gap. Absent on a live note. */
+   *  instead of not-found. `restorable` means historical content is available
+   *  for inspection; restoreAvailability is the stricter publication predicate.
+   *  Both are absent on a live note. */
   deleted?: boolean
   deletedAt?: string
   deletedByPrincipal?: string | null
   restorable?: boolean
+  restoreAvailability?: RevisionRestoreAvailability
 }
 
 /** The live note riding a version conflict: the CAS arbiter always knows the id and fresh token. */
@@ -570,6 +674,21 @@ export type WriteInput = {
    *  `notarium-id` claim, so this cannot smuggle in an identity.
    *  canon: docs/import.md#drag-and-drop-of-text-files-223 */
   frontmatter?: readonly FrontmatterEntry[]
+  /** Host-internal full-state restore mode. `replace` makes the supplied raw
+   * frontmatter the complete authored set instead of merging it into the live
+   * file. Ordinary writes/imports omit it and retain merge semantics. */
+  frontmatterMode?: 'replace'
+  /** Host-internal restore intent: keep the live storage path even when the
+   * restored title differs. A deleted note has no live path and ignores it. */
+  preservePath?: boolean
+  /** Host-internal legacy-restore intent: the historical row never captured
+   * authored aliases, so a title rollback must not synthesize over the live
+   * raw `aliases:` entry. Complete snapshots use replace semantics instead. */
+  preserveAliases?: boolean
+  /** Host-internal trash-restore destination. Unlike `directory` + `fileName`,
+   * this is the complete space-relative tombstone path, so a deleted imported
+   * basename and a prefixed class mount are restored exactly once. */
+  restorePath?: string
   /** Journal attribution: 'pat:<user>:<id>' (agent), 'user:<name>' (human), 'ui' (mode none). */
   principal?: string
   /** Host-built agent audit channel. It never crosses the note write wire: the owner
@@ -611,7 +730,12 @@ export type WriteResult = {
   versionToken?: string
   /** Raw engine response — host-side diagnostics only; never crosses the wire. */
   result?: unknown
+  /** Adapter-opaque proof of the exact physical incarnation published by this
+   * write. Conditional compensation must match it, not a semantic CAS token. */
+  physicalWriteClaim?: PhysicalWriteClaim
 }
+
+export type PhysicalWriteClaim = { kind: string; value: string }
 
 export type MoveInput = {
   /** A note-id, or — with isDirectory — the folder's storage path (folders have no identity beyond
@@ -642,8 +766,11 @@ export type TrashEntry = {
   deletedAt: string
   principal: string | null
   revisionId: string
-  /** sha-256 of the last body to resurrect; null = an honest gap (shown in trash, not restorable). */
+  /** sha-256 of the last state to resurrect; null = an honest gap (shown, not restorable). */
   contentHash: string | null
+  restoreAvailability: RevisionRestoreAvailability
+  /** Full-state marker copied from the delete tombstone. null = legacy partial. */
+  stateFormat: Revision['stateFormat']
 }
 
 /** One per-id failure in a best-effort batch. `reason` mirrors the typed error vocabulary; `error`
@@ -914,7 +1041,15 @@ export type KnowledgeStore = {
   /** `principal` is journal attribution — engines without a journal ignore it. */
   remove(
     id: string,
-    opts?: { principal?: string; agent?: AgentWriteAttribution; identityOnly?: boolean },
+    opts?: {
+      principal?: string
+      agent?: AgentWriteAttribution
+      identityOnly?: boolean
+      /** Host-internal conditional compensation: remove only this exact state. */
+      versionToken?: string
+      /** Stronger host-internal ownership proof for compensating a publication. */
+      physicalWriteClaim?: PhysicalWriteClaim
+    },
   ): Promise<void>
   /** Changes since `cursor` (null = establish one without history); an engine with no external
    *  change source returns empty upserts and its full inventory. */
@@ -967,8 +1102,9 @@ export type KnowledgeStore = {
     offset: number
     limit: number
     q?: string
+    availability?: TrashAvailabilityFilter
     scope?: ReadScope
-  }): Promise<{ items: TrashEntry[]; total: number; restorableTotal: number }>
+  }): Promise<{ items: TrashEntry[]; total: number; restorableTotal: number; partialTotal: number }>
   /** Resurrect a trashed note, keeping its id and last folder. `noteAlreadyExists` if a note is
    *  already at the restore path; `noteNotInTrash` if the id isn't trashed. */
   restoreFromTrash?(id: string, opts?: { principal?: string }): Promise<WriteResult>
@@ -987,6 +1123,7 @@ export type KnowledgeStore = {
     ids?: readonly string[]
     all?: boolean
     q?: string
+    availability?: TrashAvailabilityFilter
     scope?: ReadScope
   }): Promise<{ purged: number }>
   readonly capabilities: StoreCapabilities

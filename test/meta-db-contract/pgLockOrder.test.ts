@@ -28,7 +28,12 @@
 import pg from 'pg'
 import { expect, vi } from 'vitest'
 
-import type { IdentityRecord, RevisionInput } from '@notarium/core'
+import {
+  type IdentityRecord,
+  INSTALLATION_GENERATION_PHASE,
+  RESTORE_OPERATION_PHASE,
+  type RevisionInput,
+} from '@notarium/core'
 
 import {
   LOCK_LEVEL_OF_TABLE,
@@ -485,10 +490,80 @@ describePostgres('Postgres lock order', () => {
           AT,
         ),
       )
+      const generation = {
+        generation: 1,
+        phase: INSTALLATION_GENERATION_PHASE.activeInstalled,
+        activeKeyId: 'active-key',
+        activeHash: 'active-hash',
+        candidateKeyId: null,
+        candidateHash: null,
+        changedAt: AT,
+      }
+
+      await run('installationGeneration.compareAndSet', () =>
+        db.installationGeneration.compareAndSet({ expected: null, record: generation }),
+      )
+      const freeze = await run('installationGeneration.acquireBackupFreeze', () =>
+        db.installationGeneration.acquireBackupFreeze({
+          owner: 'backup-owner',
+          now: AT,
+          expiresAt: '2026-08-11T11:00:00.000Z',
+        }),
+      )
+
+      expect(freeze).toEqual([])
+      await run('installationGeneration.renewBackupFreeze', () =>
+        db.installationGeneration.renewBackupFreeze({
+          owner: 'backup-owner',
+          expected: {
+            generation: 1,
+            keyId: 'active-key',
+            activeHash: 'active-hash',
+            candidateKeyId: null,
+            candidateHash: null,
+          },
+          now: '2026-08-11T10:05:00.000Z',
+          expiresAt: '2026-08-11T11:05:00.000Z',
+        }),
+      )
+      await run('spaceLifecycle.transition', () =>
+        db.spaceLifecycle.transition({
+          space: 'alpha',
+          expectedPhases: ['active'],
+          phase: 'active',
+          changedAt: AT,
+        }),
+      )
+      await run('causalOutbox.append', () =>
+        db.causalOutbox.append({
+          space: 'alpha',
+          generation: 2,
+          kind: 'lock-probe',
+          operationId: null,
+          resourceId: 'note-a',
+          createdAt: AT,
+        }),
+      )
 
       // ── the identity tier and the facets under it ──────────────────────────
       await run('identity.claimMany', () =>
-        db.identity.claimMany([identity({ id: 'note-b' }), identity({ id: 'note-a' })]),
+        db.identity.claimMany([
+          identity({ id: 'note-b' }),
+          identity({ id: 'note-a' }),
+          identity({ id: 'note-terminal', filePath: 'terminal.md' }),
+        ]),
+      )
+      await run('ownerProofs.adopt', () =>
+        db.ownerProofs.adopt({
+          noteId: 'note-b',
+          space: 'alpha',
+          addressRevision: 1,
+          expectedProofRevision: null,
+          sourceHash: 'note-b-source',
+          proofJson: '{}',
+          receiptId: 'note-b-receipt',
+          updatedAt: AT,
+        }),
       )
       await run('favorites.add', () =>
         db.favorites.add({
@@ -537,6 +612,115 @@ describePostgres('Postgres lock order', () => {
 
       // ── revisions ──────────────────────────────────────────────────────────
       await run('revisions.append', () => db.revisions.append(revision('note-a'), 'body'))
+      const accepted = {
+        id: 'operation-probe',
+        space: 'alpha',
+        noteId: 'note-a',
+        endpoint: 'history-restore',
+        actorDigest: 'actor-probe',
+        idempotencyDigest: 'key-probe',
+        requestFingerprint: 'request-probe',
+        stageBinding: 'stage-probe',
+        sourceRevisionId: '1',
+        targetPath: 'note-a.md',
+        preparedEvidence: '{}',
+        createdAt: AT,
+      }
+
+      await run('restoreOperations.accept', () => db.restoreOperations.accept(accepted))
+      await run('restoreOperations.transition', () =>
+        db.restoreOperations.transition({
+          id: accepted.id,
+          expectedPhases: [RESTORE_OPERATION_PHASE.staged],
+          phase: RESTORE_OPERATION_PHASE.rejected,
+          updatedAt: AT,
+        }),
+      )
+      const terminalSource = await db.revisions.append(
+        revision('note-terminal', { contentHash: 'terminal-source-hash' }),
+        'terminal source',
+      )
+      const terminalAcceptance = {
+        ...accepted,
+        id: 'terminal-operation',
+        noteId: 'note-terminal',
+        actorDigest: 'terminal-actor',
+        idempotencyDigest: 'terminal-key',
+        requestFingerprint: 'terminal-request',
+        sourceRevisionId: terminalSource.id,
+        targetPath: 'terminal.md',
+        preparedEvidence: 'terminal-accepted',
+      }
+
+      await db.restoreOperations.accept(terminalAcceptance)
+      await db.restoreOperations.transition({
+        id: terminalAcceptance.id,
+        expectedPhases: [RESTORE_OPERATION_PHASE.staged],
+        phase: RESTORE_OPERATION_PHASE.prepared,
+        sourceRevisionId: terminalSource.id,
+        expectedHeadRevisionId: terminalSource.id,
+        targetPath: terminalAcceptance.targetPath,
+        preparedEvidence: 'terminal-prepared',
+        updatedAt: AT,
+      })
+      await db.restoreOperations.transition({
+        id: terminalAcceptance.id,
+        expectedPhases: [RESTORE_OPERATION_PHASE.prepared],
+        phase: RESTORE_OPERATION_PHASE.physicalPublished,
+        physicalReceipt: 'terminal-physical-receipt',
+        updatedAt: AT,
+      })
+      await run('restoreTerminal.commit', () =>
+        db.restoreTerminal.commit({
+          operationId: terminalAcceptance.id,
+          sourceRevisionId: terminalSource.id,
+          expectedHeadRevisionId: terminalSource.id,
+          targetPath: terminalAcceptance.targetPath,
+          preparedEvidence: 'terminal-prepared',
+          physicalReceipt: 'terminal-physical-receipt',
+          expectedIdentity: {
+            addressRevision: 1,
+            filePath: terminalAcceptance.targetPath,
+            deletedAt: null,
+          },
+          identity: identity({
+            id: 'note-terminal',
+            filePath: terminalAcceptance.targetPath,
+            addressRevision: 1,
+          }),
+          revision: revision('note-terminal', {
+            baseRevisionId: terminalSource.id,
+            sourceRevisionId: terminalSource.id,
+            kind: 'restore',
+            entryRole: 'change',
+            contentHash: 'terminal-restored-hash',
+            expectedHeadRevisionId: terminalSource.id,
+          }),
+          content: 'terminal restored',
+          proof: {
+            expectedProofRevision: null,
+            sourceHash: 'terminal-source-proof',
+            proofJson: '{}',
+            receiptId: 'terminal-proof-receipt',
+          },
+          result: {
+            noteId: 'note-terminal',
+            filePath: terminalAcceptance.targetPath,
+            versionToken: 'terminal-version',
+          },
+          outboxKind: 'restore-terminal',
+          committedAt: AT,
+        }),
+      )
+      await run('restoreTerminal.finalize', () =>
+        db.restoreTerminal.finalize({
+          operationId: terminalAcceptance.id,
+          preparedEvidence: 'terminal-prepared',
+          physicalReceipt: 'terminal-physical-receipt',
+          outboxKind: 'restore-terminal',
+          finalizedAt: AT,
+        }),
+      )
       // Over a note that HAS revisions and a blob — the fixture is built OUTSIDE the
       // window, because everything inside one is judged as the transaction it labels.
       await db.revisions.append(revision('note-purged', { contentHash: 'purged-hash' }), 'gone')

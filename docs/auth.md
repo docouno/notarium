@@ -44,6 +44,16 @@ There is no SMTP and only an admin issues a reset link — which means "lost the
 
 Commands: `list` · `passwd <user> [--password <pw> | --random]` · `create-admin <user> [--random] [--display "Name"]` · `grant <user> <space> <owner|writer|reader>`. A password without a flag is read from stdin with echo suppressed (it does not land in history/scrollback). The CLI finds the meta-DB on its own: first the **explicitly named** one (`META_DB_URL`, or the root from `DATA_DIR` — the same resolution as the server, [canon](architecture.md#data-root)); then up the tree to `docker/volumes/data/meta.db`, and after that to the pre-#101 layouts `docker/volumes/notarium-state/meta.db` and `.data/meta.db` (recovery must also find an unmigrated deployment); and only **last** — the implicit host default `~/.local/share/notarium/meta.db`. The order is exactly this because that file is materialized by any bare `npm run server`: prefer it and `list` would show "no users", while `create-admin` would create an admin in an unrelated DB, whereas the real deployment sits one folder up and REFUSES to silently create an empty DB — a wrong path fails with an error rather than looking like "no users". The scheme of an explicit `META_DB_URL` is read by the [one classifier](architecture.md#data-root) the driver itself uses, never a local prefix test: a path that merely looks Postgres-shaped (`postgres-backup/meta.db`) stays a path and meets the existence guard, an unknown scheme is refused outright, and `sqlite::memory:` is refused as having nothing to recover. The meta-DB is echoed on every run: a SQLite target by its full path — the one recovery actually needs, since opening the wrong file is the failure this guards — and a Postgres one by its scheme alone, because no rule for finding where a password ends survived review, and the driver names host, database and user in its own connection error anyway. `setPassword`/`createAdmin` are available ONLY from the CLI: there is no HTTP path (no current-credential proof), this is the host's operator boundary.
 
+The same binary also exposes the installation-only command
+`recover-replay-key --expected-key-id <stable-id> [--apply]`. It is narrower
+than account recovery: it exists only for an external meta-DB whose stable
+witness remains while the shared keyring is completely absent. The first call
+is a dry run. Before repeating with `--apply`, stop every serving process and
+recheck both `META_DB_URL` and `NOTARIUM_REPLAY_KEYRING_DIR`; the command checks
+the topology, stable id, and complete absence again immediately before starting
+the witnessed replacement saga. Present, corrupt, or mismatched files are never
+overwritten by this recovery path.
+
 `grant` accepts what an operator can actually have: the current space slug, a retired
 slug alias, or the exact stable space id. Slug/alias resolution uses the same
 `current > alias` precedence as the server, but the membership row always receives the

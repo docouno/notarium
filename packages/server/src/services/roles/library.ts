@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { lstat, mkdir, open, opendir, rm, writeFile } from 'node:fs/promises'
 import { dirname, join, relative as relativePath } from 'node:path'
 
+import type { AdmissionMode, SpaceResourceAuthority } from '@notarium/engine'
 import { renameNoReplace } from '@notarium/engine'
 import { isReclaimableInstallStaging } from './installStaging'
 import { MAX_SKILL_FILE_BYTES, MAX_SKILL_MANIFEST_BYTES } from './skillFile'
@@ -264,8 +265,12 @@ export const readPackagesFromDirectory = async (root: string): Promise<SkillPack
 
 export const createFsRoleLibrary = ({
   rootForSpace,
+  authorityForSpace,
+  resourcePrefixForSpace,
 }: {
   rootForSpace(space: string): string | null
+  authorityForSpace?(space: string): Promise<SpaceResourceAuthority | null>
+  resourcePrefixForSpace?(space: string): string | null
 }): RoleLibrary => {
   const rootsOf = (location: RoleLocation): { mount: string; root: string } => {
     const mount = rootForSpace(location.space)
@@ -382,6 +387,56 @@ export const createFsRoleLibrary = ({
     return sweep
   }
 
+  const resourcePackagePath = (location: RoleLocation, name: string): string | null => {
+    const prefix = resourcePrefixForSpace?.(location.space)
+
+    if (prefix == null) {
+      return null
+    }
+    if (location.scope === 'project' && !location.projectId) {
+      throw new Error('project role location requires projectId')
+    }
+    const relative =
+      location.scope === 'project'
+        ? `_projects/${projectDirectory(location.projectId!)}/${name}`
+        : name
+
+    return prefix ? `${prefix}/${relative}` : relative
+  }
+
+  const authorityContext = async (
+    location: RoleLocation,
+    name: string,
+  ): Promise<{ authority: SpaceResourceAuthority; resourcePath: string } | null> => {
+    const authority = await authorityForSpace?.(location.space)
+    const resourcePath = resourcePackagePath(location, name)
+
+    return authority && resourcePath ? { authority, resourcePath } : null
+  }
+
+  const withPackageAdmission = async <T>(
+    location: RoleLocation,
+    name: string,
+    mode: AdmissionMode,
+    owner: string,
+    task: (
+      context: { authority: SpaceResourceAuthority; resourcePath: string } | null,
+    ) => Promise<T>,
+  ): Promise<T> => {
+    const context = await authorityContext(location, name)
+
+    if (!context) {
+      return task(null)
+    }
+    const lease = await context.authority.admitPackage(context.resourcePath, mode, owner)
+
+    try {
+      return await task(context)
+    } finally {
+      lease.settle()
+    }
+  }
+
   return {
     listManifests: async (location) => {
       const root = rootOf(location)
@@ -412,26 +467,33 @@ export const createFsRoleLibrary = ({
         const packageDirectory = join(root, entry.name)
 
         try {
-          const size = await skillFileSize(packageDirectory)
+          const manifest = await withPackageAdmission(
+            location,
+            entry.name,
+            'shared',
+            'role-list-manifest',
+            async () => {
+              const size = await skillFileSize(packageDirectory)
 
-          if (size === null) {
+              return size == null
+                ? null
+                : { size, content: await readManifestPrefix(join(packageDirectory, 'SKILL.md')) }
+            },
+          )
+
+          if (!manifest) {
             continue
           }
           if (manifests.length >= MAX_LIBRARY_PACKAGES) {
             truncated = true
             break
           }
-          if (size > MAX_SKILL_FILE_BYTES || bytes + size > MAX_LIBRARY_BYTES) {
+          if (manifest.size > MAX_SKILL_FILE_BYTES || bytes + manifest.size > MAX_LIBRARY_BYTES) {
             console.warn(`[roles] ignoring invalid package ${entry.name}: SKILL.md is too large`)
             continue
           }
-          bytes += size
-          manifests.push({
-            name: entry.name,
-            files: new Map([
-              ['SKILL.md', await readManifestPrefix(join(packageDirectory, 'SKILL.md'))],
-            ]),
-          })
+          bytes += manifest.size
+          manifests.push({ name: entry.name, files: new Map([['SKILL.md', manifest.content]]) })
         } catch (err) {
           console.warn(`[roles] ignoring invalid package ${entry.name}:`, (err as Error).message)
         }
@@ -446,96 +508,126 @@ export const createFsRoleLibrary = ({
       if (!PACKAGE_NAME.test(name) || name.includes('--')) {
         return null
       }
-      const path = join(rootOf(location), name, 'SKILL.md')
 
-      try {
-        const info = await lstat(path)
+      return withPackageAdmission(location, name, 'shared', 'role-get-skill', async (context) => {
+        if (context) {
+          const observation = await context.authority.observe(`${context.resourcePath}/SKILL.md`, {
+            owner: 'role-get-skill-read',
+            packagePath: context.resourcePath,
+            maxBytes: MAX_SKILL_FILE_BYTES,
+          })
 
-        if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_SKILL_FILE_BYTES) {
-          return null
+          return observation.kind === 'present'
+            ? { name, files: new Map([['SKILL.md', observation.bytes]]) }
+            : null
         }
+        const path = join(rootOf(location), name, 'SKILL.md')
 
-        return {
-          name,
-          files: new Map([['SKILL.md', await readBoundedFile(path, MAX_SKILL_FILE_BYTES)]]),
+        try {
+          const info = await lstat(path)
+
+          if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_SKILL_FILE_BYTES) {
+            return null
+          }
+
+          return {
+            name,
+            files: new Map([['SKILL.md', await readBoundedFile(path, MAX_SKILL_FILE_BYTES)]]),
+          }
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+            return null
+          }
+          throw err
         }
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-          return null
-        }
-        throw err
-      }
+      })
     },
     exists: async (location, name) => {
       if (!PACKAGE_NAME.test(name) || name.includes('--')) {
         return false
       }
 
-      try {
-        await lstat(join(rootOf(location), name))
-        return true
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-          return false
+      return withPackageAdmission(location, name, 'shared', 'role-exists', async () => {
+        try {
+          await lstat(join(rootOf(location), name))
+          return true
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+            return false
+          }
+          throw err
         }
-        throw err
-      }
+      })
     },
     get: async (location, name) => {
       if (!PACKAGE_NAME.test(name) || name.includes('--')) {
         return null
       }
 
-      const directory = join(rootOf(location), name)
+      return withPackageAdmission(location, name, 'shared', 'role-get-package', async () => {
+        const directory = join(rootOf(location), name)
 
-      try {
-        const info = await lstat(directory)
+        try {
+          const info = await lstat(directory)
 
-        if (!info.isDirectory() || info.isSymbolicLink()) {
-          return null
+          if (!info.isDirectory() || info.isSymbolicLink()) {
+            return null
+          }
+          const files = await readPackageFiles(directory)
+          return files.has('SKILL.md') ? { name, files } : null
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+            return null
+          }
+          throw err
         }
-        const files = await readPackageFiles(directory)
-        return files.has('SKILL.md') ? { name, files } : null
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-          return null
-        }
-        throw err
-      }
+      })
     },
     putIfAbsent: async (location, pkg) => {
       validateSkillPackage(pkg)
       const { mount, root } = rootsOf(location)
       await prepareRoot(location, mount, root)
       await sweepStaleStaging(mount, root)
-      const target = join(root, pkg.name)
-      const temp = join(root, `.${pkg.name}.install-${randomUUID()}`)
-      await mkdir(temp, { recursive: false })
+      const context = await authorityContext(location, pkg.name)
 
-      try {
-        for (const [file, content] of pkg.files) {
-          const path = join(temp, ...file.split('/'))
-          await mkdir(dirname(path), { recursive: true })
-          await writeFile(path, content, { flag: 'wx' })
-        }
-
-        // The arbiter is the primitive, in one atomic filesystem operation: an
-        // occupied pathname of ANY shape is a conflict, never a replacement.
-        // Its errors — an unavailable capability included — travel out as they
-        // are; there is no fallback to a raceable rename on any branch.
-        return await renameNoReplace(temp, target)
-      } finally {
-        // On the conflict branch the staging really is still there, so this rm
-        // does work — and a read-only volume or an EACCES must not turn a
-        // defined `false` into a 500.
-        await rm(temp, { recursive: true, force: true }).catch((err: Error) => {
-          // This process just created a possible orphan after the last sweep.
-          // Drop the clean cache so a later install keeps checking it until it
-          // ages into the reclaimable window.
-          sweeps.delete(root)
-          console.warn(`[roles] failed to remove install staging ${temp}:`, err.message)
+      if (context) {
+        const observed = await context.authority.observe(context.resourcePath, {
+          owner: 'role-put-package-plan',
+          packagePath: context.resourcePath,
         })
+
+        if (observed.kind !== 'absent') {
+          return false
+        }
+        const published = await context.authority.publishPackageIfAbsent({
+          rootPath: context.resourcePath,
+          files: [...pkg.files].map(([path, content]) => ({ path, content })),
+          expectedRoot: observed.claim,
+        })
+
+        return published.status === 'published'
       }
+
+      return withPackageAdmission(location, pkg.name, 'exclusive', 'role-put-package', async () => {
+        const target = join(root, pkg.name)
+        const temp = join(root, `.${pkg.name}.install-${randomUUID()}`)
+        await mkdir(temp, { recursive: false })
+
+        try {
+          for (const [file, content] of pkg.files) {
+            const path = join(temp, ...file.split('/'))
+            await mkdir(dirname(path), { recursive: true })
+            await writeFile(path, content, { flag: 'wx' })
+          }
+
+          return await renameNoReplace(temp, target)
+        } finally {
+          await rm(temp, { recursive: true, force: true }).catch((err: Error) => {
+            sweeps.delete(root)
+            console.warn(`[roles] failed to remove install staging ${temp}:`, err.message)
+          })
+        }
+      })
     },
   }
 }

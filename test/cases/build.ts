@@ -19,6 +19,7 @@ import type {
   PendingOAuthClientDecl,
   ProjectDecl,
   RetrievalDecl,
+  RevisionStateDecl,
   ScopePinDecl,
   SpaceDecl,
   UserDecl,
@@ -58,6 +59,11 @@ const validateAgentDeltaCursorAnchors = (world: CaseWorld): CaseWorld => {
         `agent delta cursor anchor ${cursor.throughNote} belongs to space ${noteSpace}, ` +
           `not project space ${cursor.project.space}`,
       )
+    }
+  }
+  for (const revision of world.revisionStates ?? []) {
+    if (!noteSpaces.has(revision.note)) {
+      throw new Error(`revision state references unknown note ${revision.note}`)
     }
   }
 
@@ -126,6 +132,7 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
   const jobs: JobDecl[] = []
   const durableImports: DurableImportDecl[] = []
   const externalRewrites: ExternalRewriteDecl[] = []
+  const revisionStates: RevisionStateDecl[] = []
   const externalIdentityClaims: ExternalIdentityClaimDecl[] = []
   const events: CaseEvent[] = []
   const takenPaths = new Set<string>()
@@ -308,6 +315,12 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
     for (const rewrite of world.externalRewrites ?? []) {
       externalRewrites.push({ ...rewrite, note: `${name}:${rewrite.note}` })
     }
+    // Revision-state declarations depend on their timeline note and preserve
+    // declaration order. Namespacing makes independent cases collision-free;
+    // WorldBuilder rejects incompatible duplicates inside one case.
+    for (const revision of world.revisionStates ?? []) {
+      revisionStates.push({ ...revision, note: `${name}:${revision.note}` })
+    }
   }
 
   events.sort(compareEvents)
@@ -337,6 +350,7 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
     ...(jobs.length ? { jobs } : {}),
     ...(durableImports.length ? { durableImports } : {}),
     ...(externalRewrites.length ? { externalRewrites } : {}),
+    ...(revisionStates.length ? { revisionStates } : {}),
     ...(externalIdentityClaims.length ? { externalIdentityClaims } : {}),
   })
 }

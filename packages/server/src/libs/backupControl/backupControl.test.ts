@@ -3,8 +3,17 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 
+import {
+  InMemoryInstallationGenerationPersistence,
+  INSTALLATION_GENERATION_PHASE,
+} from '@notarium/core'
+
 import { createMutationGate } from '../mutationGate'
-import { createBackupControl, requestBackupCheckpoint } from './backupControl'
+import {
+  createBackupControl,
+  requestBackupCheckpoint,
+  requestBackupGenerationCut,
+} from './backupControl'
 
 const roots: string[] = []
 
@@ -110,5 +119,50 @@ describe('backup control socket', () => {
     checkpointDone.resolve()
     await close
     expect(closed).toBe(true)
+  })
+
+  it('holds, renews, and releases one durable installation generation', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'notarium-control-'))
+    roots.push(root)
+    const socket = join(root, 'backup.sock')
+    const installation = new InMemoryInstallationGenerationPersistence()
+    const installed = {
+      generation: 1,
+      phase: INSTALLATION_GENERATION_PHASE.activeInstalled,
+      activeKeyId: 'rk_0123456789abcdef01234567',
+      activeHash: 'sha256:active',
+      candidateKeyId: null,
+      candidateHash: null,
+      changedAt: new Date(0).toISOString(),
+    }
+    await installation.compareAndSet({ expected: null, record: installed })
+    const control = createBackupControl(socket, async () => {}, 5_000, installation, 30_000)
+
+    await control.start()
+    const lease = await requestBackupGenerationCut(socket)
+    expect(lease.bundle).toEqual({
+      generation: 1,
+      keyId: installed.activeKeyId,
+      activeHash: installed.activeHash,
+      candidateKeyId: null,
+      candidateHash: null,
+    })
+    await expect(lease.renew()).resolves.toMatch(/^\d{4}-/)
+    await expect(
+      installation.compareAndSet({
+        expected: installed,
+        record: {
+          ...installed,
+          generation: 2,
+          phase: INSTALLATION_GENERATION_PHASE.candidateReady,
+          candidateKeyId: 'rk_abcdef0123456789abcdef01',
+          candidateHash: 'sha256:candidate',
+          changedAt: new Date().toISOString(),
+        },
+      }),
+    ).resolves.toMatchObject({ status: 'backup-frozen' })
+    await lease.release()
+    await expect(lease.release()).resolves.toBeUndefined()
+    await control.close()
   })
 })

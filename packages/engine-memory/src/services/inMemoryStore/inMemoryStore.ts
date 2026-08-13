@@ -23,6 +23,7 @@ import type {
   NoteClass,
   NoteContent,
   NoteMeta,
+  PhysicalWriteClaim,
   Preview,
   ReadOptions,
   ReadScope,
@@ -36,16 +37,21 @@ import type {
 } from '@notarium/core'
 import {
   aggregateGraphHealth,
+  analyzeDocumentState,
+  basenameOf,
+  bindStorageOwnerProof,
   buildLinkIndex,
   classesForScope,
   collectPreviews,
-  computeVersionToken,
   CREATED_FALLBACK_FRONTMATTER_KEY,
   decodeWikilinkIdentity,
   DEFAULT_NOTE_TYPE,
   deriveNoteEdges,
   derivePreview,
   directoryOf,
+  DOCUMENT_ROLE,
+  DOCUMENT_STATE_FORMAT,
+  documentStateVersionToken,
   effectiveSlug,
   enrichGraph,
   FOLDER_PAGE_BASENAME,
@@ -53,6 +59,7 @@ import {
   frontmatterHasYamlNodeReferences,
   frontmatterScalar,
   IF_EXISTS,
+  isCanonicalInternalRelativeAddress,
   isCanonicalSafeRelativeAddress,
   isDurableFrontmatter,
   isDurableScalar,
@@ -61,11 +68,13 @@ import {
   isLegacyImportDestination,
   isPortableMoveDestination,
   isPortableRelativeDestination,
+  isSkillPackageRootPath,
   isValidNoteId,
   isVisibleOn,
   isWikilinkIdentityTarget,
   isWithinFrontmatterByteCap,
   liveSyncStatus,
+  logicalNoteState,
   makeSnippet,
   nextAliasesMulti,
   normAliases,
@@ -78,6 +87,8 @@ import {
   parseFrontmatterLines,
   resolveLink,
   shapeGraph,
+  skillPackagePathOf,
+  STORAGE_OWNER_KEY,
   storedSlug,
   StoreError,
   stripTitleHeading,
@@ -140,7 +151,21 @@ type StoredNote = {
    *  `created:` remains in `carried` and needs no second emission; a store-clock
    *  fallback has no authored claim at all. */
   createdProjected: boolean
+  /** Opaque physical incarnation, independent of semantic/CAS equality. */
+  physicalWriteClaim: PhysicalWriteClaim
 }
+
+const PHYSICAL_WRITE_CLAIM_KIND = 'in-memory-incarnation-v1'
+let physicalIncarnationSequence = 0
+
+const nextPhysicalWriteClaim = (): PhysicalWriteClaim => ({
+  kind: PHYSICAL_WRITE_CLAIM_KIND,
+  value: String(++physicalIncarnationSequence),
+})
+
+const physicalWriteClaimOf = (note: StoredNote): PhysicalWriteClaim => ({
+  ...note.physicalWriteClaim,
+})
 
 const stripMd = (p: string) => p.replace(/\.md$/, '')
 
@@ -355,7 +380,7 @@ export class InMemoryStore implements KnowledgeStore {
     // mutations keep it stable across rename/move — the reference behaviour
     // the contract spec holds identity-capable stores to.
     identity: true,
-    // And its own CAS arbiter (#50): the body lives right here, so the version
+    // And its own CAS arbiter (#50): the whole logical state lives here, so the version
     // check and the mutation are one synchronous step — the reference
     // behaviour for optimistic writes, mirroring what CachedStore gives a bare engine.
     cas: true,
@@ -421,17 +446,11 @@ export class InMemoryStore implements KnowledgeStore {
       if (!withinByteCap || hasBareFence || !isDurableFrontmatter(parsedCarried)) {
         throw writeFailed('snapshot frontmatter contains an invalid durable string')
       }
-      // A real file is normalised by serialize/parse before it reaches the live
-      // view. Mirror that on fixtures too: duplicate keyed entries collapse with
-      // the last authored value winning, including an unreadable last shape.
-      // Existing reference-bearing files are the exception: writes refuse them,
-      // while read/export must preserve their ordered anchor graph. Collapsing a
-      // duplicate or removing an explicit snapshot field's raw owner can leave a
-      // later alias dangling, so clone these entries without normalising them.
+      // A fixture models bytes already present on disk. Keep its raw ordered
+      // entries exactly, including duplicate custom keys; typed projections use
+      // the last readable owner without rewriting the source state on ingress.
       const hasYamlNodeReferences = frontmatterHasYamlNodeReferences(parsedCarried)
-      const importedCarried = hasYamlNodeReferences
-        ? parsedCarried?.map(cloneEntry)
-        : mergeCarried(undefined, parsedCarried)
+      const importedCarried = parsedCarried?.map(cloneEntry)
       // Explicit snapshot fields model the serializer's final typed puts/drops.
       // Remove every raw shadow even for clears, or a later export/write would
       // revive the value the typed channel deliberately removed.
@@ -470,6 +489,7 @@ export class InMemoryStore implements KnowledgeStore {
         modifiedAt: n.modifiedAt ?? null,
         createdAt: n.createdAt ?? (fromCarry.createdAt.present ? fromCarry.createdAt.value : null),
         createdProjected: n.createdAt != null,
+        physicalWriteClaim: nextPhysicalWriteClaim(),
         content: n.content || '',
         noteType:
           n.noteType !== undefined
@@ -666,15 +686,13 @@ export class InMemoryStore implements KnowledgeStore {
     return this.viewOf(this.notes[i])
   }
 
-  /** A note as read() serves it. The version token hashes THIS view (not the
-   *  stored bytes): it's what the reader saw, so it's what a save's CAS check
-   *  compares against (#50). */
+  /** A note as read() serves it. CAS hashes the canonical logical state built
+   * from the same reconstructed file shape export uses. */
   private viewOf(n: StoredNote): NoteContent & { id: string; versionToken: string } {
     const content = stripTitleHeading(n.content, n.title)
     // Mirror the real engine's parsed frontmatter: tags plus the agent-memory
-    // summary (#21) when present. The token hashes the BODY only (summary lives
-    // in frontmatter), so a summary-only change is a content no-op — same as the
-    // real engine, where read() strips frontmatter before the token.
+    // summary (#21) when present. The version token below hashes the complete
+    // logical state, so a metadata-only change is a real CAS change.
     const frontmatter: Record<string, unknown> = {}
 
     // The author's own keys first (#280) — ours below override, exactly the order
@@ -731,21 +749,125 @@ export class InMemoryStore implements KnowledgeStore {
       frontmatter[created.conflict ? CREATED_FALLBACK_FRONTMATTER_KEY : 'created'] = n.createdAt
     }
 
+    const logicalState = this.logicalStateOf(n, content)
+    const documentState = this.documentStateOf(n)
+
     return {
       id: n.id,
-      title: n.title,
+      title: documentState.projection?.title ?? n.title,
       class: n.class,
       filePath: n.filePath,
-      content,
+      content: documentState.projection?.body ?? content,
+      // Fixture typed channels remain the ordinary read projection even when
+      // an anchored raw carry cannot be rewritten to match them. The exact
+      // byte/source projection remains available on documentState.
       frontmatter,
+      logicalState,
+      documentState,
       ...(n.slug ? { slug: n.slug } : {}), // #100 phase 1: custom slug only
       ...(n.aliases.length ? { aliases: n.aliases } : {}),
       modifiedAt: n.modifiedAt,
       // The resolved creation instant (#186) — what the editor prefills its date
       // field from; mirrors the real engine serving createdAt on the read view.
       createdAt: n.createdAt,
-      versionToken: computeVersionToken(content),
+      versionToken: documentStateVersionToken(documentState),
     }
+  }
+
+  private logicalStateOf(n: StoredNote, body = stripTitleHeading(n.content, n.title)) {
+    const raw = this.fileBytesOf(n)
+
+    return logicalNoteState({
+      title: n.title,
+      body,
+      frontmatter: parseFrontmatterBlock(raw)?.entries ?? [],
+    })
+  }
+
+  private documentStateOf(n: StoredNote) {
+    const fileName = basenameOf(n.filePath)
+    const parts = n.filePath.split('/')
+    const skillMountLength =
+      parts[0] === '.notarium' && parts[1] === 'skills' ? 2 : parts[0] === 'skills' ? 1 : 0
+    const relative = parts.slice(skillMountLength)
+    const relativePath = relative.join('/')
+    const relativePackagePath = skillPackagePathOf(relativePath)
+    const packageDirectory = relativePackagePath
+      ? [...parts.slice(0, skillMountLength), relativePackagePath].join('/')
+      : ''
+    const skillRoot = isSkillPackageRootPath(relativePath)
+    let linkedRoot: StoredNote | undefined
+
+    if (n.class === 'skill' && !skillRoot && packageDirectory) {
+      const rootPath = `${packageDirectory}/SKILL.md`
+      linkedRoot = this.notes.find(
+        (candidate) => candidate.class === 'skill' && candidate.filePath === rootPath,
+      )
+    }
+    const linkedRootIsValid = linkedRoot
+      ? analyzeDocumentState({
+          source: new TextEncoder().encode(this.fileBytesOf(linkedRoot)),
+          role: DOCUMENT_ROLE.skillRoot,
+          pathFallbackTitle: 'SKILL',
+          skillDirectoryName: basenameOf(packageDirectory),
+        }).format === DOCUMENT_STATE_FORMAT.skill
+      : false
+    const role =
+      n.class === 'skill'
+        ? skillRoot
+          ? DOCUMENT_ROLE.skillRoot
+          : linkedRootIsValid
+            ? DOCUMENT_ROLE.skillAuxiliary
+            : DOCUMENT_ROLE.generic
+        : DOCUMENT_ROLE.generic
+    const source = new TextEncoder().encode(this.fileBytesOf(n))
+    const owners: Array<{
+      key: (typeof STORAGE_OWNER_KEY)[keyof typeof STORAGE_OWNER_KEY]
+      ownership: 'value' | 'entry'
+    }> = []
+    const hasYamlNodeReferences = frontmatterHasYamlNodeReferences(n.carried)
+
+    if (!hasYamlNodeReferences) {
+      owners.push({
+        key: STORAGE_OWNER_KEY.id,
+        ownership: carriedEntry(n.carried, NOTE_ID_FRONTMATTER_KEY) ? 'value' : 'entry',
+      })
+    }
+    if (n.createdAt && n.createdProjected) {
+      const created = carriedCreated(n.carried)
+      const key = created.conflict ? CREATED_FALLBACK_FRONTMATTER_KEY : 'created'
+
+      if (!carriedEntry(n.carried, key)) {
+        owners.push({ key: STORAGE_OWNER_KEY.created, ownership: 'entry' })
+      }
+    }
+    let ownerProof
+
+    try {
+      ownerProof = bindStorageOwnerProof({
+        source,
+        owners,
+        evidence: {
+          kind: 'mutation-receipt',
+          id: `${n.physicalWriteClaim.kind}:${n.physicalWriteClaim.value}`,
+        },
+        generatedContainer: owners.length > 0 && !n.carried?.length,
+      })
+    } catch {
+      // An ambiguous authored target cannot acquire authority by matching the
+      // value synthesized by this projection. The analyzer will fail it closed.
+      ownerProof = undefined
+    }
+
+    return analyzeDocumentState({
+      source,
+      role,
+      pathFallbackTitle: fileName.replace(/\.md$/i, ''),
+      ownerProof,
+      ...(role === DOCUMENT_ROLE.skillRoot
+        ? { skillDirectoryName: basenameOf(directoryOf(n.filePath)) }
+        : {}),
+    })
   }
 
   /** Stream every note as an on-disk-equivalent file for a base export (#17).
@@ -823,33 +945,60 @@ export class InMemoryStore implements KnowledgeStore {
         typed.push({ key, lines: [`${key}: ${fmScalar(n.createdAt)}`] })
       }
     }
-    // EVERY key this reconstruction writes — including the normally unconditional
-    // system keys. Deriving the filter from anything narrower is how a carried
-    // `title:` got emitted a second time, after ours and therefore won a re-read.
-    const emitted = new Set([
-      ...(preservesReferencedKey(NOTE_ID_FRONTMATTER_KEY) ? [] : [NOTE_ID_FRONTMATTER_KEY]),
-      ...(preservesReferencedKey(CREATED_FALLBACK_FRONTMATTER_KEY)
-        ? []
-        : [CREATED_FALLBACK_FRONTMATTER_KEY]),
-      ...(preservesReferencedKey('title') ? [] : ['title']),
-      ...typed.map((e) => e.key),
-    ])
-    // The author's own keys ride along verbatim (#280) — an export of an imported
-    // note must give the file back with the frontmatter it came in with.
-    const carried = (n.carried ?? []).filter((e) => !e.key || !emitted.has(e.key))
-    const keylessLines = carried.filter((e) => !e.key).flatMap((e) => e.lines)
-    const carriedLines = carried.filter((e) => e.key).flatMap((e) => e.lines)
-    const lines = [
-      // Same safety rule as serializeNoteFile: an indented/`- ` passthrough at
-      // the back would become the preceding typed key's continuation on re-read.
-      ...keylessLines,
-      ...(preservesReferencedKey(NOTE_ID_FRONTMATTER_KEY)
-        ? []
-        : [`${NOTE_ID_FRONTMATTER_KEY}: ${n.id}`]),
-      ...(preservesReferencedKey('title') ? [] : [`title: ${fmScalar(n.title)}`]),
-      ...carriedLines,
-      ...typed.flatMap((e) => e.lines),
-    ]
+    // Rebuild by replacing a key in its authored slot, like serializeNoteFile.
+    // Pulling all keyless entries to the front changes the logical ordering of
+    // comments relative to custom keys and makes the fake disagree with a real
+    // external read even before any mutation occurs.
+    const entries = (n.carried ?? []).map(cloneEntry)
+
+    const put = (entry: FrontmatterEntry): void => {
+      const occupied = entries.flatMap((candidate, index) =>
+        candidate.key === entry.key ? [index] : [],
+      )
+
+      if (!occupied.length) {
+        entries.push(entry)
+        return
+      }
+      entries[occupied[0]] = entry
+      for (const index of occupied.slice(1).reverse()) {
+        entries.splice(index, 1)
+      }
+    }
+
+    const system: FrontmatterEntry[] = []
+
+    if (!preservesReferencedKey(NOTE_ID_FRONTMATTER_KEY)) {
+      const entry = {
+        key: NOTE_ID_FRONTMATTER_KEY,
+        lines: [`${NOTE_ID_FRONTMATTER_KEY}: ${n.id}`],
+      }
+
+      if (entries.some((candidate) => candidate.key === NOTE_ID_FRONTMATTER_KEY)) {
+        put(entry)
+      } else {
+        system.push(entry)
+      }
+    }
+    if (!preservesReferencedKey('title')) {
+      const entry = { key: 'title', lines: [`title: ${fmScalar(n.title)}`] }
+
+      if (entries.some((candidate) => candidate.key === 'title')) {
+        put(entry)
+      } else {
+        system.push(entry)
+      }
+    }
+    let systemIndex = 0
+
+    while (entries[systemIndex]?.key === null) {
+      systemIndex++
+    }
+    entries.splice(systemIndex, 0, ...system)
+    for (const entry of typed) {
+      put(entry)
+    }
+    const lines = entries.flatMap((entry) => entry.lines)
     const payload = lines.join('\n')
 
     if (!isWithinFrontmatterByteCap(`${payload}\n`)) {
@@ -954,7 +1103,7 @@ export class InMemoryStore implements KnowledgeStore {
 
   /** Create or, with originalId, rename-in-place (the #8 invariant: a title or
    *  folder change relocates the note instead of duplicating it). Updates are
-   *  optimistic (#50): the caller's versionToken must match the live body or
+   *  optimistic (#50): the caller's versionToken must match the live logical state or
    *  nothing is written — the whole method is synchronous, so the check and
    *  the mutation are atomic. */
   async write({
@@ -976,7 +1125,12 @@ export class InMemoryStore implements KnowledgeStore {
     legacyImportRoot,
     createdAt,
     frontmatter,
+    frontmatterMode,
+    preservePath,
+    preserveAliases,
+    restorePath,
   }: WriteInput): Promise<WriteResult> {
+    const replacing = frontmatterMode === 'replace'
     const scalarInputs = [title, directory, noteType, rawSlug, summary, fileName, createdAt]
     const tagInputs = Array.isArray(tags) ? tags : tags != null ? [tags] : []
 
@@ -985,6 +1139,10 @@ export class InMemoryStore implements KnowledgeStore {
       tagInputs.some((value) => !isDurableScalar(value)) ||
       !isDurableText(content) ||
       !isDurableFrontmatter(frontmatter) ||
+      (restorePath != null &&
+        (!isDurableText(restorePath) ||
+          !isCanonicalInternalRelativeAddress(restorePath) ||
+          !restorePath.endsWith('.md'))) ||
       (id != null && !isValidNoteId(id)) ||
       (originalId != null &&
         !isValidNoteId(originalId) &&
@@ -992,9 +1150,10 @@ export class InMemoryStore implements KnowledgeStore {
     ) {
       throw writeFailed('input contains an invalid durable string')
     }
-    const requestedDirectory = directory ?? ''
-    const validDirectory =
-      legacyImportRoot !== undefined
+    const requestedDirectory = restorePath ? directoryOf(restorePath) : (directory ?? '')
+    const validDirectory = restorePath
+      ? true
+      : legacyImportRoot !== undefined
         ? !originalId &&
           Boolean(fileName) &&
           isLegacyImportDestination(requestedDirectory, legacyImportRoot, (prefix) =>
@@ -1011,8 +1170,8 @@ export class InMemoryStore implements KnowledgeStore {
     // the fake must reject references there even though it need not implement the
     // real engine's general inline-frontmatter merge for this safety fence.
     const incomingHasYamlNodeReferences = (): boolean =>
-      frontmatterHasYamlNodeReferences(frontmatter) ||
-      frontmatterHasYamlNodeReferences(parseFrontmatterBlock(content)?.entries)
+      (!replacing && frontmatterHasYamlNodeReferences(frontmatter)) ||
+      (!replacing && frontmatterHasYamlNodeReferences(parseFrontmatterBlock(content)?.entries))
     // Carry-forward semantics matching the real engine's serializeNoteFile: an
     // UNDEFINED field leaves the note's existing value untouched (the semantic
     // ops re-send what they read, #21 — a write that omitted them would wrongly
@@ -1048,7 +1207,7 @@ export class InMemoryStore implements KnowledgeStore {
           : prev
 
     const carriedStateFor = (prev: FrontmatterEntry[] | undefined) => {
-      const merged = mergeCarried(prev, frontmatter)
+      const merged = replacing ? frontmatter?.map(cloneEntry) : mergeCarried(prev, frontmatter)
       return { merged, typed: carriedTyped(merged) }
     }
     const preserveIncomingUnreadableCreated =
@@ -1062,6 +1221,10 @@ export class InMemoryStore implements KnowledgeStore {
       // the real serializer. It remains byte-lines in carry; canonical projection
       // resumes only after a later explicit createdAt write.
       if (frontmatter !== undefined && carriedCreated(frontmatter).present) {
+        return false
+      }
+
+      if (replacing) {
         return false
       }
 
@@ -1143,7 +1306,7 @@ export class InMemoryStore implements KnowledgeStore {
     const fileIn = (d: string, noteTitle: string, base: string | undefined, noteId?: string) =>
       (d ? `${d}/` : '') +
       `${noteFileBase(noteTitle, base, noteId, legacyImportRoot !== undefined)}.md`
-    const tokenOf = (n: StoredNote) => computeVersionToken(stripTitleHeading(n.content, n.title))
+    const tokenOf = (n: StoredNote) => documentStateVersionToken(this.documentStateOf(n))
 
     if (originalId) {
       const i = this.findIndex(originalId, identityOnly)
@@ -1169,8 +1332,13 @@ export class InMemoryStore implements KnowledgeStore {
       // to slug(title) — mirrors the notarium engine. Folder pages stay `index`.
       const fileBase = isFolderPageNote(prev.filePath) ? FOLDER_PAGE_BASENAME : fileName
       const preserveCurrentPath =
-        title === prev.title && fileName == null && dir === directoryOf(prev.filePath)
-      const filePath = preserveCurrentPath ? prev.filePath : fileIn(dir, title, fileBase, prev.id)
+        preservePath ||
+        (title === prev.title && fileName == null && dir === directoryOf(prev.filePath))
+      const filePath = restorePath
+        ? restorePath
+        : preserveCurrentPath
+          ? prev.filePath
+          : fileIn(dir, title, fileBase, prev.id)
 
       // Rename-in-place must never swallow a different note already at the
       // destination — the real engine's guard, mirrored so the fake can't pass a
@@ -1178,11 +1346,14 @@ export class InMemoryStore implements KnowledgeStore {
       if (filePath !== prev.filePath && this.indexByPath(filePath) !== -1) {
         throw moveFailed('a note already lives at the destination')
       }
-      if (incomingHasYamlNodeReferences() || frontmatterHasYamlNodeReferences(prev.carried)) {
+      if (
+        incomingHasYamlNodeReferences() ||
+        (!replacing && frontmatterHasYamlNodeReferences(prev.carried))
+      ) {
         throw new Error(YAML_NODE_REFERENCE_WRITE_ERROR)
       }
       const carriedState = carriedStateFor(prev.carried)
-      const newSlug = slugFor(prev.slug, carriedState.typed)
+      const newSlug = slugFor(replacing ? undefined : prev.slug, carriedState.typed)
       // Alias-history (#100): a title OR slug change records the old name(s) so
       // inbound [[Old Title]] / [[old-slug]] keep resolving — mirrors the real
       // engine's write() (effective-slug comparison; nextAliasesMulti dedups).
@@ -1193,21 +1364,24 @@ export class InMemoryStore implements KnowledgeStore {
       const slugChannel = storedSlug(rawSlug, title)
       const renameSlug = slugChannel === undefined ? prev.slug : newSlug
       const newEffSlug = effectiveSlug(renameSlug, title)
-      const renamed = prev.title !== title || prevEffSlug !== newEffSlug
-      const nextAliases = renamed
-        ? nextAliasesMulti(prev.aliases, [prev.title, prevEffSlug], [title, newEffSlug])
-        : aliasesFor(prev.aliases, carriedState.typed)
+      const renamed = !preserveAliases && (prev.title !== title || prevEffSlug !== newEffSlug)
+      const nextAliases = replacing
+        ? aliasesFor([], carriedState.typed)
+        : renamed
+          ? nextAliasesMulti(prev.aliases, [prev.title, prevEffSlug], [title, newEffSlug])
+          : aliasesFor(prev.aliases, carriedState.typed)
       const candidate: StoredNote = {
         ...prev,
+        physicalWriteClaim: nextPhysicalWriteClaim(),
         title,
         content,
-        noteType: noteTypeFor(prev.noteType, carriedState.typed),
-        tags: tagsFor(prev.tags, carriedState.typed),
+        noteType: noteTypeFor(replacing ? DEFAULT_NOTE_TYPE : prev.noteType, carriedState.typed),
+        tags: tagsFor(replacing ? [] : prev.tags, carriedState.typed),
         aliases: nextAliases,
         slug: newSlug,
-        summary: summaryFor(prev.summary, carriedState.typed),
-        muted: mutedFor(prev.muted, carriedState.typed),
-        carried: carriedAfterTypedChannels(carriedState.merged, renamed),
+        summary: summaryFor(replacing ? undefined : prev.summary, carriedState.typed),
+        muted: mutedFor(replacing ? undefined : prev.muted, carriedState.typed),
+        carried: carriedAfterTypedChannels(carriedState.merged, !replacing && renamed),
         filePath,
         modifiedAt: this.nowIso,
         // Authored date edit (#186): a provided `createdAt` overwrites; undefined
@@ -1224,6 +1398,7 @@ export class InMemoryStore implements KnowledgeStore {
         filePath,
         class: this.notes[i].class,
         versionToken: tokenOf(this.notes[i]),
+        physicalWriteClaim: physicalWriteClaimOf(this.notes[i]),
       }
     }
     // Identity is settled BEFORE the path here, because the last rung of the path
@@ -1231,13 +1406,13 @@ export class InMemoryStore implements KnowledgeStore {
     // circular for a title with nothing sluggable in it. The id keeps riding on the
     // path the TITLE alone implies — identical for every ordinary note, so seeded and
     // e2e-hardcoded ids are untouched.
-    const createDir = norm(directory ?? '')
+    const createDir = norm(requestedDirectory)
     const newId =
       id ||
       this.deriveId(
         (createDir ? `${createDir}/` : '') + `${sluggedNoteName(title, fileName) || 'note'}.md`,
       )
-    const filePath = fileIn(createDir, title, fileName, newId)
+    const filePath = restorePath ?? fileIn(createDir, title, fileName, newId)
     const existing = this.indexByPath(filePath)
 
     // Create-collision policy, mirroring notariumStore: refuse unless the caller
@@ -1251,20 +1426,21 @@ export class InMemoryStore implements KnowledgeStore {
     if (existing !== -1) {
       const prev = this.notes[existing]
 
-      if (frontmatterHasYamlNodeReferences(prev.carried)) {
+      if (!replacing && frontmatterHasYamlNodeReferences(prev.carried)) {
         throw new Error(YAML_NODE_REFERENCE_WRITE_ERROR)
       }
       const carriedState = carriedStateFor(prev.carried)
       const candidate: StoredNote = {
         ...prev,
+        physicalWriteClaim: nextPhysicalWriteClaim(),
         title,
         content,
-        noteType: noteTypeFor(prev.noteType, carriedState.typed),
-        tags: tagsFor(prev.tags, carriedState.typed),
-        aliases: aliasesFor(prev.aliases, carriedState.typed),
-        slug: slugFor(prev.slug, carriedState.typed),
-        summary: summaryFor(prev.summary, carriedState.typed),
-        muted: mutedFor(prev.muted, carriedState.typed),
+        noteType: noteTypeFor(replacing ? DEFAULT_NOTE_TYPE : prev.noteType, carriedState.typed),
+        tags: tagsFor(replacing ? [] : prev.tags, carriedState.typed),
+        aliases: aliasesFor(replacing ? [] : prev.aliases, carriedState.typed),
+        slug: slugFor(replacing ? undefined : prev.slug, carriedState.typed),
+        summary: summaryFor(replacing ? undefined : prev.summary, carriedState.typed),
+        muted: mutedFor(replacing ? undefined : prev.muted, carriedState.typed),
         carried: carriedAfterTypedChannels(carriedState.merged, false),
         createdAt: createdAtFor(prev.createdAt, carriedState.typed),
         createdProjected: createdProjectionFor(prev.createdProjected),
@@ -1277,6 +1453,7 @@ export class InMemoryStore implements KnowledgeStore {
         filePath,
         class: this.notes[existing].class,
         versionToken: tokenOf(this.notes[existing]),
+        physicalWriteClaim: physicalWriteClaimOf(this.notes[existing]),
       }
     }
     const carriedState = carriedStateFor(undefined)
@@ -1302,6 +1479,7 @@ export class InMemoryStore implements KnowledgeStore {
       modifiedAt: this.nowIso,
       createdAt: createdAtFor(null, carriedState.typed) ?? this.nowIso,
       createdProjected: createdAt !== undefined,
+      physicalWriteClaim: nextPhysicalWriteClaim(),
     }
     this.assertExportable(fresh)
     this.notes.push(fresh)
@@ -1311,6 +1489,7 @@ export class InMemoryStore implements KnowledgeStore {
       filePath,
       class: fresh.class,
       versionToken: tokenOf(fresh),
+      physicalWriteClaim: physicalWriteClaimOf(fresh),
     }
   }
 
@@ -1352,6 +1531,7 @@ export class InMemoryStore implements KnowledgeStore {
         if (n.filePath === src || n.filePath.startsWith(src + '/')) {
           n.filePath = destinationPath + n.filePath.slice(src.length)
           n.modifiedAt = this.nowIso
+          n.physicalWriteClaim = nextPhysicalWriteClaim()
         }
       }
       // Re-key the directory channel: the src subtree moves wholesale, the src
@@ -1376,13 +1556,34 @@ export class InMemoryStore implements KnowledgeStore {
     }
     this.notes[i].filePath = destinationPath
     this.notes[i].modifiedAt = this.nowIso
+    this.notes[i].physicalWriteClaim = nextPhysicalWriteClaim()
     this.addDirs(destinationPath) // seed the new folder; the old lingers (#97)
   }
 
-  async remove(rawId: string, opts?: { identityOnly?: boolean }): Promise<void> {
+  async remove(
+    rawId: string,
+    opts?: {
+      identityOnly?: boolean
+      versionToken?: string
+      physicalWriteClaim?: PhysicalWriteClaim
+    },
+  ): Promise<void> {
     const i = this.findIndex(rawId, opts?.identityOnly)
 
     if (i !== -1) {
+      if (
+        opts?.physicalWriteClaim &&
+        (opts.physicalWriteClaim.kind !== this.notes[i].physicalWriteClaim.kind ||
+          opts.physicalWriteClaim.value !== this.notes[i].physicalWriteClaim.value)
+      ) {
+        throw writeFailed('note changed during delete')
+      }
+      if (
+        opts?.versionToken &&
+        documentStateVersionToken(this.documentStateOf(this.notes[i])) !== opts.versionToken
+      ) {
+        throw writeFailed('note changed during delete')
+      }
       this.notes.splice(i, 1)
     }
     // never-prune (#97): the note's folder stays in the directory channel.

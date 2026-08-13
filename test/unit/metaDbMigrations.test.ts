@@ -67,6 +67,9 @@ describe('meta-DB migration assets and SQLite runner', () => {
       { version: 3, name: 'revision_integrity' },
       { version: 4, name: 'scoped_purge_fences' },
       { version: 5, name: 'revision_entry_role' },
+      { version: 6, name: 'revision_state' },
+      { version: 7, name: 'revision_purge_cas' },
+      { version: 8, name: 'causal_metadata' },
     ])
     for (const migration of migrations) {
       expect(migration.checksum).toBe(checksumMigrationPair(migration.sqlite, migration.postgres))
@@ -102,7 +105,7 @@ describe('meta-DB migration assets and SQLite runner', () => {
           .all() as Array<{ type: string; count: number }>
       ).map(({ type, count }) => [type, count]),
     )
-    expect(counts).toEqual({ index: 41, table: 27, trigger: 3 })
+    expect(counts).toEqual({ index: 50, table: 37, trigger: 27 })
     expect(
       db.prepare("SELECT 1 FROM sqlite_schema WHERE name = 'meta_schema'").get(),
     ).toBeUndefined()
@@ -135,6 +138,27 @@ describe('meta-DB migration assets and SQLite runner', () => {
         .prepare('SELECT owner, name, calls, role FROM agent_sessions WHERE id = ?')
         .get('ses_existingv1aa'),
     ).toEqual({ owner: 'alice', name: 'Existing', calls: 7, role: null })
+  })
+
+  it('adds the revision snapshot marker without relabelling legacy body blobs', () => {
+    const db = database()
+    runSqliteMigrations(db, migrations.slice(0, 6))
+    db.exec(`
+      INSERT INTO revision_blobs (hash, content)
+      VALUES ('legacy-hash', 'legacy body');
+      INSERT INTO note_revisions
+        (note_id, space, kind, title, tags, content_hash, created_at)
+      VALUES
+        ('legacy-state', 'main', 'write', 'Legacy', '[]', 'legacy-hash', '2026-08-01');
+    `)
+
+    runSqliteMigrations(db)
+
+    expect(
+      db
+        .prepare('SELECT content_hash, snapshot_format FROM note_revisions WHERE note_id = ?')
+        .get('legacy-state'),
+    ).toEqual({ content_hash: 'legacy-hash', snapshot_format: null })
   })
 
   it('keeps a pre-#327 purge fence global while scoping every new one', () => {
@@ -323,7 +347,8 @@ describe('meta-DB migration assets and SQLite runner', () => {
     expect(
       db
         .prepare(
-          `SELECT note_id, agent_owner, agent_name, session_id, session_name, session_attach
+          `SELECT note_id, agent_owner, agent_name, session_id, session_name, session_attach,
+                  snapshot_format
              FROM note_revisions WHERE note_id = 'legacy-note'`,
         )
         .get(),
@@ -334,6 +359,7 @@ describe('meta-DB migration assets and SQLite runner', () => {
       session_id: null,
       session_name: null,
       session_attach: null,
+      snapshot_format: null,
     })
   })
 

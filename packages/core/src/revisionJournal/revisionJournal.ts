@@ -10,17 +10,56 @@ import {
   type Revision,
   REVISION_ENTRY_ROLE,
   REVISION_KIND,
+  type RevisionBlob,
   type RevisionDetail,
   type RevisionEntryRole,
+  RevisionHeadConflictError,
   type RevisionInput,
   type RevisionPersistence,
+  type TrashAvailabilityFilter,
 } from '../knowledgeStore'
 import { diffStats } from '../libs/diffStats'
 import { sha256Hex } from '../libs/hash'
+import {
+  decodeDocumentState,
+  DOCUMENT_STATE_FORMAT,
+  documentSourceText,
+  encodeDocumentState,
+  LOGICAL_NOTE_STATE_FORMAT,
+  logicalNoteState,
+  type LogicalNoteState,
+  parseLogicalNoteState,
+} from '../libs/markdown'
 import type { JournalOptions, JournalRecordInput } from './types'
 
 const sameTags = (a: readonly string[], b: readonly string[]) =>
   a.length === b.length && a.every((t, i) => t === b[i])
+
+const stateBlob = (input: JournalRecordInput): RevisionBlob | null =>
+  input.documentState != null
+    ? encodeDocumentState(input.documentState)
+    : (input.logicalState?.markdown ?? input.content)
+
+const textBlob = (blob: RevisionBlob): string =>
+  typeof blob === 'string' ? blob : new TextDecoder().decode(blob)
+
+const comparableText = (
+  blob: RevisionBlob | null,
+  format: Revision['stateFormat'],
+): string | null => {
+  if (blob == null) {
+    return null
+  }
+  if (format === DOCUMENT_STATE_FORMAT.opaque) {
+    return null
+  }
+  if (format === DOCUMENT_STATE_FORMAT.markdown || format === DOCUMENT_STATE_FORMAT.skill) {
+    const bytes = typeof blob === 'string' ? new TextEncoder().encode(blob) : blob
+    return documentSourceText(decodeDocumentState(bytes))
+  }
+
+  return textBlob(blob)
+}
 
 export class RevisionJournal {
   private readonly persistence: RevisionPersistence
@@ -53,6 +92,13 @@ export class RevisionJournal {
         return null
       }
     })
+  }
+
+  /** Queue a state whose durability is part of the caller's operation. Trash
+   * restore uses this path: publishing a live file without the matching row
+   * would make a concurrent permanent purge appear to succeed. */
+  recordRequired(input: JournalRecordInput): Promise<Revision | null> {
+    return this.enqueue(input.noteId, () => this.append(input, true))
   }
 
   async list(
@@ -119,9 +165,14 @@ export class RevisionJournal {
    *  is a delete-tombstone, newest-deleted first, windowed. Class-scoped via
    *  `excludeClasses` (the read-model passes the hidden set). */
   async listTrashed(
-    opts: { offset: number; limit: number; q?: string },
+    opts: {
+      offset: number
+      limit: number
+      q?: string
+      availability?: TrashAvailabilityFilter
+    },
     excludeClasses?: readonly string[],
-  ): Promise<{ items: Revision[]; total: number; restorableTotal: number }> {
+  ): Promise<{ items: Revision[]; total: number; restorableTotal: number; partialTotal: number }> {
     await this.ensureInit()
     return this.persistence.listTrashed(this.space, opts, excludeClasses)
   }
@@ -129,10 +180,13 @@ export class RevisionJournal {
   /** Permanently erase notes from the journal (purge) + GC their blobs.
    *  Drains the append queue first so an in-flight delete-tombstone for one of
    *  these notes can't land after the rows are gone (resurrecting it in trash). */
-  async purge(noteIds: readonly string[]): Promise<void> {
+  async purge(
+    noteIds: readonly string[],
+    expectedLatest?: ReadonlyMap<string, string>,
+  ): Promise<readonly string[]> {
     await this.ensureInit()
     await this.drain()
-    return this.persistence.purgeNotes(this.space, noteIds)
+    return this.persistence.purgeNotes(this.space, noteIds, expectedLatest)
   }
 
   /** Whether the note has any journaled state — what gates the pre-edit
@@ -168,8 +222,52 @@ export class RevisionJournal {
     if (!rev || rev.noteId !== noteId) {
       return null
     }
-    const content = rev.contentHash != null ? await this.persistence.content(rev.contentHash) : null
-    return { ...rev, content }
+    const stored = rev.contentHash != null ? await this.persistence.content(rev.contentHash) : null
+
+    if (
+      stored != null &&
+      (rev.stateFormat === DOCUMENT_STATE_FORMAT.markdown ||
+        rev.stateFormat === DOCUMENT_STATE_FORMAT.skill ||
+        rev.stateFormat === DOCUMENT_STATE_FORMAT.opaque)
+    ) {
+      const bytes = typeof stored === 'string' ? new TextEncoder().encode(stored) : stored
+      const documentState = decodeDocumentState(bytes)
+      const sourceText = documentSourceText(documentState)
+      const projection = documentState.projection
+      return {
+        ...rev,
+        content: projection?.body ?? null,
+        logicalState:
+          sourceText == null || projection == null
+            ? null
+            : logicalNoteState({
+                title: projection.title,
+                body: projection.body,
+                frontmatter: projection.frontmatterEntries,
+              }),
+        documentState,
+      }
+    }
+
+    if (stored != null && rev.stateFormat === LOGICAL_NOTE_STATE_FORMAT) {
+      const logicalState: LogicalNoteState = {
+        format: LOGICAL_NOTE_STATE_FORMAT,
+        markdown: textBlob(stored),
+      }
+      return {
+        ...rev,
+        content: parseLogicalNoteState(logicalState).body,
+        logicalState,
+        documentState: null,
+      }
+    }
+
+    return {
+      ...rev,
+      content: stored == null ? null : textBlob(stored),
+      logicalState: null,
+      documentState: null,
+    }
   }
 
   /** noteId → newest revision timestamp for this journal's space — the boot
@@ -202,7 +300,22 @@ export class RevisionJournal {
     await Promise.all([...this.chains.values()])
   }
 
-  private async append(input: JournalRecordInput): Promise<Revision | null> {
+  private async append(input: JournalRecordInput, required = false): Promise<Revision | null> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.appendAgainstHead(input, required)
+      } catch (error) {
+        if (!(error instanceof RevisionHeadConflictError) || attempt >= 3) {
+          throw error
+        }
+      }
+    }
+  }
+
+  private async appendAgainstHead(
+    input: JournalRecordInput,
+    required: boolean,
+  ): Promise<Revision | null> {
     await this.ensureInit()
     let latest = await this.persistence.latestFor(this.space, input.noteId)
 
@@ -214,6 +327,8 @@ export class RevisionJournal {
         kind: REVISION_KIND.external,
         principal: null,
         content: input.baseline.content,
+        logicalState: input.baseline.logicalState,
+        documentState: input.baseline.documentState,
         title: input.baseline.title,
         // The baseline is the SAME note's pre-edit state — class is immutable.
         class: input.class,
@@ -224,10 +339,11 @@ export class RevisionJournal {
       }
       const baselineRev = await this.revisionOf(baselineInput, null, REVISION_ENTRY_ROLE.baseline)
       await this.stampStats(baselineRev, baselineInput, null)
-      latest = await this.persistence.append(baselineRev, input.baseline.content)
+      latest = await this.persistence.append(baselineRev, stateBlob(baselineInput))
     }
 
     const rev = await this.revisionOf(input, latest, await this.roleOf(input, latest))
+    rev.allowSemanticNoop = !required
 
     if (input.kind === REVISION_KIND.delete) {
       // A delete journals once; the tombstone keeps the last known hash so an
@@ -236,12 +352,10 @@ export class RevisionJournal {
         return null
       }
     } else if (
+      !required &&
       latest &&
       latest.kind !== REVISION_KIND.delete &&
-      latest.contentHash === rev.contentHash &&
-      latest.title === rev.title &&
-      latest.slug === rev.slug &&
-      sameTags(latest.tags, rev.tags)
+      (await this.isDuplicate(latest, rev, input))
     ) {
       // Same state again — a no-op save, or the delta poll echoing our own
       // write back (a reindex re-surfaces everything we write). Not a revision. Slug is in
@@ -250,7 +364,51 @@ export class RevisionJournal {
     }
 
     await this.stampStats(rev, input, latest)
-    return this.persistence.append(rev, input.content)
+    const stored = await this.persistence.append(rev, stateBlob(input))
+    return rev.allowSemanticNoop === true && stored.id === rev.expectedHeadRevisionId
+      ? null
+      : stored
+  }
+
+  private async isDuplicate(
+    latest: Revision,
+    candidate: RevisionInput,
+    input: JournalRecordInput,
+  ): Promise<boolean> {
+    if (
+      input.documentState != null &&
+      latest.stateFormat === input.documentState.format &&
+      latest.contentHash != null
+    ) {
+      const blob = await this.persistence.content(latest.contentHash)
+
+      if (blob == null) {
+        return false
+      }
+      try {
+        const bytes = typeof blob === 'string' ? new TextEncoder().encode(blob) : blob
+        return (
+          decodeDocumentState(bytes).semanticFingerprint === input.documentState.semanticFingerprint
+        )
+      } catch {
+        return false
+      }
+    }
+    if (
+      latest.stateFormat === LOGICAL_NOTE_STATE_FORMAT &&
+      candidate.stateFormat === LOGICAL_NOTE_STATE_FORMAT
+    ) {
+      return latest.contentHash === candidate.contentHash
+    }
+
+    return (
+      latest.stateFormat == null &&
+      candidate.stateFormat == null &&
+      latest.contentHash === candidate.contentHash &&
+      latest.title === candidate.title &&
+      latest.slug === candidate.slug &&
+      sameTags(latest.tags, candidate.tags)
+    )
   }
 
   /** The "+N −M" counters (timeline): the revision against its chain
@@ -266,18 +424,35 @@ export class RevisionJournal {
       const base =
         latest?.contentHash != null ? await this.persistence.content(latest.contentHash) : null
 
+      // A legacy body cannot be compared honestly with a complete Markdown
+      // snapshot: the missing metadata may or may not have existed. The first
+      // full row remains visible, but its counters are explicitly unknown.
+      if (latest && latest.stateFormat !== (rev.stateFormat ?? null)) {
+        return
+      }
+
       if (input.kind === REVISION_KIND.delete) {
-        if (base != null) {
+        const baseText = comparableText(base, latest?.stateFormat ?? null)
+
+        if (baseText != null) {
           rev.charsAdded = 0
-          rev.charsRemoved = base.length
+          rev.charsRemoved = baseText.length
         }
 
         return
       }
-      if (input.content == null) {
+      const current = stateBlob(input)
+
+      if (current == null) {
         return
       }
-      const stats = diffStats(base ?? '', input.content)
+      const currentText = comparableText(current, rev.stateFormat ?? null)
+      const baseText = comparableText(base, latest?.stateFormat ?? null)
+
+      if (currentText == null || (latest && baseText == null)) {
+        return
+      }
+      const stats = diffStats(baseText ?? '', currentText)
 
       if (stats) {
         rev.charsAdded = stats.charsAdded
@@ -318,6 +493,7 @@ export class RevisionJournal {
     entryRole: RevisionEntryRole,
   ): Promise<RevisionInput> {
     const carriedTags = input.tags ?? latest?.tags ?? []
+    const blob = stateBlob(input)
     return {
       noteId: input.noteId,
       space: this.space,
@@ -329,11 +505,27 @@ export class RevisionJournal {
       principal: input.principal,
       agent: input.agent ?? null,
       contentHash:
-        input.content != null
-          ? await sha256Hex(input.content)
+        blob != null
+          ? await sha256Hex(blob)
           : input.kind === REVISION_KIND.delete
             ? (latest?.contentHash ?? null)
             : null,
+      semanticFingerprint:
+        input.documentState?.semanticFingerprint ??
+        (input.kind === REVISION_KIND.delete ? (latest?.semanticFingerprint ?? null) : null),
+      restoreSafety:
+        input.documentState?.restoreSafety.status ??
+        (input.kind === REVISION_KIND.delete ? (latest?.restoreSafety ?? null) : null),
+      expectedHeadRevisionId: latest?.id ?? null,
+      allowSemanticNoop: true,
+      stateFormat:
+        blob != null && input.documentState != null
+          ? input.documentState.format
+          : blob != null && input.logicalState?.format === LOGICAL_NOTE_STATE_FORMAT
+            ? LOGICAL_NOTE_STATE_FORMAT
+            : input.kind === REVISION_KIND.delete && blob == null
+              ? (latest?.stateFormat ?? null)
+              : null,
       title: input.title,
       // Class is immutable per note — carry the prior revision's forward
       // when this record didn't supply one (a body-less external/delete).

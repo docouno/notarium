@@ -3,11 +3,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { beforeEach, describe, expect, it } from 'vitest'
-import {
-  SaveResponseSchema,
-  TrashPurgeResponseSchema,
-  TrashResponseSchema,
-} from '@notarium/contract'
+import { TrashPurgeResponseSchema, TrashResponseSchema } from '@notarium/contract'
 import { createApp, type Fixture } from './app.js'
 
 // Trash (#79) over the fake backend: the real Fastify app + CachedStore over
@@ -47,110 +43,93 @@ describe('trash (#79)', () => {
 
     const body = await trashOf()
     expect(TrashResponseSchema.safeParse(body).success).toBe(true)
-    expect(body.restorableTotal).toBe(1)
+    expect(body.restorableTotal).toBe(0)
     const row = body.items.find((i: { noteId: string }) => i.noteId === id)
     expect(row).toBeTruthy()
     expect(row.title).toBe('Trash Me')
     expect(row.filePath).toBe(filePath) // demo/trash-me.md
     expect(row.external).toBe(false) // deleted through us
     expect(row.restorable).toBe(true) // body captured at delete time
+    expect(row.restoreAvailability).toBe('capability-unavailable')
     expect(row.deletedBy).toBeTruthy() // a resolved author (not external)
 
     const notes = await notesOf()
     expect(notes.notes.some((n: { id: string }) => n.id === id)).toBe(false)
   })
 
-  it('restore resurrects the note with its id and folder, and clears the trash row', async () => {
+  it('single restore degrades honestly without durable strict publication', async () => {
     const { id, filePath } = await createNote('Bring Me Back')
     await del(`/api/note?id=${id}`)
+    const item = (await trashOf()).items.find(
+      (candidate: { noteId: string }) => candidate.noteId === id,
+    )
 
-    const res = await post('/api/s/main/trash/restore', { id })
-    expect(res.statusCode).toBe(200)
-    const save = res.json()
-    expect(SaveResponseSchema.safeParse(save).success).toBe(true)
-    expect(save.id).toBe(id) // SAME note-id (#51)
-    expect(save.filePath).toBe(filePath) // back in its folder
-
-    // live again, gone from the trash
-    const note = await get(`/api/note?id=${id}`)
-    expect(note.id).toBe(id)
-    expect(note.content).toContain('body')
-    const trash = await trashOf()
-    expect(trash.items.some((i: { noteId: string }) => i.noteId === id)).toBe(false)
+    const res = await post('/api/s/main/trash/restore', {
+      id,
+      revisionId: item.revisionId,
+      idempotencyKey: 'fake-single-restore',
+    })
+    expect(res.statusCode).toBe(503)
+    expect(res.json()).toMatchObject({ status: 'busy', reason: 'strict-restore-unavailable' })
+    expect((await trashOf()).items.some((i: { noteId: string }) => i.noteId === id)).toBe(true)
+    expect(filePath).toBeTruthy()
   })
 
-  it('restore-many is best-effort: several trashed notes come back in one round-trip, stale ids are reported', async () => {
+  it('bulk restore degrades honestly without durable strict publication', async () => {
     const a = await createNote('Alpha Back')
     const b = await createNote('Beta Back')
     await del(`/api/note?id=${a.id}`)
     await del(`/api/note?id=${b.id}`)
 
-    const res = await post('/api/s/main/trash/restore-many', { ids: [a.id, 'no-such-note', b.id] })
-    expect(res.statusCode).toBe(200)
-    expect(res.json()).toMatchObject({
-      ok: true,
-      restored: [{ id: a.id }, { id: b.id }],
-      failed: [{ id: 'no-such-note', reason: 'note_not_in_trash' }],
-    })
-    expect((await trashOf()).total).toBe(0)
-  })
-
-  it('restore-many supports all+q (the select-all-N path) and restores only the filtered trash rows', async () => {
-    const carbon = await createNote('Carbon Back')
-    const cobalt = await createNote('Cobalt Back')
-    await del(`/api/note?id=${carbon.id}`)
-    await del(`/api/note?id=${cobalt.id}`)
-
     const res = await post('/api/s/main/trash/restore-many', {
-      all: true,
-      q: 'carbon',
-      onlyRestorable: true,
+      ids: [a.id, 'no-such-note', b.id],
+      idempotencyKey: 'fake-bulk-restore',
     })
-    expect(res.statusCode).toBe(200)
+    expect(res.statusCode).toBe(503)
     expect(res.json()).toMatchObject({
-      ok: true,
-      restored: [{ id: carbon.id }],
-      failed: [],
+      status: 'busy',
+      reason: 'strict-restore-unavailable',
     })
     const trash = await trashOf()
-    expect(trash.total).toBe(1)
-    expect(trash.items[0].noteId).toBe(cobalt.id)
+    expect(trash.total).toBe(2)
+    expect(trash.restorableTotal).toBe(0)
   })
 
-  it('restore-many(all) scales beyond one trash page (#184 select-all-N)', async () => {
-    const ids: string[] = []
+  it('availability filters follow the public host capability for list and select-all purge', async () => {
+    const a = await createNote('Unavailable Alpha')
+    const b = await createNote('Unavailable Beta')
+    await del(`/api/note?id=${a.id}`)
+    await del(`/api/note?id=${b.id}`)
 
-    for (let i = 0; i < 101; i++) {
-      const note = await createNote(`Bulk ${String(i).padStart(3, '0')}`)
-      ids.push(note.id)
-      await del(`/api/note?id=${note.id}`)
-    }
+    const restorable = await get('/api/s/main/trash?availability=restorable')
+    expect(restorable).toMatchObject({
+      total: 0,
+      restorableTotal: 0,
+      partialTotal: 0,
+      restoreAvailable: false,
+      items: [],
+    })
+    const unavailable = await get('/api/s/main/trash?availability=unavailable')
+    expect(unavailable.total).toBe(2)
+    expect(unavailable.items).toHaveLength(2)
 
-    const firstPage = await get('/api/s/main/trash?limit=100')
-    expect(firstPage.total).toBe(101)
-    expect(firstPage.items).toHaveLength(100)
-
-    const res = await post('/api/s/main/trash/restore-many', { all: true, onlyRestorable: true })
-    expect(res.statusCode).toBe(200)
-    expect(res.json().restored).toHaveLength(101)
-    expect((await trashOf()).total).toBe(0)
-  })
-
-  it('a seeded note never saved through us is still restorable (read-before-delete)', async () => {
-    // fake-demo-carbon is seeded (no journal history) — delete must capture its
-    // body so the trash can resurrect it; otherwise the safety net is hollow.
-    const CARBON = 'fake-demo-carbon'
-    await del(`/api/note?id=${CARBON}`)
-    const trash = await trashOf()
-    const row = trash.items.find((i: { noteId: string }) => i.noteId === CARBON)
-    expect(row).toBeTruthy()
-    expect(row.restorable).toBe(true)
-
-    const res = await post('/api/s/main/trash/restore', { id: CARBON })
-    expect(res.statusCode).toBe(200)
-    expect(res.json().id).toBe(CARBON)
-    const note = await get(`/api/note?id=${CARBON}`)
-    expect(note.content).toContain('organic chemistry') // its real body came back
+    expect(
+      (
+        await post('/api/s/main/trash/purge', {
+          all: true,
+          availability: 'restorable',
+        })
+      ).json().purged,
+    ).toBe(0)
+    expect((await trashOf()).total).toBe(2)
+    expect(
+      (
+        await post('/api/s/main/trash/purge', {
+          all: true,
+          availability: 'unavailable',
+        })
+      ).json().purged,
+    ).toBe(2)
   })
 
   it('purge erases one note for good; restore then 404s', async () => {
@@ -165,8 +144,12 @@ describe('trash (#79)', () => {
 
     const trash = await trashOf()
     expect(trash.items.some((i: { noteId: string }) => i.noteId === id)).toBe(false)
-    const restore = await post('/api/s/main/trash/restore', { id })
-    expect(restore.statusCode).toBe(404) // not_in_trash
+    const restore = await post('/api/s/main/trash/restore', {
+      id,
+      revisionId: 'purged-revision',
+      idempotencyKey: 'purged-command',
+    })
+    expect(restore.statusCode).toBe(503)
   })
 
   it('purge refuses to nuke a LIVE note (only genuinely-trashed ids are erased)', async () => {

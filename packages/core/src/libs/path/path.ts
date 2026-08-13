@@ -18,6 +18,25 @@ export const basenameOf = (filePath: string): string => {
   return i === -1 ? filePath : filePath.slice(i + 1)
 }
 
+/** Canonical skill package directory for a mount-relative resource path.
+ * Personal/space packages occupy one segment; project packages occupy the exact
+ * `_projects/<project>/<package>` prefix. Files below `references/`, `scripts/`
+ * and other package folders still belong to that same root. */
+export const skillPackagePathOf = (filePath: string): string | null => {
+  const parts = filePath.split('/')
+
+  if (parts[0] === '_projects') {
+    return parts.length >= 4 && parts[1] && parts[2] ? parts.slice(0, 3).join('/') : null
+  }
+
+  return parts.length >= 2 && parts[0] ? parts[0] : null
+}
+
+export const isSkillPackageRootPath = (filePath: string): boolean => {
+  const packagePath = skillPackagePathOf(filePath)
+  return packagePath != null && filePath === `${packagePath}/SKILL.md`
+}
+
 /** Is this note the PAGE of its folder? True for a `<folder>/index.md` (or a
  *  root-level `index.md`). The folder a page belongs to is just `directoryOf` it. */
 export const isFolderPageNote = (filePath: string): boolean =>
@@ -134,6 +153,15 @@ export const isCanonicalSafeRelativePath = (input: string): boolean =>
 export const isCanonicalSafeRelativeAddress = (input: string): boolean => {
   return normalizeSafeRelativeAddress(input) === input
 }
+
+/** Canonical space-relative address for a trusted internal placement such as an
+ * identity tombstone. Unlike the public predicate it permits dot-prefixed mount
+ * components, but still rejects absolute, ambiguous and traversal spellings. */
+export const isCanonicalInternalRelativeAddress = (input: string): boolean =>
+  isDurableScalar(input) &&
+  !input.startsWith('/') &&
+  !input.includes('\\') &&
+  input.split('/').every((segment) => segment !== '' && segment !== '.' && segment !== '..')
 
 /** A new destination may pass through legacy non-portable directories that
  * already exist, but every newly-created component must be portable. `hasDir`
