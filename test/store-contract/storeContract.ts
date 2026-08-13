@@ -400,10 +400,9 @@ export const describeKnowledgeStoreContract = (
     })
 
     it('resolves a letterless name on EVERY surface, not only in the graph', async () => {
-      // The graph, the engine's own reference resolver and the client each keep a copy
-      // of this rule, and a name the branch made addressable has to reach the note on
-      // all of them: a link the graph draws as healthy, whose click 404s, sends the UI
-      // to offer CREATING the note it just linked to.
+      // Graph derivation and a bare engine's direct reader must agree on this rule.
+      // Cached production resolution is covered by its own suites; this assertion
+      // pins engine parity rather than the HTTP click route.
       await store.write({ title: '🎉🎉', directory: dir, content: 'party' })
       const created = byTitle(await store.list(), '🎉🎉')!
 

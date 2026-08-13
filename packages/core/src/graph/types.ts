@@ -1,7 +1,4 @@
-// Shared types for the graph service: edge identity/dedup shapes, the wikilink
-// resolve index and its aliases (graph.ts), plus the server-side layout/enrich
-// option and position shapes (layout.ts/enrich.ts). Split out so the impl files
-// carry only functions.
+// Public graph edge and layout data shapes.
 // canon: docs/core.md#graph-derivation
 
 import type { GRAPH_GHOST_TARGET } from '../knowledgeStore'
@@ -12,33 +9,6 @@ export type GraphEdgeLike = {
   type: string
   [GRAPH_GHOST_TARGET]?: true
 }
-
-/** A ghost's identity + create-from-ghost prefill, as the read-model
- *  registry keeps it. Degree and backlink sources are derived at shape time. */
-export type GhostStub = {
-  id: string
-  title: string
-  target: string
-  prefillTitle: string
-  /** Raw/current directory the create flow must use to close a path-form link. */
-  prefillDirectory?: string
-  /** False for a missing stable identity: minting a different note cannot close it. */
-  creatable: boolean
-}
-
-/** internal resolve key → node id. Keys cover the exact stable-id namespace plus
- *  every way a [[wikilink]] names a note: the
- *  slugged full path, the slugged filename, the slugged title, the note's custom
- *  display slug, and — so a rename never breaks inbound links —
- *  the slug of each past name (alias). */
-export type LinkIndex = Map<string, string>
-
-/** A folder's past path → its current path. Both RAW, space-relative;
- *  slugified at index-build. Lets [[oldpath/note]] resolve after a folder rename/
- *  move: the note's current key is `current/…`, this registers the `alias/…` key
- *  too. Folder identity lives server-side (marker/meta-DB), so the map is injected
- *  only where the read-model builds the index — the engine passes none. */
-export type FolderAlias = { current: string; alias: string }
 
 export type LayoutPositions = ReadonlyMap<string, { x: number; y: number }>
 

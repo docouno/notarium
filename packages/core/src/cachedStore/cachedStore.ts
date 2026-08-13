@@ -5,13 +5,7 @@
 // never hangs (cheap inventory answers first, later sweeps fill dates and edges).
 // canon: docs/core.md#read-model · docs/core.md#phased-boot
 
-import {
-  aggregateGraphHealth,
-  buildLinkIndex,
-  type FolderAlias,
-  resolveLink,
-  shapeGraph,
-} from '../graph'
+import { aggregateGraphHealth, shapeGraph } from '../graph'
 import { type AdoptResult, IdentityRegistry } from '../identity'
 import type {
   AgentWriteAttribution,
@@ -68,6 +62,7 @@ import {
 import { MutationCoordinator } from '../libs/mutationCoordinator'
 import { directoryOf, isPathUnder } from '../libs/path'
 import { normTags } from '../libs/tags'
+import { buildLinkIndex, type FolderAlias, resolveLink } from '../referenceResolver'
 import { InMemoryRevisionPersistence, RevisionJournal } from '../revisionJournal'
 import { derivePreview } from '../snippet'
 import { classesForScope, DEFAULT_NOTE_CLASS, isVisibleOn, SURFACE } from '../visibility'
@@ -2194,8 +2189,8 @@ export class CachedStore implements KnowledgeStore {
       } else {
         // Exact path is an identity hint. A title is not: choosing a unique exact
         // title here can bypass a higher-priority filename in the inner store and
-        // make CachedStore resolve a different note than graph/client. Name lookup
-        // belongs to the shared resolver below the cache.
+        // make CachedStore resolve a different note than graph derivation does. Name
+        // lookup belongs to the shared `core/referenceResolver` below the cache.
         const matches = [...this.snap.notes].filter(([, meta]) => meta.filePath === requestedId)
 
         owner =

@@ -240,15 +240,9 @@ export const legacyImportSlug = (s: string): string =>
 /** Slugify a path per segment ("Dir Name/Note" → "dir-name/note"). */
 export const slugifyPath = (p: string): string => p.split('/').map(slugify).join('/')
 
-/** The key a NOTE NAME is resolved, deduped and retired by — its slug, or the raw
- *  NFC case-folded form when the name has nothing sluggable in it. TOTAL where `slugify`
- *  is not: `[[🎉🎉]]` is a name a human writes and a note can answer to, so every
- *  surface that matches names — the link index, the resolvers on both engines and the
- *  client, the alias history, the read-model snapshot — keys on THIS, or one of them
- *  silently loses a note the others can reach (#296).
- *
- *  Use `slugify` for a value that must be a slug (a URL tail, a file name, an anchor);
- *  use this wherever two NAMES are compared.
+/** Total comparison key for human note names: the slug, or the raw NFC case-folded
+ *  form when no sluggable characters survive. Name matchers use this; values that
+ *  must themselves be slugs (URL tails, file names, anchors) use `slugify`.
  *
  *  The raw rung strips variation selectors for the same reason `slugify` does, and it
  *  is the rung those names actually take: `❤️` and `❤` are one glyph in two legal

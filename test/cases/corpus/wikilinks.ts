@@ -5,8 +5,10 @@ import type { Fragment } from './types'
 // encodes the target and keeps the label (inline markdown allowed); a nested
 // anchor/autolink/raw-HTML in a label is neutralised so the wiki anchor stays the
 // only one (security). The resolved / ghost / alias visual states are a reader
-// concern (NoteReader.resolveWiki) — the graph/identity cases exercise those; here
-// we pin the render contract. Grounded in wikilink.ts + markdown.test.ts.
+// concern — the reader completes only a known stable id locally
+// (`NoteReader/resolveKnownWiki`) and asks the server for a human reference, and the
+// graph/identity cases exercise those; here we pin the render contract. Grounded in
+// wikilink.ts + markdown.test.ts.
 export const wikilinksFragments: Fragment[] = [
   {
     id: 'wikilink-basic',

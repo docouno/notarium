@@ -58,12 +58,12 @@ export type NoteView = {
   /** Read-only mount class (#78): user-doc / agent-memory / profile. */
   class?: WireNote['class']
   /** The editable display slug (#100 phase 1) — the client builds `/n/<id>/<slug>`
-   *  from it (canonical URL) and resolveWiki keys [[my-slug]] on it. Absent when
-   *  the note has no custom slug (the URL tail then derives from the title). */
+   *  from it (canonical URL). Absent when the note has no custom slug (the URL tail
+   *  then derives from the title). Resolving `[[my-slug]]` is NOT done here: the
+   *  session inventory is partial, so a human reference goes to `api.noteResolve`. */
   slug?: string
-  /** Past human names the resolver still honours (#100) — so a renamed note's
-   *  old [[name]] resolves from this cached list (resolveWiki), no round-trip.
-   *  Absent/empty when the note was never renamed. */
+  /** Alias-history as returned by the list wire. Human resolution runs server-side
+   *  over the whole space, never against this cached window. */
   aliases?: string[]
   modifiedAt: string | null
   createdAt: string | null
@@ -93,12 +93,11 @@ export type NoteDetailView = {
   /** Read-only mount class (#78): distinguishes user docs from agent-memory. */
   class?: WireNoteDetail['class']
   /** The editable display slug (#100 phase 1) — the reader prefills the slug field
-   *  from it, the page canonicalises the URL to `/n/<id>/<slug>`, and asNote seeds
-   *  the resolution cache WITH it. Absent when the note has no custom slug. */
+   *  from it and the page canonicalises the URL to `/n/<id>/<slug>`. Absent when the
+   *  note has no custom slug. */
   slug?: string
-  /** Past human names the resolver honours (#100) — carried so a detail-opened
-   *  note (space-free /n/<id>) seeds the resolution cache (asNote) WITH its
-   *  aliases, so a [[Old Name]] to it resolves client-side, no round-trip. */
+  /** Alias-history as returned by the detail wire. It is not local lookup material:
+   *  every human reference goes to `api.noteResolve`. */
   aliases?: string[]
   content: string
   frontmatter: Record<string, unknown>

@@ -3,7 +3,8 @@
 // [[Old Name]] links that point at it. Aliases live in the note's frontmatter
 // (`aliases:`, Obsidian-native — survives an external re-clone) and
 // in the derived index; the resolver registers nameKey(alias) keys so an old
-// name resolves id-first → current name → alias-history (graph.ts buildLinkIndex).
+// name resolves id-first → current name → alias-history
+// (core/referenceResolver buildLinkIndex).
 //
 // Stored RAW, not pre-slugified: the alias stays human-readable and Obsidian-
 // compatible; the resolver slugifies on lookup, exactly as it does for current
@@ -96,7 +97,8 @@ const nextMultiBy = (
 
 /** nextAliases for folder PATH history: renaming/moving a folder from
  *  `oldPath` to `newPath` retires the old path so `[[oldPath/note]]` keeps
- *  resolving (the folder-alias pass of buildLinkIndex). Dedup is BY `namePathKey` —
+ *  resolving (the folder-alias pass of the reference resolver's `buildLinkIndex`).
+ *  Dedup is BY `namePathKey` —
  *  paths are multi-segment, so the structural `/` must survive (a bare name key would
  *  collapse it, conflating `a/b` with `ab`), and it must be the SAME key the
  *  folder-alias pass looks these up by: on `slugifyPath` a folder whose name has no

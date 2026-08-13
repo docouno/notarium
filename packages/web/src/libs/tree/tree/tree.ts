@@ -81,8 +81,11 @@ export const carryOpenKeys = (open: Set<string>, oldPath: string, newPath: strin
 //
 // Matching is in NAME-KEY space, not slug space: `namePathKey` is the key the producing
 // half uses (`nextPathAliases`) and the key every other consumer of this same history
-// uses — the graph's folder-alias pass, the engine's `resolveRow`, the reader's
-// `resolveWiki`. On `slugifyPath` this surface dropped exactly the aliases the others
+// uses — the folder-alias pass of `core/referenceResolver`'s `buildLinkIndex` and the
+// engine's `resolveRow` underneath the server's `note?ref=` channel. This surface is
+// the folder twin, and the ONE resolution the client does own: a `/files/<oldpath>`
+// URL is answered from the `/tree` payload it already holds, whereas a `[[wikilink]]`
+// naming a note is answered by the server. On `slugifyPath` it dropped exactly the aliases the others
 // keep: a folder named `📥` IS retired into the history, `[[📥/note]]` resolves
 // everywhere, and only a bookmark to `/files/📥` fell through to a 404 (#296).
 // Folder paths are stored RAW on disk, so a matched key is mapped back to a real path.

@@ -179,12 +179,8 @@ describe('NotariumStore — folder path-aliases (#100 phase 3)', () => {
     }
   })
 
-  // #125: the DIRECT resolve path (read by ref) was folder-alias-BLIND — it bit
-  // the server wiki-resolver `GET /api/s/:space/note?ref=` on a client cache-miss
-  // (cachedStore.read → inner.read → resolveRow). The graph resolved [[oldpath/note]]
-  // correctly while a direct read fell through to a tezka sibling: graph/navigation
-  // rassinkhron. resolveRow now mirrors resolveWiki — folder-alias full-path BEFORE
-  // the ambiguous bare last-segment.
+  // Bare/direct reads retain the same folder-alias fallback as graph derivation.
+  // Production HTTP resolution normally selects the winner in CachedStore first.
   it('read() resolves an ambiguous [[oldpath/note]] to the renamed folder, not the tezka sibling', async () => {
     const notesDir = mkdtempSync(join(tmpdir(), 'notarium-fa-read-'))
     const store = createNotariumStore({
@@ -200,8 +196,8 @@ describe('NotariumStore — folder path-aliases (#100 phase 3)', () => {
       // (arkhiv sorts before orbita) — the unambiguous case the read-model never feeds.
       expect((await store.read('kosmos/Note')).filePath).toBe('arkhiv/note.md')
 
-      // Fed the folder path-history (kosmos → orbita), the full-path rewrite wins BEFORE
-      // the bare last-segment, so the direct read agrees with graph() and resolveWiki.
+      // Fed the folder path-history (kosmos → orbita), the full-path rewrite wins
+      // before the bare last-segment, so this direct-read fallback agrees with graph().
       store.setFolderAliases!([{ current: 'orbita', alias: 'kosmos' }])
       expect((await store.read('kosmos/Note')).filePath).toBe('orbita/note.md')
     } finally {

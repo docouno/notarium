@@ -26,12 +26,12 @@ export const NoteListItemSchema = z.object({
   /** Storage-view field: where the note lives as a file. Identity for the Files
    *  browse surface, never a note reference. canon: docs/contract.md#wire-v2 */
   filePath: z.string(),
-  /** The editable display slug: the client builds `/n/<id>/<slug>` from it
-   *  and registers it as a resolve key. Absent when the note has no custom slug. */
+  /** The editable display slug: the client builds `/n/<id>/<slug>` from it.
+   *  Absent when the note has no custom slug. Choosing WHICH note a `[[my-slug]]`
+   *  names is the server's — the client sends human references to `noteResolve`. */
   slug: z.string().optional(),
-  /** Alias-history: past human names (former titles) the link resolver
-   *  still honours, so a renamed note's inbound [[Old Name]] resolves from this
-   *  cached list (the client's resolveWiki). Absent/empty when never renamed. */
+  /** Alias-history returned with note metadata. Human resolution runs server-side
+   *  over the whole space, never against this list window. */
   aliases: z.array(z.string()).optional(),
   /** Last content change. Precise for everything that happened on this
    *  server's watch (journal is the source); day precision (midnight UTC)

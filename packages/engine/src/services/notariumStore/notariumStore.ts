@@ -2255,16 +2255,10 @@ export class NotariumStore implements KnowledgeStore {
     }
   }
 
-  /** Resolve an incoming reference to its index row: storage path first (with
-   *  and without .md), then the title channel, then the slug-fallback passes —
-   *  every form a [[wikilink]] resolver may hand over. The slug-fallback MIRRORS
-   *  resolveWiki (client) and buildLinkIndex+resolveLink (graph) so the THREE
-   *  resolve surfaces agree on the SAME note: a FULL-PATH pass first (the literal
-   *  slug-path PLUS any folder-alias prefix-rewrite, #100 phase 3), then the bare
-   *  last-segment (filename, then title), the custom slug (#100 phase 1), and last the
-   *  ALIAS-history (#100 phase 0). Each is its OWN pass (collision rule current > slug
-   *  > alias, mirroring buildLinkIndex), so a custom slug never out-resolves another
-   *  live note's title and an old name never shadows a live note. */
+  /** Resolve an engine read key: exact identity/storage first, then the shared human
+   *  resolver. CachedStore normally selects a human winner above this seam and returns
+   *  with an identity; bare and degraded paths retain the same fallback.
+   *  @see docs/core.md#graph-derivation */
   private async resolveRow(
     rawId: string,
     identityOnly = false,
@@ -2354,9 +2348,9 @@ export class NotariumStore implements KnowledgeStore {
         return row
       }
     }
-    // The graph, direct reader and client all answer the same name algebra. Building
-    // the shared index here avoids another hand-copied pass order; exact storage paths
-    // above remain the identity fast path.
+    // Bare/degraded direct reads use the same name algebra as graph derivation.
+    // Production CachedStore resolves a human target before its exact-id read; the
+    // shared index keeps this fallback from copying the resolver's pass order.
     const all = await this.sql.all<NoteMetaRow>(`SELECT ${NOTE_META_COLS} FROM notes ORDER BY path`)
     const currentFolders = await this.mountForClass(undefined).files.listDirs()
     const index = buildLinkIndex(
@@ -3191,8 +3185,9 @@ export class NotariumStore implements KnowledgeStore {
   }
 
   /** Boot-time graph through the SAME derivation the read-model patches with
-   *  (core/services/graph — one parser, one ghost algebra, #55 settled): node
-   *  ids are storage paths (bare engine), unresolved targets become ghosts. */
+   *  (`core/referenceResolver` for the resolve index, `core/graph` for the edge
+   *  derivation — one parser, one ghost algebra, #55 settled): node ids are
+   *  storage paths (bare engine), unresolved targets become ghosts. */
   async graph(): Promise<Graph> {
     await this.ensureReady()
     // Meta + body only (#222): graph() is the one read path that genuinely needs

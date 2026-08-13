@@ -1,9 +1,8 @@
 import type { RecentNote } from '../../../../libs/recentNotes'
 import type { NoteDetailView, NoteView } from '../../../../libs/wire'
 
-/** A NoteDetailView reduced to the list shape, for the resolution cache. Carries
- *  `aliases` (#100) so a detail-opened note resolves inbound [[Old Name]] from
- *  this cache without a server round-trip — same alias channel the list serves. */
+/** Reduce a detail to the list shape without turning its metadata into a local
+ *  human-name index; only known stable ids resolve from this inventory. */
 export const asNote = (d: NoteDetailView, seed?: NoteView | null): NoteView | null =>
   !d.deleted && d.id && d.filePath
     ? {

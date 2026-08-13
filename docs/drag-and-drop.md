@@ -432,13 +432,13 @@ move-failure and identity rules survived the engine swap, the pruning rule did n
    The engine never reads the marker — folder identity is a server concern — so the
    read-model FEEDS the engine the path-history (`setFolderAliases`) and that's how
    the engine resolves a path-form `[[oldpath/note]]` to the renamed folder's note
-   even when the filename is ambiguous — in BOTH its boot graph (`buildLinkIndex`)
-   AND its direct reference resolver (`resolveRow`, the server's
-   `GET /api/s/:space/note?ref=` channel that a client hits on a cache-miss, #125).
-   Both mirror the client's `resolveWiki` algebra: literal full-path → folder-alias
-   prefix-rewrite → bare last-segment, the literal kept STRICTLY above the alias
-   (a live note at the exact path wins, like `buildLinkIndex` Pass 1 > Pass 3). The
-   read-model additionally heals ghosts. Two outcomes ride on the path-history:
+   even when the filename is ambiguous — in both its boot graph (`buildLinkIndex`) and
+   bare/direct-read fallback (`resolveRow`). The production
+   `GET /api/s/:space/note?ref=` channel calls `KnowledgeStore.resolveWikilink`;
+   `CachedStore` selects through the same `core/referenceResolver` before an exact
+   stable-id read. Literal full path stays above folder-alias rewrite, which stays above
+   the bare last segment; the read-model additionally heals ghosts. Two outcomes ride on
+   the path-history:
    `[[oldpath/note]]` keeps resolving, and `/files/<oldpath>` redirects to the
    current path (`/tree` carries
    each moved folder's `id`+`aliases`; the client `canonicalFolderPath` redirect is

@@ -277,7 +277,7 @@ export default tseslint.config(
         {
           type: 'core-domain',
           pattern:
-            'packages/core/src/{cachedStore,graph,identity,importer,knowledgeStore,listing,revisionJournal,semanticOps,snippet,visibility}/**',
+            'packages/core/src/{cachedStore,graph,identity,importer,knowledgeStore,listing,referenceResolver,revisionJournal,semanticOps,snippet,visibility}/**',
         },
         // Web UI levels (pages → layouts/composers → widgets → core). The
         // patterns pre-date the directories: rules activate as the #19 step 6

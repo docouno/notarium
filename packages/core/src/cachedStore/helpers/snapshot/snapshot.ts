@@ -1,13 +1,4 @@
-import {
-  buildLinkIndex,
-  deriveNoteEdges,
-  edgeKey,
-  type FolderAlias,
-  ghostForWikilinkTarget,
-  type GhostStub,
-  type LinkIndex,
-  resolveLink,
-} from '../../../graph'
+import { deriveNoteEdges, edgeKey } from '../../../graph'
 import {
   type Graph,
   GRAPH_GHOST_TARGET,
@@ -17,6 +8,14 @@ import {
 import { dedupeAliases } from '../../../libs/aliases'
 import { parseWikilinks } from '../../../libs/markdown'
 import { nameKey } from '../../../libs/slug'
+import {
+  buildLinkIndex,
+  type FolderAlias,
+  ghostForWikilinkTarget,
+  type GhostStub,
+  type LinkIndex,
+  resolveLink,
+} from '../../../referenceResolver'
 import { isVisibleOn, SURFACE } from '../../../visibility'
 
 /** The read-model's derived state: notes by note-id, outbound edges by source

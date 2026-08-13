@@ -1,4 +1,3 @@
-import type { FolderAlias } from '../graph'
 import type {
   IdentityPersistence,
   KnowledgeStore,
@@ -6,6 +5,7 @@ import type {
   StoreEvent,
 } from '../knowledgeStore'
 import type { BackgroundSchedulerPort } from '../libs/backgroundScheduler'
+import type { FolderAlias } from '../referenceResolver'
 
 export type CachedStoreOptions = {
   /** The engine being decorated. */
