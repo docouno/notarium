@@ -22,7 +22,7 @@ import {
 import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 
 import { clipToBytes, isAtomicInstallTempPath, UNNAMED_NOTE_FILENAME } from '@notarium/core'
-import { renameNoReplace } from './renameNoReplace'
+import { renameNoReplace, renameNoReplaceIfAvailable } from './renameNoReplace'
 import type {
   FileClaim,
   FileObservation,
@@ -275,6 +275,10 @@ const writeTemp = async (dir: string, content: string | Uint8Array): Promise<str
 
 export const createLocalFsFiles = (root: string): FileStore => {
   const rootAbs = resolve(root)
+  // Fixed once, here: the adapter's SHAPE must not change under a caller that
+  // already read it. An interpreter that disappears mid-life is an operation
+  // error, not a retroactively withdrawn capability.
+  const atomicDirectoryRename = renameNoReplaceIfAvailable()
 
   const withStorageLock = async <T>(task: () => Promise<T>): Promise<T> => {
     const key = await fs.realpath(rootAbs).catch(() => rootAbs)
@@ -1788,6 +1792,63 @@ export const createLocalFsFiles = (root: string): FileStore => {
   }
   const ensureRecovered = (): Promise<void> => withStorageLock(ensureRecoveredUnlocked)
 
+  /** Built ONLY when the runtime handed one over, so the method is absent rather
+   *  than hollow where the operation cannot be performed — taking the primitive
+   *  as a parameter is what keeps that provable at the type layer. */
+  const renameDirIfAbsentWith =
+    (publish: typeof renameNoReplace) =>
+    (from: string, to: string): Promise<boolean> =>
+      withStorageLock(async () => {
+        await ensureRecoveredUnlocked()
+        const source = abs(from)
+        const target = abs(to)
+        await fs.mkdir(dirname(target), { recursive: true })
+        const [sourceBefore, targetParent] = await Promise.all([
+          fs.lstat(source, { bigint: true }),
+          fs.stat(dirname(target), { bigint: true }),
+        ])
+
+        if (!sourceBefore.isDirectory() || sourceBefore.isSymbolicLink()) {
+          throw Object.assign(new Error('directory move source is not a directory entry'), {
+            code: 'ENOTDIR',
+          })
+        }
+        // On a case/NFC-insensitive medium two raw spellings can denote this one
+        // directory entry. That is the sole occupied-target exception admitted by
+        // the engine. GNU mv -n reports it as an ordinary no-clobber collision, so
+        // perform the atomic spelling rename directly and verify that the observed
+        // source inode — not an external replacement — won the pathname.
+        if (await sameEntryOnDisk(source, target)) {
+          await fs.rename(source, target)
+          const after = await fs.lstat(target, { bigint: true })
+
+          if (after.dev === sourceBefore.dev && after.ino === sourceBefore.ino) {
+            return true
+          }
+          throw Object.assign(new Error('directory move source changed externally'), {
+            code: 'ESTALE',
+          })
+        }
+        if (sourceBefore.dev !== targetParent.dev) {
+          throw Object.assign(new Error('atomic directory no-replace cannot cross filesystems'), {
+            code: 'ENOTSUP',
+          })
+        }
+        const moved = await publish(source, target)
+
+        if (!moved) {
+          return false
+        }
+        const targetAfter = await fs.lstat(target, { bigint: true })
+
+        if (targetAfter.dev === sourceBefore.dev && targetAfter.ino === sourceBefore.ino) {
+          return true
+        }
+        throw Object.assign(new Error('directory move source changed externally'), {
+          code: 'ESTALE',
+        })
+      })
+
   const strictStagePaths = (operationId: string): StrictStagePaths => {
     const key = sha256Bytes(Buffer.from(operationId, 'utf8'))
     const dir = join(opsRoot, `strict-${key}`)
@@ -3094,57 +3155,9 @@ export const createLocalFsFiles = (root: string): FileStore => {
       await fs.rename(abs(from), target)
     },
 
-    renameDirIfAbsent: (from, to) =>
-      withStorageLock(async () => {
-        await ensureRecoveredUnlocked()
-        const source = abs(from)
-        const target = abs(to)
-        await fs.mkdir(dirname(target), { recursive: true })
-        const [sourceBefore, targetParent] = await Promise.all([
-          fs.lstat(source, { bigint: true }),
-          fs.stat(dirname(target), { bigint: true }),
-        ])
-
-        if (!sourceBefore.isDirectory() || sourceBefore.isSymbolicLink()) {
-          throw Object.assign(new Error('directory move source is not a directory entry'), {
-            code: 'ENOTDIR',
-          })
-        }
-        // On a case/NFC-insensitive medium two raw spellings can denote this one
-        // directory entry. That is the sole occupied-target exception admitted by
-        // the engine. GNU mv -n reports it as an ordinary no-clobber collision, so
-        // perform the atomic spelling rename directly and verify that the observed
-        // source inode — not an external replacement — won the pathname.
-        if (await sameEntryOnDisk(source, target)) {
-          await fs.rename(source, target)
-          const after = await fs.lstat(target, { bigint: true })
-
-          if (after.dev === sourceBefore.dev && after.ino === sourceBefore.ino) {
-            return true
-          }
-          throw Object.assign(new Error('directory move source changed externally'), {
-            code: 'ESTALE',
-          })
-        }
-        if (sourceBefore.dev !== targetParent.dev) {
-          throw Object.assign(new Error('atomic directory no-replace cannot cross filesystems'), {
-            code: 'ENOTSUP',
-          })
-        }
-        const moved = await renameNoReplace(source, target)
-
-        if (!moved) {
-          return false
-        }
-        const targetAfter = await fs.lstat(target, { bigint: true })
-
-        if (targetAfter.dev === sourceBefore.dev && targetAfter.ino === sourceBefore.ino) {
-          return true
-        }
-        throw Object.assign(new Error('directory move source changed externally'), {
-          code: 'ESTALE',
-        })
-      }),
+    ...(atomicDirectoryRename
+      ? { renameDirIfAbsent: renameDirIfAbsentWith(atomicDirectoryRename) }
+      : {}),
 
     remove: async (rel) => {
       await ensureRecovered()

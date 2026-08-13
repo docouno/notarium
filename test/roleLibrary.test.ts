@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
-import { createLocalFsFiles } from '@notarium/engine'
+import { createLocalFsFiles, renameNoReplaceIfAvailable } from '@notarium/engine'
 import {
   createFsRoleLibrary,
   createRolesService,
@@ -38,7 +38,10 @@ describe('filesystem role library bounds', () => {
       '---\nname: oversized\ndescription: Oversized.\nmetadata:\n  notarium.kind: role\n---\n',
     )
     await writeFile(join(root, 'oversized', 'resource.bin'), Buffer.alloc(8 * 1024 * 1024 + 1))
-    const library = createFsRoleLibrary({ rootForSpace: () => root })
+    const library = createFsRoleLibrary({
+      publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+      rootForSpace: () => root,
+    })
     const roles = createRolesService({ catalog: async () => [], library })
 
     await expect(library.get(location, 'wanted')).resolves.toMatchObject({ name: 'wanted' })
@@ -54,7 +57,10 @@ describe('filesystem role library bounds', () => {
   })
 
   it('reports occupied invalid role and dependency targets as stable Add conflicts', async () => {
-    const library = createFsRoleLibrary({ rootForSpace: () => root })
+    const library = createFsRoleLibrary({
+      publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+      rootForSpace: () => root,
+    })
     const roles = createRolesService({ catalog: loadBuiltinRoleCatalog, library })
 
     await mkdir(join(root, 'grooming'), { recursive: true })
@@ -84,7 +90,10 @@ describe('filesystem role library bounds', () => {
   })
 
   it('does not disguise a real dependency I/O failure as a content conflict', async () => {
-    const library = createFsRoleLibrary({ rootForSpace: () => root })
+    const library = createFsRoleLibrary({
+      publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+      rootForSpace: () => root,
+    })
     const failure = new Error('storage unavailable')
     const roles = createRolesService({
       catalog: loadBuiltinRoleCatalog,
@@ -111,7 +120,10 @@ describe('filesystem role library bounds', () => {
       join(root, 'not-a-package', 'assets', 'large.bin'),
       Buffer.alloc(8 * 1024 * 1024 + 1),
     )
-    const library = createFsRoleLibrary({ rootForSpace: () => root })
+    const library = createFsRoleLibrary({
+      publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+      rootForSpace: () => root,
+    })
 
     await expect(library.listManifests(location)).resolves.toEqual({
       packages: [expect.objectContaining({ name: 'wanted' })],
@@ -130,7 +142,10 @@ describe('filesystem role library bounds', () => {
       join(root, 'too-long', 'SKILL.md'),
       `---\nname: too-long\ndescription: Too long.\nmetadata:\n  notarium.kind: role\n---\n\n${'x'.repeat(300_000)}`,
     )
-    const library = createFsRoleLibrary({ rootForSpace: () => root })
+    const library = createFsRoleLibrary({
+      publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+      rootForSpace: () => root,
+    })
     const roles = createRolesService({ catalog: async () => [], library })
 
     await expect(roles.listEffective({ personalSpace: 'personal' })).resolves.toEqual({
@@ -143,7 +158,10 @@ describe('filesystem role library bounds', () => {
   })
 
   it('rejects traversal paths before writing outside the package directory', async () => {
-    const library = createFsRoleLibrary({ rootForSpace: () => root })
+    const library = createFsRoleLibrary({
+      publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+      rootForSpace: () => root,
+    })
 
     await expect(
       library.putIfAbsent(location, {
@@ -159,7 +177,10 @@ describe('filesystem role library bounds', () => {
   itAtomicPublish(
     'keeps project roots separate from a same-named Personal or Space package',
     async () => {
-      const library = createFsRoleLibrary({ rootForSpace: () => root })
+      const library = createFsRoleLibrary({
+        publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+        rootForSpace: () => root,
+      })
       const projectId = 'project-root'
       const project = { scope: 'project' as const, space: 'personal', projectId }
       const packageOf = (name: string) => ({

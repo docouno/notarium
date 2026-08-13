@@ -4,14 +4,25 @@
 // canon: docs/note-model.md#create-collisions
 
 import { execFile } from 'node:child_process'
+import { accessSync, constants as fsConstants, statSync } from 'node:fs'
 import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
 
+/** Absolute by contract, never a PATH lookup: the deployment matrix and the
+ * official image both pin this exact pathname.
+ * canon: docs/release.md#platform */
+const PERL = '/usr/bin/perl'
+
 /** Linux syscall numbers are ABI, not kernel-version dependent. Keep the
  * supported set deliberately small: an unknown runtime must fail closed rather
- * than emulate RENAME_NOREPLACE with a check-then-rename sequence. */
-const RENAMEAT2_SYSCALL: Partial<Record<NodeJS.Architecture, number>> = {
+ * than emulate RENAME_NOREPLACE with a check-then-rename sequence.
+ *
+ * Exported by module path, never on the barrel: this IS the declaration of which
+ * architectures the capability is offered on, and only the host's own row can be
+ * proven by running it. A wrong number in any other row would be advertised as a
+ * working capability and reach the kernel as a different call entirely. */
+export const RENAMEAT2_SYSCALL: Partial<Record<NodeJS.Architecture, number>> = {
   arm64: 276,
   x64: 316,
 }
@@ -80,13 +91,7 @@ export const renameNoReplace = async (source: string, target: string): Promise<b
   }
 
   try {
-    await execFileAsync('/usr/bin/perl', [
-      '-e',
-      PERL_RENAME_NOREPLACE,
-      String(syscall),
-      source,
-      target,
-    ])
+    await execFileAsync(PERL, ['-e', PERL_RENAME_NOREPLACE, String(syscall), source, target])
     return true
   } catch (err) {
     const failure = err as NodeJS.ErrnoException & { stdout?: string }
@@ -121,3 +126,51 @@ export const renameNoReplace = async (source: string, target: string): Promise<b
     })
   }
 }
+
+/** What the primitive needs from the host it was composed on. */
+export type RenameNoReplaceRuntime = {
+  platform: string
+  arch: string
+  /** `/usr/bin/perl` is a regular file this process may execute. */
+  perlExecutable: boolean
+}
+
+/** The runtime matrix as a pure table, so the negative branches are provable
+ * without borrowing someone else's OS. The mapped-ABI set is read off
+ * RENAMEAT2_SYSCALL rather than restated — one list, or the two drift. */
+export const renameNoReplaceForRuntime = (
+  facts: RenameNoReplaceRuntime,
+): typeof renameNoReplace | undefined =>
+  facts.platform === 'linux' && Object.hasOwn(RENAMEAT2_SYSCALL, facts.arch) && facts.perlExecutable
+    ? renameNoReplace
+    : undefined
+
+/** Fail closed on anything a stat/access can report. A symlink IS followed —
+ * a packaged interpreter reached through one is still an interpreter — but a
+ * directory or device node wearing the name is not, and `X_OK` alone would
+ * accept both (a directory is searchable, hence executable to access()). */
+const perlExecutable = (): boolean => {
+  try {
+    if (!statSync(PERL).isFile()) {
+      return false
+    }
+    accessSync(PERL, fsConstants.X_OK)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** The capability itself, or `undefined` where this deployment cannot perform
+ * it — the one honest answer a composition root asks for BEFORE it builds
+ * something that advertises the operation (the `localEmbedderAvailable()`
+ * pattern). Deliberately uncached: a caller fixes the answer at construction,
+ * which is what makes the shape of an adapter stable for its whole life.
+ * What presence does and does not promise about individual pathnames is the
+ * canon reference this file opens with. */
+export const renameNoReplaceIfAvailable = (): typeof renameNoReplace | undefined =>
+  renameNoReplaceForRuntime({
+    platform: process.platform,
+    arch: process.arch,
+    perlExecutable: perlExecutable(),
+  })

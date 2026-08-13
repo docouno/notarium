@@ -186,8 +186,9 @@ export const handleRenameProject: Handler = async (ctx, rawArgs) => {
   if (!can(ctx.principal, 'space:write', { space: rec.space })) {
     throw new ToolFailure(`no such project: ${project}`)
   }
-  // A present-but-UNAVAILABLE marker store (space with no local notes dir) would throw
-  // deep in writeMarkerFor as an opaque 'internal error' — guard early and 404 honestly.
+  // A present-but-UNAVAILABLE marker store — no local notes dir, or a host whose
+  // runtime cannot anchor the write — would throw deep in writeMarkerFor as an
+  // opaque 'internal error'; guard early and 404 honestly.
   // Entirely-absent store (registry-only host) is fine: renameProjectSlug skips the write.
   if (ctx.markerStore && !ctx.markerStore.available(rec.space)) {
     throw new ToolFailure(`no such project: ${project}`)

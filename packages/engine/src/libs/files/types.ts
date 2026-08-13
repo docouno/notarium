@@ -239,8 +239,11 @@ export type FileStore = {
   /** Move a whole directory subtree. */
   renameDir(from: string, to: string): Promise<void>
   /** Atomically move a whole directory subtree only while the destination
-   * pathname is absent. `false` means another entry owns it; unsupported media
-   * omit the capability so callers fail closed instead of emulating a race. */
+   * pathname is absent. `false` means another entry owns it; an adapter whose
+   * medium or RUNTIME carries no such primitive omits the capability entirely,
+   * so callers fail closed instead of emulating a race. Presence answers for the
+   * deployment, not for every pathname under it.
+   * canon: docs/note-model.md#create-collisions */
   renameDirIfAbsent?(from: string, to: string): Promise<boolean>
   remove(path: string): Promise<void>
   /** Remove only the exact regular-file version whose bytes the caller read.

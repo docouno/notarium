@@ -4,12 +4,91 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import {
+  ATOMIC_NO_REPLACE_PLATFORM_GATE,
+  ATOMIC_NO_REPLACE_RUNTIME_GATE,
+} from './atomicNoReplaceGate.fixture'
 import { createLocalFsFiles } from './localFs'
+import { renameNoReplaceForRuntime, renameNoReplaceIfAvailable } from './renameNoReplace'
 
 const roots: string[] = []
 
 const itProcess = (name: string, test: () => Promise<void>): void => {
   it(name, test, 15_000)
+}
+
+const DIR_MOVE_PLATFORM_GATE = ATOMIC_NO_REPLACE_PLATFORM_GATE
+const DIR_MOVE_RUNTIME_GATE = ATOMIC_NO_REPLACE_RUNTIME_GATE
+const CROSS_DEVICE_GATE = '[gate: cross-device directory move (no second local filesystem here)]'
+
+/** A declared capability is not yet a proven one: a filesystem or kernel that
+ *  refuses the syscall answers only to a real publication. Probed once — neither
+ *  a platform, an interpreter nor a mount changes mid-run — and the reason is
+ *  split so the summary can say whether the machine could ever do this at all. */
+const dirMoveGate = await (async (): Promise<string | null> => {
+  if (!renameNoReplaceIfAvailable()) {
+    return renameNoReplaceForRuntime({
+      platform: process.platform,
+      arch: process.arch,
+      perlExecutable: true,
+    })
+      ? DIR_MOVE_RUNTIME_GATE
+      : DIR_MOVE_PLATFORM_GATE
+  }
+  let root: string | undefined
+  let marker: string | null = null
+
+  try {
+    root = await fs.mkdtemp(join(tmpdir(), 'notarium-localfs-dir-gate-'))
+    await fs.mkdir(join(root, 'source'))
+    if (!(await createLocalFsFiles(root).renameDirIfAbsent!('source', 'target'))) {
+      marker = DIR_MOVE_RUNTIME_GATE
+    }
+  } catch {
+    marker = DIR_MOVE_RUNTIME_GATE
+  }
+  if (root) {
+    await fs.rm(root, { recursive: true, force: true }).catch(() => {
+      marker = DIR_MOVE_RUNTIME_GATE
+    })
+  }
+
+  return marker
+})()
+
+/** A SECOND filesystem the temp root can reach. Its absence is a property of the
+ *  machine, not of the code, and is reported as such rather than as a pass. */
+const crossDeviceGate = await (async (): Promise<string | null> => {
+  if (process.platform !== 'linux') {
+    return CROSS_DEVICE_GATE
+  }
+  let external: string | undefined
+
+  try {
+    external = await fs.mkdtemp('/dev/shm/notarium-localfs-xdev-gate-')
+    const [here, there] = await Promise.all([fs.stat(tmpdir()), fs.stat(external)])
+
+    return here.dev === there.dev ? CROSS_DEVICE_GATE : null
+  } catch {
+    return CROSS_DEVICE_GATE
+  } finally {
+    if (external) {
+      await fs.rm(external, { recursive: true, force: true }).catch(() => {})
+    }
+  }
+})()
+
+const itDirMove = (name: string, test: () => Promise<void>): void => {
+  const run = dirMoveGate === null ? it : it.skip
+
+  run(dirMoveGate === null ? name : `${name} ${dirMoveGate}`, test)
+}
+
+const itCrossDevice = (name: string, test: () => Promise<void>): void => {
+  const closed = dirMoveGate ?? crossDeviceGate
+  const run = closed === null ? it : it.skip
+
+  run(closed === null ? name : `${name} ${closed}`, test)
 }
 
 const mkroot = async (): Promise<string> => {
@@ -1140,7 +1219,7 @@ describe('localFs pathname occupancy', () => {
     expect(await fs.readdir(root)).toEqual([])
   })
 
-  it('moves a directory only when the destination pathname is absent', async () => {
+  itDirMove('moves a directory only when the destination pathname is absent', async () => {
     const root = await mkroot()
     const files = createLocalFsFiles(root)
 
@@ -1151,7 +1230,7 @@ describe('localFs pathname occupancy', () => {
     await expect(fs.lstat(join(root, 'source'))).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
-  it('accepts a directory destination that is the exact same pathname entry', async () => {
+  itDirMove('accepts a directory destination that is the exact same pathname entry', async () => {
     const root = await mkroot()
     const files = createLocalFsFiles(root)
 
@@ -1161,7 +1240,7 @@ describe('localFs pathname occupancy', () => {
     await expect(fs.readFile(join(root, 'source', 'note.md'), 'utf8')).resolves.toBe('source')
   })
 
-  it('does not replace an occupied directory destination', async () => {
+  itDirMove('does not replace an occupied directory destination', async () => {
     const root = await mkroot()
     const files = createLocalFsFiles(root)
 
@@ -1174,22 +1253,11 @@ describe('localFs pathname occupancy', () => {
     await expect(fs.readFile(join(root, 'target', 'target.md'), 'utf8')).resolves.toBe('target')
   })
 
-  it('fails closed instead of copying a directory across filesystems', async () => {
-    if (process.platform !== 'linux') {
-      return
-    }
+  itCrossDevice('fails closed instead of copying a directory across filesystems', async () => {
     const root = await mkroot()
-    let externalRoot: string
+    const externalRoot = await fs.mkdtemp('/dev/shm/notarium-dir-noreplace-')
 
-    try {
-      externalRoot = await fs.mkdtemp('/dev/shm/notarium-dir-noreplace-')
-    } catch {
-      return
-    }
     roots.push(externalRoot)
-    if ((await fs.stat(root)).dev === (await fs.stat(externalRoot)).dev) {
-      return
-    }
     const files = createLocalFsFiles(root)
     await fs.mkdir(join(root, 'source'))
     await fs.writeFile(join(root, 'source', 'source.md'), 'source')
@@ -1202,27 +1270,62 @@ describe('localFs pathname occupancy', () => {
     await expect(fs.lstat(join(externalRoot, 'target'))).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
-  it('fails closed when the runtime has no direct renameat2 syscall mapping', async () => {
+  it('omits the directory no-replace capability on a runtime that cannot perform it', async () => {
     const root = await mkroot()
-    const files = createLocalFsFiles(root)
     const actualArch = process.arch
     await fs.mkdir(join(root, 'source'))
     await fs.writeFile(join(root, 'source', 'source.md'), 'source')
 
+    // Before construction: the shape is decided there, so an adapter built on an
+    // unmapped ABI must never advertise the method at all — a caller that asks
+    // `if (!files.renameDirIfAbsent)` has to see the truth without calling it.
     Object.defineProperty(process, 'arch', { configurable: true, value: 'unsupported-audit-arch' })
+    let files
+
     try {
-      await expect(files.renameDirIfAbsent!('source', 'target')).rejects.toMatchObject({
-        code: 'ENOTSUP',
-      })
+      files = createLocalFsFiles(root)
     } finally {
       Object.defineProperty(process, 'arch', { configurable: true, value: actualArch })
     }
 
+    expect(Object.hasOwn(files, 'renameDirIfAbsent')).toBe(false)
+    expect(files.renameDirIfAbsent).toBeUndefined()
     await expect(fs.readFile(join(root, 'source', 'source.md'), 'utf8')).resolves.toBe('source')
     await expect(fs.lstat(join(root, 'target'))).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
-  it('lets exactly one racing directory move claim an absent destination', async () => {
+  it('declares the capability exactly when this runtime provides it', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+
+    // Ungated on purpose, and it is the positive half the native gate cannot
+    // carry: that gate probes by CALLING the method, so an adapter that stopped
+    // declaring it closes the gate and reads as "this machine cannot do it".
+    // The shape must answer to the provider, not to the machine's mood.
+    expect(Object.hasOwn(files, 'renameDirIfAbsent')).toBe(
+      renameNoReplaceIfAvailable() !== undefined,
+    )
+  })
+
+  it('closes the native gate only on a runtime that truly cannot publish', async () => {
+    // A gate welded shut is invisible: everything behind it skips and the run
+    // stays green, so a whole contract can stop being exercised without one red
+    // line anywhere. This is the independent witness — it publishes for itself
+    // and demands the gate agree with what actually happened on this machine.
+    const publish = renameNoReplaceIfAvailable()
+    let published = false
+
+    if (publish) {
+      const root = await mkroot()
+
+      await fs.mkdir(join(root, 'source'))
+      published = await publish(join(root, 'source'), join(root, 'target')).catch(() => false)
+    }
+
+    expect(dirMoveGate === null).toBe(published)
+  })
+
+  itDirMove('lets exactly one racing directory move claim an absent destination', async () => {
     const root = await mkroot()
     const files = createLocalFsFiles(root)
 

@@ -593,6 +593,32 @@ describe('NotariumStore — case-insensitive path occupancy', () => {
     }
   })
 
+  it('refuses a folder move outright on an adapter that omits directory no-replace', async () => {
+    const notesDir = mkdtempSync(join(tmpdir(), 'notarium-folder-no-capability-'))
+    mkdirSync(join(notesDir, 'docs'), { recursive: true })
+    writeFileSync(join(notesDir, 'docs/a.md'), '---\ntitle: A\n---\n\nbody')
+    // What an unsupported deployment now hands the store: the capability is
+    // ABSENT, not present-and-throwing, so the refusal has to come off the shape.
+    const files: FileStore = { ...createLocalFsFiles(notesDir) }
+    delete files.renameDirIfAbsent
+    const store = new NotariumStore({
+      mounts: [{ class: 'user-doc', prefix: '', files }],
+      sql: createNodeSqliteDriver(':memory:'),
+    })
+
+    try {
+      await store.list()
+      await expect(
+        store.move({ id: 'docs', destinationPath: 'archive', isDirectory: true }),
+      ).rejects.toThrow(/without replacing a race/i)
+      expect(readdirSync(notesDir)).toEqual(['docs'])
+      expect((await store.list()).map((note) => note.filePath)).toEqual(['docs/a.md'])
+    } finally {
+      await store.stop()
+      rmSync(notesDir, { recursive: true, force: true })
+    }
+  })
+
   it('allows an exact-source case rename but rejects its alternate-case descendant', async () => {
     const notesDir = mkdtempSync(join(tmpdir(), 'notarium-folder-case-rename-'))
     mkdirSync(join(notesDir, 'Docs'), { recursive: true })

@@ -18,6 +18,7 @@ import {
   createNotariumStore,
   type Embedder,
   ensureNotariumResourceAuthority,
+  renameNoReplaceIfAvailable,
   type SearchTuning,
   SpaceResourceAuthorityRegistry,
 } from '@notarium/engine'
@@ -303,9 +304,11 @@ export const createServer = async ({
       notesDir: join(spacesRoot, rec.notesDir),
     }
   }
-  // The `.notariummeta` marker owner, keyed by space id (no local notes dir ⇒ no
-  // marker storage). Late-bound to the manager below — only called at runtime,
-  // after init, so the forward reference is safe.
+  // The `.notariummeta` marker owner, keyed by space id. A notes dir is only half
+  // of what WRITING one takes — the store settles the other half, the directory
+  // anchor, once at construction — so gate marker-backed mutations on
+  // `available(id)`, never on this closure's answer alone. Late-bound to the
+  // manager below: only called at runtime, after init, so the reference is safe.
   // canon: docs/projects.md#the-notariummeta-marker-schema-parser-pin
   let notesDirOfId: (id: string) => string | null = () => null
   const markerStore = createMarkerStore((id) => notesDirOfId(id))
@@ -548,6 +551,9 @@ export const createServer = async ({
   const roles = createRolesService({
     catalog: loadBuiltinRoleCatalog,
     library: createFsRoleLibrary({
+      // Asked of the runtime once, at composition: absent here means an install
+      // is refused before it stages anything, not after it wrote a package.
+      publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
       authorityForSpace: async (space) => {
         await manager.store(space)
         return resourceAuthorities.get(space) ?? null

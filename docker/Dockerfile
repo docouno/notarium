@@ -35,8 +35,12 @@ RUN chmod 0755 /usr/local/bin/notarium \
 # Dev runs the builder stage with `npm run dev` (concurrently + tsx + Vite).
 # `concurrently -k` shells out to `ps` when one child exits; node:slim does not
 # ship it, so install the tiny process-tool package once in the dev/build image.
+# `perl-base` owns `/usr/bin/perl`, on which the engine's atomic directory
+# no-replace depends (docs/note-model.md#create-collisions). It is Essential in
+# Debian and therefore already present — declared anyway, because a capability
+# the code advertises must not rest on what a base image happens to carry today.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends procps \
+  && apt-get install -y --no-install-recommends procps perl-base \
   && rm -rf /var/lib/apt/lists/*
 
 # Install deps against the lockfile first for better layer caching. npm
@@ -111,6 +115,14 @@ ENV HOME=/tmp
 FROM node:24-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d AS runtime
 ENV NODE_ENV=production
 WORKDIR /app
+
+# The published image's half of the same declaration (see the builder layer):
+# `/usr/bin/perl` is what makes atomic directory no-replace — folder moves, role
+# package publication — a capability this deployment actually has rather than
+# one it merely advertises. Before `USER node`, while root can still apt.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends perl-base \
+  && rm -rf /var/lib/apt/lists/*
 
 COPY docker/notarium-cli /usr/local/bin/notarium
 RUN chmod 0755 /usr/local/bin/notarium \

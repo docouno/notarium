@@ -26,6 +26,7 @@ export {
   type MarkerHit,
   type MarkerScan,
   type MarkerStore,
+  type MarkerStoreOptions,
   type SpaceFolderHit,
 } from './markerStore'
 export {

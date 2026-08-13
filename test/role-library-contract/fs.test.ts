@@ -22,7 +22,12 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { createFsRoleLibrary, type RoleLocation } from '../../packages/server/src/services/roles'
+import { renameNoReplaceIfAvailable } from '@notarium/engine'
+import {
+  createFsRoleLibrary,
+  type PublishDirectoryIfAbsent,
+  type RoleLocation,
+} from '../../packages/server/src/services/roles'
 import { isReclaimableInstallStaging } from '../../packages/server/src/services/roles/installStaging'
 import {
   ATOMIC_PUBLISH_GATE,
@@ -40,6 +45,7 @@ vi.mock('node:fs/promises', async (importOriginal) => {
   return {
     ...actual,
     lstat: vi.fn(actual.lstat),
+    mkdir: vi.fn(actual.mkdir),
     rm: vi.fn(actual.rm),
     opendir: vi.fn(actual.opendir),
   }
@@ -48,6 +54,7 @@ vi.mock('node:fs/promises', async (importOriginal) => {
 const actualFs = await vi.importActual<typeof nodeFsPromises>('node:fs/promises')
 const execFileAsync = promisify(execFile)
 const lstatMock = vi.mocked(lstat)
+const mkdirMock = vi.mocked(mkdir)
 const rmMock = vi.mocked(rm)
 const opendirMock = vi.mocked(opendir)
 const STALE_MS = 60 * 60 * 1_000
@@ -69,7 +76,18 @@ const mkmount = async (): Promise<string> => {
   return mount
 }
 
-const libraryAt = (mount: string) => createFsRoleLibrary({ rootForSpace: () => mount })
+/** The real-filesystem library, carrying whatever this runtime actually offers. */
+const libraryAt = (mount: string) =>
+  createFsRoleLibrary({
+    publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+    rootForSpace: () => mount,
+  })
+
+/** The same library with the capability dictated rather than probed. A separate
+ *  entry point on purpose: a default parameter would silently swap `undefined`
+ *  — the case under test — back for the host's real answer. */
+const libraryPublishingWith = (mount: string, publish: PublishDirectoryIfAbsent | undefined) =>
+  createFsRoleLibrary({ publishDirectoryIfAbsent: publish, rootForSpace: () => mount })
 
 /** Identity AND content of one entry, so a case proves both that an occupant kept
  *  its inode and that not a byte of it moved. */
@@ -120,6 +138,7 @@ afterEach(async () => {
   // into this hook's own cleanup.
   rmMock.mockReset().mockImplementation(actualFs.rm)
   lstatMock.mockReset().mockImplementation(actualFs.lstat)
+  mkdirMock.mockReset().mockImplementation(actualFs.mkdir)
   opendirMock.mockReset().mockImplementation(actualFs.opendir as typeof opendir)
   vi.restoreAllMocks()
   await Promise.all(
@@ -149,6 +168,145 @@ describe('role library staging selection', () => {
     expect(isReclaimableInstallStaging(staging, false)).toBe(false)
     expect(isReclaimableInstallStaging('wanted', true)).toBe(false)
     expect(isReclaimableInstallStaging('_projects', true)).toBe(false)
+  })
+})
+
+/** Deliberately OUTSIDE the native gate. These cases dictate the capability
+ *  instead of probing it, so none of them needs `renameat2` — and the host that
+ *  lacks it is precisely the one whose refusal they describe. Gated, they would
+ *  skip on the only deployment that depends on them. */
+describe('role library publication capability', () => {
+  it('closes the publication gate only on a runtime that truly cannot publish', async () => {
+    // The gate hides 34 real contract cases when it closes, and closing is a
+    // legitimate answer — so a gate stuck shut looks exactly like a machine that
+    // cannot. This witness publishes for itself and demands the gate agree.
+    const publish = renameNoReplaceIfAvailable()
+    let published = false
+
+    if (publish) {
+      const root = await mkdtemp(join(tmpdir(), 'nt-publish-gate-witness-'))
+
+      try {
+        await mkdir(join(root, 'source'))
+        published = await publish(join(root, 'source'), join(root, 'target')).catch(() => false)
+      } finally {
+        await rm(root, { recursive: true, force: true })
+      }
+    }
+
+    expect(atomicPublishAvailable).toBe(published)
+  })
+
+  it('makes every composition root state the capability, even as undefined', () => {
+    // The whole seam rests on one token: `X | undefined` REQUIRES the key while
+    // allowing an absent capability, and `X?:` would let the next composition
+    // root forget it and inherit an unavailable library silently. Nothing at
+    // runtime can see the difference, so the assertion is a type-level one —
+    // `tsc --noEmit` covers `test/`, and the call below is never made.
+    // @ts-expect-error omitting publishDirectoryIfAbsent must not compile
+    const forgotten = () => createFsRoleLibrary({ rootForSpace: () => null })
+
+    expect(forgotten).toBeTypeOf('function')
+  })
+
+  it('refuses to publish, touching nothing, when composition carried no capability', async () => {
+    const mount = await mkmount()
+
+    mkdirMock.mockClear()
+    opendirMock.mockClear()
+
+    await expect(
+      libraryPublishingWith(mount, undefined).putIfAbsent(PERSONAL, packageOf('wanted', 'Owned.')),
+    ).rejects.toMatchObject({ code: 'ENOTSUP' })
+    // Residue alone would not prove this: the staging `finally` erases its own
+    // tree, so a late refusal leaves an empty mount too. Assert the calls that
+    // must never have happened — no root prepared, no stale sweep, no staging.
+    expect(mkdirMock).not.toHaveBeenCalled()
+    expect(opendirMock).not.toHaveBeenCalled()
+    await expect(entriesOf(mount)).resolves.toEqual([])
+  })
+
+  it('does not even create the library root when the capability is absent', async () => {
+    const mount = await mkmount()
+
+    await rm(mount, { recursive: true, force: true })
+    await expect(
+      libraryPublishingWith(mount, undefined).putIfAbsent(PERSONAL, packageOf('wanted', 'Owned.')),
+    ).rejects.toMatchObject({ code: 'ENOTSUP' })
+    await expect(lstat(mount)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('keeps the two pure refusals ahead of the capability one', async () => {
+    const mount = await mkmount()
+    const absent = libraryPublishingWith(mount, undefined)
+
+    // Content and location are decided without consulting the runtime at all, so
+    // an unsupported host must not relabel either as "unavailable".
+    await expect(absent.putIfAbsent(PERSONAL, packageOf('Bad Name', 'Owned.'))).rejects.toThrow(
+      /invalid Agent Skill package/i,
+    )
+    await expect(
+      createFsRoleLibrary({
+        publishDirectoryIfAbsent: undefined,
+        rootForSpace: () => null,
+      }).putIfAbsent(PERSONAL, packageOf('wanted', 'Owned.')),
+    ).rejects.toThrow(/role library is unavailable for this space/)
+  })
+
+  it('hands the injected capability the exact staging and target pathnames', async () => {
+    const mount = await mkmount()
+    const seen: [string, string][] = []
+    const publish = vi.fn(async (source: string, target: string) => {
+      seen.push([source, target])
+      await actualFs.rename(source, target)
+      return true
+    })
+
+    await expect(
+      libraryPublishingWith(mount, publish).putIfAbsent(PERSONAL, packageOf('wanted', 'Owned.')),
+    ).resolves.toBe(true)
+    expect(publish).toHaveBeenCalledOnce()
+    expect(seen[0]![1]).toBe(join(mount, 'wanted'))
+    expect(seen[0]![0]).toMatch(/\/\.wanted\.install-/)
+    await expect(readFile(join(mount, 'wanted', 'SKILL.md'), 'utf8')).resolves.toContain('Owned.')
+    await expect(entriesOf(mount)).resolves.toEqual(['wanted'])
+  })
+
+  it('keeps the whole read side working without any capability at all', async () => {
+    const mount = await mkmount()
+
+    const publish = async (source: string, target: string) => {
+      await actualFs.rename(source, target)
+      return true
+    }
+
+    await expect(
+      libraryPublishingWith(mount, publish).putIfAbsent(PERSONAL, packageOf('wanted', 'Owned.')),
+    ).resolves.toBe(true)
+    // The same mount through a library that was handed NO capability. This is
+    // the ground on which design/02 declined a `RoleLibrary.available`, and it
+    // is worth pinning: a guard placed at the library's entrance instead of at
+    // publication would be invisible on every supported host, and would take
+    // listing and activation down with publishing on the one host that matters.
+    const absent = libraryPublishingWith(mount, undefined)
+
+    await expect(absent.listManifests(PERSONAL)).resolves.toMatchObject({
+      packages: [{ name: 'wanted' }],
+    })
+    await expect(absent.exists(PERSONAL, 'wanted')).resolves.toBe(true)
+    await expect(absent.getSkill(PERSONAL, 'wanted')).resolves.toMatchObject({ name: 'wanted' })
+  })
+
+  it('lets an injected failure travel out unchanged, staging cleaned', async () => {
+    const mount = await mkmount()
+    const failure = Object.assign(new Error('unsupported medium'), { code: 'EXDEV', errno: 18 })
+
+    await expect(
+      libraryPublishingWith(mount, async () => {
+        throw failure
+      }).putIfAbsent(PERSONAL, packageOf('wanted', 'Owned.')),
+    ).rejects.toBe(failure)
+    await expect(entriesOf(mount)).resolves.toEqual([])
   })
 })
 
@@ -205,9 +363,13 @@ describeAtomicPublish('filesystem role library publication', () => {
       ['references/guide.md', `# wanted\n\n${marker}\n`],
     ]
     const child = (marker: string) => `
+      import { renameNoReplaceIfAvailable } from '@notarium/engine'
       import { createFsRoleLibrary } from ${JSON.stringify(moduleUrl)}
 
-      const library = createFsRoleLibrary({ rootForSpace: () => ${JSON.stringify(mount)} })
+      const library = createFsRoleLibrary({
+        publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+        rootForSpace: () => ${JSON.stringify(mount)},
+      })
       const added = await library.putIfAbsent(
         { scope: 'personal', space: 'personal' },
         {
@@ -282,19 +444,21 @@ describeAtomicPublish('filesystem role library publication', () => {
     await expect(lstat(join(mount, orphan!))).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
-  it('fails closed instead of publishing when the runtime has no renameat2', async () => {
+  it('reports an injected conflict as `false` and sweeps its own staging', async () => {
     const mount = await mkmount()
-    const actualArch = process.arch
+    const occupant = packageOf('wanted', 'Occupant.')
 
-    Object.defineProperty(process, 'arch', { configurable: true, value: 'unsupported-audit-arch' })
-    try {
-      await expect(
-        libraryAt(mount).putIfAbsent(PERSONAL, packageOf('wanted', 'Owned.')),
-      ).rejects.toMatchObject({ code: 'ENOTSUP' })
-    } finally {
-      Object.defineProperty(process, 'arch', { configurable: true, value: actualArch })
-    }
-    await expect(entriesOf(mount)).resolves.toEqual([])
+    await expect(libraryAt(mount).putIfAbsent(PERSONAL, occupant)).resolves.toBe(true)
+    const before = await fingerprint(join(mount, 'wanted'))
+
+    await expect(
+      libraryPublishingWith(mount, async () => false).putIfAbsent(
+        PERSONAL,
+        packageOf('wanted', 'Second.'),
+      ),
+    ).resolves.toBe(false)
+    await expect(fingerprint(join(mount, 'wanted'))).resolves.toBe(before)
+    await expect(entriesOf(mount)).resolves.toEqual(['wanted'])
   })
 
   it('publishes into a space whose library root does not exist yet', async () => {

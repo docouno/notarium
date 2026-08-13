@@ -297,11 +297,24 @@ Directory moves use the same no-replace rule, through the one primitive the engi
 for it. On the supported Linux runtime that primitive calls `renameat2(RENAME_NOREPLACE)`
 directly rather than through GNU `mv -n`, whose portability layer may fall back to a raceable
 check-then-rename; source and destination parent are verified on one filesystem so no copy
-fallback is possible. Runtimes without the syscall — another platform, an unmapped
-architecture, a filesystem or kernel that refuses it, or an interpreter that cannot be
-executed — fail with `ENOTSUP` rather than use a check-then-rename approximation. The role
-library publishes an owned package with the same primitive. A case/NFC-only spelling change of the same directory entry
-uses the direct atomic rename exception and verifies the source inode afterwards.
+fallback is possible.
+
+**A runtime that cannot perform it does not advertise it.** The engine resolves the
+capability once — Linux, a mapped syscall ABI, and `/usr/bin/perl` present as a regular
+executable file — and an adapter built where any of those is false simply has no
+`renameDirIfAbsent` property. So a caller learns the truth from the shape, before the first
+filesystem mutation, instead of from an `ENOTSUP` thrown mid-operation: `NotariumStore.move`
+refuses a folder move up front, and the role library refuses an install before it prepares a
+root, sweeps stale staging or writes a single package byte. Nothing emulates the primitive
+with a check-then-rename approximation on that branch.
+
+Presence answers for the deployment, not for every pathname under it. A nested mount, a
+filesystem or a kernel that refuses the syscall still fails that one call with
+`ENOTSUP`/`EXDEV` — fail closed, with the source and the target entry untouched, and still
+no fallback. Untouched means the two entries, not the whole tree: creating the target's
+parent chain is part of the supported operation and happens before the refusal, so an empty
+parent can outlive it. A case/NFC-only spelling change of the same directory entry uses the direct atomic
+rename exception and verifies the source inode afterwards.
 
 `uniquify` is resolved **above** the engines, in the read-model: it picks the first free name
 from the snapshot *before* claiming the mutation fence — so the fence guards the path actually

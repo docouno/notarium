@@ -10,7 +10,7 @@ export {
 } from './services/notariumStore'
 export {
   createLocalFsFiles,
-  renameNoReplace,
+  renameNoReplaceIfAvailable,
   type FileClaim,
   type FileObservation,
   type FilePackagePublicationRequest,

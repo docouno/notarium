@@ -3,7 +3,6 @@ import { lstat, mkdir, open, opendir, rm, writeFile } from 'node:fs/promises'
 import { dirname, join, relative as relativePath } from 'node:path'
 
 import type { AdmissionMode, SpaceResourceAuthority } from '@notarium/engine'
-import { renameNoReplace } from '@notarium/engine'
 import { isReclaimableInstallStaging } from './installStaging'
 import { MAX_SKILL_FILE_BYTES, MAX_SKILL_MANIFEST_BYTES } from './skillFile'
 import type { RoleLocation } from './types'
@@ -263,12 +262,22 @@ export const readPackagesFromDirectory = async (root: string): Promise<SkillPack
   return packages.sort((left, right) => left.name.localeCompare(right.name))
 }
 
+/** The engine's atomic directory no-replace, as this composition root found it.
+ *  `undefined` is a real answer, not an omission — see the constructor. */
+export type PublishDirectoryIfAbsent = (source: string, target: string) => Promise<boolean>
+
 export const createFsRoleLibrary = ({
   rootForSpace,
+  publishDirectoryIfAbsent,
   authorityForSpace,
   resourcePrefixForSpace,
 }: {
   rootForSpace(space: string): string | null
+  /** REQUIRED to pass, allowed to be `undefined`: every composition root has to
+   *  state what the runtime it built on can do, and a library that inherited an
+   *  absent capability must be indistinguishable — in tests too — from one built
+   *  on a host that genuinely lacks it. */
+  publishDirectoryIfAbsent: PublishDirectoryIfAbsent | undefined
   authorityForSpace?(space: string): Promise<SpaceResourceAuthority | null>
   resourcePrefixForSpace?(space: string): string | null
 }): RoleLibrary => {
@@ -586,6 +595,15 @@ export const createFsRoleLibrary = ({
     putIfAbsent: async (location, pkg) => {
       validateSkillPackage(pkg)
       const { mount, root } = rootsOf(location)
+
+      // After the two pure refusals and before the first byte touches disk. A
+      // deployment that cannot publish atomically must leave no library root, no
+      // stale sweep and no staging tree behind to be found later.
+      if (!publishDirectoryIfAbsent) {
+        throw Object.assign(new Error('atomic role package publication is unavailable'), {
+          code: 'ENOTSUP',
+        })
+      }
       await prepareRoot(location, mount, root)
       await sweepStaleStaging(mount, root)
       const context = await authorityContext(location, pkg.name)
@@ -620,9 +638,19 @@ export const createFsRoleLibrary = ({
             await writeFile(path, content, { flag: 'wx' })
           }
 
-          return await renameNoReplace(temp, target)
+          // The arbiter is the primitive, in one atomic filesystem operation: an
+          // occupied pathname of ANY shape is a conflict, never a replacement.
+          // Its errors — a per-path unsupported medium included — travel out as
+          // they are; there is no fallback to a raceable rename on any branch.
+          return await publishDirectoryIfAbsent(temp, target)
         } finally {
+          // On the conflict branch the staging really is still there, so this rm
+          // does work — and a read-only volume or an EACCES must not turn a
+          // defined `false` into a 500.
           await rm(temp, { recursive: true, force: true }).catch((err: Error) => {
+            // This process just created a possible orphan after the last sweep.
+            // Drop the clean cache so a later install keeps checking it until it
+            // ages into the reclaimable window.
             sweeps.delete(root)
             console.warn(`[roles] failed to remove install staging ${temp}:`, err.message)
           })

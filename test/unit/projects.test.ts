@@ -5,13 +5,20 @@
 // index-isolation, the `.notarium/` skip) — the one piece the e2e fake (no FS)
 // can't cover.
 
+import type * as nodeFs from 'node:fs'
 import {
+  closeSync,
   promises as fs,
+  constants as fsConstants,
+  fstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   renameSync,
   rmSync,
+  type Stats,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs'
@@ -19,6 +26,22 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createLocalFsFiles } from '@notarium/engine'
+
+// The anchor probe is three synchronous calls; wrapping exactly those (and
+// nothing else this file touches) is what makes its negative branches provable
+// without a second operating system.
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof nodeFs>()
+
+  return {
+    ...actual,
+    closeSync: vi.fn(actual.closeSync),
+    fstatSync: vi.fn(actual.fstatSync),
+    openSync: vi.fn(actual.openSync),
+    statSync: vi.fn(actual.statSync),
+  }
+})
+
 import {
   acquireMarkPrefixLock,
   createMarkerStore,
@@ -37,8 +60,20 @@ import {
   withMarkLock,
 } from '@notarium/server'
 
+// The runtime seam stays off the package barrel: a pure table that ACCEPTS the
+// fact it should discover reads like a capability query once it is public.
+import {
+  anchoredMarkerWritesAvailable,
+  anchoredMarkerWritesForRuntime,
+} from '../../packages/server/src/services/projects/markerStore'
 import { InMemoryFolders } from '../fake-server/folders'
 import { InMemoryProjects } from '../fake-server/projects'
+
+const actualFs = await vi.importActual<typeof nodeFs>('node:fs')
+const closeSyncMock = vi.mocked(closeSync)
+const fstatSyncMock = vi.mocked(fstatSync)
+const openSyncMock = vi.mocked(openSync)
+const statSyncMock = vi.mocked(statSync)
 
 const VALID_ID = 'Ab3xK9_qZ2mN' // 12 chars, freshNoteId shape
 const now = () => new Date('2026-06-18T00:00:00.000Z')
@@ -48,9 +83,60 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'notarium-proj-'))
 })
 afterEach(() => {
+  // An unconsumed one-shot would leak into the next case, and these four sit on
+  // the anchor probe every marker store runs at construction.
+  closeSyncMock.mockReset().mockImplementation(actualFs.closeSync)
+  fstatSyncMock.mockReset().mockImplementation(actualFs.fstatSync)
+  openSyncMock.mockReset().mockImplementation(actualFs.openSync)
+  statSyncMock.mockReset().mockImplementation(actualFs.statSync)
   vi.restoreAllMocks()
   rmSync(dir, { recursive: true, force: true })
 })
+
+/** Two markers, because the anchor is missing for two unrelated reasons and only
+ *  one of them is permanent: a non-Linux platform will never grow `/proc`, while
+ *  a Linux host without the dynamic fd entries is a property of THIS container. */
+const ANCHOR_PLATFORM_GATE = '[gate: anchored marker write (non-Linux platform)]'
+const ANCHOR_PROC_GATE = '[gate: anchored marker write (/proc/self/fd unavailable)]'
+const anchorGate = anchoredMarkerWritesAvailable()
+  ? null
+  : anchoredMarkerWritesForRuntime({ platform: process.platform, procSelfFdAnchor: true })
+    ? ANCHOR_PROC_GATE
+    : ANCHOR_PLATFORM_GATE
+
+/** `describe` for a suite that publishes a real marker through an open directory
+ *  inode. Its deterministic siblings below run everywhere and are NOT gated. */
+const describeAnchoredMarkerWrite = (name: string, fn: () => void): void => {
+  const suite = anchorGate === null ? describe : describe.skip
+
+  suite(anchorGate === null ? name : `${name} ${anchorGate}`, fn)
+}
+
+/** The single-case form, for a publishing test inside a suite that is NOT gated.
+ *  Most suites below are mixed — a marker write sits beside cases that only read
+ *  the registry — so gating them whole would hide the portable half behind a
+ *  runtime verdict it does not depend on. */
+const itAnchoredMarkerWrite = (name: string, fn: () => void | Promise<void>): void => {
+  const test = anchorGate === null ? it : it.skip
+
+  test(anchorGate === null ? name : `${name} ${anchorGate}`, fn)
+}
+
+/** A stat answer the probe can compare, with no real inode behind it. */
+const inode = (dev: bigint, ino: bigint) => ({ dev, ino }) as unknown as Stats
+
+/** Pin `process.platform` for one case so the matrix means the same on a laptop
+ *  as it does in CI. */
+const withPlatform = <T>(value: string, run: () => T): T => {
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
+
+  Object.defineProperty(process, 'platform', { configurable: true, value })
+  try {
+    return run()
+  } finally {
+    Object.defineProperty(process, 'platform', platform)
+  }
+}
 
 const writeMarkerFile = (folderPath: string, body: Record<string, unknown>) => {
   const target = folderPath ? join(dir, folderPath) : dir
@@ -174,7 +260,200 @@ describe('parseMarker (#13)', () => {
   })
 })
 
-describe('markerStore over a real tree (#13)', () => {
+describe('anchored marker write capability', () => {
+  it.each([
+    ['linux', true, true],
+    ['linux', false, false],
+    ['darwin', true, false],
+    ['win32', false, false],
+  ] as const)('answers %s with a proven fd anchor=%s', (platform, procSelfFdAnchor, available) => {
+    expect(anchoredMarkerWritesForRuntime({ platform, procSelfFdAnchor })).toBe(available)
+  })
+
+  /** Drive the three probe calls without touching a real `/proc`. */
+  const probeWith = (opened: Stats | Error, throughProc: Stats | Error): boolean =>
+    withPlatform('linux', () => {
+      // The gate probe at module scope already ran through these same mocks. Read
+      // this case's own calls, not whatever ran before it: without the clear the
+      // pathname assertions below pass or fail by test ORDER.
+      closeSyncMock.mockClear()
+      fstatSyncMock.mockClear()
+      openSyncMock.mockClear()
+      statSyncMock.mockClear()
+      openSyncMock.mockImplementationOnce((() => 4242) as never)
+      fstatSyncMock.mockImplementationOnce(((): Stats => {
+        if (opened instanceof Error) {
+          throw opened
+        }
+
+        return opened
+      }) as never)
+      statSyncMock.mockImplementationOnce(((): Stats => {
+        if (throughProc instanceof Error) {
+          throw throughProc
+        }
+
+        return throughProc
+      }) as never)
+      closeSyncMock.mockImplementationOnce(() => {})
+
+      return anchoredMarkerWritesAvailable()
+    })
+
+  it('declares the capability only when /proc/self/fd re-enters the opened inode', () => {
+    expect(probeWith(inode(1n, 2n), inode(1n, 2n))).toBe(true)
+    // Which pathnames, not just which verdict. The DYNAMIC entry is the whole
+    // proof: stat-ing `/proc/self/fd` itself answers true on a container that
+    // carries the directory without per-fd entries — the exact host that must
+    // be refused, and a shape both routes agree on by accident on a real Linux.
+    // Pathname AND mode. `O_DIRECTORY` is the only thing that makes the open
+    // fail closed on the object's TYPE: without it a FIFO left over a masked
+    // `/proc` blocks this call — which runs inside server construction — until a
+    // writer appears, and a device node is simply opened.
+    expect(openSyncMock.mock.calls[0]).toEqual([
+      '/proc/self/fd',
+      fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY ?? 0),
+    ])
+    expect(statSyncMock.mock.calls[0]?.[0]).toBe('/proc/self/fd/4242')
+    // The fd is handed back either way — a probe that leaked one per store would
+    // exhaust the process long before anyone noticed the capability was right.
+    expect(closeSyncMock).toHaveBeenCalledWith(4242)
+  })
+
+  it.each([
+    ['the entry names a different inode', inode(1n, 2n), inode(1n, 99n)],
+    ['the entry is on a different device', inode(1n, 2n), inode(7n, 2n)],
+    [
+      'the dynamic entry is missing',
+      inode(1n, 2n),
+      Object.assign(new Error('ENOENT'), { code: 'ENOENT' }),
+    ],
+    [
+      'the opened fd cannot be stat-ed',
+      Object.assign(new Error('EACCES'), { code: 'EACCES' }),
+      inode(1n, 2n),
+    ],
+  ] as const)('withholds it when %s', (_case, opened, throughProc) => {
+    expect(probeWith(opened, throughProc)).toBe(false)
+    expect(closeSyncMock).toHaveBeenCalledWith(4242)
+  })
+
+  it('withholds it when /proc/self/fd cannot be opened as a directory', () => {
+    const closed = withPlatform('linux', () => {
+      closeSyncMock.mockClear()
+      openSyncMock.mockImplementationOnce((() => {
+        throw Object.assign(new Error('ENOTDIR'), { code: 'ENOTDIR' })
+      }) as never)
+
+      return anchoredMarkerWritesAvailable()
+    })
+
+    expect(closed).toBe(false)
+    expect(closeSyncMock).not.toHaveBeenCalled()
+  })
+
+  // The table above is fed facts by hand; this pins the WIRING of the platform
+  // half — that it is read from the process rather than assumed. Deleting that
+  // conjunct left every test green, and a kernel serving a plausible
+  // `/proc/self/fd` would then be declared able to anchor a write it cannot.
+  it.each([
+    ['linux', true],
+    ['darwin', false],
+    ['win32', false],
+  ] as const)('reads the platform from the process itself on %s', (platform, available) => {
+    const answered = withPlatform(platform, () => {
+      openSyncMock.mockImplementationOnce((() => 4242) as never)
+      fstatSyncMock.mockImplementationOnce((() => inode(1n, 2n)) as never)
+      statSyncMock.mockImplementationOnce((() => inode(1n, 2n)) as never)
+      closeSyncMock.mockImplementationOnce(() => {})
+
+      return anchoredMarkerWritesAvailable()
+    })
+
+    expect(answered).toBe(available)
+  })
+
+  it('closes the gate only where the runtime truly cannot anchor a write', () => {
+    // The same blind spot the other two gates have: welded shut it skips every
+    // gated case in this file and the run stays green, so the contract stops
+    // being exercised without one red line. The probe is the witness — the gate
+    // must never claim something the runtime did not say.
+    expect(anchorGate === null).toBe(anchoredMarkerWritesAvailable())
+  })
+
+  it('has no capability for a space without a notes dir (honest degradation)', () => {
+    expect(createMarkerStore(() => null, { anchoredWritesAvailable: true }).available('s')).toBe(
+      false,
+    )
+  })
+
+  it('has no capability where the anchor is absent, notes dir or not', () => {
+    expect(createMarkerStore(() => dir, { anchoredWritesAvailable: false }).available('s')).toBe(
+      false,
+    )
+    expect(createMarkerStore(() => dir, { anchoredWritesAvailable: true }).available('s')).toBe(
+      true,
+    )
+  })
+
+  // Production constructs the store with no options at all, so that `??` is the
+  // only thing that consults the runtime. Every case above dictates the fact
+  // instead, which leaves `?? probe()` and `?? true` indistinguishable on any
+  // host whose probe answers yes — that is, on every machine that runs this file.
+  it('consults the probe when the caller states nothing, as the server does', () => {
+    const declared = withPlatform('linux', () => {
+      openSyncMock.mockImplementationOnce((() => {
+        throw Object.assign(new Error('ENOTDIR'), { code: 'ENOTDIR' })
+      }) as never)
+
+      return createMarkerStore(() => dir).available('s')
+    })
+
+    expect(declared).toBe(false)
+  })
+
+  it('refuses a write on an unsupported runtime before it touches the folder', async () => {
+    const notesDirFor = vi.fn(() => dir)
+    const store = createMarkerStore(notesDirFor, { anchoredWritesAvailable: false })
+    mkdirSync(join(dir, 'docs'), { recursive: true })
+    notesDirFor.mockClear()
+
+    await expect(
+      store.write('s', 'docs', serializeMarker({ id: VALID_ID, slug: 'docs' })),
+    ).rejects.toMatchObject({ code: 'ENOTSUP' })
+    // Neither the marker nor the temp file an interrupted CAS would leave: the
+    // refusal landed before the root was even resolved.
+    expect(notesDirFor).not.toHaveBeenCalled()
+    expect(await fs.readdir(join(dir, 'docs'))).toEqual([])
+  })
+
+  it('keeps the whole portable half working with no anchor at all', async () => {
+    // Both canon docs promise this — the read side asks nothing of the runtime,
+    // and dropping a marker is an ordinary portable `remove`, because an anchor
+    // is what a PUBLICATION needs, not a deletion. Of the four methods only
+    // `scan` was pinned, so gating any of the other three was invisible.
+    const store = createMarkerStore(() => dir, { anchoredWritesAvailable: false })
+
+    writeMarkerFile('docs', { id: VALID_ID, slug: 'docs' })
+
+    await expect(store.read('s', 'docs')).resolves.toContain(VALID_ID)
+    await expect(store.folderExists('s', 'docs')).resolves.toBe(true)
+    await store.remove('s', 'docs')
+    await expect(store.read('s', 'docs')).resolves.toBeNull()
+  })
+
+  it('refuses to write a marker under a dot namespace (mount-boundary belt #78), normalising backslashes, ahead of the runtime verdict', async () => {
+    // A dot-segment verdict is a pure string decision no host can change, so it
+    // stays ahead of the capability check: relabelling it "unavailable" would
+    // make the mount boundary read differently from one OS to the next.
+    const store = createMarkerStore(() => dir, { anchoredWritesAvailable: false })
+
+    await expect(store.write('s', '.notarium/memory', '{}')).rejects.toThrow(/dot namespace/)
+    await expect(store.write('s', 'foo\\.notarium\\memory', '{}')).rejects.toThrow(/dot namespace/)
+  })
+})
+
+describeAnchoredMarkerWrite('markerStore over a real tree (#13)', () => {
   it('writes/reads the sibling dotfile and finds it on scan (root + nested), skipping dot-dirs', async () => {
     const store = createMarkerStore(() => dir)
     mkdirSync(join(dir, 'docs'), { recursive: true })
@@ -195,12 +474,6 @@ describe('markerStore over a real tree (#13)', () => {
       store.write('s', 'missing', serializeMarker({ id: VALID_ID, slug: 'missing' })),
     ).rejects.toMatchObject({ code: 'ENOENT' })
     await expect(fs.lstat(join(dir, 'missing'))).rejects.toMatchObject({ code: 'ENOENT' })
-  })
-
-  it('refuses to write a marker under a dot namespace (mount-boundary belt #78), normalising backslashes', async () => {
-    const store = createMarkerStore(() => dir)
-    await expect(store.write('s', '.notarium/memory', '{}')).rejects.toThrow(/dot namespace/)
-    await expect(store.write('s', 'foo\\.notarium\\memory', '{}')).rejects.toThrow(/dot namespace/)
   })
 
   it('does not overwrite a marker that races publication', async () => {
@@ -276,11 +549,6 @@ describe('markerStore over a real tree (#13)', () => {
     expect(await store.folderExists('s', 'docs')).toBe(true)
   })
 
-  it('has no capability for a space without a notes dir (honest degradation)', () => {
-    const store = createMarkerStore(() => null)
-    expect(store.available('s')).toBe(false)
-  })
-
   it('a SYMLINKED marker (not a regular file) is not enumerated AND marks the scan incomplete (no prune on it)', async () => {
     const store = createMarkerStore(() => dir)
     mkdirSync(join(dir, 'p'), { recursive: true })
@@ -331,66 +599,75 @@ describe('markFolderAsProject (#13)', () => {
     expect(laterChildEntered).toBe(true)
   })
 
-  it('mints an id + slug, writes a real marker, upserts the registry row', async () => {
-    const projects = new InMemoryProjects()
-    const markerStore = createMarkerStore(() => dir)
-    mkdirSync(join(dir, 'docs'))
-    const rec = await markFolderAsProject(
-      { projects, markerStore, now },
-      {
-        space: 's',
-        folderPath: 'docs',
-        displayName: 'Docs',
-      },
-    )
-    expect(rec.createdActive).toBe(true)
-    expect(rec.slug).toBe('docs')
-    expect(rec.id).toMatch(/^[A-Za-z0-9_-]{12}$/)
-    expect(await projects.getByHandle('s', 'docs')).toMatchObject({ id: rec.id, path: 'docs' })
-    // The marker landed on disk and carries id+slug (Fork A).
-    const onDisk = parseMarker(readFileSync(join(dir, 'docs', '.notariummeta'), 'utf8'))
-    expect(onDisk).toMatchObject({ id: rec.id, slug: 'docs', displayName: 'Docs' })
-  })
-
-  it('is idempotent: a re-mark reuses the marker id+createdAt, no duplicate', async () => {
-    const projects = new InMemoryProjects()
-    const markerStore = createMarkerStore(() => dir)
-    mkdirSync(join(dir, 'docs'))
-    const first = await markFolderAsProject(
-      { projects, markerStore, now },
-      { space: 's', folderPath: 'docs' },
-    )
-    const again = await markFolderAsProject(
-      { projects, markerStore, now: () => new Date('2027-01-01T00:00:00.000Z') },
-      { space: 's', folderPath: 'docs' },
-    )
-    expect(first.createdActive).toBe(true)
-    expect(again.createdActive).toBe(false)
-    expect(again.id).toBe(first.id)
-    expect(again.createdAt).toBe(first.createdAt) // mint moment preserved
-    expect((await projects.listForSpace('s')).length).toBe(1)
-  })
-
-  it('owns the transition outcome inside the mark lock for concurrent marks', async () => {
-    const projects = new InMemoryProjects()
-    const markerStore = createMarkerStore(() => dir)
-    mkdirSync(join(dir, 'docs'))
-    const [first, second] = await Promise.all([
-      markFolderAsProject(
+  itAnchoredMarkerWrite(
+    'mints an id + slug, writes a real marker, upserts the registry row',
+    async () => {
+      const projects = new InMemoryProjects()
+      const markerStore = createMarkerStore(() => dir)
+      mkdirSync(join(dir, 'docs'))
+      const rec = await markFolderAsProject(
         { projects, markerStore, now },
-        { space: 's', folderPath: 'docs', displayName: 'Docs' },
-      ),
-      markFolderAsProject(
+        {
+          space: 's',
+          folderPath: 'docs',
+          displayName: 'Docs',
+        },
+      )
+      expect(rec.createdActive).toBe(true)
+      expect(rec.slug).toBe('docs')
+      expect(rec.id).toMatch(/^[A-Za-z0-9_-]{12}$/)
+      expect(await projects.getByHandle('s', 'docs')).toMatchObject({ id: rec.id, path: 'docs' })
+      // The marker landed on disk and carries id+slug (Fork A).
+      const onDisk = parseMarker(readFileSync(join(dir, 'docs', '.notariummeta'), 'utf8'))
+      expect(onDisk).toMatchObject({ id: rec.id, slug: 'docs', displayName: 'Docs' })
+    },
+  )
+
+  itAnchoredMarkerWrite(
+    'is idempotent: a re-mark reuses the marker id+createdAt, no duplicate',
+    async () => {
+      const projects = new InMemoryProjects()
+      const markerStore = createMarkerStore(() => dir)
+      mkdirSync(join(dir, 'docs'))
+      const first = await markFolderAsProject(
         { projects, markerStore, now },
-        { space: 's', folderPath: 'docs', displayName: 'Docs' },
-      ),
-    ])
+        { space: 's', folderPath: 'docs' },
+      )
+      const again = await markFolderAsProject(
+        { projects, markerStore, now: () => new Date('2027-01-01T00:00:00.000Z') },
+        { space: 's', folderPath: 'docs' },
+      )
+      expect(first.createdActive).toBe(true)
+      expect(again.createdActive).toBe(false)
+      expect(again.id).toBe(first.id)
+      expect(again.createdAt).toBe(first.createdAt) // mint moment preserved
+      expect((await projects.listForSpace('s')).length).toBe(1)
+    },
+  )
 
-    expect([first.createdActive, second.createdActive].sort()).toEqual([false, true])
-    expect(first.id).toBe(second.id)
-  })
+  itAnchoredMarkerWrite(
+    'owns the transition outcome inside the mark lock for concurrent marks',
+    async () => {
+      const projects = new InMemoryProjects()
+      const markerStore = createMarkerStore(() => dir)
+      mkdirSync(join(dir, 'docs'))
+      const [first, second] = await Promise.all([
+        markFolderAsProject(
+          { projects, markerStore, now },
+          { space: 's', folderPath: 'docs', displayName: 'Docs' },
+        ),
+        markFolderAsProject(
+          { projects, markerStore, now },
+          { space: 's', folderPath: 'docs', displayName: 'Docs' },
+        ),
+      ])
 
-  it('suffixes a colliding slug -2/-3 (the I0c trap)', async () => {
+      expect([first.createdActive, second.createdActive].sort()).toEqual([false, true])
+      expect(first.id).toBe(second.id)
+    },
+  )
+
+  itAnchoredMarkerWrite('suffixes a colliding slug -2/-3 (the I0c trap)', async () => {
     const projects = new InMemoryProjects()
     const markerStore = createMarkerStore(() => dir)
 
@@ -422,43 +699,49 @@ describe('markFolderAsProject (#13)', () => {
     expect(await projects.getById(rec.id)).toBeTruthy()
   })
 
-  it('marking a COPIED folder mints a FRESH id — never steals the original (Fork B re-mint on write)', async () => {
-    const projects = new InMemoryProjects()
-    const markerStore = createMarkerStore(() => dir)
-    mkdirSync(join(dir, 'a'))
-    const orig = await markFolderAsProject(
-      { projects, markerStore, now },
-      { space: 's', folderPath: 'a', displayName: 'Proj' },
-    )
-    // Simulate `cp -r a b`: the copy carries the original's marker verbatim.
-    writeMarkerFile('b', { id: orig.id, slug: orig.slug, displayName: 'Proj' })
-    const copy = await markFolderAsProject(
-      { projects, markerStore, now },
-      { space: 's', folderPath: 'b', displayName: 'Proj' },
-    )
-    expect(copy.id).not.toBe(orig.id) // fresh id
-    expect(copy.slug).toBe('proj-2') // fresh slug, suffixed for uniqueness
-    // The original is untouched (still owns its id at its path).
-    expect(await projects.getById(orig.id)).toMatchObject({ path: 'a', slug: 'proj' })
-  })
+  itAnchoredMarkerWrite(
+    'marking a COPIED folder mints a FRESH id — never steals the original (Fork B re-mint on write)',
+    async () => {
+      const projects = new InMemoryProjects()
+      const markerStore = createMarkerStore(() => dir)
+      mkdirSync(join(dir, 'a'))
+      const orig = await markFolderAsProject(
+        { projects, markerStore, now },
+        { space: 's', folderPath: 'a', displayName: 'Proj' },
+      )
+      // Simulate `cp -r a b`: the copy carries the original's marker verbatim.
+      writeMarkerFile('b', { id: orig.id, slug: orig.slug, displayName: 'Proj' })
+      const copy = await markFolderAsProject(
+        { projects, markerStore, now },
+        { space: 's', folderPath: 'b', displayName: 'Proj' },
+      )
+      expect(copy.id).not.toBe(orig.id) // fresh id
+      expect(copy.slug).toBe('proj-2') // fresh slug, suffixed for uniqueness
+      // The original is untouched (still owns its id at its path).
+      expect(await projects.getById(orig.id)).toMatchObject({ path: 'a', slug: 'proj' })
+    },
+  )
 
-  it('heals a divergent marker: the row already at the path wins, the marker is rewritten to match', async () => {
-    const projects = new InMemoryProjects()
-    const markerStore = createMarkerStore(() => dir)
-    mkdirSync(join(dir, 'p'))
-    const rec = await markFolderAsProject(
-      { projects, markerStore, now },
-      { space: 's', folderPath: 'p', displayName: 'P' },
-    )
-    // A hand-edit puts a bogus (but well-formed) id in the marker.
-    writeMarkerFile('p', { id: 'ZZZZZZZZZZZZ', slug: 'bogus' })
-    const again = await markFolderAsProject(
-      { projects, markerStore, now },
-      { space: 's', folderPath: 'p' },
-    )
-    expect(again.id).toBe(rec.id) // the path-row wins, no fork
-    expect(parseMarker(readFileSync(join(dir, 'p', '.notariummeta'), 'utf8'))?.id).toBe(rec.id) // marker healed
-  })
+  itAnchoredMarkerWrite(
+    'heals a divergent marker: the row already at the path wins, the marker is rewritten to match',
+    async () => {
+      const projects = new InMemoryProjects()
+      const markerStore = createMarkerStore(() => dir)
+      mkdirSync(join(dir, 'p'))
+      const rec = await markFolderAsProject(
+        { projects, markerStore, now },
+        { space: 's', folderPath: 'p', displayName: 'P' },
+      )
+      // A hand-edit puts a bogus (but well-formed) id in the marker.
+      writeMarkerFile('p', { id: 'ZZZZZZZZZZZZ', slug: 'bogus' })
+      const again = await markFolderAsProject(
+        { projects, markerStore, now },
+        { space: 's', folderPath: 'p' },
+      )
+      expect(again.id).toBe(rec.id) // the path-row wins, no fork
+      expect(parseMarker(readFileSync(join(dir, 'p', '.notariummeta'), 'utf8'))?.id).toBe(rec.id) // marker healed
+    },
+  )
 })
 
 describe('ensureFolderIdentity (#212 — the page-create lazy-mint path)', () => {
@@ -469,54 +752,66 @@ describe('ensureFolderIdentity (#212 — the page-create lazy-mint path)', () =>
     return { projects, folders, markerStore, now }
   }
 
-  it('mints a fresh type=folder identity for an unidentified folder + writes the marker', async () => {
-    const d = deps()
-    mkdirSync(join(dir, 'docs'))
-    const id = await ensureFolderIdentity(d, { space: 's', folderPath: 'docs' })
-    expect(id).toMatch(/^[A-Za-z0-9_-]{12}$/)
-    expect(await d.folders.byPath('s', 'docs')).toMatchObject({ id, path: 'docs' })
-    const onDisk = parseMarker(readFileSync(join(dir, 'docs', '.notariummeta'), 'utf8'))
-    expect(onDisk).toMatchObject({ id, type: 'folder' })
-  })
+  itAnchoredMarkerWrite(
+    'mints a fresh type=folder identity for an unidentified folder + writes the marker',
+    async () => {
+      const d = deps()
+      mkdirSync(join(dir, 'docs'))
+      const id = await ensureFolderIdentity(d, { space: 's', folderPath: 'docs' })
+      expect(id).toMatch(/^[A-Za-z0-9_-]{12}$/)
+      expect(await d.folders.byPath('s', 'docs')).toMatchObject({ id, path: 'docs' })
+      const onDisk = parseMarker(readFileSync(join(dir, 'docs', '.notariummeta'), 'utf8'))
+      expect(onDisk).toMatchObject({ id, type: 'folder' })
+    },
+  )
 
-  it('is idempotent + returns a PROJECT id unchanged when the folder is already a project', async () => {
-    const d = deps()
-    mkdirSync(join(dir, 'docs'))
-    const proj = await markFolderAsProject(d, {
-      space: 's',
-      folderPath: 'docs',
-      displayName: 'Docs',
-    })
-    const id = await ensureFolderIdentity(d, { space: 's', folderPath: 'docs' })
-    expect(id).toBe(proj.id) // a project IS an identified folder — its id is the folder id
-    expect(await d.folders.byPath('s', 'docs')).toBeNull() // no second (folder-type) row minted
-    // Idempotent for a plain folder too.
-    mkdirSync(join(dir, 'guides'))
-    const a = await ensureFolderIdentity(d, { space: 's', folderPath: 'guides' })
-    const b = await ensureFolderIdentity(d, { space: 's', folderPath: 'guides' })
-    expect(a).toBe(b)
-  })
+  itAnchoredMarkerWrite(
+    'is idempotent + returns a PROJECT id unchanged when the folder is already a project',
+    async () => {
+      const d = deps()
+      mkdirSync(join(dir, 'docs'))
+      const proj = await markFolderAsProject(d, {
+        space: 's',
+        folderPath: 'docs',
+        displayName: 'Docs',
+      })
+      const id = await ensureFolderIdentity(d, { space: 's', folderPath: 'docs' })
+      expect(id).toBe(proj.id) // a project IS an identified folder — its id is the folder id
+      expect(await d.folders.byPath('s', 'docs')).toBeNull() // no second (folder-type) row minted
+      // Idempotent for a plain folder too.
+      mkdirSync(join(dir, 'guides'))
+      const a = await ensureFolderIdentity(d, { space: 's', folderPath: 'guides' })
+      const b = await ensureFolderIdentity(d, { space: 's', folderPath: 'guides' })
+      expect(a).toBe(b)
+    },
+  )
 
-  it('does not recreate a missing folder while preparing its identity', async () => {
-    const d = deps()
+  itAnchoredMarkerWrite(
+    'does not recreate a missing folder while preparing its identity',
+    async () => {
+      const d = deps()
 
-    await expect(
-      ensureFolderIdentity(d, { space: 's', folderPath: 'missing' }),
-    ).rejects.toMatchObject({ code: 'ENOENT' })
-    expect(await d.markerStore.folderExists('s', 'missing')).toBe(false)
-    expect(await d.folders.byPath('s', 'missing')).toBeNull()
-  })
+      await expect(
+        ensureFolderIdentity(d, { space: 's', folderPath: 'missing' }),
+      ).rejects.toMatchObject({ code: 'ENOENT' })
+      expect(await d.markerStore.folderExists('s', 'missing')).toBe(false)
+      expect(await d.folders.byPath('s', 'missing')).toBeNull()
+    },
+  )
 
-  it('reuses a FREE folder marker id (a clone whose registry row was lost)', async () => {
-    const d = deps()
-    writeMarkerFile('docs', { id: VALID_ID, type: 'folder', pathAliases: ['old'] })
-    const id = await ensureFolderIdentity(d, { space: 's', folderPath: 'docs' })
-    expect(id).toBe(VALID_ID) // adopted, not re-minted
-    expect(await d.folders.byPath('s', 'docs')).toMatchObject({
-      id: VALID_ID,
-      pathAliases: ['old'],
-    })
-  })
+  itAnchoredMarkerWrite(
+    'reuses a FREE folder marker id (a clone whose registry row was lost)',
+    async () => {
+      const d = deps()
+      writeMarkerFile('docs', { id: VALID_ID, type: 'folder', pathAliases: ['old'] })
+      const id = await ensureFolderIdentity(d, { space: 's', folderPath: 'docs' })
+      expect(id).toBe(VALID_ID) // adopted, not re-minted
+      expect(await d.folders.byPath('s', 'docs')).toMatchObject({
+        id: VALID_ID,
+        pathAliases: ['old'],
+      })
+    },
+  )
 
   it('REGRESSION (#212 P2): NEVER clobbers a PROJECT marker whose registry row is missing', async () => {
     const d = deps()
@@ -536,32 +831,42 @@ describe('ensureFolderIdentity (#212 — the page-create lazy-mint path)', () =>
     expect(await d.folders.byPath('s', 'docs')).toBeNull() // no folder-type row written
   })
 
-  it('preserves a co-located SPACE facet (#100 phase 4) when it does write a folder marker', async () => {
-    const d = deps()
-    // A space root whose root project was unmarked: the marker carries ONLY the space
-    // facet (no folder/project id). Creating a page there must keep the space identity.
-    writeMarkerFile('', { space: { id: 'SpAcE1234567', slug: 's' } })
-    const id = await ensureFolderIdentity(d, { space: 's', folderPath: '' })
-    expect(id).toMatch(/^[A-Za-z0-9_-]{12}$/)
-    const onDisk = parseMarker(readFileSync(join(dir, '.notariummeta'), 'utf8'))
-    expect(onDisk).toMatchObject({ id, type: 'folder', space: { id: 'SpAcE1234567', slug: 's' } })
-  })
+  itAnchoredMarkerWrite(
+    'preserves a co-located SPACE facet (#100 phase 4) when it does write a folder marker',
+    async () => {
+      const d = deps()
+      // A space root whose root project was unmarked: the marker carries ONLY the space
+      // facet (no folder/project id). Creating a page there must keep the space identity.
+      writeMarkerFile('', { space: { id: 'SpAcE1234567', slug: 's' } })
+      const id = await ensureFolderIdentity(d, { space: 's', folderPath: '' })
+      expect(id).toMatch(/^[A-Za-z0-9_-]{12}$/)
+      const onDisk = parseMarker(readFileSync(join(dir, '.notariummeta'), 'utf8'))
+      expect(onDisk).toMatchObject({ id, type: 'folder', space: { id: 'SpAcE1234567', slug: 's' } })
+    },
+  )
 
-  it('a COPIED project folder (marker id OWNED by a live project elsewhere) gets a FRESH id (Fork-B)', async () => {
-    const d = deps()
-    mkdirSync(join(dir, 'a'))
-    const orig = await markFolderAsProject(d, { space: 's', folderPath: 'a', displayName: 'Proj' })
-    // `cp -r a b`: the copy carries the original's project marker verbatim (its id is LIVE).
-    writeMarkerFile('b', { id: orig.id, slug: orig.slug, displayName: 'Proj' })
-    const id = await ensureFolderIdentity(d, { space: 's', folderPath: 'b' })
-    expect(id).not.toBe(orig.id) // never hand out — or resolve a page onto — the original's id
-    expect(id).toMatch(/^[A-Za-z0-9_-]{12}$/)
-    expect(await d.projects.getById(orig.id)).toMatchObject({ path: 'a' }) // original untouched
-    expect(await d.folders.byPath('s', 'b')).toMatchObject({ id }) // the copy re-identified as a plain folder
-  })
+  itAnchoredMarkerWrite(
+    'a COPIED project folder (marker id OWNED by a live project elsewhere) gets a FRESH id (Fork-B)',
+    async () => {
+      const d = deps()
+      mkdirSync(join(dir, 'a'))
+      const orig = await markFolderAsProject(d, {
+        space: 's',
+        folderPath: 'a',
+        displayName: 'Proj',
+      })
+      // `cp -r a b`: the copy carries the original's project marker verbatim (its id is LIVE).
+      writeMarkerFile('b', { id: orig.id, slug: orig.slug, displayName: 'Proj' })
+      const id = await ensureFolderIdentity(d, { space: 's', folderPath: 'b' })
+      expect(id).not.toBe(orig.id) // never hand out — or resolve a page onto — the original's id
+      expect(id).toMatch(/^[A-Za-z0-9_-]{12}$/)
+      expect(await d.projects.getById(orig.id)).toMatchObject({ path: 'a' }) // original untouched
+      expect(await d.folders.byPath('s', 'b')).toMatchObject({ id }) // the copy re-identified as a plain folder
+    },
+  )
 })
 
-describe('unmarkProject (#13)', () => {
+describeAnchoredMarkerWrite('unmarkProject (#13)', () => {
   it('removes the marker file + the registry row; re-mark mints a fresh id', async () => {
     const projects = new InMemoryProjects()
     const markerStore = createMarkerStore(() => dir)
@@ -600,7 +905,7 @@ describe('unmarkProject (#13)', () => {
   })
 })
 
-describe('space facet preservation (#100 phase 4 — closeout seam)', () => {
+describeAnchoredMarkerWrite('space facet preservation (#100 phase 4 — closeout seam)', () => {
   // The space-ROOT `.notariummeta` carries BOTH the root project identity AND the
   // space-identity facet (#100 phase 4). A project-side write/unmark of the root must
   // NEVER strip the space facet (the marker.ts invariant) — else the on-disk space
@@ -676,30 +981,33 @@ describe('space facet preservation (#100 phase 4 — closeout seam)', () => {
 })
 
 describe('renameProjectSlug (#100 phase 2)', () => {
-  it('renames the slug → old slug joins aliases (registry + on-disk marker), id/path stable', async () => {
-    const projects = new InMemoryProjects()
-    const markerStore = createMarkerStore(() => dir)
-    mkdirSync(join(dir, 'docs'))
-    const rec = await markFolderAsProject(
-      { projects, markerStore, now },
-      { space: 's', folderPath: 'docs', displayName: 'Docs' },
-    )
-    const res = await renameProjectSlug(
-      { projects, markerStore, now },
-      { space: 's', id: rec.id, slug: 'guides' },
-    )
-    expect(res.ok).toBe(true)
-    const row = (await projects.getById(rec.id))!
-    expect(row).toMatchObject({ id: rec.id, path: 'docs', slug: 'guides', aliases: ['docs'] })
-    // Truth travels: the on-disk marker carries the new slug + the alias history.
-    expect(parseMarker((await markerStore.read('s', 'docs')) ?? '')).toMatchObject({
-      slug: 'guides',
-      aliases: ['docs'],
-    })
-    // Resolution layer: the old current-slug handle is now free of a CURRENT holder.
-    expect(await projects.getByHandle('s', 'guides')).toMatchObject({ id: rec.id })
-    expect(await projects.getByHandle('s', 'docs')).toBeNull() // 'docs' is an alias, not current
-  })
+  itAnchoredMarkerWrite(
+    'renames the slug → old slug joins aliases (registry + on-disk marker), id/path stable',
+    async () => {
+      const projects = new InMemoryProjects()
+      const markerStore = createMarkerStore(() => dir)
+      mkdirSync(join(dir, 'docs'))
+      const rec = await markFolderAsProject(
+        { projects, markerStore, now },
+        { space: 's', folderPath: 'docs', displayName: 'Docs' },
+      )
+      const res = await renameProjectSlug(
+        { projects, markerStore, now },
+        { space: 's', id: rec.id, slug: 'guides' },
+      )
+      expect(res.ok).toBe(true)
+      const row = (await projects.getById(rec.id))!
+      expect(row).toMatchObject({ id: rec.id, path: 'docs', slug: 'guides', aliases: ['docs'] })
+      // Truth travels: the on-disk marker carries the new slug + the alias history.
+      expect(parseMarker((await markerStore.read('s', 'docs')) ?? '')).toMatchObject({
+        slug: 'guides',
+        aliases: ['docs'],
+      })
+      // Resolution layer: the old current-slug handle is now free of a CURRENT holder.
+      expect(await projects.getByHandle('s', 'guides')).toMatchObject({ id: rec.id })
+      expect(await projects.getByHandle('s', 'docs')).toBeNull() // 'docs' is an alias, not current
+    },
+  )
 
   // The HANDLE axis stays ASCII while note names went Unicode (#296): a handle is a URL
   // segment under SpaceSlugSchema, and it is minted through the same `asciiSlug` that
@@ -897,6 +1205,41 @@ describe('scanProjectsAtBoot (#13)', () => {
     expect(bySlug).toEqual(['a:docs', 'b:docs-2']) // deterministic (scan sorted by path)
   })
 
+  it('rebuilds from markers on a host that cannot WRITE them (read path is portable)', async () => {
+    writeMarkerFile('billing', { id: VALID_ID, slug: 'billing', displayName: 'Billing' })
+    const projects = new InMemoryProjects()
+    const markerStore = createMarkerStore(() => dir, { anchoredWritesAvailable: false })
+
+    expect(markerStore.available('s')).toBe(false)
+    await scanProjectsAtBoot({ projects, markerStore, now }, ['s'])
+    // Write availability gates MUTATIONS. Reconcile is a read, and a row it can
+    // restore must not be forfeited because this host cannot publish a marker.
+    expect((await projects.listForSpace('s')).map((r) => `${r.path}:${r.slug}`)).toEqual([
+      'billing:billing',
+    ])
+  })
+
+  it('still refuses to prune on an incomplete scan when writes are unavailable', async () => {
+    const projects = new InMemoryProjects()
+    await projects.upsert({
+      id: VALID_ID,
+      space: 's',
+      path: 'gone',
+      slug: 'gone',
+      aliases: [],
+      pathAliases: [],
+      displayName: 'Gone',
+      status: 'active',
+      lastSeen: now().toISOString(),
+      createdAt: now().toISOString(),
+    })
+    // No notes dir ⇒ scan is an empty LOWER BOUND, not "every marker is gone".
+    const markerStore = createMarkerStore(() => null, { anchoredWritesAvailable: false })
+
+    await scanProjectsAtBoot({ projects, markerStore, now }, ['s'])
+    expect((await projects.listForSpace('s')).map((r) => r.id)).toEqual([VALID_ID])
+  })
+
   it('one space failing does not abort the rest (per-space resilience)', async () => {
     writeMarkerFile('ok', { id: VALID_ID, slug: 'ok' })
     const projects = new InMemoryProjects()
@@ -921,22 +1264,25 @@ describe('scanProjectsAtBoot (#13)', () => {
 })
 
 describe('reconcile — external changes survive a rescan (#13 I3)', () => {
-  it('re-adopts an externally-moved folder: the marker at the new path updates the row by id', async () => {
-    // Mark 'old', then simulate `mv old new` outside us (the marker travels).
-    const projects = new InMemoryProjects()
-    const markerStore = createMarkerStore(() => dir)
-    mkdirSync(join(dir, 'old'))
-    const rec = await markFolderAsProject(
-      { projects, markerStore, now },
-      { space: 's', folderPath: 'old', displayName: 'P' },
-    )
-    rmSync(join(dir, 'old'), { recursive: true, force: true })
-    writeMarkerFile('new', { id: rec.id, slug: rec.slug, displayName: 'P' })
-    await scanProjectsAtBoot({ projects, markerStore, now }, ['s'])
-    const rows = await projects.listForSpace('s')
-    expect(rows).toHaveLength(1) // ONE row, re-adopted (not a stale + a new one)
-    expect(rows[0]).toMatchObject({ id: rec.id, slug: rec.slug, path: 'new' }) // id+slug stable, path moved
-  })
+  itAnchoredMarkerWrite(
+    're-adopts an externally-moved folder: the marker at the new path updates the row by id',
+    async () => {
+      // Mark 'old', then simulate `mv old new` outside us (the marker travels).
+      const projects = new InMemoryProjects()
+      const markerStore = createMarkerStore(() => dir)
+      mkdirSync(join(dir, 'old'))
+      const rec = await markFolderAsProject(
+        { projects, markerStore, now },
+        { space: 's', folderPath: 'old', displayName: 'P' },
+      )
+      rmSync(join(dir, 'old'), { recursive: true, force: true })
+      writeMarkerFile('new', { id: rec.id, slug: rec.slug, displayName: 'P' })
+      await scanProjectsAtBoot({ projects, markerStore, now }, ['s'])
+      const rows = await projects.listForSpace('s')
+      expect(rows).toHaveLength(1) // ONE row, re-adopted (not a stale + a new one)
+      expect(rows[0]).toMatchObject({ id: rec.id, slug: rec.slug, path: 'new' }) // id+slug stable, path moved
+    },
+  )
 
   it('adopts the marker’s aliases on a cold rebuild (#100 phase 2 re-clone durability)', async () => {
     // A repo cloned with a committed marker that already carries past slugs (the
@@ -957,43 +1303,49 @@ describe('reconcile — external changes survive a rescan (#13 I3)', () => {
     })
   })
 
-  it('heals an external marker slug-edit: the marker slug wins, the displaced registry slug → alias (#100 phase 2)', async () => {
-    // Slug is mutable now (phase 2), so the marker is its truth. Someone hand-edits the
-    // marker slug (git) WITHOUT recording the old one in aliases → boot adopts the
-    // new slug AND folds the displaced registry slug into the history, so the old
-    // `space/docs` handle is not silently lost.
-    const projects = new InMemoryProjects()
-    const markerStore = createMarkerStore(() => dir)
-    mkdirSync(join(dir, 'p'))
-    const rec = await markFolderAsProject(
-      { projects, markerStore, now },
-      { space: 's', folderPath: 'p', displayName: 'Docs' },
-    )
-    expect(rec.slug).toBe('docs')
-    writeMarkerFile('p', { id: rec.id, slug: 'guides', displayName: 'Docs' }) // external slug edit, no alias
-    await scanProjectsAtBoot({ projects, markerStore, now }, ['s'])
-    expect(await projects.getById(rec.id)).toMatchObject({ slug: 'guides', aliases: ['docs'] })
-  })
+  itAnchoredMarkerWrite(
+    'heals an external marker slug-edit: the marker slug wins, the displaced registry slug → alias (#100 phase 2)',
+    async () => {
+      // Slug is mutable now (phase 2), so the marker is its truth. Someone hand-edits the
+      // marker slug (git) WITHOUT recording the old one in aliases → boot adopts the
+      // new slug AND folds the displaced registry slug into the history, so the old
+      // `space/docs` handle is not silently lost.
+      const projects = new InMemoryProjects()
+      const markerStore = createMarkerStore(() => dir)
+      mkdirSync(join(dir, 'p'))
+      const rec = await markFolderAsProject(
+        { projects, markerStore, now },
+        { space: 's', folderPath: 'p', displayName: 'Docs' },
+      )
+      expect(rec.slug).toBe('docs')
+      writeMarkerFile('p', { id: rec.id, slug: 'guides', displayName: 'Docs' }) // external slug edit, no alias
+      await scanProjectsAtBoot({ projects, markerStore, now }, ['s'])
+      expect(await projects.getById(rec.id)).toMatchObject({ slug: 'guides', aliases: ['docs'] })
+    },
+  )
 
-  it('prunes a row whose marker vanished externally (folder/marker deleted off our routes)', async () => {
-    const projects = new InMemoryProjects()
-    const markerStore = createMarkerStore(() => dir)
-    mkdirSync(join(dir, 'gone'))
-    mkdirSync(join(dir, 'stays'))
-    await markFolderAsProject(
-      { projects, markerStore, now },
-      { space: 's', folderPath: 'gone', displayName: 'Gone' },
-    )
-    await markFolderAsProject(
-      { projects, markerStore, now },
-      { space: 's', folderPath: 'stays', displayName: 'Stays' },
-    )
-    expect((await projects.listForSpace('s')).length).toBe(2)
-    rmSync(join(dir, 'gone'), { recursive: true, force: true }) // external delete
-    await scanProjectsAtBoot({ projects, markerStore, now }, ['s'])
-    const rows = await projects.listForSpace('s')
-    expect(rows.map((r) => r.path)).toEqual(['stays']) // 'gone' pruned, 'stays' kept
-  })
+  itAnchoredMarkerWrite(
+    'prunes a row whose marker vanished externally (folder/marker deleted off our routes)',
+    async () => {
+      const projects = new InMemoryProjects()
+      const markerStore = createMarkerStore(() => dir)
+      mkdirSync(join(dir, 'gone'))
+      mkdirSync(join(dir, 'stays'))
+      await markFolderAsProject(
+        { projects, markerStore, now },
+        { space: 's', folderPath: 'gone', displayName: 'Gone' },
+      )
+      await markFolderAsProject(
+        { projects, markerStore, now },
+        { space: 's', folderPath: 'stays', displayName: 'Stays' },
+      )
+      expect((await projects.listForSpace('s')).length).toBe(2)
+      rmSync(join(dir, 'gone'), { recursive: true, force: true }) // external delete
+      await scanProjectsAtBoot({ projects, markerStore, now }, ['s'])
+      const rows = await projects.listForSpace('s')
+      expect(rows.map((r) => r.path)).toEqual(['stays']) // 'gone' pruned, 'stays' kept
+    },
+  )
 
   it('does NOT prune on an INCOMPLETE scan (a transient read error must not nuke live rows)', async () => {
     // A row exists, but the scan reports complete:false (e.g. a dir was unreadable)
@@ -1035,45 +1387,51 @@ describe('reconcile — external changes survive a rescan (#13 I3)', () => {
     expect(await projects.getById(VALID_ID)).toBeNull() // complete scan, no marker → pruned
   })
 
-  it('does NOT prune a row whose marker became CORRUPT (readable but unparseable ≠ absent)', async () => {
-    const projects = new InMemoryProjects()
-    const markerStore = createMarkerStore(() => dir)
-    mkdirSync(join(dir, 'p'))
-    const rec = await markFolderAsProject(
-      { projects, markerStore, now },
-      { space: 's', folderPath: 'p', displayName: 'P' },
-    )
-    // An external edit corrupts the marker (a stray byte / git conflict marker).
-    writeFileSync(join(dir, 'p', '.notariummeta'), '{ broken <<<<<<< json')
-    await scanProjectsAtBoot({ projects, markerStore, now }, ['s'])
-    expect(await projects.getById(rec.id)).toBeTruthy() // a parse failure suppresses prune — the project survives
-  })
+  itAnchoredMarkerWrite(
+    'does NOT prune a row whose marker became CORRUPT (readable but unparseable ≠ absent)',
+    async () => {
+      const projects = new InMemoryProjects()
+      const markerStore = createMarkerStore(() => dir)
+      mkdirSync(join(dir, 'p'))
+      const rec = await markFolderAsProject(
+        { projects, markerStore, now },
+        { space: 's', folderPath: 'p', displayName: 'P' },
+      )
+      // An external edit corrupts the marker (a stray byte / git conflict marker).
+      writeFileSync(join(dir, 'p', '.notariummeta'), '{ broken <<<<<<< json')
+      await scanProjectsAtBoot({ projects, markerStore, now }, ['s'])
+      expect(await projects.getById(rec.id)).toBeTruthy() // a parse failure suppresses prune — the project survives
+    },
+  )
 
-  it('a marker whose id is OWNED BY ANOTHER SPACE is a cross-space copy — the row never migrates (#16)', async () => {
-    const projects = new InMemoryProjects()
-    const markerStore = createMarkerStore((space) => join(dir, space)) // per-space subtrees
-    mkdirSync(join(dir, 'A', 'proj'), { recursive: true })
-    // Space A owns the project; space B's tree holds a COPY carrying A's id (a backup
-    // restored into the wrong space, or a cross-space `cp -r`).
-    const recA = await markFolderAsProject(
-      { projects, markerStore, now },
-      { space: 'A', folderPath: 'proj', displayName: 'P' },
-    )
-    mkdirSync(join(dir, 'B', 'copy'), { recursive: true })
-    writeFileSync(
-      join(dir, 'B', 'copy', '.notariummeta'),
-      serializeMarker({ id: recA.id, slug: recA.slug, displayName: 'P' }),
-    )
-    // Both scan orders must converge to the same answer (A keeps the row, B gets none).
-    for (const order of [
-      ['A', 'B'],
-      ['B', 'A'],
-    ] as const) {
-      await scanProjectsAtBoot({ projects, markerStore, now }, order)
-      expect(await projects.getById(recA.id)).toMatchObject({ space: 'A', path: 'proj' }) // never crosses to B
-      expect((await projects.listForSpace('B')).length).toBe(0) // copy is row-less, no migration
-    }
-  })
+  itAnchoredMarkerWrite(
+    'a marker whose id is OWNED BY ANOTHER SPACE is a cross-space copy — the row never migrates (#16)',
+    async () => {
+      const projects = new InMemoryProjects()
+      const markerStore = createMarkerStore((space) => join(dir, space)) // per-space subtrees
+      mkdirSync(join(dir, 'A', 'proj'), { recursive: true })
+      // Space A owns the project; space B's tree holds a COPY carrying A's id (a backup
+      // restored into the wrong space, or a cross-space `cp -r`).
+      const recA = await markFolderAsProject(
+        { projects, markerStore, now },
+        { space: 'A', folderPath: 'proj', displayName: 'P' },
+      )
+      mkdirSync(join(dir, 'B', 'copy'), { recursive: true })
+      writeFileSync(
+        join(dir, 'B', 'copy', '.notariummeta'),
+        serializeMarker({ id: recA.id, slug: recA.slug, displayName: 'P' }),
+      )
+      // Both scan orders must converge to the same answer (A keeps the row, B gets none).
+      for (const order of [
+        ['A', 'B'],
+        ['B', 'A'],
+      ] as const) {
+        await scanProjectsAtBoot({ projects, markerStore, now }, order)
+        expect(await projects.getById(recA.id)).toMatchObject({ space: 'A', path: 'proj' }) // never crosses to B
+        expect((await projects.listForSpace('B')).length).toBe(0) // copy is row-less, no migration
+      }
+    },
+  )
 })
 
 describe('recordFolderRename + folder boot reconcile (#100 phase 3)', () => {
@@ -1202,29 +1560,32 @@ describe('recordFolderRename + folder boot reconcile (#100 phase 3)', () => {
     expect(row.pathAliases).toEqual(['a']) // [[a/note]] keeps resolving
   })
 
-  it('boot recovers a crash after physical rename but before move finalization', async () => {
-    const { projects, folders } = make()
-    const markerStore = createMarkerStore(() => dir)
-    mkdirSync(join(dir, 'before'), { recursive: true })
-    const id = await ensureFolderIdentity(
-      { projects, folders, markerStore, now },
-      { space: 's', folderPath: 'before' },
-    )
+  itAnchoredMarkerWrite(
+    'boot recovers a crash after physical rename but before move finalization',
+    async () => {
+      const { projects, folders } = make()
+      const markerStore = createMarkerStore(() => dir)
+      mkdirSync(join(dir, 'before'), { recursive: true })
+      const id = await ensureFolderIdentity(
+        { projects, folders, markerStore, now },
+        { space: 's', folderPath: 'before' },
+      )
 
-    // prepare() completed, the marker travelled with the atomic directory rename,
-    // then the process died before finalizeFolderMove could update derived rows.
-    renameSync(join(dir, 'before'), join(dir, 'after'))
-    await scanProjectsAtBoot({ projects, folders, markerStore, now }, ['s'])
+      // prepare() completed, the marker travelled with the atomic directory rename,
+      // then the process died before finalizeFolderMove could update derived rows.
+      renameSync(join(dir, 'before'), join(dir, 'after'))
+      await scanProjectsAtBoot({ projects, folders, markerStore, now }, ['s'])
 
-    expect(await folders.getById(id)).toMatchObject({
-      path: 'after',
-      pathAliases: ['before'],
-    })
-    expect(parseMarker(readFileSync(join(dir, 'after', '.notariummeta'), 'utf8'))).toMatchObject({
-      id,
-      type: 'folder',
-    })
-  })
+      expect(await folders.getById(id)).toMatchObject({
+        path: 'after',
+        pathAliases: ['before'],
+      })
+      expect(parseMarker(readFileSync(join(dir, 'after', '.notariummeta'), 'utf8'))).toMatchObject({
+        id,
+        type: 'folder',
+      })
+    },
+  )
 
   // Marking a folder that ALREADY has a folder-identity must ADOPT
   // its id (flip type in place), not mint a second row colliding on UNIQUE(space,path).
@@ -1246,20 +1607,23 @@ describe('recordFolderRename + folder boot reconcile (#100 phase 3)', () => {
 
   // A rename before the registry was rebuilt must REUSE the on-disk
   // folder marker's id + history, not orphan the established identity.
-  it('recordFolderRename REUSES an on-disk folder marker when the registry row is lost (durability)', async () => {
-    const { projects, folders } = make()
-    const markerStore = createMarkerStore(() => dir)
-    // The marker traveled to the post-move path 'c' (fs.rename), but the registry row
-    // is gone (fresh clone / lost table / boot-scan not yet run for this space).
-    writeMarkerFile('c', { id: VALID_ID, type: 'folder', pathAliases: ['a'] })
-    await recordFolderRename(
-      { projects, folders, markerStore, now },
-      { space: 's', oldPath: 'b', newPath: 'c' },
-    )
-    const row = (await folders.listForSpace('s'))[0]
-    expect(row.id).toBe(VALID_ID) // reused the established id, not a fresh mint
-    expect(row.pathAliases).toEqual(['a', 'b']) // marker history ∪ this move's old path
-  })
+  itAnchoredMarkerWrite(
+    'recordFolderRename REUSES an on-disk folder marker when the registry row is lost (durability)',
+    async () => {
+      const { projects, folders } = make()
+      const markerStore = createMarkerStore(() => dir)
+      // The marker traveled to the post-move path 'c' (fs.rename), but the registry row
+      // is gone (fresh clone / lost table / boot-scan not yet run for this space).
+      writeMarkerFile('c', { id: VALID_ID, type: 'folder', pathAliases: ['a'] })
+      await recordFolderRename(
+        { projects, folders, markerStore, now },
+        { space: 's', oldPath: 'b', newPath: 'c' },
+      )
+      const row = (await folders.listForSpace('s'))[0]
+      expect(row.id).toBe(VALID_ID) // reused the established id, not a fresh mint
+      expect(row.pathAliases).toEqual(['a', 'b']) // marker history ∪ this move's old path
+    },
+  )
 
   it('recordFolderRename leaves a PROJECT marker untouched (boot reconcile owns it — no clobber)', async () => {
     const { projects, folders } = make()

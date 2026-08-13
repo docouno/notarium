@@ -75,13 +75,23 @@ let teamStore: CachedStore
  *  Keyed by the SPACE ID the server addresses it with (#100 phase 4 / #127 — the
  *  fake mints id ≠ slug), so a pre-existing folder is seeded via `seedFolder` AFTER the
  *  app resolved that opaque id, not by the human slug. */
-type SeedableMarkerStore = MarkerStore & { seedFolder(space: string, path: string): void }
+type SeedableMarkerStore = MarkerStore & {
+  seedFolder(space: string, path: string): void
+  /** Flip the capability the way a host without the anchor already answers it —
+   *  mid-test, so a case can prove the refusal is the CAPABILITY talking and not
+   *  a project that was never there. */
+  setAvailable(value: boolean): void
+}
 const inMemoryMarkerStore = (): SeedableMarkerStore => {
   const key = (s: string, p: string) => `${s}\0${p}`
   const exists = new Set<string>()
   const markers = new Map<string, string>()
+  let available = true
   return {
-    available: () => true,
+    available: () => available,
+    setAvailable: (value) => {
+      available = value
+    },
     folderExists: async (space, path) =>
       path === '' || exists.has(key(space, path)) || markers.has(key(space, path)),
     write: async (space, path, raw) => {
@@ -151,6 +161,26 @@ const startSession = async (bearer: string, project: string) => {
   })
   return ((await res.json()) as { result?: { structuredContent?: Record<string, unknown> } }).result
     ?.structuredContent
+}
+
+const callTool = async (bearer: string, name: string, args: Record<string, unknown>) => {
+  const res = await fetch(`http://127.0.0.1:${port}/mcp`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      accept: 'application/json, text/event-stream',
+      authorization: `Bearer ${bearer}`,
+    },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'tools/call',
+      params: { name, arguments: args },
+    }),
+  })
+  return (await res.json()) as {
+    result?: { isError?: boolean; content?: { type: string; text?: string }[] }
+  }
 }
 
 const mark = (cookie: string, body: Record<string, unknown>) =>
@@ -583,5 +613,69 @@ describe('project overview auto-pin lifecycle (#311)', () => {
     } finally {
       process.off('unhandledRejection', onUnhandled)
     }
+  })
+})
+
+// The marker capability is a runtime fact now, not just a configured path, so the
+// branch these gates guard went from "no local notes dir" to "any host without the
+// /proc/self/fd anchor". Both routes must refuse BEFORE they mutate anything.
+describe('marker capability absent (P5 honest degradation)', () => {
+  it('refuses to mark or to create a project, minting neither folder nor marker', async () => {
+    const cookie = await loginCookie()
+
+    markerStore.setAvailable(false)
+    for (const body of [
+      { folderPath: 'docs', displayName: 'Docs' },
+      { folderPath: 'roadmap', displayName: 'Roadmap', create: true },
+    ]) {
+      expect((await mark(cookie, body)).statusCode).toBe(404)
+    }
+    // A refusal further in would already have minted the folder: `create` goes
+    // through the space store before the marker is ever published.
+    expect(await teamStore.listDirs()).not.toContain('roadmap')
+    await expect(markerStore.read(teamId, 'docs')).resolves.toBeNull()
+  })
+
+  it('refuses to rename a project that demonstrably exists', async () => {
+    const cookie = await loginCookie()
+    const created = await mark(cookie, { folderPath: 'docs', displayName: 'Docs' })
+
+    expect(created.statusCode).toBe(201)
+    const id = created.json().id as string
+    const before = await markerStore.read(teamId, 'docs')
+
+    // 404 because the capability went away, not because the project did — the
+    // same request renames it while the anchor is there.
+    markerStore.setAvailable(false)
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/api/s/team/projects/${id}`,
+      headers: { cookie },
+      payload: { slug: 'renamed' },
+    })
+
+    expect(res.statusCode).toBe(404)
+    await expect(markerStore.read(teamId, 'docs')).resolves.toBe(before)
+  })
+
+  it('refuses the same rename over MCP, and as a missing project rather than a 500', async () => {
+    const cookie = await loginCookie()
+    const created = await mark(cookie, { folderPath: 'docs', displayName: 'Docs' })
+
+    expect(created.statusCode).toBe(201)
+    const handle = created.json().handle as string
+    const bearer = await patFor(cookie)
+    const before = await markerStore.read(teamId, 'docs')
+
+    markerStore.setAvailable(false)
+    const res = await callTool(bearer, 'rename_project', { project: handle, slug: 'renamed-proj' })
+
+    // `isError` alone cannot carry this: the gateway sets it for an honest
+    // ToolFailure and for any unexpected throw alike. The MESSAGE is the whole
+    // claim — the tool answers anti-enumeration, not `internal error` from
+    // halfway through the marker write.
+    expect(res.result?.isError).toBe(true)
+    expect(res.result?.content?.[0]?.text).toMatch(/no such project/)
+    await expect(markerStore.read(teamId, 'docs')).resolves.toBe(before)
   })
 })

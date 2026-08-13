@@ -34,9 +34,10 @@ export const scanProjectsAtBoot = async (
   for (const space of spaces) {
     // Per-space guard: one space's scan failure skips only THAT space (P5).
     try {
-      if (!markerStore.available(space)) {
-        continue
-      }
+      // Deliberately NOT gated on `available()`, which answers for WRITES —
+      // rebuilding rows from markers is a read. The fail-closed guard is
+      // `complete` (below): a space with no notes dir scans to an empty LOWER
+      // BOUND and therefore prunes nothing.
       const { hits, complete } = await markerStore.scan(space)
       const projectRows = await projects.listForSpace(space)
       const folderRows = folders ? await folders.listForSpace(space) : []

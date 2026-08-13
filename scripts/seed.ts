@@ -35,7 +35,7 @@ import {
   parseFrontmatterLines,
   sha256Hex,
 } from '@notarium/core'
-import { createNotariumStore } from '@notarium/engine'
+import { createNotariumStore, renameNoReplaceIfAvailable } from '@notarium/engine'
 import {
   ARTIFACT_TTL_MS,
   createExportHandler,
@@ -398,6 +398,7 @@ const run = async (): Promise<void> => {
   const roleService = createRolesService({
     catalog: loadBuiltinRoleCatalog,
     library: createFsRoleLibrary({
+      publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
       rootForSpace: (space) => {
         const notesDir = notesDirOf(space)
         return notesDir ? join(notesDir, SKILL_MOUNT) : null

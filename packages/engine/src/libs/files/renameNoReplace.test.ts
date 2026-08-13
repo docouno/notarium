@@ -1,10 +1,16 @@
 import type * as nodeChildProcess from 'node:child_process'
 import type { ChildProcess, ExecFileException } from 'node:child_process'
-import { promises as fs } from 'node:fs'
+import type * as nodeFs from 'node:fs'
+import { promises as fs, constants as fsConstants, type Stats } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+
+import {
+  ATOMIC_NO_REPLACE_PLATFORM_GATE,
+  ATOMIC_NO_REPLACE_RUNTIME_GATE,
+} from './atomicNoReplaceGate.fixture'
 
 // The mock must carry its OWN `promisify.custom`, delegating to the real
 // execFile: an automock
@@ -32,15 +38,42 @@ vi.mock('node:child_process', async (importOriginal) => {
   return { ...actual, execFile }
 })
 
+// The host probe is two synchronous calls, so the negative branches of the
+// provider — a missing interpreter, a directory wearing its name, a stat that
+// cannot be answered — are provable without borrowing another machine.
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof nodeFs>()
+
+  return { ...actual, accessSync: vi.fn(actual.accessSync), statSync: vi.fn(actual.statSync) }
+})
+
 const { execFile } = await import('node:child_process')
-const { renameNoReplace } = await import('./renameNoReplace')
+const { accessSync, statSync } = await import('node:fs')
+const {
+  RENAMEAT2_SYSCALL,
+  renameNoReplace,
+  renameNoReplaceForRuntime,
+  renameNoReplaceIfAvailable,
+} = await import('./renameNoReplace')
+// The adapter is imported here, not asserted from its own suite: `localFs.test.ts`
+// runs against the real filesystem and cannot make the probe answer "no", so a
+// construction that derived the facts locally would read as correct there.
+const { createLocalFsFiles } = await import('./localFs')
 
 const execFileMock = vi.mocked(execFile)
+const accessSyncMock = vi.mocked(accessSync)
+const statSyncMock = vi.mocked(statSync)
 const roots: string[] = []
-const NATIVE_PLATFORM_GATE = '[gate: atomic no-replace (no renameat2 on this platform)]'
-const NATIVE_RUNTIME_GATE = '[gate: atomic no-replace (primitive unavailable on this runtime)]'
+const NATIVE_PLATFORM_GATE = ATOMIC_NO_REPLACE_PLATFORM_GATE
+const NATIVE_RUNTIME_GATE = ATOMIC_NO_REPLACE_RUNTIME_GATE
+// Asked of the resolver rather than restated: a second list of mapped ABIs here
+// would be exactly the drift the resolver exists to prevent.
 const nativePlatformMapped =
-  process.platform === 'linux' && (process.arch === 'x64' || process.arch === 'arm64')
+  renameNoReplaceForRuntime({
+    platform: process.platform,
+    arch: process.arch,
+    perlExecutable: true,
+  }) !== undefined
 const nativeCapabilityGate = await (async (): Promise<string | null> => {
   if (!nativePlatformMapped) {
     return NATIVE_PLATFORM_GATE
@@ -116,12 +149,15 @@ const failExit = (stdout: string): void => {
 /** Error-mapping cases inject execFile failures, so they do not need a native
  * syscall. Pin the capability pre-check to one mapped ABI and restore the host
  * exactly afterwards; this keeps them meaningful on non-Linux contributors. */
-const withMappedRuntime = async <T>(run: () => Promise<T>): Promise<T> => {
+const withRuntime = async <T>(
+  facts: { platform: string; arch: string },
+  run: () => Promise<T>,
+): Promise<T> => {
   const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
   const arch = Object.getOwnPropertyDescriptor(process, 'arch')!
 
-  Object.defineProperty(process, 'platform', { configurable: true, value: 'linux' })
-  Object.defineProperty(process, 'arch', { configurable: true, value: 'x64' })
+  Object.defineProperty(process, 'platform', { configurable: true, value: facts.platform })
+  Object.defineProperty(process, 'arch', { configurable: true, value: facts.arch })
   try {
     return await run()
   } finally {
@@ -130,10 +166,178 @@ const withMappedRuntime = async <T>(run: () => Promise<T>): Promise<T> => {
   }
 }
 
+const withMappedRuntime = async <T>(run: () => Promise<T>): Promise<T> =>
+  withRuntime({ platform: 'linux', arch: 'x64' }, run)
+
+/** A stat answer of a shape the probe can classify, without a real inode. */
+const statAs = (kind: 'file' | 'directory'): Stats =>
+  ({ isFile: () => kind === 'file' }) as unknown as Stats
+
+/** Construction reads the capability and resolves the pathname, nothing more, so
+ *  the shape cases below need no directory on disk. */
+const SHAPE_PROBE_ROOT = join(tmpdir(), 'nt-no-replace-shape-probe')
+
+const actualFs = await vi.importActual<typeof nodeFs>('node:fs')
+
 afterEach(async () => {
+  // An unconsumed one-shot would otherwise leak into the next case — and these
+  // two are on the path of every adapter construction.
+  accessSyncMock.mockReset().mockImplementation(actualFs.accessSync)
+  statSyncMock.mockReset().mockImplementation(actualFs.statSync)
   vi.restoreAllMocks()
   vi.unstubAllEnvs()
   await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })))
+})
+
+describe('renameNoReplaceForRuntime', () => {
+  // The table by value, because only the host's own row can be proven by running
+  // it: a wrong number in the other one is advertised as a working capability and
+  // reaches the kernel as an unrelated call, and an added row extends the promise
+  // to an architecture nobody ran. Both are silent to every test that asks the
+  // resolver a question instead of reading what it answers from.
+  it('offers the capability on exactly these architectures, by ABI number', () => {
+    expect(RENAMEAT2_SYSCALL).toEqual({ arm64: 276, x64: 316 })
+  })
+
+  it.each([
+    ['linux', 'x64', true, true],
+    ['linux', 'arm64', true, true],
+    ['darwin', 'x64', true, false],
+    ['win32', 'x64', true, false],
+    ['linux', 'unsupported-audit-arch', true, false],
+    // A name off Object.prototype: the table must answer for its OWN keys, or an
+    // arch it never mapped reads as supported and the syscall is picked anyway.
+    ['linux', 'constructor', true, false],
+    ['linux', 'x64', false, false],
+  ] as const)(
+    'answers %s/%s with an executable interpreter=%s',
+    (platform, arch, perlExecutable, available) => {
+      expect(renameNoReplaceForRuntime({ platform, arch, perlExecutable })).toBe(
+        available ? renameNoReplace : undefined,
+      )
+    },
+  )
+})
+
+describe('renameNoReplaceIfAvailable', () => {
+  it('hands over the primitive itself when the interpreter is a regular executable', async () => {
+    await withMappedRuntime(async () => {
+      statSyncMock.mockImplementationOnce(() => statAs('file'))
+      accessSyncMock.mockImplementationOnce(() => {})
+
+      expect(renameNoReplaceIfAvailable()).toBe(renameNoReplace)
+      // Both halves are pinned to the pathname AND the mode: a probe that drifts
+      // onto a PATH lookup, another file or a bare existence check would answer
+      // for something other than "this deployment can execute this interpreter".
+      expect(statSyncMock.mock.calls[0]?.[0]).toBe('/usr/bin/perl')
+      expect(accessSyncMock.mock.calls[0]).toEqual(['/usr/bin/perl', fsConstants.X_OK])
+    })
+  })
+
+  it.each([
+    [
+      'a directory wears the interpreter pathname',
+      () => statSyncMock.mockImplementationOnce(() => statAs('directory')),
+    ],
+    [
+      'the interpreter is absent',
+      () =>
+        statSyncMock.mockImplementationOnce(() => {
+          throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
+        }),
+    ],
+    [
+      'the interpreter cannot be executed',
+      () => {
+        statSyncMock.mockImplementationOnce(() => statAs('file'))
+        accessSyncMock.mockImplementationOnce(() => {
+          throw Object.assign(new Error('EACCES'), { code: 'EACCES' })
+        })
+      },
+    ],
+  ])('withholds the capability, without failing, when %s', async (_case, inject) => {
+    await withMappedRuntime(async () => {
+      inject()
+
+      expect(renameNoReplaceIfAvailable()).toBeUndefined()
+    })
+  })
+})
+
+// The pure table is proved above with facts handed in by hand. What these pin is
+// the WIRING: that each fact is read from the process rather than assumed. Both
+// platform reads — the provider's and the primitive's own last-line guard — were
+// invisible to the suite, and could be deleted together with every test still
+// green, which is how a non-Linux host would have gone back to publishing a
+// capability it cannot perform.
+describe('the runtime facts reach the decision', () => {
+  it.each([
+    ['linux', 'x64', true],
+    ['linux', 'arm64', true],
+    ['darwin', 'x64', false],
+    ['win32', 'x64', false],
+    ['linux', 'unsupported-audit-arch', false],
+  ] as const)('the provider answers %s/%s with granted=%s', async (platform, arch, granted) => {
+    await withRuntime({ platform, arch }, async () => {
+      statSyncMock.mockImplementationOnce(() => statAs('file'))
+      accessSyncMock.mockImplementationOnce(() => {})
+
+      expect(renameNoReplaceIfAvailable()).toBe(granted ? renameNoReplace : undefined)
+    })
+  })
+
+  it.each([
+    ['darwin', 'x64'],
+    ['win32', 'x64'],
+    ['linux', 'unsupported-audit-arch'],
+  ] as const)(
+    'the primitive refuses on %s/%s without spawning anything',
+    async (platform, arch) => {
+      const root = await mkroot()
+
+      await fs.mkdir(join(root, 'source'))
+      await withRuntime({ platform, arch }, async () => {
+        execFileMock.mockClear()
+
+        await expect(
+          renameNoReplace(join(root, 'source'), join(root, 'target')),
+        ).rejects.toMatchObject({ code: 'ENOTSUP' })
+        // Defence in depth means the interpreter is never reached: syscall 316 on a
+        // BSD kernel is a different call entirely, and it would receive two pointers.
+        expect(execFileMock).not.toHaveBeenCalled()
+      })
+    },
+  )
+
+  // The construction seam, where the runtime answer becomes the adapter's shape.
+  // Without these the seam is free to derive the facts itself, and the capability
+  // is published on a host that cannot perform it — the defect this task removes,
+  // reintroduced one call site further along.
+  it.each([
+    ['linux', 'x64', true],
+    ['darwin', 'x64', false],
+    ['linux', 'unsupported-audit-arch', false],
+  ] as const)(
+    'the adapter built on %s/%s declares renameDirIfAbsent=%s',
+    async (platform, arch, declared) => {
+      await withRuntime({ platform, arch }, async () => {
+        statSyncMock.mockImplementationOnce(() => statAs('file'))
+        accessSyncMock.mockImplementationOnce(() => {})
+
+        expect(Object.hasOwn(createLocalFsFiles(SHAPE_PROBE_ROOT), 'renameDirIfAbsent')).toBe(
+          declared,
+        )
+      })
+    },
+  )
+
+  it('the adapter withholds the capability when the interpreter is not executable', async () => {
+    await withMappedRuntime(async () => {
+      statSyncMock.mockImplementationOnce(() => statAs('directory'))
+
+      expect(Object.hasOwn(createLocalFsFiles(SHAPE_PROBE_ROOT), 'renameDirIfAbsent')).toBe(false)
+    })
+  })
 })
 
 describe('renameNoReplace', () => {
@@ -210,6 +414,11 @@ describe('renameNoReplace', () => {
     await withMappedRuntime(async () => {
       failExit('17')
       await expect(renameNoReplace(join(root, 'source'), join(root, 'target'))).resolves.toBe(false)
+      // The interpreter that actually runs, not just the one the probe certified.
+      // A bare `perl` here would resolve through PATH — a user-writable directory
+      // ahead of /usr/bin, a shim, an empty PATH under a unit — and the syscall
+      // would be issued by a binary nothing vouched for.
+      expect(execFileMock.mock.lastCall?.[0]).toBe('/usr/bin/perl')
       expect(execFileMock.mock.lastCall?.[1]?.[2]).toBe('316')
     })
   })

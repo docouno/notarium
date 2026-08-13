@@ -1,10 +1,19 @@
 // Engine-managed owner of `.notariummeta` markers: writes/reads the sibling
 // dotfile outside the note write path, scans the tree on a separate typed
-// channel. Per-space, keyed by the notes dir; a space with no local notes dir
-// has no marker capability there (honest degradation, P5).
+// channel. Per-space, keyed by the notes dir. Reading and scanning are portable;
+// WRITING additionally needs the directory-inode anchor this module probes for,
+// and a host missing EITHER of the two says so up front instead of failing
+// mid-operation (honest degradation, P5).
 // canon: docs/projects.md#the-notariummeta-marker-schema-parser-pin
 
-import { promises as fs, constants as fsConstants } from 'node:fs'
+import {
+  closeSync,
+  promises as fs,
+  constants as fsConstants,
+  fstatSync,
+  openSync,
+  statSync,
+} from 'node:fs'
 import { join, relative, resolve, sep } from 'node:path'
 
 import { createLocalFsFiles } from '@notarium/engine'
@@ -16,6 +25,14 @@ import {
   parseMarker,
   type SpaceMarkerFacet,
 } from './marker'
+
+/** The one namespace both halves of this capability speak: the probe proves the
+ *  anchor here, and every marker write addresses its open directory through it.
+ *  Named because the two must not drift — a write re-anchored somewhere else
+ *  would leave the probe vouching for a namespace it no longer uses, and TS
+ *  checks neither string. */
+const PROC_SELF_FD = '/proc/self/fd'
+const fdPath = (fd: number): string => `${PROC_SELF_FD}/${fd}`
 
 /** Read + parse a notes dir's root `.notariummeta` directly by path — re-clone
  *  adoption needs the space facet BEFORE the folder has a registry id (so the
@@ -84,6 +101,10 @@ export type MarkerHit = { folderPath: string; raw: string }
 export type MarkerScan = { hits: MarkerHit[]; complete: boolean }
 
 export type MarkerStore = {
+  /** WRITE-oriented: true only where this store can both reach a notes dir AND
+   *  publish a marker into an existing folder through its open directory inode.
+   *  A caller gating a marker-backed MUTATION asks this; the read side (`read`,
+   *  `scan`, `folderExists`) is portable and asks nothing. */
   available(space: string): boolean
   /** Write-through a marker at an EXISTING `folderPath`; marker metadata never
    *  provisions a user-visible directory. Mount-boundary guard (P8): refuses
@@ -115,7 +136,71 @@ const hasDotSegment = (folderPath: string): boolean =>
 
 const toPosix = (p: string) => p.split(sep).join('/')
 
-export const createMarkerStore = (notesDirFor: (space: string) => string | null): MarkerStore => {
+/** What an anchored marker write needs from the host it was composed on. */
+export type AnchoredMarkerRuntime = {
+  platform: string
+  /** `/proc/self/fd/<fd>` really re-enters the fd it names, proven on a live fd. */
+  procSelfFdAnchor: boolean
+}
+
+/** The runtime matrix as a pure table, so the negative branches are provable on
+ *  any platform. Deliberately NOT derived from the directory no-replace fact:
+ *  a marker rides file CAS through a proc-fd anchor, not `renameat2` on a dir. */
+export const anchoredMarkerWritesForRuntime = (facts: AnchoredMarkerRuntime): boolean =>
+  facts.platform === 'linux' && facts.procSelfFdAnchor
+
+/** Open a directory and demand that `/proc/self/fd/<fd>` names that very inode.
+ *  The existence of `/proc/self/fd` proves nothing on its own — a container can
+ *  carry the directory without the dynamic per-fd entries the write depends on,
+ *  and that host would advertise a capability it cannot perform. Fail closed on
+ *  any error, mismatch or missing entry. */
+const procSelfFdAnchors = (): boolean => {
+  let fd: number | undefined
+
+  try {
+    fd = openSync(PROC_SELF_FD, fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY ?? 0))
+    const opened = fstatSync(fd, { bigint: true })
+    const throughProc = statSync(fdPath(fd), { bigint: true })
+
+    return opened.dev === throughProc.dev && opened.ino === throughProc.ino
+  } catch {
+    return false
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd)
+      } catch {
+        // The probe's verdict is already settled; a close failure cannot change it.
+      }
+    }
+  }
+}
+
+export const anchoredMarkerWritesAvailable = (): boolean =>
+  anchoredMarkerWritesForRuntime({
+    platform: process.platform,
+    procSelfFdAnchor: procSelfFdAnchors(),
+  })
+
+export type MarkerStoreOptions = {
+  /** Pin the runtime fact instead of probing for it. `false` must survive: the
+   *  option is read by presence, never by truthiness, or the one case worth
+   *  testing would silently fall back to the host's real answer. */
+  anchoredWritesAvailable?: boolean
+}
+
+export const createMarkerStore = (
+  notesDirFor: (space: string) => string | null,
+  options: MarkerStoreOptions = {},
+): MarkerStore => {
+  // Settled once per store. A `/proc` that vanishes afterwards is an operation
+  // error, fail closed — this was never a hot-plug promise.
+  const anchoredWrites = options.anchoredWritesAvailable ?? anchoredMarkerWritesAvailable()
+  const unavailable = (): Error =>
+    Object.assign(new Error('directory-anchored marker writes are unavailable'), {
+      code: 'ENOTSUP',
+    })
+
   const rootFor = (space: string) => {
     const dir = notesDirFor(space)
     return dir ? resolve(dir) : null
@@ -143,11 +228,6 @@ export const createMarkerStore = (notesDirFor: (space: string) => string | null)
     const folderAbs = absIn(rootAbs, folderPath)
     let folderHandle
 
-    if (process.platform !== 'linux') {
-      throw Object.assign(new Error('directory-anchored marker writes are unavailable'), {
-        code: 'ENOTSUP',
-      })
-    }
     try {
       folderHandle = await fs.open(
         folderAbs,
@@ -162,7 +242,7 @@ export const createMarkerStore = (notesDirFor: (space: string) => string | null)
       // `/proc/self/fd/N` resolves every relative operation through the opened
       // directory inode. If the public folder is renamed/recreated midway, a
       // temp or journal path can never be rebound into the replacement folder.
-      const anchored = createLocalFsFiles(`/proc/self/fd/${folderHandle.fd}`)
+      const anchored = createLocalFsFiles(fdPath(folderHandle.fd))
       const before = await anchored.read(MARKER_FILENAME)
       let written: boolean
 
@@ -214,11 +294,18 @@ export const createMarkerStore = (notesDirFor: (space: string) => string | null)
   }
 
   return {
-    available: (space) => notesDirFor(space) !== null,
+    available: (space) => anchoredWrites && notesDirFor(space) !== null,
 
     write: async (space, folderPath, raw) => {
+      // The mount-boundary refusal stays first: it is a pure string verdict that
+      // touches no filesystem, and it must read the same on every host.
       if (hasDotSegment(folderPath)) {
         throw new Error(`refusing to write a marker under a dot namespace: ${folderPath}`)
+      }
+      // Then the runtime, still before `rootFor`, the directory open and any
+      // temp/CAS byte: an unsupported host starts no marker mutation at all.
+      if (!anchoredWrites) {
+        throw unavailable()
       }
       const rootAbs = rootFor(space)
 

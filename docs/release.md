@@ -385,6 +385,38 @@ architectures build from source in the meantime; a multi-arch artifact is its ow
 task, because it also changes what "one digest" means and how the immutability
 check reads a manifest list.
 
+### Declared runtime prerequisites
+
+Some capabilities are properties of the *deployment*, not of the code, and the
+image is where they are declared. `docker/Dockerfile` installs **`perl-base`** in
+the builder and in the runtime stage: it owns `/usr/bin/perl`, through which the
+engine performs `renameat2(RENAME_NOREPLACE)` — the atomic directory no-replace
+behind folder moves and role package publication
+([note model](note-model.md#create-collisions)). The package is Essential in
+Debian and so already rides the pinned base; it is installed explicitly anyway,
+because a capability the code advertises must not depend on what an upstream
+image happens to ship this month.
+
+Where the prerequisite is absent — a non-Linux host, an architecture with no
+mapped syscall ABI, or a source install without the interpreter — the engine
+does not advertise the capability at all: the FileStore has no
+`renameDirIfAbsent`, so folder moves and role installs stop before they touch the
+filesystem (P5). That is honest degradation, not a broken deployment. The two do
+not answer alike, though: where the marker prerequisite below is met, a folder
+move comes back as a refusal the client can read, a role install as a server
+error — no outward capability field was added for the latter.
+
+Project markers carry a *separate* prerequisite of their own. Which operations
+refuse, which fail outright, and what either looks like to a client is behaviour
+the marker owner documents
+([projects](projects.md#the-notariummeta-marker--schema--parser-pin)) — it is not
+restated here, because a copy of that matrix has to be re-derived by hand every
+time a consumer changes and nothing checks that it was. Separate, but not
+disjoint: a non-Linux host fails both predicates at once, so it loses marker
+*writes* too. For the deployment decision that means such a host reads and serves
+the projects whose markers already exist, and cannot create one. Read that branch
+as the widest of the three, not as the loss of a single capability.
+
 ## Base image
 
 `docker/Dockerfile` pins `node:24-slim` **by digest**, in both stages. Without

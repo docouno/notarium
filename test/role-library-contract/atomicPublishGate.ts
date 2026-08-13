@@ -7,17 +7,15 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it } from 'vitest'
 
-import { renameNoReplace } from '@notarium/engine'
-
-/** The markers test/skipSummary.ts groups by. TWO of them, because the gate
- *  closes for two unrelated reasons and only one of them is a verdict about the
- *  machine: an unmapped platform is a permanent property no command changes,
- *  while an unavailable runtime (no interpreter, a filesystem or kernel without
- *  the syscall) is a property of THIS environment. */
-export const ATOMIC_PUBLISH_GATE_PLATFORM =
-  '[gate: atomic no-replace (no renameat2 on this platform)]'
-export const ATOMIC_PUBLISH_GATE_RUNTIME =
-  '[gate: atomic no-replace (primitive unavailable on this runtime)]'
+// By module path: the gate needs the raw primitive to probe with, and the engine
+// barrel deliberately exposes only the provider. The marker texts come from the
+// same place the engine's own suites read them — one text per environment, or
+// the skip summary splits one cause into two groups.
+import {
+  ATOMIC_NO_REPLACE_PLATFORM_GATE,
+  ATOMIC_NO_REPLACE_RUNTIME_GATE,
+} from '../../packages/engine/src/libs/files/atomicNoReplaceGate.fixture'
+import { renameNoReplace } from '../../packages/engine/src/libs/files/renameNoReplace'
 
 /** Probed once per module load with a real publication — neither a platform nor
  *  an interpreter changes mid-run. The probe is asynchronous, so the marker is
@@ -37,12 +35,12 @@ const closedBecause = await (async (): Promise<string | null> => {
 
     marker =
       failure.code === 'ENOTSUP' && failure.cause === undefined
-        ? ATOMIC_PUBLISH_GATE_PLATFORM
-        : ATOMIC_PUBLISH_GATE_RUNTIME
+        ? ATOMIC_NO_REPLACE_PLATFORM_GATE
+        : ATOMIC_NO_REPLACE_RUNTIME_GATE
   }
   if (root) {
     await rm(root, { recursive: true, force: true }).catch(() => {
-      marker = ATOMIC_PUBLISH_GATE_RUNTIME
+      marker = ATOMIC_NO_REPLACE_RUNTIME_GATE
     })
   }
 
@@ -55,7 +53,7 @@ export const atomicPublishAvailable = closedBecause === null
 
 /** Kept as a named export so a suite can carry the reason it sat out without
  *  knowing which of the two applied. */
-export const ATOMIC_PUBLISH_GATE = closedBecause ?? ATOMIC_PUBLISH_GATE_PLATFORM
+export const ATOMIC_PUBLISH_GATE = closedBecause ?? ATOMIC_NO_REPLACE_PLATFORM_GATE
 
 /** `describe` for a suite that publishes onto a real filesystem. */
 export const describeAtomicPublish = (name: string, fn: SuiteFactory): void => {
