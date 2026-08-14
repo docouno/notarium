@@ -7,9 +7,11 @@ import type {
   MoveResponse,
   NoteRevisionDetail,
   NoteRevisionsResponse,
+  NoteSort,
   PreviewsResponse,
   RemoveResponse,
   SaveResponse,
+  SortDir,
   TagsResponse,
   Tree,
   NoteDetail as WireNoteDetail,
@@ -106,11 +108,17 @@ export const notesApi = {
   // The structure endpoint (#64): folder skeleton + counts + stats.
   treeGet: (space: string) => req<Tree>(`${sp(space)}/tree`),
   // One lazy-tree expand step (#64): direct subfolders + direct notes
-  // (title-ordered; offset/limit for huge folders).
+  // (request-ordered; offset/limit for huge folders).
   treeChildrenGet: (
     space: string,
     path: string,
-    opts: { offset?: number; limit?: number; signal?: AbortSignal } = {},
+    opts: {
+      offset?: number
+      limit?: number
+      sort?: NoteSort
+      dir?: SortDir
+      signal?: AbortSignal
+    } = {},
   ) => {
     const q = new URLSearchParams({ path })
 
@@ -119,6 +127,12 @@ export const notesApi = {
     }
     if (opts.limit !== undefined) {
       q.set(QUERY_KEY.limit, String(opts.limit))
+    }
+    if (opts.sort) {
+      q.set(QUERY_KEY.sort, opts.sort)
+    }
+    if (opts.dir) {
+      q.set(QUERY_KEY.dir, opts.dir)
     }
 
     return req<WireTreeChildren>(`${sp(space)}/tree/children?${q.toString()}`, {

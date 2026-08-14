@@ -93,6 +93,7 @@ import { NewButton } from './NewButton'
 import { ProfileButton } from './ProfileButton'
 import { ScopePicker } from './ScopePicker'
 import { SettingsGear } from './SettingsGear'
+import { SortButton } from './SortButton'
 import { SpaceSwitcher } from './SpaceSwitcher'
 import type { MenuState, Renaming, TreeApi } from './types'
 import { VirtualTree } from './VirtualTree'
@@ -104,6 +105,10 @@ export const Sidebar = () => {
     folderTree,
     tree: structure,
     notesIn,
+    explorerSort,
+    explorerSortDir,
+    setExplorerSort,
+    setExplorerSortDir,
     ensureFolder,
     refreshFolders,
     treeLoaded,
@@ -112,6 +117,7 @@ export const Sidebar = () => {
     activeId,
     lastNote,
     openNote,
+    knownNotes,
     movedId,
     navigating,
   } = useNotes()
@@ -370,8 +376,8 @@ export const Sidebar = () => {
   // `treeRows` instead, where `notesIn` belongs.
   const favoriteBranches = useMemo(() => favoriteBranchPaths(favorites.items), [favorites.items])
   const favoriteNotesByFolder = useMemo(
-    () => favoriteNoteFolders(favorites.items),
-    [favorites.items],
+    () => favoriteNoteFolders(favorites.items, knownNotes, explorerSort, explorerSortDir),
+    [favorites.items, knownNotes, explorerSort, explorerSortDir],
   )
   // A STABLE content signature of the favorites-reveal targets (branch paths + note
   // folders). The reveal effect keys off THIS, not the churning memo identities: a
@@ -1445,9 +1451,15 @@ export const Sidebar = () => {
                 onPick={pickScope}
                 onFocus={focusProject}
               />
-              {/* Collapse all + Refresh + New (#98 item 2) act on the FILES tree — hidden on
-                  the Memory scope (#165), which owns its own rows. */}
+              {/* Sort is shared by every explorer scope. Collapse all + Refresh + New
+                  act on the FILES tree and stay hidden while Memory owns the rows. */}
               <div className={styles.sectionActions}>
+                <SortButton
+                  sort={explorerSort}
+                  dir={explorerSortDir}
+                  onSort={setExplorerSort}
+                  onDir={setExplorerSortDir}
+                />
                 {effectiveScope.kind !== 'memory' && (
                   <>
                     <button

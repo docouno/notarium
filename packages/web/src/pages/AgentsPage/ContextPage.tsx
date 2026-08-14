@@ -224,7 +224,7 @@ export const ContextPage = () => {
         // `eager` = the STABLE memory order (#210): muting a project category dims it in
         // place, never reflows it (the default newest-first order would bump a just-muted
         // category to the top, since a mute writes a revision). Mirrors the profile axis.
-        api.projectMemoryGet(space, projectScope.id, 'eager').catch(() => {
+        api.projectMemoryGet(space, projectScope.id, { order: 'eager' }).catch(() => {
           fails.push('project memory')
           return [] as MemoryCategory[]
         }),

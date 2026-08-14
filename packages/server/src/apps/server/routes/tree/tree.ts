@@ -32,7 +32,7 @@ export const treeRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
   })
 
   // One lazy-tree expand step: a folder's direct subfolders + its direct
-  // notes, title-ordered, with offset/limit for huge folders.
+  // notes, request-ordered (`title` by default), with offset/limit for huge folders.
   app.get(s('/tree/children'), { config: authz('space:read', 'space') }, async (req, reply) => {
     const q = TreeChildrenQuerySchema.safeParse(req.query)
 

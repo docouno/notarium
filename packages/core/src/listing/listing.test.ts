@@ -4,6 +4,7 @@ import type { NoteMeta } from '../knowledgeStore'
 import {
   bucketCounts,
   bucketKeyOf,
+  comparatorFor,
   queryNotes,
   tagFacet,
   treeChildren,
@@ -44,11 +45,121 @@ const BASE: NoteMeta[] = [
   }),
 ]
 
+const ORDER_FIXTURE: NoteMeta[] = [
+  note('fixture/bravo.md', {
+    id: 'a',
+    title: 'Bravo',
+    createdAt: '2026-01-03T00:00:00.000Z',
+    modifiedAt: '2026-02-01T00:00:00.000Z',
+  }),
+  note('fixture/alpha.md', {
+    id: 'b',
+    title: 'Alpha',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    modifiedAt: '2026-02-03T00:00:00.000Z',
+  }),
+  note('fixture/charlie.md', {
+    id: 'c',
+    title: 'Charlie',
+    createdAt: '2026-01-02T00:00:00.000Z',
+    modifiedAt: '2026-02-02T00:00:00.000Z',
+  }),
+  note('fixture/delta.md', {
+    id: 'd',
+    title: 'Delta',
+    createdAt: null,
+    modifiedAt: '2026-02-04T00:00:00.000Z',
+  }),
+]
+
 const q = (over: object) => ({
   sort: 'modified' as const,
   offset: 0,
   depth: 'subtree' as const,
   ...over,
+})
+
+describe('comparatorFor', () => {
+  it.each([
+    ['title', 'asc', ['b', 'a', 'c', 'd']],
+    ['title', 'desc', ['d', 'c', 'a', 'b']],
+    ['modified', 'asc', ['a', 'c', 'b', 'd']],
+    ['modified', 'desc', ['d', 'b', 'c', 'a']],
+    ['created', 'asc', ['b', 'c', 'a', 'd']],
+    ['created', 'desc', ['a', 'c', 'b', 'd']],
+  ] as const)('%s %s is total and keeps unknown dates last', (sort, dir, expected) => {
+    expect([...ORDER_FIXTURE].sort(comparatorFor(sort, dir)).map((n) => n.id)).toEqual(expected)
+  })
+
+  it('pins the canonical en-US collation independently of the runtime locale', () => {
+    const nonAscii = ['Örebro', 'Zebra', 'Ångström', 'Älg'].map((title, index) =>
+      note(`non-ascii/${index}.md`, { id: String(index), title }),
+    )
+
+    expect(nonAscii.sort(comparatorFor('title', 'asc')).map((n) => n.title)).toEqual([
+      'Älg',
+      'Ångström',
+      'Örebro',
+      'Zebra',
+    ])
+  })
+
+  it('breaks equal dates, double unknowns and collation ties deterministically', () => {
+    const sameDate = '2026-01-01T00:00:00.000Z'
+    const tied = [
+      note('ties/zulu.md', {
+        title: 'Same',
+        createdAt: sameDate,
+        modifiedAt: sameDate,
+      }),
+      note('ties/alpha.md', {
+        title: 'same',
+        createdAt: sameDate,
+        modifiedAt: sameDate,
+      }),
+      note('ties/bravo.md', {
+        title: 'Bravo',
+        createdAt: sameDate,
+        modifiedAt: sameDate,
+      }),
+      note('ties/null-zulu.md', {
+        title: 'Same',
+        createdAt: null,
+        modifiedAt: null,
+      }),
+      note('ties/null-alpha.md', {
+        title: 'same',
+        createdAt: null,
+        modifiedAt: null,
+      }),
+    ]
+    const dateOrder = [
+      'ties/bravo.md',
+      'ties/alpha.md',
+      'ties/zulu.md',
+      'ties/null-alpha.md',
+      'ties/null-zulu.md',
+    ]
+
+    for (const sort of ['created', 'modified'] as const) {
+      for (const dir of ['asc', 'desc'] as const) {
+        expect([...tied].sort(comparatorFor(sort, dir)).map((item) => item.filePath)).toEqual(
+          dateOrder,
+        )
+      }
+    }
+    for (const [dir, expected] of [
+      ['asc', ['ties/alpha.md', 'ties/zulu.md']],
+      ['desc', ['ties/zulu.md', 'ties/alpha.md']],
+    ] as const) {
+      expect(
+        tied
+          .slice(0, 2)
+          .sort(comparatorFor('title', dir))
+          .map((item) => item.filePath),
+      ).toEqual(expected)
+    }
+  })
 })
 
 describe('queryNotes', () => {
@@ -218,6 +329,40 @@ describe('treeChildren (#64)', () => {
     expect(r.notes.map((n) => n.title)).toEqual(['b'])
     expect(r.total).toBe(2)
     expect(r.folders).toHaveLength(1) // subfolders are never windowed
+  })
+  it('takes sort + dir from the tree query without dropping undated notes', () => {
+    const created = treeChildren(ORDER_FIXTURE, [], tq({ path: 'fixture', sort: 'created' }))
+    const asc = treeChildren(
+      ORDER_FIXTURE,
+      [],
+      tq({ path: 'fixture', sort: 'created', dir: 'asc' }),
+    )
+
+    expect(created.notes.map((n) => n.id)).toEqual(['a', 'c', 'b', 'd'])
+    expect(asc.notes.map((n) => n.id)).toEqual(['b', 'c', 'a', 'd'])
+    expect(created.total).toBe(4)
+    expect(asc.total).toBe(4)
+  })
+  it.each([
+    ['title', 'asc', ['b', 'a', 'c', 'd']],
+    ['title', 'desc', ['d', 'c', 'a', 'b']],
+    ['modified', 'asc', ['a', 'c', 'b', 'd']],
+    ['modified', 'desc', ['d', 'b', 'c', 'a']],
+    ['created', 'asc', ['b', 'c', 'a', 'd']],
+    ['created', 'desc', ['a', 'c', 'b', 'd']],
+  ] as const)('sorts root notes by %s/%s without reordering folders', (sort, dir, expected) => {
+    const rootFixture = [
+      ...ORDER_FIXTURE.map((item) => ({
+        ...item,
+        filePath: item.filePath.replace('fixture/', ''),
+      })),
+      note('zulu-folder/note.md'),
+      note('alpha-folder/note.md'),
+    ]
+    const result = treeChildren(rootFixture, [], tq({ sort, dir }))
+
+    expect(result.notes.map((item) => item.id)).toEqual(expected)
+    expect(result.folders.map((folder) => folder.path)).toEqual(['alpha-folder', 'zulu-folder'])
   })
 })
 

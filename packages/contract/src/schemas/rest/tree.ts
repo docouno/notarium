@@ -1,5 +1,6 @@
 import { z } from 'zod'
-import { NoteListItemSchema } from './notes'
+import { NOTE_SORT } from '../../consts/notes'
+import { NoteListItemSchema, NoteSortSchema, SortDirSchema } from './notes'
 
 /** One folder of the tree skeleton. `count` is the note population of the whole
  *  subtree (matches the Feed facet's prefix filter); `direct` only the notes
@@ -48,13 +49,15 @@ export const TreeChildrenQuerySchema = z.object({
   path: z.string().default(''),
   offset: z.coerce.number().int().min(0).default(0),
   limit: z.coerce.number().int().min(1).optional(),
+  /** Orders direct notes only; folders keep their structural name order. */
+  sort: NoteSortSchema.default(NOTE_SORT.title),
+  dir: SortDirSchema.optional(),
 })
 
 /** One expand step of the sidebar tree: the folder's direct subfolders (with
- *  the same counts the skeleton carries) and its direct notes, title-ordered —
- *  the ordering is THIS endpoint's contract, not a parameter, so every tree
- *  consumer renders the same listing. `total` is the direct-note population
- *  before the slice. */
+ *  the same counts the skeleton carries) and its direct notes, ordered by the
+ *  request (`title` by default). `total` is the direct-note population before
+ *  the slice; changing order never changes that population. */
 export const TreeChildrenResponseSchema = z.object({
   folders: z.array(TreeFolderSchema),
   notes: z.array(NoteListItemSchema),

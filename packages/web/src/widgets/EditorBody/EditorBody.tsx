@@ -77,6 +77,7 @@ const FocusControl = ({
     })
   const items: MenuItem[] = FOCUS_OPTIONS.map((o) => ({
     label: o.label,
+    radioGroup: 'Editor focus',
     active: focus === o.value,
     onClick: () => onSetFocus(o.value),
   }))

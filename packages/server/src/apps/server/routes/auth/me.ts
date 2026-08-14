@@ -25,6 +25,7 @@ import {
   ContextPinRequestSchema,
   MeAgentContextResponseSchema,
   MeAgentRolesResponseSchema,
+  MeMemoryQuerySchema,
   MeMemoryResponseSchema,
   MeSchema,
   OkResponseSchema,
@@ -352,12 +353,13 @@ export const meRoutes = async (
   // The agent-memory audit feed. A read NEVER mints a personal space (peek, not
   // ensure) — a fresh user sees an honest empty feed, not a side-effect space.
   app.get('/api/me/memory', { config: authz('self:read', 'host') }, async (req) => {
+    const query = MeMemoryQuerySchema.parse(req.query)
     const slug = await peekPersonalSpace({ auth, spaces }, req.principal)
 
     if (!slug) {
       return MeMemoryResponseSchema.parse({ categories: [] })
     }
-    const cats = await listMemoryCategories(await spaces.store(slug))
+    const cats = await listMemoryCategories(await spaces.store(slug), '', query)
     return MeMemoryResponseSchema.parse({
       categories: await withAuthors(cats, req.principal.username, auth.describeAuthor),
     })

@@ -2,11 +2,13 @@ import type {
   PatchProjectRequest,
   ProjectAgentContext,
   ProjectMemory,
+  ProjectMemoryQuery,
   ProjectRow,
   ProjectsResponse,
   RemoveResponse,
 } from '@notarium/contract'
 import { req, sp } from './client'
+import { memoryQs } from './query'
 
 export const projectsApi = {
   // ── projects (#13) ────────────────────────────────────────────────────────
@@ -36,9 +38,9 @@ export const projectsApi = {
    *  agent recorded about THIS project, with #12 provenance — the space-scoped
    *  twin of meMemoryGet. An empty list = nothing recorded yet (honest, not an
    *  error); a foreign/unknown id 404s (anti-enumeration #16). */
-  projectMemoryGet: (space: string, projectId: string, order?: 'eager') =>
+  projectMemoryGet: (space: string, projectId: string, query: ProjectMemoryQuery = {}) =>
     req<ProjectMemory>(
-      `${sp(space)}/projects/${encodeURIComponent(projectId)}/memory${order ? `?order=${order}` : ''}`,
+      `${sp(space)}/projects/${encodeURIComponent(projectId)}/memory${memoryQs(query)}`,
     ).then((d) => d.categories),
   /** The PROJECT agent-context preview (#165): capped alwaysLoad for the agent,
    *  full pins[] for the UI, plus the read-only auto index. */

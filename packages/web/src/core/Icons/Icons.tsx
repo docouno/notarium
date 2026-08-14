@@ -309,6 +309,14 @@ export const IconCalendar = (p: IconProps) => (
     <path d="M3 10h18" />
   </S>
 )
+export const IconArrowUpDown = (p: IconProps) => (
+  <S {...p}>
+    <path d="m21 16-4 4-4-4" />
+    <path d="M17 20V4" />
+    <path d="m3 8 4-4 4 4" />
+    <path d="M7 4v16" />
+  </S>
+)
 // Feed: a post card — image block over two text lines, like a social feed item.
 export const IconFeed = (p: IconProps) => (
   <S {...p}>

@@ -68,7 +68,93 @@ const storeFixture = (withBatch = true) => {
   return { store, list, read, latestRevisions, revisions }
 }
 
+const orderingStore = () => {
+  const metas = [
+    {
+      id: 'decisions',
+      title: 'decisions',
+      class: 'agent-memory' as const,
+      filePath: '.notarium/memory/decisions.md',
+      createdAt: '2026-01-02T00:00:00.000Z',
+      modifiedAt: '2026-03-01T00:00:00.000Z',
+    },
+    {
+      id: 'conventions',
+      title: 'conventions',
+      class: 'agent-memory' as const,
+      filePath: '.notarium/memory/conventions.md',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      modifiedAt: '2026-03-03T00:00:00.000Z',
+    },
+    {
+      id: 'gotchas',
+      title: 'gotchas',
+      class: 'agent-memory' as const,
+      filePath: '.notarium/memory/gotchas.md',
+      createdAt: '2026-01-03T00:00:00.000Z',
+      modifiedAt: '2026-03-02T00:00:00.000Z',
+    },
+    {
+      id: 'learnings',
+      title: 'learnings',
+      class: 'agent-memory' as const,
+      filePath: '.notarium/memory/learnings.md',
+      createdAt: null,
+      modifiedAt: '2026-03-04T00:00:00.000Z',
+    },
+  ]
+
+  return {
+    list: vi.fn(async () => metas),
+    read: vi.fn(async (id: string) => {
+      const meta = metas.find((row) => row.id === id)!
+      return {
+        ...meta,
+        content: `${meta.title} body`,
+        frontmatter: { summary: `${meta.title} summary` },
+        versionToken: `${id}-v1`,
+      }
+    }),
+  } as unknown as KnowledgeStore
+}
+
 describe('listMemoryCategories', () => {
+  it.each([
+    [{ sort: 'title', dir: 'asc' }, ['conventions', 'decisions', 'gotchas', 'learnings']],
+    [{ sort: 'title', dir: 'desc' }, ['learnings', 'gotchas', 'decisions', 'conventions']],
+    [{ sort: 'modified', dir: 'asc' }, ['decisions', 'gotchas', 'conventions', 'learnings']],
+    [{ sort: 'modified', dir: 'desc' }, ['learnings', 'conventions', 'gotchas', 'decisions']],
+    [{ sort: 'created', dir: 'asc' }, ['conventions', 'decisions', 'gotchas', 'learnings']],
+    [{ sort: 'created', dir: 'desc' }, ['gotchas', 'decisions', 'conventions', 'learnings']],
+  ] as const)('sorts the audit by %j', async (opts, expected) => {
+    const categories = await listMemoryCategories(orderingStore(), '', opts)
+
+    expect(categories.map((category) => category.category)).toEqual(expected)
+    expect(categories).toHaveLength(4)
+  })
+
+  it('keeps the historical newest-write default and lets eager win over sort + dir', async () => {
+    const dflt = await listMemoryCategories(orderingStore())
+    const eager = await listMemoryCategories(orderingStore(), '', {
+      order: 'eager',
+      sort: 'title',
+      dir: 'desc',
+    })
+
+    expect(dflt.map((category) => category.category)).toEqual([
+      'learnings',
+      'conventions',
+      'gotchas',
+      'decisions',
+    ])
+    expect(eager.map((category) => category.category)).toEqual([
+      'decisions',
+      'conventions',
+      'gotchas',
+      'learnings',
+    ])
+  })
+
   it('lists only the memory class and decorates every category with one provenance batch', async () => {
     const { store, list, read, latestRevisions, revisions } = storeFixture()
 

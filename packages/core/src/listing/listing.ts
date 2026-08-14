@@ -5,8 +5,15 @@
 // windows whatever engine sits behind it.
 // canon: docs/core.md#list-layer
 
-import type { BucketsQuery, NoteMeta, NotesQuery, TreeChildrenQuery } from '../knowledgeStore'
-import { BUCKET_GRAN, DATE_FIELD, DEPTH, NOTE_SORT } from '../knowledgeStore'
+import type {
+  BucketsQuery,
+  NoteMeta,
+  NoteSort,
+  NotesQuery,
+  SortDir,
+  TreeChildrenQuery,
+} from '../knowledgeStore'
+import { BUCKET_GRAN, DATE_FIELD, DEPTH, NOTE_SORT, SORT_DIR } from '../knowledgeStore'
 import { directoryOf, isFolderPageNote } from '../libs/path'
 import { buildTagFacet, matchesTags } from '../libs/tags'
 import type {
@@ -24,21 +31,69 @@ const WEEK_MS = 7 * DAY_MS
 /** One reusable collator: per-call `localeCompare(..., {sensitivity})` re-derives
  *  collation state every comparison and made a 100k-note sort cost ~2s — the
  *  collator brings the same ordering down to ~75ms (26×). */
-const byTitleCollator = new Intl.Collator(undefined, { sensitivity: 'base' })
+const byTitleCollator = new Intl.Collator('en-US', { sensitivity: 'base' })
 
 const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0)
 
-const byTitle = (a: NoteMeta, b: NoteMeta) =>
-  byTitleCollator.compare(a.title, b.title) ||
-  // The tie-break only needs to be total and stable, so plain code-unit order
-  // on the storage path does (and costs nothing).
-  cmp(a.filePath, b.filePath)
+export type SortFields<T> = {
+  title: (item: T) => string
+  stableKey: (item: T) => string
+  createdAt: (item: T) => string | null
+  modifiedAt: (item: T) => string | null
+}
 
-/** Newest-first by a date string; '' (unknown) sorts last; ties stay stable
- *  via the title order so a paginated window never sees an item twice.
- *  ISO strings order lexicographically — no locale machinery. */
-const byDateDesc = (key: 'createdAt' | 'modifiedAt') => (a: NoteMeta, b: NoteMeta) =>
-  cmp(String(b[key] || ''), String(a[key] || '')) || byTitle(a, b)
+type NoteLike = Pick<NoteMeta, 'title' | 'filePath' | 'createdAt' | 'modifiedAt'>
+
+const NOTE_FIELDS: SortFields<NoteLike> = {
+  title: (item) => item.title,
+  stableKey: (item) => item.filePath,
+  createdAt: (item) => item.createdAt,
+  modifiedAt: (item) => item.modifiedAt,
+}
+
+export function comparatorFor<T extends NoteLike>(
+  sort: NoteSort,
+  dir?: SortDir,
+): (a: T, b: T) => number
+export function comparatorFor<T>(
+  sort: NoteSort,
+  dir: SortDir | undefined,
+  fields: SortFields<T>,
+): (a: T, b: T) => number
+/** The one total ordering rule shared by server windows and optimistic browser
+ *  projections. Unknown dates are structural unknowns, so they stay last in
+ *  both directions; title + a stable key make every tie deterministic. */
+export function comparatorFor<T>(
+  sort: NoteSort,
+  dir?: SortDir,
+  fields: SortFields<T> = NOTE_FIELDS as SortFields<T>,
+): (a: T, b: T) => number {
+  const direction = dir ?? (sort === NOTE_SORT.title ? SORT_DIR.asc : SORT_DIR.desc)
+  const factor = direction === SORT_DIR.asc ? 1 : -1
+  const byTitle = (a: T, b: T) =>
+    byTitleCollator.compare(fields.title(a), fields.title(b)) ||
+    cmp(fields.stableKey(a), fields.stableKey(b))
+
+  if (sort === NOTE_SORT.title) {
+    return (a, b) => factor * byTitle(a, b)
+  }
+  const dateOf = sort === NOTE_SORT.created ? fields.createdAt : fields.modifiedAt
+
+  return (a, b) => {
+    const aDate = dateOf(a)
+    const bDate = dateOf(b)
+
+    if (!aDate || !bDate) {
+      if (!aDate && !bDate) {
+        return byTitle(a, b)
+      }
+
+      return aDate ? -1 : 1
+    }
+
+    return factor * cmp(aDate, bDate) || byTitle(a, b)
+  }
+}
 
 const dateKeyOf = (field: 'created' | 'modified'): 'createdAt' | 'modifiedAt' =>
   field === DATE_FIELD.created ? 'createdAt' : 'modifiedAt'
@@ -160,14 +215,10 @@ export const queryNotes = (notes: readonly NoteMeta[], q: NotesQuery): NotesWind
   if (q.from || q.to) {
     list = list.filter((n) => inDateRange(n, q))
   }
-  if (q.sort === NOTE_SORT.created) {
+  if (q.sort === NOTE_SORT.created && !q.includeUndated) {
     list = list.filter((n) => n.createdAt)
   }
-  list.sort(
-    q.sort === NOTE_SORT.title
-      ? byTitle
-      : byDateDesc(q.sort === NOTE_SORT.created ? 'createdAt' : 'modifiedAt'),
-  )
+  list.sort(comparatorFor(q.sort, q.dir))
   const total = list.length
   return {
     notes: q.limit === undefined ? list.slice(q.offset) : list.slice(q.offset, q.offset + q.limit),
@@ -273,8 +324,7 @@ export const treeSummary = (
 
 /** One lazy-tree expand step: the folder's direct subfolders (with the
  *  same subtree/direct counts the skeleton carries) and its direct notes,
- *  title-ordered — the ordering is the endpoint's contract, so every tree
- *  consumer renders the same listing. offset/limit window the notes only;
+ *  ordered by the request (`title` by default). offset/limit window the notes only;
  *  `total` is the direct-note population before the slice. */
 export const treeChildren = (
   notes: readonly NoteMeta[],
@@ -345,11 +395,13 @@ export const treeChildren = (
       }
     })
   const page = queryNotes(contentNotes, {
-    sort: NOTE_SORT.title,
+    sort: q.sort ?? NOTE_SORT.title,
+    dir: q.dir,
     offset: q.offset,
     limit: q.limit,
     folder: q.path,
     depth: DEPTH.direct,
+    includeUndated: true,
   })
   return { folders, notes: page.notes, total: page.total }
 }

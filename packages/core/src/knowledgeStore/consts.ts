@@ -88,6 +88,12 @@ export const NOTE_SORT = {
   title: 'title',
 } as const
 
+/** Direction of a list-layer sort axis. */
+export const SORT_DIR = {
+  asc: 'asc',
+  desc: 'desc',
+} as const
+
 /** The DATE axis a range filter runs on. */
 export const DATE_FIELD = {
   created: 'created',
@@ -166,5 +172,6 @@ export type ReadScope = (typeof READ_SCOPE)[keyof typeof READ_SCOPE]
 export type ScanPhase = (typeof SCAN_PHASE)[keyof typeof SCAN_PHASE]
 export type ResolvedVia = (typeof RESOLVED_VIA)[keyof typeof RESOLVED_VIA]
 export type NoteSort = (typeof NOTE_SORT)[keyof typeof NOTE_SORT]
+export type SortDir = (typeof SORT_DIR)[keyof typeof SORT_DIR]
 export type DateField = (typeof DATE_FIELD)[keyof typeof DATE_FIELD]
 export type BucketGran = (typeof BUCKET_GRAN)[keyof typeof BUCKET_GRAN]

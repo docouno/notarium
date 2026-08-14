@@ -42,33 +42,38 @@ export const ScopePicker = ({
   const items: MenuItem[] = [
     {
       label: 'Files',
+      radioGroup: 'Explorer scope',
       icon: <IconLayers size={14} />,
       active: scope.kind === 'files',
       onClick: () => onPick({ kind: 'files' }),
     },
     {
       label: 'Projects',
+      radioGroup: 'Explorer scope',
       icon: <IconFolderKanban size={14} />,
       active: scope.kind === 'projects',
       onClick: () => onPick({ kind: 'projects' }),
     },
     {
       label: 'Memory',
+      radioGroup: 'Explorer scope',
       icon: <IconBotMessage size={14} />,
       active: scope.kind === 'memory',
       onClick: () => onPick({ kind: 'memory' }),
     },
     {
       label: 'Favorites',
+      radioGroup: 'Explorer scope',
       icon: <IconStar size={14} />,
       active: scope.kind === 'favorites',
       onClick: () => onPick({ kind: 'favorites' }),
     },
     ...(recent.length
       ? [
-          { divider: true } as MenuItem,
+          { divider: true, radioGroup: 'Explorer scope' } as MenuItem,
           ...recent.map((p) => ({
             label: p.displayName,
+            radioGroup: 'Explorer scope',
             icon: <IconFolderKanban size={14} />,
             active: scope.kind === 'project' && scope.path === p.path,
             onClick: () => onFocus(p.path),

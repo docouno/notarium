@@ -6,10 +6,15 @@ import { NOTE_CLASS } from '@notarium/contract'
 import type { MemoryCategory, Profile } from '@notarium/contract'
 import {
   buildMemoryIndex,
+  comparatorFor,
   type KnowledgeStore,
   nameKey,
+  NOTE_SORT,
+  type NoteSort,
   READ_SCOPE,
   slugify,
+  type SortDir,
+  type SortFields,
   STORE_ERROR_REASON,
 } from '@notarium/core'
 
@@ -24,9 +29,14 @@ export const PROFILE_NOTE_TYPE = 'person'
  *  readable/editable only by id. */
 export const PROFILE_NOTE_CLASS = NOTE_CLASS.profile
 
-/** Audit feed order, newest write first; `?? ''` sorts timestamp-less rows last. */
-const byModifiedDesc = (a: { modifiedAt: string | null }, b: { modifiedAt: string | null }) =>
-  (b.modifiedAt ?? '').localeCompare(a.modifiedAt ?? '')
+type MemoryAuditCategory = Omit<MemoryCategory, 'author'>
+
+const MEMORY_SORT_FIELDS: SortFields<MemoryAuditCategory> = {
+  title: (item) => item.category,
+  stableKey: (item) => item.noteId,
+  createdAt: (item) => item.createdAt,
+  modifiedAt: (item) => item.modifiedAt,
+}
 
 /** List one mount subdir's agent-memory categories, decorated with journal
  *  provenance. `subdir`: '' = about-user memory, a project id = about-project.
@@ -34,8 +44,8 @@ const byModifiedDesc = (a: { modifiedAt: string | null }, b: { modifiedAt: strin
 export const listMemoryCategories = async (
   store: KnowledgeStore,
   subdir = '',
-  opts: { order?: 'modified' | 'eager' } = {},
-): Promise<Array<Omit<MemoryCategory, 'author'>>> => {
+  opts: { order?: 'modified' | 'eager'; sort?: NoteSort; dir?: SortDir } = {},
+): Promise<MemoryAuditCategory[]> => {
   // `author` is attached at the route boundary — it needs the viewer + pat
   // registry, which this builder lacks.
   const index = await buildMemoryIndex(store, { subdir })
@@ -48,7 +58,7 @@ export const listMemoryCategories = async (
     ? await store.latestRevisions(index.map((entry) => entry.noteId))
     : new Map()
 
-  const out: Array<Omit<MemoryCategory, 'author'>> = []
+  const out: MemoryAuditCategory[] = []
 
   for (const entry of index) {
     let modifiedAt = entry.modifiedAt
@@ -67,6 +77,7 @@ export const listMemoryCategories = async (
       summary: entry.summary,
       tokens: entry.tokens,
       muted: entry.muted,
+      createdAt: entry.createdAt,
       modifiedAt,
       principal,
       kind,
@@ -76,7 +87,9 @@ export const listMemoryCategories = async (
   // `eager` preserves buildMemoryIndex order = the order the agent loads memory
   // in, so curation's loaded/trimmed flags match start_session (never re-sort
   // before curating).
-  return opts.order === 'eager' ? out : out.sort(byModifiedDesc)
+  return opts.order === 'eager'
+    ? out
+    : out.sort(comparatorFor(opts.sort ?? NOTE_SORT.modified, opts.dir, MEMORY_SORT_FIELDS))
 }
 
 /** Locate the reserved profile note; undefined = not created yet. Scoped `all`

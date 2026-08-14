@@ -1,13 +1,23 @@
-import { type RefObject, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  type RefObject,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 import { Link } from 'react-router'
 import type { MemoryCategory, ProjectRow } from '@notarium/contract'
 import { STORE_EVENT } from '@notarium/contract/events'
+import { comparatorFor, type SortFields } from '@notarium/core'
 import { EmptyState } from '../../core/EmptyState'
 import { IconBotMessage, IconChevron, IconDoc, IconFolderKanban, IconUser } from '../../core/Icons'
 import { cx } from '../../libs/cx/cx'
 import { memoryNoteRoute } from '../../libs/routing/routePaths'
 import { api } from '../../services/api'
 import { TreeState } from '../../widgets/TreeState'
+import { useNotes } from '../NotesProvider'
 import { useProjects } from '../ProjectsProvider'
 import { useSpace } from '../SpaceProvider'
 import { CHANGED_COALESCE_MS, useSync } from '../SyncProvider'
@@ -24,6 +34,12 @@ import tree from './Sidebar.module.scss'
 // lives in the Context constructor, not the explorer.
 
 const USER_KEY = '__user__'
+const MEMORY_SORT_FIELDS: SortFields<MemoryCategory> = {
+  title: (category) => category.category,
+  stableKey: (category) => category.noteId,
+  createdAt: (category) => category.createdAt,
+  modifiedAt: (category) => category.modifiedAt,
+}
 type Axis = {
   key: string
   label: string
@@ -57,6 +73,7 @@ export const MemoryTree = ({
 }) => {
   const { space } = useSpace()
   const { projects } = useProjects()
+  const { explorerSort, explorerSortDir } = useNotes()
   const { subscribe } = useSync()
   const [axes, setAxes] = useState<Axis[] | null>(null)
   // Track only the CLOSED axes — everything is open by default so the content is
@@ -71,7 +88,7 @@ export const MemoryTree = ({
     // a project id that belongs to another space — it only produces anti-enum 404s.
     const projList = (projects ?? []).filter((p) => p.space === space)
     const user = api
-      .meMemoryGet()
+      .meMemoryGet({ sort: explorerSort, dir: explorerSortDir })
       .then((cats): Axis => ({ key: USER_KEY, label: 'Personal', icon: 'user', cats }))
       .catch((): Axis => ({
         key: USER_KEY,
@@ -82,7 +99,7 @@ export const MemoryTree = ({
       }))
     const projAxes = projList.map((p) =>
       api
-        .projectMemoryGet(space, p.id)
+        .projectMemoryGet(space, p.id, { sort: explorerSort, dir: explorerSortDir })
         .then((cats): Axis => ({ key: p.id, label: projectAxisLabel(p), icon: 'project', cats }))
         .catch((): Axis => ({
           key: p.id,
@@ -100,7 +117,23 @@ export const MemoryTree = ({
     // The explorer shows what EXISTS: keep an axis only when it has memory (or
     // failed to load — that we must surface, not silently hide).
     setAxes(next.filter((ax) => ax.cats.length > 0 || ax.failed))
-  }, [space, projects])
+  }, [space, projects, explorerSort, explorerSortDir])
+
+  // Changing the shared explorer order must not flash a loading state or wait
+  // for the network. Reorder the held categories before paint, invalidate any
+  // response issued under the old preference, then let load() reconcile.
+  useLayoutEffect(() => {
+    seq.current += 1
+    setAxes(
+      (current) =>
+        current?.map((axis) => ({
+          ...axis,
+          cats: [...axis.cats].sort(
+            comparatorFor(explorerSort, explorerSortDir, MEMORY_SORT_FIELDS),
+          ),
+        })) ?? null,
+    )
+  }, [explorerSort, explorerSortDir])
 
   useEffect(() => {
     void load()

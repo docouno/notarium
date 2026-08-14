@@ -55,6 +55,8 @@ export type MemoryIndexEntry = {
   summary: string
   tokens: number
   muted: boolean
+  /** Engine metadata for the category's first known creation. */
+  createdAt: string | null
   /** Engine metadata fallback for hosts without a revision journal. */
   modifiedAt: string | null
 }

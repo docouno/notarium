@@ -51,10 +51,23 @@ export const useFavorites = (): FavoritesContextValue => {
 
 const keyOf = (item: FavoriteItem): string => `${item.kind}:${item.id}`
 
+const noteSnapshotKey = (note: NoteView): string =>
+  JSON.stringify([
+    note.id,
+    note.title,
+    note.filePath,
+    note.class ?? null,
+    note.slug ?? null,
+    note.aliases ?? null,
+    note.modifiedAt,
+    note.createdAt,
+    note.preview ?? null,
+  ])
+
 export const FavoritesProvider = ({ children }: { children: ReactNode }) => {
   const { space } = useSpace()
   const { subscribe, connectionRevision, observationEpoch } = useSync()
-  const { remember } = useNotes()
+  const { remember, resolveKnown } = useNotes()
   const [items, setItems] = useState<FavoriteItem[]>([])
   const [loading, setLoading] = useState(true)
   const [loaded, setLoaded] = useState(false)
@@ -73,6 +86,10 @@ export const FavoritesProvider = ({ children }: { children: ReactNode }) => {
   // skeleton on every unrelated note save while it's on screen (Sidebar gates the
   // favorites tree render on `favorites.loading`).
   const reqSeq = useRef(0)
+  // A point-favorite snapshot may refresh only a cache value that Favorites
+  // itself seeded. The fingerprint loses ownership as soon as a reader,
+  // listing, optimistic move, or authoritative rollback changes the NoteView.
+  const seededFallbacks = useRef(new Map<string, string>())
 
   const reload = useCallback(
     async ({ background = false }: { background?: boolean } = {}) => {
@@ -88,14 +105,38 @@ export const FavoritesProvider = ({ children }: { children: ReactNode }) => {
         if (seq !== reqSeq.current) {
           return
         } // superseded by a newer reload — drop this stale snapshot
+        // Favorites owns membership; Notes owns the mutable NoteView. A GET may
+        // refresh a missing view or the last fallback that this provider seeded,
+        // but it must never overwrite a view changed by another Notes-cache writer.
+        const snapshots: NoteView[] = []
+        const pointIds = new Set<string>()
+
+        for (const item of res.items) {
+          if (item.kind !== FAVORITE_ENTITY_KIND.note) {
+            continue
+          }
+          const note = noteView(item.note)
+          const current = resolveKnown(note.id)
+          const seeded = seededFallbacks.current.get(note.id)
+
+          pointIds.add(note.id)
+          if (!current || (seeded && noteSnapshotKey(current) === seeded)) {
+            snapshots.push(note)
+          } else if (seeded) {
+            seededFallbacks.current.delete(note.id)
+          }
+        }
+        for (const id of seededFallbacks.current.keys()) {
+          if (!pointIds.has(id)) {
+            seededFallbacks.current.delete(id)
+          }
+        }
+        const accepted = remember(snapshots, [], observedAt)
+
+        for (const note of accepted) {
+          seededFallbacks.current.set(note.id, noteSnapshotKey(note))
+        }
         setItems(res.items)
-        remember(
-          res.items
-            .filter((it) => it.kind === FAVORITE_ENTITY_KIND.note)
-            .map((it) => noteView(it.note)),
-          [],
-          observedAt,
-        )
         setError(null)
         setLoaded(true) // this space has now completed a successful load (cold state over)
       } catch (err) {
@@ -111,7 +152,7 @@ export const FavoritesProvider = ({ children }: { children: ReactNode }) => {
         }
       }
     },
-    [space, remember, connectionRevision, observationEpoch],
+    [space, remember, resolveKnown, connectionRevision, observationEpoch],
   )
 
   useEffect(() => {

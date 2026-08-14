@@ -1,7 +1,8 @@
-import type { FavoriteItem } from '@notarium/contract'
+import type { FavoriteItem, NoteSort, SortDir } from '@notarium/contract'
+import { comparatorFor } from '@notarium/core'
 import type { SkeletonNode } from '../../../../libs/tree/tree'
 import { noteView, type NoteView } from '../../../../libs/wire'
-import { dirOfPath, noteSort, pathInside } from '../paths'
+import { dirOfPath, pathInside } from '../paths'
 
 export const favoriteBranchPaths = (items: readonly FavoriteItem[]): string[] =>
   items.flatMap((item) => {
@@ -15,19 +16,26 @@ export const favoriteBranchPaths = (items: readonly FavoriteItem[]): string[] =>
     return []
   })
 
-export const favoriteNoteFolders = (items: readonly FavoriteItem[]): Map<string, NoteView[]> => {
+export const favoriteNoteFolders = (
+  items: readonly FavoriteItem[],
+  knownNotes: readonly NoteView[],
+  sort: NoteSort,
+  dir: SortDir,
+): Map<string, NoteView[]> => {
   const map = new Map<string, NoteView[]>()
+  const knownById = new Map(knownNotes.map((note) => [note.id, note]))
 
   for (const item of items) {
     if (item.kind !== 'note') {
       continue
     }
-    const n = noteView(item.note)
+    const snapshot = noteView(item.note)
+    const n = knownById.get(snapshot.id) ?? snapshot
     const folder = dirOfPath(n.filePath)
     map.set(folder, [...(map.get(folder) ?? []), n])
   }
   for (const [folder, notes] of map) {
-    map.set(folder, notes.sort(noteSort))
+    map.set(folder, notes.sort(comparatorFor(sort, dir)))
   }
 
   return map

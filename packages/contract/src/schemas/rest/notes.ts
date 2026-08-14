@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { BUCKET_GRAN, DATE_FIELD, DEPTH, NOTE_SORT } from '../../consts/notes'
+import { BUCKET_GRAN, DATE_FIELD, DEPTH, NOTE_SORT, SORT_DIR } from '../../consts/notes'
 import { enumValues } from '../../libs/enumValues'
 import { IsoTimestampSchema, NoteClassSchema } from '../primitives'
 
@@ -51,6 +51,10 @@ export const NoteListItemSchema = z.object({
  *  the engine honestly doesn't know — they only surface under `modified`);
  *  `title` is A→Z for tree/browse listings. */
 export const NoteSortSchema = z.enum(enumValues(NOTE_SORT))
+
+/** Direction of a list-layer sort axis. Omitted keeps the field's historical
+ *  natural direction: title ascending, date axes descending. */
+export const SortDirSchema = z.enum(enumValues(SORT_DIR))
 
 /** A folder filter set on the wire, the folder facet of the app's one
  *  inclusion filter language: nothing selected = all; each entry ADDS its subtree

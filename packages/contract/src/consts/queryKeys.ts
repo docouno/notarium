@@ -2,6 +2,7 @@
  *  `schemas/queryKeysGuard.ts`. canon: docs/contract.md#wire-consts */
 export const QUERY_KEY = {
   sort: 'sort',
+  dir: 'dir',
   offset: 'offset',
   limit: 'limit',
   folder: 'folder',

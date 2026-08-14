@@ -114,6 +114,34 @@ const listing = (folder: string): TreeChildrenView => ({
   total: 1,
 })
 
+const orderListing = (folder: string, order: readonly string[]): TreeChildrenView => {
+  const rows: Record<string, NoteView> = {
+    alpha: {
+      id: 'alpha',
+      title: 'Alpha',
+      filePath: `${folder}/alpha.md`,
+      modifiedAt: '2026-03-03T00:00:00.000Z',
+      createdAt: '2026-01-01T00:00:00.000Z',
+    },
+    bravo: {
+      id: 'bravo',
+      title: 'Bravo',
+      filePath: `${folder}/bravo.md`,
+      modifiedAt: '2026-03-01T00:00:00.000Z',
+      createdAt: '2026-01-03T00:00:00.000Z',
+    },
+    charlie: {
+      id: 'charlie',
+      title: 'Charlie',
+      filePath: `${folder}/charlie.md`,
+      modifiedAt: '2026-03-02T00:00:00.000Z',
+      createdAt: '2026-01-02T00:00:00.000Z',
+    },
+  }
+
+  return { folders: [], notes: order.map((id) => rows[id]), total: order.length }
+}
+
 const detail = (deleted = false): NoteDetailView => ({
   id: 'D',
   title: deleted ? 'Deleted D' : 'Live D',
@@ -173,6 +201,7 @@ describe('useNotesState interleavings', () => {
     harness.reportNoteSpace.mockReset()
     harness.space = 'work'
     harness.cacheMirrorEffects.length = 0
+    localStorage.clear()
     container = document.createElement('div')
     document.body.append(container)
     root = createRoot(container)
@@ -489,6 +518,62 @@ describe('useNotesState interleavings', () => {
         ?.map((note) => note.id)
         .sort(),
     ).toEqual(['id-from', 'id-to'])
+  })
+
+  it('reorders every held folder immediately and reconciles with the same server query', async () => {
+    const reconcile = deferred<TreeChildrenView>()
+
+    harness.api.treeChildrenGet
+      .mockResolvedValueOnce(orderListing('held', ['alpha', 'bravo', 'charlie']))
+      .mockReturnValueOnce(reconcile.promise)
+    render()
+    await settle()
+    await act(async () => {
+      state.ensureFolder('held')
+      await Promise.resolve()
+    })
+    expect(state.notesIn('held')?.map((note) => note.id)).toEqual(['alpha', 'bravo', 'charlie'])
+
+    act(() => state.setExplorerSort('modified'))
+    expect(state.notesIn('held')?.map((note) => note.id)).toEqual(['bravo', 'charlie', 'alpha'])
+    expect(harness.api.treeChildrenGet).toHaveBeenLastCalledWith('work', 'held', {
+      sort: 'modified',
+      dir: 'asc',
+    })
+
+    await act(async () => reconcile.resolve(orderListing('held', ['bravo', 'charlie', 'alpha'])))
+    expect(state.notesIn('held')?.map((note) => note.id)).toEqual(['bravo', 'charlie', 'alpha'])
+  })
+
+  it('does not let a response issued under the old order overwrite the new one', async () => {
+    const oldOrder = deferred<TreeChildrenView>()
+    const newOrder = deferred<TreeChildrenView>()
+
+    harness.api.treeChildrenGet
+      .mockResolvedValueOnce(orderListing('held', ['alpha', 'bravo', 'charlie']))
+      .mockReturnValueOnce(oldOrder.promise)
+      .mockReturnValueOnce(newOrder.promise)
+    render()
+    await settle()
+    await act(async () => {
+      state.ensureFolder('held')
+      await Promise.resolve()
+    })
+    let refresh!: Promise<void>
+
+    await act(async () => {
+      refresh = state.refreshFolders(['held'])
+      await Promise.resolve()
+    })
+    act(() => state.setExplorerSort('created'))
+    expect(state.notesIn('held')?.map((note) => note.id)).toEqual(['alpha', 'charlie', 'bravo'])
+
+    await act(async () => oldOrder.resolve(orderListing('held', ['alpha', 'bravo', 'charlie'])))
+    await refresh
+    expect(state.notesIn('held')?.map((note) => note.id)).toEqual(['alpha', 'charlie', 'bravo'])
+
+    await act(async () => newOrder.resolve(orderListing('held', ['alpha', 'charlie', 'bravo'])))
+    expect(state.notesIn('held')?.map((note) => note.id)).toEqual(['alpha', 'charlie', 'bravo'])
   })
 
   it('retries D@0 after removed@1 without publishing the late live response', async () => {

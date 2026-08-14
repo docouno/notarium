@@ -27,6 +27,7 @@ import { scrollbars } from './cases/scrollbars'
 import { searchCorpus } from './cases/searchCorpus'
 import { trashEmpty, trashLong, trashMixed } from './cases/trash'
 import { trashRecovery } from './cases/trashRecovery'
+import { treeSort } from './cases/treeSort'
 import { wikiWeb } from './cases/wikiWeb'
 import type { CaseSpec } from './types'
 
@@ -39,6 +40,7 @@ export const CASES: readonly CaseSpec[] = [
   folderPage,
   noteClasses,
   explorerScroll,
+  treeSort,
   // navigation / favorites (the merged Files+Feed rail, #245)
   favorites,
   // activity / history / trash

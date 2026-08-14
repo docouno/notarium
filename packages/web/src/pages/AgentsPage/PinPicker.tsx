@@ -333,6 +333,7 @@ export const PinPicker = ({
                 ariaLabel="From space"
                 items={spaceOptions.map((o) => ({
                   label: o.label,
+                  radioGroup: 'From space',
                   active: o.slug === pickSpace,
                   onClick: () => setPickSpace(o.slug),
                 }))}

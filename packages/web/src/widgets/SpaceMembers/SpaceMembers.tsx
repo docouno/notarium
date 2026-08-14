@@ -155,6 +155,7 @@ export const SpaceMembers = ({ spaceName, canManage, source, reloadKey }: SpaceM
   const rowMenu = (member: Member): MenuItem[] => [
     ...ROLES.map((r) => ({
       label: ROLE_LABEL[r],
+      radioGroup: 'Member role',
       active: r === member.role,
       onClick: () => void onRole(member, r),
     })),

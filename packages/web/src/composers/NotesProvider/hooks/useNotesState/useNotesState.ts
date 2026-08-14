@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router'
-import { NOTE_CLASS } from '@notarium/contract/enums'
+import type { NoteSort, SortDir } from '@notarium/contract'
+import { NOTE_CLASS, NOTE_SORT, SORT_DIR } from '@notarium/contract/enums'
 import { STORE_EVENT } from '@notarium/contract/events'
 import { HTTP_STATUS } from '@notarium/contract/http'
-import { SCAN_PHASE } from '@notarium/core'
+import { comparatorFor, SCAN_PHASE } from '@notarium/core'
 import { effectiveSlug } from '@notarium/core/slug'
 import { pushRecentNote } from '../../../../libs/recentNotes'
 import { folderRoute, noteRouteForClass, parseAppPath } from '../../../../libs/routing/routePaths'
+import { STORAGE_KEYS } from '../../../../libs/storageKeys'
 import { folderOf, nestFolders } from '../../../../libs/tree/tree'
 import { canonicalFolderPath } from '../../../../libs/tree/tree'
 import type { NoteDetailView, NoteView, Tree } from '../../../../libs/wire'
@@ -69,6 +71,14 @@ export const useNotesState = (): NotesContextValue => {
   const [tree, setTree] = useState<Tree | null>(null)
   const [treeLoaded, setTreeLoaded] = useState(false)
   const [folderNotes, setFolderNotes] = useState<Map<string, NoteView[]>>(() => new Map())
+  const [explorerSort, setExplorerSortState] = useState<NoteSort>(() => {
+    const saved = localStorage.getItem(STORAGE_KEYS.explorerSort) as NoteSort | null
+    return saved && Object.values(NOTE_SORT).includes(saved) ? saved : NOTE_SORT.title
+  })
+  const [explorerSortDir, setExplorerSortDirState] = useState<SortDir>(() => {
+    const saved = localStorage.getItem(STORAGE_KEYS.explorerSortDir) as SortDir | null
+    return saved && Object.values(SORT_DIR).includes(saved) ? saved : SORT_DIR.asc
+  })
   const [seen, setSeen] = useState<Map<string, NoteView>>(() => new Map())
   // Seed reader/scope from the URL synchronously so the first paint matches the
   // destination — no flash of the default state before the data lands (#65).
@@ -96,6 +106,8 @@ export const useNotesState = (): NotesContextValue => {
   const removedSeenIdsRef = useRef(new Map<string, number>())
   const treeRef = useRef(tree)
   const folderNotesRef = useRef(folderNotes)
+  const explorerSortRef = useRef(explorerSort)
+  const explorerSortDirRef = useRef(explorerSortDir)
   const activeIdRef = useRef<string | null>(null)
   const noteRef = useRef<NoteDetailView | null>(null)
   const preserveSpaceOnNoteOpenRef = useRef<string | null>(null)
@@ -136,6 +148,12 @@ export const useNotesState = (): NotesContextValue => {
   useEffect(() => {
     noteRef.current = note
   }, [note])
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEYS.explorerSort, explorerSort)
+  }, [explorerSort])
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEYS.explorerSortDir, explorerSortDir)
+  }, [explorerSortDir])
   useEffect(() => {
     const state = location.state as NoteNavigationState | null
     preserveSpaceOnNoteOpenRef.current =
@@ -267,7 +285,10 @@ export const useNotesState = (): NotesContextValue => {
       }
 
       try {
-        const step = await api.treeChildrenGet(forSpace, folder)
+        const step = await api.treeChildrenGet(forSpace, folder, {
+          sort: explorerSortRef.current,
+          dir: explorerSortDirRef.current,
+        })
         const superseded = supersededOutcome()
 
         if (superseded) {
@@ -297,6 +318,43 @@ export const useNotesState = (): NotesContextValue => {
       }
     },
     [commitFolderNotes, commitSeen, observationEpoch],
+  )
+
+  /** Publish the new order from the held cache immediately, then reconcile the
+   * same windows with server truth. Sequence bumps keep requests issued under
+   * the previous order from overwriting this projection. */
+  const applyExplorerOrder = useCallback(
+    (sort: NoteSort, dir: SortDir) => {
+      if (sort === explorerSortRef.current && dir === explorerSortDirRef.current) {
+        return
+      }
+      explorerSortRef.current = sort
+      explorerSortDirRef.current = dir
+      setExplorerSortState(sort)
+      setExplorerSortDirState(dir)
+
+      for (const [folder, seq] of folderLoadSeq.current) {
+        folderLoadSeq.current.set(folder, seq + 1)
+      }
+      const held = [...folderNotesRef.current.keys()]
+      const next = new Map(folderNotesRef.current)
+
+      for (const folder of held) {
+        next.set(folder, [...(next.get(folder) ?? [])].sort(comparatorFor(sort, dir)))
+      }
+      commitFolderNotes(next)
+      void Promise.all(held.map((folder) => loadFolder(folder)))
+    },
+    [commitFolderNotes, loadFolder],
+  )
+
+  const setExplorerSort = useCallback(
+    (sort: NoteSort) => applyExplorerOrder(sort, explorerSortDirRef.current),
+    [applyExplorerOrder],
+  )
+  const setExplorerSortDir = useCallback(
+    (dir: SortDir) => applyExplorerOrder(explorerSortRef.current, dir),
+    [applyExplorerOrder],
   )
 
   /** Pursue an initial folder listing with one in-flight owner for the whole chain.
@@ -446,11 +504,9 @@ export const useNotesState = (): NotesContextValue => {
       const to = nextFolders.get(toFolder)
 
       if (to) {
-        // Title order mirrors the server's `sort=title` listing so the
-        // optimistic row lands where the refetch will confirm it.
         const merged = to.filter((n) => n.id !== id)
         merged.push(moved)
-        merged.sort((a, b) => (a.title || '').localeCompare(b.title || ''))
+        merged.sort(comparatorFor(explorerSortRef.current, explorerSortDirRef.current))
         nextFolders.set(toFolder, merged)
       }
 
@@ -942,6 +998,10 @@ export const useNotesState = (): NotesContextValue => {
     folderTree,
     folders,
     notesIn: useCallback((folder: string) => folderNotes.get(folder) ?? null, [folderNotes]),
+    explorerSort,
+    explorerSortDir,
+    setExplorerSort,
+    setExplorerSortDir,
     ensureFolder,
     resolveKnown,
     remember,

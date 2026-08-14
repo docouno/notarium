@@ -1,3 +1,4 @@
+import type { NoteSort, SortDir } from '@notarium/contract'
 import type { SkeletonNode } from '../../libs/tree/tree'
 import type { NoteDetailView, NoteView, Tree } from '../../libs/wire'
 
@@ -21,9 +22,14 @@ export type NotesContextValue = {
   folderTree: SkeletonNode[]
   /** Existing folder paths, e.g. for the editor's folder picker. */
   folders: string[]
-  /** Direct children of a folder ('' = project root), title-ordered — or null
+  /** Direct children of a folder ('' = project root), explorer-ordered — or null
    *  while that folder hasn't been loaded yet. */
   notesIn: (folder: string) => NoteView[] | null
+  /** One global explorer order shared by files, memory categories and favorites. */
+  explorerSort: NoteSort
+  explorerSortDir: SortDir
+  setExplorerSort: (sort: NoteSort) => void
+  setExplorerSortDir: (dir: SortDir) => void
   /** Kick the lazy load of a folder's direct listing (idempotent). */
   ensureFolder: (folder: string) => void
   /** The session's resolution cache: a note any listing/window has reported. */

@@ -7,6 +7,7 @@ import {
   PatchProjectRequestSchema,
   PROJECT_STATUS,
   ProjectAgentContextResponseSchema,
+  ProjectMemoryQuerySchema,
   ProjectMemoryResponseSchema,
   ProjectRowSchema,
   ProjectsResponseSchema,
@@ -257,8 +258,13 @@ export const projectsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => 
       // `order=eager` = the STABLE (mute-invariant) order: a mute writes a revision
       // that would otherwise bump the category to the front of the default
       // newest-first order; eager keeps it dimmed IN PLACE, not reflowed.
-      const order = (req.query as { order?: string }).order === 'eager' ? 'eager' : 'modified'
-      const cats = await listMemoryCategories(await spaceStoreFor(req), rec.id, { order })
+      const query = ProjectMemoryQuerySchema.parse(req.query)
+      const order = query.order === 'eager' ? 'eager' : 'modified'
+      const cats = await listMemoryCategories(await spaceStoreFor(req), rec.id, {
+        order,
+        sort: query.sort,
+        dir: query.dir,
+      })
       return ProjectMemoryResponseSchema.parse({
         categories: await withAuthors(cats, req.principal.username, auth.describeAuthor),
       })

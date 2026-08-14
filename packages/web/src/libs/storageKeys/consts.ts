@@ -45,6 +45,12 @@ export const STORAGE_KEYS = {
   /** Feed grouping mode. */
   feedGroup: 'bm-feed-group',
 
+  // ── Explorer prefs (NotesProvider) ──
+  /** Shared file/memory/favorites sort field. */
+  explorerSort: 'bm-explorer-sort',
+  /** Shared file/memory/favorites sort direction. */
+  explorerSortDir: 'bm-explorer-sort-dir',
+
   // ── Graph prefs (GraphView) ────────────────────────────────────────────────
   /** Graph node grouping (community/…). */
   graphGroupBy: 'bm-graph-groupby',

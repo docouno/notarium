@@ -1,3 +1,4 @@
+import type { MeMemoryQuery, ProjectMemoryQuery } from '@notarium/contract'
 import { QUERY_KEY } from '@notarium/contract/query'
 import type { NotesQueryParams } from './types'
 
@@ -48,4 +49,20 @@ export const notesQs = (p: NotesQueryParams): string => {
   }
   const s = q.toString()
   return s ? `?${s}` : ''
+}
+
+export const memoryQs = (p: MeMemoryQuery | ProjectMemoryQuery): string => {
+  const q = new URLSearchParams()
+
+  if ('order' in p && p.order) {
+    q.set('order', p.order)
+  }
+  if (p.sort) {
+    q.set(QUERY_KEY.sort, p.sort)
+  }
+  if (p.dir) {
+    q.set(QUERY_KEY.dir, p.dir)
+  }
+  const value = q.toString()
+  return value ? `?${value}` : ''
 }

@@ -24,6 +24,7 @@ import {
   type RevisionKind,
   type RevisionUnavailableReason,
   type ScanPhase,
+  type SortDir,
 } from './consts'
 export type Revision = {
   /** Journal-assigned, monotonic within a journal (the timeline order). Opaque on the wire. */
@@ -927,6 +928,8 @@ export type StoreEvent =
 // List-layer query shapes — neutral names; the wire query params coincide.
 export type NotesQuery = {
   sort: NoteSort
+  /** Omitted keeps the field's historical natural direction. */
+  dir?: SortDir
   offset: number
   limit?: number
   folder?: string
@@ -945,6 +948,8 @@ export type NotesQuery = {
   dateField?: DateField
   /** Stable-id membership set (favorites, q): keep only notes whose id is in it. */
   ids?: string[]
+  /** Structural callers keep unknown-date rows; Feed's created window does not. */
+  includeUndated?: boolean
 }
 export type BucketsQuery = {
   sort: 'created' | 'modified'
@@ -964,6 +969,8 @@ export type TreeChildrenQuery = {
   path: string
   offset: number
   limit?: number
+  sort?: NoteSort
+  dir?: SortDir
 }
 
 /** Host-owned derived state that must settle inside a storage mutation's

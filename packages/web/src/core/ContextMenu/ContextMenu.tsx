@@ -30,11 +30,15 @@ export type MenuItem = {
   onClick?: () => void
   danger?: boolean
   active?: boolean
+  /** Contiguous leaves with the same label form one named ARIA radio group. */
+  radioGroup?: string
   divider?: boolean
   children?: MenuItem[]
 }
 
-const MenuRow = ({ item, onClose }: { item: MenuItem; onClose: () => void }) => {
+type CloseMenu = () => void
+
+const MenuRow = ({ item, onClose }: { item: MenuItem; onClose: CloseMenu }) => {
   const ref = useRef<HTMLDivElement>(null)
   const [openSub, setOpenSub] = useState(false)
   const [subRight, setSubRight] = useState(true) // submenu opens to the right by default
@@ -104,8 +108,8 @@ const MenuRow = ({ item, onClose }: { item: MenuItem; onClose: () => void }) => 
   return (
     <button
       className={cx(styles.contextMenuItem, item.danger && styles.danger)}
-      role={item.active !== undefined ? 'menuitemradio' : 'menuitem'}
-      aria-checked={item.active !== undefined ? item.active : undefined}
+      role={item.radioGroup ? 'menuitemradio' : 'menuitem'}
+      aria-checked={item.radioGroup ? Boolean(item.active) : undefined}
       tabIndex={-1}
       onClick={() => {
         onClose()
@@ -121,6 +125,36 @@ const MenuRow = ({ item, onClose }: { item: MenuItem; onClose: () => void }) => 
       )}
     </button>
   )
+}
+
+const MenuRows = ({ items, onClose }: { items: MenuItem[]; onClose: CloseMenu }) => {
+  const rows: ReactNode[] = []
+
+  for (let index = 0; index < items.length;) {
+    const item = items[index]
+
+    if (!item.radioGroup) {
+      rows.push(<MenuRow key={item.label || `d${index}`} item={item} onClose={onClose} />)
+      index += 1
+      continue
+    }
+    const label = item.radioGroup
+    const grouped: MenuItem[] = []
+
+    while (items[index]?.radioGroup === label) {
+      grouped.push(items[index])
+      index += 1
+    }
+    rows.push(
+      <div key={`group:${label}`} role="group" aria-label={label}>
+        {grouped.map((entry, groupIndex) => (
+          <MenuRow key={entry.label ?? `d${groupIndex}`} item={entry} onClose={onClose} />
+        ))}
+      </div>,
+    )
+  }
+
+  return rows
 }
 
 type ContextMenuProps = {
@@ -296,9 +330,7 @@ export const ContextMenu = ({
           <div className={styles.contextMenuSep} />
         </>
       )}
-      {items.map((item, i) => (
-        <MenuRow key={item.label || `d${i}`} item={item} onClose={onClose} />
-      ))}
+      <MenuRows items={items} onClose={onClose} />
     </div>,
     document.body,
   )

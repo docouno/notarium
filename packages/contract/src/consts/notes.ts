@@ -4,6 +4,11 @@ export const NOTE_SORT = {
   title: 'title',
 } as const
 
+export const SORT_DIR = {
+  asc: 'asc',
+  desc: 'desc',
+} as const
+
 export const DATE_FIELD = {
   created: 'created',
   modified: 'modified',
@@ -16,6 +21,7 @@ export const BUCKET_GRAN = {
 } as const
 
 export type NoteSort = (typeof NOTE_SORT)[keyof typeof NOTE_SORT]
+export type SortDir = (typeof SORT_DIR)[keyof typeof SORT_DIR]
 export type DateField = (typeof DATE_FIELD)[keyof typeof DATE_FIELD]
 export type BucketGran = (typeof BUCKET_GRAN)[keyof typeof BUCKET_GRAN]
 

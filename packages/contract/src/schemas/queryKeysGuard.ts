@@ -10,6 +10,7 @@ import type { AgentAuditQuery } from './rest/agent/audit'
 import type { AgentSessionEventsQuery, AgentSessionsQuery } from './rest/agent/sessions'
 import type { BucketsQuery, NotesQuery } from './rest/notes'
 import type { TrashQuery } from './rest/trash'
+import type { TreeChildrenQuery } from './rest/tree'
 
 // `frontmatter`/`scope` are export-only keys with no query schema (the export endpoint
 // validates its body, not the query), so they ride as explicit literal members.
@@ -21,6 +22,7 @@ type WireQueryKey =
   | keyof AgentSessionsQuery
   | keyof AgentSessionEventsQuery
   | keyof TrashQuery
+  | keyof TreeChildrenQuery
   | 'frontmatter'
   | 'scope'
 

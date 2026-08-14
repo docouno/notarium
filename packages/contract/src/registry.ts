@@ -12,7 +12,12 @@ import {
   MeAgentContextResponseSchema,
   ProjectAgentContextResponseSchema,
 } from './schemas/rest/agent/context'
-import { MeMemoryResponseSchema, ProjectMemoryResponseSchema } from './schemas/rest/agent/memory'
+import {
+  MeMemoryQuerySchema,
+  MeMemoryResponseSchema,
+  ProjectMemoryQuerySchema,
+  ProjectMemoryResponseSchema,
+} from './schemas/rest/agent/memory'
 import { ProfilePutRequestSchema, ProfileResponseSchema } from './schemas/rest/agent/profile'
 import {
   AddAgentRoleRequestSchema,
@@ -209,8 +214,8 @@ export const contract = {
   members: { response: MembersResponseSchema },
   memberPut: { request: MemberPutRequestSchema, response: MembersResponseSchema },
   memberRemove: { response: MembersResponseSchema },
-  meMemory: { response: MeMemoryResponseSchema },
-  projectMemory: { response: ProjectMemoryResponseSchema },
+  meMemory: { request: MeMemoryQuerySchema, response: MeMemoryResponseSchema },
+  projectMemory: { request: ProjectMemoryQuerySchema, response: ProjectMemoryResponseSchema },
   meAgentContext: { response: MeAgentContextResponseSchema },
   projectAgentContext: { response: ProjectAgentContextResponseSchema },
   agentAudit: { request: AgentAuditQuerySchema, response: AgentAuditResponseSchema },

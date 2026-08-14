@@ -80,6 +80,7 @@ export const Select = <T extends string = string>({
           ignoreRef={triggerRef}
           items={options.map((o) => ({
             label: o.label,
+            radioGroup: ariaLabel ?? 'Select option',
             active: o.value === value,
             onClick: () => onChange(o.value),
           }))}

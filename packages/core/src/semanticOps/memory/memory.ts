@@ -317,6 +317,7 @@ export const buildMemoryIndex = async (
       // The eager profile carries the summary, not the body, so token cost = summary weight.
       tokens: estimateTokens(summary),
       muted: isMutedFlag(note.frontmatter?.muted),
+      createdAt: m.createdAt ?? null,
       modifiedAt: m.modifiedAt ?? null,
     })
   }

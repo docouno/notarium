@@ -20,6 +20,8 @@ import {
   MarkProjectRequestSchema,
   MeAgentContextResponseSchema,
   MeAgentRolesResponseSchema,
+  MeMemoryQuerySchema,
+  MemoryCategorySchema,
   MoveFolderRequestSchema,
   MoveRequestSchema,
   MoveResponseSchema,
@@ -36,6 +38,7 @@ import {
   PreviewsRequestSchema,
   PreviewsResponseSchema,
   ProjectAgentContextResponseSchema,
+  ProjectMemoryQuerySchema,
   ProjectRowSchema,
   ProjectsResponseSchema,
   RestoreResponseSchema,
@@ -49,6 +52,7 @@ import {
   SpacesResponseSchema,
   TrashRestoreManyRequestSchema,
   TrashRestoreManyResponseSchema,
+  TreeChildrenQuerySchema,
   TreeChildrenResponseSchema,
   UpdateNoteRequestSchema,
 } from '@notarium/contract'
@@ -292,6 +296,19 @@ describe('previews (#64)', () => {
 })
 
 describe('GET /api/tree/children (#64)', () => {
+  it('accepts field + direction and keeps the title/asc compatibility default', () => {
+    expect(TreeChildrenQuerySchema.parse({})).toMatchObject({
+      path: '',
+      offset: 0,
+      sort: 'title',
+    })
+    expect(
+      TreeChildrenQuerySchema.safeParse({ path: 'a', sort: 'created', dir: 'desc' }).success,
+    ).toBe(true)
+    expect(TreeChildrenQuerySchema.safeParse({ sort: 'unknown' }).success).toBe(false)
+    expect(TreeChildrenQuerySchema.safeParse({ dir: 'sideways' }).success).toBe(false)
+  })
+
   it('accepts subfolders with counts + windowed notes + total', () => {
     expect(
       TreeChildrenResponseSchema.safeParse({
@@ -302,6 +319,34 @@ describe('GET /api/tree/children (#64)', () => {
         total: 10,
       }).success,
     ).toBe(true)
+  })
+})
+
+describe('agent-memory audit order', () => {
+  it('accepts the shared sort axes on both routes while keeping project order compatibility', () => {
+    expect(MeMemoryQuerySchema.safeParse({ sort: 'created', dir: 'asc' }).success).toBe(true)
+    expect(ProjectMemoryQuerySchema.safeParse({ sort: 'title', dir: 'desc' }).success).toBe(true)
+    expect(
+      ProjectMemoryQuerySchema.safeParse({ order: 'eager', sort: 'created', dir: 'asc' }).success,
+    ).toBe(true)
+    expect(MeMemoryQuerySchema.safeParse({ dir: 'sideways' }).success).toBe(false)
+  })
+
+  it('carries nullable createdAt as part of every category', () => {
+    const base = {
+      noteId: 'memory-a',
+      category: 'a',
+      summary: 'A',
+      tokens: 1,
+      muted: false,
+      modifiedAt: null,
+      principal: null,
+      author: null,
+      kind: null,
+    }
+
+    expect(MemoryCategorySchema.safeParse({ ...base, createdAt: null }).success).toBe(true)
+    expect(MemoryCategorySchema.safeParse(base).success).toBe(false)
   })
 })
 

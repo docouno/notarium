@@ -148,6 +148,37 @@ describe('personal layer (#13): memory audit', () => {
     expect(detail.content).toContain('Prefers concise')
   })
 
+  it('accepts the shared display order without changing the default audit route', async () => {
+    const bearer = await patFor('sam', 'sam-password-1')
+
+    for (const category of ['bravo', 'alpha', 'charlie']) {
+      await callTool('remember_about_user', { observation: category, category }, bearer)
+    }
+    const cookie = await loginCookie('sam', 'sam-password-1')
+    const dflt = await getJson('/api/me/memory', cookie)
+    const titleAsc = await getJson('/api/me/memory?sort=title&dir=asc', cookie)
+    const titleDesc = await getJson('/api/me/memory?sort=title&dir=desc', cookie)
+
+    expect(dflt.categories.map((c: { category: string }) => c.category)).toEqual([
+      'charlie',
+      'alpha',
+      'bravo',
+    ])
+    expect(titleAsc.categories.map((c: { category: string }) => c.category)).toEqual([
+      'alpha',
+      'bravo',
+      'charlie',
+    ])
+    expect(titleDesc.categories.map((c: { category: string }) => c.category)).toEqual([
+      'charlie',
+      'bravo',
+      'alpha',
+    ])
+    expect(titleAsc.categories.every((c: { createdAt?: string | null }) => 'createdAt' in c)).toBe(
+      true,
+    )
+  })
+
   it('the memory feed never exposes the personal-domain slug', async () => {
     const bearer = await patFor('sam', 'sam-password-1')
     await callTool('remember_about_user', { observation: 'x', category: 'identity' }, bearer)

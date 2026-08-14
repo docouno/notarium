@@ -68,6 +68,7 @@ export const SpaceSwitcher = () => {
   const items: MenuItem[] = [
     ...spaces.map((s) => ({
       label: s.displayName,
+      radioGroup: 'Workspace',
       icon: <IconWorkspace size={14} />,
       active: s.slug === space,
       onClick: () => switchSpace(s.slug),
@@ -79,6 +80,7 @@ export const SpaceSwitcher = () => {
       ? [
           {
             label: personalSpace.displayName,
+            radioGroup: 'Workspace',
             icon: <IconUser size={14} />,
             active: onPersonal,
             onClick: () => switchSpace(personalSpace.slug),

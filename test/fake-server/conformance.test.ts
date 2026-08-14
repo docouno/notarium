@@ -240,7 +240,7 @@ describe('contract conformance over the seed fixture', () => {
     expect(t.stats.total).toBe(5)
     expect(t.stats.root).toBe(1) // root.md
   })
-  it('GET /api/tree/children — one expand step: subfolders with counts + direct notes, title-ordered', async () => {
+  it('GET /api/tree/children — one expand step defaults to title order', async () => {
     const root = await get('/api/s/main/tree/children?path=')
     expect(TreeChildrenResponseSchema.safeParse(root).success).toBe(true)
     expect(root.folders.map((f: { path: string }) => f.path)).toEqual(['archive', 'demo'])
@@ -250,6 +250,32 @@ describe('contract conformance over the seed fixture', () => {
     expect(archive.folders).toEqual([{ path: 'archive/2020', name: '2020', count: 1, direct: 1 }])
     expect(archive.notes).toEqual([])
     expect(archive.total).toBe(0)
+    const demo = await get('/api/s/main/tree/children?path=demo')
+    expect(demo.notes.map((n: { title: string }) => n.title)).toEqual([
+      'Carbon',
+      'My Note',
+      'Titanium',
+    ])
+  })
+  it('GET /api/tree/children — sort + dir change order without changing membership', async () => {
+    const natural = await get('/api/s/main/tree/children?path=demo&sort=created')
+    const asc = await get('/api/s/main/tree/children?path=demo&sort=created&dir=asc')
+
+    expect(natural.notes.map((n: { title: string }) => n.title)).toEqual([
+      'Carbon',
+      'Titanium',
+      'My Note',
+    ])
+    expect(asc.notes.map((n: { title: string }) => n.title)).toEqual([
+      'Titanium',
+      'Carbon',
+      'My Note',
+    ])
+    expect(natural.total).toBe(3)
+    expect(asc.total).toBe(3)
+    expect(natural.notes.map((n: { id: string }) => n.id).sort()).toEqual(
+      asc.notes.map((n: { id: string }) => n.id).sort(),
+    )
   })
   it('GET /api/tree/children — offset/limit window the notes, total stays honest', async () => {
     const demo = await get('/api/s/main/tree/children?path=demo&offset=1&limit=1')

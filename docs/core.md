@@ -89,7 +89,7 @@ Ownership is first-committed-claim: an absent id goes to whoever commits first, 
 
 ## List layer <a id="list-layer"></a>
 
-The pure derivations of the list surfaces (Feed/tree/buckets/tag-facet) live in `core/listing`, not in the HTTP transport: the server only calls them. The tree is **server-authoritative** — the directory channel (#97) holds every visible folder, empty ones included (never-prune), and is served from memory, not an FS-walk per request. The one inclusion language of the facets (folders #93, tags #109, class) — [contract.md](contract.md#filters); the tag axis and normalization — [note-model.md](note-model.md#note-ontology).
+The pure derivations of the list surfaces (Feed/tree/buckets/tag-facet) live in `core/listing`, not in the HTTP transport: the server only calls them. `comparatorFor` is the one total-order rule shared by server windows and optimistic browser projections: Name uses a fixed `en-US` case-insensitive collation, date ties fall back to Name + stable key, and an unknown date stays last in both directions. Feed keeps its historical defaults and may exclude unknown creation dates; structural tree listings never change membership when their order changes. The tree is **server-authoritative** — the directory channel (#97) holds every visible folder, empty ones included (never-prune), and is served from memory, not an FS-walk per request. The one inclusion language of the facets (folders #93, tags #109, class) — [contract.md](contract.md#filters); the tag axis and normalization — [note-model.md](note-model.md#note-ontology).
 
 ## Seams (files)
 

@@ -878,8 +878,9 @@ describe('agent-context pult (#165): mute / unmute', () => {
     const bearer = await patFor('sam', 'sam-password-1')
     const cookie = await loginCookie('sam', 'sam-password-1')
 
-    // The agent records three about-PROJECT categories (into main/docs), a, b, c in that order.
-    for (const c of ['a', 'b', 'c']) {
+    // The write order deliberately differs from both title directions, so the
+    // no-param route proves newest-first instead of accidentally aliasing a display sort.
+    for (const c of ['b', 'a', 'c']) {
       await callTool(
         'remember_about_project',
         { project: 'main/docs', observation: c, category: `proj-${c}`, summary: c },
@@ -892,13 +893,17 @@ describe('agent-context pult (#165): mute / unmute', () => {
         (c) => c.category,
       )
 
-    // The endpoint HONORS order=eager: the stable buildMemoryIndex (write) order [a,b,c] — NOT
-    // the default newest-first [c,b,a]. If the param were ignored the two would match; they must
+    // The endpoint HONORS order=eager: the stable buildMemoryIndex (write) order [b,a,c] — NOT
+    // the default newest-first [c,a,b]. If the param were ignored the two would match; they must
     // differ, proving the Context constructor gets the stable axis it asks for.
     const eager = await orderOf('?order=eager')
     const dflt = await orderOf('')
-    expect(eager).toEqual(['proj-a', 'proj-b', 'proj-c'])
-    expect(dflt).toEqual(['proj-c', 'proj-b', 'proj-a'])
+    expect(eager).toEqual(['proj-b', 'proj-a', 'proj-c'])
+    expect(dflt).toEqual(['proj-c', 'proj-a', 'proj-b'])
+    expect(await orderOf('?sort=title&dir=desc')).toEqual(['proj-c', 'proj-b', 'proj-a'])
+    // Constructor order is a distinct, stronger axis: even an explicit display
+    // order cannot reorder what the agent eagerly loads.
+    expect(await orderOf('?order=eager&sort=title&dir=desc')).toEqual(eager)
 
     // And muting a category (a WRITE) leaves the eager order UNCHANGED — the muted row dims where
     // it sits, never reflowing (the profile axis already did this; #210 makes project match). On

@@ -7,6 +7,7 @@ import type {
   Me,
   MeAgentRolesResponse,
   MeMemory,
+  MeMemoryQuery,
   PatCreateRequest,
   PatCreateResponse,
   PatPatchRequest,
@@ -15,6 +16,7 @@ import type {
   ProfilePutRequest,
 } from '@notarium/contract'
 import { req } from './client'
+import { memoryQs } from './query'
 
 export const meApi = {
   // ── self-service (#10): /api/me ─────────────────────────────────────────────
@@ -72,7 +74,8 @@ export const meApi = {
   // agent-authored audit feed; the profile is the human-authored always-load
   // note + display name. Individual memory notes use the id-addressed routes
   // above (noteGet/noteSave/noteRemove/revisionsGet) — they are ordinary notes.
-  meMemoryGet: () => req<MeMemory>('/api/me/memory').then((d) => d.categories),
+  meMemoryGet: (query: MeMemoryQuery = {}) =>
+    req<MeMemory>(`/api/me/memory${memoryQs(query)}`).then((d) => d.categories),
   profileGet: () => req<Profile>('/api/me/profile'),
   profilePut: (input: ProfilePutRequest) =>
     req<Profile>('/api/me/profile', { method: 'PUT', body: JSON.stringify(input) }),

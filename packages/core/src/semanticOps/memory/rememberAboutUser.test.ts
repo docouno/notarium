@@ -210,6 +210,7 @@ describe('buildMemoryIndex', () => {
       summary: 'UI prefs',
       tokens: expect.any(Number),
       muted: false,
+      createdAt: null,
       modifiedAt: null,
     })
     expect(prefs.tokens).toBeGreaterThan(0)

@@ -80,6 +80,7 @@ and for `security` — it parses the sanitized HTML into a live DOM and checks t
 | `folder-page` | `index.md` pages (nested), children summary, breadcrumbs (#212-214) | folder-page, structure, content |
 | `note-classes` | one note per class — visibility matrix for user-doc/agent-memory/profile (#78/#74) | note-classes, agent-memory, structure |
 | `explorer-scroll` | a deep tree: a note near the bottom + many collapsible folders above — the explorer scroll-position invariant (#242): a reflow above the open note does not move the scroll | structure, scale |
+| `tree-sort` | three Files notes + three personal-memory categories whose Name, Created and Modified orders all differ (#314); login `sam` / `seed-pass` | structure, agent-memory, activity |
 | `scrollbars` | overflows ALL scroll surfaces at once (#176): the tree rail, a long note in reader/editor, the feed, a dense graph + asides, a full trash — a showcase of auto-hide + glass-inset | scale, structure, content, graph, activity, trash |
 | `favorites` | the merged Files+Feed section (#245) + the Favorites lens (#42): feed + tree, favorite notes in different folders + a favorite folder + a favorite project | favorites, structure, activity |
 
@@ -152,6 +153,7 @@ caught rather than silently skipped.
 ```
 make seed-list                                     # list of cases
 make seed CASE=reader-showcase                      # (re)seed the local stand
+make seed CASE=tree-sort                            # explorer Name/Created/Modified QA
 make seed CASE=dashboard-activity SCALE=1 SEED=x PASSWORD=secret
 make seed CASE=reader-showcase,graph,trash-mixed    # COMBINATION of cases
 make seed-coverage                                  # coverage matrix
@@ -170,6 +172,8 @@ from **the same resolver as the server** (`dataPathsFromEnv`, [a single data-roo
 not from its own copy: it writes exactly the files that the stand later reads, so a
 divergence would seed one stand but bring up another.
 The default login for the stand is **`admin` / `admin`** (see «Login» below).
+
+`tree-sort` is the deliberate exception with its own `sam` / `seed-pass` user and personal memory. On the real file-backed stand, authored `createdAt` is exact, while absolute `modifiedAt` may cluster around seed time because the engine observes filesystem mtime. The replay order still makes relative Modified ordering deterministic; the case tests that ordering, not the displayed wall-clock value.
 
 ### The `identity-collision` filesystem seam (#327)
 

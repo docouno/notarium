@@ -37,6 +37,7 @@ import {
   REVISION_KIND as ContractRevisionKind,
   REVISION_UNAVAILABLE_REASON as ContractRevisionUnavailableReason,
   SCAN_PHASE as ContractScanPhase,
+  SORT_DIR as ContractSortDir,
 } from '@notarium/contract'
 // EDIT_OPERATION lives on contract's `./tools` subpath (the MCP tool surface),
 // not the `/api/*` wire barrel, so it resolves from a different entry point.
@@ -54,6 +55,7 @@ import {
   REVISION_KIND as CoreRevisionKind,
   REVISION_UNAVAILABLE_REASON as CoreRevisionUnavailableReason,
   SCAN_PHASE as CoreScanPhase,
+  SORT_DIR as CoreSortDir,
 } from '@notarium/core'
 
 /** Enums that MUST be byte-for-byte identical copies across the P8 seam. */
@@ -65,6 +67,7 @@ const identicalPairs: ReadonlyArray<
   ['REVISION_KIND', CoreRevisionKind, ContractRevisionKind],
   ['REVISION_UNAVAILABLE_REASON', CoreRevisionUnavailableReason, ContractRevisionUnavailableReason],
   ['NOTE_SORT', CoreNoteSort, ContractNoteSort],
+  ['SORT_DIR', CoreSortDir, ContractSortDir],
   ['BUCKET_GRAN', CoreBucketGran, ContractBucketGran],
   ['DATE_FIELD', CoreDateField, ContractDateField],
   ['DEPTH', CoreDepth, ContractDepth],
