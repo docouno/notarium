@@ -349,8 +349,18 @@ export class CachedStore implements KnowledgeStore {
   private readonly bulk: BulkController
   /** Directory/folder-alias changes can retarget old wikilinks. During a bulk
    *  import coalesce that corpus-wide repair and keep graph reads behind one
-   *  transition barrier until the outer bracket drains. */
-  private readonly bulkGraphContextSources = new Set<string>()
+   *  transition barrier until the outer bracket drains. Held as a FLAG rather than
+   *  as every id: a bracket reproducing a folder tree raises it once per folder,
+   *  and listing the corpus each time is the same quadratic the coalescing exists
+   *  to avoid, merely counted in folders. The drain expands it — once, and against
+   *  the snapshot as it finally stands. */
+  private bulkGraphContextWholeCorpus = false
+  /** The note-set version the open bracket started from. A bracket's writes derive
+   *  their edges against a table that may LAG them (see `Snapshot.batchIndex`), so
+   *  what the drain owes is not "the folders moved" but "notes moved at all" — this
+   *  is how it knows. A bracket that wrote nothing leaves it equal and pays
+   *  nothing. */
+  private bulkNotesVersion = 0
   private releaseBulkGraphTransition: (() => void) | null = null
   /** The write path — the CAS chokepoint + optimistic snapshot mirror +
    *  journal + trash tombstoning; the class delegates write/move/remove (see
@@ -410,7 +420,11 @@ export class CachedStore implements KnowledgeStore {
     })
     this.pollIntervalMs = pollIntervalMs
     this.readBody = readBody
-    this.snap = new Snapshot(relationType, () => this.dirs.list())
+    this.snap = new Snapshot(
+      relationType,
+      () => this.dirs.list(),
+      () => this.dirs.version,
+    )
     this.previewCache = new PreviewCache({
       maxSize: previewCacheSize,
       readBody,
@@ -861,6 +875,12 @@ export class CachedStore implements KnowledgeStore {
   // ── bulk bracket — delegated to BulkController ─────────────────────────
 
   beginBulk(): void {
+    // The baseline the drain measures against. Only an OUTER begin sets it: a
+    // nested one would move the line past writes the outer bracket already made,
+    // and those are precisely the ones owed a repair.
+    if (!this.bulk.isActive) {
+      this.bulkNotesVersion = this.snap.notes.version
+    }
     this.bulk.begin()
   }
 
@@ -2631,14 +2651,8 @@ export class CachedStore implements KnowledgeStore {
    *  barrier; endBulk publishes exactly one coherent repair. */
   private async rederiveGraphContext(): Promise<void> {
     if (this.bulk.isActive) {
-      for (const id of this.snap.notes.keys()) {
-        if (this.snap.isGraphVisibleId(id)) {
-          this.bulkGraphContextSources.add(id)
-        }
-      }
-      if (this.bulkGraphContextSources.size) {
-        this.releaseBulkGraphTransition ??= this.beginGraphTransition()
-      }
+      this.bulkGraphContextWholeCorpus = true
+      this.releaseBulkGraphTransition ??= this.beginGraphTransition()
 
       return
     }
@@ -2648,17 +2662,60 @@ export class CachedStore implements KnowledgeStore {
     )
   }
 
+  /** Does the closing bracket owe the user graph a rebuild? A folder/alias change
+   *  raised the flag; ANY note the bracket wrote is the other half, and the reason
+   *  is the batch resolve table: it is built once and then rides the bracket's own
+   *  additions and renames, so while the bracket runs a `[[name]]` can resolve to
+   *  the note that held that name BEFORE the bracket took it away (the resolver
+   *  ranks a current title strictly above another note's alias, so this is a real
+   *  reversal, not a tie). Nothing inside the bracket can notice — the deferred
+   *  ghost pass only heals links that resolved to NOTHING — so the close re-derives
+   *  the sources instead. */
+  private bulkGraphContextOwed(): boolean {
+    return this.bulkGraphContextWholeCorpus || this.snap.notes.version !== this.bulkNotesVersion
+  }
+
   private async flushBulkGraphContext(): Promise<void> {
-    if (!this.bulkGraphContextSources.size) {
+    // The per-note ghost pass was deferred for the whole bracket; run it ONCE
+    // here, before the source rebuild below reads the edges it produces.
+    if (this.snap.ghosts.size) {
+      try {
+        this.snap.reresolveGhosts(this.snap.buildIndex())
+      } catch (err) {
+        console.error('[cached-store] bulk ghost re-resolve failed:', (err as Error).message)
+        this.reconcileSoon()
+      }
+    }
+    if (!this.bulkGraphContextOwed()) {
+      // Nothing owed — but a transition may still be open (a directory change over
+      // an empty snapshot raises the flag before there is anything to repair).
+      this.releaseBulkGraphTransition?.()
+      this.releaseBulkGraphTransition = null
       return
     }
+    // Readers wait for the repair the same way they wait for a folder one: what
+    // they would otherwise read is a graph that is coherent with no table at all.
+    this.releaseBulkGraphTransition ??= this.beginGraphTransition()
 
     try {
       await this.mutations.run({ global: true }, async () => {
-        while (this.bulkGraphContextSources.size) {
-          const sourceIds = [...this.bulkGraphContextSources]
-          this.bulkGraphContextSources.clear()
-          await this.rederiveSourceEdges(sourceIds)
+        for (;;) {
+          // Re-asked INSIDE the drain, so a write that lands while an earlier pass
+          // is awaiting is picked up by the next one instead of leaving the corpus
+          // owed a repair nobody will perform.
+          if (!this.bulkGraphContextOwed()) {
+            return
+          }
+          this.bulkGraphContextWholeCorpus = false
+          this.bulkNotesVersion = this.snap.notes.version
+          // ONE linear pass over the sources, against the table as the snapshot
+          // finally stands — the price of a table the writes themselves never
+          // rebuilt. It is the same pass a bracket that touched a folder already
+          // paid; what changed is that a bracket writing only into folders that
+          // already existed no longer skips it and calls the result settled.
+          await this.rederiveSourceEdges(
+            [...this.snap.notes.keys()].filter((id) => this.snap.isGraphVisibleId(id)),
+          )
         }
       })
     } catch (err) {
@@ -2667,12 +2724,14 @@ export class CachedStore implements KnowledgeStore {
     } finally {
       this.releaseBulkGraphTransition?.()
       this.releaseBulkGraphTransition = null
-      this.bulkGraphContextSources.clear()
+      this.bulkGraphContextWholeCorpus = false
+      this.bulkNotesVersion = this.snap.notes.version
     }
   }
 
   private abandonBulkGraphContext(): void {
-    this.bulkGraphContextSources.clear()
+    this.bulkGraphContextWholeCorpus = false
+    this.bulkNotesVersion = this.snap.notes.version
     this.releaseBulkGraphTransition?.()
     this.releaseBulkGraphTransition = null
   }

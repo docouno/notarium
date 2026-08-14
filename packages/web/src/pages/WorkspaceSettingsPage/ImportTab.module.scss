@@ -57,9 +57,11 @@
   color: var(--text-muted);
 }
 
-/* Durable-import progress (#191): the note count is unknown upfront (a ZIP stream),
-   so the bar is always indeterminate — the honest signal is the status line's live
-   written count + phase, with a cancel beside it. */
+/* Import progress: the bar has two lives. A Markdown tree learns its member count
+   when planning ends and the fill becomes a real percentage; a foreign export is
+   parsed as it streams and never learns it, so the indeterminate sweep below stays
+   its steady state. The status line carries phase + processed count for both, with
+   a cancel beside it. */
 .progress {
   margin-bottom: 4px;
 }

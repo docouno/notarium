@@ -1,6 +1,7 @@
 import { jobOfRow, type JobRow } from '../../rows'
 import type { JobsPersistence } from '../../types'
 import type { SqliteDriverCtx } from './context'
+import { withJobGuard } from './importReservations'
 
 export const createJobsFacet = (ctx: SqliteDriverCtx): JobsPersistence => ({
   enqueue: async (input) => {
@@ -120,24 +121,39 @@ export const createJobsFacet = (ctx: SqliteDriverCtx): JobsPersistence => ({
       : ctx.required
           .prepare(
             `UPDATE jobs SET status = 'failed', error = ?, completed_at = ?,
+                 result = COALESCE(?, result),
                  locked_at = NULL, locked_by = NULL, updated_at = ?
                WHERE id = ? AND locked_by = ? AND status = 'running'`,
           )
-          .run(f.error, f.now, f.now, id, workerId)
+          .run(
+            f.error,
+            f.now,
+            f.result === undefined ? null : JSON.stringify(f.result),
+            f.now,
+            id,
+            workerId,
+          )
     return res.changes > 0
   },
 
-  cancel: async (id, now) => {
-    await ctx.ensureInit()
-    const res = ctx.required
-      .prepare(
-        `UPDATE jobs SET status = 'canceled', completed_at = ?, updated_at = ?,
-             locked_at = NULL, locked_by = NULL
-           WHERE id = ? AND status IN ('pending', 'running')`,
-      )
-      .run(now, now, id)
-    return res.changes > 0
-  },
+  // Invalidation from OUTSIDE the run queues behind that job's guard — the same
+  // one its fenced import writes hold. A cancel arriving mid-member therefore
+  // waits for that member instead of landing between its premise and its bytes;
+  // the next write cannot start, because its premise is then false. The heartbeat
+  // stays outside the guard, so a slow member can still keep its lease alive.
+  cancel: async (id, now) =>
+    await withJobGuard(id, async () => {
+      await ctx.ensureInit()
+      const res = ctx.required
+        .prepare(
+          `UPDATE jobs SET status = 'canceled', completed_at = ?, updated_at = ?,
+               locked_at = NULL, locked_by = NULL
+             WHERE id = ? AND status IN ('pending', 'running')`,
+        )
+        .run(now, now, id)
+
+      return res.changes > 0
+    }),
 
   release: async (id, workerId, now) => {
     await ctx.ensureInit()
@@ -184,24 +200,47 @@ export const createJobsFacet = (ctx: SqliteDriverCtx): JobsPersistence => ({
   reapStale: async (staleBefore, now) => {
     await ctx.ensureInit()
     const db = ctx.required
+    // Candidates are read first and re-checked under each job's guard: a heartbeat
+    // arriving in between revives its job, and a worker that holds the guard
+    // through a long member is exactly the job that must NOT be reaped.
     // canon: docs/jobs.md#delivery-and-recovery
-    const reopened = db
-      .prepare(
-        `UPDATE jobs SET status = 'pending', locked_at = NULL, locked_by = NULL,
-             error = 'reopened after stalled worker', updated_at = ?
-           WHERE status = 'running' AND locked_at < ? AND attempts < max_attempts
-           RETURNING *`,
-      )
-      .all(now, staleBefore) as JobRow[]
-    const failed = db
-      .prepare(
-        `UPDATE jobs SET status = 'failed', completed_at = ?, locked_at = NULL,
-             locked_by = NULL, error = 'stalled (max attempts reached)', updated_at = ?
-           WHERE status = 'running' AND locked_at < ? AND attempts >= max_attempts
-           RETURNING *`,
-      )
-      .all(now, now, staleBefore) as JobRow[]
-    return [...reopened, ...failed].map(jobOfRow)
+    const candidates = db
+      .prepare(`SELECT id FROM jobs WHERE status = 'running' AND locked_at < ? ORDER BY id`)
+      .all(staleBefore) as Array<{ id: string }>
+    const reaped: JobRow[] = []
+
+    for (const { id } of candidates) {
+      const row = await withJobGuard(id, async () => {
+        const reopened = db
+          .prepare(
+            `UPDATE jobs SET status = 'pending', locked_at = NULL, locked_by = NULL,
+                 error = 'reopened after stalled worker', updated_at = ?
+               WHERE id = ? AND status = 'running' AND locked_at < ? AND attempts < max_attempts
+               RETURNING *`,
+          )
+          .all(now, id, staleBefore) as JobRow[]
+
+        if (reopened.length) {
+          return reopened[0]
+        }
+        const failed = db
+          .prepare(
+            `UPDATE jobs SET status = 'failed', completed_at = ?, locked_at = NULL,
+                 locked_by = NULL, error = 'stalled (max attempts reached)', updated_at = ?
+               WHERE id = ? AND status = 'running' AND locked_at < ? AND attempts >= max_attempts
+               RETURNING *`,
+          )
+          .all(now, now, id, staleBefore) as JobRow[]
+
+        return failed[0] ?? null
+      })
+
+      if (row) {
+        reaped.push(row)
+      }
+    }
+
+    return reaped.map(jobOfRow)
   },
 
   findExpired: async (now, limit) => {
@@ -230,7 +269,12 @@ export const createJobsFacet = (ctx: SqliteDriverCtx): JobsPersistence => ({
     ctx.required
       .prepare(
         `DELETE FROM jobs WHERE status IN ('succeeded', 'failed', 'canceled')
-             AND artifact_ref IS NULL AND updated_at < ?`,
+             AND artifact_ref IS NULL AND updated_at < ?
+    -- Fail-closed against retention deleting the evidence a live import still
+    -- points at: while a reservation references this job, its terminal row is the
+    -- only thing that can prove what the run had already done.
+    -- canon: docs/import.md#importing-a-markdown-tree-302
+             AND NOT EXISTS (SELECT 1 FROM import_reservations r WHERE r.job_id = jobs.id)`,
       )
       .run(before)
   },

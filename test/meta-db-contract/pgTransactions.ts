@@ -57,6 +57,26 @@ export const PG_TRANSACTIONS: readonly PgTransaction[] = [
   { id: 'scopePins.addPin', levels: ['L1', 'L2d'] },
   { id: 'contextOrder.setOrder', levels: ['L1', 'L2d', 'L2e', 'L2f'] },
 
+  // Invalidation from outside a run (#302): one transaction shape, two callers —
+  // a cancel and a reaper candidate. Nothing below L0j: the point is to WAIT for a
+  // fenced write, not to touch the hierarchy.
+  { id: 'jobInvalidation.withJobFence', levels: ['L0j'] },
+
+  // Import reservations (#302). L0j is the per-job fence: it outranks identity, and
+  // every one of these holds it across what it protects.
+  //
+  // `closeForJob` declares L1p although no statement of its own names that table:
+  // `DELETE FROM import_reservations` takes it through the ON DELETE CASCADE of
+  // migration 0010. A cascade is an acquisition like any other, and the register is
+  // where an acquisition becomes a stated fact — the live observer levels a
+  // statement by its TARGET table, so this one is invisible to it by construction.
+  // The order is the only one available: the cascade fires under the parent's L1r,
+  // and deleting the claims by hand first would take L1p ahead of L1r.
+  { id: 'importReservations.reserve', levels: ['L0j', 'L1r', 'L1p'] },
+  { id: 'importReservations.adopt', levels: ['L0j', 'L1r'] },
+  { id: 'importReservations.withFencedWrite', levels: ['L0j', 'L1r', 'L1p'] },
+  { id: 'importReservations.closeForJob', levels: ['L0j', 'L1r', 'L1p'] },
+
   // Identity itself.
   { id: 'identity.claimMany', levels: ['L1'] },
   { id: 'ownerProofs.adopt', levels: ['L1'] },
@@ -85,6 +105,10 @@ export const PG_TRANSACTIONS: readonly PgTransaction[] = [
     id: 'pgMetaDb.purgeSpace',
     levels: [
       'L1',
+      // A purged space takes its imports' destination claims with it (#302). L1p is
+      // the cascade of the header delete, exactly as in `closeForJob` above.
+      'L1r',
+      'L1p',
       'L2a',
       'L2b',
       'L2c',

@@ -65,10 +65,11 @@ emoji, nested quotes, `~~~`/no-language code, escaped-md, only-frontmatter, dupl
 broken mermaid/katex, XSS payloads, inert `\href`, etc. Helpers: `fragmentsByFeature`,
 `pickFragments`, `composeNote`.
 
-**Honesty test** (`corpus.honesty.test.ts`, the only one with a `jsdom` docblock, since
-DOMPurify is needed): for each fragment — «does not throw + non-empty», `contains`/`excludes`,
+**Honesty test** (`corpus.honesty.test.ts`, carrying a `jsdom` docblock because DOMPurify
+needs one — the only such file under `test/`, though `packages/web` has its own in the same
+run): for each fragment — «does not throw + non-empty», `contains`/`excludes`,
 and for `security` — it parses the sanitized HTML into a live DOM and checks that no
-`<script>` / `on*=` handler / `javascript:` URL survived. The rest of the suite stays node-only.
+`<script>` / `on*=` handler / `javascript:` URL survived. The rest of `test/` stays node-only.
 
 ## Cases
 
@@ -131,7 +132,13 @@ and for `security` — it parses the sanitized HTML into a live DOM and checks t
 | `agent-roles` | five principals keep the boundary visible: Fresh is catalog-only; Bob owns an idle Personal fork; Maya owns switchable Personal `research`/`grooming` presets plus same-name Research Space + two Project forks; Robin can inspect the Team role read-only. Base Personal/Project pins remain visible, each placement has a distinct role pin, the Team Project role adds a set plus an oversized tail that trims under the shared `Role → Project → Personal` budget, and an active episode rehydrates `research`; Sergey remains the browsable real-stand owner | agent-roles, agent-sessions, auth, structure, scale |
 | `memory-perf` | 2700 ordinary notes + 4 personal-memory categories + 1 project-partition sentinel; reproduces memory-mount scaling, partition isolation, and graph-inert memory links | agent-memory, note-classes, scale |
 | `import-thread` | one rich imported thread | import, content |
-| `import` | a multi-format layout (claude/chatgpt/memory-json) + backdated dates-as-data → Feed year-spread (#11/#223); plus `dropped/` — the states of a dragged-in `.md` archive whose OWN frontmatter was lifted (#280): authored tags + date, an Obsidian note titled by its file name with `aliases:` and plugin keys kept, a Jekyll post whose `title:` beats a differing body `# H1`, and a frontmatter-less note dated by the file's mtime | import, content, activity |
+| `import` | a multi-format layout (claude/chatgpt/memory-json) + backdated dates-as-data → Feed year-spread (#11/#223); plus `dropped/` — the states of a dragged-in `.md` archive whose OWN frontmatter was lifted (#280): authored tags + date, an Obsidian note titled by its file name with `aliases:` and plugin keys kept, a Jekyll post whose `title:` beats a differing body `# H1`, and a frontmatter-less note dated by the file's mtime; plus `vault/` — a Markdown TREE imported from a `.zip` (#302), its nested folders reproduced and its internal exact `[[notarium-id:…]]` links repointed at the COPIES (with a fenced-code copy left as authored) | import, content, activity |
+
+### A fixture-pinned physical id (#302)
+
+Normally each applier derives a note's physical identity for itself — the fake deterministically from the path, the real stand from the store — and a case addresses notes only by the logical `n-*` handle. A case must pin the physical id (`note({ id })`) when a note's CONTENT names an identity: an authored `[[notarium-id:…]]` resolves only if the target really carries that id. The pin then has to reach EVERY projection that exposes an identity — the snapshot, the activity/history rows, and a declared `revisionState`, which stamps the id into the seeded bytes (`{{noteId}}`) as well as onto the row — or one surface would describe a different note than the other, and every surface addressed BY that id (navigation, the history panel, a resolved wikilink) would follow whichever one it happened to read. One rule decides it — `physicalIdOf` = `state.id ?? deterministicNoteId(path)` — and no projection re-derives beside it: the activity and revision projections call it, and the snapshot hands the pin to the in-memory store, which applies the same fallback. The real applier forwards the pin to `store.write({ id })`. The `import` case uses it for the imported vault's two linked notes.
+
+**Both halves are pinned, and the real one had to be pinned differently.** The fake side is a fake-server case (`test/fake-server/seedCatalog.test.ts`) that reads the pinned id back off the snapshot, the graph edge and the history rows. The real side could not be: `scripts/**` is outside the test runner's `include`, so nothing there is executed by the suite and the one line that forwards the pin could be deleted with everything still green. `test/cases/seedRealProjection.test.ts` therefore runs the applier as what it is — a CLI, against a throwaway data root — and asserts the frontmatter of the files it wrote, which is the projection a stand actually serves and the string an authored `[[notarium-id:…]]` in a sibling note has to match.
 
 ## Axes and coverage
 
@@ -352,8 +359,9 @@ preserving declaration order.
     in the fake tier: public rows report `capability-unavailable`, `restorableTotal=0`,
     and restore endpoints answer 503 rather than simulating a weaker success.
 - **Fake activity rows are keyed to the note they describe.** The projection stamps
-  each row with `deterministicNoteId(path)` — the id the in-memory store derives for
-  that path — not the catalog's logical handle (#256). With the handle the aggregate
+  each row with `physicalIdOf` — the case's pinned physical id when it declared one
+  (#302, above), else the id the in-memory store derives for that path — not the
+  catalog's logical handle (#256). With the handle the aggregate
   surfaces still worked (heatmap, feed) but every PER-NOTE lookup came back empty on
   a world that demonstrably had revisions. The id rule is imported from
   `@notarium/engine-memory`, not restated, so the two cannot drift.
@@ -374,7 +382,8 @@ preserving declaration order.
   refers to — so `world.contextSets`, `world.scopePins`, and `world.contextOrder` are
   projected only by the REAL applier (`scripts/seed.ts`, which has a logical→real map;
   order references pins by logical note-id and sets by NAME, and is resolved after the
-  sets are created). In e2e all three surfaces are exercised through the fake's REST
+  sets are created). All three surfaces are exercised through the fake's REST instead, by
+  the conformance suite under `test/fake-server/`
   (`contextSets.test.ts`, `scopePins.test.ts`, `contextOrder.test.ts`).
 - **Scope order (#210) = `b.contextOrderFor({scope, entries})`** — `entries` in the
   desired order (`{kind:'pin', note:<logical id>}` / `{kind:'set', name:<set name>}`),
@@ -390,7 +399,8 @@ preserving declaration order.
   ordinary note and prove nothing. It is covered where it does survive — the filesystem leg
   of `test/unit/cachedStoreMutations.test.ts`, which plants the file under a live store.
 - **The honesty test requires `jsdom`** (in isolation, via a docblock) — the only place
-  with a DOM in the suite; everything else is node-only.
+  with a DOM under `test/`; the rest of that tree is node-only, while `packages/web`
+  brings its own jsdom docblocks to the same run.
 - **Favorites (#42/#245) are seeded only by the REAL applier.** The `favorites`
   declaration (`{kind: note|folder|project, ref}`) mints `favorites` facet rows via
   `store`/`ensureFolderIdentity` (a folder-favorite lazily mints a folder-identity, like

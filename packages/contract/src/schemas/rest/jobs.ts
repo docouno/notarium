@@ -25,8 +25,33 @@ export const ImportSummarySchema = z.object({
   imported: z.number().int().nonnegative(),
   skipped: z.number().int().nonnegative(),
   failed: z.number().int().nonnegative(),
+  /** The DETAIL collections are capped server-side (a 10 000-note import must not
+   *  answer with 10 000 rows) while the counters above stay exact. No `.max()`
+   *  here on purpose: a result persisted by an older build may carry more, and
+   *  refusing to parse it would lose a real outcome. Readers bound it themselves. */
   files: z.array(ImportFileResultSchema),
+  /** Recognised members not present in `files`. Absent when nothing was dropped. */
+  filesOmitted: z.number().int().nonnegative().optional(),
   errors: z.array(z.object({ title: z.string().optional(), error: z.string() })),
+  /** Per-note failures not present in `errors`. Absent when nothing was dropped. */
+  errorsOmitted: z.number().int().nonnegative().optional(),
+  /** Notes that imported with their internal links still pointing at the SOURCE
+   *  corpus, because the rewriter refused to guess. A COUNT of notes, exact and
+   *  uncapped: the same fact rides `files[].warnings`, but that collection stops
+   *  at the detail cap, so on a 10 000-file archive the warning is the first
+   *  thing to disappear and this is the only thing left saying it happened.
+   *  Absent when every repoint was proven. */
+  repointFailed: z.number().int().nonnegative().optional(),
+  /** Non-Markdown members a Markdown-tree archive carried: counted exactly,
+   *  sampled boundedly, never imported (attachments have no ingestion seam yet).
+   *  Absent for every other import format. */
+  ignored: z
+    .object({
+      count: z.number().int().nonnegative(),
+      files: z.array(z.string()),
+      filesOmitted: z.number().int().nonnegative().optional(),
+    })
+    .optional(),
   /** Ids of the notes created, in write order — CAPPED (a huge import doesn't send
    *  thousands). The DnD surface opens the first when a single file landed; the
    *  counts above stay authoritative. Absent/empty when nothing was created. Rides

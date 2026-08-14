@@ -54,6 +54,7 @@ import {
   DEFAULT_NOTE_TYPE,
   deriveNoteEdges,
   derivePreview,
+  destinationOwnerConflict,
   directoryOf,
   DOCUMENT_ROLE,
   DOCUMENT_STATE_FORMAT,
@@ -65,6 +66,7 @@ import {
   freshNoteId,
   frontmatterEntryValue,
   FrontmatterLimitError,
+  frontmatterValue,
   type IdentityMaterialization,
   type IdentityMaterializationInput,
   IF_EXISTS,
@@ -76,6 +78,7 @@ import {
   isFolderPageNote,
   isLegacyImportDestination,
   isPortableMoveDestination,
+  isPortablePathComponent,
   isPortableRelativeDestination,
   isSkillPackageRootPath,
   isValidNoteId,
@@ -112,7 +115,7 @@ import {
 
 import { type Chunker, createHeadingChunker } from '../../libs/chunking'
 import type { Embedder } from '../../libs/embedding'
-import type { FileStat } from '../../libs/files'
+import { exactDirSpellings, type FileStat } from '../../libs/files'
 import type {
   MutationReceipt,
   ResourceObservation,
@@ -251,6 +254,14 @@ const writeFailed = (detail: string): StoreError => {
 }
 
 const isoOrNull = (ms: number | null): string | null => (ms ? new Date(ms).toISOString() : null)
+
+/** Every ancestor of a directory pathname, outermost first — the granularity both
+ *  destination fences reason in. */
+const ancestorPrefixes = (directory: string): string[] => {
+  const parts = directory.split('/').filter(Boolean)
+
+  return parts.map((_, index) => parts.slice(0, index + 1).join('/'))
+}
 
 /** Parse a JSON string-array index column (tags/aliases) defensively — a
  *  malformed value degrades to empty rather than crashing the index read. */
@@ -757,22 +768,65 @@ export class NotariumStore implements KnowledgeStore {
     return packagePath ? this.fullIn(mount, packagePath) : undefined
   }
 
+  /** Which spellings a write's destination needs answered — for BOTH fences, in
+   *  ONE question to the medium.
+   *
+   *  The portability fence asks `hasDir` about a prefix only when that prefix's own
+   *  component is not portable ("an existing legacy folder may keep its spelling");
+   *  every other component it decides from the string alone. The spelling fence
+   *  asks about every ancestor of the destination. The second set contains the
+   *  first, so a union costs an adapter with a shallow probe exactly what the
+   *  spelling fence already cost it — and saves the adapter WITHOUT one a second
+   *  recursive walk of the whole mount for an answer it just produced.
+   *
+   *  Exact/raw, which is what `isPortableRelativeDestination` documents its
+   *  `hasDir` to be: the grandfathered folder is a specific RAW one, and a
+   *  case-folded equivalent is not it. `dirExists` (a stat) cannot tell the two
+   *  apart on a case-insensitive medium — it would grandfather `FOO:BAR` on the
+   *  strength of an existing `foo:bar`, and the write would land in a folder it
+   *  never named. */
+  private async destinationDirSpellings(
+    mount: EngineMount,
+    directory: string,
+    legacyImportRoot?: string,
+  ): Promise<Set<string>> {
+    const prefixes = new Set(ancestorPrefixes(directory))
+
+    if (legacyImportRoot !== undefined) {
+      for (const prefix of ancestorPrefixes(legacyImportRoot)) {
+        if (!isPortablePathComponent(prefix.split('/').pop()!)) {
+          prefixes.add(prefix)
+        }
+      }
+    }
+
+    return exactDirSpellings(mount.files, [...prefixes])
+  }
+
   /** Refuse a directory spelling that the medium maps onto an existing RAW
    *  folder with another spelling. Otherwise LocalFS can write into physical
    *  `Empty/` while the derived index records `empty/`, splitting one note across
    *  two path identities until the next scan. New raw-distinct directories remain
-   *  legal on a medium that actually distinguishes them. */
-  private async assertDirectorySpelling(mount: EngineMount, directory: string): Promise<void> {
+   *  legal on a medium that actually distinguishes them.
+   *
+   *  `spelled` is the answer a caller already asked for (see
+   *  {@link destinationDirSpellings}); without one this asks for itself. */
+  private async assertDirectorySpelling(
+    mount: EngineMount,
+    directory: string,
+    spelled?: ReadonlySet<string>,
+  ): Promise<void> {
     if (!directory) {
       return
     }
-    const actual = new Set(await mount.files.listDirs())
-    const parts = directory.split('/')
+    const prefixes = ancestorPrefixes(directory)
+    // One question about every ancestor at once. Whether the medium answers it
+    // with shallow probes or with a single walk is the port's business, not this
+    // one's — see `exactDirSpellings`.
+    const present = spelled ?? (await exactDirSpellings(mount.files, prefixes))
 
-    for (let length = 1; length <= parts.length; length++) {
-      const prefix = parts.slice(0, length).join('/')
-
-      if (actual.has(prefix)) {
+    for (const prefix of prefixes) {
+      if (present.has(prefix)) {
         continue
       }
       if (await mount.files.dirExists(prefix)) {
@@ -3278,6 +3332,7 @@ export class NotariumStore implements KnowledgeStore {
     preservePath,
     preserveAliases,
     restorePath,
+    expectedDestinationId,
   }: WriteInput): Promise<WriteResult> {
     await this.ensureReady()
     const scalarInputs = [title, directory, noteType, slug, summary, fileName, createdAt]
@@ -3332,7 +3387,12 @@ export class NotariumStore implements KnowledgeStore {
       restoreRel != null
         ? directoryOf(restoreRel)
         : (directory ?? (sourceRow ? directoryOf(this.relIn(mount, sourceRow.path)) : ''))
-    const existingDirs = new Set(await mount.files.listDirs())
+    // What the destination's own ancestry looks like on the medium — asked once,
+    // for both fences below. This used to be a full recursive `listDirs()` of the
+    // whole mount on EVERY write: O(tree) per note, which is O(N²) over an import
+    // and the reason a 10 000-note archive never finished.
+    // canon: docs/import.md#importing-a-markdown-tree-302
+    const existingDirs = await this.destinationDirSpellings(mount, dir, legacyImportRoot)
 
     const validDirectory =
       legacyImportRoot !== undefined
@@ -3344,7 +3404,7 @@ export class NotariumStore implements KnowledgeStore {
     if (!validDirectory) {
       throw writeFailed('directory must be safe with portable new components')
     }
-    await this.assertDirectorySpelling(mount, dir)
+    await this.assertDirectorySpelling(mount, dir, existingDirs)
     // fileName overrides slug(title) on a CREATE (import #11) and is honoured on an
     // EDIT as explicit storage intent. A save with no title/folder/fileName change
     // preserves the current basename below, including seeded/imported files.
@@ -3417,6 +3477,97 @@ export class NotariumStore implements KnowledgeStore {
       }
     }
     const destRel = this.relIn(mount, dest)
+    const guarded = expectedDestinationId !== undefined
+
+    if (guarded && renameSource) {
+      // A planned import write never moves an existing note: it creates one, or
+      // refreshes the one already at its destination. Refusing the combination
+      // keeps the guard's single-destination reasoning true by construction
+      // rather than by assumption.
+      throw writeFailed('a planned destination write cannot also rename a note')
+    }
+    // The guard judges DISK, inside the same operation that publishes and against
+    // the very bytes the compare-and-swap will replace — ONE observation, one
+    // truth. A caller-side check would prove nothing (the note it inspected can be
+    // replaced in between), and a second independent read here would be a second
+    // truth to keep in sync — including the authority's claim, which is what the
+    // publish compares against. canon: docs/import.md#importing-a-markdown-tree-302
+    let mutationObservation: ResourceObservation | undefined
+    let targetObservation: ResourceObservation | undefined
+
+    if (guarded && this.resourceAuthority) {
+      mutationObservation = await this.resourceAuthority.observe(dest, {
+        owner: 'notarium-write-plan',
+      })
+      if (mutationObservation.kind === 'unavailable') {
+        throw writeFailed('note is not stably readable during write')
+      }
+      if (mutationObservation.kind === 'occupied') {
+        // `occupied` is a CONTRADICTION, not a silence: a directory, a symlink or a
+        // FIFO owns this pathname, and none of them is a note whose identity could
+        // ever match the plan's. Folding it into the `absent` branch below made the
+        // guard answer "the path is free" two lines above the collision policy
+        // answering "the path is taken" — one engine, two answers about one path,
+        // and the weaker one is the one that reached the caller (a skip under
+        // `skipExisting`, a clobbered symlink under `overwrite`).
+        // canon: docs/import.md#importing-a-markdown-tree-302
+        throw destinationOwnerConflict(
+          dest,
+          `is held by a ${mutationObservation.entryType}, which is not a note`,
+        )
+      }
+    }
+    const guardedRaw = guarded
+      ? mutationObservation
+        ? mutationObservation.kind === 'present'
+          ? new TextDecoder().decode(mutationObservation.bytes)
+          : null
+        : await mount.files.read(destRel)
+      : null
+
+    if (guarded) {
+      // Who this medium can SEE holding the destination — a FILE, since anything
+      // that is not one was already refused above. A file states its owner in its
+      // own frontmatter and nowhere else, so a file without that claim states
+      // NOTHING — it is not the expected note and it is not a stranger either.
+      // (An identity-keyed engine has no such state: every note it holds carries an
+      // id, so its `occupantId` is always an answer. That is the whole difference
+      // between the two engines here — the rule below is one rule.)
+      const occupantId =
+        guardedRaw == null ? null : frontmatterValue(guardedRaw, NOTE_ID_FRONTMATTER_KEY) || null
+
+      if (expectedDestinationId === null) {
+        // The plan expected a free path. An occupant carrying the planned id is
+        // this very plan replaying after a crash — converge. Anything else is a
+        // note that appeared after the plan was made, and overwriting it would
+        // take its identity away.
+        if (guardedRaw != null && occupantId !== (noteId ?? null)) {
+          throw destinationOwnerConflict(
+            dest,
+            occupantId
+              ? `is owned by ${occupantId}; the import planned to create it`
+              : 'was created by someone else since the import was planned',
+          )
+        }
+      } else if (guardedRaw == null) {
+        throw destinationOwnerConflict(dest, 'no longer exists')
+      } else if (occupantId !== null && occupantId !== expectedDestinationId) {
+        // Refuse on a CONTRADICTION, not on a silence. A vault imported before
+        // identities were written is full of unclaimed files, and a claim-less file
+        // is the ordinary state of the note the read-model's registry maps this path
+        // to — refusing there would fail every overwrite into such a vault. The
+        // physical swap below still fences the bytes changing under this write; what
+        // no engine can supply from a claim-less file is WHOSE note it is, and the
+        // layer that knows (the read-model, which owns the path→id registry) has
+        // already checked. A bare engine with no such layer above it therefore has
+        // exactly one guard here, and this is its honest reach.
+        // canon: docs/import.md#importing-a-markdown-tree-302
+        throw destinationOwnerConflict(
+          dest,
+          `is owned by ${occupantId}, not ${expectedDestinationId}`,
+        )
+      }
+    }
     const createWithoutOverwrite = ifExists !== IF_EXISTS.overwrite && !sourceRow
 
     // Create-collision policy: refuse unless the caller explicitly asked to
@@ -3430,10 +3581,7 @@ export class NotariumStore implements KnowledgeStore {
     if (createWithoutOverwrite && (await mount.files.exists(destRel))) {
       throw noteAlreadyExists(title)
     }
-    let mutationObservation: ResourceObservation | undefined
-    let targetObservation: ResourceObservation | undefined
-
-    if (this.resourceAuthority) {
+    if (this.resourceAuthority && !mutationObservation) {
       mutationObservation = await this.resourceAuthority.observe(renameSource ?? dest, {
         owner: 'notarium-write-plan',
       })
@@ -3454,8 +3602,9 @@ export class NotariumStore implements KnowledgeStore {
         ? mutationObservation.bytes
         : null
       : undefined
-    const existingRaw =
-      existingSource !== undefined
+    const existingRaw = guarded
+      ? guardedRaw
+      : existingSource !== undefined
         ? existingSource == null
           ? null
           : new TextDecoder().decode(existingSource)
@@ -3566,9 +3715,28 @@ export class NotariumStore implements KnowledgeStore {
         if (renameSource) {
           throw moveFailed('source or destination changed during write')
         }
+        if (guarded && expectedDestinationId === null && guardedRaw == null) {
+          // The guard PROVED this destination free, in this same operation, and the
+          // swap it just lost was one that publishes only into an absent pathname.
+          // So the loser here is not our own bytes moving under us — something was
+          // CREATED at a path the plan owns, between the observation and the
+          // publication. That newcomer is a stranger by construction (our own replay
+          // would have been the occupant the guard converged on above), which is
+          // exactly what the plan's caller must hear: `note_already_exists` here made
+          // a `skipExisting` import count a note it never wrote as skipped.
+          throw destinationOwnerConflict(
+            dest,
+            'was created by someone else since the import was planned',
+          )
+        }
         if (!sourceRow && createWithoutOverwrite) {
           throw noteAlreadyExists(title)
         }
+        // Deliberately NOT a destination-owner conflict, even for a planned write.
+        // The owner was proved above and matched; what this swap compares is BYTES,
+        // so losing it means the expected note's content moved under us, not that the
+        // path changed hands. Calling it an owner conflict made an import that had
+        // written 9 999 notes end terminally because the 10 000th raced one edit.
         throw writeFailed('note changed during write')
       }
       mutationReceipt = publication.receipt
@@ -3591,7 +3759,37 @@ export class NotariumStore implements KnowledgeStore {
         throw writeFailed('storage cannot create a note without replacing a race')
       }
       if (!(await mount.files.writeIfAbsent(destRel, bytes))) {
+        // Same reading as the authority's lost swap above: a plan that proved this
+        // path free and then lost the no-clobber create lost it to a newcomer.
+        if (guarded && expectedDestinationId === null && guardedRaw == null) {
+          throw destinationOwnerConflict(
+            dest,
+            'was created by someone else since the import was planned',
+          )
+        }
         throw noteAlreadyExists(title)
+      }
+    } else if (guarded) {
+      // A guarded write NEVER publishes with a plain overwrite, even though the
+      // caller asked for one: the bytes verified above are the compare baseline,
+      // so anything that changed the destination in between loses the swap
+      // instead of being silently replaced.
+      //
+      // Unreachable wherever a resource authority is configured — which is every
+      // deployment — because the authority publishes above. It stays because the
+      // branch it guards against is the one below: without it a guarded write on an
+      // authority-less engine would fall through to a plain overwrite, which is
+      // precisely the publish this channel exists to forbid.
+      if (!mount.files.writeIfAbsent || !mount.files.replaceIfAbsent) {
+        throw writeFailed('storage cannot publish a planned write without replacing a race')
+      }
+      const published =
+        guardedRaw == null
+          ? await mount.files.writeIfAbsent(destRel, bytes)
+          : await mount.files.replaceIfAbsent(destRel, destRel, guardedRaw, bytes)
+
+      if (!published) {
+        throw destinationOwnerConflict(dest, 'changed while the planned write was publishing')
       }
     } else {
       await mount.files.write(destRel, bytes)

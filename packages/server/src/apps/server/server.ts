@@ -31,6 +31,7 @@ import { createMutationGate } from '../../libs/mutationGate'
 import { notesDirReader } from '../../libs/notesDir'
 import { type AuthMode, createAuthService } from '../../services/auth'
 import { CausalOutboxProjector, causalReplicaId } from '../../services/causalOutboxProjector'
+import { closeTerminalImportReservations } from '../../services/import'
 import {
   InstallationReplayKey,
   ReplayKeyring,
@@ -604,6 +605,9 @@ export const createServer = async ({
             [JOB_KIND_IMPORT]: createImportHandler({
               resolveStore: (space) => manager.store(space),
               staging,
+              // The same meta-DB the jobs layer runs on: the reservation proves its
+              // premise against the very `jobs` row this handler holds.
+              metaDb,
             }),
           },
           // Push progress ONLY to the job's owner (its principal) — mirrors the REST
@@ -618,6 +622,16 @@ export const createServer = async ({
               const j = await metaDb.jobs.get(id)
               return !!j && (j.status === 'pending' || j.status === 'running')
             }, Date.now()),
+          // Terminal claims close before retention can remove the row that proves
+          // the job ended, and before the staging sweep reclaims what it read.
+          onTerminalCleanup: () =>
+            closeTerminalImportReservations({
+              metaDb,
+              // A stuck claim is a destination nothing frees; the next tick retries
+              // it, and until it succeeds the only evidence is this line.
+              log: (message, err) =>
+                console.error(`[import] ${message} ->`, (err as Error).message),
+            }),
           runMutation: (task) => mutationGate.run(task),
           enterMutation: () => mutationGate.enter(),
         })

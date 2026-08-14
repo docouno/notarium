@@ -2028,6 +2028,32 @@ describe('SqliteMetaDb', () => {
       expect(j?.completedAt).toBe(T(32))
     })
 
+    it('a TERMINAL failure may persist a bounded result; a retryable one never does', async () => {
+      const db = make()
+      await enqueue(db)
+      await db.jobs.claimNext('lease-A', ['export'], T(1))
+      // A retryable failure is an attempt, not an outcome — nothing to publish.
+      await db.jobs.fail('j1', 'lease-A', {
+        error: 'transient',
+        retryAt: T(30),
+        now: T(2),
+        result: { imported: 7 },
+      })
+      expect((await db.jobs.get('j1'))?.result).toBeNull()
+      // A terminal one carries what the run finished before it failed.
+      await db.jobs.claimNext('lease-B', ['export'], T(31))
+      await db.jobs.fail('j1', 'lease-B', {
+        error: 'plan conflict',
+        now: T(32),
+        result: { imported: 7, skipped: 0, failed: 1 },
+      })
+      const failed = await db.jobs.get('j1')
+
+      expect(failed?.status).toBe('failed')
+      expect(failed?.error).toBe('plan conflict')
+      expect(failed?.result).toEqual({ imported: 7, skipped: 0, failed: 1 })
+    })
+
     it('release refunds the claim attempt and only the holder can release', async () => {
       const db = make()
       await enqueue(db)

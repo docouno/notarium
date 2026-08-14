@@ -39,8 +39,19 @@ import type { CaseEvent, CaseWorld } from './types'
 // models (snapshot for structure, activity for history) — the catalog just makes
 // it declarative and shared with the real applier.
 
+/** The physical id a projection must use: the case's pin, else the id the fake
+ *  engine derives from the path. One rule, so snapshot / activity / history /
+ *  navigation / revision states can never disagree about which note a row belongs
+ *  to. Every projection below reads it — none of them re-derives. */
+const physicalIdOf = (state: { id?: string; path: string }): string =>
+  state.id ?? deterministicNoteId(state.path)
+
 type NoteState = {
   space: string
+  /** A fixture-pinned physical id, when the case pinned one. Every projection
+   *  that exposes a note's identity must read it — a snapshot that pins it while
+   *  activity/history derive their own would describe two different notes. */
+  id?: string
   path: string
   title: string
   content: string
@@ -304,6 +315,7 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
       const names = carriedNames(e.frontmatter)
       notes.set(e.noteId, {
         space: e.space,
+        id: e.physicalId,
         path: e.path,
         title: e.title,
         content: e.content,
@@ -391,7 +403,7 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
       // demonstrably has revisions. Paths are unique per space by construction
       // here (mergeWorlds suffixes collisions), so the pre-suffix form the store
       // derives is the one it keeps.
-      noteId: state ? deterministicNoteId(state.path) : e.noteId,
+      noteId: state ? physicalIdOf(state) : e.noteId,
       class: cls,
       principal: e.principal,
       // The body as of this revision IN JOURNAL FORM, so the seeded chain is
@@ -403,7 +415,6 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
       snapshot: state ? journalState(state) : undefined,
       // Churn stamped the way the journal stamps it for this op, so the "+N −M" on
       // the feed is a measurement rather than a decoration.
-      ...churn(e.op, before, state ? journalState(state) : ''),
       ...churn(e.op, before, state ? journalState(state) : ''),
       // A row the settlement quarantined: the fake serves it with the drivers'
       // effective-field semantics, so the stand shows a real gap rather than a
@@ -420,7 +431,11 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
     if (!state) {
       throw new Error(`revision state references unknown note ${declaration.note}`)
     }
-    const noteId = deterministicNoteId(state.path)
+    // The SAME rule the snapshot and the activity rows use. A revision row is the
+    // one projection that also stamps the id INTO its bytes (`{{noteId}}` in the
+    // declared source), so deriving a second id here would not merely mislabel the
+    // row — it would seed a state blob whose `notarium-id:` names a note nobody has.
+    const noteId = physicalIdOf(state)
     const materialized = materializeRevisionState(declaration, {
       noteId,
       path: state.path,
@@ -495,6 +510,7 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
     const live: NoteSnapshot[] = [...notes.values()]
       .filter((n) => n.space === s.slug && !n.deleted)
       .map((n) => ({
+        ...(n.id ? { id: n.id } : {}),
         title: n.title,
         filePath: n.path,
         content: n.content,

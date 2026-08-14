@@ -71,6 +71,7 @@ describe('meta-DB migration assets and SQLite runner', () => {
       { version: 7, name: 'revision_purge_cas' },
       { version: 8, name: 'causal_metadata' },
       { version: 9, name: 'agent_activity' },
+      { version: 10, name: 'import_reservations' },
     ])
     for (const migration of migrations) {
       expect(migration.checksum).toBe(checksumMigrationPair(migration.sqlite, migration.postgres))
@@ -106,7 +107,13 @@ describe('meta-DB migration assets and SQLite runner', () => {
           .all() as Array<{ type: string; count: number }>
       ).map(({ type, count }) => [type, count]),
     )
-    expect(counts).toEqual({ index: 55, table: 37, trigger: 27 })
+    // +2 tables and +1 index over main's schema: the import reservation pair (#302).
+    // ONE index, not two — the claims table's own lookups are served by the indexes
+    // its PRIMARY KEY and UNIQUE already create, and a third one would cost an
+    // insert per claimed path (10 000 on the supported corpus) for a predicate that
+    // is already indexed. The counter excludes `sqlite_autoindex_%`, so those two
+    // are invisible here and only the reservations' `job_id` index is counted.
+    expect(counts).toEqual({ index: 56, table: 39, trigger: 27 })
     expect(
       db.prepare("SELECT 1 FROM sqlite_schema WHERE name = 'meta_schema'").get(),
     ).toBeUndefined()

@@ -14,10 +14,26 @@ import { describeCausalMetadataContract } from './causalMetadataContract'
 import { describeFavoritesContract } from './favoritesContract'
 import { describeGatewayStateContract } from './gatewayStateContract'
 import { describeIdentityPersistenceContract } from './identityPersistenceContract'
+import { describeImportReservationsContract } from './importReservationsContract'
+import { describeJobsContract } from './jobsContract'
 import { createPostgresTestSchema, describePostgres } from './postgresHarness'
 import { describeRevisionPersistenceContract } from './revisionPersistenceContract'
 import { describeSessionAuditContract } from './sessionAuditContract'
 import { describeSpaceLifecycleWriterContract } from './spaceLifecycleWriterContract'
+
+/** Every test here creates a schema, migrates it and lets two transactions contend
+ *  across a container boundary, so the vitest default (5 s) is not a budget this
+ *  file can be polled against. Stated once, and the probe budget below is derived
+ *  from it — the same shape `pgLockPairs.test.ts` uses, and for the same reason. */
+const SUITE_TIMEOUT_MS = 15_000
+
+/** How long one probe waits for the state it is about to assert on. Deliberately a
+ *  FRACTION of the suite budget: equal to it, the test would die of the timeout
+ *  before its own "timed out waiting for N waiters" could ever be read — which is
+ *  what a 5 s wait under a 5 s test timeout did on a loaded host. */
+const PROBE_WAIT_MS = SUITE_TIMEOUT_MS / 3
+
+const SUITE = { timeout: SUITE_TIMEOUT_MS }
 
 const advisoryWaiterCount = async (
   testSchema: Awaited<ReturnType<typeof createPostgresTestSchema>>,
@@ -37,7 +53,7 @@ const waitForAdvisoryWaiters = async (
   testSchema: Awaited<ReturnType<typeof createPostgresTestSchema>>,
   expected: number,
 ): Promise<void> => {
-  const deadline = Date.now() + 5_000
+  const deadline = Date.now() + PROBE_WAIT_MS
 
   while (Date.now() < deadline) {
     if ((await advisoryWaiterCount(testSchema)) >= expected) {
@@ -54,7 +70,7 @@ const waitForTupleLockWaiter = async (
   testSchema: Awaited<ReturnType<typeof createPostgresTestSchema>>,
   expected = 1,
 ): Promise<void> => {
-  const deadline = Date.now() + 5_000
+  const deadline = Date.now() + PROBE_WAIT_MS
 
   while (Date.now() < deadline) {
     const result = await testSchema.admin.query(
@@ -183,7 +199,24 @@ const rawAppendWithoutApplicationLocks = async (
   }
 }
 
-describePostgres('live Postgres driver', () => {
+describePostgres('live Postgres driver', SUITE, () => {
+  describeImportReservationsContract('Postgres', async () => {
+    const testSchema = await createPostgresTestSchema('import_reservations')
+
+    return {
+      reservations: testSchema.db.importReservations,
+      jobs: testSchema.db.jobs,
+      purgeSpace: (space) => testSchema.db.purgeSpace(space),
+      teardown: () => testSchema.teardown(),
+    }
+  })
+
+  describeJobsContract('Postgres', async () => {
+    const testSchema = await createPostgresTestSchema('jobs_contract')
+
+    return { jobs: testSchema.db.jobs, teardown: () => testSchema.teardown() }
+  })
+
   describeSpaceLifecycleWriterContract('Postgres', async () => {
     const testSchema = await createPostgresTestSchema('space_lifecycle_writers')
     return { db: testSchema.db, teardown: () => testSchema.teardown() }
@@ -488,7 +521,7 @@ describePostgres('live Postgres driver', () => {
 
       // Neither may be chosen as a deadlock victim: the reorder waits at tier 1 for
       // the settlement it can never be ahead of.
-      await withTimeout(Promise.all([settleTask, reorderTask]), 5_000)
+      await withTimeout(Promise.all([settleTask, reorderTask]), PROBE_WAIT_MS)
       expect(await testSchema.db.identity.findById!('X')).toMatchObject({ space: 'alpha' })
       expect(
         (await testSchema.db.contextOrder.orderForTarget('project', 'scope-1')).map(
@@ -560,7 +593,7 @@ describePostgres('live Postgres driver', () => {
       await waitForTupleLockWaiter(testSchema, 2)
       await blocker.query('COMMIT')
 
-      await withTimeout(Promise.all([settleTask, purgeTask]), 5_000)
+      await withTimeout(Promise.all([settleTask, purgeTask]), PROBE_WAIT_MS)
       expect(await testSchema.db.identity.findById!('X')).toMatchObject({ space: 'alpha' })
     } finally {
       await blocker.query('ROLLBACK').catch(() => {})
@@ -619,7 +652,7 @@ describePostgres('live Postgres driver', () => {
       expect(settled).toBe(false)
 
       await blocker.query('COMMIT')
-      await withTimeout(settleTask, 5_000)
+      await withTimeout(settleTask, PROBE_WAIT_MS)
       expect(settled).toBe(true)
       expect(await testSchema.db.identity.findById!('X')).toMatchObject({ space: 'alpha' })
     } finally {
@@ -812,7 +845,7 @@ describePostgres('live Postgres driver', () => {
       await waitForTupleLockWaiter(testSchema, 2)
       await blocker.query('COMMIT')
 
-      await withTimeout(Promise.all([advanceTask, retypeTask]), 5_000)
+      await withTimeout(Promise.all([advanceTask, retypeTask]), PROBE_WAIT_MS)
       expect(await testSchema.db.projects.getById(projectId)).toBeNull()
       expect(await testSchema.db.folders.getById(projectId)).not.toBeNull()
       expect(
@@ -913,8 +946,8 @@ describePostgres('live Postgres driver', () => {
       await waitForTupleLockWaiter(testSchema, 2)
       await blocker.query('COMMIT')
 
-      await withTimeout(purgeTask, 5_000)
-      await expect(withTimeout(advanceTask, 5_000)).rejects.toThrow(/foreign key/i)
+      await withTimeout(purgeTask, PROBE_WAIT_MS)
+      await expect(withTimeout(advanceTask, PROBE_WAIT_MS)).rejects.toThrow(/foreign key/i)
       expect(await testSchema.db.projects.getById(projectId)).toBeNull()
       expect(
         await testSchema.db.agentDeltaCursors.getOrInit(
@@ -1382,7 +1415,7 @@ describePostgres('live Postgres driver', () => {
       // owns any advisory lock; otherwise releasing legacy creates a deadlock.
       await waitForTupleLockWaiter(testSchema)
       releaseLegacy?.()
-      await withTimeout(Promise.all([legacyTask, modernTask]), 5_000)
+      await withTimeout(Promise.all([legacyTask, modernTask]), PROBE_WAIT_MS)
 
       expect(await testSchema.db.revisions.latestFor('space-a', 'legacy-new-hash')).not.toBeNull()
       expect(await testSchema.db.revisions.latestFor('space-b', 'modern-new-hash')).not.toBeNull()

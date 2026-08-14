@@ -4,7 +4,7 @@
 // (#280): `title`/`tags`/`created`/`type` are lifted into the note's typed channels, everything
 // else rides along verbatim. Notarium is file-first — we are not the owner of the user's file.
 
-import { NOTE_ID_FRONTMATTER_KEY } from '../../libs/id'
+import { isValidNoteId, NOTE_ID_FRONTMATTER_KEY } from '../../libs/id'
 import {
   CREATED_FALLBACK_FRONTMATTER_KEY,
   type FrontmatterEntry,
@@ -179,6 +179,14 @@ export const markdownFileToNote = (
   const carried = hasYamlNodeReferences
     ? entries
     : entries.filter((e) => !e.key || (!NEVER_CARRIED.has(e.key) && !captured.has(e.key)))
+  // The identity claim is READ but never carried (NEVER_CARRIED still holds it
+  // out of the frontmatter above): a copy mints its own id, and the claim's only
+  // job is to key the exact-link map between two notes of the same archive.
+  // An unreadable claim is surfaced rather than silently treated as absent —
+  // "this file named an identity and we could not use it" is information.
+  const claimed = entry(NOTE_ID_FRONTMATTER_KEY)
+  const sourceId = scalarOf(claimed)
+  const hasReadableSourceId = Boolean(sourceId) && isValidNoteId(sourceId)
 
   return {
     title,
@@ -196,5 +204,11 @@ export const markdownFileToNote = (
     fileName: cappedSlug(fallback) || `note-${shortHash(fileName)}`,
     createdAt,
     source: IMPORT_SOURCE.file,
+    ...(hasReadableSourceId ? { sourceId } : {}),
+    ...(claimed && !hasReadableSourceId
+      ? {
+          sourceIdentityWarning: `${fileName}: unreadable ${NOTE_ID_FRONTMATTER_KEY} — imported with a fresh identity`,
+        }
+      : {}),
   }
 }

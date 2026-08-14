@@ -21,7 +21,7 @@ import { usersApi } from './users'
 // (services/api/*) and share the typed fetch transport in ./client; this file
 // only assembles them (spread) and hosts the job-poll helper. Method naming and
 // the #16 space-scoping convention live with the families and ./client.
-export { ApiError } from './client'
+export { ApiError, type ImportProgressLine } from './client'
 export { setSpaceAccessProbe, setUnauthorizedHandler } from './client'
 export type { BucketsQueryParams, NotesQueryParams } from './types'
 

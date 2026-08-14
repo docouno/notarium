@@ -111,6 +111,7 @@ const ctxOf = (
   })
   const ctx: JobContext = {
     job: jobRec(over.job),
+    lease: 'lease-1',
     signal: controller.signal,
     artifacts,
     report: over.report ?? (async () => {}),

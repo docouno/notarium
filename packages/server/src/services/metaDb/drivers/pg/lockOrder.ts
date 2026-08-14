@@ -12,7 +12,8 @@
 //
 // The levels, in order:
 //
-//   L1   `note_identity`
+//   L0j  per-job import fence (advisory) → L1 `note_identity` →
+//   L1r  `import_reservations` → L1p `import_reservation_paths`
 //   L2a  `favorites` → L2b `context_set_attachments` → L2c `context_sets` →
 //   L2d  `context_scope_pins` → L2e per-scope order advisory → L2f `context_order`
 //   L3m  wide-scan mutex → L3s/L3n/L3b space/note/blob stripes → L3t revision tables
@@ -32,7 +33,10 @@ import type { ContextOrderRow, ContextSetRow, ScopePinRow } from '../../rows'
 
 /** The levels in the order every transaction takes them; the INDEX is the order. */
 export const LOCK_LEVELS = [
+  'L0j',
   'L1',
+  'L1r',
+  'L1p',
   'L2a',
   'L2b',
   'L2c',
@@ -54,6 +58,8 @@ export type LockLevel = (typeof LOCK_LEVELS)[number]
  *  hierarchy and constrains nothing. */
 export const LOCK_LEVEL_OF_TABLE: Readonly<Record<string, LockLevel>> = {
   note_identity: 'L1',
+  import_reservations: 'L1r',
+  import_reservation_paths: 'L1p',
   favorites: 'L2a',
   context_set_attachments: 'L2b',
   context_sets: 'L2c',
@@ -108,6 +114,70 @@ const hash32 = (s: string): number => {
 /** Keys the per-scope advisory lock; a hash collision merely serializes two unrelated scopes, never a correctness issue. */
 const contextOrderLockKey = (targetKind: string, targetId: string): number =>
   hash32(`${targetKind}:${targetId}`)
+
+// ── L0j · per-job import fence ───────────────────────────────────────────────
+
+/** Namespaces the per-job advisory so it can never alias another single-arg key. */
+const IMPORT_JOB_LOCK_NS = 0x696d_704a // 'impJ'
+
+/** L0j — the fence every durable import path enters FIRST, and the only one that
+ *  outranks identity: reserve, adopt, the fenced physical write, terminal close, and
+ *  the transitions that invalidate a run FROM OUTSIDE it — cancel and reap.
+ *  `release`, `succeed` and `fail` are deliberately not here: a run performs those on
+ *  itself, after its own last write returned, so there is nothing for them to
+ *  interleave with and taking the fence would only make a worker wait for its own
+ *  lock. Transaction-scoped, so COMMIT/ROLLBACK releases it and no file I/O can
+ *  outlive it by accident.
+ *
+ *  The heartbeat deliberately does NOT take it. A member that takes minutes must be
+ *  able to keep its lease alive while the fence is held, or the reaper would kill the
+ *  very job that is making progress — which is why the reaper re-checks staleness
+ *  AFTER it gets the fence.
+ *
+ *  A hash collision merely serializes two unrelated jobs; it is never a correctness
+ *  issue, exactly as for the per-scope order lock above. */
+export const lockImportJobAdvisory = async (
+  client: PoolClient,
+  jobId: string,
+): Promise<{ lock: LockHold }> => {
+  await client.query('SELECT pg_advisory_xact_lock($1, $2)', [IMPORT_JOB_LOCK_NS, hash32(jobId)])
+
+  return { lock: hold('L0j', [jobId], [jobId]) }
+}
+
+export type ImportJobPremise =
+  { ok: true; lock: LockHold } | { ok: false; lock: LockHold; detail: string }
+
+/** L0j — the fence PLUS the premise a reservation path may not proceed without: this
+ *  job row is running, under this very lease.
+ *
+ *  The row is re-read with a plain SELECT, deliberately not `FOR UPDATE`. Holding a
+ *  jobs row lock across the caller's file write is the thing this design refuses: the
+ *  advisory is the mutual exclusion, the row read is only the premise, and the
+ *  heartbeat must stay free to touch that row throughout. A mismatch aborts here,
+ *  before any lower level is entered. */
+export const lockImportJobFence = async (
+  client: PoolClient,
+  jobId: string,
+  workerLease: string,
+): Promise<ImportJobPremise> => {
+  const { lock } = await lockImportJobAdvisory(client, jobId)
+  const res = await client.query('SELECT status, locked_by FROM jobs WHERE id = $1', [jobId])
+  const row = res.rows[0] as { status?: string; locked_by?: string | null } | undefined
+
+  if (!row) {
+    return { ok: false, lock, detail: `job ${jobId} no longer exists` }
+  }
+  if (row.status !== 'running' || row.locked_by !== workerLease) {
+    return {
+      ok: false,
+      lock,
+      detail: `job ${jobId} is ${row.status ?? 'gone'} under lease ${row.locked_by ?? 'none'}`,
+    }
+  }
+
+  return { ok: true, lock }
+}
 
 // ── L1 · note_identity ───────────────────────────────────────────────────────
 
@@ -210,6 +280,195 @@ export const lockSpaceIdentityRows = async (
   const ids = (res.rows as Array<{ id: string }>).map((row) => row.id)
 
   return { lock: hold('L1', ids, ids, 'range'), ids }
+}
+
+// ── L1r · import_reservations · L1p · import_reservation_paths ───────────────
+
+export type ImportReservationHeaderRow = {
+  id: string
+  space: string
+  job_id: string
+  upload_ref: string
+  fence: string
+  status: 'active' | 'closing'
+}
+
+export type ImportReservationPathRow = {
+  entry_key: string
+  destination_path: string
+  target_id: string
+  expected_id: string | null
+  ownership: 'existing-reference' | 'fresh-owned'
+}
+
+const RESERVATION_COLUMNS = 'id, space, job_id, upload_ref, fence, status'
+
+/** A claim carries the PLAN and nothing derived from it — see the type in
+ *  `metaDb/types.ts` for why "did it land" is not a column here. */
+export const IMPORT_RESERVATION_PATH_COLUMNS =
+  'entry_key, destination_path, target_id, expected_id, ownership'
+
+/** The ONE vocabulary of L1p keys, for every helper of this level: the claim rows
+ *  are arbitrated by the unique index on `(space, destination_path)`, so that pair —
+ *  and not `entry_key`, which is only unique WITHIN a reservation — is what two
+ *  transactions actually contend for. A level whose keys are declared in one
+ *  vocabulary and written in another is a level the gate cannot check. */
+const reservationPathKey = (space: string, destinationPath: string): string =>
+  `${space}:${destinationPath}`
+
+/** L1r — the reservation header, addressed the three ways its lifecycle needs it:
+ *  by upload (reserve/adopt, the immutable key), by id (a fenced write), by job
+ *  (terminal cleanup). One helper per address, still ONE entry per transaction. */
+export const lockImportReservationByUpload = async (
+  client: PoolClient,
+  space: string,
+  uploadRef: string,
+): Promise<{ lock: LockHold; row: ImportReservationHeaderRow | null }> => {
+  const key = `${space}:${uploadRef}`
+  const res = await client.query(
+    `SELECT ${RESERVATION_COLUMNS} FROM import_reservations
+       WHERE space = $1 AND upload_ref = $2 FOR UPDATE`,
+    [space, uploadRef],
+  )
+  const row = (res.rows[0] as ImportReservationHeaderRow | undefined) ?? null
+  // The same row, addressed two ways: FOUND by its natural key, WRITTEN by its
+  // surrogate id. Both belong to the declaration — one that named only the key
+  // would forbid the very write this level is entered for. The composite is
+  // spelled with `:` because the statement reaches SQL with the parts as
+  // parameters, and either spelling counts as naming the row.
+  const declared = row ? [key, row.id] : [key]
+
+  return { lock: hold('L1r', declared, row ? declared : []), row }
+}
+
+export const lockImportReservationById = async (
+  client: PoolClient,
+  reservationId: string,
+): Promise<{ lock: LockHold; row: ImportReservationHeaderRow | null }> => {
+  const res = await client.query(
+    `SELECT ${RESERVATION_COLUMNS} FROM import_reservations WHERE id = $1 FOR UPDATE`,
+    [reservationId],
+  )
+  const row = (res.rows[0] as ImportReservationHeaderRow | undefined) ?? null
+
+  return { lock: hold('L1r', [reservationId], row ? [reservationId] : []), row }
+}
+
+export const lockImportReservationByJob = async (
+  client: PoolClient,
+  jobId: string,
+): Promise<{ lock: LockHold; row: ImportReservationHeaderRow | null }> => {
+  const res = await client.query(
+    `SELECT ${RESERVATION_COLUMNS} FROM import_reservations WHERE job_id = $1 ORDER BY id FOR UPDATE`,
+    [jobId],
+  )
+  const row = (res.rows[0] as ImportReservationHeaderRow | undefined) ?? null
+
+  return { lock: hold('L1r', [jobId], row ? [jobId] : [], 'range'), row }
+}
+
+/** L1p — this reservation's destination claims, in entry order. */
+export const lockImportReservationPaths = async (
+  client: PoolClient,
+  space: string,
+  reservationId: string,
+): Promise<{ lock: LockHold; rows: ImportReservationPathRow[] }> => {
+  const res = await client.query(
+    `SELECT ${IMPORT_RESERVATION_PATH_COLUMNS}
+       FROM import_reservation_paths WHERE reservation_id = $1
+      ORDER BY entry_key FOR UPDATE`,
+    [reservationId],
+  )
+  const rows = res.rows as ImportReservationPathRow[]
+  const keys = rows.map((row) => reservationPathKey(space, row.destination_path))
+
+  return { lock: hold('L1p', keys, keys, 'range'), rows }
+}
+
+/** L1p — ONE destination claim, the unit a fenced write actually works on. Locking
+ *  the whole reservation to find one row made every write cost the size of the
+ *  import: a 10 000-note tree took 10 000 row locks per note, held across a file
+ *  write. The level is entered once either way; only the key set narrows.
+ *
+ *  Addressed by `(space, destination_path)` — the UNIQUE index — and NOT by
+ *  `(reservation_id, destination_path)`, which no index serves: that predicate made
+ *  Postgres seq-scan the whole batch (10 000 claims: `Rows Removed by Filter: 9999`,
+ *  7.4 ms) for the one row a write needs. The reservation is then a FILTER on the row
+ *  the index found: a claim held by somebody else's import is not this write's, and
+ *  the caller refuses the destination exactly as it does for one nobody claimed. */
+export const lockImportReservationPath = async (
+  client: PoolClient,
+  space: string,
+  reservationId: string,
+  destinationPath: string,
+): Promise<{ lock: LockHold; row: ImportReservationPathRow | null }> => {
+  const res = await client.query(
+    `SELECT reservation_id, ${IMPORT_RESERVATION_PATH_COLUMNS}
+       FROM import_reservation_paths
+      WHERE space = $1 AND destination_path = $2 FOR UPDATE`,
+    [space, destinationPath],
+  )
+  const claimed = res.rows[0] as (ImportReservationPathRow & { reservation_id: string }) | undefined
+  const key = reservationPathKey(space, destinationPath)
+
+  // The key is declared whether or not a row stands at it: the level was entered for
+  // this destination, and that is what the transaction may touch here.
+  return {
+    lock: hold('L1p', [key], claimed ? [key] : []),
+    row: claimed?.reservation_id === reservationId ? claimed : null,
+  }
+}
+
+/** L1p — the destinations a reserve is about to CLAIM. They do not exist yet, so the
+ *  level is entered by creating them, and rule 3 applies: sorted by the unique key
+ *  `(space, destination_path)`, so two imports whose sets overlap collide in one
+ *  agreed order instead of deadlocking halfway through each other's list.
+ *
+ *  The UNIQUE violation IS the answer here — another live import owns one of these
+ *  paths — so the caller reads it as a refusal, not as an error. */
+export const insertImportReservationPaths = async (
+  client: PoolClient,
+  reservationId: string,
+  space: string,
+  entries: ReadonlyArray<{
+    entryKey: string
+    destinationPath: string
+    targetId: string
+    expectedId: string | null
+    ownership: 'existing-reference' | 'fresh-owned'
+  }>,
+): Promise<{ lock: LockHold }> => {
+  const sorted = [...entries].sort((left, right) =>
+    left.destinationPath < right.destinationPath
+      ? -1
+      : left.destinationPath > right.destinationPath
+        ? 1
+        : 0,
+  )
+
+  for (const entry of sorted) {
+    await client.query(
+      `INSERT INTO import_reservation_paths
+         (reservation_id, entry_key, space, destination_path, target_id, expected_id, ownership)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        reservationId,
+        entry.entryKey,
+        space,
+        entry.destinationPath,
+        entry.targetId,
+        entry.expectedId,
+        entry.ownership,
+      ],
+    )
+  }
+  // Declared but NOT held: every one of these keys was absent when the level was
+  // entered — creating them IS the entry. `declared` minus `held` is the set rule 3
+  // orders, so calling them held would make the one rule this helper exists to obey
+  // vacuous, which is exactly what it was.
+  const keys = sorted.map((entry) => reservationPathKey(space, entry.destinationPath))
+
+  return { lock: hold('L1p', keys, []) }
 }
 
 // ── causal row locks (outside the tier index) ───────────────────────────────

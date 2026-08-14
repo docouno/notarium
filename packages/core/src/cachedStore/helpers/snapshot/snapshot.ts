@@ -17,6 +17,7 @@ import {
   resolveLink,
 } from '../../../referenceResolver'
 import { isVisibleOn, SURFACE } from '../../../visibility'
+import { NotesMap } from './notesMap'
 
 /** The read-model's derived state: notes by note-id, outbound edges by source
  *  note-id, and the ghost prefill registry — everything /api/notes, /api/recent and
@@ -25,8 +26,8 @@ import { isVisibleOn, SURFACE } from '../../../visibility'
  *  maps and the edge-derivation primitives over them.
  *  @see docs/core.md#read-model · docs/core.md#graph-derivation */
 export class Snapshot {
-  /** Notes by note-id. */
-  readonly notes = new Map<string, NoteMeta>()
+  /** Notes by note-id, with the write path's `filePath → ids` reverse lookup. */
+  readonly notes = new NotesMap()
   /** Outbound edges by source note-id. */
   readonly edgesBySource = new Map<string, GraphLink[]>()
   /** Ghost (unresolved-link) prefill registry by ghost id. */
@@ -46,12 +47,35 @@ export class Snapshot {
    *  reresolveGhosts retargets the engine's old-path ghosts. Empty when no port is
    *  wired (bare engine). */
   folderAliases: FolderAlias[] = []
+  /** The memoized resolve table and the state it was built from. `pastNames` is
+   *  deliberately NOT part of it: the journal's past titles are not an input to
+   *  `buildLinkIndex` — they reach the table as `aliases` ON THE METAS, and every
+   *  such merge (boot, poll, `reloadHistoricalNames`) is a `notes` mutation, which
+   *  the counter below already sees. Keying on the history as well only made the
+   *  table drop on a reload that changed no name at all. */
+  private index: LinkIndex | null = null
+  /** What the memoized table was built from. `notes.version` alone is total over
+   *  the note set (every set/delete/clear bumps it), so the retraction counter here
+   *  is not a second guard for the EXACT table — it is what {@link batchIndex}
+   *  compares, and it is recorded at build time so a batch caller can ask whether
+   *  an id has left the map since. */
+  private indexKey: {
+    notes: number
+    retractions: number
+    folders: number
+    aliases: FolderAlias[]
+  } | null = null
 
   /** Edge type for body-derived links — matches what the engine's boot graph uses so
    *  patched and swept edges dedupe against each other. */
   constructor(
     private readonly relationType: string,
     private readonly currentFolders: () => readonly string[] = () => [],
+    /** Change counter of the folder set behind `currentFolders`. The resolve
+     *  table depends on it, and a callback returning a fresh array every time
+     *  cannot be compared — so the owner reports when it moved. Without one the
+     *  table is simply rebuilt every time, which is the old behaviour. */
+    private readonly foldersVersion: () => number = () => Number.NaN,
   ) {}
 
   /** The graph-visible slice of the snapshot — agent-memory (and any non-graph
@@ -93,27 +117,115 @@ export class Snapshot {
   }
 
   /** The link index over the graph-visible notes + folder path-aliases — the
-   *  resolve table [[wikilink]]s and ghost re-resolution consult. */
+   *  resolve table [[wikilink]]s and ghost re-resolution consult.
+   *
+   *  EXACT: memoized on everything it is built FROM, so it is rebuilt whenever any
+   *  of that moved and never otherwise. The key must stay TOTAL over the inputs —
+   *  a missed one hands back a table that resolves a link to a note it no longer
+   *  names, which is a wrong answer rather than a slow one. `NaN !== NaN` makes an
+   *  owner that reports no folder version fall back to rebuilding, which is
+   *  exactly the old behaviour.
+   *
+   *  Building is O(visible notes), and a write moves the note set — so a caller
+   *  that writes and then asks for an exact table pays the corpus per write, which
+   *  is what made a bulk import quadratic. Such callers apply a BATCH and take
+   *  {@link batchIndex} instead; this one is for a single, settled answer. */
   buildIndex(): LinkIndex {
-    return buildLinkIndex(
-      this.graphVisibleNotes(),
-      this.folderAliases,
-      undefined,
-      this.currentFolders(),
-    )
+    const folders = this.currentFolders()
+    const key = {
+      notes: this.notes.version,
+      retractions: this.notes.retractions,
+      folders: this.foldersVersion(),
+      aliases: this.folderAliases,
+    }
+
+    if (
+      this.index &&
+      this.indexKey &&
+      this.indexKey.notes === key.notes &&
+      this.indexKey.folders === key.folders &&
+      this.indexKey.aliases === key.aliases
+    ) {
+      return this.index
+    }
+    this.index = buildLinkIndex(this.graphVisibleNotes(), this.folderAliases, undefined, folders)
+    this.indexKey = key
+
+    return this.index
+  }
+
+  /** The resolve table for a caller applying a BATCH of writes — an import
+   *  bracket, a delta poll — where rebuilding per note is the O(N²) the batch
+   *  exists to avoid.
+   *
+   *  It survives everything the batch does to notes it HOLDS — additions and
+   *  renames alike — and never survives an id LEAVING the map. That is the line
+   *  that matters: a table naming a note that is gone answers with an id nothing
+   *  can repair into a real edge, while a table naming a live note under a name it
+   *  just stopped bearing (or not yet naming the note that just took it) is stale
+   *  about WHICH live note — and the batch's close re-derives every source against
+   *  a fresh table, which is exactly the repair for that. Rebuilding per rename
+   *  instead would put the corpus back in the loop: a re-import of an archive whose
+   *  titles changed renames on every write, which is the same O(N²) the batch
+   *  exists to avoid, reached through the other door.
+   *
+   *  A NEW FOLDER is an addition too, and a batch that reproduces a directory tree
+   *  makes one per folder — so paying a rebuild for each would put the corpus back
+   *  in the loop, just counted in folders. The folder set reaches the table on two
+   *  axes: which note a `[[oldpath/note]]` belongs to (folder path-HISTORY, pass 3)
+   *  and which spelling a ghost offers to create into. Only the first can name the
+   *  wrong note, and it exists only when the space HAS folder history — so that is
+   *  the case that rebuilds, and a space with none rides the batch table across its
+   *  own new folders.
+   *
+   *  The bound, stated plainly, and it is NOT a symmetric tie: `buildLinkIndex`
+   *  ranks a current name strictly above an alias and orders claimants within an
+   *  axis by path, so an addition or a rename can take a key from a note whose
+   *  claim on it was strictly weaker — and until the close this table still hands
+   *  that key to the note that no longer holds it. Likewise a link to a note the
+   *  batch just added ghosts until the close, and a ghost minted mid-batch can
+   *  offer the folder spelling as AUTHORED where a fresh table would answer with
+   *  the spelling the batch just created on disk. The close settles all of it in
+   *  one pass — see `CachedStore.flushBulkGraphContext`. What does NOT settle is a
+   *  write's link CLAIM (see {@link resolvedTargetIds}), which is concurrency
+   *  control taken and released inside the batch. */
+  batchIndex(): LinkIndex {
+    if (
+      this.index &&
+      this.indexKey &&
+      this.indexKey.retractions === this.notes.retractions &&
+      this.indexKey.aliases === this.folderAliases &&
+      (!this.folderAliases.length || this.indexKey.folders === this.foldersVersion())
+    ) {
+      return this.index
+    }
+
+    return this.buildIndex()
   }
 
   /** Real note ids addressed by the authored body under the current resolver index.
    *  A write claims these ids so it cannot introduce a new inbound edge while the
    *  selected target is being deleted. Ghosts need no claim: no live resource owns
-   *  them yet. */
-  resolvedTargetIds(content: string): string[] {
+   *  them yet.
+   *
+   *  A batch caller passes its own table (see {@link batchIndex}), and what it
+   *  claims is therefore what that table says — which inside a batch can be the
+   *  note that held the name before the batch's own addition took it. The claim is
+   *  then taken on a live note that this write does not link, and the note it does
+   *  link goes unclaimed for the length of this one write. The exposure is that
+   *  window and nothing longer: the edge itself is re-derived against a fresh table
+   *  at the close, and a delete racing it re-reads the source bodies it finds
+   *  targeting the victim rather than trusting the edge projection
+   *  ({@link sourceIdsTargeting}). Buying the exact claim instead would mean the
+   *  exact table per write — the corpus per write, which is the cost this whole
+   *  channel exists to remove. */
+  resolvedTargetIds(content: string, batch?: LinkIndex): string[] {
     const labels = parseWikilinks(content)
 
     if (!labels.length) {
       return []
     }
-    const index = this.buildIndex()
+    const index = batch ?? this.buildIndex()
     const targets = new Set<string>()
 
     for (const label of labels) {
@@ -188,10 +300,12 @@ export class Snapshot {
     // ghost, never resolve into the hidden note. Folder path-aliases
     // let `[[oldpath/note]]` retarget after a folder rename.
     // Building the index is O(visible notes); a caller applying a BATCH (applyDelta
-    // over a large delta) builds it ONCE and passes it in, turning what was an
-    // O(N²) re-derive of the whole snapshot into O(N) (a 3k-note catch-up
-    // poll was a ~48s synchronous freeze before this). deferReresolve likewise lets
-    // the batch caller re-resolve ghosts ONCE at the end instead of per note.
+    // over a large delta, a write inside an import bracket) passes one table for the
+    // whole batch, turning what was an O(N²) re-derive of the whole snapshot into
+    // O(N) (a 3k-note catch-up poll was a ~48s synchronous freeze before this).
+    // deferReresolve likewise lets the batch caller re-resolve ghosts ONCE at the
+    // end instead of per note — and it is that ONE pass, over a fresh table, that
+    // pays back what a batch table was behind on. See `batchIndex`.
     const index = opts?.index ?? this.buildIndex()
     const { edges, ghosts } = deriveNoteEdges(sourceId, content, index, this.relationType)
 

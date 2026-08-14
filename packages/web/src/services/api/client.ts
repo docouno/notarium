@@ -43,6 +43,10 @@ export class ApiError extends Error {
   /** Field-level causes of a `reason: 'validation'` 400 — present so a form can
    *  point at the offending field; the generic message is the lead issue. */
   issues?: { path: string; message: string }[]
+  /** A synchronous import that failed AFTER writing some notes carries what it did
+   *  finish. The error is the outcome, but the notes are real — dropping this would
+   *  tell the user nothing happened. canon: docs/import.md#what-an-import-reports-302 */
+  partial?: ImportSummary
 }
 
 // The session-died hook (#10): a mid-flight 401 means the cookie is gone
@@ -147,19 +151,31 @@ export const req = async <T>(path: string, opts: RequestInit = {}): Promise<T> =
 /** The space-scoped route family's prefix. */
 export const sp = (space: string) => `/api/s/${encodeURIComponent(space)}`
 
+/** What a synchronous import's progress line carries. `imported` is the original
+ *  successful-write counter; `phase`/`done`/`total` ride alongside it so a Markdown
+ *  tree can draw a determinate bar (`total` stays null for everything else). */
+export type ImportProgressLine = {
+  imported: number
+  phase?: string
+  done?: number
+  total?: number | null
+}
+
 /** Read a synchronous-import NDJSON stream (the none-mode fallback of POST /import,
  *  #191): periodic `{type:'progress',imported}` heartbeats feed `onProgress`, a final
- *  `{type:'done',...summary}` resolves, a `{type:'error'}` rejects. The durable path
- *  never touches this — it returns a Job the caller tracks via jobGet/SSE instead. */
+ *  `{type:'done',...summary}` resolves, a `{type:'error'}` rejects — carrying any
+ *  bounded partial summary it came with. The durable path never touches this — it
+ *  returns a Job the caller tracks via jobGet/SSE instead. */
 const readImportStream = async (
   res: Response,
-  onProgress: (imported: number) => void,
+  onProgress: (progress: ImportProgressLine) => void,
 ): Promise<ImportSummary> => {
   const reader = res.body!.getReader()
   const decoder = new TextDecoder()
   let buf = ''
   let result: ImportSummary | null = null
   let failure: string | null = null
+  let partial: ImportSummary | undefined
 
   const handle = (line: string) => {
     const t = line.trim()
@@ -167,7 +183,15 @@ const readImportStream = async (
     if (!t) {
       return
     }
-    let msg: { type?: string; imported?: number; error?: string } & Record<string, unknown>
+    let msg: {
+      type?: string
+      imported?: number
+      phase?: string
+      done?: number
+      total?: number | null
+      error?: string
+      partial?: ImportSummary
+    } & Record<string, unknown>
 
     try {
       msg = JSON.parse(t)
@@ -175,11 +199,17 @@ const readImportStream = async (
       return
     }
     if (msg.type === 'progress') {
-      onProgress(msg.imported ?? 0)
+      onProgress({
+        imported: msg.imported ?? 0,
+        phase: msg.phase,
+        done: msg.done,
+        total: msg.total ?? null,
+      })
     } else if (msg.type === 'done') {
       result = msg as unknown as ImportSummary
     } else if (msg.type === 'error') {
       failure = msg.error || 'import failed'
+      partial = msg.partial
     }
   }
 
@@ -198,7 +228,11 @@ const readImportStream = async (
   buf += decoder.decode() // flush any trailing multibyte remainder
   handle(buf)
   if (failure) {
-    throw new ApiError(failure)
+    const err = new ApiError(failure)
+
+    err.partial = partial
+
+    throw err
   }
   if (!result) {
     throw new ApiError('import produced no result')
@@ -236,7 +270,10 @@ export const importStart = async (
   signal?: AbortSignal,
 ): Promise<
   | { mode: 'job'; job: Job }
-  | { mode: 'sync'; run: (onProgress: (imported: number) => void) => Promise<ImportSummary> }
+  | {
+      mode: 'sync'
+      run: (onProgress: (progress: ImportProgressLine) => void) => Promise<ImportSummary>
+    }
 > => {
   const form = new FormData()
 

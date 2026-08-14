@@ -85,7 +85,7 @@ PLAYWRIGHT_TEST_IMAGE ?= mcr.microsoft.com/playwright:v1.60.0-jammy
 
 .DEFAULT_GOAL := help
 .PHONY: help prepare deps deps-vector doctor dev up start down stop restart logs ps sh \
-        checkup audit-runtime test-coverage test-pg test-browser bench-session-audit backup restore backup-smoke seed seed-list \
+        checkup audit-runtime test-coverage test-pg test-browser import-bench bench-session-audit backup restore backup-smoke seed seed-list \
         footage demo-shots demo-preview demo-plates image release release-rc release-smoke save clean
 
 help: ## List available targets
@@ -247,6 +247,42 @@ test-pg: ## Run meta-DB contracts/migrations against ephemeral live Postgres
 	    --workdir /app -e HOME=/tmp \
 	    -e TEST_PG_URL=postgres://notarium:notarium@postgres:5432/notarium_test \
 	    --entrypoint npm "$(NODE_TEST_IMAGE)" run test:pg
+
+# --- import scale bench -----------------------------------------------------
+# The #302 scale artifact: 10 000 Markdown members through the production
+# composition (real server, real HTTP route, real durable job) into a data root
+# inside the container. Containerised for the same reason test-pg is — the numbers
+# are only comparable across runs if the Node, the dependency profile and the
+# filesystem underneath them are the same, and a bench that writes 10 000 notes has
+# no business doing it in the checkout. Correctness fails the run; timings are
+# printed, never asserted. NOTES trims the corpus for a quicker shape.
+NOTES ?= 10000
+import-bench: ## Run the Markdown-tree import scale bench in Docker: make import-bench [NOTES=10000]
+	@set -eu; \
+	  cleanup() { \
+	    docker rm -f $(CHECKUP_RUNNER_CONTAINER) >/dev/null 2>&1 || true; \
+	    docker volume rm -f $(CHECKUP_WORKSPACE_VOLUME) >/dev/null 2>&1 || true; \
+	  }; \
+	  trap cleanup EXIT INT TERM; \
+	  cleanup; \
+	  docker volume create $(CHECKUP_WORKSPACE_VOLUME) >/dev/null; \
+	  docker run --rm --name $(CHECKUP_RUNNER_CONTAINER) \
+	    --mount "type=bind,src=$(CURDIR),dst=/source,readonly" \
+	    --mount "type=volume,src=$(CHECKUP_WORKSPACE_VOLUME),dst=/app" \
+	    --entrypoint sh "$(NODE_TEST_IMAGE)" -c \
+	    "tar -C /source --exclude='./.git' --exclude='./.env' --exclude='./.data' \
+	      --exclude='./node_modules' --exclude='./packages/*/node_modules' \
+	      --exclude='./packages/*/dist' --exclude='./docker/volumes' \
+	      --exclude='./coverage' --exclude='./test-results' --exclude='./playwright-report' \
+	      -cf - . | tar -C /app -xf -"; \
+	  docker run --rm --name $(CHECKUP_RUNNER_CONTAINER) \
+	    --mount "type=volume,src=$(CHECKUP_WORKSPACE_VOLUME),dst=/app" \
+	    --workdir /app -e HOME=/tmp --entrypoint npm "$(NODE_TEST_IMAGE)" \
+	    run deps:lean; \
+	  docker run --rm --name $(CHECKUP_RUNNER_CONTAINER) \
+	    --mount "type=volume,src=$(CHECKUP_WORKSPACE_VOLUME),dst=/app" \
+	    --workdir /app -e HOME=/tmp -e NOTES=$(NOTES) \
+	    --entrypoint npm "$(NODE_TEST_IMAGE)" run bench:import-markdown-tree
 
 # --- session activity read-model benchmark ----------------------------------
 BENCH_PHASE ?= pre

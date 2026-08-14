@@ -33,6 +33,8 @@ sqlite/0005_revision_entry_role.sql
 sqlite/0006_revision_state.sql
 sqlite/0007_revision_purge_cas.sql
 sqlite/0008_causal_metadata.sql
+sqlite/0009_agent_activity.sql
+sqlite/0010_import_reservations.sql
 postgres/0000_baseline.sql
 postgres/0001_agent_sessions.sql
 postgres/0002_agent_session_role.sql
@@ -42,6 +44,8 @@ postgres/0005_revision_entry_role.sql
 postgres/0006_revision_state.sql
 postgres/0007_revision_purge_cas.sql
 postgres/0008_causal_metadata.sql
+postgres/0009_agent_activity.sql
+postgres/0010_import_reservations.sql
 ```
 
 `0001_agent_sessions` introduces durable agent episodes and separates each
@@ -163,6 +167,39 @@ one; asymmetric dialect assets are precedented by `0004`. The column is `NOT NUL
 written by an old process during it: its synthetic baselines count as edits, and a note
 BORN in that window reads as `edited` forever — inferring the role on read afterwards is
 exactly what this column abolishes.
+
+`0010_import_reservations` adds the two tables a Markdown-tree import claims its
+destinations in (#302). The header is keyed by `(space, upload_ref)` — the staged upload
+is immutable for the life of the job, so a retry of that job reserves once and adopts
+thereafter, while a DIFFERENT upload aiming at the same paths conflicts before the first
+write rather than half a tree in. Its `fence` is handed out on reserve/adopt and re-proved
+by every write, so a reclaimed job's newer fence is what stops the previous run's writes;
+`status` is `active` while the job may still write and `closing` once terminal cleanup
+began dropping it — a close is two statements in one synchronous step, so `closing` is a
+state only a process that DIED between them can leave behind, and reserve/adopt refuse
+such a row rather than reviving a claim already given up. The path table holds one row per
+planned destination, and its `UNIQUE (space, destination_path)` is the point of the
+migration: that one live reservation owns a path is stated by the database, not by a race.
+It is also how one claim is FOUND for a fenced write — that lookup addresses a row by
+`(space, destination_path)`, and the reservation is then a filter on the row that index
+returned rather than a scan of the batch. Whole-batch reads use the primary key whose
+leading column is `reservation_id`; using that predicate for the per-write lookup made every
+write cost the size of the import.
+Each row also carries what the plan settled — the id the path will get, the id it expected
+to already stand there, and whether that identity is this import's own or an existing
+note's merely referenced — but those three are DESCRIPTION, recorded per archive member so
+a claim can be read back and attributed. No write proves itself against them: the sidecar
+plan a run re-reads is the authority on ids. What this table arbitrates is the PATH, which
+is also why nothing here ever releases an identity.
+What the table deliberately does NOT have is a "the bytes landed"
+column: publishing the file and recording that fact are two writes with a crash window
+between them, so the flag could only repeat the question it was meant to answer. A row is
+a claim on a PATH; whether the previous attempt published is asked of the note at that
+path, by the retry, under the write's own compare-and-swap. Both dialects ship the same
+shapes so the shared persistence contract holds them to one behaviour. A space purge
+deletes its reservations directly: a header left pointing into a space that no longer
+exists would hold paths forever and keep terminal cleanup chasing a job row the same purge
+removed. See [import.md](import.md#who-owns-a-destination-while-the-import-runs).
 
 Role context presets reuse the baseline's existing `context_set_attachments`,
 `context_scope_pins`, and `context_order` tables with `target_kind='role'`. No new migration is

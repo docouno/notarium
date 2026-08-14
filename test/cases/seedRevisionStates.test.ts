@@ -2,10 +2,12 @@ import { Buffer } from 'node:buffer'
 import { describe, expect, it } from 'vitest'
 
 import { decodeDocumentState } from '@notarium/core'
+import { deterministicNoteId } from '@notarium/engine-memory'
 
 import { mergeWorlds } from './build'
 import { WorldBuilder } from './generators'
 import { materializeRevisionState } from './revisionStates'
+import { caseToFixture } from './toFixture'
 import type { RevisionStateDecl } from './types'
 
 const date = '2026-08-01T12:00:00.000Z'
@@ -87,6 +89,45 @@ describe('seed revision states (#275)', () => {
     expect(() => builder.revisionState({ ...declaration, state: { kind: 'gap' } })).toThrow(
       /conflicting revision state/,
     )
+  })
+
+  // #302: a case may PIN a note's physical id, because an authored
+  // `[[notarium-id:…]]` only resolves if the target really carries it. The pin has
+  // to reach every projection through the one rule — a revision state that derived
+  // its own id would file the row under a note nobody seeded AND stamp that other
+  // id into the state's own bytes, so the seeded restore would offer to restore a
+  // stranger's identity.
+  it('routes a pinned physical id through the revision-state projection too', () => {
+    const builder = new WorldBuilder(new Date('2026-08-12T12:00:00.000Z'))
+    builder.space({ slug: 'main' })
+    const note = builder.note({
+      space: 'main',
+      id: 'seedPinnedPhys1',
+      path: 'vault/index.md',
+      title: 'Vault index',
+      created: '2026-07-01T12:00:00.000Z',
+    })
+
+    builder.revisionState({ ...exactDeclaration, note })
+
+    const space = caseToFixture(builder.build()).spaces.find((s) => s.slug === 'main')!
+    const rows = space.activity ?? []
+
+    // The pin is not what the path would have derived, so a projection that
+    // re-derives is visibly wrong rather than accidentally right.
+    expect(deterministicNoteId('vault/index.md')).not.toBe('seedPinnedPhys1')
+    expect(space.notes.map((n) => n.id)).toEqual(['seedPinnedPhys1'])
+    // The create row AND the declared revision state address one note.
+    expect(rows.map((row) => row.noteId)).toEqual(['seedPinnedPhys1', 'seedPinnedPhys1'])
+
+    const state = rows.find((row) => row.stateBlobBase64)!
+    const source = decodeDocumentState(
+      Uint8Array.from(Buffer.from(state.stateBlobBase64!, 'base64')),
+    ).source
+
+    // The id is stamped INTO the seeded bytes (`{{noteId}}`), so it must be the
+    // pinned one there as well.
+    expect(new TextDecoder().decode(source)).toContain('notarium-id: "seedPinnedPhys1"')
   })
 
   it('namespaces dependencies and preserves case/declaration order when worlds merge', () => {

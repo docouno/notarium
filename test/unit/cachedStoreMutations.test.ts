@@ -19,6 +19,7 @@ import {
   type KnowledgeStore,
   type MoveInput,
   type StoreDelta,
+  type StoreEvent,
   type WriteInput,
 } from '@notarium/core'
 import { createNotariumStore } from '@notarium/engine'
@@ -2031,6 +2032,12 @@ for (const [name, createHarness] of variants) {
       gate.release()
       await expect(write).resolves.toMatchObject({ filePath: 'safe/after-late-failure.md' })
       await retry
+      // Exactly the failed boot call plus the reconcile's retry. The recovered
+      // boot ends with a fire-and-forget `void this.graph()`, but a store back in
+      // the ready phase shapes the graph from its own snapshot instead of asking
+      // the engine — so that refresh adds no call here, whenever it lands. The
+      // upper bound is half the point: re-deriving the engine graph more than
+      // once per recovery is exactly the cost this pins.
       expect(graph).toHaveBeenCalledTimes(2)
       expect(
         (await late.list()).some((note) => note.filePath === 'safe/after-late-failure.md'),
@@ -2281,6 +2288,68 @@ for (const [name, createHarness] of variants) {
   })
 }
 
+// A create that displaced a note and then FAILED still owes subscribers the
+// displacement: the read-model already dropped the occupant, so a client that never
+// hears about it keeps a note under an id nothing answers to. The frame is built
+// from a reconstructed "before" set, and the reconstruction earns its keep only if
+// the displaced id is actually in it.
+describe('CachedStore identity repair frame', () => {
+  let harness: Harness | undefined
+
+  afterEach(async () => {
+    await harness?.close()
+    harness = undefined
+  })
+
+  it('announces the note a failed create displaced', async () => {
+    // A path-keyed engine, because the read-model owns identity only there — on an
+    // identity-capable engine the displacement is the engine's to report.
+    harness = await createNotariumHarness()
+    const { store, inner } = harness
+    const displaced = await store.write({
+      title: 'Plan',
+      directory: 'docs',
+      content: 'the note that was standing here',
+    })
+    const events: StoreEvent[] = []
+
+    store.subscribe((event) => events.push(event))
+    // Fail the write AFTER it published — the post-write read is the first thing it
+    // does once the snapshot patch (and the displacement in it) has landed.
+    const read = inner.read.bind(inner)
+    let failNextRead = true
+
+    inner.read = async (key, opts) => {
+      if (failNextRead) {
+        failNextRead = false
+        throw new Error('post-write read failed')
+      }
+
+      return read(key, opts)
+    }
+
+    await expect(
+      store.write({
+        title: 'Plan',
+        directory: 'docs',
+        fileName: 'plan',
+        id: 'PlannedRepairAA',
+        ifExists: 'overwrite',
+        content: 'the newcomer',
+      }),
+    ).rejects.toThrow()
+    expect(failNextRead).toBe(false)
+    // The next durable identity flush is what publishes the pending repair.
+    await store.write({ title: 'Unrelated', directory: 'docs', content: 'x' })
+
+    expect(
+      events.some(
+        (event) => event.type === 'changed' && event.removed.includes(displaced.id as string),
+      ),
+    ).toBe(true)
+  })
+})
+
 describe('CachedStore create collisions — files the index has not seen', () => {
   let harness: Harness | undefined
 
@@ -2325,5 +2394,181 @@ describe('CachedStore create collisions — files the index has not seen', () =>
     expect(readFileSpy).not.toHaveBeenCalledWith(claimed, 'utf8')
     readFileSpy.mockRestore()
     expect(lstatSync(claimed).isSymbolicLink()).toBe(true)
+  })
+})
+
+// A bulk import defers the per-note ghost pass for the whole bracket and runs it
+// ONCE on close (#302) — otherwise every imported note re-resolves the whole
+// ghost registry and the import is quadratic again. What that trade owes back is
+// coherence AT the closing bracket: `endBulk()` returns a read-model an /api/graph
+// or /api/search reader can trust, not one that heals on the next poll.
+describe.each(variants)('CachedStore bulk ghost re-resolve — %s', (_name, createHarness) => {
+  /** Freeze the delta feed. The catch-up poll `endBulk()` fires would repair the
+   *  registry too, so without this the test cannot tell the bracket's own pass
+   *  from a poll that happened to win the race. */
+  const suspendDeltas = (inner: KnowledgeStore) => {
+    const changes = inner.changes.bind(inner)
+    const release = deferred()
+
+    inner.changes = async (cursor) => {
+      await release.promise
+
+      return changes(cursor)
+    }
+
+    return release.resolve
+  }
+
+  it('heals the deferred ghosts by the closing bracket when no folder appeared', async () => {
+    const h = await createHarness()
+    let resumeDeltas: (() => void) | undefined
+
+    try {
+      const source = await h.store.write({
+        title: 'Source',
+        directory: 'docs',
+        content: 'see [[Target]]',
+      })
+
+      expect((await h.store.graph()).nodes.some((node) => node.ghost)).toBe(true)
+      resumeDeltas = suspendDeltas(h.inner)
+      h.store.beginBulk()
+      // Into a folder that ALREADY exists — the import shape that leaves the
+      // bracket with no graph-context sources to rebuild. The corpus pass would
+      // have re-resolved the registry as a side effect; here nothing does but the
+      // deferred pass itself.
+      const target = await h.store.write({
+        title: 'Target',
+        directory: 'docs',
+        content: 'the note the link was waiting for',
+      })
+
+      await h.store.endBulk()
+
+      const graph = await h.store.graph()
+
+      expect(graph.nodes.some((node) => node.ghost)).toBe(false)
+      expect(graph.links).toContainEqual(
+        expect.objectContaining({ source: source.id, target: target.id }),
+      )
+    } finally {
+      resumeDeltas?.()
+      await h.close()
+    }
+  })
+
+  it('settles a name the bracket handed from one live note to another', async () => {
+    // The other half of what the batch table costs, and the half a ghost pass can
+    // never see: the link RESOLVED — to a live note that no longer holds the name.
+    // A note renamed away leaves its old title behind as an alias, and the resolver
+    // ranks a current title strictly above any note's alias, so a note created in
+    // the bracket under that title TAKES the name. Until the close the bracket's
+    // own table still hands it to the note holding only the alias, and nothing in
+    // the graph looks broken — the edge points at a real note, the wrong one.
+    const h = await createHarness()
+    let resumeDeltas: (() => void) | undefined
+
+    try {
+      const planned = await h.store.write({
+        title: 'Plan',
+        directory: 'docs',
+        content: 'the plan as it was',
+      })
+      const renamed = await h.store.write({
+        originalId: planned.id,
+        versionToken: (await h.store.read(planned.id!)).versionToken,
+        title: 'Retired Plan',
+        directory: 'docs',
+        content: 'the plan as it was',
+      })
+      // Written BEFORE the bracket, and right at the time it was written: the only
+      // note answering to `[[Plan]]` is the renamed one, through its alias.
+      const before = await h.store.write({
+        title: 'Before',
+        directory: 'docs',
+        content: 'see [[Plan]]',
+      })
+
+      expect((await h.store.graph()).links).toContainEqual(
+        expect.objectContaining({ source: before.id, target: renamed.id }),
+      )
+      resumeDeltas = suspendDeltas(h.inner)
+      h.store.beginBulk()
+      // Into the folder the notes above already created — no directory change, so
+      // nothing but the rule under test schedules the repair.
+      const fresh = await h.store.write({
+        title: 'Plan',
+        directory: 'docs',
+        fileName: 'fresh-plan',
+        content: 'the plan as it is now',
+      })
+      const during = await h.store.write({
+        title: 'During',
+        directory: 'docs',
+        content: 'see [[Plan]]',
+      })
+
+      await h.store.endBulk()
+
+      const graph = await h.store.graph()
+
+      // Both sources — the one written before the bracket and the one written
+      // inside it — end on the note that now bears the name.
+      expect(graph.links).toContainEqual(
+        expect.objectContaining({ source: before.id, target: fresh.id }),
+      )
+      expect(graph.links).toContainEqual(
+        expect.objectContaining({ source: during.id, target: fresh.id }),
+      )
+      expect(graph.links).not.toContainEqual(
+        expect.objectContaining({ source: during.id, target: renamed.id }),
+      )
+    } finally {
+      resumeDeltas?.()
+      await h.close()
+    }
+  })
+
+  it('heals a link between two notes the bracket itself created', async () => {
+    // The import's own shape, and what the write path's batch table costs: the
+    // bracket builds ONE resolve table, so a link to a note the bracket added after
+    // it ghosts on the way in — in both directions, since the table predates both
+    // notes. Nothing in the bracket resolves them; the single pass at the close is
+    // what does, and that is exactly what buys the write path an O(1) table.
+    const h = await createHarness()
+    let resumeDeltas: (() => void) | undefined
+
+    try {
+      // Into an EXISTING folder, so no directory change schedules a corpus-wide
+      // repair that would heal the graph for reasons of its own.
+      await h.store.write({ title: 'Seed', directory: 'docs', content: 'no links here' })
+      resumeDeltas = suspendDeltas(h.inner)
+      h.store.beginBulk()
+      const first = await h.store.write({
+        title: 'First',
+        directory: 'docs',
+        content: 'forward to [[Second]]',
+      })
+      const second = await h.store.write({
+        title: 'Second',
+        directory: 'docs',
+        content: 'back to [[First]]',
+      })
+
+      await h.store.endBulk()
+
+      const graph = await h.store.graph()
+
+      expect(graph.nodes.some((node) => node.ghost)).toBe(false)
+      expect(graph.links).toContainEqual(
+        expect.objectContaining({ source: first.id, target: second.id }),
+      )
+      expect(graph.links).toContainEqual(
+        expect.objectContaining({ source: second.id, target: first.id }),
+      )
+    } finally {
+      resumeDeltas?.()
+      await h.close()
+    }
   })
 })

@@ -127,6 +127,57 @@ export const importLayout: CaseSpec = {
       principal: 'user:sergey',
     })
 
+    // A Markdown TREE import (#302): a vault uploaded as a .zip, its folders
+    // reproduced verbatim under the chosen root — and its internal exact links
+    // repointed at the COPIES. The ids are pinned so the authored
+    // `[[notarium-id:…]]` below resolves on BOTH stands: the fake projects the
+    // pinned id into its snapshot, the real applier writes it through the store.
+    // The state this proves is the one a stale plan would get wrong — a link that
+    // still names the source corpus instead of what was actually imported.
+    const vaultIndexId = 'seedVaultIdx1'
+    const vaultTopicId = 'seedVaultTop1'
+
+    b.note({
+      space: 'main',
+      id: vaultIndexId,
+      path: 'vault/index.md',
+      title: 'Vault index',
+      content: [
+        '# Vault index',
+        '',
+        `The entry point of the imported vault — see [[notarium-id:${vaultTopicId}|Retrieval]].`,
+        '',
+        'A copy of that link inside code stays as authored:',
+        '',
+        '```md',
+        '[[notarium-id:source-corpus-id]]',
+        '```',
+      ].join('\n'),
+      tags: ['import', 'vault'],
+      frontmatter: 'source: obsidian',
+      created: daysBefore(now, 120, 8),
+      principal: 'user:sergey',
+    })
+    b.note({
+      space: 'main',
+      id: vaultTopicId,
+      path: 'vault/topics/retrieval.md',
+      title: 'Retrieval',
+      content: [
+        '# Retrieval',
+        '',
+        `Back to [[notarium-id:${vaultIndexId}]].`,
+        '',
+        'Nested exactly as the archive had it: `vault/topics/`.',
+      ].join('\n'),
+      tags: ['import', 'vault'],
+      created: daysBefore(now, 119, 8),
+      principal: 'user:sergey',
+    })
+    // The non-Markdown members of that same archive are NOT imported — they are
+    // counted and reported. Nothing to seed as a note; the state lives in the
+    // import job's summary (docs/import.md#what-an-import-reports-302).
+
     // A Claude project — a prompt-template + a doc under projects/<slug>/.
     b.note({
       space: 'main',

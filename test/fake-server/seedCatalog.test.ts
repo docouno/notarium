@@ -216,4 +216,41 @@ describe('seed catalog → fake backend (#175)', () => {
       await app.close()
     }
   })
+
+  // #302: a pinned physical id must be the SAME note on every surface the fake
+  // projects — the snapshot, the activity/history rows and the graph — or an
+  // authored `[[notarium-id:…]]` would resolve to a note nobody seeded.
+  it('import: a pinned physical id is one note across snapshot, links and history', async () => {
+    const world = buildCaseWorld('import', { now: DEFAULT_NOW })
+    const app = await createApp(caseToFixture(world))
+
+    try {
+      const notes = await json(app, '/api/s/main/notes?limit=200')
+      const index = (notes.notes as Array<{ id: string; filePath: string }>).find(
+        (n) => n.filePath === 'vault/index.md',
+      )!
+      const topic = (notes.notes as Array<{ id: string; filePath: string }>).find(
+        (n) => n.filePath === 'vault/topics/retrieval.md',
+      )!
+
+      // The pin reached the snapshot rather than the path-derived default.
+      expect(index.id).toBe('seedVaultIdx1')
+      expect(topic.id).toBe('seedVaultTop1')
+      expect(index.id).not.toBe(deterministicNoteId(index.filePath))
+      // The authored exact link resolves to the note it names — the proof the copy
+      // import's remap produces something the graph can actually follow.
+      const graph = await json(app, '/api/s/main/graph')
+      const edge = (graph.links as Array<{ source: string; target: string }>).find(
+        (l) => l.source === index.id && l.target === topic.id,
+      )
+
+      expect(edge).toBeTruthy()
+      // History addresses the same identity the snapshot published.
+      const history = await json(app, `/api/note/revisions?id=${index.id}`)
+
+      expect(history.total).toBeGreaterThan(0)
+    } finally {
+      await app.close()
+    }
+  })
 })

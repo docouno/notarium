@@ -15,6 +15,7 @@ import { createFavoritesFacet } from './drivers/sqlite/favorites'
 import { createFoldersFacet } from './drivers/sqlite/folders'
 import { createGatewayFacet } from './drivers/sqlite/gateway'
 import { createIdentityFacet } from './drivers/sqlite/identity'
+import { createImportReservationsFacet, withJobGuards } from './drivers/sqlite/importReservations'
 import { createInstallationGenerationFacet } from './drivers/sqlite/installationGeneration'
 import { createJobsFacet } from './drivers/sqlite/jobs'
 import { createOAuthFacet } from './drivers/sqlite/oauth'
@@ -198,6 +199,29 @@ export class SqliteMetaDb implements MetaDb {
 
   async purgeSpace(spaceId: string): Promise<void> {
     await this.ensureInit()
+    // Every import that still holds claims in this space (#302). One of them may be
+    // inside a fenced write RIGHT NOW, holding that job's guard across its physical
+    // write, and the erase below deletes the very claim that write proved itself
+    // against — so it queues behind the bytes instead of pulling the row out from
+    // under them. The Postgres twin gets the same exclusion for free: its
+    // `DELETE FROM import_reservations` waits on the header row the in-flight write
+    // holds FOR UPDATE. A reservation created AFTER this read is not covered, and is
+    // not covered on either dialect: neither orders a purge against an import that
+    // begins inside it.
+    const holders = (
+      this.required
+        .prepare('SELECT DISTINCT job_id FROM import_reservations WHERE space = ?')
+        .all(spaceId) as Array<{ job_id: string }>
+    ).map((row) => row.job_id)
+
+    await withJobGuards(holders, async () => {
+      this.eraseSpaceRows(spaceId)
+    })
+  }
+
+  /** The erase itself: ONE synchronous transaction, so once it starts nothing of
+   *  this process interleaves with it. */
+  private eraseSpaceRows(spaceId: string): void {
     const db = this.required
     db.exec('BEGIN IMMEDIATE')
     try {
@@ -262,6 +286,11 @@ export class SqliteMetaDb implements MetaDb {
       db.prepare('DELETE FROM owner_proof_receipts WHERE space = ?').run(spaceId)
       db.prepare('DELETE FROM note_owner_proofs WHERE space = ?').run(spaceId)
       db.prepare('DELETE FROM note_identity WHERE space = ?').run(spaceId)
+      // An import's destination claims die with the space they point into (#302).
+      // The claims cascade with the header; a row left behind would hold paths in a
+      // space that no longer exists, and its `activeJobIds` entry would keep the
+      // terminal-cleanup pass fetching a job row this method also deletes.
+      db.prepare('DELETE FROM import_reservations WHERE space = ?').run(spaceId)
       db.prepare('DELETE FROM restore_operations WHERE space = ?').run(spaceId)
       db.prepare('DELETE FROM causal_outbox WHERE space = ?').run(spaceId)
       // Legacy rows may carry a space/project id, current slug, or retired space
@@ -413,6 +442,8 @@ export class SqliteMetaDb implements MetaDb {
   // canon: docs/jobs.md#single-flight-the-hard-part
 
   readonly jobs = createJobsFacet(this.ctx)
+
+  readonly importReservations = createImportReservationsFacet(this.ctx)
 
   // ── revision journal facet ──────────────────────────────────────────
 

@@ -644,6 +644,23 @@ export type WriteInput = {
   /** Identity materialization channel: when set the engine writes it into frontmatter
    *  (`notarium-id`). Engines that can't ignore it. */
   id?: string
+  /** Host-internal PLANNED-DESTINATION guard, present only when a caller settled
+   *  a destination's identity ahead of the write (a Markdown-tree import).
+   *  Semantics apply only while the property is present:
+   *
+   *  - `null` — the plan expected a FREE path. The write publishes without
+   *    replacing anything; an occupant carrying the planned `id` is the same
+   *    plan replaying (a retry after a crash) and is allowed to converge.
+   *  - a string — the destination must already be owned by exactly that
+   *    identity. The body is replaced under a compare-and-swap; the identity is
+   *    not.
+   *
+   *  Any other outcome is a conflict, never a retarget: an import that quietly
+   *  wrote its note somewhere else, or over someone else's identity, is the
+   *  failure this channel exists to make impossible. Ordinary callers omit it
+   *  and keep the engine's existing create/overwrite behaviour.
+   *  canon: docs/import.md#importing-a-markdown-tree-302 */
+  expectedDestinationId?: string | null
   /** Destination-mount selector, host-internal (never on the create/update wire). The gateway sets
    *  it so remember_about_user writes into the agent-memory mount; the note's class is that mount's,
    *  ENFORCED. Ignored on edits. */

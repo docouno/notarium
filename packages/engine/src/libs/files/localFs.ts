@@ -3211,6 +3211,26 @@ export const createLocalFsFiles = (root: string): FileStore => {
       }
     },
 
+    dirExistsExact: async (rel) => {
+      await ensureRecovered()
+      if (!rel) {
+        return true
+      }
+      // The parent's own entry names are the only place the medium's REAL
+      // spelling is visible: `stat` resolves a case-folded name just as happily.
+      const cut = rel.lastIndexOf('/')
+      const parent = cut === -1 ? '' : rel.slice(0, cut)
+      const name = cut === -1 ? rel : rel.slice(cut + 1)
+
+      try {
+        const entries = await fs.readdir(abs(parent), { withFileTypes: true })
+
+        return entries.some((entry) => entry.isDirectory() && entry.name === name)
+      } catch {
+        return false
+      }
+    },
+
     dirExists: async (rel) => {
       await ensureRecovered()
       if (!rel) {

@@ -16,6 +16,7 @@ import { createFavoritesFacet } from './drivers/pg/favorites'
 import { createFoldersFacet } from './drivers/pg/folders'
 import { createGatewayFacet } from './drivers/pg/gateway'
 import { createIdentityFacet } from './drivers/pg/identity'
+import { createImportReservationsFacet } from './drivers/pg/importReservations'
 import { createInstallationGenerationFacet } from './drivers/pg/installationGeneration'
 import { createJobsFacet } from './drivers/pg/jobs'
 import {
@@ -274,6 +275,14 @@ export class PgMetaDb implements MetaDb {
         throw new Error(`space purge blocked by restore operation: ${blocker.rows[0].id}`)
       }
       await client.query('DELETE FROM note_identity WHERE space = $1', [spaceId])
+      // An import's destination claims die with the space they point into (#302).
+      // Between identity (L1) and favourites (L2a) because that is where L1r/L1p sit
+      // in the hierarchy; the claims themselves go by the ON DELETE CASCADE of
+      // migration 0010, which takes L1p after the header's L1r — the only order the
+      // ladder allows. A row left behind would hold paths in a space that no longer
+      // exists, and its `activeJobIds` entry would keep the terminal-cleanup pass
+      // fetching a job row this method also deletes.
+      await client.query('DELETE FROM import_reservations WHERE space = $1', [spaceId])
       await client.query('DELETE FROM favorites WHERE space = $1', [spaceId])
       await client.query(
         'DELETE FROM context_set_attachments WHERE target_space = $1 OR set_id IN (SELECT id FROM context_sets WHERE home_space = $1)',
@@ -459,6 +468,8 @@ export class PgMetaDb implements MetaDb {
 
   // canon: docs/jobs.md#single-flight-the-hard-part
   readonly jobs = createJobsFacet(this.ctx)
+
+  readonly importReservations = createImportReservationsFacet(this.ctx)
 
   readonly revisions = createRevisionsFacet(this.ctx)
 }

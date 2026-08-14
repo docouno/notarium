@@ -10,6 +10,8 @@ import { describeCausalMetadataContract } from './causalMetadataContract'
 import { describeFavoritesContract } from './favoritesContract'
 import { describeGatewayStateContract } from './gatewayStateContract'
 import { describeIdentityPersistenceContract } from './identityPersistenceContract'
+import { describeImportReservationsContract } from './importReservationsContract'
+import { describeJobsContract } from './jobsContract'
 import { describeRevisionPersistenceContract } from './revisionPersistenceContract'
 import { describeSessionAuditContract } from './sessionAuditContract'
 import { describeSpaceLifecycleWriterContract } from './spaceLifecycleWriterContract'
@@ -38,6 +40,21 @@ describeAgentSessionsContract('SQLite', async () => {
 describeFavoritesContract('SQLite', async () => {
   const db = new SqliteMetaDb(':memory:')
   return { persistence: db.favorites, teardown: () => db.close() }
+})
+
+describeImportReservationsContract('SQLite', async () => {
+  const db = new SqliteMetaDb(':memory:')
+  return {
+    reservations: db.importReservations,
+    jobs: db.jobs,
+    purgeSpace: (space) => db.purgeSpace(space),
+    teardown: () => db.close(),
+  }
+})
+
+describeJobsContract('SQLite', async () => {
+  const db = new SqliteMetaDb(':memory:')
+  return { jobs: db.jobs, teardown: () => db.close() }
 })
 
 // File-backed, unlike the contracts above: a settled quarantine is written by the

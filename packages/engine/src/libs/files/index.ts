@@ -15,6 +15,10 @@ export type {
   FileStrictStageResult,
   FileStrictStageState,
 } from './types'
+// The degradation, not the raw accelerator: callers ask the port which spellings
+// exist, and whether the adapter answers with shallow probes or with one walk is
+// settled inside the port, once.
+export { exactDirSpellings } from './dirSpelling'
 export { createLocalFsFiles } from './localFs'
 // The provider, not the primitive: composition asks whether this deployment can
 // do it, and the raw call is reachable only by module path. Leaving both on the

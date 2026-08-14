@@ -19,6 +19,11 @@ export class JobAbortedError extends Error {
 /** What a handler is handed for one job run. */
 export type JobContext = {
   job: JobRecord
+  /** The lease token THIS run holds in `locked_by` — unique per claim, so a
+   *  reap-and-reclaim gives the new run a different one. A handler that mutates
+   *  durable state outside the job row proves ownership with it; `job.lockedBy`
+   *  is the same value but nullable, and a handler must not have to guess. */
+  lease: string
   /** Push progress + keep the lock alive. Throws JobAbortedError on cancel/reap —
    *  handlers must let it propagate (don't swallow). */
   report(p: { done: number; total?: number | null; phase?: string | null }): Promise<void>
@@ -44,6 +49,18 @@ export type JobRunnerOptions = {
   /** The runner claims only kinds present here. */
   handlers: Record<string, JobHandler>
   onUpdate?: (job: JobRecord) => void
+  /** Consumer cleanup for jobs that have REACHED a terminal state. Called at two
+   *  moments, and both are needed: once per maintenance tick (right after the reaper
+   *  and, deliberately, before retention prune — the last moment a terminal row
+   *  still exists to be read), and once immediately after THIS runner persists a
+   *  terminal transition of its own. The tick alone is a net for crashes, but it is
+   *  a minute wide, and for a whole minute after a cancel the import contour still
+   *  refused the destinations that cancel had just released (#302).
+   *
+   *  It must therefore be idempotent — it re-reads what is still open, so a close
+   *  that already happened finds nothing — and it must not throw a job's outcome
+   *  away: a failure here is logged, never propagated. */
+  onTerminalCleanup?: () => Promise<void>
   /** Consumer housekeeping run AFTER the built-in reap/GC/prune/temp-sweep each tick.
    *  Best-effort; a throw is logged, not fatal. */
   onMaintenance?: () => void | Promise<void>
@@ -139,6 +156,24 @@ export const createJobRunner = (opts: JobRunnerOptions): JobRunner => {
     }
   }
 
+  /** Hand the consumers a job that has just ENDED, the moment its terminal row is
+   *  durable. The maintenance tick runs the very same pass and remains the net for
+   *  a process that dies in this window; what this call removes is the wait, which
+   *  was a whole maintenance interval of holding what the job no longer owns.
+   *
+   *  Deliberately fire-and-log: the row is already terminal, and a cleanup that
+   *  threw here would surface as a failure of a job that did not fail. */
+  const afterTerminal = async (): Promise<void> => {
+    if (!opts.onTerminalCleanup) {
+      return
+    }
+    try {
+      await opts.onTerminalCleanup()
+    } catch (err) {
+      log('terminal cleanup failed', err)
+    }
+  }
+
   /** Claim as many runnable jobs as free slots allow, launching each. */
   const claimLoop = async (): Promise<void> => {
     if (claiming || !running || shuttingDown || !kinds.length) {
@@ -185,9 +220,13 @@ export const createJobRunner = (opts: JobRunnerOptions): JobRunner => {
 
     if (!handler) {
       // Defensive: we only claim known kinds, so this is unreachable. Fail loudly
-      // rather than loop the row forever.
+      // rather than loop the row forever — and hand the consumers the terminal row
+      // like every other terminal transition of this runner. Unreachable is not a
+      // licence to owe a promise the docblock makes without exception: the moment
+      // this branch ever ran, its row would be the one terminal row nothing closed.
       await jobs.fail(job.id, lease, { error: `no handler for kind ${job.kind}`, now: nowIso() })
       notify(await jobs.get(job.id))
+      await afterTerminal()
       return
     }
 
@@ -224,6 +263,7 @@ export const createJobRunner = (opts: JobRunnerOptions): JobRunner => {
 
     const ctx: JobContext = {
       job,
+      lease,
       signal: controller.signal,
       artifacts,
       report: async (p) => {
@@ -276,6 +316,11 @@ export const createJobRunner = (opts: JobRunnerOptions): JobRunner => {
         await artifacts.remove(out.artifactRef).catch(() => {})
       }
       notify(current)
+      // The row is terminal when `ok` — and when it is not, it was taken by a
+      // cancel (terminal too) or by a reap (not terminal at all). The cleanup reads
+      // the row rather than trusting this call, which is what lets one unconditional
+      // call cover every one of those without a second predicate to keep in step.
+      await afterTerminal()
     } catch (err) {
       // Shutdown: release the job (refunds the claim's attempt bump) so the restart/peer
       // resumes it without burning the retry budget.
@@ -287,8 +332,12 @@ export const createJobRunner = (opts: JobRunnerOptions): JobRunner => {
       const current = await jobs.get(job.id).catch(() => null)
 
       // Canceled out from under us — the row is already terminal; just report it.
+      // A cancel is the case this matters most for: the user cancels an import and
+      // starts it again, and until the claims that cancel released are closed the
+      // second run is refused its own destinations.
       if (current?.status === 'canceled' || err instanceof JobAbortedError) {
         notify(current)
+        await afterTerminal()
         return
       }
       const message = err instanceof Error ? err.message : String(err)
@@ -296,8 +345,11 @@ export const createJobRunner = (opts: JobRunnerOptions): JobRunner => {
       // TerminalJobError = deterministic bad input — fail NOW, no retry/backoff (a re-run
       // fails identically; surface the real error immediately).
       if (err instanceof TerminalJobError) {
-        await jobs.fail(job.id, lease, { error: message, now: nowIso() })
+        // A terminal failure may carry what the run finished before it failed;
+        // a retryable one below never does.
+        await jobs.fail(job.id, lease, { error: message, now: nowIso(), result: err.result })
         notify(await jobs.get(job.id).catch(() => null))
+        await afterTerminal()
         return
       }
       log(`job ${job.id} (${job.kind}) failed: ${message}`)
@@ -312,6 +364,10 @@ export const createJobRunner = (opts: JobRunnerOptions): JobRunner => {
         await jobs.fail(job.id, lease, { error: message, now: nowIso() })
       }
       notify(await jobs.get(job.id).catch(() => null))
+      // Only the exhausted branch above is terminal; a retryable failure leaves the
+      // row pending, and the cleanup reads the row rather than this branch — which
+      // is why one call covers both without a second predicate to keep in step.
+      await afterTerminal()
       return
     } finally {
       controller.signal.removeEventListener('abort', stopHeartbeat)
@@ -341,6 +397,11 @@ export const createJobRunner = (opts: JobRunnerOptions): JobRunner => {
     } catch (err) {
       log('reapStale failed', err)
     }
+    // Terminal cleanup before anything reclaims rows or files: a reservation is
+    // closed only once its job is observably terminal, and the proof is that row.
+    // The same pass a terminal transition runs directly — this tick is what covers
+    // the runs that ended without one (a crashed worker, a reaped row).
+    await afterTerminal()
     // Delete the file, THEN clear the pointer — clearing on a failed unlink would orphan
     // the file forever (findExpired only returns rows that still carry a ref).
     try {
@@ -358,11 +419,7 @@ export const createJobRunner = (opts: JobRunnerOptions): JobRunner => {
     } catch (err) {
       log('artifact GC failed', err)
     }
-    try {
-      await jobs.prune(new Date(nowDate().getTime() - cfg.retentionMs).toISOString())
-    } catch (err) {
-      log('prune failed', err)
-    }
+
     // Sweep orphaned per-run temp parts (`*.part`) — no row references a temp, so only an
     // age-based fs sweep reclaims them.
     try {
@@ -376,6 +433,16 @@ export const createJobRunner = (opts: JobRunnerOptions): JobRunner => {
       } catch (err) {
         log('onMaintenance failed', err)
       }
+    }
+    // Retention runs LAST of the row-touching steps. Everything above needs the
+    // terminal row: the reservation close reads it to know the job ended, and the
+    // staging sweep reads it to know an upload is orphaned. Pruning first would
+    // delete the evidence they run on — and the drivers refuse it a second time,
+    // skipping any row a live reservation still references.
+    try {
+      await jobs.prune(new Date(nowDate().getTime() - cfg.retentionMs).toISOString())
+    } catch (err) {
+      log('prune failed', err)
     }
   }
 

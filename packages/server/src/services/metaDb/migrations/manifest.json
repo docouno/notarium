@@ -70,6 +70,13 @@
       "checksum": "sha256:217b95da88599baa7ad42fc4445dcda37066f0ac92853e378b2a09509e6356e7",
       "sqlite": "sqlite/0009_agent_activity.sql",
       "postgres": "postgres/0009_agent_activity.sql"
+    },
+    {
+      "version": 10,
+      "name": "import_reservations",
+      "checksum": "sha256:7a787a094f76b2be9278b3b3208202e40de598fcd51d08ea60c8ac16e30c54f3",
+      "sqlite": "sqlite/0010_import_reservations.sql",
+      "postgres": "postgres/0010_import_reservations.sql"
     }
   ]
 }

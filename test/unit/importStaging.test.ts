@@ -102,3 +102,166 @@ describe('createFsImportStagingStore (#191)', () => {
     expect((await readdir(join(root, 'S'))).some((n) => n.endsWith('.part'))).toBe(false)
   })
 })
+
+// The plan sidecar (#302): a Markdown-tree import freezes its decisions beside
+// its upload, so a re-claimed job replays the SAME plan instead of deciding
+// again. Publication is atomic and no-clobber — that is what makes "the first
+// plan wins" true for two workers racing one job rather than a hope.
+describe('the import plan sidecar (#302)', () => {
+  const PLAN = { version: 1 as const, uploadRef: 'S/job.import', entries: ['a.md'] }
+
+  it('publishes a plan beside its upload and reads it back', async () => {
+    const store = createFsImportStagingStore(freshRoot())
+    const ref = await store.stage('S', 'job', stream('zip'))
+
+    expect(await store.readPlan(ref)).toBeNull()
+    expect(await store.publishPlan(ref, 'lease-1', PLAN)).toEqual(PLAN)
+    expect(await store.readPlan(ref)).toEqual(PLAN)
+  })
+
+  it('leaves no temp behind, and the loser of a race adopts the winner’s plan', async () => {
+    const root = freshRoot()
+    const store = createFsImportStagingStore(root)
+    const ref = await store.stage('S', 'job', stream('zip'))
+    const first = await store.publishPlan(ref, 'lease-1', PLAN)
+    const second = await store.publishPlan(ref, 'lease-2', { ...PLAN, entries: ['b.md'] })
+
+    // The second publisher does NOT replace the canonical plan; it receives it.
+    expect(first).toEqual(PLAN)
+    expect(second).toEqual(PLAN)
+    expect((await readdir(join(root, 'S'))).sort()).toEqual(['job.import', 'job.import-plan'])
+  })
+
+  it('treats a truncated or foreign sidecar as absent rather than as data', async () => {
+    const store = createFsImportStagingStore(freshRoot())
+    const ref = await store.stage('S', 'job', stream('zip'))
+
+    await store.publishPlan(ref, 'lease-1', PLAN)
+    const planPath = store.pathOf(ref).replace(/\.import$/, '.import-plan')
+
+    // Half a file: the envelope's digest is exactly what makes this detectable.
+    writeFileSync(planPath, readFileSync(planPath, 'utf8').slice(0, 40))
+    expect(await store.readPlan(ref)).toBeNull()
+
+    writeFileSync(planPath, JSON.stringify({ version: 2, digest: 'x', plan: PLAN }))
+    expect(await store.readPlan(ref)).toBeNull()
+  })
+
+  // The envelope's whole purpose. A sidecar can be well-formed JSON of the right
+  // version and still not be the bytes we fsynced — that is what a torn or
+  // tampered file looks like — and reinterpreting it is the silent divergence the
+  // plan exists to prevent. Only the digest can tell the two apart.
+  it('treats a well-formed envelope whose digest does not match as absent', async () => {
+    const store = createFsImportStagingStore(freshRoot())
+    const ref = await store.stage('S', 'job', stream('zip'))
+
+    await store.publishPlan(ref, 'lease-1', PLAN)
+    const planPath = store.pathOf(ref).replace(/\.import$/, '.import-plan')
+    const envelope = JSON.parse(readFileSync(planPath, 'utf8')) as {
+      version: number
+      digest: string
+      plan: typeof PLAN
+    }
+
+    // Same digest, a different plan under it: a swapped payload reads as valid
+    // JSON of a version we know, and nothing but the hash notices.
+    writeFileSync(
+      planPath,
+      JSON.stringify({ ...envelope, plan: { ...PLAN, entries: ['tampered.md'] } }),
+    )
+    expect(await store.readPlan(ref)).toBeNull()
+  })
+
+  // No-clobber decides between plans the caller can EXECUTE. A sidecar it cannot
+  // is a different question, and answering it the same way made the upload
+  // unpublishable for good: the rewrite was refused, the read-back handed the
+  // refused plan straight back, and every retry repeated that forever.
+  it('replaces a published plan the caller refuses, and adopts one it accepts', async () => {
+    const root = freshRoot()
+    const store = createFsImportStagingStore(root)
+    const ref = await store.stage('S', 'job', stream('zip'))
+    const older = { ...PLAN, entries: ['from-an-older-build.md'] }
+    const accepts = (published: unknown): boolean =>
+      (published as typeof PLAN).entries[0] !== 'from-an-older-build.md'
+
+    expect(await store.publishPlan(ref, 'lease-1', older)).toEqual(older)
+    // Refused ⇒ replaced: what the rebuilt run publishes is what stands on disk.
+    const rebuilt = { ...PLAN, entries: ['rebuilt.md'] }
+
+    expect(await store.publishPlan(ref, 'lease-2', rebuilt, accepts)).toEqual(rebuilt)
+    expect(await store.readPlan(ref)).toEqual(rebuilt)
+    // Accepted ⇒ canonical, exactly as before: a peer of the same build never
+    // replaces a plan it could have executed itself.
+    const third = { ...PLAN, entries: ['third.md'] }
+
+    expect(await store.publishPlan(ref, 'lease-3', third, accepts)).toEqual(rebuilt)
+    expect(await store.readPlan(ref)).toEqual(rebuilt)
+    // And the replacement leaves no temp behind either.
+    expect((await readdir(join(root, 'S'))).sort()).toEqual(['job.import', 'job.import-plan'])
+  })
+
+  // The same dead end without a caller predicate at all: bytes this store cannot
+  // read back are not a plan, and holding the name against every rewrite is how a
+  // torn sidecar outlived the job it belonged to.
+  it('replaces a sidecar whose bytes no longer read back as a plan', async () => {
+    const store = createFsImportStagingStore(freshRoot())
+    const ref = await store.stage('S', 'job', stream('zip'))
+
+    await store.publishPlan(ref, 'lease-1', PLAN)
+    const planPath = store.pathOf(ref).replace(/\.import$/, '.import-plan')
+
+    writeFileSync(planPath, readFileSync(planPath, 'utf8').slice(0, 40))
+    expect(await store.readPlan(ref)).toBeNull()
+    expect(await store.publishPlan(ref, 'lease-2', PLAN)).toEqual(PLAN)
+    expect(await store.readPlan(ref)).toEqual(PLAN)
+  })
+
+  it('sweeps the plan with its upload, and a plan temp by age alone', async () => {
+    const root = freshRoot()
+    const store = createFsImportStagingStore(root)
+    const liveRef = await store.stage('S', 'live', stream('zip'))
+    const deadRef = await store.stage('S', 'dead', stream('zip'))
+
+    await store.publishPlan(liveRef, 'lease-1', PLAN)
+    await store.publishPlan(deadRef, 'lease-1', PLAN)
+    const orphanTemp = store.pathOf('S/crashed.import-plan.part-lease-9')
+
+    writeFileSync(orphanTemp, '{"half":')
+    const mtime = statSync(orphanTemp).mtimeMs
+
+    await store.sweepOrphans(async (id) => id === 'live', mtime + 5 * 60_000)
+    // The live job keeps BOTH: a retry needs the upload and the plan together.
+    expect((await readdir(join(root, 'S'))).sort()).toEqual([
+      'crashed.import-plan.part-lease-9',
+      'live.import',
+      'live.import-plan',
+    ])
+    await store.sweepOrphans(async (id) => id === 'live', mtime + 2 * 60 * 60_000)
+    expect((await readdir(join(root, 'S'))).sort()).toEqual(['live.import', 'live.import-plan'])
+  })
+
+  // Upload, plan AND plan temps: a publisher that crashed between writing its
+  // temp and linking it leaves one behind, and it belongs to this upload as much
+  // as the plan does. Removing only the two named files handed it to the age
+  // sweep — an hour of a file whose owner is already gone.
+  it('removes the plan and any crashed plan temp when its upload is removed', async () => {
+    const root = freshRoot()
+    const store = createFsImportStagingStore(root)
+    const ref = await store.stage('S', 'job', stream('zip'))
+    const otherRef = await store.stage('S', 'other', stream('zip'))
+
+    await store.publishPlan(ref, 'lease-1', PLAN)
+    writeFileSync(store.pathOf('S/job.import-plan.part-lease-9'), '{"half":')
+    writeFileSync(store.pathOf('S/other.import-plan.part-lease-9'), '{"half":')
+    await store.remove(ref)
+
+    // Another job's temp is not ours to reclaim — the two share a directory, not
+    // a lifetime.
+    expect(await readdir(join(root, 'S'))).toEqual([
+      'other.import',
+      'other.import-plan.part-lease-9',
+    ])
+    await store.remove(otherRef)
+    expect(await readdir(join(root, 'S'))).toEqual([])
+  })
+})

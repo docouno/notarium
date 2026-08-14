@@ -11,6 +11,7 @@ import type {
   WriteResult,
 } from '../../../knowledgeStore'
 import {
+  destinationOwnerConflict,
   noteAlreadyExists,
   noteNotFound,
   StoreError,
@@ -51,6 +52,7 @@ import {
 import { effectiveSlug, slugify, storedSlug } from '../../../libs/slug'
 import { normTags } from '../../../libs/tags'
 import { computeVersionToken } from '../../../libs/versionToken'
+import type { LinkIndex } from '../../../referenceResolver'
 import { derivePreview } from '../../../snippet'
 import { DEFAULT_NOTE_CLASS, isVisibleOn, SURFACE } from '../../../visibility'
 import { TRASH_MUTATION_PREFIX, trashMutationPath } from '../../consts'
@@ -421,15 +423,42 @@ export class WriteEngine {
   }
 
   /** The note already living at a create's destination, or undefined. Snapshot-only:
-   *  an unindexed file on disk is the engine's to catch. */
+   *  an unindexed file on disk is the engine's to catch.
+   *
+   *  Answered from the snapshot's own path index, not by walking it. Every write
+   *  asks this — the planned-destination guard, the collision policy, each step of
+   *  the uniquify series — so a walk here is O(notes in the space) PER WRITE, which
+   *  is the term that made an import quadratic from the read-model's side. The
+   *  registry's `idFor` would be O(1) too but is not the same fact: with an
+   *  identity-capable engine the registry is the ENGINE's, and the read-model's own
+   *  copy is empty — the snapshot is the one answer that holds in both wirings. */
   private occupantOf(path: string, exceptId?: string): ExistingNote | undefined {
-    for (const [id, meta] of this.host.snap.notes) {
-      if (meta.filePath === path && id !== exceptId) {
+    for (const id of this.host.snap.notes.idsAt(path)) {
+      const meta = id === exceptId ? undefined : this.host.snap.notes.get(id)
+
+      // The meta itself still has to SAY it lives here. The index and the metas are
+      // two structures kept in step by one class, and this answer is not merely
+      // reported to a caller — the guard refuses on it and `applyWrite` DELETES the
+      // note it names. A free comparison is the difference between a desynchronised
+      // index costing a stale refusal and it costing the wrong note.
+      if (meta && meta.filePath === path) {
         return { id, title: meta.title, filePath: meta.filePath }
       }
     }
 
     return undefined
+  }
+
+  /** The resolve table a write derives its edges and its link claims against.
+   *  Inside an import bracket that is the BATCH table — it may lag the bracket's own
+   *  additions and renames, and the bracket's close is what settles them: one
+   *  deferred ghost pass for the links that resolved to nothing, one re-derivation
+   *  of every source for the links that resolved to the wrong live note (see
+   *  `Snapshot.batchIndex` and `CachedStore.flushBulkGraphContext`). Outside one,
+   *  undefined: a lone write gets the exact table, and its links resolve the instant
+   *  it returns. */
+  private resolveIndex(): LinkIndex | undefined {
+    return this.host.isBulkActive() ? this.host.snap.batchIndex() : undefined
   }
 
   private writeClaim(input: WriteInput) {
@@ -440,7 +469,7 @@ export class WriteEngine {
       : (input.targetClass ?? DEFAULT_NOTE_CLASS)
     const linkedTargetIds =
       input.content !== undefined && isVisibleOn(SURFACE.graph, sourceClass ?? DEFAULT_NOTE_CLASS)
-        ? this.host.snap.resolvedTargetIds(input.content)
+        ? this.host.snap.resolvedTargetIds(input.content, this.resolveIndex())
         : []
     const sourceKey = input.originalId ?? input.id ?? predictedPath
     const destinationDirectory = directoryOf(predictedPath)
@@ -470,6 +499,36 @@ export class WriteEngine {
     const currentPath = input.originalId ? this.pathFor(input.originalId) : undefined
     const predictedPath = this.predictedPath(input, currentPath)
 
+    // The planned-destination guard belongs to the layer that knows which NOTE a
+    // path holds, and this is that layer. An engine can only ask the FILE what it
+    // claims, and a file whose claim has not been materialised yet answers nothing —
+    // which is how the two engines came to read the same situation differently. The
+    // read-model is also the very view the plan was built from (`list()` after a
+    // forced checkpoint), so the guard re-checks the plan's own premise. The engine
+    // still re-proves it under its publishing swap: that check is about the race,
+    // this one is about the owner. It runs BEFORE the collision policy below, so a
+    // `skipExisting` import refuses a destination that changed hands instead of
+    // reporting it as a note it skipped.
+    // canon: docs/import.md#importing-a-markdown-tree-302
+    if (input.expectedDestinationId !== undefined) {
+      const owner = this.occupantOf(predictedPath)?.id ?? null
+
+      if (input.expectedDestinationId === null) {
+        // The plan expected a free path. An owner that is this very plan's id is the
+        // same plan replaying after a crash; anything else appeared since planning.
+        if (owner !== null && owner !== input.id) {
+          throw destinationOwnerConflict(
+            predictedPath,
+            `is owned by ${owner}; the import planned to create it`,
+          )
+        }
+      } else if (owner !== input.expectedDestinationId) {
+        throw destinationOwnerConflict(
+          predictedPath,
+          owner ? `is owned by ${owner}, not ${input.expectedDestinationId}` : 'no longer exists',
+        )
+      }
+    }
     if (!input.originalId && input.ifExists !== IF_EXISTS.overwrite) {
       const occupant = this.occupantOf(predictedPath, input.id)
 
@@ -634,7 +693,6 @@ export class WriteEngine {
       }
     }
     const releaseGraphTransition = this.host.beginGraphTransition()
-    const identityBefore = !input.originalId ? new Set(this.host.snap.notes.keys()) : undefined
     const releaseIdentityPublication = !input.originalId
       ? this.host.beginIdentityPublication()
       : undefined
@@ -643,6 +701,9 @@ export class WriteEngine {
     let restoreResult: WriteResult | undefined
     let restoreVersionToken: string | undefined
     let trashRestoreJournalCommitted = false
+    // The notes this write displaced off its destination — the failure path below
+    // needs them to say what it took away.
+    const removed: string[] = []
 
     try {
       const result = await this.host.inner.write({
@@ -654,7 +715,6 @@ export class WriteEngine {
       restoreResult = result
       restoreVersionToken = result.versionToken
       const publishAfterIdentityFlush = !input.originalId && !this.host.isBulkActive()
-      const removed: string[] = []
 
       const publishWrite = async () => {
         let directoryChanged = false
@@ -730,8 +790,9 @@ export class WriteEngine {
       // Flush a fresh id before answering: a create's id may be resolved in the very next request,
       // but global id→space resolution reads the meta-DB, not this write-behind registry, so a read
       // that beat the flush would 404 a note that exists. Updates skip it (already durable). Bulk
-      // import skips the per-note flush (a starvation source) — broadcastBulk flushes the
-      // registry before each coalesced `changed` instead, so durability tracks visibility.
+      // import skips the per-note flush (a starvation source) — the bulk controller's
+      // broadcast flushes the registry before each coalesced `changed` instead, so
+      // durability tracks visibility.
       if (publishAfterIdentityFlush) {
         await this.host.flushIdentityPublication()
         if (result.filePath) {
@@ -779,8 +840,17 @@ export class WriteEngine {
       if (trashRestoreJournalCommitted) {
         this.host.reconcileSoon()
       }
-      if (identityPublicationPending && identityBefore) {
-        this.host.rememberIdentityRepair(identityBefore)
+      if (identityPublicationPending) {
+        // A stand-in for the id set as it was BEFORE this create — reconstructed
+        // here rather than copied up front, because "up front" meant copying the
+        // whole corpus on every successful write to serve a branch only a failure
+        // reaches. It is NOT that set: the map moved under it while this write was
+        // awaiting. What the frame derives from it is `before \ current`, so the
+        // union above resolves to exactly the notes THIS write displaced and did not
+        // put back — which is what the frame owes its subscribers. A note some other
+        // writer deleted meanwhile is in neither term and is not reported here; that
+        // writer publishes its own frame.
+        this.host.rememberIdentityRepair(new Set([...this.host.snap.notes.keys(), ...removed]))
       }
       throw failure
     } finally {
@@ -1471,9 +1541,12 @@ export class WriteEngine {
       this.host.identity.markMaterialized(id)
     } else {
       // The engine owns identity; still surface a displaced note when the
-      // write upserted onto a path another snapshot entry held.
-      for (const [otherId, meta] of this.host.snap.notes) {
-        if (otherId !== id && meta.filePath === newPath) {
+      // write upserted onto a path another snapshot entry held. Asked of the path
+      // index rather than by walking the snapshot: this runs on every write, and
+      // the answer is almost always "nobody". The copy is because the loop body
+      // unbinds the very list it reads.
+      for (const otherId of [...this.host.snap.notes.idsAt(newPath)]) {
+        if (otherId !== id) {
           this.host.snap.notes.delete(otherId)
           this.host.previewCache.delete(otherId)
           this.host.snap.edgesBySource.delete(otherId)
@@ -1587,7 +1660,19 @@ export class WriteEngine {
     const directoryChanged = this.host.dirs.add(directoryOf(newPath))
     // Directory context is part of the resolver index, so add it before deriving
     // even this note's own outbound edges.
-    this.host.snap.patchNoteEdges(id, input.content ?? '')
+    // Ghost re-resolution walks EVERY ghost and, when one resolves, every
+    // source's edges — so per note it is O(corpus). A bulk import closes a ghost
+    // on almost every write (each new note is the target the previous one linked
+    // forward to), which made an import quadratic. Bulk already coalesces the
+    // graph and re-derives it once at the end; the ghost pass joins it there.
+    // The table this derives against joins it too: taking the exact one here
+    // rebuilt it on every write — the note the write just published moved the very
+    // counter the memo is keyed on — so the corpus was walked per note anyway, one
+    // layer down from the loop that was fixed. Under the bracket both halves defer.
+    this.host.snap.patchNoteEdges(id, input.content ?? '', {
+      index: this.resolveIndex(),
+      deferReresolve: this.host.isBulkActive(),
+    })
     removedOut?.push(...removed)
 
     if (publish) {

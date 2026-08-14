@@ -9,6 +9,16 @@ import { namePathKey } from '../../../libs/slug'
  *  @see docs/core.md#list-layer */
 export class DirectoryIndex {
   private readonly dirs = new Set<string>()
+  /** Bumped by every mutation that really moves the folder SET. Derived state
+   *  keyed on that set (the wikilink resolve table) memoizes against it instead
+   *  of rebuilding, so a change this counter misses is not a slow read but a
+   *  silently wrong one. */
+  private revision = 0
+
+  /** How many times this index changed. Only equality matters. */
+  get version(): number {
+    return this.revision
+  }
 
   /** Add a directory path AND its ancestors. Idempotent; dot-namespaced dirs
    *  (the agent-mount) are never tracked (mirror localFs). */
@@ -22,6 +32,9 @@ export class DirectoryIndex {
     for (const part of dir.split('/')) {
       acc = acc ? `${acc}/${part}` : part
       this.dirs.add(acc)
+    }
+    if (this.dirs.size !== before) {
+      this.revision++
     }
 
     return this.dirs.size !== before
@@ -44,6 +57,7 @@ export class DirectoryIndex {
   }
 
   clear(): void {
+    this.revision++
     this.dirs.clear()
   }
 
@@ -57,6 +71,9 @@ export class DirectoryIndex {
       if (d === path || d.startsWith(prefix)) {
         this.dirs.delete(d)
       }
+    }
+    if (this.dirs.size !== before) {
+      this.revision++
     }
 
     return this.dirs.size !== before
@@ -76,6 +93,18 @@ export class DirectoryIndex {
     }
     this.add(dest)
     const after = this.list()
-    return before.length !== after.length || after.some((dir, index) => dir !== before[index])
+    const changed =
+      before.length !== after.length || after.some((dir, index) => dir !== before[index])
+
+    // The deletes above bypass versioning, and `add()` measures growth against a
+    // size the delete already reduced. Re-keying onto a path the set ALREADY
+    // tracks therefore shrinks the set while adding nothing new — the one shape
+    // that leaves `add()` with nothing to report. This comparison is the exact
+    // signal, so version off it rather than off the parts.
+    if (changed) {
+      this.revision++
+    }
+
+    return changed
   }
 }

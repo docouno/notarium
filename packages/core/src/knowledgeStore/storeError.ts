@@ -69,6 +69,21 @@ export const noteAlreadyExists = (
   return err
 }
 
+/** A write that named the identity it EXPECTED to find at its destination found
+ *  another one — or found the path taken when it planned on a free one. The
+ *  refusal exists because the alternative is silent: an ordinary overwrite would
+ *  replace that note's bytes AND its identity, and every link pointing at it
+ *  would resolve to a note nobody meant to write.
+ *  canon: docs/import.md#importing-a-markdown-tree-302 */
+export const destinationOwnerConflict = (path: string, detail: string): StoreError => {
+  const err = new StoreError(`planned destination ${path} ${detail}`)
+
+  err.isToolError = true
+  err.reason = STORE_ERROR_REASON.destinationOwnerConflict
+
+  return err
+}
+
 /** An update (original_id) arrived without a version_token. Strict on
  *  purpose — for the UI and for programmatic clients alike: a writer that
  *  can't say what it read must not overwrite. */

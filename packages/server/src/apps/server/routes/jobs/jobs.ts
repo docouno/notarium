@@ -1,12 +1,22 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify'
 import { rm } from 'node:fs/promises'
 
-import { ImportResponseSchema, JobListResponseSchema, JobSchema } from '@notarium/contract'
+import {
+  ImportResponseSchema,
+  ImportSummarySchema,
+  JobListResponseSchema,
+  JobSchema,
+} from '@notarium/contract'
 import { HTTP_STATUS } from '@notarium/contract/http'
 import { freshNoteId, IMPORT_FORMAT, ImportError, type ImportFormat } from '@notarium/core'
 
 import { safeRelAddress } from '../../../../libs/relPath'
-import { makeImportTempDir, runImport, saveUploadToTemp } from '../../../../services/import'
+import {
+  ImportPlanConflictError,
+  makeImportTempDir,
+  runImport,
+  saveUploadToTemp,
+} from '../../../../services/import'
 import { JOB_KIND_EXPORT, JOB_KIND_IMPORT, jobToWire } from '../../consumers'
 import { type ApiRouteCtx, authz, notFound, parseRangeHeader, s } from '../_shared'
 
@@ -279,8 +289,11 @@ export const jobsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
           skipExisting,
           memoryMode,
           sourceModifiedAt,
-          onProgress: (imported) => {
-            writeLine({ type: 'progress', imported })
+          // The legacy `imported` field stays exactly where it was; phase/done/total
+          // ride alongside it so an old reader keeps working and a new one can draw
+          // a determinate bar for a Markdown tree.
+          onProgress: ({ phase, done, total, imported }) => {
+            writeLine({ type: 'progress', imported, phase, done, total })
           },
           settle: () => store.settle?.(),
         })
@@ -291,7 +304,29 @@ export const jobsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
         if (!(err instanceof ImportError)) {
           console.error('[api] /import ->', (err as Error).message)
         }
-        writeLine({ type: 'error', error: message })
+        // The work already done rides out on the error line. A terminal conflict
+        // after N notes has written N real notes, and a client that is shown only
+        // the sentence has no way to learn that. This is the synchronous twin of the
+        // durable job's `result`. canon: docs/import.md#what-an-import-reports-302
+        //
+        // Validated OUTSIDE the line, and with safeParse. `partial` is typed
+        // `unknown`, so "it always matches the schema" is a convention, not a fact
+        // the compiler holds — and a throw from inside the line literal would land
+        // in the `finally`, which ends the response. The client would then be left
+        // with a stream carrying neither `done` NOR `error`: exactly the outcome
+        // this branch exists to prevent. A partial we cannot vouch for costs the
+        // counts; it must never cost the sentence.
+        const partial: unknown = err instanceof ImportPlanConflictError ? err.partial : undefined
+        const parsed = partial === undefined ? undefined : ImportSummarySchema.safeParse(partial)
+
+        if (parsed && !parsed.success) {
+          console.error('[api] /import -> dropped a partial summary that is not one')
+        }
+        writeLine({
+          type: 'error',
+          error: message,
+          ...(parsed?.success ? { partial: parsed.data } : {}),
+        })
       } finally {
         reply.raw.end()
         await cleanup()

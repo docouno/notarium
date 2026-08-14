@@ -24,6 +24,7 @@ import {
   createNotariumStore,
   type FileStore,
   NotariumStore,
+  SpaceResourceAuthority,
 } from '@notarium/engine'
 
 import { describeKnowledgeStoreContract } from './storeContract'
@@ -450,6 +451,248 @@ describe('NotariumStore — legacy move destinations', () => {
   })
 })
 
+// What the planned-destination guard can and cannot learn from a FILE. The shared
+// contract pins the rule on every stand; these cases are the half only this engine
+// can stage, because a filesystem is the only medium here that answers something
+// other than "a note". It differs from `InMemoryStore` on TWO axes, not one:
+//
+//   1. it can hold a note whose identity the file does not state (an unclaimed
+//      file), which is silence rather than contradiction — the cases below;
+//   2. it can hold a pathname that is not a note AT ALL — a directory, a symlink,
+//      a FIFO — which is contradiction rather than silence, and is what the next
+//      describe pins.
+//
+// (`InMemoryStore` mints an id for every note it holds and has no pathnames but
+// its notes', so neither shape exists there; the engines run the same comparison
+// over a medium that is simply never silent and never occupied by a non-note.)
+describe('NotariumStore — planned-destination guard over an unclaimed file', () => {
+  const staged = (frontmatter: string) => {
+    const notesDir = mkdtempSync(join(tmpdir(), 'notarium-guard-claim-'))
+
+    mkdirSync(join(notesDir, 'vault'))
+    writeFileSync(join(notesDir, 'vault/note.md'), `---\n${frontmatter}title: Note\n---\n\nbefore`)
+
+    return { notesDir, store: createNotariumStore({ notesDir }) }
+  }
+
+  const overwrite = {
+    title: 'Note',
+    directory: 'vault',
+    fileName: 'note',
+    content: 'after',
+    ifExists: IF_EXISTS.overwrite,
+  }
+
+  it('overwrites a file that claims no identity of its own', async () => {
+    // The ordinary state of a vault imported before identities were written. The
+    // file names nobody, so it CONTRADICTS nobody: refusing here would fail every
+    // overwrite into such a vault, and the layer that does know whose note this
+    // path holds (the read-model's registry) has already checked.
+    const { notesDir, store } = staged('')
+
+    try {
+      await store.list()
+      await store.write({
+        ...overwrite,
+        id: 'PlannedOwnerAA',
+        expectedDestinationId: 'PlannedOwnerAA',
+      })
+
+      expect(readFileSync(join(notesDir, 'vault/note.md'), 'utf8')).toContain('after')
+    } finally {
+      await store.stop()
+      rmSync(notesDir, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses a file that claims a different identity', async () => {
+    const { notesDir, store } = staged('notarium-id: SomeoneElseBB\n')
+
+    try {
+      await store.list()
+      await expect(
+        store.write({
+          ...overwrite,
+          id: 'PlannedOwnerAA',
+          expectedDestinationId: 'PlannedOwnerAA',
+        }),
+      ).rejects.toMatchObject({ reason: 'destination_owner_conflict' })
+      expect(readFileSync(join(notesDir, 'vault/note.md'), 'utf8')).toContain('before')
+    } finally {
+      await store.stop()
+      rmSync(notesDir, { recursive: true, force: true })
+    }
+  })
+})
+
+// A planned write that loses its destination to something other than the note it
+// planned must say so — `note_already_exists` reaching the import is read there as
+// "our own first attempt", so it is counted as a SKIP: the note is never written,
+// the job succeeds, and the report carries neither a warning nor an error. The two
+// ways a NotariumStore destination can be taken by a stranger are both staged here,
+// because neither is reachable on an identity-keyed engine.
+describe('NotariumStore — a planned destination taken by a stranger', () => {
+  const planned = {
+    title: 'Note',
+    directory: 'vault',
+    fileName: 'note',
+    content: 'planned body',
+    id: 'PlannedRaceAA',
+    expectedDestinationId: null,
+  }
+
+  const staged = () => {
+    const notesDir = mkdtempSync(join(tmpdir(), 'notarium-guard-stranger-'))
+
+    mkdirSync(join(notesDir, 'vault'))
+
+    return notesDir
+  }
+
+  it('refuses a directory standing on the planned path instead of reading it as free', async () => {
+    // `occupied` is not absence. Folded into it, the guard answered "the path is
+    // free" while the collision policy two statements later answered "the path is
+    // taken" — one engine, two answers about one pathname.
+    const notesDir = staged()
+
+    mkdirSync(join(notesDir, 'vault/note.md'))
+    const store = createNotariumStore({ notesDir })
+
+    try {
+      await store.list()
+      await expect(store.write({ ...planned, ifExists: IF_EXISTS.fail })).rejects.toMatchObject({
+        reason: 'destination_owner_conflict',
+      })
+      expect(lstatSync(join(notesDir, 'vault/note.md')).isDirectory()).toBe(true)
+    } finally {
+      await store.stop()
+      rmSync(notesDir, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses a symlink on the planned path even when the plan may overwrite', async () => {
+    // No race needed for this one: `overwrite` publishes THROUGH the guard, so a
+    // guard that read the symlink as absence let the publication replace it.
+    const notesDir = staged()
+
+    symlinkSync('missing.md', join(notesDir, 'vault/note.md'))
+    const store = createNotariumStore({ notesDir })
+
+    try {
+      await store.list()
+      await expect(
+        store.write({ ...planned, ifExists: IF_EXISTS.overwrite }),
+      ).rejects.toMatchObject({ reason: 'destination_owner_conflict' })
+      expect(lstatSync(join(notesDir, 'vault/note.md')).isSymbolicLink()).toBe(true)
+    } finally {
+      await store.stop()
+      rmSync(notesDir, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses a newcomer that appeared between the occupancy check and the publication', async () => {
+    // The guard PROVED this path free, in this same operation, and the swap it
+    // then lost publishes only into an absent pathname. So the loser is a note
+    // that appeared since — never our own replay, which the guard would have
+    // converged on. The authority is the seam because it is exactly the window
+    // the classification reasons about.
+    const notesDir = staged()
+    const files = createLocalFsFiles(notesDir)
+    let plant: (() => void) | undefined = () =>
+      writeFileSync(
+        join(notesDir, 'vault/note.md'),
+        '---\nnotarium-id: NewcomerBB\ntitle: Note\n---\n\nthe newcomer',
+      )
+    const authority = new SpaceResourceAuthority('stranger-race', [
+      { id: 'root', prefix: '', files, physicalRoot: notesDir },
+    ])
+    const racing = new Proxy(authority, {
+      get: (target, key: string) => {
+        const value = (target as unknown as Record<string, unknown>)[key]
+
+        if (typeof value !== 'function') {
+          return value
+        }
+        const method = (value as (...a: unknown[]) => unknown).bind(target)
+
+        if (key !== 'publish') {
+          return method
+        }
+
+        return (...args: unknown[]) => {
+          plant?.()
+          plant = undefined
+
+          return method(...args)
+        }
+      },
+    })
+    const store = new NotariumStore({
+      mounts: [{ class: 'user-doc', prefix: '', files }],
+      sql: createNodeSqliteDriver(':memory:'),
+      resourceAuthority: racing,
+    })
+
+    try {
+      await store.list()
+      await expect(store.write({ ...planned, ifExists: IF_EXISTS.fail })).rejects.toMatchObject({
+        reason: 'destination_owner_conflict',
+      })
+      // The newcomer kept its body AND its identity.
+      expect(readFileSync(join(notesDir, 'vault/note.md'), 'utf8')).toContain('the newcomer')
+      expect(readFileSync(join(notesDir, 'vault/note.md'), 'utf8')).toContain('NewcomerBB')
+    } finally {
+      await store.stop()
+      rmSync(notesDir, { recursive: true, force: true })
+    }
+  })
+
+  it('reports the same conflict on the authority-less no-clobber seam', async () => {
+    // Production always composes the authority above, but the engine keeps a
+    // capability fallback for embedders that wire a FileStore directly. Its final
+    // `writeIfAbsent` is a distinct mutation point: without this fixture the added
+    // owner-conflict branch there could be deleted while the authority test stayed
+    // green.
+    const notesDir = staged()
+    const files = createLocalFsFiles(notesDir)
+    let plant = true
+    const racingFiles = new Proxy(files, {
+      get: (target, key, receiver) => {
+        if (key !== 'writeIfAbsent') {
+          return Reflect.get(target, key, receiver)
+        }
+
+        return async (path: string, content: string) => {
+          if (plant) {
+            plant = false
+            writeFileSync(
+              join(notesDir, path),
+              '---\nnotarium-id: NewcomerBB\ntitle: Note\n---\n\nthe newcomer',
+            )
+          }
+
+          return await target.writeIfAbsent!(path, content)
+        }
+      },
+    })
+    const store = new NotariumStore({
+      mounts: [{ class: 'user-doc', prefix: '', files: racingFiles }],
+      sql: createNodeSqliteDriver(':memory:'),
+    })
+
+    try {
+      await store.list()
+      await expect(store.write({ ...planned, ifExists: IF_EXISTS.fail })).rejects.toMatchObject({
+        reason: 'destination_owner_conflict',
+      })
+      expect(readFileSync(join(notesDir, 'vault/note.md'), 'utf8')).toContain('the newcomer')
+    } finally {
+      await store.stop()
+      rmSync(notesDir, { recursive: true, force: true })
+    }
+  })
+})
+
 describe('NotariumStore — case-insensitive path occupancy', () => {
   const caseInsensitiveFiles = (notesDir: string): FileStore => {
     const base = createLocalFsFiles(notesDir)
@@ -659,6 +902,80 @@ describe('NotariumStore — case-insensitive path occupancy', () => {
       ).rejects.toThrow(/directory spelling/i)
       expect(readdirSync(join(notesDir, 'Empty'))).toEqual([])
       expect((await store.list()).map((note) => note.filePath)).toEqual(['Source.md'])
+    } finally {
+      await store.stop()
+      rmSync(notesDir, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses the alternate parent spelling identically without the exact-spelling probe', async () => {
+    // `dirExistsExact` is an ACCELERATOR: an adapter that lacks it answers the
+    // same question with one walk. So the two shapes must not just both refuse —
+    // they must refuse the SAME write with the SAME words. Nothing else keeps the
+    // fallback from quietly drifting into "assume it is spelled right" (which
+    // writes into the folder the medium picked) or into a refusal of its own.
+    const refusalWithout = async (accelerator: boolean): Promise<string> => {
+      const notesDir = mkdtempSync(join(tmpdir(), 'notarium-spelling-parity-'))
+      mkdirSync(join(notesDir, 'Empty'), { recursive: true })
+      const files = caseInsensitiveFiles(notesDir)
+
+      if (!accelerator) {
+        delete files.dirExistsExact
+      }
+      const store = new NotariumStore({
+        mounts: [{ class: 'user-doc', prefix: '', files }],
+        sql: createNodeSqliteDriver(':memory:'),
+      })
+
+      try {
+        await store.list()
+        return await store.write({ title: 'New', directory: 'empty', content: 'body' }).then(
+          () => 'written',
+          (err: Error) => err.message,
+        )
+      } finally {
+        await store.stop()
+        rmSync(notesDir, { recursive: true, force: true })
+      }
+    }
+    const accelerated = await refusalWithout(true)
+
+    expect(accelerated).toMatch(/directory spelling/i)
+    expect(await refusalWithout(false)).toBe(accelerated)
+  })
+
+  it('grandfathers the RAW legacy folder only, never its case-fold', async () => {
+    // The non-portable component exception is stateful: `foo:bar` may keep its
+    // spelling because that exact folder is already there. Which makes the question
+    // an EXACT/raw one, as `isPortableRelativeDestination` documents its `hasDir` to
+    // be — and a stat cannot answer it on a medium that folds case. Answering with
+    // `dirExists` here would grandfather `FOO:BAR` on the strength of `foo:bar` and
+    // hand the write a folder it never named; the spelling fence downstream would
+    // then refuse it for a reason that is not the true one, so the ONLY thing that
+    // tells the two apart is which refusal comes back.
+    const notesDir = mkdtempSync(join(tmpdir(), 'notarium-legacy-grandfather-'))
+
+    mkdirSync(join(notesDir, 'foo:bar'), { recursive: true })
+    const store = new NotariumStore({
+      mounts: [{ class: 'user-doc', prefix: '', files: caseInsensitiveFiles(notesDir) }],
+      sql: createNodeSqliteDriver(':memory:'),
+    })
+
+    try {
+      await store.list()
+      // The exact spelling is the grandfathered one, and it still works.
+      await store.write({ title: 'Kept', directory: 'foo:bar', content: 'body' })
+      expect((await store.read('foo:bar/kept')).filePath).toBe('foo:bar/kept.md')
+
+      const refusal = await store
+        .write({ title: 'New', directory: 'FOO:BAR', content: 'body' })
+        .then(
+          () => 'written',
+          (err: Error) => err.message,
+        )
+
+      expect(refusal).toMatch(/portable/i)
+      expect(refusal).not.toMatch(/spelling/i)
     } finally {
       await store.stop()
       rmSync(notesDir, { recursive: true, force: true })

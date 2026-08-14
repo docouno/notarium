@@ -271,6 +271,18 @@ export type FileStore = {
    *  answers false. Lets a move distinguish an empty-but-real folder (no indexed
    *  notes) from a genuinely missing one. */
   dirExists(path: string): Promise<boolean>
+  /** Does a directory exist under EXACTLY this spelling? On a case-insensitive or
+   *  NFC-normalizing medium `dirExists` answers for a different spelling too, and
+   *  the difference is precisely what a write must refuse. Answering it needs one
+   *  shallow listing of the parent — the alternative is a recursive walk of the
+   *  whole mount on every write, which is O(tree) per note.
+   *  OPTIONAL for a different reason than `renameDirIfAbsent` above, and the two
+   *  must not be read as the same kind of thing: that one is missing when the
+   *  deployment CANNOT perform it, so its absence fails a caller closed. This one
+   *  is a cost, not a power — every adapter that can list a directory can answer
+   *  it, and one that doesn't leaves the caller on the recursive walk, which is
+   *  equally correct and merely slow. canon: docs/core.md#cooperative */
+  dirExistsExact?(path: string): Promise<boolean>
   /** Watch the subtree for external changes (#146, P5 capability). `onChange`
    *  receives the storage-relative path when the medium can identify it, or null
    *  for a pathless hint. It fires (coalesced upstream) on any non-hidden

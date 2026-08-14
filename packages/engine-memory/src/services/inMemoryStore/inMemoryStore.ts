@@ -48,6 +48,7 @@ import {
   DEFAULT_NOTE_TYPE,
   deriveNoteEdges,
   derivePreview,
+  destinationOwnerConflict,
   directoryOf,
   DOCUMENT_ROLE,
   DOCUMENT_STATE_FORMAT,
@@ -1129,6 +1130,7 @@ export class InMemoryStore implements KnowledgeStore {
     preservePath,
     preserveAliases,
     restorePath,
+    expectedDestinationId,
   }: WriteInput): Promise<WriteResult> {
     const replacing = frontmatterMode === 'replace'
     const scalarInputs = [title, directory, noteType, rawSlug, summary, fileName, createdAt]
@@ -1415,6 +1417,36 @@ export class InMemoryStore implements KnowledgeStore {
     const filePath = restorePath ?? fileIn(createDir, title, fileName, newId)
     const existing = this.indexByPath(filePath)
 
+    // The planned-destination guard, mirroring notariumStore — including its
+    // position: it runs BEFORE the collision policy, so a `skipExisting` import
+    // still proves whose note it is skipping instead of assuming. And including its
+    // RULE: refuse when the destination's observed owner CONTRADICTS the expected
+    // one. The engines differ only in how much their medium can observe — a note
+    // here always carries its id, so `occupantId` is never the "states nothing"
+    // that a claim-less markdown file is, and the null branch below is only
+    // reachable as "nobody is standing here at all".
+    if (expectedDestinationId !== undefined) {
+      const occupantId = existing === -1 ? null : this.notes[existing].id
+
+      if (expectedDestinationId === null) {
+        if (existing !== -1 && occupantId !== newId) {
+          throw destinationOwnerConflict(
+            filePath,
+            `is owned by ${occupantId}; the import planned to create it`,
+          )
+        }
+      } else if (existing === -1) {
+        throw destinationOwnerConflict(filePath, 'no longer exists')
+      } else if (occupantId !== expectedDestinationId) {
+        // No "states nothing" branch to spare here, unlike the file engine: past
+        // this point a note IS standing on the path, and every note this engine
+        // holds carries an id.
+        throw destinationOwnerConflict(
+          filePath,
+          `is owned by ${occupantId}, not ${expectedDestinationId}`,
+        )
+      }
+    }
     // Create-collision policy, mirroring notariumStore: refuse unless the caller
     // explicitly asked to clobber. canon: docs/note-model.md#create-collisions
     if (existing !== -1 && ifExists !== IF_EXISTS.overwrite) {

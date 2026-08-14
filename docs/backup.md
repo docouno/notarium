@@ -88,7 +88,11 @@ Only Notarium-owned incomplete files are omitted: dot-named atomic note temps,
 exact `.<role>.install-<uuid>` role-package staging directories at a Personal/Space library root or
 an exact `_projects/<encoded-project-id>/` library root (one orphaned by a process death is reclaimed
 by the next install into that same library root, once it is more than an hour old),
-`jobs/imports/<space>/<job>.import.part`, and in-progress export artifact parts.
+the import contour's own unpublished temps (`jobs/imports/<space>/<job>.import.part`
+and the plan sidecar's `<job>.import-plan.part-<run>`), and in-progress export artifact
+parts. The published `<job>.import` upload and `<job>.import-plan` sidecar are NOT omitted:
+they are what a restored import job re-reads and adopts instead of re-deciding a tree it
+may already be part-way through ([import.md](import.md#the-plan-survives-the-run)).
 Ordinary user files or directories ending in `.part` are legitimate and remain
 in the backup. The supported per-space `.notarium-fs-ops/` recovery namespace is
 preserved: an accepted restart-durable restore must travel with the matching

@@ -1,6 +1,7 @@
 import { jobOfRow, type JobRow } from '../../rows'
 import type { JobsPersistence, JobStatus } from '../../types'
 import type { PgDriverCtx } from './context'
+import { cancelJobFenced, reapStaleFenced } from './jobInvalidation'
 
 export const createJobsFacet = (ctx: PgDriverCtx): JobsPersistence => ({
   enqueue: async (input) => {
@@ -115,22 +116,21 @@ export const createJobsFacet = (ctx: PgDriverCtx): JobsPersistence => ({
         )
       : await ctx.required.query(
           `UPDATE jobs SET status = 'failed', error = $3, completed_at = $4,
+               result = COALESCE($5, result),
                locked_at = NULL, locked_by = NULL, updated_at = $4
              WHERE id = $1 AND locked_by = $2 AND status = 'running'`,
-          [id, workerId, f.error, f.now],
+          [id, workerId, f.error, f.now, f.result === undefined ? null : JSON.stringify(f.result)],
         )
     return (res.rowCount ?? 0) > 0
   },
 
+  // Invalidation from outside the run takes the job's fence first — see
+  // `jobInvalidation` for why a transition that skipped it could land between a
+  // fenced write's premise and its bytes.
   cancel: async (id, now) => {
     await ctx.ensureInit()
-    const res = await ctx.required.query(
-      `UPDATE jobs SET status = 'canceled', completed_at = $2, updated_at = $2,
-           locked_at = NULL, locked_by = NULL
-         WHERE id = $1 AND status IN ('pending', 'running')`,
-      [id, now],
-    )
-    return (res.rowCount ?? 0) > 0
+
+    return await cancelJobFenced(ctx.required, id, now)
   },
 
   release: async (id, workerId, now) => {
@@ -179,21 +179,8 @@ export const createJobsFacet = (ctx: PgDriverCtx): JobsPersistence => ({
 
   reapStale: async (staleBefore, now) => {
     await ctx.ensureInit()
-    const reopened = await ctx.required.query(
-      `UPDATE jobs SET status = 'pending', locked_at = NULL, locked_by = NULL,
-           error = 'reopened after stalled worker', updated_at = $1
-         WHERE status = 'running' AND locked_at < $2 AND attempts < max_attempts
-         RETURNING *`,
-      [now, staleBefore],
-    )
-    const failed = await ctx.required.query(
-      `UPDATE jobs SET status = 'failed', completed_at = $1, locked_at = NULL,
-           locked_by = NULL, error = 'stalled (max attempts reached)', updated_at = $1
-         WHERE status = 'running' AND locked_at < $2 AND attempts >= max_attempts
-         RETURNING *`,
-      [now, staleBefore],
-    )
-    return [...(reopened.rows as JobRow[]), ...(failed.rows as JobRow[])].map(jobOfRow)
+
+    return await reapStaleFenced(ctx.required, staleBefore, now)
   },
 
   findExpired: async (now, limit) => {
@@ -219,7 +206,12 @@ export const createJobsFacet = (ctx: PgDriverCtx): JobsPersistence => ({
     await ctx.ensureInit()
     await ctx.required.query(
       `DELETE FROM jobs WHERE status IN ('succeeded', 'failed', 'canceled')
-           AND artifact_ref IS NULL AND updated_at < $1`,
+           AND artifact_ref IS NULL AND updated_at < $1
+    -- Fail-closed against retention deleting the evidence a live import still
+    -- points at: while a reservation references this job, its terminal row is the
+    -- only thing that can prove what the run had already done.
+    -- canon: docs/import.md#importing-a-markdown-tree-302
+           AND NOT EXISTS (SELECT 1 FROM import_reservations r WHERE r.job_id = jobs.id)`,
       [before],
     )
   },

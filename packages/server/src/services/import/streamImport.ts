@@ -29,6 +29,8 @@ import {
   MemoryGraph,
 } from '@notarium/core'
 
+import { MEMBER_BYTE_CAP, MEMORY_OBJECT_CAP, TEXT_FILE_CAP } from './consts'
+
 /** `'unsupported'` = recognised JSON we have no parser for; surfaced as a warning
  *  so a skip is never silent data loss. */
 export type ImportFileMeta = {
@@ -41,18 +43,6 @@ export type ImportFileMeta = {
  *  would be noise on every Claude/ChatGPT upload). */
 const SILENTLY_IGNORED = new Set(['users.json'])
 
-/** Decompressed-size cap per ZIP member — zip-bomb guard (a small archive can't
- *  inflate to fill the disk). Well above a real 600 MB export's ~1–2 GB member. */
-const MEMBER_BYTE_CAP = 6 * 1024 * 1024 * 1024
-
-/** Cap for the single-object memory shape, which must be read whole (a JSON
- *  object's sub-arrays can't be streamed element-wise). MCP graphs are tiny. */
-const MEMORY_OBJECT_CAP = 256 * 1024 * 1024
-
-/** A dropped text/markdown file is one note, read whole and bounded by this cap.
- *  canon: docs/import.md#drag-and-drop-of-text-files-223 */
-const TEXT_FILE_CAP = 64 * 1024 * 1024
-
 export type StreamImportArgs = {
   uploadPath: string
   /** Private temp dir (mkdtemp 0700) for extracted ZIP members; owned + cleaned
@@ -64,6 +54,13 @@ export type StreamImportArgs = {
   /** Called once per parsed note, awaited (backpressure). A throw is the consumer's
    *  record failure and does NOT abort the stream (the orchestrator catches/counts). */
   onNote: (note: ImportNote, ctx: { file: string; format: ImportFormat }) => Promise<void>
+  /** Called once per recognised member, in ARCHIVE ORDER, as soon as that member
+   *  is done. Ordering is the whole reason it exists rather than a loop over the
+   *  returned metas: a member that yields no notes registers nothing while it
+   *  streams, so registering all metas afterwards sorted the result by "produced
+   *  a note first" — and the wire contract says archive order.
+   *  canon: docs/import.md#what-an-import-reports-302 */
+  onFile?: (meta: ImportFileMeta) => void | Promise<void>
   /** Cooperative cancel; checked before each ZIP member so a canceled import stops
    *  promptly. canon: docs/import.md#durable-import-via-the-jobs-layer-191 */
   signal?: AbortSignal
@@ -92,7 +89,7 @@ export const saveUploadToTemp = async (stream: Readable, dir: string): Promise<s
 }
 
 /** True if the file starts with the ZIP magic `PK\x03\x04`. */
-const isZipFile = async (path: string): Promise<boolean> => {
+export const isZipFile = async (path: string): Promise<boolean> => {
   const fh = await fs.open(path, 'r')
 
   try {
@@ -484,10 +481,16 @@ export const streamImportFile = async ({
   filename,
   format,
   onNote,
+  onFile,
   signal,
   sourceModifiedAt,
 }: StreamImportArgs): Promise<ImportFileMeta[]> => {
   const files: ImportFileMeta[] = []
+
+  const record = async (meta: ImportFileMeta): Promise<void> => {
+    files.push(meta)
+    await onFile?.(meta)
+  }
 
   if (await isZipFile(uploadPath)) {
     await forEachZipMember(uploadPath, tempDir, async (name, memberPath) => {
@@ -504,7 +507,7 @@ export const streamImportFile = async ({
       })
 
       if (meta) {
-        files.push(meta)
+        await record(meta)
       }
     })
   } else {
@@ -520,7 +523,7 @@ export const streamImportFile = async ({
     )
 
     if (meta) {
-      files.push(meta)
+      await record(meta)
     }
   }
   // At least one member must be a RECOGNISED export — an upload of only

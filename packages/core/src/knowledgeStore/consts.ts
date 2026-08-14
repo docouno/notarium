@@ -37,6 +37,10 @@ export const STORE_ERROR_REASON = {
   memoryConvergenceExhausted: 'memory_convergence_exhausted',
   /** A reference write lost a race with an identity settlement — retryable (#327). */
   referenceIdentityConflict: 'reference_identity_conflict',
+  /** A planned write found a different note standing at its destination than the
+   *  plan settled on. Deterministic: the plan is stale, so retrying it unchanged
+   *  reaches the same answer. canon: docs/import.md#importing-a-markdown-tree-302 */
+  destinationOwnerConflict: 'destination_owner_conflict',
 } as const
 
 /** What a CREATE does when a note already occupies its destination path.

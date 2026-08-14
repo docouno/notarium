@@ -74,6 +74,7 @@ npm run e2e            # Playwright; e2e:docker / visual run in a container
 | `make checkup` | every portable code gate: static checks, full containerized coverage/build, live Postgres, backup smoke, container-native e2e; visual is also compared when its external baselines are present |
 | `make test-pg` | ephemeral Postgres + live meta-DB contracts/migrations |
 | `make test-browser` | e2e in a pinned Playwright image with container-native JS dependencies; visual too when external baselines are installed |
+| `make import-bench [NOTES=10000]` | the Markdown-tree import at its supported scale through the production composition; correctness fails the run, timings are reported |
 | `make seed CASE=<name>` / `seed-list` | seed a stand with a fixture |
 | `make image` / `save` | build the image locally / export it as a tarball for an air-gapped transfer |
 | `make release` / `release-rc` | publish a traceable image / publish a pre-release `X.Y.Z-rc.N` |

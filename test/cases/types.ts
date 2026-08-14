@@ -324,6 +324,8 @@ export type AgentWriteAuditDecl = {
 export type CaseEvent = (
   | {
       op: 'create'
+      /** A fixture-pinned physical note id — see NoteDecl.id. */
+      physicalId?: string
       date: CaseDate
       space: string
       noteId: string

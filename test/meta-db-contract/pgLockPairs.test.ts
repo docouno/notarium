@@ -188,8 +188,21 @@ const seed = async (db: MetaDb): Promise<void> => {
   )
 }
 
+/** Each probe here creates a schema, seeds it, and lets two transactions contend
+ *  across a container boundary, so the vitest default (5 s) is not a budget this file
+ *  can be polled against. Stated once, and PROBE_WAIT_MS is derived from it. */
+const SUITE_TIMEOUT_MS = 15_000
+
+/** How long a probe waits for its two sides to actually queue — deliberately a
+ *  FRACTION of the suite budget. Exhausting it is not a failure, and a budget EQUAL
+ *  to the test timeout could never say so: the test died of the timeout first, with
+ *  no diagnosis, which is the opposite of what the comment below promises. */
+const PROBE_WAIT_MS = SUITE_TIMEOUT_MS / 3
+
+const PROBE_SUITE = { timeout: SUITE_TIMEOUT_MS }
+
 const waitForWaiters = async (admin: pg.Pool, schema: string, expected: number): Promise<void> => {
-  const deadline = Date.now() + 5_000
+  const deadline = Date.now() + PROBE_WAIT_MS
 
   while (Date.now() < deadline) {
     const result = await admin.query(
@@ -225,7 +238,7 @@ const pairs = PROBES.flatMap((left, index) => PROBES.slice(index).map((right) =>
  *  waits for that row while the settlement holds the row and waits for the mutex. */
 const BETA = 'beta'
 
-describePostgres('Postgres deadlock probes', () => {
+describePostgres('Postgres deadlock probes', PROBE_SUITE, () => {
   for (const [left, right] of pairs) {
     it(`${left.id} × ${right.id} settle without a deadlock`, async () => {
       const testSchema = await createPostgresTestSchema('lock_pairs')
@@ -329,4 +342,220 @@ describePostgres('Postgres deadlock probes', () => {
       await testSchema.teardown()
     }
   })
+})
+
+/**
+ * The import reservation pairs (#302). They are NOT in `PROBES` above because they
+ * enter the hierarchy somewhere else entirely: L0j outranks identity, and none of
+ * them touches `note_identity` — the one row that file forces its contention through.
+ * So they get their own gate, one per pair, and the same reading applies: incident
+ * pins over a fixture, not a proof of the order.
+ */
+const IMPORT_AT = '2026-08-11T10:00:00.000Z'
+
+describePostgres('Postgres deadlock probes — import reservations', PROBE_SUITE, () => {
+  /** Two jobs, both running under a known lease — the premise every path needs. */
+  const runningImports = async (db: MetaDb, ids: readonly string[]): Promise<void> => {
+    for (const id of ids) {
+      await db.jobs.enqueue({
+        id,
+        space: SPACE,
+        kind: 'import',
+        principal: 'user:al',
+        createdAt: IMPORT_AT,
+      })
+
+      expect((await db.jobs.claimNext(`lease-${id}`, ['import'], IMPORT_AT))?.id).toBe(id)
+    }
+  }
+
+  const claim = (entryKey: string, destinationPath: string) => ({
+    entryKey,
+    destinationPath,
+    targetId: `target-${entryKey}`,
+    expectedId: null,
+    ownership: 'fresh-owned' as const,
+  })
+
+  it('reserve × reserve claiming the same destinations in opposite order', async () => {
+    const testSchema = await createPostgresTestSchema('lock_pairs_reserve')
+    const db = testSchema.db
+    const blocker = new pg.Pool({ connectionString: testSchema.scopedUrl })
+
+    try {
+      await runningImports(db, ['job-1', 'job-2'])
+      const held = await blocker.connect()
+
+      // A claim on the FIRST contested path, taken and then rolled back. The unique
+      // index is what both sides queue on, so this holds them at the same key until
+      // it lets go — the state a crossing pair needs, and the only way to get it
+      // when neither side can be paused from outside.
+      await held.query('BEGIN')
+      await held.query(
+        `INSERT INTO import_reservations (id, space, job_id, upload_ref, fence, status, created_at, updated_at)
+         VALUES ('blocker-res', $1, 'blocker-job', 'blocker-upload', 'blocker-fence', 'active', $2, $2)`,
+        [SPACE, IMPORT_AT],
+      )
+      await held.query(
+        `INSERT INTO import_reservation_paths
+           (reservation_id, entry_key, space, destination_path, target_id, expected_id, ownership)
+         VALUES ('blocker-res', 'blocked', $1, 'imported/a.md', 'target-blocked', NULL, 'fresh-owned')`,
+        [SPACE],
+      )
+
+      // The SAME two destinations, declared in opposite order. Insertion sorts by
+      // destination path, so both sides take them in one agreed order; without that,
+      // each holds the key the other is waiting for.
+      //
+      // And the two sides map their members onto those destinations DIFFERENTLY,
+      // which is what makes this a probe of the sort KEY and not merely of the sort:
+      // `entry_key` is the archive member's name, `destination_path` the slug of the
+      // note's TITLE, so job-1's `vault/apple.md` is titled "Zebra" while job-2's is
+      // titled "Apple". Sorting on `entry_key` orders these two batches oppositely —
+      // and with both fixtures keyed alike (`vault/a.md` → `imported/a.md`) that
+      // mis-sort was invisible here AND in the lock-order gate.
+      const outcomes = [
+        db.importReservations.reserve({
+          space: SPACE,
+          jobId: 'job-1',
+          workerLease: 'lease-job-1',
+          uploadRef: 'upload-1',
+          entries: [
+            claim('vault/zebra.md', 'imported/a.md'),
+            claim('vault/apple.md', 'imported/b.md'),
+          ],
+          now: IMPORT_AT,
+        }),
+        db.importReservations.reserve({
+          space: SPACE,
+          jobId: 'job-2',
+          workerLease: 'lease-job-2',
+          uploadRef: 'upload-2',
+          entries: [
+            claim('vault/zebra.md', 'imported/b.md'),
+            claim('vault/apple.md', 'imported/a.md'),
+          ],
+          now: IMPORT_AT,
+        }),
+      ].map((promise) =>
+        promise.then(
+          (outcome) => outcome,
+          (error: unknown) => error,
+        ),
+      )
+
+      await waitForWaiters(testSchema.admin, testSchema.schema, 2)
+      await held.query('ROLLBACK')
+      held.release()
+
+      const settled = await Promise.all(outcomes)
+
+      expect(settled.map(deadlockOf).filter(Boolean)).toEqual([])
+      // Exactly one of them owns the destinations; the other is REFUSED, which is
+      // the answer the unique index exists to give — not an error.
+      expect(settled.filter((outcome) => (outcome as { ok?: boolean }).ok === true)).toHaveLength(1)
+      expect(settled.filter((outcome) => (outcome as { ok?: boolean }).ok === false)).toMatchObject(
+        [{ reason: 'path_conflict' }],
+      )
+    } finally {
+      await blocker.end().catch(() => {})
+      await testSchema.teardown()
+    }
+  })
+
+  /** Both remaining pairs have the same shape: a fenced write holds the job's fence
+   *  across its physical write, and an invalidation of the SAME job arrives inside
+   *  that window. The advisory is what makes them contend at all, so no external
+   *  blocker is needed — the write itself is the gate. */
+  const againstAnEnteredWrite = async (
+    prefix: string,
+    rival: (db: MetaDb) => Promise<unknown>,
+    after: (db: MetaDb) => Promise<void>,
+  ): Promise<void> => {
+    const testSchema = await createPostgresTestSchema(prefix)
+    const db = testSchema.db
+
+    let releaseWrite = (): void => {}
+
+    try {
+      await runningImports(db, ['job-1'])
+      const taken = await db.importReservations.reserve({
+        space: SPACE,
+        jobId: 'job-1',
+        workerLease: 'lease-job-1',
+        uploadRef: 'upload-1',
+        entries: [claim('a', 'imported/a.md'), claim('b', 'imported/b.md')],
+        now: IMPORT_AT,
+      })
+
+      expect(taken.ok).toBe(true)
+      if (!taken.ok) {
+        return
+      }
+      const entered = new Promise<void>((resolve) => {
+        const inFlight = new Promise<void>((release) => {
+          releaseWrite = release
+        })
+
+        void db.importReservations
+          .withFencedWrite(
+            {
+              reservationId: taken.reservation.id,
+              fence: taken.reservation.fence,
+              jobId: 'job-1',
+              workerLease: 'lease-job-1',
+              space: SPACE,
+              destinationPath: 'imported/a.md',
+            },
+            async () => {
+              resolve()
+              await inFlight
+            },
+          )
+          .catch(() => undefined)
+      })
+
+      await entered
+      const rivalOutcome = rival(db).then(
+        () => null,
+        (error: unknown) => error,
+      )
+
+      await waitForWaiters(testSchema.admin, testSchema.schema, 1)
+      releaseWrite()
+
+      expect(deadlockOf(await rivalOutcome)).toBeNull()
+      await after(db)
+    } finally {
+      releaseWrite()
+      await testSchema.teardown()
+    }
+  }
+
+  it('fenced write × adopt of the same job', async () =>
+    await againstAnEnteredWrite(
+      'lock_pairs_adopt',
+      (db) =>
+        db.importReservations.adopt({
+          space: SPACE,
+          jobId: 'job-1',
+          workerLease: 'lease-job-1',
+          uploadRef: 'upload-1',
+          now: IMPORT_AT,
+        }),
+      async (db) => {
+        // The takeover happened, and it re-fenced: the write that was in flight
+        // waited for nothing it then invalidated.
+        expect((await db.importReservations.forJob('job-1'))?.entries).toHaveLength(2)
+      },
+    ))
+
+  it('fenced write × closeForJob of the same job', async () =>
+    await againstAnEnteredWrite(
+      'lock_pairs_close',
+      (db) => db.importReservations.closeForJob({ jobId: 'job-1', now: IMPORT_AT }),
+      async (db) => {
+        expect(await db.importReservations.forJob('job-1')).toBeNull()
+      },
+    ))
 })

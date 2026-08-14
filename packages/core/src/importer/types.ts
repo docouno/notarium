@@ -42,6 +42,17 @@ export type ImportNote = {
    *  file. Only the `markdown` format fills this; an AI export has no frontmatter
    *  of its own. canon: docs/import.md#drag-and-drop-of-text-files-223 */
   frontmatter?: readonly FrontmatterEntry[]
+  /** The identity the source file CLAIMED (`notarium-id:`), when it is a valid
+   *  durable scalar. It is a KEY, never a claim: a tree import maps it to the
+   *  fresh identity the copy receives, so exact `[[notarium-id:…]]` links between
+   *  two imported notes keep pointing at each other. It never reaches the write
+   *  path — importing is a copy, and an identity is not the author's to donate.
+   *  canon: docs/import.md#importing-a-markdown-tree-302 */
+  sourceId?: string
+  /** Set when the file carried a `notarium-id` we could NOT read as an identity
+   *  (empty, a list, a nested map). The note still imports, with a fresh identity
+   *  and no link mapping — but the skip is visible rather than silent. */
+  sourceIdentityWarning?: string
 }
 
 /** What parsing one uploaded file yields: the detected format, the notes to

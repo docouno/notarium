@@ -62,12 +62,16 @@ const observer = vi.hoisted(() => {
 
   return {
     events,
-    /** Wrap every `lock*` export so a level entry announces itself with its keys. */
+    /** Wrap every exported HELPER so a level entry announces itself with its keys.
+     *  The filter is the return value, never the name: entering a level by CREATING
+     *  its keys is `insertImportReservationPaths`, which a `lock*` prefix test
+     *  silently excused — and with it the only entry rule 4 has anything to judge.
+     *  Both modules export async functions only, so awaiting is not a shape change. */
     wrap: (module: Record<string, unknown>): Record<string, unknown> =>
       Object.fromEntries(
         Object.entries(module).map(([name, value]) => [
           name,
-          typeof value === 'function' && name.startsWith('lock')
+          typeof value === 'function'
             ? async (...args: unknown[]) => {
                 const result = (await (value as (...a: unknown[]) => Promise<unknown>)(...args)) as
                   { lock?: LockHold } | undefined
@@ -136,10 +140,42 @@ const parameterStrings = (values: readonly unknown[]): string[] =>
         : [],
   )
 
-/** A composite key (`kind:id`) is declared as one string but reaches SQL as its
- *  parts, so both spellings count as naming it. */
-const keyForms = (keys: readonly string[]): Set<string> =>
-  new Set(keys.flatMap((key) => [key, ...key.split(':')]))
+/** Is this declared key named by a statement's parameters? A composite (`kind:id`,
+ *  `space:path`) is declared as one string but reaches SQL as its PARTS, so it counts
+ *  as named only when EVERY part is there — accepting a single part would let a
+ *  shared component (the space, which every claim of an import shares) stand for the
+ *  whole key. The split is searched rather than assumed, because a part may itself
+ *  contain the separator. */
+const namesKey = (key: string, params: ReadonlySet<string>): boolean => {
+  if (params.has(key)) {
+    return true
+  }
+  for (let at = key.indexOf(':'); at >= 0; at = key.indexOf(':', at + 1)) {
+    if (params.has(key.slice(0, at)) && namesKey(key.slice(at + 1), params)) {
+      return true
+    }
+  }
+
+  return false
+}
+
+/** Which of these declared keys one statement names, in the order its parameters
+ *  name them — within a single statement the parameter order IS the acquisition
+ *  order, which is what rule 4 reads. Comparing raw parameters instead (what this
+ *  replaced) could never match a composite at all, which is how rule 4 came to judge
+ *  nothing at L1p. */
+const keysNamedBy = (keys: readonly string[], params: readonly string[]): string[] => {
+  const present = new Set(params)
+
+  return keys
+    .filter((key) => namesKey(key, present))
+    .map((key) => ({
+      key,
+      at: params.findIndex((param) => key === param || key.endsWith(`:${param}`)),
+    }))
+    .sort((left, right) => left.at - right.at)
+    .map((named) => named.key)
+}
 
 type Step = {
   level: Level
@@ -268,9 +304,7 @@ const violationsOf = (id: string, transaction: Transaction): string[] => {
     if (step.source !== 'dml' || !hold || hold.scope !== 'keys' || !hold.declared.length) {
       continue
     }
-    const declared = keyForms(hold.declared)
-
-    if (!step.keys.some((key) => declared.has(key))) {
+    if (!keysNamedBy(hold.declared, step.keys).length) {
       problems.push(`${id} wrote at ${step.level} outside its declared keys: ${step.text}`)
     }
   }
@@ -283,15 +317,14 @@ const violationsOf = (id: string, transaction: Transaction): string[] => {
     if (!hold.absent.length) {
       continue
     }
-    const absent = new Set(hold.absent)
     const acquired: string[] = []
 
     for (const step of transaction.steps) {
       if (step.level !== level || step.source !== 'dml') {
         continue
       }
-      for (const key of step.keys) {
-        if (absent.has(key) && !acquired.includes(key)) {
+      for (const key of keysNamedBy(hold.absent, step.keys)) {
+        if (!acquired.includes(key)) {
           acquired.push(key)
         }
       }
@@ -335,7 +368,12 @@ const revision = (noteId: string, over: Partial<RevisionInput> = {}): RevisionIn
   ...over,
 })
 
-describePostgres('Postgres lock order', () => {
+/** One test, and it creates a schema, migrates it and drives every registered
+ *  transaction through a live database — so the vitest default (5 s) is not a
+ *  budget it can be polled against, exactly as in the two sibling PG suites. */
+const SUITE_TIMEOUT_MS = 15_000
+
+describePostgres('Postgres lock order', { timeout: SUITE_TIMEOUT_MS }, () => {
   it('takes the levels every registered transaction declared, and every transaction runs', async () => {
     // Not `pg_…`: Postgres reserves that prefix for system schemas.
     const testSchema = await createPostgresTestSchema('lock_order')
@@ -382,11 +420,15 @@ describePostgres('Postgres lock order', () => {
     } as typeof pg.Pool.prototype.connect
 
     /** Run one registered transaction and judge only what it did. */
+    const seenLast: { transaction: Transaction | null } = { transaction: null }
+
     const run = async (id: string, action: () => Promise<unknown>): Promise<Level[]> => {
       const from = observer.events.length
 
       await action()
       const observed = transactionsIn(observer.events.slice(from))
+
+      seenLast.transaction = observed[0] ?? null
 
       // Exactly one: every registered method opens a single transaction, and a
       // fixture built inside the window would otherwise be judged as this one.
@@ -755,6 +797,120 @@ describePostgres('Postgres lock order', () => {
           at: AT,
         }),
       )
+      // Import reservations (#302). Their whole point is an exclusion that outlives a
+      // file write, so the sequence they take is the thing under test: L0j before
+      // anything, then the header, then the claims.
+      await db.jobs.enqueue({
+        id: 'import-job',
+        space: 'alpha',
+        kind: 'import',
+        principal: 'user:al',
+        createdAt: AT,
+      })
+      await db.jobs.claimNext('lease-1', ['import'], AT)
+      const claimKey = {
+        space: 'alpha',
+        jobId: 'import-job',
+        workerLease: 'lease-1',
+        uploadRef: 'upload-1',
+      }
+      const reserved = await run('importReservations.reserve', () =>
+        db.importReservations.reserve({
+          ...claimKey,
+          // DESCENDING by destination, on purpose. These keys do not exist yet, so
+          // rule 4 — absent keys are acquired in sorted order — is the only thing
+          // standing between two imports with overlapping destinations and a
+          // deadlock halfway through each other's list. A fixture already in sorted
+          // order cannot tell a sorting insert from an unsorted one.
+          //
+          // And the two orders CROSS: `entry_key` is the archive member's name,
+          // `destination_path` the slug of the note's TITLE, and nothing ties them
+          // together — an archive whose `Zebra.md` holds a note titled "Apple" is
+          // ordinary. A fixture whose keys sort alike (`vault/a.md` → `imported/a.md`)
+          // reads the same under a sort on either column, so it pins the ORDER
+          // without pinning which column that order is over — and sorting by
+          // `entry_key` would deadlock two real imports against each other while
+          // both gates stayed green.
+          entries: [
+            // A SECOND claim, so the fenced write below has something to over-lock.
+            {
+              entryKey: 'vault/apple.md',
+              destinationPath: 'imported/zebra.md',
+              targetId: 'target-zebra',
+              expectedId: null,
+              ownership: 'fresh-owned',
+            },
+            {
+              entryKey: 'vault/zebra.md',
+              destinationPath: 'imported/apple.md',
+              targetId: 'target-apple',
+              expectedId: null,
+              ownership: 'fresh-owned',
+            },
+          ],
+          now: AT,
+        }),
+      )
+      // Rule 4 can only judge keys the entry says were ABSENT, and this entry creates
+      // every one of them. A hold that reported its own creations as already held —
+      // which is what it did — left `absent` empty and the rule with nothing to read,
+      // so the descending fixture above proved nothing.
+      //
+      // The SET, not the sequence: which keys this level was entered for is this
+      // assertion's business (and length alone let a hold declare `entry_key`s here
+      // and `space:destination_path` everywhere else), while the sequence is rule 4's
+      // — pinning it here would catch the mis-sort as a broken expectation instead of
+      // as the ordering violation it is.
+      const claimed = seenLast.transaction?.holds.get('L1p')
+
+      expect(claimed, 'the reserve never announced its L1p entry').toBeDefined()
+      expect([...(claimed?.declared ?? [])].sort()).toEqual([
+        'alpha:imported/apple.md',
+        'alpha:imported/zebra.md',
+      ])
+      expect(claimed?.absent, 'the reserve entry claims to hold keys it creates').toEqual(
+        claimed?.declared,
+      )
+      const taken = await db.importReservations.forJob('import-job')
+
+      await run('importReservations.withFencedWrite', () =>
+        db.importReservations.withFencedWrite(
+          {
+            reservationId: taken!.id,
+            fence: taken!.fence,
+            jobId: 'import-job',
+            workerLease: 'lease-1',
+            space: 'alpha',
+            destinationPath: 'imported/apple.md',
+          },
+          async () => undefined,
+        ),
+      )
+      // One write, ONE claim. Taking the whole reservation to find the row made a
+      // write cost the size of the import: 10 000 row locks per note on a 10 000-note
+      // tree, every one of them held across the file write. Spelled `space:path`
+      // because that is the ONE vocabulary of this level — the pair the unique index
+      // arbitrates on, and the pair every L1p helper now declares.
+      expect(seenLast.transaction?.holds.get('L1p')?.declared).toEqual(['alpha:imported/apple.md'])
+      await run('importReservations.adopt', () =>
+        db.importReservations.adopt({ ...claimKey, now: AT }),
+      )
+      // Adopt changes only the header's job/fence while holding L1r. Its path read
+      // is deliberately unlocked: any writer or closer of this reservation must
+      // first queue behind that same header, and a rival reserve can only INSERT a
+      // different row. Claiming an L1p entry here would contradict both the actual
+      // transaction and its registry declaration.
+      expect(seenLast.transaction?.holds.get('L1p')).toBeUndefined()
+      await run('importReservations.closeForJob', () =>
+        db.importReservations.closeForJob({ jobId: 'import-job', now: AT }),
+      )
+      // The FK cascade does acquire L1p, but the observer classifies statements by
+      // their explicit target table and therefore cannot see that implicit step.
+      // The registry declares it; the live trace must not fabricate a helper hold.
+      expect(seenLast.transaction?.holds.get('L1p')).toBeUndefined()
+      // Same fence, taken by the other side: an invalidation must queue behind an
+      // entered write rather than commit inside it.
+      await run('jobInvalidation.withJobFence', () => db.jobs.cancel('import-job', AT))
       const purge = await run('pgMetaDb.purgeSpace', () => db.purgeSpace('alpha'))
 
       expect(problems).toEqual([])
@@ -768,6 +924,9 @@ describePostgres('Postgres lock order', () => {
       expect(purge).toEqual(
         expect.arrayContaining(['L1', 'L2a', 'L2b', 'L2c', 'L2d', 'L2e', 'L2f', 'L3m', 'L3t']),
       )
+      // Same reason as above: a reserve that claimed nothing would never enter L1p,
+      // and the level that arbitrates destinations would go unobserved.
+      expect(reserved).toEqual(expect.arrayContaining(['L0j', 'L1r', 'L1p']))
       // Completeness in the same test: an unexercised transaction is an unchecked one.
       expect([...seen].sort()).toEqual(
         pooledPgTransactions()

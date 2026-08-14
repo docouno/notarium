@@ -159,6 +159,13 @@ export type NoteDecl = {
    *  not a replayed write). Both must land the SAME note, so a typed field derived
    *  from these keys has to be derived on both sides. canon: docs/seeds.md */
   frontmatter?: string
+  /** A fixture-pinned PHYSICAL note id. Normally both appliers derive one (the
+   *  fake deterministically from the path, the real one from the store), and the
+   *  logical `n-*` handle above addresses lifecycle only. A case pins it when the
+   *  note's own CONTENT names an identity — an authored `[[notarium-id:…]]` link
+   *  resolves only if the target really carries that id, on both stands.
+   *  canon: docs/seeds.md */
+  id?: string
   /** When the note first appears through us (create). */
   created: string
   /** Later edit instants — each a chained `edited` revision. */
@@ -262,6 +269,7 @@ export class WorldBuilder {
       date: decl.created,
       space: decl.space,
       noteId,
+      physicalId: decl.id,
       path: decl.path,
       title: decl.title,
       content,

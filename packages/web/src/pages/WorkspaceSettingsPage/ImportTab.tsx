@@ -1,4 +1,5 @@
 import { useRef, useState } from 'react'
+import type { ImportSummary } from '@notarium/contract'
 
 import { useSpace } from '../../composers/SpaceProvider'
 import { Button } from '../../core/Button'
@@ -17,6 +18,23 @@ const MEMORY_DESC: Record<MemoryMode, string> = {
   space:
     "Memory entities go to this space's agent memory — hidden from the tree, reachable by agents via recall.",
 }
+
+/** Did the run leave anything behind? The tone of the summary Notice is the only
+ *  signal a user gets before reading it, so every kind of loss has to reach it: a
+ *  failed write, an attachment nobody imported, a copy whose links still point at
+ *  the source — and any per-file warning at all, because a warning worth printing
+ *  is worth colouring. Only `failed`/`ignored` used to count, so an import that
+ *  left 5 000 notes linked to the corpus they came from was reported in green.
+ *  The counters come first because they are the half that survives scale: `files`
+ *  is a 200-row sample, so on a 10 000-file import the warning rows are exactly
+ *  what the cap threw away. Scanning them still earns its place — it colours the
+ *  warnings that have no counter of their own, on the imports small enough to
+ *  show them all. */
+const lostSomething = (summary: ImportSummary): boolean =>
+  summary.failed > 0 ||
+  (summary.ignored?.count ?? 0) > 0 ||
+  (summary.repointFailed ?? 0) > 0 ||
+  summary.files.some((file) => file.warnings.length > 0)
 
 // Import (#11, #191): upload a Claude / ChatGPT / MCP-memory export and convert it
 // to notes (the inverse of Export). The user drops the file they downloaded — a .zip
@@ -80,14 +98,26 @@ export const ImportTab = () => {
   }
 
   const done = job?.progress.done ?? 0
-  // No job yet ⇒ the upload is still streaming; pending ⇒ queued; else writing.
-  const phaseLabel = !job ? 'Uploading…' : job.status === 'pending' ? 'Queued…' : 'Importing…'
+  const total = job?.progress.total ?? null
+  // A markdown tree knows its member count once planning ends, so the bar becomes
+  // determinate then; a foreign export never does. `done` is PROCESSED work — it
+  // must not be labelled "imported", or a run full of failures reads as a success.
+  const ratio = total && total > 0 ? Math.min(1, done / total) : null
+  // No job yet ⇒ the upload is still streaming; pending ⇒ queued; planning ⇒ the
+  // zero-write pass over the archive; else writing.
+  const phaseLabel = !job
+    ? 'Uploading…'
+    : job.status === 'pending'
+      ? 'Queued…'
+      : job.progress.phase === 'planning'
+        ? 'Reading the archive…'
+        : 'Importing…'
 
   return (
     <>
       <SettingsSection
         title="Import"
-        description="Bring an existing knowledge base in. Upload a Claude or ChatGPT data export (the .zip you downloaded, or its conversations.json), or an MCP memory.json — each conversation or entity becomes a note. Large imports run in the background — you can leave this tab and come back."
+        description="Bring an existing knowledge base in. Upload a Claude or ChatGPT data export (the .zip you downloaded, or its conversations.json), an MCP memory.json, or a .zip of Markdown files — a Notarium export or an Obsidian-style vault, whose folders are reproduced as they are. A Markdown archive is imported as a COPY: the notes are new, and links between them point at the copies. Large imports run in the background — you can leave this tab and come back."
         testId="import-section"
       >
         <div className={styles.picker}>
@@ -115,7 +145,7 @@ export const ImportTab = () => {
 
       <SettingsSection
         title="Skip existing notes"
-        description="On re-import, skip notes that already exist instead of overwriting them — useful when topping up an updated history."
+        description="On re-import, skip notes that already exist instead of overwriting them — useful when topping up an updated history. It is not a recovery mode: to heal a previously failed import's content and links, re-import with this off."
         htmlFor="import-skip"
         action={
           <Switch
@@ -150,14 +180,18 @@ export const ImportTab = () => {
         {busy && (
           <div className={styles.progress} data-testid="import-progress">
             <div className={styles.bar}>
-              {/* A ZIP's note count is unknown upfront, so the bar is always
-                  indeterminate — the honest signal is the live written count + phase. */}
-              <div className={styles.fill} data-indeterminate="true" />
+              {/* Determinate only once a plan exists: before that the member count
+                  is genuinely unknown, and a fake percentage is worse than none. */}
+              {ratio === null ? (
+                <div className={styles.fill} data-indeterminate="true" />
+              ) : (
+                <div className={styles.fill} style={{ width: `${Math.round(ratio * 100)}%` }} />
+              )}
             </div>
             <div className={styles.status}>
               <span>
                 {phaseLabel}
-                {done > 0 ? ` ${done} imported` : ''}
+                {total ? ` ${done} of ${total} processed` : done > 0 ? ` ${done} processed` : ''}
               </span>
               <Button variant="ghost" onClick={cancel} data-testid="import-cancel">
                 Cancel
@@ -173,12 +207,33 @@ export const ImportTab = () => {
         )}
 
         {summary && !busy && (
-          <Notice variant={summary.failed > 0 ? 'warning' : 'success'} className={styles.result}>
+          <Notice
+            variant={lostSomething(summary) ? 'warning' : 'success'}
+            className={styles.result}
+          >
             <div data-testid="import-summary">
               Imported <strong>{summary.imported}</strong> note{summary.imported === 1 ? '' : 's'}
               {summary.skipped > 0 ? `, ${summary.skipped} skipped` : ''}
               {summary.failed > 0 ? `, ${summary.failed} failed` : ''}.
             </div>
+            {summary.ignored && summary.ignored.count > 0 && (
+              <div className={styles.warning} data-testid="import-ignored">
+                Ignored {summary.ignored.count} non-Markdown file
+                {summary.ignored.count === 1 ? '' : 's'} (attachments are not imported yet)
+                {summary.ignored.files.length ? `: ${summary.ignored.files.join(', ')}` : ''}
+                {summary.ignored.filesOmitted ? ` …and ${summary.ignored.filesOmitted} more` : ''}
+              </div>
+            )}
+            {/* The exact count, beside the per-file warnings rather than instead of
+                them: those stop at 200 rows, and an archive big enough to lose them
+                is precisely the one where nobody would ever notice by reading. */}
+            {summary.repointFailed ? (
+              <div className={styles.warning} data-testid="import-repoint-failed">
+                Internal links were left pointing at the source in {summary.repointFailed} note
+                {summary.repointFailed === 1 ? '' : 's'} — those copies link to the archive they
+                came from, not to each other.
+              </div>
+            ) : null}
             {summary.files.map((f) => (
               <div key={f.file} className={styles.fileLine}>
                 {f.file} → {f.format} ({f.imported}
@@ -190,6 +245,23 @@ export const ImportTab = () => {
                 ))}
               </div>
             ))}
+            {summary.filesOmitted ? (
+              <div className={styles.fileLine} data-testid="import-files-omitted">
+                …and {summary.filesOmitted} more file{summary.filesOmitted === 1 ? '' : 's'}
+              </div>
+            ) : null}
+            {summary.errors.map((e, i) => (
+              <div key={i} className={styles.warning}>
+                {e.title ? `${e.title}: ` : ''}
+                {e.error}
+              </div>
+            ))}
+            {summary.errorsOmitted ? (
+              <div className={styles.warning} data-testid="import-errors-omitted">
+                …and {summary.errorsOmitted} more error
+                {summary.errorsOmitted === 1 ? '' : 's'}
+              </div>
+            ) : null}
           </Notice>
         )}
 

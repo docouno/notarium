@@ -40,7 +40,10 @@ const META_DB = `${DATA}/meta.db`
 const REPLAY_KEYRING = `${DATA}/replay-keyring`
 const MANIFEST = 'manifest.json'
 const ATOMIC_NOTE_TEMP = /^\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/i
-const IMPORT_PART = /^imports\/[^/]+\/[^/]+\.import\.part$/
+// A per-run temp of the import contour: the half-written upload, and the plan
+// sidecar a claim writes before publishing it atomically. Neither is data a
+// backup should carry — they exist only until their atomic publication lands.
+const IMPORT_PART = /^imports\/[^/]+\/[^/]+\.import(?:\.part|-plan\.part-.+)$/
 const EXPORT_PART = /^[^/]+\/[^/]+\.[^/]+\.part$/
 export const DEFAULT_MAX_BACKUP_BYTES = 64 * 1024 * 1024 * 1024
 export const DEFAULT_MAX_BACKUP_ENTRIES = 1_000_000

@@ -715,6 +715,10 @@ const run = async (): Promise<void> => {
           content: e.content,
           directory: route.directory,
           fileName: route.fileName,
+          // A fixture-pinned physical id (the identity an authored
+          // `[[notarium-id:…]]` in some other seeded note points at). Absent for
+          // every ordinary note, which keeps minting its own.
+          ...(e.physicalId ? { id: e.physicalId } : {}),
           // `pin` makes a note an always-load CONTEXT pin (the #165 tag the pult reads via
           // weighAlwaysLoad) AND a #42 favorite (below) — the two senses the decl documents.
           // Without the tag a seeded stand's pult showed ZERO local pins (only sets/scope-pins).
@@ -1251,6 +1255,8 @@ const run = async (): Promise<void> => {
     // succeeded: run the real handler, then record what it actually produced.
     const out = await exportHandler({
       job: claimed,
+      // The lease this seeded run holds — the claim above stamped it.
+      lease: claimed.lockedBy ?? 'seed',
       artifacts: jobArtifacts,
       signal: new AbortController().signal,
       report: async () => {},

@@ -949,7 +949,15 @@ export type JobsPersistence = {
   fail(
     id: string,
     workerId: string,
-    f: { error: string; retryAt?: string | null; now: string },
+    f: {
+      error: string
+      retryAt?: string | null
+      now: string
+      /** A bounded outcome a TERMINAL failure carries (an import's partial
+       *  summary). Ignored when `retryAt` is set: a retryable failure has no
+       *  outcome yet. canon: docs/jobs.md#a-terminal-failure-may-carry-a-result-302 */
+      result?: unknown
+    },
   ): Promise<boolean>
   /** Cooperative cancel: mark `canceled` while `pending` or `running`. A pending
    *  job is simply never claimed; a running job's next heartbeat returns false and
@@ -976,6 +984,165 @@ export type JobsPersistence = {
   clearArtifact(id: string, now: string): Promise<void>
   /** Prune terminal rows older than `before` — bounds the table. */
   prune(before: string): Promise<void>
+}
+
+// ── import path reservation (#302) ───────────────────────────────────────────
+
+/** Whose identity a reserved destination carries. `existing-reference` means the
+ *  path already holds an authoritative id the plan merely points at; `fresh-owned`
+ *  means the plan minted the id. It is DESCRIPTION, not a check: nothing in this
+ *  facet reads it back to decide anything, and it is written here so a claim is
+ *  readable as the batch it belongs to. It is also the reason nothing here ever
+ *  releases an identity — a reservation holds a claim on a PATH, never on the note
+ *  standing at it. canon: docs/import.md#importing-a-markdown-tree-302 */
+export const IMPORT_RESERVATION_OWNERSHIP = {
+  existingReference: 'existing-reference',
+  freshOwned: 'fresh-owned',
+} as const
+
+export type ImportReservationOwnership =
+  (typeof IMPORT_RESERVATION_OWNERSHIP)[keyof typeof IMPORT_RESERVATION_OWNERSHIP]
+
+/** One planned destination as the caller asks for it. What this facet ARBITRATES is
+ *  `destinationPath` and nothing else — the unique index on `(space,
+ *  destination_path)` is the whole exclusion. The other three fields are the batch
+ *  described at the granularity design 02 asks for (one row per archive member, not
+ *  per path), so a claim can be read back and attributed; the write does not consult
+ *  them, and neither does anything else here. */
+export type ImportReservationEntryInput = {
+  /** Stable key of the plan entry — an archive member, not an id: the outcome is
+   *  addressed by WHERE it came from, so a remint stays a detail. */
+  entryKey: string
+  /** The reserved path — the ONE field with an invariant behind it. */
+  destinationPath: string
+  /** Descriptive: the id the plan meant to write here. */
+  targetId: string
+  /** Descriptive: the id the plan expected to already stand here, or null. */
+  expectedId: string | null
+  ownership: ImportReservationOwnership
+}
+
+/** A claim reads back exactly as it was asked for: the row holds the PLAN and
+ *  nothing derived from it. What actually landed is deliberately not a column —
+ *  recording a publish is a second write, and a crash lands between the two, so
+ *  the flag could only ever repeat the question. The note at the destination is the
+ *  arbiter, and a retry re-proves it physically, against the plan it re-reads.
+ *  canon: docs/import.md#importing-a-markdown-tree-302 */
+export type ImportReservationEntry = ImportReservationEntryInput
+
+export type ImportReservation = {
+  id: string
+  space: string
+  jobId: string
+  uploadRef: string
+  /** Re-proved by every planned write; a reclaimed job gets a newer one, which is
+   *  what makes the previous run's writes fail instead of racing. */
+  fence: string
+  /** `active` while the owning job may still write. `closing` is the crash window
+   *  of `closeForJob` on a dialect that cannot flip and delete in one transaction:
+   *  a reservation found in it is on its way out, so every write path refuses it
+   *  rather than reviving a claim cleanup already gave up. */
+  status: 'active' | 'closing'
+  entries: ImportReservationEntry[]
+}
+
+/** Why a reservation could not be taken. Both are pre-write refusals — the point
+ *  of reserving at all is that the conflict is known before any note lands. */
+export const IMPORT_RESERVATION_REFUSAL = {
+  /** The job row is not running under this lease (canceled, reaped, terminal). */
+  jobNotCurrent: 'job_not_current',
+  /** Another live reservation already owns one of these destinations. */
+  pathConflict: 'path_conflict',
+  /** The reservation vanished, or this fence is no longer the current one. */
+  staleFence: 'stale_fence',
+} as const
+
+export type ImportReservationRefusal =
+  (typeof IMPORT_RESERVATION_REFUSAL)[keyof typeof IMPORT_RESERVATION_REFUSAL]
+
+export type ImportReservationOutcome =
+  | { ok: true; reservation: ImportReservation }
+  | { ok: false; reason: ImportReservationRefusal; detail?: string }
+
+/** What a fenced physical write is handed once the exclusion is held — the claim
+ *  row as it was reserved, plus the reservation it belongs to.
+ *
+ *  It is INFORMATIONAL, and the caller is free to ignore it: the import port takes
+ *  `fenced(destinationPath, write)` and its `write` closes over the sidecar plan,
+ *  which is the authoritative source of the ids. Nothing downstream re-derives a
+ *  decision from these fields, so a mismatch between them and the plan is not a
+ *  refusal anywhere — the exclusion this facet sells is the PATH, and that is proven
+ *  by finding a claim of this reservation standing at it. */
+export type FencedImportEntry = ImportReservationEntry & { reservationId: string }
+
+/** Both dialects implement this, which is what admits it to `MetaDb` at all: a
+ *  driver that throws is worse than one that does not claim the capability. SQLite
+ *  holds the exclusion by a process-owned per-job ordering, PostgreSQL by the L0j
+ *  advisory of `drivers/pg/lockOrder.ts` — same contract, different mechanism.
+ *  canon: docs/import.md#importing-a-markdown-tree-302 */
+export type ImportReservationsPersistence = {
+  /** Take the batch for this upload, or idempotently re-read the one it already
+   *  has. Proves the job row is running under `workerLease` FIRST: a terminal or
+   *  reclaimed job must not be able to create a late reservation.
+   *
+   *  Idempotent re-read means THIS job's reservation. An upload is a job's own
+   *  staged file, so a row of the same upload under another job id is not the
+   *  caller's to continue — handing it back would let a job write under a
+   *  reservation that closing its own job never finds. Taking over is `adopt`,
+   *  which re-fences; here it is a refusal. A reservation already `closing` is
+   *  refused for the same reason: cleanup has given up on it. */
+  reserve(input: {
+    space: string
+    jobId: string
+    workerLease: string
+    uploadRef: string
+    entries: readonly ImportReservationEntryInput[]
+    now: string
+  }): Promise<ImportReservationOutcome>
+  /** Re-claim an existing reservation under a NEW fence (a reaped-and-reclaimed
+   *  job). The old fence stops working the moment this returns. Moving the job id
+   *  is the POINT here — this is the one takeover the design has — but a
+   *  reservation already `closing` is refused: it is being dropped, not handed on. */
+  adopt(input: {
+    space: string
+    jobId: string
+    workerLease: string
+    uploadRef: string
+    now: string
+  }): Promise<ImportReservationOutcome>
+  /** Hold this destination's exclusion for the whole of `mutate` — which is the
+   *  PHYSICAL write. The premise (job still running under this lease, reservation
+   *  still owned by this job, fence still current, THIS reservation's claim standing
+   *  at this very path) is proven inside the same exclusion, so nothing can
+   *  invalidate it between the check and the publish, and `mutate` is not entered at
+   *  all when any part of it fails. A destination nobody claimed and one a rival
+   *  import claimed are the same refusal: neither is this write's to publish into.
+   *  A refusal throws rather than returning, so no caller can ignore it. */
+  withFencedWrite<T>(
+    input: {
+      reservationId: string
+      fence: string
+      jobId: string
+      workerLease: string
+      space: string
+      destinationPath: string
+    },
+    mutate: (entry: FencedImportEntry) => Promise<T>,
+  ): Promise<T>
+  /** The reservation a job currently holds, if any. */
+  forJob(jobId: string): Promise<ImportReservation | null>
+  /** Terminal cleanup: every claim of this job goes away, idempotently and under
+   *  the same exclusion a write takes, so a late write of that job fails its fence
+   *  instead of racing the delete. It needs nothing but the job id — a claim is a
+   *  claim on a PATH, so dropping it frees the path and touches no identity, which
+   *  is also why an existing-reference destination cannot be released here: this
+   *  layer never owned the note standing at it. Recovery from a crash mid-run is
+   *  the retry's business — it re-reads the plan and re-proves each destination
+   *  physically — not cleanup's. */
+  closeForJob(input: { jobId: string; now: string }): Promise<void>
+  /** Job ids an active reservation still references — the prune guard reads it so
+   *  retention cannot delete the row a live claim points at. */
+  activeJobIds(): Promise<string[]>
 }
 
 /** The meta-DB: all persistence facets over one connection + one migration history.
@@ -1006,6 +1173,8 @@ export type MetaDb = {
   contextOrder: ContextOrderPersistence
   oauth: OAuthPersistence
   jobs: JobsPersistence
+  /** Destination claims of a running import (#302). */
+  importReservations: ImportReservationsPersistence
   /** Owner-scoped/cross-space, so NOT swept by purgeSpace (like oauth). */
   retrievalLog: RetrievalLogPersistence
   /** Stamp pre-space-column rows ('') with the legacy single-space's id, BEFORE any

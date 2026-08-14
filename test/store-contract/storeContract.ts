@@ -9,7 +9,7 @@
 // engine-specific byte-level output — that's what would make a second engine
 // unimplementable.
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 
 import { SyncStatusSchema } from '@notarium/contract'
 import {
@@ -1270,6 +1270,192 @@ export const describeKnowledgeStoreContract = (
           await store.remove(idOf(n))
         }
       }
+    })
+
+    // ── The planned-destination guard (#302): a caller that settled a
+    //    destination's identity BEFORE the write states what it expects to find
+    //    there, and the store proves it against its own truth as it publishes.
+    //    Without it, an import's `overwrite` would replace whatever appeared in
+    //    the meantime — taking that note's identity with it.
+    describe('planned destination guard', () => {
+      const TITLE_P = 'Contract Planned'
+
+      const cleanup = async () => {
+        const n = byTitle(await store.list(), TITLE_P)
+
+        if (n) {
+          await store.remove(idOf(n))
+        }
+      }
+
+      afterEach(cleanup)
+
+      it('creates when the path really is free, under the planned identity', async () => {
+        const planned = 'PlannedIdAAAA'
+        const written = await store.write({
+          title: TITLE_P,
+          directory: dir,
+          content: 'planned body',
+          id: planned,
+          expectedDestinationId: null,
+        })
+
+        expect(written.id).toBe(planned)
+      })
+
+      it('refuses when a stranger took the destination the plan expected to be free', async () => {
+        // The note that appeared between planning and writing.
+        await store.write({ title: TITLE_P, directory: dir, content: 'the other note' })
+        const occupant = byTitle(await store.list(), TITLE_P)!
+
+        await expect(
+          store.write({
+            title: TITLE_P,
+            directory: dir,
+            content: 'CLOBBER',
+            id: 'PlannedIdBBBB',
+            expectedDestinationId: null,
+            ifExists: IF_EXISTS.overwrite,
+          }),
+        ).rejects.toMatchObject({ reason: 'destination_owner_conflict' })
+        // Its identity AND its body survived.
+        const after = byTitle(await store.list(), TITLE_P)!
+
+        expect(idOf(after)).toBe(idOf(occupant))
+        expect((await store.read(idOf(after))).content).toContain('the other note')
+      })
+
+      it('converges when the occupant IS the planned identity — the same plan replaying', async () => {
+        const planned = 'PlannedIdCCCC'
+
+        await store.write({
+          title: TITLE_P,
+          directory: dir,
+          content: 'first attempt',
+          id: planned,
+          expectedDestinationId: null,
+        })
+        await store.write({
+          title: TITLE_P,
+          directory: dir,
+          content: 'retry attempt',
+          id: planned,
+          expectedDestinationId: null,
+          ifExists: IF_EXISTS.overwrite,
+        })
+        const after = byTitle(await store.list(), TITLE_P)!
+
+        // A bare engine keys notes by path and surfaces no id here; what both
+        // must agree on is that the replay converged onto ONE note.
+        expect(after.id ?? planned).toBe(planned)
+        expect((await store.read(idOf(after))).content).toContain('retry attempt')
+      })
+
+      it('overwrites an expected owner and keeps its identity', async () => {
+        const owner = 'PlannedIdDDDD'
+
+        await store.write({
+          title: TITLE_P,
+          directory: dir,
+          content: 'before',
+          id: owner,
+          expectedDestinationId: null,
+        })
+        await store.write({
+          title: TITLE_P,
+          directory: dir,
+          content: 'after',
+          id: owner,
+          expectedDestinationId: owner,
+          ifExists: IF_EXISTS.overwrite,
+        })
+        const after = byTitle(await store.list(), TITLE_P)!
+
+        expect((await store.read(idOf(after))).content).toContain('after')
+        expect(after.id ?? owner).toBe(owner)
+      })
+
+      it('refuses when the expected owner is not the one standing there', async () => {
+        await store.write({
+          title: TITLE_P,
+          directory: dir,
+          content: 'the real owner',
+          id: 'PlannedIdEEEE',
+          expectedDestinationId: null,
+        })
+
+        await expect(
+          store.write({
+            title: TITLE_P,
+            directory: dir,
+            content: 'CLOBBER',
+            id: 'PlannedIdFFFF',
+            expectedDestinationId: 'PlannedIdGGGG',
+            ifExists: IF_EXISTS.overwrite,
+          }),
+        ).rejects.toMatchObject({ reason: 'destination_owner_conflict' })
+        expect((await store.read('PlannedIdEEEE')).content).toContain('the real owner')
+      })
+
+      it('refuses when the expected owner vanished', async () => {
+        await expect(
+          store.write({
+            title: TITLE_P,
+            directory: dir,
+            content: 'body',
+            id: 'PlannedIdHHHH',
+            expectedDestinationId: 'PlannedIdHHHH',
+            ifExists: IF_EXISTS.overwrite,
+          }),
+        ).rejects.toMatchObject({ reason: 'destination_owner_conflict' })
+      })
+
+      // `skipExisting` is not a licence to stop asking whose note it is. A plan that
+      // expected a FREE path and found a stranger has to say so — reporting it as a
+      // note that was skipped tells the user their tree imported cleanly when one of
+      // its notes silently was not written.
+      it('refuses a stranger even when the caller would rather skip than overwrite', async () => {
+        await store.write({ title: TITLE_P, directory: dir, content: 'the other note' })
+
+        await expect(
+          store.write({
+            title: TITLE_P,
+            directory: dir,
+            content: 'planned body',
+            id: 'PlannedIdIIII',
+            expectedDestinationId: null,
+            ifExists: IF_EXISTS.fail,
+          }),
+        ).rejects.toMatchObject({ reason: 'destination_owner_conflict' })
+        expect((await store.read(idOf(byTitle(await store.list(), TITLE_P)!))).content).toContain(
+          'the other note',
+        )
+      })
+
+      // The same question asked of the expected-owner branch: a verified skip has to
+      // verify. Same owner, so it really is a skip and the body stays as it was.
+      it('skips only after proving the expected owner is the one standing there', async () => {
+        const owner = 'PlannedIdJJJJ'
+
+        await store.write({
+          title: TITLE_P,
+          directory: dir,
+          content: 'original body',
+          id: owner,
+          expectedDestinationId: null,
+        })
+        await expect(
+          store.write({
+            title: TITLE_P,
+            directory: dir,
+            content: 'would replace',
+            id: owner,
+            expectedDestinationId: owner,
+            ifExists: IF_EXISTS.fail,
+          }),
+        ).rejects.toMatchObject({ reason: 'note_already_exists' })
+        expect((await store.read(owner)).content).toContain('original body')
+      })
     })
 
     // ── Optimistic writes (P3): the compare-and-swap every CAS-capable

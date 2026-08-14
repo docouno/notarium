@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ImportSummary, Job } from '@notarium/contract'
 import { SSE_EVENT } from '@notarium/contract/events'
 
-import { api, JOB_POLL_MS } from '../../services/api'
+import { api, ApiError, type ImportProgressLine, JOB_POLL_MS } from '../../services/api'
 
 // The durable-import client hook (#191 [JOBS][B]) — the inverse of useExportJob.
 // Drives one import job through its lifecycle for the Import tab: upload → enqueue →
@@ -29,19 +29,84 @@ export type ImportJobState = {
   busy: boolean
 }
 
-/** The import outcome, once succeeded — read off job.result (the server puts the
- *  ImportSummary there; null for any non-succeeded / result-less job). */
+/** How many detail rows this tab will ever render per collection. The server caps
+ *  the same way, but a result persisted by an older build predates that cap — and
+ *  a 10 000-row Notice is a frozen tab, not a diagnostic. */
+const DETAIL_CAP = 200
+
+const cap = <T>(rows: readonly T[] | undefined): { rows: T[]; omitted: number } => {
+  const all = Array.isArray(rows) ? rows : []
+
+  return { rows: all.slice(0, DETAIL_CAP), omitted: Math.max(0, all.length - DETAIL_CAP) }
+}
+
+/** Structurally normalize a result the server (or an older server) produced.
+ *  Deliberately hand-written rather than the contract's Zod schema: the web bundle
+ *  does not ship Zod (canon: docs/contract.md), and a stricter parser would throw
+ *  away a real outcome over a field it did not expect. */
+export const normalizeImportSummary = (raw: unknown): ImportSummary | null => {
+  if (!raw || typeof raw !== 'object') {
+    return null
+  }
+  const value = raw as Record<string, unknown>
+  const count = (key: string) => (typeof value[key] === 'number' ? (value[key] as number) : 0)
+  const files = cap(value.files as ImportSummary['files'])
+  const errors = cap(value.errors as ImportSummary['errors'])
+  const ignoredRaw = value.ignored as ImportSummary['ignored']
+  const ignoredFiles = cap(ignoredRaw?.files)
+  const omitted = (declared: unknown, local: number) =>
+    (typeof declared === 'number' ? declared : 0) + local
+
+  return {
+    imported: count('imported'),
+    skipped: count('skipped'),
+    failed: count('failed'),
+    files: files.rows,
+    filesOmitted: omitted(value.filesOmitted, files.omitted) || undefined,
+    errors: errors.rows,
+    errorsOmitted: omitted(value.errorsOmitted, errors.omitted) || undefined,
+    // Not derived from the rows: the per-file warnings that say the same thing are
+    // capped on both sides, so recomputing this from what survived the cap would
+    // under-report exactly the imports big enough for it to matter. A result from
+    // a server that predates the field simply has none, and reads as zero.
+    repointFailed: count('repointFailed') || undefined,
+    ignored: ignoredRaw
+      ? {
+          count: typeof ignoredRaw.count === 'number' ? ignoredRaw.count : 0,
+          files: ignoredFiles.rows,
+          filesOmitted: omitted(ignoredRaw.filesOmitted, ignoredFiles.omitted) || undefined,
+        }
+      : undefined,
+    created: Array.isArray(value.created) ? (value.created as string[]).slice(0, DETAIL_CAP) : [],
+  }
+}
+
+/** The import outcome — read off job.result. A FAILED job may carry one too: an
+ *  import that wrote N notes and then hit a terminal conflict reports both the
+ *  error and those N. A canceled job has no honest result to show. */
 const summaryOf = (job: Job | null): ImportSummary | null =>
-  job && job.status === 'succeeded' ? ((job.result as ImportSummary | null) ?? null) : null
+  job && (job.status === 'succeeded' || job.status === 'failed')
+    ? normalizeImportSummary(job.result)
+    : null
 
 /** A synthetic Job for the synchronous fallback (none-mode) so the tab renders the
  *  same progress bar / summary as a real durable job. `id:'sync'` is never sent to the
  *  server (cancel aborts the fetch instead). */
-const syncJob = (status: Job['status'], done: number, extra?: Partial<Job>): Job => ({
+const syncJob = (
+  status: Job['status'],
+  progress: { done: number; total?: number | null; phase?: string },
+  extra?: Partial<Job>,
+): Job => ({
   id: 'sync',
   kind: 'import',
   status,
-  progress: { done, total: null, ratio: null, phase: status === 'succeeded' ? 'done' : 'writing' },
+  progress: {
+    done: progress.done,
+    total: progress.total ?? null,
+    ratio:
+      progress.total && progress.total > 0 ? Math.min(1, progress.done / progress.total) : null,
+    phase: progress.phase ?? (status === 'succeeded' ? 'done' : 'writing'),
+  },
   artifact: null,
   result: null,
   error: null,
@@ -158,16 +223,24 @@ export const useImportJob = (space: string) => {
           return
         }
         // Synchronous fallback (none-mode): drive the NDJSON stream into a synthetic job.
-        setState({ job: syncJob('running', 0), busy: true, error: null })
-        const summary = await started.run((n) => {
+        setState({ job: syncJob('running', { done: 0 }), busy: true, error: null })
+        const summary = await started.run((p: ImportProgressLine) => {
           if (live()) {
-            setState({ job: syncJob('running', n), busy: true, error: null })
+            setState({
+              job: syncJob('running', {
+                done: p.done ?? p.imported,
+                total: p.total,
+                phase: p.phase,
+              }),
+              busy: true,
+              error: null,
+            })
           }
         })
 
         if (live()) {
           setState({
-            job: syncJob('succeeded', summary.imported, { result: summary }),
+            job: syncJob('succeeded', { done: summary.imported }, { result: summary }),
             busy: false,
             error: null,
           })
@@ -177,13 +250,21 @@ export const useImportJob = (space: string) => {
           return
         } // torn down — don't paint stale state (e.g. on a new space)
         if (ac.signal.aborted) {
-          setState({ job: syncJob('canceled', 0), busy: false, error: 'import canceled' })
+          setState({ job: syncJob('canceled', { done: 0 }), busy: false, error: 'import canceled' })
           return
         }
+        const message = err instanceof Error ? err.message : 'import failed'
+        // A synchronous failure that carried a partial summary becomes a synthetic
+        // FAILED job holding it: the notes it did write are real, and dropping the
+        // result here would tell the user nothing happened.
+        const partial = err instanceof ApiError ? err.partial : undefined
+
         setState({
-          job: null,
+          job: partial
+            ? syncJob('failed', { done: partial.imported }, { result: partial, error: message })
+            : null,
           busy: false,
-          error: err instanceof Error ? err.message : 'import failed',
+          error: message,
         })
       } finally {
         if (live()) {
@@ -258,10 +339,15 @@ export const useImportJob = (space: string) => {
           watch(active.id)
           return
         }
-        const done = list.find((j) => j.status === 'succeeded')
+        // The NEWEST terminal import, not the newest SUCCESSFUL one: a failed
+        // partial import is the outcome the user needs to see, and falling back to
+        // an older success would quietly claim everything went fine.
+        const terminal = list.find(
+          (j) => j.status === 'succeeded' || j.status === 'failed' || j.status === 'canceled',
+        )
 
-        if (done) {
-          apply(done)
+        if (terminal) {
+          apply(terminal)
         }
       })
       .catch(() => {
