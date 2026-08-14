@@ -33,6 +33,7 @@ import { ErrorBoundary } from './core/ErrorBoundary'
 import { DocumentLayout } from './layouts/DocumentLayout'
 import { useAutoHideScrollbars } from './libs/hooks/useAutoHideScrollbars'
 import {
+  agentActivityRoute,
   agentContextRoute,
   AGENTS_PREFIX,
   FOLDER_PREFIX,
@@ -69,6 +70,12 @@ import {
   ProjectsTab,
   WorkspaceSettingsPage,
 } from './pages/WorkspaceSettingsPage'
+
+const ActivityRedirect = ({ preserveId = false }: { preserveId?: boolean }) => {
+  const { id } = useParams<{ id: string }>()
+  const { search } = useLocation()
+  return <Navigate to={agentActivityRoute(preserveId ? id : undefined, search)} replace />
+}
 
 // App = the provider stack around a thin router. The router is a replaceable
 // edge (docs/web-ui.md): it owns URL↔page mapping, links and the
@@ -205,21 +212,35 @@ const router = createBrowserRouter([
             },
           },
           {
-            path: 'sessions',
+            path: 'activity',
             lazy: async () => {
-              const { SessionsPage } = await import('./pages/AgentsPage/SessionsPage')
+              const { ActivityFrame } = await import('./pages/AgentsPage/ActivityFrame')
 
-              return { Component: SessionsPage }
+              return { Component: ActivityFrame }
             },
-          },
-          {
-            path: 'sessions/:id',
-            lazy: async () => {
-              const { SessionPage } = await import('./pages/AgentsPage/SessionPage')
+            children: [
+              {
+                index: true,
+                lazy: async () => {
+                  const { ActivityPage } = await import('./pages/AgentsPage/ActivityPage')
 
-              return { Component: SessionPage }
-            },
+                  return { Component: ActivityPage }
+                },
+              },
+              { path: 'all', element: <ActivityRedirect /> },
+              {
+                path: ':id',
+                lazy: async () => {
+                  const { ActivityEpisodePage } =
+                    await import('./pages/AgentsPage/ActivityEpisodePage')
+
+                  return { Component: ActivityEpisodePage }
+                },
+              },
+            ],
           },
+          { path: 'sessions', element: <ActivityRedirect /> },
+          { path: 'sessions/:id', element: <ActivityRedirect preserveId /> },
           {
             path: 'roles',
             lazy: async () => {
@@ -228,9 +249,9 @@ const router = createBrowserRouter([
               return { Component: RolesPage }
             },
           },
-          { path: 'audit', element: <Navigate to="/agents/sessions" replace /> },
-          { path: 'session', element: <Navigate to="/agents/sessions" replace /> },
-          { path: 'session/*', element: <Navigate to="/agents/sessions" replace /> },
+          { path: 'audit', element: <ActivityRedirect /> },
+          { path: 'session', element: <ActivityRedirect /> },
+          { path: 'session/*', element: <ActivityRedirect /> },
         ],
       },
       {

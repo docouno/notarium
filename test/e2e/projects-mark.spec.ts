@@ -18,7 +18,7 @@ test('mark a folder as a project from the tree, see it in management, then unmar
 
   // right-click → Mark as project → confirm the dialog
   await demo.click({ button: 'right' })
-  await page.getByRole('menuitemradio', { name: 'Mark as project' }).click()
+  await page.getByRole('menuitem', { name: 'Mark as project' }).click()
   await page.getByRole('button', { name: 'Mark as project' }).click()
 
   // The badge appears on the folder row…
@@ -26,7 +26,7 @@ test('mark a folder as a project from the tree, see it in management, then unmar
   // …and the menu is now contextual — the SAME folder offers "Unmark project"
   // (proves the shared provider state updated, not just a local optimistic flag).
   await demo.click({ button: 'right' })
-  await expect(page.getByRole('menuitemradio', { name: 'Unmark project' })).toBeVisible()
+  await expect(page.getByRole('menuitem', { name: 'Unmark project' })).toBeVisible()
   await page.keyboard.press('Escape') // close the menu without acting
 
   // The space-management Projects list reflects it — one source of truth.
@@ -39,7 +39,7 @@ test('mark a folder as a project from the tree, see it in management, then unmar
   await page.goto('/')
   await expect(demo.getByTestId('project-badge')).toBeVisible()
   await demo.click({ button: 'right' })
-  await page.getByRole('menuitemradio', { name: 'Unmark project' }).click()
+  await page.getByRole('menuitem', { name: 'Unmark project' }).click()
   await page.getByRole('button', { name: 'Unmark' }).click()
   await expect(demo.getByTestId('project-badge')).toHaveCount(0)
 })
@@ -54,7 +54,7 @@ test('create a new empty project from the + menu — it shows as an empty projec
 }) => {
   await page.goto('/')
   await page.getByTestId('new-menu').click()
-  await page.getByRole('menuitemradio', { name: 'New project' }).click()
+  await page.getByRole('menuitem', { name: 'New project' }).click()
   await page.getByTestId('dialog-prompt-input').fill('Roadmap')
   await page.getByRole('button', { name: 'Create project' }).click()
 
@@ -68,7 +68,7 @@ test('create a new empty project from the + menu — it shows as an empty projec
   // an ordinary folder, so its first page can materialize immediately — no
   // restart/reconcile and no marker-only ghost in between.
   await roadmap.click({ button: 'right' })
-  await page.getByRole('menuitemradio', { name: 'Open page' }).click()
+  await page.getByRole('menuitem', { name: 'Open page' }).click()
   await expect(page.getByTestId('virtual-folder-page')).toBeVisible()
   await page.getByRole('button', { name: 'Edit', exact: true }).click()
   const editor = page.locator('.cm-content')
@@ -77,7 +77,7 @@ test('create a new empty project from the + menu — it shows as an empty projec
   await expect(page).toHaveURL(/\/n\/.+\/roadmap$/)
   await page.getByRole('button', { name: 'More actions' }).click()
   await expect(
-    page.getByRole('menuitemradio', { name: 'Unpin folder overview from agent context' }),
+    page.getByRole('menuitem', { name: 'Unpin folder overview from agent context' }),
   ).toBeVisible()
 
   // One source of truth — the space-management Projects list shows it too.

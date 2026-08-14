@@ -99,8 +99,8 @@ export const AXES: readonly AxisInfo[] = [
   },
   {
     axis: 'agent-audit',
-    title: 'Agent retrieval audit',
-    surfaces: ['agents-audit'],
+    title: 'Agent activity / retrieval audit',
+    surfaces: ['agents-activity'],
     refs: ['#243', 'projects.md', 'mcp-gateway.md'],
   },
   {

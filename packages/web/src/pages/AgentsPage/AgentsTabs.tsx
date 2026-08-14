@@ -1,21 +1,20 @@
 import { IconBot, IconHistory, IconScrollText } from '../../core/Icons'
 import { type PillTab, PillTabs } from '../../core/PillTabs'
 import {
+  agentActivityRoute,
   agentContextRoute,
   agentRolesRoute,
-  agentSessionsRoute,
 } from '../../libs/routing/routePaths'
 import { useAgentsSummary } from './AgentsProvider'
 
 // The Agents section nav (#243): a permanent pill-bar switching the Agents surface's
-// top-level sections — Context (the eager-load constructor, #165/#208) and Sessions
-// (the episode-first audit, #321). The SAME PillTabs the dashboard uses.
-// Each pill carries a live identity line from the shared AgentsChrome summary (Context =
-// its eager token load, Sessions = active + retained/archived episode counts)
+// top-level sections — Context (the eager-load constructor), Roles and Activity
+// (the owner-global audit). The SAME PillTabs the dashboard uses. Each pill carries a
+// live identity line from AgentsChrome (Activity = active + retained/archived episodes)
 // so the bar reads as the surface's primary nav, not a bare toggle. Grows as Agents gains
 // sections (roles/tokens) — each a routed `/agents/<section>`, SHELL-ready.
 
-export type AgentsSection = 'context' | 'roles' | 'sessions'
+export type AgentsSection = 'context' | 'roles' | 'activity'
 
 const fmtTokens = (n: number): string =>
   n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` : String(n)
@@ -72,12 +71,12 @@ export const AgentsTabs = ({ active }: { active: AgentsSection }) => {
       testId: 'agents-tab-roles',
     },
     {
-      key: 'sessions',
-      to: agentSessionsRoute(),
-      label: 'Sessions',
+      key: 'activity',
+      to: agentActivityRoute(),
+      label: 'Activity',
       icon: <IconHistory size={15} />,
       metric: sessionsMetric,
-      testId: 'agents-tab-sessions',
+      testId: 'agents-tab-activity',
     },
   ]
   return <PillTabs tabs={tabs} activeKey={active} ariaLabel="Agents sections" />

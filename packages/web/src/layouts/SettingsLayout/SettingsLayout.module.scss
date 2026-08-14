@@ -9,7 +9,7 @@
   padding: 28px 0 64px;
 }
 
-/* Section pill-bar (#243): the Agents sections (Context | Sessions) as a permanent bar
+/* Section pill-bar (#243): the Agents sections (Context | Roles | Activity) as a permanent bar
    above the surface body — the same PillTabs the dashboard uses. Spans the full inner
    width, over the [scope-rail | panel] split below. */
 .section-tabs {
@@ -23,7 +23,7 @@
   align-items: start;
 }
 
-/* No left rail (a section with no scope axis, e.g. Agents → Sessions): the panel takes
+/* No left rail (a section with no scope axis, e.g. Agents → Activity): the panel takes
    the whole width. */
 .body-no-rail {
   grid-template-columns: 1fr;

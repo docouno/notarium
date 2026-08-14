@@ -100,7 +100,7 @@ test('right-clicking a selected row deletes the whole selected note set (#206)',
   await expect(page.locator('[aria-selected="true"]')).toHaveCount(2)
 
   await page.locator(noteSel(a1!)).click({ button: 'right' })
-  await page.getByRole('menuitemradio', { name: 'Delete 2 items' }).click()
+  await page.getByRole('menuitem', { name: 'Delete 2 items' }).click()
   await page.getByRole('button', { name: 'Delete 2 items' }).click()
 
   await expect(page.locator(noteSel(a1!))).toHaveCount(0)
@@ -125,8 +125,8 @@ test('right-clicking an unselected row uses a single target and clears the old s
 
   await page.locator(folderSel('f3')).click({ button: 'right' })
   await expect(page.locator('[aria-selected="true"]')).toHaveCount(0)
-  await expect(page.getByRole('menuitemradio', { name: 'Delete' })).toBeVisible()
-  await expect(page.getByRole('menuitemradio', { name: 'Delete 2 items' })).toHaveCount(0)
+  await expect(page.getByRole('menuitem', { name: 'Delete' })).toBeVisible()
+  await expect(page.getByRole('menuitem', { name: 'Delete 2 items' })).toHaveCount(0)
 })
 
 test('folder plus descendant rows delete only the outer folder on the server (#206)', async ({
@@ -177,7 +177,7 @@ test('folder plus descendant rows delete only the outer folder on the server (#2
   await expect(page.locator('[aria-selected="true"]')).toHaveCount(3)
 
   await page.locator(folderBtnSel('f1')).click({ button: 'right' })
-  await page.getByRole('menuitemradio', { name: 'Delete 3 items' }).click()
+  await page.getByRole('menuitem', { name: 'Delete 3 items' }).click()
   await page.getByRole('button', { name: 'Delete 3 items' }).click()
 
   await expect(page.locator(folderSel('f1'))).toHaveCount(0)

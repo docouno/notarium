@@ -185,14 +185,22 @@ export const agentsRoute = (tab: string = DEFAULT_AGENTS_TAB): string => `${AGEN
 export const agentContextRoute = (scope: string = DEFAULT_AGENT_CONTEXT_SCOPE): string =>
   `${agentsRoute('context')}/${encodeURIComponent(scope)}`
 
-/** Legacy Agents → Audit route; the router redirects it to the session-first surface. */
+/** Legacy Agents → Audit route; the router redirects it to Activity. */
 export const agentAuditRoute = (): string => agentsRoute('audit')
 
-/** The session-first agent audit. `outside` is the explicit unbound-event bucket. */
-export const agentSessionsRoute = (sessionId?: string): string =>
-  sessionId
-    ? `${agentsRoute('sessions')}/${encodeURIComponent(sessionId)}`
-    : agentsRoute('sessions')
+/** The owner-global agent activity stream. A session id opens its permalink;
+ *  `outside` is the explicit unbound-event bucket. `state` carries the current
+ *  view filters through episode links and back navigation. */
+export const agentActivityRoute = (
+  sessionId?: string,
+  state?: URLSearchParams | string,
+): string => {
+  const path = sessionId
+    ? `${agentsRoute('activity')}/${encodeURIComponent(sessionId)}`
+    : agentsRoute('activity')
+  const query = typeof state === 'string' ? state.replace(/^\?/, '') : state?.toString()
+  return query ? `${path}?${query}` : path
+}
 
 /** The owned role library and discovery-only built-in catalog. */
 export const agentRolesRoute = (): string => agentsRoute('roles')

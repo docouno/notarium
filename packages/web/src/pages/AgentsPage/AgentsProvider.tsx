@@ -22,7 +22,6 @@ type AgentsSummaryData = {
 }
 
 export type AgentsSummary = AgentsSummaryData & {
-  updateSessions: (sessions: AgentSessions) => void
   updateContext: (context: MeAgentContext) => void
   updateRoles: (roles: MeAgentRolesResponse) => void
 }
@@ -51,7 +50,6 @@ const AgentsSummaryContext = createContext<AgentsSummary>({
   sessions: null,
   roles: null,
   loading: true,
-  updateSessions: noopUpdate,
   updateContext: noopUpdate,
   updateRoles: noopUpdate,
 })
@@ -70,10 +68,6 @@ export const AgentsChrome = () => {
   })
   const rolesVersion = useRef(0)
 
-  const updateSessions = useCallback((sessions: AgentSessions) => {
-    setSummary((prev) => ({ ...prev, sessions: sessionsSummaryOf(sessions), loading: false }))
-  }, [])
-
   const updateContext = useCallback((context: MeAgentContext) => {
     setSummary((prev) => ({ ...prev, context: contextSummaryOf(context), loading: false }))
   }, [])
@@ -83,10 +77,9 @@ export const AgentsChrome = () => {
     setSummary((prev) => ({ ...prev, roles: rolesSummaryOf(roles), loading: false }))
   }, [])
 
-  // The active overview feeds its own section summary. Direct session deep-links still need the
-  // one-row rollup; Context is always fetched because project scope does not update its metric.
+  // Every section uses the same cheap one-row rollup. The Activity stream reads a
+  // different endpoint, so it cannot feed this summary as the old overview did.
   useEffect(() => {
-    const onSessionsOverview = /^\/agents\/sessions\/?$/.test(landingPath)
     const onRoles = landingPath.startsWith('/agents/roles')
     const requestedRolesVersion = rolesVersion.current
     let alive = true
@@ -94,9 +87,7 @@ export const AgentsChrome = () => {
     void (async () => {
       const [ctx, sessions, roles] = await Promise.all([
         api.meAgentContextGet().catch(() => null),
-        onSessionsOverview
-          ? Promise.resolve(undefined)
-          : api.agentSessionsGet({ limit: 1, aggregates: '0' }).catch(() => null),
+        api.agentSessionsGet({ limit: 1, aggregates: '0' }).catch(() => null),
         onRoles ? Promise.resolve(undefined) : api.agentRolesGet().catch(() => null),
       ])
 
@@ -105,8 +96,7 @@ export const AgentsChrome = () => {
       }
       setSummary((prev) => ({
         context: ctx ? contextSummaryOf(ctx) : null,
-        sessions:
-          sessions === undefined ? prev.sessions : sessions ? sessionsSummaryOf(sessions) : null,
+        sessions: sessions ? sessionsSummaryOf(sessions) : null,
         roles:
           roles === undefined || rolesVersion.current !== requestedRolesVersion
             ? prev.roles
@@ -123,9 +113,7 @@ export const AgentsChrome = () => {
   }, [landingPath])
 
   return (
-    <AgentsSummaryContext.Provider
-      value={{ ...summary, updateSessions, updateContext, updateRoles }}
-    >
+    <AgentsSummaryContext.Provider value={{ ...summary, updateContext, updateRoles }}>
       <Outlet />
     </AgentsSummaryContext.Provider>
   )

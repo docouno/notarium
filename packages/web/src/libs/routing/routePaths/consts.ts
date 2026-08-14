@@ -89,6 +89,16 @@ export const FEED_URL_PARAMS = {
   favorite: 'favorite',
 } as const
 
+/** The Agents → Activity view's bookmarkable state. These are SPA keys, not the
+ *  `/api/me/agent-sessions*` wire contract (whose filtering key is `filter`). */
+export const AGENT_ACTIVITY_URL_PARAMS = {
+  group: 'group',
+  show: 'show',
+  agent: 'agent',
+  tool: 'tool',
+  q: 'q',
+} as const
+
 /** The trash view's bookmarkable query-keys. */
 export const TRASH_URL_PARAMS = {
   /** Which sub-view (all / notes / spaces); absent = 'all'. */

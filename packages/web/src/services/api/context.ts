@@ -63,24 +63,8 @@ export const contextApi = {
   },
   /** Session-first audit overview: retained + archived episodes, outside-session
    *  gaps and the global retrieval insights kept from the former Audit page. */
-  agentSessionsGet: (params: { limit?: number; cursor?: string; aggregates?: '0' } = {}) => {
-    const q = new URLSearchParams()
-
-    if (params.limit !== undefined) {
-      q.set(QUERY_KEY.limit, String(params.limit))
-    }
-    if (params.cursor) {
-      q.set(QUERY_KEY.cursor, params.cursor)
-    }
-    if (params.aggregates) {
-      q.set(QUERY_KEY.aggregates, params.aggregates)
-    }
-    const s = q.toString()
-    return req<AgentSessions>(`/api/me/agent-sessions${s ? `?${s}` : ''}`)
-  },
-  agentSessionEventsGet: (
-    id: string,
-    params: { limit?: number; cursor?: string; filter?: 'reads' | 'writes' } = {},
+  agentSessionsGet: (
+    params: { limit?: number; cursor?: string; filter?: 'reads' | 'writes'; aggregates?: '0' } = {},
   ) => {
     const q = new URLSearchParams()
 
@@ -93,9 +77,52 @@ export const contextApi = {
     if (params.filter) {
       q.set(QUERY_KEY.filter, params.filter)
     }
+    if (params.aggregates) {
+      q.set(QUERY_KEY.aggregates, params.aggregates)
+    }
+    const s = q.toString()
+    return req<AgentSessions>(`/api/me/agent-sessions${s ? `?${s}` : ''}`)
+  },
+  agentSessionEventsGet: (
+    id: string,
+    params: {
+      limit?: number
+      cursor?: string
+      filter?: 'reads' | 'writes'
+      agent?: string
+      tool?: AgentRetrievalTool
+      q?: string
+      aggregates?: '1'
+    } = {},
+    signal?: AbortSignal,
+  ) => {
+    const q = new URLSearchParams()
+
+    if (params.limit !== undefined) {
+      q.set(QUERY_KEY.limit, String(params.limit))
+    }
+    if (params.cursor) {
+      q.set(QUERY_KEY.cursor, params.cursor)
+    }
+    if (params.filter) {
+      q.set(QUERY_KEY.filter, params.filter)
+    }
+    if (params.agent) {
+      q.set(QUERY_KEY.agent, params.agent)
+    }
+    if (params.tool) {
+      q.set(QUERY_KEY.tool, params.tool)
+    }
+    if (params.q) {
+      q.set(QUERY_KEY.q, params.q)
+    }
+    if (params.aggregates) {
+      q.set(QUERY_KEY.aggregates, params.aggregates)
+    }
     const s = q.toString()
     return req<AgentSessionEvents>(
       `/api/me/agent-sessions/${encodeURIComponent(id)}${s ? `?${s}` : ''}`,
+      { signal },
     )
   },
   /** Toggle a note's `always-load` membership (id-addressed). Pin/unpin = the

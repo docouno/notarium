@@ -799,7 +799,7 @@ export const describeIdentityPersistenceContract = (
       // the revision mapper — so it needs its own proof that a gap stays a gap.
       const audit = await betaDb.sessionAudit.events({
         owner: 'someone',
-        sessionId: 'sess-1',
+        scope: { kind: 'session', id: 'sess-1' },
         type: 'write',
         limit: 10,
       })
@@ -816,6 +816,8 @@ export const describeIdentityPersistenceContract = (
         class: null,
         noteId: 'beta-auto-01',
         revisionKind: 'write',
+        sessionId: 'sess-1',
+        sessionName: 'Morning',
       })
       // …while a trusted write in the same session is untouched.
       expect(audited.find((e) => e?.id === alphaClean.id)).toMatchObject({
@@ -824,6 +826,20 @@ export const describeIdentityPersistenceContract = (
         agent: 'claude',
         class: 'user-doc',
       })
+      const filtered = await betaDb.sessionAudit.events({
+        owner: 'someone',
+        scope: { kind: 'session', id: 'sess-1' },
+        type: 'write',
+        agent: 'claude',
+        limit: 10,
+      })
+      expect(filtered).toMatchObject({
+        total: 1,
+        items: [expect.objectContaining({ id: alphaClean.id, agent: 'claude' })],
+      })
+      expect(await betaDb.sessionAudit.agentFacet('someone')).toEqual([
+        { agent: 'claude', count: 1 },
+      ])
     })
 
     it('never derives operational state from a gap, and purges it with the note', async () => {

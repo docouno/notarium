@@ -7,19 +7,19 @@ test('folder page shows a direct children summary under the page body', async ({
   await expect(demo).toBeVisible()
 
   await demo.click({ button: 'right' })
-  await page.getByRole('menuitemradio', { name: 'New folder' }).click()
+  await page.getByRole('menuitem', { name: 'New folder' }).click()
   await page.getByTestId('dialog-prompt-input').fill('drafts')
   await page.getByRole('button', { name: 'Create folder' }).click()
   const drafts = page.locator('[data-testid="tree-folder"][data-path="demo/drafts"]')
   await expect(drafts).toBeVisible()
 
   await drafts.click({ button: 'right' })
-  await page.getByRole('menuitemradio', { name: 'Mark as project' }).click()
+  await page.getByRole('menuitem', { name: 'Mark as project' }).click()
   await page.getByRole('button', { name: 'Mark as project' }).click()
   await expect(drafts.getByTestId('project-badge')).toBeVisible()
 
   await demo.click({ button: 'right' })
-  await page.getByRole('menuitemradio', { name: 'Open page' }).click()
+  await page.getByRole('menuitem', { name: 'Open page' }).click()
   await expect(page.getByTestId('folder-no-page')).toHaveCount(0)
   await expect(page.getByTestId('virtual-folder-page')).toBeVisible()
 
@@ -64,7 +64,7 @@ test('virtual folder page materialize race keeps the draft until explicit overwr
   const demo = page.locator('[data-testid="tree-folder"][data-path="demo"]')
   await expect(demo).toBeVisible()
   await demo.click({ button: 'right' })
-  await page.getByRole('menuitemradio', { name: 'Open page' }).click()
+  await page.getByRole('menuitem', { name: 'Open page' }).click()
   await expect(page.getByTestId('virtual-folder-page')).toBeVisible()
 
   await page.getByRole('button', { name: 'Edit', exact: true }).click()

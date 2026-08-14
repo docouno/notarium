@@ -126,3 +126,20 @@
    will move, not just the bottom. */
 .group-corner:hover ~ .group-resize::after { opacity: 0.5; }
 .aside:has(.group-corner:hover) .width-resize::after { opacity: 0.5; }
+
+@media (max-width: 720px) {
+  .overlay-on-narrow {
+    position: fixed;
+    inset: 0;
+    z-index: 30;
+    width: 100% !important;
+    max-width: 100vw;
+    border-left: 0;
+  }
+
+  .overlay-on-narrow .width-resize,
+  .overlay-on-narrow .group-resize,
+  .overlay-on-narrow .group-corner {
+    display: none;
+  }
+}

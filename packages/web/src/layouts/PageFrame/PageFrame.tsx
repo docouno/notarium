@@ -39,6 +39,8 @@ type PageFrameProps = {
   aside?: ReactNode
   /** Extra class on the scrolling content wrapper. */
   contentClassName?: string
+  /** Native inert is used while a narrow full-screen aside covers the page. */
+  contentInert?: boolean
   children: ReactNode
 }
 
@@ -48,6 +50,7 @@ export const PageFrame = ({
   topbarActions,
   aside,
   contentClassName,
+  contentInert = false,
   children,
 }: PageFrameProps) => {
   const { railOpen, toggleRail } = useChrome()
@@ -59,7 +62,17 @@ export const PageFrame = ({
   // to the content pane and writes the lift onto the topbar — the same `topbarRef`
   // the width test below measures).
   const scrollRef = useRef<HTMLDivElement>(null)
+  const frameRef = useRef<HTMLElement>(null)
   useScrollGlass(scrollRef, topbarRef)
+
+  useLayoutEffect(() => {
+    const frame = frameRef.current
+
+    if (!frame) {
+      return
+    }
+    frame.toggleAttribute('inert', contentInert)
+  }, [contentInert])
 
   // Show the inline search only when the bar is wide enough to seat it comfortably;
   // below that, drop it (it lives in Spotlight on narrower screens). Bar width, not
@@ -91,7 +104,11 @@ export const PageFrame = ({
 
   return (
     <>
-      <main className={cx('main', styles.frame)}>
+      <main
+        ref={frameRef}
+        className={cx('main', styles.frame)}
+        aria-hidden={contentInert || undefined}
+      >
         <div
           ref={topbarRef}
           className={cx(styles.topbar, 'glass', 'glass-scroll', 'glass-edge-bottom')}

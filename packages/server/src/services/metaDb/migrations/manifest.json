@@ -63,6 +63,13 @@
       "checksum": "sha256:8106ed1cf62c81345cad5e9961e21451fd4c121717d95b2af9aeb087172cbba9",
       "sqlite": "sqlite/0008_causal_metadata.sql",
       "postgres": "postgres/0008_causal_metadata.sql"
+    },
+    {
+      "version": 9,
+      "name": "agent_activity",
+      "checksum": "sha256:217b95da88599baa7ad42fc4445dcda37066f0ac92853e378b2a09509e6356e7",
+      "sqlite": "sqlite/0009_agent_activity.sql",
+      "postgres": "postgres/0009_agent_activity.sql"
     }
   ]
 }

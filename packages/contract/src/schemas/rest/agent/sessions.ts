@@ -2,7 +2,11 @@ import { z } from 'zod'
 import { AGENT_SESSION_ATTACH } from '../../../consts/audit'
 import { enumValues } from '../../../libs/enumValues'
 import { RevisionKindSchema, RevisionUnavailableReasonSchema } from '../../primitives'
-import { AgentAuditAggregatesSchema, AgentRetrievalEventSchema } from './audit'
+import {
+  AgentAuditAggregatesSchema,
+  AgentRetrievalEventSchema,
+  AgentRetrievalToolSchema,
+} from './audit'
 
 export const AgentSessionAttachSchema = z.enum(enumValues(AGENT_SESSION_ATTACH))
 
@@ -24,14 +28,21 @@ export const AgentSessionSummarySchema = z.object({
 export const AgentSessionOutsideSchema = z.object({
   reads: z.number().int(),
   writes: z.number().int(),
-  lastSeenAt: z.string(),
+  lastSeenAt: z.string().nullable(),
 })
 
 const CursorSchema = z.string().min(1).max(512)
+const databaseTextSchema = (max: number) =>
+  z
+    .string()
+    .min(1)
+    .max(max)
+    .refine((value) => !value.includes('\0'), { message: 'must not contain NUL' })
 
 export const AgentSessionsQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(30),
   cursor: CursorSchema.optional(),
+  filter: z.enum(['reads', 'writes']).optional(),
   /** Skip whole-history retrieval diagnostics when the caller only needs counts/page rows. */
   aggregates: z.enum(['0']).optional(),
 })
@@ -48,14 +59,35 @@ export const AgentSessionsResponseSchema = z.object({
   aggregates: AgentAuditAggregatesSchema.nullable(),
 })
 
-export const AgentSessionEventsQuerySchema = z.object({
-  limit: z.coerce.number().int().min(1).max(100).default(50),
-  cursor: CursorSchema.optional(),
-  filter: z.enum(['reads', 'writes']).optional(),
-})
+export const AgentSessionEventsQuerySchema = z
+  .object({
+    limit: z.coerce.number().int().min(1).max(100).default(50),
+    cursor: CursorSchema.optional(),
+    filter: z.enum(['reads', 'writes']).optional(),
+    agent: databaseTextSchema(256).optional(),
+    tool: AgentRetrievalToolSchema.optional(),
+    q: databaseTextSchema(4096).optional(),
+    aggregates: z.literal('1').optional(),
+  })
+  .superRefine((value, ctx) => {
+    if (value.tool != null && value.q == null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'tool requires q',
+      })
+    }
+    if (value.q != null && value.filter === 'writes') {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'query filter only applies to reads',
+      })
+    }
+  })
 
 export const AgentSessionRetrievalEventSchema = AgentRetrievalEventSchema.extend({
   type: z.literal('retrieval'),
+  sessionId: z.string().nullable(),
+  sessionName: z.string().nullable(),
   sessionAttach: AgentSessionAttachSchema.nullable(),
 })
 
@@ -65,6 +97,8 @@ export const AgentSessionWriteEventSchema = z.object({
   at: z.string(),
   principal: z.string().nullable(),
   agent: z.string().nullable(),
+  sessionId: z.string().nullable(),
+  sessionName: z.string().nullable(),
   sessionAttach: AgentSessionAttachSchema.nullable(),
   noteId: z.string(),
   space: z.string(),
@@ -83,15 +117,27 @@ export const AgentSessionEventSchema = z.discriminatedUnion('type', [
 
 export const AgentSessionTargetSchema = z.discriminatedUnion('kind', [
   AgentSessionSummarySchema.extend({ kind: z.literal('session') }),
-  AgentSessionOutsideSchema.extend({ kind: z.literal('outside') }),
+  z.object({ kind: z.literal('outside'), lastSeenAt: z.string().nullable() }),
+  z.object({ kind: z.literal('all') }),
 ])
+
+export const AgentSessionAgentStatSchema = z.object({
+  agent: z.string(),
+  count: z.number().int(),
+})
+
+export const AgentSessionEventAggregatesSchema = z.object({
+  retrieval: AgentAuditAggregatesSchema,
+  agents: z.array(AgentSessionAgentStatSchema),
+})
 
 export const AgentSessionEventsResponseSchema = z.object({
   target: AgentSessionTargetSchema,
   events: z.array(AgentSessionEventSchema),
-  total: z.number().int(),
+  total: z.number().int().nullable(),
   hasMore: z.boolean(),
   nextCursor: CursorSchema.nullable(),
+  aggregates: AgentSessionEventAggregatesSchema.nullable(),
 })
 
 export type AgentSessionSummary = z.infer<typeof AgentSessionSummarySchema>
@@ -103,4 +149,6 @@ export type AgentSessionEvent = z.infer<typeof AgentSessionEventSchema>
 export type AgentSessionRetrievalEvent = z.infer<typeof AgentSessionRetrievalEventSchema>
 export type AgentSessionWriteEvent = z.infer<typeof AgentSessionWriteEventSchema>
 export type AgentSessionTarget = z.infer<typeof AgentSessionTargetSchema>
+export type AgentSessionAgentStat = z.infer<typeof AgentSessionAgentStatSchema>
+export type AgentSessionEventAggregates = z.infer<typeof AgentSessionEventAggregatesSchema>
 export type AgentSessionEvents = z.infer<typeof AgentSessionEventsResponseSchema>

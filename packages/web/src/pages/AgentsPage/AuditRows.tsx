@@ -7,8 +7,7 @@ import type {
   AgentSessionRetrievalEvent,
 } from '@notarium/contract'
 import { AGENT_RETRIEVAL_TOOL, NOTE_CLASS } from '@notarium/contract/enums'
-import { Chip } from '../../core/Chips'
-import { DisclosureCard } from '../../core/DisclosureCard'
+import { ActivityTimelineRow } from '../../core/ActivityTimeline'
 import {
   IconBot,
   IconBotMessage,
@@ -19,8 +18,9 @@ import {
 } from '../../core/Icons'
 import { cx } from '../../libs/cx/cx'
 import { exactDateTime, timeAgo } from '../../libs/datetime'
-import { noteRouteForClass } from '../../libs/routing/routePaths'
-import styles from './SessionsPage.module.scss'
+import { agentActivityRoute, noteRouteForClass } from '../../libs/routing/routePaths'
+import asideStyles from './ActivityAside.module.scss'
+import styles from './ActivityRows.module.scss'
 
 export const TOOL_META: Record<AgentRetrievalTool, { label: string; icon: ReactNode }> = {
   search: { label: 'Search', icon: <IconSearch size={13} /> },
@@ -28,11 +28,17 @@ export const TOOL_META: Record<AgentRetrievalTool, { label: string; icon: ReactN
   get_note: { label: 'Open', icon: <IconEye size={13} /> },
 }
 
-export const ToolBadge = ({ tool }: { tool: AgentRetrievalTool }) => {
+export const ToolLabel = ({
+  tool,
+  showIcon = true,
+}: {
+  tool: AgentRetrievalTool
+  showIcon?: boolean
+}) => {
   const meta = TOOL_META[tool]
   return (
-    <span className={styles.toolBadge} data-tool={tool}>
-      {meta.icon}
+    <span className={styles.toolLabel} data-tool={tool}>
+      {showIcon && meta.icon}
       {meta.label}
     </span>
   )
@@ -40,15 +46,34 @@ export const ToolBadge = ({ tool }: { tool: AgentRetrievalTool }) => {
 
 /** One aggregated query line — query + how often it ran. The blind-spots variant shows the
  *  recurring empty count in amber (a hint), the frequent variant a neutral run count. */
-export const QueryStatRow = ({ stat, warn }: { stat: AgentAuditQueryStat; warn?: boolean }) => (
-  <li className={styles.statRow}>
-    <ToolBadge tool={stat.tool} />
-    <span className={styles.statQuery} title={stat.query}>
-      {stat.query}
-    </span>
-    <span className={cx(styles.statCount, warn && styles.statCountWarn)}>
-      {warn ? `${stat.misses}× empty` : `${stat.count}×`}
-    </span>
+export const QueryStatRow = ({
+  stat,
+  warn,
+  active,
+  onSelect,
+}: {
+  stat: AgentAuditQueryStat
+  warn?: boolean
+  active?: boolean
+  onSelect: (stat: AgentAuditQueryStat) => void
+}) => (
+  <li className={cx(asideStyles.statItem, active && asideStyles.statItemActive)}>
+    <button
+      type="button"
+      className={asideStyles.statRow}
+      aria-pressed={active}
+      onClick={() => onSelect(stat)}
+    >
+      <ToolLabel tool={stat.tool} />
+      <span className={asideStyles.statQuery} title={stat.query}>
+        {stat.query}
+      </span>
+      <span className={cx(asideStyles.statCount, warn && asideStyles.statCountWarn)}>
+        {warn
+          ? `${stat.misses} empty ${stat.misses === 1 ? 'run' : 'runs'}`
+          : `${stat.count} ${stat.count === 1 ? 'run' : 'runs'}`}
+      </span>
+    </button>
   </li>
 )
 
@@ -68,25 +93,41 @@ export const HitList = ({ event }: { event: AgentRetrievalEvent }) => {
         const href = noteRouteForClass(h.noteId, h.class)
         const label = h.title || h.noteId
         return (
-          <li key={`${h.noteId}-${i}`} className={styles.hit}>
-            <span className={styles.hitIcon} aria-hidden>
-              {h.class === NOTE_CLASS.agentMemory ? (
-                <IconBotMessage size={13} />
-              ) : (
-                <IconScrollText size={13} />
-              )}
-            </span>
+          <li key={`${h.noteId}-${i}`}>
             {href ? (
-              <Link to={href} className={styles.hitTitle} title={label}>
-                {label}
+              <Link to={href} className={styles.hit} data-testid="activity-hit-link">
+                <span className={styles.hitIcon} aria-hidden>
+                  {h.class === NOTE_CLASS.agentMemory ? (
+                    <IconBotMessage size={13} />
+                  ) : (
+                    <IconScrollText size={13} />
+                  )}
+                </span>
+                <span className={styles.hitTitle} title={label}>
+                  {label}
+                </span>
+                {typeof h.score === 'number' && (
+                  <span
+                    className={styles.hitScore}
+                    title="Retrieval relevance score. Higher scores rank first."
+                  >
+                    relevance {h.score.toFixed(2)}
+                  </span>
+                )}
               </Link>
             ) : (
-              <span className={styles.hitTitle} title={label}>
-                {label}
-              </span>
-            )}
-            {typeof h.score === 'number' && (
-              <span className={styles.hitScore}>{h.score.toFixed(3)}</span>
+              <div className={styles.hit}>
+                <span className={styles.hitIcon} aria-hidden>
+                  {h.class === NOTE_CLASS.agentMemory ? (
+                    <IconBotMessage size={13} />
+                  ) : (
+                    <IconScrollText size={13} />
+                  )}
+                </span>
+                <span className={styles.hitTitle} title={label}>
+                  {label}
+                </span>
+              </div>
             )}
           </li>
         )
@@ -97,8 +138,12 @@ export const HitList = ({ event }: { event: AgentRetrievalEvent }) => {
 
 export const AuditRow = ({
   event,
+  showSession = false,
+  routeState,
 }: {
   event: AgentRetrievalEvent | AgentSessionRetrievalEvent
+  showSession?: boolean
+  routeState?: URLSearchParams | string
 }) => {
   const empty = event.tool !== AGENT_RETRIEVAL_TOOL.getNote && event.resultCount === 0
   // get_note's "query" is a raw note ref (an id) — show the opened note's title instead
@@ -107,64 +152,72 @@ export const AuditRow = ({
     event.tool === AGENT_RETRIEVAL_TOOL.getNote
       ? (event.hits[0]?.title ?? event.query)
       : event.query
-  // The card chrome + disclosure toggle come from the shared DisclosureCard (#243, same
-  // primitive the context constructor uses) — the caret sits at the row START, ahead of
-  // the tool badge; the reveal (the hit list) is the card body.
-  return (
-    <li>
-      <DisclosureCard
-        caret="start"
-        headerClassName={styles.rowHead}
-        testId="audit-row"
-        header={
-          <>
-            <ToolBadge tool={event.tool} />
-            <span className={styles.query} title={label}>
-              {label}
-            </span>
-            <span className={styles.rowMeta}>
-              {event.agent && (
-                <span className={styles.agent} title={`Run by ${event.agent}`}>
-                  <IconBot size={12} />
-                  {event.agent}
-                </span>
-              )}
-              {event.classFilter && (
-                <Chip>{event.classFilter === NOTE_CLASS.agentMemory ? 'memory' : 'docs'}</Chip>
-              )}
-              {'sessionAttach' in event && event.sessionAttach && (
-                <Chip>{event.sessionAttach}</Chip>
-              )}
-              {/* Scope only shows when the call NARROWED to a project — the common whole-reach
-                  fan-out is the default and would just be noise on every row. */}
-              {event.project && (
-                <span className={styles.scope} title={event.project}>
-                  {event.project}
-                </span>
-              )}
-              <span
-                className={cx(styles.result, empty && styles.resultEmpty)}
-                title={
-                  typeof event.topScore === 'number'
-                    ? `top score ${event.topScore.toFixed(3)}`
-                    : undefined
-                }
-              >
-                {event.tool === AGENT_RETRIEVAL_TOOL.getNote
-                  ? 'opened'
-                  : event.resultCount === 0
-                    ? 'no results'
-                    : `${event.resultCount} result${event.resultCount === 1 ? '' : 's'}`}
-              </span>
-              <span className={styles.time} title={exactDateTime(event.at)}>
-                {timeAgo(event.at)}
-              </span>
-            </span>
-          </>
-        }
+  const tool = TOOL_META[event.tool]
+  const context =
+    showSession && 'sessionId' in event ? (
+      <Link
+        to={agentActivityRoute(event.sessionId ?? 'outside', routeState)}
+        className={styles.sessionMetaLink}
       >
-        <HitList event={event} />
-      </DisclosureCard>
-    </li>
+        {event.sessionId ? (event.sessionName ?? 'Session') : 'Outside session'}
+      </Link>
+    ) : null
+  const attributes = [
+    event.classFilter === NOTE_CLASS.agentMemory
+      ? 'agent memory'
+      : event.classFilter
+        ? 'user docs'
+        : null,
+    'sessionAttach' in event && event.sessionAttach ? `${event.sessionAttach} session` : null,
+    event.project,
+  ]
+    .filter(Boolean)
+    .join(' · ')
+  const outcome =
+    event.tool === AGENT_RETRIEVAL_TOOL.getNote
+      ? null
+      : event.resultCount === 0
+        ? 'no results'
+        : `${event.resultCount} result${event.resultCount === 1 ? '' : 's'}`
+  return (
+    <ActivityTimelineRow
+      as="li"
+      icon={tool.icon}
+      primary={
+        <span className={styles.query} title={label}>
+          {label}
+        </span>
+      }
+      time={<time title={exactDateTime(event.at)}>{timeAgo(event.at)}</time>}
+      action={tool.label}
+      actor={
+        event.agent ? (
+          <>
+            <IconBot size={12} />
+            {event.agent}
+          </>
+        ) : undefined
+      }
+      context={context}
+      attributes={attributes || undefined}
+      outcome={
+        outcome ? (
+          <span
+            className={cx(empty && styles.resultEmpty)}
+            title={
+              typeof event.topScore === 'number'
+                ? `Top relevance score ${event.topScore.toFixed(2)}. Higher scores rank first.`
+                : undefined
+            }
+          >
+            {outcome}
+          </span>
+        ) : undefined
+      }
+      detail={<HitList event={event} />}
+      disclosureLabel={`Toggle ${tool.label.toLowerCase()} results for ${label}`}
+      reserveDisclosure
+      testId="audit-row"
+    />
   )
 }

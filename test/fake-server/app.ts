@@ -18,6 +18,7 @@ import { rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  type AgentWriteAttribution,
   CachedStore,
   InMemoryRestoreOperationPersistence,
   type InMemoryRevisionPersistence,
@@ -85,6 +86,8 @@ export type ActivityFixture = {
   kind?: 'created' | 'edited' | 'deleted' | 'restored' | 'baseline'
   title?: string
   principal?: string
+  /** Optional host-built agent/session attribution for the session-audit twin. */
+  agent?: AgentWriteAttribution
   noteId?: string
   class?: string
   charsAdded?: number
@@ -171,6 +174,8 @@ export type Fixture = {
   noJobs?: boolean
   /** Omit the agent-session persistence facet to exercise P5 degradation. */
   noAgentSessions?: boolean
+  /** Omit the cross-source session audit facet while keeping the rest of the fake meta layer. */
+  noSessionAudit?: boolean
   /** Omit the gateway-state facet — a host with no meta-DB behind idempotencyKey.
    *  The DURABLE half of the dedup degrades away (a replay arriving later writes
    *  again); the in-process single-flight does not depend on it. */
@@ -287,6 +292,7 @@ const seedActivity = async (
         createdAt: normDate(e.date),
         charsAdded: e.charsAdded ?? null,
         charsRemoved: e.charsRemoved ?? null,
+        agent: e.agent,
       },
       blob ?? null,
     )
@@ -677,7 +683,7 @@ export const createApp = async (
     agentDeltaCursors,
     gatewayState: fixture.noGatewayState ? undefined : gatewayState,
     retrievalLog,
-    sessionAudit,
+    sessionAudit: fixture.noSessionAudit ? undefined : sessionAudit,
     projects,
     folders,
     favorites,

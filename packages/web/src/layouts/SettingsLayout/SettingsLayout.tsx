@@ -22,6 +22,9 @@ export const SettingsLayout = ({
   activeId,
   onSelect,
   sectionTabs,
+  topbarActions,
+  aside,
+  contentInert = false,
   children,
   testIdPrefix = 'settings',
 }: {
@@ -29,7 +32,7 @@ export const SettingsLayout = ({
   trail: Crumb[]
   spaceLess?: boolean
   /** Tab groups (the left scope rail), rendered with a divider between them. Omit for a
-   *  surface with no secondary axis (Agents → Sessions): the panel then spans full width. */
+   *  surface with no secondary axis (Agents → Activity): the panel then spans full width. */
   groups?: SettingsTab[][]
   /** Map a tab id to its route (so the same layout serves both settings homes). */
   routeFor?: (tabId: string) => string
@@ -37,15 +40,26 @@ export const SettingsLayout = ({
   activeId?: string
   onSelect?: (tabId: string) => void
   /** A section pill-bar (#243) rendered above the body — the surface's own top-level
-   *  sub-nav (the Agents Context | Sessions sections). Orthogonal to the left scope rail. */
+   *  sub-nav (the Agents Context | Roles | Activity sections). Orthogonal to the left scope rail. */
   sectionTabs?: ReactNode
+  /** Page-specific actions in PageFrame's canonical topbar action slot. */
+  topbarActions?: ReactNode
+  /** Optional right panel; SettingsLayout keeps owning the document-free centre column. */
+  aside?: ReactNode
+  /** Makes the main column inert while a narrow overlay aside is open. */
+  contentInert?: boolean
   children?: ReactNode
   testIdPrefix?: string
 }) => {
   const sectionLabel = trail[trail.length - 1]?.label ?? 'Settings'
   const hasRail = !!groups && groups.length > 0
   return (
-    <PageFrame topbarLeft={<Breadcrumbs trail={trail} spaceLess={spaceLess} />}>
+    <PageFrame
+      topbarLeft={<Breadcrumbs trail={trail} spaceLess={spaceLess} />}
+      topbarActions={topbarActions}
+      aside={aside}
+      contentInert={contentInert}
+    >
       <div className={styles.inner}>
         {sectionTabs && <div className={styles.sectionTabs}>{sectionTabs}</div>}
         <div className={cx(styles.body, !hasRail && styles.bodyNoRail)}>

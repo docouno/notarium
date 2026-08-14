@@ -92,7 +92,7 @@ test('switch Files → Projects → single-project focus', async ({ page, baseUR
   // Roadmap folder row itself is gone (the header label carries the name); its
   // notes + nested project show; demo stays hidden.
   await folder(page, 'Roadmap').click({ button: 'right' })
-  await page.getByRole('menuitemradio', { name: 'Focus project' }).click()
+  await page.getByRole('menuitem', { name: 'Focus project' }).click()
   await expect(picker).toHaveAttribute('data-scope', 'project')
   await expect(folder(page, 'Roadmap')).toHaveCount(0) // its own row is implied by the header
   await expect(note(page, 'fake-roadmap-plan')).toBeVisible()
@@ -119,7 +119,7 @@ test('a focused project becomes a recent quick-jump in the dropdown', async ({ p
 
   // Focus Roadmap from its context menu → it enters the recent MRU.
   await folder(page, 'Roadmap').click({ button: 'right' })
-  await page.getByRole('menuitemradio', { name: 'Focus project' }).click()
+  await page.getByRole('menuitem', { name: 'Focus project' }).click()
   await expect(picker).toHaveAttribute('data-scope', 'project')
 
   // Leave to Files, then the dropdown offers Roadmap as a recent quick-jump.
@@ -145,7 +145,7 @@ test('deep-linking a note INSIDE the focused project keeps the focus (no false b
   // the scope must NOT bounce to Files on that transient placeholder — the note is
   // in-scope, so the stored focus has to survive (the inverse of the Q3 case).
   await folder(page, 'Roadmap').click({ button: 'right' })
-  await page.getByRole('menuitemradio', { name: 'Focus project' }).click()
+  await page.getByRole('menuitem', { name: 'Focus project' }).click()
   await expect(picker).toHaveAttribute('data-scope', 'project')
 
   await page.goto('/n/fake-roadmap-plan')
@@ -166,7 +166,7 @@ test('opening a note outside the focused project bounces the scope back to Files
   await expect(folder(page, 'Roadmap')).toBeVisible()
   // Focus Roadmap from its context menu (persists the scope for the reload below).
   await folder(page, 'Roadmap').click({ button: 'right' })
-  await page.getByRole('menuitemradio', { name: 'Focus project' }).click()
+  await page.getByRole('menuitem', { name: 'Focus project' }).click()
   await expect(picker).toHaveAttribute('data-scope', 'project')
 
   // Deep-link straight to a note OUTSIDE Roadmap (the demo note). The stored focus
@@ -196,13 +196,13 @@ test('Projects view is empty until a folder is marked; marking it adds it to the
   await page.getByRole('menuitemradio', { name: 'Files' }).click()
   const demo = folder(page, 'demo')
   await demo.click({ button: 'right' })
-  await page.getByRole('menuitemradio', { name: 'Mark as project' }).click()
+  await page.getByRole('menuitem', { name: 'Mark as project' }).click()
   await page.getByRole('button', { name: 'Mark as project' }).click()
   await expect(demo.getByTestId('project-badge')).toBeVisible()
 
   // It can now be focused from its context menu — re-rooted to its contents.
   await demo.click({ button: 'right' })
-  await page.getByRole('menuitemradio', { name: 'Focus project' }).click()
+  await page.getByRole('menuitem', { name: 'Focus project' }).click()
   await expect(picker).toHaveAttribute('data-scope', 'project')
   await expect(note(page, 'fake-demo-carbon')).toBeVisible()
 })

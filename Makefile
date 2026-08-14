@@ -85,7 +85,7 @@ PLAYWRIGHT_TEST_IMAGE ?= mcr.microsoft.com/playwright:v1.60.0-jammy
 
 .DEFAULT_GOAL := help
 .PHONY: help prepare deps deps-vector doctor dev up start down stop restart logs ps sh \
-        checkup audit-runtime test-coverage test-pg test-browser backup restore backup-smoke seed seed-list \
+        checkup audit-runtime test-coverage test-pg test-browser bench-session-audit backup restore backup-smoke seed seed-list \
         footage demo-shots demo-preview demo-plates image release release-rc release-smoke save clean
 
 help: ## List available targets
@@ -247,6 +247,51 @@ test-pg: ## Run meta-DB contracts/migrations against ephemeral live Postgres
 	    --workdir /app -e HOME=/tmp \
 	    -e TEST_PG_URL=postgres://notarium:notarium@postgres:5432/notarium_test \
 	    --entrypoint npm "$(NODE_TEST_IMAGE)" run test:pg
+
+# --- session activity read-model benchmark ----------------------------------
+BENCH_PHASE ?= pre
+BENCH_SIZES ?= 10000,100000,500000
+BENCH_OUTPUT_DIR ?= $(CURDIR)/test-results/session-audit-bench
+BENCH_COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
+
+bench-session-audit: ## Benchmark the session activity read-model on SQLite and Postgres
+	@set -eu; \
+	  cleanup() { \
+	    docker rm -f $(CHECKUP_RUNNER_CONTAINER) >/dev/null 2>&1 || true; \
+	    $(COMPOSE_TEST) down --volumes --remove-orphans >/dev/null 2>&1 || true; \
+	    docker volume rm -f $(CHECKUP_WORKSPACE_VOLUME) >/dev/null 2>&1 || true; \
+	  }; \
+	  trap cleanup EXIT INT TERM; \
+	  cleanup; \
+	  mkdir -p "$(BENCH_OUTPUT_DIR)"; \
+	  docker volume create $(CHECKUP_WORKSPACE_VOLUME) >/dev/null; \
+	  docker run --rm --name $(CHECKUP_RUNNER_CONTAINER) \
+	    --mount "type=bind,src=$(CURDIR),dst=/source,readonly" \
+	    --mount "type=volume,src=$(CHECKUP_WORKSPACE_VOLUME),dst=/app" \
+	    --entrypoint sh "$(NODE_TEST_IMAGE)" -c \
+	    "tar -C /source --exclude='./.git' --exclude='./.env' --exclude='./.data' \
+	      --exclude='./node_modules' --exclude='./packages/*/node_modules' \
+	      --exclude='./packages/*/dist' --exclude='./docker/volumes' \
+	      --exclude='./coverage' --exclude='./test-results' --exclude='./playwright-report' \
+	      -cf - . | tar -C /app -xf -"; \
+	  docker run --rm --name $(CHECKUP_RUNNER_CONTAINER) \
+	    --mount "type=volume,src=$(CHECKUP_WORKSPACE_VOLUME),dst=/app" \
+	    --workdir /app -e HOME=/tmp --entrypoint npm "$(NODE_TEST_IMAGE)" \
+	    run deps:lean; \
+	  $(COMPOSE_TEST) up -d --wait postgres; \
+	  docker run --rm --name $(CHECKUP_RUNNER_CONTAINER) \
+	    --user $(HOST_UID):$(HOST_GID) \
+	    --network "$(TEST_COMPOSE_PROJECT)_default" \
+	    --mount "type=volume,src=$(CHECKUP_WORKSPACE_VOLUME),dst=/app" \
+	    --mount "type=bind,src=$(BENCH_OUTPUT_DIR),dst=/output" \
+	    --workdir /app -e HOME=/tmp -e NODE_ENV=test \
+	    -e TEST_PG_URL=postgres://notarium:notarium@postgres:5432/notarium_test \
+	    -e BENCH_PHASE="$(BENCH_PHASE)" -e BENCH_SIZES="$(BENCH_SIZES)" \
+	    -e BENCH_COMMIT="$(BENCH_COMMIT)" \
+	    -e BENCH_OUTPUT="/output/$(BENCH_PHASE).json" \
+	    -e BENCH_BASELINE="/output/pre.json" \
+	    -e BENCH_NODE_IMAGE="$(NODE_TEST_IMAGE)" -e BENCH_PG_IMAGE=postgres:16-alpine \
+	    --entrypoint npx "$(NODE_TEST_IMAGE)" tsx scripts/benchSessionAudit.ts
 
 # The pinned Playwright container owns browsers/fonts/system libraries. A clean
 # source snapshot (including external baselines, excluding host deps/state) is

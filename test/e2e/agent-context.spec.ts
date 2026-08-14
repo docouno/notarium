@@ -205,18 +205,18 @@ test('the Context constructor lists the profile and muting a category flips its 
   await expect(language).toBeVisible()
 
   await stale.getByTestId('context-memory-row-menu').click()
-  await expect(page.getByRole('menuitemradio', { name: 'Unmute' })).toBeVisible()
+  await expect(page.getByRole('menuitem', { name: 'Unmute' })).toBeVisible()
   await page.keyboard.press('Escape')
 
   await language.getByTestId('context-memory-row-menu').click()
-  await expect(page.getByRole('menuitemradio', { name: 'Mute' })).toBeVisible()
+  await expect(page.getByRole('menuitem', { name: 'Mute' })).toBeVisible()
 
   // Toggle the loaded category → it mutes (the write lands, the row reconciles): the
   // row now carries the Muted badge and its menu offers "Unmute" (the reverse) instead.
-  await page.getByRole('menuitemradio', { name: 'Mute' }).click()
+  await page.getByRole('menuitem', { name: 'Mute' }).click()
   await expect(language).toContainText('Muted')
   await language.getByTestId('context-memory-row-menu').click()
-  await expect(page.getByRole('menuitemradio', { name: 'Unmute' })).toBeVisible()
+  await expect(page.getByRole('menuitem', { name: 'Unmute' })).toBeVisible()
 })
 
 test('a note’s ⋮ menu offers «Pin to agent context» where a pin has a target', async ({ page }) => {
@@ -226,8 +226,8 @@ test('a note’s ⋮ menu offers «Pin to agent context» where a pin has a targ
   await page.goto('/n/fake-scratch')
   await expect(page.getByRole('heading', { name: 'Scratch' })).toBeVisible()
   await page.getByRole('button', { name: 'More actions' }).click()
-  await expect(page.getByRole('menuitemradio', { name: 'Pin to agent context' })).toBeVisible()
-  await page.getByRole('menuitemradio', { name: 'Pin to agent context' }).click()
+  await expect(page.getByRole('menuitem', { name: 'Pin to agent context' })).toBeVisible()
+  await page.getByRole('menuitem', { name: 'Pin to agent context' }).click()
 
   // It now reads as pinned in the Context constructor (the pinned list shows directly).
   await page.goto('/agents/context/personal')
@@ -237,7 +237,7 @@ test('a note’s ⋮ menu offers «Pin to agent context» where a pin has a targ
   await page.goto('/n/fake-deploy')
   await expect(page.getByRole('heading', { name: 'Deploy Runbook' })).toBeVisible()
   await page.getByRole('button', { name: 'More actions' }).click()
-  await expect(page.getByRole('menuitemradio', { name: 'Unpin from agent context' })).toBeVisible()
+  await expect(page.getByRole('menuitem', { name: 'Unpin from agent context' })).toBeVisible()
 })
 
 test('folder overview actions and picker rows name the note boundary explicitly', async ({
@@ -249,14 +249,12 @@ test('folder overview actions and picker rows name the note boundary explicitly'
   await expect(page.getByRole('heading', { name: 'Docs overview' })).toBeVisible()
   await page.getByRole('button', { name: 'More actions' }).click()
   await expect(
-    page.getByRole('menuitemradio', { name: 'Unpin folder overview from agent context' }),
+    page.getByRole('menuitem', { name: 'Unpin folder overview from agent context' }),
   ).toBeVisible()
-  await page
-    .getByRole('menuitemradio', { name: 'Unpin folder overview from agent context' })
-    .click()
+  await page.getByRole('menuitem', { name: 'Unpin folder overview from agent context' }).click()
   await page.getByRole('button', { name: 'More actions' }).click()
   await expect(
-    page.getByRole('menuitemradio', { name: 'Pin folder overview to agent context' }),
+    page.getByRole('menuitem', { name: 'Pin folder overview to agent context' }),
   ).toBeVisible()
 
   await page.goto('/agents/context/personal')
@@ -363,7 +361,7 @@ test('a project route focuses the project; the Personal tab switches to it inlin
     .filter({ hasText: 'Project Deploy' })
   await expect(projectPin).toBeVisible()
   await projectPin.getByTestId('context-pin-row-menu').click()
-  await page.getByRole('menuitemradio', { name: 'Open note' }).click()
+  await page.getByRole('menuitem', { name: 'Open note' }).click()
   await expect(page.getByRole('heading', { name: 'Project Deploy' })).toBeVisible()
   await page.goBack()
   await expect(page).toHaveURL(/\/agents\/context\/docs$/)
@@ -538,7 +536,7 @@ test('project context shows, adds, and removes project pins', async ({ page }) =
 
   const scratch = projectPins.filter({ hasText: 'Project Scratch' })
   await scratch.getByTestId('context-pin-row-menu').click()
-  await page.getByRole('menuitemradio', { name: 'Unpin' }).click()
+  await page.getByRole('menuitem', { name: 'Unpin' }).click()
   await expect(projectPins.filter({ hasText: 'Project Scratch' })).toHaveCount(0)
 })
 
@@ -566,7 +564,7 @@ test('the project context audits project memory and muting it persists across a 
 
   // Mute the project category → the audit caption reflects it.
   await deployMemory.getByTestId('context-project-memory-row-menu').click()
-  await page.getByRole('menuitemradio', { name: 'Mute' }).click()
+  await page.getByRole('menuitem', { name: 'Mute' }).click()
   await expect(caption).toContainText('1 muted')
 
   // The write PERSISTS server-side (id-addressed mute), not just an optimistic flip:
@@ -579,7 +577,7 @@ test('the project context audits project memory and muting it persists across a 
     .filter({ hasText: 'deploy-memory' })
     .getByTestId('context-project-memory-row-menu')
     .click()
-  await expect(page.getByRole('menuitemradio', { name: 'Unmute' })).toBeVisible()
+  await expect(page.getByRole('menuitem', { name: 'Unmute' })).toBeVisible()
 })
 
 test('switching from one project to another re-targets the project Memory block (#207)', async ({
@@ -672,7 +670,7 @@ test('agent context and note routes canonicalize legacy forms', async ({ page })
   await page.goto('/agents/context')
   await expect(page).toHaveURL(/\/agents\/context\/personal$/)
   await page.goto('/agents/session')
-  await expect(page).toHaveURL(/\/agents\/sessions$/)
+  await expect(page).toHaveURL(/\/agents\/activity$/)
 
   await page.goto('/s/main')
   await expect(page.getByTestId('space-switcher')).toContainText('Main')

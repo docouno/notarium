@@ -1,4 +1,4 @@
 export { ContextPage } from './ContextPage'
-export { SessionPage } from './SessionPage'
-export { SessionsPage } from './SessionsPage'
+export { ActivityEpisodePage } from './ActivityEpisodePage'
+export { ActivityPage } from './ActivityPage'
 export { AgentsChrome } from './AgentsProvider'

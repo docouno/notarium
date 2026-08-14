@@ -14,11 +14,13 @@
 
 import type { FastifyInstance } from 'fastify'
 import type { AddressInfo } from 'node:net'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { encodeWikilinkIdentity, sha256Hex } from '@notarium/core'
 import type { MutationGate } from '@notarium/server'
 
 import { createApp, type Fixture } from './app.js'
+import { InMemoryRetrievalLog } from './retrievalLog.js'
+import { InMemorySessionAudit } from './sessionAudit.js'
 
 const MARKER = 'zzmarker'
 const identityLink = (id: string, title: string): string =>
@@ -5115,13 +5117,66 @@ describe('session-first audit vertical (#321)', () => {
     )
     expect(overview.aggregates).not.toBeNull()
 
-    const noAggregates = await app.inject({
+    const retrievalAggregatesSpy = vi.spyOn(InMemoryRetrievalLog.prototype, 'aggregates')
+    const agentFacetSpy = vi.spyOn(InMemorySessionAudit.prototype, 'agentFacet')
+
+    try {
+      retrievalAggregatesSpy.mockClear()
+      agentFacetSpy.mockClear()
+      const noAggregates = await app.inject({
+        method: 'GET',
+        url: '/api/me/agent-sessions?limit=1&aggregates=0',
+        headers: { cookie },
+      })
+      expect(noAggregates.statusCode).toBe(200)
+      expect((noAggregates.json() as { aggregates: unknown }).aggregates).toBeNull()
+      expect(retrievalAggregatesSpy).not.toHaveBeenCalled()
+      expect(agentFacetSpy).not.toHaveBeenCalled()
+
+      const noDetailAggregates = await app.inject({
+        method: 'GET',
+        url: '/api/me/agent-sessions/all',
+        headers: { cookie },
+      })
+      expect(noDetailAggregates.statusCode).toBe(200)
+      expect(retrievalAggregatesSpy).not.toHaveBeenCalled()
+      expect(agentFacetSpy).not.toHaveBeenCalled()
+    } finally {
+      retrievalAggregatesSpy.mockRestore()
+      agentFacetSpy.mockRestore()
+    }
+
+    const emptySession = structured(
+      await callTool(port, 'start_session', { session: { name: 'No audit events' } }, bearer),
+    ) as { session: { id: string } }
+    expect(emptySession.session.id).not.toBe(sessionId)
+    const unfilteredAfterEmpty = await app.inject({
       method: 'GET',
-      url: '/api/me/agent-sessions?limit=1&aggregates=0',
+      url: '/api/me/agent-sessions?aggregates=0',
       headers: { cookie },
     })
-    expect(noAggregates.statusCode).toBe(200)
-    expect((noAggregates.json() as { aggregates: unknown }).aggregates).toBeNull()
+    expect(unfilteredAfterEmpty.json()).toMatchObject({ total: 2 })
+    for (const filter of ['reads', 'writes'] as const) {
+      const filteredOverview = await app.inject({
+        method: 'GET',
+        url: `/api/me/agent-sessions?filter=${filter}&aggregates=0`,
+        headers: { cookie },
+      })
+      expect(filteredOverview.statusCode).toBe(200)
+      expect(filteredOverview.json()).toMatchObject({
+        sessions: [expect.objectContaining({ id: sessionId })],
+        total: 1,
+        active: 1,
+        hasMore: false,
+        outside: null,
+      })
+    }
+    const invalidOverviewFilter = await app.inject({
+      method: 'GET',
+      url: '/api/me/agent-sessions?filter=other',
+      headers: { cookie },
+    })
+    expect(invalidOverviewFilter.statusCode).toBe(400)
 
     const detailResponse = await app.inject({
       method: 'GET',
@@ -5147,6 +5202,64 @@ describe('session-first audit vertical (#321)', () => {
     expect(detail.events).toContainEqual(
       expect.objectContaining({ type: 'write', revisionKind: 'delete', space: 'team' }),
     )
+
+    const global = await app.inject({
+      method: 'GET',
+      url: '/api/me/agent-sessions/all',
+      headers: { cookie },
+    })
+    expect(global.statusCode).toBe(200)
+    const globalBody = global.json() as {
+      target: { kind: string }
+      total: number | null
+      aggregates: unknown
+      events: Array<{
+        type: 'retrieval' | 'write'
+        sessionId: string | null
+        sessionName: string | null
+      }>
+    }
+    expect(globalBody).toMatchObject({
+      target: { kind: 'all' },
+      total: null,
+      aggregates: null,
+    })
+    expect(globalBody.events).toHaveLength(4)
+    expect(globalBody.events.every((event) => event.sessionId === sessionId)).toBe(true)
+    expect(globalBody.events.every((event) => event.sessionName === 'Vertical review')).toBe(true)
+
+    const globalAggregates = await app.inject({
+      method: 'GET',
+      url: '/api/me/agent-sessions/all?aggregates=1',
+      headers: { cookie },
+    })
+    expect(globalAggregates.statusCode).toBe(200)
+    expect(globalAggregates.json()).toMatchObject({
+      aggregates: {
+        retrieval: { totalQueries: 1, missCount: 0 },
+        agents: [{ agent: 'write-token', count: 4 }],
+      },
+    })
+
+    const queryFiltered = await app.inject({
+      method: 'GET',
+      url: `/api/me/agent-sessions/all?q=${encodeURIComponent(MARKER.slice(2).toUpperCase())}`,
+      headers: { cookie },
+    })
+    expect(queryFiltered.statusCode).toBe(200)
+    expect(queryFiltered.json()).toMatchObject({
+      total: null,
+      events: [expect.objectContaining({ type: 'retrieval', query: MARKER })],
+    })
+
+    for (const query of ['tool=search', 'tool=search&q=orphan&filter=writes', 'aggregates=0']) {
+      const invalid = await app.inject({
+        method: 'GET',
+        url: `/api/me/agent-sessions/all?${query}`,
+        headers: { cookie },
+      })
+      expect(invalid.statusCode).toBe(400)
+    }
 
     const firstPage = await app.inject({
       method: 'GET',
@@ -5196,6 +5309,17 @@ describe('session-first audit vertical (#321)', () => {
       headers: { cookie: bobCookie },
     })
     expect(bobOverview.json()).toMatchObject({ sessions: [], total: 0, active: 0 })
+    const bobOutside = await app.inject({
+      method: 'GET',
+      url: '/api/me/agent-sessions/outside',
+      headers: { cookie: bobCookie },
+    })
+    expect(bobOutside.statusCode).toBe(200)
+    expect(bobOutside.json()).toMatchObject({
+      target: { kind: 'outside', lastSeenAt: null },
+      events: [],
+      total: null,
+    })
   })
 
   it('rejects malformed opaque cursors before either persistence driver sees them', async () => {
@@ -5278,16 +5402,31 @@ describe('session-first audit vertical (#321)', () => {
       total: 2,
       outside: { reads: 1, writes: 1 },
     })
-    const outside = await app.inject({
-      method: 'GET',
-      url: '/api/me/agent-sessions/outside',
-      headers: { cookie },
-    })
-    expect(outside.statusCode).toBe(200)
-    expect(outside.json()).toMatchObject({
-      target: { kind: 'outside', reads: 1, writes: 1 },
-      total: 2,
-    })
+    const overviewSpy = vi.spyOn(InMemorySessionAudit.prototype, 'overview')
+
+    try {
+      const outside = await app.inject({
+        method: 'GET',
+        url: '/api/me/agent-sessions/outside',
+        headers: { cookie },
+      })
+      expect(outside.statusCode).toBe(200)
+      const body = outside.json() as {
+        target: Record<string, unknown>
+        total: number | null
+        aggregates: unknown
+      }
+      expect(body).toMatchObject({
+        target: { kind: 'outside', lastSeenAt: expect.any(String) },
+        total: null,
+        aggregates: null,
+      })
+      expect(body.target).not.toHaveProperty('reads')
+      expect(body.target).not.toHaveProperty('writes')
+      expect(overviewSpy).not.toHaveBeenCalled()
+    } finally {
+      overviewSpy.mockRestore()
+    }
   })
 
   it('uses the system owner consistently in AUTH_MODE=none', async () => {
@@ -5339,6 +5478,56 @@ describe('session-first audit vertical (#321)', () => {
       expect(detail.json()).toMatchObject({ total: 2 })
     } finally {
       await noneApp.close()
+    }
+  })
+
+  it('degrades global and Outside detail to honest empty responses without the audit facet', async () => {
+    const degradedFixture = fixture()
+    degradedFixture.noSessionAudit = true
+    const degraded = await createApp(degradedFixture)
+
+    try {
+      const cookie = await loginCookie('alice', 'alice-password-1', degraded)
+
+      for (const id of ['all', 'outside']) {
+        const response = await degraded.inject({
+          method: 'GET',
+          url: `/api/me/agent-sessions/${id}?aggregates=1`,
+          headers: { cookie },
+        })
+        expect(response.statusCode).toBe(200)
+        expect(response.json()).toMatchObject({
+          target: { kind: id },
+          events: [],
+          total: null,
+          hasMore: false,
+          nextCursor: null,
+          aggregates: {
+            retrieval: { totalQueries: 0, missCount: 0, top: [], misses: [] },
+            agents: [],
+          },
+        })
+      }
+      const invalidCursor = await degraded.inject({
+        method: 'GET',
+        url: '/api/me/agent-sessions/all?cursor=not-a-cursor',
+        headers: { cookie },
+      })
+      expect(invalidCursor.statusCode).toBe(400)
+      const invalidOverviewCursor = await degraded.inject({
+        method: 'GET',
+        url: '/api/me/agent-sessions?cursor=not-a-cursor',
+        headers: { cookie },
+      })
+      expect(invalidOverviewCursor.statusCode).toBe(400)
+      const session = await degraded.inject({
+        method: 'GET',
+        url: '/api/me/agent-sessions/ses_abcdefghijkl',
+        headers: { cookie },
+      })
+      expect(session.statusCode).toBe(404)
+    } finally {
+      await degraded.close()
     }
   })
 })

@@ -1,6 +1,6 @@
 // Retrieval-audit capture: builds the fire-and-forget audit row for a
 // successful read-tool call.
-// canon: docs/projects.md#sessions-auditing-agent-episodes-243-321-mem-audita
+// canon: docs/projects.md#activity-auditing-agent-work-243-321-mem-audita
 import { AGENT_RETRIEVAL_TOOL } from '@notarium/contract'
 import {
   type GetNoteInput,

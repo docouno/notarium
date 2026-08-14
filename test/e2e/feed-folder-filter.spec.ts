@@ -59,7 +59,7 @@ test('Folders facet narrows to selected subtrees (inclusion, server-windowed)', 
   // "Show only this folder" on `demo` (right-click) selects just it — exactly the
   // demo subtree; root.md is under no folder, so it drops (the inclusion refinement).
   await demo.click({ button: 'right' })
-  await page.getByRole('menuitemradio', { name: 'Show only this folder' }).click()
+  await page.getByRole('menuitem', { name: 'Show only this folder' }).click()
   await expect(items(page)).toHaveCount(3)
   await expect(
     page.locator('[data-testid="feed-item"][data-id="fake-archive-2020-old"]'),

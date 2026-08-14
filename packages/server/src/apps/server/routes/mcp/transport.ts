@@ -39,7 +39,7 @@ export type McpOptions = {
   agentDeltaCursors?: AgentDeltaCursorsPersistence
   gatewayState?: GatewayStatePersistence
   /** Absent ⇒ no retrieval audit capture (P5 honest degradation).
-   *  canon: docs/projects.md#sessions-auditing-agent-episodes-243-321-mem-audita */
+   *  canon: docs/projects.md#activity-auditing-agent-work-243-321-mem-audita */
   retrievalLog?: RetrievalLogPersistence
   projects?: ProjectsPersistence
   /** Absent on a host without a meta-DB / marker FS ⇒ container-reorg tools off (P5). */

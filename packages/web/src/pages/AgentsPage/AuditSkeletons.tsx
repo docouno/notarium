@@ -1,69 +1,93 @@
-import { DisclosureCardSkeleton } from '../../core/DisclosureCard'
+import { ActivityTimeline, ActivityTimelineRow } from '../../core/ActivityTimeline'
 import { Skeleton } from '../../core/Skeleton'
-import { cx } from '../../libs/cx/cx'
 import { AGGREGATE_ROWS, STAT_WIDTHS } from './consts'
-import styles from './SessionsPage.module.scss'
+import asideStyles from './ActivityAside.module.scss'
+import styles from './ActivityPage.module.scss'
+import rowStyles from './ActivityRows.module.scss'
 
 // ── loading skeletons ────────────────────────────────────────────────────────
-// Structural, NOT decorative: each placeholder mirrors the real element's box (a row
-// card's height + its badge/query/meta columns; a panel's head + stat lines), so the
+// Structural, NOT decorative: each placeholder mirrors the real element's box (a timeline
+// row's height + its badge/query/meta columns; a panel's head + stat lines), so the
 // layout is identical before and after data arrives — a first load or a filter flip
 // never reflows the page. Widths are fixed per index (deterministic, no random jitter).
 
-// One history-row placeholder — the shared DisclosureCardSkeleton reserves the real card's
-// exact 40px box; inside, the real caret / 18px badge / flexible query / meta columns, so a
-// real row drops in with zero shift.
-export const SkeletonRow = () => (
-  <DisclosureCardSkeleton>
-    <Skeleton w={13} h={13} radius="var(--radius-sm)" />
-    <Skeleton w={58} h={18} radius="999px" />
-    <span className={styles.skeletonQuery}>
-      <Skeleton w="42%" h={13} radius="var(--radius-sm)" />
-    </span>
-    <span className={styles.skeletonMeta}>
-      <Skeleton w={46} h={12} />
-      <Skeleton w={54} h={12} />
-      <Skeleton w={62} h={12} />
-    </span>
-  </DisclosureCardSkeleton>
+const ActivitySkeletonRow = () => (
+  <ActivityTimelineRow
+    as="li"
+    icon={<Skeleton w={12} h={12} radius="var(--radius-sm)" />}
+    primary={
+      <span className={rowStyles.skeletonQuery}>
+        <Skeleton w="42%" h={13} radius="var(--radius-sm)" />
+      </span>
+    }
+    time={<Skeleton w={46} h={12} />}
+    action={<Skeleton w={54} h={13} />}
+    attributes={<Skeleton w={62} h={13} />}
+    reserveDisclosure
+  />
 )
 
-// The history list while a page loads — a screenful of row placeholders in the SAME
-// `.list` container (identical gap), so real rows drop in without a jump.
-export const ListSkeleton = ({ rows = 8 }: { rows?: number }) => (
-  <ul className={styles.list} data-testid="audit-skeleton" aria-hidden>
+export const ActivityListSkeleton = ({
+  rows = 8,
+  spine = true,
+}: {
+  rows?: number
+  spine?: boolean
+}) => (
+  <ActivityTimeline as="ul" testId="audit-skeleton" ariaHidden spine={spine}>
     {Array.from({ length: rows }, (_, i) => (
-      <li key={i}>
-        <SkeletonRow />
-      </li>
+      <ActivitySkeletonRow key={i} />
     ))}
-  </ul>
+  </ActivityTimeline>
+)
+
+export const SessionListSkeleton = ({ rows = 8 }: { rows?: number }) => (
+  <div className={styles.sessionTimeline} data-testid="session-list-skeleton" aria-hidden>
+    {Array.from({ length: rows }, (_, i) => (
+      <ActivityTimeline
+        as="ul"
+        key={i}
+        className={styles.sessionTimelineSegment}
+        testId="session-skeleton-segment"
+        ariaHidden
+        spine={false}
+      >
+        <ActivityTimelineRow
+          as="li"
+          icon={<Skeleton w={12} h={12} radius="var(--radius-sm)" />}
+          primary={<Skeleton w={`${38 + ((i * 11) % 24)}%`} h={16} />}
+          time={<Skeleton w={48} h={11} />}
+          outcome={<Skeleton w={`${48 + ((i * 7) % 20)}%`} h={13} />}
+          reserveDisclosure
+          trailing={<span className={styles.sessionSkeletonAction} aria-hidden />}
+        />
+      </ActivityTimeline>
+    ))}
+  </div>
 )
 
 // One aggregate-panel stat line placeholder — badge + query + count, like QueryStatRow.
-// The 18px badge in a 5px-padded row is the real 28px stat-row, to the pixel.
+// The 18px badge in a 6px-padded row is the real 30px stat-row, to the pixel.
 export const StatRowSkeleton = ({ queryWidth }: { queryWidth: string }) => (
-  <li className={styles.statRow} aria-hidden>
+  <li className={asideStyles.statRow} aria-hidden>
     <Skeleton w={54} h={18} radius="999px" />
-    <span className={styles.statQuery}>
+    <span className={asideStyles.statQuery}>
       <Skeleton w={queryWidth} h={12} radius="var(--radius-sm)" />
     </span>
     <Skeleton w={28} h={12} />
   </li>
 )
 
-// The two aggregate panels on the FIRST load (before we know if there are aggregates).
-// Mirrors the real grid to the pixel: the FREQUENT panel (right) is the tallest and, being
-// server-capped at AGGREGATE_ROWS, is a known fixed height — reserving it exactly means the
-// controls + list below never shift. The panel head reserves the real 13px-label line box.
+// The two diagnostics sections while the Activity aside loads aggregates. They share the
+// same section headers and row geometry as the loaded Graph/Feed-style aside contents.
 export const PanelsSkeleton = () => {
   const panel = (rows: number) => (
-    <section className={styles.panel}>
-      <div className={cx(styles.panelHead, styles.skeletonPanelHead)}>
-        <Skeleton w={13} h={13} radius="var(--radius-sm)" />
+    <section className={asideStyles.section}>
+      <div className={asideStyles.sectionHeading} data-aside-section-heading>
         <Skeleton w={70} h={11} />
       </div>
-      <ul className={styles.statList}>
+      <Skeleton w="72%" h={11} />
+      <ul className={asideStyles.statList}>
         {Array.from({ length: rows }, (_, i) => (
           <StatRowSkeleton key={i} queryWidth={STAT_WIDTHS[i % STAT_WIDTHS.length]} />
         ))}
@@ -71,7 +95,7 @@ export const PanelsSkeleton = () => {
     </section>
   )
   return (
-    <div className={styles.panels} aria-hidden>
+    <div className={asideStyles.panels} aria-hidden>
       {panel(2)}
       {panel(AGGREGATE_ROWS)}
     </div>

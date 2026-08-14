@@ -1,4 +1,5 @@
 import {
+  type AgentWriteAttribution,
   DEFAULT_NOTE_TYPE,
   diffStats,
   effectiveSlug,
@@ -251,6 +252,41 @@ const churn = (
 
 export const caseToFixture = (world: CaseWorld): Fixture => {
   const sorted = [...world.events].sort(compareEvents)
+  const defaultOwner = world.auth?.users[0]?.username ?? AGENT_SYSTEM_OWNER
+
+  const agentAttributionOf = (event: CaseEvent): AgentWriteAttribution | undefined => {
+    const audit = event.agentAudit
+
+    if (!audit) {
+      return undefined
+    }
+    const session = audit.sessionRef
+      ? world.agentSessions?.find((candidate) => candidate.ref === audit.sessionRef)
+      : undefined
+
+    if (audit.sessionRef && !session) {
+      throw new Error(`agent write references unknown session: ${audit.sessionRef}`)
+    }
+    const owner = audit.owner ?? session?.owner ?? defaultOwner
+
+    if (audit.owner && session?.owner && audit.owner !== session.owner) {
+      throw new Error(`agent write owner does not match session: ${audit.sessionRef}`)
+    }
+
+    return {
+      owner,
+      agent: audit.agent ?? null,
+      ...(session && audit.sessionRef
+        ? {
+            session: {
+              id: agentSessionId(audit.sessionRef),
+              name: session.name,
+              attach: audit.sessionAttach ?? ('declared' as const),
+            },
+          }
+        : {}),
+    }
+  }
 
   // Fold the timeline into per-note final state + per-space activity rows.
   const notes = new Map<string, NoteState>()
@@ -373,6 +409,7 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
       // effective-field semantics, so the stand shows a real gap rather than a
       // drawing of one.
       ...(e.op === 'edit' && e.unavailable ? { unavailable: true } : {}),
+      ...(e.agentAudit ? { agent: agentAttributionOf(e) } : {}),
     })
     activityBySpace.set(e.space, rows)
   }
@@ -512,7 +549,6 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
     : undefined
 
   const now = Date.parse(world.now)
-  const defaultOwner = world.auth?.users[0]?.username ?? AGENT_SYSTEM_OWNER
   const agentSessions: AgentSessionRecord[] | undefined = world.agentSessions
     ?.filter((session) => session.retained !== false)
     .map((session) => ({

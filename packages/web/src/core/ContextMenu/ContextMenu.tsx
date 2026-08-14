@@ -1,4 +1,12 @@
-import { type ReactNode, type RefObject, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import {
+  type KeyboardEvent as ReactKeyboardEvent,
+  type ReactNode,
+  type RefObject,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from 'react'
 import { createPortal } from 'react-dom'
 import { cx } from '../../libs/cx/cx'
 import { useDismiss } from '../../libs/hooks/useDismiss'
@@ -62,6 +70,7 @@ const MenuRow = ({ item, onClose }: { item: MenuItem; onClose: () => void }) => 
         ref={ref}
         className={cx(styles.contextMenuItem, styles.hasSubmenu)}
         role="menuitem"
+        tabIndex={-1}
         aria-haspopup="menu"
         onMouseEnter={open}
         onMouseLeave={scheduleClose}
@@ -95,8 +104,9 @@ const MenuRow = ({ item, onClose }: { item: MenuItem; onClose: () => void }) => 
   return (
     <button
       className={cx(styles.contextMenuItem, item.danger && styles.danger)}
-      role="menuitemradio"
-      aria-checked={item.active ? 'true' : undefined}
+      role={item.active !== undefined ? 'menuitemradio' : 'menuitem'}
+      aria-checked={item.active !== undefined ? item.active : undefined}
+      tabIndex={-1}
       onClick={() => {
         onClose()
         item.onClick?.()
@@ -144,6 +154,8 @@ export const ContextMenu = ({
   elevated,
 }: ContextMenuProps) => {
   const ref = useRef<HTMLDivElement>(null)
+  const restoreTarget = useRef<HTMLElement | null>(null)
+  const suppressRestore = useRef(false)
   const [pos, setPos] = useState<{ left: number; top: number; maxHeight?: number }>({
     left: x,
     top: y,
@@ -153,6 +165,84 @@ export const ContextMenu = ({
   // overflow scroller would clip — so only flat menus get the cap + scroll. (No
   // menu currently uses submenus, but the feature exists, so gate it.)
   const scrollable = !items.some((i) => i.children)
+
+  useEffect(() => {
+    const active = document.activeElement
+    restoreTarget.current =
+      active instanceof HTMLElement && active !== document.body
+        ? active
+        : (ignoreRef?.current ?? null)
+    ref.current?.querySelector<HTMLElement>('[role^="menuitem"]')?.focus()
+    return () => {
+      const target = restoreTarget.current
+      requestAnimationFrame(() => {
+        const current = document.activeElement
+
+        if (
+          suppressRestore.current ||
+          !target?.isConnected ||
+          (current instanceof HTMLElement && current !== document.body && current.isConnected)
+        ) {
+          return
+        }
+        target.focus()
+      })
+    }
+  }, [ignoreRef])
+
+  const moveFocus = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.key === 'Tab') {
+      event.preventDefault()
+      const focusable = [
+        ...document.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ),
+      ].filter(
+        (element) =>
+          !ref.current?.contains(element) &&
+          element.getClientRects().length > 0 &&
+          element.getAttribute('aria-hidden') !== 'true',
+      )
+      const origin = restoreTarget.current
+      const originIndex = origin ? focusable.indexOf(origin) : -1
+      const nextIndex = event.shiftKey
+        ? originIndex > 0
+          ? originIndex - 1
+          : focusable.length - 1
+        : originIndex >= 0 && originIndex < focusable.length - 1
+          ? originIndex + 1
+          : 0
+      const next = focusable[nextIndex]
+      suppressRestore.current = true
+      onClose()
+      requestAnimationFrame(() => next?.focus())
+      return
+    }
+    const rows = [
+      ...event.currentTarget.querySelectorAll<HTMLElement>('[role^="menuitem"]'),
+    ].filter((row) => row.closest('[role="menu"]') === event.currentTarget)
+
+    if (rows.length === 0) {
+      return
+    }
+    const current = rows.indexOf(document.activeElement as HTMLElement)
+    const next =
+      event.key === 'ArrowDown'
+        ? (current + 1) % rows.length
+        : event.key === 'ArrowUp'
+          ? (current - 1 + rows.length) % rows.length
+          : event.key === 'Home'
+            ? 0
+            : event.key === 'End'
+              ? rows.length - 1
+              : null
+
+    if (next == null) {
+      return
+    }
+    event.preventDefault()
+    rows[next]?.focus()
+  }
 
   // Flip the menu back inside the viewport. 'up' anchors the menu's bottom at y
   // (open above a bottom-docked trigger); 'down' anchors its top at y. A scrollable
@@ -197,6 +287,7 @@ export const ContextMenu = ({
       )}
       style={{ left: pos.left, top: pos.top, minWidth, maxHeight: pos.maxHeight }}
       role="menu"
+      onKeyDown={moveFocus}
       onContextMenu={(e) => e.preventDefault()}
     >
       {header && (

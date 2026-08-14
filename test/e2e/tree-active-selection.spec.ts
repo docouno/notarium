@@ -164,7 +164,7 @@ test('deleting a set that includes the open note carries it with the rest (#229)
   await expect(page.locator('[aria-selected="true"]')).toHaveCount(2)
 
   await page.locator(noteSel(alpha!)).click({ button: 'right' })
-  await page.getByRole('menuitemradio', { name: 'Delete 2 items' }).click()
+  await page.getByRole('menuitem', { name: 'Delete 2 items' }).click()
   await page.getByRole('button', { name: 'Delete 2 items' }).click()
 
   // Both gone — including the open one — and the reader really CLEARS: the URL leaves

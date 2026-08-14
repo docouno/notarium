@@ -27,10 +27,14 @@ type AuditGroup = {
   writes: number
 }
 
+const compareIdDesc = (left: string, right: string): number => {
+  const leftId = BigInt(left)
+  const rightId = BigInt(right)
+  return leftId === rightId ? 0 : rightId > leftId ? 1 : -1
+}
+
 const byNewest = (left: { at: string; source: number; id: string }, right: typeof left): number =>
-  right.at.localeCompare(left.at) ||
-  right.source - left.source ||
-  Number(right.id) - Number(left.id)
+  right.at.localeCompare(left.at) || right.source - left.source || compareIdDesc(left.id, right.id)
 
 /** Executable in-memory twin used by the full fake-server vertical. SQL parity is
  * pinned separately by the shared SQLite/PostgreSQL persistence contract. */
@@ -183,10 +187,13 @@ export class InMemorySessionAudit implements AgentSessionAuditPersistence {
   async overview({
     owner,
     activeSince,
+    type,
     limit,
     before,
   }: Parameters<AgentSessionAuditPersistence['overview']>[0]) {
-    const all = this.summaries(owner, activeSince)
+    const all = this.summaries(owner, activeSince).filter((item) =>
+      type === 'retrieval' ? item.reads > 0 : type === 'write' ? item.writes > 0 : true,
+    )
     const matched = before
       ? all.filter(
           (item) =>
@@ -194,11 +201,15 @@ export class InMemorySessionAudit implements AgentSessionAuditPersistence {
         )
       : all
     const page = matched.slice(0, limit + 1)
+    const outside = this.outside(owner)
+    const outsideMatches =
+      outside != null &&
+      (type === 'retrieval' ? outside.reads > 0 : type === 'write' ? outside.writes > 0 : true)
     return {
       items: page.slice(0, limit),
       total: all.length,
       active: all.filter((item) => item.active).length,
-      outside: this.outside(owner),
+      outside: outsideMatches ? outside : null,
       hasMore: page.length > limit,
     }
   }
@@ -209,17 +220,26 @@ export class InMemorySessionAudit implements AgentSessionAuditPersistence {
 
   async events({
     owner,
-    sessionId,
+    scope,
     type,
+    agent,
+    tool,
+    query,
     limit,
     before,
   }: Parameters<AgentSessionAuditPersistence['events']>[0]) {
+    const inScope = (sessionId: string | null): boolean =>
+      scope.kind === 'all' ||
+      (scope.kind === 'outside' ? sessionId == null : sessionId === scope.id)
     const retrievals = this.retrievals
       .snapshot()
       .filter(
         (row) =>
           row.owner === owner &&
-          row.sessionId === sessionId &&
+          inScope(row.sessionId) &&
+          (agent == null || row.agent === agent) &&
+          (tool == null || row.tool === tool) &&
+          (query == null || row.query.toLowerCase().includes(query.toLowerCase())) &&
           (type == null || type === 'retrieval'),
       )
       .map((record) => ({
@@ -231,7 +251,12 @@ export class InMemorySessionAudit implements AgentSessionAuditPersistence {
     const writes = this.writes
       .filter(
         (row) =>
-          row.owner === owner && row.sessionId === sessionId && (type == null || type === 'write'),
+          row.owner === owner &&
+          inScope(row.sessionId) &&
+          (agent == null || (!this.quarantined.has(row.revisionId) && row.agent === agent)) &&
+          tool == null &&
+          query == null &&
+          (type == null || type === 'write'),
       )
       .map((row) => {
         const event = {
@@ -240,6 +265,8 @@ export class InMemorySessionAudit implements AgentSessionAuditPersistence {
           at: row.at,
           principal: row.principal,
           agent: row.agent,
+          sessionId: row.sessionId,
+          sessionName: row.sessionName,
           sessionAttach: row.sessionAttach,
           noteId: row.noteId,
           space: row.space,
@@ -261,14 +288,39 @@ export class InMemorySessionAudit implements AgentSessionAuditPersistence {
           (row) =>
             row.at < before.at ||
             (row.at === before.at &&
-              (row.source < rank || (row.source === rank && Number(row.id) < Number(before.id)))),
+              (row.source < rank || (row.source === rank && BigInt(row.id) < BigInt(before.id)))),
         )
       : all
     const page = matched.slice(0, limit + 1)
     return {
       items: page.slice(0, limit).map((row) => row.event),
-      total: all.length,
+      total: scope.kind === 'session' ? all.length : null,
       hasMore: page.length > limit,
     }
+  }
+
+  async agentFacet(owner: string) {
+    const counts = new Map<string, number>()
+
+    const add = (agent: string | null) => {
+      if (agent) {
+        counts.set(agent, (counts.get(agent) ?? 0) + 1)
+      }
+    }
+
+    for (const retrieval of this.retrievals.snapshot()) {
+      if (retrieval.owner === owner) {
+        add(retrieval.agent)
+      }
+    }
+    for (const write of this.writes) {
+      if (write.owner === owner && !this.quarantined.has(write.revisionId)) {
+        add(write.agent)
+      }
+    }
+
+    return [...counts.entries()]
+      .map(([agent, count]) => ({ agent, count }))
+      .sort((left, right) => right.count - left.count || left.agent.localeCompare(right.agent))
   }
 }

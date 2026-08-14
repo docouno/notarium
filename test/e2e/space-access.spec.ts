@@ -302,16 +302,24 @@ test('a reader gets a read-only chrome — no create/edit/delete affordances', a
   const kebab = page.getByRole('button', { name: 'More actions' })
   await expect(kebab).toBeVisible()
   await kebab.click()
-  await expect(page.getByRole('menuitemradio', { name: 'Copy note id' })).toBeVisible()
-  await expect(page.getByRole('menuitemradio', { name: 'Delete' })).toHaveCount(0)
-  await expect(page.getByRole('menuitemradio', { name: 'Pin to agent context' })).toHaveCount(0)
+  await expect(page.getByRole('menuitem', { name: 'Copy note id' })).toBeVisible()
+  await expect(page.getByRole('menuitem', { name: 'Delete' })).toHaveCount(0)
+  await expect(page.getByRole('menuitem', { name: 'Pin to agent context' })).toHaveCount(0)
   await page.keyboard.press('Escape')
+  await expect(kebab).toBeFocused()
+  await kebab.click()
+  await page.getByRole('menuitem', { name: 'Copy note id' }).click()
+  await expect(kebab).toBeFocused()
 
   // The note's context menu keeps read actions (Copy) but drops every mutation.
-  await page.locator('[data-testid="tree-note"]').first().click({ button: 'right' })
-  await expect(page.getByRole('menuitemradio', { name: 'Copy wikilink' })).toBeVisible()
-  await expect(page.getByRole('menuitemradio', { name: 'Rename' })).toHaveCount(0)
-  await expect(page.getByRole('menuitemradio', { name: 'Delete' })).toHaveCount(0)
+  const treeRow = page.locator('[data-testid="tree-note"]').first()
+  await treeRow.focus()
+  await treeRow.click({ button: 'right' })
+  await expect(page.getByRole('menuitem', { name: 'Copy wikilink' })).toBeVisible()
+  await expect(page.getByRole('menuitem', { name: 'Rename' })).toHaveCount(0)
+  await expect(page.getByRole('menuitem', { name: 'Delete' })).toHaveCount(0)
+  await page.getByRole('menuitem', { name: 'Copy wikilink' }).click()
+  await expect(treeRow).toBeFocused()
 
   // A plain (non-admin) reader can VIEW the members list but gets no management
   // controls — the negative side of the admin asymmetry (#121): no admin flag, not

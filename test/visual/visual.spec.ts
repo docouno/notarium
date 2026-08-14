@@ -36,6 +36,19 @@ const apply = async (page: Page, s: State) => {
   await page.setViewportSize({ width: W, height: H })
   if (s.clock) {
     await page.clock.install({ time: new Date('2026-06-10T12:00:00') })
+    await page.route('**/api/s/*/activity?*', async (route) => {
+      const url = new URL(route.request().url())
+
+      // Freeze only the day-bucket aggregate. /events and /projects keep their
+      // production requests, and the aggregate still executes in the fake server
+      // rather than returning a test-owned payload.
+      if (/^\/api\/s\/[^/]+\/activity$/.test(url.pathname)) {
+        url.searchParams.set('to', '2026-06-10T12:00:00.000Z')
+        await route.continue({ url: url.href })
+        return
+      }
+      await route.continue()
+    })
   }
   await page.addInitScript((st) => {
     localStorage.setItem('bm-theme', st.theme)
@@ -88,7 +101,7 @@ for (const theme of ['dark', 'light'] as const) {
   test.describe(`home — ${theme}`, () => {
     for (const rail of ['open', 'collapsed'] as const) {
       test(`rail ${rail}`, async ({ page }) => {
-        await apply(page, { theme, rail })
+        await apply(page, { theme, rail, clock: true })
         await page.goto('/')
         // The dashboard's own container, not its heading: the h1 is "Dashboard"
         // once a tree has loaded and only falls back to "Your knowledge base" on an
@@ -286,7 +299,7 @@ for (const theme of ['dark', 'light'] as const) {
       await page
         .locator('[data-testid="tree-note"][data-id="fake-demo-carbon"]')
         .click({ button: 'right' })
-      await page.getByRole('menuitemradio', { name: 'Delete' }).click()
+      await page.getByRole('menuitem', { name: 'Delete' }).click()
       await expect(page.getByRole('dialog')).toBeVisible()
       await shot(page, `confirm-dialog-${theme}`)
     })

@@ -59,6 +59,17 @@ const revision = (over: Partial<RevisionInput> = {}): RevisionInput => ({
   ...over,
 })
 
+const eventKey = (
+  event: Awaited<ReturnType<AgentSessionAuditPersistence['events']>>['items'][number],
+) => (event.type === 'retrieval' ? `retrieval:${event.record.id}` : `write:${event.id}`)
+
+const eventCursor = (
+  event: Awaited<ReturnType<AgentSessionAuditPersistence['events']>>['items'][number],
+) =>
+  event.type === 'retrieval'
+    ? { at: event.record.createdAt, source: 'retrieval' as const, id: event.record.id }
+    : { at: event.at, source: 'write' as const, id: event.id }
+
 export const describeSessionAuditContract = (
   name: string,
   factory: SessionAuditContractFactory,
@@ -169,7 +180,11 @@ export const describeSessionAuditContract = (
       ).toMatchObject({ retained: false, name: 'Archived review' })
       expect(await facets.audit.find('bob', 'ses_live', '2026-07-02T12:00:00.000Z')).toBeNull()
       expect(
-        await facets.audit.events({ owner: 'bob', sessionId: 'ses_live', limit: 10 }),
+        await facets.audit.events({
+          owner: 'bob',
+          scope: { kind: 'session', id: 'ses_live' },
+          limit: 10,
+        }),
       ).toMatchObject({ total: 0, items: [] })
 
       const firstPage = await facets.audit.overview({
@@ -205,6 +220,93 @@ export const describeSessionAuditContract = (
       })
     })
 
+    it('filters overview before stats, cursor pagination and the Outside projection', async () => {
+      await facets.sessions.insert({
+        id: 'ses_reads',
+        owner: 'alice',
+        name: 'Reads only',
+        named: true,
+        parentId: null,
+        createdAt: '2026-07-03T00:00:00.000Z',
+        lastSeenAt: '2026-07-03T00:00:00.000Z',
+        calls: 2,
+        role: null,
+      })
+      await facets.sessions.insert({
+        id: 'ses_writes',
+        owner: 'alice',
+        name: 'Writes only',
+        named: true,
+        parentId: null,
+        createdAt: '2026-07-01T00:00:00.000Z',
+        lastSeenAt: '2026-07-01T00:00:00.000Z',
+        calls: 2,
+        role: null,
+      })
+      await facets.retrievals.append(
+        retrieval({
+          sessionId: 'ses_reads',
+          sessionName: 'Reads only',
+          sessionAttach: 'declared',
+          createdAt: '2026-07-03T01:00:00.000Z',
+        }),
+      )
+      await facets.revisions.append(
+        revision({
+          noteId: 'writes-only-note',
+          contentHash: 'writes-only-hash',
+          createdAt: '2026-07-01T01:00:00.000Z',
+          agent: {
+            owner: 'alice',
+            agent: 'CLI',
+            session: { id: 'ses_writes', name: 'Writes only', attach: 'declared' },
+          },
+        }),
+        'writes only',
+      )
+      await facets.retrievals.append(
+        retrieval({ query: 'outside read', createdAt: '2026-07-02T00:00:00.000Z' }),
+      )
+
+      const reads = await facets.audit.overview({
+        owner: 'alice',
+        activeSince: '2026-07-02T12:00:00.000Z',
+        type: 'retrieval',
+        limit: 1,
+      })
+      expect(reads).toMatchObject({
+        total: 1,
+        active: 1,
+        hasMore: false,
+        outside: { reads: 1, writes: 0 },
+      })
+      expect(reads.items.map((item) => item.id)).toEqual(['ses_reads'])
+
+      const writes = await facets.audit.overview({
+        owner: 'alice',
+        activeSince: '2026-07-02T12:00:00.000Z',
+        type: 'write',
+        limit: 1,
+      })
+      expect(writes).toMatchObject({ total: 1, active: 0, hasMore: false, outside: null })
+      expect(writes.items.map((item) => item.id)).toEqual(['ses_writes'])
+
+      const terminal = await facets.audit.overview({
+        owner: 'alice',
+        activeSince: '2026-07-02T12:00:00.000Z',
+        type: 'write',
+        limit: 1,
+        before: { at: writes.items[0].lastSeenAt, id: writes.items[0].id },
+      })
+      expect(terminal).toMatchObject({
+        items: [],
+        total: 1,
+        active: 0,
+        hasMore: false,
+        outside: null,
+      })
+    })
+
     it('merges read and write sources with a stable cursor and type filter', async () => {
       await facets.retrievals.append(
         retrieval({
@@ -228,7 +330,7 @@ export const describeSessionAuditContract = (
 
       const first = await facets.audit.events({
         owner: 'alice',
-        sessionId: 'ses_timeline',
+        scope: { kind: 'session', id: 'ses_timeline' },
         limit: 1,
       })
       expect(first).toMatchObject({ total: 2, hasMore: true })
@@ -243,7 +345,7 @@ export const describeSessionAuditContract = (
       }
       const second = await facets.audit.events({
         owner: 'alice',
-        sessionId: 'ses_timeline',
+        scope: { kind: 'session', id: 'ses_timeline' },
         limit: 1,
         before: { at: read.record.createdAt, source: 'retrieval', id: read.record.id },
       })
@@ -252,11 +354,229 @@ export const describeSessionAuditContract = (
       expect(
         await facets.audit.events({
           owner: 'alice',
-          sessionId: 'ses_timeline',
+          scope: { kind: 'session', id: 'ses_timeline' },
           type: 'write',
           limit: 10,
         }),
       ).toMatchObject({ total: 1, items: [expect.objectContaining({ type: 'write' })] })
+    })
+
+    it('pages the owner-global union without duplicates while preserving scope and filters', async () => {
+      const session = (id: string, sessionName: string) => ({
+        id,
+        name: sessionName,
+        attach: 'declared' as const,
+      })
+      await facets.retrievals.append(
+        retrieval({
+          sessionId: 'ses_a',
+          sessionName: 'Session A',
+          query: 'session-a-read',
+          createdAt: '2026-07-01T01:00:00.000Z',
+        }),
+      )
+      await facets.revisions.append(
+        revision({
+          noteId: 'session-a-write',
+          contentHash: 'session-a-write',
+          createdAt: '2026-07-01T02:00:00.000Z',
+          agent: { owner: 'alice', agent: 'CLI', session: session('ses_a', 'Session A') },
+        }),
+        'session a',
+      )
+      await facets.retrievals.append(
+        retrieval({ query: 'outside-read', createdAt: '2026-07-01T03:00:00.000Z' }),
+      )
+      await facets.revisions.append(
+        revision({
+          noteId: 'outside-write',
+          contentHash: 'outside-write',
+          createdAt: '2026-07-01T04:00:00.000Z',
+          agent: { owner: 'alice', agent: 'CLI' },
+        }),
+        'outside',
+      )
+      await facets.retrievals.append(
+        retrieval({
+          sessionId: 'ses_b',
+          sessionName: 'Session B',
+          query: 'session-b-read',
+          createdAt: '2026-07-01T05:00:00.000Z',
+        }),
+      )
+      await facets.revisions.append(
+        revision({
+          noteId: 'session-b-write',
+          contentHash: 'session-b-write',
+          createdAt: '2026-07-01T06:00:00.000Z',
+          agent: { owner: 'alice', agent: 'CLI', session: session('ses_b', 'Session B') },
+        }),
+        'session b',
+      )
+      await facets.retrievals.append(
+        retrieval({
+          owner: 'bob',
+          query: 'private',
+          createdAt: '2026-07-01T07:00:00.000Z',
+        }),
+      )
+
+      const snapshot = await facets.audit.events({
+        owner: 'alice',
+        scope: { kind: 'all' },
+        limit: 100,
+      })
+      expect(snapshot).toMatchObject({ total: null, hasMore: false })
+      expect(snapshot.items).toHaveLength(6)
+      const first = await facets.audit.events({
+        owner: 'alice',
+        scope: { kind: 'all' },
+        limit: 2,
+      })
+      expect(first).toMatchObject({ total: null, hasMore: true })
+
+      await facets.retrievals.append(
+        retrieval({ query: 'inserted later', createdAt: '2026-07-01T08:00:00.000Z' }),
+      )
+      const walked = [...first.items]
+      let page = first
+
+      while (page.hasMore) {
+        page = await facets.audit.events({
+          owner: 'alice',
+          scope: { kind: 'all' },
+          limit: 2,
+          before: eventCursor(page.items.at(-1)!),
+        })
+        expect(page.total).toBeNull()
+        walked.push(...page.items)
+      }
+      expect(walked.map(eventKey)).toEqual(snapshot.items.map(eventKey))
+      expect(new Set(walked.map(eventKey)).size).toBe(snapshot.items.length)
+
+      const afterInsert = await facets.audit.events({
+        owner: 'alice',
+        scope: { kind: 'all' },
+        limit: 100,
+      })
+      const scoped = await Promise.all([
+        facets.audit.events({
+          owner: 'alice',
+          scope: { kind: 'session', id: 'ses_a' },
+          limit: 100,
+        }),
+        facets.audit.events({
+          owner: 'alice',
+          scope: { kind: 'session', id: 'ses_b' },
+          limit: 100,
+        }),
+        facets.audit.events({ owner: 'alice', scope: { kind: 'outside' }, limit: 100 }),
+      ])
+      const scopedKeys = scoped.flatMap((result) => result.items.map(eventKey))
+      expect(new Set(scopedKeys)).toEqual(new Set(afterInsert.items.map(eventKey)))
+      expect(scoped[2].total).toBeNull()
+      const bob = await facets.audit.events({ owner: 'bob', scope: { kind: 'all' }, limit: 100 })
+      expect(bob).toMatchObject({
+        total: null,
+        items: [
+          expect.objectContaining({
+            type: 'retrieval',
+            record: expect.objectContaining({ owner: 'bob', query: 'private' }),
+          }),
+        ],
+      })
+      expect(
+        await facets.audit.events({
+          owner: 'alice',
+          scope: { kind: 'all' },
+          agent: 'CLI',
+          limit: 100,
+        }),
+      ).toMatchObject({ items: expect.arrayContaining(snapshot.items) })
+      expect(
+        await facets.audit.events({
+          owner: 'alice',
+          scope: { kind: 'all' },
+          tool: 'search',
+          query: 'outside-read',
+          limit: 100,
+        }),
+      ).toMatchObject({
+        total: null,
+        items: [expect.objectContaining({ type: 'retrieval' })],
+      })
+      expect(await facets.audit.agentFacet('alice')).toEqual([{ agent: 'CLI', count: 7 }])
+      expect(snapshot.items).toContainEqual(
+        expect.objectContaining({
+          type: 'write',
+          sessionId: 'ses_b',
+          sessionName: 'Session B',
+        }),
+      )
+    })
+
+    it('keeps the exact session total across windows larger than the page', async () => {
+      for (let index = 0; index < 6; index += 1) {
+        await facets.retrievals.append(
+          retrieval({
+            sessionId: 'ses_long',
+            sessionName: 'Long session',
+            query: `query-${index}`,
+            createdAt: `2026-07-02T00:00:0${index}.000Z`,
+          }),
+        )
+      }
+      const first = await facets.audit.events({
+        owner: 'alice',
+        scope: { kind: 'session', id: 'ses_long' },
+        limit: 2,
+      })
+      expect(first).toMatchObject({ total: 6, hasMore: true })
+      const second = await facets.audit.events({
+        owner: 'alice',
+        scope: { kind: 'session', id: 'ses_long' },
+        limit: 2,
+        before: eventCursor(first.items.at(-1)!),
+      })
+      expect(second).toMatchObject({ total: 6, hasMore: true })
+    })
+
+    it('matches retrieval query fragments literally and case-insensitively', async () => {
+      await facets.retrievals.append(
+        retrieval({ query: 'Unbound context', createdAt: '2026-07-01T01:00:00.000Z' }),
+      )
+      await facets.retrievals.append(
+        retrieval({ query: 'literal 100%_done', createdAt: '2026-07-01T02:00:00.000Z' }),
+      )
+      await facets.retrievals.append(
+        retrieval({ query: 'literal 100XXdone', createdAt: '2026-07-01T03:00:00.000Z' }),
+      )
+
+      const fragment = await facets.audit.events({
+        owner: 'alice',
+        scope: { kind: 'all' },
+        query: 'CONTEXT',
+        limit: 10,
+      })
+      expect(fragment.items).toEqual([
+        expect.objectContaining({
+          type: 'retrieval',
+          record: expect.objectContaining({ query: 'Unbound context' }),
+        }),
+      ])
+
+      const literalWildcards = await facets.audit.events({
+        owner: 'alice',
+        scope: { kind: 'all' },
+        query: '%_',
+        limit: 10,
+      })
+      expect(literalWildcards.items).toEqual([
+        expect.objectContaining({
+          type: 'retrieval',
+          record: expect.objectContaining({ query: 'literal 100%_done' }),
+        }),
+      ])
     })
   })
 }

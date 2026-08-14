@@ -5,6 +5,7 @@ import {
   AgentContextQuerySchema,
   AgentRoleDetailRequestSchema,
   AgentRoleDetailResponseSchema,
+  AgentSessionEventsQuerySchema,
   BucketsQuerySchema,
   BucketsResponseSchema,
   ConfigSchema,
@@ -58,6 +59,24 @@ import {
 // spaces in paths, root notes, ghost links, notes without createdAt) and by
 // rejecting malformed payloads. The fake backend (#18.2) and any future host
 // must satisfy exactly these.
+
+describe('GET /api/me/agent-sessions/:id query', () => {
+  it('allows a query fragment across all retrieval tools and keeps tool as an optional narrowing', () => {
+    expect(AgentSessionEventsQuerySchema.safeParse({ q: 'same query' }).success).toBe(true)
+    expect(
+      AgentSessionEventsQuerySchema.safeParse({ q: 'same query', tool: 'search' }).success,
+    ).toBe(true)
+    expect(AgentSessionEventsQuerySchema.safeParse({ tool: 'search' }).success).toBe(false)
+    expect(
+      AgentSessionEventsQuerySchema.safeParse({ q: 'same query', filter: 'writes' }).success,
+    ).toBe(false)
+  })
+
+  it('rejects NUL before binding text filters to a database driver', () => {
+    expect(AgentSessionEventsQuerySchema.safeParse({ q: 'before\0after' }).success).toBe(false)
+    expect(AgentSessionEventsQuerySchema.safeParse({ agent: 'CLI\0hidden' }).success).toBe(false)
+  })
+})
 
 describe('GET /api/config', () => {
   it('is just the capability facts (#99 dropped the default-space pointer) and rejects the engine-leak fields', () => {

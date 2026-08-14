@@ -69,7 +69,7 @@ const FIXTURE = {
           date: TODAY,
           kind: 'edited',
           title: 'Alpha',
-          principal: 'ui',
+          principal: 'pat:alice:key-9',
           noteId: 'fake-notes-alpha',
           charsAdded: 12,
           charsRemoved: 0,
@@ -123,11 +123,36 @@ test('Home dashboard: pills, activity surface, day-drill, health/projects surfac
   const feed = page.getByTestId('activity-feed')
   await expect(feed).toBeVisible()
   await expect(feed.getByText('Secret')).toHaveCount(0)
+  const feedRows = feed.getByTestId('dashboard-activity-row')
+  const timeline = feedRows.first().locator('..')
+  const [timelineBox, firstMarkerBox, lastMarkerBox, endpoints] = await Promise.all([
+    timeline.boundingBox(),
+    feedRows.first().locator('[data-timeline-marker]').boundingBox(),
+    feedRows.last().locator('[data-timeline-marker]').boundingBox(),
+    timeline.evaluate((element) => {
+      const style = getComputedStyle(element, '::before')
+      return { top: Number.parseFloat(style.top), bottom: Number.parseFloat(style.bottom) }
+    }),
+  ])
+  const lineTop = (timelineBox?.y ?? 0) + endpoints.top
+  const lineBottom = (timelineBox?.y ?? 0) + (timelineBox?.height ?? 0) - endpoints.bottom
+  expect(lineTop).toBeGreaterThan(firstMarkerBox?.y ?? Number.POSITIVE_INFINITY)
+  expect(lineTop).toBeLessThan((firstMarkerBox?.y ?? 0) + (firstMarkerBox?.height ?? 0))
+  expect(lineBottom).toBeGreaterThan(lastMarkerBox?.y ?? Number.POSITIVE_INFINITY)
+  expect(lineBottom).toBeLessThan((lastMarkerBox?.y ?? 0) + (lastMarkerBox?.height ?? 0))
   await expect(feed.getByText('Alpha').first()).toBeVisible()
   // #217 gitlab-style: each event is a two-line entry — the metadata line shows the
   // kind + churn, and line one carries the note's location as a clickable folder
   // breadcrumb (Alpha lives in notes/, so the crumb links that folder's Files view).
   await expect(feed.getByText('+12 −0')).toBeVisible()
+  const agentEvent = feed.getByTestId('dashboard-activity-row').filter({ hasText: '+12 −0' })
+  expect(
+    await agentEvent
+      .locator('[data-timeline-slot]')
+      .evaluateAll((slots) => slots.map((slot) => slot.getAttribute('data-timeline-slot'))),
+  ).toEqual(['action', 'actor', 'outcome'])
+  await expect(agentEvent.locator('[data-timeline-slot="actor"]')).toContainText('alice’s agent')
+  await expect(agentEvent.locator('[data-timeline-slot="actor"] svg')).toBeVisible()
   const folderCrumb = feed.getByRole('link', { name: 'notes' }).first()
   await expect(folderCrumb).toBeVisible()
   await expect(folderCrumb).toHaveAttribute('href', /\/s\/main\/files\/notes$/)

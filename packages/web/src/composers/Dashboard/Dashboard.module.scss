@@ -26,7 +26,11 @@
   align-items: center;
   gap: 10px;
   color: var(--accent);
-  h1 { margin: 0; font-size: 21px; color: var(--text); }
+  h1 {
+    margin: 0;
+    font-size: 21px;
+    color: var(--text);
+  }
 }
 
 /* ── section titles ────────────────────────────────────────────────────────
@@ -43,7 +47,9 @@
   letter-spacing: 0.02em;
   text-transform: uppercase;
   color: var(--text-dim);
-  svg { color: var(--text-faint); }
+  svg {
+    color: var(--text-faint);
+  }
 }
 .card-count {
   margin-left: 4px;
@@ -130,7 +136,9 @@
 }
 .ref-link:hover {
   color: var(--text);
-  strong { color: var(--accent); }
+  strong {
+    color: var(--accent);
+  }
 }
 
 /* A surface's own vertical rhythm (the Outlet renders ONE surface node, so it
@@ -164,7 +172,9 @@ $dows: 30px;
    fixed tracks fit without overflow (any remainder is left-hugged slack, not a scrollbar),
    and a clipping context would chop the selected cell's outline on the right-edge column
    (#33 fix). */
-.heat-scroll { overflow: visible; }
+.heat-scroll {
+  overflow: visible;
+}
 /* Heatmap sizing (#219). Every week track and every cell shares ONE `--cell` edge
    plus ONE `--gap`, so rows and columns land on a single regular lattice — no more
    per-column `aspect-ratio` drift. `useDeviceSnappedGrid` (ActivityHeatmap.tsx) sets
@@ -197,16 +207,26 @@ $dows: 30px;
   font-size: 10px;
   color: var(--text-faint);
 }
-.heat-month { white-space: nowrap; padding-right: 6px; }
+.heat-month {
+  white-space: nowrap;
+  padding-right: 6px;
+}
 
-.heat-body { display: flex; gap: 0; align-items: stretch; }
+.heat-body {
+  display: flex;
+  gap: 0;
+  align-items: stretch;
+}
 .heat-dows {
   display: grid;
   grid-template-rows: repeat(7, 1fr);
   width: $dows;
   font-size: 9px;
   color: var(--text-faint);
-  span { display: flex; align-items: center; }
+  span {
+    display: flex;
+    align-items: center;
+  }
 }
 .heat-grid {
   /* `flex: 0 0 auto`, NOT `flex: 1`: the box must hug its columns, not stretch to the
@@ -257,17 +277,27 @@ $dows: 30px;
   }
 }
 @keyframes heat-shimmer {
-  0% { background-position: 130% 0; }
-  100% { background-position: -30% 0; }
+  0% {
+    background-position: 130% 0;
+  }
+  100% {
+    background-position: -30% 0;
+  }
 }
 @media (prefers-reduced-motion: reduce) {
-  .heat-grid[data-loading]::after { animation: none; }
+  .heat-grid[data-loading]::after {
+    animation: none;
+  }
 }
 /* A week is a column of 7 cells; every cell is a fixed `--cell` square (same edge
    across all weeks — see .heat-inner), so rows line up perfectly and resizing scales
    them uniformly, never distorts (#219). The vertical gap is the same device-snapped
    `--gap`, so rows sit on the device grid too. */
-.heat-week { display: flex; flex-direction: column; gap: var(--gap); }
+.heat-week {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+}
 
 .heat-cell {
   width: 100%;
@@ -283,20 +313,44 @@ $dows: 30px;
   transition: background-color 0.25s ease;
   /* Increasing LUMINANCE = more activity; the top step goes brighter (toward
      white) so levels 3 and 4 stay clearly distinct (#33). */
-  &[data-level='1'] { background: color-mix(in srgb, var(--accent) 26%, var(--bg-list)); }
-  &[data-level='2'] { background: color-mix(in srgb, var(--accent) 52%, var(--bg-list)); }
-  &[data-level='3'] { background: var(--accent); }
-  &[data-level='4'] { background: color-mix(in srgb, var(--accent) 55%, white); }
-  &:hover { outline: 1px solid var(--accent); outline-offset: 1px; }
-  &[data-selected] { outline: 2px solid var(--text); outline-offset: 1px; }
+  &[data-level='1'] {
+    background: color-mix(in srgb, var(--accent) 26%, var(--bg-list));
+  }
+  &[data-level='2'] {
+    background: color-mix(in srgb, var(--accent) 52%, var(--bg-list));
+  }
+  &[data-level='3'] {
+    background: var(--accent);
+  }
+  &[data-level='4'] {
+    background: color-mix(in srgb, var(--accent) 55%, white);
+  }
+  &:hover {
+    outline: 1px solid var(--accent);
+    outline-offset: 1px;
+  }
+  &[data-selected] {
+    outline: 2px solid var(--text);
+    outline-offset: 1px;
+  }
   /* Skeleton cells (#218): inert muted squares — the single grid sweep above carries
      the loading signal; the cell just holds its muted space (no pointer, no hover). */
-  &[data-skeleton] { cursor: default; &:hover { outline: none; } }
+  &[data-skeleton] {
+    cursor: default;
+    &:hover {
+      outline: none;
+    }
+  }
 }
 @media (prefers-reduced-motion: reduce) {
-  .heat-cell { transition: none; }
+  .heat-cell {
+    transition: none;
+  }
 }
-.heat-pad { width: 100%; height: var(--cell); }
+.heat-pad {
+  width: 100%;
+  height: var(--cell);
+}
 
 .heat-legend {
   display: flex;
@@ -307,9 +361,21 @@ $dows: 30px;
   color: var(--text-faint);
   /* Legend swatches are a fixed 11px (not the derived --cell); the height wins by
      specificity over .heat-cell's `height: var(--cell)`. */
-  .heat-cell { width: 11px; height: 11px; flex: none; cursor: default; &:hover { outline: none; } }
-  span:first-child { margin-right: 2px; }
-  span:last-child { margin-left: 2px; }
+  .heat-cell {
+    width: 11px;
+    height: 11px;
+    flex: none;
+    cursor: default;
+    &:hover {
+      outline: none;
+    }
+  }
+  span:first-child {
+    margin-right: 2px;
+  }
+  span:last-child {
+    margin-left: 2px;
+  }
 }
 
 /* Floating hover tooltip (#33) — a real styled tip, not a native `title`.
@@ -330,8 +396,13 @@ $dows: 30px;
   font-size: 11.5px;
   white-space: nowrap;
 }
-.heat-tip-date { font-weight: 600; color: var(--text); }
-.heat-tip-body { color: var(--text-dim); }
+.heat-tip-date {
+  font-weight: 600;
+  color: var(--text);
+}
+.heat-tip-body {
+  color: var(--text-dim);
+}
 
 /* ── "what changed" — a GitLab-style activity timeline (no card) ───────────── */
 /* The empty / no-activity state gets a reserved, centred area so it isn't
@@ -354,68 +425,15 @@ $dows: 30px;
   font-size: 11px;
   text-transform: none;
   letter-spacing: 0;
-  &:hover { color: var(--text); }
-}
-
-$spine: 13px; /* x of the timeline rail (= icon centre) */
-
-.timeline {
-  position: relative;
-  /* The vertical rail the icons sit on, from the first icon centre to the last. */
-  &::before {
-    content: '';
-    position: absolute;
-    left: $spine;
-    top: 16px;
-    bottom: 16px;
-    width: 2px;
-    background: var(--border);
+  &:hover {
+    color: var(--text);
   }
 }
-.event {
-  position: relative;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-height: 52px;
-  padding: 10px 10px 10px 36px; /* room for the absolute icon on the rail */
-  /* No row hover/rounding: the row isn't one click target anymore (#217) — its
-     links (folder crumbs, title) carry their own hover, so a full-row pill would
-     be a misleading affordance. */
-}
-.event-icon {
-  position: absolute;
-  left: calc(#{$spine} - 12px);
-  top: 50%;
-  transform: translateY(-50%);
-  width: 24px;
-  height: 24px;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  /* Page-bg disc masks the rail behind it (the icon reads as a node). The glyph
-     keeps its semantic kind colour — that's meaning, not decoration. */
-  background: var(--bg);
-  border: 1px solid var(--border);
-  color: var(--text-dim);
-  &[data-kind='created'] { color: var(--ok); }
-  &[data-kind='edited'] { color: var(--accent); }
-  &[data-kind='restored'] { color: var(--warning); }
-  &[data-kind='deleted'] { color: var(--danger); }
-}
-/* Two-line GitLab entry (#217): line one = location breadcrumb + title + time,
-   line two = the metadata. */
-.event-body {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-.event-head {
+
+.event-primary {
   display: flex;
   align-items: baseline;
+  flex: 1;
   min-width: 0;
   font-size: 13.5px;
   line-height: 1.35;
@@ -452,28 +470,10 @@ $spine: 13px; /* x of the timeline rail (= icon centre) */
   color: var(--text);
   font-weight: 500;
   text-decoration: none;
-  &:hover { text-decoration: underline; }
+  &:hover {
+    text-decoration: underline;
+  }
 }
-.event-date {
-  flex: none;
-  margin-left: auto;
-  padding-left: 10px;
-  color: var(--text-faint);
-  font-size: 12px;
-  white-space: nowrap;
-}
-.event-meta {
-  min-width: 0;
-  font-size: 12px;
-  color: var(--text-dim);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.event-verb { color: var(--text-dim); }
-.event-churn { color: var(--text-faint); font-variant-numeric: tabular-nums; }
-.event-by { color: var(--text-faint); }
-
 /* ── surface sections ──────────────────────────────────────────────────────── */
 /* Outline plates (border, no fill) — same treatment as the heatmap, so the whole
    page reads flat rather than a stack of filled boxes (#33). A surface stacks
@@ -486,7 +486,10 @@ $spine: 13px; /* x of the timeline rail (= icon centre) */
 }
 
 /* ── surface link lists (projects / broken / former-name / orphans) ───────── */
-.link-list { display: flex; flex-direction: column; }
+.link-list {
+  display: flex;
+  flex-direction: column;
+}
 .link-row {
   position: relative;
   display: flex;
@@ -507,7 +510,9 @@ $spine: 13px; /* x of the timeline rail (= icon centre) */
     height: 1px;
     background: var(--border);
   }
-  &:hover { background: var(--bg-hover); }
+  &:hover {
+    background: var(--bg-hover);
+  }
 }
 /* Hide the dividers ABOVE and BELOW a hovered row, so the straight separator
    doesn't poke past the row's rounded hover corners. */
@@ -526,7 +531,9 @@ $spine: 13px; /* x of the timeline rail (= icon centre) */
 }
 /* The "→ target" tail on a grooming-health row (#100 phase 5): dim, so the source note
    reads as primary and the resolved-to target as context. */
-.link-arrow { color: var(--text-faint); }
+.link-arrow {
+  color: var(--text-faint);
+}
 .link-badge {
   flex: none;
   font-size: 11px;
@@ -537,5 +544,14 @@ $spine: 13px; /* x of the timeline rail (= icon centre) */
   border-radius: var(--radius-pill);
   padding: 1px 7px;
 }
-.link-when { flex: none; color: var(--text-faint); font-size: 11.5px; white-space: nowrap; }
-.link-more { font-size: 11.5px; color: var(--text-faint); padding: 7px 6px 0; }
+.link-when {
+  flex: none;
+  color: var(--text-faint);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.link-more {
+  font-size: 11.5px;
+  color: var(--text-faint);
+  padding: 7px 6px 0;
+}

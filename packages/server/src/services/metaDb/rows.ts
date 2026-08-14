@@ -540,6 +540,8 @@ export const auditEventOfRow = (r: AuditEventRow): AgentSessionAuditEvent => {
     at: r.created_at,
     principal: r.principal,
     agent: r.agent,
+    sessionId: r.session_id,
+    sessionName: r.session_name,
     sessionAttach:
       r.session_attach === AGENT_SESSION_ATTACH.declared ||
       r.session_attach === AGENT_SESSION_ATTACH.inferred

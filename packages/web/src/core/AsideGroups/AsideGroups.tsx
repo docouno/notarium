@@ -1,4 +1,4 @@
-import { type MouseEvent as ReactMouseEvent, type ReactNode, useRef } from 'react'
+import { type MouseEvent as ReactMouseEvent, type ReactNode, useEffect, useRef } from 'react'
 import { cx } from '../../libs/cx/cx'
 import { ASIDE_PANEL, usePanelWidth } from '../../libs/hooks/usePanelWidth'
 import {
@@ -27,6 +27,15 @@ type AsideGroupsProps = {
   storageKey: string | null
   /** The panel toggle (collapse the whole aside) — shown in the first group's head. */
   headerAction?: ReactNode
+  /** Activity uses the same aside shell as a full-width drawer at <=720px. */
+  overlayOnNarrow?: boolean
+  /** Apply modal dialog semantics and keyboard containment while the narrow
+   *  full-screen variant is actually active. */
+  modal?: boolean
+  /** Close the modal shell from shared keyboard behavior such as Escape. */
+  onRequestClose?: () => void
+  /** Move focus into the active tab when this aside is mounted as an opened drawer. */
+  autoFocus?: boolean
 }
 
 // The right aside as a vertical stack of tabbed groups (#35). The group COMPOSITION
@@ -41,6 +50,10 @@ export const AsideGroups = ({
   defaultLayout,
   storageKey,
   headerAction,
+  overlayOnNarrow = false,
+  modal = false,
+  onRequestClose,
+  autoFocus = false,
 }: AsideGroupsProps) => {
   const [width, startWidthResize, setWidth] = usePanelWidth(ASIDE_PANEL)
   const { groups, setActiveTab, setGroupHeight } = useAsideLayout(
@@ -48,8 +61,67 @@ export const AsideGroups = ({
     defaultLayout,
     storageKey,
   )
+  const asideRef = useRef<HTMLElement>(null)
   const stackRef = useRef<HTMLDivElement>(null)
   const byId = new Map(panels.map((p) => [p.id, p]))
+
+  useEffect(() => {
+    if (!autoFocus) {
+      return
+    }
+    const frame = requestAnimationFrame(() => {
+      const active = asideRef.current?.querySelector<HTMLElement>('[role="tab"][tabindex="0"]')
+      active?.focus()
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [autoFocus])
+
+  useEffect(() => {
+    if (!modal) {
+      return
+    }
+    const containFocus = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        onRequestClose?.()
+        return
+      }
+      if (event.key !== 'Tab') {
+        return
+      }
+      const aside = asideRef.current
+
+      if (!aside) {
+        return
+      }
+      const focusable = [
+        ...aside.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]',
+        ),
+      ].filter((element) => element.tabIndex >= 0)
+
+      if (focusable.length === 0) {
+        event.preventDefault()
+        aside.focus()
+        return
+      }
+      const first = focusable[0]!
+      const last = focusable.at(-1)!
+      const active = document.activeElement
+
+      if (event.shiftKey && (active === first || active === aside)) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && active === last) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+    window.addEventListener('keydown', containFocus)
+    return () => {
+      window.removeEventListener('keydown', containFocus)
+    }
+  }, [modal, onRequestClose])
 
   // Height ceiling for one group: leave at least MIN for every OTHER group so a
   // drag can't collapse its neighbours. Measured live off the stack.
@@ -95,7 +167,16 @@ export const AsideGroups = ({
   }
 
   return (
-    <aside className={styles.aside} style={{ width }} data-testid="aside-groups">
+    <aside
+      ref={asideRef}
+      className={cx(styles.aside, overlayOnNarrow && styles.overlayOnNarrow)}
+      style={{ width }}
+      data-testid="aside-groups"
+      role={modal ? 'dialog' : undefined}
+      aria-modal={modal || undefined}
+      aria-label={modal ? 'Activity panels' : undefined}
+      tabIndex={modal ? -1 : undefined}
+    >
       <div className={styles.widthResize} onMouseDown={startWidthResize} />
       <div className={styles.stack} ref={stackRef}>
         {groups.map((group, i) => {
@@ -113,8 +194,8 @@ export const AsideGroups = ({
               data-testid="aside-group"
             >
               <div className={cx(styles.groupHead, 'glass', 'glass-edge-bottom')}>
-                <div className={styles.tabs} role="tablist">
-                  {group.panels.map((pid) => {
+                <div className={styles.tabs} role="tablist" aria-orientation="horizontal">
+                  {group.panels.map((pid, panelIndex) => {
                     const def = byId.get(pid)
 
                     if (!def) {
@@ -124,10 +205,36 @@ export const AsideGroups = ({
                     return (
                       <button
                         key={pid}
+                        id={`aside-${group.id}-${pid}-tab`}
                         role="tab"
                         aria-selected={pid === group.activeTab}
+                        aria-controls={`aside-${group.id}-${pid}-panel`}
+                        tabIndex={pid === group.activeTab ? 0 : -1}
                         className={cx(styles.tab, pid === group.activeTab && styles.active)}
                         onClick={() => setActiveTab(group.id, pid)}
+                        onKeyDown={(event) => {
+                          const lastIndex = group.panels.length - 1
+                          const nextIndex =
+                            event.key === 'ArrowRight'
+                              ? (panelIndex + 1) % group.panels.length
+                              : event.key === 'ArrowLeft'
+                                ? (panelIndex - 1 + group.panels.length) % group.panels.length
+                                : event.key === 'Home'
+                                  ? 0
+                                  : event.key === 'End'
+                                    ? lastIndex
+                                    : null
+
+                          if (nextIndex == null) {
+                            return
+                          }
+                          event.preventDefault()
+                          const nextId = group.panels[nextIndex]!
+                          setActiveTab(group.id, nextId)
+                          requestAnimationFrame(() =>
+                            document.getElementById(`aside-${group.id}-${nextId}-tab`)?.focus(),
+                          )
+                        }}
                         data-testid={`aside-tab-${pid}`}
                       >
                         {def.label}
@@ -142,7 +249,26 @@ export const AsideGroups = ({
                   <div className={styles.groupActions}>{headerAction}</div>
                 )}
               </div>
-              <div className={styles.groupBody}>{active?.render()}</div>
+              <div
+                id={`aside-${group.id}-${group.activeTab}-panel`}
+                className={styles.groupBody}
+                role="tabpanel"
+                aria-labelledby={`aside-${group.id}-${group.activeTab}-tab`}
+                tabIndex={0}
+              >
+                {active?.render()}
+              </div>
+              {group.panels
+                .filter((pid) => pid !== group.activeTab && byId.has(pid))
+                .map((pid) => (
+                  <div
+                    key={pid}
+                    id={`aside-${group.id}-${pid}-panel`}
+                    role="tabpanel"
+                    aria-labelledby={`aside-${group.id}-${pid}-tab`}
+                    hidden
+                  />
+                ))}
               {!last && (
                 <>
                   {/* Corner grip: width + this group's height in one diagonal drag.

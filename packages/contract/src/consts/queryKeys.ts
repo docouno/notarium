@@ -17,6 +17,7 @@ export const QUERY_KEY = {
   preview: 'preview',
   group: 'group',
   author: 'author',
+  agent: 'agent',
   tool: 'tool',
   filter: 'filter',
   beforeAt: 'beforeAt',

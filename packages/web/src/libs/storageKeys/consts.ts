@@ -69,6 +69,8 @@ export const STORAGE_KEYS = {
   railWidth: 'bm-rail-w',
   /** Per-group height spec for the tabbed-groups aside (#35). */
   asideGroups: 'bm-aside-groups',
+  /** Activity's Filters / Diagnostics group; separate from the note inspector layout. */
+  activityAsideGroups: 'bm-activity-aside-groups',
 
   // ── Hotkeys (libs/hotkeys/storage) ─────────────────────────────────────────
   /** Chosen hotkey preset id. */

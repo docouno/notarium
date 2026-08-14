@@ -14,7 +14,7 @@ test('New folder from a folder menu creates a durable child folder in the tree',
   await expect(demo).toBeVisible()
 
   await demo.click({ button: 'right' })
-  await page.getByRole('menuitemradio', { name: 'New folder' }).click()
+  await page.getByRole('menuitem', { name: 'New folder' }).click()
   await page.getByTestId('dialog-prompt-input').fill('drafts')
   await page.getByRole('button', { name: 'Create folder' }).click()
 
@@ -27,7 +27,7 @@ test('New folder from a folder menu creates a durable child folder in the tree',
 test('New folder from the root + menu creates a top-level folder', async ({ page }) => {
   await page.goto('/')
   await page.getByTestId('new-menu').click()
-  await page.getByRole('menuitemradio', { name: 'New folder' }).click()
+  await page.getByRole('menuitem', { name: 'New folder' }).click()
   await page.getByTestId('dialog-prompt-input').fill('inbox')
   await page.getByRole('button', { name: 'Create folder' }).click()
 
@@ -42,7 +42,7 @@ test('renaming a folder relocates it — the OLD folder does not linger as a dup
   await expect(demo).toBeVisible()
 
   await demo.click({ button: 'right' })
-  await page.getByRole('menuitemradio', { name: 'Rename' }).click()
+  await page.getByRole('menuitem', { name: 'Rename' }).click()
   const input = page.getByTestId('rename-input')
   await input.fill('demo-renamed')
   await input.press('Enter')
@@ -68,7 +68,7 @@ test('a renamed folder stays expanded — its open state survives the path chang
   await expect(page.locator('[data-testid="tree-note"][data-id="fake-demo-carbon"]')).toBeVisible()
 
   await demo.click({ button: 'right' })
-  await page.getByRole('menuitemradio', { name: 'Rename' }).click()
+  await page.getByRole('menuitem', { name: 'Rename' }).click()
   const input = page.getByTestId('rename-input')
   await input.fill('demo-renamed')
   await input.press('Enter')
@@ -158,7 +158,7 @@ test('deleting a folder removes it and the notes inside, in one act', async ({ p
   await expect(demo).toBeVisible()
 
   await demo.click({ button: 'right' })
-  await page.getByRole('menuitemradio', { name: 'Delete' }).click()
+  await page.getByRole('menuitem', { name: 'Delete' }).click()
   // The confirm names the note count — accept it.
   await page.getByRole('button', { name: 'Delete' }).click()
 

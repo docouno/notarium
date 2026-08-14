@@ -1,0 +1,233 @@
+/* The Agents → Activity surface: owner-global stream + episode grouping/history. */
+
+.page {
+  min-width: 0;
+}
+
+.inner {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.head {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.title {
+  min-width: 0;
+  margin: 0;
+  font-size: 20px;
+  font-weight: 650;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.sub {
+  margin: 0;
+  max-width: 64ch;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+
+.detail-head {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.detail-eyebrow {
+  color: var(--text-faint);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.detail-title-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+
+.session-provenance {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 18px;
+}
+
+.parent-link {
+  color: var(--text-dim);
+  font-size: 12px;
+  text-decoration: none;
+
+  &:hover {
+    color: var(--text);
+    text-decoration: underline;
+  }
+}
+
+/* ── filter controls ─────────────────────────────────────────────────────────*/
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 2px;
+  min-width: 0;
+}
+
+.total {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 680px) {
+  .controls {
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: 8px;
+  }
+
+  .total {
+    flex-basis: 100%;
+  }
+}
+
+/* ── grouped episodes / detail (#321) ────────────────────────────────────── */
+.session-list-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.session-list-title {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.session-list-meta {
+  color: var(--text-faint);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.session-title-line {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.session-title {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.active-label {
+  padding: 1px 6px;
+  border-radius: 999px;
+  color: var(--success);
+  background: color-mix(in srgb, var(--success) 10%, transparent);
+  font-size: 10.5px;
+  font-weight: 650;
+  text-transform: uppercase;
+}
+
+.session-kind-label {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: 999px;
+  color: var(--text-dim);
+  background: var(--bg-list);
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.load-more {
+  display: flex;
+  justify-content: center;
+}
+
+.load-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+/* ── Activity surface controls / stream metadata ─────────────────────────── */
+.activity-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  min-width: 0;
+}
+
+.control-group {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+
+  > span {
+    color: var(--text-faint);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+  }
+}
+
+.session-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.session-timeline-segment {
+  min-width: 0;
+}
+
+.session-detail {
+  margin-left: 24px;
+}
+
+.session-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0 0 8px;
+}
+
+.session-skeleton-action {
+  width: 32px;
+  height: 32px;
+  flex: none;
+}
+
+@media (max-width: 720px) {
+  .activity-controls {
+    align-items: flex-start;
+  }
+
+  .control-group {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}

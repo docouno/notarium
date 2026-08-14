@@ -137,7 +137,7 @@ test('a failed action surfaces a toast and leaves the note intact', async ({ pag
   )
 
   await page.getByRole('button', { name: 'More actions' }).click()
-  await page.getByRole('menuitemradio', { name: 'Delete' }).click() // overflow-menu item
+  await page.getByRole('menuitem', { name: 'Delete' }).click() // overflow-menu item
   await page.getByRole('button', { name: 'Delete' }).click() // confirm dialog
 
   await expect(page.getByTestId('toast')).toContainText('boom')
@@ -161,7 +161,7 @@ test('a failed folder delete leaves an open note intact', async ({ page }) => {
   )
 
   await page.locator('[data-testid="tree-folder"][data-path="demo"]').click({ button: 'right' })
-  await page.getByRole('menuitemradio', { name: 'Delete' }).click()
+  await page.getByRole('menuitem', { name: 'Delete' }).click()
   await page.getByRole('button', { name: 'Delete' }).click()
 
   await expect(page.getByTestId('toast')).toContainText('folder boom')

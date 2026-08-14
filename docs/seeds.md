@@ -126,7 +126,7 @@ and for `security` — it parses the sanitized HTML into a live DOM and checks t
 | Case | About | Axes |
 |---|---|---|
 | `agent-context` | pins + personal/project memory + projects of varying density (#165), including the pinned `product/index.md` **Folder overview #311**; **heavy pins over budget + a `Budget Lab` space for all token-budget cases #208** (personal-trim, fits / squeeze / dominant / no-pins — nesting the personal set into project Q's budget); **cross-space context set #209** (`Frontend Canon` in the `Conventions` space, connected to project Product OS + personal) **+ cross-space loose pin #209** (`Security Baseline` from `Conventions`, pinned directly into Product OS + personal) — both resolve cross-space; **retrieval audit #243** (search/recall/get_note history: hits + a recurrent vocabulary-mismatch miss + frequent queries) | agent-memory, agent-audit, structure, note-classes, scale |
-| `agent-sessions` | session-first audit: active fork siblings, exact call vs audited read/write counts, declared/inferred attachment, `Outside sessions`, an archived snapshot whose lifecycle row was GC'd, hostile and max-length unbroken labels, owner isolation, and distinct root/fork/owner delta positions | agent-sessions, agent-audit, auth, history |
+| `agent-sessions` | Activity: active fork siblings, exact call vs audited read/write counts, declared/inferred attachment, `Outside sessions`, an archived snapshot whose lifecycle row was GC'd, a mixed history longer than one 50-row page, an equal-timestamp read/write cursor boundary, hostile and max-length unbroken labels, owner isolation, and distinct root/fork/owner delta positions | agent-sessions, agent-audit, auth, history |
 | `agent-roles` | five principals keep the boundary visible: Fresh is catalog-only; Bob owns an idle Personal fork; Maya owns switchable Personal `research`/`grooming` presets plus same-name Research Space + two Project forks; Robin can inspect the Team role read-only. Base Personal/Project pins remain visible, each placement has a distinct role pin, the Team Project role adds a set plus an oversized tail that trims under the shared `Role → Project → Personal` budget, and an active episode rehydrates `research`; Sergey remains the browsable real-stand owner | agent-roles, agent-sessions, auth, structure, scale |
 | `memory-perf` | 2700 ordinary notes + 4 personal-memory categories + 1 project-partition sentinel; reproduces memory-mount scaling, partition isolation, and graph-inert memory links | agent-memory, note-classes, scale |
 | `import-thread` | one rich imported thread | import, content |
@@ -415,7 +415,9 @@ preserving declaration order.
   conflicting event owner is a seed error rather than an impossible cross-owner state.
   Retrievals are written by the REAL applier after timeline replay, when their LOGICAL
   hit refs can resolve to real id/title/class; empty `hits` is a zero-result MISS. The
-  fake projection carries retained session lifecycle rows, while retrieval and archived
-  audit snapshots remain real-stand concerns. `agent-context` demonstrates aggregate
-  query/miss data; `agent-sessions` covers root/fork/automatic/archived/Outside episodes,
-  read+write timelines, owner isolation, hostile strings, and max-length labels.
+  fake projection carries retained session lifecycle rows and agent-attributed journal writes
+  (including archived/Outside snapshots) through the same audit tap as live writes. Retrievals
+  remain a real-stand concern. `agent-context` demonstrates aggregate query/miss data;
+  `agent-sessions` covers root/fork/automatic/archived/Outside episodes, a page boundary and a
+  cross-source timestamp tie, read+write timelines, owner isolation, an owner with no activity,
+  a quarantined unavailable write, hostile strings, and max-length labels.

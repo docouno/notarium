@@ -344,7 +344,7 @@ export type RetrievalAggregates = {
 
 /** The agent-retrieval audit facet: an append-only, owner-scoped log written
  *  fire-and-forget by the MCP gateway on every read-tool call, read back by the
- *  Agents → Sessions surface. Owner-keyed and cross-space (a search fans out) — so it is
+ *  Agents → Activity surface. Owner-keyed and cross-space (a search fans out) — so it is
  *  NOT swept by purgeSpace, exactly like the per-user oauth facet. */
 export type RetrievalLogPersistence = {
   append(input: RetrievalLogInput): Promise<RetrievalLogRecord>
@@ -614,8 +614,11 @@ export type AgentSessionAuditSummary = {
 export type AgentSessionAuditOutside = {
   reads: number
   writes: number
-  lastSeenAt: string
+  lastSeenAt: string | null
 }
+
+export type AgentSessionAuditScope =
+  { kind: 'all' } | { kind: 'session'; id: string } | { kind: 'outside' }
 
 export type AgentSessionAuditSummaryCursor = { at: string; id: string }
 export type AgentSessionAuditEventCursor = {
@@ -635,6 +638,8 @@ export type AgentSessionAuditWriteEvent = {
   at: string
   principal: string | null
   agent: string | null
+  sessionId: string | null
+  sessionName: string | null
   sessionAttach: AgentSessionAttach | null
   noteId: string
   space: string
@@ -653,6 +658,7 @@ export type AgentSessionAuditPersistence = {
   overview(q: {
     owner: string
     activeSince: string
+    type?: 'retrieval' | 'write'
     limit: number
     before?: AgentSessionAuditSummaryCursor
   }): Promise<{
@@ -669,12 +675,15 @@ export type AgentSessionAuditPersistence = {
   ): Promise<AgentSessionAuditSummary | null>
   events(q: {
     owner: string
-    /** null addresses the explicit Outside sessions bucket. */
-    sessionId: string | null
+    scope: AgentSessionAuditScope
     type?: 'retrieval' | 'write'
+    agent?: string
+    tool?: RetrievalTool
+    query?: string
     limit: number
     before?: AgentSessionAuditEventCursor
-  }): Promise<{ items: AgentSessionAuditEvent[]; total: number; hasMore: boolean }>
+  }): Promise<{ items: AgentSessionAuditEvent[]; total: number | null; hasMore: boolean }>
+  agentFacet(owner: string): Promise<Array<{ agent: string; count: number }>>
 }
 
 // ── OAuth facet records ────────────────────────────────────────────────

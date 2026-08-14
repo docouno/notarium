@@ -16,7 +16,7 @@ test('inline rename relocates in place, keeping the id and leaving no duplicate'
 
   // right-click → Rename → type a new name → Enter
   await carbon.click({ button: 'right' })
-  await page.getByRole('menuitemradio', { name: 'Rename' }).click()
+  await page.getByRole('menuitem', { name: 'Rename' }).click()
   const input = page.getByTestId('rename-input')
   await input.fill('Carbonium')
   await input.press('Enter')
@@ -34,7 +34,7 @@ test('Escape cancels the rename', async ({ page }) => {
   await page
     .locator('[data-testid="tree-note"][data-id="fake-demo-titanium"]')
     .click({ button: 'right' })
-  await page.getByRole('menuitemradio', { name: 'Rename' }).click()
+  await page.getByRole('menuitem', { name: 'Rename' }).click()
   await page.getByTestId('rename-input').press('Escape')
 
   await expect(

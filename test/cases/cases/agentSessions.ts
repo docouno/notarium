@@ -12,8 +12,10 @@ export const agentSessions: CaseSpec = {
     b.project({ space: 'main', path: '', displayName: 'Main' })
     b.user({ username: 'sergey', password: 'sergey', displayName: 'Sergey', admin: true })
     b.user({ username: 'bob', password: 'bob', displayName: 'Bob' })
+    b.user({ username: 'empty', password: 'empty', displayName: 'Empty Owner' })
     b.member({ space: 'main', username: 'sergey', role: 'owner' })
     b.member({ space: 'main', username: 'bob', role: 'writer' })
+    b.member({ space: 'main', username: 'empty', role: 'reader' })
 
     const acknowledgedByRoot = b.note({
       space: 'main',
@@ -102,13 +104,27 @@ export const agentSessions: CaseSpec = {
       calls: 4,
     })
 
-    b.note({
+    const rootFindings = b.note({
       space: 'main',
       path: 'sessions/root-findings.md',
       title: 'Migration findings',
       content: '# Migration findings\n\nThe root session recorded its conclusion.',
       created: daysBefore(now, 0.04),
       principal: 'pat:CLI:seed',
+      agentAudit: {
+        sessionRef: 'review-root',
+        sessionAttach: 'declared',
+        agent: 'CLI',
+      },
+    })
+    b.event({
+      op: 'edit',
+      date: daysBefore(now, 0.035),
+      space: 'main',
+      noteId: rootFindings,
+      content: '# Migration findings\n\nThis captured write was quarantined after identity repair.',
+      principal: 'pat:CLI:seed',
+      unavailable: true,
       agentAudit: {
         sessionRef: 'review-root',
         sessionAttach: 'declared',
@@ -143,6 +159,26 @@ export const agentSessions: CaseSpec = {
       title: 'Archived session write',
       content: '# Archived session write\n\nThe lifecycle row was later collected.',
       created: daysBefore(now, 31.05),
+      principal: 'pat:CLI:seed',
+      agentAudit: {
+        sessionRef: 'expired',
+        sessionAttach: 'declared',
+        agent: 'CLI',
+      },
+    })
+    // One archived episode deliberately spans more than the Activity page size.
+    // The last edit shares its instant with a retrieval below, exercising the
+    // cross-source cursor tie-break instead of only chronological happy paths.
+    b.note({
+      space: 'main',
+      path: 'sessions/long-archived-history.md',
+      title: 'Long archived activity history',
+      content: '# Long archived activity history\n\nA page-boundary probe for Activity.',
+      created: daysBefore(now, 31.62),
+      edits: [
+        ...Array.from({ length: 51 }, (_, i) => daysBefore(now, 31.61 - i * 0.01)),
+        daysBefore(now, 31.1),
+      ],
       principal: 'pat:CLI:seed',
       agentAudit: {
         sessionRef: 'expired',

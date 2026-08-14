@@ -13,6 +13,7 @@ import { InMemoryStore } from '@notarium/engine-memory'
 import { buildCasesWorld, buildCaseWorld, DEFAULT_NOW, mergeWorlds } from './build'
 import { normDate } from './generators'
 import { CASES, getCase, listCases } from './registry'
+import { agentSessionId } from './sessionIds'
 import { caseToFixture } from './toFixture'
 import type { CaseWorld } from './types'
 
@@ -389,6 +390,26 @@ describe('seed catalog (#175)', () => {
     ).toBe(true)
     const fork = fixture.agentSessions?.find((session) => session.parentId)
     expect(fixture.agentSessions?.some((session) => session.id === fork?.parentId)).toBe(true)
+    expect(
+      fixture.spaces
+        .flatMap((space) => space.activity ?? [])
+        .some((event) => event.agent?.session?.id === agentSessionId('review-fork')),
+    ).toBe(true)
+    expect(
+      fixture.spaces
+        .flatMap((space) => space.activity ?? [])
+        .some((event) => event.agent && event.agent.session == null),
+    ).toBe(true)
+    expect(
+      fixture.spaces
+        .flatMap((space) => space.activity ?? [])
+        .filter((event) => event.agent?.owner === 'sergey'),
+    ).toHaveLength(58)
+    expect(
+      fixture.spaces
+        .flatMap((space) => space.activity ?? [])
+        .some((event) => event.unavailable && event.agent?.session?.id),
+    ).toBe(true)
   })
 
   it('agent-roles keeps catalog-only, owned-idle, and owned-active states distinct', () => {

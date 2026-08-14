@@ -1,0 +1,239 @@
+$spine: 20px;
+$head-gap: 12px;
+
+.timeline {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+
+  &::before {
+    content: '';
+    position: absolute;
+    left: $spine;
+    top: 20px;
+    bottom: 20px;
+    width: 2px;
+    background: var(--border);
+  }
+}
+
+.spine-less::before {
+  display: none;
+}
+
+.list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.row {
+  position: relative;
+  --activity-timeline-head-padding-right: 14px;
+}
+
+.head {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: $head-gap;
+  min-height: 58px;
+  padding: 11px var(--activity-timeline-head-padding-right) 11px 48px;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  transition: background 0.1s;
+
+  &:hover {
+    background: var(--bg-hover);
+  }
+}
+
+// A sibling overlay keeps the full-row button valid HTML while nested links and
+// menu buttons remain independent targets above it.
+.row-trigger {
+  position: absolute;
+  z-index: 0;
+  inset: 0;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  cursor: pointer;
+
+  &:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -4px;
+  }
+}
+
+.marker {
+  position: absolute;
+  left: calc(#{$spine} - 12px);
+  top: 50%;
+  transform: translateY(-50%);
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  z-index: 1;
+
+  &[data-variant='success'] {
+    color: var(--ok);
+  }
+  &[data-variant='info'] {
+    color: var(--accent);
+  }
+  &[data-variant='warning'] {
+    color: var(--warning);
+  }
+  &[data-variant='error'] {
+    color: var(--danger);
+  }
+}
+
+.content {
+  position: relative;
+  z-index: 1;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.head[data-expandable] .marker {
+  pointer-events: none;
+}
+
+.head[data-expandable] .content :is(a, button, input, select, textarea, [role='button']) {
+  position: relative;
+  pointer-events: auto;
+}
+
+.primary-line {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-height: 1.35em;
+  min-width: 0;
+  font-size: 13.5px;
+  line-height: 1.35;
+}
+
+.primary {
+  display: flex;
+  align-items: baseline;
+  flex: 1;
+  min-width: 0;
+  color: var(--text);
+}
+
+.time {
+  display: flex;
+  align-items: baseline;
+  flex: none;
+  color: var(--text-faint);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.meta-line {
+  display: flex;
+  align-items: center;
+  min-height: 1.4em;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-faint);
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.meta-slot {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+
+  & + &::before {
+    content: '·';
+    margin: 0 7px;
+    color: var(--text-faint);
+    opacity: 0.72;
+  }
+
+  svg {
+    flex: none;
+    color: var(--text-faint);
+  }
+}
+
+.meta-slot[data-timeline-slot='action'] {
+  color: var(--text-dim);
+  font-weight: 550;
+}
+
+.meta-slot[data-timeline-slot='outcome'] {
+  font-variant-numeric: tabular-nums;
+}
+
+.actions {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  align-self: flex-start;
+  flex: none;
+  pointer-events: none;
+
+  :is(a, button, input, select, textarea, [role='button']) {
+    pointer-events: auto;
+  }
+}
+
+.disclosure,
+.disclosure-slot {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 18px;
+  margin: 1px -4px -1px 0;
+}
+
+.disclosure {
+  color: var(--text-faint);
+}
+
+.caret-open {
+  transform: rotate(90deg);
+}
+
+.detail {
+  margin: 0
+    calc(
+      var(--activity-timeline-head-padding-right) + #{$head-gap} +
+        var(--activity-timeline-actions-width, 0px)
+    )
+    8px 48px;
+}
+
+@media (max-width: 680px) {
+  .row {
+    --activity-timeline-head-padding-right: 10px;
+  }
+
+  .meta-line {
+    flex-wrap: wrap;
+    row-gap: 3px;
+    white-space: normal;
+  }
+}

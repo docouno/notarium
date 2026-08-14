@@ -2484,7 +2484,7 @@ describe('SqliteMetaDb', () => {
       )
       const first = await db.sessionAudit.events({
         owner: 'alice',
-        sessionId: 'ses_timeline',
+        scope: { kind: 'session', id: 'ses_timeline' },
         limit: 1,
       })
       expect(first.total).toBe(2)
@@ -2498,7 +2498,7 @@ describe('SqliteMetaDb', () => {
       }
       const second = await db.sessionAudit.events({
         owner: 'alice',
-        sessionId: 'ses_timeline',
+        scope: { kind: 'session', id: 'ses_timeline' },
         limit: 1,
         before: { at: write.at, source: 'write', id: write.id },
       })
@@ -2507,7 +2507,7 @@ describe('SqliteMetaDb', () => {
       expect(
         await db.sessionAudit.events({
           owner: 'alice',
-          sessionId: 'ses_timeline',
+          scope: { kind: 'session', id: 'ses_timeline' },
           type: 'write',
           limit: 10,
         }),

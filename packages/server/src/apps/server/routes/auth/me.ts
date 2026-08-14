@@ -168,9 +168,18 @@ const sessionEventToWire = (event: AgentSessionAuditEvent) => {
     hits: r.hits,
     agent: r.agent,
     principal: r.principal,
+    sessionId: r.sessionId,
+    sessionName: r.sessionName,
     sessionAttach: r.sessionAttach,
   }
 }
+
+const emptyRetrievalAggregates = () => ({
+  totalQueries: 0,
+  missCount: 0,
+  top: [],
+  misses: [],
+})
 
 const ROLE_DETAIL_TOKEN_BUDGET = 65_536
 const ROLE_INVENTORY_LIMIT = 512
@@ -795,7 +804,7 @@ export const meRoutes = async (
 
   // Compatibility feed for retrieval-only clients; the UI is session-first.
   // A meta-DB-less host has nothing captured → an honest empty audit.
-  // canon: docs/projects.md#sessions-auditing-agent-episodes-243-321-mem-audita
+  // canon: docs/projects.md#activity-auditing-agent-work-243-321-mem-audita
   app.get('/api/me/agent-audit', { config: authz('self:read', 'host') }, async (req, reply) => {
     const owner = agentOwnerOf(req.principal)
 
@@ -871,6 +880,7 @@ export const meRoutes = async (
     }
     const owner = agentOwnerOf(req.principal)
     const includeAggregates = !q.data.cursor && q.data.aggregates !== '0'
+    const before = decodeSummaryCursor(q.data.cursor)
 
     if (!owner || !sessionAudit) {
       return AgentSessionsResponseSchema.parse({
@@ -890,8 +900,14 @@ export const meRoutes = async (
       sessionAudit.overview({
         owner,
         activeSince,
+        type:
+          q.data.filter === 'reads'
+            ? 'retrieval'
+            : q.data.filter === 'writes'
+              ? 'write'
+              : undefined,
         limit: q.data.limit,
-        before: decodeSummaryCursor(q.data.cursor),
+        before,
       }),
       includeAggregates && retrievalLog
         ? retrievalLog.aggregates(owner)
@@ -920,45 +936,81 @@ export const meRoutes = async (
       if (!q.success) {
         return reply.code(HTTP_STATUS.BAD_REQUEST).send({ error: q.error.issues[0]?.message })
       }
-      const owner = agentOwnerOf(req.principal)
-
-      if (!owner || !sessionAudit) {
-        throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
-      }
       const id = (req.params as { id: string }).id
-      const outside = id === 'outside'
+      const scope =
+        id === 'all'
+          ? ({ kind: 'all' } as const)
+          : id === 'outside'
+            ? ({ kind: 'outside' } as const)
+            : ({ kind: 'session', id } as const)
 
-      if (!outside && !AgentSessionIdSchema.safeParse(id).success) {
+      if (scope.kind === 'session' && !AgentSessionIdSchema.safeParse(id).success) {
         throw new AuthError(HTTP_STATUS.BAD_REQUEST, 'bad session id')
       }
+      const owner = agentOwnerOf(req.principal)
+
+      if (!owner || (!sessionAudit && scope.kind === 'session')) {
+        throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+      }
+      const before = decodeEventCursor(q.data.cursor)
+
+      if (!sessionAudit) {
+        return AgentSessionEventsResponseSchema.parse({
+          target: scope.kind === 'all' ? { kind: 'all' } : { kind: 'outside', lastSeenAt: null },
+          events: [],
+          total: null,
+          hasMore: false,
+          nextCursor: null,
+          aggregates:
+            q.data.aggregates === '1'
+              ? { retrieval: emptyRetrievalAggregates(), agents: [] }
+              : null,
+        })
+      }
       const activeSince = new Date(Date.now() - AGENT_SESSION_IDLE_MS).toISOString()
-      const [target, events] = await Promise.all([
-        outside
-          ? sessionAudit
-              .overview({ owner, activeSince, limit: 1 })
-              .then((result) =>
-                result.outside ? { kind: 'outside' as const, ...result.outside } : null,
-              )
-          : sessionAudit
-              .find(owner, id, activeSince)
-              .then((result) => (result ? { kind: 'session' as const, ...result } : null)),
+      const [sessionTarget, events, aggregates] = await Promise.all([
+        scope.kind === 'session'
+          ? sessionAudit.find(owner, id, activeSince)
+          : Promise.resolve(null),
         sessionAudit.events({
           owner,
-          sessionId: outside ? null : id,
+          scope,
           type:
             q.data.filter === 'reads'
               ? 'retrieval'
               : q.data.filter === 'writes'
                 ? 'write'
                 : undefined,
+          agent: q.data.agent,
+          tool: q.data.tool,
+          query: q.data.q,
           limit: q.data.limit,
-          before: decodeEventCursor(q.data.cursor),
+          before,
         }),
+        q.data.aggregates === '1'
+          ? Promise.all([
+              retrievalLog
+                ? retrievalLog.aggregates(owner)
+                : Promise.resolve(emptyRetrievalAggregates()),
+              sessionAudit.agentFacet(owner),
+            ]).then(([retrieval, agents]) => ({ retrieval, agents }))
+          : Promise.resolve(null),
       ])
 
-      if (!target) {
+      if (scope.kind === 'session' && !sessionTarget) {
         throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
       }
+      const first = events.items[0]
+      const target =
+        scope.kind === 'all'
+          ? { kind: 'all' as const }
+          : scope.kind === 'outside'
+            ? {
+                kind: 'outside' as const,
+                lastSeenAt:
+                  first?.type === 'retrieval' ? first.record.createdAt : (first?.at ?? null),
+              }
+            : { kind: 'session' as const, ...sessionTarget! }
       const last = events.hasMore ? events.items.at(-1) : null
       const cursor = last
         ? last.type === 'retrieval'
@@ -982,6 +1034,7 @@ export const meRoutes = async (
         total: events.total,
         hasMore: events.hasMore,
         nextCursor: cursor,
+        aggregates,
       })
     },
   )

@@ -21,7 +21,14 @@ import styles from './FolderTree.module.scss'
 // Node shape: { name, path, count, children: [] } (see buildFolderTree). Expansion
 // is controlled by the caller so it can seed/persist it. `maxDepth` (optional)
 // caps how deep the tree renders.
-type FolderNode = { name: string; path: string; count: number; children: FolderNode[] }
+type FolderNode = {
+  name: string
+  path: string
+  count: number
+  /** Some remote facets can preserve a selected row while its count is unavailable. */
+  showCount?: boolean
+  children: FolderNode[]
+}
 
 type FolderTreeProps = {
   nodes: FolderNode[]
@@ -130,7 +137,7 @@ const FolderRow = ({
             />
           </span>
           <span className={styles.ftreeName}>{node.name}</span>
-          <span className={styles.ftreeCount}>{node.count}</span>
+          {node.showCount !== false && <span className={styles.ftreeCount}>{node.count}</span>}
         </button>
       </div>
 

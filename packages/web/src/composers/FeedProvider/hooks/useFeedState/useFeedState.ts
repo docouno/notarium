@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useSearchParams } from 'react-router'
+import { matchPath, useLocation, useSearchParams } from 'react-router'
 import type { TagFacet } from '@notarium/contract'
 import { BUCKET_GRAN, FAVORITE_ENTITY_KIND, NOTE_SORT } from '@notarium/contract/enums'
 import { STORE_EVENT } from '@notarium/contract/events'
-import { FEED_URL_PARAMS } from '../../../../libs/routing/routePaths'
+import { FEED_URL_PARAMS, feedRoute } from '../../../../libs/routing/routePaths'
 import { STORAGE_KEYS } from '../../../../libs/storageKeys'
 import { toggleFolder as toggleFolderSet } from '../../../../libs/tree/tree'
 import type { Bucket, NoteView } from '../../../../libs/wire'
@@ -57,6 +57,8 @@ import {
 // in-memory (not persisted), exactly like the graph's folder filter.
 export const useFeedState = () => {
   const { space } = useSpace()
+  const location = useLocation()
+  const onFeedRoute = matchPath(feedRoute(space), location.pathname) != null
   const { folderTree, tree, remember, dirOfId } = useNotes()
   const { subscribe, connectionRevision, observationEpoch } = useSync()
   const [searchParams, setSearchParams] = useSearchParams()
@@ -125,7 +127,15 @@ export const useFeedState = () => {
   // anywhere is just a navigation to `/feed?q=…`. Trimmed for a stable query
   // identity; empty = no text filter. Composes with folders ∧ tags — the window,
   // total and histogram all describe the q-narrowed population (server-applied).
-  const q = (searchParams.get(FEED_URL_PARAMS.q) ?? '').trim()
+  const urlQ = (searchParams.get(FEED_URL_PARAMS.q) ?? '').trim()
+  // The provider survives route changes to retain its sparse window. Keep the last
+  // Feed-owned q with it; an unrelated surface may use the same URL key.
+  const feedQRef = useRef(onFeedRoute ? urlQ : '')
+
+  if (onFeedRoute) {
+    feedQRef.current = urlQ
+  }
+  const q = feedQRef.current
   const favorite = searchParams.get(FEED_URL_PARAMS.favorite) === '1'
   const setQ = useCallback(
     (next: string) => setSearchParams((prev) => setQParam(prev, next), { replace: false }),
@@ -278,6 +288,9 @@ export const useFeedState = () => {
 
   // Query flip: drop the window, refetch the head.
   useEffect(() => {
+    if (!onFeedRoute || queryRef.current === queryKey) {
+      return
+    }
     queryRef.current = queryKey
     windowRevisionRef.current++
     inflight.current.clear()
@@ -286,7 +299,7 @@ export const useFeedState = () => {
     setPages(pagesRef.current)
     setTotal(null)
     void fetchPage(0)
-  }, [queryKey, fetchPage])
+  }, [onFeedRoute, queryKey, fetchPage])
 
   // ── date buckets (#64): the grouped layout's skeleton ──────────────────────
   // One cheap histogram request per (sort, folder, group) tells the Feed every

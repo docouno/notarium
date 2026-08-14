@@ -2,7 +2,7 @@ import { type ReactNode } from 'react'
 import { cx } from '../../libs/cx/cx'
 import styles from './Notice.module.scss'
 
-type NoticeVariant = 'error' | 'info' | 'success' | 'warning'
+export type NoticeVariant = 'error' | 'info' | 'success' | 'warning'
 
 // A tinted inline banner (#28) — the shared strip for a short status/feedback
 // line that sits in the page flow (form errors, hints), as opposed to a modal
