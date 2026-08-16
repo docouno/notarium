@@ -45,6 +45,12 @@ export type StorageOwnerProof = {
   generatedContainer?: boolean
 }
 
+/** Fail-closed reading of the physical `notarium-id` field. This is deliberately
+ * independent from StorageOwnerProof: a proof says which bytes Notarium owns;
+ * this observation says what the exact bytes currently claim. */
+export type ExactOwnerObservation =
+  { kind: 'absent' } | { kind: 'claimed'; id: string } | { kind: 'unproven' }
+
 export type RestoreSafety =
   | { status: 'safe' }
   | { status: 'blocked'; reason: 'owner-anchor-dependency' | 'duplicate-target-mapping' }

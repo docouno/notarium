@@ -2,6 +2,7 @@ import type {
   AgentWriteAttribution,
   ExistingNote,
   MoveInput,
+  MoveResult,
   MutationOptions,
   NoteClass,
   NoteContent,
@@ -46,6 +47,7 @@ import {
   isLegacyImportDestination,
   isPortableMoveDestination,
   isPortableRelativeDestination,
+  legacyNoteNameAlias,
   noteFilePath,
   sluggedNoteName,
 } from '../../../libs/path'
@@ -99,6 +101,13 @@ const exactDocumentState = (
 const exactVersionToken = (
   note: Pick<NoteContent, 'title' | 'content' | 'frontmatter' | 'logicalState' | 'documentState'>,
 ): string => documentStateVersionToken(exactDocumentState(note))
+
+const legacyAliasesChanged = (
+  before: readonly string[] | undefined,
+  after: readonly string[] | undefined,
+): boolean =>
+  (before?.length ?? 0) !== (after?.length ?? 0) ||
+  (before ?? []).some((alias, index) => alias !== after?.[index])
 
 const folderFailed = (detail: string): StoreError => {
   const err = new StoreError(`# Folder Failed: ${detail}`)
@@ -546,10 +555,20 @@ export class WriteEngine {
       // The engine is its own registry — it settles the id, and (CAS-capable
       // engines, e.g. InMemoryStore) enforces the version check itself,
       // atomically against its own content; we only patch the snapshot.
-      // The journal baseline is read BEFORE the write (the first journaled
-      // edit of a note must capture the state it found) — a best-effort read,
-      // racing writers are already fenced by the engine's own CAS.
-      const baseline = input.originalId ? await this.baselineOf(input.originalId) : undefined
+      // One exact pre-write observation owns both the optional first-history
+      // baseline and the physical-incarnation fence. A semantic version token
+      // alone cannot distinguish byte-identical replacement generations.
+      const live = input.originalId
+        ? await this.host.inner.read(this.innerNoteKey(input.originalId), {
+            identityOnly: supportsExactIdentityAddress(this.host.inner),
+          })
+        : undefined
+
+      if (live && !live.physicalIncarnation) {
+        this.host.reconcileSoon()
+        throw new StoreError(`exact storage incarnation is unavailable for ${input.originalId}`)
+      }
+      const baseline = live ? await this.baselineOf(input.originalId!, live) : undefined
       const releaseGraphTransition = this.host.beginGraphTransition()
       const requiredTrashRestore =
         input.journal?.kind === REVISION_KIND.restore && !input.originalId
@@ -562,6 +581,7 @@ export class WriteEngine {
           ...input,
           originalId: input.originalId ? this.innerNoteKey(input.originalId) : input.originalId,
           identityOnly: Boolean(input.originalId),
+          expectedSource: live?.physicalIncarnation,
         })
         restoreResult = result
         restoreVersionToken = result.versionToken
@@ -571,12 +591,28 @@ export class WriteEngine {
             return
           }
           let directoryChanged = false
+          const aliasesBefore = this.host.snap.notes.get(result.id)?.legacyNameAliases
+          const removed: string[] = []
 
           this.host.afterNotesReady(() => {
-            directoryChanged = this.applyWrite(input, result, result.id!)
+            directoryChanged = this.applyWrite(input, result, result.id!, undefined, false, removed)
           })
-          if (directoryChanged) {
-            await this.host.rederiveGraphContext()
+          const aliasContextChanged = legacyAliasesChanged(
+            aliasesBefore,
+            this.host.snap.notes.get(result.id)?.legacyNameAliases,
+          )
+
+          if (aliasContextChanged) {
+            this.host.markInnerLinkIdentitiesDirty()
+            this.host.syncInnerLinkIdentities()
+          }
+          if (directoryChanged || aliasContextChanged) {
+            await this.host.rederiveGraphContext(
+              result.filePath ? { upserts: [result.id], removed } : undefined,
+            )
+          }
+          if (result.filePath) {
+            this.host.emitChanged([result.id], removed)
           }
         }
 
@@ -657,13 +693,14 @@ export class WriteEngine {
     if (input.originalId && !originalPath) {
       throw noteNotFound(input.originalId)
     }
-    const id = originalPath
+    let id = originalPath
       ? input.originalId!
       : (input.id ?? this.host.identity.idFor(predictedPath) ?? freshNoteId())
     // The engine speaks storage keys; this is the path the id binds to (or the
     // caller's raw key when the registry doesn't know it — the resolver channel).
     const storageKey = originalPath ?? input.originalId
     let live: NoteContent | undefined
+    let capturedLegacyNameAliases: readonly string[] | undefined
 
     if (input.originalId) {
       // Updates are strict: no token, no write — for the UI and for
@@ -691,6 +728,12 @@ export class WriteEngine {
           versionToken: liveToken,
         })
       }
+      if (live.title !== input.title || live.filePath !== predictedPath) {
+        const record = await this.host.captureLegacyEvidence(id, live)
+
+        id = record.id
+        capturedLegacyNameAliases = record.legacyNameAliases
+      }
     }
     const releaseGraphTransition = this.host.beginGraphTransition()
     const releaseIdentityPublication = !input.originalId
@@ -711,6 +754,7 @@ export class WriteEngine {
         originalId: input.originalId ? this.innerNoteKey(input.originalId, storageKey) : storageKey,
         identityOnly: Boolean(input.originalId && supportsExactIdentityAddress(this.host.inner)),
         id,
+        expectedSource: live?.physicalIncarnation,
       })
       restoreResult = result
       restoreVersionToken = result.versionToken
@@ -718,16 +762,10 @@ export class WriteEngine {
 
       const publishWrite = async () => {
         let directoryChanged = false
+        const aliasesBefore = this.host.snap.notes.get(id)?.legacyNameAliases
 
         this.host.afterNotesReady(() => {
-          directoryChanged = this.applyWrite(
-            input,
-            result,
-            id,
-            originalPath,
-            !publishAfterIdentityFlush,
-            removed,
-          )
+          directoryChanged = this.applyWrite(input, result, id, originalPath, false, removed)
         })
         if (!input.originalId) {
           // The lease was closed before inner.write. Register its durable cut
@@ -746,22 +784,88 @@ export class WriteEngine {
         // own exact-id map. Graph-context re-derivation below addresses the just
         // created note by id; without this local sync a path-keyed engine falls
         // through to its expensive whole-graph fallback before durability lands.
-        if (publishAfterIdentityFlush) {
+        const aliasContextChanged = legacyAliasesChanged(
+          aliasesBefore,
+          this.host.snap.notes.get(id)?.legacyNameAliases,
+        )
+
+        if (publishAfterIdentityFlush || aliasContextChanged) {
           this.host.markInnerLinkIdentitiesDirty()
           this.host.syncInnerLinkIdentities()
         }
-        if (directoryChanged) {
-          await this.host.rederiveGraphContext()
+        if (directoryChanged || aliasContextChanged) {
+          await this.host.rederiveGraphContext(
+            result.filePath ? { upserts: [id], removed } : undefined,
+          )
+        }
+        if (!publishAfterIdentityFlush && result.filePath) {
+          this.host.emitChanged([id], removed)
         }
       }
 
       if (!requiredTrashRestore) {
         await publishWrite()
       }
+
       // The post-write read serves double duty: the fresh token the save
       // answers with (the engine merges frontmatter — input bytes are not
       // authoritative) and the journaled after-state.
-      const after = await this.readAfterWrite(input, result, storageKey)
+      let after = await this.readAfterWrite(input, result, storageKey)
+
+      if (
+        !input.originalId &&
+        after?.title != null &&
+        after.filePath != null &&
+        legacyNoteNameAlias(after.title, after.filePath)
+      ) {
+        const aliasesBefore = this.host.snap.notes.get(id)?.legacyNameAliases
+
+        const previousId = id
+        const record = await this.host.captureLegacyEvidence(previousId, after)
+
+        id = record.id
+        capturedLegacyNameAliases = record.legacyNameAliases
+        if (id !== previousId) {
+          const materialize = this.host.inner.materializeIdentityAtPath?.bind(this.host.inner)
+
+          if (!materialize || !after.filePath) {
+            this.host.reconcileSoon()
+            throw new StoreError(`reminted identity cannot be materialized for ${previousId}`)
+          }
+          const materialized = await materialize({
+            filePath: after.filePath,
+            expectedClaimId: previousId,
+            targetId: id,
+          })
+
+          if (materialized.status !== 'materialized') {
+            this.host.reconcileSoon()
+            throw new StoreError(
+              `reminted identity changed before materialization for ${previousId}`,
+            )
+          }
+          this.host.identity.markMaterialized(id)
+          after = await this.readAfterWrite(input, result, storageKey)
+          if (!after) {
+            throw new Error('post-remint exact read failed')
+          }
+        }
+        const meta = this.host.snap.notes.get(id)
+
+        if (meta) {
+          this.host.snap.notes.set(id, {
+            ...meta,
+            legacyNameAliases: [...capturedLegacyNameAliases],
+          })
+        }
+        if (legacyAliasesChanged(aliasesBefore, capturedLegacyNameAliases)) {
+          this.host.markInnerLinkIdentitiesDirty()
+          this.host.syncInnerLinkIdentities()
+          await this.host.rederiveGraphContext(
+            result.filePath ? { upserts: [id], removed } : undefined,
+          )
+        }
+      }
       const baseline =
         live && !(await this.hasHistory(id))
           ? {
@@ -805,6 +909,10 @@ export class WriteEngine {
         id,
         title: input.title,
         versionToken: exactVersionToken(after),
+        legacyNameAliases:
+          result.legacyNameAliases ??
+          capturedLegacyNameAliases ??
+          this.host.identity.recordFor(id)?.legacyNameAliases,
       }
     } catch (err) {
       let failure: unknown = err
@@ -963,10 +1071,12 @@ export class WriteEngine {
     }
   }
 
-  /** Pre-write state for the journal baseline, identity-capable-engine path
-   *  (the bare-engine path reuses its CAS verify-read instead). Only the very
-   *  first journaled edit of a note pays this read. */
-  private async baselineOf(noteId: string): Promise<
+  /** Pre-write state for the journal baseline, projected from the same exact
+   *  observation that supplies the identity-capable engine's physical fence. */
+  private async baselineOf(
+    noteId: string,
+    live: NoteContent,
+  ): Promise<
     | {
         content: string
         logicalState: LogicalNoteState
@@ -977,25 +1087,19 @@ export class WriteEngine {
       }
     | undefined
   > {
-    try {
-      if (await this.host.journal.hasHistory(noteId)) {
-        return undefined
-      }
-      const live = await this.host.inner.read(this.innerNoteKey(noteId), {
-        identityOnly: supportsExactIdentityAddress(this.host.inner),
-      })
-      return {
-        content: live.content,
-        logicalState: exactLogicalState(live),
-        documentState: exactDocumentState(live),
-        title: live.title ?? '',
-        tags: normTags(live.frontmatter?.tags) ?? [],
-        // The custom slug the note already carried, so a restore of the baseline
-        // brings it back too. null = no custom slug (the implicit default).
-        slug: live.slug ?? null,
-      }
-    } catch {
+    if (await this.hasHistory(noteId)) {
       return undefined
+    }
+
+    return {
+      content: live.content,
+      logicalState: exactLogicalState(live),
+      documentState: exactDocumentState(live),
+      title: live.title ?? '',
+      tags: normTags(live.frontmatter?.tags) ?? [],
+      // The custom slug the note already carried, so a restore of the baseline
+      // brings it back too. null = no custom slug (the implicit default).
+      slug: live.slug ?? null,
     }
   }
 
@@ -1110,7 +1214,7 @@ export class WriteEngine {
     }
   }
 
-  async move(input: MoveInput, opts?: MutationOptions): Promise<void> {
+  async move(input: MoveInput, opts?: MutationOptions): Promise<MoveResult> {
     const currentPath = input.isDirectory ? input.id : this.pathFor(input.id)
 
     if (
@@ -1124,7 +1228,7 @@ export class WriteEngine {
       throw folderFailed('path must be a canonical public relative path')
     }
     if (input.isDirectory) {
-      return this.mutations.runStable(
+      await this.mutations.runStable(
         () => ({ global: true }),
         async () => {
           await opts?.prepare?.()
@@ -1143,6 +1247,7 @@ export class WriteEngine {
           }
         },
       )
+      return {}
     }
 
     return this.mutations.runStable(
@@ -1165,22 +1270,92 @@ export class WriteEngine {
         if (!this.host.inner.capabilities.identity && !claimedPath) {
           throw noteNotFound(input.id)
         }
+        let live = await this.host.inner.read(this.innerNoteKey(input.id, claimedPath), {
+          identityOnly: supportsExactIdentityAddress(this.host.inner),
+        })
+        const capturedRecord = this.host.inner.capabilities.identity
+          ? null
+          : await this.host.captureLegacyEvidence(input.id, live)
+        const finalId = capturedRecord?.id ?? input.id
+        const capturedAliases = capturedRecord?.legacyNameAliases ?? live.legacyNameAliases
+
+        if (!live.physicalIncarnation) {
+          this.host.reconcileSoon()
+          throw new StoreError(`exact storage incarnation is unavailable for ${input.id}`)
+        }
+        const identityRedirected = finalId !== input.id
+
+        if (identityRedirected) {
+          const materialize = this.host.inner.materializeIdentityAtPath?.bind(this.host.inner)
+
+          if (!materialize || !claimedPath) {
+            this.host.reconcileSoon()
+            throw new StoreError(`reminted identity cannot be materialized for ${input.id}`)
+          }
+          const expectedClaimId =
+            live.physicalIncarnation.owner.kind === 'claimed'
+              ? live.physicalIncarnation.owner.id
+              : null
+          const materialized = await materialize({
+            filePath: claimedPath,
+            expectedClaimId,
+            targetId: finalId,
+          })
+
+          if (materialized.status !== 'materialized') {
+            this.host.reconcileSoon()
+            throw new StoreError(`reminted identity changed before materialization for ${input.id}`)
+          }
+          this.host.identity.markMaterialized(finalId)
+          live = await this.host.inner.read(this.innerNoteKey(finalId, claimedPath), {
+            identityOnly: supportsExactIdentityAddress(this.host.inner),
+          })
+          if (
+            live.filePath !== claimedPath ||
+            !live.physicalIncarnation ||
+            live.physicalIncarnation.owner.kind !== 'claimed' ||
+            live.physicalIncarnation.owner.id !== finalId
+          ) {
+            this.host.reconcileSoon()
+            throw new StoreError(`reminted identity is unproven for ${finalId}`)
+          }
+        }
         const releaseGraphTransition = this.host.beginGraphTransition()
 
         try {
-          await this.host.inner.move({
+          const result = await this.host.inner.move({
             ...input,
-            id: this.innerNoteKey(input.id, claimedPath),
+            id: this.innerNoteKey(finalId, claimedPath),
             identityOnly: supportsExactIdentityAddress(this.host.inner),
+            expectedSource: live.physicalIncarnation,
           })
+          const finalPath = result.filePath ?? input.destinationPath
+          const finalAliases = result.legacyNameAliases ?? capturedAliases
           let directoryChanged = false
+          const aliasesBefore = this.host.snap.notes.get(finalId)?.legacyNameAliases
           this.host.afterNotesReady(() => {
-            directoryChanged = this.applyNoteMove(input.id, input.destinationPath, claimedPath)
+            directoryChanged = this.applyNoteMove(finalId, finalPath, claimedPath, finalAliases)
           })
-          if (directoryChanged) {
-            await this.host.rederiveGraphContext()
+          const aliasContextChanged = legacyAliasesChanged(aliasesBefore, finalAliases)
+
+          this.host.markInnerLinkIdentitiesDirty()
+          this.host.syncInnerLinkIdentities()
+          if (directoryChanged || aliasContextChanged) {
+            await this.host.rederiveGraphContext({ upserts: [finalId], removed: [] })
           }
           await opts?.finalize?.()
+          if (identityRedirected) {
+            await this.host.flushIdentityPublication()
+          } else {
+            this.host.emitChanged([finalId], [])
+          }
+
+          return {
+            ...result,
+            id: finalId,
+            filePath: finalPath,
+            legacyNameAliases: finalAliases,
+          }
         } finally {
           releaseGraphTransition()
         }
@@ -1247,7 +1422,7 @@ export class WriteEngine {
             directoryChanged = this.host.dirs.add(clean)
           })
           if (directoryChanged) {
-            await this.host.rederiveGraphContext()
+            await this.host.rederiveGraphContext({ upserts: [], removed: [] })
             this.host.emitChanged([], [])
           }
           await opts?.finalize?.()
@@ -1296,7 +1471,7 @@ export class WriteEngine {
                 directoryChanged = this.host.dirs.removeSubtree(path)
               })
               if (directoryChanged) {
-                await this.host.rederiveGraphContext()
+                await this.host.rederiveGraphContext({ upserts: [], removed: [] })
                 this.host.emitChanged([], [])
               }
             }
@@ -1358,9 +1533,9 @@ export class WriteEngine {
     }
     // Capture the body BEFORE deleting: the trash is only a safety net if it
     // can resurrect the note, and a note never saved through us has no journaled
-    // body to fall back on. One read on a rare op buys an always-restorable
-    // tombstone. A read failure (already gone, unreadable) degrades honestly — the
-    // tombstone then keeps whatever hash the journal already had (maybe none).
+    // body to fall back on. One exact read on a rare op buys an always-restorable
+    // tombstone and the physical incarnation required by conditional delete. A
+    // failed or unprovable read aborts before effect and schedules reconciliation.
     let lastContent: string | null = null
     let lastLogicalState: LogicalNoteState | null = null
     let lastDocumentState: DocumentState | null = null
@@ -1371,8 +1546,10 @@ export class WriteEngine {
     // last slug forward); a successful read sets it DEFINITIVELY (string | null).
     let lastSlug: string | null | undefined
 
+    let live: NoteContent
+
     try {
-      const live = await this.host.inner.read(this.innerNoteKey(id, storagePath), {
+      live = await this.host.inner.read(this.innerNoteKey(id, storagePath), {
         identityOnly: supportsExactIdentityAddress(this.host.inner),
       })
       lastContent = live.content
@@ -1390,9 +1567,22 @@ export class WriteEngine {
       // journal slug — same reason journalExternal records `?? null`. The tombstone
       // carries it so a restore re-sets the slug instead of dropping to slug(title).
       lastSlug = live.slug ?? null
-    } catch {
-      // no body to capture — restore falls back to the last known revision, if any
+    } catch (err) {
+      this.host.reconcileSoon()
+      throw err
     }
+    if (!live.physicalIncarnation) {
+      this.host.reconcileSoon()
+      throw new StoreError(`exact storage incarnation is unavailable for ${id}`)
+    }
+    if (!this.host.inner.capabilities.identity) {
+      const record = await this.host.captureLegacyEvidence(id, live)
+
+      id = record.id
+    }
+    const removesLegacyAliasOwner = Boolean(
+      live.legacyNameAliases?.length || meta?.legacyNameAliases?.length,
+    )
     const releaseGraphTransition = this.host.beginGraphTransition()
 
     try {
@@ -1401,6 +1591,7 @@ export class WriteEngine {
       // may observe the inner engine and read-model on opposite sides.
       await this.host.inner.remove(this.innerNoteKey(id, storagePath), {
         identityOnly: supportsExactIdentityAddress(this.host.inner),
+        expectedSource: live.physicalIncarnation,
       })
       // Tombstone the id↔path binding so the trash can restore the note into
       // its last folder. A bare engine's registry already holds it (storagePath);
@@ -1459,7 +1650,11 @@ export class WriteEngine {
         // inbound source against the post-delete index so `[[Title]]` becomes a
         // creatable human ghost, `[[notarium-id:…]]` becomes a tombstone, and a body
         // containing both regains both distinct edges.
-        await this.host.rederiveSources(inboundSources)
+        if (removesLegacyAliasOwner) {
+          await this.host.rederiveGraphContext({ upserts: [], removed: [id] })
+        } else {
+          await this.host.rederiveSources(inboundSources)
+        }
         this.host.emitChanged([], [id])
       }
     } finally {
@@ -1639,6 +1834,11 @@ export class WriteEngine {
       title: input.title,
       ...(slug ? { slug } : {}),
       ...(aliases?.length ? { aliases } : {}),
+      ...(result.legacyNameAliases?.length
+        ? { legacyNameAliases: [...result.legacyNameAliases] }
+        : rec?.legacyNameAliases.length
+          ? { legacyNameAliases: [...rec.legacyNameAliases] }
+          : {}),
       ...(tags?.length ? { tags } : {}),
       // Class is mount-derived and AUTHORITATIVE from the write result — no optimistic guess, so an
       // edit of a hidden note never briefly flips to user-doc. Falls back to prior/targetClass only
@@ -1682,7 +1882,12 @@ export class WriteEngine {
     return directoryChanged
   }
 
-  private applyNoteMove(id: string, destinationPath: string, oldPath?: string): boolean {
+  private applyNoteMove(
+    id: string,
+    destinationPath: string,
+    oldPath?: string,
+    legacyNameAliases?: readonly string[],
+  ): boolean {
     if (oldPath) {
       this.host.identity.rename(oldPath, destinationPath)
     }
@@ -1697,10 +1902,10 @@ export class WriteEngine {
     this.host.snap.notes.set(id, {
       ...prev,
       filePath: destinationPath,
+      ...(legacyNameAliases ? { legacyNameAliases: [...legacyNameAliases] } : {}),
       modifiedAt: this.host.iso(),
     })
     const directoryChanged = this.host.dirs.add(directoryOf(destinationPath))
-    this.host.emitChanged([id], [])
     return directoryChanged
   }
 }

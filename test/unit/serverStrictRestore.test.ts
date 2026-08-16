@@ -372,6 +372,7 @@ describe('resumable strict trash bulk', () => {
       counts: { total: 27, succeeded: 27, queued: 0, pending: 0 },
     })
     const trash = await app!.inject({ method: 'GET', url: `/api/s/${spaceSlug}/trash` })
+
     expect(trash.json().total).toBe(0)
   }, 20_000)
 })

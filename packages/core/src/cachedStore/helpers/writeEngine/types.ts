@@ -1,5 +1,5 @@
 import type { IdentityRegistry } from '../../../identity'
-import type { KnowledgeStore } from '../../../knowledgeStore'
+import type { IdentityRecord, KnowledgeStore, NoteContent } from '../../../knowledgeStore'
 import type { RevisionJournal } from '../../../revisionJournal'
 import type { PreviewCache } from '../../caches/previewCache'
 import type { DirectoryIndex } from '../directoryIndex'
@@ -21,10 +21,17 @@ export type WriteHost = {
    *  enough information to distinguish human and stable-id link intents. */
   rederiveSources: (sourceIds: readonly string[]) => Promise<void>
   /** Re-resolve every graph-visible source after directory/alias context changes.
-   *  The host coalesces this across a bulk bracket. */
-  rederiveGraphContext: () => Promise<void>
+   *  The host coalesces this across a bulk bracket. If an ordinary repair fails
+   *  after the snapshot effect, `changed` becomes graph-owned retry debt. */
+  rederiveGraphContext: (changedOnFailure?: {
+    upserts: readonly string[]
+    removed: readonly string[]
+  }) => Promise<void>
   /** Refresh folder path history after its host-side move finalizer. */
   refreshFolderAliases: () => Promise<boolean>
+  /** Validate exact physical evidence and durably remember an obsolete
+   * title-derived storage key before its source can be changed or removed. */
+  captureLegacyEvidence: (finalId: string, live: NoteContent) => Promise<IdentityRecord>
   /** Hide a transient multi-step graph patch from readers until it is coherent. */
   beginGraphTransition: () => () => void
   /** Mark the inner engine's authoritative id→path projection stale after a

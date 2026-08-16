@@ -21,6 +21,53 @@ afterEach(async () => {
 })
 
 describe('NotariumStore resource authority', () => {
+  it('binds single-note move/remove to the exact read incarnation and owner', async () => {
+    const root = await mkroot()
+    const store = createNotariumStore({ notesDir: root, spaceId: 'space-a' })
+
+    try {
+      const created = await store.write({ title: 'Owned', content: 'body', id: 'stable-id' })
+      const exact = await store.read(created.filePath!)
+
+      expect(exact.physicalIncarnation).toMatchObject({
+        claim: { kind: 'resource-observation-v1' },
+        owner: { kind: 'claimed', id: 'stable-id' },
+      })
+      const moved = await store.move({
+        id: created.filePath!,
+        destinationPath: 'archive/owned.md',
+        expectedSource: exact.physicalIncarnation,
+      })
+      expect(moved).toMatchObject({
+        id: 'stable-id',
+        filePath: 'archive/owned.md',
+      })
+
+      const stale = await store.read('archive/owned.md')
+      const path = join(root, 'archive', 'owned.md')
+      const bytes = await fs.readFile(path)
+      await fs.unlink(path)
+      await fs.writeFile(path, bytes)
+
+      await expect(
+        store.move({
+          id: 'archive/owned.md',
+          destinationPath: 'moved-again.md',
+          expectedSource: stale.physicalIncarnation,
+        }),
+      ).rejects.toThrow('source changed during move')
+      await expect(fs.readFile(path, 'utf8')).resolves.toContain('body')
+      await expect(fs.stat(join(root, 'moved-again.md'))).rejects.toMatchObject({ code: 'ENOENT' })
+
+      await expect(
+        store.remove('archive/owned.md', { expectedSource: stale.physicalIncarnation }),
+      ).rejects.toThrow('note physical incarnation changed during delete')
+      await expect(fs.readFile(path, 'utf8')).resolves.toContain('body')
+    } finally {
+      await store.stop()
+    }
+  })
+
   it('returns a receipt and binds an injected identity only after publication', async () => {
     const root = await mkroot()
     const store = createNotariumStore({ notesDir: root, spaceId: 'space-a' })

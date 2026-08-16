@@ -1096,6 +1096,84 @@ describeVector('NotariumStore vector indexing', () => {
     }
   })
 
+  it('discards an in-flight adjacency build when a legacy alias becomes ambiguous', async () => {
+    const table = {
+      'Source\n\nanchor topic [[a-b]]': [1, 0, 0, 0],
+      'AҚB\n\nfirst': [0, 1, 0, 0],
+      'AҒB\n\nsecond': [0, 0.8, 0.2, 0],
+      anchor: [1, 0, 0, 0],
+    }
+    const sql = createNodeSqliteDriver(':memory:', { vec: true })
+    const mount = userMount(notesDir)
+    const listDirs = mount.files.listDirs.bind(mount.files)
+    let armListDirs = false
+    let releaseListDirs!: () => void
+    let announceListDirs!: () => void
+    const listDirsEntered = new Promise<void>((resolve) => {
+      announceListDirs = resolve
+    })
+    const listDirsRelease = new Promise<void>((resolve) => {
+      releaseListDirs = resolve
+    })
+
+    mount.files.listDirs = async () => {
+      const result = await listDirs()
+
+      if (armListDirs) {
+        armListDirs = false
+        announceListDirs()
+        await listDirsRelease
+      }
+
+      return result
+    }
+    const store = new NotariumStore({
+      mounts: [mount],
+      sql,
+      embedder: mapEmbedder(table),
+      searchTuning: { graphSeedS: 1 },
+    })
+
+    try {
+      const source = await store.write({ title: 'Source', content: 'anchor topic [[a-b]]' })
+      const first = await store.write({ title: 'AҚB', content: 'first' })
+      const second = await store.write({ title: 'AҒB', content: 'second' })
+      await store.whenVectorsSettled()
+      const uniqueIdentities = [
+        { id: 'source-id', path: source.filePath! },
+        { id: 'first-id', path: first.filePath!, legacyNameAliases: ['a-b'] },
+        { id: 'second-id', path: second.filePath! },
+      ]
+
+      store.setLinkIdentities(uniqueIdentities)
+      const unique = await store.search('anchor')
+      store.setSearchTuning({ wGraph: 0 })
+      const withoutGraph = await store.search('anchor')
+      expect(scoreOf(unique, 'AҚB')).toBeGreaterThan(scoreOf(withoutGraph, 'AҚB'))
+
+      store.setSearchTuning({ wGraph: 0.5 })
+      store.setLinkIdentities(uniqueIdentities.map(({ id, path }) => ({ id, path })))
+      store.setLinkIdentities(uniqueIdentities)
+      armListDirs = true
+      const raced = store.search('anchor')
+
+      await listDirsEntered
+      store.setLinkIdentities([
+        ...uniqueIdentities,
+        { id: 'second-id', path: second.filePath!, legacyNameAliases: ['a-b'] },
+      ])
+      releaseListDirs()
+      const racedHits = await raced
+
+      expect(scoreOf(racedHits, 'AҚB')).toBeCloseTo(scoreOf(withoutGraph, 'AҚB'), 12)
+      const fresh = await store.search('anchor')
+      expect(scoreOf(fresh, 'AҚB')).toBeCloseTo(scoreOf(withoutGraph, 'AҚB'), 12)
+    } finally {
+      releaseListDirs?.()
+      await store.stop()
+    }
+  })
+
   it('a global hub neighbour is NOT boosted; a rare neighbour is (hub-robustness)', async () => {
     // Source is the hit; it links both Hub Note (also linked by five other notes →
     // high degree) and Rare Note (degree 1). With the top-degree node blacklisted,

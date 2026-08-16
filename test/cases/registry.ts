@@ -15,6 +15,7 @@ import { identityCollision } from './cases/identityCollision'
 import { importLayout } from './cases/importLayout'
 import { importThread } from './cases/importThread'
 import { jobs } from './cases/jobs'
+import { legacySlugLinks } from './cases/legacySlugLinks'
 import { longDocument } from './cases/longDocument'
 import { memoryPerf } from './cases/memoryPerf'
 import { multiSpace } from './cases/multiSpace'
@@ -62,6 +63,7 @@ export const CASES: readonly CaseSpec[] = [
   externalEdits,
   identityCollision,
   nameCollisions,
+  legacySlugLinks,
   nonLatinNames,
   // content / reader
   readerShowcase,

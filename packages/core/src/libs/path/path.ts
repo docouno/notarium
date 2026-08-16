@@ -1,6 +1,6 @@
 import { pathHash } from '../hash'
 import { isDurableScalar } from '../id'
-import { idToSlug, slugify } from '../slug'
+import { idToSlug, legacyNameKey, nameKey, slugify } from '../slug'
 import { CLIPPED_NAME_TAG_BYTES, FOLDER_PAGE_FILENAME, NOTE_BASENAME_MAX_BYTES } from './consts'
 
 /** Directory part of a slash-separated path ('' for a root-level file). */
@@ -321,6 +321,22 @@ export const noteFileBase = (
     ? `~${selected}-${pathHash(selected)}`
     : selected
   return boundNameToBytes(portable, NOTE_BASENAME_MAX_BYTES)
+}
+
+/** Recognise the exact basename the pre-Unicode note-path algebra minted for a
+ * title. This is evidence, not fuzzy matching: arbitrary filenames, empty legacy
+ * slugs and names which still use the same key do not become aliases. */
+export const legacyNoteNameAlias = (title: string, filePath: string): string | null => {
+  const filename = basenameOf(filePath)
+
+  if (!/\.md$/iu.test(filename)) {
+    return null
+  }
+
+  const basename = filename.slice(0, -3)
+  const legacy = legacyNameKey(title)
+
+  return legacy && basename === legacy && legacy !== nameKey(title) ? legacy : null
 }
 
 /** The name rungs ABOVE the id fallback, on their own: '' means nothing in the title

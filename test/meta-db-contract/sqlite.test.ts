@@ -12,6 +12,7 @@ import { describeGatewayStateContract } from './gatewayStateContract'
 import { describeIdentityPersistenceContract } from './identityPersistenceContract'
 import { describeImportReservationsContract } from './importReservationsContract'
 import { describeJobsContract } from './jobsContract'
+import { describeLegacyNameAliasesContract } from './legacyNameAliasesContract'
 import { describeRevisionPersistenceContract } from './revisionPersistenceContract'
 import { describeSessionAuditContract } from './sessionAuditContract'
 import { describeSpaceLifecycleWriterContract } from './spaceLifecycleWriterContract'
@@ -97,10 +98,11 @@ describeCausalMetadataContract('SQLite', async () => {
     ownerProofs: db.ownerProofs,
     revisions: db.revisions,
     terminal: db.restoreTerminal,
-    setAddress: async (noteId, space, revision) => {
+    setAddress: async (noteId, space, revision, legacyNameAliases = []) => {
       await db.identity.claimMany([
         {
           id: noteId,
+          legacyNameAliases,
           filePath: `address-${revision}.md`,
           space,
           createdAt: null,
@@ -109,6 +111,30 @@ describeCausalMetadataContract('SQLite', async () => {
         },
       ])
     },
+    getAddress: (noteId) => db.identity.findById!(noteId),
+    prepareTerminalResurrection: async (noteId, space, filePath, at) => {
+      const current = await db.identity.findById!(noteId)
+
+      if (!current) {
+        throw new Error(`missing identity ${noteId}`)
+      }
+      await db.identity.settleFileClaim({
+        space,
+        filePath,
+        current,
+        observedId: 'terminal-successor',
+        at,
+      })
+      const retired = await db.identity.findById!(noteId)
+
+      if (!retired) {
+        throw new Error(`missing retired identity ${noteId}`)
+      }
+
+      return retired
+    },
+    mergeLegacyNameAlias: (noteId, space, alias) =>
+      db.identity.mergeLegacyNameAlias({ id: noteId, space, alias }),
     teardown: () => db.close(),
   }
 })
@@ -149,6 +175,34 @@ describeIdentityPersistenceContract('SQLite', async () => {
         raw3.prepare('UPDATE context_sets SET items = ? WHERE id = ?').run(raw, setId)
       } finally {
         raw3.close()
+      }
+    },
+    teardown: async () => {
+      await alpha.close()
+      await beta.close()
+      rmSync(dir, { recursive: true, force: true })
+    },
+  }
+})
+
+describeLegacyNameAliasesContract('SQLite', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'notarium-alias-contract-'))
+  const path = join(dir, 'meta.sqlite')
+  const alpha = new SqliteMetaDb(path)
+  const beta = new SqliteMetaDb(path)
+
+  return {
+    alpha: alpha.identity,
+    beta: beta.identity,
+    corruptAliases: async (id, raw) => {
+      const connection = new DatabaseSync(path)
+
+      try {
+        connection
+          .prepare('UPDATE note_identity SET legacy_name_aliases = ? WHERE id = ?')
+          .run(raw, id)
+      } finally {
+        connection.close()
       }
     },
     teardown: async () => {

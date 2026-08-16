@@ -72,6 +72,8 @@ describe('meta-DB migration assets and SQLite runner', () => {
       { version: 8, name: 'causal_metadata' },
       { version: 9, name: 'agent_activity' },
       { version: 10, name: 'import_reservations' },
+      { version: 11, name: 'legacy_name_aliases' },
+      { version: 12, name: 'identity_settlement_lineage' },
     ])
     for (const migration of migrations) {
       expect(migration.checksum).toBe(checksumMigrationPair(migration.sqlite, migration.postgres))
@@ -146,6 +148,42 @@ describe('meta-DB migration assets and SQLite runner', () => {
         .prepare('SELECT owner, name, calls, role FROM agent_sessions WHERE id = ?')
         .get('ses_existingv1aa'),
     ).toEqual({ owner: 'alice', name: 'Existing', calls: 7, role: null })
+  })
+
+  it('adds an empty legacy alias set without guessing from existing names or paths', () => {
+    const db = database()
+    runSqliteMigrations(db, migrations.slice(0, 10))
+    db.prepare(
+      `INSERT INTO note_identity
+        (id, file_path, space, created_at, materialized, deleted_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run('legacy-identity', 'aza-stan-zhospary.md', 'main', null, 1, null)
+
+    runSqliteMigrations(db)
+
+    expect(
+      db
+        .prepare('SELECT file_path, legacy_name_aliases FROM note_identity WHERE id = ?')
+        .get('legacy-identity'),
+    ).toEqual({ file_path: 'aza-stan-zhospary.md', legacy_name_aliases: '[]' })
+  })
+
+  it('adds empty settlement lineage without inferring ancestry from existing paths', () => {
+    const db = database()
+    runSqliteMigrations(db, migrations.slice(0, 12))
+    db.prepare(
+      `INSERT INTO note_identity
+        (id, file_path, space, created_at, materialized, deleted_at, legacy_name_aliases)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run('existing-identity', 'same.md', 'main', null, 1, null, '[]')
+
+    runSqliteMigrations(db)
+
+    expect(
+      db
+        .prepare('SELECT file_path, settlement_successor_id FROM note_identity WHERE id = ?')
+        .get('existing-identity'),
+    ).toEqual({ file_path: 'same.md', settlement_successor_id: null })
   })
 
   it('adds the revision snapshot marker without relabelling legacy body blobs', () => {

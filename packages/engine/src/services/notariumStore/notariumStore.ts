@@ -25,10 +25,12 @@ import type {
   KnowledgeStore,
   ListOptions,
   MoveInput,
+  MoveResult,
   NoteChange,
   NoteClass,
   NoteContent,
   NoteMeta,
+  PhysicalIncarnation,
   Preview,
   ReadOptions,
   ReadScope,
@@ -61,6 +63,7 @@ import {
   type DocumentRole,
   documentStateVersionToken,
   effectiveSlug,
+  exactOwnerObservation,
   FOLDER_PAGE_BASENAME,
   type FolderAlias,
   freshNoteId,
@@ -115,11 +118,12 @@ import {
 
 import { type Chunker, createHeadingChunker } from '../../libs/chunking'
 import type { Embedder } from '../../libs/embedding'
-import { exactDirSpellings, type FileStat } from '../../libs/files'
-import type {
-  MutationReceipt,
-  ResourceObservation,
-  SpaceResourceAuthority,
+import { exactDirSpellings, type FileClaim, type FileStat } from '../../libs/files'
+import {
+  type MutationReceipt,
+  type ResourceObservation,
+  sameFileClaim,
+  type SpaceResourceAuthority,
 } from '../../libs/resourceAuthority'
 import type { SqlDriver } from '../../libs/sql'
 import { parseNoteFile, serializeNoteFile } from './noteFile'
@@ -168,6 +172,40 @@ type ReconcileRow = Pick<NoteRow, 'path' | 'class' | 'mtime_ms' | 'size' | 'seq'
   change_token: string | null
   source_hash: string | null
 }
+
+const RESOURCE_OBSERVATION_CLAIM_KIND = 'resource-observation-v1'
+
+const physicalIncarnationOf = (
+  observation: ResourceObservation & { kind: 'present' },
+): PhysicalIncarnation => ({
+  claim: {
+    kind: RESOURCE_OBSERVATION_CLAIM_KIND,
+    value: `${observation.adapterId}:${observation.claim.value}`,
+  },
+  owner: exactOwnerObservation(observation.bytes),
+})
+
+const observedFileClaim = (
+  incarnation: PhysicalIncarnation,
+  observation: ResourceObservation & { kind: 'present' },
+): (FileClaim & { kind: 'present' }) | null => {
+  if (
+    incarnation.claim.kind !== RESOURCE_OBSERVATION_CLAIM_KIND ||
+    !incarnation.claim.value.startsWith(`${observation.adapterId}:`)
+  ) {
+    return null
+  }
+  const value = incarnation.claim.value.slice(observation.adapterId.length + 1)
+
+  return value ? { kind: 'present', value } : null
+}
+
+const sameOwnerObservation = (
+  left: PhysicalIncarnation['owner'],
+  right: PhysicalIncarnation['owner'],
+): boolean =>
+  left.kind === right.kind &&
+  (left.kind !== 'claimed' || (right.kind === 'claimed' && left.id === right.id))
 
 /** In-memory undirected wikilink adjacency for the graph search channel (#81 Stage
  *  4b), keyed on node id = storage path (the bare-engine identity, same as
@@ -535,8 +573,13 @@ export class NotariumStore implements KnowledgeStore {
    *  `[[oldpath/note]]` resolves to a renamed folder's note even when the filename
    *  is ambiguous. Empty until fed; a refeed marks the graph dirty for a rebuild. */
   private folderAliases: FolderAlias[] = []
-  private linkIdentities = new Map<string, string>()
+  private linkIdentities = new Map<string, { path: string; legacyNameAliases: readonly string[] }>()
+  private linkIdentityAliasesByPath = new Map<string, readonly string[]>()
   private linkIdentitiesConfigured = false
+  /** Legacy alias compatibility changes invalidate more than ordinary content:
+   * a formerly resolved edge can become an intentional ghost. Fence asynchronous
+   * adjacency builds so an older resolver generation cannot republish a winner. */
+  private linkCompatibilityGeneration = 0
 
   /** The vector channel (#81), null when disabled. `vecReady` mirrors it but is
    *  cleared if the boot schema build proves vec0 absent — embedNote checks it,
@@ -2325,7 +2368,7 @@ export class NotariumStore implements KnowledgeStore {
 
     if (identityEnvelope && !identityOnly) {
       const rawRegisteredPath = this.linkIdentitiesConfigured
-        ? this.linkIdentities.get(rawId)
+        ? this.linkIdentities.get(rawId)?.path
         : undefined
       const byRawId = rawRegisteredPath
         ? await this.sql.get<NoteRow>(`SELECT * FROM notes WHERE path = ?`, [rawRegisteredPath])
@@ -2358,7 +2401,7 @@ export class NotariumStore implements KnowledgeStore {
     const identity = identityEnvelope ? envelopedId : rawId
     const registeredPath =
       identity != null && this.linkIdentitiesConfigured
-        ? this.linkIdentities.get(identity)
+        ? this.linkIdentities.get(identity)?.path
         : undefined
     const byId = registeredPath
       ? await this.sql.get<NoteRow>(`SELECT * FROM notes WHERE path = ?`, [registeredPath])
@@ -2408,7 +2451,7 @@ export class NotariumStore implements KnowledgeStore {
     const all = await this.sql.all<NoteMetaRow>(`SELECT ${NOTE_META_COLS} FROM notes ORDER BY path`)
     const currentFolders = await this.mountForClass(undefined).files.listDirs()
     const index = buildLinkIndex(
-      all.map((r) => this.metaOf(r)),
+      all.map((r) => this.linkMeta(this.metaOf(r))),
       this.folderAliases,
       undefined,
       currentFolders,
@@ -2689,6 +2732,9 @@ export class NotariumStore implements KnowledgeStore {
         frontmatter: parsed.frontmatterEntries,
       }),
       documentState,
+      ...(observation?.kind === 'present'
+        ? { physicalIncarnation: physicalIncarnationOf(observation) }
+        : {}),
       ...(parsed.slug ? { slug: parsed.slug } : {}), // #100 phase 1: custom slug only
       ...(parsed.aliases.length ? { aliases: parsed.aliases } : {}),
       modifiedAt: row.modified_at,
@@ -3107,19 +3153,74 @@ export class NotariumStore implements KnowledgeStore {
     this.graphDirty = true
   }
 
-  setLinkIdentities(identities: ReadonlyArray<{ id: string; path: string }>): void {
-    const next = new Map(identities.map(({ id, path }) => [id, path]))
+  setLinkIdentities(
+    identities: ReadonlyArray<{
+      id: string
+      path: string
+      legacyNameAliases?: readonly string[]
+    }>,
+  ): void {
+    const next = new Map(
+      identities.map(({ id, path, legacyNameAliases }) => [
+        id,
+        { path, legacyNameAliases: [...(legacyNameAliases ?? [])] },
+      ]),
+    )
+    const previousAliases = new Map(
+      [...this.linkIdentities].flatMap(([id, identity]) =>
+        identity.legacyNameAliases.length ? [[id, identity.legacyNameAliases] as const] : [],
+      ),
+    )
+    const nextAliases = new Map(
+      [...next].flatMap(([id, identity]) =>
+        identity.legacyNameAliases.length ? [[id, identity.legacyNameAliases] as const] : [],
+      ),
+    )
+    const aliasesChanged =
+      nextAliases.size !== previousAliases.size ||
+      [...nextAliases].some(([id, aliases]) => {
+        const previous = previousAliases.get(id)
+
+        return (
+          previous == null ||
+          previous.length !== aliases.length ||
+          previous.some((alias, index) => alias !== aliases[index])
+        )
+      })
 
     if (
       this.linkIdentitiesConfigured &&
       next.size === this.linkIdentities.size &&
-      [...next].every(([id, path]) => this.linkIdentities.get(id) === path)
+      [...next].every(([id, identity]) => {
+        const previous = this.linkIdentities.get(id)
+
+        return (
+          previous?.path === identity.path &&
+          previous.legacyNameAliases.length === identity.legacyNameAliases.length &&
+          previous.legacyNameAliases.every(
+            (alias, index) => alias === identity.legacyNameAliases[index],
+          )
+        )
+      })
     ) {
       return
     }
     this.linkIdentitiesConfigured = true
     this.linkIdentities = next
+    this.linkIdentityAliasesByPath = new Map(
+      [...next.values()].map(({ path, legacyNameAliases }) => [path, [...legacyNameAliases]]),
+    )
+    if (aliasesChanged) {
+      this.graphCache = null
+      this.linkCompatibilityGeneration++
+    }
     this.graphDirty = true
+  }
+
+  private linkMeta(meta: NoteMeta): NoteMeta {
+    const legacyNameAliases = this.linkIdentityAliasesByPath.get(meta.filePath)
+
+    return legacyNameAliases?.length ? { ...meta, legacyNameAliases: [...legacyNameAliases] } : meta
   }
 
   /** Register exact id addresses onto a path-keyed bare-engine link index. Once an
@@ -3132,7 +3233,7 @@ export class NotariumStore implements KnowledgeStore {
     if (this.linkIdentitiesConfigured) {
       const admittedPaths = new Set(rows.map((row) => row.path))
 
-      for (const [id, path] of this.linkIdentities) {
+      for (const [id, { path }] of this.linkIdentities) {
         // `rows` is the caller's resolver population. graph() deliberately passes
         // only graph-visible rows; admitting a hidden authoritative id here would
         // resolve the edge to a private path and lose its non-creatable ghost.
@@ -3160,6 +3261,8 @@ export class NotariumStore implements KnowledgeStore {
    *  rebuild re-marks it and the next ensureGraphAdjacency refreshes again (the
    *  just-built cache may be one mutation stale, healed next cycle). */
   private async rebuildGraphAdjacency(): Promise<void> {
+    const compatibilityGeneration = this.linkCompatibilityGeneration
+
     this.graphDirty = false
     try {
       const rows = await this.sql.all<{
@@ -3179,15 +3282,17 @@ export class NotariumStore implements KnowledgeStore {
       )
       const graphRows = rows.filter((row) => isVisibleOn(SURFACE.graph, row.class))
       const metas = graphRows.map((r) =>
-        this.metaOf({
-          path: r.path,
-          title: r.title,
-          class: r.class,
-          aliases: r.aliases,
-          slug: r.slug,
-          modified_at: null,
-          created_at: null,
-        }),
+        this.linkMeta(
+          this.metaOf({
+            path: r.path,
+            title: r.title,
+            class: r.class,
+            aliases: r.aliases,
+            slug: r.slug,
+            modified_at: null,
+            created_at: null,
+          }),
+        ),
       )
       const currentFolders = await this.mountForClass(undefined).files.listDirs()
       const index = buildLinkIndex(metas, this.folderAliases, undefined, currentFolders)
@@ -3231,6 +3336,10 @@ export class NotariumStore implements KnowledgeStore {
       for (const [id, nbs] of adj) {
         degree.set(id, nbs.size)
       }
+      if (compatibilityGeneration !== this.linkCompatibilityGeneration) {
+        this.graphDirty = true
+        return
+      }
       this.graphCache = { adj, degree, total: realIds.size }
     } catch (err) {
       console.error('[notarium] graph adjacency rebuild failed:', err)
@@ -3250,9 +3359,9 @@ export class NotariumStore implements KnowledgeStore {
     const rows = await this.sql.all<NoteMetaRow & { body: string }>(
       `SELECT ${NOTE_META_COLS}, body FROM notes ORDER BY path`,
     )
-    const metas = rows.map((r) => this.metaOf(r))
+    const metas = rows.map((r) => this.linkMeta(this.metaOf(r)))
     const graphRows = rows.filter((row) => isVisibleOn(SURFACE.graph, row.class))
-    const graphMetas = graphRows.map((row) => this.metaOf(row))
+    const graphMetas = graphRows.map((row) => this.linkMeta(this.metaOf(row)))
     // A provenance map (#100 phase 5) so each edge records HOW its [[wikilink]] resolved
     // (current name / custom slug / former note name / former folder path). It rides
     // the FRESH derivation only; the read-model's incremental cache never gets it.
@@ -3332,6 +3441,7 @@ export class NotariumStore implements KnowledgeStore {
     preservePath,
     preserveAliases,
     restorePath,
+    expectedSource,
     expectedDestinationId,
   }: WriteInput): Promise<WriteResult> {
     await this.ensureReady()
@@ -3595,6 +3705,21 @@ export class NotariumStore implements KnowledgeStore {
         if (targetObservation.kind !== 'absent') {
           throw moveFailed('a note already lives at the destination')
         }
+      }
+    }
+    if (expectedSource) {
+      if (!sourceRow || mutationObservation?.kind !== 'present') {
+        throw writeFailed('note changed during write')
+      }
+      const expectedClaim = observedFileClaim(expectedSource, mutationObservation)
+      const observedOwner = exactOwnerObservation(mutationObservation.bytes)
+
+      if (
+        !expectedClaim ||
+        !sameFileClaim(expectedClaim, mutationObservation.claim) ||
+        !sameOwnerObservation(expectedSource.owner, observedOwner)
+      ) {
+        throw writeFailed('note changed during write')
       }
     }
     const existingSource = mutationObservation
@@ -3886,7 +4011,13 @@ export class NotariumStore implements KnowledgeStore {
   /** Move a note (id channel) or a whole folder (path channel, isDirectory).
    *  Same failure surface as every engine: "# Move Failed" as a tool error.
    *  Moves stay within a mount (no cross-mount/class change in v1). */
-  async move({ id, destinationPath, isDirectory = false, identityOnly }: MoveInput): Promise<void> {
+  async move({
+    id,
+    destinationPath,
+    isDirectory = false,
+    identityOnly,
+    expectedSource,
+  }: MoveInput): Promise<MoveResult> {
     await this.ensureReady()
     if (
       (!isDirectory && !isValidNoteId(id) && decodeWikilinkIdentity(id) == null) ||
@@ -3990,7 +4121,7 @@ export class NotariumStore implements KnowledgeStore {
         await this.reindexPath(next)
       }
 
-      return
+      return {}
     }
     const row = await this.resolveRow(id, identityOnly)
 
@@ -4023,12 +4154,68 @@ export class NotariumStore implements KnowledgeStore {
       if (occupied) {
         throw moveFailed('a note already lives at the destination')
       }
-      await this.renameFileNoReplace(mount, this.relIn(mount, row.path), this.relIn(mount, dest))
+      if (expectedSource) {
+        if (!this.resourceAuthority) {
+          throw moveFailed('storage cannot prove the exact source incarnation')
+        }
+        const source = await this.resourceAuthority.observe(row.path, {
+          owner: 'notarium-move-source',
+        })
+        const target = await this.resourceAuthority.observe(dest, {
+          owner: 'notarium-move-target',
+        })
+
+        if (source.kind !== 'present' || target.kind !== 'absent') {
+          throw moveFailed('source or destination changed during move')
+        }
+        const expectedClaim = observedFileClaim(expectedSource, source)
+        const observedOwner = exactOwnerObservation(source.bytes)
+
+        if (
+          !expectedClaim ||
+          !sameFileClaim(expectedClaim, source.claim) ||
+          !sameOwnerObservation(expectedSource.owner, observedOwner)
+        ) {
+          throw moveFailed('source changed during move')
+        }
+        const publication = await this.resourceAuthority.publish(
+          {
+            kind: 'move-put',
+            sourcePath: row.path,
+            targetPath: dest,
+            content: source.bytes,
+            expectedSource: source.claim,
+            expectedTarget: target.claim,
+          },
+          { owner: 'notarium-move' },
+        )
+
+        if (publication.status === 'conflict') {
+          throw moveFailed('source or destination changed during move')
+        }
+        const transition = publication.receipt.transitions.find(({ path }) => path === dest)
+
+        if (!transition || transition.after.kind !== 'present') {
+          throw moveFailed('storage returned an invalid move receipt')
+        }
+      } else {
+        await this.renameFileNoReplace(mount, this.relIn(mount, row.path), this.relIn(mount, dest))
+      }
       await this.publishWithSeq((seq) =>
         this.sql.run(`UPDATE notes SET path = ?, seq = ? WHERE path = ?`, [dest, seq, row.path]),
       )
       await this.reindexPath(dest)
+      const current = await this.read(dest, { storageOnly: true })
+
+      return {
+        id: current.id,
+        filePath: dest,
+        versionToken: current.versionToken,
+      }
     }
+
+    const current = await this.read(row.path, { storageOnly: true })
+    return { id: current.id, filePath: row.path, versionToken: current.versionToken }
   }
 
   async remove(
@@ -4037,6 +4224,7 @@ export class NotariumStore implements KnowledgeStore {
       identityOnly?: boolean
       versionToken?: string
       physicalWriteClaim?: { kind: string; value: string }
+      expectedSource?: PhysicalIncarnation
     },
   ): Promise<void> {
     await this.ensureReady()
@@ -4047,9 +4235,33 @@ export class NotariumStore implements KnowledgeStore {
     } // removing what's already gone is a no-op, every engine agrees
     const mount = this.mountForPath(row.path)
     const rel = this.relIn(mount, row.path)
-    const expected = await mount.files.read(rel)
+    let expected = await mount.files.read(rel)
 
-    if (opts?.physicalWriteClaim) {
+    if (opts?.expectedSource) {
+      if (!this.resourceAuthority) {
+        throw writeFailed('storage cannot prove the exact source incarnation')
+      }
+      const observation = await this.resourceAuthority.observe(row.path, {
+        owner: 'notarium-remove-source',
+      })
+
+      if (observation.kind !== 'present') {
+        throw writeFailed('note physical incarnation changed during delete')
+      }
+      const expectedClaim = observedFileClaim(opts.expectedSource, observation)
+      const observedOwner = exactOwnerObservation(observation.bytes)
+
+      if (
+        !expectedClaim ||
+        !sameFileClaim(expectedClaim, observation.claim) ||
+        !sameOwnerObservation(opts.expectedSource.owner, observedOwner)
+      ) {
+        throw writeFailed('note physical incarnation changed during delete')
+      }
+      expected = new TextDecoder().decode(observation.bytes)
+    }
+
+    if (opts?.physicalWriteClaim && !opts.expectedSource) {
       if (opts.physicalWriteClaim.kind !== 'resource-publication-v1' || !this.resourceAuthority) {
         throw writeFailed('note physical incarnation changed during delete')
       }
@@ -4068,7 +4280,18 @@ export class NotariumStore implements KnowledgeStore {
     const indexedHash =
       expected == null ? undefined : await this.verifiedIndexedSourceHash(row, expected)
 
-    if (opts?.physicalWriteClaim) {
+    if (opts?.expectedSource) {
+      if (
+        expected == null ||
+        !(await this.resourceAuthority!.removeClaimed(
+          row.path,
+          opts.expectedSource.claim.value,
+          expected,
+        ))
+      ) {
+        throw writeFailed('note physical incarnation changed during delete')
+      }
+    } else if (opts?.physicalWriteClaim) {
       if (
         expected == null ||
         !indexedHash ||

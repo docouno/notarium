@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import {
   type CausalOutboxPersistence,
+  type IdentityRecord,
   INSTALLATION_GENERATION_PHASE,
   type InstallationGenerationPersistence,
   type OwnerProofPersistence,
@@ -21,7 +22,27 @@ export type CausalMetadataContractFactory = () => Promise<{
   ownerProofs: OwnerProofPersistence
   revisions: RevisionPersistence
   terminal: RestoreTerminalPersistence
-  setAddress(noteId: string, space: string, revision: number): Promise<void>
+  setAddress(
+    noteId: string,
+    space: string,
+    revision: number,
+    legacyNameAliases?: readonly string[],
+  ): Promise<void>
+  getAddress(noteId: string): Promise<IdentityRecord | null>
+  /** SQL identity storage carries durable settlement lineage alongside the restore terminal. */
+  prepareTerminalResurrection?: (
+    noteId: string,
+    space: string,
+    filePath: string,
+    at: string,
+  ) => Promise<IdentityRecord>
+  mergeLegacyNameAlias?: (
+    noteId: string,
+    space: string,
+    alias: string,
+  ) => Promise<
+    { status: 'merged'; id: string; legacyNameAliases: readonly string[] } | { status: 'not-owned' }
+  >
   teardown?: () => Promise<void>
 }>
 
@@ -258,6 +279,15 @@ export const describeCausalMetadataContract = (
     })
 
     it('commits restore terminal metadata and outbox as one replay-safe unit', async () => {
+      await facets.setAddress(operationInput.noteId, operationInput.space, 1, ['durable-alias'])
+      const retired = await facets.prepareTerminalResurrection?.(
+        operationInput.noteId,
+        operationInput.space,
+        'address-1.md',
+        '2026-08-11T00:00:30.000Z',
+      )
+      const targetPath = retired ? 'restored-note-a.md' : 'address-1.md'
+      const restoredAddressRevision = retired ? (retired.addressRevision ?? 0) + 1 : 1
       const source = await facets.revisions.append(
         {
           noteId: operationInput.noteId,
@@ -288,7 +318,7 @@ export const describeCausalMetadataContract = (
         phase: RESTORE_OPERATION_PHASE.prepared,
         sourceRevisionId: source.id,
         expectedHeadRevisionId: source.id,
-        targetPath: 'address-1.md',
+        targetPath,
         preparedEvidence: 'prepared-a',
         updatedAt: '2026-08-11T00:01:00.000Z',
       })
@@ -303,18 +333,19 @@ export const describeCausalMetadataContract = (
         operationId: operationInput.id,
         sourceRevisionId: source.id,
         expectedHeadRevisionId: source.id,
-        targetPath: 'address-1.md',
+        targetPath,
         preparedEvidence: 'prepared-a',
         physicalReceipt: 'receipt-json-a',
         expectedIdentity: {
-          addressRevision: 1,
-          filePath: 'address-1.md',
-          deletedAt: null,
+          addressRevision: retired?.addressRevision ?? 1,
+          filePath: retired?.filePath ?? 'address-1.md',
+          deletedAt: retired?.deletedAt ?? null,
         },
         identity: {
           id: operationInput.noteId,
-          addressRevision: 1,
-          filePath: 'address-1.md',
+          legacyNameAliases: ['prepared-alias'],
+          addressRevision: restoredAddressRevision,
+          filePath: targetPath,
           space: operationInput.space,
           createdAt: operationInput.createdAt,
           materialized: true,
@@ -350,7 +381,7 @@ export const describeCausalMetadataContract = (
         },
         result: {
           noteId: operationInput.noteId,
-          filePath: 'address-1.md',
+          filePath: targetPath,
           versionToken: 'version-restored',
         },
         outboxKind: 'restore-terminal',
@@ -365,6 +396,22 @@ export const describeCausalMetadataContract = (
       })
       if (first.status === 'conflict') {
         throw new Error(`terminal commit unexpectedly conflicted: ${first.conflict}`)
+      }
+      expect(await facets.getAddress(operationInput.noteId)).toMatchObject({
+        legacyNameAliases: ['durable-alias', 'prepared-alias'],
+      })
+      if (facets.mergeLegacyNameAlias) {
+        await expect(
+          facets.mergeLegacyNameAlias(
+            operationInput.noteId,
+            operationInput.space,
+            'terminal-resurrection',
+          ),
+        ).resolves.toMatchObject({
+          status: 'merged',
+          id: operationInput.noteId,
+          legacyNameAliases: ['durable-alias', 'prepared-alias', 'terminal-resurrection'],
+        })
       }
       await expect(facets.terminal.commit(commit)).resolves.toMatchObject({
         status: 'replayed',
@@ -402,7 +449,7 @@ export const describeCausalMetadataContract = (
         ).total,
       ).toBe(2)
       expect(await facets.ownerProofs.get(operationInput.noteId)).toMatchObject({
-        addressRevision: 1,
+        addressRevision: restoredAddressRevision,
         proofRevision: 1,
         receiptId: 'proof-receipt-a',
       })

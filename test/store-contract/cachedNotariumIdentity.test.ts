@@ -26,6 +26,108 @@ describe('CachedStore(NotariumStore) — authoritative link identities', () => {
   const persistedIdentity = (records: IdentityRecord[]): IdentityPersistence =>
     new InMemoryIdentity(records)
 
+  it('persists exact legacy basename evidence before a path-changing move', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'notarium-cached-legacy-alias-'))
+    writeFileSync(
+      join(root, 'aza-stan-zhospary.md'),
+      '---\nnotarium-id: legacy-kz-id\ntitle: Қазақстан жоспары\n---\n\nbody',
+    )
+    const identityPersistence = persistedIdentity([])
+    const inner = createNotariumStore({ notesDir: root, spaceId: 'main' })
+    const store = new CachedStore({
+      inner,
+      identityPersistence,
+      space: 'main',
+      pollIntervalMs: 0,
+      readBody: async (filePath) => readFileSync(join(root, filePath), 'utf8'),
+    })
+
+    try {
+      await store.start()
+      const exact = await store.read('legacy-kz-id')
+      const moved = await store.move({ id: 'legacy-kz-id', destinationPath: 'plan.md' })
+
+      expect(exact.filePath).toBe('aza-stan-zhospary.md')
+      expect(moved.filePath).toBe('plan.md')
+      expect(moved.legacyNameAliases).toEqual(['aza-stan-zhospary'])
+      await expect(identityPersistence.findById!('legacy-kz-id')).resolves.toMatchObject({
+        legacyNameAliases: ['aza-stan-zhospary'],
+      })
+    } finally {
+      store.stop()
+      await store.settle()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('captures a legacy basename introduced by an external delta before publication', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'notarium-cached-legacy-delta-'))
+    const identityPersistence = persistedIdentity([])
+    const inner = createNotariumStore({ notesDir: root, spaceId: 'main' })
+    const store = new CachedStore({
+      inner,
+      identityPersistence,
+      space: 'main',
+      pollIntervalMs: 0,
+      readBody: async (filePath) => readFileSync(join(root, filePath), 'utf8'),
+    })
+
+    try {
+      await store.start()
+      writeFileSync(
+        join(root, 'aza-stan-zhospary.md'),
+        '---\nnotarium-id: external-kz-id\ntitle: Қазақстан жоспары\n---\n\nbody',
+      )
+      await store.reconcile()
+
+      await expect(identityPersistence.findById!('external-kz-id')).resolves.toMatchObject({
+        legacyNameAliases: ['aza-stan-zhospary'],
+      })
+      await expect(store.resolveWikilink('aza-stan-zhospary')).resolves.toMatchObject({
+        id: 'external-kz-id',
+      })
+    } finally {
+      store.stop()
+      await store.settle()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not acknowledge or move a legacy candidate with an unproven owner', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'notarium-cached-legacy-owner-'))
+    writeFileSync(
+      join(root, 'aza-stan-zhospary.md'),
+      '---\nnotarium-id: [short]\ntitle: Қазақстан жоспары\n---\n\nbody',
+    )
+    const identityPersistence = persistedIdentity([])
+    const inner = createNotariumStore({ notesDir: root, spaceId: 'main' })
+    const store = new CachedStore({
+      inner,
+      identityPersistence,
+      space: 'main',
+      pollIntervalMs: 0,
+      readBody: async (filePath) => readFileSync(join(root, filePath), 'utf8'),
+    })
+
+    try {
+      await store.start()
+      const note = (await store.list()).find(({ filePath }) => filePath === 'aza-stan-zhospary.md')!
+
+      await expect(store.move({ id: note.id!, destinationPath: 'plan.md' })).rejects.toThrow(
+        'exact storage ownership is unproven',
+      )
+      expect(readFileSync(join(root, 'aza-stan-zhospary.md'), 'utf8')).toContain('body')
+      expect(() => readFileSync(join(root, 'plan.md'), 'utf8')).toThrow()
+      await expect(identityPersistence.findById!(note.id!)).resolves.toMatchObject({
+        legacyNameAliases: [],
+      })
+    } finally {
+      store.stop()
+      await store.settle()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
   it('waits for cold identity reconciliation before resolving a plain stable id', async () => {
     const root = mkdtempSync(join(tmpdir(), 'notarium-cached-cold-resolve-'))
     writeFileSync(
@@ -116,6 +218,7 @@ describe('CachedStore(NotariumStore) — authoritative link identities', () => {
     })
     const owner: IdentityRecord = {
       id: 'duplicate-id',
+      legacyNameAliases: ['historic-owner'],
       filePath: 'z.md',
       space: 'space-id',
       createdAt: null,
@@ -216,6 +319,7 @@ describe('CachedStore(NotariumStore) — authoritative link identities', () => {
     writeFileSync(join(root, 'z.md'), duplicate('Persisted Owner', 'owner body'))
     const owner: IdentityRecord = {
       id: 'duplicate-id',
+      legacyNameAliases: [],
       filePath: 'z.md',
       space: 'space-id',
       createdAt: null,
@@ -301,6 +405,7 @@ describe('CachedStore(NotariumStore) — authoritative link identities', () => {
     writeFileSync(join(root, 'z.md'), duplicate('Persisted Owner'))
     const owner: IdentityRecord = {
       id: 'duplicate-id',
+      legacyNameAliases: [],
       filePath: 'z.md',
       space: 'space-id',
       createdAt: null,
@@ -356,6 +461,7 @@ describe('CachedStore(NotariumStore) — authoritative link identities', () => {
     writeFileSync(join(root, 'z.md'), duplicate('Persisted Owner', 'owner body'))
     const owner: IdentityRecord = {
       id: 'duplicate-id',
+      legacyNameAliases: [],
       filePath: 'z.md',
       space: 'space-id',
       createdAt: null,
@@ -394,6 +500,13 @@ describe('CachedStore(NotariumStore) — authoritative link identities', () => {
         content: 'owner body',
       })
       const readsAfterHuman = innerReads
+
+      // The degraded engine inventory cannot carry durable compatibility
+      // aliases. A legacy-only miss is therefore unavailable, never a false 404.
+      await expect(store.resolveWikilink('historic-owner')).rejects.toMatchObject({
+        reason: 'engine_unavailable',
+        isUnavailable: true,
+      })
 
       await expect(store.resolveWikilink(encodeWikilinkIdentity(owner.id))).rejects.toMatchObject({
         reason: 'engine_unavailable',
@@ -759,6 +872,7 @@ describe('CachedStore(NotariumStore) — authoritative link identities', () => {
     const identityPersistence = persistedIdentity([
       {
         id: 'duplicate-id',
+        legacyNameAliases: [],
         filePath: 'z.md',
         space: 'main',
         createdAt: null,
@@ -809,6 +923,7 @@ describe('CachedStore(NotariumStore) — authoritative link identities', () => {
     const records: IdentityRecord[] = [
       {
         id: 'durable-source',
+        legacyNameAliases: [],
         filePath: 'source.md',
         space: 'main',
         createdAt: null,
@@ -817,6 +932,7 @@ describe('CachedStore(NotariumStore) — authoritative link identities', () => {
       },
       {
         id: 'durable-target',
+        legacyNameAliases: [],
         filePath: 'target.md',
         space: 'main',
         createdAt: null,

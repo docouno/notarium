@@ -1,5 +1,4 @@
 import type {
-  IdentityRecord,
   KnowledgeStore,
   StoreEvent,
   TagMutationInput,
@@ -22,8 +21,8 @@ export type SpaceStore = KnowledgeStore & {
   checkpoint?(): Promise<void>
   /** Re-read committed physical truth into this process-local projection. */
   reconcile?(): Promise<void>
-  /** Install an identity row committed by a cross-system terminal transaction. */
-  adoptCausalIdentity?(record: IdentityRecord): void | Promise<void>
+  /** Re-fetch and install an identity row committed by a cross-system terminal transaction. */
+  adoptCausalIdentity?(noteId: string): void | Promise<void>
   subscribe?(listener: (event: StoreEvent) => void): () => void
 }
 

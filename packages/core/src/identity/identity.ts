@@ -7,14 +7,28 @@
 import { DEFAULT_SPACE } from '../knowledgeStore'
 import type { IdentityFileSettlement, IdentityPersistence, IdentityRecord } from '../knowledgeStore'
 import { freshNoteId, isValidNoteId } from '../libs/id'
+import {
+  appendLegacyNameAlias,
+  canonicalLegacyNameAliases,
+  isLegacyNameAlias,
+  unionLegacyNameAliases,
+} from './legacyNameAliases'
 import type { AdoptResult } from './types'
 
 const FLUSH_DELAY_MS = 500
+
+const copyRecord = (record: IdentityRecord): IdentityRecord => ({
+  ...record,
+  legacyNameAliases: [...record.legacyNameAliases],
+})
 
 export class IdentityRegistry {
   private byPath = new Map<string, IdentityRecord>()
   private byId = new Map<string, IdentityRecord>()
   private dirty = new Set<string>()
+  /** Monotonic facts waiting for their narrow column-only ACK. They never make
+   * the structural row dirty, so an old full-record flush cannot own them. */
+  private aliasDebt = new Map<string, Set<string>>()
   private flushTimer: ReturnType<typeof setTimeout> | null = null
   /** The one persistence writer. A timer flush, an explicit create flush and
    *  graceful settle may arrive together; all of them join this tail so an
@@ -79,7 +93,10 @@ export class IdentityRegistry {
     // never combine a partial/ephemeral ownership map with the authoritative
     // rows it is about to install.
     for (const raw of await this.persistence.loadAll(this.space)) {
-      const rec = { ...raw }
+      const rec = copyRecord({
+        ...raw,
+        legacyNameAliases: canonicalLegacyNameAliases(raw.legacyNameAliases),
+      })
 
       if (!isValidNoteId(rec.id)) {
         continue
@@ -103,6 +120,7 @@ export class IdentityRegistry {
     this.byPath = loadedByPath
     this.byId = loadedById
     this.dirty.clear()
+    this.aliasDebt.clear()
     this.dropped.clear()
     for (const rec of canonicalized) {
       this.markDirty(rec)
@@ -119,41 +137,87 @@ export class IdentityRegistry {
   }
 
   recordFor(id: string): IdentityRecord | undefined {
-    return this.byId.get(id)
+    const record = this.byId.get(id)
+    return record ? copyRecord(record) : undefined
   }
 
-  /** Install one row already committed by the causal metadata authority. This
-   * is not write-behind work: marking it dirty would race the authoritative
-   * terminal transaction with an older process-local image. */
-  adoptPersisted(record: IdentityRecord): void {
-    if (record.space !== this.space) {
-      throw new Error(`identity ${record.id} belongs to another space`)
+  /** Re-fetch and project one causal identity inside the registry's persistence
+   * lane. The caller owns the outer global mutation claim. */
+  async adoptPersisted(id: string): Promise<void> {
+    if (!this.persistence?.findById) {
+      return
     }
-    const prior = this.byId.get(record.id)
 
-    if (prior && this.byPath.get(prior.filePath)?.id === prior.id) {
-      this.byPath.delete(prior.filePath)
-    }
-    const occupant = this.byPath.get(record.filePath)
+    await this.runSerialized(async () => {
+      const fetched = await this.persistence!.findById!(id)
 
-    if (occupant && occupant.id !== record.id) {
-      this.byId.delete(occupant.id)
-    }
-    const installed = { ...record }
+      if (!fetched) {
+        return
+      }
+      if (fetched.space !== this.space) {
+        throw new Error(`identity ${fetched.id} belongs to another space`)
+      }
+      const record = copyRecord({
+        ...fetched,
+        legacyNameAliases: canonicalLegacyNameAliases(fetched.legacyNameAliases),
+      })
+      const prior = this.byId.get(record.id)
+      const aliases = unionLegacyNameAliases(
+        record.legacyNameAliases,
+        prior?.legacyNameAliases ?? [],
+      )
 
-    this.byId.set(installed.id, installed)
-    if (installed.deletedAt == null) {
-      this.byPath.set(installed.filePath, installed)
-    }
-    this.dirty.delete(installed.id)
-    this.dropped.delete(installed.id)
+      if (prior && this.dirty.has(prior.id)) {
+        prior.legacyNameAliases = aliases
+        return
+      }
+      const priorRevision = prior?.addressRevision ?? 0
+      const nextRevision = record.addressRevision ?? 0
+
+      if (prior && nextRevision < priorRevision) {
+        prior.legacyNameAliases = aliases
+        return
+      }
+      if (prior && nextRevision === priorRevision) {
+        const sameAddress =
+          prior.filePath === record.filePath &&
+          prior.space === record.space &&
+          prior.createdAt === record.createdAt &&
+          prior.materialized === record.materialized &&
+          prior.deletedAt === record.deletedAt
+
+        if (!sameAddress) {
+          const confirmed = await this.persistence!.findById!(id)
+          const confirmedAliases = canonicalLegacyNameAliases(confirmed?.legacyNameAliases)
+          const stillConflicts =
+            confirmed?.space === record.space &&
+            (confirmed.addressRevision ?? 0) === nextRevision &&
+            (confirmed.filePath !== prior.filePath ||
+              confirmed.createdAt !== prior.createdAt ||
+              confirmed.materialized !== prior.materialized ||
+              confirmed.deletedAt !== prior.deletedAt)
+
+          prior.legacyNameAliases = unionLegacyNameAliases(aliases, confirmedAliases)
+          if (stillConflicts) {
+            throw new Error(`identity ${id} has conflicting address revision ${nextRevision}`)
+          }
+
+          return
+        }
+        prior.legacyNameAliases = aliases
+        return
+      }
+
+      this.installAuthoritative({ ...record, legacyNameAliases: aliases })
+    })
   }
 
   /** Read-only authoritative probe used only while the full per-space load is
    *  unavailable. It distinguishes a plain stable-id spelling from a human
    *  name without installing or dirtying any registry state. */
   async persistedRecordFor(id: string): Promise<IdentityRecord | null | undefined> {
-    return this.persistence?.findById ? this.persistence.findById(id) : undefined
+    const record = this.persistence?.findById ? await this.persistence.findById(id) : undefined
+    return record ? copyRecord(record) : record
   }
 
   /** Overwrite a record's persisted creation date. `ensure` only fills a
@@ -187,6 +251,7 @@ export class IdentityRegistry {
     }
     const rec: IdentityRecord = {
       id: freshNoteId(),
+      legacyNameAliases: [],
       // null stays null on purpose: the boot inventory doesn't know creation
       // dates, and stamping "now" there would persist a lie for the whole
       // base. Callers that genuinely create the note pass the date explicitly.
@@ -230,7 +295,7 @@ export class IdentityRegistry {
       // SYNCHRONOUS local API mutates in place — the lane serializes async work,
       // so a rename or a delete lands inside this await — and this copy is what
       // makes such a change legible once the transaction returns.
-      const asked = { ...live }
+      const asked = copyRecord(live)
       const settlement = await this.persistence!.settleFileClaim({
         space: this.space,
         filePath,
@@ -274,6 +339,10 @@ export class IdentityRegistry {
     }
     const rec: IdentityRecord = {
       id: fileId,
+      legacyNameAliases: unionLegacyNameAliases(
+        owner?.legacyNameAliases ?? [],
+        current?.legacyNameAliases ?? [],
+      ),
       filePath,
       space: this.space,
       createdAt: owner?.createdAt ?? current?.createdAt ?? createdAt ?? this.iso(),
@@ -300,7 +369,7 @@ export class IdentityRegistry {
     if (settlement.status === 'duplicate-path-owner') {
       return { kind: 'duplicate', ownerPath: settlement.owner.filePath }
     }
-    const record = { ...settlement.record }
+    const record = copyRecord(settlement.record)
 
     if (settlement.status === 'foreign-owner') {
       this.installSettled(filePath, record, live, asked)
@@ -341,8 +410,14 @@ export class IdentityRegistry {
       asked.id === record.id && this.dirty.has(record.id) && live.createdAt !== record.createdAt
     const movedUnderUs = live.filePath !== asked.filePath
     const diedUnderUs = live.deletedAt !== asked.deletedAt
+    const aliases = unionLegacyNameAliases(
+      record.legacyNameAliases,
+      asked.legacyNameAliases,
+      live.legacyNameAliases,
+    )
     const settled: IdentityRecord = {
       ...record,
+      legacyNameAliases: aliases,
       filePath: movedUnderUs ? live.filePath : filePath,
       ...(pendingBirthDate ? { createdAt: live.createdAt } : {}),
       ...(diedUnderUs ? { deletedAt: live.deletedAt } : {}),
@@ -356,6 +431,176 @@ export class IdentityRegistry {
       this.markDirty(settled)
     } else {
       this.dirty.delete(settled.id)
+    }
+    if (asked.id !== settled.id) {
+      this.transferAliasDebt(asked.id, settled.id)
+    }
+  }
+
+  /** Remember a monotonic compatibility fact without turning the whole identity
+   * row into structural write-behind work. */
+  rememberLegacyNameAlias(id: string, alias: string): boolean {
+    if (!isLegacyNameAlias(alias)) {
+      return false
+    }
+    const record = this.byId.get(id)
+
+    if (!record || record.legacyNameAliases.includes(alias)) {
+      return false
+    }
+    record.legacyNameAliases = appendLegacyNameAlias(record.legacyNameAliases, alias)
+    const debt = this.aliasDebt.get(id) ?? new Set<string>()
+    debt.add(alias)
+    this.aliasDebt.set(id, debt)
+    return true
+  }
+
+  /** Persist one alias through the narrow column-only seam. A just-minted row is
+   * first established through the ordinary claim path; a foreign collision is
+   * reminted and the same alias follows the claimant to its final id. */
+  async persistLegacyNameAlias(id: string, alias: string): Promise<IdentityRecord | null> {
+    if (!isLegacyNameAlias(alias)) {
+      return null
+    }
+    this.rememberLegacyNameAlias(id, alias)
+
+    if (!this.persistence) {
+      const local = this.byId.get(id)
+      return local ? copyRecord(local) : null
+    }
+
+    return this.runSerialized(async () => {
+      let currentId = id
+
+      for (;;) {
+        const merged = await this.persistence!.mergeLegacyNameAlias({
+          id: currentId,
+          space: this.space,
+          alias,
+        })
+
+        if (merged.status === 'merged') {
+          const local = this.byId.get(merged.id)
+          const redirected = merged.id !== currentId
+          // A redirected ACK is also an authoritative lineage handoff. Even if
+          // the successor is present locally, that copy predates the remote
+          // settlement (typically it is still a tombstone), so only the fresh
+          // durable row can replace the retired claimant in the live maps.
+          const durable =
+            redirected || !local ? await this.persistence!.findById?.(merged.id) : null
+          const record = local ?? durable
+
+          if (!record || (redirected && (!durable || durable.space !== this.space))) {
+            return null
+          }
+          const legacyNameAliases = unionLegacyNameAliases(
+            merged.legacyNameAliases,
+            record.legacyNameAliases,
+            durable?.legacyNameAliases ?? [],
+          )
+
+          if (redirected) {
+            const installed = copyRecord({ ...durable!, legacyNameAliases })
+            const superseded = [...new Set([id, currentId])].filter(
+              (candidate) => candidate !== installed.id && this.byId.has(candidate),
+            )
+
+            for (const previousId of superseded) {
+              this.transferAliasDebt(previousId, installed.id)
+            }
+            this.installAuthoritative(installed)
+            for (const previousId of superseded) {
+              const previous = this.byId.get(previousId)
+
+              if (previous && this.byPath.get(previous.filePath)?.id === previousId) {
+                this.byPath.delete(previous.filePath)
+              }
+              this.byId.delete(previousId)
+              this.dirty.delete(previousId)
+              this.dropped.delete(previousId)
+              this.onRemint?.(previousId, installed.id)
+            }
+          } else if (local) {
+            local.legacyNameAliases = legacyNameAliases
+          }
+
+          for (const debtId of new Set([id, currentId, merged.id])) {
+            this.clearPersistedAliasDebt(debtId, merged.legacyNameAliases)
+          }
+
+          return copyRecord({ ...(redirected ? durable! : record), legacyNameAliases })
+        }
+        const record = this.byId.get(currentId)
+
+        if (!record) {
+          return null
+        }
+        const [claim] = await this.persistence!.claimMany([copyRecord(record)])
+
+        if (claim.status === 'claimed') {
+          record.legacyNameAliases = unionLegacyNameAliases(
+            claim.legacyNameAliases,
+            record.legacyNameAliases,
+          )
+          continue
+        }
+        const nextId = this.remintForeign(currentId)
+
+        if (!nextId) {
+          return null
+        }
+        currentId = nextId
+      }
+    })
+  }
+
+  private installAuthoritative(record: IdentityRecord): void {
+    const prior = this.byId.get(record.id)
+
+    if (prior && this.byPath.get(prior.filePath)?.id === prior.id) {
+      this.byPath.delete(prior.filePath)
+    }
+    const occupant = this.byPath.get(record.filePath)
+
+    if (occupant && occupant.id !== record.id) {
+      this.byId.delete(occupant.id)
+    }
+    const installed = copyRecord(record)
+
+    this.byId.set(installed.id, installed)
+    if (installed.deletedAt == null) {
+      this.byPath.set(installed.filePath, installed)
+    }
+    this.dirty.delete(installed.id)
+    this.dropped.delete(installed.id)
+  }
+
+  private transferAliasDebt(previousId: string, nextId: string): void {
+    const previous = this.aliasDebt.get(previousId)
+
+    if (!previous?.size || previousId === nextId) {
+      return
+    }
+    const next = this.aliasDebt.get(nextId) ?? new Set<string>()
+
+    for (const alias of previous) {
+      next.add(alias)
+    }
+    this.aliasDebt.delete(previousId)
+    this.aliasDebt.set(nextId, next)
+  }
+
+  private clearPersistedAliasDebt(id: string, aliases: readonly string[]): void {
+    const debt = this.aliasDebt.get(id)
+
+    if (!debt) {
+      return
+    }
+    for (const alias of aliases) {
+      debt.delete(alias)
+    }
+    if (!debt.size) {
+      this.aliasDebt.delete(id)
     }
   }
 
@@ -495,9 +740,9 @@ export class IdentityRegistry {
       const rec = live ?? dropped
 
       if (rec) {
-        batch.push({ ...rec })
+        batch.push(copyRecord(rec))
         if (!live && dropped) {
-          droppedInBatch.set(id, { ...dropped })
+          droppedInBatch.set(id, copyRecord(dropped))
         }
       }
       // A newer mutation of this id will put its current record back while
@@ -510,6 +755,16 @@ export class IdentityRegistry {
       for (const outcome of await this.persistence!.claimMany(batch)) {
         if (outcome.status === 'foreign-owner') {
           this.remintForeign(outcome.id)
+          continue
+        }
+        const live = this.byId.get(outcome.id)
+
+        if (live) {
+          live.legacyNameAliases = unionLegacyNameAliases(
+            outcome.legacyNameAliases,
+            live.legacyNameAliases,
+          )
+          this.clearPersistedAliasDebt(outcome.id, outcome.legacyNameAliases)
         }
       }
     } catch (err) {
@@ -528,16 +783,17 @@ export class IdentityRegistry {
   /** A minted id turned out to be another space's. Nothing is compensated after
    *  the fact and no owner is disturbed: this path takes a fresh id right here,
    *  in the same serialized operation that learned about the collision. */
-  private remintForeign(id: string): void {
+  private remintForeign(id: string): string | undefined {
     const rec = this.byId.get(id)
 
     if (!rec) {
       // A tombstone for a row that is not ours — there is nothing to retire, so
       // drop it instead of retrying the refusal forever.
       this.dropped.delete(id)
-      return
+      this.aliasDebt.delete(id)
+      return undefined
     }
-    const next: IdentityRecord = { ...rec, id: freshNoteId(), materialized: false }
+    const next: IdentityRecord = copyRecord({ ...rec, id: freshNoteId(), materialized: false })
 
     this.byId.delete(id)
     this.byId.set(next.id, next)
@@ -545,7 +801,9 @@ export class IdentityRegistry {
       this.byPath.set(rec.filePath, next)
     }
     this.markDirty(next)
+    this.transferAliasDebt(id, next.id)
     this.onRemint?.(id, next.id)
+    return next.id
   }
 
   /** The registry's persistence lane — see {@link lane}. The tail never rejects,
@@ -567,7 +825,7 @@ export class IdentityRegistry {
 
   private persistDrop(rec: IdentityRecord): void {
     rec.deletedAt = this.iso()
-    this.dropped.set(rec.id, rec)
+    this.dropped.set(rec.id, copyRecord(rec))
     this.dirty.add(rec.id)
     this.scheduleFlush()
   }

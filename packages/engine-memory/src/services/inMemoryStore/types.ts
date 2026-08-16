@@ -24,6 +24,8 @@ export type NoteSnapshot = {
   /** Alias-history (#100): past human names the resolver still honours. Seed it
    *  to exercise alias resolution; a rename through write() appends to it. */
   aliases?: string[]
+  /** Internal compatibility state used by seeds and exact engine-parity tests. */
+  legacyNameAliases?: readonly string[]
   /** The editable display slug (#100 phase 1): seed a CUSTOM slug to exercise the
    *  slug resolve key / canonical URL. Absent = the implicit slug(title). */
   slug?: string

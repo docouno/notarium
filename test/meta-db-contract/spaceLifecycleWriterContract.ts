@@ -55,6 +55,7 @@ export const describeSpaceLifecycleWriterContract = (
           target.db.identity.claimMany([
             {
               id: 'late-note',
+              legacyNameAliases: [],
               filePath: 'late.md',
               space: 'space-closing',
               createdAt: null,

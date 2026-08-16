@@ -769,9 +769,11 @@ const run = async (): Promise<void> => {
         }
         if (e.op === 'edit') {
           const current = await store.read(prev.id)
+          const route = e.path ? routeOf(e.path, prev.class) : undefined
           const res = await store.write({
             title: e.title ?? prev.title,
             content: e.content ?? current.content,
+            ...(route ? { directory: route.directory, fileName: route.fileName } : {}),
             tags: e.tags,
             frontmatter: e.frontmatter ? parseFrontmatterLines(e.frontmatter) : undefined,
             originalId: prev.id,
@@ -786,6 +788,9 @@ const run = async (): Promise<void> => {
           prev.versionToken = res.versionToken
           if (e.title) {
             prev.title = e.title
+          }
+          if (res.filePath) {
+            prev.filePath = res.filePath
           }
           edits++
         } else if (e.op === 'delete') {

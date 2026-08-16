@@ -18,17 +18,41 @@ import { InMemoryAgentSessions } from '../fake-server/agentSessions'
 import { InMemoryFavorites } from '../fake-server/favorites'
 import { InMemoryFolders } from '../fake-server/folders'
 import { InMemoryGatewayState } from '../fake-server/gatewayState'
+import { InMemoryIdentity } from '../fake-server/identity'
 import { InMemoryProjects } from '../fake-server/projects'
 import { describeAgentDeltaCursorsContract } from './agentDeltaCursorsContract'
 import { describeAgentSessionsContract } from './agentSessionsContract'
 import { describeCausalMetadataContract } from './causalMetadataContract'
 import { describeFavoritesContract } from './favoritesContract'
 import { describeGatewayStateContract } from './gatewayStateContract'
+import { describeLegacyNameAliasesContract } from './legacyNameAliasesContract'
 import { describeRevisionPersistenceContract } from './revisionPersistenceContract'
 
 describeGatewayStateContract('in-memory twin', async () => ({
   persistence: new InMemoryGatewayState(),
 }))
+
+describeLegacyNameAliasesContract('in-memory twin', async () => {
+  const identity = new InMemoryIdentity()
+
+  return {
+    alpha: identity,
+    beta: identity,
+    corruptAliases: async (id, raw) => {
+      const row = identity.rows.get(id)
+
+      if (row) {
+        row.legacyNameAliases = (() => {
+          try {
+            return JSON.parse(raw) as string[]
+          } catch {
+            return undefined as unknown as string[]
+          }
+        })()
+      }
+    },
+  }
+})
 
 describeAgentDeltaCursorsContract('in-memory twin', async () => {
   const persistence = new InMemoryAgentDeltaCursors()
@@ -77,10 +101,11 @@ describeCausalMetadataContract('in-memory twin', async () => {
     terminal,
     installation: new InMemoryInstallationGenerationPersistence(),
     ownerProofs,
-    setAddress: async (noteId, space, revision) => {
+    setAddress: async (noteId, space, revision, legacyNameAliases = []) => {
       ownerProofs.setAddress(noteId, space, revision)
       terminal.setIdentity({
         id: noteId,
+        legacyNameAliases,
         addressRevision: revision,
         filePath: `address-${revision}.md`,
         space,
@@ -89,6 +114,7 @@ describeCausalMetadataContract('in-memory twin', async () => {
         deletedAt: null,
       })
     },
+    getAddress: async (noteId) => terminal.identityForTest(noteId),
   }
 })
 
@@ -160,6 +186,7 @@ describe('in-memory restore terminal integrity parity', () => {
 
       terminal.setIdentity({
         id: noteId,
+        legacyNameAliases: [],
         addressRevision: 1,
         filePath: path,
         space,
@@ -209,6 +236,7 @@ describe('in-memory restore terminal integrity parity', () => {
         expectedIdentity: { addressRevision: 1, filePath: path, deletedAt: null },
         identity: {
           id: noteId,
+          legacyNameAliases: [],
           addressRevision: 1,
           filePath: path,
           space,
@@ -302,6 +330,7 @@ describe('in-memory restore terminal integrity parity', () => {
     )
     terminal.setIdentity({
       id: noteId,
+      legacyNameAliases: [],
       addressRevision: 1,
       filePath: path,
       space,
@@ -350,6 +379,7 @@ describe('in-memory restore terminal integrity parity', () => {
       expectedIdentity: { addressRevision: 1, filePath: path, deletedAt: at },
       identity: {
         id: noteId,
+        legacyNameAliases: [],
         addressRevision: 1,
         filePath: path,
         space,

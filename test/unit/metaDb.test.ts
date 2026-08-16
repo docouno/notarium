@@ -27,6 +27,7 @@ import type {
 
 const REC_A: IdentityRecord = {
   id: 'id-aaaaaaaa01',
+  legacyNameAliases: [],
   addressRevision: 1,
   filePath: 'demo/a.md',
   space: 'main',
@@ -36,6 +37,7 @@ const REC_A: IdentityRecord = {
 }
 const REC_B: IdentityRecord = {
   id: 'id-bbbbbbbb01',
+  legacyNameAliases: [],
   addressRevision: 1,
   filePath: 'demo/b.md',
   space: 'work',
@@ -321,6 +323,7 @@ describe('SqliteMetaDb', () => {
       await db.identity.claimMany([
         {
           id: 'n-gone',
+          legacyNameAliases: [],
           filePath: 'a.md',
           space: victim,
           createdAt: null,
@@ -329,6 +332,7 @@ describe('SqliteMetaDb', () => {
         },
         {
           id: 'n-keep',
+          legacyNameAliases: [],
           filePath: 'a.md',
           space: keep,
           createdAt: null,
@@ -1111,6 +1115,7 @@ describe('SqliteMetaDb', () => {
       const db = make()
       const record = {
         id: 'old-id',
+        legacyNameAliases: [],
         filePath: 'a.md',
         space: 'team',
         createdAt: null,

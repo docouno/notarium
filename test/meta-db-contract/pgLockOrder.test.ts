@@ -346,6 +346,7 @@ const identity = (over: Partial<IdentityRecord> & { id: string }): IdentityRecor
   materialized: true,
   deletedAt: null,
   ...over,
+  legacyNameAliases: over.legacyNameAliases ?? [],
 })
 
 const revision = (noteId: string, over: Partial<RevisionInput> = {}): RevisionInput => ({
@@ -594,6 +595,13 @@ describePostgres('Postgres lock order', { timeout: SUITE_TIMEOUT_MS }, () => {
           identity({ id: 'note-a' }),
           identity({ id: 'note-terminal', filePath: 'terminal.md' }),
         ]),
+      )
+      await run('identity.mergeLegacyNameAlias', () =>
+        db.identity.mergeLegacyNameAlias({
+          id: 'note-b',
+          space: 'alpha',
+          alias: 'historic-note-b',
+        }),
       )
       await run('ownerProofs.adopt', () =>
         db.ownerProofs.adopt({

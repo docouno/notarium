@@ -64,6 +64,7 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
       await testSchema.db.identity.claimMany([
         {
           id: 'id-concurrent',
+          legacyNameAliases: [],
           filePath: 'concurrent.md',
           space: 'space-a',
           createdAt: null,
@@ -114,6 +115,62 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
         ['ses_existingv1aa'],
       )
       expect(result.rows).toEqual([{ owner: 'alice', name: 'Existing', calls: '7', role: null }])
+    } finally {
+      client.release()
+      await pool.end()
+    }
+  })
+
+  it('adds an empty legacy alias set without guessing from existing names or paths', async () => {
+    const testSchema = await createSchema('migration_legacy_aliases')
+    const pool = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const client = await pool.connect()
+
+    try {
+      await runPgMigrations(client, migrations.slice(0, 10))
+      await client.query(
+        `INSERT INTO note_identity
+          (id, file_path, space, created_at, materialized, deleted_at)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        ['legacy-identity', 'aza-stan-zhospary.md', 'main', null, true, null],
+      )
+
+      await runPgMigrations(client, migrations)
+
+      const result = await client.query(
+        'SELECT file_path, legacy_name_aliases FROM note_identity WHERE id = $1',
+        ['legacy-identity'],
+      )
+      expect(result.rows).toEqual([
+        { file_path: 'aza-stan-zhospary.md', legacy_name_aliases: '[]' },
+      ])
+    } finally {
+      client.release()
+      await pool.end()
+    }
+  })
+
+  it('adds empty settlement lineage without inferring ancestry from existing paths', async () => {
+    const testSchema = await createSchema('migration_settlement_lineage')
+    const pool = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const client = await pool.connect()
+
+    try {
+      await runPgMigrations(client, migrations.slice(0, 12))
+      await client.query(
+        `INSERT INTO note_identity
+          (id, file_path, space, created_at, materialized, deleted_at, legacy_name_aliases)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        ['existing-identity', 'same.md', 'main', null, true, null, '[]'],
+      )
+
+      await runPgMigrations(client, migrations)
+
+      const result = await client.query(
+        'SELECT file_path, settlement_successor_id FROM note_identity WHERE id = $1',
+        ['existing-identity'],
+      )
+      expect(result.rows).toEqual([{ file_path: 'same.md', settlement_successor_id: null }])
     } finally {
       client.release()
       await pool.end()
@@ -689,6 +746,7 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
       await initial.identity.claimMany([
         {
           id: 'id-before-search-path-shift',
+          legacyNameAliases: [],
           filePath: 'before.md',
           space: 'space-a',
           createdAt: null,
@@ -727,6 +785,7 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
       await db.identity.claimMany([
         {
           id: 'real-row',
+          legacyNameAliases: [],
           filePath: 'real.md',
           space: 'space-a',
           createdAt: null,

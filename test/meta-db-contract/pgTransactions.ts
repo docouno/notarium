@@ -79,6 +79,7 @@ export const PG_TRANSACTIONS: readonly PgTransaction[] = [
 
   // Identity itself.
   { id: 'identity.claimMany', levels: ['L1'] },
+  { id: 'identity.mergeLegacyNameAlias', levels: ['L1'] },
   { id: 'ownerProofs.adopt', levels: ['L1'] },
   {
     // Takes the mutex through the quarantine closure, and re-enters L3t for the

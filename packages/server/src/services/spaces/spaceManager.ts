@@ -599,17 +599,11 @@ export class SpaceManager {
     if (!store.reconcile) {
       throw new Error(`space ${space} cannot reconcile causal outbox events`)
     }
-    const findById = this.metaDb?.identity.findById
-
-    if (findById) {
+    if (this.metaDb?.identity.findById) {
       const noteIds = resourceId ? [resourceId] : []
 
       for (const noteId of noteIds) {
-        const identity = await findById(noteId)
-
-        if (identity) {
-          await store.adoptCausalIdentity?.(identity)
-        }
+        await store.adoptCausalIdentity?.(noteId)
       }
     }
     await store.identityReady?.()

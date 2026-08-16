@@ -5,6 +5,11 @@ import type {
   IdentityPersistence,
   IdentityRecord,
 } from '@notarium/core'
+import {
+  appendLegacyNameAlias,
+  canonicalLegacyNameAliases,
+  unionLegacyNameAliases,
+} from '@notarium/core'
 
 import type { SqliteDriverCtx } from './context'
 import { rekeyReferences } from './identityRefs'
@@ -18,13 +23,16 @@ type IdentityRow = {
   materialized: number
   deleted_at: string | null
   address_revision: number | bigint
+  legacy_name_aliases: string | null
+  settlement_successor_id: string | null
 }
 
 const SELECT_COLUMNS =
-  'id, file_path, space, created_at, materialized, deleted_at, address_revision'
+  'id, file_path, space, created_at, materialized, deleted_at, address_revision, legacy_name_aliases, settlement_successor_id'
 
 const recordOfRow = (r: IdentityRow): IdentityRecord => ({
   id: r.id,
+  legacyNameAliases: canonicalLegacyNameAliases(parseJson(r.legacy_name_aliases)),
   filePath: r.file_path,
   space: r.space,
   createdAt: r.created_at,
@@ -33,11 +41,20 @@ const recordOfRow = (r: IdentityRow): IdentityRecord => ({
   addressRevision: Number(r.address_revision),
 })
 
+const parseJson = (raw: string | null): unknown => {
+  try {
+    return raw == null ? [] : JSON.parse(raw)
+  } catch {
+    return undefined
+  }
+}
+
 /** Upsert one row WITHOUT ever changing its space. The space guard is the whole
  *  point (#327): before it, a sibling space claiming an existing id simply
  *  overwrote `space`/`file_path` and the note changed owners on a poll order. */
-const UPSERT_SQL = `INSERT INTO note_identity (id, file_path, space, created_at, materialized, deleted_at)
-     VALUES (?, ?, ?, ?, ?, ?)
+const UPSERT_SQL = `INSERT INTO note_identity
+       (id, file_path, space, created_at, materialized, deleted_at, legacy_name_aliases)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        address_revision = note_identity.address_revision + CASE
          WHEN note_identity.file_path IS NOT excluded.file_path
@@ -46,8 +63,30 @@ const UPSERT_SQL = `INSERT INTO note_identity (id, file_path, space, created_at,
        file_path = excluded.file_path,
        created_at = excluded.created_at,
        materialized = excluded.materialized,
-       deleted_at = excluded.deleted_at
+       deleted_at = excluded.deleted_at,
+       settlement_successor_id = CASE
+         WHEN excluded.deleted_at IS NULL THEN NULL
+         ELSE note_identity.settlement_successor_id
+       END
      WHERE note_identity.space = excluded.space`
+
+const mergeAliases = (
+  db: SqliteDriverCtx['required'],
+  select: ReturnType<SqliteDriverCtx['required']['prepare']>,
+  id: string,
+  incoming: readonly string[],
+): readonly string[] => {
+  const row = select.get(id) as IdentityRow
+  const aliases = unionLegacyNameAliases(
+    canonicalLegacyNameAliases(parseJson(row.legacy_name_aliases)),
+    incoming,
+  )
+  db.prepare('UPDATE note_identity SET legacy_name_aliases = ? WHERE id = ?').run(
+    JSON.stringify(aliases),
+    id,
+  )
+  return aliases
+}
 
 export const createIdentityFacet = (ctx: SqliteDriverCtx): IdentityPersistence => ({
   init: () => ctx.ensureInit(),
@@ -87,8 +126,17 @@ export const createIdentityFacet = (ctx: SqliteDriverCtx): IdentityPersistence =
           outcomes.push({ id: r.id, status: 'foreign-owner', owner: recordOfRow(existing) })
           continue
         }
-        upsert.run(r.id, r.filePath, r.space, r.createdAt, r.materialized ? 1 : 0, r.deletedAt)
-        outcomes.push({ id: r.id, status: 'claimed' })
+        upsert.run(
+          r.id,
+          r.filePath,
+          r.space,
+          r.createdAt,
+          r.materialized ? 1 : 0,
+          r.deletedAt,
+          JSON.stringify(canonicalLegacyNameAliases(r.legacyNameAliases)),
+        )
+        const legacyNameAliases = mergeAliases(db, owner, r.id, r.legacyNameAliases)
+        outcomes.push({ id: r.id, status: 'claimed', legacyNameAliases })
       }
       db.exec('COMMIT')
     } catch (err) {
@@ -97,6 +145,56 @@ export const createIdentityFacet = (ctx: SqliteDriverCtx): IdentityPersistence =
     }
 
     return outcomes
+  },
+  mergeLegacyNameAlias: async ({ id, space, alias }) => {
+    await ctx.ensureInit()
+    const db = ctx.required
+    db.exec('BEGIN IMMEDIATE')
+    try {
+      const select = db.prepare(`SELECT ${SELECT_COLUMNS} FROM note_identity WHERE id = ?`)
+      const row = select.get(id) as IdentityRow | undefined
+
+      if (!row || row.space !== space) {
+        db.exec('COMMIT')
+        return { status: 'not-owned' } as const
+      }
+      const seen = new Set<string>()
+      let target = row
+
+      for (;;) {
+        if (seen.has(target.id)) {
+          throw new Error(`identity settlement successor cycle for ${id}`)
+        }
+        seen.add(target.id)
+        const successorId = target.settlement_successor_id
+
+        if (!successorId) {
+          break
+        }
+        if (!target.deleted_at) {
+          throw new Error(`live identity ${target.id} has a settlement successor`)
+        }
+        const successor = select.get(successorId) as IdentityRow | undefined
+
+        if (!successor || successor.space !== space) {
+          throw new Error(`identity settlement successor disappeared for ${target.id}`)
+        }
+        target = successor
+      }
+      const legacyNameAliases = appendLegacyNameAlias(
+        canonicalLegacyNameAliases(parseJson(target.legacy_name_aliases)),
+        alias,
+      )
+      db.prepare('UPDATE note_identity SET legacy_name_aliases = ? WHERE id = ?').run(
+        JSON.stringify(legacyNameAliases),
+        target.id,
+      )
+      db.exec('COMMIT')
+      return { status: 'merged', id: target.id, legacyNameAliases } as const
+    } catch (err) {
+      db.exec('ROLLBACK')
+      throw err
+    }
   },
   settleFileClaim: async ({ space, filePath, current, observedId, at }: IdentityFileClaim) => {
     await ctx.ensureInit()
@@ -112,7 +210,19 @@ export const createIdentityFacet = (ctx: SqliteDriverCtx): IdentityPersistence =
           // The durable owner is authoritative and untouched. The claimant keeps
           // its own id, made durable here so the convergence that rewrites the
           // file's frontmatter can never publish a half-settled identity.
-          const record: IdentityRecord = { ...current, space, filePath, deletedAt: null }
+          const currentRow = select.get(current.id) as IdentityRow | undefined
+          const record: IdentityRecord = {
+            ...current,
+            legacyNameAliases: unionLegacyNameAliases(
+              currentRow
+                ? canonicalLegacyNameAliases(parseJson(currentRow.legacy_name_aliases))
+                : [],
+              current.legacyNameAliases,
+            ),
+            space,
+            filePath,
+            deletedAt: null,
+          }
 
           upsert.run(
             record.id,
@@ -121,7 +231,9 @@ export const createIdentityFacet = (ctx: SqliteDriverCtx): IdentityPersistence =
             record.createdAt,
             record.materialized ? 1 : 0,
             record.deletedAt,
+            JSON.stringify(record.legacyNameAliases),
           )
+          record.legacyNameAliases = mergeAliases(db, select, record.id, record.legacyNameAliases)
           rekeyReferences(db, { space, fromId: observedId, toId: record.id })
           rekeyAndQuarantineRevisions(db, { space, fromId: observedId, toId: record.id })
 
@@ -141,13 +253,22 @@ export const createIdentityFacet = (ctx: SqliteDriverCtx): IdentityPersistence =
           return {
             status: 'duplicate-path-owner',
             owner: recordOfRow(ownerRow),
-            record: { ...current },
+            record: {
+              ...current,
+              legacyNameAliases: canonicalLegacyNameAliases(current.legacyNameAliases),
+            },
           }
         }
         // Free, tombstoned-and-ours, this very path's, or the claimant's own id
         // arriving at a new path: the file's claim is the path's identity.
+        const currentRow = select.get(current.id) as IdentityRow | undefined
         const record: IdentityRecord = {
           id: observedId,
+          legacyNameAliases: unionLegacyNameAliases(
+            ownerRow ? canonicalLegacyNameAliases(parseJson(ownerRow.legacy_name_aliases)) : [],
+            currentRow ? canonicalLegacyNameAliases(parseJson(currentRow.legacy_name_aliases)) : [],
+            current.legacyNameAliases,
+          ),
           filePath,
           space,
           createdAt: ownerRow?.created_at ?? current.createdAt ?? at,
@@ -167,7 +288,9 @@ export const createIdentityFacet = (ctx: SqliteDriverCtx): IdentityPersistence =
             current.createdAt,
             current.materialized ? 1 : 0,
             at,
+            JSON.stringify(canonicalLegacyNameAliases(current.legacyNameAliases)),
           )
+          mergeAliases(db, select, current.id, current.legacyNameAliases)
         }
         upsert.run(
           record.id,
@@ -176,10 +299,16 @@ export const createIdentityFacet = (ctx: SqliteDriverCtx): IdentityPersistence =
           record.createdAt,
           record.materialized ? 1 : 0,
           record.deletedAt,
+          JSON.stringify(record.legacyNameAliases),
         )
+        record.legacyNameAliases = mergeAliases(db, select, record.id, record.legacyNameAliases)
         if (current.id === observedId) {
           return { status: 'accepted', record }
         }
+        db.prepare('UPDATE note_identity SET settlement_successor_id = ? WHERE id = ?').run(
+          record.id,
+          current.id,
+        )
         rekeyReferences(db, { space, fromId: current.id, toId: record.id })
         rekeyAndQuarantineRevisions(db, { space, fromId: current.id, toId: record.id })
 

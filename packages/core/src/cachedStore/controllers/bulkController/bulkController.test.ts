@@ -15,6 +15,10 @@ const makeHost = () => {
     resumeBackground: () => {},
     flushIdentity: async () => {},
     syncLinkIdentities: () => {},
+    canonicalizeChanged: (upserts, removed) => ({
+      upserts: [...upserts],
+      removed: [...removed],
+    }),
     dispatchChanged: (upserts, removed, folders) => {
       dispatched.push({ upserts, removed, folders })
     },
@@ -177,6 +181,82 @@ describe('BulkController coalescing', () => {
     expect(bulk.isActive).toBe(false)
   })
 
+  it('lets shutdown join an in-flight timer broadcast before closing its host', async () => {
+    const { host, dispatched } = makeHost()
+    let announce!: () => void
+    let release!: () => void
+    const entered = new Promise<void>((resolve) => {
+      announce = resolve
+    })
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let synced = false
+
+    host.flushIdentity = async () => {
+      announce()
+      await blocked
+    }
+    host.syncLinkIdentities = () => {
+      synced = true
+    }
+    const bulk = new BulkController(host)
+
+    bulk.begin()
+    bulk.absorb(['timer-batch'], [])
+    const timer = vi.advanceTimersByTimeAsync(300)
+
+    await entered
+    bulk.teardown()
+    let settled = false
+    const settling = bulk.settle().then(() => {
+      settled = true
+    })
+
+    await Promise.resolve()
+    expect(settled).toBe(false)
+    release()
+    await timer
+    await settling
+    expect(synced).toBe(true)
+    expect(dispatched).toEqual([])
+  })
+
+  it('does not resume or schedule host work after teardown interrupts end', async () => {
+    const { host, dispatched } = makeHost()
+    let announce!: () => void
+    let release!: () => void
+    const entered = new Promise<void>((resolve) => {
+      announce = resolve
+    })
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const lateHostCalls: string[] = []
+
+    host.flushIdentity = async () => {
+      announce()
+      await blocked
+    }
+    host.resumeBackground = () => lateHostCalls.push('resume')
+    host.poll = () => lateHostCalls.push('poll')
+    host.refreshGraph = () => lateHostCalls.push('graph')
+    const bulk = new BulkController(host)
+
+    bulk.begin()
+    bulk.absorb(['end-batch'], [])
+    const ending = bulk.end()
+
+    await entered
+    bulk.teardown()
+    const settling = bulk.settle()
+
+    release()
+    await Promise.all([ending, settling])
+    expect(dispatched).toEqual([])
+    expect(lateHostCalls).toEqual([])
+  })
+
   it('does not dispatch or lose a batch when identity durability fails', async () => {
     const { host, dispatched } = makeHost()
     let attempts = 0
@@ -198,5 +278,110 @@ describe('BulkController coalescing', () => {
     await bulk.end()
     expect(dispatched.map((event) => event.upserts)).toEqual([['durable-later']])
     expect(bulk.isActive).toBe(false)
+  })
+
+  it('orders a final batch after identity handoff and graph repair', async () => {
+    const { host } = makeHost()
+    const calls: string[] = []
+
+    host.flushIdentity = async () => {
+      calls.push('identity')
+    }
+    host.syncLinkIdentities = () => {
+      calls.push('aliases')
+    }
+    host.flushGraphContext = async () => {
+      calls.push('graph')
+    }
+    host.dispatchChanged = () => {
+      calls.push('changed')
+    }
+    const bulk = new BulkController(host)
+
+    bulk.begin()
+    bulk.absorb(['a'], [])
+    await bulk.end()
+
+    expect(calls).toEqual(['identity', 'aliases', 'graph', 'changed'])
+  })
+
+  it('keeps timer broadcasts progressive and defers graph repair to final end', async () => {
+    const { host, dispatched } = makeHost()
+    let graphFlushes = 0
+
+    host.flushGraphContext = async () => {
+      graphFlushes++
+    }
+    const bulk = new BulkController(host)
+
+    bulk.begin()
+    bulk.absorb(['a'], [])
+    await vi.advanceTimersByTimeAsync(300)
+
+    expect(dispatched).toHaveLength(1)
+    expect(graphFlushes).toBe(0)
+
+    await bulk.end()
+    expect(graphFlushes).toBe(1)
+  })
+
+  it('restores the final batch and reopens end when graph repair fails', async () => {
+    const { host, dispatched } = makeHost()
+    let graphAttempts = 0
+
+    host.flushGraphContext = async () => {
+      graphAttempts++
+      if (graphAttempts === 1) {
+        throw new Error('graph unavailable')
+      }
+    }
+    const bulk = new BulkController(host)
+
+    bulk.begin()
+    bulk.absorb(['retry'], [])
+    await expect(bulk.end()).rejects.toThrow('graph unavailable')
+    expect(dispatched).toEqual([])
+    expect(bulk.isActive).toBe(true)
+
+    await bulk.end()
+    expect(dispatched.map((event) => event.upserts)).toEqual([['retry']])
+    expect(graphAttempts).toBe(2)
+  })
+
+  it('canonicalizes a detached provisional batch before dispatch', async () => {
+    const { host, dispatched } = makeHost()
+    const calls: string[] = []
+    let recovered = false
+
+    host.flushIdentity = async () => {
+      calls.push('identity')
+      recovered = true
+    }
+    host.syncLinkIdentities = () => {
+      calls.push('aliases')
+    }
+    host.canonicalizeChanged = () => {
+      calls.push('canonical')
+      return recovered
+        ? { upserts: ['final'], removed: ['provisional'] }
+        : { upserts: ['stale-provisional'], removed: [] }
+    }
+    host.flushGraphContext = async () => {
+      calls.push('graph')
+    }
+    host.dispatchChanged = (upserts, removed, folders) => {
+      calls.push('changed')
+      dispatched.push({ upserts, removed, folders })
+    }
+    const bulk = new BulkController(host)
+
+    bulk.begin()
+    bulk.absorb(['provisional'], [])
+    await bulk.end()
+
+    expect(dispatched).toEqual([
+      { upserts: ['final'], removed: ['provisional'], folders: ['dir/final'] },
+    ])
+    expect(calls).toEqual(['identity', 'aliases', 'canonical', 'graph', 'changed'])
   })
 })

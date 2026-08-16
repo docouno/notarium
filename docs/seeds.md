@@ -48,7 +48,10 @@ space-id — the consistency invariants from the task statement fall out «for f
    surfaces + a canon doc; cases tag `axes`. `make seed-coverage` prints the matrix; the
    coverage test fails on a gap.
 4. **Appliers** — `caseToFixture` (fake) and `scripts/seed.ts` (real). The case model is
-   a neutral **timeline** of events, from which BOTH projections are derived.
+   a neutral **timeline** of events, from which BOTH projections are derived. An `edit` may carry a
+   production-canonical destination `path`; both appliers preserve the identity minted by `create`,
+   move the note through their normal write seam, and keep the actual returned path for subsequent
+   delete/restore events.
 
 ## Content corpus (`corpus/*`)
 
@@ -108,6 +111,7 @@ and for `security` — it parses the sanitized HTML into a live DOM and checks t
 | `search-corpus` | a spotlight corpus: same-named notes, content/path-match, tag case-fold (#188/#204) | search, content |
 | `external-edits` | a direct same-size, mtime-preserving markdown rewrite: search marker + graph edge must self-heal on server boot/poll (#267) | search, graph, content |
 | `identity-collision` | one `notarium-id` planted in two spaces on disk: the arbiter must leave a single durable owner and re-mint the loser on the next boot (#327) | identity, structure, history |
+| `legacy-slug-links` | notes moved from old ASCII-only filenames onto Unicode paths: one unique legacy link survives delete/restore, while a two-owner old basename remains a ghost | identity, graph, search, history, trash, structure |
 | `name-collisions` | the states that flow from "a title picks the file name": a folder primed for the refusal dialog, an already-uniquified `Retro`/`Retro 2`/`Retro 3` family, the same title in two folders, and a folder page whose reserved `index.md` deliberately does not collide — [note-model.md](note-model.md#create-collisions) | identity, structure |
 
 **Content / reader:**

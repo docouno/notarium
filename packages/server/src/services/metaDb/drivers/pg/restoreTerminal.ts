@@ -1,6 +1,7 @@
 import { Buffer } from 'node:buffer'
 
 import {
+  canonicalLegacyNameAliases,
   CAUSAL_BARRIER_KIND,
   DOCUMENT_STATE_FORMAT,
   LOGICAL_NOTE_STATE_FORMAT,
@@ -8,6 +9,7 @@ import {
   RESTORE_TERMINAL_CONFLICT,
   type RestoreTerminalPersistence,
   REVISION_INTEGRITY,
+  unionLegacyNameAliases,
 } from '@notarium/core'
 
 import { restoreOperationOfRow, type RestoreOperationRow } from '../../causalRows'
@@ -36,6 +38,14 @@ type ProofRow = {
   proof_json: string
   receipt_id: string
   updated_at: string
+}
+
+const parsedAliases = (raw: string | null): readonly string[] => {
+  try {
+    return canonicalLegacyNameAliases(raw == null ? [] : JSON.parse(raw))
+  } catch {
+    return []
+  }
 }
 
 export const createRestoreTerminalFacet = (ctx: PgDriverCtx): RestoreTerminalPersistence => ({
@@ -247,6 +257,10 @@ export const createRestoreTerminalFacet = (ctx: PgDriverCtx): RestoreTerminalPer
         identity.space !== input.identity.space ||
         identity.deleted_at !== input.identity.deletedAt
       const addressRevision = Number(identity.address_revision) + (addressChanged ? 1 : 0)
+      const legacyNameAliases = unionLegacyNameAliases(
+        parsedAliases(identity.legacy_name_aliases),
+        input.identity.legacyNameAliases,
+      )
 
       // Finish every tier-1 write while the transaction is still at tier 1. The
       // source/head checks below may still reject the restore, but rollback then
@@ -254,7 +268,8 @@ export const createRestoreTerminalFacet = (ctx: PgDriverCtx): RestoreTerminalPer
       await client.query(
         `UPDATE note_identity SET
            file_path = $2, space = $3, created_at = $4, materialized = $5,
-           deleted_at = $6, address_revision = $7
+           deleted_at = $6, address_revision = $7, legacy_name_aliases = $8,
+           settlement_successor_id = NULL
          WHERE id = $1`,
         [
           input.identity.id,
@@ -264,6 +279,7 @@ export const createRestoreTerminalFacet = (ctx: PgDriverCtx): RestoreTerminalPer
           input.identity.materialized,
           input.identity.deletedAt,
           addressRevision,
+          JSON.stringify(legacyNameAliases),
         ],
       )
       // Match ordinary revision writers: CAS bytes are inserted before any

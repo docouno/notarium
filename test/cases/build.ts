@@ -136,6 +136,7 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
   const externalIdentityClaims: ExternalIdentityClaimDecl[] = []
   const events: CaseEvent[] = []
   const takenPaths = new Set<string>()
+  const currentPathByNote = new Map<string, string>()
   let hasAuth = false
 
   for (const { name, world } of parts) {
@@ -237,6 +238,22 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
           path = suffixName(e.path, n)
         }
         takenPaths.add(`${e.space}\0${path}`)
+        currentPathByNote.set(`${e.space}\0${noteId}`, path)
+        events.push({ ...e, noteId, path, ...(agentAudit ? { agentAudit } : {}) })
+      } else if (e.op === 'edit' && e.path) {
+        const noteKey = `${e.space}\0${noteId}`
+        const previousPath = currentPathByNote.get(noteKey)
+
+        if (previousPath) {
+          takenPaths.delete(`${e.space}\0${previousPath}`)
+        }
+        let path = e.path
+
+        for (let n = 2; takenPaths.has(`${e.space}\0${path}`); n++) {
+          path = suffixName(e.path, n)
+        }
+        takenPaths.add(`${e.space}\0${path}`)
+        currentPathByNote.set(noteKey, path)
         events.push({ ...e, noteId, path, ...(agentAudit ? { agentAudit } : {}) })
       } else {
         events.push({ ...e, noteId, ...(agentAudit ? { agentAudit } : {}) })

@@ -340,6 +340,42 @@ describe('NotariumStore — stable-id wikilinks', () => {
       rmSync(notesDir, { recursive: true, force: true })
     }
   })
+
+  it('uses legacy identity aliases in direct and graph resolution and withholds collisions', async () => {
+    const notesDir = mkdtempSync(join(tmpdir(), 'notarium-legacy-link-hint-'))
+    const store = createNotariumStore({ notesDir })
+
+    try {
+      const first = await store.write({ title: 'AҚB', content: 'first' })
+      const second = await store.write({ title: 'AҒB', content: 'second' })
+      const linker = await store.write({ title: 'Linker', content: 'see [[a-b]]' })
+
+      store.setLinkIdentities!([
+        { id: 'first-id', path: first.filePath!, legacyNameAliases: ['a-b'] },
+        { id: 'second-id', path: second.filePath! },
+      ])
+      expect((await store.read('a-b')).filePath).toBe(first.filePath)
+      expect((await store.graph()).links).toContainEqual(
+        expect.objectContaining({ source: linker.filePath, target: first.filePath }),
+      )
+
+      store.setLinkIdentities!([
+        { id: 'first-id', path: first.filePath!, legacyNameAliases: ['a-b'] },
+        { id: 'second-id', path: second.filePath!, legacyNameAliases: ['a-b'] },
+      ])
+      await expect(store.read('a-b')).rejects.toMatchObject({ isNotFound: true })
+      const graph = await store.graph()
+      expect(
+        graph.links.some(
+          ({ source, target }) => source === linker.filePath && target === first.filePath,
+        ),
+      ).toBe(false)
+      expect(graph.nodes).toContainEqual(expect.objectContaining({ ghost: true, target: 'a-b' }))
+    } finally {
+      await store.stop()
+      rmSync(notesDir, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('NotariumStore — exact raw path resolver parity', () => {

@@ -20,6 +20,7 @@ import {
   createNodeSqliteDriver,
   type FileStore,
   NotariumStore,
+  SpaceResourceAuthority,
 } from '@notarium/engine'
 
 import type { Principal } from '../../packages/server/src/services/authz'
@@ -61,8 +62,12 @@ describe('cross-space note-id collision (#327)', () => {
 
       mkdirSync(dir, { recursive: true })
       const storage = wrap ? wrap(createLocalFsFiles(dir)) : createLocalFsFiles(dir)
+      const resourceAuthority = new SpaceResourceAuthority(name, [
+        { id: 'notes', prefix: '', files: storage, physicalRoot: dir },
+      ])
       const engine = new NotariumStore({
         mounts: [{ class: 'user-doc', prefix: '', files: storage }],
+        resourceAuthority,
         sql: (wrapSql ?? ((driver) => driver))(createNodeSqliteDriver(':memory:')),
         // Keep the rotating source sweep out of the way: these tests count
         // repair publications, not background verification.
@@ -151,6 +156,70 @@ describe('cross-space note-id collision (#327)', () => {
       space: 'beta',
       filePath: 'copy.md',
       materialized: true,
+    })
+  })
+
+  it('moves through a late settlement successor without resurrecting the retired id', async () => {
+    const { meta, space } = world()
+    const alpha = space('alpha')
+    const provisionalId = 'provisional1'
+    const durableId = 'durable-id01'
+    const oldPath = 'aza-stan-zhospary.md'
+    const newPath = 'archive/current.md'
+    const at = '2026-06-11T12:00:00.000Z'
+
+    await meta.identity.init()
+    await meta.identity.claimMany([
+      {
+        id: durableId,
+        legacyNameAliases: [],
+        filePath: 'former.md',
+        space: 'alpha',
+        createdAt: '2026-06-10T00:00:00.000Z',
+        materialized: true,
+        deletedAt: at,
+      },
+    ])
+    write(alpha.dir, oldPath, noteWith(provisionalId, 'Қазақстан жоспары', 'alpha body'))
+    await alpha.store.start()
+    expect((await alpha.store.list())[0]).toMatchObject({ id: provisionalId, filePath: oldPath })
+
+    const provisional = await meta.identity.findById!(provisionalId)
+
+    expect(provisional).not.toBeNull()
+    await meta.identity.settleFileClaim({
+      space: 'alpha',
+      filePath: oldPath,
+      current: provisional!,
+      observedId: durableId,
+      at,
+    })
+
+    const changed: ChangedEvent[] = []
+
+    alpha.store.subscribe((event) => {
+      if (event.type === 'changed') {
+        changed.push(event)
+      }
+    })
+    const moved = await alpha.store.move({ id: provisionalId, destinationPath: newPath })
+
+    expect(moved).toMatchObject({ id: durableId, filePath: newPath })
+    expect(await alpha.store.list()).toMatchObject([{ id: durableId, filePath: newPath }])
+    expect(readFileSync(join(alpha.dir, newPath), 'utf8')).toContain(
+      `${NOTE_ID_FRONTMATTER_KEY}: ${durableId}`,
+    )
+    expect(await meta.identity.findById!(provisionalId)).toMatchObject({
+      deletedAt: expect.any(String),
+    })
+    expect(await meta.identity.findById!(durableId)).toMatchObject({
+      filePath: newPath,
+      deletedAt: null,
+    })
+    expect(changed).toHaveLength(1)
+    expect(changed[0]).toMatchObject({
+      upserts: expect.arrayContaining([durableId]),
+      removed: expect.arrayContaining([provisionalId]),
     })
   })
 

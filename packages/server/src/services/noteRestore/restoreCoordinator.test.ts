@@ -1,4 +1,14 @@
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import {
+  copyFile,
+  link,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  unlink,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -132,6 +142,7 @@ const fixture = async (options: FixtureOptions = {}) => {
   await metaDb.identity.claimMany([
     {
       id: noteId,
+      legacyNameAliases: [],
       addressRevision: 1,
       filePath: targetPath,
       space: 'space-a',
@@ -229,6 +240,7 @@ const fixture = async (options: FixtureOptions = {}) => {
   return {
     metaDb,
     authority,
+    notesDir,
     noteId,
     targetPath,
     sourceState,
@@ -241,6 +253,451 @@ const fixture = async (options: FixtureOptions = {}) => {
 }
 
 describe('RestoreCoordinator recovery seams', () => {
+  const legacyCurrentState = () =>
+    analyzeDocumentState({
+      source: new TextEncoder().encode(
+        '---\nnotarium-id: 550e8400-e29b-41d4-a716-446655440000\ntitle: Қазақстан жоспары\n---\ncurrent body\n',
+      ),
+      pathFallbackTitle: 'aza-stan-zhospary',
+    })
+
+  const prepareLegacyV1Operation = async () => {
+    const currentState = legacyCurrentState()
+    const f = await fixture({
+      targetPath: 'aza-stan-zhospary.md',
+      currentState,
+    })
+    const identityWithoutPersistence = new Proxy(f.metaDb.identity, {
+      get: (target, property, receiver) => {
+        if (property === 'mergeLegacyNameAlias') {
+          return async ({ id, alias }: { id: string; alias: string }) => ({
+            status: 'merged' as const,
+            id,
+            legacyNameAliases: [alias],
+          })
+        }
+        const value = Reflect.get(target, property, receiver) as unknown
+
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+    const interruptedAuthority = proxiedAuthority(f.authority, async () => {
+      throw new Error('pause before physical publication')
+    })
+    const pending = await f
+      .coordinator(
+        proxiedMetaDb(f.metaDb, { identity: identityWithoutPersistence }),
+        interruptedAuthority,
+      )
+      .execute({
+        ...f.command,
+        versionToken: documentStateVersionToken(currentState),
+      })
+
+    expect(pending).toMatchObject({ status: 'pending', phase: 'prepared' })
+    if (pending.status !== 'pending') {
+      throw new Error(`expected prepared operation, got ${pending.status}`)
+    }
+    const operation = await f.metaDb.restoreOperations.get(pending.operationId)
+
+    if (!operation?.preparedEvidence) {
+      throw new Error('prepared operation has no evidence')
+    }
+    const evidence = JSON.parse(operation.preparedEvidence) as Record<string, unknown> & {
+      identity: { legacyNameAliases?: string[] }
+    }
+
+    evidence.version = 1
+    delete evidence.legacyNameAliases
+    evidence.identity.legacyNameAliases = []
+    const downgradedEvidence = JSON.stringify(evidence)
+    const downgraded = await f.metaDb.restoreOperations.transition({
+      id: operation.id,
+      expectedPhases: [RESTORE_OPERATION_PHASE.prepared],
+      expectedPreparedEvidence: operation.preparedEvidence,
+      phase: RESTORE_OPERATION_PHASE.prepared,
+      preparedEvidence: downgradedEvidence,
+      updatedAt: '2026-08-11T00:02:00.000Z',
+    })
+
+    expect(downgraded.status).toBe('transitioned')
+    await expect(f.metaDb.identity.findById!(f.noteId)).resolves.toMatchObject({
+      legacyNameAliases: [],
+    })
+    return { f, currentState, operationId: operation.id }
+  }
+
+  it('persists exact legacy basename evidence before restoring over the live file', async () => {
+    const currentState = legacyCurrentState()
+    const f = await fixture({
+      targetPath: 'aza-stan-zhospary.md',
+      currentState,
+    })
+    const result = await f.coordinator().execute({
+      ...f.command,
+      versionToken: documentStateVersionToken(currentState),
+    })
+
+    expect(result).toMatchObject({ status: 'succeeded' })
+    await expect(f.metaDb.identity.findById!(f.noteId)).resolves.toMatchObject({
+      legacyNameAliases: ['aza-stan-zhospary'],
+    })
+    await f.metaDb.close()
+  })
+
+  it('upgrades staged pre-compatibility evidence from the exact original source', async () => {
+    const { f, currentState } = await prepareLegacyV1Operation()
+    const result = await f.coordinator().execute({
+      ...f.command,
+      versionToken: documentStateVersionToken(currentState),
+    })
+
+    expect(result).toMatchObject({ status: 'succeeded' })
+    await expect(f.metaDb.identity.findById!(f.noteId)).resolves.toMatchObject({
+      legacyNameAliases: ['aza-stan-zhospary'],
+    })
+    await f.metaDb.close()
+  })
+
+  it('rejects a staged pre-compatibility claim mismatch without persisting an alias', async () => {
+    const { f, currentState } = await prepareLegacyV1Operation()
+    const mismatchedAuthority = new Proxy(f.authority, {
+      get: (target, property, receiver) => {
+        if (property === 'inspectStrict') {
+          return async (request: Parameters<SpaceResourceAuthority['inspectStrict']>[0]) => {
+            const state = await f.authority.inspectStrict(request)
+
+            return state.status === 'staged'
+              ? {
+                  ...state,
+                  stage: {
+                    ...state.stage,
+                    expected: { kind: 'present' as const, value: 'mismatched-stage-claim' },
+                  },
+                }
+              : state
+          }
+        }
+        const value = Reflect.get(target, property, receiver) as unknown
+
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+    const result = await f.coordinator(f.metaDb, mismatchedAuthority).execute({
+      ...f.command,
+      versionToken: documentStateVersionToken(currentState),
+    })
+
+    expect(result).toMatchObject({ status: 'conflict', reason: 'physical-target-changed' })
+    await expect(f.metaDb.identity.findById!(f.noteId)).resolves.toMatchObject({
+      legacyNameAliases: [],
+    })
+    await f.metaDb.close()
+  })
+
+  it('does not upgrade pre-compatibility evidence when its strict stage is missing', async () => {
+    const { f, currentState } = await prepareLegacyV1Operation()
+    const missingAuthority = new Proxy(f.authority, {
+      get: (target, property, receiver) => {
+        if (property === 'inspectStrict') {
+          return async () => ({ status: 'missing' as const })
+        }
+        const value = Reflect.get(target, property, receiver) as unknown
+
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+    const result = await f.coordinator(f.metaDb, missingAuthority).execute({
+      ...f.command,
+      versionToken: documentStateVersionToken(currentState),
+    })
+
+    expect(result).toMatchObject({ status: 'pending', phase: 'failed-recoverable' })
+    await expect(f.metaDb.identity.findById!(f.noteId)).resolves.toMatchObject({
+      legacyNameAliases: [],
+    })
+    await f.metaDb.close()
+  })
+
+  it('preserves a failed-recoverable pre-compatibility stage without inspecting public bytes', async () => {
+    const { f, currentState } = await prepareLegacyV1Operation()
+    const failedAuthority = new Proxy(f.authority, {
+      get: (target, property, receiver) => {
+        if (property === 'inspectStrict') {
+          return async (request: Parameters<SpaceResourceAuthority['inspectStrict']>[0]) => {
+            const state = await f.authority.inspectStrict(request)
+
+            if (state.status !== 'staged') {
+              return state
+            }
+
+            return {
+              status: 'failed-recoverable' as const,
+              stage: state.stage,
+              reason: 'interrupted publication',
+              recoveryPaths: [],
+            }
+          }
+        }
+        const value = Reflect.get(target, property, receiver) as unknown
+
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+    const result = await f.coordinator(f.metaDb, failedAuthority).execute({
+      ...f.command,
+      versionToken: documentStateVersionToken(currentState),
+    })
+
+    expect(result).toMatchObject({ status: 'pending', phase: 'failed-recoverable' })
+    await expect(f.metaDb.identity.findById!(f.noteId)).resolves.toMatchObject({
+      legacyNameAliases: [],
+    })
+    await f.metaDb.close()
+  })
+
+  it('keeps a real post-effect publishing stage recoverable without rejecting its operation', async () => {
+    const { f, currentState, operationId } = await prepareLegacyV1Operation()
+    const [stageName] = await readdir(join(f.notesDir, '.notarium-fs-ops'))
+
+    if (!stageName) {
+      throw new Error('strict stage directory is missing')
+    }
+    const stageDir = join(f.notesDir, '.notarium-fs-ops', stageName)
+    const publication = join(stageDir, 'publication')
+
+    await writeFile(join(stageDir, 'publishing'), '')
+    await copyFile(join(stageDir, 'candidate'), publication)
+    await unlink(join(f.notesDir, f.targetPath))
+    await link(publication, join(f.notesDir, f.targetPath))
+    await expect(
+      f.authority.inspectStrict({
+        operationId,
+        binding: (await f.metaDb.restoreOperations.get(operationId))!.stageBinding,
+        path: f.targetPath,
+      }),
+    ).resolves.toMatchObject({ status: 'publishing' })
+
+    const result = await f.coordinator().execute({
+      ...f.command,
+      versionToken: documentStateVersionToken(currentState),
+    })
+
+    expect(result).toMatchObject({ status: 'pending', phase: 'failed-recoverable' })
+    await expect(f.metaDb.restoreOperations.get(operationId)).resolves.toMatchObject({
+      phase: RESTORE_OPERATION_PHASE.failedRecoverable,
+    })
+    await expect(f.metaDb.identity.findById!(f.noteId)).resolves.toMatchObject({
+      legacyNameAliases: [],
+    })
+    await expect(
+      f.authority.inspectStrict({
+        operationId,
+        binding: (await f.metaDb.restoreOperations.get(operationId))!.stageBinding,
+        path: f.targetPath,
+      }),
+    ).resolves.toMatchObject({ status: 'publishing' })
+    await f.metaDb.close()
+  })
+
+  it('keeps a real receipt-backed failed stage and its recovery artifacts intact', async () => {
+    const { f, currentState, operationId } = await prepareLegacyV1Operation()
+    const operation = await f.metaDb.restoreOperations.get(operationId)
+
+    if (!operation) {
+      throw new Error('prepared restore operation is missing')
+    }
+    const ref = {
+      operationId,
+      binding: operation.stageBinding,
+      path: f.targetPath,
+    }
+    await expect(f.authority.publishStrictAdmitted(ref)).resolves.toMatchObject({
+      status: 'published',
+    })
+
+    await unlink(join(f.notesDir, f.targetPath))
+    await writeFile(join(f.notesDir, f.targetPath), currentState.source)
+    const failed = await f.authority.inspectStrict(ref)
+
+    expect(failed).toMatchObject({
+      status: 'failed-recoverable',
+      reason: 'published candidate no longer owns the public pathname',
+      recoveryPaths: expect.arrayContaining([expect.stringContaining('strict-')]),
+    })
+    const [stageName] = await readdir(join(f.notesDir, '.notarium-fs-ops'))
+
+    if (!stageName) {
+      throw new Error('strict stage directory is missing')
+    }
+    const stageDir = join(f.notesDir, '.notarium-fs-ops', stageName)
+    const artifactsBefore = await readdir(stageDir)
+
+    expect(artifactsBefore).toEqual(
+      expect.arrayContaining(['candidate', 'failure.json', 'header.json', 'receipt.json']),
+    )
+    const result = await f.coordinator().execute({
+      ...f.command,
+      versionToken: documentStateVersionToken(currentState),
+    })
+
+    expect(result).toMatchObject({ status: 'pending', phase: 'failed-recoverable' })
+    await expect(f.metaDb.restoreOperations.get(operationId)).resolves.toMatchObject({
+      phase: RESTORE_OPERATION_PHASE.failedRecoverable,
+    })
+    await expect(f.metaDb.identity.findById!(f.noteId)).resolves.toMatchObject({
+      legacyNameAliases: [],
+    })
+    await expect(f.authority.inspectStrict(ref)).resolves.toMatchObject({
+      status: 'failed-recoverable',
+      reason: 'published candidate no longer owns the public pathname',
+    })
+    expect(await readdir(stageDir)).toEqual(artifactsBefore)
+    expect((await readFile(join(stageDir, 'receipt.json'))).byteLength).toBeGreaterThan(0)
+    expect((await readFile(join(stageDir, 'failure.json'))).byteLength).toBeGreaterThan(0)
+    await f.metaDb.close()
+  })
+
+  it.each([
+    [
+      'an unproven owner',
+      new TextEncoder().encode('---\nnotarium-id: &owner broken\ncopy: *owner\n---\nbody'),
+    ],
+    [
+      'a foreign owner',
+      new TextEncoder().encode(
+        '---\nnotarium-id: 550e8400-e29b-41d4-a716-446655440099\ntitle: Foreign\n---\nbody',
+      ),
+    ],
+  ])('rejects %s while upgrading pre-compatibility evidence', async (_, bytes) => {
+    const { f, currentState } = await prepareLegacyV1Operation()
+    const unsafeAuthority = new Proxy(f.authority, {
+      get: (target, property, receiver) => {
+        if (property === 'observeStrictAdmitted') {
+          return async (path: string) => {
+            const observation = await f.authority.observeStrictAdmitted(path)
+
+            return observation.kind === 'present' ? { ...observation, bytes } : observation
+          }
+        }
+        const value = Reflect.get(target, property, receiver) as unknown
+
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+    const result = await f.coordinator(f.metaDb, unsafeAuthority).execute({
+      ...f.command,
+      versionToken: documentStateVersionToken(currentState),
+    })
+
+    expect(result).toMatchObject({ status: 'conflict', reason: 'physical-target-changed' })
+    await expect(f.metaDb.identity.findById!(f.noteId)).resolves.toMatchObject({
+      legacyNameAliases: [],
+    })
+    await f.metaDb.close()
+  })
+
+  it('rejects a current observation claim mismatch separately from the staged claim', async () => {
+    const { f, currentState } = await prepareLegacyV1Operation()
+    const mismatchedAuthority = new Proxy(f.authority, {
+      get: (target, property, receiver) => {
+        if (property === 'observeStrictAdmitted') {
+          return async (path: string) => {
+            const observation = await f.authority.observeStrictAdmitted(path)
+
+            return 'claim' in observation
+              ? {
+                  ...observation,
+                  claim: { kind: 'present' as const, value: 'mismatched-current-claim' },
+                }
+              : observation
+          }
+        }
+        const value = Reflect.get(target, property, receiver) as unknown
+
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+    const result = await f.coordinator(f.metaDb, mismatchedAuthority).execute({
+      ...f.command,
+      versionToken: documentStateVersionToken(currentState),
+    })
+
+    expect(result).toMatchObject({ status: 'conflict', reason: 'physical-target-changed' })
+    await expect(f.metaDb.identity.findById!(f.noteId)).resolves.toMatchObject({
+      legacyNameAliases: [],
+    })
+    await f.metaDb.close()
+  })
+
+  it('rejects an ownerless source after its durable identity moved to another path', async () => {
+    const { f, currentState } = await prepareLegacyV1Operation()
+    const durable = await f.metaDb.identity.findById?.(f.noteId)
+
+    if (!durable) {
+      throw new Error('fixture identity disappeared')
+    }
+    await f.metaDb.identity.claimMany([{ ...durable, filePath: 'moved.md' }])
+    const ownerlessAuthority = new Proxy(f.authority, {
+      get: (target, property, receiver) => {
+        if (property === 'observeStrictAdmitted') {
+          return async (path: string) => {
+            const observation = await f.authority.observeStrictAdmitted(path)
+
+            return observation.kind === 'present'
+              ? {
+                  ...observation,
+                  bytes: new TextEncoder().encode(
+                    '---\ntitle: Қазақстан жоспары\n---\ncurrent body',
+                  ),
+                }
+              : observation
+          }
+        }
+        const value = Reflect.get(target, property, receiver) as unknown
+
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+    const result = await f.coordinator(f.metaDb, ownerlessAuthority).execute({
+      ...f.command,
+      versionToken: documentStateVersionToken(currentState),
+    })
+
+    expect(result).toMatchObject({ status: 'conflict', reason: 'physical-target-changed' })
+    await expect(f.metaDb.identity.findById!(f.noteId)).resolves.toMatchObject({
+      legacyNameAliases: [],
+      filePath: 'moved.md',
+    })
+    await f.metaDb.close()
+  })
+
+  it('does not infer a legacy alias after a pre-compatibility stage is already published', async () => {
+    const { f, currentState, operationId } = await prepareLegacyV1Operation()
+    const operation = await f.metaDb.restoreOperations.get(operationId)
+
+    if (!operation) {
+      throw new Error('prepared operation disappeared')
+    }
+    const publication = await f.authority.publishStrictAdmitted({
+      operationId: operation.id,
+      binding: operation.stageBinding,
+      path: operation.targetPath ?? f.targetPath,
+    })
+
+    expect(publication.status).toBe('published')
+    const result = await f.coordinator().execute({
+      ...f.command,
+      versionToken: documentStateVersionToken(currentState),
+    })
+
+    expect(result).toMatchObject({ status: 'succeeded' })
+    await expect(f.metaDb.identity.findById!(f.noteId)).resolves.toMatchObject({
+      legacyNameAliases: [],
+    })
+    await f.metaDb.close()
+  })
+
   it('returns a resumable staged operation when admission is busy after acceptance', async () => {
     const f = await fixture()
     const busyAuthority = new Proxy(f.authority, {

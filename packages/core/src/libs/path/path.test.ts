@@ -10,6 +10,7 @@ import {
   isPortablePathComponent,
   isPortableRelativeDestination,
   isSkillPackageRootPath,
+  legacyNoteNameAlias,
   normalizeSafeRelativePath,
   noteFileBase,
   noteFilePath,
@@ -162,6 +163,23 @@ describe('noteFileBase', () => {
     expect(reserved).toMatch(/^~con-[a-f0-9]{24}$/)
     expect(isPortablePathComponent(`${reserved}.md`)).toBe(true)
     expect(reserved).not.toBe(noteFileBase(reserved))
+  })
+})
+
+describe('legacyNoteNameAlias', () => {
+  it('recognises only an exact obsolete title-derived basename', () => {
+    const title = 'Қазақстан жоспары'
+    const alias = 'aza-stan-zhospary'
+
+    expect(legacyNoteNameAlias(title, `archive/${alias}.md`)).toBe(alias)
+    expect(legacyNoteNameAlias(title, `archive/${alias}.MD`)).toBe(alias)
+    expect(legacyNoteNameAlias(title, 'archive/arbitrary.md')).toBeNull()
+    expect(legacyNoteNameAlias(title, 'archive/қазақстан-жоспары.md')).toBeNull()
+  })
+
+  it('rejects empty and still-current legacy keys', () => {
+    expect(legacyNoteNameAlias('第三季度规划', '.md')).toBeNull()
+    expect(legacyNoteNameAlias('Планы', 'plany.md')).toBeNull()
   })
 })
 

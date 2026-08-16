@@ -184,6 +184,31 @@ describe('revision journal (#12) — write-through', () => {
     expect(detail?.logicalState?.markdown).toContain('tags:\n- metal')
   })
 
+  it('does not block an identity-engine edit when optional baseline history is unavailable', async () => {
+    const { store, persistence } = await make()
+    const before = await store.read(TITANIUM)
+
+    persistence.hasAnyFor = async () => {
+      throw new Error('revision history unavailable')
+    }
+
+    await expect(
+      store.write({
+        title: 'Titanium',
+        directory: 'demo',
+        content: 'edited despite journal outage',
+        tags: ['metal'],
+        originalId: TITANIUM,
+        versionToken: before.versionToken,
+        principal: 'ui',
+      }),
+    ).resolves.toMatchObject({ id: TITANIUM })
+    await expect(store.read(TITANIUM)).resolves.toMatchObject({
+      content: 'edited despite journal outage',
+    })
+    await store.settle()
+  })
+
   it('a brand-new note journals one write revision, no baseline', async () => {
     const { store } = await make()
     const res = await store.write({

@@ -5,6 +5,7 @@
 import type {
   DocumentState,
   DocumentStateFormat,
+  ExactOwnerObservation,
   FrontmatterEntry,
   LogicalNoteState,
   RestoreSafety,
@@ -325,6 +326,8 @@ export type RevisionPersistence = {
  *  files (the meta-DB's first tenant). canon: docs/architecture.md#p7 */
 export type IdentityRecord = {
   id: string
+  /** Proven pre-Unicode bare name keys that remain addressable for this identity. */
+  legacyNameAliases: readonly string[]
   /** DB-owned monotonic revision of the live/tombstoned address binding.
    * Optional on write inputs and normalized by persistent drivers on reads. */
   addressRevision?: number
@@ -347,7 +350,18 @@ export type IdentityRecord = {
 /** What a batch claim did to ONE record. A row whose id already belongs to a DIFFERENT space is
  *  refused, never stolen — the registry remints and the caller re-keys. */
 export type IdentityClaimOutcome =
-  { id: string; status: 'claimed' } | { id: string; status: 'foreign-owner'; owner: IdentityRecord }
+  | { id: string; status: 'claimed'; legacyNameAliases: readonly string[] }
+  | { id: string; status: 'foreign-owner'; owner: IdentityRecord }
+
+export type IdentityLegacyNameAliasMergeOutcome =
+  | {
+      status: 'merged'
+      /** The exact row that received the alias. A superseded id may resolve through durable
+       * settlement lineage; ordinary path reuse never creates that lineage. */
+      id: string
+      legacyNameAliases: readonly string[]
+    }
+  | { status: 'not-owned' }
 
 /** One file's frontmatter id claim, put to the GLOBAL registry for arbitration. */
 export type IdentityFileClaim = {
@@ -411,6 +425,14 @@ export type IdentityPersistence = {
   /** Idempotent batch claim by id. A row is written only while the id is free or already this
    *  space's — an id owned elsewhere comes back as `foreign-owner` instead of changing owners. */
   claimMany(records: readonly IdentityRecord[]): Promise<IdentityClaimOutcome[]>
+  /** Atomically add one compatibility name to an existing row owned by `space`, following only
+   * durable settlement lineage when `id` was superseded. No other identity field may change,
+   * ordinary same-path reuse is unrelated, and a missing/foreign row is never inserted. */
+  mergeLegacyNameAlias(input: {
+    id: string
+    space: string
+    alias: string
+  }): Promise<IdentityLegacyNameAliasMergeOutcome>
   /** Arbitrate one file's frontmatter claim against the global registry and carry out the whole
    *  transition — identity rows, this space's references and its revision history — in ONE
    *  transaction. The authoritative outcome is what the registry commits to its maps. */
@@ -493,6 +515,9 @@ export type NoteMeta = {
   /** Past human names the resolver still honours so a rename never breaks inbound [[Old Name]].
    *  RAW strings, slugified on lookup; the index view of frontmatter `aliases:`. */
   aliases?: string[]
+  /** Registry-owned compatibility aliases inferred from exact historical storage
+   * evidence. Internal only; ordinary transport mappers omit them. */
+  legacyNameAliases?: readonly string[]
   /** The note's tags, as authored. On the snapshot this is THE tag axis (Feed/graph filter, facet,
    *  histogram), matched via the shared `foldTag`/`matchesTags`. */
   tags?: string[]
@@ -522,6 +547,11 @@ export type NoteContent = {
   slug?: string
   /** Same data as NoteMeta.aliases, served so a client can round-trip them. */
   aliases?: string[]
+  /** Same internal compatibility axis as NoteMeta. */
+  legacyNameAliases?: readonly string[]
+  /** Adapter-opaque identity of the exact bytes returned by this read, paired with
+   * a fail-closed observation of their storage-owner claim. Internal only. */
+  physicalIncarnation?: PhysicalIncarnation
   modifiedAt?: string | null
   /** The resolved creation instant (frontmatter `created:` over file birthtime) — served so the
    *  editor prefills the date field without re-parsing frontmatter. */
@@ -641,6 +671,9 @@ export type WriteInput = {
   ifExists?: IfExists
   /** The version the editor read. REQUIRED with originalId (CAS). */
   versionToken?: string
+  /** Exact physical source observed by the read-model before an existing-note
+   * write. Internal only; engines that receive it must bind publication to it. */
+  expectedSource?: PhysicalIncarnation
   /** Identity materialization channel: when set the engine writes it into frontmatter
    *  (`notarium-id`). Engines that can't ignore it. */
   id?: string
@@ -751,9 +784,23 @@ export type WriteResult = {
   /** Adapter-opaque proof of the exact physical incarnation published by this
    * write. Conditional compensation must match it, not a semantic CAS token. */
   physicalWriteClaim?: PhysicalWriteClaim
+  /** Complete internal alias state after the write. */
+  legacyNameAliases?: readonly string[]
 }
 
 export type PhysicalWriteClaim = { kind: string; value: string }
+
+export type PhysicalIncarnation = {
+  claim: PhysicalWriteClaim
+  owner: ExactOwnerObservation
+}
+
+export type MoveResult = {
+  id?: string
+  filePath?: string
+  versionToken?: string
+  legacyNameAliases?: readonly string[]
+}
 
 export type MoveInput = {
   /** A note-id, or — with isDirectory — the folder's storage path (folders have no identity beyond
@@ -763,6 +810,9 @@ export type MoveInput = {
   isDirectory?: boolean
   /** Internal engine-boundary discriminator for an enveloped note id. */
   identityOnly?: boolean
+  /** Exact source bytes and owner observation captured by the caller before a
+   * single-note destructive effect. Directory moves do not use it. */
+  expectedSource?: PhysicalIncarnation
 }
 
 /** The restore flow: write the journaled revision's state back through the CAS path (the
@@ -1030,7 +1080,13 @@ export type KnowledgeStore = {
   /** Authoritative stable-id → storage-path hints from an identity-owning decorator.
    *  A bare engine keys graph nodes by path but must still resolve authored `[[id]]`
    *  exactly, including unclaimed external files and copied duplicate claims. */
-  setLinkIdentities?(identities: ReadonlyArray<{ id: string; path: string }>): void
+  setLinkIdentities?(
+    identities: ReadonlyArray<{
+      id: string
+      path: string
+      legacyNameAliases?: readonly string[]
+    }>,
+  ): void
   /** Bring ONE storage path onto `targetId` and PROVE the exact index row describes those very
    *  bytes — the convergence behind the global id arbiter (#327). OPTIONAL: without it a losing
    *  claimant's file keeps naming another space's note until someone saves through us (honest
@@ -1061,7 +1117,7 @@ export type KnowledgeStore = {
   graph(opts?: ReadSurfaceOptions): Promise<Graph>
   graphHealth?(): Promise<GraphHealth>
   write(input: WriteInput, opts?: MutationOptions): Promise<WriteResult>
-  move(input: MoveInput, opts?: MutationOptions): Promise<void>
+  move(input: MoveInput, opts?: MutationOptions): Promise<MoveResult>
   /** `principal` is journal attribution — engines without a journal ignore it. */
   remove(
     id: string,
@@ -1073,6 +1129,8 @@ export type KnowledgeStore = {
       versionToken?: string
       /** Stronger host-internal ownership proof for compensating a publication. */
       physicalWriteClaim?: PhysicalWriteClaim
+      /** Exact source incarnation required for a single-note removal. */
+      expectedSource?: PhysicalIncarnation
     },
   ): Promise<void>
   /** Changes since `cursor` (null = establish one without history); an engine with no external

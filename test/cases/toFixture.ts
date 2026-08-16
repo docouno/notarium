@@ -8,6 +8,7 @@ import {
   frontmatterEntryValue,
   frontmatterListEntry,
   frontmatterScalarEntry,
+  legacyNoteNameAlias,
   logicalNoteState,
   nextAliasesMulti,
   normAliases,
@@ -15,6 +16,7 @@ import {
   slugify,
   stripFrontmatter,
   stripTitleHeading,
+  unionLegacyNameAliases,
 } from '@notarium/core'
 import { deterministicNoteId, type NoteSnapshot } from '@notarium/engine-memory'
 import { AGENT_SYSTEM_OWNER, type AgentSessionRecord } from '@notarium/server'
@@ -39,19 +41,12 @@ import type { CaseEvent, CaseWorld } from './types'
 // models (snapshot for structure, activity for history) — the catalog just makes
 // it declarative and shared with the real applier.
 
-/** The physical id a projection must use: the case's pin, else the id the fake
- *  engine derives from the path. One rule, so snapshot / activity / history /
- *  navigation / revision states can never disagree about which note a row belongs
- *  to. Every projection below reads it — none of them re-derives. */
-const physicalIdOf = (state: { id?: string; path: string }): string =>
-  state.id ?? deterministicNoteId(state.path)
-
 type NoteState = {
+  /** Stable physical identity, pinned by the case or derived once from the
+   *  create path. Every projection below reads this value; path edits never
+   *  re-derive it. */
+  id: string
   space: string
-  /** A fixture-pinned physical id, when the case pinned one. Every projection
-   *  that exposes a note's identity must read it — a snapshot that pins it while
-   *  activity/history derive their own would describe two different notes. */
-  id?: string
   path: string
   title: string
   content: string
@@ -75,6 +70,15 @@ type NoteState = {
   /** A rename makes aliases a typed serializer output. Before that, source
    *  `aliases:` stays in the raw carry so its authored shape is preserved. */
   aliasesOwned: boolean
+  legacyNameAliases: readonly string[]
+}
+
+const observeLegacyName = (state: NoteState): void => {
+  const alias = legacyNoteNameAlias(state.title, state.path)
+
+  if (alias) {
+    state.legacyNameAliases = unionLegacyNameAliases(state.legacyNameAliases, [alias])
+  }
 }
 
 const carriedNames = (
@@ -313,9 +317,9 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
 
     if (e.op === 'create') {
       const names = carriedNames(e.frontmatter)
-      notes.set(e.noteId, {
+      const state: NoteState = {
+        id: e.physicalId ?? deterministicNoteId(e.path),
         space: e.space,
-        id: e.physicalId,
         path: e.path,
         title: e.title,
         content: e.content,
@@ -331,9 +335,14 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
         deleted: false,
         aliases: names.aliases,
         aliasesOwned: false,
-      })
+        legacyNameAliases: [],
+      }
+
+      observeLegacyName(state)
+      notes.set(e.noteId, state)
     } else if (cur) {
       if (e.op === 'edit') {
+        observeLegacyName(cur)
         if (e.content !== undefined) {
           cur.content = e.content
         }
@@ -350,6 +359,9 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
           )
           cur.aliasesOwned = true
           cur.title = e.title
+        }
+        if (e.path !== undefined) {
+          cur.path = e.path
         }
         if (e.tags !== undefined) {
           cur.tags = e.tags
@@ -383,6 +395,7 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
             cur.muted = undefined
           }
         }
+        observeLegacyName(cur)
       }
       cur.deleted = e.op === 'delete'
       cur.modifiedAt = normDate(e.date)
@@ -403,7 +416,7 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
       // demonstrably has revisions. Paths are unique per space by construction
       // here (mergeWorlds suffixes collisions), so the pre-suffix form the store
       // derives is the one it keeps.
-      noteId: state ? physicalIdOf(state) : e.noteId,
+      noteId: state?.id ?? e.noteId,
       class: cls,
       principal: e.principal,
       // The body as of this revision IN JOURNAL FORM, so the seeded chain is
@@ -431,11 +444,7 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
     if (!state) {
       throw new Error(`revision state references unknown note ${declaration.note}`)
     }
-    // The SAME rule the snapshot and the activity rows use. A revision row is the
-    // one projection that also stamps the id INTO its bytes (`{{noteId}}` in the
-    // declared source), so deriving a second id here would not merely mislabel the
-    // row — it would seed a state blob whose `notarium-id:` names a note nobody has.
-    const noteId = physicalIdOf(state)
+    const noteId = state.id
     const materialized = materializeRevisionState(declaration, {
       noteId,
       path: state.path,
@@ -510,7 +519,7 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
     const live: NoteSnapshot[] = [...notes.values()]
       .filter((n) => n.space === s.slug && !n.deleted)
       .map((n) => ({
-        ...(n.id ? { id: n.id } : {}),
+        id: n.id,
         title: n.title,
         filePath: n.path,
         content: n.content,
@@ -521,6 +530,7 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
         muted: n.muted,
         frontmatter: n.frontmatter,
         aliases: n.aliasesOwned ? n.aliases : undefined,
+        legacyNameAliases: n.legacyNameAliases,
         createdAt: n.createdAt,
         modifiedAt: n.modifiedAt,
       }))

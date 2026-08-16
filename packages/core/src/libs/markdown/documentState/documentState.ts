@@ -1,5 +1,6 @@
 import { isMap, isScalar, type Pair, parseDocument, visit } from 'yaml'
 
+import { isValidNoteId } from '../../id'
 import {
   type FrontmatterEntry,
   frontmatterEntryValue,
@@ -19,6 +20,7 @@ import {
   type DocumentRole,
   type DocumentState,
   type DocumentStateFormat,
+  type ExactOwnerObservation,
   type MarkdownProjection,
   type RestoreSafety,
   type SkillProjection,
@@ -316,6 +318,46 @@ const analyzeFrontmatter = (text: string, offsets: readonly number[]): Frontmatt
     yamlErrors: doc.errors.length > 0,
     ownerAnchorDependency,
   }
+}
+
+/** Observe the storage owner from the same exact source the engine is about to
+ * mutate. Any ambiguity stays `unproven`; callers must never interpret parser
+ * failure, duplicate mappings or non-scalars as an absent owner. */
+export const exactOwnerObservation = (source: Uint8Array): ExactOwnerObservation => {
+  let text: string
+  let fm: FrontmatterAnalysis
+
+  try {
+    text = STRICT_UTF8.decode(source)
+    fm = analyzeFrontmatter(text, utf16ByteOffsets(text))
+  } catch {
+    return { kind: 'unproven' }
+  }
+
+  // The generic Markdown parser treats a leading fence without a closing fence
+  // as prose. Destructive identity decisions have a stricter boundary: such bytes
+  // could be truncated frontmatter, so absence is not proven.
+  if (!fm.block && /^\uFEFF?---[ \t]*(?:#[^\r\n]*)?(?:\r\n|\n|\r|$)/.test(text)) {
+    return { kind: 'unproven' }
+  }
+  if (fm.yamlErrors || fm.ownerAnchorDependency) {
+    return { kind: 'unproven' }
+  }
+  const owners = fm.fields.filter((field) => field.key === STORAGE_OWNER_KEY.id)
+
+  if (owners.length === 0) {
+    return { kind: 'absent' }
+  }
+  if (
+    owners.length !== 1 ||
+    owners[0].valueRange == null ||
+    typeof owners[0].value !== 'string' ||
+    !isValidNoteId(owners[0].value)
+  ) {
+    return { kind: 'unproven' }
+  }
+
+  return { kind: 'claimed', id: owners[0].value }
 }
 
 const validateProof = (

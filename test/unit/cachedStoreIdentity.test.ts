@@ -10,6 +10,7 @@ import { describe, expect, it, vi } from 'vitest'
 import type { StoreEvent } from '@notarium/contract'
 import {
   CachedStore,
+  exactOwnerObservation,
   FRONTMATTER_BYTE_CAP,
   frontmatterValue,
   InMemoryRevisionPersistence,
@@ -68,12 +69,17 @@ const makeBareEngine = (files: Map<string, string>) => {
       }
       const raw = files.get(path)!
       const claim = frontmatterValue(raw, NOTE_ID_FRONTMATTER_KEY)
+      const source = new TextEncoder().encode(raw)
       return {
         title: metaOf(path).title,
         permalink: permalinkOf(path),
         filePath: path,
         content: raw.replace(/^---\n[\s\S]*?\n---\n/, ''),
         frontmatter: claim ? { [NOTE_ID_FRONTMATTER_KEY]: claim } : {},
+        physicalIncarnation: {
+          claim: { kind: 'test-source-v1', value: `${path}\u0000${raw}` },
+          owner: exactOwnerObservation(source),
+        },
       }
     },
     preview: async () => ({ snippet: '', image: null, tags: [], words: 0, tokens: 0 }),
@@ -84,7 +90,7 @@ const makeBareEngine = (files: Map<string, string>) => {
     write: async (input) => {
       writes.push(input)
       const dir = (input.directory || '').replace(/^\/+|\/+$/g, '')
-      const filePath = (dir ? `${dir}/` : '') + `${slugify(input.title)}.md`
+      const filePath = (dir ? `${dir}/` : '') + `${input.fileName ?? slugify(input.title)}.md`
       const old = typeof input.originalId === 'string' ? input.originalId : null
 
       if (old && files.has(old) && old !== filePath) {
@@ -108,6 +114,7 @@ const makeBareEngine = (files: Map<string, string>) => {
       }
       files.delete(id)
       files.set(destinationPath, raw)
+      return { filePath: destinationPath }
     },
     remove: async (id) => {
       files.delete(id)
@@ -166,6 +173,246 @@ const gateIdentity = (
 }
 
 describe('CachedStore + bare engine — identity (#51)', () => {
+  it('rekeys a same-path provisional snapshot when causal restore adoption installs its id', async () => {
+    const durableId = 'causal-id-a1'
+    const filePath = 'restored.md'
+    const restoredAt = '2026-06-11T12:00:00.000Z'
+    const files = new Map<string, string>()
+    const bare = makeBareEngine(files)
+    const revisions = new InMemoryRevisionPersistence()
+    const persistence = new InMemoryIdentity([
+      {
+        id: durableId,
+        legacyNameAliases: [],
+        addressRevision: 1,
+        filePath,
+        space: 'main',
+        createdAt: '2026-06-10T00:00:00.000Z',
+        materialized: true,
+        deletedAt: '2026-06-11T00:00:00.000Z',
+      },
+    ])
+    const store = new CachedStore({
+      inner: bare.engine,
+      identityPersistence: persistence,
+      revisionPersistence: revisions,
+      space: 'main',
+      pollIntervalMs: 0,
+      relationType: 'links_to',
+      readBody: async (path) => files.get(path) ?? null,
+      now: () => new Date(restoredAt),
+    })
+
+    try {
+      await store.start()
+
+      // Physical publication wins the race with the terminal metadata commit,
+      // so the watcher has already published a provisional identity for this path.
+      files.set(filePath, '# restored\n\nbody')
+      await store.checkpoint()
+      const provisionalId = (await store.list())[0]!.id!
+      const events: StoreEvent[] = []
+
+      store.subscribe((event) => events.push(event))
+
+      expect(provisionalId).not.toBe(durableId)
+
+      // Model the terminal restore transaction: it retires the provisional row
+      // and revives the durable identity at the same exact path. The outbox then
+      // asks the live projection to adopt that causal row before reconciling.
+      const provisional = persistence.rows.get(provisionalId)!
+      const durable = persistence.rows.get(durableId)!
+
+      persistence.rows.set(provisionalId, {
+        ...provisional,
+        addressRevision: 2,
+        deletedAt: restoredAt,
+      })
+      persistence.rows.set(durableId, {
+        ...durable,
+        addressRevision: 2,
+        deletedAt: null,
+      })
+
+      await store.adoptCausalIdentity(durableId)
+      expect(await store.list()).toMatchObject([{ id: durableId, filePath }])
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: 'changed',
+          upserts: expect.arrayContaining([durableId]),
+          removed: expect.arrayContaining([provisionalId]),
+        }),
+      )
+      expect((await store.graph()).nodes.map(({ id }) => id)).toContain(durableId)
+      expect((await store.graph()).nodes.map(({ id }) => id)).not.toContain(provisionalId)
+
+      // The following reconcile must not interpret the retired provisional id
+      // as a real external deletion and journal a ghost trash entry for it.
+      await store.checkpoint()
+      expect(await store.listTrashed({ offset: 0, limit: 10 })).toMatchObject({
+        total: 0,
+        items: [],
+      })
+    } finally {
+      store.stop()
+      await store.settle()
+    }
+  })
+
+  it('keeps a proven legacy alias when the later storage write conflicts', async () => {
+    const files = new Map([['aza-stan-zhospary.md', 'body']])
+    const { engine } = makeBareEngine(files)
+    const list = engine.list.bind(engine)
+    const changes = engine.changes.bind(engine)
+    const read = engine.read.bind(engine)
+    let exactReads = 0
+
+    engine.list = async (opts) =>
+      (await list(opts)).map((meta) => ({ ...meta, title: 'Қазақстан жоспары' }))
+    engine.changes = async (cursor) => {
+      const delta = await changes(cursor)
+
+      return {
+        ...delta,
+        inventory: delta.inventory.map((meta) => ({ ...meta, title: 'Қазақстан жоспары' })),
+      }
+    }
+    engine.read = async (id, opts) => {
+      const detail = await read(id, opts)
+
+      exactReads++
+      return {
+        ...detail,
+        title: 'Қазақстан жоспары',
+        ...(exactReads === 1
+          ? {
+              physicalIncarnation: {
+                claim: detail.physicalIncarnation!.claim,
+                owner: { kind: 'unproven' as const },
+              },
+            }
+          : {}),
+      }
+    }
+    const identity = new InMemoryIdentity()
+    const store = new CachedStore({
+      inner: engine,
+      identityPersistence: identity,
+      space: 'main',
+      pollIntervalMs: 0,
+    })
+
+    try {
+      await store.start()
+      const note = (await store.list())[0]!
+      const token = (await store.read(note.id!)).versionToken
+
+      engine.write = async () => {
+        throw new Error('later storage conflict')
+      }
+      await expect(
+        store.write({
+          originalId: note.id,
+          title: 'Жаңа жоспар',
+          content: 'changed',
+          versionToken: token,
+        }),
+      ).rejects.toThrow('later storage conflict')
+      await expect(identity.findById!(note.id!)).resolves.toMatchObject({
+        legacyNameAliases: ['aza-stan-zhospary'],
+      })
+      expect(files.has('aza-stan-zhospary.md')).toBe(true)
+    } finally {
+      store.stop()
+      await store.settle()
+    }
+  })
+
+  it('does not persist legacy evidence for a content-only save', async () => {
+    const files = new Map([['aza-stan-zhospary.md', 'before']])
+    const { engine } = makeBareEngine(files)
+    const list = engine.list.bind(engine)
+    const changes = engine.changes.bind(engine)
+
+    engine.list = async (opts) =>
+      (await list(opts)).map((meta) => ({ ...meta, title: 'Қазақстан жоспары' }))
+    engine.changes = async (cursor) => {
+      const delta = await changes(cursor)
+
+      return {
+        ...delta,
+        inventory: delta.inventory.map((meta) => ({ ...meta, title: 'Қазақстан жоспары' })),
+      }
+    }
+    const identity = new InMemoryIdentity()
+    const mergeAlias = vi.spyOn(identity, 'mergeLegacyNameAlias')
+    const store = new CachedStore({
+      inner: engine,
+      identityPersistence: identity,
+      space: 'main',
+      pollIntervalMs: 0,
+    })
+
+    try {
+      await store.start()
+      const note = (await store.list())[0]!
+      const current = await store.read(note.id!)
+
+      mergeAlias.mockClear()
+      await store.write({
+        originalId: note.id,
+        title: 'Қазақстан жоспары',
+        content: 'after',
+        versionToken: current.versionToken,
+      })
+      expect(mergeAlias).not.toHaveBeenCalled()
+    } finally {
+      store.stop()
+      await store.settle()
+    }
+  })
+
+  it('binds a path-changing write to the incarnation that authorized its alias ACK', async () => {
+    const files = new Map([['aza-stan-zhospary.md', 'before']])
+    const { engine, writes } = makeBareEngine(files)
+    const list = engine.list.bind(engine)
+    const changes = engine.changes.bind(engine)
+
+    engine.list = async (opts) =>
+      (await list(opts)).map((meta) => ({ ...meta, title: 'Қазақстан жоспары' }))
+    engine.changes = async (cursor) => {
+      const delta = await changes(cursor)
+
+      return {
+        ...delta,
+        inventory: delta.inventory.map((meta) => ({ ...meta, title: 'Қазақстан жоспары' })),
+      }
+    }
+    const store = new CachedStore({
+      inner: engine,
+      identityPersistence: new InMemoryIdentity(),
+      space: 'main',
+      pollIntervalMs: 0,
+    })
+
+    try {
+      await store.start()
+      const note = (await store.list())[0]!
+      const live = await store.read(note.id!)
+
+      await store.write({
+        originalId: note.id,
+        title: 'Жаңа жоспар',
+        content: 'after',
+        versionToken: live.versionToken,
+      })
+      expect(writes.at(-1)?.expectedSource).toEqual(live.physicalIncarnation)
+    } finally {
+      store.stop()
+      await store.settle()
+    }
+  })
+
   it('the boot sweep adopts notarium-id claims from files; unclaimed notes get minted ids', async () => {
     const { store } = await make(
       new Map([
@@ -1501,6 +1748,86 @@ describe('CachedStore + bare engine — identity (#51)', () => {
     ).toBe(true)
   })
 
+  it('carries an alias-triggered remint through bytes, snapshot, durability, and result', async () => {
+    const refusedId = 'foreign-id01'
+    const files = new Map<string, string>()
+    const bare = makeBareEngine(files)
+    const persistence = new InMemoryIdentity([
+      {
+        id: refusedId,
+        legacyNameAliases: [],
+        filePath: 'other.md',
+        space: 'other',
+        createdAt: '2026-06-10T00:00:00.000Z',
+        materialized: true,
+        deletedAt: null,
+      },
+    ])
+    const read = bare.engine.read.bind(bare.engine)
+
+    bare.engine.read = async (id, opts) => {
+      const detail = await read(id, opts)
+      const raw = detail.filePath ? files.get(detail.filePath) : undefined
+      const title = raw ? frontmatterValue(raw, 'title') : null
+
+      return { ...detail, title: typeof title === 'string' ? title : detail.title }
+    }
+    bare.engine.materializeIdentityAtPath = async ({ filePath, expectedClaimId, targetId }) => {
+      const raw = files.get(filePath)
+
+      if (raw === undefined) {
+        return { status: 'vanished' }
+      }
+      const observedId = frontmatterValue(raw, NOTE_ID_FRONTMATTER_KEY)
+
+      if (observedId !== expectedClaimId) {
+        return {
+          status: 'claim-changed',
+          observedId: typeof observedId === 'string' ? observedId : null,
+        }
+      }
+      files.set(filePath, upsertFrontmatterKey(raw, NOTE_ID_FRONTMATTER_KEY, targetId))
+      return { status: 'materialized' }
+    }
+    const store = new CachedStore({
+      inner: bare.engine,
+      identityPersistence: persistence,
+      space: 'main',
+      pollIntervalMs: 0,
+      relationType: 'links_to',
+      readBody: async (path) => files.get(path) ?? null,
+      now: () => new Date('2026-06-11T12:00:00Z'),
+    })
+
+    await store.start()
+    const result = await store.write({
+      id: refusedId,
+      title: 'Қазақстан жоспары',
+      fileName: 'aza-stan-zhospary',
+      content: '---\ntitle: Қазақстан жоспары\n---\n\nbody',
+    })
+    const listed = await store.list()
+    const raw = files.get('aza-stan-zhospary.md')!
+    const durableMain = [...persistence.rows.values()].filter(({ space }) => space === 'main')
+
+    expect(result.id).not.toBe(refusedId)
+    expect(listed).toMatchObject([
+      {
+        id: result.id,
+        filePath: 'aza-stan-zhospary.md',
+        legacyNameAliases: ['aza-stan-zhospary'],
+      },
+    ])
+    expect(durableMain).toMatchObject([
+      {
+        id: result.id,
+        filePath: 'aza-stan-zhospary.md',
+        legacyNameAliases: ['aza-stan-zhospary'],
+      },
+    ])
+    expect(frontmatterValue(raw, NOTE_ID_FRONTMATTER_KEY)).toBe(result.id)
+  })
+
   it('drains an unsettled claim under the mutation claim, whichever side reaches it (#327)', async () => {
     // The drain re-keys the snapshot and can rewrite a file, so it belongs under the
     // global mutation claim — and it takes that claim ITSELF rather than trusting each
@@ -1554,6 +1881,28 @@ describe('CachedStore + bare engine — identity (#51)', () => {
     await recovering
     await writing
     expect(bare.writes).toHaveLength(1)
+    store.stop()
+    await store.settle()
+  })
+
+  it('joins identity recovery after settlement consumed the last path claim', async () => {
+    const { store } = await make(new Map([['source.md', '# source\n\nbody']]))
+    const held = deferred()
+    const internals = store as unknown as {
+      identityRecovery: Promise<void> | null
+    }
+
+    internals.identityRecovery = held.promise
+    let graphSettled = false
+    const graph = store.graph().then((value) => {
+      graphSettled = true
+      return value
+    })
+
+    await new Promise((tick) => setTimeout(tick, 20))
+    expect(graphSettled).toBe(false)
+    held.resolve()
+    await graph
     store.stop()
     await store.settle()
   })

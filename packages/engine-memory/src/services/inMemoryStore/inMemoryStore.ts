@@ -20,6 +20,7 @@ import type {
   KnowledgeStore,
   ListOptions,
   MoveInput,
+  MoveResult,
   NoteClass,
   NoteContent,
   NoteMeta,
@@ -74,6 +75,7 @@ import {
   isVisibleOn,
   isWikilinkIdentityTarget,
   isWithinFrontmatterByteCap,
+  legacyNoteNameAlias,
   liveSyncStatus,
   logicalNoteState,
   makeSnippet,
@@ -94,6 +96,7 @@ import {
   StoreError,
   stripTitleHeading,
   SURFACE,
+  unionLegacyNameAliases,
   versionConflict,
   versionTokenRequired,
 } from '@notarium/core'
@@ -401,6 +404,9 @@ export class InMemoryStore implements KnowledgeStore {
   }
 
   private notes: StoredNote[] = []
+  /** Identity-owned compatibility state, intentionally independent from the
+   * live note array so delete followed by a forced restore cannot forget it. */
+  private legacyNameAliasesById = new Map<string, readonly string[]>()
   // The directory channel (#97): folders that exist beyond the notes in them —
   // a "New folder", an emptied folder (never-prune), an empty marked project.
   // Always a SUPERSET of the note-derived dirs (every write seeds its ancestors),
@@ -423,6 +429,7 @@ export class InMemoryStore implements KnowledgeStore {
     // a re-seed (the e2e fake's reset) must mint the very same ids again,
     // and two seeded paths with one slug must still come out distinct.
     const next: StoredNote[] = []
+    this.legacyNameAliasesById = new Map()
 
     for (const n of snapshot.notes) {
       // #280: an imported note's own keys, authored as bare YAML lines. The typed
@@ -524,6 +531,11 @@ export class InMemoryStore implements KnowledgeStore {
       }
       this.assertExportable(candidate)
       next.push(candidate)
+      const inferred = legacyNoteNameAlias(candidate.title, candidate.filePath)
+      this.legacyNameAliasesById.set(
+        candidate.id,
+        unionLegacyNameAliases(n.legacyNameAliases ?? [], inferred ? [inferred] : []),
+      )
     }
     this.notes = next
     // A re-seed is a clean slate: no lingering/explicit empty dirs, just the
@@ -662,6 +674,8 @@ export class InMemoryStore implements KnowledgeStore {
   /** The snapshot metadata view — mirrors the real engine's metaOf, incl. the tag
    *  axis (#109) so the read-model's tag filter/facet works behind the fake too. */
   private metaOf(n: StoredNote): NoteMeta {
+    const legacyNameAliases = this.legacyNameAliasesOf(n.id)
+
     return {
       id: n.id,
       title: n.title,
@@ -669,6 +683,7 @@ export class InMemoryStore implements KnowledgeStore {
       filePath: n.filePath,
       ...(n.slug ? { slug: n.slug } : {}), // #100 phase 1: custom slug only
       ...(n.aliases.length ? { aliases: n.aliases } : {}),
+      ...(legacyNameAliases.length ? { legacyNameAliases } : {}),
       ...(n.tags.length ? { tags: n.tags } : {}),
       modifiedAt: n.modifiedAt,
       createdAt: n.createdAt,
@@ -752,6 +767,7 @@ export class InMemoryStore implements KnowledgeStore {
 
     const logicalState = this.logicalStateOf(n, content)
     const documentState = this.documentStateOf(n)
+    const legacyNameAliases = this.legacyNameAliasesOf(n.id)
 
     return {
       id: n.id,
@@ -765,13 +781,50 @@ export class InMemoryStore implements KnowledgeStore {
       frontmatter,
       logicalState,
       documentState,
+      physicalIncarnation: {
+        claim: physicalWriteClaimOf(n),
+        owner: { kind: 'claimed', id: n.id },
+      },
       ...(n.slug ? { slug: n.slug } : {}), // #100 phase 1: custom slug only
       ...(n.aliases.length ? { aliases: n.aliases } : {}),
+      ...(legacyNameAliases.length ? { legacyNameAliases } : {}),
       modifiedAt: n.modifiedAt,
       // The resolved creation instant (#186) — what the editor prefills its date
       // field from; mirrors the real engine serving createdAt on the read view.
       createdAt: n.createdAt,
       versionToken: documentStateVersionToken(documentState),
+    }
+  }
+
+  private legacyNameAliasesOf(id: string): readonly string[] {
+    return [...(this.legacyNameAliasesById.get(id) ?? [])]
+  }
+
+  private captureLegacyName(n: Pick<StoredNote, 'id' | 'title' | 'filePath'>): readonly string[] {
+    const inferred = legacyNoteNameAlias(n.title, n.filePath)
+    const aliases = unionLegacyNameAliases(
+      this.legacyNameAliasesById.get(n.id) ?? [],
+      inferred ? [inferred] : [],
+    )
+
+    this.legacyNameAliasesById.set(n.id, aliases)
+    return [...aliases]
+  }
+
+  private assertExpectedSource(note: StoredNote, expected: MoveInput['expectedSource']): void {
+    // Direct engine callers keep the compatibility move surface. The read-model
+    // always supplies this proof for destructive effects and the engine then
+    // enforces it atomically with its in-memory mutation.
+    if (!expected) {
+      return
+    }
+    if (
+      expected.claim.kind !== note.physicalWriteClaim.kind ||
+      expected.claim.value !== note.physicalWriteClaim.value ||
+      expected.owner.kind !== 'claimed' ||
+      expected.owner.id !== note.id
+    ) {
+      throw writeFailed('note changed during conditional effect')
     }
   }
 
@@ -1130,6 +1183,7 @@ export class InMemoryStore implements KnowledgeStore {
     preservePath,
     preserveAliases,
     restorePath,
+    expectedSource,
     expectedDestinationId,
   }: WriteInput): Promise<WriteResult> {
     const replacing = frontmatterMode === 'replace'
@@ -1324,11 +1378,13 @@ export class InMemoryStore implements KnowledgeStore {
       if (versionToken !== tokenOf(this.notes[i])) {
         throw versionConflict(this.viewOf(this.notes[i]))
       }
+      this.assertExpectedSource(this.notes[i], expectedSource)
       // No directory given (the restore/edit path) → keep the note in its
       // CURRENT folder; an explicit directory moves it. The path changes, the id
       // does NOT (P7).
       const dir = directory === undefined ? directoryOf(this.notes[i].filePath) : norm(directory)
       const prev = this.notes[i]
+      const legacyNameAliases = this.captureLegacyName(prev)
       // An explicit fileName is honoured on edit too (opt-in): a metadata touch that
       // hands the note's current basename keeps the file in place rather than renaming
       // to slug(title) — mirrors the notarium engine. Folder pages stay `index`.
@@ -1401,6 +1457,7 @@ export class InMemoryStore implements KnowledgeStore {
         class: this.notes[i].class,
         versionToken: tokenOf(this.notes[i]),
         physicalWriteClaim: physicalWriteClaimOf(this.notes[i]),
+        legacyNameAliases,
       }
     }
     // Identity is settled BEFORE the path here, because the last rung of the path
@@ -1457,6 +1514,7 @@ export class InMemoryStore implements KnowledgeStore {
     }
     if (existing !== -1) {
       const prev = this.notes[existing]
+      const legacyNameAliases = this.captureLegacyName(prev)
 
       if (!replacing && frontmatterHasYamlNodeReferences(prev.carried)) {
         throw new Error(YAML_NODE_REFERENCE_WRITE_ERROR)
@@ -1486,6 +1544,7 @@ export class InMemoryStore implements KnowledgeStore {
         class: this.notes[existing].class,
         versionToken: tokenOf(this.notes[existing]),
         physicalWriteClaim: physicalWriteClaimOf(this.notes[existing]),
+        legacyNameAliases,
       }
     }
     const carriedState = carriedStateFor(undefined)
@@ -1515,6 +1574,7 @@ export class InMemoryStore implements KnowledgeStore {
     }
     this.assertExportable(fresh)
     this.notes.push(fresh)
+    const legacyNameAliases = this.captureLegacyName(fresh)
     this.addDirs(filePath) // seed the note's folder into the directory channel (#97)
     return {
       id: newId,
@@ -1522,12 +1582,19 @@ export class InMemoryStore implements KnowledgeStore {
       class: fresh.class,
       versionToken: tokenOf(fresh),
       physicalWriteClaim: physicalWriteClaimOf(fresh),
+      legacyNameAliases,
     }
   }
 
   /** Move a note or a folder subtree. A failed move throws the same
    *  "# Move Failed" tool-error a bare engine surfaces (#6/#8). */
-  async move({ id, destinationPath, isDirectory = false, identityOnly }: MoveInput): Promise<void> {
+  async move({
+    id,
+    destinationPath,
+    isDirectory = false,
+    identityOnly,
+    expectedSource,
+  }: MoveInput): Promise<MoveResult> {
     const currentPath = isDirectory ? id : this.notes[this.findIndex(id, identityOnly)]?.filePath
 
     if (
@@ -1561,6 +1628,7 @@ export class InMemoryStore implements KnowledgeStore {
       // and dir entries we DO hold.
       for (const n of this.notes) {
         if (n.filePath === src || n.filePath.startsWith(src + '/')) {
+          this.captureLegacyName(n)
           n.filePath = destinationPath + n.filePath.slice(src.length)
           n.modifiedAt = this.nowIso
           n.physicalWriteClaim = nextPhysicalWriteClaim()
@@ -1576,7 +1644,7 @@ export class InMemoryStore implements KnowledgeStore {
         }
       }
 
-      return
+      return {}
     }
     const i = this.findIndex(id, identityOnly)
 
@@ -1586,10 +1654,18 @@ export class InMemoryStore implements KnowledgeStore {
     if (this.notes.some((n, j) => j !== i && n.filePath === destinationPath)) {
       throw moveFailed('a note already lives at the destination')
     }
+    this.assertExpectedSource(this.notes[i], expectedSource)
+    const legacyNameAliases = this.captureLegacyName(this.notes[i])
     this.notes[i].filePath = destinationPath
     this.notes[i].modifiedAt = this.nowIso
     this.notes[i].physicalWriteClaim = nextPhysicalWriteClaim()
     this.addDirs(destinationPath) // seed the new folder; the old lingers (#97)
+    return {
+      id: this.notes[i].id,
+      filePath: destinationPath,
+      versionToken: documentStateVersionToken(this.documentStateOf(this.notes[i])),
+      legacyNameAliases,
+    }
   }
 
   async remove(
@@ -1598,11 +1674,15 @@ export class InMemoryStore implements KnowledgeStore {
       identityOnly?: boolean
       versionToken?: string
       physicalWriteClaim?: PhysicalWriteClaim
+      expectedSource?: MoveInput['expectedSource']
     },
   ): Promise<void> {
     const i = this.findIndex(rawId, opts?.identityOnly)
 
     if (i !== -1) {
+      if (opts?.expectedSource) {
+        this.assertExpectedSource(this.notes[i], opts.expectedSource)
+      }
       if (
         opts?.physicalWriteClaim &&
         (opts.physicalWriteClaim.kind !== this.notes[i].physicalWriteClaim.kind ||
@@ -1616,6 +1696,7 @@ export class InMemoryStore implements KnowledgeStore {
       ) {
         throw writeFailed('note changed during delete')
       }
+      this.captureLegacyName(this.notes[i])
       this.notes.splice(i, 1)
     }
     // never-prune (#97): the note's folder stays in the directory channel.

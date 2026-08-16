@@ -63,6 +63,7 @@ export class BulkController {
       return
     }
     this.depth--
+    const generation = this.generation
     // Balance begin's enter, ONE per end that actually decremented — so the
     // scheduler's interactive count returns to 0 exactly when the last bracket
     // closes, even under a re-entrant import.
@@ -75,11 +76,9 @@ export class BulkController {
       // awaiting land in the still-live buffer and force another pass; the final
       // empty-check + close are synchronous, so no absorbed tail can disappear.
       for (;;) {
-        // Directory/alias changes can invalidate old sources that were not themselves
-        // imported. Rebuild them once per drain pass, under the host's global mutation
-        // fence, instead of once for every new folder (quadratic on large imports).
-        await this.host.flushGraphContext()
-        await this.broadcast()
+        // The final task joins every earlier timer task and orders the durable
+        // identity/alias handoff before the one-shot graph repair and CHANGED.
+        await this.broadcast(true)
         // Re-entrancy guard: a concurrent import may have re-opened bulk while we
         // awaited above. It shares the active generation; leave teardown to its end.
         if (this.depth > 0) {
@@ -100,6 +99,9 @@ export class BulkController {
         this.host.scheduler?.enterInteractive()
       }
       throw err
+    }
+    if (generation !== this.generation) {
+      return
     }
     this.host.resumeBackground()
     // One catch-up delta poll now the burst is over: advances the cursor past our
@@ -149,12 +151,17 @@ export class BulkController {
     this.depth = 0
   }
 
+  /** Join every timer/end broadcast that was detached before teardown. */
+  async settle(): Promise<void> {
+    await this.broadcastTail
+  }
+
   /** Make the buffered notes' ids durable in the meta-DB BEFORE the coalesced
    *  `changed` tells clients they exist. The broadcast is the first signal a
    *  client gets, and the host's resolveNote reads the meta-DB — without the flush
    *  first, a click on a just-imported note races to a 404 until the next settle. */
-  private async broadcast(): Promise<void> {
-    const task = this.broadcastTail.then(() => this.broadcastOne())
+  private async broadcast(final = false): Promise<void> {
+    const task = this.broadcastTail.then(() => this.broadcastOne(final))
 
     // A failed caller still observes its own error, while a later end/teardown
     // can join a healthy tail instead of inheriting a permanently rejected chain.
@@ -162,19 +169,26 @@ export class BulkController {
     return task
   }
 
-  private async broadcastOne(): Promise<void> {
+  private async broadcastOne(final: boolean): Promise<void> {
     const generation = this.generation
-    const batch = this.takeBatch()
+    const detached = this.takeBatch()
+    let batch: { upserts: string[]; removed: string[] } | null = null
 
     try {
-      this.host.syncLinkIdentities()
       await this.host.flushIdentity()
+      this.host.syncLinkIdentities()
+      // Recovery above may have retired provisional ids. Canonicalize only
+      // after that final mapping exists, never from the pre-recovery snapshot.
+      batch = detached ? this.host.canonicalizeChanged(detached.upserts, detached.removed) : null
+      if (final) {
+        await this.host.flushGraphContext()
+      }
       if (batch && generation === this.generation) {
         this.host.dispatchChanged(batch.upserts, batch.removed, this.host.foldersOf(batch.upserts))
       }
     } catch (err) {
-      if (batch && generation === this.generation) {
-        this.restoreBatch(batch)
+      if (detached && generation === this.generation) {
+        this.restoreBatch(batch ?? detached)
       }
       throw err
     }
@@ -239,7 +253,7 @@ export class BulkController {
     }
     this.flushTimer = setTimeout(() => {
       this.flushTimer = null
-      void this.broadcast().catch(() => {})
+      void this.broadcast(false).catch(() => {})
     }, BULK_EMIT_COALESCE_MS)
     this.flushTimer.unref?.()
   }

@@ -77,6 +77,20 @@
       "checksum": "sha256:7a787a094f76b2be9278b3b3208202e40de598fcd51d08ea60c8ac16e30c54f3",
       "sqlite": "sqlite/0010_import_reservations.sql",
       "postgres": "postgres/0010_import_reservations.sql"
+    },
+    {
+      "version": 11,
+      "name": "legacy_name_aliases",
+      "checksum": "sha256:a5cd8f6c2b60a9177bdad18b7448fe4dc857a5afd3008206ecfd42b8f6aba51f",
+      "sqlite": "sqlite/0011_legacy_name_aliases.sql",
+      "postgres": "postgres/0011_legacy_name_aliases.sql"
+    },
+    {
+      "version": 12,
+      "name": "identity_settlement_lineage",
+      "checksum": "sha256:bfc46f505b4178d01a83404e2658457b9ca3623fd974e5b6f5e5e0b2b4452fe5",
+      "sqlite": "sqlite/0012_identity_settlement_lineage.sql",
+      "postgres": "postgres/0012_identity_settlement_lineage.sql"
     }
   ]
 }

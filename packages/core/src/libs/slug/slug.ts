@@ -232,10 +232,14 @@ export const slugify = (s: string): string => {
 export const asciiSlug = (s: string): string =>
   trimEdges(romanise(s).replace(NOT_ASCII_HANDLE_CHAR, '-'))
 
+/** Frozen pre-Unicode name key. It is exposed only for recognising storage names
+ * minted by the old note-path algebra; new names always use `nameKey`/`slugify`. */
+export const legacyNameKey = (s: string): string =>
+  trimEdges(legacyRomanise(s).replace(NOT_ASCII_HANDLE_CHAR, '-'))
+
 /** Frozen legacy slug for persisted importer-owned paths only. New handles must use
  *  `asciiSlug`; note names must use `slugify`. */
-export const legacyImportSlug = (s: string): string =>
-  trimEdges(legacyRomanise(s).replace(NOT_ASCII_HANDLE_CHAR, '-'))
+export const legacyImportSlug = (s: string): string => legacyNameKey(s)
 
 /** Slugify a path per segment ("Dir Name/Note" → "dir-name/note"). */
 export const slugifyPath = (p: string): string => p.split('/').map(slugify).join('/')

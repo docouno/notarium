@@ -755,4 +755,35 @@ describe('NotariumStore external edit convergence', () => {
       await store.stop()
     }
   })
+
+  it('refuses a write after a same-semantic physical incarnation replacement', async () => {
+    const root = await mkroot()
+    const store = createNotariumStore({ notesDir: root, integritySweepBatchSize: 0 })
+
+    try {
+      await store.write({ id: 'note-id', title: 'Note', content: 'body' })
+      const stale = await store.read('note.md')
+      const notePath = join(root, 'note.md')
+      const bytes = await fs.readFile(notePath)
+
+      await fs.unlink(notePath)
+      await fs.writeFile(notePath, bytes)
+      const replaced = await store.read('note.md')
+
+      expect(replaced.versionToken).toBe(stale.versionToken)
+      expect(replaced.physicalIncarnation).not.toEqual(stale.physicalIncarnation)
+      await expect(
+        store.write({
+          id: 'note-id',
+          originalId: 'note.md',
+          title: 'Note',
+          content: 'changed',
+          expectedSource: stale.physicalIncarnation,
+        }),
+      ).rejects.toThrow('note changed during write')
+      expect((await store.read('note.md')).content).toBe('body')
+    } finally {
+      await store.stop()
+    }
+  })
 })

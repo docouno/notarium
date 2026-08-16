@@ -4,6 +4,7 @@ import {
   analyzeDocumentState,
   basenameOf,
   bindStorageOwnerProof,
+  canonicalLegacyNameAliases,
   decodeDocumentState,
   diffStats,
   DOCUMENT_ROLE,
@@ -14,8 +15,10 @@ import {
   type DocumentState,
   documentStateVersionToken,
   encodeDocumentState,
+  exactOwnerObservation,
   type IdentityRecord,
   isSkillPackageRootPath,
+  legacyNoteNameAlias,
   LOGICAL_NOTE_STATE_FORMAT,
   logicalNoteStateFromProjection,
   normTags,
@@ -29,10 +32,12 @@ import {
   SPACE_LIFECYCLE_PHASE,
   STORAGE_OWNER_KEY,
   type StorageOwnerProof,
+  unionLegacyNameAliases,
 } from '@notarium/core'
 import {
   type FileClaim,
   type ResourceStrictStageRef,
+  sameFileClaim,
   type SpaceResourceAuthority,
 } from '@notarium/engine'
 
@@ -92,7 +97,7 @@ type AcceptedEvidence = {
 }
 
 type PreparedEvidence = {
-  version: 1
+  version: 1 | 2
   kind: 'prepared'
   mode: RestoreMode
   principalId: string
@@ -118,6 +123,9 @@ type PreparedEvidence = {
     deletedAt: string | null
   }
   identity: IdentityRecord
+  /** Complete monotonic compatibility state captured before physical publish.
+   * Version-1 evidence predates this field and parses as an empty array. */
+  legacyNameAliases: readonly string[]
   expectedProofRevision: number | null
   charsAdded: number | null
   charsRemoved: number | null
@@ -183,7 +191,7 @@ const parsePreparedEvidence = (raw: string | null): PreparedEvidence => {
 
   if (
     !value ||
-    value.version !== 1 ||
+    (value.version !== 1 && value.version !== 2) ||
     value.kind !== 'prepared' ||
     typeof value.noteId !== 'string' ||
     typeof value.sourceRevisionId !== 'string' ||
@@ -194,12 +202,22 @@ const parsePreparedEvidence = (raw: string | null): PreparedEvidence => {
     !value.expectedClaim ||
     !value.expectedIdentity ||
     !value.identity ||
-    !Array.isArray(value.ownerClaims)
+    !Array.isArray(value.ownerClaims) ||
+    (value.version === 2 && !Array.isArray(value.legacyNameAliases))
   ) {
     throw corruptEvidence('restore operation has invalid prepared evidence')
   }
 
-  return value as PreparedEvidence
+  const identity = value.identity as IdentityRecord
+  const legacyNameAliases = canonicalLegacyNameAliases(
+    value.version === 2 ? value.legacyNameAliases : identity.legacyNameAliases,
+  )
+
+  return {
+    ...(value as PreparedEvidence),
+    identity: { ...identity, legacyNameAliases },
+    legacyNameAliases,
+  }
 }
 
 const terminalResultOf = (operation: RestoreOperationRecord): RestoreTerminalResult => {
@@ -639,7 +657,7 @@ export class RestoreCoordinator {
   ): Promise<RestoreOperationRecord> {
     const reject = (kind: 'conflict' | 'not-restorable', reason: string) =>
       this.reject(operation, kind, reason)
-    const identity = await this.metaDb.identity.findById?.(operation.noteId)
+    let identity = await this.metaDb.identity.findById?.(operation.noteId)
     const sourceRevision = operation.sourceRevisionId
       ? await this.metaDb.revisions.get(operation.space, operation.sourceRevisionId)
       : null
@@ -738,6 +756,42 @@ export class RestoreCoordinator {
       (!currentState || documentStateVersionToken(currentState) !== accepted.versionToken)
     ) {
       return reject('conflict', 'version-conflict')
+    }
+    if (observation.kind === 'present') {
+      const owner = exactOwnerObservation(observation.bytes)
+
+      if (
+        owner.kind === 'unproven' ||
+        (owner.kind === 'claimed' && owner.id !== operation.noteId)
+      ) {
+        return reject('conflict', 'physical-owner-unproven')
+      }
+      const currentTitle = currentState?.projection?.title
+      const alias = currentTitle ? legacyNoteNameAlias(currentTitle, identity.filePath) : null
+
+      if (alias) {
+        const merged = await this.metaDb.identity.mergeLegacyNameAlias({
+          id: identity.id,
+          space: identity.space,
+          alias,
+        })
+
+        if (merged.status !== 'merged') {
+          return reject('conflict', 'source-or-identity-changed')
+        }
+        const refreshed = await this.metaDb.identity.findById?.(identity.id)
+
+        if (!refreshed || refreshed.space !== operation.space) {
+          return reject('conflict', 'source-or-identity-changed')
+        }
+        identity = {
+          ...refreshed,
+          legacyNameAliases: unionLegacyNameAliases(
+            refreshed.legacyNameAliases,
+            merged.legacyNameAliases,
+          ),
+        }
+      }
     }
     let candidatePlan
     let sourceKind: 'document' | 'legacy'
@@ -856,7 +910,7 @@ export class RestoreCoordinator {
     const afterText = documentSourceText(candidateState)
     const stats = beforeText != null && afterText != null ? diffStats(beforeText, afterText) : null
     const prepared: PreparedEvidence = {
-      version: 1,
+      version: 2,
       kind: 'prepared',
       mode: accepted.mode,
       principalId: accepted.principalId,
@@ -882,6 +936,7 @@ export class RestoreCoordinator {
         deletedAt: identity.deletedAt,
       },
       identity: { ...identity, addressRevision: identity.addressRevision ?? 0, deletedAt: null },
+      legacyNameAliases: [...identity.legacyNameAliases],
       expectedProofRevision: proof.revision,
       charsAdded: stats?.charsAdded ?? null,
       charsRemoved: stats?.charsRemoved ?? null,
@@ -927,7 +982,7 @@ export class RestoreCoordinator {
     authority: SpaceResourceAuthority,
     packagePath: string | null,
   ): Promise<RestoreCommandResult> {
-    const prepared = parsePreparedEvidence(operation.preparedEvidence)
+    let prepared = parsePreparedEvidence(operation.preparedEvidence)
     const ref: ResourceStrictStageRef = {
       operationId: operation.id,
       binding: operation.stageBinding,
@@ -942,6 +997,33 @@ export class RestoreCoordinator {
     ) {
       const state = await authority.inspectStrict(ref)
       let publication
+
+      // A v1 operation has no durable pre-effect owner observation. Once strict
+      // publication may have started, the public pathname may already contain the
+      // candidate and cannot prove what this operation originally observed.
+      if (
+        prepared.version === 1 &&
+        (state.status === 'publishing' || state.status === 'failed-recoverable')
+      ) {
+        return this.markRecoverable(current, 'legacy-strict-stage-post-effect-ambiguous')
+      }
+
+      if (prepared.version === 1 && state.status === 'staged') {
+        const upgraded = await this.upgradePreparedEvidence(
+          current,
+          prepared,
+          authority,
+          state.stage.expected,
+        )
+
+        if (!upgraded) {
+          await authority.discardStrict(ref)
+          const rejected = await this.reject(current, 'conflict', 'physical-target-changed')
+          return rejectionOf(rejected)
+        }
+        current = upgraded.operation
+        prepared = upgraded.prepared
+      }
 
       if (state.status === 'published') {
         publication = { status: 'published' as const, receipt: state.receipt }
@@ -985,6 +1067,22 @@ export class RestoreCoordinator {
     }
     if (!current.physicalReceipt) {
       throw new Error('physical restore operation has no receipt')
+    }
+    if (prepared.version === 1) {
+      // A pre-upgrade operation may already have crossed physical publication,
+      // where the old title/path pair no longer exists to inspect. Never infer
+      // from the restored bytes; carry only aliases already durable on identity.
+      const durable = await this.metaDb.identity.findById?.(prepared.noteId)
+      const aliases = unionLegacyNameAliases(
+        prepared.legacyNameAliases,
+        durable?.legacyNameAliases ?? [],
+      )
+
+      prepared = {
+        ...prepared,
+        identity: { ...prepared.identity, legacyNameAliases: aliases },
+        legacyNameAliases: aliases,
+      }
     }
     const candidateSource = Uint8Array.from(Buffer.from(prepared.candidateSource, 'base64'))
     const ownerProof = bindStorageOwnerProof({
@@ -1094,6 +1192,103 @@ export class RestoreCoordinator {
     const result = finalized.result
 
     return { status: 'succeeded', operationId: finalized.operation.id, ...result }
+  }
+
+  /** Upgrade old prepared evidence only while the strict stage still proves its
+   * original expected claim. Published stages have crossed the trust boundary and
+   * carry only aliases that were already durable. */
+  private async upgradePreparedEvidence(
+    operation: RestoreOperationRecord,
+    prepared: PreparedEvidence,
+    authority: SpaceResourceAuthority,
+    stagedExpectedClaim: FileClaim,
+  ): Promise<{ operation: RestoreOperationRecord; prepared: PreparedEvidence } | null> {
+    const durable = await this.metaDb.identity.findById?.(prepared.noteId)
+
+    if (!durable || durable.space !== operation.space) {
+      return null
+    }
+    let aliases = unionLegacyNameAliases(prepared.legacyNameAliases, durable.legacyNameAliases)
+
+    if (!sameFileClaim(stagedExpectedClaim, prepared.expectedClaim)) {
+      return null
+    }
+    const observation = await authority.observeStrictAdmitted(prepared.targetPath)
+
+    if (
+      !('claim' in observation) ||
+      !sameFileClaim(observation.claim, prepared.expectedClaim) ||
+      (prepared.mode === 'history' && observation.kind !== 'present') ||
+      (prepared.mode === 'trash' && observation.kind !== 'absent')
+    ) {
+      return null
+    }
+    if (observation.kind === 'absent') {
+      if (durable.filePath !== prepared.targetPath) {
+        return null
+      }
+    } else {
+      if (observation.kind !== 'present') {
+        return null
+      }
+      const owner = exactOwnerObservation(observation.bytes)
+
+      if (
+        owner.kind === 'unproven' ||
+        (owner.kind === 'claimed' && owner.id !== prepared.noteId) ||
+        (owner.kind === 'absent' && durable.filePath !== prepared.targetPath)
+      ) {
+        return null
+      }
+      const state = analyzeDocumentState({
+        source: observation.bytes,
+        role: prepared.role,
+        pathFallbackTitle: prepared.pathFallbackTitle,
+        ...(prepared.skillDirectoryName ? { skillDirectoryName: prepared.skillDirectoryName } : {}),
+      })
+      const title = state.projection?.title
+      const alias = title ? legacyNoteNameAlias(title, prepared.targetPath) : null
+
+      if (alias) {
+        const merged = await this.metaDb.identity.mergeLegacyNameAlias({
+          id: prepared.noteId,
+          space: operation.space,
+          alias,
+        })
+
+        if (merged.status !== 'merged') {
+          return null
+        }
+        aliases = unionLegacyNameAliases(aliases, merged.legacyNameAliases)
+      }
+    }
+    const upgraded: PreparedEvidence = {
+      ...prepared,
+      version: 2,
+      identity: { ...prepared.identity, legacyNameAliases: aliases },
+      legacyNameAliases: aliases,
+    }
+    const transition = await this.metaDb.restoreOperations.transition({
+      id: operation.id,
+      expectedPhases: [operation.phase],
+      expectedPreparedEvidence: operation.preparedEvidence ?? undefined,
+      phase: operation.phase,
+      preparedEvidence: encodeJson(upgraded),
+      updatedAt: this.now().toISOString(),
+    })
+
+    if (transition.status === 'missing') {
+      throw new Error('prepared restore operation disappeared during evidence upgrade')
+    }
+    if (transition.status === 'phase-conflict') {
+      const concurrent = parsePreparedEvidence(transition.operation.preparedEvidence)
+
+      return concurrent.version === 2
+        ? { operation: transition.operation, prepared: concurrent }
+        : null
+    }
+
+    return { operation: transition.operation, prepared: upgraded }
   }
 
   private async targetDocumentContext(

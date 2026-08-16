@@ -92,6 +92,7 @@ const PROBES: readonly Probe[] = [
         filePath: `${NOTE}.md`,
         current: {
           id: NOTE,
+          legacyNameAliases: [],
           filePath: `${NOTE}.md`,
           space: SPACE,
           createdAt: AT,
@@ -107,6 +108,7 @@ const PROBES: readonly Probe[] = [
 
 const identity = (id: string): IdentityRecord => ({
   id,
+  legacyNameAliases: [],
   filePath: `${id}.md`,
   space: SPACE,
   createdAt: AT,

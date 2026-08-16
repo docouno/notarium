@@ -19,6 +19,93 @@ const exportText = (content: string | Uint8Array): string =>
 
 const frontmatter = (yaml: string) => parseFrontmatterLines(yaml)
 
+describe('InMemoryStore legacy-name evidence', () => {
+  it('keeps an inferred alias across an exact move, delete and forced restore', async () => {
+    const store = new InMemoryStore({
+      space: 'main',
+      notes: [
+        {
+          id: 'legacy-id',
+          title: 'Қазақстан жоспары',
+          filePath: 'aza-stan-zhospary.md',
+          content: 'body',
+        },
+      ],
+    })
+    const before = await store.read('legacy-id')
+
+    expect(before.physicalIncarnation).toMatchObject({
+      owner: { kind: 'claimed', id: 'legacy-id' },
+    })
+    expect(before.legacyNameAliases).toEqual(['aza-stan-zhospary'])
+
+    const moved = await store.move({
+      id: 'legacy-id',
+      destinationPath: 'archive/plan.md',
+      expectedSource: before.physicalIncarnation,
+    })
+    expect(moved.legacyNameAliases).toEqual(['aza-stan-zhospary'])
+    const live = await store.read('legacy-id')
+
+    await store.remove('legacy-id', { expectedSource: live.physicalIncarnation })
+    const restored = await store.write({
+      id: 'legacy-id',
+      title: 'Restored Plan',
+      content: 'restored',
+      restorePath: 'restored.md',
+    })
+    expect(restored.legacyNameAliases).toEqual(['aza-stan-zhospary'])
+    expect((await store.read('legacy-id')).legacyNameAliases).toEqual(['aza-stan-zhospary'])
+  })
+
+  it('refuses a destructive effect carrying a stale physical incarnation', async () => {
+    const store = new InMemoryStore({
+      notes: [{ id: 'note-id', title: 'Note', filePath: 'note.md', content: 'before' }],
+    })
+    const stale = await store.read('note-id')
+    await store.write({
+      originalId: 'note-id',
+      title: 'Note',
+      content: 'after',
+      versionToken: stale.versionToken,
+    })
+
+    await expect(
+      store.move({
+        id: 'note-id',
+        destinationPath: 'moved.md',
+        expectedSource: stale.physicalIncarnation,
+      }),
+    ).rejects.toThrow('note changed during conditional effect')
+    expect((await store.read('note-id')).filePath).toBe('note.md')
+  })
+
+  it('refuses a write after a same-semantic physical incarnation replacement', async () => {
+    const store = new InMemoryStore({
+      notes: [{ id: 'note-id', title: 'Note', filePath: 'note.md', content: 'body' }],
+    })
+    const stale = await store.read('note-id')
+    const replaced = await store.write({
+      originalId: 'note-id',
+      title: 'Note',
+      content: 'body',
+      versionToken: stale.versionToken,
+    })
+
+    expect(replaced.versionToken).toBe(stale.versionToken)
+    await expect(
+      store.write({
+        originalId: 'note-id',
+        title: 'Note',
+        content: 'changed',
+        versionToken: stale.versionToken,
+        expectedSource: stale.physicalIncarnation,
+      }),
+    ).rejects.toThrow('note changed during conditional effect')
+    expect((await store.read('note-id')).content).toBe('body')
+  })
+})
+
 describe('InMemoryStore document-state parity', () => {
   it('serves the same analyzer-owned state and CAS token shape as the real engine', async () => {
     const store = new InMemoryStore({

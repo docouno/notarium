@@ -16,6 +16,7 @@ import { describeGatewayStateContract } from './gatewayStateContract'
 import { describeIdentityPersistenceContract } from './identityPersistenceContract'
 import { describeImportReservationsContract } from './importReservationsContract'
 import { describeJobsContract } from './jobsContract'
+import { describeLegacyNameAliasesContract } from './legacyNameAliasesContract'
 import { createPostgresTestSchema, describePostgres } from './postgresHarness'
 import { describeRevisionPersistenceContract } from './revisionPersistenceContract'
 import { describeSessionAuditContract } from './sessionAuditContract'
@@ -309,6 +310,7 @@ describePostgres('live Postgres driver', SUITE, () => {
     const testSchema = await createPostgresTestSchema('favorites_settlement')
     const record = {
       id: 'old-id',
+      legacyNameAliases: [],
       filePath: 'a.md',
       space: 'team',
       createdAt: null,
@@ -386,6 +388,27 @@ describePostgres('live Postgres driver', SUITE, () => {
     }
   })
 
+  describeLegacyNameAliasesContract('Postgres', async () => {
+    const testSchema = await createPostgresTestSchema('legacy_alias_contract')
+    const peer = new PgMetaDb(testSchema.scopedUrl)
+
+    return {
+      alpha: testSchema.db.identity,
+      beta: peer.identity,
+      corruptAliases: async (id, raw) => {
+        await testSchema.admin.query(
+          `UPDATE "${testSchema.schema.replaceAll('"', '""')}".note_identity
+              SET legacy_name_aliases = $1 WHERE id = $2`,
+          [raw, id],
+        )
+      },
+      teardown: async () => {
+        await peer.close()
+        await testSchema.teardown()
+      },
+    }
+  })
+
   describeCausalMetadataContract('Postgres', async () => {
     const testSchema = await createPostgresTestSchema('causal_metadata_contract')
     return {
@@ -396,10 +419,11 @@ describePostgres('live Postgres driver', SUITE, () => {
       ownerProofs: testSchema.db.ownerProofs,
       revisions: testSchema.db.revisions,
       terminal: testSchema.db.restoreTerminal,
-      setAddress: async (noteId, space, addressRevision) => {
+      setAddress: async (noteId, space, addressRevision, legacyNameAliases = []) => {
         await testSchema.db.identity.claimMany([
           {
             id: noteId,
+            legacyNameAliases,
             filePath: `address-${addressRevision}.md`,
             space,
             createdAt: null,
@@ -408,6 +432,30 @@ describePostgres('live Postgres driver', SUITE, () => {
           },
         ])
       },
+      getAddress: (noteId) => testSchema.db.identity.findById!(noteId),
+      prepareTerminalResurrection: async (noteId, space, filePath, at) => {
+        const current = await testSchema.db.identity.findById!(noteId)
+
+        if (!current) {
+          throw new Error(`missing identity ${noteId}`)
+        }
+        await testSchema.db.identity.settleFileClaim({
+          space,
+          filePath,
+          current,
+          observedId: 'terminal-successor',
+          at,
+        })
+        const retired = await testSchema.db.identity.findById!(noteId)
+
+        if (!retired) {
+          throw new Error(`missing retired identity ${noteId}`)
+        }
+
+        return retired
+      },
+      mergeLegacyNameAlias: (noteId, space, alias) =>
+        testSchema.db.identity.mergeLegacyNameAlias({ id: noteId, space, alias }),
       teardown: testSchema.teardown,
     }
   })
@@ -435,6 +483,7 @@ describePostgres('live Postgres driver', SUITE, () => {
     await testSchema.db.identity.claimMany([
       {
         id: 'X',
+        legacyNameAliases: [],
         filePath: 'owned.md',
         space: 'alpha',
         createdAt: null,
@@ -445,6 +494,7 @@ describePostgres('live Postgres driver', SUITE, () => {
       // block on, and the race the test means to force never forms.
       {
         id: 'beta-auto-01',
+        legacyNameAliases: [],
         filePath: 'copy.md',
         space: 'beta',
         createdAt: null,
@@ -471,6 +521,7 @@ describePostgres('live Postgres driver', SUITE, () => {
       filePath: 'copy.md',
       current: {
         id: 'beta-auto-01',
+        legacyNameAliases: [],
         filePath: 'copy.md',
         space: 'beta',
         createdAt: null,

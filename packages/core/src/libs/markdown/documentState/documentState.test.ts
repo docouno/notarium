@@ -8,6 +8,7 @@ import {
   documentSourceText,
   documentStateVersionToken,
   encodeDocumentState,
+  exactOwnerObservation,
   planDocumentMutation,
 } from './index'
 import { DOCUMENT_ROLE, DOCUMENT_STATE_FORMAT, STORAGE_OWNER_KEY } from './types'
@@ -15,6 +16,33 @@ import { DOCUMENT_ROLE, DOCUMENT_STATE_FORMAT, STORAGE_OWNER_KEY } from './types
 const bytes = (value: string): Uint8Array => new TextEncoder().encode(value)
 
 describe('document state', () => {
+  it('observes an exact owner only from unambiguous source bytes', () => {
+    expect(exactOwnerObservation(bytes('body'))).toEqual({ kind: 'absent' })
+    expect(exactOwnerObservation(bytes('---\nnotarium-id: note-id\n---\nbody'))).toEqual({
+      kind: 'claimed',
+      id: 'note-id',
+    })
+    expect(
+      exactOwnerObservation(bytes('---\nnotarium-id: one\nnotarium-id: two\n---\nbody')),
+    ).toEqual({ kind: 'unproven' })
+    expect(exactOwnerObservation(bytes('---\nnotarium-id: [one]\n---\nbody'))).toEqual({
+      kind: 'unproven',
+    })
+    expect(exactOwnerObservation(bytes('---\nnotarium-id: foreign\nbody'))).toEqual({
+      kind: 'unproven',
+    })
+    expect(exactOwnerObservation(Uint8Array.of(0xff))).toEqual({ kind: 'unproven' })
+  })
+
+  it.each([
+    '---   \nnotarium-id: note-id\n',
+    '---\t\nnotarium-id: note-id\n',
+    '---\r',
+    '---\rnotarium-id: foreign-id01\r---\rbody',
+    '--- # authored\nnotarium-id: foreign-id01\n',
+  ])('treats malformed opener-like bytes as unproven: %j', (source) => {
+    expect(exactOwnerObservation(bytes(source))).toEqual({ kind: 'unproven' })
+  })
   it('keeps exact authored bytes and translates YAML ranges across Unicode', () => {
     const raw = [
       '---\r',

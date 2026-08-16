@@ -22,6 +22,10 @@ export type FolderResolveContext = {
 /** Folder context belongs to an index build but is not itself a link key. Keeping it
  *  out of the Map prevents reserved metadata from participating in normal resolution. */
 const folderContextByIndex = new WeakMap<LinkIndex, FolderResolveContext>()
+/** Legacy evidence is monotonic and can therefore become ambiguous. Remember
+ * every claimed key (including withheld ambiguous ones) so lower folder history
+ * cannot turn an intentional ghost into an order-dependent target. */
+const protectedLegacyKeysByIndex = new WeakMap<LinkIndex, ReadonlySet<string>>()
 
 const pathParts = (path: string): string[] => path.split('/').filter(Boolean)
 const prefixOf = (parts: readonly string[], length: number): string =>
@@ -150,7 +154,8 @@ export const buildLinkIndex = (
   notes: Iterable<NoteMeta>,
   folderAliases?: readonly FolderAlias[],
   /** Optional out-param: for each index key, which axis CLAIMED it —
-   *  `current` (pass 1), `slug` (1.5), `note-alias` (2), `folder-alias` (3). The
+   *  `current` (pass 1), `slug` (1.5), `note-alias` (authored pass 2 or legacy
+   *  identity pass 2.5), `folder-alias` (3). The
    *  grooming health derivation passes one in to learn HOW each edge resolved; the
    *  hot resolve paths (engine/read-model/fake) pass none and pay nothing. A
    *  key is claimed exactly once (passes 1.5–3 only fill FREE keys), so its
@@ -171,6 +176,8 @@ export const buildLinkIndex = (
     currentPaths: [...new Set([...currentFoldersOf(list), ...(currentFolders ?? [])])],
   }
   folderContextByIndex.set(index, folderContext)
+  const protectedLegacyKeys = new Set<string>()
+  protectedLegacyKeysByIndex.set(index, protectedLegacyKeys)
   const idOf = (n: NoteMeta): string => n.id ?? n.filePath // note-id or storage path (bare engine)
 
   const claimCurrent = (key: string, id: string): void => {
@@ -199,7 +206,6 @@ export const buildLinkIndex = (
       provenance?.set(key, RESOLVED_VIA.current)
     }
   }
-
   for (const n of list) {
     if (n.id) {
       registerLinkIdentity(index, n.id, idOf(n))
@@ -255,6 +261,34 @@ export const buildLinkIndex = (
         index.set(key, id)
         provenance?.set(key, RESOLVED_VIA.noteAlias)
       }
+    }
+  }
+  // Pass 2.5 — registry-owned legacy storage names. Aggregate every claimant
+  // before publishing: one surviving id resolves, multiple ids deliberately
+  // resolve to a ghost. This axis is weaker than all live/authored note names,
+  // but its ambiguity is stronger than folder history below it.
+  const legacyClaims = new Map<string, Set<string>>()
+
+  for (const n of list) {
+    const id = idOf(n)
+
+    for (const alias of n.legacyNameAliases ?? []) {
+      const key = nameKey(alias)
+
+      if (!key) {
+        continue
+      }
+      protectedLegacyKeys.add(key)
+      protectedLegacyKeys.add(rawPathIndexKey(alias))
+      const targets = legacyClaims.get(key) ?? new Set<string>()
+      targets.add(id)
+      legacyClaims.set(key, targets)
+    }
+  }
+  for (const [key, targets] of legacyClaims) {
+    if (targets.size === 1 && !index.has(key)) {
+      index.set(key, [...targets][0]!)
+      provenance?.set(key, RESOLVED_VIA.noteAlias)
     }
   }
   // Pass 3 — FOLDER PATH aliases. A folder rename/move retires its old
@@ -319,14 +353,20 @@ export const buildLinkIndex = (
   // the first alias-array entry win.
   for (const [candidate, targets] of rawFolderAliasClaims) {
     const key = rawPathIndexKey(candidate)
+    const normalizedKey = namePathKey(candidate)
 
-    if (targets.size === 1 && !index.has(key)) {
+    if (
+      targets.size === 1 &&
+      !index.has(key) &&
+      !protectedLegacyKeys.has(key) &&
+      !protectedLegacyKeys.has(normalizedKey)
+    ) {
       index.set(key, [...targets][0]!)
       provenance?.set(key, RESOLVED_VIA.folderAlias)
     }
   }
   for (const [key, targets] of folderAliasClaims) {
-    if (targets.size === 1 && !index.has(key)) {
+    if (targets.size === 1 && !index.has(key) && !protectedLegacyKeys.has(key)) {
       index.set(key, [...targets][0]!)
       provenance?.set(key, RESOLVED_VIA.folderAlias)
     }
@@ -453,10 +493,12 @@ export const resolveLink = (
   // Track WHICH key hit so provenance reads the right entry.
   let matchedKey = path
   let hit = path ? index.get(path) : undefined
+  let blocked = path ? protectedLegacyKeysByIndex.get(index)?.has(path) === true : false
 
-  if (hit === undefined && path.includes('/')) {
+  if (hit === undefined && !blocked && path.includes('/')) {
     hit = index.get(last)
     matchedKey = last
+    blocked = protectedLegacyKeysByIndex.get(index)?.has(last) === true
   }
   if (hit !== undefined) {
     return { targetId: hit, resolvedVia: provenance?.get(matchedKey) }

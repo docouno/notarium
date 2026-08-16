@@ -40,8 +40,13 @@ const claimLane = (
   loadAll: async () => [],
   claimMany: async (records) => {
     await claim(records)
-    return records.map((record) => ({ id: record.id, status: 'claimed' as const }))
+    return records.map((record) => ({
+      id: record.id,
+      status: 'claimed' as const,
+      legacyNameAliases: record.legacyNameAliases,
+    }))
   },
+  mergeLegacyNameAlias: async () => ({ status: 'not-owned' }),
   settleFileClaim: async () => {
     throw new Error('these tests never settle a file claim')
   },
@@ -65,9 +70,14 @@ describe('IdentityRegistry — a minted id another space already owns', () => {
         return records.map((r) =>
           batches.length === 1
             ? { id: r.id, status: 'foreign-owner' as const, owner: { ...r, space: 'other' } }
-            : { id: r.id, status: 'claimed' as const },
+            : {
+                id: r.id,
+                status: 'claimed' as const,
+                legacyNameAliases: r.legacyNameAliases,
+              },
         )
       },
+      mergeLegacyNameAlias: async () => ({ status: 'not-owned' }),
       settleFileClaim: async () => {
         throw new Error('this test never settles a file claim')
       },
@@ -138,6 +148,7 @@ describe('IdentityRegistry — a local mutation inside the settlement window', (
       init: () => store.init(),
       loadAll: (space) => store.loadAll(space),
       claimMany: (records) => store.claimMany(records),
+      mergeLegacyNameAlias: (input) => store.mergeLegacyNameAlias(input),
       findById: (id) => store.findById(id),
       settleFileClaim: async (claim) => {
         open.resolve()
@@ -430,6 +441,7 @@ describe('IdentityRegistry — persistence', () => {
     const { persistence } = fakePersistence([
       {
         id: 'live-id-00001',
+        legacyNameAliases: [],
         filePath: 'demo/a.md',
         space: 'main',
         createdAt: null,
@@ -438,6 +450,7 @@ describe('IdentityRegistry — persistence', () => {
       },
       {
         id: 'dead-id-00001',
+        legacyNameAliases: [],
         filePath: 'demo/gone.md',
         space: 'main',
         createdAt: null,
@@ -691,6 +704,230 @@ describe('IdentityRegistry — persistence', () => {
   })
 })
 
+describe('IdentityRegistry — durable legacy name aliases', () => {
+  it('keeps alias-only debt out of the structural write-behind and returns copies', async () => {
+    const { persistence, upserted } = fakePersistence()
+    const reg = makeRegistry(persistence)
+    const id = reg.ensure('demo/a.md').id
+
+    await reg.flush()
+    upserted.length = 0
+
+    expect(reg.rememberLegacyNameAlias(id, 'historic-name')).toBe(true)
+    expect(reg.rememberLegacyNameAlias(id, 'historic-name')).toBe(false)
+    const snapshot = reg.recordFor(id)!
+    ;(snapshot.legacyNameAliases as string[]).push('mutated-copy')
+    expect(reg.recordFor(id)?.legacyNameAliases).toEqual(['historic-name'])
+
+    await reg.flush()
+    expect(upserted).toEqual([])
+    expect((await persistence.findById(id))?.legacyNameAliases).toEqual([])
+
+    await reg.persistLegacyNameAlias(id, 'historic-name')
+    expect((await persistence.findById(id))?.legacyNameAliases).toEqual(['historic-name'])
+    expect(upserted).toEqual([])
+  })
+
+  it('honestly keeps aliases process-local when persistence is absent', async () => {
+    const reg = makeRegistry()
+    const id = reg.ensure('demo/a.md').id
+
+    await expect(reg.persistLegacyNameAlias(id, 'historic-name')).resolves.toMatchObject({
+      id,
+      legacyNameAliases: ['historic-name'],
+    })
+  })
+
+  it('establishes a new row before acknowledging its alias without flushing unrelated dirt', async () => {
+    const { persistence, upserted } = fakePersistence()
+    const reg = makeRegistry(persistence)
+    const target = reg.ensure('target.md').id
+    const unrelated = reg.ensure('unrelated.md').id
+
+    await reg.persistLegacyNameAlias(target, 'historic-name')
+
+    expect((await persistence.findById(target))?.legacyNameAliases).toEqual(['historic-name'])
+    expect(upserted.map((row) => row.id)).toContain(target)
+    expect(upserted.map((row) => row.id)).not.toContain(unrelated)
+    expect(await persistence.findById(unrelated)).toBeNull()
+  })
+
+  it('carries an alias ACK queued during settlement onto the authoritative final id', async () => {
+    const store = new InMemoryIdentity()
+    const entered = deferred()
+    const release = deferred()
+    const persistence: IdentityPersistence = {
+      init: () => store.init(),
+      loadAll: (space) => store.loadAll(space),
+      findById: (id) => store.findById(id),
+      claimMany: (records) => store.claimMany(records),
+      mergeLegacyNameAlias: (input) => store.mergeLegacyNameAlias(input),
+      settleFileClaim: async (claim) => {
+        entered.resolve()
+        await release.promise
+        return store.settleFileClaim(claim)
+      },
+      close: () => store.close(),
+    }
+    const reg = makeRegistry(persistence)
+    const previousId = reg.ensure('demo/a.md').id
+    const settling = reg.settleFileClaim('demo/a.md', 'final-note-id')
+
+    await entered.promise
+    const persisting = reg.persistLegacyNameAlias(previousId, 'historic-name')
+    release.resolve()
+    await Promise.all([settling, persisting])
+
+    expect(reg.recordFor(previousId)).toBeUndefined()
+    expect(reg.recordFor('final-note-id')?.legacyNameAliases).toEqual(['historic-name'])
+    expect((await store.findById('final-note-id'))?.legacyNameAliases).toEqual(['historic-name'])
+  })
+
+  it('persists aliases on an identity resurrected after it was once superseded', async () => {
+    const store = new InMemoryIdentity()
+    const reg = makeRegistry(store)
+    const previousId = reg.ensure('demo/a.md').id
+
+    await reg.flush()
+    await reg.settleFileClaim('demo/a.md', 'final-note-id')
+    reg.ensure('demo/resurrected.md')
+    await reg.settleFileClaim('demo/resurrected.md', previousId)
+    await reg.persistLegacyNameAlias(previousId, 'resurrected-name')
+
+    expect((await store.findById(previousId))?.legacyNameAliases).toEqual(['resurrected-name'])
+    expect((await store.findById('final-note-id'))?.legacyNameAliases).toEqual([])
+  })
+
+  it('reverses a settlement without leaving an alias successor cycle', async () => {
+    const store = new InMemoryIdentity()
+    const reg = makeRegistry(store)
+    const previousId = reg.ensure('demo/a.md').id
+
+    await reg.flush()
+    await reg.settleFileClaim('demo/a.md', 'final-note-id')
+    await reg.settleFileClaim('demo/a.md', previousId)
+
+    await expect(reg.persistLegacyNameAlias(previousId, 'returned-name')).resolves.toMatchObject({
+      id: previousId,
+      legacyNameAliases: ['returned-name'],
+    })
+    expect((await store.findById(previousId))?.legacyNameAliases).toEqual(['returned-name'])
+  })
+
+  it('keeps a late alias as exact debt while an older structural claim is pending', async () => {
+    const store = new InMemoryIdentity()
+    const entered = deferred()
+    const release = deferred()
+    const persistence: IdentityPersistence = {
+      init: () => store.init(),
+      loadAll: (space) => store.loadAll(space),
+      findById: (id) => store.findById(id),
+      claimMany: async (records) => {
+        entered.resolve()
+        await release.promise
+        return store.claimMany(records)
+      },
+      mergeLegacyNameAlias: (input) => store.mergeLegacyNameAlias(input),
+      settleFileClaim: (claim) => store.settleFileClaim(claim),
+      close: () => store.close(),
+    }
+    const reg = makeRegistry(persistence)
+    const id = reg.ensure('demo/a.md').id
+    const flushing = reg.flush()
+
+    await entered.promise
+    const persisting = reg.persistLegacyNameAlias(id, 'late-alias')
+    release.resolve()
+    await Promise.all([flushing, persisting])
+
+    expect((await store.findById(id))?.legacyNameAliases).toEqual(['late-alias'])
+  })
+})
+
+describe('IdentityRegistry — causal identity adoption', () => {
+  const durable = (over: Partial<IdentityRecord> = {}): IdentityRecord => ({
+    id: 'causal-note1',
+    filePath: 'old.md',
+    space: 'main',
+    createdAt: '2020-01-01T00:00:00.000Z',
+    materialized: true,
+    deletedAt: null,
+    addressRevision: 1,
+    legacyNameAliases: [],
+    ...over,
+  })
+
+  it('always unions aliases but keeps every structurally dirty local field', async () => {
+    const store = new InMemoryIdentity([durable()])
+    const reg = makeRegistry(store)
+
+    await reg.load()
+    reg.rename('old.md', 'local-new.md')
+    store.rows.set(
+      'causal-note1',
+      durable({
+        filePath: 'durable-newer.md',
+        addressRevision: 9,
+        legacyNameAliases: ['durable-alias'],
+      }),
+    )
+
+    await reg.adoptPersisted('causal-note1')
+    expect(reg.recordFor('causal-note1')).toMatchObject({
+      filePath: 'local-new.md',
+      addressRevision: 1,
+      legacyNameAliases: ['durable-alias'],
+    })
+
+    await reg.flush()
+    expect(await store.findById('causal-note1')).toMatchObject({
+      filePath: 'local-new.md',
+      legacyNameAliases: ['durable-alias'],
+    })
+  })
+
+  it('applies the clean revision algebra and fails closed on a repeated equal conflict', async () => {
+    const store = new InMemoryIdentity([durable()])
+    const reg = makeRegistry(store)
+
+    await reg.load()
+    store.rows.set(
+      'causal-note1',
+      durable({
+        filePath: 'lower.md',
+        addressRevision: 0,
+        legacyNameAliases: ['lower-alias'],
+      }),
+    )
+    await reg.adoptPersisted('causal-note1')
+    expect(reg.recordFor('causal-note1')).toMatchObject({
+      filePath: 'old.md',
+      legacyNameAliases: ['lower-alias'],
+    })
+
+    store.rows.set(
+      'causal-note1',
+      durable({
+        filePath: 'greater.md',
+        addressRevision: 2,
+        legacyNameAliases: ['greater-alias'],
+      }),
+    )
+    await reg.adoptPersisted('causal-note1')
+    expect(reg.recordFor('causal-note1')).toMatchObject({
+      filePath: 'greater.md',
+      addressRevision: 2,
+      legacyNameAliases: ['greater-alias', 'lower-alias'],
+    })
+
+    store.rows.set('causal-note1', durable({ filePath: 'conflict.md', addressRevision: 2 }))
+    await expect(reg.adoptPersisted('causal-note1')).rejects.toThrow(
+      'conflicting address revision 2',
+    )
+    expect(reg.recordFor('causal-note1')?.filePath).toBe('greater.md')
+  })
+})
+
 describe('IdentityRegistry — space (#16 groundwork)', () => {
   it('stamps its space on every record it mints or adopts', async () => {
     const reg = new IdentityRegistry({ space: 'work', now: () => new Date(NOW) })
@@ -708,6 +945,7 @@ describe('IdentityRegistry — space (#16 groundwork)', () => {
       // The same file_path exists in BOTH spaces — normal once spaces are real.
       {
         id: 'work-id-00001',
+        legacyNameAliases: [],
         filePath: 'demo/a.md',
         space: 'work',
         createdAt: null,
@@ -716,6 +954,7 @@ describe('IdentityRegistry — space (#16 groundwork)', () => {
       },
       {
         id: 'play-id-00001',
+        legacyNameAliases: [],
         filePath: 'demo/a.md',
         space: 'play',
         createdAt: null,

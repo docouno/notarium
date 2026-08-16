@@ -150,6 +150,104 @@ describe('buildLinkIndex — alias-history (#100)', () => {
   })
 })
 
+describe('buildLinkIndex — legacy storage-name aliases (#340)', () => {
+  const withLegacy = (
+    filePath: string,
+    title: string,
+    id: string,
+    legacyNameAliases: readonly string[],
+  ): NoteMeta => ({ ...meta(filePath, title), id, legacyNameAliases })
+
+  it('resolves a unique inferred alias after the note leaves its legacy path', () => {
+    const provenance = new Map<string, ResolvedVia>()
+    const index = buildLinkIndex(
+      [withLegacy('қазақстан-жоспары.md', 'Қазақстан жоспары', 'kz-id', ['aza-stan-zhospary'])],
+      undefined,
+      provenance,
+    )
+
+    expect(resolveLink('aza-stan-zhospary', index, provenance)).toMatchObject({
+      targetId: 'kz-id',
+      resolvedVia: 'note-alias',
+    })
+  })
+
+  it('withholds an ambiguous legacy key regardless of inventory order', () => {
+    const notes = [
+      withLegacy('a.md', 'A', 'a-id', ['historic']),
+      withLegacy('b.md', 'B', 'b-id', ['historic']),
+    ]
+
+    for (const inventory of [notes, [...notes].reverse()]) {
+      expect(resolveLink('historic', buildLinkIndex(inventory))).toMatchObject({
+        targetId: 'ghost:historic',
+        ghost: { target: 'historic' },
+      })
+    }
+  })
+
+  it('keeps live, custom and authored names above legacy evidence', () => {
+    const legacy = withLegacy('legacy.md', 'Legacy Target', 'legacy-id', ['claimed'])
+
+    expect(
+      resolveLink(
+        'claimed',
+        buildLinkIndex([legacy, { ...meta('live.md', 'claimed'), id: 'live-id' }]),
+      ).targetId,
+    ).toBe('live-id')
+    expect(
+      resolveLink(
+        'claimed',
+        buildLinkIndex([legacy, { ...meta('slug.md', 'Slug'), id: 'slug-id', slug: 'claimed' }]),
+      ).targetId,
+    ).toBe('slug-id')
+    expect(
+      resolveLink(
+        'claimed',
+        buildLinkIndex([
+          legacy,
+          { ...meta('authored.md', 'Authored'), id: 'authored-id', aliases: ['claimed'] },
+        ]),
+      ).targetId,
+    ).toBe('authored-id')
+  })
+
+  it('keeps a unique legacy owner above exact-raw and normalized folder history', () => {
+    const index = buildLinkIndex(
+      [
+        withLegacy('legacy.md', 'Legacy', 'legacy-id', ['historic']),
+        { ...meta('archive.md', 'Folder target'), id: 'folder-id' },
+      ],
+      [{ current: 'archive', alias: 'historic' }],
+    )
+
+    expect(resolveLink('historic', index).targetId).toBe('legacy-id')
+    expect(resolveLink('HISTORIC', index).targetId).toBe('legacy-id')
+  })
+
+  it('does not let folder history resolve an ambiguous legacy claim', () => {
+    const notes = [
+      withLegacy('a.md', 'A', 'a-id', ['historic']),
+      withLegacy('b.md', 'B', 'b-id', ['historic']),
+      { ...meta('archive.md', 'Folder target'), id: 'folder-id' },
+    ]
+
+    for (const ref of ['historic', 'HISTORIC']) {
+      expect(
+        resolveLink(ref, buildLinkIndex(notes, [{ current: 'archive', alias: 'historic' }])),
+      ).toMatchObject({ ghost: { target: 'historic' } })
+    }
+    for (const inventory of [notes, [...notes].reverse()]) {
+      expect(
+        resolveLink(
+          'HISTORIC',
+          buildLinkIndex(inventory, [{ current: 'archive', alias: 'HISTORIC' }]),
+        ),
+      ).toMatchObject({ ghost: { target: 'historic' } })
+    }
+  })
+})
+
 describe('buildLinkIndex — custom slug (#100)', () => {
   const withSlug = (filePath: string, title: string, slug: string): NoteMeta => ({
     ...meta(filePath, title),

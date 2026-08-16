@@ -1,3 +1,4 @@
+import { unionLegacyNameAliases } from '../../identity'
 import type { IdentityRecord } from '../../knowledgeStore'
 import type { InMemoryRevisionPersistence } from '../../revisionJournal/inMemoryRevisionPersistence'
 import {
@@ -20,6 +21,11 @@ export type InMemoryRestoreTerminalDependencies = {
   ownerProofs: InMemoryOwnerProofPersistence
   outbox: InMemoryCausalOutboxPersistence
 }
+
+const copyIdentity = (record: IdentityRecord): IdentityRecord => ({
+  ...record,
+  legacyNameAliases: [...record.legacyNameAliases],
+})
 
 const parseResult = (raw: string | null, operationId: string): RestoreTerminalResult => {
   if (!raw) {
@@ -64,7 +70,12 @@ export class InMemoryRestoreTerminalPersistence implements RestoreTerminalPersis
   async init(): Promise<void> {}
 
   setIdentity(record: IdentityRecord): void {
-    this.identities.set(record.id, { ...record })
+    this.identities.set(record.id, copyIdentity(record))
+  }
+
+  identityForTest(id: string): IdentityRecord | null {
+    const record = this.identities.get(id)
+    return record ? copyIdentity(record) : null
   }
 
   async commit(input: RestoreTerminalCommit) {
@@ -318,7 +329,7 @@ export class InMemoryRestoreTerminalPersistence implements RestoreTerminalPersis
     const proofSnapshot = this.dependencies.ownerProofs.snapshotForRestoreTerminal()
     const operationSnapshot = this.dependencies.operations.snapshotForRestoreTerminal()
     const identitySnapshot = new Map(
-      [...this.identities].map(([id, record]) => [id, { ...record }]),
+      [...this.identities].map(([id, record]) => [id, copyIdentity(record)]),
     )
 
     try {
@@ -333,7 +344,17 @@ export class InMemoryRestoreTerminalPersistence implements RestoreTerminalPersis
       const addressRevision =
         (identity.addressRevision ?? input.expectedIdentity.addressRevision) +
         (addressChanged ? 1 : 0)
-      this.identities.set(operation.noteId, { ...input.identity, addressRevision })
+      this.identities.set(
+        operation.noteId,
+        copyIdentity({
+          ...input.identity,
+          legacyNameAliases: unionLegacyNameAliases(
+            identity.legacyNameAliases,
+            input.identity.legacyNameAliases,
+          ),
+          addressRevision,
+        }),
+      )
       this.dependencies.ownerProofs.setAddress(operation.noteId, operation.space, addressRevision)
       const adoption = this.dependencies.ownerProofs.adoptForRestoreTerminal({
         ...input.proof,
@@ -367,7 +388,7 @@ export class InMemoryRestoreTerminalPersistence implements RestoreTerminalPersis
       this.dependencies.revisions.restoreForRestoreTerminal(revisionSnapshot)
       this.identities.clear()
       for (const [id, record] of identitySnapshot) {
-        this.identities.set(id, { ...record })
+        this.identities.set(id, copyIdentity(record))
       }
       throw error
     }

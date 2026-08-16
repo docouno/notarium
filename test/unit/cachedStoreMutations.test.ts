@@ -18,12 +18,14 @@ import {
   InMemoryRevisionPersistence,
   type KnowledgeStore,
   type MoveInput,
+  RevisionJournal,
   type StoreDelta,
   type StoreEvent,
   type WriteInput,
 } from '@notarium/core'
 import { createNotariumStore } from '@notarium/engine'
 import { InMemoryStore } from '@notarium/engine-memory'
+import { InMemoryIdentity } from '../fake-server/identity'
 
 type Harness = {
   inner: KnowledgeStore
@@ -348,7 +350,700 @@ describe('CachedStore mutation capability honesty', () => {
   })
 })
 
+describe('CachedStore deferred legacy graph repair', () => {
+  const createOutsideGraphDebt = async () => {
+    const now = '2026-07-22T12:00:00.000Z'
+    const inner = new InMemoryStore({
+      space: 'main',
+      now,
+      notes: [
+        {
+          id: 'source-note',
+          title: 'Source',
+          filePath: 'source.md',
+          content: '[[aza-stan-zhospary]] [[later-victim]]',
+        },
+        {
+          id: 'later-victim',
+          title: 'Later victim',
+          filePath: 'later-victim.md',
+          content: 'victim body',
+        },
+        {
+          id: 'victim-source',
+          title: 'Victim source',
+          filePath: 'victim-source.md',
+          content: '[[later-victim]]',
+        },
+      ],
+    })
+    const store = new CachedStore({
+      inner,
+      pollIntervalMs: 0,
+      now: () => new Date(now),
+    })
+    const changed: StoreEvent[] = []
+
+    store.subscribe((event) => {
+      if (event.type === 'changed') {
+        changed.push(event)
+      }
+    })
+    await store.start()
+    changed.length = 0
+    const read = inner.read.bind(inner)
+    const graph = inner.graph.bind(inner)
+
+    inner.read = async (id, opts) => {
+      if (id.includes('source-note')) {
+        throw new Error('outside source read failed')
+      }
+
+      return read(id, opts)
+    }
+    inner.graph = async () => {
+      throw new Error('outside graph failed')
+    }
+    try {
+      await expect(
+        store.write({
+          title: 'Қазақстан жоспары',
+          fileName: 'aza-stan-zhospary',
+          content: 'target',
+        }),
+      ).rejects.toThrow('outside graph failed')
+    } finally {
+      inner.read = read
+      inner.graph = graph
+    }
+    const target = (await store.list()).find(({ filePath }) =>
+      filePath.endsWith('aza-stan-zhospary.md'),
+    )
+
+    if (!target?.id) {
+      throw new Error('committed target is missing after graph repair failure')
+    }
+
+    return { inner, store, changed, targetId: target.id }
+  }
+
+  it('keeps a causal identity repair inside pending graph debt', async () => {
+    const now = '2026-07-22T12:00:00.000Z'
+    const provisionalId = 'causal-provisional'
+    const durableId = 'causal-durable'
+    const inner = new InMemoryStore({
+      space: 'main',
+      now,
+      notes: [
+        {
+          id: 'source-note',
+          title: 'Source',
+          filePath: 'source.md',
+          content: '[[aza-stan-zhospary]]',
+        },
+        {
+          id: provisionalId,
+          title: 'Restored',
+          filePath: 'restored.md',
+          content: 'restored body',
+        },
+      ],
+    })
+    const identity = new InMemoryIdentity([
+      {
+        id: provisionalId,
+        legacyNameAliases: [],
+        addressRevision: 1,
+        filePath: 'restored.md',
+        space: 'main',
+        createdAt: now,
+        materialized: true,
+        deletedAt: null,
+      },
+    ])
+    const store = new CachedStore({
+      inner,
+      identityPersistence: identity,
+      space: 'main',
+      pollIntervalMs: 0,
+      now: () => new Date(now),
+    })
+    const changed: StoreEvent[] = []
+
+    store.subscribe((event) => {
+      if (event.type === 'changed') {
+        changed.push(event)
+      }
+    })
+    await store.start()
+    changed.length = 0
+    const read = inner.read.bind(inner)
+    const graph = inner.graph.bind(inner)
+
+    inner.read = async (id, opts) => {
+      if (id.includes('source-note')) {
+        throw new Error('outside source read failed')
+      }
+
+      return read(id, opts)
+    }
+    inner.graph = async () => {
+      throw new Error('outside graph failed')
+    }
+    try {
+      await expect(
+        store.write({
+          title: 'Қазақстан жоспары',
+          fileName: 'aza-stan-zhospary',
+          content: 'target',
+        }),
+      ).rejects.toThrow('outside graph failed')
+    } finally {
+      inner.read = read
+      inner.graph = graph
+    }
+    const targetId = (await store.list()).find(({ filePath }) =>
+      filePath.endsWith('aza-stan-zhospary.md'),
+    )?.id
+    const provisional = identity.rows.get(provisionalId)
+
+    if (!targetId || !provisional) {
+      throw new Error('graph-debt or causal identity fixture did not initialize')
+    }
+    identity.rows.set(provisionalId, {
+      ...provisional,
+      addressRevision: 2,
+      deletedAt: now,
+    })
+    identity.rows.set(durableId, {
+      ...provisional,
+      id: durableId,
+      addressRevision: 2,
+      deletedAt: null,
+    })
+
+    try {
+      await store.adoptCausalIdentity(durableId)
+
+      expect(await store.list()).toContainEqual(
+        expect.objectContaining({ id: durableId, filePath: 'restored.md' }),
+      )
+      expect(changed).toEqual([])
+
+      await store.graph()
+      expect(changed).toEqual([
+        expect.objectContaining({
+          type: 'changed',
+          upserts: expect.arrayContaining([targetId, durableId]),
+          removed: expect.arrayContaining([provisionalId]),
+        }),
+      ])
+      await store.graph()
+      expect(changed).toHaveLength(1)
+    } finally {
+      await store.stop()
+    }
+  })
+
+  it.each([
+    ['ordinary', false],
+    ['bulk', true],
+  ] as const)('repairs an ambiguous legacy ghost after %s claimant deletion', async (_, bulk) => {
+    const inner = new InMemoryStore({
+      space: 'main',
+      notes: [
+        {
+          id: 'source-note',
+          title: 'Source',
+          filePath: 'source.md',
+          content: '[[historic-name]]',
+        },
+        {
+          id: 'legacy-one',
+          title: 'First',
+          filePath: 'first.md',
+          content: 'first',
+          legacyNameAliases: ['historic-name'],
+        },
+        {
+          id: 'legacy-two',
+          title: 'Second',
+          filePath: 'second.md',
+          content: 'second',
+          legacyNameAliases: ['historic-name'],
+        },
+      ],
+    })
+    const store = new CachedStore({ inner, pollIntervalMs: 0 })
+
+    await store.start()
+    try {
+      expect((await store.graph()).links).not.toContainEqual(
+        expect.objectContaining({ source: 'source-note', target: 'legacy-one' }),
+      )
+      if (bulk) {
+        store.beginBulk()
+      }
+      await store.remove('legacy-two')
+      if (bulk) {
+        await store.endBulk()
+      }
+
+      await expect(store.resolveWikilink('historic-name')).resolves.toMatchObject({
+        id: 'legacy-one',
+      })
+      expect((await store.graph()).links).toContainEqual(
+        expect.objectContaining({ source: 'source-note', target: 'legacy-one' }),
+      )
+    } finally {
+      store.stop()
+      await store.settle()
+    }
+  })
+
+  it('retains ordinary repair debt and blocks graph readers until retry succeeds', async () => {
+    const inner = new InMemoryStore({
+      space: 'main',
+      notes: [
+        {
+          id: 'source-note',
+          title: 'Source',
+          filePath: 'source.md',
+          content: '[[aza-stan-zhospary]]',
+        },
+      ],
+    })
+    const store = new CachedStore({ inner, pollIntervalMs: 0 })
+    const changed: StoreEvent[] = []
+
+    store.subscribe((event) => {
+      if (event.type === 'changed') {
+        changed.push(event)
+      }
+    })
+    await store.start()
+    changed.length = 0
+
+    try {
+      const read = inner.read.bind(inner)
+      const graph = inner.graph.bind(inner)
+
+      inner.read = async (id, opts) => {
+        if (id.includes('source-note')) {
+          throw new Error('ordinary source read failed')
+        }
+
+        return read(id, opts)
+      }
+      inner.graph = async () => {
+        throw new Error('ordinary graph failed')
+      }
+      await expect(
+        store.write({
+          title: 'Қазақстан жоспары',
+          fileName: 'aza-stan-zhospary',
+          content: 'target',
+        }),
+      ).rejects.toThrow('ordinary graph failed')
+      expect(changed).toEqual([])
+      expect(
+        (store as unknown as { bulkGraphContextSources: Set<string> }).bulkGraphContextSources,
+      ).toContain('source-note')
+
+      inner.read = read
+      inner.graph = graph
+      const repaired = await store.graph()
+      const target = (await store.list()).find(({ filePath }) =>
+        filePath.endsWith('aza-stan-zhospary.md'),
+      )
+
+      expect(target?.id).toBeDefined()
+      expect(repaired.links).toContainEqual(
+        expect.objectContaining({ source: 'source-note', target: target?.id }),
+      )
+      expect(changed).toEqual([
+        expect.objectContaining({
+          type: 'changed',
+          upserts: [target?.id],
+          removed: [],
+        }),
+      ])
+      await store.graph()
+      await nextTurn()
+      expect(changed).toHaveLength(1)
+      expect(
+        (store as unknown as { bulkGraphContextSources: Set<string> }).bulkGraphContextSources.size,
+      ).toBe(0)
+    } finally {
+      store.stop()
+      await store.settle()
+    }
+  })
+
+  it('nets deferred publication into a subsequent ordinary removal', async () => {
+    const { store, changed, targetId } = await createOutsideGraphDebt()
+
+    try {
+      await store.remove(targetId)
+
+      expect(changed).toEqual([
+        expect.objectContaining({ type: 'changed', upserts: [], removed: [targetId] }),
+      ])
+      await store.graph()
+      await nextTurn()
+      expect(changed).toHaveLength(1)
+    } finally {
+      store.stop()
+      await store.settle()
+    }
+  })
+
+  it('nets outside publication debt into one final bulk removal', async () => {
+    const { store, changed, targetId } = await createOutsideGraphDebt()
+
+    try {
+      store.beginBulk()
+      await store.remove(targetId)
+      await store.endBulk()
+
+      expect(changed).toEqual([
+        expect.objectContaining({ type: 'changed', upserts: [], removed: [targetId] }),
+      ])
+      await store.graph()
+      await nextTurn()
+      expect(changed).toHaveLength(1)
+    } finally {
+      store.stop()
+      await store.settle()
+    }
+  })
+
+  it('publishes an external reconcile together with the graph debt it repairs', async () => {
+    const { inner, store, changed, targetId } = await createOutsideGraphDebt()
+
+    try {
+      const debt = store as unknown as {
+        graphContextChangedPending: boolean
+        graphContextChangedUpserts: Set<string>
+      }
+
+      expect(changed).toEqual([])
+      expect(debt.graphContextChangedPending).toBe(true)
+      expect(debt.graphContextChangedUpserts).toContain(targetId)
+      const changes = inner.changes.bind(inner)
+
+      await inner.remove('later-victim')
+      const inventory = await inner.list()
+      let staged = true
+
+      inner.changes = async (cursor) => {
+        if (staged) {
+          staged = false
+          return { cursor: 'external-removal', inventory, upserts: [] }
+        }
+
+        return changes(cursor)
+      }
+      await store.reconcile()
+
+      expect((await store.list()).map(({ id }) => id)).toContain(targetId)
+      expect((await store.list()).map(({ id }) => id)).not.toContain('later-victim')
+      await nextTurn()
+
+      expect(changed).toEqual([
+        expect.objectContaining({
+          type: 'changed',
+          upserts: expect.arrayContaining([targetId]),
+          removed: ['later-victim'],
+        }),
+      ])
+      expect((await store.graph()).links).toContainEqual(
+        expect.objectContaining({ source: 'source-note', target: targetId }),
+      )
+      expect((await store.graph()).links).not.toContainEqual(
+        expect.objectContaining({ source: 'source-note', target: 'later-victim' }),
+      )
+      await nextTurn()
+      expect(changed).toHaveLength(1)
+    } finally {
+      store.stop()
+      await store.settle()
+    }
+  })
+
+  it('keeps post-restore historical alias publication inside pending graph debt', async () => {
+    const restoredId = 'restorable-note'
+    const revisions = new InMemoryRevisionPersistence()
+    const journal = new RevisionJournal({ persistence: revisions, space: 'main' })
+
+    await journal.record({
+      noteId: restoredId,
+      kind: 'external',
+      principal: null,
+      content: 'restorable',
+      title: 'Former title',
+      class: 'user-doc',
+      tags: [],
+      slug: null,
+    })
+    const inner = new InMemoryStore({
+      space: 'main',
+      notes: [
+        {
+          id: 'source-note',
+          title: 'Source',
+          filePath: 'source.md',
+          content: '[[aza-stan-zhospary]] [[Former title]]',
+        },
+        {
+          id: restoredId,
+          title: 'Current title',
+          filePath: 'current-title.md',
+          content: 'restorable',
+        },
+      ],
+    })
+    const store = new CachedStore({
+      inner,
+      revisionPersistence: revisions,
+      pollIntervalMs: 0,
+    })
+    const changed: StoreEvent[] = []
+
+    store.subscribe((event) => {
+      if (event.type === 'changed') {
+        changed.push(event)
+      }
+    })
+    await store.start()
+
+    try {
+      await store.remove(restoredId)
+      changed.length = 0
+      const read = inner.read.bind(inner)
+      const graph = inner.graph.bind(inner)
+
+      inner.read = async (id, opts) => {
+        if (id.includes('source-note')) {
+          throw new Error('restore source read failed')
+        }
+
+        return read(id, opts)
+      }
+      inner.graph = async () => {
+        throw new Error('restore graph failed')
+      }
+      try {
+        await expect(
+          store.write({
+            title: 'Қазақстан жоспары',
+            fileName: 'aza-stan-zhospary',
+            content: 'target',
+          }),
+        ).rejects.toThrow('restore graph failed')
+      } finally {
+        inner.read = read
+        inner.graph = graph
+      }
+      const target = (await store.list()).find(({ filePath }) =>
+        filePath.endsWith('aza-stan-zhospary.md'),
+      )
+
+      await store.restoreFromTrash(restoredId)
+      await nextTurn()
+      expect(changed).toEqual([])
+
+      expect((await store.graph()).links).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ source: 'source-note', target: target?.id }),
+          expect.objectContaining({ source: 'source-note', target: restoredId }),
+        ]),
+      )
+      await nextTurn()
+      expect(changed).toEqual([
+        expect.objectContaining({
+          type: 'changed',
+          upserts: expect.arrayContaining([target?.id, restoredId]),
+          removed: [],
+        }),
+      ])
+    } finally {
+      store.stop()
+      await store.settle()
+    }
+  })
+
+  it('repairs claimant deletion through the production fallback graph', async () => {
+    const { inner, store, close } = await createNotariumHarness()
+
+    try {
+      await store.makeDir?.('one')
+      await store.makeDir?.('two')
+      const source = await store.write({ title: 'Source', content: '[[aza-stan-zhospary]]' })
+
+      const createClaimant = async (directory: string, title: string) => {
+        const created = await store.write({
+          title: 'Қазақстан жоспары',
+          directory,
+          fileName: 'aza-stan-zhospary',
+          content: title,
+        })
+        const live = await store.read(created.id!)
+
+        return store.write({
+          originalId: created.id,
+          title: `${title} current`,
+          directory,
+          content: title,
+          versionToken: live.versionToken,
+        })
+      }
+      const first = await createClaimant('one', 'First')
+      const second = await createClaimant('two', 'Second')
+
+      expect((await store.graph()).links).not.toContainEqual(
+        expect.objectContaining({ source: source.id, target: first.id }),
+      )
+      const read = inner.read.bind(inner)
+
+      inner.read = async (id, opts) => {
+        if (id === 'source.md') {
+          throw new Error('production source read failed')
+        }
+
+        return read(id, opts)
+      }
+      await store.remove(second.id!)
+      inner.read = read
+
+      await expect(store.resolveWikilink('aza-stan-zhospary')).resolves.toMatchObject({
+        id: first.id,
+      })
+      expect((await store.graph()).links).toContainEqual(
+        expect.objectContaining({ source: source.id, target: first.id }),
+      )
+    } finally {
+      await close()
+    }
+  })
+
+  it('keeps the graph barrier and changed batch retryable after final bulk repair fails', async () => {
+    const inner = new InMemoryStore({
+      space: 'main',
+      notes: [
+        {
+          id: 'source-note',
+          title: 'Source',
+          filePath: 'source.md',
+          content: '[[aza-stan-zhospary]]',
+        },
+      ],
+    })
+    const store = new CachedStore({ inner, pollIntervalMs: 0 })
+    const changed: StoreEvent[] = []
+
+    store.subscribe((event) => {
+      if (event.type === 'changed') {
+        changed.push(event)
+      }
+    })
+    await store.start()
+    changed.length = 0
+
+    try {
+      store.beginBulk()
+      const target = await store.write({
+        title: 'Қазақстан жоспары',
+        fileName: 'aza-stan-zhospary',
+        content: 'target',
+      })
+      const read = inner.read.bind(inner)
+      const graph = inner.graph.bind(inner)
+
+      inner.read = async () => {
+        throw new Error('deferred source read failed')
+      }
+      inner.graph = async () => {
+        throw new Error('deferred graph failed')
+      }
+      await expect(store.endBulk()).rejects.toThrow('deferred graph failed')
+      expect(changed).toEqual([])
+      expect(
+        (store as unknown as { bulkGraphContextSources: Set<string> }).bulkGraphContextSources,
+      ).toContain('source-note')
+
+      let graphSettled = false
+      const waitingGraph = store.graph().then((value) => {
+        graphSettled = true
+        return value
+      })
+
+      await nextTurn()
+      expect(graphSettled).toBe(false)
+
+      inner.read = read
+      inner.graph = graph
+      await store.endBulk()
+      expect(
+        (store as unknown as { bulkGraphContextSources: Set<string> }).bulkGraphContextSources.size,
+      ).toBe(0)
+      expect(
+        (
+          store as unknown as {
+            snap: { edgesBySource: Map<string, Array<{ source: string; target: string }>> }
+          }
+        ).snap.edgesBySource.get('source-note'),
+      ).toContainEqual(expect.objectContaining({ target: target.id }))
+      const repaired = await waitingGraph
+
+      expect(changed).toHaveLength(1)
+      expect((await store.list()).find(({ id }) => id === target.id)?.legacyNameAliases).toEqual([
+        'aza-stan-zhospary',
+      ])
+      expect((await store.read('aza-stan-zhospary')).id).toBe(target.id)
+      expect(repaired.links).toContainEqual(
+        expect.objectContaining({ source: 'source-note', target: target.id }),
+      )
+    } finally {
+      store.stop()
+      await store.settle()
+    }
+  })
+})
+
 describe('CachedStore write ingress', () => {
+  it('carries the exact identity-engine incarnation from its pre-write read', async () => {
+    const h = await createMemoryHarness()
+
+    try {
+      const created = await h.store.write({ title: 'Note', content: 'body' })
+      const before = await h.store.read(created.id!)
+      const gate = gateWrite(h.inner, (input) => input.originalId != null)
+      const writing = h.store.write({
+        originalId: created.id,
+        title: 'Note',
+        content: 'changed',
+        versionToken: before.versionToken,
+      })
+
+      await gate.entered
+      const replacement = await h.inner.write({
+        originalId: created.id,
+        identityOnly: true,
+        title: 'Note',
+        content: 'body',
+        versionToken: before.versionToken,
+      })
+
+      expect(replacement.versionToken).toBe(before.versionToken)
+      gate.release()
+      await expect(writing).rejects.toThrow('note changed during conditional effect')
+      await expect(h.store.read(created.id!)).resolves.toMatchObject({ content: 'body' })
+    } finally {
+      await h.close()
+    }
+  })
+
   it('rejects invalid carried frontmatter before it reaches the inner engine', async () => {
     const h = await createMemoryHarness()
 
@@ -1381,7 +2076,7 @@ describe('CachedStore reconcile ordering', () => {
     await store.start()
     const finalizeEntered = deferred()
     const releaseFinalize = deferred()
-    let moving: Promise<void> | undefined
+    let moving: Promise<unknown> | undefined
     let reconcile: Promise<void> | undefined
 
     try {
@@ -1971,13 +2666,17 @@ for (const [name, createHarness] of variants) {
     })
 
     it('waits for cold phase-1 inventory before a destructive folder mutation', async () => {
-      const { inner } = await setup()
+      const { inner, notesDir } = await setup()
       const gate = gateChanges(inner)
       const coldRevisions = new InMemoryRevisionPersistence()
       const cold = new CachedStore({
         inner,
+        identityPersistence: new InMemoryIdentity(),
         revisionPersistence: coldRevisions,
         pollIntervalMs: 0,
+        ...(notesDir
+          ? { readBody: (filePath: string) => readFile(join(notesDir, filePath), 'utf8') }
+          : {}),
       })
       const boot = cold.start()
       await gate.entered

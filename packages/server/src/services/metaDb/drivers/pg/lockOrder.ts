@@ -192,10 +192,12 @@ export type IdentityRow = {
   materialized: boolean
   deleted_at: string | null
   address_revision: string | number
+  legacy_name_aliases: string | null
+  settlement_successor_id: string | null
 }
 
 export const IDENTITY_COLUMNS =
-  'id, file_path, space, created_at, materialized, deleted_at, address_revision'
+  'id, file_path, space, created_at, materialized, deleted_at, address_revision, legacy_name_aliases, settlement_successor_id'
 
 /** An unlocked read needs no transaction, so the pool itself can run it. */
 export type Queryable = Pick<PoolClient, 'query'>

@@ -16,6 +16,7 @@ import type {
   KnowledgeStore,
   ListOptions,
   MoveInput,
+  MoveResult,
   MutationOptions,
   NoteContent,
   NoteMeta,
@@ -60,7 +61,7 @@ import {
   normalizeWikilinkTarget,
 } from '../libs/markdown'
 import { MutationCoordinator } from '../libs/mutationCoordinator'
-import { directoryOf, isPathUnder } from '../libs/path'
+import { directoryOf, isPathUnder, legacyNoteNameAlias } from '../libs/path'
 import { normTags } from '../libs/tags'
 import { buildLinkIndex, type FolderAlias, resolveLink } from '../referenceResolver'
 import { InMemoryRevisionPersistence, RevisionJournal } from '../revisionJournal'
@@ -149,6 +150,16 @@ const exactObservedMeta = (note: NoteContent, fallback: NoteMeta): NoteMeta => (
   slug: note.slug,
 })
 
+const sameLegacyAliases = (
+  left: readonly string[] | undefined,
+  right: readonly string[] | undefined,
+): boolean => {
+  const a = left ?? []
+  const b = right ?? []
+
+  return a.length === b.length && a.every((alias, index) => alias === b[index])
+}
+
 /** Claims whose arbitration/convergence has not completed, keyed by storage path. */
 type UnsettledClaims = Map<string, string>
 
@@ -174,8 +185,35 @@ export class CachedStore implements KnowledgeStore {
   private readonly inner: KnowledgeStore
 
   /** Project one identity row committed outside the ordinary write engine. */
-  adoptCausalIdentity(record: IdentityRecord): void {
-    this.identity.adoptPersisted(record)
+  async adoptCausalIdentity(noteId: string): Promise<void> {
+    await this.mutations.run({ global: true }, async () => {
+      const releaseIdentityPublication = this.beginIdentityPublication()
+
+      try {
+        const legacyAliasesBefore = this.legacyAliasContextVersion
+
+        await this.identity.adoptPersisted(noteId)
+        const previousId = this.hydrateSnapshotIdentity(noteId)
+        const legacyAliasesChanged = legacyAliasesBefore !== this.legacyAliasContextVersion
+
+        if (previousId || legacyAliasesChanged) {
+          this.markIdentityPublicationPending()
+          // A physical restore can become visible to the file watcher before its
+          // terminal metadata transaction commits. The watcher then owns this path
+          // under a provisional id; causal adoption replaces that registry occupant,
+          // so the read-model and subscribers must follow the same P -> D transition.
+          this.rememberIdentityRepair(previousId ? new Set([previousId]) : new Set())
+          this.markInnerLinkIdentitiesDirty()
+          this.syncInnerLinkIdentities()
+          if (legacyAliasesChanged) {
+            await this.rederiveGraphContext()
+          }
+          await this.flushIdentityPublication()
+        }
+      } finally {
+        releaseIdentityPublication()
+      }
+    })
   }
 
   /** Base export: a PURE passthrough — export reads raw on-disk files, never this layer's
@@ -272,10 +310,9 @@ export class CachedStore implements KnowledgeStore {
   /** Frontmatter claims the global arbiter has not answered yet — a failed
    *  settlement keeps the identity publication fence shut until it succeeds. */
   private readonly unsettledClaims: UnsettledClaims = new Map()
-  /** The drain in flight, so a second surface JOINS it instead of stepping past.
-   *  A boolean here would be a silent skip: the joiner publishes while the claims
-   *  it is about to serve are still unsettled. */
-  private drainingClaims: Promise<void> | null = null
+  /** Singleton recovery task. It owns one global mutation claim before touching
+   * unsettled identity, so callers never need coordinator re-entrancy probes. */
+  private identityRecovery: Promise<void> | null = null
   /** Invalidates an older boot's graph completion when a newer authoritative
    *  rebuild wins the main checkpoint first. */
   private bootGeneration = 0
@@ -347,6 +384,10 @@ export class CachedStore implements KnowledgeStore {
    *  {@link BulkController}). Its `isActive` is the mode flag emit/poll/graph-refresh
    *  consult. */
   private readonly bulk: BulkController
+  /** Sources whose resolver context changed but whose edge repair has not yet
+   *  completed. Bulk publication coalesces this debt; ordinary failures retain it
+   *  behind the same transition barrier until a graph surface retries. */
+  private readonly bulkGraphContextSources = new Set<string>()
   /** Directory/folder-alias changes can retarget old wikilinks. During a bulk
    *  import coalesce that corpus-wide repair and keep graph reads behind one
    *  transition barrier until the outer bracket drains. Held as a FLAG rather than
@@ -362,6 +403,17 @@ export class CachedStore implements KnowledgeStore {
    *  nothing. */
   private bulkNotesVersion = 0
   private releaseBulkGraphTransition: (() => void) | null = null
+  private graphContextRecovery: Promise<void> | null = null
+  /** A mutation may commit its physical/snapshot effect and then fail while
+   * repairing resolver-dependent edges. Its public changed frame stays paired
+   * with that graph debt and is emitted once, after a successful retry. */
+  private readonly graphContextChangedUpserts = new Set<string>()
+  private readonly graphContextChangedRemoved = new Set<string>()
+  private graphContextChangedPending = false
+  /** Monotonic resolver-context version. Alias mutations bump it at the exact
+   * snapshot write that changed one owner; hot reads/polls compare integers rather
+   * than rescanning and serializing the whole corpus. */
+  private legacyAliasContextVersion = 0
   /** The write path — the CAS chokepoint + optimistic snapshot mirror +
    *  journal + trash tombstoning; the class delegates write/move/remove (see
    *  {@link WriteEngine}). */
@@ -469,7 +521,10 @@ export class CachedStore implements KnowledgeStore {
           if (!this.bulk.isActive) {
             this.syncInnerLinkIdentities()
           }
-          this.emit({ type: 'changed', upserts, removed })
+          this.emitMutationChanged(upserts, removed, {
+            invalidateExternalTransitions: false,
+            syncLinkIdentities: false,
+          })
         },
         reloadHistoricalNames: () => this.reloadHistoricalNames(),
         reresolveGhostsFromIndex: () => this.snap.reresolveGhosts(this.snap.buildIndex()),
@@ -484,8 +539,9 @@ export class CachedStore implements KnowledgeStore {
         (this.inner as { suspendBackground?: () => void }).suspendBackground?.(),
       resumeBackground: () =>
         (this.inner as { resumeBackground?: () => void }).resumeBackground?.(),
-      flushIdentity: () => this.flushIdentityPublication(),
+      flushIdentity: () => this.flushBulkIdentityContext(),
       syncLinkIdentities: () => this.syncInnerLinkIdentities(),
+      canonicalizeChanged: (upserts, removed) => this.canonicalizeBulkChanged(upserts, removed),
       dispatchChanged: (upserts, removed, folders) =>
         this.dispatch({ type: 'changed', upserts, removed, folders }),
       foldersOf: (ids) => this.foldersOf(ids),
@@ -505,9 +561,10 @@ export class CachedStore implements KnowledgeStore {
         iso: () => this.iso(),
         reconcileSoon: () => this.reconcileSoon(),
         afterNotesReady: (patch) => this.afterNotesReady(patch),
-        rederiveSources: (sourceIds) => this.rederiveSourceEdges(sourceIds),
-        rederiveGraphContext: () => this.rederiveGraphContext(),
+        rederiveSources: (sourceIds) => this.rederiveGraphSources(sourceIds),
+        rederiveGraphContext: (changedOnFailure) => this.rederiveGraphContext(changedOnFailure),
         refreshFolderAliases: () => this.refreshFolderAliases(),
+        captureLegacyEvidence: (finalId, live) => this.captureLegacyEvidence(finalId, live),
         beginGraphTransition: () => this.beginGraphTransition(),
         markInnerLinkIdentitiesDirty: () => this.markInnerLinkIdentitiesDirty(),
         syncInnerLinkIdentities: () => this.syncInnerLinkIdentities(),
@@ -515,15 +572,7 @@ export class CachedStore implements KnowledgeStore {
         markIdentityPublicationPending: () => this.markIdentityPublicationPending(),
         flushIdentityPublication: () => this.flushIdentityPublication(),
         rememberIdentityRepair: (before) => this.rememberIdentityRepair(before),
-        emitChanged: (upserts, removed) => {
-          this.markInnerLinkIdentitiesDirty()
-          if (!this.bulk.isActive) {
-            this.syncInnerLinkIdentities()
-          }
-          this.invalidateExternalTransitions([...upserts, ...removed])
-          this.lastChangeAt = this.iso()
-          this.emit({ type: 'changed', upserts, removed })
-        },
+        emitChanged: (upserts, removed) => this.emitMutationChanged(upserts, removed),
         isBulkActive: () => this.bulk.isActive,
       },
       { mutations: this.mutations, trashMutations: this.trashMutations },
@@ -568,6 +617,47 @@ export class CachedStore implements KnowledgeStore {
       // keep the last good list
       return false
     }
+  }
+
+  /** Physical evidence is admitted only while WriteEngine holds the note/path
+   * mutation claim. A claimed owner must name the final id; an ownerless legacy
+   * file is accepted only while the registry still binds that exact path to it. */
+  private async captureLegacyEvidence(finalId: string, live: NoteContent): Promise<IdentityRecord> {
+    const incarnation = live.physicalIncarnation
+    const filePath = live.filePath
+    const ownerMatches = incarnation?.owner.kind === 'claimed' && incarnation.owner.id === finalId
+    const ownerlessBinding =
+      incarnation?.owner.kind === 'absent' &&
+      filePath != null &&
+      this.identity.pathFor(finalId) === filePath
+
+    if (!incarnation || (!ownerMatches && !ownerlessBinding)) {
+      this.reconcileSoon()
+      throw new StoreError(`exact storage ownership is unproven for ${finalId}`)
+    }
+
+    const alias =
+      live.title != null && filePath != null ? legacyNoteNameAlias(live.title, filePath) : null
+
+    if (alias) {
+      const record = await this.identity.persistLegacyNameAlias(finalId, alias)
+
+      if (!record) {
+        this.reconcileSoon()
+        throw new StoreError(`identity disappeared while preserving legacy name for ${finalId}`)
+      }
+
+      return record
+    }
+
+    const record = this.identity.recordFor(finalId)
+
+    if (!record) {
+      this.reconcileSoon()
+      throw new StoreError(`identity disappeared while preserving legacy name for ${finalId}`)
+    }
+
+    return record
   }
 
   /** Refresh the complete directory channel from storage. Notes contribute
@@ -629,7 +719,13 @@ export class CachedStore implements KnowledgeStore {
       return
     }
     this.inner.setLinkIdentities(
-      [...this.snap.notes].map(([id, meta]) => ({ id, path: meta.filePath })),
+      [...this.snap.notes].map(([id, meta]) => ({
+        id,
+        path: meta.filePath,
+        ...(meta.legacyNameAliases?.length
+          ? { legacyNameAliases: [...meta.legacyNameAliases] }
+          : {}),
+      })),
     )
     this.innerLinkIdentitiesDirty = false
   }
@@ -1000,6 +1096,7 @@ export class CachedStore implements KnowledgeStore {
     // reader may have seen a temporary id; rekeySnapshot records its stable
     // successor so an already-queued mutation follows the durable identity.
     await this.sweepFileIds([...this.snap.notes.values()].map((m) => m.filePath))
+    await this.captureLegacyInventoryEvidence()
 
     if (generation !== this.bootGeneration || this.stopped) {
       return false
@@ -1045,6 +1142,42 @@ export class CachedStore implements KnowledgeStore {
     return true
   }
 
+  /** Existing pre-#296 files have no mutation that would otherwise expose their
+   * basename. Probe only detector candidates, then require the same exact
+   * physical/owner proof as a destructive write before acknowledging the alias. */
+  private async captureLegacyInventoryEvidence(
+    candidatePaths?: ReadonlySet<string>,
+  ): Promise<void> {
+    if (this.inner.capabilities.identity) {
+      return
+    }
+
+    for (const [id, meta] of this.snap.notes) {
+      if (candidatePaths && !candidatePaths.has(meta.filePath)) {
+        continue
+      }
+      if (!legacyNoteNameAlias(meta.title, meta.filePath)) {
+        continue
+      }
+      const detail = await this.inner.read(meta.filePath)
+      const incarnation = detail.physicalIncarnation
+      const exactPath = detail.filePath === meta.filePath
+      const exactTitle = detail.title === meta.title
+      const owned =
+        incarnation?.owner.kind === 'claimed'
+          ? incarnation.owner.id === id
+          : incarnation?.owner.kind === 'absent' && this.identity.pathFor(id) === meta.filePath
+
+      // An uncertain/foreign candidate is not compatibility evidence. It must
+      // not poison the alias registry, but inventory itself remains readable.
+      if (!exactPath || !exactTitle || !owned) {
+        continue
+      }
+      const record = await this.captureLegacyEvidence(id, detail)
+      this.hydrateSnapshotIdentity(record.id)
+    }
+  }
+
   private async finishBootGraphClaimed(generation: number): Promise<void> {
     this.syncInnerLinkIdentities()
     const graph = await this.inner.graph()
@@ -1086,10 +1219,18 @@ export class CachedStore implements KnowledgeStore {
    *  through untouched. */
   private adoptMeta(meta: NoteMeta): NoteMeta & { id: string } {
     if (meta.id) {
-      return meta as NoteMeta & { id: string }
+      return {
+        ...meta,
+        ...(meta.legacyNameAliases ? { legacyNameAliases: [...meta.legacyNameAliases] } : {}),
+      } as NoteMeta & { id: string }
     }
     const rec = this.identity.ensure(meta.filePath, meta.createdAt)
-    return { ...meta, id: rec.id, createdAt: rec.createdAt ?? meta.createdAt ?? null }
+    return {
+      ...meta,
+      id: rec.id,
+      createdAt: rec.createdAt ?? meta.createdAt ?? null,
+      ...(rec.legacyNameAliases.length ? { legacyNameAliases: [...rec.legacyNameAliases] } : {}),
+    }
   }
 
   /** Reload the journal's past-title backfill into `pastNames` and re-merge it into
@@ -1250,6 +1391,10 @@ export class CachedStore implements KnowledgeStore {
     this.unsettledClaims.delete(filePath)
     const settledId = this.identity.idFor(filePath) ?? null
 
+    if (settledId) {
+      this.hydrateSnapshotIdentity(settledId)
+    }
+
     // Read the move off the path, not off the outcome: re-arbitration can leave a
     // `foreign-owner` verdict on a path whose id nonetheless moved, and it can end
     // an `adopted` chain whose last hop retired an id the snapshot never held.
@@ -1357,43 +1502,56 @@ export class CachedStore implements KnowledgeStore {
    *  the identity publication fence, so a reader either gets the settled
    *  identity or the same honest persistence error the producer got — and the
    *  first read after the meta-DB recovers is what repairs the snapshot. */
-  private async drainUnsettledClaims(): Promise<void> {
-    // Join a drain already in flight — never step past it. Returning early here
-    // would let this surface open its publication fence while the very claims the
-    // drain is settling are still outstanding: the id it publishes can be a
-    // tombstone a millisecond later, and the fence exists to make that impossible.
-    if (this.drainingClaims) {
-      return this.drainingClaims
+  private async recoverUnsettledIdentity(): Promise<void> {
+    if (this.identityRecovery) {
+      return this.identityRecovery
     }
     if (!this.unsettledClaims.size) {
       return
     }
-    // A settlement re-keys the snapshot and rewrites a file, so it belongs under
-    // the mutation claim wherever it is reached from — a read surface's tail, the
-    // write-behind timer, the delta applier. Taking the claim HERE is what makes
-    // that true of every caller instead of only the ones that remembered; the
-    // claim is not re-entrant, so a caller already inside one just proceeds.
-    if (!this.mutations.holds()) {
-      return this.mutations.run({ global: true }, () => this.drainUnsettledClaims())
-    }
-    const drain = (async () => {
-      for (const [filePath, observedId] of [...this.unsettledClaims]) {
-        const settled = await this.settleClaimAtPath(filePath, observedId)
+    const pendingClaims = new Map(this.unsettledClaims)
+    const recovery = this.mutations.run({ global: true }, async () => {
+      const legacyAliasesBefore = this.legacyAliasContextVersion
 
-        if (settled.previousId && settled.settledId) {
-          this.rememberIdentityRepair(new Set([settled.previousId]))
-          this.rekeySnapshot(settled.previousId, settled.settledId)
-          this.markInnerLinkIdentitiesDirty()
-          this.syncInnerLinkIdentities()
+      while (this.unsettledClaims.size) {
+        for (const [filePath, observedId] of [...this.unsettledClaims]) {
+          const settled = await this.settleClaimAtPath(filePath, observedId)
+
+          if (settled.previousId && settled.settledId) {
+            this.rememberIdentityRepair(new Set([settled.previousId]))
+            this.rekeySnapshot(settled.previousId, settled.settledId)
+            this.markInnerLinkIdentitiesDirty()
+            this.syncInnerLinkIdentities()
+          }
         }
       }
-    })()
+      if (legacyAliasesBefore !== this.legacyAliasContextVersion) {
+        this.markInnerLinkIdentitiesDirty()
+        this.syncInnerLinkIdentities()
+        // In a bulk bracket this is the atomic ownership handoff: sources and
+        // barrier are installed before the global recovery claim is released.
+        await this.rederiveGraphContext()
+      }
+    })
 
-    this.drainingClaims = drain
+    this.identityRecovery = recovery
     try {
-      await drain
+      await recovery
+    } catch (err) {
+      // Settlement removes each path claim before snapshot/graph handoff. If a
+      // later repair step fails, restore that exact debt so the next public
+      // surface can retry instead of treating an authoritative but unpublished
+      // identity as settled.
+      for (const [filePath, observedId] of pendingClaims) {
+        if (!this.unsettledClaims.has(filePath)) {
+          this.unsettledClaims.set(filePath, observedId)
+        }
+      }
+      throw err
     } finally {
-      this.drainingClaims = null
+      if (this.identityRecovery === recovery) {
+        this.identityRecovery = null
+      }
     }
   }
 
@@ -1404,7 +1562,15 @@ export class CachedStore implements KnowledgeStore {
 
     if (meta) {
       this.snap.notes.delete(oldId)
-      this.snap.notes.set(newId, { ...meta, id: newId })
+      const aliases = this.identity.recordFor(newId)?.legacyNameAliases ?? []
+      this.snap.notes.set(newId, {
+        ...meta,
+        id: newId,
+        ...(aliases.length ? { legacyNameAliases: [...aliases] } : {}),
+      })
+      if (meta.legacyNameAliases?.length || aliases.length) {
+        this.legacyAliasContextVersion++
+      }
     }
     const preview = this.previewCache.get(oldId)
 
@@ -1413,6 +1579,41 @@ export class CachedStore implements KnowledgeStore {
       this.previewCache.set(newId, preview)
     }
     this.snap.renameEdges(oldId, newId)
+  }
+
+  private hydrateSnapshotIdentity(id: string): string | null {
+    const record = this.identity.recordFor(id)
+
+    if (!record) {
+      return null
+    }
+    let previousId: string | null = null
+
+    if (!record.deletedAt && !this.snap.notes.has(id)) {
+      for (const [candidateId, candidate] of this.snap.notes) {
+        if (candidateId !== id && candidate.filePath === record.filePath) {
+          previousId = candidateId
+          this.rekeySnapshot(candidateId, id)
+          break
+        }
+      }
+    }
+    const meta = this.snap.notes.get(id)
+
+    if (!meta) {
+      return previousId
+    }
+    const nextAliases = record.legacyNameAliases.length ? [...record.legacyNameAliases] : undefined
+
+    this.snap.notes.set(id, {
+      ...meta,
+      legacyNameAliases: nextAliases,
+    })
+    if (!sameLegacyAliases(meta.legacyNameAliases, nextAliases)) {
+      this.legacyAliasContextVersion++
+    }
+
+    return previousId
   }
 
   /** Take the engine-built graph as the edge baseline: group its links by
@@ -1490,11 +1691,14 @@ export class CachedStore implements KnowledgeStore {
     this.pendingIdentityChangeBefore = null
     const current = new Set(this.snap.notes.keys())
 
-    this.emit({
-      type: 'changed',
-      upserts: [...current],
-      removed: [...before].filter((id) => !current.has(id)),
-    })
+    this.emitMutationChanged(
+      [...current],
+      [...before].filter((id) => !current.has(id)),
+      {
+        invalidateExternalTransitions: false,
+        syncLinkIdentities: false,
+      },
+    )
   }
 
   /** Flush every identity mutation known at call time and advance the local
@@ -1503,13 +1707,20 @@ export class CachedStore implements KnowledgeStore {
   private async flushIdentityPublication(): Promise<void> {
     const revision = this.identityPublicationRevision
 
-    await this.drainUnsettledClaims()
     await this.identity.flush()
     this.durableIdentityPublicationRevision = Math.max(
       this.durableIdentityPublicationRevision,
       revision,
     )
     this.publishPendingIdentityRepair()
+  }
+
+  /** A timer/final bulk publication runs outside local note claims, so it is a
+   * safe place to finish an earlier failed arbitration and hand any resulting
+   * resolver work to the bulk graph debt before the id becomes observable. */
+  private async flushBulkIdentityContext(): Promise<void> {
+    await this.recoverIdentityForSurface()
+    await this.flushIdentityPublication()
   }
 
   private async ensureIdentityPublished(): Promise<void> {
@@ -1609,7 +1820,8 @@ export class CachedStore implements KnowledgeStore {
     // settled identity or the same honest persistence error — never a provisional
     // id of unknown ownership. The claim the re-key needs is taken by the drain
     // itself, which is what makes every other entry into it safe as well.
-    if (this.unsettledClaims.size) {
+    if (this.identityRecovery || this.unsettledClaims.size) {
+      await this.recoverUnsettledIdentity()
       await this.flushIdentityPublication()
     }
   }
@@ -1698,6 +1910,7 @@ export class CachedStore implements KnowledgeStore {
 
   async graph(): Promise<Graph> {
     await this.recoverIdentityForSurface()
+    await this.recoverGraphContextForSurface()
     await this.ensureNotes()
     return this.readAcrossStableGraphTransition(async () => {
       // The graph is a user surface: agent-memory (and any non-graph class) is
@@ -1724,6 +1937,7 @@ export class CachedStore implements KnowledgeStore {
    *  metric is honest and visibility holds. One fresh derivation per call (a maintenance surface). */
   async graphHealth(): Promise<GraphHealth> {
     await this.recoverIdentityForSurface()
+    await this.recoverGraphContextForSurface()
     await this.ensureNotes()
     return this.readAcrossStableGraphTransition(async () => {
       this.syncInnerLinkIdentities()
@@ -1974,7 +2188,10 @@ export class CachedStore implements KnowledgeStore {
     )
 
     if (resolved.ghost) {
-      throw noteNotFound(rawRef)
+      // A degraded inventory does not carry durable legacy identity aliases.
+      // Current names may still resolve safely, but a miss cannot be called a
+      // definitive 404 until identity persistence is available again.
+      throw this.identityUnavailable()
     }
     const selected = localRows.find((meta) => meta.id === resolved.targetId)
 
@@ -2452,8 +2669,10 @@ export class CachedStore implements KnowledgeStore {
         const claim = detail.frontmatter?.[NOTE_ID_FRONTMATTER_KEY]
 
         if (typeof claim === 'string' && isValidNoteId(claim)) {
+          const legacyAliasesBefore = this.legacyAliasContextVersion
           const res = await this.settleClaimAtPath(detail.filePath, claim)
           const settledId = res.settledId ?? claim
+          let publishRekey = false
 
           if (res.previousId) {
             this.markIdentityPublicationPending()
@@ -2463,12 +2682,22 @@ export class CachedStore implements KnowledgeStore {
             if (effects) {
               effects.rekeyed.push([res.previousId, settledId])
             } else {
-              this.lastChangeAt = this.iso()
-              this.emit({ type: 'changed', upserts: [settledId], removed: [res.previousId] })
+              publishRekey = true
             }
           }
           if (res.settledId) {
             rec = this.identity.recordFor(res.settledId) ?? rec
+          }
+          if (legacyAliasesBefore !== this.legacyAliasContextVersion) {
+            this.markInnerLinkIdentitiesDirty()
+            this.syncInnerLinkIdentities()
+            await this.rederiveGraphContext()
+          }
+          if (publishRekey) {
+            this.emitMutationChanged([settledId], [res.previousId!], {
+              invalidateExternalTransitions: false,
+              syncLinkIdentities: false,
+            })
           }
         }
         sourceId = rec?.id
@@ -2490,8 +2719,10 @@ export class CachedStore implements KnowledgeStore {
         if (effects) {
           effects.changedIds.add(sourceId)
         } else {
-          this.lastChangeAt = this.iso()
-          this.emit({ type: 'changed', upserts: [sourceId], removed: [] })
+          this.emitMutationChanged([sourceId], [], {
+            invalidateExternalTransitions: false,
+            syncLinkIdentities: false,
+          })
         }
       }
     }
@@ -2522,8 +2753,10 @@ export class CachedStore implements KnowledgeStore {
     if (!upserts.length && !removed.length) {
       return
     }
-    this.lastChangeAt = this.iso()
-    this.emit({ type: 'changed', upserts, removed })
+    this.emitMutationChanged(upserts, removed, {
+      invalidateExternalTransitions: false,
+      syncLinkIdentities: false,
+    })
   }
 
   private liveOwnerAtPath(filePath: string): string | undefined {
@@ -2649,7 +2882,10 @@ export class CachedStore implements KnowledgeStore {
    *  so reading their bodies is both wasted work and a visibility footgun. A bulk
    *  bracket defers the corpus pass and holds graph readers behind one transition
    *  barrier; endBulk publishes exactly one coherent repair. */
-  private async rederiveGraphContext(): Promise<void> {
+  private async rederiveGraphContext(changedOnFailure?: {
+    upserts: readonly string[]
+    removed: readonly string[]
+  }): Promise<void> {
     if (this.bulk.isActive) {
       this.bulkGraphContextWholeCorpus = true
       this.releaseBulkGraphTransition ??= this.beginGraphTransition()
@@ -2657,9 +2893,54 @@ export class CachedStore implements KnowledgeStore {
       return
     }
 
-    await this.rederiveSourceEdges(
-      [...this.snap.notes.keys()].filter((id) => this.snap.isGraphVisibleId(id)),
-    )
+    try {
+      await this.rederiveGraphSources(
+        [...this.snap.notes.keys()].filter((id) => this.snap.isGraphVisibleId(id)),
+      )
+    } catch (err) {
+      if (changedOnFailure) {
+        this.rememberGraphContextChanged(changedOnFailure.upserts, changedOnFailure.removed)
+      }
+      throw err
+    }
+  }
+
+  private async rederiveGraphSources(rawSourceIds: readonly string[]): Promise<void> {
+    for (const rawSourceId of rawSourceIds) {
+      const sourceId = this.canonicalMutationId(rawSourceId)
+
+      if (this.snap.notes.has(sourceId)) {
+        this.bulkGraphContextSources.add(sourceId)
+      }
+    }
+    if (this.bulkGraphContextSources.size) {
+      this.releaseBulkGraphTransition ??= this.beginGraphTransition()
+    }
+    if (this.bulk.isActive || !this.bulkGraphContextSources.size) {
+      return
+    }
+
+    await this.flushGraphContextClaimed(false)
+  }
+
+  private async flushGraphContextClaimed(publishRevision: boolean): Promise<void> {
+    while (this.bulkGraphContextSources.size) {
+      const sourceIds = [...this.bulkGraphContextSources]
+
+      // Delete only after the exact pass succeeds. A failed source read plus
+      // fallback graph keeps both the work and the transition barrier.
+      await this.rederiveSourceEdges(sourceIds, true)
+      for (const sourceId of sourceIds) {
+        this.bulkGraphContextSources.delete(sourceId)
+      }
+    }
+    if (publishRevision) {
+      // A failed repair may already have removed an obsolete edge bucket. Tick
+      // only once the coherent post-state is ready and before readers are released.
+      this.graphCache.onSnapshotChanged()
+    }
+    this.releaseBulkGraphTransition?.()
+    this.releaseBulkGraphTransition = null
   }
 
   /** Does the closing bracket owe the user graph a rebuild? A folder/alias change
@@ -2686,54 +2967,214 @@ export class CachedStore implements KnowledgeStore {
         this.reconcileSoon()
       }
     }
-    if (!this.bulkGraphContextOwed()) {
+    if (
+      !this.bulkGraphContextSources.size &&
+      !this.graphContextChangedPending &&
+      !this.bulkGraphContextOwed()
+    ) {
       // Nothing owed — but a transition may still be open (a directory change over
       // an empty snapshot raises the flag before there is anything to repair).
       this.releaseBulkGraphTransition?.()
       this.releaseBulkGraphTransition = null
+      this.bulkGraphContextWholeCorpus = false
+      this.bulkNotesVersion = this.snap.notes.version
       return
     }
     // Readers wait for the repair the same way they wait for a folder one: what
     // they would otherwise read is a graph that is coherent with no table at all.
     this.releaseBulkGraphTransition ??= this.beginGraphTransition()
 
-    try {
-      await this.mutations.run({ global: true }, async () => {
-        for (;;) {
-          // Re-asked INSIDE the drain, so a write that lands while an earlier pass
-          // is awaiting is picked up by the next one instead of leaving the corpus
-          // owed a repair nobody will perform.
-          if (!this.bulkGraphContextOwed()) {
-            return
-          }
+    await this.mutations.run({ global: true }, async () => {
+      let repaired = false
+
+      for (;;) {
+        if (this.bulkGraphContextOwed()) {
           this.bulkGraphContextWholeCorpus = false
           this.bulkNotesVersion = this.snap.notes.version
-          // ONE linear pass over the sources, against the table as the snapshot
-          // finally stands — the price of a table the writes themselves never
-          // rebuilt. It is the same pass a bracket that touched a folder already
-          // paid; what changed is that a bracket writing only into folders that
-          // already existed no longer skips it and calls the result settled.
-          await this.rederiveSourceEdges(
-            [...this.snap.notes.keys()].filter((id) => this.snap.isGraphVisibleId(id)),
-          )
+          for (const id of this.snap.notes.keys()) {
+            if (this.snap.isGraphVisibleId(id)) {
+              this.bulkGraphContextSources.add(id)
+            }
+          }
         }
-      })
-    } catch (err) {
-      console.error('[cached-store] bulk graph-context rebuild failed:', (err as Error).message)
-      this.reconcileSoon()
-    } finally {
-      this.releaseBulkGraphTransition?.()
-      this.releaseBulkGraphTransition = null
-      this.bulkGraphContextWholeCorpus = false
-      this.bulkNotesVersion = this.snap.notes.version
-    }
-  }
+        if (!this.bulkGraphContextSources.size) {
+          break
+        }
+        const sourceIds = [...this.bulkGraphContextSources]
 
-  private abandonBulkGraphContext(): void {
+        // Retain the exact batch on failure. A later endBulk/graph surface retries
+        // it behind the same transition barrier and publishes the changed debt once.
+        await this.rederiveSourceEdges(sourceIds, true)
+        for (const sourceId of sourceIds) {
+          this.bulkGraphContextSources.delete(sourceId)
+        }
+        repaired = true
+      }
+
+      if (repaired && !this.graphContextChangedPending) {
+        this.graphCache.onSnapshotChanged()
+      }
+      this.publishGraphContextChanged()
+    })
     this.bulkGraphContextWholeCorpus = false
     this.bulkNotesVersion = this.snap.notes.version
     this.releaseBulkGraphTransition?.()
     this.releaseBulkGraphTransition = null
+  }
+
+  private async recoverGraphContextForSurface(): Promise<void> {
+    if (
+      this.bulk.isActive ||
+      (!this.bulkGraphContextSources.size && !this.graphContextChangedPending)
+    ) {
+      return
+    }
+    if (this.graphContextRecovery) {
+      await this.graphContextRecovery
+      return
+    }
+    const recovery = this.mutations.run({ global: true }, async () => {
+      if (!this.bulk.isActive) {
+        if (this.bulkGraphContextSources.size) {
+          await this.flushGraphContextClaimed(!this.graphContextChangedPending)
+        }
+        this.publishGraphContextChanged()
+      }
+    })
+
+    this.graphContextRecovery = recovery
+    try {
+      await recovery
+    } finally {
+      if (this.graphContextRecovery === recovery) {
+        this.graphContextRecovery = null
+      }
+    }
+  }
+
+  /** A detached timer batch can outlive an identity remint. Publish only final
+   * ids, and explicitly retire provisional spellings so retries stay monotonic. */
+  private canonicalizeBulkChanged(
+    rawUpserts: readonly string[],
+    rawRemoved: readonly string[],
+  ): { upserts: string[]; removed: string[] } {
+    const upserts = new Set<string>()
+    const removed = new Set<string>()
+
+    for (const rawId of rawUpserts) {
+      const finalId = this.canonicalMutationId(rawId)
+
+      if (this.snap.notes.has(finalId)) {
+        upserts.add(finalId)
+        if (rawId !== finalId) {
+          removed.add(rawId)
+        }
+      } else {
+        removed.add(rawId)
+        removed.add(finalId)
+      }
+    }
+    for (const rawId of rawRemoved) {
+      const finalId = this.canonicalMutationId(rawId)
+
+      if (this.snap.notes.has(finalId)) {
+        upserts.add(finalId)
+        if (rawId !== finalId) {
+          removed.add(rawId)
+        }
+      } else {
+        removed.add(rawId)
+        removed.add(finalId)
+      }
+    }
+    for (const id of upserts) {
+      removed.delete(id)
+    }
+
+    return { upserts: [...upserts], removed: [...removed] }
+  }
+
+  private abandonBulkGraphContext(): void {
+    this.bulkGraphContextSources.clear()
+    this.graphContextChangedUpserts.clear()
+    this.graphContextChangedRemoved.clear()
+    this.graphContextChangedPending = false
+    this.bulkGraphContextWholeCorpus = false
+    this.bulkNotesVersion = this.snap.notes.version
+    this.releaseBulkGraphTransition?.()
+    this.releaseBulkGraphTransition = null
+  }
+
+  private rememberGraphContextChanged(
+    upserts: readonly string[],
+    removed: readonly string[],
+    invalidateExternalTransitions = true,
+  ): void {
+    if (invalidateExternalTransitions) {
+      this.invalidateExternalTransitions([...upserts, ...removed])
+    }
+    this.graphContextChangedPending = true
+    for (const id of upserts) {
+      this.graphContextChangedRemoved.delete(id)
+      this.graphContextChangedUpserts.add(id)
+    }
+    for (const id of removed) {
+      this.graphContextChangedUpserts.delete(id)
+      this.graphContextChangedRemoved.add(id)
+    }
+  }
+
+  private publishGraphContextChanged(): void {
+    if (!this.graphContextChangedPending) {
+      return
+    }
+    const batch = this.canonicalizeBulkChanged(
+      [...this.graphContextChangedUpserts],
+      [...this.graphContextChangedRemoved],
+    )
+
+    this.graphContextChangedUpserts.clear()
+    this.graphContextChangedRemoved.clear()
+    this.graphContextChangedPending = false
+    this.emitMutationChanged(batch.upserts, batch.removed, {
+      invalidateExternalTransitions: false,
+    })
+  }
+
+  private emitMutationChanged(
+    upserts: string[],
+    removed: string[],
+    {
+      invalidateExternalTransitions = true,
+      syncLinkIdentities = true,
+    }: {
+      invalidateExternalTransitions?: boolean
+      syncLinkIdentities?: boolean
+    } = {},
+  ): void {
+    if (invalidateExternalTransitions) {
+      this.invalidateExternalTransitions([...upserts, ...removed])
+    }
+    // Deferred graph publication remains the net-batch owner until repair.
+    // Folding later mutations prevents a newer frame followed by a stale replay.
+    if (this.graphContextChangedPending) {
+      this.rememberGraphContextChanged(upserts, removed, false)
+
+      if (!this.bulk.isActive && !this.bulkGraphContextSources.size) {
+        this.publishGraphContextChanged()
+      }
+
+      return
+    }
+
+    if (syncLinkIdentities) {
+      this.markInnerLinkIdentitiesDirty()
+      if (!this.bulk.isActive) {
+        this.syncInnerLinkIdentities()
+      }
+    }
+    this.lastChangeAt = this.iso()
+    this.emit({ type: 'changed', upserts, removed })
   }
 
   /** Re-derive the selected source notes from their live bodies after a target
@@ -2742,7 +3183,10 @@ export class CachedStore implements KnowledgeStore {
    *  reference, a stable-id envelope, or both. A source-body read is the smallest
    *  authoritative repair; if one cannot be read, repair only that source from the
    *  engine's fresh graph so unrelated writers remain concurrent. */
-  private async rederiveSourceEdges(rawSourceIds: readonly string[]): Promise<void> {
+  private async rederiveSourceEdges(
+    rawSourceIds: readonly string[],
+    strict = false,
+  ): Promise<void> {
     const sourceIds = [
       ...new Set(rawSourceIds.map((sourceId) => this.canonicalMutationId(sourceId))),
     ].filter((sourceId) => this.snap.notes.has(sourceId))
@@ -2804,6 +3248,9 @@ export class CachedStore implements KnowledgeStore {
         (err as Error).message,
       )
       this.reconcileSoon()
+      if (strict) {
+        throw err
+      }
     }
   }
 
@@ -2942,7 +3389,7 @@ export class CachedStore implements KnowledgeStore {
     availability?: TrashAvailabilityFilter
     scope?: ReadScope
   }) {
-    return this.trash.purgeTrash(opts)
+    return this.readIdentitySurface(() => this.trash.purgeTrash(opts))
   }
 
   // ── mutations — delegated to WriteEngine ───────────────────────
@@ -2967,6 +3414,7 @@ export class CachedStore implements KnowledgeStore {
 
     try {
       await this.ensureMutationReady()
+      await this.recoverIdentityForSurface()
       const pending = operation()
 
       // WriteEngine registers its storage/trash claim synchronously before the
@@ -2992,6 +3440,7 @@ export class CachedStore implements KnowledgeStore {
 
     try {
       await this.ensureMutationReady()
+      await this.recoverIdentityForSurface()
       return await operation()
     } finally {
       releaseIntent()
@@ -3006,7 +3455,7 @@ export class CachedStore implements KnowledgeStore {
     }
   }
 
-  move(input: MoveInput, opts?: MutationOptions): Promise<void> {
+  move(input: MoveInput, opts?: MutationOptions): Promise<MoveResult> {
     return this.runMutation(() =>
       this.writes.move({ ...input, id: this.canonicalMutationId(input.id) }, opts),
     )
@@ -3165,6 +3614,8 @@ export class CachedStore implements KnowledgeStore {
       }
       identityBefore = new Set(this.snap.notes.keys())
       const changed = await this.mutations.run({ global: true }, async () => {
+        const legacyAliasesBefore = this.legacyAliasContextVersion
+
         // Pull path-history only after the global claim has waited for an older
         // folder move's storage/finalize lease. Reading it before the claim can
         // cache the pre-move aliases and then apply the post-move delta with
@@ -3214,6 +3665,10 @@ export class CachedStore implements KnowledgeStore {
           // file still has its provisional registry id. The frontmatter sweep
           // and all journal/trash claims below use the final identity.
           const identitySweep = await this.sweepFileIds(result.sweepPaths)
+          // A file added or renamed outside Notarium may be the first time this
+          // process sees an old generated basename. Probe only this delta's
+          // changed paths; quiet polls never re-read the compatibility corpus.
+          await this.captureLegacyInventoryEvidence(new Set(result.sweepPaths))
 
           // Only now, with this delta's identities settled, may the cursor move.
           // Advancing it earlier loses the delta outright when the flush or the
@@ -3237,13 +3692,14 @@ export class CachedStore implements KnowledgeStore {
               identityResolutions.push(identityResolution)
             }
           }
+          const legacyAliasesChanged = legacyAliasesBefore !== this.legacyAliasContextVersion
           const rederiveSources =
-            directoriesChanged || aliasesChanged
+            directoriesChanged || aliasesChanged || legacyAliasesChanged
               ? [...this.snap.notes.keys()].filter((id) => this.snap.isGraphVisibleId(id))
               : result.rederiveSources
 
           if (rederiveSources.length) {
-            await this.rederiveSourceEdges(rederiveSources)
+            await this.rederiveGraphSources(rederiveSources)
           }
           for (const [rawId, title, filePath] of result.removedTitles) {
             this.scheduleExternalDelete(rawId, title, filePath, identityResolutions)
@@ -3254,6 +3710,7 @@ export class CachedStore implements KnowledgeStore {
             result.changed ||
             directoriesChanged ||
             aliasesChanged ||
+            legacyAliasesChanged ||
             rekeyed.length > 0 ||
             readEffects.changedIds.size > 0
 
@@ -3280,8 +3737,10 @@ export class CachedStore implements KnowledgeStore {
               ]),
             ].filter((id) => !upsertSet.has(id) || rekeyedRemovedSet.has(id))
 
-            this.lastChangeAt = this.iso()
-            this.emit({ type: 'changed', upserts, removed })
+            this.emitMutationChanged(upserts, removed, {
+              invalidateExternalTransitions: false,
+              syncLinkIdentities: false,
+            })
           }
 
           return didChange
@@ -3353,6 +3812,9 @@ export class CachedStore implements KnowledgeStore {
         rederiveSources.add(sourceId)
       }
       this.snap.notes.delete(id)
+      if (meta.legacyNameAliases?.length) {
+        this.legacyAliasContextVersion++
+      }
       this.snap.edgesBySource.delete(id)
       this.previewCache.delete(id)
       // Tombstoned, not forgotten: if this was an external move, the new
@@ -3381,7 +3843,7 @@ export class CachedStore implements KnowledgeStore {
         // makes "emptied" vs "removed" indistinguishable without a re-walk.)
         this.dirs.add(directoryOf(meta.filePath))
       }
-      this.snap.notes.set(id, {
+      const nextMeta = {
         ...meta,
         // Union the engine's file-truth aliases with the journal backfill:
         // a bare `{ ...meta }` would drop a legacy note's snapshot-only aliases
@@ -3392,7 +3854,12 @@ export class CachedStore implements KnowledgeStore {
         // on a reindex, and "when was this written" shouldn't move because the
         // note got edited.
         createdAt: prev?.createdAt ?? meta.createdAt ?? null,
-      })
+      }
+
+      this.snap.notes.set(id, nextMeta)
+      if (!sameLegacyAliases(prev?.legacyNameAliases, nextMeta.legacyNameAliases)) {
+        this.legacyAliasContextVersion++
+      }
     }
 
     // Build the link index ONCE for the whole batch: every note is already
@@ -3418,14 +3885,19 @@ export class CachedStore implements KnowledgeStore {
       // the delta body lacks the frontmatter tags, and a half-fresh snippet
       // (new text, stale chips) is worse than a lazy recompute on next view.
       this.previewCache.delete(id)
-      this.snap.notes.set(id, {
+      const nextMeta = {
         ...(this.snap.notes.get(id) ?? adopted),
         title: adopted.title,
         filePath: adopted.filePath,
         slug: adopted.slug, // track an external slug change (file-truth)
         aliases: this.snap.aliasesFor(id, adopted.aliases, adopted.title),
         createdAt: prev?.createdAt ?? adopted.createdAt ?? null,
-      })
+      }
+
+      this.snap.notes.set(id, nextMeta)
+      if (!sameLegacyAliases(prev?.legacyNameAliases, nextMeta.legacyNameAliases)) {
+        this.legacyAliasContextVersion++
+      }
       const observed = this.snap.notes.get(id)!
       const transition = this.nextExternalTransition(id)
 
@@ -3846,6 +4318,7 @@ export class CachedStore implements KnowledgeStore {
     await this.trashMutations.run({ prefixes: [TRASH_MUTATION_PREFIX] }, () =>
       this.mutations.run({ global: true }, async () => undefined),
     )
+    await this.bulk.settle()
     await this.drainExternalTasks()
     await this.graphCache.settle()
   }
@@ -4106,6 +4579,9 @@ export class CachedStore implements KnowledgeStore {
       return
     }
     this.snap.notes.set(noteId, { ...meta, modifiedAt: at })
-    this.emit({ type: 'changed', upserts: [noteId], removed: [] })
+    this.emitMutationChanged([noteId], [], {
+      invalidateExternalTransitions: false,
+      syncLinkIdentities: false,
+    })
   }
 }

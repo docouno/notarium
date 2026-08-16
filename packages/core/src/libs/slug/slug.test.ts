@@ -6,6 +6,7 @@ import {
   effectiveSlug,
   idToSlug,
   legacyImportSlug,
+  legacyNameKey,
   linkKey,
   nameKey,
   namePathKey,
@@ -207,6 +208,14 @@ describe('legacyImportSlug', () => {
     expect(legacyImportSlug('ϒ')).toBe('')
     // New runtime handles intentionally use the corrected romaniser.
     expect(asciiSlug('㎒')).toBe('mhz')
+  })
+})
+
+describe('legacyNameKey', () => {
+  it('is the named compatibility primitive used by importer paths', () => {
+    for (const value of ['Қазақстан жоспары', '㏀', '™', 'BookStack']) {
+      expect(legacyNameKey(value)).toBe(legacyImportSlug(value))
+    }
   })
 })
 

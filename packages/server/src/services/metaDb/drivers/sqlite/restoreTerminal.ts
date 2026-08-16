@@ -1,10 +1,12 @@
 import {
+  canonicalLegacyNameAliases,
   DOCUMENT_STATE_FORMAT,
   LOGICAL_NOTE_STATE_FORMAT,
   RESTORE_OPERATION_PHASE,
   RESTORE_TERMINAL_CONFLICT,
   type RestoreTerminalPersistence,
   REVISION_INTEGRITY,
+  unionLegacyNameAliases,
 } from '@notarium/core'
 
 import { restoreOperationOfRow, type RestoreOperationRow } from '../../causalRows'
@@ -23,6 +25,16 @@ type IdentityRow = {
   materialized: number
   deleted_at: string | null
   address_revision: number | bigint
+  legacy_name_aliases: string | null
+  settlement_successor_id: string | null
+}
+
+const parsedAliases = (raw: string | null): readonly string[] => {
+  try {
+    return canonicalLegacyNameAliases(raw == null ? [] : JSON.parse(raw))
+  } catch {
+    return []
+  }
 }
 
 type ProofRow = {
@@ -246,11 +258,15 @@ export const createRestoreTerminalFacet = (ctx: SqliteDriverCtx): RestoreTermina
         identity.space !== input.identity.space ||
         identity.deleted_at !== input.identity.deletedAt
       const addressRevision = Number(identity.address_revision) + (addressChanged ? 1 : 0)
+      const legacyNameAliases = unionLegacyNameAliases(
+        parsedAliases(identity.legacy_name_aliases),
+        input.identity.legacyNameAliases,
+      )
 
       db.prepare(
         `UPDATE note_identity SET
            file_path = ?, space = ?, created_at = ?, materialized = ?, deleted_at = ?,
-           address_revision = ?
+           address_revision = ?, legacy_name_aliases = ?, settlement_successor_id = NULL
          WHERE id = ?`,
       ).run(
         input.identity.filePath,
@@ -259,6 +275,7 @@ export const createRestoreTerminalFacet = (ctx: SqliteDriverCtx): RestoreTermina
         input.identity.materialized ? 1 : 0,
         input.identity.deletedAt,
         addressRevision,
+        JSON.stringify(legacyNameAliases),
         input.identity.id,
       )
       const proofRevision = (proofRow == null ? 0 : Number(proofRow.proof_revision)) + 1

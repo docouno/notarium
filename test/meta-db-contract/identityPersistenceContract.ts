@@ -30,6 +30,7 @@ const record = (over: Partial<IdentityRecord> & Pick<IdentityRecord, 'id'>): Ide
   materialized: false,
   deletedAt: null,
   ...over,
+  legacyNameAliases: over.legacyNameAliases ?? [],
 })
 
 export const describeIdentityPersistenceContract = (
@@ -294,7 +295,7 @@ export const describeIdentityPersistenceContract = (
 
       expect(outcomes).toEqual([
         { id: 'X', status: 'foreign-owner', owner: expect.objectContaining({ space: 'alpha' }) },
-        { id: 'beta-own-01', status: 'claimed' },
+        { id: 'beta-own-01', status: 'claimed', legacyNameAliases: [] },
       ])
       expect(await beta.findById!('X')).toMatchObject({ space: 'alpha', filePath: 'owned.md' })
       expect(await beta.loadAll('beta')).toEqual([

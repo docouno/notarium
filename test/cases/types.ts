@@ -363,6 +363,8 @@ export type CaseEvent = (
       noteId: string
       content?: string
       title?: string
+      /** Exact final space-relative destination for a path-changing edit. */
+      path?: string
       tags?: string[]
       /** Raw authored frontmatter patch, using the same merge channel as an
        * external/imported Markdown edit. Enables metadata-only history states. */
