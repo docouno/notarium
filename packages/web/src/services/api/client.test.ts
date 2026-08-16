@@ -12,7 +12,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { HTTP_STATUS } from '@notarium/contract/http'
 
-import { ApiError, type ImportProgressLine, importStart } from './client'
+import { ApiError } from './client'
+import { type ImportProgressLine, importStart } from './import'
 
 /** A response body that hands the reader raw BYTES in chunks of `chunkBytes`, with
  *  line breaks and multi-byte code points landing wherever they fall — a real socket
@@ -61,7 +62,11 @@ const syncImport = async (lines: unknown[], chunkBytes?: number) => {
     ),
   )
 
-  const started = await importStart('main', new File(['zip'], 'vault.zip'), {})
+  const started = await importStart(
+    'main',
+    { kind: 'file', file: new File(['zip'], 'vault.zip') },
+    {},
+  )
 
   if (started.mode !== 'sync') {
     throw new Error(`a 200 NDJSON response is the sync fallback, got mode=${started.mode}`)

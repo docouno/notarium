@@ -13,6 +13,7 @@ import { join } from 'node:path'
 import { crc32 } from 'node:zlib'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
+import { FOLDER_MTIME_COMMENT_PREFIX, IMPORT_SOURCE_KIND } from './consts'
 import { forEachZipMember, openZip, withExtractedMember, type ZipMember } from './zipArchive'
 
 let dir: string
@@ -32,6 +33,8 @@ type RawMember = {
   dosTime?: number
   /** Central-directory extra field bytes. */
   extra?: Buffer
+  /** Central-directory per-entry comment bytes. */
+  comment?: string
 }
 
 const LOCAL_SIG = 0x04034b50
@@ -48,6 +51,7 @@ const rawZip = (members: RawMember[]): Buffer => {
     const name = Buffer.from(member.name, 'utf8')
     const data = member.data ?? Buffer.alloc(0)
     const extra = member.extra ?? Buffer.alloc(0)
+    const comment = Buffer.from(member.comment ?? '', 'utf8')
     const crc = crc32(data)
     const local = Buffer.alloc(30)
 
@@ -77,13 +81,13 @@ const rawZip = (members: RawMember[]): Buffer => {
     central.writeUInt32LE(data.length, 24)
     central.writeUInt16LE(name.length, 28)
     central.writeUInt16LE(extra.length, 30)
-    central.writeUInt16LE(0, 32) // comment length
+    central.writeUInt16LE(comment.length, 32)
     central.writeUInt16LE(0, 34) // disk number
     central.writeUInt16LE(0, 36) // internal attributes
     central.writeUInt32LE(0, 38) // external attributes
     central.writeUInt32LE(offset, 42)
     locals.push(block)
-    centrals.push(Buffer.concat([central, name, extra]))
+    centrals.push(Buffer.concat([central, name, extra, comment]))
     offset += block.length
   }
   const directory = Buffer.concat(centrals)
@@ -138,17 +142,25 @@ const dosDate = (year: number, month: number, day: number): number =>
 const dosTime = (hour: number, minute: number, second: number): number =>
   (hour << 11) | (minute << 5) | (second >> 1)
 
-const membersOf = async (members: RawMember[]): Promise<ZipMember[]> => {
+const membersOf = async (
+  members: RawMember[],
+  sourceKind?: typeof IMPORT_SOURCE_KIND.folderTree,
+): Promise<ZipMember[]> => {
   const path = join(dir, 'raw.zip')
 
   await writeFile(path, rawZip(members))
   const seen: ZipMember[] = []
 
-  await forEachZipMember(await openZip(path), async (member) => {
-    seen.push(member)
+  await forEachZipMember(
+    await openZip(path),
+    async (member) => {
+      seen.push(member)
 
-    return 'continue'
-  })
+      return 'continue'
+    },
+    undefined,
+    sourceKind,
+  )
 
   return seen
 }
@@ -283,6 +295,82 @@ describe('a member’s modification time', () => {
 
   it('treats a zero DOS pair as "unknown" rather than as 1979', async () => {
     expect(await modifiedAtOf({ name: 'a.md', data: NOTE })).toBeNull()
+  })
+})
+
+describe('the browser-folder timestamp envelope', () => {
+  it('preserves exact pre-1980 and sub-second epoch milliseconds', async () => {
+    const [member] = await membersOf(
+      [
+        {
+          name: 'a.md',
+          data: NOTE,
+          comment: `${FOLDER_MTIME_COMMENT_PREFIX}1234`,
+        },
+      ],
+      IMPORT_SOURCE_KIND.folderTree,
+    )
+
+    expect(member.modifiedAt).toBe('1970-01-01T00:00:01.234Z')
+  })
+
+  it('keeps an explicit unknown timestamp unknown', async () => {
+    const [member] = await membersOf(
+      [
+        {
+          name: 'a.md',
+          data: NOTE,
+          comment: `${FOLDER_MTIME_COMMENT_PREFIX}unknown`,
+        },
+      ],
+      IMPORT_SOURCE_KIND.folderTree,
+    )
+
+    expect(member.modifiedAt).toBeNull()
+  })
+
+  it('ignores a matching comment on an ordinary external ZIP', async () => {
+    const [member] = await membersOf([
+      {
+        name: 'a.md',
+        data: NOTE,
+        dosDate: dosDate(2021, 7, 8),
+        comment: `${FOLDER_MTIME_COMMENT_PREFIX}1234`,
+      },
+    ])
+
+    expect(member.modifiedAt?.slice(0, 10)).toBe('2021-07-08')
+  })
+
+  it('refuses missing or malformed private metadata under folder provenance', async () => {
+    await expect(
+      membersOf([{ name: 'a.md', data: NOTE }], IMPORT_SOURCE_KIND.folderTree),
+    ).rejects.toThrow(/metadata is missing/)
+    await expect(
+      membersOf(
+        [{ name: 'a.md', data: NOTE, comment: `${FOLDER_MTIME_COMMENT_PREFIX}tomorrow` }],
+        IMPORT_SOURCE_KIND.folderTree,
+      ),
+    ).rejects.toThrow(/metadata is invalid/)
+  })
+})
+
+describe('container noise provenance', () => {
+  it('keeps user __MACOSX paths in a browser folder but filters them in ordinary ZIPs', async () => {
+    const ordinary = await membersOf([{ name: 'vault/__MACOSX/a.md', data: NOTE }])
+    const folder = await membersOf(
+      [
+        {
+          name: 'vault/__MACOSX/a.md',
+          data: NOTE,
+          comment: `${FOLDER_MTIME_COMMENT_PREFIX}unknown`,
+        },
+      ],
+      IMPORT_SOURCE_KIND.folderTree,
+    )
+
+    expect(ordinary[0]?.isContainerNoise).toBe(true)
+    expect(folder[0]?.isContainerNoise).toBe(false)
   })
 })
 

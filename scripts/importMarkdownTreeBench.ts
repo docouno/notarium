@@ -22,9 +22,9 @@
 // compared by eye against the recorded ones, which is a judgement rather than
 // a gate on purpose (docs/import.md#resource-limits-on-a-markdown-tree-302).
 //
-//   npm run bench:import-markdown-tree            # defaults: 10 000 notes
-//   NOTES=2000 npm run bench:import-markdown-tree # a quicker shape
-//   make import-bench                             # the same, in a container
+//   npm run bench:import-markdown-tree                         # archive, 10 000 notes
+//   SOURCE=folder NOTES=2000 npm run bench:import-markdown-tree # browser-folder bridge
+//   make import-bench SOURCE=folder NOTES=10000                 # container gate
 // canon: docs/import.md#importing-a-markdown-tree-302
 
 import AdmZip from 'adm-zip'
@@ -38,6 +38,7 @@ import { createServer } from '../packages/server/src/apps/server/server'
 
 const NOTES = Number(process.env.NOTES || 10_000)
 const IGNORED = Number(process.env.IGNORED || 20)
+const SOURCE = process.env.SOURCE || 'archive'
 /** How often the parallel reader hits the server while the import runs. */
 const PROBE_EVERY_MS = Number(process.env.PROBE_EVERY_MS || 100)
 /** Below this the second import is over before a cancel can reach the worker, and
@@ -72,46 +73,76 @@ const percentile = (values: readonly number[], p: number): number => {
  *  identities and exact links that form a cycle — so the identity map, the link
  *  rewrite and the date fallback are all exercised at scale, not just the
  *  parser. A bounded non-Markdown tail proves the ignored path too. */
+const memberPath = (i: number): string => `vault/${i % 11}/${i % 7}/${i % 3}/note-${i}.md`
+
+const memberBody = (i: number, notes: number): string => {
+  const next = (i + 1) % notes
+
+  return [
+    '---',
+    `notarium-id: source-${i}`,
+    `title: Note ${i}`,
+    'tags: [bench, imported]',
+    'type: note',
+    ...(i % 4 === 0 ? [`created: 20${10 + (i % 10)}-0${1 + (i % 9)}-14T09:00:00Z`] : []),
+    `plugin-field: kept-${i}`,
+    '---',
+    '',
+    `# Note ${i}`,
+    '',
+    `Forward to [[notarium-id:source-${next}|Next]] and back to [[notarium-id:source-${(i + notes - 1) % notes}]].`,
+    '',
+    'A copy that must NOT be rewritten:',
+    '',
+    '```md',
+    `[[notarium-id:source-${next}]]`,
+    '```',
+    '',
+    `Ordinary links stay put: [[Note ${next}]] and [x](other.md).`,
+  ].join('\n')
+}
+
+const ignoredPath = (i: number): string => `vault/assets/img-${i}.png`
+
 const buildCorpus = async (path: string, notes: number): Promise<void> => {
   const zip = new AdmZip()
 
   for (let i = 0; i < notes; i++) {
-    // >=3 levels of nesting, several branches — a flat archive would not
-    // exercise the directory reproduction the feature exists for.
-    const dir = `vault/${i % 11}/${i % 7}/${i % 3}`
-    const next = (i + 1) % notes
-    const body = [
-      '---',
-      `notarium-id: source-${i}`,
-      `title: Note ${i}`,
-      'tags: [bench, imported]',
-      'type: note',
-      ...(i % 4 === 0 ? [`created: 20${10 + (i % 10)}-0${1 + (i % 9)}-14T09:00:00Z`] : []),
-      `plugin-field: kept-${i}`,
-      '---',
-      '',
-      `# Note ${i}`,
-      '',
-      `Forward to [[notarium-id:source-${next}|Next]] and back to [[notarium-id:source-${(i + notes - 1) % notes}]].`,
-      '',
-      'A copy that must NOT be rewritten:',
-      '',
-      '```md',
-      `[[notarium-id:source-${next}]]`,
-      '```',
-      '',
-      `Ordinary links stay put: [[Note ${next}]] and [x](other.md).`,
-    ].join('\n')
-
-    zip.addFile(`${dir}/note-${i}.md`, Buffer.from(body, 'utf8'))
+    zip.addFile(memberPath(i), Buffer.from(memberBody(i, notes), 'utf8'))
   }
   for (let i = 0; i < IGNORED; i++) {
-    zip.addFile(
-      `vault/assets/img-${i}.png`,
-      Buffer.concat([Buffer.from('\x89PNG\r\n'), Buffer.alloc(512)]),
-    )
+    zip.addFile(ignoredPath(i), Buffer.concat([Buffer.from('\x89PNG\r\n'), Buffer.alloc(512)]))
   }
   await writeFile(path, zip.toBuffer())
+}
+
+/** Build the exact HTTP upload used by either supported bench entry seam. */
+const buildUpload = async (zipPath: string, root: string): Promise<FormData> => {
+  const form = new FormData()
+
+  if (SOURCE === 'folder') {
+    form.append('bundle', 'markdown-tree')
+    form.append('format', 'markdown')
+    form.append('root', root)
+    for (let i = 0; i < NOTES; i++) {
+      const modifiedAt = Date.UTC(2018 + (i % 7), i % 12, 1 + (i % 27), 9, 0, 0, i % 1000)
+
+      form.append(
+        `entry:${modifiedAt}`,
+        new Blob([memberBody(i, NOTES)]),
+        encodeURIComponent(memberPath(i)),
+      )
+    }
+    for (let i = 0; i < IGNORED; i++) {
+      form.append('entry:0', new Blob([]), encodeURIComponent(ignoredPath(i)))
+    }
+
+    return form
+  }
+
+  form.append('root', root)
+  form.append('file', new Blob([await readFile(zipPath)]), 'corpus.zip')
+  return form
 }
 
 type Job = {
@@ -146,11 +177,17 @@ const check = (ok: boolean, message: string): void => {
 }
 
 const run = async (): Promise<void> => {
+  check(
+    SOURCE === 'archive' || SOURCE === 'folder',
+    `SOURCE must be archive or folder, got ${SOURCE}`,
+  )
   const root = await mkdtemp(join(tmpdir(), 'notarium-import-bench-'))
   const zipPath = join(root, 'corpus.zip')
 
-  console.log(`bench: building a ${NOTES}-note corpus…`)
-  await buildCorpus(zipPath, NOTES)
+  console.log(`bench: source=${SOURCE}, building a ${NOTES}-note corpus…`)
+  if (SOURCE === 'archive') {
+    await buildCorpus(zipPath, NOTES)
+  }
   // The space's own directory, as a provisioned host would already have it.
   await mkdir(join(root, 'spaces', SPACE), { recursive: true })
 
@@ -237,21 +274,34 @@ const run = async (): Promise<void> => {
         }
       ).total
 
+    const enqueue = async (destination: string): Promise<Job> => {
+      const upload = await buildUpload(zipPath, destination)
+      const response = await fetch(`${base}/api/s/${SPACE}/import`, {
+        method: 'POST',
+        body: upload,
+      })
+
+      check(response.status === 202, `the ${SOURCE} upload answered HTTP ${response.status}`)
+      return (await response.json()) as Job
+    }
+
     const started = performance.now()
 
     loop.enable()
     // A refused probe after teardown is noise, not a finding — what the reader was
     // served WHILE THE JOB LIVED is asserted below, from the window of `probes`.
     const probing$ = probe().catch(() => {})
-    const form = new FormData()
-
-    form.append('root', 'imported')
-    form.append('file', new Blob([await readFile(zipPath)]), 'corpus.zip')
-    const enqueued = (await (
-      await fetch(`${base}/api/s/${SPACE}/import`, { method: 'POST', body: form })
-    ).json()) as Job
+    const enqueued = await enqueue('imported')
 
     check(Boolean(enqueued.id), `the import was not enqueued: ${JSON.stringify(enqueued)}`)
+    const firstJobs = (await (await fetch(`${base}/api/s/${SPACE}/jobs?kind=import`)).json()) as {
+      jobs: Job[]
+    }
+
+    check(
+      firstJobs.jobs.length === 1 && firstJobs.jobs[0].id === enqueued.id,
+      `one upload produced ${firstJobs.jobs.length} import jobs`,
+    )
     // The window the "stays answerable" claim is about: from the moment the job
     // exists to the moment it is terminal. Anything the reader completed before
     // the POST returned was answered by an idle server.
@@ -399,6 +449,7 @@ const run = async (): Promise<void> => {
     )
 
     const measurements = {
+      source: SOURCE,
       notes: NOTES,
       elapsedMs: Math.round(elapsedMs),
       notesPerSecond: Math.round((NOTES / elapsedMs) * 1000),
@@ -414,7 +465,9 @@ const run = async (): Promise<void> => {
       resultJsonBytes: Buffer.byteLength(JSON.stringify(result)),
     }
 
-    console.log('✓ correctness: totals, tree, copy identity, links, bounds and progress')
+    console.log(
+      `✓ correctness (${SOURCE}): totals, tree, copy identity, links, bounds and progress`,
+    )
     console.log(JSON.stringify(measurements, null, 2))
 
     // ── cancelling a live import ──────────────────────────────────────────────
@@ -424,13 +477,7 @@ const run = async (): Promise<void> => {
     // A second archive into its own root, cancelled once writes have started —
     // so the abort lands mid-member, not between jobs.
     if (NOTES >= MIN_CANCELLABLE_NOTES) {
-      const cancelForm = new FormData()
-
-      cancelForm.append('root', 'canceled')
-      cancelForm.append('file', new Blob([await readFile(zipPath)]), 'corpus.zip')
-      let victim = (await (
-        await fetch(`${base}/api/s/${SPACE}/import`, { method: 'POST', body: cancelForm })
-      ).json()) as Job
+      let victim = await enqueue('canceled')
 
       // Wait for a NOTE ON DISK, not for the phase. `writing` is published with the
       // plan, before the first member is written, so cancelling on it lands on the

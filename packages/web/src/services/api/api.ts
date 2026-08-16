@@ -1,10 +1,11 @@
 import type { Job } from '@notarium/contract'
 import { HTTP_STATUS } from '@notarium/contract/http'
 import { authApi } from './auth'
-import { ApiError, importStart } from './client'
+import { ApiError } from './client'
 import { contextApi } from './context'
 import { foldersApi } from './folders'
 import { graphApi } from './graph'
+import { importApi } from './import'
 import { jobsApi } from './jobs'
 import { meApi } from './me'
 import { membersApi } from './members'
@@ -21,7 +22,14 @@ import { usersApi } from './users'
 // (services/api/*) and share the typed fetch transport in ./client; this file
 // only assembles them (spread) and hosts the job-poll helper. Method naming and
 // the #16 space-scoping convention live with the families and ./client.
-export { ApiError, type ImportProgressLine } from './client'
+export { ApiError } from './client'
+export type {
+  ImportProgressLine,
+  ImportStartOptions,
+  ImportTreeEntry,
+  ImportUploadSource,
+} from './import'
+export { IMPORT_TREE_ENTRY_LIMIT, normalizeImportSummary } from './import'
 export { setSpaceAccessProbe, setUnauthorizedHandler } from './client'
 export type { BucketsQueryParams, NotesQueryParams } from './types'
 
@@ -40,13 +48,37 @@ export const api = {
   ...contextApi,
   ...usersApi,
   ...membersApi,
-  importStart,
+  ...importApi,
 }
 
 /** Client fallback cadence (ms) for polling a durable job's status (#105) — the
  *  resilience path behind the job SSE stream. One knob for the export/import hooks
  *  and pollJobToTerminal's default so the three never drift. */
 export const JOB_POLL_MS = 1500
+
+const pollingAbortError = (): DOMException => new DOMException('job polling aborted', 'AbortError')
+
+const waitForNextPoll = (interval: number, signal?: AbortSignal): Promise<void> => {
+  if (!signal) {
+    return new Promise((resolve) => setTimeout(resolve, interval))
+  }
+  if (signal.aborted) {
+    return Promise.reject(pollingAbortError())
+  }
+
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timeout)
+      reject(pollingAbortError())
+    }
+    const timeout = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve()
+    }, interval)
+
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+}
 
 /** Poll an export job to a terminal status (#105), shared by the Export tab's poll
  *  fallback and the tree's "Export folder" toast so the two never drift. Transient poll
@@ -65,16 +97,19 @@ export const pollJobToTerminal = async (
 
   for (;;) {
     if (opts.signal?.aborted) {
-      throw new DOMException('export polling aborted', 'AbortError')
+      throw pollingAbortError()
     }
     try {
-      const job = await api.jobGet(space, id)
+      const job = await api.jobGet(space, id, opts.signal)
       last = job
       gone = 0
       if (job.status === 'succeeded' || job.status === 'failed' || job.status === 'canceled') {
         return job
       }
     } catch (e) {
+      if (opts.signal?.aborted) {
+        throw pollingAbortError()
+      }
       // A 404 = the row is gone (GC'd/pruned/lost); a few in a row and we give up.
       // Any other error is transient — retry on the next tick.
       if (e instanceof ApiError && e.status === HTTP_STATUS.NOT_FOUND && ++gone >= 3) {
@@ -84,6 +119,6 @@ export const pollJobToTerminal = async (
         throw e
       }
     }
-    await new Promise((r) => setTimeout(r, interval))
+    await waitForNextPoll(interval, opts.signal)
   }
 }

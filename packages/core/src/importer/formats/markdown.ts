@@ -64,9 +64,14 @@ const DATE_KEYS = [
 /** Strip the extension from an upload's basename for the title fallback
  *  (`My Note.md` → `My Note`). Only a known text extension is peeled so a dotted
  *  name (`v1.2 notes`) keeps its dots. */
+const IMPORT_TEXT_EXTENSION = /\.(md|markdown|mdown|mkd|txt|text)$/i
+
+/** The one extension policy shared by browser intake and forced Markdown-tree import. */
+export const isImportTextPath = (path: string): boolean => IMPORT_TEXT_EXTENSION.test(path)
+
 const baseTitle = (fileName: string): string => {
   const base = fileName.split('/').pop() ?? fileName
-  return base.replace(/\.(md|markdown|mdown|mkd|txt|text)$/i, '').trim() || base
+  return base.replace(IMPORT_TEXT_EXTENSION, '').trim() || base
 }
 
 const scalarOf = (e: FrontmatterEntry | undefined): string => {

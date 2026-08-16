@@ -548,44 +548,59 @@ Context menu & inline rename (issue #15):
 
 ---
 
-## 10. External-file drop → import (#223)
+## 10. External files and folders → one import
 
 A SECOND drag-and-drop lives in the app, orthogonal to the tree move above: drag a
-text file from the OS into the window → import it as a note. The two never fight
+file set or folder from the OS into the window → import it as one outcome. The two never fight
 because they ride **different payloads** — a tree move carries the custom
 `application/x-notarium-item` mime (§7), an OS file drag carries **`Files`** in
 `dataTransfer.types` (the one field readable during `dragover`). Every file-drag
 handler gates on `isFileDrag(e)` (= `types` includes `Files`); an internal move reads
 `currentDragItems()` (empty for an external drag). Two disjoint payloads, same events.
 
-### It rides the SAME import machinery (#191), not a parallel path
-The dropped file goes through `useFileImport()` → **`api.importStart`** — the exact
-client #191 built for the Settings tab: in production it stages the upload + enqueues
-a **durable import job** (`202 + Job`, tracked to terminal via `pollJobToTerminal`);
-on a host with no job layer it answers with the synchronous NDJSON stream. Both drive
-to the same `ImportSummary`. So a drop is durable, cancelable and restart-surviving for
-free, and there is ONE import path, not two. The only DnD-specific addition on the core
-is the **`markdown` format** (`core/importer/formats/markdown.ts`) — a plain `.md`/`.txt`
-→ one note — FORCED by the client (the extension is the signal; a markdown body can
-start with `{`/`[`, so content-detection would misfire). That format is used by OS-file
-DnD and by programmatic callers that explicitly send `format=markdown`; the Settings
-import picker remains ZIP/JSON-only. The dropped file's own frontmatter is lifted rather
-than stripped, and its mtime dates the note when the frontmatter names no date (#280).
-See [import.md](import.md).
+### One owned source, one existing importer
 
-- **Each dropped file is its own import** (#191 stages one upload per job), so a
-  multi-file drop is N imports whose summaries `useFileImport` folds together for the
-  toast. `skipExisting` is on — a casual drag never clobbers an existing note.
-- **A single-file drop OPENS the note** right after (its id comes back in the summary's
-  `created[]`, capped server-side; `noteRoute(id)`). A multi-file drop does NOT jump —
-  the notes just stream into the tree (via the SSE `changed` event as each job writes).
+The drop handler first calls `captureDrop(dataTransfer)` synchronously. All later work
+uses the captured `FileSystemEntry` objects or copied fallback `File[]`; it never reads
+the expiring `DataTransfer` after an `await`. Directory readers are drained through all
+pages, the top-level wrapper is kept, and any unreadable/partial/over-limit traversal
+refuses atomically.
+
+The resulting source is routed once:
+
+- one text file (`.md`, `.markdown`, `.mdown`, `.mkd`, `.txt`, `.text`) → direct forced Markdown;
+- one `.zip` → direct auto-classification (Markdown vault or foreign export);
+- several files, or any directory → one tree request and one job/summary;
+- text plus unsupported files → unsupported paths stay in the tree as zero-byte metadata and are reported as ignored;
+- unsupported-only → local notice; a top-level ZIP mixed with any other top-level item → local atomic refusal;
+- a ZIP nested inside a directory is an ignored tree member, never a second import.
+
+Both surfaces compose through `useDropImport`: it expands the synchronous capture and
+passes the resulting source to the same `api.importStart` used by Settings. In production
+it stages the one upload and enqueues one durable job; none-mode drives the same
+`ImportSummary` from the synchronous NDJSON stream. Unmounting a surface or changing
+space aborts only its local upload/terminal monitor and releases its current-tab lease;
+an already durable server job is not canceled. There is no browser ZIP writer and no
+second note writer: the server packages a browser tree into a streaming store-mode ZIP,
+then the existing Markdown-tree planner/writer owns classification, path safety, copy
+identities and links. `skipExisting` is always on for DnD. A direct single text file opens
+`created[0]`; a multi/tree/ZIP never jumps to an arbitrary member. The full wire, mtime
+and resource contract is in [import.md](import.md#browser-tree-bridge).
+
+The two DnD surfaces share one current-tab state. While traversal/upload is not yet a
+durable job, or while none-mode is streaming, a second drop says an import is already
+running and offers no invented destination. Once `202` exposes the id, the action goes to
+`/management/import?job=<id>`, whose Settings surface watches/cancels exactly that job.
+The finite start toast is not a terminal result; succeeded, failed-with-partial and
+canceled each emit one terminal outcome.
 
 ### Two drop zones, each with the cue that fits it
 - **The tree (rail) is owned by the Sidebar section.** `sectionDragOver`/`sectionDrop`
   branch on `isFileDrag(e)` FIRST: a file drag lights the exact target folder row with
   the SAME `dropTarget`/`.drop-target` highlight as an internal move (root → the section
   `.drop-root` wash), and every folder is a valid import target (no self/descendant rules
-  — those are for MOVING items). The drop calls `useFileImport()(files, dropTargetAt(e))`.
+  — those are for MOVING items). The drop captures the native payload before starting
+  traversal and passes the captured source with `dropTargetAt(e)`.
 - **The content (reader) is owned by the window dropzone** (`ImportDropZone.tsx`, mounted
   in `App.tsx`). It acts only when the pointer is NOT over the tree
   (`!el.closest('[data-scope-root]')` — the section owns that). The whole reader lights —
@@ -602,7 +617,10 @@ See [import.md](import.md).
 ### Test checklist (external-file import)
 - [ ] Drop a `.md` in the reader (no note open) → scope root; onto a folder ROW → that
       folder; with a note open, in the reader → the note's folder (`test/e2e/import-dnd.spec.ts`).
-- [ ] A single-file drop opens the imported note; a multi-file drop imports all, opens none.
+- [ ] A folder dropped on both zones keeps its top-level wrapper and nested paths; a
+      direct single text opens, while multi/folder/ZIP opens none.
+- [ ] One Markdown ZIP and one foreign-export ZIP both use auto classification; a
+      top-level ZIP mixed with another item makes no request.
 - [ ] `markdown` import rides the durable job AND the sync fallback, returns `created[]`
       (`test/fake-server/import.test.ts`); `markdownFileToNote` unit (`…/importer/formats/markdown.test.ts`):
       title `title:` > `# H1` > filename; the file's own frontmatter lifted (tags/date/type) and
@@ -610,4 +628,11 @@ See [import.md](import.md).
       visibly (#280); deterministic per-basename filename; BOM tolerated.
 - [ ] A drop sends the file's `lastModified`, so a frontmatter-less note is dated by the FILE,
       not by the import moment ([import.md](import.md#dates-as-data)).
+- [ ] Missing/all-null Entry API retains flat files. When file items exist, their count
+      must exactly match the fallback `FileList`; either mismatch, an ambiguous empty
+      folder placeholder, partial-null, read failure or traversal overflow makes no
+      request and links capability cases to Settings. A missing item list keeps the
+      legacy `FileList` fallback.
+- [ ] A second drop has no action before 202/sync; after 202 its action, reconnect and
+      cancel stay on the exact id even when a newer import exists.
 - [ ] An internal tree move still works with the file-drag handling added (payloads disjoint).

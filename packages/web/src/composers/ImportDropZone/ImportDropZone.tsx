@@ -3,10 +3,11 @@ import { createPortal } from 'react-dom'
 
 import { DND_ATTRS, NATIVE_FILE_DRAG_TYPE } from '../../libs/dnd/dnd'
 import { useSpace } from '../SpaceProvider'
-import { useFileImport } from './useFileImport'
+import { captureDrop } from './dropEntries'
+import { useDropImport } from './useFileImport'
 import styles from './ImportDropZone.module.scss'
 
-// Drag a text file into the window → import it as a note (#223). Split by zone
+// Drag files or a folder into the window → import them as one outcome. Split by zone
 // (see docs/drag-and-drop.md §10):
 //   • the TREE (rail) — the Sidebar section owns it: it lights the exact target
 //     folder ROW like an internal move (no extra label needed) and imports the drop.
@@ -17,8 +18,8 @@ import styles from './ImportDropZone.module.scss'
 // badge (the "copy" cursor, which the page can't suppress). The centered card sits
 // away from the cursor, so the two never overlap.
 //
-// Both zones ride `DataTransfer.files` — a different payload from the tree's internal
-// move (`application/x-notarium-item`) — so neither collides with a note move.
+// Both zones synchronously snapshot the native Files payload before traversing it.
+// The internal move keeps its separate application payload, so the paths do not collide.
 
 const HIDE_MS = 250
 
@@ -59,7 +60,7 @@ type Drag = { folder: string; area: DOMRect }
 
 export const ImportDropZone = () => {
   const { canWrite } = useSpace()
-  const importFiles = useFileImport()
+  const importDrop = useDropImport()
   // The active CONTENT-zone drag: the target folder + the reader rect to wash. null
   // when there's no content-zone drag (incl. while over the tree — the Sidebar shows
   // the folder-row highlight there).
@@ -128,7 +129,13 @@ export const ImportDropZone = () => {
         return
       } // the Sidebar section imports tree drops
       e.preventDefault()
-      void importFiles(e.dataTransfer?.files ?? null, contentTargetAt(e.clientX, e.clientY))
+      const dataTransfer = e.dataTransfer
+
+      if (dataTransfer) {
+        const capture = captureDrop(dataTransfer)
+
+        void importDrop(capture, contentTargetAt(e.clientX, e.clientY))
+      }
     }
 
     window.addEventListener('dragenter', onDragEnter)
@@ -140,7 +147,7 @@ export const ImportDropZone = () => {
       window.removeEventListener('drop', onDrop)
       clearHide()
     }
-  }, [canWrite, importFiles])
+  }, [canWrite, importDrop])
 
   if (!drag || !canWrite) {
     return null

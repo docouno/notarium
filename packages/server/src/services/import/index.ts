@@ -16,6 +16,13 @@ export { classifyImportArchive, ImportPlanConflictError } from './markdownTree'
 // publishes over it, and a second spelling of it at the call site is exactly the
 // divergence the plan exists to prevent.
 export { asSettledPlan } from './identityPlan'
-export { IMPORT_DETAIL_CAP, IMPORT_PHASE, type ImportPhase } from './consts'
+export {
+  FOLDER_MTIME_COMMENT_PREFIX,
+  IMPORT_DETAIL_CAP,
+  IMPORT_PHASE,
+  IMPORT_SOURCE_KIND,
+  type ImportPhase,
+  type ImportSourceKind,
+} from './consts'
 export type { ImportProgress, MarkdownTreePlanV1, MarkdownTreePlanEntry } from './types'
 export { closeTerminalImportReservations } from './terminalReservations'

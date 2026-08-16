@@ -68,6 +68,31 @@ const multipart = (
   }
 }
 
+type DirectMultipartPart =
+  { field: string; value: string } | { field: 'file'; filename: string; content: string }
+
+const directMultipart = (parts: DirectMultipartPart[]) => {
+  const body: Buffer[] = []
+
+  for (const part of parts) {
+    body.push(
+      'filename' in part
+        ? Buffer.from(
+            `--${BOUNDARY}\r\nContent-Disposition: form-data; name="file"; filename="${part.filename}"\r\nContent-Type: text/markdown\r\n\r\n${part.content}\r\n`,
+          )
+        : Buffer.from(
+            `--${BOUNDARY}\r\nContent-Disposition: form-data; name="${part.field}"\r\n\r\n${part.value}\r\n`,
+          ),
+    )
+  }
+  body.push(Buffer.from(`--${BOUNDARY}--\r\n`))
+
+  return {
+    payload: Buffer.concat(body),
+    headers: { 'content-type': `multipart/form-data; boundary=${BOUNDARY}` },
+  }
+}
+
 const importFile = (
   filename: string,
   content: Buffer | string,
@@ -288,6 +313,38 @@ const CLAUDE_DESIGN_CHAT = JSON.stringify({
 })
 
 describe('durable import (#191): POST /api/s/:space/import → job', () => {
+  it.each([
+    [
+      'a second file',
+      [
+        { field: 'file', filename: 'a.md', content: '# A' },
+        { field: 'file', filename: 'b.md', content: '# B' },
+      ] as DirectMultipartPart[],
+    ],
+    [
+      'a late field',
+      [
+        { field: 'file', filename: 'a.md', content: '# A' },
+        { field: 'root', value: 'late' },
+      ] as DirectMultipartPart[],
+    ],
+  ])('rejects ordinary multipart with %s before enqueue', async (_name, parts) => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/s/main/import',
+      ...directMultipart(parts),
+    })
+
+    expect(response.statusCode).toBe(400)
+    expect(response.json<{ error: string }>().error).toMatch(/exactly one file part/)
+    expect(await notes()).toEqual([])
+    const jobs = JSON.parse(
+      (await app.inject({ method: 'GET', url: '/api/s/main/jobs?kind=import' })).payload,
+    ).jobs
+
+    expect(jobs).toEqual([])
+  })
+
   it('imports Claude conversations, one note each, dates reaching the snapshot', async () => {
     const job = await runImport('conversations.json', CLAUDE_CONVERSATIONS, 'application/json')
     expect(job.status).toBe('succeeded')

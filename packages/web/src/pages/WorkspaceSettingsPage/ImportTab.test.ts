@@ -1,14 +1,17 @@
 // @vitest-environment jsdom
 
-// What the Import tab actually PAINTS (#302) — the layer `useImportJob.test.ts`
-// cannot reach: that hook proves the normalizer, this proves the rows reach (or
+// What the Import tab actually PAINTS (#302) — the API-family tests
+// cannot reach: those prove the normalizer, this proves the rows reach (or
 // never reach) the DOM. Mounted with react-dom/client + act, the way this repo
 // tests React (see useNotesState.interleaving.test.ts) — no testing library.
 
-import { act, createElement } from 'react'
+import { act, createElement, Fragment } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
+import { MemoryRouter, useLocation, useNavigate } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ImportSummary, Job } from '@notarium/contract'
+import { SSE_EVENT } from '@notarium/contract/events'
+import { IMPORT_FORMAT } from '@notarium/core'
 
 import type * as ApiModule from '../../services/api'
 
@@ -26,6 +29,33 @@ const harness = vi.hoisted(() => ({
   },
   canWrite: true,
 }))
+
+class FakeEventSource {
+  static instances: FakeEventSource[] = []
+  readonly listeners = new Map<string, Array<(event: Event) => void>>()
+  readonly close = vi.fn()
+
+  constructor(readonly url: string) {
+    FakeEventSource.instances.push(this)
+  }
+
+  addEventListener(type: string, listener: EventListenerOrEventListenerObject | null): void {
+    if (typeof listener === 'function') {
+      const listeners = this.listeners.get(type) ?? []
+
+      listeners.push(listener)
+      this.listeners.set(type, listeners)
+    }
+  }
+
+  emit(type: string, data: unknown): void {
+    const event = new MessageEvent(type, { data: JSON.stringify(data) })
+
+    for (const listener of this.listeners.get(type) ?? []) {
+      listener(event)
+    }
+  }
+}
 
 vi.mock('../../composers/SpaceProvider', () => ({
   useSpace: () => ({ space: 'main', canWrite: harness.canWrite }),
@@ -75,10 +105,26 @@ const oversizedResult = {
 describe('ImportTab', () => {
   let container: HTMLDivElement
   let root: Root
+  let route = ''
+  let navigateRoute: ReturnType<typeof useNavigate>
 
-  const mount = async () => {
+  const RouteProbe = () => {
+    const location = useLocation()
+
+    navigateRoute = useNavigate()
+    route = `${location.pathname}${location.search}`
+    return null
+  }
+
+  const mount = async (entry = '/s/main/management/import') => {
     await act(async () => {
-      root.render(createElement(ImportTab))
+      root.render(
+        createElement(
+          MemoryRouter,
+          { initialEntries: [entry] },
+          createElement(Fragment, null, createElement(ImportTab), createElement(RouteProbe)),
+        ),
+      )
     })
   }
 
@@ -101,6 +147,8 @@ describe('ImportTab', () => {
     harness.api.jobCancel.mockReset()
     harness.api.jobGet.mockReset()
     harness.api.jobsList.mockReset().mockResolvedValue([])
+    FakeEventSource.instances = []
+    vi.stubGlobal('EventSource', FakeEventSource)
     container = document.createElement('div')
     document.body.append(container)
     root = createRoot(container)
@@ -110,6 +158,7 @@ describe('ImportTab', () => {
     act(() => root.unmount())
     container.remove()
     vi.useRealTimers()
+    vi.unstubAllGlobals()
   })
 
   it('renders at most 200 detail rows per collection for a pre-cap result', async () => {
@@ -285,6 +334,249 @@ describe('ImportTab', () => {
     expect(testId('import-error')?.textContent).toContain('archive is not readable')
   })
 
+  it('renders the job named by the route and never adopts a newer import', async () => {
+    harness.api.jobsList.mockResolvedValue([
+      job({
+        id: 'job-b-newer',
+        result: { imported: 99, skipped: 0, failed: 0, files: [], errors: [] },
+      }),
+    ])
+    harness.api.jobGet.mockResolvedValue(
+      job({
+        id: 'job-a-addressed',
+        result: { imported: 3, skipped: 0, failed: 0, files: [], errors: [] },
+      }),
+    )
+
+    await mount('/s/main/management/import?job=job-a-addressed')
+
+    expect(harness.api.jobGet).toHaveBeenCalledWith('main', 'job-a-addressed')
+    expect(harness.api.jobsList).not.toHaveBeenCalled()
+    expect(testId('import-summary')?.textContent).toContain('3')
+    expect(text()).not.toContain('99')
+  })
+
+  it('cancels addressed A without adopting a newer concurrent B', async () => {
+    const active = job({
+      id: 'job-a-addressed',
+      status: 'running',
+      progress: { done: 2, total: 10, ratio: 0.2, phase: 'writing' },
+      completedAt: null,
+    })
+
+    harness.api.jobGet.mockResolvedValue(active)
+    harness.api.jobCancel.mockResolvedValue(
+      job({ id: active.id, status: 'canceled', error: null, result: null }),
+    )
+    await mount('/s/main/management/import?job=job-a-addressed')
+
+    const stream = FakeEventSource.instances.at(-1)
+
+    expect(stream?.url).toBe('/api/s/main/events')
+    await act(async () => {
+      stream?.emit(
+        SSE_EVENT.JOB,
+        job({
+          id: 'job-b-newer',
+          status: 'running',
+          progress: { done: 99, total: 100, ratio: 0.99, phase: 'writing' },
+          completedAt: null,
+        }),
+      )
+    })
+    expect(testId('import-progress')?.textContent).toContain('2 of 10')
+    expect(testId('import-progress')?.textContent).not.toContain('99')
+
+    await act(async () => {
+      ;(testId('import-cancel') as HTMLButtonElement).click()
+    })
+
+    expect(harness.api.jobCancel).toHaveBeenCalledWith('main', 'job-a-addressed')
+    expect(testId('import-error')?.textContent).toContain('import canceled')
+    expect(harness.api.jobsList).not.toHaveBeenCalled()
+  })
+
+  it('does not resurrect running state when an earlier poll resolves after terminal SSE', async () => {
+    vi.useFakeTimers()
+    const running = job({
+      id: 'job-a-addressed',
+      status: 'running',
+      progress: { done: 2, total: 10, ratio: 0.2, phase: 'writing' },
+      completedAt: null,
+    })
+    let releasePoll!: (value: Job) => void
+    const latePoll = new Promise<Job>((resolve) => {
+      releasePoll = resolve
+    })
+
+    harness.api.jobGet.mockResolvedValueOnce(running).mockReturnValueOnce(latePoll)
+    await mount('/s/main/management/import?job=job-a-addressed')
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(JOB_POLL_MS)
+    })
+    expect(harness.api.jobGet).toHaveBeenCalledTimes(2)
+
+    const stream = FakeEventSource.instances.at(-1)
+
+    await act(async () => {
+      stream?.emit(
+        SSE_EVENT.JOB,
+        job({
+          id: running.id,
+          status: 'succeeded',
+          progress: { done: 10, total: 10, ratio: 1, phase: 'done' },
+          result: { imported: 10, skipped: 0, failed: 0, files: [], errors: [] },
+        }),
+      )
+    })
+    expect(testId('import-summary')?.textContent).toContain('10')
+    expect(testId('import-progress')).toBeNull()
+
+    await act(async () => {
+      releasePoll(running)
+      await latePoll
+    })
+
+    expect(testId('import-summary')?.textContent).toContain('10')
+    expect(testId('import-progress')).toBeNull()
+    expect(testId('import-cancel')).toBeNull()
+  })
+
+  it('does not accept an old watcher after the route returns to the same job id', async () => {
+    vi.useFakeTimers()
+    const oldRunning = job({
+      id: 'job-a-addressed',
+      status: 'running',
+      progress: { done: 1, total: 10, ratio: 0.1, phase: 'writing' },
+      completedAt: null,
+    })
+    const staleRunning = job({
+      ...oldRunning,
+      progress: { done: 2, total: 10, ratio: 0.2, phase: 'writing' },
+    })
+    const freshRunning = job({
+      ...oldRunning,
+      progress: { done: 8, total: 10, ratio: 0.8, phase: 'writing' },
+    })
+    let releaseOldPoll!: (value: Job) => void
+    const oldPoll = new Promise<Job>((resolve) => {
+      releaseOldPoll = resolve
+    })
+
+    harness.api.jobGet
+      .mockResolvedValueOnce(oldRunning)
+      .mockReturnValueOnce(oldPoll)
+      .mockResolvedValueOnce(freshRunning)
+    await mount('/s/main/management/import?job=job-a-addressed')
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(JOB_POLL_MS)
+    })
+    expect(harness.api.jobGet).toHaveBeenCalledTimes(2)
+
+    await act(async () => navigateRoute('/s/main/management/import'))
+    await act(async () => navigateRoute('/s/main/management/import?job=job-a-addressed'))
+    expect(harness.api.jobGet).toHaveBeenCalledTimes(3)
+    expect(testId('import-progress')?.textContent).toContain('8 of 10')
+
+    await act(async () => {
+      releaseOldPoll(staleRunning)
+      await oldPoll
+    })
+
+    expect(testId('import-progress')?.textContent).toContain('8 of 10')
+    expect(testId('import-progress')?.textContent).not.toContain('2 of 10')
+  })
+
+  it('ignores a late cancel response after the route selects another job', async () => {
+    const activeA = job({
+      id: 'job-a-addressed',
+      status: 'running',
+      progress: { done: 2, total: 10, ratio: 0.2, phase: 'writing' },
+      completedAt: null,
+    })
+    const activeB = job({
+      id: 'job-b-addressed',
+      status: 'running',
+      progress: { done: 7, total: 10, ratio: 0.7, phase: 'writing' },
+      completedAt: null,
+    })
+    let releaseCancel!: (value: Job) => void
+    const pendingCancel = new Promise<Job>((resolve) => {
+      releaseCancel = resolve
+    })
+    let releaseB!: (value: Job) => void
+    const pendingB = new Promise<Job>((resolve) => {
+      releaseB = resolve
+    })
+
+    harness.api.jobGet.mockResolvedValueOnce(activeA).mockReturnValueOnce(pendingB)
+    harness.api.jobCancel.mockReturnValue(pendingCancel)
+    await mount('/s/main/management/import?job=job-a-addressed')
+
+    await act(async () => {
+      ;(testId('import-cancel') as HTMLButtonElement).click()
+    })
+    expect(harness.api.jobCancel).toHaveBeenCalledWith('main', activeA.id)
+    await act(async () => navigateRoute('/s/main/management/import?job=job-b-addressed'))
+    expect(harness.api.jobGet).toHaveBeenCalledTimes(2)
+
+    await act(async () => {
+      releaseCancel(job({ id: activeA.id, status: 'canceled' }))
+      await pendingCancel
+    })
+
+    expect(testId('import-error')).toBeNull()
+    expect(text()).not.toContain('import canceled')
+
+    await act(async () => {
+      releaseB(activeB)
+      await pendingB
+    })
+    expect(testId('import-progress')?.textContent).toContain('7 of 10')
+  })
+
+  it('clears an addressed job before another import and reloads the newer result', async () => {
+    const resultA = { imported: 3, skipped: 0, failed: 0, files: [], errors: [] }
+    const resultB = { imported: 7, skipped: 0, failed: 0, files: [], errors: [] }
+
+    harness.api.jobGet.mockResolvedValue(
+      job({ id: 'job-a-addressed', status: 'succeeded', result: resultA }),
+    )
+    harness.api.importStart.mockResolvedValue({
+      mode: 'job',
+      job: job({ id: 'job-b-newer', status: 'succeeded', result: resultB }),
+    })
+    await mount('/s/main/management/import?job=job-a-addressed')
+
+    await act(async () => {
+      ;(testId('import-again') as HTMLButtonElement).click()
+    })
+    expect(route).toBe('/s/main/management/import')
+
+    const input = testId('import-file') as HTMLInputElement
+    Object.defineProperty(input, 'files', {
+      configurable: true,
+      value: [new File(['zip'], 'new.zip')],
+    })
+    await act(async () => input.dispatchEvent(new Event('change', { bubbles: true })))
+    await act(async () => {
+      ;(testId('import-run') as HTMLButtonElement).click()
+    })
+    expect(testId('import-summary')?.textContent).toContain('7')
+
+    harness.api.jobsList.mockResolvedValue([
+      job({ id: 'job-b-newer', status: 'succeeded', result: resultB }),
+      job({ id: 'job-a-addressed', status: 'succeeded', result: resultA }),
+    ])
+    await act(async () => root.unmount())
+    root = createRoot(container)
+    await mount(route)
+
+    expect(harness.api.jobsList).toHaveBeenCalledWith('main', 'import')
+    expect(testId('import-summary')?.textContent).toContain('7')
+    expect(testId('import-summary')?.textContent).not.toContain('3')
+  })
+
   it('goes determinate once planning hands over a total, and never calls it imported', async () => {
     vi.useFakeTimers()
     harness.api.jobsList.mockResolvedValue([
@@ -341,7 +633,7 @@ describe('ImportTab', () => {
 
   it('keeps the notes a synchronous import wrote before it failed', async () => {
     // The none-mode shape the client really returns: `mode: 'sync'` plus a `run` that
-    // drives the hijacked NDJSON stream (client.ts). The line it feeds `onProgress`
+    // drives the hijacked NDJSON stream (services/api/import.ts). The line it feeds `onProgress`
     // is the post-#302 one — `imported` alongside phase/done/total.
     harness.api.importStart.mockResolvedValue({
       mode: 'sync',
@@ -369,6 +661,180 @@ describe('ImportTab', () => {
 
     expect(testId('import-error')?.textContent).toContain('the archive ended early')
     expect(testId('import-summary')?.textContent).toContain('3')
+  })
+
+  it('uploads one selected folder tree with its root wrapper and explicit skip policy', async () => {
+    harness.api.importStart.mockResolvedValue({
+      mode: 'sync',
+      run: async () => ({ imported: 1, skipped: 0, failed: 0, files: [], errors: [] }),
+    })
+    await mount()
+
+    const markdown = new File(['# A'], 'a.md', { type: 'text/markdown' })
+    const image = new File(['png'], 'cover.png', { type: 'image/png' })
+
+    Object.defineProperty(markdown, 'webkitRelativePath', { value: 'vault/a.md' })
+    Object.defineProperty(image, 'webkitRelativePath', { value: 'vault/assets/cover.png' })
+    const input = testId('import-folder') as HTMLInputElement
+    let selectedFiles = [markdown, image]
+
+    Object.defineProperty(input, 'files', {
+      configurable: true,
+      get: () => selectedFiles,
+    })
+    Object.defineProperty(input, 'value', {
+      configurable: true,
+      get: () => (selectedFiles.length > 0 ? 'C:\\fakepath\\vault' : ''),
+      set: (value: string) => {
+        if (value === '') {
+          selectedFiles = []
+        }
+      },
+    })
+    await act(async () => {
+      input.dispatchEvent(new Event('change', { bubbles: true }))
+    })
+    await act(async () => {
+      ;(testId('import-run') as HTMLButtonElement).click()
+    })
+
+    expect(harness.api.importStart).toHaveBeenCalledWith(
+      'main',
+      {
+        kind: 'tree',
+        entries: [
+          { file: markdown, relativePath: 'vault/a.md' },
+          { file: image, relativePath: 'vault/assets/cover.png' },
+        ],
+      },
+      expect.objectContaining({ format: 'markdown', skipExisting: false }),
+      expect.any(AbortSignal),
+    )
+    expect(testId('import-summary')?.textContent).toContain('1')
+  })
+
+  it('accepts 100000 folder entries and refuses 100001 before copying the FileList', async () => {
+    await mount()
+    const input = testId('import-folder') as HTMLInputElement
+    const markdown = new File(['# A'], 'a.md')
+
+    Object.defineProperty(markdown, 'webkitRelativePath', { value: 'vault/a.md' })
+    const atLimit = {
+      length: 100_000,
+      item: () => markdown,
+      *[Symbol.iterator]() {
+        for (let index = 0; index < 100_000; index++) {
+          yield markdown
+        }
+      },
+    } as unknown as FileList
+
+    Object.defineProperty(input, 'files', { configurable: true, value: atLimit })
+    await act(async () => input.dispatchEvent(new Event('change', { bubbles: true })))
+    expect(testId('import-run')).toHaveProperty('disabled', false)
+    expect(text()).toContain('100000 items')
+
+    Object.defineProperty(input, 'files', {
+      configurable: true,
+      value: { length: 100_001 } as FileList,
+    })
+    await act(async () => input.dispatchEvent(new Event('change', { bubbles: true })))
+    expect(testId('import-selection-error')?.textContent).toContain('more than 100000 entries')
+    expect(testId('import-run')).toHaveProperty('disabled', true)
+  })
+
+  it('keeps both browser pickers behind one product entry point', async () => {
+    await mount()
+    const choose = testId('import-choose') as HTMLButtonElement
+    const fileInput = testId('import-file') as HTMLInputElement
+    const folderInput = testId('import-folder') as HTMLInputElement
+    const fileClick = vi.spyOn(fileInput, 'click').mockImplementation(() => undefined)
+    const folderClick = vi.spyOn(folderInput, 'click').mockImplementation(() => undefined)
+
+    expect(choose.textContent).toBe('Choose…')
+    expect(testId('import-choose-folder')).toBeNull()
+    expect(folderInput.multiple).toBe(false)
+    await act(async () => choose.click())
+
+    const menu = document.body.querySelector('[role="menu"]')
+    const choices = Array.from(menu?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]') ?? [])
+
+    expect(choices.map((choice) => choice.textContent)).toEqual(['File or archive', 'Folder'])
+    await act(async () => choices[1]?.click())
+    expect(folderClick).toHaveBeenCalledOnce()
+    expect(fileClick).not.toHaveBeenCalled()
+
+    await act(async () => choose.click())
+    const reopenedChoices = Array.from(
+      document.body.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
+    )
+
+    await act(async () => reopenedChoices[0]?.click())
+    expect(fileClick).toHaveBeenCalledOnce()
+  })
+
+  it('offers every supported text extension in the ordinary file picker', async () => {
+    await mount()
+    const input = testId('import-file') as HTMLInputElement
+
+    expect(input.accept.split(',')).toEqual([
+      '.zip',
+      '.json',
+      '.jsonl',
+      '.md',
+      '.markdown',
+      '.mdown',
+      '.mkd',
+      '.txt',
+      '.text',
+    ])
+  })
+
+  it('imports a selected text file as Markdown with its mtime', async () => {
+    harness.api.importStart.mockResolvedValue({
+      mode: 'sync',
+      run: async () => ({ imported: 1, skipped: 0, failed: 0, files: [], errors: [] }),
+    })
+    await mount()
+    const input = testId('import-file') as HTMLInputElement
+    const modifiedAt = Date.parse('2024-02-03T04:05:06.000Z')
+    const file = new File(['# Note'], 'note.mdown', {
+      type: 'text/markdown',
+      lastModified: modifiedAt,
+    })
+
+    Object.defineProperty(input, 'files', { configurable: true, value: [file] })
+    await act(async () => input.dispatchEvent(new Event('change', { bubbles: true })))
+    await act(async () => {
+      ;(testId('import-run') as HTMLButtonElement).click()
+    })
+
+    expect(harness.api.importStart).toHaveBeenCalledWith(
+      'main',
+      { kind: 'file', file },
+      expect.objectContaining({
+        format: IMPORT_FORMAT.markdown,
+        sendLastModified: true,
+      }),
+      expect.any(AbortSignal),
+    )
+  })
+
+  it('refuses a directory selection when the browser omits relative paths', async () => {
+    await mount()
+    const input = testId('import-folder') as HTMLInputElement
+    const markdown = new File(['# A'], 'a.md')
+
+    Object.defineProperty(input, 'files', { configurable: true, value: [markdown] })
+    await act(async () => {
+      input.dispatchEvent(new Event('change', { bubbles: true }))
+    })
+
+    expect(testId('import-selection-error')?.textContent).toContain(
+      'did not provide complete folder paths',
+    )
+    expect(testId('import-run')).toHaveProperty('disabled', true)
+    expect(harness.api.importStart).not.toHaveBeenCalled()
   })
 
   // A client of this build talking to a server that predates #302: the progress line

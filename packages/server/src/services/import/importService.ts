@@ -27,7 +27,7 @@ import {
 
 import { safeRelAddress } from '../../libs/relPath'
 import { ImportFenceError } from '../metaDb/importFence'
-import { IMPORT_PHASE, IMPORT_PROGRESS_EVERY } from './consts'
+import { IMPORT_PHASE, IMPORT_PROGRESS_EVERY, type ImportSourceKind } from './consts'
 import { underRoot } from './helpers'
 import {
   assertSettledPlanFits,
@@ -135,6 +135,8 @@ export type RunImportArgs = {
    *  so a dragged-in archive keeps its chronology instead of piling onto today.
    *  canon: docs/import.md#dates-as-data */
   sourceModifiedAt?: string
+  /** Internal provenance for the browser-folder bridge. */
+  sourceKind?: ImportSourceKind
   /** Progress, fired every `progressEvery` items and on every phase change.
    *  `done` counts PROCESSED work (a skip and a failure advance it too);
    *  `imported` remains the successful-write counter the NDJSON wire carries. */
@@ -192,6 +194,7 @@ export const runImport = async (args: RunImportArgs): Promise<ImportSummary> => 
       tempDir,
       uploadRef,
       format,
+      sourceKind: args.sourceKind,
       root,
       signal,
       // `done` stays 0 while planning: the writing phase counts from zero, and a

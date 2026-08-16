@@ -1,6 +1,5 @@
 import type {
   ImportSummary,
-  Job,
   NoteExistsResponse,
   NoteDetail as WireNoteDetail,
 } from '@notarium/contract'
@@ -60,6 +59,9 @@ export const setUnauthorizedHandler = (fn: (() => void) | null): void => {
   unauthorizedHandler = fn
 }
 
+/** Resource families with a non-JSON transport still share the same session hook. */
+export const notifyUnauthorized = (): void => unauthorizedHandler?.()
+
 // The space-access probe (#111): a 403/404 on a SPACE-SCOPED route (/api/s/…)
 // can mean the principal just lost their grant on that space (membership
 // revoked, or the space archived/deleted) — but it can equally be a genuinely
@@ -103,7 +105,7 @@ export const req = async <T>(path: string, opts: RequestInit = {}): Promise<T> =
   }
   if (!res.ok) {
     if (res.status === HTTP_STATUS.UNAUTHORIZED && !path.startsWith('/api/auth/')) {
-      unauthorizedHandler?.()
+      notifyUnauthorized()
     }
     // A 403/404 on a space-scoped route → let the access detector decide whether
     // the active space was lost (it re-checks the live grants). 401 is already
@@ -150,168 +152,3 @@ export const req = async <T>(path: string, opts: RequestInit = {}): Promise<T> =
 
 /** The space-scoped route family's prefix. */
 export const sp = (space: string) => `/api/s/${encodeURIComponent(space)}`
-
-/** What a synchronous import's progress line carries. `imported` is the original
- *  successful-write counter; `phase`/`done`/`total` ride alongside it so a Markdown
- *  tree can draw a determinate bar (`total` stays null for everything else). */
-export type ImportProgressLine = {
-  imported: number
-  phase?: string
-  done?: number
-  total?: number | null
-}
-
-/** Read a synchronous-import NDJSON stream (the none-mode fallback of POST /import,
- *  #191): periodic `{type:'progress',imported}` heartbeats feed `onProgress`, a final
- *  `{type:'done',...summary}` resolves, a `{type:'error'}` rejects — carrying any
- *  bounded partial summary it came with. The durable path never touches this — it
- *  returns a Job the caller tracks via jobGet/SSE instead. */
-const readImportStream = async (
-  res: Response,
-  onProgress: (progress: ImportProgressLine) => void,
-): Promise<ImportSummary> => {
-  const reader = res.body!.getReader()
-  const decoder = new TextDecoder()
-  let buf = ''
-  let result: ImportSummary | null = null
-  let failure: string | null = null
-  let partial: ImportSummary | undefined
-
-  const handle = (line: string) => {
-    const t = line.trim()
-
-    if (!t) {
-      return
-    }
-    let msg: {
-      type?: string
-      imported?: number
-      phase?: string
-      done?: number
-      total?: number | null
-      error?: string
-      partial?: ImportSummary
-    } & Record<string, unknown>
-
-    try {
-      msg = JSON.parse(t)
-    } catch {
-      return
-    }
-    if (msg.type === 'progress') {
-      onProgress({
-        imported: msg.imported ?? 0,
-        phase: msg.phase,
-        done: msg.done,
-        total: msg.total ?? null,
-      })
-    } else if (msg.type === 'done') {
-      result = msg as unknown as ImportSummary
-    } else if (msg.type === 'error') {
-      failure = msg.error || 'import failed'
-      partial = msg.partial
-    }
-  }
-
-  for (;;) {
-    const { value, done } = await reader.read()
-
-    if (done) {
-      break
-    }
-    buf += decoder.decode(value, { stream: true })
-    for (let nl = buf.indexOf('\n'); nl !== -1; nl = buf.indexOf('\n')) {
-      handle(buf.slice(0, nl))
-      buf = buf.slice(nl + 1)
-    }
-  }
-  buf += decoder.decode() // flush any trailing multibyte remainder
-  handle(buf)
-  if (failure) {
-    const err = new ApiError(failure)
-
-    err.partial = partial
-
-    throw err
-  }
-  if (!result) {
-    throw new ApiError('import produced no result')
-  }
-
-  return result
-}
-
-/** Import (#11, #191): upload a Claude/ChatGPT/memory export (a .zip or bare
- *  .json/.jsonl) → notes. FormData (the browser sets the multipart boundary); the
- *  file is appended LAST because the server reads the text fields off the file part.
- *  One POST, streamed once (a large archive is never re-sent); the response tells
- *  the mode:
- *   • DURABLE (202): a meta-DB backs jobs → returns the enqueued Job. Track it via
- *     jobGet / the `job` SSE event; its ImportSummary lands in job.result on success;
- *     it survives a closed tab / restart and can be canceled.
- *   • SYNC (200 NDJSON): none-mode fallback → returns `run(onProgress)` that drives
- *     the hijacked stream to the summary — honest capability degradation.
- *  A pre-stream error (413/400/401) throws ApiError (status set). Pass `signal` to
- *  abort the upload (the sync fallback's Cancel). */
-export const importStart = async (
-  space: string,
-  file: File,
-  opts: {
-    format?: string
-    root?: string
-    skipExisting?: boolean
-    memory?: 'folder' | 'space' | 'skip'
-    /** Send the dropped file's own mtime (`File.lastModified`) so a `markdown`
-     *  import can date the note by the FILE when its frontmatter names no date —
-     *  otherwise a dragged-in archive piles onto today.
-     *  canon: docs/import.md#dates-as-data */
-    sendLastModified?: boolean
-  } = {},
-  signal?: AbortSignal,
-): Promise<
-  | { mode: 'job'; job: Job }
-  | {
-      mode: 'sync'
-      run: (onProgress: (progress: ImportProgressLine) => void) => Promise<ImportSummary>
-    }
-> => {
-  const form = new FormData()
-
-  if (opts.format) {
-    form.append('format', opts.format)
-  }
-  if (opts.root) {
-    form.append('root', opts.root)
-  }
-  if (opts.skipExisting) {
-    form.append('skipExisting', 'true')
-  }
-  if (opts.memory) {
-    form.append('memory', opts.memory)
-  }
-  if (opts.sendLastModified && file.lastModified) {
-    form.append('lastModified', String(file.lastModified))
-  }
-  form.append('file', file)
-  const res = await fetch(`${sp(space)}/import`, { method: 'POST', body: form, signal })
-
-  if (!res.ok || !res.body) {
-    // A pre-stream error (413/400) carries a real JSON `{error}` body — surface it
-    // instead of a bare "HTTP 413", and mirror req()'s 401 → logout handling.
-    if (res.status === HTTP_STATUS.UNAUTHORIZED) {
-      unauthorizedHandler?.()
-    }
-    const data = (await res.json().catch(() => ({}))) as { error?: unknown }
-    const err = new ApiError(
-      typeof data.error === 'string' && data.error ? data.error : `HTTP ${res.status}`,
-    )
-    err.status = res.status
-    throw err
-  }
-  // 202 = a durable import job was enqueued; 200 = the synchronous NDJSON fallback.
-  if (res.status === HTTP_STATUS.ACCEPTED) {
-    return { mode: 'job', job: (await res.json()) as Job }
-  }
-
-  return { mode: 'sync', run: (onProgress) => readImportStream(res, onProgress) }
-}

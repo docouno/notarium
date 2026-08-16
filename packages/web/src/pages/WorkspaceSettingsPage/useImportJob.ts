@@ -2,7 +2,15 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ImportSummary, Job } from '@notarium/contract'
 import { SSE_EVENT } from '@notarium/contract/events'
 
-import { api, ApiError, type ImportProgressLine, JOB_POLL_MS } from '../../services/api'
+import {
+  api,
+  ApiError,
+  type ImportProgressLine,
+  type ImportStartOptions,
+  type ImportUploadSource,
+  JOB_POLL_MS,
+  normalizeImportSummary,
+} from '../../services/api'
 
 // The durable-import client hook (#191 [JOBS][B]) — the inverse of useExportJob.
 // Drives one import job through its lifecycle for the Import tab: upload → enqueue →
@@ -14,12 +22,7 @@ import { api, ApiError, type ImportProgressLine, JOB_POLL_MS } from '../../servi
 // jobs (no meta-DB) the POST answers with the synchronous NDJSON stream instead, which
 // this hook drives into the SAME shape (a synthetic job) so the tab renders uniformly.
 
-export type ImportOptions = {
-  format?: string
-  root?: string
-  skipExisting?: boolean
-  memory?: 'folder' | 'space' | 'skip'
-}
+export type ImportOptions = ImportStartOptions
 
 export type ImportJobState = {
   job: Job | null
@@ -27,58 +30,6 @@ export type ImportJobState = {
   error: string | null
   /** True while a job is pending or running. */
   busy: boolean
-}
-
-/** How many detail rows this tab will ever render per collection. The server caps
- *  the same way, but a result persisted by an older build predates that cap — and
- *  a 10 000-row Notice is a frozen tab, not a diagnostic. */
-const DETAIL_CAP = 200
-
-const cap = <T>(rows: readonly T[] | undefined): { rows: T[]; omitted: number } => {
-  const all = Array.isArray(rows) ? rows : []
-
-  return { rows: all.slice(0, DETAIL_CAP), omitted: Math.max(0, all.length - DETAIL_CAP) }
-}
-
-/** Structurally normalize a result the server (or an older server) produced.
- *  Deliberately hand-written rather than the contract's Zod schema: the web bundle
- *  does not ship Zod (canon: docs/contract.md), and a stricter parser would throw
- *  away a real outcome over a field it did not expect. */
-export const normalizeImportSummary = (raw: unknown): ImportSummary | null => {
-  if (!raw || typeof raw !== 'object') {
-    return null
-  }
-  const value = raw as Record<string, unknown>
-  const count = (key: string) => (typeof value[key] === 'number' ? (value[key] as number) : 0)
-  const files = cap(value.files as ImportSummary['files'])
-  const errors = cap(value.errors as ImportSummary['errors'])
-  const ignoredRaw = value.ignored as ImportSummary['ignored']
-  const ignoredFiles = cap(ignoredRaw?.files)
-  const omitted = (declared: unknown, local: number) =>
-    (typeof declared === 'number' ? declared : 0) + local
-
-  return {
-    imported: count('imported'),
-    skipped: count('skipped'),
-    failed: count('failed'),
-    files: files.rows,
-    filesOmitted: omitted(value.filesOmitted, files.omitted) || undefined,
-    errors: errors.rows,
-    errorsOmitted: omitted(value.errorsOmitted, errors.omitted) || undefined,
-    // Not derived from the rows: the per-file warnings that say the same thing are
-    // capped on both sides, so recomputing this from what survived the cap would
-    // under-report exactly the imports big enough for it to matter. A result from
-    // a server that predates the field simply has none, and reads as zero.
-    repointFailed: count('repointFailed') || undefined,
-    ignored: ignoredRaw
-      ? {
-          count: typeof ignoredRaw.count === 'number' ? ignoredRaw.count : 0,
-          files: ignoredFiles.rows,
-          filesOmitted: omitted(ignoredRaw.filesOmitted, ignoredFiles.omitted) || undefined,
-        }
-      : undefined,
-    created: Array.isArray(value.created) ? (value.created as string[]).slice(0, DETAIL_CAP) : [],
-  }
 }
 
 /** The import outcome — read off job.result. A FAILED job may carry one too: an
@@ -116,7 +67,7 @@ const syncJob = (
   ...extra,
 })
 
-export const useImportJob = (space: string) => {
+export const useImportJob = (space: string, targetJobId?: string | null) => {
   const [state, setState] = useState<ImportJobState>({ job: null, error: null, busy: false })
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const esRef = useRef<EventSource | null>(null)
@@ -128,8 +79,12 @@ export const useImportJob = (space: string) => {
   // watchers, an unmount mid-upload must not let the resolved 202 open an SSE + poll on
   // a dead hook, nor paint a stale terminal state on a new space.
   const genRef = useRef(0)
+  // A job id can return after route/reset (A → … → A), so it cannot itself identify
+  // one watcher session. stopWatch() invalidates every callback from the old generation.
+  const watchGenRef = useRef(0)
 
   const stopWatch = useCallback(() => {
+    watchGenRef.current++
     if (pollRef.current) {
       clearInterval(pollRef.current)
     }
@@ -166,14 +121,24 @@ export const useImportJob = (space: string) => {
   const watch = useCallback(
     (id: string) => {
       stopWatch()
+      const watchGen = watchGenRef.current
+
       activeId.current = id
+      const applyWatched = (job: Job) => {
+        if (watchGenRef.current === watchGen && activeId.current === id && job.id === id) {
+          apply(job)
+        }
+      }
+
       // Live updates via the named `job` SSE event (a dedicated short-lived stream for
       // this tab; auto-reconnects, torn frames ignored).
       try {
         const es = new EventSource(api.spaceEventsUrl(space))
         es.addEventListener(SSE_EVENT.JOB, (e) => {
           try {
-            apply(JSON.parse((e as MessageEvent).data as string) as Job)
+            const job = JSON.parse((e as MessageEvent).data as string) as Job
+
+            applyWatched(job)
           } catch {
             // a torn frame mid-reconnect is noise
           }
@@ -185,12 +150,12 @@ export const useImportJob = (space: string) => {
       // Poll fallback — catches a missed SSE frame, a dropped stream, or a job that
       // finished between enqueue and the stream opening.
       pollRef.current = setInterval(() => {
-        if (!activeId.current) {
+        if (watchGenRef.current !== watchGen || activeId.current !== id) {
           return
         }
         void api
           .jobGet(space, id)
-          .then(apply)
+          .then(applyWatched)
           .catch(() => {
             // transient — the next tick retries; a 404 means it was GC'd/gone
           })
@@ -202,21 +167,21 @@ export const useImportJob = (space: string) => {
   /** Upload + start an import. Durable when jobs are available, else the synchronous
    *  fallback driven into the same synthetic-job shape. */
   const start = useCallback(
-    async (file: File, opts: ImportOptions) => {
+    async (source: ImportUploadSource, opts: ImportOptions) => {
       const gen = ++genRef.current
       const live = () => gen === genRef.current // false once torn down / superseded
       setState({ job: null, error: null, busy: true })
       const ac = new AbortController()
       syncAbort.current = ac
       try {
-        const started = await api.importStart(space, file, opts, ac.signal)
+        const started = await api.importStart(space, source, opts, ac.signal)
 
         if (!live()) {
           return
         } // unmounted / space-switched while the upload streamed
         if (started.mode === 'job') {
           apply(started.job)
-          if (started.job.status !== 'succeeded') {
+          if (started.job.status === 'pending' || started.job.status === 'running') {
             watch(started.job.id)
           }
 
@@ -286,8 +251,20 @@ export const useImportJob = (space: string) => {
     if (!id || id === 'sync') {
       return
     }
+    const gen = genRef.current
+    const watchGen = watchGenRef.current
+
     try {
-      apply(await api.jobCancel(space, id))
+      const canceled = await api.jobCancel(space, id)
+
+      if (
+        genRef.current === gen &&
+        watchGenRef.current === watchGen &&
+        activeId.current === id &&
+        canceled.id === id
+      ) {
+        apply(canceled)
+      }
     } catch {
       // best-effort — the poll/SSE will reflect the real state
     }
@@ -312,10 +289,8 @@ export const useImportJob = (space: string) => {
     },
     [stopWatch],
   )
-  // Reconnect ("leave and come back", #191): on mount / space switch, resume the
-  // principal's most recent import. An in-flight one keeps streaming progress; a
-  // finished one shows its summary again. A none-mode host (jobs 404) or a transient
-  // error just leaves a clean slate.
+  // A job-addressed route owns exactly that job. The ordinary route keeps the
+  // established reconnect behavior and adopts the newest import.
   useEffect(() => {
     reset()
     // Snapshot the generation right after reset(): onChoose()/start()/reset() all bump
@@ -324,41 +299,67 @@ export const useImportJob = (space: string) => {
     // activeId can't guard this — it stays null through the whole pre-202 upload window.
     const gen0 = genRef.current
     let cancelled = false
-    void api
-      .jobsList(space, 'import')
-      .then((list) => {
-        // Bail if unmounted/space-switched, or if the user picked a file / started a job
-        // while jobsList was in flight — a stale snapshot must never tear down a fresh import.
-        if (cancelled || activeId.current || genRef.current !== gen0) {
-          return
-        }
-        const active = list.find((j) => j.status === 'pending' || j.status === 'running')
 
-        if (active) {
-          apply(active)
-          watch(active.id)
-          return
-        }
-        // The NEWEST terminal import, not the newest SUCCESSFUL one: a failed
-        // partial import is the outcome the user needs to see, and falling back to
-        // an older success would quietly claim everything went fine.
-        const terminal = list.find(
-          (j) => j.status === 'succeeded' || j.status === 'failed' || j.status === 'canceled',
-        )
+    const adopt = (job: Job) => {
+      if (cancelled || activeId.current || genRef.current !== gen0) {
+        return
+      }
+      apply(job)
+      if (job.status === 'pending' || job.status === 'running') {
+        watch(job.id)
+      }
+    }
 
-        if (terminal) {
-          apply(terminal)
-        }
-      })
-      .catch(() => {
-        // no durable jobs on this host / transient — nothing to resume
-      })
+    if (targetJobId) {
+      void api
+        .jobGet(space, targetJobId)
+        .then(adopt)
+        .catch((error) => {
+          if (!cancelled && genRef.current === gen0) {
+            setState({
+              job: null,
+              busy: false,
+              error: error instanceof Error ? error.message : 'Import job could not be loaded',
+            })
+          }
+        })
+    } else {
+      void api
+        .jobsList(space, 'import')
+        .then((list) => {
+          // Bail if unmounted/space-switched, or if the user picked a file / started a job
+          // while jobsList was in flight — a stale snapshot must never tear down a fresh import.
+          if (cancelled || activeId.current || genRef.current !== gen0) {
+            return
+          }
+          const active = list.find((j) => j.status === 'pending' || j.status === 'running')
+
+          if (active) {
+            adopt(active)
+            return
+          }
+          // The NEWEST terminal import, not the newest SUCCESSFUL one: a failed
+          // partial import is the outcome the user needs to see, and falling back to
+          // an older success would quietly claim everything went fine.
+          const terminal = list.find(
+            (j) => j.status === 'succeeded' || j.status === 'failed' || j.status === 'canceled',
+          )
+
+          if (terminal) {
+            adopt(terminal)
+          }
+        })
+        .catch(() => {
+          // no durable jobs on this host / transient — nothing to resume
+        })
+    }
+
     return () => {
       cancelled = true
       stopWatch()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [space])
+  }, [space, targetJobId])
 
   return { ...state, summary: summaryOf(state.job), start, cancel, reset }
 }

@@ -71,7 +71,8 @@ import { useAuth } from '../AuthProvider'
 import { useChrome } from '../ChromeProvider'
 import { useEditing } from '../EditingProvider'
 import { useFavorites } from '../FavoritesProvider'
-import { useFileImport } from '../ImportDropZone/useFileImport'
+import { captureDrop } from '../ImportDropZone/dropEntries'
+import { useDropImport } from '../ImportDropZone/useFileImport'
 import { useNotes } from '../NotesProvider'
 import { useProjects } from '../ProjectsProvider'
 import { useSpace } from '../SpaceProvider'
@@ -146,9 +147,9 @@ export const Sidebar = () => {
   const favorites = useFavorites()
   const { confirm, prompt } = useDialog()
   const toast = useToast()
-  // Drop an OS text file onto a folder row → import it there (#223). Shared with
-  // the window content-zone dropzone so the import action exists once.
-  const importFiles = useFileImport()
+  // Drop OS files or a folder onto a folder row and import the captured source there.
+  // Shared with the window content-zone dropzone so the import action exists once.
+  const importDrop = useDropImport()
   const location = useLocation()
   const navigate = useNavigate()
   const route = parseAppPath(location.pathname)
@@ -912,13 +913,15 @@ export const Sidebar = () => {
   }
 
   const sectionDrop = (e: ReactDragEvent) => {
-    // External file drag (#223): import the dropped files into the target folder.
+    // External file drag: snapshot it synchronously, then import into the target folder.
     if (isFileDrag(e)) {
       e.preventDefault()
       const target = dropTargetAt(e)
       setDropTarget(null)
       if (canWrite) {
-        void importFiles(e.dataTransfer.files, target)
+        const capture = captureDrop(e.dataTransfer)
+
+        void importDrop(capture, target)
       }
 
       return

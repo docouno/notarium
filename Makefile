@@ -257,7 +257,8 @@ test-pg: ## Run meta-DB contracts/migrations against ephemeral live Postgres
 # no business doing it in the checkout. Correctness fails the run; timings are
 # printed, never asserted. NOTES trims the corpus for a quicker shape.
 NOTES ?= 10000
-import-bench: ## Run the Markdown-tree import scale bench in Docker: make import-bench [NOTES=10000]
+SOURCE ?= archive
+import-bench: ## Run the Markdown-tree import scale bench in Docker: make import-bench [SOURCE=folder] [NOTES=10000]
 	@set -eu; \
 	  cleanup() { \
 	    docker rm -f $(CHECKUP_RUNNER_CONTAINER) >/dev/null 2>&1 || true; \
@@ -281,7 +282,7 @@ import-bench: ## Run the Markdown-tree import scale bench in Docker: make import
 	    run deps:lean; \
 	  docker run --rm --name $(CHECKUP_RUNNER_CONTAINER) \
 	    --mount "type=volume,src=$(CHECKUP_WORKSPACE_VOLUME),dst=/app" \
-	    --workdir /app -e HOME=/tmp -e NOTES=$(NOTES) \
+	    --workdir /app -e HOME=/tmp -e NOTES=$(NOTES) -e SOURCE=$(SOURCE) \
 	    --entrypoint npm "$(NODE_TEST_IMAGE)" run bench:import-markdown-tree
 
 # --- session activity read-model benchmark ----------------------------------

@@ -1,4 +1,8 @@
 import { type Page } from '@playwright/test'
+import AdmZip from 'adm-zip'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import { expect, test, treeNote, waitForAppReady } from './fixtures'
 
@@ -40,7 +44,13 @@ const folderSel = (path: string) => `[data-testid="tree-folder"][data-path="${pa
 const dropTextFiles = async (
   page: Page,
   targetSel: string,
-  files: Array<{ name: string; content: string; type?: string; lastModified?: number }>,
+  files: Array<{
+    name: string
+    content?: string
+    bytes?: number[]
+    type?: string
+    lastModified?: number
+  }>,
 ) => {
   await page.evaluate(
     ({ targetSel: sel, files: fs }) => {
@@ -57,7 +67,7 @@ const dropTextFiles = async (
 
       for (const f of fs) {
         dt.items.add(
-          new File([f.content], f.name, {
+          new File([f.bytes ? new Uint8Array(f.bytes) : (f.content ?? '')], f.name, {
             type: f.type ?? 'text/markdown',
             // The file's own mtime — the date a frontmatter-less note falls back to
             // (#280). A real OS drag carries it; here we set it explicitly.
@@ -83,6 +93,145 @@ const dropTextFiles = async (
   )
 }
 
+/** Deliver one synthetic legacy FileSystemEntry tree. The app captures the entry
+ * synchronously on drop, then the callbacks intentionally resolve asynchronously. */
+const dropFolder = async (
+  page: Page,
+  targetSel: string,
+  files: Array<{
+    path: string
+    content: string
+    type?: string
+    lastModified?: number
+  }>,
+) => {
+  await page.evaluate(
+    ({ targetSel: sel, files: fs }) => {
+      type Leaf = (typeof fs)[number]
+      type Directory = { name: string; files: Leaf[]; directories: Map<string, Directory> }
+      const paths = fs.map((file) => file.path.split('/'))
+      const rootName = paths[0]?.[0]
+
+      if (!rootName || paths.some((parts) => parts[0] !== rootName || parts.length < 2)) {
+        throw new Error('the synthetic folder needs one common root')
+      }
+      const tree: Directory = { name: rootName, files: [], directories: new Map() }
+
+      fs.forEach((file, index) => {
+        const parts = paths[index]
+        let directory = tree
+
+        for (const name of parts.slice(1, -1)) {
+          let child = directory.directories.get(name)
+
+          if (!child) {
+            child = { name, files: [], directories: new Map() }
+            directory.directories.set(name, child)
+          }
+          directory = child
+        }
+        directory.files.push({ ...file, path: parts.at(-1)! })
+      })
+
+      const fileEntry = (file: Leaf, parentPath: string): FileSystemFileEntry =>
+        ({
+          isFile: true,
+          isDirectory: false,
+          name: file.path,
+          fullPath: `${parentPath}/${file.path}`,
+          file: (success: FileCallback) =>
+            queueMicrotask(() =>
+              success(
+                new File([file.content], file.path, {
+                  type: file.type ?? 'text/markdown',
+                  ...(file.lastModified ? { lastModified: file.lastModified } : {}),
+                }),
+              ),
+            ),
+        }) as FileSystemFileEntry
+
+      const directoryEntry = (directory: Directory, parentPath = ''): FileSystemDirectoryEntry => {
+        const fullPath = `${parentPath}/${directory.name}`
+
+        return {
+          isFile: false,
+          isDirectory: true,
+          name: directory.name,
+          fullPath,
+          createReader: () => {
+            let read = false
+
+            return {
+              readEntries: (success: FileSystemEntriesCallback) => {
+                const entries = read
+                  ? []
+                  : [
+                      ...[...directory.directories.values()].map((child) =>
+                        directoryEntry(child, fullPath),
+                      ),
+                      ...directory.files.map((file) => fileEntry(file, fullPath)),
+                    ]
+
+                read = true
+                queueMicrotask(() => success(entries))
+              },
+            } as FileSystemDirectoryReader
+          },
+        } as FileSystemDirectoryEntry
+      }
+
+      const anchor = document.querySelector(sel)
+
+      if (!anchor) {
+        throw new Error(`no drop target for ${sel}`)
+      }
+      const rect = anchor.getBoundingClientRect()
+      const clientX = Math.round(rect.left + rect.width / 2)
+      const clientY = Math.round(rect.top + rect.height / 2)
+      const at = document.elementFromPoint(clientX, clientY) ?? anchor
+      const transfer = new DataTransfer()
+      const item = transfer.items.add(new File([], rootName))
+
+      if (!item) {
+        throw new Error('could not create a synthetic DataTransfer item')
+      }
+      // Chromium may hand Array.from(DataTransferItemList) a fresh DOM wrapper,
+      // so an expando on `item` is not a reliable method override. Patch its
+      // prototype only for the synchronous event dispatch, then restore it.
+      const itemPrototype = Object.getPrototypeOf(item) as object
+      const originalEntryMethod = Object.getOwnPropertyDescriptor(itemPrototype, 'webkitGetAsEntry')
+
+      Object.defineProperty(itemPrototype, 'webkitGetAsEntry', {
+        configurable: true,
+        value: () => directoryEntry(tree),
+      })
+      const fire = (type: string) =>
+        at.dispatchEvent(
+          new DragEvent(type, {
+            bubbles: true,
+            cancelable: true,
+            dataTransfer: transfer,
+            clientX,
+            clientY,
+          }),
+        )
+
+      try {
+        fire('dragenter')
+        fire('dragover')
+        fire('drop')
+      } finally {
+        if (originalEntryMethod) {
+          Object.defineProperty(itemPrototype, 'webkitGetAsEntry', originalEntryMethod)
+        } else {
+          delete (itemPrototype as { webkitGetAsEntry?: unknown }).webkitGetAsEntry
+        }
+      }
+    },
+    { targetSel, files },
+  )
+}
+
 /** The folder a note's tree row declares (its wrapper's data-drop-folder). */
 const folderOfTitle = (page: Page, title: string) =>
   page.evaluate((t) => {
@@ -93,6 +242,67 @@ const folderOfTitle = (page: Page, title: string) =>
         ?.parentElement?.getAttribute('data-drop-folder') ?? null
     )
   }, title)
+
+test('Settings ordinary picker imports a Markdown file offered by its native filter', async ({
+  page,
+  baseURL,
+}) => {
+  const fixtureRoot = await mkdtemp(join(tmpdir(), 'notarium-file-picker-'))
+  const notePath = join(fixtureRoot, 'picked.mdown')
+
+  try {
+    await writeFile(notePath, '# Picked Markdown\n\nImported from Settings.')
+    await page.request.post(`${baseURL}/api/__test/reset`, { data: { fixture: FIXTURE } })
+    await page.goto('/s/main/management/import')
+    await waitForAppReady(page)
+
+    const input = page.getByTestId('import-file')
+
+    await expect(input).toHaveAttribute('accept', /\.mdown/)
+    await input.setInputFiles(notePath)
+    await expect(page.getByText('picked.mdown')).toBeVisible()
+    await expect(page.getByTestId('import-run')).toBeEnabled()
+    await page.getByTestId('import-run').click()
+
+    await expect(page.getByTestId('import-summary')).toContainText('Imported 1 note')
+    await expect(treeNote(page, 'Picked Markdown')).toBeVisible()
+  } finally {
+    await rm(fixtureRoot, { recursive: true, force: true })
+  }
+})
+
+test('Settings folder picker snapshots the native directory selection before clearing it', async ({
+  page,
+  baseURL,
+}) => {
+  const fixtureRoot = await mkdtemp(join(tmpdir(), 'notarium-folder-picker-'))
+  const vault = join(fixtureRoot, 'vault')
+
+  try {
+    await mkdir(join(vault, 'nested'), { recursive: true })
+    await writeFile(join(vault, 'alpha.md'), '# Folder Alpha')
+    await writeFile(join(vault, 'nested', 'beta.txt'), 'Folder Beta')
+    await page.request.post(`${baseURL}/api/__test/reset`, { data: { fixture: FIXTURE } })
+    await page.goto('/s/main/management/import')
+    await waitForAppReady(page)
+
+    await page.getByTestId('import-folder').setInputFiles(vault)
+
+    await expect(page.getByText('vault/ (2 items)')).toBeVisible()
+    await expect(page.getByTestId('import-run')).toBeEnabled()
+    await page.getByTestId('import-run').click()
+    await expect(page.getByTestId('import-summary')).toContainText('Imported 2 notes')
+    const paths = await page.request
+      .get(`${baseURL}/api/s/main/notes?limit=50`)
+      .then((response) => response.json())
+      .then((body) => body.notes.map((note: { filePath: string }) => note.filePath))
+
+    expect(paths).toContain('vault/alpha.md')
+    expect(paths).toContain('vault/nested/beta.md')
+  } finally {
+    await rm(fixtureRoot, { recursive: true, force: true })
+  }
+})
 
 test('drop a markdown file in the reader → a note in the scope root (#223)', async ({
   page,
@@ -109,7 +319,7 @@ test('drop a markdown file in the reader → a note in the scope root (#223)', a
 
   await expect(treeNote(page, 'Welcome Note')).toBeVisible()
   await expect.poll(() => folderOfTitle(page, 'Welcome Note')).toBe('')
-  await expect(page.getByTestId('toast')).toContainText('Imported 1 note')
+  await expect(page.getByTestId('toast').filter({ hasText: 'Imported 1 note' })).toBeVisible()
   // A SINGLE-file drop OPENS the imported note (the headline behavior).
   await expect(page).toHaveURL(/\/n\/[^/]+/)
 })
@@ -285,4 +495,190 @@ test('drop several files at once → all imported in one go (#223 multi-file)', 
   await expect(treeNote(page, 'One')).toBeVisible()
   await expect(treeNote(page, 'Two')).toBeVisible()
   await expect(treeNote(page, 'three')).toBeVisible() // .txt titled from its filename
+})
+
+test('drop a folder onto a tree row → its wrapper and nested paths land under that row', async ({
+  page,
+  baseURL,
+}) => {
+  await page.request.post(`${baseURL}/api/__test/reset`, { data: { fixture: FIXTURE } })
+  await page.goto('/s/main')
+  await waitForAppReady(page)
+  await expect(page.locator(folderSel('Frontend'))).toBeVisible()
+
+  await dropFolder(page, folderSel('Frontend'), [
+    { path: 'vault/nested/alpha.md', content: '# Folder Alpha' },
+    { path: 'vault/notes.txt', content: 'Folder plain text', type: 'text/plain' },
+    { path: 'vault/assets/cover.png', content: 'not uploaded', type: 'image/png' },
+  ])
+
+  await expect
+    .poll(async () => (await page.getByTestId('toast').allTextContents()).join('\n'))
+    .toContain('Imported 2 notes')
+  const paths = await page.request
+    .get(`${baseURL}/api/s/main/notes?limit=50`)
+    .then((response) => response.json())
+    .then((body) => body.notes.map((note: { filePath: string }) => note.filePath))
+
+  expect(paths).toContain('Frontend/vault/nested/alpha.md')
+  expect(paths).toContain('Frontend/vault/notes.md')
+  const warning = page.getByTestId('toast').filter({ hasText: '1 unsupported' })
+  await expect(warning).toHaveAttribute('data-variant', 'warning')
+})
+
+test('drop a folder in the reader → it keeps the wrapper beside the open note', async ({
+  page,
+  baseURL,
+}) => {
+  await page.request.post(`${baseURL}/api/__test/reset`, { data: { fixture: FIXTURE } })
+  await page.goto('/s/main')
+  await waitForAppReady(page)
+  await expect(treeNote(page, 'existing')).toBeVisible()
+  await treeNote(page, 'existing').click()
+  await expect(page.getByRole('navigation', { name: 'Breadcrumb' })).toContainText('Frontend')
+
+  await dropFolder(page, 'main', [{ path: 'research/sub/beta.mdown', content: '# Folder Beta' }])
+
+  await expect
+    .poll(async () => (await page.getByTestId('toast').allTextContents()).join('\n'))
+    .toContain('Imported 1 note')
+  const paths = await page.request
+    .get(`${baseURL}/api/s/main/notes?limit=50`)
+    .then((response) => response.json())
+    .then((body) => body.notes.map((note: { filePath: string }) => note.filePath))
+
+  expect(paths).toContain('Frontend/research/sub/beta.md')
+})
+
+test('drop one Markdown ZIP → the auto classifier imports its tree without opening one note', async ({
+  page,
+  baseURL,
+}) => {
+  const archive = new AdmZip()
+
+  archive.addFile('vault/nested/from-archive.md', Buffer.from('# From archive'))
+  await page.request.post(`${baseURL}/api/__test/reset`, { data: { fixture: FIXTURE } })
+  await page.goto('/s/main')
+  await waitForAppReady(page)
+
+  await dropTextFiles(page, 'main', [
+    {
+      name: 'vault.zip',
+      bytes: [...archive.toBuffer()],
+      type: 'application/zip',
+    },
+  ])
+
+  await expect(page.getByTestId('toast').filter({ hasText: 'Imported 1 note' })).toBeVisible()
+  const paths = await page.request
+    .get(`${baseURL}/api/s/main/notes?limit=50`)
+    .then((response) => response.json())
+    .then((body) => body.notes.map((note: { filePath: string }) => note.filePath))
+
+  expect(paths).toContain('vault/nested/from-archive.md')
+  await expect(page).toHaveURL('/s/main')
+})
+
+test('a top-level ZIP mixed with another file is refused before any import request', async ({
+  page,
+  baseURL,
+}) => {
+  const archive = new AdmZip()
+  let importRequests = 0
+
+  archive.addFile('vault/from-archive.md', Buffer.from('# From archive'))
+  page.on('request', (request) => {
+    if (new URL(request.url()).pathname === '/api/s/main/import') {
+      importRequests++
+    }
+  })
+  await page.request.post(`${baseURL}/api/__test/reset`, { data: { fixture: FIXTURE } })
+  await page.goto('/s/main')
+  await waitForAppReady(page)
+
+  await dropTextFiles(page, 'main', [
+    { name: 'vault.zip', bytes: [...archive.toBuffer()], type: 'application/zip' },
+    { name: 'beside.md', content: '# Beside' },
+  ])
+
+  await expect(
+    page.getByTestId('toast').filter({ hasText: 'A ZIP archive must be dropped on its own' }),
+  ).toBeVisible()
+  expect(importRequests).toBe(0)
+  const titles = await page.request
+    .get(`${baseURL}/api/s/main/notes?limit=50`)
+    .then((response) => response.json())
+    .then((body) => body.notes.map((note: { title: string }) => note.title))
+
+  expect(titles).toEqual(['existing'])
+})
+
+test('an ambiguous all-null drop shows capability help without a partial request', async ({
+  page,
+  baseURL,
+}) => {
+  let importRequests = 0
+
+  page.on('request', (request) => {
+    if (new URL(request.url()).pathname === '/api/s/main/import') {
+      importRequests++
+    }
+  })
+  await page.request.post(`${baseURL}/api/__test/reset`, { data: { fixture: FIXTURE } })
+  await page.goto('/s/main')
+  await waitForAppReady(page)
+
+  await dropTextFiles(page, 'main', [
+    { name: 'vault.v1', content: '', type: '' },
+    { name: 'beside.md', content: '# Beside' },
+  ])
+
+  const notice = page
+    .getByTestId('toast')
+    .filter({ hasText: 'This browser could not fully read the dropped items' })
+
+  await expect(notice).toBeVisible()
+  await expect(notice.getByRole('button', { name: 'Open Import settings' })).toBeVisible()
+  expect(importRequests).toBe(0)
+})
+
+test('drop one foreign ZIP → it stays on the existing export classifier', async ({
+  page,
+  baseURL,
+}) => {
+  const archive = new AdmZip()
+
+  archive.addFile(
+    'conversations.json',
+    Buffer.from(
+      JSON.stringify([
+        {
+          uuid: 'foreign-1',
+          name: 'Foreign conversation',
+          created_at: '2024-03-15T14:30:00Z',
+          chat_messages: [{ sender: 'human', text: 'Hello from Claude' }],
+        },
+      ]),
+    ),
+  )
+  await page.request.post(`${baseURL}/api/__test/reset`, { data: { fixture: FIXTURE } })
+  await page.goto('/s/main')
+  await waitForAppReady(page)
+
+  await dropTextFiles(page, 'main', [
+    {
+      name: 'claude.zip',
+      bytes: [...archive.toBuffer()],
+      type: 'application/zip',
+    },
+  ])
+
+  await expect(page.getByTestId('toast').filter({ hasText: 'Imported 1 note' })).toBeVisible()
+  const titles = await page.request
+    .get(`${baseURL}/api/s/main/notes?limit=50`)
+    .then((response) => response.json())
+    .then((body) => body.notes.map((note: { title: string }) => note.title))
+
+  expect(titles).toContain('Foreign conversation')
+  await expect(page).toHaveURL('/s/main')
 })

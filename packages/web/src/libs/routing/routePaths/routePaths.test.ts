@@ -6,7 +6,17 @@ import {
   folderRoute,
   parseAppPath,
   spaceRoute,
+  workspaceSettingsRoute,
 } from './routePaths'
+
+describe('workspaceSettingsRoute', () => {
+  it('addresses one exact durable job when requested', () => {
+    expect(workspaceSettingsRoute('my space', 'import', { job: 'job/a' })).toBe(
+      '/s/my%20space/management/import?job=job%2Fa',
+    )
+    expect(workspaceSettingsRoute('main', 'import')).toBe('/s/main/management/import')
+  })
+})
 
 // The dashboard surfaces (#216) ride the existing space-scoped URL grammar: the
 // default (Activity) IS the space home, only projects/health carry a

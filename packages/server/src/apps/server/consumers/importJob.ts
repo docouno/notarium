@@ -11,6 +11,7 @@ import {
   asSettledPlan,
   IMPORT_PHASE,
   ImportPlanConflictError,
+  type ImportSourceKind,
   makeImportTempDir,
   type MarkdownTreePlanV1,
   runImport,
@@ -31,6 +32,7 @@ export type ImportParams = {
   /** The dropped file's own mtime (ISO), validated at the route — the creation
    *  date a `markdown` note falls back to. canon: docs/import.md#dates-as-data */
   sourceModifiedAt?: string
+  sourceKind?: ImportSourceKind
 }
 
 export type ImportHandlerDeps = {
@@ -74,6 +76,7 @@ export const createImportHandler =
         skipExisting: params.skipExisting,
         memoryMode: params.memoryMode,
         sourceModifiedAt: params.sourceModifiedAt,
+        sourceKind: params.sourceKind,
         uploadRef,
         // The plan is published beside its upload and adopted on every later
         // claim of this job, so a reap-reclaim writes the notes the first run

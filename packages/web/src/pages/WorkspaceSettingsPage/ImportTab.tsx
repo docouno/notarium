@@ -1,12 +1,22 @@
 import { useRef, useState } from 'react'
+import { useLocation, useNavigate } from 'react-router'
 import type { ImportSummary } from '@notarium/contract'
+import { IMPORT_FORMAT, isImportTextPath } from '@notarium/core'
 
 import { useSpace } from '../../composers/SpaceProvider'
 import { Button } from '../../core/Button'
+import { ContextMenu, type MenuItem } from '../../core/ContextMenu'
+import { IconArchive, IconFolder } from '../../core/Icons'
 import { Notice } from '../../core/Notice'
 import { Segmented } from '../../core/Segmented'
 import { SettingsSection } from '../../core/SettingsSection'
 import { Switch } from '../../core/Switch'
+import { workspaceSettingsRoute } from '../../libs/routing/routePaths'
+import {
+  IMPORT_TREE_ENTRY_LIMIT,
+  type ImportTreeEntry,
+  type ImportUploadSource,
+} from '../../services/api'
 import { useImportJob } from './useImportJob'
 import styles from './ImportTab.module.scss'
 
@@ -49,35 +59,117 @@ const lostSomething = (summary: ImportSummary): boolean =>
 // the tab reads with the same title+description rhythm as the rest of Settings.
 export const ImportTab = () => {
   const { space, canWrite } = useSpace()
+  const location = useLocation()
+  const navigate = useNavigate()
   const inputRef = useRef<HTMLInputElement>(null)
-  const [file, setFile] = useState<File | null>(null)
+  const folderInputRef = useRef<HTMLInputElement>(null)
+  const chooseRef = useRef<HTMLButtonElement>(null)
+  const [sourceMenuOpen, setSourceMenuOpen] = useState(false)
+  const [source, setSource] = useState<ImportUploadSource | null>(null)
+  const [sourceLabel, setSourceLabel] = useState('No file or folder selected')
+  const [selectionError, setSelectionError] = useState<string | null>(null)
   const [skipExisting, setSkipExisting] = useState(false)
   const [memory, setMemory] = useState<MemoryMode>('skip')
-  const { job, error, busy, summary, start, cancel, reset } = useImportJob(space)
+  const targetJobId = new URLSearchParams(location.search).get('job') || null
+  const { job, error, busy, summary, start, cancel, reset } = useImportJob(space, targetJobId)
 
-  const onImport = () => {
-    if (!file || busy) {
-      return
+  const clearTargetJob = () => {
+    if (targetJobId) {
+      navigate(workspaceSettingsRoute(space, 'import'), { replace: true })
     }
-    void start(file, { skipExisting, memory })
   }
 
-  // Choose a fresh file → clear a prior run's summary/error (never mid-import, the
-  // picker is disabled while busy).
-  const onChoose = (f: File | null) => {
-    reset()
-    setFile(f)
-    // Clear the native input's value so re-picking the SAME file later still fires
-    // onChange (the browser suppresses change when the value is unchanged) — otherwise
-    // "Import another" → pick the identical export leaves Import stuck disabled.
+  const onImport = () => {
+    if (!source || busy) {
+      return
+    }
+    const singleText = source.kind === 'file' && isImportTextPath(source.file.name)
+
+    void start(source, {
+      format: source.kind === 'tree' || singleText ? IMPORT_FORMAT.markdown : undefined,
+      skipExisting,
+      memory,
+      sendLastModified: singleText || undefined,
+    })
+  }
+
+  const clearInputValues = () => {
     if (inputRef.current) {
       inputRef.current.value = ''
     }
+    if (folderInputRef.current) {
+      folderInputRef.current.value = ''
+    }
+  }
+
+  const onChooseFile = (file: File | null) => {
+    clearTargetJob()
+    reset()
+    setSelectionError(null)
+    setSource(file ? { kind: 'file', file } : null)
+    setSourceLabel(file?.name ?? 'No file or folder selected')
+    clearInputValues()
+  }
+
+  // Copy the FileList and every relative path inside the native change event. A
+  // directory selection without one common root is not a reconstructable tree.
+  const onChooseFolder = (fileList: FileList | null) => {
+    const fileCount = fileList?.length ?? 0
+    const files = fileCount <= IMPORT_TREE_ENTRY_LIMIT ? Array.from(fileList ?? []) : []
+
+    clearTargetJob()
+    reset()
+    setSource(null)
+    setSelectionError(null)
+    setSourceLabel('No file or folder selected')
+    clearInputValues()
+    if (fileCount > IMPORT_TREE_ENTRY_LIMIT) {
+      setSelectionError(
+        `The selected folder contains more than ${IMPORT_TREE_ENTRY_LIMIT} entries.`,
+      )
+      return
+    }
+
+    if (files.length === 0) {
+      return
+    }
+    const entries: ImportTreeEntry[] = []
+    const roots = new Set<string>()
+
+    for (const file of files) {
+      const relativePath = file.webkitRelativePath || ''
+      const [root, ...tail] = relativePath.split('/')
+
+      if (!relativePath || !root || tail.length === 0 || tail.some((part) => !part)) {
+        setSelectionError(
+          'This browser did not provide complete folder paths. Choose a ZIP archive instead.',
+        )
+        return
+      }
+      roots.add(root)
+      entries.push({ file, relativePath })
+    }
+    if (roots.size !== 1) {
+      setSelectionError('Choose one folder at a time, so nothing was imported.')
+      return
+    }
+    if (!entries.some((entry) => isImportTextPath(entry.relativePath))) {
+      setSelectionError('The selected folder contains no Markdown or text files.')
+      return
+    }
+    const [root] = roots
+
+    setSource({ kind: 'tree', entries })
+    setSourceLabel(`${root}/ (${entries.length} item${entries.length === 1 ? '' : 's'})`)
   }
 
   const importAnother = () => {
+    clearTargetJob()
     reset()
-    setFile(null)
+    setSource(null)
+    setSourceLabel('No file or folder selected')
+    setSelectionError(null)
+    clearInputValues()
   }
 
   // Import writes to the space — a reader (#111) can't, and the tab is hidden for
@@ -112,6 +204,20 @@ export const ImportTab = () => {
       : job.progress.phase === 'planning'
         ? 'Reading the archive…'
         : 'Importing…'
+  const sourceMenuItems: MenuItem[] = [
+    {
+      label: 'File or archive',
+      icon: <IconArchive size={14} />,
+      onClick: () => inputRef.current?.click(),
+    },
+    {
+      label: 'Folder',
+      icon: <IconFolder size={14} />,
+      onClick: () => folderInputRef.current?.click(),
+    },
+  ]
+  const sourceMenuRect =
+    sourceMenuOpen && chooseRef.current ? chooseRef.current.getBoundingClientRect() : null
 
   return (
     <>
@@ -124,23 +230,54 @@ export const ImportTab = () => {
           <input
             ref={inputRef}
             type="file"
-            accept=".zip,.json,.jsonl,application/zip,application/json"
+            accept=".zip,.json,.jsonl,.md,.markdown,.mdown,.mkd,.txt,.text"
             className={styles.fileInput}
             data-testid="import-file"
-            onChange={(e) => onChoose(e.target.files?.[0] ?? null)}
+            onChange={(e) => onChooseFile(e.target.files?.[0] ?? null)}
+          />
+          <input
+            ref={folderInputRef}
+            type="file"
+            {...{ webkitdirectory: '', directory: '' }}
+            className={styles.fileInput}
+            data-testid="import-folder"
+            onChange={(e) => onChooseFolder(e.target.files)}
           />
           <Button
+            ref={chooseRef}
             className={styles.choose}
-            onClick={() => inputRef.current?.click()}
+            onClick={() => setSourceMenuOpen((open) => !open)}
             disabled={busy}
             data-testid="import-choose"
+            aria-haspopup="menu"
+            aria-expanded={sourceMenuOpen}
+            active={sourceMenuOpen}
           >
-            Choose file…
+            Choose…
           </Button>
-          <span className={styles.filename} title={file?.name}>
-            {file ? file.name : 'No file selected'}
+          {sourceMenuRect && (
+            <ContextMenu
+              x={sourceMenuRect.left}
+              y={sourceMenuRect.bottom + 4}
+              minWidth={sourceMenuRect.width}
+              ignoreRef={chooseRef}
+              items={sourceMenuItems}
+              onClose={() => setSourceMenuOpen(false)}
+            />
+          )}
+          <span className={styles.filename} title={sourceLabel}>
+            {sourceLabel}
           </span>
         </div>
+        {selectionError && (
+          <Notice
+            variant="info"
+            className={styles.selectionError}
+            data-testid="import-selection-error"
+          >
+            {selectionError}
+          </Notice>
+        )}
       </SettingsSection>
 
       <SettingsSection
@@ -274,7 +411,7 @@ export const ImportTab = () => {
             <Button
               variant="primary"
               onClick={onImport}
-              disabled={!file || busy}
+              disabled={!source || busy}
               data-testid="import-run"
             >
               {busy ? phaseLabel : 'Import'}

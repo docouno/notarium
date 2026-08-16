@@ -41,7 +41,8 @@ export const jobsApi = {
     opts: { frontmatter?: 'keep' | 'strip'; scope?: 'user' | 'all'; folder?: string } = {},
   ) => req<Job>(`${sp(space)}/export`, { method: 'POST', body: JSON.stringify(opts) }),
   /** Poll one job's status (the SSE `job` event carries the same shape for live). */
-  jobGet: (space: string, id: string) => req<Job>(`${sp(space)}/jobs/${id}`),
+  jobGet: (space: string, id: string, signal?: AbortSignal) =>
+    req<Job>(`${sp(space)}/jobs/${id}`, { signal }),
   /** Recent jobs of the space (this principal's, newest first). `kind` scopes to one
    *  consumer's jobs (export #105 / import #191); omitted ⇒ export (server default). */
   jobsList: (space: string, kind?: 'export' | 'import') =>

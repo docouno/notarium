@@ -19,6 +19,7 @@ import {
 } from '../../../../services/import'
 import { JOB_KIND_EXPORT, JOB_KIND_IMPORT, jobToWire } from '../../consumers'
 import { type ApiRouteCtx, authz, notFound, parseRangeHeader, s } from '../_shared'
+import { ImportBundleError, receiveImportUpload } from './importBundle'
 
 const IMPORT_FORMATS = new Set<string>([
   IMPORT_FORMAT.claudeConversations,
@@ -48,6 +49,28 @@ const sourceModifiedIso = (raw: string | undefined): string | undefined => {
   }
 
   return new Date(ms).toISOString()
+}
+
+const parseImportFields = (fields: Readonly<Record<string, string>>) => {
+  const rootRaw = fields.root
+  // `root` may name an existing legacy POSIX-only folder. The engine applies
+  // the stricter portable-component rule if the import would create it.
+  const root = rootRaw ? safeRelAddress(rootRaw) : ''
+
+  if (root === null) {
+    throw new ImportBundleError('bad import root')
+  }
+  const memoryRaw = fields.memory
+  const memoryMode: 'folder' | 'space' | 'skip' =
+    memoryRaw === 'space' || memoryRaw === 'skip' ? memoryRaw : 'folder'
+
+  return {
+    format: asImportFormat(fields.format),
+    root,
+    skipExisting: fields.skipExisting === 'true',
+    memoryMode,
+    sourceModifiedAt: sourceModifiedIso(fields.lastModified),
+  }
 }
 
 export const jobsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
@@ -179,45 +202,28 @@ export const jobsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
           .code(HTTP_STATUS.BAD_REQUEST)
           .send({ error: 'expected a multipart file upload' })
       }
-      const store = await spaceStoreFor(req)
-      const file = await req.file()
-
-      if (!file) {
-        return reply.code(HTTP_STATUS.BAD_REQUEST).send({ error: 'no file in the upload' })
-      }
-      const fields = file.fields as Record<string, { value?: unknown } | undefined>
-      const fieldStr = (k: string) =>
-        typeof fields[k]?.value === 'string' ? (fields[k]!.value as string) : undefined
-      const format = asImportFormat(fields.format?.value)
-      const rootRaw = fieldStr('root')
-      // `root` may name an existing legacy POSIX-only folder. The engine applies
-      // the stricter portable-component rule if the import would create it.
-      const root = rootRaw ? safeRelAddress(rootRaw) : ''
-
-      if (root === null) {
-        return reply.code(HTTP_STATUS.BAD_REQUEST).send({ error: 'bad import root' })
-      }
-      const skipExisting = fieldStr('skipExisting') === 'true'
-      const memoryRaw = fieldStr('memory')
-      const memoryMode = memoryRaw === 'space' || memoryRaw === 'skip' ? memoryRaw : 'folder'
-      const sourceModifiedAt = sourceModifiedIso(fieldStr('lastModified'))
-
       if (jobs && staging) {
         const jobId = freshNoteId()
-        let uploadRef: string
+        let upload: Awaited<ReturnType<typeof receiveImportUpload>>
 
         try {
-          uploadRef = await staging.stage(req.spaceId, jobId, file.file)
+          upload = await receiveImportUpload(
+            req,
+            {
+              write: (source) => staging.stage(req.spaceId, jobId, source),
+              remove: (ref) => staging.remove(ref),
+            },
+            { validateFields: parseImportFields },
+          )
         } catch (err) {
-          if ((err as { code?: string }).code === 'FST_REQ_FILE_TOO_LARGE') {
-            return reply.code(HTTP_STATUS.PAYLOAD_TOO_LARGE).send({ error: 'upload too large' })
+          if (err instanceof ImportBundleError) {
+            return reply.code(err.statusCode).send({ error: err.message })
           }
           throw err
         }
-        if (file.file.truncated) {
-          await staging.remove(uploadRef).catch(() => {})
-          return reply.code(HTTP_STATUS.PAYLOAD_TOO_LARGE).send({ error: 'upload too large' })
-        }
+        const { format, root, skipExisting, memoryMode, sourceModifiedAt } = parseImportFields(
+          upload.fields,
+        )
         // Stage-then-enqueue: the row becomes claimable only AFTER the upload is fully
         // on disk, so the runner never claims a job whose source is half-written (the
         // staging sweep's age grace covers the reverse µs-window before enqueue lands).
@@ -228,20 +234,21 @@ export const jobsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
             kind: JOB_KIND_IMPORT,
             principal: principalId(req),
             params: {
-              uploadRef,
-              filename: file.filename,
+              uploadRef: upload.uploadRef,
+              filename: upload.filename,
               format,
               root,
               skipExisting,
               memoryMode,
               sourceModifiedAt,
+              sourceKind: upload.sourceKind,
             },
             // ZIP note count is unknown upfront (a stream) → indeterminate bar; handler reports live count.
             progressTotal: null,
             createdAt: new Date().toISOString(),
           })
           .catch(async (err) => {
-            await staging.remove(uploadRef).catch(() => {})
+            await staging.remove(upload.uploadRef).catch(() => {})
             throw err
           })
         wakeJobs?.()
@@ -253,21 +260,28 @@ export const jobsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
       // Fastify's saveRequestFiles onResponse cleanup races a hijacked response.
       const tempDir = await makeImportTempDir()
       const cleanup = () => rm(tempDir, { recursive: true, force: true }).catch(() => {})
-      let uploadPath: string
+      let upload: Awaited<ReturnType<typeof receiveImportUpload>>
 
       try {
-        uploadPath = await saveUploadToTemp(file.file, tempDir)
+        upload = await receiveImportUpload(
+          req,
+          {
+            write: (source) => saveUploadToTemp(source, tempDir),
+            remove: (path) => rm(path, { force: true }),
+          },
+          { validateFields: parseImportFields },
+        )
       } catch (err) {
         await cleanup()
-        if ((err as { code?: string }).code === 'FST_REQ_FILE_TOO_LARGE') {
-          return reply.code(HTTP_STATUS.PAYLOAD_TOO_LARGE).send({ error: 'upload too large' })
+        if (err instanceof ImportBundleError) {
+          return reply.code(err.statusCode).send({ error: err.message })
         }
         throw err
       }
-      if (file.file.truncated) {
-        await cleanup()
-        return reply.code(HTTP_STATUS.PAYLOAD_TOO_LARGE).send({ error: 'upload too large' })
-      }
+      const { format, root, skipExisting, memoryMode, sourceModifiedAt } = parseImportFields(
+        upload.fields,
+      )
+      const store = await spaceStoreFor(req)
 
       reply.hijack()
       reply.raw.writeHead(200, {
@@ -280,15 +294,16 @@ export const jobsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
       try {
         const summary = await runImport({
           store,
-          uploadPath,
+          uploadPath: upload.uploadRef,
           tempDir,
-          filename: file.filename,
+          filename: upload.filename,
           principal: principalId(req),
           format,
           root,
           skipExisting,
           memoryMode,
           sourceModifiedAt,
+          sourceKind: upload.sourceKind,
           // The legacy `imported` field stays exactly where it was; phase/done/total
           // ride alongside it so an old reader keeps working and a new one can draw
           // a determinate bar for a Markdown tree.

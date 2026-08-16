@@ -1,168 +1,325 @@
-import { useCallback } from 'react'
+import { useCallback, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router'
 
-import type { ImportSummary } from '@notarium/contract'
+import type { ImportSummary, Job } from '@notarium/contract'
 import { IMPORT_FORMAT } from '@notarium/core'
 
-import { useToast } from '../../core/Toast'
-import { noteRoute } from '../../libs/routing/routePaths'
-import { api, ApiError, pollJobToTerminal } from '../../services/api'
+import { type ToastApi, useToast } from '../../core/Toast'
+import { noteRoute, workspaceSettingsRoute } from '../../libs/routing/routePaths'
+import {
+  api,
+  ApiError,
+  type ImportUploadSource,
+  normalizeImportSummary,
+  pollJobToTerminal,
+} from '../../services/api'
 import { useSpace } from '../SpaceProvider'
+import {
+  type CapturedDrop,
+  DROP_ENTRIES_ERROR,
+  DropEntriesError,
+  expandDrop,
+  prepareDrop,
+} from './dropEntries'
 
-// The shared file-import ACTION (#223), riding the SAME import machinery as the
-// Settings tab (#191): `api.importStart` stages the upload + enqueues a durable job
-// (prod) or answers with the synchronous NDJSON stream (none-mode) — this drives
-// both to the same ImportSummary. Both drop surfaces call it, so the import path
-// exists once: the tree section (a folder row) and the window content zone.
-//
-// Each dropped file is its OWN import (#191 stages one upload per job), so a
-// multi-file drop is N imports whose summaries we fold together for the toast. A
-// single-file drop opens the imported note (its id comes back in `created`).
-
-/** Accepted text extensions for a dropped-file import (v1). */
-export const TEXT_EXT = /\.(md|markdown|mdown|mkd|txt|text)$/i
-const ACCEPT_LABEL = '.md and .txt'
 const folderLabel = (folder: string): string => folder || 'the workspace root'
 const EMPTY_SUMMARY: ImportSummary = { imported: 0, skipped: 0, failed: 0, files: [], errors: [] }
 
-// One drop-import at a time, GLOBALLY. `useFileImport()` is instantiated in two
-// components (the Sidebar tree zone + the window content zone), so a per-hook ref
-// wouldn't serialise a tree drop against a reader drop — a module-level flag does.
-let importInFlight = false
+type DropImportPhase = 'preparing' | 'uploading' | 'sync' | 'job'
+type DropImportLease = symbol
+type ActiveDropImport = {
+  lease: DropImportLease
+  phase: DropImportPhase
+  space: string
+  jobId?: string
+}
 
-export type ImportFiles = (
-  fileList: FileList | File[] | null | undefined,
+// Both drop surfaces live for the whole tab and instantiate their own hook. The
+// current-tab operation therefore has to live at module scope to remain one operation.
+let activeDropImport: ActiveDropImport | null = null
+
+const claimDropImport = (phase: DropImportPhase, space: string): DropImportLease | null => {
+  if (activeDropImport) {
+    return null
+  }
+  const lease = Symbol('drop-import')
+
+  activeDropImport = { lease, phase, space }
+  return lease
+}
+
+const updateDropImport = (lease: DropImportLease, phase: DropImportPhase, jobId?: string): void => {
+  if (activeDropImport?.lease === lease) {
+    activeDropImport = { ...activeDropImport, phase, jobId }
+  }
+}
+
+const releaseDropImport = (lease: DropImportLease): void => {
+  if (activeDropImport?.lease === lease) {
+    activeDropImport = null
+  }
+}
+
+const progressAction = (
+  space: string,
+  jobId: string,
+  navigate: ReturnType<typeof useNavigate>,
+) => ({
+  label: 'View progress',
+  onClick: () => navigate(workspaceSettingsRoute(space, 'import', { job: jobId })),
+})
+
+const showAlreadyRunning = (toast: ToastApi, navigate: ReturnType<typeof useNavigate>): void => {
+  const jobId = activeDropImport?.phase === 'job' ? activeDropImport.jobId : undefined
+  const space = activeDropImport?.space
+
+  toast.info('An import is already running.', {
+    ...(jobId && space ? { action: progressAction(space, jobId, navigate) } : {}),
+  })
+}
+
+const lastSummaryError = (summary: ImportSummary): string | null =>
+  summary.errors.at(-1)?.error ?? null
+
+const summaryText = (summary: ImportSummary, folder?: string): string => {
+  const ignored = summary.ignored?.count ?? 0
+  const parts = [
+    `Imported ${summary.imported} note${summary.imported === 1 ? '' : 's'}${folder === undefined ? '' : ` into ${folderLabel(folder)}`}`,
+  ]
+
+  if (summary.skipped) {
+    parts.push(`${summary.skipped} skipped (already exists; content not compared)`)
+  }
+  if (summary.failed) {
+    parts.push(`${summary.failed} failed`)
+  }
+  if (ignored) {
+    parts.push(`${ignored} unsupported`)
+  }
+  if (summary.repointFailed) {
+    parts.push(`${summary.repointFailed} with links left pointing at the source`)
+  }
+
+  return `${parts.join(', ')}.`
+}
+
+const showSummary = (toast: ToastApi, summary: ImportSummary, folder: string): void => {
+  const ignored = summary.ignored?.count ?? 0
+  const message = summaryText(summary, folder)
+
+  if (summary.imported === 0 && summary.failed > 0) {
+    const reason = lastSummaryError(summary)
+
+    toast.error(reason ? `${message} ${reason}` : message)
+    return
+  }
+  const warning =
+    summary.failed > 0 ||
+    summary.skipped > 0 ||
+    ignored > 0 ||
+    (summary.repointFailed ?? 0) > 0 ||
+    summary.files.some((file) => file.warnings.length > 0)
+
+  toast[warning ? 'warning' : 'success'](message)
+}
+
+const showFailed = (toast: ToastApi, error: string, partial: ImportSummary | null): void => {
+  if (
+    partial &&
+    (partial.imported > 0 ||
+      partial.skipped > 0 ||
+      partial.failed > 0 ||
+      (partial.ignored?.count ?? 0) > 0 ||
+      (partial.repointFailed ?? 0) > 0)
+  ) {
+    toast.warning(`${summaryText(partial)} Import failed: ${error}`)
+    return
+  }
+  toast.error(error)
+}
+
+const terminal = (job: Job): boolean =>
+  job.status === 'succeeded' || job.status === 'failed' || job.status === 'canceled'
+
+type RunImport = (
+  source: ImportUploadSource,
   folder: string,
+  lease: DropImportLease,
+  openSingleText: boolean,
+  controller: AbortController,
 ) => Promise<void>
 
-export const useFileImport = (): ImportFiles => {
-  const { space, canWrite } = useSpace()
+const useImportRunner = (): RunImport => {
+  const { space } = useSpace()
   const toast = useToast()
   const navigate = useNavigate()
-  return useCallback<ImportFiles>(
-    async (fileList, folder) => {
-      const all = Array.from(fileList ?? [])
 
-      if (!all.length) {
-        return
+  return useCallback<RunImport>(
+    async (source, folder, lease, openSingleText, controller) => {
+      updateDropImport(lease, 'uploading')
+      let pending: string | null = toast.info(
+        `Importing ${source.kind === 'tree' ? source.entries.length : 1} item${source.kind === 'tree' && source.entries.length !== 1 ? 's' : ''}…`,
+        { duration: 0 },
+      )
+
+      try {
+        const started = await api.importStart(
+          space,
+          source,
+          {
+            format: source.kind === 'tree' || openSingleText ? IMPORT_FORMAT.markdown : undefined,
+            root: folder,
+            skipExisting: true,
+            sendLastModified: source.kind === 'file' && openSingleText,
+          },
+          controller.signal,
+        )
+
+        if (controller.signal.aborted) {
+          return
+        }
+
+        let summary: ImportSummary
+
+        if (started.mode === 'job') {
+          updateDropImport(lease, 'job', started.job.id)
+          toast.dismiss(pending)
+          pending = null
+          toast.info('Import started.', {
+            action: progressAction(space, started.job.id, navigate),
+          })
+          const job = terminal(started.job)
+            ? started.job
+            : await pollJobToTerminal(space, started.job.id, {
+                signal: controller.signal,
+                ...(openSingleText ? { intervalMs: 400 } : {}),
+              })
+
+          if (controller.signal.aborted) {
+            return
+          }
+
+          if (job.status === 'canceled') {
+            toast.info('Import canceled.')
+            return
+          }
+          if (job.status === 'failed') {
+            showFailed(toast, job.error ?? 'Import failed', normalizeImportSummary(job.result))
+            return
+          }
+          summary = normalizeImportSummary(job.result) ?? EMPTY_SUMMARY
+        } else {
+          updateDropImport(lease, 'sync')
+          summary = await started.run(() => {})
+          if (controller.signal.aborted) {
+            return
+          }
+          toast.dismiss(pending)
+          pending = null
+        }
+
+        if (openSingleText && summary.created?.[0]) {
+          navigate(noteRoute(summary.created[0])!)
+        }
+        showSummary(toast, summary, folder)
+      } catch (error) {
+        if (controller.signal.aborted) {
+          return
+        }
+        const message = error instanceof Error ? error.message : 'Import failed'
+        const partial = error instanceof ApiError ? normalizeImportSummary(error.partial) : null
+
+        showFailed(toast, message, partial)
+      } finally {
+        if (pending) {
+          toast.dismiss(pending)
+        }
+        releaseDropImport(lease)
       }
+    },
+    [space, toast, navigate],
+  )
+}
+
+export type ImportDrop = (capture: CapturedDrop, folder: string) => Promise<void>
+
+/** Expand a synchronous DataTransfer snapshot, then hand its one source to the importer. */
+export const useDropImport = (): ImportDrop => {
+  const { canWrite, space } = useSpace()
+  const toast = useToast()
+  const navigate = useNavigate()
+  const run = useImportRunner()
+  const owned = useRef<{ lease: DropImportLease; controller: AbortController } | null>(null)
+
+  useEffect(
+    () => () => {
+      const operation = owned.current
+
+      if (operation) {
+        operation.controller.abort()
+        releaseDropImport(operation.lease)
+        owned.current = null
+      }
+    },
+    [space],
+  )
+
+  return useCallback<ImportDrop>(
+    async (capture, folder) => {
       if (!canWrite) {
         toast.error('You have read-only access to this space, so importing isn’t available.')
         return
       }
-      const files = all.filter((f) => TEXT_EXT.test(f.name))
-      const rejected = all.length - files.length
+      const lease = claimDropImport('preparing', space)
 
-      if (!files.length) {
-        toast.info(`Only ${ACCEPT_LABEL} files can be dropped in — for now.`)
+      if (!lease) {
+        showAlreadyRunning(toast, navigate)
         return
       }
-      if (importInFlight) {
-        return
-      } // one drop-import at a time (global) — a second mid-flight is ignored
-      importInFlight = true
+      const controller = new AbortController()
+
+      owned.current = { lease, controller }
       try {
-        const pending = toast.info(
-          `Importing ${files.length} file${files.length === 1 ? '' : 's'}…`,
-          { duration: 0 },
+        const prepared = prepareDrop(await expandDrop(capture))
+
+        if (controller.signal.aborted) {
+          return
+        }
+        await run(prepared.source, folder, lease, prepared.openSingleText, controller)
+      } catch (error) {
+        if (controller.signal.aborted) {
+          return
+        }
+        if (
+          error instanceof DropEntriesError &&
+          error.code === DROP_ENTRIES_ERROR.capabilityUnavailable
+        ) {
+          toast.info(error.message, {
+            action: {
+              label: 'Open Import settings',
+              onClick: () => navigate(workspaceSettingsRoute(space, 'import')),
+            },
+          })
+          return
+        }
+        if (
+          error instanceof DropEntriesError &&
+          (error.code === DROP_ENTRIES_ERROR.unsupportedOnly ||
+            error.code === DROP_ENTRIES_ERROR.mixedArchive)
+        ) {
+          toast.info(error.message)
+          return
+        }
+        toast.error(
+          error instanceof Error ? error.message : 'The dropped folder could not be read.',
         )
-        let imported = 0
-        let skipped = 0
-        let failed = 0
-        let firstCreated: string | null = null
-        let lastError: string | null = null
-
-        // Sequential — a burst of drops shouldn't flood the job runner. skipExisting
-        // is on so a casual drag never clobbers an existing note.
-        for (const file of files) {
-          try {
-            const started = await api.importStart(space, file, {
-              format: IMPORT_FORMAT.markdown,
-              root: folder,
-              skipExisting: true,
-              // The file's own mtime dates the note when its frontmatter names no
-              // date (#280) — drag in an archive and it keeps its chronology
-              // instead of landing on the Feed as one heap of "today".
-              sendLastModified: true,
-            })
-            let summary: ImportSummary
-
-            if (started.mode === 'job') {
-              // Durable path: the note streams into the tree via SSE as the job writes;
-              // we poll (tight interval — one small text file) for the terminal outcome
-              // so the toast + open-after-import see the real summary.
-              const job = await pollJobToTerminal(space, started.job.id, { intervalMs: 400 })
-
-              if (job.status !== 'succeeded') {
-                failed++
-                lastError = job.error ?? 'import failed'
-                continue
-              }
-              summary = (job.result as ImportSummary | null) ?? EMPTY_SUMMARY
-            } else {
-              summary = await started.run(() => {}) // none-mode synchronous stream
-            }
-            imported += summary.imported
-            skipped += summary.skipped
-            failed += summary.failed
-            const summaryError = summary.errors.at(-1)?.error
-
-            if (summaryError) {
-              // A per-note write failure is still a successfully completed import
-              // JOB: its exact cause rides the summary rather than `job.error`.
-              // Keep the last one so an all-failed drop does not collapse a useful
-              // durable/sync rejection into the generic "Import failed" toast.
-              lastError = summaryError
-            }
-            if (!firstCreated && summary.created?.[0]) {
-              firstCreated = summary.created[0]
-            }
-          } catch (err) {
-            failed++
-            lastError = err instanceof ApiError ? err.message : 'import failed'
-          }
-        }
-        toast.dismiss(pending)
-        // Open the note right after a SINGLE-file drop — "dropped a file, here it is".
-        // A multi-file drop lands them in the tree instead (no jarring jump to one of N).
-        const openTo = files.length === 1 && firstCreated ? noteRoute(firstCreated) : null
-
-        if (openTo) {
-          navigate(openTo)
-        }
-        if (imported === 0 && failed > 0) {
-          toast.error(lastError ?? 'Import failed')
-          return
-        }
-        // Nothing imported because a same-named note already exists — NOT a clean
-        // success: skipExisting compares the PATH, not the body, so the file you
-        // dropped may differ from what's there. Warn (yellow) instead of confirming.
-        if (imported === 0 && skipped > 0) {
-          toast.warning(
-            `Nothing imported — ${skipped} note${skipped === 1 ? '' : 's'} with that name already exist${skipped === 1 ? 's' : ''} here (content not compared).`,
-          )
-          return
-        }
-        const parts = [
-          `Imported ${imported} note${imported === 1 ? '' : 's'} into ${folderLabel(folder)}`,
-        ]
-
-        if (skipped) {
-          parts.push(`${skipped} skipped (already exists)`)
-        }
-        if (failed) {
-          parts.push(`${failed} failed`)
-        }
-        if (rejected) {
-          parts.push(`${rejected} unsupported`)
-        }
-        // A skip / reject / failure means it wasn't a clean import → warn (yellow),
-        // so a same-named-but-different file is never silently confirmed as "done".
-        toast[failed || skipped || rejected ? 'warning' : 'success'](parts.join(', ') + '.')
       } finally {
-        importInFlight = false
+        releaseDropImport(lease)
+        if (owned.current?.lease === lease) {
+          owned.current = null
+        }
       }
     },
-    [space, canWrite, toast, navigate],
+    [canWrite, toast, space, navigate, run],
   )
 }

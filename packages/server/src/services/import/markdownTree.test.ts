@@ -286,6 +286,20 @@ describe('classification', () => {
     expect(plan.ignored.files).toEqual(['conversations.json'])
   })
 
+  it('uses the shared text-extension policy only for forced Markdown trees', async () => {
+    const members = ['md', 'markdown', 'mdown', 'mkd', 'txt', 'text'].map((extension) => ({
+      name: `notes/a-${extension}.${extension}`,
+      body: NOTE,
+    }))
+    const forced = await planOf(members, { format: IMPORT_FORMAT.markdown })
+    const automatic = await planOf(members)
+
+    expect(forced.entriesTotal).toBe(6)
+    expect(forced.ignored.count).toBe(0)
+    expect(automatic.entriesTotal).toBe(1)
+    expect(automatic.ignored.count).toBe(5)
+  })
+
   it('refuses an archive with neither a recognised export nor a Markdown member', async () => {
     await expect(classify(await zipOf([{ name: 'a.png', body: 'x' }]))).rejects.toThrow(
       /No recognised export files/,

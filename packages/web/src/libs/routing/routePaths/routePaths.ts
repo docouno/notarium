@@ -210,7 +210,17 @@ export const agentRolesRoute = (): string => agentsRoute('roles')
 export const workspaceSettingsRoute = (
   space: string,
   tab: string = DEFAULT_WORKSPACE_SETTINGS_TAB,
-): string => `${spaceRoute(space)}/${SEGMENTS.management}/${tab}`
+  query: { job?: string } = {},
+): string => {
+  const path = `${spaceRoute(space)}/${SEGMENTS.management}/${tab}`
+  const params = new URLSearchParams()
+
+  if (query.job) {
+    params.set('job', query.job)
+  }
+
+  return params.size > 0 ? `${path}?${params.toString()}` : path
+}
 
 /** A new-note draft as a real URL (#65): the create-intent rides the query on the
  *  current scope URL, so back/forward/reload restore the form instead of dropping

@@ -15,6 +15,8 @@ import yauzl from 'yauzl'
 
 import { ImportError } from '@notarium/core'
 
+import { FOLDER_MTIME_COMMENT_PREFIX, IMPORT_SOURCE_KIND, type ImportSourceKind } from './consts'
+
 /** Clock skew tolerated on an archive-supplied timestamp, matching the route's
  *  `lastModified` rule — one number for "not plausibly in the future". */
 const CLOCK_SKEW_MS = 5 * 60_000
@@ -42,7 +44,8 @@ export type ZipMember = {
    *  path here to keep in sync. */
   name: string
   isDirectory: boolean
-  /** Container noise (`__MACOSX/…`): neither importable nor a user file. */
+  /** Container noise (`__MACOSX/…`) in an ordinary archive. A browser-folder
+   *  source owns the same path as user data, so provenance disables this flag. */
   isContainerNoise: boolean
   declaredBytes: number
   compressedBytes: number
@@ -69,9 +72,39 @@ export type ZipMember = {
  *  The DOS triple carries no zone, so it is read as UTC: the alternative (the
  *  library's `new Date(y, m, d, …)`) makes an import's creation dates depend on
  *  the SERVER's timezone, which is neither reproducible nor more correct. */
-const memberModifiedAt = (entry: yauzl.Entry, nowMs: number): string | null =>
-  trustworthyInstant(extendedTimestampMs(entry), nowMs) ??
-  trustworthyInstant(dosTimestampMs(entry), nowMs)
+const memberModifiedAt = (
+  entry: yauzl.Entry,
+  nowMs: number,
+  sourceKind?: ImportSourceKind,
+): string | null => {
+  if (sourceKind === IMPORT_SOURCE_KIND.folderTree) {
+    const comment = entry.fileComment
+
+    if (!comment.startsWith(FOLDER_MTIME_COMMENT_PREFIX)) {
+      throw new ImportError(`${entry.fileName}: folder import timestamp metadata is missing`)
+    }
+    const value = comment.slice(FOLDER_MTIME_COMMENT_PREFIX.length)
+
+    if (value === 'unknown') {
+      return null
+    }
+    if (!/^[1-9]\d*$/.test(value)) {
+      throw new ImportError(`${entry.fileName}: folder import timestamp metadata is invalid`)
+    }
+    const instant = trustworthyInstant(Number(value), nowMs)
+
+    if (!instant) {
+      throw new ImportError(`${entry.fileName}: folder import timestamp metadata is invalid`)
+    }
+
+    return instant
+  }
+
+  return (
+    trustworthyInstant(extendedTimestampMs(entry), nowMs) ??
+    trustworthyInstant(dosTimestampMs(entry), nowMs)
+  )
+}
 
 /** An epoch this import is willing to call a real modification time, as ISO. */
 const trustworthyInstant = (ms: number | null, nowMs: number): string | null =>
@@ -173,6 +206,7 @@ export const forEachZipMember = async (
   zipfile: yauzl.ZipFile,
   visit: (member: ZipMember, entry: yauzl.Entry) => Promise<MemberVisit>,
   signal?: AbortSignal,
+  sourceKind?: ImportSourceKind,
 ): Promise<void> => {
   const nowMs = Date.now()
 
@@ -203,14 +237,24 @@ export const forEachZipMember = async (
     zipfile.on('end', () => finish())
     zipfile.on('close', () => finish())
     zipfile.on('entry', (entry: yauzl.Entry) => {
-      const name = entry.fileName
-      const member: ZipMember = {
-        name,
-        isDirectory: name.endsWith('/'),
-        isContainerNoise: name.startsWith('__MACOSX/') || name.includes('/__MACOSX/'),
-        declaredBytes: entry.uncompressedSize,
-        compressedBytes: entry.compressedSize,
-        modifiedAt: memberModifiedAt(entry, nowMs),
+      let member: ZipMember
+
+      try {
+        const name = entry.fileName
+
+        member = {
+          name,
+          isDirectory: name.endsWith('/'),
+          isContainerNoise:
+            sourceKind !== IMPORT_SOURCE_KIND.folderTree &&
+            (name.startsWith('__MACOSX/') || name.includes('/__MACOSX/')),
+          declaredBytes: entry.uncompressedSize,
+          compressedBytes: entry.compressedSize,
+          modifiedAt: memberModifiedAt(entry, nowMs, sourceKind),
+        }
+      } catch (error) {
+        finish(error)
+        return
       }
 
       visit(member, entry)

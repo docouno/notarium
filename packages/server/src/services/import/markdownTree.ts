@@ -22,6 +22,7 @@ import {
   ImportError,
   type ImportFormat,
   type ImportNote,
+  isImportTextPath,
   isMemoryObject,
   isMemoryRecord,
   markdownFileToNote,
@@ -37,6 +38,7 @@ import {
   ARCHIVE_KIND,
   IMPORT_DETAIL_CAP,
   IMPORT_PROGRESS_EVERY,
+  type ImportSourceKind,
   MAX_ARCHIVE_ENTRIES,
   MAX_COMPRESSION_RATIO,
   MAX_MARKDOWN_TREE_EXPANDED_BYTES,
@@ -67,9 +69,8 @@ import {
  *  planned entry's overhead — an ignored member never becomes a plan entry. */
 const ARCHIVE_ENTRY_METADATA_OVERHEAD_BYTES = 64
 
-/** Members a Markdown tree considers importable. Case-insensitive: a vault
- *  written on a case-insensitive filesystem ships `NOTE.MD`. */
-const MARKDOWN_MEMBER = /\.md$/i
+const isTreeTextMember = (path: string, forcedMarkdown: boolean): boolean =>
+  forcedMarkdown ? isImportTextPath(path) : /\.md$/i.test(path)
 
 /** JSON shapes the auto classifier probes for a recognised foreign export. */
 const JSON_MEMBER = /\.(json|jsonl)$/i
@@ -181,6 +182,8 @@ export type ClassifyArchiveArgs = {
   uploadRef: string
   /** Explicit format, when the caller forced one. */
   format?: ImportFormat
+  /** Only the server-built browser bridge may reinterpret its private comments. */
+  sourceKind?: ImportSourceKind
   /** Destination root the archive tree is reproduced under. */
   root: string
   signal?: AbortSignal
@@ -456,6 +459,7 @@ export const classifyImportArchive = async ({
   tempDir,
   uploadRef,
   format,
+  sourceKind,
   root,
   signal,
   onScanProgress,
@@ -574,7 +578,7 @@ export const classifyImportArchive = async ({
     if (member.isDirectory || member.isContainerNoise) {
       return 'continue'
     }
-    if (MARKDOWN_MEMBER.test(member.name)) {
+    if (isTreeTextMember(member.name, forcedMarkdown)) {
       try {
         const { directory, base } = memberAddress(member)
 
@@ -744,6 +748,7 @@ export const classifyImportArchive = async ({
       }
     },
     signal,
+    sourceKind,
   )
 
   if (foreign) {
@@ -769,6 +774,8 @@ export const classifyImportArchive = async ({
       onBytes: budget.bytes,
       onScanProgress,
       signal,
+      forcedMarkdown,
+      sourceKind,
     })
 
     // The COUNT is what holds the two passes to one set of members, and it is the
@@ -831,11 +838,15 @@ const drainIgnoredMembers = async ({
   onBytes,
   onScanProgress,
   signal,
+  forcedMarkdown,
+  sourceKind,
 }: {
   uploadPath: string
   onBytes: (bytes: number) => void
   onScanProgress?: (scanned: number) => void | Promise<void>
   signal?: AbortSignal
+  forcedMarkdown: boolean
+  sourceKind?: ImportSourceKind
 }): Promise<number> => {
   const zipfile = await openZip(uploadPath)
   let drained = 0
@@ -843,7 +854,7 @@ const drainIgnoredMembers = async ({
   await forEachZipMember(
     zipfile,
     async (member, entry) => {
-      if (!isDrainOnlyMember(member)) {
+      if (!isDrainOnlyMember(member, forcedMarkdown)) {
         return 'continue'
       }
       await drainMember(zipfile, entry, onBytes, signal)
@@ -859,6 +870,7 @@ const drainIgnoredMembers = async ({
       return 'continue'
     },
     signal,
+    sourceKind,
   )
 
   return drained
@@ -873,8 +885,8 @@ const drainIgnoredMembers = async ({
  *  question is already answered and a second call read as a guard while evaluating
  *  to a constant. The two are tied together by the count they are compared by, not
  *  by sharing this call. */
-const isDrainOnlyMember = (member: ZipMember): boolean =>
-  !member.isDirectory && !member.isContainerNoise && !MARKDOWN_MEMBER.test(member.name)
+const isDrainOnlyMember = (member: ZipMember, forcedMarkdown: boolean): boolean =>
+  !member.isDirectory && !member.isContainerNoise && !isTreeTextMember(member.name, forcedMarkdown)
 
 /** Confirm a memory-shaped member really is one (JSONL first line or the whole
  *  `{entities,relations}` object). */

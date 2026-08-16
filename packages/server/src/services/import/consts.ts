@@ -97,3 +97,13 @@ export const ARCHIVE_KIND = {
 } as const
 
 export type ArchiveKind = (typeof ARCHIVE_KIND)[keyof typeof ARCHIVE_KIND]
+
+/** Internal provenance for a ZIP assembled by the multipart folder bridge. */
+export const IMPORT_SOURCE_KIND = {
+  folderTree: 'folder-tree',
+} as const
+
+export type ImportSourceKind = (typeof IMPORT_SOURCE_KIND)[keyof typeof IMPORT_SOURCE_KIND]
+
+/** ASCII on purpose: the ZIP comment is a private, bounded transport envelope. */
+export const FOLDER_MTIME_COMMENT_PREFIX = 'notarium-folder-mtime:v1:'

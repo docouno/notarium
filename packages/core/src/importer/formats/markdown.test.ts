@@ -2,7 +2,18 @@ import { describe, expect, it } from 'vitest'
 
 import { FRONTMATTER_BYTE_CAP } from '../../libs/markdown'
 import { ImportError } from '../errors'
-import { markdownFileToNote } from './markdown'
+import { isImportTextPath, markdownFileToNote } from './markdown'
+
+describe('isImportTextPath', () => {
+  it.each(['a.md', 'a.MARKDOWN', 'nested/a.mdown', 'a.mkd', 'a.txt', 'a.TEXT'])(
+    'accepts %s',
+    (path) => expect(isImportTextPath(path)).toBe(true),
+  )
+
+  it.each(['a.zip', 'a.json', 'a.md.bak', 'md', 'folder.md/a.png'])('rejects %s', (path) =>
+    expect(isImportTextPath(path)).toBe(false),
+  )
+})
 
 // The dropped-file parser: a plain text / markdown file → one note. Pins the title
 // precedence (frontmatter `title:` > leading heading > filename), the frontmatter
