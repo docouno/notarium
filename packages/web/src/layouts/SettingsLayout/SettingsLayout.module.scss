@@ -93,6 +93,14 @@
   min-width: 0;
 }
 
+/* A document opened INSIDE a section (an Ability, an agent-memory note) already sits
+ * in the section's own vertical inset. The standalone `.doc` scaffold would add the
+ * page-level top padding a second time, so every nested reader/editor of every
+ * section drops it here — as one rule, not as a per-page padding override. */
+.panel :global(.doc) {
+  padding-top: 0;
+}
+
 /* Narrow viewport: drop the tab rail above the panel. */
 @media (max-width: 720px) {
   .body {

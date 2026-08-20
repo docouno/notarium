@@ -2,9 +2,10 @@ import { randomUUID } from 'node:crypto'
 import { lstat, mkdir, open, opendir, rm, writeFile } from 'node:fs/promises'
 import { dirname, join, relative as relativePath } from 'node:path'
 
+import { isGeneratedNoteId, isSkillName } from '@notarium/core'
 import type { AdmissionMode, SpaceResourceAuthority } from '@notarium/engine'
 import { isReclaimableInstallStaging } from './installStaging'
-import { MAX_SKILL_FILE_BYTES, MAX_SKILL_MANIFEST_BYTES } from './skillFile'
+import { MAX_SKILL_FILE_BYTES, MAX_SKILL_MANIFEST_BYTES, parseSkillFile } from './skillFile'
 import type { RoleLocation } from './types'
 
 const MAX_PACKAGE_FILES = 256
@@ -19,10 +20,22 @@ const MAX_LIBRARY_BYTES = 64 * 1024 * 1024
 // staging DIRECTORY's mtime freezes at its last top-level entry — so this bounds
 // an install's whole wall-clock time, not its idle time.
 const STALE_INSTALL_MS = 60 * 60 * 1_000
-const PACKAGE_NAME = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/
+
+const pathOccupied = async (path: string): Promise<boolean> => {
+  try {
+    await lstat(path)
+    return true
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return false
+    }
+    throw error
+  }
+}
 
 export type SkillPackage = {
-  name: string
+  /** Physical package address below one placement root. */
+  directoryName: string
   files: Map<string, Uint8Array>
 }
 
@@ -31,6 +44,21 @@ export class InvalidSkillPackageError extends Error {}
 
 export type RoleLibraryListing = { packages: SkillPackage[]; truncated: boolean }
 
+export type PublishedRolePackage = {
+  directoryName: string
+  /** Space-relative path served by the ordinary note projection. */
+  filePath: string
+}
+
+export type ProjectPublishedRolePackages = (
+  space: string,
+  packages: readonly PublishedRolePackage[],
+  /** `settle` forces the host to reconcile file truth before answering. It is the
+   *  publication barrier, and it belongs to publication only — a read pays for it
+   *  with a global mutation block over the whole space. */
+  options?: { settle?: boolean },
+) => Promise<ReadonlyMap<string, string>>
+
 export type RoleLibrary = {
   /** Discovery projection: direct SKILL.md frontmatter only, never package resources
    *  or instruction bodies. Invalid manifests are isolated by the parser; oversized
@@ -38,24 +66,50 @@ export type RoleLibrary = {
   listManifests(location: RoleLocation): Promise<RoleLibraryListing>
   /** One complete SKILL.md, without resources — activation's progressive load. */
   getSkill(location: RoleLocation, name: string): Promise<SkillPackage | null>
+  /** One exact SKILL.md by its immutable owned package address. */
+  getSkillByDirectory(location: RoleLocation, directoryName: string): Promise<SkillPackage | null>
   /** Whether the package target is occupied, including an invalid package. */
   exists(location: RoleLocation, name: string): Promise<boolean>
   /** Complete package bytes — Add/conflict verification only. */
   get(location: RoleLocation, name: string): Promise<SkillPackage | null>
+  /** Complete package bytes by immutable owned package address. */
+  getByDirectory(location: RoleLocation, directoryName: string): Promise<SkillPackage | null>
   putIfAbsent(location: RoleLocation, pkg: SkillPackage): Promise<boolean>
+  /** Move one package between two placements of the SAME space, keeping its
+   *  address. `false` — the destination pathname or manifest name was taken and
+   *  nothing moved. This is an external move as far as the note read-model is
+   *  concerned: the id lives in the file's frontmatter, so it survives the path
+   *  change ([P7](docs/architecture.md#p7)) — which is the whole reason a
+   *  promotion moves the directory instead of republishing its bytes. */
+  movePackage(from: RoleLocation, to: RoleLocation, directoryName: string): Promise<boolean>
+  /** Cross the host's read-model publication barrier and return the actual note
+   *  identity for every package address (the two differ after claim arbitration).
+   *  For WRITES only: the barrier reconciles file truth and blocks mutations across
+   *  the space while it runs. */
+  awaitReadableNoteIds(
+    location: RoleLocation,
+    directoryNames: readonly string[],
+  ): Promise<ReadonlyMap<string, string>>
+  /** The same identities off the current projection, without the barrier. A package
+   *  the projection has not caught up with is simply absent — which every reader
+   *  already treats as "not listable yet", the same answer it would get from a
+   *  package published one millisecond later. */
+  readableNoteIds(
+    location: RoleLocation,
+    directoryNames: readonly string[],
+  ): Promise<ReadonlyMap<string, string>>
 }
 
 export type InMemoryRoleLibrary = RoleLibrary & { clear(): void }
 
 export const validateSkillPackage = (pkg: SkillPackage): void => {
   if (
-    !PACKAGE_NAME.test(pkg.name) ||
-    pkg.name.includes('--') ||
+    (!isGeneratedNoteId(pkg.directoryName) && !isSkillName(pkg.directoryName)) ||
     !pkg.files.has('SKILL.md') ||
     pkg.files.get('SKILL.md')!.byteLength > MAX_SKILL_FILE_BYTES ||
     pkg.files.size > MAX_PACKAGE_FILES
   ) {
-    throw new InvalidSkillPackageError(`invalid Agent Skill package: ${pkg.name}`)
+    throw new InvalidSkillPackageError(`invalid Agent Skill package: ${pkg.directoryName}`)
   }
   let packageBytes = 0
   const entries = new Set<string>()
@@ -75,11 +129,13 @@ export const validateSkillPackage = (pkg: SkillPackage): void => {
       entries.add(parts.slice(0, index).join('/'))
     }
     if (entries.size > MAX_PACKAGE_ENTRIES) {
-      throw new InvalidSkillPackageError(`Agent Skill package has too many entries: ${pkg.name}`)
+      throw new InvalidSkillPackageError(
+        `Agent Skill package has too many entries: ${pkg.directoryName}`,
+      )
     }
     packageBytes += content.byteLength
     if (packageBytes > MAX_PACKAGE_BYTES) {
-      throw new InvalidSkillPackageError(`Agent Skill package is too large: ${pkg.name}`)
+      throw new InvalidSkillPackageError(`Agent Skill package is too large: ${pkg.directoryName}`)
     }
   }
 }
@@ -238,7 +294,7 @@ export const readPackagesFromDirectory = async (root: string): Promise<SkillPack
     if (entries > MAX_LIBRARY_ENTRIES) {
       throw new Error(`role library has too many entries: ${root}`)
     }
-    if (!entry.isDirectory() || !PACKAGE_NAME.test(entry.name) || entry.name.includes('--')) {
+    if (!entry.isDirectory() || !isSkillName(entry.name)) {
       continue
     }
     const packageDirectory = join(root, entry.name)
@@ -256,10 +312,10 @@ export const readPackagesFromDirectory = async (root: string): Promise<SkillPack
     if (bytes > MAX_LIBRARY_BYTES) {
       throw new Error(`role library is too large: ${root}`)
     }
-    packages.push({ name: entry.name, files })
+    packages.push({ directoryName: entry.name, files })
   }
 
-  return packages.sort((left, right) => left.name.localeCompare(right.name))
+  return packages.sort((left, right) => left.directoryName.localeCompare(right.directoryName))
 }
 
 /** The engine's atomic directory no-replace, as this composition root found it.
@@ -271,6 +327,7 @@ export const createFsRoleLibrary = ({
   publishDirectoryIfAbsent,
   authorityForSpace,
   resourcePrefixForSpace,
+  projectPublishedPackages,
 }: {
   rootForSpace(space: string): string | null
   /** REQUIRED to pass, allowed to be `undefined`: every composition root has to
@@ -280,7 +337,35 @@ export const createFsRoleLibrary = ({
   publishDirectoryIfAbsent: PublishDirectoryIfAbsent | undefined
   authorityForSpace?(space: string): Promise<SpaceResourceAuthority | null>
   resourcePrefixForSpace?(space: string): string | null
+  projectPublishedPackages?: ProjectPublishedRolePackages
 }): RoleLibrary => {
+  const projectNoteIds = async (
+    location: RoleLocation,
+    directoryNames: readonly string[],
+    settle: boolean,
+  ): Promise<ReadonlyMap<string, string>> => {
+    const unique = [...new Set(directoryNames)]
+
+    // Nothing to project is not a reason to reconcile a whole space.
+    if (!unique.length) {
+      return new Map()
+    }
+    if (!projectPublishedPackages) {
+      return new Map(unique.map((directoryName) => [directoryName, directoryName]))
+    }
+    const packages = unique.map((directoryName): PublishedRolePackage => {
+      const packagePath = resourcePackagePath(location, directoryName)
+
+      if (packagePath == null) {
+        throw new Error('role library has no projected resource path')
+      }
+
+      return { directoryName, filePath: `${packagePath}/SKILL.md` }
+    })
+
+    return projectPublishedPackages(location.space, packages, { settle })
+  }
+
   const rootsOf = (location: RoleLocation): { mount: string; root: string } => {
     const mount = rootForSpace(location.space)
 
@@ -296,6 +381,26 @@ export const createFsRoleLibrary = ({
   const rootOf = (location: RoleLocation): string => rootsOf(location).root
   type SweepState = { running?: Promise<void>; cleanUntil: number }
   const sweeps = new Map<string, SweepState>()
+  const placementFences = new Map<string, Promise<void>>()
+
+  const acquirePlacementFence = async (root: string): Promise<() => void> => {
+    const previous = placementFences.get(root) ?? Promise.resolve()
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const tail = previous.catch(() => undefined).then(() => gate)
+
+    placementFences.set(root, tail)
+    await previous.catch(() => undefined)
+
+    return () => {
+      release()
+      if (placementFences.get(root) === tail) {
+        placementFences.delete(root)
+      }
+    }
+  }
 
   const prepareRoot = async (
     location: RoleLocation,
@@ -423,6 +528,38 @@ export const createFsRoleLibrary = ({
     return authority && resourcePath ? { authority, resourcePath } : null
   }
 
+  /** The PLACEMENT-wide lease. Personal and a Space root are one directory shared by
+   *  every package in the placement, so "is this manifest name free" and "publish it"
+   *  have to be one critical section ACROSS package ids — a per-package lease cannot
+   *  express that. Both writers into a placement take it: publication had it inline,
+   *  promotion had only the per-package leases and the in-process fence, so the two
+   *  serialised against different mutexes and could both find one name free. */
+  const withPlacementAdmission = async <T>(
+    location: RoleLocation,
+    name: string,
+    owner: string,
+    task: (
+      context: { authority: SpaceResourceAuthority; resourcePath: string } | null,
+    ) => Promise<T>,
+  ): Promise<T> => {
+    const context = await authorityContext(location, name)
+
+    if (!context) {
+      return task(null)
+    }
+    const lease = await context.authority.admitSkillPlacement(
+      `${context.resourcePath}/SKILL.md`,
+      'exclusive',
+      owner,
+    )
+
+    try {
+      return await task(context)
+    } finally {
+      lease.settle()
+    }
+  }
+
   const withPackageAdmission = async <T>(
     location: RoleLocation,
     name: string,
@@ -445,6 +582,119 @@ export const createFsRoleLibrary = ({
       lease.settle()
     }
   }
+
+  const manifestAt = async (
+    location: RoleLocation,
+    directoryName: string,
+    owner: string,
+  ): Promise<{ size: number; content: Uint8Array } | null> => {
+    const packageDirectory = join(rootOf(location), directoryName)
+
+    return withPackageAdmission(location, directoryName, 'shared', owner, async (context) => {
+      if (context) {
+        const observation = await context.authority.observe(`${context.resourcePath}/SKILL.md`, {
+          owner: `${owner}-read`,
+          packagePath: context.resourcePath,
+          maxBytes: MAX_SKILL_FILE_BYTES,
+        })
+
+        return observation.kind === 'present'
+          ? { size: observation.bytes.byteLength, content: observation.bytes }
+          : null
+      }
+      const size = await skillFileSize(packageDirectory)
+
+      return size == null
+        ? null
+        : { size, content: await readManifestPrefix(join(packageDirectory, 'SKILL.md')) }
+    })
+  }
+
+  const manifestIndex = async (location: RoleLocation): Promise<Map<string, string>> => {
+    const index = new Map<string, string>()
+    let directory
+
+    try {
+      directory = await opendir(rootOf(location))
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        return index
+      }
+      throw err
+    }
+    let entries = 0
+
+    for await (const entry of directory) {
+      entries++
+      if (entries > MAX_LIBRARY_ENTRIES) {
+        throw new Error(`role library has too many entries: ${rootOf(location)}`)
+      }
+      if (!entry.isDirectory() || !isGeneratedNoteId(entry.name)) {
+        continue
+      }
+
+      try {
+        const manifest = await manifestAt(location, entry.name, 'role-index-manifest')
+
+        if (!manifest || manifest.size > MAX_SKILL_FILE_BYTES) {
+          continue
+        }
+        const name = parseSkillFile(Buffer.from(manifest.content).toString('utf8'), entry.name).name
+        const current = index.get(name)
+
+        // Invalid duplicate names cannot arise through the product channel, but
+        // external files are normal. Pick a stable winner until CRUD can report
+        // and repair the collision explicitly.
+        if (!current || entry.name.localeCompare(current) < 0) {
+          index.set(name, entry.name)
+        }
+      } catch (err) {
+        console.warn(`[roles] ignoring invalid package ${entry.name}:`, (err as Error).message)
+      }
+    }
+
+    return index
+  }
+
+  const skillAt = async (
+    location: RoleLocation,
+    directoryName: string,
+  ): Promise<SkillPackage | null> =>
+    withPackageAdmission(location, directoryName, 'shared', 'role-get-skill', async (context) => {
+      if (context) {
+        const observation = await context.authority.observe(`${context.resourcePath}/SKILL.md`, {
+          owner: 'role-get-skill-read',
+          packagePath: context.resourcePath,
+          maxBytes: MAX_SKILL_FILE_BYTES,
+        })
+
+        return observation.kind === 'present'
+          ? {
+              directoryName,
+              files: new Map([['SKILL.md', observation.bytes]]),
+            }
+          : null
+      }
+      const path = join(rootOf(location), directoryName, 'SKILL.md')
+
+      try {
+        const info = await lstat(path)
+
+        if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_SKILL_FILE_BYTES) {
+          return null
+        }
+
+        return {
+          directoryName,
+          files: new Map([['SKILL.md', await readBoundedFile(path, MAX_SKILL_FILE_BYTES)]]),
+        }
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+          return null
+        }
+        throw err
+      }
+    })
 
   return {
     listManifests: async (location) => {
@@ -470,25 +720,11 @@ export const createFsRoleLibrary = ({
           truncated = true
           break
         }
-        if (!entry.isDirectory() || !PACKAGE_NAME.test(entry.name) || entry.name.includes('--')) {
+        if (!entry.isDirectory() || !isGeneratedNoteId(entry.name)) {
           continue
         }
-        const packageDirectory = join(root, entry.name)
-
         try {
-          const manifest = await withPackageAdmission(
-            location,
-            entry.name,
-            'shared',
-            'role-list-manifest',
-            async () => {
-              const size = await skillFileSize(packageDirectory)
-
-              return size == null
-                ? null
-                : { size, content: await readManifestPrefix(join(packageDirectory, 'SKILL.md')) }
-            },
-          )
+          const manifest = await manifestAt(location, entry.name, 'role-list-manifest')
 
           if (!manifest) {
             continue
@@ -502,99 +738,136 @@ export const createFsRoleLibrary = ({
             continue
           }
           bytes += manifest.size
-          manifests.push({ name: entry.name, files: new Map([['SKILL.md', manifest.content]]) })
+          manifests.push({
+            directoryName: entry.name,
+            files: new Map([['SKILL.md', manifest.content]]),
+          })
         } catch (err) {
           console.warn(`[roles] ignoring invalid package ${entry.name}:`, (err as Error).message)
         }
       }
 
       return {
-        packages: manifests.sort((left, right) => left.name.localeCompare(right.name)),
+        packages: manifests.sort((left, right) =>
+          left.directoryName.localeCompare(right.directoryName),
+        ),
         truncated,
       }
     },
     getSkill: async (location, name) => {
-      if (!PACKAGE_NAME.test(name) || name.includes('--')) {
+      if (!isSkillName(name)) {
         return null
       }
 
-      return withPackageAdmission(location, name, 'shared', 'role-get-skill', async (context) => {
-        if (context) {
-          const observation = await context.authority.observe(`${context.resourcePath}/SKILL.md`, {
-            owner: 'role-get-skill-read',
-            packagePath: context.resourcePath,
-            maxBytes: MAX_SKILL_FILE_BYTES,
-          })
+      const directoryName = (await manifestIndex(location)).get(name)
 
-          return observation.kind === 'present'
-            ? { name, files: new Map([['SKILL.md', observation.bytes]]) }
-            : null
-        }
-        const path = join(rootOf(location), name, 'SKILL.md')
-
-        try {
-          const info = await lstat(path)
-
-          if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_SKILL_FILE_BYTES) {
-            return null
-          }
-
-          return {
-            name,
-            files: new Map([['SKILL.md', await readBoundedFile(path, MAX_SKILL_FILE_BYTES)]]),
-          }
-        } catch (err) {
-          if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-            return null
-          }
-          throw err
-        }
-      })
+      return directoryName ? skillAt(location, directoryName) : null
     },
+    getSkillByDirectory: async (location, directoryName) =>
+      isGeneratedNoteId(directoryName) ? skillAt(location, directoryName) : null,
     exists: async (location, name) => {
-      if (!PACKAGE_NAME.test(name) || name.includes('--')) {
+      if (!isSkillName(name)) {
         return false
       }
 
-      return withPackageAdmission(location, name, 'shared', 'role-exists', async () => {
-        try {
-          await lstat(join(rootOf(location), name))
-          return true
-        } catch (err) {
-          if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-            return false
+      const occupiedDirectly = await withPackageAdmission(
+        location,
+        name,
+        'shared',
+        'role-exists',
+        async () => {
+          try {
+            await lstat(join(rootOf(location), name))
+            return true
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+              return false
+            }
+            throw err
           }
-          throw err
-        }
-      })
+        },
+      )
+
+      return occupiedDirectly || (await manifestIndex(location)).has(name)
     },
     get: async (location, name) => {
-      if (!PACKAGE_NAME.test(name) || name.includes('--')) {
+      if (!isSkillName(name)) {
         return null
       }
 
-      return withPackageAdmission(location, name, 'shared', 'role-get-package', async () => {
-        const directory = join(rootOf(location), name)
+      const directoryName = (await manifestIndex(location)).get(name)
 
-        try {
-          const info = await lstat(directory)
+      if (!directoryName) {
+        return null
+      }
 
-          if (!info.isDirectory() || info.isSymbolicLink()) {
-            return null
+      return withPackageAdmission(
+        location,
+        directoryName,
+        'shared',
+        'role-get-package',
+        async () => {
+          const directory = join(rootOf(location), directoryName)
+
+          try {
+            const info = await lstat(directory)
+
+            if (!info.isDirectory() || info.isSymbolicLink()) {
+              return null
+            }
+            const files = await readPackageFiles(directory)
+            return files.has('SKILL.md') ? { directoryName, files } : null
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+              return null
+            }
+            throw err
           }
-          const files = await readPackageFiles(directory)
-          return files.has('SKILL.md') ? { name, files } : null
-        } catch (err) {
-          if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-            return null
+        },
+      )
+    },
+    getByDirectory: async (location, directoryName) => {
+      if (!isGeneratedNoteId(directoryName)) {
+        return null
+      }
+
+      return withPackageAdmission(
+        location,
+        directoryName,
+        'shared',
+        'role-get-package-id',
+        async () => {
+          const directory = join(rootOf(location), directoryName)
+
+          try {
+            const info = await lstat(directory)
+
+            if (!info.isDirectory() || info.isSymbolicLink()) {
+              return null
+            }
+            const files = await readPackageFiles(directory)
+            return files.has('SKILL.md') ? { directoryName, files } : null
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+              return null
+            }
+            throw err
           }
-          throw err
-        }
-      })
+        },
+      )
     },
     putIfAbsent: async (location, pkg) => {
       validateSkillPackage(pkg)
+      if (!isGeneratedNoteId(pkg.directoryName)) {
+        throw new InvalidSkillPackageError(
+          `invalid owned Agent Skill package address: ${pkg.directoryName}`,
+        )
+      }
       const { mount, root } = rootsOf(location)
+      const manifestName = parseSkillFile(
+        Buffer.from(pkg.files.get('SKILL.md')!).toString('utf8'),
+        pkg.directoryName,
+      ).name
 
       // After the two pure refusals and before the first byte touches disk. A
       // deployment that cannot publish atomically must leave no library root, no
@@ -606,102 +879,303 @@ export const createFsRoleLibrary = ({
       }
       await prepareRoot(location, mount, root)
       await sweepStaleStaging(mount, root)
-      const context = await authorityContext(location, pkg.name)
+      const context = await authorityContext(location, pkg.directoryName)
 
       if (context) {
-        const observed = await context.authority.observe(context.resourcePath, {
-          owner: 'role-put-package-plan',
-          packagePath: context.resourcePath,
-        })
-
-        if (observed.kind !== 'absent') {
-          return false
-        }
-        const published = await context.authority.publishPackageIfAbsent({
-          rootPath: context.resourcePath,
-          files: [...pkg.files].map(([path, content]) => ({ path, content })),
-          expectedRoot: observed.claim,
-        })
-
-        return published.status === 'published'
-      }
-
-      return withPackageAdmission(location, pkg.name, 'exclusive', 'role-put-package', async () => {
-        const target = join(root, pkg.name)
-        const temp = join(root, `.${pkg.name}.install-${randomUUID()}`)
-        await mkdir(temp, { recursive: false })
+        const lease = await context.authority.admitSkillPlacement(
+          `${context.resourcePath}/SKILL.md`,
+          'exclusive',
+          'role-put-placement',
+        )
 
         try {
-          for (const [file, content] of pkg.files) {
-            const path = join(temp, ...file.split('/'))
-            await mkdir(dirname(path), { recursive: true })
-            await writeFile(path, content, { flag: 'wx' })
+          const observed = await context.authority.observeStrictAdmitted(context.resourcePath)
+
+          if (observed.kind !== 'absent') {
+            return false
+          }
+          await context.authority.assertSkillManifestNameAvailableAdmitted(
+            `${context.resourcePath}/SKILL.md`,
+            pkg.files.get('SKILL.md')!,
+          )
+          const published = await context.authority.publishPackageIfAbsentAdmitted({
+            rootPath: context.resourcePath,
+            files: [...pkg.files].map(([path, content]) => ({ path, content })),
+            expectedRoot: observed.claim,
+          })
+
+          return published.status === 'published'
+        } finally {
+          lease.settle()
+        }
+      }
+      const release = await acquirePlacementFence(root)
+
+      try {
+        if (
+          (await manifestIndex(location)).has(manifestName) ||
+          (await pathOccupied(join(root, manifestName)))
+        ) {
+          return false
+        }
+
+        return await withPackageAdmission(
+          location,
+          pkg.directoryName,
+          'exclusive',
+          'role-put-package',
+          async () => {
+            const target = join(root, pkg.directoryName)
+            const temp = join(root, `.${pkg.directoryName}.install-${randomUUID()}`)
+            await mkdir(temp, { recursive: false })
+
+            try {
+              for (const [file, content] of pkg.files) {
+                const path = join(temp, ...file.split('/'))
+                await mkdir(dirname(path), { recursive: true })
+                await writeFile(path, content, { flag: 'wx' })
+              }
+
+              // One atomic pathname publication: any occupied target is a
+              // conflict, and an unsupported medium fails without a raceable
+              // fallback.
+              return await publishDirectoryIfAbsent(temp, target)
+            } finally {
+              await rm(temp, { recursive: true, force: true }).catch((err: Error) => {
+                // This process created a possible orphan after the last sweep.
+                // Make the next install keep checking until it can reclaim it.
+                sweeps.delete(root)
+                console.warn(`[roles] failed to remove install staging ${temp}:`, err.message)
+              })
+            }
+          },
+        )
+      } finally {
+        release()
+      }
+    },
+    movePackage: async (from, to, directoryName) => {
+      if (!isGeneratedNoteId(directoryName)) {
+        throw new InvalidSkillPackageError(
+          `invalid owned Agent Skill package address: ${directoryName}`,
+        )
+      }
+      if (from.space !== to.space) {
+        throw new Error('a package move cannot cross spaces')
+      }
+      const source = join(rootOf(from), directoryName)
+      const { mount, root } = rootsOf(to)
+      const target = join(root, directoryName)
+
+      if (source === target) {
+        throw new Error('a package move needs two different placements')
+      }
+      // Same refusal as `putIfAbsent`, and for the same reason: a deployment that
+      // cannot move a pathname atomically must say so before it touches anything.
+      if (!publishDirectoryIfAbsent) {
+        throw Object.assign(new Error('atomic role package publication is unavailable'), {
+          code: 'ENOTSUP',
+        })
+      }
+      const manifest = await skillAt(from, directoryName)
+
+      if (!manifest) {
+        return false
+      }
+      const manifestName = parseSkillFile(
+        Buffer.from(manifest.files.get('SKILL.md')!).toString('utf8'),
+        directoryName,
+      ).name
+
+      await prepareRoot(to, mount, root)
+
+      // The destination's placement lease wraps the whole critical section, exactly as
+      // publication's does: the name check and the publication that acts on it are one
+      // decision, and the packages that could take that name have other ids.
+      return await withPlacementAdmission(to, directoryName, 'role-move-placement', async () => {
+        const release = await acquirePlacementFence(root)
+
+        try {
+          if (
+            (await manifestIndex(to)).has(manifestName) ||
+            (await pathOccupied(join(root, manifestName)))
+          ) {
+            return false
           }
 
-          // The arbiter is the primitive, in one atomic filesystem operation: an
-          // occupied pathname of ANY shape is a conflict, never a replacement.
-          // Its errors — a per-path unsupported medium included — travel out as
-          // they are; there is no fallback to a raceable rename on any branch.
-          return await publishDirectoryIfAbsent(temp, target)
+          // Both sides admitted, destination first. The order is fixed so two moves can
+          // never hold each other's half.
+          return await withPackageAdmission(
+            to,
+            directoryName,
+            'exclusive',
+            'role-move-target',
+            () =>
+              withPackageAdmission(from, directoryName, 'exclusive', 'role-move-source', () =>
+                publishDirectoryIfAbsent(source, target),
+              ),
+          )
         } finally {
-          // On the conflict branch the staging really is still there, so this rm
-          // does work — and a read-only volume or an EACCES must not turn a
-          // defined `false` into a 500.
-          await rm(temp, { recursive: true, force: true }).catch((err: Error) => {
-            // This process just created a possible orphan after the last sweep.
-            // Drop the clean cache so a later install keeps checking it until it
-            // ages into the reclaimable window.
-            sweeps.delete(root)
-            console.warn(`[roles] failed to remove install staging ${temp}:`, err.message)
-          })
+          release()
         }
       })
     },
+    awaitReadableNoteIds: (location, directoryNames) =>
+      projectNoteIds(location, directoryNames, true),
+    readableNoteIds: (location, directoryNames) => projectNoteIds(location, directoryNames, false),
   }
 }
 
-export const createInMemoryRoleLibrary = (): InMemoryRoleLibrary => {
+export const createInMemoryRoleLibrary = ({
+  onBarrier,
+}: {
+  /** Every crossing of the read-model publication barrier, as it happens. The twin
+   *  holds no file truth to reconcile, so the barrier costs it nothing and both port
+   *  methods would otherwise be ONE function — and a double that cannot express the
+   *  difference cannot fail when a caller takes the wrong one. The difference is not
+   *  cosmetic: the barrier blocks mutations across the whole space while it runs, so
+   *  a READ that crosses it serialises every write in the space behind an inventory
+   *  listing. Recorded rather than simulated, because the twin has no honest way to
+   *  lag: its packages ARE its projection. */
+  onBarrier?: (location: RoleLocation, directoryNames: readonly string[]) => void
+} = {}): InMemoryRoleLibrary => {
+  const nameableManifest = (name: string): boolean => isSkillName(name)
   const packages = new Map<string, SkillPackage>()
-  const keyOf = (location: RoleLocation, name: string): string =>
-    `${location.space}\0${location.scope === 'project' ? location.projectId : ''}\0${name}`
+  const prefixOf = (location: RoleLocation): string =>
+    `${location.space}\0${location.scope === 'project' ? location.projectId : ''}\0`
+  const keyOf = (location: RoleLocation, directoryName: string): string =>
+    `${prefixOf(location)}${directoryName}`
+  const noteIdsAt = (
+    location: RoleLocation,
+    directoryNames: readonly string[],
+  ): ReadonlyMap<string, string> =>
+    new Map(
+      [...new Set(directoryNames)]
+        .filter((directoryName) => packages.has(keyOf(location, directoryName)))
+        // An Owned package is ID-backed: its directory name IS its note id.
+        .map((directoryName) => [directoryName, directoryName]),
+    )
   const clone = (pkg: SkillPackage): SkillPackage => ({
-    name: pkg.name,
+    directoryName: pkg.directoryName,
     files: new Map([...pkg.files].map(([name, bytes]) => [name, Uint8Array.from(bytes)])),
   })
+
+  const manifestNameOf = (pkg: SkillPackage): string | null => {
+    const manifest = pkg.files.get('SKILL.md')
+
+    if (!manifest) {
+      return null
+    }
+    try {
+      return parseSkillFile(Buffer.from(manifest).toString('utf8'), pkg.directoryName).name
+    } catch {
+      return null
+    }
+  }
+
+  const packageByName = (location: RoleLocation, name: string): SkillPackage | null => {
+    const matches = [...packages]
+      .filter(([key, pkg]) => key.startsWith(prefixOf(location)) && manifestNameOf(pkg) === name)
+      .sort(([, left], [, right]) => left.directoryName.localeCompare(right.directoryName))
+
+    return matches[0]?.[1] ?? null
+  }
 
   return {
     listManifests: async (location) => ({
       packages: [...packages]
-        .filter(([key]) =>
-          key.startsWith(
-            `${location.space}\0${location.scope === 'project' ? location.projectId : ''}\0`,
-          ),
-        )
+        .filter(([key]) => key.startsWith(prefixOf(location)))
         .map(([, pkg]) => ({
-          name: pkg.name,
+          directoryName: pkg.directoryName,
           files: new Map([['SKILL.md', Uint8Array.from(pkg.files.get('SKILL.md')!)]]),
         })),
       truncated: false,
     }),
     getSkill: async (location, name) => {
-      const pkg = packages.get(keyOf(location, name))
-      const skill = pkg?.files.get('SKILL.md')
-      return skill ? { name, files: new Map([['SKILL.md', Uint8Array.from(skill)]]) } : null
+      const pkg = packageByName(location, name)
+
+      if (!pkg) {
+        return null
+      }
+      const skill = pkg.files.get('SKILL.md')
+
+      return skill
+        ? {
+            directoryName: pkg.directoryName,
+            files: new Map([['SKILL.md', Uint8Array.from(skill)]]),
+          }
+        : null
     },
-    exists: async (location, name) => packages.has(keyOf(location, name)),
+    getSkillByDirectory: async (location, directoryName) => {
+      const pkg = packages.get(keyOf(location, directoryName))
+      const skill = pkg?.files.get('SKILL.md')
+
+      return pkg && skill
+        ? {
+            directoryName: pkg.directoryName,
+            files: new Map([['SKILL.md', Uint8Array.from(skill)]]),
+          }
+        : null
+    },
+    // `exists` answers about a manifest NAME, and asks the grammar first exactly
+    // where the shipped library asks it. Without that question an owned package
+    // ADDRESS reads as an occupied name here and as a free one on disk — and the two
+    // callers of this method (Add, promotion) refuse on nothing else.
+    exists: async (location, name) =>
+      nameableManifest(name) &&
+      (packages.has(keyOf(location, name)) || packageByName(location, name) != null),
     get: async (location, name) => {
-      const pkg = packages.get(keyOf(location, name))
+      const pkg = packageByName(location, name)
+      return pkg ? clone(pkg) : null
+    },
+    getByDirectory: async (location, directoryName) => {
+      const pkg = packages.get(keyOf(location, directoryName))
       return pkg ? clone(pkg) : null
     },
     putIfAbsent: async (location, pkg) => {
       validateSkillPackage(pkg)
-      const key = keyOf(location, pkg.name)
+      if (!isGeneratedNoteId(pkg.directoryName)) {
+        throw new InvalidSkillPackageError(
+          `invalid owned Agent Skill package address: ${pkg.directoryName}`,
+        )
+      }
+      const key = keyOf(location, pkg.directoryName)
+      const name = manifestNameOf(pkg)
 
-      if (packages.has(key)) {
+      if (packages.has(key) || (name != null && packageByName(location, name) != null)) {
         return false
       }
       packages.set(key, clone(pkg))
       return true
+    },
+    movePackage: async (from, to, directoryName) => {
+      if (from.space !== to.space) {
+        throw new Error('a package move cannot cross spaces')
+      }
+      const pkg = packages.get(keyOf(from, directoryName))
+
+      if (!pkg) {
+        return false
+      }
+      const name = manifestNameOf(pkg)
+
+      if (packages.has(keyOf(to, directoryName)) || (name != null && packageByName(to, name))) {
+        return false
+      }
+      packages.delete(keyOf(from, directoryName))
+      packages.set(keyOf(to, directoryName), pkg)
+      return true
+    },
+    // Identity is projected from a PATH, so it exists only where the package does.
+    // A twin that answered for every location would let a caller read the identity
+    // of a package it had already moved away, and say nothing about it.
+    readableNoteIds: async (location, directoryNames) => noteIdsAt(location, directoryNames),
+    awaitReadableNoteIds: async (location, directoryNames) => {
+      // The one thing this method does that the other does not. Written as a separate
+      // body on purpose: sharing `noteIdsAt` between the two is exactly how the port's
+      // deliberate distinction became invisible to every test that uses this twin.
+      onBarrier?.(location, directoryNames)
+      return noteIdsAt(location, directoryNames)
     },
     clear: () => packages.clear(),
   }

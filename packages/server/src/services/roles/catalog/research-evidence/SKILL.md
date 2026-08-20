@@ -3,6 +3,8 @@ name: research-evidence
 description: Keep research claims traceable and proportionate to their evidence. Use while collecting, comparing, and reporting technical or product findings.
 metadata:
   notarium.kind: skill
+  notarium.source: system
+  notarium.package-id: _55UeQqGnMrH
 ---
 
 # Evidence for research

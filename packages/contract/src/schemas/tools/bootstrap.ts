@@ -129,7 +129,11 @@ export const StartSessionOutputSchema = z.object({
   session: AgentSessionSchema.optional(),
   recentSessions: z.array(RecentAgentSessionSchema).optional(),
   profile: SessionProfileSchema,
-  /** Only user-added effective roles; the built-in catalog is never sent to an agent. */
+  /** The roles EFFECTIVE for this caller, from both sources the resolver reads: the
+   * Owned placements the human added, and the System roles the host ships, which are
+   * effective without an Add until their owner disables them. Each entry names its own
+   * source, so "effective" is never read as "the human chose it". A Catalog template is
+   * never effective and never sent to an agent. */
   roles: z.array(EffectiveRoleSummarySchema),
   /** The compact first page omitted roles or an owned-library bound was reached;
    * continue discovery with list_roles. */

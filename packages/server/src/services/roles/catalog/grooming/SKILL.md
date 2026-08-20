@@ -3,6 +3,8 @@ name: grooming
 description: Shape ambiguous work into an agreed, executable plan. Use when the user asks to groom, scope, decompose, or prepare work before implementation.
 metadata:
   notarium.kind: role
+  notarium.source: catalog
+  notarium.package-id: KMVMY5-vK4y1
   notarium.skills: "[[grooming-evidence]]"
 ---
 

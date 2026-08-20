@@ -1,26 +1,25 @@
-import { IconBot, IconHistory, IconScrollText } from '../../core/Icons'
+import { useAgentsExplorer } from '../../composers/AgentsExplorerProvider'
+import { IconHistory, IconScrollText, IconSparkles } from '../../core/Icons'
 import { type PillTab, PillTabs } from '../../core/PillTabs'
 import {
   agentActivityRoute,
   agentContextRoute,
   agentRolesRoute,
+  isModifiedClick,
 } from '../../libs/routing/routePaths'
 import { useAgentsSummary } from './AgentsProvider'
+import { abilitiesMetric } from './helpers/abilitiesMetric'
 
-// The Agents section nav (#243): a permanent pill-bar switching the Agents surface's
-// top-level sections — Context (the eager-load constructor), Roles and Activity
-// (the owner-global audit). The SAME PillTabs the dashboard uses. Each pill carries a
-// live identity line from AgentsChrome (Activity = active + retained/archived episodes)
-// so the bar reads as the surface's primary nav, not a bare toggle. Grows as Agents gains
-// sections (roles/tokens) — each a routed `/agents/<section>`, SHELL-ready.
-
-export type AgentsSection = 'context' | 'roles' | 'activity'
+// The Agents section nav: package library first, then eager Context and
+// owner-global Activity. Roles and Skills are two routed views under one pill.
+export type AgentsSection = 'abilities' | 'context' | 'activity'
 
 const fmtTokens = (n: number): string =>
   n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` : String(n)
 
 export const AgentsTabs = ({ active }: { active: AgentsSection }) => {
-  const { context, sessions, roles, loading } = useAgentsSummary()
+  const { context, sessions, roles, skills, loading } = useAgentsSummary()
+  const { revealNatural } = useAgentsExplorer()
 
   const contextMetric = context
     ? context.loadedTokens > 0
@@ -40,20 +39,22 @@ export const AgentsTabs = ({ active }: { active: AgentsSection }) => {
       ? '…'
       : undefined
 
-  const rolesCountMetric = roles
-    ? roles.truncated
-      ? roles.count
-        ? `${roles.count}+ roles`
-        : 'partial role count'
-      : `${roles.count} ${roles.count === 1 ? 'role' : 'roles'}${roles.count ? '' : ' added'}`
-    : undefined
-  const rolesMetric = roles
-    ? `${rolesCountMetric}${roles.activeRole ? ` · ${roles.activeRole} active` : ''}`
-    : loading
-      ? '…'
-      : undefined
+  const packageMetric = abilitiesMetric(roles, skills) ?? (loading ? '…' : undefined)
 
   const tabs: PillTab[] = [
+    {
+      key: 'abilities',
+      to: agentRolesRoute(),
+      label: 'Abilities',
+      icon: <IconSparkles size={15} />,
+      metric: packageMetric,
+      testId: 'agents-tab-roles',
+      onClick: (event) => {
+        if (!isModifiedClick(event)) {
+          revealNatural('roles')
+        }
+      },
+    },
     {
       key: 'context',
       to: agentContextRoute(),
@@ -61,14 +62,11 @@ export const AgentsTabs = ({ active }: { active: AgentsSection }) => {
       icon: <IconScrollText size={15} />,
       metric: contextMetric,
       testId: 'agents-tab-context',
-    },
-    {
-      key: 'roles',
-      to: agentRolesRoute(),
-      label: 'Roles',
-      icon: <IconBot size={15} />,
-      metric: rolesMetric,
-      testId: 'agents-tab-roles',
+      onClick: (event) => {
+        if (!isModifiedClick(event)) {
+          revealNatural('memory')
+        }
+      },
     },
     {
       key: 'activity',
@@ -77,6 +75,11 @@ export const AgentsTabs = ({ active }: { active: AgentsSection }) => {
       icon: <IconHistory size={15} />,
       metric: sessionsMetric,
       testId: 'agents-tab-activity',
+      onClick: (event) => {
+        if (!isModifiedClick(event)) {
+          revealNatural('sessions')
+        }
+      },
     },
   ]
   return <PillTabs tabs={tabs} activeKey={active} ariaLabel="Agents sections" />

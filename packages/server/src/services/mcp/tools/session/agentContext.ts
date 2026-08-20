@@ -97,9 +97,12 @@ export const curateAgentContext = async (
     : []
   const setsTrimmed = (sets: CuratedSet[]) =>
     sets.some((set) => set.items.some((item) => !item.loaded))
-  const roleScope = activeRole
-    ? await weighRoleContext(dependencies, ctx.principal, activeRole)
-    : undefined
+  // A System role is not placed, so it owns no context sets, pins or order: the
+  // role-scoped layer is an Owned-placement question and simply has no System answer.
+  const roleScope =
+    activeRole?.source === 'owned'
+      ? await weighRoleContext(dependencies, ctx.principal, activeRole)
+      : undefined
   const roleContextFrom = (
     role: NonNullable<ReturnType<typeof curatePersonalScope>['role']>,
   ): NonNullable<UseRoleOutput['context']> => ({

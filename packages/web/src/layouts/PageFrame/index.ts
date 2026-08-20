@@ -1,1 +1,1 @@
-export { PageFrame } from './PageFrame'
+export { PageFrame, TopbarActionSeparator } from './PageFrame'

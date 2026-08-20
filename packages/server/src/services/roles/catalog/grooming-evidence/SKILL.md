@@ -3,6 +3,8 @@ name: grooming-evidence
 description: Ground work grooming in existing product evidence. Use while shaping tasks from code, documentation, tracker state, and user feedback.
 metadata:
   notarium.kind: skill
+  notarium.source: catalog
+  notarium.package-id: LM1Iv2rAWGEQ
 ---
 
 # Evidence for grooming

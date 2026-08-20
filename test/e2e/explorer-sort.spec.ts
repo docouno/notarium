@@ -258,6 +258,15 @@ const setOrder = async (page: Page, field: string, direction: string) => {
   await choose(page, direction)
 }
 
+const pickAgentsDataset = async (page: Page, dataset: string) => {
+  await page.getByTestId('agents-explorer-picker').click()
+  await page.getByRole('menuitemradio', { name: dataset, exact: true }).click()
+  await expect(page.getByTestId('agents-explorer-picker')).toHaveAttribute(
+    'data-dataset',
+    dataset.toLowerCase(),
+  )
+}
+
 const folderRows = (page: Page, folder: string) =>
   page.locator(`[data-drop-folder="${folder}"] [data-testid="tree-note"]`)
 
@@ -410,7 +419,10 @@ test('Files and Memory share all six orders, fixed Name collation and persisted 
   await page.getByText('Main', { exact: true }).click()
   await expect(page).toHaveURL(/\/s\/main$/)
 
+  // Memory left the Files lens set with the Agents domain: it is one of the Agents
+  // explorer's own datasets now, and the sort control follows it there.
   await page.getByTestId('rail-agents').click()
+  await pickAgentsDataset(page, 'Memory')
   await expect(page.getByTestId('memory-tree')).toBeVisible()
   const memoryRows = page.getByTestId('memory-leaf')
   const memoryAxes = page.getByTestId('memory-axis')
@@ -474,7 +486,9 @@ test('the shared menu preserves keyboard continuity on Tab and activation', asyn
   await expect(scope).toBeFocused()
 })
 
-test('the shared sort control stays available in every explorer scope', async ({ page }) => {
+test('the shared sort control stays available in every explorer that orders its rows', async ({
+  page,
+}) => {
   await login(page)
   await page.goto('/s/main')
   const scope = page.getByTestId('explorer-scope')
@@ -500,9 +514,20 @@ test('the shared sort control stays available in every explorer scope', async ({
   await expect(scope).toHaveAttribute('data-scope', 'project')
   await expect(sort).toBeVisible()
 
-  await scope.click()
-  await page.getByRole('menuitemradio', { name: 'Memory', exact: true }).click()
-  await expect(scope).toHaveAttribute('data-scope', 'memory')
+  // Files no longer lenses Memory — the Agents section owns it, alongside three
+  // datasets that come back in the server's placement order and offer creation
+  // instead. The one control follows the rows it can actually order.
+  await page.getByTestId('rail-agents').click()
+  await expect(page.getByTestId('explorer-scope')).toHaveCount(0)
+  await pickAgentsDataset(page, 'Memory')
+  await expect(page.getByTestId('memory-tree')).toBeVisible()
+  await expect(sort).toBeVisible()
+
+  for (const dataset of ['Roles', 'Skills', 'Sessions']) {
+    await pickAgentsDataset(page, dataset)
+    await expect(sort).toHaveCount(0)
+  }
+  await pickAgentsDataset(page, 'Memory')
   await expect(sort).toBeVisible()
 })
 

@@ -304,6 +304,7 @@ describe('job SSE event is owner-scoped (#105)', () => {
       notify: () => {},
       notifyMembers: () => {},
       notifyRename: () => {},
+      notifyAgentSessions: () => {},
       notifyJob: (p: unknown) => sink.push(p),
     })
     auth.registerSse(mk('user:sam', 'main', got.ownerMain)) // the owner, in the space
@@ -315,5 +316,32 @@ describe('job SSE event is owner-scoped (#105)', () => {
     expect(got.ownerMain).toEqual([{ id: 'j1', status: 'running' }]) // owner in the space got it
     expect(got.memberMain).toEqual([]) // a fellow member did NOT — no status/artifact leak
     expect(got.ownerOther).toEqual([]) // the same principal in a different space did NOT
+  })
+})
+
+describe('agent-session SSE event is owner-scoped', () => {
+  it('delivers the invalidation to every owner tab and no other user', () => {
+    const auth = createAuthService({ mode: 'none' })
+    const got = { aliceMain: 0, aliceOther: 0, bobMain: 0 }
+    const register = (username: string, space: string, changed: () => void) =>
+      auth.registerSse({
+        principalId: `user:${username}`,
+        username,
+        space,
+        close: () => {},
+        notify: () => {},
+        notifyMembers: () => {},
+        notifyRename: () => {},
+        notifyAgentSessions: changed,
+        notifyJob: () => {},
+      })
+
+    register('alice', 'main', () => got.aliceMain++)
+    register('alice', 'other', () => got.aliceOther++)
+    register('bob', 'main', () => got.bobMain++)
+
+    auth.notifyAgentSessionsChanged('alice')
+
+    expect(got).toEqual({ aliceMain: 1, aliceOther: 1, bobMain: 0 })
   })
 })

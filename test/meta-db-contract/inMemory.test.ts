@@ -12,14 +12,32 @@ import {
   type RevisionInput,
   SPACE_LIFECYCLE_PHASE,
 } from '@notarium/core'
+import {
+  createInMemoryAbilityPlacement,
+  InMemoryAbilityAvailability,
+  InMemoryAbilityPreferences,
+  spaceLifecycleHasEnded,
+} from '@notarium/server'
 
+import { createInMemoryAbilityPlacement as createFakeServerAbilityPlacement } from '../fake-server/abilityPlacement'
+import { InMemoryAbilityPreferences as FakeServerAbilityPreferences } from '../fake-server/abilityPreferences'
 import { InMemoryAgentDeltaCursors } from '../fake-server/agentDeltaCursors'
 import { InMemoryAgentSessions } from '../fake-server/agentSessions'
+import { InMemoryContextOrder } from '../fake-server/contextOrder'
+import { InMemoryContextSets } from '../fake-server/contextSets'
 import { InMemoryFavorites } from '../fake-server/favorites'
 import { InMemoryFolders } from '../fake-server/folders'
 import { InMemoryGatewayState } from '../fake-server/gatewayState'
 import { InMemoryIdentity } from '../fake-server/identity'
 import { InMemoryProjects } from '../fake-server/projects'
+import { InMemoryScopePins } from '../fake-server/scopePins'
+import { InMemorySpaces } from '../fake-server/spaces'
+import { describeAbilityAvailabilityContract } from './abilityAvailabilityContract'
+import {
+  describeAbilityPlacementContract,
+  describeAbilityPlacementPreferencesOnlyContract,
+} from './abilityPlacementContract'
+import { describeAbilityPreferencesContract } from './abilityPreferencesContract'
 import { describeAgentDeltaCursorsContract } from './agentDeltaCursorsContract'
 import { describeAgentSessionsContract } from './agentSessionsContract'
 import { describeCausalMetadataContract } from './causalMetadataContract'
@@ -27,6 +45,12 @@ import { describeFavoritesContract } from './favoritesContract'
 import { describeGatewayStateContract } from './gatewayStateContract'
 import { describeLegacyNameAliasesContract } from './legacyNameAliasesContract'
 import { describeRevisionPersistenceContract } from './revisionPersistenceContract'
+
+/** The phases a Space never comes back from — asked of the DRIVERS' list, not of a
+ *  copy of it. A second spelling here would be a fence that agrees with the drivers
+ *  only for as long as nobody edits either, and this file exists to prove the twins
+ *  answer what the drivers answer. */
+const hasEnded = (record: { phase: string } | null): boolean => spaceLifecycleHasEnded(record)
 
 describeGatewayStateContract('in-memory twin', async () => ({
   persistence: new InMemoryGatewayState(),
@@ -69,6 +93,162 @@ describeAgentSessionsContract('in-memory twin', async () => ({
 }))
 
 describeFavoritesContract('in-memory twin', async () => ({ persistence: new InMemoryFavorites() }))
+
+// The three ability twins, through the SAME contracts the durable drivers answer. The
+// cascades a Map cannot have are supplied the way this host really has them: the
+// project/Space registry the twin reconciles its bindings against, and the journal
+// purge that ends an override — announced by the host, refused from then on by the
+// twin, which is the fence a fake-server e2e otherwise never reaches.
+describeAbilityAvailabilityContract('in-memory twin', async () => {
+  const spaces = new InMemorySpaces()
+  const projects = new InMemoryProjects()
+  const folders = new InMemoryFolders(projects)
+  const revisions = new InMemoryRevisionPersistence()
+  // The lifecycle journal both drivers read the phase out of. A twin host that keeps
+  // one has to hand it over, or its fence is a `SELECT 1 FROM spaces` — which is true
+  // of a Space in `purge-intent` and was true of this twin until the arc said so.
+  const spaceLifecycle = new InMemorySpaceLifecyclePersistence()
+  const abilityAvailability = new InMemoryAbilityAvailability({
+    projectHomeSpace: async (projectId) => (await projects.getById(projectId))?.space ?? null,
+    spaceExists: async (spaceId) => (await spaces.getById(spaceId)) != null,
+    spaceEnded: async (spaceId) => hasEnded(await spaceLifecycle.get(spaceId)),
+  })
+
+  return {
+    db: {
+      abilityAvailability,
+      spaces,
+      spaceLifecycle,
+      projects,
+      folders,
+      revisions: {
+        purgeNotes: async (space, noteIds) => {
+          const purged = await revisions.purgeNotes(space, [...noteIds])
+          abilityAvailability.notePurged(space, purged)
+          return purged
+        },
+      },
+      purgeSpace: async (space) => {
+        spaces.delete(space)
+      },
+    },
+  }
+})
+
+describeAbilityPreferencesContract('in-memory twin', async () => {
+  const spaces = new InMemorySpaces()
+  const revisions = new InMemoryRevisionPersistence()
+  const spaceLifecycle = new InMemorySpaceLifecyclePersistence()
+  // The Space registry the durable fence opens with (`SELECT 1 FROM spaces`), and the
+  // lifecycle journal its second clause reads. Without the first the twin cannot tell
+  // an override in a Space that never existed from one in a live Space; without the
+  // second it cannot tell a live Space from one already in `purge-intent`, whose row
+  // is still there — and it answers where all three drivers refuse.
+  const abilityPreferences = new InMemoryAbilityPreferences({
+    spaceExists: async (spaceId) => (await spaces.getById(spaceId)) != null,
+    spaceEnded: async (spaceId) => hasEnded(await spaceLifecycle.get(spaceId)),
+  })
+
+  return {
+    db: {
+      abilityPreferences,
+      spaces,
+      spaceLifecycle,
+      revisions: {
+        append: (revision, content) => revisions.append(revision, content),
+        purgeNotes: async (space, noteIds) => {
+          const purged = await revisions.purgeNotes(space, [...noteIds])
+          abilityPreferences.notePurged(space, purged)
+          return purged
+        },
+      },
+      purgeSpace: async (space) => {
+        spaces.delete(space)
+        abilityPreferences.spacePurged(space)
+      },
+    },
+  }
+})
+
+describeAbilityPlacementPreferencesOnlyContract('in-memory twin', async () => {
+  // The twin carries exactly what the host it is composed with holds: a meta-DB-less
+  // host has four of the five pointer tables absent and the preference twin present,
+  // so the adapter is handed the same preferences instance that host would give it —
+  // and the arm is handed that instance too, because the carry is only observable
+  // through the table it lands in.
+  const abilityPreferences = new InMemoryAbilityPreferences()
+
+  return {
+    abilityPlacement: createInMemoryAbilityPlacement({ abilityPreferences }),
+    abilityPreferences,
+  }
+})
+
+// The fake server keeps its own preferences twin because it also owns a PLACEMENT
+// facet: placement is part of the locator these rows are keyed by, so a promotion has
+// to rewrite that key across every owner at once. It answers the same contract.
+describeAbilityPreferencesContract('fake-server twin', async () => {
+  const spaces = new InMemorySpaces()
+  const revisions = new InMemoryRevisionPersistence()
+  const spaceLifecycle = new InMemorySpaceLifecyclePersistence()
+  // The fake host owns a space registry, and the contract asks the twin to refuse a
+  // home that is not in it — so the twin is built the way that host builds it.
+  const abilityPreferences = new FakeServerAbilityPreferences({
+    spaceExists: async (spaceId) => (await spaces.getById(spaceId)) != null,
+    spaceEnded: async (spaceId) => hasEnded(await spaceLifecycle.get(spaceId)),
+  })
+
+  return {
+    db: {
+      abilityPreferences,
+      spaces,
+      spaceLifecycle,
+      revisions: {
+        append: (revision, content) => revisions.append(revision, content),
+        purgeNotes: async (space, noteIds) => {
+          const purged = await revisions.purgeNotes(space, [...noteIds])
+          abilityPreferences.notePurged(space, purged)
+          return purged
+        },
+      },
+      purgeSpace: async (space) => {
+        spaces.delete(space)
+        abilityPreferences.spacePurged(space)
+      },
+    },
+  }
+})
+
+// …and because it holds all five pointer tables, its placement adapter answers the
+// FULL contract. The arm above belongs to a host that holds exactly one of them — the
+// preference table, the only one of the five that is not a meta-DB facet.
+describeAbilityPlacementContract('fake-server twin', async () => {
+  const projects = new InMemoryProjects()
+  const contextSets = new InMemoryContextSets()
+  const scopePins = new InMemoryScopePins()
+  const contextOrder = new InMemoryContextOrder()
+  const abilityPreferences = new FakeServerAbilityPreferences()
+  const sessions = new InMemoryAgentSessions()
+
+  return {
+    db: {
+      abilityPlacement: createFakeServerAbilityPlacement({
+        contextSets,
+        scopePins,
+        contextOrder,
+        abilityPreferences,
+        agentSessions: sessions,
+      }),
+      spaces: new InMemorySpaces(),
+      projects,
+      contextSets,
+      scopePins,
+      contextOrder,
+      abilityPreferences,
+      sessions,
+    },
+  }
+})
 
 describeRevisionPersistenceContract('in-memory twin', async () => {
   const persistence = new InMemoryRevisionPersistence()

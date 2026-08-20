@@ -84,11 +84,11 @@ export default defineConfig({
             recursive: true,
           })
 
-          const roleSource = new URL('./src/services/roles/catalog/', import.meta.url)
-          const roleDestination = new URL('./dist/role-catalog/', import.meta.url)
-          rmSync(roleDestination, { recursive: true, force: true })
-          mkdirSync(roleDestination, { recursive: true })
-          cpSync(roleSource, roleDestination, { recursive: true })
+          const abilitySource = new URL('./src/services/roles/catalog/', import.meta.url)
+          const abilityDestination = new URL('./dist/catalog/', import.meta.url)
+          rmSync(abilityDestination, { recursive: true, force: true })
+          mkdirSync(abilityDestination, { recursive: true })
+          cpSync(abilitySource, abilityDestination, { recursive: true })
         })
       },
     },

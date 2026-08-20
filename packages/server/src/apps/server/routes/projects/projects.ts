@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify'
 
 import {
+  ABILITY_KIND,
   AgentContextQuerySchema,
   CONTEXT_KIND,
   MarkProjectRequestSchema,
@@ -14,7 +15,7 @@ import {
   RemoveResponseSchema,
 } from '@notarium/contract'
 import { HTTP_STATUS } from '@notarium/contract/http'
-import { folderPageFilePath } from '@notarium/core'
+import { decodeAbilityLocator, folderPageFilePath } from '@notarium/core'
 
 import { withAuthors } from '../../../../libs/authors'
 import { safeRelAddress, safeRelPath } from '../../../../libs/relPath'
@@ -24,7 +25,7 @@ import {
   renameProjectSlug,
   unmarkProject,
 } from '../../../../services/projects'
-import { weighRoleContext } from '../../../../services/roles'
+import { ROLE_SCOPE, weighRoleContext } from '../../../../services/roles'
 import {
   curateProjectScope,
   enqueueConditionalNotePin,
@@ -40,6 +41,7 @@ import {
   weighScopePins,
 } from '../../../../services/storeAccess'
 import { type ApiRouteCtx, authz, notFound, s } from '../_shared'
+import { contextRoleSummaryOf, roleContextViewOf } from '../wire'
 
 export const projectsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
   const { projects, markerStore, folders, spaces, spaceStoreFor, principalId } = ctx
@@ -308,7 +310,32 @@ export const projectsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => 
       // domain) embeds nothing.
       const personalSlug = await peekPersonalSpace({ auth, spaces }, req.principal)
       const personalStore = personalSlug ? await spaces.store(personalSlug) : null
-      const roleResolveContext = { personalSpace: personalSlug, project: rec }
+      // A personal space and its Space root are the same library, so a project living
+      // in the caller's own space must not answer with both links: the Space one is
+      // not a placement the effective chain ever visits.
+      const roleLocations = [
+        ...(personalSlug ? [{ scope: ROLE_SCOPE.personal, space: personalSlug } as const] : []),
+        ...(rec.space === personalSlug
+          ? []
+          : [{ scope: ROLE_SCOPE.space, space: rec.space } as const]),
+        { scope: ROLE_SCOPE.project, space: rec.space, projectId: rec.id } as const,
+      ]
+      const decodedRole = query.role ? decodeAbilityLocator(query.role) : null
+      const encodedRole =
+        decodedRole?.source === 'owned' && decodedRole.kind === 'role' ? decodedRole : null
+      const selectedRoleLocation = encodedRole
+        ? roleLocations.find(
+            (location) =>
+              location.scope === encodedRole.location.scope &&
+              location.space === encodedRole.location.spaceId &&
+              (location.scope !== ROLE_SCOPE.project ||
+                location.projectId ===
+                  (encodedRole.location.scope === ROLE_SCOPE.project
+                    ? encodedRole.location.projectId
+                    : undefined)),
+          )
+        : undefined
+      const selectedRoleLocator = selectedRoleLocation ? encodedRole : null
       const [personalTagPins, personalLoose, personalMemory, personalSets, personalOrder] =
         personalStore
           ? await Promise.all([
@@ -330,14 +357,26 @@ export const projectsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => 
           : [[], [], [], [], []]
       const [roleListing, selectedRole] = await Promise.all([
         roles
-          ? roles.listEffective(roleResolveContext)
-          : Promise.resolve({ roles: [], truncated: false }),
-        query.role && roles
-          ? roles.resolveEffective(roleResolveContext, query.role)
+          ? Promise.all(
+              roleLocations.map((location) =>
+                roles.listOwnedAbilitiesAt(location, req.principal, ABILITY_KIND.role),
+              ),
+            ).then((listings) => ({
+              abilities: listings.flatMap((listing) => listing.abilities),
+              truncated: listings.some((listing) => listing.truncated),
+            }))
+          : Promise.resolve({ abilities: [], truncated: false }),
+        selectedRoleLocation && selectedRoleLocator && roles
+          ? roles.addressedRoleStatus(
+              { personalSpace: personalSlug, project: rec },
+              req.principal,
+              selectedRoleLocator,
+            )
           : Promise.resolve(null),
       ])
-      const roleContext = selectedRole
-        ? await weighRoleContext(resolveDeps, req.principal, selectedRole)
+      // Weighed ONLY when the agent would load it here — see the personal door.
+      const roleContext = selectedRole?.active
+        ? await weighRoleContext(resolveDeps, req.principal, selectedRole.role)
         : undefined
       const curated = curateProjectScope(
         projectPins,
@@ -351,33 +390,25 @@ export const projectsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => 
         roleContext,
       )
       const roleView =
-        selectedRole && curated.role
-          ? selectedRole.location.scope === 'personal'
-            ? {
-                ...selectedRole.role,
-                pins: curated.role.pins,
-                sets: curated.role.sets,
-                loadedTokens: curated.role.loadedTokens,
-              }
-            : selectedRole.location.scope === 'space'
-              ? {
-                  ...selectedRole.role,
-                  space: spaces.slugOf(selectedRole.location.space) ?? selectedRole.location.space,
-                  pins: curated.role.pins,
-                  sets: curated.role.sets,
-                  loadedTokens: curated.role.loadedTokens,
-                }
-              : {
-                  ...selectedRole.role,
-                  space: spaces.slugOf(selectedRole.location.space) ?? selectedRole.location.space,
-                  project: projectSummaryOf(rec, spaces.slugOf(rec.space) ?? rec.space).handle,
-                  pins: curated.role.pins,
-                  sets: curated.role.sets,
-                  loadedTokens: curated.role.loadedTokens,
-                }
+        selectedRole?.active && selectedRoleLocator
+          ? roleContextViewOf(
+              selectedRole,
+              selectedRoleLocator,
+              (roleSpace) => spaces.slugOf(roleSpace) ?? roleSpace,
+              projectSummaryOf(rec, spaces.slugOf(rec.space) ?? rec.space).handle,
+              curated.role,
+            )
           : undefined
       return ProjectAgentContextResponseSchema.parse({
-        roles: roleListing.roles,
+        // A role this project cannot activate has no business being offered here: the
+        // picker must list what effective resolution would answer with, not every
+        // package that happens to sit in a readable location. A Space base narrowed
+        // away from this project resolves to nothing in it — and this call is the ONLY
+        // thing that says so on this door, so it is the only thing that can be wrong.
+        roles: roleListing.abilities.flatMap(({ ability }) => {
+          const role = contextRoleSummaryOf(ability, rec.id)
+          return role ? [role] : []
+        }),
         ...(roleListing.truncated ? { rolesTruncated: true } : {}),
         ...(roleView ? { role: roleView } : {}),
         pins: curated.pins,

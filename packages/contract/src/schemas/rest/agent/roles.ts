@@ -1,15 +1,22 @@
 import { z } from 'zod'
 
-import { ROLE_SCOPE } from '../../../consts/primitives'
+import { ABILITY_SOURCE, ROLE_SCOPE } from '../../../consts/primitives'
 import { enumValues } from '../../../libs/enumValues'
 import { ProjectSummarySchema } from '../../tools/primitives'
+import {
+  AuthoredSkillInstructionsSchema,
+  SkillDescriptionSchema,
+  SkillNameSchema,
+} from '../_fields'
+import {
+  AgentAbilityAvailabilitySchema,
+  AgentAbilitySummarySchema,
+  AuthoredAttachmentSchema,
+  OwnedRoleAbilityLocatorSchema,
+} from './abilities'
+import { AgentPackageLibraryPageSchema } from './packageLibrary'
 
-export const RoleNameSchema = z
-  .string()
-  .min(1)
-  .max(64)
-  .regex(/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/, 'lowercase alphanumeric with inner dashes')
-  .refine((name) => !name.includes('--'), 'consecutive dashes are not allowed')
+export const RoleNameSchema = SkillNameSchema
 
 export const RoleScopeSchema = z.enum(enumValues(ROLE_SCOPE))
 export const InstalledRoleScopeSchema = z.enum([
@@ -20,70 +27,60 @@ export const InstalledRoleScopeSchema = z.enum([
 
 export const RoleSummarySchema = z.object({
   name: RoleNameSchema,
-  description: z.string().min(1).max(1024),
+  title: z.string().trim().min(1).max(512),
+  description: SkillDescriptionSchema,
   scope: RoleScopeSchema,
   origin: z.string().max(128).optional(),
   originRevision: z.string().max(80).optional(),
 })
-export const EffectiveRoleSummarySchema = RoleSummarySchema.extend({
+/** What every role summary states about itself, with no placement in it. */
+const RoleFactsSchema = RoleSummarySchema.omit({ scope: true })
+
+/** The Owned arm: a role that LIVES somewhere the caller can address. */
+export const EffectiveOwnedRoleSummarySchema = RoleFactsSchema.extend({
+  source: z.literal(ABILITY_SOURCE.owned),
   scope: InstalledRoleScopeSchema,
-})
+}).strict()
+
+/** A role that ANSWERS in this context. A union on `source`, not an optional `scope`:
+ *  a System role ships with the host and has no placement, and the shape that demanded
+ *  one could not express it — which is how the resolver came to have no System link at
+ *  all while the taxonomy, the library surface and the docs all said it did. */
+export const EffectiveRoleSummarySchema = z.discriminatedUnion('source', [
+  // Strict on both arms, like the neighbouring inventory and skill shapes: without it
+  // the System arm silently accepts a `scope` it has no placement to put there, and a
+  // producer that invented one would never be caught.
+  RoleFactsSchema.extend({ source: z.literal(ABILITY_SOURCE.system) }).strict(),
+  EffectiveOwnedRoleSummarySchema,
+])
 
 export const RoleInventoryEntrySchema = z.discriminatedUnion('scope', [
-  RoleSummarySchema.extend({ scope: z.literal(ROLE_SCOPE.personal) }),
-  RoleSummarySchema.extend({ scope: z.literal(ROLE_SCOPE.space), space: z.string() }),
+  RoleSummarySchema.extend({ scope: z.literal(ROLE_SCOPE.personal), noteId: z.string().min(1) }),
+  RoleSummarySchema.extend({
+    scope: z.literal(ROLE_SCOPE.space),
+    space: z.string(),
+    noteId: z.string().min(1),
+  }),
   RoleSummarySchema.extend({
     scope: z.literal(ROLE_SCOPE.project),
     space: z.string(),
     project: z.string().min(1),
+    noteId: z.string().min(1),
   }),
 ])
 
 export const MeAgentRolesResponseSchema = z.object({
-  catalog: z.array(RoleSummarySchema),
-  roles: z.array(RoleInventoryEntrySchema),
+  items: z.array(
+    AgentAbilitySummarySchema.refine((ability) => ability.locator.kind === 'role', {
+      message: 'role inventory may only contain role locators',
+    }),
+  ),
   projects: z.array(ProjectSummarySchema),
   activeRole: RoleNameSchema.nullable(),
+  ...AgentPackageLibraryPageSchema,
   /** Honest bounded-view marker when the host has more role placements than one
    *  settings request may scan or return. */
   truncated: z.boolean().optional(),
-})
-
-export const AgentRoleDetailParamsSchema = z.object({ name: RoleNameSchema })
-
-export const AgentRoleDetailQuerySchema = z.discriminatedUnion('scope', [
-  z.object({ scope: z.literal(ROLE_SCOPE.catalog) }).strict(),
-  z.object({ scope: z.literal(ROLE_SCOPE.personal) }).strict(),
-  z.object({ scope: z.literal(ROLE_SCOPE.space), space: z.string().min(1) }).strict(),
-  z.object({ scope: z.literal(ROLE_SCOPE.project), project: z.string().min(1) }).strict(),
-])
-export const AgentRoleDetailRequestSchema = z.discriminatedUnion('scope', [
-  z.object({ name: RoleNameSchema, scope: z.literal(ROLE_SCOPE.catalog) }).strict(),
-  z.object({ name: RoleNameSchema, scope: z.literal(ROLE_SCOPE.personal) }).strict(),
-  z
-    .object({ name: RoleNameSchema, scope: z.literal(ROLE_SCOPE.space), space: z.string().min(1) })
-    .strict(),
-  z
-    .object({
-      name: RoleNameSchema,
-      scope: z.literal(ROLE_SCOPE.project),
-      project: z.string().min(1),
-    })
-    .strict(),
-])
-
-const RoleInstructionsSchema = z.string().max(262_144)
-
-export const AgentRoleDetailResponseSchema = z.object({
-  role: RoleSummarySchema.extend({ instructions: RoleInstructionsSchema }),
-  skills: z.array(
-    z.object({
-      name: RoleNameSchema,
-      description: z.string().min(1).max(1024),
-      instructions: RoleInstructionsSchema,
-    }),
-  ),
-  truncated: z.boolean(),
 })
 
 export const AddAgentRoleRequestSchema = z
@@ -109,12 +106,52 @@ export const AddAgentRoleRequestSchema = z
     }
   })
 
-export const AddAgentRoleResponseSchema = z.object({ role: RoleInventoryEntrySchema })
+export const AddAgentRoleResponseSchema = z.object({
+  role: RoleInventoryEntrySchema,
+  locator: OwnedRoleAbilityLocatorSchema,
+  versionToken: z.string(),
+})
+
+const CustomRoleFields = {
+  name: RoleNameSchema,
+  description: SkillDescriptionSchema,
+  instructions: AuthoredSkillInstructionsSchema,
+  attachments: z.array(AuthoredAttachmentSchema).max(64).optional(),
+}
+
+export const CreateAgentRoleRequestSchema = z.discriminatedUnion('scope', [
+  z.object({ ...CustomRoleFields, scope: z.literal(ROLE_SCOPE.personal) }).strict(),
+  z
+    .object({
+      ...CustomRoleFields,
+      scope: z.literal(ROLE_SCOPE.space),
+      space: z.string().min(1),
+      /** Optional, unlike a Skill's: "not stated" is the Space-wide reach a Space
+       *  role has always had, so every existing caller keeps meaning what it meant. */
+      availability: AgentAbilityAvailabilitySchema.optional(),
+    })
+    .strict(),
+  z
+    .object({
+      ...CustomRoleFields,
+      scope: z.literal(ROLE_SCOPE.project),
+      project: z.string().min(1),
+    })
+    .strict(),
+])
+
+export const CreateAgentRoleResponseSchema = z.object({
+  role: RoleInventoryEntrySchema,
+  noteId: z.string().min(1),
+  locator: OwnedRoleAbilityLocatorSchema,
+  versionToken: z.string(),
+})
 
 export type RoleSummary = z.infer<typeof RoleSummarySchema>
 export type EffectiveRoleSummary = z.infer<typeof EffectiveRoleSummarySchema>
 export type RoleInventoryEntry = z.infer<typeof RoleInventoryEntrySchema>
 export type MeAgentRolesResponse = z.infer<typeof MeAgentRolesResponseSchema>
 export type AddAgentRoleRequest = z.infer<typeof AddAgentRoleRequestSchema>
-export type AgentRoleDetailQuery = z.infer<typeof AgentRoleDetailQuerySchema>
-export type AgentRoleDetailResponse = z.infer<typeof AgentRoleDetailResponseSchema>
+export type AddAgentRoleResponse = z.infer<typeof AddAgentRoleResponseSchema>
+export type CreateAgentRoleRequest = z.infer<typeof CreateAgentRoleRequestSchema>
+export type CreateAgentRoleResponse = z.infer<typeof CreateAgentRoleResponseSchema>

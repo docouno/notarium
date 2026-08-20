@@ -12,7 +12,8 @@ Durable owner-scoped agent episodes and their delta positions live here too
 `mcp_delta_session_cursors`); they
 are not reconstructible from note files. Session positions are deleted with the
 episode; owner fallbacks survive episode retention and are removed with their
-project.
+project. Sparse System/Owned ability preferences are likewise owner state: an
+absent row means enabled and a retained row means disabled.
 The derived per-space search/index database has a different recovery contract:
 it may be discarded and rebuilt, so its migration mechanism is deliberately not
 unified with this one.
@@ -35,6 +36,12 @@ sqlite/0007_revision_purge_cas.sql
 sqlite/0008_causal_metadata.sql
 sqlite/0009_agent_activity.sql
 sqlite/0010_import_reservations.sql
+sqlite/0011_legacy_name_aliases.sql
+sqlite/0012_identity_settlement_lineage.sql
+sqlite/0013_agent_session_role_identity.sql
+sqlite/0014_ability_availability.sql
+sqlite/0015_ability_preferences.sql
+sqlite/0016_ability_placement_trail.sql
 postgres/0000_baseline.sql
 postgres/0001_agent_sessions.sql
 postgres/0002_agent_session_role.sql
@@ -46,6 +53,12 @@ postgres/0007_revision_purge_cas.sql
 postgres/0008_causal_metadata.sql
 postgres/0009_agent_activity.sql
 postgres/0010_import_reservations.sql
+postgres/0011_legacy_name_aliases.sql
+postgres/0012_identity_settlement_lineage.sql
+postgres/0013_agent_session_role_identity.sql
+postgres/0014_ability_availability.sql
+postgres/0015_ability_preferences.sql
+postgres/0016_ability_placement_trail.sql
 ```
 
 `0001_agent_sessions` introduces durable agent episodes and separates each
@@ -63,6 +76,131 @@ longer written by the gateway.
 `0002_agent_session_role` adds the nullable selected role name to each durable episode.
 `NULL` is the base mode. Role package content remains file truth in `.notarium/skills`; the
 meta-DB stores only the episode's current selection.
+
+`0009_agent_activity` adds the owner-global Activity projection and its stable event cursor.
+
+`0013_agent_session_role_identity` adds the nullable exact selection beside that public name:
+the canonical serialized `role_locator` and `role_context_project_id`. Same-context hydration
+reopens the exact Owned package across manifest rename and refuses a same-name replacement after
+deletion. A project context change resumes in base mode. Old rows with only `role` also hydrate in
+base mode until the user explicitly selects a role; there is no name-backed compatibility resolver.
+
+`0014_ability_availability` separates an ability's immutable Personal/Space home from the projects
+where it is effective. It is keyed by `(home_space, package_id)` and package ids never collide
+between roles and skills, so ONE pair of tables serves both kinds — the name says `ability`, not
+`skill`, for that reason. One row stores `all-projects` or `selected-projects`; selected project ids
+live in a child binding table and must belong to the home Space. Whole-set replacement and
+per-project grant serialize on the shared ordered lock plan in PostgreSQL and the matching immediate
+transaction in SQLite. Both refuse a write whose target is gone — the home Space purged or purging,
+or the registry note purged for good — in the same machine-readable shape (`ABILITY_TARGET_PURGED`)
+rather than as a driver's foreign-key code, and out of the same producer the preference facet uses
+(`services/metaDb/abilityLifecycle`): one lifecycle, one question, one answer. Sweeping the row is
+only half of an END; the fence is the other half, or the next write puts the row back on a
+`package_id` — a directory name, reusable by construction — that the next package installed there
+inherits. The fence is the NOTE's and never the directory's, for the same reason. The home Space is
+a plain column, like every other Space reference here: the `REFERENCES spaces(id)` it briefly
+carried was the only foreign key to `spaces` this schema has ever had, and its implicit `FOR KEY
+SHARE` inverted the tier-4 lock order against `purgeSpace` (see below). Project
+retype/delete and Space purge remove stale bindings, and permanent purge of the package's own
+registry note forgets the policy with it. That note is a SECOND key, stored beside the package id:
+a package directory is named by the durable id its manifest declares, but claim arbitration can
+leave the note carrying a different one, so the two are equal only until it runs. A row whose writer
+did not know the note id — and only such a row — is still swept by the package id, which is exactly
+the pre-arbitration answer. The policy is instance-local and never written into portable `SKILL.md`
+bytes.
+
+An absent row is not the same answer for both kinds. A Space Skill is a dependency a Role opts into,
+so absence reads as `selected-projects` with nothing selected — unavailable until stated. A Space
+Role applied everywhere in its Space before availability existed, so absence reads as `all-projects`:
+that default is what lets availability arrive without a data migration.
+
+`0015_ability_preferences` stores only disabled System/Owned overrides, keyed by owner plus the
+canonical exact locator. Catalog is excluded by TYPE, not by schema: a preference target is a System
+or Owned locator and nothing else, and the row has no `source` column to constrain — the earlier
+`CHECK` on one was dropped when this table was rewritten around the whole locator. The locator IS
+the key, so nothing it already spells — source, kind, package id, placement — is denormalised beside
+it. Owned rows carry the two keys the locator does not answer, the ones a lifecycle END is found by:
+stable Space and registry note, both present or both absent. A placement move rewrites the locator
+for every owner at once and can therefore name no prefix of the `(owner, locator)` primary key, so
+`ability_preferences_locator` indexes that column on its own, and `0016_ability_placement_trail`
+records where the address went (see the lock order below). Reversible note deletion keeps the row.
+Permanent note purge deletes rows for the exact registry note, while whole-Space purge deletes all
+rows for that Space. A concurrent disable cannot recreate an orphan: SQLite performs the lifecycle
+and purge-fence check in the same immediate transaction; PostgreSQL takes the Space and note revision
+locks before the same check and write. The lifecycle half of that check reads `space_lifecycle.phase`
+and not only the `spaces` row, because `purge-intent` is the one ended phase that still HAS a row —
+a Space sits in it for as long as a pinned restore keeps the sweep from starting, and a fence of
+`SELECT 1 FROM spaces` alone calls such a Space live. Both refuse in the same machine-readable shape
+(`ABILITY_TARGET_PURGED`), for either value of the flag — there is nothing to re-enable on a target
+that is gone for good, and the refusal is what lets a route answer "not found" instead of 500.
+
+The PostgreSQL lock order these tables join is stated and enforced in
+`services/metaDb/drivers/pg/lockOrder.ts`, not here; the shape of tier 4 is the part worth repeating
+because two transactions meet in it from opposite directions. The order is `folders` (L4f) →
+`ability_availability`/`ability_project_bindings` (L4a) → `ability_preferences` (L4p), below the
+whole revision tier. A whole-space purge arrives from above and drops the registry after the journal;
+an availability write reads the project rows it is about to bind BEFORE writing the binding. Both
+are one order only while `folders` outranks the ability tables — the other way round is a cycle, and
+PostgreSQL resolves cycles with `40P01`. Every `folders` lock is therefore a tiered lock, including
+the project parent row the agent delta cursors take.
+
+A FOREIGN KEY is a lock statement nobody writes, and the ladder cannot order what it cannot see:
+`INSERT`/`UPDATE` of the child takes `FOR KEY SHARE` on the parent row at whatever depth the child
+sits. That is why `spaces` is on `lockOrder`'s `NO_FOREIGN_KEY_MAY_POINT_AT` list and every other
+table names its Space with a plain column — `purgeSpace` holds the space row `FOR UPDATE` from
+inside tier 3 all the way down past `folders`, so a key from tier 4 makes each side hold what the
+other waits for. The schema is held to that list by a portable check over both dialects'
+migrations. Where a parent IS ordered the key is welcome: a binding's `folders` parent is L4f, above
+the L4a child that points at it, and the writer already holds those exact rows `FOR SHARE`.
+
+L4p is entered through an advisory rather than through a row lock, because its two writers cannot
+meet on a row: a disable writes an `(owner, locator)` that need not exist yet, and a placement move
+rewrites the `locator` column for every owner at once. Under READ COMMITTED the move's range
+`UPDATE` neither sees nor locks a row inserted after its snapshot, so without a key both sides can
+name the two pass through each other and one of the writes is simply lost. The key is the PACKAGE
+(`abilityPackageOfLocator`) and not the locator, because the locator is exactly what the move
+changes: a disable that still names the address the package has left has to reach the same stripe as
+the move that left it. The two sweeps of that table do not take it and cannot — they are keyed by
+the lifecycle columns and have no package to name, and the tier-3 stripes above already order them
+against the disable; both say so in their register entries instead.
+
+L2d is the same shape two tiers up, and for the same pair. `scopePins.addPin` inserts a row keyed by
+`(target_kind, target_id, note_id)` while the same move re-addresses every pin of a target by range,
+so the two are serialized on the TARGET or not at all — and "not at all" is a note the user pinned
+landing on the address the role has just left, where nothing but the opposite move will ever read it
+again. Its two sweeps (a settlement by note, a whole-Space purge by `target_space`) have no target to
+name and meet a pin writer on rows or above them.
+
+Two tables the same move re-addresses have no such key today, and that is a statement of where the
+schema stands rather than a claim that it does not matter. `context_set_attachments` (L2b) is written
+by `contextSets.attach`, a single autocommit statement that would have to become a registered
+transaction first — `pgTransactionRegistry.test.ts` records the level as helper-less for exactly that
+reason. `agent_sessions.role_locator` is outside the ladder altogether, and an episode that binds
+itself to the address the role is leaving resumes in base mode instead of with its role, which exact
+resume is fail-closed about by design.
+
+Serializing decides which of them goes first and nothing else, which is why `0016_ability_placement_trail`
+exists: whichever side loses, one of them computed an address before the other committed. The move is
+the only writer that knows both ends of the hop, so it records `from_locator → to_locator` (with the
+Space the row is swept by), and every read and write of an override resolves through it — a disable
+written at the address just left lands where the package IS, and a caller still holding the old
+spelling gets the same answer instead of "enabled". The trail is kept one hop deep by the move
+itself: a move INTO an address deletes the row pointing out of it, a move OUT of one re-points
+whatever pointed at it, so no reader ever walks a chain and a promotion undone by hand leaves no
+cycle. All three implementations of the port do this — both dialects and the in-memory twin — and
+the contract arc is `applies a disable written at the address the move has already left`.
+
+Which transactions must enter these levels through a helper is not prose: `LEVELS_NO_STATEMENT_CAN_ENTER`
+lists the levels no statement can enter by itself, and `pgTransactionRegistry.test.ts` holds every
+registered transaction that declares one of them to a helper call in its own body — statically, so a
+removed advisory turns red without a database. A sweep that has no key to name declares that fact,
+by level and with a reason, in its own register entry.
+
+Both ability writers therefore fence themselves ABOVE tier 4 instead, on the Space stripe (L3s) and,
+when the caller knows it, the registry note stripe (L3n) — the levels a whole-space purge and an
+exact note purge take first and hold to COMMIT. That is what makes the refusal honest rather than
+lucky: a writer that passes the fence cannot be running while a purge decides, and one that arrives
+after it waits, reads the fence the purge left, and answers `ABILITY_TARGET_PURGED`.
 
 `0006_revision_state` adds nullable `note_revisions.snapshot_format`. Its original
 complete rows use `markdown-v1`; existing rows remain `NULL` and are read as legacy
@@ -205,7 +343,7 @@ Role context presets reuse the baseline's existing `context_set_attachments`,
 `context_scope_pins`, and `context_order` tables with `target_kind='role'`. No new migration is
 required: `target_kind` is deliberately text without a closed SQL `CHECK`, and both drivers already
 key every facet by `(target_kind,target_id)`. The opaque role target id deterministically encodes
-the exact owned placement's scope, stable space/project owner id, and package name; `target_space`
+the exact owned placement's scope, stable space/project owner id, and immutable package id; `target_space`
 retains purge ownership. The application contract is the closed union
 `personal | project | role`, even though storage remains evolution-friendly text.
 

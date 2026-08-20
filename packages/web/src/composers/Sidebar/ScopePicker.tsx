@@ -1,7 +1,7 @@
 import { useRef, useState } from 'react'
 import type { ProjectRow } from '@notarium/contract'
 import { ContextMenu, type MenuItem } from '../../core/ContextMenu'
-import { IconBotMessage, IconFolderKanban, IconLayers, IconStar } from '../../core/Icons'
+import { IconFolderKanban, IconLayers, IconStar } from '../../core/Icons'
 import { cx } from '../../libs/cx/cx'
 import type { ExplorerScope } from '../../libs/tree/tree'
 import styles from './Sidebar.module.scss'
@@ -34,11 +34,9 @@ export const ScopePicker = ({
       ? 'Files'
       : scope.kind === 'projects'
         ? 'Projects'
-        : scope.kind === 'memory'
-          ? 'Memory'
-          : scope.kind === 'favorites'
-            ? 'Favorites'
-            : (focused?.displayName ?? 'Project')
+        : scope.kind === 'favorites'
+          ? 'Favorites'
+          : (focused?.displayName ?? 'Project')
   const items: MenuItem[] = [
     {
       label: 'Files',
@@ -53,13 +51,6 @@ export const ScopePicker = ({
       icon: <IconFolderKanban size={14} />,
       active: scope.kind === 'projects',
       onClick: () => onPick({ kind: 'projects' }),
-    },
-    {
-      label: 'Memory',
-      radioGroup: 'Explorer scope',
-      icon: <IconBotMessage size={14} />,
-      active: scope.kind === 'memory',
-      onClick: () => onPick({ kind: 'memory' }),
     },
     {
       label: 'Favorites',

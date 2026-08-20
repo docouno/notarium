@@ -13,6 +13,7 @@ import {
   type RevisionBlob,
   type RevisionDetail,
   type RevisionEntryRole,
+  revisionHasNoContent,
   RevisionHeadConflictError,
   type RevisionInput,
   type RevisionPersistence,
@@ -24,6 +25,7 @@ import {
   decodeDocumentState,
   DOCUMENT_STATE_FORMAT,
   documentSourceText,
+  type DocumentState,
   encodeDocumentState,
   LOGICAL_NOTE_STATE_FORMAT,
   logicalNoteState,
@@ -231,7 +233,28 @@ export class RevisionJournal {
         rev.stateFormat === DOCUMENT_STATE_FORMAT.opaque)
     ) {
       const bytes = typeof stored === 'string' ? new TextEncoder().encode(stored) : stored
-      const documentState = decodeDocumentState(bytes)
+      let documentState: DocumentState
+
+      try {
+        documentState = decodeDocumentState(bytes)
+      } catch (error) {
+        // The codec proves a stored row against a FRESH reading of its own source,
+        // so a refusal here is a statement about THIS reader: an analyzer that has
+        // since learned to read those bytes differently no longer reproduces the
+        // metadata the writer of the day recorded, and no retry ever will. What the
+        // caller can act on is only that the body is not obtainable — which is the
+        // answer this journal already has, and which its readers already handle:
+        // both restore surfaces raise this very error one line later when `content`
+        // comes back null, and the deleted view degrades to none. Letting the raw
+        // codec error escape instead reached the one reader that maps errors to a
+        // status — the revision-detail door — as an unclassified fault, so an
+        // ordinary request for an old revision answered 500. The cause stays in the
+        // log (the server's handler prints it), never on the wire.
+        const refusal = revisionHasNoContent(revisionId)
+
+        refusal.cause = error
+        throw refusal
+      }
       const sourceText = documentSourceText(documentState)
       const projection = documentState.projection
       return {

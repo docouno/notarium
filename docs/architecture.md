@@ -179,20 +179,26 @@ A placement layer by the "range" of a value — the rule for where to write a do
 - **web `consts.ts` per feature folder** — UI-local values (storage keys, route segments, panel dimensions).
 - **A backend module-top `const X_MS = …`** — allowed only for single use inside one file.
 
-A domain enum's value is taken from a const object (`NOTE_CLASS.userDoc`), not a raw literal — greppability, a safe rename, no silent drift where TS does not check the value (a log, a string DB column). A cross-package enum needed by `core` and `contract` lives as TWO independent copies (P8 decoupling), reconciled by the gate [`test/enumDrift.test.ts`](../test/enumDrift.test.ts).
+A domain enum's value is taken from a const object (`NOTE_CLASS.userDoc`), not a raw literal — greppability, a safe rename, no silent drift where TS does not check the value (a log, a string DB column). A cross-package enum needed by `core` and `contract` lives as TWO independent copies (P8 decoupling), reconciled by the gate [`test/enumDrift.test.ts`](../test/enumDrift.test.ts). That gate covers three things, not one: enums that must be identical copies (same key set, same values); the two subset relations that are deliberate and are asserted AS subsets so the omission cannot read as drift (`RESOLVED_VIA` — core's `current` never crosses the graph-health wire; `IF_EXISTS` — `overwrite` is kept off the wire, a security poka-yoke, not tidiness); and, since #309, a duplicated SHAPE — core's hand-written `isAbilityLocator` predicate must answer exactly what contract's `AbilityLocatorSchema` parses, over a fixed table of accepted and rejected candidates. The predicate is hand-written and not a re-export because the SPA imports `@notarium/core` at RUNTIME: reading the shape from the wire schema would drag zod and every schema into the initial browser chunk — the same boundary the web fence states. **The decoupling is a RUNTIME one, and it is fenced on both sides.** `packages/core/package.json` declares a `@notarium/contract` dependency, and the single place that uses it (`libs/abilityLocator`) keeps it a type-only import, which erases at build. `no-restricted-imports` states that in lint for `packages/core/src/**` the same way it does for `packages/web/src/**`: a type import passes, a value import — the thing that would actually make the two packages one — does not. Core `consts.ts` files stay stricter still and take nothing from contract at all.
 
 ## Materialized refinements
 
 - **P11 / role libraries (#307):** the class registry adds `skill`: package truth in the hidden
-  `.notarium/skills` mount, excluded from every generic discovery surface and read only through the
-  role resolver. Markdown members participate in the current note versioning/replication path;
+  `.notarium/skills` mount, excluded from every generic discovery surface and read through the
+  role resolver or exact source-specific Agents → Abilities routes. Generic note-journal links use
+  `/n/<note-id>`; there is no parallel class-aware `/skill` resolver. Markdown members participate in
+  the current note versioning/replication path;
   auxiliary bytes remain outside the note journal but are retained verbatim by data backup and the
-  package-aware `scope=all` export. Personal/Space packages own the mount root; Project libraries
-  live under reserved `_projects/<encoded-project-id>/` so ids and package names cannot collide
-  without hiding Project Markdown from the mount's index walk.
-  A packaged read-only catalog is a different source outside workspace mounts; it
-  becomes effective only when a human copies a valid Agent Skills package into an owned
-  Personal/Space/Project library.
+  package-aware `scope=all` export. Personal/Space libraries own the mount root; Project libraries
+  under reserved `_projects/<encoded-project-id>/` contain roles only. Skills have one immutable
+  package in a Personal/Space home; Space project availability is durable meta-DB policy, not a
+  second physical package.
+  The packaged read-only inventory is outside workspace mounts and has two sources:
+  System abilities are effective by default, while Catalog templates become effective only after
+  a human copies a valid Agent Skills package into an Owned home — a Personal or Project library
+  for a role, a Personal or Space one for a skill; the Add request schema admits no other target.
+  Exact source/kind/package/location locators and the central principal-aware resolver prevent
+  source or access-policy fallback by name.
 
 ## Related
 

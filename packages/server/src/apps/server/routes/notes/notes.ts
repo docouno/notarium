@@ -112,6 +112,11 @@ export const notesRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
     if (!deriveNoteTitle(parsed.content ?? '', parsed.title)) {
       return missing(reply, 'title')
     }
+    if (parsed.description !== undefined) {
+      return reply
+        .code(HTTP_STATUS.BAD_REQUEST)
+        .send({ error: 'skill manifest fields require a skill package root' })
+    }
     let directory: string | undefined
 
     if (parsed.directory !== undefined) {

@@ -669,6 +669,33 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
           await client.query('DELETE FROM revision_blobs WHERE hash = $1', [h])
         }
       }
+      // Owner state of a package whose registry note is gone for good. The policy is
+      // keyed by the package DIRECTORY, so the note that ends it is a SECOND key —
+      // the directory is named by the id its manifest declared, and claim arbitration
+      // can leave the note carrying a different one, which is why migration 0015 gave
+      // the preference row both keys and 0014 gives the policy row both too. A row
+      // whose writer did not know the note id keeps the pre-arbitration answer, and
+      // only such a row: matching the package id for a row that HAS the key would
+      // forget a live policy whose directory happens to be named like some other
+      // purged note. Last in the transaction because these tables sit below the
+      // revision tier in the lock order. canon: docs/meta-db.md#source-of-truth
+      const purgedPolicy = `home_space = $1
+          AND (registry_note_id = ANY($2)
+               OR (registry_note_id IS NULL AND package_id = ANY($2)))`
+
+      await client.query(
+        `DELETE FROM ability_project_bindings
+          WHERE home_space = $1
+            AND package_id IN (
+              SELECT package_id FROM ability_availability WHERE ${purgedPolicy}
+            )`,
+        [space, ids],
+      )
+      await client.query(`DELETE FROM ability_availability WHERE ${purgedPolicy}`, [space, ids])
+      await client.query(
+        'DELETE FROM ability_preferences WHERE space_id = $1 AND registry_note_id = ANY($2)',
+        [space, ids],
+      )
       await client.query('COMMIT')
     } catch (err) {
       await client.query('ROLLBACK')

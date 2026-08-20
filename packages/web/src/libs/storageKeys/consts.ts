@@ -77,6 +77,17 @@ export const STORAGE_KEYS = {
   asideGroups: 'bm-aside-groups',
   /** Activity's Filters / Diagnostics group; separate from the note inspector layout. */
   activityAsideGroups: 'bm-activity-aside-groups',
+  /** Abilities discovery filters; separate from Activity's two-panel layout. */
+  packageLibraryAsideGroups: 'bm-package-library-aside-groups',
+
+  // ── Tab-scoped routed drafts ──────────────────────────────────────────────
+  /** Owned ability publication drafts. `+ encodeURIComponent(owner) + ':' + draftId`. */
+  abilityDraftPrefix: 'notarium:ability-draft:',
+
+  // ── Agents explorer (AgentsExplorerProvider) ──────────────────────────────
+  /** Dataset lens and collapsed groups, per owner + Space.
+   *  `[+ 'groups:'] + encodeURIComponent(owner) + ':' + spaceId`. */
+  agentsExplorerPrefix: 'notarium:agents-explorer:',
 
   // ── Hotkeys (libs/hotkeys/storage) ─────────────────────────────────────────
   /** Chosen hotkey preset id. */

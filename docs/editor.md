@@ -48,6 +48,35 @@ Final render: markers hidden, tables as a grid, images as previews. The third mo
 - **Edit / Preview is an orthogonal axis.** The **Preview** button in the topbar, in any mode, shows the note's final HTML render (the same one as in read mode), without saving. "How I work" (Source/WYSIWYM) and "edit/view" (Edit/Preview) are independent.
 - **The agent sees the same body.** An MCP agent reads and writes the same markdown as a human (P4) — the writing mode has nothing to do with it, it is purely client-side.
 
+## Routed Role and Skill authoring (#309)
+
+Owned Roles and Skills use the same global editing lifecycle as notes: one `EditingProvider`
+owns dirty state, router blocking, `beforeunload`, Save/Cancel hotkeys, preview, and the honest
+CAS conflict dialog. The ability surface changes the fields, not the lifecycle. It shows manifest
+name + description + raw Markdown instructions; a Role additionally shows its ordered exact Skill
+attachments. Generic note metadata (folder, slug, type, created date, tags) is hidden and omitted
+from ability saves, so editing instructions cannot accidentally rewrite it.
+
+A new ability is a routed document at `/agents/abilities/<roles|skills>/new/<draft-id>`. The URL
+carries the stable draft identity; a versioned `sessionStorage` record carries the authored body
+and creation settings under `(authenticated owner, draft-id)`. Reload restores only that exact
+pair. Publish removes the record and replaces the history entry with the returned exact Owned
+route; Cancel or confirmed discard removes it too. Logout, a mid-session 401, or a principal
+change clears the previous owner's records, so a shared browser never offers one user's draft to
+another.
+
+The first Save calls the Role/Skill publication operation because no package exists yet. Every
+later Owned Save goes through the ordinary id-addressed note update with its version token, so
+history, replication, CAS refusal, and explicit overwrite behavior stay common. Role attachment
+changes ride that same CAS write as an exact locator + complete ordered list. An unrelated body or
+manifest edit omits the attachment fields and therefore preserves legacy invalid raw tokens;
+explicit Detach removes them. Enabled state stays a one-shot kebab action outside authored dirty
+state, while where an ability belongs and how far it reaches are fields of the document and commit
+with its one Save. Covering anything other than exactly its own project is something only a Space
+home can do, so a Project-homed Role given a wider answer relocates to its Space home inside that
+same Save. Relocation is one-way: a package moves up to the Space, never down into a project or
+across to another one.
+
 ## Distraction-free: Focus and Typewriter (#118)
 
 On top of any writing mode sit two **independent writing aids** for long texts — they are orthogonal to both the triad (Source/WYSIWYM) and the Edit/Preview axis. Like a mode, these are pure decoration/scroll over an unchanged string: the bytes are not touched, the round-trip stays exact.

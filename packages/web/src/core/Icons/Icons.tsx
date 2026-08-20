@@ -259,12 +259,34 @@ export const IconBotMessage = (p: IconProps) => (
     <path d="M20 12h2" />
   </S>
 )
-// The personal-layer / Agents glyph (#13): an AI "sparkle" — distinct from the
-// brand (IconBrain) and from Files (IconLayers).
+// Abilities — Lucide `sparkles`, traced from the published path.
 export const IconSparkles = (p: IconProps) => (
   <S {...p}>
-    <path d="M12 3l1.7 4.6L18 9l-4.3 1.4L12 15l-1.7-4.6L6 9l4.3-1.4L12 3Z" />
-    <path d="M18.5 14l.8 2 2 .8-2 .8-.8 2-.8-2-2-.8 2-.8 .8-2Z" />
+    <path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z" />
+    <path d="M20 3v4" />
+    <path d="M22 5h-4" />
+    <path d="M4 17v2" />
+    <path d="M5 18H3" />
+  </S>
+)
+// Role — Lucide `drama`: a persona the agent adopts, distinct from the Agent itself.
+export const IconDrama = (p: IconProps) => (
+  <S {...p}>
+    <path d="M10 11h.01" />
+    <path d="M14 6h.01" />
+    <path d="M18 6h.01" />
+    <path d="M6.5 13.1c.9.8 2.1 1.2 3.3.9" />
+    <path d="M14.2 9.9c.8-.7 2-.9 3-.5" />
+    <path d="M4 5c4-2 8-2 12 0v6c0 5-3 8-6 9-3-1-6-4-6-9Z" />
+    <path d="M12 3c3-.8 6-.5 8 1v6c0 3.8-1.7 6.4-4 8" />
+  </S>
+)
+// Skill — Lucide `award`: a learned capability, not the umbrella Abilities sparkle.
+export const IconAward = (p: IconProps) => (
+  <S {...p}>
+    <circle cx="12" cy="8" r="5" />
+    <path d="M8.2 12 7 22l5-3 5 3-1.2-10" />
+    <path d="m10.3 8 1.1 1.1L14 6.5" />
   </S>
 )
 // A push-pin (#165): the «always-load» / pinned-note glyph — a literal pin, not a

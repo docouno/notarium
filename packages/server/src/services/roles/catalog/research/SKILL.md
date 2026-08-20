@@ -3,7 +3,9 @@ name: research
 description: Investigate an uncertain question and produce an evidence-backed decision. Use when the user asks to research, compare approaches, validate an assumption, or reduce uncertainty.
 metadata:
   notarium.kind: role
-  notarium.skills: "[[research-evidence]]"
+  notarium.source: system
+  notarium.package-id: ZME09f9AROG8
+  notarium.skills: "[[notarium-id:system:_55UeQqGnMrH|research-evidence]]"
 ---
 
 # Research

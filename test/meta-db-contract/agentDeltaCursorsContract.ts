@@ -33,6 +33,8 @@ const session = (
   lastSeenAt: '2026-08-04T10:00:00.000Z',
   calls: 1,
   role: null,
+  roleLocator: null,
+  roleContextProjectId: null,
 })
 
 const root = (owner: string, id: string): AgentDeltaCursorScope => ({

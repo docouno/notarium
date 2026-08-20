@@ -85,7 +85,7 @@ contains:
   mtimes, SHA-256 checksums, and the witnessed installation generation.
 
 Only Notarium-owned incomplete files are omitted: dot-named atomic note temps,
-exact `.<role>.install-<uuid>` role-package staging directories at a Personal/Space library root or
+exact `.<package-id>.install-<uuid>` role-package staging directories at a Personal/Space library root or
 an exact `_projects/<encoded-project-id>/` library root (one orphaned by a process death is reclaimed
 by the next install into that same library root, once it is more than an hour old),
 the import contour's own unpublished temps (`jobs/imports/<space>/<job>.import.part`
@@ -105,7 +105,9 @@ remains private to recovery and is not part of a user space export. `data/engine
 derived and omitted; it rebuilds after restore.
 
 This image-native backup covers the canonical one-root layout under `SPACES_ROOT`,
-including its default `.notarium/skills` mounts. An embedded host that configures
+including its ID-backed default `.notarium/skills/<package-id>` mounts. The package directory and
+materialized `notarium-id` remain stable when manifest names change, and the backup preserves both.
+An embedded host that configures
 a physical mount outside that root owns that adapter's backup/restore capability;
 the online archive cannot discover arbitrary external storage from filesystem paths.
 

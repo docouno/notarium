@@ -454,31 +454,20 @@ describe('localFs raw export', () => {
     const root = await mkroot()
     const files = createLocalFsFiles(root)
     const project = join(root, '_projects', 'cHJvamVjdA')
-    const temp = join(project, '.draft.install-550e8400-e29b-41d4-a716-446655440000')
+    const staging = '.AbCdefGhij_1.install-550e8400-e29b-41d4-a716-446655440000'
+    const temp = join(project, staging)
     await fs.mkdir(join(project, 'ready'), { recursive: true })
     await fs.mkdir(temp, { recursive: true })
     await fs.mkdir(join(project, 'ready', '.authored'), { recursive: true })
-    await fs.mkdir(
-      join(project, 'ready', 'assets', '.draft.install-550e8400-e29b-41d4-a716-446655440000'),
-      { recursive: true },
-    )
+    await fs.mkdir(join(project, 'ready', 'assets', staging), { recursive: true })
     await fs.writeFile(join(project, 'ready', 'SKILL.md'), 'published')
     await fs.writeFile(join(project, 'ready', '.authored', 'resource.bin'), Buffer.from([0, 255]))
-    await fs.writeFile(
-      join(project, 'ready', '.draft.install-550e8400-e29b-41d4-a716-446655440000'),
-      'authored file',
-    )
+    await fs.writeFile(join(project, 'ready', staging), 'authored file')
     await fs.writeFile(join(temp, 'SKILL.md'), 'partial')
     await fs.mkdir(join(root, '.notarium-fs-ops', 'strict-private'), { recursive: true })
     await fs.writeFile(join(root, '.notarium-fs-ops', 'strict-private', 'candidate'), 'private')
     await fs.writeFile(
-      join(
-        project,
-        'ready',
-        'assets',
-        '.draft.install-550e8400-e29b-41d4-a716-446655440000',
-        'resource.bin',
-      ),
+      join(project, 'ready', 'assets', staging, 'resource.bin'),
       'authored directory',
     )
     const exported = []
@@ -488,10 +477,10 @@ describe('localFs raw export', () => {
     }
 
     expect(exported.sort()).toEqual([
+      `_projects/cHJvamVjdA/ready/${staging}`,
       '_projects/cHJvamVjdA/ready/.authored/resource.bin',
-      '_projects/cHJvamVjdA/ready/.draft.install-550e8400-e29b-41d4-a716-446655440000',
       '_projects/cHJvamVjdA/ready/SKILL.md',
-      '_projects/cHJvamVjdA/ready/assets/.draft.install-550e8400-e29b-41d4-a716-446655440000/resource.bin',
+      `_projects/cHJvamVjdA/ready/assets/${staging}/resource.bin`,
     ])
   })
 

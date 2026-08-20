@@ -8,6 +8,9 @@ import {
   REVISION_LOCK_STRIPE_MASK,
 } from '../../packages/server/src/services/metaDb/drivers/pg/revisionLocks'
 import { PgMetaDb } from '../../packages/server/src/services/metaDb/pgMetaDb'
+import { describeAbilityAvailabilityContract } from './abilityAvailabilityContract'
+import { describeAbilityPlacementContract } from './abilityPlacementContract'
+import { describeAbilityPreferencesContract } from './abilityPreferencesContract'
 import { describeAgentDeltaCursorsContract } from './agentDeltaCursorsContract'
 import { describeAgentSessionsContract } from './agentSessionsContract'
 import { describeCausalMetadataContract } from './causalMetadataContract'
@@ -201,6 +204,21 @@ const rawAppendWithoutApplicationLocks = async (
 }
 
 describePostgres('live Postgres driver', SUITE, () => {
+  describeAbilityPreferencesContract('Postgres', async () => {
+    const testSchema = await createPostgresTestSchema('ability_preferences')
+    return { db: testSchema.db, teardown: testSchema.teardown }
+  })
+
+  describeAbilityAvailabilityContract('Postgres', async () => {
+    const testSchema = await createPostgresTestSchema('ability_availability')
+    return { db: testSchema.db, teardown: testSchema.teardown }
+  })
+
+  describeAbilityPlacementContract('Postgres', async () => {
+    const testSchema = await createPostgresTestSchema('ability_placement')
+    return { db: testSchema.db, teardown: testSchema.teardown }
+  })
+
   describeImportReservationsContract('Postgres', async () => {
     const testSchema = await createPostgresTestSchema('import_reservations')
 
@@ -860,6 +878,8 @@ describePostgres('live Postgres driver', SUITE, () => {
         lastSeenAt: '2026-08-04T10:00:00Z',
         calls: 1,
         role: null,
+        roleLocator: null,
+        roleContextProjectId: null,
       })
       // The owner row exists while the session row does not: getOrInit can leave
       // exactly this shape when a concurrent retype removes the materialised row
@@ -958,6 +978,8 @@ describePostgres('live Postgres driver', SUITE, () => {
         lastSeenAt: '2026-08-04T10:00:00Z',
         calls: 1,
         role: null,
+        roleLocator: null,
+        roleContextProjectId: null,
       })
       const scope = { owner: 'alice', session: { id: sessionId, parentId: null } }
       await testSchema.db.agentDeltaCursors.advance(scope, projectId, '10', '2026-08-04T10:01:00Z')

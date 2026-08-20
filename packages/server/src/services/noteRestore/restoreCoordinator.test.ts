@@ -20,6 +20,8 @@ import {
   type DocumentState,
   documentStateVersionToken,
   encodeDocumentState,
+  exactOwnerObservation,
+  FRONTMATTER_BYTE_CAP,
   type LOGICAL_NOTE_STATE_FORMAT,
   RESTORE_OPERATION_PHASE,
   type RestoreOperationPersistence,
@@ -1189,6 +1191,218 @@ describe('RestoreCoordinator eligibility', () => {
     await f.metaDb.close()
   })
 
+  it('restores a deleted skill revision whose matching owner field was not projected yet', async () => {
+    const sourceState = analyzeDocumentState({
+      source: new TextEncoder().encode(
+        `---\nnotarium-id: ${NOTE_ID}\nname: restore-captain\ndescription: Recoverable role.\nmetadata:\n  notarium.kind: role\n---\n\nKeep the package recoverable.\n`,
+      ),
+      role: DOCUMENT_ROLE.skillRoot,
+      pathFallbackTitle: 'SKILL',
+      skillDirectoryName: NOTE_ID,
+    })
+    expect(sourceState.provenance.claims).toEqual([])
+    const f = await fixture({
+      mode: 'trash',
+      targetPath: `${NOTE_ID}/SKILL.md`,
+      sourceState,
+      sourceClass: 'skill',
+    })
+    const result = await f.coordinator().execute(f.trashCommand)
+
+    expect(result).toMatchObject({ status: 'succeeded', noteId: NOTE_ID })
+    const restored = await readFile(join(roots[0], 'notes', f.targetPath), 'utf8')
+    expect(restored.match(/^notarium-id:/gm)).toHaveLength(1)
+    expect(restored).toContain('name: restore-captain')
+    await f.metaDb.close()
+  })
+
+  // The ordinary path, and the reason a hard refusal here was the wrong answer: a
+  // document imported from another vault carries the reserved keys with somebody else's
+  // values and no proof behind them. Restore settles the note's identity, so those
+  // fields are rewritten — the answer an ordinary save already gives them.
+  it('restores an ordinary note whose revision carries a foreign owner field', async () => {
+    const sourceState = analyzeDocumentState({
+      source: new TextEncoder().encode(
+        '---\ntitle: Imported\nnotarium-id: foreign-vault-id\nnotarium-created: 2019-05-05T00:00:00.000Z\n---\n\nimported body\n',
+      ),
+      pathFallbackTitle: 'note',
+    })
+
+    expect(sourceState.provenance.claims).toEqual([])
+    const f = await fixture({ mode: 'trash', sourceState })
+    const result = await f.coordinator().execute(f.trashCommand)
+
+    expect(result).toMatchObject({ status: 'succeeded', noteId: NOTE_ID })
+    const restored = await readFile(join(roots[0], 'notes', f.targetPath), 'utf8')
+
+    expect(restored.match(/^notarium-id:/gm)).toHaveLength(1)
+    expect(restored.match(/^notarium-created:/gm)).toHaveLength(1)
+    expect(restored).toContain(`notarium-id: ${NOTE_ID}`)
+    expect(restored).toContain(`notarium-created: ${CREATED_AT}`)
+    expect(restored).toContain('imported body')
+    await f.metaDb.close()
+  })
+
+  // The same import, one shape further out: the foreign reserved key carries a block
+  // value, so its analyzer range ends past the line break that terminates the entry.
+  // Rewriting that range in place pulled the following line — here the note's own
+  // identity line — onto the value, and the file it published was frontmatter no scan
+  // could read the note out of again.
+  it.each([
+    {
+      name: 'a block sequence',
+      frontmatter: 'title: Imported\ntags: [a]\nnotarium-created:\n  - 2019-05-05T00:00:00.000Z\n',
+    },
+    {
+      name: 'a nested map',
+      frontmatter: 'title: Imported\ntags: [a]\nnotarium-created:\n  at: 2019-05-05\n',
+    },
+    {
+      name: 'no value at all',
+      frontmatter: 'title: Imported\ntags: [a]\nnotarium-created:\n',
+    },
+  ])(
+    'restores an ordinary note whose foreign owner field carries $name',
+    async ({ frontmatter }) => {
+      const sourceState = analyzeDocumentState({
+        source: new TextEncoder().encode(`---\n${frontmatter}---\n\nimported body\n`),
+        pathFallbackTitle: 'note',
+      })
+
+      expect(sourceState.provenance.claims).toEqual([])
+      const f = await fixture({ mode: 'trash', sourceState })
+      const result = await f.coordinator().execute(f.trashCommand)
+
+      expect(result).toMatchObject({ status: 'succeeded', noteId: NOTE_ID })
+      const text = await readFile(join(roots[0], 'notes', f.targetPath), 'utf8')
+      const restored = new TextEncoder().encode(text)
+
+      // The next scan must still find the note, not mint a new identity for it.
+      expect(exactOwnerObservation(restored)).toEqual({ kind: 'claimed', id: NOTE_ID })
+      const reread = analyzeDocumentState({ source: restored, pathFallbackTitle: 'note' })
+
+      expect(reread.restoreSafety).toEqual({ status: 'safe' })
+      expect(reread.projection?.title).toBe('Imported')
+      expect(reread.projection?.frontmatter).toMatchObject({ tags: ['a'] })
+      expect(text.match(/^notarium-id:/gm)).toHaveLength(1)
+      expect(text.match(/^notarium-created:/gm)).toHaveLength(1)
+      expect(text).toContain(`notarium-id: ${NOTE_ID}`)
+      expect(text).toContain(`notarium-created: ${CREATED_AT}`)
+      expect(text).toContain('imported body')
+      await f.metaDb.close()
+    },
+  )
+
+  // A blank line inside frontmatter is legal YAML and ordinary in an imported vault.
+  // The raw parser drops it as a separator, so the analyzer's entry walk has to step
+  // over it — and restore is exactly the writer that turns a TRAILING blank into an
+  // INTERIOR one, because it appends the owner keys before the closing fence. Without
+  // the step-over the walk desynchronized there, every later range read as corrupt,
+  // the candidate degraded to opaque, and binding its owner proof threw out of
+  // prepare: the operation stayed `staged`, replayed the same throw on every retry,
+  // and pinned the whole space against archive and purge forever.
+  it.each([
+    { name: 'ends with', frontmatter: 'title: Historical\n\n' },
+    { name: 'separates its keys with', frontmatter: 'title: Historical\n\ntags: [vault]\n' },
+    { name: 'opens with', frontmatter: '\ntitle: Historical\n' },
+  ])('restores a note whose frontmatter $name a blank line', async ({ frontmatter }) => {
+    const sourceState = analyzeDocumentState({
+      source: new TextEncoder().encode(`---\n${frontmatter}---\nold body\n`),
+      pathFallbackTitle: 'note',
+    })
+    const f = await fixture({ mode: 'trash', sourceState })
+    const result = await f.coordinator().execute(f.trashCommand)
+
+    expect(result).toMatchObject({ status: 'succeeded', noteId: NOTE_ID })
+    const text = await readFile(join(roots[0], 'notes', f.targetPath), 'utf8')
+
+    expect(exactOwnerObservation(new TextEncoder().encode(text))).toEqual({
+      kind: 'claimed',
+      id: NOTE_ID,
+    })
+    expect(text).toContain('title: Historical')
+    expect(text).toContain('old body')
+    // Terminal, so nothing is left pinning the space.
+    expect(await f.metaDb.restoreOperations.listRecoverable('space-a')).toEqual([])
+    await f.metaDb.close()
+  })
+
+  // A note saved by a Windows editor, lifted out of a backup, or dropped into the
+  // directory by hand carries a UTF-8 BOM, and the frontmatter parser accepts one on
+  // purpose. Those three bytes stood between the analyzer's ranges and the bytes they
+  // named, so restore spliced the owner keys three bytes early — into the middle of the
+  // last authored entry. The two outcomes shared that single root and differed only in
+  // whether the wreckage still parsed: this one did, so the operation answered
+  // `succeeded` while the file it published had a mangled `z:` key and no `notarium-id`
+  // at all. `absent` is what the next scan reads there, which is a licence to mint a
+  // fresh identity for a note that already had one and leave every link to it dangling.
+  it.each([
+    { name: 'LF', marked: '\uFEFF---\ntitle: Historical\nx: 1\ny: 2\nz: 3\n---\nold body\n' },
+    { name: 'CRLF', marked: '\uFEFF---\r\ntitle: Historical\r\nz: 3\r\n---\r\nold body\r\n' },
+  ])(
+    'restores a byte-order-marked note without losing its identity ($name)',
+    async ({ marked }) => {
+      const sourceState = analyzeDocumentState({
+        source: new TextEncoder().encode(marked),
+        pathFallbackTitle: 'note',
+      })
+      const f = await fixture({ mode: 'trash', sourceState })
+
+      expect(sourceState.restoreSafety).toEqual({ status: 'safe' })
+      const result = await f.coordinator().execute(f.trashCommand)
+
+      expect(result).toMatchObject({ status: 'succeeded', noteId: NOTE_ID })
+      const published = new Uint8Array(await readFile(join(roots[0], 'notes', f.targetPath)))
+      const text = new TextDecoder('utf-8', { ignoreBOM: true }).decode(published)
+
+      expect(exactOwnerObservation(published)).toEqual({ kind: 'claimed', id: NOTE_ID })
+      // The mark is the file's encoding prologue: it stays exactly where it was, and the
+      // authored keys it used to shift are untouched.
+      expect(text.startsWith('\uFEFF---')).toBe(true)
+      expect(text).toContain('title: Historical')
+      expect(text).toContain('z: 3')
+      expect(text).toContain(`notarium-id: ${NOTE_ID}`)
+      expect(text).toContain(`notarium-created: ${CREATED_AT}`)
+      expect(text).toContain('old body')
+      expect(analyzeDocumentState({ source: published, pathFallbackTitle: 'note' })).toMatchObject({
+        restoreSafety: { status: 'safe' },
+        projection: { title: 'Historical' },
+      })
+      expect(await f.metaDb.restoreOperations.listRecoverable('space-a')).toEqual([])
+      await f.metaDb.close()
+    },
+  )
+
+  // The other half of the same rule: a candidate the analyzer HONESTLY cannot read
+  // back. This note's authored frontmatter sits exactly at the 64 KiB cap, so the two
+  // owner keys restore appends cross it and the candidate stops parsing at all. No
+  // retry can change that — so the refusal must be terminal and carry a failure code,
+  // instead of throwing out of prepare and leaving the operation in `staged`, a phase
+  // `listRecoverable` reports and space archive/purge refuses to pass.
+  it('refuses terminally when the restore candidate cannot be analyzed', async () => {
+    const sourceState = analyzeDocumentState({
+      source: new TextEncoder().encode(
+        `---\nx: ${'a'.repeat(FRONTMATTER_BYTE_CAP - 4)}\n---\nold body\n`,
+      ),
+      pathFallbackTitle: 'note',
+    })
+
+    expect(sourceState.restoreSafety).toEqual({ status: 'safe' })
+    const f = await fixture({ mode: 'trash', sourceState })
+    const result = await f.coordinator().execute(f.trashCommand)
+
+    expect(result).toMatchObject({ status: 'not-restorable', reason: 'candidate-is-unsafe' })
+    expect(await f.coordinator().execute(f.trashCommand)).toMatchObject({
+      status: 'not-restorable',
+      reason: 'candidate-is-unsafe',
+    })
+    expect(await f.metaDb.restoreOperations.listRecoverable('space-a')).toEqual([])
+    // The proof the space is free again: purge refuses to run while any restore
+    // operation is still nonterminal.
+    await f.metaDb.purgeSpace('space-a')
+    await f.metaDb.close()
+  })
+
   it.each([
     {
       name: 'an honest content gap',
@@ -1306,6 +1520,40 @@ describe('RestoreCoordinator eligibility', () => {
     await f.metaDb.close()
   })
 
+  // Captured tags are serialized as a block list, so the base this path plans against
+  // holds `tags:` over its own lines — the same shape an imported vault writes. The
+  // projection channel has to land on that shape too, or the only note it can recreate
+  // is the one that never had a tag.
+  it('recreates a deleted note from a legacy partial row with captured tags', async () => {
+    const f = await fixture({
+      mode: 'trash',
+      sourceRecord: {
+        content: 'legacy trash body\n',
+        stateFormat: null,
+        title: 'Legacy trash title',
+        tags: ['alpha', 'beta'],
+        slug: 'legacy-slug',
+      },
+    })
+    const result = await f.coordinator().execute(f.trashCommand)
+
+    expect(result).toMatchObject({ status: 'succeeded', noteId: f.noteId })
+    const text = await readFile(join(roots[0], 'notes', f.targetPath), 'utf8')
+    const restored = analyzeDocumentState({
+      source: new TextEncoder().encode(text),
+      pathFallbackTitle: 'note',
+    })
+
+    expect(restored.restoreSafety).toEqual({ status: 'safe' })
+    expect(restored.projection?.title).toBe('Legacy trash title')
+    expect(restored.projection?.frontmatter).toMatchObject({
+      tags: ['alpha', 'beta'],
+      slug: 'legacy-slug',
+    })
+    expect(text).toContain('legacy trash body')
+    await f.metaDb.close()
+  })
+
   it('binds replay lookup to the actor without exposing another actor result', async () => {
     const f = await fixture()
     const first = await f.coordinator().execute(f.command)
@@ -1379,6 +1627,53 @@ describe('RestoreCoordinator eligibility', () => {
     },
   )
 
+  it('refuses a skill history rollback into a name occupied in the placement', async () => {
+    const sourceState = analyzeDocumentState({
+      source: new TextEncoder().encode(
+        '---\nname: occupied\ndescription: Historical name\n---\nHistorical instructions\n',
+      ),
+      role: DOCUMENT_ROLE.skillRoot,
+      pathFallbackTitle: 'SKILL',
+      skillDirectoryName: 'review',
+    })
+    const currentState = analyzeDocumentState({
+      source: new TextEncoder().encode(
+        '---\nname: current\ndescription: Current name\n---\nCurrent instructions\n',
+      ),
+      role: DOCUMENT_ROLE.skillRoot,
+      pathFallbackTitle: 'SKILL',
+      skillDirectoryName: 'review',
+    })
+    const f = await fixture({
+      targetPath: 'review/SKILL.md',
+      sourceState,
+      currentState,
+      sourceClass: 'skill',
+      currentClass: 'skill',
+    })
+    await mkdir(join(roots[0], 'notes', 'occupied-package'), { recursive: true })
+    await writeFile(
+      join(roots[0], 'notes', 'occupied-package', 'SKILL.md'),
+      '---\nname: occupied\ndescription: Existing package\n---\nInstructions\n',
+    )
+    const liveState = analyzeDocumentState({
+      source: await readFile(join(roots[0], 'notes', 'review', 'SKILL.md')),
+      role: DOCUMENT_ROLE.skillRoot,
+      pathFallbackTitle: 'SKILL',
+      skillDirectoryName: 'review',
+    })
+    expect(documentStateVersionToken(liveState)).toBe(f.command.versionToken)
+
+    expect(await f.coordinator().execute(f.command)).toMatchObject({
+      status: 'conflict',
+      reason: 'skill-name-conflict',
+    })
+    await expect(
+      readFile(join(roots[0], 'notes', 'review', 'SKILL.md'), 'utf8'),
+    ).resolves.toContain('name: current')
+    await f.metaDb.close()
+  })
+
   it('requires a current valid skill root before restoring an auxiliary file', async () => {
     const sourceState = analyzeDocumentState({
       source: new TextEncoder().encode('---\ntitle: Guide\n---\nhistorical guide\n'),
@@ -1427,7 +1722,7 @@ describe('RestoreCoordinator eligibility', () => {
         .execute({ ...invalid.command, versionToken: invalidPackageToken }),
     ).toMatchObject({
       status: 'not-restorable',
-      reason: 'role-mismatch',
+      reason: 'skill-package-root-missing',
     })
     await invalid.metaDb.close()
   })
@@ -1516,13 +1811,13 @@ describe('RestoreCoordinator eligibility', () => {
     let rivalBlocked = false
     const authority = new Proxy(f.authority, {
       get: (target, property, receiver) => {
-        if (property === 'admitPackage') {
-          return async (...args: Parameters<SpaceResourceAuthority['admitPackage']>) => {
-            const lease = await target.admitPackage(...args)
+        if (property === 'admitSkillPlacement') {
+          return async (...args: Parameters<SpaceResourceAuthority['admitSkillPlacement']>) => {
+            const lease = await target.admitSkillPlacement(...args)
 
             if (args[2].startsWith('restore:')) {
               await target
-                .admitPackage('review', 'exclusive', 'rival-skill-root-write', {
+                .admitSkillPlacement('other-package/SKILL.md', 'exclusive', 'rival-skill-write', {
                   deadlineMs: 5,
                 })
                 .then(

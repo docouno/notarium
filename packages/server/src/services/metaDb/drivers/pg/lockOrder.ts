@@ -1,3 +1,4 @@
+import type { PoolClient } from 'pg'
 // The ONE statement of PostgreSQL lock order for this meta-DB, and — with
 // `revisionLocks` — the ONLY module allowed to take a tiered lock at all. SQLite needs
 // none of this: it has a single writer, so nothing here applies to it.
@@ -17,6 +18,14 @@
 //   L2a  `favorites` → L2b `context_set_attachments` → L2c `context_sets` →
 //   L2d  `context_scope_pins` → L2e per-scope order advisory → L2f `context_order`
 //   L3m  wide-scan mutex → L3s/L3n/L3b space/note/blob stripes → L3t revision tables
+//   L4f  `folders` → L4a `ability_availability`/`ability_project_bindings` →
+//   L4p  `ability_preferences`
+//
+// Tier 4 is last because the two transactions that span it end there: a whole-space
+// purge drops the registry after the revision tier, and an availability write reads
+// the project rows it is about to bind BEFORE it writes the binding. Both directions
+// are one order only when `folders` outranks the ability tables — the other way round
+// is a cycle, and Postgres resolves cycles with `40P01`.
 //
 // Postgres cannot enforce an ordering, so the enforcement is ours and it is in two
 // halves, both required: ESLint keeps every tiered lock inside this module (a lock
@@ -26,8 +35,9 @@
 // the order for itself deadlocks against one that derived it differently.
 // canon: docs/core.md#identity · docs/note-history.md
 
-import type { PoolClient } from 'pg'
+import { type ABILITY_AVAILABILITY_MODE } from '@notarium/contract'
 
+import { abilityPackageOfLocator } from '../../abilityAddress'
 import type { ChainRow } from '../../revisionQuarantine'
 import type { ContextOrderRow, ContextSetRow, ScopePinRow } from '../../rows'
 
@@ -48,6 +58,9 @@ export const LOCK_LEVELS = [
   'L3n',
   'L3b',
   'L3t',
+  'L4f',
+  'L4a',
+  'L4p',
 ] as const
 
 export type LockLevel = (typeof LOCK_LEVELS)[number]
@@ -55,7 +68,8 @@ export type LockLevel = (typeof LOCK_LEVELS)[number]
 /** The level a statement belongs to when it MUTATES this table. DML is levelled by
  *  its target (`INSERT INTO|DELETE FROM|UPDATE <table>`), never by the table names it
  *  merely mentions in a subquery. A table absent from this map is outside the
- *  hierarchy and constrains nothing. */
+ *  hierarchy and constrains nothing OF ITS OWN — but a FOREIGN KEY pointing AT it
+ *  does, silently, and that edge is stated in `NO_FOREIGN_KEY_MAY_POINT_AT` below. */
 export const LOCK_LEVEL_OF_TABLE: Readonly<Record<string, LockLevel>> = {
   note_identity: 'L1',
   import_reservations: 'L1r',
@@ -68,7 +82,41 @@ export const LOCK_LEVEL_OF_TABLE: Readonly<Record<string, LockLevel>> = {
   note_revisions: 'L3t',
   revision_blobs: 'L3t',
   revision_purge_fences: 'L3t',
+  folders: 'L4f',
+  ability_availability: 'L4a',
+  ability_project_bindings: 'L4a',
+  ability_preferences: 'L4p',
+  // The trail a placement move leaves so an override written at the address it left
+  // still lands where the package is. Written and read under the same advisory, by the
+  // same two transactions, so it is the same level — not a level of its own.
+  ability_placement_trail: 'L4p',
 }
+
+/** Tables no FOREIGN KEY may point at, and the reason the ladder cannot survive one.
+ *
+ *  A foreign key is a lock statement nobody wrote: `INSERT`/`UPDATE` of the CHILD
+ *  takes `FOR KEY SHARE` on the PARENT row, at whatever moment the child is written,
+ *  which for a tier-4 child is the very bottom of the ladder. That is harmless while
+ *  the parent is either levelled here (the ladder then orders both ends: a binding's
+ *  `folders` parent is L4f, above the L4a child that points at it) or row-locked only
+ *  by transactions that hold NOTHING ELSE (`agent_sessions`, `oauth_clients`, `jobs`
+ *  — their holders take one row and commit, so they can close no cycle).
+ *
+ *  `spaces` is neither. `purgeSpace` takes the space row `FOR UPDATE` while it holds
+ *  tiers 1–3 and BEFORE it deletes `folders` (L4f) and the ability tables (L4a) below
+ *  it. A foreign key from a tier-4 table therefore inverts the pair: the writer holds
+ *  L4f and waits for the space row, the purge holds the space row and waits for L4f,
+ *  and Postgres answers `40P01`. Migration 0014 carried exactly that edge through
+ *  three review rounds — the only foreign key to `spaces` this schema has ever had, in
+ *  a meta-DB where every other table names its Space with a plain column. The pair
+ *  probe over it stayed green throughout, because the two sides were released from one
+ *  queue and the writer simply won the race; it takes a deadlock now.
+ *
+ *  So: model the table (give it a level and a helper here) or drop the key. The
+ *  schema is checked against this list by `test/meta-db-contract/pgTransactionRegistry.test.ts`,
+ *  which reads the migrations of BOTH dialects — SQLite has one writer and cannot
+ *  deadlock, but a schema that disagrees between dialects is its own defect. */
+export const NO_FOREIGN_KEY_MAY_POINT_AT: readonly string[] = ['spaces']
 
 /** The one place the hierarchy demands the PRESENCE of a lock rather than its order:
  *  the order overlay is rewritten DELETE-then-INSERT, so a writer that never entered
@@ -78,6 +126,34 @@ export const LOCK_LEVEL_OF_TABLE: Readonly<Record<string, LockLevel>> = {
 export const LOCK_LEVEL_REQUIRES: Readonly<Partial<Record<LockLevel, LockLevel>>> = {
   L2f: 'L2e',
 }
+
+/** The levels a statement cannot enter by BEING a statement.
+ *
+ *  At most levels the write is its own lock: an exact-key `INSERT`/`UPDATE` takes the
+ *  row it names, and two writers of that row meet on it whether or not either called a
+ *  helper. Here they do not meet at all. What excludes at these levels is a lock on a
+ *  KEY — an advisory, or the stripe standing in for a key set — and the writers pair
+ *  off on keys they can both name rather than on rows either of them holds: an
+ *  arbitration `INSERT` and a range `UPDATE` under READ COMMITTED are invisible to one
+ *  another, so a transaction that declares one of these levels and calls no helper of
+ *  this module holds NOTHING there. It is not out of order; it is unserialized, and
+ *  the loser of the race is a write that silently disappears.
+ *
+ *  That is why the register is held to this list transaction by transaction
+ *  (`pgTransactionRegistry.test.ts`): "the level has a helper somewhere" was true of
+ *  `L4p` while both of its call sites could be deleted with every portable test green.
+ *  A sweep with no key to name says so in its own register entry, by level and with a
+ *  reason — the exemption is a fact about that transaction, not a hole in the rule. */
+export const LEVELS_NO_STATEMENT_CAN_ENTER: readonly LockLevel[] = [
+  'L0j',
+  'L2d',
+  'L2e',
+  'L3m',
+  'L3s',
+  'L3n',
+  'L3b',
+  'L4p',
+]
 
 /** What a helper hands back about the lock it just took: the level it entered, the
  *  keys the entry declared, and the ones that turned out to exist. `declared` minus
@@ -101,6 +177,11 @@ const hold = (
 /** Namespaces the two-arg per-scope reorder lock so it can never alias the single-arg SETUP_LOCK_KEY. */
 const CONTEXT_ORDER_LOCK_NS = 0x6374_4f72 // 'ctOr'
 
+/** …and the pin advisory one level above it, on the SAME pair. Two namespaces because
+ *  they are two levels: a transaction that takes both takes them in ladder order, and
+ *  one that takes the pin lock alone must not be excluded by a reorder. */
+const SCOPE_PIN_LOCK_NS = 0x7363_5069 // 'scPi'
+
 const hash32 = (s: string): number => {
   let h = 0
 
@@ -111,9 +192,33 @@ const hash32 = (s: string): number => {
   return h
 }
 
-/** Keys the per-scope advisory lock; a hash collision merely serializes two unrelated scopes, never a correctness issue. */
-const contextOrderLockKey = (targetKind: string, targetId: string): number =>
+/** Keys a per-scope advisory lock — the pin level and the reorder level below it name
+ *  the same `(kind, id)` pair, so they hash it the same way and differ only in their
+ *  namespace. A hash collision merely serializes two unrelated scopes, never a
+ *  correctness issue. */
+const scopeLockKey = (targetKind: string, targetId: string): number =>
   hash32(`${targetKind}:${targetId}`)
+
+/** The advisory keys of a set of scopes, taken in one order by every caller of every
+ *  level that keys by a scope. */
+const takeScopeAdvisoryLocks = async (
+  client: PoolClient,
+  namespace: number,
+  scopes: ReadonlyArray<{ targetKind: string; targetId: string }>,
+): Promise<void> => {
+  const seen = new Set<number>()
+  // Sorted by the lock KEY, not by a rendered pair: the key is what Postgres orders
+  // on, so two callers agree even when different scopes hash alike, and a target id
+  // needs no separator escaping.
+  const keys = scopes
+    .map((scope) => scopeLockKey(scope.targetKind, scope.targetId))
+    .filter((key) => !seen.has(key) && seen.add(key))
+    .sort((left, right) => left - right)
+
+  for (const key of keys) {
+    await client.query('SELECT pg_advisory_xact_lock($1, $2)', [namespace, key])
+  }
+}
 
 // ── L0j · per-job import fence ───────────────────────────────────────────────
 
@@ -526,6 +631,157 @@ export const lockRestoreParentRow = async (
   return result.rows.length > 0
 }
 
+// ── L4f/L4a · ability availability ──────────────────────────────────────────
+
+/** Serialize replacement of one package's availability record. The advisory
+ * namespace cannot alias any other application lock; a hash collision only
+ * serializes unrelated packages. */
+export const lockAbilityAvailabilityPackage = async (
+  client: PoolClient,
+  homeSpace: string,
+  packageId: string,
+): Promise<void> => {
+  await client.query(
+    `SELECT pg_advisory_xact_lock(
+       hashtext('notarium:ability-availability'),
+       hashtext($1)
+     )`,
+    [JSON.stringify([homeSpace, packageId])],
+  )
+}
+
+/** L4f — the project rows whose membership validates a selected-project binding. The
+ *  share lock is what makes the check hold to COMMIT, and taking it here rather than
+ *  inline is what makes the level visible: a whole-space purge drops these same rows,
+ *  and the two orders have to be one order. */
+export const lockAbilityHomeProjects = async (
+  client: PoolClient,
+  homeSpace: string,
+  projectIds: readonly string[],
+): Promise<{ ids: string[]; lock: LockHold }> => {
+  const declared = [...new Set(projectIds)].sort()
+
+  if (!declared.length) {
+    return { ids: [], lock: hold('L4f', [], []) }
+  }
+  const result = await client.query(
+    `SELECT id FROM folders
+      WHERE type = 'project' AND space = $1 AND id = ANY($2::text[])
+      ORDER BY id
+      FOR SHARE`,
+    [homeSpace, declared],
+  )
+  const ids = (result.rows as Array<{ id: string }>).map(({ id }) => id)
+
+  return { ids, lock: hold('L4f', declared, ids) }
+}
+
+/** L4f — one project parent row, keyed exactly. The delta cursors take it so their
+ *  child rows are written under the same parent-first order a retype trigger and a
+ *  project delete take; it was an inline `FOR KEY SHARE` with a note saying `folders`
+ *  is "outside the note-identity hierarchy", which stopped being true the moment the
+ *  table became L4f. Nothing else about that transaction changes: it enters one level
+ *  and writes tables the hierarchy does not know. */
+export const lockProjectParentRow = async (
+  client: PoolClient,
+  projectId: string,
+): Promise<{ ids: string[]; lock: LockHold }> => {
+  const result = await client.query(
+    "SELECT id FROM folders WHERE id = $1 AND type = 'project' FOR KEY SHARE",
+    [projectId],
+  )
+  const ids = (result.rows as Array<{ id: string }>).map(({ id }) => id)
+
+  return { ids, lock: hold('L4f', [projectId], ids) }
+}
+
+/** L4a — the optional current availability row, after its package advisory lock. */
+export const lockAbilityAvailabilityRow = async (
+  client: PoolClient,
+  homeSpace: string,
+  packageId: string,
+): Promise<{
+  mode:
+    | typeof ABILITY_AVAILABILITY_MODE.allProjects
+    | typeof ABILITY_AVAILABILITY_MODE.selectedProjects
+    | undefined
+  lock: LockHold
+}> => {
+  const key = `${homeSpace}:${packageId}`
+  const result = await client.query(
+    `SELECT mode FROM ability_availability
+      WHERE home_space = $1 AND package_id = $2
+      FOR UPDATE`,
+    [homeSpace, packageId],
+  )
+  const row = result.rows[0] as
+    | {
+        mode:
+          | typeof ABILITY_AVAILABILITY_MODE.allProjects
+          | typeof ABILITY_AVAILABILITY_MODE.selectedProjects
+      }
+    | undefined
+
+  return { mode: row?.mode, lock: hold('L4a', [key], row ? [key] : []) }
+}
+
+// ── L4p · ability preferences ───────────────────────────────────────────────
+
+/** Namespaces the per-package override lock; it can alias no other application key. */
+const ABILITY_PREFERENCES_LOCK_NS = 'notarium:ability-preferences'
+
+/** L4p — the PACKAGES a transaction may rewrite owner state for, and the only entry
+ *  this level has.
+ *
+ *  An advisory rather than a row lock, because the two writers of `ability_preferences`
+ *  cannot meet on a row at all. `setEnabled` writes one `(owner, locator)` that need
+ *  not exist yet; a placement move rewrites the `locator` COLUMN for every owner at
+ *  once and can therefore name no prefix of that primary key. Under READ COMMITTED the
+ *  move's range `UPDATE` neither sees nor locks a row inserted after its snapshot, so
+ *  without this the two simply pass through each other and one of the writes is lost.
+ *
+ *  Keyed by the PACKAGE (`abilityPackageOfLocator`) although the rows are keyed by the
+ *  locator, and that is the point: the locator is exactly what the move changes. A
+ *  locator key holds only while both sides spell the address the same way, and the
+ *  case this level exists for is the one where they do not — a disable that names the
+ *  address the package has just left has to reach the same stripe as the move that
+ *  left it, or it resolves its address forward (`ability_placement_trail`) with no lock
+ *  over the answer. The package is invariant under a move, so the package is the
+ *  stripe, and every transaction here needs exactly ONE key.
+ *
+ *  Sorted anyway, and the set is a set: a move takes both of its addresses, and two of
+ *  them mirrored would otherwise each hold the other's first key for Postgres to
+ *  resolve with `40P01`. Sorting keeps that impossible even if the two addresses ever
+ *  stop naming one package.
+ *
+ *  What it does NOT cover, on purpose: the two SWEEPS of this table
+ *  (`revisions.purgeNotes`, `pgMetaDb.purgeSpace`) are keyed by the lifecycle columns
+ *  and have no package to name. They are already ordered against `setEnabled` by the
+ *  tier-3 stripes its lifecycle fence takes first, which is why `LOCK_LEVEL_REQUIRES`
+ *  has no L4p entry — a presence rule here would be unsatisfiable for exactly the
+ *  transactions that do not need it. Both say so in their register entries instead,
+ *  where `pgTransactionRegistry.test.ts` holds every other transaction to the helper.
+ *
+ *  A hash collision only serializes two unrelated packages. */
+export const lockAbilityPreferencePackages = async (
+  client: PoolClient,
+  locators: readonly string[],
+): Promise<{ lock: LockHold }> => {
+  const declared = [...new Set(locators.map(abilityPackageOfLocator))].sort()
+
+  for (const packageKey of declared) {
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))', [
+      ABILITY_PREFERENCES_LOCK_NS,
+      packageKey,
+    ])
+  }
+
+  // An advisory key is never ABSENT — there is no row for it to be missing — so what
+  // this entry makes live is rule 3: a statement at L4p names a package declared here
+  // or it is a lock this transaction never took. Same shape as L0j, L2d and L2e.
+  return { lock: hold('L4p', declared, declared) }
+}
+
 export const lockOwnerProofRow = async <T>(
   client: PoolClient,
   noteId: string,
@@ -622,6 +878,43 @@ export const lockContextSetsMentioning = async (
 
 // ── L2d · context_scope_pins ─────────────────────────────────────────────────
 
+/** L2d — the TARGETS a transaction may pin a note at, or re-address every pin of.
+ *
+ *  An advisory rather than the row locks below it, and for the same reason `L4p` is
+ *  one: these two writers cannot meet on a row. `addPin` INSERTs a row keyed by
+ *  `(target_kind, target_id, note_id)` that need not exist yet; a placement move
+ *  rewrites `target_id` for every pin of a target at once and can name no note of it.
+ *  Under READ COMMITTED the move's range `UPDATE` neither sees nor locks a row
+ *  inserted after its snapshot, so without this the two pass straight through each
+ *  other — the pin lands on the target id the role has just LEFT, and nothing ever
+ *  sweeps `context_scope_pins` by target except the opposite move, so the note the
+ *  user pinned is gone from that role's context for good. The target is the one key
+ *  both sides can name, so the target is the stripe.
+ *
+ *  Sorted inside, because a move names TWO of them: two moves with mirrored pairs
+ *  would otherwise each hold the other's first key and Postgres would answer `40P01`.
+ *  The sort is the shared one, on the KEY, so this level and the reorder advisory a
+ *  level below agree about the order of the same pair.
+ *
+ *  What it does NOT cover, on purpose: the two sweeps of this table
+ *  (`identity.settleFileClaim` by note, `pgMetaDb.purgeSpace` by `target_space`) have
+ *  no target to name. Both meet a pin writer on rows or above it — the settlement on
+ *  the pin rows themselves, the purge on the Space row and the tier-3 stripes — which
+ *  is why their register entries declare the sweep rather than a helper. */
+export const lockScopePinTargets = async (
+  client: PoolClient,
+  targets: ReadonlyArray<{ targetKind: string; targetId: string }>,
+): Promise<{ lock: LockHold }> => {
+  await takeScopeAdvisoryLocks(client, SCOPE_PIN_LOCK_NS, targets)
+  const declared = [
+    ...new Set(targets.map((target) => `${target.targetKind}:${target.targetId}`)),
+  ].sort()
+
+  // An advisory key is never ABSENT — there is no row for it to be missing — so what
+  // this entry makes live is rule 3, exactly as at L0j, L2e and L4p.
+  return { lock: hold('L2d', declared, declared) }
+}
+
 /** L2d — every scope's pin of these notes, wherever it lives. The rows of BOTH sides
  *  of a re-key are taken together: the target's row is a merge partner, and filtering
  *  it out by `note_space` would leave the row the INSERT then collides with unlocked. */
@@ -676,29 +969,11 @@ export const lockScopePinsInScope = async (
 /** L2e — the per-scope context-order locks, sorted by scope. The overlay is
  *  rewritten DELETE-then-INSERT, and under READ COMMITTED two such transactions miss
  *  each other's committed rows and collide on the primary key. */
-const takeContextOrderScopeLocks = async (
-  client: PoolClient,
-  scopes: ReadonlyArray<{ targetKind: string; targetId: string }>,
-): Promise<void> => {
-  const seen = new Set<number>()
-  // Sorted by the lock KEY, not by a rendered pair: the key is what Postgres orders
-  // on, so two callers agree even when different scopes hash alike, and a target id
-  // needs no separator escaping.
-  const keys = scopes
-    .map((scope) => contextOrderLockKey(scope.targetKind, scope.targetId))
-    .filter((key) => !seen.has(key) && seen.add(key))
-    .sort((left, right) => left - right)
-
-  for (const key of keys) {
-    await client.query('SELECT pg_advisory_xact_lock($1, $2)', [CONTEXT_ORDER_LOCK_NS, key])
-  }
-}
-
 export const lockContextOrderScopes = async (
   client: PoolClient,
   scopes: ReadonlyArray<{ targetKind: string; targetId: string }>,
 ): Promise<{ lock: LockHold }> => {
-  await takeContextOrderScopeLocks(client, scopes)
+  await takeScopeAdvisoryLocks(client, CONTEXT_ORDER_LOCK_NS, scopes)
   const declared = [...new Set(scopes.map((scope) => `${scope.targetKind}:${scope.targetId}`))]
 
   return { lock: hold('L2e', declared, declared) }
@@ -732,7 +1007,7 @@ export const lockContextOrderScopesOfSpace = async (
     for (const scope of fresh) {
       held.set(`${scope.targetKind}:${scope.targetId}`, scope)
     }
-    await takeContextOrderScopeLocks(client, fresh)
+    await takeScopeAdvisoryLocks(client, CONTEXT_ORDER_LOCK_NS, fresh)
   }
   const keys = [...held.keys()]
 

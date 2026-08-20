@@ -11,7 +11,7 @@ import type { EditingContextValue } from './types'
 //    ensureCanLeaveDraft/guarded.
 // A tab close/reload still falls back to the browser's native beforeunload.
 
-export type { Ghost, EditingContextValue } from './types'
+export type { EditingContextValue, EditingSessionAdapter, Ghost } from './types'
 
 const EditingContext = createContext<EditingContextValue | null>(null)
 

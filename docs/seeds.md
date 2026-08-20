@@ -133,7 +133,9 @@ and for `security` — it parses the sanitized HTML into a live DOM and checks t
 |---|---|---|
 | `agent-context` | pins + personal/project memory + projects of varying density (#165), including the pinned `product/index.md` **Folder overview #311**; **heavy pins over budget + a `Budget Lab` space for all token-budget cases #208** (personal-trim, fits / squeeze / dominant / no-pins — nesting the personal set into project Q's budget); **cross-space context set #209** (`Frontend Canon` in the `Conventions` space, connected to project Product OS + personal) **+ cross-space loose pin #209** (`Security Baseline` from `Conventions`, pinned directly into Product OS + personal) — both resolve cross-space; **retrieval audit #243** (search/recall/get_note history: hits + a recurrent vocabulary-mismatch miss + frequent queries) | agent-memory, agent-audit, structure, note-classes, scale |
 | `agent-sessions` | Activity: active fork siblings, exact call vs audited read/write counts, declared/inferred attachment, `Outside sessions`, an archived snapshot whose lifecycle row was GC'd, a mixed history longer than one 50-row page, an equal-timestamp read/write cursor boundary, hostile and max-length unbroken labels, owner isolation, and distinct root/fork/owner delta positions | agent-sessions, agent-audit, auth, history |
-| `agent-roles` | five principals keep the boundary visible: Fresh is catalog-only; Bob owns an idle Personal fork; Maya owns switchable Personal `research`/`grooming` presets plus same-name Research Space + two Project forks; Robin can inspect the Team role read-only. Base Personal/Project pins remain visible, each placement has a distinct role pin, the Team Project role adds a set plus an oversized tail that trims under the shared `Role → Project → Personal` budget, and an active episode rehydrates `research`; Sergey remains the browsable real-stand owner | agent-roles, agent-sessions, auth, structure, scale |
+| `agent-roles` | five principals keep the boundary visible: Fresh is catalog-only; Bob owns an idle Personal fork; the default stand owner Sergey owns a Personal `release-reviewer` with distinct Base/Role pins plus editable Personal and Main-project Memory rows; Maya owns switchable Personal `research`/`grooming` presets plus same-name Research Space + two Project role forks. Its skill library has Personal and Space homes, `coder` bound to Team Alpha/Beta but not Gamma, an all-projects skill, a direct catalog fork with provenance, an exact-linked rename, a custom exact link, duplicate names, and a deleted package retained as a broken role reference. A long Custom role preserves authored body and carries one legacy malformed attachment for preserve-vs-detach editing; another owned role remains in Personal Trash. Robin can inspect the Team home read-only. Base Personal/Project pins remain visible, each role placement has a distinct pin, the Team Project role adds a set plus an oversized tail that trims under the shared `Role → Project → Personal` budget, and an active episode rehydrates `research` | agent-roles, agent-sessions, agent-memory, auth, structure, scale |
+| `agent-abilities-rich` | the same axis at VOLUME on the default login, where `agent-roles` proves boundaries with one placement each: Personal, Space and three Project role groups populated at once, BOTH inventories past both page sizes the surfaces use (the library's 24-row page and the explorer's 30-row page — 42 roles and 34 skills in the Product Space), a title long enough to force truncation everywhere it is listed, one display name deliberately held at two placements, a `launch-review` Space role narrowed to two of the Space's five projects with its own version in one of them, a version whose base was never created, and a Space skill fleet whose availability differs per project (all / one / several). It is also the case that seeds a catalog Add on a PROJECT placement — the one operation whose supporting package lands at a different home than the role itself (the Space) — and then edits that exact installed package through `source:'role-dependency'` + `roleTarget` + `renameTo`, so the role keeps an exact link to a skill whose name has since changed. The same pair a second time in a project of the owner's PERSONAL space, where the dependency's home is the personal library rather than a Space root — the one state that tells a seeder which answers "which space is personal" the way production does from one that answers `null` and publishes a link nothing can resolve. It also carries the attachment and preference states an OWNER produces rather than the library: a role attached where a skill belongs (`wrong-kind`), a Space role reaching the whole Space through a skill bound to one project (`unavailable`), and three Enable/Disable rows — an Owned role, an Owned skill and a System skill — with one of the two same-name `shared-reviewer` placements disabled and the other left alone | agent-roles, agent-memory, structure, auth, scale |
+| `agent-abilities-sparse` | the other end of the same axis: a first-run stand with System and Catalog plus exactly one Owned skill and no Owned role at all — the empty groups, the single-row group and the skeleton geometry that a fully populated stand can never show | agent-roles, structure, auth |
 | `memory-perf` | 2700 ordinary notes + 4 personal-memory categories + 1 project-partition sentinel; reproduces memory-mount scaling, partition isolation, and graph-inert memory links | agent-memory, note-classes, scale |
 | `import-thread` | one rich imported thread | import, content |
 | `import` | a multi-format layout (claude/chatgpt/memory-json) + backdated dates-as-data → Feed year-spread (#11/#223); plus `dropped/` — the states of a dragged-in `.md` archive whose OWN frontmatter was lifted (#280): authored tags + date, an Obsidian note titled by its file name with `aliases:` and plugin keys kept, a Jekyll post whose `title:` beats a differing body `# H1`, and a frontmatter-less note dated by the file's mtime; plus `vault/` — a Markdown TREE imported from a `.zip` (#302), its nested folders reproduced and its internal exact `[[notarium-id:…]]` links repointed at the COPIES (with a fenced-code copy left as authored) | import, content, activity |
@@ -317,6 +319,74 @@ token substitution. Duplicate `(note,date)` declarations must be byte-identical;
 incompatible duplicates fail, and combined cases namespace note dependencies while
 preserving declaration order.
 
+### Owned Agent Skill states
+
+`agentSkills` declares one Personal/Space `home` plus manifest intent, never a storage path or id.
+A Space home declares `availability:all-projects|selected-projects`; selected declarations name
+project references which each applier resolves to stable ids in the same Space. There is no
+Project-target compatibility form. A Custom declaration provides `name`, `description`, and
+optional instructions. `source:'catalog'` runs the direct Skill Add path and retains provenance;
+`source:'role-dependency'` instead selects the exact supporting package already installed by an
+earlier `agentRole` and cannot create a same-name substitute. Optional `roleTarget` addresses a
+different exact role placement without changing skill ownership — which is what a catalog Add on a
+PROJECT placement produces, since a project is no skill home and the dependency lands in the Space.
+Both are seeded by `agent-abilities-rich`, TWICE: once where the project sits in a shared Space
+(the dependency lands in that Space) and once where it sits in a project of the owner's PERSONAL
+space, where Personal is the space's own root and the dependency lands in the personal library
+instead. The second is not a repetition — it is the only seeded state in which a role with a
+dependency lives in a project of a personal space, and it is what keeps a seeder answering "no
+personal space" for such a placement visible: the Add then writes the role's only link as
+`[[notarium-id:space:…]]`, an address the locator seam refuses, while the seed still reports ok.
+Declared-but-unseeded is how an applier branch stays dead, so the pair is exercised by the same
+run that seeds the stand. `renameTo`, `linkedRole`, and
+`deleted` operations run in that order, making rename-stable links and a deleted broken reference
+durable fixture states without adding a product UI for role composition.
+
+`agentRoles` declares either the catalog Add path or `source:'custom'` with its complete authored
+instructions. Roles retain Personal/Space/Project placements; Custom creation supports all three.
+A Space target may declare `availability` in the same shape a Space skill does — it is refused on a
+Personal or Project target, which have no reach to narrow, and on a catalog Add, whose operation
+carries a destination and nothing else. `deleted:true` removes the exact published package through
+the same journaled directory operation, so the role is absent from inventory and present in Trash.
+`attachRole` attaches ANOTHER role by exact locator where a skill belongs — the one route to the
+`wrong-kind` attachment health — and resolves against a Personal or Space role declared earlier in
+the same Space.
+
+`agentAbilityPreferences` declares the owner Enable/Disable overrides. Each row names an owner and
+one ability: a System package by manifest name, an Owned one by the placement that published it.
+Catalog packages cannot be activated and are refused. The facet is sparse in the product and in the
+declaration alike — anything undeclared stays enabled, which is what an absent row means at
+runtime, and two owners may disagree about the same shared ability. Both stands resolve a
+declaration through ONE applier (`test/cases/applyAbilityPreferences.ts`), the way they already
+share the role, skill and availability appliers; a host supplies only its own clock and its own
+preference facet. The rows the REAL applier writes are read back out of the seeded meta-DB by
+`test/cases/agentRolesRealSeed.test.ts` — the count the seeder reports says nothing about what
+landed in them.
+
+The bundled inventory is part of every seeded stand: `research` plus `research-evidence` are
+System, while `grooming` plus `grooming-evidence` are Catalog. The `agent-roles` case combines that
+split with same-name Owned research placements, exact System lookup/toggle coverage, a renamed
+dependency, a missing dependency produced by permanent package deletion, and Space availability
+edges — including `launch-review`, a Space role reaching two of the five Team projects, which is
+the state a second copy used to stand in for, and `field-guide`, a project role with no Space base:
+the one shape a promotion can land without meeting its own name. The remapped default stand owner also receives `release-reviewer` plus a role-only pin, so
+manual QA can compare Base Context with an exact Role context without changing accounts. System
+packages are never copied or mutated by the seed appliers.
+
+Both appliers call the same `applyAgentSkillDeclarations` helper through production
+`RolesService`, `RoleLibrary`, and `KnowledgeStore` seams. Add/Create mints the note id first; the
+configured library derives the package directory from it. Subsequent rename/link/delete address
+that exact id and derive the package root from the live note, so neither `.notarium/skills` nor an
+embedded mount prefix leaks into the declaration. The fake RoleLibrary is backed by the same
+in-memory store as note routes; package and editor mutations therefore cannot diverge into two
+maps. Every seeded root is parsed as a valid Agent Skills manifest before publication.
+
+The direct recovery fixtures follow the same positional validity. `restore-states` keeps its
+opaque UTF-8 root invalid with an illegal manifest name, and `trash-recovery` keeps its imported
+helper opaque the same way, because that is the only route that carries the state: `description` is
+optional, so omitting it still projects a perfectly valid package, and a manifest name is not
+required to match its directory.
+
 - **+content edge case** → add a `Fragment` to `corpus/<feature>.ts`. It flows on its own
   into the reader cases + the coverage matrix + the honesty test.
 - **+case** → a new file in `cases/*` (exports a `CaseSpec` with `axes`) + a row in
@@ -335,15 +405,31 @@ preserving declaration order.
   Declared `revisionStates` are appended through the production revision persistence after
   the ordinary timeline, with the real note id, expected-head CAS, encoded bytes, semantic
   fingerprint and persisted restore safety.
+  Owned roles are applied through catalog/custom create and optional package delete before
+  `agentSkills`; the shared skill applier then performs Custom/direct catalog Add, exact dependency
+  rename/link, availability binding, and package delete mutations against the configured skill mount.
   Agent delta cursors resolve their declarative `throughNote` anchor to the real latest
   revision id only after the timeline exists, then advance through the production meta-DB
-  persistence. Zero edits to production code.
+  persistence. Declared Enable/Disable overrides are written last, against the exact
+  package ids the appliers just published — the facet is sparse, so only declared rows
+  exist and everything else stays enabled by absence. Zero edits to production code.
 - **Fake** (`caseToFixture`): a fold of the timeline → `Fixture` (a snapshot of live
   notes + activity rows); a note whose last op is `delete` — only a tombstone row.
   Declared `revisionStates` become the same encoded bytes (base64 only as the fixture
   carrier), format/fingerprint/safety and gap marker in the in-memory journal.
+  Agent packages are then applied to the live in-memory store, not a parallel package-only map.
   Meta-DB-only delta cursor declarations are intentionally real-applier-only; the fake has
-  no revision ids to which their semantic anchors could honestly resolve.
+  no revision ids to which their semantic anchors could honestly resolve. A session's exact
+  role locator is not carried in the fixture either — package ids are minted at publish
+  time, so the fake applier resolves it from the declared role name once the packages
+  exist, the same way the real seeder does.
+  Owner Enable/Disable rows ride along in `agentAbilityPreferences` and are applied
+  last, exactly as on the real stand — resolved against the ids the two appliers just
+  minted, and refused with the same `ability preference references an unpublished …`
+  when a declaration names a package nobody published. This used to be a caveat
+  ("the fake does not express Enable/Disable"), and it was the reason no browser gate
+  could START from a disabled ability — it could only click one off. Proven end to end
+  in `test/fake-server/seedCatalog.test.ts`.
 
 ## Deliberate caveats
 

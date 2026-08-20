@@ -11,12 +11,22 @@ describe('MCP role-summary curation', () => {
   it('keeps effective-role discovery inside its own token budget and reports truncation', () => {
     const input = Array.from({ length: 20 }, (_, index) => ({
       name: `role-${index}`,
+      title: `Role ${index}`,
       description: `Role ${index} ${'x'.repeat(900)}`,
+      source: 'owned' as const,
       scope: 'personal' as const,
     }))
     const result = curateRoleSummaries(input, 1_000)
     const charged = result.roles.reduce(
-      (total, role) => total + 64 + role.name.length + role.scope.length + role.description.length,
+      (total, role) =>
+        total +
+        64 +
+        role.name.length +
+        role.title.length +
+        // A System role has no placement to charge for; its SOURCE is what the budget
+        // counts instead, exactly as the producer does.
+        ('scope' in role ? role.scope.length : role.source.length) +
+        role.description.length,
       0,
     )
 
@@ -30,7 +40,9 @@ describe('MCP role-summary curation', () => {
   it('returns an alphabetic prefix when names alone exceed the budget', () => {
     const input = Array.from({ length: 100 }, (_, index) => ({
       name: `role-${String(index).padStart(3, '0')}-${'n'.repeat(45)}`,
+      title: `Role ${index}`,
       description: 'Description.',
+      source: 'owned' as const,
       scope: 'personal' as const,
     }))
     const result = curateRoleSummaries(input, 100)
@@ -45,7 +57,15 @@ describe('MCP role-summary curation', () => {
 
   it('marks a single abbreviated description and makes the abbreviation visible', () => {
     const result = curateRoleSummaries(
-      [{ name: 'one-role', description: 'x'.repeat(1_024), scope: 'personal' }],
+      [
+        {
+          name: 'one-role',
+          title: 'One role',
+          description: 'x'.repeat(1_024),
+          source: 'owned' as const,
+          scope: 'personal',
+        },
+      ],
       1_000,
     )
 
@@ -59,7 +79,15 @@ describe('MCP role-summary curation', () => {
     const markdown = renderSession(
       {
         profile: { memory: [], alwaysLoad: [] },
-        roles: [{ name: 'one-role', description: 'Abbreviated…', scope: 'personal' }],
+        roles: [
+          {
+            name: 'one-role',
+            title: 'One role',
+            description: 'Abbreviated…',
+            source: 'owned' as const,
+            scope: 'personal',
+          },
+        ],
         rolesTruncated: true,
         projects: [],
         toolsHelp: [],
@@ -93,7 +121,7 @@ describe('MCP role-summary curation', () => {
   it('marks unavailable-selector hints as bounded even with fewer than twenty visible roles', () => {
     expect(() =>
       assertRoleAvailable(
-        [{ name: 'one-role', description: 'One role.', scope: 'personal' }],
+        [{ name: 'one-role', title: 'One role', description: 'One role.', scope: 'personal' }],
         'missing-role',
         true,
       ),
@@ -109,7 +137,15 @@ describe('MCP role-summary curation', () => {
         personalSpace: async () => 'personal',
         roles: {
           listEffective: async () => ({
-            roles: [{ name: 'one-role', description: 'One role.', scope: 'personal' }],
+            roles: [
+              {
+                name: 'one-role',
+                title: 'One role',
+                description: 'One role.',
+                source: 'owned' as const,
+                scope: 'personal',
+              },
+            ],
             truncated: true,
           }),
         },

@@ -1,4 +1,5 @@
 import { CONTEXT_KIND } from '@notarium/contract'
+import { isGeneratedNoteId } from '@notarium/core'
 
 import type { Principal } from '../authz'
 import type {
@@ -13,7 +14,7 @@ import {
   weighScopeOrder,
   weighScopePins,
 } from '../storeAccess'
-import type { ResolvedEffectiveRole, RoleLocation } from './types'
+import type { ResolvedOwnedRole, RoleLocation } from './types'
 
 export type RoleContextTarget = {
   id: string
@@ -25,7 +26,7 @@ export type RoleContextTarget = {
 export type ParsedRoleContextTarget = {
   scope: RoleLocation['scope']
   ownerId: string
-  name: string
+  packageId: string
 }
 
 const roleOwnerId = (location: RoleLocation): string => {
@@ -40,41 +41,43 @@ const roleOwnerId = (location: RoleLocation): string => {
   return location.space
 }
 
-/** Stable identity of one owned Agent Skill placement. Scope + stable space/project id
- * + standard package name survives display-name, handle and project-path changes while
+/** The ONE spelling of a role context target id. Placement is part of the address —
+ * which is exactly why promoting a project version to the Space base has to MOVE the
+ * rows keyed by it instead of assuming they follow the package. */
+export const roleContextTargetIdOf = (location: RoleLocation, packageId: string): string =>
+  `${location.scope}:${encodeURIComponent(roleOwnerId(location))}:${packageId}`
+
+/** Stable identity of one owned Agent Role placement. Scope + stable space/project id
+ * + immutable package id survives role-name, handle and project-path changes while
  * keeping same-name Personal/Space/Project forks independent. */
 export const roleContextTargetOf = (
-  resolved: Pick<ResolvedEffectiveRole, 'location'> & { role: { name: string } },
-): RoleContextTarget => {
-  const ownerId = roleOwnerId(resolved.location)
-
-  return {
-    id: `${resolved.location.scope}:${encodeURIComponent(ownerId)}:${encodeURIComponent(resolved.role.name)}`,
-    space: resolved.location.space,
-    name: resolved.role.name,
-    location: resolved.location,
-  }
-}
+  resolved: Pick<ResolvedOwnedRole, 'location' | 'packageId'> & { role: { name: string } },
+): RoleContextTarget => ({
+  id: roleContextTargetIdOf(resolved.location, resolved.packageId),
+  space: resolved.location.space,
+  name: resolved.role.name,
+  location: resolved.location,
+})
 
 /** Best-effort decoder for management labels. Persistence treats target ids as opaque;
  * malformed/stale values stay safely undescribed instead of selecting another role. */
 export const parseRoleContextTarget = (id: string): ParsedRoleContextTarget | null => {
-  const [scope, ownerRaw, nameRaw, ...tail] = id.split(':')
+  const [scope, ownerRaw, packageId, ...tail] = id.split(':')
 
   if (
     tail.length > 0 ||
     !['personal', 'space', 'project'].includes(scope) ||
     !ownerRaw ||
-    !nameRaw
+    !packageId
   ) {
     return null
   }
 
   try {
     const ownerId = decodeURIComponent(ownerRaw)
-    const name = decodeURIComponent(nameRaw)
-
-    return ownerId && name ? { scope: scope as RoleLocation['scope'], ownerId, name } : null
+    return ownerId && isGeneratedNoteId(packageId)
+      ? { scope: scope as RoleLocation['scope'], ownerId, packageId }
+      : null
   } catch {
     return null
   }
@@ -93,7 +96,7 @@ type RoleContextDeps = {
 export const weighRoleContext = async (
   deps: RoleContextDeps,
   principal: Principal,
-  resolved: ResolvedEffectiveRole,
+  resolved: ResolvedOwnedRole,
 ) => {
   const target = roleContextTargetOf(resolved)
   const selector = { kind: CONTEXT_KIND.role, id: target.id } as const

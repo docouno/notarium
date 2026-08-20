@@ -39,6 +39,7 @@ type SpotlightItem = {
   createdAt: string | null
   noteType?: string
   snippet?: string
+  href?: string
 }
 
 type Section = { key: string; label: string; items: SpotlightItem[] }
@@ -82,6 +83,7 @@ export const Spotlight = ({ space, onClose }: { space: string; onClose: () => vo
       modifiedAt: n.modifiedAt,
       createdAt: n.createdAt,
       noteType: n.noteType,
+      href: n.href,
     }))
     return [{ key: 'recent', label: 'Recent', items }]
   }, [q, results, recent])
@@ -109,7 +111,7 @@ export const Spotlight = ({ space, onClose }: { space: string; onClose: () => vo
       if (!item) {
         return
       }
-      const href = noteRoute(item.id, effectiveSlug(item.slug, item.title))
+      const href = item.href ?? noteRoute(item.id, effectiveSlug(item.slug, item.title))
 
       if (!href) {
         return

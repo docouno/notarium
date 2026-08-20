@@ -25,6 +25,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { renameNoReplaceIfAvailable } from '@notarium/engine'
 import {
   createFsRoleLibrary,
+  InvalidSkillPackageError,
   type PublishDirectoryIfAbsent,
   type RoleLocation,
 } from '../../packages/server/src/services/roles'
@@ -33,8 +34,14 @@ import {
   ATOMIC_PUBLISH_GATE,
   atomicPublishAvailable,
   describeAtomicPublish,
+  itAtomicPublish,
 } from './atomicPublishGate'
-import { describeRoleLibraryContract, packageOf } from './roleLibraryContract'
+import {
+  describeRoleLibraryAddressCollisionContract,
+  describeRoleLibraryContract,
+  packageDirectoryOf,
+  packageOf,
+} from './roleLibraryContract'
 
 // Two entry points are wrapped, both delegating to the real ones: the suite has
 // to fail one specific cleanup and one specific walk. Everything else — the
@@ -116,7 +123,7 @@ const fingerprint = async (path: string): Promise<string> => {
 const orphanStaging = async (
   directory: string,
   ageMs: number,
-  name = 'wanted',
+  name = packageDirectoryOf('wanted'),
 ): Promise<string> => {
   const path = join(directory, `.${name}.install-${randomUUID()}`)
 
@@ -154,16 +161,23 @@ describeRoleLibraryContract(
   { gate: atomicPublishAvailable ? undefined : ATOMIC_PUBLISH_GATE },
 )
 
+describeRoleLibraryAddressCollisionContract(
+  'createFsRoleLibrary',
+  async () => ({ library: libraryAt(await mkmount()) }),
+  { gate: atomicPublishAvailable ? undefined : ATOMIC_PUBLISH_GATE },
+)
+
 describe('role library staging selection', () => {
   it('reserves the staging grammar only where a library root actually is', () => {
-    const staging = `.wanted.install-${randomUUID()}`
+    const packageDirectory = packageDirectoryOf('wanted')
+    const staging = `.${packageDirectory}.install-${randomUUID()}`
 
     expect(isReclaimableInstallStaging(staging, true)).toBe(true)
     expect(isReclaimableInstallStaging(`_projects/cHJvamVjdC1h/${staging}`, true)).toBe(true)
     // A package resource under that grammar is authored data, kept verbatim by
     // export and by backup.
-    expect(isReclaimableInstallStaging(`wanted/assets/${staging}`, true)).toBe(false)
-    expect(isReclaimableInstallStaging(`wanted/${staging}`, true)).toBe(false)
+    expect(isReclaimableInstallStaging(`${packageDirectory}/assets/${staging}`, true)).toBe(false)
+    expect(isReclaimableInstallStaging(`${packageDirectory}/${staging}`, true)).toBe(false)
     // So is a regular file or a symlink wearing the name.
     expect(isReclaimableInstallStaging(staging, false)).toBe(false)
     expect(isReclaimableInstallStaging('wanted', true)).toBe(false)
@@ -243,7 +257,7 @@ describe('role library publication capability', () => {
     // Content and location are decided without consulting the runtime at all, so
     // an unsupported host must not relabel either as "unavailable".
     await expect(absent.putIfAbsent(PERSONAL, packageOf('Bad Name', 'Owned.'))).rejects.toThrow(
-      /invalid Agent Skill package/i,
+      /invalid Agent Skill (?:package|manifest)/i,
     )
     await expect(
       createFsRoleLibrary({
@@ -266,10 +280,13 @@ describe('role library publication capability', () => {
       libraryPublishingWith(mount, publish).putIfAbsent(PERSONAL, packageOf('wanted', 'Owned.')),
     ).resolves.toBe(true)
     expect(publish).toHaveBeenCalledOnce()
-    expect(seen[0]![1]).toBe(join(mount, 'wanted'))
-    expect(seen[0]![0]).toMatch(/\/\.wanted\.install-/)
-    await expect(readFile(join(mount, 'wanted', 'SKILL.md'), 'utf8')).resolves.toContain('Owned.')
-    await expect(entriesOf(mount)).resolves.toEqual(['wanted'])
+    const directoryName = packageDirectoryOf('wanted')
+    expect(seen[0]![1]).toBe(join(mount, directoryName))
+    expect(seen[0]![0]).toContain(`/.${directoryName}.install-`)
+    await expect(readFile(join(mount, directoryName, 'SKILL.md'), 'utf8')).resolves.toContain(
+      'Owned.',
+    )
+    await expect(entriesOf(mount)).resolves.toEqual([directoryName])
   })
 
   it('keeps the whole read side working without any capability at all', async () => {
@@ -291,10 +308,12 @@ describe('role library publication capability', () => {
     const absent = libraryPublishingWith(mount, undefined)
 
     await expect(absent.listManifests(PERSONAL)).resolves.toMatchObject({
-      packages: [{ name: 'wanted' }],
+      packages: [{ directoryName: packageDirectoryOf('wanted') }],
     })
     await expect(absent.exists(PERSONAL, 'wanted')).resolves.toBe(true)
-    await expect(absent.getSkill(PERSONAL, 'wanted')).resolves.toMatchObject({ name: 'wanted' })
+    await expect(absent.getSkill(PERSONAL, 'wanted')).resolves.toMatchObject({
+      directoryName: packageDirectoryOf('wanted'),
+    })
   })
 
   it('lets an injected failure travel out unchanged, staging cleaned', async () => {
@@ -308,6 +327,155 @@ describe('role library publication capability', () => {
     ).rejects.toBe(failure)
     await expect(entriesOf(mount)).resolves.toEqual([])
   })
+})
+
+/** The refusals `movePackage` owes that only a real filesystem can state. The shared
+ *  contract asserts the floor every implementation of the port owes — never `true`,
+ *  nothing moved — because both doubles answer `false` where this library throws. The
+ *  SHAPE lives here, next to the identical shapes `putIfAbsent` already has, so the
+ *  production implementation is described by something rather than by nothing: until
+ *  this file existed, `movePackage` on disk was executed by no test at all. */
+describe('role library promotion refusals', () => {
+  it('refuses an address that is not an owned package address, touching nothing', async () => {
+    const mount = await mkmount()
+
+    mkdirMock.mockClear()
+    opendirMock.mockClear()
+
+    // Same refusal `putIfAbsent` makes about the same string, and for the same reason:
+    // a manifest NAME is not an address, and a promotion addressed by one would publish
+    // a directory this library never minted.
+    await expect(libraryAt(mount).movePackage(PROJECT, PERSONAL, 'wanted')).rejects.toBeInstanceOf(
+      InvalidSkillPackageError,
+    )
+    expect(mkdirMock).not.toHaveBeenCalled()
+    expect(opendirMock).not.toHaveBeenCalled()
+    await expect(entriesOf(mount)).resolves.toEqual([])
+  })
+
+  it('refuses two placements that are one, and a move across two spaces', async () => {
+    const mount = await mkmount()
+    const directoryName = packageDirectoryOf('wanted')
+
+    // Both are caller errors rather than an occupied destination, so neither is the
+    // `false` a caller answers by picking another name. Publishing a directory onto
+    // itself is not a move; two spaces are two note stores.
+    await expect(libraryAt(mount).movePackage(PROJECT, PROJECT, directoryName)).rejects.toThrow(
+      /two different placements/,
+    )
+    await expect(
+      libraryAt(mount).movePackage(PROJECT, { ...PERSONAL, space: 'elsewhere' }, directoryName),
+    ).rejects.toThrow(/cross spaces/)
+  })
+
+  it('refuses to promote, touching nothing, when composition carried no capability', async () => {
+    const mount = await mkmount()
+
+    mkdirMock.mockClear()
+    opendirMock.mockClear()
+
+    // A deployment that cannot move a pathname atomically has to say so before it
+    // touches anything — a promotion has no raceable fallback either.
+    await expect(
+      libraryPublishingWith(mount, undefined).movePackage(
+        PROJECT,
+        PERSONAL,
+        packageDirectoryOf('wanted'),
+      ),
+    ).rejects.toMatchObject({ code: 'ENOTSUP' })
+    expect(mkdirMock).not.toHaveBeenCalled()
+    expect(opendirMock).not.toHaveBeenCalled()
+    await expect(entriesOf(mount)).resolves.toEqual([])
+  })
+
+  it('keeps the pure refusals ahead of the capability one', async () => {
+    const mount = await mkmount()
+    const absent = libraryPublishingWith(mount, undefined)
+
+    // Address and placement are decided without consulting the runtime at all, so an
+    // unsupported host must not relabel either as "unavailable" — the mirror of the
+    // same ordering `putIfAbsent` keeps.
+    await expect(absent.movePackage(PROJECT, PERSONAL, 'wanted')).rejects.toBeInstanceOf(
+      InvalidSkillPackageError,
+    )
+    await expect(
+      absent.movePackage(PROJECT, PROJECT, packageDirectoryOf('wanted')),
+    ).rejects.toThrow(/two different placements/)
+  })
+
+  itAtomicPublish(
+    'waits for the placement lease a publication into the same destination holds',
+    async () => {
+      const mount = await mkmount()
+      const pkg = packageOf('wanted', 'Owned.')
+
+      // Seeded without an authority: the SOURCE is not what this case is about.
+      await expect(libraryAt(mount).putIfAbsent(PROJECT, pkg)).resolves.toBe(true)
+
+      let release: () => void = () => {}
+      const held = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      const asked: string[] = []
+      const authority = {
+        admitSkillPlacement: async (path: string) => {
+          asked.push(path)
+          await held
+          return { settle: () => {} }
+        },
+        admitPackage: async () => ({ settle: () => {} }),
+        // The reads this move makes on its way; only the leases are under test.
+        observe: async () => ({ kind: 'present', bytes: pkg.files.get('SKILL.md')! }),
+      }
+      const library = createFsRoleLibrary({
+        publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+        rootForSpace: () => mount,
+        resourcePrefixForSpace: () => '',
+        authorityForSpace: () => authority as never,
+      })
+      const move = library.movePackage(PROJECT, PERSONAL, pkg.directoryName)
+      const raced = await Promise.race([
+        move.then(() => 'moved'),
+        new Promise((resolve) => setTimeout(() => resolve('waiting'), 60)),
+      ])
+
+      // Personal and a Space root are ONE directory shared by every package in the
+      // placement — which is exactly why `putIfAbsent` serialises the name check and
+      // the publication on a PLACEMENT-wide lease rather than a per-package one. A
+      // promotion publishes into that same directory and owes the same lease; holding
+      // only the per-package ones lets a move and a publication both find the manifest
+      // name free and both take it.
+      expect(raced).toBe('waiting')
+      expect(asked).toEqual([`${pkg.directoryName}/SKILL.md`])
+      release()
+      await expect(move).resolves.toBe(true)
+    },
+  )
+
+  itAtomicPublish(
+    'refuses a destination name held by something that is not a package',
+    async () => {
+      const mount = await mkmount()
+      const library = libraryAt(mount)
+      const pkg = packageOf('wanted', 'Owned.')
+
+      await expect(library.putIfAbsent(PROJECT, pkg)).resolves.toBe(true)
+      // A bare file wearing the manifest name. It has no in-memory representation at all,
+      // which is exactly why this case cannot live in the shared contract — and it is the
+      // ordinary state of a mount a user also edits by hand.
+      const occupant = join(mount, 'wanted')
+
+      await writeFile(occupant, 'not a package')
+      const before = await fingerprint(occupant)
+
+      await expect(library.movePackage(PROJECT, PERSONAL, pkg.directoryName)).resolves.toBe(false)
+      await expect(fingerprint(occupant)).resolves.toBe(before)
+      // Refused, so the version is still the version: still in its project, and no
+      // half-published directory at the destination.
+      await expect(library.getByDirectory(PROJECT, pkg.directoryName)).resolves.not.toBeNull()
+      await expect(entriesOf(mount)).resolves.toEqual(['_projects', 'wanted'])
+    },
+  )
 })
 
 describeAtomicPublish('filesystem role library publication', () => {
@@ -341,7 +509,7 @@ describeAtomicPublish('filesystem role library publication', () => {
 
   it.each(OCCUPANTS)('refuses %s without touching it', async (_label, create) => {
     const mount = await mkmount()
-    const target = join(mount, 'wanted')
+    const target = join(mount, packageDirectoryOf('wanted'))
 
     await create(target)
     const before = await fingerprint(target)
@@ -373,7 +541,7 @@ describeAtomicPublish('filesystem role library publication', () => {
       const added = await library.putIfAbsent(
         { scope: 'personal', space: 'personal' },
         {
-          name: 'wanted',
+          directoryName: ${JSON.stringify(packageDirectoryOf('wanted'))},
           files: new Map(
             ${JSON.stringify(membersOf(marker))}.map(([name, content]) => [name, Buffer.from(content)]),
           ),
@@ -408,7 +576,7 @@ describeAtomicPublish('filesystem role library publication', () => {
         .sort(([left], [right]) => left.localeCompare(right)),
     ).toEqual(membersOf(markers[winner]!).sort(([left], [right]) => left.localeCompare(right)))
     // The losers neither replaced the winner's package nor left staging behind.
-    await expect(entriesOf(mount)).resolves.toEqual(['wanted'])
+    await expect(entriesOf(mount)).resolves.toEqual([packageDirectoryOf('wanted')])
   }, 15_000)
 
   it('leaves no staging of its own behind, after a success and after a conflict', async () => {
@@ -416,40 +584,39 @@ describeAtomicPublish('filesystem role library publication', () => {
     const library = libraryAt(mount)
 
     await expect(library.putIfAbsent(PERSONAL, packageOf('wanted', 'Owned.'))).resolves.toBe(true)
-    await expect(entriesOf(mount)).resolves.toEqual(['wanted'])
+    await expect(entriesOf(mount)).resolves.toEqual([packageDirectoryOf('wanted')])
     await expect(library.putIfAbsent(PERSONAL, packageOf('wanted', 'Second.'))).resolves.toBe(false)
-    await expect(entriesOf(mount)).resolves.toEqual(['wanted'])
+    await expect(entriesOf(mount)).resolves.toEqual([packageDirectoryOf('wanted')])
   })
 
-  it('keeps a conflict a defined answer when the staging cleanup itself fails', async () => {
+  it('rejects a name conflict before creating publication staging', async () => {
     const mount = await mkmount()
     const library = libraryAt(mount)
 
     await library.putIfAbsent(PERSONAL, packageOf('wanted', 'Occupant.'))
+    rmMock.mockClear()
     rmMock.mockRejectedValueOnce(
       Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' }),
     )
 
     await expect(library.putIfAbsent(PERSONAL, packageOf('wanted', 'Second.'))).resolves.toBe(false)
-    await expect(readFile(join(mount, 'wanted', 'SKILL.md'), 'utf8')).resolves.toContain(
-      'Occupant.',
-    )
-    const orphan = (await entriesOf(mount)).find((entry) => entry.startsWith('.wanted.install-'))
-
-    expect(orphan).toBeDefined()
-    const stale = new Date(Date.now() - 2 * STALE_MS)
-
-    await utimes(join(mount, orphan!), stale, stale)
+    await expect(
+      readFile(join(mount, packageDirectoryOf('wanted'), 'SKILL.md'), 'utf8'),
+    ).resolves.toContain('Occupant.')
+    expect(rmMock).not.toHaveBeenCalled()
+    await expect(entriesOf(mount)).resolves.toEqual([packageDirectoryOf('wanted')])
+    rmMock.mockReset()
+    rmMock.mockImplementation(actualFs.rm)
     await expect(library.putIfAbsent(PERSONAL, packageOf('second', 'Owned.'))).resolves.toBe(true)
-    await expect(lstat(join(mount, orphan!))).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
   it('reports an injected conflict as `false` and sweeps its own staging', async () => {
     const mount = await mkmount()
     const occupant = packageOf('wanted', 'Occupant.')
+    const directoryName = packageDirectoryOf('wanted')
 
     await expect(libraryAt(mount).putIfAbsent(PERSONAL, occupant)).resolves.toBe(true)
-    const before = await fingerprint(join(mount, 'wanted'))
+    const before = await fingerprint(join(mount, directoryName))
 
     await expect(
       libraryPublishingWith(mount, async () => false).putIfAbsent(
@@ -457,8 +624,8 @@ describeAtomicPublish('filesystem role library publication', () => {
         packageOf('wanted', 'Second.'),
       ),
     ).resolves.toBe(false)
-    await expect(fingerprint(join(mount, 'wanted'))).resolves.toBe(before)
-    await expect(entriesOf(mount)).resolves.toEqual(['wanted'])
+    await expect(fingerprint(join(mount, directoryName))).resolves.toBe(before)
+    await expect(entriesOf(mount)).resolves.toEqual([directoryName])
   })
 
   it('publishes into a space whose library root does not exist yet', async () => {
@@ -547,7 +714,7 @@ describeAtomicPublish('filesystem role library publication', () => {
       libraryAt(configuredMount).putIfAbsent(PROJECT, packageOf('wanted', 'Owned.')),
     ).resolves.toBe(true)
     await expect(
-      readFile(join(projectRoot(realMount), 'wanted', 'SKILL.md'), 'utf8'),
+      readFile(join(projectRoot(realMount), packageDirectoryOf('wanted'), 'SKILL.md'), 'utf8'),
     ).resolves.toContain('Owned.')
   })
 
@@ -582,17 +749,19 @@ describeAtomicPublish('filesystem role library publication', () => {
     it('never reaches published packages, sibling data or a reserved namespace', async () => {
       const mount = await mkmount()
       const root = rootOf(mount)
+      const wantedDirectory = packageDirectoryOf('wanted')
+      const otherDirectory = packageDirectoryOf('other')
 
-      await mkdir(join(root, 'wanted', 'assets'), { recursive: true })
-      await writeFile(join(root, 'wanted', 'SKILL.md'), 'published')
+      await mkdir(join(root, wantedDirectory, 'assets'), { recursive: true })
+      await writeFile(join(root, wantedDirectory, 'SKILL.md'), 'published')
       await mkdir(join(root, 'not-a-package'), { recursive: true })
       await mkdir(join(root, '_projects', 'cHJvamVjdC1i'), { recursive: true })
-      const twin = await orphanStaging(join(root, 'wanted', 'assets'), 2 * STALE_MS)
-      const stagedFile = join(root, `.wanted.install-${randomUUID()}`)
-      const stagedLink = join(root, `.other.install-${randomUUID()}`)
+      const twin = await orphanStaging(join(root, wantedDirectory, 'assets'), 2 * STALE_MS)
+      const stagedFile = join(root, `.${wantedDirectory}.install-${randomUUID()}`)
+      const stagedLink = join(root, `.${otherDirectory}.install-${randomUUID()}`)
 
       await writeFile(stagedFile, 'authored')
-      await symlink(join(root, 'wanted'), stagedLink)
+      await symlink(join(root, wantedDirectory), stagedLink)
       const stale = new Date(Date.now() - 2 * STALE_MS)
 
       await utimes(stagedFile, stale, stale)
@@ -612,17 +781,18 @@ describeAtomicPublish('filesystem role library publication', () => {
       for (const [entry, print] of before) {
         await expect(fingerprint(join(root, entry))).resolves.toBe(print)
       }
-      expect(await entriesOf(root)).toEqual([...before.keys(), 'other'].sort())
+      expect(await entriesOf(root)).toEqual([...before.keys(), otherDirectory].sort())
       await expect(lstat(twin)).resolves.toMatchObject({})
       await expect(readFile(stagedFile, 'utf8')).resolves.toBe('authored')
-      await expect(readlink(stagedLink)).resolves.toBe(join(root, 'wanted'))
+      await expect(readlink(stagedLink)).resolves.toBe(join(root, wantedDirectory))
     })
 
     it.each([
       ['regular file', async (path: string) => await actualFs.writeFile(path, 'authored')],
       [
         'symlink',
-        async (path: string, root: string) => await actualFs.symlink(join(root, 'wanted'), path),
+        async (path: string, root: string) =>
+          await actualFs.symlink(join(root, packageDirectoryOf('wanted')), path),
       ],
     ] as const)('keeps a %s that replaces a directory after opendir', async (_kind, replace) => {
       const mount = await mkmount()

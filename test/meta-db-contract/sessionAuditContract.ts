@@ -96,6 +96,8 @@ export const describeSessionAuditContract = (
         lastSeenAt: '2026-07-03T00:00:00.000Z',
         calls: 7,
         role: null,
+        roleLocator: null,
+        roleContextProjectId: null,
       })
       await facets.retrievals.append(
         retrieval({
@@ -231,6 +233,8 @@ export const describeSessionAuditContract = (
         lastSeenAt: '2026-07-03T00:00:00.000Z',
         calls: 2,
         role: null,
+        roleLocator: null,
+        roleContextProjectId: null,
       })
       await facets.sessions.insert({
         id: 'ses_writes',
@@ -242,6 +246,8 @@ export const describeSessionAuditContract = (
         lastSeenAt: '2026-07-01T00:00:00.000Z',
         calls: 2,
         role: null,
+        roleLocator: null,
+        roleContextProjectId: null,
       })
       await facets.retrievals.append(
         retrieval({

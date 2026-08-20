@@ -13,11 +13,27 @@ export type Ghost = {
   sources?: GhostSource[]
 }
 
+export type EditingSessionAdapter = {
+  /** Stable for one routed document/draft; repeated registration is idempotent. */
+  id: string
+  draft: Draft
+  canWrite: boolean
+  versionToken?: string
+  save: (payload: SaveInput, versionToken?: string) => Promise<unknown>
+  onSaved?: (result: unknown) => void | Promise<void>
+  /** Cleanup shared by explicit cancel and a confirmed navigation away. */
+  onDiscard?: () => void
+  /** Extra action for the explicit Cancel control only (for example, leave a draft route). */
+  onCancel?: () => void
+  discardMessage?: string
+}
+
 export type EditingContextValue = {
   isEditing: boolean
   draft: Draft | null
   editor: NoteDraftEditor
   saving: boolean
+  startSession: (adapter: EditingSessionAdapter) => void
   startNew: (directory?: unknown) => Promise<void>
   startEdit: () => void
   startFolderPageEdit: (folderPath: string, title: string) => Promise<void>

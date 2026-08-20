@@ -157,11 +157,11 @@ describe('deleted note detail wire', () => {
     {
       name: 'literal UTF-8',
       source: new TextEncoder().encode(
-        '---\nname: another-package\ndescription: mismatch\n---\n# literal **source**\n',
+        '---\nname: invalid--package\ndescription: invalid name\n---\n# literal **source**\n',
       ),
       expected: {
         encoding: 'utf8' as const,
-        data: '---\nname: another-package\ndescription: mismatch\n---\n# literal **source**\n',
+        data: '---\nname: invalid--package\ndescription: invalid name\n---\n# literal **source**\n',
       },
     },
     {
@@ -182,5 +182,53 @@ describe('deleted note detail wire', () => {
 
     expect(documentState.format).toBe('opaque-v1')
     expect(wire).toMatchObject({ content: '', source: expected, restoreAvailability: 'opaque' })
+  })
+})
+
+describe('live note detail wire', () => {
+  const live = (source: string, pathFallbackTitle: string): NoteContent => {
+    const documentState = analyzeDocumentState({
+      source: new TextEncoder().encode(source),
+      pathFallbackTitle,
+    })
+
+    return {
+      id: 'note-1',
+      title: documentState.projection?.title ?? pathFallbackTitle,
+      class: 'user-doc',
+      filePath: 'note.md',
+      content: documentState.projection?.body ?? '',
+      frontmatter: documentState.projection?.frontmatter ?? {},
+      documentState,
+      modifiedAt: null,
+      createdAt: null,
+      versionToken: 'version-1',
+    }
+  }
+
+  it('preserves a hidden authored H1 separately from the note identity title', () => {
+    const wire = NoteDetailResponseSchema.parse(
+      noteDetailToWire(live('# Authored title\n\nBody.\n', 'identity-title')),
+    )
+
+    expect(wire).toMatchObject({
+      title: 'Authored title',
+      documentTitle: 'Authored title',
+      content: 'Body.\n',
+    })
+  })
+
+  it('preserves the H1 coupled to frontmatter title', () => {
+    const wire = NoteDetailResponseSchema.parse(
+      noteDetailToWire(
+        live('---\ntitle: Authored title\n---\n\n# Authored title\n\nBody.\n', 'identity-title'),
+      ),
+    )
+
+    expect(wire).toMatchObject({
+      title: 'Authored title',
+      documentTitle: 'Authored title',
+      content: 'Body.\n',
+    })
   })
 })

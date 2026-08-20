@@ -6,6 +6,7 @@ import type {
   MutationOptions,
   NoteClass,
   NoteContent,
+  NoteMeta,
   TagMutationInput,
   TagMutationResult,
   WriteInput,
@@ -75,6 +76,26 @@ const normAuthoredDate = (v?: string): string | undefined => {
 /** How far `uniquify` will count before giving up and surfacing the collision. A
  *  folder holding fifty "Plans N" is a user problem, not a naming one. */
 const UNIQUIFY_LIMIT = 50
+
+type RemovalCapture = {
+  id: string
+  storagePath?: string
+  meta?: NoteMeta
+  inboundSources: string[]
+  lastContent: string | null
+  lastLogicalState: LogicalNoteState | null
+  lastDocumentState: DocumentState | null
+  lastTags?: string[]
+  lastClass?: NoteClass
+  lastTitle?: string
+  lastSlug?: string | null
+  /** The exact storage incarnation the capture observed — the removal must delete
+   *  THAT one, not whatever now sits at the path (#302). */
+  physicalIncarnation: NonNullable<NoteContent['physicalIncarnation']>
+  /** Deleting a note that owned legacy name aliases invalidates name-resolved edges
+   *  beyond its own inbound sources, so the graph re-derives wholesale. */
+  removesLegacyAliasOwner: boolean
+}
 
 const isCollision = (err: unknown): boolean =>
   (err as { reason?: string }).reason === STORE_ERROR_REASON.noteAlreadyExists
@@ -1003,6 +1024,10 @@ export class WriteEngine {
 
     const currentMeta = input.originalId ? this.host.snap.notes.get(input.originalId) : undefined
 
+    // Whether a file is the package ROOT is a mount-relative question and this layer holds
+    // full storage paths only — `<pkg>/references/SKILL.md` ends like a manifest and is an
+    // auxiliary. The engine answers it where the mount is known, and `preservePath` is how
+    // that answer arrives; a basename read here predicted a rename the engine did not make.
     if (
       currentPath &&
       (input.preservePath ||
@@ -1440,8 +1465,12 @@ export class WriteEngine {
       agent?: AgentWriteAttribution
     },
   ): Promise<void> {
-    if (!isCanonicalSafeRelativeAddress(path)) {
-      throw folderFailed('path must be a canonical public relative path')
+    if (
+      !(opts?.internalAddress
+        ? isCanonicalInternalRelativeAddress(path)
+        : isCanonicalSafeRelativeAddress(path))
+    ) {
+      throw folderFailed('path must be a canonical relative path')
     }
 
     return this.trashMutations.run({ prefixes: [TRASH_MUTATION_PREFIX] }, () =>
@@ -1461,11 +1490,29 @@ export class WriteEngine {
             // note into or out of this subtree. The prefix/source fence now keeps this set stable.
             const victims = this.noteIdsUnder(path)
 
-            for (const id of victims) {
-              await this.removeClaimed(id, opts)
-            }
             if (this.host.inner.removeDir) {
-              await this.host.inner.removeDir(path)
+              if (opts?.internalAddress) {
+                const captured: RemovalCapture[] = []
+
+                await this.host.inner.removeDir(path, {
+                  internalAddress: true,
+                  beforeDetach: async () => {
+                    for (const id of victims) {
+                      captured.push(await this.captureRemoval(id, true))
+                    }
+                  },
+                  afterDetach: async () => {
+                    for (const state of captured) {
+                      await this.removeClaimed(state.id, opts, state, true)
+                    }
+                  },
+                })
+              } else {
+                for (const id of victims) {
+                  await this.removeClaimed(id, opts)
+                }
+                await this.host.inner.removeDir(path)
+              }
               let directoryChanged = false
               this.host.afterNotesReady(() => {
                 directoryChanged = this.host.dirs.removeSubtree(path)
@@ -1516,13 +1563,10 @@ export class WriteEngine {
     return { noteIds, paths, prefixes: targetIds.map(linkTargetPrefix) }
   }
 
-  private async removeClaimed(
-    id: string,
-    opts?: { principal?: string; agent?: AgentWriteAttribution },
-  ): Promise<void> {
+  private async captureRemoval(id: string, resourceAdmitted = false): Promise<RemovalCapture> {
     const storagePath = this.pathFor(id)
     const meta = this.host.snap.notes.get(id)
-    const inboundSources = this.host.snap.sourceIdsTargeting([id])
+    const inboundSources = [...this.host.snap.sourceIdsTargeting([id])]
 
     // A repeated/stale delete must not manufacture a fresh tombstone after a
     // successful permanent purge. The live snapshot/path binding is the
@@ -1551,6 +1595,7 @@ export class WriteEngine {
     try {
       live = await this.host.inner.read(this.innerNoteKey(id, storagePath), {
         identityOnly: supportsExactIdentityAddress(this.host.inner),
+        ...(resourceAdmitted ? { resourceAdmitted: true } : {}),
       })
       lastContent = live.content
       lastLogicalState = exactLogicalState(live)
@@ -1580,19 +1625,63 @@ export class WriteEngine {
 
       id = record.id
     }
-    const removesLegacyAliasOwner = Boolean(
-      live.legacyNameAliases?.length || meta?.legacyNameAliases?.length,
-    )
+
+    return {
+      id,
+      storagePath,
+      meta,
+      inboundSources,
+      lastContent,
+      lastLogicalState,
+      lastDocumentState,
+      lastTags,
+      lastClass,
+      lastTitle,
+      lastSlug,
+      physicalIncarnation: live.physicalIncarnation,
+      removesLegacyAliasOwner: Boolean(
+        live.legacyNameAliases?.length || meta?.legacyNameAliases?.length,
+      ),
+    }
+  }
+
+  private async removeClaimed(
+    id: string,
+    opts?: { principal?: string; agent?: AgentWriteAttribution },
+    capture?: RemovalCapture,
+    physicallyDetached = false,
+  ): Promise<void> {
+    const state = capture ?? (await this.captureRemoval(id))
+    const {
+      storagePath,
+      meta,
+      inboundSources,
+      lastContent,
+      lastLogicalState,
+      lastDocumentState,
+      lastTags,
+      lastClass,
+      lastTitle,
+      lastSlug,
+      physicalIncarnation,
+      removesLegacyAliasOwner,
+    } = state
+
+    id = state.id
     const releaseGraphTransition = this.host.beginGraphTransition()
 
     try {
       // From the first physical mutation through the tombstone, snapshot removal,
       // exact-identity refresh and inbound re-derivation, no fresh graph surface
       // may observe the inner engine and read-model on opposite sides.
-      await this.host.inner.remove(this.innerNoteKey(id, storagePath), {
-        identityOnly: supportsExactIdentityAddress(this.host.inner),
-        expectedSource: live.physicalIncarnation,
-      })
+      // A package removal detaches the whole directory first, so its notes are
+      // already gone from storage by the time each one is journalled.
+      if (!physicallyDetached) {
+        await this.host.inner.remove(this.innerNoteKey(id, storagePath), {
+          identityOnly: supportsExactIdentityAddress(this.host.inner),
+          expectedSource: physicalIncarnation,
+        })
+      }
       // Tombstone the id↔path binding so the trash can restore the note into
       // its last folder. A bare engine's registry already holds it (storagePath);
       // an identity-capable engine (the in-memory fake) doesn't populate this
@@ -1623,7 +1712,7 @@ export class WriteEngine {
         content: lastContent,
         logicalState: lastLogicalState,
         documentState: lastDocumentState,
-        title: meta?.title ?? lastTitle ?? '',
+        title: lastDocumentState?.projection?.skill?.title ?? meta?.title ?? lastTitle ?? '',
         class: meta?.class ?? lastClass,
         // Prefer the live snapshot's slug, fall back to the read; undefined (a
         // cold-boot delete that read neither) carries the prior slug forward.

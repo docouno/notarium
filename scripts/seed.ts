@@ -51,20 +51,27 @@ import {
   hashPassword,
   healSpaceMarker,
   JOB_KIND_EXPORT,
-  loadBuiltinRoleCatalog,
+  loadBundledAbilityInventory,
   markFolderAsProject,
   mintOAuthAccessToken,
   mintOAuthRefreshToken,
+  ownedRoleLocator,
   renameProjectSlug,
   roleContextTargetOf,
   sha256,
   SpaceManager,
   type SpaceRecord,
+  SYSTEM_PRINCIPAL,
 } from '@notarium/server'
 
 import { buildCasesWorld, listCases } from '../test/cases'
-import type { CaseWorld, ContextSetAttachDecl, UserDecl } from '../test/cases'
+import type { AgentRoleTargetDecl, CaseWorld, ContextSetAttachDecl, UserDecl } from '../test/cases'
+import { applyAgentAbilityPreferences } from '../test/cases/applyAbilityPreferences'
+import { applyAgentRoleDeclarations } from '../test/cases/applyAgentRoles'
+import { applyAgentSkillDeclarations } from '../test/cases/applyAgentSkills'
 import { normDate } from '../test/cases/generators'
+import { personalSpaceForPlacement } from '../test/cases/personalSpaceSeam'
+import { resolveAvailabilityDecl } from '../test/cases/resolveAvailability'
 import { materializeRevisionState } from '../test/cases/revisionStates'
 import { agentSessionId } from '../test/cases/sessionIds'
 import { seedDurableImports } from './seedDurableImports'
@@ -353,6 +360,15 @@ const run = async (): Promise<void> => {
       personalSpaceOf.set(u.username, u.personalSpace)
     }
   }
+  // Every space that IS somebody's personal one, by id. This stand's answer to the
+  // question production answers with `peekPersonalSpace` on every owned-package call.
+  const personalSpaceIds = new Set(
+    [...personalSpaceOf.values()].flatMap((slug) => {
+      const id = idOf.get(slug)
+
+      return id ? [id] : []
+    }),
+  )
 
   const t = nowIso
 
@@ -395,55 +411,160 @@ const run = async (): Promise<void> => {
 
   // 3a. Owned role forks. The catalog remains read-only; the seed exercises the
   // same copy-on-Add service as REST instead of dropping ad-hoc fixture files.
+  const roleLibrary = createFsRoleLibrary({
+    publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+    rootForSpace: (space) => {
+      const notesDir = notesDirOf(space)
+      return notesDir ? join(notesDir, SKILL_MOUNT) : null
+    },
+  })
   const roleService = createRolesService({
-    catalog: loadBuiltinRoleCatalog,
-    library: createFsRoleLibrary({
-      publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
-      rootForSpace: (space) => {
-        const notesDir = notesDirOf(space)
-        return notesDir ? join(notesDir, SKILL_MOUNT) : null
-      },
-    }),
+    catalog: loadBundledAbilityInventory,
+    library: roleLibrary,
+    abilityAvailability: metaDb.abilityAvailability,
+    abilityPreferences: metaDb.abilityPreferences,
+    abilityPlacement: metaDb.abilityPlacement,
   })
   const projectRows = await metaDb.projects.listForSpaces([...idOf.values()])
-  let agentRoles = 0
 
-  for (const declaration of world.agentRoles ?? []) {
-    const target = declaration.target
+  const seedStoreForSpace = async (space: string) => {
+    const store = await manager.store(space)
 
+    // RoleLibrary publishes through the filesystem authority. Production's
+    // watcher/poll would converge this mount asynchronously; the stopped-stand
+    // seeder needs the same reconciliation before its immediate note mutation.
+    await store.reconcile?.()
+    return store
+  }
+
+  const resolveRoleTarget = async (target: AgentRoleTargetDecl) => {
     if (target.kind === 'personal') {
       const username = target.user ? asUser(target.user) : primary.username
       const personalSlug = personalSpaceOf.get(username)
       const personal = personalSlug ? idOf.get(personalSlug) : null
 
       if (!personal) {
-        throw new Error(`agent role ${declaration.name} has no personal space for ${username}`)
+        throw new Error(`agent package has no personal space for ${username}`)
       }
-      await roleService.addFromCatalog(declaration.name, { scope: 'personal', space: personal })
-    } else if (target.kind === 'space') {
-      const space = idOf.get(target.space)
+
+      return { scope: 'personal' as const, space: personal }
+    }
+    const space = idOf.get(target.space)
+
+    if (!space) {
+      throw new Error(`agent package references an unknown space: ${target.space}`)
+    }
+    if (target.kind === 'space') {
+      return { scope: 'space' as const, space }
+    }
+    const project = projectRows.find(
+      (candidate) => candidate.space === space && candidate.path === target.path,
+    )
+
+    if (!project) {
+      throw new Error(`agent package references an unknown project: ${target.space}/${target.path}`)
+    }
+
+    return { scope: 'project' as const, space: project.space, projectId: project.id }
+  }
+
+  const projectOf = (reference: { space: string; path: string }) => {
+    const space = idOf.get(reference.space)
+
+    return (
+      projectRows.find(
+        (candidate) => candidate.space === space && candidate.path === reference.path,
+      ) ?? null
+    )
+  }
+  const appliedRoles = await applyAgentRoleDeclarations({
+    declarations: world.agentRoles ?? [],
+    roles: roleService,
+    resolveLocation: async (declaration) => {
+      const location = await resolveRoleTarget(declaration.target)
+
+      if (declaration.availability && location.scope !== 'space') {
+        throw new Error(`agent role ${declaration.name} cannot declare availability here`)
+      }
+
+      return {
+        location,
+        personalSpace: personalSpaceForPlacement(personalSpaceIds, location.space),
+        ...(location.scope === 'space'
+          ? {
+              availability: resolveAvailabilityDecl(
+                declaration.availability,
+                location.space,
+                projectOf,
+                `agent role ${declaration.name}`,
+              ),
+            }
+          : {}),
+      }
+    },
+    storeForSpace: seedStoreForSpace,
+  })
+
+  const appliedSkills = await applyAgentSkillDeclarations({
+    declarations: world.agentSkills ?? [],
+    roles: roleService,
+    library: roleLibrary,
+    storeForSpace: seedStoreForSpace,
+    resolveLocation: async (declaration) => {
+      const home = declaration.home
+
+      if (home.kind === 'personal') {
+        if (declaration.availability) {
+          throw new Error(`personal skill ${declaration.name} cannot declare availability`)
+        }
+        const username = home.user ? asUser(home.user) : primary.username
+        const personalSlug = personalSpaceOf.get(username)
+        const personal = personalSlug ? idOf.get(personalSlug) : null
+
+        if (!personal) {
+          throw new Error(`agent skill ${declaration.name} has no personal space for ${username}`)
+        }
+
+        const location = { scope: 'personal' as const, space: personal }
+        return {
+          role: declaration.roleTarget ? await resolveRoleTarget(declaration.roleTarget) : location,
+          skill: location,
+        }
+      }
+      const space = idOf.get(home.space)
 
       if (!space) {
-        throw new Error(`agent role ${declaration.name} references an unknown space`)
+        throw new Error(`agent skill ${declaration.name} references an unknown space`)
       }
-      await roleService.addFromCatalog(declaration.name, { scope: 'space', space })
-    } else {
-      const space = idOf.get(target.space)
-      const project = projectRows.find(
-        (candidate) => candidate.space === space && candidate.path === target.path,
+      const location = { scope: 'space' as const, space }
+      const availability = resolveAvailabilityDecl(
+        declaration.availability,
+        space,
+        projectOf,
+        `agent skill ${declaration.name}`,
       )
 
-      if (!project) {
-        throw new Error(`agent role ${declaration.name} references an unknown project`)
+      return {
+        role: declaration.roleTarget ? await resolveRoleTarget(declaration.roleTarget) : location,
+        skill: location,
+        availability,
       }
-      await roleService.addFromCatalog(declaration.name, {
-        scope: 'project',
-        space: project.space,
-        projectId: project.id,
-      })
-    }
-    agentRoles++
-  }
+    },
+  })
+
+  // Owner Enable/Disable overrides, resolved by the one applier both stands share
+  // (`test/cases/applyAbilityPreferences.ts`) — the real clock and the real facet are
+  // this host's to supply, the resolution is not.
+  const agentAbilityPreferences = await applyAgentAbilityPreferences({
+    declarations: world.agentAbilityPreferences ?? [],
+    roles: roleService,
+    publishedRoles: appliedRoles,
+    publishedSkills: appliedSkills,
+    resolvePlacement: resolveRoleTarget,
+    ownerOf: (preference) => (preference.user ? asUser(preference.user) : primary.username),
+    setEnabled: (owner, target, enabled) =>
+      metaDb.abilityPreferences.setEnabled(owner, target, enabled, t),
+  })
 
   /** Resolve every seeded context facet through one scope-addressing seam. Role
    * declarations address an exact owned placement, not the effective winner, so
@@ -496,12 +617,34 @@ const run = async (): Promise<void> => {
                 : null
             })()
 
-    if (!location || !(await roleService.loadAt(location, declaration.name, 1))) {
+    const rolePackage = location ? await roleLibrary.getSkill(location, declaration.name) : null
+    // The service decides personal-vs-Space from the locator, so it needs the personal
+    // space of the owner this declaration names — never the seeder's own. Asked of the
+    // PLACEMENT rather than of the declaration's kind: a role sitting in a project of
+    // somebody's personal space is placed there by that same owner, and answering
+    // `null` for it made the resolver look for its dependencies in a Space root that
+    // space does not have.
+    const ownerPersonalSpace = location
+      ? personalSpaceForPlacement(personalSpaceIds, location.space)
+      : null
+    const resolved =
+      location && rolePackage
+        ? await roleService.addressedRoleAt(
+            // Minted, not spelled: the seeder chose the placement, but how a placement
+            // becomes an address is the service's rule — and a stand built on a stale
+            // spelling answers 404 to the very server that seeded it.
+            ownedRoleLocator(location, rolePackage.directoryName),
+            SYSTEM_PRINCIPAL,
+            ownerPersonalSpace,
+          )
+        : null
+
+    if (!resolved) {
       throw new Error(
         `role context references a missing owned role: ${declaration.name} (${target.kind})`,
       )
     }
-    const roleTarget = roleContextTargetOf({ role: { name: declaration.name }, location })
+    const roleTarget = roleContextTargetOf(resolved)
     return { targetKind: 'role', targetId: roleTarget.id, targetSpace: roleTarget.space }
   }
 
@@ -610,6 +753,11 @@ const run = async (): Promise<void> => {
       continue
     }
     const owner = session.owner ? asUser(session.owner) : primary.username
+    const personalSlug = personalSpaceOf.get(owner)
+    const personalSpace = personalSlug ? (idOf.get(personalSlug) ?? null) : null
+    const selectedRole = session.role
+      ? await roleService.resolveEffective({ personalSpace }, SYSTEM_PRINCIPAL, session.role)
+      : null
     await metaDb.sessions.insert({
       id: agentSessionId(session.ref),
       owner,
@@ -622,7 +770,12 @@ const run = async (): Promise<void> => {
       createdAt: daysAgoIso(session.createdDaysAgo),
       lastSeenAt: daysAgoIso(session.lastSeenDaysAgo),
       calls: session.calls,
-      role: session.role ?? null,
+      role: selectedRole?.role.name ?? null,
+      // The address the resolver already produced, not a second derivation of it: a
+      // System role has no placement to build one from at all, and rebuilding it here
+      // made the seeder a producer of the very locator the binding is looked up by.
+      roleLocator: selectedRole?.locator ?? null,
+      roleContextProjectId: null,
     })
     agentSessions++
   }
@@ -709,7 +862,29 @@ const run = async (): Promise<void> => {
         : undefined
 
       if (e.op === 'create') {
-        const route = routeOf(e.path, e.class)
+        let eventPath = e.path
+
+        if (e.projectMemory) {
+          const projectSpace = idOf.get(e.projectMemory.space)
+          const project = projectRows.find(
+            (candidate) =>
+              candidate.space === projectSpace && candidate.path === e.projectMemory!.path,
+          )
+
+          if (!project || project.space !== spaceId) {
+            throw new Error(
+              `project memory references an unknown project: ${e.projectMemory.space}/${e.projectMemory.path}`,
+            )
+          }
+          if (e.class !== 'agent-memory' || !e.path.startsWith(`${AGENT_MEMORY_MOUNT}/`)) {
+            throw new Error(`project memory note must use the agent-memory mount: ${e.path}`)
+          }
+          eventPath = e.path.replace(
+            `${AGENT_MEMORY_MOUNT}/`,
+            `${AGENT_MEMORY_MOUNT}/${project.id}/`,
+          )
+        }
+        const route = routeOf(eventPath, e.class)
         const res = await store.write({
           title: e.title,
           content: e.content,
@@ -747,7 +922,7 @@ const run = async (): Promise<void> => {
           title: e.title,
           versionToken: res.versionToken,
           class: e.class ?? 'user-doc',
-          filePath: e.path,
+          filePath: eventPath,
           createdAt: normDate(e.date),
         })
         creates++
@@ -1381,7 +1556,9 @@ const run = async (): Promise<void> => {
           connectedApps,
           pendingOAuthClients,
           agentSessions,
-          agentRoles,
+          agentRoles: appliedRoles.length,
+          agentSkills: appliedSkills.length,
+          agentAbilityPreferences,
           agentDeltaCursors,
           favorites,
           retrievals,

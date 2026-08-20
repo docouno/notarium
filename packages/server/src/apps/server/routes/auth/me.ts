@@ -6,29 +6,46 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify'
 
 import {
+  ABILITY_AVAILABILITY_MODE,
+  ABILITY_KIND,
   AddAgentRoleRequestSchema,
   AddAgentRoleResponseSchema,
+  type AddAgentSkillRequest,
+  AddAgentSkillRequestSchema,
+  AddAgentSkillResponseSchema,
+  type AgentAbilityAvailability,
+  AgentAbilityDetailResponseSchema,
+  type AgentAbilitySummary,
   AgentAuditQuerySchema,
   AgentAuditResponseSchema,
   AgentContextQuerySchema,
-  AgentRoleDetailParamsSchema,
-  AgentRoleDetailQuerySchema,
-  AgentRoleDetailResponseSchema,
+  AgentPackageLibraryQuerySchema,
   AgentSessionEventsQuerySchema,
   AgentSessionEventsResponseSchema,
   AgentSessionsQuerySchema,
   AgentSessionsResponseSchema,
+  type AgentSkillSummary,
   ConnectionPatchRequestSchema,
   ConnectionsResponseSchema,
   CONTEXT_KIND,
   ContextOrderRequestSchema,
   ContextPinRequestSchema,
+  CreateAbilityVersionRequestSchema,
+  CreateAbilityVersionResponseSchema,
+  CreateAgentRoleRequestSchema,
+  CreateAgentRoleResponseSchema,
+  type CreateAgentSkillRequest,
+  CreateAgentSkillRequestSchema,
+  CreateAgentSkillResponseSchema,
   MeAgentContextResponseSchema,
   MeAgentRolesResponseSchema,
+  MeAgentSkillsResponseSchema,
   MeMemoryQuerySchema,
   MeMemoryResponseSchema,
   MeSchema,
   OkResponseSchema,
+  type OwnedAbilityLocation,
+  type OwnedAbilityLocator,
   PasswordChangeRequestSchema,
   PatCreateRequestSchema,
   PatCreateResponseSchema,
@@ -36,10 +53,18 @@ import {
   PatsResponseSchema,
   ProfilePutRequestSchema,
   ProfileResponseSchema,
+  PROJECT_STATUS,
   type RoleInventoryEntry,
+  SetAbilityHomeRequestSchema,
+  SetAbilityHomeResponseSchema,
+  SetAgentAbilityAvailabilityRequestSchema,
+  SetAgentAbilityAvailabilityResponseSchema,
+  SetAgentAbilityEnabledRequestSchema,
+  SetAgentAbilityEnabledResponseSchema,
 } from '@notarium/contract'
 import { HTTP_STATUS } from '@notarium/contract/http'
 import { AgentSessionIdSchema } from '@notarium/contract/tools'
+import { decodeAbilityLocator, encodeAbilityLocator } from '@notarium/core'
 
 import { withAuthors } from '../../../../libs/authors'
 import { AGENT_SESSION_IDLE_MS } from '../../../../services/agentSessions'
@@ -52,16 +77,22 @@ import type {
   AgentSessionsPersistence,
   ContextOrderPersistence,
   ContextSetsPersistence,
+  ProjectRecord,
   ProjectsPersistence,
   RetrievalLogPersistence,
   ScopePinsPersistence,
 } from '../../../../services/metaDb'
 import {
+  abilityReachesProject,
   CatalogRoleNotFoundError,
+  CatalogSkillNotFoundError,
+  ownedRoleLocator,
+  ownedSkillLocator,
   ROLE_SCOPE,
   RoleAlreadyExistsError,
   RoleDependencyConflictError,
   type RolesService,
+  SkillAlreadyExistsError,
   weighRoleContext,
 } from '../../../../services/roles'
 import {
@@ -82,7 +113,13 @@ import {
   weighScopeOrder,
   weighScopePins,
 } from '../../../../services/storeAccess'
+import { contextRoleSummaryOf, roleContextViewOf } from '../wire'
 import { authz, setSessionCookie } from './_helpers'
+import {
+  type PackageLibraryCandidate,
+  PackageLibraryCursorError,
+  pagePackageLibrary,
+} from './packageLibrary'
 
 const encodeAuditCursor = (value: Record<string, string>): string =>
   Buffer.from(JSON.stringify(value), 'utf8').toString('base64url')
@@ -183,22 +220,110 @@ const emptyRetrievalAggregates = () => ({
 })
 
 const ROLE_DETAIL_TOKEN_BUDGET = 65_536
-const ROLE_INVENTORY_LIMIT = 512
 const ROLE_INVENTORY_LOCATION_LIMIT = 128
 const ROLE_PROJECT_SUMMARY_LIMIT = 128
+const SKILL_INVENTORY_LOCATION_LIMIT = 128
+const SKILL_PROJECT_SUMMARY_LIMIT = 128
 
-const personalRoleForWire = (role: {
-  name: string
-  description: string
-  origin?: string
-  originRevision?: string
-}): RoleInventoryEntry => ({
+type OwnedRoleSummary = Extract<AgentAbilitySummary, { source: 'owned' }>
+type ProjectRoleLocator = Extract<OwnedAbilityLocator, { kind: 'role' }> & {
+  location: Extract<OwnedAbilityLocation, { scope: 'project' }>
+}
+/** One role as the library shows it: the base that owns the name, plus the project
+ *  versions that override it. Either half may be missing — a Space role with no
+ *  override, or an override whose base was never created. */
+type OwnedRoleGroup = {
+  base?: OwnedRoleSummary
+  versions: Array<OwnedRoleSummary & { locator: ProjectRoleLocator }>
+}
+
+/** Where a just-published Role landed, in the shape the wire states it. A project
+ *  placement CANNOT be spelled without the handle the caller named — the literal that
+ *  used to fill it in with `''` when the branch was unreachable is now unwritable. */
+type PublishedRolePlacement =
+  | { scope: typeof ROLE_SCOPE.personal }
+  | { scope: typeof ROLE_SCOPE.space; space: string }
+  | { scope: typeof ROLE_SCOPE.project; space: string; project: string }
+
+/** The wire form of a Role that was just published. One producer, because it was
+ *  written four times — a personal special case plus one literal per endpoint — and
+ *  the copies had already diverged in what they spelled back. */
+const publishedRoleForWire = (
+  role: {
+    name: string
+    title: string
+    description: string
+    noteId: string
+    origin?: string
+    originRevision?: string
+  },
+  placement: PublishedRolePlacement,
+): RoleInventoryEntry => ({
   name: role.name,
+  title: role.title,
   description: role.description,
-  scope: ROLE_SCOPE.personal,
+  noteId: role.noteId,
+  ...placement,
   ...(role.origin !== undefined ? { origin: role.origin } : {}),
   ...(role.originRevision !== undefined ? { originRevision: role.originRevision } : {}),
 })
+
+/** The placement half, resolved once: the space by its slug, and the project by the
+ *  handle the caller named. Kept beside the builder so the two endpoints cannot spell
+ *  the same landing differently. */
+const rolePlacementForWire = (
+  role: { scope: RoleInventoryEntry['scope']; space: string },
+  project: string,
+  slugOf: (space: string) => string | undefined,
+): PublishedRolePlacement =>
+  role.scope === ROLE_SCOPE.personal
+    ? { scope: ROLE_SCOPE.personal }
+    : role.scope === ROLE_SCOPE.space
+      ? { scope: ROLE_SCOPE.space, space: slugOf(role.space) ?? role.space }
+      : { scope: ROLE_SCOPE.project, space: slugOf(role.space) ?? role.space, project }
+
+/** The wire form of a Skill that was just published — the same one answer for both
+ *  entries. Space placement carries a reach, and it is normalised HERE rather than
+ *  echoed raw: one endpoint deduplicated the projects it sent back and the other did
+ *  not, so the same request produced two different answers depending on which door it
+ *  came through. */
+const publishedSkillForWire = (
+  skill: {
+    name: string
+    title: string
+    description: string
+    noteId: string
+    scope: RoleInventoryEntry['scope']
+    space: string
+    origin?: string
+    originRevision?: string
+  },
+  space: { space: string; availability: AgentAbilityAvailability } | null,
+): AgentSkillSummary => {
+  const identity = {
+    name: skill.name,
+    title: skill.title,
+    description: skill.description,
+    noteId: skill.noteId,
+    ...(skill.origin !== undefined ? { origin: skill.origin } : {}),
+    ...(skill.originRevision !== undefined ? { originRevision: skill.originRevision } : {}),
+  }
+
+  return space
+    ? {
+        ...identity,
+        scope: ROLE_SCOPE.space,
+        space: space.space,
+        availability:
+          space.availability.mode === ABILITY_AVAILABILITY_MODE.allProjects
+            ? space.availability
+            : {
+                mode: ABILITY_AVAILABILITY_MODE.selectedProjects,
+                projects: [...new Set(space.availability.projects)],
+              },
+      }
+    : { ...identity, scope: ROLE_SCOPE.personal }
+}
 
 export const meRoutes = async (
   app: FastifyInstance,
@@ -228,6 +353,138 @@ export const meRoutes = async (
     projects?: ProjectsPersistence
   },
 ) => {
+  /** Every project of these spaces, archived ones included. A reach that names a
+   * project does not stop naming it when the project is archived, and a list that
+   * omitted it would make the reach unreadable — and unsendable, since the client
+   * can only echo back what it was shown. Surfaces that OFFER a project to create
+   * something in filter by status themselves; being nameable and being a valid
+   * destination are different questions. */
+  const contextProjectsFor = async (readableSpaces: string[]) =>
+    !projectsForRoles || !readableSpaces.length
+      ? []
+      : projectsForRoles.listForSpaces(readableSpaces)
+
+  const activeProjectsFor = async (readableSpaces: string[]) =>
+    (await contextProjectsFor(readableSpaces)).filter(
+      (project) => project.status === PROJECT_STATUS.active,
+    )
+
+  const publishedVersion = async (req: FastifyRequest, noteId: string): Promise<string> => {
+    const hit = await readNoteAccess(storeAccess, req.principal, noteId, 'note:read')
+
+    if (!hit?.note.versionToken) {
+      throw new Error('published ability has no readable version token')
+    }
+
+    return hit.note.versionToken
+  }
+
+  /** Publication requests name projects by handle — the caller is creating the
+   *  ability and has no ids yet — while the reach itself is keyed by stable ids. A
+   *  handle outside the ability's home space is a 404, not a silently dropped entry. */
+  const resolveAvailabilityHandles = async (
+    space: string,
+    availability: AgentAbilityAvailability,
+  ) => {
+    if (availability.mode === ABILITY_AVAILABILITY_MODE.allProjects) {
+      return { mode: ABILITY_AVAILABILITY_MODE.allProjects }
+    }
+    const projects = await contextProjectsFor([space])
+    const byHandle = new Map(
+      projects.map((project) => [
+        projectSummaryOf(project, spaces.slugOf(project.space) ?? project.space).handle,
+        project,
+      ]),
+    )
+    const selected = availability.projects.map((handle) => byHandle.get(handle))
+
+    if (selected.some((project) => !project)) {
+      throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+    }
+
+    return {
+      mode: ABILITY_AVAILABILITY_MODE.selectedProjects,
+      projectIds: [...new Set(selected.map((project) => project!.id))],
+    }
+  }
+
+  /** The caller's own library, minted on demand. Owning a personal space is the
+   *  ordinary case, but it is not a given: where the host cannot mint one, the
+   *  resolver honestly degrades to the first space it can see (P5), and that space is
+   *  somebody's shared library — so writability is asked either way. */
+  const writablePersonalSpace = async (req: FastifyRequest): Promise<string> => {
+    if (!req.principal.username && !req.principal.system) {
+      throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+    }
+    const personal = req.principal.username
+      ? await ensurePersonalSpaceFor({ auth, spaces }, req.principal.username)
+      : spaces.list()[0]?.id
+
+    if (!personal || !can(req.principal, 'space:write', { space: personal })) {
+      throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+    }
+
+    return personal
+  }
+
+  /** A SHARED space, named the way the client names it. A personal one is refused
+   *  rather than silently accepted: Personal and a Space root are one directory, and
+   *  the two scopes do not carry the same writer rules. */
+  const writableSharedSpace = async (req: FastifyRequest, slug: string): Promise<string> => {
+    const space = spaces.resolveId(slug)
+
+    if (
+      !space ||
+      !can(req.principal, 'space:write', { space }) ||
+      (await auth.isPersonalSpace(space))
+    ) {
+      throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+    }
+
+    return space
+  }
+
+  /** A project by the handle the client sends, searched across every space the caller
+   *  can read — the handle is space-qualified, so the search is not a guess. An absent
+   *  handle names no project, which is the same answer as naming a missing one. */
+  const writableProject = async (
+    req: FastifyRequest,
+    handle: string | undefined,
+  ): Promise<ProjectRecord> => {
+    const readableSpaces = spaces
+      .list()
+      .map((space) => space.id)
+      .filter((space) => can(req.principal, 'space:read', { space }))
+    const project = (await activeProjectsFor(readableSpaces)).find(
+      (entry) =>
+        projectSummaryOf(entry, spaces.slugOf(entry.space) ?? entry.space).handle === handle,
+    )
+
+    if (!project || !can(req.principal, 'space:write', { space: project.space })) {
+      throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+    }
+
+    return project
+  }
+
+  const skillPlacementFor = async (
+    req: FastifyRequest,
+    body: AddAgentSkillRequest | CreateAgentSkillRequest,
+  ) => {
+    if (body.scope === ROLE_SCOPE.personal) {
+      return {
+        location: { scope: ROLE_SCOPE.personal, space: await writablePersonalSpace(req) } as const,
+        availability: undefined,
+      }
+    }
+    const space = await writableSharedSpace(req, body.space)
+
+    return {
+      location: { scope: ROLE_SCOPE.space, space } as const,
+      availability: await resolveAvailabilityHandles(space, body.availability),
+    }
+  }
+
   app.get('/api/me', { config: authz('self:read', 'host') }, async (req) => {
     if (!req.principal.username) {
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
@@ -389,7 +646,14 @@ export const meRoutes = async (
     // flags match the bundle exactly (never modified-sorted). Sets and cross-space
     // pins resolve under THIS reader — honest degradation (P5).
     const resolveDeps = { store: storeAccess, spaces, contextSets, scopePins, contextOrder }
-    const roleResolveContext = { personalSpace: slug }
+    const encodedRole = query.role ? decodeAbilityLocator(query.role) : null
+    const selectedRoleLocator =
+      encodedRole?.source === 'owned' &&
+      encodedRole.kind === 'role' &&
+      encodedRole.location.scope === ROLE_SCOPE.personal &&
+      encodedRole.location.spaceId === slug
+        ? encodedRole
+        : null
     const [tagPins, loosePins, memory, sets, order, roleListing, selectedRole] = await Promise.all([
       weighAlwaysLoad(store),
       weighScopePins(resolveDeps, req.principal, { kind: CONTEXT_KIND.personal, id: slug }),
@@ -397,14 +661,22 @@ export const meRoutes = async (
       weighScopeContextSets(resolveDeps, req.principal, { kind: CONTEXT_KIND.personal, id: slug }),
       weighScopeOrder(resolveDeps, { kind: CONTEXT_KIND.personal, id: slug }),
       roles
-        ? roles.listEffective(roleResolveContext)
-        : Promise.resolve({ roles: [], truncated: false }),
-      query.role && roles
-        ? roles.resolveEffective(roleResolveContext, query.role)
+        ? roles.listOwnedAbilitiesAt(
+            { scope: ROLE_SCOPE.personal, space: slug },
+            req.principal,
+            ABILITY_KIND.role,
+          )
+        : Promise.resolve({ abilities: [], truncated: false }),
+      selectedRoleLocator && roles
+        ? roles.addressedRoleStatus({ personalSpace: slug }, req.principal, selectedRoleLocator)
         : Promise.resolve(null),
     ])
-    const roleContext = selectedRole
-      ? await weighRoleContext(resolveDeps, req.principal, selectedRole)
+    // Weighed ONLY when the agent would load it. This door's whole job is to mirror
+    // that load, so a layer it does not load must not enter the budget: charged
+    // anyway, it displaced a personal always-load pin the agent DOES load and reported
+    // it dropped. Which role the address names is the identity door's question.
+    const roleContext = selectedRole?.active
+      ? await weighRoleContext(resolveDeps, req.principal, selectedRole.role)
       : undefined
     const curated = curatePersonalScope(
       [...tagPins, ...loosePins],
@@ -415,16 +687,14 @@ export const meRoutes = async (
       roleContext,
     )
     const roleView =
-      selectedRole && curated.role
-        ? {
-            ...selectedRole.role,
-            pins: curated.role.pins,
-            sets: curated.role.sets,
-            loadedTokens: curated.role.loadedTokens,
-          }
+      selectedRole?.active && selectedRoleLocator
+        ? roleContextViewOf(selectedRole, selectedRoleLocator, (space) => space, null, curated.role)
         : undefined
     return MeAgentContextResponseSchema.parse({
-      roles: roleListing.roles,
+      roles: roleListing.abilities.flatMap(({ ability }) => {
+        const role = contextRoleSummaryOf(ability)
+        return role ? [role] : []
+      }),
       ...(roleListing.truncated ? { rolesTruncated: true } : {}),
       ...(roleView ? { role: roleView } : {}),
       pins: curated.pins,
@@ -437,84 +707,425 @@ export const meRoutes = async (
   })
 
   // ── roles: packaged catalog is discovery-only; only owned copies are effective.
-  app.get('/api/me/agent-roles', { config: authz('self:read', 'host') }, async (req) => {
+  app.get('/api/me/agent-skills', { config: authz('self:read', 'host') }, async (req) => {
+    const query = AgentPackageLibraryQuerySchema.parse(req.query)
+
     if (!roles) {
-      return MeAgentRolesResponseSchema.parse({
-        catalog: [],
-        roles: [],
+      return MeAgentSkillsResponseSchema.parse({
+        items: [],
         projects: [],
-        activeRole: null,
+        filteredTotal: 0,
+        nextCursor: null,
+        facets: {
+          source: { system: 0, catalog: 0, owned: 0 },
+          home: { personal: 0, space: 0 },
+          availability: { all: 0, selected: 0 },
+          projects: [],
+        },
       })
     }
-    const personal = await peekPersonalSpace({ auth, spaces }, req.principal)
+    const readableSpaces = spaces
+      .list()
+      .map((entry) => entry.id)
+      .filter((space) => can(req.principal, 'space:read', { space }))
+
+    if (
+      query.spaceId &&
+      (!spaces.recOf(query.spaceId) || !readableSpaces.includes(query.spaceId))
+    ) {
+      throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+    }
+    const scopedSpaces = query.spaceId ? [query.spaceId] : readableSpaces
+    const [personal, readableProjects, bundled] = await Promise.all([
+      peekPersonalSpace({ auth, spaces }, req.principal),
+      contextProjectsFor(scopedSpaces),
+      roles.listBundledAbilities(req.principal),
+    ])
+    const projectSources = readableProjects
+      .map((project) => ({
+        id: project.id,
+        space: project.space,
+        project: projectSummaryOf(project, spaces.slugOf(project.space) ?? project.space),
+      }))
+      .sort((left, right) =>
+        left.project.handle < right.project.handle
+          ? -1
+          : left.project.handle > right.project.handle
+            ? 1
+            : 0,
+      )
+    const projectHandleById = new Map(
+      projectSources.map(({ id, project }) => [id, project.handle] as const),
+    )
+    const allLocations = [
+      ...(personal ? [{ location: { scope: ROLE_SCOPE.personal, space: personal } as const }] : []),
+      ...scopedSpaces
+        .filter((space) => space !== personal)
+        .map((space) => ({ location: { scope: ROLE_SCOPE.space, space } as const })),
+    ]
+    const locations = allLocations.slice(0, SKILL_INVENTORY_LOCATION_LIMIT)
+    const candidates: PackageLibraryCandidate<AgentAbilitySummary>[] = bundled
+      .filter(({ locator }) => locator.kind === 'skill')
+      .map((ability) => ({
+        item: ability,
+        name: ability.name,
+        description: ability.description,
+        source: ability.source,
+        projects: [],
+        identity: encodeAbilityLocator(ability.locator),
+      }))
+    const writableProjects = projectSources.filter(
+      ({ space }) =>
+        (!query.spaceId || query.spaceId === space) && can(req.principal, 'space:write', { space }),
+    )
+    let truncated =
+      allLocations.length > SKILL_INVENTORY_LOCATION_LIMIT ||
+      writableProjects.length > SKILL_PROJECT_SUMMARY_LIMIT
+
+    for (const source of locations) {
+      const listing = await roles.listOwnedAbilitiesAt(
+        source.location,
+        req.principal,
+        ABILITY_KIND.skill,
+      )
+      truncated ||= listing.truncated
+      for (const { ability: skill, availability: storedAvailability } of listing.abilities) {
+        if (skill.locator.location.scope === ROLE_SCOPE.personal) {
+          candidates.push({
+            item: skill,
+            name: skill.name,
+            description: skill.description,
+            source: 'owned',
+            home: 'personal',
+            availability: 'all',
+            projects: projectSources.map(({ project }) => project.handle),
+            identity: encodeAbilityLocator(skill.locator),
+          })
+          continue
+        }
+        const availability =
+          storedAvailability?.mode === ABILITY_AVAILABILITY_MODE.selectedProjects
+            ? {
+                mode: ABILITY_AVAILABILITY_MODE.selectedProjects,
+                projects: storedAvailability.projectIds
+                  .flatMap((id) => {
+                    const handle = projectHandleById.get(id)
+                    return handle ? [handle] : []
+                  })
+                  .sort(),
+              }
+            : { mode: ABILITY_AVAILABILITY_MODE.allProjects }
+        candidates.push({
+          item: skill,
+          name: skill.name,
+          description: skill.description,
+          source: 'owned',
+          home: 'space',
+          availability:
+            availability.mode === ABILITY_AVAILABILITY_MODE.selectedProjects ? 'selected' : 'all',
+          projects:
+            availability.mode === ABILITY_AVAILABILITY_MODE.selectedProjects
+              ? availability.projects
+              : projectSources
+                  .filter((project) => project.space === skill.locator.location.spaceId)
+                  .map(({ project }) => project.handle),
+          identity: encodeAbilityLocator(skill.locator),
+        })
+      }
+    }
+    let page
+
+    try {
+      page = pagePackageLibrary({
+        candidates,
+        projects: projectSources.map(({ project }) => project),
+        query,
+      })
+    } catch (error) {
+      if (error instanceof PackageLibraryCursorError) {
+        throw new AuthError(HTTP_STATUS.BAD_REQUEST, 'bad cursor')
+      }
+      throw error
+    }
+
+    return MeAgentSkillsResponseSchema.parse({
+      ...page,
+      projects: writableProjects
+        .slice(0, SKILL_PROJECT_SUMMARY_LIMIT)
+        .map(({ project }) => project),
+      ...(truncated ? { truncated: true } : {}),
+    })
+  })
+
+  app.post('/api/me/agent-skills', { config: authz('self:manage', 'host') }, async (req, reply) => {
+    if (!roles) {
+      throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+    }
+    const body = CreateAgentSkillRequestSchema.parse(req.body ?? {})
+    const { location, availability } = await skillPlacementFor(req, body)
+
+    try {
+      const skill = await roles.createCustomSkill(
+        body.name,
+        body.description,
+        body.instructions,
+        location,
+        availability,
+      )
+      const locator = ownedSkillLocator(location, skill.packageId)
+
+      return reply.code(HTTP_STATUS.CREATED).send(
+        CreateAgentSkillResponseSchema.parse({
+          skill: publishedSkillForWire(
+            skill,
+            body.scope === ROLE_SCOPE.space
+              ? {
+                  space: spaces.slugOf(skill.space) ?? skill.space,
+                  availability: body.availability,
+                }
+              : null,
+          ),
+          noteId: skill.noteId,
+          locator,
+          versionToken: await publishedVersion(req, skill.noteId),
+        }),
+      )
+    } catch (error) {
+      if (error instanceof SkillAlreadyExistsError) {
+        throw new AuthError(HTTP_STATUS.CONFLICT, error.message, 'skill_exists')
+      }
+      throw error
+    }
+  })
+
+  app.post(
+    '/api/me/agent-skills/catalog',
+    { config: authz('self:manage', 'host') },
+    async (req, reply) => {
+      if (!roles) {
+        throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+      }
+      const body = AddAgentSkillRequestSchema.parse(req.body ?? {})
+
+      if (!(await roles.hasCatalogSkill(body.name))) {
+        throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+      }
+      const { location, availability } = await skillPlacementFor(req, body)
+
+      try {
+        const skill = await roles.addSkillFromCatalog(body.name, location, availability)
+        const locator = ownedSkillLocator(location, skill.packageId)
+
+        return reply.code(HTTP_STATUS.CREATED).send(
+          AddAgentSkillResponseSchema.parse({
+            skill: publishedSkillForWire(
+              skill,
+              body.scope === ROLE_SCOPE.space
+                ? {
+                    space: spaces.slugOf(skill.space) ?? skill.space,
+                    availability: body.availability,
+                  }
+                : null,
+            ),
+            noteId: skill.noteId,
+            locator,
+            versionToken: await publishedVersion(req, skill.noteId),
+          }),
+        )
+      } catch (error) {
+        if (error instanceof SkillAlreadyExistsError) {
+          throw new AuthError(HTTP_STATUS.CONFLICT, error.message, 'skill_exists')
+        }
+        if (error instanceof CatalogSkillNotFoundError) {
+          throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+        }
+        throw error
+      }
+    },
+  )
+
+  app.get('/api/me/agent-roles', { config: authz('self:read', 'host') }, async (req) => {
+    const query = AgentPackageLibraryQuerySchema.parse(req.query)
+
+    if (!roles) {
+      return MeAgentRolesResponseSchema.parse({
+        items: [],
+        projects: [],
+        activeRole: null,
+        filteredTotal: 0,
+        nextCursor: null,
+        facets: {
+          source: { system: 0, catalog: 0, owned: 0 },
+          home: { personal: 0, space: 0 },
+          availability: { all: 0, selected: 0 },
+          projects: [],
+        },
+      })
+    }
     const readableSpaces = spaces
       .list()
       .map((space) => space.id)
       .filter((space) => can(req.principal, 'space:read', { space }))
-    const projects = await contextProjectsFor(readableSpaces)
+
+    if (
+      query.spaceId &&
+      (!spaces.recOf(query.spaceId) || !readableSpaces.includes(query.spaceId))
+    ) {
+      throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+    }
+    const scopedSpaces = query.spaceId ? [query.spaceId] : readableSpaces
+    const [personal, projects, bundled] = await Promise.all([
+      peekPersonalSpace({ auth, spaces }, req.principal),
+      contextProjectsFor(scopedSpaces),
+      roles.listBundledAbilities(req.principal),
+    ])
+    const projectSources = projects
+      .map((project) => ({
+        id: project.id,
+        space: project.space,
+        project: projectSummaryOf(project, spaces.slugOf(project.space) ?? project.space),
+      }))
+      .sort((left, right) =>
+        left.project.handle < right.project.handle
+          ? -1
+          : left.project.handle > right.project.handle
+            ? 1
+            : 0,
+      )
     const summaries = []
     let writableProjectCount = 0
 
-    for (const project of projects) {
-      if (!can(req.principal, 'space:write', { space: project.space })) {
+    for (const source of projectSources) {
+      if (!can(req.principal, 'space:write', { space: source.space })) {
         continue
       }
       writableProjectCount++
       if (summaries.length < ROLE_PROJECT_SUMMARY_LIMIT) {
-        summaries.push(projectSummaryOf(project, spaces.slugOf(project.space) ?? project.space))
+        summaries.push(source.project)
       }
     }
     const personalLocations = [
       ...(personal ? [{ location: { scope: ROLE_SCOPE.personal, space: personal } as const }] : []),
     ]
-    const projectLocations = projects.map((project) => ({
+    const projectLocations = projectSources.map((project) => ({
       location: {
         scope: ROLE_SCOPE.project,
         space: project.space,
         projectId: project.id,
       } as const,
-      project: projectSummaryOf(project, spaces.slugOf(project.space) ?? project.space).handle,
+      project: project.project.handle,
     }))
     const spaceLocations = [
-      ...readableSpaces
+      ...scopedSpaces
         .filter((space) => space !== personal)
         .map((space) => ({ location: { scope: ROLE_SCOPE.space, space } as const })),
     ]
-    // Settings primarily creates Project forks. Keep those visible before the
-    // descriptive Space layer when a principal can read more locations than one
-    // bounded inventory request may scan.
-    const locations = [...personalLocations, ...projectLocations, ...spaceLocations].slice(
+    // Bases before versions. A version is not an item of this listing — it collapses
+    // into the base it overrides — so a scan that reached the project but not its
+    // Space would render the version as a role of its own, which is precisely the
+    // duplicate this listing exists to stop showing.
+    const locations = [...personalLocations, ...spaceLocations, ...projectLocations].slice(
       0,
       ROLE_INVENTORY_LOCATION_LIMIT,
     )
-    const inventory: RoleInventoryEntry[] = []
+    const candidates: PackageLibraryCandidate<AgentAbilitySummary>[] = bundled
+      .filter(({ locator }) => locator.kind === 'role')
+      .map((ability) => ({
+        item: ability,
+        name: ability.name,
+        description: ability.description,
+        source: ability.source,
+        projects: [],
+        identity: encodeAbilityLocator(ability.locator),
+      }))
     let inventoryTruncated =
       personalLocations.length + projectLocations.length + spaceLocations.length >
         ROLE_INVENTORY_LOCATION_LIMIT || writableProjectCount > ROLE_PROJECT_SUMMARY_LIMIT
 
+    // One role, one entry. The base and its project versions share a name inside one
+    // Space by construction, which is exactly what makes `(spaceId, name)` the role's
+    // identity here — a Space has at most one non-project placement, so a group can
+    // never hold two candidate bases.
+    const groups = new Map<string, OwnedRoleGroup>()
+
     for (const source of locations.slice(0, ROLE_INVENTORY_LOCATION_LIMIT)) {
-      const listing = await roles.listAt(source.location)
+      const listing = await roles.listOwnedAbilitiesAt(
+        source.location,
+        req.principal,
+        ABILITY_KIND.role,
+      )
       inventoryTruncated ||= listing.truncated
-      const entries = listing.roles.map((role): RoleInventoryEntry => {
-        if (role.scope === ROLE_SCOPE.personal) {
-          return personalRoleForWire(role)
+      for (const { ability: role } of listing.abilities) {
+        const key = `${role.locator.location.spaceId}\0${role.name}`
+        const group = groups.get(key) ?? { versions: [] }
+
+        if (role.locator.location.scope === ROLE_SCOPE.project) {
+          group.versions.push(role as OwnedRoleSummary & { locator: ProjectRoleLocator })
+        } else {
+          group.base = role
         }
-
-        return {
-          ...role,
-          space: spaces.slugOf(role.space) ?? role.space,
-          ...('project' in source ? { project: source.project } : {}),
-        } as RoleInventoryEntry
-      })
-      const remaining: number = ROLE_INVENTORY_LIMIT - inventory.length
-
-      if (entries.length > remaining) {
-        inventoryTruncated = true
+        groups.set(key, group)
       }
-      inventory.push(...entries.slice(0, remaining))
-      if (inventory.length === ROLE_INVENTORY_LIMIT) {
-        inventoryTruncated ||= source !== locations.at(-1)
-        break
+    }
+
+    const ownedRoleCandidate = (
+      item: OwnedRoleSummary,
+      versions: OwnedRoleGroup['versions'],
+    ): PackageLibraryCandidate<AgentAbilitySummary> => {
+      const personalHome = item.locator.location.scope === ROLE_SCOPE.personal
+      const availability = item.availability
+      const versioned = versions.map((version) => version.locator.location.projectId)
+      const own =
+        item.locator.location.scope === ROLE_SCOPE.project ? [item.locator.location.projectId] : []
+      const reach = personalHome
+        ? projectSources.map(({ project }) => project.handle)
+        : projectSources
+            .filter(
+              ({ id, space }) =>
+                space === item.locator.location.spaceId &&
+                (own.includes(id) ||
+                  versioned.includes(id) ||
+                  abilityReachesProject(availability, id, 'skill')),
+            )
+            .map(({ project }) => project.handle)
+
+      return {
+        item: {
+          ...item,
+          versions: versions.map((version) => ({
+            projectId: version.locator.location.projectId,
+            locator: version.locator,
+          })),
+        },
+        name: item.name,
+        description: item.description,
+        source: 'owned',
+        home: personalHome ? 'personal' : 'space',
+        availability:
+          personalHome || availability?.mode === ABILITY_AVAILABILITY_MODE.allProjects
+            ? 'all'
+            : 'selected',
+        projects: reach,
+        identity: encodeAbilityLocator(item.locator),
+      }
+    }
+
+    for (const group of groups.values()) {
+      const versions = [...group.versions].sort((left, right) =>
+        left.locator.location.projectId.localeCompare(right.locator.location.projectId),
+      )
+
+      if (group.base) {
+        candidates.push(ownedRoleCandidate(group.base, versions))
+        continue
+      }
+      // Nothing to override, so nothing is a version: a project role with no Space
+      // base is an independent role that happens to share a name across projects, and
+      // each is its own entry named by the project it lives in. Collapsing THESE
+      // would have to elect an arbitrary one to stand for the rest, and the others
+      // would vanish from the library entirely.
+      for (const version of versions) {
+        candidates.push(ownedRoleCandidate(version, []))
       }
     }
     const owner = req.principal.username ?? (req.principal.system ? 'system' : null)
@@ -526,12 +1137,48 @@ export const meRoutes = async (
             2,
           )
         : []
+    let activeRole: string | null = null
+
+    if (active.length === 1) {
+      const saved = active[0]
+
+      if (saved.roleLocator && saved.roleLocator.kind === ABILITY_KIND.role) {
+        const contextProject =
+          saved.roleContextProjectId && projectsForRoles
+            ? await projectsForRoles.getById(saved.roleContextProjectId)
+            : null
+        // Asked of the service, in the episode's OWN context. Deciding it here meant
+        // judging reach by space alone, so a role narrowed away from the project was
+        // drawn as active on a surface where `use_role` would refuse to raise it.
+        const resolved = await roles.resolveSavedRole(
+          { personalSpace: personal, ...(contextProject ? { project: contextProject } : {}) },
+          req.principal,
+          saved.roleLocator,
+        )
+
+        activeRole = resolved?.role.name ?? null
+      }
+    }
+
+    let page
+
+    try {
+      page = pagePackageLibrary({
+        candidates,
+        projects: projectSources.map(({ project }) => project),
+        query,
+      })
+    } catch (error) {
+      if (error instanceof PackageLibraryCursorError) {
+        throw new AuthError(HTTP_STATUS.BAD_REQUEST, 'bad cursor')
+      }
+      throw error
+    }
 
     return MeAgentRolesResponseSchema.parse({
-      catalog: await roles.listCatalog(),
-      roles: inventory,
+      ...page,
       projects: summaries,
-      activeRole: active.length === 1 ? active[0].role : null,
+      activeRole,
       ...(inventoryTruncated ? { truncated: true } : {}),
     })
   })
@@ -540,66 +1187,259 @@ export const meRoutes = async (
   // deliberately NOT effective-role resolution: two same-name forks at different
   // scopes remain separately inspectable instead of the narrower one replacing the
   // content the user clicked.
-  app.get('/api/me/agent-roles/:name', { config: authz('self:read', 'host') }, async (req) => {
-    if (!roles) {
-      throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
-    }
-    const { name } = AgentRoleDetailParamsSchema.parse(req.params)
-    const query = AgentRoleDetailQuerySchema.parse(req.query)
-    let detail
-
-    if (query.scope === ROLE_SCOPE.catalog) {
-      detail = await roles.loadCatalog(name, ROLE_DETAIL_TOKEN_BUDGET)
-    } else if (query.scope === ROLE_SCOPE.personal) {
-      const personal = await peekPersonalSpace({ auth, spaces }, req.principal)
-
-      if (personal) {
-        detail = await roles.loadAt(
-          { scope: ROLE_SCOPE.personal, space: personal },
-          name,
-          ROLE_DETAIL_TOKEN_BUDGET,
-        )
+  app.get(
+    '/api/me/agent-abilities/:locator',
+    { config: authz('self:read', 'host') },
+    async (req) => {
+      if (!roles) {
+        throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
       }
-    } else if (query.scope === ROLE_SCOPE.space) {
-      const space = spaces.resolveId(query.space)
+      const locator = decodeAbilityLocator((req.params as { locator: string }).locator)
+
+      if (!locator) {
+        throw new AuthError(HTTP_STATUS.BAD_REQUEST, 'bad ability locator')
+      }
+      const personalSpace = await peekPersonalSpace({ auth, spaces }, req.principal)
+      const project =
+        locator.source === 'owned' &&
+        locator.location.scope === ROLE_SCOPE.project &&
+        projectsForRoles
+          ? await projectsForRoles.getById(locator.location.projectId)
+          : undefined
 
       if (
-        space &&
-        can(req.principal, 'space:read', { space }) &&
-        !(await auth.isPersonalSpace(space))
+        locator.source === 'owned' &&
+        locator.location.scope === ROLE_SCOPE.project &&
+        (!project || project.space !== locator.location.spaceId)
       ) {
-        detail = await roles.loadAt(
-          { scope: ROLE_SCOPE.space, space },
-          name,
-          ROLE_DETAIL_TOKEN_BUDGET,
-        )
+        throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
       }
-    } else {
-      const readableSpaces = spaces
-        .list()
-        .map((space) => space.id)
-        .filter((space) => can(req.principal, 'space:read', { space }))
-      const project = (await contextProjectsFor(readableSpaces)).find(
-        (entry) =>
-          projectSummaryOf(entry, spaces.slugOf(entry.space) ?? entry.space).handle ===
-          query.project,
+      const detail = await roles.describeAbility(
+        { personalSpace, ...(project ? { project } : {}) },
+        req.principal,
+        locator,
+        ROLE_DETAIL_TOKEN_BUDGET,
       )
 
-      if (project) {
-        detail = await roles.loadAt(
-          { scope: ROLE_SCOPE.project, space: project.space, projectId: project.id },
-          name,
-          ROLE_DETAIL_TOKEN_BUDGET,
-        )
+      if (!detail) {
+        throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
       }
-    }
+      // A base names its versions here too, so the reader can see where this role has
+      // its own body — and the kebab can offer only the projects that do not have one
+      // yet, instead of offering a conflict. Any HOME is a base: Personal is the home a
+      // project of the caller's own space falls back to, and the service answers for it.
+      const versions =
+        locator.source === 'owned' &&
+        locator.kind === 'role' &&
+        locator.location.scope !== ROLE_SCOPE.project
+          ? await roles.listRoleVersions(
+              req.principal,
+              locator,
+              personalSpace,
+              (await contextProjectsFor([locator.location.spaceId])).map((entry) => entry.id),
+            )
+          : null
+      // The other direction of the same relation. Without it a project role cannot
+      // say whether the body it shows overrides another one of the same name, and the
+      // reader has no way back to it.
+      const baseLocator =
+        locator.source === 'owned' &&
+        locator.kind === 'role' &&
+        locator.location.scope === ROLE_SCOPE.project
+          ? await roles.findRoleBase(req.principal, locator, personalSpace)
+          : null
+      const { health, truncated, ...ability } = detail
+      return AgentAbilityDetailResponseSchema.parse({
+        ability: {
+          ...ability,
+          ...(versions ? { versions } : {}),
+          ...(baseLocator ? { baseLocator } : {}),
+        },
+        ...(health ? { health } : {}),
+        truncated,
+      })
+    },
+  )
 
-    if (!detail) {
-      throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
-    }
+  app.put(
+    '/api/me/agent-abilities/:locator/enabled',
+    { config: authz('self:manage', 'host') },
+    async (req) => {
+      if (!roles) {
+        throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+      }
+      const locator = decodeAbilityLocator((req.params as { locator: string }).locator)
+      const body = SetAgentAbilityEnabledRequestSchema.parse(req.body)
 
-    return AgentRoleDetailResponseSchema.parse(detail)
-  })
+      if (!locator) {
+        throw new AuthError(HTTP_STATUS.BAD_REQUEST, 'bad ability locator')
+      }
+      if (locator.source === 'catalog') {
+        throw new AuthError(HTTP_STATUS.BAD_REQUEST, 'Catalog abilities cannot be enabled')
+      }
+      const personalSpace = await peekPersonalSpace({ auth, spaces }, req.principal)
+      const project =
+        locator.source === 'owned' &&
+        locator.location.scope === ROLE_SCOPE.project &&
+        projectsForRoles
+          ? await projectsForRoles.getById(locator.location.projectId)
+          : undefined
+
+      if (
+        locator.source === 'owned' &&
+        locator.location.scope === ROLE_SCOPE.project &&
+        (!project || project.space !== locator.location.spaceId)
+      ) {
+        throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+      }
+      await roles.setEnabled(
+        { personalSpace, ...(project ? { project } : {}) },
+        req.principal,
+        locator,
+        body.enabled,
+      )
+
+      return SetAgentAbilityEnabledResponseSchema.parse({ locator, enabled: body.enabled })
+    },
+  )
+
+  app.put(
+    '/api/me/agent-abilities/:locator/availability',
+    { config: authz('self:manage', 'host') },
+    async (req) => {
+      if (!roles || !projectsForRoles) {
+        throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+      }
+      const locator = decodeAbilityLocator((req.params as { locator: string }).locator)
+      const availability = SetAgentAbilityAvailabilityRequestSchema.parse(req.body)
+
+      if (!locator || locator.source !== 'owned' || locator.location.scope !== ROLE_SCOPE.space) {
+        throw new AuthError(HTTP_STATUS.BAD_REQUEST, 'bad ability locator')
+      }
+      // Membership in the home space is the whole question. Archiving a project does
+      // not unbind a reach that names it — the row still describes where the ability
+      // applies, and only deleting or re-typing the folder removes it (meta-db
+      // cascades). Rejecting archived ids here would make an existing reach
+      // unsendable, and the client would have to drop it to save anything at all.
+      if (availability.mode === ABILITY_AVAILABILITY_MODE.selectedProjects) {
+        const projects = await Promise.all(
+          availability.projectIds.map((projectId) => projectsForRoles.getById(projectId)),
+        )
+
+        if (projects.some((project) => !project || project.space !== locator.location.spaceId)) {
+          throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+        }
+      }
+      await roles.setAbilityAvailability(
+        { personalSpace: await peekPersonalSpace({ auth, spaces }, req.principal) },
+        req.principal,
+        locator,
+        availability,
+      )
+
+      return SetAgentAbilityAvailabilityResponseSchema.parse({ locator, availability })
+    },
+  )
+
+  // Fork a Space base into a project version of the SAME role. Not a second role:
+  // it shares the name, and effective resolution picks it over the base inside that
+  // one project. The listing collapses it back into its base.
+  app.post(
+    '/api/me/agent-abilities/:locator/versions',
+    { config: authz('self:manage', 'host') },
+    async (req, reply) => {
+      if (!roles || !projectsForRoles) {
+        throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+      }
+      const locator = decodeAbilityLocator((req.params as { locator: string }).locator)
+      const body = CreateAbilityVersionRequestSchema.parse(req.body ?? {})
+
+      if (
+        !locator ||
+        locator.source !== 'owned' ||
+        locator.kind !== 'role' ||
+        locator.location.scope !== ROLE_SCOPE.space
+      ) {
+        throw new AuthError(HTTP_STATUS.BAD_REQUEST, 'bad ability locator')
+      }
+      const project = await projectsForRoles.getById(body.projectId)
+
+      if (
+        !project ||
+        project.status !== 'active' ||
+        project.space !== locator.location.spaceId ||
+        !can(req.principal, 'space:write', { space: project.space })
+      ) {
+        throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+      }
+      try {
+        const version = await roles.createRoleVersion(
+          req.principal,
+          locator,
+          await peekPersonalSpace({ auth, spaces }, req.principal),
+          project.id,
+        )
+
+        return reply.code(HTTP_STATUS.CREATED).send(
+          CreateAbilityVersionResponseSchema.parse({
+            // Minted, not spelled out: this literal is an argument of `.parse()`, so
+            // the compiler never checked it — a shape change to the locator would have
+            // reached every other door and failed HERE at runtime, after the version
+            // package was already published.
+            locator: ownedRoleLocator(
+              { scope: ROLE_SCOPE.project, space: version.space, projectId: project.id },
+              version.packageId,
+            ),
+            noteId: version.noteId,
+            versionToken: await publishedVersion(req, version.noteId),
+          }),
+        )
+      } catch (error) {
+        if (error instanceof RoleAlreadyExistsError) {
+          throw new AuthError(HTTP_STATUS.CONFLICT, error.message, 'role_exists')
+        }
+        throw error
+      }
+    },
+  )
+
+  // Change where a Role belongs, inside its own space. The package keeps its address
+  // and every durable pointer moves with it. This is the edit behind the aside's
+  // `Belongs to` — never a menu command, because where an ability lives is a property
+  // of it and commits with the document's one Save.
+  app.put(
+    '/api/me/agent-abilities/:locator/home',
+    { config: authz('self:manage', 'host') },
+    async (req) => {
+      if (!roles || !projectsForRoles) {
+        throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+      }
+      const locator = decodeAbilityLocator((req.params as { locator: string }).locator)
+      SetAbilityHomeRequestSchema.parse(req.body ?? {})
+
+      if (!locator || locator.source !== 'owned' || locator.kind !== 'role') {
+        throw new AuthError(HTTP_STATUS.BAD_REQUEST, 'bad ability locator')
+      }
+      try {
+        const moved = await roles.moveRolePlacement(
+          req.principal,
+          locator,
+          await peekPersonalSpace({ auth, spaces }, req.principal),
+        )
+
+        return SetAbilityHomeResponseSchema.parse({
+          locator: moved.locator,
+          availability: moved.availability,
+          noteId: moved.role.noteId,
+        })
+      } catch (error) {
+        if (error instanceof RoleAlreadyExistsError) {
+          throw new AuthError(HTTP_STATUS.CONFLICT, error.message, 'role_exists')
+        }
+        throw error
+      }
+    },
+  )
 
   app.post('/api/me/agent-roles', { config: authz('self:manage', 'host') }, async (req, reply) => {
     if (!roles) {
@@ -615,32 +1455,10 @@ export const meRoutes = async (
     let location
 
     if (body.scope === ROLE_SCOPE.personal) {
-      if (!req.principal.username && !req.principal.system) {
-        throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
-      }
-      const personal = req.principal.username
-        ? await ensurePersonalSpaceFor({ auth, spaces }, req.principal.username)
-        : spaces.list()[0]?.id
-
-      if (!personal) {
-        throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
-      }
-      location = { scope: ROLE_SCOPE.personal, space: personal } as const
+      location = { scope: ROLE_SCOPE.personal, space: await writablePersonalSpace(req) } as const
     } else {
-      const readableSpaces = spaces
-        .list()
-        .map((space) => space.id)
-        .filter((space) => can(req.principal, 'space:read', { space }))
-      const projects = await contextProjectsFor(readableSpaces)
-      const project = projects.find(
-        (entry) =>
-          projectSummaryOf(entry, spaces.slugOf(entry.space) ?? entry.space).handle ===
-          body.project,
-      )
+      const project = await writableProject(req, body.project)
 
-      if (!project || !can(req.principal, 'space:write', { space: project.space })) {
-        throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
-      }
       location = {
         scope: ROLE_SCOPE.project,
         space: project.space,
@@ -648,19 +1466,20 @@ export const meRoutes = async (
       } as const
     }
     try {
-      const role = await roles.addFromCatalog(body.name, location)
-      const project = role.projectId && body.project ? { project: body.project } : {}
-      const wireRole =
-        role.scope === ROLE_SCOPE.personal
-          ? personalRoleForWire(role)
-          : {
-              ...role,
-              space: spaces.slugOf(role.space) ?? role.space,
-              ...project,
-            }
+      const role = await roles.addFromCatalog(
+        body.name,
+        location,
+        await peekPersonalSpace({ auth, spaces }, req.principal),
+      )
+      const locator = ownedRoleLocator(location, role.packageId)
       return reply.code(HTTP_STATUS.CREATED).send(
         AddAgentRoleResponseSchema.parse({
-          role: wireRole,
+          role: publishedRoleForWire(
+            role,
+            rolePlacementForWire(role, body.project ?? '', (space) => spaces.slugOf(space)),
+          ),
+          locator,
+          versionToken: await publishedVersion(req, role.noteId),
         }),
       )
     } catch (err) {
@@ -677,15 +1496,81 @@ export const meRoutes = async (
     }
   })
 
-  const contextProjectsFor = async (readableSpaces: string[]) => {
-    if (!projectsForRoles || !readableSpaces.length) {
-      return []
-    }
+  app.post(
+    '/api/me/agent-roles/custom',
+    { config: authz('self:manage', 'host') },
+    async (req, reply) => {
+      if (!roles) {
+        throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+      }
+      const body = CreateAgentRoleRequestSchema.parse(req.body ?? {})
+      let location
 
-    return (await projectsForRoles.listForSpaces(readableSpaces)).filter(
-      (project) => project.status === 'active',
-    )
-  }
+      if (body.scope === ROLE_SCOPE.personal) {
+        location = { scope: ROLE_SCOPE.personal, space: await writablePersonalSpace(req) } as const
+      } else if (body.scope === ROLE_SCOPE.space) {
+        location = {
+          scope: ROLE_SCOPE.space,
+          space: await writableSharedSpace(req, body.space),
+        } as const
+      } else {
+        const project = await writableProject(req, body.project)
+
+        location = {
+          scope: ROLE_SCOPE.project,
+          space: project.space,
+          projectId: project.id,
+        } as const
+      }
+
+      // A Space role may state its reach at creation, in the same handle-named shape a
+      // Skill uses. Omitted means the Space-wide default, which is what a Space role
+      // meant before reach existed.
+      const availability =
+        body.scope === ROLE_SCOPE.space && body.availability
+          ? await resolveAvailabilityHandles(location.space, body.availability)
+          : undefined
+
+      try {
+        const role = await roles.createCustomRole(
+          body.name,
+          body.description,
+          body.instructions,
+          location,
+          {
+            principal: req.principal,
+            attachments: body.attachments,
+            personalSpace: await peekPersonalSpace({ auth, spaces }, req.principal),
+            ...(availability ? { availability } : {}),
+          },
+        )
+        const locator = ownedRoleLocator(location, role.packageId)
+        return reply.code(HTTP_STATUS.CREATED).send(
+          CreateAgentRoleResponseSchema.parse({
+            role: publishedRoleForWire(
+              role,
+              rolePlacementForWire(
+                role,
+                body.scope === ROLE_SCOPE.project ? body.project : '',
+                (space) => spaces.slugOf(space),
+              ),
+            ),
+            noteId: role.noteId,
+            locator,
+            versionToken: await publishedVersion(req, role.noteId),
+          }),
+        )
+      } catch (error) {
+        if (error instanceof RoleAlreadyExistsError) {
+          throw new AuthError(HTTP_STATUS.CONFLICT, error.message, 'role_exists')
+        }
+        if (error instanceof RoleDependencyConflictError) {
+          throw new AuthError(HTTP_STATUS.CONFLICT, error.message, 'role_dependency_conflict')
+        }
+        throw error
+      }
+    },
+  )
 
   // Attach a context set to MY personal scope. The receiver is only me, so no
   // personal/shared restriction (unlike a shared project). Mints the personal

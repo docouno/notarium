@@ -1,6 +1,8 @@
+import { parseAbilityLocator, serializeAbilityLocator } from '@notarium/core'
 import type {
   AgentSessionNamedStart,
   AgentSessionRecord,
+  AgentSessionRoleSelection,
   AgentSessionsPersistence,
 } from '@notarium/server'
 
@@ -134,7 +136,13 @@ export class InMemoryAgentSessions implements AgentSessionsPersistence {
     }
 
     if (match.lastSeenAt >= activeSince) {
-      const fork = { ...candidate, parentId: match.id, role: match.role }
+      const fork = {
+        ...candidate,
+        parentId: match.id,
+        role: match.role,
+        roleLocator: match.roleLocator,
+        roleContextProjectId: match.roleContextProjectId,
+      }
       this.insertChecked(fork)
       return { kind: 'forked', record: clone(fork) }
     }
@@ -150,24 +158,47 @@ export class InMemoryAgentSessions implements AgentSessionsPersistence {
     return this.list(owner, since, limit)
   }
 
-  async setRole(owner: string, id: string, role: string) {
+  async setRole(owner: string, id: string, role: AgentSessionRoleSelection) {
     const record = this.records.get(id)
 
     if (!record || record.owner !== owner) {
       return null
     }
-    const changed = record.role !== role
-    record.role = role
+    const changed =
+      record.role !== role.name ||
+      JSON.stringify(record.roleLocator) !== JSON.stringify(role.locator) ||
+      record.roleContextProjectId !== role.contextProjectId
+    record.role = role.name
+    record.roleLocator = role.locator
+    record.roleContextProjectId = role.contextProjectId
     return { record: clone(record), changed }
   }
 
-  async prune(before: string): Promise<void> {
+  /** Follow a role package that changed placement. Exact resume is fail-closed, so an
+   *  episode left on the old locator silently drops back to base mode instead of
+   *  following its role — mirrors the drivers' UPDATE over `role_locator`. */
+  moveRoleLocator(fromLocator: string, toLocator: string): void {
+    const moved = parseAbilityLocator(toLocator)
+
+    if (!moved || moved.source !== 'owned') {
+      throw new Error(`not an owned ability locator: ${toLocator}`)
+    }
+    for (const record of this.records.values()) {
+      if (record.roleLocator && serializeAbilityLocator(record.roleLocator) === fromLocator) {
+        record.roleLocator = moved
+      }
+    }
+  }
+
+  async prune(before: string): Promise<string[]> {
     const removed = new Set<string>()
+    const owners = new Set<string>()
 
     for (const [id, record] of this.records) {
       if (record.lastSeenAt < before) {
         this.records.delete(id)
         removed.add(id)
+        owners.add(record.owner)
       }
     }
     // Mirrors ON DELETE SET NULL on the durable self-reference.
@@ -177,6 +208,7 @@ export class InMemoryAgentSessions implements AgentSessionsPersistence {
       }
     }
     this.lifecycleView?.deleteSessions(removed)
+    return [...owners].sort()
   }
 
   private list(owner: string, since: string, limit: number, name?: string): AgentSessionRecord[] {

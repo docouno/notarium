@@ -7,7 +7,7 @@ comments, which is exactly what #245 said to fix.
 
 Key files:
 - `packages/web/src/composers/Sidebar/Sidebar.tsx` — the rail strip + the wide
-  panel (space switcher + the file/memory tree). Owns the scope picker, the tree
+  panel (space switcher + the Files or Agents explorer). Owns the picker, tree
   reveal, DnD, and the rail highlight.
 - `packages/web/src/libs/tree/tree/explorerScope.ts` — `ExplorerScope` (the tree
   LENS) + `railScopeActive` (the pure, matrix-tested highlight helper, the ONE
@@ -15,6 +15,8 @@ Key files:
   `explorerScope.test.ts`.
 - `packages/web/src/composers/NotesProvider/NotesProvider.tsx` — `nav.type`
   (`all | feed | folder`), the reader/scope surface signal.
+- `packages/web/src/composers/AgentsExplorerProvider/AgentsExplorerProvider.tsx` —
+  the Agents dataset state, per-owner/Space persistence, caches and invalidation.
 
 ---
 
@@ -37,6 +39,58 @@ ALWAYS visible; the collapse toggle hides only the wide panel (the tree).
 - **Graph / Agents / Trash / Settings / Management** = *chrome surfaces*: the
   reader isn't showing a document, so no file-scope icon lights (`browsing` is
   false). `activeId` is retained only to restore the tree on return.
+
+## Agents shell and Explorer
+
+Agents owns one shell and one `PageFrame` across **Abilities → Context → Activity**.
+Abilities keeps its routed **Roles | Skills** local rail. The wide Explorer panel has
+an independent picker for **Roles | Skills | Memory | Sessions**; these are separate
+read-models, not Files filters, and choosing one never changes the central route.
+Files/Projects/Favorites remain in the Files picker and never include agent data.
+
+An explicit top-pill or Roles/Skills-rail action reveals the route's natural Agents
+dataset. A manual Explorer choice then survives entity navigation, Back/Forward and
+reload until another explicit section action. The record is stored under
+`notarium:agents-explorer:<owner>:<space-id>`; changing owner or Space restores that
+pair's own picker preference.
+
+Roles/Skills are listed for the **active Space**: Personal (the cross-space fallback,
+always present), that Space, its Projects, then System and Catalog — in that order,
+closest to the user first. The request carries the exact `spaceId`, and the server
+applies it BEFORE the global location cap, so the Space the user is in is listed whole
+instead of competing with every readable Space for one bounded scan. Placements
+elsewhere are reached through the global library, which stays unscoped; the explorer
+links to it rather than pouring other Spaces into the tree. Sessions remain the one
+owner-global dataset.
+
+Groups are ordinary collapsible tree rows — the same rows the Memory dataset uses,
+with a chevron, a scope icon (Personal / Space / Project / System / Catalog) and the
+plain display name. A Space and a Project may legitimately share a display name; the
+icon is what distinguishes them, so the caption carries no address. Collapse state is
+per owner + Space under `notarium:agents-explorer:groups:<owner>:<space-id>`, with
+Catalog collapsed by default. The panel head offers the section's own `+` (New role on
+Roles, New skill on Skills), the same affordance Files has.
+
+Ability list, read, new, and edit are routed surfaces inside that one shell. Owned routes carry
+the encoded durable locator; System/Catalog routes carry their immutable package id. A new Role or
+Skill carries a random draft id in the URL and restores its owner-bound body from session storage;
+its first successful publish replaces the draft history entry with the exact Owned route. Opening
+Context from an Owned Role carries that same encoded locator in `?role=`—the selector and every
+role-preset mutation keep exact identity even when several placements share a name. Project and
+Space targets first adopt and remember the owning Space, because the Agents URL is space-free and
+must not resolve a project slug through whichever Space happened to be active before the click.
+
+Agents breadcrumbs expose the whole route hierarchy rather than only the current section:
+`Agents / Abilities / Roles|Skills / <title>`, `Agents / Context / <scope> / <role>`, and
+`Agents / Activity / <episode>`. An agent-memory note remains a Context surface:
+`Agents / Context / Memory / <title>`. Its `/m/<id>/<slug>?context=<scope>` URL preserves the
+originating Personal/project selection through read, Edit, Save, Cancel, reload and canonical slug
+replacement; the same Agents rail therefore stays mounted for the complete editing journey.
+
+At viewport widths up to 720px the wide panel is an ephemeral modal drawer, closed by
+default. It does not change the persisted desktop collapse preference. Open moves
+focus into the panel and makes the main surface inert; Tab stays trapped, and
+Escape/backdrop/navigation close it and return focus to the opener.
 
 ## The merged Files section (#245)
 

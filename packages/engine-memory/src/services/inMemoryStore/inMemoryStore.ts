@@ -21,6 +21,7 @@ import type {
   ListOptions,
   MoveInput,
   MoveResult,
+  MutationOptions,
   NoteClass,
   NoteContent,
   NoteMeta,
@@ -90,7 +91,9 @@ import {
   parseFrontmatterLines,
   resolveLink,
   shapeGraph,
+  skillNameConflict,
   skillPackagePathOf,
+  skillPlacementPathOf,
   STORAGE_OWNER_KEY,
   storedSlug,
   StoreError,
@@ -170,6 +173,38 @@ const nextPhysicalWriteClaim = (): PhysicalWriteClaim => ({
 const physicalWriteClaimOf = (note: StoredNote): PhysicalWriteClaim => ({
   ...note.physicalWriteClaim,
 })
+
+/** The fake owns no mount table, so the two skill mounts it models are recognised
+ *  here — ONCE — and every canonical package predicate below is fed the same
+ *  mount-relative path the real engine feeds them (`NotariumStore.relIn`). */
+const splitSkillMount = (filePath: string): { mount: string[]; relativePath: string } => {
+  const parts = filePath.split('/')
+  const mountLength =
+    parts[0] === '.notarium' && parts[1] === 'skills' ? 2 : parts[0] === 'skills' ? 1 : 0
+
+  return { mount: parts.slice(0, mountLength), relativePath: parts.slice(mountLength).join('/') }
+}
+
+/** Is this note the ROOT manifest of its Agent Skill package? The single producer
+ *  every path asks — read classification, the manifest fence, the name-conflict scan
+ *  and the rename guard — so the fake cannot answer one structural question two ways.
+ *  It is the real engine's own test (`mount.class === 'skill' && isSkillPackageRootPath`),
+ *  which is root BY DEPTH: `<pkg>/references/SKILL.md` merely ENDS like a manifest and
+ *  is an ordinary auxiliary. A `basenameOf(...) === 'SKILL.md'` test would promote one
+ *  at ANY depth — and then reject writing the very file the read beside it classifies
+ *  as auxiliary. canon: docs/note-model.md#note-ontology */
+const isSkillPackageRootNote = (note: Pick<StoredNote, 'class' | 'filePath'>): boolean =>
+  note.class === 'skill' && isSkillPackageRootPath(splitSkillMount(note.filePath).relativePath)
+
+/** The library root a package competes for its NAME in: the mount root for a
+ *  Personal/Space package, the encoded `_projects/<project>` root for a project one.
+ *  Same canonical producer the real engine's resource authority uses. */
+const skillPlacementOf = (filePath: string): string => {
+  const { mount, relativePath } = splitSkillMount(filePath)
+  const placement = skillPlacementPathOf(relativePath)
+
+  return [...mount, ...(placement ? [placement] : [])].join('/')
+}
 
 const stripMd = (p: string) => p.replace(/\.md$/, '')
 
@@ -840,16 +875,10 @@ export class InMemoryStore implements KnowledgeStore {
 
   private documentStateOf(n: StoredNote) {
     const fileName = basenameOf(n.filePath)
-    const parts = n.filePath.split('/')
-    const skillMountLength =
-      parts[0] === '.notarium' && parts[1] === 'skills' ? 2 : parts[0] === 'skills' ? 1 : 0
-    const relative = parts.slice(skillMountLength)
-    const relativePath = relative.join('/')
+    const { mount, relativePath } = splitSkillMount(n.filePath)
     const relativePackagePath = skillPackagePathOf(relativePath)
-    const packageDirectory = relativePackagePath
-      ? [...parts.slice(0, skillMountLength), relativePackagePath].join('/')
-      : ''
-    const skillRoot = isSkillPackageRootPath(relativePath)
+    const packageDirectory = relativePackagePath ? [...mount, relativePackagePath].join('/') : ''
+    const skillRoot = isSkillPackageRootNote(n)
     let linkedRoot: StoredNote | undefined
 
     if (n.class === 'skill' && !skillRoot && packageDirectory) {
@@ -922,6 +951,32 @@ export class InMemoryStore implements KnowledgeStore {
         ? { skillDirectoryName: basenameOf(directoryOf(n.filePath)) }
         : {}),
     })
+  }
+
+  private assertSkillRootAvailable(candidate: StoredNote): void {
+    if (!isSkillPackageRootNote(candidate)) {
+      return
+    }
+    const state = this.documentStateOf(candidate)
+    const name = state.projection?.skill?.name
+
+    if (state.format !== DOCUMENT_STATE_FORMAT.skill || !name) {
+      throw writeFailed('invalid Agent Skill manifest')
+    }
+    const placement = skillPlacementOf(candidate.filePath)
+
+    for (const sibling of this.notes) {
+      if (sibling.id === candidate.id || !isSkillPackageRootNote(sibling)) {
+        continue
+      }
+
+      if (
+        skillPlacementOf(sibling.filePath) === placement &&
+        this.documentStateOf(sibling).projection?.skill?.name === name
+      ) {
+        throw skillNameConflict(name)
+      }
+    }
   }
 
   /** Stream every note as an on-disk-equivalent file for a base export (#17).
@@ -1391,6 +1446,7 @@ export class InMemoryStore implements KnowledgeStore {
       const fileBase = isFolderPageNote(prev.filePath) ? FOLDER_PAGE_BASENAME : fileName
       const preserveCurrentPath =
         preservePath ||
+        isSkillPackageRootNote(prev) ||
         (title === prev.title && fileName == null && dir === directoryOf(prev.filePath))
       const filePath = restorePath
         ? restorePath
@@ -1448,6 +1504,7 @@ export class InMemoryStore implements KnowledgeStore {
         createdAt: createdAtFor(prev.createdAt, carriedState.typed),
         createdProjected: createdProjectionFor(prev.createdProjected),
       }
+      this.assertSkillRootAvailable(candidate)
       this.assertExportable(candidate)
       this.notes[i] = candidate
       this.addDirs(filePath) // a folder change seeds the new dir (#97); the old lingers
@@ -1536,6 +1593,7 @@ export class InMemoryStore implements KnowledgeStore {
         createdProjected: createdProjectionFor(prev.createdProjected),
         modifiedAt: this.nowIso,
       }
+      this.assertSkillRootAvailable(candidate)
       this.assertExportable(candidate)
       this.notes[existing] = candidate
       return {
@@ -1572,6 +1630,7 @@ export class InMemoryStore implements KnowledgeStore {
       createdProjected: createdAt !== undefined,
       physicalWriteClaim: nextPhysicalWriteClaim(),
     }
+    this.assertSkillRootAvailable(fresh)
     this.assertExportable(fresh)
     this.notes.push(fresh)
     const legacyNameAliases = this.captureLegacyName(fresh)
@@ -1721,8 +1780,12 @@ export class InMemoryStore implements KnowledgeStore {
     this.addDirPath(clean)
   }
 
-  async removeDir(path: string): Promise<void> {
-    if (!isCanonicalSafeRelativeAddress(path)) {
+  async removeDir(path: string, opts?: MutationOptions): Promise<void> {
+    if (
+      !(opts?.internalAddress
+        ? isCanonicalInternalRelativeAddress(path)
+        : isCanonicalSafeRelativeAddress(path))
+    ) {
       throw moveFailed('folder path contains an invalid durable string')
     }
     const clean = path.replace(/^\/+|\/+$/g, '')
@@ -1730,13 +1793,21 @@ export class InMemoryStore implements KnowledgeStore {
     if (!clean) {
       return
     }
+    const before = this.notes
+    await opts?.beforeDetach?.()
     this.notes = this.notes.filter(
       (n) => n.filePath !== clean && !n.filePath.startsWith(clean + '/'),
     )
-    for (const d of [...this.dirs]) {
-      if (d === clean || d.startsWith(clean + '/')) {
-        this.dirs.delete(d)
+    try {
+      await opts?.afterDetach?.()
+      for (const d of [...this.dirs]) {
+        if (d === clean || d.startsWith(clean + '/')) {
+          this.dirs.delete(d)
+        }
       }
+    } catch (error) {
+      this.notes = before
+      throw error
     }
   }
 

@@ -43,6 +43,17 @@ describe('parseNoteFile', () => {
     expect(parseNoteFile('just prose', 'dir/some-note.md').title).toBe('some-note')
   })
 
+  it('steps over the encoding prologue on a frontmatter-less file, as the frontmatter branch does', () => {
+    const marked = parseNoteFile('\uFEFF# From Heading\n\nbody\n', 'dir/x.md')
+
+    expect(marked.title).toBe('From Heading')
+    expect(marked.body).toBe('body\n')
+    expect(parseNoteFile('\uFEFF---\ntitle: Front\n---\n\nbody\n', 'dir/x.md').title).toBe('Front')
+    // Exactly one mark leads a file; a second one is ordinary content, which is
+    // also how the frontmatter reader and documentState read it.
+    expect(parseNoteFile('\uFEFF\uFEFF# From Heading\n\nbody\n', 'dir/x.md').title).toBe('x')
+  })
+
   it('keeps the deliberate legacy column-zero/anywhere H1 fallback exactly', () => {
     const raw = 'lead paragraph\n\n# Legacy Title ###\n\nbody'
     const parsed = parseNoteFile(raw, 'dir/fallback.md')

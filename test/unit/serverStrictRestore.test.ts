@@ -280,6 +280,52 @@ describe('strict single-note restore', () => {
 })
 
 describe('resumable strict trash bulk', () => {
+  it('restores a package selected from the same Trash view, listed by its title', async () => {
+    const created = await app!.inject({
+      method: 'POST',
+      url: '/api/me/agent-roles/custom',
+      payload: {
+        name: 'trash-role-proof',
+        description: 'A role deleted after its authored heading is persisted.',
+        instructions: '# Trash role proof\n\nKeep the manifest name stable in Trash.',
+        scope: 'personal',
+      },
+    })
+
+    expect(created.statusCode, created.body).toBe(201)
+    const noteId = created.json().role.noteId as string
+    const removed = await app!.inject({ method: 'DELETE', url: `/api/note?id=${noteId}` })
+    expect(removed.statusCode, removed.body).toBe(200)
+    const trash = await app!.inject({ method: 'GET', url: '/api/s/main/trash' })
+    const item = trash
+      .json()
+      .items.find((candidate: { noteId: string }) => candidate.noteId === noteId)
+
+    // Trash is an ordinary user surface: the row reads the title the manifest
+    // displays, not the machine name that addresses the package.
+    expect(item).toMatchObject({
+      noteId,
+      title: 'Trash role proof',
+      class: 'skill',
+      restoreAvailability: 'full',
+    })
+    const restored = await app!.inject({
+      method: 'POST',
+      url: '/api/s/main/trash/restore-many',
+      payload: { ids: [noteId], idempotencyKey: 'skill-bulk-restore-proof' },
+    })
+
+    expect(restored.statusCode, restored.body).toBe(200)
+    expect(TrashRestoreManyResponseSchema.parse(restored.json())).toMatchObject({
+      status: 'completed',
+      counts: { total: 1, succeeded: 1, conflict: 0 },
+      items: [{ id: noteId, status: 'succeeded' }],
+    })
+    const live = await app!.inject({ method: 'GET', url: `/api/note?id=${noteId}` })
+    expect(live.statusCode, live.body).toBe(200)
+    expect(live.json()).toMatchObject({ id: noteId, title: 'Trash role proof', agentKind: 'role' })
+  })
+
   it('freezes explicit order, reports stale ids and rejects changed replay payloads', async () => {
     const a = await createNote('Bulk Alpha', 'alpha\n')
     const b = await createNote('Bulk Beta', 'beta\n')

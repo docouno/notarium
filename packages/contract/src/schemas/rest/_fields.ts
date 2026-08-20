@@ -1,5 +1,27 @@
 import { z } from 'zod'
-import { DurableAddressPathSchema, DurableScalarSchema, DurableTextSchema } from '../primitives'
+import { DurableScalarSchema, DurableTextSchema } from '../primitives'
+
+export const SkillNameSchema = z
+  .string()
+  .min(1)
+  .max(64)
+  .regex(/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/, 'lowercase alphanumeric with inner dashes')
+  .refine((name) => !name.includes('--'), 'consecutive dashes are not allowed')
+
+export const SkillDescriptionSchema = z
+  .string()
+  .max(1024)
+  .refine(
+    (description) => description.length === 0 || description.trim().length > 0,
+    'description must be empty or contain non-whitespace text',
+  )
+
+export const SkillInstructionsSchema = z.string().max(262_144)
+
+export const AuthoredSkillInstructionsSchema = SkillInstructionsSchema.min(1).refine(
+  (instructions) => /^(?:[ \t]*\r?\n)*[ \t]*#(?!#)[ \t]+\S[^\r\n]*(?:\r?\n|$)/.test(instructions),
+  'instructions must start with an H1 title',
+)
 
 export const noteWriteFields = {
   /** Optional: a note's title is a PROJECTION of its body (the leading
@@ -9,9 +31,20 @@ export const noteWriteFields = {
    *  in the body is peeled off), but no client need send it. */
   title: DurableScalarSchema.optional(),
   content: DurableTextSchema.optional(),
-  /** Untrusted storage path — the server normalises and rejects traversal
-   *  (`..`/absolute) BEFORE the engine sees it (security spec). */
-  directory: DurableAddressPathSchema.optional(),
+  /** The Agent Skill manifest description. The host admits it only for a root note
+   * in the skill class and merges it into authored frontmatter by key. The manifest
+   * NAME is absent on purpose: it is the package's machine key, minted once at
+   * publication, and a display rename must not rekey locators, attachments or the
+   * base a project version overrides.
+   * canon: docs/note-model.md#roles-and-skills */
+  description: SkillDescriptionSchema.optional(),
+  /** Untrusted storage path. The lexical guard cannot live on the schema: a package
+   *  member echoes its own hidden `.notarium/…` directory, which the ordinary address
+   *  form rejects by design. So the rule moved to the route, and EVERY writer of this
+   *  field owes it — pass it through `safeRelAddress` (or refuse the change outright,
+   *  the way a skill member does) before the engine sees it. There is no schema-level
+   *  net under a route that forgets. security spec: docs/architecture.md#p8 */
+  directory: DurableScalarSchema.optional(),
   noteType: DurableScalarSchema.optional(),
   tags: z.union([z.array(DurableScalarSchema), DurableScalarSchema]).optional(),
   /** The editable display slug the user typed — three-state like the

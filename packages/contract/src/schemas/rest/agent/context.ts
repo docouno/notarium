@@ -2,8 +2,9 @@ import { z } from 'zod'
 import { CONTEXT_ENTRY_KIND, CONTEXT_KIND } from '../../../consts/context'
 import { ROLE_SCOPE } from '../../../consts/primitives'
 import { enumValues } from '../../../libs/enumValues'
+import { OwnedRoleAbilityLocatorSchema } from './abilities'
 import { MemoryCategorySchema } from './memory'
-import { EffectiveRoleSummarySchema, RoleNameSchema } from './roles'
+import { EffectiveOwnedRoleSummarySchema } from './roles'
 
 /** Where a context facet is attached: base Personal/Project or one exact owned role. */
 export const ContextKindSchema = z.enum(enumValues(CONTEXT_KIND))
@@ -109,21 +110,28 @@ const RoleContextFieldsSchema = {
   loadedTokens: z.number().int(),
 }
 
+/** One exact, currently enabled owned Role placement available to the Context
+ * constructor. Names are presentation only; every read and mutation is addressed by
+ * the durable locator so same-name Personal/Space/Project placements cannot alias. */
+export const ContextRoleSummarySchema = EffectiveOwnedRoleSummarySchema.extend({
+  locator: OwnedRoleAbilityLocatorSchema,
+})
+
 /** The exact owned role placement selected by the effective-role resolver, plus its
  * role-only context layer after joint session-budget curation. Personal placements do
  * not reveal the private personal-space slug; shared placements carry the location the
  * constructor needs for set ownership and pin labels. */
 export const RoleContextViewSchema = z.discriminatedUnion('scope', [
-  EffectiveRoleSummarySchema.extend({
+  ContextRoleSummarySchema.extend({
     scope: z.literal(ROLE_SCOPE.personal),
     ...RoleContextFieldsSchema,
   }),
-  EffectiveRoleSummarySchema.extend({
+  ContextRoleSummarySchema.extend({
     scope: z.literal(ROLE_SCOPE.space),
     space: z.string(),
     ...RoleContextFieldsSchema,
   }),
-  EffectiveRoleSummarySchema.extend({
+  ContextRoleSummarySchema.extend({
     scope: z.literal(ROLE_SCOPE.project),
     space: z.string(),
     project: z.string(),
@@ -131,14 +139,86 @@ export const RoleContextViewSchema = z.discriminatedUnion('scope', [
   }),
 ])
 
-/** Optional selector on a context preview. An unavailable/stale name degrades to the
- * base preview while `roles` still carries the current bounded choices. */
-export const AgentContextQuerySchema = z.object({ role: RoleNameSchema.optional() }).strict()
+/** WHY the addressed role is not the one the agent would load here. `disabled` is the
+ *  viewer's own Enable/Disable bit — a private READING preference. `out-of-reach` is
+ *  about WHERE the caller is standing, and covers both of its halves: a placement this
+ *  scope does not reach at all (a Space or Project role asked about from Personal), and
+ *  a Space role narrowed away from this project. `unhealthy` is a role whose attachments
+ *  no longer resolve, which resume refuses. All three leave the role EDITABLE: whether
+ *  its shared context may be changed is a question about the space, not about whether
+ *  this reader happens to load it. */
+export const RoleInactiveReasonSchema = z.enum(['disabled', 'out-of-reach', 'unhealthy'])
 
-/** Select the same effective role placement for role-context mutations. A project id is
- * an internal REST address (not an outward MCP project handle); omitted = personal mode. */
-export const RoleContextTargetQuerySchema = z
-  .object({ projectId: z.string().min(1).optional() })
+/** The role layer as the surface that CONFIGURES it sees the pins: no `loaded`.
+ *  The omission is the point and it is enforced by the type rather than promised in
+ *  prose — `loaded` is a statement about a BUDGET, and this door weighs none. Saying
+ *  "shown" and "paid for" with one value is exactly what made a preview report a
+ *  personal always-load pin as dropped while the agent went on loading it. `tokens`
+ *  stays: how heavy a note is belongs to the note, not to anyone's budget. */
+export const ContextLayerPinSchema = ContextPinSchema.omit({ loaded: true })
+
+export const ContextLayerSetViewSchema = ContextSetViewSchema.extend({
+  items: z.array(ContextSetItemSchema.omit({ loaded: true })),
+})
+
+const RoleContextLayerFieldsSchema = {
+  pins: z.array(ContextLayerPinSchema),
+  sets: z.array(ContextLayerSetViewSchema),
+}
+
+/** The role an address NAMES, with its own editable layer. Same identity fields as
+ * {@link RoleContextViewSchema}, minus every budget word — no `loaded`, no
+ * `loadedTokens`. */
+export const RoleContextIdentitySchema = z.discriminatedUnion('scope', [
+  ContextRoleSummarySchema.extend({
+    scope: z.literal(ROLE_SCOPE.personal),
+    ...RoleContextLayerFieldsSchema,
+  }),
+  ContextRoleSummarySchema.extend({
+    scope: z.literal(ROLE_SCOPE.space),
+    space: z.string(),
+    ...RoleContextLayerFieldsSchema,
+  }),
+  ContextRoleSummarySchema.extend({
+    scope: z.literal(ROLE_SCOPE.project),
+    space: z.string(),
+    project: z.string(),
+    ...RoleContextLayerFieldsSchema,
+  }),
+])
+
+/** `GET /api/me/agent-roles/:locator/context` — the IDENTITY door.
+ *
+ *  Two doors, because the two questions have different answers and different owners.
+ *  "Which role does this address name, and may I configure it" is a question about the
+ *  space: a member who switched a shared role off FOR THEMSELVES still configures its
+ *  shared context, so this door answers whenever the caller may read the placement.
+ *  "Does the agent load it here, and what does that cost" is a question about this
+ *  reader, here, now — and it belongs to the preview door, which weighs a budget.
+ *  One response answering both is what made the preview lie: the layer of a role the
+ *  agent does not load was charged to the session budget and displaced a pin that IS
+ *  loaded. */
+export const MeRoleContextResponseSchema = z
+  .object({
+    role: RoleContextIdentitySchema,
+    /** Would the agent load this role where the caller asked? Editing does not depend
+     *  on it; it is here so the surface can SAY why, instead of showing a role the
+     *  agent ignores as though it were live. */
+    active: z.boolean(),
+    inactive: RoleInactiveReasonSchema.optional(),
+  })
+  .strict()
+
+/** Where the caller is standing, for the identity door. Reach is a question about a
+ * project, so without one `out-of-reach` is not an answer this surface can give. */
+export const RoleContextQuerySchema = z
+  .object({ project: z.string().min(1).max(256).optional() })
+  .strict()
+
+/** Optional selector on a context preview. An unavailable/stale exact locator degrades to the
+ * base preview while `roles` still carries the current bounded choices. */
+export const AgentContextQuerySchema = z
+  .object({ role: z.string().min(1).max(4096).optional() })
   .strict()
 
 /** One entry of a scope's ordered pin+set sequence: kind + stable ref (a pin's note
@@ -181,10 +261,13 @@ export const ContextPinRequestSchema = z.object({ space: z.string(), noteId: z.s
  *  `self:read`. */
 export const MeAgentContextResponseSchema = z.object({
   /** Effective roles in personal mode. The catalog is never included. */
-  roles: z.array(EffectiveRoleSummarySchema),
+  roles: z.array(ContextRoleSummarySchema),
   rolesTruncated: z.boolean().optional(),
-  /** Present only when the requested role is currently effective. Its layer is loaded
-   * before Personal under the same `P` budget. */
+  /** Present ONLY when the requested role is the one the agent would load here. Its
+   * layer is loaded before Personal under the same `P` budget, so this preview mirrors
+   * the agent's real load and nothing else. WHICH role an address names — a question
+   * whose answer does not depend on whether this reader loads it — belongs to
+   * `GET /api/me/agent-roles/:locator/context`, which makes no budget claim at all. */
   role: RoleContextViewSchema.optional(),
   /** Curated pins, loaded-first under `P` (a bloated pin over the budget = loaded:false). */
   pins: z.array(ContextPinSchema),
@@ -211,10 +294,11 @@ export const MeAgentContextResponseSchema = z.object({
  *  anti-enumeration 404 like its memory twin. Preview does not call MCP delta persistence. */
 export const ProjectAgentContextResponseSchema = z.object({
   /** Effective roles for this project (`Project > Space > Personal`). */
-  roles: z.array(EffectiveRoleSummarySchema),
+  roles: z.array(ContextRoleSummarySchema),
   rolesTruncated: z.boolean().optional(),
-  /** Present only when the requested role is effective here. Loaded before Project and
-   * Personal under the same `Q` budget. */
+  /** Present ONLY when the requested role is the one the agent would load in this
+   * project. Loaded before Project and Personal under the same `Q` budget. Identity —
+   * which role the address names — is the other door's question. */
   role: RoleContextViewSchema.optional(),
   /** The project's curated pins, loaded-first under `Q`. */
   pins: z.array(ContextPinSchema),
@@ -264,9 +348,17 @@ export type ContextSetView = z.infer<typeof ContextSetViewSchema>
 
 export type RoleContextView = z.infer<typeof RoleContextViewSchema>
 
-export type AgentContextQuery = z.infer<typeof AgentContextQuerySchema>
+export type RoleContextIdentity = z.infer<typeof RoleContextIdentitySchema>
 
-export type RoleContextTargetQuery = z.infer<typeof RoleContextTargetQuerySchema>
+export type MeRoleContext = z.infer<typeof MeRoleContextResponseSchema>
+
+export type RoleContextQuery = z.infer<typeof RoleContextQuerySchema>
+
+export type RoleInactiveReason = z.infer<typeof RoleInactiveReasonSchema>
+
+export type ContextRoleSummary = z.infer<typeof ContextRoleSummarySchema>
+
+export type AgentContextQuery = z.infer<typeof AgentContextQuerySchema>
 
 export type ContextSetCreateRequest = z.infer<typeof ContextSetCreateRequestSchema>
 

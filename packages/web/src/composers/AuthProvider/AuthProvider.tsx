@@ -5,10 +5,12 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from 'react'
 import type { AuthMode, AuthSession, Me, SpaceRole } from '@notarium/contract'
 import { AUTH_MODE } from '@notarium/contract/enums'
+import { clearAbilityDrafts } from '../../libs/abilityDraftStorage'
 import { withGrant } from '../../libs/access'
 import { api, setUnauthorizedHandler } from '../../services/api'
 
@@ -58,6 +60,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   // arrive (same contract as SpaceProvider's `ready`), so children never see a
   // half-known auth state.
   const [session, setSession] = useState<AuthSession | null>(null)
+  const draftOwnerRef = useRef<string | null>(null)
 
   const refresh = useCallback(async () => {
     try {
@@ -106,6 +109,20 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     setUnauthorizedHandler(() => void refresh())
     return () => setUnauthorizedHandler(null)
   }, [refresh])
+
+  const draftOwner = session?.mode === AUTH_MODE.none ? '@system' : (session?.me?.username ?? null)
+
+  // Drafts are principal-local even though sessionStorage is tab-local. Logout,
+  // a mid-session 401, and an in-tab principal swap all clear the prior owner's
+  // cache before another principal can mount the routed authoring surface.
+  useEffect(() => {
+    const previous = draftOwnerRef.current
+
+    if (previous && previous !== draftOwner) {
+      clearAbilityDrafts(previous)
+    }
+    draftOwnerRef.current = draftOwner
+  }, [draftOwner])
 
   const value = useMemo<AuthContextValue>(
     () => ({

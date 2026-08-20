@@ -1,4 +1,5 @@
 import type { FrontmatterEntry } from '../frontmatter'
+import type { SkillLink } from './skillLinks'
 
 export const DOCUMENT_STATE_FORMAT = {
   markdown: 'markdown-v2',
@@ -57,16 +58,26 @@ export type RestoreSafety =
   | { status: 'unknown'; reason: 'invalid-yaml' | 'parser-range-uncertainty' }
 
 export type TitleOrigin =
-  | { kind: 'frontmatter'; title: string; valueRange: ByteRange; coupledH1Range?: ByteRange }
+  /** `entryRange` is the field's whole physical entry: a frontmatter title may be
+   * authored as a block scalar, whose value has no slot to rewrite on the key's line. */
+  | {
+      kind: 'frontmatter'
+      title: string
+      valueRange: ByteRange
+      entryRange: ByteRange
+      coupledH1Range?: ByteRange
+    }
   | { kind: 'hidden-h1' | 'legacy-h1'; title: string; valueRange: ByteRange }
   | { kind: 'path-fallback'; title: string }
 
 export type SkillProjection = {
+  /** Human-facing document title. The manifest `name` below is a stable machine key. */
+  title: string
   name: string
   description: string
   metadata: Record<string, string>
   instructions: string
-  linkedSkills: string[]
+  linkedSkills: SkillLink[]
   role: boolean
 }
 
@@ -90,7 +101,9 @@ export type DocumentState = {
   pathFallbackTitle: string | null
   semanticFingerprint: string
   projection: MarkdownProjection | null
-  /** Needed to revalidate a persisted skill root without consulting a path. */
+  /** The package directory this manifest physically sits in. A skill root projects only
+   *  when the caller can name it — the analyzer never reads the path — and it rides the
+   *  persisted state so a re-analysis lands on the same role. */
   skillDirectoryName?: string
 }
 

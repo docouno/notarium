@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import type { MouseEvent as ReactMouseEvent, ReactNode } from 'react'
 import { Link } from 'react-router'
 import { cx } from '../../libs/cx/cx'
 import styles from './PillTabs.module.scss'
@@ -23,6 +23,7 @@ export type PillTab = {
   /** A softer attention dot (amber) — a signal that's a hint, not an error. */
   warn?: boolean
   testId?: string
+  onClick?: (event: ReactMouseEvent<HTMLAnchorElement>) => void
 }
 
 export const PillTabs = ({
@@ -50,6 +51,7 @@ export const PillTabs = ({
           className={cx(styles.pill, isActive && styles.pillActive)}
           aria-current={isActive ? 'page' : undefined}
           data-testid={t.testId}
+          onClick={t.onClick}
         >
           {t.icon && (
             <span className={styles.pillIcon} aria-hidden>

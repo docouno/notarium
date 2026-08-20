@@ -36,7 +36,7 @@
     "licenses": "node scripts/gen-licenses.mjs && node scripts/gen-reading-faces.mjs --licenses-only",
     "format": "prettier --write \"packages/*/src/**/*.{ts,tsx}\" \"test/**/*.ts\" \"scripts/**/*.{ts,mjs}\"",
     "format:check": "prettier --check \"packages/*/src/**/*.{ts,tsx}\" \"test/**/*.ts\" \"scripts/**/*.{ts,mjs}\"",
-    "e2e": "npm run e2e:fake && npm run e2e:real",
+    "e2e": "npm run e2e:fake; fake=$?; npm run e2e:real; real=$?; [ $fake -eq 0 ] || exit $fake; exit $real",
     "e2e:fake": "playwright test test/e2e",
     "e2e:real": "playwright test -c playwright.real.config.ts",
     "e2e:docker": "HOST_UID=$(id -u) HOST_GID=$(id -g) docker compose -f docker/compose.test.yml run --rm pw npm run e2e",

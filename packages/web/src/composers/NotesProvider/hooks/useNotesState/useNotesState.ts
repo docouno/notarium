@@ -617,7 +617,8 @@ export const useNotesState = (): NotesContextValue => {
           if (
             !keepSourceSpace &&
             n.space &&
-            (n.class !== NOTE_CLASS.agentMemory || n.space !== personalSpace?.slug)
+            ((n.class !== NOTE_CLASS.agentMemory && n.class !== NOTE_CLASS.skill) ||
+              n.space !== personalSpace?.slug)
           ) {
             reportNoteSpace(n.space)
           }
@@ -754,7 +755,8 @@ export const useNotesState = (): NotesContextValue => {
         if (
           !keepSourceSpace &&
           n.space &&
-          (n.class !== NOTE_CLASS.agentMemory || n.space !== personalSpace?.slug)
+          ((n.class !== NOTE_CLASS.agentMemory && n.class !== NOTE_CLASS.skill) ||
+            n.space !== personalSpace?.slug)
         ) {
           reportNoteSpace(n.space)
         }

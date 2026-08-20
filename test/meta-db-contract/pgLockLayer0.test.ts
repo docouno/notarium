@@ -60,7 +60,10 @@ describe('Postgres lock order — layer 0', () => {
 
   it('sees every row-lock strength, including the ones a first draft forgets', async () => {
     // `FOR KEY SHARE` is not a hypothetical: the first pattern missed it, and the
-    // driver already had one (`agentDeltaCursors`, on a non-tiered table).
+    // driver already had one — `agentDeltaCursors`, on `folders`, exempted as
+    // "outside the hierarchy" and then left there when tier 4 gave that table a level
+    // (L4f). It goes through `lockProjectParentRow` now, and the live gate levels a
+    // lock statement by its table, so neither half rests on the inline note.
     const strengths = [
       'SELECT 1 FROM note_identity FOR NO KEY UPDATE',
       'SELECT 1 FROM note_identity FOR KEY SHARE',

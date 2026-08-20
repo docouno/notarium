@@ -1,4 +1,4 @@
-import { test as base, expect, type Page } from '@playwright/test'
+import { test as base, expect, type Locator, type Page } from '@playwright/test'
 
 // Shared E2E fixture. The fake backend is a single in-memory process shared by
 // the whole run, so before each test we re-seed it (POST /api/__test/reset) to
@@ -34,4 +34,4 @@ export const openSpotlight = async (page: Page) => {
 }
 
 export { expect }
-export type { Page }
+export type { Locator, Page }

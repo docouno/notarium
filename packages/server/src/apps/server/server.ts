@@ -56,7 +56,8 @@ import {
 import {
   createFsRoleLibrary,
   createRolesService,
-  loadBuiltinRoleCatalog,
+  inMemoryAbilityPersistence,
+  loadBundledAbilityInventory,
 } from '../../services/roles'
 import { type DiscoveredSpace, SpaceManager } from '../../services/spaces'
 import { buildApp, webDist } from './app'
@@ -93,7 +94,7 @@ export const AGENT_MOUNT_PREFIX = AGENT_MEMORY_MOUNT
  *  canon: docs/note-model.md#note-classes */
 export const PROFILE_MOUNT_PREFIX = '.notarium/profile'
 
-/** Space-relative path of the writable Agent Skills library. Built-in catalog
+/** Space-relative path of the writable Agent Skills library. The bundled inventory
  * templates do NOT live here: Add copies one into this owned, hidden mount. */
 export const SKILL_MOUNT_PREFIX = '.notarium/skills'
 
@@ -543,14 +544,24 @@ export const createServer = async ({
                 q: selection.mode === 'all' ? (selection.q ?? undefined) : undefined,
                 availability:
                   selection.mode === 'all' && selection.onlyRestorable ? 'restorable' : undefined,
-                scope: READ_SCOPE.agentRecall,
+                scope: READ_SCOPE.trash,
               })
             ).items
           },
         })
       : undefined
   const roles = createRolesService({
-    catalog: loadBuiltinRoleCatalog,
+    catalog: loadBundledAbilityInventory,
+    // Spelled either way round, never inherited: a spread that silently contributes
+    // nothing is how a host with a meta-DB ends up on volatile facets, and the
+    // difference only shows after a restart.
+    ...(metaDb
+      ? {
+          abilityAvailability: metaDb.abilityAvailability,
+          abilityPreferences: metaDb.abilityPreferences,
+          abilityPlacement: metaDb.abilityPlacement,
+        }
+      : inMemoryAbilityPersistence()),
     library: createFsRoleLibrary({
       // Asked of the runtime once, at composition: absent here means an install
       // is refused before it stages anything, not after it wrote a package.
@@ -578,6 +589,46 @@ export const createServer = async ({
           ? (mountsForConfig(cfg, notesDir).find((mount) => mount.class === NOTE_CLASS.skill)
               ?.dir ?? null)
           : null
+      },
+      projectPublishedPackages: async (space, packages, options) => {
+        const store = await manager.store(space)
+
+        // The barrier belongs to publication: it reconciles file truth and blocks
+        // mutations across the space while it runs. A reader asks the projection what
+        // it currently holds — a package it has not caught up with is answered as
+        // absent, which is the same answer as "published a moment later".
+        if (options?.settle) {
+          if (store.checkpoint) {
+            await store.checkpoint()
+          } else if (store.reconcile) {
+            await store.reconcile()
+            await store.identityReady?.()
+          } else {
+            throw new Error(`space ${space} cannot project a published role package`)
+          }
+        }
+        const notes = await store.list({ scope: READ_SCOPE.all, classes: [NOTE_CLASS.skill] })
+        const byPath = new Map(notes.map((note) => [note.filePath, note]))
+        const projected = new Map<string, string>()
+
+        for (const pkg of packages) {
+          const note = byPath.get(pkg.filePath)
+
+          // A partial answer, by contract: the package may have moved between the
+          // directory scan and this lookup, and every caller already reads a missing
+          // identity as "not listable". Failing the whole call would turn one racing
+          // rename into a 500 for an entire library page.
+          if (!note?.id) {
+            continue
+          }
+          const readable = await store.read(note.id)
+
+          if (readable.filePath === pkg.filePath) {
+            projected.set(pkg.directoryName, note.id)
+          }
+        }
+
+        return projected
       },
     }),
   })

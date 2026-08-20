@@ -1,5 +1,7 @@
 import { useRef, useState } from 'react'
-import { DEFAULT_NOTE_TYPE } from '@notarium/core'
+import type { AuthoredAttachment, OwnedAbilityLocator } from '@notarium/contract'
+import { ABILITY_AVAILABILITY_MODE } from '@notarium/contract/enums'
+import { asciiSlug, DEFAULT_NOTE_TYPE, isSkillName } from '@notarium/core'
 import { deriveNoteTitle } from '@notarium/core/markdown'
 import type { SaveInput } from '../../libs/wire'
 
@@ -30,11 +32,41 @@ const dateInputToIso = (day: string): string => {
   return new Date(y, m - 1, d).toISOString()
 }
 
+/** What "Belongs to" ANSWERS, as one comparable value. The fields behind it are not
+ *  independent — a project list means nothing under "the whole Space" — so dirty is
+ *  judged on the answer alone: switching the segment and switching it back is not an
+ *  edit, the user sees the sentence they started with and Save stays inert.
+ *  canon: docs/web-ui.md#web-react */
+const placementAnswer = (
+  home: 'personal' | 'space',
+  availability:
+    | typeof ABILITY_AVAILABILITY_MODE.allProjects
+    | typeof ABILITY_AVAILABILITY_MODE.selectedProjects,
+  projects: readonly string[],
+): string =>
+  home === 'personal'
+    ? 'personal'
+    : availability === ABILITY_AVAILABILITY_MODE.allProjects
+      ? 'space'
+      : `projects:${[...projects].sort().join(',')}`
+
 // The snapshot taken when editing starts; passing a new object (a new edit/new
 // session) re-seeds the fields. While not editing the hook gets null and stays
 // inert.
 export type Draft = {
   isNew: boolean
+  documentKind?: 'ability'
+  abilityKind?: 'role' | 'skill'
+  abilityLocator?: OwnedAbilityLocator
+  /** The persisted draft this session was seeded from — the key it belongs to and
+   *  whether it came back from storage. Carried BY the draft so the page's writer
+   *  reads the key and the body out of one value. */
+  abilityDraft?: { owner: string; draftId: string; restored: boolean }
+  /** ID-derived fallback for a new Ability whose human H1 has no ASCII handle chars. */
+  abilityNameFallback?: string
+  /** The published package's machine key. Read-only: it is minted once at
+   *  publication, and a rename would rekey every locator that points at it. */
+  abilityName?: string
   /** A virtual folder page (#213 follow-up): no note exists yet, but the editor
    *  is authoring the folder's future `index.md`. Save materialises it lazily. */
   folderPagePath?: string
@@ -54,12 +86,33 @@ export type Draft = {
   content: string
   tags: string[]
   noteType: string
+  /** The ability's short manifest description, the one field the aside edits. */
+  abilityDescription?: string
+  attachments?: AuthoredAttachment[]
+  abilityHome?: 'personal' | 'space'
+  abilitySpace?: string
+  abilitySpaceId?: string
+  abilityAvailability?:
+    typeof ABILITY_AVAILABILITY_MODE.allProjects | typeof ABILITY_AVAILABILITY_MODE.selectedProjects
+  /** The projects the ability covers, by stable project id — the identity the
+   *  server answers with and the only one a project outside the picker survives. */
+  abilityProjects?: string[]
   /** The note's creation instant (#186), full ISO-8601 UTC, for prefilling the
    *  editable date field; null when unknown (a fresh note before it's saved). */
   createdAt: string | null
 }
 
 export type NoteDraftEditor = ReturnType<typeof useNoteDraft>
+
+export const abilityMachineName = (title: string, fallback: string): string => {
+  const fromTitle = asciiSlug(title)
+    .replace(/_/g, '-')
+    .replace(/-+/g, '-')
+    .slice(0, 64)
+    .replace(/-+$/g, '')
+
+  return fromTitle || fallback
+}
 
 // Shared editing state for a note draft. The edit UI is split across regions — the
 // topbar actions, the main column (the document) and the right aside (folder/slug/
@@ -73,6 +126,21 @@ export function useNoteDraft(initialDraft: Draft | null) {
   const [directory, setDirectory] = useState(initialDraft?.directory || '')
   const [tags, setTags] = useState<string[]>(initialDraft?.tags || [])
   const [noteType, setNoteType] = useState(initialDraft?.noteType || DEFAULT_NOTE_TYPE)
+  const [abilityDescription, setAbilityDescription] = useState(
+    initialDraft?.abilityDescription || '',
+  )
+  const [attachments, setAttachments] = useState<AuthoredAttachment[]>(
+    initialDraft?.attachments ?? [],
+  )
+  const [abilityHome, setAbilityHome] = useState<'personal' | 'space'>(
+    initialDraft?.abilityHome ?? 'personal',
+  )
+  const [abilityAvailability, setAbilityAvailability] = useState<
+    typeof ABILITY_AVAILABILITY_MODE.allProjects | typeof ABILITY_AVAILABILITY_MODE.selectedProjects
+  >(initialDraft?.abilityAvailability ?? ABILITY_AVAILABILITY_MODE.allProjects)
+  const [abilityProjects, setAbilityProjects] = useState<string[]>(
+    initialDraft?.abilityProjects ?? [],
+  )
   // The creation date as the picker shows it (#186): the note's instant reduced to a
   // local `YYYY-MM-DD`. '' = no date set yet (a fresh note). The seed it's compared
   // against on save lives in `createdSeed` so a save only sends the date when the
@@ -80,6 +148,7 @@ export function useNoteDraft(initialDraft: Draft | null) {
   const createdSeed = isoToDateInput(initialDraft?.createdAt)
   const [createdDate, setCreatedDate] = useState(createdSeed)
   const [contentDirty, setContentDirty] = useState(false)
+  const [contentVersion, setContentVersion] = useState(0)
   // The title the body currently derives to — recomputed on every edit so the save
   // gate and the slug placeholder track what the user types on the first line.
   const [derivedTitle, setDerivedTitle] = useState(() =>
@@ -112,8 +181,16 @@ export function useNoteDraft(initialDraft: Draft | null) {
     setDirectory(initialDraft?.directory || '')
     setTags(initialDraft?.tags || [])
     setNoteType(initialDraft?.noteType || DEFAULT_NOTE_TYPE)
+    setAbilityDescription(initialDraft?.abilityDescription || '')
+    setAttachments(initialDraft?.attachments ?? [])
+    setAbilityHome(initialDraft?.abilityHome ?? 'personal')
+    setAbilityAvailability(
+      initialDraft?.abilityAvailability ?? ABILITY_AVAILABILITY_MODE.allProjects,
+    )
+    setAbilityProjects(initialDraft?.abilityProjects ?? [])
     setCreatedDate(isoToDateInput(initialDraft?.createdAt))
     setContentDirty(false)
+    setContentVersion(0)
     setDerivedTitle(deriveNoteTitle(initialDraft?.content || ''))
   }
 
@@ -128,9 +205,15 @@ export function useNoteDraft(initialDraft: Draft | null) {
   const onContentChange = () => {
     const body = readContent()
     setContentDirty(body !== (initialDraft?.content || ''))
+    setContentVersion((version) => version + 1)
     setDerivedTitle(deriveNoteTitle(body))
   }
 
+  // The ordered attachment list diverged from the snapshot. Published separately
+  // because a save sends attachments ONLY then: an unrelated instruction save must
+  // preserve the invalid raw rows the server is still holding.
+  const attachmentsDirty =
+    JSON.stringify(attachments) !== JSON.stringify(initialDraft?.attachments ?? [])
   // Dirty when any aside field diverges from the initial snapshot, or the body
   // changed (the body now carries the title, so a title edit flips contentDirty).
   // Tags compared via JSON so order matters and tag values containing spaces or
@@ -139,6 +222,14 @@ export function useNoteDraft(initialDraft: Draft | null) {
     slug !== (initialDraft?.slug || '') ||
     directory !== (initialDraft?.directory || '') ||
     noteType !== (initialDraft?.noteType || DEFAULT_NOTE_TYPE) ||
+    abilityDescription !== (initialDraft?.abilityDescription || '') ||
+    attachmentsDirty ||
+    placementAnswer(abilityHome, abilityAvailability, abilityProjects) !==
+      placementAnswer(
+        initialDraft?.abilityHome ?? 'personal',
+        initialDraft?.abilityAvailability ?? ABILITY_AVAILABILITY_MODE.allProjects,
+        initialDraft?.abilityProjects ?? [],
+      ) ||
     createdDate !== createdSeed ||
     JSON.stringify(tags) !== JSON.stringify(initialDraft?.tags || [])
   const dirty = !!initialDraft && (fieldsDirty || contentDirty)
@@ -151,27 +242,62 @@ export function useNoteDraft(initialDraft: Draft | null) {
   // from a single source of truth.
   const isNew = !!initialDraft?.isNew
   const saveRequiresDirty = !!initialDraft?.saveRequiresDirty
-  const canSave = !!derivedTitle.trim() && ((isNew && !saveRequiresDirty) || dirty)
+  // A NEW ability mints its key from the title it is being given; a published one
+  // keeps the key it was minted with — there is no field that edits it.
+  const abilityName =
+    initialDraft?.documentKind === 'ability' && isNew
+      ? abilityMachineName(derivedTitle, initialDraft.abilityNameFallback ?? '')
+      : (initialDraft?.abilityName ?? '').trim()
+  // Asked, not restated: the machine name the editor accepts is the one the package
+  // may carry, LENGTH included — a bound this door used to leave to the server.
+  const abilityNameValid = isSkillName(abilityName)
+  // "Only these projects" with nothing chosen is not a reach — it is an ability
+  // nobody can use, arrived at by accident. Asked of a new and an existing ability
+  // alike: an empty selection would reach the server as a reach nobody can use and
+  // come back as a rejected save.
+  const abilityPlacementValid =
+    initialDraft?.documentKind !== 'ability' ||
+    abilityHome !== 'space' ||
+    abilityAvailability === ABILITY_AVAILABILITY_MODE.allProjects ||
+    abilityProjects.length > 0
+  const documentValid =
+    initialDraft?.documentKind === 'ability'
+      ? abilityNameValid && Boolean(derivedTitle.trim()) && abilityPlacementValid
+      : Boolean(derivedTitle.trim())
+  const canSave = documentValid && ((isNew && !saveRequiresDirty) || dirty)
 
   // The editor's camelCase save view (libs/wire SaveInput) — the api service
   // assembles the snake wire body from it; the form never spells the wire. No
   // `title` since #156: the server derives it from `content` at the write chokepoint.
-  const buildPayload = (): SaveInput => ({
-    // Always addressed (#100 phase 1): a value sets the custom slug, '' clears it back
-    // to the implicit default. The host softens/lazies it (storedSlug).
-    slug: slug.trim(),
-    directory: directory.trim(),
-    noteType: noteType.trim() || DEFAULT_NOTE_TYPE,
-    tags,
-    content: readContent(),
-    // Authored creation date (#186): sent ONLY when the user moved it off the seed
-    // AND a day is set — so a normal save never restamps `created`, and clearing the
-    // field is a no-op (there's no "reset to birthtime" channel in scope). Built as
-    // the picked day's LOCAL midnight ISO instant.
-    ...(createdDate && createdDate !== createdSeed
-      ? { createdAt: dateInputToIso(createdDate) }
-      : {}),
-  })
+  const buildPayload = (): SaveInput => {
+    if (initialDraft?.documentKind === 'ability') {
+      // ADDRESSLESS on purpose: an ability's package can be relocated by the very
+      // save that carries this payload, so the address is the save run's to state
+      // (helpers/abilitySave) — a snapshot address would retry into a 404.
+      return {
+        content: readContent(),
+        name: abilityName,
+        description: abilityDescription.trim(),
+      }
+    }
+
+    return {
+      // Always addressed (#100 phase 1): a value sets the custom slug, '' clears it back
+      // to the implicit default. The host softens/lazies it (storedSlug).
+      slug: slug.trim(),
+      directory: directory.trim(),
+      noteType: noteType.trim() || DEFAULT_NOTE_TYPE,
+      tags,
+      content: readContent(),
+      // Authored creation date (#186): sent ONLY when the user moved it off the seed
+      // AND a day is set — so a normal save never restamps `created`, and clearing the
+      // field is a no-op (there's no "reset to birthtime" channel in scope). Built as
+      // the picked day's LOCAL midnight ISO instant.
+      ...(createdDate && createdDate !== createdSeed
+        ? { createdAt: dateInputToIso(createdDate) }
+        : {}),
+    }
+  }
 
   return {
     slug,
@@ -182,15 +308,32 @@ export function useNoteDraft(initialDraft: Draft | null) {
     setTags,
     noteType,
     setNoteType,
+    abilityDescription,
+    setAbilityDescription,
+    attachments,
+    setAttachments,
+    attachmentsDirty,
+    abilityHome,
+    setAbilityHome,
+    abilityAvailability,
+    setAbilityAvailability,
+    abilityProjects,
+    setAbilityProjects,
     createdDate,
     setCreatedDate,
     registerContent,
     onContentChange,
+    contentVersion,
     dirty,
     canSave,
     buildPayload,
     isNew,
     lockDirectory: !!initialDraft?.lockDirectory,
+    isAbility: initialDraft?.documentKind === 'ability',
+    abilityKind: initialDraft?.abilityKind,
+    abilitySpace: initialDraft?.abilitySpace ?? '',
+    abilitySpaceId: initialDraft?.abilitySpaceId ?? '',
+    abilityMachineName: abilityName,
     content: initialDraft?.content || '',
     /** The title the body derives to (#156) — read-only, for the slug placeholder.
      *  The note has no editable title field; this just mirrors the leading `# H1`. */

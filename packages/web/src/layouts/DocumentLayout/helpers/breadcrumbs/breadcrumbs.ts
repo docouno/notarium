@@ -1,6 +1,12 @@
-import { NOTE_CLASS } from '@notarium/contract/enums'
+import { ABILITY_KIND, NOTE_CLASS } from '@notarium/contract/enums'
 import { isFolderPageNote } from '@notarium/core'
-import { folderPageHref, folderRoute } from '../../../../libs/routing/routePaths'
+import {
+  agentRolesRoute,
+  agentSkillsRoute,
+  agentsRoute,
+  folderPageHref,
+  folderRoute,
+} from '../../../../libs/routing/routePaths'
 import type { NoteDetailView, Tree, TreeFolder } from '../../../../libs/wire'
 import type { Crumb } from '../../../Breadcrumbs'
 
@@ -48,6 +54,17 @@ export const buildTrail = ({
       : []
 
   const isMemory = note?.class === NOTE_CLASS.agentMemory
+
+  if (note?.class === NOTE_CLASS.skill) {
+    const name = typeof note.frontmatter?.name === 'string' ? note.frontmatter.name : note.title
+    const role = note.agentKind === ABILITY_KIND.role
+
+    return [
+      { label: 'Agents', href: agentsRoute() },
+      { label: role ? 'Roles' : 'Skills', href: role ? agentRolesRoute() : agentSkillsRoute() },
+      { label: name || (role ? 'Role' : 'Skill') },
+    ]
+  }
 
   return note
     ? breadcrumb

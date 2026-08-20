@@ -27,6 +27,7 @@ export type NoteSuggestion = {
   createdAt: string | null
   noteType?: string
   snippet?: string
+  href?: string
 }
 
 export type NoteSuggestions = {
@@ -132,6 +133,7 @@ export const useNoteSuggestions = (
       noteType?: string
       modifiedAt?: string | null
       createdAt?: string | null
+      href?: string
     }) => {
       if (seen.has(n.id)) {
         return
@@ -146,6 +148,7 @@ export const useNoteSuggestions = (
         noteType: n.noteType,
         modifiedAt: n.modifiedAt ?? backfill?.modifiedAt ?? null,
         createdAt: n.createdAt ?? backfill?.createdAt ?? null,
+        href: n.href,
       })
     }
 
@@ -162,6 +165,12 @@ export const useNoteSuggestions = (
     return out.slice(0, RECENT_LIMIT)
   }, [recent, modified])
 
+  // A SEARCH hit never carries an exact route, and joining one onto it from the MRU —
+  // which this hook briefly did — was a fix for a case the read model does not produce.
+  // An Owned Ability's document is class `skill`, and `skill` is `userSearch:false`
+  // (`core/visibility/policy.ts`): the read model drops it from every user-scoped
+  // search, so a hit for one cannot arrive here at all. Recent is a different half and
+  // genuinely carries `href`, because the visit that recorded the row knew the route.
   const hits = useMemo<NoteSuggestion[] | null>(() => {
     if (!q) {
       return null

@@ -140,7 +140,7 @@ describe('InMemoryStore document-state parity', () => {
     expect(a.versionToken).toBe(b.versionToken)
   })
 
-  it('only classifies a linked skill resource under a valid direct skill root', async () => {
+  it('classifies linked resources under a positional skill root after manifest rename', async () => {
     const valid = new InMemoryStore({
       space: 'main',
       notes: [
@@ -195,7 +195,7 @@ describe('InMemoryStore document-state parity', () => {
         },
       ],
     })
-    const invalid = new InMemoryStore({
+    const renamed = new InMemoryStore({
       space: 'main',
       notes: [
         {
@@ -204,7 +204,7 @@ describe('InMemoryStore document-state parity', () => {
           class: 'skill',
           filePath: 'skills/demo/SKILL.md',
           content: 'Instructions',
-          frontmatter: 'name: other\ndescription: Wrong directory',
+          frontmatter: 'name: other\ndescription: Renamed package',
         },
         {
           id: 'helper',
@@ -247,10 +247,133 @@ describe('InMemoryStore document-state parity', () => {
       DOCUMENT_ROLE.skillAuxiliary,
     )
     expect((await missing.read('helper')).documentState?.role).toBe(DOCUMENT_ROLE.generic)
-    expect((await invalid.read('helper')).documentState?.role).toBe(DOCUMENT_ROLE.generic)
+    expect((await renamed.read('helper')).documentState?.role).toBe(DOCUMENT_ROLE.skillAuxiliary)
     expect((await ancestorOnly.read('nested-helper')).documentState?.role).toBe(
       DOCUMENT_ROLE.generic,
     )
+  })
+
+  /** "Is this the package ROOT?" has exactly one producer in the fake, and it is the
+   *  one the real engine uses (`isSkillPackageRootPath` — root BY DEPTH). A manifest
+   *  BASENAME at any other depth is an ordinary auxiliary, so `<pkg>/references/SKILL.md`
+   *  must (a) be writable at all and stay auxiliary, and (b) follow its title on rename
+   *  like any other note. Reading already answered this canonically; the write fence and
+   *  the rename guard answered it by filename suffix and disagreed with both the read
+   *  beside them and NotariumStore. Parity anchor for (b):
+   *  packages/core/src/cachedStore/helpers/writeEngine/writeEngine.test.ts. */
+  it('writes a nested SKILL.md as an auxiliary and lets its title rename it', async () => {
+    const store = new InMemoryStore({
+      space: 'main',
+      notes: [
+        {
+          id: 'root',
+          title: 'demo',
+          class: 'skill',
+          filePath: 'skills/demo/SKILL.md',
+          content: 'Instructions',
+          frontmatter: 'name: demo\ndescription: Demo skill',
+        },
+      ],
+    })
+    const created = await store.write({
+      id: 'nested-skill-name',
+      title: 'Nested SKILL',
+      content: 'Nested reference',
+      targetClass: 'skill',
+      restorePath: 'skills/demo/references/SKILL.md',
+    })
+
+    expect(created.filePath).toBe('skills/demo/references/SKILL.md')
+
+    const live = await store.read('nested-skill-name')
+
+    expect(live.documentState?.role).toBe(DOCUMENT_ROLE.skillAuxiliary)
+
+    const renamed = await store.write({
+      originalId: 'nested-skill-name',
+      title: 'Renamed Helper',
+      content: 'Nested reference',
+      versionToken: live.versionToken,
+      expectedSource: live.physicalIncarnation,
+    })
+
+    expect(renamed.filePath).toBe('skills/demo/references/renamed-helper.md')
+  })
+
+  /** Divergence (b) on its own, reached without the manifest fence: an ALREADY seeded
+   *  `<pkg>/references/SKILL.md` is an auxiliary, so a title change moves it like any
+   *  other note. Only the package ROOT is pinned to its path (the real engine's
+   *  `preserveCurrentPath`, NotariumStore write). */
+  it('keeps the package root pinned while a nested SKILL.md follows its title', async () => {
+    const store = new InMemoryStore({
+      space: 'main',
+      notes: [
+        {
+          id: 'root',
+          title: 'demo',
+          class: 'skill',
+          filePath: 'skills/demo/SKILL.md',
+          content: 'Instructions',
+          frontmatter: 'name: demo\ndescription: Demo skill',
+        },
+        {
+          id: 'nested-skill-name',
+          title: 'Nested SKILL',
+          class: 'skill',
+          filePath: 'skills/demo/references/SKILL.md',
+          content: 'Nested reference',
+        },
+      ],
+    })
+    const nested = await store.read('nested-skill-name')
+    const renamedNested = await store.write({
+      originalId: 'nested-skill-name',
+      title: 'Renamed Helper',
+      content: 'Nested reference',
+      versionToken: nested.versionToken,
+      expectedSource: nested.physicalIncarnation,
+    })
+
+    expect(renamedNested.filePath).toBe('skills/demo/references/renamed-helper.md')
+
+    const root = await store.read('root')
+    const renamedRoot = await store.write({
+      originalId: 'root',
+      title: 'Demo renamed',
+      content: 'Instructions',
+      versionToken: root.versionToken,
+      expectedSource: root.physicalIncarnation,
+    })
+
+    expect(renamedRoot.filePath).toBe('skills/demo/SKILL.md')
+  })
+
+  /** The same producer, seen from the other side: a manifest basename directly under
+   *  the skill MOUNT (`skills/SKILL.md`) is not a package root either — it has no
+   *  package directory to name — so it neither passes the manifest fence nor pins
+   *  its own path. Reading already treats it that way (`ancestorOnly` above). */
+  it('treats a mount-level SKILL.md as an ordinary note on the write paths', async () => {
+    const store = new InMemoryStore({ space: 'main', notes: [] })
+    const created = await store.write({
+      id: 'mount-level',
+      title: 'Mount level',
+      content: 'no manifest frontmatter here',
+      targetClass: 'skill',
+      restorePath: 'skills/SKILL.md',
+    })
+
+    expect(created.filePath).toBe('skills/SKILL.md')
+
+    const live = await store.read('mount-level')
+    const renamed = await store.write({
+      originalId: 'mount-level',
+      title: 'Mount level renamed',
+      content: 'no manifest frontmatter here',
+      versionToken: live.versionToken,
+      expectedSource: live.physicalIncarnation,
+    })
+
+    expect(renamed.filePath).toBe('skills/mount-level-renamed.md')
   })
 })
 

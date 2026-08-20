@@ -15,6 +15,8 @@
 // = false); the read-model (CachedStore) is the single chokepoint that hides
 // classes per surface. In production every engine sits behind the read-model.
 
+import { randomUUID } from 'node:crypto'
+
 import type {
   BackgroundGate,
   ExportEntry,
@@ -26,6 +28,7 @@ import type {
   ListOptions,
   MoveInput,
   MoveResult,
+  MutationOptions,
   NoteChange,
   NoteClass,
   NoteContent,
@@ -103,6 +106,7 @@ import {
   resolveLink,
   sha256Hex,
   shapeGraph,
+  skillNameConflict,
   skillPackagePathOf,
   sluggedNoteName,
   STORAGE_OWNER_KEY,
@@ -172,6 +176,19 @@ type ReconcileRow = Pick<NoteRow, 'path' | 'class' | 'mtime_ms' | 'size' | 'seq'
   change_token: string | null
   source_hash: string | null
 }
+
+/** The engine's ONE way to read a note's bytes as text — the same one
+ *  `FileStore.read` already answers with (`Buffer.toString('utf8')`), so a file's
+ *  text is the same string whichever door produced it. A default `TextDecoder` is
+ *  not that door: it eats a leading U+FEFF, and a vault holds files a Windows
+ *  editor (or a restore) wrote with one. The index fingerprints a note through
+ *  `FileStore.read`, so a write path that decoded the same bytes without the mark
+ *  hashed a DIFFERENT string and the CAS fence refused every save of such a note
+ *  forever. Decoding must be the exact inverse of the `TextEncoder` this file
+ *  writes back with; `ignoreBOM: true` means "emit the mark", not "skip past it".
+ *  Non-strict on purpose: an undecodable byte becomes U+FFFD here exactly as it
+ *  does for `FileStore.read`, and this decoder must not disagree with it. */
+const NOTE_TEXT_UTF8 = new TextDecoder('utf-8', { ignoreBOM: true })
 
 const RESOURCE_OBSERVATION_CLAIM_KIND = 'resource-observation-v1'
 
@@ -2313,7 +2330,7 @@ export class NotariumStore implements KnowledgeStore {
     ) {
       throw new Error('mutation receipt does not prove the published note')
     }
-    const raw = new TextDecoder().decode(source)
+    const raw = NOTE_TEXT_UTF8.decode(source)
 
     await this.upsertRow(
       fullPath,
@@ -2550,9 +2567,13 @@ export class NotariumStore implements KnowledgeStore {
    *  stray notes, sibling markers, nested empty dirs) and drop the index rows it
    *  covered. CachedStore removes journaled notes first, so by here the subtree is
    *  usually just empty dir shells + markers; this is the wholesale cleanup. */
-  async removeDir(path: string): Promise<void> {
+  async removeDir(path: string, opts?: MutationOptions): Promise<void> {
     await this.ensureReady()
-    if (!isCanonicalSafeRelativeAddress(path)) {
+    if (
+      !(opts?.internalAddress
+        ? isCanonicalInternalRelativeAddress(path)
+        : isCanonicalSafeRelativeAddress(path))
+    ) {
       throw moveFailed('folder path contains an invalid durable string')
     }
     const clean = path.replace(/^\/+|\/+$/g, '')
@@ -2560,30 +2581,64 @@ export class NotariumStore implements KnowledgeStore {
     if (!clean) {
       return
     }
-    const mount = this.mountForPath(clean)
-    const rel = this.relIn(mount, clean)
+    const packageLease =
+      opts?.internalAddress && this.resourceAuthority
+        ? await this.resourceAuthority.admitSkillPlacement(
+            `${clean}/SKILL.md`,
+            'exclusive',
+            'notarium-remove-skill-package',
+          )
+        : null
 
-    // Destructive directory sources are RAW identities. On an insensitive medium
-    // `docs` may reach a physical `Docs`, while the BINARY index/journal only know
-    // `Docs`; accepting that alternate spelling would delete bytes without victims.
-    if (!(await mount.files.listDirs()).includes(rel)) {
-      return
+    try {
+      const mount = this.mountForPath(clean)
+      const rel = this.relIn(mount, clean)
+
+      // Destructive directory sources are RAW identities. On an insensitive medium
+      // `docs` may reach a physical `Docs`, while the BINARY index/journal only know
+      // `Docs`; accepting that alternate spelling would delete bytes without victims.
+      if (!(await mount.files.listDirs()).includes(rel)) {
+        return
+      }
+      if (!opts?.internalAddress) {
+        await mount.files.removeDir(rel)
+      } else {
+        if (!mount.files.renameDirIfAbsent) {
+          throw moveFailed('storage cannot atomically detach a skill package')
+        }
+        const staging = `${directoryOf(rel) ? `${directoryOf(rel)}/` : ''}.${basenameOf(
+          rel,
+        )}.delete-${randomUUID()}`
+
+        await opts.beforeDetach?.()
+        if (!(await mount.files.renameDirIfAbsent(rel, staging))) {
+          throw moveFailed('skill package changed during delete')
+        }
+        try {
+          await opts.afterDetach?.()
+          await mount.files.removeDir(staging)
+        } catch (error) {
+          await mount.files.renameDirIfAbsent(staging, rel).catch(() => false)
+          throw error
+        }
+      }
+      const prefix = `${clean}/`
+
+      await this.sql.run(
+        `DELETE FROM notes
+         WHERE path = ? COLLATE BINARY
+            OR substr(path, 1, length(?)) = ? COLLATE BINARY`,
+        [clean, prefix, prefix],
+      )
+      this.invalidateGraphCache() // removing notes can change the wikilink graph (#81 Stage 4b)
+      // Dropping a whole subtree (a project, a deep folder) can free a lot of index
+      // pages at runtime — the one bulk-free path that isn't a boot teardown or an
+      // embed re-write (#198). Compact them back to the OS instead of waiting for the
+      // next boot; no-ops on a small freelist, so a tiny folder delete costs nothing.
+      this.scheduleReclaim()
+    } finally {
+      packageLease?.settle()
     }
-    await mount.files.removeDir(rel)
-    const prefix = `${clean}/`
-
-    await this.sql.run(
-      `DELETE FROM notes
-       WHERE path = ? COLLATE BINARY
-          OR substr(path, 1, length(?)) = ? COLLATE BINARY`,
-      [clean, prefix, prefix],
-    )
-    this.invalidateGraphCache() // removing notes can change the wikilink graph (#81 Stage 4b)
-    // Dropping a whole subtree (a project, a deep folder) can free a lot of index
-    // pages at runtime — the one bulk-free path that isn't a boot teardown or an
-    // embed re-write (#198). Compact them back to the OS instead of waiting for the
-    // next boot; no-ops on a small freelist, so a tiny folder delete costs nothing.
-    this.scheduleReclaim()
   }
 
   /** Stream every source file for a base export (#17). Walks the on-disk truth
@@ -2656,17 +2711,24 @@ export class NotariumStore implements KnowledgeStore {
 
     if (this.resourceAuthority && row.class === 'skill' && !skillRoot) {
       if (packagePath) {
-        const linked = await this.resourceAuthority.observeLinked(
-          row.path,
-          `${packagePath}/SKILL.md`,
-          (target) =>
-            analyzeDocumentState({
-              source: target.bytes,
-              role: DOCUMENT_ROLE.skillRoot,
-              skillDirectoryName: basenameOf(packagePath),
-            }).format === DOCUMENT_STATE_FORMAT.skill,
-          { owner: 'notarium-read-skill-auxiliary' },
-        )
+        const validateTarget = (target: ResourceObservation & { kind: 'present' }): boolean =>
+          analyzeDocumentState({
+            source: target.bytes,
+            role: DOCUMENT_ROLE.skillRoot,
+            skillDirectoryName: basenameOf(packagePath),
+          }).format === DOCUMENT_STATE_FORMAT.skill
+        const linked = opts?.resourceAdmitted
+          ? await this.resourceAuthority.observeLinkedAdmitted(
+              row.path,
+              `${packagePath}/SKILL.md`,
+              validateTarget,
+            )
+          : await this.resourceAuthority.observeLinked(
+              row.path,
+              `${packagePath}/SKILL.md`,
+              validateTarget,
+              { owner: 'notarium-read-skill-auxiliary' },
+            )
 
         if (linked) {
           observation = linked.source
@@ -2675,7 +2737,9 @@ export class NotariumStore implements KnowledgeStore {
       }
     }
     observation ??= this.resourceAuthority
-      ? await this.resourceAuthority.observe(row.path, { owner: 'notarium-read' })
+      ? opts?.resourceAdmitted
+        ? await this.resourceAuthority.observeStrictAdmitted(row.path)
+        : await this.resourceAuthority.observe(row.path, { owner: 'notarium-read' })
       : undefined
 
     if (observation?.kind === 'unavailable' || observation?.kind === 'occupied') {
@@ -2695,7 +2759,7 @@ export class NotariumStore implements KnowledgeStore {
       exactSource !== undefined
         ? exactSource == null
           ? null
-          : new TextDecoder().decode(exactSource)
+          : NOTE_TEXT_UTF8.decode(exactSource)
         : await mount.files.read(relativePath)
 
     if (raw == null) {
@@ -3542,6 +3606,7 @@ export class NotariumStore implements KnowledgeStore {
     const preserveCurrentPath =
       sourceRow != null &&
       (preservePath ||
+        (mount.class === 'skill' && isSkillPackageRootPath(sourceRel)) ||
         (title === sourceRow.title && fileName == null && dir === directoryOf(sourceRel)))
     // The id the READ-MODEL settled comes first, and the file's own claim is only the
     // fallback: the mutation fence (`WriteEngine.predictedPath`) predicts with that same
@@ -3630,7 +3695,7 @@ export class NotariumStore implements KnowledgeStore {
     const guardedRaw = guarded
       ? mutationObservation
         ? mutationObservation.kind === 'present'
-          ? new TextDecoder().decode(mutationObservation.bytes)
+          ? NOTE_TEXT_UTF8.decode(mutationObservation.bytes)
           : null
         : await mount.files.read(destRel)
       : null
@@ -3732,7 +3797,7 @@ export class NotariumStore implements KnowledgeStore {
       : existingSource !== undefined
         ? existingSource == null
           ? null
-          : new TextDecoder().decode(existingSource)
+          : NOTE_TEXT_UTF8.decode(existingSource)
         : await mount.files.read(renameSource ? sourceRel : destRel)
 
     if (createWithoutOverwrite && existingRaw != null) {
@@ -3803,6 +3868,21 @@ export class NotariumStore implements KnowledgeStore {
     })
 
     const candidateSource = new TextEncoder().encode(bytes)
+    const candidateSkillRoot =
+      mount.class === 'skill' && isSkillPackageRootPath(this.relIn(mount, dest))
+
+    if (candidateSkillRoot) {
+      const packagePath = skillPackagePathOf(this.relIn(mount, dest))!
+      const candidateState = analyzeDocumentState({
+        source: candidateSource,
+        role: DOCUMENT_ROLE.skillRoot,
+        skillDirectoryName: basenameOf(packagePath),
+      })
+
+      if (candidateState.format !== DOCUMENT_STATE_FORMAT.skill) {
+        throw writeFailed('invalid Agent Skill manifest')
+      }
+    }
     let mutationReceipt: MutationReceipt | undefined
 
     if (this.resourceAuthority) {
@@ -3810,10 +3890,41 @@ export class NotariumStore implements KnowledgeStore {
         throw writeFailed('storage did not provide a mutation observation')
       }
       const packagePath = this.packagePathFor(mount, renameSource ? sourceRel : destRel)
-      const publication = renameSource
-        ? mutationObservation.kind === 'present' && targetObservation?.kind === 'absent'
-          ? await this.resourceAuthority.publish(
-              {
+      const placementLease = candidateSkillRoot
+        ? await this.resourceAuthority.admitSkillPlacement(
+            dest,
+            'exclusive',
+            'notarium-skill-write',
+          )
+        : null
+      let publication
+
+      try {
+        if (placementLease) {
+          try {
+            await this.resourceAuthority.assertSkillManifestNameAvailableAdmitted(
+              dest,
+              candidateSource,
+            )
+          } catch (error) {
+            if ((error as { code?: string }).code === 'SKILL_NAME_CONFLICT') {
+              const state = analyzeDocumentState({
+                source: candidateSource,
+                role: DOCUMENT_ROLE.skillRoot,
+                skillDirectoryName: basenameOf(skillPackagePathOf(destRel)!),
+              })
+              throw skillNameConflict(state.projection?.skill?.name ?? title)
+            }
+            throw error
+          }
+        }
+        const publish = placementLease
+          ? this.resourceAuthority.publishAdmitted.bind(this.resourceAuthority)
+          : (request: Parameters<SpaceResourceAuthority['publish']>[0]) =>
+              this.resourceAuthority!.publish(request, { owner: 'notarium-write' })
+        publication = renameSource
+          ? mutationObservation.kind === 'present' && targetObservation?.kind === 'absent'
+            ? await publish({
                 kind: 'move-put',
                 sourcePath: renameSource,
                 targetPath: dest,
@@ -3821,20 +3932,18 @@ export class NotariumStore implements KnowledgeStore {
                 expectedSource: mutationObservation.claim,
                 expectedTarget: targetObservation.claim,
                 ...(packagePath ? { packagePath } : {}),
-              },
-              { owner: 'notarium-write' },
-            )
-          : { status: 'conflict' as const }
-        : await this.resourceAuthority.publish(
-            {
+              })
+            : ({ status: 'conflict' } as const)
+          : await publish({
               kind: 'put',
               path: dest,
               content: candidateSource,
               expected: mutationObservation.claim,
               ...(packagePath ? { packagePath } : {}),
-            },
-            { owner: 'notarium-write' },
-          )
+            })
+      } finally {
+        placementLease?.settle()
+      }
 
       if (publication.status === 'conflict') {
         if (renameSource) {
@@ -4258,7 +4367,7 @@ export class NotariumStore implements KnowledgeStore {
       ) {
         throw writeFailed('note physical incarnation changed during delete')
       }
-      expected = new TextDecoder().decode(observation.bytes)
+      expected = NOTE_TEXT_UTF8.decode(observation.bytes)
     }
 
     if (opts?.physicalWriteClaim && !opts.expectedSource) {

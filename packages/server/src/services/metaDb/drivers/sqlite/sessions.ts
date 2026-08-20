@@ -1,3 +1,4 @@
+import { parseAbilityLocator, serializeAbilityLocator } from '@notarium/core'
 import type {
   AgentSessionNamedStart,
   AgentSessionRecord,
@@ -15,6 +16,15 @@ type AgentSessionRow = {
   last_seen_at: string
   calls: number
   role: string | null
+  role_locator: string | null
+  role_context_project_id: string | null
+}
+
+const roleLocatorOf = (value: string | null): AgentSessionRecord['roleLocator'] => {
+  const locator = value ? parseAbilityLocator(value) : null
+  // A bound role is a role of either shippable source. Narrowing to `owned` here is
+  // what would leave a System activation unable to survive its own resume.
+  return locator?.kind === 'role' && locator.source !== 'catalog' ? locator : null
 }
 
 const sessionOf = (row: AgentSessionRow): AgentSessionRecord => ({
@@ -27,16 +37,19 @@ const sessionOf = (row: AgentSessionRow): AgentSessionRecord => ({
   lastSeenAt: row.last_seen_at,
   calls: row.calls,
   role: row.role,
+  roleLocator: roleLocatorOf(row.role_locator),
+  roleContextProjectId: row.role_context_project_id,
 })
 
-const COLUMNS = 'id, owner, name, named, parent_id, created_at, last_seen_at, calls, role'
+const COLUMNS =
+  'id, owner, name, named, parent_id, created_at, last_seen_at, calls, role, role_locator, role_context_project_id'
 
 const insertSession = (ctx: SqliteDriverCtx, session: AgentSessionRecord): AgentSessionRecord => {
   const row = ctx.required
     .prepare(
       `INSERT INTO agent_sessions
-         (id, owner, name, named, parent_id, created_at, last_seen_at, calls, role)
-       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+         (id, owner, name, named, parent_id, created_at, last_seen_at, calls, role, role_locator, role_context_project_id)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         WHERE ? IS NULL
            OR EXISTS (
              SELECT 1 FROM agent_sessions
@@ -54,6 +67,8 @@ const insertSession = (ctx: SqliteDriverCtx, session: AgentSessionRecord): Agent
       session.lastSeenAt,
       session.calls,
       session.role,
+      session.roleLocator ? serializeAbilityLocator(session.roleLocator) : null,
+      session.roleContextProjectId,
       session.parentId,
       session.parentId,
       session.owner,
@@ -131,6 +146,8 @@ export const createSessionsFacet = (ctx: SqliteDriverCtx): AgentSessionsPersiste
               ...candidate,
               parentId: match.id,
               role: match.role,
+              roleLocator: roleLocatorOf(match.role_locator),
+              roleContextProjectId: match.role_context_project_id,
             }),
           }
         } else {
@@ -178,13 +195,24 @@ export const createSessionsFacet = (ctx: SqliteDriverCtx): AgentSessionsPersiste
         ctx.required.exec('COMMIT')
         return null
       }
-      const changed = before.role !== role
+      const changed =
+        before.role !== role.name ||
+        before.role_locator !== serializeAbilityLocator(role.locator) ||
+        before.role_context_project_id !== role.contextProjectId
       const row = changed
         ? (ctx.required
             .prepare(
-              `UPDATE agent_sessions SET role = ? WHERE owner = ? AND id = ? RETURNING ${COLUMNS}`,
+              `UPDATE agent_sessions
+                  SET role = ?, role_locator = ?, role_context_project_id = ?
+                WHERE owner = ? AND id = ? RETURNING ${COLUMNS}`,
             )
-            .get(role, owner, id) as AgentSessionRow)
+            .get(
+              role.name,
+              serializeAbilityLocator(role.locator),
+              role.contextProjectId,
+              owner,
+              id,
+            ) as AgentSessionRow)
         : before
       ctx.required.exec('COMMIT')
       return { record: sessionOf(row), changed }
@@ -197,6 +225,9 @@ export const createSessionsFacet = (ctx: SqliteDriverCtx): AgentSessionsPersiste
   },
   prune: async (before) => {
     await ctx.ensureInit()
-    ctx.required.prepare('DELETE FROM agent_sessions WHERE last_seen_at < ?').run(before)
+    const rows = ctx.required
+      .prepare('DELETE FROM agent_sessions WHERE last_seen_at < ? RETURNING owner')
+      .all(before) as Array<{ owner: string }>
+    return [...new Set(rows.map(({ owner }) => owner))].sort()
   },
 })

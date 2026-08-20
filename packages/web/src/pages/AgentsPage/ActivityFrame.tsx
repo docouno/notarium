@@ -6,12 +6,7 @@ import type {
   AgentSessionEventAggregates,
 } from '@notarium/contract'
 import { useChrome } from '../../composers/ChromeProvider'
-import { AsideGroups, type AsidePanelDef } from '../../core/AsideGroups'
-import { IconPanelRight } from '../../core/Icons'
-import { IconToggle } from '../../core/IconToggle'
-import { type Crumb } from '../../layouts/Breadcrumbs'
-import { SettingsLayout } from '../../layouts/SettingsLayout'
-import { agentActivityRoute } from '../../libs/routing/routePaths'
+import type { AsidePanelDef } from '../../core/AsideGroups'
 import { STORAGE_KEYS } from '../../libs/storageKeys'
 import { api } from '../../services/api'
 import { ActivityDiagnostics, ActivityFilters } from './ActivityAside'
@@ -22,7 +17,8 @@ import {
   patchActivityState,
   readActivityState,
 } from './activityState'
-import { AgentsTabs } from './AgentsTabs'
+import { AgentsPanel } from './AgentsPanel'
+import { useAgentsShell } from './AgentsProvider'
 
 const ACTIVITY_LAYOUT = [{ panels: ['filters', 'diagnostics'], activeTab: 'filters' }]
 
@@ -35,22 +31,6 @@ type ActivityFrameContext = {
 
 export const useActivityFrame = (): ActivityFrameContext => useOutletContext<ActivityFrameContext>()
 
-const useNarrowActivityAside = () => {
-  const [narrow, setNarrow] = useState(
-    () => typeof window !== 'undefined' && window.matchMedia('(max-width: 720px)').matches,
-  )
-
-  useEffect(() => {
-    const media = window.matchMedia('(max-width: 720px)')
-    const update = () => setNarrow(media.matches)
-    update()
-    media.addEventListener('change', update)
-    return () => media.removeEventListener('change', update)
-  }, [])
-
-  return narrow
-}
-
 /** One route-level shell for the complete Activity section. Overview/episode
  *  navigation swaps only the outlet, so the aside, its loaded diagnostics and
  *  the centre-column geometry remain alive. */
@@ -58,22 +38,18 @@ export const ActivityFrame = () => {
   const { id } = useParams<{ id: string }>()
   const [searchParams, setSearchParams] = useSearchParams()
   const state = readActivityState(searchParams)
-  const { asideOpen, toggleAside } = useChrome()
-  const narrowAside = useNarrowActivityAside()
-  const previousAsideOpen = useRef(asideOpen)
-  const openerRef = useRef<HTMLButtonElement>(null)
+  const { asideOpen } = useChrome()
   const aggregateAbort = useRef<AbortController | null>(null)
   const [aggregates, setAggregates] = useState<AgentSessionEventAggregates | null>(null)
-  const [detailTitle, setDetailTitle] = useState<string | null>(null)
   const [aggregateStatus, setAggregateStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>(
     'idle',
   )
   const aggregateRequestSeq = useRef(0)
-  const focusAsideOnOpen = asideOpen && !previousAsideOpen.current
-
-  useEffect(() => {
-    previousAsideOpen.current = asideOpen
-  }, [asideOpen])
+  const { setBreadcrumbTail } = useAgentsShell()
+  const setDetailTitle = useCallback(
+    (title: string | null) => setBreadcrumbTail(title ? { label: title } : null),
+    [setBreadcrumbTail],
+  )
 
   const loadAggregates = useCallback(async () => {
     const seq = ++aggregateRequestSeq.current
@@ -137,7 +113,7 @@ export const ActivityFrame = () => {
     if (!id) {
       setDetailTitle(null)
     }
-  }, [id])
+  }, [id, setDetailTitle])
 
   const applyFilter = useCallback(
     (patch: ActivityPatch) => {
@@ -165,28 +141,6 @@ export const ActivityFrame = () => {
     [applyFilter, state.show],
   )
 
-  const closeAside = useCallback(() => {
-    toggleAside()
-    requestAnimationFrame(() => openerRef.current?.focus())
-  }, [toggleAside])
-
-  const openToggle = (
-    <IconToggle
-      ref={openerRef}
-      icon={<IconPanelRight size={15} />}
-      active={false}
-      onClick={toggleAside}
-      title="Open activity panels"
-    />
-  )
-  const closeToggle = (
-    <IconToggle
-      icon={<IconPanelRight size={15} />}
-      active
-      onClick={closeAside}
-      title="Close activity panels"
-    />
-  )
   const aggregateAgents = aggregates?.agents ?? []
   const filterAgents = aggregateAgents.some((item) => item.agent === state.agent)
     ? aggregateAgents
@@ -221,37 +175,15 @@ export const ActivityFrame = () => {
       ),
     },
   ]
-  const aside = asideOpen ? (
-    <AsideGroups
-      panels={panels}
-      defaultLayout={ACTIVITY_LAYOUT}
-      storageKey={STORAGE_KEYS.activityAsideGroups}
-      headerAction={closeToggle}
-      overlayOnNarrow
-      modal={narrowAside}
-      onRequestClose={closeAside}
-      autoFocus={focusAsideOnOpen || narrowAside}
-    />
-  ) : null
-  const trail: Crumb[] = id
-    ? [
-        { label: 'Agents' },
-        { label: 'Activity', href: agentActivityRoute(undefined, searchParams) },
-        { label: detailTitle ?? 'Activity' },
-      ]
-    : [{ label: 'Agents' }, { label: 'Activity' }]
-
   return (
-    <SettingsLayout
-      trail={trail}
-      spaceLess
-      sectionTabs={<AgentsTabs active="activity" />}
-      topbarActions={!asideOpen ? openToggle : undefined}
-      aside={aside}
-      contentInert={asideOpen && narrowAside}
-      testIdPrefix={id ? 'activity-episode' : 'activity'}
-    >
+    <>
       <Outlet context={{ state, searchParams, setState, setDetailTitle }} />
-    </SettingsLayout>
+      <AgentsPanel
+        panels={panels}
+        defaultLayout={ACTIVITY_LAYOUT}
+        storageKey={STORAGE_KEYS.activityAsideGroups}
+        label="activity panels"
+      />
+    </>
   )
 }

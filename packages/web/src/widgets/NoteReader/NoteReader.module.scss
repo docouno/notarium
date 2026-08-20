@@ -1,10 +1,6 @@
-/* Reader head + meta. The `.doc` container and the rendered `.markdown` body are
-   global (shared container / marked output — see styles/shared.scss + markdown.scss). */
-.doc-head { margin-bottom: 22px; }
-.doc-title {
-  font-size: 32px; font-weight: 700; letter-spacing: -0.02em;
-  line-height: 1.2; margin: 0 0 12px;
-}
+/* Reader meta. The `.doc` container, the document heading (`.doc-head`/`.doc-title`)
+   and the rendered `.markdown` body are global — see styles/shared.scss and
+   markdown.scss. */
 .doc-meta { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; }
 .pill {
   font-size: 11.5px; font-weight: 500;

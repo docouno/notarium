@@ -1,0 +1,37 @@
+/* The editor surface itself; its aside body is the shared AsidePanel, so nothing
+ * here restates the field rhythm or the control skins. */
+.page {
+  --editor-body-padding: 0 0 16vh;
+  display: flex;
+  min-height: 560px;
+  flex-direction: column;
+}
+
+.skill-tree,
+.skill-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* Sub-caption inside one field: quieter than the field label above it, and
+ * sentence case — the uppercase register belongs to the field label alone. */
+.skill-group h3 {
+  margin: 4px 0 0;
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.skill-label {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.skill-label small,
+.skill-tree > small {
+  color: var(--text-faint);
+  font-size: 11px;
+}

@@ -87,6 +87,7 @@ export type SseHandle = {
   notify: () => void
   notifyMembers: () => void
   notifyRename: () => void
+  notifyAgentSessions: () => void
   notifyJob: (payload: unknown) => void
 }
 
@@ -144,6 +145,7 @@ export type AuthCtx = {
   notifySse: (match: (h: SseHandle) => boolean) => void
   notifyMembersOf: (space: string) => void
   notifyRenameOf: (space: string) => void
+  notifyAgentSessionsOf: (owner: string) => void
   notifyJobOf: (space: string, ownerPrincipalId: string, payload: unknown) => void
   registerFail: (key: string) => void
   failKey: (username: string, ip: string) => string
@@ -262,6 +264,23 @@ export function createAuthService({
       }
       try {
         h.notifyRename()
+      } catch {
+        // a socket mid-teardown is fine
+      }
+    }
+  }
+
+  // Agent episodes are owner-global rather than space-scoped. Every live tab of
+  // that owner receives the nudge and refetches from the owner-gated REST route.
+  const notifyAgentSessionsOf = (owner: string) => {
+    for (const h of sseHandles) {
+      const matches = owner === '@system' ? h.username === null : h.username === owner
+
+      if (!matches) {
+        continue
+      }
+      try {
+        h.notifyAgentSessions()
       } catch {
         // a socket mid-teardown is fine
       }
@@ -478,6 +497,7 @@ export function createAuthService({
     notifySse,
     notifyMembersOf,
     notifyRenameOf,
+    notifyAgentSessionsOf,
     notifyJobOf,
     registerFail,
     failKey,

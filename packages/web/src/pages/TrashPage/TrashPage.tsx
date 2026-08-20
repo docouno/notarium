@@ -19,7 +19,7 @@ import { Breadcrumbs } from '../../layouts/Breadcrumbs'
 import { cx } from '../../libs/cx/cx'
 import { errorText } from '../../libs/errors'
 import { PARTIAL_RESTORE_CONFIRMATION, recoveryPresentation } from '../../libs/revisions/revisions'
-import { memoryNoteRoute, noteRoute, TRASH_URL_PARAMS } from '../../libs/routing/routePaths'
+import { noteRouteForClass, TRASH_URL_PARAMS } from '../../libs/routing/routePaths'
 import { api } from '../../services/api'
 import { BOTTOM_CONTENT_GAP, PAGE, RESTORE_REASONS, ROW_H, TOP_CONTENT_GAP } from './consts'
 import { restoreSummary } from './helpers/restoreSummary'
@@ -49,7 +49,7 @@ export const TrashPage = () => {
   } = useSpace()
   const { subscribe } = useSync()
   const { confirm, alert } = useDialog()
-  const { railOpen, toggleRail } = useChrome()
+  const { leftPanelOpen, narrowLayout, toggleLeftPanel } = useChrome()
   const toast = useToast()
 
   // Tabs (#110): the Trash is the ONE place for everything deleted — notes (#79) and
@@ -616,9 +616,17 @@ export const TrashPage = () => {
           <div className={styles.topbarLeft}>
             <IconToggle
               icon={<IconPanelLeft size={15} />}
-              active={railOpen}
-              onClick={toggleRail}
-              title={railOpen ? 'Collapse sidebar' : 'Expand sidebar'}
+              active={leftPanelOpen}
+              onClick={toggleLeftPanel}
+              title={
+                narrowLayout
+                  ? leftPanelOpen
+                    ? 'Close sidebar'
+                    : 'Open sidebar'
+                  : leftPanelOpen
+                    ? 'Collapse sidebar'
+                    : 'Expand sidebar'
+              }
             />
             <Breadcrumbs trail={[{ label: 'Trash' }]} />
           </div>
@@ -816,10 +824,7 @@ export const TrashPage = () => {
                     kind: 'note',
                     id: n!.noteId,
                     title: n!.title || 'Untitled',
-                    href:
-                      n!.class === NOTE_CLASS.agentMemory
-                        ? (memoryNoteRoute(n!.noteId) ?? '#')
-                        : (noteRoute(n!.noteId) ?? '#'),
+                    href: noteRouteForClass(n!.noteId, n!.class) ?? '#',
                     pathText: n!.filePath,
                     who: n!.deletedBy ?? null,
                     date: n!.deletedAt,

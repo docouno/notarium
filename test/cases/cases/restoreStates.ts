@@ -132,7 +132,7 @@ export const restoreStates: CaseSpec = {
         skillDirectoryName: 'opaque-utf8',
         source: {
           encoding: 'utf8',
-          data: '---\nname: another-package\ndescription: Directory mismatch\n---\nThis remains literal UTF-8 source, not Markdown.\n',
+          data: '---\nname: invalid--package\ndescription: Invalid skill name\n---\nThis remains literal UTF-8 source, not Markdown.\n',
         },
       },
     })
@@ -189,7 +189,7 @@ export const restoreStates: CaseSpec = {
         skillDirectoryName: 'invalid-direct',
         source: {
           encoding: 'utf8',
-          data: '---\nname: another-name\n---\nMissing required description and wrong package name.\n',
+          data: '---\nname: invalid--direct\n---\nThe package stays opaque because its machine name is invalid.\n',
         },
       },
     })

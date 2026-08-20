@@ -28,6 +28,7 @@ export const NOTE_CLASS = {
 export const STORE_ERROR_REASON = {
   noteNotFound: 'note_not_found',
   noteAlreadyExists: 'note_already_exists',
+  skillNameConflict: 'skill_name_conflict',
   versionTokenRequired: 'version_token_required',
   versionConflict: 'version_conflict',
   revisionNotFound: 'revision_not_found',
@@ -65,6 +66,8 @@ export const IF_EXISTS = {
 export const READ_SCOPE = {
   user: 'user',
   agentRecall: 'agentRecall',
+  /** Unified human trash: ordinary notes + memory + installed skill packages. */
+  trash: 'trash',
   all: 'all',
 } as const
 

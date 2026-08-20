@@ -19,14 +19,19 @@ The names/descriptions the agent sees in `tools/list` are static and live in [de
 
 **Bootstrap**
 - `start_session` — call it **first** in a new session. It opens/resumes an agent episode and, when one episode binds unambiguously, returns `session.id`; retain that id and pass it as the top-level `session` argument on every later session-aware tool. In one round-trip it also returns the user profile (always-load), accessible projects and, with a `project` hint, a **compact index** of the project (a note count + top-level folders — enumerate via `list_notes`), the bound episode's own delta of changes since its last visit and `knownValues`. Without a bound episode (including ambiguous name matching), the delta follows the owner fallback. The delta is SPACE-WIDE and a **journal gap** (`unavailableReason`) travels in it like any other entry — it counts toward `total`, holds its place in the cursor, and keeps its location fields absent when the note has no current path; `recent_activity(project)` alone narrows by the current path ([identity](core.md#identity)). `acknowledge:false` peeks without advancing but still freezes a bound episode's independent starting position. An acknowledge advances the bound episode plus its owner fallback, or only that fallback when no episode binds; every write is monotonic, so a slower, older concurrent response cannot rewind the next delta window. Not calling it just means less context: the other tools work on their own. Curating WHAT lands in `profile.alwaysLoad`/`project.alwaysLoad` — the Agents → Context section ([docs/projects.md](projects.md#init-context-curation)): manual pins in place (`always-load`), **context sets + cross-space loose pins** and muting memory.
-  Its `roles` section contains only compact summaries from libraries the human explicitly owns;
-  the packaged catalog is never effective by itself. Pass `role` (`name` is a compatibility alias)
-  to activate one in the same call. Its exact owned placement also selects the role context preset;
+  Its `roles` section contains compact summaries of the roles EFFECTIVE for that caller — the
+  Owned placements the human added plus the System roles the host ships, which are effective
+  without an Add until their owner switches one off; the packaged Catalog is never effective by
+  itself and never reaches an agent. Pass `role` (`name` is a compatibility alias) to activate one
+  in the same call. Its exact owned placement also selects the role context preset (a System role
+  is not placed, so it owns no preset and its slice is empty);
   `activeRole.context.alwaysLoad` carries the role-only loaded refs before the base context.
 - `list_roles` — page through the complete bounded inventory of effective roles after
   `start_session.rolesTruncated:true`, or whenever its compact first page is insufficient. It
-  accepts the same project hint and returns only owned Personal/Space/Project roles, never catalog
-  templates. An underlying host/library cap is reported as `truncated:true` on this tool.
+  accepts the same project hint and returns both effective sources — Owned Personal/Space/Project
+  placements, each naming its `scope`, and System roles, which name `source: system` and have no
+  placement to name — never Catalog templates. Only the Owned side is bounded, so an underlying
+  host/library cap is reported as `truncated:true` on this tool.
 - `use_role` — activate one effective role and load its instructions plus linked Agent Skills under
   `budgetTokens`. Use the same project handle as `start_session` so
   `Project > Space > Personal` precedence resolves identically. Repeating the selected name is an
@@ -104,9 +109,19 @@ service carried through `Ctx.session`, ready for future chat callers. A host wit
 degrades honestly: `start_session` omits the session fields and other tools silently ignore the
 argument.
 
+Every successful episode create, touch or role mutation emits the owner-scoped named SSE nudge
+`agent-sessions` on that owner's live tabs, independent of which Space each tab is viewing. Global
+retention pruning returns every owner whose rows were removed and nudges each of them, including
+when the triggering call then exits with a missing or ambiguous session. The event carries no
+snapshot: `GET /api/me/agent-sessions` remains truth. `SyncProvider` advances the same typed
+revision on every successful EventSource connection, reconciling mutations missed while the tab
+was disconnected. The Agents Explorer invalidates only its Sessions dataset, without broad
+store-event invalidation or a page reload.
+
 An episode stores at most one selected role name. `null` is the base mode; there is no synthetic
 base role. Selecting a role never changes grants or token scope. `use_role` writes the name only
-after resolving it from the effective owned library. A repeated name returns `already_active`, but
+after resolving it against the effective set — the Owned libraries narrowest-first, then the
+shipped System package as the final fallback. A repeated name returns `already_active`, but
 still reloads the effective package: the same name may now resolve to a narrower Project/Space fork.
 `start_session` also reloads a resumed episode's still-effective saved role, so a fresh model
 context is not left with a durable role name but no role instructions. The durable selector is
@@ -144,12 +159,14 @@ Markdown source-of-truth boundary.
 
 ## Roles and Agent Skills <a id="roles"></a>
 
-The packaged built-in catalog and writable libraries are separate sources. Catalog packages are
-read-only discovery templates and never participate in effective resolution. A bounded package is
-one valid `<name>/SKILL.md` plus optional `references/`, `scripts/`, and `assets/`; the human `Add`
-copies every package member into `.notarium/skills`, recording `notarium.origin` and
-`notarium.originRevision` in `SKILL.md`. Auxiliary package members remain byte-identical, while the
-manifest is deliberately rewritten with that provenance. The server never executes package scripts. Tool activation
+The packaged inventory contains separate immutable System and Catalog sources alongside writable
+Owned libraries. System abilities are effective by default; Catalog packages are read-only
+discovery templates and never participate in effective resolution. A bounded Owned
+package is one valid `<note-id>/SKILL.md` plus optional `references/`, `scripts/`, and `assets/`;
+the immutable directory and materialized `notarium-id` are storage identity, while manifest
+`name` remains editable. The human `Add` copies every package member into `.notarium/skills`,
+recording `notarium.origin` and `notarium.originRevision` in `SKILL.md`. Auxiliary package members
+remain byte-identical, while the manifest is deliberately rewritten with that provenance. The server never executes package scripts. Tool activation
 loads only the role and linked-skill instructions; resource delivery to clients remains a separate
 progressive-disclosure channel. Complete package bytes are nevertheless present in workspace
 `scope=all` export, so a client can download a ready Agent Skill without a converter. Export keeps
@@ -158,21 +175,58 @@ is never overwritten by a later catalog release. Add publishes a package into it
 an occupied target — a complete package, an empty or partially restored directory, a file, a symlink — is
 reported as a conflict and left byte-for-byte intact, never replaced.
 
-Owned scopes are Personal (private across projects), Space (shared in one space), and Project
-(stored under reserved `.notarium/skills/_projects/<encoded-project-id>/`). Same-name precedence is
-`Project > Space > Personal`. The first UI slice exposes Add to Personal and Project; Space remains
-an effective storage scope but has no separate Add action yet. There is deliberately no mutable
-server-global scope. The configured library mount may itself be a symlink, but its library-owned
-`_projects` namespace and encoded Project root must be real directories; Add fails before sweeping or
-writing a package if either path is a symlink or another entry type.
+Roles may be owned at Personal, Space, or Project placement, with human effective precedence
+`Owned Project > Owned Space > Owned Personal > System`; their Project packages live under the reserved
+`.notarium/skills/_projects/<encoded-project-id>/<package-id>/` root. Adding a Catalog role targets
+a Personal or Project home only — a Space is not an Add destination for a role, and the request
+schema rejects it — so a shared default is reached by authoring one or by moving a project role up,
+not by a copy. Skills have only Personal or Space homes, and a Catalog skill adds to either. Personal skills are private and available across the owner's project contexts. A Space
+skill has one meta-DB policy, either `all-projects` or a stable project-id allowlist; the same package
+can therefore be used in projects A/B and remain absent from C. There is no Project-owned skill
+fallback. Agents → Abilities exposes a role-first routed switch and exact source-specific detail
+routes. Its central library spans every readable home; the separate Explorer projection is scoped
+to the current Space before the location cap and groups placements rather than creating another
+Files tree. There is deliberately no mutable server-global scope. The configured
+library mount may itself be a symlink, but its library-owned `_projects` namespace and encoded
+Project root must be real directories; role Add fails before sweeping or writing a package if either
+path is a symlink or another entry type.
+
+Catalog role manifests keep portable name links. System roles carry exact System links. During Add
+the server resolves each Catalog dependency,
+publishes or reuses its Personal/Space owned fork, applies the Space availability binding, and
+rewrites the role to an exact locator containing home scope,
+package id, and a display-only label. Owned activation follows only that locator: rename preserves
+the link, deletion produces an observable missing dependency, and a same-name replacement is not
+silently adopted; a Space locator also fails closed outside its availability policy. Human REST
+addresses an ability by an opaque encoding of the exact source/kind/package/location locator: one
+detail route plus the `enabled`, `availability`, `versions` and `home` mutations hang off it.
+System and Owned preferences are owner-scoped, default-enabled sparse overrides; Catalog is
+not toggleable. Role health reports each exact attachment and activation fails closed on any
+missing, disabled, unavailable, malformed, or wrong-kind dependency. The MCP role surface is
+name-backed and serves the same effective set as the human one — Owned placements plus the System
+supply, never a Catalog template — so all three agent doors report an effective System role with
+`source: system` and no scope. Durable sessions additionally store the exact System or Owned locator and
+the project context in which it was selected, so same-context resume survives rename; a context
+change or missing package resumes in base mode without same-name rebinding.
 
 Role discovery is bounded at both agent and settings surfaces. `start_session.roles` has a separate
-1,000-token summary budget and raises `rolesTruncated:true` when summaries were abbreviated,
+1,000-token summary budget — a summary is the machine name, the human title, the sanitized
+description and the scope, and all four are charged against it — and raises `rolesTruncated:true`
+when summaries were abbreviated,
 omitted, or an owned-library bound was reached; continue with paginated `list_roles`. Explicit
 activation still resolves any known effective name directly, outside the discovery window, and
-loads it through its own budget. The Roles settings response scans at most 128 placements, exposes
-at most 128 writable Project choices, and returns at most 512 owned entries, with
-`truncated:true` when the bounded view cannot cover the library.
+loads it through its own budget. The self-management `GET /api/me/agent-roles` and
+`GET /api/me/agent-skills` collections share strict `q`, `source`, `home`, `availability`, `project`,
+`spaceId`, `limit`, and opaque `cursor` query fields; `spaceId` is applied BEFORE the location cap,
+which is what lets a scoped surface list its own Space whole instead of competing for one bounded
+scan ([navigation.md](navigation.md#agents-shell-and-explorer)). They return `items` discriminated by `source` across
+all three — `system`, `catalog`, `owned` — plus `filteredTotal`, `nextCursor`, and accessible-only
+facets. Ordering is deterministic across duplicate
+names and cursors are bound to the complete query. Discovery still scans at most 128 readable
+locations and exposes at most 128 writable Project choices; `truncated:true` reports that lower
+bound independently from page pagination. Create/Add waits for the ordinary note projection before
+returning the exact package id. Role and Skill roots use the same typed edit/rename, whole-package
+Trash delete, and strict restore path; catalog entries remain read-only until Add creates a fork.
 
 ## Security (why the set is exactly this) <a id="security"></a>
 

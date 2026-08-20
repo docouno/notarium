@@ -1,4 +1,13 @@
-import { basenameOf, directoryOf } from '@notarium/core'
+import {
+  analyzeDocumentState,
+  basenameOf,
+  directoryOf,
+  DOCUMENT_ROLE,
+  DOCUMENT_STATE_FORMAT,
+  isSkillPackageRootPath,
+  skillPackagePathOf,
+  skillPlacementPathOf,
+} from '@notarium/core'
 
 import type {
   FileStrictMutationReceipt,
@@ -104,6 +113,7 @@ export class SpaceResourceAuthority {
           mode: 'exclusive',
           owner: options?.owner ?? 'space-lifecycle-close',
           path: '',
+          lifecycle: true,
           ...(options?.deadlineMs != null ? { deadlineMs: options.deadlineMs } : {}),
         })
         .then((lease) => lease.settle())
@@ -126,7 +136,7 @@ export class SpaceResourceAuthority {
     this.accepting = true
   }
 
-  admitResource(
+  async admitResource(
     path: string,
     mode: AdmissionMode,
     owner: string,
@@ -137,14 +147,8 @@ export class SpaceResourceAuthority {
       allowDuringClosure?: boolean
     },
   ): Promise<AdmissionLease> {
-    if (!this.accepting && options?.allowDuringClosure !== true) {
-      return Promise.reject(
-        Object.assign(new Error('space resource admission is closed'), {
-          code: 'SPACE_LIFECYCLE_CLOSED',
-        }),
-      )
-    }
-    this.assertRootsStable()
+    this.assertAdmissible(options?.allowDuringClosure)
+
     return this.admission.admit({
       scope: 'resource',
       mode,
@@ -156,20 +160,14 @@ export class SpaceResourceAuthority {
     })
   }
 
-  admitPackage(
+  async admitPackage(
     packagePath: string,
     mode: AdmissionMode,
     owner: string,
     options?: { deadlineMs?: number; signal?: AbortSignal; allowDuringClosure?: boolean },
   ): Promise<AdmissionLease> {
-    if (!this.accepting && options?.allowDuringClosure !== true) {
-      return Promise.reject(
-        Object.assign(new Error('space resource admission is closed'), {
-          code: 'SPACE_LIFECYCLE_CLOSED',
-        }),
-      )
-    }
-    this.assertRootsStable()
+    this.assertAdmissible(options?.allowDuringClosure)
+
     return this.admission.admit({
       scope: 'package',
       mode,
@@ -178,6 +176,107 @@ export class SpaceResourceAuthority {
       ...(options?.deadlineMs != null ? { deadlineMs: options.deadlineMs } : {}),
       ...(options?.signal ? { signal: options.signal } : {}),
     })
+  }
+
+  /** Placement-wide skill admission. Unlike a package lease, this deliberately
+   * accepts the empty adapter-relative root: Personal/Space packages share that
+   * placement and must serialize name check + publication across different ids. */
+  async admitSkillPlacement(
+    resourcePath: string,
+    mode: AdmissionMode,
+    owner: string,
+    options?: { deadlineMs?: number; signal?: AbortSignal; allowDuringClosure?: boolean },
+  ): Promise<AdmissionLease> {
+    this.assertAdmissible(options?.allowDuringClosure)
+    const path = normalizePath(resourcePath)
+    const { adapter, relativePath } = this.route(path)
+    const placement = skillPlacementPathOf(relativePath)
+
+    if (placement == null) {
+      throw new Error(`resource is not in a canonical skill placement: ${path}`)
+    }
+    // Admission paths are deliberately flat here. A physical mount root is an
+    // ancestor of every project package, but name uniqueness is independent per
+    // placement: a Personal/Space mutation must not stall an unrelated project.
+    // The empty lifecycle package still overlaps every key and closes the whole
+    // authority as before.
+    const placementPath = `.__skill-placement/${this.adapters.indexOf(adapter)}/${encodeURIComponent(
+      placement || '@root',
+    )}`
+
+    return this.admission.admit({
+      scope: 'package',
+      mode,
+      owner,
+      path: placementPath,
+      ...(options?.deadlineMs != null ? { deadlineMs: options.deadlineMs } : {}),
+      ...(options?.signal ? { signal: options.signal } : {}),
+    })
+  }
+
+  /** Validate one candidate root against file truth while the caller owns the
+   * placement lease. The manifest index is derived, so no DB registry becomes a
+   * second source of truth. */
+  async assertSkillManifestNameAvailableAdmitted(
+    resourcePath: string,
+    content: Uint8Array,
+  ): Promise<void> {
+    this.assertAdmitted()
+    const path = normalizePath(resourcePath)
+    const { adapter, relativePath } = this.route(path)
+
+    if (!isSkillPackageRootPath(relativePath)) {
+      return
+    }
+    const packagePath = skillPackagePathOf(relativePath)!
+    const placement = skillPlacementPathOf(relativePath)!
+    const directoryName = basenameOf(packagePath)
+    const candidate = analyzeDocumentState({
+      source: Uint8Array.from(content),
+      role: DOCUMENT_ROLE.skillRoot,
+      skillDirectoryName: directoryName,
+    })
+    const name = candidate.projection?.skill?.name
+
+    if (candidate.format !== DOCUMENT_STATE_FORMAT.skill || !name) {
+      throw Object.assign(new Error('invalid Agent Skill manifest'), {
+        code: 'INVALID_SKILL_MANIFEST',
+      })
+    }
+    const directTarget = placement ? `${placement}/${name}` : name
+
+    if (directTarget !== packagePath && (await adapter.files.dirExists(directTarget))) {
+      throw Object.assign(new Error(`skill name "${name}" already exists in this placement`), {
+        code: 'SKILL_NAME_CONFLICT',
+      })
+    }
+
+    for (const entry of await adapter.files.scan()) {
+      if (
+        entry.path === relativePath ||
+        !isSkillPackageRootPath(entry.path) ||
+        skillPlacementPathOf(entry.path) !== placement
+      ) {
+        continue
+      }
+      const siblingPackage = skillPackagePathOf(entry.path)!
+      const raw = await adapter.files.read(entry.path)
+
+      if (raw == null) {
+        continue
+      }
+      const sibling = analyzeDocumentState({
+        source: new TextEncoder().encode(raw),
+        role: DOCUMENT_ROLE.skillRoot,
+        skillDirectoryName: basenameOf(siblingPackage),
+      })
+
+      if (sibling.projection?.skill?.name === name) {
+        throw Object.assign(new Error(`skill name "${name}" already exists in this placement`), {
+          code: 'SKILL_NAME_CONFLICT',
+        })
+      }
+    }
   }
 
   /** Buffered reads release admission only after cloning the immutable sample. */
@@ -258,6 +357,37 @@ export class SpaceResourceAuthority {
     }
   }
 
+  /** The caller already owns the enclosing placement/package admission. Keep
+   * the same A-target-B stability proof without recursively acquiring a lease. */
+  async observeLinkedAdmitted(
+    sourcePath: string,
+    targetPath: string,
+    validateTarget: (target: ResourceObservation & { kind: 'present' }) => boolean,
+  ): Promise<StableLinkedObservation | null> {
+    this.assertAdmitted()
+    const source = normalizePath(sourcePath)
+    const target = normalizePath(targetPath)
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const first = await this.observeAdmitted(source)
+      const targetObservation = await this.observeAdmitted(target)
+      const second = await this.observeAdmitted(source)
+
+      if (
+        first.kind === 'present' &&
+        second.kind === 'present' &&
+        sameFileClaim(first.claim, second.claim)
+      ) {
+        return targetObservation.kind === 'present' && validateTarget(targetObservation)
+          ? { source: second, target: targetObservation }
+          : null
+      }
+    }
+    throw Object.assign(new Error('linked resource did not produce a stable observation'), {
+      code: 'UNSTABLE_OBSERVATION',
+    })
+  }
+
   /** A lazy adapter export keeps its root-package lease until the consumer
    * drains, returns or throws from the iterator. The adapter may stream files;
    * releasing after iterator creation would make admission purely ceremonial. */
@@ -303,20 +433,7 @@ export class SpaceResourceAuthority {
       request.kind === 'put'
         ? [normalizePath(request.path)]
         : [normalizePath(request.sourcePath), normalizePath(request.targetPath)]
-    const routed = paths.map((path) => ({ path, ...this.route(path) }))
-    const adapter = routed[0].adapter
-
-    if (routed.some((entry) => entry.adapter !== adapter)) {
-      throw new Error('one publication cannot cross resource adapters')
-    }
-    if (!adapter.files.publish) {
-      throw Object.assign(new Error(`adapter ${adapter.id} cannot publish with proof`), {
-        code: 'PUBLICATION_UNAVAILABLE',
-      })
-    }
     const packagePath = request.packagePath ? normalizePath(request.packagePath) : undefined
-    // Capture the submitted candidate before the first suspension. The caller
-    // retains its buffer and may mutate it while admission is queued.
     const content = Uint8Array.from(request.content)
     const packageLease = packagePath
       ? await this.admitPackage(packagePath, 'shared', options?.owner ?? 'publish', options)
@@ -333,77 +450,8 @@ export class SpaceResourceAuthority {
           }),
         )
       }
-      const result = await adapter.files.publish(
-        request.kind === 'put'
-          ? {
-              kind: 'put',
-              path: routed[0].relativePath,
-              content,
-              expected: request.expected,
-            }
-          : {
-              kind: 'move-put',
-              sourcePath: routed[0].relativePath,
-              targetPath: routed[1].relativePath,
-              content,
-              expectedSource: request.expectedSource,
-              expectedTarget: request.expectedTarget,
-            },
-      )
 
-      if (result.status === 'conflict') {
-        return result
-      }
-      const expectedRelativePaths = new Set(routed.map((entry) => entry.relativePath))
-      const expectedBefore = new Map(
-        request.kind === 'put'
-          ? [[routed[0].relativePath, request.expected] as const]
-          : [
-              [routed[0].relativePath, request.expectedSource] as const,
-              [routed[1].relativePath, request.expectedTarget] as const,
-            ],
-      )
-
-      if (
-        result.transitions.length !== expectedRelativePaths.size ||
-        result.transitions.some((transition) => {
-          const before = expectedBefore.get(transition.path)
-          const afterKind =
-            request.kind === 'move-put' && transition.path === routed[0].relativePath
-              ? 'absent'
-              : 'present'
-
-          return (
-            !expectedRelativePaths.has(transition.path) ||
-            before == null ||
-            !sameFileClaim(before, transition.before) ||
-            transition.after.kind !== afterKind
-          )
-        })
-      ) {
-        throw new Error(`adapter ${adapter.id} returned an invalid publication proof set`)
-      }
-      const receiptId = `${this.spaceId}:receipt-${nextReceiptId++}`
-      const receipt: MutationReceipt = {
-        id: receiptId,
-        spaceId: this.spaceId,
-        adapterId: adapter.id,
-        observationId: `${receiptId}:observation`,
-        semanticEventTime: new Date().toISOString(),
-        restartDurable: false,
-        candidateHash: result.candidateHash,
-        transitions: result.transitions.map((transition) => {
-          const entry = routed.find((candidate) => candidate.relativePath === transition.path)
-
-          if (!entry) {
-            throw new Error(`adapter ${adapter.id} returned a transition outside its request`)
-          }
-
-          return { ...transition, path: entry.path }
-        }),
-      }
-
-      return { status: 'published', receipt }
+      return await this.publishAdmitted({ ...request, content })
     } finally {
       for (const lease of resourceLeases.reverse()) {
         lease.settle()
@@ -412,10 +460,123 @@ export class SpaceResourceAuthority {
     }
   }
 
+  /** Exact publication for a caller that already owns an enclosing exclusive
+   * package/placement lease. */
+  async publishAdmitted(request: ResourcePublicationRequest): Promise<ResourcePublicationResult> {
+    this.assertAdmitted()
+    const paths =
+      request.kind === 'put'
+        ? [normalizePath(request.path)]
+        : [normalizePath(request.sourcePath), normalizePath(request.targetPath)]
+    const routed = paths.map((path) => ({ path, ...this.route(path) }))
+    const adapter = routed[0].adapter
+
+    if (routed.some((entry) => entry.adapter !== adapter)) {
+      throw new Error('one publication cannot cross resource adapters')
+    }
+    if (!adapter.files.publish) {
+      throw Object.assign(new Error(`adapter ${adapter.id} cannot publish with proof`), {
+        code: 'PUBLICATION_UNAVAILABLE',
+      })
+    }
+    const content = Uint8Array.from(request.content)
+    const result = await adapter.files.publish(
+      request.kind === 'put'
+        ? {
+            kind: 'put',
+            path: routed[0].relativePath,
+            content,
+            expected: request.expected,
+          }
+        : {
+            kind: 'move-put',
+            sourcePath: routed[0].relativePath,
+            targetPath: routed[1].relativePath,
+            content,
+            expectedSource: request.expectedSource,
+            expectedTarget: request.expectedTarget,
+          },
+    )
+
+    if (result.status === 'conflict') {
+      return result
+    }
+    const expectedRelativePaths = new Set(routed.map((entry) => entry.relativePath))
+    const expectedBefore = new Map(
+      request.kind === 'put'
+        ? [[routed[0].relativePath, request.expected] as const]
+        : [
+            [routed[0].relativePath, request.expectedSource] as const,
+            [routed[1].relativePath, request.expectedTarget] as const,
+          ],
+    )
+
+    if (
+      result.transitions.length !== expectedRelativePaths.size ||
+      result.transitions.some((transition) => {
+        const before = expectedBefore.get(transition.path)
+        const afterKind =
+          request.kind === 'move-put' && transition.path === routed[0].relativePath
+            ? 'absent'
+            : 'present'
+
+        return (
+          !expectedRelativePaths.has(transition.path) ||
+          before == null ||
+          !sameFileClaim(before, transition.before) ||
+          transition.after.kind !== afterKind
+        )
+      })
+    ) {
+      throw new Error(`adapter ${adapter.id} returned an invalid publication proof set`)
+    }
+    const receiptId = `${this.spaceId}:receipt-${nextReceiptId++}`
+    const receipt: MutationReceipt = {
+      id: receiptId,
+      spaceId: this.spaceId,
+      adapterId: adapter.id,
+      observationId: `${receiptId}:observation`,
+      semanticEventTime: new Date().toISOString(),
+      restartDurable: false,
+      candidateHash: result.candidateHash,
+      transitions: result.transitions.map((transition) => {
+        const entry = routed.find((candidate) => candidate.relativePath === transition.path)
+
+        if (!entry) {
+          throw new Error(`adapter ${adapter.id} returned a transition outside its request`)
+        }
+
+        return { ...transition, path: entry.path }
+      }),
+    }
+
+    return { status: 'published', receipt }
+  }
+
   async publishPackageIfAbsent(
     request: ResourcePackagePublicationRequest,
     options?: { owner?: string; deadlineMs?: number; signal?: AbortSignal },
   ): Promise<ResourcePublicationResult> {
+    const rootPath = normalizePath(request.rootPath)
+    const lease = await this.admitPackage(
+      rootPath,
+      'exclusive',
+      options?.owner ?? 'publish-package',
+      options,
+    )
+
+    try {
+      return await this.publishPackageIfAbsentAdmitted(request)
+    } finally {
+      lease.settle()
+    }
+  }
+
+  /** Atomic package publication under an enclosing placement/package lease. */
+  async publishPackageIfAbsentAdmitted(
+    request: ResourcePackagePublicationRequest,
+  ): Promise<ResourcePublicationResult> {
+    this.assertAdmitted()
     const rootPath = normalizePath(request.rootPath)
     const files = request.files.map((file) => ({
       path: normalizePath(`${rootPath}/${file.path}`),
@@ -436,65 +597,54 @@ export class SpaceResourceAuthority {
         code: 'PACKAGE_PUBLICATION_UNAVAILABLE',
       })
     }
-    const lease = await this.admitPackage(
-      rootPath,
-      'exclusive',
-      options?.owner ?? 'publish-package',
-      options,
-    )
+    const result = await adapter.files.publishPackageIfAbsent({
+      rootPath: routed[0].relativePath,
+      files: files.map((file) => ({ path: file.relativeToPackage, content: file.content })),
+      expectedRoot: request.expectedRoot,
+    })
 
-    try {
-      const result = await adapter.files.publishPackageIfAbsent({
-        rootPath: routed[0].relativePath,
-        files: files.map((file) => ({ path: file.relativeToPackage, content: file.content })),
-        expectedRoot: request.expectedRoot,
-      })
-
-      if (result.status === 'conflict') {
-        return result
-      }
-      const expectedPaths = new Set(routed.map((entry) => entry.relativePath))
-
-      if (
-        result.transitions.length !== expectedPaths.size ||
-        result.transitions.some((transition) => {
-          const isRoot = transition.path === routed[0].relativePath
-
-          return (
-            !expectedPaths.has(transition.path) ||
-            transition.after.kind !== 'present' ||
-            (isRoot
-              ? !sameFileClaim(transition.before, request.expectedRoot)
-              : transition.before.kind !== 'absent')
-          )
-        })
-      ) {
-        throw new Error(`adapter ${adapter.id} returned an invalid package proof set`)
-      }
-      const receiptId = `${this.spaceId}:receipt-${nextReceiptId++}`
-      const receipt: MutationReceipt = {
-        id: receiptId,
-        spaceId: this.spaceId,
-        adapterId: adapter.id,
-        observationId: `${receiptId}:observation`,
-        semanticEventTime: new Date().toISOString(),
-        restartDurable: false,
-        candidateHash: result.candidateHash,
-        transitions: result.transitions.map((transition) => {
-          const entry = routed.find((candidate) => candidate.relativePath === transition.path)
-
-          if (!entry) {
-            throw new Error(`adapter ${adapter.id} returned a transition outside its package`)
-          }
-
-          return { ...transition, path: entry.path }
-        }),
-      }
-
-      return { status: 'published', receipt }
-    } finally {
-      lease.settle()
+    if (result.status === 'conflict') {
+      return result
     }
+    const expectedPaths = new Set(routed.map((entry) => entry.relativePath))
+
+    if (
+      result.transitions.length !== expectedPaths.size ||
+      result.transitions.some((transition) => {
+        const isRoot = transition.path === routed[0].relativePath
+
+        return (
+          !expectedPaths.has(transition.path) ||
+          transition.after.kind !== 'present' ||
+          (isRoot
+            ? !sameFileClaim(transition.before, request.expectedRoot)
+            : transition.before.kind !== 'absent')
+        )
+      })
+    ) {
+      throw new Error(`adapter ${adapter.id} returned an invalid package proof set`)
+    }
+    const receiptId = `${this.spaceId}:receipt-${nextReceiptId++}`
+    const receipt: MutationReceipt = {
+      id: receiptId,
+      spaceId: this.spaceId,
+      adapterId: adapter.id,
+      observationId: `${receiptId}:observation`,
+      semanticEventTime: new Date().toISOString(),
+      restartDurable: false,
+      candidateHash: result.candidateHash,
+      transitions: result.transitions.map((transition) => {
+        const entry = routed.find((candidate) => candidate.relativePath === transition.path)
+
+        if (!entry) {
+          throw new Error(`adapter ${adapter.id} returned a transition outside its package`)
+        }
+
+        return { ...transition, path: entry.path }
+      }),
+    }
+
+    return { status: 'published', receipt }
   }
 
   supportsRestartDurableStrict(path: string): boolean {
@@ -575,6 +725,7 @@ export class SpaceResourceAuthority {
    * resource/package lease. Strict multi-system commands use this instead of
    * nesting another admission request under their long-lived lease. */
   async observeStrictAdmitted(path: string, maxBytes?: number): Promise<ResourceObservation> {
+    this.assertAdmitted()
     const canonicalPath = normalizePath(path)
 
     if (maxBytes != null && (!Number.isSafeInteger(maxBytes) || maxBytes < 0)) {
@@ -626,6 +777,7 @@ export class SpaceResourceAuthority {
   async publishStrictAdmitted(
     request: ResourceStrictStageRef,
   ): Promise<ResourceStrictPublicationResult> {
+    this.assertAdmitted()
     const path = normalizePath(request.path)
     const initial = await this.inspectStrict(request)
 
@@ -813,6 +965,41 @@ export class SpaceResourceAuthority {
     }
 
     return { adapter, relativePath }
+  }
+
+  /** The lifecycle question, and the ONE place any entry point asks it: admission.
+   *  Every public entry either passes through here to get its lease, or is an
+   *  `*Admitted` entry whose caller already did — so the answer is given once per
+   *  critical section instead of once per method, and a save no longer pays a third
+   *  synchronous `lstat`+`realpath` of every mount root on the way out. */
+  private assertAdmissible(allowDuringClosure?: boolean): void {
+    if (!this.accepting && allowDuringClosure !== true) {
+      throw Object.assign(new Error('space resource admission is closed'), {
+        code: 'SPACE_LIFECYCLE_CLOSED',
+      })
+    }
+    this.assertRootsStable()
+  }
+
+  /** What an `*Admitted` entry asks instead — and why it must NOT re-ask the one
+   *  above. `closeAdmission` drops `accepting` synchronously and only THEN drains, so
+   *  work admitted before the fence is still entitled to finish; a second lifecycle
+   *  check on the way out breaks exactly the promise the fence makes, and refuses the
+   *  recovery path, which holds its lease with `allowDuringClosure`. So the question
+   *  here is the other half: was this call admitted at all? A call made while this
+   *  authority holds no application lease provably did not come through admission, so
+   *  it answers the admission gate after the fact and fails closed.
+   *
+   *  A backstop, not a proof: while some UNRELATED lease is live an unadmitted caller
+   *  still slips past. Proving it per call needs the lease itself as an argument,
+   *  which is a change to every caller of an `*Admitted` entry. What IS structural
+   *  here is that no entry can skip the question — the classification test in
+   *  `spaceResourceAuthority.test.ts` fails by name on a method it has never heard
+   *  of, so a new entry cannot be added without answering. */
+  private assertAdmitted(): void {
+    if (this.admission.activeLeases() === 0) {
+      this.assertAdmissible()
+    }
   }
 
   private assertRootsStable(): void {

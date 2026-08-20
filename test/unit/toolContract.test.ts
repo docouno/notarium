@@ -128,7 +128,13 @@ describe('tool registry', () => {
 
 describe('role tool boundaries', () => {
   it('accepts only installed scopes in agent-visible role outputs', () => {
-    const catalogRole = { name: 'grooming', description: 'Grooming.', scope: 'catalog' }
+    const catalogRole = {
+      source: 'owned',
+      name: 'grooming',
+      title: 'Grooming',
+      description: 'Grooming.',
+      scope: 'catalog',
+    }
 
     expect(ListRolesOutputSchema.safeParse({ roles: [catalogRole], total: 1 }).success).toBe(false)
     expect(UseRoleOutputSchema.safeParse({ status: 'activated', role: catalogRole }).success).toBe(
@@ -140,10 +146,27 @@ describe('role tool boundaries', () => {
         total: 1,
       }).success,
     ).toBe(true)
+    // The other arm of the same union: a System role ships with the host and has no
+    // placement, so stating one for it is as wrong as naming `catalog` a placement.
+    const systemRole = { source: 'system', name: 'research', title: 'R', description: 'R.' }
+
+    expect(ListRolesOutputSchema.safeParse({ roles: [systemRole], total: 1 }).success).toBe(true)
+    expect(
+      ListRolesOutputSchema.safeParse({
+        roles: [{ ...systemRole, scope: 'personal' }],
+        total: 1,
+      }).success,
+    ).toBe(false)
   })
 
   it('validates the role slice and full surviving base replacement', () => {
-    const role = { name: 'research', description: 'Research.', scope: 'project' }
+    const role = {
+      source: 'owned',
+      name: 'research',
+      title: 'Research',
+      description: 'Research.',
+      scope: 'project',
+    }
     const note = { noteId: 'note-a', title: 'A' }
     const context = {
       alwaysLoad: [note],

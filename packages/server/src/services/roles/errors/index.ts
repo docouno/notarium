@@ -1,3 +1,6 @@
+export * from './abilityUnavailableError'
 export * from './catalogRoleNotFoundError'
+export * from './catalogSkillNotFoundError'
 export * from './roleAlreadyExistsError'
 export * from './roleDependencyConflictError'
+export * from './skillAlreadyExistsError'

@@ -1,13 +1,58 @@
 import { describe, expect, it } from 'vitest'
+import { NOTE_CLASS } from '@notarium/contract/enums'
 import {
+  agentAbilityDraftRoute,
+  agentAbilityRoute,
+  agentContextRoute,
+  agentRolesRoute,
+  agentSkillsRoute,
+  agentsRoute,
+  agentsSurfaceOf,
   dashboardRoute,
   folderPageHref,
   folderPageRoute,
   folderRoute,
+  memoryNoteRoute,
+  noteRouteForClass,
   parseAppPath,
   spaceRoute,
   workspaceSettingsRoute,
 } from './routePaths'
+
+describe('agent package routes', () => {
+  it('opens Agents on the role-first package library', () => {
+    expect(agentsRoute()).toBe('/agents/abilities/roles')
+    expect(agentRolesRoute()).toBe('/agents/abilities/roles')
+    expect(agentSkillsRoute()).toBe('/agents/abilities/skills')
+    expect(agentAbilityDraftRoute('role', 'draft-1')).toBe('/agents/abilities/roles/new/draft-1')
+    expect(agentAbilityDraftRoute('skill', 'draft/2')).toBe(
+      '/agents/abilities/skills/new/draft%2F2',
+    )
+    expect(agentContextRoute()).toBe('/agents/context')
+    expect(agentContextRoute('project-a')).toBe('/agents/context/project-a')
+    expect(parseAppPath('/agents')).toEqual({ kind: 'agents', tab: 'abilities' })
+  })
+
+  it('keeps generic skill notes on /n and gives Owned abilities an exact route', () => {
+    expect(noteRouteForClass('AbCdefGhij_1', NOTE_CLASS.skill, 'research-evidence')).toBe(
+      '/n/AbCdefGhij_1/research-evidence',
+    )
+    const route = agentAbilityRoute({
+      source: 'owned',
+      kind: 'skill',
+      packageId: 'AbCdefGhij_1',
+      location: { scope: 'space', spaceId: 'space_1' },
+    })
+    expect(route).toMatch(/^\/agents\/abilities\/skills\/owned\//)
+    expect(parseAppPath('/skill/AbCdefGhij_1/research-evidence')).toEqual({ kind: 'root' })
+  })
+
+  it('keeps an agent-memory note tied to its originating Context scope', () => {
+    expect(memoryNoteRoute('memory-1', 'release facts', 'team/docs')).toBe(
+      '/m/memory-1/release%20facts?context=team%2Fdocs',
+    )
+  })
+})
 
 describe('workspaceSettingsRoute', () => {
   it('addresses one exact durable job when requested', () => {
@@ -93,5 +138,51 @@ describe('folderPageHref — folder→page link (#214)', () => {
 
   it('prefers the id even when a path is present (durable wins)', () => {
     expect(folderPageHref('work', { id: 'F2', path: 'A/B' })).toBe('/folder/F2')
+  })
+})
+
+// One classifier for `/agents/…`, because three private ones disagreed: a
+// `startsWith`, an `includes` and a regexp answered "which section / which library /
+// is this the index" differently for the same URL.
+describe('agentsSurfaceOf — what an Agents URL is', () => {
+  it('is null outside the Agents surfaces', () => {
+    expect(agentsSurfaceOf('/s/work/feed')).toBeNull()
+    expect(agentsSurfaceOf('/n/abc/title')).toBeNull()
+  })
+
+  it('reads the roles library index', () => {
+    expect(agentsSurfaceOf(agentRolesRoute())).toEqual({
+      section: 'abilities',
+      memoryNote: false,
+      abilityKind: 'roles',
+      abilityIndex: true,
+    })
+  })
+
+  it('reads the skills library and keeps its kind on a package page', () => {
+    expect(agentsSurfaceOf(agentSkillsRoute())).toMatchObject({
+      abilityKind: 'skills',
+      abilityIndex: true,
+    })
+    expect(agentsSurfaceOf(agentAbilityDraftRoute('skill', 'draft-1'))).toMatchObject({
+      section: 'abilities',
+      abilityKind: 'skills',
+      abilityIndex: false,
+    })
+  })
+
+  it('reads the context and activity sections', () => {
+    expect(agentsSurfaceOf(agentContextRoute('apollo'))).toMatchObject({
+      section: 'context',
+      memoryNote: false,
+    })
+    expect(agentsSurfaceOf(agentsRoute('activity'))).toMatchObject({ section: 'activity' })
+  })
+
+  it('counts a memory note as the Context section on its own route', () => {
+    expect(agentsSurfaceOf(memoryNoteRoute('mem-1', 'what-i-know') ?? '')).toMatchObject({
+      section: 'context',
+      memoryNote: true,
+    })
   })
 })

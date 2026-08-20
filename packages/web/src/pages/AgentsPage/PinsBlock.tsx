@@ -1,5 +1,5 @@
 import { useMemo } from 'react'
-import type { ContextOrderEntry, ContextPin, ContextSetView, Preview } from '@notarium/contract'
+import type { ContextOrderEntry, Preview } from '@notarium/contract'
 import { Button } from '../../core/Button'
 import { Chip } from '../../core/Chips'
 import { type MenuItem } from '../../core/ContextMenu'
@@ -12,6 +12,7 @@ import { CardListSkeleton } from './ContextSkeletons'
 import { parseEntryKey, pinKey, setKey } from './helpers/contextOrder'
 import { pinsTrimmed } from './helpers/contextTrim'
 import { formatTokens } from './helpers/format'
+import type { ContextPinView, ContextSetItemView, ContextSetRowView } from './types'
 import styles from './ContextPage.module.scss'
 
 export const PinEmptyState = ({
@@ -55,7 +56,7 @@ export const PinRow = ({
   reorder,
   editable = true,
 }: {
-  pin: ContextPin
+  pin: ContextPinView
   preview?: Preview | null
   scale: number
   onOpen: (id: string) => void
@@ -65,7 +66,7 @@ export const PinRow = ({
 }) => {
   const meta: string[] = []
 
-  if (!pin.loaded) {
+  if (pin.loaded === false) {
     meta.push('Over the token budget')
   }
   if (preview?.words) {
@@ -100,9 +101,9 @@ export const PinRow = ({
           <span className={styles.itemBadges} data-testid="context-item-badges">
             {pin.folderOverview && <Chip>Folder overview</Chip>}
             {pin.space && <Chip>{pin.space}</Chip>}
-            {!pin.loaded && <StatusBadge state="trimmed" />}
+            {pin.loaded === false && <StatusBadge state="trimmed" />}
           </span>
-          <TokenMeter tokens={pin.tokens} scale={scale} trimmed={!pin.loaded} />
+          <TokenMeter tokens={pin.tokens} scale={scale} trimmed={pin.loaded === false} />
         </span>
       }
       summary={preview?.snippet}
@@ -127,7 +128,7 @@ export const SetItemRow = ({
   reorder,
   editable = true,
 }: {
-  item: ContextSetView['items'][number]
+  item: ContextSetItemView
   preview?: Preview | null
   scale: number
   onOpen: (id: string) => void
@@ -142,9 +143,9 @@ export const SetItemRow = ({
         <span className={styles.itemBadges} data-testid="context-item-badges">
           {item.folderOverview && <Chip>Folder overview</Chip>}
           <Chip>{item.space}</Chip>
-          {!item.loaded && <StatusBadge state="trimmed" />}
+          {item.loaded === false && <StatusBadge state="trimmed" />}
         </span>
-        <TokenMeter tokens={item.tokens} scale={scale} trimmed={!item.loaded} />
+        <TokenMeter tokens={item.tokens} scale={scale} trimmed={item.loaded === false} />
       </span>
     }
     summary={preview?.snippet}
@@ -181,20 +182,20 @@ export const SetRow = ({
   reorder,
   editable = true,
 }: {
-  set: ContextSetView
+  set: ContextSetRowView
   previews: Record<string, Preview | null>
   scale: number
   onOpen: (id: string) => void
-  onAddNotes: (set: ContextSetView) => void
-  onDetach: (set: ContextSetView) => void
-  onDelete: (set: ContextSetView) => void
-  onRemoveItem: (set: ContextSetView, noteId: string) => void
-  onReorderItems: (set: ContextSetView, noteIds: string[]) => void
+  onAddNotes: (set: ContextSetRowView) => void
+  onDetach: (set: ContextSetRowView) => void
+  onDelete: (set: ContextSetRowView) => void
+  onRemoveItem: (set: ContextSetRowView, noteId: string) => void
+  onReorderItems: (set: ContextSetRowView, noteIds: string[]) => void
   reorder?: ReorderHandle
   editable?: boolean
 }) => {
   const total = set.items.reduce((s, i) => s + i.tokens, 0)
-  const trimmed = set.items.some((i) => !i.loaded)
+  const trimmed = set.items.some((i) => i.loaded === false)
   // The set's OWN item order (#210) — a separate reorder list nested inside the expanded set.
   // Its `drag` is isolated from the outer pin+set list (each useReorder owns its own state),
   // so dragging a member never nudges the set among the pins. <2 items ⇒ inert.
@@ -288,21 +289,21 @@ export const PinsBlock = ({
   listTestId,
   editable = true,
 }: {
-  pins: ContextPin[] | null
-  sets: ContextSetView[] | null
+  pins: ContextPinView[] | null
+  sets: ContextSetRowView[] | null
   previews: Record<string, Preview | null>
   scale: number
   onAdd: () => void
   onOpen: (id: string) => void
   onUnpin: (id: string, space?: string) => void
-  onAddNotesToSet: (set: ContextSetView) => void
-  onDetachSet: (set: ContextSetView) => void
-  onDeleteSet: (set: ContextSetView) => void
-  onRemoveItem: (set: ContextSetView, noteId: string) => void
+  onAddNotesToSet: (set: ContextSetRowView) => void
+  onDetachSet: (set: ContextSetRowView) => void
+  onDeleteSet: (set: ContextSetRowView) => void
+  onRemoveItem: (set: ContextSetRowView, noteId: string) => void
   /** Persist a new pin+set order for this scope (#210) — the whole sequence, kind+ref. */
   onReorder: (entries: ContextOrderEntry[]) => void
   /** Persist a new item order inside a set (#210). */
-  onReorderSetItems: (set: ContextSetView, noteIds: string[]) => void
+  onReorderSetItems: (set: ContextSetRowView, noteIds: string[]) => void
   emptyHint: string
   addTestId: string
   listTestId: string
@@ -314,7 +315,7 @@ export const PinsBlock = ({
   // rank space, so a set can sit above a pin. Rendered as one DnD-reorderable list; the drag
   // keys are the server's order refs (`pin:<id>` / `set:<id>`), so a drop maps straight back.
   const entries = useMemo<
-    Array<{ key: string; order: number; pin?: ContextPin; set?: ContextSetView }>
+    Array<{ key: string; order: number; pin?: ContextPinView; set?: ContextSetRowView }>
   >(
     () =>
       [

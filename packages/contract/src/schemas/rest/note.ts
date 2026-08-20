@@ -9,6 +9,7 @@ import {
   SpaceSlugSchema,
 } from '../primitives'
 import { noteWriteFields } from './_fields'
+import { AuthoredAttachmentSchema, OwnedRoleAbilityLocatorSchema } from './agent/abilities'
 import { LiteralSourceSchema, RestoreAvailabilitySchema } from './history'
 
 export const NoteDetailResponseSchema = z.object({
@@ -24,6 +25,12 @@ export const NoteDetailResponseSchema = z.object({
    *  free-form frontmatter `type`: `class` follows the mount, `type` is a label.
    *  canon: docs/note-model.md#note-classes */
   class: NoteClassSchema.optional(),
+  /** Role and skill packages share the `skill` note class and storage machinery;
+   *  this typed discriminator lets package-aware chrome choose the right surface. */
+  agentKind: z.enum(['role', 'skill']).optional(),
+  /** Exact authored leading H1 when the stored body has one. It can differ from
+   *  the package's manifest name, which remains the note identity label. */
+  documentTitle: z.string().optional(),
   content: z.string(),
   frontmatter: z.record(z.unknown()),
   /** The editable display slug, lifted from frontmatter `slug:`; the
@@ -79,15 +86,29 @@ export const CreateNoteRequestSchema = z.object({
   ifExists: z.enum([IF_EXISTS.fail, IF_EXISTS.uniquify]).optional(),
 })
 
-export const UpdateNoteRequestSchema = z.object({
-  ...noteWriteFields,
-  /** The note-id being edited in place — triggers move-then-write so a
-   *  title/folder change renames rather than duplicating (the rename invariant). */
-  originalId: DurableNonEmptyScalarSchema,
-  /** The version the editor read (see NoteDetailResponseSchema.versionToken): the
-   *  writer must prove what it's overwriting. A stale token → 409 ConflictResponse. */
-  versionToken: z.string(),
-})
+export const UpdateNoteRequestSchema = z
+  .object({
+    ...noteWriteFields,
+    /** Exact Role package whose authored attachment list is being replaced. This
+     *  is sent only when that list changed; ordinary instruction saves omit both
+     *  fields and therefore preserve even currently-invalid raw attachment tokens. */
+    abilityLocator: OwnedRoleAbilityLocatorSchema.optional(),
+    attachments: z.array(AuthoredAttachmentSchema).max(64).optional(),
+    /** The note-id being edited in place — triggers move-then-write so a
+     *  title/folder change renames rather than duplicating (the rename invariant). */
+    originalId: DurableNonEmptyScalarSchema,
+    /** The version the editor read (see NoteDetailResponseSchema.versionToken): the
+     *  writer must prove what it's overwriting. A stale token → 409 ConflictResponse. */
+    versionToken: z.string(),
+  })
+  .superRefine((value, ctx) => {
+    if ((value.abilityLocator === undefined) !== (value.attachments === undefined)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'abilityLocator and attachments must be passed together',
+      })
+    }
+  })
 
 export const SaveResponseSchema = z.object({
   ok: z.literal(true),

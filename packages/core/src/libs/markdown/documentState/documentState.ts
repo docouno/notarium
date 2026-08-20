@@ -8,6 +8,7 @@ import {
   parseFrontmatterBlock,
 } from '../frontmatter'
 import { nextPhysicalLineSpan, parseAtxH1Line } from '../title'
+import { isSkillName, parseSkillLinks } from './skillLinks'
 import {
   type ByteRange,
   DOCUMENT_ROLE,
@@ -32,10 +33,22 @@ import {
 } from './types'
 
 const UTF8 = new TextEncoder()
-const STRICT_UTF8 = new TextDecoder('utf-8', { fatal: true })
+/** The ONE decoding of a document's bytes, and it has to be LOSSLESS, not merely valid.
+ * Everything below reads the text and then names byte ranges in the source it came from,
+ * so a decoder that drops input silently puts the two in different coordinate systems and
+ * every range afterwards points at the wrong bytes. `TextDecoder` does exactly that by
+ * default: `ignoreBOM` is false, which means "consume a leading BOM and do not emit it".
+ * Those three missing bytes made the planner splice its patch into the middle of the
+ * preceding entry — and where the wreckage still parsed as YAML, nothing downstream
+ * objected and the document lost the owner key the write existed to add. */
+const STRICT_UTF8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
+/** A byte-order mark is the file's encoding prologue, not document content: exactly one
+ * leads the source, no projection channel carries it, and every mutation writes around
+ * it. A second U+FEFF is ordinary content — and `FM_OPEN` agrees, refusing to read a
+ * frontmatter block behind it. */
+const BOM = '\uFEFF'
+const afterBom = (text: string): number => (text.startsWith(BOM) ? BOM.length : 0)
 const OWNER_KEYS = new Set<StorageOwnerKey>(Object.values(STORAGE_OWNER_KEY))
-const SKILL_NAME = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/
-const WIKI_SKILL = /\[\[([a-z0-9](?:[a-z0-9-]*[a-z0-9])?)\]\]/g
 const MAX_LINKED_SKILLS = 64
 const MAX_SKILL_LINKS_METADATA = 8_192
 const MAX_ORIGIN = 128
@@ -150,28 +163,54 @@ const byteRange = (offsets: readonly number[], start: number, end: number): Byte
   return { start: byteStart, end: byteEnd }
 }
 
-const firstLineEnd = (text: string): number => {
-  const line = nextPhysicalLineSpan(text, 0)
-  return line?.next ?? text.length
+/** One frontmatter line, by the rule the RAW PARSER and the YAML reader both use
+ * (`\r?\n`) rather than the Markdown physical-line rule. The two disagree on a lone CR
+ * and on U+2028/U+2029, and none of those ends a YAML line: reading this block with the
+ * wider rule split an entry the parser had kept whole, so the analyzer declared its own
+ * ranges corrupt and an ordinary title made the document unreadable. `limit` is the
+ * payload end, so no walk can wander past the closing fence. */
+const nextFrontmatterLineSpan = (
+  text: string,
+  start: number,
+  limit: number,
+): { end: number; next: number } | null => {
+  if (start >= limit) {
+    return null
+  }
+  const feed = text.indexOf('\n', start)
+  const breakAt = feed < 0 || feed >= limit ? limit : feed
+
+  return {
+    end: breakAt > start && text[breakAt - 1] === '\r' ? breakAt - 1 : breakAt,
+    next: Math.min(breakAt + 1, limit),
+  }
 }
 
+/** A line the raw parser treats as a separator: horizontal whitespace only, exactly
+ * `isYamlBlank` in `parseFrontmatterBlock`. `String.trim` is NOT the same predicate —
+ * it also strips NBSP and friends, which the parser carries as a real entry. */
+const SEPARATOR_BLANK = /^[ \t]*$/
+
+// A byte-order mark needs no compensation HERE and never did: it shares the opening
+// fence's line, and this walk steps over that whole line to reach the payload. What the
+// mark does move is the mapping from text index to source byte, which is `offsets`' job
+// and is now correct because the text is decoded losslessly.
 const frontmatterBounds = (
   text: string,
   bodyStart: number,
 ): { payloadStart: number; payloadEnd: number } => {
-  const bom = text.startsWith('\uFEFF') ? 1 : 0
-  const payloadStart = firstLineEnd(text.slice(bom)) + bom
+  const payloadStart = nextFrontmatterLineSpan(text, 0, bodyStart)?.next ?? bodyStart
   let cursor = payloadStart
   let payloadEnd = -1
 
   while (cursor < bodyStart) {
-    const line = nextPhysicalLineSpan(text, cursor)
+    const line = nextFrontmatterLineSpan(text, cursor, bodyStart)
 
     if (!line) {
       break
     }
-    if (text.slice(line.start, line.end).replace(/[ \t]+$/g, '') === '---') {
-      payloadEnd = line.start
+    if (text.slice(cursor, line.end).replace(/[ \t]+$/g, '') === '---') {
+      payloadEnd = cursor
       break
     }
     cursor = line.next
@@ -187,18 +226,37 @@ const entryRanges = (
   text: string,
   entries: readonly FrontmatterEntry[],
   payloadStart: number,
+  payloadEnd: number,
   offsets: readonly number[],
 ): Array<{ key: string | null; range: ByteRange }> => {
   const ranges: Array<{ key: string | null; range: ByteRange }> = []
   let cursor = payloadStart
 
   for (const entry of entries) {
+    // A blank line BETWEEN entries is legal YAML that the raw parser drops: it is not an
+    // entry of its own, while a blank that BELONGS to one — block-scalar content, a
+    // paragraph break inside a continued value — stays in that entry's lines and is
+    // matched below. Stepping over exactly the dropped ones is what keeps this walk in
+    // sync with the parser. Without it the first such blank shifted every later range,
+    // the whole document was reported as corrupt, and since writing an owner key before
+    // the closing fence turns a TRAILING blank into an interior one, an ordinary note
+    // became unreadable the moment Notarium claimed it.
+    if (!SEPARATOR_BLANK.test(entry.lines[0] ?? '')) {
+      let blank = nextFrontmatterLineSpan(text, cursor, payloadEnd)
+
+      while (blank && SEPARATOR_BLANK.test(text.slice(cursor, blank.end))) {
+        cursor = blank.next
+        blank = nextFrontmatterLineSpan(text, cursor, payloadEnd)
+      }
+    }
     const start = cursor
 
+    // Within an entry the lines stay exactly consecutive and byte-identical: a real
+    // divergence between parser and source still fails closed here.
     for (const expected of entry.lines) {
-      const line = nextPhysicalLineSpan(text, cursor)
+      const line = nextFrontmatterLineSpan(text, cursor, payloadEnd)
 
-      if (!line || text.slice(line.start, line.end) !== expected) {
+      if (!line || text.slice(cursor, line.end) !== expected) {
         throw new Error('frontmatter entry ranges do not match the source')
       }
       cursor = line.next
@@ -229,7 +287,7 @@ const analyzeFrontmatter = (text: string, offsets: readonly number[]): Frontmatt
   const { payloadStart, payloadEnd } = frontmatterBounds(text, block.bodyStart)
   const payload = text.slice(payloadStart, payloadEnd)
   const doc = parseDocument(payload, { prettyErrors: false, uniqueKeys: false })
-  const entries = entryRanges(text, block.entries, payloadStart, offsets)
+  const entries = entryRanges(text, block.entries, payloadStart, payloadEnd, offsets)
   const fields: FieldRange[] = []
   const anchored = new Map<string, ByteRange>()
   const aliases: Array<{ source: string; range: ByteRange }> = []
@@ -336,8 +394,10 @@ export const exactOwnerObservation = (source: Uint8Array): ExactOwnerObservation
 
   // The generic Markdown parser treats a leading fence without a closing fence
   // as prose. Destructive identity decisions have a stricter boundary: such bytes
-  // could be truncated frontmatter, so absence is not proven.
-  if (!fm.block && /^\uFEFF?---[ \t]*(?:#[^\r\n]*)?(?:\r\n|\n|\r|$)/.test(text)) {
+  // could be truncated frontmatter, so absence is not proven. The mark is counted
+  // loosely (`*`) where the parser counts it strictly (`?`) precisely so the two can
+  // disagree without the disagreement reading as "no owner here".
+  if (!fm.block && /^\uFEFF*---[ \t]*(?:#[^\r\n]*)?(?:\r\n|\n|\r|$)/.test(text)) {
     return { kind: 'unproven' }
   }
   if (fm.yamlErrors || fm.ownerAnchorDependency) {
@@ -503,6 +563,7 @@ const titleProjection = (
         kind: 'frontmatter',
         title,
         valueRange: titleFields[0].valueRange,
+        entryRange: titleFields[0].entryRange,
         ...(first?.title === title ? { coupledH1Range: first.range } : {}),
       },
       bodyStart: first?.title === title ? first.lineEnd : bodyStart,
@@ -554,6 +615,7 @@ const skillProjection = (
   fm: FrontmatterAnalysis,
   text: string,
   bodyStart: number,
+  titleOrigin: TitleOrigin,
   directoryName: string | undefined,
   sourceSize: number,
 ): SkillProjection | null => {
@@ -566,13 +628,11 @@ const skillProjection = (
 
   if (
     typeof name !== 'string' ||
-    name.length > 64 ||
-    !SKILL_NAME.test(name) ||
-    name.includes('--') ||
-    name !== directoryName ||
-    typeof description !== 'string' ||
-    !description.trim() ||
-    description.length > 1024 ||
+    !isSkillName(name) ||
+    (description !== undefined &&
+      (typeof description !== 'string' ||
+        (!!description && !description.trim()) ||
+        description.length > 1024)) ||
     !metadata
   ) {
     return null
@@ -589,19 +649,20 @@ const skillProjection = (
   if (instructions.length > MAX_INSTRUCTIONS) {
     return null
   }
-  const linkedSkills = [
-    ...new Set(
-      [...(metadata['notarium.skills'] ?? '').matchAll(WIKI_SKILL)].map((entry) => entry[1]),
-    ),
-  ]
+  const linkedSkills = parseSkillLinks(metadata['notarium.skills'] ?? '')
 
   if (linkedSkills.length > MAX_LINKED_SKILLS) {
     return null
   }
 
   return {
+    // A skill root goes through the normal note write chokepoint: its authored H1 is
+    // stored as the note title and therefore returns as a generated `title` frontmatter
+    // field on later reads. Keep that human title; only a true path fallback means the
+    // package has no authored display title and must fall back to its machine name.
+    title: titleOrigin.kind === 'path-fallback' ? name : titleOrigin.title.trim() || name,
     name,
-    description: description.trim(),
+    description: typeof description === 'string' ? description.trim() : '',
     metadata,
     instructions,
     linkedSkills,
@@ -718,6 +779,15 @@ const opaqueState = (
   return { ...base, semanticFingerprint: fingerprintOf(base) }
 }
 
+/** The opaque reading of these bytes: exact source, no interpretation, nothing owned.
+ * It is what the analyzer returns for bytes it cannot prove a Markdown reading for —
+ * and therefore what a persisted `opaque-v1` snapshot MEANS. Exported so the codec can
+ * reconstruct one whose bytes a later analyzer learned to read: an opaque row records
+ * the reader of the day, not a property of the file, so gaining the ability to parse it
+ * must not turn stored history into a forgery. */
+export const opaqueDocumentState = (input: DocumentAnalysisInput): DocumentState =>
+  opaqueState(input, input.role ?? DOCUMENT_ROLE.opaque, cloneBytes(input.source))
+
 export const analyzeDocumentState = (input: DocumentAnalysisInput): DocumentState => {
   const source = cloneBytes(input.source)
   const requestedRole = input.role ?? DOCUMENT_ROLE.generic
@@ -743,7 +813,14 @@ export const analyzeDocumentState = (input: DocumentAnalysisInput): DocumentStat
   const proof = validateProof(input.ownerProof, fm.fields, source.byteLength)
   const fallback = input.pathFallbackTitle ?? ''
   const title = titleProjection(text, offsets, fm, fallback)
-  const bodyCharStart = trimOneLeadingBlank(text, title.bodyStart)
+  // A document with no frontmatter and no readable heading starts its body at offset
+  // zero, which is where the encoding prologue sits. Excluding the mark keeps it out of
+  // authored prose and — because the range excludes it too — keeps a body rewrite from
+  // writing over it.
+  const bodyCharStart = trimOneLeadingBlank(
+    text,
+    title.bodyStart === 0 ? afterBom(text) : title.bodyStart,
+  )
   const bodyRange = byteRange(offsets, bodyCharStart, text.length)
   const frontmatterEntries = (fm.block?.entries ?? [])
     .filter((entry) => !entry.key || !OWNER_KEYS.has(entry.key as StorageOwnerKey))
@@ -763,7 +840,8 @@ export const analyzeDocumentState = (input: DocumentAnalysisInput): DocumentStat
     const skill = skillProjection(
       fm,
       text,
-      fm.block?.bodyStart ?? 0,
+      bodyCharStart,
+      title.origin,
       input.skillDirectoryName,
       source.byteLength,
     )
@@ -772,7 +850,7 @@ export const analyzeDocumentState = (input: DocumentAnalysisInput): DocumentStat
       return opaqueState(input, DOCUMENT_ROLE.skillRoot, source)
     }
     format = DOCUMENT_STATE_FORMAT.skill
-    projection.title = skill.name
+    projection.title = skill.title
     projection.skill = skill
   }
   const base = {
@@ -866,10 +944,44 @@ const applyPatches = (source: Uint8Array, patches: readonly DocumentPatch[]): Ui
   return result
 }
 
-const patchScalar = (state: DocumentState, range: ByteRange, value: string): DocumentPatch => {
-  const raw = STRICT_UTF8.decode(state.source.slice(range.start, range.end))
-  return { range, bytes: UTF8.encode(yamlScalarLike(raw, value)) }
+type TargetField = { key: string; entryRange: ByteRange; valueRange: ByteRange }
+
+/** Rewrite one frontmatter field to carry `render(authored value)`.
+ *
+ * A value is replaced WHERE IT STANDS only when it occupies a slot on its key's own
+ * line. A block list, a nested map, a block scalar, a multi-line plain scalar and a bare
+ * `key:` have no such slot: the analyzer's value range then runs past the line break
+ * that terminates the entry, or is empty. Patching that range alone writes over the
+ * terminator and glues the next line — the following field, or the closing fence — onto
+ * the value, which is how a settled `notarium-id` got swallowed by the field above it
+ * and the note lost its identity in bytes that still parsed.
+ *
+ * Those shapes are rewritten as one whole `key: value` entry instead. Refusing was the
+ * other candidate and it is the worse one here: every caller of this planner is already
+ * REPLACING the value, so the only thing an entry rewrite discards is the authored
+ * formatting of a value that does not survive the mutation either way — while a refusal
+ * would strand ordinary imported documents (a block-list `tags:` is what both Notarium's
+ * own serializer and every Obsidian vault write). */
+const patchField = (
+  state: DocumentState,
+  field: TargetField,
+  render: (raw: string) => string,
+): DocumentPatch => {
+  const raw = STRICT_UTF8.decode(state.source.slice(field.valueRange.start, field.valueRange.end))
+
+  if (raw.length > 0 && !/[\n\r]/.test(raw)) {
+    return { range: field.valueRange, bytes: UTF8.encode(render(raw)) }
+  }
+  const entry = STRICT_UTF8.decode(state.source.slice(field.entryRange.start, field.entryRange.end))
+
+  return {
+    range: field.entryRange,
+    bytes: UTF8.encode(`${field.key}: ${render('')}${/\r\n$/.test(entry) ? '\r\n' : '\n'}`),
+  }
 }
+
+const patchScalar = (state: DocumentState, field: TargetField, value: string): DocumentPatch =>
+  patchField(state, field, (raw) => yamlScalarLike(raw, value))
 
 const insertionBeforeClosingFence = (
   state: DocumentState,
@@ -879,14 +991,19 @@ const insertionBeforeClosingFence = (
   const block = parseFrontmatterBlock(text)
   const eol = text.includes('\r\n') ? '\r\n' : '\n'
   const payload = lines.join(eol)
+  const offsets = utf16ByteOffsets(text)
 
   if (!block) {
+    // A generated envelope opens the document — but the encoding prologue opens the
+    // FILE, and a mark that no longer leads its bytes is not a mark at all: it becomes a
+    // stray zero-width space in the middle of the prose.
+    const start = afterBom(text)
+
     return {
-      range: { start: 0, end: 0 },
+      range: byteRange(offsets, start, start),
       bytes: UTF8.encode(`---${eol}${payload}${eol}---${eol}`),
     }
   }
-  const offsets = utf16ByteOffsets(text)
   const bounds = frontmatterBounds(text, block.bodyStart)
   return {
     range: byteRange(offsets, bounds.payloadEnd, bounds.payloadEnd),
@@ -925,7 +1042,13 @@ export const planDocumentMutation = (
         pathFallbackTitle = null
       }
     } else if (origin.kind === 'frontmatter') {
-      patches.push(patchScalar(state, origin.valueRange, intent.title))
+      patches.push(
+        patchScalar(
+          state,
+          { key: 'title', entryRange: origin.entryRange, valueRange: origin.valueRange },
+          intent.title,
+        ),
+      )
       if (origin.coupledH1Range) {
         patches.push({ range: origin.coupledH1Range, bytes: UTF8.encode(intent.title) })
       }
@@ -953,7 +1076,13 @@ export const planDocumentMutation = (
         patches.push({ range: field.entryRange, bytes: new Uint8Array() })
       }
     } else if (field?.valueRange) {
-      patches.push({ range: field.valueRange, bytes: UTF8.encode(value) })
+      patches.push(
+        patchField(
+          state,
+          { key, entryRange: field.entryRange, valueRange: field.valueRange },
+          () => value,
+        ),
+      )
     } else {
       insertions.push(`${key}: ${value}`)
     }
@@ -974,7 +1103,25 @@ export const planDocumentMutation = (
       if (value == null) {
         continue
       }
-      insertions.push(`${key}: ${frontmatterScalar(value)}`)
+      // The reserved key already sits in the file with no proof bound to it — an imported
+      // document, or bytes older than the proof row. It is rewritten WHERE IT STANDS, the
+      // answer the physical serializer gives; a second entry appended beside it left the
+      // proposed proof bound to the field it had not written.
+      const authored = frontmatter.fields.find((field) => field.key === key)
+
+      if (!authored) {
+        insertions.push(`${key}: ${frontmatterScalar(value)}`)
+      } else if (authored.valueRange) {
+        patches.push(
+          patchScalar(
+            state,
+            { key, entryRange: authored.entryRange, valueRange: authored.valueRange },
+            value,
+          ),
+        )
+      } else {
+        throw new Error(`document has no unique scalar target for ${key}`)
+      }
       continue
     }
     if (value == null) {
@@ -983,7 +1130,13 @@ export const planDocumentMutation = (
       }
       patches.push({ range: claim.entryRange, bytes: new Uint8Array() })
     } else {
-      patches.push(patchScalar(state, claim.valueRange, value))
+      patches.push(
+        patchScalar(
+          state,
+          { key, entryRange: claim.entryRange, valueRange: claim.valueRange },
+          value,
+        ),
+      )
     }
   }
   if (insertions.length) {
@@ -1001,14 +1154,40 @@ export const planDocumentMutation = (
   const candidateFm = candidate.projection
     ? analyzeFrontmatter(candidateText, candidateOffsets)
     : null
-  const proposedClaims = Object.keys(intent.owners ?? {}).flatMap((key) => {
-    const owner = candidateFm?.fields.find((entry) => entry.key === key)
+  const requestedOwners = Object.entries(intent.owners ?? {}) as Array<
+    [StorageOwnerKey, string | null]
+  >
+  // A plan is a promise about identity, so it is checked against the bytes it produced
+  // rather than against the ranges it trusted. Every key asked for has to read back out
+  // of the candidate as exactly the value requested, and every key asked to go has to be
+  // gone. Without this the planner handed back a proposed proof missing the very key it
+  // was told to write and no caller could tell: the receipt bound only what HAD landed,
+  // the mangled document still parsed, and the restore reported success over a note that
+  // no longer named itself. It fires on shapes with no top-level mapping to take a key at
+  // all (a sequence, a bare scalar), and it is the backstop for any future disagreement
+  // between a range and the source it is supposed to address.
+  //
+  // A candidate that cannot be READ AT ALL is deliberately not this check's verdict: it
+  // is a statement about the whole document rather than about one key, the caller owns a
+  // gate that says so in those words, and no plan whose candidate is opaque can be
+  // published by anyone.
+  const proposedClaims = (candidateFm ? requestedOwners : []).flatMap(([key, value]) => {
+    const written = candidateFm?.fields.filter((entry) => entry.key === key) ?? []
+
+    if (
+      value == null
+        ? written.length > 0
+        : written.length !== 1 || !written[0].valueRange || written[0].value !== value
+    ) {
+      throw new Error(`document mutation did not land its storage owner field: ${key}`)
+    }
+    const owner = written[0]
     const prior = state.provenance.claims.find((claim) => claim.key === key)
 
     return owner?.valueRange
       ? [
           {
-            key: key as StorageOwnerKey,
+            key,
             ownership: prior?.ownership ?? ('entry' as const),
             valueRange: owner.valueRange,
             entryRange: owner.entryRange,

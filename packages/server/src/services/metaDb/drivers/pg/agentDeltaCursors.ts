@@ -2,6 +2,7 @@ import type pg from 'pg'
 
 import type { AgentDeltaCursorScope, AgentDeltaCursorsPersistence } from '../../types'
 import type { PgDriverCtx } from './context'
+import { lockProjectParentRow } from './lockOrder'
 
 type Queryable = Pick<pg.Pool, 'query'> | Pick<pg.PoolClient, 'query'>
 type CursorRow = { last_rev: string | null }
@@ -98,12 +99,9 @@ export const createAgentDeltaCursorsFacet = (ctx: PgDriverCtx): AgentDeltaCursor
       // Keep one parent-first lock order with project deletion/retyping. Without
       // this, updating an existing owner child and then inserting a missing
       // session child can deadlock a retype trigger that already owns the parent
-      // row and is waiting to delete that owner child.
-      await client.query(
-        // eslint-disable-next-line no-restricted-syntax -- outside the note-identity hierarchy: the project parent row, ordered against retype/delete only
-        "SELECT id FROM folders WHERE id = $1 AND type = 'project' FOR KEY SHARE",
-        [project],
-      )
+      // row and is waiting to delete that owner child. `folders` is L4f, so the
+      // lock is taken through the module that states the order (#327).
+      await lockProjectParentRow(client, project)
       await advanceOwner(client, scope.owner, project, lastRev, updatedAt)
       await advanceSession(client, scope.session.id, project, lastRev, updatedAt)
       await client.query('COMMIT')

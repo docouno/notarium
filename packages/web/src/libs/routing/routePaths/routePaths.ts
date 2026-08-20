@@ -19,7 +19,9 @@
 // Route *matching* is react-router's job (the router is a replaceable edge);
 // only path building/classification lives here.
 
-import { NOTE_CLASS } from '@notarium/contract/enums'
+import type { AbilityLocator } from '@notarium/contract'
+import { ABILITY_KIND, ABILITY_SOURCE, NOTE_CLASS } from '@notarium/contract/enums'
+import { encodeAbilityLocator } from '@notarium/core'
 import {
   AGENTS_PREFIX,
   DEFAULT_AGENT_CONTEXT_SCOPE,
@@ -179,14 +181,51 @@ export const settingsRoute = (tab: string = DEFAULT_SETTINGS_TAB): string =>
 
 /** The Agents surface; `tab` selects the section (#13). Space-free — the
  *  personal layer is the user's, not a project's, so this carries no slug. */
-export const agentsRoute = (tab: string = DEFAULT_AGENTS_TAB): string => `${AGENTS_PREFIX}/${tab}`
+export const agentsRoute = (tab?: string): string =>
+  `${AGENTS_PREFIX}/${tab ?? `${DEFAULT_AGENTS_TAB}/roles`}`
 
-/** The Agents → Context constructor axis: personal by default, or a project slug. */
+/** The Agents → Context constructor. Personal owns the bare canonical route;
+ *  project scopes append their stable slug. */
 export const agentContextRoute = (scope: string = DEFAULT_AGENT_CONTEXT_SCOPE): string =>
-  `${agentsRoute('context')}/${encodeURIComponent(scope)}`
+  scope === DEFAULT_AGENT_CONTEXT_SCOPE
+    ? agentsRoute('context')
+    : `${agentsRoute('context')}/${encodeURIComponent(scope)}`
 
-/** Legacy Agents → Audit route; the router redirects it to Activity. */
-export const agentAuditRoute = (): string => agentsRoute('audit')
+/** What an Agents URL IS, answered once. Three surfaces asked this privately and
+ *  none of them the same way (`startsWith`, `includes`, a regexp), so `/agents/…`
+ *  meant three different things depending on who looked. Null for a path outside
+ *  Agents — the memory-note surface (`/m/<id>`) counts as inside: it is a Context
+ *  document that only lives on its own route. */
+export type AgentsSurface = {
+  section: 'abilities' | 'context' | 'activity'
+  /** An agent-memory note (`/m/<id>`) rather than the Context page itself. */
+  memoryNote: boolean
+  /** Which package library the path belongs to; `roles` is the section's landing. */
+  abilityKind: 'roles' | 'skills'
+  /** The library index, as opposed to a package/draft page under it. */
+  abilityIndex: boolean
+}
+
+export const agentsSurfaceOf = (pathname: string): AgentsSurface | null => {
+  const segs = (pathname || HOME_ROUTE).split('/').filter(Boolean).map(decodeURIComponent)
+
+  if (segs[0] === SEGMENTS.memory) {
+    return { section: 'context', memoryNote: true, abilityKind: 'roles', abilityIndex: false }
+  }
+  if (segs[0] !== SEGMENTS.agents) {
+    return null
+  }
+  const section =
+    segs[1] === 'activity' ? 'activity' : segs[1] === 'context' ? 'context' : 'abilities'
+  const library = segs[1] === DEFAULT_AGENTS_TAB && (segs[2] === 'roles' || segs[2] === 'skills')
+
+  return {
+    section,
+    memoryNote: false,
+    abilityKind: library && segs[2] === 'skills' ? 'skills' : 'roles',
+    abilityIndex: library && segs.length === 3,
+  }
+}
 
 /** The owner-global agent activity stream. A session id opens its permalink;
  *  `outside` is the explicit unbound-event bucket. `state` carries the current
@@ -202,8 +241,36 @@ export const agentActivityRoute = (
   return query ? `${path}?${query}` : path
 }
 
-/** The owned role library and discovery-only built-in catalog. */
-export const agentRolesRoute = (): string => agentsRoute('roles')
+const packageLibraryRoute = (
+  section: 'roles' | 'skills',
+  state?: URLSearchParams | string,
+): string => {
+  const query = typeof state === 'string' ? state.replace(/^\?/, '') : state?.toString()
+  const path = `${agentsRoute('abilities')}/${section}`
+  return query ? `${path}?${query}` : path
+}
+
+/** One route per section, not per source: System, Catalog and Owned abilities are
+ *  three origins of the same library, so the Catalog has no address of its own. */
+export const agentRolesRoute = (state?: URLSearchParams | string): string =>
+  packageLibraryRoute('roles', state)
+
+export const agentSkillsRoute = (state?: URLSearchParams | string): string =>
+  packageLibraryRoute('skills', state)
+
+export const agentAbilityDraftRoute = (kind: 'role' | 'skill', draftId: string): string =>
+  `${
+    kind === ABILITY_KIND.role ? agentRolesRoute() : agentSkillsRoute()
+  }/new/${encodeURIComponent(draftId)}`
+
+/** Exact detail route. Owned addresses carry the opaque locator; bundled addresses
+ * keep their immutable package id readable in the URL. */
+export const agentAbilityRoute = (locator: AbilityLocator): string => {
+  const root = locator.kind === ABILITY_KIND.role ? agentRolesRoute() : agentSkillsRoute()
+  return locator.source === ABILITY_SOURCE.owned
+    ? `${root}/owned/${encodeURIComponent(encodeAbilityLocator(locator))}`
+    : `${root}/${locator.source}/${encodeURIComponent(locator.packageId)}`
+}
 
 /** The workspace (per-space) settings surface: `/s/<space>/management/<tab>` (#28).
  *  Members today; grows with the space's own settings. */
@@ -271,16 +338,25 @@ export const noteRoute = (id: string | null | undefined, slug?: string): string 
   return slug ? `${base}/${encodeURIComponent(slug)}` : base
 }
 
-/** Build the SPA route for an agent-memory note: /m/<id>/<slug>. */
-export const memoryNoteRoute = (id: string | null | undefined, slug?: string): string | null => {
+/** Build the SPA route for an agent-memory note: /m/<id>/<slug>. `contextScope`
+ * keeps the originating Agents → Context selection while the note is read or edited. */
+export const memoryNoteRoute = (
+  id: string | null | undefined,
+  slug?: string,
+  contextScope?: string,
+): string | null => {
   if (!id) {
     return null
   }
   const base = `${MEMORY_NOTE_PREFIX}/${encodeURIComponent(id)}`
-  return slug ? `${base}/${encodeURIComponent(slug)}` : base
+  const path = slug ? `${base}/${encodeURIComponent(slug)}` : base
+
+  return contextScope
+    ? `${path}?${new URLSearchParams({ context: contextScope }).toString()}`
+    : path
 }
 
-/** Canonical note route for a loaded note class. User-docs live at /n, memory at /m. */
+/** Canonical note route for a loaded note class. */
 export const noteRouteForClass = (
   id: string | null | undefined,
   noteClass?: string,

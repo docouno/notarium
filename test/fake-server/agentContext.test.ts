@@ -17,10 +17,18 @@
 import type { FastifyInstance } from 'fastify'
 import type { AddressInfo } from 'node:net'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { estimateTokens } from '@notarium/core'
+
+import { encodeAbilityLocator, estimateTokens } from '@notarium/core'
 import { PERSONAL_TOKEN_BUDGET, PROJECT_TOKEN_BUDGET } from '@notarium/server'
 
 import { createApp, type Fixture } from './app.js'
+
+const customResearch = {
+  source: 'custom' as const,
+  name: 'research',
+  description: 'Investigate a question with explicit evidence.',
+  instructions: '# Research\n\nResearch the evidence before deciding.',
+}
 
 const fixture = (): Fixture => ({
   now: '2026-06-23T12:00:00.000Z',
@@ -78,8 +86,8 @@ const fixture = (): Fixture => ({
     { space: 'other', path: 'secret' },
   ],
   agentRoles: [
-    { name: 'research', target: { kind: 'personal', user: 'sam' } },
-    { name: 'research', target: { kind: 'project', space: 'main', path: 'docs' } },
+    { ...customResearch, target: { kind: 'personal', user: 'sam' } },
+    { ...customResearch, target: { kind: 'project', space: 'main', path: 'docs' } },
   ],
   auth: {
     users: [
@@ -180,6 +188,23 @@ const sendJson = (method: 'POST' | 'PUT' | 'DELETE', url: string, cookie: string
     headers: { cookie },
     payload: (body ?? {}) as Record<string, unknown>,
   })
+
+const exactRole = async (
+  cookie: string,
+  scope: 'personal' | 'space' | 'project',
+  projectId?: string,
+): Promise<string> => {
+  const context = await getJson(
+    projectId ? `/api/s/main/projects/${projectId}/agent-context` : '/api/me/agent-context',
+    cookie,
+  )
+  const role = (context.roles as Array<{ name: string; scope: string; locator: never }>).find(
+    (candidate) => candidate.name === 'research' && candidate.scope === scope,
+  )
+
+  expect(role).toBeDefined()
+  return encodeAbilityLocator(role!.locator)
+}
 
 const makeSet = async (
   cookie: string,
@@ -419,6 +444,80 @@ describe('agent-context pult (#165): preview', () => {
     expect(foreign.body).not.toContain('secret')
   })
 
+  it('the ROLE-IDENTITY door answers the same 404 for an unknown or foreign project id (anti-enum #16)', async () => {
+    // The same rule as the door above, on the door that grew a `?project=` of its own.
+    // It reached the registry raw, so the parameter told a non-member two things it may
+    // not know: that an id exists at all, and the slug of the space holding it.
+    //
+    // Asked on a PROJECT-scoped role on purpose. `project` is the only word this answer
+    // has for a placement, and the producer grows it in the project arm alone: asked on
+    // a personal role, "and it names nothing" is unfalsifiable by construction — the
+    // field is absent under every behaviour, including the one it exists to forbid.
+    const cookie = await loginCookie('sam', 'sam-password-1')
+    const projectRole = await exactRole(cookie, 'project', 'proj-main-docs')
+    const ask = (project: string) =>
+      app.inject({
+        method: 'GET',
+        url: `/api/me/agent-roles/${projectRole}/context?project=${project}`,
+        headers: { cookie },
+      })
+    const readable = await ask('proj-main-docs')
+    const unknown = await ask('proj-main-nope')
+    const foreign = await ask('proj-other-secret')
+
+    // The world where the subject exists, read first so the negations below are read
+    // against an answer that demonstrably CAN name a project: asked about one it may
+    // read, this door names it, in the words a handle is spelled in.
+    expect(readable.statusCode, readable.body).toBe(200)
+    expect(readable.json().role.project).toBe('main/docs')
+
+    expect(unknown.statusCode, unknown.body).toBe(404)
+    // The refusal carries neither word that identifies the project the caller may not
+    // know about — the slug of the space holding it, and the path that names it. Both
+    // are spellings this very field has printed: it held the ASKED project's space slug
+    // before it was made to read the addressed placement instead. The slug is matched as
+    // a whole JSON value, since `other` is a substring of ordinary English; the path is
+    // matched bare, so it is caught inside a handle too. Read before the
+    // indistinguishability claim below, so each of the two is the first to observe its
+    // own defect.
+    expect(foreign.body).not.toContain('"other"')
+    expect(foreign.body).not.toContain('secret')
+    // And it is indistinguishable from the unknown one in BOTH halves of the answer,
+    // asserted as one value so neither half can be the only one read: a refusal that can
+    // be told apart IS the oracle, whether or not it also discloses a name.
+    expect({ status: foreign.statusCode, body: foreign.body }).toEqual({
+      status: unknown.statusCode,
+      body: unknown.body,
+    })
+    // …and the door still answers about the role itself when nothing is claimed — the
+    // same role, in the same words, as the preview door that stands in its project.
+    expect((await getJson(`/api/me/agent-roles/${projectRole}/context`, cookie)).role.name).toBe(
+      (
+        await getJson(
+          `/api/s/main/projects/proj-main-docs/agent-context?role=${projectRole}`,
+          cookie,
+        )
+      ).role.name,
+    )
+  })
+
+  it('names the project the ROLE stands in, in the words the preview door uses', async () => {
+    const cookie = await loginCookie('sam', 'sam-password-1')
+    const projectRole = await exactRole(cookie, 'project', 'proj-main-docs')
+    const preview = await getJson(
+      `/api/s/main/projects/proj-main-docs/agent-context?role=${projectRole}`,
+      cookie,
+    )
+    const named = await getJson(`/api/me/agent-roles/${projectRole}/context`, cookie)
+
+    // One role, one place, one spelling. This field held a raw registry id when asked
+    // without a project, a SPACE slug when asked with one, and the handle here — three
+    // answers about the same placement, and no reader to notice.
+    expect(preview.role.project).toBeDefined()
+    expect(named.role.project).toBe(preview.role.project)
+    expect(named.role.space).toBe(preview.role.space)
+  })
+
   it('a non-member cannot read another space’s project agent-context (404, #10)', async () => {
     const cookie = await loginCookie('mallory', 'mallory-password-1')
     expect(
@@ -436,6 +535,8 @@ describe('agent-context pult (#165): preview', () => {
 describe('owned role context (#308)', () => {
   it('keeps role sets and order on their exact placement, detaches, and guards ownership', async () => {
     const cookie = await loginCookie('sam', 'sam-password-1')
+    const personalRole = await exactRole(cookie, 'personal')
+    const projectRole = await exactRole(cookie, 'project', 'proj-main-docs')
     const sharedSet = await makeSet(cookie, 'main', 'Role sources', [['main', 'fake-pin-docs']])
     const personalSet = await makeSet(cookie, 'sam-personal', 'Private sources', [
       ['sam-personal', 'fake-plain-me'],
@@ -444,7 +545,7 @@ describe('owned role context (#308)', () => {
     expect(
       (
         await putJson(
-          '/api/me/agent-roles/research/context-pins',
+          `/api/me/agent-roles/${personalRole}/context-pins`,
           { space: 'sam-personal', noteId: 'fake-plain-me' },
           cookie,
         )
@@ -453,21 +554,26 @@ describe('owned role context (#308)', () => {
     expect(
       (
         await putJson(
-          '/api/me/agent-roles/research/context-pins?projectId=proj-main-docs',
+          `/api/me/agent-roles/${projectRole}/context-pins`,
           { space: 'main', noteId: 'fake-plain-docs' },
           cookie,
         )
       ).statusCode,
     ).toBe(200)
     expect(
-      (await sendJson('PUT', `/api/me/agent-roles/research/context-sets/${sharedSet}`, cookie))
-        .statusCode,
+      (
+        await sendJson(
+          'PUT',
+          `/api/me/agent-roles/${personalRole}/context-sets/${sharedSet}`,
+          cookie,
+        )
+      ).statusCode,
     ).toBe(200)
     expect(
       (
         await sendJson(
           'PUT',
-          `/api/me/agent-roles/research/context-sets/${sharedSet}?projectId=proj-main-docs`,
+          `/api/me/agent-roles/${projectRole}/context-sets/${sharedSet}`,
           cookie,
         )
       ).statusCode,
@@ -476,7 +582,7 @@ describe('owned role context (#308)', () => {
     expect(
       (
         await putJson(
-          '/api/me/agent-roles/research/context-order',
+          `/api/me/agent-roles/${personalRole}/context-order`,
           {
             entries: [
               { kind: 'set', ref: sharedSet },
@@ -490,7 +596,7 @@ describe('owned role context (#308)', () => {
     expect(
       (
         await putJson(
-          '/api/me/agent-roles/research/context-order?projectId=proj-main-docs',
+          `/api/me/agent-roles/${projectRole}/context-order`,
           {
             entries: [
               { kind: 'pin', ref: 'fake-plain-docs' },
@@ -502,7 +608,7 @@ describe('owned role context (#308)', () => {
       ).statusCode,
     ).toBe(200)
 
-    const personal = await getJson('/api/me/agent-context?role=research', cookie)
+    const personal = await getJson(`/api/me/agent-context?role=${personalRole}`, cookie)
     expect(personal.role).toMatchObject({
       scope: 'personal',
       pins: [expect.objectContaining({ noteId: 'fake-plain-me', order: 1 })],
@@ -515,7 +621,7 @@ describe('owned role context (#308)', () => {
       ],
     })
     const project = await getJson(
-      '/api/s/main/projects/proj-main-docs/agent-context?role=research',
+      `/api/s/main/projects/proj-main-docs/agent-context?role=${projectRole}`,
       cookie,
     )
     expect(project.role).toMatchObject({
@@ -528,24 +634,24 @@ describe('owned role context (#308)', () => {
       (
         await sendJson(
           'DELETE',
-          `/api/me/agent-roles/research/context-sets/${sharedSet}?projectId=proj-main-docs`,
+          `/api/me/agent-roles/${projectRole}/context-sets/${sharedSet}`,
           cookie,
         )
       ).statusCode,
     ).toBe(200)
     const projectAfterDetach = await getJson(
-      '/api/s/main/projects/proj-main-docs/agent-context?role=research',
+      `/api/s/main/projects/proj-main-docs/agent-context?role=${projectRole}`,
       cookie,
     )
     expect(projectAfterDetach.role.sets).toEqual([])
-    const personalAfterDetach = await getJson('/api/me/agent-context?role=research', cookie)
+    const personalAfterDetach = await getJson(`/api/me/agent-context?role=${personalRole}`, cookie)
     expect(personalAfterDetach.role.sets).toEqual([
       expect.objectContaining({ id: sharedSet, order: 0 }),
     ])
 
     const rejected = await sendJson(
       'PUT',
-      `/api/me/agent-roles/research/context-sets/${personalSet}?projectId=proj-main-docs`,
+      `/api/me/agent-roles/${projectRole}/context-sets/${personalSet}`,
       cookie,
     )
     expect(rejected.statusCode).toBe(400)
@@ -559,11 +665,13 @@ describe('owned role context (#308)', () => {
     const docs = (projects.projects as Array<{ id: string; slug: string }>).find(
       (project) => project.slug === 'docs',
     )!
+    const personalRole = await exactRole(cookie, 'personal')
+    const projectRole = await exactRole(cookie, 'project', docs.id)
 
     expect(
       (
         await putJson(
-          '/api/me/agent-roles/research/context-pins',
+          `/api/me/agent-roles/${personalRole}/context-pins`,
           { space: 'sam-personal', noteId: 'fake-plain-me' },
           cookie,
         )
@@ -572,7 +680,7 @@ describe('owned role context (#308)', () => {
     expect(
       (
         await putJson(
-          `/api/me/agent-roles/research/context-pins?projectId=${docs.id}`,
+          `/api/me/agent-roles/${projectRole}/context-pins`,
           { space: 'main', noteId: 'fake-plain-docs' },
           cookie,
         )
@@ -583,14 +691,14 @@ describe('owned role context (#308)', () => {
     expect(base.roles).toEqual([expect.objectContaining({ name: 'research', scope: 'personal' })])
     expect(base.role).toBeUndefined()
 
-    const personal = await getJson('/api/me/agent-context?role=research', cookie)
+    const personal = await getJson(`/api/me/agent-context?role=${personalRole}`, cookie)
     expect(personal.role).toMatchObject({
       name: 'research',
       scope: 'personal',
       pins: [expect.objectContaining({ noteId: 'fake-plain-me' })],
     })
     const project = await getJson(
-      `/api/s/main/projects/${docs.id}/agent-context?role=research`,
+      `/api/s/main/projects/${docs.id}/agent-context?role=${projectRole}`,
       cookie,
     )
     expect(project.role).toMatchObject({
@@ -638,16 +746,17 @@ describe('owned role context (#308)', () => {
     })
   })
 
-  it('rejects an empty projectId instead of mutating the Personal role preset', async () => {
+  it('rejects a malformed exact locator without mutating the Personal role preset', async () => {
     const cookie = await loginCookie('sam', 'sam-password-1')
+    const personalRole = await exactRole(cookie, 'personal')
     const response = await putJson(
-      '/api/me/agent-roles/research/context-pins?projectId=',
+      '/api/me/agent-roles/not-a-locator/context-pins',
       { space: 'sam-personal', noteId: 'fake-plain-me' },
       cookie,
     )
 
-    expect(response.statusCode).toBe(400)
-    const preview = await getJson('/api/me/agent-context?role=research', cookie)
+    expect(response.statusCode).toBe(404)
+    const preview = await getJson(`/api/me/agent-context?role=${personalRole}`, cookie)
     expect(preview.role.pins).toEqual([])
   })
 
@@ -679,10 +788,11 @@ describe('owned role context (#308)', () => {
 
     const cookie = await loginCookie('sam', 'sam-password-1')
     const bearer = await patFor('sam', 'sam-password-1')
+    const personalRole = await exactRole(cookie, 'personal')
     expect(
       (
         await putJson(
-          '/api/me/agent-roles/research/context-pins',
+          `/api/me/agent-roles/${personalRole}/context-pins`,
           { space: 'sam-personal', noteId: 'fake-role-heavy' },
           cookie,
         )
@@ -713,7 +823,7 @@ describe('owned role context (#308)', () => {
     await app.close()
     const f = fixture()
     f.projects!.push({ space: 'main', path: 'space-scope' })
-    f.agentRoles!.push({ name: 'research', target: { kind: 'space', space: 'main' } })
+    f.agentRoles!.push({ ...customResearch, target: { kind: 'space', space: 'main' } })
     f.noContextFacets = true
     app = await createApp(f)
     port = await listen(app)
@@ -738,18 +848,167 @@ describe('owned role context (#308)', () => {
 
   it('does not let role selection expand a reader into a role-context writer', async () => {
     const cookie = await loginCookie('robin', 'robin-password-1')
+    const projectRole = await exactRole(cookie, 'project', 'proj-main-docs')
     const response = await putJson(
-      '/api/me/agent-roles/research/context-pins?projectId=proj-main-docs',
+      `/api/me/agent-roles/${projectRole}/context-pins`,
       { space: 'main', noteId: 'fake-plain-docs' },
       cookie,
     )
 
     expect(response.statusCode).toBe(403)
     const preview = await getJson(
-      '/api/s/main/projects/proj-main-docs/agent-context?role=research',
+      `/api/s/main/projects/proj-main-docs/agent-context?role=${projectRole}`,
       cookie,
     )
     expect(preview.role).toMatchObject({ name: 'research', scope: 'project', pins: [] })
+  })
+})
+
+describe('the addressed role vs the role the agent loads (#309)', () => {
+  /** Turning a role off is a private READING preference. Whether its shared context may
+   *  be configured is a question about the space — so the IDENTITY door keeps answering
+   *  which role the address names, and answers it without a budget. Folding the two
+   *  questions into the preview broke one of them each way round: it first told a member
+   *  their own shared role did not exist, then charged its layer to a budget the agent
+   *  never spends. */
+  it('names a role the viewer switched off, hands back its layer, and says it is not loaded', async () => {
+    const cookie = await loginCookie('sam', 'sam-password-1')
+    const personalRole = await exactRole(cookie, 'personal')
+
+    expect(
+      (
+        await putJson(
+          `/api/me/agent-roles/${personalRole}/context-pins`,
+          { space: 'sam-personal', noteId: 'fake-plain-me' },
+          cookie,
+        )
+      ).statusCode,
+    ).toBe(200)
+    expect(
+      (await putJson(`/api/me/agent-abilities/${personalRole}/enabled`, { enabled: false }, cookie))
+        .statusCode,
+    ).toBe(200)
+
+    const named = await getJson(`/api/me/agent-roles/${personalRole}/context`, cookie)
+
+    expect(named.active).toBe(false)
+    expect(named.inactive).toBe('disabled')
+    // The layer is what the page edits, so it arrives — and carries no word about a
+    // budget this door does not weigh.
+    expect(named.role.pins.map((pin: { noteId: string }) => pin.noteId)).toEqual(['fake-plain-me'])
+    expect(named.role.pins.every((pin: object) => !('loaded' in pin))).toBe(true)
+    expect('loadedTokens' in named.role).toBe(false)
+  })
+
+  /** The blocker of round 7, stated as an arc. The preview exists to mirror what the
+   *  agent loads; charging it for a layer the agent does not load made it report a
+   *  personal always-load pin as dropped while `start_session` went on loading it. */
+  it('charges the preview budget nothing for a role the agent does not load', async () => {
+    const cookie = await loginCookie('sam', 'sam-password-1')
+    const personalRole = await exactRole(cookie, 'personal')
+    await putJson(
+      `/api/me/agent-roles/${personalRole}/context-pins`,
+      { space: 'sam-personal', noteId: 'fake-plain-me' },
+      cookie,
+    )
+    const base = await getJson('/api/me/agent-context', cookie)
+    await putJson(`/api/me/agent-abilities/${personalRole}/enabled`, { enabled: false }, cookie)
+
+    const preview = await getJson(`/api/me/agent-context?role=${personalRole}`, cookie)
+
+    expect(preview.role).toBeUndefined()
+    expect(preview.loadedTokens).toBe(base.loadedTokens)
+    expect(preview.pins.map((pin: { noteId: string; loaded: boolean }) => pin.loaded)).toEqual(
+      base.pins.map((pin: { loaded: boolean }) => pin.loaded),
+    )
+  })
+
+  /** The same claim on the PROJECT door — and it is the door that needed it. The
+   *  sentinel above was written for the personal one, while all three reasons a role can
+   *  be inactive live here: reach is a question about a project, and health is read in
+   *  one. Mutating the project door's budget gate alone left the whole run green. */
+  it('charges the PROJECT preview budget nothing for a role the agent does not load', async () => {
+    const cookie = await loginCookie('sam', 'sam-password-1')
+    const projectRole = await exactRole(cookie, 'project', 'proj-main-docs')
+    await putJson(
+      `/api/me/agent-roles/${projectRole}/context-pins`,
+      { space: 'main', noteId: 'fake-pin-docs' },
+      cookie,
+    )
+    const url = `/api/s/main/projects/proj-main-docs/agent-context`
+    const withRole = await getJson(`${url}?role=${projectRole}`, cookie)
+
+    // The subject exists: the role IS loaded here to start with, and it carries a layer.
+    // Stated as the anti-vacuum guard, because a world where the role is absent would
+    // satisfy every assertion below without observing anything.
+    expect(withRole.role).toBeDefined()
+    expect(withRole.role.pins.length).toBeGreaterThan(0)
+    const base = await getJson(url, cookie)
+    await putJson(`/api/me/agent-abilities/${projectRole}/enabled`, { enabled: false }, cookie)
+
+    const inactive = await getJson(`${url}?role=${projectRole}`, cookie)
+
+    expect(inactive.role).toBeUndefined()
+    expect(inactive.loadedTokens).toBe(base.loadedTokens)
+    expect(inactive.projectLoadedTokens).toBe(base.projectLoadedTokens)
+    expect(inactive.pins.map((pin: { loaded: boolean }) => pin.loaded)).toEqual(
+      base.pins.map((pin: { loaded: boolean }) => pin.loaded),
+    )
+    await putJson(`/api/me/agent-abilities/${projectRole}/enabled`, { enabled: true }, cookie)
+  })
+
+  /** The door that CONFIGURES a role lists everything the author put on it. Curation is
+   *  asked for the order and nothing else: its dedup is a rule about LOADING — "a note
+   *  the agent would load twice loads once" — and applying it to the editing view
+   *  deleted the second membership of a note that legitimately sits in two sets. With the
+   *  row gone there was no `Remove from set` to reach it by, while the sets endpoint went
+   *  on showing the note in both. */
+  it('lists a note that sits in two of the role sets, in both of them', async () => {
+    const cookie = await loginCookie('sam', 'sam-password-1')
+    const personalRole = await exactRole(cookie, 'personal')
+    const shared = 'fake-plain-me'
+    const first = await makeSet(cookie, 'sam-personal', 'Twin A', [['sam-personal', shared]])
+    const second = await makeSet(cookie, 'sam-personal', 'Twin B', [['sam-personal', shared]])
+
+    for (const id of [first, second]) {
+      expect(
+        (
+          await sendJson(
+            'PUT',
+            `/api/me/agent-roles/${personalRole}/context-sets/${id}`,
+            cookie,
+            {},
+          )
+        ).statusCode,
+      ).toBe(200)
+    }
+
+    const named = await getJson(`/api/me/agent-roles/${personalRole}/context`, cookie)
+    const sets = named.role.sets as Array<{ id: string; items: Array<{ noteId: string }> }>
+
+    // Both memberships are real and both are the author's — the surface that edits them
+    // has to show both, or one of them cannot be removed at all.
+    expect(sets.map((set) => set.id).sort()).toEqual([first, second].sort())
+    expect(sets.map((set) => set.items.filter((item) => item.noteId === shared).length)).toEqual([
+      1, 1,
+    ])
+  })
+
+  /** The picker offers what the agent would load. A role the viewer switched off is not
+   *  that, and it was being offered. */
+  it('drops a role the viewer switched off from the choices it offers', async () => {
+    const cookie = await loginCookie('sam', 'sam-password-1')
+    const personalRole = await exactRole(cookie, 'personal')
+    const before = await getJson('/api/me/agent-context', cookie)
+
+    expect(before.roles.length).toBeGreaterThan(0)
+    await putJson(`/api/me/agent-abilities/${personalRole}/enabled`, { enabled: false }, cookie)
+
+    const after = await getJson('/api/me/agent-context', cookie)
+
+    expect(
+      after.roles.map((role: { locator: unknown }) => encodeAbilityLocator(role.locator as never)),
+    ).not.toContain(personalRole)
   })
 })
 

@@ -57,6 +57,9 @@ type CodeEditorProps = {
    *  formatting + writing-aid toggles follow the user's preset/overrides. Read once at
    *  mount (the editor remounts per draft); omit to use the web-native defaults. */
   editorKeys?: EditorBinding[]
+  /** Focus the editing surface on mount. Forms that have earlier required fields
+   *  can opt out and let their own initial control keep focus. */
+  autoFocus?: boolean
 }
 
 export const CodeEditor = ({
@@ -72,6 +75,7 @@ export const CodeEditor = ({
   onToggleTypewriter,
   cursor = 'start',
   editorKeys,
+  autoFocus = true,
 }: CodeEditorProps) => {
   const host = useRef<HTMLDivElement>(null)
   const viewRef = useRef<EditorView | null>(null)
@@ -224,7 +228,10 @@ export const CodeEditor = ({
     onReady?.(() => view.state.doc.toString())
     onView?.(view)
     emitStats(view.state, true)
-    view.focus()
+    if (autoFocus) {
+      view.focus()
+    }
+
     return () => {
       onReady?.(null)
       onView?.(null)

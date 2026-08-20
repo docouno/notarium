@@ -1,5 +1,7 @@
 import type pg from 'pg'
 
+import { parseAbilityLocator, serializeAbilityLocator } from '@notarium/core'
+
 import type {
   AgentSessionNamedStart,
   AgentSessionRecord,
@@ -17,6 +19,15 @@ type AgentSessionRow = {
   last_seen_at: string
   calls: number | string
   role: string | null
+  role_locator: string | null
+  role_context_project_id: string | null
+}
+
+const roleLocatorOf = (value: string | null): AgentSessionRecord['roleLocator'] => {
+  const locator = value ? parseAbilityLocator(value) : null
+  // A bound role is a role of either shippable source. Narrowing to `owned` here is
+  // what would leave a System activation unable to survive its own resume.
+  return locator?.kind === 'role' && locator.source !== 'catalog' ? locator : null
 }
 
 const sessionOf = (row: AgentSessionRow): AgentSessionRecord => ({
@@ -29,9 +40,12 @@ const sessionOf = (row: AgentSessionRow): AgentSessionRecord => ({
   lastSeenAt: row.last_seen_at,
   calls: Number(row.calls),
   role: row.role,
+  roleLocator: roleLocatorOf(row.role_locator),
+  roleContextProjectId: row.role_context_project_id,
 })
 
-const COLUMNS = 'id, owner, name, named, parent_id, created_at, last_seen_at, calls, role'
+const COLUMNS =
+  'id, owner, name, named, parent_id, created_at, last_seen_at, calls, role, role_locator, role_context_project_id'
 
 type Queryable = Pick<pg.Pool, 'query'>
 
@@ -41,8 +55,8 @@ const insertSession = async (
 ): Promise<AgentSessionRecord> => {
   const result = await db.query(
     `INSERT INTO agent_sessions
-       (id, owner, name, named, parent_id, created_at, last_seen_at, calls, role)
-     SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9
+       (id, owner, name, named, parent_id, created_at, last_seen_at, calls, role, role_locator, role_context_project_id)
+     SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
       WHERE $5::text IS NULL
          OR EXISTS (
            SELECT 1 FROM agent_sessions
@@ -59,6 +73,8 @@ const insertSession = async (
       session.lastSeenAt,
       session.calls,
       session.role,
+      session.roleLocator ? serializeAbilityLocator(session.roleLocator) : null,
+      session.roleContextProjectId,
     ],
   )
   const row = result.rows[0] as AgentSessionRow | undefined
@@ -143,6 +159,8 @@ export const createSessionsFacet = (ctx: PgDriverCtx): AgentSessionsPersistence 
               ...candidate,
               parentId: match.id,
               role: match.role,
+              roleLocator: roleLocatorOf(match.role_locator),
+              roleContextProjectId: match.role_context_project_id,
             }),
           }
         } else {
@@ -196,12 +214,17 @@ export const createSessionsFacet = (ctx: PgDriverCtx): AgentSessionsPersistence 
         await client.query('COMMIT')
         return null
       }
-      const changed = before.role !== role
+      const changed =
+        before.role !== role.name ||
+        before.role_locator !== serializeAbilityLocator(role.locator) ||
+        before.role_context_project_id !== role.contextProjectId
       const row = changed
         ? ((
             await client.query(
-              `UPDATE agent_sessions SET role = $1 WHERE owner = $2 AND id = $3 RETURNING ${COLUMNS}`,
-              [role, owner, id],
+              `UPDATE agent_sessions
+                  SET role = $1, role_locator = $2, role_context_project_id = $3
+                WHERE owner = $4 AND id = $5 RETURNING ${COLUMNS}`,
+              [role.name, serializeAbilityLocator(role.locator), role.contextProjectId, owner, id],
             )
           ).rows[0] as AgentSessionRow)
         : before
@@ -216,6 +239,10 @@ export const createSessionsFacet = (ctx: PgDriverCtx): AgentSessionsPersistence 
   },
   prune: async (before) => {
     await ctx.ensureInit()
-    await ctx.required.query('DELETE FROM agent_sessions WHERE last_seen_at < $1', [before])
+    const result = await ctx.required.query<{ owner: string }>(
+      'DELETE FROM agent_sessions WHERE last_seen_at < $1 RETURNING owner',
+      [before],
+    )
+    return [...new Set(result.rows.map(({ owner }) => owner))].sort()
   },
 })

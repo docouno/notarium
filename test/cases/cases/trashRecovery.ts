@@ -105,6 +105,8 @@ export const trashRecovery: CaseSpec = {
       },
     })
 
+    // Source-only: the manifest name is not one a package can carry, so the row has
+    // bytes to show and nothing safe to republish.
     const importedSource = deletedNote(b, now, {
       path: 'imports/imported-helper-source.md',
       title: 'Imported helper source',
@@ -120,7 +122,7 @@ export const trashRecovery: CaseSpec = {
         skillDirectoryName: 'imported-helper',
         source: {
           encoding: 'utf8',
-          data: '---\nname: different-package\ndescription: Imported helper source\n---\nThe original text is still available for inspection.\n',
+          data: '---\nname: imported--helper\n---\nThe original text is still available for inspection.\n',
         },
       },
     })

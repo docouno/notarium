@@ -5,20 +5,25 @@ import { readPackagesFromDirectory, type SkillPackage } from './library'
 
 let cached: Promise<SkillPackage[]> | undefined
 
-/** Source checkout and bundled runtime carry the same read-only catalog. */
-export const loadBuiltinRoleCatalog = (): Promise<SkillPackage[]> => {
+/** Source checkout and bundled runtime carry the same read-only ability inventory.
+ * A missing directory is a broken artifact, not an empty inventory: reading it as
+ * empty would take System and Catalog abilities away from every user and answer
+ * "no such role" to every Add, with nothing in the log to say why. A failed read is
+ * not memoised either — one bad boot must not disable the surface for the process. */
+export const loadBundledAbilityInventory = (): Promise<SkillPackage[]> => {
   if (cached) {
     return cached
   }
-  const candidates = [
-    new URL('./catalog/', import.meta.url),
-    new URL('./role-catalog/', import.meta.url),
-  ]
-  const directory = candidates.find((candidate) => existsSync(fileURLToPath(candidate)))
+  const directory = fileURLToPath(new URL('./catalog/', import.meta.url))
 
-  if (!directory) {
-    throw new Error('built-in role catalog is missing from the runtime artifact')
+  if (!existsSync(directory)) {
+    return Promise.reject(new Error('bundled ability inventory is missing from the artifact'))
   }
-  cached = readPackagesFromDirectory(fileURLToPath(directory))
-  return cached
+  const loading = readPackagesFromDirectory(directory).catch((error: unknown) => {
+    cached = undefined
+    throw error
+  })
+
+  cached = loading
+  return loading
 }

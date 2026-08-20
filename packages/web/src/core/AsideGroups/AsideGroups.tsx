@@ -1,6 +1,8 @@
 import { type MouseEvent as ReactMouseEvent, type ReactNode, useEffect, useRef } from 'react'
 import { cx } from '../../libs/cx/cx'
+import { useKeyboardLayer } from '../../libs/hooks/useKeyboardLayer'
 import { ASIDE_PANEL, usePanelWidth } from '../../libs/hooks/usePanelWidth'
+import { KEYBOARD_LAYER } from '../../libs/keyboardLayers'
 import {
   type GroupState,
   type LayoutSpec,
@@ -36,6 +38,8 @@ type AsideGroupsProps = {
   onRequestClose?: () => void
   /** Move focus into the active tab when this aside is mounted as an opened drawer. */
   autoFocus?: boolean
+  /** Accessible name for the narrow modal variant. */
+  modalLabel?: string
 }
 
 // The right aside as a vertical stack of tabbed groups (#35). The group COMPOSITION
@@ -54,6 +58,7 @@ export const AsideGroups = ({
   modal = false,
   onRequestClose,
   autoFocus = false,
+  modalLabel = 'Panels',
 }: AsideGroupsProps) => {
   const [width, startWidthResize, setWidth] = usePanelWidth(ASIDE_PANEL)
   const { groups, setActiveTab, setGroupHeight } = useAsideLayout(
@@ -64,6 +69,10 @@ export const AsideGroups = ({
   const asideRef = useRef<HTMLElement>(null)
   const stackRef = useRef<HTMLDivElement>(null)
   const byId = new Map(panels.map((p) => [p.id, p]))
+  // The drawer is one of several surfaces that answer Escape; the shared arbiter
+  // hands it the key only while nothing is stacked over it, and answers separately
+  // for the focus trap, which a popover over the drawer must not take.
+  const ownsFocus = useKeyboardLayer(modal, KEYBOARD_LAYER.modal, onRequestClose)
 
   useEffect(() => {
     if (!autoFocus) {
@@ -81,12 +90,7 @@ export const AsideGroups = ({
       return
     }
     const containFocus = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        event.preventDefault()
-        onRequestClose?.()
-        return
-      }
-      if (event.key !== 'Tab') {
+      if (event.key !== 'Tab' || !ownsFocus()) {
         return
       }
       const aside = asideRef.current
@@ -121,7 +125,7 @@ export const AsideGroups = ({
     return () => {
       window.removeEventListener('keydown', containFocus)
     }
-  }, [modal, onRequestClose])
+  }, [modal, ownsFocus])
 
   // Height ceiling for one group: leave at least MIN for every OTHER group so a
   // drag can't collapse its neighbours. Measured live off the stack.
@@ -174,7 +178,7 @@ export const AsideGroups = ({
       data-testid="aside-groups"
       role={modal ? 'dialog' : undefined}
       aria-modal={modal || undefined}
-      aria-label={modal ? 'Activity panels' : undefined}
+      aria-label={modal ? modalLabel : undefined}
       tabIndex={modal ? -1 : undefined}
     >
       <div className={styles.widthResize} onMouseDown={startWidthResize} />

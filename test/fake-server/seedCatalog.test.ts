@@ -1,5 +1,7 @@
 import type { FastifyInstance } from 'fastify'
-import { describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import type { AbilityLocator } from '@notarium/contract'
+import { encodeAbilityLocator } from '@notarium/core'
 import { deterministicNoteId } from '@notarium/engine-memory'
 
 import { buildCaseWorld, caseToFixture, DEFAULT_NOW } from '../cases'
@@ -215,6 +217,158 @@ describe('seed catalog → fake backend (#175)', () => {
     } finally {
       await app.close()
     }
+  })
+
+  // #309: `agent-abilities-rich` is the stand the Abilities browser gates run on, and
+  // three of its promises are about the SEEDED starting point rather than about any
+  // click: a disabled ability, a second page, and a supporting package the owner
+  // edited where the Add put it. One boot serves all three — the case is read-only
+  // here and publishing 41 roles + 31 skills is the expensive part.
+  describe('agent-abilities-rich (#309)', () => {
+    let app: FastifyInstance
+    let cookie: string
+
+    beforeAll(async () => {
+      const world = buildCaseWorld('agent-abilities-rich', { now: DEFAULT_NOW })
+      app = await createApp(caseToFixture(world), {
+        // The subject is the seeded state; password hashing has its own suite and
+        // costs a scrypt verification the lean CI budget need not pay again.
+        passwordVerifier: () => Promise.resolve(true),
+      })
+      const login = await app.inject({
+        method: 'POST',
+        url: '/api/auth/login',
+        payload: { username: 'sergey', password: 'sergey' },
+      })
+      expect(login.statusCode).toBe(200)
+      cookie = (login.headers['set-cookie'] as string).split(';')[0]
+    }, 60_000)
+
+    afterAll(async () => {
+      await app?.close()
+    })
+
+    const get = (url: string) =>
+      app.inject({ method: 'GET', url, headers: { cookie } }).then((r) => r.json())
+
+    type Item = { name: string; source: string; enabled?: boolean; locator: AbilityLocator }
+
+    // A seeded Enable/Disable override has to REACH the fake, or every browser gate over
+    // this backend starts from an all-enabled inventory and the disabled states a case
+    // declares are only ever reachable by clicking them off first.
+    it('carries seeded Enable/Disable into the fake through the real listing', async () => {
+      const skills: Item[] = (await get('/api/me/agent-skills?limit=100')).items
+      const roles: Item[] = (await get('/api/me/agent-roles?limit=100')).items
+      const enabledOf = (items: Item[], name: string, scope?: string) =>
+        items.find(
+          (item) =>
+            item.name === name &&
+            (!scope || (item.locator.source === 'owned' && item.locator.location.scope === scope)),
+        )?.enabled
+
+      // The declared rows, read back off the route the product reads: an Owned skill,
+      // a System skill, and ONE of the two `shared-reviewer` placements.
+      expect(enabledOf(skills, 'evidence-index', 'personal')).toBe(false)
+      expect(enabledOf(skills, 'research-evidence')).toBe(false)
+      expect(enabledOf(roles, 'shared-reviewer', 'personal')).toBe(false)
+      // Sparse: everything the case did NOT name stays enabled by absence, and the
+      // override is a property of the exact package rather than of its name.
+      expect(enabledOf(roles, 'shared-reviewer', 'space')).toBe(true)
+      expect(enabledOf(skills, 'evidence-check', 'personal')).toBe(true)
+      expect(enabledOf(skills, 'grooming-evidence-house', 'space')).toBe(true)
+    })
+
+    // The case promises a stand where the Abilities surfaces PAGE (docs/seeds.md). A
+    // promise about a page size is a promise about a count, and a count drifts silently:
+    // the Skills fleet sat at 22 rows against a 24-row page, so the second page the doc
+    // advertised did not exist on any seeded stand.
+    it('clears both page sizes the Abilities surfaces ask for, on BOTH tabs', async () => {
+      // The two production page sizes, by their source of truth:
+      // `packages/web/src/pages/AgentsPage/packageLibraryState.ts` (the library grid) and
+      // `packages/web/src/composers/Sidebar/AgentsExplorer.tsx` (the explorer tree).
+      const LIBRARY_PAGE = 24
+      const EXPLORER_PAGE = 30
+      // Scoped the way both surfaces scope themselves — the Space the reader is in,
+      // with the Personal fallback the server adds on top.
+      const spaces = (await get('/api/spaces')) as { spaces: Array<{ id: string; slug: string }> }
+      const spaceId = spaces.spaces.find((space) => space.slug === 'product')!.id
+      const page = (kind: 'roles' | 'skills') =>
+        get(`/api/me/agent-${kind}?spaceId=${encodeURIComponent(spaceId)}&limit=100`) as Promise<{
+          filteredTotal: number
+        }>
+
+      const [roles, skills] = await Promise.all([page('roles'), page('skills')])
+
+      expect(skills.filteredTotal).toBeGreaterThan(EXPLORER_PAGE)
+      expect(skills.filteredTotal).toBeGreaterThan(LIBRARY_PAGE)
+      expect(roles.filteredTotal).toBeGreaterThan(EXPLORER_PAGE)
+      expect(roles.filteredTotal).toBeGreaterThan(LIBRARY_PAGE)
+    })
+
+    // `source:'role-dependency'` + `roleTarget` are the two applier branches that only a
+    // SPLIT home reaches — the role in a project, its supporting package in the Space.
+    // Declared and documented is not the same as executed: until a case seeded them,
+    // both branches could be deleted with the whole suite still green.
+    it('edits the supporting package the catalog Add installed, not a same-name substitute', async () => {
+      const skills: Item[] = (await get('/api/me/agent-skills?limit=100')).items
+      const owned = skills.filter((item) => item.source === 'owned')
+
+      // The Add installed ONE supporting package, and the declaration renamed THAT one.
+      // A same-name substitute — what the branch exists to refuse — would leave the old
+      // name behind beside the new one.
+      expect(owned.filter((item) => item.name === 'grooming-evidence-house')).toHaveLength(1)
+      expect(owned.some((item) => item.name === 'grooming-evidence')).toBe(false)
+
+      // The role that installed it sits in the PROJECT, and its link still resolves
+      // after the rename — an exact locator, not a name that drifted.
+      const roles: Item[] = (await get('/api/me/agent-roles?limit=100')).items
+      // The OWNED fork, not the read-only catalog row of the same name it was forked
+      // from — only the fork has a placement and a supporting package to be healthy about.
+      const grooming = roles.find((item) => item.name === 'grooming' && item.source === 'owned')!
+      expect(grooming?.locator).toMatchObject({ location: { scope: 'project' } })
+      const detail = await get(
+        `/api/me/agent-abilities/${encodeURIComponent(encodeAbilityLocator(grooming.locator))}`,
+      )
+      expect(detail.health).toMatchObject({ healthy: true })
+      expect(detail.health.attachments).toHaveLength(1)
+    })
+  })
+
+  // #309: the fake's preference channel is only worth having if it fails the way the
+  // real seeder fails. A row that names a package nobody published is a BROKEN world,
+  // and quietly skipping it would leave the fake serving that ability ENABLED while
+  // `scripts/seed.ts` refused to boot at all — the two stands disagreeing about the
+  // same case, with the browser gate reading the forgiving one and calling it green.
+  it('refuses a preference row that names a package no declaration published', async () => {
+    const fixture = caseToFixture(buildCaseWorld('agent-abilities-sparse', { now: DEFAULT_NOW }))
+
+    // Resolved-instead-of-rejected is the failure this guards, so a boot that DID come
+    // back is closed rather than left dangling behind a confusing second error.
+    const failure = await createApp({
+      ...fixture,
+      agentAbilityPreferences: [
+        {
+          user: 'sergey',
+          ability: {
+            source: 'owned',
+            kind: 'skill',
+            name: 'never-published',
+            home: { kind: 'personal', user: 'sergey' },
+          },
+          enabled: false,
+        },
+      ],
+    }).then(
+      async (booted) => {
+        await booted.close()
+        return null
+      },
+      (error: Error) => error.message,
+    )
+
+    expect(failure ?? 'the fake booted with a preference row that names nothing').toContain(
+      'ability preference references an unpublished owned skill',
+    )
   })
 
   // #302: a pinned physical id must be the SAME note on every surface the fake

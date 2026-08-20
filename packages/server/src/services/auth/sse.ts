@@ -18,6 +18,12 @@ export const createSse = (ctx: AuthCtx) => ({
     ctx.notifyRenameOf(spaceId)
   },
 
+  /** Owner-global episode list changed through MCP; every tab for that owner
+   *  refetches the REST projection, independent of its active Space. */
+  notifyAgentSessionsChanged: (owner: string): void => {
+    ctx.notifyAgentSessionsOf(owner)
+  },
+
   /** Owner-scoped, not space-scoped: mirrors the REST ownership check so a job's
    *  status/error/artifact never leaks to other space members. */
   notifyJobChanged: (spaceId: string, ownerPrincipalId: string, payload: unknown): void => {

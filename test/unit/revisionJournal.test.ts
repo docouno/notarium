@@ -12,6 +12,7 @@ import {
   analyzeDocumentState,
   bindStorageOwnerProof,
   CachedStore,
+  decodeDocumentState,
   encodeDocumentState,
   InMemoryRevisionPersistence,
   logicalNoteState,
@@ -115,6 +116,94 @@ describe('revision journal (#12) — write-through', () => {
       sourceRevisionId: deleted!.id,
     })
     expect(rows.items.map((revision) => revision.kind)).toEqual(['restore', 'external', 'delete'])
+  })
+
+  it("refuses a stored blob it can no longer project with the journal's own vocabulary", async () => {
+    const persistence = new InMemoryRevisionPersistence()
+    const journal = new RevisionJournal({ persistence, space: 'main' })
+    // This row is CONSTRUCTED, and it has to be — no path in this tree writes one.
+    // Every producer of a proof binds it over the SAME buffer it then analyses
+    // (`notariumStore` on write and on read, `restoreCoordinator` twice,
+    // `inMemoryStore`), so a blob is self-consistent the moment it is written, and
+    // stays so however the file was decoded: the BOM fix moved `raw`, never `source`.
+    //
+    // What DOES produce one is the single thing one tree cannot hold — two analyzers.
+    // The codec proves a stored header against a FRESH reading of that row's own
+    // source, so a reader that has since learned to lay those bytes out differently
+    // stops reproducing what the writer of the day recorded, and no retry ever will.
+    // The claim below is moved off its field to stand in for exactly that, by the
+    // narrowest mechanism there is: `validateProof` keeps a claim only on an EXACT
+    // field-range match, so a claim that matches none is dropped, the re-derived
+    // fingerprint becomes the one of a document with no claims, and it cannot equal
+    // the fingerprint stored beside it. The SIZE of the move carries nothing — any
+    // offset that misses the field does this — and nothing else about the fixture is
+    // load-bearing either.
+    //
+    // The subject is not the refusal. It is the JOURNAL's answer to a refusal: the
+    // vocabulary its readers already handle, rather than the codec's raw throw, which
+    // reached the one reader that maps errors to a status as an unclassified fault and
+    // turned an ordinary request for an old revision into a 500.
+    const source = new TextEncoder().encode('---\nnotarium-id: AbCdefGhij_1\ntitle: A\n---\nbody\n')
+    const proof = bindStorageOwnerProof({
+      source,
+      owners: [{ key: 'notarium-id', ownership: 'value' }],
+      evidence: { kind: 'mutation-receipt', id: 'receipt-pre-upgrade' },
+    })
+    const state = analyzeDocumentState({ source, ownerProof: proof, pathFallbackTitle: 'a' })
+    const offField = (range: { start: number; end: number }) => ({
+      start: range.start - 1,
+      end: range.end - 1,
+    })
+
+    // The claim this fixture moves is a real one: without it the blob would be
+    // self-consistent and there would be nothing for the journal to answer for.
+    expect(state.provenance.claims).toHaveLength(1)
+    const preUpgrade = encodeDocumentState({
+      ...state,
+      provenance: {
+        ...state.provenance,
+        claims: state.provenance.claims.map((claim) => ({
+          ...claim,
+          valueRange: offField(claim.valueRange),
+          entryRange: offField(claim.entryRange),
+        })),
+      },
+    })
+
+    // The premise, asserted rather than assumed: the codec refuses THIS blob, and for
+    // the stated reason — not because the envelope is malformed or truncated. Without
+    // it a fixture that quietly stopped drifting would leave the arc below passing on
+    // an error the journal never had to translate.
+    expect(() => decodeDocumentState(preUpgrade)).toThrowError(/does not match its source/u)
+    const appended = await persistence.append(
+      {
+        noteId: 'drifted-proof-note',
+        space: 'main',
+        baseRevisionId: null,
+        theirRevisionId: null,
+        sourceRevisionId: null,
+        kind: 'write',
+        entryRole: 'origin',
+        principal: 'ui',
+        contentHash: await sha256Hex(preUpgrade),
+        semanticFingerprint: state.semanticFingerprint,
+        restoreSafety: state.restoreSafety.status,
+        stateFormat: state.format,
+        title: 'A',
+        class: 'user-doc',
+        slug: null,
+        tags: [],
+        createdAt: '2026-06-12T11:00:00Z',
+        charsAdded: null,
+        charsRemoved: null,
+      },
+      preUpgrade,
+    )
+
+    await expect(journal.detail('drifted-proof-note', appended.id)).rejects.toMatchObject({
+      reason: 'revision_has_no_content',
+      isToolError: true,
+    })
   })
 
   it('deduplicates receipt lineage and proven owner-value churn by semantic fingerprint', async () => {
@@ -1221,9 +1310,7 @@ describe('trash (#79) — the journal view + undelete', () => {
   it.each([
     {
       id: 'opaque-utf8-deleted',
-      source: new TextEncoder().encode(
-        '---\nname: another-package\ndescription: mismatch\n---\nLiteral source.\n',
-      ),
+      source: new TextEncoder().encode('---\nname: invalid--package\n---\nLiteral source.\n'),
     },
     { id: 'opaque-bytes-deleted', source: Uint8Array.from([0xff, 0x00, 0xfe, 0x61]) },
   ])('keeps exact document source in the deleted view for $id', async ({ id, source }) => {

@@ -7,6 +7,7 @@ import type {
   ContextSetResponse,
   ContextSetsResponse,
   MeAgentContext,
+  MeRoleContext,
   MuteNoteResponse,
   PinNoteResponse,
 } from '@notarium/contract'
@@ -19,6 +20,23 @@ export const contextApi = {
    *  full pins[] for the UI (memory is meMemoryGet). */
   meAgentContextGet: (role?: string) =>
     req<MeAgentContext>(`/api/me/agent-context${role ? `?role=${encodeURIComponent(role)}` : ''}`),
+  /** The IDENTITY door beside it (#309): WHICH owned role this address names, its own
+   *  editable layer (pins + sets, with no word about a budget), and whether the agent
+   *  would load it where the caller is standing — `project` says where that is, because
+   *  reach is a question about a project.
+   *
+   *  Two calls because they are two questions with two owners. `meAgentContextGet`
+   *  mirrors what the agent loads and therefore omits a role it does not load; reading
+   *  the layer from it made "the agent ignores this role here" and "no such role"
+   *  indistinguishable, and the page threw the reader into the base context — on the
+   *  very page that configures that role's shared context. Here "no such role" has
+   *  exactly one spelling, a 404. */
+  meRoleContextGet: (roleLocator: string, project?: string) =>
+    req<MeRoleContext>(
+      `/api/me/agent-roles/${encodeURIComponent(roleLocator)}/context${
+        project ? `?project=${encodeURIComponent(project)}` : ''
+      }`,
+    ),
   /** The agent-retrieval audit (#243): the viewer's own agent search/recall/get_note
    *  history (newest-first, windowed) + whole-history aggregates. `tool` narrows to one
    *  tool; `filter='misses'` keeps only the zero-result calls. */
@@ -185,14 +203,14 @@ export const contextApi = {
   contextSetDetachPersonal: (id: string) =>
     req<{ ok: true }>(`/api/me/context-sets/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   /** Attach/detach against the exact effective owned role in personal or project mode. */
-  contextSetAttachRole: (role: string, id: string, projectId?: string) =>
+  contextSetAttachRole: (roleLocator: string, id: string) =>
     req<{ ok: true }>(
-      `/api/me/agent-roles/${encodeURIComponent(role)}/context-sets/${encodeURIComponent(id)}${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''}`,
+      `/api/me/agent-roles/${encodeURIComponent(roleLocator)}/context-sets/${encodeURIComponent(id)}`,
       { method: 'PUT' },
     ),
-  contextSetDetachRole: (role: string, id: string, projectId?: string) =>
+  contextSetDetachRole: (roleLocator: string, id: string) =>
     req<{ ok: true }>(
-      `/api/me/agent-roles/${encodeURIComponent(role)}/context-sets/${encodeURIComponent(id)}${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''}`,
+      `/api/me/agent-roles/${encodeURIComponent(roleLocator)}/context-sets/${encodeURIComponent(id)}`,
       { method: 'DELETE' },
     ),
 
@@ -218,14 +236,14 @@ export const contextApi = {
       { method: 'DELETE' },
     ),
   /** Role pins always use the role registry, including notes in the role's own space. */
-  contextPinAttachRole: (role: string, noteSpace: string, noteId: string, projectId?: string) =>
+  contextPinAttachRole: (roleLocator: string, noteSpace: string, noteId: string) =>
+    req<{ ok: true }>(`/api/me/agent-roles/${encodeURIComponent(roleLocator)}/context-pins`, {
+      method: 'PUT',
+      body: JSON.stringify({ space: noteSpace, noteId }),
+    }),
+  contextPinDetachRole: (roleLocator: string, noteId: string) =>
     req<{ ok: true }>(
-      `/api/me/agent-roles/${encodeURIComponent(role)}/context-pins${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''}`,
-      { method: 'PUT', body: JSON.stringify({ space: noteSpace, noteId }) },
-    ),
-  contextPinDetachRole: (role: string, noteId: string, projectId?: string) =>
-    req<{ ok: true }>(
-      `/api/me/agent-roles/${encodeURIComponent(role)}/context-pins/${encodeURIComponent(noteId)}${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''}`,
+      `/api/me/agent-roles/${encodeURIComponent(roleLocator)}/context-pins/${encodeURIComponent(noteId)}`,
       { method: 'DELETE' },
     ),
 
@@ -243,11 +261,11 @@ export const contextApi = {
       method: 'PUT',
       body: JSON.stringify({ entries }),
     }),
-  contextOrderRole: (role: string, entries: ContextOrderEntry[], projectId?: string) =>
-    req<{ ok: true }>(
-      `/api/me/agent-roles/${encodeURIComponent(role)}/context-order${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ''}`,
-      { method: 'PUT', body: JSON.stringify({ entries }) },
-    ),
+  contextOrderRole: (roleLocator: string, entries: ContextOrderEntry[]) =>
+    req<{ ok: true }>(`/api/me/agent-roles/${encodeURIComponent(roleLocator)}/context-order`, {
+      method: 'PUT',
+      body: JSON.stringify({ entries }),
+    }),
   /** Reorder a set's items to `noteIds` (a home-space write; `space` = the set's home). */
   contextSetItemsOrder: (space: string, id: string, noteIds: string[]) =>
     req<ContextSetResponse>(`${sp(space)}/context-sets/${encodeURIComponent(id)}/order`, {

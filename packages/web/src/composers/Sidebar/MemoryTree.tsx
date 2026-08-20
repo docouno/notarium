@@ -9,7 +9,6 @@ import {
 } from 'react'
 import { Link } from 'react-router'
 import type { MemoryCategory, ProjectRow } from '@notarium/contract'
-import { STORE_EVENT } from '@notarium/contract/events'
 import { comparatorFor, type SortFields } from '@notarium/core'
 import { EmptyState } from '../../core/EmptyState'
 import { IconBotMessage, IconChevron, IconDoc, IconFolderKanban, IconUser } from '../../core/Icons'
@@ -17,10 +16,10 @@ import { cx } from '../../libs/cx/cx'
 import { memoryNoteRoute } from '../../libs/routing/routePaths'
 import { api } from '../../services/api'
 import { TreeState } from '../../widgets/TreeState'
+import { useAgentsExplorer } from '../AgentsExplorerProvider'
 import { useNotes } from '../NotesProvider'
 import { useProjects } from '../ProjectsProvider'
 import { useSpace } from '../SpaceProvider'
-import { CHANGED_COALESCE_MS, useSync } from '../SyncProvider'
 import { ExplorerVirtualRows } from './ExplorerVirtualRows'
 import styles from './MemoryTree.module.scss'
 import tree from './Sidebar.module.scss'
@@ -42,6 +41,7 @@ const MEMORY_SORT_FIELDS: SortFields<MemoryCategory> = {
 }
 type Axis = {
   key: string
+  contextScope: string
   label: string
   icon: 'user' | 'project'
   cats: MemoryCategory[]
@@ -73,8 +73,8 @@ export const MemoryTree = ({
 }) => {
   const { space } = useSpace()
   const { projects } = useProjects()
+  const { versions } = useAgentsExplorer()
   const { explorerSort, explorerSortDir } = useNotes()
-  const { subscribe } = useSync()
   const [axes, setAxes] = useState<Axis[] | null>(null)
   // Track only the CLOSED axes — everything is open by default so the content is
   // visible the moment the surface loads.
@@ -89,9 +89,16 @@ export const MemoryTree = ({
     const projList = (projects ?? []).filter((p) => p.space === space)
     const user = api
       .meMemoryGet({ sort: explorerSort, dir: explorerSortDir })
-      .then((cats): Axis => ({ key: USER_KEY, label: 'Personal', icon: 'user', cats }))
+      .then((cats): Axis => ({
+        key: USER_KEY,
+        contextScope: 'personal',
+        label: 'Personal',
+        icon: 'user',
+        cats,
+      }))
       .catch((): Axis => ({
         key: USER_KEY,
+        contextScope: 'personal',
         label: 'Personal',
         icon: 'user',
         cats: [],
@@ -100,9 +107,16 @@ export const MemoryTree = ({
     const projAxes = projList.map((p) =>
       api
         .projectMemoryGet(space, p.id, { sort: explorerSort, dir: explorerSortDir })
-        .then((cats): Axis => ({ key: p.id, label: projectAxisLabel(p), icon: 'project', cats }))
+        .then((cats): Axis => ({
+          key: p.id,
+          contextScope: p.slug,
+          label: projectAxisLabel(p),
+          icon: 'project',
+          cats,
+        }))
         .catch((): Axis => ({
           key: p.id,
+          contextScope: p.slug,
           label: projectAxisLabel(p),
           icon: 'project',
           cats: [],
@@ -137,7 +151,7 @@ export const MemoryTree = ({
 
   useEffect(() => {
     void load()
-  }, [load])
+  }, [load, versions.memory])
 
   useEffect(() => {
     if (!activeId || !axes) {
@@ -157,27 +171,6 @@ export const MemoryTree = ({
       return next
     })
   }, [activeId, axes])
-
-  // Live freshness via the active space's SSE (covers about-project edits).
-  useEffect(() => {
-    let timer: ReturnType<typeof setTimeout> | null = null
-    const unsub = subscribe((event) => {
-      if (event.type !== STORE_EVENT.CHANGED || timer) {
-        return
-      }
-      timer = setTimeout(() => {
-        timer = null
-        void load()
-      }, CHANGED_COALESCE_MS)
-    })
-
-    return () => {
-      if (timer) {
-        clearTimeout(timer)
-      }
-      unsub()
-    }
-  }, [subscribe, load])
 
   const toggle = (key: string) =>
     setClosed((prev) => {
@@ -310,7 +303,7 @@ export const MemoryTree = ({
               >
                 <span className={tree.chevSpacer} />
                 <Link
-                  to={memoryNoteRoute(row.cat.noteId) ?? '#'}
+                  to={memoryNoteRoute(row.cat.noteId, undefined, row.axis.contextScope) ?? '#'}
                   className={cx(tree.navItemBtn, tree.noteRow)}
                   aria-current={active ? 'page' : undefined}
                   title={row.cat.summary || row.cat.category}

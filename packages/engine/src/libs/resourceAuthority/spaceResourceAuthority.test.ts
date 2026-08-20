@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   createLocalFsFiles,
@@ -10,8 +10,28 @@ import {
   type FileStore,
 } from '../files'
 import { SpaceResourceAuthorityRegistry } from './registry'
+import type * as rootsModule from './roots'
 import { preflightResourceRoots } from './roots'
 import { SpaceResourceAuthority } from './spaceResourceAuthority'
+
+/** Counts the physical root re-canonicalization — one `lstat` + `realpath` per mount
+ *  root — so "the lease path does not pay the check twice" is measured rather than
+ *  asserted about the source. */
+const rootChecks = vi.hoisted(() => ({ count: 0 }))
+
+vi.mock('./roots', async (importOriginal) => {
+  const actual = (await importOriginal()) as typeof rootsModule
+
+  return {
+    ...actual,
+    assertCanonicalResourceRoot: (
+      root: Parameters<typeof actual.assertCanonicalResourceRoot>[0],
+    ) => {
+      rootChecks.count++
+      actual.assertCanonicalResourceRoot(root)
+    },
+  }
+})
 
 const roots: string[] = []
 
@@ -34,6 +54,81 @@ const present = (value: number, claim = String(value)): FileObservation => ({
 
 const observingStore = (observe: (path: string) => Promise<FileObservation>): FileStore =>
   ({ observe }) as FileStore
+
+/** Public entries that TAKE a lease: the one place the lifecycle question is asked. */
+const LEASE_GATES = ['admitResource', 'admitPackage', 'admitSkillPlacement'] as const
+
+/** Public entries the caller enters under its OWN lease. They ask whether they were
+ *  admitted, never whether the space is still accepting — the fence drains them. */
+const ADMITTED_ENTRIES = [
+  'assertSkillManifestNameAvailableAdmitted',
+  'observeLinkedAdmitted',
+  'observeStrictAdmitted',
+  'publishAdmitted',
+  'publishPackageIfAbsentAdmitted',
+  'publishStrictAdmitted',
+] as const
+
+/** Everything else on the prototype: composed entries that reach one of the two
+ *  above, pure queries, and the private helpers. Listed so that a NEW method cannot
+ *  quietly belong to nothing. */
+const NEITHER = [
+  'assertAdmissible',
+  'assertAdmitted',
+  'assertRootsStable',
+  'closeAdmission',
+  'diagnostics',
+  'discardStrict',
+  'exportAdapter',
+  'inspectStrict',
+  'mapStrictHeader',
+  'mapStrictPublication',
+  'mapStrictReceipt',
+  'mapStrictState',
+  'observe',
+  'observeAdmitted',
+  'observeLinked',
+  'publish',
+  'publishPackageIfAbsent',
+  'publishStrict',
+  'removeClaimed',
+  'reopenAdmission',
+  'resourcePathContext',
+  'route',
+  'stageStrict',
+  'supportsRestartDurableStrict',
+] as const
+
+/** One call per admitted entry, so "every admitted entry refuses an unadmitted call"
+ *  is checked over the entries themselves rather than over a hand-picked three. */
+const admittedEntryCalls = (
+  authority: SpaceResourceAuthority,
+): Record<(typeof ADMITTED_ENTRIES)[number], () => Promise<unknown>> => {
+  const absent = { kind: 'absent' as const, value: 'test:absent' }
+
+  return {
+    assertSkillManifestNameAvailableAdmitted: () =>
+      authority.assertSkillManifestNameAvailableAdmitted('pkg/SKILL.md', Uint8Array.of(1)),
+    observeLinkedAdmitted: () =>
+      authority.observeLinkedAdmitted('pkg/note.md', 'pkg/SKILL.md', () => true),
+    observeStrictAdmitted: () => authority.observeStrictAdmitted('note.md'),
+    publishAdmitted: () =>
+      authority.publishAdmitted({
+        kind: 'put',
+        path: 'note.md',
+        content: Uint8Array.of(1),
+        expected: absent,
+      }),
+    publishPackageIfAbsentAdmitted: () =>
+      authority.publishPackageIfAbsentAdmitted({
+        rootPath: 'pkg',
+        files: [{ path: 'SKILL.md', content: Uint8Array.of(1) }],
+        expectedRoot: absent,
+      }),
+    publishStrictAdmitted: () =>
+      authority.publishStrictAdmitted({ operationId: 'op', binding: 'binding', path: 'note.md' }),
+  }
+}
 
 describe('SpaceResourceAuthority', () => {
   it('rejects ambiguous topology and non-canonical resource requests', async () => {
@@ -270,6 +365,30 @@ describe('SpaceResourceAuthority', () => {
     expect(rootCalls).toEqual(['note.md'])
     expect(skill.kind === 'present' ? skill.bytes : null).toEqual(Uint8Array.of(7))
     expect(note).toMatchObject({ spaceId: 'space', adapterId: 'root', path: 'note.md' })
+  })
+
+  it('serializes different package ids at the shared skill placement boundary', async () => {
+    const authority = new SpaceResourceAuthority('space', [
+      { id: 'skills', prefix: '.skills', files: observingStore(async () => present(1)) },
+    ])
+    const placement = await authority.admitSkillPlacement(
+      '.skills/Ab3xK9_qZ12R/SKILL.md',
+      'exclusive',
+      'rename',
+    )
+
+    await expect(
+      authority.admitSkillPlacement('.skills/Zy9xW8_vU76Q/SKILL.md', 'exclusive', 'create', {
+        deadlineMs: 5,
+      }),
+    ).rejects.toMatchObject({ code: 'DEADLINE' })
+    const otherProject = await authority.admitSkillPlacement(
+      '.skills/_projects/cHJvamVjdA/Zy9xW8_vU76Q/SKILL.md',
+      'exclusive',
+      'other-project',
+    )
+    otherProject.settle()
+    placement.settle()
   })
 
   it('uses A-target-B claims for linked-resource classification', async () => {
@@ -686,5 +805,177 @@ describe('SpaceResourceAuthority', () => {
     ])
 
     expect(authority.supportsRestartDurableStrict('note.md')).toBe(false)
+  })
+
+  // ── The lifecycle question has ONE home: the admission gate ──────────────────
+  //
+  // Round 2 caught `assertLifecycleOpen` wrong in both directions at once, which is
+  // what a per-method answer costs. Too wide: `publish` asked at the gate AND again
+  // on the way out, so an ordinary save that the drain had already admitted died of
+  // the fence it was being waited for. Too narrow: three `*Admitted` entries —
+  // publication among them — never asked anything. The four tests below hold the two
+  // halves and the classification that keeps a future method from having no home.
+
+  it('finishes a publication the fence is already waiting for', async () => {
+    const absent = { kind: 'absent' as const, value: 'test:absent' }
+    const authority = new SpaceResourceAuthority('space', [
+      {
+        id: 'root',
+        prefix: '',
+        files: {
+          observe: async () => present(1, 'after'),
+          publish: async (request: FilePublicationRequest) => ({
+            status: 'published',
+            candidateHash: 'a'.repeat(64),
+            transitions: [
+              {
+                path: request.kind === 'put' ? request.path : request.targetPath,
+                before: absent,
+                after: { kind: 'present' as const, value: 'test:after' },
+                mtimeMs: 2,
+              },
+            ],
+          }),
+        } as unknown as FileStore,
+      },
+    ])
+    // The publication asks for its lease BEFORE the fence and receives it AFTER —
+    // which is precisely the window `closeAdmission` promises to wait through, and
+    // precisely the window a second lifecycle check inside `publishAdmitted` kills.
+    const blocker = await authority.admitResource('note.md', 'exclusive', 'blocking-writer')
+    const publishing = authority.publish({
+      kind: 'put',
+      path: 'note.md',
+      content: Uint8Array.of(7),
+      expected: absent,
+    })
+    const closing = authority.closeAdmission()
+
+    await expect(authority.admitResource('other.md', 'shared', 'fresh')).rejects.toMatchObject({
+      code: 'SPACE_LIFECYCLE_CLOSED',
+    })
+    blocker.settle()
+    await expect(publishing).resolves.toMatchObject({ status: 'published' })
+    await closing
+  })
+
+  it('refuses every admitted entry that reaches a closed space with no lease at all', async () => {
+    const authority = new SpaceResourceAuthority('space', [
+      { id: 'root', prefix: '', files: observingStore(async () => present(1)) },
+    ])
+
+    await authority.closeAdmission()
+    for (const [name, call] of Object.entries(admittedEntryCalls(authority))) {
+      await expect(call(), name).rejects.toMatchObject({ code: 'SPACE_LIFECYCLE_CLOSED' })
+    }
+  })
+
+  it('still admits recovery through an admitted entry while the space closes', async () => {
+    const absent = { kind: 'absent' as const, value: 'test:absent' }
+    const authority = new SpaceResourceAuthority('space', [
+      {
+        id: 'root',
+        prefix: '',
+        files: {
+          observe: async () => present(1, 'after'),
+          publish: async (request: FilePublicationRequest) => ({
+            status: 'published',
+            candidateHash: 'a'.repeat(64),
+            transitions: [
+              {
+                path: request.kind === 'put' ? request.path : request.targetPath,
+                before: absent,
+                after: { kind: 'present' as const, value: 'test:after' },
+                mtimeMs: 2,
+              },
+            ],
+          }),
+        } as unknown as FileStore,
+      },
+    ])
+
+    await authority.closeAdmission()
+    // `restoreCoordinator.resume` is exactly this shape: it takes its lease with
+    // `allowDuringClosure` and then publishes through an admitted entry. The lease
+    // IS the answer; re-asking here would end restore recovery on a closing space.
+    const lease = await authority.admitResource('note.md', 'exclusive', 'restore:op', {
+      allowDuringClosure: true,
+    })
+
+    await expect(
+      authority.publishAdmitted({
+        kind: 'put',
+        path: 'note.md',
+        content: Uint8Array.of(7),
+        expected: absent,
+      }),
+    ).resolves.toMatchObject({ status: 'published' })
+    await expect(authority.observeStrictAdmitted('note.md')).resolves.toMatchObject({
+      kind: 'present',
+    })
+    lease.settle()
+  })
+
+  it('classifies every method of the authority as a gate, an admitted entry or neither', () => {
+    // The gate that makes the class impossible to extend blindly: a method added
+    // without an answer to "who asks the lifecycle question here" is in none of the
+    // three lists and fails BY NAME, and an admitted entry that is not exercised
+    // above has no invoker in the table the previous test iterates.
+    const declared = [...LEASE_GATES, ...ADMITTED_ENTRIES, ...NEITHER].sort()
+    const actual = Object.getOwnPropertyNames(SpaceResourceAuthority.prototype)
+      .filter((name) => name !== 'constructor')
+      .sort()
+
+    expect(actual).toEqual(declared)
+    expect(
+      Object.keys(
+        admittedEntryCalls(
+          new SpaceResourceAuthority('space', [
+            { id: 'root', prefix: '', files: observingStore(async () => present(1)) },
+          ]),
+        ),
+      ).sort(),
+    ).toEqual([...ADMITTED_ENTRIES].sort())
+  })
+
+  it('canonicalizes the mount roots once per lease and never again under them', async () => {
+    const root = await mkroot()
+    const absent = { kind: 'absent' as const, value: 'test:absent' }
+    const authority = new SpaceResourceAuthority('space', [
+      {
+        id: 'root',
+        prefix: '',
+        physicalRoot: root,
+        files: {
+          observe: async () => present(1, 'after'),
+          publish: async (request: FilePublicationRequest) => ({
+            status: 'published',
+            candidateHash: 'a'.repeat(64),
+            transitions: [
+              {
+                path: request.kind === 'put' ? request.path : request.targetPath,
+                before: absent,
+                after: { kind: 'present' as const, value: 'test:after' },
+                mtimeMs: 2,
+              },
+            ],
+          }),
+        } as unknown as FileStore,
+      },
+    ])
+    const before = rootChecks.count
+
+    await authority.publish({
+      kind: 'put',
+      path: 'pkg/note.md',
+      content: Uint8Array.of(7),
+      expected: absent,
+      packagePath: 'pkg',
+    })
+
+    // Two leases, two checks. The third — one more synchronous `lstat`+`realpath` of
+    // every mount root on the way out of every save — is what a lifecycle check
+    // inside `publishAdmitted` costs.
+    expect(rootChecks.count - before).toBe(2)
   })
 })

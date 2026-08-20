@@ -1,11 +1,21 @@
 import type {
+  AbilityLocator,
   AddAgentRoleRequest,
-  AgentRoleDetailQuery,
-  AgentRoleDetailResponse,
+  AddAgentRoleResponse,
+  AddAgentSkillRequest,
+  AddAgentSkillResponse,
+  AgentAbilityDetailResponse,
+  AgentPackageLibraryQueryInput,
   ConnectionPatchRequest,
   ConnectionsResponse,
+  CreateAbilityVersionResponse,
+  CreateAgentRoleRequest,
+  CreateAgentRoleResponse,
+  CreateAgentSkillRequest,
+  CreateAgentSkillResponse,
   Me,
   MeAgentRolesResponse,
+  MeAgentSkillsResponse,
   MeMemory,
   MeMemoryQuery,
   PatCreateRequest,
@@ -14,30 +24,91 @@ import type {
   PatsResponse,
   Profile,
   ProfilePutRequest,
+  SetAbilityHomeRequest,
+  SetAbilityHomeResponse,
+  SetAgentAbilityAvailabilityRequest,
+  SetAgentAbilityAvailabilityResponse,
+  SetAgentAbilityEnabledResponse,
 } from '@notarium/contract'
+import { encodeAbilityLocator } from '@notarium/core'
 import { req } from './client'
 import { memoryQs } from './query'
+
+const packageLibraryQuery = (query: AgentPackageLibraryQueryInput): string => {
+  const params = new URLSearchParams()
+
+  for (const [key, value] of Object.entries(query)) {
+    if (value !== undefined) {
+      params.set(key, String(value))
+    }
+  }
+  const encoded = params.toString()
+  return encoded ? `?${encoded}` : ''
+}
 
 export const meApi = {
   // ── self-service (#10): /api/me ─────────────────────────────────────────────
   meGet: () => req<Me>('/api/me'),
-  agentRolesGet: () => req<MeAgentRolesResponse>('/api/me/agent-roles'),
-  agentRoleDetail: (name: string, query: AgentRoleDetailQuery) => {
-    const params = new URLSearchParams({ scope: query.scope })
-
-    if (query.scope === 'space') {
-      params.set('space', query.space)
-    } else if (query.scope === 'project') {
-      params.set('project', query.project)
-    }
-
-    return req<AgentRoleDetailResponse>(`/api/me/agent-roles/${encodeURIComponent(name)}?${params}`)
-  },
-  agentRoleAdd: (input: AddAgentRoleRequest) =>
-    req<{ role: MeAgentRolesResponse['roles'][number] }>('/api/me/agent-roles', {
+  agentRolesGet: (query: AgentPackageLibraryQueryInput = {}) =>
+    req<MeAgentRolesResponse>(`/api/me/agent-roles${packageLibraryQuery(query)}`),
+  agentAbilityGet: (locator: AbilityLocator) =>
+    req<AgentAbilityDetailResponse>(
+      `/api/me/agent-abilities/${encodeURIComponent(encodeAbilityLocator(locator))}`,
+    ),
+  agentAbilitySetEnabled: (
+    locator: Exclude<AbilityLocator, { source: 'catalog' }>,
+    enabled: boolean,
+  ) =>
+    req<SetAgentAbilityEnabledResponse>(
+      `/api/me/agent-abilities/${encodeURIComponent(encodeAbilityLocator(locator))}/enabled`,
+      { method: 'PUT', body: JSON.stringify({ enabled }) },
+    ),
+  agentAbilitySetAvailability: (
+    locator: Extract<AbilityLocator, { source: 'owned' }>,
+    availability: SetAgentAbilityAvailabilityRequest,
+  ) =>
+    req<SetAgentAbilityAvailabilityResponse>(
+      `/api/me/agent-abilities/${encodeURIComponent(encodeAbilityLocator(locator))}/availability`,
+      { method: 'PUT', body: JSON.stringify(availability) },
+    ),
+  agentAbilityCreateVersion: (
+    locator: Extract<AbilityLocator, { source: 'owned'; kind: 'role' }>,
+    projectId: string,
+  ) =>
+    req<CreateAbilityVersionResponse>(
+      `/api/me/agent-abilities/${encodeURIComponent(encodeAbilityLocator(locator))}/versions`,
+      { method: 'POST', body: JSON.stringify({ projectId }) },
+    ),
+  agentAbilitySetHome: (
+    locator: Extract<AbilityLocator, { source: 'owned'; kind: 'role' }>,
+    target: SetAbilityHomeRequest,
+  ) =>
+    req<SetAbilityHomeResponse>(
+      `/api/me/agent-abilities/${encodeURIComponent(encodeAbilityLocator(locator))}/home`,
+      { method: 'PUT', body: JSON.stringify(target) },
+    ),
+  agentRoleAddExact: (input: AddAgentRoleRequest) =>
+    req<AddAgentRoleResponse>('/api/me/agent-roles', {
       method: 'POST',
       body: JSON.stringify(input),
-    }).then((response) => response.role),
+    }),
+  agentRoleCreate: (input: CreateAgentRoleRequest) =>
+    req<CreateAgentRoleResponse>('/api/me/agent-roles/custom', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+  agentSkillsGet: (query: AgentPackageLibraryQueryInput = {}) =>
+    req<MeAgentSkillsResponse>(`/api/me/agent-skills${packageLibraryQuery(query)}`),
+  agentSkillPublish: (input: CreateAgentSkillRequest) =>
+    req<CreateAgentSkillResponse>('/api/me/agent-skills', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+  agentSkillAddExact: (input: AddAgentSkillRequest) =>
+    req<AddAgentSkillResponse>('/api/me/agent-skills/catalog', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
   passwordChange: (currentPassword: string, newPassword: string) =>
     req<{ ok: true }>('/api/me/password', {
       method: 'POST',

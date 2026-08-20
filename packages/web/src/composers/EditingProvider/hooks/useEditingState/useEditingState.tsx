@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useBlocker, useLocation, useNavigate } from 'react-router'
+import { NOTE_CLASS } from '@notarium/contract/enums'
 import { HTTP_STATUS } from '@notarium/contract/http'
 import {
   DEFAULT_NOTE_TYPE,
@@ -21,7 +22,7 @@ import type { NoteDetailView, SaveInput } from '../../../../libs/wire'
 import { api, ApiError } from '../../../../services/api'
 import { useNotes } from '../../../NotesProvider'
 import { useSpace } from '../../../SpaceProvider'
-import type { EditingContextValue, Ghost } from '../../types'
+import type { EditingContextValue, EditingSessionAdapter, Ghost } from '../../types'
 import { type Draft, useNoteDraft } from '../../useNoteDraft'
 import styles from '../../EditingProvider.module.scss'
 
@@ -36,9 +37,12 @@ const fitsInLabel = (title: string): boolean =>
   [...title].reduce((width, ch) => width + (ch.codePointAt(0)! > 0x2e7f ? 2 : 1), 0) <= 24
 
 export const useEditingState = (): EditingContextValue => {
-  const { space, canWrite } = useSpace()
+  const { space, canWrite, personalSpace } = useSpace()
   const { nav, note, clearReader, refreshFolders, openNote, reloadNote, tree } = useNotes()
   const folders = useMemo(() => tree?.folders ?? [], [tree?.folders])
+  const canWriteOpenNote =
+    canWrite ||
+    (note?.class === NOTE_CLASS.skill && personalSpace != null && note.space === personalSpace.slug)
   const { confirm, alert, choice } = useDialog()
   const toast = useToast()
   const navigate = useNavigate()
@@ -62,11 +66,30 @@ export const useEditingState = (): EditingContextValue => {
   // own already-confirmed actions navigate (the draft state hasn't re-rendered
   // yet, so the predicate would otherwise still see the old dirty draft).
   const bypassRef = useRef(false)
+  const sessionRef = useRef<(EditingSessionAdapter & { routeKey: string }) | null>(null)
+  const versionTokenRef = useRef<string | undefined>(undefined)
 
   const setDraft = useCallback((d: Draft | null) => {
     draftRef.current = d
     setDraftState(d)
   }, [])
+
+  const clearSession = useCallback(() => {
+    sessionRef.current = null
+    setDraft(null)
+  }, [setDraft])
+
+  const startSession = useCallback(
+    (adapter: EditingSessionAdapter) => {
+      if (sessionRef.current?.id === adapter.id && draftRef.current) {
+        return
+      }
+      sessionRef.current = { ...adapter, routeKey: location.key }
+      versionTokenRef.current = adapter.versionToken
+      setDraft(adapter.draft)
+    },
+    [location.key, setDraft],
+  )
 
   // Any router navigation while dirty is intercepted here (the other half of
   // the hybrid guard — non-navigation actions go through ensureCanLeaveDraft).
@@ -87,7 +110,7 @@ export const useEditingState = (): EditingContextValue => {
 
     return confirm({
       title: 'Discard unsaved changes?',
-      message: 'Your edits to this note haven’t been saved.',
+      message: sessionRef.current?.discardMessage ?? 'Your edits to this note haven’t been saved.',
       confirmLabel: 'Discard',
       danger: true,
     })
@@ -114,6 +137,7 @@ export const useEditingState = (): EditingContextValue => {
   const goNewDraft = useCallback(
     (prefill: { title?: string; dir?: string; links?: string[] }) => {
       clearReader()
+      sessionRef.current = null
       bypassRef.current = true
       navigate(`${scopeHref()}${newDraftQuery(prefill)}`)
       bypassRef.current = false
@@ -241,15 +265,17 @@ export const useEditingState = (): EditingContextValue => {
   // re-seed useNoteDraft and wipe the typed text; and it must NOT follow a
   // live `note` refresh (SSE-driven reload) — the token asserts what the user
   // actually saw, that's the whole CAS handshake.
-  const versionTokenRef = useRef<string | undefined>(undefined)
-
   const startEdit = useCallback(() => {
-    if (!note || !canWrite) {
+    if (!note || !canWriteOpenNote) {
       return
     }
     versionTokenRef.current = note.versionToken
+    sessionRef.current = null
+    const documentTitle =
+      note.class === NOTE_CLASS.skill ? note.documentTitle || note.title : note.title
     setDraft({
       isNew: false,
+      lockDirectory: note.class === NOTE_CLASS.skill,
       slug: note.slug || '', // #100 phase 1: prefill the custom slug ('' = implicit default)
       directory: folderOf(note.filePath),
       // Reconstruct the WHOLE document (#156): the stored body has its title H1
@@ -257,13 +283,13 @@ export const useEditingState = (): EditingContextValue => {
       // edits the title inline as the first line; the save chokepoint derives the
       // title from it and strips the heading back off. The versionToken (pinned
       // above) is unaffected — it tracks the stored, H1-less body.
-      content: note.title ? `# ${note.title}\n\n${note.content}` : note.content,
+      content: documentTitle ? `# ${documentTitle}\n\n${note.content}` : note.content,
       tags: Array.isArray(note.frontmatter?.tags) ? (note.frontmatter.tags as string[]) : [],
       noteType: (note.frontmatter?.type as string) || DEFAULT_NOTE_TYPE,
       // Prefill the editable creation date (#186) from the note's resolved instant.
       createdAt: note.createdAt ?? null,
     })
-  }, [note, canWrite, setDraft])
+  }, [note, canWriteOpenNote, setDraft])
 
   const startFolderPageEdit = useCallback(
     async (folderPath: string, title: string) => {
@@ -274,6 +300,7 @@ export const useEditingState = (): EditingContextValue => {
         return
       }
       versionTokenRef.current = undefined
+      sessionRef.current = null
       setDraft({
         isNew: true,
         folderPagePath: folderPath,
@@ -418,12 +445,27 @@ export const useEditingState = (): EditingContextValue => {
       // Root guard (#111): if the role was downgraded to reader mid-edit, the save
       // would 403 — refuse it honestly instead. Covers both the Save button and the
       // ⌘/Ctrl+Enter shortcut, which bypasses any button gating.
-      if (!canWrite) {
+      const externalSession = sessionRef.current
+      const canWriteDraft =
+        externalSession?.canWrite ||
+        canWrite ||
+        (draftRef.current?.isNew === false &&
+          note?.class === NOTE_CLASS.skill &&
+          personalSpace != null &&
+          note.space === personalSpace.slug)
+
+      if (!canWriteDraft) {
         toast.error('You have read-only access to this space.')
         return
       }
       setSaving(true)
       try {
+        if (externalSession) {
+          const result = await externalSession.save(payload, versionTokenRef.current)
+          clearSession()
+          await externalSession.onSaved?.(result)
+          return
+        }
         const folderPagePath = draftRef.current?.folderPagePath
 
         if (folderPagePath !== undefined) {
@@ -516,6 +558,7 @@ export const useEditingState = (): EditingContextValue => {
       note,
       space,
       canWrite,
+      personalSpace,
       refreshFolders,
       openNote,
       reloadNote,
@@ -523,6 +566,7 @@ export const useEditingState = (): EditingContextValue => {
       setDraft,
       resolveCreateCollision,
       resolveFolderPageMaterializeConflict,
+      clearSession,
     ],
   )
 
@@ -586,11 +630,14 @@ export const useEditingState = (): EditingContextValue => {
   // resurrect the form the user just dismissed (setDraft(null) first, so the
   // clean-up navigation isn't itself guarded).
   const cancelEdit = useCallback(() => {
-    setDraft(null)
+    const session = sessionRef.current
+    session?.onDiscard?.()
+    clearSession()
+    session?.onCancel?.()
     if (parseNewDraft(window.location.search)) {
       navigate(window.location.pathname, { replace: true })
     }
-  }, [setDraft, navigate])
+  }, [clearSession, navigate])
 
   const guarded = useCallback(
     <A extends unknown[]>(fn: (...args: A) => void) =>
@@ -599,7 +646,8 @@ export const useEditingState = (): EditingContextValue => {
           return
         }
         if (draftRef.current) {
-          setDraft(null)
+          sessionRef.current?.onDiscard?.()
+          clearSession()
         }
         bypassRef.current = true
         try {
@@ -608,7 +656,7 @@ export const useEditingState = (): EditingContextValue => {
           bypassRef.current = false
         }
       },
-    [ensureCanLeaveDraft, setDraft],
+    [ensureCanLeaveDraft, clearSession],
   )
 
   // A blocked navigation = the dirty-draft confirm, then proceed or stay.
@@ -622,6 +670,7 @@ export const useEditingState = (): EditingContextValue => {
         return
       }
       if (ok) {
+        sessionRef.current?.onDiscard?.()
         blocker.proceed()
       } else {
         blocker.reset()
@@ -637,8 +686,11 @@ export const useEditingState = (): EditingContextValue => {
   // draft afterwards when the new URL itself asks for one (a ?new create-intent),
   // so a clear→seed pair handles "navigate from one new-draft URL to another".
   useEffect(() => {
+    if (sessionRef.current?.routeKey === location.key) {
+      return
+    }
     if (draftRef.current) {
-      setDraft(null)
+      clearSession()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [location.key])
@@ -698,6 +750,7 @@ export const useEditingState = (): EditingContextValue => {
     draft,
     editor,
     saving,
+    startSession,
     startNew,
     startEdit,
     startFolderPageEdit,

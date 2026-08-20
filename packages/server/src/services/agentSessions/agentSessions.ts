@@ -1,7 +1,12 @@
 import { AGENT_SESSION_STATE, type AgentSessionState } from '@notarium/contract'
 import { AGENT_SESSION_ATTACH, type AgentSessionAttach, freshNoteId } from '@notarium/core'
 
-import type { AgentSessionRecord, AgentSessionRoleSet, AgentSessionsPersistence } from '../metaDb'
+import type {
+  AgentSessionRecord,
+  AgentSessionRoleSelection,
+  AgentSessionRoleSet,
+  AgentSessionsPersistence,
+} from '../metaDb'
 import {
   AGENT_SESSION_IDLE_MS,
   AGENT_SESSION_RECENT_LIMIT,
@@ -33,7 +38,7 @@ export type AgentSessions = {
     defaultName: string,
   ): Promise<AgentSessionStart>
   /** Persist one selected role for the bound episode. */
-  setRole(session: BoundAgentSession, role: string): Promise<AgentSessionRoleSet>
+  setRole(session: BoundAgentSession, role: AgentSessionRoleSelection): Promise<AgentSessionRoleSet>
 }
 
 export class NoSuchAgentSessionError extends Error {
@@ -49,6 +54,8 @@ export type CreateAgentSessionsOptions = {
   now?: () => Date
   /** Deterministic collision-free mint seam for the contract/service tests. */
   mintId?: () => string
+  /** Best-effort owner-global invalidation after a durable session mutation. */
+  onChange?: (owner: string) => void
 }
 
 const before = (now: Date, elapsedMs: number): string =>
@@ -58,7 +65,16 @@ export const createAgentSessions = ({
   persistence,
   now: getNow = () => new Date(),
   mintId = () => `ses_${freshNoteId()}`,
+  onChange,
 }: CreateAgentSessionsOptions): AgentSessions => {
+  const changed = (owner: string): void => {
+    try {
+      onChange?.(owner)
+    } catch {
+      // UI invalidation must never turn a committed session mutation into a failure.
+    }
+  }
+
   const insert = async (
     owner: string,
     name: string,
@@ -78,8 +94,11 @@ export const createAgentSessions = ({
       lastSeenAt: at,
       calls: 1,
       role: null,
+      roleLocator: null,
+      roleContextProjectId: null,
     }
     await persistence.insert(record)
+    changed(owner)
     return { record, attach, state }
   }
 
@@ -103,6 +122,7 @@ export const createAgentSessions = ({
           throw new NoSuchAgentSessionError()
         }
 
+        changed(owner)
         return { record, attach: AGENT_SESSION_ATTACH.declared }
       }
 
@@ -111,6 +131,11 @@ export const createAgentSessions = ({
         before(now, AGENT_SESSION_IDLE_MS),
         at,
       )
+
+      if (record) {
+        changed(owner)
+      }
+
       return record ? { record, attach: AGENT_SESSION_ATTACH.inferred } : null
     },
 
@@ -119,7 +144,11 @@ export const createAgentSessions = ({
       const at = now.toISOString()
       const activeSince = before(now, AGENT_SESSION_IDLE_MS)
       const retainedSince = before(now, AGENT_SESSION_RETENTION_MS)
-      await persistence.prune(retainedSince)
+      const prunedOwners = await persistence.prune(retainedSince)
+
+      for (const prunedOwner of prunedOwners) {
+        changed(prunedOwner)
+      }
 
       if (request && 'id' in request) {
         const record = await persistence.touch(owner, request.id, at, retainedSince)
@@ -128,6 +157,7 @@ export const createAgentSessions = ({
           throw new NoSuchAgentSessionError()
         }
 
+        changed(owner)
         return {
           session: {
             record,
@@ -149,6 +179,8 @@ export const createAgentSessions = ({
             lastSeenAt: at,
             calls: 1,
             role: null,
+            roleLocator: null,
+            roleContextProjectId: null,
           },
           activeSince,
           retainedSince,
@@ -159,6 +191,7 @@ export const createAgentSessions = ({
           return { recentSessions: result.matches }
         }
 
+        changed(owner)
         return {
           session: {
             record: result.record,
@@ -171,6 +204,7 @@ export const createAgentSessions = ({
       const inferred = await persistence.inferActiveAndTouch(owner, activeSince, at)
 
       if (inferred) {
+        changed(owner)
         return {
           session: {
             record: inferred,
@@ -207,6 +241,10 @@ export const createAgentSessions = ({
         throw new NoSuchAgentSessionError()
       }
       session.record = result.record
+      if (result.changed) {
+        changed(session.record.owner)
+      }
+
       return result
     },
   }

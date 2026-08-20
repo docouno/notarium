@@ -4,6 +4,9 @@ import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
 import { SqliteMetaDb } from '../../packages/server/src/services/metaDb/sqliteMetaDb'
+import { describeAbilityAvailabilityContract } from './abilityAvailabilityContract'
+import { describeAbilityPlacementContract } from './abilityPlacementContract'
+import { describeAbilityPreferencesContract } from './abilityPreferencesContract'
 import { describeAgentDeltaCursorsContract } from './agentDeltaCursorsContract'
 import { describeAgentSessionsContract } from './agentSessionsContract'
 import { describeCausalMetadataContract } from './causalMetadataContract'
@@ -36,6 +39,11 @@ describeAgentDeltaCursorsContract('SQLite', async () => {
 describeAgentSessionsContract('SQLite', async () => {
   const db = new SqliteMetaDb(':memory:')
   return { persistence: db.sessions, teardown: () => db.close() }
+})
+
+describeAbilityPreferencesContract('SQLite', async () => {
+  const db = new SqliteMetaDb(':memory:')
+  return { db, teardown: () => db.close() }
 })
 
 describeFavoritesContract('SQLite', async () => {
@@ -153,6 +161,16 @@ describeSessionAuditContract('SQLite', async () => {
     sessions: db.sessions,
     teardown: () => db.close(),
   }
+})
+
+describeAbilityAvailabilityContract('SQLite', async () => {
+  const db = new SqliteMetaDb(':memory:')
+  return { db, teardown: () => db.close() }
+})
+
+describeAbilityPlacementContract('SQLite', async () => {
+  const db = new SqliteMetaDb(':memory:')
+  return { db, teardown: () => db.close() }
 })
 
 // Two connections onto ONE file database: ':memory:' would give each handle its

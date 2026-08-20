@@ -79,6 +79,38 @@ export default tseslint.config(
     },
   },
 
+  // core ↔ contract stay DECOUPLED: a domain enum both layers need lives as two
+  // independent const-object copies, reconciled by test/enumDrift.test.ts rather than
+  // by an import. The one sanctioned edge is TYPE-ONLY — types erase, so core still
+  // ships without contract at runtime, and a type it borrows cannot drift from the
+  // schema the way a copied one can. A VALUE import is the thing that would make the
+  // two packages one, so it is the thing this refuses.
+  {
+    files: ['packages/core/src/**/*.ts'],
+    rules: {
+      '@typescript-eslint/no-restricted-imports': [
+        'error',
+        {
+          paths: [
+            {
+              name: '@notarium/contract',
+              allowTypeImports: true,
+              message:
+                'core: @notarium/contract is TYPE-ONLY here — core and contract are decoupled packages, and a runtime value shared between them lives as two copies gated by test/enumDrift.test.ts.',
+            },
+          ],
+          patterns: [
+            {
+              group: ['@notarium/contract/*'],
+              message:
+                'core: @notarium/contract is TYPE-ONLY here — core and contract are decoupled packages, and a runtime value shared between them lives as two copies gated by test/enumDrift.test.ts.',
+            },
+          ],
+        },
+      ],
+    },
+  },
+
   // Consts purity (#56): consts/ is the zod-free SINK — no zod, no schema imports; a value
   // type derives from its dict via (typeof X)[keyof typeof X], never z.infer / keyof<schema>
   // / `satisfies Record<…, SchemaType>`. Locks the one-way schema→const dependency, which
@@ -150,7 +182,13 @@ export default tseslint.config(
   //
   // A non-tiered lock (the setup mutex, the jobs queue, an OAuth client table, a
   // session row, a spaces row) is exempt where it stands, with the reason inline —
-  // it is outside the hierarchy, so it constrains nothing and no helper owns it.
+  // it is outside the hierarchy, so it constrains nothing and no helper owns it. The
+  // exemption is only as true as its table's absence from `LOCK_LEVEL_OF_TABLE`, and
+  // that is a moving target: `folders` acquired a level (L4f) with tier 4, which made
+  // the inline `FOR KEY SHARE` in `agentDeltaCursors` a tiered lock with a stale note
+  // saying otherwise. Adding a table to the tier map means auditing the exemptions
+  // that name it; the live gate in `pgLockOrder.test.ts` now levels a lock statement
+  // by its table too, so the second half no longer depends on this comment.
   //
   // A narrow `files` block REPLACES `no-restricted-syntax` wholesale for the files it
   // matches, so the repo-wide `TSEnumDeclaration` ban above is repeated here.

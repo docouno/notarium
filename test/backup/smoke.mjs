@@ -284,10 +284,10 @@ try {
     'test -f /app/packages/server/dist/metaDb-migrations/manifest.json ' +
       '&& test -f /app/packages/server/dist/metaDb-migrations/sqlite/0000_baseline.sql ' +
       '&& test -f /app/packages/server/dist/metaDb-migrations/postgres/0000_baseline.sql ' +
-      '&& test -f /app/packages/server/dist/role-catalog/grooming/SKILL.md ' +
-      '&& test -f /app/packages/server/dist/role-catalog/grooming-evidence/SKILL.md ' +
-      '&& test -f /app/packages/server/dist/role-catalog/research/SKILL.md ' +
-      '&& test -f /app/packages/server/dist/role-catalog/research-evidence/SKILL.md',
+      '&& test -f /app/packages/server/dist/catalog/grooming/SKILL.md ' +
+      '&& test -f /app/packages/server/dist/catalog/grooming-evidence/SKILL.md ' +
+      '&& test -f /app/packages/server/dist/catalog/research/SKILL.md ' +
+      '&& test -f /app/packages/server/dist/catalog/research-evidence/SKILL.md',
   ])
 
   await run(['volume', 'create', sourceVolume])

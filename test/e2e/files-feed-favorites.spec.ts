@@ -203,10 +203,14 @@ test('picking a file lens OFF the section lands on the feed and lights it consis
   const scope = page.getByTestId('explorer-scope')
   const picker = () => scope.click()
 
-  // The bug this guards: from the Agents surface, picking Favorites dropped you on
-  // the DASHBOARD with the star lit, but picking Files/Projects dropped you there
-  // with NOTHING lit — inconsistent. Now BOTH land on the merged Files section (the
-  // feed) and light their icon the same way.
+  // The bug this guards: from a surface OUTSIDE the merged Files section, picking
+  // Favorites dropped you on the DASHBOARD with the star lit, but picking
+  // Files/Projects dropped you there with NOTHING lit — inconsistent. Now BOTH land
+  // on the merged Files section (the feed) and light their icon the same way.
+  //
+  // The rail star is reachable from anywhere, so Agents still serves it. The FILE
+  // lens picker is not: Agents owns its own dataset picker, so the file lenses are
+  // asked from another off-section surface — the dashboard.
 
   // Favorites (via the rail star) from Agents → the feed, star lit, Files dark.
   await page.goto('/agents/context/personal')
@@ -216,8 +220,8 @@ test('picking a file lens OFF the section lands on the feed and lights it consis
   await expect(star).toHaveAttribute('aria-pressed', 'true')
   await expect(files).not.toHaveAttribute('aria-current', 'page')
 
-  // Projects (via the scope picker) from Agents → the SAME feed, Files lit, star dark.
-  await page.goto('/agents/context/personal')
+  // Projects (via the scope picker) off-section → the SAME feed, Files lit, star dark.
+  await page.goto('/s/main')
   await picker()
   await page.getByRole('menuitemradio', { name: 'Projects' }).click()
   await expect(page).toHaveURL(/\/s\/main\/feed$/)
@@ -225,8 +229,8 @@ test('picking a file lens OFF the section lands on the feed and lights it consis
   await expect(files).toHaveAttribute('aria-current', 'page')
   await expect(star).toHaveAttribute('aria-pressed', 'false')
 
-  // Files (via the scope picker) from Agents → the feed, Files lit — identical shape.
-  await page.goto('/agents/context/personal')
+  // Files (via the scope picker) off-section → the feed, Files lit — identical shape.
+  await page.goto('/s/main')
   await picker()
   await page.getByRole('menuitemradio', { name: 'Files' }).click()
   await expect(page).toHaveURL(/\/s\/main\/feed$/)

@@ -102,7 +102,7 @@ const fixture = async (): Promise<{
       'skills',
       '_projects',
       'cHJvamVjdA',
-      '.draft.install-550e8400-e29b-41d4-a716-446655440000',
+      '.AbCdefGhij_1.install-550e8400-e29b-41d4-a716-446655440000',
     ),
     { recursive: true },
   )
@@ -159,7 +159,7 @@ const fixture = async (): Promise<{
       'skills',
       '_projects',
       'cHJvamVjdA',
-      '.draft.install-550e8400-e29b-41d4-a716-446655440000',
+      '.AbCdefGhij_1.install-550e8400-e29b-41d4-a716-446655440000',
       'SKILL.md',
     ),
     'partial package',
@@ -246,7 +246,7 @@ describe('online data backup and restore', () => {
       'data/spaces/main/.12345678-1234-1234-1234-123456789abc.tmp',
     )
     expect(result.manifest.files.map((file) => file.path)).not.toContain(
-      'data/spaces/main/.notarium/skills/_projects/cHJvamVjdA/.draft.install-550e8400-e29b-41d4-a716-446655440000/SKILL.md',
+      'data/spaces/main/.notarium/skills/_projects/cHJvamVjdA/.AbCdefGhij_1.install-550e8400-e29b-41d4-a716-446655440000/SKILL.md',
     )
     expect(result.manifest.files.map((file) => file.path)).toEqual(
       expect.arrayContaining([

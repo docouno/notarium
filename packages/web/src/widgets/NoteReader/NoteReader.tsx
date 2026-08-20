@@ -158,8 +158,8 @@ export const NoteReader = ({
 
   return (
     <article className="doc">
-      <header className={styles.docHead}>
-        <h1 className={styles.docTitle}>{note.title}</h1>
+      <header className="doc-head">
+        <h1 className="doc-title">{note.documentTitle || note.title}</h1>
         <div className={styles.docMeta}>
           {fm.type ? <span className={styles.pill}>{fm.type as string}</span> : null}
           <TagChips tags={tags} hrefForTag={tagHref} onOpenTag={onOpenTag} />

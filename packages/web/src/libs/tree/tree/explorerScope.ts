@@ -18,13 +18,6 @@ import type { SkeletonNode } from './tree'
 //                and shows only its CONTENTS (the project's own row is implied by
 //                the header label, not repeated). The "root" drop zone / new-note
 //                target becomes the project's folder.
-//  - 'memory'  → the agent-memory audit (#165), shown as a TREE in the same
-//                explorer panel: top-level axes (Personal + each project), their
-//                memory categories beneath, each a link to its note. It is NOT a
-//                view over the file skeleton — it's a separate data source — so the
-//                file-tree helpers below ignore it (the Sidebar renders a dedicated
-//                <MemoryTree> for it). Not persisted: it's driven by the route
-//                (the Agents surface), so a reload restores the file scope.
 //  - 'favorites' → the user's pinned notes/folders/projects (#42), shown through
 //                the normal file-tree renderer as a filtered structure. Favorite
 //                folders/projects keep their full subtree; favorite notes create
@@ -34,7 +27,6 @@ export type ExplorerScope =
   | { kind: 'projects' }
   | { kind: 'favorites' }
   | { kind: 'project'; path: string }
-  | { kind: 'memory' }
 
 /** A predicate "is the folder at this path a marked project?" — supplied by the
  *  caller (ProjectsProvider's projectAt). The space root ('') is intentionally
@@ -122,11 +114,6 @@ export const scopeHidesFolder = (
   if (scope.kind === 'files') {
     return false
   }
-  // Memory isn't a file-tree view (#165) — it never hides a file folder (the
-  // reveal-on-open logic that calls this only runs for the file scopes).
-  if (scope.kind === 'memory') {
-    return false
-  }
   if (scope.kind === 'favorites') {
     return false
   }
@@ -182,7 +169,7 @@ export const isFilesSection = (s: {
  *
  *  Inputs (all already known in the Sidebar): `browsing` (on a document surface),
  *  `memoryNoteOpen` (an /m note), `navType` (all | feed | folder), `scopeKind` (the
- *  tree lens: files | favorites | projects | project | memory).
+ *  tree lens: files | favorites | projects | project).
  *
  *  Guarantees (unit-tested as a matrix): Files and Favorites never light at once;
  *  neither lights on the home dashboard, a memory note, or a chrome surface. */
@@ -194,11 +181,7 @@ export const railScopeActive = (input: {
 }): { filesActive: boolean; favoritesActive: boolean } => {
   const onSection = isFilesSection(input)
   const favoritesActive = onSection && input.scopeKind === 'favorites'
-  // Files covers the three non-favorites FILE-tree lenses explicitly (files /
-  // projects / single-project) rather than "not favorites" — so a lens that isn't a
-  // file-tree view (memory, or any future kind) never lights Files even if it somehow
-  // reached an on-section surface. Today 'memory' can't (it's the Agents surface,
-  // browsing=false), but the explicit list keeps the guarantee local, not implicit.
+  // Files covers the three non-favorites file-tree lenses explicitly.
   const k = input.scopeKind
   const filesActive = onSection && (k === 'files' || k === 'projects' || k === 'project')
   return { filesActive, favoritesActive }

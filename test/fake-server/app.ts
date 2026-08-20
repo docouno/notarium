@@ -36,26 +36,40 @@ import {
   createFsArtifactStore,
   createFsImportStagingStore,
   createImportHandler,
-  createInMemoryRoleLibrary,
   createJobRunner,
   createRolesService,
   hashPassword,
   hostInfoFrom,
+  InMemoryAbilityAvailability,
   JOB_KIND_EXPORT,
   JOB_KIND_IMPORT,
   jobToWire,
-  loadBuiltinRoleCatalog,
+  loadBundledAbilityInventory,
   type MarkerStore,
   markFolderAsProject,
   type MetaDb,
   type MutationGate,
   type ProjectRecord,
   type SpaceDef,
+  spaceLifecycleHasEnded,
   SpaceManager,
   type SpaceRecord,
   SqliteMetaDb,
+  SYSTEM_PRINCIPAL,
 } from '@notarium/server'
-import type { AgentRoleDecl } from '../cases/types'
+import { applyAgentAbilityPreferences } from '../cases/applyAbilityPreferences'
+import { applyAgentRoleDeclarations } from '../cases/applyAgentRoles'
+import { applyAgentSkillDeclarations } from '../cases/applyAgentSkills'
+import { personalSpaceForPlacement } from '../cases/personalSpaceSeam'
+import { resolveAvailabilityDecl } from '../cases/resolveAvailability'
+import type {
+  AgentAbilityPreferenceDecl,
+  AgentRoleDecl,
+  AgentRoleTargetDecl,
+  AgentSkillDecl,
+} from '../cases/types'
+import { createInMemoryAbilityPlacement } from './abilityPlacement'
+import { InMemoryAbilityPreferences } from './abilityPreferences'
 import { InMemoryAgentDeltaCursors } from './agentDeltaCursors'
 import { InMemoryAgentSessions } from './agentSessions'
 import { AuditedRevisionPersistence } from './auditedRevisionPersistence'
@@ -71,6 +85,7 @@ import { InMemoryRetrievalLog } from './retrievalLog'
 import { InMemoryScopePins } from './scopePins'
 import { InMemorySessionAudit } from './sessionAudit'
 import { InMemorySpaces } from './spaces'
+import { createStoreRoleLibrary } from './storeRoleLibrary'
 
 /** A pre-dated journal revision (activity heatmap/feed). The fake's journal
  *  is otherwise only filled by live writes (stamped "now"), so the dashboard's
@@ -168,6 +183,18 @@ export type Fixture = {
   auth?: AuthFixture
   agentSessions?: AgentSessionRecord[]
   agentRoles?: AgentRoleDecl[]
+  agentSkills?: AgentSkillDecl[]
+  /** Owner Enable/Disable overrides, applied AFTER the packages above so each row can
+   *  name the exact placement that published it. Sparse like the durable facet: a row
+   *  exists only where a declaration asked for one, and absence already means enabled. */
+  agentAbilityPreferences?: AgentAbilityPreferenceDecl[]
+  /** Lower a production bound so a world can cross it with a handful of rows instead
+   *  of hundreds. The behaviour behind the bound stays the real one — only the number
+   *  is the fixture's. */
+  limits?: {
+    /** Packages one placement's listing returns before it reports `truncated`. */
+    libraryPackages?: number
+  }
   /** Omit the durable job layer from buildApp — reproduces a none-mode host
    *  with no meta-DB backing jobs, so the async-export routes 404 and the client falls
    *  back to the synchronous streaming export (the capability-degradation tier). */
@@ -352,10 +379,34 @@ export const createApp = async (
   const contextSets = new InMemoryContextSets()
   const scopePins = new InMemoryScopePins()
   const contextOrder = new InMemoryContextOrder()
+  // Declared here rather than beside the meta-DB stub below because the ability twins
+  // are built out of it: it is the journal half of their fence, and an arrow that
+  // closed over it before it existed would answer a Space in `purge-intent` `false`.
+  const spaceLifecycle = new InMemorySpaceLifecyclePersistence()
+  // The registry the durable schema's foreign keys point at. Without it the fake is
+  // silently laxer than the server it stands in for: a binding to a project of
+  // another Space would be stored, and neither cascade would ever be observed.
+  //
+  // BOTH halves of the ability fence, out of the two registries this host really keeps:
+  // the `spaces` row and the lifecycle journal beside it. Handing over the first alone
+  // is what made the fake accept an override and a policy in a Space already in
+  // `purge-intent`, where every driver refuses — the very laxness the paragraph above
+  // says this wiring exists to prevent. The phase list is the drivers' own
+  // (`spaceLifecycleHasEnded`), not a copy.
+  const spaceEnded = async (spaceId: string): Promise<boolean> =>
+    spaceLifecycleHasEnded(await spaceLifecycle.get(spaceId))
+  const abilityAvailability = new InMemoryAbilityAvailability({
+    projectHomeSpace: async (projectId) => (await projects.getById(projectId))?.space ?? null,
+    spaceExists: async (spaceId) => (await spacesRegistry.getById(spaceId)) != null,
+    spaceEnded,
+  })
+  const abilityPreferences = new InMemoryAbilityPreferences({
+    spaceExists: async (spaceId) => (await spacesRegistry.getById(spaceId)) != null,
+    spaceEnded,
+  })
   const agentSessions = new InMemoryAgentSessions()
   const retrievalLog = new InMemoryRetrievalLog()
   const sessionAudit = new InMemorySessionAudit(agentSessions, retrievalLog)
-  agentSessions.seed(fixture.agentSessions ?? [])
   const agentDeltaCursors = new InMemoryAgentDeltaCursors()
   projects.attachLifecycle(agentDeltaCursors)
   agentSessions.attachLifecycle(agentDeltaCursors)
@@ -368,7 +419,10 @@ export const createApp = async (
     // The engine + read-model address the space by its STABLE id, exactly
     // as production server.ts does — the slug only ever appears on the wire.
     const engine = new InMemoryStore({ space: rec.id, now: fixture.now, notes })
-    const revisions = new AuditedRevisionPersistence(sessionAudit, rec.id)
+    const revisions = new AuditedRevisionPersistence(sessionAudit, rec.id, [
+      abilityAvailability,
+      abilityPreferences,
+    ])
     const store = new CachedStore({
       inner: engine,
       revisionPersistence: revisions,
@@ -407,7 +461,6 @@ export const createApp = async (
   // FUTURE read of another facet must extend this stub (else a runtime NPE): keep it in
   // lockstep with spaceManager.ts's read sites (`spaces`, `identity.findById`,
   // `adoptLegacyRows`).
-  const spaceLifecycle = new InMemorySpaceLifecyclePersistence()
   const restoreOperations = new InMemoryRestoreOperationPersistence(spaceLifecycle)
   const metaDbStub: Pick<
     MetaDb,
@@ -428,7 +481,12 @@ export const createApp = async (
     // world half is the manager's onPurge below; the auth grants are scrubbed by the
     // real drivers transactionally, but here me() already drops a grant whose space the
     // registry no longer lists, so the wire shows the space gone without touching authDb.
-    purgeSpace: async (id: string) => spacesRegistry.delete(id),
+    purgeSpace: async (id: string) => {
+      spacesRegistry.delete(id)
+      // The Space's overrides go with it and the fence closes behind them — the
+      // second half of what the driver does in one transaction.
+      abilityPreferences.spacePurged(id)
+    },
   }
   const manager = new SpaceManager({
     spaces: defs,
@@ -513,15 +571,31 @@ export const createApp = async (
   // populate it is I0c). Registry-only here (no markerStore) — markFolderAsProject
   // upserts the row directly. AFTER init so space-slugs translate to their ids.
   projects.seed(projectRecords(fixture, idOf))
-  const roleLibrary = createInMemoryRoleLibrary()
-  const roles = createRolesService({ catalog: loadBuiltinRoleCatalog, library: roleLibrary })
+  const roleLibrary = createStoreRoleLibrary(
+    async (space) => manager.store(space),
+    // Read per call: a reset swaps the whole world, and with it the bound a fixture
+    // asked the listing to report as truncated.
+    () => fixture.limits?.libraryPackages,
+  )
+  const roles = createRolesService({
+    catalog: loadBundledAbilityInventory,
+    library: roleLibrary,
+    abilityAvailability,
+    abilityPreferences,
+    // Placement is part of an owned Role's address. This host keeps every table keyed
+    // by it, so the no-op default would silently strand context, the owner's
+    // preference and a live episode on a placement that no longer exists.
+    abilityPlacement: createInMemoryAbilityPlacement({
+      contextSets,
+      scopePins,
+      contextOrder,
+      abilityPreferences,
+      agentSessions,
+    }),
+  })
 
-  const seedRoles = async (fx: Fixture): Promise<void> => {
-    roleLibrary.clear()
-
-    for (const declaration of fx.agentRoles ?? []) {
-      const target = declaration.target
-
+  const seedAgentPackages = async (fx: Fixture): Promise<void> => {
+    const resolveRoleTarget = async (target: AgentRoleTargetDecl) => {
       if (target.kind === 'personal') {
         const user = target.user
           ? fx.auth?.users.find((candidate) => candidate.username === target.user)
@@ -529,36 +603,168 @@ export const createApp = async (
         const personal = user?.personalSpace
 
         if (!personal) {
-          throw new Error(`fixture personal role ${declaration.name} has no personal space`)
+          throw new Error('fixture agent package has no personal space')
         }
-        await roles.addFromCatalog(declaration.name, {
-          scope: 'personal',
-          space: idOf(personal),
-        })
-        continue
+
+        return { scope: 'personal' as const, space: idOf(personal) }
       }
       if (target.kind === 'space') {
-        await roles.addFromCatalog(declaration.name, {
-          scope: 'space',
-          space: idOf(target.space),
-        })
-        continue
+        return { scope: 'space' as const, space: idOf(target.space) }
       }
       const project = projectRecords(fx, idOf).find(
         (candidate) => candidate.space === idOf(target.space) && candidate.path === target.path,
       )
 
       if (!project) {
-        throw new Error(`fixture role ${declaration.name} references an unknown project`)
+        throw new Error('fixture agent package references an unknown project')
       }
-      await roles.addFromCatalog(declaration.name, {
-        scope: 'project',
-        space: project.space,
-        projectId: project.id,
-      })
+
+      return { scope: 'project' as const, space: project.space, projectId: project.id }
     }
+    const projectOf = (reference: { space: string; path: string }) =>
+      projectRecords(fx, idOf).find(
+        (candidate) =>
+          candidate.space === idOf(reference.space) && candidate.path === reference.path,
+      ) ?? null
+    // Every space that IS somebody's personal one, by id — this stand's answer to the
+    // question production answers with `peekPersonalSpace` on every owned-package call.
+    const personalSpaceIds = new Set(
+      (fx.auth?.users ?? []).flatMap((user) =>
+        user.personalSpace ? [idOf(user.personalSpace)] : [],
+      ),
+    )
+    const appliedRoles = await applyAgentRoleDeclarations({
+      declarations: fx.agentRoles ?? [],
+      roles,
+      resolveLocation: async (declaration) => {
+        const location = await resolveRoleTarget(declaration.target)
+
+        if (declaration.availability && location.scope !== 'space') {
+          throw new Error(`fixture role ${declaration.name} cannot declare availability here`)
+        }
+
+        return {
+          location,
+          personalSpace: personalSpaceForPlacement(personalSpaceIds, location.space),
+          ...(location.scope === 'space'
+            ? {
+                availability: resolveAvailabilityDecl(
+                  declaration.availability,
+                  location.space,
+                  projectOf,
+                  `fixture role ${declaration.name}`,
+                ),
+              }
+            : {}),
+        }
+      },
+      storeForSpace: (space) => manager.store(space),
+    })
+
+    const appliedSkills = await applyAgentSkillDeclarations({
+      declarations: fx.agentSkills ?? [],
+      roles,
+      library: roleLibrary,
+      storeForSpace: (space) => manager.store(space),
+      resolveLocation: async (declaration) => {
+        const home = declaration.home
+
+        if (home.kind === 'personal') {
+          if (declaration.availability) {
+            throw new Error(
+              `fixture personal skill ${declaration.name} cannot declare availability`,
+            )
+          }
+          const user = home.user
+            ? fx.auth?.users.find((candidate) => candidate.username === home.user)
+            : fx.auth?.users[0]
+          const personal = user?.personalSpace
+
+          if (!personal) {
+            throw new Error(`fixture personal skill ${declaration.name} has no personal space`)
+          }
+
+          const location = { scope: 'personal' as const, space: idOf(personal) }
+          return {
+            role: declaration.roleTarget
+              ? await resolveRoleTarget(declaration.roleTarget)
+              : location,
+            skill: location,
+          }
+        }
+        const location = { scope: 'space' as const, space: idOf(home.space) }
+        const availability = resolveAvailabilityDecl(
+          declaration.availability,
+          location.space,
+          projectOf,
+          `fixture skill ${declaration.name}`,
+        )
+
+        return {
+          role: declaration.roleTarget ? await resolveRoleTarget(declaration.roleTarget) : location,
+          skill: location,
+          availability,
+        }
+      },
+    })
+
+    // Owner Enable/Disable, written LAST against the ids the two appliers just minted
+    // — by the one applier both stands share (`test/cases/applyAbilityPreferences.ts`),
+    // so this fake and `scripts/seed.ts` cannot disagree about what a case declares.
+    // Only the clock and the facet are this host's.
+    const updatedAt = fx.now ?? new Date().toISOString()
+
+    await applyAgentAbilityPreferences({
+      declarations: fx.agentAbilityPreferences ?? [],
+      roles,
+      publishedRoles: appliedRoles,
+      publishedSkills: appliedSkills,
+      resolvePlacement: resolveRoleTarget,
+      ownerOf: (preference) => {
+        const owner = preference.user ?? fx.auth?.users[0]?.username
+
+        if (!owner) {
+          throw new Error('fixture ability preference has no owner')
+        }
+
+        return owner
+      },
+      setEnabled: (owner, target, enabled) =>
+        abilityPreferences.setEnabled(owner, target, enabled, updatedAt),
+    })
   }
-  await seedRoles(fixture)
+  await seedAgentPackages(fixture)
+  const seedAgentSessions = async (fx: Fixture): Promise<void> => {
+    const records = await Promise.all(
+      (fx.agentSessions ?? []).map(async (record) => {
+        if (!record.role) {
+          return record
+        }
+        const user = fx.auth?.users.find((candidate) => candidate.username === record.owner)
+        const personalSpace = user?.personalSpace ? idOf(user.personalSpace) : null
+        const resolved = await roles.resolveEffective(
+          { personalSpace },
+          SYSTEM_PRINCIPAL,
+          record.role,
+        )
+
+        return resolved
+          ? {
+              ...record,
+              role: resolved.role.name,
+              // The address the resolver already produced — the same one the real
+              // seeder now stores. Rebuilt here it was a second producer of the
+              // locator, and a System role has no placement to rebuild one from.
+              roleLocator: resolved.locator,
+              roleContextProjectId: null,
+            }
+          : record
+      }),
+    )
+
+    agentSessions.seed(records)
+  }
+  await seedAgentSessions(fixture)
   // Deterministic tests want every fixture space live before the first request — no
   // lazy-boot timing in the suite (now keyed + booted by the stable id).
   for (const rec of manager.list()) {
@@ -780,11 +986,13 @@ export const createApp = async (
     await seedAuth(next.auth)
     gatewayState.clear()
     agentDeltaCursors.clear()
-    agentSessions.seed(next.agentSessions ?? [])
     retrievalLog.clear()
     oauthDb.clear()
     projects.seed(projectRecords(next, idOf))
-    await seedRoles(next)
+    abilityAvailability.clearAll()
+    abilityPreferences.clear()
+    await seedAgentPackages(next)
+    await seedAgentSessions(next)
     favorites.clear()
     contextSets.clear()
     scopePins.clear()

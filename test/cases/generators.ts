@@ -1,7 +1,9 @@
 import type {
+  AgentAbilityPreferenceDecl,
   AgentDeltaCursorDecl,
   AgentRoleDecl,
   AgentSessionDecl,
+  AgentSkillDecl,
   AgentWriteAuditDecl,
   CaseEvent,
   CaseNoteClass,
@@ -146,6 +148,9 @@ export type NoteDecl = {
   class?: CaseNoteClass
   summary?: string
   muted?: boolean
+  /** Resolve this agent-memory note into `.notarium/memory/<project-id>/` in
+   * both the real and fake seed projections. */
+  projectMemory?: { space: string; path: string }
   pin?: boolean
   principal?: string
   /** Agent/session attribution copied to every authored lifecycle event. */
@@ -192,6 +197,8 @@ export class WorldBuilder {
   private readonly retrievals: RetrievalDecl[] = []
   private readonly agentSessions: AgentSessionDecl[] = []
   private readonly agentRoles: AgentRoleDecl[] = []
+  private readonly agentSkills: AgentSkillDecl[] = []
+  private readonly agentAbilityPreferences: AgentAbilityPreferenceDecl[] = []
   private readonly agentDeltaCursors: AgentDeltaCursorDecl[] = []
   private readonly jobs: JobDecl[] = []
   private readonly durableImports: DurableImportDecl[] = []
@@ -278,6 +285,7 @@ export class WorldBuilder {
       class: decl.class,
       summary: decl.summary,
       muted: decl.muted,
+      projectMemory: decl.projectMemory,
       pin: decl.pin,
       frontmatter: decl.frontmatter,
       principal: decl.principal,
@@ -345,9 +353,21 @@ export class WorldBuilder {
     return this
   }
 
-  /** Copy a built-in role into an owned personal or project library. */
+  /** Declare one Owned Role package. */
   agentRole(decl: AgentRoleDecl): this {
     this.agentRoles.push(decl)
+    return this
+  }
+
+  /** Declare one Owned Skill package. */
+  agentSkill(decl: AgentSkillDecl): this {
+    this.agentSkills.push(decl)
+    return this
+  }
+
+  /** Declare one owner Enable/Disable override. */
+  agentAbilityPreference(decl: AgentAbilityPreferenceDecl): this {
+    this.agentAbilityPreferences.push(decl)
     return this
   }
 
@@ -423,6 +443,10 @@ export class WorldBuilder {
       ...(this.retrievals.length ? { retrievals: this.retrievals } : {}),
       ...(this.agentSessions.length ? { agentSessions: this.agentSessions } : {}),
       ...(this.agentRoles.length ? { agentRoles: this.agentRoles } : {}),
+      ...(this.agentSkills.length ? { agentSkills: this.agentSkills } : {}),
+      ...(this.agentAbilityPreferences.length
+        ? { agentAbilityPreferences: this.agentAbilityPreferences }
+        : {}),
       ...(this.agentDeltaCursors.length ? { agentDeltaCursors: this.agentDeltaCursors } : {}),
       ...(this.jobs.length ? { jobs: this.jobs } : {}),
       ...(this.durableImports.length ? { durableImports: this.durableImports } : {}),

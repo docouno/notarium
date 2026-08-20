@@ -70,8 +70,8 @@ export type ParsedNote = {
    * version the whole logical note must use these rather than reverse-engineer
    * YAML from the deliberately-small Record view. */
   frontmatterEntries: FrontmatterEntry[]
-  /** The body as read() serves it: frontmatter split off, the storage-format
-   *  title heading stripped. */
+  /** The body as read() serves it: frontmatter and encoding prologue split off, the
+   *  storage-format title heading stripped. */
   body: string
 }
 
@@ -140,8 +140,13 @@ const anywhereH1Title = (content: string): string => {
 }
 
 export const parseNoteFile = (raw: string, path: string): ParsedNote => {
-  const fm = parseFrontmatterBlock(raw)
-  const afterFm = fm ? raw.slice(fm.bodyStart) : raw
+  // A leading U+FEFF is the file's encoding prologue, not content: the frontmatter
+  // reader already steps over it, so only the block-less branch met the mark — sitting
+  // where the title scan and the heading strip expect the first character, it cost the
+  // note its own `# heading` title. Exactly one mark leads a file; a second is content.
+  const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw
+  const fm = parseFrontmatterBlock(text)
+  const afterFm = fm ? text.slice(fm.bodyStart) : text
   const frontmatter: Record<string, unknown> = {}
 
   for (const e of fm?.entries ?? []) {

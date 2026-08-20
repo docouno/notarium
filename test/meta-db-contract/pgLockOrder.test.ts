@@ -35,10 +35,11 @@ import {
   type RevisionInput,
 } from '@notarium/core'
 
+import { abilityPackageOfLocator } from '../../packages/server/src/services/metaDb/abilityAddress'
 import {
   LOCK_LEVEL_OF_TABLE,
   LOCK_LEVEL_REQUIRES,
-  type LOCK_LEVELS,
+  LOCK_LEVELS,
 } from '../../packages/server/src/services/metaDb/drivers/pg/lockOrder'
 import { pooledPgTransactions } from './pgTransactions'
 import { createPostgresTestSchema, describePostgres } from './postgresHarness'
@@ -55,10 +56,21 @@ const observer = vi.hoisted(() => {
   type Event =
     | { kind: 'begin'; client: unknown }
     | { kind: 'end'; client: unknown }
-    | { kind: 'statement'; client: unknown; text: string; values: readonly unknown[] }
+    | {
+        kind: 'statement'
+        client: unknown
+        text: string
+        values: readonly unknown[]
+        /** Issued from inside a wrapped helper, which announces its own hold. */
+        inHelper: boolean
+      }
     | { kind: 'lock'; client: unknown; helper: string; hold: LockHold }
 
   const events: Event[] = []
+  /** How deep inside a wrapped helper each client currently is. A helper's own lock
+   *  statement is already announced by its return value; only statements OUTSIDE
+   *  every helper are candidates for the inline-lock detector below. */
+  const helperDepth = new Map<unknown, number>()
 
   return {
     events,
@@ -73,8 +85,16 @@ const observer = vi.hoisted(() => {
           name,
           typeof value === 'function'
             ? async (...args: unknown[]) => {
-                const result = (await (value as (...a: unknown[]) => Promise<unknown>)(...args)) as
-                  { lock?: LockHold } | undefined
+                const client = args[0]
+                helperDepth.set(client, (helperDepth.get(client) ?? 0) + 1)
+                let result: { lock?: LockHold } | undefined
+
+                try {
+                  result = (await (value as (...a: unknown[]) => Promise<unknown>)(...args)) as
+                    { lock?: LockHold } | undefined
+                } finally {
+                  helperDepth.set(client, (helperDepth.get(client) ?? 1) - 1)
+                }
 
                 if (result?.lock) {
                   events.push({ kind: 'lock', client: args[0], helper: name, hold: result.lock })
@@ -109,6 +129,7 @@ const observer = vi.hoisted(() => {
           client,
           text: trimmed,
           values: Array.isArray(args[1]) ? (args[1] as unknown[]) : [],
+          inHelper: (helperDepth.get(client) ?? 0) > 0,
         })
       }
     },
@@ -129,6 +150,31 @@ type Level = (typeof LOCK_LEVELS)[number]
 const mutatedTable = (text: string): string | null =>
   /\b(?:INSERT\s+INTO|DELETE\s+FROM|UPDATE)\s+"?([a-z_][a-z0-9_]*)"?/i.exec(text)?.[1] ?? null
 
+/** Does this statement TAKE a lock, whatever expression it is spelled with? DML is one
+ *  way; a bare `SELECT … FOR KEY SHARE` is another, and it was invisible here — which
+ *  is how `agentDeltaCursors.advance` came to hold `folders` (L4f) under a register
+ *  entry of `levels: []`, with three green gates over it. The strengths are the same
+ *  list the ESLint layer matches, and for the same reason: a first draft forgets
+ *  `FOR KEY SHARE`. */
+const ROW_LOCK = /\bFOR\s+(?:NO\s+KEY\s+)?UPDATE\b|\bFOR\s+(?:KEY\s+)?SHARE\b/i
+
+/** Every table a lock statement names. A row lock is taken on what the statement
+ *  READS, so the names come from its FROM/JOIN list; `LOCK TABLE` names its own. The
+ *  answer is filtered against the tier map by the caller, so a non-tiered name here
+ *  costs nothing. */
+const lockedTables = (text: string): string[] => {
+  const explicit = /\bLOCK\s+(?:TABLE\s+)?(?:ONLY\s+)?"?([a-z_][a-z0-9_]*)"?/i.exec(text)
+
+  if (explicit) {
+    return [explicit[1]]
+  }
+  if (!ROW_LOCK.test(text)) {
+    return []
+  }
+
+  return [...text.matchAll(/\b(?:FROM|JOIN)\s+"?([a-z_][a-z0-9_]*)"?/gi)].map((match) => match[1])
+}
+
 /** Strings a statement passes as parameters, arrays flattened — the only key material
  *  available without parsing SQL, and enough to say which declared keys it touches. */
 const parameterStrings = (values: readonly unknown[]): string[] =>
@@ -139,6 +185,24 @@ const parameterStrings = (values: readonly unknown[]): string[] =>
         ? [value]
         : [],
   )
+
+/** How a statement's parameter names a key OF ITS LEVEL. At every level but one the
+ *  two are the same string: the entry declares the ids the rows are keyed by, and the
+ *  statement binds them. `L4p` is the exception on purpose — the rows are keyed by the
+ *  ADDRESS of a package and the entry is keyed by the PACKAGE, because the address is
+ *  precisely what the other writer of that table changes (`lockOrder`, L4p). So a
+ *  parameter is compared BOTH as itself and as the package it names; a parameter that
+ *  is not an address projects to itself, so nothing else is affected. */
+const LEVEL_KEY_PROJECTION: Partial<Record<Level, (parameter: string) => string>> = {
+  L4p: abilityPackageOfLocator,
+}
+
+const keysOfStatement = (level: Level, values: readonly unknown[]): string[] => {
+  const project = LEVEL_KEY_PROJECTION[level]
+  const parameters = parameterStrings(values)
+
+  return project ? [...new Set([...parameters, ...parameters.map(project)])] : parameters
+}
 
 /** Is this declared key named by a statement's parameters? A composite (`kind:id`,
  *  `space:path`) is declared as one string but reaches SQL as its PARTS, so it counts
@@ -225,18 +289,33 @@ const transactionsIn = (events: readonly (typeof observer.events)[number][]): Tr
       current.steps.push({ level, source: 'lock', helper: event.helper, keys: declared })
       continue
     }
-    const table = mutatedTable(event.text)
-    const level = table ? (LOCK_LEVEL_OF_TABLE[table] as Level | undefined) : undefined
+    const mutated = mutatedTable(event.text)
+    // A helper's own lock statement is announced by the helper; anything else that
+    // takes a lock on a tiered table is an acquisition this transaction made by hand,
+    // and it is levelled exactly like a mutation of that table.
+    const tables = [
+      ...(mutated ? [mutated] : []),
+      ...(event.inHelper ? [] : lockedTables(event.text)),
+    ]
+    const levels = [
+      ...new Set(
+        tables
+          .map((table) => LOCK_LEVEL_OF_TABLE[table] as Level | undefined)
+          .filter((level): level is Level => level != null),
+      ),
+    ]
 
-    if (!level) {
+    if (!levels.length) {
       continue
     }
-    current.steps.push({
-      level,
-      source: 'dml',
-      text: event.text,
-      keys: parameterStrings(event.values),
-    })
+    for (const level of levels) {
+      current.steps.push({
+        level,
+        source: 'dml',
+        text: event.text,
+        keys: keysOfStatement(level, event.values),
+      })
+    }
   }
 
   return done
@@ -381,6 +460,7 @@ describePostgres('Postgres lock order', { timeout: SUITE_TIMEOUT_MS }, () => {
     const db = testSchema.db
     const connect = pg.Pool.prototype.connect
     const seen = new Set<string>()
+    const observedLevels = new Set<Level>()
     const problems: string[] = []
 
     // pg's `query` and `connect` are five-way overloads; the wrappers only forward, so
@@ -439,9 +519,15 @@ describePostgres('Postgres lock order', { timeout: SUITE_TIMEOUT_MS }, () => {
         problems.push(...violationsOf(id, transaction))
       }
 
-      return [
+      const levels = [
         ...new Set(observed.flatMap((transaction) => transaction.steps.map((step) => step.level))),
       ]
+
+      for (const level of levels) {
+        observedLevels.add(level)
+      }
+
+      return levels
     }
 
     try {
@@ -491,6 +577,25 @@ describePostgres('Postgres lock order', { timeout: SUITE_TIMEOUT_MS }, () => {
       await run('pgMetaDb.grantMemberToActiveSpace', () =>
         db.grantMemberToActiveSpace('alpha', 'al', 'writer', AT),
       )
+      // A non-empty selection on purpose: an empty one never reads the project rows,
+      // so it would never enter L4f and the order this transaction shares with the
+      // whole-space purge would go unobserved. A registry note for the same reason —
+      // a `null` one never enters L3n, and the lifecycle fence above tier 4 would be
+      // observed by half.
+      await run('abilityAvailability.set', () =>
+        db.abilityAvailability.set(
+          'alpha',
+          'skill-one',
+          { mode: 'selected-projects', projectIds: ['project-alpha'] },
+          'registry-note',
+        ),
+      )
+      await run('abilityAvailability.clear', () =>
+        db.abilityAvailability.clear('alpha', 'skill-one'),
+      )
+      await run('abilityAvailability.grantProject', () =>
+        db.abilityAvailability.grantProject('alpha', 'skill-two', 'project-alpha', null),
+      )
       await run('sessions.startNamed', () =>
         db.sessions.startNamed(
           {
@@ -503,13 +608,26 @@ describePostgres('Postgres lock order', { timeout: SUITE_TIMEOUT_MS }, () => {
             lastSeenAt: AT,
             calls: 1,
             role: null,
+            roleLocator: null,
+            roleContextProjectId: null,
           },
           AT,
           AT,
           10,
         ),
       )
-      await run('sessions.setRole', () => db.sessions.setRole('user:al', 'session-1', 'role-a'))
+      await run('sessions.setRole', () =>
+        db.sessions.setRole('user:al', 'session-1', {
+          name: 'role-a',
+          locator: {
+            source: 'owned',
+            kind: 'role',
+            packageId: 'AbCdefGhij_1',
+            location: { scope: 'personal', spaceId: 'alpha' },
+          },
+          contextProjectId: null,
+        }),
+      )
       await run('agentDeltaCursors.advance', () =>
         db.agentDeltaCursors.advance(
           { owner: 'user:al', session: { id: 'session-1', parentId: null } },
@@ -656,6 +774,34 @@ describePostgres('Postgres lock order', { timeout: SUITE_TIMEOUT_MS }, () => {
           { entryKind: 'set', entryRef: 'set-1' },
           { entryKind: 'pin', entryRef: 'note-a' },
         ]),
+      )
+
+      // Registered since the preference facet landed, but never exercised until now:
+      // an unexercised transaction is an unchecked one, which is exactly what the
+      // completeness assertion below exists to catch.
+      await run('abilityPreferences.setEnabled', () =>
+        db.abilityPreferences.setEnabled(
+          'user:al',
+          {
+            locator: {
+              source: 'owned',
+              kind: 'role',
+              packageId: 'AbCdefGhij_1',
+              location: { scope: 'space', spaceId: 'alpha' },
+            },
+            registryNoteId: 'note-a',
+          },
+          false,
+          AT,
+        ),
+      )
+      await run('abilityPlacement.moveOwnedRolePlacement', () =>
+        db.abilityPlacement.moveOwnedRolePlacement({
+          fromTargetId: 'project:project-alpha:AbCdefGhij_1',
+          toTargetId: 'space:alpha:AbCdefGhij_1',
+          fromLocator: 'owned:role:project:alpha:project-alpha:AbCdefGhij_1',
+          toLocator: 'owned:role:space:alpha:AbCdefGhij_1',
+        }),
       )
 
       await run('contextSets.deleteSet', () => db.contextSets.deleteSet('set-1'))
@@ -935,6 +1081,12 @@ describePostgres('Postgres lock order', { timeout: SUITE_TIMEOUT_MS }, () => {
       // Same reason as above: a reserve that claimed nothing would never enter L1p,
       // and the level that arbitrates destinations would go unobserved.
       expect(reserved).toEqual(expect.arrayContaining(['L0j', 'L1r', 'L1p']))
+      // …and the same question asked of the LADDER rather than of three fixtures: a
+      // level no transaction in this run ever reaches is a level nothing above
+      // observes. Written against `LOCK_LEVELS` itself, so adding a rung without a
+      // fixture that reaches it fails here by name — which the three hand-written
+      // arrays above could not do, and did not do when tier 4 arrived.
+      expect([...LOCK_LEVELS].filter((level) => !observedLevels.has(level))).toEqual([])
       // Completeness in the same test: an unexercised transaction is an unchecked one.
       expect([...seen].sort()).toEqual(
         pooledPgTransactions()

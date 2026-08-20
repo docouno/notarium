@@ -33,9 +33,10 @@ import type {
   ScopePinsPersistence,
   SpacesPersistence,
 } from '../../services/metaDb'
+import { isAbilityTargetPurgedError } from '../../services/metaDb'
 import type { BulkRestoreCoordinator, RestoreCoordinator } from '../../services/noteRestore'
 import type { MarkerStore } from '../../services/projects'
-import type { RolesService } from '../../services/roles'
+import { AbilityUnavailableError, type RolesService } from '../../services/roles'
 import type { SpaceManager } from '../../services/spaces'
 import { installAuthz } from './perimeter/authz'
 import { spaFallbackDecision, spaRequestDecision } from './perimeter/spaFallback'
@@ -124,7 +125,13 @@ export const buildApp = async ({
   restoreCoordinator,
   bulkRestoreCoordinator,
 }: BuildAppOptions): Promise<FastifyInstance> => {
-  const app = Fastify({ bodyLimit: 4 * 1024 * 1024, trustProxy: trustProxy ?? false })
+  const app = Fastify({
+    bodyLimit: 4 * 1024 * 1024,
+    // Exact Owned ability locators are bounded base64url JSON and exceed the
+    // router's 100-character default even with generated 12-character ids.
+    routerOptions: { maxParamLength: 512 },
+    trustProxy: trustProxy ?? false,
+  })
   const authService = auth ?? createAuthService({ mode: AUTH_MODE.none })
   app.addHook('preClose', async () => authService.disconnectAllSse())
 
@@ -296,11 +303,23 @@ export const buildApp = async ({
           .code(HTTP_STATUS.BAD_REQUEST)
           .send({ error: message, reason: 'validation', issues })
       }
-      console.error(`[api] ${req.method} ${req.url} ->`, err.message)
+      // The cause, where the error carries one the message deliberately does not (an
+      // anti-enumeration 404 says the same thing to every caller; the log does not).
+      console.error(
+        `[api] ${req.method} ${req.url} ->`,
+        err.cause ? `${err.message} (${String(err.cause)})` : err.message,
+      )
       if (err.isUnavailable) {
         return reply
           .code(HTTP_STATUS.SERVICE_UNAVAILABLE)
           .send({ error: err.message, reason: err.reason || 'engine_unavailable' })
+      }
+      // The two ways an ability is simply not there — the service refused the address,
+      // or its durable target was purged out from under the write. One answer, asked
+      // once HERE rather than wired into each route's catch, because a route that
+      // forgot the wiring answered a plain client request with a 500.
+      if (err instanceof AbilityUnavailableError || isAbilityTargetPurgedError(err)) {
+        return reply.code(HTTP_STATUS.NOT_FOUND).send({ error: 'not found' })
       }
       if (err.isNotFound) {
         return reply

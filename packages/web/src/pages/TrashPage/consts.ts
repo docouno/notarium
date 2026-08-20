@@ -24,4 +24,6 @@ export const RESTORE_REASONS = {
   'physical-target-changed':
     'The original path is occupied by another note. Move or rename that note, then try restoring again.',
   not_found: 'This item is no longer available.',
+  'owner-provenance-conflict':
+    'The saved copy’s front matter can’t be rewritten safely — its Notarium fields are duplicated or malformed.',
 } as const

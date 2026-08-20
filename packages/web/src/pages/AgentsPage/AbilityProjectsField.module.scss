@@ -1,0 +1,12 @@
+/* A plain checkbox list — the column belongs to the list itself, exactly like every
+ * other checkbox field in an aside. */
+.tree {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.tree small {
+  color: var(--text-faint);
+  font-size: 11px;
+}

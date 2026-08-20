@@ -1,6 +1,8 @@
 import { type ReactNode, useEffect, useRef } from 'react'
 import { createPortal } from 'react-dom'
 import { cx } from '../../libs/cx/cx'
+import { useKeyboardLayer } from '../../libs/hooks/useKeyboardLayer'
+import { KEYBOARD_LAYER } from '../../libs/keyboardLayers'
 import styles from './Modal.module.scss'
 
 // Base modal primitive: a dimmed overlay with a centered panel. Presentational
@@ -26,6 +28,8 @@ type ModalProps = {
   // / --modal-backdrop-blur here to tune how much the page shows through behind a
   // surface that wants to read as glass OVER content (e.g. the Spotlight switcher).
   overlayClassName?: string
+  testId?: string
+  overlayTestId?: string
 }
 
 export const Modal = ({
@@ -36,6 +40,8 @@ export const Modal = ({
   size = 'sm',
   className = '',
   overlayClassName = '',
+  testId,
+  overlayTestId,
 }: ModalProps) => {
   const panelRef = useRef<HTMLDivElement>(null)
 
@@ -44,6 +50,11 @@ export const Modal = ({
   // otherwise it would keep stealing focus back to the panel from inputs inside.
   const onCloseRef = useRef(onClose)
   onCloseRef.current = onClose
+  // Escape comes from the shared arbiter, which knows about the popover this panel
+  // may have over it and about the drawer it may sit on. Omitting `onClose` still
+  // registers the layer: a sticky dialog swallows the key rather than letting the
+  // surface underneath answer for it.
+  const ownsFocus = useKeyboardLayer(true, KEYBOARD_LAYER.modal, () => onCloseRef.current?.())
 
   useEffect(() => {
     const prevFocus = document.activeElement
@@ -56,16 +67,9 @@ export const Modal = ({
     }
 
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        if (onCloseRef.current) {
-          e.stopPropagation()
-          onCloseRef.current()
-        }
-
-        return
-      }
-      // Focus trap: keep Tab cycling within the panel.
-      if (e.key !== 'Tab') {
+      // Focus trap: keep Tab cycling within the panel — but only while this panel is
+      // the live modal. A popover over it owns Escape without owning the trap.
+      if (e.key !== 'Tab' || !ownsFocus()) {
         return
       }
       const panel = panelRef.current
@@ -102,11 +106,14 @@ export const Modal = ({
         prevFocus.focus()
       }
     }
-  }, [])
+    // `ownsFocus` is referentially stable, so this still runs once on mount — the
+    // effect locks scroll and takes focus, and must not do either twice.
+  }, [ownsFocus])
 
   return createPortal(
     <div
       className={cx(styles.modalOverlay, overlayClassName)}
+      data-testid={overlayTestId}
       onMouseDown={(e) => {
         if (closeOnBackdrop && onClose && e.target === e.currentTarget) {
           onClose()
@@ -126,6 +133,7 @@ export const Modal = ({
         role="dialog"
         aria-modal="true"
         aria-labelledby={labelledBy}
+        data-testid={testId}
         tabIndex={-1}
       >
         {children}

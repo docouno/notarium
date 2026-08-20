@@ -2,6 +2,7 @@ import { scopePinOfRow, type ScopePinRow } from '../../rows'
 import type { ContextSetTargetKind, ScopePinRecord, ScopePinsPersistence } from '../../types'
 import type { PgDriverCtx } from './context'
 import { enterIdentityTierForReferences } from './liveIdentity'
+import { lockScopePinTargets } from './lockOrder'
 
 export const createScopePinsFacet = (ctx: PgDriverCtx): ScopePinsPersistence => ({
   addPin: async (r: ScopePinRecord) => {
@@ -13,6 +14,13 @@ export const createScopePinsFacet = (ctx: PgDriverCtx): ScopePinsPersistence => 
       const identity = await enterIdentityTierForReferences(client, [r.noteId])
       const noteId = identity.canonical(r.noteSpace, r.noteId)
 
+      // L2d, and the reason the INSERT below is not its own lock: the other writer of
+      // this table is a placement move, which rewrites `target_id` for every pin of a
+      // target at once and can name no note. Under READ COMMITTED that range UPDATE
+      // neither sees nor locks the row this INSERT is about to create, so without a key
+      // both sides name the pin lands on a target the role has already left — and
+      // nothing but the opposite move ever looks at that target again. See `lockOrder`.
+      await lockScopePinTargets(client, [{ targetKind: r.targetKind, targetId: r.targetId }])
       await client.query(
         `INSERT INTO context_scope_pins (target_kind, target_id, target_space, note_space, note_id, created_at)
            VALUES ($1, $2, $3, $4, $5, $6)

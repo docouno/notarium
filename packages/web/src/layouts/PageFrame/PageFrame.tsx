@@ -3,6 +3,7 @@ import { useChrome } from '../../composers/ChromeProvider'
 import { IconPanelLeft } from '../../core/Icons'
 import { IconToggle } from '../../core/IconToggle'
 import { cx } from '../../libs/cx/cx'
+import { useMainInert } from '../../libs/hooks/useMainInert'
 import { useScrollGlass } from '../../libs/hooks/useScrollGlass'
 import styles from './PageFrame.module.scss'
 
@@ -44,6 +45,11 @@ type PageFrameProps = {
   children: ReactNode
 }
 
+/** Shared divider between page actions and a view-level topbar control. */
+export const TopbarActionSeparator = () => (
+  <span className={styles.actionSep} data-testid="topbar-action-separator" aria-hidden="true" />
+)
+
 export const PageFrame = ({
   topbarLeft,
   topbarCenter,
@@ -53,7 +59,7 @@ export const PageFrame = ({
   contentInert = false,
   children,
 }: PageFrameProps) => {
-  const { railOpen, toggleRail } = useChrome()
+  const { narrowLayout, leftPanelOpen, toggleLeftPanel } = useChrome()
   const topbarRef = useRef<HTMLDivElement>(null)
   const [showSearch, setShowSearch] = useState(true)
 
@@ -62,17 +68,8 @@ export const PageFrame = ({
   // to the content pane and writes the lift onto the topbar — the same `topbarRef`
   // the width test below measures).
   const scrollRef = useRef<HTMLDivElement>(null)
-  const frameRef = useRef<HTMLElement>(null)
   useScrollGlass(scrollRef, topbarRef)
-
-  useLayoutEffect(() => {
-    const frame = frameRef.current
-
-    if (!frame) {
-      return
-    }
-    frame.toggleAttribute('inert', contentInert)
-  }, [contentInert])
+  useMainInert(contentInert)
 
   // Show the inline search only when the bar is wide enough to seat it comfortably;
   // below that, drop it (it lives in Spotlight on narrower screens). Bar width, not
@@ -104,11 +101,7 @@ export const PageFrame = ({
 
   return (
     <>
-      <main
-        ref={frameRef}
-        className={cx('main', styles.frame)}
-        aria-hidden={contentInert || undefined}
-      >
+      <main className={cx('main', styles.frame)}>
         <div
           ref={topbarRef}
           className={cx(styles.topbar, 'glass', 'glass-scroll', 'glass-edge-bottom')}
@@ -116,9 +109,17 @@ export const PageFrame = ({
           <div className={styles.topbarLead}>
             <IconToggle
               icon={<IconPanelLeft size={15} />}
-              active={railOpen}
-              onClick={toggleRail}
-              title={railOpen ? 'Collapse sidebar' : 'Expand sidebar'}
+              active={leftPanelOpen}
+              onClick={toggleLeftPanel}
+              title={
+                narrowLayout
+                  ? leftPanelOpen
+                    ? 'Close sidebar'
+                    : 'Open sidebar'
+                  : leftPanelOpen
+                    ? 'Collapse sidebar'
+                    : 'Expand sidebar'
+              }
             />
             <div className={styles.topbarLeft}>{topbarLeft}</div>
           </div>

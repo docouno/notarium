@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import { NOTE_BASENAME_MAX_BYTES } from './consts'
 import {
   hasPortablePathComponents,
+  isAtomicInstallTempName,
   isCanonicalInternalRelativeAddress,
   isCanonicalSafeRelativeAddress,
   isCanonicalSafeRelativePath,
@@ -15,6 +16,7 @@ import {
   noteFileBase,
   noteFilePath,
   skillPackagePathOf,
+  skillPlacementPathOf,
   sluggedNoteName,
 } from './path'
 
@@ -29,6 +31,24 @@ describe('skill package paths', () => {
     expect(isSkillPackageRootPath('review/SKILL.md')).toBe(true)
     expect(isSkillPackageRootPath('review/references/SKILL.md')).toBe(false)
     expect(isSkillPackageRootPath('_projects/project-a/review/SKILL.md')).toBe(true)
+  })
+
+  it('derives the common placement root independently of the package id', () => {
+    expect(skillPlacementPathOf('Ab3xK9_qZ12/SKILL.md')).toBe('')
+    expect(skillPlacementPathOf('Ab3xK9_qZ12/references/guide.md')).toBe('')
+    expect(skillPlacementPathOf('_projects/cHJvamVjdA/Ab3xK9_qZ12/SKILL.md')).toBe(
+      '_projects/cHJvamVjdA',
+    )
+    expect(skillPlacementPathOf('SKILL.md')).toBeNull()
+  })
+
+  it('recognises staging names built from the exact generated-id alphabet', () => {
+    const uuid = '00000000-0000-4000-8000-000000000000'
+
+    expect(isAtomicInstallTempName(`.AbCdefGhij_1.install-${uuid}`)).toBe(true)
+    expect(isAtomicInstallTempName(`.A__________-.install-${uuid}`)).toBe(true)
+    expect(isAtomicInstallTempName(`._projects.install-${uuid}`)).toBe(false)
+    expect(isAtomicInstallTempName(`.short.install-${uuid}`)).toBe(false)
   })
 })
 

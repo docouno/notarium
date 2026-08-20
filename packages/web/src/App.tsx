@@ -8,6 +8,7 @@ import {
   useParams,
 } from 'react-router'
 import { AUTH_MODE } from '@notarium/contract/enums'
+import { AgentsExplorerProvider } from './composers/AgentsExplorerProvider'
 import { AuthProvider, useAuth } from './composers/AuthProvider'
 import { InvitePage, LoginPage, SetupPage } from './composers/AuthScreens'
 import { ChromeProvider } from './composers/ChromeProvider'
@@ -35,6 +36,7 @@ import { useAutoHideScrollbars } from './libs/hooks/useAutoHideScrollbars'
 import {
   agentActivityRoute,
   agentContextRoute,
+  agentRolesRoute,
   AGENTS_PREFIX,
   FOLDER_PREFIX,
   MEMORY_NOTE_PREFIX,
@@ -44,7 +46,7 @@ import {
   SPACE_PREFIX,
   spaceRoute,
 } from './libs/routing/routePaths'
-import { AgentsChrome } from './pages/AgentsPage'
+import { AgentsChrome, MemoryNotePage } from './pages/AgentsPage'
 import { FeedPage } from './pages/FeedPage'
 import { FilesPage } from './pages/FilesPage'
 import { FolderPage } from './pages/FolderPage'
@@ -138,21 +140,23 @@ const AppShell = () => {
                           global listeners, the cheat sheet and the customisation. */}
                       <HotkeysProvider>
                         <FeedProvider>
-                          <div className="app">
-                            <Sidebar />
-                            {/* A page crash is caught HERE (#65), so the sidebar/chrome
+                          <AgentsExplorerProvider>
+                            <div className="app">
+                              <Sidebar />
+                              {/* A page crash is caught HERE (#65), so the sidebar/chrome
                                 survive while the content area shows a state screen;
                                 navigating away (resetKey) clears it. The outermost
                                 boundary in main.tsx is the last resort for the rest. */}
-                            <ErrorBoundary resetKey={location.pathname}>
-                              <Outlet />
-                            </ErrorBoundary>
-                            {/* Drag a text file anywhere in the window → import it as a
+                              <ErrorBoundary resetKey={location.pathname}>
+                                <Outlet />
+                              </ErrorBoundary>
+                              {/* Drag a text file anywhere in the window → import it as a
                                 note into the folder under the cursor / current scope
                                 (#223). A portal overlay; rides `Files` drags only, so it
                                 never collides with the tree's move-DnD. */}
-                            <ImportDropZone />
-                          </div>
+                              <ImportDropZone />
+                            </div>
+                          </AgentsExplorerProvider>
                         </FeedProvider>
                       </HotkeysProvider>
                     </EditingProvider>
@@ -193,16 +197,24 @@ const router = createBrowserRouter([
           { path: 'users', element: <UsersTab /> },
         ],
       },
-      // Agents (#13): agent-facing personal/project tooling. Today it contains
-      // the Context constructor; later roles/tokens/activity will live next to it.
+      // Agents (#13): role/skill packages, the context constructor and session audit.
       // User-level, space-free; the sidebar stays, the page owns the main area.
-      // The bare prefix lands on the first surface.
+      // The bare prefix lands on the role-first package library.
       {
         path: AGENTS_PREFIX,
         element: <AgentsChrome />,
         children: [
-          { index: true, element: <Navigate to={agentContextRoute()} replace /> },
-          { path: 'context', element: <Navigate to={agentContextRoute()} replace /> },
+          { index: true, element: <Navigate to={agentRolesRoute()} replace /> },
+          { path: 'abilities', element: <Navigate to={agentRolesRoute()} replace /> },
+          {
+            path: 'context',
+            lazy: async () => {
+              const { ContextPage } = await import('./pages/AgentsPage/ContextPage')
+
+              return { Component: ContextPage }
+            },
+          },
+          { path: 'context/personal', element: <Navigate to={agentContextRoute()} replace /> },
           {
             path: 'context/:scope',
             lazy: async () => {
@@ -242,16 +254,131 @@ const router = createBrowserRouter([
           { path: 'sessions', element: <ActivityRedirect /> },
           { path: 'sessions/:id', element: <ActivityRedirect preserveId /> },
           {
-            path: 'roles',
             lazy: async () => {
-              const { RolesPage } = await import('./pages/AgentsPage/RolesPage')
+              const { PackageLibraryFrame } = await import('./pages/AgentsPage/PackageLibraryFrame')
 
-              return { Component: RolesPage }
+              return { Component: PackageLibraryFrame }
             },
+            children: [
+              {
+                path: 'abilities/roles',
+                lazy: async () => {
+                  const { AbilityLibraryPage } =
+                    await import('./pages/AgentsPage/AbilityLibraryPage')
+
+                  return { Component: () => <AbilityLibraryPage expectedKind="roles" /> }
+                },
+              },
+              {
+                path: 'abilities/skills',
+                lazy: async () => {
+                  const { AbilityLibraryPage } =
+                    await import('./pages/AgentsPage/AbilityLibraryPage')
+
+                  return { Component: () => <AbilityLibraryPage expectedKind="skills" /> }
+                },
+              },
+              {
+                path: 'abilities/roles/new/:draftId',
+                lazy: async () => {
+                  const { AbilityDraftPage } = await import('./pages/AgentsPage/AbilityDraftPage')
+
+                  return { Component: () => <AbilityDraftPage expectedKind="roles" /> }
+                },
+              },
+              {
+                path: 'abilities/skills/new/:draftId',
+                lazy: async () => {
+                  const { AbilityDraftPage } = await import('./pages/AgentsPage/AbilityDraftPage')
+
+                  return { Component: () => <AbilityDraftPage expectedKind="skills" /> }
+                },
+              },
+              {
+                path: 'abilities/roles/owned/:locator',
+                lazy: async () => {
+                  const { AbilityDetailPage } = await import('./pages/AgentsPage/AbilityDetailPage')
+
+                  return {
+                    Component: () => (
+                      <AbilityDetailPage expectedKind="role" expectedSource="owned" />
+                    ),
+                  }
+                },
+              },
+              {
+                path: 'abilities/skills/owned/:locator',
+                lazy: async () => {
+                  const { AbilityDetailPage } = await import('./pages/AgentsPage/AbilityDetailPage')
+
+                  return {
+                    Component: () => (
+                      <AbilityDetailPage expectedKind="skill" expectedSource="owned" />
+                    ),
+                  }
+                },
+              },
+              {
+                path: 'abilities/roles/system/:packageId',
+                lazy: async () => {
+                  const { AbilityDetailPage } = await import('./pages/AgentsPage/AbilityDetailPage')
+
+                  return {
+                    Component: () => (
+                      <AbilityDetailPage expectedKind="role" expectedSource="system" />
+                    ),
+                  }
+                },
+              },
+              {
+                path: 'abilities/roles/catalog/:packageId',
+                lazy: async () => {
+                  const { AbilityDetailPage } = await import('./pages/AgentsPage/AbilityDetailPage')
+
+                  return {
+                    Component: () => (
+                      <AbilityDetailPage expectedKind="role" expectedSource="catalog" />
+                    ),
+                  }
+                },
+              },
+              {
+                path: 'abilities/skills/system/:packageId',
+                lazy: async () => {
+                  const { AbilityDetailPage } = await import('./pages/AgentsPage/AbilityDetailPage')
+
+                  return {
+                    Component: () => (
+                      <AbilityDetailPage expectedKind="skill" expectedSource="system" />
+                    ),
+                  }
+                },
+              },
+              {
+                path: 'abilities/skills/catalog/:packageId',
+                lazy: async () => {
+                  const { AbilityDetailPage } = await import('./pages/AgentsPage/AbilityDetailPage')
+
+                  return {
+                    Component: () => (
+                      <AbilityDetailPage expectedKind="skill" expectedSource="catalog" />
+                    ),
+                  }
+                },
+              },
+            ],
           },
           { path: 'audit', element: <ActivityRedirect /> },
           { path: 'session', element: <ActivityRedirect /> },
           { path: 'session/*', element: <ActivityRedirect /> },
+          { path: '*', element: <NotFoundPage /> },
+        ],
+      },
+      {
+        element: <AgentsChrome />,
+        children: [
+          { path: `${MEMORY_NOTE_PREFIX}/:id/*`, element: <MemoryNotePage /> },
+          { path: `${MEMORY_NOTE_PREFIX}/:id`, element: <MemoryNotePage /> },
         ],
       },
       {
@@ -294,8 +421,6 @@ const router = createBrowserRouter([
           { path: `${NOTE_PREFIX}/:id`, element: <NotePage /> },
           // An agent-memory note by identity. Same reader as /n, distinct route
           // surface so the chrome stays in Agents/Memory before detail loads.
-          { path: `${MEMORY_NOTE_PREFIX}/:id/*`, element: <NotePage /> },
-          { path: `${MEMORY_NOTE_PREFIX}/:id`, element: <NotePage /> },
           // A folder's durable PAGE address (#212), space-free like /n — the
           // registry resolves the id; the resolver redirects to the page note or
           // the folder's current /files/<path>.

@@ -126,7 +126,7 @@ export const HotkeysProvider = ({ children }: { children: ReactNode }) => {
       'search.focus': () => spotlight.open(),
       'help.keys': () => setCheatsheetOpen(true),
       'view.theme': () => chrome.setTheme(chrome.theme === 'dark' ? 'light' : 'dark'),
-      'view.leftPanel': () => chrome.toggleRail(),
+      'view.leftPanel': () => chrome.toggleLeftPanel(),
       'view.rightPanel': () => chrome.toggleAside(),
       'go.home': () => navigate(spaceRoute(space)),
       'go.feed': () => navigate(feedRoute(space)),

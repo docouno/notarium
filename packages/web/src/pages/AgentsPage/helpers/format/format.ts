@@ -16,3 +16,18 @@ export const projectLabel = (project: ProjectRow) => {
 
   return project.displayName || project.path.split('/').filter(Boolean).at(-1) || project.slug
 }
+
+/** Projects read by their human name; the handle joins in only when two of them
+ *  (or a project and its Space root) would otherwise show the same words. Every
+ *  surface that lists projects to CHOOSE from uses this — an ambiguous menu is a
+ *  menu the user cannot answer. */
+export const projectChoiceLabels = <T extends { displayName: string; handle: string }>(
+  projects: readonly T[],
+): Array<T & { label: string }> =>
+  projects.map((entry) => ({
+    ...entry,
+    label:
+      projects.filter((other) => other.displayName === entry.displayName).length > 1
+        ? `${entry.displayName} · ${entry.handle}`
+        : entry.displayName,
+  }))

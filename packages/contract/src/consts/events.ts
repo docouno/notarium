@@ -9,6 +9,8 @@ export const SSE_EVENT = {
   MEMBERS: 'members',
   /** Space slug changed → viewers adopt it live. Truth is /api/spaces. */
   RENAME: 'rename',
+  /** Owner's durable agent sessions changed → owner tabs refetch their session views. */
+  AGENT_SESSIONS: 'agent-sessions',
   /** Owner-scoped async-job progress. */
   JOB: 'job',
 } as const

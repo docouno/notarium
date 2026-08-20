@@ -54,4 +54,15 @@ export class InMemoryContextOrder implements ContextOrderPersistence {
       })
     }
   }
+
+  /** Re-address a role's order overlay when its package changes placement — the
+   *  drivers' delete-then-update: whatever sits at the destination belongs to the
+   *  package being moved, so it is cleared rather than colliding on the key. */
+  moveRoleTarget(fromTargetId: string, toTargetId: string): void {
+    this.rows = this.rows
+      .filter((r) => !(r.targetKind === 'role' && r.targetId === toTargetId))
+      .map((r) =>
+        r.targetKind === 'role' && r.targetId === fromTargetId ? { ...r, targetId: toTargetId } : r,
+      )
+  }
 }

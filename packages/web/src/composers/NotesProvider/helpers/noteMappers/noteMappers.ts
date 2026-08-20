@@ -20,6 +20,7 @@ export const asNote = (d: NoteDetailView, seed?: NoteView | null): NoteView | nu
 export const asRecent = (d: NoteDetailView, seed?: NoteView | null): RecentNote | null =>
   !d.deleted && d.id && d.filePath
     ? {
+        kind: 'note',
         id: d.id,
         title: d.title || '',
         slug: d.slug,

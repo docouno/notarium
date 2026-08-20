@@ -1,3 +1,5 @@
+import { agentAbilitiesRich } from './cases/agentAbilitiesRich'
+import { agentAbilitiesSparse } from './cases/agentAbilitiesSparse'
 import { agentContext } from './cases/agentContext'
 import { agentRoles } from './cases/agentRoles'
 import { agentSessions } from './cases/agentSessions'
@@ -71,6 +73,8 @@ export const CASES: readonly CaseSpec[] = [
   // agent memory / context
   agentContext,
   agentRoles,
+  agentAbilitiesRich,
+  agentAbilitiesSparse,
   agentSessions,
   memoryPerf,
   // import

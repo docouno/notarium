@@ -222,7 +222,11 @@ export const createGateway = (deps: GatewayDeps): McpGateway => {
   const store = createStoreAccess(deps.spaces)
   const now = deps.now ?? (() => new Date())
   const agentSessions = deps.sessions
-    ? createAgentSessions({ persistence: deps.sessions, now })
+    ? createAgentSessions({
+        persistence: deps.sessions,
+        now,
+        onChange: deps.auth.notifyAgentSessionsChanged,
+      })
     : undefined
   // A local safety rail against a model burning its turn budget on the exact
   // same procedural call. It is deliberately consecutive-only: any other tool

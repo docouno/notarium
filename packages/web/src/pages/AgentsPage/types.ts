@@ -1,4 +1,16 @@
-import type { MemoryCategory } from '@notarium/contract'
+import type { ContextPin, ContextSetView, MemoryCategory } from '@notarium/contract'
+
+/** A pin as a context PANEL renders it (#309). `loaded` is optional because it is a
+ *  claim about a budget, and not every source of a pin weighs one: the scope previews
+ *  do (they mirror what the agent loads), the role identity door does not (it hands
+ *  back the layer that is edited, whether or not the agent loads it here). Absent
+ *  therefore means "nobody said", which is why every reader below asks `=== false`
+ *  rather than `!loaded` — the two differ exactly on the layer no one weighed. */
+export type ContextPinView = Omit<ContextPin, 'loaded'> & { loaded?: boolean }
+export type ContextSetItemView = Omit<ContextSetView['items'][number], 'loaded'> & {
+  loaded?: boolean
+}
+export type ContextSetRowView = Omit<ContextSetView, 'items'> & { items: ContextSetItemView[] }
 
 // The scale's TWO scopes (#208). Colour encodes SELECTION, not identity (heatmap
 // ramp, #33): the ACTIVE band is the bright top step (toward white), every other band

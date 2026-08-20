@@ -1,4 +1,6 @@
 import { type Page } from '@playwright/test'
+import type { OwnedAbilityLocator } from '@notarium/contract'
+import { encodeAbilityLocator } from '@notarium/core'
 import { expect, test } from './fixtures'
 
 // The Context constructor (#165), UI leg: the human steers what an agent loads
@@ -135,9 +137,21 @@ const WORLD = {
     { space: 'main', path: 'specs', slug: 'specs', displayName: 'Specs' },
   ],
   agentRoles: [
-    { name: 'research', target: { kind: 'personal', user: 'sam' } },
+    {
+      source: 'custom' as const,
+      name: 'research',
+      description: 'Investigate a question with explicit evidence.',
+      instructions: '# Research\n\nResearch the evidence before deciding.',
+      target: { kind: 'personal', user: 'sam' },
+    },
     { name: 'grooming', target: { kind: 'personal', user: 'sam' } },
-    { name: 'research', target: { kind: 'project', space: 'main', path: 'docs' } },
+    {
+      source: 'custom' as const,
+      name: 'research',
+      description: 'Investigate a question with explicit evidence.',
+      instructions: '# Research\n\nResearch the evidence before deciding.',
+      target: { kind: 'project', space: 'main', path: 'docs' },
+    },
   ],
   auth: {
     users: [
@@ -175,6 +189,32 @@ const login = async (page: Page, username: string, password: string) => {
   await page.getByTestId('auth-password').fill(password)
   await page.getByTestId('auth-submit').click()
   await expect(page.getByTestId('auth-login')).not.toBeVisible()
+}
+
+const ownedRoleLocator = async (
+  page: Page,
+  name: string,
+  scope: OwnedAbilityLocator['location']['scope'],
+): Promise<string> => {
+  const response = await page.request.get('/api/me/agent-roles?limit=100')
+  expect(response.ok()).toBe(true)
+  const body = (await response.json()) as {
+    items: Array<{
+      name: string
+      source: string
+      locator: OwnedAbilityLocator
+    }>
+  }
+  const role = body.items.find(
+    (item) =>
+      item.source === 'owned' &&
+      item.locator.kind === 'role' &&
+      item.name === name &&
+      item.locator.location.scope === scope,
+  )
+
+  expect(role).toBeDefined()
+  return encodeAbilityLocator(role!.locator)
 }
 
 test('the Context constructor lists the profile and muting a category flips its row', async ({
@@ -319,7 +359,8 @@ test('direct pins and context-set items keep the title and show a Folder overvie
 
   await page.goto('/s/main')
   await page.getByRole('link', { name: 'Agents' }).click()
-  await page.getByRole('link', { name: 'Docs' }).click()
+  await page.getByTestId('agents-tab-context').click()
+  await page.getByTestId('context-scope-tab-docs').click()
   const direct = page
     .getByTestId('context-project')
     .getByTestId('context-pin-row')
@@ -344,8 +385,9 @@ test('a project route focuses the project; the Personal tab switches to it inlin
   await page.goto('/s/main')
   await expect(page.getByTestId('space-switcher')).toContainText('Main')
   await page.getByRole('link', { name: 'Agents' }).click()
-  await expect(page).toHaveURL(/\/agents\/context\/personal$/)
-  await page.getByRole('link', { name: 'Docs' }).click()
+  await page.getByTestId('agents-tab-context').click()
+  await expect(page).toHaveURL(/\/agents\/context$/)
+  await page.getByTestId('context-scope-tab-docs').click()
   await expect(page).toHaveURL(/\/agents\/context\/docs$/)
   // A project route focuses the PROJECT band of the one scale — its panels show, the
   // personal Profile panel is NOT stacked below (#208): it's the Personal tab instead.
@@ -380,20 +422,28 @@ test('an effective role is a separate first context band with an independent pre
   page,
 }) => {
   await login(page, 'sam', 'sam-password-1')
-  const personalPin = await page.request.put('/api/me/agent-roles/research/context-pins', {
-    data: { space: 'sam-personal', noteId: 'fake-scratch' },
-  })
+  const personalRole = await ownedRoleLocator(page, 'research', 'personal')
+  const projectRole = await ownedRoleLocator(page, 'research', 'project')
+  const personalPin = await page.request.put(
+    `/api/me/agent-roles/${encodeURIComponent(personalRole)}/context-pins`,
+    { data: { space: 'sam-personal', noteId: 'fake-scratch' } },
+  )
   expect(personalPin.ok()).toBe(true)
   const projectPin = await page.request.put(
-    '/api/me/agent-roles/research/context-pins?projectId=proj-main-docs',
+    `/api/me/agent-roles/${encodeURIComponent(projectRole)}/context-pins`,
     { data: { space: 'main', noteId: 'fake-project-scratch' } },
   )
   expect(projectPin.ok()).toBe(true)
 
   await page.goto('/agents/context/personal')
   await page.getByTestId('context-role-selector').click()
-  await page.getByRole('menuitemradio', { name: 'research · Personal' }).click()
-  await expect(page).toHaveURL(/\/agents\/context\/personal\?role=research$/)
+  await page
+    .getByRole('group', { name: 'Personal' })
+    .getByRole('menuitemradio', { name: 'Research' })
+    .click()
+  await expect(page).toHaveURL(
+    (url) => url.pathname === '/agents/context' && url.searchParams.get('role') === personalRole,
+  )
   await expect(page.getByTestId('context-role')).toBeVisible()
   await expect(page.getByTestId('context-role-pins')).toContainText('Scratch')
   await expect(page.getByTestId('context-aggregate-role')).toBeVisible()
@@ -411,28 +461,40 @@ test('an effective role is a separate first context band with an independent pre
   // this also keeps the test independent from another test's remembered active space.
   await page.goto('/s/main')
   await page.getByRole('link', { name: 'Agents' }).click()
-  await page.getByRole('link', { name: 'Docs' }).click()
+  await page.getByTestId('agents-tab-context').click()
+  await page.getByTestId('context-scope-tab-docs').click()
   await page.getByTestId('context-role-selector').click()
-  await page.getByRole('menuitemradio', { name: 'research · Project' }).click()
-  await expect(page).toHaveURL(/\/agents\/context\/docs\?role=research$/)
+  await page
+    .getByRole('group', { name: 'From this project' })
+    .getByRole('menuitemradio', { name: 'Research' })
+    .click()
+  await expect(page).toHaveURL(
+    (url) =>
+      url.pathname === '/agents/context/docs' && url.searchParams.get('role') === projectRole,
+  )
   await expect(page.getByTestId('context-role')).toBeVisible()
   await expect(page.getByTestId('context-role-pins')).toContainText('Project Scratch')
   await expect(
     page.getByTestId('context-role-pins').getByText('Scratch', { exact: true }),
   ).toHaveCount(0)
 
-  // A role is an orthogonal context axis: scope navigation preserves the selection
-  // and resolves the same name against the destination's exact placement.
+  // A role preset belongs to one exact placement, so a scope tab does not carry the
+  // selection across: the destination opens on its own Base context directly, instead of
+  // fetching a role it cannot hold and undoing the URL afterwards (#309).
   await page.getByTestId('context-scope-tab-personal').click()
-  await expect(page).toHaveURL(/\/agents\/context\/personal\?role=research$/)
-  await expect(page.getByTestId('context-role-pins')).toContainText('Scratch')
-  await expect(page.getByTestId('context-role-pins')).not.toContainText('Project Scratch')
+  await expect(page).toHaveURL(/\/agents\/context$/)
+  await expect(page.getByTestId('context-role')).toHaveCount(0)
+  await expect(page.getByTestId('context-profile')).toBeVisible()
   await page.getByTestId('context-scope-tab-docs').click()
-  await expect(page).toHaveURL(/\/agents\/context\/docs\?role=research$/)
-  await expect(page.getByTestId('context-role-pins')).toContainText('Project Scratch')
+  await expect(page).toHaveURL(/\/agents\/context\/docs$/)
 
-  await page.goto('/agents/context/proj-main-docs?role=research')
-  await expect(page).toHaveURL(/\/agents\/context\/docs\?role=research$/)
+  await page.goto(
+    `/agents/context/proj-main-docs?${new URLSearchParams({ role: projectRole }).toString()}`,
+  )
+  await expect(page).toHaveURL(
+    (url) =>
+      url.pathname === '/agents/context/docs' && url.searchParams.get('role') === projectRole,
+  )
   await expect(page.getByTestId('context-role-pins')).toContainText('Project Scratch')
   await page.getByTestId('context-aggregate-personal').click()
   await expect(page.getByTestId('context-profile')).toBeVisible()
@@ -448,53 +510,108 @@ test('role switching rejects stale responses and an unavailable bookmark normali
   page,
 }) => {
   await login(page, 'sam', 'sam-password-1')
+  const researchRole = await ownedRoleLocator(page, 'research', 'personal')
+  const groomingRole = await ownedRoleLocator(page, 'grooming', 'personal')
+
   for (const [role, noteId] of [
-    ['research', 'fake-scratch'],
-    ['grooming', 'fake-grooming'],
+    [researchRole, 'fake-scratch'],
+    [groomingRole, 'fake-grooming'],
   ] as const) {
     expect(
       (
-        await page.request.put(`/api/me/agent-roles/${role}/context-pins`, {
+        await page.request.put(`/api/me/agent-roles/${encodeURIComponent(role)}/context-pins`, {
           data: { space: 'sam-personal', noteId },
         })
       ).ok(),
     ).toBe(true)
   }
-  await page.route('**/api/me/agent-context?role=research', async (route) => {
-    await new Promise((resolve) => setTimeout(resolve, 300))
+  // The research preview is HELD, not merely slowed: the test itself decides when the
+  // stale answer lands, so "it came back last" is a property of the scenario instead of a
+  // bet on how the machine happens to schedule two sleeps.
+  let releaseResearchPreview!: () => void
+  const heldResearchPreview = new Promise<void>((resolve) => {
+    releaseResearchPreview = resolve
+  })
+  await page.route('**/api/me/agent-context?*', async (route) => {
+    const url = new URL(route.request().url())
+
+    if (url.searchParams.get('role') === researchRole) {
+      await heldResearchPreview
+    }
     await route.continue()
   })
 
   await page.goto('/agents/context/personal')
   await page.getByTestId('context-role-selector').click()
-  await page.getByRole('menuitemradio', { name: 'research · Personal' }).click()
+  await page
+    .getByRole('group', { name: 'Personal' })
+    .getByRole('menuitemradio', { name: 'Research' })
+    .click()
   await page.getByTestId('context-role-selector').click()
-  await page.getByRole('menuitemradio', { name: 'grooming · Personal' }).click()
-  await expect(page).toHaveURL(/\?role=grooming$/)
+  await page
+    .getByRole('group', { name: 'Personal' })
+    .getByRole('menuitemradio', { name: 'Grooming' })
+    .click()
+  await expect(page).toHaveURL((url) => url.searchParams.get('role') === groomingRole)
   await expect(page.getByTestId('context-role-pins')).toContainText('Grooming Checklist')
   await expect(page.getByTestId('context-role-pins')).not.toContainText('Scratch')
-  await page.waitForTimeout(400)
+
+  // Now let the abandoned preview answer and wait for that answer to reach the client —
+  // a rejection can only be proven against a response that actually arrived.
+  const staleResearchPreview = page.waitForResponse((response) => {
+    const url = new URL(response.url())
+
+    return url.pathname === '/api/me/agent-context' && url.searchParams.get('role') === researchRole
+  })
+  releaseResearchPreview()
+  await staleResearchPreview
+
+  // Arrival is not application, so read the pins only behind a render the app can produce
+  // only afterwards: the picker's rows come from a round-trip started once the stale answer
+  // was already on the client, and React cannot paint them while an earlier commit is still
+  // pending. Whatever that answer would have done to the role pins is therefore on screen by
+  // the time the first row is — and it never washes out, so the read below cannot pass by
+  // catching the page a moment too early.
+  await page.getByTestId('context-add-role-pin').click()
+  await expect(page.getByTestId('pin-picker-item').first()).toBeVisible()
+  await page.keyboard.press('Escape')
+  await expect(page.getByTestId('pin-picker')).toHaveCount(0)
   await expect(page.getByTestId('context-role-pins')).toContainText('Grooming Checklist')
+  await expect(page.getByTestId('context-role-pins')).not.toContainText('Scratch')
 
   await page.goto('/agents/context/personal?role=removed-role')
-  await expect(page).toHaveURL(/\/agents\/context\/personal$/)
+  await expect(page).toHaveURL(/\/agents\/context$/)
   await expect(page.getByTestId('context-profile')).toBeVisible()
   await expect(page.getByTestId('context-role')).toHaveCount(0)
 })
 
 test('a failed role preview exposes no base mutation surface', async ({ page }) => {
   await login(page, 'sam', 'sam-password-1')
-  await page.route('**/api/s/main/projects/*/agent-context?role=research', async (route) => {
-    await route.fulfill({ status: 503, body: 'temporarily unavailable' })
+  const projectRole = await ownedRoleLocator(page, 'research', 'project')
+  await page.route('**/api/s/main/projects/*/agent-context?*', async (route) => {
+    const url = new URL(route.request().url())
+
+    if (url.searchParams.get('role') === projectRole) {
+      await route.fulfill({ status: 503, body: 'temporarily unavailable' })
+      return
+    }
+    await route.continue()
   })
 
   await page.goto('/s/main')
   await page.getByRole('link', { name: 'Agents' }).click()
-  await page.getByRole('link', { name: 'Docs' }).click()
+  await page.getByTestId('agents-tab-context').click()
+  await page.getByTestId('context-scope-tab-docs').click()
   await page.getByTestId('context-role-selector').click()
-  await page.getByRole('menuitemradio', { name: 'research · Project' }).click()
+  await page
+    .getByRole('group', { name: 'From this project' })
+    .getByRole('menuitemradio', { name: 'Research' })
+    .click()
   await expect(page.getByTestId('context-error')).toContainText('Couldn’t load project context')
-  await expect(page).toHaveURL(/\/agents\/context\/docs\?role=research$/)
+  await expect(page).toHaveURL(
+    (url) =>
+      url.pathname === '/agents/context/docs' && url.searchParams.get('role') === projectRole,
+  )
   await expect(page.getByTestId('context-profile')).toHaveCount(0)
   await expect(page.getByTestId('context-project')).toHaveCount(0)
   await expect(page.getByTestId('context-role')).toHaveCount(0)
@@ -507,13 +624,62 @@ test('a reader can inspect a shared role preset without write affordances', asyn
   await login(page, 'robin', 'robin-password-1')
   await page.goto('/s/main')
   await page.getByRole('link', { name: 'Agents' }).click()
-  await page.getByRole('link', { name: 'Docs' }).click()
+  await page.getByTestId('agents-tab-context').click()
+  await page.getByTestId('context-scope-tab-docs').click()
   await page.getByTestId('context-role-selector').click()
-  await page.getByRole('menuitemradio', { name: 'research · Project' }).click()
+  await page
+    .getByRole('group', { name: 'From this project' })
+    .getByRole('menuitemradio', { name: 'Research' })
+    .click()
 
   await expect(page.getByTestId('context-role')).toBeVisible()
   await expect(page.getByTestId('context-role-readonly')).toBeVisible()
   await expect(page.getByTestId('context-add-role-pin')).toHaveCount(0)
+})
+
+/** The blocker of round 7, in a browser (#309). Switching a role off is a private
+ *  READING preference — it says nothing about whether that role's shared context may be
+ *  configured, and the very menu that switches it off offers «Configure context» right
+ *  beside. So the page it lands on has to say, in words, that the agent will not load
+ *  this role here — and still hand over every control that changes what it loads. */
+test('a role the reader switched off is named, explained, and still editable', async ({ page }) => {
+  await login(page, 'sam', 'sam-password-1')
+  const personalRole = await ownedRoleLocator(page, 'research', 'personal')
+  expect(
+    (
+      await page.request.put(
+        `/api/me/agent-roles/${encodeURIComponent(personalRole)}/context-pins`,
+        { data: { space: 'sam-personal', noteId: 'fake-scratch' } },
+      )
+    ).ok(),
+  ).toBe(true)
+  expect(
+    (
+      await page.request.put(
+        `/api/me/agent-abilities/${encodeURIComponent(personalRole)}/enabled`,
+        { data: { enabled: false } },
+      )
+    ).ok(),
+  ).toBe(true)
+
+  await page.goto(`/agents/context?${new URLSearchParams({ role: personalRole }).toString()}`)
+  await expect(page).toHaveURL((url) => url.searchParams.get('role') === personalRole)
+
+  // The address still names the role — this is NOT the "no longer available" path.
+  await expect(page.getByTestId('context-role')).toBeVisible()
+  await expect(page.getByTestId('context-role-unavailable')).toHaveCount(0)
+  await expect(page.getByTestId('context-role-inactive')).toContainText(
+    'switched this role off for yourself',
+  )
+  // Its own layer is on screen, and editable: the right to change a role's context is a
+  // question about the space, not about this reader's private switch.
+  await expect(page.getByTestId('context-role-pins')).toContainText('Scratch')
+  await expect(page.getByTestId('context-add-role-pin')).toBeVisible()
+  // And it costs the session budget nothing, because the agent does not load it here.
+  await expect(page.getByTestId('context-aggregate-role')).toHaveAttribute(
+    'data-loaded-tokens',
+    '0',
+  )
 })
 
 test('project context shows, adds, and removes project pins', async ({ page }) => {
@@ -521,7 +687,8 @@ test('project context shows, adds, and removes project pins', async ({ page }) =
 
   await page.goto('/s/main')
   await page.getByRole('link', { name: 'Agents' }).click()
-  await page.getByRole('link', { name: 'Docs' }).click()
+  await page.getByTestId('agents-tab-context').click()
+  await page.getByTestId('context-scope-tab-docs').click()
   await expect(page).toHaveURL(/\/agents\/context\/docs$/)
 
   const projectPins = page.getByTestId('context-project').getByTestId('context-pin-row')
@@ -547,7 +714,8 @@ test('the project context audits project memory and muting it persists across a 
 
   await page.goto('/s/main')
   await page.getByRole('link', { name: 'Agents' }).click()
-  await page.getByRole('link', { name: 'Docs' }).click()
+  await page.getByTestId('agents-tab-context').click()
+  await page.getByTestId('context-scope-tab-docs').click()
   await expect(page).toHaveURL(/\/agents\/context\/docs$/)
 
   // The PROJECT section carries its own Memory block — the about-project axis the
@@ -587,7 +755,8 @@ test('switching from one project to another re-targets the project Memory block 
 
   await page.goto('/s/main')
   await page.getByRole('link', { name: 'Agents' }).click()
-  await page.getByRole('link', { name: 'Docs' }).click()
+  await page.getByTestId('agents-tab-context').click()
+  await page.getByTestId('context-scope-tab-docs').click()
   await expect(page).toHaveURL(/\/agents\/context\/docs$/)
 
   // Project A (Docs): its own memory category renders (rows show directly, #208).
@@ -642,20 +811,52 @@ test('switching from one project to another re-targets the project Memory block 
   await expect(project.getByTestId('context-project-memory-caption')).toContainText('1 category')
 })
 
-test('the Memory explorer lists project memory and opens it through /m', async ({ page }) => {
+test('Memory read and edit keep the Agents shell and originating project scope', async ({
+  page,
+}) => {
   await login(page, 'sam', 'sam-password-1')
 
   await page.goto('/s/main')
   await expect(page.getByTestId('space-switcher')).toContainText('Main')
   await page.getByRole('link', { name: 'Agents' }).click()
+  await page.getByTestId('agents-tab-context').click()
   await expect(page.getByTestId('agents-context')).toBeVisible()
   await expect(page.getByTestId('memory-tree')).toBeVisible()
 
   const projectMemory = page.getByTestId('memory-leaf').filter({ hasText: 'deploy-memory' })
   await expect(projectMemory).toBeVisible()
   await projectMemory.click()
-  await expect(page).toHaveURL(/\/m\/fake-project-memory/)
+  await expect(page).toHaveURL(/\/m\/fake-project-memory\/deploy-memory\?context=docs$/)
+  await expect(page.getByTestId('memory-note-surface')).toBeVisible()
+  await expect(page.getByTestId('context-scope-tab-docs')).toHaveAttribute('aria-current', 'page')
+  await expect(page.getByTestId('context-scope-tab-personal')).not.toHaveAttribute(
+    'aria-current',
+    'page',
+  )
+  const explorer = page.getByTestId('memory-tree')
+  const activeMemory = explorer.getByTestId('memory-leaf').filter({ hasText: 'deploy-memory' })
+  await expect(page.getByTestId('agents-explorer-picker')).toHaveAttribute('data-dataset', 'memory')
+  await expect(explorer.getByTestId('memory-axis').filter({ hasText: 'Docs' })).toBeVisible()
+  await expect(activeMemory.getByRole('link')).toHaveAttribute('aria-current', 'page')
   await expect(page.getByRole('heading', { name: 'deploy-memory' })).toBeVisible()
+
+  await page.getByRole('button', { name: 'Edit', exact: true }).click()
+  await expect(page.getByTestId('memory-note-surface')).toBeVisible()
+  await expect(page.getByTestId('context-scope-tab-docs')).toHaveAttribute('aria-current', 'page')
+  await expect(page.getByTestId('memory-tree')).toBeVisible()
+  await expect(activeMemory.getByRole('link')).toHaveAttribute('aria-current', 'page')
+  const editor = page.locator('.cm-content')
+  await editor.click()
+  await page.keyboard.press('ControlOrMeta+a')
+  await page.keyboard.type('# deploy-memory\n\nDeploys need two approvals and an owner.')
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+
+  await expect(page).toHaveURL(/\/m\/fake-project-memory\/deploy-memory\?context=docs$/)
+  await expect(page.getByText('Deploys need two approvals and an owner.')).toBeVisible()
+  await expect(page.getByTestId('context-scope-tab-docs')).toHaveAttribute('aria-current', 'page')
+  await expect(page.getByTestId('memory-tree')).toBeVisible()
+  await expect(activeMemory.getByRole('link')).toHaveAttribute('aria-current', 'page')
+  await expect(page.getByLabel('Breadcrumb')).toContainText('Agents/Context/Memory/deploy-memory')
 })
 
 test('agent context and note routes canonicalize legacy forms', async ({ page }) => {
@@ -666,16 +867,17 @@ test('agent context and note routes canonicalize legacy forms', async ({ page })
   const docsProject = projects.projects.find((p) => p.slug === 'docs')!
 
   await page.goto('/agents')
-  await expect(page).toHaveURL(/\/agents\/context\/personal$/)
+  await expect(page).toHaveURL(/\/agents\/abilities\/roles$/)
   await page.goto('/agents/context')
-  await expect(page).toHaveURL(/\/agents\/context\/personal$/)
+  await expect(page).toHaveURL(/\/agents\/context$/)
   await page.goto('/agents/session')
   await expect(page).toHaveURL(/\/agents\/activity$/)
 
   await page.goto('/s/main')
   await expect(page.getByTestId('space-switcher')).toContainText('Main')
   await page.getByRole('link', { name: 'Agents' }).click()
-  await page.getByRole('link', { name: 'Docs' }).click()
+  await page.getByTestId('agents-tab-context').click()
+  await page.getByTestId('context-scope-tab-docs').click()
   await expect(page).toHaveURL(/\/agents\/context\/docs$/)
   await expect(page.getByTestId('context-project')).toBeVisible()
   await page.waitForFunction(

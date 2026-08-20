@@ -218,7 +218,7 @@ describe('railScopeActive (#245 merged Files+Feed rail highlight)', () => {
     for (const chrome of [false, true]) {
       for (const memory of [false, true]) {
         for (const nav of ['all', 'feed', 'folder'] as const) {
-          for (const scope of ['files', 'favorites', 'projects', 'project', 'memory'] as const) {
+          for (const scope of ['files', 'favorites', 'projects', 'project'] as const) {
             const { filesActive, favoritesActive } = active({ chrome, memory, nav, scope })
             // Exclusion invariant: the two file-tree rail icons are never lit together.
             expect(filesActive && favoritesActive).toBe(false)

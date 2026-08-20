@@ -65,10 +65,8 @@ export const DEFAULT_WORKSPACE_SETTINGS_TAB = 'general'
  *  lists), so this carries no slug, like /settings. */
 export const AGENTS_PREFIX = `/${SEGMENTS.agents}` as const
 
-/** The Agents tab shown when none is named (`/agents` → `/agents/context`). The
- *  Context constructor (#165) is the main surface; later Agents sections will live
- *  next to it. */
-export const DEFAULT_AGENTS_TAB = 'context'
+/** The role-first Abilities library is the Agents entry surface. */
+export const DEFAULT_AGENTS_TAB = 'abilities'
 
 /** The Context constructor's default axis (`/agents/context` → personal). */
 export const DEFAULT_AGENT_CONTEXT_SCOPE = 'personal'
@@ -97,6 +95,16 @@ export const AGENT_ACTIVITY_URL_PARAMS = {
   agent: 'agent',
   tool: 'tool',
   q: 'q',
+} as const
+
+/** The shared Abilities library's bookmarkable state. Cursor pagination is
+ *  intentionally local: only user-chosen discovery filters survive navigation. */
+export const AGENT_PACKAGE_LIBRARY_URL_PARAMS = {
+  q: 'q',
+  source: 'source',
+  home: 'home',
+  availability: 'availability',
+  project: 'project',
 } as const
 
 /** The trash view's bookmarkable query-keys. */

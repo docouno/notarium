@@ -1,0 +1,25 @@
+/* The multi-line control wears the same skin as the aside's single-line inputs
+ * (EditorMeta): elevated surface, 1px border, small radius, accent focus ring. */
+.textarea {
+  width: 100%;
+  min-height: 84px;
+  padding: 8px 10px;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.45;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  outline: 0;
+  background: var(--bg-elevated);
+}
+
+.textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.textarea:disabled {
+  opacity: 0.6;
+}

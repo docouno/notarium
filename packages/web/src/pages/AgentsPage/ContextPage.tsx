@@ -4,40 +4,50 @@ import type {
   ContextMemory,
   ContextOrderEntry,
   ContextSet,
-  ContextSetView,
   MeAgentContext,
   MemoryCategory,
+  MeRoleContext,
   Preview,
   ProjectAgentContext,
   RoleContextView,
+  RoleInactiveReason,
   Space,
 } from '@notarium/contract'
 import { STORE_EVENT } from '@notarium/contract/events'
+import { HTTP_STATUS } from '@notarium/contract/http'
+import { encodeAbilityLocator } from '@notarium/core'
 import { useProjects } from '../../composers/ProjectsProvider'
 import { useSpace } from '../../composers/SpaceProvider'
 import { CHANGED_COALESCE_MS, useSync } from '../../composers/SyncProvider'
 import { Chip } from '../../core/Chips'
 import { useDialog } from '../../core/Dialog'
-import { IconFolderKanban, IconUser } from '../../core/Icons'
+import { IconFolderKanban } from '../../core/Icons'
 import { Notice } from '../../core/Notice'
 import { Select } from '../../core/Select'
 import { useToast } from '../../core/Toast'
-import { SettingsLayout, type SettingsTab } from '../../layouts/SettingsLayout'
 import { agentContextRoute, memoryNoteRoute, noteRoute } from '../../libs/routing/routePaths'
-import { api } from '../../services/api'
-import { useAgentsSummary } from './AgentsProvider'
-import { AgentsTabs } from './AgentsTabs'
+import { api, ApiError } from '../../services/api'
+import { useAgentsShell, useAgentsSummary } from './AgentsProvider'
 import { EMPTY_PERSONAL, EMPTY_PROJECT } from './consts'
 import { AggregateBar } from './ContextMeters'
 import { AggregateBarSkeleton } from './ContextSkeletons'
-import { orderItemsBy, reRankByEntries } from './helpers/contextOrder'
+import { orderSetItemsIn, reRankByEntries } from './helpers/contextOrder'
+import { CONTEXT_ROLE_PARAM } from './helpers/contextScope'
 import { memoryState, memoryTrimmed, pinsTrimmed, setsTrimmed } from './helpers/contextTrim'
 import { projectLabel } from './helpers/format'
+import { roleLayerRows } from './helpers/roleLayer'
 import { rememberContextScopeSpace, rememberedContextScopeSpace } from './helpers/scopeStorage'
 import { MemoryBlock } from './MemoryBlock'
 import { PinPicker } from './PinPicker'
 import { PinsBlock } from './PinsBlock'
-import type { MemoryItem, ProjectScope, ScopeCard, ScopeKey, SetSave } from './types'
+import type {
+  ContextSetRowView,
+  MemoryItem,
+  ProjectScope,
+  ScopeCard,
+  ScopeKey,
+  SetSave,
+} from './types'
 import styles from './ContextPage.module.scss'
 
 // The Context constructor (#165/#208): the control surface for what an agent loads
@@ -55,6 +65,33 @@ import styles from './ContextPage.module.scss'
 // Every note carries a weight meter (its share of the scope budget) so the fattest —
 // the ones worth trimming — stand out.
 
+/** Resolution order, and therefore reading order: the role that would actually win
+ *  in this context is listed first. */
+const ROLE_SCOPE_ORDER = ['project', 'space', 'personal'] as const
+const ROLE_SCOPE_CAPTION: Record<string, string> = {
+  project: 'From this project',
+  space: 'From the space',
+  personal: 'Personal',
+}
+
+/** Why the agent does not load the addressed role HERE (#309) — one sentence per cause,
+ *  because the three are not the same news to the person reading them, and each closes
+ *  the same way: the layer below is still theirs to change. Editing a shared role is a
+ *  question about the space; whether this reader happens to load it is not.
+ *
+ *  `out-of-reach` is deliberately the vaguer of the three, because the reason word covers
+ *  both halves of reach — a placement this context never visits (a Project role addressed
+ *  from Personal) and a Space role narrowed away from this project. Naming only the second
+ *  would be the more useful sentence and a false one half the time. */
+const ROLE_INACTIVE_NOTICE: Record<RoleInactiveReason, string> = {
+  disabled:
+    'You switched this role off for yourself, so the agent won’t load it here. What it loads is still yours to change.',
+  'out-of-reach':
+    'This role belongs to a scope this context doesn’t reach, so the agent won’t load it here. What it loads is still yours to change.',
+  unhealthy:
+    'This role’s attachments no longer resolve, so a session refuses to raise it. What it loads is still yours to change.',
+}
+
 export const ContextPage = () => {
   const { space, spaces: allSpaces, personalSpace, reportNoteSpace, canWrite } = useSpace()
   const { projects, projectsSpace } = useProjects()
@@ -65,14 +102,23 @@ export const ContextPage = () => {
   const { scope: routeScope } = useParams()
   const { subscribe } = useSync()
   const { updateContext } = useAgentsSummary()
+  const { setBreadcrumbTail } = useAgentsShell()
 
   const scope = routeScope ?? 'personal'
-  const selectedRoleName = searchParams.get('role') ?? ''
+  const selectedRoleLocator = searchParams.get(CONTEXT_ROLE_PARAM) ?? ''
   // The eager scope as the SERVER curated it (#208): `personal` is the personal-route
   // scope (budget P); `project` carries the project pins AND the embedded personal
   // (budget Q); `projectMemory` is the about-project audit (recall-on-demand, #207).
   const [personal, setPersonal] = useState<MeAgentContext | null>(null)
   const [project, setProject] = useState<ProjectAgentContext | null>(null)
+  // The IDENTITY of the addressed role (#309): which role it is, its own EDITABLE layer,
+  // and whether the agent would load it where we stand. A separate door from the preview
+  // above, because the preview answers only "what does the agent load here, at what cost"
+  // and therefore omits a role it does not load — which is not an answer to "which role
+  // does this address name, and may I configure it". `roleUnnamed` is the ONE way an
+  // address can name nothing: that door's 404.
+  const [roleIdentity, setRoleIdentity] = useState<MeRoleContext | null>(null)
+  const [roleUnnamed, setRoleUnnamed] = useState(false)
   const [loadedContextKey, setLoadedContextKey] = useState<string | null>(null)
   const [projectMemory, setProjectMemory] = useState<MemoryCategory[] | null>(null)
   const [previews, setPreviews] = useState<Record<string, Preview | null>>({})
@@ -123,7 +169,7 @@ export const ContextPage = () => {
       : null
   }, [scope, projects])
   const scopeIdentity = projectScope?.id ?? (scope === 'personal' ? 'personal' : 'pending')
-  const requestContextKey = `${scopeIdentity}\u0000${selectedRoleName}`
+  const requestContextKey = `${scopeIdentity}\u0000${selectedRoleLocator}`
   const contextIsCurrent = loadedContextKey === requestContextKey
   const loadedScopeIdentity = loadedContextKey?.split('\u0000', 1)[0]
 
@@ -143,8 +189,8 @@ export const ContextPage = () => {
   // the personal route the (only) personal band. A reset here — keyed to the project
   // identity — also drops a stale project selection when the user switches projects.
   useEffect(() => {
-    setActiveScope(selectedRoleName ? 'role' : projectScope ? 'project' : 'personal')
-  }, [projectScope, selectedRoleName])
+    setActiveScope(selectedRoleLocator ? 'role' : projectScope ? 'project' : 'personal')
+  }, [projectScope, selectedRoleLocator])
 
   // On a project→project switch the page does not remount (the route has no key), so the
   // previous project's context would linger non-null and render under the new project's
@@ -209,14 +255,32 @@ export const ContextPage = () => {
     }
     const my = ++seq.current
     const fails: string[] = []
+    // Asked beside the preview, never derived from it: a role the agent does not load
+    // here is still a role this page configures, and only a 404 means the address names
+    // none. `project` is where the caller stands, because reach is a question about one.
+    const askIdentity = (): Promise<{ named: MeRoleContext | null; unnamed: boolean }> =>
+      selectedRoleLocator
+        ? api
+            .meRoleContextGet(selectedRoleLocator, projectScope?.id)
+            .then((named) => ({ named, unnamed: false }))
+            .catch((err: unknown) => {
+              const unnamed = err instanceof ApiError && err.status === HTTP_STATUS.NOT_FOUND
+
+              if (!unnamed) {
+                fails.push('role context')
+              }
+
+              return { named: null, unnamed }
+            })
+        : Promise.resolve({ named: null, unnamed: false })
 
     if (projectScope) {
       // The PROJECT scope (#208): its agent-context (project pins + the embedded personal
       // background curated against Q + the auto index) AND its about-project memory audit
       // (recall-on-demand, the same axis the explorer's MemoryTree shows).
-      const [proj, projMem] = await Promise.all([
+      const [proj, projMem, identity] = await Promise.all([
         api
-          .projectAgentContextGet(space, projectScope.id, selectedRoleName || undefined)
+          .projectAgentContextGet(space, projectScope.id, selectedRoleLocator || undefined)
           .catch(() => {
             fails.push('project context')
             return EMPTY_PROJECT
@@ -228,6 +292,7 @@ export const ContextPage = () => {
           fails.push('project memory')
           return [] as MemoryCategory[]
         }),
+        askIdentity(),
       ])
 
       if (my !== seq.current || myContextKey !== liveContextKey.current) {
@@ -236,14 +301,19 @@ export const ContextPage = () => {
       setProject(proj)
       setProjectMemory(projMem)
       setPersonal(null)
+      setRoleIdentity(identity.named)
+      setRoleUnnamed(identity.unnamed)
       setLoadedContextKey(myContextKey)
       setFailed(fails)
       return
     }
-    const ctx = await api.meAgentContextGet(selectedRoleName || undefined).catch(() => {
-      fails.push('personal context')
-      return EMPTY_PERSONAL
-    })
+    const [ctx, identity] = await Promise.all([
+      api.meAgentContextGet(selectedRoleLocator || undefined).catch(() => {
+        fails.push('personal context')
+        return EMPTY_PERSONAL
+      }),
+      askIdentity(),
+    ])
 
     if (my !== seq.current || myContextKey !== liveContextKey.current) {
       return
@@ -252,9 +322,11 @@ export const ContextPage = () => {
     updateContext(ctx)
     setProject(null)
     setProjectMemory(null)
+    setRoleIdentity(identity.named)
+    setRoleUnnamed(identity.unnamed)
     setLoadedContextKey(myContextKey)
     setFailed(fails)
-  }, [scope, space, projectScope, selectedRoleName, requestContextKey, updateContext])
+  }, [scope, space, projectScope, selectedRoleLocator, requestContextKey, updateContext])
 
   useEffect(() => {
     void load()
@@ -265,19 +337,18 @@ export const ContextPage = () => {
   // bare heading (#165 UX r5). One batch; best-effort. Covers the project pins AND the
   // embedded personal pins (a project route) or the personal pins (a personal route).
   useEffect(() => {
-    const setItemIds = (ss: ContextSetView[] | undefined) =>
+    const setItemIds = (ss: ContextSetRowView[] | undefined) =>
       (ss ?? []).flatMap((s) => s.items.map((i) => i.noteId))
     const ids = [
       ...(personal?.pins ?? []).map((p) => p.noteId),
-      ...(personal?.role?.pins ?? []).map((p) => p.noteId),
       ...(project?.pins ?? []).map((p) => p.noteId),
-      ...(project?.role?.pins ?? []).map((p) => p.noteId),
       ...(project?.personal.pins ?? []).map((p) => p.noteId),
+      // The role rows come from the identity door, so its layer is what needs previews.
+      ...(roleIdentity?.role.pins ?? []).map((p) => p.noteId),
       ...setItemIds(personal?.sets),
-      ...setItemIds(personal?.role?.sets),
       ...setItemIds(project?.sets),
-      ...setItemIds(project?.role?.sets),
       ...setItemIds(project?.personal.sets),
+      ...setItemIds(roleIdentity?.role.sets),
     ]
     const missing = ids.filter((id) => !(id in previews))
 
@@ -311,7 +382,7 @@ export const ContextPage = () => {
     return () => {
       live = false
     }
-  }, [personal, project, previews])
+  }, [personal, project, roleIdentity, previews])
 
   // Live freshness: the active space's SSE stream covers project changes; coalesce.
   useEffect(() => {
@@ -382,18 +453,40 @@ export const ContextPage = () => {
   const currentProject = contextIsCurrent && !contextLoadFailed ? project : null
   const currentPreview = projectScope ? currentProject : currentPersonal
   const contextReady = currentPreview !== null
-  const roleContext: RoleContextView | undefined = projectScope
+  // The two halves of one addressed role, kept apart on purpose (#309). `roleLayer` is
+  // the identity door's answer — WHICH role and WHAT is in it, the thing this page edits.
+  // `roleWeighed` is the preview's — present only when the agent loads it here, and the
+  // only source allowed to say what any of it costs.
+  const namedRole = contextIsCurrent ? roleIdentity : null
+  const roleLayer = namedRole?.role
+  const roleWeighed: RoleContextView | undefined = projectScope
     ? currentProject?.role
     : currentPersonal?.role
-  const isRoleScope = activeScope === 'role' && !!selectedRoleName && !!roleContext
+  const roleInactive = namedRole && !namedRole.active ? namedRole.inactive : undefined
+  const roleRows = useMemo(
+    () => (roleLayer ? roleLayerRows(roleLayer, roleWeighed) : null),
+    [roleLayer, roleWeighed],
+  )
+
+  useEffect(() => {
+    setBreadcrumbTail(roleLayer ? { label: roleLayer.title ?? roleLayer.name } : null)
+    return () => setBreadcrumbTail(null)
+  }, [roleLayer, setBreadcrumbTail])
+  const isRoleScope = activeScope === 'role' && !!selectedRoleLocator && !!roleLayer
   const isProjectScope = activeScope === 'project' && !!projectScope
-  const roleEditable = !!roleContext && (roleContext.scope === 'personal' || canWrite)
-  const roleSelectionUnavailable = !!selectedRoleName && contextReady && !roleContext
-  const roleProjectId = projectScope?.id
+  // Whether a shared role's context may be CHANGED is a question about the space — not
+  // about whether this reader happens to load it. All three inactive causes stay editable.
+  const roleEditable = !!roleLayer && (roleLayer.scope === 'personal' || canWrite)
+  // An address stops naming a role for exactly ONE reason: there is nothing to name, and
+  // the identity door spells that as a 404. Absence from the preview is not that reason —
+  // it says the agent does not load this role here, which is a different sentence and
+  // gets its own one below. Reading it as this one is what threw a member out of the page
+  // that configures the shared role they had switched off for themselves.
+  const roleSelectionUnavailable = !!selectedRoleLocator && contextIsCurrent && roleUnnamed
   const scopeHomeSpace = isRoleScope
-    ? roleContext.scope === 'personal'
+    ? roleLayer.scope === 'personal'
       ? (personalSpace?.slug ?? space)
-      : roleContext.space
+      : roleLayer.space
     : isProjectScope
       ? space
       : (personalSpace?.slug ?? space)
@@ -406,7 +499,7 @@ export const ContextPage = () => {
       return
     }
     const next = new URLSearchParams(searchParams)
-    next.delete('role')
+    next.delete(CONTEXT_ROLE_PARAM)
     setSearchParams(next, { replace: true })
     setActiveScope(projectScope ? 'project' : 'personal')
     toast.warning('That role is no longer available here. Showing base context.')
@@ -414,14 +507,14 @@ export const ContextPage = () => {
   const attachToScope = useCallback(
     async (id: string) => {
       if (isRoleScope) {
-        await api.contextSetAttachRole(selectedRoleName, id, roleProjectId)
+        await api.contextSetAttachRole(selectedRoleLocator, id)
       } else if (isProjectScope && projectScope) {
         await api.contextSetAttachProject(space, projectScope.id, id)
       } else {
         await api.contextSetAttachPersonal(id)
       }
     },
-    [isRoleScope, selectedRoleName, roleProjectId, isProjectScope, projectScope, space],
+    [isRoleScope, selectedRoleLocator, isProjectScope, projectScope, space],
   )
 
   // Pin the multi-selected notes into the ACTIVE scope (the picker's Notes mode). A note
@@ -433,7 +526,7 @@ export const ContextPage = () => {
       await Promise.all(
         items.map((it) =>
           isRoleScope
-            ? api.contextPinAttachRole(selectedRoleName, it.space, it.noteId, roleProjectId)
+            ? api.contextPinAttachRole(selectedRoleLocator, it.space, it.noteId)
             : it.space === scopeHomeSpace
               ? api.notePin(it.noteId, true)
               : isProjectScope && projectScope
@@ -455,27 +548,25 @@ export const ContextPage = () => {
   // from whichever list shows it; reload re-curates the budget.
   const unpin = useCallback(
     async (id: string, pinSpace?: string) => {
-      setPersonal((p) => (p ? { ...p, pins: p.pins.filter((x) => x.noteId !== id) } : p))
-      setPersonal((p) =>
-        p?.role
-          ? { ...p, role: { ...p.role, pins: p.role.pins.filter((x) => x.noteId !== id) } }
-          : p,
-      )
+      const without = <P extends { noteId: string }>(pins: P[]) =>
+        pins.filter((x) => x.noteId !== id)
+      setPersonal((p) => (p ? { ...p, pins: without(p.pins) } : p))
       setProject((p) =>
         p
           ? {
               ...p,
-              pins: p.pins.filter((x) => x.noteId !== id),
-              ...(p.role
-                ? { role: { ...p.role, pins: p.role.pins.filter((x) => x.noteId !== id) } }
-                : {}),
-              personal: { ...p.personal, pins: p.personal.pins.filter((x) => x.noteId !== id) },
+              pins: without(p.pins),
+              personal: { ...p.personal, pins: without(p.personal.pins) },
             }
           : p,
       )
+      // The role's rows come from the identity door, so the optimistic drop belongs to
+      // ITS copy of the layer — dropping it from the preview instead would leave the row
+      // on screen until the reload landed.
+      setRoleIdentity((r) => (r ? { ...r, role: { ...r.role, pins: without(r.role.pins) } } : r))
       try {
         if (isRoleScope) {
-          await api.contextPinDetachRole(selectedRoleName, id, roleProjectId)
+          await api.contextPinDetachRole(selectedRoleLocator, id)
         } else if (pinSpace) {
           // A pure cross-space pin — drop the registry row only; the note lives in ANOTHER
           // space, so we must NOT touch its own-space `always-load` tag.
@@ -506,16 +597,7 @@ export const ContextPage = () => {
         void load()
       }
     },
-    [
-      toast,
-      load,
-      isRoleScope,
-      selectedRoleName,
-      roleProjectId,
-      isProjectScope,
-      projectScope,
-      space,
-    ],
+    [toast, load, isRoleScope, selectedRoleLocator, isProjectScope, projectScope, space],
   )
 
   // Save a set (the picker's Set mode): create-or-reuse, add the cross-space items, attach here.
@@ -558,10 +640,10 @@ export const ContextPage = () => {
     }
   }
 
-  const detachSet = async (set: ContextSetView) => {
+  const detachSet = async (set: ContextSetRowView) => {
     try {
       if (isRoleScope) {
-        await api.contextSetDetachRole(selectedRoleName, set.id, roleProjectId)
+        await api.contextSetDetachRole(selectedRoleLocator, set.id)
       } else if (isProjectScope && projectScope) {
         await api.contextSetDetachProject(space, projectScope.id, set.id)
       } else {
@@ -578,7 +660,7 @@ export const ContextPage = () => {
   // Deleting a set DESTROYS it for every scope it's attached to (not just here) — a
   // destructive act, so confirm it (guards a misclick). Detach/remove are reversible
   // and stay one-click.
-  const deleteSet = async (set: ContextSetView) => {
+  const deleteSet = async (set: ContextSetRowView) => {
     const ok = await confirm({
       title: `Delete «${set.name}»?`,
       message:
@@ -603,7 +685,7 @@ export const ContextPage = () => {
     }
   }
 
-  const removeSetItem = async (set: ContextSetView, noteId: string) => {
+  const removeSetItem = async (set: ContextSetRowView, noteId: string) => {
     try {
       await api.contextSetItemRemove(set.homeSpace, set.id, noteId)
     } catch {
@@ -671,21 +753,14 @@ export const ContextPage = () => {
   }
 
   const reorderRole = (entries: ContextOrderEntry[]) => {
-    if (!selectedRoleName || !roleContext) {
+    if (!selectedRoleLocator || !roleLayer) {
       return
     }
-    setPersonal((p) =>
-      p?.role
-        ? { ...p, role: { ...p.role, ...reRankByEntries(p.role.pins, p.role.sets, entries) } }
-        : p,
-    )
-    setProject((p) =>
-      p?.role
-        ? { ...p, role: { ...p.role, ...reRankByEntries(p.role.pins, p.role.sets, entries) } }
-        : p,
+    setRoleIdentity((r) =>
+      r ? { ...r, role: { ...r.role, ...reRankByEntries(r.role.pins, r.role.sets, entries) } } : r,
     )
     serializeReorder(
-      () => api.contextOrderRole(selectedRoleName, entries, roleProjectId),
+      () => api.contextOrderRole(selectedRoleLocator, entries),
       'Couldn’t save the role order.',
     )
   }
@@ -693,58 +768,27 @@ export const ContextPage = () => {
   // Reorder the ITEMS inside a set (#210) — a home-space write, so it addresses the set's real
   // home. Optimistic on every list that may show this set (personal + the project's embedded
   // personal + project sets).
-  const reorderSetItems = (set: ContextSetView, noteIds: string[]) => {
-    const reorder = (s: ContextSetView): ContextSetView =>
-      s.id === set.id ? { ...s, items: orderItemsBy(s.items, noteIds) } : s
-    setPersonal((p) =>
-      p
-        ? {
-            ...p,
-            sets: p.sets.map(reorder),
-            ...(p.role ? { role: { ...p.role, sets: p.role.sets.map(reorder) } } : {}),
-          }
-        : p,
-    )
+  const reorderSetItems = (set: ContextSetRowView, noteIds: string[]) => {
+    const reorder = <I extends { noteId: string }, S extends { id: string; items: I[] }>(
+      sets: S[],
+    ): S[] => orderSetItemsIn(sets, set.id, noteIds)
+    setPersonal((p) => (p ? { ...p, sets: reorder(p.sets) } : p))
     setProject((p) =>
       p
         ? {
             ...p,
-            sets: p.sets.map(reorder),
-            ...(p.role ? { role: { ...p.role, sets: p.role.sets.map(reorder) } } : {}),
-            personal: { ...p.personal, sets: p.personal.sets.map(reorder) },
+            sets: reorder(p.sets),
+            personal: { ...p.personal, sets: reorder(p.personal.sets) },
           }
         : p,
     )
+    setRoleIdentity((r) => (r ? { ...r, role: { ...r.role, sets: reorder(r.role.sets) } } : r))
     serializeReorder(
       () => api.contextSetItemsOrder(set.homeSpace, set.id, noteIds),
       'Couldn’t reorder the set.',
       true,
     )
   }
-
-  const scopeGroups = useMemo<SettingsTab[][]>(() => {
-    // The personal domain's ROOT project collapses its handle to the space, but its
-    // slug is `personal` — which collides with the reserved Personal tab id (a
-    // duplicate React key + a redundant "Space root" tab that just re-routes to
-    // Personal). Drop that collision so the reserved tab is the single source.
-    const projectTabs = (projects ?? [])
-      .filter((p) => p.slug !== 'personal')
-      .map((p) => ({
-        id: p.slug,
-        label: projectLabel(p),
-        icon: <IconFolderKanban size={14} />,
-      }))
-    return projectTabs.length
-      ? [[{ id: 'personal', label: 'Personal', icon: <IconUser size={14} /> }], projectTabs]
-      : [[{ id: 'personal', label: 'Personal', icon: <IconUser size={14} /> }]]
-  }, [projects])
-  const contextScopeRoute = useCallback(
-    (nextScope: string) => {
-      const search = searchParams.toString()
-      return `${agentContextRoute(nextScope)}${search ? `?${search}` : ''}`
-    },
-    [searchParams],
-  )
 
   // The eager memory lists as MemoryItems (state from the SERVER's loaded flags, #208), in
   // the server's STABLE order — NOT re-sorted by state (#210): muting dims a row in place,
@@ -760,6 +804,27 @@ export const ContextPage = () => {
     [projectMemory],
   )
 
+  // The role band (#309): a TAB whenever a role is addressed — the panel below has to
+  // stay reachable after a click on Personal — but a WEIGHT only from the door that
+  // weighed one. A role the agent does not load here costs this budget nothing, and the
+  // band says exactly that with a zero instead of by quietly taking a slice of the bar.
+  const roleBand: ScopeCard[] = useMemo(
+    () =>
+      roleLayer
+        ? [
+            {
+              key: 'role',
+              label: `Role · ${roleLayer.title}`,
+              loaded: roleWeighed?.loadedTokens ?? 0,
+              trimmed: roleWeighed
+                ? pinsTrimmed(roleWeighed.pins) + setsTrimmed(roleWeighed.sets)
+                : 0,
+            },
+          ]
+        : [],
+    [roleLayer, roleWeighed],
+  )
+
   // The aggregate context load (#208): ONE scale = the active scope's SINGLE budget. On
   // a project route the current PROJECT band leads, then the embedded PERSONAL, both
   // against Q; on the personal route, Personal alone against P. loaded ≤ budget always,
@@ -770,17 +835,7 @@ export const ContextPage = () => {
         return null
       }
       const scopes: ScopeCard[] = [
-        ...(currentProject.role
-          ? [
-              {
-                key: 'role' as const,
-                label: `Role · ${currentProject.role.name}`,
-                loaded: currentProject.role.loadedTokens,
-                trimmed:
-                  pinsTrimmed(currentProject.role.pins) + setsTrimmed(currentProject.role.sets),
-              },
-            ]
-          : []),
+        ...roleBand,
         {
           key: 'project',
           label: projectScope.label,
@@ -806,21 +861,11 @@ export const ContextPage = () => {
     if (!currentPersonal) {
       return null
     }
-    const roleLoaded = currentPersonal.role?.loadedTokens ?? 0
+    const roleLoaded = roleWeighed?.loadedTokens ?? 0
 
     return {
       scopes: [
-        ...(currentPersonal.role
-          ? [
-              {
-                key: 'role' as const,
-                label: `Role · ${currentPersonal.role.name}`,
-                loaded: currentPersonal.role.loadedTokens,
-                trimmed:
-                  pinsTrimmed(currentPersonal.role.pins) + setsTrimmed(currentPersonal.role.sets),
-              },
-            ]
-          : []),
+        ...roleBand,
         {
           key: 'personal',
           label: 'Personal',
@@ -834,7 +879,7 @@ export const ContextPage = () => {
       totalLoaded: currentPersonal.loadedTokens,
       budgetTokens: currentPersonal.budgetTokens,
     }
-  }, [projectScope, currentProject, currentPersonal])
+  }, [projectScope, currentProject, currentPersonal, roleBand, roleWeighed])
 
   const personalPinIds = useMemo(
     () =>
@@ -850,18 +895,18 @@ export const ContextPage = () => {
     [currentProject],
   )
   const rolePinIds = useMemo(
-    () => new Set((roleContext?.pins ?? []).map((pin) => pin.noteId)),
-    [roleContext],
+    () => new Set((roleLayer?.pins ?? []).map((pin) => pin.noteId)),
+    [roleLayer],
   )
   const openMemoryNote = useCallback(
     (id: string) => {
-      const href = memoryNoteRoute(id)
+      const href = memoryNoteRoute(id, undefined, projectScope?.canonicalScope ?? 'personal')
 
       if (href) {
         navigate(href)
       }
     },
-    [navigate],
+    [navigate, projectScope],
   )
   const openPinnedNote = useCallback(
     (id: string) => {
@@ -889,21 +934,33 @@ export const ContextPage = () => {
         ? (project?.roles ?? [])
         : (personal?.roles ?? [])
       : []
-    const options = [
-      { value: '', label: 'Base context' },
-      ...availableRoles.map((role) => ({
-        value: role.name,
-        label: `${role.name} · ${role.scope[0].toUpperCase()}${role.scope.slice(1)}`,
-      })),
-    ]
+    // Grouped by where a role comes from, in the order resolution prefers them
+    // (Project beats Space beats Personal). The caption states the scope once, so a
+    // role reads as its own name instead of "name · Scope".
+    const grouped = ROLE_SCOPE_ORDER.flatMap((roleScope) =>
+      availableRoles
+        .filter((role) => role.scope === roleScope)
+        .map((role) => ({
+          value: encodeAbilityLocator(role.locator),
+          label: role.title,
+          group: ROLE_SCOPE_CAPTION[roleScope],
+        })),
+    )
+    const options = [{ value: '', label: 'Base context' }, ...grouped]
 
-    if (selectedRoleName && !availableRoles.some((role) => role.name === selectedRoleName)) {
-      options.push({
-        value: selectedRoleName,
-        label: roleContext
-          ? `${roleContext.name} · ${roleContext.scope[0].toUpperCase()}${roleContext.scope.slice(1)}`
-          : `${selectedRoleName} · unavailable`,
-      })
+    if (
+      selectedRoleLocator &&
+      !availableRoles.some((role) => encodeAbilityLocator(role.locator) === selectedRoleLocator)
+    ) {
+      options.push(
+        roleLayer
+          ? {
+              value: selectedRoleLocator,
+              label: roleLayer.title,
+              group: ROLE_SCOPE_CAPTION[roleLayer.scope] ?? 'Unavailable',
+            }
+          : { value: selectedRoleLocator, label: 'Unavailable role', group: 'Unavailable' },
+      )
     }
 
     return options
@@ -913,20 +970,20 @@ export const ContextPage = () => {
     projectScope,
     project?.roles,
     personal?.roles,
-    selectedRoleName,
-    roleContext,
+    selectedRoleLocator,
+    roleLayer,
   ])
 
-  const selectRole = (name: string) => {
+  const selectRole = (locator: string) => {
     const next = new URLSearchParams(searchParams)
 
-    if (name) {
-      next.set('role', name)
+    if (locator) {
+      next.set(CONTEXT_ROLE_PARAM, locator)
     } else {
-      next.delete('role')
+      next.delete(CONTEXT_ROLE_PARAM)
     }
     setSearchParams(next, { replace: true })
-    setActiveScope(name ? 'role' : projectScope ? 'project' : 'personal')
+    setActiveScope(locator ? 'role' : projectScope ? 'project' : 'personal')
   }
 
   // The readable spaces (personal first) feed the picker's cross-space set-item selector.
@@ -945,7 +1002,7 @@ export const ContextPage = () => {
     return opts
   }, [allSpaces, personalSpace])
   // Sets attachable to the ACTIVE scope: personal data cannot feed a shared project/role.
-  const sharedRoleScope = isRoleScope && roleContext?.scope !== 'personal'
+  const sharedRoleScope = isRoleScope && roleLayer?.scope !== 'personal'
   const attachableSets = useMemo(
     () => allSets.filter((s) => (isProjectScope || sharedRoleScope ? !s.personal : true)),
     [allSets, isProjectScope, sharedRoleScope],
@@ -955,17 +1012,17 @@ export const ContextPage = () => {
       new Set(
         (
           (isRoleScope
-            ? roleContext.sets
+            ? roleLayer.sets
             : isProjectScope
               ? currentProject?.sets
               : personalScope?.sets) ?? []
         ).map((set) => set.id),
       ),
-    [isRoleScope, roleContext, isProjectScope, currentProject, personalScope],
+    [isRoleScope, roleLayer, isProjectScope, currentProject, personalScope],
   )
   // Shared set handlers for whichever panel is showing (they act on the active scope).
   const pinsBlockSetProps = {
-    onAddNotesToSet: (set: ContextSetView) =>
+    onAddNotesToSet: (set: ContextSetRowView) =>
       setPicker({ addToSetId: set.id, addToSetHome: set.homeSpace }),
     onDetachSet: detachSet,
     onDeleteSet: deleteSet,
@@ -1048,11 +1105,16 @@ export const ContextPage = () => {
     </section>
   ) : null
 
-  const roleSection = roleContext ? (
+  const roleSection = roleRows ? (
     <section className={styles.section} data-testid="context-role">
+      {roleInactive && (
+        <Notice variant="warning" data-testid="context-role-inactive">
+          {ROLE_INACTIVE_NOTICE[roleInactive]}
+        </Notice>
+      )}
       <PinsBlock
-        pins={roleContext.pins}
-        sets={roleContext.sets}
+        pins={roleRows.pins}
+        sets={roleRows.sets}
         previews={previews}
         scale={
           projectScope ? (currentProject?.budgetTokens ?? 0) : (currentPersonal?.budgetTokens ?? 0)
@@ -1076,14 +1138,7 @@ export const ContextPage = () => {
   ) : null
 
   return (
-    <SettingsLayout
-      trail={[{ label: 'Agents' }, { label: 'Context' }]}
-      spaceLess
-      sectionTabs={<AgentsTabs active="context" />}
-      groups={scopeGroups}
-      routeFor={contextScopeRoute}
-      testIdPrefix="context-scope"
-    >
+    <>
       <div className={styles.page} data-testid="agents-context">
         <div className={styles.inner}>
           <header className={styles.pageHead}>
@@ -1096,16 +1151,13 @@ export const ContextPage = () => {
             <div className={styles.rolePicker}>
               <span className={styles.rolePickerLabel}>Effective role</span>
               <Select
-                value={selectedRoleName}
+                value={selectedRoleLocator}
                 options={roleOptions}
                 onChange={selectRole}
                 aria-label="Effective role context"
                 data-testid="context-role-selector"
               />
-              <span>
-                Role context loads first under the same session budget. Selecting a role never
-                grants access to notes or spaces.
-              </span>
+              <span>A role’s own context loads first, inside the same budget.</span>
             </div>
           </header>
 
@@ -1146,7 +1198,7 @@ export const ContextPage = () => {
               Personal tab switches to it inline (its band lights, its panels replace the
               project's) — the personal context is never duplicated as a second panel. */}
           {contextReady && !roleSelectionUnavailable
-            ? activeScope === 'role' && roleContext
+            ? activeScope === 'role' && roleRows
               ? roleSection
               : activeScope === 'project' && projectScope
                 ? projectSection
@@ -1159,7 +1211,7 @@ export const ContextPage = () => {
         <PinPicker
           space={scopeHomeSpace}
           folder={
-            (isProjectScope || (isRoleScope && roleContext?.scope === 'project')) && projectScope
+            (isProjectScope || (isRoleScope && roleLayer?.scope === 'project')) && projectScope
               ? projectScope.path
               : undefined
           }
@@ -1174,6 +1226,6 @@ export const ContextPage = () => {
           onClose={() => setPicker(null)}
         />
       )}
-    </SettingsLayout>
+    </>
   )
 }

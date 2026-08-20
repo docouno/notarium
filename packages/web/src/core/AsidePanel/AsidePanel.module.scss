@@ -1,0 +1,77 @@
+/* The shared aside body rhythm: one source for every panel the right aside hosts. */
+.panel {
+  display: flex;
+  padding: 12px var(--gutter) 24px;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.field {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.label {
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.value {
+  min-width: 0;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.text {
+  color: var(--text);
+  font-size: 13px;
+}
+
+/* The section column: the same body inset as `.panel`, but its children are
+   captioned sections divided by a rule instead of labelled fields. */
+.sections {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  padding: 12px var(--gutter) 14px;
+}
+
+.section {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  border: 0;
+}
+
+.section + .section {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.section-heading {
+  display: flex;
+  min-height: 20px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  color: var(--text-faint);
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.section-hint {
+  margin: -3px 0 0;
+  color: var(--text-faint);
+  font-size: 11.5px;
+  line-height: 1.4;
+}

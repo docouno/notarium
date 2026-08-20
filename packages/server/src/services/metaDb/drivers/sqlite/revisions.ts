@@ -567,6 +567,37 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
       for (const noteId of ids) {
         fenceNote.run(noteId, space)
       }
+      // Owner state of a package whose registry note is gone for good. The policy is
+      // keyed by the package DIRECTORY, so the note that ends it is a SECOND key —
+      // the directory is named by the id its manifest declared, and claim arbitration
+      // can leave the note carrying a different one, which is why migration 0015 gave
+      // the preference row both keys and 0014 gives the policy row both too. A row
+      // whose writer did not know the note id keeps the pre-arbitration answer, and
+      // only such a row: matching the package id for a row that HAS the key would
+      // forget a live policy whose directory happens to be named like some other
+      // purged note. canon: docs/meta-db.md#source-of-truth
+      const purgedPolicy = `home_space = ?
+          AND (registry_note_id = ?
+               OR (registry_note_id IS NULL AND package_id = ?))`
+      const deleteBindings = db.prepare(
+        `DELETE FROM ability_project_bindings
+          WHERE home_space = ?
+            AND package_id IN (
+              SELECT package_id FROM ability_availability WHERE ${purgedPolicy}
+            )`,
+      )
+      const deleteAvailability = db.prepare(
+        `DELETE FROM ability_availability WHERE ${purgedPolicy}`,
+      )
+      const deletePreferences = db.prepare(
+        'DELETE FROM ability_preferences WHERE space_id = ? AND registry_note_id = ?',
+      )
+
+      for (const noteId of ids) {
+        deleteBindings.run(space, space, noteId, noteId)
+        deleteAvailability.run(space, noteId, noteId)
+        deletePreferences.run(space, noteId)
+      }
       const stillUsed = db.prepare('SELECT 1 FROM note_revisions WHERE content_hash = ? LIMIT 1')
       const dropBlob = db.prepare('DELETE FROM revision_blobs WHERE hash = ?')
 

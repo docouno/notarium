@@ -3114,7 +3114,11 @@ export const createLocalFsFiles = (root: string): FileStore => {
         if (
           observation.kind !== 'present' ||
           !claimMatches(observation.claim, expectedClaim) ||
-          new TextDecoder().decode(observation.bytes) !== expectedContent
+          // Same decoding as `read`/`readRegular` — and as `detachClaimedPath`
+          // below, which re-checks this very content after staging. A default
+          // `TextDecoder` eats a leading U+FEFF, so on a file that carries one
+          // this pre-check would pass while the staged re-check refused.
+          Buffer.from(observation.bytes).toString('utf8') !== expectedContent
         ) {
           return false
         }

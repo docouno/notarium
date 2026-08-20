@@ -38,6 +38,16 @@ export const orderItemsBy = <T extends { noteId: string }>(
   return out
 }
 
+/** Apply a set's new ITEM order to every copy of that set in a scope's list (#210). A set
+ *  is shared across the scopes it attaches to, so the same drag lands on several lists —
+ *  and those lists no longer have one row shape: a scope preview weighs its items, the
+ *  role's own layer does not (#309). Generic over the row so the rule stays written once. */
+export const orderSetItemsIn = <I extends { noteId: string }, S extends { id: string; items: I[] }>(
+  sets: S[],
+  setId: string,
+  noteIds: readonly string[],
+): S[] => sets.map((s) => (s.id === setId ? { ...s, items: orderItemsBy(s.items, noteIds) } : s))
+
 /** Optimistically stamp pins + sets with the `order` implied by a new entry sequence (#210),
  *  so the merged list re-sorts instantly on drop instead of snapping back until the reload. */
 export const reRankByEntries = <

@@ -1,4 +1,12 @@
-import { createContext, type ReactNode, useContext, useEffect, useState } from 'react'
+import {
+  createContext,
+  type ReactNode,
+  useCallback,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+} from 'react'
 
 import { themeColor } from '../../libs/pwa'
 import { STORAGE_KEYS } from '../../libs/storageKeys'
@@ -149,13 +157,13 @@ export type ChromeContextValue = {
   /** Right aside (local graph / note meta / feed facets). */
   asideOpen: boolean
   toggleAside: () => void
-  /** Whether the left rail's WIDE PANEL (space switcher + search + file tree) is
-   *  shown (#103). The slim activity strip beside it is permanent — this toggles
-   *  only the panel, VS Code-style. Persisted to `bm-rail-open` (default shown).
-   *  Naming/key kept for continuity (the value's meaning narrowed, not its type). */
-  railOpen: boolean
-  setRailOpen: (open: boolean) => void
-  toggleRail: () => void
+  /** Responsive projection consumed by every Explorer owner (PageFrame, graph,
+   *  Trash and hotkeys). Narrow layout toggles the temporary drawer; wide layout
+   *  toggles the persisted panel preference. */
+  narrowLayout: boolean
+  leftPanelOpen: boolean
+  toggleLeftPanel: () => void
+  closeLeftPanel: () => void
   // One-shot focus target carried into the graph when "open in graph" is used
   // from a note's local graph: GraphView pins it (focusId) on entry then clears
   // it, so a later plain visit to the graph doesn't re-focus a stale note.
@@ -211,6 +219,12 @@ export const ChromeProvider = ({ children }: { children: ReactNode }) => {
   )
   const [railOpen, setRailOpen] = useState(
     () => localStorage.getItem(STORAGE_KEYS.railOpen) !== '0',
+  )
+  const [narrowRailOpen, setNarrowRailOpenState] = useState(false)
+  const narrowRailOpenRef = useRef(false)
+  const narrowReturnFocusRef = useRef<HTMLElement | null>(null)
+  const [narrowLayout, setNarrowLayout] = useState(
+    () => typeof window !== 'undefined' && window.matchMedia('(max-width: 720px)').matches,
   )
   const [graphFocus, setGraphFocus] = useState<string | null>(null)
   // Focus mode (#118), stored as two pieces so the chosen granularity survives an
@@ -272,6 +286,63 @@ export const ChromeProvider = ({ children }: { children: ReactNode }) => {
     localStorage.setItem(STORAGE_KEYS.railOpen, railOpen ? '1' : '0')
   }, [railOpen])
 
+  const setNarrowRailOpen = useCallback((open: boolean) => {
+    if (open && !narrowRailOpenRef.current) {
+      narrowReturnFocusRef.current =
+        document.activeElement instanceof HTMLElement ? document.activeElement : null
+    }
+    narrowRailOpenRef.current = open
+    setNarrowRailOpenState(open)
+  }, [])
+
+  const toggleNarrowRail = useCallback(() => {
+    setNarrowRailOpen(!narrowRailOpenRef.current)
+  }, [setNarrowRailOpen])
+
+  useEffect(() => {
+    const media = window.matchMedia('(max-width: 720px)')
+
+    const update = () => {
+      setNarrowLayout(media.matches)
+      if (narrowRailOpenRef.current) {
+        setNarrowRailOpen(false)
+      }
+    }
+    update()
+    media.addEventListener('change', update)
+    return () => media.removeEventListener('change', update)
+  }, [setNarrowRailOpen])
+
+  useEffect(() => {
+    if (narrowRailOpen || !narrowReturnFocusRef.current) {
+      return undefined
+    }
+    const target = narrowReturnFocusRef.current
+    narrowReturnFocusRef.current = null
+    const frame = requestAnimationFrame(() => {
+      if (target.isConnected) {
+        target.focus()
+      }
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [narrowRailOpen])
+
+  const leftPanelOpen = narrowLayout ? narrowRailOpen : railOpen
+  const toggleLeftPanel = useCallback(() => {
+    if (narrowLayout) {
+      toggleNarrowRail()
+    } else {
+      setRailOpen((open) => !open)
+    }
+  }, [narrowLayout, toggleNarrowRail])
+  const closeLeftPanel = useCallback(() => {
+    if (narrowLayout) {
+      setNarrowRailOpen(false)
+    } else {
+      setRailOpen(false)
+    }
+  }, [narrowLayout, setNarrowRailOpen])
+
   const value: ChromeContextValue = {
     theme,
     setTheme,
@@ -300,9 +371,10 @@ export const ChromeProvider = ({ children }: { children: ReactNode }) => {
     toggleTypewriter: () => setTypewriter((o) => !o),
     asideOpen,
     toggleAside: () => setAsideOpen((o) => !o),
-    railOpen,
-    setRailOpen,
-    toggleRail: () => setRailOpen((o) => !o),
+    narrowLayout,
+    leftPanelOpen,
+    toggleLeftPanel,
+    closeLeftPanel,
     graphFocus,
     setGraphFocus,
   }

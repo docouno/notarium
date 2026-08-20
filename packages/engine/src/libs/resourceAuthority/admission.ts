@@ -126,6 +126,22 @@ export class ResourceAdmission {
     })
   }
 
+  /** How many APPLICATION leases are live right now. The fence's own drain lease is
+   *  not one: it overlaps every key, so while it is held nothing else can be admitted
+   *  and counting it would let an unadmitted caller read the drain as its own
+   *  admission. */
+  activeLeases(): number {
+    let count = 0
+
+    for (const entry of this.active.values()) {
+      if (entry.state !== 'settled' && !entry.request.lifecycle) {
+        count++
+      }
+    }
+
+    return count
+  }
+
   diagnostics(): AdmissionDiagnostic[] {
     return [...this.active.values(), ...this.waiting]
       .filter((entry) => entry.state !== 'settled')

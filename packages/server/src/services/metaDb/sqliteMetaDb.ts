@@ -5,6 +5,9 @@ import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
+import { createAbilityAvailabilityFacet } from './drivers/sqlite/abilityAvailability'
+import { createAbilityPlacementFacet } from './drivers/sqlite/abilityPlacement'
+import { createAbilityPreferencesFacet } from './drivers/sqlite/abilityPreferences'
 import { createAgentDeltaCursorsFacet } from './drivers/sqlite/agentDeltaCursors'
 import { createAuthFacet } from './drivers/sqlite/auth'
 import { createCausalOutboxFacet } from './drivers/sqlite/causalOutbox'
@@ -341,6 +344,11 @@ export class SqliteMetaDb implements MetaDb {
       ).run(spaceId, spaceId, spaceId)
       // The type-aware project FK cascades both cursor tables from this parent
       // delete. Keeping cleanup parent-first matches concurrent session advance.
+      db.prepare('DELETE FROM ability_project_bindings WHERE home_space = ?').run(spaceId)
+      db.prepare('DELETE FROM ability_availability WHERE home_space = ?').run(spaceId)
+      db.prepare('DELETE FROM ability_preferences WHERE space_id = ?').run(spaceId)
+      // The forwarding rows of this Space go with the overrides they forward.
+      db.prepare('DELETE FROM ability_placement_trail WHERE space_id = ?').run(spaceId)
       db.prepare('DELETE FROM folders WHERE space = ?').run(spaceId)
       db.prepare('DELETE FROM favorites WHERE space = ?').run(spaceId)
       db.prepare(
@@ -412,6 +420,12 @@ export class SqliteMetaDb implements MetaDb {
   // ── context order facet ────────────────────────────────────────────
 
   readonly contextOrder = createContextOrderFacet(this.ctx)
+
+  readonly abilityAvailability = createAbilityAvailabilityFacet(this.ctx)
+
+  readonly abilityPreferences = createAbilityPreferencesFacet(this.ctx)
+
+  readonly abilityPlacement = createAbilityPlacementFacet(this.ctx)
 
   // ── agent retrieval audit facet ────────────────────────────────────
 

@@ -1,5 +1,5 @@
 // Markdown rendering for the read/bootstrap tools: the prose projection of each tool's structured payload.
-import { type RoleSummary } from '@notarium/contract'
+import { type EffectiveRoleSummary } from '@notarium/contract'
 import {
   type AgentSession,
   type DeltaEntry,
@@ -25,7 +25,7 @@ type SessionStructured = {
     memory: Array<{ noteId: string; category: string; summary: string }>
     alwaysLoad: Array<{ noteId: string; title: string }>
   }
-  roles: RoleSummary[]
+  roles: EffectiveRoleSummary[]
   rolesTruncated?: boolean
   activeRole?: UseRoleOutput
   projects: ProjectSummary[]
@@ -77,7 +77,10 @@ export const renderSession = (
   if (s.roles.length) {
     lines.push('', '**Available roles** (call `use_role` when one matches the work):')
     for (const role of s.roles) {
-      lines.push(`- \`${role.name}\` (${role.scope}) — ${role.description}`)
+      // A System role has no placement to name; its SOURCE is what the line states.
+      lines.push(
+        `- \`${role.name}\` (${role.source === 'system' ? 'system' : role.scope}) — ${role.description}`,
+      )
     }
   } else if (s.rolesTruncated) {
     lines.push('', 'No roles are visible in this bounded summary.')

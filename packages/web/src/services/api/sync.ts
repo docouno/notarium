@@ -28,7 +28,10 @@ export const syncApi = {
    *  `onRename` (#100 phase 4 / #123) fires on the NAMED `rename` event — this space's
    *  slug changed. Every live viewer of the space gets it, so a second tab adopts the
    *  new slug live (re-fetch /api/spaces, canonicalise the URL, relabel the switcher)
-   *  without a reload. */
+   *  without a reload.
+   *
+   *  `onAgentSessions` fires on the owner-scoped `agent-sessions` event. It is a
+   *  nudge only; the owner-gated session REST routes remain the source of truth. */
   events: (
     space: string,
     onEvent: (event: StoreEvent) => void,
@@ -36,6 +39,7 @@ export const syncApi = {
     onAccess?: () => void,
     onMembers?: () => void,
     onRename?: () => void,
+    onAgentSessions?: () => void,
     onOpen?: () => void,
   ): (() => void) => {
     const es = new EventSource(`${sp(space)}/events`)
@@ -57,6 +61,9 @@ export const syncApi = {
     }
     if (onRename) {
       es.addEventListener(SSE_EVENT.RENAME, () => onRename())
+    }
+    if (onAgentSessions) {
+      es.addEventListener(SSE_EVENT.AGENT_SESSIONS, () => onAgentSessions())
     }
 
     return () => es.close()

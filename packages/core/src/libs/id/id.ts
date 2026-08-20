@@ -7,6 +7,7 @@
 import { NOTE_ID_LENGTH } from './consts'
 
 const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-'
+const ALPHABET_SET = new Set(ALPHABET)
 
 /** JavaScript strings may contain isolated UTF-16 surrogates even though neither
  *  UTF-8 nor URI encoding can represent them. Never let such a value become a
@@ -48,6 +49,11 @@ export const isDurableScalar = (value: string): boolean =>
 export const RESERVED_NOTE_ID_PREFIX = 'notarium-id:'
 
 export const isValidNoteId = (value: string): boolean => value.length > 0 && isDurableScalar(value)
+
+/** Exact storage-address form minted by freshNoteId(). The broader note-id
+ * domain also accepts imported opaque ids, which are not safe path components. */
+export const isGeneratedNoteId = (value: string): boolean =>
+  value.length === NOTE_ID_LENGTH && [...value].every((char) => ALPHABET_SET.has(char))
 
 export const freshNoteId = (size = NOTE_ID_LENGTH): string => {
   const bytes = new Uint8Array(size)

@@ -77,10 +77,15 @@ export const UseRoleOutputSchema = z.object({
 })
 
 export const ListRolesOutputSchema = z.object({
+  /** The same effective set `start_session.roles` reports: Owned placements the human
+   * added plus the host's System roles, each naming its own source; never a Catalog
+   * template. */
   roles: z.array(EffectiveRoleSummarySchema),
   total: z.number().int().nonnegative(),
   nextCursor: z.string().optional(),
-  /** The underlying owned library hit a host bound; this page is honest but not exhaustive. */
+  /** Only the OWNED side of the effective set is bounded — the System supply is always
+   * listed whole — so this marks an owned-library host bound: the page is honest but not
+   * exhaustive. */
   truncated: z.boolean().optional(),
 })
 

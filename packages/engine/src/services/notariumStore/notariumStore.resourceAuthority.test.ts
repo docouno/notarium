@@ -305,4 +305,45 @@ describe('NotariumStore resource authority', () => {
       await store.stop()
     }
   })
+
+  it('atomically detaches an internal skill package and restores it if finalization fails', async () => {
+    const root = await mkroot()
+    const skillRoot = join(root, '.notarium', 'skills')
+    const packageRoot = join(skillRoot, 'Ab3xK9_qZ12')
+    await fs.mkdir(join(packageRoot, 'assets'), { recursive: true })
+    await fs.writeFile(
+      join(packageRoot, 'SKILL.md'),
+      '---\nname: demo\ndescription: Demo skill\n---\n\nInstructions',
+    )
+    await fs.writeFile(join(packageRoot, 'assets', 'opaque.bin'), Buffer.from([0, 1, 255]))
+    const store = createNotariumStore({
+      mounts: [
+        { class: 'user-doc', dir: root, prefix: '' },
+        { class: 'skill', dir: skillRoot, prefix: '.notarium/skills' },
+      ],
+    })
+
+    try {
+      await store.list()
+      let detached = false
+      await expect(
+        store.removeDir?.('.notarium/skills/Ab3xK9_qZ12', {
+          internalAddress: true,
+          afterDetach: async () => {
+            detached = true
+            await expect(fs.stat(packageRoot)).rejects.toMatchObject({ code: 'ENOENT' })
+            throw new Error('journal refused')
+          },
+        }),
+      ).rejects.toThrow('journal refused')
+      expect(detached).toBe(true)
+      await expect(fs.readFile(join(packageRoot, 'SKILL.md'), 'utf8')).resolves.toContain(
+        'name: demo',
+      )
+      await store.removeDir?.('.notarium/skills/Ab3xK9_qZ12', { internalAddress: true })
+      await expect(fs.stat(packageRoot)).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally {
+      await store.stop()
+    }
+  })
 })

@@ -25,6 +25,8 @@ const row = (
   lastSeenAt,
   calls: 1,
   role: null,
+  roleLocator: null,
+  roleContextProjectId: null,
   ...over,
 })
 
@@ -124,15 +126,29 @@ export const describeAgentSessionsContract = (
 
     it('sets a role atomically and reports idempotent repeats', async () => {
       await persistence.insert(row('ses_aaaaaaaaaaaa', 'alice', '2026-08-04T10:00:00.000Z'))
+      const role = {
+        name: 'grooming',
+        locator: {
+          source: 'owned' as const,
+          kind: 'role' as const,
+          packageId: 'AbCdefGhij_1',
+          location: { scope: 'personal' as const, spaceId: 'space-personal' },
+        },
+        contextProjectId: null,
+      }
 
-      await expect(persistence.setRole('bob', 'ses_aaaaaaaaaaaa', 'grooming')).resolves.toBeNull()
-      await expect(persistence.setRole('alice', 'ses_aaaaaaaaaaaa', 'grooming')).resolves.toEqual({
+      await expect(persistence.setRole('bob', 'ses_aaaaaaaaaaaa', role)).resolves.toBeNull()
+      await expect(persistence.setRole('alice', 'ses_aaaaaaaaaaaa', role)).resolves.toEqual({
         changed: true,
-        record: expect.objectContaining({ role: 'grooming' }),
+        record: expect.objectContaining({
+          role: 'grooming',
+          roleLocator: role.locator,
+          roleContextProjectId: null,
+        }),
       })
-      await expect(persistence.setRole('alice', 'ses_aaaaaaaaaaaa', 'grooming')).resolves.toEqual({
+      await expect(persistence.setRole('alice', 'ses_aaaaaaaaaaaa', role)).resolves.toEqual({
         changed: false,
-        record: expect.objectContaining({ role: 'grooming' }),
+        record: expect.objectContaining({ roleLocator: role.locator }),
       })
     })
 
@@ -229,8 +245,9 @@ export const describeAgentSessionsContract = (
         }),
       )
       await persistence.insert(row('ses_cccccccccccc', 'alice', '2026-07-02T00:00:00.000Z'))
+      await persistence.insert(row('ses_dddddddddddd', 'bob', '2026-07-01T12:00:00.000Z'))
 
-      await persistence.prune('2026-07-02T00:00:00.000Z')
+      expect(await persistence.prune('2026-07-02T00:00:00.000Z')).toEqual(['alice', 'bob'])
       expect(await persistence.listRecent('alice', '2020-01-01T00:00:00.000Z', 10)).toEqual([
         expect.objectContaining({ id: 'ses_bbbbbbbbbbbb', parentId: null }),
         expect.objectContaining({ id: 'ses_cccccccccccc' }),

@@ -2,9 +2,11 @@ import { compareEvents } from './generators'
 import { getCase } from './registry'
 import { makeRng } from './rng'
 import type {
+  AgentAbilityPreferenceDecl,
   AgentDeltaCursorDecl,
   AgentRoleDecl,
   AgentSessionDecl,
+  AgentSkillDecl,
   CaseEvent,
   CaseWorld,
   ConnectedAppDecl,
@@ -128,6 +130,8 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
   const retrievals: RetrievalDecl[] = []
   const agentSessions: AgentSessionDecl[] = []
   const agentRoles = new Map<string, AgentRoleDecl>()
+  const agentSkills = new Map<string, AgentSkillDecl>()
+  const agentAbilityPreferences = new Map<string, AgentAbilityPreferenceDecl>()
   const agentDeltaCursors: AgentDeltaCursorDecl[] = []
   const jobs: JobDecl[] = []
   const durableImports: DurableImportDecl[] = []
@@ -303,6 +307,39 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
         agentRoles.set(key, role)
       }
     }
+    // A skill declaration carries no logical note handle either: it addresses a HOME
+    // (personal/space) and names roles by the name in the case file, which merge keeps
+    // stable — so, exactly like roles above, the decls pass through unchanged and dedup
+    // by placement + name, first wins. Declaration ORDER survives inside each case, so
+    // a `role-dependency` skill still follows the role that installed it, and a
+    // `renameTo`/`linkedRole`/`deleted` operation still applies to its own package.
+    for (const skill of world.agentSkills ?? []) {
+      const home = skill.home
+      const key =
+        home.kind === 'personal'
+          ? `personal\0${home.user ?? ''}\0${skill.name}`
+          : `space\0${home.space}\0${skill.name}`
+
+      if (!agentSkills.has(key)) {
+        agentSkills.set(key, skill)
+      }
+    }
+    // Preferences address abilities, not notes, so nothing here is namespaced; two
+    // cases naming the same owner and the same ability are one row, first wins.
+    for (const preference of world.agentAbilityPreferences ?? []) {
+      const ability = preference.ability
+      const placement =
+        ability.source === 'system'
+          ? 'system'
+          : ability.kind === 'role'
+            ? JSON.stringify(ability.target)
+            : JSON.stringify(ability.home)
+      const key = `${preference.user ?? ''}\0${ability.source}\0${ability.kind}\0${ability.name}\0${placement}`
+
+      if (!agentAbilityPreferences.has(key)) {
+        agentAbilityPreferences.set(key, preference)
+      }
+    }
     // Cursor declarations reference both a session and a journalled note by logical
     // id; namespace both exactly like their source declarations.
     for (const cursor of world.agentDeltaCursors ?? []) {
@@ -363,6 +400,10 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
     ...(retrievals.length ? { retrievals } : {}),
     ...(agentSessions.length ? { agentSessions } : {}),
     ...(agentRoles.size ? { agentRoles: [...agentRoles.values()] } : {}),
+    ...(agentSkills.size ? { agentSkills: [...agentSkills.values()] } : {}),
+    ...(agentAbilityPreferences.size
+      ? { agentAbilityPreferences: [...agentAbilityPreferences.values()] }
+      : {}),
     ...(agentDeltaCursors.length ? { agentDeltaCursors } : {}),
     ...(jobs.length ? { jobs } : {}),
     ...(durableImports.length ? { durableImports } : {}),

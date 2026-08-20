@@ -11,8 +11,10 @@
 
 import type {
   Author,
+  AuthoredAttachment,
   CreateNoteRequest,
   IfExists,
+  OwnedAbilityLocator,
   Preview,
   SaveResponse,
   TreeFolder,
@@ -92,6 +94,8 @@ export type NoteDetailView = {
   filePath?: string
   /** Read-only mount class (#78): distinguishes user docs from agent-memory. */
   class?: WireNoteDetail['class']
+  agentKind?: WireNoteDetail['agentKind']
+  documentTitle?: WireNoteDetail['documentTitle']
   /** The editable display slug (#100 phase 1) — the reader prefills the slug field
    *  from it and the page canonicalises the URL to `/n/<id>/<slug>`. Absent when the
    *  note has no custom slug. */
@@ -129,6 +133,8 @@ export const noteDetailView = (d: WireNoteDetail): NoteDetailView => ({
   title: d.title,
   filePath: d.filePath,
   class: d.class,
+  agentKind: d.agentKind,
+  documentTitle: d.documentTitle,
   slug: d.slug,
   aliases: d.aliases,
   content: d.content,
@@ -265,6 +271,16 @@ export type SaveInput = {
   /** No `title` since #156: the title is the document's leading `# H1`, carried in
    *  `content`. The server derives it at the write chokepoint. */
   content?: string
+  /** The package's machine name, carried for PUBLICATION only (the create-ability
+   *  endpoints mint the key from it). It is not a note-wire field: the name is
+   *  fixed at publication, so no note save can rename a package. */
+  name?: string
+  /** The Agent Skill manifest description. */
+  description?: string
+  /** Exact authored Role attachment replacement. Omitted unless the ordered
+   *  list changed, so an unrelated instruction save preserves invalid raw rows. */
+  abilityLocator?: Extract<OwnedAbilityLocator, { kind: 'role' }>
+  attachments?: AuthoredAttachment[]
   directory?: string
   noteType?: string
   tags?: string[] | string
@@ -289,6 +305,7 @@ export type SaveInput = {
 
 export const createInputToWire = (i: SaveInput): CreateNoteRequest => ({
   content: i.content,
+  description: i.description,
   directory: i.directory,
   noteType: i.noteType,
   tags: i.tags,
@@ -299,6 +316,9 @@ export const createInputToWire = (i: SaveInput): CreateNoteRequest => ({
 
 export const updateInputToWire = (i: SaveInput): UpdateNoteRequest => ({
   content: i.content,
+  description: i.description,
+  abilityLocator: i.abilityLocator,
+  attachments: i.attachments,
   directory: i.directory,
   noteType: i.noteType,
   tags: i.tags,

@@ -91,6 +91,34 @@
       "checksum": "sha256:bfc46f505b4178d01a83404e2658457b9ca3623fd974e5b6f5e5e0b2b4452fe5",
       "sqlite": "sqlite/0012_identity_settlement_lineage.sql",
       "postgres": "postgres/0012_identity_settlement_lineage.sql"
+    },
+    {
+      "version": 13,
+      "name": "agent_session_role_identity",
+      "checksum": "sha256:d2917a0459b36aac0e8fd4317eb34591f82d11ac8de2193f66688237832a8b5a",
+      "sqlite": "sqlite/0013_agent_session_role_identity.sql",
+      "postgres": "postgres/0013_agent_session_role_identity.sql"
+    },
+    {
+      "version": 14,
+      "name": "ability_availability",
+      "checksum": "sha256:ff5693b24e7f9868fe955bd649be989b2f19839e18ec8bf8fbc36145709e6b8b",
+      "sqlite": "sqlite/0014_ability_availability.sql",
+      "postgres": "postgres/0014_ability_availability.sql"
+    },
+    {
+      "version": 15,
+      "name": "ability_preferences",
+      "checksum": "sha256:9af80d73170a70b75a8cdc4c1e70d1af55ffc1addda536293e106fb818d67840",
+      "sqlite": "sqlite/0015_ability_preferences.sql",
+      "postgres": "postgres/0015_ability_preferences.sql"
+    },
+    {
+      "version": 16,
+      "name": "ability_placement_trail",
+      "checksum": "sha256:067b1558e50f3a378e8615f0485e332afc36f4817048191235e41583ea12d6f2",
+      "sqlite": "sqlite/0016_ability_placement_trail.sql",
+      "postgres": "postgres/0016_ability_placement_trail.sql"
     }
   ]
 }

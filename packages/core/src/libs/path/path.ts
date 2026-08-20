@@ -1,5 +1,5 @@
 import { pathHash } from '../hash'
-import { isDurableScalar } from '../id'
+import { isDurableScalar, isGeneratedNoteId } from '../id'
 import { idToSlug, legacyNameKey, nameKey, slugify } from '../slug'
 import { CLIPPED_NAME_TAG_BYTES, FOLDER_PAGE_FILENAME, NOTE_BASENAME_MAX_BYTES } from './consts'
 
@@ -32,6 +32,20 @@ export const skillPackagePathOf = (filePath: string): string | null => {
   return parts.length >= 2 && parts[0] ? parts[0] : null
 }
 
+/** Placement root for one mount-relative skill package resource. Personal/space
+ * packages share the mount root; project packages share their encoded project
+ * root. null means the address is not inside a canonical package. */
+export const skillPlacementPathOf = (filePath: string): string | null => {
+  const packagePath = skillPackagePathOf(filePath)
+
+  if (packagePath == null) {
+    return null
+  }
+  const parts = packagePath.split('/')
+
+  return parts[0] === '_projects' ? parts.slice(0, 2).join('/') : ''
+}
+
 export const isSkillPackageRootPath = (filePath: string): boolean => {
   const packagePath = skillPackagePathOf(filePath)
   return packagePath != null && filePath === `${packagePath}/SKILL.md`
@@ -49,9 +63,11 @@ export const folderPageFilePath = (folderPath: string): string =>
 
 /** Exact operation-owned staging directory name used while publishing a package. */
 export const isAtomicInstallTempName = (name: string): boolean =>
-  /^\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.install-[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(
-    name,
-  )
+  (() => {
+    const match = /^\.(.+)\.install-([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})$/i.exec(name)
+
+    return Boolean(match && isGeneratedNoteId(match[1]))
+  })()
 
 /** A staging path is reserved only at a Personal/Space library root or at the
  * exact `_projects/<encoded-id>` root. Same-looking package resources are data. */

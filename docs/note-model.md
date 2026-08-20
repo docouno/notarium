@@ -39,7 +39,7 @@ and cannot be shadowed by compatibility data.
 | `user-doc` | tree/feed/search, freely organized by the user | user (UI) + `create_note` | default `type` + the project folder by handle; escape `path?`/`type?`/`tags?` |
 | `agent-memory` | personal domain + a project subdirectory (#13), as a separate section | `remember_about_user` + `remember_about_project` (memory about the user/project) | `category` → category-file; frontmatter `summary` → derived-index |
 | `profile` (#159) | HIDDEN from ALL discovery surfaces (tree/graph/feed/search); access only via Settings → Profile + the agent's `start_session` (by id) | `PUT /api/me/profile` (the user writes about themselves) | a singleton in the `.notarium/profile` mount; `type:person`, the `always-load` tag; human content, NOT agent memory (provenance — the user) |
-| `skill` (#307) | hidden from generic tree/graph/feed/search/recall; visible through Agents → Roles and role resolution only | the human `Add` flow (editing follows in #309) | valid Agent Skills packages in `.notarium/skills`; Personal/Space at the mount root, Project under reserved `_projects/<encoded-project-id>/`; Markdown members participate in current note versioning/replication, while auxiliary bytes are retained verbatim and included in `scope=all` export/data backup but remain outside the note journal |
+| `skill` (#307/#309) | hidden from generic tree/graph/feed/search/recall; visible through Agents → Abilities and role resolution | the human Add/New Role/Skill flows through exact Ability routes | valid ID-backed Agent Skills packages in `.notarium/skills`; roles may live in Personal/Space/Project libraries, while skills have only Personal/Space homes and Space availability lives in the meta-DB; Markdown members participate in current note versioning/replication, while auxiliary bytes are retained verbatim and included in `scope=all` export/data backup but remain outside the note journal |
 
 **The write-intent trio (#13)** — the agent does **not choose** the class/folder/space (poka-yoke), the tool imposes it:
 - `create_note` → class `user-doc` (knowledge into the project tree by handle `(space, slug)` + `path`);
@@ -50,33 +50,118 @@ _(#13, 2026-06-17: the name `remember_about_project` was RECLAIMED for memory; t
 
 ### Roles and skills <a id="roles-and-skills"></a>
 
-A skill is a portable, bounded Agent Skills package: `<name>/SKILL.md` plus optional
-`scripts/`, `references/`, and `assets/`. Add copies every member: auxiliary files remain
-byte-identical, while `SKILL.md` is rewritten with immutable built-in provenance. The server never
-executes scripts, and role activation progressively loads only the Markdown instructions. A role is the
-same valid package with
-`metadata.notarium.kind: role`; `metadata.notarium.skills` links its supporting packages by wiki
-name. The packaged catalog is a separate read-only source. It is not a scope and is never loaded by
-an agent until a human explicitly copies a template into an owned library. Copying records origin
-and catalog revision, but produces an independent fork: no catalog update overwrites it.
-Agents → Roles exposes a read-only detail for both sources: the complete role instructions and
-the supporting skills loaded with it. The list description remains discovery metadata; it is not
-a substitute for the package body. Editing an owned fork is a separate capability (#309).
+A skill is a portable, bounded Agent Skills package: `<note-id>/SKILL.md` plus optional
+`scripts/`, `references/`, and `assets/`. The package directory is immutable storage identity;
+the manifest `name` is editable discovery metadata. Add copies every member:
+auxiliary files remain byte-identical, while `SKILL.md` is rewritten with the same `notarium-id`
+and immutable Catalog provenance. The server never executes scripts, and role activation
+progressively loads only the Markdown instructions. A role is the same valid package with
+`metadata.notarium.kind: role`. Every package has one source: `System`, `Catalog`, or `Owned`.
+System packages are immutable, effective by default, and use exact System dependency locators.
+Catalog packages are immutable templates only: they are neither effective nor toggleable.
+Catalog templates link supporting packages by wiki name; Add rewrites those links to Owned
+locators carrying placement + exact package id + a readable label. The label is never a lookup
+key. Copying records origin and catalog revision, but produces an independent Owned fork: no
+Catalog update overwrites it.
+Agents → Abilities exposes exact read-only System, Catalog and Owned detail routes: the complete
+instructions and, for roles, the supporting skills loaded with them. The central Roles/Skills
+libraries are owner-global and searchable; the Agents Explorer is a separate current-Space
+projection grouped by System, Personal, Space, Project (Roles only), and Catalog. A Project group
+holds only roles that have no Space base — a version never forms a group, because it is not a role
+of its own. Home,
+availability, and project remain server-side facets. An Owned package opens through
+`/agents/abilities/<roles|skills>/owned/:locator`; System and Catalog use their source-specific
+package-id routes. New authoring lives at `/agents/abilities/<roles|skills>/new/<draft-id>` and
+publishes before replacing that URL with the returned exact Owned route. Subsequent Owned edits
+use the common note-id + version-token write path; the ability surface omits generic note metadata
+and changes only manifest identity, instructions, and (for Roles) the authored attachment list.
+A generic note/history/trash reference remains `/n/<note-id>`—there is no
+parallel `/skill` resolver. Create and Add return only
+after the common note projection can read the returned exact id, so immediate navigation cannot
+land on a transient 404. Hidden package notes never enter the generic explorer tree, favorites, or
+mount-path breadcrumbs. The list description remains discovery metadata; it is not a substitute
+for the package body. In Trash, a package root keeps its manifest name even when its authored body
+has no heading; single and bulk restore use that same package-aware Trash projection.
 
-Owned resolution is by package name: `Project > Space > Personal`. Personal means private to the
-user across projects; Space means shared inside one space; Project is the narrowest. There is no
-mutable global scope and no stored enable flag: presence in an owned scope means effective, while
-the one role selected in a durable agent episode is separately called active. No selection means
-base mode, not a synthetic base role.
+Roles retain Personal/Space/Project placement and effective name precedence
+`Owned Project > Owned Space > Owned Personal > System`; package members and persisted Owned/System
+links never resolve a target by name. Catalog never participates in effective resolution.
+Skills instead have one identity in a Personal or Space home. Personal is private and available
+across the owner's project contexts. Every Space-homed ABILITY — role or skill — has one durable
+availability policy: `all-projects` or a set of stable project-id bindings. A selected-project
+ability can therefore be effective in A and B but absent in C without copying or forking its
+package, which is what a role needed in two projects out of five has instead of a second copy.
+An absent policy row is read per kind: a Space skill defaults to nothing selected (a dependency is
+opted into), a Space role to `all-projects` (that is what a Space role meant before the policy
+existed, so the setting arrives with no data migration). Availability only ever decides inside a
+project context: outside one a Space ability is not a candidate at all, and Personal has no
+projects to select from. Project-owned skill packages are not a compatibility path. Public ability locators carry source + kind + immutable
+package id; an Owned locator additionally carries stable space id and, for Project roles, stable
+project id.
+
+A Project role is a VERSION of the role its Space base shares a name with, not a second role.
+Listings therefore collapse the pair into one entry: the base carries the identity and the versions
+hang off it as `{ projectId, locator }`, counted once in `filteredTotal` and reachable by their own
+exact locator. A version overrides its base inside its project and is self-sufficient there — it
+was created by an explicit act for that project, so the base's availability is not a permission it
+asks for. A project role with NO base of that name is not a version of anything: it is an independent role that happens to share a name across projects, so each stays its own entry named by the project it lives in — collapsing those would have to elect an arbitrary one to stand for the rest and would hide the others. Two
+operations replace copying: fork a base into a project version (same name, the base's body and
+attachments as a starting point, its own package address), and RELOCATE a project role up to the
+Space home of the space it already lives in. Only the first is an action, because it creates
+something. The second is not a command at all: where a role's package sits follows from how far it
+reaches, and covering anything other than exactly its own project is something only a Space home can
+do — so a project role given a wider reach relocates on the way through the document's ordinary save.
+Up is the ONE direction the model has. The request carries a single destination (`{ scope: 'space' }`,
+so no other target is expressible), and the service — not the route — refuses everything else, from
+one reading of the locator: a placement that is not a project one has nothing above it, and a
+personal space has no Space root to be lifted into, because there Personal and the Space root are
+one directory. There is no Space → project and no
+project → project relocation, and a skill, having no project placement, has nothing to relocate. It
+is refused before anything moves when the destination name is taken, which is exactly the case of a
+version whose base carries that name above it: a base and its version may share a name only while
+they sit in different placements, and neither merging nor overwriting is an answer the user could
+have meant. The package directory moves inside the same Space, so the package address survives it —
+and because placement is part of a role's address, so must every durable pointer keyed by it: the
+context target `(scope, owner id, package id)`, the owner's `(owner, locator)` preference row and a
+live episode's `role_locator` move in one meta-DB transaction. The role keeps exactly the reach it
+had — the one project it served, written as that single selection, never the Space-wide default,
+because a relocation must not widen what a role applies to. If the pointer transaction fails the
+package is put back and the previous reach restored — but only together: reach describes where the
+package IS, so undoing it while the package could not be returned would leave a role standing at the
+Space root with an absent reach row, which READS as all-projects. A failed relocation must not widen
+what a role applies to any more than a successful one may. Personal ↔ Space is deliberately not offered: it is a move between spaces, which the note
+engine has no operation for. When it arrives it must also carry the availability row and re-ask the
+reach, since project ids do not survive the crossing.
+
+Role health is a fact about a (role, project) pair, not about a role: an attachment that a Space
+skill's availability withholds from project B leaves the role healthy in A and unhealthy in B, and
+an unhealthy role fails closed at activation there. Persisted role attachments retain their exact System/Owned token, authored order, and
+duplicates. Malformed exact-looking tokens remain visible as `invalid-locator` rather than
+disappearing. An ordinary manifest/instructions save leaves the attachment metadata entry
+untouched; a changed attachment list is validated against the exact Role placement and replaces
+only `metadata.notarium.skills` inside the same CAS write. Existing malformed raw tokens may be
+preserved or explicitly detached but never newly introduced. Role health classifies each
+attachment as `healthy`, `missing`, `disabled`,
+`unavailable`, `invalid-locator`, or `wrong-kind`; an enabled unhealthy Owned role blocks lower
+same-name fallbacks and cannot activate.
+
+System and Owned enabled state is an owner-scoped sparse override in the meta-DB: absence means
+enabled and a row means disabled. Disabling a more-specific Owned role reveals the next enabled
+fallback; Catalog has no preference row. Owned overrides survive a reversible soft delete, then
+are removed with permanent note or Space purge. The one role selected in a durable agent episode is
+separately called active. No selection means base mode, not a synthetic base role.
 An active named episode fork inherits its parent's selected role; a brand-new episode starts in
-base mode. Resolution is repeated on hydration, so the inherited name may pick a newer narrower
-owned fork in the new project context.
+base mode. The episode stores both the public name and its exact placement/package pair. Hydration
+in the same project context reopens that exact package across rename. A changed project context or
+missing exact package degrades to base mode instead of rebinding by name to a same-name replacement.
 
 Each owned role placement may also carry a context preset: ordered pins and context sets stored in
-the meta-DB against `(placement scope, stable owner id, role name)`. The preset belongs to the owned
+the meta-DB against `(placement scope, stable owner id, role package id)`. The preset belongs to the owned
 copy; a catalog template has none and is never effective before Add. Same-name Personal, Space, and
 Project copies therefore keep independent presets, and the exact placement selected for the role
-body selects the preset too. At session load it is the most-specific layer under the existing
+body selects the preset too. The Context UI previews and mutates this preset by the encoded exact
+Owned Role locator; names are labels only and cannot rebind a stale bookmark to a same-name copy.
+At session load it is the most-specific layer under the existing
 Personal/Project budget (`Role → Project → Personal`), not a separate allowance. It adds no grants
 and no role-scoped memory, delta, or index. Without a meta-DB the file-first role package and its
 instructions still work; only the preset and durable session selection degrade away (P5).

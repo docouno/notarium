@@ -42,7 +42,7 @@ import { EditorMeta } from '../../widgets/EditorMeta'
 import { FeedAside } from '../../widgets/FeedAside'
 import { HistoryTimeline, RevisionView } from '../../widgets/NoteHistory'
 import { Breadcrumbs } from '../Breadcrumbs'
-import { PageFrame } from '../PageFrame'
+import { PageFrame, TopbarActionSeparator } from '../PageFrame'
 import { FEED_LAYOUT } from './consts'
 import { buildTrail } from './helpers/breadcrumbs'
 import { useEditorPreview } from './hooks/useEditorPreview'
@@ -129,6 +129,9 @@ export const DocumentLayout = () => {
     !isEditing && virtualFolderPath
       ? tree?.folders.find((f) => f.path === virtualFolderPath && !f.pageNoteId)
       : undefined
+  const canWriteDocument =
+    canWrite ||
+    (note?.class === NOTE_CLASS.skill && personalSpace != null && note.space === personalSpace.slug)
 
   // The cross-cutting search (#190) lives CENTRED in the shared topbar on every
   // document page (Home / Feed / note / files), bar-anchored so it never drifts.
@@ -161,7 +164,7 @@ export const DocumentLayout = () => {
   )
 
   const trail = buildTrail({ note, virtualFolder, feedActive, tree, space })
-  const crumbs = <Breadcrumbs trail={trail} />
+  const crumbs = <Breadcrumbs trail={trail} spaceLess={note?.class === NOTE_CLASS.skill} />
 
   // «Pin to agent context» (#165): membership in always-load. Shown only where the
   // pin has a target the agent's scan reaches (the personal domain or a marked
@@ -182,7 +185,7 @@ export const DocumentLayout = () => {
   const notePinned = isPinned(note?.frontmatter)
   const folderOverview = !!note?.filePath && isFolderPageNote(note.filePath)
   const pinnable =
-    canWrite &&
+    canWriteDocument &&
     canPinNote({
       noteSpace: note?.space,
       noteFolder: noteFolderOf(note?.filePath),
@@ -215,21 +218,26 @@ export const DocumentLayout = () => {
           Hidden for agent-memory notes (#42): favorites resolve within the active
           space's store, but a personal-memory note keeps chrome on the space being
           audited, so a favorite there would 404 — don't offer an always-failing star. */}
-      {reading && note && !historySel && !deletedNote && note.class !== NOTE_CLASS.agentMemory && (
-        <Button
-          variant="ghost"
-          icon
-          active={isFavorite}
-          title={isFavorite ? 'Remove from favorites' : 'Add to favorites'}
-          aria-label={isFavorite ? 'Remove from favorites' : 'Add to favorites'}
-          aria-pressed={isFavorite}
-          data-testid="note-favorite"
-          onClick={toggleFavorite}
-        >
-          {isFavorite ? <IconStarFilled size={15} /> : <IconStar size={15} />}
-        </Button>
-      )}
-      {reading && note && !historySel && !deletedNote && canWrite && (
+      {reading &&
+        note &&
+        !historySel &&
+        !deletedNote &&
+        note.class !== NOTE_CLASS.agentMemory &&
+        note.class !== NOTE_CLASS.skill && (
+          <Button
+            variant="ghost"
+            icon
+            active={isFavorite}
+            title={isFavorite ? 'Remove from favorites' : 'Add to favorites'}
+            aria-label={isFavorite ? 'Remove from favorites' : 'Add to favorites'}
+            aria-pressed={isFavorite}
+            data-testid="note-favorite"
+            onClick={toggleFavorite}
+          >
+            {isFavorite ? <IconStarFilled size={15} /> : <IconStar size={15} />}
+          </Button>
+        )}
+      {reading && note && !historySel && !deletedNote && canWriteDocument && (
         <Button variant="ghost" onClick={startEdit}>
           <IconEdit size={15} /> Edit
         </Button>
@@ -268,7 +276,7 @@ export const DocumentLayout = () => {
           </Button>
           {/* Demoted to reader mid-edit (#111): drop Save (the write); Cancel
               stays so they can leave the editor. saveDraft also root-guards. */}
-          {canWrite && (
+          {canWriteDocument && (
             <Button
               variant="primary"
               onClick={() => void saveDraft(editor.buildPayload())}
@@ -309,7 +317,7 @@ export const DocumentLayout = () => {
           when open it sits in the aside header instead. */}
       {canPanel && !asideOpen && (
         <>
-          <span className={styles.actionSep} />
+          <TopbarActionSeparator />
           {panelToggle}
         </>
       )}
@@ -407,7 +415,7 @@ export const DocumentLayout = () => {
             source={historySource}
             revision={historySel.revision}
             isLatest={historySel.isLatest}
-            restorable={canWrite}
+            restorable={canWriteDocument}
             onBack={() => setHistorySel(null)}
             onRestored={() => {
               setHistorySel(null)
@@ -455,7 +463,7 @@ export const DocumentLayout = () => {
                   },
                 ]
               : []),
-            ...(canWrite
+            ...(canWriteDocument
               ? [
                   { divider: true },
                   {

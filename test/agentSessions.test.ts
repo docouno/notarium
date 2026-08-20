@@ -22,6 +22,69 @@ const ids = (...values: string[]): (() => string) => {
 }
 
 describe('agent sessions service', () => {
+  it('nudges the owner after committed session mutations, never on misses', async () => {
+    const persistence = new InMemoryAgentSessions()
+    const changed: string[] = []
+    const sessions = createAgentSessions({
+      persistence,
+      mintId: ids('ses_aaaaaaaaaaaa'),
+      onChange: (owner) => changed.push(owner),
+    })
+
+    expect(await sessions.attach('alice')).toBeNull()
+    await expect(sessions.attach('alice', 'ses_missing00000')).rejects.toBeInstanceOf(
+      NoSuchAgentSessionError,
+    )
+    expect(changed).toEqual([])
+
+    const started = await sessions.start('alice', { name: 'work' }, 'unused')
+    await sessions.attach('alice', started.session?.record.id)
+    await sessions.setRole(started.session!, {
+      name: 'grooming',
+      locator: {
+        source: 'owned',
+        kind: 'role',
+        packageId: 'AbCdefGhij_1',
+        location: { scope: 'personal', spaceId: 'personal-a' },
+      },
+      contextProjectId: null,
+    })
+
+    expect(changed).toEqual(['alice', 'alice', 'alice'])
+  })
+
+  it('nudges every owner whose expired sessions are pruned before an early exit', async () => {
+    const persistence = new InMemoryAgentSessions()
+    persistence.seed([
+      {
+        id: 'ses_aliceold000',
+        owner: 'alice',
+        name: 'old work',
+        named: true,
+        parentId: null,
+        createdAt: '2026-06-01T00:00:00.000Z',
+        lastSeenAt: '2026-06-01T00:00:00.000Z',
+        calls: 1,
+        role: null,
+        roleLocator: null,
+        roleContextProjectId: null,
+      },
+    ])
+    const changed: string[] = []
+    const sessions = createAgentSessions({
+      persistence,
+      now: () => new Date('2026-08-04T12:00:00.000Z'),
+      onChange: (owner) => changed.push(owner),
+    })
+
+    await expect(
+      sessions.start('bob', { id: 'ses_missing00000' }, 'unused'),
+    ).rejects.toBeInstanceOf(NoSuchAgentSessionError)
+
+    expect(persistence.snapshot()).toEqual([])
+    expect(changed).toEqual(['alice'])
+  })
+
   it('attaches explicitly or only to exactly one active owner session', async () => {
     const persistence = new InMemoryAgentSessions()
     let now = new Date('2026-08-04T12:00:00.000Z')
@@ -87,7 +150,16 @@ describe('agent sessions service', () => {
       state: AGENT_SESSION_STATE.new,
       record: { id: 'ses_bbbbbbbbbbbb', named: true, parentId: null },
     })
-    await sessions.setRole(named.session!, 'grooming')
+    await sessions.setRole(named.session!, {
+      name: 'grooming',
+      locator: {
+        source: 'owned',
+        kind: 'role',
+        packageId: 'AbCdefGhij_1',
+        location: { scope: 'personal', spaceId: 'personal-a' },
+      },
+      contextProjectId: null,
+    })
     const fork = await sessions.start('alice', { name: 'work' }, 'unused')
     expect(fork.session).toMatchObject({
       state: AGENT_SESSION_STATE.forked,
@@ -96,6 +168,13 @@ describe('agent sessions service', () => {
         parentId: 'ses_bbbbbbbbbbbb',
         name: 'work',
         role: 'grooming',
+        roleLocator: {
+          source: 'owned',
+          kind: 'role',
+          packageId: 'AbCdefGhij_1',
+          location: { scope: 'personal', spaceId: 'personal-a' },
+        },
+        roleContextProjectId: null,
       },
     })
     const ambiguous = await sessions.start('alice', { name: 'work' }, 'unused')
@@ -152,6 +231,8 @@ describe('agent sessions service', () => {
         lastSeenAt: '2026-07-10T00:00:00.000Z',
         calls: 1,
         role: null,
+        roleLocator: null,
+        roleContextProjectId: null,
       },
       {
         id: 'ses_bbbbbbbbbbbb',
@@ -163,6 +244,8 @@ describe('agent sessions service', () => {
         lastSeenAt: '2026-07-11T00:00:00.000Z',
         calls: 1,
         role: null,
+        roleLocator: null,
+        roleContextProjectId: null,
       },
       ...Array.from({ length: 10 }, (_, index) => ({
         id: `ses_recent0000${index}`,
@@ -174,6 +257,8 @@ describe('agent sessions service', () => {
         lastSeenAt: `2026-08-04T0${index}:00:00.000Z`,
         calls: 1,
         role: null,
+        roleLocator: null,
+        roleContextProjectId: null,
       })),
     ])
     const sessions = createAgentSessions({
@@ -205,6 +290,8 @@ describe('agent sessions service', () => {
           lastSeenAt: '2026-08-04T12:00:00.000Z',
           calls: 1,
           role: null,
+          roleLocator: null,
+          roleContextProjectId: null,
         },
         {
           id: 'ses_parent00000',
@@ -216,6 +303,8 @@ describe('agent sessions service', () => {
           lastSeenAt: '2026-08-04T12:00:00.000Z',
           calls: 1,
           role: null,
+          roleLocator: null,
+          roleContextProjectId: null,
         },
       ]),
     ).toThrow(/parent agent session/)

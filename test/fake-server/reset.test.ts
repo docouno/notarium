@@ -70,6 +70,8 @@ const withAuditSession = (value: Fixture): Fixture => ({
       lastSeenAt: '2026-06-10T10:00:00.000Z',
       calls: 1,
       role: null,
+      roleLocator: null,
+      roleContextProjectId: null,
     },
   ],
 })

@@ -81,6 +81,31 @@ const observeLegacyName = (state: NoteState): void => {
   }
 }
 
+const projectMemoryPath = (world: CaseWorld, event: Extract<CaseEvent, { op: 'create' }>) => {
+  if (!event.projectMemory) {
+    return event.path
+  }
+  const project = world.projects?.find(
+    (candidate) =>
+      candidate.space === event.projectMemory!.space &&
+      candidate.path === event.projectMemory!.path,
+  )
+
+  if (!project || event.space !== project.space) {
+    throw new Error(
+      `project memory references an unknown project: ${event.projectMemory.space}/${event.projectMemory.path}`,
+    )
+  }
+  if (event.class !== 'agent-memory' || !event.path.startsWith('.notarium/memory/')) {
+    throw new Error(`project memory note must use the agent-memory mount: ${event.path}`)
+  }
+  const lastSegment = project.path.replace(/\/+$/, '').split('/').pop()
+  const slug = project.slug || lastSegment || project.space
+  const projectId = `proj-${project.space}-${slug}`
+
+  return event.path.replace('.notarium/memory/', `.notarium/memory/${projectId}/`)
+}
+
 const carriedNames = (
   frontmatter: string | undefined,
 ): { aliases: string[]; slug: string | undefined } => {
@@ -320,7 +345,7 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
       const state: NoteState = {
         id: e.physicalId ?? deterministicNoteId(e.path),
         space: e.space,
-        path: e.path,
+        path: projectMemoryPath(world, e),
         title: e.title,
         content: e.content,
         tags: e.pin ? [...(e.tags ?? []), 'always-load'] : e.tags,
@@ -592,7 +617,24 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
       lastSeenAt: new Date(now - session.lastSeenDaysAgo * 86_400_000).toISOString(),
       calls: session.calls,
       role: session.role ?? null,
+      // A package id is minted when the package is published, which happens in the
+      // applier rather than in this projection. The applier resolves the exact locator
+      // from `role` once the packages exist, the way the real seeder does.
+      roleLocator: null,
+      roleContextProjectId: null,
     }))
 
-  return { now: world.now, spaces, projects, auth, agentSessions, agentRoles: world.agentRoles }
+  return {
+    now: world.now,
+    spaces,
+    projects,
+    auth,
+    agentSessions,
+    agentRoles: world.agentRoles,
+    agentSkills: world.agentSkills,
+    // Carried verbatim, like the package declarations beside it: a preference row
+    // addresses a package by the NAME the case wrote and the placement it asked for,
+    // and the exact id it resolves to is minted by the applier at publish time.
+    agentAbilityPreferences: world.agentAbilityPreferences,
+  }
 }

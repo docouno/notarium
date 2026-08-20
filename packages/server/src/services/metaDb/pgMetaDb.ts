@@ -5,6 +5,9 @@ import pg from 'pg'
 
 import { CAUSAL_BARRIER_KIND } from '@notarium/core'
 
+import { createAbilityAvailabilityFacet } from './drivers/pg/abilityAvailability'
+import { createAbilityPlacementFacet } from './drivers/pg/abilityPlacement'
+import { createAbilityPreferencesFacet } from './drivers/pg/abilityPreferences'
 import { createAgentDeltaCursorsFacet } from './drivers/pg/agentDeltaCursors'
 import { createAuthFacet } from './drivers/pg/auth'
 import { lockCausalBarriers } from './drivers/pg/causalBarriers'
@@ -195,7 +198,7 @@ export class PgMetaDb implements MetaDb {
       // The row lock serializes this decision with archive/rename and with purge's
       // matching lock. If grant wins, a later purge removes the new membership;
       // if purge/archive wins, this transaction refuses without writing.
-      // eslint-disable-next-line no-restricted-syntax -- outside the note-identity hierarchy: the space row, shared only with purge's matching lock
+      // eslint-disable-next-line no-restricted-syntax -- outside the ladder: the space row, and this transaction takes nothing else
       const result = await client.query('SELECT * FROM spaces WHERE id = $1 FOR UPDATE', [spaceId])
       const row = result.rows[0] as SpaceRow | undefined
 
@@ -304,7 +307,11 @@ export class PgMetaDb implements MetaDb {
       // Serialize child cleanup with recovery grant. Without this early row lock,
       // purge could delete memberships, wait on the final space delete, then leave
       // a concurrent late grant orphaned after passing the cleanup point.
-      // eslint-disable-next-line no-restricted-syntax -- outside the note-identity hierarchy: the space row, shared only with grant's matching lock
+      //
+      // It is HELD from here to COMMIT, across L4f and the ability tables below it,
+      // and that is what makes `spaces` a table no foreign key may point at: a key
+      // would have a tier-4 writer take this same row implicitly, from underneath.
+      // eslint-disable-next-line no-restricted-syntax -- outside the ladder: the space row, which no foreign key may point at (lockOrder: NO_FOREIGN_KEY_MAY_POINT_AT)
       await client.query('SELECT id FROM spaces WHERE id = $1 FOR UPDATE', [spaceId])
       await client.query(
         `INSERT INTO revision_purge_fences (kind, entity_id, space) VALUES ('space', $1, $1)
@@ -393,7 +400,20 @@ export class PgMetaDb implements MetaDb {
       )
       // The project FK cascades both cursor tables from this parent delete. This
       // preserves the parent-first order used by concurrent session advance.
+      //
+      // BEFORE the ability tables, not after: an availability write share-locks these
+      // same project rows and only then writes the binding, so a purge that took the
+      // ability tables first would close the cycle Postgres breaks with `40P01`. The
+      // binding FK cascades from here too; the explicit delete below still runs, for
+      // the rows keyed by this home Space whose project lives elsewhere.
+      // canon: packages/server/src/services/metaDb/drivers/pg/lockOrder.ts
       await client.query('DELETE FROM folders WHERE space = $1', [spaceId])
+      await client.query('DELETE FROM ability_project_bindings WHERE home_space = $1', [spaceId])
+      await client.query('DELETE FROM ability_availability WHERE home_space = $1', [spaceId])
+      await client.query('DELETE FROM ability_preferences WHERE space_id = $1', [spaceId])
+      // The forwarding rows of this Space go with the overrides they forward: nothing
+      // stands at either end of them any more.
+      await client.query('DELETE FROM ability_placement_trail WHERE space_id = $1', [spaceId])
       await client.query('DELETE FROM space_members WHERE space = $1', [spaceId])
       // Job rows only; on-disk artifacts are swept by the runner's TTL GC (this layer owns no filesystem).
       await client.query('DELETE FROM jobs WHERE space = $1', [spaceId])
@@ -451,6 +471,12 @@ export class PgMetaDb implements MetaDb {
   readonly scopePins = createScopePinsFacet(this.ctx)
 
   readonly contextOrder = createContextOrderFacet(this.ctx)
+
+  readonly abilityAvailability = createAbilityAvailabilityFacet(this.ctx)
+
+  readonly abilityPreferences = createAbilityPreferencesFacet(this.ctx)
+
+  readonly abilityPlacement = createAbilityPlacementFacet(this.ctx)
 
   readonly retrievalLog = createRetrievalLogFacet(this.ctx)
 

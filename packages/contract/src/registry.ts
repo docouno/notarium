@@ -1,4 +1,15 @@
 import { ErrorResponseSchema, OkResponseSchema } from './schemas/rest/_shared'
+import {
+  AgentAbilityDetailResponseSchema,
+  CreateAbilityVersionRequestSchema,
+  CreateAbilityVersionResponseSchema,
+  SetAbilityHomeRequestSchema,
+  SetAbilityHomeResponseSchema,
+  SetAgentAbilityAvailabilityRequestSchema,
+  SetAgentAbilityAvailabilityResponseSchema,
+  SetAgentAbilityEnabledRequestSchema,
+  SetAgentAbilityEnabledResponseSchema,
+} from './schemas/rest/agent/abilities'
 import { AgentAuditQuerySchema, AgentAuditResponseSchema } from './schemas/rest/agent/audit'
 import {
   ContextOrderRequestSchema,
@@ -18,12 +29,13 @@ import {
   ProjectMemoryQuerySchema,
   ProjectMemoryResponseSchema,
 } from './schemas/rest/agent/memory'
+import { AgentPackageLibraryQuerySchema } from './schemas/rest/agent/packageLibrary'
 import { ProfilePutRequestSchema, ProfileResponseSchema } from './schemas/rest/agent/profile'
 import {
   AddAgentRoleRequestSchema,
   AddAgentRoleResponseSchema,
-  AgentRoleDetailRequestSchema,
-  AgentRoleDetailResponseSchema,
+  CreateAgentRoleRequestSchema,
+  CreateAgentRoleResponseSchema,
   MeAgentRolesResponseSchema,
 } from './schemas/rest/agent/roles'
 import {
@@ -32,6 +44,13 @@ import {
   AgentSessionsQuerySchema,
   AgentSessionsResponseSchema,
 } from './schemas/rest/agent/sessions'
+import {
+  AddAgentSkillRequestSchema,
+  AddAgentSkillResponseSchema,
+  CreateAgentSkillRequestSchema,
+  CreateAgentSkillResponseSchema,
+  MeAgentSkillsResponseSchema,
+} from './schemas/rest/agent/skills'
 import {
   AcceptInviteRequestSchema,
   AuthSessionResponseSchema,
@@ -224,12 +243,38 @@ export const contract = {
     request: AgentSessionEventsQuerySchema,
     response: AgentSessionEventsResponseSchema,
   },
-  agentRoles: { response: MeAgentRolesResponseSchema },
-  agentRoleDetail: {
-    request: AgentRoleDetailRequestSchema,
-    response: AgentRoleDetailResponseSchema,
+  agentRoles: { request: AgentPackageLibraryQuerySchema, response: MeAgentRolesResponseSchema },
+  agentAbilityDetail: { response: AgentAbilityDetailResponseSchema },
+  agentAbilityEnabled: {
+    request: SetAgentAbilityEnabledRequestSchema,
+    response: SetAgentAbilityEnabledResponseSchema,
+  },
+  agentAbilityAvailability: {
+    request: SetAgentAbilityAvailabilityRequestSchema,
+    response: SetAgentAbilityAvailabilityResponseSchema,
+  },
+  agentAbilityVersions: {
+    request: CreateAbilityVersionRequestSchema,
+    response: CreateAbilityVersionResponseSchema,
+  },
+  agentAbilityHome: {
+    request: SetAbilityHomeRequestSchema,
+    response: SetAbilityHomeResponseSchema,
   },
   agentRoleAdd: { request: AddAgentRoleRequestSchema, response: AddAgentRoleResponseSchema },
+  agentRoleCreate: {
+    request: CreateAgentRoleRequestSchema,
+    response: CreateAgentRoleResponseSchema,
+  },
+  agentSkills: { request: AgentPackageLibraryQuerySchema, response: MeAgentSkillsResponseSchema },
+  agentSkillCreate: {
+    request: CreateAgentSkillRequestSchema,
+    response: CreateAgentSkillResponseSchema,
+  },
+  agentSkillAdd: {
+    request: AddAgentSkillRequestSchema,
+    response: AddAgentSkillResponseSchema,
+  },
   pinNote: { request: PinNoteRequestSchema, response: PinNoteResponseSchema },
   muteNote: { request: MuteNoteRequestSchema, response: MuteNoteResponseSchema },
   contextSets: { response: ContextSetsResponseSchema },

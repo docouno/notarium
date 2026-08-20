@@ -23,6 +23,20 @@ describe('restoreSummary', () => {
     })
   })
 
+  // A restore the server refuses because the saved copy's own front matter cannot be
+  // rewritten. Without the reason in this surface's vocabulary the row showed the wire
+  // token, which tells the reader nothing they can act on.
+  it('explains a refusal the saved copy itself caused', () => {
+    expect(
+      restoreSummary(1, 0, [
+        { id: 'imported', error: 'not-restorable', reason: 'owner-provenance-conflict' },
+      ]),
+    ).toEqual({
+      tone: 'error',
+      text: 'The saved copy’s front matter can’t be rewritten safely — its Notarium fields are duplicated or malformed.',
+    })
+  })
+
   it('explains how to clear a single occupied restore target', () => {
     expect(
       restoreSummary(1, 0, [

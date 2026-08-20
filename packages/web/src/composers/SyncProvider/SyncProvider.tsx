@@ -55,6 +55,8 @@ export type SyncContextValue = {
    *  a space-level membership change (add/remove/role). The members tab folds this
    *  into its reload key so an open list re-fetches live for ANY viewer. */
   membersRev: number
+  /** Owner-global durable agent-session changes observed on this tab's SSE socket. */
+  agentSessionsRev: number
 }
 
 const SyncContext = createContext<SyncContextValue | null>(null)
@@ -80,9 +82,11 @@ export const SyncProvider = ({ children }: { children: ReactNode }) => {
   const { verify } = useSpaceAccess()
   const [status, setStatus] = useState<SyncStatus | null>(null)
   const [membersRev, setMembersRev] = useState(0)
+  const [agentSessionsRev, setAgentSessionsRev] = useState(0)
   const [connectionRevision, setConnectionRevision] = useState(0)
   const connectionRevisionRef = useRef(0)
   const observationEpochRef = useRef(0)
+  const agentSessionsRevisionRef = useRef(0)
   const listeners = useRef(new Set<Listener>())
   const changes = useRef<Array<{ at: number; count: number }>>([])
 
@@ -156,6 +160,11 @@ export const SyncProvider = ({ children }: { children: ReactNode }) => {
     // just the affected principal (that's the addressed `access` nudge above).
     const onMembers = () => setMembersRev((r) => r + 1)
 
+    const onAgentSessions = () => {
+      agentSessionsRevisionRef.current += 1
+      setAgentSessionsRev(agentSessionsRevisionRef.current)
+    }
+
     // This space's slug changed (#100 phase 4 / #123), renamed from another tab: adopt the
     // new slug live. reloadSpaces re-fetches the list (new slug + the old one in
     // aliases) and rename-follows the active slug; refresh updates `me.spaces` so the
@@ -169,15 +178,27 @@ export const SyncProvider = ({ children }: { children: ReactNode }) => {
       const revisions = advanceConnectionRevisions({
         connectionRevision: connectionRevisionRef.current,
         observationEpoch: observationEpochRef.current,
+        agentSessionsRevision: agentSessionsRevisionRef.current,
       })
 
       connectionRevisionRef.current = revisions.connectionRevision
       observationEpochRef.current = revisions.observationEpoch
+      agentSessionsRevisionRef.current = revisions.agentSessionsRevision
       setConnectionRevision(revisions.connectionRevision)
+      setAgentSessionsRev(agentSessionsRevisionRef.current)
     }
 
     const open = () => {
-      unsub = api.events(space, onEvent, onError, onAccess, onMembers, onRename, onOpen)
+      unsub = api.events(
+        space,
+        onEvent,
+        onError,
+        onAccess,
+        onMembers,
+        onRename,
+        onAgentSessions,
+        onOpen,
+      )
     }
     open()
 
@@ -221,6 +242,7 @@ export const SyncProvider = ({ children }: { children: ReactNode }) => {
         connectionRevision,
         observationEpoch,
         membersRev,
+        agentSessionsRev,
       }}
     >
       {children}

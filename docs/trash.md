@@ -15,6 +15,16 @@ The tombstone append is awaited before `changed` because it is the durable trash
 External remove/add observations share the same per-note fence, so a move cannot leave
 a stale delete on top.
 
+Deleting a `skill` root is a package operation: the complete package directory is atomically
+detached, every Markdown member is tombstoned through the same journal fence, and only then is the
+staged directory destroyed. A failure before completion reattaches it. Trash therefore admits the
+`skill` class and opens its journal snapshot by stable note id at `/n/<note-id>`; Trash does not
+pretend a deleted package still has a live placement locator and does not expose skill packages in
+generic tree/feed/search/graph discovery. Restoring the root republishes a valid `SKILL.md` at its immutable
+package id, while each Markdown auxiliary remains its own tombstone. Non-Markdown resources are
+backed up/exported but are outside the note journal, so package deletion cannot promise to restore
+those bytes from Trash.
+
 The last path lives in the identity registry. `markDeleted` retains the id→path/class
 binding with `deletedAt`, allowing undelete and deleted-note routing without treating
 the removed file as live.
@@ -53,6 +63,17 @@ same terminal transaction as history restore, preserving note-id, class and comp
 last path. A collision never overwrites another note. Exact states rebind only
 receipt-proven storage owners; legacy rows restore their known body/fixed fields;
 unsafe and opaque states fail before publication.
+
+A `skill` package adds one axis the generic path does not have: the manifest name.
+Restoring a package ROOT re-validates the candidate `SKILL.md` against file truth while
+the operation holds the placement lease. A manifest that no longer projects as an Agent
+Skill is `not-restorable` (`invalid-skill-manifest`); a name already claimed in the same
+placement — by another package's directory or by a sibling manifest declaring it — is a
+`conflict` (`skill-name-conflict`), because that name is what a role's link resolves and
+one placement cannot hold two of them. A Markdown AUXILIARY is restorable only under a
+live, valid root: with the root gone the auxiliary is `not-restorable`
+(`skill-package-root-missing`) rather than a loose file republished into the hidden
+mount.
 
 The operation returns `succeeded` (200), `pending` (202), `conflict` (409),
 `not-restorable` (422), or pre-accept `busy` (503). Repeating the same principal,

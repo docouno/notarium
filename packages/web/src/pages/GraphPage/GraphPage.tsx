@@ -7,15 +7,17 @@ import { useNotes } from '../../composers/NotesProvider'
 export const GraphPage = () => {
   const { openNote } = useNotes()
   const { createFromGhost } = useEditing()
-  const { theme, railOpen, toggleRail, graphFocus, setGraphFocus } = useChrome()
+  const { theme, leftPanelOpen, narrowLayout, toggleLeftPanel, graphFocus, setGraphFocus } =
+    useChrome()
   return (
     <main className="main">
       <GraphView
         onOpen={openNote}
         onCreateFromGhost={createFromGhost}
         theme={theme}
-        railOpen={railOpen}
-        onToggleRail={toggleRail}
+        railOpen={leftPanelOpen}
+        railNarrow={narrowLayout}
+        onToggleRail={toggleLeftPanel}
         initialFocusId={graphFocus}
         onFocusConsumed={() => setGraphFocus(null)}
       />

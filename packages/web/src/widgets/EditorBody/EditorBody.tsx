@@ -199,7 +199,7 @@ export const EditorBody = ({
 
   return (
     <>
-      <div className={styles.bodyCol}>
+      <div className={styles.bodyCol} data-testid="editor-body-column">
         <div className={styles.editorBody}>
           {/* The editor stays mounted in Preview (display:none), so its text, undo
               history and cursor all survive the round-trip — only the live getter

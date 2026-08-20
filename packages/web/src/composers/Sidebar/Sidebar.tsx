@@ -25,6 +25,7 @@ import {
   IconFolderPlus,
   IconGraph,
   IconLayers,
+  IconPlus,
   IconRefresh,
   IconSearch,
   IconStar,
@@ -42,12 +43,15 @@ import {
   readDrag,
 } from '../../libs/dnd/dnd'
 import { errorText } from '../../libs/errors'
+import { useMainInert } from '../../libs/hooks/useMainInert'
 import { RAIL_PANEL, usePanelWidth } from '../../libs/hooks/usePanelWidth'
 import {
+  agentAbilityDraftRoute,
   agentsRoute,
   feedRoute,
   folderPageHref,
   graphRoute,
+  isModifiedClick,
   parseAppPath,
   spaceRoute,
   trashRoute,
@@ -67,6 +71,7 @@ import type { NoteView } from '../../libs/wire'
 import { api } from '../../services/api'
 import { SyncButton } from '../../widgets/SyncIndicator'
 import { TreeState, type TreeStatus } from '../../widgets/TreeState'
+import { useAgentsExplorer } from '../AgentsExplorerProvider'
 import { useAuth } from '../AuthProvider'
 import { useChrome } from '../ChromeProvider'
 import { useEditing } from '../EditingProvider'
@@ -79,6 +84,8 @@ import { useSpace } from '../SpaceProvider'
 import { useSpotlight } from '../SpotlightProvider'
 import { useSync } from '../SyncProvider'
 import { useNoteActions } from '../useNoteActions'
+import { AgentsExplorer } from './AgentsExplorer'
+import { AgentsExplorerPicker } from './AgentsExplorerPicker'
 import { RECENT_KEY, ROOT, SCOPE_KEY } from './consts'
 import { dropFolderAt, isFileDrag } from './helpers/drop'
 import { flattenTree } from './helpers/explorerRows'
@@ -86,10 +93,10 @@ import { favoriteBranchPaths, favoriteNoteFolders, favoriteTreeView } from './he
 import { dirOfPath, pathInside } from './helpers/paths'
 import { loadRecent, loadScope } from './helpers/scopeStorage'
 import { seedTopLevel } from './helpers/seedTopLevel'
+import { useDrawerKeyboard } from './hooks/useDrawerKeyboard'
 import { useFolderExport } from './hooks/useFolderExport'
 import { usePanelChrome } from './hooks/usePanelChrome'
 import { useTreeSelection } from './hooks/useTreeSelection'
-import { MemoryTree } from './MemoryTree'
 import { NewButton } from './NewButton'
 import { ProfileButton } from './ProfileButton'
 import { ScopePicker } from './ScopePicker'
@@ -125,7 +132,13 @@ export const Sidebar = () => {
   const spotlight = useSpotlight()
   const { status: syncStatus, changedLastMinute } = useSync()
   const { mode } = useAuth()
-  const { railOpen, toggleRail } = useChrome()
+  const {
+    narrowLayout: narrow,
+    leftPanelOpen: panelVisible,
+    toggleLeftPanel,
+    closeLeftPanel,
+  } = useChrome()
+  const { revealNatural, dataset: agentsDataset } = useAgentsExplorer()
   const { startNew } = useEditing()
   const {
     renameItem,
@@ -156,13 +169,14 @@ export const Sidebar = () => {
   const onGraph = route.kind === 'graph'
   const agentsHome = route.kind === 'agents'
   const memoryNoteOpen = route.kind === 'memoryNote'
+  const agentNoteOpen = memoryNoteOpen
   // Graph, Settings and workspace-Management are chrome-only surfaces: the
   // reader isn't showing a note on them, so the rail must not keep one lit. The
   // route still RETAINS activeId (so "Files" can return to the last note), but
   // the rail's highlight is gated on actually being on a doc surface. Graph
   // already did this; Settings/Management were missed — going to Settings left
   // the previously-open note highlighted in the tree (#94).
-  const onAgents = agentsHome || memoryNoteOpen
+  const onAgents = agentsHome || agentNoteOpen
   const onTrash = route.kind === 'trash'
   const onChromePage =
     onGraph ||
@@ -174,7 +188,11 @@ export const Sidebar = () => {
   // Are we on a face of the merged Files section (#245: feed / folder page / note)?
   // Shared by the rail highlight (railScopeActive) and pickScope (which lands you
   // on the section before applying a file-tree lens), so the two never disagree.
-  const onFilesSection = isFilesSection({ browsing, memoryNoteOpen, navType: nav.type })
+  const onFilesSection = isFilesSection({
+    browsing,
+    memoryNoteOpen: agentNoteOpen,
+    navType: nav.type,
+  })
   const homeHref = spaceRoute(space)
   const feedHref = feedRoute(space)
   const graphHref = graphRoute(space)
@@ -182,6 +200,20 @@ export const Sidebar = () => {
   // The Agents surface (#13) is space-free — its href never carries the active
   // space (the personal domain is the user's, not a project's).
   const agentsHref = agentsRoute()
+  const panelRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (narrow) {
+      closeLeftPanel()
+    }
+  }, [closeLeftPanel, location.pathname, narrow])
+
+  // The narrow panel is a modal drawer: it takes focus and traps Tab, while the
+  // content it covers is held inert through the shared holder (one owner for the
+  // attribute the page frame also holds).
+  useMainInert(narrow && panelVisible)
+
+  useDrawerKeyboard(narrow && panelVisible, panelRef, closeLeftPanel)
 
   // Width + horizontal resize, persisted; clamped to [200px, min(25vw, 520px)].
   // The vw cap mirrors the right aside's 45vw (neither panel may hog the window);
@@ -199,16 +231,10 @@ export const Sidebar = () => {
   // Persisted per space (loadScope), so a focus survives a reload.
   const [scope, setScope] = useState<ExplorerScope>(() => loadScope(space))
   const scopeRef = useRef(scope)
-  // On the Agents surface (#165) the explorer shows the agent-memory TREE instead
-  // of the file tree — derived from the route, not persisted, so leaving Agents
-  // restores the file scope. `scope` holds every file-side view (Files/Projects/
-  // focus/Favorites, #42) and IS persisted, so opening a note keeps the rail on
-  // its scope with no flicker; `effectiveScope` is what the panel renders + the
-  // picker reflects (only Memory overrides it, because Memory is route-driven).
-  const effectiveScope = useMemo<ExplorerScope>(
-    () => (onAgents ? { kind: 'memory' } : scope),
-    [onAgents, scope],
-  )
+  // `scope` holds every file-side view (Files/Projects/focus/Favorites, #42) and
+  // is persisted independently. Agents routes use AgentsExplorerProvider instead,
+  // so their four datasets never overwrite the Files lens.
+  const effectiveScope = scope
   useEffect(() => {
     scopeRef.current = scope
   }, [scope])
@@ -222,10 +248,6 @@ export const Sidebar = () => {
   // through `pickScope` below, which adds the land-on-the-section navigation.
   const chooseScope = useCallback(
     (next: ExplorerScope) => {
-      if (next.kind === 'memory') {
-        navigate(agentsHref)
-        return
-      }
       setScope(next)
       try {
         localStorage.setItem(SCOPE_KEY + space, JSON.stringify(next))
@@ -233,7 +255,7 @@ export const Sidebar = () => {
         /* storage blocked */
       }
     },
-    [space, navigate, agentsHref],
+    [space],
   )
   // A USER-initiated lens pick (the rail star, the scope picker, focus-project). Set
   // the lens, then — if we're NOT already on a face of the merged Files section
@@ -248,7 +270,7 @@ export const Sidebar = () => {
   const pickScope = useCallback(
     (next: ExplorerScope) => {
       chooseScope(next)
-      if (next.kind !== 'memory' && !onFilesSection) {
+      if (!onFilesSection) {
         navigate(feedHref)
       }
     },
@@ -1016,7 +1038,7 @@ export const Sidebar = () => {
   // ref rather than depending on treeRows).
   treeRowsRef.current = treeRows
 
-  const noteOpen = browsing && !memoryNoteOpen && !!activeId
+  const noteOpen = browsing && !agentNoteOpen && !!activeId
   // Files and Favorites are the two EXPLORER-lens rail icons (#42/#245): the rail
   // lights exactly ONE of them, and ONLY while a face of the merged Files section is
   // the subject (feed / folder page / note) — never on the home dashboard (the logo
@@ -1030,7 +1052,7 @@ export const Sidebar = () => {
   // icon always lights where you land — Files and Favorites behave identically.
   const { filesActive, favoritesActive } = railScopeActive({
     browsing,
-    memoryNoteOpen,
+    memoryNoteOpen: agentNoteOpen,
     navType: nav.type,
     scopeKind: effectiveScope.kind,
   })
@@ -1158,7 +1180,7 @@ export const Sidebar = () => {
   // Folders are expand/collapse only (no "selected folder" highlight — clicking a
   // folder just toggles it, à la Obsidian/VS Code). browseFolder still drives the
   // reveal so the tree expands to the open/moved note or a deep-linked folder.
-  const browseFolder = browsing && !memoryNoteOpen && nav.type === 'folder' ? nav.folder : null
+  const browseFolder = browsing && !agentNoteOpen && nav.type === 'folder' ? nav.folder : null
 
   // The first skeleton unions every root into the open set, then latches so a later
   // Collapse all remains sticky.
@@ -1335,8 +1357,8 @@ export const Sidebar = () => {
             title="Favorites"
             onClick={() => {
               pickScope({ kind: 'favorites' })
-              if (!railOpen) {
-                toggleRail()
+              if (!panelVisible) {
+                toggleLeftPanel()
               }
             }}
           >
@@ -1348,6 +1370,11 @@ export const Sidebar = () => {
             data-testid="rail-agents"
             aria-current={onAgents ? 'page' : undefined}
             title="Agents"
+            onClick={(event) => {
+              if (!isModifiedClick(event)) {
+                revealNatural('roles')
+              }
+            }}
           >
             <IconBot size={17} />
           </Link>
@@ -1413,8 +1440,24 @@ export const Sidebar = () => {
           it comes back with the right total height but zero rendered rows until a
           real resize — and CSS show/hide IS that resize, so the rows always return.
           Bonus: the scroll position survives a collapse round-trip. */}
+      {narrow && panelVisible && (
+        <button
+          type="button"
+          className={styles.narrowBackdrop}
+          aria-label="Close sidebar"
+          onClick={closeLeftPanel}
+        />
+      )}
       <div
-        className={cx(styles.panel, !railOpen && styles.panelHidden)}
+        ref={panelRef}
+        className={cx(
+          styles.panel,
+          !panelVisible && styles.panelHidden,
+          narrow && styles.panelNarrow,
+        )}
+        role={narrow && panelVisible ? 'dialog' : undefined}
+        aria-modal={narrow && panelVisible ? true : undefined}
+        aria-label={narrow && panelVisible ? 'Explorer' : undefined}
         style={
           {
             width,
@@ -1446,24 +1489,50 @@ export const Sidebar = () => {
             // with the row, so re-attach rootContextMenu here (it stays on the scroll
             // body too, for the empty area below the tree).
             <div className={styles.sectionHead} onContextMenu={rootContextMenu}>
-              {/* The view selector (#164 + #165): Files / Projects / Memory + recent jumps. */}
-              <ScopePicker
-                scope={effectiveScope}
-                projects={projects ?? []}
-                recent={recentProjects}
-                onPick={pickScope}
-                onFocus={focusProject}
-              />
-              {/* Sort is shared by every explorer scope. Collapse all + Refresh + New
-                  act on the FILES tree and stay hidden while Memory owns the rows. */}
-              <div className={styles.sectionActions}>
-                <SortButton
-                  sort={explorerSort}
-                  dir={explorerSortDir}
-                  onSort={setExplorerSort}
-                  onDir={setExplorerSortDir}
+              {/* Files and Agents own separate dataset pickers. */}
+              {onAgents ? (
+                <AgentsExplorerPicker />
+              ) : (
+                <ScopePicker
+                  scope={effectiveScope}
+                  projects={projects ?? []}
+                  recent={recentProjects}
+                  onPick={pickScope}
+                  onFocus={focusProject}
                 />
-                {effectiveScope.kind !== 'memory' && (
+              )}
+              {/* Collapse all + Refresh + New act on the FILES tree. Sort is offered by
+                  every explorer that orders its own rows — the file tree and Agents
+                  Memory; Roles/Skills arrive in the server's placement order. */}
+              <div className={styles.sectionActions}>
+                {(!onAgents || agentsDataset === 'memory') && (
+                  <SortButton
+                    sort={explorerSort}
+                    dir={explorerSortDir}
+                    onSort={setExplorerSort}
+                    onDir={setExplorerSortDir}
+                  />
+                )}
+                {onAgents &&
+                  canWrite &&
+                  (agentsDataset === 'roles' || agentsDataset === 'skills') && (
+                    <button
+                      className={styles.iconBtn}
+                      title={agentsDataset === 'roles' ? 'New role' : 'New skill'}
+                      data-testid="new-ability"
+                      onClick={() =>
+                        navigate(
+                          agentAbilityDraftRoute(
+                            agentsDataset === 'roles' ? 'role' : 'skill',
+                            crypto.randomUUID(),
+                          ),
+                        )
+                      }
+                    >
+                      <IconPlus size={16} />
+                    </button>
+                  )}
+                {!onAgents && (
                   <>
                     <button
                       className={styles.iconBtn}
@@ -1525,19 +1594,15 @@ export const Sidebar = () => {
             onClick={sectionClick}
             onContextMenu={rootContextMenu}
           >
-            {effectiveScope.kind === 'memory' ? (
-              // The Agents surface (#165): the agent-memory audit owns its data
-              // fetch + axes, but uses the same explorer virtual rows/reveal
-              // primitive as Files (and the same TreeState skin). The right-aside
-              // FolderFilter the old Memory page used is gone: the axes ARE the filter.
-              <MemoryTree
+            {onAgents ? (
+              <AgentsExplorer
                 activeId={treeActiveId}
                 scrollRef={railScrollRef}
-                visible={railOpen}
+                visible={panelVisible}
                 headH={panelHeadH}
               />
             ) : (
-              // Every non-memory scope (files, project, projects, favorites) wears the
+              // Every Files scope (files, project, projects, favorites) wears the
               // ONE shared lifecycle skin (#220): loading→skeleton, cold error→Notice,
               // empty→the scope's EmptyState, ready→the virtualized tree. The status +
               // empty node are computed above so this stays a single, uniform mount.
@@ -1552,7 +1617,7 @@ export const Sidebar = () => {
                 <VirtualTree
                   rows={treeRows}
                   scrollRef={railScrollRef}
-                  visible={railOpen}
+                  visible={panelVisible}
                   headH={panelHeadH}
                   activeId={treeActiveId}
                   activeFolderPath={treeActiveFolderPath}

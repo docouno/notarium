@@ -19,6 +19,10 @@ export type AdmissionRequest = {
   packagePath?: string
   deadlineMs?: number
   signal?: AbortSignal
+  /** The fence's own drain lease, not application work. It overlaps every key, so
+   *  it is the one lease whose presence must NOT read as "somebody is admitted
+   *  here" — while it is held the authority is closed and empty by definition. */
+  lifecycle?: boolean
 }
 
 export type AdmissionLease = {

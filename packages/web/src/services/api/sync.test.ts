@@ -30,9 +30,26 @@ describe('sync events transport', () => {
     vi.stubGlobal('EventSource', FakeEventSource)
     const onOpen = vi.fn()
 
-    syncApi.events('space', vi.fn(), undefined, undefined, undefined, undefined, onOpen)
+    syncApi.events('space', vi.fn(), undefined, undefined, undefined, undefined, undefined, onOpen)
     FakeEventSource.last?.onopen?.({} as Event)
 
     expect(onOpen).toHaveBeenCalledOnce()
+  })
+
+  it('subscribes to owner-scoped agent-session invalidation', () => {
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const onAgentSessions = vi.fn()
+
+    syncApi.events('space', vi.fn(), undefined, undefined, undefined, undefined, onAgentSessions)
+
+    expect(FakeEventSource.last?.addEventListener).toHaveBeenCalledWith(
+      'agent-sessions',
+      expect.any(Function),
+    )
+    const handler = FakeEventSource.last?.addEventListener.mock.calls.find(
+      ([event]) => event === 'agent-sessions',
+    )?.[1] as (() => void) | undefined
+    handler?.()
+    expect(onAgentSessions).toHaveBeenCalledOnce()
   })
 })

@@ -3,7 +3,7 @@
 // the read-model asks: is class C visible on surface S, and which classes does scope X admit.
 // canon: docs/note-model.md#note-classes · docs/core.md#read-model
 
-import { READ_SCOPE } from '../knowledgeStore'
+import { NOTE_CLASS, READ_SCOPE } from '../knowledgeStore'
 import type { NoteClass, ReadScope } from '../knowledgeStore'
 import type { Surface } from './consts'
 import { CLASS_POLICY, DEFAULT_NOTE_CLASS, NOTE_CLASSES } from './policy'
@@ -22,6 +22,9 @@ export const classesForScope = (scope: ReadScope): Set<NoteClass> => {
   }
   if (scope === READ_SCOPE.agentRecall) {
     return new Set(NOTE_CLASSES.filter((c) => CLASS_POLICY[c].agentRecall))
+  }
+  if (scope === READ_SCOPE.trash) {
+    return new Set([...NOTE_CLASSES.filter((c) => CLASS_POLICY[c].agentRecall), NOTE_CLASS.skill])
   }
 
   // `user`: visible on at least one user-document surface (feed or tree).

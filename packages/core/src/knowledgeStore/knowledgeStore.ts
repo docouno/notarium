@@ -616,6 +616,10 @@ export type ReadOptions = {
    *  id/title/slug fallback. The read-model uses it when its persisted registry
    *  already names the authoritative owner of a stable id during degraded boot. */
   storageOnly?: boolean
+  /** Trusted host hint: the caller already owns the enclosing resource-authority
+   *  lease, so a physical read must use admitted observations instead of trying
+   *  to acquire that lease recursively. */
+  resourceAdmitted?: boolean
 }
 
 /** A note's Feed-card enrichment: snippet, first image, tags, word count, and a model-agnostic
@@ -1047,6 +1051,14 @@ export type TreeChildrenQuery = {
 export type MutationOptions = {
   prepare?: () => void | Promise<void>
   finalize?: () => void | Promise<void>
+  /** Host-internal checkpoint under physical subtree admission and before its
+   * atomic detach. */
+  beforeDetach?: () => void | Promise<void>
+  /** Host-internal checkpoint after an atomic subtree detach and before staging
+   * bytes are destroyed. */
+  afterDetach?: () => void | Promise<void>
+  /** Admit a canonical hidden-mount address supplied by trusted host code. */
+  internalAddress?: boolean
 }
 
 /** Host-only exact tag delta. Unlike a whole-document save, it reads live metadata

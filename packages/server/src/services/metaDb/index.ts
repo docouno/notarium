@@ -8,12 +8,28 @@ export {
   metaDbTargetOf,
 } from './metaDbUrl'
 export { auditWriteGapOf } from './rows'
+// The half of the ability fence a host with an in-memory lifecycle journal answers
+// itself. Exported so the twins' `spaceEnded` and the drivers' `phase IN (…)` cannot
+// be two lists.
+export { spaceLifecycleHasEnded } from './abilityLifecycle'
+// What a durable ability ADDRESS is asked outside the facet that stores it: the
+// package it names, and the Space that package lives in.
+export { abilityPackageOfLocator, abilitySpaceOfLocator } from './abilityAddress'
+export {
+  ABILITY_TARGET_PURGED,
+  abilityTargetPurgedError,
+  isAbilityTargetPurgedError,
+} from './types'
 export { SqliteMetaDb } from './sqliteMetaDb'
 export { PgMetaDb } from './pgMetaDb'
 export type {
+  AbilityPreferenceLocator,
+  AbilityPreferencesPersistence,
+  AbilityPreferenceTarget,
   AgentDeltaCursorScope,
   AgentDeltaCursorsPersistence,
   AgentSessionRecord,
+  AgentSessionRoleSelection,
   AgentSessionAuditEvent,
   AgentSessionAuditPersistence,
   AgentSessionAuditSummary,
@@ -67,6 +83,12 @@ export type {
   ScopePinRecord,
   ScopePinsPersistence,
   SessionRecord,
+  AbilityAvailability,
+  AbilityAvailabilityPersistence,
+  AbilityAvailabilityRecord,
+  AbilityAvailabilityRegistryNote,
+  AbilityPlacementPersistence,
+  OwnedRolePlacementMove,
   SpaceRecord,
   SpacesPersistence,
   UserRecord,

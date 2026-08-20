@@ -13,9 +13,10 @@ import { InMemoryStore } from '@notarium/engine-memory'
 import { buildCasesWorld, buildCaseWorld, DEFAULT_NOW, mergeWorlds } from './build'
 import { normDate } from './generators'
 import { CASES, getCase, listCases } from './registry'
+import { materializeRevisionState } from './revisionStates'
 import { agentSessionId } from './sessionIds'
 import { caseToFixture } from './toFixture'
-import type { CaseWorld } from './types'
+import type { AgentRoleTargetDecl, CaseWorld } from './types'
 
 const NAMES = CASES.map((c) => c.name)
 
@@ -30,6 +31,39 @@ describe('seed catalog (#175)', () => {
       expect(c.description.length).toBeGreaterThan(10)
       expect(getCase(c.name).name).toBe(c.name)
     }
+  })
+
+  // A description is operator-facing copy — `make seed CASE=…` prints it and then hands
+  // over a stand — and the operator has no way to check it: `agent-abilities-sparse`
+  // said "no Owned role or skill" while seeding an Owned skill, so the one case that
+  // exists to show a first-run stand advertised the wrong first run. A NEGATIVE claim is
+  // the half a machine CAN check, and it is the half that rots: a case grows states long
+  // after its sentence was written, and nothing pulls the sentence along.
+  const ABSENCE_CLAIMS: Array<{ claim: RegExp; holds: (world: CaseWorld) => boolean }> = [
+    { claim: /\bno owned role\b/i, holds: (world) => !world.agentRoles?.length },
+    { claim: /\bno owned (role or )?skill\b/i, holds: (world) => !world.agentSkills?.length },
+    {
+      claim: /\bno memory\b/i,
+      holds: (world) =>
+        !world.events.some((event) => event.op === 'create' && event.class === 'agent-memory'),
+    },
+    { claim: /\bno session\b/i, holds: (world) => !world.agentSessions?.length },
+  ]
+
+  it('no case description claims an ABSENCE the case then declares', () => {
+    const broken: string[] = []
+
+    for (const { name, description } of listCases()) {
+      const world = buildCaseWorld(name, { now: DEFAULT_NOW })
+
+      for (const { claim, holds } of ABSENCE_CLAIMS) {
+        if (claim.test(description) && !holds(world)) {
+          broken.push(`${name}: "${description.match(claim)?.[0]}" is not true of the world`)
+        }
+      }
+    }
+
+    expect(broken).toEqual([])
   })
 
   it.each(NAMES)('builds "%s" deterministically for a fixed seed', (name) => {
@@ -177,6 +211,18 @@ describe('seed catalog (#175)', () => {
         (event) => event.op === 'create' && event.path === 'imports/imported-helper-source.md',
       ),
     ).toBeDefined()
+    // Source-only, and it has to STAY source-only: the row is a package root whose
+    // manifest name is not one a package can carry, so restore has bytes to show and
+    // nothing safe to republish. A name that projects cleanly turns this into an
+    // ordinary full restore and the case silently loses the state.
+    expect(
+      materializeRevisionState(states[2], {
+        noteId: 'seedImportedHelp',
+        path: 'imports/imported-helper-source.md',
+        createdAt: DEFAULT_NOW,
+        title: 'Imported helper source',
+      }).restoreAvailability,
+    ).toBe('opaque')
     expect(
       world.events.filter(
         (event) => event.op === 'create' && event.path.startsWith('recoverable/meeting-note-'),
@@ -417,15 +463,103 @@ describe('seed catalog (#175)', () => {
 
     expect(world.agentRoles).toEqual([
       { name: 'grooming', target: { kind: 'personal', user: 'bob' } },
-      { name: 'research', target: { kind: 'personal', user: 'maya' } },
+      expect.objectContaining({
+        source: 'custom',
+        name: 'release-reviewer',
+        target: { kind: 'personal', user: 'sergey' },
+      }),
+      expect.objectContaining({
+        source: 'custom',
+        name: 'research',
+        target: { kind: 'personal', user: 'maya' },
+      }),
       { name: 'grooming', target: { kind: 'personal', user: 'maya' } },
-      { name: 'research', target: { kind: 'space', space: 'team' } },
-      { name: 'research', target: { kind: 'project', space: 'team', path: 'other' } },
-      { name: 'research', target: { kind: 'project', space: 'maya-home', path: 'work' } },
+      expect.objectContaining({
+        source: 'custom',
+        name: 'research',
+        target: { kind: 'space', space: 'team' },
+      }),
+      expect.objectContaining({
+        source: 'custom',
+        name: 'research',
+        target: { kind: 'project', space: 'team', path: 'other' },
+      }),
+      expect.objectContaining({
+        source: 'custom',
+        name: 'field-guide',
+        target: { kind: 'project', space: 'team', path: 'other' },
+      }),
+      // The V18 state a copy used to stand in for: one Space role, narrowed to two
+      // of the five Team projects.
+      expect.objectContaining({
+        source: 'custom',
+        name: 'launch-review',
+        target: { kind: 'space', space: 'team' },
+        availability: {
+          mode: 'selected-projects',
+          projects: [
+            { space: 'team', path: 'alpha' },
+            { space: 'team', path: 'beta' },
+          ],
+        },
+      }),
+      expect.objectContaining({
+        source: 'custom',
+        name: 'research',
+        target: { kind: 'project', space: 'maya-home', path: 'work' },
+      }),
+      expect.objectContaining({
+        source: 'custom',
+        name: 'release-captain',
+        target: { kind: 'personal', user: 'maya' },
+      }),
+      expect.objectContaining({
+        source: 'custom',
+        name: 'retired-captain',
+        deleted: true,
+      }),
     ])
     expect(world.agentSessions).toContainEqual(
       expect.objectContaining({ owner: 'maya', role: 'research' }),
     )
+    expect(world.agentSkills).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: 'meeting-brief',
+          home: expect.objectContaining({ kind: 'personal' }),
+        }),
+        expect.objectContaining({
+          name: 'team-tone',
+          home: expect.objectContaining({ kind: 'space' }),
+          availability: { mode: 'all-projects' },
+        }),
+        expect.objectContaining({
+          name: 'coder',
+          home: { kind: 'space', space: 'team' },
+          availability: {
+            mode: 'selected-projects',
+            projects: [
+              { space: 'team', path: 'alpha' },
+              { space: 'team', path: 'beta' },
+            ],
+          },
+        }),
+        expect.objectContaining({
+          source: 'catalog',
+          name: 'grooming-evidence',
+        }),
+        expect.objectContaining({
+          name: 'research-evidence',
+          renameTo: 'source-audit',
+          home: { kind: 'space', space: 'team' },
+          linkedRole: 'research',
+        }),
+        expect.objectContaining({ name: 'handoff-check', linkedRole: 'grooming' }),
+        expect.objectContaining({ name: 'retired-check', deleted: true }),
+      ]),
+    )
+    expect(world.agentSkills?.some((skill) => 'target' in skill)).toBe(false)
+    expect(world.agentSkills?.filter((skill) => skill.name === 'shared-review')).toHaveLength(2)
     expect(world.agentSessions?.some((session) => session.owner === 'bob')).toBe(false)
     expect(world.spaces.some((space) => space.personalFor === 'fresh')).toBe(false)
     expect(world.auth?.members.some((member) => member.username === 'fresh')).toBe(false)
@@ -434,12 +568,237 @@ describe('seed catalog (#175)', () => {
       username: 'robin',
       role: 'reader',
     })
+    expect(
+      world.events.filter((event) => event.op === 'create' && event.class === 'agent-memory'),
+    ).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ space: 'main', title: 'release-preferences' }),
+        expect.objectContaining({
+          space: 'main',
+          title: 'release-handoff',
+          projectMemory: { space: 'main', path: 'other' },
+        }),
+      ]),
+    )
 
     const fixture = caseToFixture(world)
+    const main = fixture.spaces.find((space) => space.slug === 'main')
+    expect(main?.notes).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          filePath: '.notarium/memory/release-preferences.md',
+          class: 'agent-memory',
+        }),
+        expect.objectContaining({
+          filePath: '.notarium/memory/proj-main-other/release-handoff.md',
+          class: 'agent-memory',
+        }),
+      ]),
+    )
     expect(fixture.agentRoles).toEqual(world.agentRoles)
+    expect(fixture.agentSkills).toEqual(world.agentSkills)
     expect(fixture.agentSessions?.find((session) => session.owner === 'maya')?.role).toBe(
       'research',
     )
+  })
+
+  it('agent-abilities-rich fills every group and names the states only volume shows', () => {
+    const world = buildCaseWorld('agent-abilities-rich', { now: DEFAULT_NOW })
+    const roles = world.agentRoles ?? []
+    const skills = world.agentSkills ?? []
+    // Space-qualified on purpose: a project of the owner's PERSONAL space is a
+    // different placement group from a project of a shared one — Personal is that
+    // space's root — and a key that named only the path would have merged the two.
+    const groupOf = (target: AgentRoleTargetDecl) =>
+      target.kind === 'project' ? `project:${target.space}/${target.path}` : target.kind
+    const byGroup = new Map<string, number>()
+
+    for (const role of roles) {
+      byGroup.set(groupOf(role.target), (byGroup.get(groupOf(role.target)) ?? 0) + 1)
+    }
+
+    // Every group populated AT ONCE for one owner — what `agent-roles` cannot show
+    // with one placement per principal — and Personal past the explorer's page size,
+    // so pagination is reachable at the default SCALE rather than only above it.
+    expect([...byGroup].sort()).toEqual([
+      ['personal', 14],
+      ['project:main/', 1],
+      ['project:product/api', 4],
+      ['project:product/legacy', 1],
+      ['project:product/mobile', 1],
+      ['project:product/web', 7],
+      ['space', 14],
+    ])
+    expect(world.projects?.filter((project) => project.space === 'product')).toHaveLength(5)
+    // The authored H1 is the human title on every surface that lists a role, and this
+    // one is long enough to force truncation in cards, explorer rows and breadcrumbs.
+    const longTitled = roles.find((role) => role.name === 'release-readiness-and-handoff-review')
+    expect(
+      (longTitled && 'instructions' in longTitled ? longTitled.instructions : '').split('\n')[0]
+        .length,
+    ).toBeGreaterThan(60)
+    expect(roles.filter((role) => role.name === 'shared-reviewer')).toHaveLength(2)
+    // One role in three V18 states: a Space base narrowed to two of the five projects,
+    // its own version in one of them, and a version whose base never existed.
+    expect(roles).toContainEqual(
+      expect.objectContaining({
+        name: 'launch-review',
+        target: { kind: 'space', space: 'product' },
+        availability: {
+          mode: 'selected-projects',
+          projects: [
+            { space: 'product', path: 'web' },
+            { space: 'product', path: 'api' },
+          ],
+        },
+      }),
+    )
+    expect(roles).toContainEqual(
+      expect.objectContaining({
+        name: 'launch-review',
+        target: { kind: 'project', space: 'product', path: 'web' },
+      }),
+    )
+    expect(roles).toContainEqual(
+      expect.objectContaining({
+        name: 'legacy-triage',
+        target: { kind: 'project', space: 'product', path: 'legacy' },
+      }),
+    )
+    // The Space skill fleet answers reach three different ways, so the editor's
+    // project list is exercised at all / one / several and not only at "all".
+    expect(
+      new Set(
+        skills
+          .filter((skill) => skill.name.startsWith('team-'))
+          .map((skill) =>
+            skill.availability?.mode === 'selected-projects'
+              ? skill.availability.projects.length
+              : 0,
+          ),
+      ),
+    ).toEqual(new Set([0, 1, 3]))
+    // The two attachment states no other case reaches: a role attached where a skill
+    // belongs, and a Space role reaching the whole Space through a skill bound to one
+    // project.
+    expect(roles).toContainEqual(
+      expect.objectContaining({ name: 'evidence-lead', attachRole: 'release-reviewer' }),
+    )
+    expect(skills).toContainEqual(
+      expect.objectContaining({
+        name: 'store-review',
+        linkedRole: 'handoff-review',
+        home: { kind: 'space', space: 'product' },
+        availability: {
+          mode: 'selected-projects',
+          projects: [{ space: 'product', path: 'mobile' }],
+        },
+      }),
+    )
+    expect(
+      roles.some(
+        (role) =>
+          role.name === 'handoff-review' && role.target.kind === 'space' && !role.availability,
+      ),
+    ).toBe(true)
+    // Enable/Disable at all three sources the facet can carry, with the disabled
+    // Personal `shared-reviewer` leaving its Space twin enabled — the override is a
+    // property of the package, never of the name.
+    expect(world.agentAbilityPreferences).toEqual([
+      {
+        user: 'sergey',
+        ability: {
+          source: 'owned',
+          kind: 'role',
+          name: 'shared-reviewer',
+          target: { kind: 'personal', user: 'sergey' },
+        },
+        enabled: false,
+      },
+      {
+        user: 'sergey',
+        ability: {
+          source: 'owned',
+          kind: 'skill',
+          name: 'evidence-index',
+          home: { kind: 'personal', user: 'sergey' },
+        },
+        enabled: false,
+      },
+      {
+        user: 'sergey',
+        ability: { source: 'system', kind: 'skill', name: 'research-evidence' },
+        enabled: false,
+      },
+    ])
+
+    // A catalog Add on a PROJECT placement, and the supporting package it installs in
+    // the SPACE addressed as what it is: the only declaration shape that has to name a
+    // role placement and a skill home separately. Both applier branches behind it were
+    // dead until this pair existed (#309 review).
+    expect(roles).toContainEqual({
+      name: 'grooming',
+      target: { kind: 'project', space: 'product', path: 'mobile' },
+    })
+    expect(skills).toContainEqual({
+      source: 'role-dependency',
+      role: 'grooming',
+      name: 'grooming-evidence',
+      home: { kind: 'space', space: 'product' },
+      roleTarget: { kind: 'project', space: 'product', path: 'mobile' },
+      renameTo: 'grooming-evidence-house',
+    })
+    // The same pair where the space is the owner's PERSONAL one (`main` is
+    // `personalFor: 'sergey'`), which is a different answer rather than a repetition:
+    // Personal is that space's root, so the dependency's home is `personal` and the
+    // role's link has to say so. Without this state no seeded stand held a role with a
+    // dependency in a project of a personal space, and a seeder that answered "no
+    // personal space" published a link nothing could resolve while the seed reported ok.
+    expect(roles).toContainEqual({
+      name: 'grooming',
+      target: { kind: 'project', space: 'main', path: '' },
+    })
+    expect(skills).toContainEqual({
+      source: 'role-dependency',
+      role: 'grooming',
+      name: 'grooming-evidence',
+      home: { kind: 'personal', user: 'sergey' },
+      roleTarget: { kind: 'project', space: 'main', path: '' },
+      renameTo: 'grooming-evidence-mine',
+    })
+    expect(world.spaces.find((space) => space.slug === 'main')?.personalFor).toBe('sergey')
+
+    const fixture = caseToFixture(world)
+    expect(fixture.agentRoles).toEqual(world.agentRoles)
+    expect(fixture.agentSkills).toEqual(world.agentSkills)
+    // The preference channel the fake gained with #309. Without it the fixture would
+    // reach the fake backend one field short, and a browser gate could only ever start
+    // from an all-enabled inventory.
+    expect(fixture.agentAbilityPreferences).toEqual(world.agentAbilityPreferences)
+  })
+
+  it('agent-abilities-sparse keeps a first-run stand at exactly one owned package', () => {
+    const world = buildCaseWorld('agent-abilities-sparse', { now: DEFAULT_NOW })
+
+    // No Owned role at all, one Owned skill, and no preference row: the empty group,
+    // the single-row group and the default-enabled inventory a full stand hides.
+    expect(world.agentRoles).toBeUndefined()
+    expect(world.agentSkills).toEqual([
+      expect.objectContaining({
+        name: 'evidence-check',
+        home: { kind: 'personal', user: 'sergey' },
+      }),
+    ])
+    expect(world.agentAbilityPreferences).toBeUndefined()
+    expect(world.agentSessions).toBeUndefined()
+    expect(
+      world.events.some((event) => event.op === 'create' && event.class === 'agent-memory'),
+    ).toBe(false)
+    // Two spaces with one project each, so an empty group still has a place to be.
+    expect(world.projects?.map((project) => `${project.space}/${project.path}`)).toEqual([
+      'main/',
+      'product/',
+    ])
   })
 
   it('rejects a delta cursor anchored in another project revision stream', () => {
@@ -547,6 +906,85 @@ describe('seed catalog (#175)', () => {
     expect(combined.durableImports).toEqual(alone.durableImports)
     const slugs = new Set(combined.spaces.map((s) => s.slug))
     expect((combined.jobs ?? []).every((j) => slugs.has(j.space))).toBe(true)
+  })
+
+  // The jobs clause above is one field's version of a rule that holds for the whole
+  // world, and stating it per field is how a field ends up with no clause at all:
+  // `agentSkills` shipped declared (`types.ts`), applied (`scripts/seed.ts`) and read
+  // (`toFixture.ts`) while `mergeWorlds` never carried it, so every combination
+  // dropped the skill fleet silently. These two clauses are the general form — the
+  // FIELD LIST is exhaustive by type, so a new world field cannot be added without
+  // landing under them.
+  const WORLD_FIELDS = {
+    now: true,
+    spaces: true,
+    projects: true,
+    contextSets: true,
+    scopePins: true,
+    contextOrder: true,
+    auth: true,
+    events: true,
+    favorites: true,
+    retrievals: true,
+    agentSessions: true,
+    agentRoles: true,
+    agentSkills: true,
+    agentAbilityPreferences: true,
+    agentDeltaCursors: true,
+    jobs: true,
+    durableImports: true,
+    externalRewrites: true,
+    revisionStates: true,
+    externalIdentityClaims: true,
+  } as const satisfies Record<keyof CaseWorld, true>
+
+  const WORLD_FIELD_NAMES = Object.keys(WORLD_FIELDS) as Array<keyof CaseWorld>
+
+  /** How much of a field survived. A merge cannot be judged by deep equality — half
+   *  the fields are namespaced by case on the way through — but it can be judged by
+   *  how many declarations came out: an absent field and a dropped row both count. */
+  const sizeOf = (value: unknown): number =>
+    Array.isArray(value) ? value.length : value == null ? 0 : 1
+
+  it('mergeWorlds carries EVERY declared world field, not the ones someone remembered', () => {
+    // A partner that declares nothing but its own space: whatever a case brought must
+    // then come out whole, field by field, with no per-field expectation to forget.
+    const probe: CaseWorld = { now: DEFAULT_NOW, spaces: [{ slug: 'merge-probe' }], events: [] }
+
+    for (const name of NAMES) {
+      const world = buildCaseWorld(name, { scale: 0.1, now: DEFAULT_NOW })
+      const merged = mergeWorlds([
+        { name, world },
+        { name: 'merge-probe', world: probe },
+      ])
+
+      // The anchor is the first part's by contract; everything else is additive.
+      expect(merged.now).toBe(world.now)
+      for (const field of WORLD_FIELD_NAMES.filter((candidate) => candidate !== 'now')) {
+        expect({ [`${name}.${field}`]: sizeOf(merged[field]) }).toEqual({
+          [`${name}.${field}`]: sizeOf(world[field]) + sizeOf(probe[field]),
+        })
+      }
+    }
+  })
+
+  it('every world field is declared by some case, so the merge clause above can see it', () => {
+    // Without this, a field nothing declares makes the clause above vacuous for it —
+    // exactly the hole `agentSkills` fell through between being declarable and being
+    // merged. A new field arrives with a case that seeds it, or it arrives red.
+    const declared = new Set<keyof CaseWorld>()
+
+    for (const name of NAMES) {
+      const world = buildCaseWorld(name, { scale: 0.1, now: DEFAULT_NOW })
+
+      for (const field of WORLD_FIELD_NAMES) {
+        if (sizeOf(world[field])) {
+          declared.add(field)
+        }
+      }
+    }
+
+    expect([...WORLD_FIELD_NAMES].filter((field) => !declared.has(field))).toEqual([])
   })
 
   it('combining cases namespaces external-rewrite note handles (#267)', () => {

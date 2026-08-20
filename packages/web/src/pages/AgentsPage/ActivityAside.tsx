@@ -6,6 +6,7 @@ import type {
   AgentSessionEventAggregates,
 } from '@notarium/contract'
 import { AGENT_RETRIEVAL_TOOL } from '@notarium/contract/enums'
+import { AsideSection, AsideSections } from '../../core/AsidePanel'
 import { Button } from '../../core/Button'
 import { IconX } from '../../core/Icons'
 import { Notice } from '../../core/Notice'
@@ -60,10 +61,11 @@ export const ActivityFilters = ({
   }
 
   return (
-    <div className={styles.activityAside} data-testid="activity-filters">
-      <section className={styles.section} data-testid="activity-query-filter">
-        <div className={styles.sectionHeading} data-aside-section-heading>
-          <span>Retrieval query</span>
+    <AsideSections testId="activity-filters">
+      <AsideSection
+        heading="Retrieval query"
+        testId="activity-query-filter"
+        action={
           <button
             type="button"
             className="gf-section-reset"
@@ -74,7 +76,8 @@ export const ActivityFilters = ({
           >
             <IconX size={13} />
           </button>
-        </div>
+        }
+      >
         <Segmented<QueryTool>
           block
           value={tool}
@@ -94,12 +97,13 @@ export const ActivityFilters = ({
           placeholder="Contains text"
           inputProps={{ 'aria-label': 'Retrieval query', 'data-testid': 'activity-query' }}
         />
-      </section>
+      </AsideSection>
 
       {agents.length > 0 && (
-        <section className={styles.section} data-testid="activity-agent-filter">
-          <div className={styles.sectionHeading} data-aside-section-heading>
-            <span>Agent</span>
+        <AsideSection
+          heading="Agent"
+          testId="activity-agent-filter"
+          action={
             <button
               type="button"
               className="gf-section-reset"
@@ -110,7 +114,8 @@ export const ActivityFilters = ({
             >
               <IconX size={13} />
             </button>
-          </div>
+          }
+        >
           <div className={styles.agentList} data-testid="activity-agent-list">
             <FolderTree
               nodes={agents.map((item) => ({
@@ -127,9 +132,9 @@ export const ActivityFilters = ({
               swatch={false}
             />
           </div>
-        </section>
+        </AsideSection>
       )}
-    </div>
+    </AsideSections>
   )
 }
 
@@ -169,12 +174,8 @@ export const ActivityDiagnostics = ({
   const active = (stat: AgentAuditQueryStat) => state.tool === stat.tool && state.q === stat.query
 
   return (
-    <div className={styles.panels} data-testid="activity-diagnostics">
-      <section className={styles.section}>
-        <div className={styles.sectionHeading} data-aside-section-heading>
-          Blind spots
-        </div>
-        <p className={styles.sectionHint}>Queries that repeatedly returned no results.</p>
+    <AsideSections testId="activity-diagnostics">
+      <AsideSection heading="Blind spots" hint="Queries that repeatedly returned no results.">
         {blindSpots.length > 0 ? (
           <ul className={styles.statList} data-testid="activity-blind-spots">
             {blindSpots.map((stat) => (
@@ -190,13 +191,9 @@ export const ActivityDiagnostics = ({
         ) : (
           <p className={styles.diagnosticsEmpty}>No recurring empty queries.</p>
         )}
-      </section>
+      </AsideSection>
 
-      <section className={styles.section}>
-        <div className={styles.sectionHeading} data-aside-section-heading>
-          Frequent
-        </div>
-        <p className={styles.sectionHint}>Most-used retrieval queries across all activity.</p>
+      <AsideSection heading="Frequent" hint="Most-used retrieval queries across all activity.">
         {frequent.length > 0 ? (
           <ul className={styles.statList} data-testid="activity-frequent-queries">
             {frequent.map((stat) => (
@@ -211,7 +208,7 @@ export const ActivityDiagnostics = ({
         ) : (
           <p className={styles.diagnosticsEmpty}>No retrieval queries yet.</p>
         )}
-      </section>
-    </div>
+      </AsideSection>
+    </AsideSections>
   )
 }

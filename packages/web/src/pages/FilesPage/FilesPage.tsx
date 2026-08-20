@@ -4,7 +4,6 @@ import { useNotes } from '../../composers/NotesProvider'
 import { useSpace } from '../../composers/SpaceProvider'
 import { Splash } from '../../composers/Splash'
 import { noteRoute, parseAppPath } from '../../libs/routing/routePaths'
-import styles from './FilesPage.module.scss'
 
 // `/s/<space>/files/<path>` — a folder of the Files surface (#51, #212). A folder
 // with a PAGE (#212) shows its body in the standard note reader, so this redirects
@@ -42,8 +41,8 @@ export const FilesPage = () => {
   const name = folder.name || path.split('/').pop() || space
   return (
     <article className="doc" data-testid="virtual-folder-page">
-      <header className={styles.docHead}>
-        <h1 className={styles.docTitle}>{name}</h1>
+      <header className="doc-head">
+        <h1 className="doc-title">{name}</h1>
       </header>
       <FolderChildrenSummary space={space} folderPath={path} />
     </article>

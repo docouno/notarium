@@ -16,6 +16,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@notarium/contract": "*",
     "d3-force": "^3.0.0",
     "diff": "^9.0.0",
     "graphology": "^0.26.0",

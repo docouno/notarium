@@ -60,6 +60,7 @@ type GraphViewProps = {
   onCreateFromGhost: (node: GraphNode) => void
   theme: string
   railOpen: boolean
+  railNarrow: boolean
   onToggleRail: () => void
   initialFocusId: string | null
   onFocusConsumed?: () => void
@@ -70,6 +71,7 @@ export const GraphView = ({
   onCreateFromGhost,
   theme,
   railOpen,
+  railNarrow,
   onToggleRail,
   initialFocusId,
   onFocusConsumed,
@@ -571,7 +573,15 @@ export const GraphView = ({
             icon={<IconPanelLeft size={15} />}
             active={railOpen}
             onClick={onToggleRail}
-            title={railOpen ? 'Collapse sidebar' : 'Expand sidebar'}
+            title={
+              railNarrow
+                ? railOpen
+                  ? 'Close sidebar'
+                  : 'Open sidebar'
+                : railOpen
+                  ? 'Collapse sidebar'
+                  : 'Expand sidebar'
+            }
           />
           {/* Presentation controls (Group/Size/…) moved into the aside's Display
               tab — the set outgrew a canvas chip — so the overlay stays light. */}

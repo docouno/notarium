@@ -1,47 +1,6 @@
-/* Activity's right-panel contents. AsideGroups owns width, tabs, scrolling and
-   mobile presentation; this module owns facets and retrieval diagnostics. */
-.panels {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-  padding: 12px var(--gutter) 14px;
-}
-
-.section {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  min-width: 0;
-  margin: 0;
-  border: 0;
-}
-
-.section + .section {
-  margin-top: 12px;
-  padding-top: 12px;
-  border-top: 1px solid var(--border);
-}
-
-.section-heading {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 6px;
-  min-height: 20px;
-  color: var(--text-faint);
-  font-size: 11.5px;
-  font-weight: 600;
-  letter-spacing: 0.03em;
-  text-transform: uppercase;
-}
-
-.section-hint {
-  margin: -3px 0 0;
-  color: var(--text-faint);
-  font-size: 11.5px;
-  line-height: 1.4;
-}
-
+/* Activity's right-panel contents: retrieval diagnostics rows and the agent list.
+   The panel body and its captioned sections come from `core/AsidePanel`; this module
+   owns only what is Activity's own. */
 .stat-list {
   display: flex;
   flex-direction: column;
@@ -122,20 +81,9 @@
   padding: 12px var(--gutter);
 }
 
-.activity-aside {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-  padding: 12px var(--gutter) 14px;
-}
-
 .agent-list {
   max-height: 128px;
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
-}
-
-.section > button {
-  width: 100%;
 }

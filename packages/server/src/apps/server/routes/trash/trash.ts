@@ -46,7 +46,7 @@ export const trashRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
             limit: q.data.limit,
             q: q.data.q,
             availability: restoreAvailable ? q.data.availability : undefined,
-            scope: READ_SCOPE.agentRecall,
+            scope: READ_SCOPE.trash,
           })
     const { items, total, restorableTotal, partialTotal } = result
     const cache = new Map<string | null, Author>()
@@ -219,7 +219,7 @@ export const trashRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
         !bulkRestoreCoordinator && body.data.availability === 'unavailable'
           ? undefined
           : body.data.availability,
-      scope: READ_SCOPE.agentRecall,
+      scope: READ_SCOPE.trash,
     })
     return TrashPurgeResponseSchema.parse({ ok: true, purged })
   })

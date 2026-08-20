@@ -69,6 +69,17 @@ export const noteAlreadyExists = (
   return err
 }
 
+/** Two immutable package ids cannot publish the same Agent Skill name inside
+ * one placement. The manifest name is the user's lookup/display key, so this is
+ * a typed conflict rather than a generic malformed-write error. */
+export const skillNameConflict = (name: string): StoreError => {
+  const err = new StoreError(`skill name "${name}" already exists in this placement`)
+  err.isConflict = true
+  err.reason = STORE_ERROR_REASON.skillNameConflict
+
+  return err
+}
+
 /** A write that named the identity it EXPECTED to find at its destination found
  *  another one — or found the path taken when it planned on a free one. The
  *  refusal exists because the alternative is silent: an ordinary overwrite would

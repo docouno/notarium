@@ -6,7 +6,22 @@
 /* Document container — the reader (NoteReader). The editor (EditorBody) mirrors
    its 740px width and 44px title inset in its own centered columns so a note's
    title/width doesn't shift between read and edit. */
-.doc { max-width: var(--doc-width); margin: 0 auto; padding: 44px 0 16vh; }
+/* `width: 100%` is not redundant: a section hosts the document inside a flex column,
+   where a block without a width shrinks to its CONTENT and the auto margins then
+   centre that — so a short note drifted right of the column it lives in, while the
+   same markup in the standalone reader filled it. The width pins the column; the
+   max-width still caps the measure. */
+.doc { width: 100%; max-width: var(--doc-width); margin: 0 auto; padding: 44px 0 16vh; }
+
+/* The document's own heading — one size for every document surface (a note, a
+   folder page, an Ability). Global rather than per-reader: a reader that renders its
+   title through `.markdown h1` instead reads a different size on the neighbouring
+   route of the same section. */
+.doc-head { margin-bottom: 22px; }
+.doc-title {
+  font-size: 32px; font-weight: 700; letter-spacing: -0.02em;
+  line-height: 1.2; margin: 0 0 12px;
+}
 
 /* Main column (column 3 frame) — DocumentLayout and the graph page share it. */
 .main { flex: 1; display: flex; flex-direction: column; min-width: 0; height: 100%; }

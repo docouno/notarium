@@ -2,15 +2,19 @@ import { describe, expect, it } from 'vitest'
 import {
   AddAgentRoleRequestSchema,
   AddAgentRoleResponseSchema,
+  AddAgentSkillRequestSchema,
+  AddAgentSkillResponseSchema,
+  AgentAbilityDetailResponseSchema,
   AgentContextQuerySchema,
-  AgentRoleDetailRequestSchema,
-  AgentRoleDetailResponseSchema,
+  AgentPackageLibraryQuerySchema,
   AgentSessionEventsQuerySchema,
   BucketsQuerySchema,
   BucketsResponseSchema,
   ConfigSchema,
   ConflictResponseSchema,
   contract,
+  CreateAbilityVersionRequestSchema,
+  CreateAgentRoleRequestSchema,
   CreateNoteRequestSchema,
   DurablePathSchema,
   DurableScalarSchema,
@@ -20,6 +24,7 @@ import {
   MarkProjectRequestSchema,
   MeAgentContextResponseSchema,
   MeAgentRolesResponseSchema,
+  MeAgentSkillsResponseSchema,
   MeMemoryQuerySchema,
   MemoryCategorySchema,
   MoveFolderRequestSchema,
@@ -44,10 +49,15 @@ import {
   RestoreResponseSchema,
   RestoreSpacesRequestSchema,
   RestoreSpacesResponseSchema,
-  RoleContextTargetQuerySchema,
   RoleContextViewSchema,
   SaveResponseSchema,
   SearchResponseSchema,
+  SetAbilityHomeRequestSchema,
+  SetAbilityHomeResponseSchema,
+  SetAgentAbilityAvailabilityRequestSchema,
+  SetAgentAbilityAvailabilityResponseSchema,
+  SetAgentAbilityEnabledRequestSchema,
+  SetAgentAbilityEnabledResponseSchema,
   SpaceSlugSchema,
   SpacesResponseSchema,
   TrashRestoreManyRequestSchema,
@@ -510,6 +520,24 @@ describe('note writes (#16 split: create is space-scoped, update id-addressed)',
       UpdateNoteRequestSchema.safeParse({ title: 'Renamed', versionToken: 'v1:abc' }).success,
     ).toBe(false)
   })
+  it('replaces Role attachments only when the exact locator and full list arrive together', () => {
+    const base = { originalId: 'role-note', versionToken: 'v1:abc' }
+    const locator = {
+      source: 'owned' as const,
+      kind: 'role' as const,
+      packageId: 'RolePackage1',
+      location: { scope: 'personal' as const, spaceId: 'personal-space' },
+    }
+
+    expect(UpdateNoteRequestSchema.safeParse({ ...base, abilityLocator: locator }).success).toBe(
+      false,
+    )
+    expect(UpdateNoteRequestSchema.safeParse({ ...base, attachments: [] }).success).toBe(false)
+    expect(
+      UpdateNoteRequestSchema.safeParse({ ...base, abilityLocator: locator, attachments: [] })
+        .success,
+    ).toBe(true)
+  })
   // #51: the save response carries the note-id the client navigates to.
   it('SaveResponse requires the saved note-id', () => {
     expect(
@@ -730,7 +758,7 @@ describe('projects (#13: mark-as-project + list)', () => {
 })
 
 describe('agent context constructor (#165)', () => {
-  it('the registry resolves context preview and mutation operations by name', () => {
+  it('the registry resolves context preview and mutation operations by exact locator', () => {
     expect(contract.meAgentContext.response).toBe(MeAgentContextResponseSchema)
     expect(contract.projectAgentContext.response).toBe(ProjectAgentContextResponseSchema)
     expect(contract.pinNote.request).toBe(PinNoteRequestSchema)
@@ -739,35 +767,55 @@ describe('agent context constructor (#165)', () => {
     expect(contract.muteNote.response).toBe(MuteNoteResponseSchema)
   })
 
-  it('selects previews by a bounded role name and mutations by a non-empty project id', () => {
+  it('carries one bounded opaque role locator and rejects a second addressing axis', () => {
     expect(AgentContextQuerySchema.safeParse({}).success).toBe(true)
-    expect(AgentContextQuerySchema.safeParse({ role: 'research' }).success).toBe(true)
-    expect(AgentContextQuerySchema.safeParse({ role: 'Research' }).success).toBe(false)
+    expect(AgentContextQuerySchema.safeParse({ role: 'encoded-locator' }).success).toBe(true)
+    expect(AgentContextQuerySchema.safeParse({ role: '' }).success).toBe(false)
+    expect(AgentContextQuerySchema.safeParse({ role: 'x'.repeat(4097) }).success).toBe(false)
     expect(
-      AgentContextQuerySchema.safeParse({ role: 'research', projectId: 'wrong-axis' }).success,
-    ).toBe(false)
-
-    expect(RoleContextTargetQuerySchema.safeParse({}).success).toBe(true)
-    expect(RoleContextTargetQuerySchema.safeParse({ projectId: 'project-docs' }).success).toBe(true)
-    expect(RoleContextTargetQuerySchema.safeParse({ projectId: '' }).success).toBe(false)
-    expect(
-      RoleContextTargetQuerySchema.safeParse({ projectId: 'project-docs', role: 'research' })
+      AgentContextQuerySchema.safeParse({ role: 'encoded-locator', projectId: 'wrong-axis' })
         .success,
     ).toBe(false)
   })
 
   it('validates every exact owned-role placement in a context preview', () => {
     const fields = {
+      // A context view is an OWNED placement by construction, and now says so: the
+      // effective-role shape became a union on `source` when System roles entered the
+      // resolver, and only the Owned arm carries a placement at all.
+      source: 'owned' as const,
       name: 'research',
+      title: 'Research',
       description: 'Research.',
       pins: [{ noteId: 'note-a', title: 'A', loaded: true, tokens: 12, order: 0 }],
       sets: [],
       loadedTokens: 12,
     }
 
-    expect(RoleContextViewSchema.safeParse({ ...fields, scope: 'personal' }).success).toBe(true)
     expect(
-      RoleContextViewSchema.safeParse({ ...fields, scope: 'space', space: 'team' }).success,
+      RoleContextViewSchema.safeParse({
+        ...fields,
+        scope: 'personal',
+        locator: {
+          source: 'owned',
+          kind: 'role',
+          packageId: 'RoleAAAAAAAA',
+          location: { scope: 'personal', spaceId: 'personal-a' },
+        },
+      }).success,
+    ).toBe(true)
+    expect(
+      RoleContextViewSchema.safeParse({
+        ...fields,
+        scope: 'space',
+        space: 'team',
+        locator: {
+          source: 'owned',
+          kind: 'role',
+          packageId: 'RoleBBBBBBBB',
+          location: { scope: 'space', spaceId: 'space-a' },
+        },
+      }).success,
     ).toBe(true)
     expect(
       RoleContextViewSchema.safeParse({
@@ -775,6 +823,12 @@ describe('agent context constructor (#165)', () => {
         scope: 'project',
         space: 'team',
         project: 'team/docs',
+        locator: {
+          source: 'owned',
+          kind: 'role',
+          packageId: 'RoleCCCCCCCC',
+          location: { scope: 'project', spaceId: 'space-a', projectId: 'project-a' },
+        },
       }).success,
     ).toBe(true)
 
@@ -788,18 +842,22 @@ describe('agent context constructor (#165)', () => {
 
 describe('agent roles', () => {
   it('registers inventory, detail, and Add operations in the central REST contract', () => {
+    expect(contract.agentAbilityDetail.response).toBe(AgentAbilityDetailResponseSchema)
+    expect(contract.agentAbilityEnabled.request).toBe(SetAgentAbilityEnabledRequestSchema)
+    expect(contract.agentAbilityEnabled.response).toBe(SetAgentAbilityEnabledResponseSchema)
+    expect(contract.agentAbilityAvailability.request).toBe(SetAgentAbilityAvailabilityRequestSchema)
+    expect(contract.agentAbilityAvailability.response).toBe(
+      SetAgentAbilityAvailabilityResponseSchema,
+    )
+    expect(contract.agentRoles.request).toBe(AgentPackageLibraryQuerySchema)
     expect(contract.agentRoles.response).toBe(MeAgentRolesResponseSchema)
-    expect(contract.agentRoleDetail.request).toBe(AgentRoleDetailRequestSchema)
-    expect(contract.agentRoleDetail.response).toBe(AgentRoleDetailResponseSchema)
+    // Detail is ONE operation for both kinds, addressed by an exact locator. A
+    // per-kind, name-addressed detail entry would be a second way to say the same
+    // thing — and the one that cannot tell two same-name placements apart.
+    expect(contract).not.toHaveProperty('agentRoleDetail')
+    expect(contract).not.toHaveProperty('agentSkillDetail')
     expect(contract.agentRoleAdd.request).toBe(AddAgentRoleRequestSchema)
     expect(contract.agentRoleAdd.response).toBe(AddAgentRoleResponseSchema)
-  })
-
-  it('combines detail path params and query into one registry request schema', () => {
-    expect(
-      AgentRoleDetailRequestSchema.safeParse({ name: 'research', scope: 'catalog' }).success,
-    ).toBe(true)
-    expect(AgentRoleDetailRequestSchema.safeParse({ name: 'research' }).success).toBe(false)
   })
 
   it('requires a project only for an exact project placement', () => {
@@ -823,5 +881,266 @@ describe('agent roles', () => {
         project: 'team/docs',
       }).success,
     ).toBe(false)
+  })
+
+  it('carries a role\u2019s project versions as a property, never as items of their own', () => {
+    const base = {
+      locator: {
+        source: 'owned',
+        kind: 'role',
+        packageId: 'AbCdefGhij_1',
+        location: { scope: 'space', spaceId: 'team-space-id' },
+      },
+      title: 'Launch review',
+      name: 'launch-review',
+      description: 'Review launch readiness.',
+      noteId: 'ZyXwvUtsrq_1',
+      origin: 'custom',
+      source: 'owned',
+      enabled: true,
+      availability: { mode: 'selected-projects', projectIds: ['project-web'] },
+      versions: [
+        {
+          projectId: 'project-web',
+          locator: {
+            source: 'owned',
+            kind: 'role',
+            packageId: 'AbCdefGhij_2',
+            location: { scope: 'project', spaceId: 'team-space-id', projectId: 'project-web' },
+          },
+        },
+      ],
+    }
+    const page = {
+      projects: [],
+      activeRole: null,
+      filteredTotal: 1,
+      nextCursor: null,
+      facets: {
+        source: { system: 0, catalog: 0, owned: 1 },
+        home: { personal: 0, space: 1 },
+        availability: { all: 0, selected: 1 },
+        projects: [],
+      },
+    }
+
+    expect(MeAgentRolesResponseSchema.safeParse({ ...page, items: [base] }).success).toBe(true)
+    // A version is addressed by an exact ROLE locator; a skill locator there would
+    // mean the collapse mixed two kinds into one entry.
+    expect(
+      MeAgentRolesResponseSchema.safeParse({
+        ...page,
+        items: [
+          {
+            ...base,
+            versions: [
+              {
+                projectId: 'project-web',
+                locator: {
+                  source: 'owned',
+                  kind: 'skill',
+                  packageId: 'AbCdefGhij_2',
+                  location: { scope: 'space', spaceId: 'team-space-id' },
+                },
+              },
+            ],
+          },
+        ],
+      }).success,
+    ).toBe(false)
+  })
+
+  it('states where an ability is effective and where it lives, refusing empty answers', () => {
+    expect(contract.agentAbilityVersions.request).toBe(CreateAbilityVersionRequestSchema)
+    expect(contract.agentAbilityHome.request).toBe(SetAbilityHomeRequestSchema)
+    expect(
+      SetAgentAbilityAvailabilityRequestSchema.safeParse({ mode: 'all-projects' }).success,
+    ).toBe(true)
+    // "Selected, but nothing selected" is not a reach — it is an ability nobody can
+    // use, arrived at by accident.
+    expect(
+      SetAgentAbilityAvailabilityRequestSchema.safeParse({
+        mode: 'selected-projects',
+        projectIds: [],
+      }).success,
+    ).toBe(false)
+    expect(CreateAbilityVersionRequestSchema.safeParse({ projectId: 'project-web' }).success).toBe(
+      true,
+    )
+    expect(CreateAbilityVersionRequestSchema.safeParse({}).success).toBe(false)
+    // One direction only: a project version becomes the Space base. Sending a role
+    // DOWN or sideways had no caller — where an ability belongs is edited as a
+    // property, and a project body is created through `/versions`. Personal is a
+    // different space besides, and the engine cannot move a note between two.
+    expect(SetAbilityHomeRequestSchema.safeParse({ scope: 'space' }).success).toBe(true)
+    expect(
+      SetAbilityHomeRequestSchema.safeParse({ scope: 'project', projectId: 'project-web' }).success,
+    ).toBe(false)
+    expect(SetAbilityHomeRequestSchema.safeParse({ scope: 'project' }).success).toBe(false)
+    expect(SetAbilityHomeRequestSchema.safeParse({ scope: 'personal' }).success).toBe(false)
+    // The reach a promotion keeps is not optional: a move that stated nothing would
+    // read as the Space-wide default and silently widen the role.
+    expect(
+      SetAbilityHomeResponseSchema.safeParse({
+        locator: {
+          source: 'owned',
+          kind: 'role',
+          packageId: 'AAAAAAAAAAAA',
+          location: { scope: 'space', spaceId: 'space-team' },
+        },
+        noteId: 'AAAAAAAAAAAA',
+      }).success,
+    ).toBe(false)
+  })
+
+  it('accepts an H1-authored Role without a description', () => {
+    expect(
+      CreateAgentRoleRequestSchema.safeParse({
+        name: 'review-changes',
+        description: '',
+        instructions: '# Review changes',
+        scope: 'personal',
+      }).success,
+    ).toBe(true)
+    expect(
+      CreateAgentRoleRequestSchema.safeParse({
+        name: 'review-changes',
+        description: '',
+        instructions: 'Review the changes.',
+        scope: 'personal',
+      }).success,
+    ).toBe(false)
+  })
+})
+
+describe('agent skills', () => {
+  const project = {
+    id: 'project-docs',
+    handle: 'team/docs',
+    displayName: 'Docs',
+    space: 'team',
+    status: 'active' as const,
+  }
+
+  it('registers a separate bounded inventory and catalog preview', () => {
+    expect(contract.agentSkills.request).toBe(AgentPackageLibraryQuerySchema)
+    expect(contract.agentSkills.response).toBe(MeAgentSkillsResponseSchema)
+    expect(contract.agentSkillAdd.request).toBe(AddAgentSkillRequestSchema)
+    expect(contract.agentSkillAdd.response).toBe(AddAgentSkillResponseSchema)
+  })
+
+  it('keeps catalog identities read-only and owned identities note-addressable', () => {
+    expect(
+      MeAgentSkillsResponseSchema.safeParse({
+        items: [
+          {
+            locator: { source: 'catalog', kind: 'skill', packageId: 'CatalogProof' },
+            title: 'Grooming evidence',
+            name: 'grooming-evidence',
+            description: 'Catalog template.',
+            source: 'catalog',
+          },
+          {
+            locator: {
+              source: 'owned',
+              kind: 'skill',
+              packageId: 'PersonalProo',
+              location: { scope: 'personal', spaceId: 'personal-space-id' },
+            },
+            title: 'Personal proof',
+            name: 'personal-proof',
+            description: 'Custom.',
+            noteId: 'AbCdefGhij_1',
+            source: 'owned',
+            origin: 'custom',
+            enabled: true,
+          },
+          {
+            locator: {
+              source: 'owned',
+              kind: 'skill',
+              packageId: 'SpaceProof12',
+              location: { scope: 'space', spaceId: 'team-space-id' },
+            },
+            title: 'Space proof',
+            name: 'space-proof',
+            description: 'Forked.',
+            noteId: 'ZyXwvUtsrq_2',
+            origin: 'catalog',
+            originRevision: `sha256:${'a'.repeat(64)}`,
+            source: 'owned',
+            enabled: false,
+          },
+        ],
+        projects: [project],
+        filteredTotal: 3,
+        nextCursor: null,
+        facets: {
+          source: { system: 0, catalog: 1, owned: 2 },
+          home: { personal: 1, space: 1 },
+          availability: { all: 1, selected: 1 },
+          projects: [{ project, count: 2 }],
+        },
+        truncated: true,
+      }).success,
+    ).toBe(true)
+    expect(
+      MeAgentSkillsResponseSchema.safeParse({
+        items: [
+          {
+            locator: { source: 'catalog', kind: 'skill', packageId: 'CatalogProof' },
+            title: 'Grooming evidence',
+            name: 'grooming-evidence',
+            description: 'Catalog template.',
+            source: 'catalog',
+            noteId: 'must-not-exist',
+          },
+        ],
+        projects: [],
+        filteredTotal: 1,
+        nextCursor: null,
+        facets: {
+          source: { system: 0, catalog: 1, owned: 0 },
+          home: { personal: 0, space: 0 },
+          availability: { all: 0, selected: 0 },
+          projects: [],
+        },
+      }).success,
+    ).toBe(false)
+    expect(
+      AddAgentSkillRequestSchema.safeParse({
+        name: 'grooming-evidence',
+        scope: 'space',
+        space: 'team',
+        availability: { mode: 'selected-projects', projects: ['team/docs'] },
+      }).success,
+    ).toBe(true)
+    expect(
+      AddAgentSkillRequestSchema.safeParse({
+        name: 'grooming-evidence',
+        scope: 'space',
+        space: 'team',
+      }).success,
+    ).toBe(false)
+  })
+
+  it('shares the server-side library query without accepting the old active-space dump', () => {
+    const query = {
+      q: 'evidence',
+      source: 'owned',
+      home: 'space',
+      availability: 'selected',
+      project: 'team/docs',
+      limit: '25',
+      cursor: 'opaque',
+    }
+
+    // Roles and Skills share ONE query schema: the same three filters, the same
+    // bound, the same cursor — a second copy is how the two libraries drift.
+    expect(contract.agentRoles.request).toBe(contract.agentSkills.request)
+    expect(AgentPackageLibraryQuerySchema.safeParse(query).success).toBe(true)
+    expect(AgentPackageLibraryQuerySchema.safeParse({}).success).toBe(true)
+    expect(AgentPackageLibraryQuerySchema.safeParse({ space: 'team' }).success).toBe(false)
+    expect(AgentPackageLibraryQuerySchema.safeParse({ limit: 101 }).success).toBe(false)
   })
 })

@@ -7,6 +7,9 @@ import styles from './Select.module.scss'
 type SelectOption<T extends string> = {
   value: T
   label: string
+  /** Options carrying the same group are listed together under its caption, so the
+   *  group name is stated once instead of being suffixed onto every label. */
+  group?: string
 }
 
 type SelectProps<T extends string> = {
@@ -78,12 +81,17 @@ export const Select = <T extends string = string>({
           minWidth={menu.width}
           elevated={elevated}
           ignoreRef={triggerRef}
-          items={options.map((o) => ({
-            label: o.label,
-            radioGroup: ariaLabel ?? 'Select option',
-            active: o.value === value,
-            onClick: () => onChange(o.value),
-          }))}
+          items={options.flatMap((o, index) => {
+            const opening = o.group && o.group !== options[index - 1]?.group
+            const row = {
+              label: o.label,
+              radioGroup: o.group ?? ariaLabel ?? 'Select option',
+              active: o.value === value,
+              onClick: () => onChange(o.value),
+            }
+
+            return opening ? [{ heading: o.group }, row] : [row]
+          })}
           onClose={() => setMenu(null)}
         />
       )}

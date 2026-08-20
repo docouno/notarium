@@ -8,7 +8,7 @@ import {
 } from '../consts/primitives'
 import { enumValues } from '../libs/enumValues'
 
-const isWellFormedUnicode = (value: string): boolean => {
+export const isWellFormedUnicode = (value: string): boolean => {
   for (let i = 0; i < value.length; i++) {
     const unit = value.charCodeAt(i)
 

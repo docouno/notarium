@@ -222,7 +222,10 @@ export class CachedStore implements KnowledgeStore {
   exportNotes?: (opts?: { scope?: ReadScope }) => AsyncIterable<ExportEntry>
   /** Optional directory mutations mirror the underlying engine honestly. */
   makeDir?: (path: string, opts?: MutationOptions) => Promise<void>
-  removeDir?: (path: string, opts?: MutationOptions & { principal?: string }) => Promise<void>
+  removeDir?: (
+    path: string,
+    opts?: MutationOptions & { principal?: string; agent?: AgentWriteAttribution },
+  ) => Promise<void>
   private readonly pollIntervalMs: number
   private readonly now: () => Date
   /** This store's space. The journal/CAS tables are SHARED across spaces (partitioned by a `space`

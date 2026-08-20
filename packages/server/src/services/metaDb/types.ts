@@ -1,3 +1,5 @@
+import { type ABILITY_AVAILABILITY_MODE } from '@notarium/contract'
+import type { OwnedAbilityLocator, SystemAbilityLocator } from '@notarium/contract'
 import type {
   AgentSessionAttach,
   CausalOutboxPersistence,
@@ -102,6 +104,116 @@ export type ProjectsPersistence = {
    *  plain-folder rows share the table). Segment-boundary safe (`demo` ≠ `demofoo`).
    *  Best-effort; a blip self-heals at the next boot reconcile. */
   renamePrefix(space: string, oldPrefix: string, newPrefix: string): Promise<void>
+}
+
+// ── owned ability availability ───────────────────────────────────────
+
+export type AbilityAvailability =
+  | { mode: typeof ABILITY_AVAILABILITY_MODE.allProjects }
+  | { mode: typeof ABILITY_AVAILABILITY_MODE.selectedProjects; projectIds: string[] }
+
+export type AbilityAvailabilityRecord = AbilityAvailability & {
+  /** Stable id of the Space-owned package's home. */
+  homeSpace: string
+  /** Immutable package directory id used by exact role locators. */
+  packageId: string
+}
+
+/** The registry note whose permanent purge ends this policy — the SECOND key, and
+ *  not derivable from the first. The package id is the directory name, and claim
+ *  arbitration makes the two differ: the directory keeps the id its manifest declared
+ *  while the note is issued a different one (`roles/library.ts`: "the two differ after
+ *  claim arbitration"). A row that does not carry it is swept by the package id, the
+ *  pre-arbitration assumption, and nothing better is available for it. */
+/** The durable identity the projection gave this package, or `null` when the caller
+ * writes the policy BEFORE the package is readable — the one honest case. Stated,
+ * never omitted: a row that does not know its registry note falls back to the
+ * pre-arbitration key, and the difference only shows on a purge. */
+export type AbilityAvailabilityRegistryNote = string | null
+
+export type AbilityAvailabilityPersistence = {
+  get(homeSpace: string, packageId: string): Promise<AbilityAvailabilityRecord | null>
+  listForSpace(homeSpace: string): Promise<AbilityAvailabilityRecord[]>
+  /** Whole-set replacement; selected project ids must belong to homeSpace. */
+  set(
+    homeSpace: string,
+    packageId: string,
+    availability: AbilityAvailability,
+    registryNoteId: AbilityAvailabilityRegistryNote,
+  ): Promise<void>
+  /** Idempotently makes a Space-owned package available to one project. */
+  grantProject(
+    homeSpace: string,
+    packageId: string,
+    projectId: string,
+    registryNoteId: AbilityAvailabilityRegistryNote,
+  ): Promise<void>
+  /** Forget the policy entirely — the ability no longer has a Space home to reach
+   *  FROM. Deliberately not `set(selected, [])`: for a Role an absent row means
+   *  "everywhere", while an empty selection means "nowhere", so leaving one behind
+   *  would silently disable the role if it ever came back up to the Space. */
+  clear(homeSpace: string, packageId: string): Promise<void>
+}
+
+// ── owned ability placement ──────────────────────────────────────────
+
+/** One promotion of an owned Role from its project version to the Space base,
+ *  addressed the two ways the meta-DB stores that placement. Both are opaque
+ *  strings here: the context target id `${scope}:${ownerId}:${packageId}` and the
+ *  serialized `AbilityLocator`. The DOMAIN owns their grammar — persistence only
+ *  rewrites the rows that point at the old address. */
+export type OwnedRolePlacementMove = {
+  fromTargetId: string
+  toTargetId: string
+  fromLocator: string
+  toLocator: string
+}
+
+/** Placement is part of an owned Role's ADDRESS: the context target encodes the
+ *  scope and its owner id, the preference key holds the whole locator, and a live
+ *  episode remembers the exact package it resumed. Moving the package without
+ *  moving these leaves pins, sets, order, the owner's `disabled` bit and the
+ *  session binding pointing at an address that no longer exists — so this is one
+ *  transaction, not five calls. OPTIONAL: a meta-DB-less host has none of it. */
+export type AbilityPlacementPersistence = {
+  moveOwnedRolePlacement(move: OwnedRolePlacementMove): Promise<void>
+}
+
+// ── owner ability preferences ────────────────────────────────────────
+
+export type AbilityPreferenceLocator = SystemAbilityLocator | OwnedAbilityLocator
+
+/** The address an episode is bound to. The same two sources as a preference row, for
+ *  the same reason: both ask about an ability the host ships or the owner owns. */
+export type ActiveRoleLocator = AbilityPreferenceLocator
+
+export type AbilityPreferenceTarget =
+  { locator: SystemAbilityLocator } | { locator: OwnedAbilityLocator; registryNoteId: string }
+
+/** The lifecycle fence of the ability tables, refused with a MACHINE-readable code.
+ *  A route answers "not found" for an ability whose registry note or whose Space is
+ *  gone for good, and stays loud about an internal failure — it cannot tell the two
+ *  apart from a bare `Error`, so the losing side of the race used to reach the client
+ *  as a 500. Every implementation of these facets refuses with this exact shape. */
+export const ABILITY_TARGET_PURGED = 'ABILITY_TARGET_PURGED'
+
+export const abilityTargetPurgedError = (message: string): Error =>
+  Object.assign(new Error(message), { code: ABILITY_TARGET_PURGED })
+
+export const isAbilityTargetPurgedError = (error: unknown): boolean =>
+  (error as { code?: unknown } | null)?.code === ABILITY_TARGET_PURGED
+
+/** Sparse owner overrides: an absent row means enabled. Catalog packages cannot
+ * be activated and therefore cannot have a preference. */
+export type AbilityPreferencesPersistence = {
+  isEnabled(owner: string, locator: AbilityPreferenceLocator): Promise<boolean>
+  disabled(owner: string, locators: readonly AbilityPreferenceLocator[]): Promise<Set<string>>
+  setEnabled(
+    owner: string,
+    target: AbilityPreferenceTarget,
+    enabled: boolean,
+    updatedAt: string,
+  ): Promise<void>
 }
 
 /** Persistence for `type='folder'` rows of the shared `folders` table (a separate
@@ -551,6 +663,18 @@ export type AgentSessionRecord = {
   calls: number
   /** Latest explicitly selected effective role, or null for the base mode. */
   role: string | null
+  /** Exact Owned role locator selected when `role` is non-null. */
+  /** The address the episode is bound to. Either source: a System role is activated by
+   *  the same resolver and must survive a resume the same way an Owned one does. */
+  roleLocator: ActiveRoleLocator | null
+  /** Project context in which selection was resolved, independent of placement. */
+  roleContextProjectId: string | null
+}
+
+export type AgentSessionRoleSelection = {
+  name: string
+  locator: ActiveRoleLocator
+  contextProjectId: string | null
 }
 
 export type AgentSessionRoleSet = {
@@ -590,8 +714,13 @@ export type AgentSessionsPersistence = {
   ): Promise<AgentSessionNamedStart>
   listRecent(owner: string, since: string, limit: number): Promise<AgentSessionRecord[]>
   /** Set the active role atomically; `changed=false` is the idempotent repeat. */
-  setRole(owner: string, id: string, role: string): Promise<AgentSessionRoleSet | null>
-  prune(before: string): Promise<void>
+  setRole(
+    owner: string,
+    id: string,
+    role: AgentSessionRoleSelection,
+  ): Promise<AgentSessionRoleSet | null>
+  /** Delete expired rows and return every distinct owner whose read model changed. */
+  prune(before: string): Promise<string[]>
 }
 
 // ── Owner session audit read model ─────────────────────────────
@@ -1171,6 +1300,9 @@ export type MetaDb = {
   contextSets: ContextSetsPersistence
   scopePins: ScopePinsPersistence
   contextOrder: ContextOrderPersistence
+  abilityAvailability: AbilityAvailabilityPersistence
+  abilityPreferences: AbilityPreferencesPersistence
+  abilityPlacement: AbilityPlacementPersistence
   oauth: OAuthPersistence
   jobs: JobsPersistence
   /** Destination claims of a running import (#302). */

@@ -138,4 +138,15 @@ export class InMemoryContextSets implements ContextSetsPersistence {
       .filter((s): s is ContextSetRecord => s != null)
       .map((s) => ({ ...s, items: s.items.map((i) => ({ ...i })) }))
   }
+
+  /** Re-address a role's attachments when its package changes placement — the
+   *  drivers' delete-then-update: whatever sits at the destination belongs to the
+   *  package being moved, so it is cleared rather than colliding on the key. */
+  moveRoleTarget(fromTargetId: string, toTargetId: string): void {
+    this.attachments = this.attachments
+      .filter((a) => !(a.targetKind === 'role' && a.targetId === toTargetId))
+      .map((a) =>
+        a.targetKind === 'role' && a.targetId === fromTargetId ? { ...a, targetId: toTargetId } : a,
+      )
+  }
 }

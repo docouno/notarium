@@ -756,6 +756,78 @@ describe('NotariumStore external edit convergence', () => {
     }
   })
 
+  it('edits and deletes a note whose file was authored with a UTF-8 byte order mark', async () => {
+    const root = await mkroot()
+    // Files a Windows editor — or a restore from the trash — leaves in the vault.
+    // The mark is part of the BYTES every reader here decodes: `read` emits it, so
+    // the index fingerprints it. A mutation path that decoded the same bytes
+    // without it hashed a different string and never matched its own baseline.
+    await fs.writeFile(join(root, 'edited.md'), '\uFEFF---\ntitle: Edited\n---\n\nold body\n')
+    await fs.writeFile(join(root, 'dropped.md'), '\uFEFF---\ntitle: Dropped\n---\n\nbody\n')
+    const store = createNotariumStore({ notesDir: root, integritySweepBatchSize: 0 })
+
+    try {
+      expect((await store.read('edited.md')).title).toBe('Edited')
+      await expect(
+        store.write({ title: 'Edited', content: 'new body\n', originalId: 'edited.md' }),
+      ).resolves.toMatchObject({ filePath: 'edited.md' })
+      expect((await store.read('edited.md')).content).toBe('new body\n')
+
+      // The delete the write engine actually issues binds the exact incarnation
+      // it read, so the bytes it proves against travel through the same decoder.
+      const dropped = await store.read('dropped.md')
+      expect(dropped.title).toBe('Dropped')
+      await expect(
+        store.remove('dropped.md', { expectedSource: dropped.physicalIncarnation }),
+      ).resolves.toBeUndefined()
+      await expect(store.read('dropped.md')).rejects.toThrow('not found')
+    } finally {
+      await store.stop()
+    }
+  })
+
+  it('reads a byte-order-marked note with no frontmatter by its own heading, undecodable bytes included', async () => {
+    const root = await mkroot()
+    // A converter that stamps a UTF-8 mark on a legacy-encoded file leaves BOTH: the
+    // mark and bytes no UTF-8 reader can decode. DocumentState has no projection to
+    // offer for those bytes, so read() falls through to the file parse — which must
+    // still find the note's own heading title behind the mark. When it did not, the
+    // note took its FILENAME as the title and kept mark plus heading in the body, and
+    // the first ordinary save wrote that second heading into the user's file for good.
+    const bytes = Buffer.concat([
+      Buffer.from('\uFEFF# Hello\n\nbo', 'utf8'),
+      Buffer.from([0xc3, 0x28]),
+      Buffer.from('dy\n', 'utf8'),
+    ])
+    await fs.writeFile(join(root, 'x.md'), bytes)
+    const store = createNotariumStore({ notesDir: root, integritySweepBatchSize: 0 })
+
+    try {
+      expect((await store.list()).map((note) => note.title)).toEqual(['Hello'])
+      const read = await store.read('x.md')
+
+      expect(read.documentState?.projection).toBeNull()
+      expect(read.title).toBe('Hello')
+      expect(read.content).toBe('bo\uFFFD(dy\n')
+      expect(read.logicalState?.markdown).toBe('---\ntitle: Hello\n---\nbo\uFFFD(dy\n')
+
+      // The ordinary editor round-trip: save back exactly what the read served.
+      const saved = await store.write({
+        title: read.title!,
+        content: read.content,
+        originalId: 'x.md',
+      })
+      const savedPath = saved.filePath!
+      const after = await fs.readFile(join(root, savedPath), 'utf8')
+
+      expect(after.match(/^# .*$/gm)).toEqual(['# Hello'])
+      expect(after).not.toContain('\uFEFF')
+      expect((await store.read(savedPath)).title).toBe('Hello')
+    } finally {
+      await store.stop()
+    }
+  })
+
   it('refuses a write after a same-semantic physical incarnation replacement', async () => {
     const root = await mkroot()
     const store = createNotariumStore({ notesDir: root, integritySweepBatchSize: 0 })

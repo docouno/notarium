@@ -1,4 +1,4 @@
-import type { RoleSummary } from '@notarium/contract'
+import type { EffectiveRoleSummary } from '@notarium/contract'
 import type {
   ListRolesInput,
   ListRolesOutput,
@@ -44,11 +44,11 @@ const safeSummary = <T extends { name: string; description: string }>(summary: T
     : {}),
 })
 
-export const assertRoleAvailable = (
-  available: RoleSummary[],
+export const assertRoleAvailable = <T extends { name: string; description: string }>(
+  available: readonly T[],
   name: string,
   inventoryTruncated = false,
-): RoleSummary => {
+): T => {
   const summary = available.find((role) => role.name === name)
 
   if (!summary) {
@@ -61,10 +61,10 @@ export const assertRoleAvailable = (
         : ''
     throw new ToolFailure(
       names.length
-        ? `role "${name}" is not added in this scope — available roles: ${names.join(', ')}${tail}${boundedHint}`
+        ? `role "${name}" is not effective in this scope — available roles: ${names.join(', ')}${tail}${boundedHint}`
         : inventoryTruncated
           ? `role "${name}" is not visible in the bounded inventory — call list_roles to inspect the available window`
-          : `role "${name}" is not added in this scope — add a role from the Notarium catalog first`,
+          : `role "${name}" is not effective in this scope — add one from the Notarium catalog, or re-enable a System role the owner turned off`,
     )
   }
 
@@ -77,16 +77,17 @@ export const activateRole = async (
   name: string,
   budgetTokens: number,
   preloaded?: LoadedEffectiveRole,
-  knownListing?: { roles: RoleSummary[]; truncated: boolean },
+  knownListing?: { roles: EffectiveRoleSummary[]; truncated: boolean },
   precuratedContext?: UseRoleOutput['context'],
 ): Promise<UseRoleOutput> => {
   if (!ctx.roles) {
     throw new ToolFailure('roles are unavailable on this host')
   }
-  const loaded = preloaded ?? (await ctx.roles.loadEffective(context, name, budgetTokens))
+  const loaded =
+    preloaded ?? (await ctx.roles.loadEffective(context, ctx.principal, name, budgetTokens))
 
   if (!loaded) {
-    const listing = knownListing ?? (await ctx.roles.listEffective(context))
+    const listing = knownListing ?? (await ctx.roles.listEffective(context, ctx.principal))
     assertRoleAvailable(listing.roles, name, listing.truncated)
     throw new ToolFailure(`role "${name}" is not available in this scope`)
   }
@@ -97,14 +98,25 @@ export const activateRole = async (
   // Resolve every fallible package/context dependency before changing durable episode
   // state. A failed activation must never reappear as active on the next resume.
   if (ctx.agentSessions && ctx.session) {
-    const set = await ctx.agentSessions.setRole(ctx.session, name)
+    // The address the resolver landed on, not one rebuilt from its placement: a System
+    // role has no placement to rebuild from, and every rebuild was a second producer.
+    const set = await ctx.agentSessions.setRole(ctx.session, {
+      name: loaded.role.name,
+      locator: loaded.locator,
+      contextProjectId: context.project?.id ?? null,
+    })
     status = set.changed ? 'activated' : 'already_active'
   }
 
+  // The loaded role carries its body; the body travels as its OWN field. Spreading the
+  // whole thing put `instructions` inside the summary too, which the wire shape simply
+  // stripped until its arms became strict.
+  const { instructions, ...summary } = loaded.role
+
   return {
     status,
-    role: safeSummary(loaded.role),
-    instructions: sanitizeText(loaded.role.instructions),
+    role: safeSummary(summary),
+    instructions: sanitizeText(instructions),
     skills: loaded.skills.map((skill) => ({
       name: sanitizeText(skill.name),
       description: sanitizeText(skill.description),
@@ -132,7 +144,7 @@ export const handleListRoles: Handler = async (ctx, rawArgs) => {
   const input = rawArgs as ListRolesInput
   const project = input.project ? await ctx.resolveProject(input.project) : undefined
   const listing = ctx.roles
-    ? await ctx.roles.listEffective(await roleContext(ctx, project))
+    ? await ctx.roles.listEffective(await roleContext(ctx, project), ctx.principal)
     : { roles: [], truncated: false }
   const available = listing.roles
   const offset = Number(input.cursor ?? 0)
@@ -146,10 +158,14 @@ export const handleListRoles: Handler = async (ctx, rawArgs) => {
   }
   const lines = roles.length
     ? [
-        `**Added roles ${offset + 1}-${next} of ${available.length}:**`,
-        ...roles.map((role) => `- \`${role.name}\` (${role.scope}) — ${role.description}`),
+        `**Effective roles ${offset + 1}-${next} of ${available.length}:**`,
+        // A System role has no placement to name, so its SOURCE is what the line states.
+        ...roles.map(
+          (role) =>
+            `- \`${role.name}\` (${role.source === 'system' ? 'system' : role.scope}) — ${role.description}`,
+        ),
       ]
-    : ['No added roles in this page.']
+    : ['No effective roles in this page.']
 
   if (structured.nextCursor) {
     lines.push(`Continue with cursor \`${structured.nextCursor}\`.`)

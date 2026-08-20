@@ -4,11 +4,23 @@ import { advanceConnectionRevisions, advanceObservationEpoch } from './connectio
 
 describe('SSE connection revision', () => {
   it('advances on every successful transport connection', () => {
-    const first = advanceConnectionRevisions({ connectionRevision: 0, observationEpoch: 0 })
+    const first = advanceConnectionRevisions({
+      connectionRevision: 0,
+      observationEpoch: 0,
+      agentSessionsRevision: 0,
+    })
     const reconnect = advanceConnectionRevisions(first)
 
-    expect(first).toEqual({ connectionRevision: 1, observationEpoch: 1 })
-    expect(reconnect).toEqual({ connectionRevision: 2, observationEpoch: 2 })
+    expect(first).toEqual({
+      connectionRevision: 1,
+      observationEpoch: 1,
+      agentSessionsRevision: 1,
+    })
+    expect(reconnect).toEqual({
+      connectionRevision: 2,
+      observationEpoch: 2,
+      agentSessionsRevision: 2,
+    })
   })
 
   it('advances the request epoch before a changed frame reaches consumers', () => {

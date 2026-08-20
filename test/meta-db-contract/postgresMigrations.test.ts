@@ -111,10 +111,19 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
       await runPgMigrations(client, migrations)
 
       const result = await client.query(
-        'SELECT owner, name, calls, role FROM agent_sessions WHERE id = $1',
+        'SELECT owner, name, calls, role, role_locator, role_context_project_id FROM agent_sessions WHERE id = $1',
         ['ses_existingv1aa'],
       )
-      expect(result.rows).toEqual([{ owner: 'alice', name: 'Existing', calls: '7', role: null }])
+      expect(result.rows).toEqual([
+        {
+          owner: 'alice',
+          name: 'Existing',
+          calls: '7',
+          role: null,
+          role_locator: null,
+          role_context_project_id: null,
+        },
+      ])
     } finally {
       client.release()
       await pool.end()

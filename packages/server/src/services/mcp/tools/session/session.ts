@@ -1,6 +1,6 @@
 // start_session: the agent bootstrap bundle — profile/always-load, per-project index + delta, known-values vocabulary.
 // canon: docs/mcp-gateway.md#tools · docs/projects.md#init-context-curation
-import { type RoleSummary } from '@notarium/contract'
+import { type EffectiveRoleSummary } from '@notarium/contract'
 import {
   type AgentSession,
   type DeltaEntry,
@@ -12,7 +12,13 @@ import {
 import { buildMemoryIndex, isPathUnder, READ_SCOPE, treeChildren } from '@notarium/core'
 
 import { AGENT_SESSION_IDLE_MS } from '../../../agentSessions'
-import { type ProjectRecord } from '../../../metaDb'
+import type { Principal } from '../../../authz'
+import { type AgentSessionRecord, type ProjectRecord } from '../../../metaDb'
+import {
+  type EffectiveRoleContext,
+  type LoadedEffectiveRole,
+  type RolesService,
+} from '../../../roles'
 import { type SpaceStore } from '../../../spaces'
 import { type Ctx, type Handler, ToolFailure, toolsHelpFor } from '../../gateway'
 import { handleOf, notePath, projectLabelForNote } from '../../helpers/projectAddressing'
@@ -34,6 +40,30 @@ const KNOWN_CATEGORIES_LIMIT = 50
 const KNOWN_TAGS_LIMIT = 50
 /** Compact first-page discovery budget; list_roles paginates the continuation. */
 const ROLE_SUMMARIES_TOKEN_BUDGET = 1_000
+
+export const loadSavedSessionRole = async (
+  roles: RolesService,
+  context: EffectiveRoleContext,
+  principal: Principal,
+  saved: AgentSessionRecord,
+  budgetTokens: number,
+): Promise<LoadedEffectiveRole | null> => {
+  // A session binds a ROLE. The stored locator is the general ability shape, so the
+  // kind is asked here rather than left for the package read to notice.
+  if (!saved.role || saved.roleLocator?.kind !== 'role') {
+    return null
+  }
+  const currentProjectId = context.project?.id ?? null
+
+  // The project the session was bound IN, which is not the same question as where
+  // the role lives: a personal role resumed from another project is still the wrong
+  // session, even though its placement is reachable from both.
+  if (saved.roleContextProjectId !== currentProjectId) {
+    return null
+  }
+
+  return roles.loadSavedRole(context, principal, saved.roleLocator, budgetTokens)
+}
 
 /** Session names are agent-supplied labels, so normalise control characters and
  * defang prompt-control pseudo-tags before storage and every wire projection. */
@@ -236,11 +266,11 @@ export const handleStartSession: Handler = async (ctx, rawArgs) => {
   const hinted = project !== undefined ? await ctx.resolveProject(project) : undefined
   const effectiveRoleContext = await roleContext(ctx, hinted)
   const effectiveRoleListing = ctx.roles
-    ? await ctx.roles.listEffective(effectiveRoleContext)
+    ? await ctx.roles.listEffective(effectiveRoleContext, ctx.principal)
     : { roles: [], truncated: false }
   const effectiveRoles = effectiveRoleListing.roles
   const selectedRolePackage = selectedRole
-    ? await ctx.roles?.loadEffective(effectiveRoleContext, selectedRole, 4_000)
+    ? await ctx.roles?.loadEffective(effectiveRoleContext, ctx.principal, selectedRole, 4_000)
     : undefined
 
   if (selectedRole) {
@@ -270,13 +300,20 @@ export const handleStartSession: Handler = async (ctx, rawArgs) => {
   ctx.session = opened?.session
   // A resumed episode must rehydrate its saved prompt after client/model context
   // loss. Explicit same-role selection and implicit resume both include the body.
-  const savedRole = opened?.session?.record.role
-  const roleToHydrate = selectedRole ?? savedRole
-  const rolePackageToHydrate = selectedRolePackage
-    ? selectedRolePackage
-    : roleToHydrate && ctx.roles
-      ? await ctx.roles.loadEffective(effectiveRoleContext, roleToHydrate, 4_000)
-      : null
+  const saved = opened?.session?.record
+  let rolePackageToHydrate = selectedRolePackage ?? null
+
+  if (!selectedRole && saved && ctx.roles) {
+    // Same-context resumes use the immutable locator. A context change returns
+    // base mode without rebinding the public name.
+    rolePackageToHydrate = await loadSavedSessionRole(
+      ctx.roles,
+      effectiveRoleContext,
+      ctx.principal,
+      saved,
+      4_000,
+    )
+  }
   const projects = await ctx.readableProjects()
   const {
     profile,
@@ -286,19 +323,18 @@ export const handleStartSession: Handler = async (ctx, rawArgs) => {
   } = await curateAgentContext(ctx, hinted, rolePackageToHydrate)
   const bundle = hinted ? await buildProjectBundle(ctx, hinted, acknowledge) : undefined
   const curatedRoles = curateRoleSummaries(effectiveRoles, ROLE_SUMMARIES_TOKEN_BUDGET)
-  const roles: RoleSummary[] = curatedRoles.roles
-  const activeRole: UseRoleOutput | undefined =
-    roleToHydrate && rolePackageToHydrate
-      ? await activateRole(
-          ctx,
-          effectiveRoleContext,
-          roleToHydrate,
-          4_000,
-          rolePackageToHydrate,
-          effectiveRoleListing,
-          activeRoleContext,
-        )
-      : undefined
+  const roles: EffectiveRoleSummary[] = curatedRoles.roles
+  const activeRole: UseRoleOutput | undefined = rolePackageToHydrate
+    ? await activateRole(
+        ctx,
+        effectiveRoleContext,
+        rolePackageToHydrate.role.name,
+        4_000,
+        rolePackageToHydrate,
+        effectiveRoleListing,
+        activeRoleContext,
+      )
+    : undefined
   // Fold bundle-internal `indexTruncated` into the top-level signal, then drop it.
   const truncated = curationTruncated || Boolean(bundle?.indexTruncated)
 

@@ -1,3 +1,6 @@
+export * from './abilityAvailability'
+export * from './abilityPlacement'
+export * from './abilityPreferences'
 export * from './catalog'
 export * from './context'
 export * from './errors'

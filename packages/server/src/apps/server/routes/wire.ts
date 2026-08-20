@@ -1,10 +1,12 @@
 // The transport boundary's domain↔wire mappers.
 // canon: docs/contract.md#mappers-at-the-boundaries-a-idmappersa
 
-import { ACTIVITY_EVENT_KIND, REVISION_KIND } from '@notarium/contract'
+import { ACTIVITY_EVENT_KIND, REVISION_KIND, ROLE_SCOPE } from '@notarium/contract'
 import type {
   ActivityEventKind,
+  AgentAbilitySummary,
   Author,
+  ContextRoleSummary,
   CreateNoteRequest,
   MoveRequest,
   RevisionUnavailableReason,
@@ -23,6 +25,7 @@ import type {
 import {
   DOCUMENT_STATE_FORMAT,
   documentSourceText,
+  frontmatterScalarEntry,
   RESOLVED_VIA,
   REVISION_ENTRY_ROLE,
   REVISION_RESTORE_AVAILABILITY,
@@ -30,6 +33,13 @@ import {
 } from '@notarium/core'
 
 type WithoutAuthor<T> = T extends unknown ? Omit<T, 'author'> : never
+
+const skillFrontmatter = (body: {
+  description?: string
+}): ReturnType<typeof frontmatterScalarEntry>[] | undefined =>
+  body.description === undefined
+    ? undefined
+    : [frontmatterScalarEntry('description', body.description)]
 import type {
   ConflictNote,
   Graph,
@@ -73,12 +83,24 @@ export const noteDetailToWire = (
     d.deleted && d.documentState?.format === DOCUMENT_STATE_FORMAT.opaque
       ? documentSourceText(d.documentState)
       : undefined
+  const titleOrigin = d.documentState?.projection?.titleOrigin
+  const documentTitle =
+    titleOrigin?.kind === 'hidden-h1' ||
+    (titleOrigin?.kind === 'frontmatter' && titleOrigin.coupledH1Range)
+      ? titleOrigin.title
+      : undefined
 
   return {
     id: d.id,
     space,
     title: d.title,
     class: d.class,
+    ...(d.documentState?.projection?.skill
+      ? {
+          agentKind: d.documentState.projection.skill.role ? ('role' as const) : ('skill' as const),
+        }
+      : {}),
+    ...(documentTitle ? { documentTitle } : {}),
     filePath: d.filePath,
     content: d.content,
     frontmatter: d.frontmatter,
@@ -353,6 +375,7 @@ export const createToDomain = (body: CreateNoteRequest, principal: string): Writ
   slug: body.slug,
   // Absent stays absent — a normal save never touches `created`.
   createdAt: isoOrUndefined(body.createdAt),
+  frontmatter: skillFrontmatter(body),
   // Passed through as the client sent it: the wire enum admits only fail/uniquify,
   // and the domain's own default is fail — no route can widen that.
   ifExists: body.ifExists,
@@ -369,6 +392,7 @@ export const updateToDomain = (body: UpdateNoteRequest, principal: string): Writ
   tags: body.tags,
   slug: body.slug,
   createdAt: isoOrUndefined(body.createdAt),
+  frontmatter: skillFrontmatter(body),
   originalId: body.originalId,
   versionToken: body.versionToken,
   principal,
@@ -387,3 +411,111 @@ export const moveFolderToDomain = (path: string, destinationPath: string): MoveI
   isDirectory: true,
 })
 import { Buffer } from 'node:buffer'
+
+import type {
+  ContextPin,
+  ContextSetView,
+  OwnedAbilityLocator,
+  RoleContextIdentity,
+  RoleContextView,
+} from '@notarium/contract'
+
+import { abilityReachesProject, type AddressedRoleStatus } from '../../../services/roles'
+
+/** Does this ability's reach cover that project? Only a Space home carries a reach at
+ *  all; the rest is the service's rule, asked rather than restated. Spelled out here,
+ *  the copy was kind-blind — it read an absent row as "everywhere" for a SKILL too,
+ *  where the service reads it as "nothing selected". */
+export const abilityReaches = (ability: AgentAbilitySummary, projectId: string): boolean =>
+  ability.source !== 'owned' ||
+  ability.locator.location.scope !== ROLE_SCOPE.space ||
+  abilityReachesProject(ability.availability, projectId, ability.locator.kind)
+
+/** One addressed role, in the three arms its placement can take. The single producer of
+ *  those arms: both context previews built the same three-arm literal by hand, and the
+ *  moment the wire type became a union on `source` neither answer validated. Callers
+ *  decide WHEN a role is stated — the preview doors only when the agent loads it, the
+ *  identity door whenever the caller may read it — and this decides only HOW. */
+export const roleContextViewOf = (
+  status: AddressedRoleStatus,
+  locator: Extract<OwnedAbilityLocator, { kind: 'role' }>,
+  spaceSlugOf: (space: string) => string,
+  projectHandle: string | null,
+  layer: { pins: ContextPin[]; sets: ContextSetView[]; loadedTokens: number } | undefined,
+): RoleContextView => {
+  const own = layer ?? { pins: [], sets: [], loadedTokens: 0 }
+  const facts = { ...status.role.role, locator, ...own }
+  const location = status.role.location
+
+  return location.scope === ROLE_SCOPE.personal
+    ? { ...facts, scope: ROLE_SCOPE.personal }
+    : location.scope === ROLE_SCOPE.space
+      ? { ...facts, scope: ROLE_SCOPE.space, space: spaceSlugOf(location.space) }
+      : {
+          ...facts,
+          scope: ROLE_SCOPE.project,
+          space: spaceSlugOf(location.space),
+          project: projectHandle ?? location.projectId!,
+        }
+}
+
+/** The same role, as the door that CONFIGURES it states it: identity plus the layer,
+ *  with every budget word removed. Built by calling the producer above rather than by
+ *  writing the three scope arms a second time — a second author of the arms is exactly
+ *  the duplication `roleContextViewOf` was extracted to end. What this adds is one
+ *  deletion, in one place: `loaded` and `loadedTokens` are claims about a budget, and
+ *  this door weighs none. */
+export const roleContextIdentityOf = (
+  status: AddressedRoleStatus,
+  locator: Extract<OwnedAbilityLocator, { kind: 'role' }>,
+  spaceSlugOf: (space: string) => string,
+  projectHandle: string | null,
+  layer: { pins: ContextPin[]; sets: ContextSetView[] },
+): RoleContextIdentity => {
+  const view = roleContextViewOf(status, locator, spaceSlugOf, projectHandle, {
+    ...layer,
+    loadedTokens: 0,
+  })
+
+  // The two deletions this door is FOR, by name and in one place, so the shapes cannot
+  // drift apart quietly: `loaded` on every row, `loadedTokens` on the role.
+  const unweighed = <T extends { loaded: boolean }>(row: T): Omit<T, 'loaded'> => {
+    const copy: Omit<T, 'loaded'> & { loaded?: boolean } = { ...row }
+
+    delete copy.loaded
+
+    return copy
+  }
+  const identity: Omit<RoleContextView, 'loadedTokens'> & { loadedTokens?: number } = { ...view }
+
+  delete identity.loadedTokens
+
+  return {
+    ...identity,
+    pins: view.pins.map(unweighed),
+    sets: view.sets.map((set) => ({ ...set, items: set.items.map(unweighed) })),
+  } as RoleContextIdentity
+}
+
+/** An Owned, enabled Role as the Context constructor sees it. One producer because two
+ *  routes built the same literal by hand and neither carried `source`: the moment the
+ *  wire type became a union on it, both answers failed their own response validation.
+ *  `projectId` narrows by reach when the caller is asking from inside a project; asked
+ *  without one, reach is not a question this surface has. */
+export const contextRoleSummaryOf = (
+  ability: AgentAbilitySummary,
+  projectId?: string,
+): ContextRoleSummary | null =>
+  ability.source === 'owned' &&
+  ability.locator.kind === 'role' &&
+  ability.enabled &&
+  (projectId === undefined || abilityReaches(ability, projectId))
+    ? {
+        source: 'owned',
+        locator: ability.locator,
+        name: ability.name,
+        title: ability.title,
+        description: ability.description,
+        scope: ability.locator.location.scope,
+      }
+    : null

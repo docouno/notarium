@@ -32,6 +32,10 @@ export const eventsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
       const notifyMembers = () => reply.raw.write(`event: ${SSE_EVENT.MEMBERS}\ndata: {}\n\n`)
       // NAMED `rename` event; empty body — the truth is GET /api/spaces.
       const notifyRename = () => reply.raw.write(`event: ${SSE_EVENT.RENAME}\ndata: {}\n\n`)
+      // Owner-global durable session nudge. The socket registry targets only
+      // handles belonging to the session owner; truth stays in the REST list.
+      const notifyAgentSessions = () =>
+        reply.raw.write(`event: ${SSE_EVENT.AGENT_SESSIONS}\ndata: {}\n\n`)
       // NAMED `job` event with wire job status. notifyJobOf targets ONLY the owner's
       // handles (filters by principalId) — status/error/artifact never leaks to other
       // space members. canon: docs/jobs.md#wiring
@@ -71,6 +75,7 @@ export const eventsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
         notify,
         notifyMembers,
         notifyRename,
+        notifyAgentSessions,
         notifyJob,
       })
       req.raw.on('close', () => {

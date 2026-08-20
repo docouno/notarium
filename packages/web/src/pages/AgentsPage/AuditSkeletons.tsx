@@ -1,4 +1,5 @@
 import { ActivityTimeline, ActivityTimelineRow } from '../../core/ActivityTimeline'
+import { AsideSection, AsideSections } from '../../core/AsidePanel'
 import { Skeleton } from '../../core/Skeleton'
 import { AGGREGATE_ROWS, STAT_WIDTHS } from './consts'
 import asideStyles from './ActivityAside.module.scss'
@@ -81,23 +82,15 @@ export const StatRowSkeleton = ({ queryWidth }: { queryWidth: string }) => (
 // The two diagnostics sections while the Activity aside loads aggregates. They share the
 // same section headers and row geometry as the loaded Graph/Feed-style aside contents.
 export const PanelsSkeleton = () => {
-  const panel = (rows: number) => (
-    <section className={asideStyles.section}>
-      <div className={asideStyles.sectionHeading} data-aside-section-heading>
-        <Skeleton w={70} h={11} />
-      </div>
+  const panel = (key: string, rows: number) => (
+    <AsideSection key={key} heading={<Skeleton w={70} h={11} />}>
       <Skeleton w="72%" h={11} />
       <ul className={asideStyles.statList}>
         {Array.from({ length: rows }, (_, i) => (
           <StatRowSkeleton key={i} queryWidth={STAT_WIDTHS[i % STAT_WIDTHS.length]} />
         ))}
       </ul>
-    </section>
+    </AsideSection>
   )
-  return (
-    <div className={asideStyles.panels} aria-hidden>
-      {panel(2)}
-      {panel(AGGREGATE_ROWS)}
-    </div>
-  )
+  return <AsideSections>{[panel('misses', 2), panel('top', AGGREGATE_ROWS)]}</AsideSections>
 }

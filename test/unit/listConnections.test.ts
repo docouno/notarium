@@ -227,6 +227,7 @@ describe('updateConnection — SSE belt (#181)', () => {
       notify: () => {},
       notifyMembers: () => {},
       notifyRename: () => {},
+      notifyAgentSessions: () => {},
       notifyJob: () => {},
     })
     // Empty patch = no-op: it must NOT tear down the live stream (the FIX-2 early-return).

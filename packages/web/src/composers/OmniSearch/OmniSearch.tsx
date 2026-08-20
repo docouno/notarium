@@ -98,7 +98,7 @@ export const OmniSearch = ({
 
   const openNote = useCallback(
     (sug: NoteSuggestion, newTab: boolean) => {
-      const href = noteRoute(sug.id, effectiveSlug(sug.slug, sug.title))
+      const href = sug.href ?? noteRoute(sug.id, effectiveSlug(sug.slug, sug.title))
 
       if (!href) {
         return

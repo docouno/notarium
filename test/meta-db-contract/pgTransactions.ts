@@ -26,6 +26,13 @@ export type PgTransaction = {
    *  decides how many facets a settlement touches, the order is not data's business. */
   levels: readonly LockLevel[]
   exempt?: PgTransactionExemption
+  /** Levels of `LEVELS_NO_STATEMENT_CAN_ENTER` this transaction enters with NO helper,
+   *  and the reason each one has no key to hand a helper. Only a sweep belongs here: it
+   *  is defined by a lifecycle column (a space, a note, a purge fence) and the keys of
+   *  the level are exactly what it cannot name. The value is the reason, read by a
+   *  human; the KEY is checked, both ways — a level listed here that turns out to call
+   *  a helper is as red as one that does not and is not listed. */
+  sweeps?: Partial<Record<LockLevel, string>>
   /** The migration transaction runs on its own `pg.Client` before the pool exists,
    *  so the live observer (which patches the pool) cannot see it. */
   pooled?: false
@@ -36,7 +43,6 @@ export const PG_TRANSACTIONS: readonly PgTransaction[] = [
   { id: 'auth.createFirstUser', levels: [] },
   { id: 'sessions.startNamed', levels: [] },
   { id: 'sessions.setRole', levels: [] },
-  { id: 'agentDeltaCursors.advance', levels: [] },
   { id: 'oauth.upsertPendingClient', levels: [] },
   { id: 'pgMetaDb.grantMemberToActiveSpace', levels: [] },
   { id: 'causalOutbox.append', levels: [] },
@@ -47,6 +53,28 @@ export const PG_TRANSACTIONS: readonly PgTransaction[] = [
   { id: 'restoreTerminal.finalize', levels: [] },
   { id: 'spaceLifecycle.transition', levels: [] },
 
+  // Tier 4 — the registry a binding points at, then the ability tables. `set` and
+  // `grantProject` read the project rows under a share lock and write the binding
+  // after, which is the order a whole-space purge has to take too. Above both, the
+  // same tier-3 stripes the preference twin takes: they prove the ability this policy
+  // is ABOUT is not purged, and they are what keeps the answer true to COMMIT. L3n is
+  // absent from a run whose caller does not know the registry note — a run is a
+  // SUBSEQUENCE of what is registered.
+  { id: 'abilityAvailability.set', levels: ['L3s', 'L3n', 'L4f', 'L4a'] },
+  { id: 'abilityAvailability.grantProject', levels: ['L3s', 'L3n', 'L4f', 'L4a'] },
+  // Nothing to fence: removing owner state cannot outlive anything.
+  { id: 'abilityAvailability.clear', levels: ['L4a'] },
+  // The project parent row is L4f like any other `folders` lock. The child cursor
+  // tables are outside the hierarchy, so this transaction enters one level and
+  // nothing else — but it DOES enter it, which the entry it replaced (an inline
+  // `FOR KEY SHARE` under `levels: []`, excused as "outside the hierarchy") denied.
+  { id: 'agentDeltaCursors.advance', levels: ['L4f'] },
+  // Spans tiers 3 and 4: it proves the exact Space and note are not purged before it
+  // writes the override that would outlive them. One Space, one note, both known
+  // before the first lock — so no wide-scan mutex, which the criterion in `lockOrder`
+  // never granted it.
+  { id: 'abilityPreferences.setEnabled', levels: ['L3s', 'L3n', 'L4p'] },
+
   // Reference writers: identity first, then their own facet.
   { id: 'favorites.add', levels: ['L1', 'L2a'] },
   { id: 'favorites.removeByEntity', levels: ['L1', 'L2a'] },
@@ -56,6 +84,10 @@ export const PG_TRANSACTIONS: readonly PgTransaction[] = [
   { id: 'contextSets.deleteSet', levels: ['L2b', 'L2c'] },
   { id: 'scopePins.addPin', levels: ['L1', 'L2d'] },
   { id: 'contextOrder.setOrder', levels: ['L1', 'L2d', 'L2e', 'L2f'] },
+  // Changing where a Role belongs rewrites every durable pointer at its old
+  // placement. It never touches identity: the notes it re-targets are named by rows
+  // it is moving, not resolved from a client's ids.
+  { id: 'abilityPlacement.moveOwnedRolePlacement', levels: ['L2b', 'L2d', 'L2e', 'L2f', 'L4p'] },
 
   // Invalidation from outside a run (#302): one transaction shape, two callers —
   // a cancel and a reaper candidate. Nothing below L0j: the point is to WAIT for a
@@ -98,9 +130,14 @@ export const PG_TRANSACTIONS: readonly PgTransaction[] = [
     exempt: 'append-cas',
   },
   {
+    // The owner state of a purged package goes last, below the revision tier where
+    // its tables sit.
     id: 'revisions.purgeNotes',
-    levels: ['L3m', 'L3n', 'L3t', 'L3b', 'L3t'],
+    levels: ['L3m', 'L3n', 'L3t', 'L3b', 'L3t', 'L4a', 'L4p'],
     exempt: 'wide-scan',
+    sweeps: {
+      L4p: "every owner's override of a note gone for good, found by (space_id, registry_note_id) — the two keys a purge has, and the one it has not is the LOCATOR the level is keyed by. It is ordered against `setEnabled` by the note stripe (L3n) above, which that transaction takes before its own L4p.",
+    },
   },
   {
     id: 'pgMetaDb.purgeSpace',
@@ -122,8 +159,15 @@ export const PG_TRANSACTIONS: readonly PgTransaction[] = [
       'L3n',
       'L3b',
       'L3t',
+      'L4f',
+      'L4a',
+      'L4p',
     ],
     exempt: 'wide-scan',
+    sweeps: {
+      L2d: 'every pin whose SCOPE lived in this Space, deleted by `target_space`. A whole Space is not a target: the level is keyed by the (kind, id) a pin hangs on, and a purge holds the Space row and the tier-3 stripes instead — which is what a pin writer waits behind.',
+      L4p: 'every override of this Space, by `space_id`, for every owner and every package at once — the same sweep `purgeNotes` makes for one note, with the same missing key.',
+    },
   },
 
   { id: 'runPgMigrations.runPgMigrations', levels: [], pooled: false },

@@ -160,16 +160,104 @@ export type AgentSessionDecl = {
   role?: string
 }
 
-/** One owned fork from the read-only built-in role catalog. The declaration
+/** One Owned fork from the read-only Catalog role inventory. The declaration
  * addresses product scopes; both seed appliers resolve them to stable ids. */
 export type AgentRoleTargetDecl =
   | { kind: 'personal'; user?: string }
   | { kind: 'space'; space: string }
   | { kind: 'project'; space: string; path: string }
 
-export type AgentRoleDecl = {
+type AgentRoleStateDecl = {
   name: string
   target: AgentRoleTargetDecl
+  /** Space-home reach. A Space role acts across its whole Space unless narrowed;
+   * Personal has no projects to select from and a project version is its own reach. */
+  availability?: AgentAbilityAvailabilityDecl
+  /** Inject one legacy malformed attachment after publication. This represents
+   * pre-exact Role metadata that the editor must preserve until explicit detach. */
+  invalidAttachment?: string
+  /** Attach ANOTHER Owned Role as though it were a skill, by exact locator. The only
+   * route to the `wrong-kind` attachment health: the locator resolves and what it
+   * names is a role. Names a role declared EARLIER at a Personal or Space placement,
+   * because a project-scoped attachment locator is not a shape the product emits. */
+  attachRole?: string
+  /** Delete the package after publication so the exact role remains in Trash. */
+  deleted?: boolean
+}
+
+export type AgentCatalogRoleDecl = AgentRoleStateDecl & {
+  source?: 'catalog'
+}
+
+export type AgentCustomRoleDecl = AgentRoleStateDecl & {
+  source: 'custom'
+  description: string
+  instructions: string
+}
+
+export type AgentRoleDecl = AgentCatalogRoleDecl | AgentCustomRoleDecl
+
+export type AgentSkillHomeDecl =
+  { kind: 'personal'; user?: string } | { kind: 'space'; space: string }
+
+export type AgentAbilityAvailabilityDecl =
+  | { mode: 'all-projects' }
+  | { mode: 'selected-projects'; projects: Array<{ space: string; path: string }> }
+
+type AgentSkillStateDecl = {
+  name: string
+  home: AgentSkillHomeDecl
+  /** Space-home policy. Personal skills are always available across the owner's projects. */
+  availability?: AgentAbilityAvailabilityDecl
+  /** Exact role placement used by dependency lookup/linking when it differs from skill home. */
+  roleTarget?: AgentRoleTargetDecl
+  /** Rename the manifest after publication while keeping its package id. */
+  renameTo?: string
+  /** Add an exact locator to this package from the named role at the same placement. */
+  linkedRole?: string
+  /** Delete the package only after every requested link/mutation was applied. */
+  deleted?: boolean
+}
+
+/** One user-authored Agent Skill package. The applier mints its package id before
+ * deriving any path; declarations never spell a mount or storage address. */
+export type AgentCustomSkillDecl = AgentSkillStateDecl & {
+  source?: 'custom'
+  description: string
+  instructions?: string
+}
+
+/** One direct fork of a read-only catalog skill. */
+export type AgentCatalogSkillDecl = AgentSkillStateDecl & {
+  source: 'catalog'
+}
+
+/** A supporting package installed by an earlier role declaration. This variant
+ * mutates that exact linked package instead of creating a same-name replacement. */
+export type AgentRoleDependencySkillDecl = AgentSkillStateDecl & {
+  source: 'role-dependency'
+  role: string
+}
+
+export type AgentSkillDecl =
+  AgentCustomSkillDecl | AgentCatalogSkillDecl | AgentRoleDependencySkillDecl
+
+/** Addresses one ability the way its source allows: a packaged System ability by
+ *  manifest name, an Owned one by the placement that published it. Catalog packages
+ *  cannot be activated and therefore cannot be named here. */
+export type AgentAbilityRefDecl =
+  | { source: 'system'; kind: 'role' | 'skill'; name: string }
+  | { source: 'owned'; kind: 'role'; name: string; target: AgentRoleTargetDecl }
+  | { source: 'owned'; kind: 'skill'; name: string; home: AgentSkillHomeDecl }
+
+/** One owner Enable/Disable override. Sparse like the runtime facet: no declaration
+ *  means enabled. The override belongs to an OWNER rather than to the package, so two
+ *  owners may disagree about the same shared ability. */
+export type AgentAbilityPreferenceDecl = {
+  /** Whose preference; defaults to the primary seed login. */
+  user?: string
+  ability: AgentAbilityRefDecl
+  enabled: boolean
 }
 
 /** One durable delta position. `throughNote` resolves to that note's latest
@@ -342,6 +430,9 @@ export type CaseEvent = (
       /** Agent-memory `muted` opt-out (#165) — kept in the audit, dropped from the
        *  eager profile. */
       muted?: boolean
+      /** Place this agent-memory note in the exact about-project partition. The
+       * appliers resolve the declared project to their own durable project id. */
+      projectMemory?: { space: string; path: string }
       /** Pin the note: adds the #165 `always-load` tag (the pult's local context pin) AND a
        *  #42 favorite. The tag is what the agent-context pult renders as a Pinned row. */
       pin?: boolean
@@ -456,8 +547,14 @@ export type CaseWorld = {
   retrievals?: RetrievalDecl[]
   /** Durable agent episodes, projected to both the fake and real meta-DB. */
   agentSessions?: AgentSessionDecl[]
-  /** Owned role packages copied from the built-in catalog. */
+  /** Owned Role packages: authored here, or forked from a Catalog template. */
   agentRoles?: AgentRoleDecl[]
+  /** Owned Skill packages at a Personal or Space home: authored, forked from a
+   *  Catalog template, or a role's supporting package mutated in place. */
+  agentSkills?: AgentSkillDecl[]
+  /** Owner Enable/Disable overrides — real applier only (the fixture has no
+   *  preference channel), like jobs/favorites/retrievals. */
+  agentAbilityPreferences?: AgentAbilityPreferenceDecl[]
   /** Owner/session delta positions, resolved against real journal revisions. */
   agentDeltaCursors?: AgentDeltaCursorDecl[]
   /** Durable job rows + their artifacts (#105) — real applier only, written after the

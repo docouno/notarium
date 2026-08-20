@@ -21,6 +21,7 @@ import styles from './ContextMenu.module.scss'
 // Items are a flat list; an entry may be:
 //   { label, icon, onClick, danger, active }  — a leaf (active → check mark)
 //   { divider: true }                         — a separator
+//   { heading: 'Space' }                      — a quiet caption over the rows below
 //   { label, icon, children: [...] }          — a submenu (flyout on hover)
 //
 // We deliberately avoid a menu library to keep the bundle dep-free.
@@ -33,6 +34,10 @@ export type MenuItem = {
   /** Contiguous leaves with the same label form one named ARIA radio group. */
   radioGroup?: string
   divider?: boolean
+  /** A non-interactive caption naming the rows beneath it. Use when the list holds
+   *  several kinds of the same thing and the KIND would otherwise have to be spelled
+   *  into every label. */
+  heading?: string
   children?: MenuItem[]
 }
 
@@ -48,6 +53,14 @@ const MenuRow = ({ item, onClose }: { item: MenuItem; onClose: CloseMenu }) => {
 
   if (item.divider) {
     return <div className={styles.contextMenuSep} />
+  }
+
+  if (item.heading) {
+    return (
+      <div className={styles.contextMenuHeading} role="presentation">
+        {item.heading}
+      </div>
+    )
   }
 
   if (item.children) {

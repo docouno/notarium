@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest'
 
-import { isDurableScalar, isDurableText, isValidNoteId, isWellFormedUnicode } from './id'
+import {
+  isDurableScalar,
+  isDurableText,
+  isGeneratedNoteId,
+  isValidNoteId,
+  isWellFormedUnicode,
+} from './id'
 
 describe('durable string guards', () => {
   it('rejects isolated surrogates but accepts complete pairs', () => {
@@ -18,5 +24,13 @@ describe('durable string guards', () => {
     expect(isValidNoteId('notarium-id:foo')).toBe(true)
     expect(isValidNoteId('notarium-id:%zz')).toBe(true)
     expect(isValidNoteId('')).toBe(false)
+  })
+
+  it('separates generated storage ids from the wider opaque id domain', () => {
+    expect(isGeneratedNoteId('AbCdefGhij_1')).toBe(true)
+    expect(isGeneratedNoteId('A__________-')).toBe(true)
+    expect(isGeneratedNoteId('opaque.id-1')).toBe(false)
+    expect(isGeneratedNoteId('notarium-id:foo')).toBe(false)
+    expect(isGeneratedNoteId('_projects')).toBe(false)
   })
 })

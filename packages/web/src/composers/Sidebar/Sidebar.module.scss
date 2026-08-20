@@ -57,6 +57,23 @@
    tree's measurement alive (a remount loses it) and preserves search + scroll. */
 .panel-hidden { display: none; }
 
+.panel-narrow {
+  position: fixed;
+  z-index: 31;
+  top: 0;
+  bottom: 0;
+  left: 47px;
+  box-shadow: 12px 0 32px rgba(0, 0, 0, 0.28);
+}
+
+.narrow-backdrop {
+  position: fixed;
+  z-index: 30;
+  inset: 0 0 0 47px;
+  border: 0;
+  background: rgba(0, 0, 0, 0.38);
+}
+
 /* Right-edge resize handle on the panel (mirrors the aside's left-edge one). */
 .panel-resize {
   position: absolute; right: -3px; top: 0; bottom: 0; width: 6px;

@@ -51,7 +51,9 @@ test('an off-Feed q leaves the held Feed window untouched', async ({ page }) => 
   const baseline = requests.length
 
   await page.getByTestId('rail-agents').click()
-  await expect(page.getByTestId('agents-context')).toBeVisible()
+  // Agents lands on its package library, not on Context — the rail opens the
+  // section, and the section's first surface is Abilities.
+  await expect(page.getByTestId('agents-roles')).toBeVisible()
   await page.evaluate((path) => {
     history.replaceState(null, '', path)
     dispatchEvent(new PopStateEvent('popstate'))

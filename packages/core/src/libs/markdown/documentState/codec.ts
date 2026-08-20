@@ -1,4 +1,4 @@
-import { analyzeDocumentState } from './documentState'
+import { analyzeDocumentState, opaqueDocumentState } from './documentState'
 import {
   DOCUMENT_ROLE,
   DOCUMENT_STATE_FORMAT,
@@ -114,13 +114,28 @@ export const decodeDocumentState = (blob: Uint8Array): DocumentState => {
     throw new Error('truncated document-state blob')
   }
   const header = parseHeader(JSON.parse(STRICT_UTF8.decode(blob.slice(headerStart, sourceStart))))
-  const state = analyzeDocumentState({
+  const input = {
     source: blob.slice(sourceStart),
     role: header.role,
     pathFallbackTitle: header.pathFallbackTitle,
     ownerProof: header.provenance,
     skillDirectoryName: header.skillDirectoryName,
-  })
+  }
+  const state = analyzeDocumentState(input)
+
+  // An `opaque-v1` row records what the analyzer of the day could prove about these
+  // bytes — a statement about the reader, not about the file. A later reader that CAN
+  // parse them does not make the stored row a forgery, so hand back the state it was
+  // written as instead of failing every read of that revision. The check keeps all its
+  // teeth: the fingerprint must be exactly the one an opaque reading of THESE bytes
+  // produces, so tampering with either half still fails below.
+  if (header.format === DOCUMENT_STATE_FORMAT.opaque && state.format !== header.format) {
+    const stale = opaqueDocumentState(input)
+
+    if (stale.semanticFingerprint === header.semanticFingerprint) {
+      return stale
+    }
+  }
 
   if (
     state.format !== header.format ||

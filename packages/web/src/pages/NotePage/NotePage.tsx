@@ -35,7 +35,7 @@ import styles from './NotePage.module.scss'
 export const NotePage = () => {
   const { mode, note, noteError, knownNotes, navigating, openNote, reloadNote } = useNotes()
   const { openOrCreateFromWiki } = useEditing()
-  const { space, canWrite } = useSpace()
+  const { space, canWrite, personalSpace } = useSpace()
   const { confirm } = useDialog()
   const toast = useToast()
   const navigate = useNavigate()
@@ -67,12 +67,16 @@ export const NotePage = () => {
       return
     }
     const want = effectiveSlug(note.slug, note.title || '')
-    const target = noteRouteForClass(note.id, note.class, want)
+    const canonical = noteRouteForClass(note.id, note.class, want)
+    // The query rides along for every class: canonicalising the PATH must not drop
+    // parameters an incoming link carried, and the comparison below is against
+    // `pathname + search` — a target built without them would replace on every load.
+    const target = canonical ? `${canonical}${location.search}` : null
 
-    if (target && target !== location.pathname) {
+    if (target && target !== `${location.pathname}${location.search}`) {
       navigate(target, { replace: true, state: location.state })
     }
-  }, [note, location.pathname, location.state, navigate])
+  }, [note, location.pathname, location.search, location.state, navigate])
 
   if (mode !== 'read') {
     return <Splash />
@@ -101,6 +105,9 @@ export const NotePage = () => {
   if (!note) {
     return null
   }
+  const canManageNote =
+    canWrite ||
+    (note.class === NOTE_CLASS.skill && personalSpace != null && note.space === personalSpace.slug)
 
   // A DELETED note (#79) opened by link: its last state, read-only, under a
   // "deleted" banner with Restore / Delete forever. The page owns the transport
@@ -112,7 +119,7 @@ export const NotePage = () => {
         notes={knownNotes}
         onOpenWikiLink={openNote}
         onUnresolvedWiki={openOrCreateFromWiki}
-        canManage={canWrite}
+        canManage={canManageNote}
         busy={trashBusy}
         onRestore={() => {
           void (async () => {

@@ -21,13 +21,25 @@ beforeEach(() => {
   } as Storage
 })
 
-const note = (id: string, title = id) => ({ id, title, filePath: `${id}.md` })
+const note = (id: string, title = id) => ({
+  kind: 'note' as const,
+  id,
+  title,
+  filePath: `${id}.md`,
+})
 
 describe('recentNotes MRU', () => {
   it('loads what was pushed', () => {
     pushRecentNote('main', note('a', 'Alpha'))
     expect(loadRecentNotes('main')).toEqual([
-      { id: 'a', title: 'Alpha', filePath: 'a.md', modifiedAt: null, createdAt: null },
+      {
+        kind: 'note',
+        id: 'a',
+        title: 'Alpha',
+        filePath: 'a.md',
+        modifiedAt: null,
+        createdAt: null,
+      },
     ])
   })
 
@@ -55,9 +67,16 @@ describe('recentNotes MRU', () => {
   })
 
   it('keeps the display slug for canonical-URL routing', () => {
-    pushRecentNote('main', { id: 'a', title: 'Alpha', slug: 'custom-slug', filePath: 'a.md' })
+    pushRecentNote('main', {
+      kind: 'note',
+      id: 'a',
+      title: 'Alpha',
+      slug: 'custom-slug',
+      filePath: 'a.md',
+    })
     expect(loadRecentNotes('main')[0]).toEqual({
       id: 'a',
+      kind: 'note',
       title: 'Alpha',
       slug: 'custom-slug',
       filePath: 'a.md',
@@ -68,6 +87,7 @@ describe('recentNotes MRU', () => {
 
   it('keeps stored date hints', () => {
     pushRecentNote('main', {
+      kind: 'note',
       id: 'a',
       title: 'Alpha',
       filePath: 'a.md',
@@ -75,6 +95,7 @@ describe('recentNotes MRU', () => {
       createdAt: '2026-06-01T09:00:00.000Z',
     })
     expect(loadRecentNotes('main')[0]).toEqual({
+      kind: 'note',
       id: 'a',
       title: 'Alpha',
       filePath: 'a.md',
@@ -96,13 +117,44 @@ describe('recentNotes MRU', () => {
     expect(loadRecentNotes('main')).toEqual([])
   })
 
-  it('normalises legacy rows without date fields', () => {
+  it('adopts an unversioned legacy store as the generic notes it can only hold', () => {
     localStorage.setItem(
       'notarium.recentNotes:main',
       JSON.stringify([{ id: 'a', title: 'Alpha', filePath: 'a.md' }]),
     )
+    // A bare array predates Abilities in the ring, so every row in it is a generic
+    // note and `/n/<id>` still addresses it. Adopting costs nothing; dropping would
+    // cost the user their whole MRU.
     expect(loadRecentNotes('main')).toEqual([
-      { id: 'a', title: 'Alpha', filePath: 'a.md', modifiedAt: null, createdAt: null },
+      {
+        kind: 'note',
+        id: 'a',
+        title: 'Alpha',
+        filePath: 'a.md',
+        modifiedAt: null,
+        createdAt: null,
+      },
     ])
+  })
+
+  it('drops a versioned store this generation cannot read', () => {
+    localStorage.setItem(
+      'notarium.recentNotes:main',
+      JSON.stringify({ version: 1, items: [{ id: 'a', title: 'Alpha', filePath: 'a.md' }] }),
+    )
+    expect(loadRecentNotes('main')).toEqual([])
+  })
+
+  it('keeps an Owned Ability exact route in the versioned MRU', () => {
+    pushRecentNote('main', {
+      kind: 'owned-ability',
+      id: 'ability-note',
+      title: 'Research',
+      href: '/agents/abilities/roles/owned/exact',
+    })
+    expect(loadRecentNotes('main')[0]).toMatchObject({
+      kind: 'owned-ability',
+      href: '/agents/abilities/roles/owned/exact',
+    })
   })
 })

@@ -226,8 +226,9 @@ test('Session grouping filters before pagination and separates nested episode ti
   await expect(page.getByTestId('activity-session-outside')).toBeVisible()
   expect(overviewRequests.at(-1)?.searchParams.get('filter')).toBe('writes')
   await expect(page.getByText('3 sessions')).toBeVisible()
-  await expect(page.getByText('release planning', { exact: true })).toHaveCount(0)
-  await expect(page.getByText('main · automatic seed', { exact: true })).toHaveCount(0)
+  const activityMain = page.locator('main.main')
+  await expect(activityMain.getByText('release planning', { exact: true })).toHaveCount(0)
+  await expect(activityMain.getByText('main · automatic seed', { exact: true })).toHaveCount(0)
   expect(
     await page
       .getByTestId('activity-session-row')
@@ -311,7 +312,7 @@ test('Session grouping filters before pagination and separates nested episode ti
   await expect(page).toHaveURL(/\/agents\/activity\?show=reads&group=session$/)
   expect(overviewRequests.at(-1)?.searchParams.get('filter')).toBe('reads')
   await expect(page.getByText('0 sessions')).toBeVisible()
-  await expect(page.getByText('release planning', { exact: true })).toHaveCount(0)
+  await expect(activityMain.getByText('release planning', { exact: true })).toHaveCount(0)
   await expect(page.getByTestId('activity-session-events')).toHaveCount(0)
   await expect(
     page.locator('[data-testid="activity-session-row"][data-expanded="true"]'),
@@ -769,11 +770,45 @@ test('Diagnostics opts in once and narrows the stream with one URL write', async
   await queryFilter.getByRole('button', { name: 'Clear search' }).click()
   await expect(page).toHaveURL(/\/agents\/activity\?show=reads$/)
 
+  // Armed BEFORE the typing so nothing sits between it and the click: the scenario needs the
+  // switch to land while the query debounce is still pending.
+  const writesStream = page.waitForResponse((response) => {
+    const url = new URL(response.url())
+
+    return (
+      url.pathname === '/api/me/agent-sessions/all' &&
+      url.searchParams.get('filter') === 'writes' &&
+      !url.searchParams.has('q')
+    )
+  })
   await queryFilter.getByRole('textbox', { name: 'Retrieval query' }).fill('stale draft')
   await page.getByRole('button', { name: 'Writes', exact: true }).click()
-  await page.waitForTimeout(450)
-  await expect(page).toHaveURL(/\/agents\/activity\?show=writes$/)
+  await writesStream
+  // The switch CANCELS the pending query debounce instead of racing it. The box is fed by the
+  // very state the debounce closes over, so an emptied box is the app reporting that the
+  // half-typed filter was dropped and the timer re-evaluated — a sleep reports nothing.
   await expect(queryFilter.getByRole('textbox', { name: 'Retrieval query' })).toHaveValue('')
+  await expect(page).toHaveURL(/\/agents\/activity\?show=writes$/)
+
+  // That a timer never fires still has to be proven, and the honest clock for it is the
+  // debounce itself: a cycle STARTED after the switch is queued behind the abandoned one and
+  // so can only reach the server later. Once this query is answered, a surviving timer would
+  // already have shipped `stale draft`. It doubles as the positive control that the debounce
+  // is alive at all — a query typed now does pull the stream back to reads.
+  const laterQuery = page.waitForResponse((response) => {
+    const url = new URL(response.url())
+
+    return (
+      url.pathname === '/api/me/agent-sessions/all' &&
+      url.searchParams.get('q') === 'typed after the switch'
+    )
+  })
+  await queryFilter.getByRole('textbox', { name: 'Retrieval query' }).fill('typed after the switch')
+  await laterQuery
+  expect(eventRequests.filter((url) => url.searchParams.get('q') === 'stale draft')).toEqual([])
+  await expect(page).toHaveURL(/\/agents\/activity\?show=reads&q=typed\+after\+the\+switch$/)
+  await queryFilter.getByRole('button', { name: 'Clear search' }).click()
+  await expect(page).toHaveURL(/\/agents\/activity\?show=reads$/)
 
   await page.getByTestId('aside-tab-diagnostics').click()
   await blindSpot.click()

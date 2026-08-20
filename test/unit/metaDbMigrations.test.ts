@@ -74,6 +74,10 @@ describe('meta-DB migration assets and SQLite runner', () => {
       { version: 10, name: 'import_reservations' },
       { version: 11, name: 'legacy_name_aliases' },
       { version: 12, name: 'identity_settlement_lineage' },
+      { version: 13, name: 'agent_session_role_identity' },
+      { version: 14, name: 'ability_availability' },
+      { version: 15, name: 'ability_preferences' },
+      { version: 16, name: 'ability_placement_trail' },
     ])
     for (const migration of migrations) {
       expect(migration.checksum).toBe(checksumMigrationPair(migration.sqlite, migration.postgres))
@@ -109,13 +113,14 @@ describe('meta-DB migration assets and SQLite runner', () => {
           .all() as Array<{ type: string; count: number }>
       ).map(({ type, count }) => [type, count]),
     )
-    // +2 tables and +1 index over main's schema: the import reservation pair (#302).
-    // ONE index, not two — the claims table's own lookups are served by the indexes
-    // its PRIMARY KEY and UNIQUE already create, and a third one would cost an
-    // insert per claimed path (10 000 on the supported corpus) for a predicate that
-    // is already indexed. The counter excludes `sqlite_autoindex_%`, so those two
-    // are invisible here and only the reservations' `job_id` index is counted.
-    expect(counts).toEqual({ index: 56, table: 39, trigger: 27 })
+    // Both lines land in one schema: main's import reservation pair (#302) on top of
+    // the agent session/availability/preference tables (#309). Two of the indexes are
+    // the second key each ability table is found again by: the availability policy's
+    // registry note, and the locator a placement move rewrites for every owner. The
+    // placement trail adds the third table of that group and its own two: the hop is
+    // read forwards (by `from_locator`, which is the primary key), re-pointed backwards
+    // (by `to_locator`, the sweep that keeps it one hop deep) and purged by Space.
+    expect(counts).toEqual({ index: 62, table: 43, trigger: 30 })
     expect(
       db.prepare("SELECT 1 FROM sqlite_schema WHERE name = 'meta_schema'").get(),
     ).toBeUndefined()
@@ -145,9 +150,18 @@ describe('meta-DB migration assets and SQLite runner', () => {
 
     expect(
       db
-        .prepare('SELECT owner, name, calls, role FROM agent_sessions WHERE id = ?')
+        .prepare(
+          'SELECT owner, name, calls, role, role_locator, role_context_project_id FROM agent_sessions WHERE id = ?',
+        )
         .get('ses_existingv1aa'),
-    ).toEqual({ owner: 'alice', name: 'Existing', calls: 7, role: null })
+    ).toEqual({
+      owner: 'alice',
+      name: 'Existing',
+      calls: 7,
+      role: null,
+      role_locator: null,
+      role_context_project_id: null,
+    })
   })
 
   it('adds an empty legacy alias set without guessing from existing names or paths', () => {

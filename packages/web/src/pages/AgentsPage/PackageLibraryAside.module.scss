@@ -1,0 +1,15 @@
+/* The package filters' own bits. The panel body and its captioned sections are the
+   shared `core/AsidePanel` primitives, not a second copy of that skin here. */
+.project-list {
+  min-height: 0;
+  max-height: 220px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.unavailable {
+  margin: 0;
+  color: var(--warning);
+  font-size: 12px;
+  line-height: 1.4;
+}

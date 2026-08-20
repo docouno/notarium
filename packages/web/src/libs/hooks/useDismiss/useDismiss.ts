@@ -1,4 +1,6 @@
 import { type RefObject, useEffect, useRef } from 'react'
+import { KEYBOARD_LAYER } from '../../keyboardLayers'
+import { useKeyboardLayer } from '../useKeyboardLayer'
 
 type DismissRef = RefObject<HTMLElement | null> | undefined
 
@@ -22,6 +24,11 @@ const VIEWPORT_GRACE_MS = 400
 // for a popover anchored to a fixed screen point. Gated by `active` so it only listens
 // while open. The latest onDismiss/inside are read through refs, so the listeners are
 // bound once per active/viewport change instead of re-binding on every parent render.
+//
+// Escape is NOT one of the listeners below: a popover is one of several surfaces that
+// answer it, and a stack private to this hook cannot see the dialog opened over the
+// popover — only the shared arbiter orders both. So the hook declares itself a
+// transient layer and is called back when the key is actually its.
 export const useDismiss = (
   active: boolean,
   onDismiss: () => void,
@@ -32,6 +39,8 @@ export const useDismiss = (
   onDismissRef.current = onDismiss
   const insideRef = useRef(inside)
   insideRef.current = inside
+
+  useKeyboardLayer(active, KEYBOARD_LAYER.transient, onDismiss)
 
   useEffect(() => {
     if (!active) {
@@ -70,15 +79,9 @@ export const useDismiss = (
       dismiss()
     }
 
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        dismiss()
-      }
-    }
     // Capture phase + window so a pointerdown/scroll inside any nested container still
     // dismisses (the ContextMenu contract), and consistently for the simpler menus too.
     window.addEventListener('mousedown', onInteractOutside, true)
-    window.addEventListener('keydown', onKey)
     if (viewport) {
       window.addEventListener('contextmenu', onInteractOutside, true)
       window.addEventListener('scroll', onViewport, true)
@@ -87,7 +90,6 @@ export const useDismiss = (
 
     return () => {
       window.removeEventListener('mousedown', onInteractOutside, true)
-      window.removeEventListener('keydown', onKey)
       if (viewport) {
         window.removeEventListener('contextmenu', onInteractOutside, true)
         window.removeEventListener('scroll', onViewport, true)

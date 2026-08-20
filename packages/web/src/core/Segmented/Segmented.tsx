@@ -7,6 +7,7 @@ type SegmentedOption<T extends string> = {
   label?: string
   icon?: ReactNode
   title?: string
+  disabled?: boolean
 }
 
 type SegmentedProps<T extends string> = {
@@ -50,7 +51,7 @@ export const Segmented = <T extends string = string>({
         className={cx(styles.segBtn, value === o.value && styles.on)}
         aria-pressed={value === o.value}
         onClick={() => onChange(o.value)}
-        disabled={disabled}
+        disabled={disabled || o.disabled}
         title={o.title || o.label}
       >
         {o.icon}

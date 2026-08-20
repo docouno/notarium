@@ -607,9 +607,14 @@ export class RestoreCoordinator {
     const packagePath =
       skillPackageContextOf(authority, className, operation.targetPath)?.packagePath ?? null
     const lease = packagePath
-      ? await authority.admitPackage(packagePath, 'exclusive', `restore:${operation.id}`, {
-          allowDuringClosure: true,
-        })
+      ? await authority.admitSkillPlacement(
+          operation.targetPath,
+          'exclusive',
+          `restore:${operation.id}`,
+          {
+            allowDuringClosure: true,
+          },
+        )
       : await authority.admitResource(
           operation.targetPath,
           'exclusive',
@@ -712,6 +717,9 @@ export class RestoreCoordinator {
 
     if (target.status === 'retry') {
       throw new Error(target.reason)
+    }
+    if (target.status === 'reject') {
+      return reject('not-restorable', target.reason)
     }
     let headDocumentState: DocumentState | null = null
 
@@ -883,25 +891,58 @@ export class RestoreCoordinator {
       }
       sourceKind = 'legacy'
     }
-    const placeholderProof = bindStorageOwnerProof({
-      source: candidatePlan.source,
-      owners: candidatePlan.proposedOwnerProof.claims.map(({ key, ownership }) => ({
-        key,
-        ownership,
-      })),
-      evidence: { kind: 'mutation-receipt', id: operation.id },
-      generatedContainer: candidatePlan.proposedOwnerProof.generatedContainer,
-    })
-    const candidateState = analyzeDocumentState({
-      source: candidatePlan.source,
-      role: target.role,
-      pathFallbackTitle: candidatePlan.pathFallbackTitle,
-      ownerProof: placeholderProof,
-      ...(target.skillDirectoryName ? { skillDirectoryName: target.skillDirectoryName } : {}),
-    })
+    // Reading the candidate back is PURE: the same bytes give the same answer on every
+    // replay, so a throw here is a verdict about this restore and not a transient fault
+    // no retry can clear — the honest refusal a document over the frontmatter cap gets,
+    // for instance. It has to be terminal. Left to propagate it aborted prepare with the
+    // operation still `staged`, which `listRecoverable` reports, so ONE such note pinned
+    // its whole space against archive and purge forever while every retry re-threw.
+    // Everything above this point may legitimately fail transiently (the meta-DB, the
+    // filesystem, an admission lease) and is deliberately left retryable.
+    let candidateState: DocumentState
+
+    try {
+      const placeholderProof = bindStorageOwnerProof({
+        source: candidatePlan.source,
+        owners: candidatePlan.proposedOwnerProof.claims.map(({ key, ownership }) => ({
+          key,
+          ownership,
+        })),
+        evidence: { kind: 'mutation-receipt', id: operation.id },
+        generatedContainer: candidatePlan.proposedOwnerProof.generatedContainer,
+      })
+
+      candidateState = analyzeDocumentState({
+        source: candidatePlan.source,
+        role: target.role,
+        pathFallbackTitle: candidatePlan.pathFallbackTitle,
+        ownerProof: placeholderProof,
+        ...(target.skillDirectoryName ? { skillDirectoryName: target.skillDirectoryName } : {}),
+      })
+    } catch (error) {
+      // The failure code says what the operator can act on; the cause stays in the log.
+      this.onError(error, operation)
+      return reject('not-restorable', 'candidate-is-unsafe')
+    }
 
     if (!candidateState.projection || candidateState.restoreSafety.status !== 'safe') {
       return reject('not-restorable', 'candidate-is-unsafe')
+    }
+    if (target.role === DOCUMENT_ROLE.skillRoot) {
+      try {
+        await authority.assertSkillManifestNameAvailableAdmitted(
+          identity.filePath,
+          candidatePlan.source,
+        )
+      } catch (error) {
+        if ((error as { code?: string }).code === 'SKILL_NAME_CONFLICT') {
+          return reject('conflict', 'skill-name-conflict')
+        }
+        if ((error as { code?: string }).code === 'INVALID_SKILL_MANIFEST') {
+          return reject('not-restorable', 'invalid-skill-manifest')
+        }
+        throw error
+      }
     }
     const beforeText =
       sourceKind === 'document'
@@ -1303,6 +1344,7 @@ export class RestoreCoordinator {
         skillDirectoryName: string | null
       }
     | { status: 'retry'; reason: string }
+    | { status: 'reject'; reason: string }
   > {
     const pathFallbackTitle = fallbackTitleOf(path)
 
@@ -1349,6 +1391,10 @@ export class RestoreCoordinator {
         pathFallbackTitle,
         skillDirectoryName: null,
       }
+    }
+
+    if (root.kind === 'absent') {
+      return { status: 'reject', reason: 'skill-package-root-missing' }
     }
 
     return {
