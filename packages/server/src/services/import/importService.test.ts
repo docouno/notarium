@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
-import { STORE_ERROR_REASON } from '@notarium/core'
+import { noteFilePath, parseImport, STORE_ERROR_REASON } from '@notarium/core'
 
 import { runImport, type RunImportArgs } from './importService'
 import { ImportPlanConflictError } from './markdownTree'
@@ -50,23 +50,53 @@ type WriteCall = {
   id?: string
   expectedDestinationId?: string | null
   title?: string
+  sourceLocator?: string
+  legacyImportRoot?: string
+  legacyPredecessorPath?: string
+  originalId?: string
+  versionToken?: string
+  preservePath?: boolean
+  class?: 'user-doc'
+  content?: string
 }
 
 /** A store that records exactly what the import asked it to write. `existing` is
  *  the destination inventory the plan is settled against; `refuse` lets a test
  *  answer one destination the way the engine's own guard would. */
 const storeOf = (
-  existing: Array<{ id: string; filePath: string }> = [],
+  existing: Array<{
+    id: string
+    filePath: string
+    title?: string
+    sourceLocator?: string
+    versionToken?: string
+  }> = [],
   refuse?: (input: WriteCall) => { reason: string; message: string } | undefined,
 ) => {
   const writes: WriteCall[] = []
   let minted = 0
+  const state = existing.map((note) => ({
+    title: note.title ?? note.filePath,
+    sourceLocator: note.sourceLocator,
+    versionToken: note.versionToken ?? 'v1',
+    ...note,
+  }))
 
   return {
     writes,
+    state,
     store: {
-      list: async () => existing,
+      list: async () => state,
       checkpoint: async () => {},
+      read: async (id: string) => {
+        const note = state.find((candidate) => candidate.id === id)
+
+        if (!note) {
+          throw new Error(`missing note: ${id}`)
+        }
+
+        return { ...note, content: '', frontmatter: {} }
+      },
       write: async (input: WriteCall) => {
         const refusal = refuse?.(input)
 
@@ -74,8 +104,29 @@ const storeOf = (
           throw Object.assign(new Error(refusal.message), { reason: refusal.reason })
         }
         writes.push(input)
+        const current = input.originalId
+          ? state.find((candidate) => candidate.id === input.originalId)
+          : undefined
+        const id = current?.id ?? input.id ?? `minted-${++minted}`
+        const filePath =
+          current && input.preservePath
+            ? current.filePath
+            : noteFilePath(input.title ?? '', input.directory, input.fileName, id)
+        const stored = {
+          id,
+          title: input.title ?? '',
+          filePath,
+          sourceLocator: input.sourceLocator,
+          versionToken: `v${writes.length + 1}`,
+        }
 
-        return { id: input.id ?? `minted-${++minted}` }
+        if (current) {
+          Object.assign(current, stored)
+        } else {
+          state.push(stored)
+        }
+
+        return { ...stored, class: 'user-doc' as const }
       },
     },
   }
@@ -272,11 +323,14 @@ describe('cancelling a run (#302)', () => {
     const store = {
       list: async () => [],
       checkpoint: async () => {},
+      read: async () => {
+        throw new Error('unexpected read')
+      },
       write: async (input: { title?: string }) => {
         writes.push(input.title ?? '')
         controller.abort()
 
-        return { id: `n${writes.length}` }
+        return { id: `n${writes.length}`, filePath: `${input.title}.md` }
       },
     }
 
@@ -492,6 +546,257 @@ describe('the plan gate and an archive that never publishes a plan (#302)', () =
 })
 
 describe('what a foreign import reports (#302)', () => {
+  const claudeFile = async (uuid = 'source-1', title = 'Chat') => {
+    const path = join(dir, 'conversations.json')
+    const raw = JSON.stringify([
+      {
+        uuid,
+        name: title,
+        created_at: '2024-01-01T00:00:00Z',
+        chat_messages: [{ sender: 'human', text: `body ${uuid}` }],
+      },
+    ])
+
+    await writeFile(path, raw)
+    return { path, raw, note: parseImport(raw).notes[0] }
+  }
+
+  it('re-imports by locator after a user move and skipExisting ignores the old path', async () => {
+    const { path } = await claudeFile()
+    const harness = storeOf()
+    const first = await importOf(path, harness.store, { format: 'claude-conversations' })
+    const id = harness.state[0].id
+
+    expect(first).toMatchObject({ imported: 1, failed: 0 })
+    harness.state[0].filePath = 'moved/by-user.md'
+    const second = await importOf(path, harness.store, { format: 'claude-conversations' })
+
+    expect(second).toMatchObject({ imported: 1, failed: 0 })
+    expect(harness.writes.at(-1)).toMatchObject({
+      originalId: id,
+      preservePath: true,
+      sourceLocator: harness.state[0].sourceLocator,
+    })
+    expect(harness.state[0].filePath).toBe('moved/by-user.md')
+
+    const writesBeforeSkip = harness.writes.length
+    const skipped = await importOf(path, harness.store, {
+      format: 'claude-conversations',
+      skipExisting: true,
+    })
+    expect(skipped).toMatchObject({ imported: 0, skipped: 1, failed: 0 })
+    expect(harness.writes).toHaveLength(writesBeforeSkip)
+  })
+
+  it('refuses a source-less legacy predecessor without creating a canonical sibling', async () => {
+    const { path, note } = await claudeFile()
+    const legacyPath = noteFilePath(
+      note.title,
+      `imported/${note.legacyDirectory}`,
+      note.legacyFileName,
+      undefined,
+      true,
+    )
+    const harness = storeOf([{ id: 'legacy', filePath: legacyPath }])
+    const summary = await importOf(path, harness.store, { format: 'claude-conversations' })
+
+    expect(summary).toMatchObject({ imported: 0, failed: 1 })
+    expect(summary.errors[0].error).toMatch(/source-less legacy predecessor/)
+    expect(harness.writes).toHaveLength(0)
+    expect(harness.state).toHaveLength(1)
+  })
+
+  it('allows a different source-tagged legacy occupant and creates at canonical path', async () => {
+    const { path, note } = await claudeFile()
+    const legacyPath = noteFilePath(
+      note.title,
+      `imported/${note.legacyDirectory}`,
+      note.legacyFileName,
+      undefined,
+      true,
+    )
+    const harness = storeOf([
+      { id: 'other', filePath: legacyPath, sourceLocator: 'v1:claude:conversation:b3RoZXI' },
+    ])
+    const summary = await importOf(path, harness.store, { format: 'claude-conversations' })
+
+    expect(summary).toMatchObject({ imported: 1, failed: 0 })
+    expect(harness.state).toHaveLength(2)
+    expect(harness.state.find((candidate) => candidate.id !== 'other')?.filePath).toBe(
+      noteFilePath(note.title, `imported/${note.directory}`, note.fileName),
+    )
+  })
+
+  it('refuses a different source-tagged occupant at the canonical path', async () => {
+    const { path, note } = await claudeFile()
+    const canonicalPath = noteFilePath(note.title, `imported/${note.directory}`, note.fileName)
+    const harness = storeOf([
+      {
+        id: 'other',
+        filePath: canonicalPath,
+        sourceLocator: 'v1:claude:conversation:b3RoZXI',
+      },
+    ])
+    const summary = await importOf(path, harness.store, { format: 'claude-conversations' })
+
+    expect(summary).toMatchObject({ imported: 0, failed: 1 })
+    expect(summary.errors[0].error).toMatch(/canonical import path is occupied/)
+    expect(harness.writes).toHaveLength(0)
+  })
+
+  it('refuses duplicate and ambiguous locators before an offending second write', async () => {
+    const { path, note } = await claudeFile()
+    const duplicateRaw = JSON.stringify([
+      {
+        uuid: 'source-1',
+        name: 'First',
+        chat_messages: [{ sender: 'human', text: 'first' }],
+      },
+      {
+        uuid: 'source-1',
+        name: 'Second',
+        chat_messages: [{ sender: 'human', text: 'second' }],
+      },
+    ])
+    await writeFile(path, duplicateRaw)
+    const harness = storeOf()
+    let attempts = 0
+    const uncertain = {
+      ...harness.store,
+      write: async () => {
+        attempts++
+        throw new Error('publication outcome unknown')
+      },
+    }
+    const duplicate = await importOf(path, uncertain as never, {
+      format: 'claude-conversations',
+    })
+
+    expect(duplicate).toMatchObject({ imported: 0, failed: 2 })
+    expect(duplicate.errors[1].error).toMatch(/duplicate source locator/)
+    expect(attempts).toBe(1)
+
+    const ambiguous = storeOf([
+      { id: 'a', filePath: 'a.md', sourceLocator: note.sourceLocator },
+      { id: 'b', filePath: 'b.md', sourceLocator: note.sourceLocator },
+    ])
+    await writeFile(path, note.sourceLocator ? duplicateRaw.slice(0, duplicateRaw.length) : '')
+    const result = await importOf(path, ambiguous.store, { format: 'claude-conversations' })
+    expect(result).toMatchObject({ imported: 0, failed: 2 })
+    expect(result.errors[0].error).toMatch(/2 live owners/)
+    expect(ambiguous.writes).toHaveLength(0)
+  })
+
+  it('reports a stale parallel create safely and the next separate retry converges', async () => {
+    const { path, note } = await claudeFile()
+    const harness = storeOf()
+    const baseWrite = harness.store.write
+    let race = true
+    const racingStore = {
+      ...harness.store,
+      write: async (input: WriteCall) => {
+        if (race) {
+          race = false
+          harness.state.push({
+            id: 'winner',
+            title: input.title ?? '',
+            filePath: noteFilePath(input.title ?? '', input.directory, input.fileName, 'winner'),
+            sourceLocator: input.sourceLocator,
+            versionToken: 'winner-v1',
+          })
+          throw Object.assign(new Error('destination changed owner'), {
+            reason: STORE_ERROR_REASON.destinationOwnerConflict,
+          })
+        }
+
+        return baseWrite(input)
+      },
+    }
+
+    const first = await importOf(path, racingStore as never, { format: 'claude-conversations' })
+    expect(first).toMatchObject({ imported: 0, failed: 1 })
+    expect(harness.state).toHaveLength(1)
+
+    const retry = await importOf(path, racingStore as never, { format: 'claude-conversations' })
+    expect(retry).toMatchObject({ imported: 1, failed: 0 })
+    expect(harness.writes.at(-1)).toMatchObject({ originalId: 'winner', preservePath: true })
+    expect(harness.state).toHaveLength(1)
+    expect(harness.state[0].sourceLocator).toBe(note.sourceLocator)
+  })
+
+  it('counts an idless record and continues with both valid neighbours', async () => {
+    const path = join(dir, 'conversations.json')
+    const record = (uuid: string | undefined, name: string) => ({
+      uuid,
+      name,
+      chat_messages: [{ sender: 'human', text: name }],
+    })
+
+    await writeFile(
+      path,
+      JSON.stringify([
+        record('valid-a', 'A'),
+        record(undefined, 'Missing'),
+        record('valid-b', 'B'),
+      ]),
+    )
+    const { store, writes } = storeOf()
+    const progress: ImportProgress[] = []
+    const summary = await importOf(path, store, {
+      format: 'claude-conversations',
+      progressEvery: 1,
+      onProgress: (value) => {
+        progress.push({ ...value })
+      },
+    })
+
+    expect(summary).toMatchObject({ imported: 2, failed: 1, skipped: 0 })
+    expect(summary.errors).toEqual([
+      { title: 'Missing', error: 'claude conversation: missing durable uuid' },
+    ])
+    expect(writes.map((write) => write.title)).toEqual(['A', 'B'])
+    expect(writes.every((write) => write.sourceLocator?.startsWith('v1:claude:'))).toBe(true)
+    expect(writes.every((write) => write.legacyImportRoot === undefined)).toBe(true)
+    expect(progress.map(({ done, imported }) => ({ done, imported }))).toEqual([
+      { done: 0, imported: 0 },
+      { done: 1, imported: 1 },
+      { done: 2, imported: 1 },
+      { done: 3, imported: 2 },
+      { done: 3, imported: 2 },
+    ])
+  })
+
+  it('finishes foreign progress at the processed count when every record is skipped', async () => {
+    const path = join(dir, 'conversations.json')
+    await writeFile(
+      path,
+      JSON.stringify(
+        Array.from({ length: 3 }, (_, index) => ({
+          uuid: `empty-${index}`,
+          chat_messages: [{ sender: 'human', text: '' }],
+        })),
+      ),
+    )
+    const { store } = storeOf()
+    const progress: ImportProgress[] = []
+    const summary = await importOf(path, store, {
+      format: 'claude-conversations',
+      progressEvery: 1,
+      onProgress: (value) => {
+        progress.push({ ...value })
+      },
+    })
+
+    expect(summary).toMatchObject({ imported: 0, skipped: 0, failed: 0 })
+    expect(progress.map(({ done, imported }) => ({ done, imported }))).toEqual([
+      { done: 0, imported: 0 },
+      { done: 1, imported: 0 },
+      { done: 2, imported: 0 },
+      { done: 3, imported: 0 },
+      { done: 3, imported: 0 },
+    ])
+  })
+
   // The wire contract says archive order. Registering every member's meta after
   // the stream instead of as it finished sorted the result by "produced a note
   // first", which put an unrecognised member behind one listed after it.

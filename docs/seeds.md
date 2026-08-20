@@ -138,7 +138,7 @@ and for `security` — it parses the sanitized HTML into a live DOM and checks t
 | `agent-abilities-sparse` | the other end of the same axis: a first-run stand with System and Catalog plus exactly one Owned skill and no Owned role at all — the empty groups, the single-row group and the skeleton geometry that a fully populated stand can never show | agent-roles, structure, auth |
 | `memory-perf` | 2700 ordinary notes + 4 personal-memory categories + 1 project-partition sentinel; reproduces memory-mount scaling, partition isolation, and graph-inert memory links | agent-memory, note-classes, scale |
 | `import-thread` | one rich imported thread | import, content |
-| `import` | a multi-format layout (claude/chatgpt/memory-json) + backdated dates-as-data → Feed year-spread (#11/#223); plus `dropped/` — the states of a dragged-in `.md` archive whose OWN frontmatter was lifted (#280): authored tags + date, an Obsidian note titled by its file name with `aliases:` and plugin keys kept, a Jekyll post whose `title:` beats a differing body `# H1`, and a frontmatter-less note dated by the file's mtime; plus `vault/` — a Markdown TREE imported from a `.zip` (#302), its nested folders reproduced and its internal exact `[[notarium-id:…]]` links repointed at the COPIES (with a fenced-code copy left as authored) | import, content, activity |
+| `import` | a multi-format layout (claude/chatgpt/memory-json) + backdated dates-as-data → Feed year-spread (#11/#223); source-addressable Claude/ChatGPT notes carry canonical `notarium-source`, including two same-titled CJK project docs with distinct portable placement, beside one deliberately source-less legacy predecessor; plus `dropped/` — the states of a dragged-in `.md` archive whose OWN frontmatter was lifted (#280): authored tags + date, an Obsidian note titled by its file name with `aliases:` and plugin keys kept, a Jekyll post whose `title:` beats a differing body `# H1`, and a frontmatter-less note dated by the file's mtime; plus `vault/` — a Markdown TREE imported from a `.zip` (#302), its nested folders reproduced and its internal exact `[[notarium-id:…]]` links repointed at the COPIES (with a fenced-code copy left as authored) | import, content, activity |
 
 ### A fixture-pinned physical id (#302)
 
@@ -300,6 +300,8 @@ same typed projections from the final carry as its write does (`type`/`tags`/`al
 `summary`/`muted`). Explicit fixture fields have the serializer's final priority, including
 empty clears, and remove their raw shadow so it cannot reappear on export. Skipping either rule
 would make the fake disagree with the real file after import (pinned by `inMemoryStore.test.ts`).
+
+A create declaration may additionally carry typed **`sourceLocator`**. Both appliers materialize it through the same trusted `WriteInput.sourceLocator`/`NoteSnapshot.sourceLocator` channel, so the file contains reserved `notarium-source` while ordinary frontmatter/public projections do not. This is distinct from authored `frontmatter`: putting the same key there models fresh untrusted carry and must not mint a claim. Omitting `sourceLocator` is how a case deliberately preserves a source-less legacy import state.
 
 Ordinary seeded history remains a readable compatibility projection: the fake writes a
 complete canonical `markdown-v1` snapshot and hashes/diffs that snapshot, not only the

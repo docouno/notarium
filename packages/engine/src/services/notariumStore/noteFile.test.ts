@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  claudeConversationSourceLocator,
   FRONTMATTER_BYTE_CAP,
   frontmatterEntryValue,
   FrontmatterLimitError,
+  IMPORT_SOURCE_FRONTMATTER_KEY,
   markdownFileToNote,
   parseFrontmatterBlock,
 } from '@notarium/core'
@@ -166,6 +168,56 @@ describe('parseNoteFile', () => {
     expect(parsed.frontmatter).not.toHaveProperty('slug')
     expect(parsed.frontmatter).not.toHaveProperty('created')
     expect(parsed.frontmatter).not.toHaveProperty('notarium-id')
+  })
+})
+
+describe('notarium-source file truth', () => {
+  const locator = claudeConversationSourceLocator('conversation-一')!
+  const carried = (value: string) => [
+    { key: IMPORT_SOURCE_FRONTMATTER_KEY, lines: [`${IMPORT_SOURCE_FRONTMATTER_KEY}: ${value}`] },
+  ]
+
+  it('projects only a canonical direct-file claim and hides the raw key', () => {
+    const parsed = parseNoteFile(
+      `---\n${IMPORT_SOURCE_FRONTMATTER_KEY}: ${locator}\nauthor: S\n---\n\n# T\n\nbody`,
+      't.md',
+    )
+
+    expect(parsed.sourceLocator).toBe(locator)
+    expect(parsed.frontmatter).toEqual({ author: 'S' })
+    expect(
+      parseNoteFile(`---\n${IMPORT_SOURCE_FRONTMATTER_KEY}: authored\n---\n\n# T`, 't.md')
+        .sourceLocator,
+    ).toBeNull()
+  })
+
+  it('strips fresh raw/inline spoofing, preserves a live claim and materializes typed provenance', () => {
+    const spoofed = serializeNoteFile({
+      title: 'T',
+      body: `---\n${IMPORT_SOURCE_FRONTMATTER_KEY}: ${locator}\n---\n\nbody`,
+      frontmatter: carried(locator),
+    })
+    expect(spoofed).not.toContain(IMPORT_SOURCE_FRONTMATTER_KEY)
+
+    const tagged = serializeNoteFile({ title: 'T', body: 'body', sourceLocator: locator })
+    expect(parseNoteFile(tagged, 't.md').sourceLocator).toBe(locator)
+
+    const edited = serializeNoteFile({ title: 'T2', body: 'new', existingRaw: tagged })
+    expect(parseNoteFile(edited, 't.md').sourceLocator).toBe(locator)
+  })
+
+  it('restores the historical locator through full-state replace', () => {
+    const historical = serializeNoteFile({ title: 'Old', body: 'old', sourceLocator: locator })
+    const state = parseNoteFile(historical, 'old.md')
+    const restored = serializeNoteFile({
+      title: state.title,
+      body: state.body,
+      frontmatter: state.frontmatterEntries,
+      frontmatterMode: 'replace',
+      existingRaw: serializeNoteFile({ title: 'Now', body: 'now' }),
+    })
+
+    expect(parseNoteFile(restored, 'old.md').sourceLocator).toBe(locator)
   })
 })
 

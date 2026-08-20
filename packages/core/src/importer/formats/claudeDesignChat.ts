@@ -6,7 +6,15 @@
 
 import { IMPORT_SOURCE } from '../consts'
 import { convoFileName, importerDirectorySlug, stampOf, toIso } from '../helpers/format'
-import type { ImportNote } from '../types'
+import {
+  failedImportRecord,
+  importedNote,
+  partitionImportOutcomes,
+  skippedImportRecord,
+} from '../outcomes'
+import { portableDisplayGroup, sourceNoteFileName, sourceProjectDirectoryName } from '../placement'
+import { claudeDesignChatSourceLocator, claudeProjectPlacementLocator } from '../sourceLocator'
+import type { ImportRecordOutcome } from '../types'
 
 type DesignBlock = { type?: string; text?: unknown }
 type DesignContent = { content?: unknown } | string
@@ -60,12 +68,11 @@ const renderMessage = (m: DesignMessage): string => {
   return `### ${role}${stamp ? ` (${stamp})` : ''}\n\n${text}`
 }
 
-/** One design chat → one note (the streaming unit). null when there's no message
- *  list. Grouped under `design-chats/<project>` so a project's chats sit together
- *  even though each is its own file. */
-export const claudeDesignChatToNote = (chat: DesignChat, index = 0): ImportNote | null => {
+/** One design chat → one record outcome. Project-bound chats share the project's
+ * source-tagged directory; an unbound chat uses portable display grouping. */
+export const claudeDesignChatToNote = (chat: DesignChat): ImportRecordOutcome => {
   if (!chat || typeof chat !== 'object' || !Array.isArray(chat.messages)) {
-    return null
+    return skippedImportRecord('design chat has no message list')
   }
   const title = (chat.title || '').trim() || 'Design chat'
   const createdAt = toIso(chat.created_at ?? null)
@@ -75,35 +82,48 @@ export const claudeDesignChatToNote = (chat: DesignChat, index = 0): ImportNote 
   // mirroring the conversation parsers; this also activates the empty-counter in
   // the streaming processSingleObject path.
   if (!body.trim()) {
-    return null
+    return skippedImportRecord('design chat has no renderable content')
   }
   const project = (chat.project?.name || '').trim()
   const projectSlug = importerDirectorySlug(project)
-  // Preserve the pre-#296 fallback exactly. Changing a deterministic import
-  // destination without source-provenance migration duplicates an existing
-  // CJK project on its first re-import; the run-level reservation fails closed
-  // when two records in one upload share this legacy path.
+  // Preserve the pre-#296 fallback exactly as predecessor evidence. The host
+  // refuses a source-less occupant there instead of guessing or duplicating it.
   const sub = project ? `/${projectSlug || 'project'}` : ''
-  const sourceId = chat.uuid || `${index}`
-  return {
+  const sourceLocator = claudeDesignChatSourceLocator(chat.uuid)
+
+  if (!sourceLocator) {
+    return failedImportRecord(title, 'claude design chat: missing durable uuid')
+  }
+  const projectLocator = claudeProjectPlacementLocator(chat.project?.uuid)
+  const directory = projectLocator
+    ? `projects/${sourceProjectDirectoryName(project, projectLocator)}/design-chats`
+    : project
+      ? `design-chats/${portableDisplayGroup(project)}`
+      : 'design-chats'
+
+  return importedNote({
     title,
     body,
-    directory: `design-chats${sub}`,
+    directory,
     tags: ['claude', 'design-chat'],
     noteType: 'conversation',
     createdAt: createdAt ?? undefined,
-    fileName: convoFileName(title, createdAt, sourceId),
+    fileName: sourceNoteFileName(title, sourceLocator, createdAt),
+    legacyDirectory: `design-chats${sub}`,
+    legacyFileName: convoFileName(title, createdAt, chat.uuid!),
     source: IMPORT_SOURCE.claude,
-  }
+    sourceLocator,
+  })
 }
 
 export const parseClaudeDesignChat = (
   data: unknown,
-): { notes: ImportNote[]; warnings: string[] } => {
+): ReturnType<typeof partitionImportOutcomes> & { warnings: string[] } => {
   const chats: DesignChat[] = Array.isArray(data) ? (data as DesignChat[]) : [data as DesignChat]
-  const notes = chats
-    .map((c, i) => claudeDesignChatToNote(c, i))
-    .filter((n): n is ImportNote => n != null)
-  const warnings = notes.length ? [] : ['claude design chat: no renderable content']
-  return { notes, warnings }
+  const partitioned = partitionImportOutcomes(chats.map((chat) => claudeDesignChatToNote(chat)))
+  const warnings =
+    partitioned.notes.length || partitioned.failures.length
+      ? []
+      : ['claude design chat: no renderable content']
+  return { ...partitioned, warnings }
 }

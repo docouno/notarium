@@ -233,18 +233,30 @@ export const createJobRunner = (opts: JobRunnerOptions): JobRunner => {
     let lastDone = job.progressDone
     let lastTotal = job.progressTotal
     let lastPhase = job.phase
+    let heartbeatTail = Promise.resolve()
+
+    const writeHeartbeat = (progress: Parameters<JobContext['report']>[0]): Promise<boolean> => {
+      const input = { ...progress, now: nowIso() }
+      const write = heartbeatTail.then(() => jobs.heartbeat(job.id, lease, input))
+
+      // Timer and handler reports share one completion order. Recover only the
+      // sequencing tail: each caller still observes its own rejection/false result.
+      heartbeatTail = write.then(
+        () => undefined,
+        () => undefined,
+      )
+      return write
+    }
 
     // Heartbeat refreshes the lock; a false return ⇒ the row is no longer ours
     // (cancel/reap) → abort.
     const hb = setInterval(
       () => {
-        void jobs
-          .heartbeat(job.id, lease, {
-            done: lastDone,
-            total: lastTotal,
-            phase: lastPhase,
-            now: nowIso(),
-          })
+        void writeHeartbeat({
+          done: lastDone,
+          total: lastTotal,
+          phase: lastPhase,
+        })
           .then((ok) => {
             if (!ok && !controller.signal.aborted) {
               controller.abort()
@@ -274,11 +286,10 @@ export const createJobRunner = (opts: JobRunnerOptions): JobRunner => {
         if (p.phase !== undefined) {
           lastPhase = p.phase
         }
-        const ok = await jobs.heartbeat(job.id, lease, {
+        const ok = await writeHeartbeat({
           done: p.done,
           total: p.total,
           phase: p.phase,
-          now: nowIso(),
         })
 
         if (!ok) {

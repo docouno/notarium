@@ -10,6 +10,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
+import { claudeConversationSourceLocator } from '@notarium/core'
+
 import type { Embedder } from '../../libs/embedding'
 import { createLocalFsFiles } from '../../libs/files'
 import { createNodeSqliteDriver } from '../../libs/sql'
@@ -180,17 +182,25 @@ describeVector('index migration preserves vectors', () => {
    *  the replay then trips over its own ALTER ("duplicate column name"). */
   const seedEmbeddedIndex = async () => {
     const emb = countingEmbedder()
+    const sourceLocatorStep = INDEX_MIGRATIONS.at(-1)!
     const store = new NotariumStore({
       mounts: [userMount(notesDir)],
       sql: createNodeSqliteDriver(indexDb, { vec: true }),
       embedder: emb.embedder,
-      migrations: [INDEX_MIGRATIONS[0]],
+      // Current code writes the newest notes-table projection. Seed with that
+      // additive column present, then remove it below to reproduce the exact
+      // pre-step schema without running an old binary in this test process.
+      migrations: [INDEX_MIGRATIONS[0], sourceLocatorStep],
     })
     const path = await writePath(store, { title: 'Cat', content: 'A small feline.' })
     await store.whenVectorsSettled()
     const embeddedOnce = emb.textCount
     expect(embeddedOnce).toBeGreaterThan(0)
     await store.stop()
+    const legacy = createNodeSqliteDriver(indexDb, { vec: true })
+    await legacy.run(`ALTER TABLE notes DROP COLUMN source_locator`)
+    await legacy.run(`UPDATE meta SET value = '1' WHERE key = ?`, [INDEX_VERSION_KEY])
+    await legacy.close()
     return { emb, path, embeddedOnce }
   }
 
@@ -258,20 +268,9 @@ describeVector('index migration preserves vectors', () => {
   })
 
   it('applies the shipped fingerprint-table step without re-embedding', async () => {
-    const baseline = INDEX_MIGRATIONS[0]
-    const emb = countingEmbedder()
-    let store = new NotariumStore({
-      mounts: [userMount(notesDir)],
-      sql: createNodeSqliteDriver(indexDb, { vec: true }),
-      embedder: emb.embedder,
-      migrations: [baseline],
-    })
-    const path = await writePath(store, { title: 'Lynx', content: 'A quiet wild cat.' })
-    await store.whenVectorsSettled()
-    const embeddedOnce = emb.textCount
-    await store.stop()
+    const { emb, path, embeddedOnce } = await seedEmbeddedIndex()
 
-    store = new NotariumStore({
+    const store = new NotariumStore({
       mounts: [userMount(notesDir)],
       sql: createNodeSqliteDriver(indexDb, { vec: true }),
       embedder: emb.embedder,
@@ -297,13 +296,80 @@ describeVector('index migration preserves vectors', () => {
     await after.close()
   })
 
+  it('adds nullable source_locator without rowid, FTS, vector or hidden backfill churn', async () => {
+    const locator = claudeConversationSourceLocator('pre-task-authored')!
+    const emb = countingEmbedder()
+    let store = createNotariumStore({ notesDir, indexDb, embedder: emb.embedder })
+    const path = await writePath(store, {
+      title: 'Tagged before the migration',
+      content: 'stable body',
+      sourceLocator: locator,
+    })
+    await store.whenVectorsSettled()
+    const embeddedOnce = emb.textCount
+    await store.stop()
+
+    const before = createNodeSqliteDriver(indexDb, { vec: true })
+    const row = await before.get<{ rowid: number; embedded_hash: string | null }>(
+      `SELECT rowid, embedded_hash FROM notes WHERE path = ?`,
+      [path],
+    )
+    const ftsBefore = (await before.get<{ n: number }>(
+      `SELECT count(*) AS n FROM notes_fts WHERE rowid = ?`,
+      [row!.rowid],
+    ))!.n
+    const vectorsBefore = (await before.get<{ n: number }>(
+      `SELECT count(*) AS n FROM note_vectors WHERE note_rowid = ?`,
+      [row!.rowid],
+    ))!.n
+    // Reproduce the immediately-pre-task index: the file already contains an
+    // authored same-name key, but the derived row has no projection column yet.
+    await before.run(`ALTER TABLE notes DROP COLUMN source_locator`)
+    await before.run(`UPDATE meta SET value = ? WHERE key = ?`, [
+      String(INDEX_MIGRATIONS.length - 1),
+      INDEX_VERSION_KEY,
+    ])
+    await before.close()
+
+    store = createNotariumStore({ notesDir, indexDb, embedder: emb.embedder })
+    const listed = await store.list()
+    await store.whenVectorsSettled()
+    expect(listed.find((note) => note.filePath === path)?.sourceLocator).toBeUndefined()
+    expect(emb.textCount).toBe(embeddedOnce)
+    await store.stop()
+
+    const after = createNodeSqliteDriver(indexDb, { vec: true })
+    const upgraded = await after.get<{
+      rowid: number
+      source_locator: string | null
+      embedded_hash: string | null
+    }>(`SELECT rowid, source_locator, embedded_hash FROM notes WHERE path = ?`, [path])
+    expect(upgraded).toMatchObject({
+      rowid: row!.rowid,
+      source_locator: null,
+      embedded_hash: row!.embedded_hash,
+    })
+    expect(
+      (await after.get<{ n: number }>(`SELECT count(*) AS n FROM notes_fts WHERE rowid = ?`, [
+        row!.rowid,
+      ]))!.n,
+    ).toBe(ftsBefore)
+    expect(
+      (await after.get<{ n: number }>(
+        `SELECT count(*) AS n FROM note_vectors WHERE note_rowid = ?`,
+        [row!.rowid],
+      ))!.n,
+    ).toBe(vectorsBefore)
+    await after.close()
+  })
+
   it('applies an appended additive step through ensureReady, crash-safely, without re-embedding', async () => {
     // Drive the REAL boot path (ensureReady's apply-loop) through an appended step —
     // inject a synthetic two-step ladder rooted at the frozen baseline. This is the
     // core promise end-to-end: an ADD COLUMN bumps the version but keeps rowids, so the
     // note is NOT re-embedded. Plus crash-safety: a step that fails mid-way rolls back
     // whole (no half-applied, non-idempotent ALTER wedging the next boot).
-    const baseline = INDEX_MIGRATIONS[0]
+    const baseline = [...INDEX_MIGRATIONS]
     const emb = countingEmbedder()
 
     // Boot 1 at the baseline ladder (v1): embed one note.
@@ -311,7 +377,7 @@ describeVector('index migration preserves vectors', () => {
       mounts: [userMount(notesDir)],
       sql: createNodeSqliteDriver(indexDb, { vec: true }),
       embedder: emb.embedder,
-      migrations: [baseline],
+      migrations: baseline,
     })
     const path = await writePath(store, { title: 'Fox', content: 'A quick red fox.' })
     await store.whenVectorsSettled()
@@ -329,13 +395,13 @@ describeVector('index migration preserves vectors', () => {
       mounts: [userMount(notesDir)],
       sql: createNodeSqliteDriver(indexDb, { vec: true }),
       embedder: emb.embedder,
-      migrations: [baseline, brokenStep],
+      migrations: [...baseline, brokenStep],
     })
     await expect(store.list()).rejects.toThrow()
     await store.stop()
 
     let d = createNodeSqliteDriver(indexDb, { vec: true })
-    expect(await indexVersion(d)).toBe('1') // rolled back — version never advanced
+    expect(await indexVersion(d)).toBe(String(baseline.length))
     expect(await hasColumn(d, 'notes', 'future_col')).toBe(false) // the ALTER was undone
     await d.close()
 
@@ -346,7 +412,7 @@ describeVector('index migration preserves vectors', () => {
       mounts: [userMount(notesDir)],
       sql: createNodeSqliteDriver(indexDb, { vec: true }),
       embedder: emb.embedder,
-      migrations: [baseline, goodStep],
+      migrations: [...baseline, goodStep],
     })
     await store.list()
     await store.whenVectorsSettled()
@@ -354,7 +420,7 @@ describeVector('index migration preserves vectors', () => {
     await store.stop()
 
     d = createNodeSqliteDriver(indexDb, { vec: true })
-    expect(await indexVersion(d)).toBe('2')
+    expect(await indexVersion(d)).toBe(String(baseline.length + 1))
     expect(await hasColumn(d, 'notes', 'future_col')).toBe(true)
     const row = await d.get<{ content_hash: string; embedded_hash: string }>(
       `SELECT content_hash, embedded_hash FROM notes WHERE path = ?`,
@@ -373,7 +439,7 @@ describeVector('index migration preserves vectors', () => {
     // (not just the one-step-per-reboot path the other tests exercise).
     const emb = countingEmbedder()
     const ladder: IndexMigration[] = [
-      INDEX_MIGRATIONS[0],
+      ...INDEX_MIGRATIONS,
       { sql: `ALTER TABLE notes ADD COLUMN future_col TEXT` },
     ]
     const store = new NotariumStore({
@@ -390,7 +456,7 @@ describeVector('index migration preserves vectors', () => {
     await store.stop()
 
     const d = createNodeSqliteDriver(indexDb, { vec: true })
-    expect(await indexVersion(d)).toBe('2') // both steps stamped
+    expect(await indexVersion(d)).toBe(String(ladder.length))
     expect(await hasColumn(d, 'notes', 'future_col')).toBe(true) // appended step applied
     await d.close()
   })

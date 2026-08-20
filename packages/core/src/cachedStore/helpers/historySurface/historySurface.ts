@@ -1,3 +1,4 @@
+import { isImportNoteSourceLocator } from '../../../importer'
 import type {
   BatchFailure,
   NoteClass,
@@ -27,6 +28,7 @@ import { normAliases } from '../../../libs/aliases'
 import { frontmatterEntryValue, parseLogicalNoteState } from '../../../libs/markdown'
 import { MutationCoordinator } from '../../../libs/mutationCoordinator'
 import { slugify } from '../../../libs/slug'
+import { IMPORT_SOURCE_FRONTMATTER_KEY } from '../../../sourceIdentity'
 import { classesForScope, NOTE_CLASSES } from '../../../visibility'
 import { TRASH_MUTATION_PREFIX, trashMutationPath } from '../../consts'
 import type { HistoryHost } from './types'
@@ -484,12 +486,18 @@ export class HistorySurface {
         : null
     const state = detail?.logicalState ? parseLogicalNoteState(detail.logicalState) : null
     const frontmatter: Record<string, unknown> = {}
+    let sourceLocator: string | undefined
 
     for (const entry of state?.frontmatter ?? []) {
       if (!entry.key) {
         continue
       }
       const value = frontmatterEntryValue(entry)
+
+      if (entry.key === IMPORT_SOURCE_FRONTMATTER_KEY) {
+        sourceLocator = isImportNoteSourceLocator(value) ? value : undefined
+        continue
+      }
 
       if (value == null) {
         delete frontmatter[entry.key]
@@ -514,6 +522,7 @@ export class HistorySurface {
       filePath: this.host.identity.recordFor(id)?.filePath ?? undefined,
       content: state?.body ?? detail?.content ?? '',
       frontmatter,
+      ...(sourceLocator ? { sourceLocator } : {}),
       logicalState: detail?.logicalState ?? undefined,
       documentState: detail?.documentState ?? undefined,
       ...(aliases?.length ? { aliases } : {}),

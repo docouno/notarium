@@ -43,6 +43,9 @@ export type NoteSnapshot = {
    *  what an imported note keeps; served back through read().frontmatter and the
    *  export reconstruction. */
   frontmatter?: string
+  /** Canonical reserved import provenance. A fixture may also model a direct
+   * external file by carrying the same key in `frontmatter`. */
+  sourceLocator?: string
 }
 
 export type StoreSnapshot = {

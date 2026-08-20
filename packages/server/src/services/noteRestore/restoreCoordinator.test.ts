@@ -16,12 +16,14 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   analyzeDocumentState,
   bindStorageOwnerProof,
+  claudeConversationSourceLocator,
   DOCUMENT_ROLE,
   type DocumentState,
   documentStateVersionToken,
   encodeDocumentState,
   exactOwnerObservation,
   FRONTMATTER_BYTE_CAP,
+  IMPORT_SOURCE_FRONTMATTER_KEY,
   type LOGICAL_NOTE_STATE_FORMAT,
   RESTORE_OPERATION_PHASE,
   type RestoreOperationPersistence,
@@ -1324,6 +1326,24 @@ describe('RestoreCoordinator eligibility', () => {
     expect(text).toContain('old body')
     // Terminal, so nothing is left pinning the space.
     expect(await f.metaDb.restoreOperations.listRecoverable('space-a')).toEqual([])
+    await f.metaDb.close()
+  })
+
+  it('strict trash restore preserves the historical import source locator', async () => {
+    const locator = claudeConversationSourceLocator('strict-restore-source')!
+    const sourceState = analyzeDocumentState({
+      source: new TextEncoder().encode(
+        `---\ntitle: Imported\n${IMPORT_SOURCE_FRONTMATTER_KEY}: ${locator}\n---\nold body\n`,
+      ),
+      pathFallbackTitle: 'note',
+    })
+    const f = await fixture({ mode: 'trash', sourceState })
+    const result = await f.coordinator().execute(f.trashCommand)
+
+    expect(result).toMatchObject({ status: 'succeeded', noteId: NOTE_ID })
+    const text = await readFile(join(roots[0], 'notes', f.targetPath), 'utf8')
+    expect(text).toContain(`${IMPORT_SOURCE_FRONTMATTER_KEY}: ${locator}`)
+    expect(text.match(new RegExp(`^${IMPORT_SOURCE_FRONTMATTER_KEY}:`, 'gm'))).toHaveLength(1)
     await f.metaDb.close()
   })
 

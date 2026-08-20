@@ -1,10 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
 
+import { claudeConversationSourceLocator } from '../../../importer'
 import type { NoteContent, NoteMeta, RevisionInput } from '../../../knowledgeStore'
 import { DOCUMENT_ROLE } from '../../../libs/markdown'
 import { analyzeDocumentState } from '../../../libs/markdown'
 import { type MutationClaim, MutationCoordinator } from '../../../libs/mutationCoordinator'
 import { noteFilePath } from '../../../libs/path'
+import { NotesMap } from '../snapshot/notesMap'
 import type { WriteHost } from './types'
 import { WriteEngine } from './writeEngine'
 
@@ -26,8 +28,16 @@ const hostFor = (
     },
     snap: {
       notes: Object.assign(notes, {
-        idsAt: (path: string) =>
-          [...notes].filter(([, meta]) => meta.filePath === path).map(([id]) => id),
+        idsAt:
+          'idsAt' in notes
+            ? (notes as NotesMap).idsAt.bind(notes)
+            : (path: string) =>
+                [...notes].filter(([, meta]) => meta.filePath === path).map(([id]) => id),
+        idsWithSourceLocator:
+          'idsWithSourceLocator' in notes
+            ? (notes as NotesMap).idsWithSourceLocator.bind(notes)
+            : (locator: string) =>
+                [...notes].filter(([, meta]) => meta.sourceLocator === locator).map(([id]) => id),
       }),
       resolvedTargetIds: () => [],
       sourceIdsTargeting: () => [],
@@ -97,6 +107,92 @@ describe('WriteEngine destination fence', () => {
     expect([...(claims[0]?.paths ?? [])]).toContain(
       noteFilePath('Field Notes', `${PACKAGE_DIR}/references`, undefined, 'aux-note-id'),
     )
+  })
+
+  it('claims and re-checks a source-less legacy predecessor with the canonical create', async () => {
+    const legacyPath = 'conversations/claude/legacy.md'
+    const canonicalPath = 'conversations/claude/canonical.md'
+    const notes = new Map<string, NoteMeta>([
+      [
+        'legacy-id',
+        {
+          id: 'legacy-id',
+          title: 'Legacy',
+          filePath: legacyPath,
+          modifiedAt: null,
+          createdAt: null,
+        },
+      ],
+    ])
+    const claims: MutationClaim[] = []
+
+    const coordinator = new MutationCoordinator()
+    const runStable = coordinator.runStable.bind(coordinator)
+    vi.spyOn(coordinator, 'runStable').mockImplementation(async (claimFor, operation) => {
+      claims.push(claimFor())
+      return runStable(claimFor, operation)
+    })
+    const { host } = hostFor(notes)
+    const engine = new WriteEngine(host, { mutations: coordinator })
+
+    await expect(
+      engine.write({
+        id: 'fresh-id',
+        title: 'Canonical',
+        content: 'body',
+        directory: 'conversations/claude',
+        fileName: 'canonical',
+        sourceLocator: claudeConversationSourceLocator('source-1')!,
+        expectedDestinationId: null,
+        legacyPredecessorPath: legacyPath,
+      }),
+    ).rejects.toMatchObject({ reason: 'destination_owner_conflict' })
+    expect(claims[0].paths).toEqual(expect.arrayContaining([canonicalPath, legacyPath]))
+    expect(host.inner.write).not.toHaveBeenCalled()
+  })
+
+  it('re-checks a locator owner through the reverse index without walking the corpus', async () => {
+    const notes = new NotesMap()
+    const locator = claudeConversationSourceLocator('indexed-owner')!
+
+    for (let index = 0; index < 50_000; index++) {
+      notes.set(`note-${index}`, {
+        id: `note-${index}`,
+        title: `Note ${index}`,
+        filePath: `notes/${index}.md`,
+        modifiedAt: null,
+        createdAt: null,
+      })
+    }
+    notes.set('source-owner', {
+      id: 'source-owner',
+      title: 'Owner',
+      filePath: 'owner.md',
+      sourceLocator: locator,
+      modifiedAt: null,
+      createdAt: null,
+    })
+    Object.defineProperty(notes, Symbol.iterator, {
+      value: () => {
+        throw new Error('source lookup walked the corpus')
+      },
+    })
+    const { host } = hostFor(notes)
+
+    await expect(
+      new WriteEngine(host).write({
+        id: 'fresh-id',
+        title: 'Fresh',
+        content: 'body',
+        fileName: 'fresh',
+        sourceLocator: locator,
+        expectedDestinationId: null,
+      }),
+    ).rejects.toMatchObject({
+      reason: 'destination_owner_conflict',
+      message: expect.stringContaining('source locator is already owned by source-owner'),
+    })
+    expect(host.inner.write).not.toHaveBeenCalled()
   })
 })
 

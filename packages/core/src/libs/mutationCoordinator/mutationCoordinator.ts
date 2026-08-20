@@ -2,6 +2,8 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 
 export type MutationClaim = {
   global?: boolean
+  /** Opaque process-local resources that are neither note ids nor paths. */
+  resources?: Iterable<string | null | undefined>
   noteIds?: Iterable<string | null | undefined>
   paths?: Iterable<string | null | undefined>
   prefixes?: Iterable<string | null | undefined>
@@ -9,6 +11,7 @@ export type MutationClaim = {
 
 type Claim = {
   global: boolean
+  resources: Set<string>
   noteIds: Set<string>
   paths: Set<string>
   prefixes: Set<string>
@@ -49,6 +52,7 @@ const values = (
 
 const normalizeClaim = (claim: MutationClaim): Claim => ({
   global: claim.global === true,
+  resources: values(claim.resources),
   noteIds: values(claim.noteIds),
   paths: values(claim.paths, cleanPath),
   prefixes: values(claim.prefixes, cleanPath),
@@ -56,6 +60,7 @@ const normalizeClaim = (claim: MutationClaim): Claim => ({
 
 const union = (a: Claim, b: Claim): Claim => ({
   global: a.global || b.global,
+  resources: new Set([...a.resources, ...b.resources]),
   noteIds: new Set([...a.noteIds, ...b.noteIds]),
   paths: new Set([...a.paths, ...b.paths]),
   prefixes: new Set([...a.prefixes, ...b.prefixes]),
@@ -73,6 +78,7 @@ const contains = (superset: Set<string>, subset: Set<string>): boolean => {
 
 const covers = (held: Claim, current: Claim): boolean =>
   (!current.global || held.global) &&
+  contains(held.resources, current.resources) &&
   contains(held.noteIds, current.noteIds) &&
   contains(held.paths, current.paths) &&
   contains(held.prefixes, current.prefixes)
@@ -94,7 +100,11 @@ const conflicts = (a: Claim, b: Claim): boolean => {
   if (a.global || b.global) {
     return true
   }
-  if (intersects(a.noteIds, b.noteIds) || intersects(a.paths, b.paths)) {
+  if (
+    intersects(a.resources, b.resources) ||
+    intersects(a.noteIds, b.noteIds) ||
+    intersects(a.paths, b.paths)
+  ) {
     return true
   }
   for (const path of a.paths) {

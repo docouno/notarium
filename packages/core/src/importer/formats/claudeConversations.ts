@@ -3,8 +3,16 @@
 // rendered as `### Human/Assistant (timestamp)` sections (readable).
 
 import { IMPORT_SOURCE } from '../consts'
-import { convoFileName, shortHash, stampOf, toIso } from '../helpers/format'
-import type { ImportNote } from '../types'
+import { convoFileName, stampOf, toIso } from '../helpers/format'
+import {
+  failedImportRecord,
+  importedNote,
+  partitionImportOutcomes,
+  skippedImportRecord,
+} from '../outcomes'
+import { sourceNoteFileName } from '../placement'
+import { claudeConversationSourceLocator } from '../sourceLocator'
+import type { ImportRecordOutcome } from '../types'
 
 type ClaudeAttachment = { file_name?: string; extracted_content?: string }
 type ClaudeFile = { file_name?: string; file_uuid?: string }
@@ -82,17 +90,16 @@ const renderMessage = (m: ClaudeMessage): string => {
   return `### ${role}${stamp ? ` (${stamp})` : ''}\n\n${content}`
 }
 
-/** One conversation → one note (the streaming unit). null when the record is too
- *  empty to be a conversation (no id/name/messages). `index` only seeds a
- *  fallback title for the rare unnamed-and-idless case. */
+/** One conversation → one record outcome (the streaming unit). `index` only
+ * seeds a diagnostic title for the rare unnamed-and-idless failure. */
 export const claudeConversationToNote = (
   conv: ClaudeConversation,
   index = 0,
-): ImportNote | null => {
+): ImportRecordOutcome => {
   const uuid = conv?.uuid || ''
 
   if (!uuid && !conv?.name && !conv?.chat_messages?.length) {
-    return null
+    return skippedImportRecord('not a conversation')
   }
   const title = (conv.name || '').trim() || `Conversation ${uuid || index + 1}`
   const createdAt = toIso(conv.created_at)
@@ -100,48 +107,50 @@ export const claudeConversationToNote = (
 
   // No renderable content (every message empty in the export) → not a note.
   if (!body.trim()) {
-    return null
+    return skippedImportRecord('conversation has no renderable content')
   }
-  // The id keys the deterministic filename. Without one (rare), key on the index
-  // + a body hash so two idless same-titled chats don't collide onto one file.
-  const sourceId = uuid || `${index}-${shortHash(body)}`
-  return {
+  const sourceLocator = claudeConversationSourceLocator(uuid)
+
+  if (!sourceLocator) {
+    return failedImportRecord(title, 'claude conversation: missing durable uuid')
+  }
+
+  return importedNote({
     title,
     body,
     directory: 'conversations/claude',
     tags: ['claude', 'conversation'],
     noteType: 'conversation',
     createdAt: createdAt ?? undefined,
-    fileName: convoFileName(title, createdAt, sourceId),
+    fileName: sourceNoteFileName(title, sourceLocator, createdAt),
+    legacyDirectory: 'conversations/claude',
+    legacyFileName: convoFileName(title, createdAt, uuid),
     source: IMPORT_SOURCE.claude,
-  }
+    sourceLocator,
+  })
 }
 
 export const parseClaudeConversations = (
   data: unknown,
-): { notes: ImportNote[]; warnings: string[] } => {
+): ReturnType<typeof partitionImportOutcomes> & { warnings: string[] } => {
   if (!Array.isArray(data)) {
-    return { notes: [], warnings: ['claude conversations: expected a JSON array'] }
-  }
-  const notes: ImportNote[] = []
-  let empty = 0
-  data.forEach((conv, i) => {
-    const note = claudeConversationToNote(conv as ClaudeConversation, i)
-
-    if (note) {
-      notes.push(note)
-    } else {
-      empty++
+    return {
+      notes: [],
+      failures: [],
+      skipped: 0,
+      warnings: ['claude conversations: expected a JSON array'],
     }
-  })
+  }
+  const outcomes = data.map((conv, i) => claudeConversationToNote(conv as ClaudeConversation, i))
+  const { notes, failures, skipped } = partitionImportOutcomes(outcomes)
   const warnings: string[] = []
 
-  if (!notes.length) {
+  if (!notes.length && !failures.length) {
     warnings.push('claude conversations: no conversations found')
   }
-  if (empty) {
-    warnings.push(`claude conversations: skipped ${empty} conversation(s) with no content`)
+  if (skipped) {
+    warnings.push(`claude conversations: skipped ${skipped} conversation(s) with no content`)
   }
 
-  return { notes, warnings }
+  return { notes, failures, skipped, warnings }
 }

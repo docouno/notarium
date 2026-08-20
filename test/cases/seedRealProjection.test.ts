@@ -41,6 +41,12 @@ describe('the real seed applier', () => {
     // A guard on the fixture itself: if the case stops pinning anything, this
     // test would pass vacuously and the mutation would go green again.
     expect(pinned.length).toBeGreaterThan(0)
+    const sourceTagged = world.events.flatMap((event) =>
+      event.op === 'create' && event.sourceLocator
+        ? [{ space: event.space, path: event.path, locator: event.sourceLocator }]
+        : [],
+    )
+    expect(sourceTagged.length).toBeGreaterThan(0)
 
     const dataDir = await mkdtemp(join(tmpdir(), 'notarium-seed-real-'))
 
@@ -50,7 +56,7 @@ describe('the real seed applier', () => {
         [join(repoRoot, 'scripts/seed.ts')],
         {
           cwd: repoRoot,
-          env: { ...process.env, CASE, DATA_DIR: dataDir },
+          env: { ...process.env, CASE, DATA_DIR: dataDir, NOW: world.now },
         },
       )
 
@@ -71,6 +77,15 @@ describe('the real seed applier', () => {
           }
         }
       }
+      for (const note of sourceTagged) {
+        const file = await readFile(join(dataDir, 'spaces', note.space, note.path), 'utf8')
+        expect(`${note.path}: ${file}`).toContain(`notarium-source: ${note.locator}`)
+      }
+      const legacy = await readFile(
+        join(dataDir, 'spaces/main/conversations/claude/20240101-collision-00fax1ug.md'),
+        'utf8',
+      )
+      expect(legacy).not.toContain('notarium-source:')
     } finally {
       await rm(dataDir, { recursive: true, force: true })
     }

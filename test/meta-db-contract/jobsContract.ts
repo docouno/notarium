@@ -103,6 +103,41 @@ export const describeJobsContract = (name: string, factory: JobsContractFactory)
       }
     })
 
+    it('preserves omitted progress fields and clears explicit nulls', async () => {
+      const { jobs, teardown } = await factory()
+
+      try {
+        await enqueue(jobs, 'job-1')
+        await jobs.claimNext('lease-1', ['export'], T(1))
+        await jobs.heartbeat('job-1', 'lease-1', {
+          done: 7,
+          total: 10,
+          phase: 'writing',
+          now: T(2),
+        })
+        await jobs.heartbeat('job-1', 'lease-1', { done: 8, now: T(3) })
+        expect(await jobs.get('job-1')).toMatchObject({
+          progressDone: 8,
+          progressTotal: 10,
+          phase: 'writing',
+        })
+
+        await jobs.heartbeat('job-1', 'lease-1', {
+          done: 9,
+          total: null,
+          phase: null,
+          now: T(4),
+        })
+        expect(await jobs.get('job-1')).toMatchObject({
+          progressDone: 9,
+          progressTotal: null,
+          phase: null,
+        })
+      } finally {
+        await teardown?.()
+      }
+    })
+
     it('reaps a stalled worker: retries left reopen it, an exhausted budget fails it', async () => {
       const { jobs, teardown } = await factory()
 

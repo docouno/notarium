@@ -3,7 +3,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 
-import { FRONTMATTER_BYTE_CAP, FrontmatterLimitError, parseFrontmatterBlock } from '@notarium/core'
+import {
+  claudeConversationSourceLocator,
+  FRONTMATTER_BYTE_CAP,
+  FrontmatterLimitError,
+  IMPORT_SOURCE_FRONTMATTER_KEY,
+  parseFrontmatterBlock,
+} from '@notarium/core'
 
 import { createNotariumStore } from './createNotariumStore'
 
@@ -308,6 +314,77 @@ describe('NotariumStore read/reconcile projection (#222)', () => {
       expect(detail.frontmatter).not.toHaveProperty('notarium-created')
       expect(keys).not.toContain('created')
       expect(keys).not.toContain('notarium-created')
+    } finally {
+      await store.stop()
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('persists source provenance in file/index across restart without exposing raw frontmatter', async () => {
+    const root = await fs.mkdtemp(join(tmpdir(), 'nstore-source-'))
+    const dbRoot = await fs.mkdtemp(join(tmpdir(), 'nstore-source-db-'))
+    const indexDb = join(dbRoot, 'index.db')
+    const locator = claudeConversationSourceLocator('real-restart-source')!
+    let store = createNotariumStore({ notesDir: root, indexDb })
+
+    try {
+      const result = await store.write({
+        id: 'source-note-id',
+        title: 'Imported',
+        content: 'v1',
+        sourceLocator: locator,
+      })
+      const raw = await fs.readFile(join(root, result.filePath!), 'utf8')
+      expect(raw).toContain(`${IMPORT_SOURCE_FRONTMATTER_KEY}: ${locator}`)
+      expect((await store.list())[0].sourceLocator).toBe(locator)
+      expect((await store.read('source-note-id')).frontmatter).not.toHaveProperty(
+        IMPORT_SOURCE_FRONTMATTER_KEY,
+      )
+      await store.stop()
+
+      store = createNotariumStore({ notesDir: root, indexDb })
+      expect((await store.list())[0].sourceLocator).toBe(locator)
+      const restarted = await store.read('source-note-id')
+      expect(restarted.sourceLocator).toBe(locator)
+      await store.write({
+        originalId: 'source-note-id',
+        title: 'Imported',
+        content: 'v2',
+        preservePath: true,
+      })
+      expect(await fs.readFile(join(root, result.filePath!), 'utf8')).toContain(
+        `${IMPORT_SOURCE_FRONTMATTER_KEY}: ${locator}`,
+      )
+    } finally {
+      await store.stop()
+      await fs.rm(root, { recursive: true, force: true })
+      await fs.rm(dbRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('indexes only canonical direct-files as source claims', async () => {
+    const root = await fs.mkdtemp(join(tmpdir(), 'nstore-source-direct-'))
+    const locator = claudeConversationSourceLocator('direct-source')!
+    const store = createNotariumStore({ notesDir: root })
+
+    try {
+      await write(
+        root,
+        'canonical.md',
+        `---\n${IMPORT_SOURCE_FRONTMATTER_KEY}: ${locator}\n---\n\n# Canonical\n\nbody`,
+      )
+      await write(
+        root,
+        'authored.md',
+        `---\n${IMPORT_SOURCE_FRONTMATTER_KEY}: authored\n---\n\n# Authored\n\nbody`,
+      )
+      const listed = await store.list()
+
+      expect(listed.find((note) => note.filePath === 'canonical.md')?.sourceLocator).toBe(locator)
+      expect(listed.find((note) => note.filePath === 'authored.md')?.sourceLocator).toBeUndefined()
+      const canonical = await store.read('canonical.md')
+      expect(canonical.sourceLocator).toBe(locator)
+      expect(canonical.frontmatter).not.toHaveProperty(IMPORT_SOURCE_FRONTMATTER_KEY)
     } finally {
       await store.stop()
       await fs.rm(root, { recursive: true, force: true })

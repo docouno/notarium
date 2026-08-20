@@ -19,6 +19,8 @@ import {
   FrontmatterLimitError,
   frontmatterListEntry,
   frontmatterScalarEntry,
+  IMPORT_SOURCE_FRONTMATTER_KEY,
+  isImportNoteSourceLocator,
   isValidNoteId,
   isWithinFrontmatterByteCap,
   nextPhysicalLineSpan,
@@ -60,6 +62,8 @@ export type ParsedNote = {
   slug: string | null
   /** The file's notarium-id claim (P7), when present. */
   idClaim: string | null
+  /** Canonical reserved import provenance, kept out of `frontmatter`. */
+  sourceLocator: string | null
   /** Frontmatter `created:` as ISO-8601 UTC (#11), null when the file makes no
    *  claim — the index then falls back to the filesystem birthtime. */
   createdAt: string | null
@@ -170,6 +174,8 @@ export const parseNoteFile = (raw: string, path: string): ParsedNote => {
   const fileName = path.split('/').pop()?.replace(/\.md$/, '') || path
   const title = fmTitle || h1Title || fileName
   const claim = frontmatter[NOTE_ID_FRONTMATTER_KEY]
+  const sourceLocator = frontmatter[IMPORT_SOURCE_FRONTMATTER_KEY]
+  delete frontmatter[IMPORT_SOURCE_FRONTMATTER_KEY]
   // Canonicalise the frontmatter slug to URL form (#100 phase 1): our writes already
   // slugify it, but an externally-authored `slug: My Custom Slug` is normalised
   // here so the resolve key and the URL tail stay the same clean slug.
@@ -184,6 +190,7 @@ export const parseNoteFile = (raw: string, path: string): ParsedNote => {
     aliases: normAliases(frontmatter.aliases) ?? [],
     slug: fmSlug || null,
     idClaim: typeof claim === 'string' && isValidNoteId(claim) ? claim : null,
+    sourceLocator: isImportNoteSourceLocator(sourceLocator) ? sourceLocator : null,
     createdAt: fmDate(frontmatter.created) ?? fmDate(frontmatter[CREATED_FALLBACK_FRONTMATTER_KEY]),
     frontmatter,
     frontmatterEntries: fm?.entries ?? [],
@@ -216,6 +223,8 @@ export type SerializeInput = {
   muted?: boolean
   /** The identity materialization channel (P7/#51). */
   id?: string
+  /** Trusted typed provenance. Undefined preserves the existing file field. */
+  sourceLocator?: string
   /** Authored creation instant (ISO-8601 UTC) → `created:` frontmatter. undefined =
    *  leave any existing date alone (a normal body save); a value SETS/overwrites it.
    *  Import (#11) and the agent `create_note` (#21) SET it on create; the UI EDITs it
@@ -250,6 +259,7 @@ export const serializeNoteFile = ({
   summary,
   muted,
   id,
+  sourceLocator,
   createdAt,
   frontmatter,
   frontmatterMode,
@@ -358,6 +368,9 @@ export const serializeNoteFile = ({
 
   if (!replacing) {
     for (const e of frontmatter ?? []) {
+      if (e.key === IMPORT_SOURCE_FRONTMATTER_KEY) {
+        continue
+      }
       if (e.key) {
         put(e)
       } else if (!existingKeyless.has(e.lines[0])) {
@@ -372,6 +385,9 @@ export const serializeNoteFile = ({
   // Inline frontmatter riding the body merges in next (ours below override).
   if (inline) {
     for (const e of inline.entries) {
+      if (e.key === IMPORT_SOURCE_FRONTMATTER_KEY) {
+        continue
+      }
       if (e.key) {
         put(e)
       }
@@ -433,6 +449,9 @@ export const serializeNoteFile = ({
   }
   if (id) {
     put(frontmatterScalarEntry(NOTE_ID_FRONTMATTER_KEY, id))
+  }
+  if (sourceLocator) {
+    put(frontmatterScalarEntry(IMPORT_SOURCE_FRONTMATTER_KEY, sourceLocator))
   }
   // Dates-as-data (#11/#186): write `created:` whenever a value is provided —
   // SET/overwrite, so an authored date edit lands and a re-import re-stamps the

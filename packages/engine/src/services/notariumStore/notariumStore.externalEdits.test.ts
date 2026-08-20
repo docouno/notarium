@@ -679,10 +679,16 @@ describe('NotariumStore external edit convergence', () => {
       mounts: userMount(adapter.files),
       sql: createNodeSqliteDriver(indexDb),
       integritySweepBatchSize: 0,
-      migrations: [INDEX_MIGRATIONS[0]],
+      // Current write SQL needs the newest notes-table shape. Remove that
+      // column after seeding to reproduce the exact pre-step baseline.
+      migrations: [INDEX_MIGRATIONS[0], INDEX_MIGRATIONS.at(-1)!],
     })
     const seed = await store.changes(null)
     await store.stop()
+    const legacy = createNodeSqliteDriver(indexDb)
+    await legacy.run(`ALTER TABLE notes DROP COLUMN source_locator`)
+    await legacy.run(`UPDATE meta SET value = '1' WHERE key = ?`, [INDEX_VERSION_KEY])
+    await legacy.close()
 
     store = new NotariumStore({
       mounts: userMount(adapter.files),

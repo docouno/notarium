@@ -14,7 +14,12 @@ import AdmZip from 'adm-zip'
 import type { FastifyInstance } from 'fastify'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
-import { FRONTMATTER_BYTE_CAP } from '@notarium/core'
+import {
+  claudeConversationSourceLocator,
+  FRONTMATTER_BYTE_CAP,
+  noteFilePath,
+  parseImport,
+} from '@notarium/core'
 
 import { createApp, type Fixture } from './app.js'
 
@@ -360,7 +365,7 @@ describe('durable import (#191): POST /api/s/:space/import → job', () => {
     // when it was imported (the fixture's `now` is 2026).
     expect(trip.createdAt).toBe('2024-03-15T14:30:00.000Z')
     expect(trip.filePath).toMatch(
-      /^conversations\/claude\/20240315-planning-the-trip-[a-z0-9]{8}\.md$/,
+      /^conversations\/claude\/20240315-planning-the-trip-[a-f0-9]{24}\.md$/,
     )
   })
 
@@ -374,6 +379,8 @@ describe('durable import (#191): POST /api/s/:space/import → job', () => {
     expect(detail.content).toContain('### Human')
     expect(detail.content).toContain('How about Lisbon?')
     expect(detail.frontmatter.tags).toContain('claude')
+    expect(detail.frontmatter).not.toHaveProperty('notarium-source')
+    expect(detail).not.toHaveProperty('sourceLocator')
   })
 
   it('re-import is idempotent — same files, no duplicates', async () => {
@@ -479,11 +486,14 @@ describe('durable import (#191): POST /api/s/:space/import → job', () => {
     // 2 conversations + 1 prompt-template + 1 doc.
     expect(done.imported).toBe(4)
     const paths = (await notes()).map((n) => n.filePath).sort()
-    expect(paths).toContain('projects/acme-redesign/prompt-template.md')
-    expect(paths).toContain('projects/acme-redesign/docs/brief.md')
+    const projectRoot = paths
+      .find((path) => /\/prompt-template\.md$/u.test(path))!
+      .replace(/\/prompt-template\.md$/u, '')
+    expect(projectRoot).toMatch(/^projects\/acme-redesign-[a-f0-9]{24}$/u)
+    expect(paths.some((path) => path.startsWith(`${projectRoot}/docs/brief-`))).toBe(true)
   })
 
-  it('fails an in-run destination collision instead of silently overwriting the first note', async () => {
+  it('keeps same-named projects and docs distinct by source identity', async () => {
     const colliding = JSON.stringify([
       {
         uuid: 'first-project',
@@ -500,11 +510,11 @@ describe('durable import (#191): POST /api/s/:space/import → job', () => {
     ])
     const done = (await runImport('projects.json', colliding, 'application/json')).result!
 
-    expect(done.imported).toBe(2)
-    expect(done.failed).toBe(2)
-    expect(done.errors.every((error) => /destination collision/.test(error.error))).toBe(true)
+    expect(done.imported).toBe(4)
+    expect(done.failed).toBe(0)
     const list = await notes()
-    expect(list).toHaveLength(2)
+    expect(list).toHaveLength(4)
+    expect(new Set(list.map((note) => note.filePath)).size).toBe(4)
     const contents = await Promise.all(
       list.map(
         async (note) =>
@@ -515,40 +525,56 @@ describe('durable import (#191): POST /api/s/:space/import → job', () => {
     )
     expect(contents.join('\n')).toContain('FIRST PROMPT')
     expect(contents.join('\n')).toContain('FIRST DOC')
-    expect(contents.join('\n')).not.toContain('SECOND')
+    expect(contents.join('\n')).toContain('SECOND PROMPT')
+    expect(contents.join('\n')).toContain('SECOND DOC')
   })
 
-  it('imports the evolved Claude ZIP — per-file project/memory/design-chat + surfaces a skipped member (#113)', async () => {
-    const zip = new AdmZip()
-    zip.addFile('conversations.json', Buffer.from(CLAUDE_CONVERSATIONS)) // 2 conversations
-    zip.addFile('projects/019ad515.json', Buffer.from(CLAUDE_PROJECT_OBJ)) // prompt-template + 1 doc
-    zip.addFile('memories.json', Buffer.from(CLAUDE_MEMORIES)) // 1 memory note
-    zip.addFile('design_chats/dc-1.json', Buffer.from(CLAUDE_DESIGN_CHAT)) // 1 design chat
-    zip.addFile('users.json', Buffer.from('{"name":"me"}')) // irrelevant — skipped SILENTLY
-    zip.addFile('assets.json', Buffer.from('{"some":"unrelated json"}')) // unrecognised — skipped WITH a warning
-    const done = (await runImport('claude-export.zip', zip.toBuffer(), 'application/zip')).result!
+  it.each([
+    ['folder', 6, 6, 1, true],
+    ['space', 6, 5, 1, false],
+    ['skip', 5, 5, 0, false],
+  ] as const)(
+    'imports the evolved Claude ZIP with memory=%s and keeps every foreign branch honest (#113)',
+    async (memory, expectedImported, expectedVisible, expectedMemoryImported, memoryVisible) => {
+      const zip = new AdmZip()
+      zip.addFile('conversations.json', Buffer.from(CLAUDE_CONVERSATIONS)) // 2 conversations
+      zip.addFile('projects/019ad515.json', Buffer.from(CLAUDE_PROJECT_OBJ)) // prompt-template + 1 doc
+      zip.addFile('memories.json', Buffer.from(CLAUDE_MEMORIES)) // 1 memory note
+      zip.addFile('design_chats/dc-1.json', Buffer.from(CLAUDE_DESIGN_CHAT)) // 1 design chat
+      zip.addFile('users.json', Buffer.from('{"name":"me"}')) // irrelevant — skipped SILENTLY
+      zip.addFile('assets.json', Buffer.from('{"some":"unrelated json"}')) // unrecognised — skipped WITH a warning
+      const job = await runImport('claude-export.zip', zip.toBuffer(), 'application/zip', {
+        memory,
+      })
+      const done = job.result!
 
-    // 2 conversations + (prompt-template + doc) + 1 memory + 1 design-chat.
-    expect(done.imported).toBe(6)
-    expect(done.failed).toBe(0)
-    const byFormat = Object.fromEntries(done.files.map((f) => [f.format, f]))
-    expect(byFormat['claude-conversations'].imported).toBe(2)
-    expect(byFormat['claude-projects'].imported).toBe(2)
-    expect(byFormat['claude-memory'].imported).toBe(1)
-    expect(byFormat['claude-design-chat'].imported).toBe(1)
+      // 2 conversations + (prompt-template + doc) + 1 memory + 1 design-chat.
+      expect(done.imported).toBe(expectedImported)
+      expect(done.failed).toBe(0)
+      expect(job.progress).toMatchObject({ done: 6, total: 6, phase: 'done' })
+      const byFormat = Object.fromEntries(done.files.map((f) => [f.format, f]))
+      expect(byFormat['claude-conversations'].imported).toBe(2)
+      expect(byFormat['claude-projects'].imported).toBe(2)
+      expect(byFormat['claude-memory'].imported).toBe(expectedMemoryImported)
+      expect(byFormat['claude-design-chat'].imported).toBe(1)
 
-    // The unrecognised member is surfaced (no silent data loss); users.json is not.
-    const skipped = byFormat['unsupported']
-    expect(skipped).toBeTruthy()
-    expect(skipped.warnings.join(' ')).toMatch(/assets\.json.*skipped/i)
-    expect(done.files.some((f) => f.file.includes('users.json'))).toBe(false)
+      // The unrecognised member is surfaced (no silent data loss); users.json is not.
+      const skipped = byFormat['unsupported']
+      expect(skipped).toBeTruthy()
+      expect(skipped.warnings.join(' ')).toMatch(/assets\.json.*skipped/i)
+      expect(done.files.some((f) => f.file.includes('users.json'))).toBe(false)
 
-    const paths = (await notes()).map((n) => n.filePath).sort()
-    expect(paths).toContain('projects/how-to-use-claude/prompt-template.md')
-    expect(paths).toContain('projects/how-to-use-claude/docs/guide.md')
-    expect(paths.some((p) => p.startsWith('memory/claude/'))).toBe(true)
-    expect(paths.some((p) => p.startsWith('design-chats/landing-redesign/'))).toBe(true)
-  })
+      const paths = (await notes()).map((n) => n.filePath).sort()
+      expect(paths).toHaveLength(expectedVisible)
+      const projectRoot = paths
+        .find((path) => /\/prompt-template\.md$/u.test(path))!
+        .replace(/\/prompt-template\.md$/u, '')
+      expect(projectRoot).toMatch(/^projects\/how-to-use-claude-[a-f0-9]{24}$/u)
+      expect(paths.some((path) => path.startsWith(`${projectRoot}/docs/guide-`))).toBe(true)
+      expect(paths.some((p) => p.startsWith('memory/claude/'))).toBe(memoryVisible)
+      expect(paths.some((p) => p.startsWith('design-chats/landing-redesign/'))).toBe(true)
+    },
+  )
 
   it('an unrecognised upload fails the job with a clear error', async () => {
     const job = await runImport('random.json', '{"hello":"world"}', 'application/json')
@@ -635,7 +661,7 @@ describe('durable import (#191): POST /api/s/:space/import → job', () => {
     expect(await notes()).toHaveLength(0)
   })
 
-  it('re-imports frozen Windows-device paths byte-for-byte without exposing them to public writes', async () => {
+  it('uses portable source-tagged CON/NUL paths and re-imports the same note', async () => {
     const project = JSON.stringify([
       {
         uuid: 'legacy-device-project',
@@ -648,7 +674,12 @@ describe('durable import (#191): POST /api/s/:space/import → job', () => {
     })
 
     expect(first.result).toMatchObject({ imported: 1, failed: 0 })
-    expect((await notes()).map((note) => note.filePath)).toEqual(['projects/con/docs/nul.md'])
+    const firstNotes = await notes()
+    expect(firstNotes).toHaveLength(1)
+    expect(firstNotes[0].filePath).toMatch(
+      /^projects\/con-[a-f0-9]{24}\/docs\/nul-[a-f0-9]{24}\.md$/u,
+    )
+    const id = firstNotes[0].id
 
     const second = await runImport(
       'projects.json',
@@ -658,7 +689,83 @@ describe('durable import (#191): POST /api/s/:space/import → job', () => {
     )
 
     expect(second.result).toMatchObject({ imported: 1, failed: 0 })
-    expect((await notes()).map((note) => note.filePath)).toEqual(['projects/con/docs/nul.md'])
+    expect(await notes()).toEqual([
+      expect.objectContaining({ id, filePath: firstNotes[0].filePath }),
+    ])
+  })
+
+  it('refuses a source-less legacy predecessor without mutating it or creating a sibling', async () => {
+    const raw = JSON.stringify([
+      {
+        uuid: 'legacy-source',
+        name: 'Legacy chat',
+        created_at: '2024-01-01T00:00:00Z',
+        chat_messages: [{ sender: 'human', text: 'new body' }],
+      },
+    ])
+    const parsed = parseImport(raw, 'claude-conversations').notes[0]
+    const legacyPath = noteFilePath(
+      parsed.title,
+      parsed.legacyDirectory,
+      parsed.legacyFileName,
+      undefined,
+      true,
+    )
+
+    await app.close()
+    app = await createApp({
+      ...fixture(),
+      spaces: [
+        {
+          slug: 'main',
+          displayName: 'Main',
+          notes: [
+            { id: 'legacy-id', title: 'Legacy chat', filePath: legacyPath, content: 'old body' },
+          ],
+        },
+      ],
+    })
+    const result = await runImport('conversations.json', raw, 'application/json')
+
+    expect(result.result).toMatchObject({ imported: 0, failed: 1 })
+    expect(result.result!.errors[0].error).toMatch(/source-less legacy predecessor/)
+    const list = await notes()
+    expect(list).toEqual([expect.objectContaining({ id: 'legacy-id', filePath: legacyPath })])
+    const detail = JSON.parse(
+      (await app.inject({ method: 'GET', url: '/api/s/main/note?ref=legacy-id' })).payload,
+    )
+    expect(detail.content).toBe('old body')
+  })
+
+  it('does not let fresh Markdown mint a foreign source claim', async () => {
+    const locator = claudeConversationSourceLocator('spoof-source')!
+    const markdown = `---\nnotarium-source: ${locator}\n---\n\n# Spoof\n\nmarkdown body`
+    const importedMarkdown = await runImport('spoof.md', markdown, 'text/markdown', {
+      format: 'markdown',
+    })
+    expect(importedMarkdown.result).toMatchObject({ imported: 1, failed: 0 })
+    const spoof = (await notes()).find((note) => note.title === 'Spoof')!
+    const spoofDetail = JSON.parse(
+      (await app.inject({ method: 'GET', url: `/api/s/main/note?ref=${spoof.id}` })).payload,
+    )
+    expect(spoofDetail.frontmatter).not.toHaveProperty('notarium-source')
+
+    const foreign = JSON.stringify([
+      {
+        uuid: 'spoof-source',
+        name: 'Real source',
+        chat_messages: [{ sender: 'human', text: 'foreign body' }],
+      },
+    ])
+    expect(
+      (await runImport('conversations.json', foreign, 'application/json')).result,
+    ).toMatchObject({ imported: 1, failed: 0 })
+    expect(await notes()).toHaveLength(2)
+    expect(
+      JSON.parse(
+        (await app.inject({ method: 'GET', url: `/api/s/main/note?ref=${spoof.id}` })).payload,
+      ).content,
+    ).toBe('markdown body')
   })
 
   it('skipExisting skips notes that already exist instead of overwriting', async () => {

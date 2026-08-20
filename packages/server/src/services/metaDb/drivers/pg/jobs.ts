@@ -61,11 +61,20 @@ export const createJobsFacet = (ctx: PgDriverCtx): JobsPersistence => ({
       `UPDATE jobs SET
            locked_at = $3,
            progress_done = $4,
-           progress_total = COALESCE($5, progress_total),
-           phase = COALESCE($6, phase),
+           progress_total = CASE WHEN $5 THEN $6 ELSE progress_total END,
+           phase = CASE WHEN $7 THEN $8 ELSE phase END,
            updated_at = $3
          WHERE id = $1 AND locked_by = $2 AND status = 'running'`,
-      [id, workerId, p.now, p.done, p.total ?? null, p.phase ?? null],
+      [
+        id,
+        workerId,
+        p.now,
+        p.done,
+        p.total !== undefined,
+        p.total ?? null,
+        p.phase !== undefined,
+        p.phase ?? null,
+      ],
     )
     return (res.rowCount ?? 0) > 0
   },

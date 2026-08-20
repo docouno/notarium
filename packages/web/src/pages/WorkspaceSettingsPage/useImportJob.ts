@@ -170,6 +170,7 @@ export const useImportJob = (space: string, targetJobId?: string | null) => {
     async (source: ImportUploadSource, opts: ImportOptions) => {
       const gen = ++genRef.current
       const live = () => gen === genRef.current // false once torn down / superseded
+      let processedDone = 0
       setState({ job: null, error: null, busy: true })
       const ac = new AbortController()
       syncAbort.current = ac
@@ -190,10 +191,11 @@ export const useImportJob = (space: string, targetJobId?: string | null) => {
         // Synchronous fallback (none-mode): drive the NDJSON stream into a synthetic job.
         setState({ job: syncJob('running', { done: 0 }), busy: true, error: null })
         const summary = await started.run((p: ImportProgressLine) => {
+          processedDone = Math.max(processedDone, p.done ?? p.imported)
           if (live()) {
             setState({
               job: syncJob('running', {
-                done: p.done ?? p.imported,
+                done: processedDone,
                 total: p.total,
                 phase: p.phase,
               }),
@@ -204,8 +206,10 @@ export const useImportJob = (space: string, targetJobId?: string | null) => {
         })
 
         if (live()) {
+          const done = Math.max(processedDone, summary.imported + summary.skipped + summary.failed)
+
           setState({
-            job: syncJob('succeeded', { done: summary.imported }, { result: summary }),
+            job: syncJob('succeeded', { done }, { result: summary }),
             busy: false,
             error: null,
           })
@@ -215,7 +219,11 @@ export const useImportJob = (space: string, targetJobId?: string | null) => {
           return
         } // torn down — don't paint stale state (e.g. on a new space)
         if (ac.signal.aborted) {
-          setState({ job: syncJob('canceled', { done: 0 }), busy: false, error: 'import canceled' })
+          setState({
+            job: syncJob('canceled', { done: processedDone }),
+            busy: false,
+            error: 'import canceled',
+          })
           return
         }
         const message = err instanceof Error ? err.message : 'import failed'
@@ -223,11 +231,12 @@ export const useImportJob = (space: string, targetJobId?: string | null) => {
         // FAILED job holding it: the notes it did write are real, and dropping the
         // result here would tell the user nothing happened.
         const partial = err instanceof ApiError ? err.partial : undefined
+        const done = partial
+          ? Math.max(processedDone, partial.imported + partial.skipped + partial.failed)
+          : processedDone
 
         setState({
-          job: partial
-            ? syncJob('failed', { done: partial.imported }, { result: partial, error: message })
-            : null,
+          job: partial ? syncJob('failed', { done }, { result: partial, error: message }) : null,
           busy: false,
           error: message,
         })

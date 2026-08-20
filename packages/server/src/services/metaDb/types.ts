@@ -1048,6 +1048,8 @@ export type JobsPersistence = {
    *  lease on its next heartbeat and self-aborts (no same-id double-run). */
   claimNext(workerId: string, kinds: readonly string[], now: string): Promise<JobRecord | null>
   /** Heartbeat + progress, ONLY while still `running` and held by this worker.
+   *  Optional total/phase are tri-state: omission preserves the current field,
+   *  explicit null clears it, and a value replaces it.
    *  Returns false when the row is no longer ours (canceled / reaped / stolen) —
    *  the runner aborts the in-flight handler on false (cooperative cancel). */
   heartbeat(

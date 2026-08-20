@@ -164,6 +164,8 @@ export type NoteDecl = {
    *  not a replayed write). Both must land the SAME note, so a typed field derived
    *  from these keys has to be derived on both sides. canon: docs/seeds.md */
   frontmatter?: string
+  /** Canonical source-addressable import provenance. */
+  sourceLocator?: string
   /** A fixture-pinned PHYSICAL note id. Normally both appliers derive one (the
    *  fake deterministically from the path, the real one from the store), and the
    *  logical `n-*` handle above addresses lifecycle only. A case pins it when the
@@ -288,6 +290,7 @@ export class WorldBuilder {
       projectMemory: decl.projectMemory,
       pin: decl.pin,
       frontmatter: decl.frontmatter,
+      sourceLocator: decl.sourceLocator,
       principal: decl.principal,
       agentAudit: decl.agentAudit,
     })

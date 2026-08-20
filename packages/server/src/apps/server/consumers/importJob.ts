@@ -63,6 +63,7 @@ export const createImportHandler =
     const claimKey = { space: job.space, jobId: job.id, workerLease: lease, uploadRef }
     // Every planned write of this run goes through the fence this claim installs.
     let claimed: { reservationId: string; fence: string } | null = null
+    let processedDone = job.progressDone
 
     try {
       const summary = await runImport({
@@ -106,7 +107,10 @@ export const createImportHandler =
         // throws JobAbortedError on cancel/reap, so a cancel lands within one
         // progress batch.
         // canon: docs/import.md#cooperative-responsiveness-on-large-imports-192
-        onProgress: (p) => report({ done: p.done, total: p.total, phase: p.phase }),
+        onProgress: (p) => {
+          processedDone = Math.max(processedDone, p.done)
+          return report({ done: processedDone, total: p.total, phase: p.phase })
+        },
         settle: () => store.settle?.(),
         reservation: reservations && {
           claim: async (entries) => {
@@ -145,7 +149,7 @@ export const createImportHandler =
       })
       // Notes are durable-complete here; embedding/graph enrich runs in the
       // background off the job.
-      const done = summary.imported + summary.skipped + summary.failed
+      const done = Math.max(processedDone, summary.imported + summary.skipped + summary.failed)
       await report({ done, total: done, phase: IMPORT_PHASE.done })
       return { result: summary }
     } catch (err) {

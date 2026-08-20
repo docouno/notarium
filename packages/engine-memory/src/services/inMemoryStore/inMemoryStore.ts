@@ -62,12 +62,14 @@ import {
   frontmatterHasYamlNodeReferences,
   frontmatterScalar,
   IF_EXISTS,
+  IMPORT_SOURCE_FRONTMATTER_KEY,
   isCanonicalInternalRelativeAddress,
   isCanonicalSafeRelativeAddress,
   isDurableFrontmatter,
   isDurableScalar,
   isDurableText,
   isFolderPageNote,
+  isImportNoteSourceLocator,
   isLegacyImportDestination,
   isPortableMoveDestination,
   isPortableRelativeDestination,
@@ -152,6 +154,8 @@ type StoredNote = {
    *  carries them here and serves them back through read().frontmatter and the
    *  export reconstruction — the same keys, the same place. */
   carried?: FrontmatterEntry[]
+  /** Typed projection of the reserved file-truth provenance. */
+  sourceLocator?: string
   modifiedAt: string | null
   createdAt: string | null
   /** Whether the resolved creation date owns a typed YAML projection. Raw
@@ -392,6 +396,9 @@ const carriedTyped = (carried: readonly FrontmatterEntry[] | undefined) => {
       value === true || value === 'true' ? true : undefined,
     ),
     createdAt,
+    sourceLocator: carriedField(carried, IMPORT_SOURCE_FRONTMATTER_KEY, (value) =>
+      isImportNoteSourceLocator(value) ? value : undefined,
+    ),
   }
 }
 
@@ -505,6 +512,7 @@ export class InMemoryStore implements KnowledgeStore {
           ['slug', n.slug],
           ['summary', n.summary],
           ['muted', n.muted],
+          [IMPORT_SOURCE_FRONTMATTER_KEY, n.sourceLocator],
         ]
           .filter(([, value]) => value !== undefined)
           .map(([key]) => key as string),
@@ -524,6 +532,10 @@ export class InMemoryStore implements KnowledgeStore {
         carried = withoutCarriedKey(carried, CREATED_FALLBACK_FRONTMATTER_KEY)
       }
       const fromCarry = carriedTyped(carried)
+
+      if (n.sourceLocator != null && !isImportNoteSourceLocator(n.sourceLocator)) {
+        throw writeFailed('snapshot source locator is invalid')
+      }
       const candidate: StoredNote = {
         id: n.id || this.deriveId(n.filePath, (id) => next.some((m) => m.id === id)),
         title: n.title,
@@ -562,6 +574,12 @@ export class InMemoryStore implements KnowledgeStore {
             : fromCarry.muted.present
               ? fromCarry.muted.value
               : undefined, // #165: only the truthy flag rides
+        sourceLocator:
+          n.sourceLocator !== undefined
+            ? n.sourceLocator
+            : fromCarry.sourceLocator.present
+              ? fromCarry.sourceLocator.value
+              : undefined,
         carried,
       }
       this.assertExportable(candidate)
@@ -720,6 +738,7 @@ export class InMemoryStore implements KnowledgeStore {
       ...(n.aliases.length ? { aliases: n.aliases } : {}),
       ...(legacyNameAliases.length ? { legacyNameAliases } : {}),
       ...(n.tags.length ? { tags: n.tags } : {}),
+      ...(n.sourceLocator ? { sourceLocator: n.sourceLocator } : {}),
       modifiedAt: n.modifiedAt,
       createdAt: n.createdAt,
     }
@@ -756,6 +775,7 @@ export class InMemoryStore implements KnowledgeStore {
         !e.key ||
         e.key === 'title' ||
         e.key === NOTE_ID_FRONTMATTER_KEY ||
+        e.key === IMPORT_SOURCE_FRONTMATTER_KEY ||
         e.key === CREATED_FALLBACK_FRONTMATTER_KEY
       ) {
         continue
@@ -814,6 +834,7 @@ export class InMemoryStore implements KnowledgeStore {
       // an anchored raw carry cannot be rewritten to match them. The exact
       // byte/source projection remains available on documentState.
       frontmatter,
+      ...(n.sourceLocator ? { sourceLocator: n.sourceLocator } : {}),
       logicalState,
       documentState,
       physicalIncarnation: {
@@ -1089,6 +1110,12 @@ export class InMemoryStore implements KnowledgeStore {
         system.push(entry)
       }
     }
+    if (n.sourceLocator && !isCarried(IMPORT_SOURCE_FRONTMATTER_KEY)) {
+      system.push({
+        key: IMPORT_SOURCE_FRONTMATTER_KEY,
+        lines: [`${IMPORT_SOURCE_FRONTMATTER_KEY}: ${n.sourceLocator}`],
+      })
+    }
     if (!preservesReferencedKey('title')) {
       const entry = { key: 'title', lines: [`title: ${fmScalar(n.title)}`] }
 
@@ -1240,9 +1267,19 @@ export class InMemoryStore implements KnowledgeStore {
     restorePath,
     expectedSource,
     expectedDestinationId,
+    sourceLocator,
   }: WriteInput): Promise<WriteResult> {
     const replacing = frontmatterMode === 'replace'
-    const scalarInputs = [title, directory, noteType, rawSlug, summary, fileName, createdAt]
+    const scalarInputs = [
+      title,
+      directory,
+      noteType,
+      rawSlug,
+      summary,
+      fileName,
+      createdAt,
+      sourceLocator,
+    ]
     const tagInputs = Array.isArray(tags) ? tags : tags != null ? [tags] : []
 
     if (
@@ -1257,7 +1294,8 @@ export class InMemoryStore implements KnowledgeStore {
       (id != null && !isValidNoteId(id)) ||
       (originalId != null &&
         !isValidNoteId(originalId) &&
-        decodeWikilinkIdentity(originalId) == null)
+        decodeWikilinkIdentity(originalId) == null) ||
+      (sourceLocator != null && !isImportNoteSourceLocator(sourceLocator))
     ) {
       throw writeFailed('input contains an invalid durable string')
     }
@@ -1317,10 +1355,27 @@ export class InMemoryStore implements KnowledgeStore {
           ? (carried.createdAt.value ?? prev)
           : prev
 
+    const incomingFrontmatter = replacing
+      ? frontmatter
+      : withoutCarriedKey(frontmatter?.map(cloneEntry), IMPORT_SOURCE_FRONTMATTER_KEY)
+
     const carriedStateFor = (prev: FrontmatterEntry[] | undefined) => {
-      const merged = replacing ? frontmatter?.map(cloneEntry) : mergeCarried(prev, frontmatter)
+      const merged = replacing
+        ? incomingFrontmatter?.map(cloneEntry)
+        : mergeCarried(prev, incomingFrontmatter)
       return { merged, typed: carriedTyped(merged) }
     }
+    const sourceLocatorFor = (
+      prev: string | undefined,
+      carried: ReturnType<typeof carriedTyped>,
+    ): string | undefined =>
+      sourceLocator !== undefined
+        ? sourceLocator
+        : replacing
+          ? carried.sourceLocator.present
+            ? carried.sourceLocator.value
+            : undefined
+          : prev
     const preserveIncomingUnreadableCreated =
       createdAt !== undefined && carriedCreated(frontmatter).conflict
 
@@ -1374,6 +1429,9 @@ export class InMemoryStore implements KnowledgeStore {
           carried = withoutCarriedKey(carried, 'created')
         }
         carried = withoutCarriedKey(carried, CREATED_FALLBACK_FRONTMATTER_KEY)
+      }
+      if (sourceLocator !== undefined) {
+        carried = withoutCarriedKey(carried, IMPORT_SOURCE_FRONTMATTER_KEY)
       }
 
       return carried
@@ -1495,6 +1553,10 @@ export class InMemoryStore implements KnowledgeStore {
         slug: newSlug,
         summary: summaryFor(replacing ? undefined : prev.summary, carriedState.typed),
         muted: mutedFor(replacing ? undefined : prev.muted, carriedState.typed),
+        sourceLocator: sourceLocatorFor(
+          replacing ? undefined : prev.sourceLocator,
+          carriedState.typed,
+        ),
         carried: carriedAfterTypedChannels(carriedState.merged, !replacing && renamed),
         filePath,
         modifiedAt: this.nowIso,
@@ -1588,6 +1650,10 @@ export class InMemoryStore implements KnowledgeStore {
         slug: slugFor(replacing ? undefined : prev.slug, carriedState.typed),
         summary: summaryFor(replacing ? undefined : prev.summary, carriedState.typed),
         muted: mutedFor(replacing ? undefined : prev.muted, carriedState.typed),
+        sourceLocator: sourceLocatorFor(
+          replacing ? undefined : prev.sourceLocator,
+          carriedState.typed,
+        ),
         carried: carriedAfterTypedChannels(carriedState.merged, false),
         createdAt: createdAtFor(prev.createdAt, carriedState.typed),
         createdProjected: createdProjectionFor(prev.createdProjected),
@@ -1622,6 +1688,7 @@ export class InMemoryStore implements KnowledgeStore {
       slug: slugFor(undefined, carriedState.typed),
       summary: summaryFor(undefined, carriedState.typed),
       muted: mutedFor(undefined, carriedState.typed),
+      sourceLocator: sourceLocatorFor(undefined, carriedState.typed),
       carried: carriedAfterTypedChannels(carriedState.merged, false),
       // Dates-as-data (#11): an import threads the original `createdAt` (the real
       // engine's `created:`-over-birthtime rule); `modified` always stamps now.

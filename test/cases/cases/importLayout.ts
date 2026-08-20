@@ -1,9 +1,18 @@
+import {
+  chatGptConversationSourceLocator,
+  claudeConversationSourceLocator,
+  claudeProjectDocSourceLocator,
+  claudeProjectPlacementLocator,
+  claudeProjectPromptSourceLocator,
+  sourceNoteFileName,
+  sourceProjectDirectoryName,
+} from '@notarium/core'
 import { fragmentById } from '../corpus'
 import { daysBefore, WorldBuilder } from '../generators'
 import type { CaseSpec } from '../types'
 
-// The import LAYOUT (#11/#113/#223/#280): converted AI exports laid out in the canonical
-// folders (conversations/claude, conversations/chatgpt, memory/<type>, projects/<slug>)
+// The import LAYOUT (#11/#113/#223/#280): converted AI exports laid out in source-tagged
+// canonical folders (plus path-keyed memory and one source-less legacy predecessor)
 // with provenance tags and BACKDATED dates-as-data — so the Feed spreads the history
 // across real YEARS (2021–2025), the "backdated import looks real" proof (#11). Bodies
 // come from the imports corpus. Distinct from import-thread (one rich thread) — this is
@@ -23,27 +32,34 @@ export const importLayout: CaseSpec = {
 
     // Claude conversations across ~three years (dates-as-data → Feed year-spread).
     ;[1400, 980, 620, 300, 90].forEach((days, i) => {
+      const title = `Planning session ${i + 1}`
+      const created = daysBefore(now, days, 14)
+      const sourceLocator = claudeConversationSourceLocator(`seed-claude-planning-${i + 1}`)!
       b.note({
         space: 'main',
-        path: `conversations/claude/planning-session-${i + 1}.md`,
-        title: `Planning session ${i + 1}`,
-        content: `# Planning session ${i + 1}\n\n${claude}`,
+        path: `conversations/claude/${sourceNoteFileName(title, sourceLocator, created)}.md`,
+        title,
+        content: `# ${title}\n\n${claude}`,
         tags: ['import', 'claude'],
         noteType: 'conversation',
-        created: daysBefore(now, days, 14),
+        sourceLocator,
+        created,
         principal: 'user:sergey',
       })
     })
 
     // A ChatGPT thread (modern export shape).
+    const chatGptCreated = daysBefore(now, 500, 11)
+    const chatGptLocator = chatGptConversationSourceLocator('seed-chatgpt-heatmap')!
     b.note({
       space: 'main',
-      path: 'conversations/chatgpt/heatmap-formula.md',
+      path: `conversations/chatgpt/${sourceNoteFileName('Heatmap formula', chatGptLocator, chatGptCreated)}.md`,
       title: 'Heatmap formula',
       content: `# Heatmap formula\n\n${fragmentById('imports-chatgpt-thread').md}`,
       tags: ['import', 'chatgpt'],
       noteType: 'conversation',
-      created: daysBefore(now, 500, 11),
+      sourceLocator: chatGptLocator,
+      created: chatGptCreated,
       principal: 'user:sergey',
     })
 
@@ -178,23 +194,64 @@ export const importLayout: CaseSpec = {
     // counted and reported. Nothing to seed as a note; the state lives in the
     // import job's summary (docs/import.md#what-an-import-reports-302).
 
-    // A Claude project — a prompt-template + a doc under projects/<slug>/.
+    // A source-tagged Claude project — prompt and docs share one placement key.
+    const projectId = 'seed-project-acme'
+    const projectPlacement = claudeProjectPlacementLocator(projectId)!
+    const projectDirectory = `projects/${sourceProjectDirectoryName('Acme Redesign', projectPlacement)}`
+    const projectPromptLocator = claudeProjectPromptSourceLocator(projectId)!
+    const projectDocLocator = claudeProjectDocSourceLocator(projectId, 'seed-doc-brief')!
     b.note({
       space: 'main',
-      path: 'projects/acme-redesign/prompt-template.md',
-      title: 'Acme Redesign',
+      path: `${projectDirectory}/prompt-template.md`,
+      title: 'Prompt Template: Acme Redesign',
       content: '# Acme Redesign\n\nCustom project instructions for the redesign.',
       tags: ['import', 'claude'],
+      sourceLocator: projectPromptLocator,
       created: daysBefore(now, 350, 10),
       principal: 'user:sergey',
     })
     b.note({
       space: 'main',
-      path: 'projects/acme-redesign/docs/brief.md',
+      path: `${projectDirectory}/docs/${sourceNoteFileName('Brief', projectDocLocator)}.md`,
       title: 'Brief',
       content: '# Brief\n\nRedesign the marketing site; keep the mascot.',
       tags: ['import', 'claude'],
+      sourceLocator: projectDocLocator,
       created: daysBefore(now, 349, 10),
+      principal: 'user:sergey',
+    })
+
+    // Collision-prone display names are distinct because source identity, not
+    // pathname lossiness, supplies both placement and basename suffixes.
+    for (const [projectUuid, docUuid] of [
+      ['seed-project-cjk-a', 'seed-doc-cjk-a'],
+      ['seed-project-cjk-b', 'seed-doc-cjk-b'],
+    ] as const) {
+      const placement = claudeProjectPlacementLocator(projectUuid)!
+      const locator = claudeProjectDocSourceLocator(projectUuid, docUuid)!
+      const directory = `projects/${sourceProjectDirectoryName('项目', placement)}/docs`
+
+      b.note({
+        space: 'main',
+        path: `${directory}/${sourceNoteFileName('同名文档', locator)}.md`,
+        title: '同名文档',
+        content: '# 同名文档\n\nFuture source-tagged import state.',
+        tags: ['import', 'claude'],
+        sourceLocator: locator,
+        created: daysBefore(now, 40, 10),
+        principal: 'user:sergey',
+      })
+    }
+
+    // Deliberately source-less predecessor from the legacy layout. A future
+    // re-import must refuse it rather than guessing or creating a sibling.
+    b.note({
+      space: 'main',
+      path: 'conversations/claude/20240101-collision-00fax1ug.md',
+      title: 'Legacy source-less import',
+      content: '# Legacy source-less import\n\nKept in place; no automatic backfill.',
+      tags: ['import', 'claude', 'legacy'],
+      created: daysBefore(now, 800, 10),
       principal: 'user:sergey',
     })
 

@@ -508,6 +508,9 @@ export type NoteMeta = {
   class?: NoteClass
   /** Storage-view location: where the note lives as a file. Never a note reference. */
   filePath: string
+  /** Internal source-addressable import provenance. File truth, omitted by
+   * ordinary transport mappers. */
+  sourceLocator?: string
   /** The editable display slug — decoupled from title and filename. Present ONLY when custom (else
    *  the default stays implicit; consumers fall back via effectiveSlug).
    *  canon: docs/note-model.md#note-ontology */
@@ -536,6 +539,9 @@ export type NoteContent = {
   filePath?: string
   content: string
   frontmatter: Record<string, unknown>
+  /** Typed projection of reserved `notarium-source`; the raw key is excluded
+   * from the public/authored frontmatter projection. */
+  sourceLocator?: string
   /** Exact logical Markdown state used internally by CAS/history. Optional only
    * for compatibility with capability-thin third-party/test stores; repository
    * engines always provide it. Ordinary transport mappers do not expose it. */
@@ -698,6 +704,12 @@ export type WriteInput = {
    *  and keep the engine's existing create/overwrite behaviour.
    *  canon: docs/import.md#importing-a-markdown-tree-302 */
   expectedDestinationId?: string | null
+  /** Trusted import provenance. Undefined carries an existing live locator;
+   * fresh authored/raw frontmatter cannot mint this claim. */
+  sourceLocator?: string
+  /** Exact source-less predecessor path the foreign importer proved absent.
+   * CachedStore alone re-checks it under the same mutation claim as create. */
+  legacyPredecessorPath?: string
   /** Destination-mount selector, host-internal (never on the create/update wire). The gateway sets
    *  it so remember_about_user writes into the agent-memory mount; the note's class is that mount's,
    *  ENFORCED. Ignored on edits. */

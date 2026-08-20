@@ -19,6 +19,8 @@ import {
   type ImportNote,
   type KnowledgeStore,
   noteFilePath,
+  type NoteMeta,
+  READ_SCOPE,
   rewriteWikilinkIdentities,
   STORE_ERROR_REASON,
   WikilinkRewriteError,
@@ -89,7 +91,8 @@ const toWriteInput = (
   // typed fields by the write path. canon: docs/import.md#drag-and-drop-of-text-files-223
   frontmatter: n.frontmatter,
   fileName: n.fileName,
-  legacyImportRoot: root,
+  legacyImportRoot: n.sourceLocator ? undefined : root,
+  sourceLocator: n.sourceLocator,
   // Only `created:` is threaded; `modified` is left to file mtime so it never goes
   // stale or fights the journal.
   // canon: docs/import.md#dates-as-data
@@ -106,6 +109,7 @@ export type RunImportArgs = {
    *  canon: docs/import.md#cooperative-responsiveness-on-large-imports-192 */
   store: Pick<KnowledgeStore, 'write'> &
     Partial<IdentityPlanStore> & {
+      read?: KnowledgeStore['read']
       beginBulk?: () => void
       endBulk?: () => void | Promise<void>
     }
@@ -145,10 +149,55 @@ export type RunImportArgs = {
    *  notes so a bulk import doesn't accumulate un-flushed revisions. */
   settle?: () => void | Promise<void>
   progressEvery?: number
-  /** Cooperative cancel: checked before each note write. A throw unwinds the bulk
-   *  bracket (endBulk still drains the deferred work) and maps to JobAbortedError.
+  /** Cooperative cancel: checked for every parsed record and before each note
+   *  write. A throw unwinds the bulk bracket (endBulk still drains deferred work)
+   *  and maps to JobAbortedError.
    *  canon: docs/import.md#durable-import-via-the-jobs-layer-191 */
   signal?: AbortSignal
+}
+
+type ForeignInventory = {
+  byLocator: Map<string, NoteMeta[]>
+  byPath: Map<string, NoteMeta[]>
+}
+
+const SOURCE_AWARE_FORMATS = new Set<ImportFormat>([
+  IMPORT_FORMAT.claudeConversations,
+  IMPORT_FORMAT.claudeProjects,
+  IMPORT_FORMAT.claudeDesignChat,
+  IMPORT_FORMAT.chatgpt,
+])
+
+const snapshotForeignInventory = async (
+  store: RunImportArgs['store'],
+): Promise<ForeignInventory> => {
+  if (!store.checkpoint || !store.list || !store.read) {
+    throw new Error('foreign import requires checkpoint, list and read store capabilities')
+  }
+  await store.checkpoint()
+  const byLocator = new Map<string, NoteMeta[]>()
+  const byPath = new Map<string, NoteMeta[]>()
+
+  for (const meta of await store.list({ scope: READ_SCOPE.all })) {
+    const atPath = byPath.get(meta.filePath)
+
+    if (atPath) {
+      atPath.push(meta)
+    } else {
+      byPath.set(meta.filePath, [meta])
+    }
+    if (meta.sourceLocator) {
+      const owners = byLocator.get(meta.sourceLocator)
+
+      if (owners) {
+        owners.push(meta)
+      } else {
+        byLocator.set(meta.sourceLocator, [meta])
+      }
+    }
+  }
+
+  return { byLocator, byPath }
 }
 
 /** Run a streaming import. Throws ImportError (from classification or the
@@ -511,8 +560,8 @@ const runMarkdownTreeImport = async (
   }
 }
 
-/** The foreign (Claude/ChatGPT/MCP-memory) path, unchanged in behaviour: parse
- *  and write in one streaming pass, tolerating one bad member. */
+/** The foreign path streams after one frozen source/path inventory. Source-aware
+ * records converge by locator; memory formats retain their path-based branch. */
 const runForeignImport = async (
   args: RunImportArgs,
   collector: SummaryCollector,
@@ -533,6 +582,22 @@ const runForeignImport = async (
     progressEvery = IMPORT_PROGRESS_EVERY,
     signal,
   } = args
+  // A retry can inherit a determinate terminal total from the attempt that died
+  // after its final report. Foreign work is indeterminate again from this point;
+  // publish that fact before the checkpoint/inventory scan so SSE and polling
+  // cannot keep showing a stale 100% bar while the new attempt is already working.
+  await onProgress?.({
+    phase: IMPORT_PHASE.writing,
+    done: 0,
+    total: null,
+    imported: collector.importedCount,
+  })
+  // Must happen before beginBulk: checkpoint refuses inside an active batch, and
+  // this frozen view is the classification baseline for every streamed record.
+  const inventory =
+    format == null || SOURCE_AWARE_FORMATS.has(format)
+      ? await snapshotForeignInventory(store)
+      : { byLocator: new Map<string, NoteMeta[]>(), byPath: new Map<string, NoteMeta[]>() }
 
   return await inBulk(store, async () => {
     // Re-import may intentionally overwrite a path from an EARLIER run, but two
@@ -540,6 +605,22 @@ const runForeignImport = async (
     // the set across every streamed ZIP member; format-local checks cannot see a
     // collision produced by two separate files.
     const writtenDestinations = new Set<string>()
+    // Separate from paths: a moved source owns its locator at a non-canonical
+    // destination. Sticky across uncertain failures, reserved before any await.
+    const seenLocators = new Set<string>()
+    let processed = 0
+
+    const registerConfirmedOwner = (locator: string, owner: NoteMeta & { id: string }): void => {
+      inventory.byLocator.set(locator, [owner])
+      const atPath = inventory.byPath.get(owner.filePath)
+
+      if (atPath) {
+        const withoutSameId = atPath.filter((candidate) => candidate.id !== owner.id)
+        inventory.byPath.set(owner.filePath, [...withoutSameId, owner])
+      } else {
+        inventory.byPath.set(owner.filePath, [owner])
+      }
+    }
 
     await streamImportFile({
       uploadPath,
@@ -552,6 +633,30 @@ const runForeignImport = async (
       // Doing it after the stream put every member that produced no note behind
       // every member that did — a reordering of the wire result nobody asked for.
       onFile: (meta) => collector.file(meta.file, meta.format, meta.warnings),
+      onRecordFailure: async (failure) => {
+        collector.failed(failure.title, failure.error)
+      },
+      onRecordHeartbeat: async () => {
+        if (signal?.aborted) {
+          throw new Error('import canceled')
+        }
+        await new Promise((resolve) => setImmediate(resolve))
+      },
+      onRecordProcessed: async () => {
+        if (signal?.aborted) {
+          throw new Error('import canceled')
+        }
+        if (++processed % progressEvery === 0) {
+          await settle?.()
+          await onProgress?.({
+            phase: IMPORT_PHASE.writing,
+            done: processed,
+            total: null,
+            imported: collector.importedCount,
+          })
+        }
+        await new Promise((resolve) => setImmediate(resolve))
+      },
       onNote: async (note, ctx) => {
         // Cancel check BEFORE the write's try/catch, so an abort propagates (stops the
         // stream) instead of being counted as a per-note failure.
@@ -577,18 +682,112 @@ const runForeignImport = async (
           collector.failed(note.title, `unsafe directory: ${dirRaw}`)
           return
         }
-        // The ONE place a create is allowed to clobber, and it is stated out loud:
-        // idempotency rests on the deterministic fileName, so a re-import must land on
-        // the SAME file. `skipExisting` is the user's opt-out.
+        // Source-aware records branch by locator below. Only the memory/Markdown
+        // branch retains the explicit path-overwrite policy.
         // canon: docs/import.md#idempotency-dedup-on-re-import
         const importRoot = toSpaceMemory ? '' : (safeRelAddress(root) ?? root)
-        const input = toWriteInput(note, dir, importRoot, principal, {
-          targetClass: toSpaceMemory ? NOTE_CLASS.agentMemory : undefined,
-          ifExists: skipExisting ? IF_EXISTS.fail : IF_EXISTS.overwrite,
-        })
-        const destinationKey = `${toSpaceMemory ? NOTE_CLASS.agentMemory : NOTE_CLASS.userDoc}:${noteFilePath(note.title, dir, note.fileName, undefined, true)}`
+        let input: WriteInput
+        let destinationKey: string | undefined
 
-        if (writtenDestinations.has(destinationKey)) {
+        if (note.sourceLocator) {
+          const locator = note.sourceLocator
+
+          if (seenLocators.has(locator)) {
+            collector.failed(note.title, `duplicate source locator in import stream: ${locator}`)
+            return
+          }
+          seenLocators.add(locator)
+          const owners = inventory.byLocator.get(locator) ?? []
+
+          if (owners.length > 1) {
+            collector.failed(note.title, `source locator has ${owners.length} live owners`)
+            return
+          }
+          const owner = owners[0]
+
+          if (owner) {
+            if (!owner.id) {
+              collector.failed(note.title, 'source locator owner has no durable note id')
+              return
+            }
+            if (skipExisting) {
+              collector.skipped(ctx.file)
+              return
+            }
+            try {
+              const live = await store.read!(owner.id, { identityOnly: true })
+
+              if (live.sourceLocator !== locator || !live.versionToken) {
+                collector.failed(note.title, 'source locator owner changed during import inventory')
+                return
+              }
+              input = {
+                ...toWriteInput(note, dir, importRoot, principal, { ifExists: IF_EXISTS.fail }),
+                originalId: owner.id,
+                identityOnly: true,
+                versionToken: live.versionToken,
+                preservePath: true,
+              }
+            } catch (err) {
+              collector.failed(note.title, (err as Error).message)
+              return
+            }
+          } else {
+            const canonicalPath = noteFilePath(note.title, dir, note.fileName)
+            const canonicalOwners = inventory.byPath.get(canonicalPath) ?? []
+
+            if (canonicalOwners.length > 0) {
+              collector.failed(
+                note.title,
+                `canonical import path is occupied by another source: ${canonicalPath}`,
+              )
+              return
+            }
+            if (!note.legacyDirectory || !note.legacyFileName) {
+              collector.failed(note.title, 'source-aware record has no legacy predecessor address')
+              return
+            }
+            const legacyDirRaw = underRoot(root, note.legacyDirectory)
+            const legacyDir = safeRelAddress(legacyDirRaw)
+
+            if (legacyDir === null) {
+              collector.failed(note.title, `unsafe legacy predecessor directory: ${legacyDirRaw}`)
+              return
+            }
+            const legacyPath = noteFilePath(
+              note.title,
+              legacyDir,
+              note.legacyFileName,
+              undefined,
+              true,
+            )
+            const sourceLessPredecessor = (inventory.byPath.get(legacyPath) ?? []).find(
+              (candidate) => candidate.sourceLocator === undefined,
+            )
+
+            if (sourceLessPredecessor) {
+              collector.failed(
+                note.title,
+                `source-less legacy predecessor occupies ${legacyPath}; refusing to guess ownership`,
+              )
+              return
+            }
+            input = {
+              ...toWriteInput(note, dir, importRoot, principal, { ifExists: IF_EXISTS.fail }),
+              expectedDestinationId: null,
+              legacyPredecessorPath: legacyPath,
+            }
+            destinationKey = `${NOTE_CLASS.userDoc}:${canonicalPath}`
+          }
+        } else {
+          input = toWriteInput(note, dir, importRoot, principal, {
+            targetClass: toSpaceMemory ? NOTE_CLASS.agentMemory : undefined,
+            ifExists: skipExisting ? IF_EXISTS.fail : IF_EXISTS.overwrite,
+          })
+          destinationKey = `${toSpaceMemory ? NOTE_CLASS.agentMemory : NOTE_CLASS.userDoc}:${noteFilePath(note.title, dir, note.fileName, undefined, true)}`
+        }
+
+        if (destinationKey && writtenDestinations.has(destinationKey)) {
           collector.failed(
             note.title,
             `import destination collision: ${destinationKey.slice(destinationKey.indexOf(':') + 1)}`,
@@ -598,23 +797,35 @@ const runForeignImport = async (
         // Reserve before the await. A store failure after physical publication is
         // an uncertain outcome; allowing a later colliding record through would
         // turn that uncertainty into a guaranteed overwrite.
-        writtenDestinations.add(destinationKey)
+        if (destinationKey) {
+          writtenDestinations.add(destinationKey)
+        }
 
         try {
           const w = await store.write(input)
 
-          collector.imported(ctx.file, w.id)
-          if (collector.importedCount % progressEvery === 0) {
-            await settle?.()
-            await onProgress?.({
-              phase: IMPORT_PHASE.writing,
-              done: collector.importedCount,
-              total: null,
-              imported: collector.importedCount,
+          if (note.sourceLocator) {
+            const ownerId = w.id ?? input.originalId
+            const ownerPath =
+              w.filePath ?? inventory.byLocator.get(note.sourceLocator)?.[0]?.filePath
+
+            if (!ownerId || !ownerPath) {
+              throw new Error('source-aware write returned no authoritative id/path')
+            }
+            registerConfirmedOwner(note.sourceLocator, {
+              id: ownerId,
+              title: w.title ?? note.title,
+              class: w.class ?? NOTE_CLASS.userDoc,
+              filePath: ownerPath,
+              sourceLocator: note.sourceLocator,
+              modifiedAt: null,
+              createdAt: note.createdAt ?? null,
             })
           }
+          collector.imported(ctx.file, w.id)
         } catch (err) {
           if (
+            !note.sourceLocator &&
             skipExisting &&
             (err as { reason?: string }).reason === STORE_ERROR_REASON.noteAlreadyExists
           ) {
@@ -624,10 +835,17 @@ const runForeignImport = async (
           // A single note's write failure is recorded, not fatal — the rest import.
           collector.failed(note.title, (err as Error).message)
         }
-        // Cooperative yield after each write so an interactive request that arrived
-        // mid-import is serviced now, not queued behind the stream.
-        await new Promise((resolve) => setImmediate(resolve))
       },
+    })
+
+    if (processed % progressEvery !== 0) {
+      await settle?.()
+    }
+    await onProgress?.({
+      phase: IMPORT_PHASE.writing,
+      done: processed,
+      total: null,
+      imported: collector.importedCount,
     })
 
     return collector.snapshot()

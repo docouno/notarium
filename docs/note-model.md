@@ -179,6 +179,7 @@ instructions still work; only the preset and durable session selection degrade a
 
 ### Note meta-fields
 - `notarium-id` — identity (#51), in the frontmatter (P7).
+- `notarium-source` — reserved source-addressable import provenance. It is logical/file state (therefore part of CAS/history/restore/export), not a `StorageOwnerKey` and not public/authored metadata. `NoteMeta`/`NoteContent` carry an internal typed `sourceLocator`; ordinary REST/MCP/frontmatter projections omit it. A canonical direct external field is file truth, while fresh Markdown/public/inline carry is stripped. The derived index projects it into nullable `source_locator` without backfilling unchanged legacy rows.
 - `kind`/`class` — the note's class (`user-doc` / `agent-memory` / …); the single point of surface filtering (a policy invariant, not a bypassable `WHERE` — #74 §2).
 - `summary` — on `agent-memory` files; feeds the derived memory-index. Write semantics (#102): a `summary` passed to `remember_*` **overwrites** the previous one, an omitted one is **carry-forward** (the previous is kept); the response carries `summaryUpdated` (true = overwritten, false = kept) — there is no silent loss.
 - `type`, `tags` — the `user-doc` ontology (escape-parameters of `create_note`); `path` is normalized, `..`/absolute paths are rejected.
@@ -365,9 +366,11 @@ in the engines):
 | `overwrite` | upserts onto the occupied path | **import only** — and it is not on the wire |
 
 `overwrite` is deliberately absent from `CreateNoteRequest`: replacing another note's bytes is
-a host-internal capability, so no client can reach it however it composes a request. Its one
-caller is the importer, whose idempotency rests on a deterministic `fileName` — a re-import
-must land on the same file ([import.md](import.md#idempotency-dedup-on-re-import)).
+a host-internal capability, so no client can reach it however it composes a request. It remains
+only on path-based import branches (Markdown trees and memory formats). Source-addressable
+Claude/ChatGPT records do not overwrite by path: they update the unique `notarium-source`
+owner by id+CAS, or create at a guarded canonical path
+([import.md](import.md#idempotency-dedup-on-re-import)).
 
 **The fence is the PATH, not the title** — the path is what would be clobbered. A title is
 still not unique in a folder, and deliberately so: a note whose basename diverges from

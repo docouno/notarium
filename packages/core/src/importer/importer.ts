@@ -1,6 +1,6 @@
 // The importer entry point: one uploaded file's raw text → notes to create.
 // Auto-detects the format (overridable) and dispatches to the format parser.
-// Pure — the host (server) feeds it bytes and consumes the ImportNote[].
+// Pure — the host consumes notes plus explicit per-record failures/skips.
 
 import { IMPORT_FORMAT } from './consts'
 import type { ImportFormat } from './consts'
@@ -13,7 +13,7 @@ import { parseClaudeMemory } from './formats/claudeMemory'
 import { parseClaudeProjects } from './formats/claudeProjects'
 import { markdownFileToNote } from './formats/markdown'
 import { parseMemoryJson } from './formats/memoryJson'
-import type { ImportParseResult } from './types'
+import type { ImportParseResult, ImportRecordFailure } from './types'
 
 export { ImportError } from './errors'
 
@@ -35,11 +35,11 @@ export const parseImport = (
   }
   // A dropped text file: the whole file IS the note — no JSON parse.
   if (fmt === IMPORT_FORMAT.markdown) {
-    return { format: fmt, notes: [markdownFileToNote(raw, fileName)], warnings: [] }
+    return { format: fmt, notes: [markdownFileToNote(raw, fileName)], failures: [], warnings: [] }
   }
   if (fmt === IMPORT_FORMAT.memoryJson) {
     const { notes, warnings } = parseMemoryJson(raw)
-    return { format: fmt, notes, warnings }
+    return { format: fmt, notes, failures: [], warnings }
   }
   let data: unknown
 
@@ -58,6 +58,11 @@ export const parseImport = (
           : fmt === IMPORT_FORMAT.claudeDesignChat
             ? parseClaudeDesignChat
             : parseClaudeConversations
-  const { notes, warnings } = parse(data)
-  return { format: fmt, notes, warnings }
+  const parsed = parse(data)
+  return {
+    format: fmt,
+    notes: parsed.notes,
+    failures: 'failures' in parsed ? (parsed.failures as ImportRecordFailure[]) : [],
+    warnings: parsed.warnings,
+  }
 }

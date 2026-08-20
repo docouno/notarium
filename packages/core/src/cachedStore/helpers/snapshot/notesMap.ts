@@ -3,10 +3,10 @@ import { VersionedMap } from './versionedMap'
 
 const NO_IDS: readonly string[] = []
 
-/** The snapshot's notes: metas by note-id, plus the two derived facts the write
+/** The snapshot's notes: metas by note-id, plus the derived facts the write
  *  path would otherwise recompute by walking the whole map on EVERY write —
- *  "which note lives at this storage path" and "could the resolve table have gone
- *  stale in a way that makes it LIE".
+ *  "which note lives at this storage path", "which notes claim an import source",
+ *  and "could the resolve table have gone stale in a way that makes it LIE".
  *
  *  Both live inside the Map for the reason its version counter does: a rule that
  *  says "remember to update the path index here" is a rule someone eventually
@@ -23,6 +23,7 @@ export class NotesMap extends VersionedMap<string, NoteMeta> {
   retractions = 0
 
   private readonly idsByPath = new Map<string, string[]>()
+  private readonly idsBySourceLocator = new Map<string, string[]>()
 
   set(id: string, meta: NoteMeta): this {
     const prior = this.get(id)
@@ -42,6 +43,20 @@ export class NotesMap extends VersionedMap<string, NoteMeta> {
         this.idsByPath.set(meta.filePath, [id])
       }
     }
+    if (prior?.sourceLocator !== meta.sourceLocator) {
+      if (prior?.sourceLocator) {
+        this.unbindSourceLocator(prior.sourceLocator, id)
+      }
+      if (meta.sourceLocator) {
+        const bucket = this.idsBySourceLocator.get(meta.sourceLocator)
+
+        if (bucket) {
+          bucket.push(id)
+        } else {
+          this.idsBySourceLocator.set(meta.sourceLocator, [id])
+        }
+      }
+    }
 
     return super.set(id, meta)
   }
@@ -52,6 +67,9 @@ export class NotesMap extends VersionedMap<string, NoteMeta> {
     if (prior) {
       this.retractions++
       this.unbind(prior.filePath, id)
+      if (prior.sourceLocator) {
+        this.unbindSourceLocator(prior.sourceLocator, id)
+      }
     }
 
     return super.delete(id)
@@ -62,6 +80,7 @@ export class NotesMap extends VersionedMap<string, NoteMeta> {
       this.retractions++
     }
     this.idsByPath.clear()
+    this.idsBySourceLocator.clear()
     super.clear()
   }
 
@@ -74,6 +93,12 @@ export class NotesMap extends VersionedMap<string, NoteMeta> {
    *  callers that need map order walk the map. */
   idsAt(filePath: string): readonly string[] {
     return this.idsByPath.get(filePath) ?? NO_IDS
+  }
+
+  /** The ids carrying one canonical source locator. Normally none or one;
+   * multiple ids are the ambiguous-owner state the importer refuses. */
+  idsWithSourceLocator(locator: string): readonly string[] {
+    return this.idsBySourceLocator.get(locator) ?? NO_IDS
   }
 
   private unbind(filePath: string, id: string): void {
@@ -89,6 +114,22 @@ export class NotesMap extends VersionedMap<string, NoteMeta> {
     }
     if (!bucket.length) {
       this.idsByPath.delete(filePath)
+    }
+  }
+
+  private unbindSourceLocator(locator: string, id: string): void {
+    const bucket = this.idsBySourceLocator.get(locator)
+
+    if (!bucket) {
+      return
+    }
+    const at = bucket.indexOf(id)
+
+    if (at !== -1) {
+      bucket.splice(at, 1)
+    }
+    if (!bucket.length) {
+      this.idsBySourceLocator.delete(locator)
     }
   }
 }

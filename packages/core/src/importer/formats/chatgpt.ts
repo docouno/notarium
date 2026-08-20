@@ -5,8 +5,16 @@
 // in original order — then render the visible messages.
 
 import { IMPORT_SOURCE } from '../consts'
-import { convoFileName, shortHash, stampOf, toIso } from '../helpers/format'
-import type { ImportNote } from '../types'
+import { convoFileName, stampOf, toIso } from '../helpers/format'
+import {
+  failedImportRecord,
+  importedNote,
+  partitionImportOutcomes,
+  skippedImportRecord,
+} from '../outcomes'
+import { sourceNoteFileName } from '../placement'
+import { chatGptConversationSourceLocator } from '../sourceLocator'
+import type { ImportRecordOutcome } from '../types'
 
 type ChatGptContent = {
   content_type?: string
@@ -265,15 +273,10 @@ const renderMessage = (m: ChatGptMessage): string => {
   return `### ${label}${stamp ? ` (${stamp})` : ''}\n\n${content}`
 }
 
-/** One ChatGPT conversation (a mapping graph) → one note (the streaming unit).
- *  null when the record has no message graph. `index` disambiguates an idless
- *  conversation's filename. */
-export const chatGptConversationToNote = (
-  conv: ChatGptConversation,
-  index = 0,
-): ImportNote | null => {
+/** One ChatGPT conversation (a mapping graph) → one record outcome. */
+export const chatGptConversationToNote = (conv: ChatGptConversation): ImportRecordOutcome => {
   if (!conv?.mapping || typeof conv.mapping !== 'object') {
-    return null
+    return skippedImportRecord('conversation has no mapping')
   }
   const title = (conv.title || '').trim() || 'Untitled'
   const createdAt = toIso(conv.create_time ?? null)
@@ -282,46 +285,46 @@ export const chatGptConversationToNote = (
   // A conversation with no renderable text (an abandoned/voice/asset-only chat the
   // export left content-less) isn't worth an empty note — skip it.
   if (!body.trim()) {
-    return null
+    return skippedImportRecord('conversation has no renderable content')
   }
-  // Without a stable id, key the filename on the index + a body hash so two
-  // idless 'Untitled' chats don't collide onto one file.
-  const sourceId = conv.conversation_id || conv.id || `${index}-${shortHash(body)}`
-  return {
+  const sourceId = conv.conversation_id || conv.id || ''
+  const sourceLocator = chatGptConversationSourceLocator(sourceId)
+
+  if (!sourceLocator) {
+    return failedImportRecord(title, 'chatgpt conversation: missing durable conversation id')
+  }
+
+  return importedNote({
     title,
     body,
     directory: 'conversations/chatgpt',
     tags: ['chatgpt', 'conversation'],
     noteType: 'conversation',
     createdAt: createdAt ?? undefined,
-    fileName: convoFileName(title, createdAt, sourceId),
+    fileName: sourceNoteFileName(title, sourceLocator, createdAt),
+    legacyDirectory: 'conversations/chatgpt',
+    legacyFileName: convoFileName(title, createdAt, sourceId),
     source: IMPORT_SOURCE.chatgpt,
-  }
+    sourceLocator,
+  })
 }
 
-export const parseChatGpt = (data: unknown): { notes: ImportNote[]; warnings: string[] } => {
+export const parseChatGpt = (
+  data: unknown,
+): ReturnType<typeof partitionImportOutcomes> & { warnings: string[] } => {
   if (!Array.isArray(data)) {
-    return { notes: [], warnings: ['chatgpt: expected a JSON array'] }
+    return { notes: [], failures: [], skipped: 0, warnings: ['chatgpt: expected a JSON array'] }
   }
-  const notes: ImportNote[] = []
-  let empty = 0
-  data.forEach((conv, i) => {
-    const note = chatGptConversationToNote(conv as ChatGptConversation, i)
-
-    if (note) {
-      notes.push(note)
-    } else {
-      empty++
-    }
-  })
+  const outcomes = data.map((conv) => chatGptConversationToNote(conv as ChatGptConversation))
+  const { notes, failures, skipped } = partitionImportOutcomes(outcomes)
   const warnings: string[] = []
 
-  if (!notes.length) {
+  if (!notes.length && !failures.length) {
     warnings.push('chatgpt: no conversations found')
   }
-  if (empty) {
-    warnings.push(`chatgpt: skipped ${empty} conversation(s) with no content`)
+  if (skipped) {
+    warnings.push(`chatgpt: skipped ${skipped} conversation(s) with no content`)
   }
 
-  return { notes, warnings }
+  return { notes, failures, skipped, warnings }
 }

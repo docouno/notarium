@@ -1,17 +1,17 @@
 // Import: convert a Claude / ChatGPT / MCP-memory export into notes. The
-// parsers here are PURE (string → ImportNote[]): no store, no IO, no engine — the
+// parsers here are PURE (string → ImportRecordOutcome[]): no store, no IO, no engine — the
 // mirror-image of export's host-edge transform, but richer. The host (server)
 // composes them: parse (here) → store.write per note (the canonical write path).
-// One conversation/entity → one note; idempotency is identity-aware
-// (deterministic per-source filenames) rather than clobber-by-path.
+// One source record → one note/failure/skip; source-addressable identity is
+// separate from its deterministic path representation.
 
 import type { FrontmatterEntry } from '../libs/markdown'
 import type { ImportFormat, ImportSource } from './consts'
 /** One note an importer wants created — the normalised handoff to the write
  *  path. The host maps this onto a WriteInput: `title`/`tags`/`directory` ride
  *  the usual create channels; `createdAt`/`fileName`/`frontmatter` ride the
- *  host-internal write channels. Provenance is carried by `tags` (e.g. `claude`);
- *  the parser derives the deterministic `fileName` from the source id internally. */
+ *  host-internal write channels. Provenance is carried by `tags` (e.g. `claude`)
+ *  and, for source-addressable formats, the reserved source locator. */
 export type ImportNote = {
   title: string
   /** The note body as markdown — NO leading `# title` heading (the write path
@@ -28,13 +28,20 @@ export type ImportNote = {
    *  `modified` is deliberately NOT threaded: it stays the file's real mtime
    *  (= import time, then real edit times) so it never goes stale or flips. */
   createdAt?: string
-  /** Explicit filename (sans `.md`) the note lands under — deterministic per
-   *  source so a re-import overwrites the SAME file (idempotent) and same-titled
-   *  items never collide. Overrides the default `slug(title)`. */
+  /** Explicit canonical filename (sans `.md`). Source-aware re-import resolves
+   *  by locator; this remains its deterministic portable first placement. */
   fileName: string
   /** The tool family this note came from — drives the memory-destination routing
    *  (a `memory` note can go to the agent mount). */
   source: ImportSource
+  /** Canonical source identity for source-addressable foreign records. Absent
+   * for Markdown and memory formats, which retain their own identity models. */
+  sourceLocator?: string
+  /** Relative predecessor placement from the pre-source-locator importer. The
+   * host joins its own root/class exactly once and uses it only as a refusal
+   * fence; it is never a fallback destination. */
+  legacyDirectory?: string
+  legacyFileName?: string
   /** The source file's OWN frontmatter, minus the keys lifted into the typed
    *  fields above and minus any `notarium-id` claim (#280). Carried as raw entries
    *  so a key we don't model — a nested map, a plugin's field — survives the write
@@ -55,10 +62,18 @@ export type ImportNote = {
   sourceIdentityWarning?: string
 }
 
+export type ImportRecordFailure = { title: string; error: string }
+
+export type ImportRecordOutcome =
+  | { kind: 'note'; note: ImportNote }
+  | { kind: 'failure'; failure: ImportRecordFailure }
+  | { kind: 'skip'; reason: string }
+
 /** What parsing one uploaded file yields: the detected format, the notes to
  *  create, and any non-fatal skips worth surfacing in the summary. */
 export type ImportParseResult = {
   format: ImportFormat
   notes: ImportNote[]
+  failures: ImportRecordFailure[]
   warnings: string[]
 }

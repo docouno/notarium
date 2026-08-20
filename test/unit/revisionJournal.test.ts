@@ -12,8 +12,10 @@ import {
   analyzeDocumentState,
   bindStorageOwnerProof,
   CachedStore,
+  claudeConversationSourceLocator,
   decodeDocumentState,
   encodeDocumentState,
+  IMPORT_SOURCE_FRONTMATTER_KEY,
   InMemoryRevisionPersistence,
   logicalNoteState,
   parseFrontmatterLines,
@@ -1031,6 +1033,92 @@ describe('revision journal (#12) — delete and restore', () => {
 })
 
 describe('trash (#79) — the journal view + undelete', () => {
+  it('keeps typed import provenance through a capability-thin projection and trash cycle', async () => {
+    const sourceLocator = claudeConversationSourceLocator('thin-source')!
+    const inner = new InMemoryStore({
+      space: 'main',
+      now: FIXTURE.now,
+      notes: [
+        {
+          id: 'thin-source-note',
+          title: 'Same projection',
+          filePath: 'source.md',
+          content: 'same body',
+          sourceLocator,
+        },
+        ...['clean', 'raw', 'invalid'].map((kind) => ({
+          id: `thin-${kind}-note`,
+          title: 'Same projection',
+          filePath: `${kind}.md`,
+          content: 'same body',
+        })),
+      ],
+    })
+    const exactRead = inner.read.bind(inner)
+    const exactWrite = inner.write.bind(inner)
+
+    inner.capabilities.cas = false
+    inner.read = async (...args) => {
+      const thin = { ...(await exactRead(...args)) }
+
+      delete thin.logicalState
+      delete thin.documentState
+      delete thin.versionToken
+      if (thin.id === 'thin-raw-note') {
+        thin.frontmatter = { [IMPORT_SOURCE_FRONTMATTER_KEY]: sourceLocator }
+      }
+      if (thin.id === 'thin-invalid-note') {
+        thin.sourceLocator = 'not-a-locator'
+      }
+
+      return thin
+    }
+    inner.write = async (input) => {
+      const versionToken = input.originalId
+        ? (await exactRead(input.originalId, { identityOnly: true })).versionToken
+        : undefined
+      const thin = { ...(await exactWrite({ ...input, versionToken })) }
+
+      delete thin.versionToken
+
+      return thin
+    }
+    const { store } = await make(inner)
+    const sourced = await store.read('thin-source-note')
+    const clean = await store.read('thin-clean-note')
+    const raw = await store.read('thin-raw-note')
+    const invalid = await store.read('thin-invalid-note')
+
+    expect(sourced.sourceLocator).toBe(sourceLocator)
+    expect(sourced.versionToken).not.toBe(clean.versionToken)
+    expect(raw.versionToken).toBe(clean.versionToken)
+    expect(invalid.versionToken).toBe(clean.versionToken)
+
+    await store.write({
+      originalId: 'thin-source-note',
+      title: 'Same projection',
+      content: 'updated body',
+      versionToken: sourced.versionToken,
+      principal: 'ui',
+    })
+    await store.remove('thin-source-note', { principal: 'ui' })
+    await store.restoreFromTrash!('thin-source-note', { principal: 'ui' })
+
+    expect(await store.read('thin-source-note')).toMatchObject({
+      content: 'updated body',
+      sourceLocator,
+    })
+
+    for (const id of ['thin-raw-note', 'thin-invalid-note']) {
+      await store.remove(id, { principal: 'ui' })
+      await store.restoreFromTrash!(id, { principal: 'ui' })
+      const exact = await exactRead(id)
+
+      expect(exact.sourceLocator).toBeUndefined()
+      expect(exact.logicalState?.markdown).not.toContain(IMPORT_SOURCE_FRONTMATTER_KEY)
+    }
+  })
+
   it('a deleted note appears in the trash with its last folder, restorable', async () => {
     const { store } = await make()
     await store.remove(TITANIUM, { principal: 'ui' })

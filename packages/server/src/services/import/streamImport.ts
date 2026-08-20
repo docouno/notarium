@@ -23,6 +23,8 @@ import {
   ImportError,
   type ImportFormat,
   type ImportNote,
+  type ImportRecordFailure,
+  type ImportRecordOutcome,
   isMemoryObject,
   isMemoryRecord,
   markdownFileToNote,
@@ -54,6 +56,18 @@ export type StreamImportArgs = {
   /** Called once per parsed note, awaited (backpressure). A throw is the consumer's
    *  record failure and does NOT abort the stream (the orchestrator catches/counts). */
   onNote: (note: ImportNote, ctx: { file: string; format: ImportFormat }) => Promise<void>
+  /** Per-record source-identity failure. Unlike a thrown member error it is
+   * counted and the surrounding stream keeps pulling records. */
+  onRecordFailure?: (
+    failure: ImportRecordFailure,
+    ctx: { file: string; format: ImportFormat },
+  ) => Promise<void>
+  /** Called once after every parsed record outcome (note/failure/skip). The host
+   * owns cancellation, progress batching and cooperative yielding here. */
+  onRecordProcessed?: (ctx: { file: string; format: ImportFormat }) => Promise<void>
+  /** Parse-only heartbeat for graph records that materialize notes only after the
+   * input has been accumulated. It advances no user-facing counter. */
+  onRecordHeartbeat?: (ctx: { file: string; format: ImportFormat }) => Promise<void>
   /** Called once per recognised member, in ARCHIVE ORDER, as soon as that member
    *  is done. Ordering is the whole reason it exists rather than a loop over the
    *  returned metas: a member that yields no notes registers nothing while it
@@ -126,6 +140,8 @@ const streamArrayMember = async (
   file: string,
   forced: ImportFormat | undefined,
   onNote: StreamImportArgs['onNote'],
+  onRecordFailure: StreamImportArgs['onRecordFailure'],
+  onRecordProcessed: StreamImportArgs['onRecordProcessed'],
 ): Promise<{ format: ImportFormat | null; count: number; empty: number }> => {
   let format = forced ?? null
   let count = 0
@@ -154,16 +170,17 @@ const streamArrayMember = async (
       // skipped-empty conversation (counted); other formats' null just yields nothing.
       const isConversation =
         format === IMPORT_FORMAT.chatgpt || format === IMPORT_FORMAT.claudeConversations
-      const notes =
+      const outcomes: ImportRecordOutcome[] =
         format === IMPORT_FORMAT.claudeProjects
           ? claudeProjectToNotes(value as Parameters<typeof claudeProjectToNotes>[0], key)
           : format === IMPORT_FORMAT.claudeMemory
-            ? claudeMemoryItemToNotes(value as Parameters<typeof claudeMemoryItemToNotes>[0])
+            ? claudeMemoryItemToNotes(value as Parameters<typeof claudeMemoryItemToNotes>[0]).map(
+                (note) => ({ kind: 'note' as const, note }),
+              )
             : format === IMPORT_FORMAT.chatgpt
               ? [
                   chatGptConversationToNote(
                     value as Parameters<typeof chatGptConversationToNote>[0],
-                    key,
                   ),
                 ]
               : [
@@ -173,15 +190,21 @@ const streamArrayMember = async (
                   ),
                 ]
 
-      for (const n of notes) {
-        if (!n) {
+      if (outcomes.length === 0) {
+        await onRecordProcessed?.({ file, format })
+      }
+      for (const outcome of outcomes) {
+        if (outcome.kind === 'skip') {
           if (isConversation) {
             empty++
           }
-          continue
+        } else if (outcome.kind === 'failure') {
+          await onRecordFailure?.(outcome.failure, { file, format })
+        } else {
+          await onNote(outcome.note, { file, format })
+          count++
         }
-        await onNote(n, { file, format })
-        count++
+        await onRecordProcessed?.({ file, format })
       }
     }
   } finally {
@@ -198,6 +221,8 @@ const streamMemoryMember = async (
   file: string,
   prefix: string,
   onNote: StreamImportArgs['onNote'],
+  onRecordProcessed: StreamImportArgs['onRecordProcessed'],
+  onRecordHeartbeat: StreamImportArgs['onRecordHeartbeat'],
 ): Promise<string[]> => {
   const graph = new MemoryGraph()
 
@@ -218,6 +243,7 @@ const streamMemoryMember = async (
     } catch {
       /* unparseable — yields an empty graph + its "no entities" warning */
     }
+    await onRecordHeartbeat?.({ file, format: IMPORT_FORMAT.memoryJson })
   } else {
     const rl = createInterface({ input: createReadStream(path), crlfDelay: Infinity })
 
@@ -232,10 +258,17 @@ const streamMemoryMember = async (
       } catch {
         /* skip a malformed line */
       }
+      await onRecordHeartbeat?.({ file, format: IMPORT_FORMAT.memoryJson })
     }
   }
-  for (const note of graph.toNotes()) {
+  const notes = graph.toNotes()
+
+  if (notes.length === 0) {
+    await onRecordProcessed?.({ file, format: IMPORT_FORMAT.memoryJson })
+  }
+  for (const note of notes) {
     await onNote(note, { file, format: IMPORT_FORMAT.memoryJson })
+    await onRecordProcessed?.({ file, format: IMPORT_FORMAT.memoryJson })
   }
 
   return graph.warnings()
@@ -248,6 +281,8 @@ const processSingleObject = async (
   path: string,
   forced: ImportFormat | undefined,
   onNote: StreamImportArgs['onNote'],
+  onRecordFailure: StreamImportArgs['onRecordFailure'],
+  onRecordProcessed: StreamImportArgs['onRecordProcessed'],
 ): Promise<{ format: ImportFormat | null; count: number; empty: number }> => {
   const { size } = await fs.stat(path)
 
@@ -266,26 +301,34 @@ const processSingleObject = async (
   if (!format) {
     return { format: null, count: 0, empty: 0 }
   }
-  const notes =
+  const outcomes: ImportRecordOutcome[] =
     format === IMPORT_FORMAT.claudeProjects
       ? claudeProjectToNotes(obj as Parameters<typeof claudeProjectToNotes>[0], 0)
       : format === IMPORT_FORMAT.claudeDesignChat
-        ? [claudeDesignChatToNote(obj as Parameters<typeof claudeDesignChatToNote>[0], 0)]
+        ? [claudeDesignChatToNote(obj as Parameters<typeof claudeDesignChatToNote>[0])]
         : format === IMPORT_FORMAT.claudeMemory
-          ? claudeMemoryItemToNotes(obj as Parameters<typeof claudeMemoryItemToNotes>[0])
+          ? claudeMemoryItemToNotes(obj as Parameters<typeof claudeMemoryItemToNotes>[0]).map(
+              (note) => ({ kind: 'note' as const, note }),
+            )
           : []
   let count = 0
   let empty = 0
 
-  for (const n of notes) {
-    if (!n) {
+  if (outcomes.length === 0) {
+    await onRecordProcessed?.({ file: path, format })
+  }
+  for (const outcome of outcomes) {
+    if (outcome.kind === 'skip') {
       if (format === IMPORT_FORMAT.claudeDesignChat) {
         empty++
       }
-      continue
+    } else if (outcome.kind === 'failure') {
+      await onRecordFailure?.(outcome.failure, { file: path, format })
+    } else {
+      await onNote(outcome.note, { file: path, format })
+      count++
     }
-    await onNote(n, { file: path, format })
-    count++
+    await onRecordProcessed?.({ file: path, format })
   }
 
   return { format, count, empty }
@@ -298,6 +341,7 @@ const processTextFile = async (
   path: string,
   file: string,
   onNote: StreamImportArgs['onNote'],
+  onRecordProcessed: StreamImportArgs['onRecordProcessed'],
   sourceModifiedAt?: string,
 ): Promise<ImportFileMeta> => {
   const { size } = await fs.stat(path)
@@ -315,6 +359,7 @@ const processTextFile = async (
     file,
     format: IMPORT_FORMAT.markdown,
   })
+  await onRecordProcessed?.({ file, format: IMPORT_FORMAT.markdown })
   return { file, format: IMPORT_FORMAT.markdown, warnings: [] }
 }
 
@@ -341,21 +386,38 @@ const processMember = async (
   file: string,
   forced: ImportFormat | undefined,
   onNote: StreamImportArgs['onNote'],
+  onRecordFailure: StreamImportArgs['onRecordFailure'],
+  onRecordProcessed: StreamImportArgs['onRecordProcessed'],
+  onRecordHeartbeat: StreamImportArgs['onRecordHeartbeat'],
   sourceModifiedAt?: string,
 ): Promise<ImportFileMeta | null> => {
   if (forced === IMPORT_FORMAT.markdown) {
-    return processTextFile(path, file, onNote, sourceModifiedAt)
+    return processTextFile(path, file, onNote, onRecordProcessed, sourceModifiedAt)
   }
   const full = await peekStart(path)
   const first = full.trimStart()[0]
   const isMemory = first === '{' && (firstLineIsMemory(full) || looksLikeMemoryObject(full))
 
   if (forced === IMPORT_FORMAT.memoryJson || (!forced && isMemory)) {
-    const warnings = await streamMemoryMember(path, file, full, onNote)
+    const warnings = await streamMemoryMember(
+      path,
+      file,
+      full,
+      onNote,
+      onRecordProcessed,
+      onRecordHeartbeat,
+    )
     return { file, format: IMPORT_FORMAT.memoryJson, warnings }
   }
   if (first === '[') {
-    const { format, count, empty } = await streamArrayMember(path, file, forced, onNote)
+    const { format, count, empty } = await streamArrayMember(
+      path,
+      file,
+      forced,
+      onNote,
+      onRecordFailure,
+      onRecordProcessed,
+    )
 
     if (!format) {
       return skippedMeta(file)
@@ -366,7 +428,17 @@ const processMember = async (
   if (first === '{') {
     // processSingleObject only knows the temp path — re-route ctx.file to the archive name.
     const route: StreamImportArgs['onNote'] = (note, ctx) => onNote(note, { ...ctx, file })
-    const { format, count, empty } = await processSingleObject(path, forced, route)
+    const routeFailure: NonNullable<StreamImportArgs['onRecordFailure']> = (failure, ctx) =>
+      onRecordFailure?.(failure, { ...ctx, file }) ?? Promise.resolve()
+    const routeProcessed: NonNullable<StreamImportArgs['onRecordProcessed']> = (ctx) =>
+      onRecordProcessed?.({ ...ctx, file }) ?? Promise.resolve()
+    const { format, count, empty } = await processSingleObject(
+      path,
+      forced,
+      route,
+      routeFailure,
+      routeProcessed,
+    )
 
     if (!format) {
       return skippedMeta(file)
@@ -481,6 +553,9 @@ export const streamImportFile = async ({
   filename,
   format,
   onNote,
+  onRecordFailure,
+  onRecordProcessed,
+  onRecordHeartbeat,
   onFile,
   signal,
   sourceModifiedAt,
@@ -499,7 +574,15 @@ export const streamImportFile = async ({
       if (signal?.aborted) {
         throw new Error('import canceled')
       }
-      const meta = await processMember(memberPath, name, format, onNote).catch((err) => {
+      const meta = await processMember(
+        memberPath,
+        name,
+        format,
+        onNote,
+        onRecordFailure,
+        onRecordProcessed,
+        onRecordHeartbeat,
+      ).catch((err) => {
         if (err instanceof ImportError) {
           return null
         } // tolerate one bad member in an archive
@@ -519,6 +602,9 @@ export const streamImportFile = async ({
       filename || 'upload',
       format,
       onNote,
+      onRecordFailure,
+      onRecordProcessed,
+      onRecordHeartbeat,
       sourceModifiedAt,
     )
 

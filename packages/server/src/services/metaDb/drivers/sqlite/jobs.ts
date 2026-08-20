@@ -63,12 +63,22 @@ export const createJobsFacet = (ctx: SqliteDriverCtx): JobsPersistence => ({
         `UPDATE jobs SET
              locked_at = ?,
              progress_done = ?,
-             progress_total = COALESCE(?, progress_total),
-             phase = COALESCE(?, phase),
+             progress_total = CASE WHEN ? THEN ? ELSE progress_total END,
+             phase = CASE WHEN ? THEN ? ELSE phase END,
              updated_at = ?
            WHERE id = ? AND locked_by = ? AND status = 'running'`,
       )
-      .run(p.now, p.done, p.total ?? null, p.phase ?? null, p.now, id, workerId)
+      .run(
+        p.now,
+        p.done,
+        p.total !== undefined ? 1 : 0,
+        p.total ?? null,
+        p.phase !== undefined ? 1 : 0,
+        p.phase ?? null,
+        p.now,
+        id,
+        workerId,
+      )
     return res.changes > 0
   },
 

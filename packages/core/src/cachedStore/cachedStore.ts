@@ -48,16 +48,13 @@ import {
 import type { AuthorFilter } from '../knowledgeStore'
 import { isValidNoteId, NOTE_ID_FRONTMATTER_KEY } from '../libs/id'
 import {
-  analyzeDocumentState,
   decodeWikilinkIdentity,
   type DocumentState,
-  documentStateVersionToken,
   encodeWikilinkIdentity,
   FrontmatterLimitError,
   frontmatterValue,
   isWikilinkIdentityTarget,
   type LogicalNoteState,
-  logicalNoteStateFromProjection,
   normalizeWikilinkTarget,
 } from '../libs/markdown'
 import { MutationCoordinator } from '../libs/mutationCoordinator'
@@ -80,6 +77,7 @@ import {
 import { BulkController } from './controllers/bulkController'
 import { WatchController } from './controllers/watchController'
 import { DirectoryIndex } from './helpers/directoryIndex'
+import { exactDocumentState, exactLogicalState, exactVersionToken } from './helpers/exactNoteState'
 import { filterGraphForUser } from './helpers/filterGraph'
 import { HistorySurface } from './helpers/historySurface'
 import { supportsExactIdentityAddress } from './helpers/innerIdentity'
@@ -117,34 +115,12 @@ type ReadEffects = {
   changedIds: Set<string>
 }
 
-const exactLogicalState = (
-  note: Pick<NoteContent, 'title' | 'content' | 'frontmatter' | 'logicalState'>,
-) =>
-  note.logicalState ??
-  logicalNoteStateFromProjection({
-    title: note.title,
-    body: note.content,
-    frontmatter: note.frontmatter,
-  })
-
-const exactDocumentState = (
-  note: Pick<NoteContent, 'title' | 'content' | 'frontmatter' | 'logicalState' | 'documentState'>,
-): DocumentState =>
-  note.documentState ??
-  analyzeDocumentState({
-    source: new TextEncoder().encode(exactLogicalState(note).markdown),
-    pathFallbackTitle: note.title ?? null,
-  })
-
-const exactVersionToken = (
-  note: Pick<NoteContent, 'title' | 'content' | 'frontmatter' | 'logicalState' | 'documentState'>,
-): string => documentStateVersionToken(exactDocumentState(note))
-
 const exactObservedMeta = (note: NoteContent, fallback: NoteMeta): NoteMeta => ({
   ...fallback,
   title: note.title ?? fallback.title,
   class: note.class ?? fallback.class,
   filePath: note.filePath ?? fallback.filePath,
+  sourceLocator: note.sourceLocator,
   // Presence and absence are both projections of the exact state. Assigning
   // undefined deliberately clears a slug sampled by an earlier delta.
   slug: note.slug,

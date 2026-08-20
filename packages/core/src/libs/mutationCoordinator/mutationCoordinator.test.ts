@@ -33,6 +33,29 @@ describe('MutationCoordinator', () => {
     expect(order).toEqual(['first:start', 'first:fail', 'second'])
   })
 
+  it('serializes equal opaque resources without treating them as paths or note ids', async () => {
+    const coordinator = new MutationCoordinator()
+    const gate = deferred()
+    const order: string[] = []
+    const first = coordinator.run({ resources: ['source:v1:a'] }, async () => {
+      order.push('first:start')
+      await gate.promise
+      order.push('first:end')
+    })
+    const same = coordinator.run({ resources: ['source:v1:a'] }, async () => {
+      order.push('same')
+    })
+    const different = coordinator.run({ resources: ['source:v1:b'] }, async () => {
+      order.push('different')
+    })
+
+    await Promise.resolve()
+    expect(order).toEqual(['first:start', 'different'])
+    gate.resolve()
+    await Promise.all([first, same, different])
+    expect(order).toEqual(['first:start', 'different', 'first:end', 'same'])
+  })
+
   it('fences exact child paths against source and destination folder prefixes', async () => {
     const coordinator = new MutationCoordinator()
     const gate = deferred()

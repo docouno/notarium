@@ -120,6 +120,7 @@ export type NoteRow = {
   modified_at: string | null
   note_type: string
   id_claim: string | null
+  source_locator: string | null
   tags: string
   /** Alias-history (#100) as a JSON string array — past human names the link
    *  resolver still honours, parsed from frontmatter `aliases:`. Defaults '[]'. */

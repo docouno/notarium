@@ -73,7 +73,9 @@ const fakeStore = () => {
     fileName?: string
     directory?: string
     id?: string
+    originalId?: string
     expectedDestinationId?: string | null
+    sourceLocator?: string
   }> = []
   /** Who owns each destination, as the identity layer would answer. Only read
    *  when the caller states an expectation — an import that never passes one gets
@@ -85,14 +87,42 @@ const fakeStore = () => {
     // A Markdown tree is planned against the destination inventory, and the plan
     // refuses to run at all without a store that can be checkpointed and listed —
     // an empty space is still an answer.
-    list: async () => [],
+    list: async () =>
+      writes.map((write, index) => ({
+        id: write.id ?? `n${index + 1}`,
+        title: write.title ?? '',
+        filePath: `${write.directory ? `${write.directory}/` : ''}${write.fileName}.md`,
+        sourceLocator: write.sourceLocator,
+        modifiedAt: null,
+        createdAt: null,
+      })),
     checkpoint: async () => {},
+    read: async (id: string) => {
+      const index = writes.findIndex((write, at) => (write.id ?? `n${at + 1}`) === id)
+      const write = writes[index]
+
+      if (!write) {
+        throw new Error(`missing note: ${id}`)
+      }
+
+      return {
+        id,
+        title: write.title,
+        filePath: `${write.directory ? `${write.directory}/` : ''}${write.fileName}.md`,
+        sourceLocator: write.sourceLocator,
+        content: '',
+        frontmatter: {},
+        versionToken: `v${index + 1}`,
+      }
+    },
     write: async (input: {
       title?: string
       fileName?: string
       directory?: string
       id?: string
+      originalId?: string
       expectedDestinationId?: string | null
+      sourceLocator?: string
     }) => {
       // The identity layer's planned-destination guard, as the import sees it:
       // it can only refuse when the caller states what the plan proved.
@@ -107,10 +137,39 @@ const fakeStore = () => {
           )
         }
       }
+      if (input.originalId) {
+        const existing = writes.findIndex(
+          (write, index) => (write.id ?? `n${index + 1}`) === input.originalId,
+        )
+
+        if (existing < 0) {
+          throw new Error(`missing note: ${input.originalId}`)
+        }
+        writes[existing] = { ...writes[existing], ...input, id: input.originalId }
+        const updated = writes[existing]
+        return {
+          id: input.originalId,
+          title: updated.title,
+          class: 'user-doc' as const,
+          filePath: `${updated.directory ? `${updated.directory}/` : ''}${updated.fileName}.md`,
+          sourceLocator: updated.sourceLocator,
+          versionToken: `v${existing + 2}`,
+        }
+      }
       writes.push(input)
       // Mirrors the write path: a caller-supplied identity is the one the note
       // gets, and only an absent one is minted here.
-      return { id: input.id ?? `n${writes.length}` }
+      const id = input.id ?? `n${writes.length}`
+      const filePath = `${input.directory ? `${input.directory}/` : ''}${input.fileName}.md`
+      owners.set(filePath, id)
+      return {
+        id,
+        title: input.title,
+        class: 'user-doc' as const,
+        filePath,
+        sourceLocator: input.sourceLocator,
+        versionToken: `v${writes.length}`,
+      }
     },
   }
 }
@@ -254,8 +313,9 @@ const ctxOf = (
   staging: ImportStagingStore,
   params: unknown,
   signal: AbortSignal,
+  jobOverrides: Partial<JobRecord> = {},
 ): JobContext => ({
-  job: jobRec(params),
+  job: { ...jobRec(params), ...jobOverrides },
   lease: 'lease-1',
   signal,
   artifacts: {} as never, // an import handler produces no artifact
@@ -927,6 +987,27 @@ describe('createImportHandler (#191)', () => {
     expect(state.removed).toBe(false)
   })
 
+  it('replays a durable foreign upload through a fresh handler without duplicating its source', async () => {
+    const { staging } = stagingFor(CONVERSATIONS)
+    const store = fakeStore()
+    const deps = { resolveStore: async () => store as never, staging }
+    const params = { uploadRef: 'ref', filename: 'conversations.json' }
+
+    const first = await createImportHandler(deps)(
+      ctxOf(store, staging, params, new AbortController().signal),
+    )
+    const retried = await createImportHandler(deps)(
+      ctxOf(store, staging, params, new AbortController().signal),
+    )
+
+    expect(first.result).toMatchObject({ imported: 1, failed: 0 })
+    expect(retried.result).toMatchObject({ imported: 1, failed: 0 })
+    expect(await store.list()).toEqual([
+      expect.objectContaining({ id: 'n1', sourceLocator: expect.stringMatching(/^v1:claude:/u) }),
+    ])
+    expect(store.writes).toHaveLength(1)
+  })
+
   it('maps a pre-aborted signal to a clean JobAbortedError (cooperative cancel)', async () => {
     const { staging } = stagingFor(CONVERSATIONS)
     const store = fakeStore()
@@ -944,6 +1025,166 @@ describe('createImportHandler (#191)', () => {
       ),
     ).rejects.toBeInstanceOf(JobAbortedError)
     expect(store.writes).toHaveLength(0) // aborted before the first write
+  })
+
+  it('observes cancellation while processing a series of idless record failures', async () => {
+    const idless = JSON.stringify(
+      Array.from({ length: 50 }, (_, index) => ({
+        name: `Missing id ${index}`,
+        chat_messages: [{ sender: 'human', text: `body ${index}` }],
+      })),
+    )
+    const { staging } = stagingFor(idless)
+    const store = fakeStore()
+    const handler = createImportHandler({ resolveStore: async () => store as never, staging })
+    let abortChecks = 0
+    const signal = {
+      get aborted() {
+        abortChecks++
+        return abortChecks >= 4
+      },
+    } as AbortSignal
+
+    await expect(
+      handler(ctxOf(store, staging, { uploadRef: 'ref', filename: 'conversations.json' }, signal)),
+    ).rejects.toBeInstanceOf(JobAbortedError)
+    expect(abortChecks).toBeGreaterThanOrEqual(4)
+    expect(store.writes).toHaveLength(0)
+  })
+
+  it.each([
+    [
+      'Claude projects array',
+      'projects.json',
+      'claude-projects',
+      JSON.stringify([{ uuid: 'empty-project', docs: [] }]),
+    ],
+    [
+      'single Claude project',
+      'projects/empty.json',
+      'claude-projects',
+      JSON.stringify({ uuid: 'empty-project', docs: [] }),
+    ],
+    [
+      'Claude memory',
+      'memories.json',
+      'claude-memory',
+      JSON.stringify([{ account_uuid: 'empty-account' }]),
+    ],
+    [
+      'MCP memory graph',
+      'memory.json',
+      'memory-json',
+      JSON.stringify({ entities: [], relations: [] }),
+    ],
+  ] as const)(
+    'observes cancellation on a zero-output %s record',
+    async (_label, filename, format, raw) => {
+      const { staging } = stagingFor(raw)
+      const store = fakeStore()
+      const handler = createImportHandler({ resolveStore: async () => store as never, staging })
+      const signal = { aborted: true } as AbortSignal
+
+      await expect(
+        handler(ctxOf(store, staging, { uploadRef: 'ref', filename, format }, signal)),
+      ).rejects.toBeInstanceOf(JobAbortedError)
+      expect(store.writes).toHaveLength(0)
+    },
+  )
+
+  it('observes cancellation while scanning zero-output MCP memory records', async () => {
+    const { staging } = stagingFor(Array.from({ length: 20 }, () => '{}').join('\n'))
+    const store = fakeStore()
+    const handler = createImportHandler({ resolveStore: async () => store as never, staging })
+    let abortChecks = 0
+    const signal = {
+      get aborted() {
+        abortChecks++
+        return abortChecks >= 4
+      },
+    } as AbortSignal
+
+    await expect(
+      handler(
+        ctxOf(
+          store,
+          staging,
+          { uploadRef: 'ref', filename: 'memory.jsonl', format: 'memory-json' },
+          signal,
+        ),
+      ),
+    ).rejects.toBeInstanceOf(JobAbortedError)
+    expect(abortChecks).toBeGreaterThanOrEqual(4)
+    expect(store.writes).toHaveLength(0)
+  })
+
+  it('keeps terminal progress at the processed high-water for skip-only records', async () => {
+    const empty = JSON.stringify(
+      Array.from({ length: 200 }, (_, index) => ({
+        uuid: `empty-${index}`,
+        chat_messages: [{ sender: 'human', text: '' }],
+      })),
+    )
+    const { staging } = stagingFor(empty)
+    const store = fakeStore()
+    const handler = createImportHandler({ resolveStore: async () => store as never, staging })
+    const reports: Array<{ done: number; total: number | null; phase: string | null }> = []
+    const context = {
+      ...ctxOf(
+        store,
+        staging,
+        { uploadRef: 'ref', filename: 'conversations.json' },
+        new AbortController().signal,
+      ),
+      report: async (progress: (typeof reports)[number]) => {
+        reports.push({ ...progress })
+      },
+    }
+    const out = await handler(context)
+
+    expect(out.result).toMatchObject({ imported: 0, skipped: 0, failed: 0 })
+    expect(reports.at(-1)).toEqual({ done: 200, total: 200, phase: 'done' })
+    expect(
+      reports.every((report, index) => index === 0 || report.done >= reports[index - 1].done),
+    ).toBe(true)
+  })
+
+  it('never reports below the persisted high-water after a durable reclaim', async () => {
+    const empty = JSON.stringify(
+      Array.from({ length: 300 }, (_, index) => ({
+        uuid: `empty-${index}`,
+        chat_messages: [{ sender: 'human', text: '' }],
+      })),
+    )
+    const { staging } = stagingFor(empty)
+    const store = fakeStore()
+    const handler = createImportHandler({ resolveStore: async () => store as never, staging })
+    const reports: Array<{ done: number; total: number | null; phase: string | null }> = []
+    let reportsAtCheckpoint = -1
+
+    store.checkpoint = async () => {
+      reportsAtCheckpoint = reports.length
+    }
+    const context = {
+      ...ctxOf(
+        store,
+        staging,
+        { uploadRef: 'ref', filename: 'conversations.json' },
+        new AbortController().signal,
+        { progressDone: 250 },
+      ),
+      report: async (progress: (typeof reports)[number]) => {
+        reports.push({ ...progress })
+      },
+    }
+
+    await handler(context)
+
+    expect(reportsAtCheckpoint).toBe(1)
+    expect(reports[0]).toEqual({ done: 250, total: null, phase: 'writing' })
+    expect(reports.length).toBeGreaterThan(1)
+    expect(reports.every((report) => report.done >= 250)).toBe(true)
+    expect(reports.at(-1)).toEqual({ done: 300, total: 300, phase: 'done' })
   })
 
   it('fails loudly when the job carries no uploadRef', async () => {

@@ -57,6 +57,7 @@ type NoteState = {
   muted?: boolean
   /** The author's own frontmatter, as bare YAML lines (#280). */
   frontmatter?: string
+  sourceLocator?: string
   /** Normalised custom slug derived from the author's carried `slug:`. */
   slug?: string
   createdAt: string
@@ -354,6 +355,7 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
         summary: e.summary,
         muted: e.muted,
         frontmatter: e.frontmatter,
+        sourceLocator: e.sourceLocator,
         slug: names.slug,
         createdAt: normDate(e.date),
         modifiedAt: normDate(e.date),
@@ -554,6 +556,7 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
         summary: n.summary,
         muted: n.muted,
         frontmatter: n.frontmatter,
+        sourceLocator: n.sourceLocator,
         aliases: n.aliasesOwned ? n.aliases : undefined,
         legacyNameAliases: n.legacyNameAliases,
         createdAt: n.createdAt,

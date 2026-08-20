@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { FRONTMATTER_BYTE_CAP } from '../libs/markdown'
+import { isPortablePathComponent } from '../libs/path'
 import { detectFormat } from './detect'
 import { parseClaudeDesignChat } from './formats/claudeDesignChat'
 import { ImportError, parseImport } from './importer'
@@ -135,6 +136,7 @@ describe('claude conversations', () => {
     expect(trip.directory).toBe('conversations/claude')
     expect(trip.createdAt).toBe('2024-03-15T14:30:00.000Z')
     expect(trip.source).toBe('claude')
+    expect(trip.sourceLocator).toMatch(/^v1:claude:conversation:/)
     expect(trip.body).toContain('### Human (2024-03-15 14:30:00)')
     expect(trip.body).toContain('Where should we go?')
     expect(trip.body).toContain('### Assistant')
@@ -202,10 +204,31 @@ describe('claude conversations', () => {
 
   it('filenames are deterministic, date-prefixed and source-id-disambiguated', () => {
     const { notes } = parseImport(CLAUDE_CONVERSATIONS)
-    expect(notes[0].fileName).toMatch(/^20240315-planning-the-trip-[a-z0-9]{8}$/)
+    expect(notes[0].fileName).toMatch(/^20240315-planning-the-trip-[a-f0-9]{24}$/)
     // Re-parsing the same export yields identical filenames (idempotent path).
     const again = parseImport(CLAUDE_CONVERSATIONS).notes
     expect(again.map((n) => n.fileName)).toEqual(notes.map((n) => n.fileName))
+  })
+
+  it('keeps valid records around an idless record and reports one explicit failure', () => {
+    const record = (uuid: string | undefined, text: string) => ({
+      uuid,
+      name: text,
+      chat_messages: [{ sender: 'human', text }],
+    })
+    const parsed = parseImport(
+      JSON.stringify([
+        record('valid-a', 'A'),
+        record(undefined, 'Missing'),
+        record('valid-b', 'B'),
+      ]),
+      'claude-conversations',
+    )
+
+    expect(parsed.notes.map((note) => note.title)).toEqual(['A', 'B'])
+    expect(parsed.failures).toEqual([
+      { title: 'Missing', error: 'claude conversation: missing durable uuid' },
+    ])
   })
 })
 
@@ -537,11 +560,11 @@ describe('claude projects', () => {
     expect(format).toBe('claude-projects')
     expect(notes).toHaveLength(2)
     const prompt = notes.find((n) => n.noteType === 'prompt_template')!
-    expect(prompt.directory).toBe('projects/acme-redesign')
+    expect(prompt.directory).toMatch(/^projects\/acme-redesign-[a-f0-9]{24}$/)
     expect(prompt.fileName).toBe('prompt-template')
     expect(prompt.body).toContain('You are a design assistant.')
     const doc = notes.find((n) => n.noteType === 'project_doc')!
-    expect(doc.directory).toBe('projects/acme-redesign/docs')
+    expect(doc.directory).toBe(`${prompt.directory}/docs`)
     expect(doc.title).toBe('brief')
     expect(doc.createdAt).toBe('2024-01-11T09:00:00.000Z')
   })
@@ -555,10 +578,12 @@ describe('claude projects', () => {
     const component = note.directory.split('/')[1]
     expect(new TextEncoder().encode(component)).toHaveLength(255)
     expect(component).toMatch(/-[a-f0-9]{24}$/)
-    expect(parseImport(CLAUDE_PROJECTS).notes[0].directory).toBe('projects/acme-redesign')
+    expect(parseImport(CLAUDE_PROJECTS).notes[0].directory).toMatch(
+      /^projects\/acme-redesign-[a-f0-9]{24}$/,
+    )
   })
 
-  it('keeps the legacy fallback paths for unromanizable projects and docs', () => {
+  it('separates CJK project/doc identities while retaining exact legacy predecessors', () => {
     const data = JSON.stringify([
       {
         uuid: 'project-one',
@@ -577,13 +602,43 @@ describe('claude projects', () => {
     const destinations = notes.map((note) => `${note.directory}/${note.fileName}`)
 
     expect(notes).toHaveLength(4)
-    expect(destinations).toEqual([
+    expect(new Set(destinations).size).toBe(4)
+    expect(notes.every((note) => note.sourceLocator?.startsWith('v1:claude:'))).toBe(true)
+    expect(notes.map((note) => `${note.legacyDirectory}/${note.legacyFileName}`)).toEqual([
       'projects/project/prompt-template',
       'projects/project/docs/doc',
       'projects/project/prompt-template',
       'projects/project/docs/doc',
     ])
-    expect(destinations.filter((path) => path.endsWith('/prompt-template'))).toHaveLength(2)
+    for (const note of notes) {
+      expect(note.directory.split('/').every((part) => isPortablePathComponent(part))).toBe(true)
+      expect(isPortablePathComponent(`${note.fileName}.md`)).toBe(true)
+    }
+  })
+
+  it('reports missing project/doc ids per affected record without dropping valid siblings', () => {
+    const parsed = parseImport(
+      JSON.stringify([
+        {
+          uuid: 'project-ok',
+          name: 'Mixed',
+          prompt_template: 'valid prompt',
+          docs: [
+            { filename: 'missing.md', content: 'missing id' },
+            { uuid: 'doc-ok', filename: 'valid.md', content: 'valid' },
+          ],
+        },
+      ]),
+      'claude-projects',
+    )
+
+    expect(parsed.notes.map((note) => note.title)).toEqual(['Prompt Template: Mixed', 'valid'])
+    expect(parsed.failures).toEqual([
+      {
+        title: 'missing',
+        error: 'claude project document: missing durable project/doc uuid',
+      },
+    ])
   })
 })
 
@@ -609,9 +664,9 @@ describe('claude export — evolved layout (#113)', () => {
     const { format, notes } = parseImport(data)
     expect(format).toBe('claude-projects')
     const prompt = notes.find((n) => n.noteType === 'prompt_template')!
-    expect(prompt.directory).toBe('projects/how-to-use-claude')
+    expect(prompt.directory).toMatch(/^projects\/how-to-use-claude-[a-f0-9]{24}$/)
     const doc = notes.find((n) => n.noteType === 'project_doc')!
-    expect(doc.directory).toBe('projects/how-to-use-claude/docs')
+    expect(doc.directory).toBe(`${prompt.directory}/docs`)
     expect(doc.title).toBe('guide')
   })
 
@@ -661,7 +716,7 @@ describe('claude export — evolved layout (#113)', () => {
     expect(format).toBe('claude-design-chat')
     expect(notes).toHaveLength(1)
     const [n] = notes
-    expect(n.directory).toBe('design-chats/landing-redesign') // grouped under the project
+    expect(n.directory).toMatch(/^projects\/landing-redesign-[a-f0-9]{24}\/design-chats$/)
     expect(n.createdAt).toBe('2024-04-22T23:02:40.000Z')
     expect(n.body).toContain('### User')
     expect(n.body).toContain('need a landing page')
@@ -670,7 +725,7 @@ describe('claude export — evolved layout (#113)', () => {
     expect(n.body.indexOf('need a landing page')).toBeLessThan(n.body.indexOf('here is a draft'))
   })
 
-  it('keeps the legacy project fallback for non-romanised design chats', () => {
+  it('uses distinct source-tagged CJK project groups for design chats', () => {
     const parsed = parseClaudeDesignChat([
       {
         uuid: 'chat-a',
@@ -687,7 +742,8 @@ describe('claude export — evolved layout (#113)', () => {
     ])
 
     expect(parsed.notes).toHaveLength(2)
-    expect(parsed.notes.map((note) => note.directory)).toEqual([
+    expect(new Set(parsed.notes.map((note) => note.directory)).size).toBe(2)
+    expect(parsed.notes.map((note) => note.legacyDirectory)).toEqual([
       'design-chats/project',
       'design-chats/project',
     ])
@@ -704,6 +760,38 @@ describe('claude export — evolved layout (#113)', () => {
     const component = note.directory.split('/')[1]
     expect(new TextEncoder().encode(component)).toHaveLength(255)
     expect(component).toMatch(/-[a-f0-9]{24}$/)
+  })
+
+  it('keeps CON/NUL and no-project design grouping portable', () => {
+    const parsed = parseClaudeDesignChat([
+      {
+        uuid: 'chat-bound',
+        title: 'NUL',
+        project: { uuid: 'project-bound', name: 'CON' },
+        messages: [{ role: 'user', content: 'bound' }],
+      },
+      {
+        uuid: 'chat-display',
+        title: 'NUL',
+        project: { name: 'CON' },
+        messages: [{ role: 'user', content: 'display' }],
+      },
+      {
+        uuid: 'chat-root',
+        title: 'NUL',
+        messages: [{ role: 'user', content: 'root' }],
+      },
+    ])
+
+    expect(parsed.notes.map((note) => note.directory)).toEqual([
+      expect.stringMatching(/^projects\/con-[a-f0-9]{24}\/design-chats$/),
+      expect.stringMatching(/^design-chats\/con-[a-f0-9]{24}$/),
+      'design-chats',
+    ])
+    for (const note of parsed.notes) {
+      expect(note.directory.split('/').every((part) => isPortablePathComponent(part))).toBe(true)
+      expect(isPortablePathComponent(`${note.fileName}.md`)).toBe(true)
+    }
   })
 
   it('design chat: content as an ARRAY of text blocks is extracted', () => {
@@ -923,7 +1011,24 @@ describe('robustness fixes', () => {
       },
     ])
     const fn = parseImport(data).notes[0].fileName
-    expect(fn.length).toBeLessThan(120) // date(8)+'-'+slug(≤80)+'-'+hash(8)
+    expect(new TextEncoder().encode(`${fn}.md`).length).toBeLessThanOrEqual(255)
+  })
+
+  it('separates the known legacy FNV32 collision pair by full source locator hash', () => {
+    const data = JSON.stringify(
+      ['uuid-ct1-cbzpn2-cc028r', 'uuid-f16-fd0o62-fd0dvk'].map((uuid) => ({
+        uuid,
+        name: 'Collision',
+        created_at: '2024-01-01T00:00:00Z',
+        chat_messages: [{ sender: 'human', text: uuid }],
+      })),
+    )
+    const notes = parseImport(data, 'claude-conversations').notes
+
+    expect(notes).toHaveLength(2)
+    expect(notes[0].legacyFileName).toBe(notes[1].legacyFileName)
+    expect(notes[0].fileName).not.toBe(notes[1].fileName)
+    expect(notes[0].sourceLocator).not.toBe(notes[1].sourceLocator)
   })
 
   it('a long NON-LATIN title is capped in BYTES, not characters', () => {
@@ -942,7 +1047,7 @@ describe('robustness fixes', () => {
     expect(new TextEncoder().encode(`${fn}.md`).length).toBeLessThanOrEqual(255)
   })
 
-  it('two idless untitled conversations get distinct filenames (no collision)', () => {
+  it('idless conversations fail per record instead of minting probabilistic identity', () => {
     const data = JSON.stringify([
       {
         name: '',
@@ -975,9 +1080,10 @@ describe('robustness fixes', () => {
         },
       },
     ])
-    const notes = parseImport(data).notes
-    expect(notes).toHaveLength(2)
-    expect(notes[0].fileName).not.toBe(notes[1].fileName)
+    const parsed = parseImport(data)
+    expect(parsed.notes).toHaveLength(0)
+    expect(parsed.failures).toHaveLength(2)
+    expect(parsed.failures.every((failure) => failure.error.includes('missing durable'))).toBe(true)
   })
 })
 

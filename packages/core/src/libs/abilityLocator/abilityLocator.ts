@@ -1,5 +1,6 @@
 import type { AbilityLocator } from '@notarium/contract'
 
+import { decodeUtf8Base64Url, encodeUtf8Base64Url } from '../base64url'
 import { isDurableScalar, isGeneratedNoteId } from '../id'
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -92,41 +93,15 @@ export const parseAbilityLocator = (value: string): AbilityLocator | null => {
   }
 }
 
-const base64url = (bytes: Uint8Array): string => {
-  let binary = ''
-
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte)
-  }
-
-  return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/u, '')
-}
-
-const fromBase64url = (value: string): Uint8Array | null => {
-  if (!/^[A-Za-z0-9_-]+$/u.test(value)) {
-    return null
-  }
-  try {
-    const encoded = value.replaceAll('-', '+').replaceAll('_', '/')
-    const binary = atob(encoded.padEnd(Math.ceil(encoded.length / 4) * 4, '='))
-    return Uint8Array.from(binary, (char) => char.charCodeAt(0))
-  } catch {
-    return null
-  }
-}
-
 export const encodeAbilityLocator = (locator: AbilityLocator): string =>
-  base64url(new TextEncoder().encode(serializeAbilityLocator(locator)))
+  encodeUtf8Base64Url(serializeAbilityLocator(locator))
 
 export const decodeAbilityLocator = (value: string): AbilityLocator | null => {
-  const bytes = fromBase64url(value)
+  const decoded = decodeUtf8Base64Url(value)
 
-  if (!bytes) {
+  if (decoded == null) {
     return null
   }
-  try {
-    return parseAbilityLocator(new TextDecoder('utf-8', { fatal: true }).decode(bytes))
-  } catch {
-    return null
-  }
+
+  return parseAbilityLocator(decoded)
 }

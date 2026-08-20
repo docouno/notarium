@@ -7,9 +7,16 @@
 import { describe, expect, it } from 'vitest'
 
 import type { IdentityRegistry } from '../../../identity'
+import { claudeConversationSourceLocator } from '../../../importer'
 import { noteAlreadyExists, type WriteInput, type WriteResult } from '../../../knowledgeStore'
+import {
+  logicalNoteState,
+  type LogicalNoteState,
+  parseFrontmatterLines,
+} from '../../../libs/markdown'
 import { MutationCoordinator } from '../../../libs/mutationCoordinator'
 import type { RevisionJournal } from '../../../revisionJournal'
+import { IMPORT_SOURCE_FRONTMATTER_KEY } from '../../../sourceIdentity'
 import { trashMutationPath } from '../../consts'
 import { HistorySurface } from './historySurface'
 import type { HistoryHost } from './types'
@@ -24,6 +31,7 @@ type Seed = {
   contentHash?: string | null
   content?: string | null
   lastPath?: string
+  logicalState?: LogicalNoteState
 }
 
 const makeHost = (opts: {
@@ -77,7 +85,11 @@ const makeHost = (opts: {
         return null
       }
 
-      return { ...tombOf(id), content: s.content === undefined ? 'body' : s.content }
+      return {
+        ...tombOf(id),
+        content: s.content === undefined ? 'body' : s.content,
+        logicalState: s.logicalState,
+      }
     },
     drain: async () => {},
     purge: async (ids: string[]) => {
@@ -172,6 +184,30 @@ describe('HistorySurface restore/purge guards', () => {
     expect(calls.writes[0].journal).toMatchObject({ kind: 'restore' })
     expect(calls.reload).toBe(1)
     expect(calls.emitChanged).toEqual([[['n1'], []]]) // reresolve moved an edge
+  })
+
+  it('keeps source provenance in full-state restore input but hides it from deleted note frontmatter', async () => {
+    const locator = claudeConversationSourceLocator('history-source')!
+    const state = logicalNoteState({
+      title: 'Imported',
+      body: 'body',
+      frontmatter: parseFrontmatterLines(`${IMPORT_SOURCE_FRONTMATTER_KEY}: ${locator}\nauthor: S`),
+    })
+    const { trash, calls } = makeHost({
+      seeds: {
+        n1: { title: 'Imported', lastPath: 'imported.md', logicalState: state },
+      },
+    })
+
+    const deleted = await trash.deletedNoteView('n1')
+    expect(deleted?.sourceLocator).toBe(locator)
+    expect(deleted?.frontmatter).toEqual({ author: 'S' })
+
+    await trash.restoreFromTrash('n1')
+    expect(calls.writes[0].frontmatterMode).toBe('replace')
+    expect(calls.writes[0].frontmatter).toEqual(
+      expect.arrayContaining([expect.objectContaining({ key: IMPORT_SOURCE_FRONTMATTER_KEY })]),
+    )
   })
 
   it('restoreTrash restores the good ids and reports per-id failures without aborting the batch', async () => {

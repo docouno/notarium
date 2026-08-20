@@ -82,6 +82,7 @@ import {
   isDurableScalar,
   isDurableText,
   isFolderPageNote,
+  isImportNoteSourceLocator,
   isLegacyImportDestination,
   isPortableMoveDestination,
   isPortablePathComponent,
@@ -158,7 +159,8 @@ import type { EngineMount, NotariumStoreOptions, NoteRow, SearchTuning } from '.
  *  for nothing — O(corpus bytes) of loop-blocking work that stalls every other space.
  *  Bodies are fetched only where genuinely used: the delta's changed upserts and the
  *  graph's wikilink derivation. */
-const NOTE_META_COLS = 'path, title, class, created_at, modified_at, id_claim, aliases, slug, tags'
+const NOTE_META_COLS =
+  'path, title, class, created_at, modified_at, id_claim, source_locator, aliases, slug, tags'
 type NoteMetaRow = Pick<
   NoteRow,
   | 'path'
@@ -167,6 +169,7 @@ type NoteMetaRow = Pick<
   | 'created_at'
   | 'modified_at'
   | 'id_claim'
+  | 'source_locator'
   | 'aliases'
   | 'slug'
   | 'tags'
@@ -2064,7 +2067,7 @@ export class NotariumStore implements KnowledgeStore {
       const updated = await this.sql.run(
         `UPDATE notes SET title = ?, class = ?, mtime_ms = ?, size = ?, modified_at = ?,
                           note_type = ?, created_at = COALESCE(?, created_at),
-                          id_claim = ?, tags = ?, aliases = ?, slug = ?, body = ?, content_hash = ?, seq = ?
+                          id_claim = ?, source_locator = ?, tags = ?, aliases = ?, slug = ?, body = ?, content_hash = ?, seq = ?
          WHERE path = ?`,
         [
           parsed.title,
@@ -2075,6 +2078,7 @@ export class NotariumStore implements KnowledgeStore {
           parsed.noteType ?? DEFAULT_NOTE_TYPE,
           parsed.createdAt,
           parsed.idClaim,
+          parsed.sourceLocator,
           tags,
           aliases,
           slug,
@@ -2087,8 +2091,8 @@ export class NotariumStore implements KnowledgeStore {
 
       if (updated.changes === 0) {
         await this.sql.run(
-          `INSERT INTO notes (path, title, class, mtime_ms, size, created_at, modified_at, note_type, id_claim, tags, aliases, slug, body, content_hash, seq)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO notes (path, title, class, mtime_ms, size, created_at, modified_at, note_type, id_claim, source_locator, tags, aliases, slug, body, content_hash, seq)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             fullPath,
             parsed.title,
@@ -2099,6 +2103,7 @@ export class NotariumStore implements KnowledgeStore {
             modifiedAt,
             parsed.noteType ?? DEFAULT_NOTE_TYPE,
             parsed.idClaim,
+            parsed.sourceLocator,
             tags,
             aliases,
             slug,
@@ -2486,6 +2491,7 @@ export class NotariumStore implements KnowledgeStore {
 
   private metaOf(
     row: Pick<NoteRow, 'path' | 'title' | 'class' | 'modified_at' | 'created_at'> & {
+      source_locator?: string | null
       aliases?: string
       slug?: string | null
       tags?: string
@@ -2497,6 +2503,7 @@ export class NotariumStore implements KnowledgeStore {
       title: row.title,
       class: row.class,
       filePath: row.path,
+      ...(row.source_locator ? { sourceLocator: row.source_locator } : {}),
       ...(row.slug ? { slug: row.slug } : {}), // #100 phase 1: custom slug only
       ...(aliases.length ? { aliases } : {}),
       ...(tags.length ? { tags } : {}),
@@ -2790,6 +2797,7 @@ export class NotariumStore implements KnowledgeStore {
       // identity decorator adopts an external file's notarium-id from here.
       // DocumentState keeps the authored-only projection separately.
       frontmatter: parsed.frontmatter,
+      ...(parsed.sourceLocator ? { sourceLocator: parsed.sourceLocator } : {}),
       logicalState: logicalNoteState({
         title: parsed.title,
         body: parsed.body,
@@ -3507,9 +3515,19 @@ export class NotariumStore implements KnowledgeStore {
     restorePath,
     expectedSource,
     expectedDestinationId,
+    sourceLocator,
   }: WriteInput): Promise<WriteResult> {
     await this.ensureReady()
-    const scalarInputs = [title, directory, noteType, slug, summary, fileName, createdAt]
+    const scalarInputs = [
+      title,
+      directory,
+      noteType,
+      slug,
+      summary,
+      fileName,
+      createdAt,
+      sourceLocator,
+    ]
     const tagInputs = Array.isArray(tags) ? tags : tags != null ? [tags] : []
 
     if (
@@ -3524,7 +3542,8 @@ export class NotariumStore implements KnowledgeStore {
       (id != null && !isValidNoteId(id)) ||
       (originalId != null &&
         !isValidNoteId(originalId) &&
-        decodeWikilinkIdentity(originalId) == null)
+        decodeWikilinkIdentity(originalId) == null) ||
+      (sourceLocator != null && !isImportNoteSourceLocator(sourceLocator))
     ) {
       throw writeFailed('input contains an invalid durable string')
     }
@@ -3860,6 +3879,7 @@ export class NotariumStore implements KnowledgeStore {
       summary,
       muted,
       id: noteId,
+      sourceLocator,
       createdAt,
       frontmatter,
       frontmatterMode,

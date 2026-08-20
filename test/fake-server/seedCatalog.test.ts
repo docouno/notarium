@@ -407,4 +407,38 @@ describe('seed catalog → fake backend (#175)', () => {
       await app.close()
     }
   })
+
+  it('import: source locator and source-less legacy states reach the fake projection', async () => {
+    const world = buildCaseWorld('import', { now: DEFAULT_NOW })
+    const expected = new Map(
+      world.events.flatMap((event) =>
+        event.op === 'create' && event.sourceLocator
+          ? [[event.path, event.sourceLocator] as const]
+          : [],
+      ),
+    )
+    expect(expected.size).toBeGreaterThan(0)
+    const fixture = caseToFixture(world)
+    const snapshots = fixture.spaces.find((space) => space.slug === 'main')!.notes
+
+    for (const [path, locator] of expected) {
+      expect(snapshots.find((note) => note.filePath === path)?.sourceLocator).toBe(locator)
+    }
+    expect(
+      snapshots.find(
+        (note) => note.filePath === 'conversations/claude/20240101-collision-00fax1ug.md',
+      )?.sourceLocator,
+    ).toBeUndefined()
+
+    const app = await createApp(fixture)
+
+    try {
+      const sourceNote = snapshots.find((note) => note.sourceLocator)!
+      const detail = await json(app, `/api/s/main/note?ref=${sourceNote.id}`)
+      expect(detail.frontmatter).not.toHaveProperty('notarium-source')
+      expect(detail).not.toHaveProperty('sourceLocator')
+    } finally {
+      await app.close()
+    }
+  })
 })

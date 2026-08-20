@@ -1,3 +1,4 @@
+import { isImportNoteSourceLocator } from '../../../importer'
 import type {
   AgentWriteAttribution,
   ExistingNote,
@@ -24,15 +25,12 @@ import { IF_EXISTS, REVISION_KIND, STORE_ERROR_REASON } from '../../../knowledge
 import { nextAliasesMulti, normAliases } from '../../../libs/aliases'
 import { freshNoteId, isDurableScalar, isDurableText, isValidNoteId } from '../../../libs/id'
 import {
-  analyzeDocumentState,
   type DocumentState,
-  documentStateVersionToken,
   encodeWikilinkIdentity,
   frontmatterEntryOf,
   frontmatterEntryValue,
   isDurableFrontmatter,
   type LogicalNoteState,
-  logicalNoteStateFromProjection,
   promoteBodyTitle,
   stripFrontmatter,
   stripTitleHeading,
@@ -57,8 +55,10 @@ import { normTags } from '../../../libs/tags'
 import { computeVersionToken } from '../../../libs/versionToken'
 import type { LinkIndex } from '../../../referenceResolver'
 import { derivePreview } from '../../../snippet'
+import { IMPORT_SOURCE_FRONTMATTER_KEY } from '../../../sourceIdentity'
 import { DEFAULT_NOTE_CLASS, isVisibleOn, SURFACE } from '../../../visibility'
 import { TRASH_MUTATION_PREFIX, trashMutationPath } from '../../consts'
+import { exactDocumentState, exactLogicalState, exactVersionToken } from '../exactNoteState'
 import { supportsExactIdentityAddress } from '../innerIdentity'
 import type { WriteHost } from './types'
 
@@ -99,29 +99,6 @@ type RemovalCapture = {
 
 const isCollision = (err: unknown): boolean =>
   (err as { reason?: string }).reason === STORE_ERROR_REASON.noteAlreadyExists
-
-const exactLogicalState = (
-  note: Pick<NoteContent, 'title' | 'content' | 'frontmatter' | 'logicalState'>,
-) =>
-  note.logicalState ??
-  logicalNoteStateFromProjection({
-    title: note.title,
-    body: note.content,
-    frontmatter: note.frontmatter,
-  })
-
-const exactDocumentState = (
-  note: Pick<NoteContent, 'title' | 'content' | 'frontmatter' | 'logicalState' | 'documentState'>,
-): DocumentState =>
-  note.documentState ??
-  analyzeDocumentState({
-    source: new TextEncoder().encode(exactLogicalState(note).markdown),
-    pathFallbackTitle: note.title ?? null,
-  })
-
-const exactVersionToken = (
-  note: Pick<NoteContent, 'title' | 'content' | 'frontmatter' | 'logicalState' | 'documentState'>,
-): string => documentStateVersionToken(exactDocumentState(note))
 
 const legacyAliasesChanged = (
   before: readonly string[] | undefined,
@@ -181,6 +158,14 @@ const assertWriteText = (input: WriteInput): void => {
   ) {
     throw invalidWrite('restore path must be a canonical Markdown file path')
   }
+  if (
+    input.legacyPredecessorPath != null &&
+    (!isDurableText(input.legacyPredecessorPath) ||
+      !isCanonicalSafeRelativeAddress(input.legacyPredecessorPath) ||
+      !input.legacyPredecessorPath.endsWith('.md'))
+  ) {
+    throw invalidWrite('legacy predecessor path must be a canonical Markdown file path')
+  }
   for (const [name, value] of [
     ['id', input.id],
     ['original id', input.originalId],
@@ -201,6 +186,12 @@ const linkTargetPrefix = (targetId: string): string =>
   `\u0000graph-target/${targetId.length}:${targetId}\u0000`
 const linkTargetPath = (targetId: string, sourceKey: string): string =>
   `${linkTargetPrefix(targetId)}/${sourceKey.length}:${sourceKey}\u0000`
+
+// A source locator is an import identity, not a note id or a storage path. It is
+// still a process-local mutation resource: two fresh creates of one source must
+// serialize even when mutable display fields choose different canonical paths.
+const sourceLocatorResource = (locator: string): string =>
+  `\u0000import-source/${locator.length}:${locator}\u0000`
 
 /** The read-model write path: the ONE chokepoint every mutation funnels
  *  through (REST/MCP/import/e2e fake) — title-as-projection, soft-slug, fair id/path/prefix
@@ -513,10 +504,15 @@ export class WriteEngine {
     }
 
     return {
+      resources:
+        !input.originalId && input.sourceLocator
+          ? [sourceLocatorResource(input.sourceLocator)]
+          : undefined,
       noteIds: [input.originalId, input.id, this.host.identity.idFor(predictedPath)],
       paths: [
         currentPath,
         predictedPath,
+        input.legacyPredecessorPath,
         ...linkedTargetIds.map((targetId) => linkTargetPath(targetId, sourceKey)),
       ],
     }
@@ -556,6 +552,33 @@ export class WriteEngine {
         throw destinationOwnerConflict(
           predictedPath,
           owner ? `is owned by ${owner}, not ${input.expectedDestinationId}` : 'no longer exists',
+        )
+      }
+    }
+    if (!input.originalId && input.sourceLocator) {
+      const owner = this.host.snap.notes
+        .idsWithSourceLocator(input.sourceLocator)
+        .find((id) => id !== input.id)
+
+      if (owner) {
+        throw destinationOwnerConflict(predictedPath, `source locator is already owned by ${owner}`)
+      }
+    }
+    if (!input.originalId && input.legacyPredecessorPath) {
+      const sourceLessPredecessor = this.host.snap.notes
+        .idsAt(input.legacyPredecessorPath)
+        .map((id) => this.host.snap.notes.get(id))
+        .find(
+          (meta) =>
+            meta != null &&
+            meta.filePath === input.legacyPredecessorPath &&
+            meta.sourceLocator === undefined,
+        )
+
+      if (sourceLessPredecessor) {
+        throw destinationOwnerConflict(
+          input.legacyPredecessorPath,
+          `contains a source-less legacy predecessor (${sourceLessPredecessor.id ?? 'unknown id'})`,
         )
       }
     }
@@ -1865,6 +1888,9 @@ export class WriteEngine {
     const incomingTags = input.frontmatter
       ? frontmatterEntryOf(input.frontmatter, 'tags')
       : undefined
+    const incomingSourceLocator = input.frontmatter
+      ? frontmatterEntryOf(input.frontmatter, IMPORT_SOURCE_FRONTMATTER_KEY)
+      : undefined
     const incomingSlugValue = incomingSlug && frontmatterEntryValue(incomingSlug)
     const replacing = input.frontmatterMode === 'replace'
     const carriedAliases =
@@ -1918,6 +1944,16 @@ export class WriteEngine {
           ? []
           : prev?.tags
     const tags = input.tags === undefined ? carriedTags : (normTags(input.tags) ?? [])
+    const rawSourceLocator = incomingSourceLocator
+      ? frontmatterEntryValue(incomingSourceLocator)
+      : undefined
+    const sourceLocator =
+      input.sourceLocator ??
+      (replacing
+        ? isImportNoteSourceLocator(rawSourceLocator)
+          ? rawSourceLocator
+          : undefined
+        : prev?.sourceLocator)
     this.host.snap.notes.set(id, {
       id,
       title: input.title,
@@ -1929,6 +1965,7 @@ export class WriteEngine {
           ? { legacyNameAliases: [...rec.legacyNameAliases] }
           : {}),
       ...(tags?.length ? { tags } : {}),
+      ...(sourceLocator ? { sourceLocator } : {}),
       // Class is mount-derived and AUTHORITATIVE from the write result — no optimistic guess, so an
       // edit of a hidden note never briefly flips to user-doc. Falls back to prior/targetClass only
       // for an engine that doesn't report it.

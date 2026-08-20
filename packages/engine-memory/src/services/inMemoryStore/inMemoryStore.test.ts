@@ -2,10 +2,12 @@ import { describe, expect, it } from 'vitest'
 import { parse as parseYaml } from 'yaml'
 
 import {
+  claudeConversationSourceLocator,
   DOCUMENT_ROLE,
   DOCUMENT_STATE_FORMAT,
   documentStateVersionToken,
   FRONTMATTER_BYTE_CAP,
+  IMPORT_SOURCE_FRONTMATTER_KEY,
   parseFrontmatterLines,
 } from '@notarium/core'
 
@@ -18,6 +20,60 @@ const exportText = (content: string | Uint8Array): string =>
   typeof content === 'string' ? content : new TextDecoder().decode(content)
 
 const frontmatter = (yaml: string) => parseFrontmatterLines(yaml)
+
+describe('InMemoryStore import source provenance', () => {
+  const locator = claudeConversationSourceLocator('conversation-一')!
+
+  it('keeps typed provenance internal, strips fresh spoofing and exports file truth', async () => {
+    const store = new InMemoryStore({ space: 'main', notes: [] })
+    const created = await store.write({
+      title: 'Imported',
+      content: 'body',
+      sourceLocator: locator,
+      frontmatter: [
+        { key: IMPORT_SOURCE_FRONTMATTER_KEY, lines: [`${IMPORT_SOURCE_FRONTMATTER_KEY}: spoof`] },
+      ],
+    })
+    const read = await store.read(created.id!)
+
+    expect(read.sourceLocator).toBe(locator)
+    expect(read.frontmatter).not.toHaveProperty(IMPORT_SOURCE_FRONTMATTER_KEY)
+    expect((await store.list())[0].sourceLocator).toBe(locator)
+    let exported
+
+    for await (const entry of store.exportNotes()) {
+      exported = entry
+      break
+    }
+
+    if (!exported) {
+      throw new Error('source-tagged note was not exported')
+    }
+    expect(exportText(exported.content)).toContain(`${IMPORT_SOURCE_FRONTMATTER_KEY}: ${locator}`)
+  })
+
+  it('indexes a canonical direct-file claim but not an invalid one', async () => {
+    const store = new InMemoryStore({
+      space: 'main',
+      notes: [
+        {
+          title: 'Direct',
+          filePath: 'direct.md',
+          frontmatter: `${IMPORT_SOURCE_FRONTMATTER_KEY}: ${locator}`,
+        },
+        {
+          title: 'Invalid',
+          filePath: 'invalid.md',
+          frontmatter: `${IMPORT_SOURCE_FRONTMATTER_KEY}: authored`,
+        },
+      ],
+    })
+    const notes = await store.list()
+
+    expect(notes.find((note) => note.filePath === 'direct.md')?.sourceLocator).toBe(locator)
+    expect(notes.find((note) => note.filePath === 'invalid.md')?.sourceLocator).toBeUndefined()
+  })
+})
 
 describe('InMemoryStore legacy-name evidence', () => {
   it('keeps an inferred alias across an exact move, delete and forced restore', async () => {

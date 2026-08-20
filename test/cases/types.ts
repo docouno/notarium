@@ -444,6 +444,9 @@ export type CaseEvent = (
        *  fixture is a snapshot, not a replayed write). Both must land the SAME note.
        *  canon: docs/seeds.md */
       frontmatter?: string
+      /** Canonical future-import provenance projected into file truth by both
+       * seed appliers. Omit deliberately for a source-less legacy state. */
+      sourceLocator?: string
       /** Journal attribution (#12): `user:<name>` | `pat:<name>:<id>` | `ui`. */
       principal?: string
     }

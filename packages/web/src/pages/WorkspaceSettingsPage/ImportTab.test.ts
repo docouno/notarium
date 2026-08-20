@@ -69,6 +69,7 @@ vi.mock('../../services/api', async (importOriginal) => ({
 
 import { ApiError, type ImportProgressLine, JOB_POLL_MS } from '../../services/api'
 import { ImportTab } from './ImportTab'
+import { useImportJob } from './useImportJob'
 
 ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
@@ -661,6 +662,69 @@ describe('ImportTab', () => {
 
     expect(testId('import-error')?.textContent).toContain('the archive ended early')
     expect(testId('import-summary')?.textContent).toContain('3')
+  })
+
+  it('keeps processed high-water in terminal synchronous jobs and resets it per run', async () => {
+    let hook!: ReturnType<typeof useImportJob>
+    let reachedProgress!: () => void
+    const progress = new Promise<void>((resolve) => {
+      reachedProgress = resolve
+    })
+
+    const Probe = () => {
+      hook = useImportJob('main')
+      return null
+    }
+
+    harness.api.importStart
+      .mockResolvedValueOnce({
+        mode: 'sync',
+        run: async (onProgress) => {
+          onProgress({ imported: 0, done: 200, phase: 'writing' })
+          return { imported: 0, skipped: 0, failed: 0, files: [], errors: [] }
+        },
+      })
+      .mockResolvedValueOnce({
+        mode: 'sync',
+        run: async (onProgress) => {
+          onProgress({ imported: 3, done: 150, phase: 'writing' })
+          const err = new ApiError('partial')
+
+          err.partial = { imported: 3, skipped: 0, failed: 1, files: [], errors: [] }
+          throw err
+        },
+      })
+      .mockImplementationOnce(async (_space, _source, _opts, signal) => ({
+        mode: 'sync',
+        run: async (onProgress) => {
+          onProgress({ imported: 0, done: 90, phase: 'writing' })
+          reachedProgress()
+
+          return await new Promise<ImportSummary>((_resolve, reject) => {
+            signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+          })
+        },
+      }))
+    await act(async () => root.render(createElement(Probe)))
+    const source = { kind: 'file' as const, file: new File(['zip'], 'vault.zip') }
+
+    await act(async () => hook.start(source, {}))
+    expect(hook.job).toMatchObject({ status: 'succeeded', progress: { done: 200 } })
+
+    await act(async () => hook.start(source, {}))
+    expect(hook.job).toMatchObject({ status: 'failed', progress: { done: 150 } })
+
+    let canceled!: Promise<void>
+
+    act(() => {
+      canceled = hook.start(source, {})
+    })
+    await act(async () => progress)
+    await act(async () => {
+      await hook.cancel()
+      await canceled
+    })
+    expect(hook.job).toMatchObject({ status: 'canceled', progress: { done: 90 } })
   })
 
   it('uploads one selected folder tree with its root wrapper and explicit skip policy', async () => {

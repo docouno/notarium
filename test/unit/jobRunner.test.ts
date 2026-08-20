@@ -18,7 +18,7 @@ import {
 } from '../../packages/server/src/apps/server/consumers/jobRunner'
 import type { ArtifactStore } from '../../packages/server/src/libs/artifactStore'
 import { SqliteMetaDb } from '../../packages/server/src/services/metaDb/sqliteMetaDb'
-import type { JobRecord } from '../../packages/server/src/services/metaDb/types'
+import type { JobRecord, JobsPersistence } from '../../packages/server/src/services/metaDb/types'
 
 // These tests drive the runner over REAL timers (poll/heartbeat/backoff), so give the
 // whole file headroom above vitest's 5s default — under a fully parallel suite the timers
@@ -105,12 +105,13 @@ describe('createJobRunner (#105)', () => {
     handlers: Record<string, JobHandler>,
     over: Partial<Parameters<typeof createJobRunner>[0]> = {},
     artifacts = makeArtifacts(),
+    wrapJobs?: (jobs: JobsPersistence) => JobsPersistence,
   ) => {
     const db = new SqliteMetaDb(':memory:')
     dbs.push(db)
     const updates: JobRecord[] = []
     const runner = createJobRunner({
-      jobs: db.jobs,
+      jobs: wrapJobs?.(db.jobs) ?? db.jobs,
       artifacts,
       handlers,
       onUpdate: (j) => updates.push(j),
@@ -289,6 +290,260 @@ describe('createJobRunner (#105)', () => {
     const j = await db.jobs.get('j1')
     expect(j?.status).toBe('running') // still the peer's
     expect(j?.lockedBy).toBe('lease-PEER') // original run didn't clobber it
+  })
+
+  it('keeps persisted and emitted progress aligned when a retry clears a stale total', async () => {
+    let reported!: () => void
+    const writing = new Promise<void>((resolve) => {
+      reported = resolve
+    })
+    let finish!: () => void
+    const finished = new Promise<void>((resolve) => {
+      finish = resolve
+    })
+
+    const handler: JobHandler = async (ctx) => {
+      await ctx.report({ done: 250, total: null, phase: 'writing' })
+      reported()
+      await finished
+      await ctx.report({ done: 300, total: 300, phase: 'done' })
+      return { result: { imported: 0 } }
+    }
+    const { db, runner, updates } = setup({ import: handler })
+
+    await enqueue(db, { kind: 'import' })
+    await db.jobs.claimNext('lease-old', ['import'], new Date().toISOString())
+    await db.jobs.heartbeat('j1', 'lease-old', {
+      done: 250,
+      total: 250,
+      phase: 'done',
+      now: new Date().toISOString(),
+    })
+    await db.jobs.release('j1', 'lease-old', new Date().toISOString())
+    runner.start()
+    runner.wake()
+    await writing
+
+    expect(await db.jobs.get('j1')).toMatchObject({
+      status: 'running',
+      progressDone: 250,
+      progressTotal: null,
+      phase: 'writing',
+    })
+    expect(updates.at(-1)).toMatchObject({
+      progressDone: 250,
+      progressTotal: null,
+      phase: 'writing',
+    })
+
+    finish()
+    await waitFor(async () => (await db.jobs.get('j1'))?.status === 'succeeded')
+  })
+
+  it('serializes a periodic heartbeat before a newer handler report', async () => {
+    const setIntervalSpy = vi.spyOn(globalThis, 'setInterval')
+    let firstReported!: () => void
+    const first = new Promise<void>((resolve) => {
+      firstReported = resolve
+    })
+    let continueRun!: () => void
+    const continued = new Promise<void>((resolve) => {
+      continueRun = resolve
+    })
+    let newerReported!: () => void
+    const newer = new Promise<void>((resolve) => {
+      newerReported = resolve
+    })
+    let finish!: () => void
+    const finished = new Promise<void>((resolve) => {
+      finish = resolve
+    })
+    let delayNext = false
+    let oldEntered!: () => void
+    const entered = new Promise<void>((resolve) => {
+      oldEntered = resolve
+    })
+    let releaseOld!: () => void
+    const release = new Promise<void>((resolve) => {
+      releaseOld = resolve
+    })
+    let oldFinished!: () => void
+    const oldDone = new Promise<void>((resolve) => {
+      oldFinished = resolve
+    })
+
+    const handler: JobHandler = async (ctx) => {
+      await ctx.report({ done: 100, total: 300, phase: 'writing' })
+      firstReported()
+      await continued
+      await ctx.report({ done: 200, total: 300, phase: 'writing' })
+      newerReported()
+      await finished
+      return { result: { imported: 0 } }
+    }
+    const { db, runner, updates } = setup({ import: handler }, {}, makeArtifacts(), (jobs) => ({
+      ...jobs,
+      heartbeat: async (...args) => {
+        if (delayNext) {
+          delayNext = false
+          oldEntered()
+          await release
+          const result = await jobs.heartbeat(...args)
+
+          oldFinished()
+          return result
+        }
+
+        return await jobs.heartbeat(...args)
+      },
+    }))
+
+    await enqueue(db, { kind: 'import' })
+    runner.start()
+    runner.wake()
+    await first
+    const heartbeatTick = setIntervalSpy.mock.calls.find(([, delay]) => delay === 20_000)?.[0]
+
+    expect(heartbeatTick).toBeDefined()
+    delayNext = true
+    heartbeatTick!()
+    await entered
+    continueRun()
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    releaseOld()
+    await Promise.all([oldDone, newer])
+
+    expect(await db.jobs.get('j1')).toMatchObject({
+      status: 'running',
+      progressDone: 200,
+      progressTotal: 300,
+      phase: 'writing',
+    })
+    expect(updates.at(-1)).toMatchObject({ progressDone: 200, progressTotal: 300 })
+
+    finish()
+    await waitFor(async () => (await db.jobs.get('j1'))?.status === 'succeeded')
+  })
+
+  it('recovers the heartbeat tail after a periodic write rejects', async () => {
+    const setIntervalSpy = vi.spyOn(globalThis, 'setInterval')
+    const logs: string[] = []
+    let firstReported!: () => void
+    const first = new Promise<void>((resolve) => {
+      firstReported = resolve
+    })
+    let continueRun!: () => void
+    const continued = new Promise<void>((resolve) => {
+      continueRun = resolve
+    })
+    let reportOutcome!: (outcome: 'resolved' | 'rejected') => void
+    const outcome = new Promise<'resolved' | 'rejected'>((resolve) => {
+      reportOutcome = resolve
+    })
+    let finish!: () => void
+    const finished = new Promise<void>((resolve) => {
+      finish = resolve
+    })
+    let rejectNext = false
+    let rejectedEntered!: () => void
+    const entered = new Promise<void>((resolve) => {
+      rejectedEntered = resolve
+    })
+    let releaseRejected!: () => void
+    const release = new Promise<void>((resolve) => {
+      releaseRejected = resolve
+    })
+
+    const handler: JobHandler = async (ctx) => {
+      await ctx.report({ done: 100, total: 300, phase: 'writing' })
+      firstReported()
+      await continued
+      try {
+        await ctx.report({ done: 200, total: 300, phase: 'writing' })
+        reportOutcome('resolved')
+      } catch (error) {
+        reportOutcome('rejected')
+        throw error
+      }
+      await finished
+      return { result: { imported: 0 } }
+    }
+    const { db, runner } = setup(
+      { import: handler },
+      { log: (message) => logs.push(message) },
+      makeArtifacts(),
+      (jobs) => ({
+        ...jobs,
+        heartbeat: async (...args) => {
+          if (rejectNext) {
+            rejectNext = false
+            rejectedEntered()
+            await release
+            throw new Error('periodic heartbeat failed')
+          }
+
+          return await jobs.heartbeat(...args)
+        },
+      }),
+    )
+
+    await enqueue(db, { kind: 'import' })
+    runner.start()
+    runner.wake()
+    await first
+    const heartbeatTick = setIntervalSpy.mock.calls.find(([, delay]) => delay === 20_000)?.[0]
+
+    expect(heartbeatTick).toBeDefined()
+    rejectNext = true
+    heartbeatTick!()
+    await entered
+    continueRun()
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    releaseRejected()
+
+    expect(await outcome).toBe('resolved')
+    await waitFor(() => logs.includes('heartbeat j1 failed'))
+    expect(await db.jobs.get('j1')).toMatchObject({
+      status: 'running',
+      progressDone: 200,
+      progressTotal: 300,
+    })
+
+    finish()
+    await waitFor(async () => (await db.jobs.get('j1'))?.status === 'succeeded')
+  })
+
+  it('propagates a report heartbeat rejection into the job retry', async () => {
+    let runs = 0
+    let rejectNext = true
+
+    const handler: JobHandler = async (ctx) => {
+      runs++
+      await ctx.report({ done: runs, phase: 'writing' })
+      return { result: { runs } }
+    }
+    const { db, runner } = setup({ import: handler }, {}, makeArtifacts(), (jobs) => ({
+      ...jobs,
+      heartbeat: async (...args) => {
+        if (rejectNext) {
+          rejectNext = false
+          throw new Error('report heartbeat failed')
+        }
+
+        return await jobs.heartbeat(...args)
+      },
+    }))
+
+    await enqueue(db, { kind: 'import', maxAttempts: 2 })
+    runner.start()
+    runner.wake()
+    await waitFor(async () => (await db.jobs.get('j1'))?.status === 'succeeded')
+
+    expect(runs).toBe(2)
+    expect(await db.jobs.get('j1')).toMatchObject({
+      progressDone: 2,
+      result: { runs: 2 },
+    })
   })
 
   it('artifact GC removes an expired file then clears its pointer', async () => {

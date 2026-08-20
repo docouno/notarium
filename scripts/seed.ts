@@ -906,6 +906,7 @@ const run = async (): Promise<void> => {
           // importer uses, so a seeded "imported note" carries its keys the way a
           // really-dropped file does rather than by a seeder-only shortcut.
           frontmatter: e.frontmatter ? parseFrontmatterLines(e.frontmatter) : undefined,
+          sourceLocator: e.sourceLocator,
           createdAt: normDate(e.date),
           principal: remapPrincipal(e.principal),
           ...(agent ? { agent } : {}),

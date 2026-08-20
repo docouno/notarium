@@ -75,11 +75,8 @@ export const cappedSlug = (s: string, max = 80): string =>
 export const importerDirectorySlug = (s: string): string =>
   boundNameToBytes(legacyImportSlug(s), IMPORT_DIRECTORY_MAX_BYTES)
 
-/** Deterministic filename (sans `.md`) for a conversation:
- *  `<YYYYMMDD>-<slug(title)>-<hash8(sourceId)>`. The date prefix groups
- *  chronologically and the source-id hash makes re-import idempotent. The 32-bit
- *  suffix is not a proof of uniqueness; one streamed run fails closed if two
- *  different source records still claim the same final storage key. */
+/** Exact pre-source-locator conversation basename. New source-aware notes use
+ * `sourceNoteFileName`; this survives only as legacy predecessor evidence. */
 export const convoFileName = (title: string, iso: string | null, sourceId: string): string => {
   const date = datePrefix(iso)
   return `${date ? `${date}-` : ''}${cappedSlug(title) || 'untitled'}-${shortHash(sourceId)}`
