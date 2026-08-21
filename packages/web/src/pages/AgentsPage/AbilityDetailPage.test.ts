@@ -7,12 +7,22 @@ import type { AgentAbilityDetailResponse, OwnedAbilityLocator } from '@notarium/
 import { encodeAbilityLocator } from '@notarium/core'
 import { loadRecentNotes } from '../../libs/recentNotes'
 import { agentAbilityRoute } from '../../libs/routing/routePaths'
+import type { CatalogAbilityAddDialog as CatalogAbilityAddDialogComponent } from './CatalogAbilityAddDialog'
 
 type MenuProps = {
   addVersion?: Array<{ label: string; onClick: () => void }>
+  busy: boolean
   onAdd?: () => void
   onDelete?: () => void
   onToggle?: (enabled: boolean) => void
+}
+
+type DialogProps = {
+  name: string
+  install?:
+    | { personal: boolean; projects: Record<string, boolean> }
+    | { personal: boolean; spaces: Record<string, boolean> }
+  onAdd: (input: unknown) => Promise<void>
 }
 
 const harness = vi.hoisted(() => ({
@@ -23,6 +33,13 @@ const harness = vi.hoisted(() => ({
     agentAbilityCreateVersion: vi.fn(),
     agentAbilitySetEnabled: vi.fn(),
     agentRoleAddExact: vi.fn(),
+    // The Add dialog asks the role library which targets this host can publish to.
+    // A default that answers "none" would close the dialog's destinations and the
+    // cases below would never reach the write they are about.
+    agentRolesGet: vi.fn().mockResolvedValue({
+      projects: [],
+      installAvailability: { personal: true, projects: {} },
+    }),
     noteRemove: vi.fn(),
   },
   // The section's reload key. Held by the HARNESS, not minted inside the mock factory:
@@ -46,7 +63,7 @@ const harness = vi.hoisted(() => ({
   // The kebab is a menu of callbacks; the tests below take the ones the page hands it
   // rather than opening it, which is the menu's own test.
   menu: null as MenuProps | null,
-  dialog: null as { onAdd: (input: unknown) => Promise<void> } | null,
+  dialog: null as DialogProps | null,
   inventory: { projects: [] } as {
     projects: Array<{ id: string; displayName: string; handle: string; space: string }>
   },
@@ -96,15 +113,47 @@ vi.mock('./AgentsPanel', () => ({ AgentsPanel: () => null }))
 vi.mock('./AbilityActionsMenu', () => ({
   AbilityActionsMenu: (props: MenuProps) => {
     harness.menu = props
-    return null
+    if (!props.onAdd) {
+      return null
+    }
+
+    return createElement(
+      'button',
+      {
+        type: 'button',
+        disabled: props.busy,
+        'data-testid': 'catalog-add-action',
+        onClick: props.onAdd,
+      },
+      'Add',
+    )
   },
 }))
-vi.mock('./CatalogAbilityAddDialog', () => ({
-  CatalogAbilityAddDialog: (props: { onAdd: (input: unknown) => Promise<void> }) => {
-    harness.dialog = props
-    return null
-  },
-}))
+vi.mock('./CatalogAbilityAddDialog', async (importOriginal) => {
+  const actual = await importOriginal<{
+    CatalogAbilityAddDialog: typeof CatalogAbilityAddDialogComponent
+  }>()
+
+  return {
+    ...actual,
+    CatalogAbilityAddDialog: (props: DialogProps) => {
+      useLayoutEffect(() => {
+        harness.dialog = props
+
+        return () => {
+          if (harness.dialog === props) {
+            harness.dialog = null
+          }
+        }
+      }, [props])
+
+      return createElement(
+        actual.CatalogAbilityAddDialog,
+        props as Parameters<typeof actual.CatalogAbilityAddDialog>[0],
+      )
+    },
+  }
+})
 vi.mock('react-router', async () => {
   const { createElement: h } = await import('react')
 
@@ -154,15 +203,16 @@ const detailOf = (packageId: string, title = packageId): AgentAbilityDetailRespo
     truncated: false,
   }) as unknown as AgentAbilityDetailResponse
 
-const CATALOG_LOCATOR = { source: 'catalog', kind: 'role', packageId: 'CatalogRole1' } as const
+const catalogLocatorOf = (packageId: string) =>
+  ({ source: 'catalog', kind: 'role', packageId }) as const
 
-const catalogDetail = () =>
+const catalogDetail = (packageId = 'CatalogRole1') =>
   ({
     ability: {
       source: 'catalog',
-      locator: CATALOG_LOCATOR,
-      title: 'Catalog role',
-      name: 'CatalogRole1',
+      locator: catalogLocatorOf(packageId),
+      title: packageId,
+      name: packageId,
       description: 'From the catalog',
       instructions: 'body',
     },
@@ -222,6 +272,10 @@ describe('the ability page', () => {
     harness.api.agentAbilityCreateVersion.mockReset()
     harness.api.agentAbilitySetEnabled.mockReset().mockResolvedValue(undefined)
     harness.api.agentRoleAddExact.mockReset()
+    harness.api.agentRolesGet.mockReset().mockResolvedValue({
+      projects: [],
+      installAvailability: { personal: true, projects: {} },
+    })
     harness.api.noteRemove.mockReset().mockResolvedValue(undefined)
     harness.navigate.mockReset()
     harness.invalidate.mockReset()
@@ -678,6 +732,213 @@ describe('the ability page', () => {
     expect(harness.navigate).toHaveBeenCalledWith(agentAbilityRoute(locatorOf('Adopted12345')), {
       replace: true,
     })
+  })
+
+  it('keeps a newer Add dialog when a stale write succeeds and its refusal is retryable', async () => {
+    const addedA = deferred<{ locator: OwnedAbilityLocator }>()
+    const adoptedB = locatorOf('AdoptedRoleB')
+
+    harness.api.agentAbilityGet.mockImplementation(async (at: { packageId: string }) =>
+      catalogDetail(at.packageId),
+    )
+    harness.api.agentRoleAddExact
+      .mockReturnValueOnce(addedA.promise)
+      .mockRejectedValueOnce(
+        Object.assign(new Error('unstable server detail'), {
+          reason: 'role_install_unavailable',
+        }),
+      )
+      .mockResolvedValueOnce({ locator: adoptedB })
+
+    harness.params = { packageId: 'CatalogRoleA' }
+    await render({ expectedSource: 'catalog' })
+    await act(async () => harness.menu!.onAdd?.())
+    await act(async () => {
+      document
+        .querySelector<HTMLButtonElement>('[data-testid="catalog-ability-add-dialog-submit"]')!
+        .click()
+    })
+
+    harness.params = { packageId: 'CatalogRoleB' }
+    await render({ expectedSource: 'catalog' })
+    await act(async () => harness.menu!.onAdd?.())
+
+    expect(harness.dialog).toMatchObject({ name: 'CatalogRoleB' })
+
+    await act(async () => {
+      addedA.resolve({ locator: locatorOf('AdoptedRoleA') })
+      await addedA.promise
+    })
+
+    expect(harness.invalidate).toHaveBeenCalledWith('roles')
+    expect(harness.navigate).not.toHaveBeenCalled()
+    expect(harness.dialog).toMatchObject({ name: 'CatalogRoleB' })
+    expect(document.querySelector('[data-testid="catalog-ability-add-dialog"]')).not.toBeNull()
+
+    const submitB = document.querySelector<HTMLButtonElement>(
+      '[data-testid="catalog-ability-add-dialog-submit"]',
+    )!
+    await act(async () => submitB.click())
+
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain(
+      'This host cannot install packages in that location. Reload and try again.',
+    )
+    expect(harness.dialog).toMatchObject({ name: 'CatalogRoleB' })
+    expect(submitB.disabled).toBe(false)
+
+    await act(async () => submitB.click())
+
+    expect(harness.api.agentRoleAddExact).toHaveBeenCalledTimes(3)
+    expect(harness.dialog).toBeNull()
+    expect(harness.navigate).toHaveBeenCalledWith(agentAbilityRoute(adoptedB), { replace: true })
+  })
+
+  it('keeps Add availability with the latest catalog address when reads finish out of order', async () => {
+    const roleLibraryA = deferred<{
+      projects: []
+      installAvailability: { personal: boolean; projects: Record<string, boolean> }
+    }>()
+    const roleLibraryB = deferred<{
+      projects: []
+      installAvailability: { personal: boolean; projects: Record<string, boolean> }
+    }>()
+    const installA = { personal: false, projects: { alpha: true } }
+    const installB = { personal: true, projects: { beta: true } }
+
+    harness.api.agentAbilityGet.mockImplementation(async (at: { packageId: string }) =>
+      catalogDetail(at.packageId),
+    )
+    harness.api.agentRolesGet
+      .mockReturnValueOnce(roleLibraryA.promise)
+      .mockReturnValueOnce(roleLibraryB.promise)
+
+    harness.params = { packageId: 'CatalogRoleA' }
+    await render({ expectedSource: 'catalog' })
+    await act(async () => harness.menu!.onAdd?.())
+
+    expect(harness.api.agentRolesGet).toHaveBeenCalledTimes(1)
+
+    harness.params = { packageId: 'CatalogRoleB' }
+    await render({ expectedSource: 'catalog' })
+    await act(async () => harness.menu!.onAdd?.())
+
+    expect(harness.api.agentRolesGet).toHaveBeenCalledTimes(2)
+
+    await act(async () => {
+      roleLibraryB.resolve({ projects: [], installAvailability: installB })
+      await roleLibraryB.promise
+    })
+
+    expect(harness.dialog).toMatchObject({ name: 'CatalogRoleB', install: installB })
+
+    await act(async () => {
+      roleLibraryA.resolve({ projects: [], installAvailability: installA })
+      await roleLibraryA.promise
+    })
+
+    expect(harness.dialog).toMatchObject({ name: 'CatalogRoleB', install: installB })
+  })
+
+  it('keeps Add availability with the newest generation after an ABA walk', async () => {
+    const roleLibraryA1 = deferred<{
+      projects: []
+      installAvailability: { personal: boolean; projects: Record<string, boolean> }
+    }>()
+    const roleLibraryA2 = deferred<{
+      projects: []
+      installAvailability: { personal: boolean; projects: Record<string, boolean> }
+    }>()
+    const installA1 = { personal: false, projects: { stale: true } }
+    const installA2 = { personal: true, projects: { current: true } }
+
+    harness.api.agentAbilityGet.mockImplementation(async (at: { packageId: string }) =>
+      catalogDetail(at.packageId),
+    )
+    harness.api.agentRolesGet
+      .mockReturnValueOnce(roleLibraryA1.promise)
+      .mockReturnValueOnce(roleLibraryA2.promise)
+
+    harness.params = { packageId: 'CatalogRoleA' }
+    await render({ expectedSource: 'catalog' })
+    await act(async () => harness.menu!.onAdd?.())
+
+    harness.params = { packageId: 'CatalogRoleB' }
+    await render({ expectedSource: 'catalog' })
+    harness.params = { packageId: 'CatalogRoleA' }
+    await render({ expectedSource: 'catalog' })
+    await act(async () => harness.menu!.onAdd?.())
+
+    await act(async () => {
+      roleLibraryA2.resolve({ projects: [], installAvailability: installA2 })
+      await roleLibraryA2.promise
+    })
+
+    expect(harness.dialog).toMatchObject({ name: 'CatalogRoleA', install: installA2 })
+
+    await act(async () => {
+      roleLibraryA1.resolve({ projects: [], installAvailability: installA1 })
+      await roleLibraryA1.promise
+    })
+
+    expect(harness.dialog).toMatchObject({ name: 'CatalogRoleA', install: installA2 })
+  })
+
+  it('keeps the Add action busy until the newest same-address read settles', async () => {
+    const roleLibraryA1 = deferred<{
+      projects: []
+      installAvailability: { personal: boolean; projects: Record<string, boolean> }
+    }>()
+    const roleLibraryA2 = deferred<{
+      projects: []
+      installAvailability: { personal: boolean; projects: Record<string, boolean> }
+    }>()
+    const installA1 = { personal: false, projects: { stale: true } }
+    const installA2 = { personal: true, projects: { current: true } }
+
+    harness.api.agentAbilityGet.mockImplementation(async (at: { packageId: string }) =>
+      catalogDetail(at.packageId),
+    )
+    harness.api.agentRolesGet
+      .mockReturnValueOnce(roleLibraryA1.promise)
+      .mockReturnValueOnce(roleLibraryA2.promise)
+
+    harness.params = { packageId: 'CatalogRoleA' }
+    await render({ expectedSource: 'catalog' })
+    await act(async () =>
+      document.querySelector<HTMLButtonElement>('[data-testid="catalog-add-action"]')!.click(),
+    )
+
+    harness.params = { packageId: 'CatalogRoleB' }
+    await render({ expectedSource: 'catalog' })
+    harness.params = { packageId: 'CatalogRoleA' }
+    await render({ expectedSource: 'catalog' })
+    await act(async () =>
+      document.querySelector<HTMLButtonElement>('[data-testid="catalog-add-action"]')!.click(),
+    )
+
+    expect(
+      document.querySelector<HTMLButtonElement>('[data-testid="catalog-add-action"]')!.disabled,
+    ).toBe(true)
+
+    await act(async () => {
+      roleLibraryA1.resolve({ projects: [], installAvailability: installA1 })
+      await roleLibraryA1.promise
+    })
+
+    expect(harness.dialog).toBeNull()
+    expect(
+      document.querySelector<HTMLButtonElement>('[data-testid="catalog-add-action"]')!.disabled,
+    ).toBe(true)
+
+    await act(async () => {
+      roleLibraryA2.resolve({ projects: [], installAvailability: installA2 })
+      await roleLibraryA2.promise
+    })
+
+    expect(harness.dialog).toMatchObject({ name: 'CatalogRoleA', install: installA2 })
+    expect(
+      document.querySelector<HTMLButtonElement>('[data-testid="catalog-add-action"]')!.disabled,
+    ).toBe(false)
   })
 
   it('tells the section about an adoption that landed after the reader left', async () => {

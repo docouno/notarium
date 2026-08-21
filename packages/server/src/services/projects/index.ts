@@ -22,11 +22,14 @@ export {
 export {
   createMarkerStore,
   discoverSpaceFolders,
-  readRootMarker,
+  localFsAnchoredFiles,
+  type MarkerAnchoredFilesFactory,
+  type MarkerAnchoredFileView,
   type MarkerHit,
   type MarkerScan,
   type MarkerStore,
   type MarkerStoreOptions,
+  readRootMarker,
   type SpaceFolderHit,
 } from './markerStore'
 export {

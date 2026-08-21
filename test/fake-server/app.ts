@@ -579,7 +579,8 @@ export const createApp = async (
   )
   const roles = createRolesService({
     catalog: loadBundledAbilityInventory,
-    library: roleLibrary,
+    library: roleLibrary.library,
+    publication: roleLibrary.publication,
     abilityAvailability,
     abilityPreferences,
     // Placement is part of an owned Role's address. This host keeps every table keyed
@@ -664,7 +665,7 @@ export const createApp = async (
     const appliedSkills = await applyAgentSkillDeclarations({
       declarations: fx.agentSkills ?? [],
       roles,
-      library: roleLibrary,
+      library: roleLibrary.library,
       storeForSpace: (space) => manager.store(space),
       resolveLocation: async (declaration) => {
         const home = declaration.home

@@ -1,6 +1,7 @@
 import { InMemoryStore } from '@notarium/engine-memory'
 
 import { createStoreRoleLibrary } from '../fake-server/storeRoleLibrary'
+import { writableLibrary } from '../roleLibraryComposition'
 import { describeRoleLibraryContract } from './roleLibraryContract'
 
 /** The fake server's library is the ONLY `RoleLibrary` under every browser gate, so
@@ -14,5 +15,5 @@ describeRoleLibraryContract('createStoreRoleLibrary', async () => {
     notes: [],
   })
 
-  return { library: createStoreRoleLibrary(() => Promise.resolve(store)) }
+  return { library: writableLibrary(createStoreRoleLibrary(() => Promise.resolve(store))) }
 })

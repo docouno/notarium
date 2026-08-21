@@ -10,6 +10,7 @@ import { createLocalFsFiles } from '../../libs/files'
 import { createNodeSqliteDriver } from '../../libs/sql'
 import { createNotariumStore } from './createNotariumStore'
 import { NotariumStore } from './notariumStore'
+import { engineMountOf } from './types'
 
 // Boot heal for the notes #296 lost. Before the name formula had an id rung, a title
 // in a script we could not romanise slugged to '' and the note was written to
@@ -289,7 +290,8 @@ describe('boot heal for unnamed note files (#296)', () => {
     // writer (an Obsidian save, a sync client) really has, and the only one the
     // `taken` set built from that scan cannot know about. `fs.rename` would overwrite
     // it without a word, so disk truth has to be re-checked (P3).
-    const base = createLocalFsFiles(root)
+    const assembly = createLocalFsFiles(root)
+    const base = assembly.base
     const files: FileStore = {
       ...base,
       scan: async () => {
@@ -302,7 +304,7 @@ describe('boot heal for unnamed note files (#296)', () => {
       },
     }
     const store = new NotariumStore({
-      mounts: [{ class: 'user-doc' as const, prefix: '', files }],
+      mounts: [engineMountOf({ class: 'user-doc', prefix: '' }, { ...assembly, base: files })],
       sql: createNodeSqliteDriver(':memory:'),
       integritySweepBatchSize: 0,
     })
@@ -326,7 +328,8 @@ describe('boot heal for unnamed note files (#296)', () => {
   it('reconciles the new path in the same pass when post-move stat is transiently null', async () => {
     const root = await mkroot()
     await writeUnnamed(root, 'journal', 'FFFFFFFFFFFF', '第三季度规划', 'Healed now.')
-    const base = createLocalFsFiles(root)
+    const assembly = createLocalFsFiles(root)
+    const base = assembly.base
     let missed = false
     const files: FileStore = {
       ...base,
@@ -341,7 +344,7 @@ describe('boot heal for unnamed note files (#296)', () => {
       },
     }
     const store = new NotariumStore({
-      mounts: [{ class: 'user-doc' as const, prefix: '', files }],
+      mounts: [engineMountOf({ class: 'user-doc', prefix: '' }, { ...assembly, base: files })],
       sql: createNodeSqliteDriver(':memory:'),
       integritySweepBatchSize: 0,
     })

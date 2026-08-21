@@ -18,7 +18,7 @@ import type { Embedder } from '../../libs/embedding'
 import { createLocalFsFiles } from '../../libs/files'
 import { createNodeSqliteDriver, type SqlDriver } from '../../libs/sql'
 import { NotariumStore } from './notariumStore'
-import type { EngineMount } from './types'
+import { type EngineMount, engineMountOf } from './types'
 import { describeVector } from './vectorGate.fixture'
 
 /** A deterministic, instant embedder: a vector is derived from the text bytes so
@@ -59,16 +59,13 @@ const countingEmbedder = (id = 'mock@v1', dimensions = 8) => {
   }
 }
 
-const userMount = (dir: string): EngineMount => ({
-  class: 'user-doc',
-  prefix: '',
-  files: createLocalFsFiles(dir),
-})
-const agentMount = (dir: string): EngineMount => ({
-  class: 'agent-memory',
-  prefix: '.notarium/memory',
-  files: createLocalFsFiles(join(dir, '.notarium/memory')),
-})
+const userMount = (dir: string): EngineMount =>
+  engineMountOf({ class: 'user-doc', prefix: '' }, createLocalFsFiles(dir))
+const agentMount = (dir: string): EngineMount =>
+  engineMountOf(
+    { class: 'agent-memory', prefix: '.notarium/memory' },
+    createLocalFsFiles(join(dir, '.notarium/memory')),
+  )
 
 /** write() returns filePath as optional (wire divergence); the notarium engine
  *  always sets it — narrow it for the assertions. */

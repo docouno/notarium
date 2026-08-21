@@ -37,11 +37,14 @@ import {
   CatalogSkillNotFoundError,
   RoleAlreadyExistsError,
   RoleDependencyConflictError,
+  RoleInstallUnavailableError,
   SkillAlreadyExistsError,
 } from './errors'
 import {
   InvalidSkillPackageError,
   type RoleLibrary,
+  type RolePackagePublication,
+  type RolePackagePublicationPolicy,
   type SkillPackage,
   validateSkillPackage,
 } from './library'
@@ -513,12 +516,16 @@ export const inMemoryAbilityPersistence = () => {
 export const createRolesService = ({
   catalog,
   library,
+  publication,
   abilityAvailability,
   abilityPreferences,
   abilityPlacement,
 }: {
   catalog: () => Promise<SkillPackage[]>
   library: RoleLibrary
+  /** The write side, separately. Reading a library works on a deployment that
+   *  cannot publish at all, so the two are not one dependency. */
+  publication: RolePackagePublicationPolicy
   /** REQUIRED to pass: every composition root states which persistence it built on.
    *  `inMemoryAbilityPersistence()` spells the answer for a host that has none. */
   abilityAvailability: AbilityAvailabilityPersistence
@@ -1249,13 +1256,52 @@ export const createRolesService = ({
     return worst ?? { healthy: true, attachments: [] }
   }
 
+  /** The writer for one settled placement, or a typed refusal. Asked BEFORE any
+   *  mutation the caller is about to make: composition either can publish here or
+   *  cannot, and finding out afterwards is what left half-installed state behind. */
+  const publisherAt = async (location: RoleHomeLocation): Promise<RolePackagePublication> => {
+    const handle = publication.availableFor({ kind: 'location', location })
+      ? await publication.publicationFor(location)
+      : null
+
+    if (!handle) {
+      throw new RoleInstallUnavailableError(
+        `role installation is unavailable for this ${location.scope} placement`,
+      )
+    }
+
+    return handle
+  }
+
+  /** Every distinct placement one Add will write to, resolved once each and then
+   *  held. Deduplicated by the canonical location, so a Personal role whose
+   *  linked skills live in that same placement takes ONE handle, not two — and
+   *  resolved together, so a Project role whose Space dependencies are
+   *  publishable but whose own placement is not is refused before either. */
+  const placementPublishers = async (
+    ...locations: readonly RoleHomeLocation[]
+  ): Promise<RolePackagePublication[]> => {
+    const keyOf = (location: RoleHomeLocation): string =>
+      `${location.scope}\0${location.space}\0${location.projectId ?? ''}`
+    const resolved = new Map<string, RolePackagePublication>()
+
+    for (const location of locations) {
+      if (!resolved.has(keyOf(location))) {
+        resolved.set(keyOf(location), await publisherAt(location))
+      }
+    }
+
+    return locations.map((location) => resolved.get(keyOf(location))!)
+  }
+
   const publishOwnedPackage = async (
     location: RoleHomeLocation,
+    publisher: RolePackagePublication,
     pkg: SkillPackage,
     conflict: () => Error,
   ): Promise<string> => {
     try {
-      if (!(await library.putIfAbsent(location, pkg))) {
+      if (!(await publisher.putIfAbsent(pkg))) {
         throw conflict()
       }
     } catch (error) {
@@ -1448,6 +1494,22 @@ export const createRolesService = ({
   }
 
   return {
+    canAddSkillAt: (target) => publication.availableFor(target),
+    canAddRoleAt: (target, personalSpace) => {
+      if (!publication.availableFor(target)) {
+        return false
+      }
+      if (target.kind === 'prospective-personal') {
+        // A Personal role and its linked skills share one placement, so the
+        // answer above already covered both.
+        return true
+      }
+
+      return publication.availableFor({
+        kind: 'location',
+        location: homeOf(addressed(target.location), personalSpace),
+      })
+    },
     describeAbility: async (context, principal, locator, budgetTokens) => {
       if (locator.source === 'catalog') {
         const parsed = (await catalogPackages()).find(({ skill, pkg }) => {
@@ -1779,6 +1841,7 @@ export const createRolesService = ({
         validateSkillPackage(pkg)
         const registryNoteId = await publishOwnedPackage(
           location,
+          await publisherAt(location),
           pkg,
           () => new RoleAlreadyExistsError(`role "${name}" already exists in ${location.scope}`),
         )
@@ -1831,6 +1894,11 @@ export const createRolesService = ({
         // but identity is projected from a PATH — so it is only readable while the
         // package is still at that path. Read here, one line above the move.
         const movedNoteId = await projectedNoteId(from, locator.packageId)
+        // BOTH sides, before the first mutation. The destination publishes the
+        // move; the source publishes the undo — and discovering that the source
+        // placement cannot take the package back, after the reach row is already
+        // written, is exactly the half-applied promotion this ordering removes.
+        const [intoTarget, backToSource] = await Promise.all([publisherAt(to), publisherAt(from)])
 
         const moved = ownedRoleLocator(to, locator.packageId)
         // Reach belongs to a Space home and only to it. Coming up from a project the
@@ -1850,7 +1918,7 @@ export const createRolesService = ({
         let published = false
 
         try {
-          published = await library.movePackage(from, to, locator.packageId)
+          published = await intoTarget.moveFrom(from, locator.packageId)
 
           if (!published) {
             throw new RoleAlreadyExistsError(`role "${name}" already exists in ${to.scope}`)
@@ -1867,7 +1935,7 @@ export const createRolesService = ({
           // placement that no longer exists. Nothing to put back when the move itself
           // was refused — but the reach written ahead of it still has to come off.
           const undone = published
-            ? await library.movePackage(to, from, locator.packageId).catch((err: Error) => {
+            ? await backToSource.moveFrom(to, locator.packageId).catch((err: Error) => {
                 console.error(`[roles] failed to undo the move of ${name}:`, err.message)
                 return false
               })
@@ -2349,17 +2417,44 @@ export const createRolesService = ({
           return existing
         }
 
-        const installedDependencies: SkillPackage[] = []
+        // Conflicts first, all of them, and they still answer 409: a dependency
+        // that already exists with other content is the user's problem to resolve,
+        // not a capability the host is missing.
+        const planned = []
 
         for (const parsed of dependencies) {
           const pkg = forkCatalogPackage(parsed)
-          const existing = await compatibleDependency(parsed, pkg)
 
+          planned.push({ parsed, pkg, existing: await compatibleDependency(parsed, pkg) })
+        }
+        // Only then the placements — and both of them, before the first write.
+        // Resolving them later, one at a time, is how a Project Add published its
+        // Space dependencies and only then discovered it could not publish the role.
+        const [dependencyPublisher, rolePublisher] = await placementPublishers(
+          dependencyLocation,
+          location,
+        )
+        const installedDependencies: SkillPackage[] = []
+
+        for (const { parsed, pkg, existing } of planned) {
           if (existing) {
             installedDependencies.push(existing)
             continue
           }
-          const added = await library.putIfAbsent(dependencyLocation, pkg)
+          let added: boolean
+
+          try {
+            added = await dependencyPublisher.putIfAbsent(pkg)
+          } catch (error) {
+            if ((error as { code?: string }).code !== 'SKILL_NAME_CONFLICT') {
+              throw error
+            }
+            // The authority caught a placement-wide name race. Treat it like its
+            // direct-FS `false` twin so an identical catalog fork may still be
+            // reused; `compatibleDependency` turns every other occupant into the
+            // stable dependency conflict this operation owns.
+            added = false
+          }
 
           const raced = added ? null : await compatibleDependency(parsed, pkg)
 
@@ -2378,127 +2473,94 @@ export const createRolesService = ({
           installedDependencies.map((dependency) => dependency.directoryName),
         )
 
-        // A dependency that already existed is REUSED, so granting it reach widens a
-        // skill the owner already had. Captured before the first grant, because if the
-        // role then fails to publish the caller is told nothing happened — and a failed
-        // Add must not widen what a skill applies to any more than a successful one may.
-        const reachBeforeAdd = new Map<string, AbilityAvailability | null>()
-
+        // Grants are part of dependency-first partial persistence. A later role
+        // failure leaves completed packages and grants in place, so a retry or a
+        // concurrent Add can reuse them without erasing another successful Add.
         for (const dependency of installedDependencies) {
-          reachBeforeAdd.set(
-            dependency.directoryName,
-            await abilityAvailability.get(location.space, dependency.directoryName),
-          )
-        }
-        // Everything from here on is compensated: the reach comes back off — but only
-        // while the ROLE has not landed. Once it has, that reach is the reach of a live
-        // role's dependencies, and taking it back left the role published, effective,
-        // and fail-closed forever with no retry available to it (Add answers 409).
-        // The dependency PACKAGES are never undone — the library port has no removal —
-        // so a failed Add can leave a freshly forked skill behind, inert until
-        // something reaches it. That is the honest limit of what this port can undo.
-        let rolePublished = false
+          const registryNoteId = dependencyNoteIds.get(dependency.directoryName) ?? null
 
-        const undoDependencyReach = async () => {
-          if (rolePublished) {
-            return
-          }
-          for (const [directoryName, before] of reachBeforeAdd) {
-            await (
-              before
-                ? abilityAvailability.set(location.space, directoryName, before, null)
-                : abilityAvailability.clear(location.space, directoryName)
-            ).catch((err: Error) => {
-              console.error(
-                `[roles] failed to undo the reach of linked skill ${directoryName}:`,
-                err.message,
-              )
-            })
-          }
-        }
-
-        try {
-          for (const dependency of installedDependencies) {
-            const registryNoteId = dependencyNoteIds.get(dependency.directoryName) ?? null
-
-            if (location.scope === ROLE_SCOPE.project && location.projectId) {
-              await abilityAvailability.grantProject(
-                location.space,
-                dependency.directoryName,
-                location.projectId,
-                registryNoteId,
-              )
-            } else if (dependencyLocation.scope === ROLE_SCOPE.space) {
-              await abilityAvailability.set(
-                location.space,
-                dependency.directoryName,
-                { mode: ABILITY_AVAILABILITY_MODE.allProjects },
-                registryNoteId,
-              )
-            }
-          }
-
-          const rolePackage = forkCatalogPackage(
-            role,
-            installedDependencies.map((dependency, index) =>
-              serializeSkillLocator({
-                scope: dependencyLocation.scope,
-                packageId: dependency.directoryName,
-                label: dependencies[index]!.skill.name,
-              }),
-            ),
-          )
-          const added = await library.putIfAbsent(location, rolePackage)
-
-          if (!added) {
-            throw new RoleAlreadyExistsError(`role "${name}" already exists in ${location.scope}`)
-          }
-          rolePublished = true
-
-          const installed = await library.get(location, name)
-
-          if (!installed) {
-            throw new Error(`role "${name}" was not installed`)
-          }
-          const [, readableRoles] = await Promise.all([
-            library.awaitReadableNoteIds(
-              dependencyLocation,
-              installedDependencies.map((dependency) => dependency.directoryName),
-            ),
-            library.awaitReadableNoteIds(location, [installed.directoryName]),
-          ])
-          const noteId = readableRoles.get(installed.directoryName)
-
-          if (!noteId) {
-            throw new Error(`role "${name}" was published without a readable note identity`)
-          }
-          // A Space home starts where a Space role has always acted: everywhere in its
-          // Space. Narrowing is an explicit act, not the shape a role arrives in.
-          const availability =
-            location.scope === ROLE_SCOPE.space
-              ? { mode: ABILITY_AVAILABILITY_MODE.allProjects }
-              : undefined
-
-          if (availability) {
+          if (location.scope === ROLE_SCOPE.project && location.projectId) {
+            await abilityAvailability.grantProject(
+              location.space,
+              dependency.directoryName,
+              location.projectId,
+              registryNoteId,
+            )
+          } else if (dependencyLocation.scope === ROLE_SCOPE.space) {
             await abilityAvailability.set(
               location.space,
-              rolePackage.directoryName,
-              availability,
-              noteId,
+              dependency.directoryName,
+              { mode: ABILITY_AVAILABILITY_MODE.allProjects },
+              registryNoteId,
             )
           }
+        }
 
-          return {
-            ...summaryOf(parsePackage(installed), location.scope),
-            space: location.space,
-            ...(location.projectId ? { projectId: location.projectId } : {}),
-            ...(availability ? { availability } : {}),
-            packageId: rolePackage.directoryName,
-            noteId,
-          }
+        const rolePackage = forkCatalogPackage(
+          role,
+          installedDependencies.map((dependency, index) =>
+            serializeSkillLocator({
+              scope: dependencyLocation.scope,
+              packageId: dependency.directoryName,
+              label: dependencies[index]!.skill.name,
+            }),
+          ),
+        )
+        let added: boolean
+
+        try {
+          added = await rolePublisher.putIfAbsent(rolePackage)
         } catch (error) {
-          await undoDependencyReach()
-          throw error
+          if ((error as { code?: string }).code !== 'SKILL_NAME_CONFLICT') {
+            throw error
+          }
+          throw new RoleAlreadyExistsError(`role "${name}" already exists in ${location.scope}`)
+        }
+
+        if (!added) {
+          throw new RoleAlreadyExistsError(`role "${name}" already exists in ${location.scope}`)
+        }
+
+        const installed = await library.get(location, name)
+
+        if (!installed) {
+          throw new Error(`role "${name}" was not installed`)
+        }
+        const [, readableRoles] = await Promise.all([
+          library.awaitReadableNoteIds(
+            dependencyLocation,
+            installedDependencies.map((dependency) => dependency.directoryName),
+          ),
+          library.awaitReadableNoteIds(location, [installed.directoryName]),
+        ])
+        const noteId = readableRoles.get(installed.directoryName)
+
+        if (!noteId) {
+          throw new Error(`role "${name}" was published without a readable note identity`)
+        }
+        // A Space home starts where a Space role has always acted: everywhere in its
+        // Space. Narrowing is an explicit act, not the shape a role arrives in.
+        const availability =
+          location.scope === ROLE_SCOPE.space
+            ? { mode: ABILITY_AVAILABILITY_MODE.allProjects }
+            : undefined
+
+        if (availability) {
+          await abilityAvailability.set(
+            location.space,
+            rolePackage.directoryName,
+            availability,
+            noteId,
+          )
+        }
+
+        return {
+          ...summaryOf(parsePackage(installed), location.scope),
+          space: location.space,
+          ...(location.projectId ? { projectId: location.projectId } : {}),
+          ...(availability ? { availability } : {}),
+          packageId: rolePackage.directoryName,
+          noteId,
         }
       } finally {
         release()
@@ -2512,8 +2574,13 @@ export const createRolesService = ({
         throw new CatalogSkillNotFoundError(`no such catalog skill: ${name}`)
       }
       const pkg = forkCatalogPackage(skill)
+
+      if (await library.exists(location, name)) {
+        throw new SkillAlreadyExistsError(`skill "${name}" already exists in ${location.scope}`)
+      }
       const noteId = await publishOwnedPackage(
         location,
+        await publisherAt(location),
         pkg,
         () => new SkillAlreadyExistsError(`skill "${name}" already exists in ${location.scope}`),
       )
@@ -2554,8 +2621,13 @@ export const createRolesService = ({
       availability,
     ): Promise<PublishedSkillInventoryEntry> => {
       const pkg = customPackage(name, description, instructions, false)
+
+      if (await library.exists(location, name)) {
+        throw new SkillAlreadyExistsError(`skill "${name}" already exists in ${location.scope}`)
+      }
       const noteId = await publishOwnedPackage(
         location,
+        await publisherAt(location),
         pkg,
         () => new SkillAlreadyExistsError(`skill "${name}" already exists in ${location.scope}`),
       )
@@ -2631,6 +2703,13 @@ export const createRolesService = ({
           ? (options.availability ?? { mode: ABILITY_AVAILABILITY_MODE.allProjects })
           : undefined
 
+      if (await library.exists(location, name)) {
+        throw new RoleAlreadyExistsError(`role "${name}" already exists in ${location.scope}`)
+      }
+      // Resolve the writer before reach becomes durable. An incomplete authority
+      // view is a composition refusal and must leave no orphan availability row.
+      const publisher = await publisherAt(location)
+
       // Reach is written BEFORE the package is readable. For a role the absence of a
       // row reads as all-projects, so publishing first opens a window — as wide as the
       // projection barrier inside publish — in which a role narrowed to one project
@@ -2641,6 +2720,7 @@ export const createRolesService = ({
       }
       const noteId = await publishOwnedPackage(
         location,
+        publisher,
         pkg,
         () => new RoleAlreadyExistsError(`role "${name}" already exists in ${location.scope}`),
       )

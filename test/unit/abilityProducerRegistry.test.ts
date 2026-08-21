@@ -359,6 +359,8 @@ const CALL_REGISTERS: readonly CallRegister[] = [
       'packages/server/src/services/roles/roles.ts#addFromCatalog':
         'an entry reached by ENUMERATING a home the caller was already granted',
       'packages/server/src/services/roles/roles.ts#createCustomRole': 'the same boundary, stated',
+      'packages/server/src/services/roles/roles.ts#canAddRoleAt':
+        'the placement plan an Add is judged available by, asked before the Add itself',
     },
   },
   {
@@ -400,6 +402,8 @@ const CALL_REGISTERS: readonly CallRegister[] = [
       'packages/server/src/services/roles/roles.ts#loadSavedRole': 'the saved-role loader',
       'packages/server/src/services/roles/roles.ts#addFromCatalog':
         'the home a catalog fork lands in',
+      'packages/server/src/services/roles/roles.ts#canAddRoleAt':
+        'the SECOND placement an Add needs — asking it any other way would judge a role by its package alone',
     },
   },
   {

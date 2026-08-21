@@ -2,7 +2,18 @@ import type { BackgroundGate, NoteClass } from '@notarium/core'
 
 import type { Chunker } from '../../libs/chunking'
 import type { Embedder } from '../../libs/embedding'
-import type { FileStore } from '../../libs/files'
+import type {
+  FileConditionalMutation,
+  FileDirectoryNoReplaceMove,
+  FileEntryIdentity,
+  FileExactDirectorySpelling,
+  FileExactRead,
+  FileNoReplaceMove,
+  FileResourceExport,
+  FileStore,
+  FileStoreAssembly,
+  FileWatch,
+} from '../../libs/files'
 import type { SpaceResourceAuthority } from '../../libs/resourceAuthority'
 import type { SqlDriver } from '../../libs/sql'
 import type { IndexMigration } from './schema'
@@ -14,19 +25,78 @@ import type { IndexMigration } from './schema'
  *  prefix '', never descends into a sub-mount — dot-named sub-mounts like
  *  `.notarium/memory` fall out of its scan for free). Adapters may differ per
  *  mount (P5) — today all localfs, but the seam is the FileStore, not a path. */
+/** Exactly the semantics the note store degrades around — publication,
+ *  observation and claimed removal answer to the resource authority instead and
+ *  are therefore not reachable from here. */
+export type EngineMountFileCapabilities = {
+  exactRead?: FileExactRead
+  resourceExport?: FileResourceExport
+  conditionalFileMutation?: FileConditionalMutation
+  entryIdentity?: FileEntryIdentity
+  fileNoReplaceMove?: FileNoReplaceMove
+  directoryNoReplaceMove?: FileDirectoryNoReplaceMove
+  watch?: FileWatch
+}
+
+export type EngineMountFileAccelerators = {
+  exactDirectorySpelling?: FileExactDirectorySpelling
+}
+
 export type EngineMount = {
   class: NoteClass
   /** Space-relative namespace for this mount's index paths ('' = the space
    *  root / notes-mount). A row's `path` is `prefix ? prefix/rel : rel`. */
   prefix: string
   files: FileStore
+  /** What this mount's adapter declared it can do. A missing entry is a refusal
+   *  the store honours; it never probes `files` for an operation. */
+  fileCapabilities: EngineMountFileCapabilities
+  /** Cheaper routes to answers the store can always reach without them. */
+  fileAccelerators: EngineMountFileAccelerators
 }
+
+/** Project one adapter assembly onto one mount. The store never sees the
+ *  aggregate: it gets the base port under the name it has always used, plus the
+ *  two named views above — so which facets this consumer may reach is settled
+ *  here, in the wiring, and not by whatever the adapter happens to carry. */
+export const engineMountOf = (
+  mount: { class: NoteClass; prefix: string },
+  assembly: FileStoreAssembly,
+): EngineMount => ({
+  class: mount.class,
+  prefix: mount.prefix,
+  files: assembly.base,
+  fileCapabilities: {
+    ...(assembly.capabilities.exactRead ? { exactRead: assembly.capabilities.exactRead } : {}),
+    ...(assembly.capabilities.resourceExport
+      ? { resourceExport: assembly.capabilities.resourceExport }
+      : {}),
+    ...(assembly.capabilities.conditionalFileMutation
+      ? { conditionalFileMutation: assembly.capabilities.conditionalFileMutation }
+      : {}),
+    ...(assembly.capabilities.entryIdentity
+      ? { entryIdentity: assembly.capabilities.entryIdentity }
+      : {}),
+    ...(assembly.capabilities.fileNoReplaceMove
+      ? { fileNoReplaceMove: assembly.capabilities.fileNoReplaceMove }
+      : {}),
+    ...(assembly.capabilities.directoryNoReplaceMove
+      ? { directoryNoReplaceMove: assembly.capabilities.directoryNoReplaceMove }
+      : {}),
+    ...(assembly.capabilities.watch ? { watch: assembly.capabilities.watch } : {}),
+  },
+  fileAccelerators: {
+    ...(assembly.accelerators.exactDirectorySpelling
+      ? { exactDirectorySpelling: assembly.accelerators.exactDirectorySpelling }
+      : {}),
+  },
+})
 
 export type NotariumStoreOptions = {
   /** The space's typed mounts (#78). The FIRST is the default write target /
    *  notes-mount (user-doc, prefix ''); further mounts (agent-mount) are hidden
    *  typed placements in the same space. Must be non-empty. */
-  mounts: EngineMount[]
+  mounts: readonly EngineMount[]
   /** One physical-byte/admission authority shared by every mount and sidecar in
    * this space. Optional only for low-level tests that construct the engine
    * directly; production composition always supplies it. */

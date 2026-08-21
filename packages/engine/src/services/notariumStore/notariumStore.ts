@@ -565,7 +565,7 @@ export class NotariumStore implements KnowledgeStore {
 
   /** Typed mounts, longest-prefix-first so path→mount matching picks the most
    *  specific (the root mount, prefix '', is the catch-all and sorts last). */
-  private readonly mounts: EngineMount[]
+  private readonly mounts: readonly EngineMount[]
   private readonly mountsByPrefix: EngineMount[]
   private readonly resourceAuthority?: SpaceResourceAuthority
   private readonly sql: SqlDriver
@@ -750,7 +750,7 @@ export class NotariumStore implements KnowledgeStore {
     // fs.watch engage can still fail at runtime (inotify exhausted, network
     // mount) — watch() returns null then and the read-model degrades to polling;
     // this capability is the "worth trying" hint, not a guarantee.
-    if (this.mounts.some((m) => typeof m.files.watch === 'function')) {
+    if (this.mounts.some((m) => m.fileCapabilities.watch)) {
       this.capabilities.watch = true
     }
   }
@@ -863,7 +863,9 @@ export class NotariumStore implements KnowledgeStore {
       }
     }
 
-    return exactDirSpellings(mount.files, [...prefixes])
+    return exactDirSpellings(mount.files, mount.fileAccelerators.exactDirectorySpelling, [
+      ...prefixes,
+    ])
   }
 
   /** Refuse a directory spelling that the medium maps onto an existing RAW
@@ -886,7 +888,13 @@ export class NotariumStore implements KnowledgeStore {
     // One question about every ancestor at once. Whether the medium answers it
     // with shallow probes or with a single walk is the port's business, not this
     // one's — see `exactDirSpellings`.
-    const present = spelled ?? (await exactDirSpellings(mount.files, prefixes))
+    const present =
+      spelled ??
+      (await exactDirSpellings(
+        mount.files,
+        mount.fileAccelerators.exactDirectorySpelling,
+        prefixes,
+      ))
 
     for (const prefix of prefixes) {
       if (present.has(prefix)) {
@@ -904,15 +912,16 @@ export class NotariumStore implements KnowledgeStore {
    *  A same-entry alternate spelling is the case/NFC-only rename exception; every
    *  absent destination must be claimed by the adapter's atomic no-replace primitive. */
   private async renameFileNoReplace(mount: EngineMount, from: string, to: string): Promise<void> {
+    const identity = mount.fileCapabilities.entryIdentity
+    const noReplace = mount.fileCapabilities.fileNoReplaceMove
     const occupied = await mount.files.exists(to)
-    const sameSourceEntry =
-      occupied && mount.files.sameEntry ? await mount.files.sameEntry(from, to) : false
+    const sameSourceEntry = occupied && identity ? await identity.sameEntry(from, to) : false
 
     if (sameSourceEntry) {
-      if (!mount.files.renameIfAbsent) {
+      if (!noReplace) {
         throw moveFailed('storage cannot rename a note without replacing a race')
       }
-      if (!(await mount.files.renameIfAbsent(from, to))) {
+      if (!(await noReplace.renameIfAbsent(from, to))) {
         throw moveFailed('a note already lives at the destination')
       }
 
@@ -921,10 +930,10 @@ export class NotariumStore implements KnowledgeStore {
     if (occupied) {
       throw moveFailed('a note already lives at the destination')
     }
-    if (!mount.files.renameIfAbsent) {
+    if (!noReplace) {
       throw moveFailed('storage cannot move a note without replacing a concurrent destination')
     }
-    if (!(await mount.files.renameIfAbsent(from, to))) {
+    if (!(await noReplace.renameIfAbsent(from, to))) {
       throw moveFailed('a note already lives at the destination')
     }
   }
@@ -1874,7 +1883,9 @@ export class NotariumStore implements KnowledgeStore {
       // adapter's atomic no-replace primitive may heal automatically; on a collision
       // (including a directory invisible to scan) claim the next series member now,
       // rather than waiting forever on the same candidate next boot.
-      if (!mount.files.renameIfAbsent) {
+      const noReplace = mount.fileCapabilities.fileNoReplaceMove
+
+      if (!noReplace) {
         continue
       }
       for (let attempt = 0; attempt < 10_000; attempt++) {
@@ -1892,7 +1903,7 @@ export class NotariumStore implements KnowledgeStore {
         let moved = false
 
         try {
-          moved = await mount.files.renameIfAbsent(entry.path, rel)
+          moved = await noReplace.renameIfAbsent(entry.path, rel)
         } catch {
           break // vanished source or permission wall — next scan reconverges
         }
@@ -2243,12 +2254,14 @@ export class NotariumStore implements KnowledgeStore {
         if (actual !== expected) {
           return { status: 'claim-changed', observedId: actual }
         }
-        if (!mount.files.replaceIfAbsent) {
+        const mutation = mount.fileCapabilities.conditionalFileMutation
+
+        if (!mutation) {
           throw writeFailed('storage cannot rewrite an identity claim without replacing a race')
         }
         const next = upsertFrontmatterKey(snapshot.raw, NOTE_ID_FRONTMATTER_KEY, targetId)
 
-        if (!(await mount.files.replaceIfAbsent(rel, rel, snapshot.raw, next))) {
+        if (!(await mutation.replaceIfAbsent(rel, rel, snapshot.raw, next))) {
           // Someone replaced the file between the snapshot and the swap. That is
           // exactly what the loop exists for: re-observe and classify the winner
           // instead of turning a transient race into a terminal failure.
@@ -2610,7 +2623,9 @@ export class NotariumStore implements KnowledgeStore {
       if (!opts?.internalAddress) {
         await mount.files.removeDir(rel)
       } else {
-        if (!mount.files.renameDirIfAbsent) {
+        const directoryMove = mount.fileCapabilities.directoryNoReplaceMove
+
+        if (!directoryMove) {
           throw moveFailed('storage cannot atomically detach a skill package')
         }
         const staging = `${directoryOf(rel) ? `${directoryOf(rel)}/` : ''}.${basenameOf(
@@ -2618,14 +2633,14 @@ export class NotariumStore implements KnowledgeStore {
         )}.delete-${randomUUID()}`
 
         await opts.beforeDetach?.()
-        if (!(await mount.files.renameDirIfAbsent(rel, staging))) {
+        if (!(await directoryMove.renameDirIfAbsent(rel, staging))) {
           throw moveFailed('skill package changed during delete')
         }
         try {
           await opts.afterDetach?.()
           await mount.files.removeDir(staging)
         } catch (error) {
-          await mount.files.renameDirIfAbsent(staging, rel).catch(() => false)
+          await directoryMove.renameDirIfAbsent(staging, rel).catch(() => false)
           throw error
         }
       }
@@ -2668,10 +2683,12 @@ export class NotariumStore implements KnowledgeStore {
       if (!allowed.has(mount.class)) {
         continue
       }
-      if (mount.class === 'skill' && mount.files.exportFiles) {
+      const resourceExport = mount.fileCapabilities.resourceExport
+
+      if (mount.class === 'skill' && resourceExport) {
         const entries = this.resourceAuthority
           ? this.resourceAuthority.exportAdapter(mount.prefix, { owner: 'notarium-export' })
-          : mount.files.exportFiles()
+          : resourceExport.exportFiles()
 
         for await (const entry of entries) {
           yield {
@@ -2759,8 +2776,8 @@ export class NotariumStore implements KnowledgeStore {
       ? observation.kind === 'present'
         ? observation.bytes
         : null
-      : mount.files.readBytes
-        ? await mount.files.readBytes(relativePath)
+      : mount.fileCapabilities.exactRead
+        ? await mount.fileCapabilities.exactRead.readBytes(relativePath)
         : undefined
     const raw =
       exactSource !== undefined
@@ -3888,6 +3905,11 @@ export class NotariumStore implements KnowledgeStore {
     })
 
     const candidateSource = new TextEncoder().encode(bytes)
+    // Named once for every branch below: which of create/update/delete this write
+    // takes is decided by the row and the caller, but they all rest on the same
+    // one guarantee — that the medium can make a pathname's current bytes the
+    // condition of the mutation replacing them.
+    const mutation = mount.fileCapabilities.conditionalFileMutation
     const candidateSkillRoot =
       mount.class === 'skill' && isSkillPackageRootPath(this.relIn(mount, dest))
 
@@ -3995,24 +4017,24 @@ export class NotariumStore implements KnowledgeStore {
       }
       mutationReceipt = publication.receipt
     } else if (renameSource) {
-      if (!mount.files.replaceIfAbsent) {
+      if (!mutation) {
         throw moveFailed('storage cannot publish a renamed note without replacing a race')
       }
-      if (!(await mount.files.replaceIfAbsent(sourceRel, destRel, existingRaw!, bytes))) {
+      if (!(await mutation.replaceIfAbsent(sourceRel, destRel, existingRaw!, bytes))) {
         throw moveFailed('a note already lives at the destination')
       }
     } else if (sourceRow) {
-      if (!mount.files.replaceIfAbsent) {
+      if (!mutation) {
         throw writeFailed('storage cannot update a note without replacing a race')
       }
-      if (!(await mount.files.replaceIfAbsent(sourceRel, destRel, existingRaw!, bytes))) {
+      if (!(await mutation.replaceIfAbsent(sourceRel, destRel, existingRaw!, bytes))) {
         throw writeFailed('note changed during write')
       }
     } else if (createWithoutOverwrite) {
-      if (!mount.files.writeIfAbsent) {
+      if (!mutation) {
         throw writeFailed('storage cannot create a note without replacing a race')
       }
-      if (!(await mount.files.writeIfAbsent(destRel, bytes))) {
+      if (!(await mutation.writeIfAbsent(destRel, bytes))) {
         // Same reading as the authority's lost swap above: a plan that proved this
         // path free and then lost the no-clobber create lost it to a newcomer.
         if (guarded && expectedDestinationId === null && guardedRaw == null) {
@@ -4034,13 +4056,13 @@ export class NotariumStore implements KnowledgeStore {
       // branch it guards against is the one below: without it a guarded write on an
       // authority-less engine would fall through to a plain overwrite, which is
       // precisely the publish this channel exists to forbid.
-      if (!mount.files.writeIfAbsent || !mount.files.replaceIfAbsent) {
+      if (!mutation) {
         throw writeFailed('storage cannot publish a planned write without replacing a race')
       }
       const published =
         guardedRaw == null
-          ? await mount.files.writeIfAbsent(destRel, bytes)
-          : await mount.files.replaceIfAbsent(destRel, destRel, guardedRaw, bytes)
+          ? await mutation.writeIfAbsent(destRel, bytes)
+          : await mutation.replaceIfAbsent(destRel, destRel, guardedRaw, bytes)
 
       if (!published) {
         throw destinationOwnerConflict(dest, 'changed while the planned write was publishing')
@@ -4199,18 +4221,17 @@ export class NotariumStore implements KnowledgeStore {
       )
       const sourceRel = this.relIn(mount, src)
       const destinationRel = this.relIn(mount, dest)
+      const identity = mount.fileCapabilities.entryIdentity
       const destinationOnDisk = await mount.files.dirExists(destinationRel)
       const sameSourceDirectory =
-        destinationOnDisk && mount.files.sameEntry
-          ? await mount.files.sameEntry(sourceRel, destinationRel)
-          : false
+        destinationOnDisk && identity ? await identity.sameEntry(sourceRel, destinationRel) : false
 
       // On an insensitive medium a non-existent descendant spelling can still
       // have the source directory as an existing ancestor (`Docs` → `docs/sub`).
       // Refuse that actual self-move while still permitting direct `Docs` → `docs`.
-      if (mount.files.sameEntry) {
+      if (identity) {
         for (let parent = directoryOf(destinationRel); parent; parent = directoryOf(parent)) {
-          if (await mount.files.sameEntry(sourceRel, parent)) {
+          if (await identity.sameEntry(sourceRel, parent)) {
             throw moveFailed('cannot move a folder into itself')
           }
         }
@@ -4232,10 +4253,12 @@ export class NotariumStore implements KnowledgeStore {
       if (!rows.length && !(await mount.files.dirExists(this.relIn(mount, src)))) {
         throw moveFailed('folder not found')
       }
-      if (!mount.files.renameDirIfAbsent) {
+      const directoryMove = mount.fileCapabilities.directoryNoReplaceMove
+
+      if (!directoryMove) {
         throw moveFailed('storage cannot move a folder without replacing a race')
       }
-      if (!(await mount.files.renameDirIfAbsent(sourceRel, destinationRel))) {
+      if (!(await directoryMove.renameDirIfAbsent(sourceRel, destinationRel))) {
         throw moveFailed('destination folder is occupied')
       }
       for (const r of rows) {
@@ -4433,7 +4456,9 @@ export class NotariumStore implements KnowledgeStore {
       ) {
         throw writeFailed('note physical incarnation changed during delete')
       }
-    } else if (mount.files.removeIfUnchanged) {
+    } else if (mount.fileCapabilities.conditionalFileMutation) {
+      const mutation = mount.fileCapabilities.conditionalFileMutation
+
       if (expected == null && (await mount.files.exists(rel))) {
         throw writeFailed('note changed during delete')
       }
@@ -4441,7 +4466,7 @@ export class NotariumStore implements KnowledgeStore {
         if (!indexedHash || (await sha256Hex(expected)) !== indexedHash) {
           throw writeFailed('note changed during delete')
         }
-        if (!(await mount.files.removeIfUnchanged(rel, expected))) {
+        if (!(await mutation.removeIfUnchanged(rel, expected))) {
           throw writeFailed('note changed during delete')
         }
       }
@@ -4468,7 +4493,7 @@ export class NotariumStore implements KnowledgeStore {
     const closers: Array<() => void> = []
 
     for (const mount of this.mounts) {
-      const unwatch = mount.files.watch?.((path) => {
+      const unwatch = mount.fileCapabilities.watch?.watch((path) => {
         if (path?.endsWith('.md')) {
           this.forcedReadPaths.add(this.fullIn(mount, path))
         }

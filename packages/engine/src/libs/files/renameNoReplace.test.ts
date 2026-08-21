@@ -309,6 +309,20 @@ describe('the runtime facts reach the decision', () => {
     },
   )
 
+  /** Which of the primitive's three dependents the freshly built adapter declares.
+   *  Asked as one object so a partial answer fails as a partial answer: the three
+   *  rest on the SAME runtime fact, and any build where they disagree is
+   *  advertising an operation the host cannot perform. */
+  const declaredNoReplaceFacets = (): Record<string, boolean> => {
+    const { capabilities } = createLocalFsFiles(SHAPE_PROBE_ROOT)
+
+    return {
+      directoryNoReplaceMove: Object.hasOwn(capabilities, 'directoryNoReplaceMove'),
+      packagePublication: Object.hasOwn(capabilities, 'packagePublication'),
+      strictPublication: Object.hasOwn(capabilities, 'strictPublication'),
+    }
+  }
+
   // The construction seam, where the runtime answer becomes the adapter's shape.
   // Without these the seam is free to derive the facts itself, and the capability
   // is published on a host that cannot perform it — the defect this task removes,
@@ -318,15 +332,17 @@ describe('the runtime facts reach the decision', () => {
     ['darwin', 'x64', false],
     ['linux', 'unsupported-audit-arch', false],
   ] as const)(
-    'the adapter built on %s/%s declares renameDirIfAbsent=%s',
+    'the adapter built on %s/%s declares the no-replace facets=%s',
     async (platform, arch, declared) => {
       await withRuntime({ platform, arch }, async () => {
         statSyncMock.mockImplementationOnce(() => statAs('file'))
         accessSyncMock.mockImplementationOnce(() => {})
 
-        expect(Object.hasOwn(createLocalFsFiles(SHAPE_PROBE_ROOT), 'renameDirIfAbsent')).toBe(
-          declared,
-        )
+        expect(declaredNoReplaceFacets()).toEqual({
+          directoryNoReplaceMove: declared,
+          packagePublication: declared,
+          strictPublication: declared,
+        })
       })
     },
   )
@@ -335,7 +351,11 @@ describe('the runtime facts reach the decision', () => {
     await withMappedRuntime(async () => {
       statSyncMock.mockImplementationOnce(() => statAs('directory'))
 
-      expect(Object.hasOwn(createLocalFsFiles(SHAPE_PROBE_ROOT), 'renameDirIfAbsent')).toBe(false)
+      expect(declaredNoReplaceFacets()).toEqual({
+        directoryNoReplaceMove: false,
+        packagePublication: false,
+        strictPublication: false,
+      })
     })
   })
 })

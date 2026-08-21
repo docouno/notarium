@@ -10,6 +10,7 @@ import {
   InvalidSkillPackageError,
   parseSkillFile,
   type RoleLibrary,
+  type RoleLibraryComposition,
   type RoleLibraryListing,
   type RoleLocation,
   type SkillPackage,
@@ -68,7 +69,7 @@ export const createStoreRoleLibrary = (
      *  space while it runs. */
     onBarrier?: (location: RoleLocation, directoryNames: readonly string[]) => void
   } = {},
-): RoleLibrary => {
+): RoleLibraryComposition => {
   /** One claim at a time per placement — the fake's stand-in for the filesystem
    *  library's `acquirePlacementFence`. `putIfAbsent` asks "is this name free?" and
    *  then writes, with awaits in between; unfenced, two concurrent installers of one
@@ -231,7 +232,139 @@ export const createStoreRoleLibrary = (
     }
   }
 
-  return {
+  const putIfAbsent = async (location: RoleLocation, pkg: SkillPackage): Promise<boolean> => {
+    // The pure refusal first and OUTSIDE the fence, the order the shipped library
+    // keeps: a malformed package is refused without consulting the placement at all.
+    validateSkillPackage(pkg)
+
+    return claimPlacement(location, async () => {
+      const name = parsedName(pkg)
+
+      if (
+        !name ||
+        (await packageByDirectory(location, pkg.directoryName)) != null ||
+        (await packageByName(location, name)) != null
+      ) {
+        return false
+      }
+      const store = await storeForSpace(location.space)
+      const root = packageRoot(location, pkg.directoryName)
+
+      try {
+        for (const [relative, bytes] of pkg.files) {
+          if (!relative.endsWith('.md')) {
+            // Not a note, so not the store's — but still the package's.
+            resources.set(
+              resourceKey(location.space, `${root}/${relative}`),
+              Uint8Array.from(bytes),
+            )
+            continue
+          }
+          const role =
+            relative === 'SKILL.md' ? DOCUMENT_ROLE.skillRoot : DOCUMENT_ROLE.skillAuxiliary
+          const state = analyzeDocumentState({
+            source: bytes,
+            role,
+            pathFallbackTitle: relative.split('/').at(-1)!.replace(/\.md$/i, ''),
+            ...(role === DOCUMENT_ROLE.skillRoot ? { skillDirectoryName: pkg.directoryName } : {}),
+          })
+          const projection = state.projection
+
+          if (!projection) {
+            throw new InvalidSkillPackageError(`invalid Agent Skill Markdown: ${relative}`)
+          }
+          await store.write(
+            {
+              id: relative === 'SKILL.md' ? pkg.directoryName : undefined,
+              title:
+                role === DOCUMENT_ROLE.skillRoot && projection.titleOrigin.kind === 'hidden-h1'
+                  ? projection.titleOrigin.title
+                  : projection.title,
+              content: projection.body,
+              frontmatter: projection.frontmatterEntries,
+              frontmatterMode: 'replace',
+              targetClass: NOTE_CLASS.skill,
+              restorePath: `${root}/${relative}`,
+            },
+            { internalAddress: true },
+          )
+        }
+
+        return true
+      } catch (error) {
+        await store.removeDir?.(root, { internalAddress: true })
+        for (const [relative] of resourcesUnder(location.space, root)) {
+          resources.delete(resourceKey(location.space, `${root}/${relative}`))
+        }
+        throw error
+      }
+    })
+  }
+
+  const movePackage = async (
+    from: RoleLocation,
+    to: RoleLocation,
+    directoryName: string,
+  ): Promise<boolean> => {
+    if (from.space !== to.space) {
+      throw new Error('a package move cannot cross spaces')
+    }
+    const pkg = await packageByDirectory(from, directoryName)
+    const name = pkg && parsedName(pkg)
+
+    if (!pkg || !name) {
+      return false
+    }
+    if (
+      (await packageByDirectory(to, directoryName)) != null ||
+      (await packageByName(to, name)) != null
+    ) {
+      return false
+    }
+    const store = await storeForSpace(from.space)
+    const notes = await store.list({ scope: READ_SCOPE.all, classes: [NOTE_CLASS.skill] })
+    const sourceRoot = packageRoot(from, directoryName)
+    const targetRoot = packageRoot(to, directoryName)
+
+    // Production moves the directory and lets identity survive the path change on
+    // the frontmatter claim. The fake has no filesystem, so it re-addresses each
+    // member BY ITS EXISTING ID — same guarantee, stated instead of inherited.
+    for (const note of notes) {
+      if (!note.filePath?.startsWith(`${sourceRoot}/`) || !note.id) {
+        continue
+      }
+      const relative = note.filePath.slice(sourceRoot.length + 1)
+      const content = await store.read(note.id)
+      const projection = content.documentState?.projection
+
+      if (!projection) {
+        throw new Error(`fake role package member is unreadable: ${note.filePath}`)
+      }
+      await store.write(
+        {
+          id: note.id,
+          originalId: note.id,
+          versionToken: content.versionToken,
+          title: content.title ?? projection.title,
+          content: projection.body,
+          frontmatter: projection.frontmatterEntries,
+          frontmatterMode: 'replace',
+          targetClass: NOTE_CLASS.skill,
+          restorePath: `${targetRoot}/${relative}`,
+        },
+        { internalAddress: true },
+      )
+    }
+    // The non-note members move with the directory, exactly as they do on disk.
+    for (const [relative, bytes] of resourcesUnder(from.space, sourceRoot)) {
+      resources.delete(resourceKey(from.space, `${sourceRoot}/${relative}`))
+      resources.set(resourceKey(to.space, `${targetRoot}/${relative}`), bytes)
+    }
+
+    return true
+  }
+
+  const library: RoleLibrary = {
     listManifests: listing,
     getSkill: async (location, name) => {
       const pkg = await packageByName(location, name)
@@ -266,134 +399,6 @@ export const createStoreRoleLibrary = (
       const pkg = await packageByDirectory(location, directoryName)
       return pkg ? clone(pkg) : null
     },
-    putIfAbsent: async (location, pkg) => {
-      // The pure refusal first and OUTSIDE the fence, the order the shipped library
-      // keeps: a malformed package is refused without consulting the placement at all.
-      validateSkillPackage(pkg)
-
-      return claimPlacement(location, async () => {
-        const name = parsedName(pkg)
-
-        if (
-          !name ||
-          (await packageByDirectory(location, pkg.directoryName)) != null ||
-          (await packageByName(location, name)) != null
-        ) {
-          return false
-        }
-        const store = await storeForSpace(location.space)
-        const root = packageRoot(location, pkg.directoryName)
-
-        try {
-          for (const [relative, bytes] of pkg.files) {
-            if (!relative.endsWith('.md')) {
-              // Not a note, so not the store's — but still the package's.
-              resources.set(
-                resourceKey(location.space, `${root}/${relative}`),
-                Uint8Array.from(bytes),
-              )
-              continue
-            }
-            const role =
-              relative === 'SKILL.md' ? DOCUMENT_ROLE.skillRoot : DOCUMENT_ROLE.skillAuxiliary
-            const state = analyzeDocumentState({
-              source: bytes,
-              role,
-              pathFallbackTitle: relative.split('/').at(-1)!.replace(/\.md$/i, ''),
-              ...(role === DOCUMENT_ROLE.skillRoot
-                ? { skillDirectoryName: pkg.directoryName }
-                : {}),
-            })
-            const projection = state.projection
-
-            if (!projection) {
-              throw new InvalidSkillPackageError(`invalid Agent Skill Markdown: ${relative}`)
-            }
-            await store.write(
-              {
-                id: relative === 'SKILL.md' ? pkg.directoryName : undefined,
-                title:
-                  role === DOCUMENT_ROLE.skillRoot && projection.titleOrigin.kind === 'hidden-h1'
-                    ? projection.titleOrigin.title
-                    : projection.title,
-                content: projection.body,
-                frontmatter: projection.frontmatterEntries,
-                frontmatterMode: 'replace',
-                targetClass: NOTE_CLASS.skill,
-                restorePath: `${root}/${relative}`,
-              },
-              { internalAddress: true },
-            )
-          }
-
-          return true
-        } catch (error) {
-          await store.removeDir?.(root, { internalAddress: true })
-          for (const [relative] of resourcesUnder(location.space, root)) {
-            resources.delete(resourceKey(location.space, `${root}/${relative}`))
-          }
-          throw error
-        }
-      })
-    },
-    movePackage: async (from, to, directoryName) => {
-      if (from.space !== to.space) {
-        throw new Error('a package move cannot cross spaces')
-      }
-      const pkg = await packageByDirectory(from, directoryName)
-      const name = pkg && parsedName(pkg)
-
-      if (!pkg || !name) {
-        return false
-      }
-      if (
-        (await packageByDirectory(to, directoryName)) != null ||
-        (await packageByName(to, name)) != null
-      ) {
-        return false
-      }
-      const store = await storeForSpace(from.space)
-      const notes = await store.list({ scope: READ_SCOPE.all, classes: [NOTE_CLASS.skill] })
-      const sourceRoot = packageRoot(from, directoryName)
-      const targetRoot = packageRoot(to, directoryName)
-
-      // Production moves the directory and lets identity survive the path change on
-      // the frontmatter claim. The fake has no filesystem, so it re-addresses each
-      // member BY ITS EXISTING ID — same guarantee, stated instead of inherited.
-      for (const note of notes) {
-        if (!note.filePath?.startsWith(`${sourceRoot}/`) || !note.id) {
-          continue
-        }
-        const relative = note.filePath.slice(sourceRoot.length + 1)
-        const content = await store.read(note.id)
-        const projection = content.documentState?.projection
-
-        if (!projection) {
-          throw new Error(`fake role package member is unreadable: ${note.filePath}`)
-        }
-        await store.write(
-          {
-            id: note.id,
-            originalId: note.id,
-            versionToken: content.versionToken,
-            title: content.title ?? projection.title,
-            content: projection.body,
-            frontmatter: projection.frontmatterEntries,
-            frontmatterMode: 'replace',
-            targetClass: NOTE_CLASS.skill,
-            restorePath: `${targetRoot}/${relative}`,
-          },
-          { internalAddress: true },
-        )
-      }
-      // The non-note members move with the directory, exactly as they do on disk.
-      for (const [relative, bytes] of resourcesUnder(from.space, sourceRoot)) {
-        resources.delete(resourceKey(from.space, `${sourceRoot}/${relative}`))
-        resources.set(resourceKey(to.space, `${targetRoot}/${relative}`), bytes)
-      }
-
-      return true
-    },
     // Two bodies, not one alias: `awaitReadableNoteIds` is the WRITE-side question and
     // pays for a barrier, `readableNoteIds` is the same answer without it. Aliased,
     // the fake could not fail a read path that took the barrier — and the browser
@@ -403,5 +408,16 @@ export const createStoreRoleLibrary = (
       return noteIdsAt(location, directoryNames)
     },
     readableNoteIds: async (location, directoryNames) => noteIdsAt(location, directoryNames),
+  }
+
+  return {
+    library,
+    publication: {
+      availableFor: () => true,
+      publicationFor: async (location) => ({
+        putIfAbsent: (pkg) => putIfAbsent(location, pkg),
+        moveFrom: (origin, directoryName) => movePackage(origin, location, directoryName),
+      }),
+    },
   }
 }

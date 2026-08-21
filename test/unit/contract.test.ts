@@ -883,6 +883,35 @@ describe('agent roles', () => {
     ).toBe(false)
   })
 
+  it('accepts only the approved role install availability wire shape', () => {
+    const page = {
+      items: [],
+      projects: [],
+      activeRole: null,
+      filteredTotal: 0,
+      nextCursor: null,
+      facets: {
+        source: { system: 0, catalog: 0, owned: 0 },
+        home: { personal: 0, space: 0 },
+        availability: { all: 0, selected: 0 },
+        projects: [],
+      },
+    }
+
+    expect(
+      MeAgentRolesResponseSchema.safeParse({
+        ...page,
+        installAvailability: { personal: true, projects: { 'team/docs': false } },
+      }).success,
+    ).toBe(true)
+    expect(
+      MeAgentRolesResponseSchema.safeParse({
+        ...page,
+        installAvailability: { personal: true, targets: { 'team/docs': false } },
+      }).success,
+    ).toBe(false)
+  })
+
   it('carries a role\u2019s project versions as a property, never as items of their own', () => {
     const base = {
       locator: {
@@ -1027,6 +1056,34 @@ describe('agent skills', () => {
     expect(contract.agentSkills.response).toBe(MeAgentSkillsResponseSchema)
     expect(contract.agentSkillAdd.request).toBe(AddAgentSkillRequestSchema)
     expect(contract.agentSkillAdd.response).toBe(AddAgentSkillResponseSchema)
+  })
+
+  it('accepts only the approved skill install availability wire shape', () => {
+    const page = {
+      items: [],
+      projects: [],
+      filteredTotal: 0,
+      nextCursor: null,
+      facets: {
+        source: { system: 0, catalog: 0, owned: 0 },
+        home: { personal: 0, space: 0 },
+        availability: { all: 0, selected: 0 },
+        projects: [],
+      },
+    }
+
+    expect(
+      MeAgentSkillsResponseSchema.safeParse({
+        ...page,
+        installAvailability: { personal: true, spaces: { team: false } },
+      }).success,
+    ).toBe(true)
+    expect(
+      MeAgentSkillsResponseSchema.safeParse({
+        ...page,
+        installAvailability: { personal: true, targets: { team: false } },
+      }).success,
+    ).toBe(false)
   })
 
   it('keeps catalog identities read-only and owned identities note-addressable', () => {

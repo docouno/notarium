@@ -399,12 +399,25 @@ image happens to ship this month.
 
 Where the prerequisite is absent — a non-Linux host, an architecture with no
 mapped syscall ABI, or a source install without the interpreter — the engine
-does not advertise the capability at all: the FileStore has no
-`renameDirIfAbsent`, so folder moves and role installs stop before they touch the
-filesystem (P5). That is honest degradation, not a broken deployment. The two do
-not answer alike, though: where the marker prerequisite below is met, a folder
-move comes back as a refusal the client can read, a role install as a server
-error — no outward capability field was added for the latter.
+does not advertise the capabilities at all: the adapter carries no
+`directoryNoReplaceMove`, no `packagePublication` and no `strictPublication`, so
+folder moves and role installs stop before they touch the filesystem (P5). That
+is honest degradation, not a broken deployment.
+
+The two answer differently outward. A role or skill install has a pre-action
+answer: the ability library reports `installAvailability` per target, so the Add
+dialog omits unavailable Role projects, disables unavailable destination kinds
+and disables Add when no target remains. A direct POST to an unavailable target
+is still `503` with reason
+`role_install_unavailable` — composition refusal happens before a personal space
+is minted or a byte is staged. Presence answers for the deployment, not for every
+pathname: a mount or filesystem that refuses the package commit itself yields the
+same typed `503`, and nothing was published at that failing target either.
+
+A folder move has no corresponding availability read model. The client invokes
+the move, and the store then refuses the request at runtime when
+`directoryNoReplaceMove` is absent or the operation cannot be completed; the
+client receives that refusal after the action instead of disabling it beforehand.
 
 Project markers carry a *separate* prerequisite of their own. Which operations
 refuse, which fail outright, and what either looks like to a client is behaviour

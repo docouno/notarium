@@ -32,7 +32,11 @@ import {
   sha256Hex,
   SPACE_LIFECYCLE_PHASE,
 } from '@notarium/core'
-import { createLocalFsFiles, SpaceResourceAuthority } from '@notarium/engine'
+import {
+  createLocalFsFiles,
+  resourceAuthorityAdapterOf,
+  SpaceResourceAuthority,
+} from '@notarium/engine'
 
 import { type Principal, SYSTEM_PRINCIPAL } from '../authz'
 import { InstallationReplayKey, ReplayKeyring } from '../installationReplayKey'
@@ -120,7 +124,10 @@ const fixture = async (options: FixtureOptions = {}) => {
   await mkdir(resourceRoot, { recursive: true })
   const files = createLocalFsFiles(resourceRoot)
   const authority = new SpaceResourceAuthority('space-a', [
-    { id: 'notes', prefix: resourcePrefix, files, physicalRoot: resourceRoot },
+    resourceAuthorityAdapterOf(
+      { id: 'notes', prefix: resourcePrefix, physicalRoot: resourceRoot },
+      files,
+    ),
   ])
   const noteId = NOTE_ID
   const trashMode = options.mode === 'trash'

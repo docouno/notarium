@@ -182,12 +182,57 @@ export const anchoredMarkerWritesAvailable = (): boolean =>
     procSelfFdAnchor: procSelfFdAnchors(),
   })
 
+/** What a marker write needs of storage, and nothing else: the current bytes, and
+ *  a compare-and-set over them. Directory moves, package publication and entry
+ *  identity are not its dependencies — a host that cannot do any of them can
+ *  still identify a folder. */
+export type MarkerAnchoredFileView = {
+  read(path: string): Promise<string | null>
+  mutation: {
+    writeIfAbsent(path: string, content: string): Promise<boolean>
+    replaceIfAbsent(
+      from: string,
+      to: string,
+      expectedSource: string,
+      content: string,
+    ): Promise<boolean>
+    removeIfUnchanged(path: string, expectedContent: string): Promise<boolean>
+  }
+}
+
+/** Built PER WRITE, on the `/proc/self/fd/<fd>` pathname of a directory this
+ *  process has already opened. A prebuilt bundle cannot exist: the root only
+ *  comes into being once the fd does, and that is the entire point — every
+ *  relative operation then resolves through the captured inode, so a folder
+ *  renamed or recreated mid-write cannot receive the bytes. */
+export type MarkerAnchoredFilesFactory = (anchorRoot: string) => MarkerAnchoredFileView
+
 export type MarkerStoreOptions = {
   /** Pin the runtime fact instead of probing for it. `false` must survive: the
    *  option is read by presence, never by truthiness, or the one case worth
    *  testing would silently fall back to the host's real answer. */
   anchoredWritesAvailable?: boolean
+  /** The storage half of the capability. REQUIRED to pass, allowed to be
+   *  `undefined`: a composition root that cannot offer conditional file mutation
+   *  says so here, and `available` answers false for the same reason it answers
+   *  false without the host anchor — one capability, two prerequisites. */
+  anchoredFilesForRoot?: MarkerAnchoredFilesFactory | undefined
 }
+
+/** The production factory: one LocalFS assembly on the opened directory, narrowed
+ *  to the two things a marker write reaches for. Absent when the adapter declares
+ *  no conditional mutation at all. */
+export const localFsAnchoredFiles = (): MarkerAnchoredFilesFactory | undefined =>
+  createLocalFsFiles(PROC_SELF_FD).capabilities.conditionalFileMutation
+    ? (anchorRoot) => {
+        const anchored = createLocalFsFiles(anchorRoot)
+
+        return {
+          read: (path) => anchored.base.read(path),
+          mutation: anchored.capabilities.conditionalFileMutation!,
+        }
+      }
+    : undefined
 
 export const createMarkerStore = (
   notesDirFor: (space: string) => string | null,
@@ -196,6 +241,7 @@ export const createMarkerStore = (
   // Settled once per store. A `/proc` that vanishes afterwards is an operation
   // error, fail closed — this was never a hot-plug promise.
   const anchoredWrites = options.anchoredWritesAvailable ?? anchoredMarkerWritesAvailable()
+  const anchoredFilesForRoot = options.anchoredFilesForRoot
   const unavailable = (): Error =>
     Object.assign(new Error('directory-anchored marker writes are unavailable'), {
       code: 'ENOTSUP',
@@ -224,6 +270,7 @@ export const createMarkerStore = (
     rootAbs: string,
     folderPath: string,
     raw: string,
+    anchoredFiles: MarkerAnchoredFilesFactory,
   ): Promise<void> => {
     const folderAbs = absIn(rootAbs, folderPath)
     let folderHandle
@@ -242,24 +289,17 @@ export const createMarkerStore = (
       // `/proc/self/fd/N` resolves every relative operation through the opened
       // directory inode. If the public folder is renamed/recreated midway, a
       // temp or journal path can never be rebound into the replacement folder.
-      const anchored = createLocalFsFiles(fdPath(folderHandle.fd))
+      // The exact `/proc/self/fd/<fd>` of the directory just opened — never the
+      // public pathname it was reached by.
+      const anchored = anchoredFiles(fdPath(folderHandle.fd))
+      const mutation = anchored.mutation
       const before = await anchored.read(MARKER_FILENAME)
       let written: boolean
 
       if (before == null) {
-        if (!anchored.writeIfAbsent) {
-          throw Object.assign(new Error('atomic marker create is unavailable'), {
-            code: 'ENOTSUP',
-          })
-        }
-        written = await anchored.writeIfAbsent(MARKER_FILENAME, raw)
+        written = await mutation.writeIfAbsent(MARKER_FILENAME, raw)
       } else {
-        if (!anchored.replaceIfAbsent) {
-          throw Object.assign(new Error('atomic marker replace is unavailable'), {
-            code: 'ENOTSUP',
-          })
-        }
-        written = await anchored.replaceIfAbsent(MARKER_FILENAME, MARKER_FILENAME, before, raw)
+        written = await mutation.replaceIfAbsent(MARKER_FILENAME, MARKER_FILENAME, before, raw)
       }
 
       if (!written) {
@@ -279,8 +319,8 @@ export const createMarkerStore = (
       // stale parent; a second writer wins rather than being overwritten.
       const rolledBack =
         before == null
-          ? await anchored.removeIfUnchanged?.(MARKER_FILENAME, raw)
-          : await anchored.replaceIfAbsent?.(MARKER_FILENAME, MARKER_FILENAME, raw, before)
+          ? await mutation.removeIfUnchanged(MARKER_FILENAME, raw)
+          : await mutation.replaceIfAbsent(MARKER_FILENAME, MARKER_FILENAME, raw, before)
 
       if (!rolledBack) {
         throw Object.assign(new Error('marker parent changed; rollback was not safe'), {
@@ -294,7 +334,12 @@ export const createMarkerStore = (
   }
 
   return {
-    available: (space) => anchoredWrites && notesDirFor(space) !== null,
+    // One capability, three prerequisites, all settled without touching a disk:
+    // the host anchor, the storage half composition handed over, and a notes dir
+    // to anchor inside. A `true` that skipped any of them would be discovered
+    // mid-write, which is what this method exists to prevent.
+    available: (space) =>
+      anchoredWrites && anchoredFilesForRoot !== undefined && notesDirFor(space) !== null,
 
     write: async (space, folderPath, raw) => {
       // The mount-boundary refusal stays first: it is a pure string verdict that
@@ -304,7 +349,7 @@ export const createMarkerStore = (
       }
       // Then the runtime, still before `rootFor`, the directory open and any
       // temp/CAS byte: an unsupported host starts no marker mutation at all.
-      if (!anchoredWrites) {
+      if (!anchoredWrites || !anchoredFilesForRoot) {
         throw unavailable()
       }
       const rootAbs = rootFor(space)
@@ -312,7 +357,7 @@ export const createMarkerStore = (
       if (!rootAbs) {
         throw new Error(`no marker storage for space ${space}`)
       }
-      await writeInExistingFolder(rootAbs, folderPath, raw)
+      await writeInExistingFolder(rootAbs, folderPath, raw, anchoredFilesForRoot)
     },
 
     read: async (space, folderPath) => {
@@ -339,7 +384,7 @@ export const createMarkerStore = (
       }
       // localFs.remove unlinks + best-effort prunes emptied dirs; a folder that
       // still holds notes stays.
-      await createLocalFsFiles(dir).remove(markerRelPath(folderPath))
+      await createLocalFsFiles(dir).base.remove(markerRelPath(folderPath))
     },
 
     folderExists: async (space, folderPath) => {

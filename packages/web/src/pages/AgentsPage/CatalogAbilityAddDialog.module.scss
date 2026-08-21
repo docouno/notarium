@@ -1,3 +1,14 @@
+.notice {
+  margin: 0;
+  padding: 11px 13px;
+  color: var(--text-dim);
+  font-size: 12.5px;
+  line-height: 1.45;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-list);
+}
+
 .field {
   display: flex;
   flex-direction: column;

@@ -12,13 +12,10 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { createLocalFsFiles } from '../../libs/files'
 import { createNodeSqliteDriver } from '../../libs/sql'
 import { NotariumStore } from './notariumStore'
-import type { EngineMount } from './types'
+import { type EngineMount, engineMountOf } from './types'
 
-const userMount = (dir: string): EngineMount => ({
-  class: 'user-doc',
-  prefix: '',
-  files: createLocalFsFiles(dir),
-})
+const userMount = (dir: string): EngineMount =>
+  engineMountOf({ class: 'user-doc', prefix: '' }, createLocalFsFiles(dir))
 
 describe('NotariumStore graphHealth (#100 phase 5)', () => {
   let notesDir: string

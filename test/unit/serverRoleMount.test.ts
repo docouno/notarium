@@ -16,6 +16,7 @@ import {
   type SkillPackage,
 } from '../../packages/server/src/services/roles'
 import { describeAtomicPublish } from '../role-library-contract/atomicPublishGate'
+import { writableLibrary } from '../roleLibraryComposition'
 
 let root: string
 let app: FastifyInstance | undefined
@@ -568,14 +569,16 @@ describe('createServer — configured role mount', () => {
           ],
         ]),
       }
-      const library = createFsRoleLibrary({
-        publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
-        rootForSpace: () => skillDir,
-      })
+      const library = writableLibrary(
+        createFsRoleLibrary({
+          publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+          rootForSpace: () => skillDir,
+        }),
+      )
       const roles = createRolesService({
         ...inMemoryAbilityPersistence(),
         catalog: async () => [],
-        library,
+        ...library.deps,
       })
 
       await expect(

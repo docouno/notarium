@@ -15,7 +15,7 @@ import type { Embedder } from '../../libs/embedding'
 import { createLocalFsFiles } from '../../libs/files'
 import { createNodeSqliteDriver } from '../../libs/sql'
 import { NotariumStore } from './notariumStore'
-import type { EngineMount } from './types'
+import { type EngineMount, engineMountOf } from './types'
 import { describeVector } from './vectorGate.fixture'
 
 const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0))
@@ -57,11 +57,8 @@ const gatedEmbedder = (concurrency: number, dimensions = 8) => {
   return { embedder, state }
 }
 
-const userMount = (dir: string): EngineMount => ({
-  class: 'user-doc',
-  prefix: '',
-  files: createLocalFsFiles(dir),
-})
+const userMount = (dir: string): EngineMount =>
+  engineMountOf({ class: 'user-doc', prefix: '' }, createLocalFsFiles(dir))
 
 /** Like gatedEmbedder but tracks concurrency PER embed-input (so per note): a second
  *  concurrent embed of the SAME text bumps maxPerKey to 2. Gates carry their key so a

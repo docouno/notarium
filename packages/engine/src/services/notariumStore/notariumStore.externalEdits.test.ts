@@ -4,12 +4,13 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { sha256Hex } from '@notarium/core'
 
-import type { FileStat, FileStore } from '../../libs/files'
+import type { FileStat, FileStore, FileStoreAssembly } from '../../libs/files'
 import { createLocalFsFiles } from '../../libs/files'
 import { createNodeSqliteDriver, type SqlDriver } from '../../libs/sql'
 import { createNotariumStore } from './createNotariumStore'
 import { NotariumStore } from './notariumStore'
 import { INDEX_MIGRATIONS, INDEX_VERSION_KEY, META_INTEGRITY_SWEEP_CURSOR } from './schema'
+import { engineMountOf } from './types'
 
 const roots: string[] = []
 const fixedTime = new Date('2026-07-23T12:00:00.000Z')
@@ -32,12 +33,13 @@ const writePreservingMtime = async (root: string, path: string, raw: string): Pr
 const staticTokenFiles = (
   root: string,
 ): {
-  files: FileStore
+  assembly: FileStoreAssembly
   signal(path: string | null): void
   setUnreadable(path: string, unreadable: boolean): void
   readCount(path: string): number
 } => {
-  const base = createLocalFsFiles(root)
+  const adapter = createLocalFsFiles(root)
+  const base = adapter.base
   let listener: ((path: string | null) => void) | null = null
   const unreadable = new Set<string>()
   const reads = new Map<string, number>()
@@ -53,16 +55,24 @@ const staticTokenFiles = (
       reads.set(path, (reads.get(path) ?? 0) + 1)
       return unreadable.has(path) ? Promise.resolve(null) : base.read(path)
     },
-    watch: (onChange) => {
-      listener = onChange
-      return () => {
-        listener = null
-      }
-    },
   }
 
   return {
-    files,
+    assembly: {
+      base: files,
+      capabilities: {
+        ...adapter.capabilities,
+        watch: {
+          watch: (onChange) => {
+            listener = onChange
+            return () => {
+              listener = null
+            }
+          },
+        },
+      },
+      accelerators: adapter.accelerators,
+    },
     signal: (path) => listener?.(path),
     setUnreadable: (path, value) => {
       if (value) {
@@ -75,7 +85,9 @@ const staticTokenFiles = (
   }
 }
 
-const userMount = (files: FileStore) => [{ class: 'user-doc' as const, prefix: '', files }]
+const userMount = (assembly: FileStoreAssembly) => [
+  engineMountOf({ class: 'user-doc', prefix: '' }, assembly),
+]
 
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })))
@@ -124,7 +136,7 @@ describe('NotariumStore external edit convergence', () => {
     await writePreservingMtime(root, 'probe.md', '# Probe\n\nAAAA')
     const adapter = staticTokenFiles(root)
     const store = new NotariumStore({
-      mounts: userMount(adapter.files),
+      mounts: userMount(adapter.assembly),
       sql: createNodeSqliteDriver(':memory:'),
       integritySweepBatchSize: 0,
     })
@@ -158,7 +170,7 @@ describe('NotariumStore external edit convergence', () => {
     await writePreservingMtime(root, 'probe.md', '# Probe\n\nAAAA')
     const adapter = staticTokenFiles(root)
     const store = new NotariumStore({
-      mounts: userMount(adapter.files),
+      mounts: userMount(adapter.assembly),
       sql: createNodeSqliteDriver(':memory:'),
       integritySweepBatchSize: 1,
     })
@@ -191,7 +203,7 @@ describe('NotariumStore external edit convergence', () => {
     await writePreservingMtime(root, 'probe.md', before)
     const adapter = staticTokenFiles(root)
     const store = new NotariumStore({
-      mounts: userMount(adapter.files),
+      mounts: userMount(adapter.assembly),
       sql: createNodeSqliteDriver(':memory:'),
       integritySweepBatchSize: 1,
     })
@@ -236,7 +248,7 @@ describe('NotariumStore external edit convergence', () => {
     }
     const adapter = staticTokenFiles(root)
     let store = new NotariumStore({
-      mounts: userMount(adapter.files),
+      mounts: userMount(adapter.assembly),
       sql: createNodeSqliteDriver(indexDb),
       integritySweepBatchSize: 1,
     })
@@ -254,7 +266,7 @@ describe('NotariumStore external edit convergence', () => {
     await db.close()
 
     store = new NotariumStore({
-      mounts: userMount(adapter.files),
+      mounts: userMount(adapter.assembly),
       sql: createNodeSqliteDriver(indexDb),
       integritySweepBatchSize: 1,
     })
@@ -281,7 +293,7 @@ describe('NotariumStore external edit convergence', () => {
     const adapter = staticTokenFiles(root)
     const sql = createNodeSqliteDriver(':memory:')
     const store = new NotariumStore({
-      mounts: userMount(adapter.files),
+      mounts: userMount(adapter.assembly),
       sql,
       integritySweepBatchSize: 1,
     })
@@ -317,7 +329,7 @@ describe('NotariumStore external edit convergence', () => {
     }
     const adapter = staticTokenFiles(root)
     const store = new NotariumStore({
-      mounts: userMount(adapter.files),
+      mounts: userMount(adapter.assembly),
       sql: createNodeSqliteDriver(':memory:'),
       integritySweepBatchSize: 1,
     })
@@ -361,13 +373,13 @@ describe('NotariumStore external edit convergence', () => {
     const adapter = staticTokenFiles(root)
     const sql = createNodeSqliteDriver(':memory:')
     const store = new NotariumStore({
-      mounts: userMount(adapter.files),
+      mounts: userMount(adapter.assembly),
       sql,
       integritySweepBatchSize: 1,
     })
     await store.list()
     await writePreservingMtime(root, 'a.md', newRaw)
-    const baseStat = await adapter.files.stat('a.md')
+    const baseStat = await adapter.assembly.base.stat('a.md')
 
     if (!baseStat) {
       throw new Error('missing test stat')
@@ -481,12 +493,12 @@ describe('NotariumStore external edit convergence', () => {
       },
     }
     const store = new NotariumStore({
-      mounts: userMount(adapter.files),
+      mounts: userMount(adapter.assembly),
       sql,
       integritySweepBatchSize: 0,
     })
     await store.list()
-    const stat = await adapter.files.stat('a.md')
+    const stat = await adapter.assembly.base.stat('a.md')
 
     if (!stat) {
       throw new Error('missing test stat')
@@ -584,7 +596,7 @@ describe('NotariumStore external edit convergence', () => {
       },
     }
     const store = new NotariumStore({
-      mounts: userMount(adapter.files),
+      mounts: userMount(adapter.assembly),
       sql,
       integritySweepBatchSize: 0,
     })
@@ -605,7 +617,7 @@ describe('NotariumStore external edit convergence', () => {
 
     try {
       const seed = await store.changes(null)
-      const stat = await adapter.files.stat('a.md')
+      const stat = await adapter.assembly.base.stat('a.md')
 
       if (!stat) {
         throw new Error('missing test stat')
@@ -676,7 +688,7 @@ describe('NotariumStore external edit convergence', () => {
     await writePreservingMtime(root, 'probe.md', '# Probe\n\nbody')
     const adapter = staticTokenFiles(root)
     let store = new NotariumStore({
-      mounts: userMount(adapter.files),
+      mounts: userMount(adapter.assembly),
       sql: createNodeSqliteDriver(indexDb),
       integritySweepBatchSize: 0,
       // Current write SQL needs the newest notes-table shape. Remove that
@@ -691,7 +703,7 @@ describe('NotariumStore external edit convergence', () => {
     await legacy.close()
 
     store = new NotariumStore({
-      mounts: userMount(adapter.files),
+      mounts: userMount(adapter.assembly),
       sql: createNodeSqliteDriver(indexDb),
       integritySweepBatchSize: 1,
     })

@@ -1,8 +1,15 @@
 import type {
   FileClaim,
+  FileClaimedRemoval,
   FileObservation,
+  FilePackagePublication,
   FileProofTransition,
-  FileStore,
+  FileResourceExport,
+  FileResourceObservation,
+  FileResourcePublication,
+  FileStat,
+  FileStoreAssembly,
+  FileStrictPublication,
   FileStrictStageHeader,
 } from '../files'
 
@@ -52,13 +59,72 @@ export type AdmissionDiagnostic = {
   deadlineAt: number | null
 }
 
+/** The base inventory the authority itself needs: enumerate a placement, read a
+ *  manifest, and tell a directory from a file. Deliberately three operations and
+ *  not the whole port — the authority owns physical bytes and admission, so it
+ *  has no business reaching a directory move or a note write. */
+export type ResourceAuthorityFileView = {
+  scan(): Promise<FileStat[]>
+  read(path: string): Promise<string | null>
+  dirExists(path: string): Promise<boolean>
+}
+
+/** Which physical-byte guarantees this adapter declared. Each one is checked on
+ *  its own, because each degrades on its own: an adapter can observe without
+ *  being able to publish, and publish single resources without being able to
+ *  install a package. */
+export type ResourceAuthorityFileCapabilities = {
+  resourceExport?: FileResourceExport
+  resourceObservation?: FileResourceObservation
+  resourcePublication?: FileResourcePublication
+  claimedRemoval?: FileClaimedRemoval
+  packagePublication?: FilePackagePublication
+  strictPublication?: FileStrictPublication
+}
+
 export type ResourceAuthorityAdapter = {
   id: string
   prefix: string
-  files: FileStore
+  files: ResourceAuthorityFileView
+  capabilities: ResourceAuthorityFileCapabilities
   /** Physical root used only for composition validation. */
   physicalRoot?: string
 }
+
+/** Project one adapter assembly onto one authority adapter — the counterpart of
+ *  `engineMountOf`, and the reason neither consumer ever holds the aggregate. */
+export const resourceAuthorityAdapterOf = (
+  identity: { id: string; prefix: string; physicalRoot?: string },
+  assembly: FileStoreAssembly,
+): ResourceAuthorityAdapter => ({
+  id: identity.id,
+  prefix: identity.prefix,
+  ...(identity.physicalRoot === undefined ? {} : { physicalRoot: identity.physicalRoot }),
+  // The base port itself, narrowed by the field's TYPE rather than by a wrapper:
+  // the authority cannot name an operation outside the view, and one adapter
+  // still shares the single lock/recovery context of its root.
+  files: assembly.base,
+  capabilities: {
+    ...(assembly.capabilities.resourceExport
+      ? { resourceExport: assembly.capabilities.resourceExport }
+      : {}),
+    ...(assembly.capabilities.resourceObservation
+      ? { resourceObservation: assembly.capabilities.resourceObservation }
+      : {}),
+    ...(assembly.capabilities.resourcePublication
+      ? { resourcePublication: assembly.capabilities.resourcePublication }
+      : {}),
+    ...(assembly.capabilities.claimedRemoval
+      ? { claimedRemoval: assembly.capabilities.claimedRemoval }
+      : {}),
+    ...(assembly.capabilities.packagePublication
+      ? { packagePublication: assembly.capabilities.packagePublication }
+      : {}),
+    ...(assembly.capabilities.strictPublication
+      ? { strictPublication: assembly.capabilities.strictPublication }
+      : {}),
+  },
+})
 
 export type ResourceObservation = FileObservation & {
   spaceId: string
@@ -94,6 +160,20 @@ export type ResourcePackagePublicationRequest = {
   rootPath: string
   files: ReadonlyArray<{ path: string; content: Uint8Array }>
   expectedRoot: FileClaim & { kind: 'absent' }
+}
+
+/** One placement's package publication, handed out only where the adapter can
+ *  actually perform the whole protocol. Its EXISTENCE is the availability
+ *  answer, so a caller asks composition once and never probes a method.
+ *
+ *  The claim never leaves this object: routing, the strict absent observation it
+ *  is derived from, the placement-wide manifest-name check and the commit are
+ *  one admitted decision. Split across a caller, another writer could take the
+ *  name between the check and the publication that acts on it. */
+export type PackagePublicationView = {
+  publishIfAbsent(
+    request: Omit<ResourcePackagePublicationRequest, 'expectedRoot'>,
+  ): Promise<ResourcePublicationResult>
 }
 
 export type ResourceProofTransition = Omit<FileProofTransition, 'path'> & { path: string }

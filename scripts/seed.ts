@@ -52,6 +52,7 @@ import {
   healSpaceMarker,
   JOB_KIND_EXPORT,
   loadBundledAbilityInventory,
+  localFsAnchoredFiles,
   markFolderAsProject,
   mintOAuthAccessToken,
   mintOAuthRefreshToken,
@@ -216,7 +217,9 @@ const run = async (): Promise<void> => {
     const rec = manager.recOf(id)
     return rec ? join(spacesRoot, rec.notesDir) : null
   }
-  const markerStore = createMarkerStore((id) => notesDirOf(id))
+  const markerStore = createMarkerStore((id) => notesDirOf(id), {
+    anchoredFilesForRoot: localFsAnchoredFiles(),
+  })
 
   const manager = new SpaceManager({
     spaces: [],
@@ -420,7 +423,8 @@ const run = async (): Promise<void> => {
   })
   const roleService = createRolesService({
     catalog: loadBundledAbilityInventory,
-    library: roleLibrary,
+    library: roleLibrary.library,
+    publication: roleLibrary.publication,
     abilityAvailability: metaDb.abilityAvailability,
     abilityPreferences: metaDb.abilityPreferences,
     abilityPlacement: metaDb.abilityPlacement,
@@ -508,7 +512,7 @@ const run = async (): Promise<void> => {
   const appliedSkills = await applyAgentSkillDeclarations({
     declarations: world.agentSkills ?? [],
     roles: roleService,
-    library: roleLibrary,
+    library: roleLibrary.library,
     storeForSpace: seedStoreForSpace,
     resolveLocation: async (declaration) => {
       const home = declaration.home
@@ -617,7 +621,9 @@ const run = async (): Promise<void> => {
                 : null
             })()
 
-    const rolePackage = location ? await roleLibrary.getSkill(location, declaration.name) : null
+    const rolePackage = location
+      ? await roleLibrary.library.getSkill(location, declaration.name)
+      : null
     // The service decides personal-vs-Space from the locator, so it needs the personal
     // space of the owner this declaration names — never the seeder's own. Asked of the
     // PLACEMENT rather than of the declaration's kind: a role sitting in a project of

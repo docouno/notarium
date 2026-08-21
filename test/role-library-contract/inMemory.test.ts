@@ -1,13 +1,14 @@
 import { createInMemoryRoleLibrary } from '../../packages/server/src/services/roles'
+import { writableLibrary } from '../roleLibraryComposition'
 import {
   describeRoleLibraryAddressCollisionContract,
   describeRoleLibraryContract,
 } from './roleLibraryContract'
 
 describeRoleLibraryContract('InMemoryRoleLibrary', async () => ({
-  library: createInMemoryRoleLibrary(),
+  library: writableLibrary(createInMemoryRoleLibrary()),
 }))
 
 describeRoleLibraryAddressCollisionContract('InMemoryRoleLibrary', async () => ({
-  library: createInMemoryRoleLibrary(),
+  library: writableLibrary(createInMemoryRoleLibrary()),
 }))

@@ -23,13 +23,16 @@ import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 
 import { clipToBytes, isAtomicInstallTempPath, UNNAMED_NOTE_FILENAME } from '@notarium/core'
 import { renameNoReplace, renameNoReplaceIfAvailable } from './renameNoReplace'
+import { FilePackagePublicationUnavailableError } from './types'
 import type {
   FileClaim,
   FileObservation,
+  FilePackagePublication,
   FilePublicationResult,
   FileStat,
-  FileStore,
+  FileStoreAssembly,
   FileStrictMutationReceipt,
+  FileStrictPublication,
   FileStrictPublicationResult,
   FileStrictStageHeader,
   FileStrictStageRequest,
@@ -273,7 +276,7 @@ const writeTemp = async (dir: string, content: string | Uint8Array): Promise<str
   throw collision ?? new Error('failed to claim a temporary file')
 }
 
-export const createLocalFsFiles = (root: string): FileStore => {
+export const createLocalFsFiles = (root: string): FileStoreAssembly => {
   const rootAbs = resolve(root)
   // Fixed once, here: the adapter's SHAPE must not change under a caller that
   // already read it. An interpreter that disappears mid-life is an operation
@@ -2183,6 +2186,7 @@ export const createLocalFsFiles = (root: string): FileStore => {
   const restoreStrictDetached = async (
     paths: StrictStagePaths,
     target: string,
+    publish: typeof renameNoReplace,
   ): Promise<boolean> => {
     if (!(await pathExists(paths.detachedOriginal))) {
       return true
@@ -2191,7 +2195,7 @@ export const createLocalFsFiles = (root: string): FileStore => {
       return sameInode(target, paths.detachedOriginal)
     }
     try {
-      if (await renameNoReplace(paths.detachedOriginal, target)) {
+      if (await publish(paths.detachedOriginal, target)) {
         await syncDirectory(dirname(target))
         await syncDirectory(paths.dir)
         return true
@@ -2220,6 +2224,7 @@ export const createLocalFsFiles = (root: string): FileStore => {
   const publishStrictStage = async (
     paths: StrictStagePaths,
     stage: FileStrictStageHeader,
+    publish: typeof renameNoReplace,
   ): Promise<FileStrictPublicationResult> => {
     const candidate = await readRegularBytes(paths.candidate)
 
@@ -2368,7 +2373,7 @@ export const createLocalFsFiles = (root: string): FileStore => {
       await syncDirectory(paths.dir)
 
       if (!(await sameInode(paths.detachedOriginal, paths.original))) {
-        if (!(await restoreStrictDetached(paths, target))) {
+        if (!(await restoreStrictDetached(paths, target, publish))) {
           return markStrictFailure(paths, stage, 'foreign target was displaced during detach')
         }
         await clearStrictPublishing(paths)
@@ -2377,7 +2382,7 @@ export const createLocalFsFiles = (root: string): FileStore => {
       const detachedBytes = await readRegularBytes(paths.detachedOriginal)
 
       if (detachedBytes == null || !bytesEqual(detachedBytes, originalSnapshot)) {
-        if (!(await restoreStrictDetached(paths, target))) {
+        if (!(await restoreStrictDetached(paths, target, publish))) {
           return markStrictFailure(
             paths,
             stage,
@@ -2413,6 +2418,7 @@ export const createLocalFsFiles = (root: string): FileStore => {
 
   const stageStrictCandidate = async (
     request: FileStrictStageRequest,
+    publish: typeof renameNoReplace,
   ): Promise<FileStrictStageResult> => {
     if (!validStrictText(request.operationId) || !validStrictText(request.binding)) {
       throw new Error('strict stage requires bounded operation and binding identifiers')
@@ -2468,7 +2474,7 @@ export const createLocalFsFiles = (root: string): FileStore => {
         await candidateHandle.close()
       }
       await syncDirectory(temp)
-      if (!(await renameNoReplace(temp, paths.dir))) {
+      if (!(await publish(temp, paths.dir))) {
         const raced = await readStrictStage(request.operationId)
 
         if (raced.status === 'missing') {
@@ -2499,283 +2505,12 @@ export const createLocalFsFiles = (root: string): FileStore => {
     }
   }
 
-  return {
-    scan: async () => {
-      await ensureRecovered()
-      const out: FileStat[] = []
-
-      const walk = async (dirAbs: string): Promise<void> => {
-        let entries
-
-        try {
-          entries = await fs.readdir(dirAbs, { withFileTypes: true })
-        } catch {
-          return // the dir vanished mid-scan — the next rescan reconverges
-        }
-        for (const e of entries) {
-          // The ONE dot-file the scan does not hide is UNNAMED_NOTE_FILENAME: not
-          // somebody's hidden state but our own legacy note (#296), and hiding it is
-          // what made the reconcile read a live file as an external delete. Surfacing
-          // it lets the engine re-adopt/index the legacy identity instead of producing
-          // a tombstone. LocalFS can now migrate it with the no-replace primitive
-          // below. Narrow on purpose:
-          // EXACTLY `.md`, never `.anything.md`, so atomic-write temps stay hidden.
-          if (hidden(e.name) && !(e.isFile() && e.name === UNNAMED_NOTE_FILENAME)) {
-            continue
-          }
-          const full = join(dirAbs, e.name)
-
-          if (e.isDirectory()) {
-            await walk(full)
-          } else if (e.isFile() && e.name.endsWith('.md')) {
-            const s = await statOf(toPosix(relative(rootAbs, full)))
-
-            if (s) {
-              out.push(s)
-            }
-          }
-        }
-      }
-      await walk(rootAbs)
-      return out
-    },
-
-    async *exportFiles() {
-      const walk = async function* (
-        dirAbs: string,
-      ): AsyncIterable<{ path: string; content: Uint8Array }> {
-        let entries
-
-        try {
-          entries = await fs.readdir(dirAbs, { withFileTypes: true })
-        } catch (err) {
-          if (errnoCode(err) === 'ENOENT') {
-            return // vanished during export — the next snapshot reconverges
-          }
-          throw err
-        }
-        for (const entry of entries) {
-          // Atomic role installs can stage at the mount root or below a Project
-          // namespace. They are never published package truth and must not leak
-          // into a concurrent export. Other dot resources are preserved.
-          const full = join(dirAbs, entry.name)
-          const exportPath = toPosix(relative(rootAbs, full))
-
-          if (
-            entry.isDirectory() &&
-            (exportPath === FS_OPS_DIR || isAtomicInstallTempPath(exportPath))
-          ) {
-            continue
-          }
-
-          if (entry.isDirectory()) {
-            yield* walk(full)
-          } else if (entry.isFile()) {
-            try {
-              yield {
-                path: exportPath,
-                content: await fs.readFile(full),
-              }
-            } catch (err) {
-              if (errnoCode(err) !== 'ENOENT') {
-                throw err
-              }
-            }
-          }
-        }
-      }
-
-      yield* walk(rootAbs)
-    },
-
-    listDirs: async () => {
-      await ensureRecovered()
-      // The directory channel (#97): every non-dot directory under the root, on
-      // its OWN typed walk — never mixed into scan()'s FileStat[] (the index =
-      // notes-only invariant #78). Dot-dirs are skipped (.git/.obsidian and the
-      // .notarium agent-mount), so only user-visible folders surface into the
-      // tree. The root itself ('') is not a folder node — it is excluded.
-      const out: string[] = []
-
-      const walk = async (dirAbs: string): Promise<void> => {
-        let entries
-
-        try {
-          entries = await fs.readdir(dirAbs, { withFileTypes: true })
-        } catch {
-          return // vanished mid-walk — the next listing reconverges
-        }
-        for (const e of entries) {
-          if (!e.isDirectory() || hidden(e.name)) {
-            continue
-          }
-          const full = join(dirAbs, e.name)
-          out.push(toPosix(relative(rootAbs, full)))
-          await walk(full)
-        }
-      }
-      await walk(rootAbs)
-      return out
-    },
-
-    stat: async (rel) => {
-      await ensureRecovered()
-      return statOf(rel)
-    },
-
-    read: async (rel) => {
-      await ensureRecovered()
-      return readRegular(abs(rel))
-    },
-
-    readBytes: async (rel) => {
-      await ensureRecovered()
-      const observation = await observeRegular(rel)
-
-      return observation.kind === 'present' ? observation.bytes : null
-    },
-
-    observe: async (rel, options) => {
-      await ensureRecovered()
-      return observeRegular(rel, options)
-    },
-
-    publish: (request) =>
-      withStorageLock(async (): Promise<FilePublicationResult> => {
-        await ensureRecoveredUnlocked()
-        const candidateHash = sha256Bytes(request.content)
-
-        if (request.kind === 'put') {
-          const current = await observeRegular(request.path)
-
-          if (current.kind === 'unavailable') {
-            return { status: 'conflict' }
-          }
-          if (!claimMatches(request.expected, current.claim)) {
-            return { status: 'conflict' }
-          }
-          if (current.kind === 'absent') {
-            const target = abs(request.path)
-            const dir = dirname(target)
-            await fs.mkdir(dir, { recursive: true })
-            const tmp = await writeTemp(dir, request.content)
-
-            try {
-              try {
-                await fs.link(tmp, target)
-              } catch (err) {
-                if (errnoCode(err) === 'EEXIST') {
-                  return { status: 'conflict' }
-                }
-                throw err
-              }
-              const proof = await proofAfterOwnedCleanup(tmp, target, request.content, () =>
-                fs.unlink(tmp),
-              )
-
-              return {
-                status: 'published',
-                candidateHash,
-                transitions: [
-                  {
-                    path: request.path,
-                    before: current.claim,
-                    after: proof.claim,
-                    mtimeMs: proof.mtimeMs,
-                  },
-                ],
-              }
-            } finally {
-              await fs.unlink(tmp).catch(() => {})
-            }
-          }
-          if (current.kind === 'occupied') {
-            const replaced = await replaceOccupiedBytes(
-              abs(request.path),
-              current.claim.value,
-              request.content,
-            )
-
-            return replaced.published
-              ? {
-                  status: 'published',
-                  candidateHash,
-                  transitions: [
-                    {
-                      path: request.path,
-                      before: current.claim,
-                      after: replaced.proof.claim,
-                      mtimeMs: replaced.proof.mtimeMs,
-                    },
-                  ],
-                }
-              : { status: 'conflict' }
-          }
-          const replaced = await replaceAbsentBytes(
-            abs(request.path),
-            abs(request.path),
-            current.bytes,
-            request.content,
-          )
-
-          return replaced.published
-            ? {
-                status: 'published',
-                candidateHash,
-                transitions: [
-                  {
-                    path: request.path,
-                    before: current.claim,
-                    after: replaced.proof.claim,
-                    mtimeMs: replaced.proof.mtimeMs,
-                  },
-                ],
-              }
-            : { status: 'conflict' }
-        }
-
-        const [source, target] = await Promise.all([
-          observeRegular(request.sourcePath),
-          observeRegular(request.targetPath),
-        ])
-
-        if (
-          source.kind !== 'present' ||
-          target.kind !== 'absent' ||
-          !claimMatches(source.claim, request.expectedSource) ||
-          !claimMatches(target.claim, request.expectedTarget)
-        ) {
-          return { status: 'conflict' }
-        }
-        const replaced = await replaceAbsentBytes(
-          abs(request.sourcePath),
-          abs(request.targetPath),
-          source.bytes,
-          request.content,
-        )
-
-        return replaced.published
-          ? {
-              status: 'published',
-              candidateHash,
-              transitions: [
-                {
-                  path: request.sourcePath,
-                  before: source.claim,
-                  after: absentFileClaim(request.sourcePath),
-                  mtimeMs: null,
-                },
-                {
-                  path: request.targetPath,
-                  before: target.claim,
-                  after: replaced.proof.claim,
-                  mtimeMs: replaced.proof.mtimeMs,
-                },
-              ],
-            }
-          : { status: 'conflict' }
-      }),
-
+  /** Built ONLY when the runtime handed the primitive over, and taking it as a
+   *  parameter is what makes that provable: an aggregate package lands by
+   *  renaming its staged root onto an absent pathname, so a deployment without
+   *  that rename cannot publish a package at all — and must say so at
+   *  composition rather than half-way through a staged tree. */
+  const packagePublicationWith = (publish: typeof renameNoReplace): FilePackagePublication => ({
     publishPackageIfAbsent: (request) => {
       const files = request.files.map((file) => ({
         path: file.path,
@@ -2829,7 +2564,26 @@ export const createLocalFsFiles = (root: string): FileStore => {
               await fs.lstat(join(temp, ...file.path.split('/')), { bigint: true }),
             )
           }
-          if (!(await renameNoReplace(temp, target))) {
+          let committed: boolean
+
+          // The ONLY place a refusal can still be read as "nothing happened".
+          // Wrapping anything wider would cover the proof checks below, whose
+          // failure says the package may well be on disk.
+          try {
+            committed = await publish(temp, target)
+          } catch (err) {
+            const code = errnoCode(err)
+
+            if (code === 'ENOTSUP' || code === 'EXDEV') {
+              throw new FilePackagePublicationUnavailableError(
+                `package publication is unavailable at ${request.rootPath}`,
+                { cause: err },
+              )
+            }
+            throw err
+          }
+
+          if (!committed) {
             return { status: 'conflict' }
           }
           const publishedRoot = await fs.lstat(target, { bigint: true })
@@ -2873,105 +2627,92 @@ export const createLocalFsFiles = (root: string): FileStore => {
         }
       })
     },
+  })
 
-    strictPublication: {
-      restartDurable: true,
-      stage: (request) => {
-        const captured: FileStrictStageRequest = {
-          ...request,
-          expected: { ...request.expected },
-          content: Uint8Array.from(request.content),
+  /** Same primitive, same reason, different contract: the strict protocol makes
+   *  its stage directory visible with one no-replace rename and restores a
+   *  detached original the same way. Restart durability is what it promises, and
+   *  it cannot promise it on a runtime that has no atomic namespace transition. */
+  const strictPublicationWith = (publish: typeof renameNoReplace): FileStrictPublication => ({
+    restartDurable: true,
+    stage: (request) => {
+      const captured: FileStrictStageRequest = {
+        ...request,
+        expected: { ...request.expected },
+        content: Uint8Array.from(request.content),
+      }
+
+      return withStorageLock(() => stageStrictCandidate(captured, publish))
+    },
+    inspect: (operationId, binding) =>
+      withStorageLock(async () => {
+        const state = await readStrictStage(operationId)
+
+        if (state.status !== 'missing') {
+          assertStrictBinding(state, binding)
         }
 
-        return withStorageLock(() => stageStrictCandidate(captured))
-      },
-      inspect: (operationId, binding) =>
-        withStorageLock(async () => {
-          const state = await readStrictStage(operationId)
+        return state
+      }),
+    publish: (operationId, binding) =>
+      withStorageLock(async () => {
+        await ensureRecoveredUnlocked()
+        const state = await readStrictStage(operationId)
 
-          if (state.status !== 'missing') {
-            assertStrictBinding(state, binding)
-          }
+        if (state.status === 'missing') {
+          throw Object.assign(new Error('strict stage is missing'), {
+            code: 'STRICT_STAGE_MISSING',
+          })
+        }
+        assertStrictBinding(state, binding)
 
+        if (state.status === 'published') {
+          return { status: 'published', receipt: state.receipt }
+        }
+        if (state.status === 'failed-recoverable') {
           return state
-        }),
-      publish: (operationId, binding) =>
-        withStorageLock(async () => {
-          await ensureRecoveredUnlocked()
-          const state = await readStrictStage(operationId)
+        }
+        const paths = strictStagePaths(operationId)
 
-          if (state.status === 'missing') {
-            throw Object.assign(new Error('strict stage is missing'), {
-              code: 'STRICT_STAGE_MISSING',
-            })
+        if (state.status === 'staged') {
+          await writeMarker(paths.publishing)
+          await syncDirectory(paths.dir)
+        }
+
+        return publishStrictStage(paths, state.stage, publish)
+      }),
+    discard: (operationId, binding) =>
+      withStorageLock(async () => {
+        const paths = strictStagePaths(operationId)
+        let header: FileStrictStageHeader | null = null
+
+        try {
+          const disk = parseStrictHeader(await fs.readFile(paths.header, 'utf8'), operationId)
+          header = {
+            operationId: disk.operationId,
+            binding: disk.binding,
+            path: disk.path,
+            expected: disk.expected,
+            candidateHash: disk.candidateHash,
           }
-          assertStrictBinding(state, binding)
-
-          if (state.status === 'published') {
-            return { status: 'published', receipt: state.receipt }
-          }
-          if (state.status === 'failed-recoverable') {
-            return state
-          }
-          const paths = strictStagePaths(operationId)
-
-          if (state.status === 'staged') {
-            await writeMarker(paths.publishing)
-            await syncDirectory(paths.dir)
-          }
-
-          return publishStrictStage(paths, state.stage)
-        }),
-      discard: (operationId, binding) =>
-        withStorageLock(async () => {
-          const paths = strictStagePaths(operationId)
-          let header: FileStrictStageHeader | null = null
-
-          try {
-            const disk = parseStrictHeader(await fs.readFile(paths.header, 'utf8'), operationId)
-            header = {
-              operationId: disk.operationId,
-              binding: disk.binding,
-              path: disk.path,
-              expected: disk.expected,
-              candidateHash: disk.candidateHash,
-            }
-          } catch (error) {
-            if (errnoCode(error) === 'ENOENT' && !(await pathExists(paths.dir))) {
-              return false
-            }
-            throw error
-          }
-
-          if (header.binding !== binding) {
-            throw Object.assign(new Error('strict stage idempotency binding does not match'), {
-              code: 'STRICT_IDEMPOTENCY_CONFLICT',
-            })
-          }
-
-          // A terminal DB record is the replay source of truth, so a caller may
-          // reclaim a published stage even if the public path was legitimately
-          // edited after success. Non-terminal stages still use the full state
-          // validation below and retain ambiguous recovery artifacts.
-          if (await pathExists(paths.receipt)) {
-            await fs.rm(paths.dir, { recursive: true, force: true })
-            await syncDirectory(opsRoot)
-            await fs.rmdir(opsRoot).catch((err) => {
-              if (!['ENOENT', 'ENOTEMPTY'].includes(errnoCode(err) ?? '')) {
-                throw err
-              }
-            })
-            return true
-          }
-          const state = await readStrictStage(operationId)
-
-          if (state.status === 'missing') {
+        } catch (error) {
+          if (errnoCode(error) === 'ENOENT' && !(await pathExists(paths.dir))) {
             return false
           }
-          assertStrictBinding(state, binding)
-          if (state.status === 'publishing' || state.status === 'failed-recoverable') {
-            return false
-          }
+          throw error
+        }
+
+        if (header.binding !== binding) {
+          throw Object.assign(new Error('strict stage idempotency binding does not match'), {
+            code: 'STRICT_IDEMPOTENCY_CONFLICT',
+          })
+        }
+
+        // A terminal DB record is the replay source of truth, so a caller may
+        // reclaim a published stage even if the public path was legitimately
+        // edited after success. Non-terminal stages still use the full state
+        // validation below and retain ambiguous recovery artifacts.
+        if (await pathExists(paths.receipt)) {
           await fs.rm(paths.dir, { recursive: true, force: true })
           await syncDirectory(opsRoot)
           await fs.rmdir(opsRoot).catch((err) => {
@@ -2980,312 +2721,644 @@ export const createLocalFsFiles = (root: string): FileStore => {
             }
           })
           return true
-        }),
-    },
+        }
+        const state = await readStrictStage(operationId)
 
-    write: async (rel, content) => {
-      await ensureRecovered()
-      const target = abs(rel)
-      const dir = dirname(target)
-      await fs.mkdir(dir, { recursive: true })
-      const tmp = await writeTemp(dir, content)
-
-      try {
-        await fs.rename(tmp, target)
-      } catch (err) {
-        // A failed publish leaves no owned temp behind when cleanup is possible;
-        // cleanup failure never replaces the actionable rename error.
-        await fs.unlink(tmp).catch(() => {})
-        throw err
-      }
-    },
-
-    writeIfAbsent: async (rel, content) => {
-      await ensureRecovered()
-      const target = abs(rel)
-      const dir = dirname(target)
-      await fs.mkdir(dir, { recursive: true })
-      const tmp = await writeTemp(dir, content)
-
-      try {
-        // A hard-link publish is one atomic no-replace filesystem operation. The
-        // target can never expose partial bytes, and EEXIST includes dangling
-        // symlinks/directories — pathname ownership, not readability, is the guard.
-        await fs.link(tmp, target)
-      } catch (err) {
-        await fs.unlink(tmp).catch(() => {})
-        if (errnoCode(err) === 'EEXIST') {
+        if (state.status === 'missing') {
           return false
         }
-        throw err
-      }
-      await fs.unlink(tmp).catch(() => {})
-      return true
-    },
-
-    // dev+ino alone also equates two distinct hardlink pathnames. A rename
-    // between those is a POSIX no-op, while realpath preserves distinct hardlink
-    // names and canonicalizes alternate case/NFC spellings of one entry on an
-    // insensitive filesystem.
-    sameEntry: async (left, right) => {
-      await ensureRecovered()
-      return sameEntryOnDisk(abs(left), abs(right))
-    },
-
-    rename: async (from, to) => {
-      await ensureRecovered()
-      const target = abs(to)
-      await fs.mkdir(dirname(target), { recursive: true })
-      await fs.rename(abs(from), target)
-      // #97: no prune — the emptied source folder is durable (the directory
-      // channel surfaces it; an explicit removeDir is the only delete).
-    },
-
-    renameIfAbsent: (from, to) =>
-      withStorageLock(async () => {
-        await ensureRecoveredUnlocked()
-        const source = abs(from)
-        const expectedSource = await readRegular(source)
-
-        if (expectedSource == null) {
-          throw Object.assign(new Error('move source is missing or is not a regular file'), {
-            code: 'ENOENT',
-          })
+        assertStrictBinding(state, binding)
+        if (state.status === 'publishing' || state.status === 'failed-recoverable') {
+          return false
         }
-
-        return renameAbsent(source, abs(to), expectedSource)
+        await fs.rm(paths.dir, { recursive: true, force: true })
+        await syncDirectory(opsRoot)
+        await fs.rmdir(opsRoot).catch((err) => {
+          if (!['ENOENT', 'ENOTEMPTY'].includes(errnoCode(err) ?? '')) {
+            throw err
+          }
+        })
+        return true
       }),
+  })
 
-    replaceIfAbsent: (from, to, expectedSource, content) =>
-      withStorageLock(async () => {
-        await ensureRecoveredUnlocked()
-        return (
-          await replaceAbsentBytes(
-            abs(from),
-            abs(to),
-            Buffer.from(expectedSource, 'utf8'),
-            Buffer.from(content, 'utf8'),
-          )
-        ).published
-      }),
+  return {
+    base: {
+      scan: async () => {
+        await ensureRecovered()
+        const out: FileStat[] = []
 
-    removeIfUnchanged: (rel, expectedContent) =>
-      withStorageLock(async () => {
-        await ensureRecoveredUnlocked()
-        const source = abs(rel)
-        let sourceClaim: string
+        const walk = async (dirAbs: string): Promise<void> => {
+          let entries
+
+          try {
+            entries = await fs.readdir(dirAbs, { withFileTypes: true })
+          } catch {
+            return // the dir vanished mid-scan — the next rescan reconverges
+          }
+          for (const e of entries) {
+            // The ONE dot-file the scan does not hide is UNNAMED_NOTE_FILENAME: not
+            // somebody's hidden state but our own legacy note (#296), and hiding it is
+            // what made the reconcile read a live file as an external delete. Surfacing
+            // it lets the engine re-adopt/index the legacy identity instead of producing
+            // a tombstone. LocalFS can now migrate it with the no-replace primitive
+            // below. Narrow on purpose:
+            // EXACTLY `.md`, never `.anything.md`, so atomic-write temps stay hidden.
+            if (hidden(e.name) && !(e.isFile() && e.name === UNNAMED_NOTE_FILENAME)) {
+              continue
+            }
+            const full = join(dirAbs, e.name)
+
+            if (e.isDirectory()) {
+              await walk(full)
+            } else if (e.isFile() && e.name.endsWith('.md')) {
+              const s = await statOf(toPosix(relative(rootAbs, full)))
+
+              if (s) {
+                out.push(s)
+              }
+            }
+          }
+        }
+        await walk(rootAbs)
+        return out
+      },
+
+      listDirs: async () => {
+        await ensureRecovered()
+        // The directory channel (#97): every non-dot directory under the root, on
+        // its OWN typed walk — never mixed into scan()'s FileStat[] (the index =
+        // notes-only invariant #78). Dot-dirs are skipped (.git/.obsidian and the
+        // .notarium agent-mount), so only user-visible folders surface into the
+        // tree. The root itself ('') is not a folder node — it is excluded.
+        const out: string[] = []
+
+        const walk = async (dirAbs: string): Promise<void> => {
+          let entries
+
+          try {
+            entries = await fs.readdir(dirAbs, { withFileTypes: true })
+          } catch {
+            return // vanished mid-walk — the next listing reconverges
+          }
+          for (const e of entries) {
+            if (!e.isDirectory() || hidden(e.name)) {
+              continue
+            }
+            const full = join(dirAbs, e.name)
+            out.push(toPosix(relative(rootAbs, full)))
+            await walk(full)
+          }
+        }
+        await walk(rootAbs)
+        return out
+      },
+
+      stat: async (rel) => {
+        await ensureRecovered()
+        return statOf(rel)
+      },
+
+      read: async (rel) => {
+        await ensureRecovered()
+        return readRegular(abs(rel))
+      },
+
+      write: async (rel, content) => {
+        await ensureRecovered()
+        const target = abs(rel)
+        const dir = dirname(target)
+        await fs.mkdir(dir, { recursive: true })
+        const tmp = await writeTemp(dir, content)
 
         try {
-          sourceClaim = await claimSource(source)
+          await fs.rename(tmp, target)
+        } catch (err) {
+          // A failed publish leaves no owned temp behind when cleanup is possible;
+          // cleanup failure never replaces the actionable rename error.
+          await fs.unlink(tmp).catch(() => {})
+          throw err
+        }
+      },
+
+      rename: async (from, to) => {
+        await ensureRecovered()
+        const target = abs(to)
+        await fs.mkdir(dirname(target), { recursive: true })
+        await fs.rename(abs(from), target)
+        // #97: no prune — the emptied source folder is durable (the directory
+        // channel surfaces it; an explicit removeDir is the only delete).
+      },
+
+      renameDir: async (from, to) => {
+        await ensureRecovered()
+        const target = abs(to)
+        await fs.mkdir(dirname(target), { recursive: true })
+        await fs.rename(abs(from), target)
+      },
+
+      remove: async (rel) => {
+        await ensureRecovered()
+        try {
+          await fs.unlink(abs(rel))
         } catch (err) {
           if (errnoCode(err) === 'ENOENT') {
-            return true
+            return // already gone — removing a missing file is a no-op
           }
           throw err
         }
+      },
+
+      makeDir: async (rel) => {
+        await ensureRecovered()
+        // Create parents freely, but claim the requested leaf itself exactly once.
+        // Recursive mkdir on the leaf reports success for an existing alternate
+        // case/NFC spelling on an insensitive filesystem and made the cache invent a
+        // second folder that did not exist on disk.
+        const target = abs(rel)
+        await fs.mkdir(dirname(target), { recursive: true })
 
         try {
-          if ((await readRegular(sourceClaim)) !== expectedContent) {
+          await fs.mkdir(target)
+          return true
+        } catch (err) {
+          if (errnoCode(err) === 'EEXIST') {
             return false
           }
-          const detached = await detachClaimedPath(source, sourceClaim, expectedContent)
+          throw err
+        }
+      },
 
-          if (detached.status === 'removed') {
+      removeDir: async (rel) => {
+        await ensureRecovered()
+        // Delete a folder subtree wholesale (#97 folder delete): notes, any sibling
+        // markers (.notariummeta) and nested empty dirs go with it. force so a
+        // missing dir is a no-op (idempotent, mirrors remove()).
+        await fs.rm(abs(rel), { recursive: true, force: true })
+      },
+
+      exists: async (rel) => {
+        await ensureRecovered()
+        try {
+          // Pathname occupancy, not target readability: a dangling symlink still owns
+          // the destination and must fence a no-clobber move/create.
+          await fs.lstat(abs(rel))
+          return true
+        } catch {
+          return false
+        }
+      },
+
+      dirExists: async (rel) => {
+        await ensureRecovered()
+        if (!rel) {
+          return true
+        } // the storage root always exists as a directory
+        try {
+          return (await fs.stat(abs(rel))).isDirectory()
+        } catch {
+          return false
+        }
+      },
+    },
+
+    capabilities: {
+      exactRead: {
+        readBytes: async (rel) => {
+          await ensureRecovered()
+          const observation = await observeRegular(rel)
+
+          return observation.kind === 'present' ? observation.bytes : null
+        },
+      },
+
+      resourceExport: {
+        async *exportFiles() {
+          const walk = async function* (
+            dirAbs: string,
+          ): AsyncIterable<{ path: string; content: Uint8Array }> {
+            let entries
+
+            try {
+              entries = await fs.readdir(dirAbs, { withFileTypes: true })
+            } catch (err) {
+              if (errnoCode(err) === 'ENOENT') {
+                return // vanished during export — the next snapshot reconverges
+              }
+              throw err
+            }
+            for (const entry of entries) {
+              // Atomic role installs can stage at the mount root or below a Project
+              // namespace. They are never published package truth and must not leak
+              // into a concurrent export. Other dot resources are preserved.
+              const full = join(dirAbs, entry.name)
+              const exportPath = toPosix(relative(rootAbs, full))
+
+              if (
+                entry.isDirectory() &&
+                (exportPath === FS_OPS_DIR || isAtomicInstallTempPath(exportPath))
+              ) {
+                continue
+              }
+
+              if (entry.isDirectory()) {
+                yield* walk(full)
+              } else if (entry.isFile()) {
+                try {
+                  yield {
+                    path: exportPath,
+                    content: await fs.readFile(full),
+                  }
+                } catch (err) {
+                  if (errnoCode(err) !== 'ENOENT') {
+                    throw err
+                  }
+                }
+              }
+            }
+          }
+
+          yield* walk(rootAbs)
+        },
+      },
+
+      conditionalFileMutation: {
+        writeIfAbsent: async (rel, content) => {
+          await ensureRecovered()
+          const target = abs(rel)
+          const dir = dirname(target)
+          await fs.mkdir(dir, { recursive: true })
+          const tmp = await writeTemp(dir, content)
+
+          try {
+            // A hard-link publish is one atomic no-replace filesystem operation. The
+            // target can never expose partial bytes, and EEXIST includes dangling
+            // symlinks/directories — pathname ownership, not readability, is the guard.
+            await fs.link(tmp, target)
+          } catch (err) {
+            await fs.unlink(tmp).catch(() => {})
+            if (errnoCode(err) === 'EEXIST') {
+              return false
+            }
+            throw err
+          }
+          await fs.unlink(tmp).catch(() => {})
+          return true
+        },
+
+        replaceIfAbsent: (from, to, expectedSource, content) =>
+          withStorageLock(async () => {
+            await ensureRecoveredUnlocked()
+            return (
+              await replaceAbsentBytes(
+                abs(from),
+                abs(to),
+                Buffer.from(expectedSource, 'utf8'),
+                Buffer.from(content, 'utf8'),
+              )
+            ).published
+          }),
+
+        removeIfUnchanged: (rel, expectedContent) =>
+          withStorageLock(async () => {
+            await ensureRecoveredUnlocked()
+            const source = abs(rel)
+            let sourceClaim: string
+
+            try {
+              sourceClaim = await claimSource(source)
+            } catch (err) {
+              if (errnoCode(err) === 'ENOENT') {
+                return true
+              }
+              throw err
+            }
+
+            try {
+              if ((await readRegular(sourceClaim)) !== expectedContent) {
+                return false
+              }
+              const detached = await detachClaimedPath(source, sourceClaim, expectedContent)
+
+              if (detached.status === 'removed') {
+                return true
+              }
+              // Once the source pathname vanished outside this operation we cannot
+              // prove whether it was unlinked or renamed elsewhere (hardlinks make
+              // nlink deltas non-local). Fail closed; a retry observes a true absence.
+              if (detached.status === 'absent') {
+                return false
+              }
+
+              return false
+            } finally {
+              await fs.unlink(sourceClaim).catch(() => {})
+            }
+          }),
+      },
+
+      entryIdentity: {
+        // dev+ino alone also equates two distinct hardlink pathnames. A rename
+        // between those is a POSIX no-op, while realpath preserves distinct hardlink
+        // names and canonicalizes alternate case/NFC spellings of one entry on an
+        // insensitive filesystem.
+        sameEntry: async (left, right) => {
+          await ensureRecovered()
+          return sameEntryOnDisk(abs(left), abs(right))
+        },
+      },
+
+      fileNoReplaceMove: {
+        renameIfAbsent: (from, to) =>
+          withStorageLock(async () => {
+            await ensureRecoveredUnlocked()
+            const source = abs(from)
+            const expectedSource = await readRegular(source)
+
+            if (expectedSource == null) {
+              throw Object.assign(new Error('move source is missing or is not a regular file'), {
+                code: 'ENOENT',
+              })
+            }
+
+            return renameAbsent(source, abs(to), expectedSource)
+          }),
+      },
+
+      resourceObservation: {
+        observe: async (rel, options) => {
+          await ensureRecovered()
+          return observeRegular(rel, options)
+        },
+      },
+
+      resourcePublication: {
+        publish: (request) =>
+          withStorageLock(async (): Promise<FilePublicationResult> => {
+            await ensureRecoveredUnlocked()
+            const candidateHash = sha256Bytes(request.content)
+
+            if (request.kind === 'put') {
+              const current = await observeRegular(request.path)
+
+              if (current.kind === 'unavailable') {
+                return { status: 'conflict' }
+              }
+              if (!claimMatches(request.expected, current.claim)) {
+                return { status: 'conflict' }
+              }
+              if (current.kind === 'absent') {
+                const target = abs(request.path)
+                const dir = dirname(target)
+                await fs.mkdir(dir, { recursive: true })
+                const tmp = await writeTemp(dir, request.content)
+
+                try {
+                  try {
+                    await fs.link(tmp, target)
+                  } catch (err) {
+                    if (errnoCode(err) === 'EEXIST') {
+                      return { status: 'conflict' }
+                    }
+                    throw err
+                  }
+                  const proof = await proofAfterOwnedCleanup(tmp, target, request.content, () =>
+                    fs.unlink(tmp),
+                  )
+
+                  return {
+                    status: 'published',
+                    candidateHash,
+                    transitions: [
+                      {
+                        path: request.path,
+                        before: current.claim,
+                        after: proof.claim,
+                        mtimeMs: proof.mtimeMs,
+                      },
+                    ],
+                  }
+                } finally {
+                  await fs.unlink(tmp).catch(() => {})
+                }
+              }
+              if (current.kind === 'occupied') {
+                const replaced = await replaceOccupiedBytes(
+                  abs(request.path),
+                  current.claim.value,
+                  request.content,
+                )
+
+                return replaced.published
+                  ? {
+                      status: 'published',
+                      candidateHash,
+                      transitions: [
+                        {
+                          path: request.path,
+                          before: current.claim,
+                          after: replaced.proof.claim,
+                          mtimeMs: replaced.proof.mtimeMs,
+                        },
+                      ],
+                    }
+                  : { status: 'conflict' }
+              }
+              const replaced = await replaceAbsentBytes(
+                abs(request.path),
+                abs(request.path),
+                current.bytes,
+                request.content,
+              )
+
+              return replaced.published
+                ? {
+                    status: 'published',
+                    candidateHash,
+                    transitions: [
+                      {
+                        path: request.path,
+                        before: current.claim,
+                        after: replaced.proof.claim,
+                        mtimeMs: replaced.proof.mtimeMs,
+                      },
+                    ],
+                  }
+                : { status: 'conflict' }
+            }
+
+            const [source, target] = await Promise.all([
+              observeRegular(request.sourcePath),
+              observeRegular(request.targetPath),
+            ])
+
+            if (
+              source.kind !== 'present' ||
+              target.kind !== 'absent' ||
+              !claimMatches(source.claim, request.expectedSource) ||
+              !claimMatches(target.claim, request.expectedTarget)
+            ) {
+              return { status: 'conflict' }
+            }
+            const replaced = await replaceAbsentBytes(
+              abs(request.sourcePath),
+              abs(request.targetPath),
+              source.bytes,
+              request.content,
+            )
+
+            return replaced.published
+              ? {
+                  status: 'published',
+                  candidateHash,
+                  transitions: [
+                    {
+                      path: request.sourcePath,
+                      before: source.claim,
+                      after: absentFileClaim(request.sourcePath),
+                      mtimeMs: null,
+                    },
+                    {
+                      path: request.targetPath,
+                      before: target.claim,
+                      after: replaced.proof.claim,
+                      mtimeMs: replaced.proof.mtimeMs,
+                    },
+                  ],
+                }
+              : { status: 'conflict' }
+          }),
+      },
+
+      claimedRemoval: {
+        removeIfClaimed: (rel, expectedContent, expectedClaim) =>
+          withStorageLock(async () => {
+            await ensureRecoveredUnlocked()
+            const observation = await observeRegular(rel)
+
+            if (
+              observation.kind !== 'present' ||
+              !claimMatches(observation.claim, expectedClaim) ||
+              // Same decoding as `read`/`readRegular` — and as `detachClaimedPath`
+              // below, which re-checks this very content after staging. A default
+              // `TextDecoder` eats a leading U+FEFF, so on a file that carries one
+              // this pre-check would pass while the staged re-check refused.
+              Buffer.from(observation.bytes).toString('utf8') !== expectedContent
+            ) {
+              return false
+            }
+            const expectedInode = claimInode(expectedClaim)
+
+            if (!expectedInode) {
+              return false
+            }
+            const source = abs(rel)
+            let sourceClaim: string
+
+            try {
+              sourceClaim = await claimSource(source)
+            } catch (error) {
+              if (errnoCode(error) === 'ENOENT') {
+                return false
+              }
+              throw error
+            }
+            try {
+              const claimed = await fs.lstat(sourceClaim, { bigint: true })
+
+              if (claimed.dev !== expectedInode.dev || claimed.ino !== expectedInode.ino) {
+                return false
+              }
+              const detached = await detachClaimedPath(source, sourceClaim, expectedContent)
+
+              return detached.status === 'removed'
+            } finally {
+              await fs.unlink(sourceClaim).catch(() => {})
+            }
+          }),
+      },
+
+      watch: {
+        watch: (onChange) => {
+          // The fast path (#146): a recursive fs.watch turns an external edit into an
+          // early reconcile instead of waiting out the poll interval. It is ONLY a
+          // hint (P3) — the caller still reconciles by a full scan(), so we don't
+          // need per-event accuracy, just a wake-up; a dropped event is caught by the
+          // periodic backstop. fs.watch can throw synchronously where recursive watch
+          // is unavailable (some platforms) or inotify is exhausted (ENOSPC/EMFILE);
+          // we return null so the caller degrades to polling (honest P5), never crash.
+          let watcher: ReturnType<typeof fsWatch>
+
+          try {
+            watcher = fsWatch(rootAbs, { recursive: true }, (_event, filename) => {
+              // filename is root-relative (a Buffer becomes a string with the default
+              // encoding); on the rare null we can't tell where it fired, so treat it
+              // as a real change rather than dropping it.
+              const rel = filename == null ? null : toPosix(filename.toString())
+
+              if (hiddenPath(rel)) {
+                return
+              } // own tmp writes, .git/.obsidian — index-irrelevant
+              onChange(rel)
+            })
+          } catch (err) {
+            console.warn(
+              '[notarium] fs watch unavailable — falling back to polling:',
+              (err as Error).message,
+            )
+            return null
+          }
+          // An async watcher error (the inotify queue overflowed, the root was
+          // removed) must not throw into the event loop — log and let the periodic
+          // backstop carry correctness from here (the watcher is dead, polling lives).
+          watcher.on('error', (err) =>
+            console.warn(
+              '[notarium] fs watch error — polling backstop continues:',
+              (err as Error).message,
+            ),
+          )
+          return () => watcher.close()
+        },
+      },
+
+      // Three contracts, one runtime fact. Directory move, package install and
+      // strict publication each need the same atomic no-replace namespace
+      // transition, so a runtime that cannot perform it declares none of them —
+      // and does so here, before any of the three has created a root, a staging
+      // tree or a journal entry to be found later.
+      ...(atomicDirectoryRename
+        ? {
+            directoryNoReplaceMove: {
+              renameDirIfAbsent: renameDirIfAbsentWith(atomicDirectoryRename),
+            },
+            packagePublication: packagePublicationWith(atomicDirectoryRename),
+            strictPublication: strictPublicationWith(atomicDirectoryRename),
+          }
+        : {}),
+    },
+
+    accelerators: {
+      exactDirectorySpelling: {
+        dirExistsExact: async (rel) => {
+          await ensureRecovered()
+          if (!rel) {
             return true
           }
-          // Once the source pathname vanished outside this operation we cannot
-          // prove whether it was unlinked or renamed elsewhere (hardlinks make
-          // nlink deltas non-local). Fail closed; a retry observes a true absence.
-          if (detached.status === 'absent') {
+          // The parent's own entry names are the only place the medium's REAL
+          // spelling is visible: `stat` resolves a case-folded name just as happily.
+          const cut = rel.lastIndexOf('/')
+          const parent = cut === -1 ? '' : rel.slice(0, cut)
+          const name = cut === -1 ? rel : rel.slice(cut + 1)
+
+          try {
+            const entries = await fs.readdir(abs(parent), { withFileTypes: true })
+
+            return entries.some((entry) => entry.isDirectory() && entry.name === name)
+          } catch {
             return false
           }
-
-          return false
-        } finally {
-          await fs.unlink(sourceClaim).catch(() => {})
-        }
-      }),
-
-    removeIfClaimed: (rel, expectedContent, expectedClaim) =>
-      withStorageLock(async () => {
-        await ensureRecoveredUnlocked()
-        const observation = await observeRegular(rel)
-
-        if (
-          observation.kind !== 'present' ||
-          !claimMatches(observation.claim, expectedClaim) ||
-          // Same decoding as `read`/`readRegular` — and as `detachClaimedPath`
-          // below, which re-checks this very content after staging. A default
-          // `TextDecoder` eats a leading U+FEFF, so on a file that carries one
-          // this pre-check would pass while the staged re-check refused.
-          Buffer.from(observation.bytes).toString('utf8') !== expectedContent
-        ) {
-          return false
-        }
-        const expectedInode = claimInode(expectedClaim)
-
-        if (!expectedInode) {
-          return false
-        }
-        const source = abs(rel)
-        let sourceClaim: string
-
-        try {
-          sourceClaim = await claimSource(source)
-        } catch (error) {
-          if (errnoCode(error) === 'ENOENT') {
-            return false
-          }
-          throw error
-        }
-        try {
-          const claimed = await fs.lstat(sourceClaim, { bigint: true })
-
-          if (claimed.dev !== expectedInode.dev || claimed.ino !== expectedInode.ino) {
-            return false
-          }
-          const detached = await detachClaimedPath(source, sourceClaim, expectedContent)
-
-          return detached.status === 'removed'
-        } finally {
-          await fs.unlink(sourceClaim).catch(() => {})
-        }
-      }),
-
-    renameDir: async (from, to) => {
-      await ensureRecovered()
-      const target = abs(to)
-      await fs.mkdir(dirname(target), { recursive: true })
-      await fs.rename(abs(from), target)
-    },
-
-    ...(atomicDirectoryRename
-      ? { renameDirIfAbsent: renameDirIfAbsentWith(atomicDirectoryRename) }
-      : {}),
-
-    remove: async (rel) => {
-      await ensureRecovered()
-      try {
-        await fs.unlink(abs(rel))
-      } catch (err) {
-        if (errnoCode(err) === 'ENOENT') {
-          return // already gone — removing a missing file is a no-op
-        }
-        throw err
-      }
-    },
-
-    makeDir: async (rel) => {
-      await ensureRecovered()
-      // Create parents freely, but claim the requested leaf itself exactly once.
-      // Recursive mkdir on the leaf reports success for an existing alternate
-      // case/NFC spelling on an insensitive filesystem and made the cache invent a
-      // second folder that did not exist on disk.
-      const target = abs(rel)
-      await fs.mkdir(dirname(target), { recursive: true })
-
-      try {
-        await fs.mkdir(target)
-        return true
-      } catch (err) {
-        if (errnoCode(err) === 'EEXIST') {
-          return false
-        }
-        throw err
-      }
-    },
-
-    removeDir: async (rel) => {
-      await ensureRecovered()
-      // Delete a folder subtree wholesale (#97 folder delete): notes, any sibling
-      // markers (.notariummeta) and nested empty dirs go with it. force so a
-      // missing dir is a no-op (idempotent, mirrors remove()).
-      await fs.rm(abs(rel), { recursive: true, force: true })
-    },
-
-    exists: async (rel) => {
-      await ensureRecovered()
-      try {
-        // Pathname occupancy, not target readability: a dangling symlink still owns
-        // the destination and must fence a no-clobber move/create.
-        await fs.lstat(abs(rel))
-        return true
-      } catch {
-        return false
-      }
-    },
-
-    dirExistsExact: async (rel) => {
-      await ensureRecovered()
-      if (!rel) {
-        return true
-      }
-      // The parent's own entry names are the only place the medium's REAL
-      // spelling is visible: `stat` resolves a case-folded name just as happily.
-      const cut = rel.lastIndexOf('/')
-      const parent = cut === -1 ? '' : rel.slice(0, cut)
-      const name = cut === -1 ? rel : rel.slice(cut + 1)
-
-      try {
-        const entries = await fs.readdir(abs(parent), { withFileTypes: true })
-
-        return entries.some((entry) => entry.isDirectory() && entry.name === name)
-      } catch {
-        return false
-      }
-    },
-
-    dirExists: async (rel) => {
-      await ensureRecovered()
-      if (!rel) {
-        return true
-      } // the storage root always exists as a directory
-      try {
-        return (await fs.stat(abs(rel))).isDirectory()
-      } catch {
-        return false
-      }
-    },
-
-    watch: (onChange) => {
-      // The fast path (#146): a recursive fs.watch turns an external edit into an
-      // early reconcile instead of waiting out the poll interval. It is ONLY a
-      // hint (P3) — the caller still reconciles by a full scan(), so we don't
-      // need per-event accuracy, just a wake-up; a dropped event is caught by the
-      // periodic backstop. fs.watch can throw synchronously where recursive watch
-      // is unavailable (some platforms) or inotify is exhausted (ENOSPC/EMFILE);
-      // we return null so the caller degrades to polling (honest P5), never crash.
-      let watcher: ReturnType<typeof fsWatch>
-
-      try {
-        watcher = fsWatch(rootAbs, { recursive: true }, (_event, filename) => {
-          // filename is root-relative (a Buffer becomes a string with the default
-          // encoding); on the rare null we can't tell where it fired, so treat it
-          // as a real change rather than dropping it.
-          const rel = filename == null ? null : toPosix(filename.toString())
-
-          if (hiddenPath(rel)) {
-            return
-          } // own tmp writes, .git/.obsidian — index-irrelevant
-          onChange(rel)
-        })
-      } catch (err) {
-        console.warn(
-          '[notarium] fs watch unavailable — falling back to polling:',
-          (err as Error).message,
-        )
-        return null
-      }
-      // An async watcher error (the inotify queue overflowed, the root was
-      // removed) must not throw into the event loop — log and let the periodic
-      // backstop carry correctness from here (the watcher is dead, polling lives).
-      watcher.on('error', (err) =>
-        console.warn(
-          '[notarium] fs watch error — polling backstop continues:',
-          (err as Error).message,
-        ),
-      )
-      return () => watcher.close()
+        },
+      },
     },
   }
 }

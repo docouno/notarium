@@ -14,7 +14,7 @@ import type { Embedder } from '../../libs/embedding'
 import { createLocalFsFiles } from '../../libs/files'
 import { createNodeSqliteDriver, type SqlDriver } from '../../libs/sql'
 import { NotariumStore } from './notariumStore'
-import type { EngineMount } from './types'
+import { type EngineMount, engineMountOf } from './types'
 import { describeVector } from './vectorGate.fixture'
 
 /** Instant deterministic embedder — distinct text → distinct unit vector. */
@@ -42,11 +42,8 @@ const mockEmbedder = (dimensions = 4): Embedder => ({
     }),
 })
 
-const userMount = (dir: string): EngineMount => ({
-  class: 'user-doc',
-  prefix: '',
-  files: createLocalFsFiles(dir),
-})
+const userMount = (dir: string): EngineMount =>
+  engineMountOf({ class: 'user-doc', prefix: '' }, createLocalFsFiles(dir))
 
 const vecCount = (sql: SqlDriver): Promise<number> =>
   sql.get<{ n: number }>(`SELECT count(*) AS n FROM note_vectors`).then((r) => r?.n ?? 0)

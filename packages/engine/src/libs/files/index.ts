@@ -1,12 +1,26 @@
 export type {
   FileClaim,
+  FileClaimedRemoval,
+  FileConditionalMutation,
+  FileDirectoryNoReplaceMove,
+  FileEntryIdentity,
+  FileExactDirectorySpelling,
+  FileExactRead,
+  FileNoReplaceMove,
   FileObservation,
+  FilePackagePublication,
   FilePackagePublicationRequest,
   FileProofTransition,
   FilePublicationRequest,
   FilePublicationResult,
+  FileResourceExport,
+  FileResourceObservation,
+  FileResourcePublication,
   FileStat,
   FileStore,
+  FileStoreAccelerators,
+  FileStoreAssembly,
+  FileStoreCapabilities,
   FileStrictMutationReceipt,
   FileStrictPublication,
   FileStrictPublicationResult,
@@ -14,7 +28,9 @@ export type {
   FileStrictStageRequest,
   FileStrictStageResult,
   FileStrictStageState,
+  FileWatch,
 } from './types'
+export { FilePackagePublicationUnavailableError } from './types'
 // The degradation, not the raw accelerator: callers ask the port which spellings
 // exist, and whether the adapter answers with shallow probes or with one walk is
 // settled inside the port, once.

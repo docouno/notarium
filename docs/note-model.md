@@ -403,13 +403,22 @@ check-then-rename; source and destination parent are verified on one filesystem 
 fallback is possible.
 
 **A runtime that cannot perform it does not advertise it.** The engine resolves the
-capability once — Linux, a mapped syscall ABI, and `/usr/bin/perl` present as a regular
-executable file — and an adapter built where any of those is false simply has no
-`renameDirIfAbsent` property. So a caller learns the truth from the shape, before the first
-filesystem mutation, instead of from an `ENOTSUP` thrown mid-operation: `NotariumStore.move`
-refuses a folder move up front, and the role library refuses an install before it prepares a
-root, sweeps stale staging or writes a single package byte. Nothing emulates the primitive
-with a check-then-rename approximation on that branch.
+primitive once — Linux, a mapped syscall ABI, and `/usr/bin/perl` present as a regular
+executable file — and an adapter built where any of those is false carries no
+`directoryNoReplaceMove` capability at all. So a caller learns the truth from the shape,
+before the first filesystem mutation, instead of from an `ENOTSUP` thrown mid-operation:
+`NotariumStore.move` refuses a folder move up front, and the role library hands out no
+publication writer at all — so an install is refused before a root is prepared, stale
+staging is swept or a single package byte is written. Nothing emulates the primitive with a
+check-then-rename approximation on that branch.
+
+**Three contracts rest on that one runtime fact, and they stand or fall together.** Moving a
+directory, installing a package directory and staging a strict publication all land by
+renaming onto an absent pathname, so an adapter built without the primitive declares none of
+`directoryNoReplaceMove`, `packagePublication` or `strictPublication`. They stay separate
+capabilities because they are separate promises — a different medium could offer one and not
+another — but on this adapter they are derived from a single captured provider, which is why
+a build cannot advertise two of them and quietly fail the third.
 
 Presence answers for the deployment, not for every pathname under it. A nested mount, a
 filesystem or a kernel that refuses the syscall still fails that one call with

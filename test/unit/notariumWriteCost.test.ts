@@ -25,16 +25,15 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { CachedStore, IF_EXISTS } from '@notarium/core'
-import { createLocalFsFiles, type FileStore } from '@notarium/engine'
+import { createLocalFsFiles, engineMountOf, type FileStoreAssembly } from '@notarium/engine'
 import { InMemoryStore } from '@notarium/engine-memory'
-
 import { createNodeSqliteDriver } from '../../packages/engine/src/libs/sql'
 import { NotariumStore } from '../../packages/engine/src/services/notariumStore/notariumStore'
+import { withFacets } from '../store-contract/fileStoreAssembly'
 
 type Calls = Record<string, number>
 
-/** Counts what the store asks the medium for, and forwards everything. */
-const counting = (inner: FileStore, into: Calls): FileStore =>
+const countingPart = <T extends object>(inner: T, into: Calls): T =>
   new Proxy(inner, {
     get: (target, key: string) => {
       const value = (target as unknown as Record<string, unknown>)[key]
@@ -49,7 +48,27 @@ const counting = (inner: FileStore, into: Calls): FileStore =>
         return (value as (...a: unknown[]) => unknown).apply(target, args)
       }
     },
-  }) as FileStore
+  })
+
+/** Counts what the store asks the medium for, and forwards everything. Counted
+ *  per OPERATION name across the whole assembly: which facet an operation was
+ *  reached through is composition's business, and the cost this file measures is
+ *  the same either way. */
+const counting = (inner: FileStoreAssembly, into: Calls): FileStoreAssembly => ({
+  base: countingPart(inner.base, into),
+  capabilities: Object.fromEntries(
+    Object.entries(inner.capabilities).map(([name, facet]) => [
+      name,
+      countingPart(facet as object, into),
+    ]),
+  ),
+  accelerators: Object.fromEntries(
+    Object.entries(inner.accelerators).map(([name, facet]) => [
+      name,
+      countingPart(facet as object, into),
+    ]),
+  ),
+})
 
 /** A store on its own temp dir with its own call counter, already booted — so a
  *  later measurement counts the write and not the first-touch scan. */
@@ -60,13 +79,13 @@ const freshStore = async (opts?: { accelerator?: boolean; legacyDir?: string }) 
     mkdirSync(join(dir, opts.legacyDir), { recursive: true })
   }
   const calls: Calls = {}
-  const files = counting(createLocalFsFiles(dir), calls)
-
-  if (opts?.accelerator === false) {
-    delete files.dirExistsExact
-  }
+  const counted = counting(createLocalFsFiles(dir), calls)
+  const files =
+    opts?.accelerator === false
+      ? withFacets(counted, { accelerators: { exactDirectorySpelling: undefined } })
+      : counted
   const store = new NotariumStore({
-    mounts: [{ class: 'user-doc', prefix: '', files }],
+    mounts: [engineMountOf({ class: 'user-doc', prefix: '' }, files)],
     sql: createNodeSqliteDriver(':memory:'),
   })
 
@@ -288,7 +307,7 @@ const freshStack = async (seed: number) => {
   const calls: Calls = {}
   const files = counting(createLocalFsFiles(dir), calls)
   const inner = new NotariumStore({
-    mounts: [{ class: 'user-doc', prefix: '', files }],
+    mounts: [engineMountOf({ class: 'user-doc', prefix: '' }, files)],
     sql: createNodeSqliteDriver(':memory:'),
   })
   const store = new CachedStore({ inner, pollIntervalMs: 0, relationType: 'links_to' })

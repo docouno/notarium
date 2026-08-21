@@ -41,7 +41,12 @@ const dirMoveGate = await (async (): Promise<string | null> => {
   try {
     root = await fs.mkdtemp(join(tmpdir(), 'notarium-localfs-dir-gate-'))
     await fs.mkdir(join(root, 'source'))
-    if (!(await createLocalFsFiles(root).renameDirIfAbsent!('source', 'target'))) {
+    if (
+      !(await createLocalFsFiles(root).capabilities.directoryNoReplaceMove!.renameDirIfAbsent(
+        'source',
+        'target',
+      ))
+    ) {
       marker = DIR_MOVE_RUNTIME_GATE
     }
   } catch {
@@ -140,18 +145,18 @@ const crashMove = (
 
     const files = createLocalFsFiles(root)
     if (${JSON.stringify(kind)} === 'rename') {
-      await files.renameIfAbsent('source.md', ${samePath ? "'source.md'" : "'target.md'"})
+      await files.capabilities.fileNoReplaceMove.renameIfAbsent('source.md', ${samePath ? "'source.md'" : "'target.md'"})
     } else if (${JSON.stringify(kind)} === 'replace-entry') {
-      const observed = await files.observe('source.md')
+      const observed = await files.capabilities.resourceObservation.observe('source.md')
       if (observed.kind !== 'occupied') throw new Error('expected an occupied entry')
-      await files.publish({
+      await files.capabilities.resourcePublication.publish({
         kind: 'put',
         path: 'source.md',
         content: new TextEncoder().encode('app-final'),
         expected: observed.claim,
       })
     } else {
-      await files.replaceIfAbsent(
+      await files.capabilities.conditionalFileMutation.replaceIfAbsent(
         'source.md',
         ${samePath ? "'source.md'" : "'target.md'"},
         'source',
@@ -186,7 +191,7 @@ const crashRecoveryAfterDetach = (root: string): void => {
       if (String(from) === source && String(to).endsWith('/detached-source')) process.exit(87)
       return result
     }
-    await createLocalFsFiles(root).scan()
+    await createLocalFsFiles(root).base.scan()
   `
   let status: number | undefined
 
@@ -246,9 +251,9 @@ const crashAfterCapturingForeign = (
 
     const files = createLocalFsFiles(root)
     if (edge === 'detached-source') {
-      await files.replaceIfAbsent('source.md', 'target.md', 'original', 'final')
+      await files.capabilities.conditionalFileMutation.replaceIfAbsent('source.md', 'target.md', 'original', 'final')
     } else {
-      await files.renameIfAbsent('source.md', 'target.md')
+      await files.capabilities.fileNoReplaceMove.renameIfAbsent('source.md', 'target.md')
     }
   `
   let status: number | undefined
@@ -277,14 +282,14 @@ describe('localFs atomic writes (#262)', () => {
     const open = vi.spyOn(fs, 'open')
     vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000)
 
-    await Promise.all([files.write('a.md', bodyA), files.write('b.md', bodyB)])
+    await Promise.all([files.base.write('a.md', bodyA), files.base.write('b.md', bodyB)])
 
     const claims = open.mock.calls.map(([path, flags]) => [String(path), flags] as const)
     expect(claims).toHaveLength(2)
     expect(new Set(claims.map(([path]) => path))).toHaveLength(2)
     expect(claims.every(([, flags]) => flags === 'wx')).toBe(true)
-    await expect(files.read('a.md')).resolves.toBe(bodyA)
-    await expect(files.read('b.md')).resolves.toBe(bodyB)
+    await expect(files.base.read('a.md')).resolves.toBe(bodyA)
+    await expect(files.base.read('b.md')).resolves.toBe(bodyB)
     expect((await fs.readdir(root)).sort()).toEqual(['a.md', 'b.md'])
   })
 
@@ -308,14 +313,14 @@ describe('localFs atomic writes (#262)', () => {
       return realOpen(path, flags, mode)
     })
 
-    await files.write('note.md', 'safe')
+    await files.base.write('note.md', 'safe')
 
     expect(open).toHaveBeenCalledTimes(2)
     expect(attempted[0]).not.toBe(attempted[1])
     expect(open.mock.calls.every(([, flags]) => flags === 'wx')).toBe(true)
     expect(unlink).not.toHaveBeenCalled()
     await expect(fs.readFile(sentinel, 'utf8')).resolves.toBe('foreign')
-    await expect(files.read('note.md')).resolves.toBe('safe')
+    await expect(files.base.read('note.md')).resolves.toBe('safe')
   })
 
   it('stops after bounded exclusive-claim collisions without deleting foreign files', async () => {
@@ -325,7 +330,7 @@ describe('localFs atomic writes (#262)', () => {
     const open = vi.spyOn(fs, 'open').mockRejectedValue(collision)
     const unlink = vi.spyOn(fs, 'unlink')
 
-    await expect(files.write('note.md', 'body')).rejects.toBe(collision)
+    await expect(files.base.write('note.md', 'body')).rejects.toBe(collision)
     expect(open).toHaveBeenCalledTimes(8)
     expect(unlink).not.toHaveBeenCalled()
   })
@@ -337,7 +342,7 @@ describe('localFs atomic writes (#262)', () => {
     vi.spyOn(fs, 'open').mockRejectedValueOnce(denied)
     const unlink = vi.spyOn(fs, 'unlink')
 
-    await expect(files.write('note.md', 'body')).rejects.toBe(denied)
+    await expect(files.base.write('note.md', 'body')).rejects.toBe(denied)
     expect(unlink).not.toHaveBeenCalled()
   })
 
@@ -358,7 +363,7 @@ describe('localFs atomic writes (#262)', () => {
       return handle
     })
 
-    await expect(files.write('note.md', 'body')).rejects.toBe(failure)
+    await expect(files.base.write('note.md', 'body')).rejects.toBe(failure)
     expect(closeCalls).toBe(1)
     await expect(fs.readdir(root)).resolves.toEqual([])
   })
@@ -377,7 +382,7 @@ describe('localFs atomic writes (#262)', () => {
     })
     const unlink = vi.spyOn(fs, 'unlink').mockRejectedValueOnce(errno('EACCES'))
 
-    await expect(files.write('note.md', 'body')).rejects.toBe(writeFailure)
+    await expect(files.base.write('note.md', 'body')).rejects.toBe(writeFailure)
     expect(unlink).toHaveBeenCalledWith(claimed)
     await expect(fs.readFile(claimed, 'utf8')).resolves.toBe('')
   })
@@ -397,7 +402,7 @@ describe('localFs atomic writes (#262)', () => {
       return handle
     })
 
-    await expect(files.write('note.md', 'body')).rejects.toBe(failure)
+    await expect(files.base.write('note.md', 'body')).rejects.toBe(failure)
     await expect(fs.readdir(root)).resolves.toEqual([])
   })
 
@@ -407,7 +412,7 @@ describe('localFs atomic writes (#262)', () => {
     const failure = errno('EIO')
     vi.spyOn(fs, 'rename').mockRejectedValueOnce(failure)
 
-    await expect(files.write('note.md', 'body')).rejects.toBe(failure)
+    await expect(files.base.write('note.md', 'body')).rejects.toBe(failure)
     await expect(fs.readdir(root)).resolves.toEqual([])
   })
 
@@ -419,7 +424,7 @@ describe('localFs atomic writes (#262)', () => {
     vi.spyOn(fs, 'rename').mockRejectedValueOnce(renameFailure)
     const unlink = vi.spyOn(fs, 'unlink').mockRejectedValueOnce(errno('EACCES'))
 
-    await expect(files.write('note.md', 'body')).rejects.toBe(renameFailure)
+    await expect(files.base.write('note.md', 'body')).rejects.toBe(renameFailure)
     const claimed = String(open.mock.calls[0]?.[0])
     expect(unlink).toHaveBeenCalledWith(claimed)
     await expect(fs.readFile(claimed, 'utf8')).resolves.toBe('body')
@@ -431,11 +436,11 @@ describe('localFs remove errors (#262)', () => {
     const root = await mkroot()
     const files = createLocalFsFiles(root)
 
-    await expect(files.remove('missing.md')).resolves.toBeUndefined()
+    await expect(files.base.remove('missing.md')).resolves.toBeUndefined()
 
     const denied = errno('EACCES')
     vi.spyOn(fs, 'unlink').mockRejectedValueOnce(denied)
-    await expect(files.remove('forbidden.md')).rejects.toBe(denied)
+    await expect(files.base.remove('forbidden.md')).rejects.toBe(denied)
   })
 })
 
@@ -443,7 +448,7 @@ describe('localFs raw export', () => {
   const exportedPaths = async (files: ReturnType<typeof createLocalFsFiles>) => {
     const paths: string[] = []
 
-    for await (const entry of files.exportFiles!()) {
+    for await (const entry of files.capabilities.resourceExport!.exportFiles()) {
       paths.push(entry.path)
     }
 
@@ -472,7 +477,7 @@ describe('localFs raw export', () => {
     )
     const exported = []
 
-    for await (const entry of files.exportFiles!()) {
+    for await (const entry of files.capabilities.resourceExport!.exportFiles()) {
       exported.push(entry.path)
     }
 
@@ -522,7 +527,7 @@ describe('localFs lexical containment', () => {
     const root = await mkroot()
     const files = createLocalFsFiles(root)
 
-    await expect(files.read('../outside.md')).rejects.toThrow(/path escapes the storage root/)
+    await expect(files.base.read('../outside.md')).rejects.toThrow(/path escapes the storage root/)
   })
 })
 
@@ -532,14 +537,14 @@ describe('localFs pathname occupancy', () => {
     const files = createLocalFsFiles(root)
 
     execFileSync('mkfifo', [join(root, 'pipe.md')])
-    await expect(files.read('pipe.md')).resolves.toBeNull()
+    await expect(files.base.read('pipe.md')).resolves.toBeNull()
   })
 
   it('counts a dangling symlink as occupied', async () => {
     const root = await mkroot()
     const files = createLocalFsFiles(root)
     await fs.symlink('missing.md', join(root, 'claimed.md'))
-    await expect(files.exists('claimed.md')).resolves.toBe(true)
+    await expect(files.base.exists('claimed.md')).resolves.toBe(true)
   })
 
   it('publishes complete bytes only once without replacing an occupied pathname', async () => {
@@ -548,48 +553,52 @@ describe('localFs pathname occupancy', () => {
 
     await expect(
       Promise.all([
-        files.writeIfAbsent!('claimed.md', 'first'),
-        files.writeIfAbsent!('claimed.md', 'second'),
+        files.capabilities.conditionalFileMutation!.writeIfAbsent('claimed.md', 'first'),
+        files.capabilities.conditionalFileMutation!.writeIfAbsent('claimed.md', 'second'),
       ]),
     ).resolves.toEqual(expect.arrayContaining([true, false]))
-    await expect(files.read('claimed.md')).resolves.toMatch(/^(first|second)$/)
+    await expect(files.base.read('claimed.md')).resolves.toMatch(/^(first|second)$/)
     expect(await fs.readdir(root)).toEqual(['claimed.md'])
 
     await fs.unlink(join(root, 'claimed.md'))
     await fs.symlink('missing.md', join(root, 'claimed.md'))
-    await expect(files.writeIfAbsent!('claimed.md', 'intruder')).resolves.toBe(false)
+    await expect(
+      files.capabilities.conditionalFileMutation!.writeIfAbsent('claimed.md', 'intruder'),
+    ).resolves.toBe(false)
     expect((await fs.lstat(join(root, 'claimed.md'))).isSymbolicLink()).toBe(true)
   })
 
   it('moves onto an absent pathname without replacing a racing create', async () => {
     const root = await mkroot()
     const files = createLocalFsFiles(root)
-    await files.write('source.md', 'source')
+    await files.base.write('source.md', 'source')
 
     const [moved, created] = await Promise.all([
-      files.renameIfAbsent!('source.md', 'target.md'),
-      files.writeIfAbsent!('target.md', 'rival'),
+      files.capabilities.fileNoReplaceMove!.renameIfAbsent('source.md', 'target.md'),
+      files.capabilities.conditionalFileMutation!.writeIfAbsent('target.md', 'rival'),
     ])
 
     expect([moved, created].filter(Boolean)).toHaveLength(1)
     if (moved) {
-      await expect(files.read('target.md')).resolves.toBe('source')
-      await expect(files.read('source.md')).resolves.toBeNull()
+      await expect(files.base.read('target.md')).resolves.toBe('source')
+      await expect(files.base.read('source.md')).resolves.toBeNull()
     } else {
-      await expect(files.read('target.md')).resolves.toBe('rival')
-      await expect(files.read('source.md')).resolves.toBe('source')
+      await expect(files.base.read('target.md')).resolves.toBe('rival')
+      await expect(files.base.read('source.md')).resolves.toBe('source')
     }
   })
 
   it('leaves source and destination intact when a no-replace move is occupied', async () => {
     const root = await mkroot()
     const files = createLocalFsFiles(root)
-    await files.write('source.md', 'source')
-    await files.write('target.md', 'target')
+    await files.base.write('source.md', 'source')
+    await files.base.write('target.md', 'target')
 
-    await expect(files.renameIfAbsent!('source.md', 'target.md')).resolves.toBe(false)
-    await expect(files.read('source.md')).resolves.toBe('source')
-    await expect(files.read('target.md')).resolves.toBe('target')
+    await expect(
+      files.capabilities.fileNoReplaceMove!.renameIfAbsent('source.md', 'target.md'),
+    ).resolves.toBe(false)
+    await expect(files.base.read('source.md')).resolves.toBe('source')
+    await expect(files.base.read('target.md')).resolves.toBe('target')
   })
 
   it('rolls back its claimed destination when removing the source fails', async () => {
@@ -599,7 +608,7 @@ describe('localFs pathname occupancy', () => {
     const realRename = fs.rename.bind(fs)
     let injected = false
 
-    await files.write('source.md', 'source')
+    await files.base.write('source.md', 'source')
     vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
       if (!injected && String(from) === source && String(to).endsWith('/detached-source')) {
         injected = true
@@ -609,11 +618,13 @@ describe('localFs pathname occupancy', () => {
       return realRename(from, to)
     })
 
-    await expect(files.renameIfAbsent!('source.md', 'target.md')).rejects.toMatchObject({
+    await expect(
+      files.capabilities.fileNoReplaceMove!.renameIfAbsent('source.md', 'target.md'),
+    ).rejects.toMatchObject({
       code: 'EACCES',
     })
-    await expect(files.read('source.md')).resolves.toBe('source')
-    await expect(files.read('target.md')).resolves.toBeNull()
+    await expect(files.base.read('source.md')).resolves.toBe('source')
+    await expect(files.base.read('target.md')).resolves.toBeNull()
   })
 
   it('never unlinks a replacement that wins the source pathname during move', async () => {
@@ -635,11 +646,13 @@ describe('localFs pathname occupancy', () => {
       return realRename(from, to)
     })
 
-    await expect(files.renameIfAbsent!('source.md', 'target.md')).rejects.toMatchObject({
+    await expect(
+      files.capabilities.fileNoReplaceMove!.renameIfAbsent('source.md', 'target.md'),
+    ).rejects.toMatchObject({
       code: 'ESTALE',
     })
-    await expect(files.read('source.md')).resolves.toBe('external-new')
-    await expect(files.read('target.md')).resolves.toBeNull()
+    await expect(files.base.read('source.md')).resolves.toBe('external-new')
+    await expect(files.base.read('target.md')).resolves.toBeNull()
     const entries = await fs.readdir(root)
     const recovery = entries.find((entry) => entry.startsWith('source.recovered-'))
 
@@ -667,10 +680,15 @@ describe('localFs pathname occupancy', () => {
     })
 
     await expect(
-      files.replaceIfAbsent!('source.md', 'target.md', 'source', 'app-final'),
+      files.capabilities.conditionalFileMutation!.replaceIfAbsent(
+        'source.md',
+        'target.md',
+        'source',
+        'app-final',
+      ),
     ).rejects.toMatchObject({ code: 'ESTALE' })
-    await expect(files.read('source.md')).resolves.toBe('external-new')
-    await expect(files.read('target.md')).resolves.toBe('external-target')
+    await expect(files.base.read('source.md')).resolves.toBe('external-new')
+    await expect(files.base.read('target.md')).resolves.toBe('external-target')
     expect((await fs.readdir(root)).sort()).toEqual(['source.md', 'target.md'])
   })
 
@@ -695,10 +713,15 @@ describe('localFs pathname occupancy', () => {
     })
 
     await expect(
-      files.replaceIfAbsent!('source.md', 'target.md', 'source', 'app-final'),
+      files.capabilities.conditionalFileMutation!.replaceIfAbsent(
+        'source.md',
+        'target.md',
+        'source',
+        'app-final',
+      ),
     ).rejects.toMatchObject({ code: 'ESTALE' })
-    await expect(files.read('source.md')).resolves.toBe('source')
-    await expect(files.read('target.md')).resolves.toBe('external-new')
+    await expect(files.base.read('source.md')).resolves.toBe('source')
+    await expect(files.base.read('target.md')).resolves.toBe('external-new')
     expect((await fs.readdir(root)).sort()).toEqual(['source.md', 'target.md'])
   })
 
@@ -708,9 +731,14 @@ describe('localFs pathname occupancy', () => {
     await fs.writeFile(join(root, 'source.md'), 'source')
 
     await expect(
-      files.replaceIfAbsent!('source.md', 'source.md', 'source', 'app-final'),
+      files.capabilities.conditionalFileMutation!.replaceIfAbsent(
+        'source.md',
+        'source.md',
+        'source',
+        'app-final',
+      ),
     ).resolves.toBe(true)
-    await expect(files.read('source.md')).resolves.toBe('app-final')
+    await expect(files.base.read('source.md')).resolves.toBe('app-final')
     expect(await fs.readdir(root)).toEqual(['source.md'])
   })
 
@@ -724,7 +752,9 @@ describe('localFs pathname occupancy', () => {
     await fs.utimes(source, old, old)
     const before = await fs.stat(source, { bigint: true })
 
-    await expect(files.renameIfAbsent!('source.md', 'target.md')).resolves.toBe(true)
+    await expect(
+      files.capabilities.fileNoReplaceMove!.renameIfAbsent('source.md', 'target.md'),
+    ).resolves.toBe(true)
     const after = await fs.stat(join(root, 'target.md'), { bigint: true })
 
     expect(after.ino).toBe(before.ino)
@@ -748,11 +778,11 @@ describe('localFs pathname occupancy', () => {
       await expect(fs.readFile(target, 'utf8')).resolves.toBe('source')
 
       const recovered = createLocalFsFiles(root)
-      await expect(recovered.scan()).resolves.toEqual([
+      await expect(recovered.base.scan()).resolves.toEqual([
         expect.objectContaining({ path: 'target.md' }),
       ])
-      await expect(recovered.read('source.md')).resolves.toBeNull()
-      await expect(recovered.read('target.md')).resolves.toBe('source')
+      await expect(recovered.base.read('source.md')).resolves.toBeNull()
+      await expect(recovered.base.read('target.md')).resolves.toBe('source')
       expect((await fs.stat(target, { bigint: true })).ino).toBe(before.ino)
       expect(await fs.readdir(root)).toEqual(['target.md'])
     },
@@ -768,8 +798,8 @@ describe('localFs pathname occupancy', () => {
       crashRecoveryAfterDetach(root)
 
       const recovered = createLocalFsFiles(root)
-      await expect(recovered.read('source.md')).resolves.toBeNull()
-      await expect(recovered.read('target.md')).resolves.toBe('source')
+      await expect(recovered.base.read('source.md')).resolves.toBeNull()
+      await expect(recovered.base.read('target.md')).resolves.toBe('source')
       expect(await fs.readdir(root)).toEqual(['target.md'])
     },
   )
@@ -783,8 +813,8 @@ describe('localFs pathname occupancy', () => {
       crashMove(root, 'replace', 'after-publication')
 
       const recovered = createLocalFsFiles(root)
-      await expect(recovered.read('target.md')).resolves.toBe('app-final')
-      await expect(recovered.read('source.md')).resolves.toBeNull()
+      await expect(recovered.base.read('target.md')).resolves.toBe('app-final')
+      await expect(recovered.base.read('source.md')).resolves.toBeNull()
       expect(await fs.readdir(root)).toEqual(['target.md'])
     },
   )
@@ -796,8 +826,8 @@ describe('localFs pathname occupancy', () => {
     crashMove(root, 'replace', 'before-publication')
 
     const recovered = createLocalFsFiles(root)
-    await expect(recovered.read('source.md')).resolves.toBe('source')
-    await expect(recovered.read('target.md')).resolves.toBeNull()
+    await expect(recovered.base.read('source.md')).resolves.toBe('source')
+    await expect(recovered.base.read('target.md')).resolves.toBeNull()
     expect(await fs.readdir(root)).toEqual(['source.md'])
   })
 
@@ -809,7 +839,7 @@ describe('localFs pathname occupancy', () => {
     await expect(fs.lstat(join(root, 'source.md'))).rejects.toMatchObject({ code: 'ENOENT' })
 
     const recovered = createLocalFsFiles(root)
-    await expect(recovered.read('source.md')).resolves.toBe('app-final')
+    await expect(recovered.base.read('source.md')).resolves.toBe('app-final')
     expect(await fs.readdir(root)).toEqual(['source.md'])
   })
 
@@ -824,7 +854,7 @@ describe('localFs pathname occupancy', () => {
     await expect(fs.lstat(source)).rejects.toMatchObject({ code: 'ENOENT' })
 
     const recovered = createLocalFsFiles(root)
-    await expect(recovered.read('source.md')).resolves.toBe('app-final')
+    await expect(recovered.base.read('source.md')).resolves.toBe('app-final')
     expect((await fs.lstat(source)).isFile()).toBe(true)
     expect(await fs.readdir(root)).toEqual(['source.md'])
   })
@@ -839,9 +869,9 @@ describe('localFs pathname occupancy', () => {
     await fs.rename(join(root, 'external.md'), target)
 
     const recovered = createLocalFsFiles(root)
-    await recovered.scan()
-    await expect(recovered.read('source.md')).resolves.toBe('source')
-    await expect(recovered.read('target.md')).resolves.toBe('external-target')
+    await recovered.base.scan()
+    await expect(recovered.base.read('source.md')).resolves.toBe('source')
+    await expect(recovered.base.read('target.md')).resolves.toBe('external-target')
     expect((await fs.readdir(root)).sort()).toEqual(['source.md', 'target.md'])
   })
 
@@ -857,12 +887,12 @@ describe('localFs pathname occupancy', () => {
       await fs.rename(join(root, 'external.md'), source)
 
       const recovered = createLocalFsFiles(root)
-      await recovered.scan()
+      await recovered.base.scan()
       const entries = (await fs.readdir(root)).sort()
       const recovery = entries.find((entry) => entry.startsWith('source.recovered-'))
 
-      await expect(recovered.read('source.md')).resolves.toBe('external-source')
-      await expect(recovered.read('target.md')).resolves.toBeNull()
+      await expect(recovered.base.read('source.md')).resolves.toBe('external-source')
+      await expect(recovered.base.read('target.md')).resolves.toBeNull()
       expect(recovery).toBeDefined()
       await expect(fs.readFile(join(root, recovery!), 'utf8')).resolves.toBe('source')
       expect(entries).not.toContain('.notarium-fs-ops')
@@ -876,10 +906,10 @@ describe('localFs pathname occupancy', () => {
 
       crashAfterCapturingForeign(root, 'detached-source')
 
-      await expect(createLocalFsFiles(root).scan()).resolves.toEqual(expect.any(Array))
+      await expect(createLocalFsFiles(root).base.scan()).resolves.toEqual(expect.any(Array))
       // A second adapter must observe a fully converged namespace, not depend on
       // process-local recovery state left by the first pass.
-      await expect(createLocalFsFiles(root).scan()).resolves.toEqual(expect.any(Array))
+      await expect(createLocalFsFiles(root).base.scan()).resolves.toEqual(expect.any(Array))
       await expect(fs.readFile(join(root, 'source.md'), 'utf8')).resolves.toBe('FOREIGN-SOURCE')
       await expect(fs.lstat(join(root, 'target.md'))).rejects.toMatchObject({ code: 'ENOENT' })
 
@@ -899,8 +929,8 @@ describe('localFs pathname occupancy', () => {
 
       crashAfterCapturingForeign(root, 'detached-target')
 
-      await expect(createLocalFsFiles(root).scan()).resolves.toEqual(expect.any(Array))
-      await expect(createLocalFsFiles(root).scan()).resolves.toEqual(expect.any(Array))
+      await expect(createLocalFsFiles(root).base.scan()).resolves.toEqual(expect.any(Array))
+      await expect(createLocalFsFiles(root).base.scan()).resolves.toEqual(expect.any(Array))
       await expect(fs.readFile(join(root, 'source.md'), 'utf8')).resolves.toBe('original')
       await expect(fs.readFile(join(root, 'target.md'), 'utf8')).resolves.toBe('FOREIGN-TARGET')
       expect(await fs.readdir(root)).toEqual(['source.md', 'target.md'])
@@ -921,7 +951,7 @@ describe('localFs pathname occupancy', () => {
         value: 'unsupported-audit-arch',
       })
       try {
-        await expect(createLocalFsFiles(root).scan()).resolves.toEqual(expect.any(Array))
+        await expect(createLocalFsFiles(root).base.scan()).resolves.toEqual(expect.any(Array))
       } finally {
         Object.defineProperty(process, 'arch', { configurable: true, value: actualArch })
       }
@@ -968,12 +998,14 @@ describe('localFs pathname occupancy', () => {
       return result
     })
 
-    const move = first.replaceIfAbsent!('source.md', 'target.md', 'original', 'final').then(
-      (value) => ({ value }),
-      (error: unknown) => ({ error }),
-    )
+    const move = first.capabilities
+      .conditionalFileMutation!.replaceIfAbsent('source.md', 'target.md', 'original', 'final')
+      .then(
+        (value) => ({ value }),
+        (error: unknown) => ({ error }),
+      )
     await published
-    const peer = second.write('peer.md', 'peer')
+    const peer = second.base.write('peer.md', 'peer')
     const peerSettledBeforeRelease = await Promise.race([
       peer.then(
         () => true,
@@ -1014,7 +1046,7 @@ describe('localFs pathname occupancy', () => {
     )
     await fs.writeFile(join(operation, 'active'), '')
 
-    await expect(createLocalFsFiles(root).scan()).rejects.toThrow(
+    await expect(createLocalFsFiles(root).base.scan()).rejects.toThrow(
       /invalid LocalFS move recovery path/,
     )
     await expect(fs.readFile(join(root, 'victim.md'), 'utf8')).resolves.toBe('foreign')
@@ -1028,10 +1060,15 @@ describe('localFs pathname occupancy', () => {
     vi.spyOn(fs, 'rmdir').mockRejectedValueOnce(errno('EIO'))
 
     await expect(
-      files.replaceIfAbsent!('source.md', 'target.md', 'source', 'app-final'),
+      files.capabilities.conditionalFileMutation!.replaceIfAbsent(
+        'source.md',
+        'target.md',
+        'source',
+        'app-final',
+      ),
     ).resolves.toBe(true)
-    await expect(files.read('source.md')).resolves.toBeNull()
-    await expect(files.read('target.md')).resolves.toBe('app-final')
+    await expect(files.base.read('source.md')).resolves.toBeNull()
+    await expect(files.base.read('target.md')).resolves.toBe('app-final')
     expect(await fs.readdir(root)).toContain('.notarium-fs-ops')
   })
 
@@ -1053,7 +1090,12 @@ describe('localFs pathname occupancy', () => {
     })
 
     await expect(
-      files.replaceIfAbsent!('source.md', 'source.md', 'source', 'app-final'),
+      files.capabilities.conditionalFileMutation!.replaceIfAbsent(
+        'source.md',
+        'source.md',
+        'source',
+        'app-final',
+      ),
     ).rejects.toThrow(/recovery remains/i)
     const [operation] = await fs.readdir(join(root, '.notarium-fs-ops'))
 
@@ -1070,9 +1112,14 @@ describe('localFs pathname occupancy', () => {
     vi.spyOn(fs, 'open').mockRejectedValueOnce(errno('EACCES'))
 
     await expect(
-      files.replaceIfAbsent!('source.md', 'target.md', 'source', 'app-final'),
+      files.capabilities.conditionalFileMutation!.replaceIfAbsent(
+        'source.md',
+        'target.md',
+        'source',
+        'app-final',
+      ),
     ).rejects.toMatchObject({ code: 'EACCES' })
-    await expect(files.read('source.md')).resolves.toBe('source')
+    await expect(files.base.read('source.md')).resolves.toBe('source')
     expect(await fs.readdir(root)).toEqual(['source.md'])
   })
 
@@ -1095,8 +1142,10 @@ describe('localFs pathname occupancy', () => {
       return realRename(from, to)
     })
 
-    await expect(files.removeIfUnchanged!('source.md', 'source')).resolves.toBe(false)
-    await expect(files.read('source.md')).resolves.toBe('external-new')
+    await expect(
+      files.capabilities.conditionalFileMutation!.removeIfUnchanged('source.md', 'source'),
+    ).resolves.toBe(false)
+    await expect(files.base.read('source.md')).resolves.toBe('external-new')
     expect(await fs.readdir(root)).toEqual(['source.md'])
   })
 
@@ -1109,7 +1158,7 @@ describe('localFs pathname occupancy', () => {
     let injected = false
 
     await fs.writeFile(source, 'same bytes')
-    const observation = await files.observe!('source.md')
+    const observation = await files.capabilities.resourceObservation!.observe('source.md')
 
     if (observation.kind !== 'present') {
       throw new Error('expected present source observation')
@@ -1126,11 +1175,15 @@ describe('localFs pathname occupancy', () => {
     })
 
     await expect(
-      files.removeIfClaimed!('source.md', 'same bytes', observation.claim),
+      files.capabilities.claimedRemoval!.removeIfClaimed(
+        'source.md',
+        'same bytes',
+        observation.claim,
+      ),
     ).resolves.toBe(false)
     expect(injected).toBe(true)
     expect((await fs.stat(source, { bigint: true })).ino).toBe(externalInode)
-    await expect(files.read('source.md')).resolves.toBe('same bytes')
+    await expect(files.base.read('source.md')).resolves.toBe('same bytes')
   })
 
   it('bounds a visible recovery name for a maximum-length legal source basename', async () => {
@@ -1154,7 +1207,9 @@ describe('localFs pathname occupancy', () => {
       return realRename(from, to)
     })
 
-    await expect(files.removeIfUnchanged!(leaf, 'original')).resolves.toBe(false)
+    await expect(
+      files.capabilities.conditionalFileMutation!.removeIfUnchanged(leaf, 'original'),
+    ).resolves.toBe(false)
     const entries = await fs.readdir(root)
     const recovered = entries.find((entry) => entry.includes('.recovered-'))
 
@@ -1182,8 +1237,10 @@ describe('localFs pathname occupancy', () => {
       return realRename(from, to)
     })
 
-    await expect(files.removeIfUnchanged!('source.md', 'source')).resolves.toBe(false)
-    await expect(files.read('moved.md')).resolves.toBe('source')
+    await expect(
+      files.capabilities.conditionalFileMutation!.removeIfUnchanged('source.md', 'source'),
+    ).resolves.toBe(false)
+    await expect(files.base.read('moved.md')).resolves.toBe('source')
     expect(await fs.readdir(root)).toEqual(['moved.md'])
   })
 
@@ -1204,7 +1261,9 @@ describe('localFs pathname occupancy', () => {
       return realRename(from, to)
     })
 
-    await expect(files.removeIfUnchanged!('source.md', 'source')).resolves.toBe(false)
+    await expect(
+      files.capabilities.conditionalFileMutation!.removeIfUnchanged('source.md', 'source'),
+    ).resolves.toBe(false)
     expect(await fs.readdir(root)).toEqual([])
   })
 
@@ -1214,7 +1273,9 @@ describe('localFs pathname occupancy', () => {
 
     await fs.mkdir(join(root, 'source'))
     await fs.writeFile(join(root, 'source', 'note.md'), 'source')
-    await expect(files.renameDirIfAbsent!('source', 'target')).resolves.toBe(true)
+    await expect(
+      files.capabilities.directoryNoReplaceMove!.renameDirIfAbsent('source', 'target'),
+    ).resolves.toBe(true)
     await expect(fs.readFile(join(root, 'target', 'note.md'), 'utf8')).resolves.toBe('source')
     await expect(fs.lstat(join(root, 'source'))).rejects.toMatchObject({ code: 'ENOENT' })
   })
@@ -1225,7 +1286,9 @@ describe('localFs pathname occupancy', () => {
 
     await fs.mkdir(join(root, 'source'))
     await fs.writeFile(join(root, 'source', 'note.md'), 'source')
-    await expect(files.renameDirIfAbsent!('source', 'source')).resolves.toBe(true)
+    await expect(
+      files.capabilities.directoryNoReplaceMove!.renameDirIfAbsent('source', 'source'),
+    ).resolves.toBe(true)
     await expect(fs.readFile(join(root, 'source', 'note.md'), 'utf8')).resolves.toBe('source')
   })
 
@@ -1237,7 +1300,9 @@ describe('localFs pathname occupancy', () => {
     await fs.mkdir(join(root, 'target'))
     await fs.writeFile(join(root, 'source', 'source.md'), 'source')
     await fs.writeFile(join(root, 'target', 'target.md'), 'target')
-    await expect(files.renameDirIfAbsent!('source', 'target')).resolves.toBe(false)
+    await expect(
+      files.capabilities.directoryNoReplaceMove!.renameDirIfAbsent('source', 'target'),
+    ).resolves.toBe(false)
     await expect(fs.readFile(join(root, 'source', 'source.md'), 'utf8')).resolves.toBe('source')
     await expect(fs.readFile(join(root, 'target', 'target.md'), 'utf8')).resolves.toBe('target')
   })
@@ -1252,7 +1317,9 @@ describe('localFs pathname occupancy', () => {
     await fs.writeFile(join(root, 'source', 'source.md'), 'source')
     await fs.symlink(externalRoot, join(root, 'other-fs'))
 
-    await expect(files.renameDirIfAbsent!('source', 'other-fs/target')).rejects.toMatchObject({
+    await expect(
+      files.capabilities.directoryNoReplaceMove!.renameDirIfAbsent('source', 'other-fs/target'),
+    ).rejects.toMatchObject({
       code: 'ENOTSUP',
     })
     await expect(fs.readFile(join(root, 'source', 'source.md'), 'utf8')).resolves.toBe('source')
@@ -1266,8 +1333,9 @@ describe('localFs pathname occupancy', () => {
     await fs.writeFile(join(root, 'source', 'source.md'), 'source')
 
     // Before construction: the shape is decided there, so an adapter built on an
-    // unmapped ABI must never advertise the method at all — a caller that asks
-    // `if (!files.renameDirIfAbsent)` has to see the truth without calling it.
+    // unmapped ABI must never advertise the facets at all — a caller that asks
+    // `if (!files.capabilities.directoryNoReplaceMove)` has to see the truth
+    // without calling anything.
     Object.defineProperty(process, 'arch', { configurable: true, value: 'unsupported-audit-arch' })
     let files
 
@@ -1277,10 +1345,21 @@ describe('localFs pathname occupancy', () => {
       Object.defineProperty(process, 'arch', { configurable: true, value: actualArch })
     }
 
-    expect(Object.hasOwn(files, 'renameDirIfAbsent')).toBe(false)
-    expect(files.renameDirIfAbsent).toBeUndefined()
+    // All THREE, together. Directory move, package install and strict publication
+    // rest on the same runtime primitive, so a build that keeps any one of them
+    // here would be advertising an operation this host cannot perform.
+    expect(Object.hasOwn(files.capabilities, 'directoryNoReplaceMove')).toBe(false)
+    expect(Object.hasOwn(files.capabilities, 'packagePublication')).toBe(false)
+    expect(Object.hasOwn(files.capabilities, 'strictPublication')).toBe(false)
+    // What stays is what a caller can still do: the base port and every facet
+    // that does not need the primitive.
+    expect(Object.hasOwn(files.capabilities, 'conditionalFileMutation')).toBe(true)
+    expect(Object.hasOwn(files.capabilities, 'fileNoReplaceMove')).toBe(true)
+    // And construction touched nothing: no root, no staging tree, no journal for a
+    // later run to find.
     await expect(fs.readFile(join(root, 'source', 'source.md'), 'utf8')).resolves.toBe('source')
     await expect(fs.lstat(join(root, 'target'))).rejects.toMatchObject({ code: 'ENOENT' })
+    expect((await fs.readdir(root)).sort()).toEqual(['source'])
   })
 
   it('declares the capability exactly when this runtime provides it', async () => {
@@ -1291,9 +1370,11 @@ describe('localFs pathname occupancy', () => {
     // carry: that gate probes by CALLING the method, so an adapter that stopped
     // declaring it closes the gate and reads as "this machine cannot do it".
     // The shape must answer to the provider, not to the machine's mood.
-    expect(Object.hasOwn(files, 'renameDirIfAbsent')).toBe(
-      renameNoReplaceIfAvailable() !== undefined,
-    )
+    const provided = renameNoReplaceIfAvailable() !== undefined
+
+    expect(Object.hasOwn(files.capabilities, 'directoryNoReplaceMove')).toBe(provided)
+    expect(Object.hasOwn(files.capabilities, 'packagePublication')).toBe(provided)
+    expect(Object.hasOwn(files.capabilities, 'strictPublication')).toBe(provided)
   })
 
   it('closes the native gate only on a runtime that truly cannot publish', async () => {
@@ -1323,8 +1404,8 @@ describe('localFs pathname occupancy', () => {
       await fs.writeFile(join(root, source, 'winner.md'), source)
     }
     const results = await Promise.all([
-      files.renameDirIfAbsent!('left', 'target'),
-      files.renameDirIfAbsent!('right', 'target'),
+      files.capabilities.directoryNoReplaceMove!.renameDirIfAbsent('left', 'target'),
+      files.capabilities.directoryNoReplaceMove!.renameDirIfAbsent('right', 'target'),
     ])
 
     expect(results.filter(Boolean)).toHaveLength(1)
@@ -1338,23 +1419,31 @@ describe('localFs pathname occupancy', () => {
     const root = await mkroot()
     const files = createLocalFsFiles(root)
 
-    await expect(files.makeDir('Café')).resolves.toBe(true)
-    await expect(files.makeDir('Café')).resolves.toBe(false)
-    await expect(files.makeDir('Cafe\u0301')).resolves.toBe(true)
-    await expect(files.listDirs()).resolves.toEqual(expect.arrayContaining(['Café', 'Cafe\u0301']))
+    await expect(files.base.makeDir('Café')).resolves.toBe(true)
+    await expect(files.base.makeDir('Café')).resolves.toBe(false)
+    await expect(files.base.makeDir('Cafe\u0301')).resolves.toBe(true)
+    await expect(files.base.listDirs()).resolves.toEqual(
+      expect.arrayContaining(['Café', 'Cafe\u0301']),
+    )
   })
 
   it('distinguishes one pathname entry from a hardlink and a symlink to it', async () => {
     const root = await mkroot()
     const files = createLocalFsFiles(root)
 
-    await files.write('source.md', 'body')
+    await files.base.write('source.md', 'body')
     await fs.link(join(root, 'source.md'), join(root, 'same-entry.md'))
     await fs.symlink('source.md', join(root, 'symlink.md'))
 
-    await expect(files.sameEntry!('source.md', 'source.md')).resolves.toBe(true)
-    await expect(files.sameEntry!('source.md', 'same-entry.md')).resolves.toBe(false)
-    await expect(files.sameEntry!('source.md', 'symlink.md')).resolves.toBe(false)
+    await expect(
+      files.capabilities.entryIdentity!.sameEntry('source.md', 'source.md'),
+    ).resolves.toBe(true)
+    await expect(
+      files.capabilities.entryIdentity!.sameEntry('source.md', 'same-entry.md'),
+    ).resolves.toBe(false)
+    await expect(
+      files.capabilities.entryIdentity!.sameEntry('source.md', 'symlink.md'),
+    ).resolves.toBe(false)
   })
 
   it('observes exact bytes, claim and mtime from one regular-file sample', async () => {
@@ -1363,7 +1452,7 @@ describe('localFs pathname occupancy', () => {
     const source = Uint8Array.of(0xff, 0x00, 0x0d, 0x0a)
 
     await fs.writeFile(join(root, 'opaque.bin'), source)
-    const first = await files.observe!('opaque.bin')
+    const first = await files.capabilities.resourceObservation!.observe('opaque.bin')
 
     expect(first).toMatchObject({
       kind: 'present',
@@ -1373,7 +1462,7 @@ describe('localFs pathname occupancy', () => {
     expect(first.kind === 'present' ? first.bytes : null).toEqual(source)
 
     await fs.writeFile(join(root, 'opaque.bin'), Uint8Array.of(0xfe))
-    const second = await files.observe!('opaque.bin')
+    const second = await files.capabilities.resourceObservation!.observe('opaque.bin')
 
     expect(second.kind).toBe('present')
     expect(second.kind === 'present' && first.kind === 'present' && second.claim).not.toEqual(
@@ -1385,13 +1474,17 @@ describe('localFs pathname occupancy', () => {
     const root = await mkroot()
     const files = createLocalFsFiles(root)
 
-    await expect(files.observe!('missing.md')).resolves.toMatchObject({
+    await expect(
+      files.capabilities.resourceObservation!.observe('missing.md'),
+    ).resolves.toMatchObject({
       kind: 'absent',
       claim: { kind: 'absent' },
       mtimeMs: null,
     })
     await fs.symlink('missing.md', join(root, 'occupied.md'))
-    await expect(files.observe!('occupied.md')).resolves.toMatchObject({
+    await expect(
+      files.capabilities.resourceObservation!.observe('occupied.md'),
+    ).resolves.toMatchObject({
       kind: 'occupied',
       claim: { kind: 'present' },
       entryType: 'symlink',
@@ -1402,13 +1495,13 @@ describe('localFs pathname occupancy', () => {
   it('publishes byte-safe creates and updates with operation-owned proof transitions', async () => {
     const root = await mkroot()
     const files = createLocalFsFiles(root)
-    const absent = await files.observe!('opaque.bin')
+    const absent = await files.capabilities.resourceObservation!.observe('opaque.bin')
 
     expect(absent.kind).toBe('absent')
     if (absent.kind !== 'absent') {
       return
     }
-    const created = await files.publish!({
+    const created = await files.capabilities.resourcePublication!.publish({
       kind: 'put',
       path: 'opaque.bin',
       content: Uint8Array.of(0xff, 0x00),
@@ -1426,7 +1519,7 @@ describe('localFs pathname occupancy', () => {
         }),
       ],
     })
-    const first = await files.observe!('opaque.bin')
+    const first = await files.capabilities.resourceObservation!.observe('opaque.bin')
     expect(first.kind).toBe('present')
     if (first.kind !== 'present') {
       return
@@ -1435,7 +1528,7 @@ describe('localFs pathname occupancy', () => {
       first.claim,
     )
 
-    const updated = await files.publish!({
+    const updated = await files.capabilities.resourcePublication!.publish({
       kind: 'put',
       path: 'opaque.bin',
       content: Uint8Array.of(0xfe, 0x0d, 0x0a),
@@ -1452,7 +1545,7 @@ describe('localFs pathname occupancy', () => {
     const root = await mkroot()
     const files = createLocalFsFiles(root)
     await fs.writeFile(join(root, 'note.md'), 'first')
-    const first = await files.observe!('note.md')
+    const first = await files.capabilities.resourceObservation!.observe('note.md')
 
     expect(first.kind).toBe('present')
     if (first.kind !== 'present') {
@@ -1460,7 +1553,7 @@ describe('localFs pathname occupancy', () => {
     }
     await fs.writeFile(join(root, 'note.md'), 'external')
     await expect(
-      files.publish!({
+      files.capabilities.resourcePublication!.publish({
         kind: 'put',
         path: 'note.md',
         content: new TextEncoder().encode('ours'),
@@ -1474,15 +1567,15 @@ describe('localFs pathname occupancy', () => {
     const root = await mkroot()
     const files = createLocalFsFiles(root)
     await fs.writeFile(join(root, 'source.md'), Uint8Array.of(0xff))
-    const source = await files.observe!('source.md')
-    const target = await files.observe!('target.md')
+    const source = await files.capabilities.resourceObservation!.observe('source.md')
+    const target = await files.capabilities.resourceObservation!.observe('target.md')
 
     expect(source.kind).toBe('present')
     expect(target.kind).toBe('absent')
     if (source.kind !== 'present' || target.kind !== 'absent') {
       return
     }
-    const result = await files.publish!({
+    const result = await files.capabilities.resourcePublication!.publish({
       kind: 'move-put',
       sourcePath: 'source.md',
       targetPath: 'target.md',
@@ -1515,13 +1608,13 @@ describe('localFs pathname occupancy', () => {
   it('atomically publishes one aggregate package proof', async () => {
     const root = await mkroot()
     const files = createLocalFsFiles(root)
-    const absent = await files.observe!('demo')
+    const absent = await files.capabilities.resourceObservation!.observe('demo')
 
     expect(absent.kind).toBe('absent')
     if (absent.kind !== 'absent') {
       return
     }
-    const result = await files.publishPackageIfAbsent!({
+    const result = await files.capabilities.packagePublication!.publishPackageIfAbsent({
       rootPath: 'demo',
       files: [
         { path: 'SKILL.md', content: new TextEncoder().encode('manifest') },
@@ -1549,7 +1642,7 @@ describe('localFs pathname occupancy', () => {
       Buffer.from([0xff, 0x00]),
     )
     await expect(
-      files.publishPackageIfAbsent!({
+      files.capabilities.packagePublication!.publishPackageIfAbsent({
         rootPath: 'demo',
         files: [{ path: 'SKILL.md', content: new TextEncoder().encode('rival') }],
         expectedRoot: absent.claim,
@@ -1561,13 +1654,13 @@ describe('localFs pathname occupancy', () => {
 describe('localFs restart-durable strict publication', () => {
   const stagedAbsent = async (root: string, operationId = 'restore-op') => {
     const files = createLocalFsFiles(root)
-    const observed = await files.observe!('note.md')
+    const observed = await files.capabilities.resourceObservation!.observe('note.md')
 
     expect(observed.kind).toBe('absent')
     if (observed.kind !== 'absent') {
       throw new Error('expected an absent target')
     }
-    const result = await files.strictPublication!.stage({
+    const result = await files.capabilities.strictPublication!.stage({
       operationId,
       binding: 'binding-a',
       path: 'note.md',
@@ -1584,10 +1677,10 @@ describe('localFs restart-durable strict publication', () => {
     const files = await stagedAbsent(root)
 
     await expect(
-      createLocalFsFiles(root).strictPublication!.inspect('restore-op', 'binding-a'),
+      createLocalFsFiles(root).capabilities.strictPublication!.inspect('restore-op', 'binding-a'),
     ).resolves.toMatchObject({ status: 'staged', stage: { candidateHash: expect.any(String) } })
     await expect(
-      files.strictPublication!.stage({
+      files.capabilities.strictPublication!.stage({
         operationId: 'restore-op',
         binding: 'binding-a',
         path: 'note.md',
@@ -1596,7 +1689,7 @@ describe('localFs restart-durable strict publication', () => {
       }),
     ).resolves.toEqual({ status: 'idempotency-conflict' })
 
-    const published = await files.strictPublication!.publish('restore-op', 'binding-a')
+    const published = await files.capabilities.strictPublication!.publish('restore-op', 'binding-a')
 
     expect(published).toMatchObject({
       status: 'published',
@@ -1616,12 +1709,14 @@ describe('localFs restart-durable strict publication', () => {
     }
     await fs.writeFile(join(root, 'note.md'), 'external in-place edit')
     await expect(
-      createLocalFsFiles(root).strictPublication!.inspect('restore-op', 'binding-a'),
+      createLocalFsFiles(root).capabilities.strictPublication!.inspect('restore-op', 'binding-a'),
     ).resolves.toMatchObject({
       status: 'failed-recoverable',
       reason: 'published candidate no longer owns the public pathname',
     })
-    await expect(files.strictPublication!.discard('restore-op', 'binding-a')).resolves.toBe(true)
+    await expect(
+      files.capabilities.strictPublication!.discard('restore-op', 'binding-a'),
+    ).resolves.toBe(true)
     await expect(fs.readFile(join(root, 'note.md'), 'utf8')).resolves.toBe('external in-place edit')
   })
 
@@ -1630,14 +1725,17 @@ describe('localFs restart-durable strict publication', () => {
     const files = await stagedAbsent(root, 'replaced-receipt')
 
     await expect(
-      files.strictPublication!.publish('replaced-receipt', 'binding-a'),
+      files.capabilities.strictPublication!.publish('replaced-receipt', 'binding-a'),
     ).resolves.toMatchObject({ status: 'published' })
     const foreign = join(root, 'foreign.md')
     await fs.writeFile(foreign, 'candidate')
     await fs.rename(foreign, join(root, 'note.md'))
 
     await expect(
-      createLocalFsFiles(root).strictPublication!.inspect('replaced-receipt', 'binding-a'),
+      createLocalFsFiles(root).capabilities.strictPublication!.inspect(
+        'replaced-receipt',
+        'binding-a',
+      ),
     ).resolves.toMatchObject({
       status: 'failed-recoverable',
       reason: 'published candidate no longer owns the public pathname',
@@ -1656,12 +1754,14 @@ describe('localFs restart-durable strict publication', () => {
 
       return realLink(source, target)
     })
-    await expect(files.strictPublication!.publish('lost-ack', 'binding-a')).rejects.toMatchObject({
+    await expect(
+      files.capabilities.strictPublication!.publish('lost-ack', 'binding-a'),
+    ).rejects.toMatchObject({
       code: 'EIO',
     })
     vi.restoreAllMocks()
 
-    const resumed = await createLocalFsFiles(root).strictPublication!.publish(
+    const resumed = await createLocalFsFiles(root).capabilities.strictPublication!.publish(
       'lost-ack',
       'binding-a',
     )
@@ -1674,7 +1774,7 @@ describe('localFs restart-durable strict publication', () => {
     const root = await mkroot()
     await fs.writeFile(join(root, 'note.md'), 'original')
     const files = createLocalFsFiles(root)
-    const observed = await files.observe!('note.md')
+    const observed = await files.capabilities.resourceObservation!.observe('note.md')
 
     expect(observed.kind).toBe('present')
     if (observed.kind !== 'present') {
@@ -1683,14 +1783,17 @@ describe('localFs restart-durable strict publication', () => {
     const openOriginal = await fs.open(join(root, 'note.md'), 'r')
 
     try {
-      await files.strictPublication!.stage({
+      await files.capabilities.strictPublication!.stage({
         operationId: 'replace-op',
         binding: 'binding-a',
         path: 'note.md',
         content: new TextEncoder().encode('restored'),
         expected: observed.claim,
       })
-      const published = await files.strictPublication!.publish('replace-op', 'binding-a')
+      const published = await files.capabilities.strictPublication!.publish(
+        'replace-op',
+        'binding-a',
+      )
 
       expect(published.status).toBe('published')
       await expect(fs.readFile(join(root, 'note.md'), 'utf8')).resolves.toBe('restored')
@@ -1708,13 +1811,13 @@ describe('localFs restart-durable strict publication', () => {
     const root = await mkroot()
     await fs.writeFile(join(root, 'note.md'), 'original')
     const files = createLocalFsFiles(root)
-    const observed = await files.observe!('note.md')
+    const observed = await files.capabilities.resourceObservation!.observe('note.md')
 
     expect(observed.kind).toBe('present')
     if (observed.kind !== 'present') {
       return
     }
-    await files.strictPublication!.stage({
+    await files.capabilities.strictPublication!.stage({
       operationId: 'racing-creator',
       binding: 'binding-a',
       path: 'note.md',
@@ -1730,7 +1833,10 @@ describe('localFs restart-durable strict publication', () => {
 
       return realLink(source, target)
     })
-    const result = await files.strictPublication!.publish('racing-creator', 'binding-a')
+    const result = await files.capabilities.strictPublication!.publish(
+      'racing-creator',
+      'binding-a',
+    )
 
     expect(result).toMatchObject({
       status: 'failed-recoverable',
@@ -1740,9 +1846,9 @@ describe('localFs restart-durable strict publication', () => {
       ]),
     })
     await expect(fs.readFile(join(root, 'note.md'), 'utf8')).resolves.toBe('external')
-    await expect(files.strictPublication!.discard('racing-creator', 'binding-a')).resolves.toBe(
-      false,
-    )
+    await expect(
+      files.capabilities.strictPublication!.discard('racing-creator', 'binding-a'),
+    ).resolves.toBe(false)
   })
 
   it('quarantines a corrupt stage instead of guessing its recovery state', async () => {
@@ -1751,9 +1857,9 @@ describe('localFs restart-durable strict publication', () => {
     const [stageDir] = await fs.readdir(join(root, '.notarium-fs-ops'))
     await fs.writeFile(join(root, '.notarium-fs-ops', stageDir!, 'header.json'), '{}')
 
-    await expect(files.strictPublication!.inspect('corrupt-op', 'binding-a')).rejects.toMatchObject(
-      { code: 'STRICT_STAGE_CORRUPT' },
-    )
+    await expect(
+      files.capabilities.strictPublication!.inspect('corrupt-op', 'binding-a'),
+    ).rejects.toMatchObject({ code: 'STRICT_STAGE_CORRUPT' })
     expect(await fs.readdir(join(root, '.notarium-fs-ops'))).toEqual([
       expect.stringMatching(/^quarantine-/),
     ])

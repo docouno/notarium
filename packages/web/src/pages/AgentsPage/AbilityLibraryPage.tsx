@@ -586,6 +586,7 @@ export const AbilityLibraryPage = ({ expectedKind }: { expectedKind?: 'roles' | 
               space={space}
               spaceAvailable={canWrite && personalSpace?.slug !== space}
               projects={data.projects ?? []}
+              install={data.installAvailability}
               onAdd={addCatalog}
               onClose={() => setCatalogAdd(null)}
             />

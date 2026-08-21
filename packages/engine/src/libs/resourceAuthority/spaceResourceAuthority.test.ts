@@ -3,16 +3,32 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { sha256Hex } from '@notarium/core'
+
 import {
   createLocalFsFiles,
+  type FileClaim,
   type FileObservation,
+  type FilePackagePublicationRequest,
+  type FileProofTransition,
   type FilePublicationRequest,
-  type FileStore,
+  type FileStrictPublicationResult,
+  type FileStrictStageRequest,
+  type FileStrictStageState,
 } from '../files'
 import { SpaceResourceAuthorityRegistry } from './registry'
 import type * as rootsModule from './roots'
 import { preflightResourceRoots } from './roots'
 import { SpaceResourceAuthority } from './spaceResourceAuthority'
+import {
+  type ResourceAuthorityAdapter,
+  resourceAuthorityAdapterOf,
+  type ResourceAuthorityFileCapabilities,
+  type ResourceAuthorityFileView,
+  type ResourcePublicationRequest,
+  type ResourceStrictStageRef,
+  type ResourceStrictStageRequest,
+} from './types'
 
 /** Counts the physical root re-canonicalization — one `lstat` + `realpath` per mount
  *  root — so "the lease path does not pay the check twice" is measured rather than
@@ -52,8 +68,50 @@ const present = (value: number, claim = String(value)): FileObservation => ({
   mtimeMs: value,
 })
 
-const observingStore = (observe: (path: string) => Promise<FileObservation>): FileStore =>
-  ({ observe }) as FileStore
+/** The base inventory every adapter owes the authority. An empty tree is a
+ *  complete, honest answer — these fixtures test routing and proof handling, not
+ *  what a placement happens to contain. */
+const emptyInventory: ResourceAuthorityFileView = {
+  scan: async () => [],
+  read: async () => null,
+  dirExists: async () => false,
+}
+
+/** One adapter's whole file dependency, spelled as the two fields the type
+ *  declares. Written out rather than cast: a cast would let a fixture claim a
+ *  facet it does not implement, which is the exact confusion the split removes. */
+const adapterFiles = (
+  capabilities: ResourceAuthorityFileCapabilities,
+  files: ResourceAuthorityFileView = emptyInventory,
+): Pick<ResourceAuthorityAdapter, 'files' | 'capabilities'> => ({ files, capabilities })
+
+const observingAdapter = (
+  observe: (path: string) => Promise<FileObservation>,
+): Pick<ResourceAuthorityAdapter, 'files' | 'capabilities'> =>
+  adapterFiles({ resourceObservation: { observe } })
+
+/** Observation plus a publication that always succeeds — the pair the lifecycle
+ *  tests need, and nothing else. */
+const publishingFiles = (
+  absent: FileClaim & { kind: 'absent' },
+): Pick<ResourceAuthorityAdapter, 'files' | 'capabilities'> =>
+  adapterFiles({
+    resourceObservation: { observe: async () => present(1, 'after') },
+    resourcePublication: {
+      publish: async (request: FilePublicationRequest) => ({
+        status: 'published',
+        candidateHash: await sha256Hex(request.content),
+        transitions: [
+          {
+            path: request.kind === 'put' ? request.path : request.targetPath,
+            before: absent,
+            after: { kind: 'present' as const, value: 'test:after' },
+            mtimeMs: 2,
+          },
+        ],
+      }),
+    },
+  })
 
 /** Public entries that TAKE a lease: the one place the lifecycle question is asked. */
 const LEASE_GATES = ['admitResource', 'admitPackage', 'admitSkillPlacement'] as const
@@ -65,7 +123,6 @@ const ADMITTED_ENTRIES = [
   'observeLinkedAdmitted',
   'observeStrictAdmitted',
   'publishAdmitted',
-  'publishPackageIfAbsentAdmitted',
   'publishStrictAdmitted',
 ] as const
 
@@ -77,6 +134,7 @@ const NEITHER = [
   'assertAdmitted',
   'assertRootsStable',
   'closeAdmission',
+  'commitPackageIfAbsentAdmitted',
   'diagnostics',
   'discardStrict',
   'exportAdapter',
@@ -88,8 +146,11 @@ const NEITHER = [
   'observe',
   'observeAdmitted',
   'observeLinked',
+  // A composition QUESTION, answered without touching the medium. The lease
+  // belongs to the view it returns, and is taken through `admitSkillPlacement`
+  // — already a gate above.
+  'packagePublicationFor',
   'publish',
-  'publishPackageIfAbsent',
   'publishStrict',
   'removeClaimed',
   'reopenAdmission',
@@ -119,12 +180,6 @@ const admittedEntryCalls = (
         content: Uint8Array.of(1),
         expected: absent,
       }),
-    publishPackageIfAbsentAdmitted: () =>
-      authority.publishPackageIfAbsentAdmitted({
-        rootPath: 'pkg',
-        files: [{ path: 'SKILL.md', content: Uint8Array.of(1) }],
-        expectedRoot: absent,
-      }),
     publishStrictAdmitted: () =>
       authority.publishStrictAdmitted({ operationId: 'op', binding: 'binding', path: 'note.md' }),
   }
@@ -132,29 +187,29 @@ const admittedEntryCalls = (
 
 describe('SpaceResourceAuthority', () => {
   it('rejects ambiguous topology and non-canonical resource requests', async () => {
-    const files = observingStore(async () => present(1))
+    const files = observingAdapter(async () => present(1))
 
-    expect(() => new SpaceResourceAuthority('  ', [{ id: 'root', prefix: '', files }])).toThrow(
+    expect(() => new SpaceResourceAuthority('  ', [{ id: 'root', prefix: '', ...files }])).toThrow(
       'space id',
     )
     expect(() => new SpaceResourceAuthority('space', [])).toThrow('at least one adapter')
     expect(
       () =>
         new SpaceResourceAuthority('space', [
-          { id: 'duplicate', prefix: '', files },
-          { id: 'duplicate', prefix: 'skills', files },
+          { id: 'duplicate', prefix: '', ...files },
+          { id: 'duplicate', prefix: 'skills', ...files },
         ]),
     ).toThrow('ids must be unique')
     expect(
       () =>
         new SpaceResourceAuthority('space', [
-          { id: 'one', prefix: 'skills', files },
-          { id: 'two', prefix: 'skills', files },
+          { id: 'one', prefix: 'skills', ...files },
+          { id: 'two', prefix: 'skills', ...files },
         ]),
     ).toThrow('prefixes must be unique')
 
     const authority = new SpaceResourceAuthority('space', [
-      { id: 'skills', prefix: 'skills', files },
+      { id: 'skills', prefix: 'skills', ...files },
     ])
 
     for (const path of ['', '/note.md', 'note.md/', 'folder\\note.md', 'folder/../note.md']) {
@@ -168,10 +223,10 @@ describe('SpaceResourceAuthority', () => {
   })
 
   it('reports missing adapter capabilities instead of fabricating observations or proofs', async () => {
-    const incapable = {} as FileStore
+    const incapable = adapterFiles({})
     const authority = new SpaceResourceAuthority('space', [
-      { id: 'root', prefix: '', files: observingStore(async () => present(1)) },
-      { id: 'skills', prefix: 'skills', files: incapable },
+      { id: 'root', prefix: '', ...observingAdapter(async () => present(1)) },
+      { id: 'skills', prefix: 'skills', ...incapable },
     ])
     const absent = { kind: 'absent' as const, value: 'test:absent' }
 
@@ -203,13 +258,6 @@ describe('SpaceResourceAuthority', () => {
       }),
     ).rejects.toThrow('cannot cross resource adapters')
     await expect(
-      authority.publishPackageIfAbsent({
-        rootPath: 'skills/demo',
-        files: [{ path: 'SKILL.md', content: Uint8Array.of(1) }],
-        expectedRoot: absent,
-      }),
-    ).rejects.toMatchObject({ code: 'PACKAGE_PUBLICATION_UNAVAILABLE' })
-    await expect(
       authority.stageStrict({
         operationId: 'op',
         binding: 'binding',
@@ -236,12 +284,19 @@ describe('SpaceResourceAuthority', () => {
 
   it('rejects incomplete adapter proof sets and preserves explicit conflicts', async () => {
     const absent = { kind: 'absent' as const, value: 'test:absent' }
-    const conflictStore = {
-      publish: async () => ({ status: 'conflict', path: 'note.md', actual: absent }),
-      publishPackageIfAbsent: async () => ({ status: 'conflict', path: 'pkg', actual: absent }),
-    } as unknown as FileStore
+    const conflictStore = adapterFiles({
+      resourceObservation: {
+        observe: async () => ({ kind: 'absent', claim: absent, mtimeMs: null }),
+      },
+      resourcePublication: {
+        publish: async () => ({ status: 'conflict' }),
+      },
+      packagePublication: {
+        publishPackageIfAbsent: async () => ({ status: 'conflict' }),
+      },
+    })
     const conflictAuthority = new SpaceResourceAuthority('space', [
-      { id: 'root', prefix: '', files: conflictStore },
+      { id: 'root', prefix: '', ...conflictStore },
     ])
 
     await expect(
@@ -253,27 +308,38 @@ describe('SpaceResourceAuthority', () => {
       }),
     ).resolves.toMatchObject({ status: 'conflict' })
     await expect(
-      conflictAuthority.publishPackageIfAbsent({
+      conflictAuthority.packagePublicationFor('', 'test')!.publishIfAbsent({
         rootPath: 'pkg',
-        files: [{ path: 'SKILL.md', content: Uint8Array.of(1) }],
-        expectedRoot: absent,
+        files: [
+          {
+            path: 'SKILL.md',
+            content: new TextEncoder().encode('---\nname: pkg\ndescription: Package.\n---'),
+          },
+        ],
       }),
     ).resolves.toMatchObject({ status: 'conflict' })
 
-    const invalidStore = {
-      publish: async () => ({
-        status: 'published',
-        candidateHash: 'a'.repeat(64),
-        transitions: [],
-      }),
-      publishPackageIfAbsent: async () => ({
-        status: 'published',
-        candidateHash: 'a'.repeat(64),
-        transitions: [],
-      }),
-    } as unknown as FileStore
+    const invalidStore = adapterFiles({
+      resourceObservation: {
+        observe: async () => ({ kind: 'absent', claim: absent, mtimeMs: null }),
+      },
+      resourcePublication: {
+        publish: async (request) => ({
+          status: 'published',
+          candidateHash: await sha256Hex(request.content),
+          transitions: [],
+        }),
+      },
+      packagePublication: {
+        publishPackageIfAbsent: async () => ({
+          status: 'published',
+          candidateHash: 'a'.repeat(64),
+          transitions: [],
+        }),
+      },
+    })
     const invalidAuthority = new SpaceResourceAuthority('space', [
-      { id: 'root', prefix: '', files: invalidStore },
+      { id: 'root', prefix: '', ...invalidStore },
     ])
 
     await expect(
@@ -285,17 +351,21 @@ describe('SpaceResourceAuthority', () => {
       }),
     ).rejects.toThrow('invalid publication proof set')
     await expect(
-      invalidAuthority.publishPackageIfAbsent({
+      invalidAuthority.packagePublicationFor('', 'test')!.publishIfAbsent({
         rootPath: 'pkg',
-        files: [{ path: 'SKILL.md', content: Uint8Array.of(1) }],
-        expectedRoot: absent,
+        files: [
+          {
+            path: 'SKILL.md',
+            content: new TextEncoder().encode('---\nname: pkg\ndescription: Package.\n---'),
+          },
+        ],
       }),
     ).rejects.toThrow('invalid package proof set')
   })
 
   it('closes fresh admission only after earlier work drains and reopens explicitly', async () => {
     const authority = new SpaceResourceAuthority('space', [
-      { id: 'root', prefix: '', files: observingStore(async () => present(1)) },
+      { id: 'root', prefix: '', ...observingAdapter(async () => present(1)) },
     ])
     const active = await authority.admitResource('note.md', 'shared', 'accepted-before-close')
     let closed = false
@@ -333,7 +403,7 @@ describe('SpaceResourceAuthority', () => {
       {
         id: 'root',
         prefix: '',
-        files: observingStore(async (path) => {
+        ...observingAdapter(async (path) => {
           rootCalls.push(path)
           return present(1)
         }),
@@ -341,7 +411,7 @@ describe('SpaceResourceAuthority', () => {
       {
         id: 'skills',
         prefix: '.notarium/skills',
-        files: observingStore(async (path) => {
+        ...observingAdapter(async (path) => {
           skillCalls.push(path)
           return {
             kind: 'present',
@@ -369,7 +439,7 @@ describe('SpaceResourceAuthority', () => {
 
   it('serializes different package ids at the shared skill placement boundary', async () => {
     const authority = new SpaceResourceAuthority('space', [
-      { id: 'skills', prefix: '.skills', files: observingStore(async () => present(1)) },
+      { id: 'skills', prefix: '.skills', ...observingAdapter(async () => present(1)) },
     ])
     const placement = await authority.admitSkillPlacement(
       '.skills/Ab3xK9_qZ12R/SKILL.md',
@@ -397,7 +467,7 @@ describe('SpaceResourceAuthority', () => {
       {
         id: 'root',
         prefix: '',
-        files: observingStore(async (path) => {
+        ...observingAdapter(async (path) => {
           calls.push(path)
           return path.endsWith('SKILL.md') ? present(2, 'target') : present(1, 'source')
         }),
@@ -425,7 +495,7 @@ describe('SpaceResourceAuthority', () => {
       {
         id: 'root',
         prefix: '',
-        files: observingStore(async (path) =>
+        ...observingAdapter(async (path) =>
           path === 'SKILL.md' ? present(9, 'target') : present(1, `source-${sourceVersion++}`),
         ),
       },
@@ -439,14 +509,16 @@ describe('SpaceResourceAuthority', () => {
   })
 
   it('holds a root-package lease until a lazy export iterator is closed', async () => {
-    const adapter = {
-      async *exportFiles() {
-        yield { path: 'demo/SKILL.md', content: Uint8Array.of(1) }
-        yield { path: 'demo/asset.bin', content: Uint8Array.of(2) }
+    const adapter = adapterFiles({
+      resourceExport: {
+        async *exportFiles() {
+          yield { path: 'demo/SKILL.md', content: Uint8Array.of(1) }
+          yield { path: 'demo/asset.bin', content: Uint8Array.of(2) }
+        },
       },
-    } as unknown as FileStore
+    })
     const authority = new SpaceResourceAuthority('space', [
-      { id: 'skills', prefix: '.skills', files: adapter },
+      { id: 'skills', prefix: '.skills', ...adapter },
     ])
     const iterator = authority.exportAdapter('.skills')[Symbol.asyncIterator]()
 
@@ -477,30 +549,32 @@ describe('SpaceResourceAuthority', () => {
     const publicationGate = new Promise<void>((resolve) => {
       releasePublication = resolve
     })
-    const adapter: FileStore = {
-      observe: async () => present(1, 'after'),
-      publish: async (request: FilePublicationRequest) => {
-        await publicationGate
-        submittedByte = request.content[0]
-        return {
-          status: 'published',
-          candidateHash: 'a'.repeat(64),
-          transitions: [
-            {
-              path: request.kind === 'put' ? request.path : request.targetPath,
-              before:
-                request.kind === 'put'
-                  ? request.expected
-                  : { kind: 'absent' as const, value: 'test:absent' },
-              after: { kind: 'present', value: 'test:after' },
-              mtimeMs: 2,
-            },
-          ],
-        }
+    const adapter = adapterFiles({
+      resourceObservation: { observe: async () => present(1, 'after') },
+      resourcePublication: {
+        publish: async (request: FilePublicationRequest) => {
+          await publicationGate
+          submittedByte = request.content[0]
+          return {
+            status: 'published',
+            candidateHash: await sha256Hex(request.content),
+            transitions: [
+              {
+                path: request.kind === 'put' ? request.path : request.targetPath,
+                before:
+                  request.kind === 'put'
+                    ? request.expected
+                    : { kind: 'absent' as const, value: 'test:absent' },
+                after: { kind: 'present' as const, value: 'test:after' },
+                mtimeMs: 2,
+              },
+            ],
+          }
+        },
       },
-    } as unknown as FileStore
+    })
     const authority = new SpaceResourceAuthority('space', [
-      { id: 'skills', prefix: '.notarium/skills', files: adapter },
+      { id: 'skills', prefix: '.notarium/skills', ...adapter },
     ])
     const expected = { kind: 'absent' as const, value: 'test:absent' }
     const source = Uint8Array.of(7)
@@ -534,7 +608,7 @@ describe('SpaceResourceAuthority', () => {
         spaceId: 'space',
         adapterId: 'skills',
         restartDurable: false,
-        candidateHash: 'a'.repeat(64),
+        candidateHash: await sha256Hex(Uint8Array.of(7)),
         transitions: [
           {
             path: '.notarium/skills/demo/SKILL.md',
@@ -546,6 +620,262 @@ describe('SpaceResourceAuthority', () => {
       },
     })
     expect(submittedByte).toBe(7)
+  })
+
+  it('snapshots observation options before admission and owns the returned sample', async () => {
+    const adapterClaim = { kind: 'present' as const, value: 'adapter:original' }
+    const adapterBytes = Uint8Array.of(7)
+    const adapterObservation: FileObservation = {
+      kind: 'present',
+      bytes: adapterBytes,
+      claim: adapterClaim,
+      mtimeMs: 2,
+    }
+    const observe = vi.fn(async () => adapterObservation)
+    const authority = new SpaceResourceAuthority('space', [
+      { id: 'root', prefix: '', ...observingAdapter(observe) },
+    ])
+    const blocker = await authority.admitResource('note.md', 'exclusive', 'blocking-writer')
+    const options = { owner: 'immutable-observation', maxBytes: 7 }
+    const observing = authority.observe('note.md', options)
+
+    await Promise.resolve()
+    expect(authority.diagnostics()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          state: 'waiting',
+          owner: 'immutable-observation',
+          path: 'note.md',
+        }),
+      ]),
+    )
+    options.maxBytes = 70
+    blocker.settle()
+    const observation = await observing
+
+    expect(observe).toHaveBeenCalledWith('note.md', { maxBytes: 7 })
+    adapterClaim.value = 'adapter:mutated'
+    adapterBytes[0] = 9
+    expect(observation).toMatchObject({
+      kind: 'present',
+      bytes: Uint8Array.of(7),
+      claim: { kind: 'present', value: 'adapter:original' },
+    })
+  })
+
+  it('owns an ordinary publication command from lease through adapter proof and receipt', async () => {
+    const originalExpected: FileClaim = { kind: 'absent', value: 'original:absent' }
+    const originalContent = Uint8Array.of(7)
+    const originalPublish = vi.fn(async (submitted: FilePublicationRequest) => {
+      expect(submitted).toEqual({
+        kind: 'put',
+        path: 'note.md',
+        content: Uint8Array.of(7),
+        expected: { kind: 'absent', value: 'original:absent' },
+      })
+      if (submitted.kind !== 'put') {
+        throw new Error('expected the original put command')
+      }
+
+      return {
+        status: 'published' as const,
+        candidateHash: await sha256Hex(submitted.content),
+        transitions: [
+          {
+            path: submitted.path,
+            before: submitted.expected,
+            after: { kind: 'present' as const, value: 'original:present' },
+            mtimeMs: 2,
+          },
+        ],
+      }
+    })
+    const mutatedPublish = vi.fn(async () => ({ status: 'conflict' as const }))
+    const authority = new SpaceResourceAuthority('space', [
+      {
+        id: 'original',
+        prefix: 'original',
+        ...adapterFiles({ resourcePublication: { publish: originalPublish } }),
+      },
+      {
+        id: 'mutated',
+        prefix: 'mutated',
+        ...adapterFiles({ resourcePublication: { publish: mutatedPublish } }),
+      },
+    ])
+    const blocker = await authority.admitResource(
+      'original/note.md',
+      'exclusive',
+      'blocking-writer',
+    )
+    const request: ResourcePublicationRequest = {
+      kind: 'put',
+      path: 'original/note.md',
+      content: originalContent,
+      expected: originalExpected,
+    }
+    const publishing = authority.publish(request, { owner: 'immutable-command' })
+
+    await Promise.resolve()
+    expect(authority.diagnostics()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          state: 'waiting',
+          owner: 'immutable-command',
+          path: 'original/note.md',
+        }),
+      ]),
+    )
+    originalExpected.kind = 'present'
+    originalExpected.value = 'mutated:claim'
+    originalContent[0] = 9
+    Object.assign(request, {
+      kind: 'move-put',
+      path: 'mutated/note.md',
+      sourcePath: 'mutated/source.md',
+      targetPath: 'mutated/target.md',
+      content: Uint8Array.of(9),
+      expectedSource: { kind: 'present', value: 'mutated:source' },
+      expectedTarget: { kind: 'absent', value: 'mutated:target' },
+    })
+    blocker.settle()
+
+    await expect(publishing).resolves.toMatchObject({
+      status: 'published',
+      receipt: {
+        adapterId: 'original',
+        transitions: [
+          {
+            path: 'original/note.md',
+            before: { kind: 'absent', value: 'original:absent' },
+            after: { kind: 'present', value: 'original:present' },
+          },
+        ],
+      },
+    })
+    expect(originalPublish).toHaveBeenCalledTimes(1)
+    expect(mutatedPublish).not.toHaveBeenCalled()
+  })
+
+  it('keeps the ordinary proof baseline private from the adapter and owns its receipt', async () => {
+    const expected = { kind: 'absent' as const, value: 'caller:absent' }
+    const content = Uint8Array.of(7)
+    let call = 0
+    let returnedTransition: FileProofTransition | undefined
+    const publish = vi.fn(async (submitted: FilePublicationRequest) => {
+      if (submitted.kind !== 'put') {
+        throw new Error('expected put')
+      }
+      call++
+      expect(submitted.expected).not.toBe(expected)
+      expect(submitted.content).not.toBe(content)
+
+      if (call === 1) {
+        submitted.expected.value = 'adapter:forged'
+
+        return {
+          status: 'published' as const,
+          candidateHash: await sha256Hex(submitted.content),
+          transitions: [
+            {
+              path: submitted.path,
+              before: submitted.expected,
+              after: { kind: 'present' as const, value: 'adapter:present' },
+              mtimeMs: 2,
+            },
+          ],
+        }
+      }
+
+      returnedTransition = {
+        path: submitted.path,
+        before: submitted.expected,
+        after: { kind: 'present', value: 'adapter:present' },
+        mtimeMs: 2,
+      }
+
+      return {
+        status: 'published' as const,
+        candidateHash: await sha256Hex(submitted.content),
+        transitions: [returnedTransition],
+      }
+    })
+    const authority = new SpaceResourceAuthority('space', [
+      {
+        id: 'root',
+        prefix: '',
+        ...adapterFiles({ resourcePublication: { publish } }),
+      },
+    ])
+
+    await expect(
+      authority.publish({ kind: 'put', path: 'forged.md', content, expected }),
+    ).rejects.toThrow('invalid publication proof set')
+    expect(expected).toEqual({ kind: 'absent', value: 'caller:absent' })
+    expect(content).toEqual(Uint8Array.of(7))
+
+    const result = await authority.publish({ kind: 'put', path: 'safe.md', content, expected })
+
+    expect(result).toMatchObject({
+      status: 'published',
+      receipt: {
+        transitions: [
+          {
+            path: 'safe.md',
+            before: { kind: 'absent', value: 'caller:absent' },
+            after: { kind: 'present', value: 'adapter:present' },
+          },
+        ],
+      },
+    })
+    if (result.status !== 'published' || !returnedTransition) {
+      return
+    }
+    returnedTransition.before.value = 'adapter:mutated-before'
+    returnedTransition.after.value = 'adapter:mutated-after'
+    expected.value = 'caller:mutated'
+    expect(result.receipt.transitions[0]).toMatchObject({
+      before: { kind: 'absent', value: 'caller:absent' },
+      after: { kind: 'present', value: 'adapter:present' },
+    })
+  })
+
+  it('rejects an ordinary candidate hash derived from adapter-mutated content', async () => {
+    const expected = { kind: 'absent' as const, value: 'test:absent' }
+    const content = Uint8Array.of(7)
+    const publish = vi.fn(async (submitted: FilePublicationRequest) => {
+      if (submitted.kind !== 'put') {
+        throw new Error('expected put')
+      }
+      submitted.content[0] = 9
+
+      return {
+        status: 'published' as const,
+        candidateHash: await sha256Hex(submitted.content),
+        transitions: [
+          {
+            path: submitted.path,
+            before: submitted.expected,
+            after: { kind: 'present' as const, value: 'test:present' },
+            mtimeMs: 2,
+          },
+        ],
+      }
+    })
+    const authority = new SpaceResourceAuthority('space', [
+      {
+        id: 'root',
+        prefix: '',
+        ...adapterFiles({ resourcePublication: { publish } }),
+      },
+    ])
+
+    await expect(
+      authority.publish({ kind: 'put', path: 'note.md', content, expected }),
+    ).rejects.toThrow('invalid publication candidate hash')
+    expect(publish).toHaveBeenCalledTimes(1)
+    expect(content).toEqual(Uint8Array.of(7))
+    expect(expected).toEqual({ kind: 'absent', value: 'test:absent' })
   })
 
   it('rejects physical overlap across spaces after resolving symlinks', async () => {
@@ -578,7 +908,7 @@ describe('SpaceResourceAuthority', () => {
         id: 'root',
         prefix: '',
         physicalRoot: late,
-        files: observingStore(async () => present(1)),
+        ...observingAdapter(async () => present(1)),
       },
     ])
     await fs.symlink(elsewhere, late)
@@ -594,7 +924,7 @@ describe('SpaceResourceAuthority', () => {
         id: 'root',
         prefix: '',
         physicalRoot: spaceRoot,
-        files: observingStore(async () => present(1)),
+        ...observingAdapter(async () => present(1)),
       },
     ]
     const first = registry.getOrCreate('space-a', adapter(root))
@@ -606,29 +936,352 @@ describe('SpaceResourceAuthority', () => {
     )
   })
 
+  it('shares one A snapshot across registry roots and authority when getters turn into B', async () => {
+    const rootA = await mkroot()
+    const rootB = await mkroot()
+    const nestedB = join(rootA, 'nested-b')
+    await fs.mkdir(nestedB)
+    const reads: Record<string, number> = {}
+
+    const next = <Value>(key: string, first: Value, later: Value): Value => {
+      reads[key] = (reads[key] ?? 0) + 1
+      return reads[key] === 1 ? first : later
+    }
+    const scanA: ResourceAuthorityFileView['scan'] = vi.fn(async () => [])
+    const readA: ResourceAuthorityFileView['read'] = vi.fn(async () => null)
+    const dirExistsA: ResourceAuthorityFileView['dirExists'] = vi.fn(async () => false)
+    const observeA: NonNullable<
+      ResourceAuthorityFileCapabilities['resourceObservation']
+    >['observe'] = vi.fn(async () => ({
+      kind: 'absent' as const,
+      claim: { kind: 'absent' as const, value: 'a:absent' },
+      mtimeMs: null,
+    }))
+
+    const failB = async (): Promise<never> => {
+      throw new Error('B adapter reached')
+    }
+    const files: ResourceAuthorityFileView = {
+      get scan() {
+        return next('files.scan', scanA, failB)
+      },
+      get read() {
+        return next('files.read', readA, failB)
+      },
+      get dirExists() {
+        return next('files.dirExists', dirExistsA, failB)
+      },
+    }
+    const observation: NonNullable<ResourceAuthorityFileCapabilities['resourceObservation']> = {
+      get observe() {
+        return next('resourceObservation.observe', observeA, failB)
+      },
+    }
+    const capabilities: ResourceAuthorityFileCapabilities = {
+      get resourceExport() {
+        return next('capabilities.resourceExport', undefined, undefined)
+      },
+      get resourceObservation() {
+        return next('capabilities.resourceObservation', observation, { observe: failB })
+      },
+      get resourcePublication() {
+        return next('capabilities.resourcePublication', undefined, undefined)
+      },
+      get claimedRemoval() {
+        return next('capabilities.claimedRemoval', undefined, undefined)
+      },
+      get packagePublication() {
+        return next('capabilities.packagePublication', undefined, undefined)
+      },
+      get strictPublication() {
+        return next('capabilities.strictPublication', undefined, undefined)
+      },
+    }
+    const adapter: ResourceAuthorityAdapter = {
+      get id() {
+        return next('adapter.id', 'root-a', 'root-b')
+      },
+      get prefix() {
+        return next('adapter.prefix', '', 'b')
+      },
+      get physicalRoot() {
+        return next('adapter.physicalRoot', rootA, rootB)
+      },
+      get files() {
+        return next('adapter.files', files, {
+          scan: failB,
+          read: failB,
+          dirExists: failB,
+        })
+      },
+      get capabilities() {
+        return next('adapter.capabilities', capabilities, {
+          resourceObservation: { observe: failB },
+        })
+      },
+    }
+    const registry = new SpaceResourceAuthorityRegistry()
+    const authority = registry.getOrCreate('space-a', [adapter])
+
+    await expect(authority.observe('note.md')).resolves.toMatchObject({
+      adapterId: 'root-a',
+      claim: { value: 'a:absent' },
+    })
+    expect(
+      registry.getOrCreate('space-a', [
+        {
+          id: 'root-a',
+          prefix: '',
+          physicalRoot: rootA,
+          files: { scan: scanA, read: readA, dirExists: dirExistsA },
+          capabilities: { resourceObservation: { observe: observeA } },
+        },
+      ]),
+    ).toBe(authority)
+    expect(() =>
+      registry.getOrCreate('space-b', [
+        {
+          id: 'nested-b',
+          prefix: '',
+          physicalRoot: nestedB,
+          ...observingAdapter(async () => present(1)),
+        },
+      ]),
+    ).toThrow(/overlap across spaces/)
+    expect(reads).toEqual({
+      'adapter.id': 1,
+      'adapter.prefix': 1,
+      'adapter.physicalRoot': 1,
+      'adapter.files': 1,
+      'files.scan': 1,
+      'files.read': 1,
+      'files.dirExists': 1,
+      'adapter.capabilities': 1,
+      'capabilities.resourceExport': 1,
+      'capabilities.resourceObservation': 1,
+      'capabilities.resourcePublication': 1,
+      'capabilities.claimedRemoval': 1,
+      'capabilities.packagePublication': 1,
+      'capabilities.strictPublication': 1,
+      'resourceObservation.observe': 1,
+    })
+  })
+
+  it('snapshots generic registry adapters before routing and root ownership', async () => {
+    const rootA = await mkroot()
+    const rootB = await mkroot()
+    const nestedA = join(rootA, 'nested')
+    await fs.mkdir(nestedA)
+    const absentA = { kind: 'absent' as const, value: 'a:absent' }
+    const manifest = new TextEncoder().encode(
+      '---\nname: demo\ndescription: Adapter snapshot.\n---\n',
+    )
+    const existingManifest = '---\nname: existing\ndescription: Existing package.\n---\n'
+    const scanA = vi.fn(async () => [
+      { path: 'existing/SKILL.md', mtimeMs: 1, size: 1, birthtimeMs: null },
+    ])
+    const readA = vi.fn(async () => existingManifest)
+    const dirExistsA = vi.fn(async () => false)
+    const observeA = vi.fn(async () => ({ kind: 'absent' as const, claim: absentA, mtimeMs: null }))
+    const publishA = vi.fn(async (request: FilePublicationRequest) => ({
+      status: 'published' as const,
+      candidateHash: await sha256Hex(request.content),
+      transitions: [
+        {
+          path: request.kind === 'put' ? request.path : request.targetPath,
+          before: request.kind === 'put' ? request.expected : request.expectedTarget,
+          after: { kind: 'present' as const, value: 'a:published' },
+          mtimeMs: 2,
+        },
+      ],
+    }))
+    const publishPackageA = vi.fn(async (request: FilePackagePublicationRequest) => ({
+      status: 'published' as const,
+      candidateHash: 'a'.repeat(64),
+      transitions: [
+        {
+          path: request.rootPath,
+          before: request.expectedRoot,
+          after: { kind: 'present' as const, value: 'a:package' },
+          mtimeMs: 3,
+        },
+        ...request.files.map((file) => ({
+          path: `${request.rootPath}/${file.path}`,
+          before: { kind: 'absent' as const, value: `a:absent:${file.path}` },
+          after: { kind: 'present' as const, value: `a:present:${file.path}` },
+          mtimeMs: 3,
+        })),
+      ],
+    }))
+    const filesA: ResourceAuthorityFileView = {
+      scan: scanA,
+      read: readA,
+      dirExists: dirExistsA,
+    }
+    const capabilitiesA: ResourceAuthorityFileCapabilities = {
+      resourceObservation: { observe: observeA },
+      resourcePublication: { publish: publishA },
+      packagePublication: { publishPackageIfAbsent: publishPackageA },
+    }
+    const adapter: ResourceAuthorityAdapter = {
+      id: 'root-a',
+      prefix: '',
+      physicalRoot: rootA,
+      files: filesA,
+      capabilities: capabilitiesA,
+    }
+    const registry = new SpaceResourceAuthorityRegistry()
+    const authority = registry.getOrCreate('space-a', [adapter])
+    const replacement = observingAdapter(async () => ({
+      kind: 'absent',
+      claim: { kind: 'absent', value: 'b:absent' },
+      mtimeMs: null,
+    }))
+    const filesB: ResourceAuthorityFileView = {
+      scan: vi.fn(async () => {
+        throw new Error('replacement scan reached')
+      }),
+      read: vi.fn(async () => {
+        throw new Error('replacement read reached')
+      }),
+      dirExists: vi.fn(async () => {
+        throw new Error('replacement dirExists reached')
+      }),
+    }
+    const publishB = vi.fn(async () => {
+      throw new Error('replacement publication reached')
+    })
+    const publishPackageB = vi.fn(async () => {
+      throw new Error('replacement package publication reached')
+    })
+    const capabilitiesB: ResourceAuthorityFileCapabilities = {
+      ...replacement.capabilities,
+      resourcePublication: { publish: publishB },
+      packagePublication: { publishPackageIfAbsent: publishPackageB },
+    }
+
+    // Replace both the adapter views and every original method. The authority
+    // must retain bound A methods, not follow either live alias to B.
+    filesA.scan = filesB.scan
+    filesA.read = filesB.read
+    filesA.dirExists = filesB.dirExists
+    capabilitiesA.resourceObservation!.observe =
+      replacement.capabilities.resourceObservation!.observe
+    capabilitiesA.resourcePublication!.publish = publishB
+    capabilitiesA.packagePublication!.publishPackageIfAbsent = publishPackageB
+    adapter.id = 'root-b'
+    adapter.prefix = 'replacement'
+    adapter.physicalRoot = rootB
+    adapter.files = filesB
+    adapter.capabilities = capabilitiesB
+
+    await expect(authority.observe('note.md')).resolves.toMatchObject({
+      adapterId: 'root-a',
+      claim: absentA,
+    })
+    await expect(
+      authority.publish({
+        kind: 'put',
+        path: 'note.md',
+        content: Uint8Array.of(7),
+        expected: absentA,
+      }),
+    ).resolves.toMatchObject({
+      status: 'published',
+      receipt: { adapterId: 'root-a', transitions: [{ path: 'note.md', before: absentA }] },
+    })
+    await expect(
+      authority.packagePublicationFor('', 'snapshot-test')!.publishIfAbsent({
+        rootPath: 'incoming',
+        files: [{ path: 'SKILL.md', content: manifest }],
+      }),
+    ).resolves.toMatchObject({ status: 'published', receipt: { adapterId: 'root-a' } })
+
+    expect(observeA).toHaveBeenCalledTimes(2)
+    expect(publishA).toHaveBeenCalledTimes(1)
+    expect(publishPackageA).toHaveBeenCalledTimes(1)
+    expect(dirExistsA).toHaveBeenCalledTimes(1)
+    expect(scanA).toHaveBeenCalledTimes(1)
+    expect(readA).toHaveBeenCalledTimes(1)
+    expect(publishB).not.toHaveBeenCalled()
+    expect(publishPackageB).not.toHaveBeenCalled()
+    expect(() =>
+      registry.getOrCreate('space-b', [
+        {
+          id: 'nested',
+          prefix: '',
+          physicalRoot: nestedA,
+          ...observingAdapter(async () => present(1)),
+        },
+      ]),
+    ).toThrow(/overlap across spaces/)
+  })
+
+  it('binds owned registrations to one frozen owner and its adapters', async () => {
+    const root = await mkroot()
+    const registry = new SpaceResourceAuthorityRegistry()
+    const adapter = () => [
+      {
+        id: 'root',
+        prefix: '',
+        physicalRoot: root,
+        ...observingAdapter(async () => present(1)),
+      },
+    ]
+    const owner = Object.freeze({ adaptersForAuthority: adapter })
+    const first = registry.getOrCreateOwned({
+      spaceId: 'space-a',
+      owner,
+    })
+    const reopened = registry.getOrCreateOwned({
+      spaceId: 'space-a',
+      owner,
+    })
+
+    expect(reopened).toBe(first)
+    expect(() =>
+      registry.getOrCreateOwned({
+        spaceId: 'space-a',
+        owner: Object.freeze({ adaptersForAuthority: adapter }),
+      }),
+    ).toThrow(/owner identity changed/)
+    expect(() => registry.getOrCreate('space-a', adapter())).toThrow(/owner identity changed/)
+  })
+
+  it('requires one frozen owner on the owned registration path', () => {
+    const registry = new SpaceResourceAuthorityRegistry()
+    // @ts-expect-error owned registration cannot receive adapters without their owner
+    const forgotten = () => registry.getOrCreateOwned({ spaceId: 'space-a', adapters: [] })
+    const mutable = () =>
+      registry.getOrCreateOwned({
+        spaceId: 'space-a',
+        owner: { adaptersForAuthority: () => [] },
+      })
+
+    expect(forgotten).toBeTypeOf('function')
+    expect(mutable).toThrow(/requires a frozen owner/)
+  })
+
   it('returns one aggregate receipt for an atomically installed package', async () => {
     const root = await mkroot()
     const authority = new SpaceResourceAuthority('space', [
-      {
-        id: 'skills',
-        prefix: '.skills',
-        physicalRoot: root,
-        files: createLocalFsFiles(root),
-      },
+      resourceAuthorityAdapterOf(
+        { id: 'skills', prefix: '.skills', physicalRoot: root },
+        createLocalFsFiles(root),
+      ),
     ])
-    const absent = await authority.observe('.skills/demo')
+    const view = authority.packagePublicationFor('.skills', 'test')
 
-    expect(absent.kind).toBe('absent')
-    if (absent.kind !== 'absent') {
-      return
-    }
-    const result = await authority.publishPackageIfAbsent({
+    expect(view).not.toBeNull()
+    const result = await view!.publishIfAbsent({
       rootPath: '.skills/demo',
       files: [
-        { path: 'SKILL.md', content: new TextEncoder().encode('manifest') },
+        {
+          path: 'SKILL.md',
+          content: new TextEncoder().encode('---\nname: demo\ndescription: Demo.\n---'),
+        },
         { path: 'asset.bin', content: Uint8Array.of(0xff) },
       ],
-      expectedRoot: absent.claim,
     })
 
     expect(result).toMatchObject({
@@ -647,12 +1300,10 @@ describe('SpaceResourceAuthority', () => {
     const root = await mkroot()
     await fs.writeFile(join(root, 'source.md'), 'old')
     const authority = new SpaceResourceAuthority('space', [
-      {
-        id: 'notes',
-        prefix: 'notes',
-        physicalRoot: root,
-        files: createLocalFsFiles(root),
-      },
+      resourceAuthorityAdapterOf(
+        { id: 'notes', prefix: 'notes', physicalRoot: root },
+        createLocalFsFiles(root),
+      ),
     ])
     const source = await authority.observe('notes/source.md')
     const target = await authority.observe('notes/target.md')
@@ -688,15 +1339,112 @@ describe('SpaceResourceAuthority', () => {
     })
   })
 
-  it('keeps a staged strict mutation resumable while admission is busy', async () => {
-    const root = await mkroot()
+  it('rejects a move-put proof that duplicates the source and omits the target', async () => {
+    const expectedSource = { kind: 'present' as const, value: 'test:source' }
+    const expectedTarget = { kind: 'absent' as const, value: 'test:target' }
     const authority = new SpaceResourceAuthority('space', [
       {
         id: 'notes',
         prefix: '',
-        physicalRoot: root,
-        files: createLocalFsFiles(root),
+        ...adapterFiles({
+          resourcePublication: {
+            publish: async (request: FilePublicationRequest) => {
+              if (request.kind !== 'move-put') {
+                throw new Error('expected move-put')
+              }
+
+              return {
+                status: 'published',
+                candidateHash: await sha256Hex(request.content),
+                transitions: [
+                  {
+                    path: request.sourcePath,
+                    before: request.expectedSource,
+                    after: { kind: 'absent' as const, value: 'test:removed' },
+                    mtimeMs: null,
+                  },
+                  {
+                    path: request.sourcePath,
+                    before: request.expectedSource,
+                    after: { kind: 'absent' as const, value: 'test:removed' },
+                    mtimeMs: null,
+                  },
+                ],
+              }
+            },
+          },
+        }),
       },
+    ])
+
+    await expect(
+      authority.publish({
+        kind: 'move-put',
+        sourcePath: 'source.md',
+        targetPath: 'target.md',
+        content: Uint8Array.of(1),
+        expectedSource,
+        expectedTarget,
+      }),
+    ).rejects.toThrow('invalid publication proof set')
+  })
+
+  it('rejects a package proof that duplicates the root and omits a resource', async () => {
+    const absent = { kind: 'absent' as const, value: 'test:absent' }
+    const authority = new SpaceResourceAuthority('space', [
+      {
+        id: 'skills',
+        prefix: '',
+        ...adapterFiles({
+          resourceObservation: {
+            observe: async () => ({ kind: 'absent', claim: absent, mtimeMs: null }),
+          },
+          packagePublication: {
+            publishPackageIfAbsent: async (request) => ({
+              status: 'published',
+              candidateHash: 'a'.repeat(64),
+              transitions: [
+                {
+                  path: request.rootPath,
+                  before: request.expectedRoot,
+                  after: { kind: 'present', value: 'test:package' },
+                  mtimeMs: null,
+                },
+                {
+                  path: request.rootPath,
+                  before: request.expectedRoot,
+                  after: { kind: 'present', value: 'test:package' },
+                  mtimeMs: null,
+                },
+              ],
+            }),
+          },
+        }),
+      },
+    ])
+    const view = authority.packagePublicationFor('', 'invalid-proof')
+
+    expect(view).not.toBeNull()
+    await expect(
+      view!.publishIfAbsent({
+        rootPath: 'demo',
+        files: [
+          {
+            path: 'SKILL.md',
+            content: new TextEncoder().encode('---\nname: demo\ndescription: Demo.\n---\n'),
+          },
+        ],
+      }),
+    ).rejects.toThrow('invalid package proof set')
+  })
+
+  it('keeps a staged strict mutation resumable while admission is busy', async () => {
+    const root = await mkroot()
+    const authority = new SpaceResourceAuthority('space', [
+      resourceAuthorityAdapterOf(
+        { id: 'notes', prefix: '', physicalRoot: root },
+        createLocalFsFiles(root),
+      ),
     ])
     const absent = await authority.observe('note.md')
 
@@ -762,15 +1510,545 @@ describe('SpaceResourceAuthority', () => {
     expect(authority.supportsRestartDurableStrict('note.md')).toBe(true)
   })
 
+  it('owns a strict stage command while the adapter is pending', async () => {
+    let announceStage!: () => void
+    let releaseStage!: () => void
+    const stageStarted = new Promise<void>((resolve) => {
+      announceStage = resolve
+    })
+    const stageReleased = new Promise<void>((resolve) => {
+      releaseStage = resolve
+    })
+    const stage = vi.fn(async (submitted) => {
+      announceStage()
+      await stageReleased
+      expect(submitted).toEqual({
+        operationId: 'original-operation',
+        binding: 'original-binding',
+        path: 'note.md',
+        content: Uint8Array.of(7),
+        expected: { kind: 'absent', value: 'original:absent' },
+      })
+
+      return {
+        status: 'accepted' as const,
+        created: true,
+        state: {
+          status: 'staged' as const,
+          stage: {
+            operationId: submitted.operationId,
+            binding: submitted.binding,
+            path: submitted.path,
+            expected: submitted.expected,
+            candidateHash: await sha256Hex(submitted.content),
+          },
+        },
+      }
+    })
+    const authority = new SpaceResourceAuthority('space', [
+      {
+        id: 'strict',
+        prefix: 'strict',
+        ...adapterFiles({
+          strictPublication: {
+            restartDurable: true,
+            stage,
+            inspect: async () => ({ status: 'missing' }),
+            publish: async () => {
+              throw new Error('not used')
+            },
+            discard: async () => false,
+          },
+        }),
+      },
+    ])
+    const expected: FileClaim = { kind: 'absent', value: 'original:absent' }
+    const content = Uint8Array.of(7)
+    const request: ResourceStrictStageRequest = {
+      operationId: 'original-operation',
+      binding: 'original-binding',
+      path: 'strict/note.md',
+      content,
+      expected,
+    }
+    const staging = authority.stageStrict(request)
+
+    await stageStarted
+    request.operationId = 'mutated-operation'
+    request.binding = 'mutated-binding'
+    request.path = 'strict/mutated.md'
+    content[0] = 9
+    expected.kind = 'present'
+    expected.value = 'mutated:claim'
+    releaseStage()
+
+    await expect(staging).resolves.toMatchObject({
+      status: 'accepted',
+      state: {
+        status: 'staged',
+        stage: {
+          operationId: 'original-operation',
+          binding: 'original-binding',
+          path: 'strict/note.md',
+          expected: { kind: 'absent', value: 'original:absent' },
+        },
+      },
+    })
+    expect(stage).toHaveBeenCalledTimes(1)
+  })
+
+  it('rejects a strict stage hash derived from adapter-mutated content', async () => {
+    const expected = { kind: 'absent' as const, value: 'test:absent' }
+    const content = Uint8Array.of(7)
+    const stage = vi.fn(async (submitted: FileStrictStageRequest) => {
+      submitted.content[0] = 9
+
+      return {
+        status: 'accepted' as const,
+        created: true,
+        state: {
+          status: 'staged' as const,
+          stage: {
+            operationId: submitted.operationId,
+            binding: submitted.binding,
+            path: submitted.path,
+            expected: submitted.expected,
+            candidateHash: await sha256Hex(submitted.content),
+          },
+        },
+      }
+    })
+    const authority = new SpaceResourceAuthority('space', [
+      {
+        id: 'root',
+        prefix: '',
+        ...adapterFiles({
+          strictPublication: {
+            restartDurable: true,
+            stage,
+            inspect: async () => ({ status: 'missing' }),
+            publish: async () => {
+              throw new Error('not used')
+            },
+            discard: async () => false,
+          },
+        }),
+      },
+    ])
+
+    await expect(
+      authority.stageStrict({
+        operationId: 'strict-operation',
+        binding: 'strict-binding',
+        path: 'note.md',
+        content,
+        expected,
+      }),
+    ).rejects.toThrow('invalid strict stage header')
+    expect(stage).toHaveBeenCalledTimes(1)
+    expect(content).toEqual(Uint8Array.of(7))
+    expect(expected).toEqual({ kind: 'absent', value: 'test:absent' })
+  })
+
+  it('keeps a later strict receipt bound to the accepted candidate hash', async () => {
+    const content = Uint8Array.of(7)
+    const expected = { kind: 'absent' as const, value: 'test:absent' }
+    const candidateHash = await sha256Hex(content)
+    const stage = {
+      operationId: 'strict-operation',
+      binding: 'strict-binding',
+      path: 'note.md',
+      expected,
+      candidateHash,
+    }
+    const authority = new SpaceResourceAuthority('space', [
+      {
+        id: 'root',
+        prefix: '',
+        ...adapterFiles({
+          strictPublication: {
+            restartDurable: true,
+            stage: async () => ({
+              status: 'accepted',
+              created: true,
+              state: { status: 'staged', stage },
+            }),
+            inspect: async () => ({ status: 'staged', stage }),
+            publish: async () => ({
+              status: 'published',
+              receipt: {
+                operationId: stage.operationId,
+                binding: stage.binding,
+                observationId: 'test:observation',
+                semanticEventTime: '2026-08-20T00:00:00.000Z',
+                restartDurable: true,
+                candidateHash: await sha256Hex(Uint8Array.of(9)),
+                transitions: [
+                  {
+                    path: stage.path,
+                    before: stage.expected,
+                    after: { kind: 'present', value: 'test:present' },
+                    mtimeMs: 2,
+                  },
+                ],
+              },
+            }),
+            discard: async () => false,
+          },
+        }),
+      },
+    ])
+
+    await expect(
+      authority.stageStrict({
+        operationId: stage.operationId,
+        binding: stage.binding,
+        path: stage.path,
+        content,
+        expected,
+      }),
+    ).resolves.toMatchObject({ status: 'accepted' })
+    await expect(
+      authority.publishStrict({
+        operationId: stage.operationId,
+        binding: stage.binding,
+        path: stage.path,
+      }),
+    ).rejects.toThrow('invalid strict publication proof')
+  })
+
+  it('owns a strict publish command from lease through adapter proof and receipt', async () => {
+    const expected = { kind: 'absent' as const, value: 'original:absent' }
+    const stage = {
+      operationId: 'original-operation',
+      binding: 'original-binding',
+      path: 'note.md',
+      expected,
+      candidateHash: 'a'.repeat(64),
+    }
+    const inspectOriginal = vi.fn(async () => ({ status: 'staged' as const, stage }))
+    const publishOriginal = vi.fn(async () => ({
+      status: 'published' as const,
+      receipt: {
+        operationId: stage.operationId,
+        binding: stage.binding,
+        observationId: 'original:observation',
+        semanticEventTime: '2026-08-20T00:00:00.000Z',
+        restartDurable: true as const,
+        candidateHash: stage.candidateHash,
+        transitions: [
+          {
+            path: stage.path,
+            before: stage.expected,
+            after: { kind: 'present' as const, value: 'original:present' },
+            mtimeMs: 2,
+          },
+        ],
+      },
+    }))
+    const mutatedStage = {
+      operationId: 'mutated-operation',
+      binding: 'mutated-binding',
+      path: 'note.md',
+      expected: { kind: 'absent' as const, value: 'mutated:absent' },
+      candidateHash: 'b'.repeat(64),
+    }
+    const inspectMutated = vi.fn(async () => ({ status: 'staged' as const, stage: mutatedStage }))
+    const publishMutated = vi.fn(async () => ({
+      status: 'published' as const,
+      receipt: {
+        operationId: mutatedStage.operationId,
+        binding: mutatedStage.binding,
+        observationId: 'mutated:observation',
+        semanticEventTime: '2026-08-20T00:00:00.000Z',
+        restartDurable: true as const,
+        candidateHash: mutatedStage.candidateHash,
+        transitions: [
+          {
+            path: mutatedStage.path,
+            before: mutatedStage.expected,
+            after: { kind: 'present' as const, value: 'mutated:present' },
+            mtimeMs: 2,
+          },
+        ],
+      },
+    }))
+    const authority = new SpaceResourceAuthority('space', [
+      {
+        id: 'original',
+        prefix: 'original',
+        ...adapterFiles({
+          strictPublication: {
+            restartDurable: true,
+            stage: async () => ({ status: 'idempotency-conflict' }),
+            inspect: inspectOriginal,
+            publish: publishOriginal,
+            discard: async () => false,
+          },
+        }),
+      },
+      {
+        id: 'mutated',
+        prefix: 'mutated',
+        ...adapterFiles({
+          strictPublication: {
+            restartDurable: true,
+            stage: async () => ({ status: 'idempotency-conflict' }),
+            inspect: inspectMutated,
+            publish: publishMutated,
+            discard: async () => false,
+          },
+        }),
+      },
+    ])
+    const blocker = await authority.admitResource(
+      'original/note.md',
+      'exclusive',
+      'blocking-writer',
+    )
+    const request: ResourceStrictStageRef = {
+      operationId: 'original-operation',
+      binding: 'original-binding',
+      path: 'original/note.md',
+    }
+    const publishing = authority.publishStrict(request, { owner: 'immutable-strict-command' })
+
+    await Promise.resolve()
+    expect(authority.diagnostics()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          state: 'waiting',
+          owner: 'immutable-strict-command',
+          path: 'original/note.md',
+        }),
+      ]),
+    )
+    request.operationId = 'mutated-operation'
+    request.binding = 'mutated-binding'
+    request.path = 'mutated/note.md'
+    blocker.settle()
+
+    await expect(publishing).resolves.toMatchObject({
+      status: 'published',
+      receipt: {
+        operationId: 'original-operation',
+        binding: 'original-binding',
+        adapterId: 'original',
+        transitions: [
+          {
+            path: 'original/note.md',
+            before: { kind: 'absent', value: 'original:absent' },
+            after: { kind: 'present', value: 'original:present' },
+          },
+        ],
+      },
+    })
+    expect(inspectOriginal).toHaveBeenCalledWith('original-operation', 'original-binding')
+    expect(publishOriginal).toHaveBeenCalledWith('original-operation', 'original-binding')
+    expect(inspectMutated).not.toHaveBeenCalled()
+    expect(publishMutated).not.toHaveBeenCalled()
+  })
+
+  it('keeps strict stage claims private and validates exact adapter headers', async () => {
+    const callerExpected = { kind: 'absent' as const, value: 'caller:absent' }
+    const callerContent = Uint8Array.of(7)
+    const stage = vi.fn(async (submitted: FileStrictStageRequest) => {
+      expect(submitted.expected).not.toBe(callerExpected)
+      expect(submitted.content).not.toBe(callerContent)
+      submitted.expected.value = 'adapter:forged'
+
+      return {
+        status: 'accepted' as const,
+        created: true,
+        state: {
+          status: 'staged' as const,
+          stage: {
+            operationId: submitted.operationId,
+            binding: submitted.binding,
+            path: submitted.path,
+            expected: submitted.expected,
+            candidateHash: 'a'.repeat(64),
+          },
+        },
+      }
+    })
+    const validStage = {
+      operationId: 'strict-operation',
+      binding: 'strict-binding',
+      path: 'note.md',
+      expected: { kind: 'absent' as const, value: 'adapter:absent' },
+      candidateHash: 'a'.repeat(64),
+    }
+    let inspected: FileStrictStageState = {
+      status: 'staged',
+      stage: { ...validStage, binding: 'adapter:forged-binding' },
+    }
+    let published: FileStrictPublicationResult = {
+      status: 'conflict',
+      stage: { ...validStage, candidateHash: 'b'.repeat(64) },
+    }
+    const inspect = vi.fn(async (): Promise<FileStrictStageState> => inspected)
+    const publish = vi.fn(async (): Promise<FileStrictPublicationResult> => published)
+    const authority = new SpaceResourceAuthority('space', [
+      {
+        id: 'root',
+        prefix: '',
+        ...adapterFiles({
+          strictPublication: {
+            restartDurable: true,
+            stage,
+            inspect,
+            publish,
+            discard: async () => false,
+          },
+        }),
+      },
+    ])
+
+    await expect(
+      authority.stageStrict({
+        operationId: 'strict-operation',
+        binding: 'strict-binding',
+        path: 'note.md',
+        content: callerContent,
+        expected: callerExpected,
+      }),
+    ).rejects.toThrow('invalid strict stage header')
+    expect(callerExpected).toEqual({ kind: 'absent', value: 'caller:absent' })
+    expect(callerContent).toEqual(Uint8Array.of(7))
+
+    await expect(
+      authority.inspectStrict({
+        operationId: 'strict-operation',
+        binding: 'strict-binding',
+        path: 'note.md',
+      }),
+    ).rejects.toThrow('invalid strict stage header')
+
+    inspected = { status: 'staged', stage: validStage }
+    await expect(
+      authority.publishStrict({
+        operationId: 'strict-operation',
+        binding: 'strict-binding',
+        path: 'note.md',
+      }),
+    ).rejects.toThrow('invalid strict stage header')
+
+    published = { status: 'conflict', stage: validStage }
+    await expect(
+      authority.publishStrict({
+        operationId: 'strict-operation',
+        binding: 'strict-binding',
+        path: 'note.md',
+      }),
+    ).resolves.toMatchObject({
+      status: 'conflict',
+      stage: {
+        operationId: 'strict-operation',
+        binding: 'strict-binding',
+        path: 'note.md',
+        expected: { kind: 'absent', value: 'adapter:absent' },
+        candidateHash: 'a'.repeat(64),
+      },
+    })
+  })
+
+  it('owns strict headers and receipts returned by an adapter', async () => {
+    const adapterExpected = { kind: 'absent' as const, value: 'adapter:absent' }
+    const adapterAfter = { kind: 'present' as const, value: 'adapter:present' }
+    const adapterStage = {
+      operationId: 'strict-operation',
+      binding: 'strict-binding',
+      path: 'note.md',
+      expected: adapterExpected,
+      candidateHash: 'a'.repeat(64),
+    }
+    const adapterReceipt = {
+      operationId: 'strict-operation',
+      binding: 'strict-binding',
+      observationId: 'adapter:observation',
+      semanticEventTime: '2026-08-20T00:00:00.000Z',
+      restartDurable: true as const,
+      candidateHash: 'a'.repeat(64),
+      transitions: [
+        {
+          path: 'note.md',
+          before: adapterExpected,
+          after: adapterAfter,
+          mtimeMs: 2,
+        },
+      ],
+    }
+    const adapterState: FileStrictStageState = {
+      status: 'published',
+      stage: adapterStage,
+      receipt: adapterReceipt,
+    }
+    const authority = new SpaceResourceAuthority('space', [
+      {
+        id: 'root',
+        prefix: '',
+        ...adapterFiles({
+          strictPublication: {
+            restartDurable: true,
+            stage: async () => ({ status: 'idempotency-conflict' }),
+            inspect: async () => adapterState,
+            publish: async () => ({ status: 'published', receipt: adapterReceipt }),
+            discard: async () => false,
+          },
+        }),
+      },
+    ])
+    const state = await authority.inspectStrict({
+      operationId: 'strict-operation',
+      binding: 'strict-binding',
+      path: 'note.md',
+    })
+
+    expect(state).toMatchObject({
+      status: 'published',
+      stage: {
+        expected: { kind: 'absent', value: 'adapter:absent' },
+        candidateHash: 'a'.repeat(64),
+      },
+      receipt: {
+        transitions: [
+          {
+            before: { kind: 'absent', value: 'adapter:absent' },
+            after: { kind: 'present', value: 'adapter:present' },
+          },
+        ],
+      },
+    })
+    adapterExpected.value = 'adapter:mutated-expected'
+    adapterAfter.value = 'adapter:mutated-after'
+    adapterStage.candidateHash = 'b'.repeat(64)
+    adapterReceipt.candidateHash = 'b'.repeat(64)
+    expect(state).toMatchObject({
+      status: 'published',
+      stage: {
+        expected: { kind: 'absent', value: 'adapter:absent' },
+        candidateHash: 'a'.repeat(64),
+      },
+      receipt: {
+        candidateHash: 'a'.repeat(64),
+        transitions: [
+          {
+            before: { kind: 'absent', value: 'adapter:absent' },
+            after: { kind: 'present', value: 'adapter:present' },
+          },
+        ],
+      },
+    })
+  })
+
   it('distinguishes a missing strict stage from an idempotency binding conflict', async () => {
     const root = await mkroot()
     const authority = new SpaceResourceAuthority('space', [
-      {
-        id: 'notes',
-        prefix: '',
-        physicalRoot: root,
-        files: createLocalFsFiles(root),
-      },
+      resourceAuthorityAdapterOf(
+        { id: 'notes', prefix: '', physicalRoot: root },
+        createLocalFsFiles(root),
+      ),
     ])
     const absent = await authority.observe('note.md')
 
@@ -799,12 +2077,448 @@ describe('SpaceResourceAuthority', () => {
     ).resolves.toMatchObject({ status: 'idempotency-conflict' })
   })
 
+  it('hands out no package publication where the prerequisite set is incomplete', () => {
+    // Aggregate commit WITHOUT the strict observation its absent claim comes from.
+    // Advertised as available, this composition would reach the commit and only
+    // then discover it has no claim to publish against.
+    const halfCapable = new SpaceResourceAuthority('space', [
+      {
+        id: 'skills',
+        prefix: '.skills',
+        ...adapterFiles({
+          packagePublication: { publishPackageIfAbsent: async () => ({ status: 'conflict' }) },
+        }),
+      },
+    ])
+
+    expect(halfCapable.packagePublicationFor('.skills', 'audit')).toBeNull()
+    // And the mirror: observation without the commit is no publisher either.
+    const observationOnly = new SpaceResourceAuthority('space', [
+      { id: 'skills', prefix: '.skills', ...observingAdapter(async () => present(1)) },
+    ])
+
+    expect(observationOnly.packagePublicationFor('.skills', 'audit')).toBeNull()
+  })
+
+  it('rejects non-package roots, duplicate files and invalid paths before storage work', async () => {
+    const absent = { kind: 'absent' as const, value: 'test:absent' }
+    const observe = vi.fn(async () => ({ kind: 'absent' as const, claim: absent, mtimeMs: null }))
+    const commit = vi.fn(async () => ({ status: 'conflict' as const }))
+    const authority = new SpaceResourceAuthority('space', [
+      {
+        id: 'root',
+        prefix: '',
+        ...adapterFiles({
+          resourceObservation: { observe },
+          packagePublication: { publishPackageIfAbsent: commit },
+        }),
+      },
+    ])
+    const view = authority.packagePublicationFor('', 'invalid-package')!
+    const manifest = new TextEncoder().encode('---\nname: demo\ndescription: Demo.\n---\n')
+
+    for (const request of [
+      {
+        rootPath: 'nested/demo',
+        files: [{ path: 'SKILL.md', content: manifest }],
+      },
+      {
+        rootPath: 'demo',
+        files: [
+          { path: 'SKILL.md', content: manifest },
+          { path: 'SKILL.md', content: manifest },
+        ],
+      },
+      {
+        rootPath: 'demo/../other',
+        files: [{ path: 'SKILL.md', content: manifest }],
+      },
+      {
+        rootPath: 'demo',
+        files: [
+          { path: 'SKILL.md', content: manifest },
+          { path: '../asset.bin', content: Uint8Array.of(1) },
+        ],
+      },
+    ]) {
+      await expect(view.publishIfAbsent(request)).rejects.toThrow()
+    }
+
+    expect(observe).not.toHaveBeenCalled()
+    expect(commit).not.toHaveBeenCalled()
+    expect(authority.diagnostics()).toEqual([])
+
+    await authority.closeAdmission()
+    await expect(
+      view.publishIfAbsent({
+        rootPath: 'demo',
+        files: [{ path: 'SKILL.md', content: manifest }],
+      }),
+    ).rejects.toMatchObject({ code: 'SPACE_LIFECYCLE_CLOSED' })
+    expect(observe).not.toHaveBeenCalled()
+    expect(commit).not.toHaveBeenCalled()
+  })
+
+  it('closes route, observation, name check and commit into one admitted decision', async () => {
+    const root = await mkroot()
+    const adapter = resourceAuthorityAdapterOf(
+      { id: 'skills', prefix: '.skills', physicalRoot: root },
+      createLocalFsFiles(root),
+    )
+    const commit = vi.fn(adapter.capabilities.packagePublication!.publishPackageIfAbsent)
+
+    adapter.capabilities = {
+      ...adapter.capabilities,
+      packagePublication: { publishPackageIfAbsent: commit },
+    }
+    const authority = new SpaceResourceAuthority('space', [adapter])
+    const view = authority.packagePublicationFor('.skills', 'audit')
+
+    expect(view).not.toBeNull()
+    const manifest = new TextEncoder().encode('---\nname: demo\ndescription: Demo.\n---\n\nBody.')
+    const published = await view!.publishIfAbsent({
+      rootPath: '.skills/demo',
+      files: [
+        { path: 'SKILL.md', content: manifest },
+        { path: 'asset.bin', content: Uint8Array.of(0xff) },
+      ],
+    })
+
+    // The caller never saw a claim: the absent observation the commit was
+    // conditioned on was taken and used inside the same admission.
+    expect(published).toMatchObject({ status: 'published' })
+    expect(commit).toHaveBeenCalledTimes(1)
+
+    await expect(
+      view!.publishIfAbsent({
+        rootPath: '.skills/demo/nested',
+        files: [{ path: 'SKILL.md', content: manifest }],
+      }),
+    ).rejects.toThrow('canonical package root')
+    expect(commit).toHaveBeenCalledTimes(1)
+    await expect(fs.lstat(join(root, 'demo', 'nested'))).rejects.toMatchObject({ code: 'ENOENT' })
+
+    // A second package under a DIFFERENT address but the same manifest name is
+    // the placement-wide conflict the name check exists for.
+    const beforeConflict = await fs.readdir(root)
+
+    await expect(
+      view!.publishIfAbsent({
+        rootPath: '.skills/other',
+        files: [{ path: 'SKILL.md', content: manifest }],
+      }),
+    ).rejects.toMatchObject({ code: 'SKILL_NAME_CONFLICT' })
+    // Name validation precedes the raw aggregate commit. A conflict neither
+    // invokes it nor leaves a package/staging mutation behind.
+    expect(commit).toHaveBeenCalledTimes(1)
+    await expect(fs.readdir(root)).resolves.toEqual(beforeConflict)
+    await expect(fs.lstat(join(root, 'other'))).rejects.toMatchObject({ code: 'ENOENT' })
+
+    const projectView = authority.packagePublicationFor('.skills/_projects/one', 'audit')
+
+    await expect(
+      projectView!.publishIfAbsent({
+        rootPath: '.skills/_projects/two/demo',
+        files: [{ path: 'SKILL.md', content: manifest }],
+      }),
+    ).rejects.toThrow('outside its publication placement')
+    expect(commit).toHaveBeenCalledTimes(1)
+
+    // An occupied root is an ordinary conflict, not an error.
+    await expect(
+      view!.publishIfAbsent({
+        rootPath: '.skills/demo',
+        files: [{ path: 'SKILL.md', content: manifest }],
+      }),
+    ).resolves.toMatchObject({ status: 'conflict' })
+  })
+
+  it('serializes concurrent same-name packages across one placement', async () => {
+    const root = await mkroot()
+    const manifest = new TextEncoder().encode('---\nname: demo\ndescription: Demo.\n---\n')
+    const adapter = resourceAuthorityAdapterOf(
+      { id: 'skills', prefix: '.skills', physicalRoot: root },
+      createLocalFsFiles(root),
+    )
+    const commitPackage = adapter.capabilities.packagePublication!.publishPackageIfAbsent
+    let releaseCommit!: () => void
+    let announceCommit!: () => void
+    const commitReleased = new Promise<void>((resolve) => {
+      releaseCommit = resolve
+    })
+    const commitStarted = new Promise<void>((resolve) => {
+      announceCommit = resolve
+    })
+    const commit = vi.fn(async (...args: Parameters<typeof commitPackage>) => {
+      announceCommit()
+      await commitReleased
+
+      return commitPackage(...args)
+    })
+
+    adapter.capabilities = {
+      ...adapter.capabilities,
+      packagePublication: { publishPackageIfAbsent: commit },
+    }
+    const authority = new SpaceResourceAuthority('space', [adapter])
+    const view = authority.packagePublicationFor('.skills', 'concurrent-add')
+
+    expect(view).not.toBeNull()
+    const first = view!.publishIfAbsent({
+      rootPath: '.skills/first',
+      files: [{ path: 'SKILL.md', content: manifest }],
+    })
+
+    await commitStarted
+    const second = view!.publishIfAbsent({
+      rootPath: '.skills/second',
+      files: [{ path: 'SKILL.md', content: manifest }],
+    })
+
+    await Promise.resolve()
+    expect(commit).toHaveBeenCalledTimes(1)
+    releaseCommit()
+    await expect(first).resolves.toMatchObject({ status: 'published' })
+    await expect(second).rejects.toMatchObject({ code: 'SKILL_NAME_CONFLICT' })
+    expect(commit).toHaveBeenCalledTimes(1)
+    await expect(fs.readdir(root)).resolves.toEqual(['first'])
+  })
+
+  it('owns package paths and bytes before awaiting the manifest name check', async () => {
+    const root = await mkroot()
+    await fs.mkdir(join(root, 'taken'))
+    await fs.writeFile(
+      join(root, 'taken', 'SKILL.md'),
+      '---\nname: taken\ndescription: Existing.\n---\n',
+    )
+    const adapter = resourceAuthorityAdapterOf(
+      { id: 'skills', prefix: '.skills', physicalRoot: root },
+      createLocalFsFiles(root),
+    )
+    const scan = adapter.files.scan
+    let announceScan!: () => void
+    let releaseScan!: () => void
+    const scanStarted = new Promise<void>((resolve) => {
+      announceScan = resolve
+    })
+    const scanReleased = new Promise<void>((resolve) => {
+      releaseScan = resolve
+    })
+
+    adapter.files = {
+      ...adapter.files,
+      scan: async () => {
+        announceScan()
+        await scanReleased
+
+        return scan()
+      },
+    }
+    const authority = new SpaceResourceAuthority('space', [adapter])
+    const view = authority.packagePublicationFor('.skills', 'immutable-request')!
+    const manifest = new TextEncoder().encode('---\nname: safee\ndescription: Candidate.\n---\n')
+    const asset = Uint8Array.of(1, 2, 3)
+    const request = {
+      rootPath: '.skills/safee',
+      files: [
+        { path: 'SKILL.md', content: manifest },
+        { path: 'asset.bin', content: asset },
+      ],
+    }
+    const publishing = view.publishIfAbsent(request)
+
+    await scanStarted
+    request.rootPath = '.skills/changed'
+    request.files[0].path = 'RENAMED.md'
+    request.files[1].path = 'changed.bin'
+    manifest.set(new TextEncoder().encode('---\nname: taken\ndescription: Candidate.\n---\n'))
+    asset.set([9, 9, 9])
+    releaseScan()
+
+    await expect(publishing).resolves.toMatchObject({ status: 'published' })
+    await expect(fs.readFile(join(root, 'safee', 'SKILL.md'), 'utf8')).resolves.toContain(
+      'name: safee',
+    )
+    await expect(fs.readFile(join(root, 'safee', 'asset.bin'))).resolves.toEqual(
+      Buffer.from([1, 2, 3]),
+    )
+    await expect(fs.lstat(join(root, 'changed'))).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(fs.lstat(join(root, 'safee', 'RENAMED.md'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    })
+    await expect(fs.lstat(join(root, 'safee', 'changed.bin'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    })
+  })
+
+  it('keeps the package root claim private and owns the aggregate receipt', async () => {
+    const adapterClaim = { kind: 'absent' as const, value: 'adapter:absent' }
+    let call = 0
+    let returnedTransitions: FileProofTransition[] | undefined
+    const commit = vi.fn(async (request: FilePackagePublicationRequest) => {
+      call++
+      const transitions: FileProofTransition[] = [
+        {
+          path: request.rootPath,
+          before: request.expectedRoot,
+          after: { kind: 'present', value: 'adapter:root' },
+          mtimeMs: 2,
+        },
+        ...request.files.map((file) => ({
+          path: `${request.rootPath}/${file.path}`,
+          before: { kind: 'absent' as const, value: `adapter:absent:${file.path}` },
+          after: { kind: 'present' as const, value: `adapter:present:${file.path}` },
+          mtimeMs: 2,
+        })),
+      ]
+
+      if (call === 1) {
+        request.expectedRoot.value = 'adapter:forged-root'
+
+        return {
+          status: 'published' as const,
+          candidateHash: 'a'.repeat(64),
+          transitions,
+        }
+      }
+
+      returnedTransitions = transitions
+
+      return {
+        status: 'published' as const,
+        candidateHash: 'b'.repeat(64),
+        transitions,
+      }
+    })
+    const authority = new SpaceResourceAuthority('space', [
+      {
+        id: 'root',
+        prefix: '',
+        ...adapterFiles({
+          resourceObservation: {
+            observe: async () => ({ kind: 'absent', claim: adapterClaim, mtimeMs: null }),
+          },
+          packagePublication: { publishPackageIfAbsent: commit },
+        }),
+      },
+    ])
+    const view = authority.packagePublicationFor('', 'adapter-boundary')!
+    const manifest = (name: string) =>
+      new TextEncoder().encode(`---\nname: ${name}\ndescription: Package.\n---\n`)
+
+    await expect(
+      view.publishIfAbsent({
+        rootPath: 'forged',
+        files: [{ path: 'SKILL.md', content: manifest('forged') }],
+      }),
+    ).rejects.toThrow('invalid package proof set')
+    expect(adapterClaim).toEqual({ kind: 'absent', value: 'adapter:absent' })
+
+    const result = await view.publishIfAbsent({
+      rootPath: 'safe',
+      files: [{ path: 'SKILL.md', content: manifest('safe') }],
+    })
+
+    expect(result).toMatchObject({
+      status: 'published',
+      receipt: {
+        transitions: expect.arrayContaining([
+          expect.objectContaining({
+            path: 'safe',
+            before: { kind: 'absent', value: 'adapter:absent' },
+          }),
+          expect.objectContaining({ path: 'safe/SKILL.md' }),
+        ]),
+      },
+    })
+    if (result.status !== 'published' || !returnedTransitions) {
+      return
+    }
+    returnedTransitions[0].before.value = 'adapter:mutated-root'
+    returnedTransitions[0].after.value = 'adapter:mutated-present'
+    expect(result.receipt.transitions[0]).toMatchObject({
+      before: { kind: 'absent', value: 'adapter:absent' },
+      after: { kind: 'present', value: 'adapter:root' },
+    })
+  })
+
   it('reports process-only adapters as not restart durable', () => {
     const authority = new SpaceResourceAuthority('space', [
-      { id: 'memory', prefix: '', files: observingStore(async () => present(1)) },
+      { id: 'memory', prefix: '', ...observingAdapter(async () => present(1)) },
     ])
 
     expect(authority.supportsRestartDurableStrict('note.md')).toBe(false)
+  })
+
+  it('retains claimed-removal admission until the physical operation settles', async () => {
+    let announceRemoval!: () => void
+    let finishRemoval!: (removed: boolean) => void
+    const removalStarted = new Promise<void>((resolve) => {
+      announceRemoval = resolve
+    })
+    const removalResult = new Promise<boolean>((resolve) => {
+      finishRemoval = resolve
+    })
+    const removeIfClaimed = vi.fn(() => {
+      announceRemoval()
+      return removalResult
+    })
+    const authority = new SpaceResourceAuthority('space', [
+      {
+        id: 'root',
+        prefix: '',
+        ...adapterFiles({ claimedRemoval: { removeIfClaimed } }),
+      },
+    ])
+    const removing = authority.removeClaimed('note.md', 'root:claim', 'expected')
+
+    await removalStarted
+    expect(authority.diagnostics()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          state: 'active',
+          mode: 'exclusive',
+          owner: 'resource-claim-compensation',
+          path: 'note.md',
+        }),
+      ]),
+    )
+
+    const controller = new AbortController()
+    let competingGranted = false
+    const competing = authority
+      .admitResource('note.md', 'exclusive', 'competing-writer', { signal: controller.signal })
+      .then((lease) => {
+        competingGranted = true
+        return lease
+      })
+
+    await Promise.resolve()
+    expect(competingGranted).toBe(false)
+    expect(authority.diagnostics()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          state: 'waiting',
+          owner: 'competing-writer',
+          path: 'note.md',
+        }),
+      ]),
+    )
+    controller.abort(new Error('cancel competing writer'))
+    await expect(competing).rejects.toThrow('cancel competing writer')
+
+    let closed = false
+    const closing = authority.closeAdmission().then(() => {
+      closed = true
+    })
+
+    await Promise.resolve()
+    expect(closed).toBe(false)
+    finishRemoval(true)
+    await expect(removing).resolves.toBe(true)
+    await closing
+    expect(closed).toBe(true)
+    expect(authority.diagnostics()).toEqual([])
   })
 
   // ── The lifecycle question has ONE home: the admission gate ──────────────────
@@ -822,21 +2536,7 @@ describe('SpaceResourceAuthority', () => {
       {
         id: 'root',
         prefix: '',
-        files: {
-          observe: async () => present(1, 'after'),
-          publish: async (request: FilePublicationRequest) => ({
-            status: 'published',
-            candidateHash: 'a'.repeat(64),
-            transitions: [
-              {
-                path: request.kind === 'put' ? request.path : request.targetPath,
-                before: absent,
-                after: { kind: 'present' as const, value: 'test:after' },
-                mtimeMs: 2,
-              },
-            ],
-          }),
-        } as unknown as FileStore,
+        ...publishingFiles(absent),
       },
     ])
     // The publication asks for its lease BEFORE the fence and receives it AFTER —
@@ -861,7 +2561,7 @@ describe('SpaceResourceAuthority', () => {
 
   it('refuses every admitted entry that reaches a closed space with no lease at all', async () => {
     const authority = new SpaceResourceAuthority('space', [
-      { id: 'root', prefix: '', files: observingStore(async () => present(1)) },
+      { id: 'root', prefix: '', ...observingAdapter(async () => present(1)) },
     ])
 
     await authority.closeAdmission()
@@ -876,21 +2576,7 @@ describe('SpaceResourceAuthority', () => {
       {
         id: 'root',
         prefix: '',
-        files: {
-          observe: async () => present(1, 'after'),
-          publish: async (request: FilePublicationRequest) => ({
-            status: 'published',
-            candidateHash: 'a'.repeat(64),
-            transitions: [
-              {
-                path: request.kind === 'put' ? request.path : request.targetPath,
-                before: absent,
-                after: { kind: 'present' as const, value: 'test:after' },
-                mtimeMs: 2,
-              },
-            ],
-          }),
-        } as unknown as FileStore,
+        ...publishingFiles(absent),
       },
     ])
 
@@ -931,7 +2617,7 @@ describe('SpaceResourceAuthority', () => {
       Object.keys(
         admittedEntryCalls(
           new SpaceResourceAuthority('space', [
-            { id: 'root', prefix: '', files: observingStore(async () => present(1)) },
+            { id: 'root', prefix: '', ...observingAdapter(async () => present(1)) },
           ]),
         ),
       ).sort(),
@@ -946,21 +2632,7 @@ describe('SpaceResourceAuthority', () => {
         id: 'root',
         prefix: '',
         physicalRoot: root,
-        files: {
-          observe: async () => present(1, 'after'),
-          publish: async (request: FilePublicationRequest) => ({
-            status: 'published',
-            candidateHash: 'a'.repeat(64),
-            transitions: [
-              {
-                path: request.kind === 'put' ? request.path : request.targetPath,
-                before: absent,
-                after: { kind: 'present' as const, value: 'test:after' },
-                mtimeMs: 2,
-              },
-            ],
-          }),
-        } as unknown as FileStore,
+        ...publishingFiles(absent),
       },
     ])
     const before = rootChecks.count

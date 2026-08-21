@@ -5,16 +5,31 @@ import {
   DOCUMENT_ROLE,
   DOCUMENT_STATE_FORMAT,
   isSkillPackageRootPath,
+  sha256Hex,
   skillPackagePathOf,
   skillPlacementPathOf,
 } from '@notarium/core'
 
 import type {
+  FileClaim,
+  FileObservation,
+  FilePackagePublicationRequest,
+  FileProofTransition,
+  FilePublicationRequest,
+  FilePublicationResult,
   FileStrictMutationReceipt,
   FileStrictPublicationResult,
   FileStrictStageHeader,
+  FileStrictStageRequest,
+  FileStrictStageResult,
   FileStrictStageState,
 } from '../files'
+import {
+  adaptersInSnapshot,
+  snapshotInTrustedInput,
+  snapshotResourceAuthorityAdapters,
+  type TrustedResourceAuthorityAdapterSnapshotInput,
+} from './adapterSnapshot'
 import { ResourceAdmission } from './admission'
 import { assertCanonicalResourceRoot, preflightResourceRoots } from './roots'
 import {
@@ -23,6 +38,7 @@ import {
   type AdmissionMode,
   type CanonicalResourceRoot,
   type MutationReceipt,
+  type PackagePublicationView,
   type ResourceAuthorityAdapter,
   type ResourceObservation,
   type ResourcePackagePublicationRequest,
@@ -38,6 +54,11 @@ import {
   type StableLinkedObservation,
   type StrictMutationReceipt,
 } from './types'
+
+/** The one file a skill package is addressed by. `isSkillPackageRootPath` is the
+ * canonical predicate over it; this is the same name spelled once for the two
+ * places below that have to CONSTRUCT the address rather than test one. */
+const SKILL_MANIFEST_FILENAME = 'SKILL.md'
 
 type RoutedResource = {
   adapter: ResourceAuthorityAdapter
@@ -60,34 +81,281 @@ const normalizePath = (path: string): string => {
   return path
 }
 
+const snapshotClaim = <T extends FileClaim>(claim: T): T =>
+  ({ kind: claim.kind, value: claim.value }) as T
+
+const snapshotObservation = (observation: FileObservation): FileObservation => {
+  if (observation.kind === 'present') {
+    return {
+      kind: 'present',
+      bytes: Uint8Array.from(observation.bytes),
+      claim: snapshotClaim(observation.claim),
+      mtimeMs: observation.mtimeMs,
+    }
+  }
+  if (observation.kind === 'absent') {
+    return {
+      kind: 'absent',
+      claim: snapshotClaim(observation.claim),
+      mtimeMs: null,
+    }
+  }
+  if (observation.kind === 'occupied') {
+    return {
+      kind: 'occupied',
+      claim: snapshotClaim(observation.claim),
+      entryType: observation.entryType,
+      mtimeMs: observation.mtimeMs,
+    }
+  }
+
+  return { kind: 'unavailable', reason: observation.reason, mtimeMs: null }
+}
+
+const snapshotProofTransition = (transition: FileProofTransition): FileProofTransition => ({
+  path: transition.path,
+  before: snapshotClaim(transition.before),
+  after: snapshotClaim(transition.after),
+  mtimeMs: transition.mtimeMs,
+})
+
+const snapshotPublicationResult = (result: FilePublicationResult): FilePublicationResult =>
+  result.status === 'conflict'
+    ? { status: 'conflict' }
+    : {
+        status: 'published',
+        candidateHash: result.candidateHash,
+        transitions: result.transitions.map(snapshotProofTransition),
+      }
+
+const snapshotStrictHeader = (stage: FileStrictStageHeader): FileStrictStageHeader => ({
+  operationId: stage.operationId,
+  binding: stage.binding,
+  path: stage.path,
+  expected: snapshotClaim(stage.expected),
+  candidateHash: stage.candidateHash,
+})
+
+const snapshotStrictReceipt = (receipt: FileStrictMutationReceipt): FileStrictMutationReceipt => ({
+  operationId: receipt.operationId,
+  binding: receipt.binding,
+  observationId: receipt.observationId,
+  semanticEventTime: receipt.semanticEventTime,
+  restartDurable: receipt.restartDurable,
+  candidateHash: receipt.candidateHash,
+  transitions: receipt.transitions.map(snapshotProofTransition),
+})
+
+type PresentStrictStageState = Exclude<FileStrictStageState, { status: 'missing' }>
+
+const snapshotPresentStrictState = (state: PresentStrictStageState): PresentStrictStageState => {
+  const stage = snapshotStrictHeader(state.stage)
+
+  if (state.status === 'published') {
+    return { status: 'published', stage, receipt: snapshotStrictReceipt(state.receipt) }
+  }
+  if (state.status === 'failed-recoverable') {
+    return {
+      status: 'failed-recoverable',
+      stage,
+      reason: state.reason,
+      recoveryPaths: [...state.recoveryPaths],
+    }
+  }
+
+  return { status: state.status, stage }
+}
+
+const snapshotStrictState = (state: FileStrictStageState): FileStrictStageState =>
+  state.status === 'missing' ? { status: 'missing' } : snapshotPresentStrictState(state)
+
+const snapshotStrictStageResult = (result: FileStrictStageResult): FileStrictStageResult =>
+  result.status === 'idempotency-conflict'
+    ? { status: 'idempotency-conflict' }
+    : {
+        status: 'accepted',
+        created: result.created,
+        state: snapshotPresentStrictState(result.state),
+      }
+
+const snapshotStrictPublicationResult = (
+  result: FileStrictPublicationResult,
+): FileStrictPublicationResult => {
+  if (result.status === 'published') {
+    return { status: 'published', receipt: snapshotStrictReceipt(result.receipt) }
+  }
+  const stage = snapshotStrictHeader(result.stage)
+
+  return result.status === 'conflict'
+    ? { status: 'conflict', stage }
+    : {
+        status: 'failed-recoverable',
+        stage,
+        reason: result.reason,
+        recoveryPaths: [...result.recoveryPaths],
+      }
+}
+
+const publicationSubmission = (
+  request: ResourcePublicationRequest,
+  relativePaths: readonly string[],
+): FilePublicationRequest =>
+  request.kind === 'put'
+    ? {
+        kind: 'put',
+        path: relativePaths[0],
+        content: Uint8Array.from(request.content),
+        expected: snapshotClaim(request.expected),
+      }
+    : {
+        kind: 'move-put',
+        sourcePath: relativePaths[0],
+        targetPath: relativePaths[1],
+        content: Uint8Array.from(request.content),
+        expectedSource: snapshotClaim(request.expectedSource),
+        expectedTarget: snapshotClaim(request.expectedTarget),
+      }
+
+const packagePublicationSubmission = (
+  rootPath: string,
+  files: ReadonlyArray<{ path: string; content: Uint8Array }>,
+  expectedRoot: FileClaim & { kind: 'absent' },
+): FilePackagePublicationRequest => ({
+  rootPath,
+  files: files.map((file) => ({ path: file.path, content: Uint8Array.from(file.content) })),
+  expectedRoot: snapshotClaim(expectedRoot),
+})
+
+const strictStageSubmission = (
+  request: ResourceStrictStageRequest,
+  relativePath: string,
+): FileStrictStageRequest => ({
+  operationId: request.operationId,
+  binding: request.binding,
+  path: relativePath,
+  content: Uint8Array.from(request.content),
+  expected: snapshotClaim(request.expected),
+})
+
+const snapshotPublicationRequest = (
+  request: ResourcePublicationRequest,
+): ResourcePublicationRequest => {
+  const packagePath = request.packagePath ? normalizePath(request.packagePath) : undefined
+
+  return request.kind === 'put'
+    ? {
+        kind: 'put',
+        path: normalizePath(request.path),
+        content: Uint8Array.from(request.content),
+        expected: snapshotClaim(request.expected),
+        ...(packagePath ? { packagePath } : {}),
+      }
+    : {
+        kind: 'move-put',
+        sourcePath: normalizePath(request.sourcePath),
+        targetPath: normalizePath(request.targetPath),
+        content: Uint8Array.from(request.content),
+        expectedSource: snapshotClaim(request.expectedSource),
+        expectedTarget: snapshotClaim(request.expectedTarget),
+        ...(packagePath ? { packagePath } : {}),
+      }
+}
+
+const snapshotStrictStageRequest = (
+  request: ResourceStrictStageRequest,
+): ResourceStrictStageRequest => ({
+  operationId: request.operationId,
+  binding: request.binding,
+  path: normalizePath(request.path),
+  content: Uint8Array.from(request.content),
+  expected: snapshotClaim(request.expected),
+  ...(request.packagePath ? { packagePath: normalizePath(request.packagePath) } : {}),
+})
+
+const snapshotStrictStageRef = (request: ResourceStrictStageRef): ResourceStrictStageRef => ({
+  operationId: request.operationId,
+  binding: request.binding,
+  path: normalizePath(request.path),
+  ...(request.packagePath ? { packagePath: normalizePath(request.packagePath) } : {}),
+})
+
 const containsPrefix = (prefix: string, path: string): boolean =>
   !prefix || path === prefix || path.startsWith(`${prefix}/`)
 
+type ProofTransitionExpectation = {
+  path: string
+  before: FileClaim | FileClaim['kind']
+  afterKind: FileClaim['kind']
+}
+
+const hasExactProofTransitionSet = (
+  transitions: readonly FileProofTransition[],
+  expected: readonly ProofTransitionExpectation[],
+): boolean => {
+  if (transitions.length !== expected.length) {
+    return false
+  }
+  const remaining = new Map(expected.map((transition) => [transition.path, transition]))
+
+  if (remaining.size !== expected.length) {
+    return false
+  }
+
+  for (const transition of transitions) {
+    const expectation = remaining.get(transition.path)
+
+    if (
+      !expectation ||
+      (typeof expectation.before === 'string'
+        ? transition.before.kind !== expectation.before
+        : !sameFileClaim(transition.before, expectation.before)) ||
+      transition.after.kind !== expectation.afterKind
+    ) {
+      return false
+    }
+    remaining.delete(transition.path)
+  }
+
+  return remaining.size === 0
+}
+
 export class SpaceResourceAuthority {
   readonly spaceId: string
-  private readonly adapters: ResourceAuthorityAdapter[]
+  private readonly adapters: readonly ResourceAuthorityAdapter[]
   private readonly admission = new ResourceAdmission()
   private readonly roots: CanonicalResourceRoot[]
   private accepting = true
   private closePromise: Promise<void> | null = null
 
-  constructor(spaceId: string, adapters: readonly ResourceAuthorityAdapter[]) {
+  constructor(spaceId: string, adapters: readonly ResourceAuthorityAdapter[])
+  constructor(
+    spaceId: string,
+    input: readonly ResourceAuthorityAdapter[] | TrustedResourceAuthorityAdapterSnapshotInput,
+  ) {
+    const trustedSnapshot = snapshotInTrustedInput(input)
+    const snapshot =
+      trustedSnapshot ??
+      snapshotResourceAuthorityAdapters(input as readonly ResourceAuthorityAdapter[])
+    const snapshots = adaptersInSnapshot(snapshot)
+
     if (!spaceId.trim()) {
       throw new Error('resource authority requires a space id')
     }
-    if (!adapters.length) {
+    if (!snapshots.length) {
       throw new Error('resource authority requires at least one adapter')
     }
-    if (new Set(adapters.map((adapter) => adapter.id)).size !== adapters.length) {
+    if (new Set(snapshots.map((adapter) => adapter.id)).size !== snapshots.length) {
       throw new Error('resource authority adapter ids must be unique')
     }
-    if (new Set(adapters.map((adapter) => adapter.prefix)).size !== adapters.length) {
+    if (new Set(snapshots.map((adapter) => adapter.prefix)).size !== snapshots.length) {
       throw new Error('resource authority adapter prefixes must be unique')
     }
     this.spaceId = spaceId
-    this.adapters = [...adapters].sort((left, right) => right.prefix.length - left.prefix.length)
+    this.adapters = Object.freeze(
+      [...snapshots].sort((left, right) => right.prefix.length - left.prefix.length),
+    )
     this.roots = preflightResourceRoots(
-      adapters.flatMap((adapter) =>
+      snapshots.flatMap((adapter) =>
         adapter.physicalRoot
           ? [{ spaceId, adapterId: adapter.id, root: adapter.physicalRoot }]
           : [],
@@ -291,21 +559,25 @@ export class SpaceResourceAuthority {
     },
   ): Promise<ResourceObservation> {
     const canonicalPath = normalizePath(path)
+    const owner = options?.owner ?? 'observe'
+    const packagePath = options?.packagePath
+    const deadlineMs = options?.deadlineMs
+    const signal = options?.signal
+    const maxBytes = options?.maxBytes
 
-    if (
-      options?.maxBytes != null &&
-      (!Number.isSafeInteger(options.maxBytes) || options.maxBytes < 0)
-    ) {
+    if (maxBytes != null && (!Number.isSafeInteger(maxBytes) || maxBytes < 0)) {
       throw new Error('observation maxBytes must be a non-negative safe integer')
     }
-    const lease = await this.admitResource(canonicalPath, 'shared', options?.owner ?? 'observe', {
-      ...(options?.packagePath ? { packagePath: options.packagePath } : {}),
-      ...(options?.deadlineMs != null ? { deadlineMs: options.deadlineMs } : {}),
-      ...(options?.signal ? { signal: options.signal } : {}),
+    const lease = await this.admitResource(canonicalPath, 'shared', owner, {
+      ...(packagePath ? { packagePath } : {}),
+      ...(deadlineMs != null ? { deadlineMs } : {}),
+      // AbortSignal is the intentional live control channel; scalar options are
+      // captured above so caller mutation cannot retarget admitted work.
+      ...(signal ? { signal } : {}),
     })
 
     try {
-      return await this.observeAdmitted(canonicalPath, options?.maxBytes)
+      return await this.observeAdmitted(canonicalPath, maxBytes)
     } finally {
       lease.settle()
     }
@@ -402,7 +674,7 @@ export class SpaceResourceAuthority {
     if (!adapter) {
       throw new Error(`no resource adapter is rooted at ${canonicalPrefix}`)
     }
-    if (!adapter.files.exportFiles) {
+    if (!adapter.capabilities.resourceExport) {
       throw Object.assign(new Error(`adapter ${adapter.id} cannot export resources`), {
         code: 'EXPORT_UNAVAILABLE',
       })
@@ -415,7 +687,7 @@ export class SpaceResourceAuthority {
     )
 
     try {
-      for await (const entry of adapter.files.exportFiles()) {
+      for await (const entry of adapter.capabilities.resourceExport.exportFiles()) {
         const path = normalizePath(`${canonicalPrefix}/${entry.path}`)
 
         yield { path, content: Uint8Array.from(entry.content) }
@@ -429,29 +701,33 @@ export class SpaceResourceAuthority {
     request: ResourcePublicationRequest,
     options?: { owner?: string; deadlineMs?: number; signal?: AbortSignal },
   ): Promise<ResourcePublicationResult> {
+    const snapshot = snapshotPublicationRequest(request)
     const paths =
-      request.kind === 'put'
-        ? [normalizePath(request.path)]
-        : [normalizePath(request.sourcePath), normalizePath(request.targetPath)]
-    const packagePath = request.packagePath ? normalizePath(request.packagePath) : undefined
-    const content = Uint8Array.from(request.content)
+      snapshot.kind === 'put' ? [snapshot.path] : [snapshot.sourcePath, snapshot.targetPath]
+    const packagePath = snapshot.packagePath
+    const owner = options?.owner ?? 'publish'
+    const deadlineMs = options?.deadlineMs
+    const signal = options?.signal
     const packageLease = packagePath
-      ? await this.admitPackage(packagePath, 'shared', options?.owner ?? 'publish', options)
+      ? await this.admitPackage(packagePath, 'shared', owner, {
+          ...(deadlineMs != null ? { deadlineMs } : {}),
+          ...(signal ? { signal } : {}),
+        })
       : undefined
     const resourceLeases: AdmissionLease[] = []
 
     try {
       for (const path of [...new Set(paths)].sort()) {
         resourceLeases.push(
-          await this.admitResource(path, 'exclusive', options?.owner ?? 'publish', {
+          await this.admitResource(path, 'exclusive', owner, {
             ...(packagePath ? { packagePath } : {}),
-            ...(options?.deadlineMs != null ? { deadlineMs: options.deadlineMs } : {}),
-            ...(options?.signal ? { signal: options.signal } : {}),
+            ...(deadlineMs != null ? { deadlineMs } : {}),
+            ...(signal ? { signal } : {}),
           }),
         )
       }
 
-      return await this.publishAdmitted({ ...request, content })
+      return await this.publishAdmitted(snapshot)
     } finally {
       for (const lease of resourceLeases.reverse()) {
         lease.settle()
@@ -464,70 +740,59 @@ export class SpaceResourceAuthority {
    * package/placement lease. */
   async publishAdmitted(request: ResourcePublicationRequest): Promise<ResourcePublicationResult> {
     this.assertAdmitted()
+    const snapshot = snapshotPublicationRequest(request)
     const paths =
-      request.kind === 'put'
-        ? [normalizePath(request.path)]
-        : [normalizePath(request.sourcePath), normalizePath(request.targetPath)]
+      snapshot.kind === 'put' ? [snapshot.path] : [snapshot.sourcePath, snapshot.targetPath]
     const routed = paths.map((path) => ({ path, ...this.route(path) }))
     const adapter = routed[0].adapter
 
     if (routed.some((entry) => entry.adapter !== adapter)) {
       throw new Error('one publication cannot cross resource adapters')
     }
-    if (!adapter.files.publish) {
+    if (!adapter.capabilities.resourcePublication) {
       throw Object.assign(new Error(`adapter ${adapter.id} cannot publish with proof`), {
         code: 'PUBLICATION_UNAVAILABLE',
       })
     }
-    const content = Uint8Array.from(request.content)
-    const result = await adapter.files.publish(
-      request.kind === 'put'
-        ? {
-            kind: 'put',
-            path: routed[0].relativePath,
-            content,
-            expected: request.expected,
-          }
-        : {
-            kind: 'move-put',
-            sourcePath: routed[0].relativePath,
-            targetPath: routed[1].relativePath,
-            content,
-            expectedSource: request.expectedSource,
-            expectedTarget: request.expectedTarget,
-          },
+    const candidateHash = await sha256Hex(snapshot.content)
+    const result = snapshotPublicationResult(
+      await adapter.capabilities.resourcePublication.publish(
+        publicationSubmission(
+          snapshot,
+          routed.map((entry) => entry.relativePath),
+        ),
+      ),
     )
 
     if (result.status === 'conflict') {
       return result
     }
-    const expectedRelativePaths = new Set(routed.map((entry) => entry.relativePath))
-    const expectedBefore = new Map(
-      request.kind === 'put'
-        ? [[routed[0].relativePath, request.expected] as const]
+    if (result.candidateHash !== candidateHash) {
+      throw new Error(`adapter ${adapter.id} returned an invalid publication candidate hash`)
+    }
+    const expectedTransitions: ProofTransitionExpectation[] =
+      snapshot.kind === 'put'
+        ? [
+            {
+              path: routed[0].relativePath,
+              before: snapshot.expected,
+              afterKind: 'present',
+            },
+          ]
         : [
-            [routed[0].relativePath, request.expectedSource] as const,
-            [routed[1].relativePath, request.expectedTarget] as const,
-          ],
-    )
+            {
+              path: routed[0].relativePath,
+              before: snapshot.expectedSource,
+              afterKind: 'absent',
+            },
+            {
+              path: routed[1].relativePath,
+              before: snapshot.expectedTarget,
+              afterKind: 'present',
+            },
+          ]
 
-    if (
-      result.transitions.length !== expectedRelativePaths.size ||
-      result.transitions.some((transition) => {
-        const before = expectedBefore.get(transition.path)
-        const afterKind =
-          request.kind === 'move-put' && transition.path === routed[0].relativePath
-            ? 'absent'
-            : 'present'
-
-        return (
-          !expectedRelativePaths.has(transition.path) ||
-          before == null ||
-          !sameFileClaim(before, transition.before) ||
-          transition.after.kind !== afterKind
-        )
-      })
-    ) {
+    if (!hasExactProofTransitionSet(result.transitions, expectedTransitions)) {
       throw new Error(`adapter ${adapter.id} returned an invalid publication proof set`)
     }
     const receiptId = `${this.spaceId}:receipt-${nextReceiptId++}`
@@ -538,7 +803,7 @@ export class SpaceResourceAuthority {
       observationId: `${receiptId}:observation`,
       semanticEventTime: new Date().toISOString(),
       restartDurable: false,
-      candidateHash: result.candidateHash,
+      candidateHash,
       transitions: result.transitions.map((transition) => {
         const entry = routed.find((candidate) => candidate.relativePath === transition.path)
 
@@ -546,38 +811,27 @@ export class SpaceResourceAuthority {
           throw new Error(`adapter ${adapter.id} returned a transition outside its request`)
         }
 
-        return { ...transition, path: entry.path }
+        return {
+          path: entry.path,
+          before: snapshotClaim(transition.before),
+          after: snapshotClaim(transition.after),
+          mtimeMs: transition.mtimeMs,
+        }
       }),
     }
 
     return { status: 'published', receipt }
   }
 
-  async publishPackageIfAbsent(
-    request: ResourcePackagePublicationRequest,
-    options?: { owner?: string; deadlineMs?: number; signal?: AbortSignal },
-  ): Promise<ResourcePublicationResult> {
-    const rootPath = normalizePath(request.rootPath)
-    const lease = await this.admitPackage(
-      rootPath,
-      'exclusive',
-      options?.owner ?? 'publish-package',
-      options,
-    )
-
-    try {
-      return await this.publishPackageIfAbsentAdmitted(request)
-    } finally {
-      lease.settle()
-    }
-  }
-
-  /** Atomic package publication under an enclosing placement/package lease. */
-  async publishPackageIfAbsentAdmitted(
+  /** Raw aggregate commit under the placement lease owned by
+   * `packagePublicationFor`. Keeping it private makes the manifest-name check an
+   * unavoidable part of every authority package publication. */
+  private async commitPackageIfAbsentAdmitted(
     request: ResourcePackagePublicationRequest,
   ): Promise<ResourcePublicationResult> {
     this.assertAdmitted()
     const rootPath = normalizePath(request.rootPath)
+    const expectedRoot = snapshotClaim(request.expectedRoot)
     const files = request.files.map((file) => ({
       path: normalizePath(`${rootPath}/${file.path}`),
       relativeToPackage: file.path,
@@ -592,36 +846,31 @@ export class SpaceResourceAuthority {
     if (routed.some((entry) => entry.adapter !== adapter)) {
       throw new Error('one package publication cannot cross resource adapters')
     }
-    if (!adapter.files.publishPackageIfAbsent) {
+    if (!adapter.capabilities.packagePublication) {
       throw Object.assign(new Error(`adapter ${adapter.id} cannot publish packages with proof`), {
         code: 'PACKAGE_PUBLICATION_UNAVAILABLE',
       })
     }
-    const result = await adapter.files.publishPackageIfAbsent({
-      rootPath: routed[0].relativePath,
-      files: files.map((file) => ({ path: file.relativeToPackage, content: file.content })),
-      expectedRoot: request.expectedRoot,
-    })
+    const result = snapshotPublicationResult(
+      await adapter.capabilities.packagePublication.publishPackageIfAbsent(
+        packagePublicationSubmission(
+          routed[0].relativePath,
+          files.map((file) => ({ path: file.relativeToPackage, content: file.content })),
+          expectedRoot,
+        ),
+      ),
+    )
 
     if (result.status === 'conflict') {
       return result
     }
-    const expectedPaths = new Set(routed.map((entry) => entry.relativePath))
+    const expectedTransitions: ProofTransitionExpectation[] = routed.map((entry, index) => ({
+      path: entry.relativePath,
+      before: index === 0 ? expectedRoot : 'absent',
+      afterKind: 'present',
+    }))
 
-    if (
-      result.transitions.length !== expectedPaths.size ||
-      result.transitions.some((transition) => {
-        const isRoot = transition.path === routed[0].relativePath
-
-        return (
-          !expectedPaths.has(transition.path) ||
-          transition.after.kind !== 'present' ||
-          (isRoot
-            ? !sameFileClaim(transition.before, request.expectedRoot)
-            : transition.before.kind !== 'absent')
-        )
-      })
-    ) {
+    if (!hasExactProofTransitionSet(result.transitions, expectedTransitions)) {
       throw new Error(`adapter ${adapter.id} returned an invalid package proof set`)
     }
     const receiptId = `${this.spaceId}:receipt-${nextReceiptId++}`
@@ -640,18 +889,103 @@ export class SpaceResourceAuthority {
           throw new Error(`adapter ${adapter.id} returned a transition outside its package`)
         }
 
-        return { ...transition, path: entry.path }
+        return {
+          path: entry.path,
+          before: snapshotClaim(transition.before),
+          after: snapshotClaim(transition.after),
+          mtimeMs: transition.mtimeMs,
+        }
       }),
     }
 
     return { status: 'published', receipt }
   }
 
+  /** The whole package publication for one placement, or `null` where this
+   * deployment cannot perform it. Composition asks ONCE, before it mints a
+   * space, prepares a root or stages a byte — which is what makes "unavailable
+   * here" answerable without a filesystem probe and without a half-written
+   * package to explain afterwards.
+   *
+   * Prerequisites are three independent facts, and a partial set is unavailable:
+   * the aggregate commit itself, the strict observation its absent claim comes
+   * from, and the base inventory the placement-wide name check walks. */
+  packagePublicationFor(placementPath: string, owner: string): PackagePublicationView | null {
+    this.assertRootsStable()
+    const canonicalPlacement = placementPath ? normalizePath(placementPath) : ''
+    const adapter = this.adapters.find((candidate) =>
+      containsPrefix(candidate.prefix, canonicalPlacement),
+    )
+
+    if (!adapter) {
+      throw new Error(`no resource adapter owns placement ${canonicalPlacement}`)
+    }
+    const adapterPlacement = adapter.prefix
+      ? canonicalPlacement.slice(adapter.prefix.length).replace(/^\//, '')
+      : canonicalPlacement
+
+    if (!adapter.capabilities.packagePublication || !adapter.capabilities.resourceObservation) {
+      return null
+    }
+
+    return {
+      publishIfAbsent: async (request) => {
+        const rootPath = normalizePath(request.rootPath)
+        const files = request.files.map((file) => ({
+          path: normalizePath(file.path),
+          content: Uint8Array.from(file.content),
+        }))
+
+        if (new Set(files.map((file) => file.path)).size !== files.length) {
+          throw new Error('package publication requires unique resource paths')
+        }
+        const snapshot = { rootPath, files }
+        const manifest = snapshot.files.find((file) => file.path === SKILL_MANIFEST_FILENAME)
+
+        if (!manifest) {
+          throw Object.assign(new Error('a skill package must carry a manifest'), {
+            code: 'INVALID_SKILL_MANIFEST',
+          })
+        }
+        const manifestPath = `${snapshot.rootPath}/${SKILL_MANIFEST_FILENAME}`
+        const routedManifest = this.route(manifestPath)
+
+        if (routedManifest.adapter !== adapter) {
+          throw new Error(`package root is outside its publication placement: ${snapshot.rootPath}`)
+        }
+        if (!isSkillPackageRootPath(routedManifest.relativePath)) {
+          throw new Error(`package root is not a canonical package root: ${snapshot.rootPath}`)
+        }
+        if (skillPlacementPathOf(routedManifest.relativePath) !== adapterPlacement) {
+          throw new Error(`package root is outside its publication placement: ${snapshot.rootPath}`)
+        }
+        const lease = await this.admitSkillPlacement(manifestPath, 'exclusive', owner)
+
+        try {
+          const observed = await this.observeStrictAdmitted(snapshot.rootPath)
+
+          if (observed.kind !== 'absent') {
+            return { status: 'conflict' }
+          }
+          await this.assertSkillManifestNameAvailableAdmitted(manifestPath, manifest.content)
+
+          return await this.commitPackageIfAbsentAdmitted({
+            rootPath: snapshot.rootPath,
+            files: snapshot.files,
+            expectedRoot: observed.claim,
+          })
+        } finally {
+          lease.settle()
+        }
+      },
+    }
+  }
+
   supportsRestartDurableStrict(path: string): boolean {
     this.assertRootsStable()
     const { adapter } = this.route(normalizePath(path))
 
-    return adapter.files.strictPublication?.restartDurable === true
+    return adapter.capabilities.strictPublication?.restartDurable === true
   }
 
   /** Translate a space-relative resource address into the coordinate system of
@@ -669,9 +1003,10 @@ export class SpaceResourceAuthority {
    * later owns the resource lease for the complete physical lifetime. */
   async stageStrict(request: ResourceStrictStageRequest): Promise<ResourceStrictStageResult> {
     this.assertRootsStable()
-    const path = normalizePath(request.path)
+    const snapshot = snapshotStrictStageRequest(request)
+    const path = snapshot.path
     const { adapter, relativePath } = this.route(path)
-    const strict = adapter.files.strictPublication
+    const strict = adapter.capabilities.strictPublication
 
     if (!strict?.restartDurable) {
       throw Object.assign(
@@ -679,19 +1014,20 @@ export class SpaceResourceAuthority {
         { code: 'STRICT_PUBLICATION_UNAVAILABLE' },
       )
     }
-    const content = Uint8Array.from(request.content)
-    const result = await strict.stage({
-      operationId: request.operationId,
-      binding: request.binding,
-      path: relativePath,
-      content,
-      expected: request.expected,
-    })
+    const candidateHash = await sha256Hex(snapshot.content)
+    const result = snapshotStrictStageResult(
+      await strict.stage(strictStageSubmission(snapshot, relativePath)),
+    )
 
     if (result.status === 'idempotency-conflict') {
       return result
     }
-    const state = this.mapStrictState(path, adapter.id, relativePath, result.state)
+    const state = this.mapStrictState(path, adapter.id, relativePath, result.state, {
+      operationId: snapshot.operationId,
+      binding: snapshot.binding,
+      expected: snapshot.expected,
+      candidateHash,
+    })
 
     if (state.status === 'missing') {
       throw new Error(`adapter ${adapter.id} accepted a missing strict stage`)
@@ -706,9 +1042,10 @@ export class SpaceResourceAuthority {
 
   async inspectStrict(request: ResourceStrictStageRef): Promise<ResourceStrictStageState> {
     this.assertRootsStable()
-    const path = normalizePath(request.path)
+    const snapshot = snapshotStrictStageRef(request)
+    const path = snapshot.path
     const { adapter, relativePath } = this.route(path)
-    const strict = adapter.files.strictPublication
+    const strict = adapter.capabilities.strictPublication
 
     if (!strict?.restartDurable) {
       throw Object.assign(
@@ -716,9 +1053,12 @@ export class SpaceResourceAuthority {
         { code: 'STRICT_PUBLICATION_UNAVAILABLE' },
       )
     }
-    const state = await strict.inspect(request.operationId, request.binding)
+    const state = snapshotStrictState(await strict.inspect(snapshot.operationId, snapshot.binding))
 
-    return this.mapStrictState(path, adapter.id, relativePath, state)
+    return this.mapStrictState(path, adapter.id, relativePath, state, {
+      operationId: snapshot.operationId,
+      binding: snapshot.binding,
+    })
   }
 
   /** Exact read for a caller that already owns the enclosing exclusive
@@ -747,7 +1087,7 @@ export class SpaceResourceAuthority {
     const canonicalPath = normalizePath(path)
     const { adapter, relativePath } = this.route(canonicalPath)
 
-    if (!adapter.files.removeIfClaimed || !physicalClaim.startsWith(`${adapter.id}:`)) {
+    if (!adapter.capabilities.claimedRemoval || !physicalClaim.startsWith(`${adapter.id}:`)) {
       return false
     }
     const claimValue = physicalClaim.slice(adapter.id.length + 1)
@@ -762,10 +1102,14 @@ export class SpaceResourceAuthority {
     )
 
     try {
-      return adapter.files.removeIfClaimed(relativePath, expectedContent, {
-        kind: 'present',
-        value: claimValue,
-      })
+      return await adapter.capabilities.claimedRemoval.removeIfClaimed(
+        relativePath,
+        expectedContent,
+        {
+          kind: 'present',
+          value: claimValue,
+        },
+      )
     } finally {
       lease.settle()
     }
@@ -778,16 +1122,16 @@ export class SpaceResourceAuthority {
     request: ResourceStrictStageRef,
   ): Promise<ResourceStrictPublicationResult> {
     this.assertAdmitted()
-    const path = normalizePath(request.path)
-    const initial = await this.inspectStrict(request)
+    const snapshot = snapshotStrictStageRef(request)
+    const path = snapshot.path
+    const initial = await this.inspectStrict(snapshot)
 
     if (initial.status === 'missing') {
       throw Object.assign(new Error('strict stage is missing'), { code: 'STRICT_STAGE_MISSING' })
     }
     const { adapter, relativePath } = this.route(path)
-    const result = await adapter.files.strictPublication!.publish(
-      request.operationId,
-      request.binding,
+    const result = snapshotStrictPublicationResult(
+      await adapter.capabilities.strictPublication!.publish(snapshot.operationId, snapshot.binding),
     )
 
     return this.mapStrictPublication(path, adapter.id, relativePath, result, initial.stage)
@@ -802,23 +1146,29 @@ export class SpaceResourceAuthority {
       recovery?: boolean
     },
   ): Promise<ResourceStrictPublicationResult> {
-    const path = normalizePath(request.path)
-    const packagePath = request.packagePath ? normalizePath(request.packagePath) : undefined
+    const snapshot = snapshotStrictStageRef(request)
+    const path = snapshot.path
+    const packagePath = snapshot.packagePath
+    const owner = options?.owner ?? 'strict-publish'
+    const deadlineMs = options?.deadlineMs
+    const signal = options?.signal
+    const recovery = options?.recovery === true
     const packageLease = packagePath
-      ? await this.admitPackage(packagePath, 'shared', options?.owner ?? 'strict-publish', {
-          ...options,
-          allowDuringClosure: options?.recovery,
+      ? await this.admitPackage(packagePath, 'shared', owner, {
+          ...(deadlineMs != null ? { deadlineMs } : {}),
+          ...(signal ? { signal } : {}),
+          ...(recovery ? { allowDuringClosure: true } : {}),
         })
       : undefined
-    const lease = await this.admitResource(path, 'exclusive', options?.owner ?? 'strict-publish', {
+    const lease = await this.admitResource(path, 'exclusive', owner, {
       ...(packagePath ? { packagePath } : {}),
-      ...(options?.deadlineMs != null ? { deadlineMs: options.deadlineMs } : {}),
-      ...(options?.signal ? { signal: options.signal } : {}),
-      ...(options?.recovery ? { allowDuringClosure: true } : {}),
+      ...(deadlineMs != null ? { deadlineMs } : {}),
+      ...(signal ? { signal } : {}),
+      ...(recovery ? { allowDuringClosure: true } : {}),
     })
 
     try {
-      return await this.publishStrictAdmitted(request)
+      return await this.publishStrictAdmitted(snapshot)
     } finally {
       lease.settle()
       packageLease?.settle()
@@ -827,36 +1177,35 @@ export class SpaceResourceAuthority {
 
   async discardStrict(request: ResourceStrictStageRef): Promise<boolean> {
     this.assertRootsStable()
-    const path = normalizePath(request.path)
+    const snapshot = snapshotStrictStageRef(request)
+    const path = snapshot.path
     const { adapter } = this.route(path)
-    const strict = adapter.files.strictPublication
+    const strict = adapter.capabilities.strictPublication
 
     if (!strict?.restartDurable) {
       return false
     }
 
-    return strict.discard(request.operationId, request.binding)
+    return strict.discard(snapshot.operationId, snapshot.binding)
   }
 
   private async observeAdmitted(path: string, maxBytes?: number): Promise<ResourceObservation> {
     const { adapter, relativePath } = this.route(path)
 
-    if (!adapter.files.observe) {
+    if (!adapter.capabilities.resourceObservation) {
       throw Object.assign(new Error(`adapter ${adapter.id} cannot make exact observations`), {
         code: 'OBSERVATION_UNAVAILABLE',
       })
     }
-    const observation = await adapter.files.observe(
-      relativePath,
-      maxBytes == null ? undefined : { maxBytes },
+    const observation = snapshotObservation(
+      await adapter.capabilities.resourceObservation.observe(
+        relativePath,
+        maxBytes == null ? undefined : { maxBytes },
+      ),
     )
-    const immutable =
-      observation.kind === 'present'
-        ? { ...observation, bytes: Uint8Array.from(observation.bytes) }
-        : observation
 
     return {
-      ...immutable,
+      ...observation,
       spaceId: this.spaceId,
       path,
       adapterId: adapter.id,
@@ -869,12 +1218,32 @@ export class SpaceResourceAuthority {
     adapterId: string,
     relativePath: string,
     stage: FileStrictStageHeader,
+    expected: {
+      operationId: string
+      binding: string
+      expected?: FileClaim
+      candidateHash?: string
+    },
   ): ResourceStrictStageHeader {
-    if (stage.path !== relativePath) {
-      throw new Error(`adapter ${adapterId} returned a strict stage for another resource`)
+    if (
+      stage.operationId !== expected.operationId ||
+      stage.binding !== expected.binding ||
+      stage.path !== relativePath ||
+      (expected.expected != null && !sameFileClaim(stage.expected, expected.expected)) ||
+      (expected.candidateHash != null && stage.candidateHash !== expected.candidateHash)
+    ) {
+      throw new Error(`adapter ${adapterId} returned an invalid strict stage header`)
     }
 
-    return { ...stage, spaceId: this.spaceId, adapterId, path }
+    return {
+      operationId: stage.operationId,
+      binding: stage.binding,
+      expected: snapshotClaim(stage.expected),
+      candidateHash: stage.candidateHash,
+      spaceId: this.spaceId,
+      adapterId,
+      path,
+    }
   }
 
   private mapStrictReceipt(
@@ -890,6 +1259,7 @@ export class SpaceResourceAuthority {
     if (
       receipt.operationId !== stage.operationId ||
       receipt.binding !== stage.binding ||
+      receipt.restartDurable !== true ||
       receipt.candidateHash !== stage.candidateHash ||
       receipt.transitions.length !== 1 ||
       receipt.transitions[0].path !== relativePath ||
@@ -900,10 +1270,22 @@ export class SpaceResourceAuthority {
     }
 
     return {
-      ...receipt,
+      operationId: receipt.operationId,
+      binding: receipt.binding,
+      observationId: receipt.observationId,
+      semanticEventTime: receipt.semanticEventTime,
+      restartDurable: true,
+      candidateHash: receipt.candidateHash,
       spaceId: this.spaceId,
       adapterId,
-      transitions: [{ ...receipt.transitions[0], path }],
+      transitions: [
+        {
+          path,
+          before: snapshotClaim(receipt.transitions[0].before),
+          after: snapshotClaim(receipt.transitions[0].after),
+          mtimeMs: receipt.transitions[0].mtimeMs,
+        },
+      ],
     }
   }
 
@@ -912,11 +1294,17 @@ export class SpaceResourceAuthority {
     adapterId: string,
     relativePath: string,
     state: FileStrictStageState,
+    expected: {
+      operationId: string
+      binding: string
+      expected?: FileClaim
+      candidateHash?: string
+    },
   ): ResourceStrictStageState {
     if (state.status === 'missing') {
-      return state
+      return { status: 'missing' }
     }
-    const stage = this.mapStrictHeader(path, adapterId, relativePath, state.stage)
+    const stage = this.mapStrictHeader(path, adapterId, relativePath, state.stage, expected)
 
     if (state.status === 'published') {
       return {
@@ -926,7 +1314,12 @@ export class SpaceResourceAuthority {
       }
     }
     if (state.status === 'failed-recoverable') {
-      return { ...state, stage }
+      return {
+        status: 'failed-recoverable',
+        stage,
+        reason: state.reason,
+        recoveryPaths: [...state.recoveryPaths],
+      }
     }
 
     return { status: state.status, stage }
@@ -946,10 +1339,21 @@ export class SpaceResourceAuthority {
       }
     }
 
-    return {
-      ...result,
-      stage: this.mapStrictHeader(path, adapterId, relativePath, result.stage),
-    }
+    const mappedStage = this.mapStrictHeader(path, adapterId, relativePath, result.stage, {
+      operationId: stage.operationId,
+      binding: stage.binding,
+      expected: stage.expected,
+      candidateHash: stage.candidateHash,
+    })
+
+    return result.status === 'conflict'
+      ? { status: 'conflict', stage: mappedStage }
+      : {
+          status: 'failed-recoverable',
+          stage: mappedStage,
+          reason: result.reason,
+          recoveryPaths: [...result.recoveryPaths],
+        }
   }
 
   private route(path: string): RoutedResource {

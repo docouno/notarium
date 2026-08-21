@@ -10,6 +10,7 @@ import {
   type RoleLocation,
   type RolesService,
 } from '../../packages/server/src/services/roles'
+import { writableLibrary, type WritableRoleLibrary } from '../roleLibraryComposition'
 
 /**
  * The port draws ONE line through its two identity reads
@@ -45,7 +46,7 @@ const PROJECT_CONTEXT: EffectiveRoleContext = {
 }
 
 let crossings: string[]
-let library: ReturnType<typeof createInMemoryRoleLibrary>
+let library: WritableRoleLibrary
 let roles: RolesService
 
 const spaceRoleLocator = (packageId: string) =>
@@ -58,14 +59,18 @@ const spaceRoleLocator = (packageId: string) =>
 
 beforeEach(() => {
   crossings = []
-  library = createInMemoryRoleLibrary({
-    onBarrier: (location, directoryNames) =>
-      crossings.push(`${location.scope}:${location.space}:${[...directoryNames].sort().join(',')}`),
-  })
+  library = writableLibrary(
+    createInMemoryRoleLibrary({
+      onBarrier: (location, directoryNames) =>
+        crossings.push(
+          `${location.scope}:${location.space}:${[...directoryNames].sort().join(',')}`,
+        ),
+    }),
+  )
   roles = createRolesService({
     ...inMemoryAbilityPersistence(),
     catalog: async () => [],
-    library,
+    ...library.deps,
     abilityAvailability: new InMemoryAbilityAvailability(),
   })
 })

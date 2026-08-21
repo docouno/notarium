@@ -77,7 +77,19 @@ Restore is a persisted idempotent operation, not a best-effort `write()` wrapper
 stages exact bytes under the adapter-owned recovery namespace, validates the live
 head/address/proof/lifecycle cut, publishes through the resource authority, then one
 meta-DB transaction appends `kind: restore`, advances head/address/owner proof, records
-the physical receipt and outbox event, and stores the terminal response. Recovery can
+the physical receipt and outbox event, and stores the terminal response.
+
+The authority reaches storage through its own named view, never the whole port:
+a three-operation inventory — enumerate, read, tell a directory from a file — plus the
+physical-byte capabilities it depends on, each present or absent on its own. Exact
+observation, claim-bound publication, claimed removal, aggregate package publication and
+the restart-durable strict protocol are five separate declarations, so an adapter that can
+observe but not publish, or publish single resources but not install a package, says
+exactly that. A missing one refuses the operation it names — `OBSERVATION_UNAVAILABLE`,
+`PUBLICATION_UNAVAILABLE`, `PACKAGE_PUBLICATION_UNAVAILABLE`,
+`STRICT_PUBLICATION_UNAVAILABLE` — and leaves the rest working. Note writes and directory
+moves are not reachable from this view at all: they belong to the note store, and one
+adapter offering two unadmitted routes to the same bytes is what the split removes. Recovery can
 resume every accepted phase after process exit; replay returns the stored result and
 never appends a second revision.
 

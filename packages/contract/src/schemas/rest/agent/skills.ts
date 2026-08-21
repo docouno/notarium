@@ -87,6 +87,14 @@ export const MeAgentSkillsResponseSchema = z.object({
   projects: z.array(ProjectSummarySchema),
   ...AgentPackageLibraryPageSchema,
   truncated: z.boolean().optional(),
+  /** The same answer as the role library's, over the targets a SKILL can take:
+   *  Personal, or one shared Space. `spaces` is keyed by the space slug an Add
+   *  would send; a missing field or key reads as `false`. The Role response uses
+   *  `projects` instead because the two resources expose their exact wire nouns. */
+  installAvailability: z
+    .object({ personal: z.boolean(), spaces: z.record(z.string(), z.boolean()) })
+    .strict()
+    .optional(),
 })
 
 export const CreateAgentSkillResponseSchema = z.object({

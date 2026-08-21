@@ -18,8 +18,10 @@ import { CachedStore, NOTE_ID_FRONTMATTER_KEY } from '@notarium/core'
 import {
   createLocalFsFiles,
   createNodeSqliteDriver,
-  type FileStore,
+  engineMountOf,
+  type FileStoreAssembly,
   NotariumStore,
+  resourceAuthorityAdapterOf,
   SpaceResourceAuthority,
 } from '@notarium/engine'
 
@@ -28,6 +30,7 @@ import { SqliteMetaDb } from '../../packages/server/src/services/metaDb/sqliteMe
 import { SpaceManager } from '../../packages/server/src/services/spaces'
 import type { SpaceStore } from '../../packages/server/src/services/spaces'
 import { createStoreAccess, readNoteAccess } from '../../packages/server/src/services/storeAccess'
+import { withFacets } from './fileStoreAssembly'
 
 const SHARED_ID = 'shared-note1'
 
@@ -54,7 +57,7 @@ describe('cross-space note-id collision (#327)', () => {
     /** One space: its own notes dir, its own index, the SHARED identity table. */
     const space = (
       name: string,
-      wrap?: (files: FileStore) => FileStore,
+      wrap?: (files: FileStoreAssembly) => FileStoreAssembly,
       identity?: (real: typeof meta.identity) => typeof meta.identity,
       wrapSql?: <T>(sql: T) => T,
     ) => {
@@ -63,10 +66,10 @@ describe('cross-space note-id collision (#327)', () => {
       mkdirSync(dir, { recursive: true })
       const storage = wrap ? wrap(createLocalFsFiles(dir)) : createLocalFsFiles(dir)
       const resourceAuthority = new SpaceResourceAuthority(name, [
-        { id: 'notes', prefix: '', files: storage, physicalRoot: dir },
+        resourceAuthorityAdapterOf({ id: 'notes', prefix: '', physicalRoot: dir }, storage),
       ])
       const engine = new NotariumStore({
-        mounts: [{ class: 'user-doc', prefix: '', files: storage }],
+        mounts: [engineMountOf({ class: 'user-doc', prefix: '' }, storage)],
         resourceAuthority,
         sql: (wrapSql ?? ((driver) => driver))(createNodeSqliteDriver(':memory:')),
         // Keep the rotating source sweep out of the way: these tests count
@@ -302,23 +305,26 @@ describe('cross-space note-id collision (#327)', () => {
     // The window the final observation exists for: convergence reads the
     // rewritten file once to prove the index against it, and once more to close
     // the proof. R1 → R2 lands strictly BETWEEN those two reads.
-    const beta = space('beta', (real) => ({
-      ...real,
-      read: async (path) => {
-        if (path === 'copy.md' && convergedReads === 1) {
-          convergedReads++
-          write(betaDir, 'copy.md', noteWith(betaSettledId, 'Beta copy', 'second body'))
-        }
-        const raw = await real.read(path)
+    const beta = space('beta', (real) =>
+      withFacets(real, {
+        base: {
+          read: async (path) => {
+            if (path === 'copy.md' && convergedReads === 1) {
+              convergedReads++
+              write(betaDir, 'copy.md', noteWith(betaSettledId, 'Beta copy', 'second body'))
+            }
+            const raw = await real.base.read(path)
 
-        if (path === 'copy.md' && raw != null && !raw.includes(SHARED_ID) && !convergedReads) {
-          betaSettledId = raw.match(/notarium-id: (\S+)/)?.[1] ?? ''
-          convergedReads++
-        }
+            if (path === 'copy.md' && raw != null && !raw.includes(SHARED_ID) && !convergedReads) {
+              betaSettledId = raw.match(/notarium-id: (\S+)/)?.[1] ?? ''
+              convergedReads++
+            }
 
-        return raw
-      },
-    }))
+            return raw
+          },
+        },
+      }),
+    )
     let betaSettledId = ''
 
     betaDir = beta.dir
@@ -368,16 +374,19 @@ describe('cross-space note-id collision (#327)', () => {
     // Every observation sees a different generation. `stat` and `read` are
     // separate storage calls, so the only honest answer is "not proven yet" —
     // never a claim of convergence over bytes nobody has held still.
-    const beta = space('beta', (real) => ({
-      ...real,
-      read: async (path) => {
-        if (path === 'copy.md') {
-          write(betaDir, 'copy.md', noteWith(SHARED_ID, 'Beta copy', `body ${++churn}`))
-        }
+    const beta = space('beta', (real) =>
+      withFacets(real, {
+        base: {
+          read: async (path) => {
+            if (path === 'copy.md') {
+              write(betaDir, 'copy.md', noteWith(SHARED_ID, 'Beta copy', `body ${++churn}`))
+            }
 
-        return real.read(path)
-      },
-    }))
+            return real.base.read(path)
+          },
+        },
+      }),
+    )
 
     betaDir = beta.dir
     write(betaDir, 'copy.md', noteWith(SHARED_ID, 'Beta copy', 'body 0'))
@@ -398,16 +407,19 @@ describe('cross-space note-id collision (#327)', () => {
     const { space } = world()
     let dir = ''
     let churn = 0
-    const alpha = space('alpha', (real) => ({
-      ...real,
-      read: async (path) => {
-        if (path === 'note.md') {
-          write(dir, 'note.md', noteWith('freeclaim003', 'A', `body ${++churn}`))
-        }
+    const alpha = space('alpha', (real) =>
+      withFacets(real, {
+        base: {
+          read: async (path) => {
+            if (path === 'note.md') {
+              write(dir, 'note.md', noteWith('freeclaim003', 'A', `body ${++churn}`))
+            }
 
-        return real.read(path)
-      },
-    }))
+            return real.base.read(path)
+          },
+        },
+      }),
+    )
 
     dir = alpha.dir
     // A FREE claim: this path is `adopted`, the branch whose retry the fast path
@@ -434,17 +446,20 @@ describe('cross-space note-id collision (#327)', () => {
     // arbiter answers a third time. Re-keying from the LAST hop's retired id
     // (`second`) leaves the note published under `first` — an id whose durable row
     // is by then a tombstone.
-    const alpha = space('alpha', (real) => ({
-      ...real,
-      read: async (path) => {
-        if (armed && path === 'note.md' && ++seen === 2) {
-          write(alphaDir, 'note.md', noteWith(third, 'Alpha', 'alpha body'))
-          injected = true
-        }
+    const alpha = space('alpha', (real) =>
+      withFacets(real, {
+        base: {
+          read: async (path) => {
+            if (armed && path === 'note.md' && ++seen === 2) {
+              write(alphaDir, 'note.md', noteWith(third, 'Alpha', 'alpha body'))
+              injected = true
+            }
 
-        return real.read(path)
-      },
-    }))
+            return real.base.read(path)
+          },
+        },
+      }),
+    )
 
     alphaDir = alpha.dir
     write(alphaDir, 'note.md', noteWith(first, 'Alpha', 'alpha body'))
@@ -495,17 +510,20 @@ describe('cross-space note-id collision (#327)', () => {
     // verdict is `duplicate`. Reading the verdict instead of the movement drops the
     // re-key, and the snapshot goes on serving a tombstone — after which every poll
     // mints another id for the same file, without limit.
-    const alpha = space('alpha', (real) => ({
-      ...real,
-      read: async (path) => {
-        if (armed && path === 'note.md' && ++seen === 2) {
-          write(dir, 'note.md', noteWith(held, 'Alpha', 'alpha body'))
-          injected = true
-        }
+    const alpha = space('alpha', (real) =>
+      withFacets(real, {
+        base: {
+          read: async (path) => {
+            if (armed && path === 'note.md' && ++seen === 2) {
+              write(dir, 'note.md', noteWith(held, 'Alpha', 'alpha body'))
+              injected = true
+            }
 
-        return real.read(path)
-      },
-    }))
+            return real.base.read(path)
+          },
+        },
+      }),
+    )
 
     dir = alpha.dir
     write(dir, 'orig.md', noteWith(held, 'Original', 'original body'))
@@ -552,17 +570,20 @@ describe('cross-space note-id collision (#327)', () => {
     // snapshot. There is nothing left to converge and nothing left to defend, but
     // the claim must not stay outstanding forever: it is retried on every read
     // surface and every poll of this SPACE, and it can never succeed again.
-    const beta = space('beta', (real) => ({
-      ...real,
-      read: async (path) => {
-        if (armed && path === 'copy.md' && ++seen === 2) {
-          rmSync(join(betaDir, 'copy.md'), { force: true })
-          injected = true
-        }
+    const beta = space('beta', (real) =>
+      withFacets(real, {
+        base: {
+          read: async (path) => {
+            if (armed && path === 'copy.md' && ++seen === 2) {
+              rmSync(join(betaDir, 'copy.md'), { force: true })
+              injected = true
+            }
 
-        return real.read(path)
-      },
-    }))
+            return real.base.read(path)
+          },
+        },
+      }),
+    )
 
     betaDir = beta.dir
     write(betaDir, 'copy.md', noteWith('betaown00001', 'Beta copy', 'beta body'))
@@ -854,18 +875,21 @@ describe('cross-space note-id collision (#327)', () => {
     let armed = false
     let seen = 0
     let injected = false
-    const beta = space('beta', (real) => ({
-      ...real,
-      read: async (path) => {
-        if (armed && path === 'copy.md' && ++seen === 2) {
-          // No frontmatter at all — the claim is gone, the body stays.
-          writeFileSync(join(betaDir, 'copy.md'), '# Beta copy\n\nbeta body\n')
-          injected = true
-        }
+    const beta = space('beta', (real) =>
+      withFacets(real, {
+        base: {
+          read: async (path) => {
+            if (armed && path === 'copy.md' && ++seen === 2) {
+              // No frontmatter at all — the claim is gone, the body stays.
+              writeFileSync(join(betaDir, 'copy.md'), '# Beta copy\n\nbeta body\n')
+              injected = true
+            }
 
-        return real.read(path)
-      },
-    }))
+            return real.base.read(path)
+          },
+        },
+      }),
+    )
 
     betaDir = beta.dir
     write(betaDir, 'own.md', noteWith('betaown00001', 'Beta own', 'beta body'))

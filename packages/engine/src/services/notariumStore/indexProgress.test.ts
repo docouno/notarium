@@ -16,7 +16,7 @@ import type { Embedder } from '../../libs/embedding'
 import { createLocalFsFiles } from '../../libs/files'
 import { createNodeSqliteDriver } from '../../libs/sql'
 import { NotariumStore } from './notariumStore'
-import type { EngineMount } from './types'
+import { type EngineMount, engineMountOf } from './types'
 import { describeVector } from './vectorGate.fixture'
 
 /** Instant deterministic embedder — distinct text → distinct unit vector. */
@@ -69,11 +69,8 @@ const controllableGate = () => {
   }
 }
 
-const userMount = (dir: string): EngineMount => ({
-  class: 'user-doc',
-  prefix: '',
-  files: createLocalFsFiles(dir),
-})
+const userMount = (dir: string): EngineMount =>
+  engineMountOf({ class: 'user-doc', prefix: '' }, createLocalFsFiles(dir))
 const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve))
 
 describe('engine.vector status — FTS-only degradation', () => {

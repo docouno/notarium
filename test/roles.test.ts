@@ -20,10 +20,16 @@ import {
   RoleAlreadyExistsError,
   roleContextTargetOf,
   RoleDependencyConflictError,
+  RoleInstallUnavailableError,
+  type RoleLibraryComposition,
+  type RoleLocation,
+  type RolePublicationTarget,
   type RolesService,
+  SkillAlreadyExistsError,
   type SkillPackage,
   withCatalogProvenance,
 } from '../packages/server/src/services/roles'
+import { interceptPublication, writableLibrary } from './roleLibraryComposition'
 
 /** Everything an Owned library holds, in one answer. The service answers per KIND —
  *  no caller ever wants both — so a test about what Add LEFT there asks twice. */
@@ -139,10 +145,10 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('keeps Catalog packages discovery-only until Add copies a role and its linked skill', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const roles = createRolesService({
       catalog: loadBundledAbilityInventory,
-      library,
+      ...library.deps,
       ...inMemoryAbilityPersistence(),
     })
     const context = { personalSpace: 'space-personal' }
@@ -266,7 +272,7 @@ describe('role catalog and owned libraries', () => {
   it('activates System roles by default and lets the owner disable them', async () => {
     const roles = createRolesService({
       catalog: loadBundledAbilityInventory,
-      library: createInMemoryRoleLibrary(),
+      ...writableLibrary(createInMemoryRoleLibrary()).deps,
       ...inMemoryAbilityPersistence(),
     })
     const context = { personalSpace: null }
@@ -305,7 +311,7 @@ describe('role catalog and owned libraries', () => {
   it('resumes a System role from its saved binding, and drops it when disabled', async () => {
     const roles = createRolesService({
       catalog: loadBundledAbilityInventory,
-      library: createInMemoryRoleLibrary(),
+      ...writableLibrary(createInMemoryRoleLibrary()).deps,
       ...inMemoryAbilityPersistence(),
     })
     const context = { personalSpace: null }
@@ -325,10 +331,10 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('uses Owned over System, but an explicit disable reveals the System fallback', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const roles = createRolesService({
       catalog: loadBundledAbilityInventory,
-      library,
+      ...library.deps,
       ...inMemoryAbilityPersistence(),
     })
     const context = { personalSpace: 'personal' }
@@ -357,10 +363,10 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('skips wrong-kind and disabled Owned candidates before choosing a broader fallback', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const roles = createRolesService({
       catalog: loadBundledAbilityInventory,
-      library,
+      ...library.deps,
       ...inMemoryAbilityPersistence(),
     })
     const context = {
@@ -437,10 +443,10 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('rejects a Space locator alias for a package in the Personal root', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const roles = createRolesService({
       catalog: loadBundledAbilityInventory,
-      library,
+      ...library.deps,
       ...inMemoryAbilityPersistence(),
     })
     const created = await roles.createCustomRole(
@@ -474,7 +480,7 @@ describe('role catalog and owned libraries', () => {
     }
     const roles = createRolesService({
       catalog: async () => [...inventory, duplicate],
-      library: createInMemoryRoleLibrary(),
+      ...writableLibrary(createInMemoryRoleLibrary()).deps,
       ...inMemoryAbilityPersistence(),
     })
 
@@ -484,7 +490,7 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('copies the skills a Catalog role links, and no others', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const linked = skillPkg('linked-evidence', 'The one the role names.', 'Linked body.')
     const bystander = skillPkg('other-evidence', 'A skill the role never names.', 'Other body.')
     const role = pkg('bundled-role', 'Bundled role.', 'Body.')
@@ -497,7 +503,7 @@ describe('role catalog and owned libraries', () => {
     )
     const roles = createRolesService({
       catalog: async () => [role, linked, bystander].map(catalogPackage),
-      library,
+      ...library.deps,
       ...inMemoryAbilityPersistence(),
     })
     const location = { scope: 'personal' as const, space: 'space-personal' }
@@ -523,7 +529,7 @@ describe('role catalog and owned libraries', () => {
 
         return inventory
       },
-      library: createInMemoryRoleLibrary(),
+      ...writableLibrary(createInMemoryRoleLibrary()).deps,
       ...inMemoryAbilityPersistence(),
     })
 
@@ -534,10 +540,10 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('preserves malformed exact attachments in health and never falls back past them', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const roles = createRolesService({
       catalog: loadBundledAbilityInventory,
-      library,
+      ...library.deps,
       ...inMemoryAbilityPersistence(),
     })
     const role = pkg('research', 'Broken replacement.', 'Broken instructions.')
@@ -614,11 +620,11 @@ describe('role catalog and owned libraries', () => {
    *  durable-frontmatter gate refuses the line. That seam showed as a bare 400 from a gate
    *  three layers down which knows nothing about attachments. It has to be named here. */
   it('refuses an attachment it cannot write back, and says which one', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const roles = createRolesService({
       ...inMemoryAbilityPersistence(),
       catalog: loadBundledAbilityInventory,
-      library,
+      ...library.deps,
     })
     const home = { scope: 'personal' as const, space: 'personal' }
     const unwritable = '[[notarium-id:space:broken|ev\u2028idence]]'
@@ -674,12 +680,12 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('classifies every exact attachment failure before activation', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const abilityAvailability = new InMemoryAbilityAvailability()
     const roles = createRolesService({
       ...inMemoryAbilityPersistence(),
       catalog: loadBundledAbilityInventory,
-      library,
+      ...library.deps,
       abilityAvailability,
     })
     const space = { scope: 'space' as const, space: 'shared' }
@@ -780,11 +786,11 @@ describe('role catalog and owned libraries', () => {
    *  just called valid, with no way to open or repair the role. Read here through the
    *  very schema that door parses with. */
   it('answers with a health the wire carries when a package names an attachment it may not', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const roles = createRolesService({
       ...inMemoryAbilityPersistence(),
       catalog: loadBundledAbilityInventory,
-      library,
+      ...library.deps,
       abilityAvailability: new InMemoryAbilityAvailability(),
     })
     const space = { scope: 'space' as const, space: 'shared' }
@@ -840,12 +846,12 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('requires all-project availability for a Space Role but accepts the matching Project Role', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const abilityAvailability = new InMemoryAbilityAvailability()
     const roles = createRolesService({
       ...inMemoryAbilityPersistence(),
       catalog: loadBundledAbilityInventory,
-      library,
+      ...library.deps,
       abilityAvailability,
     })
     const skillId = 'SelectedSk_1'
@@ -885,10 +891,10 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('does not expose Personal Owned abilities through a narrowed principal', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const roles = createRolesService({
       catalog: loadBundledAbilityInventory,
-      library,
+      ...library.deps,
       ...inMemoryAbilityPersistence(),
     })
     await roles.createCustomRole('private-role', 'Private.', 'Private.', {
@@ -924,10 +930,10 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('never overwrites an owned fork and lets a project fork shadow personal', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const roles = createRolesService({
       catalog: loadBundledAbilityInventory,
-      library,
+      ...library.deps,
       ...inMemoryAbilityPersistence(),
     })
     const personal = { scope: 'personal' as const, space: 'personal' }
@@ -983,10 +989,10 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('loads an owned dependency only by its locator across rename and replacement', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const roles = createRolesService({
       catalog: async () => [],
-      library,
+      ...library.deps,
       ...inMemoryAbilityPersistence(),
     })
     const personal = { scope: 'personal' as const, space: 'personal' }
@@ -1032,8 +1038,9 @@ describe('role catalog and owned libraries', () => {
 
     const missingExact = createRolesService({
       catalog: async () => [],
+      publication: library.deps.publication,
       library: {
-        ...library,
+        ...library.deps.library,
         getSkillByDirectory: async (location, id) =>
           id === dependencyId ? null : library.getSkillByDirectory(location, id),
       },
@@ -1054,12 +1061,12 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('resolves a cross-placement locator only with the full effective context', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const abilityAvailability = new InMemoryAbilityAvailability()
     const roles = createRolesService({
       ...inMemoryAbilityPersistence(),
       catalog: async () => [],
-      library,
+      ...library.deps,
       abilityAvailability,
     })
     const space = { scope: 'space' as const, space: 'shared' }
@@ -1125,10 +1132,10 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('rehydrates a renamed session role by exact package and never by a replacement name', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const roles = createRolesService({
       catalog: async () => [],
-      library,
+      ...library.deps,
       ...inMemoryAbilityPersistence(),
     })
     const personal = { scope: 'personal' as const, space: 'personal' }
@@ -1168,8 +1175,9 @@ describe('role catalog and owned libraries', () => {
     })
     const missingExact = createRolesService({
       catalog: async () => [],
+      publication: library.deps.publication,
       library: {
-        ...library,
+        ...library.deps.library,
         getSkillByDirectory: async (location, id) =>
           id === packageId ? null : library.getSkillByDirectory(location, id),
       },
@@ -1223,12 +1231,12 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('resumes a bound role only where its reach still answers', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const availability = new InMemoryAbilityAvailability()
     const roles = createRolesService({
       ...inMemoryAbilityPersistence(),
       catalog: async () => [],
-      library,
+      ...library.deps,
       abilityAvailability: availability,
     })
     const base = await roles.createCustomRole('review', 'Team review.', 'The team way.', {
@@ -1259,12 +1267,12 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('resumes a Space role whose skill reaches only the project being resumed in', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const availability = new InMemoryAbilityAvailability()
     const roles = createRolesService({
       ...inMemoryAbilityPersistence(),
       catalog: async () => [],
-      library,
+      ...library.deps,
       abilityAvailability: availability,
     })
     const space = { scope: 'space' as const, space: 'shared' }
@@ -1308,10 +1316,10 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('maps a role publication race after the precheck to already-exists', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const roles = createRolesService({
       catalog: loadBundledAbilityInventory,
-      library,
+      ...library.deps,
       ...inMemoryAbilityPersistence(),
     })
     const location = { scope: 'personal' as const, space: 'personal' }
@@ -1331,12 +1339,12 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('reuses one Space-owned linked skill across project roles and expands its bindings', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const abilityAvailability = new InMemoryAbilityAvailability()
     const roles = createRolesService({
       ...inMemoryAbilityPersistence(),
       catalog: loadBundledAbilityInventory,
-      library,
+      ...library.deps,
       abilityAvailability,
     })
     const projectA = { scope: 'project' as const, space: 'shared', projectId: 'project-a' }
@@ -1397,10 +1405,10 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('rejects a linked-skill collision instead of binding a role to different bytes', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const roles = createRolesService({
       catalog: loadBundledAbilityInventory,
-      library,
+      ...library.deps,
       ...inMemoryAbilityPersistence(),
     })
     const personal = { scope: 'personal' as const, space: 'personal' }
@@ -1428,10 +1436,10 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('reports truncation instead of silently exceeding the requested budget', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const roles = createRolesService({
       catalog: async () => [],
-      library,
+      ...library.deps,
       ...inMemoryAbilityPersistence(),
     })
     await library.putIfAbsent(
@@ -1451,7 +1459,7 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('budgets linked names and descriptions even when their instruction bodies are empty', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const dependencies = Array.from({ length: 8 }, (_, index) => ({
       ...skillPkg(`support-${index}`, `Supporting description ${index} ${'x'.repeat(80)}`),
       directoryName: `Support${index}aBcD`,
@@ -1470,7 +1478,7 @@ describe('role catalog and owned libraries', () => {
     )
     const roles = createRolesService({
       catalog: async () => [],
-      library,
+      ...library.deps,
       ...inMemoryAbilityPersistence(),
     })
     const personal = { scope: 'personal' as const, space: 'personal' }
@@ -1501,14 +1509,14 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('forks every file in a complete Agent Skills package', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const role = pkg('resource-role', 'Resource role.', 'Instructions.')
     role.files.set('scripts/run.sh', Buffer.from('#!/bin/sh\necho safe-copy\n'))
     role.files.set('references/guide.md', Buffer.from('# Guide\n\nSupporting evidence.'))
     role.files.set('assets/template.bin', Buffer.from([0, 1, 2, 255]))
     const roles = createRolesService({
       catalog: async () => [catalogPackage(role)],
-      library,
+      ...library.deps,
       ...inMemoryAbilityPersistence(),
     })
     const location = { scope: 'personal' as const, space: 'personal' }
@@ -1540,10 +1548,10 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('does not expose malformed owned provenance as Catalog ancestry', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const roles = createRolesService({
       catalog: async () => [],
-      library,
+      ...library.deps,
       ...inMemoryAbilityPersistence(),
     })
     const location = { scope: 'personal' as const, space: 'personal' }
@@ -1564,10 +1572,10 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('keeps valid catalog provenance after the owned package is renamed', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const roles = createRolesService({
       catalog: async () => [],
-      library,
+      ...library.deps,
       ...inMemoryAbilityPersistence(),
     })
     const location = { scope: 'personal' as const, space: 'personal' }
@@ -1609,13 +1617,14 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('activates an exact known role outside a truncated discovery window', async () => {
-    const backing = createInMemoryRoleLibrary()
+    const backing = writableLibrary(createInMemoryRoleLibrary())
     const location = { scope: 'personal' as const, space: 'personal' }
     await backing.putIfAbsent(location, pkg('known-role', 'Known role.', 'Direct instructions.'))
     const roles = createRolesService({
       catalog: async () => [],
+      publication: backing.deps.publication,
       library: {
-        ...backing,
+        ...backing.deps.library,
         listManifests: async () => ({ packages: [], truncated: true }),
       },
       ...inMemoryAbilityPersistence(),
@@ -1635,7 +1644,7 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('stops progressive linked-skill reads when the role consumes the output budget', async () => {
-    const backing = createInMemoryRoleLibrary()
+    const backing = writableLibrary(createInMemoryRoleLibrary())
     const location = { scope: 'personal' as const, space: 'personal' }
     const role = pkg('progressive-role', 'Progressive role.', 'x'.repeat(1_000))
     role.files.set(
@@ -1650,8 +1659,9 @@ describe('role catalog and owned libraries', () => {
     const reads: string[] = []
     const roles = createRolesService({
       catalog: async () => [],
+      publication: backing.deps.publication,
       library: {
-        ...backing,
+        ...backing.deps.library,
         getSkill: async (where, name) => {
           reads.push(name)
           return backing.getSkill(where, name)
@@ -1696,7 +1706,7 @@ describe('role catalog and owned libraries', () => {
           files: new Map([['SKILL.md', Buffer.from(source)]]),
         },
       ],
-      library: createInMemoryRoleLibrary(),
+      ...writableLibrary(createInMemoryRoleLibrary()).deps,
       ...inMemoryAbilityPersistence(),
     })
 
@@ -1710,10 +1720,10 @@ describe('role catalog and owned libraries', () => {
     const role = pkg('package-limit', 'Package limit.', 'Instructions.')
     const skillBytes = role.files.get('SKILL.md')!.byteLength
     role.files.set('assets/fill.bin', Buffer.alloc(8 * 1024 * 1024 - skillBytes))
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const roles = createRolesService({
       catalog: async () => [catalogPackage(role)],
-      library,
+      ...library.deps,
       ...inMemoryAbilityPersistence(),
     })
 
@@ -1753,7 +1763,7 @@ describe('role catalog and owned libraries', () => {
   it("refuses a locator that calls one library by the other placement's name", async () => {
     const roles = createRolesService({
       catalog: loadBundledAbilityInventory,
-      library: createInMemoryRoleLibrary(),
+      ...writableLibrary(createInMemoryRoleLibrary()).deps,
       ...inMemoryAbilityPersistence(),
     })
     const shared = await roles.createCustomRole('review', 'Review.', 'Review carefully.', {
@@ -1809,10 +1819,10 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('gives a personal role no versions, no base and nowhere to be promoted to', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const roles = createRolesService({
       catalog: loadBundledAbilityInventory,
-      library,
+      ...library.deps,
       ...inMemoryAbilityPersistence(),
     })
     const mine = await roles.createCustomRole('notes', 'Notes.', 'Take notes.', {
@@ -1890,7 +1900,7 @@ describe('role catalog and owned libraries', () => {
   it('gives a Space role a reach, and resolves it only where that reach says', async () => {
     const roles = createRolesService({
       catalog: loadBundledAbilityInventory,
-      library: createInMemoryRoleLibrary(),
+      ...writableLibrary(createInMemoryRoleLibrary()).deps,
       ...inMemoryAbilityPersistence(),
     })
     const created = await roles.createCustomRole(
@@ -1935,7 +1945,7 @@ describe('role catalog and owned libraries', () => {
   it('lets a narrowed Space role fall back to Personal instead of disappearing', async () => {
     const roles = createRolesService({
       catalog: loadBundledAbilityInventory,
-      library: createInMemoryRoleLibrary(),
+      ...writableLibrary(createInMemoryRoleLibrary()).deps,
       ...inMemoryAbilityPersistence(),
     })
     await roles.createCustomRole('review', 'Personal review.', 'My own way.', {
@@ -1962,10 +1972,10 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('resolves a Space role everywhere while no reach was ever recorded', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const roles = createRolesService({
       catalog: loadBundledAbilityInventory,
-      library,
+      ...library.deps,
       ...inMemoryAbilityPersistence(),
     })
     // Published behind the service's back, exactly like a role that predates
@@ -1987,7 +1997,7 @@ describe('role catalog and owned libraries', () => {
   it('forks a Space base into a project version and keeps the two bodies apart', async () => {
     const roles = createRolesService({
       catalog: loadBundledAbilityInventory,
-      library: createInMemoryRoleLibrary(),
+      ...writableLibrary(createInMemoryRoleLibrary()).deps,
       ...inMemoryAbilityPersistence(),
     })
     const base = await roles.createCustomRole(
@@ -2021,7 +2031,7 @@ describe('role catalog and owned libraries', () => {
   it('keeps an override self-sufficient when the base does not reach its project', async () => {
     const roles = createRolesService({
       catalog: loadBundledAbilityInventory,
-      library: createInMemoryRoleLibrary(),
+      ...writableLibrary(createInMemoryRoleLibrary()).deps,
       ...inMemoryAbilityPersistence(),
     })
     const base = await roles.createCustomRole('review', 'Team review.', 'The team way.', {
@@ -2051,7 +2061,7 @@ describe('role catalog and owned libraries', () => {
   it('refuses a second version of one role in the same project', async () => {
     const roles = createRolesService({
       catalog: loadBundledAbilityInventory,
-      library: createInMemoryRoleLibrary(),
+      ...writableLibrary(createInMemoryRoleLibrary()).deps,
       ...inMemoryAbilityPersistence(),
     })
     const base = await roles.createCustomRole('review', 'Team review.', 'The team way.', {
@@ -2067,12 +2077,12 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('lets a role narrowed to two projects depend on a skill that reaches both', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const availability = new InMemoryAbilityAvailability()
     const roles = createRolesService({
       ...inMemoryAbilityPersistence(),
       catalog: loadBundledAbilityInventory,
-      library,
+      ...library.deps,
       abilityAvailability: availability,
     })
     const skillId = 'ReachSkill1_'.slice(0, 12)
@@ -2131,12 +2141,12 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('makes health a fact about a role AND a project, not about a role alone', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const availability = new InMemoryAbilityAvailability()
     const roles = createRolesService({
       ...inMemoryAbilityPersistence(),
       catalog: loadBundledAbilityInventory,
-      library,
+      ...library.deps,
       abilityAvailability: availability,
     })
     const skillId = 'SharedSkill1'
@@ -2203,12 +2213,13 @@ describe('role catalog and owned libraries', () => {
    *  addresses the same server then answered 404 for, and the two writes that share
    *  those addresses answered 500 instead of 404 for the very same package. */
   it('answers one way about a package the projection has not caught up with', async () => {
-    const inner = createInMemoryRoleLibrary()
+    const inner = writableLibrary(createInMemoryRoleLibrary())
     const roles = createRolesService({
       ...inMemoryAbilityPersistence(),
       catalog: loadBundledAbilityInventory,
+      publication: inner.deps.publication,
       library: {
-        ...inner,
+        ...inner.deps.library,
         // A package on disk that the read model has not projected yet. The real library
         // calls this normal: external files land in a mount all the time.
         readableNoteIds: async (location, directoryNames) =>
@@ -2272,7 +2283,7 @@ describe('role catalog and owned libraries', () => {
     const roles = createRolesService({
       ...inMemoryAbilityPersistence(),
       catalog: loadBundledAbilityInventory,
-      library: createInMemoryRoleLibrary(),
+      ...writableLibrary(createInMemoryRoleLibrary()).deps,
     })
     const base = await roles.createCustomRole('review', 'Personal review.', 'The personal way.', {
       scope: 'personal',
@@ -2312,7 +2323,7 @@ describe('role catalog and owned libraries', () => {
     const roles = createRolesService({
       ...inMemoryAbilityPersistence(),
       catalog: loadBundledAbilityInventory,
-      library: createInMemoryRoleLibrary(),
+      ...writableLibrary(createInMemoryRoleLibrary()).deps,
     })
     const home = { scope: 'space', space: 'shared' } as const
     const skill = await roles.createCustomSkill('evidence', 'Evidence.', 'Gather it.', home)
@@ -2350,7 +2361,7 @@ describe('role catalog and owned libraries', () => {
     const roles = createRolesService({
       ...inMemoryAbilityPersistence(),
       catalog: loadBundledAbilityInventory,
-      library: createInMemoryRoleLibrary(),
+      ...writableLibrary(createInMemoryRoleLibrary()).deps,
     })
     const skill = await roles.createCustomSkill('evidence', 'Evidence.', 'Gather it.', {
       scope: 'personal',
@@ -2425,7 +2436,7 @@ describe('role catalog and owned libraries', () => {
     const roles = createRolesService({
       ...inMemoryAbilityPersistence(),
       catalog: loadBundledAbilityInventory,
-      library: createInMemoryRoleLibrary(),
+      ...writableLibrary(createInMemoryRoleLibrary()).deps,
     })
     const role = await roles.createCustomRole('review', 'Review.', 'The way.', {
       scope: 'space',
@@ -2456,7 +2467,7 @@ describe('role catalog and owned libraries', () => {
     const roles = createRolesService({
       ...inMemoryAbilityPersistence(),
       catalog: loadBundledAbilityInventory,
-      library: createInMemoryRoleLibrary(),
+      ...writableLibrary(createInMemoryRoleLibrary()).deps,
     })
     const role = await roles.createCustomRole('review', 'Review.', 'The way.', {
       scope: 'space',
@@ -2489,11 +2500,11 @@ describe('role catalog and owned libraries', () => {
   /** Resume refuses an unsound role. A surface that reports the binding as live has
    *  to refuse it too, or the page says a role is active while the agent has none. */
   it('reports no active saved role when resume would drop it as unsound', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const roles = createRolesService({
       ...inMemoryAbilityPersistence(),
       catalog: loadBundledAbilityInventory,
-      library,
+      ...library.deps,
     })
     const space = { scope: 'space' as const, space: 'shared' }
     const roleId = 'BrokenRole_1'
@@ -2540,10 +2551,6 @@ describe('role catalog and owned libraries', () => {
     await expect(roles.resolveSavedRole(context, SYSTEM_PRINCIPAL, locator)).resolves.toBeNull()
   })
 
-  /** Add installs dependencies and grants them reach BEFORE it publishes the role. A
-   *  dependency that already existed is REUSED, so that grant widens a skill the owner
-   *  already had — and if the role then fails to publish, the caller is told nothing
-   *  happened while the widening stays. `moveRolePlacement` compensates; this did not. */
   /** The preview claims it mirrors what the agent loads. A role whose attachment no
    *  longer resolves is refused by resume — so the preview has to say so, rather than
    *  drawing it as the selected role and charging its layer to the budget. */
@@ -2551,7 +2558,7 @@ describe('role catalog and owned libraries', () => {
     const roles = createRolesService({
       ...inMemoryAbilityPersistence(),
       catalog: loadBundledAbilityInventory,
-      library: createInMemoryRoleLibrary(),
+      ...writableLibrary(createInMemoryRoleLibrary()).deps,
     })
     const home = { scope: 'space', space: 'shared' } as const
     const skill = await roles.createCustomSkill('evidence', 'Evidence.', 'Gather it.', home)
@@ -2612,13 +2619,321 @@ describe('role catalog and owned libraries', () => {
     await expect(roles.effectiveRoleAt(context, SYSTEM_PRINCIPAL, locator)).resolves.toBeNull()
   })
 
-  it('does not widen a shared skill when the role it was added for fails to publish', async () => {
-    const library = createInMemoryRoleLibrary()
+  /** The placement plan of ONE Add, settled before any of it lands. A role is not
+   *  one package: its linked skills go to the home its dependencies live in, and the
+   *  role package to the target itself. A host that can publish one and not the other
+   *  used to discover that after the dependencies were already on disk. */
+  describe('the placement plan is settled before the first package lands', () => {
+    const projectPlacement = { scope: 'project', space: 'shared', projectId: 'project-b' } as const
+
+    /** One composition that refuses a writer for chosen placements, and counts every
+     *  resolve — so a case can assert both WHICH placements were asked for and that
+     *  each was asked exactly once. */
+    const countingComposition = (
+      composition: RoleLibraryComposition,
+      unavailable: (location: RoleLocation) => boolean = () => false,
+    ) => {
+      const key = (location: RoleLocation) =>
+        `${location.scope}:${location.space}:${location.projectId ?? ''}`
+      const asked: string[] = []
+      const resolved: string[] = []
+
+      return {
+        asked,
+        resolved,
+        deps: {
+          library: composition.library,
+          publication: {
+            availableFor: (target: RolePublicationTarget) => {
+              if (target.kind === 'prospective-personal') {
+                return composition.publication.availableFor(target)
+              }
+              asked.push(key(target.location))
+
+              return !unavailable(target.location) && composition.publication.availableFor(target)
+            },
+            publicationFor: async (location: RoleLocation) => {
+              resolved.push(key(location))
+
+              return unavailable(location) ? null : composition.publication.publicationFor(location)
+            },
+          },
+        },
+      }
+    }
+
+    it('refuses the whole Add when only the role placement is unpublishable', async () => {
+      const library = writableLibrary(createInMemoryRoleLibrary())
+      const availability = new InMemoryAbilityAvailability()
+      const composition = countingComposition(
+        library.deps,
+        (location) => location.scope === 'project',
+      )
+      const roles = createRolesService({
+        ...inMemoryAbilityPersistence(),
+        catalog: loadBundledAbilityInventory,
+        ...composition.deps,
+        abilityAvailability: availability,
+      })
+
+      await expect(roles.addFromCatalog('grooming', projectPlacement, null)).rejects.toBeInstanceOf(
+        RoleInstallUnavailableError,
+      )
+      // Both placements were asked about, and the refusal of one stopped the other
+      // before it wrote: no dependency package, no reach row, nothing to undo.
+      expect(composition.asked).toContain('project:shared:project-b')
+      expect(composition.resolved).not.toContain('project:shared:project-b')
+      await expect(
+        library.listManifests({ scope: 'space', space: 'shared' }),
+      ).resolves.toMatchObject({ packages: [] })
+      await expect(library.listManifests(projectPlacement)).resolves.toMatchObject({ packages: [] })
+    })
+
+    it('refuses it when only the dependency home is unpublishable', async () => {
+      const library = writableLibrary(createInMemoryRoleLibrary())
+      const composition = countingComposition(
+        library.deps,
+        (location) => location.scope === 'space',
+      )
+      const roles = createRolesService({
+        ...inMemoryAbilityPersistence(),
+        catalog: loadBundledAbilityInventory,
+        ...composition.deps,
+      })
+
+      await expect(roles.addFromCatalog('grooming', projectPlacement, null)).rejects.toBeInstanceOf(
+        RoleInstallUnavailableError,
+      )
+      await expect(library.listManifests(projectPlacement)).resolves.toMatchObject({ packages: [] })
+    })
+
+    it('resolves each distinct placement exactly once, and reuses one for a shared home', async () => {
+      const library = writableLibrary(createInMemoryRoleLibrary())
+      const composition = countingComposition(library.deps)
+      const roles = createRolesService({
+        ...inMemoryAbilityPersistence(),
+        catalog: loadBundledAbilityInventory,
+        ...composition.deps,
+      })
+
+      await roles.addFromCatalog('grooming', projectPlacement, null)
+      // Two distinct placements, two resolves — the dependency loop and the role
+      // write both used handles taken before either of them ran.
+      expect(composition.resolved).toEqual(['space:shared:', 'project:shared:project-b'])
+
+      composition.resolved.length = 0
+      // Personal keeps its dependencies at home, so one placement and ONE handle.
+      await roles.addFromCatalog('grooming', { scope: 'personal', space: 'personal' }, 'personal')
+      expect(composition.resolved).toEqual(['personal:personal:'])
+    })
+
+    it('keeps a compatible dependency that already landed when the role commit is refused', async () => {
+      const library = writableLibrary(createInMemoryRoleLibrary())
+      const availability = new InMemoryAbilityAvailability()
+      let refuse = true
+      const roles = createRolesService({
+        ...inMemoryAbilityPersistence(),
+        catalog: loadBundledAbilityInventory,
+        ...interceptPublication(library.deps, {
+          putIfAbsent: (location, _candidate, next) =>
+            location.scope === 'project' && refuse
+              ? Promise.reject(new RoleInstallUnavailableError('the medium refused this pathname'))
+              : next(),
+        }),
+        abilityAvailability: availability,
+      })
+
+      await expect(roles.addFromCatalog('grooming', projectPlacement, null)).rejects.toBeInstanceOf(
+        RoleInstallUnavailableError,
+      )
+      // The failing target is absent — but the dependency that DID land stays. The
+      // port has no package removal, and a retry is the honest way back.
+      await expect(library.listManifests(projectPlacement)).resolves.toMatchObject({ packages: [] })
+      const dependencies = await library.listManifests({ scope: 'space', space: 'shared' })
+      const dependency = await library.get({ scope: 'space', space: 'shared' }, 'grooming-evidence')
+
+      expect(dependencies.packages).toHaveLength(1)
+      expect(dependency).not.toBeNull()
+      await expect(availability.get('shared', dependency!.directoryName)).resolves.toMatchObject({
+        projectIds: ['project-b'],
+      })
+
+      refuse = false
+      await expect(roles.addFromCatalog('grooming', projectPlacement, null)).resolves.toMatchObject(
+        { name: 'grooming' },
+      )
+      // Retry converged on the SAME dependency rather than forking a second copy.
+      await expect(
+        library.listManifests({ scope: 'space', space: 'shared' }),
+      ).resolves.toMatchObject({ packages: dependencies.packages })
+    })
+
+    it('does not name a failure after the commit unavailable', async () => {
+      const library = writableLibrary(createInMemoryRoleLibrary())
+      const roles = createRolesService({
+        ...inMemoryAbilityPersistence(),
+        catalog: loadBundledAbilityInventory,
+        ...library.deps,
+      })
+
+      // The projection barrier runs AFTER the package is on disk. Answering
+      // "unavailable" here would invite a retry that then conflicts with the very
+      // package this call published.
+      library.deps.library.awaitReadableNoteIds = async () => {
+        throw new Error('the projection barrier timed out')
+      }
+
+      const failed = await roles
+        .addFromCatalog('grooming', projectPlacement, null)
+        .catch((error: unknown) => error)
+
+      expect(failed).not.toBeInstanceOf(RoleInstallUnavailableError)
+      expect(failed).toMatchObject({ message: 'the projection barrier timed out' })
+    })
+
+    it('keeps every stable package conflict ahead of publication refusal', async () => {
+      const composition = createInMemoryRoleLibrary()
+      const seeded = createRolesService({
+        ...inMemoryAbilityPersistence(),
+        catalog: loadBundledAbilityInventory,
+        ...composition,
+      })
+      const personal = { scope: 'personal', space: 'personal' } as const
+      const space = { scope: 'space', space: 'shared' } as const
+
+      await seeded.addFromCatalog('grooming', personal, 'personal')
+      await seeded.createCustomRole('custom-role', 'Custom role.', '# Custom role', personal)
+      await seeded.createCustomSkill('custom-skill', 'Custom skill.', '# Custom skill', personal)
+      await seeded.createCustomSkill('space-skill', 'Space skill.', '# Space skill', space)
+      const base = await seeded.createCustomRole(
+        'versioned-role',
+        'Versioned role.',
+        '# Versioned role',
+        space,
+      )
+      await seeded.createRoleVersion(
+        SYSTEM_PRINCIPAL,
+        spaceRoleLocator(base.packageId, space.space),
+        null,
+        'project-web',
+      )
+
+      const publicationFor = vi.fn(async () => null)
+      const refused = createRolesService({
+        ...inMemoryAbilityPersistence(),
+        catalog: loadBundledAbilityInventory,
+        library: composition.library,
+        publication: { availableFor: () => false, publicationFor },
+      })
+
+      await expect(refused.addFromCatalog('grooming', personal, 'personal')).rejects.toBeInstanceOf(
+        RoleAlreadyExistsError,
+      )
+      await expect(
+        refused.addSkillFromCatalog('grooming-evidence', personal),
+      ).rejects.toBeInstanceOf(SkillAlreadyExistsError)
+      await expect(
+        refused.createCustomRole('custom-role', 'Custom role.', '# Custom role', personal),
+      ).rejects.toBeInstanceOf(RoleAlreadyExistsError)
+      await expect(
+        refused.createCustomSkill('custom-skill', 'Custom skill.', '# Custom skill', personal),
+      ).rejects.toBeInstanceOf(SkillAlreadyExistsError)
+      await expect(
+        refused.createCustomSkill('space-skill', 'Space skill.', '# Space skill', space),
+      ).rejects.toBeInstanceOf(SkillAlreadyExistsError)
+      await expect(
+        refused.createRoleVersion(
+          SYSTEM_PRINCIPAL,
+          spaceRoleLocator(base.packageId, space.space),
+          null,
+          'project-web',
+        ),
+      ).rejects.toBeInstanceOf(RoleAlreadyExistsError)
+      expect(publicationFor).not.toHaveBeenCalled()
+    })
+
+    it('resolves a custom Space role publisher before writing reach metadata', async () => {
+      const composition = createInMemoryRoleLibrary()
+      const availability = new InMemoryAbilityAvailability()
+      const set = vi.spyOn(availability, 'set')
+      const publicationFor = vi.fn(async () => null)
+      const roles = createRolesService({
+        ...inMemoryAbilityPersistence(),
+        catalog: async () => [],
+        library: composition.library,
+        publication: { availableFor: () => true, publicationFor },
+        abilityAvailability: availability,
+      })
+
+      await expect(
+        roles.createCustomRole(
+          'custom-role',
+          'Custom role.',
+          '# Custom role',
+          { scope: 'space', space: 'shared' },
+          { availability: { mode: 'selected-projects', projectIds: ['project-web'] } },
+        ),
+      ).rejects.toBeInstanceOf(RoleInstallUnavailableError)
+      expect(publicationFor).toHaveBeenCalledOnce()
+      expect(set).not.toHaveBeenCalled()
+    })
+
+    it('maps authority name races to the dependency and final-role conflict domains', async () => {
+      const dependencyComposition = createInMemoryRoleLibrary()
+      const dependencyRoles = createRolesService({
+        ...inMemoryAbilityPersistence(),
+        catalog: loadBundledAbilityInventory,
+        ...interceptPublication(dependencyComposition, {
+          putIfAbsent: async () => {
+            throw Object.assign(new Error('name raced'), { code: 'SKILL_NAME_CONFLICT' })
+          },
+        }),
+      })
+
+      await expect(
+        dependencyRoles.addFromCatalog('grooming', projectPlacement, null),
+      ).rejects.toBeInstanceOf(RoleDependencyConflictError)
+
+      const roleComposition = createInMemoryRoleLibrary()
+      let writes = 0
+      const roleRoles = createRolesService({
+        ...inMemoryAbilityPersistence(),
+        catalog: loadBundledAbilityInventory,
+        ...interceptPublication(roleComposition, {
+          putIfAbsent: async (_location, _candidate, next) => {
+            writes++
+            if (writes === 2) {
+              throw Object.assign(new Error('name raced'), { code: 'SKILL_NAME_CONFLICT' })
+            }
+
+            return next()
+          },
+        }),
+      })
+
+      await expect(
+        roleRoles.addFromCatalog('grooming', projectPlacement, null),
+      ).rejects.toBeInstanceOf(RoleAlreadyExistsError)
+    })
+  })
+
+  it('retains a shared skill grant when the role it was added for fails to publish', async () => {
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const availability = new InMemoryAbilityAvailability()
     const roles = createRolesService({
       ...inMemoryAbilityPersistence(),
       catalog: loadBundledAbilityInventory,
-      library,
+      ...interceptPublication(library.deps, {
+        // Dependencies go to the Space home; the role itself is the LAST thing
+        // published and the only thing published at the project placement.
+        putIfAbsent: (location, _pkg, next) => {
+          if (location.scope === 'project') {
+            throw new Error('the destination refused the role package')
+          }
+
+          return next()
+        },
+      }),
       abilityAvailability: availability,
     })
     const dependency = await roles.addSkillFromCatalog(
@@ -2627,17 +2942,6 @@ describe('role catalog and owned libraries', () => {
       { mode: 'selected-projects', projectIds: ['project-a'] },
     )
     const reachBefore = await availability.get('shared', dependency.packageId)
-    const putIfAbsent = library.putIfAbsent.bind(library)
-
-    library.putIfAbsent = async (location, candidate) => {
-      // Dependencies go to the Space home; the role itself is the LAST thing published
-      // and the only thing published at the project placement.
-      if (location.scope === 'project') {
-        throw new Error('the destination refused the role package')
-      }
-
-      return putIfAbsent(location, candidate)
-    }
 
     await expect(
       roles.addFromCatalog(
@@ -2647,19 +2951,91 @@ describe('role catalog and owned libraries', () => {
       ),
     ).rejects.toThrow('the destination refused the role package')
 
-    await expect(availability.get('shared', dependency.packageId)).resolves.toEqual(reachBefore)
+    await expect(availability.get('shared', dependency.packageId)).resolves.toEqual({
+      ...reachBefore,
+      projectIds: ['project-a', 'project-b'],
+    })
   })
 
-  /** Compensation undoes what did NOT land. Once the role is published it is live, and
-   *  taking its dependencies' reach back left it effective and fail-closed forever —
-   *  with no way out, because Add then answers 409. */
+  it('does not erase a concurrent successful Add when an earlier role publication fails', async () => {
+    const library = writableLibrary(createInMemoryRoleLibrary())
+    const availability = new InMemoryAbilityAvailability()
+    const lateRefusal = new RoleInstallUnavailableError('the project-b role commit was refused')
+    let reachedLateCommit!: () => void
+    let refuseLateCommit!: () => void
+    const atLateCommit = new Promise<void>((resolve) => {
+      reachedLateCommit = resolve
+    })
+    const blockedCommit = new Promise<boolean>((_resolve, reject) => {
+      refuseLateCommit = () => reject(lateRefusal)
+    })
+    const roles = createRolesService({
+      ...inMemoryAbilityPersistence(),
+      catalog: loadBundledAbilityInventory,
+      ...interceptPublication(library.deps, {
+        putIfAbsent: (location, _pkg, next) => {
+          if (location.scope === 'project' && location.projectId === 'project-b') {
+            reachedLateCommit()
+            return blockedCommit
+          }
+
+          return next()
+        },
+      }),
+      abilityAvailability: availability,
+    })
+    const space = { scope: 'space', space: 'shared' } as const
+    const projectB = { scope: 'project', space: 'shared', projectId: 'project-b' } as const
+    const projectC = { scope: 'project', space: 'shared', projectId: 'project-c' } as const
+    const addB = roles.addFromCatalog('grooming', projectB, null)
+
+    await atLateCommit
+    const dependency = await library.get(space, 'grooming-evidence')
+
+    expect(dependency).not.toBeNull()
+    await expect(availability.get('shared', dependency!.directoryName)).resolves.toMatchObject({
+      projectIds: ['project-b'],
+    })
+
+    await expect(roles.addFromCatalog('grooming', projectC, null)).resolves.toMatchObject({
+      name: 'grooming',
+      projectId: 'project-c',
+    })
+    await expect(library.listManifests(space)).resolves.toMatchObject({
+      packages: [expect.objectContaining({ directoryName: dependency!.directoryName })],
+    })
+    refuseLateCommit()
+    await expect(addB).rejects.toBe(lateRefusal)
+
+    await expect(availability.get('shared', dependency!.directoryName)).resolves.toEqual({
+      homeSpace: 'shared',
+      packageId: dependency!.directoryName,
+      mode: 'selected-projects',
+      projectIds: ['project-b', 'project-c'],
+    })
+    await expect(
+      roles.loadEffective(
+        projectContext('project-c', 'shared'),
+        SYSTEM_PRINCIPAL,
+        'grooming',
+        4_000,
+      ),
+    ).resolves.toMatchObject({
+      role: { name: 'grooming' },
+      skills: [{ name: 'grooming-evidence' }],
+    })
+  })
+
+  /** Dependency-first Add keeps completed grants across every later failure. Once the
+   *  role is published, removing them would leave a live role permanently unhealthy:
+   *  retry cannot repair it because the role itself now conflicts. */
   it('keeps a landed role reachable when the step after publication fails', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const availability = new InMemoryAbilityAvailability()
     const roles = createRolesService({
       ...inMemoryAbilityPersistence(),
       catalog: loadBundledAbilityInventory,
-      library,
+      ...library.deps,
       abilityAvailability: availability,
     })
     const home = { scope: 'space', space: 'shared' } as const
@@ -2670,8 +3046,10 @@ describe('role catalog and owned libraries', () => {
     })
     const awaitReadable = library.awaitReadableNoteIds.bind(library)
 
-    // Fails AFTER putIfAbsent has landed the role at its placement.
-    library.awaitReadableNoteIds = async (location, ids) => {
+    // Fails AFTER putIfAbsent has landed the role at its placement. Patched on the
+    // object the SERVICE holds — the writable wrapper is a copy, and a service
+    // that never saw the patch would sail through the case.
+    library.deps.library.awaitReadableNoteIds = async (location, ids) => {
       if (location.scope === 'project') {
         throw new Error('the projection barrier timed out')
       }
@@ -2697,14 +3075,14 @@ describe('role catalog and owned libraries', () => {
    *  which a role narrowed to one project answers in every project of its Space —
    *  the invariant `createCustomRole` already states and orders itself by. */
   it('never leaves a promoted role reachable from a project it was narrowed away from', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const availability = new InMemoryAbilityAvailability()
     const insideTheWindow: unknown[] = []
     const set = availability.set.bind(availability)
     const roles = createRolesService({
       ...inMemoryAbilityPersistence(),
       catalog: loadBundledAbilityInventory,
-      library,
+      ...library.deps,
       abilityAvailability: availability,
       abilityPlacement: { moveOwnedRolePlacement: async () => {} },
     })
@@ -2743,7 +3121,7 @@ describe('role catalog and owned libraries', () => {
 
   it('promotes a version with its address, its state and a reach that does not widen', async () => {
     const moveOwnedRolePlacement = vi.fn(async () => {})
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const availability = new InMemoryAbilityAvailability()
     const reachWrites: unknown[][] = []
     const set = availability.set.bind(availability)
@@ -2755,7 +3133,7 @@ describe('role catalog and owned libraries', () => {
     const roles = createRolesService({
       ...inMemoryAbilityPersistence(),
       catalog: loadBundledAbilityInventory,
-      library,
+      ...library.deps,
       abilityAvailability: availability,
       abilityPlacement: { moveOwnedRolePlacement },
     })
@@ -2813,12 +3191,21 @@ describe('role catalog and owned libraries', () => {
 
   it('does not widen a role whose promotion could not be undone', async () => {
     const failure = new Error('meta-DB is unavailable')
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const availability = new InMemoryAbilityAvailability()
+    // The promotion itself goes through; only putting the package BACK is refused,
+    // so the role stays at the Space root whatever the rollback does about its reach.
+    let moves = 0
     const roles = createRolesService({
       ...inMemoryAbilityPersistence(),
       catalog: loadBundledAbilityInventory,
-      library,
+      ...interceptPublication(library.deps, {
+        moveFrom: (_into, _from, _directoryName, next) => {
+          moves += 1
+
+          return moves === 1 ? next() : Promise.resolve(false)
+        },
+      }),
       abilityAvailability: availability,
       abilityPlacement: {
         moveOwnedRolePlacement: async () => {
@@ -2831,16 +3218,6 @@ describe('role catalog and owned libraries', () => {
       space: 'shared',
       projectId: 'project-web',
     })
-    // The promotion itself goes through; only putting the package BACK is refused,
-    // so the role stays at the Space root whatever the rollback does about its reach.
-    const move = library.movePackage.bind(library)
-    let moves = 0
-
-    library.movePackage = async (from, to, directoryName) => {
-      moves += 1
-
-      return moves === 1 ? move(from, to, directoryName) : false
-    }
 
     await expect(
       roles.moveRolePlacement(
@@ -2864,10 +3241,10 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('keeps a promoted role turned off, on a host that has no meta-DB', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const roles = createRolesService({
       catalog: async () => [],
-      library,
+      ...library.deps,
       // The composition a host without a meta-DB actually gets. It holds a preference
       // table, so the placement adapter it is handed has to carry that row.
       ...inMemoryAbilityPersistence(),
@@ -2902,11 +3279,11 @@ describe('role catalog and owned libraries', () => {
 
   it('refuses to promote onto an occupied name before anything moves', async () => {
     const moveOwnedRolePlacement = vi.fn(async () => {})
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const roles = createRolesService({
       ...inMemoryAbilityPersistence(),
       catalog: loadBundledAbilityInventory,
-      library,
+      ...library.deps,
       abilityPlacement: { moveOwnedRolePlacement },
     })
     const base = await roles.createCustomRole('review', 'Team review.', 'The team way.', {
@@ -2946,12 +3323,12 @@ describe('role catalog and owned libraries', () => {
 
   it('puts a promoted package back when its durable pointers could not follow', async () => {
     const failure = new Error('meta-DB is unavailable')
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const availability = new InMemoryAbilityAvailability()
     const roles = createRolesService({
       ...inMemoryAbilityPersistence(),
       catalog: loadBundledAbilityInventory,
-      library,
+      ...library.deps,
       abilityAvailability: availability,
       abilityPlacement: {
         moveOwnedRolePlacement: async () => {

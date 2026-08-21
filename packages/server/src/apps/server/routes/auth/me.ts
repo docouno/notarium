@@ -91,6 +91,7 @@ import {
   ROLE_SCOPE,
   RoleAlreadyExistsError,
   RoleDependencyConflictError,
+  RoleInstallUnavailableError,
   type RolesService,
   SkillAlreadyExistsError,
   weighRoleContext,
@@ -467,11 +468,33 @@ export const meRoutes = async (
     return project
   }
 
+  /** One outward answer for "this deployment cannot publish a package there".
+   *  Stable by reason code, because it is not the caller's mistake and a retry
+   *  after the host is fixed is the only thing that changes it. */
+  const installUnavailable = (): AuthError =>
+    new AuthError(
+      HTTP_STATUS.SERVICE_UNAVAILABLE,
+      'role installation is unavailable for this location',
+      'role_install_unavailable',
+    )
+
   const skillPlacementFor = async (
     req: FastifyRequest,
     body: AddAgentSkillRequest | CreateAgentSkillRequest,
   ) => {
+    if (!roles) {
+      throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+    }
     if (body.scope === ROLE_SCOPE.personal) {
+      const existing = await peekPersonalSpace({ auth, spaces }, req.principal)
+
+      // Before the mint, not after it. A host that cannot publish a package must
+      // not leave a freshly created personal space behind as the only trace of a
+      // refused Add.
+      if (!existing && !roles.canAddSkillAt({ kind: 'prospective-personal' })) {
+        throw installUnavailable()
+      }
+
       return {
         location: { scope: ROLE_SCOPE.personal, space: await writablePersonalSpace(req) } as const,
         availability: undefined,
@@ -854,6 +877,27 @@ export const meRoutes = async (
         .slice(0, SKILL_PROJECT_SUMMARY_LIMIT)
         .map(({ project }) => project),
       ...(truncated ? { truncated: true } : {}),
+      // A skill takes one placement: Personal, or one shared Space. Keyed by
+      // space slug, which is what an Add names on the wire.
+      installAvailability: {
+        personal: roles.canAddSkillAt(
+          personal
+            ? { kind: 'location', location: { scope: ROLE_SCOPE.personal, space: personal } }
+            : { kind: 'prospective-personal' },
+        ),
+        spaces: Object.fromEntries(
+          scopedSpaces
+            .filter((space) => space !== personal && can(req.principal, 'space:write', { space }))
+            .map((space) => [
+              // The slug, because that is what an Add names on the wire.
+              spaces.slugOf(space) ?? space,
+              roles.canAddSkillAt({
+                kind: 'location',
+                location: { scope: ROLE_SCOPE.space, space },
+              }),
+            ]),
+        ),
+      },
     })
   })
 
@@ -893,6 +937,9 @@ export const meRoutes = async (
     } catch (error) {
       if (error instanceof SkillAlreadyExistsError) {
         throw new AuthError(HTTP_STATUS.CONFLICT, error.message, 'skill_exists')
+      }
+      if (error instanceof RoleInstallUnavailableError) {
+        throw installUnavailable()
       }
       throw error
     }
@@ -938,6 +985,9 @@ export const meRoutes = async (
         }
         if (error instanceof CatalogSkillNotFoundError) {
           throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+        }
+        if (error instanceof RoleInstallUnavailableError) {
+          throw installUnavailable()
         }
         throw error
       }
@@ -992,7 +1042,7 @@ export const meRoutes = async (
             ? 1
             : 0,
       )
-    const summaries = []
+    const summaries: ReturnType<typeof projectSummaryOf>[] = []
     let writableProjectCount = 0
 
     for (const source of projectSources) {
@@ -1180,6 +1230,32 @@ export const meRoutes = async (
       projects: summaries,
       activeRole,
       ...(inventoryTruncated ? { truncated: true } : {}),
+      // Asked of composition for exactly the targets this response offers.
+      // Nothing is minted here — a user who has never had a Personal space gets
+      // the prospective answer, not a space.
+      installAvailability: {
+        personal: roles.canAddRoleAt(
+          personal
+            ? { kind: 'location', location: { scope: ROLE_SCOPE.personal, space: personal } }
+            : { kind: 'prospective-personal' },
+          personal,
+        ),
+        projects: Object.fromEntries(
+          projectSources
+            .filter(({ project }) => summaries.includes(project))
+            .map(({ id, space, project }) => [
+              project.handle,
+              project.status === PROJECT_STATUS.active &&
+                roles.canAddRoleAt(
+                  {
+                    kind: 'location',
+                    location: { scope: ROLE_SCOPE.project, space, projectId: id },
+                  },
+                  personal,
+                ),
+            ]),
+        ),
+      },
     })
   })
 
@@ -1398,6 +1474,9 @@ export const meRoutes = async (
         if (error instanceof RoleAlreadyExistsError) {
           throw new AuthError(HTTP_STATUS.CONFLICT, error.message, 'role_exists')
         }
+        if (error instanceof RoleInstallUnavailableError) {
+          throw installUnavailable()
+        }
         throw error
       }
     },
@@ -1436,6 +1515,9 @@ export const meRoutes = async (
         if (error instanceof RoleAlreadyExistsError) {
           throw new AuthError(HTTP_STATUS.CONFLICT, error.message, 'role_exists')
         }
+        if (error instanceof RoleInstallUnavailableError) {
+          throw installUnavailable()
+        }
         throw error
       }
     },
@@ -1452,9 +1534,16 @@ export const meRoutes = async (
     if (!(await roles.hasCatalog(body.name))) {
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
     }
+    const personalSpace = await peekPersonalSpace({ auth, spaces }, req.principal)
     let location
 
     if (body.scope === ROLE_SCOPE.personal) {
+      // Before the mint: composition either can publish a Personal package or
+      // cannot, and finding out after `writablePersonalSpace` would leave a space
+      // created for an Add that never happened.
+      if (!personalSpace && !roles.canAddRoleAt({ kind: 'prospective-personal' }, personalSpace)) {
+        throw installUnavailable()
+      }
       location = { scope: ROLE_SCOPE.personal, space: await writablePersonalSpace(req) } as const
     } else {
       const project = await writableProject(req, body.project)
@@ -1466,11 +1555,7 @@ export const meRoutes = async (
       } as const
     }
     try {
-      const role = await roles.addFromCatalog(
-        body.name,
-        location,
-        await peekPersonalSpace({ auth, spaces }, req.principal),
-      )
+      const role = await roles.addFromCatalog(body.name, location, personalSpace)
       const locator = ownedRoleLocator(location, role.packageId)
       return reply.code(HTTP_STATUS.CREATED).send(
         AddAgentRoleResponseSchema.parse({
@@ -1492,6 +1577,12 @@ export const meRoutes = async (
       if (err instanceof CatalogRoleNotFoundError) {
         throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
       }
+      // ONLY this class. A raw errno caught here would answer "unavailable" for a
+      // package that is already on disk, and the retry it invites would then
+      // conflict with the install it claims never happened.
+      if (err instanceof RoleInstallUnavailableError) {
+        throw installUnavailable()
+      }
       throw err
     }
   })
@@ -1504,9 +1595,17 @@ export const meRoutes = async (
         throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
       }
       const body = CreateAgentRoleRequestSchema.parse(req.body ?? {})
+      const personalSpace = await peekPersonalSpace({ auth, spaces }, req.principal)
       let location
 
       if (body.scope === ROLE_SCOPE.personal) {
+        // Before the mint, for the same reason the catalog Add checks there.
+        if (
+          !personalSpace &&
+          !roles.canAddRoleAt({ kind: 'prospective-personal' }, personalSpace)
+        ) {
+          throw installUnavailable()
+        }
         location = { scope: ROLE_SCOPE.personal, space: await writablePersonalSpace(req) } as const
       } else if (body.scope === ROLE_SCOPE.space) {
         location = {
@@ -1540,7 +1639,7 @@ export const meRoutes = async (
           {
             principal: req.principal,
             attachments: body.attachments,
-            personalSpace: await peekPersonalSpace({ auth, spaces }, req.principal),
+            personalSpace,
             ...(availability ? { availability } : {}),
           },
         )
@@ -1566,6 +1665,9 @@ export const meRoutes = async (
         }
         if (error instanceof RoleDependencyConflictError) {
           throw new AuthError(HTTP_STATUS.CONFLICT, error.message, 'role_dependency_conflict')
+        }
+        if (error instanceof RoleInstallUnavailableError) {
+          throw installUnavailable()
         }
         throw error
       }

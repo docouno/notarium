@@ -18,6 +18,7 @@ import {
   createNotariumStore,
   type Embedder,
   ensureNotariumResourceAuthority,
+  NotariumStoreCompositionOwner,
   renameNoReplaceIfAvailable,
   type SearchTuning,
   SpaceResourceAuthorityRegistry,
@@ -49,6 +50,7 @@ import {
   createMarkerStore,
   discoverSpaceFolders,
   healSpaceMarker,
+  localFsAnchoredFiles,
   markFolderAsProject,
   readRootMarker,
   scanProjectsAtBoot,
@@ -98,25 +100,33 @@ export const PROFILE_MOUNT_PREFIX = '.notarium/profile'
  * templates do NOT live here: Add copies one into this owned, hidden mount. */
 export const SKILL_MOUNT_PREFIX = '.notarium/skills'
 
+/** Which classes a space gets, and where each sits under its notes dir. Split
+ *  from the builder below because the SHAPE of the policy has to be readable
+ *  without naming a space: composition answers "will a space this host has not
+ *  created yet have a library root" from here, rather than by inventing a
+ *  directory for one that does not exist. */
+const DEFAULT_MOUNT_LAYOUT = [
+  { class: NOTE_CLASS.userDoc, prefix: '' },
+  { class: NOTE_CLASS.agentMemory, prefix: AGENT_MOUNT_PREFIX },
+  { class: NOTE_CLASS.profile, prefix: PROFILE_MOUNT_PREFIX },
+  { class: NOTE_CLASS.skill, prefix: SKILL_MOUNT_PREFIX },
+] as const
+
+type MountLayoutEntry = (typeof DEFAULT_MOUNT_LAYOUT)[number]
+
+const SKILL_MOUNT_LAYOUT: MountLayoutEntry = DEFAULT_MOUNT_LAYOUT.find(
+  (entry) => entry.class === NOTE_CLASS.skill,
+)!
+
+const mountAt = (notesDir: string, entry: MountLayoutEntry): MountConfig => ({
+  class: entry.class,
+  dir: entry.prefix ? join(notesDir, entry.prefix) : notesDir,
+  prefix: entry.prefix,
+})
+
 /** Default mount set for a notarium space. */
-export const defaultMounts = (notesDir: string): MountConfig[] => [
-  { class: NOTE_CLASS.userDoc, dir: notesDir, prefix: '' },
-  {
-    class: NOTE_CLASS.agentMemory,
-    dir: join(notesDir, AGENT_MOUNT_PREFIX),
-    prefix: AGENT_MOUNT_PREFIX,
-  },
-  {
-    class: NOTE_CLASS.profile,
-    dir: join(notesDir, PROFILE_MOUNT_PREFIX),
-    prefix: PROFILE_MOUNT_PREFIX,
-  },
-  {
-    class: NOTE_CLASS.skill,
-    dir: join(notesDir, SKILL_MOUNT_PREFIX),
-    prefix: SKILL_MOUNT_PREFIX,
-  },
-]
+export const defaultMounts = (notesDir: string): MountConfig[] =>
+  DEFAULT_MOUNT_LAYOUT.map((entry) => mountAt(notesDir, entry))
 
 /** Resolve the exact mount set shared by the store and sidecar services. A
  * configured class mount is authoritative, including its physical directory. */
@@ -125,14 +135,7 @@ const mountsForConfig = (cfg: SpaceConfig, notesDir: string): MountConfig[] => {
 
   return mounts.some((mount) => mount.class === NOTE_CLASS.skill)
     ? mounts
-    : [
-        ...mounts,
-        {
-          class: NOTE_CLASS.skill,
-          dir: join(notesDir, SKILL_MOUNT_PREFIX),
-          prefix: SKILL_MOUNT_PREFIX,
-        },
-      ]
+    : [...mounts, mountAt(notesDir, SKILL_MOUNT_LAYOUT)]
 }
 
 /** Clamp a marker-borne label: a hand-planted `.notariummeta` bypasses the wire's
@@ -272,6 +275,10 @@ export const createServer = async ({
     dripMs: backgroundDripMs,
   })
   const resourceAuthorities = new SpaceResourceAuthorityRegistry()
+  // This process owns one physical adapter assembly per stable space id. The
+  // derived store may be cold or evicted while restore still needs the authority;
+  // both paths receive this same explicit composition instead of rebuilding it.
+  const storeCompositions = new NotariumStoreCompositionOwner()
   // 'password' without a meta-DB is a boot error, not a degraded mode — accepting
   // logins into a store that forgets them is worse than refusing to start. The
   // OAuth facet joins the SAME service so its tokens validate at one chokepoint.
@@ -306,14 +313,18 @@ export const createServer = async ({
       notesDir: join(spacesRoot, rec.notesDir),
     }
   }
-  // The `.notariummeta` marker owner, keyed by space id. A notes dir is only half
-  // of what WRITING one takes — the store settles the other half, the directory
-  // anchor, once at construction — so gate marker-backed mutations on
-  // `available(id)`, never on this closure's answer alone. Late-bound to the
+  // The `.notariummeta` marker owner, keyed by space id. Write availability joins
+  // the notes root, the verified host anchor and a conditional mutation factory,
+  // so gate marker-backed mutations on `available(id)`. Late-bound to the
   // manager below: only called at runtime, after init, so the reference is safe.
   // canon: docs/projects.md#the-notariummeta-marker-schema-parser-pin
   let notesDirOfId: (id: string) => string | null = () => null
-  const markerStore = createMarkerStore((id) => notesDirOfId(id))
+  const markerStore = createMarkerStore((id) => notesDirOfId(id), {
+    // Asked of the storage adapter once, at composition: a medium with no
+    // conditional file mutation cannot publish a marker, and this host says so
+    // up front rather than at the first Mark as project.
+    anchoredFilesForRoot: localFsAnchoredFiles(),
+  })
 
   // First-provision only (idempotent): mark the space root as a project — always
   // an addressable root so create_note works immediately — and seat the space id
@@ -354,6 +365,7 @@ export const createServer = async ({
     onPurge: spacesRoot
       ? async (rec) => {
           resourceAuthorities.remove(rec.id)
+          storeCompositions.remove(rec.id)
           const cfg = configForRec(rec)
           const root = resolve(spacesRoot)
           const dir = cfg?.notesDir ? resolve(cfg.notesDir) : null
@@ -457,10 +469,11 @@ export const createServer = async ({
       }
       const notesDir = cfg.notesDir
       const mounts = mountsForConfig(cfg, notesDir)
+      const composition = storeCompositions.getOrCreate(rec.id, mounts)
       const engine = createNotariumStore({
         spaceId: rec.id,
         resourceAuthorityRegistry: resourceAuthorities,
-        mounts,
+        composition,
         // Keyed by the stable notes_dir, not the (mutable) slug — a rename never
         // moves the index DB.
         indexDb: cfg.indexDb || join(engineDataDir, `${rec.notesDir}.db`),
@@ -507,10 +520,13 @@ export const createServer = async ({
       return null
     }
 
+    const mounts = mountsForConfig(cfg, cfg.notesDir)
+    const composition = storeCompositions.getOrCreate(rec.id, mounts)
+
     return ensureNotariumResourceAuthority({
       spaceId: rec.id,
       resourceAuthorityRegistry: resourceAuthorities,
-      mounts: mountsForConfig(cfg, cfg.notesDir),
+      composition,
     })
   }
   const restoreCoordinator =
@@ -550,6 +566,20 @@ export const createServer = async ({
           },
         })
       : undefined
+
+  /** The skill library root of one existing space, or `null` where this host
+   *  serves no library for it. One resolver, used by the library's reads and by
+   *  the prospective answer's no-mint branch. */
+  const skillRootForSpace = (space: string): string | null => {
+    const rec = manager.recOf(space)
+    const cfg = rec ? configForRec(rec) : undefined
+    const notesDir = cfg?.notesDir
+
+    return notesDir
+      ? (mountsForConfig(cfg, notesDir).find((mount) => mount.class === NOTE_CLASS.skill)?.dir ??
+          null)
+      : null
+  }
   const roles = createRolesService({
     catalog: loadBundledAbilityInventory,
     // Spelled either way round, never inherited: a spread that silently contributes
@@ -562,10 +592,19 @@ export const createServer = async ({
           abilityPlacement: metaDb.abilityPlacement,
         }
       : inMemoryAbilityPersistence()),
-    library: createFsRoleLibrary({
+    ...createFsRoleLibrary({
       // Asked of the runtime once, at composition: absent here means an install
       // is refused before it stages anything, not after it wrote a package.
       publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+      // Where a Personal Add that has not minted yet would land. A host that can
+      // mint reads the answer off the mount LAYOUT, which carries a skill library
+      // for every space it produces; one that cannot mint degrades to the first
+      // existing space, and that space's own configured root answers. Neither
+      // branch touches a disk or invents a root for a space nobody has created.
+      prospectivePersonalRoot: () =>
+        manager.capabilities.spaceCreate
+          ? DEFAULT_MOUNT_LAYOUT.some((entry) => entry.class === NOTE_CLASS.skill)
+          : skillRootForSpace(manager.list()[0]?.id ?? '') != null,
       authorityForSpace: async (space) => {
         await manager.store(space)
         return resourceAuthorities.get(space) ?? null
@@ -580,16 +619,7 @@ export const createServer = async ({
               ?.prefix ?? null)
           : null
       },
-      rootForSpace: (space) => {
-        const rec = manager.recOf(space)
-        const cfg = rec ? configForRec(rec) : undefined
-        const notesDir = cfg?.notesDir
-
-        return notesDir
-          ? (mountsForConfig(cfg, notesDir).find((mount) => mount.class === NOTE_CLASS.skill)
-              ?.dir ?? null)
-          : null
-      },
+      rootForSpace: skillRootForSpace,
       projectPublishedPackages: async (space, packages, options) => {
         const store = await manager.store(space)
 

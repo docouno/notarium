@@ -25,7 +25,7 @@ import {
   LEGACY_VERSION_KEY,
   planIndexMigration,
 } from './schema'
-import type { EngineMount } from './types'
+import { type EngineMount, engineMountOf } from './types'
 import { describeVector } from './vectorGate.fixture'
 
 describe('planIndexMigration', () => {
@@ -142,11 +142,8 @@ const writePath = async (
   return r.filePath
 }
 
-const userMount = (dir: string): EngineMount => ({
-  class: 'user-doc',
-  prefix: '',
-  files: createLocalFsFiles(dir),
-})
+const userMount = (dir: string): EngineMount =>
+  engineMountOf({ class: 'user-doc', prefix: '' }, createLocalFsFiles(dir))
 
 const indexVersion = (db: ReturnType<typeof createNodeSqliteDriver>) =>
   db

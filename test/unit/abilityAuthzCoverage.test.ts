@@ -11,6 +11,7 @@ import {
   type RoleLocation,
   type SkillHomeLocation,
 } from '../../packages/server/src/services/roles'
+import { writableLibrary } from '../roleLibraryComposition'
 
 /** Every entry of `RolesService` that asks `can()` and had no test able to see the
  *  answer. The whole file exists because of ONE property of the all-access host:
@@ -98,13 +99,13 @@ const projectContext = {
 }
 
 const world = () => {
-  const library = createInMemoryRoleLibrary()
+  const library = writableLibrary(createInMemoryRoleLibrary())
   const abilityAvailability = new InMemoryAbilityAvailability()
   const roles = createRolesService({
     ...inMemoryAbilityPersistence(),
     abilityAvailability,
     catalog: async () => [],
-    library,
+    ...library.deps,
   })
 
   return { roles, library, abilityAvailability }

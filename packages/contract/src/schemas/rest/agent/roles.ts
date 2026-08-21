@@ -81,6 +81,21 @@ export const MeAgentRolesResponseSchema = z.object({
   /** Honest bounded-view marker when the host has more role placements than one
    *  settings request may scan or return. */
   truncated: z.boolean().optional(),
+  /** Where this deployment can actually publish a role package. A storage backend
+   *  that cannot install one atomically is not a per-user setting and not an
+   *  error to discover after the click — the client offers only the targets that
+   *  answer true here.
+   *
+   *  `projects` is keyed by the exact value an Add would send — here a project
+   *  handle from `projects` above — and a Project is true only when BOTH its
+   *  placements are publishable: the role package goes to the project, its linked
+   *  skills to the Space. Optional on the wire for rolling clients, and a missing
+   *  field or key reads as `false` — an old response fails closed rather than
+   *  advertising an install the host would refuse. */
+  installAvailability: z
+    .object({ personal: z.boolean(), projects: z.record(z.string(), z.boolean()) })
+    .strict()
+    .optional(),
 })
 
 export const AddAgentRoleRequestSchema = z

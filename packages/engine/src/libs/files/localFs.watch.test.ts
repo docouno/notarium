@@ -29,7 +29,7 @@ describe('localFs.watch (#146)', () => {
     try {
       const files = createLocalFsFiles(root)
       const paths: Array<string | null> = []
-      const unwatch = files.watch!((path) => {
+      const unwatch = files.capabilities.watch!.watch((path) => {
         paths.push(path)
       })
       expect(unwatch).toBeTruthy() // recursive fs.watch engages on this platform
@@ -55,7 +55,7 @@ describe('localFs.watch (#146)', () => {
     try {
       const files = createLocalFsFiles(root)
       let hits = 0
-      const unwatch = files.watch!(() => {
+      const unwatch = files.capabilities.watch!.watch(() => {
         hits++
       })
 
@@ -89,13 +89,13 @@ describe('localFs.watch (#146)', () => {
       const fixed = new Date('2026-07-23T12:00:00.000Z')
       await fs.writeFile(path, 'AAAA')
       await fs.utimes(path, fixed, fixed)
-      const before = await files.stat('note.md')
+      const before = await files.base.stat('note.md')
       // Some filesystems quantize ctime to a scheduler tick. Cross that
       // boundary so this tests token semantics rather than timestamp resolution.
       await sleep(20)
       await fs.writeFile(path, 'BBBB')
       await fs.utimes(path, fixed, fixed)
-      const after = await files.stat('note.md')
+      const after = await files.base.stat('note.md')
 
       expect(after?.size).toBe(before?.size)
       expect(after?.mtimeMs).toBe(before?.mtimeMs)

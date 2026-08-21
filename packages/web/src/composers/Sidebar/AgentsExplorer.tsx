@@ -205,17 +205,30 @@ export const AgentsExplorer = ({
         } else {
           const previous = base as AgentsAbilityExplorerPage | null
           const items = previous ? [...previous.items] : []
+
           // Scoped to the active Space (design 15): the filter runs BEFORE the
           // global location cap, so the Space the user is actually in is listed
           // WHOLE instead of competing for a shared bounded scan. Personal rides
           // along regardless — it is the cross-space fallback and the server adds
           // it outside the scope.
-          const read = (at?: string) =>
-            (dataset === 'roles' ? api.agentRolesGet : api.agentSkillsGet)({
+          const read = async (at?: string): Promise<Omit<AgentsAbilityExplorerPage, 'pages'>> => {
+            const page = await (dataset === 'roles' ? api.agentRolesGet : api.agentSkillsGet)({
               limit: 30,
               ...scope,
               ...(at ? { cursor: at } : {}),
             })
+
+            // The two library responses deliberately carry different domain fields
+            // (`activeRole`, install projects/spaces). Explorer pagination needs only
+            // their shared row projection, so settle that projection here instead of
+            // making the generic cursor drain unify unrelated wire contracts.
+            return {
+              items: page.items,
+              projects: page.projects,
+              nextCursor: page.nextCursor,
+              truncated: page.truncated ?? false,
+            }
+          }
           const first = await read(cursor)
 
           if (!fresh()) {

@@ -16,6 +16,7 @@ import {
 } from '../packages/server/src/services/roles'
 import { itAtomicPublish } from './role-library-contract/atomicPublishGate'
 import { packageDirectoryOf } from './role-library-contract/roleLibraryContract'
+import { writableLibrary } from './roleLibraryComposition'
 
 let root: string
 const location = { scope: 'personal' as const, space: 'personal' }
@@ -37,10 +38,12 @@ describe('filesystem role library bounds', () => {
       join(root, directoryName, 'SKILL.md'),
       '---\nname: renamed-role\ndescription: Renamed role.\nmetadata:\n  notarium.kind: role\n---\n\nInstructions.',
     )
-    const library = createFsRoleLibrary({
-      publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
-      rootForSpace: () => root,
-    })
+    const library = writableLibrary(
+      createFsRoleLibrary({
+        publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+        rootForSpace: () => root,
+      }),
+    )
 
     await expect(library.getSkill(location, 'renamed-role')).resolves.toMatchObject({
       directoryName,
@@ -70,10 +73,12 @@ describe('filesystem role library bounds', () => {
         )
       }),
     )
-    const library = createFsRoleLibrary({
-      publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
-      rootForSpace: () => root,
-    })
+    const library = writableLibrary(
+      createFsRoleLibrary({
+        publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+        rootForSpace: () => root,
+      }),
+    )
 
     await expect(library.listManifests(location)).resolves.toMatchObject({ truncated: true })
     await expect(library.getSkill(location, 'role-299')).resolves.toMatchObject({
@@ -99,13 +104,15 @@ describe('filesystem role library bounds', () => {
       join(root, oversizedDirectory, 'resource.bin'),
       Buffer.alloc(8 * 1024 * 1024 + 1),
     )
-    const library = createFsRoleLibrary({
-      publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
-      rootForSpace: () => root,
-    })
+    const library = writableLibrary(
+      createFsRoleLibrary({
+        publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+        rootForSpace: () => root,
+      }),
+    )
     const roles = createRolesService({
       catalog: async () => [],
-      library,
+      ...library.deps,
       ...inMemoryAbilityPersistence(),
     })
 
@@ -128,13 +135,15 @@ describe('filesystem role library bounds', () => {
   })
 
   it('reports occupied invalid role and dependency targets as stable Add conflicts', async () => {
-    const library = createFsRoleLibrary({
-      publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
-      rootForSpace: () => root,
-    })
+    const library = writableLibrary(
+      createFsRoleLibrary({
+        publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+        rootForSpace: () => root,
+      }),
+    )
     const roles = createRolesService({
       catalog: loadBundledAbilityInventory,
-      library,
+      ...library.deps,
       ...inMemoryAbilityPersistence(),
     })
 
@@ -165,15 +174,18 @@ describe('filesystem role library bounds', () => {
   })
 
   it('does not disguise a real dependency I/O failure as a content conflict', async () => {
-    const library = createFsRoleLibrary({
-      publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
-      rootForSpace: () => root,
-    })
+    const library = writableLibrary(
+      createFsRoleLibrary({
+        publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+        rootForSpace: () => root,
+      }),
+    )
     const failure = new Error('storage unavailable')
     const roles = createRolesService({
       catalog: loadBundledAbilityInventory,
+      publication: library.deps.publication,
       library: {
-        ...library,
+        ...library.deps.library,
         exists: async (_where, name) => name === 'grooming-evidence',
         get: async () => {
           throw failure
@@ -198,10 +210,12 @@ describe('filesystem role library bounds', () => {
       join(root, 'not-a-package', 'assets', 'large.bin'),
       Buffer.alloc(8 * 1024 * 1024 + 1),
     )
-    const library = createFsRoleLibrary({
-      publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
-      rootForSpace: () => root,
-    })
+    const library = writableLibrary(
+      createFsRoleLibrary({
+        publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+        rootForSpace: () => root,
+      }),
+    )
 
     await expect(library.listManifests(location)).resolves.toEqual({
       packages: [expect.objectContaining({ directoryName: wantedDirectory })],
@@ -223,13 +237,15 @@ describe('filesystem role library bounds', () => {
       join(root, longDirectory, 'SKILL.md'),
       `---\nname: too-long\ndescription: Too long.\nmetadata:\n  notarium.kind: role\n---\n\n${'x'.repeat(300_000)}`,
     )
-    const library = createFsRoleLibrary({
-      publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
-      rootForSpace: () => root,
-    })
+    const library = writableLibrary(
+      createFsRoleLibrary({
+        publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+        rootForSpace: () => root,
+      }),
+    )
     const roles = createRolesService({
       catalog: async () => [],
-      library,
+      ...library.deps,
       ...inMemoryAbilityPersistence(),
     })
 
@@ -245,10 +261,12 @@ describe('filesystem role library bounds', () => {
   })
 
   it('rejects traversal paths before writing outside the package directory', async () => {
-    const library = createFsRoleLibrary({
-      publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
-      rootForSpace: () => root,
-    })
+    const library = writableLibrary(
+      createFsRoleLibrary({
+        publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+        rootForSpace: () => root,
+      }),
+    )
 
     await expect(
       library.putIfAbsent(location, {
@@ -264,10 +282,12 @@ describe('filesystem role library bounds', () => {
   itAtomicPublish(
     'keeps project roots separate from a same-named Personal or Space package',
     async () => {
-      const library = createFsRoleLibrary({
-        publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
-        rootForSpace: () => root,
-      })
+      const library = writableLibrary(
+        createFsRoleLibrary({
+          publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+          rootForSpace: () => root,
+        }),
+      )
       const projectId = 'project-root'
       const project = { scope: 'project' as const, space: 'personal', projectId }
       const packageOf = (name: string) => ({
@@ -294,7 +314,7 @@ describe('filesystem role library bounds', () => {
         packages: [expect.objectContaining({ directoryName: packageDirectoryOf('project-role') })],
         truncated: false,
       })
-      expect((await createLocalFsFiles(root).scan()).map((entry) => entry.path)).toContain(
+      expect((await createLocalFsFiles(root).base.scan()).map((entry) => entry.path)).toContain(
         `_projects/${Buffer.from(projectId).toString('base64url')}/${packageDirectoryOf('project-role')}/SKILL.md`,
       )
     },

@@ -175,6 +175,19 @@ is never overwritten by a later catalog release. Add publishes a package into it
 an occupied target — a complete package, an empty or partially restored directory, a file, a symlink — is
 reported as a conflict and left byte-for-byte intact, never replaced.
 
+**Where a package may be installed is a property of the deployment, and it is answered before
+the Add.** Both library listings carry `installAvailability`: roles return
+`{ personal, projects }`, keyed by project handle, while skills return `{ personal, spaces }`,
+keyed by space slug. A client therefore offers only destinations this host can publish to. The
+field is optional on the wire and
+a missing field or key reads as unavailable, so an older response fails closed. A role is TWO
+placements, its package and the home its linked skills live in, and a target is offered only
+when both are publishable. A direct POST to an unavailable target answers `503` with reason
+`role_install_unavailable`, before a personal space is minted or a byte is staged; the same
+typed answer covers a commit the medium refuses on one pathname, and in either case nothing was
+published there. It is not a rollback of the whole request: linked skills already published for
+this role stay, and a retry reuses them rather than forking a second copy.
+
 Roles may be owned at Personal, Space, or Project placement, with human effective precedence
 `Owned Project > Owned Space > Owned Personal > System`; their Project packages live under the reserved
 `.notarium/skills/_projects/<encoded-project-id>/<package-id>/` root. Adding a Catalog role targets

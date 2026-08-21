@@ -22,11 +22,14 @@ import {
   createLocalFsFiles,
   createNodeSqliteDriver,
   createNotariumStore,
-  type FileStore,
+  engineMountOf,
+  type FileStoreAssembly,
   NotariumStore,
+  resourceAuthorityAdapterOf,
   SpaceResourceAuthority,
 } from '@notarium/engine'
 
+import { withFacets } from './fileStoreAssembly'
 import { describeKnowledgeStoreContract } from './storeContract'
 
 describeKnowledgeStoreContract('NotariumStore (localfs + sqlite)', async () => {
@@ -67,14 +70,13 @@ describe('NotariumStore raw export convergence', () => {
   it('skips a source that vanishes between inventory and read', async () => {
     const notesDir = mkdtempSync(join(tmpdir(), 'notarium-export-vanish-'))
     writeFileSync(join(notesDir, 'note.md'), '---\ntitle: Note\n---\n\nbody')
-    const base = createLocalFsFiles(notesDir)
+    const adapter = createLocalFsFiles(notesDir)
     let vanish = false
-    const files: FileStore = {
-      ...base,
-      read: async (path) => (vanish ? null : base.read(path)),
-    }
+    const files = withFacets(adapter, {
+      base: { read: async (path) => (vanish ? null : adapter.base.read(path)) },
+    })
     const store = new NotariumStore({
-      mounts: [{ class: 'user-doc', prefix: '', files }],
+      mounts: [engineMountOf({ class: 'user-doc', prefix: '' }, files)],
       sql: createNodeSqliteDriver(':memory:'),
     })
 
@@ -640,7 +642,7 @@ describe('NotariumStore — a planned destination taken by a stranger', () => {
         '---\nnotarium-id: NewcomerBB\ntitle: Note\n---\n\nthe newcomer',
       )
     const authority = new SpaceResourceAuthority('stranger-race', [
-      { id: 'root', prefix: '', files, physicalRoot: notesDir },
+      resourceAuthorityAdapterOf({ id: 'root', prefix: '', physicalRoot: notesDir }, files),
     ])
     const racing = new Proxy(authority, {
       get: (target, key: string) => {
@@ -664,7 +666,7 @@ describe('NotariumStore — a planned destination taken by a stranger', () => {
       },
     })
     const store = new NotariumStore({
-      mounts: [{ class: 'user-doc', prefix: '', files }],
+      mounts: [engineMountOf({ class: 'user-doc', prefix: '' }, files)],
       sql: createNodeSqliteDriver(':memory:'),
       resourceAuthority: racing,
     })
@@ -690,29 +692,29 @@ describe('NotariumStore — a planned destination taken by a stranger', () => {
     // owner-conflict branch there could be deleted while the authority test stayed
     // green.
     const notesDir = staged()
-    const files = createLocalFsFiles(notesDir)
+    const adapter = createLocalFsFiles(notesDir)
+    const mutation = adapter.capabilities.conditionalFileMutation!
     let plant = true
-    const racingFiles = new Proxy(files, {
-      get: (target, key, receiver) => {
-        if (key !== 'writeIfAbsent') {
-          return Reflect.get(target, key, receiver)
-        }
+    const racingFiles = withFacets(adapter, {
+      capabilities: {
+        conditionalFileMutation: {
+          ...mutation,
+          writeIfAbsent: async (path: string, content: string) => {
+            if (plant) {
+              plant = false
+              writeFileSync(
+                join(notesDir, path),
+                '---\nnotarium-id: NewcomerBB\ntitle: Note\n---\n\nthe newcomer',
+              )
+            }
 
-        return async (path: string, content: string) => {
-          if (plant) {
-            plant = false
-            writeFileSync(
-              join(notesDir, path),
-              '---\nnotarium-id: NewcomerBB\ntitle: Note\n---\n\nthe newcomer',
-            )
-          }
-
-          return await target.writeIfAbsent!(path, content)
-        }
+            return await mutation.writeIfAbsent(path, content)
+          },
+        },
       },
     })
     const store = new NotariumStore({
-      mounts: [{ class: 'user-doc', prefix: '', files: racingFiles }],
+      mounts: [engineMountOf({ class: 'user-doc', prefix: '' }, racingFiles)],
       sql: createNodeSqliteDriver(':memory:'),
     })
 
@@ -730,8 +732,12 @@ describe('NotariumStore — a planned destination taken by a stranger', () => {
 })
 
 describe('NotariumStore — case-insensitive path occupancy', () => {
-  const caseInsensitiveFiles = (notesDir: string): FileStore => {
-    const base = createLocalFsFiles(notesDir)
+  const caseInsensitiveFiles = (notesDir: string): FileStoreAssembly => {
+    const adapter = createLocalFsFiles(notesDir)
+    const base = adapter.base
+    const identity = adapter.capabilities.entryIdentity!
+    const noReplace = adapter.capabilities.fileNoReplaceMove!
+    const mutation = adapter.capabilities.conditionalFileMutation!
     const key = (path: string) => path.normalize('NFC').toLocaleLowerCase()
 
     const actualPath = async (path: string): Promise<string> => {
@@ -746,41 +752,51 @@ describe('NotariumStore — case-insensitive path occupancy', () => {
       )
     }
 
-    return {
-      ...base,
-      stat: async (path) => base.stat(await actualPath(path)),
-      read: async (path) => base.read(await actualPath(path)),
-      exists: async (path) => base.exists(await actualPath(path)),
-      dirExists: async (path) => base.dirExists(await actualPath(path)),
-      sameEntry: async (left, right) =>
-        base.sameEntry!(await actualPath(left), await actualPath(right)),
-      rename: async (from, to) => base.rename(await actualPath(from), to),
-      renameIfAbsent: async (from, to) => {
-        const actualDestination = await actualPath(to)
+    return withFacets(adapter, {
+      base: {
+        stat: async (path) => base.stat(await actualPath(path)),
+        read: async (path) => base.read(await actualPath(path)),
+        exists: async (path) => base.exists(await actualPath(path)),
+        dirExists: async (path) => base.dirExists(await actualPath(path)),
+        rename: async (from, to) => base.rename(await actualPath(from), to),
+        renameDir: async (from, to) => base.renameDir(await actualPath(from), to),
+        removeDir: async (path) => base.removeDir(await actualPath(path)),
+        makeDir: async (path) => {
+          const actual = await actualPath(path)
 
-        if (await base.exists(actualDestination)) {
-          return false
-        }
-
-        return base.renameIfAbsent!(await actualPath(from), to)
+          return (await base.dirExists(actual)) ? false : base.makeDir(path)
+        },
       },
-      replaceIfAbsent: async (from, to, expectedSource, content) => {
-        const actualDestination = await actualPath(to)
+      capabilities: {
+        entryIdentity: {
+          sameEntry: async (left, right) =>
+            identity.sameEntry(await actualPath(left), await actualPath(right)),
+        },
+        fileNoReplaceMove: {
+          renameIfAbsent: async (from, to) => {
+            const actualDestination = await actualPath(to)
 
-        if (await base.exists(actualDestination)) {
-          return false
-        }
+            if (await base.exists(actualDestination)) {
+              return false
+            }
 
-        return base.replaceIfAbsent!(await actualPath(from), to, expectedSource, content)
+            return noReplace.renameIfAbsent(await actualPath(from), to)
+          },
+        },
+        conditionalFileMutation: {
+          ...mutation,
+          replaceIfAbsent: async (from, to, expectedSource, content) => {
+            const actualDestination = await actualPath(to)
+
+            if (await base.exists(actualDestination)) {
+              return false
+            }
+
+            return mutation.replaceIfAbsent(await actualPath(from), to, expectedSource, content)
+          },
+        },
       },
-      renameDir: async (from, to) => base.renameDir(await actualPath(from), to),
-      removeDir: async (path) => base.removeDir(await actualPath(path)),
-      makeDir: async (path) => {
-        const actual = await actualPath(path)
-
-        return (await base.dirExists(actual)) ? false : base.makeDir(path)
-      },
-    }
+    })
   }
 
   it('refuses a rename onto a distinct hardlink pathname without changing either name', async () => {
@@ -808,7 +824,9 @@ describe('NotariumStore — case-insensitive path occupancy', () => {
   it('allows a case-only rename when both spellings are the same entry', async () => {
     const notesDir = mkdtempSync(join(tmpdir(), 'notarium-case-rename-'))
     writeFileSync(join(notesDir, 'Foo.md'), '---\ntitle: Foo\n---\n\nold')
-    const base = createLocalFsFiles(notesDir)
+    const adapter = createLocalFsFiles(notesDir)
+    const base = adapter.base
+    const identity = adapter.capabilities.entryIdentity!
 
     const actualPath = async (path: string): Promise<string> => {
       if (await base.exists(path)) {
@@ -821,17 +839,22 @@ describe('NotariumStore — case-insensitive path occupancy', () => {
       )
     }
 
-    const files: FileStore = {
-      ...base,
-      stat: async (path) => base.stat(await actualPath(path)),
-      read: async (path) => base.read(await actualPath(path)),
-      exists: async (path) => base.exists(await actualPath(path)),
-      sameEntry: async (left, right) =>
-        base.sameEntry!(await actualPath(left), await actualPath(right)),
-      rename: async (from, to) => base.rename(await actualPath(from), to),
-    }
+    const files = withFacets(adapter, {
+      base: {
+        stat: async (path) => base.stat(await actualPath(path)),
+        read: async (path) => base.read(await actualPath(path)),
+        exists: async (path) => base.exists(await actualPath(path)),
+        rename: async (from, to) => base.rename(await actualPath(from), to),
+      },
+      capabilities: {
+        entryIdentity: {
+          sameEntry: async (left, right) =>
+            identity.sameEntry(await actualPath(left), await actualPath(right)),
+        },
+      },
+    })
     const store = new NotariumStore({
-      mounts: [{ class: 'user-doc', prefix: '', files }],
+      mounts: [engineMountOf({ class: 'user-doc', prefix: '' }, files)],
       sql: createNodeSqliteDriver(':memory:'),
     })
 
@@ -851,7 +874,7 @@ describe('NotariumStore — case-insensitive path occupancy', () => {
     mkdirSync(join(notesDir, 'Docs'), { recursive: true })
     writeFileSync(join(notesDir, 'Docs/A.md'), '---\ntitle: A\n---\n\nbody')
     const store = new NotariumStore({
-      mounts: [{ class: 'user-doc', prefix: '', files: caseInsensitiveFiles(notesDir) }],
+      mounts: [engineMountOf({ class: 'user-doc', prefix: '' }, caseInsensitiveFiles(notesDir))],
       sql: createNodeSqliteDriver(':memory:'),
     })
 
@@ -878,10 +901,11 @@ describe('NotariumStore — case-insensitive path occupancy', () => {
     writeFileSync(join(notesDir, 'docs/a.md'), '---\ntitle: A\n---\n\nbody')
     // What an unsupported deployment now hands the store: the capability is
     // ABSENT, not present-and-throwing, so the refusal has to come off the shape.
-    const files: FileStore = { ...createLocalFsFiles(notesDir) }
-    delete files.renameDirIfAbsent
+    const files = withFacets(createLocalFsFiles(notesDir), {
+      capabilities: { directoryNoReplaceMove: undefined },
+    })
     const store = new NotariumStore({
-      mounts: [{ class: 'user-doc', prefix: '', files }],
+      mounts: [engineMountOf({ class: 'user-doc', prefix: '' }, files)],
       sql: createNodeSqliteDriver(':memory:'),
     })
 
@@ -903,7 +927,7 @@ describe('NotariumStore — case-insensitive path occupancy', () => {
     mkdirSync(join(notesDir, 'Docs'), { recursive: true })
     writeFileSync(join(notesDir, 'Docs/A.md'), '---\ntitle: A\n---\n\nbody')
     const store = new NotariumStore({
-      mounts: [{ class: 'user-doc', prefix: '', files: caseInsensitiveFiles(notesDir) }],
+      mounts: [engineMountOf({ class: 'user-doc', prefix: '' }, caseInsensitiveFiles(notesDir))],
       sql: createNodeSqliteDriver(':memory:'),
     })
 
@@ -926,7 +950,7 @@ describe('NotariumStore — case-insensitive path occupancy', () => {
     mkdirSync(join(notesDir, 'Empty'), { recursive: true })
     writeFileSync(join(notesDir, 'Source.md'), '---\ntitle: Source\n---\n\n[[empty/New]]')
     const store = new NotariumStore({
-      mounts: [{ class: 'user-doc', prefix: '', files: caseInsensitiveFiles(notesDir) }],
+      mounts: [engineMountOf({ class: 'user-doc', prefix: '' }, caseInsensitiveFiles(notesDir))],
       sql: createNodeSqliteDriver(':memory:'),
     })
 
@@ -953,13 +977,13 @@ describe('NotariumStore — case-insensitive path occupancy', () => {
     const refusalWithout = async (accelerator: boolean): Promise<string> => {
       const notesDir = mkdtempSync(join(tmpdir(), 'notarium-spelling-parity-'))
       mkdirSync(join(notesDir, 'Empty'), { recursive: true })
-      const files = caseInsensitiveFiles(notesDir)
-
-      if (!accelerator) {
-        delete files.dirExistsExact
-      }
+      const files = accelerator
+        ? caseInsensitiveFiles(notesDir)
+        : withFacets(caseInsensitiveFiles(notesDir), {
+            accelerators: { exactDirectorySpelling: undefined },
+          })
       const store = new NotariumStore({
-        mounts: [{ class: 'user-doc', prefix: '', files }],
+        mounts: [engineMountOf({ class: 'user-doc', prefix: '' }, files)],
         sql: createNodeSqliteDriver(':memory:'),
       })
 
@@ -993,7 +1017,7 @@ describe('NotariumStore — case-insensitive path occupancy', () => {
 
     mkdirSync(join(notesDir, 'foo:bar'), { recursive: true })
     const store = new NotariumStore({
-      mounts: [{ class: 'user-doc', prefix: '', files: caseInsensitiveFiles(notesDir) }],
+      mounts: [engineMountOf({ class: 'user-doc', prefix: '' }, caseInsensitiveFiles(notesDir))],
       sql: createNodeSqliteDriver(':memory:'),
     })
 
@@ -1024,7 +1048,7 @@ describe('NotariumStore — case-insensitive path occupancy', () => {
     mkdirSync(join(notesDir, 'Docs'), { recursive: true })
     writeFileSync(join(notesDir, 'Docs/A.md'), '---\ntitle: A\n---\n\nbody')
     const store = new NotariumStore({
-      mounts: [{ class: 'user-doc', prefix: '', files: caseInsensitiveFiles(notesDir) }],
+      mounts: [engineMountOf({ class: 'user-doc', prefix: '' }, caseInsensitiveFiles(notesDir))],
       sql: createNodeSqliteDriver(':memory:'),
     })
 
@@ -1051,17 +1075,22 @@ describe('NotariumStore — case-insensitive path occupancy', () => {
     const notesDir = mkdtempSync(join(tmpdir(), 'notarium-note-rename-race-'))
     const sourceBytes = '---\ntitle: Source\n---\n\nsource body'
     writeFileSync(join(notesDir, 'source.md'), sourceBytes)
-    const base = createLocalFsFiles(notesDir)
+    const adapter = createLocalFsFiles(notesDir)
+    const mutation = adapter.capabilities.conditionalFileMutation!
     const rivalBytes = '---\ntitle: Rival\n---\n\nrival body'
-    const files: FileStore = {
-      ...base,
-      replaceIfAbsent: async (from, to, expectedSource, content) => {
-        writeFileSync(join(notesDir, to), rivalBytes)
-        return base.replaceIfAbsent!(from, to, expectedSource, content)
+    const files = withFacets(adapter, {
+      capabilities: {
+        conditionalFileMutation: {
+          ...mutation,
+          replaceIfAbsent: async (from, to, expectedSource, content) => {
+            writeFileSync(join(notesDir, to), rivalBytes)
+            return mutation.replaceIfAbsent(from, to, expectedSource, content)
+          },
+        },
       },
-    }
+    })
     const store = new NotariumStore({
-      mounts: [{ class: 'user-doc', prefix: '', files }],
+      mounts: [engineMountOf({ class: 'user-doc', prefix: '' }, files)],
       sql: createNodeSqliteDriver(':memory:'),
     })
 
@@ -1084,22 +1113,23 @@ describe('NotariumStore — case-insensitive path occupancy', () => {
     const sourceBytes = '---\ntitle: Source\nnotarium-id: ORIGINAL1234\n---\n\nsource body'
     const externalBytes = '---\ntitle: External\nnotarium-id: EXTERNAL9999\n---\n\nexternal body'
     writeFileSync(join(notesDir, 'source.md'), sourceBytes)
-    const base = createLocalFsFiles(notesDir)
+    const adapter = createLocalFsFiles(notesDir)
     let inject = false
-    const files: FileStore = {
-      ...base,
-      read: async (path) => {
-        if (inject && path === 'source.md') {
-          inject = false
-          writeFileSync(join(notesDir, 'external.md'), externalBytes)
-          renameSync(join(notesDir, 'external.md'), join(notesDir, path))
-        }
+    const files = withFacets(adapter, {
+      base: {
+        read: async (path) => {
+          if (inject && path === 'source.md') {
+            inject = false
+            writeFileSync(join(notesDir, 'external.md'), externalBytes)
+            renameSync(join(notesDir, 'external.md'), join(notesDir, path))
+          }
 
-        return base.read(path)
+          return adapter.base.read(path)
+        },
       },
-    }
+    })
     const store = new NotariumStore({
-      mounts: [{ class: 'user-doc', prefix: '', files }],
+      mounts: [engineMountOf({ class: 'user-doc', prefix: '' }, files)],
       sql: createNodeSqliteDriver(':memory:'),
     })
 
@@ -1121,17 +1151,22 @@ describe('NotariumStore — case-insensitive path occupancy', () => {
     const sourceBytes = '---\ntitle: Source\nnotarium-id: ORIGINAL1234\n---\n\nsource body'
     const externalBytes = '---\ntitle: External\nnotarium-id: EXTERNAL9999\n---\n\nexternal body'
     writeFileSync(join(notesDir, 'source.md'), sourceBytes)
-    const base = createLocalFsFiles(notesDir)
-    const files: FileStore = {
-      ...base,
-      replaceIfAbsent: async (from, to, expectedSource, content) => {
-        writeFileSync(join(notesDir, 'external.md'), externalBytes)
-        renameSync(join(notesDir, 'external.md'), join(notesDir, from))
-        return base.replaceIfAbsent!(from, to, expectedSource, content)
+    const adapter = createLocalFsFiles(notesDir)
+    const mutation = adapter.capabilities.conditionalFileMutation!
+    const files = withFacets(adapter, {
+      capabilities: {
+        conditionalFileMutation: {
+          ...mutation,
+          replaceIfAbsent: async (from, to, expectedSource, content) => {
+            writeFileSync(join(notesDir, 'external.md'), externalBytes)
+            renameSync(join(notesDir, 'external.md'), join(notesDir, from))
+            return mutation.replaceIfAbsent(from, to, expectedSource, content)
+          },
+        },
       },
-    }
+    })
     const store = new NotariumStore({
-      mounts: [{ class: 'user-doc', prefix: '', files }],
+      mounts: [engineMountOf({ class: 'user-doc', prefix: '' }, files)],
       sql: createNodeSqliteDriver(':memory:'),
     })
 
@@ -1150,18 +1185,23 @@ describe('NotariumStore — case-insensitive path occupancy', () => {
   it('does not delete a file that replaces the indexed note during removal', async () => {
     const notesDir = mkdtempSync(join(tmpdir(), 'notarium-note-delete-race-'))
     writeFileSync(join(notesDir, 'source.md'), '---\ntitle: Source\n---\n\nsource body')
-    const base = createLocalFsFiles(notesDir)
+    const adapter = createLocalFsFiles(notesDir)
+    const mutation = adapter.capabilities.conditionalFileMutation!
     const externalBytes = '---\ntitle: External\n---\n\nexternal body'
-    const files: FileStore = {
-      ...base,
-      removeIfUnchanged: async (path, expectedContent) => {
-        writeFileSync(join(notesDir, 'external.md'), externalBytes)
-        renameSync(join(notesDir, 'external.md'), join(notesDir, path))
-        return base.removeIfUnchanged!(path, expectedContent)
+    const files = withFacets(adapter, {
+      capabilities: {
+        conditionalFileMutation: {
+          ...mutation,
+          removeIfUnchanged: async (path, expectedContent) => {
+            writeFileSync(join(notesDir, 'external.md'), externalBytes)
+            renameSync(join(notesDir, 'external.md'), join(notesDir, path))
+            return mutation.removeIfUnchanged(path, expectedContent)
+          },
+        },
       },
-    }
+    })
     const store = new NotariumStore({
-      mounts: [{ class: 'user-doc', prefix: '', files }],
+      mounts: [engineMountOf({ class: 'user-doc', prefix: '' }, files)],
       sql: createNodeSqliteDriver(':memory:'),
     })
 
@@ -1221,15 +1261,11 @@ describe('NotariumStore — case-insensitive path occupancy', () => {
   it('fails closed when storage lacks conditional create and delete primitives', async () => {
     const notesDir = mkdtempSync(join(tmpdir(), 'notarium-note-capabilities-'))
     writeFileSync(join(notesDir, 'source.md'), '---\ntitle: Source\n---\n\nsource body')
-    const base = createLocalFsFiles(notesDir)
-    const files: FileStore = {
-      ...base,
-      writeIfAbsent: undefined,
-      replaceIfAbsent: undefined,
-      removeIfUnchanged: undefined,
-    }
+    const files = withFacets(createLocalFsFiles(notesDir), {
+      capabilities: { conditionalFileMutation: undefined },
+    })
     const store = new NotariumStore({
-      mounts: [{ class: 'user-doc', prefix: '', files }],
+      mounts: [engineMountOf({ class: 'user-doc', prefix: '' }, files)],
       sql: createNodeSqliteDriver(':memory:'),
     })
 

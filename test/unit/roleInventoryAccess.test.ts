@@ -7,6 +7,7 @@ import {
   inMemoryAbilityPersistence,
   type RoleLocation,
 } from '../../packages/server/src/services/roles'
+import { writableLibrary } from '../roleLibraryComposition'
 
 const SPACE: RoleLocation = { scope: 'space', space: 'shared' }
 
@@ -24,11 +25,11 @@ const reader = (spaces: readonly string[]): Principal => ({
 
 describe('owned ability inventory — the placement is enumerated, so the grant is asked here', () => {
   it('answers an empty page for a Space the caller cannot read', async () => {
-    const library = createInMemoryRoleLibrary()
+    const library = writableLibrary(createInMemoryRoleLibrary())
     const roles = createRolesService({
       ...inMemoryAbilityPersistence(),
       catalog: async () => [],
-      library,
+      ...library.deps,
     })
 
     await roles.createCustomRole('review', 'Team review.', 'The team way.', SPACE)

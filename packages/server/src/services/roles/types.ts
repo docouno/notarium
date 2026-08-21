@@ -60,6 +60,13 @@ export type AddressedProjectPlacement = AddressedPlacement & { projectId: string
 export type SkillHomeLocation = RoleLocation & { scope: SkillHomeScope; projectId?: never }
 export type RoleHomeLocation = RoleLocation
 
+/** Where a package is about to go, in the two shapes a caller can actually name.
+ *  A Personal Add starts before its space exists, so its target cannot be a
+ *  location yet — and answering it by minting one would be the mutation the
+ *  preflight it feeds exists to avoid. */
+export type RolePublicationTarget =
+  { kind: 'prospective-personal' } | { kind: 'location'; location: RoleLocation }
+
 export type EffectiveRoleContext = {
   personalSpace: string | null
   project?: ProjectRecord
@@ -344,6 +351,23 @@ export type RolesService = {
    *  dependencies live depends on it: Personal IS the root of that space, so a role
    *  placed in a project of it takes personal skills, not Space ones. `null` is a
    *  real answer — a host or principal with no personal space. */
+  /** Can this deployment publish EVERY placement a role Add at that target would
+   *  write to? A role is not one package: its linked skills go to the home its
+   *  dependencies live in, and the role package to the target itself, so a host
+   *  that can publish one and not the other must not offer the target at all.
+   *
+   *  Pure — no space is minted, no authority or store is built, no path is
+   *  probed — so a read model may ask it for every target it lists, and an Add
+   *  may ask it before the first byte of durable state exists. `personalSpace`
+   *  is the caller's own space, because it decides where dependencies live.
+   *
+   *  True does not promise a particular pathname: presence answers for the
+   *  deployment, and the commit itself can still refuse one target. That refusal
+   *  is `RoleInstallUnavailableError`: its failing package was not published, while
+   *  dependency packages and grants completed earlier in the Add remain reusable. */
+  canAddRoleAt(target: RolePublicationTarget, personalSpace: string | null): boolean
+  /** The same question for a skill, which is one package in one placement. */
+  canAddSkillAt(target: RolePublicationTarget): boolean
   addFromCatalog(
     name: string,
     location: RoleLocation,

@@ -3,10 +3,16 @@ import { lstat, mkdir, open, opendir, rm, writeFile } from 'node:fs/promises'
 import { dirname, join, relative as relativePath } from 'node:path'
 
 import { isGeneratedNoteId, isSkillName } from '@notarium/core'
-import type { AdmissionMode, SpaceResourceAuthority } from '@notarium/engine'
+import {
+  type AdmissionMode,
+  FilePackagePublicationUnavailableError,
+  type PackagePublicationView,
+  type SpaceResourceAuthority,
+} from '@notarium/engine'
+import { RoleInstallUnavailableError } from './errors'
 import { isReclaimableInstallStaging } from './installStaging'
 import { MAX_SKILL_FILE_BYTES, MAX_SKILL_MANIFEST_BYTES, parseSkillFile } from './skillFile'
-import type { RoleLocation } from './types'
+import type { RoleLocation, RolePublicationTarget } from './types'
 
 const MAX_PACKAGE_FILES = 256
 const MAX_PACKAGE_BYTES = 8 * 1024 * 1024
@@ -74,14 +80,6 @@ export type RoleLibrary = {
   get(location: RoleLocation, name: string): Promise<SkillPackage | null>
   /** Complete package bytes by immutable owned package address. */
   getByDirectory(location: RoleLocation, directoryName: string): Promise<SkillPackage | null>
-  putIfAbsent(location: RoleLocation, pkg: SkillPackage): Promise<boolean>
-  /** Move one package between two placements of the SAME space, keeping its
-   *  address. `false` — the destination pathname or manifest name was taken and
-   *  nothing moved. This is an external move as far as the note read-model is
-   *  concerned: the id lives in the file's frontmatter, so it survives the path
-   *  change ([P7](docs/architecture.md#p7)) — which is the whole reason a
-   *  promotion moves the directory instead of republishing its bytes. */
-  movePackage(from: RoleLocation, to: RoleLocation, directoryName: string): Promise<boolean>
   /** Cross the host's read-model publication barrier and return the actual note
    *  identity for every package address (the two differ after claim arbitration).
    *  For WRITES only: the barrier reconciles file truth and blocks mutations across
@@ -100,7 +98,44 @@ export type RoleLibrary = {
   ): Promise<ReadonlyMap<string, string>>
 }
 
-export type InMemoryRoleLibrary = RoleLibrary & { clear(): void }
+/** One placement's writer, already bound to its target. The location is not a
+ *  parameter: it was settled during preflight, and a handle that still accepted
+ *  one could be handed the wrong placement halfway through a multi-package Add. */
+export type RolePackagePublication = {
+  putIfAbsent(pkg: SkillPackage): Promise<boolean>
+  /** Move one package into THIS placement from another placement of the SAME
+   *  space, keeping its address. `false` — the destination pathname or manifest
+   *  name was taken and nothing moved. This is an external move as far as the
+   *  note read-model is concerned: the id lives in the file's frontmatter, so it
+   *  survives the path change ([P7](docs/architecture.md#p7)) — which is the whole
+   *  reason a promotion moves the directory instead of republishing its bytes. */
+  moveFrom(source: RoleLocation, directoryName: string): Promise<boolean>
+}
+
+export type RolePackagePublicationPolicy = {
+  /** Pure composition answer: can this deployment publish a package at this
+   *  target at all? No space is minted, no authority or store is built, no path
+   *  is probed — so a read model may ask it for every target it lists. */
+  availableFor(target: RolePublicationTarget): boolean
+  /** The writer for one settled placement, or `null` when the prerequisites are
+   *  incomplete. Resolving one prepares nothing: no root, no sweep, no staging. */
+  publicationFor(location: RoleLocation): Promise<RolePackagePublication | null>
+}
+
+/** What a composition root gets: the read side and the write side, separately.
+ *  Everything that reads works on a deployment that cannot publish at all. */
+export type RoleLibraryComposition = {
+  library: RoleLibrary
+  publication: RolePackagePublicationPolicy
+}
+
+/** The same PAIR a filesystem composition returns, plus a reset. Test paths get
+ *  no shortcut around the write boundary: a package reaches storage through a
+ *  target-bound handle here too, or the tests would prove a seam production does
+ *  not have. */
+export type InMemoryRoleLibraryComposition = RoleLibraryComposition & {
+  library: RoleLibrary & { clear(): void }
+}
 
 export const validateSkillPackage = (pkg: SkillPackage): void => {
   if (
@@ -324,12 +359,19 @@ export type PublishDirectoryIfAbsent = (source: string, target: string) => Promi
 
 export const createFsRoleLibrary = ({
   rootForSpace,
+  prospectivePersonalRoot = () => false,
   publishDirectoryIfAbsent,
   authorityForSpace,
   resourcePrefixForSpace,
   projectPublishedPackages,
 }: {
   rootForSpace(space: string): string | null
+  /** Whether a Personal placement this host has not created yet will have a
+   *  library root. Declared by the composition root from the SAME mount policy a
+   *  minted space is built with — never by probing a filesystem or by inventing a
+   *  root path for a space that does not exist. Absent ⇒ a Personal Add on a
+   *  host that has not minted yet is refused rather than guessed at. */
+  prospectivePersonalRoot?(): boolean
   /** REQUIRED to pass, allowed to be `undefined`: every composition root has to
    *  state what the runtime it built on can do, and a library that inherited an
    *  absent capability must be indistinguishable — in tests too — from one built
@@ -338,7 +380,7 @@ export const createFsRoleLibrary = ({
   authorityForSpace?(space: string): Promise<SpaceResourceAuthority | null>
   resourcePrefixForSpace?(space: string): string | null
   projectPublishedPackages?: ProjectPublishedRolePackages
-}): RoleLibrary => {
+}): RoleLibraryComposition => {
   const projectNoteIds = async (
     location: RoleLocation,
     directoryNames: readonly string[],
@@ -514,6 +556,23 @@ export const createFsRoleLibrary = ({
       location.scope === 'project'
         ? `_projects/${projectDirectory(location.projectId!)}/${name}`
         : name
+
+    return prefix ? `${prefix}/${relative}` : relative
+  }
+
+  const resourcePlacementPath = (location: RoleLocation): string | null => {
+    const prefix = resourcePrefixForSpace?.(location.space)
+
+    if (prefix == null) {
+      return null
+    }
+    if (location.scope === 'project' && !location.projectId) {
+      throw new Error('project role location requires projectId')
+    }
+    if (location.scope !== 'project') {
+      return prefix
+    }
+    const relative = `_projects/${projectDirectory(location.projectId!)}`
 
     return prefix ? `${prefix}/${relative}` : relative
   }
@@ -696,7 +755,214 @@ export const createFsRoleLibrary = ({
       }
     })
 
-  return {
+  /** One placement's writer, resolved once and then held. Resolving it prepares
+   *  nothing — no root, no sweep, no staging — so a caller may settle every
+   *  target of a multi-package Add before the first of them mutates anything.
+   *  The FS root, its real-directory/symlink guard, the placement fence and the
+   *  stale-staging sweep stay owned here; only the moment they run moves. */
+  const publicationAt = async (location: RoleLocation): Promise<RolePackagePublication | null> => {
+    if (!publishDirectoryIfAbsent || rootForSpace(location.space) == null) {
+      return null
+    }
+    const { mount, root } = rootsOf(location)
+    const publish = publishDirectoryIfAbsent
+    const authorityChannelConfigured =
+      authorityForSpace !== undefined || resourcePrefixForSpace !== undefined
+    let authorityPublication: PackagePublicationView | null = null
+
+    if (authorityChannelConfigured) {
+      const authority = await authorityForSpace?.(location.space)
+      const placementPath = resourcePlacementPath(location)
+
+      if (!authority || placementPath == null) {
+        return null
+      }
+      authorityPublication = authority.packagePublicationFor(placementPath, 'role-put-placement')
+      if (!authorityPublication) {
+        return null
+      }
+    }
+
+    const authorityCommitting = async <T>(commit: () => Promise<T>): Promise<T> => {
+      try {
+        return await commit()
+      } catch (err) {
+        // The authority protocol continues after the aggregate rename to prove
+        // its result. Only its producer-local typed refusal guarantees that the
+        // package did not land; a raw errno here may come from post-commit proof.
+        if (err instanceof FilePackagePublicationUnavailableError) {
+          throw new RoleInstallUnavailableError(
+            'role installation is unavailable for this location',
+          )
+        }
+        throw err
+      }
+    }
+
+    /** Direct FS has no proof protocol after this callback: it is the primitive
+     *  commit itself, so its narrow raw pathname refusal still proves that the
+     *  target was not published. */
+    const directCommitting = async (commit: () => Promise<boolean>): Promise<boolean> => {
+      try {
+        return await commit()
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code
+
+        if (
+          err instanceof FilePackagePublicationUnavailableError ||
+          code === 'ENOTSUP' ||
+          code === 'EXDEV'
+        ) {
+          throw new RoleInstallUnavailableError(
+            'role installation is unavailable for this location',
+          )
+        }
+        throw err
+      }
+    }
+
+    return {
+      putIfAbsent: async (pkg: SkillPackage) => {
+        validateSkillPackage(pkg)
+        if (!isGeneratedNoteId(pkg.directoryName)) {
+          throw new InvalidSkillPackageError(
+            `invalid owned Agent Skill package address: ${pkg.directoryName}`,
+          )
+        }
+        const manifestName = parseSkillFile(
+          Buffer.from(pkg.files.get('SKILL.md')!).toString('utf8'),
+          pkg.directoryName,
+        ).name
+
+        await prepareRoot(location, mount, root)
+        await sweepStaleStaging(mount, root)
+        const authorityResourcePath = resourcePackagePath(location, pkg.directoryName)
+
+        if (authorityPublication) {
+          if (authorityResourcePath == null) {
+            throw new Error('role library has no projected resource path')
+          }
+
+          return await authorityCommitting(async () => {
+            const published = await authorityPublication.publishIfAbsent({
+              rootPath: authorityResourcePath,
+              files: [...pkg.files].map(([path, content]) => ({ path, content })),
+            })
+
+            return published.status === 'published'
+          })
+        }
+        const release = await acquirePlacementFence(root)
+
+        try {
+          if (
+            (await manifestIndex(location)).has(manifestName) ||
+            (await pathOccupied(join(root, manifestName)))
+          ) {
+            return false
+          }
+
+          return await withPackageAdmission(
+            location,
+            pkg.directoryName,
+            'exclusive',
+            'role-put-package',
+            async () => {
+              const target = join(root, pkg.directoryName)
+              const temp = join(root, `.${pkg.directoryName}.install-${randomUUID()}`)
+              await mkdir(temp, { recursive: false })
+
+              try {
+                for (const [file, content] of pkg.files) {
+                  const path = join(temp, ...file.split('/'))
+                  await mkdir(dirname(path), { recursive: true })
+                  await writeFile(path, content, { flag: 'wx' })
+                }
+
+                // One atomic pathname publication: any occupied target is a
+                // conflict, and an unsupported medium fails without a raceable
+                // fallback.
+                return await directCommitting(() => publish(temp, target))
+              } finally {
+                await rm(temp, { recursive: true, force: true }).catch((err: Error) => {
+                  // This process created a possible orphan after the last sweep.
+                  // Make the next install keep checking until it can reclaim it.
+                  sweeps.delete(root)
+                  console.warn(`[roles] failed to remove install staging ${temp}:`, err.message)
+                })
+              }
+            },
+          )
+        } finally {
+          release()
+        }
+      },
+
+      moveFrom: async (origin: RoleLocation, directoryName: string) => {
+        const from = origin
+        const to = location
+
+        if (!isGeneratedNoteId(directoryName)) {
+          throw new InvalidSkillPackageError(
+            `invalid owned Agent Skill package address: ${directoryName}`,
+          )
+        }
+        if (from.space !== to.space) {
+          throw new Error('a package move cannot cross spaces')
+        }
+        const source = join(rootOf(from), directoryName)
+        const target = join(root, directoryName)
+
+        if (source === target) {
+          throw new Error('a package move needs two different placements')
+        }
+        const manifest = await skillAt(from, directoryName)
+
+        if (!manifest) {
+          return false
+        }
+        const manifestName = parseSkillFile(
+          Buffer.from(manifest.files.get('SKILL.md')!).toString('utf8'),
+          directoryName,
+        ).name
+
+        await prepareRoot(to, mount, root)
+
+        // The destination's placement lease wraps the whole critical section, exactly as
+        // publication's does: the name check and the publication that acts on it are one
+        // decision, and the packages that could take that name have other ids.
+        return await withPlacementAdmission(to, directoryName, 'role-move-placement', async () => {
+          const release = await acquirePlacementFence(root)
+
+          try {
+            if (
+              (await manifestIndex(to)).has(manifestName) ||
+              (await pathOccupied(join(root, manifestName)))
+            ) {
+              return false
+            }
+
+            // Both sides admitted, destination first. The order is fixed so two moves can
+            // never hold each other's half.
+            return await withPackageAdmission(
+              to,
+              directoryName,
+              'exclusive',
+              'role-move-target',
+              () =>
+                withPackageAdmission(from, directoryName, 'exclusive', 'role-move-source', () =>
+                  directCommitting(() => publish(source, target)),
+                ),
+            )
+          } finally {
+            release()
+          }
+        })
+      },
+    }
+  }
+
+  const library: RoleLibrary = {
     listManifests: async (location) => {
       const root = rootOf(location)
       let directory
@@ -856,173 +1122,23 @@ export const createFsRoleLibrary = ({
         },
       )
     },
-    putIfAbsent: async (location, pkg) => {
-      validateSkillPackage(pkg)
-      if (!isGeneratedNoteId(pkg.directoryName)) {
-        throw new InvalidSkillPackageError(
-          `invalid owned Agent Skill package address: ${pkg.directoryName}`,
-        )
-      }
-      const { mount, root } = rootsOf(location)
-      const manifestName = parseSkillFile(
-        Buffer.from(pkg.files.get('SKILL.md')!).toString('utf8'),
-        pkg.directoryName,
-      ).name
-
-      // After the two pure refusals and before the first byte touches disk. A
-      // deployment that cannot publish atomically must leave no library root, no
-      // stale sweep and no staging tree behind to be found later.
-      if (!publishDirectoryIfAbsent) {
-        throw Object.assign(new Error('atomic role package publication is unavailable'), {
-          code: 'ENOTSUP',
-        })
-      }
-      await prepareRoot(location, mount, root)
-      await sweepStaleStaging(mount, root)
-      const context = await authorityContext(location, pkg.directoryName)
-
-      if (context) {
-        const lease = await context.authority.admitSkillPlacement(
-          `${context.resourcePath}/SKILL.md`,
-          'exclusive',
-          'role-put-placement',
-        )
-
-        try {
-          const observed = await context.authority.observeStrictAdmitted(context.resourcePath)
-
-          if (observed.kind !== 'absent') {
-            return false
-          }
-          await context.authority.assertSkillManifestNameAvailableAdmitted(
-            `${context.resourcePath}/SKILL.md`,
-            pkg.files.get('SKILL.md')!,
-          )
-          const published = await context.authority.publishPackageIfAbsentAdmitted({
-            rootPath: context.resourcePath,
-            files: [...pkg.files].map(([path, content]) => ({ path, content })),
-            expectedRoot: observed.claim,
-          })
-
-          return published.status === 'published'
-        } finally {
-          lease.settle()
-        }
-      }
-      const release = await acquirePlacementFence(root)
-
-      try {
-        if (
-          (await manifestIndex(location)).has(manifestName) ||
-          (await pathOccupied(join(root, manifestName)))
-        ) {
-          return false
-        }
-
-        return await withPackageAdmission(
-          location,
-          pkg.directoryName,
-          'exclusive',
-          'role-put-package',
-          async () => {
-            const target = join(root, pkg.directoryName)
-            const temp = join(root, `.${pkg.directoryName}.install-${randomUUID()}`)
-            await mkdir(temp, { recursive: false })
-
-            try {
-              for (const [file, content] of pkg.files) {
-                const path = join(temp, ...file.split('/'))
-                await mkdir(dirname(path), { recursive: true })
-                await writeFile(path, content, { flag: 'wx' })
-              }
-
-              // One atomic pathname publication: any occupied target is a
-              // conflict, and an unsupported medium fails without a raceable
-              // fallback.
-              return await publishDirectoryIfAbsent(temp, target)
-            } finally {
-              await rm(temp, { recursive: true, force: true }).catch((err: Error) => {
-                // This process created a possible orphan after the last sweep.
-                // Make the next install keep checking until it can reclaim it.
-                sweeps.delete(root)
-                console.warn(`[roles] failed to remove install staging ${temp}:`, err.message)
-              })
-            }
-          },
-        )
-      } finally {
-        release()
-      }
-    },
-    movePackage: async (from, to, directoryName) => {
-      if (!isGeneratedNoteId(directoryName)) {
-        throw new InvalidSkillPackageError(
-          `invalid owned Agent Skill package address: ${directoryName}`,
-        )
-      }
-      if (from.space !== to.space) {
-        throw new Error('a package move cannot cross spaces')
-      }
-      const source = join(rootOf(from), directoryName)
-      const { mount, root } = rootsOf(to)
-      const target = join(root, directoryName)
-
-      if (source === target) {
-        throw new Error('a package move needs two different placements')
-      }
-      // Same refusal as `putIfAbsent`, and for the same reason: a deployment that
-      // cannot move a pathname atomically must say so before it touches anything.
-      if (!publishDirectoryIfAbsent) {
-        throw Object.assign(new Error('atomic role package publication is unavailable'), {
-          code: 'ENOTSUP',
-        })
-      }
-      const manifest = await skillAt(from, directoryName)
-
-      if (!manifest) {
-        return false
-      }
-      const manifestName = parseSkillFile(
-        Buffer.from(manifest.files.get('SKILL.md')!).toString('utf8'),
-        directoryName,
-      ).name
-
-      await prepareRoot(to, mount, root)
-
-      // The destination's placement lease wraps the whole critical section, exactly as
-      // publication's does: the name check and the publication that acts on it are one
-      // decision, and the packages that could take that name have other ids.
-      return await withPlacementAdmission(to, directoryName, 'role-move-placement', async () => {
-        const release = await acquirePlacementFence(root)
-
-        try {
-          if (
-            (await manifestIndex(to)).has(manifestName) ||
-            (await pathOccupied(join(root, manifestName)))
-          ) {
-            return false
-          }
-
-          // Both sides admitted, destination first. The order is fixed so two moves can
-          // never hold each other's half.
-          return await withPackageAdmission(
-            to,
-            directoryName,
-            'exclusive',
-            'role-move-target',
-            () =>
-              withPackageAdmission(from, directoryName, 'exclusive', 'role-move-source', () =>
-                publishDirectoryIfAbsent(source, target),
-              ),
-          )
-        } finally {
-          release()
-        }
-      })
-    },
     awaitReadableNoteIds: (location, directoryNames) =>
       projectNoteIds(location, directoryNames, true),
     readableNoteIds: (location, directoryNames) => projectNoteIds(location, directoryNames, false),
+  }
+
+  return {
+    library,
+    publication: {
+      // Pure, and deliberately so: a read model asks this for every target it
+      // lists, so it may not mint a space, build an authority or touch a disk.
+      availableFor: (target) =>
+        publishDirectoryIfAbsent !== undefined &&
+        (target.kind === 'prospective-personal'
+          ? prospectivePersonalRoot()
+          : rootForSpace(target.location.space) != null),
+      publicationFor: publicationAt,
+    },
   }
 }
 
@@ -1038,7 +1154,7 @@ export const createInMemoryRoleLibrary = ({
    *  listing. Recorded rather than simulated, because the twin has no honest way to
    *  lag: its packages ARE its projection. */
   onBarrier?: (location: RoleLocation, directoryNames: readonly string[]) => void
-} = {}): InMemoryRoleLibrary => {
+} = {}): InMemoryRoleLibraryComposition => {
   const nameableManifest = (name: string): boolean => isSkillName(name)
   const packages = new Map<string, SkillPackage>()
   const prefixOf = (location: RoleLocation): string =>
@@ -1081,7 +1197,47 @@ export const createInMemoryRoleLibrary = ({
     return matches[0]?.[1] ?? null
   }
 
-  return {
+  const putIfAbsent = async (location: RoleLocation, pkg: SkillPackage): Promise<boolean> => {
+    validateSkillPackage(pkg)
+    if (!isGeneratedNoteId(pkg.directoryName)) {
+      throw new InvalidSkillPackageError(
+        `invalid owned Agent Skill package address: ${pkg.directoryName}`,
+      )
+    }
+    const key = keyOf(location, pkg.directoryName)
+    const name = manifestNameOf(pkg)
+
+    if (packages.has(key) || (name != null && packageByName(location, name) != null)) {
+      return false
+    }
+    packages.set(key, clone(pkg))
+    return true
+  }
+
+  const movePackage = async (
+    from: RoleLocation,
+    to: RoleLocation,
+    directoryName: string,
+  ): Promise<boolean> => {
+    if (from.space !== to.space) {
+      throw new Error('a package move cannot cross spaces')
+    }
+    const pkg = packages.get(keyOf(from, directoryName))
+
+    if (!pkg) {
+      return false
+    }
+    const name = manifestNameOf(pkg)
+
+    if (packages.has(keyOf(to, directoryName)) || (name != null && packageByName(to, name))) {
+      return false
+    }
+    packages.delete(keyOf(from, directoryName))
+    packages.set(keyOf(to, directoryName), pkg)
+    return true
+  }
+
+  const library = {
     listManifests: async (location) => ({
       packages: [...packages]
         .filter(([key]) => key.startsWith(prefixOf(location)))
@@ -1132,40 +1288,6 @@ export const createInMemoryRoleLibrary = ({
       const pkg = packages.get(keyOf(location, directoryName))
       return pkg ? clone(pkg) : null
     },
-    putIfAbsent: async (location, pkg) => {
-      validateSkillPackage(pkg)
-      if (!isGeneratedNoteId(pkg.directoryName)) {
-        throw new InvalidSkillPackageError(
-          `invalid owned Agent Skill package address: ${pkg.directoryName}`,
-        )
-      }
-      const key = keyOf(location, pkg.directoryName)
-      const name = manifestNameOf(pkg)
-
-      if (packages.has(key) || (name != null && packageByName(location, name) != null)) {
-        return false
-      }
-      packages.set(key, clone(pkg))
-      return true
-    },
-    movePackage: async (from, to, directoryName) => {
-      if (from.space !== to.space) {
-        throw new Error('a package move cannot cross spaces')
-      }
-      const pkg = packages.get(keyOf(from, directoryName))
-
-      if (!pkg) {
-        return false
-      }
-      const name = manifestNameOf(pkg)
-
-      if (packages.has(keyOf(to, directoryName)) || (name != null && packageByName(to, name))) {
-        return false
-      }
-      packages.delete(keyOf(from, directoryName))
-      packages.set(keyOf(to, directoryName), pkg)
-      return true
-    },
     // Identity is projected from a PATH, so it exists only where the package does.
     // A twin that answered for every location would let a caller read the identity
     // of a package it had already moved away, and say nothing about it.
@@ -1178,5 +1300,16 @@ export const createInMemoryRoleLibrary = ({
       return noteIdsAt(location, directoryNames)
     },
     clear: () => packages.clear(),
+  } satisfies RoleLibrary & { clear(): void }
+
+  return {
+    library,
+    publication: {
+      availableFor: () => true,
+      publicationFor: async (location) => ({
+        putIfAbsent: (pkg) => putIfAbsent(location, pkg),
+        moveFrom: (origin, directoryName) => movePackage(origin, location, directoryName),
+      }),
+    },
   }
 }

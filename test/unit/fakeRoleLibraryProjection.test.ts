@@ -12,6 +12,7 @@ import {
   type SkillPackage,
 } from '../../packages/server/src/services/roles'
 import { createStoreRoleLibrary } from '../fake-server/storeRoleLibrary'
+import { writableLibrary } from '../roleLibraryComposition'
 
 const NOW = '2099-08-05T12:00:00.000Z'
 const LOCATION: RoleLocation = { scope: 'personal', space: 'personal' }
@@ -47,7 +48,7 @@ class LaggingProjectionStore extends InMemoryStore {
 describe('fake role library — package identities off the note projection', () => {
   it('answers a package the projection does not hold as absent, never as a throw', async () => {
     const store = new InMemoryStore({ space: 'personal', now: NOW, notes: [] })
-    const library = createStoreRoleLibrary(() => Promise.resolve(store))
+    const library = writableLibrary(createStoreRoleLibrary(() => Promise.resolve(store)))
 
     expect(await library.putIfAbsent(LOCATION, rolePackage('ZyXwvUtsrq_2', 'projected'))).toBe(true)
 
@@ -76,9 +77,11 @@ describe('fake role library — package identities off the note projection', () 
     // browser gates, so what it cannot express, none of them can catch.
     const store = new InMemoryStore({ space: 'personal', now: NOW, notes: [] })
     const crossed: string[][] = []
-    const library = createStoreRoleLibrary(() => Promise.resolve(store), undefined, {
-      onBarrier: (_location, directoryNames) => crossed.push([...directoryNames]),
-    })
+    const library = writableLibrary(
+      createStoreRoleLibrary(() => Promise.resolve(store), undefined, {
+        onBarrier: (_location, directoryNames) => crossed.push([...directoryNames]),
+      }),
+    )
 
     expect(await library.putIfAbsent(LOCATION, rolePackage('ZyXwvUtsrq_2', 'projected'))).toBe(true)
 
@@ -90,15 +93,17 @@ describe('fake role library — package identities off the note projection', () 
   })
 
   it('leaves the verdict on a missing identity to RolesService, which degrades honestly', async () => {
-    const library = createStoreRoleLibrary(() =>
-      Promise.resolve(new LaggingProjectionStore({ space: 'personal', now: NOW, notes: [] })),
+    const library = writableLibrary(
+      createStoreRoleLibrary(() =>
+        Promise.resolve(new LaggingProjectionStore({ space: 'personal', now: NOW, notes: [] })),
+      ),
     )
     // This host has no meta-DB, and says so rather than inheriting it by omission —
     // the spread goes first so anything stated below would override it.
     const roles = createRolesService({
       ...inMemoryAbilityPersistence(),
       catalog: loadBundledAbilityInventory,
-      library,
+      ...library.deps,
     })
 
     // The domain error is the point: the honest-degradation branch of `RolesService`

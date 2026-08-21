@@ -44,7 +44,7 @@ import { AbilityActionsMenu } from './AbilityActionsMenu'
 import { AbilityEditorSurface } from './AbilityEditorSurface'
 import { AgentsPanel } from './AgentsPanel'
 import { useAgentsShell } from './AgentsProvider'
-import { CatalogAbilityAddDialog } from './CatalogAbilityAddDialog'
+import { CatalogAbilityAddDialog, type CatalogInstallAvailability } from './CatalogAbilityAddDialog'
 import {
   abilitySaveLanded,
   type AbilitySaveProgress,
@@ -113,17 +113,6 @@ export const AbilityDetailPage = ({
   const address = locator ? encodeAbilityLocator(locator) : null
   const addressRef = useRef(address)
   addressRef.current = address
-  // Leaving the section is a walk too, and a ref only ever written while RENDERING
-  // answers "still here" forever after the last render. Every gate below asks this one
-  // ref whether the reader is where they asked from, and `navigate` keeps working from
-  // a page that is gone — react-router arms its own guard in a layout effect and never
-  // disarms it — so that stale answer is a real landing on somebody else's screen.
-  useEffect(() => {
-    addressRef.current = address
-    return () => {
-      addressRef.current = null
-    }
-  }, [address])
 
   const { space, spaces, personalSpace, canWrite, reportNoteSpace } = useSpace()
   const { scope, invalidate, versions } = useAgentsExplorer()
@@ -142,6 +131,11 @@ export const AbilityDetailPage = ({
   const [failed, setFailed] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [catalogAddOpen, setCatalogAddOpen] = useState(false)
+  // Which targets this host can publish to, for the kind being added. A role's
+  // answer is per PROJECT and a skill's per Space, so the skill inventory this
+  // page already reads cannot stand in for the role library's — it is read
+  // alongside, once, when the dialog is about to open.
+  const [installTargets, setInstallTargets] = useState<CatalogInstallAvailability | undefined>()
   const markdownRef = useRef<HTMLDivElement>(null)
   const handledEditIntent = useRef<string | null>(null)
   // The save closure is minted when editing starts; the settings it must apply are
@@ -153,7 +147,28 @@ export const AbilityDetailPage = ({
   // the edit ends either way.
   const progress = useRef<AbilitySaveProgress | null>(null)
   const seq = useRef(0)
+  const catalogAddSeq = useRef(0)
+  const pendingCatalogAdd = useRef<number | null>(null)
   const seenAddress = useRef<string | null>(null)
+
+  // Leaving the section is a walk too, and a ref only ever written while RENDERING
+  // answers "still here" forever after the last render. An Add read belongs to that
+  // address as well: walking invalidates its generation, closes any dialog already
+  // open for the old package, and releases only the busy state owned by that read.
+  useEffect(() => {
+    addressRef.current = address
+    if (pendingCatalogAdd.current !== null) {
+      pendingCatalogAdd.current = null
+      setBusy(false)
+    }
+    setCatalogAddOpen(false)
+    setInstallTargets(undefined)
+
+    return () => {
+      addressRef.current = null
+      catalogAddSeq.current += 1
+    }
+  }, [address])
 
   useEffect(() => {
     editorRef.current = editing.editor
@@ -478,23 +493,37 @@ export const AbilityDetailPage = ({
       return
     }
     const asked = addressRef.current
+    const request = ++catalogAddSeq.current
+    pendingCatalogAdd.current = request
 
     setBusy(true)
     try {
       // Through the wrapper, not the bare reader: the dialog offers destinations out
       // of `inventory`, and a reader whose answer is thrown away leaves it empty.
-      await readInventory()
-      // The dialog adds THIS package to the library; opened over a page the reader
-      // has since walked to, it would offer the one they left.
-      if (asked === addressRef.current) {
-        setCatalogAddOpen(true)
+      const [loaded, roleLibrary] = await Promise.all([
+        readInventory(),
+        detail.ability.locator.kind === ABILITY_KIND.role
+          ? api.agentRolesGet({ limit: 1, ...(scope?.spaceId ? { spaceId: scope.spaceId } : {}) })
+          : null,
+      ])
+
+      // Availability and the dialog are one accepted result. Splitting this gate lets
+      // a late read replace the targets of a newer dialog even when it no longer opens
+      // its own; the generation also covers a newer request for the same address.
+      if (asked !== addressRef.current || request !== catalogAddSeq.current) {
+        return
       }
+      setInstallTargets((roleLibrary ?? loaded.first)?.installAvailability)
+      setCatalogAddOpen(true)
     } catch (error) {
-      if (asked === addressRef.current) {
+      if (asked === addressRef.current && request === catalogAddSeq.current) {
         setFailed(errorText(error))
       }
     } finally {
-      setBusy(false)
+      if (pendingCatalogAdd.current === request && request === catalogAddSeq.current) {
+        pendingCatalogAdd.current = null
+        setBusy(false)
+      }
     }
   }
 
@@ -503,18 +532,20 @@ export const AbilityDetailPage = ({
       return
     }
     const asked = addressRef.current
+    const request = catalogAddSeq.current
     const result =
       detail.ability.locator.kind === ABILITY_KIND.role
         ? await api.agentRoleAddExact(input as AddAgentRoleRequest)
         : await api.agentSkillAddExact(input as AddAgentSkillRequest)
-    // The write happened, so every listing re-reads either way. Only the LANDING is
-    // the reader's to lose: they asked for this from the catalog page they were on,
-    // and a page they have since left may not send them anywhere.
+    // The write happened, so every listing re-reads either way. Closing and landing
+    // belong to the exact dialog generation that submitted it: the same address may
+    // have walked away and back, or a newer address may already own another dialog.
     invalidate(detail.ability.locator.kind === ABILITY_KIND.role ? 'roles' : 'skills')
-    setCatalogAddOpen(false)
-    if (asked === addressRef.current) {
-      navigate(agentAbilityRoute(result.locator), { replace: true })
+    if (asked !== addressRef.current || request !== catalogAddSeq.current) {
+      return
     }
+    setCatalogAddOpen(false)
+    navigate(agentAbilityRoute(result.locator), { replace: true })
   }
 
   const addRoleVersion = async (project: MeAgentSkillsResponse['projects'][number]) => {
@@ -879,6 +910,7 @@ export const AbilityDetailPage = ({
           space={space}
           spaceAvailable={canWrite && personalSpace?.slug !== space}
           projects={inventory?.projects ?? []}
+          install={installTargets}
           onAdd={addCatalog}
           onClose={() => setCatalogAddOpen(false)}
         />

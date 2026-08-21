@@ -17,9 +17,10 @@ import type {
   RoleLocation,
   SkillPackage,
 } from '../../packages/server/src/services/roles'
+import type { WritableRoleLibrary } from '../roleLibraryComposition'
 
 export type RoleLibraryFactory = () => Promise<{
-  library: RoleLibrary
+  library: WritableRoleLibrary
   teardown?: () => Promise<void>
 }>
 
@@ -61,7 +62,7 @@ export const describeRoleLibraryContract = (
   const version: RoleLocation = { scope: 'project', space: 'personal', projectId: 'project-a' }
 
   suite(`${ROLE_LIBRARY_CONTRACT_PREFIX}${name}${gate ? ` ${gate}` : ''}`, () => {
-    let library: RoleLibrary
+    let library: WritableRoleLibrary
     let teardown: (() => Promise<void>) | undefined
 
     beforeEach(async () => {

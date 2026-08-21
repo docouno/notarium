@@ -168,16 +168,15 @@ export type FileStrictPublication = {
   discard(operationId: string, binding: string): Promise<boolean>
 }
 
+/** The operations every adapter performs. Nothing here is optional, so a caller
+ *  holding one never asks whether it can enumerate, read, write, move or delete
+ *  — the questions that ARE medium-dependent live on the facets below, each with
+ *  its own answer and its own degradation. */
 export type FileStore = {
   /** Every note file under the root, recursively. The full-inventory truth
    *  source (P3) — cheap by design: stats only. The engine independently
    *  source-verifies a bounded rotating subset. */
   scan(): Promise<FileStat[]>
-  /** Every regular file under the root as raw bytes. A package/resource capability kept separate
-   *  from scan(): the knowledge index remains Markdown-only, while a full export can preserve
-   *  auxiliary files byte-for-byte. Paths are storage-relative POSIX. OPTIONAL: note-only or
-   *  remote adapters may omit it and keep the legacy Markdown export path. */
-  exportFiles?(): AsyncIterable<{ path: string; content: Uint8Array }>
   /** Every non-dot directory under the root, recursively (#97 directory channel).
    *  Space-relative POSIX paths, root ('') excluded. A SEPARATE walk from scan()
    *  — never mixed into the note FileStat[] (index = notes only, #78). This is
@@ -188,77 +187,17 @@ export type FileStore = {
   /** null = the file is gone (a stat/read race with an external delete is a
    *  normal answer, not an error). */
   read(path: string): Promise<string | null>
-  /** Exact physical bytes from the same observation as read(). Optional only for legacy/remote
-   * adapters; callers that need opaque-source fidelity degrade explicitly when it is absent. */
-  readBytes?(path: string): Promise<Uint8Array | null>
-  /** Exact physical observation for provenance-sensitive operations. Unlike
-   * `readBytes`, this distinguishes absence from an occupied non-regular path
-   * and binds bytes/change claim/mtime to one stable adapter sample. */
-  observe?(path: string, options?: { maxBytes?: number }): Promise<FileObservation>
-  /** Atomically publish against adapter claims and return proof transitions
-   * derived inside that mutation operation. A conflict never mutates storage. */
-  publish?(request: FilePublicationRequest): Promise<FilePublicationResult>
-  /** Atomically install one absent package directory and return one aggregate
-   * proof set for its root and every submitted resource. */
-  publishPackageIfAbsent?(request: FilePackagePublicationRequest): Promise<FilePublicationResult>
-  /** Strict publication is a separate durable protocol from ordinary writes:
-   * the causal metadata layer stages first, prepares its row, then asks this
-   * capability to publish/resume and finally discards the recovery artifact. */
-  strictPublication?: FileStrictPublication
   /** Atomic visibility: an operation-owned temp file + rename (P3 — readers and
    *  a process crash mid-write must never leave a half-written note). This does
    *  not promise fsync-level durability across sudden power loss. Creates parent
    *  directories. */
   write(path: string, content: string): Promise<void>
-  /** Atomically publish complete bytes only when the pathname is absent. `false`
-   *  means another file, directory or symlink already owns it. Optional for media
-   *  without a no-replace create primitive. */
-  writeIfAbsent?(path: string, content: string): Promise<boolean>
-  /** Whether two path spellings currently name the same file or directory entry.
-   *  Used only to permit case/NFC-only renames on insensitive filesystems without
-   *  treating a symlink or distinct hardlink pathname as the source itself. */
-  sameEntry?(left: string, right: string): Promise<boolean>
   /** Move one file with the medium's ordinary replacement semantics. Creates
    *  destination parents; directories remain durable when the source empties. */
   rename(from: string, to: string): Promise<void>
-  /** Publish the source's exact bytes at the destination without overwriting,
-   *  then remove only the source version that was observed. Also handles two
-   *  spellings of the same medium entry. `false` means a different entry owns
-   *  the destination. */
-  renameIfAbsent?(from: string, to: string): Promise<boolean>
-  /** Atomically publish the FINAL bytes at an absent destination while moving a
-   *  source whose exact bytes were read by the caller. The adapter must never
-   *  overwrite either a racing destination or a replacement of the source.
-   *  `false` means another entry owns the destination. */
-  replaceIfAbsent?(
-    from: string,
-    to: string,
-    expectedSource: string,
-    content: string,
-  ): Promise<boolean>
   /** Move a whole directory subtree. */
   renameDir(from: string, to: string): Promise<void>
-  /** Atomically move a whole directory subtree only while the destination
-   * pathname is absent. `false` means another entry owns it; an adapter whose
-   * medium or RUNTIME carries no such primitive omits the capability entirely,
-   * so callers fail closed instead of emulating a race. Presence answers for the
-   * deployment, not for every pathname under it.
-   * canon: docs/note-model.md#create-collisions */
-  renameDirIfAbsent?(from: string, to: string): Promise<boolean>
   remove(path: string): Promise<void>
-  /** Remove only the exact regular-file version whose bytes the caller read.
-   *  `false` means the pathname was replaced or edited and remains intact;
-   *  an already-absent source counts as successfully removed. */
-  removeIfUnchanged?(path: string, expectedContent: string): Promise<boolean>
-  /** Remove only the exact adapter claim produced by an earlier publication.
-   *  The adapter must bind claim verification and pathname detachment into one
-   *  conditional operation; checking the claim in a caller and deleting later
-   *  would let a same-byte replacement win between those two steps. */
-  removeIfClaimed?(
-    path: string,
-    expectedContent: string,
-    expectedClaim: FileClaim & { kind: 'present' },
-  ): Promise<boolean>
   /** Create the durable on-disk anchor for a "New folder" (#97). Missing parents
    *  are created, then the leaf is claimed atomically. `false` means a file or
    *  directory already owns that exact medium pathname. */
@@ -271,30 +210,186 @@ export type FileStore = {
    *  answers false. Lets a move distinguish an empty-but-real folder (no indexed
    *  notes) from a genuinely missing one. */
   dirExists(path: string): Promise<boolean>
-  /** Does a directory exist under EXACTLY this spelling? On a case-insensitive or
-   *  NFC-normalizing medium `dirExists` answers for a different spelling too, and
-   *  the difference is precisely what a write must refuse. Answering it needs one
-   *  shallow listing of the parent — the alternative is a recursive walk of the
-   *  whole mount on every write, which is O(tree) per note.
-   *  OPTIONAL for a different reason than `renameDirIfAbsent` above, and the two
-   *  must not be read as the same kind of thing: that one is missing when the
-   *  deployment CANNOT perform it, so its absence fails a caller closed. This one
-   *  is a cost, not a power — every adapter that can list a directory can answer
-   *  it, and one that doesn't leaves the caller on the recursive walk, which is
-   *  equally correct and merely slow. canon: docs/core.md#cooperative */
-  dirExistsExact?(path: string): Promise<boolean>
-  /** Watch the subtree for external changes (#146, P5 capability). `onChange`
-   *  receives the storage-relative path when the medium can identify it, or null
-   *  for a pathless hint. It fires (coalesced upstream) on any non-hidden
-   *  create/modify/delete under the root — it is an INVITATION TO RESCAN, never a
-   *  source of truth: the caller reconciles via a full scan() (P3), so a missed or
-   *  duplicate signal only shifts WHEN the rescan runs, never its correctness.
-   *  Returns a closer, or
-   *  `null` when a watcher can't be ESTABLISHED on this medium (inotify exhausted,
-   *  an unsupported platform) — the caller degrades to periodic polling (honest P5,
-   *  not a crash). A watcher that establishes but then under-delivers (a network
-   *  mount only sees local writes, not another host's edits; an async inotify
-   *  overflow) can't be detected here — the caller's periodic backstop is the net
-   *  for that, by design. OPTIONAL: a backend with no change feed omits it. */
-  watch?(onChange: (path: string | null) => void): (() => void) | null
+}
+
+/** Exact physical bytes from the same observation as `read`. Absent on legacy or
+ *  remote adapters that can only hand back decoded text; callers that need
+ *  opaque-source fidelity degrade to that text explicitly. */
+export type FileExactRead = {
+  readBytes(path: string): Promise<Uint8Array | null>
+}
+
+/** Every regular file under the root as raw bytes. A package/resource capability kept
+ *  separate from `scan`: the knowledge index remains Markdown-only, while a full export
+ *  can preserve auxiliary files byte-for-byte. Paths are storage-relative POSIX. Absent
+ *  on note-only or remote adapters, which keep the legacy Markdown export path. */
+export type FileResourceExport = {
+  exportFiles(): AsyncIterable<{ path: string; content: Uint8Array }>
+}
+
+/** Content/path compare-and-set over one regular file: create, update, delete.
+ *  One facet rather than three, because the three answer the same question about
+ *  the medium — whether a pathname's bytes can be made the condition of the
+ *  mutation that changes them — and no medium offers a proper subset of them. */
+export type FileConditionalMutation = {
+  /** Atomically publish complete bytes only when the pathname is absent. `false`
+   *  means another file, directory or symlink already owns it. */
+  writeIfAbsent(path: string, content: string): Promise<boolean>
+  /** Atomically publish the FINAL bytes at an absent destination while moving a
+   *  source whose exact bytes were read by the caller. The adapter must never
+   *  overwrite either a racing destination or a replacement of the source.
+   *  `false` means another entry owns the destination. */
+  replaceIfAbsent(
+    from: string,
+    to: string,
+    expectedSource: string,
+    content: string,
+  ): Promise<boolean>
+  /** Remove only the exact regular-file version whose bytes the caller read.
+   *  `false` means the pathname was replaced or edited and remains intact;
+   *  an already-absent source counts as successfully removed. */
+  removeIfUnchanged(path: string, expectedContent: string): Promise<boolean>
+}
+
+/** Whether two path spellings currently name the same file or directory entry.
+ *  Used only to permit case/NFC-only renames on insensitive filesystems without
+ *  treating a symlink or distinct hardlink pathname as the source itself.
+ *  Absence fails exactly those spelling-only exceptions closed — an ordinary move
+ *  between two DISTINCT pathnames never consults it and stays available. */
+export type FileEntryIdentity = {
+  sameEntry(left: string, right: string): Promise<boolean>
+}
+
+/** Publish the source's exact bytes at the destination without overwriting,
+ *  then remove only the source version that was observed. Also handles two
+ *  spellings of the same medium entry. `false` means a different entry owns
+ *  the destination. */
+export type FileNoReplaceMove = {
+  renameIfAbsent(from: string, to: string): Promise<boolean>
+}
+
+/** Atomically move a whole directory subtree only while the destination
+ *  pathname is absent. `false` means another entry owns it; an adapter whose
+ *  medium or RUNTIME carries no such primitive omits the facet entirely, so
+ *  callers fail closed instead of emulating a race. Presence answers for the
+ *  deployment, not for every pathname under it.
+ *  canon: docs/note-model.md#create-collisions */
+export type FileDirectoryNoReplaceMove = {
+  renameDirIfAbsent(from: string, to: string): Promise<boolean>
+}
+
+/** Exact physical observation for provenance-sensitive operations. Unlike
+ *  `FileExactRead`, this distinguishes absence from an occupied non-regular path
+ *  and binds bytes/change claim/mtime to one stable adapter sample. */
+export type FileResourceObservation = {
+  observe(path: string, options?: { maxBytes?: number }): Promise<FileObservation>
+}
+
+/** Atomically publish against adapter claims and return proof transitions
+ *  derived inside that mutation operation. A conflict never mutates storage. */
+export type FileResourcePublication = {
+  publish(request: FilePublicationRequest): Promise<FilePublicationResult>
+}
+
+/** Remove only the exact adapter claim produced by an earlier publication.
+ *  The adapter must bind claim verification and pathname detachment into one
+ *  conditional operation; checking the claim in a caller and deleting later
+ *  would let a same-byte replacement win between those two steps. */
+export type FileClaimedRemoval = {
+  removeIfClaimed(
+    path: string,
+    expectedContent: string,
+    expectedClaim: FileClaim & { kind: 'present' },
+  ): Promise<boolean>
+}
+
+/** The commit could not be performed on this pathname, and NOTHING was published.
+ *  Presence of the facet answers for the deployment; an individual pathname can
+ *  still be refused by the medium (a filesystem that does not carry the
+ *  primitive, a staging directory and a destination on different devices). The
+ *  distinction this class carries is narrow on purpose: it is raised only around
+ *  the commit itself, before it succeeds, so a caller may map it to "unavailable
+ *  here" without having to guess whether a package landed. */
+export class FilePackagePublicationUnavailableError extends Error {
+  override readonly name = 'FilePackagePublicationUnavailableError'
+}
+
+/** Atomically install one absent package directory and return one aggregate
+ *  proof set for its root and every submitted resource. */
+export type FilePackagePublication = {
+  publishPackageIfAbsent(request: FilePackagePublicationRequest): Promise<FilePublicationResult>
+}
+
+/** Watch the subtree for external changes (#146, P5 capability). `onChange`
+ *  receives the storage-relative path when the medium can identify it, or null
+ *  for a pathless hint. It fires (coalesced upstream) on any non-hidden
+ *  create/modify/delete under the root — it is an INVITATION TO RESCAN, never a
+ *  source of truth: the caller reconciles via a full scan() (P3), so a missed or
+ *  duplicate signal only shifts WHEN the rescan runs, never its correctness.
+ *  Returns a closer, or `null` when a watcher can't be ESTABLISHED on this medium
+ *  (inotify exhausted, an unsupported platform) — the caller degrades to periodic
+ *  polling (honest P5, not a crash). A watcher that establishes but then
+ *  under-delivers (a network mount only sees local writes, not another host's
+ *  edits; an async inotify overflow) can't be detected here — the caller's
+ *  periodic backstop is the net for that, by design. A backend with no change
+ *  feed omits the facet. */
+export type FileWatch = {
+  watch(onChange: (path: string | null) => void): (() => void) | null
+}
+
+/** Does a directory exist under EXACTLY this spelling? On a case-insensitive or
+ *  NFC-normalizing medium `dirExists` answers for a different spelling too, and
+ *  the difference is precisely what a write must refuse. Answering it needs one
+ *  shallow listing of the parent — the alternative is a recursive walk of the
+ *  whole mount on every write, which is O(tree) per note.
+ *  An ACCELERATOR, not a capability, and the two must not be read as the same
+ *  kind of thing: a capability is missing when the deployment CANNOT perform the
+ *  operation, so its absence fails a caller closed. This one is a cost, not a
+ *  power — every adapter that can list a directory can answer it, and one that
+ *  doesn't leaves the caller on the recursive walk, which is equally correct and
+ *  merely slow. canon: docs/core.md#cooperative */
+export type FileExactDirectorySpelling = {
+  dirExistsExact(path: string): Promise<boolean>
+}
+
+/** The semantics this deployment can actually guarantee, each one independently
+ *  present or absent. A missing facet is a refusal a caller must honour — never a
+ *  hollow object whose methods throw, which would move the refusal from
+ *  composition time to the middle of an operation. */
+export type FileStoreCapabilities = {
+  exactRead?: FileExactRead
+  resourceExport?: FileResourceExport
+  conditionalFileMutation?: FileConditionalMutation
+  entryIdentity?: FileEntryIdentity
+  fileNoReplaceMove?: FileNoReplaceMove
+  directoryNoReplaceMove?: FileDirectoryNoReplaceMove
+  resourceObservation?: FileResourceObservation
+  resourcePublication?: FileResourcePublication
+  claimedRemoval?: FileClaimedRemoval
+  packagePublication?: FilePackagePublication
+  /** Strict publication is a separate durable protocol from ordinary writes:
+   *  the causal metadata layer stages first, prepares its row, then asks this
+   *  capability to publish/resume and finally discards the recovery artifact. */
+  strictPublication?: FileStrictPublication
+  watch?: FileWatch
+}
+
+/** Cheaper routes to an answer the port can always produce without them. An
+ *  absent accelerator never changes WHAT a caller is told, only what it costs to
+ *  find out — so no branch here may fail an operation closed. */
+export type FileStoreAccelerators = {
+  exactDirectorySpelling?: FileExactDirectorySpelling
+}
+
+/** What a storage adapter hands its composition root: the base port, plus what
+ *  this particular deployment declared once, at construction.
+ *
+ *  Deliberately NOT assignable to `FileStore` — the nesting is the type boundary.
+ *  A runtime consumer receives `base` and the named views it was granted, never
+ *  the aggregate, so "which facets may this caller reach" is settled where the
+ *  wiring is written rather than by whatever the object happens to carry. */
+export type FileStoreAssembly = {
+  base: FileStore
+  capabilities: FileStoreCapabilities
+  accelerators: FileStoreAccelerators
 }
