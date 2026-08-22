@@ -24,6 +24,10 @@ The split that trips people up first is `engine` vs `engine-vector`: semantic se
 
 Node 24 is expected.
 
+For parallel tasks, use the repository's shared Worktrunk lifecycle rather than raw
+`git worktree` commands. The one-time install, team path layout and daily commands are
+in [docs/worktrees.md](docs/worktrees.md).
+
 ```bash
 npm run deps:lean      # default: no embedder
 npm run dev            # → http://localhost:3000

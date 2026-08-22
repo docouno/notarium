@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+readonly primary_worktree="${1:?usage: pre-start <primary-worktree> <compose-project>}"
+readonly compose_project="${2:?usage: pre-start <primary-worktree> <compose-project>}"
+readonly port_min=8801
+readonly port_max=8815
+readonly managed_begin="# --- Worktrunk managed: begin ---"
+readonly managed_end="# --- Worktrunk managed: end ---"
+
+if [[ ! "$compose_project" =~ ^[a-z][a-z0-9_-]*$ ]]; then
+  printf 'worktree bootstrap: invalid Compose project: %s\n' "$compose_project" >&2
+  exit 2
+fi
+
+if [[ ! -d "$primary_worktree" ]] \
+  || ! git -C "$primary_worktree" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  printf 'worktree bootstrap: invalid primary worktree: %s\n' "$primary_worktree" >&2
+  exit 2
+fi
+
+repository_root="$(git rev-parse --show-toplevel)"
+cd "$repository_root"
+readonly current_root="$(pwd -P)"
+readonly primary_root="$(cd "$primary_worktree" && pwd -P)"
+if [[ "$current_root" == "$primary_root" ]]; then
+  printf 'worktree bootstrap: pre-start must run in a linked worktree, not primary\n' >&2
+  exit 2
+fi
+
+primary_git_common_dir="$(
+  git -C "$primary_worktree" rev-parse --path-format=absolute --git-common-dir
+)"
+target_git_common_dir="$(git rev-parse --path-format=absolute --git-common-dir)"
+primary_git_common_dir="$(cd "$primary_git_common_dir" && pwd -P)"
+target_git_common_dir="$(cd "$target_git_common_dir" && pwd -P)"
+if [[ "$primary_git_common_dir" != "$target_git_common_dir" ]]; then
+  printf 'worktree bootstrap: primary and target belong to different repositories\n' >&2
+  exit 2
+fi
+readonly lock_dir="$target_git_common_dir/notarium-worktree-port.lock"
+readonly lock_pid_file="$lock_dir/pid"
+
+if [[ ! -f .env ]]; then
+  if [[ -f "$primary_worktree/.env" ]]; then
+    cp -- "$primary_worktree/.env" .env
+    printf 'worktree bootstrap: copied .env from primary worktree\n'
+  elif [[ -f "$primary_worktree/.env.example" ]]; then
+    cp -- "$primary_worktree/.env.example" .env
+    printf 'worktree bootstrap: created .env from primary .env.example\n'
+  else
+    printf 'worktree bootstrap: primary has neither .env nor .env.example\n' >&2
+    exit 1
+  fi
+fi
+
+temporary_env=''
+lock_held=0
+cleanup() {
+  if [[ -n "$temporary_env" ]]; then
+    rm -f -- "$temporary_env"
+  fi
+  if ((lock_held)); then
+    rm -f -- "$lock_pid_file"
+    rmdir -- "$lock_dir" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+for ((attempt = 1; attempt <= 50; attempt++)); do
+  if mkdir -- "$lock_dir" 2>/dev/null; then
+    lock_held=1
+    printf '%s\n' "$$" >"$lock_pid_file"
+    break
+  fi
+
+  if [[ -f "$lock_pid_file" ]]; then
+    lock_pid="$(sed -n '1p' "$lock_pid_file")"
+    if [[ "$lock_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$lock_pid" 2>/dev/null; then
+      rm -f -- "$lock_pid_file"
+      rmdir -- "$lock_dir" 2>/dev/null || true
+    fi
+  fi
+  sleep 0.1
+done
+
+if ((!lock_held)); then
+  printf 'worktree bootstrap: timed out waiting for the port allocator lock: %s\n' \
+    "$lock_dir" >&2
+  exit 1
+fi
+
+read_env_port() {
+  local env_file="$1"
+
+  [[ -f "$env_file" ]] || return 0
+  sed -n 's/^[[:space:]]*PORT[[:space:]]*=[[:space:]]*\([0-9][0-9]*\)[[:space:]]*$/\1/p' \
+    "$env_file" | tail -n 1
+}
+
+port_is_available() {
+  NOTARIUM_PORT_TO_CHECK="$1" node <<'NODE'
+const net = require('node:net');
+
+const server = net.createServer();
+server.unref();
+server.once('error', () => process.exit(1));
+server.listen(
+  { host: '0.0.0.0', port: Number(process.env.NOTARIUM_PORT_TO_CHECK), exclusive: true },
+  () => server.close(() => process.exit(0)),
+);
+NODE
+}
+
+reserved_ports=' '
+reserved_descriptions=''
+
+while IFS= read -r -d '' worktree_field; do
+  case "$worktree_field" in
+    'worktree '*)
+      worktree_path="${worktree_field#worktree }"
+      if [[ "$(cd "$worktree_path" 2>/dev/null && pwd -P || true)" == "$current_root" ]]; then
+        continue
+      fi
+
+      reserved_port="$(read_env_port "$worktree_path/.env")"
+      if [[ "$reserved_port" =~ ^[0-9]+$ ]] \
+        && ((reserved_port >= port_min && reserved_port <= port_max)); then
+        reserved_ports+="$reserved_port "
+        reserved_descriptions+="  $reserved_port  $worktree_path"$'\n'
+      fi
+      ;;
+  esac
+done < <(git worktree list --porcelain -z)
+
+port="$(read_env_port .env)"
+if [[ ! "$port" =~ ^[0-9]+$ ]] \
+  || ((port < port_min || port > port_max)) \
+  || [[ "$reserved_ports" == *" $port "* ]]; then
+  port=''
+fi
+
+if [[ -n "$port" ]] && ! port_is_available "$port"; then
+  # A matching Compose project means this hook was re-run for its already-started
+  # checkout; preserve the stable reservation. Any other listener is a conflict.
+  if ! docker ps \
+    --filter "label=com.docker.compose.project=$compose_project" \
+    --filter "publish=$port" --quiet 2>/dev/null | grep -q .; then
+    port=''
+  fi
+fi
+
+if [[ -z "$port" ]]; then
+  for ((candidate = port_min; candidate <= port_max; candidate++)); do
+    if [[ "$reserved_ports" == *" $candidate "* ]]; then
+      continue
+    fi
+    if port_is_available "$candidate"; then
+      port="$candidate"
+      break
+    fi
+  done
+fi
+
+if [[ -z "$port" ]]; then
+  printf 'worktree bootstrap: no free port in %s-%s\n' "$port_min" "$port_max" >&2
+  if [[ -n "$reserved_descriptions" ]]; then
+    printf 'Worktree reservations:\n%s' "$reserved_descriptions" >&2
+  fi
+  exit 1
+fi
+
+temporary_env="$(mktemp)"
+
+# Re-running the hook must replace, rather than duplicate, its generated values.
+# A missing end marker is treated as corruption and leaves the original file intact.
+awk -v begin="$managed_begin" -v end="$managed_end" '
+  $0 == begin { managed = 1; next }
+  $0 == end { managed = 0; next }
+  !managed { print }
+  END { if (managed) exit 2 }
+' .env >"$temporary_env" || {
+  printf 'worktree bootstrap: malformed managed block in %s/.env\n' "$repository_root" >&2
+  exit 1
+}
+
+{
+  printf '\n%s\n' "$managed_begin"
+  printf '# Generated for this linked worktree; rerun the pre-start hook to refresh.\n'
+  printf 'PORT=%s\n' "$port"
+  printf 'COMPOSE_PROJECT_NAME=%s\n' "$compose_project"
+  printf '%s\n' "$managed_end"
+} >>"$temporary_env"
+
+mv -- "$temporary_env" .env
+temporary_env=''
+rm -f -- "$lock_pid_file"
+rmdir -- "$lock_dir"
+lock_held=0
+trap - EXIT
+
+printf 'worktree bootstrap: PORT=%s, COMPOSE_PROJECT_NAME=%s\n' "$port" "$compose_project"
+printf 'worktree bootstrap: development URL http://localhost:%s\n' "$port"
+
+make dev

@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+readonly primary_worktree="${1:?usage: pre-remove <primary-worktree>}"
+
+if [[ ! -d "$primary_worktree" ]] \
+  || ! git -C "$primary_worktree" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  printf 'worktree cleanup: invalid primary worktree: %s\n' "$primary_worktree" >&2
+  exit 2
+fi
+
+repository_root="$(git rev-parse --show-toplevel)"
+cd "$repository_root"
+readonly current_root="$(pwd -P)"
+readonly primary_root="$(cd "$primary_worktree" && pwd -P)"
+
+if [[ "$current_root" == "$primary_root" ]]; then
+  printf 'worktree cleanup: pre-remove must run in a linked worktree, not primary\n' >&2
+  exit 2
+fi
+
+primary_git_common_dir="$(
+  git -C "$primary_worktree" rev-parse --path-format=absolute --git-common-dir
+)"
+target_git_common_dir="$(git rev-parse --path-format=absolute --git-common-dir)"
+primary_git_common_dir="$(cd "$primary_git_common_dir" && pwd -P)"
+target_git_common_dir="$(cd "$target_git_common_dir" && pwd -P)"
+if [[ "$primary_git_common_dir" != "$target_git_common_dir" ]]; then
+  printf 'worktree cleanup: primary and target belong to different repositories\n' >&2
+  exit 2
+fi
+
+# `make prepare` creates this directory before a stand can start. If it does not
+# exist, this checkout has no Compose runtime or bind-mounted state to clean up.
+if [[ ! -d docker/volumes ]]; then
+  printf 'worktree cleanup: no local runtime state; nothing to stop\n'
+  exit 0
+fi
+
+if ! command -v docker >/dev/null 2>&1; then
+  printf '%s\n' \
+    'worktree cleanup: Docker is required to stop this checkout runtime' \
+    'Start/install Docker and retry, or use --no-hooks only after checking for orphaned containers.' >&2
+  exit 1
+fi
+
+if ! docker info >/dev/null 2>&1; then
+  printf '%s\n' \
+    'worktree cleanup: Docker is unavailable; the checkout may still own restartable containers' \
+    'Start Docker and retry, or use --no-hooks only after checking for orphaned containers.' >&2
+  exit 1
+fi
+
+make down
+printf 'worktree cleanup: Compose runtime stopped; local checkout data will be removed with the worktree\n'

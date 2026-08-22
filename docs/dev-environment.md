@@ -4,6 +4,12 @@ This is the portable development-environment contract for this repository.
 
 ## Commands
 
+- Parallel task checkouts use Worktrunk. `wt switch --create <type>/<slug>` creates
+  an isolated sibling checkout. User-configured entrypoints call the shared scripts
+  from the primary worktree, so they also bootstrap branches that predate the scripts:
+  copy the local environment, reserve a free dev port, assign a unique Compose project
+  and start `make dev`. `wt remove` stops that checkout's stand before deletion.
+  One-time setup, path layout, lifecycle and recovery are in [worktrees.md](worktrees.md).
 - `make deps` installs npm dependencies for the current checkout when `node_modules` is missing or stale. **No-embedder by default**: it installs every workspace except the deps-only carrier `@notarium/engine-vector`, so the ~360 MB CPU embedder (`onnxruntime-*`, `@huggingface/transformers`) is never downloaded. `sqlite-vec` (200 KB) is not part of that exclusion — it is an ordinary `@notarium/engine` dependency and ships in both profiles, so the vec0 suites run on a default checkout. A no-embedder checkout degrades to FTS at runtime; the dev overlay defaults `VECTOR_SEARCH=off` to match.
 - `make deps-vector` installs the same dependencies **including** the embedder through the canonical `deps:full` script — use it for embedding work, the license corpus, or anything that needs the real model rather than a mock. The script pins onnxruntime-node to its CPU-only payload; a bare `npm ci` instead downloads another ~302 MB of unused CUDA/TensorRT providers from NuGet. Pair the full install with `VECTOR_SEARCH=on` in `.env`.
 - Switching a checkout **back** to no-embedder (to reclaim the ~360 MB after a `make deps-vector`) needs `rm -rf node_modules && make deps`: plain `make deps` is idempotent (it no-ops when the workspace links already resolve) and so will **not** prune an already-installed embedder. A fresh worktree gets the lean profile automatically.
