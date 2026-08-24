@@ -15,6 +15,8 @@ import type {
 } from '../../packages/server/src/services/metaDb/types'
 
 const PACKAGE_ID = 'AbCdefGhij_1'
+const REGISTRY_NOTE_ID = 'RegistryNote1'
+const MANIFEST_NOTE_ID = 'ManifestNote1'
 
 const projectLocator: OwnedAbilityLocator = {
   source: 'owned',
@@ -38,6 +40,17 @@ const move = {
   toTargetId: TO_TARGET,
   fromLocator: serializeAbilityLocator(projectLocator),
   toLocator: serializeAbilityLocator(spaceLocator),
+  registryNoteId: REGISTRY_NOTE_ID,
+  manifestNoteId: MANIFEST_NOTE_ID,
+}
+
+const reverseMove = {
+  fromTargetId: TO_TARGET,
+  toTargetId: FROM_TARGET,
+  fromLocator: serializeAbilityLocator(spaceLocator),
+  toLocator: serializeAbilityLocator(projectLocator),
+  registryNoteId: REGISTRY_NOTE_ID,
+  manifestNoteId: MANIFEST_NOTE_ID,
 }
 
 /** BOTH spellings of the one package, asked in ONE question — the shape the hot path
@@ -156,6 +169,7 @@ export const describeAbilityPlacementContract = (
         role: 'review',
         roleLocator: projectLocator,
         roleContextProjectId: 'project-a',
+        projectId: null,
       })
 
       await db.abilityPlacement.moveOwnedRolePlacement(move)
@@ -191,7 +205,39 @@ export const describeAbilityPlacementContract = (
       ).resolves.toMatchObject([{ id: 'session-1', roleLocator: spaceLocator }])
     })
 
-    it('is a no-op when the old placement holds nothing', async () => {
+    it('exposes only a recorded target and rewrites the trail on a back move', async () => {
+      await expect(
+        db.abilityPlacement.resolveMovedOwnedRoleLocator(move.fromLocator),
+      ).resolves.toBeNull()
+
+      await db.abilityPlacement.moveOwnedRolePlacement(move)
+
+      await expect(
+        db.abilityPlacement.resolveMovedOwnedRoleLocator(move.fromLocator),
+      ).resolves.toEqual({
+        toLocator: move.toLocator,
+        registryNoteId: REGISTRY_NOTE_ID,
+        manifestNoteId: MANIFEST_NOTE_ID,
+      })
+      await expect(
+        db.abilityPlacement.resolveMovedOwnedRoleLocator(move.toLocator),
+      ).resolves.toBeNull()
+
+      await db.abilityPlacement.moveOwnedRolePlacement(reverseMove)
+
+      await expect(
+        db.abilityPlacement.resolveMovedOwnedRoleLocator(move.fromLocator),
+      ).resolves.toBeNull()
+      await expect(
+        db.abilityPlacement.resolveMovedOwnedRoleLocator(move.toLocator),
+      ).resolves.toEqual({
+        toLocator: move.fromLocator,
+        registryNoteId: REGISTRY_NOTE_ID,
+        manifestNoteId: MANIFEST_NOTE_ID,
+      })
+    })
+
+    it('leaves pointer tables empty when the old placement holds nothing', async () => {
       await expect(db.abilityPlacement.moveOwnedRolePlacement(move)).resolves.toBeUndefined()
       await expect(db.contextSets.setsForTarget('role', TO_TARGET)).resolves.toEqual([])
       await expect(db.scopePins.pinsForTarget('role', TO_TARGET)).resolves.toEqual([])
@@ -278,6 +324,8 @@ export const describeAbilityPlacementContract = (
           toTargetId: FROM_TARGET,
           fromLocator: move.toLocator,
           toLocator: move.fromLocator,
+          registryNoteId: REGISTRY_NOTE_ID,
+          manifestNoteId: MANIFEST_NOTE_ID,
         }),
       ).resolves.toBeUndefined()
 
@@ -404,6 +452,38 @@ export const describeAbilityPlacementPreferencesOnlyContract = (
       // on, and its `start_session` reads exactly this call.
       await expect(bothSpellings(abilityPreferences, 'user:alice')).resolves.toEqual(BOTH_DISABLED)
       await expect(bothSpellings(abilityPreferences, 'user:bob')).resolves.toEqual(BOTH_DISABLED)
+    })
+
+    it('exposes only a recorded target and rewrites the trail on a back move', async () => {
+      const { abilityPlacement } = await factory()
+
+      await expect(
+        abilityPlacement.resolveMovedOwnedRoleLocator(move.fromLocator),
+      ).resolves.toBeNull()
+
+      await abilityPlacement.moveOwnedRolePlacement(move)
+
+      await expect(
+        abilityPlacement.resolveMovedOwnedRoleLocator(move.fromLocator),
+      ).resolves.toEqual({
+        toLocator: move.toLocator,
+        registryNoteId: REGISTRY_NOTE_ID,
+        manifestNoteId: MANIFEST_NOTE_ID,
+      })
+      await expect(
+        abilityPlacement.resolveMovedOwnedRoleLocator(move.toLocator),
+      ).resolves.toBeNull()
+
+      await abilityPlacement.moveOwnedRolePlacement(reverseMove)
+
+      await expect(
+        abilityPlacement.resolveMovedOwnedRoleLocator(move.fromLocator),
+      ).resolves.toBeNull()
+      await expect(abilityPlacement.resolveMovedOwnedRoleLocator(move.toLocator)).resolves.toEqual({
+        toLocator: move.fromLocator,
+        registryNoteId: REGISTRY_NOTE_ID,
+        manifestNoteId: MANIFEST_NOTE_ID,
+      })
     })
 
     // The same fact the full contract states, in the host that keeps this table and

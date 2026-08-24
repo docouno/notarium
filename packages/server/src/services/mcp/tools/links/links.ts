@@ -11,6 +11,7 @@ import {
 } from '@notarium/core'
 
 import { type Ctx, type Handler, toolErrorMessage, ToolFailure } from '../../gateway'
+import { mcpNoteMutationOptions, openMcpNoteDoor } from '../../helpers/noteDoor'
 import { writeAttributionOf } from '../../helpers/writeAttribution'
 import { sanitizeText } from '../../sanitize'
 
@@ -95,7 +96,7 @@ export const resolveLinkTitle = async (
     // One anti-enumeration null covers both a missing note and one the caller can't
     // read, so the cross-space message below only fires for a `to` already visible
     // (no existence leak).
-    const hitTo = await ctx.store.noteStore(ctx.principal, to as string, 'note:read')
+    const hitTo = await openMcpNoteDoor(ctx, to as string, 'note:read')
 
     if (!hitTo) {
       throw new ToolFailure('no such note to link to, or you do not have access to it')
@@ -107,8 +108,8 @@ export const resolveLinkTitle = async (
         'Cross-space links are not supported yet — both notes must be in the same space.',
       )
     }
-    const detail = await hitTo.store.read(to as string)
-    const targetId = detail.id ?? (to as string)
+    const detail = hitTo.note
+    const targetId = hitTo.noteId
 
     if (opts.fromId && targetId === opts.fromId) {
       throw new ToolFailure('a note cannot be linked to itself.')
@@ -134,13 +135,12 @@ export const resolveLinkTitle = async (
 export const handleLink: Handler = async (ctx, rawArgs) => {
   const { from, to, toTitle, relation } = rawArgs as LinkInput
   // Unknown id, foreign space and tombstone all collapse to one 404 (anti-enumeration).
-  const hitFrom = await ctx.store.noteStore(ctx.principal, from, 'note:write')
+  const hitFrom = await openMcpNoteDoor(ctx, from, 'note:write')
 
   if (!hitFrom) {
     throw new ToolFailure('no such note to link from, or you do not have access to it')
   }
-  const source = await hitFrom.store.read(from)
-  const sourceId = source.id ?? from
+  const sourceId = hitFrom.noteId
   const title = await resolveLinkTitle(ctx, {
     fromId: sourceId,
     fromSpace: hitFrom.space,
@@ -148,12 +148,16 @@ export const handleLink: Handler = async (ctx, rawArgs) => {
     to,
     toTitle,
   })
-  const result = await linkNotes(hitFrom.store, {
-    fromId: sourceId,
-    toTitle: title,
-    relation,
-    ...writeAttributionOf(ctx),
-  })
+  const result = await linkNotes(
+    hitFrom.store,
+    {
+      fromId: sourceId,
+      toTitle: title,
+      relation,
+      ...writeAttributionOf(ctx),
+    },
+    mcpNoteMutationOptions,
+  )
   const structured = { ok: true as const, versionToken: result.versionToken ?? '' }
   const aliasAt = title.indexOf('|')
   const display = aliasAt === -1 ? title : title.slice(aliasAt + 1)
@@ -179,7 +183,16 @@ export const handleLinkMany: Handler = async (ctx, rawArgs) => {
     byIndex.set(i, { index: i, ok: false, error: sanitizeText(toolErrorMessage(err, 'link_many')) })
 
   for (const [from, indices] of groups) {
-    const hitFrom = await ctx.store.noteStore(ctx.principal, from, 'note:write')
+    let hitFrom: Awaited<ReturnType<typeof openMcpNoteDoor>>
+
+    try {
+      hitFrom = await openMcpNoteDoor(ctx, from, 'note:write')
+    } catch (err) {
+      for (const i of indices) {
+        fail(i, err)
+      }
+      continue
+    }
 
     if (!hitFrom) {
       const err = new ToolFailure('no such note to link from, or you do not have access to it')
@@ -189,17 +202,7 @@ export const handleLinkMany: Handler = async (ctx, rawArgs) => {
       }
       continue
     }
-    let sourceId: string
-
-    try {
-      const source = await hitFrom.store.read(from)
-      sourceId = source.id ?? from
-    } catch (err) {
-      for (const i of indices) {
-        fail(i, err)
-      }
-      continue
-    }
+    const sourceId = hitFrom.noteId
     const specs: LinkSpec[] = []
     const valid: number[] = []
 
@@ -224,11 +227,15 @@ export const handleLinkMany: Handler = async (ctx, rawArgs) => {
       continue
     }
     try {
-      const r = await linkNotesMany(hitFrom.store, {
-        fromId: sourceId,
-        links: specs,
-        ...writeAttributionOf(ctx),
-      })
+      const r = await linkNotesMany(
+        hitFrom.store,
+        {
+          fromId: sourceId,
+          links: specs,
+          ...writeAttributionOf(ctx),
+        },
+        mcpNoteMutationOptions,
+      )
 
       for (const i of valid) {
         byIndex.set(i, { index: i, ok: true, versionToken: r.versionToken ?? '' })

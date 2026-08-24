@@ -6,7 +6,7 @@
 // NOTHING and returns the current token — idempotent, and avoids journaling a synthesized baseline
 // that would misattribute the note.
 
-import type { KnowledgeStore } from '../../knowledgeStore'
+import type { KnowledgeStore, MutationOptions } from '../../knowledgeStore'
 import { StoreError, versionConflict } from '../../knowledgeStore'
 import { sha256Hex } from '../../libs/hash'
 import { replaceMarkdownSection, stripFrontmatter, stripTitleHeading } from '../../libs/markdown'
@@ -126,8 +126,10 @@ export const applyEdit = (body: string, input: EditNoteInput): string => {
 export const editNote = async (
   store: KnowledgeStore,
   input: EditNoteInput,
+  options?: MutationOptions,
 ): Promise<EditResult> => {
   const note = await store.read(input.noteId)
+  await options?.assertCurrent?.(note)
   const current = note.versionToken ?? ''
   const id = note.id ?? input.noteId
 
@@ -154,16 +156,19 @@ export const editNote = async (
   // write that omits them would clear them (the engine normalises absent tags to
   // []), exactly as the UI editor re-sends them. No directory → the note stays
   // in its current mount/folder; the class is never relabelled on an edit.
-  const r = await store.write({
-    title: note.title ?? '',
-    content: next,
-    originalId: id,
-    versionToken: current,
-    tags: normTags(note.frontmatter?.tags),
-    noteType: typeof note.frontmatter?.type === 'string' ? note.frontmatter.type : undefined,
-    principal: input.principal,
-    agent: input.agent,
-  })
+  const r = await store.write(
+    {
+      title: note.title ?? '',
+      content: next,
+      originalId: id,
+      versionToken: current,
+      tags: normTags(note.frontmatter?.tags),
+      noteType: typeof note.frontmatter?.type === 'string' ? note.frontmatter.type : undefined,
+      principal: input.principal,
+      agent: input.agent,
+    },
+    options,
+  )
   // Integrity echo: hash the body THIS edit wrote (`next`). For
   // `replace` the agent can recompute it from its own `content`; for the surgical
   // modes it confirms the post-edit size/hash without a get_note. Same caveat as

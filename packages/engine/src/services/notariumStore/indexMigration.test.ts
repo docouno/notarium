@@ -179,7 +179,7 @@ describeVector('index migration preserves vectors', () => {
    *  the replay then trips over its own ALTER ("duplicate column name"). */
   const seedEmbeddedIndex = async () => {
     const emb = countingEmbedder()
-    const sourceLocatorStep = INDEX_MIGRATIONS.at(-1)!
+    const sourceLocatorStep = INDEX_MIGRATIONS.at(-2)!
     const store = new NotariumStore({
       mounts: [userMount(notesDir)],
       sql: createNodeSqliteDriver(indexDb, { vec: true }),
@@ -322,8 +322,9 @@ describeVector('index migration preserves vectors', () => {
     // Reproduce the immediately-pre-task index: the file already contains an
     // authored same-name key, but the derived row has no projection column yet.
     await before.run(`ALTER TABLE notes DROP COLUMN source_locator`)
+    await before.run(`ALTER TABLE document_proofs DROP COLUMN context_json`)
     await before.run(`UPDATE meta SET value = ? WHERE key = ?`, [
-      String(INDEX_MIGRATIONS.length - 1),
+      String(INDEX_MIGRATIONS.length - 2),
       INDEX_VERSION_KEY,
     ])
     await before.close()

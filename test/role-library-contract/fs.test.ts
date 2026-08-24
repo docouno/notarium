@@ -23,8 +23,11 @@ import { promisify } from 'node:util'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
+  ensureNotariumResourceAuthority,
   FilePackagePublicationUnavailableError,
+  NotariumStoreCompositionOwner,
   renameNoReplaceIfAvailable,
+  SpaceResourceAuthorityRegistry,
 } from '@notarium/engine'
 import {
   createFsRoleLibrary,
@@ -74,6 +77,29 @@ const PERSONAL: RoleLocation = { scope: 'personal', space: 'personal' }
 const PROJECT: RoleLocation = { scope: 'project', space: 'personal', projectId: 'project-a' }
 const projectRoot = (mount: string): string =>
   join(mount, '_projects', Buffer.from(PROJECT.projectId!, 'utf8').toString('base64url'))
+const SKILL_PREFIX = '.notarium/skills'
+
+const admittedLibraryAt = (mount: string) => {
+  const registry = new SpaceResourceAuthorityRegistry()
+  const compositions = new NotariumStoreCompositionOwner()
+  const authority = ensureNotariumResourceAuthority({
+    spaceId: PERSONAL.space,
+    resourceAuthorityRegistry: registry,
+    composition: compositions.getOrCreate(PERSONAL.space, [
+      { class: 'skill', dir: mount, prefix: SKILL_PREFIX },
+    ]),
+  })
+  const library = writableLibrary(
+    createFsRoleLibrary({
+      publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+      rootForSpace: () => mount,
+      resourcePrefixForSpace: () => SKILL_PREFIX,
+      authorityForSpace: async () => authority,
+    }),
+  )
+
+  return { authority, library }
+}
 
 /** Permission-based fixtures are vacuous under a uid that ignores permissions. */
 const UNPRIVILEGED_GATE =
@@ -335,9 +361,11 @@ describe('role library publication capability', () => {
       packages: [{ directoryName: packageDirectoryOf('wanted') }],
     })
     await expect(absent.exists(PERSONAL, 'wanted')).resolves.toBe(true)
-    await expect(absent.getSkill(PERSONAL, 'wanted')).resolves.toMatchObject({
-      directoryName: packageDirectoryOf('wanted'),
-    })
+    await expect(absent.getAbilitiesNamed(PERSONAL, 'wanted')).resolves.toEqual(
+      new Map([
+        ['skill', expect.objectContaining({ directoryName: packageDirectoryOf('wanted') })],
+      ]),
+    )
   })
 
   it('refuses an incomplete configured authority during pure writer resolution', async () => {
@@ -598,6 +626,96 @@ describe('role library promotion refusals', () => {
       await expect(move).resolves.toBe(true)
     },
   )
+
+  itAtomicPublish(
+    'holds source and target package admissions through placement finalize',
+    async () => {
+      const mount = await mkmount()
+      const { library } = admittedLibraryAt(mount)
+      const pkg = packageOf('wanted', 'Owned.')
+
+      await expect(library.putIfAbsent(PROJECT, pkg)).resolves.toBe(true)
+      let entered!: () => void
+      const finalizing = new Promise<void>((resolve) => {
+        entered = resolve
+      })
+      let release!: () => void
+      const held = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      const moving = library.movePackage(PROJECT, PERSONAL, pkg.directoryName, async () => {
+        entered()
+        await held
+      })
+
+      await finalizing
+      const sourceRead = library.withExactPackageRead(PROJECT, pkg.directoryName, (read) => read())
+      const targetRead = library.withExactPackageRead(PERSONAL, pkg.directoryName, (read) => read())
+      const raced = await Promise.race([
+        Promise.all([sourceRead, targetRead]).then(() => 'read'),
+        new Promise((resolve) => setTimeout(() => resolve('waiting'), 60)),
+      ])
+
+      expect(raced).toBe('waiting')
+      release()
+      await expect(moving).resolves.toBe(true)
+      await expect(sourceRead).resolves.toBeNull()
+      await expect(targetRead).resolves.toMatchObject({
+        pkg: { directoryName: pkg.directoryName },
+        registryNoteId: pkg.directoryName,
+      })
+    },
+  )
+
+  itAtomicPublish('keeps an identity-bound mutation admitted through its callback', async () => {
+    const mount = await mkmount()
+    const { library } = admittedLibraryAt(mount)
+    const pkg = packageOf('wanted', 'Owned.')
+
+    await expect(library.putIfAbsent(PROJECT, pkg)).resolves.toBe(true)
+    let entered!: () => void
+    const admitted = new Promise<void>((resolve) => {
+      entered = resolve
+    })
+    let release!: () => void
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const mutation = library.withExactPackageMutation(PROJECT, pkg.directoryName, async (read) => {
+      expect(await read()).toMatchObject({ pkg: { directoryName: pkg.directoryName } })
+      entered()
+      await held
+      return true
+    })
+
+    await admitted
+    const moving = library.movePackage(PROJECT, PERSONAL, pkg.directoryName)
+    const raced = await Promise.race([
+      moving.then(() => 'moved'),
+      new Promise((resolve) => setTimeout(() => resolve('waiting'), 60)),
+    ])
+
+    expect(raced).toBe('waiting')
+    release()
+    await expect(mutation).resolves.toBe(true)
+    await expect(moving).resolves.toBe(true)
+  })
+
+  itAtomicPublish('rolls a finalize failure back before releasing either package', async () => {
+    const mount = await mkmount()
+    const { library } = admittedLibraryAt(mount)
+    const pkg = packageOf('wanted', 'Owned.')
+    const failure = new Error('placement metadata unavailable')
+
+    await expect(library.putIfAbsent(PROJECT, pkg)).resolves.toBe(true)
+    await expect(
+      library.movePackage(PROJECT, PERSONAL, pkg.directoryName, async () => {
+        throw failure
+      }),
+    ).rejects.toBe(failure)
+    await expect(library.getByDirectory(PROJECT, pkg.directoryName)).resolves.not.toBeNull()
+    await expect(library.getByDirectory(PERSONAL, pkg.directoryName)).resolves.toBeNull()
+  })
 
   itAtomicPublish(
     'refuses a destination name held by something that is not a package',

@@ -7,17 +7,15 @@ import type { FastifyInstance } from 'fastify'
 // run via plain `await <family>Routes(app, deps)`, NOT nested app.register, so they
 // SHARE that one scope (hooks, content-type parsers).
 
+import type { AbilitiesService } from '../../../../services/abilities'
 import type { AuthService } from '../../../../services/auth'
 import type {
   AgentSessionAuditPersistence,
-  AgentSessionsPersistence,
   ContextOrderPersistence,
   ContextSetsPersistence,
-  ProjectsPersistence,
   RetrievalLogPersistence,
   ScopePinsPersistence,
 } from '../../../../services/metaDb'
-import type { RolesService } from '../../../../services/roles'
 import type { SpaceManager } from '../../../../services/spaces'
 import type { StoreAccess } from '../../../../services/storeAccess'
 import { authFlowRoutes } from './authFlow'
@@ -36,9 +34,7 @@ export const authRoutes = async (
     contextOrder?: ContextOrderPersistence
     retrievalLog?: RetrievalLogPersistence
     sessionAudit?: AgentSessionAuditPersistence
-    roles?: RolesService
-    sessions?: AgentSessionsPersistence
-    projects?: ProjectsPersistence
+    abilities?: AbilitiesService
   },
 ) => {
   // Family handlers just throw; AuthError → wire envelope mapping is centralized

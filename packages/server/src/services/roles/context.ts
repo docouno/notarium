@@ -1,5 +1,5 @@
 import { CONTEXT_KIND } from '@notarium/contract'
-import { isGeneratedNoteId } from '@notarium/core'
+import { isGeneratedNoteId, type NoteClass } from '@notarium/core'
 
 import type { Principal } from '../authz'
 import type {
@@ -89,6 +89,7 @@ type RoleContextDeps = {
   contextSets?: ContextSetsPersistence
   scopePins?: ScopePinsPersistence
   contextOrder?: ContextOrderPersistence
+  noteClassAllowed?: (noteClass: NoteClass | undefined) => boolean
 }
 
 /** Resolve the three reusable context facets for the exact placement selected by the

@@ -60,7 +60,6 @@ export const useEditingState = (): EditingContextValue => {
   // which must not re-subscribe on every keystroke. draftRef is updated
   // synchronously on set so a navigation issued in the same tick sees it.
   const editorRef = useRef(editor)
-  editorRef.current = editor
   const draftRef = useRef<Draft | null>(draft)
   // `bypassRef` silences the blocker for the synchronous window in which our
   // own already-confirmed actions navigate (the draft state hasn't re-rendered
@@ -68,6 +67,9 @@ export const useEditingState = (): EditingContextValue => {
   const bypassRef = useRef(false)
   const sessionRef = useRef<(EditingSessionAdapter & { routeKey: string }) | null>(null)
   const versionTokenRef = useRef<string | undefined>(undefined)
+  const sessionSaveAvailable = sessionRef.current?.canSave?.(editor) ?? true
+  const exposedEditor = sessionSaveAvailable ? editor : { ...editor, canSave: false }
+  editorRef.current = exposedEditor
 
   const setDraft = useCallback((d: Draft | null) => {
     draftRef.current = d
@@ -447,15 +449,19 @@ export const useEditingState = (): EditingContextValue => {
       // ⌘/Ctrl+Enter shortcut, which bypasses any button gating.
       const externalSession = sessionRef.current
       const canWriteDraft =
-        externalSession?.canWrite ||
-        canWrite ||
-        (draftRef.current?.isNew === false &&
-          note?.class === NOTE_CLASS.skill &&
-          personalSpace != null &&
-          note.space === personalSpace.slug)
+        externalSession?.canWrite ??
+        (canWrite ||
+          (draftRef.current?.isNew === false &&
+            note?.class === NOTE_CLASS.skill &&
+            personalSpace != null &&
+            note.space === personalSpace.slug))
 
       if (!canWriteDraft) {
         toast.error('You have read-only access to this space.')
+        return
+      }
+      if (externalSession?.canSave?.(editorRef.current) === false) {
+        toast.error('The selected ability target is unavailable.')
         return
       }
       setSaving(true)
@@ -748,7 +754,7 @@ export const useEditingState = (): EditingContextValue => {
   const value: EditingContextValue = {
     isEditing,
     draft,
-    editor,
+    editor: exposedEditor,
     saving,
     startSession,
     startNew,

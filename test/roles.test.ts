@@ -1,11 +1,12 @@
 import { Buffer } from 'node:buffer'
 import { describe, expect, it, vi } from 'vitest'
 
-import { AbilityHealthSchema } from '@notarium/contract'
+import { ABILITY_KIND, AbilityHealthSchema, type OwnedAbilityLocator } from '@notarium/contract'
+import { serializeAbilityLocator } from '@notarium/core'
 
-import { SYSTEM_PRINCIPAL } from '../packages/server/src/services/authz'
+import { type Principal, SYSTEM_PRINCIPAL } from '../packages/server/src/services/authz'
 import type { Ctx } from '../packages/server/src/services/mcp/gateway'
-import { activateRole } from '../packages/server/src/services/mcp/tools/roles'
+import { activateRole, activateSkill } from '../packages/server/src/services/mcp/tools/roles'
 import { loadSavedSessionRole } from '../packages/server/src/services/mcp/tools/session/session'
 import {
   AbilityUnavailableError,
@@ -23,6 +24,7 @@ import {
   RoleInstallUnavailableError,
   type RoleLibraryComposition,
   type RoleLocation,
+  rolePackageMoveRollbackError,
   type RolePublicationTarget,
   type RolesService,
   SkillAlreadyExistsError,
@@ -50,6 +52,40 @@ const ownedNames = async (
 const packageDirectoryOf = (name: string): string =>
   Buffer.from(name).toString('base64url').padEnd(12, 'A').slice(0, 12)
 
+const loadedOf = <T>(outcome: { ok: boolean; loaded?: T }): T => {
+  expect(outcome.ok).toBe(true)
+  if (!outcome.loaded) {
+    throw new Error('expected a loaded ability outcome')
+  }
+
+  return outcome.loaded
+}
+
+const forkRoleVersion = async (
+  roles: RolesService,
+  principal: Principal,
+  locator: Extract<OwnedAbilityLocator, { kind: 'role' }>,
+  personalSpace: string | null,
+  projectId: string,
+) => {
+  const source = await roles.withCurrentOwnedTarget(
+    locator,
+    principal,
+    async (snapshot) => snapshot,
+  )
+
+  if (!source || source.locator.kind !== ABILITY_KIND.role) {
+    throw new AbilityUnavailableError('no such Owned Role')
+  }
+
+  return roles.createRoleVersion(
+    principal,
+    { ...source, locator: source.locator },
+    personalSpace,
+    projectId,
+  )
+}
+
 const pkg = (name: string, description: string, body: string): SkillPackage => ({
   directoryName: packageDirectoryOf(name),
   files: new Map([
@@ -69,6 +105,17 @@ const skillPkg = (name: string, description: string, body = ''): SkillPackage =>
   ]),
 })
 
+const claimed = (source: SkillPackage, registryNoteId: string): SkillPackage => {
+  const files = new Map(source.files)
+  const manifest = Buffer.from(files.get('SKILL.md')!).toString('utf8')
+
+  files.set(
+    'SKILL.md',
+    Buffer.from(manifest.replace('---\n', `---\nnotarium-id: ${registryNoteId}\n`)),
+  )
+  return { ...source, files }
+}
+
 const catalogPackage = (sourcePackage: SkillPackage): SkillPackage => {
   const files = new Map(sourcePackage.files)
   const raw = Buffer.from(files.get('SKILL.md')!).toString('utf8')
@@ -82,6 +129,466 @@ const catalogPackage = (sourcePackage: SkillPackage): SkillPackage => {
 }
 
 describe('role catalog and owned libraries', () => {
+  it('forwards the fenced raw-member roster through the owned removal adapter', async () => {
+    const directoryName = 'AbCdefGhij_1'
+    const composition = createInMemoryRoleLibrary()
+    const files = new Map<string, Uint8Array>([
+      [
+        'SKILL.md',
+        Buffer.from(
+          '---\nname: roster-proof\ndescription: Roster forwarding proof.\n---\n\nInstructions.',
+        ),
+      ],
+    ])
+    const members = ['SKILL.md', 'references']
+    const inspectAndRemove = vi.fn(async (_location, _packageId, options) => {
+      await options.assertSafe({ directoryName, files }, members)
+      return true
+    })
+    const roles = createRolesService({
+      catalog: async () => [],
+      ...composition,
+      library: { ...composition.library, inspectAndRemove },
+      ...inMemoryAbilityPersistence(),
+    })
+    const assertSafe = vi.fn()
+    const remove = vi.fn()
+
+    await expect(
+      roles.inspectAndRemoveOwned(
+        {
+          locator: {
+            source: 'owned',
+            kind: 'skill',
+            packageId: directoryName,
+            location: { scope: 'personal', spaceId: 'personal' },
+          },
+          registryNoteId: 'RegistryNote1',
+          manifestNoteId: 'ManifestNote1',
+        },
+        'personal',
+        { assertSafe, remove },
+      ),
+    ).resolves.toBe(true)
+    expect(assertSafe).toHaveBeenCalledWith(files, members)
+    expect(inspectAndRemove).toHaveBeenCalledWith(
+      { scope: 'personal', space: 'personal' },
+      directoryName,
+      expect.objectContaining({
+        expected: {
+          kind: 'skill',
+          registryNoteId: 'RegistryNote1',
+          manifestNoteId: 'ManifestNote1',
+        },
+        remove,
+      }),
+    )
+  })
+
+  it('rejects a recorded move target that changes package identity or Space', async () => {
+    const stale = {
+      source: 'owned',
+      kind: 'role',
+      packageId: 'AbCdefGhij_1',
+      location: { scope: 'project', spaceId: 'shared', projectId: 'project-a' },
+    } as const
+    const invalidTargets = [
+      {
+        ...stale,
+        kind: 'skill' as const,
+        location: { scope: 'space' as const, spaceId: 'shared' },
+      },
+      {
+        ...stale,
+        location: { scope: 'space' as const, spaceId: 'other-space' },
+      },
+      {
+        ...stale,
+        packageId: 'ZyXwvUtsrq_2',
+        location: { scope: 'space' as const, spaceId: 'shared' },
+      },
+      {
+        source: 'system' as const,
+        kind: 'role' as const,
+        packageId: stale.packageId,
+      },
+    ]
+
+    for (const invalid of invalidTargets) {
+      const roles = createRolesService({
+        ...inMemoryAbilityPersistence(),
+        catalog: loadBundledAbilityInventory,
+        ...createInMemoryRoleLibrary(),
+        abilityPlacement: {
+          resolveMovedOwnedRoleLocator: async () => ({
+            toLocator: serializeAbilityLocator(invalid),
+            registryNoteId: 'RegistryNote1',
+            manifestNoteId: 'ManifestNote1',
+          }),
+          moveOwnedRolePlacement: async () => {},
+        },
+      })
+
+      await expect(
+        roles.withCurrentOwnedTarget(stale, SYSTEM_PRINCIPAL, async ({ locator }) => locator),
+      ).resolves.toBeNull()
+    }
+
+    const legacy = createRolesService({
+      ...inMemoryAbilityPersistence(),
+      catalog: loadBundledAbilityInventory,
+      ...createInMemoryRoleLibrary(),
+      abilityPlacement: {
+        resolveMovedOwnedRoleLocator: async () => ({
+          toLocator: serializeAbilityLocator({
+            ...stale,
+            location: { scope: 'space', spaceId: 'shared' },
+          }),
+          registryNoteId: null,
+          manifestNoteId: null,
+        }),
+        moveOwnedRolePlacement: async () => {},
+      },
+    })
+
+    await expect(
+      legacy.withCurrentOwnedTarget(stale, SYSTEM_PRINCIPAL, async ({ locator }) => locator),
+    ).resolves.toBeNull()
+  })
+
+  it('uses no-row input but lets a recorded identity retire a reoccupied source', async () => {
+    const source = { scope: 'project' as const, space: 'shared', projectId: 'project-a' }
+    const target = { scope: 'space' as const, space: 'shared' }
+    const packageId = 'AbCdefGhij_1'
+    const stale = {
+      source: 'owned',
+      kind: 'role',
+      packageId,
+      location: { scope: 'project', spaceId: 'shared', projectId: 'project-a' },
+    } as const
+    const moved = { ...stale, location: { scope: 'space', spaceId: 'shared' } } as const
+    const backing = writableLibrary(createInMemoryRoleLibrary())
+    const original = {
+      ...claimed(pkg('original-role', 'Original.', 'Original body.'), 'ManifestOriginal'),
+      directoryName: packageId,
+    }
+    const collision = {
+      ...claimed(pkg('collision-role', 'Collision.', 'Collision body.'), 'CollisionManifest'),
+      directoryName: packageId,
+    }
+
+    await backing.putIfAbsent(target, original)
+    await backing.putIfAbsent(source, collision)
+    let recorded: {
+      toLocator: string
+      registryNoteId: string | null
+      manifestNoteId: string | null
+    } | null = null
+    const reads: RoleLocation[] = []
+    const roles = createRolesService({
+      ...inMemoryAbilityPersistence(),
+      catalog: async () => [],
+      publication: backing.deps.publication,
+      library: {
+        ...backing.deps.library,
+        withExactPackageRead: (location, directoryName, task) => {
+          reads.push(location)
+          return backing.deps.library.withExactPackageRead(location, directoryName, (read) =>
+            task(async () => {
+              const snapshot = await read()
+
+              return snapshot
+                ? {
+                    ...snapshot,
+                    registryNoteId:
+                      location.scope === 'space' ? 'RegistryOriginal' : 'CollisionRegistry',
+                  }
+                : null
+            }),
+          )
+        },
+      },
+      abilityPlacement: {
+        resolveMovedOwnedRoleLocator: async () => recorded,
+        moveOwnedRolePlacement: async () => {},
+      },
+    })
+
+    await expect(
+      roles.withCurrentOwnedTarget(stale, SYSTEM_PRINCIPAL, async ({ locator }) => locator),
+    ).resolves.toEqual(stale)
+    expect(reads).toEqual([source])
+
+    reads.length = 0
+    recorded = {
+      toLocator: serializeAbilityLocator(moved),
+      registryNoteId: 'RegistryOriginal',
+      manifestNoteId: 'ManifestOriginal',
+    }
+    await expect(
+      roles.withCurrentOwnedTarget(stale, SYSTEM_PRINCIPAL, async ({ locator }) => locator),
+    ).resolves.toEqual(moved)
+    // The old placement is a TOMBSTONE once a row exists. Its live collision is never
+    // even opened; only the recorded target is exact-read.
+    expect(reads).toEqual([target])
+  })
+
+  it.each([
+    ['missing target', null, 'OriginalRegistry', 'ManifestOriginal'],
+    [
+      'reoccupied target with stale projection',
+      claimed(pkg('other-role', 'Other.', 'Other body.'), 'OtherRegistry'),
+      'OriginalRegistry',
+      'ManifestOriginal',
+    ],
+    [
+      'wrong target kind',
+      claimed(skillPkg('other-skill', 'Other skill.'), 'OriginalRegistry'),
+      'OriginalRegistry',
+      'OriginalRegistry',
+    ],
+    [
+      'wrong projected identity',
+      claimed(pkg('original-role', 'Original.', 'Body.'), 'OriginalRegistry'),
+      'OtherRegistry',
+      'OriginalRegistry',
+    ],
+  ] as const)(
+    'fails closed on a recorded move with %s',
+    async (_case, targetPackage, projectedRegistryNoteId, recordedManifestNoteId) => {
+      const source = { scope: 'project' as const, space: 'shared', projectId: 'project-a' }
+      const target = { scope: 'space' as const, space: 'shared' }
+      const packageId = 'AbCdefGhij_1'
+      const stale = {
+        source: 'owned',
+        kind: 'role',
+        packageId,
+        location: { scope: 'project', spaceId: 'shared', projectId: 'project-a' },
+      } as const
+      const moved = { ...stale, location: { scope: 'space', spaceId: 'shared' } } as const
+      const backing = writableLibrary(createInMemoryRoleLibrary())
+
+      await backing.putIfAbsent(source, {
+        ...pkg('collision-role', 'Collision.', 'Collision body.'),
+        directoryName: packageId,
+      })
+      if (targetPackage) {
+        await backing.putIfAbsent(target, { ...targetPackage, directoryName: packageId })
+      }
+      const roles = createRolesService({
+        ...inMemoryAbilityPersistence(),
+        catalog: async () => [],
+        publication: backing.deps.publication,
+        library: {
+          ...backing.deps.library,
+          withExactPackageRead: (location, directoryName, task) =>
+            backing.deps.library.withExactPackageRead(location, directoryName, (read) =>
+              task(async () => {
+                const snapshot = await read()
+                return snapshot ? { ...snapshot, registryNoteId: projectedRegistryNoteId } : null
+              }),
+            ),
+        },
+        abilityPlacement: {
+          resolveMovedOwnedRoleLocator: async () => ({
+            toLocator: serializeAbilityLocator(moved),
+            registryNoteId: 'OriginalRegistry',
+            manifestNoteId: recordedManifestNoteId,
+          }),
+          moveOwnedRolePlacement: async () => {},
+        },
+      })
+
+      await expect(
+        roles.withCurrentOwnedTarget(stale, SYSTEM_PRINCIPAL, async ({ locator }) => locator),
+      ).resolves.toBeNull()
+    },
+  )
+
+  it('fails closed on a recorded target whose exact manifest is corrupt', async () => {
+    const packageId = 'AbCdefGhij_1'
+    const stale = {
+      source: 'owned',
+      kind: 'role',
+      packageId,
+      location: { scope: 'project', spaceId: 'shared', projectId: 'project-a' },
+    } as const
+    const moved = { ...stale, location: { scope: 'space', spaceId: 'shared' } } as const
+    const composition = createInMemoryRoleLibrary()
+    const roles = createRolesService({
+      ...inMemoryAbilityPersistence(),
+      catalog: async () => [],
+      publication: composition.publication,
+      library: {
+        ...composition.library,
+        withExactPackageRead: (_location, _directoryName, task) =>
+          task(async () => ({
+            pkg: {
+              directoryName: packageId,
+              files: new Map([['SKILL.md', Buffer.from('not valid frontmatter')]]),
+            },
+            registryNoteId: 'OriginalRegistry',
+          })),
+      },
+      abilityPlacement: {
+        resolveMovedOwnedRoleLocator: async () => ({
+          toLocator: serializeAbilityLocator(moved),
+          registryNoteId: 'OriginalRegistry',
+          manifestNoteId: 'OriginalRegistry',
+        }),
+        moveOwnedRolePlacement: async () => {},
+      },
+    })
+
+    await expect(
+      roles.withCurrentOwnedTarget(stale, SYSTEM_PRINCIPAL, async ({ locator }) => locator),
+    ).resolves.toBeNull()
+  })
+
+  it('retries authority when a back-move commits while the shared read waits', async () => {
+    const source = { scope: 'project' as const, space: 'shared', projectId: 'project-a' }
+    const target = { scope: 'space' as const, space: 'shared' }
+    const packageId = 'AbCdefGhij_1'
+    const stale = {
+      source: 'owned',
+      kind: 'role',
+      packageId,
+      location: { scope: 'project', spaceId: 'shared', projectId: 'project-a' },
+    } as const
+    const moved = { ...stale, location: { scope: 'space', spaceId: 'shared' } } as const
+    const backing = writableLibrary(createInMemoryRoleLibrary())
+
+    await backing.putIfAbsent(target, {
+      ...claimed(pkg('original-role', 'Original.', 'Original body.'), packageId),
+      directoryName: packageId,
+    })
+    const hop = {
+      toLocator: serializeAbilityLocator(moved),
+      registryNoteId: packageId,
+      manifestNoteId: packageId,
+    }
+    let authorityReads = 0
+    const readLocations: RoleLocation[] = []
+    const roles = createRolesService({
+      ...inMemoryAbilityPersistence(),
+      catalog: async () => [],
+      publication: backing.deps.publication,
+      library: {
+        ...backing.deps.library,
+        withExactPackageRead: (location, directoryName, task) => {
+          readLocations.push(location)
+          return backing.deps.library.withExactPackageRead(location, directoryName, task)
+        },
+      },
+      abilityPlacement: {
+        // First selection says source. Its under-lease recheck sees the move; the
+        // second selection and recheck agree on target.
+        resolveMovedOwnedRoleLocator: async () => (++authorityReads === 1 ? null : hop),
+        moveOwnedRolePlacement: async () => {},
+      },
+    })
+
+    await expect(
+      roles.withCurrentOwnedTarget(stale, SYSTEM_PRINCIPAL, async ({ locator }) => locator),
+    ).resolves.toEqual(moved)
+    expect(readLocations).toEqual([source, target])
+    expect(authorityReads).toBe(4)
+  })
+
+  it.each([
+    ['same kind', claimed(pkg('review', 'Replacement.', 'Replacement body.'), 'ReplacementId')],
+    ['cross kind', claimed(skillPkg('review', 'Replacement skill.'), 'ReplacementSkillId')],
+  ] as const)(
+    'rejects a carried target reoccupied by %s at the same address and name',
+    async (_case, replacement) => {
+      const packageId = 'AbCdefGhij_1'
+      const locator = {
+        source: 'owned' as const,
+        kind: 'role' as const,
+        packageId,
+        location: { scope: 'space' as const, spaceId: 'shared' },
+      }
+      const original = claimed(pkg('review', 'Original.', 'Original body.'), 'OriginalId')
+      let current = { ...original, directoryName: packageId }
+      let registryNoteId = 'OriginalRegistry'
+      const exact: RoleLibraryComposition['library']['withExactPackageRead'] = async (
+        _location,
+        _directoryName,
+        task,
+      ) => task(async () => ({ pkg: current, registryNoteId }))
+      const composition = createInMemoryRoleLibrary()
+      const roles = createRolesService({
+        ...inMemoryAbilityPersistence(),
+        catalog: async () => [],
+        publication: composition.publication,
+        library: {
+          ...composition.library,
+          withExactPackageRead: exact,
+          withExactPackageMutation: exact,
+        },
+      })
+      const target = await roles.withCurrentOwnedTarget(
+        locator,
+        SYSTEM_PRINCIPAL,
+        async (proof) => proof,
+      )
+
+      expect(target).toMatchObject({
+        registryNoteId: 'OriginalRegistry',
+        manifestNoteId: 'OriginalId',
+      })
+      current = { ...replacement, directoryName: packageId }
+      registryNoteId = 'ReplacementRegistry'
+      const called = vi.fn()
+
+      await expect(
+        roles.withOwnedTarget(target!, SYSTEM_PRINCIPAL, async (proof) => {
+          called(proof)
+          return true
+        }),
+      ).resolves.toBeNull()
+      expect(called).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each([
+    ['same kind', claimed(pkg('review', 'Replacement.', 'Replacement body.'), 'ReplacementId')],
+    ['cross kind', claimed(skillPkg('review', 'Replacement skill.'), 'ReplacementSkillId')],
+  ] as const)(
+    'rechecks move source kind and both identities under admission after %s replacement',
+    async (_case, replacement) => {
+      const source = { scope: 'project' as const, space: 'shared', projectId: 'project-web' }
+      const destination = { scope: 'space' as const, space: 'shared' }
+      const packageId = 'AbCdefGhij_1'
+      const composition = createInMemoryRoleLibrary()
+      const library = writableLibrary(composition)
+
+      await library.putIfAbsent(source, {
+        ...claimed(pkg('review', 'Original.', 'Original body.'), 'OriginalId'),
+        directoryName: packageId,
+      })
+      ;(composition.library as typeof composition.library & { clear(): void }).clear()
+      await library.putIfAbsent(source, { ...replacement, directoryName: packageId })
+      const publisher = await composition.publication.publicationFor(destination)
+
+      expect(publisher).not.toBeNull()
+      await expect(
+        publisher!.moveFrom(
+          source,
+          packageId,
+          {
+            kind: ABILITY_KIND.role,
+            registryNoteId: packageId,
+            manifestNoteId: 'OriginalId',
+          },
+          async () => undefined,
+        ),
+      ).rejects.toBeInstanceOf(AbilityUnavailableError)
+      await expect(library.getByDirectory(source, packageId)).resolves.not.toBeNull()
+      await expect(library.getByDirectory(destination, packageId)).resolves.toBeNull()
+    },
+  )
+
   it('does not persist a session role when context assembly fails', async () => {
     const setRole = vi.fn()
     const contextFailure = new Error('context store unavailable')
@@ -258,10 +765,13 @@ describe('role catalog and owned libraries', () => {
       truncated: false,
     })
     expect(await roles.loadEffective(context, SYSTEM_PRINCIPAL, 'grooming', 4_000)).toMatchObject({
-      role: { name: 'grooming' },
-      location: { scope: 'personal', space: 'space-personal' },
-      skills: [{ name: 'grooming-evidence' }],
-      truncated: false,
+      ok: true,
+      loaded: {
+        role: { name: 'grooming' },
+        location: { scope: 'personal', space: 'space-personal' },
+        skills: [{ name: 'grooming-evidence' }],
+        truncated: false,
+      },
     })
   })
 
@@ -284,14 +794,17 @@ describe('role catalog and owned libraries', () => {
     await expect(
       roles.resolveEffective(context, SYSTEM_PRINCIPAL, 'research'),
     ).resolves.toMatchObject({ role: { name: 'research', source: 'system' }, locator })
-    // Answering at all IS the health verdict here: the loader drops an unsound role
-    // rather than handing back a summary that says so.
+    // Loading is a typed outcome: success carries the resolved package, while a
+    // disabled System candidate stays diagnosable instead of collapsing to null.
     await expect(
       roles.loadEffective(context, SYSTEM_PRINCIPAL, 'research', 4_000),
     ).resolves.toMatchObject({
-      role: { name: 'research', source: 'system' },
-      locator,
-      skills: [{ name: 'research-evidence' }],
+      ok: true,
+      loaded: {
+        role: { name: 'research', source: 'system' },
+        locator,
+        skills: [{ name: 'research-evidence' }],
+      },
     })
 
     await roles.setEnabled(context, SYSTEM_PRINCIPAL, locator, false)
@@ -302,7 +815,13 @@ describe('role catalog and owned libraries', () => {
     await expect(roles.resolveEffective(context, SYSTEM_PRINCIPAL, 'research')).resolves.toBeNull()
     await expect(
       roles.loadEffective(context, SYSTEM_PRINCIPAL, 'research', 4_000),
-    ).resolves.toBeNull()
+    ).resolves.toMatchObject({
+      ok: false,
+      reason: 'disabled',
+      source: 'system',
+      access: 'system',
+      remediation: [{ kind: 'open-agents-ui' }],
+    })
   })
 
   /** Activation without resume is half a link: the episode would raise the role once
@@ -320,14 +839,19 @@ describe('role catalog and owned libraries', () => {
     await expect(
       roles.loadSavedRole(context, SYSTEM_PRINCIPAL, locator, 4_000),
     ).resolves.toMatchObject({
-      source: 'system',
-      role: { source: 'system', name: 'research' },
-      skills: [{ name: 'research-evidence' }],
-      locator,
+      ok: true,
+      loaded: {
+        source: 'system',
+        role: { source: 'system', name: 'research' },
+        skills: [{ name: 'research-evidence' }],
+        locator,
+      },
     })
 
     await roles.setEnabled(context, SYSTEM_PRINCIPAL, locator, false)
-    await expect(roles.loadSavedRole(context, SYSTEM_PRINCIPAL, locator, 4_000)).resolves.toBeNull()
+    await expect(
+      roles.loadSavedRole(context, SYSTEM_PRINCIPAL, locator, 4_000),
+    ).resolves.toMatchObject({ ok: false, reason: 'disabled', source: 'system' })
   })
 
   it('uses Owned over System, but an explicit disable reveals the System fallback', async () => {
@@ -354,12 +878,13 @@ describe('role catalog and owned libraries', () => {
     await expect(
       roles.loadEffective(context, SYSTEM_PRINCIPAL, 'research', 4_000),
     ).resolves.toMatchObject({
-      role: { source: 'owned', instructions: 'Personal instructions.' },
+      ok: true,
+      loaded: { role: { source: 'owned', instructions: 'Personal instructions.' } },
     })
     await roles.setEnabled(context, SYSTEM_PRINCIPAL, locator, false)
     await expect(
       roles.loadEffective(context, SYSTEM_PRINCIPAL, 'research', 4_000),
-    ).resolves.toMatchObject({ role: { source: 'system' } })
+    ).resolves.toMatchObject({ ok: true, loaded: { role: { source: 'system' } } })
   })
 
   it('skips wrong-kind and disabled Owned candidates before choosing a broader fallback', async () => {
@@ -437,9 +962,99 @@ describe('role catalog and owned libraries', () => {
     await expect(
       roles.loadEffective(context, SYSTEM_PRINCIPAL, 'fallback-role', 4_000),
     ).resolves.toMatchObject({
-      location: { scope: 'personal', space: 'personal' },
-      locator: expectedLocator,
+      ok: true,
+      loaded: {
+        location: { scope: 'personal', space: 'personal' },
+        locator: expectedLocator,
+      },
     })
+    const resolution = await roles.listAbilityResolution(context, SYSTEM_PRINCIPAL)
+
+    expect(
+      resolution.candidates.filter(({ kind, name }) => kind === 'role' && name === 'fallback-role'),
+    ).toMatchObject([
+      expect.objectContaining({ source: 'owned', enabled: true, effective: true }),
+      expect.objectContaining({ source: 'owned', enabled: false, effective: false }),
+    ])
+  })
+
+  it('uses one reach-aware winner kernel for standalone skills and role discovery', async () => {
+    const library = writableLibrary(createInMemoryRoleLibrary())
+    const abilityAvailability = new InMemoryAbilityAvailability()
+    const roles = createRolesService({
+      catalog: async () => [],
+      ...library.deps,
+      ...inMemoryAbilityPersistence(),
+      abilityAvailability,
+    })
+    const context = {
+      personalSpace: 'personal',
+      project: {
+        id: 'project-a',
+        space: 'shared',
+        path: 'main',
+        slug: 'main',
+        aliases: [],
+        pathAliases: [],
+        displayName: 'Main',
+        status: 'active' as const,
+        createdAt: 'x',
+        lastSeen: 'x',
+      },
+    }
+    await roles.createCustomSkill('standalone', 'Personal fallback.', 'Personal body.', {
+      scope: 'personal',
+      space: 'personal',
+    })
+    const shared = await roles.createCustomSkill(
+      'standalone',
+      'Shared candidate.',
+      'Shared body.',
+      { scope: 'space', space: 'shared' },
+      { mode: 'selected-projects', projectIds: ['project-b'] },
+    )
+    const first = (await roles.listAbilityResolution(context, SYSTEM_PRINCIPAL)).candidates.filter(
+      ({ kind, name }) => kind === 'skill' && name === 'standalone',
+    )
+
+    expect(first).toMatchObject([
+      expect.objectContaining({
+        location: expect.objectContaining({ scope: 'personal' }),
+        effective: true,
+      }),
+      expect.objectContaining({
+        location: expect.objectContaining({ scope: 'space' }),
+        effective: false,
+      }),
+    ])
+    await abilityAvailability.set('shared', shared.packageId, {
+      mode: 'selected-projects',
+      projectIds: ['project-a'],
+    })
+    const second = (await roles.listAbilityResolution(context, SYSTEM_PRINCIPAL)).candidates.filter(
+      ({ kind, name }) => kind === 'skill' && name === 'standalone',
+    )
+
+    expect(second).toMatchObject([
+      expect.objectContaining({
+        location: expect.objectContaining({ scope: 'personal' }),
+        effective: false,
+      }),
+      expect.objectContaining({
+        location: expect.objectContaining({ scope: 'space' }),
+        effective: true,
+      }),
+    ])
+    const outsideProject = (
+      await roles.listAbilityResolution({ personalSpace: 'personal' }, SYSTEM_PRINCIPAL)
+    ).candidates.filter(({ kind, name }) => kind === 'skill' && name === 'standalone')
+
+    expect(outsideProject).toMatchObject([
+      expect.objectContaining({
+        location: expect.objectContaining({ scope: 'personal' }),
+        effective: true,
+      }),
+    ])
   })
 
   it('rejects a Space locator alias for a package in the Personal root', async () => {
@@ -579,7 +1194,7 @@ describe('role catalog and owned libraries', () => {
     })
     await expect(
       roles.loadEffective({ personalSpace: 'personal' }, SYSTEM_PRINCIPAL, 'research', 4_000),
-    ).resolves.toBeNull()
+    ).resolves.toMatchObject({ ok: false, reason: 'unhealthy' })
 
     await expect(
       roles.serializeOwnedRoleAttachments(
@@ -774,7 +1389,22 @@ describe('role catalog and owned libraries', () => {
     })
     await expect(
       roles.loadEffective(context, SYSTEM_PRINCIPAL, 'health-matrix', 4_000),
-    ).resolves.toBeNull()
+    ).resolves.toMatchObject({
+      ok: false,
+      reason: 'unhealthy',
+      source: 'owned',
+      health: {
+        healthy: false,
+        attachments: [
+          { health: 'healthy' },
+          { health: 'missing' },
+          { health: 'disabled' },
+          { health: 'unavailable' },
+          { health: 'wrong-kind' },
+          { health: 'invalid-locator' },
+        ],
+      },
+    })
   })
 
   /** A hand-edited or imported `SKILL.md` is a supported way in — the package is
@@ -967,12 +1597,15 @@ describe('role catalog and owned libraries', () => {
         4_000,
       ),
     ).toMatchObject({
-      role: {
-        scope: 'project',
-        description: 'Project wording.',
-        instructions: 'Project rules win.',
+      ok: true,
+      loaded: {
+        role: {
+          scope: 'project',
+          description: 'Project wording.',
+          instructions: 'Project rules win.',
+        },
+        location: project,
       },
-      location: project,
     })
     // Outside a project the chain has no project link, so the same name resolves to
     // the personal body — the override is not a replacement, it is a narrower place.
@@ -984,7 +1617,13 @@ describe('role catalog and owned libraries', () => {
         4_000,
       ),
     ).toMatchObject({
-      role: { scope: 'personal', instructions: expect.not.stringContaining('Project rules win.') },
+      ok: true,
+      loaded: {
+        role: {
+          scope: 'personal',
+          instructions: expect.not.stringContaining('Project rules win.'),
+        },
+      },
     })
   })
 
@@ -1031,9 +1670,12 @@ describe('role catalog and owned libraries', () => {
     await expect(
       roles.loadSavedRole(context, SYSTEM_PRINCIPAL, savedLocator, 4_000),
     ).resolves.toMatchObject({
-      role: { name: 'exact-role' },
-      packageId: roleId,
-      skills: [{ name: 'renamed-evidence', instructions: 'Exact body.' }],
+      ok: true,
+      loaded: {
+        role: { name: 'exact-role' },
+        packageId: roleId,
+        skills: [{ name: 'renamed-evidence', instructions: 'Exact body.' }],
+      },
     })
 
     const missingExact = createRolesService({
@@ -1048,7 +1690,7 @@ describe('role catalog and owned libraries', () => {
     })
     await expect(
       missingExact.loadSavedRole(context, SYSTEM_PRINCIPAL, savedLocator, 4_000),
-    ).resolves.toBeNull()
+    ).resolves.toMatchObject({ ok: false, reason: 'unhealthy' })
   })
 
   it('keeps context preset identity stable when the role label changes', () => {
@@ -1111,7 +1753,7 @@ describe('role catalog and owned libraries', () => {
 
     await expect(
       roles.loadEffective(context('project-a'), SYSTEM_PRINCIPAL, 'cross-role', 4_000),
-    ).resolves.toBeNull()
+    ).resolves.toMatchObject({ ok: false, reason: 'unhealthy' })
     await abilityAvailability.set('shared', dependencyId, {
       mode: 'selected-projects',
       projectIds: ['project-a', 'project-b'],
@@ -1119,16 +1761,18 @@ describe('role catalog and owned libraries', () => {
     await expect(
       roles.loadEffective(context('project-a'), SYSTEM_PRINCIPAL, 'cross-role', 4_000),
     ).resolves.toMatchObject({
-      skills: [{ name: 'shared-evidence', instructions: 'Shared exact body.' }],
+      ok: true,
+      loaded: { skills: [{ name: 'shared-evidence', instructions: 'Shared exact body.' }] },
     })
     await expect(
       roles.loadEffective(context('project-b'), SYSTEM_PRINCIPAL, 'cross-role', 4_000),
     ).resolves.toMatchObject({
-      skills: [{ name: 'shared-evidence', instructions: 'Shared exact body.' }],
+      ok: true,
+      loaded: { skills: [{ name: 'shared-evidence', instructions: 'Shared exact body.' }] },
     })
     await expect(
       roles.loadEffective(context('project-c'), SYSTEM_PRINCIPAL, 'cross-role', 4_000),
-    ).resolves.toBeNull()
+    ).resolves.toMatchObject({ ok: false, reason: 'unhealthy' })
   })
 
   it('rehydrates a renamed session role by exact package and never by a replacement name', async () => {
@@ -1165,13 +1809,14 @@ describe('role catalog and owned libraries', () => {
         location: { scope: 'personal' as const, spaceId: 'personal' },
       },
       roleContextProjectId: null,
+      projectId: null,
     }
 
     await expect(
       loadSavedSessionRole(roles, { personalSpace: 'personal' }, SYSTEM_PRINCIPAL, saved, 4_000),
     ).resolves.toMatchObject({
-      role: { name: 'renamed-role', instructions: 'Renamed body.' },
-      packageId,
+      ok: true,
+      loaded: { role: { name: 'renamed-role', instructions: 'Renamed body.' }, packageId },
     })
     const missingExact = createRolesService({
       catalog: async () => [],
@@ -1191,7 +1836,7 @@ describe('role catalog and owned libraries', () => {
         saved,
         4_000,
       ),
-    ).resolves.toBeNull()
+    ).resolves.toMatchObject({ ok: false, reason: 'gone' })
 
     // A resume reaches the SAME placements resolution does, and a Space scope
     // borrowed for the caller's own personal library is not one of them: the two are
@@ -1220,6 +1865,7 @@ describe('role catalog and owned libraries', () => {
         {
           ...saved,
           roleContextProjectId: 'project-mine',
+          projectId: null,
           roleLocator: {
             ...saved.roleLocator,
             location: { scope: 'space' as const, spaceId: 'personal' },
@@ -1227,7 +1873,51 @@ describe('role catalog and owned libraries', () => {
         },
         4_000,
       ),
-    ).resolves.toBeNull()
+    ).resolves.toMatchObject({ ok: false, reason: 'gone' })
+  })
+
+  it('offers both current and saved projects for a resumed role context mismatch', async () => {
+    const roles = createRolesService({
+      catalog: async () => [],
+      ...writableLibrary(createInMemoryRoleLibrary()).deps,
+      ...inMemoryAbilityPersistence(),
+    })
+    const saved = {
+      id: 'ses_aaaaaaaaaaaa',
+      owner: 'alice',
+      name: 'work',
+      named: true,
+      parentId: null,
+      createdAt: 'x',
+      lastSeenAt: 'x',
+      calls: 1,
+      role: 'review',
+      roleLocator: {
+        source: 'system' as const,
+        kind: 'role' as const,
+        packageId: 'ZME09f9AROG8',
+      },
+      roleContextProjectId: 'project-a',
+      projectId: 'project-b',
+    }
+
+    await expect(
+      loadSavedSessionRole(
+        roles,
+        projectContext('project-b', 'shared'),
+        SYSTEM_PRINCIPAL,
+        saved,
+        4_000,
+        { saved: 'team/a', current: 'team/b' },
+      ),
+    ).resolves.toMatchObject({
+      ok: false,
+      reason: 'context-mismatch',
+      remediation: [
+        { kind: 'reactivate-role', role: 'review', project: 'team/b' },
+        { kind: 'reactivate-role', role: 'review', project: 'team/a' },
+      ],
+    })
   })
 
   it('resumes a bound role only where its reach still answers', async () => {
@@ -1253,17 +1943,17 @@ describe('role catalog and owned libraries', () => {
     // Where the reach answers, resume and activation agree.
     await expect(
       roles.loadSavedRole(projectContext('project-a', 'shared'), SYSTEM_PRINCIPAL, locator, 4_000),
-    ).resolves.toMatchObject({ role: { name: 'review' } })
+    ).resolves.toMatchObject({ ok: true, loaded: { role: { name: 'review' } } })
 
     // And where it does not, they must STILL agree: a listing that refuses to offer
     // the role and a resume that hands over its instructions are the same session
     // telling the agent two different things about the same role.
     await expect(
       roles.loadEffective(projectContext('project-b', 'shared'), SYSTEM_PRINCIPAL, 'review', 4_000),
-    ).resolves.toBeNull()
+    ).resolves.toMatchObject({ ok: false, reason: 'out-of-reach' })
     await expect(
       roles.loadSavedRole(projectContext('project-b', 'shared'), SYSTEM_PRINCIPAL, locator, 4_000),
-    ).resolves.toBeNull()
+    ).resolves.toMatchObject({ ok: false, reason: 'out-of-reach' })
   })
 
   it('resumes a Space role whose skill reaches only the project being resumed in', async () => {
@@ -1309,10 +1999,13 @@ describe('role catalog and owned libraries', () => {
     // the role resumes NOWHERE — while `use_role` activates it right here.
     await expect(
       roles.loadEffective(projectContext('project-a', 'shared'), SYSTEM_PRINCIPAL, 'review', 4_000),
-    ).resolves.toMatchObject({ role: { name: 'review' } })
+    ).resolves.toMatchObject({ ok: true, loaded: { role: { name: 'review' } } })
     await expect(
       roles.loadSavedRole(projectContext('project-a', 'shared'), SYSTEM_PRINCIPAL, locator, 4_000),
-    ).resolves.toMatchObject({ role: { name: 'review' }, skills: [{ name: 'evidence' }] })
+    ).resolves.toMatchObject({
+      ok: true,
+      loaded: { role: { name: 'review' }, skills: [{ name: 'evidence' }] },
+    })
   })
 
   it('maps a role publication race after the precheck to already-exists', async () => {
@@ -1391,16 +2084,18 @@ describe('role catalog and owned libraries', () => {
     await expect(
       roles.loadEffective(context('project-a'), SYSTEM_PRINCIPAL, 'grooming', 4_000),
     ).resolves.toMatchObject({
-      skills: [{ name: 'grooming-evidence' }],
+      ok: true,
+      loaded: { skills: [{ name: 'grooming-evidence' }] },
     })
     await expect(
       roles.loadEffective(context('project-b'), SYSTEM_PRINCIPAL, 'grooming', 4_000),
     ).resolves.toMatchObject({
-      skills: [{ name: 'grooming-evidence' }],
+      ok: true,
+      loaded: { skills: [{ name: 'grooming-evidence' }] },
     })
     expect(
       await roles.loadEffective(context('project-c'), SYSTEM_PRINCIPAL, 'grooming', 4_000),
-    ).toBeNull()
+    ).toMatchObject({ ok: false })
     expect(await library.get(projectC, 'grooming-evidence')).toBeNull()
   })
 
@@ -1447,27 +2142,29 @@ describe('role catalog and owned libraries', () => {
       pkg('long-role', 'Long role.', 'x'.repeat(1_000)),
     )
 
-    const loaded = await roles.loadEffective(
-      { personalSpace: 'personal' },
-      SYSTEM_PRINCIPAL,
-      'long-role',
-      100,
+    const loaded = loadedOf(
+      await roles.loadEffective({ personalSpace: 'personal' }, SYSTEM_PRINCIPAL, 'long-role', 100),
     )
-    expect(loaded!.role.instructions.length).toBeLessThanOrEqual(400)
-    expect(loaded!.role.instructions.length).toBeGreaterThan(0)
-    expect(loaded?.truncated).toBe(true)
+    expect(loaded.role.instructions.length).toBeLessThanOrEqual(400)
+    expect(loaded.role.instructions.length).toBeGreaterThan(0)
+    expect(loaded.truncated).toBe(true)
   })
 
-  it('budgets linked names and descriptions even when their instruction bodies are empty', async () => {
+  it('returns metadata for all 64 attachments while charging only instruction bodies', async () => {
     const library = writableLibrary(createInMemoryRoleLibrary())
-    const dependencies = Array.from({ length: 8 }, (_, index) => ({
-      ...skillPkg(`support-${index}`, `Supporting description ${index} ${'x'.repeat(80)}`),
-      directoryName: `Support${index}aBcD`,
+    const dependencies = Array.from({ length: 64 }, (_, index) => ({
+      ...skillPkg(
+        `support-${index.toString().padStart(2, '0')}`,
+        `Supporting description ${index} ${'x'.repeat(900)}`,
+        `body-${index}`,
+      ),
+      directoryName: `S${index.toString().padStart(3, '0')}portAbCd`,
     }))
     const role = pkg('bounded-role', 'Bounded role.', '')
     const links = dependencies
       .map(
-        ({ directoryName }, index) => `[[notarium-id:personal:${directoryName}|support-${index}]]`,
+        ({ directoryName }, index) =>
+          `[[notarium-id:personal:${directoryName}|support-${index.toString().padStart(2, '0')}]]`,
       )
       .join(' ')
     role.files.set(
@@ -1487,25 +2184,277 @@ describe('role catalog and owned libraries', () => {
       await library.putIfAbsent(personal, dependency)
     }
     await library.putIfAbsent(personal, role)
-    const loaded = await roles.loadEffective(
-      { personalSpace: personal.space },
-      SYSTEM_PRINCIPAL,
-      'bounded-role',
-      100,
+    const loaded = loadedOf(
+      await roles.loadEffective(
+        { personalSpace: personal.space },
+        SYSTEM_PRINCIPAL,
+        'bounded-role',
+        100,
+      ),
     )
-    const returnedCharacters =
-      loaded!.role.name.length +
-      loaded!.role.description.length +
-      loaded!.role.instructions.length +
-      loaded!.skills.reduce(
-        (total, skill) =>
-          total + skill.name.length + skill.description.length + skill.instructions.length,
-        0,
-      )
+    expect(loaded.skills).toHaveLength(64)
+    expect(loaded.skills[0]).toMatchObject({
+      name: 'support-00',
+      description: expect.stringContaining('x'.repeat(900)),
+      state: 'loaded',
+      instructions: 'body-0',
+    })
+    expect(loaded.skills.some((skill) => skill.state === 'omitted-by-budget')).toBe(true)
+    expect(loaded.truncated).toBe(false)
+  })
 
-    expect(returnedCharacters).toBeLessThanOrEqual(400)
-    expect(loaded?.skills.length).toBeLessThan(dependencies.length)
-    expect(loaded?.truncated).toBe(true)
+  it('omits linked instruction bodies as a strict prefix and never slices one', async () => {
+    const library = writableLibrary(createInMemoryRoleLibrary())
+    const location = { scope: 'personal' as const, space: 'personal' }
+    const large = skillPkg('large-support', 'Large support.', 'x'.repeat(401))
+    const small = skillPkg('small-support', 'Small support.', 'fits')
+    const role = pkg('prefix-role', 'Prefix role.', '')
+    role.files.set(
+      'SKILL.md',
+      Buffer.from(
+        `---\nname: prefix-role\ndescription: Prefix role.\nmetadata:\n  notarium.kind: role\n  notarium.skills: "[[notarium-id:personal:${large.directoryName}|large-support]] [[notarium-id:personal:${small.directoryName}|small-support]]"\n---\n`,
+      ),
+    )
+    await library.putIfAbsent(location, large)
+    await library.putIfAbsent(location, small)
+    await library.putIfAbsent(location, role)
+    const roles = createRolesService({
+      catalog: async () => [],
+      ...library.deps,
+      ...inMemoryAbilityPersistence(),
+    })
+
+    const loaded = loadedOf(
+      await roles.loadEffective(
+        { personalSpace: location.space },
+        SYSTEM_PRINCIPAL,
+        'prefix-role',
+        100,
+      ),
+    )
+
+    expect(loaded.skills).toEqual([
+      expect.objectContaining({ name: 'large-support', state: 'omitted-by-budget' }),
+      expect.objectContaining({ name: 'small-support', state: 'omitted-by-budget' }),
+    ])
+    expect(loaded.skills.every((skill) => !('instructions' in skill))).toBe(true)
+    expect(loaded.truncated).toBe(false)
+  })
+
+  it('loads role attachments from the health snapshot instead of silently dropping a raced read', async () => {
+    const backing = writableLibrary(createInMemoryRoleLibrary())
+    const location = { scope: 'personal' as const, space: 'personal' }
+    const dependency = {
+      ...skillPkg('snapshot-support', 'Snapshot support.', 'Stable body.'),
+      directoryName: 'SnapSkilAb12',
+    }
+    const role = {
+      ...pkg('snapshot-role', 'Snapshot role.', 'Role body.'),
+      directoryName: 'SnapRoleAb12',
+    }
+    role.files.set(
+      'SKILL.md',
+      Buffer.from(
+        `---\nname: snapshot-role\ndescription: Snapshot role.\nmetadata:\n  notarium.kind: role\n  notarium.skills: "[[notarium-id:personal:${dependency.directoryName}|snapshot-support]]"\n---\n\nRole body.`,
+      ),
+    )
+    await backing.putIfAbsent(location, dependency)
+    await backing.putIfAbsent(location, role)
+    let dependencyReads = 0
+    const roles = createRolesService({
+      catalog: async () => [],
+      publication: backing.deps.publication,
+      library: {
+        ...backing.deps.library,
+        getSkillByDirectory: async (where, directoryName) => {
+          if (directoryName !== dependency.directoryName) {
+            return backing.getSkillByDirectory(where, directoryName)
+          }
+          dependencyReads += 1
+          return dependencyReads === 1
+            ? backing.getSkillByDirectory(where, directoryName)
+            : { ...pkg('wrong-kind', 'Wrong kind.', 'Wrong body.'), directoryName }
+        },
+      },
+      ...inMemoryAbilityPersistence(),
+    })
+
+    await expect(
+      roles.loadEffective(
+        { personalSpace: location.space },
+        SYSTEM_PRINCIPAL,
+        'snapshot-role',
+        4_000,
+      ),
+    ).resolves.toMatchObject({
+      ok: true,
+      loaded: {
+        skills: [
+          {
+            name: 'snapshot-support',
+            state: 'loaded',
+            instructions: 'Stable body.',
+          },
+        ],
+      },
+    })
+    expect(dependencyReads).toBe(1)
+  })
+
+  it('activates the same effective skill winner as discovery and keeps its body whole', async () => {
+    const library = writableLibrary(createInMemoryRoleLibrary())
+    const personal = { scope: 'personal' as const, space: 'personal' }
+    const space = { scope: 'space' as const, space: 'shared' }
+    await library.putIfAbsent(
+      personal,
+      skillPkg('research-evidence', 'Personal evidence.', 'Personal body.'),
+    )
+    await library.putIfAbsent(
+      space,
+      skillPkg('research-evidence', 'Space evidence.', 'Space body.'),
+    )
+    const persistence = inMemoryAbilityPersistence()
+    await persistence.abilityAvailability.set(
+      space.space,
+      packageDirectoryOf('research-evidence'),
+      {
+        mode: 'all-projects',
+      },
+    )
+    const roles = createRolesService({
+      catalog: loadBundledAbilityInventory,
+      ...library.deps,
+      ...persistence,
+    })
+    const context = {
+      personalSpace: personal.space,
+      project: {
+        id: 'project-a',
+        space: space.space,
+        path: 'project-a',
+        slug: 'project-a',
+        aliases: [],
+        pathAliases: [],
+        displayName: 'Project A',
+        status: 'active' as const,
+        createdAt: 'x',
+        lastSeen: 'x',
+      },
+    }
+    const runtimeWinner = (await roles.listAbilityResolution(context, SYSTEM_PRINCIPAL)).candidates
+      .filter((candidate) => candidate.kind === 'skill' && candidate.name === 'research-evidence')
+      .find((candidate) => candidate.effective)
+
+    await expect(
+      roles.loadEffectiveSkill(context, SYSTEM_PRINCIPAL, 'research-evidence', 4_000),
+    ).resolves.toMatchObject({
+      ok: true,
+      loaded: {
+        skill: {
+          source: 'owned',
+          kind: 'skill',
+          scope: 'space',
+          name: runtimeWinner?.name,
+          instructions: 'Space body.',
+        },
+        locator: runtimeWinner?.locator,
+      },
+    })
+  })
+
+  it('returns wrong-kind only when the other runtime tool has an active winner', async () => {
+    const library = writableLibrary(createInMemoryRoleLibrary())
+    const location = { scope: 'personal' as const, space: 'personal' }
+    await library.putIfAbsent(
+      location,
+      skillPkg('skill-only', 'A standalone skill.', 'Skill body.'),
+    )
+    const roles = createRolesService({
+      catalog: async () => [],
+      ...library.deps,
+      ...inMemoryAbilityPersistence(),
+    })
+
+    await expect(
+      roles.loadEffective({ personalSpace: location.space }, SYSTEM_PRINCIPAL, 'skill-only', 4_000),
+    ).resolves.toEqual({
+      ok: false,
+      reason: 'wrong-kind',
+      actual: 'skill',
+      remediation: [{ kind: 'call-other-kind', actual: 'skill' }],
+    })
+  })
+
+  it('fails closed when a standalone skill body exceeds its activation budget', async () => {
+    const library = writableLibrary(createInMemoryRoleLibrary())
+    const location = { scope: 'personal' as const, space: 'personal' }
+    await library.putIfAbsent(
+      location,
+      skillPkg('oversized-skill', 'Oversized skill.', 'x'.repeat(70_000)),
+    )
+    const roles = createRolesService({
+      catalog: async () => [],
+      ...library.deps,
+      ...inMemoryAbilityPersistence(),
+    })
+
+    await expect(
+      roles.loadEffectiveSkill(
+        { personalSpace: location.space },
+        SYSTEM_PRINCIPAL,
+        'oversized-skill',
+        16_000,
+      ),
+    ).rejects.toMatchObject({
+      name: 'SkillTooLargeForActivation',
+      requiredTokens: 17_500,
+      maxTokens: 16_000,
+    })
+  })
+
+  it('rejects a skill package that would silently discard notarium.skills links', async () => {
+    const library = writableLibrary(createInMemoryRoleLibrary())
+    const location = { scope: 'personal' as const, space: 'personal' }
+    const linkedSkill = skillPkg('linked-skill', 'Linked skill.', 'Linked body.')
+    const invalid = skillPkg('invalid-composite', 'Invalid composite.', 'Body.')
+    const empty = skillPkg('empty-composite', 'Empty composite.', 'Body.')
+    invalid.files.set(
+      'SKILL.md',
+      Buffer.from(
+        `---\nname: invalid-composite\ndescription: Invalid composite.\nmetadata:\n  notarium.skills: "[[notarium-id:personal:${linkedSkill.directoryName}|linked-skill]]"\n---\n\nBody.`,
+      ),
+    )
+    empty.files.set(
+      'SKILL.md',
+      Buffer.from(
+        '---\nname: empty-composite\ndescription: Empty composite.\nmetadata:\n  notarium.skills: ""\n---\n\nBody.',
+      ),
+    )
+    await library.putIfAbsent(location, linkedSkill)
+    await library.putIfAbsent(location, invalid)
+    await library.putIfAbsent(location, empty)
+    const roles = createRolesService({
+      catalog: async () => [],
+      ...library.deps,
+      ...inMemoryAbilityPersistence(),
+    })
+
+    const resolution = await roles.listAbilityResolution(
+      { personalSpace: location.space },
+      SYSTEM_PRINCIPAL,
+    )
+    const names = resolution.candidates.map((candidate) => candidate.name)
+
+    expect(names).not.toContain('invalid-composite')
+    expect(names).not.toContain('empty-composite')
+    await expect(
+      roles.loadEffectiveSkill(
+        { personalSpace: location.space },
+        SYSTEM_PRINCIPAL,
+        'invalid-composite',
+        4_000,
+      ),
+    ).resolves.toMatchObject({ ok: false, reason: 'not-found' })
   })
 
   it('forks every file in a complete Agent Skills package', async () => {
@@ -1639,11 +2588,142 @@ describe('role catalog and owned libraries', () => {
     await expect(
       roles.loadEffective({ personalSpace: 'personal' }, SYSTEM_PRINCIPAL, 'known-role', 4_000),
     ).resolves.toMatchObject({
-      role: { name: 'known-role', scope: 'personal', instructions: 'Direct instructions.' },
+      ok: true,
+      loaded: {
+        role: { name: 'known-role', scope: 'personal', instructions: 'Direct instructions.' },
+      },
     })
   })
 
-  it('stops progressive linked-skill reads when the role consumes the output budget', async () => {
+  it('uses the same stable package for listing and exact same-name activation', async () => {
+    const backing = writableLibrary(createInMemoryRoleLibrary())
+    const location = { scope: 'personal' as const, space: 'personal' }
+    const first = {
+      ...skillPkg('duplicate-skill', 'First duplicate.', 'First instructions.'),
+      directoryName: 'AbCdefGhij_1',
+    }
+    const second = {
+      ...skillPkg('duplicate-skill', 'Second duplicate.', 'Second instructions.'),
+      directoryName: 'ZyXwvUtsrq_2',
+    }
+    const persistence = inMemoryAbilityPersistence()
+    const roles = createRolesService({
+      catalog: async () => [],
+      publication: backing.deps.publication,
+      library: {
+        ...backing.deps.library,
+        listManifests: async (where) =>
+          where.scope === location.scope && where.space === location.space
+            ? { packages: [first, second], truncated: false }
+            : { packages: [], truncated: false },
+        getAbilitiesNamed: async (where, name) =>
+          where.scope === location.scope &&
+          where.space === location.space &&
+          name === 'duplicate-skill'
+            ? new Map([[ABILITY_KIND.skill, first]])
+            : new Map(),
+      },
+      ...persistence,
+    })
+    const context = { personalSpace: 'personal' }
+    const resolution = await roles.listAbilityResolution(context, SYSTEM_PRINCIPAL)
+    const listed = resolution.candidates.find(
+      (candidate) => candidate.name === 'duplicate-skill' && candidate.effective,
+    )
+    const loaded = loadedOf(
+      await roles.loadEffectiveSkill(context, SYSTEM_PRINCIPAL, 'duplicate-skill', 4_000),
+    )
+
+    expect(listed?.locator.packageId).toBe(first.directoryName)
+    expect(loaded.locator.packageId).toBe(first.directoryName)
+    expect(loaded.skill.instructions).toBe('First instructions.')
+    if (loaded.locator.source !== 'owned') {
+      throw new Error('expected the owned duplicate package')
+    }
+
+    await persistence.abilityPreferences.setEnabled(
+      '@system',
+      { locator: loaded.locator, registryNoteId: first.directoryName },
+      false,
+      'x',
+    )
+    const disabledResolution = await roles.listAbilityResolution(context, SYSTEM_PRINCIPAL)
+
+    expect(
+      disabledResolution.candidates.find(
+        (candidate) => candidate.name === 'duplicate-skill' && candidate.effective,
+      ),
+    ).toBeUndefined()
+    await expect(
+      roles.loadEffectiveSkill(context, SYSTEM_PRINCIPAL, 'duplicate-skill', 4_000),
+    ).resolves.toMatchObject({ ok: false, reason: 'disabled' })
+  })
+
+  it('resolves stable same-name external packages independently for each ability kind', async () => {
+    const backing = writableLibrary(createInMemoryRoleLibrary())
+    const location = { scope: 'personal' as const, space: 'personal' }
+    const skill = {
+      ...skillPkg('shared-name', 'External skill.', 'Skill instructions.'),
+      directoryName: 'AbCdefGhij_1',
+    }
+    const role = {
+      ...pkg('shared-name', 'External role.', 'Role instructions.'),
+      directoryName: 'ZyXwvUtsrq_2',
+    }
+    const roles = createRolesService({
+      catalog: async () => [],
+      publication: backing.deps.publication,
+      library: {
+        ...backing.deps.library,
+        listManifests: async (where) =>
+          where.scope === location.scope && where.space === location.space
+            ? { packages: [skill, role], truncated: false }
+            : { packages: [], truncated: false },
+        getAbilitiesNamed: async (where, name) =>
+          where.scope === location.scope && where.space === location.space && name === 'shared-name'
+            ? new Map([
+                [ABILITY_KIND.skill, skill],
+                [ABILITY_KIND.role, role],
+              ])
+            : new Map(),
+      },
+      ...inMemoryAbilityPersistence(),
+    })
+    const context = { personalSpace: 'personal' }
+    const resolution = await roles.listAbilityResolution(context, SYSTEM_PRINCIPAL)
+    const effective = resolution.candidates
+      .filter((candidate) => candidate.name === 'shared-name' && candidate.effective)
+      .map((candidate) => ({ kind: candidate.kind, packageId: candidate.locator.packageId }))
+
+    expect(effective).toEqual([
+      { kind: 'skill', packageId: skill.directoryName },
+      { kind: 'role', packageId: role.directoryName },
+    ])
+    expect(
+      loadedOf(await roles.loadEffective(context, SYSTEM_PRINCIPAL, 'shared-name', 4_000)),
+    ).toMatchObject({
+      locator: { kind: 'role', packageId: role.directoryName },
+      role: { instructions: 'Role instructions.' },
+    })
+    expect(
+      loadedOf(await roles.loadEffectiveSkill(context, SYSTEM_PRINCIPAL, 'shared-name', 4_000)),
+    ).toMatchObject({
+      locator: { kind: 'skill', packageId: skill.directoryName },
+      skill: { instructions: 'Skill instructions.' },
+    })
+    const ctx = { principal: SYSTEM_PRINCIPAL, roles } as Ctx
+
+    await expect(
+      activateRole(ctx, context, 'shared-name', 4_000, undefined, undefined, {
+        alwaysLoad: [],
+      }),
+    ).resolves.toMatchObject({ instructions: 'Role instructions.' })
+    await expect(activateSkill(ctx, context, 'shared-name', 4_000)).resolves.toMatchObject({
+      instructions: 'Skill instructions.',
+    })
+  })
+
+  it('reports every linked skill when the role body consumes the output budget', async () => {
     const backing = writableLibrary(createInMemoryRoleLibrary())
     const location = { scope: 'personal' as const, space: 'personal' }
     const role = pkg('progressive-role', 'Progressive role.', 'x'.repeat(1_000))
@@ -1662,9 +2742,9 @@ describe('role catalog and owned libraries', () => {
       publication: backing.deps.publication,
       library: {
         ...backing.deps.library,
-        getSkill: async (where, name) => {
+        getAbilitiesNamed: async (where, name) => {
           reads.push(name)
-          return backing.getSkill(where, name)
+          return backing.getAbilitiesNamed(where, name)
         },
       },
       ...inMemoryAbilityPersistence(),
@@ -1672,7 +2752,16 @@ describe('role catalog and owned libraries', () => {
 
     await expect(
       roles.loadEffective({ personalSpace: 'personal' }, SYSTEM_PRINCIPAL, 'progressive-role', 100),
-    ).resolves.toMatchObject({ truncated: true, skills: [] })
+    ).resolves.toMatchObject({
+      ok: true,
+      loaded: {
+        truncated: true,
+        skills: [
+          { name: 'support-one', state: 'omitted-by-budget' },
+          { name: 'support-two', state: 'omitted-by-budget' },
+        ],
+      },
+    })
     expect(reads).toEqual(['progressive-role'])
   })
 
@@ -1814,7 +2903,7 @@ describe('role catalog and owned libraries', () => {
     // answer: `space` borrowed for a personal library is not a place, and Personal
     // has no projects to fork into.
     await expect(
-      roles.createRoleVersion(SYSTEM_PRINCIPAL, asSpace, 'personal', 'project-web'),
+      forkRoleVersion(roles, SYSTEM_PRINCIPAL, asSpace, 'personal', 'project-web'),
     ).rejects.toBeInstanceOf(AbilityUnavailableError)
   })
 
@@ -2006,7 +3095,8 @@ describe('role catalog and owned libraries', () => {
       '# Team review\n\nThe team way.',
       { scope: 'space', space: 'shared' },
     )
-    const version = await roles.createRoleVersion(
+    const version = await forkRoleVersion(
+      roles,
       SYSTEM_PRINCIPAL,
       spaceRoleLocator(base.packageId, 'shared'),
       null,
@@ -2028,6 +3118,96 @@ describe('role catalog and owned libraries', () => {
     ).resolves.toMatchObject({ location: { scope: 'space', space: 'shared' } })
   })
 
+  it('copies the admitted source snapshot when its address is reoccupied behind the destination fence', async () => {
+    const backing = writableLibrary(createInMemoryRoleLibrary())
+    const baseLocation = { scope: 'space', space: 'shared' } as const
+    const destination = {
+      scope: 'project',
+      space: 'shared',
+      projectId: 'project-web',
+    } as const
+    const original = {
+      ...claimed(
+        pkg('review', 'Original review.', '# Original review\n\nOriginal body.'),
+        'OriginalManifest',
+      ),
+      directoryName: 'OriginalPkg1',
+    }
+    const reoccupant = {
+      ...claimed(
+        pkg('collision', 'Collision review.', '# Collision review\n\nCollision body.'),
+        'CollisionManifest',
+      ),
+      directoryName: original.directoryName,
+    }
+
+    await backing.putIfAbsent(baseLocation, original)
+    let destinationChecked = false
+    let sourceAdmitted = false
+    const roles = createRolesService({
+      catalog: async () => [],
+      ...inMemoryAbilityPersistence(),
+      publication: backing.deps.publication,
+      library: {
+        ...backing.deps.library,
+        withExactPackageRead: async (location, directoryName, task) => {
+          sourceAdmitted = true
+          try {
+            return await backing.deps.library.withExactPackageRead(location, directoryName, task)
+          } finally {
+            sourceAdmitted = false
+          }
+        },
+        exists: async (location, name, options) => {
+          if (
+            location.scope === destination.scope &&
+            location.projectId === destination.projectId
+          ) {
+            expect(sourceAdmitted).toBe(false)
+            destinationChecked = true
+          }
+
+          return backing.deps.library.exists(location, name, options)
+        },
+        getByDirectory: async (location, directoryName) =>
+          destinationChecked &&
+          location.scope === baseLocation.scope &&
+          location.space === baseLocation.space &&
+          directoryName === original.directoryName
+            ? reoccupant
+            : backing.deps.library.getByDirectory(location, directoryName),
+      },
+    })
+    const version = await forkRoleVersion(
+      roles,
+      SYSTEM_PRINCIPAL,
+      spaceRoleLocator(original.directoryName, 'shared'),
+      null,
+      destination.projectId,
+    )
+
+    expect(destinationChecked).toBe(true)
+    expect(version).toMatchObject({
+      name: 'review',
+      title: 'Original review',
+      description: 'Original review.',
+    })
+    await expect(
+      roles.resolveEffective(
+        projectContext(destination.projectId, destination.space),
+        SYSTEM_PRINCIPAL,
+        'review',
+      ),
+    ).resolves.toMatchObject({ role: { title: 'Original review' } })
+    await expect(
+      roles.resolveEffective(
+        projectContext(destination.projectId, destination.space),
+        SYSTEM_PRINCIPAL,
+        'collision',
+      ),
+    ).resolves.toBeNull()
+  })
+
   it('keeps an override self-sufficient when the base does not reach its project', async () => {
     const roles = createRolesService({
       catalog: loadBundledAbilityInventory,
@@ -2038,7 +3218,8 @@ describe('role catalog and owned libraries', () => {
       scope: 'space',
       space: 'shared',
     })
-    await roles.createRoleVersion(
+    await forkRoleVersion(
+      roles,
       SYSTEM_PRINCIPAL,
       spaceRoleLocator(base.packageId, 'shared'),
       null,
@@ -2069,10 +3250,10 @@ describe('role catalog and owned libraries', () => {
       space: 'shared',
     })
     const locator = spaceRoleLocator(base.packageId, 'shared')
-    await roles.createRoleVersion(SYSTEM_PRINCIPAL, locator, null, 'project-web')
+    await forkRoleVersion(roles, SYSTEM_PRINCIPAL, locator, null, 'project-web')
 
     await expect(
-      roles.createRoleVersion(SYSTEM_PRINCIPAL, locator, null, 'project-web'),
+      forkRoleVersion(roles, SYSTEM_PRINCIPAL, locator, null, 'project-web'),
     ).rejects.toBeInstanceOf(RoleAlreadyExistsError)
   })
 
@@ -2122,22 +3303,30 @@ describe('role catalog and owned libraries', () => {
     ).resolves.toMatchObject({ name: 'review' })
     // One project further than the skill reaches leaves the role fail-closed there,
     // which is a state authoring refuses rather than publishes.
-    await expect(
-      roles.createCustomRole(
-        'wider',
-        'Wider.',
-        'Wider.',
-        { scope: 'space', space: 'shared' },
-        {
-          principal: SYSTEM_PRINCIPAL,
-          attachments: [attachment],
-          availability: {
-            mode: 'selected-projects',
-            projectIds: ['project-api', 'project-web', 'project-mobile'],
-          },
+    const wider = roles.createCustomRole(
+      'wider',
+      'Wider.',
+      'Wider.',
+      { scope: 'space', space: 'shared' },
+      {
+        principal: SYSTEM_PRINCIPAL,
+        attachments: [attachment],
+        availability: {
+          mode: 'selected-projects',
+          projectIds: ['project-api', 'project-web', 'project-mobile'],
         },
-      ),
-    ).rejects.toBeInstanceOf(RoleDependencyConflictError)
+      },
+    )
+
+    await expect(wider).rejects.toBeInstanceOf(RoleDependencyConflictError)
+    await expect(wider).rejects.toMatchObject({
+      details: {
+        attachment: 'reach-skill',
+        verdict: 'unavailable',
+        projectId: 'project-mobile',
+        rule: 'an attachment must reach every project covered by the role',
+      },
+    })
   })
 
   it('makes health a fact about a role AND a project, not about a role alone', async () => {
@@ -2196,7 +3385,7 @@ describe('role catalog and owned libraries', () => {
         'review',
         4_000,
       ),
-    ).resolves.toMatchObject({ role: { name: 'review' } })
+    ).resolves.toMatchObject({ ok: true, loaded: { role: { name: 'review' } } })
     // Fail-closed where the dependency does not reach.
     await expect(
       roles.loadEffective(
@@ -2205,7 +3394,7 @@ describe('role catalog and owned libraries', () => {
         'review',
         4_000,
       ),
-    ).resolves.toBeNull()
+    ).resolves.toMatchObject({ ok: false, reason: 'unhealthy' })
   })
 
   /** "Does this package exist" had two answers: the listing and the detail demanded a
@@ -2546,7 +3735,9 @@ describe('role catalog and owned libraries', () => {
     }
 
     // The binding still ADDRESSES a live, enabled, in-reach package...
-    await expect(roles.loadSavedRole(context, SYSTEM_PRINCIPAL, locator, 4_000)).resolves.toBeNull()
+    await expect(
+      roles.loadSavedRole(context, SYSTEM_PRINCIPAL, locator, 4_000),
+    ).resolves.toMatchObject({ ok: false, reason: 'unhealthy' })
     // ...so the two answers have to agree that it is not raisable.
     await expect(roles.resolveSavedRole(context, SYSTEM_PRINCIPAL, locator)).resolves.toBeNull()
   })
@@ -2606,7 +3797,9 @@ describe('role catalog and owned libraries', () => {
     await roles.setEnabled(context, SYSTEM_PRINCIPAL, skillLocator, false)
 
     // Resume refuses the role...
-    await expect(roles.loadSavedRole(context, SYSTEM_PRINCIPAL, locator, 4_000)).resolves.toBeNull()
+    await expect(
+      roles.loadSavedRole(context, SYSTEM_PRINCIPAL, locator, 4_000),
+    ).resolves.toMatchObject({ ok: false, reason: 'unhealthy' })
     // ...so the preview must not call it live — while still naming it, because its
     // shared context stays editable.
     await expect(
@@ -2811,7 +4004,8 @@ describe('role catalog and owned libraries', () => {
         '# Versioned role',
         space,
       )
-      await seeded.createRoleVersion(
+      await forkRoleVersion(
+        seeded,
         SYSTEM_PRINCIPAL,
         spaceRoleLocator(base.packageId, space.space),
         null,
@@ -2842,7 +4036,8 @@ describe('role catalog and owned libraries', () => {
         refused.createCustomSkill('space-skill', 'Space skill.', '# Space skill', space),
       ).rejects.toBeInstanceOf(SkillAlreadyExistsError)
       await expect(
-        refused.createRoleVersion(
+        forkRoleVersion(
+          refused,
           SYSTEM_PRINCIPAL,
           spaceRoleLocator(base.packageId, space.space),
           null,
@@ -3021,8 +4216,11 @@ describe('role catalog and owned libraries', () => {
         4_000,
       ),
     ).resolves.toMatchObject({
-      role: { name: 'grooming' },
-      skills: [{ name: 'grooming-evidence' }],
+      ok: true,
+      loaded: {
+        role: { name: 'grooming' },
+        skills: [{ name: 'grooming-evidence' }],
+      },
     })
   })
 
@@ -3070,6 +4268,59 @@ describe('role catalog and owned libraries', () => {
     })
   })
 
+  it('keeps distinct physical and projected identities through move and stale resolution', async () => {
+    const library = writableLibrary(createInMemoryRoleLibrary())
+    const source = { scope: 'project' as const, space: 'shared', projectId: 'project-web' }
+    const packageId = 'AbCdefGhij_1'
+    const manifestNoteId = 'ForeignClaim1'
+    const stale = {
+      source: 'owned',
+      kind: 'role',
+      packageId,
+      location: { scope: 'project', spaceId: 'shared', projectId: 'project-web' },
+    } as const
+    const staleKey = serializeAbilityLocator(stale)
+    let trail: {
+      toLocator: string
+      registryNoteId: string | null
+      manifestNoteId: string | null
+    } | null = null
+    const moveOwnedRolePlacement = vi.fn(async (move) => {
+      trail = {
+        toLocator: move.toLocator,
+        registryNoteId: move.registryNoteId,
+        manifestNoteId: move.manifestNoteId,
+      }
+    })
+    const roles = createRolesService({
+      ...inMemoryAbilityPersistence(),
+      catalog: async () => [],
+      ...library.deps,
+      abilityPlacement: {
+        resolveMovedOwnedRoleLocator: async (fromLocator) =>
+          fromLocator === staleKey ? trail : null,
+        moveOwnedRolePlacement,
+      },
+    })
+
+    await library.putIfAbsent(source, {
+      ...claimed(pkg('review', 'Project review.', 'The project way.'), manifestNoteId),
+      directoryName: packageId,
+    })
+
+    const promoted = await roles.moveRolePlacement(SYSTEM_PRINCIPAL, stale, null)
+
+    expect(moveOwnedRolePlacement).toHaveBeenCalledWith(
+      expect.objectContaining({
+        registryNoteId: packageId,
+        manifestNoteId,
+      }),
+    )
+    await expect(
+      roles.withCurrentOwnedTarget(stale, SYSTEM_PRINCIPAL, async ({ locator }) => locator),
+    ).resolves.toEqual(promoted.locator)
+  })
+
   /** Reach is written BEFORE the package is readable at its new home. For a role the
    *  ABSENCE of a row reads as all-projects, so publishing first opens a window in
    *  which a role narrowed to one project answers in every project of its Space —
@@ -3084,7 +4335,10 @@ describe('role catalog and owned libraries', () => {
       catalog: loadBundledAbilityInventory,
       ...library.deps,
       abilityAvailability: availability,
-      abilityPlacement: { moveOwnedRolePlacement: async () => {} },
+      abilityPlacement: {
+        resolveMovedOwnedRoleLocator: async () => null,
+        moveOwnedRolePlacement: async () => {},
+      },
     })
 
     availability.set = async (...args) => {
@@ -3135,7 +4389,10 @@ describe('role catalog and owned libraries', () => {
       catalog: loadBundledAbilityInventory,
       ...library.deps,
       abilityAvailability: availability,
-      abilityPlacement: { moveOwnedRolePlacement },
+      abilityPlacement: {
+        resolveMovedOwnedRoleLocator: async () => null,
+        moveOwnedRolePlacement,
+      },
     })
     const version = await roles.createCustomRole('review', 'Project review.', 'The project way.', {
       scope: 'project',
@@ -3157,12 +4414,16 @@ describe('role catalog and owned libraries', () => {
       projectIds: ['project-web'],
     })
     // Placement is part of the address, so the rows keyed by it move in one call.
-    expect(moveOwnedRolePlacement).toHaveBeenCalledWith({
-      fromTargetId: `project:project-web:${version.packageId}`,
-      toTargetId: `space:shared:${version.packageId}`,
-      fromLocator: expect.stringContaining('project'),
-      toLocator: expect.stringContaining('space'),
-    })
+    expect(moveOwnedRolePlacement).toHaveBeenCalledWith(
+      expect.objectContaining({
+        fromTargetId: `project:project-web:${version.packageId}`,
+        toTargetId: `space:shared:${version.packageId}`,
+        fromLocator: expect.stringContaining('project'),
+        toLocator: expect.stringContaining('space'),
+        registryNoteId: version.packageId,
+        manifestNoteId: version.packageId,
+      }),
+    )
     await expect(
       library.getSkillByDirectory(
         { scope: 'project', space: 'shared', projectId: 'project-web' },
@@ -3193,21 +4454,26 @@ describe('role catalog and owned libraries', () => {
     const failure = new Error('meta-DB is unavailable')
     const library = writableLibrary(createInMemoryRoleLibrary())
     const availability = new InMemoryAbilityAvailability()
-    // The promotion itself goes through; only putting the package BACK is refused,
-    // so the role stays at the Space root whatever the rollback does about its reach.
-    let moves = 0
+    // The package lands, but the pointer finalize and the rollback both fail. The
+    // typed writer result says the target remains authoritative, so target reach must
+    // survive even though the caller still receives the finalize failure.
     const roles = createRolesService({
       ...inMemoryAbilityPersistence(),
       catalog: loadBundledAbilityInventory,
       ...interceptPublication(library.deps, {
-        moveFrom: (_into, _from, _directoryName, next) => {
-          moves += 1
+        moveFrom: async (_into, _from, _directoryName, _expected, _finalize, next) => {
+          const moved = await next(async () => undefined)
 
-          return moves === 1 ? next() : Promise.resolve(false)
+          if (moved) {
+            throw rolePackageMoveRollbackError(failure)
+          }
+
+          return false
         },
       }),
       abilityAvailability: availability,
       abilityPlacement: {
+        resolveMovedOwnedRoleLocator: async () => null,
         moveOwnedRolePlacement: async () => {
           throw failure
         },
@@ -3265,7 +4531,7 @@ describe('role catalog and owned libraries', () => {
     await roles.setEnabled(context, SYSTEM_PRINCIPAL, locator, false)
     await expect(
       roles.loadEffective(context, SYSTEM_PRINCIPAL, 'review', 4_000),
-    ).resolves.toBeNull()
+    ).resolves.toMatchObject({ ok: false, reason: 'disabled' })
 
     const promoted = await roles.moveRolePlacement(SYSTEM_PRINCIPAL, locator, null)
 
@@ -3284,13 +4550,17 @@ describe('role catalog and owned libraries', () => {
       ...inMemoryAbilityPersistence(),
       catalog: loadBundledAbilityInventory,
       ...library.deps,
-      abilityPlacement: { moveOwnedRolePlacement },
+      abilityPlacement: {
+        resolveMovedOwnedRoleLocator: async () => null,
+        moveOwnedRolePlacement,
+      },
     })
     const base = await roles.createCustomRole('review', 'Team review.', 'The team way.', {
       scope: 'space',
       space: 'shared',
     })
-    const version = await roles.createRoleVersion(
+    const version = await forkRoleVersion(
+      roles,
       SYSTEM_PRINCIPAL,
       spaceRoleLocator(base.packageId, 'shared'),
       null,
@@ -3331,6 +4601,7 @@ describe('role catalog and owned libraries', () => {
       ...library.deps,
       abilityAvailability: availability,
       abilityPlacement: {
+        resolveMovedOwnedRoleLocator: async () => null,
         moveOwnedRolePlacement: async () => {
           throw failure
         },

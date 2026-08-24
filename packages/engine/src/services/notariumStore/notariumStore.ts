@@ -35,6 +35,7 @@ import type {
   NoteMeta,
   PhysicalIncarnation,
   Preview,
+  PublishedResourceEvidence,
   ReadOptions,
   ReadScope,
   ResolvedVia,
@@ -64,6 +65,7 @@ import {
   DOCUMENT_ROLE,
   DOCUMENT_STATE_FORMAT,
   type DocumentRole,
+  type DocumentState,
   documentStateVersionToken,
   effectiveSlug,
   exactOwnerObservation,
@@ -530,6 +532,49 @@ const toSnippet = (raw: string | null | undefined): string =>
   (raw || '').replace(/\s+/g, ' ').trim().slice(0, 160)
 
 export class NotariumStore implements KnowledgeStore {
+  async adoptPublishedResource(evidence: PublishedResourceEvidence): Promise<DocumentState> {
+    await this.reindexPublishedPath(
+      evidence.path,
+      evidence.source,
+      {
+        id: evidence.receipt.id,
+        spaceId: '',
+        adapterId: 'durable-publication',
+        observationId: `durable:${evidence.receipt.id}`,
+        semanticEventTime: evidence.receipt.semanticEventTime,
+        restartDurable: false,
+        candidateHash: evidence.receipt.candidateHash,
+        transitions: evidence.receipt.transitions,
+      },
+      evidence.ownerProof,
+      evidence.document,
+    )
+    const mount = this.mountForPath(evidence.path)
+    const relative = this.relIn(mount, evidence.path)
+    const packagePath = this.packagePathFor(mount, relative)
+    const skillRoot = mount.class === 'skill' && isSkillPackageRootPath(relative)
+    const role =
+      evidence.document?.role ??
+      (mount.class === 'skill'
+        ? skillRoot
+          ? DOCUMENT_ROLE.skillRoot
+          : DOCUMENT_ROLE.skillAuxiliary
+        : DOCUMENT_ROLE.generic)
+
+    return analyzeDocumentState({
+      source: evidence.source,
+      role,
+      ownerProof: evidence.ownerProof,
+      pathFallbackTitle:
+        evidence.document?.pathFallbackTitle ?? basenameOf(evidence.path).replace(/\.md$/i, ''),
+      ...(role === DOCUMENT_ROLE.skillRoot
+        ? {
+            skillDirectoryName: evidence.document?.skillDirectoryName ?? basenameOf(packagePath!),
+          }
+        : {}),
+    })
+  }
+
   readonly capabilities: StoreCapabilities = {
     // FTS5 — real full-text search, the engine's own index.
     fts: true,
@@ -2311,20 +2356,54 @@ export class NotariumStore implements KnowledgeStore {
 
   /** A proof is applicable only to the exact source hash it was adopted with.
    * Corrupt/stale derived rows degrade to authored metadata, never authority. */
-  private async ownerProofFor(
+  private async ownerEvidenceFor(
     fullPath: string,
     source: Uint8Array,
-  ): Promise<StorageOwnerProof | undefined> {
+  ): Promise<
+    | {
+        proof: StorageOwnerProof
+        document?: NonNullable<PublishedResourceEvidence['document']>
+      }
+    | undefined
+  > {
     const sourceHash = await sha256Hex(source)
-    const row = await this.sql.get<{ proof_json: string }>(
-      `SELECT document_proofs.proof_json
+    const row = await this.sql.get<{ proof_json: string; context_json: string | null }>(
+      `SELECT document_proofs.proof_json, document_proofs.context_json
          FROM document_proofs
          JOIN notes ON notes.rowid = document_proofs.note_rowid
         WHERE notes.path = ? AND document_proofs.source_hash = ?`,
       [fullPath, sourceHash],
     )
 
-    return row ? parseStoredOwnerProof(row.proof_json) : undefined
+    if (!row) {
+      return undefined
+    }
+    const proof = parseStoredOwnerProof(row.proof_json)
+
+    if (!proof) {
+      return undefined
+    }
+    let document: NonNullable<PublishedResourceEvidence['document']> | undefined
+
+    try {
+      const parsed = row.context_json ? (JSON.parse(row.context_json) as unknown) : null
+
+      if (
+        parsed &&
+        typeof parsed === 'object' &&
+        Object.values(DOCUMENT_ROLE).includes(
+          (parsed as { role?: DocumentRole }).role as DocumentRole,
+        ) &&
+        ((parsed as { pathFallbackTitle?: unknown }).pathFallbackTitle === null ||
+          typeof (parsed as { pathFallbackTitle?: unknown }).pathFallbackTitle === 'string')
+      ) {
+        document = parsed as NonNullable<PublishedResourceEvidence['document']>
+      }
+    } catch {
+      document = undefined
+    }
+
+    return { proof, ...(document ? { document } : {}) }
   }
 
   /** Materialize the receipt's submitted bytes directly. Re-reading the path
@@ -2335,6 +2414,7 @@ export class NotariumStore implements KnowledgeStore {
     source: Uint8Array,
     receipt: MutationReceipt,
     proof: StorageOwnerProof,
+    document?: PublishedResourceEvidence['document'],
   ): Promise<void> {
     const mount = this.mountForPath(fullPath)
     const transition = receipt.transitions.find((candidate) => candidate.path === fullPath)
@@ -2373,13 +2453,21 @@ export class NotariumStore implements KnowledgeStore {
     if (row) {
       if (proof.claims.length) {
         await this.sql.run(
-          `INSERT INTO document_proofs (note_rowid, source_hash, proof_json, receipt_id)
-           VALUES (?, ?, ?, ?)
+          `INSERT INTO document_proofs
+             (note_rowid, source_hash, proof_json, receipt_id, context_json)
+           VALUES (?, ?, ?, ?, ?)
            ON CONFLICT(note_rowid) DO UPDATE SET
              source_hash = excluded.source_hash,
              proof_json = excluded.proof_json,
-             receipt_id = excluded.receipt_id`,
-          [row.rowid, sourceHash, JSON.stringify(proof), receipt.id],
+             receipt_id = excluded.receipt_id,
+             context_json = excluded.context_json`,
+          [
+            row.rowid,
+            sourceHash,
+            JSON.stringify(proof),
+            receipt.id,
+            document ? JSON.stringify(document) : null,
+          ],
         )
       } else {
         await this.sql.run(`DELETE FROM document_proofs WHERE note_rowid = ?`, [row.rowid])
@@ -2601,12 +2689,20 @@ export class NotariumStore implements KnowledgeStore {
     if (!clean) {
       return
     }
-    const packageLease =
-      opts?.internalAddress && this.resourceAuthority
+    const placementLease =
+      opts?.internalAddress && this.resourceAuthority && !opts.resourceAdmitted
         ? await this.resourceAuthority.admitSkillPlacement(
             `${clean}/SKILL.md`,
             'exclusive',
             'notarium-remove-skill-package',
+          )
+        : null
+    const packageLease =
+      opts?.internalAddress && this.resourceAuthority && !opts.resourceAdmitted
+        ? await this.resourceAuthority.admitPackage(
+            clean,
+            'exclusive',
+            'notarium-remove-skill-package-content',
           )
         : null
 
@@ -2660,6 +2756,7 @@ export class NotariumStore implements KnowledgeStore {
       this.scheduleReclaim()
     } finally {
       packageLease?.settle()
+      placementLease?.settle()
     }
   }
 
@@ -2793,14 +2890,20 @@ export class NotariumStore implements KnowledgeStore {
     }
     const source = exactSource ?? new TextEncoder().encode(raw)
     const parsed = parseNoteFile(raw, row.path)
-    const ownerProof = await this.ownerProofFor(row.path, source)
+    const ownerEvidence = await this.ownerEvidenceFor(row.path, source)
+    const ownerProof = ownerEvidence?.proof
+    role = ownerEvidence?.document?.role ?? role
     const documentState = analyzeDocumentState({
       source,
       role,
-      pathFallbackTitle: fileName.replace(/\.md$/i, ''),
+      pathFallbackTitle:
+        ownerEvidence?.document?.pathFallbackTitle ?? fileName.replace(/\.md$/i, ''),
       ownerProof,
       ...(role === DOCUMENT_ROLE.skillRoot
-        ? { skillDirectoryName: basenameOf(directoryOf(row.path)) }
+        ? {
+            skillDirectoryName:
+              ownerEvidence?.document?.skillDirectoryName ?? basenameOf(directoryOf(row.path)),
+          }
         : {}),
     })
     const projection = documentState.projection
@@ -3508,32 +3611,35 @@ export class NotariumStore implements KnowledgeStore {
    *  The destination MOUNT is chosen by `targetClass` on create (default
    *  user-doc); on edit it stays in the note's existing mount — class doesn't
    *  change under an edit (#78). */
-  async write({
-    title,
-    content = '',
-    directory,
-    noteType,
-    tags,
-    slug,
-    summary,
-    muted,
-    originalId,
-    identityOnly,
-    id,
-    targetClass,
-    ifExists,
-    fileName,
-    legacyImportRoot,
-    createdAt,
-    frontmatter,
-    frontmatterMode,
-    preservePath,
-    preserveAliases,
-    restorePath,
-    expectedSource,
-    expectedDestinationId,
-    sourceLocator,
-  }: WriteInput): Promise<WriteResult> {
+  async write(
+    {
+      title,
+      content = '',
+      directory,
+      noteType,
+      tags,
+      slug,
+      summary,
+      muted,
+      originalId,
+      identityOnly,
+      id,
+      targetClass,
+      ifExists,
+      fileName,
+      legacyImportRoot,
+      createdAt,
+      frontmatter,
+      frontmatterMode,
+      preservePath,
+      preserveAliases,
+      restorePath,
+      expectedSource,
+      expectedDestinationId,
+      sourceLocator,
+    }: WriteInput,
+    opts?: MutationOptions,
+  ): Promise<WriteResult> {
     await this.ensureReady()
     const scalarInputs = [
       title,
@@ -3705,11 +3811,13 @@ export class NotariumStore implements KnowledgeStore {
     // publish compares against. canon: docs/import.md#importing-a-markdown-tree-302
     let mutationObservation: ResourceObservation | undefined
     let targetObservation: ResourceObservation | undefined
+    const observeForWrite = (path: string, owner: string) =>
+      opts?.resourceAdmitted
+        ? this.resourceAuthority!.observeStrictAdmitted(path)
+        : this.resourceAuthority!.observe(path, { owner })
 
     if (guarded && this.resourceAuthority) {
-      mutationObservation = await this.resourceAuthority.observe(dest, {
-        owner: 'notarium-write-plan',
-      })
+      mutationObservation = await observeForWrite(dest, 'notarium-write-plan')
       if (mutationObservation.kind === 'unavailable') {
         throw writeFailed('note is not stably readable during write')
       }
@@ -3793,16 +3901,12 @@ export class NotariumStore implements KnowledgeStore {
       throw noteAlreadyExists(title)
     }
     if (this.resourceAuthority && !mutationObservation) {
-      mutationObservation = await this.resourceAuthority.observe(renameSource ?? dest, {
-        owner: 'notarium-write-plan',
-      })
+      mutationObservation = await observeForWrite(renameSource ?? dest, 'notarium-write-plan')
       if (mutationObservation.kind === 'unavailable') {
         throw writeFailed('note is not stably readable during write')
       }
       if (renameSource) {
-        targetObservation = await this.resourceAuthority.observe(dest, {
-          owner: 'notarium-write-target',
-        })
+        targetObservation = await observeForWrite(dest, 'notarium-write-target')
         if (targetObservation.kind !== 'absent') {
           throw moveFailed('a note already lives at the destination')
         }
@@ -3854,10 +3958,12 @@ export class NotariumStore implements KnowledgeStore {
     }
     const priorOwnerProof =
       sourceRow && existingRaw != null
-        ? await this.ownerProofFor(
-            sourceRow.path,
-            existingSource ?? new TextEncoder().encode(existingRaw),
-          )
+        ? (
+            await this.ownerEvidenceFor(
+              sourceRow.path,
+              existingSource ?? new TextEncoder().encode(existingRaw),
+            )
+          )?.proof
         : undefined
     // The slug to persist (#100 phase 1, lazy): cleaned + kept only when it diverges
     // from slug(title). undefined = not addressed (slug stays as the file has it),
@@ -3932,17 +4038,18 @@ export class NotariumStore implements KnowledgeStore {
         throw writeFailed('storage did not provide a mutation observation')
       }
       const packagePath = this.packagePathFor(mount, renameSource ? sourceRel : destRel)
-      const placementLease = candidateSkillRoot
-        ? await this.resourceAuthority.admitSkillPlacement(
-            dest,
-            'exclusive',
-            'notarium-skill-write',
-          )
-        : null
+      const placementLease =
+        candidateSkillRoot && !opts?.resourceAdmitted
+          ? await this.resourceAuthority.admitSkillPlacement(
+              dest,
+              'exclusive',
+              'notarium-skill-write',
+            )
+          : null
       let publication
 
       try {
-        if (placementLease) {
+        if (placementLease || (candidateSkillRoot && opts?.resourceAdmitted)) {
           try {
             await this.resourceAuthority.assertSkillManifestNameAvailableAdmitted(
               dest,
@@ -3960,10 +4067,11 @@ export class NotariumStore implements KnowledgeStore {
             throw error
           }
         }
-        const publish = placementLease
-          ? this.resourceAuthority.publishAdmitted.bind(this.resourceAuthority)
-          : (request: Parameters<SpaceResourceAuthority['publish']>[0]) =>
-              this.resourceAuthority!.publish(request, { owner: 'notarium-write' })
+        const publish =
+          placementLease || opts?.resourceAdmitted
+            ? this.resourceAuthority.publishAdmitted.bind(this.resourceAuthority)
+            : (request: Parameters<SpaceResourceAuthority['publish']>[0]) =>
+                this.resourceAuthority!.publish(request, { owner: 'notarium-write' })
         publication = renameSource
           ? mutationObservation.kind === 'present' && targetObservation?.kind === 'absent'
             ? await publish({
@@ -4552,8 +4660,16 @@ export class NotariumStore implements KnowledgeStore {
       // Delta poll: ONE atomic snapshot. The CASE keeps the body blob out of the
       // result set for unchanged rows (SQLite decodes `body` only where seq > since),
       // so a big space's poll stops re-reading its whole corpus every interval.
-      const rows = await this.sql.all<NoteMetaRow & { seq: number; body: string }>(
-        `SELECT ${NOTE_META_COLS}, seq, CASE WHEN seq > ? THEN body ELSE '' END AS body FROM notes ORDER BY path`,
+      const rows = await this.sql.all<
+        NoteMetaRow & { seq: number; body: string; requires_exact_state: number }
+      >(
+        `SELECT ${NOTE_META_COLS}, seq,
+                CASE WHEN seq > ? THEN body ELSE '' END AS body,
+                EXISTS(
+                  SELECT 1 FROM document_proofs
+                   WHERE document_proofs.note_rowid = notes.rowid
+                ) AS requires_exact_state
+           FROM notes ORDER BY path`,
         [since],
       )
       const inventory: NoteMeta[] = []
@@ -4563,7 +4679,12 @@ export class NotariumStore implements KnowledgeStore {
         const meta = this.metaOf(r)
         inventory.push(meta)
         if (r.seq > since) {
-          upserts.push({ meta, content: r.body, tags: parseJsonArray(r.tags) })
+          upserts.push({
+            meta,
+            content: r.body,
+            tags: parseJsonArray(r.tags),
+            ...(r.requires_exact_state ? { requiresExactState: true } : {}),
+          })
         }
       }
 

@@ -271,9 +271,9 @@ export function useNoteDraft(initialDraft: Draft | null) {
   // `title` since #156: the server derives it from `content` at the write chokepoint.
   const buildPayload = (): SaveInput => {
     if (initialDraft?.documentKind === 'ability') {
-      // ADDRESSLESS on purpose: an ability's package can be relocated by the very
-      // save that carries this payload, so the address is the save run's to state
-      // (helpers/abilitySave) — a snapshot address would retry into a 404.
+      // ADDRESSLESS on purpose: the shared ability service owns the current package
+      // address and returns the post-save locator; a draft snapshot would retry into
+      // a 404 after a home move.
       return {
         content: readContent(),
         name: abilityName,

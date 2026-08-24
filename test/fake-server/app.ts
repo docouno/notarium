@@ -19,7 +19,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   type AgentWriteAttribution,
+  analyzeDocumentState,
   CachedStore,
+  DOCUMENT_ROLE,
   InMemoryRestoreOperationPersistence,
   type InMemoryRevisionPersistence,
   InMemorySpaceLifecyclePersistence,
@@ -38,6 +40,7 @@ import {
   createImportHandler,
   createJobRunner,
   createRolesService,
+  type CustomAbilityCreator,
   hashPassword,
   hostInfoFrom,
   InMemoryAbilityAvailability,
@@ -49,13 +52,19 @@ import {
   markFolderAsProject,
   type MetaDb,
   type MutationGate,
+  ownedRoleLocator,
+  ownedSkillLocator,
+  projectHandleOf,
   type ProjectRecord,
+  type RoleLocation,
+  type SkillHomeLocation,
   type SpaceDef,
   spaceLifecycleHasEnded,
   SpaceManager,
   type SpaceRecord,
   SqliteMetaDb,
   SYSTEM_PRINCIPAL,
+  SystemAbilityNameConflictError,
 } from '@notarium/server'
 import { applyAgentAbilityPreferences } from '../cases/applyAbilityPreferences'
 import { applyAgentRoleDeclarations } from '../cases/applyAgentRoles'
@@ -579,6 +588,12 @@ export const createApp = async (
   )
   const roles = createRolesService({
     catalog: loadBundledAbilityInventory,
+    projectHandleForId: async (projectId) => {
+      const project = await projects.getById(projectId)
+      return project
+        ? projectHandleOf(project, manager.slugOf(project.space) ?? project.space)
+        : null
+    },
     library: roleLibrary.library,
     publication: roleLibrary.publication,
     abilityAvailability,
@@ -594,6 +609,131 @@ export const createApp = async (
       agentSessions,
     }),
   })
+  const customAbilityCreator: CustomAbilityCreator = {
+    createDurably: async ({ attribution, preparePackage, operation }) => {
+      let { prepared, pkg } = await preparePackage()
+      const availability = prepared.availability
+
+      if (
+        operation?.systemNamePolicy === 'reject' &&
+        (await roles.hasSystemAbility(prepared.kind, prepared.body.name))
+      ) {
+        throw new SystemAbilityNameConflictError(
+          `${prepared.kind} "${prepared.body.name}" conflicts with a System ability`,
+        )
+      }
+
+      if (availability) {
+        while (
+          !(await abilityAvailability.reserve(
+            prepared.location.space,
+            pkg.directoryName,
+            availability,
+          ))
+        ) {
+          ;({ prepared, pkg } = await preparePackage())
+        }
+      }
+      const manifest = pkg.files.get('SKILL.md')
+      const path = roles.manifestPath(prepared.location, pkg.directoryName)
+
+      if (!manifest || pkg.files.size !== 1 || !path) {
+        throw new Error('fake custom ability must be one SKILL.md package')
+      }
+      const state = analyzeDocumentState({
+        source: manifest,
+        role: DOCUMENT_ROLE.skillRoot,
+        skillDirectoryName: pkg.directoryName,
+      })
+      const projection = state.projection
+
+      if (!projection?.skill) {
+        throw new Error('fake custom ability manifest is invalid')
+      }
+      const store = await manager.store(prepared.location.space)
+      let written
+
+      try {
+        written = await roles.withCreateAdmission(prepared.location, pkg.directoryName, () =>
+          store.write(
+            {
+              id: pkg.directoryName,
+              title:
+                projection.titleOrigin.kind === 'hidden-h1'
+                  ? projection.titleOrigin.title
+                  : projection.title,
+              content: projection.body,
+              frontmatter: projection.frontmatterEntries,
+              frontmatterMode: 'replace',
+              targetClass: 'skill',
+              restorePath: path,
+              principal: attribution.principal,
+              ...(attribution.agent ? { agent: attribution.agent } : {}),
+            },
+            {
+              requiredRevision: true,
+              resourceAdmitted: true,
+              ...(prepared.availability
+                ? {
+                    beforePublish: async ({ id }) => {
+                      if (
+                        !(await abilityAvailability.finalize(
+                          prepared.location.space,
+                          pkg.directoryName,
+                          id,
+                        ))
+                      ) {
+                        throw new Error('fake ability availability finalize failed')
+                      }
+                    },
+                  }
+                : {}),
+            },
+          ),
+        )
+      } catch (error) {
+        if (prepared.availability) {
+          await abilityAvailability.cancel(prepared.location.space, pkg.directoryName)
+        }
+        throw error
+      }
+      if (!written.id || !written.versionToken) {
+        throw new Error('fake custom ability produced no identity')
+      }
+      const ability = {
+        name: prepared.body.name,
+        title: projection.title,
+        description: prepared.body.description,
+        scope: prepared.location.scope,
+        space: prepared.location.space,
+        ...(prepared.location.projectId ? { projectId: prepared.location.projectId } : {}),
+        ...(prepared.availability ? { availability: prepared.availability } : {}),
+        packageId: pkg.directoryName,
+        noteId: written.id,
+      }
+
+      return prepared.kind === 'role'
+        ? {
+            kind: 'role',
+            body: prepared.body,
+            location: prepared.location as RoleLocation,
+            ability,
+            locator: ownedRoleLocator(prepared.location as RoleLocation, pkg.directoryName),
+            versionToken: written.versionToken,
+          }
+        : {
+            kind: 'skill',
+            body: prepared.body,
+            location: prepared.location as SkillHomeLocation,
+            ability: {
+              ...ability,
+              scope: (prepared.location as SkillHomeLocation).scope,
+            },
+            locator: ownedSkillLocator(prepared.location as SkillHomeLocation, pkg.directoryName),
+            versionToken: written.versionToken,
+          }
+    },
+  }
 
   const seedAgentPackages = async (fx: Fixture): Promise<void> => {
     const resolveRoleTarget = async (target: AgentRoleTargetDecl) => {
@@ -666,6 +806,7 @@ export const createApp = async (
       declarations: fx.agentSkills ?? [],
       roles,
       library: roleLibrary.library,
+      seedPackageFile: roleLibrary.seedPackageFile,
       storeForSpace: (space) => manager.store(space),
       resolveLocation: async (declaration) => {
         const home = declaration.home
@@ -743,8 +884,9 @@ export const createApp = async (
         }
         const user = fx.auth?.users.find((candidate) => candidate.username === record.owner)
         const personalSpace = user?.personalSpace ? idOf(user.personalSpace) : null
+        const sessionProject = record.projectId ? await projects.getById(record.projectId) : null
         const resolved = await roles.resolveEffective(
-          { personalSpace },
+          { personalSpace, ...(sessionProject ? { project: sessionProject } : {}) },
           SYSTEM_PRINCIPAL,
           record.role,
         )
@@ -757,7 +899,7 @@ export const createApp = async (
               // seeder now stores. Rebuilt here it was a second producer of the
               // locator, and a System role has no placement to rebuild one from.
               roleLocator: resolved.locator,
-              roleContextProjectId: null,
+              roleContextProjectId: sessionProject?.id ?? null,
             }
           : record
       }),
@@ -886,6 +1028,7 @@ export const createApp = async (
     spaces: manager,
     auth,
     sessions: fixture.noAgentSessions ? undefined : agentSessions,
+    customAbilityCreator,
     roles,
     agentDeltaCursors,
     gatewayState: fixture.noGatewayState ? undefined : gatewayState,

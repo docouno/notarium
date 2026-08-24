@@ -21,6 +21,7 @@ import type {
   NoteContent,
   NoteMeta,
   Preview,
+  PublishedResourceEvidence,
   ReadOptions,
   ReadScope,
   RestoreInput,
@@ -100,6 +101,7 @@ type ExternalObservation = {
   title: string
   content: string | undefined
   tags: string[] | undefined
+  requiresExactState: boolean
   transition: number
   meta: NoteMeta
 }
@@ -159,6 +161,53 @@ const IDENTITY_CONVERGENCE_BACKOFF_MS = 25
 
 export class CachedStore implements KnowledgeStore {
   private readonly inner: KnowledgeStore
+  private readonly causalPublicationReleases = new Set<() => void>()
+
+  async beginCausalPublication(): Promise<() => void> {
+    const releaseIntent = await this.mutationAdmission.acquire('mutation')
+
+    try {
+      await this.ensureMutationReady()
+      const releaseMutation = await this.mutations.acquire({ global: true })
+      let held = true
+
+      const release = () => {
+        if (!held) {
+          return
+        }
+        held = false
+        this.causalPublicationReleases.delete(release)
+        releaseMutation()
+        releaseIntent()
+      }
+
+      this.causalPublicationReleases.add(release)
+      return release
+    } catch (error) {
+      releaseIntent()
+      throw error
+    }
+  }
+
+  primeCommittedIdentity(record: IdentityRecord): Promise<void> {
+    return this.identity.primeCommitted(record)
+  }
+
+  confirmCommittedIdentity(id: string): Promise<void> {
+    return this.identity.confirmCommitted(id)
+  }
+
+  releasePrimedIdentity(id: string): Promise<void> {
+    return this.identity.releasePrimed(id)
+  }
+
+  async adoptPublishedResource(evidence: PublishedResourceEvidence): Promise<DocumentState> {
+    if (!this.inner.adoptPublishedResource) {
+      throw new Error('inner store cannot adopt a durable publication')
+    }
+
+    return this.inner.adoptPublishedResource(evidence)
+  }
 
   /** Project one identity row committed outside the ordinary write engine. */
   async adoptCausalIdentity(noteId: string): Promise<void> {
@@ -874,6 +923,13 @@ export class CachedStore implements KnowledgeStore {
 
   stop(): void {
     this.stopped = true
+    // A recoverable causal operation deliberately keeps projection admission
+    // closed while this process can still serve. Process shutdown itself ends
+    // serving; release those process-local leases so settle can drain. Durable
+    // operation/receipt recovery reacquires the fence before next admission.
+    for (const release of [...this.causalPublicationReleases]) {
+      release()
+    }
     // Wake operations that were admitted only as waiters. ensureMutationReady
     // observes stopped and fails them closed before they can queue storage work.
     this.openNotesBarrier()
@@ -2056,8 +2112,10 @@ export class CachedStore implements KnowledgeStore {
    *  returned — opening a note heals its part of the graph (the engine's
    *  relation index may lag or lie). */
   async read(id: string, opts?: ReadOptions): Promise<NoteContent> {
-    await this.recoverIdentityForSurface()
-    const content = await this.readInternal(id, opts, false)
+    if (!opts?.mutationClaimed) {
+      await this.recoverIdentityForSurface()
+    }
+    const content = await this.readInternal(id, opts, opts?.mutationClaimed === true)
 
     await this.ensureIdentityPublished()
     return content
@@ -3848,7 +3906,7 @@ export class CachedStore implements KnowledgeStore {
     // post-import catch-up, a cold reconcile) from being an O(N²) freeze.
     const batchIndex = this.snap.buildIndex()
 
-    for (const { meta, content, tags } of delta.upserts) {
+    for (const { meta, content, tags, requiresExactState = false } of delta.upserts) {
       const adopted = this.adoptMeta(meta)
       const id = adopted.id
       const prev = this.snap.notes.get(id)
@@ -3898,6 +3956,7 @@ export class CachedStore implements KnowledgeStore {
           title: adopted.title,
           content,
           tags,
+          requiresExactState,
           transition,
           meta: observed,
         })
@@ -3912,6 +3971,7 @@ export class CachedStore implements KnowledgeStore {
           title: adopted.title,
           content: undefined,
           tags: undefined,
+          requiresExactState,
           transition,
           meta: observed,
         })
@@ -3969,7 +4029,8 @@ export class CachedStore implements KnowledgeStore {
 
     if (
       !this.inner.capabilities.identity &&
-      (identityUnchecked ||
+      (observation.requiresExactState ||
+        identityUnchecked ||
         (unresolvedId === observation.noteId &&
           this.identity.recordFor(unresolvedId)?.materialized !== true))
     ) {

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
+import { ABILITY_KIND, type OwnedAbilityLocator } from '@notarium/contract'
 import type { Principal, SpaceRole } from '../../packages/server/src/services/authz'
 import {
   AbilityUnavailableError,
@@ -9,6 +10,7 @@ import {
   inMemoryAbilityPersistence,
   RoleDependencyConflictError,
   type RoleLocation,
+  type RolesService,
   type SkillHomeLocation,
 } from '../../packages/server/src/services/roles'
 import { writableLibrary } from '../roleLibraryComposition'
@@ -32,6 +34,29 @@ const PROJECT = {
   space: 'shared',
   projectId: 'project-a',
 } as const satisfies RoleLocation
+
+const forkRoleVersion = async (
+  roles: RolesService,
+  principal: Principal,
+  locator: Extract<OwnedAbilityLocator, { kind: 'role' }>,
+) => {
+  const source = await roles.withCurrentOwnedTarget(
+    locator,
+    principal,
+    async (snapshot) => snapshot,
+  )
+
+  if (!source || source.locator.kind !== ABILITY_KIND.role) {
+    throw new AbilityUnavailableError('no such Owned Role')
+  }
+
+  return roles.createRoleVersion(
+    principal,
+    { ...source, locator: source.locator },
+    'personal',
+    'project-a',
+  )
+}
 
 /** A real caller. `system: false` is the entire point: it is the only way any rule in
  *  `authz` is consulted at all. */
@@ -159,9 +184,7 @@ describe('ability service authorization — the nine gates the system principal 
     ).rejects.toBeInstanceOf(AbilityUnavailableError)
     // Refused BEFORE the row was touched: reach decides where a role answers at all,
     // so a refusal that still wrote would be the whole failure this gate prevents.
-    await expect(abilityAvailability.get('shared', base.packageId)).resolves.toMatchObject({
-      mode: 'all-projects',
-    })
+    await expect(abilityAvailability.get('shared', base.packageId)).resolves.toBeNull()
 
     await expect(
       roles.setAbilityAvailability({ personalSpace: 'personal' }, writer, locator, narrowed),
@@ -174,7 +197,7 @@ describe('ability service authorization — the nine gates the system principal 
     const base = await roles.createCustomRole('review', 'Review.', 'The way.', SHARED)
     const locator = sharedRole(base.packageId)
 
-    await roles.createRoleVersion(writer, locator, 'personal', 'project-a')
+    await forkRoleVersion(roles, writer, locator)
 
     await expect(
       roles.listRoleVersions(outsider, locator, 'personal', ['project-a']),
@@ -188,12 +211,7 @@ describe('ability service authorization — the nine gates the system principal 
   it('finds no base for a version whose Space the caller cannot read', async () => {
     const { roles } = world()
     const base = await roles.createCustomRole('review', 'Review.', 'The way.', SHARED)
-    const version = await roles.createRoleVersion(
-      writer,
-      sharedRole(base.packageId),
-      'personal',
-      'project-a',
-    )
+    const version = await forkRoleVersion(roles, writer, sharedRole(base.packageId))
     const locator = projectRole(version.packageId)
 
     await expect(roles.findRoleBase(outsider, locator, 'personal')).resolves.toBeNull()
@@ -207,16 +225,17 @@ describe('ability service authorization — the nine gates the system principal 
     const base = await roles.createCustomRole('review', 'Review.', 'The way.', SHARED)
     const locator = sharedRole(base.packageId)
 
-    await expect(
-      roles.createRoleVersion(reader, locator, 'personal', 'project-a'),
-    ).rejects.toBeInstanceOf(AbilityUnavailableError)
+    await expect(forkRoleVersion(roles, reader, locator)).rejects.toBeInstanceOf(
+      AbilityUnavailableError,
+    )
     // A version is a package published into the project library; the refusal has to
     // land before that, not after.
-    await expect(library.getSkill(PROJECT, 'review')).resolves.toBeNull()
+    await expect(library.getAbilitiesNamed(PROJECT, 'review')).resolves.toEqual(new Map())
 
-    await expect(
-      roles.createRoleVersion(writer, locator, 'personal', 'project-a'),
-    ).resolves.toMatchObject({ name: 'review', scope: 'project' })
+    await expect(forkRoleVersion(roles, writer, locator)).resolves.toMatchObject({
+      name: 'review',
+      scope: 'project',
+    })
   })
 
   it('refuses to promote a project version for a read-only caller', async () => {
@@ -281,10 +300,12 @@ describe('ability service authorization — the nine gates the system principal 
 
     // The saved binding names a placement the CONTEXT reaches, and the context is
     // built from the project the caller is in — not from what the caller may read.
-    await expect(roles.loadSavedRole(projectContext, outsider, locator, 4_000)).resolves.toBeNull()
+    await expect(
+      roles.loadSavedRole(projectContext, outsider, locator, 4_000),
+    ).resolves.toMatchObject({ ok: false, reason: 'gone' })
     await expect(
       roles.loadSavedRole(projectContext, reader, locator, 4_000),
-    ).resolves.toMatchObject({ role: { name: 'review' } })
+    ).resolves.toMatchObject({ ok: true, loaded: { role: { name: 'review' } } })
 
     // Both entries of the saved binding, because they share ONE gate: `resolveSavedRole`
     // and `loadSavedRole` are two callers of `savedRoleEntry`, and a suite that only

@@ -45,8 +45,4 @@ export const assertRestoreTerminalCommitShape = (input: RestoreTerminalCommit): 
   }
 }
 
-export const RESTORE_TERMINAL_LIFECYCLE_PHASES: readonly string[] = [
-  'active',
-  'closing',
-  'archived',
-]
+export const RESTORE_TERMINAL_LIFECYCLE_PHASES: readonly string[] = ['active', 'closing']

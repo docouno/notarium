@@ -6,6 +6,7 @@ import { DOCUMENT_ROLE } from '../../../libs/markdown'
 import { analyzeDocumentState } from '../../../libs/markdown'
 import { type MutationClaim, MutationCoordinator } from '../../../libs/mutationCoordinator'
 import { noteFilePath } from '../../../libs/path'
+import { exactVersionToken } from '../exactNoteState'
 import { NotesMap } from '../snapshot/notesMap'
 import type { WriteHost } from './types'
 import { WriteEngine } from './writeEngine'
@@ -41,6 +42,7 @@ const hostFor = (
       }),
       resolvedTargetIds: () => [],
       sourceIdsTargeting: () => [],
+      patchNoteEdges: vi.fn(() => []),
       edgesBySource: new Map(),
       batchIndex: () => undefined,
     },
@@ -49,6 +51,7 @@ const hostFor = (
       idFor: () => undefined,
       recordFor: () => undefined,
       bindOwnedId: vi.fn(),
+      markMaterialized: vi.fn(),
       markDeleted: vi.fn(),
     },
     journal: {
@@ -56,8 +59,8 @@ const hostFor = (
         journalled.push(revision)
       },
     },
-    previewCache: { delete: vi.fn() },
-    dirs: { has: () => true },
+    previewCache: { delete: vi.fn(), set: vi.fn() },
+    dirs: { has: () => true, add: vi.fn(() => false) },
     iso: () => '2026-08-18T00:00:00.000Z',
     reconcileSoon: vi.fn(),
     afterNotesReady: (patch: () => void) => patch(),
@@ -77,6 +80,135 @@ const hostFor = (
 }
 
 describe('WriteEngine destination fence', () => {
+  it('enters aroundWrite after the mutation claim and releases it after finalize', async () => {
+    const id = 'owned-note-id'
+    const path = `${PACKAGE_DIR}/SKILL.md`
+    const events: string[] = []
+    const notes = new Map<string, NoteMeta>([
+      [
+        id,
+        { id, title: 'Owned', class: 'skill', filePath: path, modifiedAt: null, createdAt: null },
+      ],
+    ])
+    const live = {
+      id,
+      title: 'Owned',
+      class: 'skill',
+      filePath: path,
+      content: 'before',
+      frontmatter: {},
+      versionToken: 'before-token',
+      physicalIncarnation: { adapterId: 'test', claim: { kind: 'test', value: 'before' } },
+    } as unknown as NoteContent
+    const after = { ...live, content: 'after', versionToken: 'after-token' }
+    const beforeToken = exactVersionToken(live)
+    const coordinator = new MutationCoordinator()
+    const runStable = coordinator.runStable.bind(coordinator)
+
+    vi.spyOn(coordinator, 'runStable').mockImplementation((claimFor, task) =>
+      runStable(claimFor, async () => {
+        events.push('claim')
+        return task()
+      }),
+    )
+    const { host } = hostFor(notes)
+    ;(host.inner.read as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce(live)
+      .mockResolvedValue(after)
+    ;(host.inner.write as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      events.push('inner')
+      return { id, title: 'Owned', class: 'skill', filePath: path, versionToken: 'after-token' }
+    })
+
+    await new WriteEngine(host, { mutations: coordinator }).write(
+      {
+        originalId: id,
+        title: 'Owned',
+        content: 'after',
+        versionToken: beforeToken,
+      },
+      {
+        aroundWrite: async (write) => {
+          events.push('around:enter')
+          try {
+            return await write()
+          } finally {
+            events.push('around:finally')
+          }
+        },
+        prepare: () => {
+          events.push('prepare')
+        },
+        assertCurrent: () => {
+          events.push('assert-current')
+        },
+        finalize: () => {
+          events.push('finalize')
+        },
+      },
+    )
+
+    expect(events).toEqual([
+      'claim',
+      'around:enter',
+      'prepare',
+      'assert-current',
+      'inner',
+      'finalize',
+      'around:finally',
+    ])
+  })
+
+  it('releases aroundWrite when the physical write fails', async () => {
+    const id = 'owned-note-id'
+    const path = `${PACKAGE_DIR}/SKILL.md`
+    const events: string[] = []
+    const { host } = hostFor(
+      new Map([
+        [
+          id,
+          { id, title: 'Owned', class: 'skill', filePath: path, modifiedAt: null, createdAt: null },
+        ],
+      ]),
+    )
+    const live = {
+      id,
+      title: 'Owned',
+      class: 'skill',
+      filePath: path,
+      content: 'before',
+      frontmatter: {},
+      versionToken: 'before-token',
+      physicalIncarnation: { adapterId: 'test', claim: { kind: 'test', value: 'before' } },
+    } as unknown as NoteContent
+    const beforeToken = exactVersionToken(live)
+
+    ;(host.inner.read as ReturnType<typeof vi.fn>).mockResolvedValue(live)
+    ;(host.inner.write as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('physical failed'))
+
+    await expect(
+      new WriteEngine(host).write(
+        {
+          originalId: id,
+          title: 'Owned',
+          content: 'after',
+          versionToken: beforeToken,
+        },
+        {
+          aroundWrite: async (write) => {
+            events.push('around:enter')
+            try {
+              return await write()
+            } finally {
+              events.push('around:finally')
+            }
+          },
+        },
+      ),
+    ).rejects.toThrow('physical failed')
+    expect(events).toEqual(['around:enter', 'around:finally'])
+  })
+
   /** `<pkg>/references/SKILL.md` ends like a manifest and is an auxiliary: the engine
    *  renames it, so the claim the fence takes has to cover where it lands. */
   it('claims where a renamed package auxiliary really goes', async () => {
@@ -236,8 +368,45 @@ describe('WriteEngine tombstone', () => {
     )
     ;(host.inner.read as ReturnType<typeof vi.fn>).mockResolvedValue(live)
 
-    await new WriteEngine(host).remove('role-note-id')
+    const assertCurrent = vi.fn()
+
+    await new WriteEngine(host).remove('role-note-id', { assertCurrent })
+    expect(assertCurrent).toHaveBeenCalledWith(live)
     expect(journalled).toHaveLength(1)
     expect(journalled[0]).toMatchObject({ noteId: 'role-note-id', title: 'My Role' })
+  })
+
+  it('checks the exact current class before a note move has any effect', async () => {
+    const id = 'move-note-id'
+    const live = {
+      id,
+      title: 'Move me',
+      class: 'skill',
+      filePath: 'move-me.md',
+      content: 'Body.',
+      frontmatter: {},
+      physicalIncarnation: { adapterId: 'test', claim: { kind: 'test', value: 'move' } },
+    } as unknown as NoteContent
+    const { host } = hostFor(
+      new Map([[id, { id, title: 'Move me', class: 'skill', filePath: 'move-me.md' } as NoteMeta]]),
+    )
+    const move = vi.fn()
+
+    ;(host.inner.read as ReturnType<typeof vi.fn>).mockResolvedValue(live)
+    ;(host.inner as typeof host.inner & { move: typeof move }).move = move
+
+    await expect(
+      new WriteEngine(host).move(
+        { id, destinationPath: 'docs/move-me.md' },
+        {
+          assertCurrent: (current) => {
+            if (current.class === 'skill') {
+              throw new Error('blocked current skill')
+            }
+          },
+        },
+      ),
+    ).rejects.toThrow('blocked current skill')
+    expect(move).not.toHaveBeenCalled()
   })
 })

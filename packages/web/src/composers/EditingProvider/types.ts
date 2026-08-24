@@ -18,6 +18,8 @@ export type EditingSessionAdapter = {
   id: string
   draft: Draft
   canWrite: boolean
+  /** Live target admission shared by buttons, hotkeys and the root Save guard. */
+  canSave?: (editor: NoteDraftEditor) => boolean
   versionToken?: string
   save: (payload: SaveInput, versionToken?: string) => Promise<unknown>
   onSaved?: (result: unknown) => void | Promise<void>

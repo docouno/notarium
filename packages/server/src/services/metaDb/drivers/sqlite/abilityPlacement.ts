@@ -5,6 +5,30 @@ import type { SqliteDriverCtx } from './context'
 const ROLE_TARGET = 'role'
 
 export const createAbilityPlacementFacet = (ctx: SqliteDriverCtx): AbilityPlacementPersistence => ({
+  resolveMovedOwnedRoleLocator: async (fromLocator) => {
+    await ctx.ensureInit()
+    const row = ctx.required
+      .prepare(
+        `SELECT to_locator, registry_note_id, manifest_note_id
+           FROM ability_placement_trail
+          WHERE from_locator = ?`,
+      )
+      .get(fromLocator) as
+      | {
+          to_locator: string
+          registry_note_id: string | null
+          manifest_note_id: string | null
+        }
+      | undefined
+
+    return row
+      ? {
+          toLocator: row.to_locator,
+          registryNoteId: row.registry_note_id,
+          manifestNoteId: row.manifest_note_id,
+        }
+      : null
+  },
   moveOwnedRolePlacement: async (move: OwnedRolePlacementMove) => {
     await ctx.ensureInit()
     const db = ctx.required
@@ -62,15 +86,20 @@ export const createAbilityPlacementFacet = (ctx: SqliteDriverCtx): AbilityPlacem
 
       if (space !== null) {
         db.prepare('DELETE FROM ability_placement_trail WHERE from_locator = ?').run(move.toLocator)
-        db.prepare('UPDATE ability_placement_trail SET to_locator = ? WHERE to_locator = ?').run(
-          move.toLocator,
-          move.fromLocator,
-        )
         db.prepare(
-          `INSERT INTO ability_placement_trail (from_locator, to_locator, space_id)
-           VALUES (?, ?, ?)
-           ON CONFLICT (from_locator) DO UPDATE SET to_locator = excluded.to_locator`,
-        ).run(move.fromLocator, move.toLocator, space)
+          `UPDATE ability_placement_trail
+             SET to_locator = ?, registry_note_id = ?, manifest_note_id = ?
+           WHERE to_locator = ?`,
+        ).run(move.toLocator, move.registryNoteId, move.manifestNoteId, move.fromLocator)
+        db.prepare(
+          `INSERT INTO ability_placement_trail
+             (from_locator, to_locator, space_id, registry_note_id, manifest_note_id)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT (from_locator) DO UPDATE SET
+             to_locator = excluded.to_locator,
+             registry_note_id = excluded.registry_note_id,
+             manifest_note_id = excluded.manifest_note_id`,
+        ).run(move.fromLocator, move.toLocator, space, move.registryNoteId, move.manifestNoteId)
       }
 
       // Exact resume is fail-closed by design, so an episode left on the old locator

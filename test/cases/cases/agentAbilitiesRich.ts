@@ -66,6 +66,14 @@ export const agentAbilitiesRich: CaseSpec = {
     b.member({ space: 'main', username: 'sergey', role: 'owner' })
     b.member({ space: 'product', username: 'sergey', role: 'owner' })
     b.member({ space: 'product', username: 'maya', role: 'writer' })
+    b.agentSession({
+      ref: 'agent-created-ability',
+      owner: 'sergey',
+      name: 'Agent ability authoring',
+      createdDaysAgo: 2,
+      lastSeenDaysAgo: 0,
+      calls: 4,
+    })
 
     b.note({
       space: 'main',
@@ -208,6 +216,21 @@ export const agentAbilitiesRich: CaseSpec = {
       attachRole: 'release-reviewer',
       target: { kind: 'personal', user: 'sergey' },
     })
+    b.agentRole({
+      source: 'custom',
+      name: 'malformed-attachment-proof',
+      description: 'Carry one malformed legacy attachment into runtime health.',
+      instructions: '# Malformed attachment proof\n\nKeep the invalid locator observable.',
+      invalidAttachment: '[[notarium-id:space:broken|invalid-proof]]',
+      target: { kind: 'personal', user: 'sergey' },
+    })
+    b.agentRole({
+      source: 'custom',
+      name: 'missing-dependency-proof',
+      description: 'Retain an exact link after its package is deleted.',
+      instructions: '# Missing dependency proof\n\nThe dependency must remain missing.',
+      target: { kind: 'personal', user: 'sergey' },
+    })
 
     // The Skills inventory is sized the way the Roles one is: the Product Space's
     // fleet plus the Personal fallback that always rides along has to clear BOTH
@@ -261,6 +284,54 @@ export const agentAbilitiesRich: CaseSpec = {
       instructions: '# Evidence index\n\nKeep every claim addressable while the review runs.',
       home: { kind: 'personal', user: 'sergey' },
       linkedRole: 'evidence-lead',
+    })
+    b.agentSkill({
+      name: 'markdown-package-proof',
+      description: 'A Markdown auxiliary that blocks the temporary agent delete contract.',
+      instructions:
+        '# Markdown package proof\n\nMust fail closed in delete_ability; human package delete remains available.',
+      home: { kind: 'personal', user: 'sergey' },
+      packageFiles: [
+        {
+          path: 'references/checklist.md',
+          content: '# Checklist\n\nA restorable package member.\n',
+        },
+      ],
+    })
+    b.agentSkill({
+      name: 'asset-package-proof',
+      description: 'A package with bytes Trash cannot restore.',
+      instructions: '# Asset package proof\n\nMust fail closed in delete_ability.',
+      home: { kind: 'personal', user: 'sergey' },
+      packageFiles: [{ path: 'assets/template.bin', content: 'seeded binary-shaped resource' }],
+    })
+    b.agentSkill({
+      name: 'deleted-dependency-proof',
+      description: 'A dependency deleted after its exact role link was authored.',
+      instructions: '# Deleted dependency proof\n\nThis package is intentionally removed.',
+      home: { kind: 'personal', user: 'sergey' },
+      linkedRole: 'missing-dependency-proof',
+      deleted: true,
+    })
+    b.agentSkill({
+      name: 'agent-created-oversized-proof',
+      description: 'An agent-attributed body too large for runtime activation.',
+      instructions: `# Agent-created oversized proof\n\n${'Oversized agent-authored evidence block. '.repeat(2_000)}`,
+      home: { kind: 'personal', user: 'sergey' },
+      agentAudit: {
+        principal: 'pat:seed:ability-author',
+        owner: 'sergey',
+        agent: 'Seed ability author',
+        sessionRef: 'agent-created-ability',
+        sessionAttach: 'declared',
+      },
+      pins: [{ kind: 'project', space: 'product', path: 'web' }],
+    })
+    b.agentSkill({
+      name: 'research',
+      description: 'A same-name Owned Skill beside the System research Role.',
+      instructions: '# Research skill\n\nSAME_KIND_SKILL_SENTINEL.',
+      home: { kind: 'personal', user: 'sergey' },
     })
 
     // A catalog Add on a PROJECT placement — the one operation that installs a

@@ -14,8 +14,10 @@ import {
 } from '@notarium/contract/tools'
 import { asciiSlug, STORE_ERROR_REASON } from '@notarium/core'
 
+import { clientFailureOf } from '../../libs/clientFailure'
+import type { AbilitiesService } from '../abilities'
 import { type AgentSessions, type BoundAgentSession, createAgentSessions } from '../agentSessions'
-import { type AuthService } from '../auth'
+import type { AuthService } from '../auth'
 import { type Action, agentOwnerOf, can, type Principal, scopeAllows } from '../authz'
 import type {
   AgentDeltaCursorsPersistence,
@@ -38,6 +40,13 @@ import { TOOL_META, type ToolAnnotations } from './descriptions'
 import { projectSummaryOf } from './helpers/projectAddressing'
 import { retrievalRowOf } from './helpers/retrievalAudit'
 import { sanitizeText } from './sanitize'
+import {
+  handleCreateAbility,
+  handleDeleteAbility,
+  handleEditAbility,
+  handleGetAbility,
+  handleListAbilities,
+} from './tools/abilities'
 import { handleMoveFolder, handleRenameFolder, handleRenameProject } from './tools/containers'
 import { handleCreateNote, handleCreateNotes } from './tools/create'
 import { handleLink, handleLinkMany } from './tools/links'
@@ -56,13 +65,14 @@ import {
   handleRecentActivity,
   handleSearch,
 } from './tools/read'
-import { handleListRoles, handleUseRole } from './tools/roles'
+import { handleUseRole, handleUseSkill } from './tools/roles'
 import { handleStartSession } from './tools/session'
 
 export type GatewayDeps = {
   spaces: SpaceManager
   auth: AuthService
   roles?: RolesService
+  abilities?: AbilitiesService
   /** Durable, owner-scoped agent episodes. Absent means the whole session feature
    *  degrades away: start_session emits no session and regular calls ignore it. */
   sessions?: AgentSessionsPersistence
@@ -138,9 +148,13 @@ export type Ctx = {
   agentDeltaCursors?: AgentDeltaCursorsPersistence
   gatewayState?: GatewayStatePersistence
   /** App-level active writes keyed by scope and idempotency key. */
-  idempotencyInFlight?: Map<string, Promise<{ result: DedupResult; wasHit: boolean }>>
+  idempotencyInFlight?: Map<
+    string,
+    Promise<{ result: DedupResult; wasHit: boolean; persistenceFailed?: true }>
+  >
   agentSessions?: AgentSessions
   roles?: RolesService
+  abilities?: AbilitiesService
   /** Stable session owner: username in password mode, reserved `@system` in none mode. */
   sessionOwner: string | null
   /** Episode attached to this call. start_session fills it after opening one. */
@@ -185,6 +199,15 @@ const errorResult = (text: string): ToolResult => ({
 
 const LOOP_GUARDED_TOOLS = new Set<ToolName>(['search', 'recall'])
 const LOOP_GUARD_MAX_SESSIONS = 2_048
+const CLIENT_FAILURE_ONLY_TOOLS = new Set<string>([
+  'list_abilities',
+  'get_ability',
+  'create_ability',
+  'edit_ability',
+  'delete_ability',
+  'use_role',
+  'use_skill',
+])
 
 const loopGuardResult = (name: 'search' | 'recall'): ToolResult => {
   const structured = name === 'search' ? { results: [] } : { context: '', sources: [] }
@@ -233,7 +256,10 @@ export const createGateway = (deps: GatewayDeps): McpGateway => {
   // call clears the marker, so an intentional later refresh remains possible.
   const lastProceduralBySession = new Map<string, string>()
   // App-scoped: a module-level map would couple independent gateway instances.
-  const idempotencyInFlight = new Map<string, Promise<{ result: DedupResult; wasHit: boolean }>>()
+  const idempotencyInFlight = new Map<
+    string,
+    Promise<{ result: DedupResult; wasHit: boolean; persistenceFailed?: true }>
+  >()
 
   const ctxFor = (principal: Principal): Ctx => {
     // Both return the STABLE space id — the gateway addresses stores/meta-DB by id;
@@ -267,6 +293,7 @@ export const createGateway = (deps: GatewayDeps): McpGateway => {
       idempotencyInFlight,
       agentSessions,
       roles: deps.roles,
+      abilities: deps.abilities,
       sessionOwner: agentOwnerOf(principal),
       now,
       personalSpace,
@@ -427,7 +454,10 @@ export const createGateway = (deps: GatewayDeps): McpGateway => {
           name !== 'get_my_projects'
         ) {
           const sessionId = (parsed.data as { session?: string }).session
-          ctx.session = (await agentSessions.attach(ctx.sessionOwner, sessionId)) ?? undefined
+          ctx.session =
+            (await (name === 'use_skill'
+              ? agentSessions.read(ctx.sessionOwner, sessionId)
+              : agentSessions.attach(ctx.sessionOwner, sessionId))) ?? undefined
         }
         if (ctx.session) {
           if (LOOP_GUARDED_TOOLS.has(name as ToolName)) {
@@ -494,13 +524,17 @@ export const createGateway = (deps: GatewayDeps): McpGateway => {
 }
 
 /** The actionable message for a thrown error, shared by mapError and the batch
- *  handlers. A ToolFailure carries its own safe message; a domain error keeps its
- *  guidance (CAS conflict → re-read and retry); anything unexpected is logged and
- *  reported opaquely (no internal leak). NOT sanitised here — every caller defangs
- *  its own output. */
+ *  handlers. Explicit client failures carry their safe projection; legacy note-tool
+ *  markers retain their existing guidance. Anything else is logged and reported
+ *  opaquely. NOT sanitised here — every caller defangs its own output. */
 export const toolErrorMessage = (err: unknown, name: string): string => {
   if (err instanceof ToolFailure) {
     return err.message
+  }
+  const clientFailure = clientFailureOf(err)
+
+  if (clientFailure) {
+    return clientFailure.kind === 'not-found' ? 'not found' : clientFailure.message
   }
   const e = err as {
     isConflict?: boolean
@@ -515,7 +549,20 @@ export const toolErrorMessage = (err: unknown, name: string): string => {
     return `${e.message || 'that memory category is being rewritten concurrently'} — nothing was written. Repeat the same call.`
   }
   if (e.isConflict) {
+    if (CLIENT_FAILURE_ONLY_TOOLS.has(name)) {
+      console.error(`[mcp] ${name} ->`, (err as Error)?.message)
+      return 'internal error'
+    }
+
     return 'This note changed since you last read it. Re-read it with get_note to get the current versionToken, then retry.'
+  }
+  // Ability-domain errors must opt into the explicit, message-validated contract
+  // above. Legacy structural flags belong to older note tools; accepting them here
+  // would let a storage error bypass the new no-leak boundary with an arbitrary
+  // `message` merely because it happened to carry `isToolError` or `isNotFound`.
+  if (CLIENT_FAILURE_ONLY_TOOLS.has(name)) {
+    console.error(`[mcp] ${name} ->`, (err as Error)?.message)
+    return 'internal error'
   }
   if (e.isNotFound) {
     return e.message || 'not found'
@@ -549,8 +596,13 @@ export const toolsHelpFor = (principal: Principal): ToolHelp[] =>
  *  canon: docs/mcp-gateway.md#tools */
 const HANDLERS: Partial<Record<ToolName, Handler>> = {
   start_session: handleStartSession,
-  list_roles: handleListRoles,
+  list_abilities: handleListAbilities,
+  get_ability: handleGetAbility,
+  create_ability: handleCreateAbility,
+  edit_ability: handleEditAbility,
+  delete_ability: handleDeleteAbility,
   use_role: handleUseRole,
+  use_skill: handleUseSkill,
   whoami: handleWhoami,
   get_my_projects: handleGetMyProjects,
   list_notes: handleListNotes,

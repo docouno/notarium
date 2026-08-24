@@ -1,4 +1,5 @@
 export * from './bootstrap'
+export * from './abilities'
 export { AgentSessionIdSchema } from './_fields'
 export * from './discover'
 export * from './primitives'

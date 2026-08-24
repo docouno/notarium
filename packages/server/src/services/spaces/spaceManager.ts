@@ -5,9 +5,11 @@
 
 import {
   asciiSlug,
+  type DocumentState,
   freshNoteId,
   type IdentityRecord,
   noteFileBase,
+  type PublishedResourceEvidence,
   READ_SCOPE,
   SPACE_LIFECYCLE_PHASE,
   type SpaceLifecyclePhase,
@@ -40,9 +42,15 @@ type SpaceEntry = {
   store: SpaceStore | null
   lastAccess: number
   sseRefs: number
+  causalPublicationRefs: number
   /** A meta-DB global-id lookup selected this live space. The next post-auth
    * store handoff must wait for its authoritative duplicate-owner registry. */
   identityReadyRequired: boolean
+}
+
+type AcceptedCausalPublication = {
+  kind: 'ability-create' | 'restore'
+  operationId: string
 }
 
 export class SpaceManager {
@@ -303,11 +311,20 @@ export class SpaceManager {
       error.cause = cause
       throw error
     }
-    const blockers = await db.restoreOperations.listRecoverable(rec.id)
+    const [restoreBlockers, abilityBlockers] = await Promise.all([
+      db.restoreOperations.listRecoverable(rec.id),
+      db.abilityCreate ? db.abilityCreate.listRecoverable() : Promise.resolve([]),
+    ])
+    const blockers = [
+      ...restoreBlockers.map((operation) => ({ kind: 'restore', operation })),
+      ...abilityBlockers
+        .filter((operation) => operation.space === rec.id)
+        .map((operation) => ({ kind: 'ability-create', operation })),
+    ]
 
     if (blockers.length) {
       throw spaceError(
-        `space lifecycle is pinned by restore operation ${blockers[0].id}`,
+        `space lifecycle is pinned by ${blockers[0].kind} operation ${blockers[0].operation.id}`,
         'space_busy',
       )
     }
@@ -546,20 +563,45 @@ export class SpaceManager {
     if (!entry || entry.lifecycle !== SPACE_LIFECYCLE_PHASE.active) {
       throw spaceNotFound(id)
     }
+
+    return this.loadStore(entry, false)
+  }
+
+  /** Boot or reuse the projection owned by one admitted durable operation. The
+   * public store door remains active-only; only a verified operation may keep its
+   * private projection alive while archive is draining in `closing`. */
+  private async loadStore(
+    entry: SpaceEntry,
+    allowClosing: boolean,
+    primeIdentity?: IdentityRecord,
+  ): Promise<SpaceStore> {
+    const lifecycleAllowed = () =>
+      entry.lifecycle === SPACE_LIFECYCLE_PHASE.active ||
+      (allowClosing && entry.lifecycle === SPACE_LIFECYCLE_PHASE.closing)
+
+    if (!lifecycleAllowed()) {
+      throw spaceNotFound(entry.rec.id)
+    }
     entry.lastAccess = Date.now()
     if (!entry.storePromise) {
       const rec = entry.rec
       const booting: Promise<SpaceStore> = Promise.resolve()
         .then(() => this.createStore(rec))
-        .then((store) => {
+        .then(async (store) => {
           // Evicted/archived WHILE booting: a concurrent archive()/idle-eviction nulled
           // storePromise. Don't install this now-stale store — it would leak a started
           // store on an archived space and double-open its .db on restore. Tear it down.
-          if (entry.storePromise !== booting || entry.lifecycle !== SPACE_LIFECYCLE_PHASE.active) {
+          if (entry.storePromise !== booting || !lifecycleAllowed()) {
             store.stop?.()
             return store
           }
           entry.store = store
+          if (primeIdentity) {
+            if (!store.primeCommittedIdentity) {
+              throw new Error(`space ${rec.id} cannot prime a causal identity before boot`)
+            }
+            await store.primeCommittedIdentity(primeIdentity)
+          }
           void store.start?.()
           return store
         })
@@ -575,6 +617,13 @@ export class SpaceManager {
 
     const store = await entry.storePromise
 
+    if (primeIdentity) {
+      if (!store.primeCommittedIdentity) {
+        throw new Error(`space ${entry.rec.id} cannot prime a causal identity`)
+      }
+      await store.primeCommittedIdentity(primeIdentity)
+    }
+
     if (entry.identityReadyRequired) {
       // resolveNote runs before resource auth. Defer the potentially expensive
       // boot/readiness barrier to the later store() handoff so an inaccessible
@@ -584,6 +633,48 @@ export class SpaceManager {
     }
 
     return store
+  }
+
+  private async acceptedCausalPublication(
+    space: string,
+    accepted: AcceptedCausalPublication,
+  ): Promise<{ valid: boolean; identity?: IdentityRecord }> {
+    if (!this.metaDb) {
+      return { valid: false }
+    }
+    if (accepted.kind === 'restore') {
+      const operation = await this.metaDb.restoreOperations.get(accepted.operationId)
+
+      return {
+        valid:
+          operation?.space === space &&
+          operation.phase !== 'succeeded' &&
+          operation.phase !== 'rejected',
+      }
+    }
+    const operation = await this.metaDb.abilityCreate?.get(accepted.operationId)
+    const valid =
+      operation?.space === space &&
+      operation.phase !== 'succeeded' &&
+      operation.phase !== 'rejected'
+
+    return {
+      valid,
+      ...(valid && operation
+        ? {
+            identity: {
+              id: operation.noteId,
+              filePath: operation.targetPath,
+              space: operation.space,
+              createdAt: operation.createdAt,
+              materialized: false,
+              deletedAt: null,
+              addressRevision: 1,
+              legacyNameAliases: [],
+            },
+          }
+        : {}),
+    }
   }
 
   /** Outbox recovery for this replica. An inactive space has no live projection
@@ -608,6 +699,100 @@ export class SpaceManager {
     }
     await store.identityReady?.()
     await store.reconcile()
+  }
+
+  async beginCausalPublication(
+    space: string,
+    accepted?: AcceptedCausalPublication,
+  ): Promise<() => void> {
+    const entry = this.entries.get(space)
+
+    if (
+      !entry ||
+      (entry.lifecycle !== SPACE_LIFECYCLE_PHASE.active &&
+        entry.lifecycle !== SPACE_LIFECYCLE_PHASE.closing)
+    ) {
+      throw spaceNotFound(space)
+    }
+    const acceptedState = accepted
+      ? await this.acceptedCausalPublication(space, accepted)
+      : { valid: false }
+    const acceptedVerified = acceptedState.valid
+
+    if (entry.lifecycle === SPACE_LIFECYCLE_PHASE.closing && !acceptedVerified) {
+      throw spaceNotFound(space)
+    }
+    entry.causalPublicationRefs++
+
+    try {
+      const store = await this.loadStore(entry, acceptedVerified, acceptedState.identity)
+
+      if (!store.beginCausalPublication) {
+        throw new Error(`space ${space} cannot fence a causal publication`)
+      }
+      const releaseStore = await store.beginCausalPublication()
+      let held = true
+
+      return () => {
+        if (!held) {
+          return
+        }
+        held = false
+        releaseStore()
+        entry.causalPublicationRefs--
+      }
+    } catch (error) {
+      entry.causalPublicationRefs--
+      throw error
+    }
+  }
+
+  async primeWarmCausalIdentity(space: string, record: IdentityRecord): Promise<void> {
+    const entry = this.entries.get(space)
+
+    if (!entry?.storePromise) {
+      return
+    }
+    const store = await entry.storePromise
+
+    if (!store.primeCommittedIdentity) {
+      throw new Error(`space ${space} cannot prime a causal identity`)
+    }
+    await store.primeCommittedIdentity(record)
+  }
+
+  async confirmCausalIdentity(space: string, noteId: string): Promise<void> {
+    await (await this.causalProjectionStore(space)).confirmCommittedIdentity?.(noteId)
+  }
+
+  async releasePrimedIdentity(space: string, noteId: string): Promise<void> {
+    await (await this.causalProjectionStore(space)).releasePrimedIdentity?.(noteId)
+  }
+
+  async adoptCausalPublication(
+    space: string,
+    evidence: PublishedResourceEvidence,
+  ): Promise<DocumentState> {
+    const store = await this.causalProjectionStore(space)
+
+    if (!store.adoptPublishedResource) {
+      throw new Error(`space ${space} cannot adopt a durable publication`)
+    }
+    if (evidence.identity) {
+      await store.primeCommittedIdentity?.(evidence.identity)
+    }
+
+    return store.adoptPublishedResource(evidence)
+  }
+
+  private causalProjectionStore(space: string): Promise<SpaceStore> {
+    const entry = this.entries.get(space)
+
+    if (!entry || entry.causalPublicationRefs === 0) {
+      throw spaceNotFound(space)
+    }
+
+    return this.loadStore(entry, true)
   }
 
   /** Per-space SSE subscription; holds an eviction guard (sseRefs) for the socket's
@@ -984,6 +1169,7 @@ export class SpaceManager {
       store: null,
       lastAccess: 0,
       sseRefs: 0,
+      causalPublicationRefs: 0,
       identityReadyRequired: false,
     })
     this.rebuildSlugIndex()
@@ -1007,7 +1193,12 @@ export class SpaceManager {
     const cutoff = Date.now() - this.idleEvictMs
 
     for (const entry of this.entries.values()) {
-      if (!entry.store || entry.sseRefs > 0 || entry.lastAccess > cutoff) {
+      if (
+        !entry.store ||
+        entry.sseRefs > 0 ||
+        entry.causalPublicationRefs > 0 ||
+        entry.lastAccess > cutoff
+      ) {
         continue
       }
       const store = entry.store

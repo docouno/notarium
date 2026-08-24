@@ -39,6 +39,7 @@ import {
   type ResourceStrictStageRef,
   sameFileClaim,
   type SpaceResourceAuthority,
+  type StrictMutationReceipt,
 } from '@notarium/engine'
 
 import { can, type Principal } from '../authz'
@@ -385,6 +386,8 @@ export class RestoreCoordinator {
   private readonly now: () => Date
   private readonly operationId: () => string
   private readonly onError: NonNullable<RestoreCoordinatorOptions['onError']>
+  private readonly projectionReleases = new Map<string, () => void>()
+  private readonly recoveryAuthorities = new Set<SpaceResourceAuthority>()
 
   constructor(options: RestoreCoordinatorOptions) {
     this.metaDb = options.metaDb
@@ -401,6 +404,48 @@ export class RestoreCoordinator {
           `[restore]${operation ? ` ${operation.id}/${operation.phase}` : ''} ->`,
           (error as Error).message,
         ))
+  }
+
+  private async enterProjection(operation: RestoreOperationRecord): Promise<void> {
+    if (this.projectionReleases.has(operation.id)) {
+      return
+    }
+    this.projectionReleases.set(
+      operation.id,
+      await this.spaces.beginCausalPublication(operation.space, {
+        kind: 'restore',
+        operationId: operation.id,
+      }),
+    )
+  }
+
+  private releaseProjection(operationId: string): void {
+    const release = this.projectionReleases.get(operationId)
+
+    if (!release) {
+      return
+    }
+    this.projectionReleases.delete(operationId)
+    release()
+  }
+
+  private closeForRecovery(authority: SpaceResourceAuthority): void {
+    this.recoveryAuthorities.add(authority)
+    void authority
+      .closeAdmission({ owner: 'restore-recovery' })
+      .catch((error) => this.onError(error))
+  }
+
+  private async reopenAfterCommit(space: string, authority: SpaceResourceAuthority): Promise<void> {
+    if (!this.recoveryAuthorities.delete(authority)) {
+      return
+    }
+    await authority.closeAdmission({ owner: 'restore-recovery' })
+    const lifecycle = await this.metaDb.spaceLifecycle.get(space)
+
+    if (lifecycle?.phase === SPACE_LIFECYCLE_PHASE.active && !authority.diagnostics().length) {
+      authority.reopenAdmission()
+    }
   }
 
   async execute(
@@ -606,6 +651,7 @@ export class RestoreCoordinator {
       null
     const packagePath =
       skillPackageContextOf(authority, className, operation.targetPath)?.packagePath ?? null
+    await this.enterProjection(operation)
     const lease = packagePath
       ? await authority.admitSkillPlacement(
           operation.targetPath,
@@ -639,11 +685,28 @@ export class RestoreCoordinator {
       } else {
         result = await this.publishAndCommit(current, authority, packagePath)
       }
+      if (
+        result.status === 'pending' &&
+        (result.phase === 'physical-published' || result.phase === 'failed-recoverable')
+      ) {
+        this.closeForRecovery(authority)
+      }
+    } catch (error) {
+      const durable = await this.metaDb.restoreOperations.get(operation.id)
+
+      if (
+        durable?.phase === RESTORE_OPERATION_PHASE.physicalPublished ||
+        durable?.phase === RESTORE_OPERATION_PHASE.failedRecoverable
+      ) {
+        this.closeForRecovery(authority)
+      }
+      throw error
     } finally {
       lease.settle()
     }
 
     if (result.status === 'succeeded') {
+      await this.reopenAfterCommit(operation.space, authority)
       try {
         await this.spaces.reconcileCausalProjection(operation.space, operation.noteId)
       } catch (error) {
@@ -1143,6 +1206,40 @@ export class RestoreCoordinator {
     if (documentStateVersionToken(finalState) !== prepared.candidateVersionToken) {
       throw new Error('prepared restore candidate changed semantic identity')
     }
+    const physicalReceipt = JSON.parse(current.physicalReceipt) as StrictMutationReceipt
+
+    if (
+      physicalReceipt.operationId !== current.id ||
+      physicalReceipt.binding !== current.stageBinding ||
+      physicalReceipt.restartDurable !== true ||
+      physicalReceipt.candidateHash !== (await sha256Hex(candidateSource))
+    ) {
+      throw new Error('restore physical receipt changed before projection adoption')
+    }
+    const adopted = await this.spaces.adoptCausalPublication(current.space, {
+      path: prepared.targetPath,
+      source: candidateSource,
+      ownerProof,
+      document: {
+        role: prepared.role,
+        pathFallbackTitle: prepared.pathFallbackTitle,
+        skillDirectoryName: prepared.skillDirectoryName,
+      },
+      identity: prepared.identity,
+      receipt: {
+        id: current.id,
+        semanticEventTime: physicalReceipt.semanticEventTime,
+        candidateHash: physicalReceipt.candidateHash,
+        transitions: physicalReceipt.transitions,
+      },
+    })
+
+    if (
+      documentStateVersionToken(adopted) !== prepared.candidateVersionToken ||
+      adopted.semanticFingerprint !== finalState.semanticFingerprint
+    ) {
+      throw new Error('restore projection changed before terminal metadata')
+    }
     const content = encodeDocumentState(finalState)
     const contentHash = await sha256Hex(content)
     const fields = projectionFields(finalState)
@@ -1207,6 +1304,7 @@ export class RestoreCoordinator {
       return this.markRecoverable(current, `terminal-${terminal.conflict}`)
     }
     current = terminal.operation
+    this.releaseProjection(current.id)
     // Publication is the physical linearization point. Once terminal.commit has
     // persisted the restore revision, a foreign pathname replacement is a later
     // external mutation: keeping metadata-committed nonterminal cannot make the
@@ -1426,6 +1524,8 @@ export class RestoreCoordinator {
       throw new Error('restore operation disappeared while rejecting it')
     }
 
+    this.releaseProjection(operation.id)
+
     return transition.operation
   }
 
@@ -1456,6 +1556,7 @@ export class RestoreCoordinator {
   private async completedResponse(
     operation: RestoreOperationRecord,
   ): Promise<RestoreCommandResult> {
+    this.releaseProjection(operation.id)
     const authority = operation.targetPath ? await this.authorityForSpace(operation.space) : null
 
     if (authority && operation.targetPath && operation.preparedEvidence) {

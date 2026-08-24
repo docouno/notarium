@@ -16,6 +16,7 @@ export { spaceLifecycleHasEnded } from './abilityLifecycle'
 // package it names, and the Space that package lives in.
 export { abilityPackageOfLocator, abilitySpaceOfLocator } from './abilityAddress'
 export {
+  ABILITY_CREATE_PHASE,
   ABILITY_TARGET_PURGED,
   abilityTargetPurgedError,
   isAbilityTargetPurgedError,
@@ -23,6 +24,12 @@ export {
 export { SqliteMetaDb } from './sqliteMetaDb'
 export { PgMetaDb } from './pgMetaDb'
 export type {
+  AbilityCreateAccept,
+  AbilityCreateCommit,
+  AbilityCreateOperationRecord,
+  AbilityCreatePersistence,
+  AbilityCreatePhase,
+  AbilityCreateTerminalResult,
   AbilityPreferenceLocator,
   AbilityPreferencesPersistence,
   AbilityPreferenceTarget,
@@ -33,6 +40,7 @@ export type {
   AgentSessionAuditEvent,
   AgentSessionAuditPersistence,
   AgentSessionAuditSummary,
+  AgentSessionInferredStart,
   AgentSessionRoleSet,
   AgentSessionNamedStart,
   AgentSessionsPersistence,

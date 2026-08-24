@@ -64,12 +64,21 @@ describe('createServer — configured role mount', () => {
               { class: 'skill', dir: skillDir, prefix: '.roles-library' },
             ],
           },
+          {
+            slug: 'shared',
+            engine: 'notarium',
+            notesDir: join(root, 'shared-notes'),
+          },
         ],
         metaDbUrl: `sqlite:${join(root, 'meta.db')}`,
         authMode: 'none',
         engineDataDir: join(root, 'engine'),
         jobsDataDir: join(root, 'jobs'),
         importStagingDir: join(root, 'jobs', 'imports'),
+        // This suite proves package-mount semantics, not operator-static Personal
+        // degradation. Declare namespace ownership so its Personal setup remains a
+        // supported positive arm; the static system refusal has its own regression.
+        spacesRoot: join(root, 'spaces'),
         pollIntervalMs: 10,
         replayKeyring: {
           path: join(root, 'replay-keys'),
@@ -349,6 +358,14 @@ describe('createServer — configured role mount', () => {
     })
 
     it('creates a Space-wide custom skill with the reach it stated', async () => {
+      const inventory = await app!.inject({ method: 'GET', url: '/api/me/agent-skills' })
+      const sharedTarget = Object.entries(
+        inventory.json().installAvailability.spaces as Record<string, boolean>,
+      ).find(([, available]) => available)?.[0]
+
+      if (!sharedTarget) {
+        throw new Error('fixture has no shared Ability target')
+      }
       const spaceCustom = await app!.inject({
         method: 'POST',
         url: '/api/me/agent-skills',
@@ -357,7 +374,7 @@ describe('createServer — configured role mount', () => {
           description: 'A space-wide custom procedure.',
           instructions: '# Space proof\n\nFollow this procedure in the selected space.',
           scope: 'space',
-          space: 'main',
+          space: sharedTarget,
           availability: { mode: 'all-projects' },
         },
       })
@@ -367,7 +384,7 @@ describe('createServer — configured role mount', () => {
         expect.objectContaining({
           name: 'space-proof',
           scope: 'space',
-          space: 'main',
+          space: sharedTarget,
           availability: { mode: 'all-projects' },
         }),
       )

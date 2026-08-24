@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- **Agents can discover, activate and author Roles and Agent Skills through MCP.** `list_abilities` replaces the role-only listing, standalone skills activate without becoming session state, role composition reports every attachment honestly, project context is sticky, and four typed authoring tools cover read/create/edit/Trash delete. Custom creation is restart-recoverable across filesystem and meta-DB publication, with the agent/session attribution preserved as the package's single origin revision.
+
 ### Fixed
 
 - **A misspelt `META_DB_URL` no longer opens an empty database.** Every tool now classifies the URL the same way, in one place: `postgres://…`/`postgresql://…` (scheme case-insensitive), `sqlite:<path>`, `sqlite::memory:`, or a plain file path. Anything else — `postgress://…`, `mysql://…`, a bare `sqlite:`, or a connection string that lost its scheme and carries a credential (`host=db password=…`, `//user:pw@host/db`) — is refused with a message instead of being read as a filename, which previously started the server on a fresh empty database (re-opening the public first-run screen while the real data sat untouched) and made `admin` report "no users". A path that merely looks Postgres-shaped, such as `postgres-backup/meta.db`, stays a path.

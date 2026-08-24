@@ -1,19 +1,21 @@
 // Markdown rendering for the read/bootstrap tools: the prose projection of each tool's structured payload.
-import { type EffectiveRoleSummary } from '@notarium/contract'
 import {
   type AgentSession,
   type DeltaEntry,
   type FolderEntry,
   type ListNotesItem,
+  type NextAbilityAction,
   type NoteLink,
   type ProjectSummary,
   type Provenance,
   type RecentActivityItem,
   type RecentAgentSession,
   RESPONSE_FORMAT,
+  type RuntimeAbilitySummary,
   type SearchHit,
   type ToolHelp,
   type UseRoleOutput,
+  type UseSkillOutput,
 } from '@notarium/contract/tools'
 
 import { renderProvenance } from '../provenance'
@@ -25,9 +27,12 @@ type SessionStructured = {
     memory: Array<{ noteId: string; category: string; summary: string }>
     alwaysLoad: Array<{ noteId: string; title: string }>
   }
-  roles: EffectiveRoleSummary[]
-  rolesTruncated?: boolean
+  abilities: RuntimeAbilitySummary[]
+  abilitiesTruncated?: boolean
+  nextAction?: NextAbilityAction
   activeRole?: UseRoleOutput
+  roleDiagnostic?: string
+  projectResolutionHint?: string
   projects: ProjectSummary[]
   project?: {
     index: { noteCount: number; folders: FolderEntry[] }
@@ -74,27 +79,29 @@ export const renderSession = (
       lines.push(`- ${a.title} \`${a.noteId}\``)
     }
   }
-  if (s.roles.length) {
-    lines.push('', '**Available roles** (call `use_role` when one matches the work):')
-    for (const role of s.roles) {
-      // A System role has no placement to name; its SOURCE is what the line states.
+  if (s.projectResolutionHint) {
+    lines.push('', s.projectResolutionHint)
+  }
+  if (s.abilities.length) {
+    lines.push('', '**Available abilities:**')
+    for (const ability of s.abilities) {
       lines.push(
-        `- \`${role.name}\` (${role.source === 'system' ? 'system' : role.scope}) — ${role.description}`,
+        `- \`${ability.name}\` (${ability.kind}, ${ability.source === 'system' ? 'system' : ability.scope}) — ${ability.description}`,
       )
     }
-  } else if (s.rolesTruncated) {
-    lines.push('', 'No roles are visible in this bounded summary.')
+  } else if (s.abilitiesTruncated) {
+    lines.push('', 'No abilities fit in this bounded summary.')
   } else {
-    lines.push('', 'No roles have been added in this scope; continue in the base mode.')
+    lines.push('', 'No abilities are available in this scope; continue in the base mode.')
   }
-  if (s.rolesTruncated) {
-    lines.push(
-      '',
-      '_(role summaries were abbreviated or omitted — use `list_roles` for the bounded inventory)_',
-    )
+  if (s.abilitiesTruncated && s.nextAction) {
+    lines.push('', `Required next action: \`${JSON.stringify(s.nextAction)}\``)
   }
   if (s.activeRole) {
     lines.push('', renderRole(s.activeRole))
+  }
+  if (s.roleDiagnostic) {
+    lines.push('', `**Saved role was not restored:** ${s.roleDiagnostic}`)
   }
   lines.push(
     '',
@@ -166,7 +173,14 @@ export const renderRole = (loaded: UseRoleOutput): string => {
   }
 
   for (const skill of loaded.skills ?? []) {
-    lines.push('', `## Linked skill: ${skill.name}`, '', skill.instructions)
+    lines.push('', `## Linked skill: ${skill.name}`, '')
+    if (skill.state === 'loaded') {
+      lines.push(skill.instructions)
+    } else {
+      lines.push(
+        `_(instructions omitted by the role budget — call \`use_skill\` with \`skill: "${skill.name}"\` to load them)_`,
+      )
+    }
   }
   if (loaded.context?.alwaysLoad.length) {
     lines.push('', '**Role context:**')
@@ -206,6 +220,9 @@ export const renderRole = (loaded: UseRoleOutput): string => {
 
   return lines.join('\n').trim()
 }
+
+export const renderSkill = (loaded: UseSkillOutput): string =>
+  [`# Active skill: ${loaded.skill.name}`, '', loaded.instructions].join('\n').trim()
 
 /** Where a note lives, in prose: project handle, else space slug, else personal. */
 const whereLabel = (loc: { space?: string; project?: string }): string => {

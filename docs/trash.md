@@ -25,6 +25,19 @@ package id, while each Markdown auxiliary remains its own tombstone. Non-Markdow
 backed up/exported but are outside the note journal, so package deletion cannot promise to restore
 those bytes from Trash.
 
+For this RC, agent `delete_ability` deliberately uses a narrower contract than the human package
+door. It inspects under the package fence and accepts only one regular direct `SKILL.md`; every
+auxiliary member (including Markdown, hidden/nested names, alternate case, symbolic links and
+non-Markdown bytes) keeps the package intact and directs the caller to Agents UI. The one victim is
+tombstoned with a required append after atomic detach. Append failure escapes that boundary, so the
+staged directory is renamed back and the API cannot report success without a recovery point.
+
+Human UI/REST package deletion keeps the established multi-file behaviour described above. Full
+agent deletion of Markdown packages is a POST-RC extension: it needs an exact detach roster and an
+atomic required tombstone batch for SQLite, PostgreSQL and in-memory persistence. Repeating
+`recordRequired` once per member is not an acceptable substitute because a mid-loop failure would
+leave only part of the package recoverable.
+
 The last path lives in the identity registry. `markDeleted` retains the id→path/class
 binding with `deletedAt`, allowing undelete and deleted-note routing without treating
 the removed file as live.

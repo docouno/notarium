@@ -111,7 +111,7 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
       await runPgMigrations(client, migrations)
 
       const result = await client.query(
-        'SELECT owner, name, calls, role, role_locator, role_context_project_id FROM agent_sessions WHERE id = $1',
+        'SELECT owner, name, calls, role, role_locator, role_context_project_id, project_id FROM agent_sessions WHERE id = $1',
         ['ses_existingv1aa'],
       )
       expect(result.rows).toEqual([
@@ -122,6 +122,7 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
           role: null,
           role_locator: null,
           role_context_project_id: null,
+          project_id: null,
         },
       ])
     } finally {

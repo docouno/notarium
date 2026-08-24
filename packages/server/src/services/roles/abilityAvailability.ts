@@ -119,6 +119,58 @@ export class InMemoryAbilityAvailability implements AbilityAvailabilityPersisten
     )
   }
 
+  async reserve(
+    homeSpace: string,
+    packageId: string,
+    availability: AbilityAvailability,
+  ): Promise<boolean> {
+    const projectIds =
+      availability.mode === ABILITY_AVAILABILITY_MODE.selectedProjects
+        ? [...new Set(availability.projectIds)].sort()
+        : []
+
+    await this.assertHome(homeSpace)
+    await this.assertProjects(homeSpace, projectIds)
+    const key = this.key(homeSpace, packageId)
+
+    if (this.records.has(key)) {
+      return false
+    }
+    this.records.set(
+      key,
+      availability.mode === ABILITY_AVAILABILITY_MODE.allProjects
+        ? { homeSpace, packageId, mode: ABILITY_AVAILABILITY_MODE.allProjects }
+        : {
+            homeSpace,
+            packageId,
+            mode: ABILITY_AVAILABILITY_MODE.selectedProjects,
+            projectIds,
+          },
+    )
+    return true
+  }
+
+  async finalize(homeSpace: string, packageId: string, actualNoteId: string): Promise<boolean> {
+    const key = this.key(homeSpace, packageId)
+
+    if (!this.records.has(key) || this.registryNotes.has(key)) {
+      return false
+    }
+    this.assertRegistryNote(homeSpace, actualNoteId)
+    this.registryNotes.set(key, actualNoteId)
+    return true
+  }
+
+  async cancel(homeSpace: string, packageId: string): Promise<boolean> {
+    const key = this.key(homeSpace, packageId)
+
+    if (!this.records.has(key) || this.registryNotes.has(key)) {
+      return false
+    }
+    this.records.delete(key)
+    return true
+  }
+
   /** The durable `home_space` FOREIGN KEY, asked where a Map has no key to enforce.
    *  A policy whose home Space is gone (or was never there) cannot be stored: the
    *  drivers refuse it, and a twin that saves it lets a caller believe a purged Space

@@ -45,7 +45,7 @@ import { contextRoleSummaryOf, roleContextViewOf } from '../wire'
 
 export const projectsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
   const { projects, markerStore, folders, spaces, spaceStoreFor, principalId } = ctx
-  const { storeAccess, contextSets, scopePins, contextOrder, auth, roles } = ctx
+  const { storeAccess, contextSets, scopePins, contextOrder, auth, roles, abilities } = ctx
 
   // Mark a folder (or space root, folderPath: '') as a project: write-through the
   // `.notariummeta` marker + upsert the registry row. Idempotent; marking is
@@ -308,14 +308,19 @@ export const projectsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => 
       const projectPins = [...projectTagPins, ...projectLoose]
       // Personal background: its store may be another space; none-mode (no personal
       // domain) embeds nothing.
-      const personalSlug = await peekPersonalSpace({ auth, spaces }, req.principal)
+      const [personalSlug, abilityPersonalSpace] = await Promise.all([
+        peekPersonalSpace({ auth, spaces }, req.principal),
+        abilities ? abilities.personalSpaceFor(req.principal) : Promise.resolve(null),
+      ])
       const personalStore = personalSlug ? await spaces.store(personalSlug) : null
       // A personal space and its Space root are the same library, so a project living
       // in the caller's own space must not answer with both links: the Space one is
       // not a placement the effective chain ever visits.
       const roleLocations = [
-        ...(personalSlug ? [{ scope: ROLE_SCOPE.personal, space: personalSlug } as const] : []),
-        ...(rec.space === personalSlug
+        ...(abilityPersonalSpace
+          ? [{ scope: ROLE_SCOPE.personal, space: abilityPersonalSpace } as const]
+          : []),
+        ...(rec.space === abilityPersonalSpace
           ? []
           : [{ scope: ROLE_SCOPE.space, space: rec.space } as const]),
         { scope: ROLE_SCOPE.project, space: rec.space, projectId: rec.id } as const,
@@ -368,7 +373,7 @@ export const projectsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => 
           : Promise.resolve({ abilities: [], truncated: false }),
         selectedRoleLocation && selectedRoleLocator && roles
           ? roles.addressedRoleStatus(
-              { personalSpace: personalSlug, project: rec },
+              { personalSpace: abilityPersonalSpace, project: rec },
               req.principal,
               selectedRoleLocator,
             )

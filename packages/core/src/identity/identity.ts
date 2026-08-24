@@ -85,6 +85,10 @@ export class IdentityRegistry {
       this.flushTimer = null
     }
     await this.persistence.init()
+    const primedRecords = [...this.primed].flatMap((id) => {
+      const record = this.byId.get(id)
+      return record ? [copyRecord(record)] : []
+    })
     const loadedByPath = new Map<string, IdentityRecord>()
     const loadedById = new Map<string, IdentityRecord>()
     const canonicalized: IdentityRecord[] = []
@@ -116,6 +120,13 @@ export class IdentityRegistry {
       if (!rec.deletedAt) {
         loadedByPath.set(rec.filePath, rec)
       }
+    }
+    // A host transaction may reserve an identity before this cold registry loads.
+    // Its process-local prime must win over the persisted provisional row until the
+    // terminal commit confirms or releases it; otherwise boot retires the absent path.
+    for (const rec of primedRecords) {
+      loadedById.set(rec.id, rec)
+      loadedByPath.set(rec.filePath, rec)
     }
     this.byPath = loadedByPath
     this.byId = loadedById
@@ -647,6 +658,9 @@ export class IdentityRegistry {
     if (!rec) {
       return undefined
     }
+    if (this.primed.has(rec.id)) {
+      return undefined
+    }
     this.byPath.delete(filePath)
     rec.deletedAt = this.iso()
     this.markDirty(rec)
@@ -669,7 +683,7 @@ export class IdentityRegistry {
   markMaterialized(id: string): void {
     const rec = this.byId.get(id)
 
-    if (!rec || rec.materialized) {
+    if (!rec || rec.materialized || this.primed.has(id)) {
       return
     }
     rec.materialized = true
@@ -817,6 +831,61 @@ export class IdentityRegistry {
     )
 
     return run
+  }
+
+  private readonly primed = new Set<string>()
+
+  /** Install a host transaction's reserved identity without writing it back. The
+   * caller owns durability; this only prevents a warm process from racing that row
+   * with an auto-minted claimant when the physical bytes become visible. */
+  primeCommitted(record: IdentityRecord): Promise<void> {
+    return this.runSerialized(async () => {
+      const current = this.byPath.get(record.filePath)
+      const owner = this.byId.get(record.id)
+
+      if (
+        (current && current.id !== record.id && current.materialized) ||
+        (owner && owner.filePath !== record.filePath && !owner.deletedAt)
+      ) {
+        throw new Error(`cannot prime occupied identity ${record.id} at ${record.filePath}`)
+      }
+      if (current && current.id !== record.id) {
+        this.byId.delete(current.id)
+        this.dirty.delete(current.id)
+        this.dropped.delete(current.id)
+      }
+      const installed = copyRecord({ ...record, materialized: true, deletedAt: null })
+
+      this.byId.set(installed.id, installed)
+      this.byPath.set(installed.filePath, installed)
+      this.dirty.delete(installed.id)
+      this.dropped.delete(installed.id)
+      this.primed.add(installed.id)
+    })
+  }
+
+  confirmCommitted(id: string): Promise<void> {
+    return this.runSerialized(async () => {
+      this.primed.delete(id)
+    })
+  }
+
+  releasePrimed(id: string): Promise<void> {
+    return this.runSerialized(async () => {
+      if (!this.primed.delete(id)) {
+        return
+      }
+      const record = this.byId.get(id)
+
+      if (record) {
+        this.byId.delete(id)
+        if (this.byPath.get(record.filePath)?.id === id) {
+          this.byPath.delete(record.filePath)
+        }
+      }
+      this.dirty.delete(id)
+      this.dropped.delete(id)
+    })
   }
 
   /** Records whose id was superseded locally still need their tombstone

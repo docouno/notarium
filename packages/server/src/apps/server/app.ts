@@ -16,6 +16,7 @@ import type { BuildInfo } from '../../libs/buildInfo'
 import type { HostInfo } from '../../libs/hostInfo'
 import type { ImportStagingStore } from '../../libs/importStaging'
 import type { MutationGate, MutationRelease } from '../../libs/mutationGate'
+import { createAbilities, type CustomAbilityCreator } from '../../services/abilities'
 import { AuthError, type AuthService, createAuthService } from '../../services/auth'
 import type {
   AgentDeltaCursorsPersistence,
@@ -38,6 +39,7 @@ import type { BulkRestoreCoordinator, RestoreCoordinator } from '../../services/
 import type { MarkerStore } from '../../services/projects'
 import { AbilityUnavailableError, type RolesService } from '../../services/roles'
 import type { SpaceManager } from '../../services/spaces'
+import { createStoreAccess } from '../../services/storeAccess'
 import { installAuthz } from './perimeter/authz'
 import { spaFallbackDecision, spaRequestDecision } from './perimeter/spaFallback'
 import { validationIssuesOf } from './perimeter/validationError'
@@ -53,6 +55,7 @@ export type BuildAppOptions = {
   spaces: SpaceManager
   auth?: AuthService
   sessions?: AgentSessionsPersistence
+  customAbilityCreator?: CustomAbilityCreator
   roles?: RolesService
   agentDeltaCursors?: AgentDeltaCursorsPersistence
   gatewayState?: GatewayStatePersistence
@@ -97,6 +100,7 @@ export const buildApp = async ({
   spaces,
   auth,
   sessions,
+  customAbilityCreator,
   roles,
   agentDeltaCursors,
   gatewayState,
@@ -133,6 +137,17 @@ export const buildApp = async ({
     trustProxy: trustProxy ?? false,
   })
   const authService = auth ?? createAuthService({ mode: AUTH_MODE.none })
+  const abilities = roles
+    ? createAbilities({
+        roles,
+        spaces,
+        auth: authService,
+        projects,
+        sessions,
+        customCreator: customAbilityCreator,
+        store: createStoreAccess(spaces),
+      })
+    : undefined
   app.addHook('preClose', async () => authService.disconnectAllSse())
 
   // Interactive-traffic signal: count each short request in flight so the background
@@ -373,6 +388,7 @@ export const buildApp = async ({
     sessionAudit,
     sessions,
     roles,
+    abilities,
     markerStore,
     spacesPersistence,
     about,
@@ -399,6 +415,7 @@ export const buildApp = async ({
     spaces,
     auth: authService,
     roles,
+    abilities,
     sessions,
     agentDeltaCursors,
     gatewayState,

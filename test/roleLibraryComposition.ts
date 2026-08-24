@@ -7,16 +7,22 @@
 // handle: a fixture cannot reach a placement composition refuses, and a suite
 // that wants to prove the refusal asks `publicationFor` directly.
 
-import type {
-  RoleLibrary,
-  RoleLibraryComposition,
-  RoleLocation,
-  SkillPackage,
+import {
+  type RoleLibrary,
+  type RoleLibraryComposition,
+  type RoleLocation,
+  type RolePackagePublication,
+  type SkillPackage,
 } from '../packages/server/src/services/roles'
 
 export type WritableRoleLibrary = RoleLibrary & {
   putIfAbsent(location: RoleLocation, pkg: SkillPackage): Promise<boolean>
-  movePackage(from: RoleLocation, to: RoleLocation, directoryName: string): Promise<boolean>
+  movePackage(
+    from: RoleLocation,
+    to: RoleLocation,
+    directoryName: string,
+    finalize?: (evidence: { manifestNoteId: string | null }) => Promise<void>,
+  ): Promise<boolean>
   /** The two dependencies `createRolesService` takes, carried alongside so a suite
    *  that writes through this wrapper cannot hand the service a DIFFERENT
    *  composition than the one it is seeding. */
@@ -39,8 +45,9 @@ export const writableLibrary = (composition: RoleLibraryComposition): WritableRo
   putIfAbsent: async (location, pkg) => (await handleFor(composition, location)).putIfAbsent(pkg),
   // The destination owns the move, and the source rides along as a parameter —
   // the same asymmetry the handle itself carries.
-  movePackage: async (from, to, directoryName) =>
-    (await handleFor(composition, to)).moveFrom(from, directoryName),
+  movePackage: async (from, to, directoryName, finalize = async () => undefined) => {
+    return (await handleFor(composition, to)).moveFrom(from, directoryName, null, finalize)
+  },
 })
 
 /** One composition whose WRITER misbehaves for chosen placements.
@@ -61,7 +68,11 @@ export const interceptPublication = (
       into: RoleLocation,
       from: RoleLocation,
       directoryName: string,
-      next: () => Promise<boolean>,
+      expected: Parameters<RolePackagePublication['moveFrom']>[2],
+      finalize: (evidence: { manifestNoteId: string | null }) => Promise<void>,
+      next: (
+        finalize?: (evidence: { manifestNoteId: string | null }) => Promise<void>,
+      ) => Promise<boolean>,
     ) => Promise<boolean>
   },
 ): RoleLibraryComposition => ({
@@ -80,12 +91,17 @@ export const interceptPublication = (
           intercept.putIfAbsent
             ? intercept.putIfAbsent(location, pkg, () => handle.putIfAbsent(pkg))
             : handle.putIfAbsent(pkg),
-        moveFrom: (from, directoryName) =>
+        moveFrom: (from, directoryName, expected, finalize) =>
           intercept.moveFrom
-            ? intercept.moveFrom(location, from, directoryName, () =>
-                handle.moveFrom(from, directoryName),
+            ? intercept.moveFrom(
+                location,
+                from,
+                directoryName,
+                expected,
+                finalize,
+                (selected = finalize) => handle.moveFrom(from, directoryName, expected, selected),
               )
-            : handle.moveFrom(from, directoryName),
+            : handle.moveFrom(from, directoryName, expected, finalize),
       }
     },
   },

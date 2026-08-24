@@ -121,6 +121,35 @@ describe('SpaceManager', () => {
     expect(stores.get('b')!.start).toHaveBeenCalledTimes(1)
   })
 
+  it('keeps a causal publication store resident until its projection lease releases', async () => {
+    vi.useFakeTimers()
+    try {
+      const releaseStore = vi.fn()
+      const store = {
+        ...stubStore(),
+        beginCausalPublication: vi.fn(async () => releaseStore),
+      } as SpaceStore
+      const manager = new SpaceManager({
+        spaces: [{ slug: 'a', displayName: 'A' }],
+        createStore: () => store,
+        idleEvictMs: 1,
+      })
+      await manager.init()
+      const release = await manager.beginCausalPublication('a')
+
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(store.stop).not.toHaveBeenCalled()
+
+      release()
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(releaseStore).toHaveBeenCalledTimes(1)
+      expect(store.stop).toHaveBeenCalledTimes(1)
+      await manager.stopAll()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('rejects an unknown slug with a typed not-found', async () => {
     const manager = new SpaceManager({
       spaces: [{ slug: 'a', displayName: 'A' }],
@@ -400,6 +429,70 @@ describe('SpaceManager', () => {
 
     expect(manager.listArchived()).toEqual([expect.objectContaining({ id: rec.id })])
     expect(await metaDb!.spaceLifecycle.get(rec.id)).toMatchObject({ phase: 'archived' })
+  })
+
+  it('admits only the preaccepted causal operation through lifecycle closing', async () => {
+    const metaDb = fakeMetaDb()
+    const releaseStore = vi.fn()
+    const store = {
+      ...stubStore(),
+      beginCausalPublication: vi.fn(async () => releaseStore),
+    } as SpaceStore
+    const manager = new SpaceManager({
+      spaces: [],
+      createStore: () => store,
+      createSpace: async () => {},
+      metaDb,
+    })
+    await manager.init()
+    const rec = await manager.create({ slug: 'work', displayName: 'Work' })
+    await metaDb!.restoreOperations.accept({
+      id: 'restore-accepted',
+      space: rec.id,
+      noteId: 'note-a',
+      endpoint: 'history-restore',
+      actorDigest: 'actor-a',
+      idempotencyDigest: 'key-a',
+      requestFingerprint: 'request-a',
+      stageBinding: 'stage-a',
+      sourceRevisionId: 'revision-a',
+      targetPath: 'note.md',
+      preparedEvidence: '{"kind":"accepted"}',
+      createdAt: '2026-08-11T00:00:00.000Z',
+    })
+
+    await expect(manager.archive(rec.id)).rejects.toMatchObject({ reason: 'space_busy' })
+    await expect(manager.beginCausalPublication(rec.id)).rejects.toMatchObject({ isNotFound: true })
+    await expect(
+      manager.beginCausalPublication(rec.id, {
+        kind: 'restore',
+        operationId: 'not-accepted',
+      }),
+    ).rejects.toMatchObject({ isNotFound: true })
+    await expect(
+      metaDb!.restoreOperations.accept({
+        id: 'restore-fresh',
+        space: rec.id,
+        noteId: 'note-b',
+        endpoint: 'history-restore',
+        actorDigest: 'actor-b',
+        idempotencyDigest: 'key-b',
+        requestFingerprint: 'request-b',
+        stageBinding: 'stage-b',
+        sourceRevisionId: 'revision-b',
+        targetPath: 'other.md',
+        preparedEvidence: '{"kind":"accepted"}',
+        createdAt: '2026-08-11T00:01:00.000Z',
+      }),
+    ).rejects.toThrow(/lifecycle/i)
+
+    const release = await manager.beginCausalPublication(rec.id, {
+      kind: 'restore',
+      operationId: 'restore-accepted',
+    })
+    expect(store.beginCausalPublication).toHaveBeenCalledTimes(1)
+    release()
+    expect(releaseStore).toHaveBeenCalledTimes(1)
   })
 
   it('archive refuses a personal and a config-pinned space (#110)', async () => {

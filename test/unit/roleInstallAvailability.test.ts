@@ -33,7 +33,10 @@ const { createServer } = await import('../../packages/server/src/apps/server/ser
 let root: string
 let app: FastifyInstance | undefined
 
-const boot = async (withSharedSpace = false): Promise<FastifyInstance> => {
+const boot = async (
+  withSharedSpace = false,
+  capabilities: { spaceCreate: boolean } = { spaceCreate: true },
+): Promise<FastifyInstance> => {
   const notesDir = join(root, 'notes')
 
   app = await createServer({
@@ -54,7 +57,7 @@ const boot = async (withSharedSpace = false): Promise<FastifyInstance> => {
     engineDataDir: join(root, 'engine'),
     jobsDataDir: join(root, 'jobs'),
     importStagingDir: join(root, 'jobs', 'imports'),
-    spacesRoot: join(root, 'spaces'),
+    ...(capabilities.spaceCreate ? { spacesRoot: join(root, 'spaces') } : {}),
     pollIntervalMs: 10,
     replayKeyring: { path: join(root, 'replay-keys'), topology: 'canonical-local' },
   })
@@ -269,5 +272,20 @@ describe('role install availability — a host that cannot publish a package', (
       // found. Still the typed answer, never a 500.
       expect(added.json().reason).toBe('role_install_unavailable')
     }
+  })
+
+  it('does not treat the operator-static system home as a Personal ability namespace', async () => {
+    const server = await boot(false, { spaceCreate: false })
+    const roles = await server.inject({ method: 'GET', url: '/api/me/agent-roles' })
+    const added = await server.inject({
+      method: 'POST',
+      url: '/api/me/agent-roles',
+      payload: { name: 'grooming', scope: 'personal' },
+    })
+
+    expect(roles.statusCode, roles.body).toBe(200)
+    expect(roles.json().installAvailability.personal).toBe(false)
+    expect(added.statusCode, added.body).toBe(503)
+    expect(added.json().reason).toBe('role_install_unavailable')
   })
 })

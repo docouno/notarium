@@ -106,6 +106,78 @@ export const createAbilityAvailabilityFacet = (
     return recordsOf(rows)
   },
 
+  reserve: async (homeSpace, packageId, availability) => {
+    await ctx.ensureInit()
+    const db = ctx.required
+    const projectIds =
+      availability.mode === ABILITY_AVAILABILITY_MODE.selectedProjects
+        ? [...new Set(availability.projectIds)].sort()
+        : []
+
+    db.exec('BEGIN IMMEDIATE')
+    try {
+      assertAbilityTargetLive(db, homeSpace, null)
+      assertProjects(db, homeSpace, projectIds)
+      const inserted = db
+        .prepare(
+          `INSERT INTO ability_availability (home_space, package_id, mode, registry_note_id)
+           VALUES (?, ?, ?, NULL)
+           ON CONFLICT(home_space, package_id) DO NOTHING`,
+        )
+        .run(homeSpace, packageId, availability.mode).changes
+
+      if (inserted === 1) {
+        const insert = db.prepare(
+          'INSERT INTO ability_project_bindings (home_space, package_id, project_id) VALUES (?, ?, ?)',
+        )
+
+        for (const projectId of projectIds) {
+          insert.run(homeSpace, packageId, projectId)
+        }
+      }
+      db.exec('COMMIT')
+      return inserted === 1
+    } catch (error) {
+      db.exec('ROLLBACK')
+      throw error
+    }
+  },
+
+  finalize: async (homeSpace, packageId, actualNoteId) => {
+    await ctx.ensureInit()
+    const db = ctx.required
+
+    db.exec('BEGIN IMMEDIATE')
+    try {
+      assertAbilityTargetLive(db, homeSpace, actualNoteId)
+      const changed = db
+        .prepare(
+          `UPDATE ability_availability
+              SET registry_note_id = ?
+            WHERE home_space = ? AND package_id = ? AND registry_note_id IS NULL`,
+        )
+        .run(actualNoteId, homeSpace, packageId).changes
+
+      db.exec('COMMIT')
+      return changed === 1
+    } catch (error) {
+      db.exec('ROLLBACK')
+      throw error
+    }
+  },
+
+  cancel: async (homeSpace, packageId) => {
+    await ctx.ensureInit()
+    const changed = ctx.required
+      .prepare(
+        `DELETE FROM ability_availability
+          WHERE home_space = ? AND package_id = ? AND registry_note_id IS NULL`,
+      )
+      .run(homeSpace, packageId).changes
+
+    return changed === 1
+  },
+
   set: async (homeSpace, packageId, availability: AbilityAvailability, registryNoteId) => {
     await ctx.ensureInit()
     const db = ctx.required

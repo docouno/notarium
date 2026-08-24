@@ -17,6 +17,7 @@ import {
 } from '../../../spaces'
 import { weighScopeContextSets, weighScopeOrder, weighScopePins } from '../../../storeAccess'
 import type { Ctx } from '../../gateway'
+import { isMcpNoteClassAllowed } from '../../helpers/noteDoor'
 import { sanitizeText } from '../../sanitize'
 
 /** The eager always-load profile: loaded agent-memory summaries + always-load pins. */
@@ -76,6 +77,7 @@ export const curateAgentContext = async (
     contextSets: ctx.contextSets,
     scopePins: ctx.scopePins,
     contextOrder: ctx.contextOrder,
+    noteClassAllowed: isMcpNoteClassAllowed,
   }
   const personalPins = [
     ...(personalStore ? await weighAlwaysLoad(personalStore) : []),

@@ -8,7 +8,7 @@
 // CAS write retries a lost race itself (link takes no versionToken).
 // canon: docs/note-model.md#note-ontology
 
-import type { KnowledgeStore, WriteResult } from '../../knowledgeStore'
+import type { KnowledgeStore, MutationOptions, WriteResult } from '../../knowledgeStore'
 import { isDurableScalar } from '../../libs/id'
 import {
   decodeWikilinkIdentity,
@@ -139,9 +139,11 @@ export const applyLinks = (body: string, links: LinkSpec[]): string =>
 export const linkNotesMany = async (
   store: KnowledgeStore,
   input: LinkManyInput,
+  options?: MutationOptions,
 ): Promise<WriteResult> => {
   for (let attempt = 0; ; attempt++) {
     const from = await store.read(input.fromId)
+    await options?.assertCurrent?.(from)
     const fromId = from.id ?? input.fromId
 
     // The transport may have addressed the source through a cold/provisional id,
@@ -162,18 +164,21 @@ export const linkNotesMany = async (
       return { id: fromId, versionToken: token }
     } // idempotent no-op
     try {
-      return await store.write({
-        title: from.title ?? '',
-        content: next,
-        originalId: fromId,
-        versionToken: token,
-        // Carry tags/type forward — a write that omits them clears them (the
-        // engine normalises absent tags to []); link only touches the body.
-        tags: normTags(from.frontmatter?.tags),
-        noteType: typeof from.frontmatter?.type === 'string' ? from.frontmatter.type : undefined,
-        principal: input.principal,
-        agent: input.agent,
-      })
+      return await store.write(
+        {
+          title: from.title ?? '',
+          content: next,
+          originalId: fromId,
+          versionToken: token,
+          // Carry tags/type forward — a write that omits them clears them (the
+          // engine normalises absent tags to []); link only touches the body.
+          tags: normTags(from.frontmatter?.tags),
+          noteType: typeof from.frontmatter?.type === 'string' ? from.frontmatter.type : undefined,
+          principal: input.principal,
+          agent: input.agent,
+        },
+        options,
+      )
     } catch (err) {
       if ((err as { isConflict?: boolean }).isConflict && attempt < 2) {
         continue
@@ -185,9 +190,17 @@ export const linkNotesMany = async (
 
 /** Materialize ONE typed link — the single-edge case of linkNotesMany (kept as the
  *  named intent the single `link` tool calls; one write path, no duplication). */
-export const linkNotes = async (store: KnowledgeStore, input: LinkInput): Promise<WriteResult> =>
-  linkNotesMany(store, {
-    fromId: input.fromId,
-    links: [{ toTitle: input.toTitle, relation: input.relation }],
-    principal: input.principal,
-  })
+export const linkNotes = async (
+  store: KnowledgeStore,
+  input: LinkInput,
+  options?: MutationOptions,
+): Promise<WriteResult> =>
+  linkNotesMany(
+    store,
+    {
+      fromId: input.fromId,
+      links: [{ toTitle: input.toTitle, relation: input.relation }],
+      principal: input.principal,
+    },
+    options,
+  )

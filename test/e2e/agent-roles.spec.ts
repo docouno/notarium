@@ -1,3 +1,4 @@
+import type { Request } from '@playwright/test'
 import { buildCaseWorld, caseToFixture } from '../cases'
 import { expect, type Locator, type Page, test } from './fixtures'
 
@@ -946,6 +947,109 @@ test('@v14 a role draft survives reload and publishes exact attachments', async 
   await expect(detail).toContainText('Meeting brief · healthy')
 })
 
+test('@v24 a restored unavailable target blocks the global Save shortcut', async ({ page }) => {
+  await openTeamAgents(page)
+  await page.getByTestId('role-create').click()
+  await expect(page).toHaveURL(/\/agents\/abilities\/roles\/new\//)
+  const draftUrl = page.url()
+
+  await openAbilityPanel(page)
+  await page.getByTestId('ability-description').fill('Must stay recoverable without publishing.')
+  await setAbilityInstructions(page, '# Unavailable Personal\n\nKeep this draft local.')
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        Object.keys(sessionStorage).some((key) => key.startsWith('notarium:ability-draft:')),
+      ),
+    )
+    .toBe(true)
+
+  await page.route('**/api/me/agent-roles?*', async (route) => {
+    const response = await route.fetch()
+    const body = (await response.json()) as {
+      installAvailability?: { personal?: boolean }
+    }
+
+    await route.fulfill({
+      response,
+      json: {
+        ...body,
+        installAvailability: { ...body.installAvailability, personal: false },
+      },
+    })
+  })
+  let createCalls = 0
+
+  await page.route('**/api/me/agent-roles/custom', async (route) => {
+    createCalls++
+    await route.continue()
+  })
+  page.once('dialog', (dialog) => void dialog.accept())
+  await page.reload()
+
+  await expect(page).toHaveURL(draftUrl)
+  await expect(page.locator('.cm-content')).toContainText('Unavailable Personal')
+  await expect(page.getByTestId('ability-save')).toBeDisabled()
+  await page.keyboard.press('Control+Enter')
+  await page.evaluate(async () => {
+    await fetch('/api/me')
+  })
+
+  expect(createCalls).toBe(0)
+  await expect(page).toHaveURL(draftUrl)
+})
+
+test('@v25 a restored stale Projects target blocks the global Save shortcut', async ({ page }) => {
+  await openTeamAgents(page)
+  await page.getByTestId('role-create').click()
+  await expect(page).toHaveURL(/\/agents\/abilities\/roles\/new\//)
+  const draftUrl = page.url()
+
+  await openAbilityPanel(page)
+  await page
+    .getByRole('group', { name: 'Belongs to' })
+    .getByRole('button', {
+      name: 'Projects',
+      exact: true,
+    })
+    .click()
+  await page.getByTestId('ability-description').fill('The selected projects disappeared.')
+  await setAbilityInstructions(page, '# Stale Projects\n\nKeep this draft local.')
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        Object.keys(sessionStorage).some((key) => key.startsWith('notarium:ability-draft:')),
+      ),
+    )
+    .toBe(true)
+
+  await page.route(/\/api\/me\/agent-skills\?.*limit=100(?:&|$)/, async (route) => {
+    const response = await route.fetch()
+    const body = (await response.json()) as { projects?: unknown[] }
+
+    await route.fulfill({ response, json: { ...body, projects: [] } })
+  })
+  let createCalls = 0
+
+  await page.route('**/api/me/agent-roles/custom', async (route) => {
+    createCalls++
+    await route.abort()
+  })
+  page.once('dialog', (dialog) => void dialog.accept())
+  await page.reload()
+
+  await expect(page).toHaveURL(draftUrl)
+  await expect(page.locator('.cm-content')).toContainText('Stale Projects')
+  await expect(page.getByTestId('ability-save')).toBeDisabled()
+  await page.keyboard.press('Control+Enter')
+  await page.evaluate(async () => {
+    await fetch('/api/me')
+  })
+
+  expect(createCalls).toBe(0)
+  await expect(page).toHaveURL(draftUrl)
+})
+
 test('@v14 a truncated library remains honest and keeps routed catalog cards', async ({
   page,
   baseURL,
@@ -1056,10 +1160,27 @@ test('@v17 Space skill availability leaves with the document under one Save', as
   for (const name of ['Team · team', 'Team · team/other', 'Beta', 'Gamma']) {
     await projectList.getByText(name, { exact: true }).click()
   }
+  const saveWrites: string[] = []
+
+  const captureSaveWrite = (request: Request) => {
+    const path = new URL(request.url()).pathname
+
+    if (
+      (request.method() === 'POST' && path === '/api/note') ||
+      (request.method() === 'PUT' &&
+        /\/api\/me\/agent-abilities\/[^/]+\/(?:save|home|availability)$/.test(path))
+    ) {
+      saveWrites.push(`${request.method()} ${path}`)
+    }
+  }
+  page.on('request', captureSaveWrite)
   await page.getByTestId('ability-save').click()
   // One Save commits the document AND the setting, so leaving edit mode is the
   // signal that both landed — reloading before that races the second write.
   await expect(page.getByRole('button', { name: 'Edit', exact: true })).toBeVisible()
+  page.off('request', captureSaveWrite)
+  expect(saveWrites).toHaveLength(1)
+  expect(saveWrites[0]).toMatch(/^PUT \/api\/me\/agent-abilities\/[^/]+\/save$/)
 
   await page.reload()
   await openAbilityPanel(page)

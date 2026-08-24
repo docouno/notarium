@@ -28,8 +28,8 @@ type DialogProps = {
 const harness = vi.hoisted(() => ({
   api: {
     agentAbilityGet: vi.fn(),
+    agentAbilitySave: vi.fn(),
     noteGet: vi.fn(),
-    noteSave: vi.fn(),
     agentAbilityCreateVersion: vi.fn(),
     agentAbilitySetEnabled: vi.fn(),
     agentRoleAddExact: vi.fn(),
@@ -267,8 +267,13 @@ describe('the ability page', () => {
     harness.readInventory.mockReset()
     harness.readInventory.mockResolvedValue({ first: { projects: [] }, all: [] })
     harness.api.agentAbilityGet.mockReset()
+    harness.api.agentAbilitySave.mockReset().mockImplementation(async (locator) => ({
+      locator,
+      noteId: `note-${locator.packageId}`,
+      versionToken: `v-${locator.packageId}-saved`,
+      steps: [{ step: 'document', outcome: 'applied' }],
+    }))
     harness.api.noteGet.mockReset()
-    harness.api.noteSave.mockReset()
     harness.api.agentAbilityCreateVersion.mockReset()
     harness.api.agentAbilitySetEnabled.mockReset().mockResolvedValue(undefined)
     harness.api.agentRoleAddExact.mockReset()
@@ -348,6 +353,149 @@ describe('the ability page', () => {
     expect(
       encodeAbilityLocator(harness.editing.startSession.mock.calls[0][0].draft.abilityLocator),
     ).toBe(encodeAbilityLocator(locatorOf('Reviewer1234')))
+  })
+
+  it('sends one compound request for the authored document and its settings', async () => {
+    harness.api.agentAbilityGet.mockImplementation(async (at: OwnedAbilityLocator) =>
+      detailOf(at.packageId),
+    )
+    harness.api.noteGet.mockImplementation(async () => noteOf('Reviewer1234'))
+    harness.editing.editor = {
+      abilityDescription: 'Updated role',
+      abilityAvailability: 'selected-projects',
+      abilityProjects: ['project-a'],
+      attachmentsDirty: true,
+      attachments: [],
+    }
+    address('Reviewer1234')
+    harness.location = { key: 'a', state: { editAbility: true } }
+    await render()
+
+    const session = harness.editing.startSession.mock.calls[0][0]
+    await act(async () => {
+      await session.save({ content: '# Reviewer\n\nUpdated body.' }, 'seed-token')
+    })
+
+    expect(harness.api.agentAbilitySave).toHaveBeenCalledTimes(1)
+    expect(harness.api.agentAbilitySave).toHaveBeenCalledWith(locatorOf('Reviewer1234'), {
+      content: '# Reviewer\n\nUpdated body.',
+      description: 'Updated role',
+      covers: ['project-a'],
+      attachments: [],
+      versionToken: 'seed-token',
+    })
+  })
+
+  it('adopts a partial save token before rejecting and resumes from it', async () => {
+    harness.api.agentAbilityGet.mockImplementation(async (at: OwnedAbilityLocator) =>
+      detailOf(at.packageId),
+    )
+    harness.api.noteGet.mockImplementation(async () => noteOf('Reviewer1234'))
+    harness.editing.editor = {
+      abilityDescription: 'Updated role',
+      abilityAvailability: 'all-projects',
+      abilityProjects: [],
+      attachmentsDirty: false,
+      attachments: [],
+    }
+    const locator = locatorOf('Reviewer1234')
+    harness.api.agentAbilitySave
+      .mockResolvedValueOnce({
+        locator,
+        noteId: 'note-Reviewer1234',
+        versionToken: 'partial-token',
+        steps: [
+          { step: 'document', outcome: 'applied' },
+          { step: 'availability', outcome: 'failed', error: 'reach failed' },
+        ],
+      })
+      .mockResolvedValueOnce({
+        locator,
+        noteId: 'note-Reviewer1234',
+        versionToken: 'retry-token',
+        steps: [
+          { step: 'document', outcome: 'skipped' },
+          { step: 'availability', outcome: 'applied' },
+        ],
+      })
+    address('Reviewer1234')
+    harness.location = { key: 'a', state: { editAbility: true } }
+    await render()
+
+    const session = harness.editing.startSession.mock.calls[0][0]
+    await expect(
+      session.save({ content: '# Reviewer\n\nUpdated body.' }, 'seed-token'),
+    ).rejects.toThrow('reach failed')
+    await act(async () => {
+      await session.save({ content: '# Reviewer\n\nUpdated body.' }, 'seed-token')
+    })
+
+    expect(harness.api.agentAbilitySave).toHaveBeenNthCalledWith(
+      2,
+      locator,
+      expect.objectContaining({ versionToken: 'partial-token' }),
+    )
+  })
+
+  it('honours a fresh conflict token after a partial save lost a later race', async () => {
+    harness.api.agentAbilityGet.mockImplementation(async (at: OwnedAbilityLocator) =>
+      detailOf(at.packageId),
+    )
+    harness.api.noteGet.mockImplementation(async () => noteOf('Reviewer1234'))
+    harness.editing.editor = {
+      abilityDescription: 'Updated role',
+      abilityAvailability: 'all-projects',
+      abilityProjects: [],
+      attachmentsDirty: false,
+      attachments: [],
+    }
+    const locator = locatorOf('Reviewer1234')
+    harness.api.agentAbilitySave
+      .mockResolvedValueOnce({
+        locator,
+        noteId: 'note-Reviewer1234',
+        versionToken: 'partial-token',
+        steps: [
+          { step: 'document', outcome: 'applied' },
+          { step: 'availability', outcome: 'failed', error: 'reach failed' },
+        ],
+      })
+      // An external writer advances the document after the partial commit. The
+      // ordinary partial continuation now loses its CAS race.
+      .mockRejectedValueOnce(new Error('version conflict'))
+      .mockResolvedValueOnce({
+        locator,
+        noteId: 'note-Reviewer1234',
+        versionToken: 'overwrite-token',
+        steps: [
+          { step: 'document', outcome: 'applied' },
+          { step: 'availability', outcome: 'applied' },
+        ],
+      })
+    address('Reviewer1234')
+    harness.location = { key: 'a', state: { editAbility: true } }
+    await render()
+
+    const session = harness.editing.startSession.mock.calls[0][0]
+    await expect(
+      session.save({ content: '# Reviewer\n\nUpdated body.' }, 'seed-token'),
+    ).rejects.toThrow('reach failed')
+    await expect(
+      session.save({ content: '# Reviewer\n\nUpdated body.' }, 'seed-token'),
+    ).rejects.toThrow('version conflict')
+
+    // The shared conflict dialog advances its own token before retrying "Save my
+    // version". That explicit overwrite proof must supersede the older token from
+    // the partial response; otherwise every retry repeats the same 409 forever.
+    await act(async () => {
+      await session.save({ content: '# Reviewer\n\nUpdated body.' }, 'external-token')
+    })
+
+    expect(harness.api.agentAbilitySave).toHaveBeenNthCalledWith(
+      3,
+      locator,
+      expect.objectContaining({ versionToken: 'external-token' }),
+    )
   })
 
   // The page hands `invalidate` to five of its own writes and rides the same live
@@ -448,7 +596,6 @@ describe('the ability page', () => {
       detailOf(at.packageId),
     )
     harness.api.noteGet.mockImplementation(async () => noteOf('Reviewer1234'))
-    harness.api.noteSave.mockResolvedValue({ versionToken: 'v2' })
     address('Reviewer1234')
     harness.location = { key: 'a', state: { editAbility: true } }
     await render()

@@ -11,6 +11,7 @@ import { HTTP_STATUS } from '@notarium/contract/http'
 import type { InteractiveSignal } from '@notarium/core'
 
 import type { MutationGate } from '../../../../libs/mutationGate'
+import type { AbilitiesService } from '../../../../services/abilities'
 import type { AuthService } from '../../../../services/auth'
 import { type Principal, SYSTEM_PRINCIPAL } from '../../../../services/authz'
 import { SERVER_INFO, SERVER_INSTRUCTIONS } from '../../../../services/mcp/descriptions'
@@ -35,6 +36,7 @@ export type McpOptions = {
   spaces: SpaceManager
   auth: AuthService
   roles?: RolesService
+  abilities?: AbilitiesService
   sessions?: AgentSessionsPersistence
   agentDeltaCursors?: AgentDeltaCursorsPersistence
   gatewayState?: GatewayStatePersistence
@@ -102,6 +104,7 @@ export const registerMcp = async (
     spaces,
     auth,
     roles,
+    abilities,
     sessions,
     agentDeltaCursors,
     gatewayState,
@@ -122,6 +125,7 @@ export const registerMcp = async (
     spaces,
     auth,
     roles,
+    abilities,
     sessions,
     agentDeltaCursors,
     gatewayState,

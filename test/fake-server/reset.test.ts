@@ -72,6 +72,7 @@ const withAuditSession = (value: Fixture): Fixture => ({
       role: null,
       roleLocator: null,
       roleContextProjectId: null,
+      projectId: null,
     },
   ],
 })

@@ -6,9 +6,10 @@ import {
   RevisionKindSchema,
   RevisionUnavailableReasonSchema,
 } from '../primitives'
-import { EffectiveRoleSummarySchema, RoleNameSchema } from '../rest/agent/roles'
+import { RoleNameSchema } from '../rest/agent/roles'
 import { PatScopeSchema } from '../rest/pats'
 import { AgentSessionIdSchema, locationFields } from './_fields'
+import { NextAbilityActionSchema, RuntimeAbilitySummarySchema } from './abilities'
 import {
   CapabilitiesSchema,
   FolderEntrySchema,
@@ -38,33 +39,33 @@ export const GetMyProjectsOutputSchema = z.object({
   projects: z.array(ProjectSummarySchema),
 })
 
-export const StartSessionInputSchema = z.object({
-  /** Hint (a project handle); without it the bundle is user-level only (profile
-   *  + projects). */
-  project: ProjectHandleSchema.optional(),
-  /** Free-form task hint; no v1 effect. */
-  task: z.string().optional(),
-  /** Canonical explicit role selector. `name` is a compatibility alias for
-   * schema-literal local clients; when given, the role body rides this response. */
-  role: RoleNameSchema.optional(),
-  name: RoleNameSchema.optional(),
-  /** Address an existing session by id, or open/resume/fork by a non-unique name.
-   * Exactly one key avoids silently accepting a stale id/name pair. */
-  session: z
-    .object({
-      id: AgentSessionIdSchema.optional(),
-      name: z.string().trim().min(1).max(160).optional(),
-    })
-    .refine((value) => Number(value.id !== undefined) + Number(value.name !== undefined) === 1, {
-      message: 'provide exactly one of id or name',
-    })
-    .optional(),
-  /** Whether to advance the bound `(session, project)` cursor plus its owner
-   *  fallback, or just the owner fallback when no session binds. Default true;
-   *  `false` = peek. A bound session's starting position is still materialised. */
-  acknowledge: z.boolean().default(true),
-  responseFormat: ResponseFormatSchema.default(RESPONSE_FORMAT.concise),
-})
+export const StartSessionInputSchema = z
+  .object({
+    /** Hint (a project handle); without it the bundle is user-level only (profile
+     *  + projects). */
+    project: ProjectHandleSchema.optional(),
+    /** Free-form task hint; no v1 effect. */
+    task: z.string().optional(),
+    /** Canonical explicit role selector; when given, the role body rides this response. */
+    role: RoleNameSchema.optional(),
+    /** Address an existing session by id, or open/resume/fork by a non-unique name.
+     * Exactly one key avoids silently accepting a stale id/name pair. */
+    session: z
+      .object({
+        id: AgentSessionIdSchema.optional(),
+        name: z.string().trim().min(1).max(160).optional(),
+      })
+      .refine((value) => Number(value.id !== undefined) + Number(value.name !== undefined) === 1, {
+        message: 'provide exactly one of id or name',
+      })
+      .optional(),
+    /** Whether to advance the bound `(session, project)` cursor plus its owner
+     *  fallback, or just the owner fallback when no session binds. Default true;
+     *  `false` = peek. A bound session's starting position is still materialised. */
+    acknowledge: z.boolean().default(true),
+    responseFormat: ResponseFormatSchema.default(RESPONSE_FORMAT.concise),
+  })
+  .strict()
 
 /** The user-level always-load bundle: a derived index of the user's agent-memory
  *  (one entry per category) plus the curated always-load user-docs.
@@ -129,15 +130,9 @@ export const StartSessionOutputSchema = z.object({
   session: AgentSessionSchema.optional(),
   recentSessions: z.array(RecentAgentSessionSchema).optional(),
   profile: SessionProfileSchema,
-  /** The roles EFFECTIVE for this caller, from both sources the resolver reads: the
-   * Owned placements the human added, and the System roles the host ships, which are
-   * effective without an Add until their owner disables them. Each entry names its own
-   * source, so "effective" is never read as "the human chose it". A Catalog template is
-   * never effective and never sent to an agent. */
-  roles: z.array(EffectiveRoleSummarySchema),
-  /** The compact first page omitted roles or an owned-library bound was reached;
-   * continue discovery with list_roles. */
-  rolesTruncated: z.boolean().optional(),
+  abilities: z.array(RuntimeAbilitySummarySchema),
+  abilitiesTruncated: z.literal(true).optional(),
+  nextAction: NextAbilityActionSchema.optional(),
   /** Full activation payload when start_session selected a role explicitly. */
   activeRole: UseRoleOutputSchema.optional(),
   projects: z.array(ProjectSummarySchema),

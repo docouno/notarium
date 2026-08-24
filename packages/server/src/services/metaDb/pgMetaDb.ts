@@ -6,6 +6,7 @@ import pg from 'pg'
 import { CAUSAL_BARRIER_KIND } from '@notarium/core'
 
 import { createAbilityAvailabilityFacet } from './drivers/pg/abilityAvailability'
+import { createAbilityCreateFacet } from './drivers/pg/abilityCreate'
 import { createAbilityPlacementFacet } from './drivers/pg/abilityPlacement'
 import { createAbilityPreferencesFacet } from './drivers/pg/abilityPreferences'
 import { createAgentDeltaCursorsFacet } from './drivers/pg/agentDeltaCursors'
@@ -268,14 +269,20 @@ export class PgMetaDb implements MetaDb {
         )
       }
       const blocker = await client.query(
-        `SELECT id FROM restore_operations
+        `SELECT id, kind FROM (
+           SELECT id, 'restore' AS kind, space, phase FROM restore_operations
+           UNION ALL
+           SELECT id, 'ability-create' AS kind, space, phase FROM ability_create_operations
+         ) AS operations
           WHERE space = $1 AND phase NOT IN ('succeeded', 'rejected')
           LIMIT 1`,
         [spaceId],
       )
 
       if (blocker.rows.length) {
-        throw new Error(`space purge blocked by restore operation: ${blocker.rows[0].id}`)
+        throw new Error(
+          `space purge blocked by ${blocker.rows[0].kind} operation: ${blocker.rows[0].id}`,
+        )
       }
       await client.query('DELETE FROM note_identity WHERE space = $1', [spaceId])
       // An import's destination claims die with the space they point into (#302).
@@ -349,6 +356,7 @@ export class PgMetaDb implements MetaDb {
       await client.query('DELETE FROM owner_proof_receipts WHERE space = $1', [spaceId])
       await client.query('DELETE FROM note_owner_proofs WHERE space = $1', [spaceId])
       await client.query('DELETE FROM restore_operations WHERE space = $1', [spaceId])
+      await client.query('DELETE FROM ability_create_operations WHERE space = $1', [spaceId])
       await client.query('DELETE FROM causal_outbox WHERE space = $1', [spaceId])
       // Legacy rows may carry a space/project id, current slug, or retired space
       // alias. Ids are authoritative; textual history is purged only when every
@@ -473,6 +481,8 @@ export class PgMetaDb implements MetaDb {
   readonly contextOrder = createContextOrderFacet(this.ctx)
 
   readonly abilityAvailability = createAbilityAvailabilityFacet(this.ctx)
+
+  readonly abilityCreate = createAbilityCreateFacet(this.ctx)
 
   readonly abilityPreferences = createAbilityPreferencesFacet(this.ctx)
 

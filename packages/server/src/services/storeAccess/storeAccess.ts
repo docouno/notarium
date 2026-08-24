@@ -8,6 +8,8 @@
 // (anti-enumeration). id-addressed routes declare resource:'note' and defer their
 // check here, since it can only be made once the store is resolved.
 
+import type { NoteClass } from '@notarium/core'
+
 import { type Action, can, type Principal } from '../authz'
 import type {
   ContextOrderPersistence,
@@ -82,15 +84,27 @@ export const readNoteAccess = async (
   principal: Principal,
   id: string,
   action: Action,
+  options?: { resourceAdmitted?: boolean },
 ): Promise<LiveNoteAccess | null> => {
   const hit = await access.noteStore(principal, id, action)
 
   if (!hit) {
     return null
   }
-  const note = await hit.store.read(id).catch(() => null)
+  let note: Awaited<ReturnType<typeof hit.store.read>>
 
-  if (!note || note.deleted) {
+  try {
+    note = await (options?.resourceAdmitted
+      ? hit.store.read(id, { resourceAdmitted: true })
+      : hit.store.read(id))
+  } catch (error) {
+    if ((error as { isNotFound?: boolean }).isNotFound) {
+      return null
+    }
+    throw error
+  }
+
+  if (note.deleted) {
     return null
   }
 
@@ -105,6 +119,9 @@ type ScopeResolveDeps = {
   contextSets?: ContextSetsPersistence
   scopePins?: ScopePinsPersistence
   contextOrder?: ContextOrderPersistence
+  /** Optional consumer policy after access resolution. Human REST omits it; the
+   * MCP assembly uses it to keep transport-specific classes out of its bundle. */
+  noteClassAllowed?: (noteClass: NoteClass | undefined) => boolean
 }
 
 /** Per-reader note reader for cross-space resolution: unreachable refs (unknown id /
@@ -115,7 +132,7 @@ const scopeNoteReader =
   (deps: ScopeResolveDeps, principal: Principal) => async (noteId: string) => {
     const hit = await readNoteAccess(deps.store, principal, noteId, 'note:read')
 
-    if (!hit) {
+    if (!hit || (deps.noteClassAllowed && !deps.noteClassAllowed(hit.note.class))) {
       return null
     }
 

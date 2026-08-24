@@ -34,7 +34,12 @@ import { type ApiRouteCtx, authz, notFound, s } from '../_shared'
 import { roleContextIdentityOf } from '../wire'
 
 export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
-  const { contextSets, projects, scopePins, contextOrder, spaces, auth, roles } = ctx
+  const { contextSets, projects, scopePins, contextOrder, spaces, auth, roles, abilities } = ctx
+
+  const rolePersonalSpaceFor = (req: FastifyRequest) =>
+    abilities
+      ? abilities.personalSpaceFor(req.principal)
+      : peekPersonalSpace({ auth, spaces }, req.principal)
 
   /** Resolve the exact enabled owned Role placement carried by the route. The
    * locator already contains its immutable location; display names and a separate
@@ -52,11 +57,7 @@ export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) 
       return null
     }
 
-    return roles.addressedRoleAt(
-      locator,
-      req.principal,
-      await peekPersonalSpace({ auth, spaces }, req.principal),
-    )
+    return roles.addressedRoleAt(locator, req.principal, await rolePersonalSpaceFor(req))
   }
 
   /** A personal role is owned by the caller. Shared placements retain their space's
@@ -84,7 +85,7 @@ export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) 
     const attachments = contextSets ? await contextSets.attachmentsForSet(set.id) : []
     // A property of the CALLER, not of an attachment: reading it per item asked the
     // same question once per row of the set.
-    const personalSpace = await peekPersonalSpace({ auth, spaces }, req.principal)
+    const personalSpace = await rolePersonalSpaceFor(req)
     // Per-reader redaction: drop attachments to scopes the reader can't `space:read`.
     // A personal space is single-member → others never learn it loads this set.
     const attachmentsWire = (
@@ -553,7 +554,7 @@ export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) 
       }
       const status = await roles.addressedRoleStatus(
         {
-          personalSpace: await peekPersonalSpace({ auth, spaces }, req.principal),
+          personalSpace: await rolePersonalSpaceFor(req),
           ...(project ? { project } : {}),
         },
         req.principal,

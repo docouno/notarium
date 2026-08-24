@@ -973,3 +973,35 @@ describe('IdentityRegistry — space (#16 groundwork)', () => {
   // (MetaDb.adoptLegacyRows) before any registry loads — covered by the
   // meta-DB driver tests; the registry itself never sees '' rows anymore.
 })
+
+describe('IdentityRegistry — cold causal prime', () => {
+  it('survives load and cannot be tombstoned or flushed before terminal confirmation', async () => {
+    const provisional: IdentityRecord = {
+      id: 'causal-note1',
+      legacyNameAliases: [],
+      filePath: '.notarium/skills/pkg/SKILL.md',
+      space: 'work',
+      createdAt: NOW,
+      materialized: false,
+      deletedAt: null,
+      addressRevision: 1,
+    }
+    const { persistence, upserted } = fakePersistence([provisional])
+    const reg = new IdentityRegistry({ persistence, space: 'work', now: () => new Date(NOW) })
+
+    await reg.primeCommitted(provisional)
+    await reg.load()
+    reg.reconcileLivePaths([])
+    reg.markMaterialized(provisional.id)
+    await reg.flush()
+
+    expect(reg.idFor(provisional.filePath)).toBe(provisional.id)
+    expect(reg.recordFor(provisional.id)).toMatchObject({ materialized: true, deletedAt: null })
+    expect(upserted).toEqual([])
+
+    await reg.confirmCommitted(provisional.id)
+    reg.reconcileLivePaths([])
+    expect(reg.idFor(provisional.filePath)).toBeUndefined()
+    expect(reg.recordFor(provisional.id)?.deletedAt).toBe(NOW)
+  })
+})

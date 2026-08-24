@@ -1,13 +1,19 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  AbilitySummarySchema,
+  CreateAbilityInputSchema,
+  CreateAbilityOutputSchema,
   CreateNoteInputSchema,
   CreateNotesInputSchema,
   CreateNotesOutputSchema,
   DeleteNoteInputSchema,
   DeleteNoteOutputSchema,
+  EditAbilityInputSchema,
+  EditAbilityOutputSchema,
   EditNoteInputSchema,
   FolderReorgOutputSchema,
+  GetAbilityOutputSchema,
   GetMyProjectsOutputSchema,
   GetNoteInputSchema,
   GetNoteOutputSchema,
@@ -15,9 +21,10 @@ import {
   LinkManyInputSchema,
   LinkManyOutputSchema,
   LinkOutputSchema,
+  ListAbilitiesInputSchema,
+  ListAbilitiesOutputSchema,
   ListNotesInputSchema,
   ListNotesOutputSchema,
-  ListRolesOutputSchema,
   MoveFolderInputSchema,
   MoveNoteInputSchema,
   MoveNoteOutputSchema,
@@ -38,6 +45,8 @@ import {
   toolNames,
   tools,
   UseRoleOutputSchema,
+  UseSkillInputSchema,
+  UseSkillOutputSchema,
   WhoamiOutputSchema,
   WriteResultSchema,
 } from '@notarium/contract/tools'
@@ -50,19 +59,23 @@ import {
 // transport (stage 3) and the e2e fake must satisfy exactly these.
 
 describe('tool registry', () => {
-  it('pins the v2 set of 23 tools, each with input + output schemas', () => {
+  it('replaces list_roles with list_abilities and adds standalone skill activation', () => {
     expect(toolNames.sort()).toEqual(
       [
         'create_note',
         'create_notes',
+        'create_ability',
+        'delete_ability',
         'delete_note',
+        'edit_ability',
         'edit_note',
+        'get_ability',
         'get_my_projects',
         'get_note',
         'link',
         'link_many',
         'list_notes',
-        'list_roles',
+        'list_abilities',
         'move_folder',
         'move_note',
         'recall',
@@ -75,6 +88,7 @@ describe('tool registry', () => {
         'search',
         'start_session',
         'use_role',
+        'use_skill',
         'whoami',
       ].sort(),
     )
@@ -100,8 +114,13 @@ describe('tool registry', () => {
     expect(toolActions.recall).toBe('space:read')
     expect(toolActions.whoami).toBe('self:read')
     expect(toolActions.get_my_projects).toBe('spaces:list')
-    expect(toolActions.list_roles).toBe('space:read')
+    expect(toolActions.list_abilities).toBe('space:read')
     expect(toolActions.use_role).toBe('space:read')
+    expect(toolActions.use_skill).toBe('space:read')
+    expect(toolActions.get_ability).toBe('space:write')
+    expect(toolActions.create_ability).toBe('space:write')
+    expect(toolActions.edit_ability).toBe('space:write')
+    expect(toolActions.delete_ability).toBe('space:write')
     expect(toolActions.remember_about_user).toBe('space:write')
     expect(toolActions.create_note).toBe('space:write')
     expect(toolActions.remember_about_project).toBe('space:write')
@@ -126,35 +145,65 @@ describe('tool registry', () => {
   })
 })
 
-describe('role tool boundaries', () => {
-  it('accepts only installed scopes in agent-visible role outputs', () => {
-    const catalogRole = {
+describe('ability discovery boundaries', () => {
+  it('admits only System and Owned summaries with real placement discriminants', () => {
+    const ownedRole = {
+      ref: 'owned-role-ref',
       source: 'owned',
+      kind: 'role',
       name: 'grooming',
       title: 'Grooming',
       description: 'Grooming.',
-      scope: 'catalog',
+      scope: 'personal',
+      enabled: true,
+      effective: true,
     }
 
-    expect(ListRolesOutputSchema.safeParse({ roles: [catalogRole], total: 1 }).success).toBe(false)
-    expect(UseRoleOutputSchema.safeParse({ status: 'activated', role: catalogRole }).success).toBe(
-      false,
+    expect(AbilitySummarySchema.safeParse(ownedRole).success).toBe(true)
+    expect(AbilitySummarySchema.safeParse({ ...ownedRole, source: 'catalog' }).success).toBe(false)
+    expect(AbilitySummarySchema.safeParse({ ...ownedRole, scope: 'catalog' }).success).toBe(false)
+
+    const systemRole = {
+      ref: 'system-role-ref',
+      source: 'system',
+      kind: 'role',
+      name: 'research',
+      title: 'R',
+      description: 'R.',
+    }
+
+    expect(ListAbilitiesOutputSchema.safeParse({ abilities: [systemRole], total: 1 }).success).toBe(
+      true,
     )
     expect(
-      ListRolesOutputSchema.safeParse({
-        roles: [{ ...catalogRole, scope: 'personal' }],
+      ListAbilitiesOutputSchema.safeParse({
+        abilities: [{ ...systemRole, scope: 'personal' }],
         total: 1,
       }).success,
-    ).toBe(true)
-    // The other arm of the same union: a System role ships with the host and has no
-    // placement, so stating one for it is as wrong as naming `catalog` a placement.
-    const systemRole = { source: 'system', name: 'research', title: 'R', description: 'R.' }
+    ).toBe(false)
+  })
 
-    expect(ListRolesOutputSchema.safeParse({ roles: [systemRole], total: 1 }).success).toBe(true)
+  it('makes role-only health and versions physically impossible on skills', () => {
+    const ownedSkill = {
+      ref: 'owned-skill-ref',
+      source: 'owned',
+      kind: 'skill',
+      name: 'summarize',
+      title: 'Summarize',
+      description: 'Summarize.',
+      scope: 'space',
+      enabled: true,
+      effective: false,
+    }
+
+    expect(AbilitySummarySchema.safeParse(ownedSkill).success).toBe(true)
+    expect(AbilitySummarySchema.safeParse({ ...ownedSkill, healthy: false }).success).toBe(false)
+    expect(AbilitySummarySchema.safeParse({ ...ownedSkill, versions: [] }).success).toBe(false)
     expect(
-      ListRolesOutputSchema.safeParse({
-        roles: [{ ...systemRole, scope: 'personal' }],
-        total: 1,
+      AbilitySummarySchema.safeParse({
+        ...ownedSkill,
+        source: 'system',
+        healthy: false,
       }).success,
     ).toBe(false)
   })
@@ -199,6 +248,170 @@ describe('role tool boundaries', () => {
       }).success,
     ).toBe(false)
   })
+
+  it('makes linked-skill budget states a strict discriminated union', () => {
+    const role = {
+      source: 'owned',
+      name: 'research',
+      title: 'Research',
+      description: 'Research.',
+      scope: 'personal',
+    }
+    const facts = {
+      name: 'research-evidence',
+      title: 'Research evidence',
+      description: 'Keep claims traceable.',
+    }
+
+    expect(
+      UseRoleOutputSchema.safeParse({
+        status: 'activated',
+        role,
+        skills: [{ ...facts, state: 'loaded', instructions: 'Cite sources.' }],
+      }).success,
+    ).toBe(true)
+    expect(
+      UseRoleOutputSchema.safeParse({
+        status: 'activated',
+        role,
+        skills: [{ ...facts, state: 'omitted-by-budget' }],
+      }).success,
+    ).toBe(true)
+    expect(
+      UseRoleOutputSchema.safeParse({
+        status: 'activated',
+        role,
+        skills: [{ ...facts, state: 'loaded' }],
+      }).success,
+    ).toBe(false)
+    expect(
+      UseRoleOutputSchema.safeParse({
+        status: 'activated',
+        role,
+        skills: [{ ...facts, state: 'omitted-by-budget', instructions: 'must not leak' }],
+      }).success,
+    ).toBe(false)
+  })
+
+  it('defines symmetric standalone skill selectors without weakening the strict input root', () => {
+    expect(UseSkillInputSchema.parse({ skill: 'research-evidence' })).toEqual({
+      skill: 'research-evidence',
+      budgetTokens: 4_000,
+    })
+    expect(UseSkillInputSchema.parse({ name: 'research-evidence' })).toEqual({
+      name: 'research-evidence',
+      budgetTokens: 4_000,
+    })
+    expect(UseSkillInputSchema.shape.skill.description).toContain('Canonical')
+    expect(UseSkillInputSchema.shape.name.description).toContain('Compatibility alias')
+    expect(
+      UseSkillInputSchema.safeParse({ skill: 'research-evidence', unexpected: true }).success,
+    ).toBe(false)
+
+    const system = {
+      status: 'activated',
+      skill: {
+        source: 'system',
+        kind: 'skill',
+        name: 'research-evidence',
+        title: 'Research evidence',
+        description: 'Keep claims traceable.',
+      },
+      instructions: 'Cite sources.',
+    }
+    const owned = {
+      ...system,
+      skill: { ...system.skill, source: 'owned', scope: 'space' },
+    }
+
+    expect(UseSkillOutputSchema.safeParse(system).success).toBe(true)
+    expect(UseSkillOutputSchema.safeParse(owned).success).toBe(true)
+    expect(UseSkillOutputSchema.safeParse({ ...system, status: 'already_active' }).success).toBe(
+      false,
+    )
+    expect(UseSkillOutputSchema.safeParse({ ...system, truncated: true }).success).toBe(false)
+    expect(UseSkillOutputSchema.safeParse({ ...system, context: {} }).success).toBe(false)
+  })
+})
+
+describe('ability authoring boundaries', () => {
+  const personalRole = {
+    kind: 'role',
+    name: 'review',
+    description: 'Review carefully.',
+    instructions: '# Review\n\nReview carefully.',
+    placement: { home: 'personal' },
+  }
+
+  it('keeps every tool schema object-rooted for MCP transport', () => {
+    for (const name of [
+      'get_ability',
+      'create_ability',
+      'edit_ability',
+      'delete_ability',
+    ] as const) {
+      expect(typeof tools[name].input.shape).toBe('object')
+      expect(typeof tools[name].output.shape).toBe('object')
+    }
+  })
+
+  it('keeps kind-dependent create rules imperative while rejecting unknown fields', () => {
+    expect(CreateAbilityInputSchema.safeParse(personalRole).success).toBe(true)
+    expect(
+      CreateAbilityInputSchema.safeParse({ ...personalRole, placement: { home: 'personal', x: 1 } })
+        .success,
+    ).toBe(false)
+  })
+
+  it('makes impossible authoring output arms fail contract validation', () => {
+    const owned = {
+      ref: 'owned-ref',
+      source: 'owned',
+      kind: 'skill',
+      name: 'review',
+      title: 'Review',
+      description: 'Review carefully.',
+      instructions: '# Review\n\nReview carefully.',
+      enabled: true,
+      scope: 'space',
+      versionToken: 'v1',
+    }
+
+    expect(GetAbilityOutputSchema.safeParse({ ability: owned }).success).toBe(true)
+    expect(
+      GetAbilityOutputSchema.safeParse({
+        ability: { ...owned, health: { healthy: true, attachments: [] } },
+      }).success,
+    ).toBe(false)
+    expect(
+      CreateAbilityOutputSchema.safeParse({
+        ref: 'ref',
+        versionToken: 'v1',
+        name: 'review',
+        outcome: 'created',
+        warnings: ['unknown-warning'],
+      }).success,
+    ).toBe(false)
+    expect(
+      EditAbilityOutputSchema.safeParse({
+        ref: 'ref',
+        steps: [{ step: 'document', outcome: 'failed' }],
+      }).success,
+    ).toBe(false)
+    expect(
+      EditAbilityOutputSchema.safeParse({
+        ref: 'ref',
+        steps: [{ step: 'document', outcome: 'applied', error: 'impossible' }],
+      }).success,
+    ).toBe(false)
+  })
+
+  it('leaves patch-presence and token coupling to the handler without losing object root', () => {
+    expect(EditAbilityInputSchema.safeParse({ ref: 'ref' }).success).toBe(true)
+    expect(
+      EditAbilityInputSchema.safeParse({ ref: 'ref', instructions: '# Next\n\nBody.' }).success,
+    ).toBe(true)
+  })
 })
 
 describe('input defaults (session-bootstrap §4, toolset-v1-spec §3)', () => {
@@ -216,6 +429,12 @@ describe('input defaults (session-bootstrap §4, toolset-v1-spec §3)', () => {
     expect(ListNotesInputSchema.parse({}).limit).toBe(50)
     expect(RecentActivityInputSchema.parse({}).limit).toBe(20)
   })
+  it('list_abilities defaults to runtime and binds compact continuation tokens', () => {
+    expect(ListAbilitiesInputSchema.parse({})).toMatchObject({ view: 'runtime', limit: 20 })
+    expect(ListAbilitiesInputSchema.safeParse({ q: '' }).success).toBe(false)
+    expect(ListAbilitiesInputSchema.safeParse({ cursor: 'short' }).success).toBe(false)
+    expect(ListAbilitiesInputSchema.safeParse({ cursor: 'abcdefghijklmnop' }).success).toBe(true)
+  })
   it('discover/recall inputs enforce their numeric bounds (#102 phase 2)', () => {
     expect(ListNotesInputSchema.safeParse({ limit: 0 }).success).toBe(false)
     expect(ListNotesInputSchema.safeParse({ limit: 101 }).success).toBe(false)
@@ -227,6 +446,11 @@ describe('input defaults (session-bootstrap §4, toolset-v1-spec §3)', () => {
       acknowledge: true,
       responseFormat: 'concise',
     })
+  })
+  it('keeps the role selector canonical and reserves name for session addressing', () => {
+    expect(StartSessionInputSchema.safeParse({ role: 'research' }).success).toBe(true)
+    expect(StartSessionInputSchema.safeParse({ name: 'research' }).success).toBe(false)
+    expect(StartSessionInputSchema.safeParse({ session: { name: 'Research' } }).success).toBe(true)
   })
   it('remember_about_user defaults category to "general"', () => {
     expect(RememberAboutUserInputSchema.parse({ observation: 'likes dark mode' }).category).toBe(

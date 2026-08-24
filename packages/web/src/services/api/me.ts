@@ -1,5 +1,7 @@
 import type {
   AbilityLocator,
+  AbilitySaveRequest,
+  AbilitySaveResponse,
   AddAgentRoleRequest,
   AddAgentRoleResponse,
   AddAgentSkillRequest,
@@ -24,10 +26,6 @@ import type {
   PatsResponse,
   Profile,
   ProfilePutRequest,
-  SetAbilityHomeRequest,
-  SetAbilityHomeResponse,
-  SetAgentAbilityAvailabilityRequest,
-  SetAgentAbilityAvailabilityResponse,
   SetAgentAbilityEnabledResponse,
 } from '@notarium/contract'
 import { encodeAbilityLocator } from '@notarium/core'
@@ -63,14 +61,6 @@ export const meApi = {
       `/api/me/agent-abilities/${encodeURIComponent(encodeAbilityLocator(locator))}/enabled`,
       { method: 'PUT', body: JSON.stringify({ enabled }) },
     ),
-  agentAbilitySetAvailability: (
-    locator: Extract<AbilityLocator, { source: 'owned' }>,
-    availability: SetAgentAbilityAvailabilityRequest,
-  ) =>
-    req<SetAgentAbilityAvailabilityResponse>(
-      `/api/me/agent-abilities/${encodeURIComponent(encodeAbilityLocator(locator))}/availability`,
-      { method: 'PUT', body: JSON.stringify(availability) },
-    ),
   agentAbilityCreateVersion: (
     locator: Extract<AbilityLocator, { source: 'owned'; kind: 'role' }>,
     projectId: string,
@@ -79,13 +69,13 @@ export const meApi = {
       `/api/me/agent-abilities/${encodeURIComponent(encodeAbilityLocator(locator))}/versions`,
       { method: 'POST', body: JSON.stringify({ projectId }) },
     ),
-  agentAbilitySetHome: (
-    locator: Extract<AbilityLocator, { source: 'owned'; kind: 'role' }>,
-    target: SetAbilityHomeRequest,
+  agentAbilitySave: (
+    locator: Extract<AbilityLocator, { source: 'owned' }>,
+    input: AbilitySaveRequest,
   ) =>
-    req<SetAbilityHomeResponse>(
-      `/api/me/agent-abilities/${encodeURIComponent(encodeAbilityLocator(locator))}/home`,
-      { method: 'PUT', body: JSON.stringify(target) },
+    req<AbilitySaveResponse>(
+      `/api/me/agent-abilities/${encodeURIComponent(encodeAbilityLocator(locator))}/save`,
+      { method: 'PUT', body: JSON.stringify(input) },
     ),
   agentRoleAddExact: (input: AddAgentRoleRequest) =>
     req<AddAgentRoleResponse>('/api/me/agent-roles', {

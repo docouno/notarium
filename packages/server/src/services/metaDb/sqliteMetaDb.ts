@@ -6,6 +6,7 @@ import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
 import { createAbilityAvailabilityFacet } from './drivers/sqlite/abilityAvailability'
+import { createAbilityCreateFacet } from './drivers/sqlite/abilityCreate'
 import { createAbilityPlacementFacet } from './drivers/sqlite/abilityPlacement'
 import { createAbilityPreferencesFacet } from './drivers/sqlite/abilityPreferences'
 import { createAgentDeltaCursorsFacet } from './drivers/sqlite/agentDeltaCursors'
@@ -255,14 +256,18 @@ export class SqliteMetaDb implements MetaDb {
       }
       const blocker = db
         .prepare(
-          `SELECT id FROM restore_operations
+          `SELECT id, kind FROM (
+             SELECT id, 'restore' AS kind, space, phase FROM restore_operations
+             UNION ALL
+             SELECT id, 'ability-create' AS kind, space, phase FROM ability_create_operations
+           ) AS operations
             WHERE space = ? AND phase NOT IN ('succeeded', 'rejected')
             LIMIT 1`,
         )
-        .get(spaceId) as { id: string } | undefined
+        .get(spaceId) as { id: string; kind: string } | undefined
 
       if (blocker) {
-        throw new Error(`space purge blocked by restore operation: ${blocker.id}`)
+        throw new Error(`space purge blocked by ${blocker.kind} operation: ${blocker.id}`)
       }
       db.prepare(
         "INSERT OR IGNORE INTO revision_purge_fences (kind, entity_id, space) VALUES ('space', ?, ?)",
@@ -295,6 +300,7 @@ export class SqliteMetaDb implements MetaDb {
       // terminal-cleanup pass fetching a job row this method also deletes.
       db.prepare('DELETE FROM import_reservations WHERE space = ?').run(spaceId)
       db.prepare('DELETE FROM restore_operations WHERE space = ?').run(spaceId)
+      db.prepare('DELETE FROM ability_create_operations WHERE space = ?').run(spaceId)
       db.prepare('DELETE FROM causal_outbox WHERE space = ?').run(spaceId)
       // Legacy rows may carry a space/project id, current slug, or retired space
       // alias. Ids are authoritative; resolve textual history only when all live
@@ -422,6 +428,8 @@ export class SqliteMetaDb implements MetaDb {
   readonly contextOrder = createContextOrderFacet(this.ctx)
 
   readonly abilityAvailability = createAbilityAvailabilityFacet(this.ctx)
+
+  readonly abilityCreate = createAbilityCreateFacet(this.ctx)
 
   readonly abilityPreferences = createAbilityPreferencesFacet(this.ctx)
 

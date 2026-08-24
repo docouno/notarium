@@ -39,7 +39,16 @@ and cannot be shadowed by compatibility data.
 | `user-doc` | tree/feed/search, freely organized by the user | user (UI) + `create_note` | default `type` + the project folder by handle; escape `path?`/`type?`/`tags?` |
 | `agent-memory` | personal domain + a project subdirectory (#13), as a separate section | `remember_about_user` + `remember_about_project` (memory about the user/project) | `category` → category-file; frontmatter `summary` → derived-index |
 | `profile` (#159) | HIDDEN from ALL discovery surfaces (tree/graph/feed/search); access only via Settings → Profile + the agent's `start_session` (by id) | `PUT /api/me/profile` (the user writes about themselves) | a singleton in the `.notarium/profile` mount; `type:person`, the `always-load` tag; human content, NOT agent memory (provenance — the user) |
-| `skill` (#307/#309) | hidden from generic tree/graph/feed/search/recall; visible through Agents → Abilities and role resolution | the human Add/New Role/Skill flows through exact Ability routes | valid ID-backed Agent Skills packages in `.notarium/skills`; roles may live in Personal/Space/Project libraries, while skills have only Personal/Space homes and Space availability lives in the meta-DB; Markdown members participate in current note versioning/replication, while auxiliary bytes are retained verbatim and included in `scope=all` export/data backup but remain outside the note journal |
+| `skill` (#307/#309) | hidden from generic tree/graph/feed/search/recall; visible through Agents → Abilities and role resolution | human Add/New Role/Skill and exact Ability routes; MCP `create_ability`/`edit_ability`, while RC `delete_ability` accepts only a single regular direct `SKILL.md` package | valid ID-backed Agent Skills packages in `.notarium/skills`; roles may live in Personal/Space/Project libraries, while skills have only Personal/Space homes and Space availability lives in the meta-DB; Markdown members participate in current note versioning/replication, while auxiliary bytes are retained verbatim and included in `scope=all` export/data backup but remain outside the note journal; human multi-file delete is unchanged, and atomic agent batch tombstones are POST-RC |
+
+Generic MCP note/link/context doors never address `skill`; human REST metadata/preview and the
+compatibility note write keep their existing access. The transport policy protects package
+integrity and typed authoring, not a stronger credential boundary.
+
+RC agent deletion is intentionally stricter than the package model: `delete_ability` refuses any
+auxiliary member and requires the sole root tombstone before detached bytes are destroyed. This is
+a temporary recovery constraint, not a claim that Agent Skills packages are single-file; the human
+door still handles full packages, and agent multi-file deletion waits for atomic batch tombstones.
 
 **The write-intent trio (#13)** — the agent does **not choose** the class/folder/space (poka-yoke), the tool imposes it:
 - `create_note` → class `user-doc` (knowledge into the project tree by handle `(space, slug)` + `path`);
@@ -72,8 +81,11 @@ of its own. Home,
 availability, and project remain server-side facets. An Owned package opens through
 `/agents/abilities/<roles|skills>/owned/:locator`; System and Catalog use their source-specific
 package-id routes. New authoring lives at `/agents/abilities/<roles|skills>/new/<draft-id>` and
-publishes before replacing that URL with the returned exact Owned route. Subsequent Owned edits
-use the common note-id + version-token write path; the ability surface omits generic note metadata
+publishes before replacing that URL with the returned exact Owned route. Subsequent Owned edits use
+`PUT /api/me/agent-abilities/:locator/save`: one application producer applies the manifest document
+under note CAS, then the placement-owned `home`/availability state, and returns the current locator,
+version token and per-step outcome. The generic `POST /api/note` ability arm calls the same authored
+document producer; it is not a parallel serializer. The ability surface omits generic note metadata
 and changes only manifest identity, instructions, and (for Roles) the authored attachment list.
 A generic note/history/trash reference remains `/n/<note-id>`—there is no
 parallel `/skill` resolver. Create and Add return only
@@ -82,6 +94,14 @@ land on a transient 404. Hidden package notes never enter the generic explorer t
 mount-path breadcrumbs. The list description remains discovery metadata; it is not a substitute
 for the package body. In Trash, a package root keeps its manifest name even when its authored body
 has no heading; single and bulk restore use that same package-aware Trash projection.
+
+That human URL/REST read-model reuse does not make an ability package a generic MCP note. Direct
+MCP note lifecycle and graph-link tools reject an accessible package root and point to the Ability
+tools; access is checked before the class refusal. The ordinary REST note write remains open and
+uses the same authored-document producer as the exact Ability save route. A physical skill root
+whose typed projection is malformed remains repairable there with a body/description CAS write;
+changing its typed attachment list still refuses until the projection is valid. This split protects the
+typed agent door and whole-package lifecycle; it is not a stronger credential boundary.
 
 Roles retain Personal/Space/Project placement and effective name precedence
 `Owned Project > Owned Space > Owned Personal > System`; package members and persisted Owned/System
@@ -108,7 +128,9 @@ asks for. A project role with NO base of that name is not a version of anything:
 operations replace copying: fork a base into a project version (same name, the base's body and
 attachments as a starting point, its own package address), and RELOCATE a project role up to the
 Space home of the space it already lives in. Only the first is an action, because it creates
-something. The second is not a command at all: where a role's package sits follows from how far it
+something. The fork copies one identity-bound snapshot captured under the source package's
+registry/manifest authority; destination admission never reopens the source address, so a package
+that later occupies it cannot become the version. The second is not a command at all: where a role's package sits follows from how far it
 reaches, and covering anything other than exactly its own project is something only a Space home can
 do — so a project role given a wider reach relocates on the way through the document's ordinary save.
 Up is the ONE direction the model has. The request carries a single destination (`{ scope: 'space' }`,
@@ -147,7 +169,9 @@ same-name fallbacks and cannot activate.
 
 System and Owned enabled state is an owner-scoped sparse override in the meta-DB: absence means
 enabled and a row means disabled. Disabling a more-specific Owned role reveals the next enabled
-fallback; Catalog has no preference row. Owned overrides survive a reversible soft delete, then
+fallback; Catalog has no preference row. The human toggle needs a readable exact package, not a
+writer grant, because it changes only that owner's preference. Agent `edit_ability` remains an
+authoring door and requires both a write-ceiling credential and a writer grant. Owned overrides survive a reversible soft delete, then
 are removed with permanent note or Space purge. The one role selected in a durable agent episode is
 separately called active. No selection means base mode, not a synthetic base role.
 An active named episode fork inherits its parent's selected role; a brand-new episode starts in
@@ -165,6 +189,9 @@ At session load it is the most-specific layer under the existing
 Personal/Project budget (`Role → Project → Personal`), not a separate allowance. It adds no grants
 and no role-scoped memory, delta, or index. Without a meta-DB the file-first role package and its
 instructions still work; only the preset and durable session selection degrade away (P5).
+Generic context metadata may contain a direct ability-package note id (the REST editor keeps its
+exact authored view), but the MCP projection omits only that `class: skill` item. The containing set
+and every ordinary note item remain; no extra diagnostic field is added to the agent wire.
 
 ### agent-memory: structure and behavior <a id="agent-memory"></a>
 - **File-per-category, not file-per-observation** (against micro-files): `remember_about_user(observation, category)` appends into the category file; new categories = new files.

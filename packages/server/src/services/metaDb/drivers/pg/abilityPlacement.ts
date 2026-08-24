@@ -10,6 +10,30 @@ import {
 const ROLE_TARGET = 'role'
 
 export const createAbilityPlacementFacet = (ctx: PgDriverCtx): AbilityPlacementPersistence => ({
+  resolveMovedOwnedRoleLocator: async (fromLocator) => {
+    await ctx.ensureInit()
+    const result = await ctx.required.query(
+      `SELECT to_locator, registry_note_id, manifest_note_id
+         FROM ability_placement_trail
+        WHERE from_locator = $1`,
+      [fromLocator],
+    )
+    const row = result.rows[0] as
+      | {
+          to_locator: string
+          registry_note_id: string | null
+          manifest_note_id: string | null
+        }
+      | undefined
+
+    return row
+      ? {
+          toLocator: row.to_locator,
+          registryNoteId: row.registry_note_id,
+          manifestNoteId: row.manifest_note_id,
+        }
+      : null
+  },
   moveOwnedRolePlacement: async (move: OwnedRolePlacementMove) => {
     await ctx.ensureInit()
     const client = await ctx.required.connect()
@@ -111,14 +135,20 @@ export const createAbilityPlacementFacet = (ctx: PgDriverCtx): AbilityPlacementP
           move.toLocator,
         ])
         await client.query(
-          'UPDATE ability_placement_trail SET to_locator = $1 WHERE to_locator = $2',
-          [move.toLocator, move.fromLocator],
+          `UPDATE ability_placement_trail
+              SET to_locator = $1, registry_note_id = $2, manifest_note_id = $3
+            WHERE to_locator = $4`,
+          [move.toLocator, move.registryNoteId, move.manifestNoteId, move.fromLocator],
         )
         await client.query(
-          `INSERT INTO ability_placement_trail (from_locator, to_locator, space_id)
-           VALUES ($1, $2, $3)
-           ON CONFLICT (from_locator) DO UPDATE SET to_locator = excluded.to_locator`,
-          [move.fromLocator, move.toLocator, space],
+          `INSERT INTO ability_placement_trail
+             (from_locator, to_locator, space_id, registry_note_id, manifest_note_id)
+           VALUES ($1, $2, $3, $4, $5)
+           ON CONFLICT (from_locator) DO UPDATE SET
+             to_locator = excluded.to_locator,
+             registry_note_id = excluded.registry_note_id,
+             manifest_note_id = excluded.manifest_note_id`,
+          [move.fromLocator, move.toLocator, space, move.registryNoteId, move.manifestNoteId],
         )
       }
 

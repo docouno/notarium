@@ -58,6 +58,7 @@ describe('context sets — how a role attachment is named back to the reader', (
       engineDataDir: join(root, 'engine'),
       jobsDataDir: join(root, 'jobs'),
       importStagingDir: join(root, 'jobs', 'imports'),
+      spacesRoot: join(root, 'spaces'),
       pollIntervalMs: 10,
     })
     await app.ready()

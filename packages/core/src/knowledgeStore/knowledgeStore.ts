@@ -3,12 +3,14 @@
 // canon: docs/architecture.md#p8
 
 import type {
+  DocumentRole,
   DocumentState,
   DocumentStateFormat,
   ExactOwnerObservation,
   FrontmatterEntry,
   LogicalNoteState,
   RestoreSafety,
+  StorageOwnerProof,
 } from '../libs/markdown'
 import {
   type BucketGran,
@@ -626,6 +628,9 @@ export type ReadOptions = {
    *  lease, so a physical read must use admitted observations instead of trying
    *  to acquire that lease recursively. */
   resourceAdmitted?: boolean
+  /** Trusted host hint: the caller is inside this store's MutationCoordinator
+   * claim and needs an exact verification read without reacquiring that claim. */
+  mutationClaimed?: boolean
 }
 
 /** A note's Feed-card enrichment: snippet, first image, tags, word count, and a model-agnostic
@@ -811,6 +816,29 @@ export type PhysicalIncarnation = {
   owner: ExactOwnerObservation
 }
 
+export type PublishedResourceEvidence = {
+  path: string
+  source: Uint8Array
+  ownerProof: StorageOwnerProof
+  identity?: IdentityRecord
+  document?: {
+    role: DocumentRole
+    pathFallbackTitle: string | null
+    skillDirectoryName?: string | null
+  }
+  receipt: {
+    id: string
+    semanticEventTime: string
+    candidateHash: string
+    transitions: Array<{
+      path: string
+      before: { kind: 'present' | 'absent'; value: string }
+      after: { kind: 'present' | 'absent'; value: string }
+      mtimeMs: number | null
+    }>
+  }
+}
+
 export type MoveResult = {
   id?: string
   filePath?: string
@@ -871,6 +899,9 @@ export type NoteChange = {
   meta: NoteMeta
   content?: string
   tags?: string[]
+  /** Receipt-backed owner proof changes full document identity without changing
+   * the user projection. Consumers must exact-read this state. */
+  requiresExactState?: boolean
 }
 
 /** What `changes(cursor)` reports (the cursor is opaque — pass it back for "since"). `inventory`
@@ -1063,14 +1094,48 @@ export type TreeChildrenQuery = {
 export type MutationOptions = {
   prepare?: () => void | Promise<void>
   finalize?: () => void | Promise<void>
+  /** Host policy over the exact live note observed inside this mutation's claim.
+   * The callback must stay pure: it already runs inside the store's claim and must
+   * not re-enter mutation methods. */
+  assertCurrent?: (note: NoteContent) => void | Promise<void>
+  /** Host-owned bracket entered after the write claim is held and settled in its
+   * own `finally`. Used when a caller must acquire a second authority in canonical
+   * claim → authority order without releasing it before the physical write. */
+  aroundWrite?: (write: () => Promise<WriteResult>) => Promise<WriteResult>
   /** Host-internal checkpoint under physical subtree admission and before its
    * atomic detach. */
-  beforeDetach?: () => void | Promise<void>
+  beforeDetach?: (victimNoteIds?: readonly string[]) => void | Promise<void>
   /** Host-internal checkpoint after an atomic subtree detach and before staging
    * bytes are destroyed. */
   afterDetach?: () => void | Promise<void>
+  /** Make the write's journal append part of the operation instead of the normal
+   * fire-and-forget history path. Reserved for compound host publications. */
+  requiredRevision?: boolean
+  /** Required-write hook after identity + journal settle and before the read-model
+   * publishes the new note. */
+  beforePublish?: (result: { id: string; versionToken: string }) => void | Promise<void>
+  /** The trusted caller already owns the enclosing resource/package admission. */
+  resourceAdmitted?: boolean
   /** Admit a canonical hidden-mount address supplied by trusted host code. */
   internalAddress?: boolean
+}
+
+export type RemoveOptions = {
+  principal?: string
+  agent?: AgentWriteAttribution
+  identityOnly?: boolean
+  /** Make the delete tombstone a required part of the physical removal. Package
+   *  deletion uses this only after it has proved a single victim; multi-note
+   *  callers need an atomic batch primitive instead of repeated required appends. */
+  requiredRevision?: boolean
+  /** Host-internal conditional compensation: remove only this exact state. */
+  versionToken?: string
+  /** Stronger host-internal ownership proof for compensating a publication. */
+  physicalWriteClaim?: PhysicalWriteClaim
+  /** Exact source incarnation required for a single-note removal. */
+  expectedSource?: PhysicalIncarnation
+  /** Same mutation-bound host policy as MutationOptions.assertCurrent. */
+  assertCurrent?: MutationOptions['assertCurrent']
 }
 
 /** Host-only exact tag delta. Unlike a whole-document save, it reads live metadata
@@ -1086,6 +1151,20 @@ export type TagMutationInput = {
 export type TagMutationResult = { changed: boolean; tags: string[] }
 
 export type KnowledgeStore = {
+  /** Hold this replica's file-truth reconciliation on its last committed
+   * projection while a host-owned durable publication crosses physical and
+   * terminal metadata cuts. The returned release is process-local admission,
+   * not durability: the host operation/receipt/outbox own crash recovery. */
+  beginCausalPublication?(): Promise<() => void>
+  /** Adopt a restart-durable publication into a derived engine with the exact
+   * physical receipt and owner proof, rather than rediscovering it as external. */
+  adoptPublishedResource?(evidence: PublishedResourceEvidence): Promise<DocumentState>
+  /** Host-only bridge for a durable cross-system publication. Metadata commits in
+   * the host DB while the physical candidate is still fenced; priming keeps this
+   * process's identity cache from inventing a second claimant when bytes appear. */
+  primeCommittedIdentity?(record: IdentityRecord): Promise<void>
+  confirmCommittedIdentity?(id: string): Promise<void>
+  releasePrimedIdentity?(id: string): Promise<void>
   /** Every note's metadata; `opts.scope` applies class-visibility (ReadScope). */
   list(opts?: ListOptions): Promise<NoteMeta[]>
   /** The directory channel: every visible folder path, INCLUDING empty ones the note index can't
@@ -1143,20 +1222,7 @@ export type KnowledgeStore = {
   write(input: WriteInput, opts?: MutationOptions): Promise<WriteResult>
   move(input: MoveInput, opts?: MutationOptions): Promise<MoveResult>
   /** `principal` is journal attribution — engines without a journal ignore it. */
-  remove(
-    id: string,
-    opts?: {
-      principal?: string
-      agent?: AgentWriteAttribution
-      identityOnly?: boolean
-      /** Host-internal conditional compensation: remove only this exact state. */
-      versionToken?: string
-      /** Stronger host-internal ownership proof for compensating a publication. */
-      physicalWriteClaim?: PhysicalWriteClaim
-      /** Exact source incarnation required for a single-note removal. */
-      expectedSource?: PhysicalIncarnation
-    },
-  ): Promise<void>
+  remove(id: string, opts?: RemoveOptions): Promise<void>
   /** Changes since `cursor` (null = establish one without history); an engine with no external
    *  change source returns empty upserts and its full inventory. */
   changes(cursor: string | null): Promise<StoreDelta>

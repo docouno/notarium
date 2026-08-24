@@ -27,7 +27,7 @@ export type ToolMeta = {
 export const TOOL_META = {
   start_session: {
     description:
-      "Call this FIRST in a new session. When the host supports agent episodes, it opens or resumes one and may return `session.id`; KEEP a returned id and pass it as the top-level `session` argument on every later tool call. Address by id to resume exactly, or by a non-unique human name: a sleeping match resumes, an active match forks and inherits its selected role, and ambiguous matches return matching choices without binding a session. Loads the user's profile and the roles effective for you here: the ones the human added into a Personal/Space/Project library, plus the System roles Notarium ships, which are effective without an Add until their owner switches one off. A Catalog template is never enabled automatically, so a role being effective is not by itself evidence the human chose it — a `source:'system'` role is the host's default, not their decision. When one role clearly matches, call `use_role`; or pass canonical `role` here to receive and activate it in this same call (`name` is a compatibility alias). Resuming an episode reloads its saved effective role so a fresh model context receives the instructions again. With a `project` hint the response also carries its compact index, pinned notes, delta and vocabulary, and resolves Project > Space > Personal role overrides. `acknowledge:false` peeks without advancing. Large context bundles are truncated honestly (`truncated:true`) — fall back to list_notes/search; abbreviated or omitted role summaries use `rolesTruncated:true` and continue with `list_roles`.",
+      "Call this FIRST in a new session. When the host supports agent episodes, it opens or resumes one and may return `session.id`; KEEP a returned id and pass it as the top-level `session` argument on every later tool call. Address by id to resume exactly, or by a non-unique human name through `session:{name}`: a sleeping match resumes, an active match forks and inherits its selected role and project hint, and ambiguous matches return matching choices without binding a session. Loads the user's profile and the activation-ready roles and skills available here from Owned and System sources; Catalog templates never reach the agent inventory. When an ability clearly matches, call `use_role` for a role or `use_skill` for a standalone skill; canonical `role` may instead be passed here to activate it in the same call. Resuming an episode reloads its saved effective role so a fresh model context receives the instructions again; an inactive, missing, or context-mismatched binding returns actionable diagnostics instead of silently rebinding. Standalone skills are task-time and must be activated again when needed. With a `project` hint the response also carries its compact index, pinned notes, delta and vocabulary, resolves Project > Space > Personal overrides, and stores that project on the episode for later by-name ability calls. A resume without `project` preserves the hint. `acknowledge:false` peeks without advancing. Large context bundles are truncated honestly; `abilitiesTruncated:true` carries an exact machine-readable `nextAction` for `list_abilities`.",
     annotations: {
       title: 'Start session',
       readOnlyHint: false,
@@ -36,22 +36,76 @@ export const TOOL_META = {
       openWorldHint: false,
     },
   },
-  list_roles: {
+  list_abilities: {
     description:
-      "Page through every role effective in the current Personal/Space/Project context. Two sources reach this list and each entry names its own: `source:'owned'` is a role the human added, and it carries the `scope` it was placed at; `source:'system'` is a role Notarium ships, effective everywhere without an Add and carrying no placement — treat it as the host default, not as a choice the human made. An Owned role of the same name overrides the System one. Use it when start_session reports rolesTruncated or when you need to discover beyond its compact role summaries. Pass the same project handle as start_session/use_role so Project > Space > Personal precedence matches. Catalog templates are never listed, because being offered in the Catalog does not make a role effective.",
+      "Discover roles and standalone skills from the same resolver used by activation. `view:'runtime'` (default) returns one active winner per kind/name in the current Personal/Space/Project context; an unhealthy role remains visible with `healthy:false`. `view:'authoring'` returns every readable System and Owned candidate before enable/availability filtering, including disabled, out-of-reach and shadowed candidates with opaque `ref` addresses and `effective` marking the runtime winner. Filter by `kind`, `source` or `q`; explicit `project` sets resolution context rather than filtering placements, otherwise a bound session's sticky start_session project is used. Catalog is never listed. Follow a returned machine-readable `nextAction` exactly until it disappears; continuation cursors are compact, opaque and bound to the view, filters and project context.",
     annotations: {
-      title: 'List effective roles',
+      title: 'List abilities',
       readOnlyHint: true,
       idempotentHint: true,
       openWorldHint: false,
     },
   },
+  get_ability: {
+    description:
+      'Read one System or Owned ability by the opaque `ref` returned by list_abilities(view:"authoring"). Returns the complete instructions without a runtime token budget, plus placement, enabled state and per-attachment health; an Owned result also carries its current `versionToken` for edit_ability. Catalog is intentionally unreadable. Use this before editing; never construct refs.',
+    annotations: {
+      title: 'Read an ability',
+      readOnlyHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  create_ability: {
+    description:
+      'Create one custom role or standalone skill in a writable Personal, Space or (roles only) Project placement. The instructions are body-first: a leading H1 is the title; there is no separate title field. Role attachments use skill refs from list_abilities(view:"authoring"). Pass idempotencyKey for a retry-safe create and reuse the returned ref for later authoring.',
+    annotations: {
+      title: 'Create an ability',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+  },
+  edit_ability: {
+    description:
+      'Patch one Owned ability by opaque ref. Authored fields (description, instructions, attachments) require the versionToken from get_ability; enabled, availability and a project-role lift to its Space home do not. One call executes ordered resumable steps and reports each as applied, skipped or failed; after a partial failure repeat with the returned ref/token. Omitted fields are preserved.',
+    annotations: {
+      title: 'Edit an ability',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  delete_ability: {
+    description:
+      'Move one Owned ability package to Trash by opaque ref. For this RC the agent path accepts only a package containing exactly one regular SKILL.md; any auxiliary, hidden, nested, alternate-case, symbolic-link, or non-Markdown member is refused and must be removed in the Agents UI. The required tombstone must commit or the package is reattached. System and Catalog abilities cannot be deleted.',
+    annotations: {
+      title: 'Delete an ability',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+  },
   use_role: {
     description:
-      'Activate one role effective in the current Personal/Space/Project scope — either added there by the human or shipped with Notarium as a System role, an Owned placement winning over a System role of the same name — and load its instructions, linked skills, role context, and an authoritative replacement for the base context previously returned by start_session. Refs omitted from that replacement are evicted by the shared Role → Project → Personal budget. Use canonical `role`; `name` is a compatibility alias. Pass the same `project` handle used for start_session so project and space overrides resolve correctly. A repeated name is an idempotent already-active success but is resolved and loaded again because a narrower project or space fork may now win. A catalog-only or unknown role is not activated and returns the roles actually available; adding catalog templates is an explicit human action in Notarium.',
+      'Activate one role effective in the current Personal/Space/Project scope — either added there by the human or shipped with Notarium as a System role, an Owned placement winning over a System role of the same name — and load its instructions, linked skills, role context, and an authoritative replacement for the base context previously returned by start_session. Refs omitted from that replacement are evicted by the shared Role → Project → Personal budget. Use canonical `role`; `name` is a compatibility alias. Explicit `project` wins; otherwise a bound session uses the sticky project written by start_session. A repeated name is an idempotent already-active success but is resolved and loaded again because a narrower project or space fork may now win. Disabled, out-of-reach, unhealthy, wrong-kind and missing states return their typed reason with server-computed remediation; unreadable packages remain indistinguishable from absence.',
     annotations: {
       title: 'Use an effective role',
       readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  use_skill: {
+    description:
+      'Activate one standalone skill effective in the current Personal/Space context and return its complete instructions. Use canonical `skill`; `name` is a compatibility alias, and exactly one selector is required. Explicit `project` selects the Space context used by the same resolver as list_abilities; otherwise a bound session uses the sticky project written by start_session. The skill is task-time context: it never changes the selected role or any durable session state, so call it again after a resume when needed. Disabled, out-of-reach, wrong-kind and missing states return their typed reason with server-computed remediation. Activation fails closed when the full body exceeds `budgetTokens`; reduce or split the ability instead of relying on partial instructions.',
+    annotations: {
+      title: 'Use an effective skill',
+      readOnlyHint: true,
       destructiveHint: false,
       idempotentHint: true,
       openWorldHint: false,
@@ -273,12 +327,12 @@ export const TOOL_META = {
 } as const satisfies Record<string, ToolMeta>
 
 /** The MCP `serverInfo` (returned in `initialize`). */
-export const SERVER_INFO = { name: 'notarium', version: '0.9.0' } as const
+export const SERVER_INFO = { name: 'notarium', version: '0.11.0' } as const
 
 /** The server `instructions` text (returned in `initialize`) — the main lever on
  *  call ordering; keep it a STATIC literal (no note content) and under ~200 words. */
 export const SERVER_INSTRUCTIONS = [
-  'Call `start_session` first. When it returns `session.id`, retain that id and pass it as the top-level `session` argument on every subsequent tool call. Notarium is your knowledge workspace; the bootstrap also loads your profile, projects, the roles effective for you (the ones the human added plus the ones Notarium ships), and what changed since you last looked.',
+  'Call `start_session` first. When it returns `session.id`, retain that id and pass it as the top-level `session` argument on every subsequent tool call. Notarium is your knowledge workspace; the bootstrap also loads your profile, projects, activation-ready roles and skills, and what changed since you last looked. If it returns `nextAction`, follow that exact `list_abilities` call before ability activation or answering. Activate a matching role with `use_role` and a matching standalone skill with `use_skill`.',
   'Search before you write: `search` finds existing notes — and now your own agent-memory too — so you do not create duplicates. To browse structure use `list_notes` (an `ls` of a folder) and `recent_activity` (the latest changes).',
   'Three kinds of writing: `remember_about_user` and `remember_about_project` record durable facts into private memory (about the user / about a project); `create_note` adds shared, user-visible knowledge to a project. The agent never picks where memory goes — its location is fixed. Migrating or importing many notes? Use `create_notes` and `link_many` (batch, best-effort per item) instead of one call each.',
   'Change a note with `edit_note`, addressed by words — a heading or an exact snippet, never line numbers; memory is just a note, corrected the same way. Reorganize, all `verb_entity`: a note with `move_note` (to another folder) / `rename_note` (its title); a whole folder with `move_folder` / `rename_folder` (by its `path` from list_notes); a project with `rename_project` (its handle/name) — renames are link-safe (old names keep resolving). Remove a whole note with `delete_note`: it is reversible — the note goes to the trash and the user can restore it. Connect notes with `link` — `toTitle` forward-references a note not created yet.',

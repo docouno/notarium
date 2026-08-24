@@ -596,6 +596,127 @@ describePostgres('Postgres lock order', { timeout: SUITE_TIMEOUT_MS }, () => {
       await run('abilityAvailability.grantProject', () =>
         db.abilityAvailability.grantProject('alpha', 'skill-two', 'project-alpha', null),
       )
+      await run('abilityAvailability.reserve', () =>
+        db.abilityAvailability.reserve('alpha', 'skill-reserved', {
+          mode: 'selected-projects',
+          projectIds: ['project-alpha'],
+        }),
+      )
+      await run('abilityAvailability.finalize', () =>
+        db.abilityAvailability.finalize('alpha', 'skill-reserved', 'registry-reserved'),
+      )
+      await db.abilityAvailability.reserve('alpha', 'skill-cancelled', {
+        mode: 'selected-projects',
+        projectIds: ['project-alpha'],
+      })
+      await run('abilityAvailability.cancel', () =>
+        db.abilityAvailability.cancel('alpha', 'skill-cancelled'),
+      )
+      const abilityCreateAccepted = {
+        id: 'ability-create-operation',
+        actorDigest: 'ability-create-actor',
+        idempotencyDigest: 'ability-create-key',
+        requestFingerprint: 'ability-create-request',
+        space: 'alpha',
+        packageId: 'AbilityPkg01',
+        noteId: 'AbilityNote1',
+        targetPath: '.notarium/skills/AbilityPkg01/SKILL.md',
+        availabilityRequired: true,
+        stageBinding: 'ability-create-stage',
+        preparedEvidence: 'ability-create-evidence',
+        identity: identity({
+          id: 'AbilityNote1',
+          filePath: '.notarium/skills/AbilityPkg01/SKILL.md',
+          materialized: false,
+        }),
+        availability: {
+          mode: 'selected-projects' as const,
+          projectIds: ['project-alpha'],
+        },
+        createdAt: AT,
+      }
+      await run('abilityCreate.accept', () => db.abilityCreate.accept(abilityCreateAccepted))
+      await db.abilityCreate.markPhysical(
+        abilityCreateAccepted.id,
+        abilityCreateAccepted.preparedEvidence,
+        'ability-create-receipt',
+        AT,
+      )
+      await run('abilityCreate.commit', () =>
+        db.abilityCreate.commit({
+          operationId: abilityCreateAccepted.id,
+          preparedEvidence: abilityCreateAccepted.preparedEvidence,
+          physicalReceipt: 'ability-create-receipt',
+          identity: identity({
+            id: abilityCreateAccepted.noteId,
+            filePath: abilityCreateAccepted.targetPath,
+            materialized: true,
+          }),
+          revision: revision(abilityCreateAccepted.noteId, {
+            contentHash: 'ability-create-content',
+            semanticFingerprint: 'ability-create-semantic',
+            entryRole: 'origin',
+          }) as RevisionInput & { contentHash: string; semanticFingerprint: string },
+          content: new TextEncoder().encode('ability create content'),
+          ownerProof: {
+            sourceHash: 'ability-create-source',
+            proofJson: '{}',
+            receiptId: abilityCreateAccepted.id,
+          },
+          result: {
+            packageId: abilityCreateAccepted.packageId,
+            noteId: abilityCreateAccepted.noteId,
+            versionToken: 'ability-create-version',
+          },
+          committedAt: AT,
+        }),
+      )
+      await run('abilityCreate.finalize', () =>
+        db.abilityCreate.finalize(
+          abilityCreateAccepted.id,
+          abilityCreateAccepted.preparedEvidence,
+          'ability-create-receipt',
+          AT,
+        ),
+      )
+      const abilityCreateRejected = {
+        ...abilityCreateAccepted,
+        id: 'ability-create-rejected',
+        idempotencyDigest: 'ability-create-rejected-key',
+        packageId: 'AbilityPkg02',
+        noteId: 'AbilityNote2',
+        targetPath: '.notarium/skills/AbilityPkg02/SKILL.md',
+        identity: identity({
+          id: 'AbilityNote2',
+          filePath: '.notarium/skills/AbilityPkg02/SKILL.md',
+          materialized: false,
+        }),
+      }
+      await db.abilityCreate.accept(abilityCreateRejected)
+      await run('abilityCreate.reject', () =>
+        db.abilityCreate.reject(abilityCreateRejected.id, 'probe-rejection', AT),
+      )
+      await run('sessions.startInferred', () =>
+        db.sessions.startInferred(
+          {
+            id: 'session-inferred',
+            owner: 'user:inferred',
+            name: 'personal · now',
+            named: false,
+            parentId: null,
+            createdAt: AT,
+            lastSeenAt: AT,
+            calls: 1,
+            role: null,
+            roleLocator: null,
+            roleContextProjectId: null,
+            projectId: null,
+          },
+          AT,
+          AT,
+          10,
+        ),
+      )
       await run('sessions.startNamed', () =>
         db.sessions.startNamed(
           {
@@ -610,6 +731,7 @@ describePostgres('Postgres lock order', { timeout: SUITE_TIMEOUT_MS }, () => {
             role: null,
             roleLocator: null,
             roleContextProjectId: null,
+            projectId: null,
           },
           AT,
           AT,
@@ -801,6 +923,8 @@ describePostgres('Postgres lock order', { timeout: SUITE_TIMEOUT_MS }, () => {
           toTargetId: 'space:alpha:AbCdefGhij_1',
           fromLocator: 'owned:role:project:alpha:project-alpha:AbCdefGhij_1',
           toLocator: 'owned:role:space:alpha:AbCdefGhij_1',
+          registryNoteId: 'note-a',
+          manifestNoteId: 'note-a',
         }),
       )
 

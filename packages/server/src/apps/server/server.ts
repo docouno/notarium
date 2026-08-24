@@ -30,6 +30,7 @@ import { hostInfoFrom } from '../../libs/hostInfo'
 import { createFsImportStagingStore } from '../../libs/importStaging'
 import { createMutationGate } from '../../libs/mutationGate'
 import { notesDirReader } from '../../libs/notesDir'
+import { DurableAbilityCreator } from '../../services/abilities'
 import { type AuthMode, createAuthService } from '../../services/auth'
 import { CausalOutboxProjector, causalReplicaId } from '../../services/causalOutboxProjector'
 import { closeTerminalImportReservations } from '../../services/import'
@@ -52,6 +53,7 @@ import {
   healSpaceMarker,
   localFsAnchoredFiles,
   markFolderAsProject,
+  projectHandleOf,
   readRootMarker,
   scanProjectsAtBoot,
 } from '../../services/projects'
@@ -582,6 +584,12 @@ export const createServer = async ({
   }
   const roles = createRolesService({
     catalog: loadBundledAbilityInventory,
+    projectHandleForId: async (projectId) => {
+      const project = await metaDb?.projects.getById(projectId)
+      return project
+        ? projectHandleOf(project, manager.slugOf(project.space) ?? project.space)
+        : null
+    },
     // Spelled either way round, never inherited: a spread that silently contributes
     // nothing is how a host with a meta-DB ends up on volatile facets, and the
     // difference only shows after a restart.
@@ -662,6 +670,21 @@ export const createServer = async ({
       },
     }),
   })
+  const customAbilityCreator = metaDb
+    ? new DurableAbilityCreator({
+        persistence: metaDb.abilityCreate,
+        roles,
+        authorityForSpace,
+        beginProjection: (space, operationId) =>
+          manager.beginCausalPublication(space, { kind: 'ability-create', operationId }),
+        primeIdentity: (space, record) => manager.primeWarmCausalIdentity(space, record),
+        confirmIdentity: (space, noteId) => manager.confirmCausalIdentity(space, noteId),
+        releaseIdentity: (space, noteId) => manager.releasePrimedIdentity(space, noteId),
+        adoptPublication: (space, evidence) => manager.adoptCausalPublication(space, evidence),
+        reconcile: (space, noteId) => manager.reconcileCausalProjection(space, noteId),
+        wakeOutbox: causalOutboxProjector ? () => causalOutboxProjector.wake() : undefined,
+      })
+    : undefined
 
   // Late-bind the marker store's id → notes-dir resolution to the manager.
   notesDirOfId = (id) => {
@@ -731,6 +754,7 @@ export const createServer = async ({
     roles,
     scheduler,
     sessions: metaDb?.sessions,
+    customAbilityCreator,
     agentDeltaCursors: metaDb?.agentDeltaCursors,
     gatewayState: metaDb?.gateway,
     retrievalLog: metaDb?.retrievalLog,
@@ -778,6 +802,7 @@ export const createServer = async ({
     // init provisions config spaces AND recovers runtime spaces from the registry —
     // runtime spaces live only in the registry, so without this they'd vanish on restart.
     await manager.init()
+    await customAbilityCreator?.recover()
     // Accepted restores pin lifecycle work. Resolve their durable state before
     // the outbox/projected read models and public handlers are admitted.
     await restoreCoordinator?.recover()

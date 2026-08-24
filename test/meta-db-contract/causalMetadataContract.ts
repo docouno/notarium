@@ -387,6 +387,20 @@ export const describeCausalMetadataContract = (
         outboxKind: 'restore-terminal',
         committedAt: '2026-08-11T00:03:00.000Z',
       }
+      await facets.lifecycle.transition({
+        space: operationInput.space,
+        expectedPhases: [SPACE_LIFECYCLE_PHASE.active],
+        phase: SPACE_LIFECYCLE_PHASE.closing,
+        changedAt: '2026-08-11T00:02:30.000Z',
+      })
+      await expect(
+        facets.operations.accept({
+          ...operationInput,
+          id: 'fresh-while-closing',
+          actorDigest: 'fresh-actor',
+          idempotencyDigest: 'fresh-key',
+        }),
+      ).rejects.toThrow(/lifecycle|active/i)
 
       const first = await facets.terminal.commit(commit)
       expect(first).toMatchObject({

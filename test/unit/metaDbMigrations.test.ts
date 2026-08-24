@@ -78,6 +78,10 @@ describe('meta-DB migration assets and SQLite runner', () => {
       { version: 14, name: 'ability_availability' },
       { version: 15, name: 'ability_preferences' },
       { version: 16, name: 'ability_placement_trail' },
+      { version: 17, name: 'ability_create_operations' },
+      { version: 18, name: 'causal_operation_lifecycle' },
+      { version: 19, name: 'ability_placement_identity' },
+      { version: 20, name: 'ability_create_success_replay' },
     ])
     for (const migration of migrations) {
       expect(migration.checksum).toBe(checksumMigrationPair(migration.sqlite, migration.postgres))
@@ -120,11 +124,101 @@ describe('meta-DB migration assets and SQLite runner', () => {
     // placement trail adds the third table of that group and its own two: the hop is
     // read forwards (by `from_locator`, which is the primary key), re-pointed backwards
     // (by `to_locator`, the sweep that keeps it one hop deep) and purged by Space.
-    expect(counts).toEqual({ index: 62, table: 43, trigger: 30 })
+    // Two 0019 guards allow legacy identity-less rows to remain while refusing any
+    // new or rewritten hop that does not bind a registry note identity.
+    expect(counts).toEqual({ index: 64, table: 44, trigger: 33 })
     expect(
       db.prepare("SELECT 1 FROM sqlite_schema WHERE name = 'meta_schema'").get(),
     ).toBeUndefined()
     expect((db.prepare('PRAGMA auto_vacuum').get() as { auto_vacuum: number }).auto_vacuum).toBe(2)
+  })
+
+  it('keeps a legacy identity-less trail row but requires identity on new and rewritten rows', () => {
+    const db = database()
+
+    runSqliteMigrations(db, migrations.slice(0, 19))
+    db.prepare(
+      `INSERT INTO ability_placement_trail (from_locator, to_locator, space_id)
+       VALUES ('legacy-from', 'legacy-to', 'space-main')`,
+    ).run()
+
+    runSqliteMigrations(db)
+
+    expect(
+      db
+        .prepare(
+          `SELECT to_locator, registry_note_id, manifest_note_id
+             FROM ability_placement_trail
+            WHERE from_locator = 'legacy-from'`,
+        )
+        .get(),
+    ).toEqual({ to_locator: 'legacy-to', registry_note_id: null, manifest_note_id: null })
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO ability_placement_trail (from_locator, to_locator, space_id)
+           VALUES ('new-from', 'new-to', 'space-main')`,
+        )
+        .run(),
+    ).toThrow(/requires both note identities/)
+    expect(() =>
+      db
+        .prepare(
+          `UPDATE ability_placement_trail
+              SET to_locator = 'legacy-next'
+            WHERE from_locator = 'legacy-from'`,
+        )
+        .run(),
+    ).toThrow(/requires both note identities/)
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO ability_placement_trail
+             (from_locator, to_locator, space_id, registry_note_id, manifest_note_id)
+           VALUES ('new-from', 'new-to', 'space-main', 'RegistryNote1', 'ManifestNote1')`,
+        )
+        .run(),
+    ).not.toThrow()
+  })
+
+  it('releases success-only replay keys held by an existing rejected ability create', () => {
+    const db = database()
+
+    runSqliteMigrations(db, migrations.slice(0, 20))
+    db.prepare(
+      `INSERT INTO ability_create_operations
+        (id, actor_digest, idempotency_digest, request_fingerprint, space, package_id,
+         note_id, target_path, availability_required, stage_binding, phase,
+         prepared_evidence, created_at, updated_at)
+       VALUES (?, 'actor', 'key', 'request', 'space-main', ?, ?, ?, 0, 'binding',
+               'rejected', '{}', '2026-08-23T00:00:00.000Z', '2026-08-23T00:00:00.000Z')`,
+    ).run('rejected-operation', 'PackageId001', 'RegistryNote1', 'first/SKILL.md')
+
+    runSqliteMigrations(db)
+
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO ability_create_operations
+            (id, actor_digest, idempotency_digest, request_fingerprint, space, package_id,
+             note_id, target_path, availability_required, stage_binding, phase,
+             prepared_evidence, created_at, updated_at)
+           VALUES (?, 'actor', 'key', 'request', 'space-main', ?, ?, ?, 0, 'binding',
+                   'accepted', '{}', '2026-08-23T00:00:01.000Z', '2026-08-23T00:00:01.000Z')`,
+        )
+        .run('retry-operation', 'PackageId002', 'RegistryNote2', 'second/SKILL.md'),
+    ).not.toThrow()
+    expect(
+      db
+        .prepare(
+          `SELECT id, phase FROM ability_create_operations
+            WHERE actor_digest = 'actor' AND idempotency_digest = 'key' ORDER BY id`,
+        )
+        .all(),
+    ).toEqual([
+      { id: 'rejected-operation', phase: 'rejected' },
+      { id: 'retry-operation', phase: 'accepted' },
+    ])
   })
 
   it('reopens a valid prefix as a no-op without rewriting its applied timestamp', () => {
@@ -151,7 +245,7 @@ describe('meta-DB migration assets and SQLite runner', () => {
     expect(
       db
         .prepare(
-          'SELECT owner, name, calls, role, role_locator, role_context_project_id FROM agent_sessions WHERE id = ?',
+          'SELECT owner, name, calls, role, role_locator, role_context_project_id, project_id FROM agent_sessions WHERE id = ?',
         )
         .get('ses_existingv1aa'),
     ).toEqual({
@@ -161,6 +255,7 @@ describe('meta-DB migration assets and SQLite runner', () => {
       role: null,
       role_locator: null,
       role_context_project_id: null,
+      project_id: null,
     })
   })
 

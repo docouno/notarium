@@ -101,6 +101,70 @@ export const describeAbilityAvailabilityContract = (
       expect(await db.abilityAvailability.listForSpace('space-main')).toHaveLength(1)
     })
 
+    it('reserves, finalizes and protects a pre-publication reach with CAS semantics', async () => {
+      expect(
+        await db.abilityAvailability.reserve('space-main', PACKAGE_DIRECTORY, {
+          mode: 'selected-projects',
+          projectIds: ['project-b', 'project-a', 'project-a'],
+        }),
+      ).toBe(true)
+      expect(
+        await db.abilityAvailability.reserve('space-main', PACKAGE_DIRECTORY, {
+          mode: 'selected-projects',
+          projectIds: ['project-c'],
+        }),
+      ).toBe(false)
+      expect(await db.abilityAvailability.get('space-main', PACKAGE_DIRECTORY)).toEqual({
+        homeSpace: 'space-main',
+        packageId: PACKAGE_DIRECTORY,
+        mode: 'selected-projects',
+        projectIds: ['project-a', 'project-b'],
+      })
+
+      expect(
+        await db.abilityAvailability.finalize('space-main', PACKAGE_DIRECTORY, REGISTRY_NOTE),
+      ).toBe(true)
+      expect(
+        await db.abilityAvailability.finalize('space-main', PACKAGE_DIRECTORY, 'OtherRegistry'),
+      ).toBe(false)
+      expect(await db.abilityAvailability.cancel('space-main', PACKAGE_DIRECTORY)).toBe(false)
+      expect(await db.abilityAvailability.get('space-main', PACKAGE_DIRECTORY)).not.toBeNull()
+    })
+
+    it('reserves the exact all-project reach before publication', async () => {
+      expect(
+        await db.abilityAvailability.reserve('space-main', PACKAGE_DIRECTORY, {
+          mode: 'all-projects',
+        }),
+      ).toBe(true)
+      expect(await db.abilityAvailability.get('space-main', PACKAGE_DIRECTORY)).toEqual({
+        homeSpace: 'space-main',
+        packageId: PACKAGE_DIRECTORY,
+        mode: 'all-projects',
+      })
+      expect(
+        await db.abilityAvailability.finalize('space-main', PACKAGE_DIRECTORY, REGISTRY_NOTE),
+      ).toBe(true)
+    })
+
+    it('cancels only an unfinalized reservation and leaves the package id reusable', async () => {
+      expect(
+        await db.abilityAvailability.reserve('space-main', PACKAGE_DIRECTORY, {
+          mode: 'selected-projects',
+          projectIds: ['project-a'],
+        }),
+      ).toBe(true)
+      expect(await db.abilityAvailability.cancel('space-main', PACKAGE_DIRECTORY)).toBe(true)
+      expect(await db.abilityAvailability.cancel('space-main', PACKAGE_DIRECTORY)).toBe(false)
+      expect(await db.abilityAvailability.get('space-main', PACKAGE_DIRECTORY)).toBeNull()
+      expect(
+        await db.abilityAvailability.reserve('space-main', PACKAGE_DIRECTORY, {
+          mode: 'selected-projects',
+          projectIds: ['project-b'],
+        }),
+      ).toBe(true)
+    })
+
     it('replaces the whole selected set atomically and grantProject unions one binding', async () => {
       await db.abilityAvailability.set(
         'space-main',

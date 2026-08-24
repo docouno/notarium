@@ -1,6 +1,8 @@
+import { ABILITY_KIND, type AbilityKind } from '@notarium/contract'
 import {
   analyzeDocumentState,
   DOCUMENT_ROLE,
+  exactOwnerObservation,
   isSkillName,
   type KnowledgeStore,
   NOTE_CLASS,
@@ -8,11 +10,13 @@ import {
 } from '@notarium/core'
 import {
   InvalidSkillPackageError,
+  isResolvableAbilityManifest,
   parseSkillFile,
   type RoleLibrary,
-  type RoleLibraryComposition,
   type RoleLibraryListing,
   type RoleLocation,
+  type RolePackagePublication,
+  type SeedableRoleLibraryComposition,
   type SkillPackage,
   validateSkillPackage,
 } from '@notarium/server'
@@ -69,7 +73,7 @@ export const createStoreRoleLibrary = (
      *  space while it runs. */
     onBarrier?: (location: RoleLocation, directoryNames: readonly string[]) => void
   } = {},
-): RoleLibraryComposition => {
+): SeedableRoleLibraryComposition => {
   /** One claim at a time per placement — the fake's stand-in for the filesystem
    *  library's `acquirePlacementFence`. `putIfAbsent` asks "is this name free?" and
    *  then writes, with awaits in between; unfenced, two concurrent installers of one
@@ -110,6 +114,7 @@ export const createStoreRoleLibrary = (
   const packageByDirectory = async (
     location: RoleLocation,
     directoryName: string,
+    mutationClaimed = false,
   ): Promise<SkillPackage | null> => {
     const store = await storeForSpace(location.space)
     const root = packageRoot(location, directoryName)
@@ -125,7 +130,10 @@ export const createStoreRoleLibrary = (
         continue
       }
       const relative = note.filePath.slice(root.length + 1)
-      const content = await store.read(note.id ?? note.filePath)
+      const content = await store.read(
+        note.id ?? note.filePath,
+        mutationClaimed ? { mutationClaimed: true } : undefined,
+      )
       const source = content.documentState?.source
 
       if (source) {
@@ -164,24 +172,40 @@ export const createStoreRoleLibrary = (
     ).filter((pkg): pkg is SkillPackage => pkg != null)
   }
 
-  const parsedName = (pkg: SkillPackage): string | null => {
+  const parsedIdentity = (pkg: SkillPackage): { name: string; kind: AbilityKind } | null => {
     const manifest = pkg.files.get('SKILL.md')
 
     if (!manifest) {
       return null
     }
     try {
-      return parseSkillFile(Buffer.from(manifest).toString('utf8'), pkg.directoryName).name
+      const parsed = parseSkillFile(Buffer.from(manifest).toString('utf8'), pkg.directoryName)
+
+      if (!isResolvableAbilityManifest(parsed)) {
+        return null
+      }
+
+      return {
+        name: parsed.name,
+        kind: parsed.role ? ABILITY_KIND.role : ABILITY_KIND.skill,
+      }
     } catch {
       return null
     }
   }
 
+  const parsedName = (pkg: SkillPackage): string | null => parsedIdentity(pkg)?.name ?? null
+
   const packageByName = async (
     location: RoleLocation,
     name: string,
+    kind?: AbilityKind,
   ): Promise<SkillPackage | null> =>
-    (await packagesAt(location)).find((pkg) => parsedName(pkg) === name) ?? null
+    (await packagesAt(location)).find((pkg) => {
+      const identity = parsedIdentity(pkg)
+
+      return identity?.name === name && (kind === undefined || identity.kind === kind)
+    }) ?? null
 
   /** Package identities off the note projection. The fake writes through the store it
    *  reads, so its publication barrier is already crossed by the time anyone asks;
@@ -305,14 +329,31 @@ export const createStoreRoleLibrary = (
     from: RoleLocation,
     to: RoleLocation,
     directoryName: string,
+    expected: Parameters<RolePackagePublication['moveFrom']>[2],
+    finalize: (evidence: { manifestNoteId: string | null }) => Promise<void>,
   ): Promise<boolean> => {
     if (from.space !== to.space) {
       throw new Error('a package move cannot cross spaces')
     }
     const pkg = await packageByDirectory(from, directoryName)
     const name = pkg && parsedName(pkg)
+    const manifest = pkg?.files.get('SKILL.md')
+    const parsed = manifest
+      ? parseSkillFile(Buffer.from(manifest).toString('utf8'), directoryName)
+      : null
+    const owner = manifest ? exactOwnerObservation(manifest) : { kind: 'unproven' as const }
+    const registryNoteId = (await noteIdsAt(from, [directoryName])).get(directoryName)
 
-    if (!pkg || !name) {
+    if (!pkg || !name || !parsed) {
+      return false
+    }
+    if (
+      expected &&
+      ((parsed.role ? ABILITY_KIND.role : ABILITY_KIND.skill) !== expected.kind ||
+        registryNoteId !== expected.registryNoteId ||
+        owner.kind !== 'claimed' ||
+        owner.id !== expected.manifestNoteId)
+    ) {
       return false
     }
     if (
@@ -361,18 +402,37 @@ export const createStoreRoleLibrary = (
       resources.set(resourceKey(to.space, `${targetRoot}/${relative}`), bytes)
     }
 
-    return true
+    try {
+      await finalize({ manifestNoteId: owner.kind === 'claimed' ? owner.id : null })
+      return true
+    } catch (error) {
+      const restored = await movePackage(to, from, directoryName, expected, async () => undefined)
+
+      if (!restored) {
+        throw error
+      }
+      throw error
+    }
   }
 
   const library: RoleLibrary = {
     listManifests: listing,
-    getSkill: async (location, name) => {
-      const pkg = await packageByName(location, name)
-      const manifest = pkg?.files.get('SKILL.md')
+    getAbilitiesNamed: async (location, name) => {
+      const found = new Map<AbilityKind, SkillPackage>()
 
-      return pkg && manifest
-        ? { directoryName: pkg.directoryName, files: new Map([['SKILL.md', manifest]]) }
-        : null
+      for (const kind of [ABILITY_KIND.role, ABILITY_KIND.skill] as const) {
+        const pkg = await packageByName(location, name, kind)
+        const manifest = pkg?.files.get('SKILL.md')
+
+        if (pkg && manifest) {
+          found.set(kind, {
+            directoryName: pkg.directoryName,
+            files: new Map([['SKILL.md', manifest]]),
+          })
+        }
+      }
+
+      return found
     },
     getSkillByDirectory: async (location, directoryName) => {
       const pkg = await packageByDirectory(location, directoryName)
@@ -382,6 +442,22 @@ export const createStoreRoleLibrary = (
         ? { directoryName: pkg.directoryName, files: new Map([['SKILL.md', manifest]]) }
         : null
     },
+    withExactPackageRead: async (location, directoryName, task) =>
+      task(async () => {
+        const pkg = await packageByDirectory(location, directoryName)
+        const registryNoteId = (await noteIdsAt(location, [directoryName])).get(directoryName)
+
+        return pkg && registryNoteId ? { pkg: clone(pkg), registryNoteId } : null
+      }),
+    withExactPackageMutation: async (location, directoryName, task) =>
+      claimPlacement(location, () =>
+        task(async () => {
+          const pkg = await packageByDirectory(location, directoryName, true)
+          const registryNoteId = (await noteIdsAt(location, [directoryName])).get(directoryName)
+
+          return pkg && registryNoteId ? { pkg: clone(pkg), registryNoteId } : null
+        }),
+      ),
     // A name no package may carry occupies nothing. Asked here, ahead of any lookup,
     // exactly where the shipped library asks it: a fake that answered `true` for a
     // malformed name would make an unpublishable name look taken, and the Add that
@@ -408,15 +484,68 @@ export const createStoreRoleLibrary = (
       return noteIdsAt(location, directoryNames)
     },
     readableNoteIds: async (location, directoryNames) => noteIdsAt(location, directoryNames),
+    inspectAndRemove: async (location, directoryName, options) => {
+      let found = false
+
+      await options.remove(async (victimNoteIds) => {
+        const root = packageRoot(location, directoryName)
+        const pkg = await packageByDirectory(location, directoryName, true)
+
+        if (!pkg) {
+          throw new Error('ability package changed before delete')
+        }
+        const files = new Map<string, Uint8Array>([
+          ['SKILL.md', Uint8Array.from(pkg.files.get('SKILL.md')!)],
+        ])
+
+        for (const [relative, bytes] of resourcesUnder(location.space, root)) {
+          files.set(relative, Uint8Array.from(bytes))
+        }
+        if (options.expected) {
+          const manifest = files.get('SKILL.md')!
+          const parsed = parseSkillFile(Buffer.from(manifest).toString('utf8'), directoryName)
+          const owner = exactOwnerObservation(manifest)
+
+          if (
+            (parsed.role ? ABILITY_KIND.role : ABILITY_KIND.skill) !== options.expected.kind ||
+            !victimNoteIds?.includes(options.expected.registryNoteId) ||
+            owner.kind !== 'claimed' ||
+            owner.id !== options.expected.manifestNoteId
+          ) {
+            throw new Error('ability package changed before delete')
+          }
+        }
+        await options.assertSafe({ directoryName, files }, [...files.keys()])
+        found = true
+      })
+
+      return found
+    },
+    manifestPath: (location, directoryName) => `${packageRoot(location, directoryName)}/SKILL.md`,
+    withCreateAdmission: (location, _directoryName, task) => claimPlacement(location, task),
   }
 
   return {
     library,
+    seedPackageFile: async (location, directoryName, relative, content) => {
+      if (
+        !relative ||
+        relative.includes('\\') ||
+        relative.split('/').some((part) => !part || part === '.' || part === '..')
+      ) {
+        throw new InvalidSkillPackageError(`invalid seeded package path: ${relative}`)
+      }
+      resources.set(
+        resourceKey(location.space, `${packageRoot(location, directoryName)}/${relative}`),
+        Uint8Array.from(content),
+      )
+    },
     publication: {
       availableFor: () => true,
       publicationFor: async (location) => ({
         putIfAbsent: (pkg) => putIfAbsent(location, pkg),
-        moveFrom: (origin, directoryName) => movePackage(origin, location, directoryName),
+        moveFrom: (origin, directoryName, expected, finalize) =>
+          movePackage(origin, location, directoryName, expected, finalize),
       }),
     },
   }

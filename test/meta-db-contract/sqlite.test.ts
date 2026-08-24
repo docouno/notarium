@@ -5,6 +5,7 @@ import { DatabaseSync } from 'node:sqlite'
 
 import { SqliteMetaDb } from '../../packages/server/src/services/metaDb/sqliteMetaDb'
 import { describeAbilityAvailabilityContract } from './abilityAvailabilityContract'
+import { describeAbilityCreateContract } from './abilityCreateContract'
 import { describeAbilityPlacementContract } from './abilityPlacementContract'
 import { describeAbilityPreferencesContract } from './abilityPreferencesContract'
 import { describeAgentDeltaCursorsContract } from './agentDeltaCursorsContract'
@@ -42,6 +43,11 @@ describeAgentSessionsContract('SQLite', async () => {
 })
 
 describeAbilityPreferencesContract('SQLite', async () => {
+  const db = new SqliteMetaDb(':memory:')
+  return { db, teardown: () => db.close() }
+})
+
+describeAbilityCreateContract('SQLite', async () => {
   const db = new SqliteMetaDb(':memory:')
   return { db, teardown: () => db.close() }
 })

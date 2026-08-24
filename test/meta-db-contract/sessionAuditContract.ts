@@ -98,6 +98,7 @@ export const describeSessionAuditContract = (
         role: null,
         roleLocator: null,
         roleContextProjectId: null,
+        projectId: null,
       })
       await facets.retrievals.append(
         retrieval({
@@ -235,6 +236,7 @@ export const describeSessionAuditContract = (
         role: null,
         roleLocator: null,
         roleContextProjectId: null,
+        projectId: null,
       })
       await facets.sessions.insert({
         id: 'ses_writes',
@@ -248,6 +250,7 @@ export const describeSessionAuditContract = (
         role: null,
         roleLocator: null,
         roleContextProjectId: null,
+        projectId: null,
       })
       await facets.retrievals.append(
         retrieval({

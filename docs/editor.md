@@ -65,17 +65,16 @@ route; Cancel or confirmed discard removes it too. Logout, a mid-session 401, or
 change clears the previous owner's records, so a shared browser never offers one user's draft to
 another.
 
-The first Save calls the Role/Skill publication operation because no package exists yet. Every
-later Owned Save goes through the ordinary id-addressed note update with its version token, so
-history, replication, CAS refusal, and explicit overwrite behavior stay common. Role attachment
-changes ride that same CAS write as an exact locator + complete ordered list. An unrelated body or
-manifest edit omits the attachment fields and therefore preserves legacy invalid raw tokens;
-explicit Detach removes them. Enabled state stays a one-shot kebab action outside authored dirty
-state, while where an ability belongs and how far it reaches are fields of the document and commit
-with its one Save. Covering anything other than exactly its own project is something only a Space
-home can do, so a Project-homed Role given a wider answer relocates to its Space home inside that
-same Save. Relocation is one-way: a package moves up to the Space, never down into a project or
-across to another one.
+The first Save uses the durable Role/Skill publication transaction; it does not expose a package
+until its identity, origin revision and reach have one recoverable outcome. Every later Owned Save
+uses `PUT /api/me/agent-abilities/:locator/save`, the server-side orchestrator over the same authored
+CAS writer as the compatibility `POST /api/note` door. It applies document, home and availability in
+order and returns every step outcome. The client adopts a returned locator/version even when a
+later step fails, keeps the draft open and retries from server truth. Role attachment changes ride
+the document CAS as an exact locator + complete ordered list. An unrelated body or manifest edit
+omits them and preserves legacy invalid raw tokens; explicit Detach removes them. Enabled state
+stays a one-shot kebab action. Covering anything other than exactly one project requires a Space
+home, so a Project role may relocate only upward to its own Space, never to another project/Space.
 
 ## Distraction-free: Focus and Typewriter (#118)
 

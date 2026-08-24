@@ -69,6 +69,48 @@ export const ABILITY_ATTACHMENT_HEALTH = {
   wrongKind: 'wrong-kind',
 } as const
 
+export const ROLE_ATTACHMENT_STATE = {
+  loaded: 'loaded',
+  omittedByBudget: 'omitted-by-budget',
+} as const
+
+export const ABILITY_SAVE_STEP = {
+  document: 'document',
+  home: 'home',
+  availability: 'availability',
+  enabled: 'enabled',
+} as const
+
+export const ABILITY_SAVE_OUTCOME = {
+  applied: 'applied',
+  skipped: 'skipped',
+  failed: 'failed',
+} as const
+
+export const ABILITY_CREATE_OUTCOME = {
+  created: 'created',
+  skipped: 'skipped',
+} as const
+
+export const ABILITY_CREATE_WARNING = {
+  idempotencyNotPersisted: 'idempotency-not-persisted',
+} as const
+
+export const ABILITY_LIST_VIEW = {
+  runtime: 'runtime',
+  authoring: 'authoring',
+} as const
+
+export const ABILITY_CONTINUATION_REASON = {
+  abilitiesTruncated: 'abilities-truncated',
+  zeroResults: 'zero-results',
+  nextPage: 'next-page',
+} as const
+
+export const ABILITY_CONTINUATION_REQUIREMENT = {
+  activationOrAnswer: 'ability-activation-or-answer',
+} as const
+
 /** The longest search a package-library request can carry. Stated here rather than
  *  only inside the schema so the SURFACE that composes the request can hold to it: a
  *  query the client cannot ask must not reach the wire as a validation failure that
@@ -89,6 +131,16 @@ export type AbilityAvailabilityMode =
   (typeof ABILITY_AVAILABILITY_MODE)[keyof typeof ABILITY_AVAILABILITY_MODE]
 export type AbilityAttachmentHealth =
   (typeof ABILITY_ATTACHMENT_HEALTH)[keyof typeof ABILITY_ATTACHMENT_HEALTH]
+export type RoleAttachmentState = (typeof ROLE_ATTACHMENT_STATE)[keyof typeof ROLE_ATTACHMENT_STATE]
+export type AbilitySaveStep = (typeof ABILITY_SAVE_STEP)[keyof typeof ABILITY_SAVE_STEP]
+export type AbilitySaveOutcome = (typeof ABILITY_SAVE_OUTCOME)[keyof typeof ABILITY_SAVE_OUTCOME]
+export type AbilityCreateOutcome =
+  (typeof ABILITY_CREATE_OUTCOME)[keyof typeof ABILITY_CREATE_OUTCOME]
+export type AbilityCreateWarning =
+  (typeof ABILITY_CREATE_WARNING)[keyof typeof ABILITY_CREATE_WARNING]
+export type AbilityListView = (typeof ABILITY_LIST_VIEW)[keyof typeof ABILITY_LIST_VIEW]
+export type AbilityContinuationReason =
+  (typeof ABILITY_CONTINUATION_REASON)[keyof typeof ABILITY_CONTINUATION_REASON]
 
 /** The exact storage-address form a host mints for a package. `core` states the same
  *  two facts for the runtime that produces them; P8 keeps the pair as two copies rather

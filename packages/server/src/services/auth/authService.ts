@@ -5,6 +5,7 @@ import type { IncomingHttpHeaders } from 'node:http'
 
 import { AUTH_MODE, SPACE_ROLE, TOKEN_PURPOSE } from '@notarium/contract'
 import { HTTP_STATUS } from '@notarium/contract/http'
+import { defineClientFailure } from '../../libs/clientFailure'
 import {
   DUMMY_HASH_PROMISE,
   hashPassword,
@@ -67,6 +68,11 @@ export class AuthError extends Error {
     super(message)
     this.status = status
     this.reason = reason
+    if (status === HTTP_STATUS.NOT_FOUND) {
+      defineClientFailure(this, { kind: 'not-found' })
+    } else if (status === HTTP_STATUS.BAD_REQUEST) {
+      defineClientFailure(this, { kind: 'actionable', message })
+    }
   }
 }
 

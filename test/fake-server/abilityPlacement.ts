@@ -18,11 +18,18 @@ export const createInMemoryAbilityPlacement = (facets: {
   abilityPreferences: InMemoryAbilityPreferences
   agentSessions: InMemoryAgentSessions
 }): AbilityPlacementPersistence => ({
+  resolveMovedOwnedRoleLocator: async (fromLocator) =>
+    facets.abilityPreferences.movedPlacement(fromLocator),
   moveOwnedRolePlacement: async (move: OwnedRolePlacementMove) => {
     facets.contextSets.moveRoleTarget(move.fromTargetId, move.toTargetId)
     facets.scopePins.moveRoleTarget(move.fromTargetId, move.toTargetId)
     facets.contextOrder.moveRoleTarget(move.fromTargetId, move.toTargetId)
-    facets.abilityPreferences.moveLocator(move.fromLocator, move.toLocator)
+    facets.abilityPreferences.moveLocator(
+      move.fromLocator,
+      move.toLocator,
+      move.registryNoteId,
+      move.manifestNoteId,
+    )
     facets.agentSessions.moveRoleLocator(move.fromLocator, move.toLocator)
   },
 })

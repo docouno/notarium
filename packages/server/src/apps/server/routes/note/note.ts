@@ -40,12 +40,7 @@ import { redactsKeyId, withAuthors } from '../../../../libs/authors'
 import { safeRelAddress } from '../../../../libs/relPath'
 import { can } from '../../../../services/authz'
 import { lastSegment } from '../../../../services/projects'
-import {
-  RoleDependencyConflictError,
-  skillLinksMetadataEntry,
-  unwritableSkillLinks,
-} from '../../../../services/roles'
-import { peekPersonalSpace } from '../../../../services/spaces'
+import { RoleDependencyConflictError } from '../../../../services/roles'
 import { setNoteMuted, setNotePinned } from '../../../../services/spaces'
 import { type ApiRouteCtx, authz, missing, notFound, s } from '../_shared'
 import {
@@ -67,7 +62,7 @@ export const noteRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
     auth,
     principalId,
     restoreCoordinator,
-    roles,
+    abilities,
   } = ctx
 
   // Wiki-link resolver: `ref` (path/title/permalink) resolves WITHIN this space
@@ -274,41 +269,33 @@ export const noteRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
         .code(HTTP_STATUS.BAD_REQUEST)
         .send({ error: 'skill manifest fields require a skill package root' })
     }
-    let attachmentFrontmatter
+    const domain = updateToDomain(
+      { ...parsed, directory, originalId: live.id ?? parsed.originalId },
+      principalId(req),
+    )
 
-    if (parsed.attachments !== undefined && parsed.abilityLocator !== undefined) {
-      if (!skillRoot || live.documentState?.projection == null || !roles) {
-        return reply
-          .code(HTTP_STATUS.BAD_REQUEST)
-          .send({ error: 'Role attachments require an editable Role package root' })
-      }
+    if (skillRoot && abilities) {
       try {
-        const validated = await roles.serializeOwnedRoleAttachments(
-          req.principal,
-          parsed.abilityLocator,
-          parsed.attachments,
-          await peekPersonalSpace({ auth, spaces }, req.principal),
-        )
+        const target = abilities.authorizeDocument(req.principal, { ...hit, note: live })
 
-        if (validated.noteId !== (live.id ?? parsed.originalId)) {
-          return reply
-            .code(HTTP_STATUS.BAD_REQUEST)
-            .send({ error: 'ability locator does not address this note' })
+        if (!target) {
+          return notFound(reply)
         }
-        // Same refusal as the ability service makes, asked of the same producer: this
-        // door writes the very same list, and a package readable-but-not-writable must
-        // say so here too rather than fall through to the generic frontmatter gate.
-        const unwritable = unwritableSkillLinks(validated.links)
+        const saved = await abilities.writeDocument(req.principal, {
+          target,
+          input: domain,
+          description: parsed.description,
+          ...(parsed.abilityLocator && parsed.attachments
+            ? { locator: parsed.abilityLocator, attachments: parsed.attachments }
+            : {}),
+        })
 
-        if (unwritable.length) {
-          throw new RoleDependencyConflictError(
-            `attachment cannot be written back to SKILL.md: ${unwritable.join(' ')}`,
-          )
-        }
-        attachmentFrontmatter = skillLinksMetadataEntry(
-          live.documentState.projection.frontmatterEntries,
-          validated.links,
-        )
+        return SaveResponseSchema.parse({
+          ok: true,
+          id: saved.id,
+          filePath: saved.filePath,
+          versionToken: saved.versionToken,
+        })
       } catch (error) {
         if (error instanceof RoleDependencyConflictError) {
           return reply.code(HTTP_STATUS.CONFLICT).send({
@@ -316,21 +303,11 @@ export const noteRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
             reason: 'role_dependency_conflict',
           })
         }
-        // Anything else — including an ability that is simply not there, which the
-        // host answers as one 404 for every route — is rethrown. Reporting OUR failure
-        // as a 404 tells the author their open note vanished and leaves no server trace.
         throw error
       }
     }
-    const domain = updateToDomain(
-      { ...parsed, directory, originalId: live.id ?? parsed.originalId },
-      principalId(req),
-    )
     const r = await hit.store.write({
       ...domain,
-      ...(attachmentFrontmatter
-        ? { frontmatter: [...(domain.frontmatter ?? []), attachmentFrontmatter] }
-        : {}),
       // A folder page's identity is the reserved basename `index.md`, not its title —
       // preserve it on edit so saving the body doesn't demote it to a child note.
       ...(live.filePath && isFolderPageNote(live.filePath)
@@ -543,16 +520,13 @@ export const noteRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
 
     // Deleting the package ROOT is a package operation; deleting any other member of
     // the package is one tombstone. Same one answer as the write path above.
-    if (
-      live.documentState?.role === DOCUMENT_ROLE.skillRoot &&
-      live.filePath != null &&
-      hit.store.removeDir
-    ) {
-      await hit.store.removeDir(directoryOf(live.filePath), {
-        principal: principalId(req),
-        internalAddress: true,
-      })
-    } else {
+    const target = abilities?.authorizeDocument(req.principal, { ...hit, note: live })
+    const removedPackage =
+      target && abilities
+        ? await abilities.removeDocument(req.principal, target, { principal: principalId(req) })
+        : false
+
+    if (!removedPackage) {
       await hit.store.remove(id, { principal: principalId(req) })
     }
 

@@ -12,6 +12,7 @@ import { editNote } from '@notarium/core'
 import { safeRelAddress } from '../../../../libs/relPath'
 import { type Handler, ToolFailure } from '../../gateway'
 import { dedupedWrite, wireSpace, writeEcho, type WriteRun } from '../../helpers/dedup'
+import { mcpNoteMutationOptions, openMcpNoteDoor } from '../../helpers/noteDoor'
 import { notePath, projectLabelForNote } from '../../helpers/projectAddressing'
 import { writeAttributionOf } from '../../helpers/writeAttribution'
 import { sanitizeText } from '../../sanitize'
@@ -25,28 +26,37 @@ export const handleEditNote: Handler = async (ctx, rawArgs) => {
   // Idempotency-key only, no content-hash window (edit_note is not a create): a
   // keyless retry of an additive append DUPLICATES. The key returns the original
   // edit's {noteId, versionToken}.
+  const preflight = await openMcpNoteDoor(ctx, ref, 'note:write')
+
+  if (!preflight) {
+    throw new ToolFailure('no such note, or you do not have access to it')
+  }
   const { result, wasHit } = await dedupedWrite<WriteRun>(
     ctx,
-    { toolName: 'edit_note', idempotencyKey },
+    { toolName: 'edit_note', idempotencyKey, scopeKey: ref },
     async () => {
       // Resolve on note:write — unknown id, foreign space and tombstone all
       // collapse to one 404 (storeAccess) — anti-enumeration.
-      const hit = await ctx.store.noteStore(ctx.principal, ref, 'note:write')
+      const hit = await openMcpNoteDoor(ctx, ref, 'note:write')
 
       if (!hit) {
         throw new ToolFailure('no such note, or you do not have access to it')
       }
       editSpace = hit.space
       // canon: docs/contract.md#cas
-      const r = await editNote(hit.store, {
-        noteId: ref,
-        operation,
-        content,
-        section,
-        find,
-        versionToken,
-        ...writeAttributionOf(ctx),
-      })
+      const r = await editNote(
+        hit.store,
+        {
+          noteId: ref,
+          operation,
+          content,
+          section,
+          find,
+          versionToken,
+          ...writeAttributionOf(ctx),
+        },
+        mcpNoteMutationOptions,
+      )
       return {
         noteId: r.id ?? '',
         versionToken: r.versionToken ?? '',
@@ -67,15 +77,15 @@ export const handleDeleteNote: Handler = async (ctx, rawArgs) => {
   const { ref } = rawArgs as DeleteNoteInput
   // Resolve on note:delete — unknown id, foreign space and an already-deleted
   // tombstone all collapse to one 404 (storeAccess + the read below) — anti-enumeration.
-  const hit = await ctx.store.noteStore(ctx.principal, ref, 'note:delete')
+  const hit = await openMcpNoteDoor(ctx, ref, 'note:delete')
 
   if (!hit) {
     throw new ToolFailure('no such note, or you do not have access to it')
   }
   // Read BEFORE remove: echoes what was trashed and 404s honestly on a note
   // already in the trash (read throws not-found for a tombstone without deletedView).
-  const note = await hit.store.read(ref)
-  const noteId = note.id ?? ref
+  const note = hit.note
+  const noteId = hit.noteId
   const personal = await ctx.personalSpace()
   // hit.space is the opaque id (compare on it); the wire `space` label and the
   // project labeller take the slug.
@@ -88,7 +98,7 @@ export const handleDeleteNote: Handler = async (ctx, rawArgs) => {
   )
   const path = notePath(note.filePath)
   // Soft-delete → the space trash (reversible). canon: docs/trash.md#model
-  await hit.store.remove(noteId, writeAttributionOf(ctx))
+  await hit.store.remove(noteId, { ...writeAttributionOf(ctx), ...mcpNoteMutationOptions })
   const structured: Record<string, unknown> = {
     noteId,
     title: sanitizeText(note.title ?? '(untitled)'),
@@ -109,13 +119,13 @@ export const handleMoveNote: Handler = async (ctx, rawArgs) => {
   // Resolve on note:write — unknown id, foreign space and tombstone collapse to
   // one 404 (storeAccess) — anti-enumeration. Move is id-addressed: destination
   // folder is always WITHIN the note's own space (no cross-space moves).
-  const hit = await ctx.store.noteStore(ctx.principal, ref, 'note:write')
+  const hit = await openMcpNoteDoor(ctx, ref, 'note:write')
 
   if (!hit) {
     throw new ToolFailure('no such note, or you do not have access to it')
   }
-  const note = await hit.store.read(ref)
-  const noteId = note.id ?? ref
+  const note = hit.note
+  const noteId = hit.noteId
   const current = note.filePath
 
   if (!current) {
@@ -134,7 +144,7 @@ export const handleMoveNote: Handler = async (ctx, rawArgs) => {
   const dest = folder ? `${folder}/${base}` : base
   // Renames the file + UPDATEs the row in place; a no-op move (already at dest)
   // is a silent success. canon: docs/core.md#identity
-  await hit.store.move({ id: noteId, destinationPath: dest })
+  await hit.store.move({ id: noteId, destinationPath: dest }, mcpNoteMutationOptions)
   const personal = await ctx.personalSpace()
   // hit.space is the opaque id; wire label + project labeller take the slug.
   // `dest` is the authoritative new path (no re-read needed).
@@ -158,7 +168,7 @@ export const handleMoveNote: Handler = async (ctx, rawArgs) => {
 
 export const handleRenameNote: Handler = async (ctx, rawArgs) => {
   const { ref, title } = rawArgs as RenameNoteInput
-  const hit = await ctx.store.noteStore(ctx.principal, ref, 'note:write')
+  const hit = await openMcpNoteDoor(ctx, ref, 'note:write')
 
   if (!hit) {
     throw new ToolFailure('no such note, or you do not have access to it')
@@ -168,8 +178,8 @@ export const handleRenameNote: Handler = async (ctx, rawArgs) => {
   // Read for the live body + fresh versionToken: rename does a full write, so the
   // body MUST be carried forward or the write would BLANK it. CAS makes a concurrent
   // edit conflict rather than clobber.
-  const note = await hit.store.read(ref)
-  const noteId = note.id ?? ref
+  const note = hit.note
+  const noteId = hit.noteId
   const projectsHere = await ctx.projectsInSpace(hit.space)
   const labelFor = (filePath: string | null | undefined) =>
     projectLabelForNote(spaceSlug, filePath, note.class, projectsHere)
@@ -193,13 +203,16 @@ export const handleRenameNote: Handler = async (ctx, rawArgs) => {
   }
   // Full write with the new title; the old title lands in alias-history so inbound
   // [[Old Title]] keep resolving.
-  const r = await hit.store.write({
-    originalId: noteId,
-    title,
-    content: note.content,
-    versionToken: note.versionToken,
-    ...writeAttributionOf(ctx),
-  })
+  const r = await hit.store.write(
+    {
+      originalId: noteId,
+      title,
+      content: note.content,
+      versionToken: note.versionToken,
+      ...writeAttributionOf(ctx),
+    },
+    mcpNoteMutationOptions,
+  )
   const newPath = notePath(r.filePath)
   const projectHandle = labelFor(r.filePath)
   const structured: Record<string, unknown> = {

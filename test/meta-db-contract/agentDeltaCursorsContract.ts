@@ -35,6 +35,7 @@ const session = (
   role: null,
   roleLocator: null,
   roleContextProjectId: null,
+  projectId: null,
 })
 
 const root = (owner: string, id: string): AgentDeltaCursorScope => ({

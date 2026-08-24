@@ -2,16 +2,22 @@ import { randomUUID } from 'node:crypto'
 import { lstat, mkdir, open, opendir, rm, writeFile } from 'node:fs/promises'
 import { dirname, join, relative as relativePath } from 'node:path'
 
-import { isGeneratedNoteId, isSkillName } from '@notarium/core'
+import { ABILITY_KIND, type AbilityKind } from '@notarium/contract'
+import { exactOwnerObservation, isGeneratedNoteId, isSkillName } from '@notarium/core'
 import {
   type AdmissionMode,
   FilePackagePublicationUnavailableError,
   type PackagePublicationView,
   type SpaceResourceAuthority,
 } from '@notarium/engine'
-import { RoleInstallUnavailableError } from './errors'
+import { AbilityUnavailableError, RoleInstallUnavailableError } from './errors'
 import { isReclaimableInstallStaging } from './installStaging'
-import { MAX_SKILL_FILE_BYTES, MAX_SKILL_MANIFEST_BYTES, parseSkillFile } from './skillFile'
+import {
+  isResolvableAbilityManifest,
+  MAX_SKILL_FILE_BYTES,
+  MAX_SKILL_MANIFEST_BYTES,
+  parseSkillFile,
+} from './skillFile'
 import type { RoleLocation, RolePublicationTarget } from './types'
 
 const MAX_PACKAGE_FILES = 256
@@ -50,6 +56,12 @@ export class InvalidSkillPackageError extends Error {}
 
 export type RoleLibraryListing = { packages: SkillPackage[]; truncated: boolean }
 
+export type NamedAbilityPackages = ReadonlyMap<AbilityKind, SkillPackage>
+export type RolePackageReader = () => Promise<{
+  pkg: SkillPackage
+  registryNoteId: string
+} | null>
+
 export type PublishedRolePackage = {
   directoryName: string
   /** Space-relative path served by the ordinary note projection. */
@@ -70,12 +82,34 @@ export type RoleLibrary = {
    *  or instruction bodies. Invalid manifests are isolated by the parser; oversized
    *  manifests are skipped without reading their bodies. */
   listManifests(location: RoleLocation): Promise<RoleLibraryListing>
-  /** One complete SKILL.md, without resources — activation's progressive load. */
-  getSkill(location: RoleLocation, name: string): Promise<SkillPackage | null>
+  /** One stable same-name candidate per ability kind, without resources. External
+   *  packages may collide on a manifest name even though product writes cannot. */
+  getAbilitiesNamed(location: RoleLocation, name: string): Promise<NamedAbilityPackages>
   /** One exact SKILL.md by its immutable owned package address. */
   getSkillByDirectory(location: RoleLocation, directoryName: string): Promise<SkillPackage | null>
+  /** Select metadata authority and read the exact package identity in one shared
+   * package admission. The callback runs before bytes are read so it can recheck the
+   * authority chosen before it waited for the lease. */
+  withExactPackageRead<T>(
+    location: RoleLocation,
+    directoryName: string,
+    task: (read: RolePackageReader) => Promise<T>,
+  ): Promise<T>
+  /** The mutation twin: exclusive placement first, then a shared package admission.
+   * Placement excludes every manifest writer while package admission excludes detach;
+   * keeping package mode shared lets nested exact reads reuse the live package.
+   * The callback owns the package through its actual store/metadata mutation. */
+  withExactPackageMutation<T>(
+    location: RoleLocation,
+    directoryName: string,
+    task: (read: RolePackageReader) => Promise<T>,
+  ): Promise<T>
   /** Whether the package target is occupied, including an invalid package. */
-  exists(location: RoleLocation, name: string): Promise<boolean>
+  exists(
+    location: RoleLocation,
+    name: string,
+    options?: { allowDuringClosure?: boolean },
+  ): Promise<boolean>
   /** Complete package bytes — Add/conflict verification only. */
   get(location: RoleLocation, name: string): Promise<SkillPackage | null>
   /** Complete package bytes by immutable owned package address. */
@@ -96,6 +130,27 @@ export type RoleLibrary = {
     location: RoleLocation,
     directoryNames: readonly string[],
   ): Promise<ReadonlyMap<string, string>>
+  inspectAndRemove(
+    location: RoleLocation,
+    directoryName: string,
+    options: {
+      expected?: {
+        kind: AbilityKind
+        registryNoteId: string
+        manifestNoteId: string
+      }
+      assertSafe(pkg: SkillPackage, members?: readonly string[]): void | Promise<void>
+      remove(beforeDetach: (victimNoteIds?: readonly string[]) => Promise<void>): Promise<void>
+    },
+  ): Promise<boolean>
+  /** Canonical space-relative root manifest path for a package at this placement. */
+  manifestPath(location: RoleLocation, directoryName: string): string | null
+  withCreateAdmission<T>(
+    location: RoleLocation,
+    directoryName: string,
+    task: () => Promise<T>,
+    options?: { allowDuringClosure?: boolean },
+  ): Promise<T>
 }
 
 /** One placement's writer, already bound to its target. The location is not a
@@ -109,8 +164,30 @@ export type RolePackagePublication = {
    *  note read-model is concerned: the id lives in the file's frontmatter, so it
    *  survives the path change ([P7](docs/architecture.md#p7)) — which is the whole
    *  reason a promotion moves the directory instead of republishing its bytes. */
-  moveFrom(source: RoleLocation, directoryName: string): Promise<boolean>
+  moveFrom(
+    source: RoleLocation,
+    directoryName: string,
+    expected: {
+      kind: AbilityKind
+      registryNoteId: string
+      manifestNoteId: string
+    } | null,
+    finalize: (evidence: { manifestNoteId: string | null }) => Promise<void>,
+  ): Promise<boolean>
 }
+
+/** A finalize failure was followed by a failed physical rollback, so the package is
+ * still at the target. The caller must preserve target-owned state such as reach. */
+export const rolePackageMoveRollbackError = (cause: unknown): Error =>
+  Object.assign(new Error('ability placement finalize and physical rollback both failed'), {
+    cause,
+    physicalMoveCommitted: true as const,
+  })
+
+export const isRolePackageMoveRollbackError = (
+  error: unknown,
+): error is Error & { cause: unknown; physicalMoveCommitted: true } =>
+  (error as { physicalMoveCommitted?: unknown } | null)?.physicalMoveCommitted === true
 
 export type RolePackagePublicationPolicy = {
   /** Pure composition answer: can this deployment publish a package at this
@@ -127,6 +204,17 @@ export type RolePackagePublicationPolicy = {
 export type RoleLibraryComposition = {
   library: RoleLibrary
   publication: RolePackagePublicationPolicy
+}
+
+/** Seed-only package augmentation used to materialize recovery edge cases. It is
+ * deliberately absent from RolesService and every REST/MCP surface. */
+export type SeedableRoleLibraryComposition = RoleLibraryComposition & {
+  seedPackageFile(
+    location: RoleLocation,
+    directoryName: string,
+    relativePath: string,
+    content: Uint8Array,
+  ): Promise<void>
 }
 
 /** The same PAIR a filesystem composition returns, plus a reset. Test paths get
@@ -260,7 +348,10 @@ const readManifestPrefix = async (path: string): Promise<Uint8Array> => {
   }
 }
 
-const readPackageFiles = async (root: string): Promise<Map<string, Uint8Array>> => {
+const readPackageFiles = async (
+  root: string,
+  options: { recordSpecialEntries?: boolean; members?: Set<string> } = {},
+): Promise<Map<string, Uint8Array>> => {
   const files = new Map<string, Uint8Array>()
   let bytes = 0
   let entries = 0
@@ -274,11 +365,17 @@ const readPackageFiles = async (root: string): Promise<Map<string, Uint8Array>> 
       if (entries > MAX_PACKAGE_ENTRIES) {
         throw new InvalidSkillPackageError(`Agent Skill package has too many entries: ${root}`)
       }
-      if (entry.isSymbolicLink()) {
-        continue
-      }
       const relative = prefix ? `${prefix}/${entry.name}` : entry.name
       const absolute = join(directory, entry.name)
+
+      options.members?.add(relative)
+
+      if (entry.isSymbolicLink()) {
+        if (options.recordSpecialEntries) {
+          files.set(`${relative} (symbolic link)`, new Uint8Array())
+        }
+        continue
+      }
 
       if (entry.isDirectory()) {
         await walk(absolute, relative, depth + 1)
@@ -289,6 +386,8 @@ const readPackageFiles = async (root: string): Promise<Map<string, Uint8Array>> 
         const content = await readBoundedFile(absolute, MAX_PACKAGE_BYTES - bytes)
         bytes += content.byteLength
         files.set(relative, content)
+      } else if (options.recordSpecialEntries) {
+        files.set(`${relative} (non-regular entry)`, new Uint8Array())
       }
     }
   }
@@ -380,7 +479,7 @@ export const createFsRoleLibrary = ({
   authorityForSpace?(space: string): Promise<SpaceResourceAuthority | null>
   resourcePrefixForSpace?(space: string): string | null
   projectPublishedPackages?: ProjectPublishedRolePackages
-}): RoleLibraryComposition => {
+}): SeedableRoleLibraryComposition => {
   const projectNoteIds = async (
     location: RoleLocation,
     directoryNames: readonly string[],
@@ -600,6 +699,7 @@ export const createFsRoleLibrary = ({
     task: (
       context: { authority: SpaceResourceAuthority; resourcePath: string } | null,
     ) => Promise<T>,
+    options?: { allowDuringClosure?: boolean },
   ): Promise<T> => {
     const context = await authorityContext(location, name)
 
@@ -610,6 +710,7 @@ export const createFsRoleLibrary = ({
       `${context.resourcePath}/SKILL.md`,
       'exclusive',
       owner,
+      options,
     )
 
     try {
@@ -627,13 +728,14 @@ export const createFsRoleLibrary = ({
     task: (
       context: { authority: SpaceResourceAuthority; resourcePath: string } | null,
     ) => Promise<T>,
+    options?: { allowDuringClosure?: boolean },
   ): Promise<T> => {
     const context = await authorityContext(location, name)
 
     if (!context) {
       return task(null)
     }
-    const lease = await context.authority.admitPackage(context.resourcePath, mode, owner)
+    const lease = await context.authority.admitPackage(context.resourcePath, mode, owner, options)
 
     try {
       return await task(context)
@@ -646,31 +748,50 @@ export const createFsRoleLibrary = ({
     location: RoleLocation,
     directoryName: string,
     owner: string,
+    options?: { allowDuringClosure?: boolean },
   ): Promise<{ size: number; content: Uint8Array } | null> => {
     const packageDirectory = join(rootOf(location), directoryName)
 
-    return withPackageAdmission(location, directoryName, 'shared', owner, async (context) => {
-      if (context) {
-        const observation = await context.authority.observe(`${context.resourcePath}/SKILL.md`, {
-          owner: `${owner}-read`,
-          packagePath: context.resourcePath,
-          maxBytes: MAX_SKILL_FILE_BYTES,
-        })
+    return withPackageAdmission(
+      location,
+      directoryName,
+      'shared',
+      owner,
+      async (context) => {
+        if (context) {
+          const observation = await context.authority.observe(`${context.resourcePath}/SKILL.md`, {
+            owner: `${owner}-read`,
+            packagePath: context.resourcePath,
+            maxBytes: MAX_SKILL_FILE_BYTES,
+            ...options,
+          })
 
-        return observation.kind === 'present'
-          ? { size: observation.bytes.byteLength, content: observation.bytes }
-          : null
-      }
-      const size = await skillFileSize(packageDirectory)
+          return observation.kind === 'present'
+            ? { size: observation.bytes.byteLength, content: observation.bytes }
+            : null
+        }
+        const size = await skillFileSize(packageDirectory)
 
-      return size == null
-        ? null
-        : { size, content: await readManifestPrefix(join(packageDirectory, 'SKILL.md')) }
-    })
+        return size == null
+          ? null
+          : { size, content: await readManifestPrefix(join(packageDirectory, 'SKILL.md')) }
+      },
+      options,
+    )
   }
 
-  const manifestIndex = async (location: RoleLocation): Promise<Map<string, string>> => {
-    const index = new Map<string, string>()
+  type ManifestIndexEntry = {
+    /** Legacy name-global winner used by full-package authoring reads. */
+    first: string
+    /** Runtime identity is (kind, name), so exact activation needs both winners. */
+    byKind: Partial<Record<AbilityKind, string>>
+  }
+
+  const manifestIndex = async (
+    location: RoleLocation,
+    options?: { allowDuringClosure?: boolean },
+  ): Promise<Map<string, ManifestIndexEntry>> => {
+    const index = new Map<string, ManifestIndexEntry>()
     let directory
 
     try {
@@ -693,20 +814,34 @@ export const createFsRoleLibrary = ({
       }
 
       try {
-        const manifest = await manifestAt(location, entry.name, 'role-index-manifest')
+        const manifest = await manifestAt(location, entry.name, 'role-index-manifest', options)
 
         if (!manifest || manifest.size > MAX_SKILL_FILE_BYTES) {
           continue
         }
-        const name = parseSkillFile(Buffer.from(manifest.content).toString('utf8'), entry.name).name
-        const current = index.get(name)
+        const parsed = parseSkillFile(Buffer.from(manifest.content).toString('utf8'), entry.name)
 
-        // Invalid duplicate names cannot arise through the product channel, but
-        // external files are normal. Pick a stable winner until CRUD can report
-        // and repair the collision explicitly.
-        if (!current || entry.name.localeCompare(current) < 0) {
-          index.set(name, entry.name)
+        if (!isResolvableAbilityManifest(parsed)) {
+          throw new InvalidSkillPackageError(
+            `Agent Skill package cannot attach skills: ${entry.name}`,
+          )
         }
+        const kind = parsed.role ? ABILITY_KIND.role : ABILITY_KIND.skill
+        const indexed = index.get(parsed.name)
+        const byKind = indexed?.byKind ?? {}
+        const current = byKind[kind]
+
+        // Product writes reject duplicate names, but external files can still create
+        // them. Identity is (kind, name), so keep one stable package per kind rather
+        // than letting the smaller package of the other kind hide it.
+        if (!current || entry.name.localeCompare(current) < 0) {
+          byKind[kind] = entry.name
+        }
+        index.set(parsed.name, {
+          first:
+            !indexed || entry.name.localeCompare(indexed.first) < 0 ? entry.name : indexed.first,
+          byKind,
+        })
       } catch (err) {
         console.warn(`[roles] ignoring invalid package ${entry.name}:`, (err as Error).message)
       }
@@ -715,45 +850,60 @@ export const createFsRoleLibrary = ({
     return index
   }
 
+  const skillAtPhysical = async (
+    location: RoleLocation,
+    directoryName: string,
+  ): Promise<SkillPackage | null> => {
+    const path = join(rootOf(location), directoryName, 'SKILL.md')
+
+    try {
+      const info = await lstat(path)
+
+      if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_SKILL_FILE_BYTES) {
+        return null
+      }
+
+      return {
+        directoryName,
+        files: new Map([['SKILL.md', await readBoundedFile(path, MAX_SKILL_FILE_BYTES)]]),
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        return null
+      }
+      throw err
+    }
+  }
+
+  const skillAtAdmitted = async (
+    location: RoleLocation,
+    directoryName: string,
+    context: { authority: SpaceResourceAuthority; resourcePath: string } | null,
+  ): Promise<SkillPackage | null> => {
+    if (context) {
+      const observation = await context.authority.observeStrictAdmitted(
+        `${context.resourcePath}/SKILL.md`,
+        MAX_SKILL_FILE_BYTES,
+      )
+
+      return observation.kind === 'present'
+        ? {
+            directoryName,
+            files: new Map([['SKILL.md', observation.bytes]]),
+          }
+        : null
+    }
+
+    return skillAtPhysical(location, directoryName)
+  }
+
   const skillAt = async (
     location: RoleLocation,
     directoryName: string,
   ): Promise<SkillPackage | null> =>
-    withPackageAdmission(location, directoryName, 'shared', 'role-get-skill', async (context) => {
-      if (context) {
-        const observation = await context.authority.observe(`${context.resourcePath}/SKILL.md`, {
-          owner: 'role-get-skill-read',
-          packagePath: context.resourcePath,
-          maxBytes: MAX_SKILL_FILE_BYTES,
-        })
-
-        return observation.kind === 'present'
-          ? {
-              directoryName,
-              files: new Map([['SKILL.md', observation.bytes]]),
-            }
-          : null
-      }
-      const path = join(rootOf(location), directoryName, 'SKILL.md')
-
-      try {
-        const info = await lstat(path)
-
-        if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_SKILL_FILE_BYTES) {
-          return null
-        }
-
-        return {
-          directoryName,
-          files: new Map([['SKILL.md', await readBoundedFile(path, MAX_SKILL_FILE_BYTES)]]),
-        }
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-          return null
-        }
-        throw err
-      }
-    })
+    withPackageAdmission(location, directoryName, 'shared', 'role-get-skill', (context) =>
+      skillAtAdmitted(location, directoryName, context),
+    )
 
   /** One placement's writer, resolved once and then held. Resolving it prepares
    *  nothing — no root, no sweep, no staging — so a caller may settle every
@@ -898,7 +1048,16 @@ export const createFsRoleLibrary = ({
         }
       },
 
-      moveFrom: async (origin: RoleLocation, directoryName: string) => {
+      moveFrom: async (
+        origin: RoleLocation,
+        directoryName: string,
+        expected: {
+          kind: AbilityKind
+          registryNoteId: string
+          manifestNoteId: string
+        } | null,
+        finalize: (evidence: { manifestNoteId: string | null }) => Promise<void>,
+      ) => {
         const from = origin
         const to = location
 
@@ -916,16 +1075,6 @@ export const createFsRoleLibrary = ({
         if (source === target) {
           throw new Error('a package move needs two different placements')
         }
-        const manifest = await skillAt(from, directoryName)
-
-        if (!manifest) {
-          return false
-        }
-        const manifestName = parseSkillFile(
-          Buffer.from(manifest.files.get('SKILL.md')!).toString('utf8'),
-          directoryName,
-        ).name
-
         await prepareRoot(to, mount, root)
 
         // The destination's placement lease wraps the whole critical section, exactly as
@@ -935,13 +1084,6 @@ export const createFsRoleLibrary = ({
           const release = await acquirePlacementFence(root)
 
           try {
-            if (
-              (await manifestIndex(to)).has(manifestName) ||
-              (await pathOccupied(join(root, manifestName)))
-            ) {
-              return false
-            }
-
             // Both sides admitted, destination first. The order is fixed so two moves can
             // never hold each other's half.
             return await withPackageAdmission(
@@ -950,8 +1092,69 @@ export const createFsRoleLibrary = ({
               'exclusive',
               'role-move-target',
               () =>
-                withPackageAdmission(from, directoryName, 'exclusive', 'role-move-source', () =>
-                  directCommitting(() => publish(source, target)),
+                withPackageAdmission(
+                  from,
+                  directoryName,
+                  'exclusive',
+                  'role-move-source',
+                  async () => {
+                    // The source package is already exclusively admitted. Reading
+                    // through `authority.observe` would try to acquire a nested shared
+                    // package lease and deadlock behind our own exclusive one.
+                    const currentSource = await skillAtPhysical(from, directoryName)
+
+                    if (!currentSource) {
+                      return false
+                    }
+                    const currentManifest = currentSource.files.get('SKILL.md')!
+                    const currentSkill = parseSkillFile(
+                      Buffer.from(currentManifest).toString('utf8'),
+                      directoryName,
+                    )
+                    const owner = exactOwnerObservation(currentManifest)
+                    const registryNoteId = (await projectNoteIds(from, [directoryName], false)).get(
+                      directoryName,
+                    )
+
+                    if (
+                      expected &&
+                      ((currentSkill.role ? ABILITY_KIND.role : ABILITY_KIND.skill) !==
+                        expected.kind ||
+                        registryNoteId !== expected.registryNoteId ||
+                        owner.kind !== 'claimed' ||
+                        owner.id !== expected.manifestNoteId)
+                    ) {
+                      throw new AbilityUnavailableError('ability package changed before move')
+                    }
+                    if (
+                      (await manifestIndex(to)).has(currentSkill.name) ||
+                      (await pathOccupied(join(root, currentSkill.name)))
+                    ) {
+                      return false
+                    }
+                    const manifestNoteId = owner.kind === 'claimed' ? owner.id : null
+                    const published = await directCommitting(() => publish(source, target))
+
+                    if (!published) {
+                      return false
+                    }
+                    try {
+                      await finalize({ manifestNoteId })
+                      return true
+                    } catch (error) {
+                      let restored = false
+
+                      try {
+                        restored = await directCommitting(() => publish(target, source))
+                      } catch {
+                        throw rolePackageMoveRollbackError(error)
+                      }
+                      if (!restored) {
+                        throw rolePackageMoveRollbackError(error)
+                      }
+                      throw error
+                    }
+                  },
                 ),
             )
           } finally {
@@ -1020,18 +1223,100 @@ export const createFsRoleLibrary = ({
         truncated,
       }
     },
-    getSkill: async (location, name) => {
+    getAbilitiesNamed: async (location, name) => {
       if (!isSkillName(name)) {
-        return null
+        return new Map()
       }
 
-      const directoryName = (await manifestIndex(location)).get(name)
+      const indexed = (await manifestIndex(location)).get(name)
+      const found = new Map<AbilityKind, SkillPackage>()
 
-      return directoryName ? skillAt(location, directoryName) : null
+      for (const kind of [ABILITY_KIND.role, ABILITY_KIND.skill] as const) {
+        const directoryName = indexed?.byKind[kind]
+        const pkg = directoryName ? await skillAt(location, directoryName) : null
+        const manifest = pkg?.files.get('SKILL.md')
+
+        if (!pkg || !manifest) {
+          continue
+        }
+        try {
+          const parsed = parseSkillFile(Buffer.from(manifest).toString('utf8'), pkg.directoryName)
+
+          // The external manifest may change after the index pass. The producer owns
+          // the kind-keyed contract, so it must reject that torn read here rather than
+          // make every resolver rediscover which identity it actually received.
+          if (
+            parsed.name === name &&
+            parsed.role === (kind === ABILITY_KIND.role) &&
+            isResolvableAbilityManifest(parsed)
+          ) {
+            found.set(kind, pkg)
+          }
+        } catch (err) {
+          console.warn(
+            `[roles] ignoring invalid package ${pkg.directoryName}:`,
+            (err as Error).message,
+          )
+        }
+      }
+
+      return found
     },
     getSkillByDirectory: async (location, directoryName) =>
       isGeneratedNoteId(directoryName) ? skillAt(location, directoryName) : null,
-    exists: async (location, name) => {
+    withExactPackageRead: async (location, directoryName, task) => {
+      if (!isGeneratedNoteId(directoryName)) {
+        return task(async () => null)
+      }
+
+      return withPackageAdmission(
+        location,
+        directoryName,
+        'shared',
+        'role-exact-authority',
+        (context) =>
+          task(async () => {
+            const pkg = await skillAtAdmitted(location, directoryName, context)
+
+            if (!pkg) {
+              return null
+            }
+            const registryNoteId = (await projectNoteIds(location, [directoryName], false)).get(
+              directoryName,
+            )
+
+            return registryNoteId ? { pkg, registryNoteId } : null
+          }),
+      )
+    },
+    withExactPackageMutation: async (location, directoryName, task) => {
+      if (!isGeneratedNoteId(directoryName)) {
+        return task(async () => null)
+      }
+
+      return withPlacementAdmission(location, directoryName, 'role-exact-mutation-placement', () =>
+        withPackageAdmission(
+          location,
+          directoryName,
+          'shared',
+          'role-exact-mutation-package',
+          (context) =>
+            task(async () => {
+              const pkg = await skillAtAdmitted(location, directoryName, context)
+
+              if (!pkg) {
+                return null
+              }
+              const registryNoteId = (await projectNoteIds(location, [directoryName], false)).get(
+                directoryName,
+              )
+
+              return registryNoteId ? { pkg, registryNoteId } : null
+            }),
+        ),
+      )
+    },
+    exists: async (location, name, options) => {
       if (!isSkillName(name)) {
         return false
       }
@@ -1052,16 +1337,17 @@ export const createFsRoleLibrary = ({
             throw err
           }
         },
+        options,
       )
 
-      return occupiedDirectly || (await manifestIndex(location)).has(name)
+      return occupiedDirectly || (await manifestIndex(location, options)).has(name)
     },
     get: async (location, name) => {
       if (!isSkillName(name)) {
         return null
       }
 
-      const directoryName = (await manifestIndex(location)).get(name)
+      const directoryName = (await manifestIndex(location)).get(name)?.first
 
       if (!directoryName) {
         return null
@@ -1125,10 +1411,97 @@ export const createFsRoleLibrary = ({
     awaitReadableNoteIds: (location, directoryNames) =>
       projectNoteIds(location, directoryNames, true),
     readableNoteIds: (location, directoryNames) => projectNoteIds(location, directoryNames, false),
+    inspectAndRemove: async (location, directoryName, options) => {
+      let found = false
+
+      await options.remove(async (victimNoteIds) => {
+        const directory = join(rootOf(location), directoryName)
+
+        try {
+          const info = await lstat(directory)
+
+          if (!info.isDirectory() || info.isSymbolicLink()) {
+            throw new AbilityUnavailableError('ability package changed before delete')
+          }
+          const members = new Set<string>()
+          const files = await readPackageFiles(directory, {
+            recordSpecialEntries: true,
+            members,
+          })
+
+          if (!files.has('SKILL.md')) {
+            throw new AbilityUnavailableError('ability package changed before delete')
+          }
+          const pkg = { directoryName, files }
+
+          validateSkillPackage(pkg)
+          const parsed = parseSkillFile(
+            Buffer.from(files.get('SKILL.md')!).toString('utf8'),
+            directoryName,
+          )
+          const owner = exactOwnerObservation(files.get('SKILL.md')!)
+
+          if (
+            options.expected &&
+            ((parsed.role ? ABILITY_KIND.role : ABILITY_KIND.skill) !== options.expected.kind ||
+              !victimNoteIds?.includes(options.expected.registryNoteId) ||
+              owner.kind !== 'claimed' ||
+              owner.id !== options.expected.manifestNoteId)
+          ) {
+            throw new AbilityUnavailableError('ability package changed before delete')
+          }
+          await options.assertSafe(pkg, [...members])
+          found = true
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+            throw new AbilityUnavailableError('ability package changed before delete')
+          }
+          throw error
+        }
+      })
+
+      return found
+    },
+    manifestPath: (location, directoryName) => {
+      const root = resourcePackagePath(location, directoryName)
+      return root == null ? null : `${root}/SKILL.md`
+    },
+    withCreateAdmission: (location, directoryName, task, options) =>
+      withPlacementAdmission(
+        location,
+        directoryName,
+        'ability-create-placement',
+        () =>
+          withPackageAdmission(
+            location,
+            directoryName,
+            'exclusive',
+            'ability-create-package',
+            task,
+            options,
+          ),
+        options,
+      ),
   }
 
   return {
     library,
+    seedPackageFile: async (location, directoryName, relative, content) => {
+      const parts = relative.split('/')
+
+      if (
+        !isGeneratedNoteId(directoryName) ||
+        !relative ||
+        relative.includes('\\') ||
+        parts.some((part) => !part || part === '.' || part === '..')
+      ) {
+        throw new InvalidSkillPackageError(`invalid seeded package path: ${relative}`)
+      }
+      const target = join(rootOf(location), directoryName, ...parts)
+
+      await mkdir(dirname(target), { recursive: true })
+      await writeFile(target, content, { flag: 'wx' })
+    },
     publication: {
       // Pure, and deliberately so: a read model asks this for every target it
       // lists, so it may not mint a space, build an authority or touch a disk.
@@ -1176,22 +1549,45 @@ export const createInMemoryRoleLibrary = ({
     files: new Map([...pkg.files].map(([name, bytes]) => [name, Uint8Array.from(bytes)])),
   })
 
-  const manifestNameOf = (pkg: SkillPackage): string | null => {
+  const manifestIdentityOf = (pkg: SkillPackage): { name: string; kind: AbilityKind } | null => {
     const manifest = pkg.files.get('SKILL.md')
 
     if (!manifest) {
       return null
     }
     try {
-      return parseSkillFile(Buffer.from(manifest).toString('utf8'), pkg.directoryName).name
+      const parsed = parseSkillFile(Buffer.from(manifest).toString('utf8'), pkg.directoryName)
+
+      if (!isResolvableAbilityManifest(parsed)) {
+        return null
+      }
+
+      return {
+        name: parsed.name,
+        kind: parsed.role ? ABILITY_KIND.role : ABILITY_KIND.skill,
+      }
     } catch {
       return null
     }
   }
 
-  const packageByName = (location: RoleLocation, name: string): SkillPackage | null => {
+  const manifestNameOf = (pkg: SkillPackage): string | null => manifestIdentityOf(pkg)?.name ?? null
+
+  const packageByName = (
+    location: RoleLocation,
+    name: string,
+    kind?: AbilityKind,
+  ): SkillPackage | null => {
     const matches = [...packages]
-      .filter(([key, pkg]) => key.startsWith(prefixOf(location)) && manifestNameOf(pkg) === name)
+      .filter(([key, pkg]) => {
+        const identity = manifestIdentityOf(pkg)
+
+        return (
+          key.startsWith(prefixOf(location)) &&
+          identity?.name === name &&
+          (kind === undefined || identity.kind === kind)
+        )
+      })
       .sort(([, left], [, right]) => left.directoryName.localeCompare(right.directoryName))
 
     return matches[0]?.[1] ?? null
@@ -1218,6 +1614,12 @@ export const createInMemoryRoleLibrary = ({
     from: RoleLocation,
     to: RoleLocation,
     directoryName: string,
+    expected: {
+      kind: AbilityKind
+      registryNoteId: string
+      manifestNoteId: string
+    } | null,
+    finalize: (evidence: { manifestNoteId: string | null }) => Promise<void>,
   ): Promise<boolean> => {
     if (from.space !== to.space) {
       throw new Error('a package move cannot cross spaces')
@@ -1228,13 +1630,46 @@ export const createInMemoryRoleLibrary = ({
       return false
     }
     const name = manifestNameOf(pkg)
+    const manifest = pkg.files.get('SKILL.md')
+    const parsed = manifest
+      ? parseSkillFile(Buffer.from(manifest).toString('utf8'), directoryName)
+      : null
+    const owner = manifest ? exactOwnerObservation(manifest) : { kind: 'unproven' as const }
+
+    if (
+      expected &&
+      (!parsed ||
+        (parsed.role ? ABILITY_KIND.role : ABILITY_KIND.skill) !== expected.kind ||
+        directoryName !== expected.registryNoteId ||
+        owner.kind !== 'claimed' ||
+        owner.id !== expected.manifestNoteId)
+    ) {
+      throw new AbilityUnavailableError('ability package changed before move')
+    }
 
     if (packages.has(keyOf(to, directoryName)) || (name != null && packageByName(to, name))) {
       return false
     }
     packages.delete(keyOf(from, directoryName))
     packages.set(keyOf(to, directoryName), pkg)
-    return true
+    try {
+      await finalize({ manifestNoteId: owner.kind === 'claimed' ? owner.id : null })
+      return true
+    } catch (error) {
+      const targetKey = keyOf(to, directoryName)
+      const sourceKey = keyOf(from, directoryName)
+      const restored = packages.get(targetKey) === pkg && !packages.has(sourceKey)
+
+      if (restored) {
+        packages.delete(targetKey)
+        packages.set(sourceKey, pkg)
+      }
+
+      if (!restored) {
+        throw rolePackageMoveRollbackError(error)
+      }
+      throw error
+    }
   }
 
   const library = {
@@ -1247,20 +1682,22 @@ export const createInMemoryRoleLibrary = ({
         })),
       truncated: false,
     }),
-    getSkill: async (location, name) => {
-      const pkg = packageByName(location, name)
+    getAbilitiesNamed: async (location, name) => {
+      const found = new Map<AbilityKind, SkillPackage>()
 
-      if (!pkg) {
-        return null
-      }
-      const skill = pkg.files.get('SKILL.md')
+      for (const kind of [ABILITY_KIND.role, ABILITY_KIND.skill] as const) {
+        const pkg = packageByName(location, name, kind)
+        const skill = pkg?.files.get('SKILL.md')
 
-      return skill
-        ? {
+        if (pkg && skill) {
+          found.set(kind, {
             directoryName: pkg.directoryName,
             files: new Map([['SKILL.md', Uint8Array.from(skill)]]),
-          }
-        : null
+          })
+        }
+      }
+
+      return found
     },
     getSkillByDirectory: async (location, directoryName) => {
       const pkg = packages.get(keyOf(location, directoryName))
@@ -1273,6 +1710,18 @@ export const createInMemoryRoleLibrary = ({
           }
         : null
     },
+    withExactPackageRead: async (location, directoryName, task) =>
+      task(async () => {
+        const pkg = packages.get(keyOf(location, directoryName))
+
+        return pkg ? { pkg: clone(pkg), registryNoteId: directoryName } : null
+      }),
+    withExactPackageMutation: async (location, directoryName, task) =>
+      task(async () => {
+        const pkg = packages.get(keyOf(location, directoryName))
+
+        return pkg ? { pkg: clone(pkg), registryNoteId: directoryName } : null
+      }),
     // `exists` answers about a manifest NAME, and asks the grammar first exactly
     // where the shipped library asks it. Without that question an owned package
     // ADDRESS reads as an occupied name here and as a free one on disk — and the two
@@ -1299,6 +1748,46 @@ export const createInMemoryRoleLibrary = ({
       onBarrier?.(location, directoryNames)
       return noteIdsAt(location, directoryNames)
     },
+    inspectAndRemove: async (location, directoryName, options) => {
+      let found = false
+
+      await options.remove(async () => {
+        const pkg = packages.get(keyOf(location, directoryName))
+
+        if (!pkg) {
+          throw new AbilityUnavailableError('ability package changed before delete')
+        }
+        const manifest = pkg.files.get('SKILL.md')
+        const parsed = manifest
+          ? parseSkillFile(Buffer.from(manifest).toString('utf8'), directoryName)
+          : null
+        const owner = manifest ? exactOwnerObservation(manifest) : { kind: 'unproven' as const }
+
+        if (
+          options.expected &&
+          (!parsed ||
+            (parsed.role ? ABILITY_KIND.role : ABILITY_KIND.skill) !== options.expected.kind ||
+            directoryName !== options.expected.registryNoteId ||
+            owner.kind !== 'claimed' ||
+            owner.id !== options.expected.manifestNoteId)
+        ) {
+          throw new AbilityUnavailableError('ability package changed before delete')
+        }
+        await options.assertSafe(clone(pkg), [...pkg.files.keys()])
+        found = true
+      })
+
+      return found
+    },
+    manifestPath: (location, directoryName) => {
+      const root =
+        location.scope === 'project'
+          ? `.notarium/skills/_projects/${projectDirectory(location.projectId!)}/${directoryName}`
+          : `.notarium/skills/${directoryName}`
+
+      return `${root}/SKILL.md`
+    },
+    withCreateAdmission: async (_location, _directoryName, task) => task(),
     clear: () => packages.clear(),
   } satisfies RoleLibrary & { clear(): void }
 
@@ -1308,7 +1797,8 @@ export const createInMemoryRoleLibrary = ({
       availableFor: () => true,
       publicationFor: async (location) => ({
         putIfAbsent: (pkg) => putIfAbsent(location, pkg),
-        moveFrom: (origin, directoryName) => movePackage(origin, location, directoryName),
+        moveFrom: (origin, directoryName, expected, finalize) =>
+          movePackage(origin, location, directoryName, expected, finalize),
       }),
     },
   }

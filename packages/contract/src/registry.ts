@@ -1,5 +1,7 @@
 import { ErrorResponseSchema, OkResponseSchema } from './schemas/rest/_shared'
 import {
+  AbilitySaveRequestSchema,
+  AbilitySaveResponseSchema,
   AgentAbilityDetailResponseSchema,
   CreateAbilityVersionRequestSchema,
   CreateAbilityVersionResponseSchema,
@@ -260,6 +262,11 @@ export const contract = {
   agentAbilityHome: {
     request: SetAbilityHomeRequestSchema,
     response: SetAbilityHomeResponseSchema,
+  },
+  agentAbilitySave: {
+    request: AbilitySaveRequestSchema,
+    response: AbilitySaveResponseSchema,
+    conflict: ConflictResponseSchema,
   },
   agentRoleAdd: { request: AddAgentRoleRequestSchema, response: AddAgentRoleResponseSchema },
   agentRoleCreate: {

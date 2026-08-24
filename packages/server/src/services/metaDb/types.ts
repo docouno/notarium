@@ -4,15 +4,19 @@ import type {
   AgentSessionAttach,
   CausalOutboxPersistence,
   IdentityPersistence,
+  IdentityRecord,
   InstallationGenerationPersistence,
   OwnerProofPersistence,
   RestoreOperationPersistence,
   RestoreTerminalPersistence,
+  RevisionInput,
   RevisionKind,
   RevisionPersistence,
   RevisionUnavailableReason,
   SpaceLifecyclePersistence,
 } from '@notarium/core'
+
+import { defineClientFailure } from '../../libs/clientFailure'
 
 /** Derived space registry row; the `.notariummeta` marker is the source of truth.
  *  canon: docs/spaces.md#model · docs/architecture.md#p7 */
@@ -134,6 +138,11 @@ export type AbilityAvailabilityRegistryNote = string | null
 export type AbilityAvailabilityPersistence = {
   get(homeSpace: string, packageId: string): Promise<AbilityAvailabilityRecord | null>
   listForSpace(homeSpace: string): Promise<AbilityAvailabilityRecord[]>
+  /** Reserve a not-yet-published Space package's exact reach. Only this package id
+   * may finalize or cancel the NULL-identity row. */
+  reserve(homeSpace: string, packageId: string, availability: AbilityAvailability): Promise<boolean>
+  finalize(homeSpace: string, packageId: string, actualNoteId: string): Promise<boolean>
+  cancel(homeSpace: string, packageId: string): Promise<boolean>
   /** Whole-set replacement; selected project ids must belong to homeSpace. */
   set(
     homeSpace: string,
@@ -155,6 +164,131 @@ export type AbilityAvailabilityPersistence = {
   clear(homeSpace: string, packageId: string): Promise<void>
 }
 
+// ── durable custom-ability create ─────────────────────────────────────
+
+export const ABILITY_CREATE_PHASE = {
+  accepted: 'accepted',
+  physicalPublished: 'physical-published',
+  metadataCommitted: 'metadata-committed',
+  succeeded: 'succeeded',
+  rejected: 'rejected',
+  failedRecoverable: 'failed-recoverable',
+} as const
+
+export type AbilityCreatePhase = (typeof ABILITY_CREATE_PHASE)[keyof typeof ABILITY_CREATE_PHASE]
+
+export type AbilityCreateOperationRecord = {
+  id: string
+  actorDigest: string
+  idempotencyDigest: string | null
+  requestFingerprint: string
+  space: string
+  packageId: string
+  noteId: string
+  targetPath: string
+  availabilityRequired: boolean
+  stageBinding: string
+  phase: AbilityCreatePhase
+  preparedEvidence: string
+  physicalReceipt: string | null
+  terminalResult: string | null
+  failureCode: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export type AbilityCreateTerminalResult = {
+  packageId: string
+  noteId: string
+  versionToken: string
+  revisionId: string
+}
+
+export type AbilityCreateAccept = {
+  id: string
+  actorDigest: string
+  idempotencyDigest: string | null
+  requestFingerprint: string
+  space: string
+  packageId: string
+  noteId: string
+  targetPath: string
+  availabilityRequired: boolean
+  stageBinding: string
+  preparedEvidence: string
+  identity: IdentityRecord
+  availability: AbilityAvailability | null
+  createdAt: string
+}
+
+export type AbilityCreateCommit = {
+  operationId: string
+  preparedEvidence: string
+  physicalReceipt: string
+  identity: IdentityRecord
+  revision: RevisionInput & { contentHash: string; semanticFingerprint: string }
+  content: Uint8Array
+  ownerProof: {
+    sourceHash: string
+    proofJson: string
+    receiptId: string
+  }
+  result: Omit<AbilityCreateTerminalResult, 'revisionId'>
+  committedAt: string
+}
+
+export type AbilityCreatePersistence = {
+  findReplay(input: {
+    actorDigest: string
+    idempotencyDigest: string
+    requestFingerprint: string
+  }): Promise<
+    | { status: 'missing' }
+    | { status: 'replayed'; operation: AbilityCreateOperationRecord }
+    | { status: 'idempotency-conflict'; operation: AbilityCreateOperationRecord }
+  >
+  accept(
+    input: AbilityCreateAccept,
+  ): Promise<
+    | { status: 'accepted'; operation: AbilityCreateOperationRecord }
+    | { status: 'replayed'; operation: AbilityCreateOperationRecord }
+    | { status: 'idempotency-conflict'; operation: AbilityCreateOperationRecord }
+    | { status: 'identity-conflict' | 'path-conflict' | 'package-conflict' }
+  >
+  get(id: string): Promise<AbilityCreateOperationRecord | null>
+  listRecoverable(): Promise<AbilityCreateOperationRecord[]>
+  markPhysical(
+    id: string,
+    preparedEvidence: string,
+    physicalReceipt: string,
+    updatedAt: string,
+  ): Promise<AbilityCreateOperationRecord | null>
+  markRecoverable(
+    id: string,
+    failureCode: string,
+    updatedAt: string,
+  ): Promise<AbilityCreateOperationRecord | null>
+  reject(
+    id: string,
+    failureCode: string,
+    updatedAt: string,
+  ): Promise<AbilityCreateOperationRecord | null>
+  commit(input: AbilityCreateCommit): Promise<
+    | {
+        status: 'committed' | 'replayed'
+        operation: AbilityCreateOperationRecord
+        result: AbilityCreateTerminalResult
+      }
+    | { status: 'conflict'; operation: AbilityCreateOperationRecord | null }
+  >
+  finalize(
+    id: string,
+    preparedEvidence: string,
+    physicalReceipt: string,
+    updatedAt: string,
+  ): Promise<AbilityCreateOperationRecord | null>
+}
+
 // ── owned ability placement ──────────────────────────────────────────
 
 /** One promotion of an owned Role from its project version to the Space base,
@@ -167,6 +301,21 @@ export type OwnedRolePlacementMove = {
   toTargetId: string
   fromLocator: string
   toLocator: string
+  /** Stable identity projected for the package before its physical move. A locator is
+   * an address and can be reoccupied; the trail must bind the package that left it. */
+  registryNoteId: string
+  /** Exact owner claim read from the moved SKILL.md under source package admission.
+   * Claim arbitration may make it differ from `registryNoteId`; both are authority. */
+  manifestNoteId: string
+}
+
+/** One persisted forwarding row. Nullable identities are possible only for a row
+ * written before migration 0019. It is still RECORDED and retires the source spelling,
+ * but cannot prove a target identity and must fail closed. */
+export type OwnedRolePlacementTrail = {
+  toLocator: string
+  registryNoteId: string | null
+  manifestNoteId: string | null
 }
 
 /** Placement is part of an owned Role's ADDRESS: the context target encodes the
@@ -176,6 +325,9 @@ export type OwnedRolePlacementMove = {
  *  session binding pointing at an address that no longer exists — so this is one
  *  transaction, not five calls. OPTIONAL: a meta-DB-less host has none of it. */
 export type AbilityPlacementPersistence = {
+  /** Exact recorded authority for an address the package left. `null` means NO ROW;
+   * a returned row with invalid/legacy evidence still tombstones the source address. */
+  resolveMovedOwnedRoleLocator(fromLocator: string): Promise<OwnedRolePlacementTrail | null>
   moveOwnedRolePlacement(move: OwnedRolePlacementMove): Promise<void>
 }
 
@@ -198,7 +350,9 @@ export type AbilityPreferenceTarget =
 export const ABILITY_TARGET_PURGED = 'ABILITY_TARGET_PURGED'
 
 export const abilityTargetPurgedError = (message: string): Error =>
-  Object.assign(new Error(message), { code: ABILITY_TARGET_PURGED })
+  defineClientFailure(Object.assign(new Error(message), { code: ABILITY_TARGET_PURGED }), {
+    kind: 'not-found',
+  })
 
 export const isAbilityTargetPurgedError = (error: unknown): boolean =>
   (error as { code?: unknown } | null)?.code === ABILITY_TARGET_PURGED
@@ -669,6 +823,8 @@ export type AgentSessionRecord = {
   roleLocator: ActiveRoleLocator | null
   /** Project context in which selection was resolved, independent of placement. */
   roleContextProjectId: string | null
+  /** Sticky project hint for by-name ability resolution in this work episode. */
+  projectId: string | null
 }
 
 export type AgentSessionRoleSelection = {
@@ -689,28 +845,56 @@ export type AgentSessionNamedStart =
   | { kind: 'ambiguous'; matches: AgentSessionRecord[] }
   | { kind: 'new' | 'resumed' | 'forked'; record: AgentSessionRecord }
 
+/** Atomic outcome of an unaddressed start. A zero/ambiguous active world creates one
+ * root; exactly one active episode resumes it. Ambiguity carries the choices observed
+ * before the new root was inserted. */
+export type AgentSessionInferredStart = {
+  kind: 'new' | 'resumed'
+  record: AgentSessionRecord
+  recentSessions?: AgentSessionRecord[]
+}
+
 /** Durable storage for agent work sessions. Policy (2h active / 30d retention,
  * resume vs fork) lives in the transport-independent agentSessions service.
- * `inferActiveAndTouch` and `startNamed` are deliberately atomic: their
+ * `inferActiveAndTouch`, `startInferred` and `startNamed` are deliberately atomic: their
  * observe-and-update decisions must remain one linearizable operation. */
 export type AgentSessionsPersistence = {
   insert(session: AgentSessionRecord): Promise<void>
+  /** Read one retained owner episode without touching activity or calls. */
+  getRetained(owner: string, id: string, retainedSince: string): Promise<AgentSessionRecord | null>
+  /** Read matching retained names without touching them; used only by start preflight. */
+  listNamed(
+    owner: string,
+    name: string,
+    retainedSince: string,
+    limit: number,
+  ): Promise<AgentSessionRecord[]>
   touch(
     owner: string,
     id: string,
     lastSeenAt: string,
     retainedSince: string,
+    projectId?: string,
   ): Promise<AgentSessionRecord | null>
   inferActiveAndTouch(
     owner: string,
     activeSince: string,
     lastSeenAt: string,
+    projectId?: string,
   ): Promise<AgentSessionRecord | null>
+  startInferred(
+    candidate: AgentSessionRecord,
+    activeSince: string,
+    recentSince: string,
+    limit: number,
+    projectId?: string,
+  ): Promise<AgentSessionInferredStart>
   startNamed(
     candidate: AgentSessionRecord,
     activeSince: string,
     retainedSince: string,
     limit: number,
+    projectId?: string,
   ): Promise<AgentSessionNamedStart>
   listRecent(owner: string, since: string, limit: number): Promise<AgentSessionRecord[]>
   /** Set the active role atomically; `changed=false` is the idempotent repeat. */
@@ -1303,6 +1487,7 @@ export type MetaDb = {
   scopePins: ScopePinsPersistence
   contextOrder: ContextOrderPersistence
   abilityAvailability: AbilityAvailabilityPersistence
+  abilityCreate: AbilityCreatePersistence
   abilityPreferences: AbilityPreferencesPersistence
   abilityPlacement: AbilityPlacementPersistence
   oauth: OAuthPersistence

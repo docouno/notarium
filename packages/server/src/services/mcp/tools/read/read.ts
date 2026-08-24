@@ -32,6 +32,7 @@ import { safeRelAddress } from '../../../../libs/relPath'
 import { type ProjectRecord } from '../../../metaDb'
 import { type SpaceStore } from '../../../spaces'
 import { type Handler, ToolFailure } from '../../gateway'
+import { openMcpNoteDoor } from '../../helpers/noteDoor'
 import { handleOf, notePath, projectLabelForNote } from '../../helpers/projectAddressing'
 import { projectProvenance } from '../../helpers/provenance'
 import {
@@ -148,14 +149,14 @@ export const handleSearch: Handler = async (ctx, rawArgs) => {
 export const handleGetNote: Handler = async (ctx, rawArgs) => {
   const { ref, responseFormat } = rawArgs as GetNoteInput
   // Unknown id, foreign space and tombstone all collapse to one 404 (anti-enum).
-  const hit = await ctx.store.noteStore(ctx.principal, ref, 'note:read')
+  const hit = await openMcpNoteDoor(ctx, ref, 'note:read')
 
   if (!hit) {
     throw new ToolFailure('no such note, or you do not have access to it')
   }
-  const note = await hit.store.read(ref)
+  const note = hit.note
   const personal = await ctx.personalSpace()
-  const noteId = note.id ?? ref
+  const noteId = hit.noteId
   // Provenance keyed by the RESOLVED id (a wiki-ref is not the journal key); absent on a non-journalling host.
   // canon: docs/note-history.md#model
   const provenance = await projectProvenance(hit.store, noteId)

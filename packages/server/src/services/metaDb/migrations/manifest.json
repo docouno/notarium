@@ -95,7 +95,7 @@
     {
       "version": 13,
       "name": "agent_session_role_identity",
-      "checksum": "sha256:d2917a0459b36aac0e8fd4317eb34591f82d11ac8de2193f66688237832a8b5a",
+      "checksum": "sha256:51e7f0001c1a1ba530a35865c852bf4a535dce43c7a5abe2b4f1335dc82c5c17",
       "sqlite": "sqlite/0013_agent_session_role_identity.sql",
       "postgres": "postgres/0013_agent_session_role_identity.sql"
     },
@@ -119,6 +119,34 @@
       "checksum": "sha256:067b1558e50f3a378e8615f0485e332afc36f4817048191235e41583ea12d6f2",
       "sqlite": "sqlite/0016_ability_placement_trail.sql",
       "postgres": "postgres/0016_ability_placement_trail.sql"
+    },
+    {
+      "version": 17,
+      "name": "ability_create_operations",
+      "checksum": "sha256:45244473599445272a9e417d505ced6b91ab0340ea988eb5958fe05eb2a86ff6",
+      "sqlite": "sqlite/0017_ability_create_operations.sql",
+      "postgres": "postgres/0017_ability_create_operations.sql"
+    },
+    {
+      "version": 18,
+      "name": "causal_operation_lifecycle",
+      "checksum": "sha256:8cf90a602c6d4cc6f30d42967ec8ddb157ad77f7975fa9024c50d45a9dc55e3c",
+      "sqlite": "sqlite/0018_causal_operation_lifecycle.sql",
+      "postgres": "postgres/0018_causal_operation_lifecycle.sql"
+    },
+    {
+      "version": 19,
+      "name": "ability_placement_identity",
+      "checksum": "sha256:d719dce2438115db61571e0a34f0e29770778ccfd85148ddf923bd7283a8bec8",
+      "sqlite": "sqlite/0019_ability_placement_identity.sql",
+      "postgres": "postgres/0019_ability_placement_identity.sql"
+    },
+    {
+      "version": 20,
+      "name": "ability_create_success_replay",
+      "checksum": "sha256:bd746f69eae0c0fe4777f493711711c7503554f7b78cdf29c9aabd3ff1f9f119",
+      "sqlite": "sqlite/0020_ability_create_success_replay.sql",
+      "postgres": "postgres/0020_ability_create_success_replay.sql"
     }
   ]
 }

@@ -72,6 +72,33 @@ const makeInner = (canWatch: boolean) => {
 }
 
 describe('CachedStore external-change watcher (#146)', () => {
+  it('keeps explicit and watcher reconciliation behind one causal publication', async () => {
+    const h = makeInner(true)
+    const cs = new CachedStore({ inner: h.inner, space: 't', pollIntervalMs: 0 })
+    await cs.start()
+    const release = await cs.beginCausalPublication()
+    const before = h.changesCalls
+    const explicit = cs.reconcile()
+
+    h.trigger()
+    await sleep(75)
+    expect(h.changesCalls).toBe(before)
+    release()
+    await explicit
+    await waitFor(() => h.changesCalls > before)
+    cs.stop()
+  })
+
+  it('drops a process-local causal lease during stop so durable recovery can restart', async () => {
+    const h = makeInner(false)
+    const cs = new CachedStore({ inner: h.inner, space: 't', pollIntervalMs: 0 })
+    await cs.start()
+    await cs.beginCausalPublication()
+
+    cs.stop()
+    await expect(cs.settle()).resolves.toBeUndefined()
+  })
+
   it('engages the watcher, reconciles early on a signal, and reports the backstop', async () => {
     const h = makeInner(true)
     // A huge poll interval: any reconcile within the test window can ONLY have

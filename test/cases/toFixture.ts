@@ -605,27 +605,40 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
   const now = Date.parse(world.now)
   const agentSessions: AgentSessionRecord[] | undefined = world.agentSessions
     ?.filter((session) => session.retained !== false)
-    .map((session) => ({
-      id: agentSessionId(session.ref),
-      owner: session.owner ?? defaultOwner,
-      name: session.name,
-      named: session.named ?? true,
-      parentId:
-        session.parentRef &&
-        world.agentSessions?.find((candidate) => candidate.ref === session.parentRef)?.retained !==
-          false
-          ? agentSessionId(session.parentRef)
-          : null,
-      createdAt: new Date(now - session.createdDaysAgo * 86_400_000).toISOString(),
-      lastSeenAt: new Date(now - session.lastSeenDaysAgo * 86_400_000).toISOString(),
-      calls: session.calls,
-      role: session.role ?? null,
-      // A package id is minted when the package is published, which happens in the
-      // applier rather than in this projection. The applier resolves the exact locator
-      // from `role` once the packages exist, the way the real seeder does.
-      roleLocator: null,
-      roleContextProjectId: null,
-    }))
+    .map((session) => {
+      const project = session.project
+        ? projects?.find(
+            (candidate) =>
+              candidate.space === session.project!.space &&
+              candidate.path === session.project!.path,
+          )
+        : undefined
+      const lastSegment = project?.path.replace(/\/+$/, '').split('/').pop()
+      const projectSlug = project ? project.slug || lastSegment || project.space : undefined
+
+      return {
+        id: agentSessionId(session.ref),
+        owner: session.owner ?? defaultOwner,
+        name: session.name,
+        named: session.named ?? true,
+        parentId:
+          session.parentRef &&
+          world.agentSessions?.find((candidate) => candidate.ref === session.parentRef)
+            ?.retained !== false
+            ? agentSessionId(session.parentRef)
+            : null,
+        createdAt: new Date(now - session.createdDaysAgo * 86_400_000).toISOString(),
+        lastSeenAt: new Date(now - session.lastSeenDaysAgo * 86_400_000).toISOString(),
+        calls: session.calls,
+        role: session.role ?? null,
+        // A package id is minted when the package is published, which happens in the
+        // applier rather than in this projection. The applier resolves the exact locator
+        // from `role` once the packages exist, the way the real seeder does.
+        roleLocator: null,
+        roleContextProjectId: null,
+        projectId: project && projectSlug ? `proj-${project.space}-${projectSlug}` : null,
+      }
+    })
 
   return {
     now: world.now,

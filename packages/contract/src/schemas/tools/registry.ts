@@ -1,4 +1,16 @@
 import {
+  CreateAbilityInputSchema,
+  CreateAbilityOutputSchema,
+  DeleteAbilityInputSchema,
+  DeleteAbilityOutputSchema,
+  EditAbilityInputSchema,
+  EditAbilityOutputSchema,
+  GetAbilityInputSchema,
+  GetAbilityOutputSchema,
+  ListAbilitiesInputSchema,
+  ListAbilitiesOutputSchema,
+} from './abilities'
+import {
   GetMyProjectsInputSchema,
   GetMyProjectsOutputSchema,
   StartSessionInputSchema,
@@ -35,10 +47,10 @@ import {
   RenameProjectOutputSchema,
 } from './reorg'
 import {
-  ListRolesInputSchema,
-  ListRolesOutputSchema,
   UseRoleInputSchema,
   UseRoleOutputSchema,
+  UseSkillInputSchema,
+  UseSkillOutputSchema,
 } from './roles'
 import {
   CreateNoteInputSchema,
@@ -58,8 +70,13 @@ import {
  *  canon: docs/contract.md#registry */
 export const tools = {
   start_session: { input: StartSessionInputSchema, output: StartSessionOutputSchema },
-  list_roles: { input: ListRolesInputSchema, output: ListRolesOutputSchema },
+  list_abilities: { input: ListAbilitiesInputSchema, output: ListAbilitiesOutputSchema },
+  get_ability: { input: GetAbilityInputSchema, output: GetAbilityOutputSchema },
+  create_ability: { input: CreateAbilityInputSchema, output: CreateAbilityOutputSchema },
+  edit_ability: { input: EditAbilityInputSchema, output: EditAbilityOutputSchema },
+  delete_ability: { input: DeleteAbilityInputSchema, output: DeleteAbilityOutputSchema },
   use_role: { input: UseRoleInputSchema, output: UseRoleOutputSchema },
+  use_skill: { input: UseSkillInputSchema, output: UseSkillOutputSchema },
   whoami: { input: WhoamiInputSchema, output: WhoamiOutputSchema },
   get_my_projects: { input: GetMyProjectsInputSchema, output: GetMyProjectsOutputSchema },
   list_notes: { input: ListNotesInputSchema, output: ListNotesOutputSchema },
@@ -96,8 +113,13 @@ export const toolNames = Object.keys(tools) as ToolName[]
  *  canon: docs/architecture.md#p14 */
 export const toolActions = {
   start_session: 'space:read',
-  list_roles: 'space:read',
+  list_abilities: 'space:read',
+  get_ability: 'space:write',
+  create_ability: 'space:write',
+  edit_ability: 'space:write',
+  delete_ability: 'space:write',
   use_role: 'space:read',
+  use_skill: 'space:read',
   whoami: 'self:read',
   get_my_projects: 'spaces:list',
   list_notes: 'space:read',

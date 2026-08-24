@@ -158,6 +158,8 @@ export type AgentSessionDecl = {
   retained?: boolean
   /** Explicitly selected effective role; absent means the base mode. */
   role?: string
+  /** Sticky project hint stored on the episode. */
+  project?: { space: string; path: string }
 }
 
 /** One Owned fork from the read-only Catalog role inventory. The declaration
@@ -217,6 +219,13 @@ type AgentSkillStateDecl = {
   linkedRole?: string
   /** Delete the package only after every requested link/mutation was applied. */
   deleted?: boolean
+  /** Extra package members for seed-only recovery/deletion states. No product
+   * authoring surface exposes this channel. */
+  packageFiles?: Array<{ path: string; content: string }>
+  /** Create this Custom package through the agent-attributed production producer. */
+  agentAudit?: AgentWriteAuditDecl & { principal: string }
+  /** Legacy loose pins intentionally pointing at the package root. */
+  pins?: ContextSetAttachDecl[]
 }
 
 /** One user-authored Agent Skill package. The applier mints its package id before

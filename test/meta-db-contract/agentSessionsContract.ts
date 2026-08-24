@@ -27,6 +27,7 @@ const row = (
   role: null,
   roleLocator: null,
   roleContextProjectId: null,
+  projectId: null,
   ...over,
 })
 
@@ -124,6 +125,28 @@ export const describeAgentSessionsContract = (
       ).resolves.toBeNull()
     })
 
+    it('reads retained ids and names without touching their activity', async () => {
+      const original = row('ses_aaaaaaaaaaaa', 'alice', '2026-08-04T10:00:00.000Z', {
+        name: 'same',
+        calls: 7,
+        projectId: 'project-a',
+      })
+      await persistence.insert(original)
+
+      await expect(
+        persistence.getRetained('alice', original.id, '2026-08-01T00:00:00.000Z'),
+      ).resolves.toEqual(original)
+      await expect(
+        persistence.getRetained('bob', original.id, '2026-08-01T00:00:00.000Z'),
+      ).resolves.toBeNull()
+      await expect(
+        persistence.listNamed('alice', 'same', '2026-08-01T00:00:00.000Z', 2),
+      ).resolves.toEqual([original])
+      await expect(
+        persistence.getRetained('alice', original.id, '2026-08-04T10:00:00.001Z'),
+      ).resolves.toBeNull()
+    })
+
     it('sets a role atomically and reports idempotent repeats', async () => {
       await persistence.insert(row('ses_aaaaaaaaaaaa', 'alice', '2026-08-04T10:00:00.000Z'))
       const role = {
@@ -144,11 +167,42 @@ export const describeAgentSessionsContract = (
           role: 'grooming',
           roleLocator: role.locator,
           roleContextProjectId: null,
+          projectId: null,
         }),
       })
       await expect(persistence.setRole('alice', 'ses_aaaaaaaaaaaa', role)).resolves.toEqual({
         changed: false,
         record: expect.objectContaining({ roleLocator: role.locator }),
+      })
+    })
+
+    it('sets a sticky project through a start touch owner-safely without changing the role', async () => {
+      await persistence.insert(
+        row('ses_aaaaaaaaaaaa', 'alice', '2026-08-04T10:00:00.000Z', {
+          role: 'grooming',
+        }),
+      )
+
+      await expect(
+        persistence.touch(
+          'bob',
+          'ses_aaaaaaaaaaaa',
+          '2026-08-04T11:00:00.000Z',
+          '2026-07-01T00:00:00.000Z',
+          'project-b',
+        ),
+      ).resolves.toBeNull()
+      await expect(
+        persistence.touch(
+          'alice',
+          'ses_aaaaaaaaaaaa',
+          '2026-08-04T11:00:00.000Z',
+          '2026-07-01T00:00:00.000Z',
+          'project-a',
+        ),
+      ).resolves.toMatchObject({
+        role: 'grooming',
+        projectId: 'project-a',
       })
     })
 
@@ -182,7 +236,10 @@ export const describeAgentSessionsContract = (
 
     it('serializes concurrent starts of one sleeping named session into resume then fork', async () => {
       await persistence.insert(
-        row('ses_aaaaaaaaaaaa', 'alice', '2026-08-04T06:00:00.000Z', { name: 'same' }),
+        row('ses_aaaaaaaaaaaa', 'alice', '2026-08-04T06:00:00.000Z', {
+          name: 'same',
+          projectId: 'project-a',
+        }),
       )
 
       const results = await Promise.all([
@@ -202,7 +259,9 @@ export const describeAgentSessionsContract = (
 
       expect(results.map(({ kind }) => kind).sort()).toEqual(['forked', 'resumed'])
       const forked = results.find((result) => result.kind === 'forked')
-      expect(forked).toMatchObject({ record: { parentId: 'ses_aaaaaaaaaaaa', calls: 1 } })
+      expect(forked).toMatchObject({
+        record: { parentId: 'ses_aaaaaaaaaaaa', calls: 1, projectId: 'project-a' },
+      })
       expect(await persistence.listRecent('alice', '2026-07-05T00:00:00.000Z', 10)).toEqual(
         expect.arrayContaining([
           expect.objectContaining({ id: 'ses_aaaaaaaaaaaa', calls: 2 }),
@@ -235,6 +294,38 @@ export const describeAgentSessionsContract = (
         throw new Error('missing new root outcome')
       }
       expect(forked).toMatchObject({ record: { parentId: root.record.id } })
+    })
+
+    it('serializes concurrent unaddressed first starts into one root and one resume', async () => {
+      const results = await Promise.all([
+        persistence.startInferred(
+          row('ses_aaaaaaaaaaaa', 'alice', '2026-08-04T12:00:00.000Z', {
+            name: 'personal · now',
+            named: false,
+          }),
+          '2026-08-04T10:00:00.000Z',
+          '2026-07-28T12:00:00.000Z',
+          10,
+        ),
+        persistence.startInferred(
+          row('ses_bbbbbbbbbbbb', 'alice', '2026-08-04T12:00:00.000Z', {
+            name: 'personal · now',
+            named: false,
+          }),
+          '2026-08-04T10:00:00.000Z',
+          '2026-07-28T12:00:00.000Z',
+          10,
+        ),
+      ])
+
+      expect(results.map(({ kind }) => kind).sort()).toEqual(['new', 'resumed'])
+      const created = results.find(({ kind }) => kind === 'new')
+      const resumed = results.find(({ kind }) => kind === 'resumed')
+
+      expect(resumed?.record.id).toBe(created?.record.id)
+      expect(await persistence.listRecent('alice', '2026-07-28T12:00:00.000Z', 10)).toEqual([
+        expect.objectContaining({ id: created?.record.id, calls: 2, parentId: null }),
+      ])
     })
 
     it('prunes strictly before the boundary and nulls a surviving child parent', async () => {

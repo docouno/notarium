@@ -4,7 +4,7 @@ import type { CaseSpec } from '../types'
 export const agentSessions: CaseSpec = {
   name: 'agent-sessions',
   description:
-    'Durable MCP episodes and independent project delta positions: active fork siblings, owner fallback, a second owner, sleeping and automatic sessions, hostile/long labels, and an expired row.',
+    'Durable MCP episodes, sticky project hints, and independent project delta positions: active fork siblings, owner fallback, a second owner, sleeping and automatic sessions, hostile/long labels, and an expired row.',
   axes: ['agent-sessions', 'agent-audit', 'auth', 'history'],
   build: ({ now }) => {
     const b = new WorldBuilder(now)
@@ -69,6 +69,7 @@ export const agentSessions: CaseSpec = {
       ref: 'automatic',
       name: 'main · automatic seed',
       named: false,
+      project: { space: 'main', path: '' },
       createdDaysAgo: 1,
       lastSeenDaysAgo: 0.5,
       calls: 5,

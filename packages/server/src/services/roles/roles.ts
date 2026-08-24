@@ -7,15 +7,20 @@ import {
   type AbilityAttachmentHealth,
   type AbilityAttachmentState,
   type AbilityHealth,
+  type AbilityKind,
   type AgentAbilitySummary,
   type AuthoredAttachment,
   type CatalogAbilityLocator,
   type OwnedAbilityLocator,
+  ROLE_ATTACHMENT_STATE,
   type SystemAbilityLocator,
 } from '@notarium/contract'
 import {
+  encodeAbilityLocator,
+  exactOwnerObservation,
   freshNoteId,
   frontmatterScalar,
+  parseAbilityLocator,
   serializeAbilityLocator,
   serializeSkillLocator,
   type SkillLink,
@@ -39,12 +44,15 @@ import {
   RoleDependencyConflictError,
   RoleInstallUnavailableError,
   SkillAlreadyExistsError,
+  SkillTooLargeForActivationError,
 } from './errors'
 import {
   InvalidSkillPackageError,
+  isRolePackageMoveRollbackError,
   type RoleLibrary,
   type RolePackagePublication,
   type RolePackagePublicationPolicy,
+  type RolePackageReader,
   type SkillPackage,
   validateSkillPackage,
 } from './library'
@@ -52,6 +60,7 @@ import {
   authoredSkillFile,
   bundledAbilityIdentityOf,
   hasCatalogProvenance,
+  isResolvableAbilityManifest,
   packageRevision,
   parseSkillFile,
   unwritableSkillLinks,
@@ -60,15 +69,23 @@ import {
   withSkillLinks,
 } from './skillFile'
 import {
+  type AbilityDetail,
+  type AbilityLoadOutcome,
+  type AbilityRemediation,
+  type AbilityResolutionCandidate,
   type ActiveRoleLocator,
   type AddressedPlacement,
   type AddressedProjectPlacement,
   type AddressedRoleStatus,
   type EffectiveRoleContext,
   type EffectiveRoleSummary,
+  type LoadedEffectiveRole,
+  type LoadedEffectiveSkill,
   type LoadedRole,
   type LoadedSkill,
   type OwnedAbilityInventoryEntry,
+  type OwnedAbilitySnapshot,
+  type OwnedAbilityTarget,
   type PublishedRoleInventoryEntry,
   type PublishedSkillInventoryEntry,
   type ResolvedEffectiveRole,
@@ -83,6 +100,11 @@ import {
 } from './types'
 
 type ParsedPackage = { pkg: SkillPackage; skill: ReturnType<typeof parseSkillFile> }
+
+const clonePackage = (pkg: SkillPackage): SkillPackage => ({
+  directoryName: pkg.directoryName,
+  files: new Map([...pkg.files].map(([path, bytes]) => [path, Uint8Array.from(bytes)])),
+})
 
 const availabilityStateOf = (
   availability: AbilityAvailability | null | undefined,
@@ -202,10 +224,15 @@ const parsePackage = (pkg: SkillPackage): ParsedPackage => {
     throw new Error(`${pkg.directoryName}/SKILL.md is missing`)
   }
 
-  return {
-    pkg,
-    skill: parseSkillFile(Buffer.from(file).toString('utf8'), pkg.directoryName),
+  const skill = parseSkillFile(Buffer.from(file).toString('utf8'), pkg.directoryName)
+
+  if (!isResolvableAbilityManifest(skill)) {
+    throw new InvalidSkillPackageError(
+      `Agent Skill package cannot attach skills: ${pkg.directoryName}`,
+    )
   }
+
+  return { pkg, skill }
 }
 
 const forkCatalogPackage = (
@@ -278,9 +305,8 @@ const customPackage = (
 const blocksAttachmentWrite = (health: AbilityAttachmentHealth | undefined): boolean =>
   health !== ABILITY_ATTACHMENT_HEALTH.healthy && health !== ABILITY_ATTACHMENT_HEALTH.disabled
 
-/** What a package says about itself, with no placement in it. Split out because a
- *  System role has these facts and no scope at all. */
-const roleFactsOf = (parsed: ParsedPackage): Omit<RoleSummary, 'scope'> => {
+/** What a role or skill package says about itself, with no placement in it. */
+const abilityFactsOf = (parsed: ParsedPackage): Omit<RoleSummary, 'scope'> => {
   const origin = parsed.skill.metadata['notarium.origin']
   const originRevision = parsed.skill.metadata['notarium.originRevision']
   // Provenance is a paired, narrow declaration. Arbitrary writable metadata
@@ -303,7 +329,7 @@ const summaryOf = <S extends RoleSummary['scope']>(
   scope: S,
 ): Omit<RoleSummary, 'scope'> & { scope: S } => {
   return {
-    ...roleFactsOf(parsed),
+    ...abilityFactsOf(parsed),
     scope,
   }
 }
@@ -384,65 +410,32 @@ const homeOf = (
   ) as SkillHomeLocation & AddressedPlacement
 
 const tokenChars = (tokens: number): number => Math.max(0, tokens) * 4
-const ROLE_BUNDLE_OVERHEAD_CHARS = 96
-const SKILL_BUNDLE_OVERHEAD_CHARS = 64
+const instructionTokens = (instructions: string): number => Math.ceil(instructions.length / 4)
 
-const loadParsedSkill = (
-  parsed: ParsedPackage,
-  scope: RoleSummary['scope'],
-  budgetTokens: number,
-): LoadedSkill => {
-  let remaining = tokenChars(budgetTokens)
-  let truncated = false
-
-  const take = (text: string): string => {
-    if (text.length <= remaining) {
-      remaining -= text.length
-      return text
-    }
-    truncated = true
-    const slice = text.slice(0, Math.max(0, remaining)).trimEnd()
-    remaining = 0
-    return slice
-  }
+const loadParsedSkill = (parsed: ParsedPackage, scope: RoleSummary['scope']): LoadedSkill => {
   const summary = summaryOf(parsed, scope)
-  const fixed = SKILL_BUNDLE_OVERHEAD_CHARS + summary.name.length + summary.scope.length
-
-  if (fixed > remaining) {
-    truncated = true
-    remaining = 0
-  } else {
-    remaining -= fixed
-  }
 
   return {
     skill: {
       ...summary,
-      description: take(summary.description),
-      instructions: take(parsed.skill.instructions),
+      instructions: parsed.skill.instructions,
     },
-    truncated,
+    truncated: false,
   }
 }
 
 const loadParsedRole = async (
   parsed: ParsedPackage,
   scope: RoleSummary['scope'],
-  dependency: (link: SkillLink) => Promise<ParsedPackage | undefined>,
+  dependency: (
+    link: SkillLink,
+    index: number,
+  ) => Promise<ParsedPackage | undefined> | ParsedPackage | undefined,
   budgetTokens: number,
-): Promise<LoadedRole> => {
+  failOnChangedDependency = false,
+): Promise<LoadedRole | null> => {
   let remaining = tokenChars(budgetTokens)
   let truncated = false
-
-  const charge = (characters: number): boolean => {
-    if (characters > remaining) {
-      truncated = true
-      remaining = 0
-      return false
-    }
-    remaining -= characters
-    return true
-  }
 
   const take = (text: string): string => {
     if (text.length <= remaining) {
@@ -455,44 +448,41 @@ const loadParsedRole = async (
     return slice
   }
   const summary = summaryOf(parsed, scope)
-  charge(
-    ROLE_BUNDLE_OVERHEAD_CHARS +
-      summary.name.length +
-      summary.scope.length +
-      (summary.origin?.length ?? 0) +
-      (summary.originRevision?.length ?? 0),
-  )
-  const description = take(summary.description)
   const roleInstructions = take(parsed.skill.instructions)
   const skills: LoadedRole['skills'] = []
+  let omitRemaining = false
 
-  for (const link of parsed.skill.linkedSkills) {
-    const label = link.kind === 'name' ? link.name : link.kind === 'locator' ? link.label : link.raw
-
-    if (remaining <= SKILL_BUNDLE_OVERHEAD_CHARS + label.length) {
-      truncated = true
-      break
-    }
-    const linked = (await dependency(link))?.skill
+  for (const [index, link] of parsed.skill.linkedSkills.entries()) {
+    const linked = (await dependency(link, index))?.skill
 
     if (!linked || linked.role) {
+      if (failOnChangedDependency) {
+        return null
+      }
       continue
     }
-    if (!charge(SKILL_BUNDLE_OVERHEAD_CHARS + linked.name.length) || !remaining) {
-      truncated = true
-      break
-    }
-    const linkedDescription = take(linked.description)
-    skills.push({
+    const facts = {
       name: linked.name,
       title: linked.title,
-      description: linkedDescription,
-      instructions: take(linked.instructions),
+      description: linked.description,
+    }
+
+    if (omitRemaining || linked.instructions.length > remaining) {
+      omitRemaining = true
+      skills.push({ ...facts, state: ROLE_ATTACHMENT_STATE.omittedByBudget })
+      continue
+    }
+
+    remaining -= linked.instructions.length
+    skills.push({
+      ...facts,
+      state: ROLE_ATTACHMENT_STATE.loaded,
+      instructions: linked.instructions,
     })
   }
 
   return {
-    role: { ...summary, description, instructions: roleInstructions },
+    role: { ...summary, instructions: roleInstructions },
     skills,
     truncated,
   }
@@ -520,6 +510,7 @@ export const createRolesService = ({
   abilityAvailability,
   abilityPreferences,
   abilityPlacement,
+  projectHandleForId = async () => null,
 }: {
   catalog: () => Promise<SkillPackage[]>
   library: RoleLibrary
@@ -531,6 +522,9 @@ export const createRolesService = ({
   abilityAvailability: AbilityAvailabilityPersistence
   abilityPreferences: AbilityPreferencesPersistence
   abilityPlacement: AbilityPlacementPersistence
+  /** Project ids are durable internals; remediation exposes only current handles.
+   * Optional because a meta-DB-less host has no project registry to translate with. */
+  projectHandleForId?: (projectId: string) => Promise<string | null>
 }): RolesService => {
   let catalogPromise: Promise<ParsedPackage[]> | undefined
   const addFences = new Map<string, Promise<void>>()
@@ -685,7 +679,7 @@ export const createRolesService = ({
     parsed: ParsedPackage,
   ): ResolvedOwnedRole => ({
     source: 'owned',
-    role: { source: 'owned', ...roleFactsOf(parsed), scope: location.scope },
+    role: { source: 'owned', ...abilityFactsOf(parsed), scope: location.scope },
     location,
     packageId: parsed.pkg.directoryName,
     locator: ownedRoleLocator(location, parsed.pkg.directoryName),
@@ -721,11 +715,145 @@ export const createRolesService = ({
     | { source: 'system'; parsed: ParsedPackage }
     | { source: 'owned'; parsed: ParsedPackage; location: AddressedPlacement }
 
-  /** The System counterpart of `activeOwnedRoleAt`. A System package has no placement
-   *  and no reach, so the owner's preference row is the whole gate. */
-  const activeSystemRole = async (parsed: ParsedPackage, principal: Principal): Promise<boolean> =>
-    parsed.skill.role &&
-    (await abilityPreferences.isEnabled(preferenceOwner(principal), systemRoleLocator(parsed)))
+  type AbilityResolutionEntry = EffectiveRoleEntry & {
+    kind: AbilityKind
+    locator: ActiveRoleLocator
+    enabled: boolean
+    reachable: boolean
+    effective: boolean
+    /** False only for externally introduced same-name packages that lost this
+     * placement's stable package-id tie-break. They remain authoring-addressable. */
+    resolutionCandidate?: false
+    health?: AbilityHealth
+  }
+
+  const resolutionKey = (kind: AbilityKind, name: string): string => `${kind}\0${name}`
+
+  const activeSystemAbility = async (
+    parsed: ParsedPackage,
+    principal: Principal,
+  ): Promise<boolean> =>
+    abilityPreferences.isEnabled(
+      preferenceOwner(principal),
+      bundledAbilityLocator(parsed) as SystemAbilityLocator,
+    )
+
+  const abilityReachesContext = (
+    parsed: ParsedPackage,
+    location: AddressedPlacement,
+    availability: AbilityAvailability | null | undefined,
+    projectId: string | undefined,
+  ): boolean =>
+    parsed.skill.role
+      ? coversProject(location, availability ?? undefined, projectId)
+      : location.scope !== ROLE_SCOPE.space || skillReaches(availability, projectId)
+
+  const selectAbilityWinners = (
+    candidates: readonly AbilityResolutionEntry[],
+  ): Map<string, AbilityResolutionEntry> => {
+    const winners = new Map<string, AbilityResolutionEntry>()
+
+    for (const candidate of candidates) {
+      candidate.effective = false
+      if (candidate.resolutionCandidate !== false && candidate.enabled && candidate.reachable) {
+        winners.set(resolutionKey(candidate.kind, candidate.parsed.skill.name), candidate)
+      }
+    }
+
+    for (const winner of winners.values()) {
+      winner.effective = true
+    }
+
+    return winners
+  }
+
+  const abilityResolutionEntries = async (
+    context: EffectiveRoleContext,
+    principal: Principal,
+  ): Promise<{
+    candidates: AbilityResolutionEntry[]
+    winners: Map<string, AbilityResolutionEntry>
+    truncated: boolean
+  }> => {
+    const candidates: AbilityResolutionEntry[] = []
+    const owner = preferenceOwner(principal)
+    let truncated = false
+
+    for (const parsed of await systemPackages()) {
+      const kind = parsed.skill.role ? ABILITY_KIND.role : ABILITY_KIND.skill
+      const locator = bundledAbilityLocator(parsed) as SystemAbilityLocator
+      const enabled = await abilityPreferences.isEnabled(owner, locator)
+      const entry: AbilityResolutionEntry = {
+        source: 'system',
+        parsed,
+        kind,
+        locator,
+        enabled,
+        reachable: true,
+        effective: false,
+      }
+
+      candidates.push(entry)
+    }
+
+    for (const location of readableLocationsFor(context, principal)) {
+      const listing = await parsedAt(library, location)
+      const reach = await reachAt(location)
+      const addressedPackages = listing.packages
+        .map((parsed) => ({ parsed, locator: ownedAbilityLocator(location, parsed) }))
+        .filter(
+          (entry): entry is { parsed: ParsedPackage; locator: OwnedAbilityLocator } =>
+            entry.locator != null,
+        )
+        .sort((left, right) =>
+          left.parsed.pkg.directoryName.localeCompare(right.parsed.pkg.directoryName),
+        )
+      // External files can violate the product's same-name uniqueness invariant.
+      // Exact RoleLibrary lookup canonically picks the smallest package id. Keep all
+      // packages addressable for authoring, but let only that same stable package
+      // participate in runtime resolution at this placement.
+      const stablePackages = new Set<string>()
+      const disabled = await abilityPreferences.disabled(
+        owner,
+        addressedPackages.map(({ locator }) => locator),
+      )
+
+      truncated ||= listing.truncated
+      for (const { parsed, locator } of addressedPackages) {
+        const kind = parsed.skill.role ? ABILITY_KIND.role : ABILITY_KIND.skill
+        const stableKey = resolutionKey(kind, parsed.skill.name)
+        const resolutionCandidate = !stablePackages.has(stableKey)
+
+        stablePackages.add(stableKey)
+        const enabled = !disabled.has(serializeAbilityLocator(locator))
+        const availability = reach?.get(parsed.pkg.directoryName)
+        const reachable = abilityReachesContext(parsed, location, availability, context.project?.id)
+        const entry: AbilityResolutionEntry = {
+          source: 'owned',
+          parsed,
+          location,
+          kind,
+          locator,
+          enabled,
+          reachable,
+          effective: false,
+          ...(resolutionCandidate ? {} : { resolutionCandidate: false as const }),
+        }
+
+        candidates.push(entry)
+      }
+    }
+
+    const winners = selectAbilityWinners(candidates)
+
+    for (const winner of winners.values()) {
+      if (winner.kind === ABILITY_KIND.role) {
+        winner.health = await entryHealth(winner, context, principal)
+      }
+    }
+
+    return { candidates, winners, truncated }
+  }
 
   const effectiveRoleEntries = async (
     context: EffectiveRoleContext,
@@ -734,96 +862,257 @@ export const createRolesService = ({
     entries: Map<string, EffectiveRoleEntry>
     truncated: boolean
   }> => {
-    const effective = new Map<string, EffectiveRoleEntry>()
-    const owner = preferenceOwner(principal)
-    let truncated = false
+    const resolution = await abilityResolutionEntries(context, principal)
+    const entries = new Map<string, EffectiveRoleEntry>()
 
-    // System is the broadest source there is, so it is seeded first and any Owned
-    // placement of the same name overrides it — `Owned Project > Space > Personal > System`.
-    for (const parsed of await systemPackages()) {
-      if (await activeSystemRole(parsed, principal)) {
-        effective.set(parsed.skill.name, { source: 'system', parsed })
-      }
-    }
-
-    // Ordered general → specific. A same-name package in a narrower scope wins.
-    for (const location of readableLocationsFor(context, principal)) {
-      const listing = await parsedAt(library, location)
-      truncated ||= listing.truncated
-      const roles = listing.packages.filter((parsed) => parsed.skill.role)
-
-      if (!roles.length) {
-        continue
-      }
-      // One question per LOCATION, not per package: this runs on every discovery and
-      // on every MCP activation, over a window of up to MAX_LIBRARY_PACKAGES.
-      const reach = await reachAt(location)
-      const candidates = roles.filter((parsed) =>
-        coversProject(location, reach?.get(parsed.pkg.directoryName), context.project?.id),
-      )
-      const locators = candidates.map((parsed) =>
-        ownedRoleLocator(location, parsed.pkg.directoryName),
-      )
-      const disabled = await abilityPreferences.disabled(owner, locators)
-
-      for (const [index, parsed] of candidates.entries()) {
-        if (!disabled.has(serializeAbilityLocator(locators[index]!))) {
-          effective.set(parsed.skill.name, { source: 'owned', parsed, location })
-        }
-      }
-    }
-
-    return { entries: effective, truncated }
-  }
-
-  /** What makes an Owned package answerable AS A ROLE at a placement the caller can
-   * already reach: it is a role at all, the Space reach covers the project being asked
-   * about, and the owner has not turned it off. One producer, because the two entries
-   * that need it — activation BY NAME and resume BY EXACT PACKAGE — each answered it
-   * separately and stopped agreeing: resume never asked reach at all, so a role the
-   * owner had narrowed away from a project still resumed there. */
-  const activeOwnedRoleAt = async (
-    location: AddressedPlacement,
-    parsed: ParsedPackage,
-    principal: Principal,
-    projectId: string | undefined,
-  ): Promise<boolean> =>
-    parsed.skill.role &&
-    (await availableAt(location, parsed.pkg.directoryName, projectId)) &&
-    (await abilityPreferences.isEnabled(
-      preferenceOwner(principal),
-      ownedRoleLocator(location, parsed.pkg.directoryName),
-    ))
-
-  const directEnabledOwnedRole = async (
-    locations: readonly AddressedPlacement[],
-    principal: Principal,
-    name: string,
-    projectId?: string,
-  ): Promise<{ parsed: ParsedPackage; location: AddressedPlacement } | null> => {
-    // Exact activation is not constrained by the bounded discovery window.
-    // Search narrowest → broadest, mirroring effectivePackages precedence.
-    for (const location of [...locations].reverse()) {
-      const pkg = await library.getSkill(location, name)
-
-      if (!pkg) {
-        continue
-      }
-      try {
-        const parsed = parsePackage(pkg)
-
-        if (await activeOwnedRoleAt(location, parsed, principal, projectId)) {
-          return { parsed, location }
-        }
-      } catch (err) {
-        console.warn(
-          `[roles] ignoring invalid ${location.scope} package ${name}:`,
-          (err as Error).message,
+    for (const winner of resolution.winners.values()) {
+      if (winner.kind === ABILITY_KIND.role) {
+        entries.set(
+          winner.parsed.skill.name,
+          winner.source === 'system'
+            ? { source: 'system', parsed: winner.parsed }
+            : { source: 'owned', parsed: winner.parsed, location: winner.location },
         )
       }
     }
 
-    return null
+    return { entries, truncated: resolution.truncated }
+  }
+
+  const exactAbilityEntriesNamed = async (
+    locations: readonly AddressedPlacement[],
+    principal: Principal,
+    name: string,
+    projectId?: string,
+  ): Promise<AbilityResolutionEntry[]> => {
+    const owner = preferenceOwner(principal)
+    const candidates: AbilityResolutionEntry[] = []
+
+    for (const parsed of await systemPackages()) {
+      if (parsed.skill.name !== name) {
+        continue
+      }
+      const kind = parsed.skill.role ? ABILITY_KIND.role : ABILITY_KIND.skill
+      const locator = bundledAbilityLocator(parsed) as SystemAbilityLocator
+
+      candidates.push({
+        source: 'system',
+        parsed,
+        kind,
+        locator,
+        enabled: await abilityPreferences.isEnabled(owner, locator),
+        reachable: true,
+        effective: false,
+      })
+    }
+
+    // Exact activation is not constrained by the bounded discovery window. Entries
+    // stay broad → narrow so the shared selector applies the same precedence as list.
+    for (const location of locations) {
+      const packages = await library.getAbilitiesNamed(location, name)
+
+      for (const [kind, pkg] of packages) {
+        try {
+          const parsed = parsePackage(pkg)
+          const locator = ownedAbilityLocator(location, parsed)
+
+          if (!locator) {
+            continue
+          }
+          const availability =
+            location.scope === ROLE_SCOPE.space
+              ? await abilityAvailability.get(location.space, parsed.pkg.directoryName)
+              : undefined
+          candidates.push({
+            source: 'owned',
+            parsed,
+            location,
+            kind,
+            locator,
+            enabled: await abilityPreferences.isEnabled(owner, locator),
+            reachable: abilityReachesContext(parsed, location, availability, projectId),
+            effective: false,
+          })
+        } catch (err) {
+          console.warn(
+            `[roles] ignoring invalid ${location.scope} package ${name}:`,
+            (err as Error).message,
+          )
+        }
+      }
+    }
+
+    return candidates
+  }
+
+  const effectiveAbilityNamed = async (
+    locations: readonly AddressedPlacement[],
+    principal: Principal,
+    kind: AbilityKind,
+    name: string,
+    projectId?: string,
+  ): Promise<AbilityResolutionEntry | null> => {
+    const candidates = await exactAbilityEntriesNamed(locations, principal, name, projectId)
+
+    return selectAbilityWinners(candidates).get(resolutionKey(kind, name)) ?? null
+  }
+
+  type AbilityCandidateSelection =
+    | { kind: 'active'; candidate: AbilityResolutionEntry }
+    | { kind: 'inactive'; candidate: AbilityResolutionEntry }
+    | { kind: 'wrong-kind'; actual: AbilityKind }
+    | { kind: 'not-found' }
+
+  /** Resolve one name without discarding the best readable inactive candidate. Active
+   * same-kind fallback wins first; only when none exists does the narrowest inactive
+   * candidate beat an active candidate of the other kind. */
+  const selectAbilityForLoad = async (
+    locations: readonly AddressedPlacement[],
+    principal: Principal,
+    kind: AbilityKind,
+    name: string,
+    projectId?: string,
+  ): Promise<AbilityCandidateSelection> => {
+    const candidates = await exactAbilityEntriesNamed(locations, principal, name, projectId)
+    const winners = selectAbilityWinners(candidates)
+    const active = winners.get(resolutionKey(kind, name))
+
+    if (active) {
+      return { kind: 'active', candidate: active }
+    }
+    // Candidates are broad → narrow. Keeping the last requested-kind candidate gives
+    // the same precedence the winner selector applies by overwriting its map entry.
+    const inactive = candidates.filter((candidate) => candidate.kind === kind).at(-1)
+
+    if (inactive) {
+      return { kind: 'inactive', candidate: inactive }
+    }
+    const other = kind === ABILITY_KIND.role ? ABILITY_KIND.skill : ABILITY_KIND.role
+
+    return winners.has(resolutionKey(other, name))
+      ? { kind: 'wrong-kind', actual: other }
+      : { kind: 'not-found' }
+  }
+
+  const candidateAccess = (
+    candidate: AbilityResolutionEntry,
+    principal: Principal,
+  ): 'writer' | 'reader' | 'system' =>
+    candidate.source === 'system'
+      ? 'system'
+      : can(principal, 'space:write', { space: candidate.location.space })
+        ? 'writer'
+        : 'reader'
+
+  const retryProjectHandles = async (candidate: AbilityResolutionEntry): Promise<string[]> => {
+    if (candidate.source !== 'owned' || candidate.location.scope !== ROLE_SCOPE.space) {
+      return []
+    }
+    const availability = await abilityAvailability.get(
+      candidate.location.space,
+      candidate.parsed.pkg.directoryName,
+    )
+
+    if (availability?.mode !== ABILITY_AVAILABILITY_MODE.selectedProjects) {
+      return []
+    }
+    const handles = await Promise.all(
+      availability.projectIds.map((projectId) => projectHandleForId(projectId)),
+    )
+    return [...new Set(handles.filter((handle): handle is string => handle != null))].sort()
+  }
+
+  const failedCandidate = async (
+    candidate: AbilityResolutionEntry,
+    context: EffectiveRoleContext,
+    principal: Principal,
+    reason: 'disabled' | 'out-of-reach' | 'unhealthy',
+    health?: AbilityHealth,
+  ): Promise<Extract<AbilityLoadOutcome, { ok: false }>> => {
+    const ref = encodeAbilityLocator(candidate.locator)
+    const access = candidateAccess(candidate, principal)
+    let remediation: AbilityRemediation[]
+
+    if (reason === 'disabled') {
+      remediation =
+        candidate.source === 'system'
+          ? [{ kind: 'open-agents-ui', ref }]
+          : access === 'writer'
+            ? [{ kind: 'edit-ability', ref, patch: 'enabled' }]
+            : [{ kind: 'contact-space-writer' }]
+    } else if (reason === 'out-of-reach') {
+      if (candidate.source === 'owned' && access === 'writer') {
+        remediation = [{ kind: 'edit-ability', ref, patch: 'availability' }]
+      } else {
+        const projects = await retryProjectHandles(candidate)
+        remediation = [
+          ...(projects.length ? [{ kind: 'retry-project' as const, projects }] : []),
+          { kind: 'contact-space-writer' as const },
+        ]
+      }
+    } else {
+      // Attachment health is already a typed diagnosis. Package composition is most
+      // safely repaired on the Agents surface; the adapter adds reason-specific prose
+      // without re-running access or resolution policy.
+      remediation = [{ kind: 'open-agents-ui', ref }]
+    }
+    const facts = {
+      ok: false as const,
+      reason,
+      ref,
+      source: candidate.source,
+      access,
+      remediation,
+    }
+
+    if (reason === 'unhealthy') {
+      if (!health) {
+        throw new Error('unhealthy ability outcome requires attachment health')
+      }
+
+      return { ...facts, reason, health }
+    }
+
+    return reason === 'out-of-reach'
+      ? {
+          ...facts,
+          reason,
+          ...(context.project
+            ? {
+                project: (await projectHandleForId(context.project.id)) ?? context.project.slug,
+              }
+            : {}),
+        }
+      : { ...facts, reason }
+  }
+
+  const failedSelection = async (
+    selection: Exclude<AbilityCandidateSelection, { kind: 'active' }>,
+    context: EffectiveRoleContext,
+    principal: Principal,
+  ): Promise<Extract<AbilityLoadOutcome, { ok: false }>> => {
+    if (selection.kind === 'inactive') {
+      return failedCandidate(
+        selection.candidate,
+        context,
+        principal,
+        selection.candidate.enabled ? 'out-of-reach' : 'disabled',
+      )
+    }
+    if (selection.kind === 'wrong-kind') {
+      return {
+        ok: false,
+        reason: 'wrong-kind',
+        actual: selection.actual,
+        remediation: [{ kind: 'call-other-kind', actual: selection.actual }],
+      }
+    }
+
+    return {
+      ok: false,
+      reason: 'not-found',
+      remediation: [{ kind: 'list-abilities', view: 'runtime' }],
+    }
   }
 
   /** A project OF a home the caller already reaches. Derived from an addressed home
@@ -895,22 +1184,25 @@ export const createRolesService = ({
     name: string,
     projectId?: string,
   ): Promise<EffectiveRoleEntry | null> => {
-    const owned = await directEnabledOwnedRole(locations, principal, name, projectId)
+    const hit = await effectiveAbilityNamed(
+      locations,
+      principal,
+      ABILITY_KIND.role,
+      name,
+      projectId,
+    )
 
-    if (owned) {
-      return { source: 'owned', parsed: owned.parsed, location: owned.location }
-    }
-    const system = (await systemPackages()).find(({ skill }) => skill.role && skill.name === name)
-
-    return system && (await activeSystemRole(system, principal))
-      ? { source: 'system', parsed: system }
+    return hit
+      ? hit.source === 'system'
+        ? { source: 'system', parsed: hit.parsed }
+        : { source: 'owned', parsed: hit.parsed, location: hit.location }
       : null
   }
 
   const effectiveSummaryOf = (entry: EffectiveRoleEntry): EffectiveRoleSummary =>
     entry.source === 'system'
-      ? { source: 'system', ...roleFactsOf(entry.parsed) }
-      : { source: 'owned', ...roleFactsOf(entry.parsed), scope: entry.location.scope }
+      ? { source: 'system', ...abilityFactsOf(entry.parsed) }
+      : { source: 'owned', ...abilityFactsOf(entry.parsed), scope: entry.location.scope }
 
   const activeRoleLocatorOf = (entry: EffectiveRoleEntry): ActiveRoleLocator =>
     entry.source === 'system'
@@ -1110,7 +1402,7 @@ export const createRolesService = ({
     return parsed ?? undefined
   }
 
-  const healthForRole = async (
+  const roleActivationSnapshot = async (
     parsed: ParsedPackage,
     // Catalog composition is not expressed on the wire at all — a Catalog package is
     // read to be forked, and the fork is what gets a health verdict.
@@ -1121,12 +1413,14 @@ export const createRolesService = ({
     location: AddressedPlacement | undefined,
     personalSpace: string | null,
     projectId?: string,
-  ): Promise<AbilityHealth> => {
+  ): Promise<{ health: AbilityHealth; dependencies: Array<ParsedPackage | undefined> }> => {
     const owner = preferenceOwner(principal)
     const attachments: AbilityAttachmentState[] = []
+    const dependencies: Array<ParsedPackage | undefined> = []
 
     for (const link of parsed.skill.linkedSkills) {
       if (link.kind === 'invalid' || link.kind === 'name') {
+        dependencies.push(undefined)
         attachments.push({
           attachment: {
             kind: 'invalid',
@@ -1144,6 +1438,7 @@ export const createRolesService = ({
           packageId: link.packageId,
         } as const
         const dependency = await systemPackageById(link.packageId)
+        dependencies.push(dependency ?? undefined)
         const health = !dependency
           ? ABILITY_ATTACHMENT_HEALTH.missing
           : dependency.skill.role
@@ -1170,9 +1465,10 @@ export const createRolesService = ({
         ? ownedSkillLocator(dependencyLocation, link.packageId)
         : null
       let health: AbilityAttachmentState['health'] = ABILITY_ATTACHMENT_HEALTH.unavailable
+      let dependency: ParsedPackage | undefined
 
       if (locator && can(principal, 'space:read', { space: dependencyLocation!.space })) {
-        const dependency = await exactOwnedPackage(dependencyLocation!, link.packageId)
+        dependency = (await exactOwnedPackage(dependencyLocation!, link.packageId)) ?? undefined
 
         if (!dependency) {
           health = ABILITY_ATTACHMENT_HEALTH.missing
@@ -1205,13 +1501,28 @@ export const createRolesService = ({
               health,
             },
       )
+      dependencies.push(dependency)
     }
 
     return {
-      healthy: attachments.every(({ health }) => health === ABILITY_ATTACHMENT_HEALTH.healthy),
-      attachments,
+      health: {
+        healthy: attachments.every(({ health }) => health === ABILITY_ATTACHMENT_HEALTH.healthy),
+        attachments,
+      },
+      dependencies,
     }
   }
+
+  const healthForRole = async (
+    parsed: ParsedPackage,
+    source: 'system' | 'owned',
+    principal: Principal,
+    location: AddressedPlacement | undefined,
+    personalSpace: string | null,
+    projectId?: string,
+  ): Promise<AbilityHealth> =>
+    (await roleActivationSnapshot(parsed, source, principal, location, personalSpace, projectId))
+      .health
 
   /** A role's own page has no project context, but a role that covers a set of
    * projects has an answer in each of them — and a single "no project" verdict would
@@ -1322,47 +1633,104 @@ export const createRolesService = ({
     return noteId
   }
 
-  /** Does this saved binding still ADDRESS an effective role in THIS context — is the
-   *  placement still reachable from here, does the package still exist, is it still
-   *  enabled and still in reach? One producer because the REST surface answered it by
-   *  hand and disagreed with resume: it judged reach by SPACE alone, so a role the
-   *  owner had narrowed away from the project was still drawn as active there while
-   *  `start_session` refused to raise it.
-   *
-   *  Soundness is the OTHER half and lives in `entryHealth`; resume applies both, so
-   *  any surface reporting a binding as live must apply both too. */
-  const savedRoleEntry = async (
+  /** Exact saved bindings need the same candidate facts as by-name activation, but
+   * they start from an address and must distinguish a package that is gone from one
+   * that is merely inactive in the current context. */
+  const savedRoleCandidate = async (
     context: EffectiveRoleContext,
     principal: Principal,
     locator: ActiveRoleLocator,
-  ): Promise<EffectiveRoleEntry | null> => {
+  ): Promise<AbilityResolutionEntry | Extract<AbilityLoadOutcome, { ok: false }>> => {
     if (locator.source === 'system') {
       const parsed = await systemPackageById(locator.packageId)
 
-      return parsed && (await activeSystemRole(parsed, principal))
-        ? { source: 'system', parsed }
-        : null
+      if (!parsed) {
+        return {
+          ok: false,
+          reason: 'gone',
+          ref: encodeAbilityLocator(locator),
+          remediation: [{ kind: 'list-abilities', view: 'runtime' }],
+        }
+      }
+      if (!parsed.skill.role) {
+        return {
+          ok: false,
+          reason: 'wrong-kind',
+          actual: ABILITY_KIND.skill,
+          remediation: [{ kind: 'call-other-kind', actual: ABILITY_KIND.skill }],
+        }
+      }
+      const candidate: AbilityResolutionEntry = {
+        source: 'system',
+        parsed,
+        kind: ABILITY_KIND.role,
+        locator,
+        enabled: await activeSystemAbility(parsed, principal),
+        reachable: true,
+        effective: false,
+      }
+
+      return candidate.enabled
+        ? candidate
+        : await failedCandidate(candidate, context, principal, 'disabled')
     }
     const placement = ownedPlacementOf(locator, context.personalSpace)
-    // A binding is only still a binding where the CURRENT context reaches it. The
-    // chain is the one list of placements this context can see, so asking it here
-    // is the same question resolution asks — not a fifth hand-written copy of it.
-    const location = locationsFor(context).find(
+
+    if (!placement || !can(principal, 'space:read', { space: placement.space })) {
+      return {
+        ok: false,
+        reason: 'gone',
+        remediation: [{ kind: 'list-abilities', view: 'runtime' }],
+      }
+    }
+    const parsed = await exactOwnedPackage(placement, locator.packageId)
+
+    if (!parsed) {
+      return {
+        ok: false,
+        reason: 'gone',
+        ref: encodeAbilityLocator(locator),
+        remediation: [{ kind: 'list-abilities', view: 'runtime' }],
+      }
+    }
+    if (!parsed.skill.role) {
+      return {
+        ok: false,
+        reason: 'wrong-kind',
+        actual: ABILITY_KIND.skill,
+        remediation: [{ kind: 'call-other-kind', actual: ABILITY_KIND.skill }],
+      }
+    }
+    const currentReachesPlacement = locationsFor(context).some(
       (entry) =>
-        placement != null &&
         entry.scope === placement.scope &&
         entry.space === placement.space &&
         entry.projectId === placement.projectId,
     )
-
-    if (!location || !can(principal, 'space:read', { space: location.space })) {
-      return null
+    const availability =
+      placement.scope === ROLE_SCOPE.space
+        ? await abilityAvailability.get(placement.space, parsed.pkg.directoryName)
+        : undefined
+    const candidate: AbilityResolutionEntry = {
+      source: 'owned',
+      parsed,
+      location: placement,
+      kind: ABILITY_KIND.role,
+      locator,
+      enabled: await abilityPreferences.isEnabled(preferenceOwner(principal), locator),
+      reachable:
+        currentReachesPlacement &&
+        abilityReachesContext(parsed, placement, availability, context.project?.id),
+      effective: false,
     }
-    const role = await exactOwnedPackage(location, locator.packageId)
 
-    return role && (await activeOwnedRoleAt(location, role, principal, context.project?.id))
-      ? { source: 'owned', parsed: role, location }
-      : null
+    if (!candidate.enabled) {
+      return failedCandidate(candidate, context, principal, 'disabled')
+    }
+
+    return candidate.reachable
+      ? candidate
+      : await failedCandidate(candidate, context, principal, 'out-of-reach')
   }
 
   /** WHICH role this address names, and whether the agent actually loads it here.
@@ -1426,13 +1794,13 @@ export const createRolesService = ({
     return entry.source === 'system'
       ? {
           source: 'system',
-          role: { source: 'system', ...roleFactsOf(entry.parsed) },
+          role: { source: 'system', ...abilityFactsOf(entry.parsed) },
           packageId,
           locator,
         }
       : {
           source: 'owned',
-          role: { source: 'owned', ...roleFactsOf(entry.parsed), scope: entry.location.scope },
+          role: { source: 'owned', ...abilityFactsOf(entry.parsed), scope: entry.location.scope },
           location: entry.location,
           packageId,
           locator,
@@ -1468,32 +1836,434 @@ export const createRolesService = ({
     entry: EffectiveRoleEntry,
     context: EffectiveRoleContext,
     principal: Principal,
-    locations: readonly AddressedPlacement[],
     budgetTokens: number,
   ) => {
-    const health = await entryHealth(entry, context, principal)
+    const snapshot = await roleActivationSnapshot(
+      entry.parsed,
+      entry.source,
+      principal,
+      entry.source === 'owned' ? entry.location : undefined,
+      context.personalSpace,
+      context.project?.id,
+    )
 
-    if (!health.healthy) {
-      return null
+    if (!snapshot.health.healthy) {
+      return { loaded: null, health: snapshot.health }
     }
     const loaded = await loadParsedRole(
       entry.parsed,
       // A System package is not placed; the scope here only labels the summary that
       // `loadParsedRole` builds, and the caller replaces it with the source union.
       entry.source === 'system' ? ROLE_SCOPE.catalog : entry.location.scope,
-      async (link) =>
-        link.kind === 'locator' && link.source === 'system'
-          ? ((await systemPackageById(link.packageId)) ?? undefined)
-          : entry.source === 'system'
-            ? undefined
-            : linkedAt(link, locations, context.personalSpace, context.project?.id),
+      (_link, index) => snapshot.dependencies[index],
       budgetTokens,
+      true,
     )
 
-    return { loaded, health }
+    return { loaded, health: snapshot.health }
+  }
+
+  const prepareCustomRole = async (
+    name: string,
+    description: string,
+    instructions: string,
+    location: RoleHomeLocation,
+    options: {
+      principal: Principal
+      attachments?: readonly AuthoredAttachment[]
+      availability?: AbilityAvailability
+      personalSpace?: string | null
+    },
+  ): Promise<SkillPackage> => {
+    const home = addressed(location)
+    const links = (options.attachments ?? []).map((attachment) => {
+      if (attachment.kind === 'invalid') {
+        throw new RoleDependencyConflictError('new invalid skill attachments are not allowed')
+      }
+
+      return serializedAttachmentAt(home, options.personalSpace ?? null, attachment)
+    })
+    const pkg = customPackage(name, description, instructions, true, links)
+
+    for (const projectId of coveredProjectsOf(location, options.availability)) {
+      const health = await healthForRole(
+        parsePackage(pkg),
+        'owned',
+        options.principal,
+        home,
+        options.personalSpace ?? null,
+        projectId,
+      )
+      const blocked = health.attachments.find(({ health: verdict }) =>
+        blocksAttachmentWrite(verdict),
+      )
+
+      if (blocked) {
+        const attachment =
+          blocked.attachment.kind === 'exact'
+            ? blocked.attachment.label
+            : blocked.attachment.kind === 'invalid'
+              ? blocked.attachment.raw
+              : 'unknown attachment'
+        const rule =
+          blocked.health === ABILITY_ATTACHMENT_HEALTH.wrongKind
+            ? 'an attachment must address a skill'
+            : blocked.health === ABILITY_ATTACHMENT_HEALTH.unavailable
+              ? 'an attachment must reach every project covered by the role'
+              : blocked.health === ABILITY_ATTACHMENT_HEALTH.invalidLocator
+                ? 'an attachment must have a valid locator'
+                : 'an attachment must exist and be readable at the role home'
+
+        throw new RoleDependencyConflictError(
+          `skill attachment "${attachment}" is ${blocked.health} for project ${projectId}; ${rule}`,
+          { attachment, verdict: blocked.health, rule, projectId },
+        )
+      }
+    }
+
+    return pkg
+  }
+
+  const describeOwnedParsed = async (
+    context: EffectiveRoleContext,
+    principal: Principal,
+    locator: OwnedAbilityLocator,
+    location: AddressedPlacement,
+    parsed: ParsedPackage,
+    noteId: string,
+    budgetTokens: number,
+  ): Promise<AbilityDetail | null> => {
+    if (parsed.skill.role !== (locator.kind === ABILITY_KIND.role)) {
+      return null
+    }
+    const exact = ownedAbilityLocator(location, parsed)
+
+    if (!exact || serializeAbilityLocator(exact) !== serializeAbilityLocator(locator)) {
+      return null
+    }
+    const enabled = await abilityPreferences.isEnabled(preferenceOwner(principal), locator)
+    const loaded = parsed.skill.role
+      ? await loadParsedRole(
+          parsed,
+          location.scope,
+          async (link) =>
+            link.kind === 'locator' && link.source === 'system'
+              ? ((await systemPackageById(link.packageId)) ?? undefined)
+              : linkedAt(
+                  link,
+                  [homeOf(location, context.personalSpace)],
+                  context.personalSpace,
+                  location.projectId ?? context.project?.id,
+                ),
+          budgetTokens,
+        )
+      : loadParsedSkill(parsed, location.scope)
+
+    if (!loaded) {
+      return null
+    }
+    const item = 'role' in loaded ? loaded.role : loaded.skill
+    const reach = await abilityAvailability.get(location.space, locator.packageId)
+
+    return {
+      locator,
+      source: 'owned',
+      title: parsed.skill.title,
+      name: item.name,
+      description: item.description,
+      instructions: item.instructions,
+      enabled,
+      noteId,
+      origin: hasCatalogProvenance(parsed.skill) ? 'catalog' : 'custom',
+      ...(hasCatalogProvenance(parsed.skill)
+        ? { originRevision: parsed.skill.metadata['notarium.originRevision'] }
+        : {}),
+      ...(location.scope === ROLE_SCOPE.space
+        ? {
+            availability: abilityAvailabilityOf(reach, parsed.skill.role ? 'role' : 'skill'),
+          }
+        : {}),
+      ...(parsed.skill.role
+        ? {
+            health: await roleHealthAcross(
+              parsed,
+              principal,
+              location,
+              context.personalSpace,
+              context.project?.id,
+              reach,
+            ),
+          }
+        : {}),
+      truncated: loaded.truncated,
+    }
+  }
+
+  const describeOwnedSnapshot = async (
+    context: EffectiveRoleContext,
+    principal: Principal,
+    snapshot: OwnedAbilitySnapshot,
+    budgetTokens: number,
+  ): Promise<AbilityDetail | null> => {
+    const location = exactLocationIn(context, principal, snapshot.locator)
+
+    if (!location) {
+      return null
+    }
+    let parsed: ParsedPackage
+
+    try {
+      parsed = parsePackage(snapshot.pkg)
+    } catch {
+      return null
+    }
+
+    return describeOwnedParsed(
+      context,
+      principal,
+      snapshot.locator,
+      location,
+      parsed,
+      snapshot.registryNoteId,
+      budgetTokens,
+    )
   }
 
   return {
+    resolveOwnedPlacement: (location, personalSpace) => {
+      if (location.scope === ROLE_SCOPE.personal) {
+        return location.space === personalSpace ? addressed(location) : null
+      }
+      if (location.scope === ROLE_SCOPE.space) {
+        return spaceRootOf(location.space, personalSpace)
+      }
+
+      return location.projectId ? addressed(location) : null
+    },
+    resolveOwnedAt: async (location, principal, kind, packageId) => {
+      if (!can(principal, 'space:read', { space: location.space })) {
+        return null
+      }
+      const at = addressed(location)
+      const parsed = await exactOwnedPackage(at, packageId)
+
+      if (!parsed || parsed.skill.role !== (kind === ABILITY_KIND.role)) {
+        return null
+      }
+      const locator = ownedAbilityLocator(at, parsed)
+
+      return locator && (await projectedNoteId(at, packageId)) ? locator : null
+    },
+    withOwnedAt: async (location, principal, kind, packageId, registryNoteId, task) => {
+      if (!can(principal, 'space:read', { space: location.space })) {
+        return null
+      }
+      const at = addressed(location)
+
+      return library.withExactPackageRead(at, packageId, async (read) => {
+        const snapshot = await read()
+
+        if (!snapshot || snapshot.registryNoteId !== registryNoteId) {
+          return null
+        }
+        let parsed: ParsedPackage
+
+        try {
+          parsed = parsePackage(snapshot.pkg)
+        } catch {
+          return null
+        }
+        const manifest = snapshot.pkg.files.get('SKILL.md')
+        const owner = manifest ? exactOwnerObservation(manifest) : { kind: 'unproven' as const }
+        const locator = ownedAbilityLocator(at, parsed)
+
+        return locator &&
+          parsed.skill.role === (kind === ABILITY_KIND.role) &&
+          owner.kind === 'claimed'
+          ? task({ locator, registryNoteId, manifestNoteId: owner.id, pkg: snapshot.pkg })
+          : null
+      })
+    },
+    withCurrentOwnedTarget: async (locator, principal, task, mode = 'read') => {
+      if (!can(principal, 'space:read', { space: locator.location.spaceId })) {
+        return null
+      }
+      type Authority =
+        | { state: 'current'; locator: OwnedAbilityLocator }
+        | {
+            state: 'moved'
+            locator: OwnedAbilityLocator
+            registryNoteId: string
+            manifestNoteId: string
+          }
+        | { state: 'invalid' }
+      const authority = async (): Promise<Authority> => {
+        const recorded = await abilityPlacement.resolveMovedOwnedRoleLocator(
+          serializeAbilityLocator(locator),
+        )
+
+        if (!recorded) {
+          return { state: 'current', locator }
+        }
+        const moved = parseAbilityLocator(recorded.toLocator)
+
+        return moved?.source === 'owned' &&
+          moved.kind === locator.kind &&
+          moved.packageId === locator.packageId &&
+          moved.location.spaceId === locator.location.spaceId &&
+          recorded.registryNoteId &&
+          recorded.manifestNoteId
+          ? {
+              state: 'moved',
+              locator: moved,
+              registryNoteId: recorded.registryNoteId,
+              manifestNoteId: recorded.manifestNoteId,
+            }
+          : { state: 'invalid' }
+      }
+      const sameAuthority = (left: Authority, right: Authority): boolean =>
+        left.state === right.state &&
+        left.state !== 'invalid' &&
+        right.state !== 'invalid' &&
+        serializeAbilityLocator(left.locator) === serializeAbilityLocator(right.locator) &&
+        (left.state === 'current' ||
+          (right.state === 'moved' &&
+            left.registryNoteId === right.registryNoteId &&
+            left.manifestNoteId === right.manifestNoteId))
+
+      // A back-move can win while this reader waits for one side's package admission.
+      // Retry the newly selected authority a bounded number of times; sustained churn
+      // is not a reason to guess at either address.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const selected = await authority()
+
+        if (selected.state === 'invalid') {
+          return null
+        }
+        const selectedLocation = addressed({
+          scope: selected.locator.location.scope,
+          space: selected.locator.location.spaceId,
+          ...(selected.locator.location.scope === ROLE_SCOPE.project
+            ? { projectId: selected.locator.location.projectId }
+            : {}),
+        })
+        let changed = false
+
+        const admitted = async (read: RolePackageReader) => {
+          const checked = await authority()
+
+          if (!sameAuthority(selected, checked)) {
+            changed = true
+            return null
+          }
+          const snapshot = await read()
+
+          if (!snapshot) {
+            return null
+          }
+          let parsed: ParsedPackage
+
+          try {
+            parsed = parsePackage(snapshot.pkg)
+          } catch (error) {
+            console.warn(
+              `[roles] ignoring invalid ${selectedLocation.scope} package ${selected.locator.packageId}:`,
+              (error as Error).message,
+            )
+            return null
+          }
+          if (parsed.skill.role !== (selected.locator.kind === ABILITY_KIND.role)) {
+            return null
+          }
+          const manifest = snapshot.pkg.files.get('SKILL.md')
+          const owner = manifest ? exactOwnerObservation(manifest) : { kind: 'unproven' as const }
+
+          if (
+            owner.kind !== 'claimed' ||
+            (selected.state === 'moved' &&
+              (snapshot.registryNoteId !== selected.registryNoteId ||
+                owner.id !== selected.manifestNoteId))
+          ) {
+            return null
+          }
+          const exact = ownedAbilityLocator(selectedLocation, parsed)
+
+          if (
+            !exact ||
+            serializeAbilityLocator(exact) !== serializeAbilityLocator(selected.locator)
+          ) {
+            return null
+          }
+
+          return task({
+            locator: exact,
+            registryNoteId: snapshot.registryNoteId,
+            manifestNoteId: owner.id,
+            pkg: snapshot.pkg,
+          })
+        }
+        const resolved = await (mode === 'mutation'
+          ? library.withExactPackageMutation(selectedLocation, selected.locator.packageId, admitted)
+          : library.withExactPackageRead(selectedLocation, selected.locator.packageId, admitted))
+
+        if (!changed) {
+          return resolved
+        }
+      }
+
+      return null
+    },
+    withOwnedTarget: async (target, principal, task, mode = 'read') => {
+      const { locator } = target
+
+      if (!can(principal, 'space:read', { space: locator.location.spaceId })) {
+        return null
+      }
+      if (await abilityPlacement.resolveMovedOwnedRoleLocator(serializeAbilityLocator(locator))) {
+        return null
+      }
+      const location = addressed({
+        scope: locator.location.scope,
+        space: locator.location.spaceId,
+        ...(locator.location.scope === ROLE_SCOPE.project
+          ? { projectId: locator.location.projectId }
+          : {}),
+      })
+
+      const admitted = async (read: RolePackageReader) => {
+        const snapshot = await read()
+
+        if (!snapshot || snapshot.registryNoteId !== target.registryNoteId) {
+          return null
+        }
+        let parsed: ParsedPackage
+
+        try {
+          parsed = parsePackage(snapshot.pkg)
+        } catch {
+          return null
+        }
+        const manifest = snapshot.pkg.files.get('SKILL.md')
+        const owner = manifest ? exactOwnerObservation(manifest) : { kind: 'unproven' as const }
+        const exact = ownedAbilityLocator(location, parsed)
+
+        if (
+          parsed.skill.role !== (locator.kind === ABILITY_KIND.role) ||
+          owner.kind !== 'claimed' ||
+          owner.id !== target.manifestNoteId ||
+          !exact ||
+          serializeAbilityLocator(exact) !== serializeAbilityLocator(locator)
+        ) {
+          return null
+        }
+
+        return task({ ...target, pkg: snapshot.pkg })
+      }
+
+      return mode === 'mutation'
+        ? library.withExactPackageMutation(location, locator.packageId, admitted)
+        : library.withExactPackageRead(location, locator.packageId, admitted)
+    },
     canAddSkillAt: (target) => publication.availableFor(target),
     canAddRoleAt: (target, personalSpace) => {
       if (!publication.availableFor(target)) {
@@ -1528,7 +2298,11 @@ export const createRolesService = ({
                 link.kind === 'name' ? catalogPackageOf(link.name, ABILITY_KIND.skill) : undefined,
               budgetTokens,
             )
-          : loadParsedSkill(parsed, ROLE_SCOPE.catalog, budgetTokens)
+          : loadParsedSkill(parsed, ROLE_SCOPE.catalog)
+
+        if (!loaded) {
+          return null
+        }
         const item = 'role' in loaded ? loaded.role : loaded.skill
         return {
           locator,
@@ -1559,7 +2333,11 @@ export const createRolesService = ({
                   : undefined,
               budgetTokens,
             )
-          : loadParsedSkill(parsed, ROLE_SCOPE.catalog, budgetTokens)
+          : loadParsedSkill(parsed, ROLE_SCOPE.catalog)
+
+        if (!loaded) {
+          return null
+        }
         const item = 'role' in loaded ? loaded.role : loaded.skill
         return {
           locator,
@@ -1583,96 +2361,68 @@ export const createRolesService = ({
       }
       const parsed = await exactOwnedPackage(location, locator.packageId)
 
-      if (!parsed || parsed.skill.role !== (locator.kind === 'role')) {
+      if (!parsed) {
         return null
       }
-      const enabled = await abilityPreferences.isEnabled(owner, locator)
       const noteIds = await library.readableNoteIds(location, [locator.packageId])
       const noteId = noteIds.get(locator.packageId)
 
       if (!noteId) {
         return null
       }
-      const loaded = parsed.skill.role
-        ? await loadParsedRole(
-            parsed,
-            location.scope,
-            async (link) =>
-              link.kind === 'locator' && link.source === 'system'
-                ? ((await systemPackageById(link.packageId)) ?? undefined)
-                : // Scoped to THIS role's own placement, the way activation scopes it.
-                  // Handed the reader's readable chain instead, a personal dependency
-                  // would be looked up in the READER's personal library — so what a
-                  // shared role appears to be made of would depend on who opened it.
-                  linkedAt(
-                    link,
-                    [homeOf(location, context.personalSpace)],
-                    context.personalSpace,
-                    location.projectId ?? context.project?.id,
-                  ),
-            budgetTokens,
-          )
-        : loadParsedSkill(parsed, location.scope, budgetTokens)
-      const item = 'role' in loaded ? loaded.role : loaded.skill
-      const reach = await abilityAvailability.get(location.space, locator.packageId)
-      return {
+
+      return describeOwnedParsed(
+        context,
+        principal,
         locator,
-        source: 'owned' as const,
-        title: parsed.skill.title,
-        name: item.name,
-        description: item.description,
-        instructions: item.instructions,
-        enabled,
+        location,
+        parsed,
         noteId,
-        origin: hasCatalogProvenance(parsed.skill) ? 'catalog' : 'custom',
-        ...(hasCatalogProvenance(parsed.skill)
-          ? { originRevision: parsed.skill.metadata['notarium.originRevision'] }
-          : {}),
-        ...(location.scope === ROLE_SCOPE.space
-          ? {
-              availability: abilityAvailabilityOf(reach, parsed.skill.role ? 'role' : 'skill'),
-            }
-          : {}),
-        ...(parsed.skill.role
-          ? {
-              health: await roleHealthAcross(
-                parsed,
-                principal,
-                location,
-                context.personalSpace,
-                context.project?.id,
-                reach,
-              ),
-            }
-          : {}),
-        truncated: loaded.truncated,
-      }
+        budgetTokens,
+      )
     },
+
+    describeOwnedAbility: describeOwnedSnapshot,
 
     setEnabled: async (context, principal, locator, enabled) => {
       const owner = preferenceOwner(principal)
+      const target: OwnedAbilityTarget | null =
+        'registryNoteId' in locator ? (locator as OwnedAbilityTarget) : null
+      const exactLocator: ActiveRoleLocator = target
+        ? target.locator
+        : (locator as ActiveRoleLocator)
 
-      if (locator.source === 'system') {
-        const parsed = await systemPackageById(locator.packageId)
+      if (exactLocator.source === 'system') {
+        const parsed = await systemPackageById(exactLocator.packageId)
 
-        if (!parsed || parsed.skill.role !== (locator.kind === 'role')) {
+        if (!parsed || parsed.skill.role !== (exactLocator.kind === 'role')) {
           throw new AbilityUnavailableError('no such System ability')
         }
-        await abilityPreferences.setEnabled(owner, { locator }, enabled, new Date().toISOString())
+        await abilityPreferences.setEnabled(
+          owner,
+          { locator: exactLocator },
+          enabled,
+          new Date().toISOString(),
+        )
         return
       }
-      const location = exactLocationIn(context, principal, locator)
+      const location = exactLocationIn(context, principal, exactLocator)
 
       if (!location) {
         throw new AbilityUnavailableError('Owned ability is unavailable to this principal')
       }
-      const parsed = await exactOwnedPackage(location, locator.packageId)
+      let registryNoteId = target?.registryNoteId
 
-      if (!parsed || parsed.skill.role !== (locator.kind === 'role')) {
-        throw new AbilityUnavailableError('no such Owned ability')
+      if (!target) {
+        const parsed = await exactOwnedPackage(location, exactLocator.packageId)
+
+        if (!parsed || parsed.skill.role !== (exactLocator.kind === 'role')) {
+          throw new AbilityUnavailableError('no such Owned ability')
+        }
+        registryNoteId = (await library.readableNoteIds(location, [exactLocator.packageId])).get(
+          exactLocator.packageId,
+        )
       }
-      const noteIds = await library.readableNoteIds(location, [locator.packageId])
-      const registryNoteId = noteIds.get(locator.packageId)
 
       if (!registryNoteId) {
         // The same package the DETAIL answers 404 for. A bare Error here made one door
@@ -1681,14 +2431,19 @@ export const createRolesService = ({
       }
       await abilityPreferences.setEnabled(
         owner,
-        { locator, registryNoteId },
+        { locator: exactLocator, registryNoteId },
         enabled,
         new Date().toISOString(),
       )
     },
 
     setAbilityAvailability: async (context, principal, locator, availability) => {
-      const location = ownedPlacementOf(locator, context.personalSpace)
+      const target: OwnedAbilityTarget | null =
+        'registryNoteId' in locator ? (locator as OwnedAbilityTarget) : null
+      const exactLocator: OwnedAbilityLocator = target
+        ? target.locator
+        : (locator as OwnedAbilityLocator)
+      const location = ownedPlacementOf(exactLocator, context.personalSpace)
 
       if (
         location?.scope !== ROLE_SCOPE.space ||
@@ -1698,14 +2453,26 @@ export const createRolesService = ({
           'Owned ability availability is unavailable to this principal',
         )
       }
-      const parsed = await exactOwnedPackage(location, locator.packageId)
+      let registryNoteId = target?.registryNoteId
 
-      if (!parsed || parsed.skill.role !== (locator.kind === 'role')) {
-        throw new AbilityUnavailableError('no such Owned ability')
+      if (!target) {
+        const parsed = await exactOwnedPackage(location, exactLocator.packageId)
+
+        if (!parsed || parsed.skill.role !== (exactLocator.kind === 'role')) {
+          throw new AbilityUnavailableError('no such Owned ability')
+        }
+        registryNoteId = (await projectedNoteId(location, exactLocator.packageId)) ?? undefined
       }
-      const registryNoteId = await projectedNoteId(location, locator.packageId)
 
-      await abilityAvailability.set(location.space, locator.packageId, availability, registryNoteId)
+      if (!registryNoteId) {
+        throw new AbilityUnavailableError('Owned ability has no readable registry identity')
+      }
+      await abilityAvailability.set(
+        location.space,
+        exactLocator.packageId,
+        availability,
+        registryNoteId,
+      )
     },
 
     listRoleVersions: async (principal, locator, personalSpace, projectIds) => {
@@ -1731,7 +2498,9 @@ export const createRolesService = ({
       // this asks each project for that name rather than for a package address.
       for (const projectId of projectIds) {
         const location = projectIn(base, projectId)
-        const pkg = await library.getSkill(location, parsed.skill.name)
+        const pkg = (await library.getAbilitiesNamed(location, parsed.skill.name)).get(
+          ABILITY_KIND.role,
+        )
 
         if (!pkg) {
           continue
@@ -1769,7 +2538,7 @@ export const createRolesService = ({
       if (!parsed?.skill.role) {
         return null
       }
-      const pkg = await library.getSkill(base, parsed.skill.name)
+      const pkg = (await library.getAbilitiesNamed(base, parsed.skill.name)).get(ABILITY_KIND.role)
 
       if (!pkg) {
         return null
@@ -1785,7 +2554,8 @@ export const createRolesService = ({
       }
     },
 
-    createRoleVersion: async (principal, locator, personalSpace, projectId) => {
+    createRoleVersion: async (principal, sourceTarget, personalSpace, projectId) => {
+      const locator = sourceTarget.locator
       const base = ownedPlacementOf(locator, personalSpace)
 
       if (
@@ -1795,9 +2565,29 @@ export const createRolesService = ({
       ) {
         throw new AbilityUnavailableError('a project version needs a writable Space base')
       }
-      const parsed = await exactOwnedPackage(base, locator.packageId)
+      const capture = (snapshot: OwnedAbilitySnapshot) => {
+        const pkg = clonePackage(snapshot.pkg)
+        const manifest = pkg.files.get('SKILL.md')
+        const owner = manifest ? exactOwnerObservation(manifest) : { kind: 'unproven' as const }
+        let parsed: ParsedPackage
 
-      if (!parsed?.skill.role) {
+        try {
+          parsed = parsePackage(pkg)
+        } catch {
+          return null
+        }
+
+        return parsed.skill.role &&
+          serializeAbilityLocator(snapshot.locator) === serializeAbilityLocator(locator) &&
+          snapshot.registryNoteId &&
+          owner.kind === 'claimed' &&
+          owner.id === snapshot.manifestNoteId
+          ? { snapshot: { ...snapshot, pkg }, parsed }
+          : null
+      }
+      const captured = capture(sourceTarget)
+
+      if (!captured) {
         throw new AbilityUnavailableError('no such Owned Role')
       }
       const location = {
@@ -1805,7 +2595,7 @@ export const createRolesService = ({
         space: base.space,
         projectId,
       } as const
-      const name = parsed.skill.name
+      const name = captured.parsed.skill.name
       const release = await acquireAddFence(location, name)
 
       try {
@@ -1824,17 +2614,15 @@ export const createRolesService = ({
         // that skill does not reach THIS project the version is simply unhealthy here
         // — a normal (role, project) state, visible as such. Granting the skill that
         // project instead would widen its reach behind the user's back.
-        const source = await library.getByDirectory(base, locator.packageId)
-
-        if (!source) {
-          throw new AbilityUnavailableError('no such Owned Role')
-        }
         const noteId = freshNoteId()
-        const files = new Map(source.files)
+        const files = new Map(captured.snapshot.pkg.files)
         files.set(
           'SKILL.md',
           Buffer.from(
-            withFreshNoteId(Buffer.from(source.files.get('SKILL.md')!).toString('utf8'), noteId),
+            withFreshNoteId(
+              Buffer.from(captured.snapshot.pkg.files.get('SKILL.md')!).toString('utf8'),
+              noteId,
+            ),
           ),
         )
         const pkg = { directoryName: noteId, files }
@@ -1858,7 +2646,9 @@ export const createRolesService = ({
       }
     },
 
-    moveRolePlacement: async (principal, locator, personalSpace) => {
+    moveRolePlacement: async (principal, requestedTarget, personalSpace) => {
+      const locator =
+        'registryNoteId' in requestedTarget ? requestedTarget.locator : requestedTarget
       const placed = ownedPlacementOf(locator, personalSpace)
       const from = placed && projectPlacement(placed)
       const to = from && spaceRootOf(from.space, personalSpace)
@@ -1870,11 +2660,44 @@ export const createRolesService = ({
         throw new AbilityUnavailableError('this role cannot change where it belongs')
       }
       const space = from.space
-      const parsed = await exactOwnedPackage(from, locator.packageId)
+      const captured = await library.withExactPackageRead(from, locator.packageId, async (read) => {
+        const snapshot = await read()
 
-      if (!parsed?.skill.role) {
+        if (!snapshot) {
+          return null
+        }
+        const manifest = snapshot.pkg.files.get('SKILL.md')
+        const owner = manifest ? exactOwnerObservation(manifest) : { kind: 'unproven' as const }
+        let current: ParsedPackage | null = null
+
+        try {
+          current = parsePackage(snapshot.pkg)
+        } catch {
+          return null
+        }
+
+        if (!current.skill.role || owner.kind !== 'claimed') {
+          return null
+        }
+        const target: OwnedAbilityTarget & {
+          locator: Extract<OwnedAbilityLocator, { kind: 'role' }>
+        } = {
+          locator,
+          registryNoteId: snapshot.registryNoteId,
+          manifestNoteId: owner.id,
+        }
+
+        return 'registryNoteId' in requestedTarget &&
+          (requestedTarget.registryNoteId !== target.registryNoteId ||
+            requestedTarget.manifestNoteId !== target.manifestNoteId)
+          ? null
+          : { parsed: current, target }
+      })
+
+      if (!captured) {
         throw new AbilityUnavailableError('no such Owned Role')
       }
+      const { parsed, target } = captured
       const name = parsed.skill.name
       const release = await acquireAddFence(to, name)
 
@@ -1890,15 +2713,8 @@ export const createRolesService = ({
         // of a row READS as all-projects for a role, which means a half-undone move
         // would not leave the reach untouched — it would widen it to the whole Space.
         const reachBefore = await abilityAvailability.get(space, locator.packageId)
-        // The package address survives the move and so does the identity behind it,
-        // but identity is projected from a PATH — so it is only readable while the
-        // package is still at that path. Read here, one line above the move.
-        const movedNoteId = await projectedNoteId(from, locator.packageId)
-        // BOTH sides, before the first mutation. The destination publishes the
-        // move; the source publishes the undo — and discovering that the source
-        // placement cannot take the package back, after the reach row is already
-        // written, is exactly the half-applied promotion this ordering removes.
-        const [intoTarget, backToSource] = await Promise.all([publisherAt(to), publisherAt(from)])
+        const movedNoteId = target.registryNoteId
+        const intoTarget = await publisherAt(to)
 
         const moved = ownedRoleLocator(to, locator.packageId)
         // Reach belongs to a Space home and only to it. Coming up from a project the
@@ -1915,37 +2731,39 @@ export const createRolesService = ({
         // harmless: the package is still a project placement, which reaches its own
         // project by construction and never consults this row.
         await abilityAvailability.set(space, locator.packageId, availability, movedNoteId)
-        let published = false
-
         try {
-          published = await intoTarget.moveFrom(from, locator.packageId)
+          const published = await intoTarget.moveFrom(
+            from,
+            locator.packageId,
+            {
+              kind: target.locator.kind,
+              registryNoteId: target.registryNoteId,
+              manifestNoteId: target.manifestNoteId,
+            },
+            ({ manifestNoteId }) => {
+              if (!manifestNoteId) {
+                throw new AbilityUnavailableError('ability package has no physical owner identity')
+              }
+
+              return abilityPlacement.moveOwnedRolePlacement({
+                fromTargetId: roleContextTargetIdOf(from, locator.packageId),
+                toTargetId: roleContextTargetIdOf(to, locator.packageId),
+                fromLocator: serializeAbilityLocator(locator),
+                toLocator: serializeAbilityLocator(moved),
+                registryNoteId: movedNoteId,
+                manifestNoteId,
+              })
+            },
+          )
 
           if (!published) {
             throw new RoleAlreadyExistsError(`role "${name}" already exists in ${to.scope}`)
           }
-          await abilityPlacement.moveOwnedRolePlacement({
-            fromTargetId: roleContextTargetIdOf(from, locator.packageId),
-            toTargetId: roleContextTargetIdOf(to, locator.packageId),
-            fromLocator: serializeAbilityLocator(locator),
-            toLocator: serializeAbilityLocator(moved),
-          })
         } catch (error) {
-          // The package already moved and its pointers did not. Put it back rather
-          // than leave a role whose context, preference and episodes still name a
-          // placement that no longer exists. Nothing to put back when the move itself
-          // was refused — but the reach written ahead of it still has to come off.
-          const undone = published
-            ? await backToSource.moveFrom(to, locator.packageId).catch((err: Error) => {
-                console.error(`[roles] failed to undo the move of ${name}:`, err.message)
-                return false
-              })
-            : true
-
-          // Reach describes where the package IS, so undoing it is meaningless unless
-          // the package went back. A role left standing at the Space root with its
-          // pre-move reach — for a project version, no row at all — would read as
-          // all-projects, and a failed promotion would end up WIDENING the role.
-          if (undone) {
+          // `moveFrom` rolls a finalize failure back while it still owns both package
+          // admissions. Only its typed rollback failure means the package remains at
+          // the target and the target reach must be preserved.
+          if (!isRolePackageMoveRollbackError(error)) {
             await (
               reachBefore
                 ? abilityAvailability.set(space, locator.packageId, reachBefore, movedNoteId)
@@ -1954,11 +2772,9 @@ export const createRolesService = ({
               console.error(`[roles] failed to undo the reach of ${name}:`, err.message)
             })
           } else {
-            console.error(
-              `[roles] failed to undo the move of ${name}: destination refused the package`,
-            )
+            console.error(`[roles] failed to undo the move of ${name}: source was reoccupied`)
           }
-          throw error
+          throw isRolePackageMoveRollbackError(error) ? error.cause : error
         }
         const noteIds = await library.awaitReadableNoteIds(to, [locator.packageId])
         const noteId = noteIds.get(locator.packageId)
@@ -1969,6 +2785,11 @@ export const createRolesService = ({
 
         return {
           locator: moved,
+          target: {
+            locator: moved,
+            registryNoteId: target.registryNoteId,
+            manifestNoteId: target.manifestNoteId,
+          },
           availability,
           role: {
             ...summaryOf(parsed, to.scope),
@@ -1982,13 +2803,26 @@ export const createRolesService = ({
       }
     },
 
-    serializeOwnedRoleAttachments: async (principal, locator, attachments, personalSpace) => {
+    serializeOwnedRoleAttachments: async (principal, subject, attachments, personalSpace) => {
+      const snapshot: OwnedAbilitySnapshot | null =
+        'registryNoteId' in subject ? (subject as OwnedAbilitySnapshot) : null
+      const locator = snapshot
+        ? snapshot.locator
+        : (subject as Extract<OwnedAbilityLocator, { kind: 'role' }>)
       const location = ownedPlacementOf(locator, personalSpace)
 
       if (!location || !can(principal, 'space:write', { space: location.space })) {
         throw new AbilityUnavailableError('Owned Role is unavailable to this principal')
       }
-      const current = await exactOwnedPackage(location, locator.packageId)
+      let current: ParsedPackage | null
+
+      try {
+        current = snapshot
+          ? parsePackage(snapshot.pkg)
+          : await exactOwnedPackage(location, locator.packageId)
+      } catch {
+        current = null
+      }
 
       if (!current?.skill.role) {
         throw new AbilityUnavailableError('no such Owned Role')
@@ -2066,15 +2900,35 @@ export const createRolesService = ({
         }
       }
 
-      const noteId = (await library.readableNoteIds(location, [current.pkg.directoryName])).get(
-        current.pkg.directoryName,
-      )
+      const noteId =
+        snapshot?.registryNoteId ??
+        (await library.readableNoteIds(location, [current.pkg.directoryName])).get(
+          current.pkg.directoryName,
+        )
 
       if (!noteId) {
         throw new AbilityUnavailableError('Owned Role has no readable registry identity')
       }
 
       return { links, noteId }
+    },
+
+    inspectAndRemoveOwned: async (target, personalSpace, options) => {
+      const location = ownedPlacementOf(target.locator, personalSpace)
+
+      if (!location) {
+        return false
+      }
+
+      return library.inspectAndRemove(location, target.locator.packageId, {
+        expected: {
+          kind: target.locator.kind,
+          registryNoteId: target.registryNoteId,
+          manifestNoteId: target.manifestNoteId,
+        },
+        assertSafe: (pkg, members) => options.assertSafe(pkg.files, members),
+        remove: options.remove,
+      })
     },
 
     listBundledAbilities: async (principal) => {
@@ -2107,6 +2961,57 @@ export const createRolesService = ({
           left.name.localeCompare(right.name) ||
           left.locator.packageId.localeCompare(right.locator.packageId),
       )
+    },
+
+    listAbilityResolution: async (context, principal) => {
+      const resolution = await abilityResolutionEntries(context, principal)
+      const candidates: AbilityResolutionCandidate[] = resolution.candidates.map((entry) => {
+        const facts = abilityFactsOf(entry.parsed)
+
+        if (entry.source === 'system') {
+          return entry.kind === ABILITY_KIND.role
+            ? {
+                ...facts,
+                source: 'system',
+                kind: 'role',
+                locator: entry.locator as SystemAbilityLocator & { kind: 'role' },
+                enabled: entry.enabled,
+                effective: entry.effective,
+                ...(entry.health ? { health: entry.health } : {}),
+              }
+            : {
+                ...facts,
+                source: 'system',
+                kind: 'skill',
+                locator: entry.locator as SystemAbilityLocator & { kind: 'skill' },
+                enabled: entry.enabled,
+                effective: entry.effective,
+              }
+        }
+
+        return entry.kind === ABILITY_KIND.role
+          ? {
+              ...facts,
+              source: 'owned',
+              kind: 'role',
+              locator: entry.locator as Extract<OwnedAbilityLocator, { kind: 'role' }>,
+              location: entry.location,
+              enabled: entry.enabled,
+              effective: entry.effective,
+              ...(entry.health ? { health: entry.health } : {}),
+            }
+          : {
+              ...facts,
+              source: 'owned',
+              kind: 'skill',
+              locator: entry.locator as Extract<OwnedAbilityLocator, { kind: 'skill' }>,
+              location: entry.location as SkillHomeLocation,
+              enabled: entry.enabled,
+              effective: entry.effective,
+            }
+      })
+
+      return { candidates, truncated: resolution.truncated }
     },
 
     listOwnedAbilitiesAt: async (location, principal, kind) => {
@@ -2184,6 +3089,18 @@ export const createRolesService = ({
       }
     },
 
+    hasSystemAbility: async (kind, name) =>
+      (await systemPackages()).some(
+        ({ skill }) => skill.name === name && skill.role === (kind === ABILITY_KIND.role),
+      ),
+    hasOwnedAbilityAt: (location, name, options) => library.exists(location, name, options),
+    prepareCustomSkill: (name, description, instructions) =>
+      customPackage(name, description, instructions, false),
+    prepareCustomRole,
+    manifestPath: (location, packageId) => library.manifestPath(location, packageId),
+    withCreateAdmission: (location, packageId, task, options) =>
+      library.withCreateAdmission(location, packageId, task, options),
+
     hasCatalog: async (name) => (await catalogPackageOf(name, ABILITY_KIND.role)) != null,
 
     hasCatalogSkill: async (name) => (await catalogPackageOf(name, ABILITY_KIND.skill)) != null,
@@ -2215,13 +3132,13 @@ export const createRolesService = ({
       return hit.source === 'system'
         ? {
             source: 'system',
-            role: { source: 'system', ...roleFactsOf(hit.parsed) },
+            role: { source: 'system', ...abilityFactsOf(hit.parsed) },
             packageId,
             locator,
           }
         : {
             source: 'owned',
-            role: { source: 'owned', ...roleFactsOf(hit.parsed), scope: hit.location.scope },
+            role: { source: 'owned', ...abilityFactsOf(hit.parsed), scope: hit.location.scope },
             location: hit.location,
             packageId,
             locator,
@@ -2243,96 +3160,161 @@ export const createRolesService = ({
     },
 
     resolveSavedRole: async (context, principal, locator) => {
-      const entry = await savedRoleEntry(context, principal, locator)
+      const candidate = await savedRoleCandidate(context, principal, locator)
 
-      if (!entry) {
+      if ('ok' in candidate) {
         return null
       }
 
-      return (await entryHealth(entry, context, principal)).healthy ? resolvedRoleOf(entry) : null
+      return (await entryHealth(candidate, context, principal)).healthy
+        ? resolvedRoleOf(candidate)
+        : null
     },
 
     loadSavedRole: async (context, principal, locator, budgetTokens) => {
-      const entry = await savedRoleEntry(context, principal, locator)
+      const candidate = await savedRoleCandidate(context, principal, locator)
 
-      if (!entry) {
-        return null
+      if ('ok' in candidate) {
+        return candidate
       }
-      // A saved binding resolves its attachments where the ROLE lives, not along the
-      // discovery chain; a System package has no such home and takes none.
-      const outcome = await loadEffectiveEntry(
-        entry,
-        context,
-        principal,
-        entry.source === 'owned' ? [homeOf(entry.location, context.personalSpace)] : [],
-        budgetTokens,
-      )
+      const outcome = await loadEffectiveEntry(candidate, context, principal, budgetTokens)
 
-      if (!outcome) {
-        return null
+      if (!outcome.loaded) {
+        return failedCandidate(candidate, context, principal, 'unhealthy', outcome.health)
       }
-      const resolved = resolvedRoleOf(entry)
+      const resolved = resolvedRoleOf(candidate)
       const instructions = outcome.loaded.role.instructions
 
-      return resolved.source === 'system'
-        ? {
-            source: 'system',
-            role: { ...resolved.role, instructions },
-            skills: outcome.loaded.skills,
-            truncated: outcome.loaded.truncated,
-            packageId: resolved.packageId,
-            locator: resolved.locator,
-          }
-        : {
-            source: 'owned',
-            role: { ...resolved.role, instructions },
-            skills: outcome.loaded.skills,
-            truncated: outcome.loaded.truncated,
-            location: resolved.location,
-            packageId: resolved.packageId,
-            locator: resolved.locator,
-          }
+      const loaded: LoadedEffectiveRole =
+        resolved.source === 'system'
+          ? {
+              source: 'system',
+              role: { ...resolved.role, instructions },
+              skills: outcome.loaded.skills,
+              truncated: outcome.loaded.truncated,
+              packageId: resolved.packageId,
+              locator: resolved.locator,
+            }
+          : {
+              source: 'owned',
+              role: { ...resolved.role, instructions },
+              skills: outcome.loaded.skills,
+              truncated: outcome.loaded.truncated,
+              location: resolved.location,
+              packageId: resolved.packageId,
+              locator: resolved.locator,
+            }
+
+      return { ok: true, loaded, health: outcome.health }
     },
 
     loadEffective: async (context, principal, name, budgetTokens) => {
       const locations = readableLocationsFor(context, principal)
-      const hit = await effectiveRoleNamed(locations, principal, name, context.project?.id)
+      const selection = await selectAbilityForLoad(
+        locations,
+        principal,
+        ABILITY_KIND.role,
+        name,
+        context.project?.id,
+      )
 
-      if (!hit) {
-        return null
+      if (selection.kind !== 'active') {
+        return failedSelection(selection, context, principal)
       }
-      const outcome = await loadEffectiveEntry(hit, context, principal, locations, budgetTokens)
+      const hit = selection.candidate
+      const outcome = await loadEffectiveEntry(hit, context, principal, budgetTokens)
 
-      if (!outcome) {
-        return null
+      if (!outcome.loaded) {
+        return failedCandidate(hit, context, principal, 'unhealthy', outcome.health)
       }
       const { loaded } = outcome
       const packageId = hit.parsed.pkg.directoryName
       const locator = activeRoleLocatorOf(hit)
       const instructions = loaded.role.instructions
 
-      return hit.source === 'system'
-        ? {
-            source: 'system',
-            role: { source: 'system', ...roleFactsOf(hit.parsed), instructions },
-            skills: loaded.skills,
-            truncated: loaded.truncated,
-            packageId,
-            locator,
-          }
-        : {
-            source: 'owned',
-            role: {
+      const resolved: LoadedEffectiveRole =
+        hit.source === 'system'
+          ? {
+              source: 'system',
+              role: { source: 'system', ...abilityFactsOf(hit.parsed), instructions },
+              skills: loaded.skills,
+              truncated: loaded.truncated,
+              packageId,
+              locator,
+            }
+          : {
               source: 'owned',
-              ...roleFactsOf(hit.parsed),
-              scope: hit.location.scope,
-              instructions,
-            },
-            skills: loaded.skills,
-            truncated: loaded.truncated,
-            location: hit.location,
-            packageId,
-            locator,
+              role: {
+                source: 'owned',
+                ...abilityFactsOf(hit.parsed),
+                scope: hit.location.scope,
+                instructions,
+              },
+              skills: loaded.skills,
+              truncated: loaded.truncated,
+              location: hit.location,
+              packageId,
+              locator,
+            }
+
+      return { ok: true, loaded: resolved, health: outcome.health }
+    },
+
+    loadEffectiveSkill: async (context, principal, name, budgetTokens) => {
+      const selection = await selectAbilityForLoad(
+        readableLocationsFor(context, principal),
+        principal,
+        ABILITY_KIND.skill,
+        name,
+        context.project?.id,
+      )
+
+      if (selection.kind !== 'active') {
+        return failedSelection(selection, context, principal)
+      }
+      const hit = selection.candidate
+      const requiredTokens = instructionTokens(hit.parsed.skill.instructions)
+
+      if (requiredTokens > budgetTokens) {
+        throw new SkillTooLargeForActivationError(requiredTokens, budgetTokens)
+      }
+      const facts = {
+        kind: ABILITY_KIND.skill,
+        name: hit.parsed.skill.name,
+        title: hit.parsed.skill.title,
+        description: hit.parsed.skill.description,
+      } as const
+
+      const loaded: LoadedEffectiveSkill | null =
+        hit.source === 'system'
+          ? {
+              packageId: hit.locator.packageId,
+              locator: hit.locator,
+              skill: {
+                ...facts,
+                source: 'system',
+                instructions: hit.parsed.skill.instructions,
+              },
+            }
+          : hit.location.scope === ROLE_SCOPE.project
+            ? null
+            : {
+                packageId: hit.locator.packageId,
+                locator: hit.locator,
+                skill: {
+                  ...facts,
+                  source: 'owned',
+                  scope: hit.location.scope,
+                  instructions: hit.parsed.skill.instructions,
+                },
+              }
+
+      return loaded
+        ? { ok: true, loaded }
+        : {
+            ok: false,
+            reason: 'not-found',
+            remediation: [{ kind: 'list-abilities', view: 'runtime' }],
           }
     },
 
@@ -2620,29 +3602,50 @@ export const createRolesService = ({
       location,
       availability,
     ): Promise<PublishedSkillInventoryEntry> => {
-      const pkg = customPackage(name, description, instructions, false)
+      let pkg = customPackage(name, description, instructions, false)
 
       if (await library.exists(location, name)) {
         throw new SkillAlreadyExistsError(`skill "${name}" already exists in ${location.scope}`)
       }
-      const noteId = await publishOwnedPackage(
-        location,
-        await publisherAt(location),
-        pkg,
-        () => new SkillAlreadyExistsError(`skill "${name}" already exists in ${location.scope}`),
-      )
       const resolvedAvailability =
         location.scope === ROLE_SCOPE.space
           ? (availability ?? { mode: ABILITY_AVAILABILITY_MODE.allProjects })
           : undefined
+      let reserved = false
 
       if (resolvedAvailability) {
-        await abilityAvailability.set(
-          location.space,
-          pkg.directoryName,
-          resolvedAvailability,
-          noteId,
+        for (;;) {
+          reserved = await abilityAvailability.reserve(
+            location.space,
+            pkg.directoryName,
+            resolvedAvailability,
+          )
+          if (reserved) {
+            break
+          }
+          pkg = customPackage(name, description, instructions, false)
+        }
+      }
+      let noteId: string
+
+      try {
+        noteId = await publishOwnedPackage(
+          location,
+          await publisherAt(location),
+          pkg,
+          () => new SkillAlreadyExistsError(`skill "${name}" already exists in ${location.scope}`),
         )
+      } catch (error) {
+        if (reserved) {
+          await abilityAvailability.cancel(location.space, pkg.directoryName)
+        }
+        throw error
+      }
+
+      if (resolvedAvailability) {
+        if (!(await abilityAvailability.finalize(location.space, pkg.directoryName, noteId))) {
+          throw new Error('ability availability reservation could not be finalized')
+        }
       }
 
       return {
@@ -2664,44 +3667,26 @@ export const createRolesService = ({
       location,
       options = {},
     ): Promise<PublishedRoleInventoryEntry> => {
-      // Enumerated, not addressed by a locator: the caller names a home it has already
-      // been granted, so the question the seam asks does not arise here.
-      const home = addressed(location)
-      const attachments = options.attachments ?? []
-      const links = attachments.map((attachment) => {
-        if (attachment.kind === 'invalid') {
-          throw new RoleDependencyConflictError('new invalid skill attachments are not allowed')
-        }
-
-        return serializedAttachmentAt(home, options.personalSpace ?? null, attachment)
-      })
-      const pkg = customPackage(name, description, instructions, true, links)
-
-      if (links.length) {
-        if (!options.principal) {
-          throw new RoleDependencyConflictError('skill attachments require a principal')
-        }
-        const principal = options.principal
-
-        for (const projectId of coveredProjectsOf(location, options.availability)) {
-          const health = await healthForRole(
-            parsePackage(pkg),
-            'owned',
-            principal,
-            home,
-            options.personalSpace ?? null,
-            projectId,
-          )
-
-          if (health.attachments.some(({ health: verdict }) => blocksAttachmentWrite(verdict))) {
-            throw new RoleDependencyConflictError('one or more skill attachments are unavailable')
-          }
-        }
+      if (!options.principal && options.attachments?.length) {
+        throw new RoleDependencyConflictError('skill attachments require a principal')
       }
+      const makePackage = () =>
+        options.principal
+          ? prepareCustomRole(name, description, instructions, location, {
+              principal: options.principal,
+              ...(options.attachments ? { attachments: options.attachments } : {}),
+              ...(options.availability ? { availability: options.availability } : {}),
+              ...(options.personalSpace !== undefined
+                ? { personalSpace: options.personalSpace }
+                : {}),
+            })
+          : Promise.resolve(customPackage(name, description, instructions, true))
+      let pkg = await makePackage()
       const availability =
         location.scope === ROLE_SCOPE.space
           ? (options.availability ?? { mode: ABILITY_AVAILABILITY_MODE.allProjects })
           : undefined
+      const reservation = location.scope === ROLE_SCOPE.space ? options.availability : undefined
 
       if (await library.exists(location, name)) {
         throw new RoleAlreadyExistsError(`role "${name}" already exists in ${location.scope}`)
@@ -2710,25 +3695,45 @@ export const createRolesService = ({
       // view is a composition refusal and must leave no orphan availability row.
       const publisher = await publisherAt(location)
 
-      // Reach is written BEFORE the package is readable. For a role the absence of a
-      // row reads as all-projects, so publishing first opens a window — as wide as the
-      // projection barrier inside publish — in which a role narrowed to one project
-      // answers in every project of its Space. A row for a package that never appears
-      // is inert and dies with its Space; the reverse is not.
-      if (availability) {
-        await abilityAvailability.set(location.space, pkg.directoryName, availability, null)
-      }
-      const noteId = await publishOwnedPackage(
-        location,
-        publisher,
-        pkg,
-        () => new RoleAlreadyExistsError(`role "${name}" already exists in ${location.scope}`),
-      )
+      // Explicit reach is reserved before publication. An unstated Space Role keeps
+      // its historical absent-row=all-projects default and needs no policy row.
+      let reserved = false
 
-      // The row was written before there WAS an identity to name; now there is. The
-      // key is learned, never forgotten, so this second write only fills it in.
-      if (availability) {
-        await abilityAvailability.set(location.space, pkg.directoryName, availability, noteId)
+      if (reservation) {
+        for (;;) {
+          reserved = await abilityAvailability.reserve(
+            location.space,
+            pkg.directoryName,
+            reservation,
+          )
+          if (reserved) {
+            break
+          }
+          pkg = await makePackage()
+        }
+      }
+      let noteId: string
+
+      try {
+        noteId = await publishOwnedPackage(
+          location,
+          publisher,
+          pkg,
+          () => new RoleAlreadyExistsError(`role "${name}" already exists in ${location.scope}`),
+        )
+      } catch (error) {
+        if (reserved) {
+          await abilityAvailability.cancel(location.space, pkg.directoryName)
+        }
+        throw error
+      }
+
+      // The reservation knew only the package id; publication supplies the actual
+      // registry note id, which claim arbitration may make different.
+      if (reservation) {
+        if (!(await abilityAvailability.finalize(location.space, pkg.directoryName, noteId))) {
+          throw new Error('ability availability reservation could not be finalized')
+        }
       }
 
       return {

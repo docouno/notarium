@@ -489,6 +489,7 @@ describe('SqliteMetaDb', () => {
         role: null,
         roleLocator: null,
         roleContextProjectId: null,
+        projectId: null,
       })
       const sessionCursor = {
         owner: 'al',
@@ -2410,6 +2411,7 @@ describe('SqliteMetaDb', () => {
         role: null,
         roleLocator: null,
         roleContextProjectId: null,
+        projectId: null,
       })
       await db.retrievalLog.append(
         ret({
@@ -2497,6 +2499,7 @@ describe('SqliteMetaDb', () => {
         role: null,
         roleLocator: null,
         roleContextProjectId: null,
+        projectId: null,
       })
       await db.retrievalLog.append(
         ret({

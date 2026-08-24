@@ -18,7 +18,11 @@ export const dedupedWrite = async <T extends DedupResult>(
   ctx: Ctx,
   keys: { toolName: ToolName; idempotencyKey?: string; scopeKey?: string },
   run: () => Promise<T>,
-): Promise<{ result: T | DedupResult; wasHit: boolean }> => {
+): Promise<{
+  result: T | DedupResult
+  wasHit: boolean
+  persistenceFailed?: true
+}> => {
   const gs = ctx.gatewayState
   const idempotencyKey = keys.idempotencyKey
 
@@ -38,7 +42,11 @@ export const dedupedWrite = async <T extends DedupResult>(
     // performed no write — the same shape a sequential replay answers with.
     return { result: (await running).result, wasHit: true }
   }
-  const attempt = (async (): Promise<{ result: DedupResult; wasHit: boolean }> => {
+  const attempt = (async (): Promise<{
+    result: DedupResult
+    wasHit: boolean
+    persistenceFailed?: true
+  }> => {
     const nowMs = ctx.now().getTime()
     const hit = gs
       ? await gs.dedupGet(scope, idempotencyKey, new Date(nowMs - DEDUP_IDEM_TTL_MS).toISOString())
@@ -50,13 +58,18 @@ export const dedupedWrite = async <T extends DedupResult>(
     const result = await run()
 
     if (gs) {
-      await gs.dedupPut(
-        scope,
-        idempotencyKey,
-        { noteId: result.noteId, versionToken: result.versionToken },
-        new Date(nowMs).toISOString(),
-      )
-      await gs.dedupPrune(new Date(nowMs - DEDUP_IDEM_TTL_MS).toISOString())
+      try {
+        await gs.dedupPut(
+          scope,
+          idempotencyKey,
+          { noteId: result.noteId, versionToken: result.versionToken },
+          new Date(nowMs).toISOString(),
+        )
+        await gs.dedupPrune(new Date(nowMs - DEDUP_IDEM_TTL_MS).toISOString())
+      } catch (error) {
+        console.error('[mcp] idempotency persistence failed ->', (error as Error).message)
+        return { result, wasHit: false, persistenceFailed: true }
+      }
     }
 
     return { result, wasHit: false }

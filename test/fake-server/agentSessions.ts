@@ -1,5 +1,6 @@
 import { parseAbilityLocator, serializeAbilityLocator } from '@notarium/core'
 import type {
+  AgentSessionInferredStart,
   AgentSessionNamedStart,
   AgentSessionRecord,
   AgentSessionRoleSelection,
@@ -66,6 +67,26 @@ export class InMemoryAgentSessions implements AgentSessionsPersistence {
     this.insertChecked(session)
   }
 
+  async getRetained(
+    owner: string,
+    id: string,
+    retainedSince: string,
+  ): Promise<AgentSessionRecord | null> {
+    const record = this.records.get(id)
+    return record && record.owner === owner && record.lastSeenAt >= retainedSince
+      ? clone(record)
+      : null
+  }
+
+  async listNamed(
+    owner: string,
+    name: string,
+    retainedSince: string,
+    limit: number,
+  ): Promise<AgentSessionRecord[]> {
+    return this.list(owner, retainedSince, limit, name)
+  }
+
   private insertChecked(session: AgentSessionRecord): void {
     if (this.records.has(session.id)) {
       throw new Error(`duplicate agent session id: ${session.id}`)
@@ -87,6 +108,7 @@ export class InMemoryAgentSessions implements AgentSessionsPersistence {
     id: string,
     lastSeenAt: string,
     retainedSince: string,
+    projectId?: string,
   ): Promise<AgentSessionRecord | null> {
     const record = this.records.get(id)
 
@@ -95,6 +117,10 @@ export class InMemoryAgentSessions implements AgentSessionsPersistence {
     }
     record.lastSeenAt = record.lastSeenAt > lastSeenAt ? record.lastSeenAt : lastSeenAt
     record.calls += 1
+    if (projectId !== undefined) {
+      record.projectId = projectId
+    }
+
     return clone(record)
   }
 
@@ -102,6 +128,7 @@ export class InMemoryAgentSessions implements AgentSessionsPersistence {
     owner: string,
     activeSince: string,
     lastSeenAt: string,
+    projectId?: string,
   ): Promise<AgentSessionRecord | null> {
     const active = [...this.records.values()].filter(
       (record) => record.owner === owner && record.lastSeenAt >= activeSince,
@@ -113,7 +140,43 @@ export class InMemoryAgentSessions implements AgentSessionsPersistence {
     const record = active[0]
     record.lastSeenAt = record.lastSeenAt > lastSeenAt ? record.lastSeenAt : lastSeenAt
     record.calls += 1
+    if (projectId !== undefined) {
+      record.projectId = projectId
+    }
+
     return clone(record)
+  }
+
+  async startInferred(
+    candidate: AgentSessionRecord,
+    activeSince: string,
+    recentSince: string,
+    limit: number,
+    projectId?: string,
+  ): Promise<AgentSessionInferredStart> {
+    const active = this.list(candidate.owner, activeSince, 2)
+
+    if (active.length === 1) {
+      const stored = this.records.get(active[0]!.id)!
+      stored.lastSeenAt =
+        stored.lastSeenAt > candidate.lastSeenAt ? stored.lastSeenAt : candidate.lastSeenAt
+      stored.calls += 1
+      if (projectId !== undefined) {
+        stored.projectId = projectId
+      }
+
+      return { kind: 'resumed', record: clone(stored) }
+    }
+
+    const recentSessions =
+      active.length >= 2 ? this.list(candidate.owner, recentSince, limit) : undefined
+    const created = { ...candidate, projectId: projectId ?? candidate.projectId }
+    this.insertChecked(created)
+    return {
+      kind: 'new',
+      record: clone(created),
+      ...(recentSessions ? { recentSessions } : {}),
+    }
   }
 
   async startNamed(
@@ -121,6 +184,7 @@ export class InMemoryAgentSessions implements AgentSessionsPersistence {
     activeSince: string,
     retainedSince: string,
     limit: number,
+    projectId?: string,
   ): Promise<AgentSessionNamedStart> {
     const matches = this.list(candidate.owner, retainedSince, limit + 1, candidate.name)
 
@@ -131,8 +195,9 @@ export class InMemoryAgentSessions implements AgentSessionsPersistence {
     const match = matches[0]
 
     if (!match) {
-      this.insertChecked(candidate)
-      return { kind: 'new', record: clone(candidate) }
+      const created = { ...candidate, projectId: projectId ?? candidate.projectId }
+      this.insertChecked(created)
+      return { kind: 'new', record: clone(created) }
     }
 
     if (match.lastSeenAt >= activeSince) {
@@ -142,6 +207,7 @@ export class InMemoryAgentSessions implements AgentSessionsPersistence {
         role: match.role,
         roleLocator: match.roleLocator,
         roleContextProjectId: match.roleContextProjectId,
+        projectId: projectId ?? match.projectId,
       }
       this.insertChecked(fork)
       return { kind: 'forked', record: clone(fork) }
@@ -151,6 +217,10 @@ export class InMemoryAgentSessions implements AgentSessionsPersistence {
     stored.lastSeenAt =
       stored.lastSeenAt > candidate.lastSeenAt ? stored.lastSeenAt : candidate.lastSeenAt
     stored.calls += 1
+    if (projectId !== undefined) {
+      stored.projectId = projectId
+    }
+
     return { kind: 'resumed', record: clone(stored) }
   }
 

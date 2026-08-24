@@ -556,6 +556,7 @@ export class SpaceResourceAuthority {
       deadlineMs?: number
       signal?: AbortSignal
       maxBytes?: number
+      allowDuringClosure?: boolean
     },
   ): Promise<ResourceObservation> {
     const canonicalPath = normalizePath(path)
@@ -564,6 +565,7 @@ export class SpaceResourceAuthority {
     const deadlineMs = options?.deadlineMs
     const signal = options?.signal
     const maxBytes = options?.maxBytes
+    const allowDuringClosure = options?.allowDuringClosure
 
     if (maxBytes != null && (!Number.isSafeInteger(maxBytes) || maxBytes < 0)) {
       throw new Error('observation maxBytes must be a non-negative safe integer')
@@ -574,6 +576,7 @@ export class SpaceResourceAuthority {
       // AbortSignal is the intentional live control channel; scalar options are
       // captured above so caller mutation cannot retarget admitted work.
       ...(signal ? { signal } : {}),
+      ...(allowDuringClosure ? { allowDuringClosure: true } : {}),
     })
 
     try {

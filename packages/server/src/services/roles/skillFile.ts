@@ -86,6 +86,12 @@ export const parseSkillFile = (raw: string, directoryName: string): ParsedSkill 
   return skill
 }
 
+/** A Role may compose skills; a standalone Skill may not. Keep this eligibility
+ * predicate below the parser so discovery, exact winner selection and every
+ * library twin reject the same candidate before it can participate in resolution. */
+export const isResolvableAbilityManifest = (skill: ParsedSkill): boolean =>
+  skill.role || !('notarium.skills' in skill.metadata)
+
 export const bundledAbilityIdentityOf = (
   skill: SkillProjection,
   label: string,

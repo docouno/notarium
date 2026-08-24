@@ -1,3 +1,5 @@
+import { defineClientFailure } from '../../../libs/clientFailure'
+
 /** The addressed ability is not one this principal can reach: no such placement, no
  * such package, or no grant. Distinct from an internal failure so a route can answer
  * "not found" for the first and stay loud about the second.
@@ -11,5 +13,6 @@ export class AbilityUnavailableError extends Error {
   constructor(cause: string) {
     super('not found')
     this.cause = cause
+    defineClientFailure(this, { kind: 'not-found' })
   }
 }

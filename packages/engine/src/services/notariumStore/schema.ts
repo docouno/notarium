@@ -279,6 +279,10 @@ const IMPORT_SOURCE_SCHEMA = `
 ALTER TABLE notes ADD COLUMN source_locator TEXT;
 `
 
+const DOCUMENT_PROOF_CONTEXT_SCHEMA = `
+ALTER TABLE document_proofs ADD COLUMN context_json TEXT;
+`
+
 /** The ladder. INDEX_MIGRATIONS[0] is the FROZEN baseline — the meta+notes+FTS schema
  *  as it shipped at legacy version '7' (note_type included). A fresh index replays it
  *  from 0; a legacy '7' index replays it too, but every statement is CREATE IF NOT
@@ -293,6 +297,7 @@ export const INDEX_MIGRATIONS: readonly IndexMigration[] = [
   { sql: NOTE_ID_CLAIM_INDEX_SCHEMA },
   { sql: DOCUMENT_PROOF_SCHEMA },
   { sql: IMPORT_SOURCE_SCHEMA },
+  { sql: DOCUMENT_PROOF_CONTEXT_SCHEMA },
 ]
 
 /** The current ladder length — the integer version an index converges to. */

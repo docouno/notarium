@@ -5,7 +5,7 @@ import { ABILITY_AVAILABILITY_MODE, ABILITY_KIND, ROLE_SCOPE } from '@notarium/c
 import { DEFAULT_NOTE_TYPE } from '@notarium/core'
 import { useAgentsExplorer } from '../../composers/AgentsExplorerProvider'
 import { useAuth } from '../../composers/AuthProvider'
-import { useEditing } from '../../composers/EditingProvider'
+import { type NoteDraftEditor, useEditing } from '../../composers/EditingProvider'
 import { useSpace } from '../../composers/SpaceProvider'
 import { Button } from '../../core/Button'
 import { IconX } from '../../core/Icons'
@@ -37,7 +37,7 @@ export const AbilityDraftPage = ({ expectedKind }: { expectedKind?: 'roles' | 's
   const owner = mode === 'none' ? '@system' : (me?.username ?? '')
   const { scope, invalidate } = useAgentsExplorer()
   const { setBreadcrumbTail } = useAgentsShell()
-  const { space, canWrite } = useSpace()
+  const { space, spaces, personalSpace } = useSpace()
   const navigate = useNavigate()
   const editing = useEditing()
   const editorRef = useRef(editing.editor)
@@ -49,6 +49,8 @@ export const AbilityDraftPage = ({ expectedKind }: { expectedKind?: 'roles' | 's
   }, [abilityKind, setBreadcrumbTail])
   const [inventory, setInventory] = useState<MeAgentSkillsResponse | null>(null)
   const [skills, setSkills] = useState<AgentAbilitySummary[]>([])
+  const [personalAvailable, setPersonalAvailable] = useState(false)
+  const [spaceAvailable, setSpaceAvailable] = useState(false)
   const [failed, setFailed] = useState<string | null>(null)
   const createdAtRef = useRef<string | null>(null)
   // The last record actually persisted, so an unchanged draft is not rewritten.
@@ -63,14 +65,63 @@ export const AbilityDraftPage = ({ expectedKind }: { expectedKind?: 'roles' | 's
 
     void (async () => {
       try {
-        const { first, all } = await loadSkillInventory(scope?.spaceId ?? null)
+        const stored = readAbilityDraft(owner, draftId, abilityKind)
+        const draftSpace = stored?.creationSettings.space || space
+        const draftSpaceId =
+          (draftSpace === personalSpace?.slug ? personalSpace : null)?.id ??
+          spaces.find((candidate) => candidate.slug === draftSpace)?.id ??
+          (draftSpace === space ? scope?.spaceId : undefined)
+        const targetSpace = draftSpaceId ? { spaceId: draftSpaceId } : {}
+        const [{ first, all }, roleInventory] = await Promise.all([
+          loadSkillInventory(draftSpaceId ?? null),
+          abilityKind === ABILITY_KIND.role
+            ? api.agentRolesGet({ ...targetSpace, limit: 1 })
+            : Promise.resolve(null),
+        ])
 
         if (!alive) {
           return
         }
         setInventory(first)
         setSkills(all)
-        const stored = readAbilityDraft(owner, draftId, abilityKind)
+        const personalTargetAvailable =
+          (roleInventory?.installAvailability ?? first.installAvailability)?.personal === true
+        const spaceTargetAvailable = first.installAvailability?.spaces?.[draftSpace] === true
+        const canPublish = personalTargetAvailable || spaceTargetAvailable
+
+        const prepareTarget = (editor: NoteDraftEditor) => {
+          if (editor.abilityHome === ROLE_SCOPE.personal) {
+            return personalTargetAvailable ? ({ scope: ROLE_SCOPE.personal } as const) : null
+          }
+          if (!spaceTargetAvailable || editor.abilitySpace !== draftSpace) {
+            return null
+          }
+          if (editor.abilityAvailability === ABILITY_AVAILABILITY_MODE.allProjects) {
+            return {
+              scope: ROLE_SCOPE.space,
+              availability: { mode: ABILITY_AVAILABILITY_MODE.allProjects } as const,
+            } as const
+          }
+          if (editor.abilityProjects.length === 0) {
+            return null
+          }
+          const projectsById = new Map(first.projects.map((project) => [project.id, project]))
+          const projects = editor.abilityProjects.map((id) => projectsById.get(id)?.handle)
+
+          if (!projects.every((project): project is string => project != null)) {
+            return null
+          }
+
+          return {
+            scope: ROLE_SCOPE.space,
+            availability: {
+              mode: ABILITY_AVAILABILITY_MODE.selectedProjects,
+              projects,
+            } as const,
+          } as const
+        }
+        setPersonalAvailable(personalTargetAvailable)
+        setSpaceAvailable(spaceTargetAvailable)
         const now = new Date().toISOString()
         // A RESTORED session is not dirty exactly when it still equals the record it
         // opened on, so the storage writer must know which it is before it may decide
@@ -85,8 +136,8 @@ export const AbilityDraftPage = ({ expectedKind }: { expectedKind?: 'roles' | 's
           updatedAt: now,
           authoredDraft: { name: '', description: '', instructions: '', attachments: [] },
           creationSettings: {
-            home: ROLE_SCOPE.personal,
-            space,
+            home: personalTargetAvailable ? ROLE_SCOPE.personal : ROLE_SCOPE.space,
+            space: draftSpace,
             availability: ABILITY_AVAILABILITY_MODE.allProjects,
             projects: [],
           },
@@ -98,9 +149,8 @@ export const AbilityDraftPage = ({ expectedKind }: { expectedKind?: 'roles' | 's
         writtenRef.current = null
         editing.startSession({
           id: `ability-draft:${owner}:${draftId}`,
-          // Personal publication is always writable for the draft owner. Shared
-          // placements stay disabled below and are still authorization-checked by REST.
-          canWrite: true,
+          canWrite: canPublish,
+          canSave: (editor) => prepareTarget(editor) !== null,
           draft: {
             isNew: true,
             documentKind: 'ability',
@@ -118,8 +168,8 @@ export const AbilityDraftPage = ({ expectedKind }: { expectedKind?: 'roles' | 's
             abilityDescription: record.authoredDraft.description,
             attachments: record.authoredDraft.attachments,
             abilityHome: record.creationSettings.home,
-            abilitySpace: record.creationSettings.space || space,
-            abilitySpaceId: scope?.spaceId ?? '',
+            abilitySpace: record.creationSettings.space || draftSpace,
+            abilitySpaceId: draftSpaceId ?? '',
             abilityAvailability: record.creationSettings.availability,
             abilityProjects: record.creationSettings.projects,
             createdAt: null,
@@ -132,25 +182,23 @@ export const AbilityDraftPage = ({ expectedKind }: { expectedKind?: 'roles' | 's
             }),
           save: async (payload) => {
             const editor = editorRef.current
+            const target = prepareTarget(editor)
+
+            if (!target) {
+              throw new Error('The selected ability target is unavailable.')
+            }
             const identity = {
               name: payload.name ?? '',
               description: payload.description ?? '',
               instructions: payload.content ?? '',
             }
-            // Publication names projects by HANDLE — the package does not exist yet,
-            // so there is nothing to key a reach by id against. Everywhere after
-            // this the reach is stated in ids.
-            const covered = editor.abilityProjects.flatMap((id) => {
-              const project = first.projects.find((entry) => entry.id === id)
-              return project ? [project.handle] : []
-            })
 
             if (abilityKind === ABILITY_KIND.role) {
               // Two answers, not three: Personal, or the Space with the projects it
               // covers. "Only these projects" is a Space role with a chosen reach —
               // one package, several projects, which is what a copy used to be for.
               const input =
-                editor.abilityHome === ROLE_SCOPE.personal
+                target.scope === ROLE_SCOPE.personal
                   ? ({
                       ...identity,
                       scope: ROLE_SCOPE.personal,
@@ -161,31 +209,19 @@ export const AbilityDraftPage = ({ expectedKind }: { expectedKind?: 'roles' | 's
                       scope: ROLE_SCOPE.space,
                       space: editor.abilitySpace,
                       attachments: editor.attachments,
-                      availability:
-                        editor.abilityAvailability === ABILITY_AVAILABILITY_MODE.allProjects
-                          ? ({ mode: ABILITY_AVAILABILITY_MODE.allProjects } as const)
-                          : ({
-                              mode: ABILITY_AVAILABILITY_MODE.selectedProjects,
-                              projects: covered,
-                            } as const),
+                      availability: target.availability,
                     } as const)
 
               return api.agentRoleCreate(input)
             }
             const input =
-              editor.abilityHome === ROLE_SCOPE.personal
+              target.scope === ROLE_SCOPE.personal
                 ? ({ ...identity, scope: ROLE_SCOPE.personal } as const)
                 : ({
                     ...identity,
                     scope: ROLE_SCOPE.space,
                     space: editor.abilitySpace,
-                    availability:
-                      editor.abilityAvailability === ABILITY_AVAILABILITY_MODE.allProjects
-                        ? ({ mode: ABILITY_AVAILABILITY_MODE.allProjects } as const)
-                        : ({
-                            mode: ABILITY_AVAILABILITY_MODE.selectedProjects,
-                            projects: covered,
-                          } as const),
+                    availability: target.availability,
                   } as const)
 
             return api.agentSkillPublish(input)
@@ -210,7 +246,7 @@ export const AbilityDraftPage = ({ expectedKind }: { expectedKind?: 'roles' | 's
     // startSession is stable; editing itself deliberately stays out so typing
     // cannot re-seed the adapter's immutable initial draft.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [abilityKind, canWrite, draftId, kind, navigate, owner, space, scope?.spaceId])
+  }, [abilityKind, draftId, kind, navigate, owner, personalSpace, space, spaces, scope?.spaceId])
 
   useEffect(() => {
     // The route names a draft id and the editor answers for the session it was seeded
@@ -314,6 +350,11 @@ export const AbilityDraftPage = ({ expectedKind }: { expectedKind?: 'roles' | 's
   }
 
   return (
-    <AbilityEditorSurface projects={inventory.projects} skills={skills} spaceAvailable={canWrite} />
+    <AbilityEditorSurface
+      projects={inventory.projects}
+      skills={skills}
+      personalAvailable={personalAvailable}
+      spaceAvailable={spaceAvailable}
+    />
   )
 }

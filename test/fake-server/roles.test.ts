@@ -26,6 +26,56 @@ describe('role catalog → Add → effective → active walking skeleton', () =>
     )
   })
 
+  const enableLazyPersonalProvisioning = async () => {
+    await app.close()
+    app = await createApp(
+      {
+        ...caseToFixture(buildCaseWorld('agent-roles', { now: '2099-08-05T12:00:00.000Z' })),
+        capabilities: { spaceCreate: true },
+      },
+      { passwordVerifier: () => Promise.resolve(true) },
+    )
+  }
+
+  const enableStaticPersonalFallback = async (space: 'main' | 'team' = 'main') => {
+    await app.close()
+    const fixture = caseToFixture(
+      buildCaseWorld('agent-roles', { now: '2099-08-05T12:00:00.000Z' }),
+    )
+
+    fixture.auth!.members.push({ space, username: 'fresh', role: 'writer' })
+    app = await createApp(fixture, { passwordVerifier: () => Promise.resolve(true) })
+  }
+
+  const enableStaticSystemFallback = async () => {
+    await app.close()
+    const fixture = caseToFixture(
+      buildCaseWorld('agent-roles', { now: '2099-08-05T12:00:00.000Z' }),
+    )
+
+    fixture.auth = undefined
+    fixture.agentRoles = []
+    fixture.agentSkills = []
+    fixture.agentAbilityPreferences = []
+    fixture.agentSessions = []
+    app = await createApp(fixture)
+  }
+
+  const enableMintableSystemHome = async () => {
+    await app.close()
+    const fixture = caseToFixture(
+      buildCaseWorld('agent-roles', { now: '2099-08-05T12:00:00.000Z' }),
+    )
+
+    fixture.auth = undefined
+    fixture.capabilities = { spaceCreate: true }
+    fixture.agentRoles = []
+    fixture.agentSkills = []
+    fixture.agentAbilityPreferences = []
+    fixture.agentSessions = []
+    app = await createApp(fixture)
+  }
+
   afterEach(async () => {
     if (app) {
       await app.close()
@@ -40,6 +90,60 @@ describe('role catalog → Add → effective → active walking skeleton', () =>
     })
     expect(response.statusCode).toBe(200)
     return (response.headers['set-cookie'] as string).split(';')[0]
+  }
+
+  /** A scoped PAT over the real HTTP MCP transport. */
+  const mcpCaller = async (cookie: string, scope: 'read' | 'write' = 'read', spaces?: string[]) => {
+    const tokenResponse = await app.inject({
+      method: 'POST',
+      url: '/api/me/tokens',
+      headers: { cookie },
+      payload: { name: 'roles', scope, ...(spaces ? { spaces } : {}) },
+    })
+    expect(tokenResponse.statusCode).toBe(201)
+    const bearer = tokenResponse.json().token as string
+    await app.listen({ port: 0, host: '127.0.0.1' })
+    const port = (app.server.address() as AddressInfo).port
+
+    return async (name: string, args: Record<string, unknown>): Promise<Rpc> => {
+      const response = await fetch(`http://127.0.0.1:${port}/mcp`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json, text/event-stream',
+          authorization: `Bearer ${bearer}`,
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tools/call',
+          params: { name, arguments: args },
+        }),
+      })
+      return (await response.json()) as Rpc
+    }
+  }
+
+  const systemMcpCaller = async () => {
+    await app.listen({ port: 0, host: '127.0.0.1' })
+    const port = (app.server.address() as AddressInfo).port
+
+    return async (name: string, args: Record<string, unknown>): Promise<Rpc> => {
+      const response = await fetch(`http://127.0.0.1:${port}/mcp`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json, text/event-stream',
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tools/call',
+          params: { name, arguments: args },
+        }),
+      })
+      return (await response.json()) as Rpc
+    }
   }
 
   it('exposes catalog-only, owned-idle, and selected-session states without conflating them', async () => {
@@ -306,6 +410,54 @@ describe('role catalog → Add → effective → active walking skeleton', () =>
       payload: { enabled: false },
     })
     expect(rejected.statusCode).toBe(400)
+  })
+
+  it('keeps the human enabled preference available to an Owned-ability reader', async () => {
+    const robin = await login('robin', 'robin')
+    const maya = await login('maya', 'maya')
+    const inventory = await app.inject({
+      method: 'GET',
+      url: '/api/me/agent-roles?source=owned&q=launch-review&limit=100',
+      headers: { cookie: robin },
+    })
+
+    expect(inventory.statusCode, inventory.body).toBe(200)
+    const locator = inventory
+      .json()
+      .items.find(
+        (item: { name: string; locator: { location?: { scope: string } } }) =>
+          item.name === 'launch-review' && item.locator.location?.scope === 'space',
+      ).locator
+    const ref = encodeAbilityLocator(locator)
+    const disabled = await app.inject({
+      method: 'PUT',
+      url: `/api/me/agent-abilities/${ref}/enabled`,
+      headers: { cookie: robin },
+      payload: { enabled: false },
+    })
+
+    expect(disabled.statusCode, disabled.body).toBe(200)
+    const robinDetail = await app.inject({
+      method: 'GET',
+      url: `/api/me/agent-abilities/${ref}`,
+      headers: { cookie: robin },
+    })
+    const mayaDetail = await app.inject({
+      method: 'GET',
+      url: `/api/me/agent-abilities/${ref}`,
+      headers: { cookie: maya },
+    })
+
+    expect(robinDetail.statusCode, robinDetail.body).toBe(200)
+    expect(robinDetail.json()).toMatchObject({ ability: { enabled: false } })
+    expect(mayaDetail.statusCode, mayaDetail.body).toBe(200)
+    expect(mayaDetail.json()).toMatchObject({ ability: { enabled: true } })
+
+    const call = await mcpCaller(robin, 'write')
+    const refused = await call('edit_ability', { ref, enabled: true })
+
+    expect(refused.result?.isError).toBe(true)
+    expect(contentText(refused)).toBe('not found')
   })
 
   it('refuses every write aimed at a System ability, which owns no document to edit', async () => {
@@ -758,39 +910,6 @@ describe('role catalog → Add → effective → active walking skeleton', () =>
       return cookie
     }
 
-    /** A read-scoped PAT over the real HTTP surface — the gateway is a transport, not
-     *  an injectable route. */
-    const mcpCaller = async (cookie: string) => {
-      const tokenResponse = await app.inject({
-        method: 'POST',
-        url: '/api/me/tokens',
-        headers: { cookie },
-        payload: { name: 'roles', scope: 'read' },
-      })
-      expect(tokenResponse.statusCode).toBe(201)
-      const bearer = tokenResponse.json().token as string
-      await app.listen({ port: 0, host: '127.0.0.1' })
-      const port = (app.server.address() as AddressInfo).port
-
-      return async (name: string, args: Record<string, unknown>): Promise<Rpc> => {
-        const response = await fetch(`http://127.0.0.1:${port}/mcp`, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            accept: 'application/json, text/event-stream',
-            authorization: `Bearer ${bearer}`,
-          },
-          body: JSON.stringify({
-            jsonrpc: '2.0',
-            id: 1,
-            method: 'tools/call',
-            params: { name, arguments: args },
-          }),
-        })
-        return (await response.json()) as Rpc
-      }
-    }
-
     it('copies a catalog template into an exact Personal package without its address', async () => {
       const cookie = await login('sergey', 'sergey')
       const add = await app.inject({
@@ -862,35 +981,82 @@ describe('role catalog → Add → effective → active walking skeleton', () =>
       expect(sameNameProjectAdd.statusCode).toBe(201)
     })
 
-    it('pages the added roles and never lists the catalog', async () => {
+    it('pages runtime roles with compact bound cursors and never lists the catalog', async () => {
       const call = await mcpCaller(await addGrooming())
-      const firstRoles = await call('list_roles', { project: 'main', limit: 1 })
+      const firstRoles = await call('list_abilities', { project: 'main', kind: 'role', limit: 1 })
 
       // Three effective roles, not two: the two Added placements plus the shipping
       // System `research`, which is effective without an Add and pages after them.
       expect(firstRoles.result?.structuredContent).toEqual({
-        roles: [expect.objectContaining({ name: 'grooming', scope: 'project' })],
+        abilities: [expect.objectContaining({ name: 'grooming', scope: 'project' })],
         total: 3,
-        nextCursor: '1',
+        nextCursor: expect.stringMatching(/^[A-Za-z0-9_-]{16}$/),
+        nextAction: expect.objectContaining({
+          tool: 'list_abilities',
+          reason: 'next-page',
+        }),
       })
       expect(
-        (firstRoles.result?.structuredContent as { roles: Array<{ scope: string }> }).roles.some(
-          ({ scope }) => scope === 'catalog',
-        ),
+        (
+          firstRoles.result?.structuredContent as { abilities: Array<{ scope: string }> }
+        ).abilities.some(({ scope }) => scope === 'catalog'),
       ).toBe(false)
 
-      const nextRoles = await call('list_roles', { project: 'main', limit: 1, cursor: '1' })
+      const firstCursor = (firstRoles.result?.structuredContent as { nextCursor: string })
+        .nextCursor
+      const nextRoles = await call('list_abilities', {
+        project: 'main',
+        kind: 'role',
+        limit: 1,
+        cursor: firstCursor,
+      })
       expect(nextRoles.result?.structuredContent).toEqual({
-        roles: [expect.objectContaining({ name: 'release-reviewer', scope: 'personal' })],
+        abilities: [expect.objectContaining({ name: 'release-reviewer', scope: 'personal' })],
         total: 3,
-        nextCursor: '2',
+        nextCursor: expect.stringMatching(/^[A-Za-z0-9_-]{16}$/),
+        nextAction: expect.objectContaining({ reason: 'next-page' }),
       })
       // Paging still ENDS — one page later. The System role is the tail of the same
       // list and names its SOURCE where an Owned role names its placement.
-      const lastRoles = await call('list_roles', { project: 'main', limit: 1, cursor: '2' })
+      const nextCursor = (nextRoles.result?.structuredContent as { nextCursor: string }).nextCursor
+      const lastRoles = await call('list_abilities', {
+        project: 'main',
+        kind: 'role',
+        limit: 1,
+        cursor: nextCursor,
+      })
       expect(lastRoles.result?.structuredContent).toEqual({
-        roles: [expect.objectContaining({ name: 'research', source: 'system' })],
+        abilities: [expect.objectContaining({ name: 'research', source: 'system' })],
         total: 3,
+      })
+
+      const wrongView = await call('list_abilities', {
+        project: 'main',
+        view: 'authoring',
+        kind: 'role',
+        limit: 1,
+        cursor: firstCursor,
+      })
+      expect(wrongView.result?.isError).toBe(true)
+      expect(JSON.stringify(wrongView.result?.content)).toContain(
+        'cursor does not match this ability view, filter, or project context',
+      )
+
+      const zero = await call('list_abilities', {
+        project: 'main',
+        kind: 'role',
+        q: 'definitely-missing',
+        limit: 7,
+      })
+      expect(zero.result?.structuredContent).toMatchObject({
+        abilities: [],
+        total: 0,
+        nextAction: {
+          tool: 'list_abilities',
+          arguments: { view: 'runtime', project: 'main', kind: 'role', limit: 7 },
+          reason: 'zero-results',
+          requiredBefore: 'ability-activation-or-answer',
+        },
       })
     })
 
@@ -923,10 +1089,16 @@ describe('role catalog → Add → effective → active walking skeleton', () =>
       // What this asserts is that both ADDED placements are offered under their own
       // scope. The shipping System role rides the same list and is not the subject.
       expect(opened.result?.structuredContent).toMatchObject({
-        roles: expect.arrayContaining([
-          expect.objectContaining({ name: 'grooming', source: 'owned', scope: 'personal' }),
+        abilities: expect.arrayContaining([
+          expect.objectContaining({
+            name: 'grooming',
+            kind: 'role',
+            source: 'owned',
+            scope: 'personal',
+          }),
           expect.objectContaining({
             name: 'release-reviewer',
+            kind: 'role',
             source: 'owned',
             scope: 'personal',
           }),
@@ -937,6 +1109,15 @@ describe('role catalog → Add → effective → active walking skeleton', () =>
           skills: [{ name: 'grooming-evidence' }],
         },
       })
+      expect(opened.result?.structuredContent).not.toHaveProperty('roles')
+      expect(opened.result?.structuredContent).not.toHaveProperty('rolesTruncated')
+      expect(
+        (
+          opened.result?.structuredContent as {
+            abilities: Array<Record<string, unknown>>
+          }
+        ).abilities.every((ability) => !('ref' in ability) && !('versions' in ability)),
+      ).toBe(true)
       expect(
         (opened.result?.structuredContent as { activeRole: { role: object } }).activeRole.role,
       ).not.toHaveProperty('packageId')
@@ -953,6 +1134,143 @@ describe('role catalog → Add → effective → active walking skeleton', () =>
       expect(contentText(repeated)).toContain('# Active role: grooming')
       expect(contentText(repeated)).toContain('Establish the underlying pain')
       expect(contentText(repeated)).toContain('## Linked skill: grooming-evidence')
+
+      const skill = await call('use_skill', { skill: 'grooming-evidence', session })
+      expect(skill.result?.isError).not.toBe(true)
+      expect(skill.result?.structuredContent).toMatchObject({
+        status: 'activated',
+        skill: {
+          name: 'grooming-evidence',
+          kind: 'skill',
+          source: 'owned',
+          scope: 'personal',
+        },
+        instructions: expect.stringContaining('Read the current product contract'),
+      })
+      expect(contentText(skill)).toContain('# Active skill: grooming-evidence')
+
+      const repeatedSkill = await call('use_skill', { skill: 'grooming-evidence', session })
+      expect(repeatedSkill.result?.structuredContent).toEqual(skill.result?.structuredContent)
+      const aliasedSkill = await call('use_skill', { name: 'grooming-evidence', session })
+      expect(aliasedSkill.result?.structuredContent).toEqual(skill.result?.structuredContent)
+      const bothSkillSelectors = await call('use_skill', {
+        skill: 'grooming-evidence',
+        name: 'grooming-evidence',
+        session,
+      })
+      expect(bothSkillSelectors.result?.isError).toBe(true)
+      expect(contentText(bothSkillSelectors)).toContain('provide exactly one of skill or name')
+      const noSkillSelector = await call('use_skill', { session })
+      expect(noSkillSelector.result?.isError).toBe(true)
+      expect(contentText(noSkillSelector)).toContain('provide exactly one of skill or name')
+      const roleAfterSkills = await call('use_role', { role: 'grooming', session })
+      expect(roleAfterSkills.result?.structuredContent).toMatchObject({ status: 'already_active' })
+    })
+
+    it('uses the sticky start_session project for discovery, activation, and resume', async () => {
+      const cookie = await addGrooming()
+      const call = await mcpCaller(cookie)
+      const opened = await call('start_session', { project: 'main' })
+      const session = (opened.result?.structuredContent as { session: { id: string } }).session.id
+
+      const listed = await call('list_abilities', { session, kind: 'role', limit: 50 })
+      expect(listed.result?.structuredContent).toMatchObject({
+        abilities: expect.arrayContaining([
+          expect.objectContaining({ name: 'grooming', source: 'owned', scope: 'project' }),
+        ]),
+      })
+      expect(contentText(listed)).toContain("from this session's sticky start_session hint")
+      expect(contentText(listed)).toContain('project "main"')
+
+      const bootstrapped = await call('start_session', {
+        session: { id: session },
+        role: 'grooming',
+      })
+      expect(bootstrapped.result?.structuredContent).toMatchObject({
+        activeRole: { role: { name: 'grooming', scope: 'project' } },
+      })
+      expect(contentText(bootstrapped)).toContain("from this session's sticky start_session hint")
+
+      const activated = await call('use_role', { role: 'grooming', session })
+      expect(activated.result?.structuredContent).toMatchObject({
+        status: 'already_active',
+        role: { name: 'grooming', scope: 'project' },
+      })
+      expect(contentText(activated)).toContain("from this session's sticky start_session hint")
+
+      const beforeSkill = await app.inject({
+        method: 'GET',
+        url: '/api/me/agent-sessions?aggregates=0',
+        headers: { cookie },
+      })
+      const beforeSkillEpisode = beforeSkill
+        .json()
+        .sessions.find((candidate: { id: string }) => candidate.id === session)
+      const skill = await call('use_skill', { skill: 'grooming-evidence', session })
+      expect(skill.result?.structuredContent).toMatchObject({
+        skill: { name: 'grooming-evidence' },
+      })
+      expect(contentText(skill)).toContain("from this session's sticky start_session hint")
+      const afterSkill = await app.inject({
+        method: 'GET',
+        url: '/api/me/agent-sessions?aggregates=0',
+        headers: { cookie },
+      })
+      const afterSkillEpisode = afterSkill
+        .json()
+        .sessions.find((candidate: { id: string }) => candidate.id === session)
+
+      expect(afterSkillEpisode).toMatchObject({
+        calls: beforeSkillEpisode.calls,
+        lastSeenAt: beforeSkillEpisode.lastSeenAt,
+      })
+
+      const resumed = await call('start_session', { session: { id: session } })
+      expect(resumed.result?.structuredContent).toMatchObject({
+        activeRole: { role: { name: 'grooming', scope: 'project' } },
+      })
+      expect(contentText(resumed)).toContain("from this session's sticky start_session hint")
+    })
+
+    it('returns typed unhealthy attachment diagnostics instead of a generic role refusal', async () => {
+      const call = await mcpCaller(await login('maya', 'maya'))
+      const opened = await call('start_session', { session: { name: 'v5-health' } })
+      const session = (opened.result?.structuredContent as { session: { id: string } }).session.id
+      const refused = await call('use_role', { role: 'release-captain', session })
+      const text = contentText(refused)
+
+      expect(refused.result?.isError).toBe(true)
+      expect(text).toContain('release-captain" is unhealthy')
+      expect(text).toContain('invalid-locator')
+      expect(text).toContain('repair the malformed binding')
+      expect(text).not.toContain('not effective in this scope')
+    })
+
+    it('sends a disabled System role only to the Agents UI, never to edit_ability', async () => {
+      const cookie = await login('fresh', 'fresh')
+      const inventory = await app.inject({
+        method: 'GET',
+        url: '/api/me/agent-roles?q=research&source=system',
+        headers: { cookie },
+      })
+      const system = inventory.json().items[0]
+      const disabled = await app.inject({
+        method: 'PUT',
+        url: `/api/me/agent-abilities/${encodeAbilityLocator(system.locator)}/enabled`,
+        headers: { cookie },
+        payload: { enabled: false },
+      })
+      expect(disabled.statusCode, disabled.body).toBe(200)
+      const call = await mcpCaller(cookie)
+      const opened = await call('start_session', { session: { name: 'v5-disabled' } })
+      const session = (opened.result?.structuredContent as { session: { id: string } }).session.id
+      const refused = await call('use_role', { role: 'research', session })
+      const text = contentText(refused)
+
+      expect(refused.result?.isError).toBe(true)
+      expect(text).toContain('research" is disabled (system, system')
+      expect(text).toContain('open the Agents UI')
+      expect(text).not.toContain('edit_ability')
     })
 
     it('prefers the project fork of the same name over the Personal one', async () => {
@@ -980,6 +1298,9 @@ describe('role catalog → Add → effective → active walking skeleton', () =>
       const resumed = await call('start_session', { session: { id: session } })
       expect(resumed.result?.structuredContent).not.toHaveProperty('activeRole')
       expect(contentText(resumed)).not.toContain('# Active role: grooming')
+      expect(contentText(resumed)).toContain('Saved role was not restored')
+      expect(contentText(resumed)).toContain('saved: "main", current: Personal')
+      expect(contentText(resumed)).toContain('call use_role for "grooming"')
       const explicitlyResumed = await call('start_session', {
         session: { id: session },
         role: 'grooming',
@@ -1070,7 +1391,7 @@ describe('role catalog → Add → effective → active walking skeleton', () =>
         jsonrpc: '2.0',
         id: 1,
         method: 'tools/call',
-        params: { name: 'list_roles', arguments: {} },
+        params: { name: 'list_abilities', arguments: { kind: 'role' } },
       }),
     })
     const rpc = (await response.json()) as Rpc
@@ -1078,8 +1399,8 @@ describe('role catalog → Add → effective → active walking skeleton', () =>
     // Personal library. A System role ships with the host and is effective under any
     // principal, so its presence is not the leak this guards — an owned entry is.
     expect(
-      (rpc.result?.structuredContent as { roles: Array<{ source: string }> }).roles.filter(
-        (role) => role.source === 'owned',
+      (rpc.result?.structuredContent as { abilities: Array<{ source: string }> }).abilities.filter(
+        (ability) => ability.source === 'owned',
       ),
     ).toEqual([])
   })
@@ -1407,6 +1728,44 @@ describe('role catalog → Add → effective → active walking skeleton', () =>
     })
   })
 
+  it('keeps human Personal and Project overrides of a System role while preserving duplicate 409', async () => {
+    const sergey = await login('sergey', 'sergey')
+    const create = (scope: 'personal' | 'project') =>
+      app.inject({
+        method: 'POST',
+        url: '/api/me/agent-roles/custom',
+        headers: { cookie: sergey },
+        payload: {
+          name: 'research',
+          description: `${scope} human override of the System role.`,
+          instructions: `# Research ${scope}\n\nHuman-authored override.`,
+          ...(scope === 'personal'
+            ? { scope: 'personal' }
+            : { scope: 'project', project: 'main/other' }),
+        },
+      })
+    const personal = await create('personal')
+    const project = await create('project')
+
+    expect(personal.statusCode, personal.body).toBe(201)
+    expect(personal.json()).toMatchObject({
+      role: { name: 'research', scope: 'personal' },
+      locator: { source: 'owned', kind: 'role', location: { scope: 'personal' } },
+    })
+    expect(project.statusCode, project.body).toBe(201)
+    expect(project.json()).toMatchObject({
+      role: { name: 'research', scope: 'project', project: 'main/other' },
+      locator: { source: 'owned', kind: 'role', location: { scope: 'project' } },
+    })
+    const duplicate = await create('personal')
+
+    expect(duplicate.statusCode, duplicate.body).toBe(409)
+    expect(duplicate.json()).toEqual({
+      error: 'role "research" already exists in personal',
+      reason: 'role_exists',
+    })
+  })
+
   it('publishes an attached Role, edits it through note CAS, and detaches by exact locator', async () => {
     const maya = await login('maya', 'maya')
     const skills = await app.inject({
@@ -1532,6 +1891,417 @@ describe('role catalog → Add → effective → active walking skeleton', () =>
     expect(stale.json()).toMatchObject({ reason: 'version_conflict' })
   })
 
+  it('repairs a projection-less physical skill root through the compatibility note door', async () => {
+    const fixture = caseToFixture(
+      buildCaseWorld('agent-roles', { now: '2099-08-05T12:00:00.000Z' }),
+    )
+    const personal = fixture.spaces.find((space) => space.slug === 'maya-home')!
+    const noteId = 'Malformed001'
+
+    personal.notes.push({
+      id: noteId,
+      title: 'Malformed role',
+      class: 'skill',
+      filePath: `.notarium/skills/${noteId}/SKILL.md`,
+      content: '# Malformed role\n\nRepair this body.',
+      frontmatter: `notarium-id: ${noteId}\nname: malformed-repair\ndescription: "   "\nmetadata:\n  notarium.kind: role`,
+    })
+    await app.close()
+    app = await createApp(fixture, { passwordVerifier: () => Promise.resolve(true) })
+    const maya = await login('maya', 'maya')
+    const before = await app.inject({
+      method: 'GET',
+      url: `/api/note?id=${noteId}`,
+      headers: { cookie: maya },
+    })
+    expect(before.statusCode, before.body).toBe(200)
+
+    const typed = await app.inject({
+      method: 'POST',
+      url: '/api/note',
+      headers: { cookie: maya },
+      payload: {
+        originalId: noteId,
+        versionToken: before.json().versionToken,
+        content: '# Malformed role\n\nTyped attachment edit must not guess.',
+        abilityLocator: {
+          source: 'owned',
+          kind: 'role',
+          packageId: noteId,
+          location: { scope: 'personal', spaceId: 'maya-home' },
+        },
+        attachments: [],
+      },
+    })
+    expect(typed.statusCode, typed.body).toBe(400)
+    expect(typed.json()).toEqual({
+      error: 'Role attachments require an editable Role package root',
+    })
+
+    const repaired = await app.inject({
+      method: 'POST',
+      url: '/api/note',
+      headers: { cookie: maya },
+      payload: {
+        originalId: noteId,
+        versionToken: before.json().versionToken,
+        content: '# Repaired role\n\nThe compatibility writer repaired this package.',
+        description: 'A valid description supplied by the compatibility write.',
+      },
+    })
+
+    expect(repaired.statusCode, repaired.body).toBe(200)
+    const after = await app.inject({
+      method: 'GET',
+      url: `/api/note?id=${noteId}`,
+      headers: { cookie: maya },
+    })
+    expect(after.statusCode, after.body).toBe(200)
+    expect(after.json()).toMatchObject({
+      id: noteId,
+      documentTitle: 'Repaired role',
+      agentKind: 'role',
+      frontmatter: {
+        name: 'malformed-repair',
+        description: 'A valid description supplied by the compatibility write.',
+      },
+    })
+  })
+
+  it('commits an ability document and its reach through one resumable save door', async () => {
+    const maya = await login('maya', 'maya')
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/me/agent-roles/custom',
+      headers: { cookie: maya },
+      payload: {
+        name: 'single-save-reviewer',
+        description: 'Before the compound save.',
+        instructions: '# Single save reviewer\n\nBefore the compound save.',
+        scope: 'space',
+        space: 'team',
+      },
+    })
+    expect(created.statusCode, created.body).toBe(201)
+    const locator = created.json().locator
+
+    const saved = await app.inject({
+      method: 'PUT',
+      url: `/api/me/agent-abilities/${encodeAbilityLocator(locator)}/save`,
+      headers: { cookie: maya },
+      payload: {
+        content: '# Single save reviewer\n\nAfter the compound save.',
+        description: 'After the compound save.',
+        covers: null,
+        versionToken: created.json().versionToken,
+      },
+    })
+
+    expect(saved.statusCode, saved.body).toBe(200)
+    expect(saved.json()).toMatchObject({
+      locator,
+      noteId: created.json().noteId,
+      versionToken: expect.any(String),
+      steps: [
+        { step: 'document', outcome: 'applied' },
+        { step: 'availability', outcome: 'skipped' },
+      ],
+    })
+    const detail = await app.inject({
+      method: 'GET',
+      url: `/api/me/agent-abilities/${encodeAbilityLocator(locator)}`,
+      headers: { cookie: maya },
+    })
+    expect(detail.statusCode, detail.body).toBe(200)
+    expect(detail.json()).toMatchObject({
+      ability: {
+        description: 'After the compound save.',
+        instructions: 'After the compound save.',
+        availability: { mode: 'all-projects' },
+      },
+    })
+
+    const repeated = await app.inject({
+      method: 'PUT',
+      url: `/api/me/agent-abilities/${encodeAbilityLocator(locator)}/save`,
+      headers: { cookie: maya },
+      payload: {
+        content: '# Single save reviewer\n\nAfter the compound save.',
+        description: 'After the compound save.',
+        covers: null,
+        versionToken: saved.json().versionToken,
+      },
+    })
+    expect(repeated.statusCode, repeated.body).toBe(200)
+    expect(repeated.json()).toMatchObject({
+      versionToken: saved.json().versionToken,
+      steps: [
+        { step: 'document', outcome: 'skipped' },
+        { step: 'availability', outcome: 'skipped' },
+      ],
+    })
+
+    const partial = await app.inject({
+      method: 'PUT',
+      url: `/api/me/agent-abilities/${encodeAbilityLocator(locator)}/save`,
+      headers: { cookie: maya },
+      payload: {
+        content: '# Single save reviewer\n\nThe document lands before the failed reach.',
+        description: 'The document lands before the failed reach.',
+        covers: ['missing-project'],
+        versionToken: repeated.json().versionToken,
+      },
+    })
+    expect(partial.statusCode, partial.body).toBe(200)
+    expect(partial.json()).toMatchObject({
+      locator,
+      versionToken: expect.any(String),
+      steps: [
+        { step: 'document', outcome: 'applied' },
+        { step: 'availability', outcome: 'failed', error: 'not found' },
+      ],
+    })
+    expect(partial.json().versionToken).not.toBe(repeated.json().versionToken)
+  })
+
+  it('resumes later Save steps after an already-written attachment disappears', async () => {
+    const maya = await login('maya', 'maya')
+    const skill = await app.inject({
+      method: 'POST',
+      url: '/api/me/agent-skills',
+      headers: { cookie: maya },
+      payload: {
+        name: 'save-retry-evidence',
+        description: 'Exists for the first document commit only.',
+        instructions: '# Save retry evidence\n\nTemporary dependency.',
+        scope: 'space',
+        space: 'team',
+        availability: { mode: 'all-projects' },
+      },
+    })
+    expect(skill.statusCode, skill.body).toBe(201)
+    const attachment = {
+      kind: 'exact' as const,
+      locator: skill.json().locator,
+      label: 'save-retry-evidence',
+    }
+    const role = await app.inject({
+      method: 'POST',
+      url: '/api/me/agent-roles/custom',
+      headers: { cookie: maya },
+      payload: {
+        name: 'save-retry-role',
+        description: 'Exercises a partial compound Save.',
+        instructions: '# Save retry role\n\nBefore the partial Save.',
+        scope: 'space',
+        space: 'team',
+        attachments: [attachment],
+      },
+    })
+    expect(role.statusCode, role.body).toBe(201)
+    const locator = role.json().locator
+    const body = {
+      content: '# Save retry role\n\nThe authored document already landed.',
+      description: 'The authored document already landed.',
+      attachments: [attachment],
+      enabled: false,
+    }
+    const partial = await app.inject({
+      method: 'PUT',
+      url: `/api/me/agent-abilities/${encodeAbilityLocator(locator)}/save`,
+      headers: { cookie: maya },
+      payload: {
+        ...body,
+        covers: ['missing-project'],
+        versionToken: role.json().versionToken,
+      },
+    })
+
+    expect(partial.statusCode, partial.body).toBe(200)
+    expect(partial.json()).toMatchObject({
+      steps: [
+        { step: 'document', outcome: 'applied' },
+        { step: 'availability', outcome: 'failed' },
+      ],
+    })
+    const removed = await app.inject({
+      method: 'DELETE',
+      url: `/api/note?id=${encodeURIComponent(skill.json().skill.noteId)}`,
+      headers: { cookie: maya },
+    })
+    expect(removed.statusCode, removed.body).toBe(200)
+
+    const resumed = await app.inject({
+      method: 'PUT',
+      url: `/api/me/agent-abilities/${encodeAbilityLocator(locator)}/save`,
+      headers: { cookie: maya },
+      payload: {
+        ...body,
+        covers: null,
+        versionToken: partial.json().versionToken,
+      },
+    })
+
+    expect(resumed.statusCode, resumed.body).toBe(200)
+    expect(resumed.json()).toMatchObject({
+      versionToken: partial.json().versionToken,
+      steps: [
+        { step: 'document', outcome: 'skipped' },
+        { step: 'availability', outcome: 'skipped' },
+        { step: 'enabled', outcome: 'applied' },
+      ],
+    })
+  })
+
+  it('returns stale Save CAS with current before checking a disappeared attachment', async () => {
+    const maya = await login('maya', 'maya')
+    const skill = await app.inject({
+      method: 'POST',
+      url: '/api/me/agent-skills',
+      headers: { cookie: maya },
+      payload: {
+        name: 'stale-cas-evidence',
+        description: 'Removed before the stale retry.',
+        instructions: '# Stale CAS evidence\n\nTemporary dependency.',
+        scope: 'personal',
+      },
+    })
+    expect(skill.statusCode, skill.body).toBe(201)
+    const attachment = {
+      kind: 'exact' as const,
+      locator: skill.json().locator,
+      label: 'stale-cas-evidence',
+    }
+    const role = await app.inject({
+      method: 'POST',
+      url: '/api/me/agent-roles/custom',
+      headers: { cookie: maya },
+      payload: {
+        name: 'stale-cas-role',
+        description: 'Before the concurrent edit.',
+        instructions: '# Stale CAS role\n\nBefore the concurrent edit.',
+        scope: 'personal',
+        attachments: [attachment],
+      },
+    })
+    expect(role.statusCode, role.body).toBe(201)
+    const ref = encodeAbilityLocator(role.json().locator)
+    const advanced = await app.inject({
+      method: 'PUT',
+      url: `/api/me/agent-abilities/${ref}/save`,
+      headers: { cookie: maya },
+      payload: {
+        content: '# Stale CAS role\n\nA concurrent document edit.',
+        description: 'A concurrent document edit.',
+        attachments: [attachment],
+        covers: null,
+        versionToken: role.json().versionToken,
+      },
+    })
+    expect(advanced.statusCode, advanced.body).toBe(200)
+    const removed = await app.inject({
+      method: 'DELETE',
+      url: `/api/note?id=${encodeURIComponent(skill.json().skill.noteId)}`,
+      headers: { cookie: maya },
+    })
+    expect(removed.statusCode, removed.body).toBe(200)
+
+    const stale = await app.inject({
+      method: 'PUT',
+      url: `/api/me/agent-abilities/${ref}/save`,
+      headers: { cookie: maya },
+      payload: {
+        content: '# Stale CAS role\n\nA stale overwrite.',
+        description: 'A stale overwrite.',
+        attachments: [attachment],
+        covers: null,
+        versionToken: role.json().versionToken,
+      },
+    })
+
+    expect(stale.statusCode, stale.body).toBe(409)
+    expect(stale.json()).toMatchObject({
+      reason: 'version_conflict',
+      current: {
+        id: role.json().noteId,
+        versionToken: advanced.json().versionToken,
+      },
+    })
+  })
+
+  it('continues a compound save from the pre-move locator by package identity', async () => {
+    const maya = await login('maya', 'maya')
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/me/agent-roles/custom',
+      headers: { cookie: maya },
+      payload: {
+        name: 'moving-save-reviewer',
+        description: 'Starts in one project.',
+        instructions: '# Moving save reviewer\n\nStarts in one project.',
+        scope: 'project',
+        project: 'team/other',
+      },
+    })
+    expect(created.statusCode, created.body).toBe(201)
+    const original = created.json().locator
+    const library = await app.inject({
+      method: 'GET',
+      url: '/api/me/agent-roles?limit=100',
+      headers: { cookie: maya },
+    })
+    expect(library.statusCode, library.body).toBe(200)
+    const anotherProject = library
+      .json()
+      .projects.find(
+        (project: { id: string; space: string }) =>
+          project.space === 'team' && project.id !== original.location.projectId,
+      )
+    expect(anotherProject).toBeDefined()
+    const covers = [original.location.projectId, anotherProject.id]
+    const first = await app.inject({
+      method: 'PUT',
+      url: `/api/me/agent-abilities/${encodeAbilityLocator(original)}/save`,
+      headers: { cookie: maya },
+      payload: {
+        content: '# Moving save reviewer\n\nThe first save moves the package.',
+        description: 'The first save moves the package.',
+        covers,
+        versionToken: created.json().versionToken,
+      },
+    })
+    expect(first.statusCode, first.body).toBe(200)
+    expect(first.json()).toMatchObject({
+      locator: { location: { scope: 'space' } },
+      steps: [
+        { step: 'document', outcome: 'applied' },
+        { step: 'home', outcome: 'applied' },
+        { step: 'availability', outcome: 'applied' },
+      ],
+    })
+
+    const continued = await app.inject({
+      method: 'PUT',
+      // Deliberately stale: an interrupted caller still owns this exact ref.
+      url: `/api/me/agent-abilities/${encodeAbilityLocator(original)}/save`,
+      headers: { cookie: maya },
+      payload: {
+        content: '# Moving save reviewer\n\nThe retry found the moved package.',
+        description: 'The retry found the moved package.',
+        covers,
+        versionToken: first.json().versionToken,
+      },
+    })
+    expect(continued.statusCode, continued.body).toBe(200)
+    expect(continued.json()).toMatchObject({
+      locator: first.json().locator,
+      steps: [
+        { step: 'document', outcome: 'applied' },
+        { step: 'availability', outcome: 'skipped' },
+      ],
+    })
+  })
+
   it('updates Space Skill availability independently from authored content', async () => {
     const maya = await login('maya', 'maya')
     const inventory = await app.inject({
@@ -1552,6 +2322,38 @@ describe('role catalog → Add → effective → active walking skeleton', () =>
     expect(skill).toBeDefined()
     expect(project).toBeDefined()
     const encoded = encodeAbilityLocator(skill.locator)
+    const detailBefore = await app.inject({
+      method: 'GET',
+      url: `/api/me/agent-abilities/${encoded}`,
+      headers: { cookie: maya },
+    })
+    const note = await app.inject({
+      method: 'GET',
+      url: `/api/note?id=${encodeURIComponent(skill.noteId)}`,
+      headers: { cookie: maya },
+    })
+    const invalidComposition = await app.inject({
+      method: 'PUT',
+      url: `/api/me/agent-abilities/${encoded}/save`,
+      headers: { cookie: maya },
+      payload: {
+        content: `# ${detailBefore.json().ability.title}\n\n${detailBefore.json().ability.instructions}`,
+        description: detailBefore.json().ability.description,
+        attachments: [],
+        covers: null,
+        versionToken: note.json().versionToken,
+      },
+    })
+    expect(invalidComposition.statusCode, invalidComposition.body).toBe(400)
+    expect(invalidComposition.json()).toEqual({
+      error: 'Skill abilities do not have attachments',
+    })
+    const unchanged = await app.inject({
+      method: 'GET',
+      url: `/api/note?id=${encodeURIComponent(skill.noteId)}`,
+      headers: { cookie: maya },
+    })
+    expect(unchanged.json().versionToken).toBe(note.json().versionToken)
 
     const all = await app.inject({
       method: 'PUT',
@@ -1584,7 +2386,472 @@ describe('role catalog → Add → effective → active walking skeleton', () =>
     })
   })
 
+  it('publishes the first Personal ability while lazy provisioning its human owner', async () => {
+    await enableLazyPersonalProvisioning()
+    const cookie = await login('fresh', 'fresh')
+    const before = await app.inject({ method: 'GET', url: '/api/me', headers: { cookie } })
+
+    expect(before.statusCode, before.body).toBe(200)
+    expect(before.json().personalSpace).toBeNull()
+
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/me/agent-skills',
+      headers: { cookie },
+      payload: {
+        name: 'first-human-personal',
+        description: 'Created on the lazy first touch.',
+        instructions: '# First human personal\n\nProvision and publish together.',
+        scope: 'personal',
+      },
+    })
+
+    expect(created.statusCode, created.body).toBe(201)
+    expect(created.json()).toMatchObject({
+      skill: { name: 'first-human-personal', scope: 'personal' },
+      locator: { location: { scope: 'personal', spaceId: expect.any(String) } },
+      versionToken: expect.any(String),
+    })
+    const after = await app.inject({ method: 'GET', url: '/api/me', headers: { cookie } })
+
+    expect(after.statusCode, after.body).toBe(200)
+    expect(after.json().personalSpace).toEqual(expect.any(String))
+    const detail = await app.inject({
+      method: 'GET',
+      url: `/api/me/agent-abilities/${encodeAbilityLocator(created.json().locator)}`,
+      headers: { cookie },
+    })
+
+    expect(detail.statusCode, detail.body).toBe(200)
+    expect(detail.json()).toMatchObject({
+      ability: { name: 'first-human-personal', source: 'owned' },
+    })
+  })
+
+  it('publishes the first Personal ability for an unrestricted write agent', async () => {
+    await enableLazyPersonalProvisioning()
+    const cookie = await login('fresh', 'fresh')
+    const call = await mcpCaller(cookie, 'write')
+    const created = await call('create_ability', {
+      kind: 'skill',
+      name: 'first-agent-personal',
+      description: 'Created by an agent on the lazy first touch.',
+      instructions: '# First agent personal\n\nProvision and publish together.',
+      placement: { home: 'personal' },
+      idempotencyKey: 'first-agent-personal-one',
+    })
+
+    expect(created.result?.isError, contentText(created)).not.toBe(true)
+    expect(created.result?.structuredContent).toMatchObject({
+      outcome: 'created',
+      name: 'first-agent-personal',
+      ref: expect.any(String),
+    })
+    const after = await app.inject({ method: 'GET', url: '/api/me', headers: { cookie } })
+
+    expect(after.statusCode, after.body).toBe(200)
+    expect(after.json().personalSpace).toEqual(expect.any(String))
+    const opened = await call('get_ability', {
+      ref: (created.result?.structuredContent as { ref: string }).ref,
+    })
+
+    expect(opened.result?.isError, contentText(opened)).not.toBe(true)
+    expect(opened.result?.structuredContent).toMatchObject({
+      ability: { name: 'first-agent-personal', source: 'owned' },
+    })
+  })
+
+  it('refuses a narrowed agent before lazy Personal provisioning has any side effect', async () => {
+    await enableLazyPersonalProvisioning()
+    const cookie = await login('robin', 'robin')
+    const before = await app.inject({ method: 'GET', url: '/api/me', headers: { cookie } })
+
+    expect(before.statusCode, before.body).toBe(200)
+    expect(before.json().personalSpace).toBeNull()
+
+    const call = await mcpCaller(cookie, 'write', ['team'])
+    const refused = await call('create_ability', {
+      kind: 'skill',
+      name: 'narrowed-personal-refusal',
+      description: 'Must not provision outside the token narrowing.',
+      instructions: '# Narrowed personal refusal\n\nLeave no durable state.',
+      placement: { home: 'personal' },
+      idempotencyKey: 'narrowed-personal-refusal-one',
+    })
+
+    expect(refused.result?.isError).toBe(true)
+    expect(contentText(refused)).toBe('not found')
+    const after = await app.inject({ method: 'GET', url: '/api/me', headers: { cookie } })
+
+    expect(after.statusCode, after.body).toBe(200)
+    expect(after.json().personalSpace).toBeNull()
+  })
+
+  it('keeps an existing Personal home writable when the agent is narrowed to it', async () => {
+    const cookie = await login('maya', 'maya')
+    const call = await mcpCaller(cookie, 'write', ['maya-home'])
+    const created = await call('create_ability', {
+      kind: 'skill',
+      name: 'narrowed-existing-personal',
+      description: 'The explicit Personal grant remains usable.',
+      instructions: '# Narrowed existing Personal\n\nPublish inside the token narrowing.',
+      placement: { home: 'personal' },
+      idempotencyKey: 'narrowed-existing-personal-one',
+    })
+
+    expect(created.result?.isError, contentText(created)).not.toBe(true)
+    expect(created.result?.structuredContent).toMatchObject({
+      outcome: 'created',
+      name: 'narrowed-existing-personal',
+    })
+  })
+
+  it('does not turn an operator-static fallback into Personal write authority', async () => {
+    const cookie = await login('fresh', 'fresh')
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/me/agent-skills',
+      headers: { cookie },
+      payload: {
+        name: 'static-fallback-refusal',
+        description: 'The first configured space is not implicitly mine.',
+        instructions: '# Static fallback refusal\n\nRequire a real writer grant.',
+        scope: 'personal',
+      },
+    })
+
+    expect(created.statusCode, created.body).toBe(503)
+    expect(created.json()).toEqual({
+      error: 'role installation is unavailable for this location',
+      reason: 'role_install_unavailable',
+    })
+    const after = await app.inject({ method: 'GET', url: '/api/me', headers: { cookie } })
+
+    expect(after.statusCode, after.body).toBe(200)
+    expect(after.json().personalSpace).toBeNull()
+  })
+
+  it('advertises and enforces pointer-less static Personal installs as unavailable', async () => {
+    await enableStaticPersonalFallback()
+    const cookie = await login('fresh', 'fresh')
+    const skills = await app.inject({
+      method: 'GET',
+      url: '/api/me/agent-skills?q=static-personal-refusal',
+      headers: { cookie },
+    })
+    const roles = await app.inject({
+      method: 'GET',
+      url: '/api/me/agent-roles?q=static-personal-refusal',
+      headers: { cookie },
+    })
+
+    expect(skills.json().installAvailability.personal).toBe(false)
+    expect(roles.json().installAvailability.personal).toBe(false)
+
+    for (const request of [
+      {
+        url: '/api/me/agent-skills',
+        payload: {
+          name: 'static-personal-refusal',
+          description: 'No distinct Personal namespace exists.',
+          instructions: '# Static Personal refusal\n\nDo not publish an ambiguous package.',
+          scope: 'personal',
+        },
+      },
+      {
+        url: '/api/me/agent-roles/custom',
+        payload: {
+          name: 'static-personal-refusal',
+          description: 'No distinct Personal namespace exists.',
+          instructions: '# Static Personal refusal\n\nDo not publish an ambiguous package.',
+          scope: 'personal',
+        },
+      },
+    ]) {
+      const refused = await app.inject({ method: 'POST', headers: { cookie }, ...request })
+
+      expect(refused.statusCode, refused.body).toBe(503)
+      expect(refused.json()).toMatchObject({ reason: 'role_install_unavailable' })
+    }
+    const after = await app.inject({
+      method: 'GET',
+      url: '/api/me/agent-skills?source=owned&q=static-personal-refusal',
+      headers: { cookie },
+    })
+    const me = await app.inject({ method: 'GET', url: '/api/me', headers: { cookie } })
+
+    expect(after.json()).toMatchObject({ items: [], filteredTotal: 0 })
+    expect(me.json().personalSpace).toBeNull()
+  })
+
+  it('refuses pointer-less static Personal authoring over MCP without publishing', async () => {
+    await enableStaticPersonalFallback()
+    const cookie = await login('fresh', 'fresh')
+    const call = await mcpCaller(cookie, 'write')
+    const refused = await call('create_ability', {
+      kind: 'skill',
+      name: 'static-agent-refusal',
+      description: 'No distinct Personal namespace exists.',
+      instructions: '# Static agent refusal\n\nDo not publish an ambiguous package.',
+      placement: { home: 'personal' },
+      idempotencyKey: 'static-agent-refusal-one',
+    })
+
+    expect(refused.result?.isError).toBe(true)
+    expect(contentText(refused)).toContain('installation is unavailable')
+    const after = await app.inject({
+      method: 'GET',
+      url: '/api/me/agent-skills?source=owned&q=static-agent-refusal',
+      headers: { cookie },
+    })
+
+    expect(after.json()).toMatchObject({ items: [], filteredTotal: 0 })
+  })
+
+  it('keeps explicit Space reach intact on a pointer-less static host', async () => {
+    await enableStaticPersonalFallback('team')
+    const cookie = await login('fresh', 'fresh')
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/me/agent-skills',
+      headers: { cookie },
+      payload: {
+        name: 'static-space-skill',
+        description: 'Remains a project-scoped Space ability.',
+        instructions: '# Static Space skill\n\nRespect selected-project reach.',
+        scope: 'space',
+        space: 'team',
+        availability: { mode: 'selected-projects', projects: ['team/other'] },
+      },
+    })
+
+    expect(created.statusCode, created.body).toBe(201)
+    expect(created.json()).toMatchObject({
+      skill: {
+        name: 'static-space-skill',
+        scope: 'space',
+        availability: { mode: 'selected-projects', projects: ['team/other'] },
+      },
+      locator: { location: { scope: 'space' } },
+    })
+    const call = await mcpCaller(cookie, 'write')
+    const outside = await call('use_skill', { skill: 'static-space-skill' })
+    const inside = await call('use_skill', { skill: 'static-space-skill', project: 'team/other' })
+
+    expect(outside.result?.isError).toBe(true)
+    expect(inside.result?.isError, contentText(inside)).not.toBe(true)
+    expect(inside.result?.structuredContent).toMatchObject({
+      status: 'activated',
+      skill: { name: 'static-space-skill', scope: 'space' },
+    })
+  })
+
+  it('keeps the static system home out of Personal ability semantics', async () => {
+    await enableStaticSystemFallback()
+    const inventory = await app.inject({ method: 'GET', url: '/api/me/agent-skills' })
+
+    expect(inventory.statusCode, inventory.body).toBe(200)
+    expect(inventory.json().installAvailability.personal).toBe(false)
+
+    const personal = await app.inject({
+      method: 'POST',
+      url: '/api/me/agent-skills',
+      payload: {
+        name: 'system-static-personal',
+        description: 'The system fallback is not a Personal ability namespace.',
+        instructions: '# System static Personal\n\nRefuse before publication.',
+        scope: 'personal',
+      },
+    })
+
+    expect(personal.statusCode, personal.body).toBe(503)
+    expect(personal.json()).toMatchObject({ reason: 'role_install_unavailable' })
+
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/me/agent-skills',
+      payload: {
+        name: 'system-static-space',
+        description: 'Remains an explicitly project-scoped Space ability.',
+        instructions: '# System static Space\n\nKeep the selected-project reach.',
+        scope: 'space',
+        space: 'main',
+        availability: { mode: 'selected-projects', projects: ['main/other'] },
+      },
+    })
+
+    expect(created.statusCode, created.body).toBe(201)
+    expect(created.json()).toMatchObject({
+      skill: {
+        name: 'system-static-space',
+        scope: 'space',
+        availability: { mode: 'selected-projects', projects: ['main/other'] },
+      },
+      locator: { location: { scope: 'space' } },
+    })
+    const detail = await app.inject({
+      method: 'GET',
+      url: `/api/me/agent-abilities/${encodeAbilityLocator(created.json().locator)}`,
+    })
+    const listed = await app.inject({
+      method: 'GET',
+      url: '/api/me/agent-skills?source=owned&q=system-static-space',
+    })
+
+    expect(detail.statusCode, detail.body).toBe(200)
+    expect(detail.json()).toMatchObject({
+      ability: { locator: { location: { scope: 'space' } } },
+    })
+    expect(listed.json()).toMatchObject({
+      items: [
+        expect.objectContaining({
+          locator: expect.objectContaining({
+            location: expect.objectContaining({ scope: 'space' }),
+          }),
+        }),
+      ],
+      filteredTotal: 1,
+    })
+
+    const call = await systemMcpCaller()
+    const outside = await call('use_skill', { skill: 'system-static-space' })
+    const inside = await call('use_skill', {
+      skill: 'system-static-space',
+      project: 'main/other',
+    })
+
+    expect(outside.result?.isError).toBe(true)
+    expect(inside.result?.isError, contentText(inside)).not.toBe(true)
+    expect(inside.result?.structuredContent).toMatchObject({
+      status: 'activated',
+      skill: { name: 'system-static-space', scope: 'space' },
+    })
+
+    const role = await app.inject({
+      method: 'POST',
+      url: '/api/me/agent-roles/custom',
+      payload: {
+        name: 'system-static-role',
+        description: 'Stays in the project-capable Space chain.',
+        instructions: '# System static Role\n\nKeep the Space placement.',
+        scope: 'space',
+        space: 'main',
+        availability: { mode: 'selected-projects', projects: ['main/other'] },
+      },
+    })
+
+    expect(role.statusCode, role.body).toBe(201)
+    const roleRef = encodeAbilityLocator(role.json().locator)
+    const personalContext = await app.inject({
+      method: 'GET',
+      url: `/api/me/agent-context?role=${roleRef}`,
+    })
+    const projectContext = await app.inject({
+      method: 'GET',
+      url: `/api/s/main/projects/proj-main-other/agent-context?role=${roleRef}`,
+    })
+
+    expect(personalContext.statusCode, personalContext.body).toBe(200)
+    expect(personalContext.json().roles).toEqual([])
+    expect(personalContext.json().role).toBeUndefined()
+    expect(projectContext.statusCode, projectContext.body).toBe(200)
+    expect(projectContext.json().roles).toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: 'system-static-role' })]),
+    )
+    expect(projectContext.json().role).toMatchObject({ name: 'system-static-role' })
+
+    const exactContext = await app.inject({
+      method: 'GET',
+      url: `/api/me/agent-roles/${roleRef}/context?project=proj-main-other`,
+    })
+    const set = await app.inject({
+      method: 'POST',
+      url: '/api/s/main/context-sets',
+      payload: { name: 'Static system role' },
+    })
+
+    expect(exactContext.statusCode, exactContext.body).toBe(200)
+    expect(exactContext.json().role).toMatchObject({ name: 'system-static-role' })
+    expect(set.statusCode, set.body).toBe(200)
+    const attached = await app.inject({
+      method: 'PUT',
+      url: `/api/me/agent-roles/${roleRef}/context-sets/${set.json().set.id}`,
+    })
+    const sets = await app.inject({ method: 'GET', url: '/api/context-sets' })
+
+    expect(attached.statusCode, attached.body).toBe(200)
+    expect(sets.statusCode, sets.body).toBe(200)
+    expect(sets.json().sets).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          attachments: expect.arrayContaining([
+            expect.objectContaining({ kind: 'role', label: 'Role · system-static-role · main' }),
+          ]),
+        }),
+      ]),
+    )
+  })
+
+  it('reserves the mintable system first root for Personal abilities', async () => {
+    await enableMintableSystemHome()
+    const inventory = await app.inject({ method: 'GET', url: '/api/me/agent-skills' })
+    const personal = await app.inject({
+      method: 'POST',
+      url: '/api/me/agent-skills',
+      payload: {
+        name: 'mintable-system-personal',
+        description: 'Uses the canonical system home.',
+        instructions: '# Mintable system Personal\n\nKeep the first root Personal.',
+        scope: 'personal',
+      },
+    })
+
+    expect(inventory.json().installAvailability.personal).toBe(true)
+    expect(personal.statusCode, personal.body).toBe(201)
+    expect(personal.json().locator).toMatchObject({ location: { scope: 'personal' } })
+
+    const refusedSpace = await app.inject({
+      method: 'POST',
+      url: '/api/me/agent-skills',
+      payload: {
+        name: 'mintable-system-first-space',
+        description: 'Must not alias the canonical Personal root.',
+        instructions: '# Mintable system first Space\n\nRefuse the ambiguous placement.',
+        scope: 'space',
+        space: 'main',
+        availability: { mode: 'selected-projects', projects: ['main/other'] },
+      },
+    })
+    const absent = await app.inject({
+      method: 'GET',
+      url: '/api/me/agent-skills?source=owned&q=mintable-system-first-space',
+    })
+
+    expect(refusedSpace.statusCode, refusedSpace.body).toBe(404)
+    expect(absent.json()).toMatchObject({ items: [], filteredTotal: 0 })
+
+    const shared = await app.inject({
+      method: 'POST',
+      url: '/api/me/agent-skills',
+      payload: {
+        name: 'mintable-system-shared',
+        description: 'Uses a distinct Space root.',
+        instructions: '# Mintable system shared\n\nKeep Space reach.',
+        scope: 'space',
+        space: 'team',
+        availability: { mode: 'selected-projects', projects: ['team/other'] },
+      },
+    })
+
+    expect(shared.statusCode, shared.body).toBe(201)
+    expect(shared.json()).toMatchObject({
+      locator: { location: { scope: 'space' } },
+      skill: { availability: { mode: 'selected-projects', projects: ['team/other'] } },
+    })
+  })
+
   it('does not mint a Personal space when the catalog role does not exist', async () => {
+    await enableLazyPersonalProvisioning()
     const cookie = await login('fresh', 'fresh')
     const before = await app.inject({ method: 'GET', url: '/api/me', headers: { cookie } })
     expect(before.statusCode).toBe(200)
@@ -1985,6 +3252,32 @@ describe('role catalog → Add → effective → active walking skeleton', () =>
     expect(fromPersonal.json().role.locator).toEqual(base.locator)
     expect(fromPersonal.json().active).toBe(false)
     expect(fromPersonal.json().inactive).toBe('out-of-reach')
+
+    const call = await mcpCaller(cookie)
+    const opened = await call('start_session', { project: 'team/beta' })
+    const session = (opened.result?.structuredContent as { session: { id: string } }).session.id
+    const refused = await call('use_role', { role: 'launch-review', session })
+    const refusal = contentText(refused)
+    const authoring = await call('list_abilities', {
+      session,
+      view: 'authoring',
+      kind: 'role',
+      q: 'launch-review',
+      limit: 50,
+    })
+    const authoringRef = (
+      authoring.result?.structuredContent as { abilities: Array<{ ref?: string }> }
+    ).abilities.find((ability) => ability.ref)?.ref
+
+    expect(refused.result?.isError).toBe(true)
+    expect(refusal).toContain('out-of-reach in project "team/beta"')
+    expect(refusal).toContain('(owned, reader, ref "')
+    expect(refusal).toContain('retry in project "team/alpha"')
+    expect(refusal).toContain('contact a writer of the owning Space')
+    expect(authoringRef).toEqual(expect.any(String))
+    expect(refusal).toContain(authoringRef!)
+    expect(refusal).not.toContain(beta.id)
+    expect(refusal).not.toContain(alpha.id)
     expect(
       (
         await app.inject({
@@ -2078,6 +3371,7 @@ const scopedWorld = (): Fixture => {
       role: null,
       roleLocator: null,
       roleContextProjectId: null,
+      projectId: null,
     })),
   }
 }

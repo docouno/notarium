@@ -151,13 +151,23 @@ export class MutationCoordinator {
   }
 
   async run<T>(claim: MutationClaim, task: () => Promise<T>): Promise<T> {
-    const lease = await this.acquire(normalizeClaim(claim))
+    const lease = await this.acquireNormalized(normalizeClaim(claim))
 
     try {
       return await this.leased.run(true, task)
     } finally {
       lease.release()
     }
+  }
+
+  /** Hold a claim across a host-owned causal publication whose physical and
+   * metadata checkpoints live outside the ordinary write engine. The caller
+   * must release it; process crash drops the lease and durable host recovery
+   * remains the source of correctness. */
+  async acquire(claim: MutationClaim): Promise<() => void> {
+    const lease = await this.acquireNormalized(normalizeClaim(claim))
+
+    return lease.release
   }
 
   /** Acquire resources derived from mutable read-model state. A queued move may
@@ -168,7 +178,7 @@ export class MutationCoordinator {
    *  ticket keeps priority over later waiters still in the queue. */
   async runStable<T>(claimFor: () => MutationClaim, task: () => Promise<T>): Promise<T> {
     let claim = normalizeClaim(claimFor())
-    let lease = await this.acquire(claim)
+    let lease = await this.acquireNormalized(claim)
 
     for (;;) {
       let current: Claim
@@ -193,7 +203,7 @@ export class MutationCoordinator {
     }
   }
 
-  private acquire(claim: Claim): Promise<Lease> {
+  private acquireNormalized(claim: Claim): Promise<Lease> {
     return this.enqueue(claim, this.nextTicket++)
   }
 

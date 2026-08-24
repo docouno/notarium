@@ -35,7 +35,13 @@ import {
   parseFrontmatterLines,
   sha256Hex,
 } from '@notarium/core'
-import { createNotariumStore, renameNoReplaceIfAvailable } from '@notarium/engine'
+import {
+  createNotariumStore,
+  ensureNotariumResourceAuthority,
+  NotariumStoreCompositionOwner,
+  renameNoReplaceIfAvailable,
+  SpaceResourceAuthorityRegistry,
+} from '@notarium/engine'
 import {
   ARTIFACT_TTL_MS,
   createExportHandler,
@@ -47,6 +53,7 @@ import {
   createRolesService,
   dataPathsFromEnv,
   describeMetaDbUrl,
+  DurableAbilityCreator,
   ensureFolderIdentity,
   hashPassword,
   healSpaceMarker,
@@ -220,6 +227,23 @@ const run = async (): Promise<void> => {
   const markerStore = createMarkerStore((id) => notesDirOf(id), {
     anchoredFilesForRoot: localFsAnchoredFiles(),
   })
+  const resourceAuthorities = new SpaceResourceAuthorityRegistry()
+  const storeCompositions = new NotariumStoreCompositionOwner()
+
+  const authorityForSpace = async (space: string) => {
+    const notesDir = notesDirOf(space)
+
+    if (!notesDir) {
+      return null
+    }
+    const composition = storeCompositions.getOrCreate(space, defaultMounts(notesDir))
+
+    return ensureNotariumResourceAuthority({
+      spaceId: space,
+      resourceAuthorityRegistry: resourceAuthorities,
+      composition,
+    })
+  }
 
   const manager = new SpaceManager({
     spaces: [],
@@ -244,8 +268,11 @@ const run = async (): Promise<void> => {
     },
     createStore: (rec: SpaceRecord) => {
       const notesDir = join(spacesRoot, rec.notesDir)
+      const composition = storeCompositions.getOrCreate(rec.id, defaultMounts(notesDir))
       const engine = createNotariumStore({
-        mounts: defaultMounts(notesDir),
+        spaceId: rec.id,
+        resourceAuthorityRegistry: resourceAuthorities,
+        composition,
         indexDb: join(engineDataDir, `${rec.notesDir}.db`),
       })
       // The seeder is the SOLE writer. Disable the engine's fs.watch so the
@@ -420,6 +447,8 @@ const run = async (): Promise<void> => {
       const notesDir = notesDirOf(space)
       return notesDir ? join(notesDir, SKILL_MOUNT) : null
     },
+    authorityForSpace,
+    resourcePrefixForSpace: (space) => (notesDirOf(space) ? SKILL_MOUNT : null),
   })
   const roleService = createRolesService({
     catalog: loadBundledAbilityInventory,
@@ -428,6 +457,19 @@ const run = async (): Promise<void> => {
     abilityAvailability: metaDb.abilityAvailability,
     abilityPreferences: metaDb.abilityPreferences,
     abilityPlacement: metaDb.abilityPlacement,
+  })
+  const durableAbilityCreator = new DurableAbilityCreator({
+    persistence: metaDb.abilityCreate,
+    roles: roleService,
+    authorityForSpace,
+    beginProjection: (space, operationId) =>
+      manager.beginCausalPublication(space, { kind: 'ability-create', operationId }),
+    primeIdentity: (space, record) => manager.primeWarmCausalIdentity(space, record),
+    confirmIdentity: (space, noteId) => manager.confirmCausalIdentity(space, noteId),
+    releaseIdentity: (space, noteId) => manager.releasePrimedIdentity(space, noteId),
+    adoptPublication: (space, evidence) => manager.adoptCausalPublication(space, evidence),
+    reconcile: (space, noteId) => manager.reconcileCausalProjection(space, noteId),
+    now: () => clock,
   })
   const projectRows = await metaDb.projects.listForSpaces([...idOf.values()])
 
@@ -513,7 +555,115 @@ const run = async (): Promise<void> => {
     declarations: world.agentSkills ?? [],
     roles: roleService,
     library: roleLibrary.library,
+    seedPackageFile: roleLibrary.seedPackageFile,
     storeForSpace: seedStoreForSpace,
+    createCustom: async (declaration, location, availability) => {
+      const audit = declaration.agentAudit
+
+      if (!audit) {
+        throw new Error(`agent-created skill ${declaration.name} has no audit declaration`)
+      }
+      const declaredSession = audit.sessionRef
+        ? world.agentSessions?.find((session) => session.ref === audit.sessionRef)
+        : undefined
+
+      if (audit.sessionRef && !declaredSession) {
+        throw new Error(`agent-created skill references unknown session: ${audit.sessionRef}`)
+      }
+      const owner = resolveSeedAgentActivityOwner({
+        kind: 'write',
+        activityOwner: audit.owner,
+        sessionOwner: declaredSession ? (declaredSession.owner ?? primary.username) : undefined,
+        fallbackOwner: primary.username,
+        asUser,
+      })
+      const principalId = remapPrincipal(audit.principal) ?? audit.principal
+      const principal = {
+        ...SYSTEM_PRINCIPAL,
+        id: principalId,
+        username: owner,
+        scope: 'write' as const,
+        grants: new Map([[location.space, 'owner' as const]]),
+        spaces: new Set([location.space]),
+        system: false,
+      }
+      const addressed = roleService.resolveOwnedPlacement(
+        location,
+        personalSpaceForPlacement(personalSpaceIds, location.space),
+      )
+
+      if (!addressed) {
+        throw new Error(`agent-created skill has no addressed placement: ${declaration.name}`)
+      }
+      const body = {
+        name: declaration.name,
+        description: declaration.description,
+        instructions: declaration.instructions ?? '',
+        ...(location.scope === 'personal'
+          ? { scope: 'personal' as const }
+          : {
+              scope: 'space' as const,
+              space: manager.slugOf(location.space) ?? location.space,
+              availability:
+                availability?.mode === 'selected-projects'
+                  ? {
+                      mode: 'selected-projects' as const,
+                      projects: availability.projectIds,
+                    }
+                  : { mode: 'all-projects' as const },
+            }),
+      }
+      const result = await durableAbilityCreator.createDurably({
+        prepared: {
+          kind: 'skill',
+          source: 'custom',
+          body,
+          principal,
+          personalSpace: personalSpaceForPlacement(personalSpaceIds, location.space),
+          location: addressed,
+          ...(availability ? { availability } : {}),
+        },
+        attribution: {
+          principal: principalId,
+          agent: {
+            owner,
+            agent: audit.agent ?? null,
+            ...(declaredSession && audit.sessionRef
+              ? {
+                  session: {
+                    id: agentSessionId(audit.sessionRef),
+                    name: declaredSession.name,
+                    attach: audit.sessionAttach ?? ('declared' as const),
+                  },
+                }
+              : {}),
+          },
+        },
+        preparePackage: async () => ({
+          prepared: {
+            kind: 'skill',
+            source: 'custom',
+            body,
+            principal,
+            personalSpace: personalSpaceForPlacement(personalSpaceIds, location.space),
+            location: addressed,
+            ...(availability ? { availability } : {}),
+          },
+          pkg: roleService.prepareCustomSkill(
+            declaration.name,
+            declaration.description,
+            declaration.instructions ?? '',
+          ),
+        }),
+        operation: {
+          idempotencyKey: `seed:${declaration.name}`,
+          scopeKey: `${location.scope}:${location.space}`,
+          systemNamePolicy: 'reject',
+        },
+      })
+
+      return { packageId: result.ability.packageId, noteId: result.ability.noteId }
+    },
     resolveLocation: async (declaration) => {
       const home = declaration.home
 
@@ -622,7 +772,7 @@ const run = async (): Promise<void> => {
             })()
 
     const rolePackage = location
-      ? await roleLibrary.library.getSkill(location, declaration.name)
+      ? (await roleLibrary.library.getAbilitiesNamed(location, declaration.name)).get('role')
       : null
     // The service decides personal-vs-Space from the locator, so it needs the personal
     // space of the owner this declaration names — never the seeder's own. Asked of the
@@ -761,8 +911,25 @@ const run = async (): Promise<void> => {
     const owner = session.owner ? asUser(session.owner) : primary.username
     const personalSlug = personalSpaceOf.get(owner)
     const personalSpace = personalSlug ? (idOf.get(personalSlug) ?? null) : null
+    const sessionProject = session.project
+      ? projectRows.find(
+          (project) =>
+            project.space === idOf.get(session.project!.space) &&
+            project.path === session.project!.path,
+        )
+      : undefined
+
+    if (session.project && !sessionProject) {
+      throw new Error(
+        `agent session ${session.ref} references an unknown project ${session.project.space}:${session.project.path}`,
+      )
+    }
     const selectedRole = session.role
-      ? await roleService.resolveEffective({ personalSpace }, SYSTEM_PRINCIPAL, session.role)
+      ? await roleService.resolveEffective(
+          { personalSpace, ...(sessionProject ? { project: sessionProject } : {}) },
+          SYSTEM_PRINCIPAL,
+          session.role,
+        )
       : null
     await metaDb.sessions.insert({
       id: agentSessionId(session.ref),
@@ -781,7 +948,8 @@ const run = async (): Promise<void> => {
       // System role has no placement to build one from at all, and rebuilding it here
       // made the seeder a producer of the very locator the binding is looked up by.
       roleLocator: selectedRole?.locator ?? null,
-      roleContextProjectId: null,
+      roleContextProjectId: selectedRole ? (sessionProject?.id ?? null) : null,
+      projectId: sessionProject?.id ?? null,
     })
     agentSessions++
   }
@@ -1195,6 +1363,22 @@ const run = async (): Promise<void> => {
         createdAt: t,
       })
       scopePins++
+    }
+  }
+
+  for (const skill of appliedSkills) {
+    for (const attach of skill.declaration.pins ?? []) {
+      const target = await resolveContextTarget(attach)
+
+      if (target) {
+        await metaDb.scopePins.addPin({
+          ...target,
+          noteSpace: skill.location.space,
+          noteId: skill.noteId,
+          createdAt: t,
+        })
+        scopePins++
+      }
     }
   }
 

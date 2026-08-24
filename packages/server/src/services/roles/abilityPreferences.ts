@@ -54,7 +54,15 @@ export class InMemoryAbilityPreferences implements AbilityPreferencesPersistence
    *  for the same reason — carrying the rows is only half of an address change, and
    *  the other half is that a caller whose address is one statement older writes its
    *  choice where the package IS. One hop deep, kept so by `moveLocator`. */
-  private readonly moved = new Map<string, { to: string; spaceId: string | null }>()
+  private readonly moved = new Map<
+    string,
+    {
+      to: string
+      spaceId: string | null
+      registryNoteId: string | null
+      manifestNoteId: string | null
+    }
+  >()
 
   constructor(private readonly registry?: AbilityPreferencesRegistry) {}
 
@@ -64,7 +72,30 @@ export class InMemoryAbilityPreferences implements AbilityPreferencesPersistence
 
   /** The address that locator stands at now. */
   private live(locator: string): string {
-    return this.moved.get(locator)?.to ?? locator
+    return this.movedLocator(locator) ?? locator
+  }
+
+  /** The read-side of the placement trail. Returning null for an unrecorded address
+   *  is intentional: current inventory cannot prove that two equal package ids are
+   *  the same package. */
+  movedLocator(locator: string): string | null {
+    return this.moved.get(locator)?.to ?? null
+  }
+
+  movedPlacement(locator: string): {
+    toLocator: string
+    registryNoteId: string | null
+    manifestNoteId: string | null
+  } | null {
+    const hop = this.moved.get(locator)
+
+    return hop
+      ? {
+          toLocator: hop.to,
+          registryNoteId: hop.registryNoteId,
+          manifestNoteId: hop.manifestNoteId,
+        }
+      : null
   }
 
   private noteKey(spaceId: string, registryNoteId: string): string {
@@ -149,7 +180,12 @@ export class InMemoryAbilityPreferences implements AbilityPreferencesPersistence
    *  promotion stays inside one Space and keeps the same registry note. The
    *  destination is cleared first for the same reason the drivers clear it — it
    *  belongs to the package being moved either way. */
-  moveLocator(fromLocator: string, toLocator: string): void {
+  moveLocator(
+    fromLocator: string,
+    toLocator: string,
+    registryNoteId: string,
+    manifestNoteId: string,
+  ): void {
     const carried: Array<[string, PreferenceRow]> = []
 
     for (const [key, row] of [...this.records]) {
@@ -176,12 +212,14 @@ export class InMemoryAbilityPreferences implements AbilityPreferencesPersistence
     this.moved.delete(toLocator)
     for (const [from, hop] of this.moved) {
       if (hop.to === fromLocator) {
-        this.moved.set(from, { ...hop, to: toLocator })
+        this.moved.set(from, { ...hop, to: toLocator, registryNoteId, manifestNoteId })
       }
     }
     this.moved.set(fromLocator, {
       to: toLocator,
       spaceId: abilitySpaceOfLocator(fromLocator),
+      registryNoteId,
+      manifestNoteId,
     })
   }
 

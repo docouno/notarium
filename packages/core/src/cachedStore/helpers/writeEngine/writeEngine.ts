@@ -8,6 +8,7 @@ import type {
   NoteClass,
   NoteContent,
   NoteMeta,
+  RemoveOptions,
   TagMutationInput,
   TagMutationResult,
   WriteInput,
@@ -54,6 +55,7 @@ import { effectiveSlug, slugify, storedSlug } from '../../../libs/slug'
 import { normTags } from '../../../libs/tags'
 import { computeVersionToken } from '../../../libs/versionToken'
 import type { LinkIndex } from '../../../referenceResolver'
+import type { JournalRecordInput } from '../../../revisionJournal'
 import { derivePreview } from '../../../snippet'
 import { IMPORT_SOURCE_FRONTMATTER_KEY } from '../../../sourceIdentity'
 import { DEFAULT_NOTE_CLASS, isVisibleOn, SURFACE } from '../../../visibility'
@@ -364,11 +366,15 @@ export class WriteEngine {
   private writeOnce(input: WriteInput, opts?: MutationOptions): Promise<WriteResult> {
     return this.mutations.runStable(
       () => this.writeClaim(input),
-      async () => {
-        await opts?.prepare?.()
-        const result = await this.writeClaimed(input)
-        await opts?.finalize?.()
-        return result
+      () => {
+        const write = async () => {
+          await opts?.prepare?.()
+          const result = await this.writeClaimed(input, opts)
+          await opts?.finalize?.()
+          return result
+        }
+
+        return opts?.aroundWrite ? opts.aroundWrite(write) : write()
       },
     )
   }
@@ -518,7 +524,7 @@ export class WriteEngine {
     }
   }
 
-  private async writeClaimed(rawInput: WriteInput): Promise<WriteResult> {
+  private async writeClaimed(rawInput: WriteInput, opts?: MutationOptions): Promise<WriteResult> {
     // Slug selection reads the snapshot, so it belongs inside the mutation
     // checkpoint with path selection and the physical write.
     const input = { ...rawInput, slug: this.uniqueSlug(rawInput) }
@@ -608,6 +614,9 @@ export class WriteEngine {
           })
         : undefined
 
+      if (live) {
+        await opts?.assertCurrent?.(live)
+      }
       if (live && !live.physicalIncarnation) {
         this.host.reconcileSoon()
         throw new StoreError(`exact storage incarnation is unavailable for ${input.originalId}`)
@@ -616,17 +625,22 @@ export class WriteEngine {
       const releaseGraphTransition = this.host.beginGraphTransition()
       const requiredTrashRestore =
         input.journal?.kind === REVISION_KIND.restore && !input.originalId
+      const requiredCompoundCreate = opts?.requiredRevision === true && !input.originalId
+      const delayPublication = requiredTrashRestore || requiredCompoundCreate
       let restoreResult: WriteResult | undefined
       let restoreVersionToken: string | undefined
       let trashRestoreJournalCommitted = false
 
       try {
-        const result = await this.host.inner.write({
-          ...input,
-          originalId: input.originalId ? this.innerNoteKey(input.originalId) : input.originalId,
-          identityOnly: Boolean(input.originalId),
-          expectedSource: live?.physicalIncarnation,
-        })
+        const result = await this.host.inner.write(
+          {
+            ...input,
+            originalId: input.originalId ? this.innerNoteKey(input.originalId) : input.originalId,
+            identityOnly: Boolean(input.originalId),
+            expectedSource: live?.physicalIncarnation,
+          },
+          opts?.resourceAdmitted ? { resourceAdmitted: true } : undefined,
+        )
         restoreResult = result
         restoreVersionToken = result.versionToken
         const publishWrite = async () => {
@@ -660,21 +674,31 @@ export class WriteEngine {
           }
         }
 
-        if (!requiredTrashRestore) {
+        if (!delayPublication) {
           await publishWrite()
         }
-        const after = await this.readAfterWrite(input, result)
+        const after = await this.readAfterWrite(input, result, undefined, opts?.resourceAdmitted)
 
-        if (requiredTrashRestore && !after) {
+        if (delayPublication && !after) {
           throw new Error('post-write exact read failed')
         }
         restoreVersionToken = after ? exactVersionToken(after) : undefined
-        await this.journalWrite(input, result.id ?? input.originalId, baseline, after, result.class)
-        trashRestoreJournalCommitted = requiredTrashRestore
+        await this.journalWrite(
+          input,
+          result.id ?? input.originalId,
+          baseline,
+          after,
+          result.class,
+          opts?.requiredRevision,
+        )
+        if (opts?.beforePublish && result.id && restoreVersionToken) {
+          await opts.beforePublish({ id: result.id, versionToken: restoreVersionToken })
+        }
+        trashRestoreJournalCommitted = delayPublication
         if (!after) {
           throw new Error('post-write exact read failed')
         }
-        if (requiredTrashRestore) {
+        if (delayPublication) {
           await publishWrite()
         }
 
@@ -683,6 +707,26 @@ export class WriteEngine {
         let failure: unknown = err
 
         if (
+          requiredCompoundCreate &&
+          !trashRestoreJournalCommitted &&
+          restoreResult?.id &&
+          restoreVersionToken
+        ) {
+          try {
+            await this.rollbackUnjournaledTrashRestore(
+              restoreResult.id,
+              restoreResult,
+              restoreVersionToken,
+              opts?.resourceAdmitted,
+            )
+          } catch (rollbackErr) {
+            this.host.reconcileSoon()
+            failure = new AggregateError(
+              [err, rollbackErr],
+              'required create revision failed and the physical write could not be rolled back',
+            )
+          }
+        } else if (
           requiredTrashRestore &&
           !trashRestoreJournalCommitted &&
           restoreResult?.id &&
@@ -760,6 +804,8 @@ export class WriteEngine {
         supportsExactIdentityAddress(this.host.inner) ? { identityOnly: true } : undefined,
       )
 
+      await opts?.assertCurrent?.(live)
+
       if (live.filePath !== storageKey) {
         throw noteNotFound(input.originalId)
       }
@@ -785,6 +831,8 @@ export class WriteEngine {
       : undefined
     let identityPublicationPending = false
     const requiredTrashRestore = input.journal?.kind === REVISION_KIND.restore && !input.originalId
+    const requiredCompoundCreate = opts?.requiredRevision === true && !input.originalId
+    const delayPublication = requiredTrashRestore || requiredCompoundCreate
     let restoreResult: WriteResult | undefined
     let restoreVersionToken: string | undefined
     let trashRestoreJournalCommitted = false
@@ -793,13 +841,18 @@ export class WriteEngine {
     const removed: string[] = []
 
     try {
-      const result = await this.host.inner.write({
-        ...input,
-        originalId: input.originalId ? this.innerNoteKey(input.originalId, storageKey) : storageKey,
-        identityOnly: Boolean(input.originalId && supportsExactIdentityAddress(this.host.inner)),
-        id,
-        expectedSource: live?.physicalIncarnation,
-      })
+      const result = await this.host.inner.write(
+        {
+          ...input,
+          originalId: input.originalId
+            ? this.innerNoteKey(input.originalId, storageKey)
+            : storageKey,
+          identityOnly: Boolean(input.originalId && supportsExactIdentityAddress(this.host.inner)),
+          id,
+          expectedSource: live?.physicalIncarnation,
+        },
+        opts?.resourceAdmitted ? { resourceAdmitted: true } : undefined,
+      )
       restoreResult = result
       restoreVersionToken = result.versionToken
       const publishAfterIdentityFlush = !input.originalId && !this.host.isBulkActive()
@@ -847,14 +900,14 @@ export class WriteEngine {
         }
       }
 
-      if (!requiredTrashRestore) {
+      if (!delayPublication) {
         await publishWrite()
       }
 
       // The post-write read serves double duty: the fresh token the save
       // answers with (the engine merges frontmatter — input bytes are not
       // authoritative) and the journaled after-state.
-      let after = await this.readAfterWrite(input, result, storageKey)
+      let after = await this.readAfterWrite(input, result, storageKey, opts?.resourceAdmitted)
 
       if (
         !input.originalId &&
@@ -889,7 +942,7 @@ export class WriteEngine {
             )
           }
           this.host.identity.markMaterialized(id)
-          after = await this.readAfterWrite(input, result, storageKey)
+          after = await this.readAfterWrite(input, result, storageKey, opts?.resourceAdmitted)
           if (!after) {
             throw new Error('post-remint exact read failed')
           }
@@ -923,16 +976,19 @@ export class WriteEngine {
             }
           : undefined
 
-      if (requiredTrashRestore && !after) {
+      if (delayPublication && !after) {
         throw new Error('post-write exact read failed')
       }
       restoreVersionToken = after ? exactVersionToken(after) : undefined
-      await this.journalWrite(input, id, baseline, after, result.class)
-      trashRestoreJournalCommitted = requiredTrashRestore
+      await this.journalWrite(input, id, baseline, after, result.class, opts?.requiredRevision)
+      if (opts?.beforePublish && restoreVersionToken) {
+        await opts.beforePublish({ id, versionToken: restoreVersionToken })
+      }
+      trashRestoreJournalCommitted = delayPublication
       if (!after) {
         throw new Error('post-write exact read failed')
       }
-      if (requiredTrashRestore) {
+      if (delayPublication) {
         await publishWrite()
       }
       // Flush a fresh id before answering: a create's id may be resolved in the very next request,
@@ -962,6 +1018,26 @@ export class WriteEngine {
       let failure: unknown = err
 
       if (
+        requiredCompoundCreate &&
+        !trashRestoreJournalCommitted &&
+        restoreResult &&
+        restoreVersionToken
+      ) {
+        try {
+          await this.rollbackUnjournaledTrashRestore(
+            id,
+            restoreResult,
+            restoreVersionToken,
+            opts?.resourceAdmitted,
+          )
+        } catch (rollbackErr) {
+          this.host.reconcileSoon()
+          failure = new AggregateError(
+            [err, rollbackErr],
+            'required create revision failed and the physical write could not be rolled back',
+          )
+        }
+      } else if (
         requiredTrashRestore &&
         !trashRestoreJournalCommitted &&
         restoreResult &&
@@ -1077,6 +1153,7 @@ export class WriteEngine {
     input: WriteInput,
     result: WriteResult,
     storageKey?: string,
+    resourceAdmitted = false,
   ): Promise<NoteContent | null> {
     try {
       const resultId = result.id ?? input.originalId
@@ -1087,7 +1164,10 @@ export class WriteEngine {
       // avoiding a full id→path registry rebuild after every create in a bulk
       // import. Interactive/stale-id operations still use the exact envelope.
       if (!this.host.inner.capabilities.identity && exactPath) {
-        const detail = await this.host.inner.read(exactPath)
+        const detail = await this.host.inner.read(
+          exactPath,
+          resourceAdmitted ? { resourceAdmitted: true } : undefined,
+        )
 
         return detail.filePath === exactPath ? detail : null
       }
@@ -1097,8 +1177,10 @@ export class WriteEngine {
       return await this.host.inner.read(
         key,
         supportsExactIdentityAddress(this.host.inner) && resultId
-          ? { identityOnly: true }
-          : undefined,
+          ? { identityOnly: true, ...(resourceAdmitted ? { resourceAdmitted: true } : {}) }
+          : resourceAdmitted
+            ? { resourceAdmitted: true }
+            : undefined,
       )
     } catch {
       return null
@@ -1171,6 +1253,7 @@ export class WriteEngine {
      *  . Falls back to the create intent / the snapshot; the journal
      *  carries it forward on later body-less revisions. */
     cls?: string | null,
+    required = false,
   ): Promise<void> {
     if (!noteId) {
       return Promise.resolve()
@@ -1201,7 +1284,7 @@ export class WriteEngine {
       baseline,
     }
 
-    if (input.journal?.kind === REVISION_KIND.restore && !input.originalId) {
+    if (required || (input.journal?.kind === REVISION_KIND.restore && !input.originalId)) {
       return this.host.journal.recordRequired(record).then(() => undefined)
     }
     void this.host.journal.record(record)
@@ -1216,17 +1299,26 @@ export class WriteEngine {
     id: string,
     result: WriteResult,
     versionToken: string,
+    resourceAdmitted = false,
   ): Promise<void> {
     const path = result.filePath ?? this.pathFor(id)
+
     // The read-model deliberately has not published this restore yet, so its
     // id→path hints still describe a tombstone. Address the engine by the exact
     // path returned from the physical write; the identity envelope would sync
     // those old hints and make a path-keyed engine miss the just-created row.
-    await this.host.inner.remove(path ?? this.innerNoteKey(id), {
-      identityOnly: path ? false : supportsExactIdentityAddress(this.host.inner),
-      versionToken,
-      physicalWriteClaim: result.physicalWriteClaim,
-    })
+    if (resourceAdmitted && path && this.host.inner.removeDir) {
+      await this.host.inner.removeDir(directoryOf(path), {
+        internalAddress: true,
+        resourceAdmitted: true,
+      })
+    } else {
+      await this.host.inner.remove(path ?? this.innerNoteKey(id), {
+        identityOnly: path ? false : supportsExactIdentityAddress(this.host.inner),
+        versionToken,
+        physicalWriteClaim: result.physicalWriteClaim,
+      })
+    }
     if (path) {
       if (!this.host.identity.recordFor(id)) {
         this.host.identity.bindOwnedId(path, id)
@@ -1321,6 +1413,8 @@ export class WriteEngine {
         let live = await this.host.inner.read(this.innerNoteKey(input.id, claimedPath), {
           identityOnly: supportsExactIdentityAddress(this.host.inner),
         })
+
+        await opts?.assertCurrent?.(live)
         const capturedRecord = this.host.inner.capabilities.identity
           ? null
           : await this.host.captureLegacyEvidence(input.id, live)
@@ -1436,10 +1530,7 @@ export class WriteEngine {
     return directoryChanged
   }
 
-  async remove(
-    id: string,
-    opts?: { principal?: string; agent?: AgentWriteAttribution },
-  ): Promise<void> {
+  async remove(id: string, opts?: RemoveOptions): Promise<void> {
     return this.trashMutations.run({ paths: [trashMutationPath(id)] }, () =>
       this.mutations.runStable(
         () => this.removalClaim([id]),
@@ -1520,8 +1611,9 @@ export class WriteEngine {
                 await this.host.inner.removeDir(path, {
                   internalAddress: true,
                   beforeDetach: async () => {
+                    await opts?.beforeDetach?.(victims)
                     for (const id of victims) {
-                      captured.push(await this.captureRemoval(id, true))
+                      captured.push(await this.captureRemoval(id, { resourceAdmitted: true }))
                     }
                   },
                   afterDetach: async () => {
@@ -1586,7 +1678,10 @@ export class WriteEngine {
     return { noteIds, paths, prefixes: targetIds.map(linkTargetPrefix) }
   }
 
-  private async captureRemoval(id: string, resourceAdmitted = false): Promise<RemovalCapture> {
+  private async captureRemoval(
+    id: string,
+    options: Pick<RemoveOptions, 'assertCurrent'> & { resourceAdmitted?: boolean } = {},
+  ): Promise<RemovalCapture> {
     const storagePath = this.pathFor(id)
     const meta = this.host.snap.notes.get(id)
     const inboundSources = [...this.host.snap.sourceIdsTargeting([id])]
@@ -1618,8 +1713,9 @@ export class WriteEngine {
     try {
       live = await this.host.inner.read(this.innerNoteKey(id, storagePath), {
         identityOnly: supportsExactIdentityAddress(this.host.inner),
-        ...(resourceAdmitted ? { resourceAdmitted: true } : {}),
+        ...(options.resourceAdmitted ? { resourceAdmitted: true } : {}),
       })
+      await options.assertCurrent?.(live)
       lastContent = live.content
       lastLogicalState = exactLogicalState(live)
       lastDocumentState = exactDocumentState(live)
@@ -1670,11 +1766,11 @@ export class WriteEngine {
 
   private async removeClaimed(
     id: string,
-    opts?: { principal?: string; agent?: AgentWriteAttribution },
+    opts?: RemoveOptions,
     capture?: RemovalCapture,
     physicallyDetached = false,
   ): Promise<void> {
-    const state = capture ?? (await this.captureRemoval(id))
+    const state = capture ?? (await this.captureRemoval(id, { assertCurrent: opts?.assertCurrent }))
     const {
       storagePath,
       meta,
@@ -1705,29 +1801,15 @@ export class WriteEngine {
           expectedSource: physicalIncarnation,
         })
       }
-      // Tombstone the id↔path binding so the trash can restore the note into
-      // its last folder. A bare engine's registry already holds it (storagePath);
-      // an identity-capable engine (the in-memory fake) doesn't populate this
-      // registry, so seed the binding from the snapshot path before tombstoning —
-      // otherwise restore would have no folder to aim at. Harmless for live reads:
-      // markDeleted drops it from byPath, so pathFor/idFor still ignore it; only
-      // recordFor (the trash's path source) sees the tombstone.
       const lastPath = storagePath ?? meta?.filePath
-
-      if (lastPath) {
-        if (!this.host.identity.recordFor(id)) {
-          this.host.identity.bindOwnedId(lastPath, id)
-        }
-        this.host.identity.markDeleted(lastPath)
-      }
       // The tombstone revision: carries the final body (a blob in the CAS) so
       // the undelete flow resurrects the exact last state. When the read above
       // failed, content is null and the journal keeps the last known hash instead.
-      // AWAITED (not fire-and-forget like a save): the tombstone IS the trash entry,
-      // and the 'changed' emit + the response below tell clients "it's deleted" — a
-      // trash opened right after must already see it, not race the append. record()
-      // swallows its own errors, so this still never fails the delete (P2).
-      await this.host.journal.record({
+      // Agent package deletion opts into recordRequired: its single tombstone is
+      // part of the operation, and an append failure escapes this after-detach
+      // callback so the engine can rename the staged package back. Ordinary human
+      // deletion keeps the historical best-effort journal behaviour.
+      const record: JournalRecordInput = {
         noteId: id,
         kind: REVISION_KIND.delete,
         principal: opts?.principal ?? null,
@@ -1741,7 +1823,22 @@ export class WriteEngine {
         // cold-boot delete that read neither) carries the prior slug forward.
         slug: meta?.slug ?? lastSlug,
         tags: lastTags,
-      })
+      }
+
+      if (opts?.requiredRevision) {
+        await this.host.journal.recordRequired(record)
+      } else {
+        await this.host.journal.record(record)
+      }
+      // Tombstone the id↔path binding only after a required recovery point exists.
+      // A failed required append must leave both the physical package and this
+      // process's identity projection live for a clean retry.
+      if (lastPath) {
+        if (!this.host.identity.recordFor(id)) {
+          this.host.identity.bindOwnedId(lastPath, id)
+        }
+        this.host.identity.markDeleted(lastPath)
+      }
       // Single-note restore resolves tombstones from the durable causal
       // authority, not this process's warm registry. Publish the tombstone before
       // delete returns so an immediate restore cannot observe the old live row.

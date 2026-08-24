@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { type Ctx } from '../../gateway'
 import { dedupedWrite } from './dedup'
@@ -58,5 +58,34 @@ describe('dedupedWrite single-flight', () => {
       wasHit: false,
     })
     expect(runs).toBe(2)
+  })
+
+  it('returns a committed write with an honest warning when durable replay persistence fails', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const ctx = {
+      principal: { id: 'principal-id' },
+      idempotencyInFlight: new Map(),
+      gatewayState: {
+        dedupGet: vi.fn(async () => null),
+        dedupPut: vi.fn(async () => {
+          throw new Error('db unavailable')
+        }),
+        dedupPrune: vi.fn(async () => undefined),
+      },
+      now: () => new Date('2026-08-11T00:00:00.000Z'),
+    } as unknown as Ctx
+
+    await expect(
+      dedupedWrite(ctx, { toolName: 'create_ability', idempotencyKey: 'same-key' }, async () => ({
+        noteId: 'package-id',
+        versionToken: 'version-one',
+      })),
+    ).resolves.toEqual({
+      result: { noteId: 'package-id', versionToken: 'version-one' },
+      wasHit: false,
+      persistenceFailed: true,
+    })
+    expect(error).toHaveBeenCalledWith('[mcp] idempotency persistence failed ->', 'db unavailable')
+    error.mockRestore()
   })
 })

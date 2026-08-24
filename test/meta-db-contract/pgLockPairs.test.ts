@@ -168,6 +168,8 @@ const PROBES: readonly Probe[] = [
         toTargetId: `space:${SPACE}:${PACKAGE}`,
         fromLocator: `owned:role:project:${SPACE}:${PROJECT}:${PACKAGE}`,
         toLocator: `owned:role:space:${SPACE}:${PACKAGE}`,
+        registryNoteId: NOTE,
+        manifestNoteId: NOTE,
       }),
   },
   { id: 'revisions.purgeNotes', run: (db) => db.revisions.purgeNotes(SPACE, [NOTE]) },
@@ -595,6 +597,8 @@ describePostgres('Postgres deadlock probes', PROBE_SUITE, () => {
           toTargetId: `space:${SPACE}:${PACKAGE}`,
           fromLocator,
           toLocator,
+          registryNoteId: NOTE,
+          manifestNoteId: NOTE,
         })
         .then(
           () => null,
@@ -695,6 +699,8 @@ describePostgres('Postgres deadlock probes', PROBE_SUITE, () => {
             packageId: PACKAGE,
             location: { scope: 'space', spaceId: SPACE },
           }),
+          registryNoteId: NOTE,
+          manifestNoteId: NOTE,
         })
         .then(
           () => null,

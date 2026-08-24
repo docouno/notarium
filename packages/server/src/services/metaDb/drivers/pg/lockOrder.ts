@@ -614,6 +614,21 @@ export const lockRestoreOperationRow = async <T>(
   return result.rows[0] as T | undefined
 }
 
+export const lockAbilityCreateOperationRow = async <T>(
+  client: PoolClient,
+  operationId: string,
+  mode: 'share' | 'update' = 'update',
+): Promise<T | undefined> => {
+  const result = await client.query(
+    mode === 'share'
+      ? 'SELECT * FROM ability_create_operations WHERE id = $1 FOR SHARE'
+      : 'SELECT * FROM ability_create_operations WHERE id = $1 FOR UPDATE',
+    [operationId],
+  )
+
+  return result.rows[0] as T | undefined
+}
+
 export const lockRestoreParentRow = async (
   client: PoolClient,
   operationId: string,

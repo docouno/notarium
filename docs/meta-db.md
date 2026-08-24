@@ -8,7 +8,7 @@ Authoritative revision heads, restore-operation evidence, space lifecycle,
 receipt-backed owner proofs, installation generation, and the causal outbox live
 in the same repository; filesystem bytes remain under the resource authority.
 Durable owner-scoped agent episodes and their delta positions live here too
-(`agent_sessions`, including its selected role, `mcp_delta_owner_cursors`,
+(`agent_sessions`, including its selected role and sticky project hint, `mcp_delta_owner_cursors`,
 `mcp_delta_session_cursors`); they
 are not reconstructible from note files. Session positions are deleted with the
 episode; owner fallbacks survive episode retention and are removed with their
@@ -42,6 +42,10 @@ sqlite/0013_agent_session_role_identity.sql
 sqlite/0014_ability_availability.sql
 sqlite/0015_ability_preferences.sql
 sqlite/0016_ability_placement_trail.sql
+sqlite/0017_ability_create_operations.sql
+sqlite/0018_causal_operation_lifecycle.sql
+sqlite/0019_ability_placement_identity.sql
+sqlite/0020_ability_create_success_replay.sql
 postgres/0000_baseline.sql
 postgres/0001_agent_sessions.sql
 postgres/0002_agent_session_role.sql
@@ -59,6 +63,10 @@ postgres/0013_agent_session_role_identity.sql
 postgres/0014_ability_availability.sql
 postgres/0015_ability_preferences.sql
 postgres/0016_ability_placement_trail.sql
+postgres/0017_ability_create_operations.sql
+postgres/0018_causal_operation_lifecycle.sql
+postgres/0019_ability_placement_identity.sql
+postgres/0020_ability_create_success_replay.sql
 ```
 
 `0001_agent_sessions` introduces durable agent episodes and separates each
@@ -80,10 +88,13 @@ meta-DB stores only the episode's current selection.
 `0009_agent_activity` adds the owner-global Activity projection and its stable event cursor.
 
 `0013_agent_session_role_identity` adds the nullable exact selection beside that public name:
-the canonical serialized `role_locator` and `role_context_project_id`. Same-context hydration
-reopens the exact Owned package across manifest rename and refuses a same-name replacement after
-deletion. A project context change resumes in base mode. Old rows with only `role` also hydrate in
-base mode until the user explicitly selects a role; there is no name-backed compatibility resolver.
+the canonical serialized `role_locator`, its `role_context_project_id`, and a separate sticky
+`project_id` for by-name ability resolution. Same-context hydration reopens the exact Owned package
+across manifest rename and refuses a same-name replacement after deletion. A project context change
+returns a typed diagnostic in base mode instead of silently rebinding. Only
+`start_session(project)` changes the sticky hint; a resume without `project` preserves it and a fork
+inherits it. Old rows with only `role` also hydrate in base mode until the user explicitly selects a
+role; there is no name-backed compatibility resolver.
 
 `0014_ability_availability` separates an ability's immutable Personal/Space home from the projects
 where it is effective. It is keyed by `(home_space, package_id)` and package ids never collide
@@ -108,6 +119,52 @@ leave the note carrying a different one, so the two are equal only until it runs
 did not know the note id — and only such a row — is still swept by the package id, which is exactly
 the pre-arbitration answer. The policy is instance-local and never written into portable `SKILL.md`
 bytes.
+
+Creation reserves the exact policy before a Space package becomes readable. The reservation row
+holds `registry_note_id = NULL` and already carries either `all-projects` or the deduplicated
+`selected-projects` set; only a successful package publication may CAS-finalize it with the actual
+registry note id, and only an unfinalized row may be cancelled. Space Skills reserve both modes
+because their absent-row default is unavailable; Space Roles reserve only explicit availability,
+while an unstated policy keeps their historical absent-row `all-projects` default. A stale row makes
+creation mint a fresh package id instead of overwriting somebody else's lifecycle state.
+
+`0017_ability_create_operations` makes Custom ability publication restart-recoverable across the
+filesystem/meta-DB boundary. An accepted row binds actor/idempotency/request digests to package id,
+settled note id, target path, exact reach and strict-stage evidence. The storage adapter owns the
+restart-durable candidate and physical receipt. Once publication succeeds, one terminal transaction
+materializes identity, writes the attributed `origin` revision and receipt-backed owner proof,
+finalizes reach with the actual note id, appends the causal outbox event and records the replay
+result. This `metadata-committed` transaction is the semantic point of no return; the later
+`succeeded` transition only acknowledges projection/stage cleanup. A committed transaction whose
+acknowledgement was lost is replayed; a physical effect whose
+terminal commit was interrupted stays recoverable and blocks public resource admission until boot
+recovery completes. Pre-physical rejection alone may release the provisional identity/reach rows.
+The derived engine adopts the same receipt under the shared causal-publication admission before the
+terminal transaction, preventing boot or watcher reconciliation from reappearing as a second
+anonymous external edit. Cleanup/reconcile failure after the terminal transaction leaves the outbox
+pending and does not turn the committed create into a 500.
+
+`0018_causal_operation_lifecycle` keeps lifecycle closure an admission fence rather than aborting
+work already admitted durably. The revision trigger still rejects ordinary writes outside `active`,
+but recognizes the exact `physical-published` restore or ability-create operation that owns the
+terminal revision. Both terminal writers accept `active` and `closing`; fresh operation acceptance
+remains `active`-only, and neither path can write after the lifecycle reaches `archived`.
+
+`0019_ability_placement_identity` binds every new placement-trail hop to two independent identities:
+the registry note projected for the package and the physical owner claim read from its manifest
+under source admission. Claim arbitration may make them different, so neither substitutes for the
+other. A locator names an address and that address can be reoccupied; a recorded target is accepted
+only when both live identities match their respective trail values. Rows written before this
+migration keep nullable identities because opaque locators cannot be backfilled honestly; their
+presence still retires the old spelling, but resolution fails closed. Both dialects reject a new or
+rewritten trail row without either identity while allowing legacy rows to remain until a later
+supported move replaces or removes them.
+
+`0020_ability_create_success_replay` separates operation history from ownership of an idempotency
+key. Rejected create rows remain available for lifecycle/audit inspection, but the unique replay
+index and both replay lookups exclude them. A corrected request may therefore reuse the same key
+after the pre-publication refusal is removed; accepted, recoverable and committed operations still
+own it and retain request-fingerprint conflict detection in both SQLite and PostgreSQL.
 
 An absent row is not the same answer for both kinds. A Space Skill is a dependency a Role opts into,
 so absence reads as `selected-projects` with nothing selected — unavailable until stated. A Space
@@ -189,6 +246,24 @@ itself: a move INTO an address deletes the row pointing out of it, a move OUT of
 whatever pointed at it, so no reader ever walks a chain and a promotion undone by hand leaves no
 cycle. All three implementations of the port do this — both dialects and the in-memory twin — and
 the contract arc is `applies a disable written at the address the move has already left`.
+
+The same recorded hop is the only stale-address bridge for Ability authoring. Authority is selected
+before any exact package read: no row means the input address, while any recorded row retires that
+spelling even if a new package occupies it. Under a shared package admission the resolver rechecks
+the same authority, exact-reads only the selected address, and for a hop also requires both the
+physical owner claim and projected registry note id recorded by `0019`. Invalid/legacy evidence or
+a missing live target means not found; scanning sibling projects for the same package id is not
+evidence that the package moved. The resulting snapshot carries both identities with the package
+bytes; application detail may be derived after release without reopening that same fair gate. Every
+later metadata update, move or delete reopens the exact target and verifies both identities at its
+own mutation point.
+
+An authored manifest write additionally joins the ordinary store order instead of wrapping it from
+outside. `MutationCoordinator` first owns the note/path claim; its `aroundWrite` bracket then takes
+the target placement/package admission, revalidates the snapshot identities, performs the admitted
+physical CAS write and releases in `finally`. Taking placement first and then calling the public
+store writer is forbidden: an ordinary writer takes the claim first, so the reverse order forms a
+claim↔placement cycle.
 
 Which transactions must enter these levels through a helper is not prose: `LEVELS_NO_STATEMENT_CAN_ENTER`
 lists the levels no statement can enter by itself, and `pgTransactionRegistry.test.ts` holds every

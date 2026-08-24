@@ -262,6 +262,8 @@ const RULES: readonly SpellingRule[] = [
         'the canonical serializer: every field is read off the locator it was handed, in a fixed order for cache keys — it re-states an address, it cannot invent one',
       'packages/server/src/services/roles/roles.ts#ownedRoleLocator': 'the producer, role arm',
       'packages/server/src/services/roles/roles.ts#ownedSkillLocator': 'the producer, skill arm',
+      'packages/server/src/services/abilities/helpers/create/creator.ts#createDurably':
+        'durable operation evidence snapshots the already service-minted placement beside kind/package identity; it never constructs a public locator',
     },
   },
   {
@@ -345,6 +347,175 @@ type CallRegister = {
 
 const CALL_REGISTERS: readonly CallRegister[] = [
   {
+    producer: 'createDurably',
+    why: 'custom ability creation must cross the durable operation/terminal coordinator instead of the removed process-local requiredRevision+beforePublish path.',
+    askedFrom: {
+      'packages/server/src/services/abilities/abilities.ts#create':
+        'the shared human/MCP custom create lifecycle',
+      'scripts/seed.ts#createCustom':
+        'the real seed materializes agent-attributed edge states through the same durable producer',
+    },
+  },
+  {
+    producer: 'withCreateAdmission',
+    why: 'the physical package, required first revision and availability finalize stay invisible behind one placement+package admission.',
+    askedFrom: {
+      'packages/server/src/services/abilities/helpers/create/creator.ts#resume':
+        'the durable coordinator holds placement admission through physical publication and terminal commit',
+      'packages/server/src/services/roles/roles.ts#withCreateAdmission':
+        'the RolesService forwarding seam to its package library',
+    },
+  },
+  {
+    producer: 'inspectAndRemoveOwned',
+    why: 'package inspection and detach must share one physical checkpoint so a racing asset cannot slip past delete_ability.',
+    askedFrom: {
+      'packages/server/src/services/abilities/abilities.ts#removeOwnedPackage':
+        'the common human/MCP package removal producer',
+    },
+  },
+  {
+    producer: 'withOwnedAt',
+    why: 'a live document identity and its physical package stay admitted through the exact target proof callback.',
+    askedFrom: {
+      'packages/server/src/services/abilities/abilities.ts#locateOwnedPackageForDocument':
+        'the human package-root door starts from a live document rather than a stale locator',
+    },
+  },
+  {
+    producer: 'withCurrentOwnedTarget',
+    why: 'all stale package consumers share trail-first authority and keep dual identity proof admitted through the consumer callback.',
+    askedFrom: {
+      'packages/server/src/services/abilities/abilities.ts#captureOwnedAuthoringTarget':
+        'the shared authoring capture resolves placement authority for get/save/edit/remove and version forks without loading unrelated detail projections',
+      'packages/server/src/services/abilities/abilities.ts#setEnabled':
+        'the human owner-preference door accepts a readable package but still binds the preference write to its exact live identity',
+    },
+  },
+  {
+    producer: 'resolveMovedOwnedRoleLocator',
+    why: 'the domain distinguishes no row from a recorded invalid row and rechecks the authority under package admission.',
+    askedFrom: {
+      'packages/server/src/services/roles/roles.ts#authority':
+        'the resolver-local authority selector distinguishes absent, valid and invalid recorded rows',
+      'packages/server/src/services/roles/roles.ts#withOwnedTarget':
+        'a carried proof fails closed when its locator has since become a retired source',
+    },
+  },
+  {
+    producer: 'withExactPackageRead',
+    why: 'placement authority, exact package bytes and projected registry note identity must be one shared package-admission decision.',
+    askedFrom: {
+      'packages/server/src/services/roles/roles.ts#withCurrentOwnedTarget':
+        'the authority resolver exact-reads only its selected source or target under the lease',
+      'packages/server/src/services/roles/roles.ts#withOwnedTarget':
+        'a carried dual-identity proof is revalidated at the next consumer linearization',
+      'packages/server/src/services/roles/roles.ts#withOwnedAt':
+        'the human document door binds its live registry identity to exact physical bytes',
+      'packages/server/src/services/roles/roles.ts#moveRolePlacement':
+        'move captures kind and both identities before handing proof to the exclusive move producer',
+    },
+  },
+  {
+    producer: 'withExactPackageMutation',
+    why: 'identity-bound writes acquire exclusive placement then shared package admission and retain both through the consumer mutation.',
+    askedFrom: {
+      'packages/server/src/services/roles/roles.ts#withCurrentOwnedTarget':
+        'the first authoring mutation keeps trail authority and both identities live through the callback',
+      'packages/server/src/services/roles/roles.ts#withOwnedTarget':
+        'later save steps revalidate carried identity proof under a fresh mutation admission',
+    },
+  },
+  {
+    producer: 'authorizeDocument',
+    why: 'a note access hit is not yet an Ability write authority. Both human doors and the compound service must pass through the same class/access mint before the authored producer or package delete sees a target.',
+    askedFrom: {
+      'packages/server/src/apps/server/routes/note/note.ts#noteRoutes':
+        'the generic note write and package-root delete doors',
+      'packages/server/src/services/abilities/abilities.ts#save':
+        'the compound Ability Save document step',
+      'packages/server/src/services/abilities/abilities.ts#edit': 'the MCP patch document step',
+      'packages/server/src/services/abilities/abilities.ts#remove':
+        'the MCP whole-package delete door',
+    },
+  },
+  {
+    producer: 'writeDocument',
+    why: 'the immediate authored Ability writer remains the generic human note door adapter over the shared preparation producer.',
+    askedFrom: {
+      'packages/server/src/apps/server/routes/note/note.ts#noteRoutes':
+        'the generic human note door for an Ability root',
+    },
+  },
+  {
+    producer: 'prepareDocument',
+    why: 'the one authored Ability preparation producer. It validates description/attachments and builds the exact CAS write before compound authoring enters its final identity admission.',
+    askedFrom: {
+      'packages/server/src/services/abilities/helpers/save/save.ts#writeDocument':
+        'the immediate generic note-door adapter commits the prepared write',
+      'packages/server/src/services/abilities/abilities.ts#save':
+        'the compound Ability Save document step',
+      'packages/server/src/services/abilities/abilities.ts#edit': 'the MCP patch document step',
+    },
+  },
+  {
+    producer: 'resolveOwnedPlacement',
+    why: 'the application layer may resolve human handles and grants, but only RolesService may mint the addressed placement that crosses into package operations.',
+    askedFrom: {
+      'packages/server/src/services/abilities/helpers/placement/placement.ts#prepareCreate':
+        'the shared human/MCP create preflight',
+      'scripts/seed.ts#createCustom':
+        'the real seed resolves its declarative home through the same service mint before durable publication',
+    },
+  },
+  {
+    producer: 'personalSpaceFor',
+    why: 'every Ability consumer must distinguish a proven Personal context from the authless operator-static fallback; using generic Personal content resolution reclassifies explicit Space packages.',
+    askedFrom: {
+      'packages/server/src/services/abilities/helpers/placement/placement.ts#prepareCreate':
+        'the shared human/MCP create preflight',
+      'packages/server/src/services/abilities/helpers/placement/placement.ts#writableSharedSpace':
+        'rejects an explicit Space placement that aliases the canonical Personal root',
+      'packages/server/src/services/abilities/helpers/inventory/inventory.ts#listRoles':
+        'the human Role inventory and install affordance',
+      'packages/server/src/services/abilities/helpers/inventory/inventory.ts#listSkills':
+        'the human Skill inventory and install affordance',
+      'packages/server/src/services/abilities/helpers/save/save.ts#prepareDocument':
+        'Role attachment serialization at the authored document door',
+      'packages/server/src/services/abilities/abilities.ts#contextFor':
+        'exact human/MCP detail and shared authoring context',
+      'packages/server/src/services/abilities/abilities.ts#locateOwnedPackageForDocument':
+        'the compatibility note door location search',
+      'packages/server/src/services/abilities/abilities.ts#applyAvailability':
+        'Space reach mutation',
+      'packages/server/src/services/abilities/abilities.ts#setHome': 'the direct Role home move',
+      'packages/server/src/services/abilities/abilities.ts#save': 'compound Save home transition',
+      'packages/server/src/services/abilities/abilities.ts#edit': 'MCP edit home transition',
+      'packages/server/src/services/abilities/abilities.ts#removeOwnedPackage':
+        'whole-package inspection and delete',
+      'packages/server/src/services/mcp/tools/roles/roles.ts#roleContext':
+        'the shared MCP list/use/start-session ability context',
+      'packages/server/src/apps/server/routes/auth/me.ts#meRoutes':
+        'the human Personal Context role projection, separate from generic memory fallback',
+      'packages/server/src/apps/server/routes/projects/projects.ts#projectsRoutes':
+        'the human Project Context effective Role chain',
+      'packages/server/src/apps/server/routes/contextSets/contextSets.ts#rolePersonalSpaceFor':
+        'exact Role Context read, mutations and context-set labels',
+    },
+  },
+  {
+    producer: 'personalInstallAvailable',
+    why: 'create preflight and human install affordances must agree that a Personal package needs either a live Personal pointer or a mintable namespace.',
+    askedFrom: {
+      'packages/server/src/services/abilities/helpers/placement/placement.ts#prepareCreate':
+        'the shared human/MCP create preflight',
+      'packages/server/src/services/abilities/helpers/inventory/inventory.ts#listRoles':
+        'the human Role install affordance',
+      'packages/server/src/services/abilities/helpers/inventory/inventory.ts#listSkills':
+        'the human Skill install affordance',
+    },
+  },
+  {
     producer: 'addressed',
     why: 'the mint of the addressed-placement brand. Its own docblock claims it is called from exactly three kinds of place and nowhere else; that claim was prose until here. A new caller is a new way for a client-named placement to acquire the brand that says the service derived it.',
     askedFrom: {
@@ -358,9 +529,20 @@ const CALL_REGISTERS: readonly CallRegister[] = [
         'derives a project of an addressed home',
       'packages/server/src/services/roles/roles.ts#addFromCatalog':
         'an entry reached by ENUMERATING a home the caller was already granted',
-      'packages/server/src/services/roles/roles.ts#createCustomRole': 'the same boundary, stated',
+      'packages/server/src/services/roles/roles.ts#prepareCustomRole':
+        'the prepared custom package validated before compound publication',
       'packages/server/src/services/roles/roles.ts#canAddRoleAt':
         'the placement plan an Add is judged available by, asked before the Add itself',
+      'packages/server/src/services/roles/roles.ts#resolveOwnedPlacement':
+        'the application service resolved human words and asks the domain to mint the placement',
+      'packages/server/src/services/roles/roles.ts#resolveOwnedAt':
+        'an exact package found at a service-owned placement',
+      'packages/server/src/services/roles/roles.ts#withCurrentOwnedTarget':
+        'the trail authority already selected one exact package placement',
+      'packages/server/src/services/roles/roles.ts#withOwnedTarget':
+        'a carried proof reopens only its service-minted placement',
+      'packages/server/src/services/roles/roles.ts#withOwnedAt':
+        'the human document target is checked at a service-minted exact placement',
     },
   },
   {
@@ -369,7 +551,7 @@ const CALL_REGISTERS: readonly CallRegister[] = [
     askedFrom: {
       'packages/server/src/apps/server/routes/wire.ts#abilityReaches':
         'the transport, labelling a library card',
-      'packages/server/src/apps/server/routes/auth/me.ts#ownedRoleCandidate':
+      'packages/server/src/services/abilities/helpers/inventory/inventory.ts#ownedRoleCandidate':
         'the skill arm of the candidate list',
       'packages/server/src/services/roles/roles.ts#coversProject':
         'the role arm, inside the service',
@@ -395,11 +577,11 @@ const CALL_REGISTERS: readonly CallRegister[] = [
         'the home an attachment is serialized against',
       'packages/server/src/services/roles/roles.ts#linkedAt':
         'the home a linked skill is loaded from',
-      'packages/server/src/services/roles/roles.ts#healthForRole':
+      'packages/server/src/services/roles/roles.ts#roleActivationSnapshot':
         'the home a dependency’s health is read in',
-      'packages/server/src/services/roles/roles.ts#describeAbility': 'the detail door',
+      'packages/server/src/services/roles/roles.ts#describeOwnedParsed':
+        'the admitted-snapshot detail door',
       'packages/server/src/services/roles/roles.ts#findRoleBase': 'the base of a project version',
-      'packages/server/src/services/roles/roles.ts#loadSavedRole': 'the saved-role loader',
       'packages/server/src/services/roles/roles.ts#addFromCatalog':
         'the home a catalog fork lands in',
       'packages/server/src/services/roles/roles.ts#canAddRoleAt':
@@ -408,12 +590,23 @@ const CALL_REGISTERS: readonly CallRegister[] = [
   },
   {
     producer: 'entryHealth',
-    why: 'the SOUNDNESS half of "may this role be used" — the half that reads the packages it depends on. Resume applies both halves; a door that applies only the other one activates a role whose dependencies are missing, disabled or the wrong kind.',
+    why: 'the entry-shaped health adapter used by projections that need a verdict but not dependency bodies. Activation asks the snapshot producer below instead, so the verdict and bodies come from one read.',
     askedFrom: {
+      'packages/server/src/services/roles/roles.ts#abilityResolutionEntries':
+        'the shared runtime/authoring/bundle winner projection',
       'packages/server/src/services/roles/roles.ts#addressedRoleStatus':
         'the addressed status door',
-      'packages/server/src/services/roles/roles.ts#loadEffectiveEntry': 'the effective loader',
       'packages/server/src/services/roles/roles.ts#resolveSavedRole': 'the saved-role resolver',
+    },
+  },
+  {
+    producer: 'roleActivationSnapshot',
+    why: 'the one dependency read behind both role health and activation. The effective loader consumes its exact package snapshots so a second read cannot silently drop or slice a dependency after the verdict.',
+    askedFrom: {
+      'packages/server/src/services/roles/roles.ts#healthForRole':
+        'the health-only adapter used by listing, status and resume resolution',
+      'packages/server/src/services/roles/roles.ts#loadEffectiveEntry':
+        'the activation path that needs both the verdict and the exact dependency bodies',
     },
   },
   {
@@ -430,7 +623,7 @@ const CALL_REGISTERS: readonly CallRegister[] = [
         'the package write chokepoint: a directory is a generated id or a name',
       'packages/server/src/services/roles/library.ts#readPackagesFromDirectory':
         'the on-disk scan, deciding which directories are packages at all',
-      'packages/server/src/services/roles/library.ts#getSkill': 'a lookup by name',
+      'packages/server/src/services/roles/library.ts#getAbilitiesNamed': 'a lookup by name',
       'packages/server/src/services/roles/library.ts#exists': 'the same, asked as a predicate',
       'packages/server/src/services/roles/library.ts#get': 'the same, on the role arm',
       'packages/server/src/services/roles/library.ts#nameableManifest':

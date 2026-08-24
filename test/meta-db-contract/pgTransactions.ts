@@ -41,6 +41,7 @@ export type PgTransaction = {
 export const PG_TRANSACTIONS: readonly PgTransaction[] = [
   // Outside the hierarchy entirely: no tiered table, no tiered lock.
   { id: 'auth.createFirstUser', levels: [] },
+  { id: 'sessions.startInferred', levels: [] },
   { id: 'sessions.startNamed', levels: [] },
   { id: 'sessions.setRole', levels: [] },
   { id: 'oauth.upsertPendingClient', levels: [] },
@@ -62,8 +63,19 @@ export const PG_TRANSACTIONS: readonly PgTransaction[] = [
   // SUBSEQUENCE of what is registered.
   { id: 'abilityAvailability.set', levels: ['L3s', 'L3n', 'L4f', 'L4a'] },
   { id: 'abilityAvailability.grantProject', levels: ['L3s', 'L3n', 'L4f', 'L4a'] },
+  { id: 'abilityAvailability.reserve', levels: ['L3s', 'L4f', 'L4a'] },
+  { id: 'abilityAvailability.finalize', levels: ['L3s', 'L3n', 'L4a'] },
+  { id: 'abilityAvailability.cancel', levels: ['L4a'] },
   // Nothing to fence: removing owner state cannot outlive anything.
   { id: 'abilityAvailability.clear', levels: ['L4a'] },
+  { id: 'abilityCreate.accept', levels: ['L1', 'L3s', 'L4f', 'L4a'] },
+  { id: 'abilityCreate.reject', levels: ['L1', 'L4a'] },
+  { id: 'abilityCreate.finalize', levels: [] },
+  {
+    id: 'abilityCreate.commit',
+    levels: ['L1', 'L3t', 'L3s', 'L3n', 'L3b', 'L3t', 'L4a'],
+    exempt: 'append-cas',
+  },
   // The project parent row is L4f like any other `folders` lock. The child cursor
   // tables are outside the hierarchy, so this transaction enters one level and
   // nothing else — but it DOES enter it, which the entry it replaced (an inline

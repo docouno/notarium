@@ -9,6 +9,7 @@ import {
 } from '../../packages/server/src/services/metaDb/drivers/pg/revisionLocks'
 import { PgMetaDb } from '../../packages/server/src/services/metaDb/pgMetaDb'
 import { describeAbilityAvailabilityContract } from './abilityAvailabilityContract'
+import { describeAbilityCreateContract } from './abilityCreateContract'
 import { describeAbilityPlacementContract } from './abilityPlacementContract'
 import { describeAbilityPreferencesContract } from './abilityPreferencesContract'
 import { describeAgentDeltaCursorsContract } from './agentDeltaCursorsContract'
@@ -211,6 +212,11 @@ describePostgres('live Postgres driver', SUITE, () => {
 
   describeAbilityAvailabilityContract('Postgres', async () => {
     const testSchema = await createPostgresTestSchema('ability_availability')
+    return { db: testSchema.db, teardown: testSchema.teardown }
+  })
+
+  describeAbilityCreateContract('Postgres', async () => {
+    const testSchema = await createPostgresTestSchema('ability_create')
     return { db: testSchema.db, teardown: testSchema.teardown }
   })
 
@@ -880,6 +886,7 @@ describePostgres('live Postgres driver', SUITE, () => {
         role: null,
         roleLocator: null,
         roleContextProjectId: null,
+        projectId: null,
       })
       // The owner row exists while the session row does not: getOrInit can leave
       // exactly this shape when a concurrent retype removes the materialised row
@@ -980,6 +987,7 @@ describePostgres('live Postgres driver', SUITE, () => {
         role: null,
         roleLocator: null,
         roleContextProjectId: null,
+        projectId: null,
       })
       const scope = { owner: 'alice', session: { id: sessionId, parentId: null } }
       await testSchema.db.agentDeltaCursors.advance(scope, projectId, '10', '2026-08-04T10:01:00Z')

@@ -4,6 +4,8 @@ import {
   ABILITY_ATTACHMENT_HEALTH,
   ABILITY_KIND,
   ABILITY_ORIGIN,
+  ABILITY_SAVE_OUTCOME,
+  ABILITY_SAVE_STEP,
   ABILITY_SOURCE,
   ROLE_SCOPE,
 } from '../../../consts/primitives'
@@ -335,6 +337,55 @@ export const SetAbilityHomeResponseSchema = z
   })
   .strict()
 
+/** One human Save over the authored document and the placement-owned settings.
+ * `covers:null` means every project; a non-empty list names the exact project ids.
+ * Attachments stay omission-sensitive: absent preserves the authored list, while an
+ * empty list deliberately removes it. */
+export const AbilitySaveRequestSchema = z
+  .object({
+    content: z.string(),
+    description: SkillDescriptionSchema,
+    attachments: z.array(AuthoredAttachmentSchema).max(64).optional(),
+    covers: z.array(DurableNonEmptyScalarSchema).min(1).max(128).nullable(),
+    enabled: z.boolean().optional(),
+    versionToken: z.string(),
+  })
+  .strict()
+
+const AbilitySaveStepSchema = z.enum(enumValues(ABILITY_SAVE_STEP))
+
+export const AbilitySaveStepResultSchema = z.discriminatedUnion('outcome', [
+  z
+    .object({
+      step: AbilitySaveStepSchema,
+      outcome: z.literal(ABILITY_SAVE_OUTCOME.applied),
+    })
+    .strict(),
+  z
+    .object({
+      step: AbilitySaveStepSchema,
+      outcome: z.literal(ABILITY_SAVE_OUTCOME.skipped),
+    })
+    .strict(),
+  z
+    .object({
+      step: AbilitySaveStepSchema,
+      outcome: z.literal(ABILITY_SAVE_OUTCOME.failed),
+      error: z.string().min(1),
+      reason: z.string().min(1).optional(),
+    })
+    .strict(),
+])
+
+export const AbilitySaveResponseSchema = z
+  .object({
+    locator: OwnedAbilityLocatorSchema,
+    noteId: DurableNonEmptyScalarSchema,
+    versionToken: z.string(),
+    steps: z.array(AbilitySaveStepResultSchema).min(1).max(4),
+  })
+  .strict()
+
 export type AbilityPackageId = z.infer<typeof AbilityPackageIdSchema>
 export type SystemAbilityLocator = z.infer<typeof SystemAbilityLocatorSchema>
 export type CatalogAbilityLocator = z.infer<typeof CatalogAbilityLocatorSchema>
@@ -363,3 +414,6 @@ export type CreateAbilityVersionRequest = z.infer<typeof CreateAbilityVersionReq
 export type CreateAbilityVersionResponse = z.infer<typeof CreateAbilityVersionResponseSchema>
 export type SetAbilityHomeRequest = z.infer<typeof SetAbilityHomeRequestSchema>
 export type SetAbilityHomeResponse = z.infer<typeof SetAbilityHomeResponseSchema>
+export type AbilitySaveRequest = z.infer<typeof AbilitySaveRequestSchema>
+export type AbilitySaveStepResult = z.infer<typeof AbilitySaveStepResultSchema>
+export type AbilitySaveResponse = z.infer<typeof AbilitySaveResponseSchema>

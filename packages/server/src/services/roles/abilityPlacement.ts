@@ -15,7 +15,14 @@ import type { InMemoryAbilityPreferences } from './abilityPreferences'
 export const createInMemoryAbilityPlacement = (facets: {
   abilityPreferences: InMemoryAbilityPreferences
 }): AbilityPlacementPersistence => ({
+  resolveMovedOwnedRoleLocator: async (fromLocator) =>
+    facets.abilityPreferences.movedPlacement(fromLocator),
   moveOwnedRolePlacement: async (move: OwnedRolePlacementMove) => {
-    facets.abilityPreferences.moveLocator(move.fromLocator, move.toLocator)
+    facets.abilityPreferences.moveLocator(
+      move.fromLocator,
+      move.toLocator,
+      move.registryNoteId,
+      move.manifestNoteId,
+    )
   },
 })

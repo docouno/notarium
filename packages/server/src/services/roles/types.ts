@@ -5,12 +5,14 @@ import {
   type AuthoredAttachment,
   type CatalogAbilityLocator,
   type OwnedAbilityLocator,
+  type ROLE_ATTACHMENT_STATE,
   ROLE_SCOPE,
   type SystemAbilityLocator,
 } from '@notarium/contract'
 
 import type { Principal } from '../authz'
 import type { AbilityAvailability, ProjectRecord } from '../metaDb'
+import type { SkillPackage } from './library'
 
 export { ROLE_SCOPE }
 
@@ -92,7 +94,21 @@ export type AbilityDetail = {
 
 export type LoadedRole = {
   role: RoleSummary & { instructions: string }
-  skills: Array<{ name: string; title: string; description: string; instructions: string }>
+  skills: Array<
+    | {
+        name: string
+        title: string
+        description: string
+        state: typeof ROLE_ATTACHMENT_STATE.loaded
+        instructions: string
+      }
+    | {
+        name: string
+        title: string
+        description: string
+        state: typeof ROLE_ATTACHMENT_STATE.omittedByBudget
+      }
+  >
   truncated: boolean
 }
 /** Same split as `ResolvedEffectiveRole`: what was loaded, and — for an Owned role
@@ -123,7 +139,7 @@ export type ResolvedOwnedRole = Extract<ResolvedEffectiveRole, { source: 'owned'
 /** Why the agent does not load a role the caller addressed. Mirrors the wire enum; the
  *  three reasons are deliberately distinguishable because the surface tells the human
  *  which one it is, and "not effective" alone was the message that gave an agent a role
- *  in `list_roles` it could not activate. */
+ *  in the runtime ability inventory it could not activate. */
 export const ROLE_INACTIVE = {
   disabled: 'disabled',
   outOfReach: 'out-of-reach',
@@ -147,6 +163,51 @@ export type ResolvedEffectiveRole = { packageId: string; locator: ActiveRoleLoca
       location: RoleLocation
     }
 )
+
+type AbilityResolutionFacts = {
+  name: string
+  title: string
+  description: string
+  enabled: boolean
+  effective: boolean
+}
+
+export type AbilityResolutionCandidate = AbilityResolutionFacts &
+  (
+    | {
+        source: 'system'
+        kind: 'role'
+        locator: SystemAbilityLocator & { kind: 'role' }
+        location?: never
+        health?: AbilityHealth
+      }
+    | {
+        source: 'system'
+        kind: 'skill'
+        locator: SystemAbilityLocator & { kind: 'skill' }
+        location?: never
+        health?: never
+      }
+    | {
+        source: 'owned'
+        kind: 'role'
+        locator: Extract<OwnedAbilityLocator, { kind: 'role' }>
+        location: RoleLocation
+        health?: AbilityHealth
+      }
+    | {
+        source: 'owned'
+        kind: 'skill'
+        locator: Extract<OwnedAbilityLocator, { kind: 'skill' }>
+        location: SkillHomeLocation
+        health?: never
+      }
+  )
+
+export type AbilityResolutionListing = {
+  candidates: AbilityResolutionCandidate[]
+  truncated: boolean
+}
 
 /** A role that LIVES somewhere. `catalog` is a source, not a placement, so an entry
  *  that has a space cannot carry it — the narrowing is here rather than at each
@@ -172,9 +233,24 @@ export type PublishedRoleInventoryEntry = RoleInventoryEntry & { packageId: stri
  *  a project home, which reaches its own project by construction. */
 export type MovedRole = {
   locator: Extract<OwnedAbilityLocator, { kind: 'role' }>
+  target: OwnedAbilityTarget & { locator: Extract<OwnedAbilityLocator, { kind: 'role' }> }
   availability?: AbilityAvailability
   role: RoleSummary & { space: string; packageId: string; noteId: string }
 }
+
+/** Identity proof captured from both the registry projection and the physical
+ * manifest while the package is admitted. A locator is only an address; this is
+ * the authority a later exclusive operation must revalidate before it acts. */
+export type OwnedAbilityTarget = {
+  locator: OwnedAbilityLocator
+  registryNoteId: string
+  manifestNoteId: string
+}
+
+/** Immutable package bytes captured with the two independent identity proofs under
+ * one package admission. Consumers may derive detail after release, then revalidate
+ * `target` at the eventual mutation boundary. */
+export type OwnedAbilitySnapshot = OwnedAbilityTarget & { pkg: SkillPackage }
 
 export type SkillInventoryEntry = {
   name: string
@@ -206,7 +282,116 @@ export type LoadedSkill = {
   truncated: boolean
 }
 
+export type EffectiveSkillSummary =
+  | {
+      source: 'system'
+      kind: 'skill'
+      name: string
+      title: string
+      description: string
+    }
+  | {
+      source: 'owned'
+      kind: 'skill'
+      name: string
+      title: string
+      description: string
+      scope: SkillHomeScope
+    }
+
+export type LoadedEffectiveSkill = {
+  packageId: string
+  locator: ActiveRoleLocator
+  skill: EffectiveSkillSummary & { instructions: string }
+}
+
+export type LoadedEffectiveAbility = LoadedEffectiveRole | LoadedEffectiveSkill
+
+/** Server-computed recovery steps for a failed runtime resolution. MCP adapters only
+ * render these; they never repeat access checks or infer policy from an opaque ref. */
+export type AbilityRemediation =
+  | { kind: 'edit-ability'; ref: string; patch: 'enabled' | 'availability' }
+  | { kind: 'open-agents-ui'; ref: string }
+  | { kind: 'retry-project'; projects: string[] }
+  | { kind: 'contact-space-writer' }
+  | { kind: 'call-other-kind'; actual: 'role' | 'skill' }
+  | { kind: 'list-abilities'; view: 'runtime' | 'authoring' }
+  | { kind: 'reactivate-role'; role: string; project?: string }
+
+export type FailedAbilityCandidate = {
+  ref: string
+  source: 'owned' | 'system'
+  access: 'writer' | 'reader' | 'system'
+  remediation: AbilityRemediation[]
+}
+
+/** A nullable loader merged absence, private disablement, reach, kind and health into
+ * one answer. This union keeps those states distinct all the way to the transport. */
+export type AbilityLoadOutcome<T extends LoadedEffectiveAbility = LoadedEffectiveAbility> =
+  | { ok: true; loaded: T; health?: AbilityHealth }
+  | ({ ok: false; reason: 'unhealthy'; health: AbilityHealth } & FailedAbilityCandidate)
+  | ({ ok: false; reason: 'disabled' } & FailedAbilityCandidate)
+  | ({ ok: false; reason: 'out-of-reach'; project?: string } & FailedAbilityCandidate)
+  | {
+      ok: false
+      reason: 'wrong-kind'
+      actual: 'role' | 'skill'
+      remediation: AbilityRemediation[]
+    }
+  | {
+      ok: false
+      reason: 'context-mismatch'
+      savedProject?: string
+      currentProject?: string
+      role: string
+      remediation: AbilityRemediation[]
+    }
+  | { ok: false; reason: 'gone'; ref?: string; remediation: AbilityRemediation[] }
+  | { ok: false; reason: 'not-found'; remediation: AbilityRemediation[] }
+
 export type RolesService = {
+  /** Turn one already-resolved owner placement into the service-minted address.
+   * Personal and Space share a physical root, so callers may not manufacture this
+   * answer from the scope literal themselves. */
+  resolveOwnedPlacement(
+    location: RoleLocation,
+    personalSpace: string | null,
+  ): AddressedPlacement | null
+  /** Resolve one immutable package address at one already-reachable placement.
+   * Exact lookup is deliberately independent from bounded discovery windows. */
+  resolveOwnedAt(
+    location: RoleLocation,
+    principal: Principal,
+    kind: AbilityKind,
+    packageId: string,
+  ): Promise<OwnedAbilityLocator | null>
+  /** Bind a live document-door identity to its exact package placement. Unlike stale
+   * locator resolution this never follows placement history: the document id is the
+   * authority and must still own this physical manifest under admission. */
+  withOwnedAt<T>(
+    location: RoleLocation,
+    principal: Principal,
+    kind: AbilityKind,
+    packageId: string,
+    registryNoteId: string,
+    task: (snapshot: OwnedAbilitySnapshot) => Promise<T>,
+  ): Promise<T | null>
+  /** Resolve the authoritative target and keep its identity proof live through the
+   * callback. A recorded hop retires its source even when it is reoccupied. */
+  withCurrentOwnedTarget<T>(
+    locator: OwnedAbilityLocator,
+    principal: Principal,
+    task: (snapshot: OwnedAbilitySnapshot) => Promise<T>,
+    mode?: 'read' | 'mutation',
+  ): Promise<T | null>
+  /** Re-open a previously proven target and compare both independent identities
+   * under admission before the callback reaches its read/mutation linearization. */
+  withOwnedTarget<T>(
+    target: OwnedAbilityTarget,
+    principal: Principal,
+    task: (snapshot: OwnedAbilitySnapshot) => Promise<T>,
+    mode?: 'read' | 'mutation',
+  ): Promise<T | null>
   listBundledAbilities(principal: Principal): Promise<AgentAbilitySummary[]>
   /** `kind` is REQUIRED to pass: no caller has ever wanted both, and every one of
    *  them already knows which it is asking for. A default would let a new caller
@@ -216,6 +401,39 @@ export type RolesService = {
     principal: Principal,
     kind: AbilityKind,
   ): Promise<BoundedAbilityList>
+  /** All readable System+Owned candidates in one context, before inactive candidates
+   * are hidden. `effective` marks the active by-name winner; role winners also carry
+   * their attachment health. */
+  listAbilityResolution(
+    context: EffectiveRoleContext,
+    principal: Principal,
+  ): Promise<AbilityResolutionListing>
+  hasSystemAbility(kind: AbilityKind, name: string): Promise<boolean>
+  hasOwnedAbilityAt(
+    location: RoleLocation,
+    name: string,
+    options?: { allowDuringClosure?: boolean },
+  ): Promise<boolean>
+  prepareCustomSkill(name: string, description: string, instructions: string): SkillPackage
+  prepareCustomRole(
+    name: string,
+    description: string,
+    instructions: string,
+    location: RoleHomeLocation,
+    options: {
+      principal: Principal
+      attachments?: readonly AuthoredAttachment[]
+      availability?: AbilityAvailability
+      personalSpace?: string | null
+    },
+  ): Promise<SkillPackage>
+  manifestPath(location: RoleLocation, packageId: string): string | null
+  withCreateAdmission<T>(
+    location: RoleLocation,
+    packageId: string,
+    task: () => Promise<T>,
+    options?: { allowDuringClosure?: boolean },
+  ): Promise<T>
   hasCatalog(name: string): Promise<boolean>
   hasCatalogSkill(name: string): Promise<boolean>
   describeAbility(
@@ -224,10 +442,18 @@ export type RolesService = {
     locator: ActiveRoleLocator | CatalogAbilityLocator,
     budgetTokens: number,
   ): Promise<AbilityDetail | null>
+  /** Project one already captured Owned package without reopening its package
+   * admission. Dependency reads happen only after the target lease was released. */
+  describeOwnedAbility(
+    context: EffectiveRoleContext,
+    principal: Principal,
+    snapshot: OwnedAbilitySnapshot,
+    budgetTokens: number,
+  ): Promise<AbilityDetail | null>
   setEnabled(
     context: EffectiveRoleContext,
     principal: Principal,
-    locator: ActiveRoleLocator,
+    locator: ActiveRoleLocator | OwnedAbilityTarget,
     enabled: boolean,
   ): Promise<void>
   /** Where a Space-homed ability is effective. Both kinds answer it — the reach of a
@@ -237,7 +463,7 @@ export type RolesService = {
   setAbilityAvailability(
     context: EffectiveRoleContext,
     principal: Principal,
-    locator: OwnedAbilityLocator,
+    locator: OwnedAbilityLocator | OwnedAbilityTarget,
     availability: AbilityAvailability,
   ): Promise<void>
   /** Which of the named projects hold a version of this Space base. Asked with the
@@ -256,12 +482,15 @@ export type RolesService = {
     principal: Principal,
     locator: Extract<OwnedAbilityLocator, { kind: 'role' }>,
     personalSpace: string | null,
-  ): Promise<OwnedAbilityLocator | null>
-  /** Fork a Space base into a project version of the SAME role: same name, the base's
-   * body and attachments as a starting point, its own package address. */
+  ): Promise<Extract<OwnedAbilityLocator, { kind: 'role' }> | null>
+  /** Fork an already admitted Space base snapshot into a project version of the SAME
+   * role: same name, captured body and attachments, its own package address. Authority
+   * selection belongs to `withCurrentOwnedTarget`; this sink never reopens a locator. */
   createRoleVersion(
     principal: Principal,
-    locator: Extract<OwnedAbilityLocator, { kind: 'role' }>,
+    source: OwnedAbilitySnapshot & {
+      locator: Extract<OwnedAbilityLocator, { kind: 'role' }>
+    },
     personalSpace: string | null,
     projectId: string,
   ): Promise<PublishedRoleInventoryEntry>
@@ -271,7 +500,9 @@ export type RolesService = {
    * different Space), and when the role is already a base. */
   moveRolePlacement(
     principal: Principal,
-    locator: Extract<OwnedAbilityLocator, { kind: 'role' }>,
+    target:
+      | Extract<OwnedAbilityLocator, { kind: 'role' }>
+      | (OwnedAbilityTarget & { locator: Extract<OwnedAbilityLocator, { kind: 'role' }> }),
     personalSpace: string | null,
   ): Promise<MovedRole>
   /** Validate and serialize a complete replacement of an Owned Role's authored
@@ -279,10 +510,23 @@ export type RolesService = {
    * current package; new invalid tokens and unhealthy exact locators fail closed. */
   serializeOwnedRoleAttachments(
     principal: Principal,
-    locator: Extract<OwnedAbilityLocator, { kind: 'role' }>,
+    locator:
+      | Extract<OwnedAbilityLocator, { kind: 'role' }>
+      | (OwnedAbilitySnapshot & { locator: Extract<OwnedAbilityLocator, { kind: 'role' }> }),
     attachments: readonly AuthoredAttachment[],
     personalSpace: string | null,
   ): Promise<{ links: string[]; noteId: string }>
+  inspectAndRemoveOwned(
+    target: OwnedAbilityTarget,
+    personalSpace: string | null,
+    options: {
+      assertSafe(
+        files: ReadonlyMap<string, Uint8Array>,
+        members?: readonly string[],
+      ): void | Promise<void>
+      remove(beforeDetach: (victimNoteIds?: readonly string[]) => Promise<void>): Promise<void>
+    },
+  ): Promise<boolean>
   listEffective(
     context: EffectiveRoleContext,
     principal: Principal,
@@ -340,13 +584,19 @@ export type RolesService = {
     principal: Principal,
     locator: ActiveRoleLocator,
     budgetTokens: number,
-  ): Promise<LoadedEffectiveRole | null>
+  ): Promise<AbilityLoadOutcome<LoadedEffectiveRole>>
   loadEffective(
     context: EffectiveRoleContext,
     principal: Principal,
     name: string,
     budgetTokens: number,
-  ): Promise<LoadedEffectiveRole | null>
+  ): Promise<AbilityLoadOutcome<LoadedEffectiveRole>>
+  loadEffectiveSkill(
+    context: EffectiveRoleContext,
+    principal: Principal,
+    name: string,
+    budgetTokens: number,
+  ): Promise<AbilityLoadOutcome<LoadedEffectiveSkill>>
   /** `personalSpace` says which space is the CALLER's own, because where a role's
    *  dependencies live depends on it: Personal IS the root of that space, so a role
    *  placed in a project of it takes personal skills, not Space ones. `null` is a

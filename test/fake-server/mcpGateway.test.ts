@@ -15,7 +15,7 @@
 import type { FastifyInstance } from 'fastify'
 import type { AddressInfo } from 'node:net'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { encodeWikilinkIdentity, sha256Hex } from '@notarium/core'
+import { decodeAbilityLocator, encodeWikilinkIdentity, sha256Hex } from '@notarium/core'
 import type { MutationGate } from '@notarium/server'
 
 import { createApp, type Fixture } from './app.js'
@@ -202,6 +202,36 @@ const patFor = async (
   return created.json().token as string
 }
 
+const createPersonalAbility = async (
+  bearer: string,
+  kind: 'role' | 'skill',
+  name: string,
+): Promise<{ ref: string; noteId: string; versionToken: string }> => {
+  const created = await callTool(
+    port,
+    'create_ability',
+    {
+      kind,
+      name,
+      description: `${name} description.`,
+      instructions: `# ${name}\n\n${name} instructions.`,
+      placement: { home: 'personal' },
+    },
+    bearer,
+  )
+
+  expect(isError(created), text(created)).toBe(false)
+  const ref = structured(created).ref as string
+  const locator = decodeAbilityLocator(ref)
+  expect(locator?.source).toBe('owned')
+
+  return {
+    ref,
+    noteId: locator!.packageId,
+    versionToken: structured(created).versionToken as string,
+  }
+}
+
 describe('initialize handshake', () => {
   it('returns serverInfo and the instructions text', async () => {
     const bearer = await patFor('alice', 'alice-password-1', 'read')
@@ -235,13 +265,14 @@ describe('tools/list scope filter (#10/#21)', () => {
     expect(names).toEqual([
       'get_my_projects',
       'get_note',
+      'list_abilities',
       'list_notes',
-      'list_roles',
       'recall',
       'recent_activity',
       'search',
       'start_session',
       'use_role',
+      'use_skill',
       'whoami',
     ])
     expect(names).not.toContain('create_note')
@@ -262,16 +293,20 @@ describe('tools/list scope filter (#10/#21)', () => {
     // `verb_entity`: note reorg (move_note/rename_note, note:write) + container reorg
     // (move_folder/rename_folder/rename_project, space:write).
     expect(names).toEqual([
+      'create_ability',
       'create_note',
       'create_notes',
+      'delete_ability',
       'delete_note',
+      'edit_ability',
       'edit_note',
+      'get_ability',
       'get_my_projects',
       'get_note',
       'link',
       'link_many',
+      'list_abilities',
       'list_notes',
-      'list_roles',
       'move_folder',
       'move_note',
       'recall',
@@ -284,6 +319,7 @@ describe('tools/list scope filter (#10/#21)', () => {
       'search',
       'start_session',
       'use_role',
+      'use_skill',
       'whoami',
     ])
   })
@@ -345,6 +381,859 @@ describe('tools/list scope filter (#10/#21)', () => {
       }
     )?.items
     expect(noteItem?.properties).not.toHaveProperty('session')
+    const start = listed.find(({ name }) => name === 'start_session')
+
+    expect(start?.inputSchema.properties).toHaveProperty('role')
+    expect(start?.inputSchema.properties).not.toHaveProperty('name')
+
+    const useSkill = listed.find(({ name }) => name === 'use_skill') as
+      | {
+          inputSchema: {
+            additionalProperties?: boolean
+            properties?: Record<string, { description?: string }>
+          }
+        }
+      | undefined
+    expect(useSkill?.inputSchema.additionalProperties).toBe(false)
+    expect(useSkill?.inputSchema.properties?.skill?.description).toContain('Canonical')
+    expect(useSkill?.inputSchema.properties?.name?.description).toContain('Compatibility alias')
+  })
+})
+
+describe('ability authoring vertical', () => {
+  it('creates two skills and one linked role in exactly three calls, then reads and edits it', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const createSkill = (name: string) =>
+      callTool(
+        port,
+        'create_ability',
+        {
+          kind: 'skill',
+          name,
+          description: `${name} description.`,
+          instructions: `# ${name}\n\nUse ${name}.`,
+          placement: { home: 'personal' },
+          idempotencyKey: `create-${name}`,
+        },
+        bearer,
+      )
+    const first = await createSkill('proof-one')
+    const second = await createSkill('proof-two')
+
+    expect(isError(first)).toBe(false)
+    expect(isError(second)).toBe(false)
+    const role = await callTool(
+      port,
+      'create_ability',
+      {
+        kind: 'role',
+        name: 'proof-role',
+        description: 'Coordinates both proof skills.',
+        instructions: '# Proof role\n\nUse both skills.',
+        placement: { home: 'personal' },
+        attachments: [{ ref: structured(first).ref }, { ref: structured(second).ref }],
+        idempotencyKey: 'create-proof-role',
+      },
+      bearer,
+    )
+
+    expect(isError(role), text(role)).toBe(false)
+    expect(structured(role)).toMatchObject({ name: 'proof-role', outcome: 'created' })
+    const ref = structured(role).ref as string
+    const read = await callTool(port, 'get_ability', { ref }, bearer)
+
+    expect(isError(read), text(read)).toBe(false)
+    expect(structured(read).ability).toMatchObject({
+      ref,
+      kind: 'role',
+      source: 'owned',
+      name: 'proof-role',
+      instructions: '# Proof role\n\nUse both skills.',
+      health: { healthy: true },
+    })
+    const versionToken = (structured(read).ability as { versionToken: string }).versionToken
+    const descriptionEdit = await callTool(
+      port,
+      'edit_ability',
+      { ref, versionToken, description: 'Updated description only.' },
+      bearer,
+    )
+
+    expect(isError(descriptionEdit), text(descriptionEdit)).toBe(false)
+    const afterDescription = await callTool(port, 'get_ability', { ref }, bearer)
+    expect(structured(afterDescription).ability).toMatchObject({
+      title: 'Proof role',
+      instructions: '# Proof role\n\nUse both skills.',
+      description: 'Updated description only.',
+    })
+    const nextToken = (structured(afterDescription).ability as { versionToken: string })
+      .versionToken
+    const edited = await callTool(
+      port,
+      'edit_ability',
+      { ref, versionToken: nextToken, instructions: '# Proof role\n\nUpdated instructions.' },
+      bearer,
+    )
+
+    expect(isError(edited), text(edited)).toBe(false)
+    expect(structured(edited).steps).toEqual([{ step: 'document', outcome: 'applied' }])
+    expect(structured(edited).versionToken).not.toBe(nextToken)
+  })
+
+  it('replays create by package id and reports skipped instead of creating a second package', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const input = {
+      kind: 'skill',
+      name: 'retry-proof',
+      description: 'Retry proof.',
+      instructions: '# Retry proof\n\nDo it once.',
+      placement: { home: 'personal' },
+      idempotencyKey: 'retry-proof-key',
+    }
+    const first = await callTool(port, 'create_ability', input, bearer)
+    const replay = await callTool(port, 'create_ability', input, bearer)
+
+    expect(structured(first)).toMatchObject({ outcome: 'created' })
+    expect(structured(replay)).toMatchObject({ outcome: 'skipped', ref: structured(first).ref })
+  })
+
+  it('does not let the gateway cache hide a changed create fingerprint', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const input = {
+      kind: 'skill',
+      name: 'retry-fingerprint-proof',
+      description: 'Original request.',
+      instructions: '# Retry fingerprint proof\n\nOriginal body.',
+      placement: { home: 'personal' },
+      idempotencyKey: 'retry-fingerprint-key',
+    }
+    const first = await callTool(port, 'create_ability', input, bearer)
+    const changed = await callTool(
+      port,
+      'create_ability',
+      { ...input, description: 'Changed request.' },
+      bearer,
+    )
+
+    expect(isError(first), text(first)).toBe(false)
+    expect(isError(changed)).toBe(true)
+    const reread = await callTool(port, 'get_ability', { ref: structured(first).ref }, bearer)
+    expect(structured(reread).ability).toMatchObject({ description: 'Original request.' })
+  })
+
+  it('replays a linked Role before resolving an attachment that disappeared after success', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const attachment = await createPersonalAbility(bearer, 'skill', 'retry-attachment')
+    const input = {
+      kind: 'role',
+      name: 'retry-linked-role',
+      description: 'Retry a committed linked Role.',
+      instructions: '# Retry linked role\n\nUse the attachment.',
+      placement: { home: 'personal' },
+      attachments: [{ ref: attachment.ref }],
+      idempotencyKey: 'retry-linked-role-key',
+    }
+    const first = await callTool(port, 'create_ability', input, bearer)
+
+    expect(isError(first), text(first)).toBe(false)
+    const removed = await callTool(port, 'delete_ability', { ref: attachment.ref }, bearer)
+    expect(isError(removed), text(removed)).toBe(false)
+    const replay = await callTool(port, 'create_ability', input, bearer)
+
+    expect(isError(replay), text(replay)).toBe(false)
+    expect(structured(replay)).toMatchObject({
+      outcome: 'skipped',
+      ref: structured(first).ref,
+    })
+  })
+
+  it('resumes later edit steps before resolving an attachment that disappeared', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const attachment = await createPersonalAbility(bearer, 'skill', 'edit-retry-attachment')
+    const role = await callTool(
+      port,
+      'create_ability',
+      {
+        kind: 'role',
+        name: 'edit-retry-role',
+        description: 'Exercises resumable authored edit.',
+        instructions: '# Edit retry role\n\nBefore the partial edit.',
+        placement: { home: 'personal' },
+        attachments: [{ ref: attachment.ref, label: 'custom-retry-label' }],
+      },
+      bearer,
+    )
+    expect(isError(role), text(role)).toBe(false)
+    const ref = structured(role).ref as string
+    const authored = {
+      ref,
+      instructions: '# Edit retry role\n\nThe document already landed.',
+      attachments: [{ ref: attachment.ref }],
+      enabled: false,
+    }
+    const partial = await callTool(
+      port,
+      'edit_ability',
+      {
+        ...authored,
+        versionToken: structured(role).versionToken,
+        home: { home: 'space' },
+      },
+      bearer,
+    )
+
+    expect(isError(partial), text(partial)).toBe(false)
+    expect(structured(partial).steps).toMatchObject([
+      { step: 'document', outcome: 'applied' },
+      { step: 'home', outcome: 'failed' },
+    ])
+    const afterPartial = await callTool(port, 'get_ability', { ref }, bearer)
+    expect(structured(afterPartial).ability).toMatchObject({
+      health: {
+        attachments: [
+          {
+            attachment: { kind: 'exact', label: 'custom-retry-label' },
+            health: 'healthy',
+          },
+        ],
+      },
+    })
+    const removed = await callTool(port, 'delete_ability', { ref: attachment.ref }, bearer)
+    expect(isError(removed), text(removed)).toBe(false)
+
+    const resumed = await callTool(
+      port,
+      'edit_ability',
+      {
+        ...authored,
+        versionToken: structured(partial).versionToken,
+      },
+      bearer,
+    )
+
+    expect(isError(resumed), text(resumed)).toBe(false)
+    expect(structured(resumed)).toMatchObject({
+      ref,
+      versionToken: structured(partial).versionToken,
+      steps: [
+        { step: 'document', outcome: 'skipped' },
+        { step: 'enabled', outcome: 'applied' },
+      ],
+    })
+  })
+
+  it('returns stale authored CAS remediation before resolving a disappeared attachment', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const attachment = await createPersonalAbility(bearer, 'skill', 'stale-edit-attachment')
+    const role = await callTool(
+      port,
+      'create_ability',
+      {
+        kind: 'role',
+        name: 'stale-edit-role',
+        description: 'Before the concurrent edit.',
+        instructions: '# Stale edit role\n\nBefore the concurrent edit.',
+        placement: { home: 'personal' },
+        attachments: [{ ref: attachment.ref }],
+      },
+      bearer,
+    )
+    expect(isError(role), text(role)).toBe(false)
+    const ref = structured(role).ref as string
+    const staleToken = structured(role).versionToken as string
+    const advanced = await callTool(
+      port,
+      'edit_ability',
+      { ref, versionToken: staleToken, description: 'A concurrent document edit.' },
+      bearer,
+    )
+    expect(isError(advanced), text(advanced)).toBe(false)
+    expect(structured(advanced).steps).toEqual([{ step: 'document', outcome: 'applied' }])
+    const removed = await callTool(port, 'delete_ability', { ref: attachment.ref }, bearer)
+    expect(isError(removed), text(removed)).toBe(false)
+
+    const stale = await callTool(
+      port,
+      'edit_ability',
+      {
+        ref,
+        versionToken: staleToken,
+        instructions: '# Stale edit role\n\nA stale overwrite.',
+        attachments: [{ ref: attachment.ref }],
+      },
+      bearer,
+    )
+
+    expect(isError(stale), text(stale)).toBe(false)
+    expect(structured(stale)).toMatchObject({
+      ref,
+      steps: [
+        {
+          step: 'document',
+          outcome: 'failed',
+          error: expect.stringMatching(/call get_ability.*versionToken/i),
+        },
+      ],
+    })
+    expect(structured(stale)).not.toHaveProperty('versionToken')
+  })
+
+  it('returns an actionable conflict for an actual duplicate create', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    await createPersonalAbility(bearer, 'skill', 'duplicate-create-proof')
+    const duplicate = await callTool(
+      port,
+      'create_ability',
+      {
+        kind: 'skill',
+        name: 'duplicate-create-proof',
+        description: 'Must not replace the existing skill.',
+        instructions: '# Duplicate create proof\n\nDo not publish this.',
+        placement: { home: 'personal' },
+      },
+      bearer,
+    )
+
+    expect(isError(duplicate)).toBe(true)
+    expect(text(duplicate)).toContain('already exists in personal')
+    expect(text(duplicate)).not.toBe('internal error')
+  })
+
+  it('returns an actionable dependency refusal from an actual role create', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const roleDependency = await createPersonalAbility(bearer, 'role', 'wrong-kind-dependency')
+    const refused = await callTool(
+      port,
+      'create_ability',
+      {
+        kind: 'role',
+        name: 'dependency-refusal-proof',
+        description: 'Must require a Skill attachment.',
+        instructions: '# Dependency refusal proof\n\nDo not publish this.',
+        placement: { home: 'personal' },
+        attachments: [{ ref: roleDependency.ref }],
+      },
+      bearer,
+    )
+
+    expect(isError(refused)).toBe(true)
+    expect(text(refused)).toMatch(/attachment|attachments/)
+    expect(text(refused)).not.toBe('internal error')
+  })
+
+  it('makes the first create revision durable with the agent principal', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const created = await callTool(
+      port,
+      'create_ability',
+      {
+        kind: 'skill',
+        name: 'revision-proof',
+        description: 'Revision proof.',
+        instructions: '# Revision proof\n\nAttribute the first write.',
+        placement: { home: 'personal' },
+      },
+      bearer,
+    )
+    const locator = decodeAbilityLocator(structured(created).ref as string)
+    const cookie = await loginCookie('alice', 'alice-password-1')
+    const history = await app.inject({
+      method: 'GET',
+      url: `/api/note/revisions?id=${locator!.packageId}`,
+      headers: { cookie },
+    })
+
+    expect(history.statusCode).toBe(200)
+    expect(history.json()).toMatchObject({
+      total: 1,
+      revisions: [{ principal: expect.stringMatching(/^pat:alice:/), kind: 'write' }],
+    })
+  })
+
+  it('requires authored CAS, allows preference-only edit without it, and deletes a simple package', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const created = await callTool(
+      port,
+      'create_ability',
+      {
+        kind: 'skill',
+        name: 'delete-proof',
+        description: 'Delete proof.',
+        instructions: '# Delete proof\n\nTemporary.',
+        placement: { home: 'personal' },
+      },
+      bearer,
+    )
+    const ref = structured(created).ref as string
+
+    const noToken = await callTool(
+      port,
+      'edit_ability',
+      { ref, instructions: '# Would clobber\n\nNo token.' },
+      bearer,
+    )
+    expect(isError(noToken)).toBe(true)
+    expect(text(noToken)).toContain('versionToken is required')
+
+    const preference = await callTool(port, 'edit_ability', { ref, enabled: false }, bearer)
+    expect(isError(preference), text(preference)).toBe(false)
+    expect(structured(preference).steps).toEqual([{ step: 'enabled', outcome: 'applied' }])
+
+    const removed = await callTool(port, 'delete_ability', { ref }, bearer)
+    expect(isError(removed), text(removed)).toBe(false)
+    expect(structured(removed)).toMatchObject({ ref, name: 'delete-proof' })
+    const missing = await callTool(port, 'get_ability', { ref }, bearer)
+    expect(isError(missing)).toBe(true)
+  })
+
+  it('reads System abilities but refuses their mutation and same-kind name shadowing', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const listed = await callTool(
+      port,
+      'list_abilities',
+      { view: 'authoring', source: 'system', kind: 'role', limit: 50 },
+      bearer,
+    )
+    const system = (structured(listed).abilities as Array<{ ref: string; name: string }>)[0]
+    const read = await callTool(port, 'get_ability', { ref: system.ref }, bearer)
+
+    expect(isError(read), text(read)).toBe(false)
+    expect(structured(read).ability).toMatchObject({ source: 'system', name: system.name })
+    const refusedMutation = await callTool(
+      port,
+      'edit_ability',
+      { ref: system.ref, enabled: false },
+      bearer,
+    )
+
+    expect(isError(refusedMutation)).toBe(true)
+    expect(text(refusedMutation)).toContain('only an Owned ability can be edited')
+    const shadow = await callTool(
+      port,
+      'create_ability',
+      {
+        kind: 'role',
+        name: system.name,
+        description: 'Would shadow the shipped role.',
+        instructions: '# Shadow\n\nDo not create this.',
+        placement: { home: 'personal' },
+      },
+      bearer,
+    )
+
+    expect(isError(shadow)).toBe(true)
+    expect(text(shadow)).toContain('conflicts with a System ability')
+    const keyedShadow = await callTool(
+      port,
+      'create_ability',
+      {
+        kind: 'role',
+        name: system.name,
+        description: 'Would durably shadow the shipped role.',
+        instructions: '# Keyed shadow\n\nDo not create this.',
+        placement: { home: 'personal' },
+        idempotencyKey: 'system-shadow-key',
+      },
+      bearer,
+    )
+
+    expect(isError(keyedShadow)).toBe(true)
+    expect(text(keyedShadow)).toContain('conflicts with a System ability')
+    const crossKind = await callTool(
+      port,
+      'create_ability',
+      {
+        kind: 'skill',
+        name: system.name,
+        description: 'Same name, different kind.',
+        instructions: '# Cross-kind research\n\nThis Skill is allowed.',
+        placement: { home: 'personal' },
+      },
+      bearer,
+    )
+
+    expect(isError(crossKind), text(crossKind)).toBe(false)
+    expect(structured(crossKind)).toMatchObject({ name: system.name, outcome: 'created' })
+  })
+
+  it('projects a placement writer denial as anti-enumeration not found', async () => {
+    const reader = await patFor('bob', 'bob-password-01', 'write')
+    const refused = await callTool(
+      port,
+      'create_ability',
+      {
+        kind: 'skill',
+        name: 'reader-cannot-publish',
+        description: 'Must not disclose the placement.',
+        instructions: '# Reader refusal\n\nDo not publish this.',
+        placement: { home: 'space', space: 'team' },
+      },
+      reader,
+    )
+
+    expect(isError(refused)).toBe(true)
+    expect(text(refused)).toBe('not found')
+  })
+
+  it('projects an Owned ability writer denial as anti-enumeration not found', async () => {
+    const writer = await patFor('alice', 'alice-password-1', 'write')
+    const created = await callTool(
+      port,
+      'create_ability',
+      {
+        kind: 'skill',
+        name: 'writer-only-edit',
+        description: 'Only a Space writer may change this.',
+        instructions: '# Writer only\n\nKeep this unchanged.',
+        placement: { home: 'space', space: 'team' },
+      },
+      writer,
+    )
+    const reader = await patFor('bob', 'bob-password-01', 'write')
+    const refused = await callTool(
+      port,
+      'edit_ability',
+      { ref: structured(created).ref, enabled: false },
+      reader,
+    )
+
+    expect(isError(refused)).toBe(true)
+    expect(text(refused)).toBe('not found')
+  })
+
+  it('persists all-project reach for a new Space skill before activation', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const created = await callTool(
+      port,
+      'create_ability',
+      {
+        kind: 'skill',
+        name: 'team-wide-proof',
+        description: 'Works in every Team project.',
+        instructions: '# Team-wide proof\n\nUse the shared rule.',
+        placement: { home: 'space', space: 'team' },
+        availability: { mode: 'all-projects' },
+      },
+      bearer,
+    )
+
+    expect(isError(created), text(created)).toBe(false)
+    const activated = await callTool(
+      port,
+      'use_skill',
+      { skill: 'team-wide-proof', project: 'team' },
+      bearer,
+    )
+    expect(isError(activated), text(activated)).toBe(false)
+    expect(structured(activated)).toMatchObject({ status: 'activated' })
+  })
+
+  it('refuses every auxiliary package member and leaves both seeded packages intact', async () => {
+    await app.close()
+    app = await createApp({
+      ...fixture(),
+      agentSkills: [
+        {
+          name: 'markdown-delete-proof',
+          description: 'Markdown package.',
+          instructions: '# Markdown delete proof\n\nSafe.',
+          home: { kind: 'personal', user: 'alice' },
+          packageFiles: [{ path: 'references/checklist.md', content: '# Checklist\n\nSafe.\n' }],
+        },
+        {
+          name: 'asset-delete-proof',
+          description: 'Asset package.',
+          instructions: '# Asset delete proof\n\nUnsafe.',
+          home: { kind: 'personal', user: 'alice' },
+          packageFiles: [{ path: 'assets/template.bin', content: 'not restorable' }],
+        },
+      ],
+    })
+    port = await listen(app)
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const list = async (q: string) =>
+      (
+        structured(
+          await callTool(
+            port,
+            'list_abilities',
+            { view: 'authoring', kind: 'skill', q, limit: 50 },
+            bearer,
+          ),
+        ).abilities as Array<{ ref: string }>
+      )[0]!.ref
+    const assetRef = await list('asset-delete-proof')
+    const markdownRef = await list('markdown-delete-proof')
+    const refusedAsset = await callTool(port, 'delete_ability', { ref: assetRef }, bearer)
+    const refusedMarkdown = await callTool(port, 'delete_ability', { ref: markdownRef }, bearer)
+
+    expect(isError(refusedAsset)).toBe(true)
+    expect(text(refusedAsset)).toContain('contains auxiliary member "assets/template.bin"')
+    expect(isError(refusedMarkdown)).toBe(true)
+    expect(text(refusedMarkdown)).toContain('auxiliary indexed members')
+    expect(isError(await callTool(port, 'get_ability', { ref: assetRef }, bearer))).toBe(false)
+    expect(isError(await callTool(port, 'get_ability', { ref: markdownRef }, bearer))).toBe(false)
+  })
+})
+
+describe('skill class MCP note door (V7)', () => {
+  it('refuses every generic id-addressed note door while the ability and REST door stay live', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const ability = await createPersonalAbility(bearer, 'skill', 'v7-door-proof')
+    const attempts: Array<[string, Record<string, unknown>, RegExp]> = [
+      ['get_note', { ref: ability.noteId }, /get_ability/i],
+      [
+        'edit_note',
+        {
+          ref: ability.noteId,
+          operation: 'append',
+          content: 'must not land',
+          versionToken: ability.versionToken,
+        },
+        /edit_ability/i,
+      ],
+      ['move_note', { ref: ability.noteId, toFolder: 'archive' }, /edit_ability/i],
+      ['rename_note', { ref: ability.noteId, title: 'Wrong generic rename' }, /edit_ability/i],
+      ['delete_note', { ref: ability.noteId }, /delete_ability/i],
+    ]
+
+    for (const [tool, args, guidance] of attempts) {
+      const refused = await callTool(port, tool, args, bearer)
+      expect(isError(refused), tool).toBe(true)
+      expect(text(refused), tool).toMatch(/ability package/i)
+      expect(text(refused), tool).toMatch(guidance)
+    }
+
+    const unchanged = await callTool(port, 'get_ability', { ref: ability.ref }, bearer)
+    expect(isError(unchanged), text(unchanged)).toBe(false)
+    expect((structured(unchanged).ability as { instructions: string }).instructions).toBe(
+      '# v7-door-proof\n\nv7-door-proof instructions.',
+    )
+
+    // The generic REST write remains deliberately open for the SAME write PAT.
+    const rest = await app.inject({
+      method: 'POST',
+      url: '/api/note',
+      headers: { authorization: `Bearer ${bearer}` },
+      payload: {
+        originalId: ability.noteId,
+        versionToken: ability.versionToken,
+        content: '# v7-door-proof\n\nREST remains the human-compatible write channel.',
+      },
+    })
+    expect(rest.statusCode).toBe(200)
+    const afterRest = await callTool(port, 'get_ability', { ref: ability.ref }, bearer)
+    expect((structured(afterRest).ability as { instructions: string }).instructions).toContain(
+      'REST remains the human-compatible write channel.',
+    )
+  })
+
+  it('refuses skill sources and targets across single, batch, and inline link doors', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const createdAbility = await callTool(
+      port,
+      'create_ability',
+      {
+        kind: 'skill',
+        name: 'v7-link-proof',
+        description: 'Same-space link refusal proof.',
+        instructions: '# V7 link proof\n\nStay behind the ability door.',
+        placement: { home: 'space', space: 'team' },
+        availability: { mode: 'all-projects' },
+      },
+      bearer,
+    )
+    expect(isError(createdAbility), text(createdAbility)).toBe(false)
+    const ability = {
+      noteId: decodeAbilityLocator(structured(createdAbility).ref as string)!.packageId,
+    }
+    const source = structured(
+      await callTool(
+        port,
+        'create_note',
+        { project: 'team', title: 'V7 source', body: 'source' },
+        bearer,
+      ),
+    ).noteId as string
+    const target = structured(
+      await callTool(
+        port,
+        'create_note',
+        { project: 'team', title: 'V7 target', body: 'target' },
+        bearer,
+      ),
+    ).noteId as string
+
+    for (const args of [
+      { from: ability.noteId, to: target, relation: 'relates_to' },
+      { from: source, to: ability.noteId, relation: 'relates_to' },
+    ]) {
+      const refused = await callTool(port, 'link', args, bearer)
+      expect(isError(refused)).toBe(true)
+      expect(text(refused)).toMatch(/ability package.*edit_ability/is)
+    }
+
+    const batch = await callTool(
+      port,
+      'link_many',
+      {
+        links: [
+          { from: source, to: ability.noteId, relation: 'blocked' },
+          { from: source, to: target, relation: 'allowed' },
+          { from: ability.noteId, to: target, relation: 'blocked-source' },
+        ],
+      },
+      bearer,
+    )
+    const results = structured(batch).results as Array<{ ok: boolean; error?: string }>
+    expect(results).toMatchObject([
+      { ok: false, error: expect.stringMatching(/ability package/i) },
+      { ok: true },
+      { ok: false, error: expect.stringMatching(/ability package/i) },
+    ])
+
+    const inline = await callTool(
+      port,
+      'create_note',
+      {
+        project: 'team',
+        title: 'V7 blocked inline source',
+        body: 'must stay absent',
+        links: [{ to: ability.noteId, relation: 'blocked' }],
+      },
+      bearer,
+    )
+    expect(isError(inline)).toBe(true)
+    expect(text(inline)).toMatch(/ability package.*edit_ability/is)
+  })
+
+  it('applies the class refusal only after access, preserving anti-enumeration', async () => {
+    const root = await patFor('root', 'root-password-1', 'write')
+    const created = await callTool(
+      port,
+      'create_ability',
+      {
+        kind: 'skill',
+        name: 'v7-private-proof',
+        description: 'Lives outside Alice reach.',
+        instructions: '# V7 private proof\n\nDo not disclose.',
+        placement: { home: 'space', space: 'main' },
+        availability: { mode: 'all-projects' },
+      },
+      root,
+    )
+    expect(isError(created), text(created)).toBe(false)
+    const noteId = decodeAbilityLocator(structured(created).ref as string)!.packageId
+    const alice = await patFor('alice', 'alice-password-1', 'read')
+    const refused = await callTool(port, 'get_note', { ref: noteId }, alice)
+
+    expect(isError(refused)).toBe(true)
+    expect(text(refused)).toMatch(/no such note/i)
+    expect(text(refused)).not.toMatch(/ability|get_ability/i)
+  })
+
+  it('filters only skill items from MCP context projection while REST previews stay exact', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const cookie = await loginCookie('alice', 'alice-password-1')
+    const skill = await createPersonalAbility(bearer, 'skill', 'v7-context-skill')
+    const role = await createPersonalAbility(bearer, 'role', 'v7-context-role')
+    const note = structured(
+      await callTool(
+        port,
+        'create_note',
+        { project: 'team', title: 'V7 ordinary context', body: 'ordinary context body' },
+        bearer,
+      ),
+    ).noteId as string
+
+    const pin = await app.inject({
+      method: 'PUT',
+      url: '/api/me/context-pins',
+      headers: { cookie },
+      payload: { space: 'alice-personal', noteId: skill.noteId },
+    })
+    expect(pin.statusCode).toBe(200)
+    const personalPreview = await app.inject({
+      method: 'GET',
+      url: '/api/me/agent-context',
+      headers: { cookie },
+    })
+    expect(JSON.stringify(personalPreview.json())).toContain(skill.noteId)
+
+    const createdSet = await app.inject({
+      method: 'POST',
+      url: '/api/s/alice-personal/context-sets',
+      headers: { cookie },
+      payload: { name: 'V7 mixed set' },
+    })
+    expect(createdSet.statusCode).toBe(200)
+    const setId = createdSet.json().set.id as string
+
+    for (const [space, noteId] of [
+      ['alice-personal', skill.noteId],
+      ['team', note],
+    ]) {
+      const added = await app.inject({
+        method: 'POST',
+        url: `/api/s/alice-personal/context-sets/${setId}/items`,
+        headers: { cookie },
+        payload: { space, noteId },
+      })
+      expect(added.statusCode, added.body).toBe(200)
+    }
+    const attached = await app.inject({
+      method: 'PUT',
+      url: `/api/me/agent-roles/${role.ref}/context-sets/${setId}`,
+      headers: { cookie },
+    })
+    expect(attached.statusCode).toBe(200)
+    const rolePreview = await app.inject({
+      method: 'GET',
+      url: `/api/me/agent-roles/${role.ref}/context`,
+      headers: { cookie },
+    })
+    expect(rolePreview.statusCode).toBe(200)
+    expect(JSON.stringify(rolePreview.json())).toContain(skill.noteId)
+    expect(JSON.stringify(rolePreview.json())).toContain(note)
+
+    const started = await callTool(port, 'start_session', {}, bearer)
+    const profile = structured(started).profile as {
+      alwaysLoad: Array<{ noteId: string; title: string }>
+    }
+    expect(profile.alwaysLoad.map((item) => item.noteId)).not.toContain(skill.noteId)
+    expect(text(started)).not.toContain(skill.noteId)
+    // The skill remains legitimately discoverable in the separate abilities block;
+    // only the generic always-load projection must omit its title/ref/body.
+    expect(text(started).split('**Available abilities:**')[0]).not.toContain('v7-context-skill')
+    expect(text(started)).not.toContain('v7-context-skill instructions.')
+
+    const activated = await callTool(port, 'use_role', { role: 'v7-context-role' }, bearer)
+    expect(isError(activated), text(activated)).toBe(false)
+    const context = structured(activated).context as {
+      alwaysLoad: Array<{ noteId: string; title: string }>
+    }
+    expect(context.alwaysLoad.map((item) => item.noteId)).toContain(note)
+    expect(context.alwaysLoad.map((item) => item.noteId)).not.toContain(skill.noteId)
+    expect(text(activated)).not.toContain(skill.noteId)
+    expect(text(activated)).not.toContain('v7-context-skill')
+  })
+
+  it('keeps skill packages out of generic discovery surfaces', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const ability = await createPersonalAbility(bearer, 'skill', 'v7-hidden-marker')
+    const search = await callTool(port, 'search', { query: 'v7-hidden-marker' }, bearer)
+    const recall = await callTool(port, 'recall', { query: 'v7-hidden-marker' }, bearer)
+    const listed = await callTool(port, 'list_notes', {}, bearer)
+    const recent = await callTool(port, 'recent_activity', {}, bearer)
+    const combined = JSON.stringify({
+      search: structured(search),
+      recall: structured(recall),
+      listed: structured(listed),
+      recent: structured(recent),
+    })
+
+    expect(combined).not.toContain(ability.noteId)
+    expect(combined).not.toContain('v7-hidden-marker')
   })
 })
 

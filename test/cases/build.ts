@@ -315,13 +315,22 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
     // `renameTo`/`linkedRole`/`deleted` operation still applies to its own package.
     for (const skill of world.agentSkills ?? []) {
       const home = skill.home
+      const merged = skill.agentAudit?.sessionRef
+        ? {
+            ...skill,
+            agentAudit: {
+              ...skill.agentAudit,
+              sessionRef: `${name}:${skill.agentAudit.sessionRef}`,
+            },
+          }
+        : skill
       const key =
         home.kind === 'personal'
           ? `personal\0${home.user ?? ''}\0${skill.name}`
           : `space\0${home.space}\0${skill.name}`
 
       if (!agentSkills.has(key)) {
-        agentSkills.set(key, skill)
+        agentSkills.set(key, merged)
       }
     }
     // Preferences address abilities, not notes, so nothing here is namespaced; two

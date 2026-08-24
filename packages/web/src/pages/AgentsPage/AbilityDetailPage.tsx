@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom'
 import { Link, useLocation, useNavigate, useParams } from 'react-router'
 import type {
   AbilityLocator,
+  AbilitySaveResponse,
   AddAgentRoleRequest,
   AddAgentSkillRequest,
   AgentAbilityDetailResponse,
@@ -45,12 +46,6 @@ import { AbilityEditorSurface } from './AbilityEditorSurface'
 import { AgentsPanel } from './AgentsPanel'
 import { useAgentsShell } from './AgentsProvider'
 import { CatalogAbilityAddDialog, type CatalogInstallAvailability } from './CatalogAbilityAddDialog'
-import {
-  abilitySaveLanded,
-  type AbilitySaveProgress,
-  abilitySaveProgress,
-  runAbilitySave,
-} from './helpers/abilitySave'
 import { projectContextScope } from './helpers/contextScope'
 import { projectChoiceLabels } from './helpers/format'
 import { rememberContextScopeSpace } from './helpers/scopeStorage'
@@ -141,11 +136,15 @@ export const AbilityDetailPage = ({
   // The save closure is minted when editing starts; the settings it must apply are
   // whatever the user left in the draft at Save time, so it reads them through a ref.
   const editorRef = useRef(editing.editor)
-  // What this edit has already committed, as one value — the address included, since
-  // a home move relocates the package and every later write has to be addressed at
-  // where it now is. Seeded at Edit, folded by the save run, adopted by the page when
-  // the edit ends either way.
-  const progress = useRef<AbilitySaveProgress | null>(null)
+  // The server owns the multi-domain Save. Keep its latest honest result so a
+  // partial-success retry uses the fresh locator/token and Cancel can re-read what
+  // already landed instead of reverting the page to its stale seed. Remember which
+  // shared-editor token produced it too: a conflict decision advances that token and
+  // must supersede an older partial continuation.
+  const committedSave = useRef<{
+    result: AbilitySaveResponse
+    editorVersionToken: string
+  } | null>(null)
   const seq = useRef(0)
   const catalogAddSeq = useRef(0)
   const pendingCatalogAdd = useRef<number | null>(null)
@@ -289,14 +288,15 @@ export const AbilityDetailPage = ({
   // The page adopts what the edit committed, however the edit ended. Anything landed
   // means the loaded detail is stale; a landed MOVE means the URL addresses a package
   // that is no longer there, and a route built from the seed address 404s on reload.
-  const adoptProgress = useCallback(
+  const adoptSave = useCallback(
     async (asked: string | null) => {
-      const committed = progress.current
-      progress.current = null
+      const committed = committedSave.current?.result
+      committedSave.current = null
 
-      if (!committed || !abilitySaveLanded(committed)) {
+      if (!committed) {
         return
       }
+      invalidate(committed.locator.kind === ABILITY_KIND.role ? 'roles' : 'skills')
       // The session outlives the address it was minted at: the editor clears it BEFORE
       // it awaits this, so an edit that ended after the reader walked on lands on
       // whatever they are reading NOW. Neither half of the adoption is theirs to take —
@@ -306,13 +306,13 @@ export const AbilityDetailPage = ({
       if (asked !== addressRef.current) {
         return
       }
-      if (committed.moved) {
+      if (encodeAbilityLocator(committed.locator) !== asked) {
         navigate(agentAbilityRoute(committed.locator), { replace: true })
         return
       }
       await load()
     },
-    [load, navigate],
+    [invalidate, load, navigate],
   )
 
   const startEdit = useCallback(async () => {
@@ -350,8 +350,7 @@ export const AbilityDetailPage = ({
         availability?.mode === ABILITY_AVAILABILITY_MODE.selectedProjects
           ? availability.projectIds
           : []
-      // Nothing this edit has committed yet, and it starts where the package is now.
-      progress.current = abilitySaveProgress(ability.locator)
+      committedSave.current = null
       const documentTitle = note.documentTitle || note.title
       editing.startSession({
         id: `owned-ability:${encodeAbilityLocator(ability.locator)}`,
@@ -392,41 +391,38 @@ export const AbilityDetailPage = ({
         },
         save: async (payload, versionToken) => {
           const edited = editorRef.current
-
-          return runAbilitySave({
-            progress: progress.current ?? abilitySaveProgress(ability.locator),
-            commit: (next) => {
-              progress.current = next
-            },
-            payload,
-            noteId: note.id,
-            versionToken,
-            seedReach: ability.availability ?? null,
-            answer: {
-              covers:
-                edited.abilityAvailability === ABILITY_AVAILABILITY_MODE.selectedProjects
-                  ? edited.abilityProjects
-                  : null,
-              attachments: edited.attachmentsDirty ? edited.attachments : null,
-            },
-            effects: {
-              saveDocument: (body) => api.noteSave(note.space ?? space, body),
-              moveHome: (at) => api.agentAbilitySetHome(at, { scope: ROLE_SCOPE.space }),
-              setReach: async (at, next) => {
-                await api.agentAbilitySetAvailability(at, next)
-              },
-            },
+          const previous = committedSave.current
+          const editorVersionToken = versionToken ?? note.versionToken
+          const result = await api.agentAbilitySave(previous?.result.locator ?? ability.locator, {
+            content: payload.content ?? '',
+            description: edited.abilityDescription ?? '',
+            covers:
+              edited.abilityAvailability === ABILITY_AVAILABILITY_MODE.selectedProjects
+                ? edited.abilityProjects
+                : null,
+            ...(edited.attachmentsDirty ? { attachments: edited.attachments } : {}),
+            versionToken:
+              previous?.editorVersionToken === editorVersionToken
+                ? previous.result.versionToken
+                : editorVersionToken,
           })
+          committedSave.current = { result, editorVersionToken }
+          const failedStep = result.steps.find(({ outcome }) => outcome === 'failed')
+
+          if (failedStep?.outcome === 'failed') {
+            throw new Error(failedStep.error)
+          }
+
+          return { id: result.noteId, versionToken: result.versionToken }
         },
         onSaved: async () => {
-          invalidate(ability.locator.kind === ABILITY_KIND.role ? 'roles' : 'skills')
-          await adoptProgress(asked)
+          await adoptSave(asked)
         },
         // Abandoning a PART-applied save still leaves the page addressing a package
         // that has moved and showing a document that has been rewritten — so the exit
         // re-reads truth instead of keeping the screen the edit invalidated.
         onCancel: () => {
-          void adoptProgress(asked)
+          void adoptSave(asked)
         },
       })
     } catch (error) {
@@ -434,7 +430,7 @@ export const AbilityDetailPage = ({
     } finally {
       setBusy(false)
     }
-  }, [detail, busy, readInventory, editing, canWrite, space, invalidate, adoptProgress])
+  }, [detail, busy, readInventory, editing, canWrite, space, adoptSave])
 
   useEffect(() => {
     const state = routeLocation.state as { editAbility?: boolean } | null

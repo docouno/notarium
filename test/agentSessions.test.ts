@@ -68,6 +68,7 @@ describe('agent sessions service', () => {
         role: null,
         roleLocator: null,
         roleContextProjectId: null,
+        projectId: null,
       },
     ])
     const changed: string[] = []
@@ -91,7 +92,7 @@ describe('agent sessions service', () => {
     const sessions = createAgentSessions({
       persistence,
       now: () => now,
-      mintId: ids('ses_aaaaaaaaaaaa', 'ses_bbbbbbbbbbbb'),
+      mintId: ids('ses_aaaaaaaaaaaa', 'ses_bbbbbbbbbbbb', 'ses_cccccccccccc'),
     })
 
     expect(await sessions.attach('alice')).toBeNull()
@@ -114,6 +115,64 @@ describe('agent sessions service', () => {
     })
   })
 
+  it('previews explicit, named, and inferred starts without touching the episode', async () => {
+    const persistence = new InMemoryAgentSessions()
+    const changed: string[] = []
+    const sessions = createAgentSessions({
+      persistence,
+      now: () => new Date('2026-08-04T12:00:00.000Z'),
+      mintId: ids('ses_aaaaaaaaaaaa'),
+      onChange: (owner) => changed.push(owner),
+    })
+    const started = await sessions.start('alice', { name: 'work' }, 'unused', 'project-a')
+    const id = started.session!.record.id
+    const before = persistence.snapshot()[0]
+
+    await expect(sessions.preview('alice', { id })).resolves.toMatchObject({
+      id,
+      projectId: 'project-a',
+    })
+    await expect(sessions.preview('alice', { name: 'work' })).resolves.toMatchObject({ id })
+    await expect(sessions.preview('alice', undefined)).resolves.toMatchObject({ id })
+    await expect(sessions.preview('bob', { id })).resolves.toBeNull()
+    await expect(sessions.read('alice', id)).resolves.toMatchObject({
+      attach: 'declared',
+      record: { id, projectId: 'project-a' },
+    })
+    await expect(sessions.read('alice')).resolves.toMatchObject({
+      attach: 'inferred',
+      record: { id, projectId: 'project-a' },
+    })
+    await expect(sessions.read('bob', id)).rejects.toBeInstanceOf(NoSuchAgentSessionError)
+    expect(persistence.snapshot()[0]).toEqual(before)
+    expect(changed).toEqual(['alice'])
+  })
+
+  it('linearizes concurrent unaddressed first starts into one episode', async () => {
+    const persistence = new InMemoryAgentSessions()
+    const sessions = createAgentSessions({
+      persistence,
+      now: () => new Date('2026-08-04T12:00:00.000Z'),
+      mintId: ids('ses_aaaaaaaaaaaa', 'ses_bbbbbbbbbbbb'),
+    })
+
+    const starts = await Promise.all([
+      sessions.start('alice', undefined, 'personal · now'),
+      sessions.start('alice', undefined, 'personal · now'),
+    ])
+
+    expect(starts.map(({ session }) => session?.state).sort()).toEqual([
+      AGENT_SESSION_STATE.new,
+      AGENT_SESSION_STATE.resumed,
+    ])
+    expect(new Set(starts.map(({ session }) => session?.record.id))).toEqual(
+      new Set(['ses_aaaaaaaaaaaa']),
+    )
+    expect(persistence.snapshot()).toEqual([
+      expect.objectContaining({ id: 'ses_aaaaaaaaaaaa', calls: 2, parentId: null }),
+    ])
+  })
+
   it('creates, resumes, forks and disambiguates by the documented rules', async () => {
     const persistence = new InMemoryAgentSessions()
     let now = new Date('2026-08-04T12:00:00.000Z')
@@ -128,6 +187,7 @@ describe('agent sessions service', () => {
         'ses_eeeeeeeeeeee',
         'ses_ffffffffffff',
         'ses_gggggggggggg',
+        'ses_hhhhhhhhhhhh',
       ),
     })
 
@@ -148,7 +208,7 @@ describe('agent sessions service', () => {
     const named = await sessions.start('alice', { name: 'work' }, 'unused')
     expect(named.session).toMatchObject({
       state: AGENT_SESSION_STATE.new,
-      record: { id: 'ses_bbbbbbbbbbbb', named: true, parentId: null },
+      record: { id: 'ses_cccccccccccc', named: true, parentId: null },
     })
     await sessions.setRole(named.session!, {
       name: 'grooming',
@@ -164,8 +224,8 @@ describe('agent sessions service', () => {
     expect(fork.session).toMatchObject({
       state: AGENT_SESSION_STATE.forked,
       record: {
-        id: 'ses_cccccccccccc',
-        parentId: 'ses_bbbbbbbbbbbb',
+        id: 'ses_dddddddddddd',
+        parentId: 'ses_cccccccccccc',
         name: 'work',
         role: 'grooming',
         roleLocator: {
@@ -175,30 +235,75 @@ describe('agent sessions service', () => {
           location: { scope: 'personal', spaceId: 'personal-a' },
         },
         roleContextProjectId: null,
+        projectId: null,
       },
     })
     const ambiguous = await sessions.start('alice', { name: 'work' }, 'unused')
     expect(ambiguous.session).toBeUndefined()
     expect(ambiguous.recentSessions?.map(({ id }) => id)).toEqual([
+      'ses_dddddddddddd',
       'ses_cccccccccccc',
-      'ses_bbbbbbbbbbbb',
     ])
 
     const freshAmidAmbiguity = await sessions.start('alice', undefined, 'fresh automatic')
     expect(freshAmidAmbiguity.session).toMatchObject({
       state: AGENT_SESSION_STATE.new,
-      record: { id: 'ses_eeeeeeeeeeee', named: false },
+      record: { id: 'ses_ffffffffffff', named: false },
     })
-    expect(freshAmidAmbiguity.recentSessions?.map(({ id }) => id)).not.toContain('ses_dddddddddddd')
+    expect(freshAmidAmbiguity.recentSessions?.map(({ id }) => id)).not.toContain('ses_eeeeeeeeeeee')
 
     await sessions.start('bob', { name: 'sleeping' }, 'unused')
     now = new Date('2026-08-04T15:00:00.000Z')
     expect(await sessions.start('bob', { name: 'sleeping' }, 'unused')).toMatchObject({
       session: {
         state: AGENT_SESSION_STATE.resumed,
-        record: { id: 'ses_ffffffffffff', calls: 2, parentId: null },
+        record: { id: 'ses_gggggggggggg', calls: 2, parentId: null },
       },
     })
+  })
+
+  it('persists a project hint only from start and preserves it across resume and fork', async () => {
+    const persistence = new InMemoryAgentSessions()
+    let now = new Date('2026-08-04T12:00:00.000Z')
+    const sessions = createAgentSessions({
+      persistence,
+      now: () => now,
+      mintId: ids('ses_aaaaaaaaaaaa', 'ses_bbbbbbbbbbbb', 'ses_cccccccccccc'),
+    })
+
+    const started = await sessions.start('alice', { name: 'work' }, 'unused', 'project-a')
+    expect(started.session?.record.projectId).toBe('project-a')
+
+    now = new Date('2026-08-04T15:00:00.000Z')
+    const resumed = await sessions.start('alice', { name: 'work' }, 'unused')
+    expect(resumed.session?.record.projectId).toBe('project-a')
+
+    now = new Date('2026-08-04T15:01:00.000Z')
+    const forked = await sessions.start('alice', { name: 'work' }, 'unused', 'project-b')
+    expect(forked.session?.record).toMatchObject({
+      parentId: resumed.session?.record.id,
+      projectId: 'project-b',
+    })
+
+    const attached = await sessions.attach('alice', forked.session?.record.id)
+    expect(attached?.record.projectId).toBe('project-b')
+  })
+
+  it('lets a second unaddressed start replace the one active owner episode hint', async () => {
+    const persistence = new InMemoryAgentSessions()
+    const sessions = createAgentSessions({
+      persistence,
+      mintId: ids('ses_aaaaaaaaaaaa', 'ses_bbbbbbbbbbbb'),
+    })
+
+    const first = await sessions.start('alice', undefined, 'first', 'project-a')
+    const second = await sessions.start('alice', undefined, 'second', 'project-b')
+
+    expect(second.session?.record).toMatchObject({
+      id: first.session?.record.id,
+      projectId: 'project-b',
+    })
+    expect(persistence.snapshot()).toHaveLength(1)
   })
 
   it('expires an id at the 30-day retention boundary', async () => {
@@ -233,6 +338,7 @@ describe('agent sessions service', () => {
         role: null,
         roleLocator: null,
         roleContextProjectId: null,
+        projectId: null,
       },
       {
         id: 'ses_bbbbbbbbbbbb',
@@ -246,6 +352,7 @@ describe('agent sessions service', () => {
         role: null,
         roleLocator: null,
         roleContextProjectId: null,
+        projectId: null,
       },
       ...Array.from({ length: 10 }, (_, index) => ({
         id: `ses_recent0000${index}`,
@@ -259,6 +366,7 @@ describe('agent sessions service', () => {
         role: null,
         roleLocator: null,
         roleContextProjectId: null,
+        projectId: null,
       })),
     ])
     const sessions = createAgentSessions({
@@ -292,6 +400,7 @@ describe('agent sessions service', () => {
           role: null,
           roleLocator: null,
           roleContextProjectId: null,
+          projectId: null,
         },
         {
           id: 'ses_parent00000',
@@ -305,6 +414,7 @@ describe('agent sessions service', () => {
           role: null,
           roleLocator: null,
           roleContextProjectId: null,
+          projectId: null,
         },
       ]),
     ).toThrow(/parent agent session/)

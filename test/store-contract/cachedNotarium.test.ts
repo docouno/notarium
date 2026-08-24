@@ -51,6 +51,76 @@ describeKnowledgeStoreContract('CachedStore(NotariumStore)', async () => {
 })
 
 describe('CachedStore(NotariumStore) trash restore/purge ordering', () => {
+  it('reattaches a single-file package when its required delete tombstone cannot append', async () => {
+    const notesDir = mkdtempSync(join(tmpdir(), 'notarium-engine-required-delete-'))
+    const packageId = 'RequiredTrash_1'
+    const persistence = new InMemoryRevisionPersistence()
+    const store = new CachedStore({
+      inner: createNotariumStore({
+        mounts: [
+          { class: 'user-doc', dir: notesDir, prefix: '' },
+          {
+            class: 'skill',
+            dir: join(notesDir, '.notarium/skills'),
+            prefix: '.notarium/skills',
+          },
+        ],
+      }),
+      revisionPersistence: persistence,
+      space: 'main',
+      pollIntervalMs: 0,
+    })
+
+    try {
+      await store.start()
+      const created = await store.write({
+        id: packageId,
+        title: 'Required Trash',
+        content: '# Required Trash\n\nKeep me.\n',
+        restorePath: `.notarium/skills/${packageId}/SKILL.md`,
+        targetClass: 'skill',
+        frontmatter: [
+          { key: 'name', lines: ['name: required-trash'] },
+          { key: 'description', lines: ['description: Required Trash.'] },
+        ],
+      })
+      await store.settle()
+      const live = await store.read(created.id!)
+      const packagePath = live.filePath!.slice(0, live.filePath!.lastIndexOf('/'))
+      const packageDir = join(notesDir, packagePath)
+      const append = persistence.append.bind(persistence)
+
+      persistence.append = async (revision, content) => {
+        if (revision.kind === 'delete') {
+          throw new Error('injected required tombstone outage')
+        }
+
+        return append(revision, content)
+      }
+
+      await expect(
+        store.removeDir?.(packagePath, {
+          internalAddress: true,
+          principal: 'pat:alice:write',
+          requiredRevision: true,
+          beforeDetach: (victimNoteIds) => {
+            expect(victimNoteIds).toEqual([created.id])
+          },
+        }),
+      ).rejects.toThrow('injected required tombstone outage')
+      expect(existsSync(join(packageDir, 'SKILL.md'))).toBe(true)
+      await expect(store.read(created.id!)).resolves.toMatchObject({
+        id: created.id,
+        filePath: live.filePath,
+      })
+      expect((await persistence.latestFor('main', created.id!))?.kind).not.toBe('delete')
+    } finally {
+      store.stop()
+      await store.settle()
+      rmSync(notesDir, { recursive: true, force: true })
+    }
+  })
+
   it('conditionally removes a physical restore when permanent purge wins', async () => {
     const notesDir = mkdtempSync(join(tmpdir(), 'notarium-engine-restore-purge-'))
     const restoreInner = createNotariumStore({ notesDir })

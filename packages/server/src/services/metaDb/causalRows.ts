@@ -6,6 +6,49 @@ import type {
   RestoreOperationRecord,
   SpaceLifecycleRecord,
 } from '@notarium/core'
+import type { AbilityCreateOperationRecord } from './types'
+
+export type AbilityCreateOperationRow = {
+  id: string
+  actor_digest: string
+  idempotency_digest: string | null
+  request_fingerprint: string
+  space: string
+  package_id: string
+  note_id: string
+  target_path: string
+  availability_required: number | boolean
+  stage_binding: string
+  phase: string
+  prepared_evidence: string
+  physical_receipt: string | null
+  terminal_result: string | null
+  failure_code: string | null
+  created_at: string
+  updated_at: string
+}
+
+export const abilityCreateOperationOfRow = (
+  row: AbilityCreateOperationRow,
+): AbilityCreateOperationRecord => ({
+  id: row.id,
+  actorDigest: row.actor_digest,
+  idempotencyDigest: row.idempotency_digest,
+  requestFingerprint: row.request_fingerprint,
+  space: row.space,
+  packageId: row.package_id,
+  noteId: row.note_id,
+  targetPath: row.target_path,
+  availabilityRequired: Boolean(row.availability_required),
+  stageBinding: row.stage_binding,
+  phase: row.phase as AbilityCreateOperationRecord['phase'],
+  preparedEvidence: row.prepared_evidence,
+  physicalReceipt: row.physical_receipt,
+  terminalResult: row.terminal_result,
+  failureCode: row.failure_code,
+  createdAt: row.created_at,
+  updatedAt: row.updated_at,
+})
 
 export type RestoreOperationRow = {
   id: string

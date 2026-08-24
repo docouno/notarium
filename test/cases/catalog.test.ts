@@ -621,7 +621,7 @@ describe('seed catalog (#175)', () => {
     // with one placement per principal — and Personal past the explorer's page size,
     // so pagination is reachable at the default SCALE rather than only above it.
     expect([...byGroup].sort()).toEqual([
-      ['personal', 14],
+      ['personal', 16],
       ['project:main/', 1],
       ['project:product/api', 4],
       ['project:product/legacy', 1],
@@ -701,6 +701,18 @@ describe('seed catalog (#175)', () => {
           role.name === 'handoff-review' && role.target.kind === 'space' && !role.availability,
       ),
     ).toBe(true)
+    expect(skills).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: 'markdown-package-proof',
+          packageFiles: [expect.objectContaining({ path: 'references/checklist.md' })],
+        }),
+        expect.objectContaining({
+          name: 'asset-package-proof',
+          packageFiles: [expect.objectContaining({ path: 'assets/template.bin' })],
+        }),
+      ]),
+    )
     // Enable/Disable at all three sources the facet can carry, with the disabled
     // Personal `shared-reviewer` leaving its Space twin enabled — the override is a
     // property of the package, never of the name.

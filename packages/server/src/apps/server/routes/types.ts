@@ -2,6 +2,7 @@ import type { ArtifactStore } from '../../../libs/artifactStore'
 import type { BuildInfo } from '../../../libs/buildInfo'
 import type { HostInfo } from '../../../libs/hostInfo'
 import type { ImportStagingStore } from '../../../libs/importStaging'
+import type { AbilitiesService } from '../../../services/abilities'
 import type { AuthService } from '../../../services/auth'
 import type {
   AgentSessionAuditPersistence,
@@ -28,6 +29,7 @@ export type ApiRoutesOptions = {
   spaces: SpaceManager
   auth: AuthService
   roles?: RolesService
+  abilities?: AbilitiesService
   sessions?: AgentSessionsPersistence
   projects?: ProjectsPersistence
   folders?: FolderIdentityPersistence

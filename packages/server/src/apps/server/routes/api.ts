@@ -41,8 +41,7 @@ export const apiRoutes = async (app: FastifyInstance, opts: ApiRoutesOptions) =>
     contextOrder,
     retrievalLog,
     sessionAudit,
-    roles,
-    sessions,
+    abilities,
   } = opts
   const ctx = buildApiRouteCtx(opts)
 
@@ -55,9 +54,7 @@ export const apiRoutes = async (app: FastifyInstance, opts: ApiRoutesOptions) =>
     contextOrder,
     retrievalLog,
     sessionAudit,
-    projects: opts.projects,
-    roles,
-    sessions,
+    abilities,
   })
 
   // Plain calls, NOT app.register: keeps every family in one plugin scope

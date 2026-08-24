@@ -103,6 +103,90 @@ export const createAbilityAvailabilityFacet = (
     return recordsOf(result.rows as AvailabilityRow[])
   },
 
+  reserve: async (homeSpace, packageId, availability) => {
+    await ctx.ensureInit()
+    const client = await ctx.required.connect()
+    const projectIds =
+      availability.mode === ABILITY_AVAILABILITY_MODE.selectedProjects
+        ? [...new Set(availability.projectIds)].sort()
+        : []
+
+    try {
+      await client.query('BEGIN')
+      await lockAbilityAvailabilityPackage(client, homeSpace, packageId)
+      await assertAbilityTargetLive(client, homeSpace, null)
+      await assertProjects(client, homeSpace, projectIds)
+      const inserted = await client.query(
+        `INSERT INTO ability_availability (home_space, package_id, mode, registry_note_id)
+         VALUES ($1, $2, $3, NULL)
+         ON CONFLICT(home_space, package_id) DO NOTHING
+         RETURNING package_id`,
+        [homeSpace, packageId, availability.mode],
+      )
+
+      if (inserted.rowCount === 1 && projectIds.length) {
+        await client.query(
+          `INSERT INTO ability_project_bindings (home_space, package_id, project_id)
+           SELECT $1, $2, unnest($3::text[])`,
+          [homeSpace, packageId, projectIds],
+        )
+      }
+      await client.query('COMMIT')
+      return inserted.rowCount === 1
+    } catch (error) {
+      await client.query('ROLLBACK')
+      throw error
+    } finally {
+      client.release()
+    }
+  },
+
+  finalize: async (homeSpace, packageId, actualNoteId) => {
+    await ctx.ensureInit()
+    const client = await ctx.required.connect()
+
+    try {
+      await client.query('BEGIN')
+      await lockAbilityAvailabilityPackage(client, homeSpace, packageId)
+      await assertAbilityTargetLive(client, homeSpace, actualNoteId)
+      const updated = await client.query(
+        `UPDATE ability_availability
+            SET registry_note_id = $3
+          WHERE home_space = $1 AND package_id = $2 AND registry_note_id IS NULL`,
+        [homeSpace, packageId, actualNoteId],
+      )
+      await client.query('COMMIT')
+      return updated.rowCount === 1
+    } catch (error) {
+      await client.query('ROLLBACK')
+      throw error
+    } finally {
+      client.release()
+    }
+  },
+
+  cancel: async (homeSpace, packageId) => {
+    await ctx.ensureInit()
+    const client = await ctx.required.connect()
+
+    try {
+      await client.query('BEGIN')
+      await lockAbilityAvailabilityPackage(client, homeSpace, packageId)
+      const removed = await client.query(
+        `DELETE FROM ability_availability
+          WHERE home_space = $1 AND package_id = $2 AND registry_note_id IS NULL`,
+        [homeSpace, packageId],
+      )
+      await client.query('COMMIT')
+      return removed.rowCount === 1
+    } catch (error) {
+      await client.query('ROLLBACK')
+      throw error
+    } finally {
+      client.release()
+    }
+  },
+
   set: async (homeSpace, packageId, availability: AbilityAvailability, registryNoteId) => {
     await ctx.ensureInit()
     const client = await ctx.required.connect()

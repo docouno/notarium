@@ -1,5 +1,5 @@
 import { Buffer } from 'node:buffer'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { access, lstat, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -30,6 +30,158 @@ afterEach(async () => {
 })
 
 describe('filesystem role library bounds', () => {
+  it('vetoes detach when the package contains a symbolic-link member', async () => {
+    const directoryName = 'AbCdefGhij_1'
+    const directory = join(root, directoryName)
+    const outside = join(root, 'outside.bin')
+
+    await mkdir(directory, { recursive: true })
+    await writeFile(
+      join(directory, 'SKILL.md'),
+      '---\nname: linked-skill\ndescription: Linked skill.\n---\n\nInstructions.',
+    )
+    await writeFile(outside, 'must not be followed')
+    await symlink(outside, join(directory, 'asset.bin'))
+    const library = writableLibrary(
+      createFsRoleLibrary({
+        publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+        rootForSpace: () => root,
+      }),
+    )
+    let detached = false
+
+    await expect(
+      library.inspectAndRemove(location, directoryName, {
+        assertSafe: async (pkg) => {
+          const members = [...pkg.files.keys()]
+          const unsafe =
+            members.length === 1 && members[0] === 'SKILL.md'
+              ? undefined
+              : members.find((path) => path !== 'SKILL.md')
+
+          if (unsafe) {
+            throw new Error(`unsafe package member: ${unsafe}`)
+          }
+        },
+        remove: async (beforeDetach) => {
+          await beforeDetach()
+          detached = true
+        },
+      }),
+    ).rejects.toThrow('unsafe package member: asset.bin (symbolic link)')
+    expect(detached).toBe(false)
+    await expect(lstat(join(directory, 'asset.bin'))).resolves.toMatchObject({})
+  })
+
+  it('vetoes an auxiliary member added before the fenced detach inspection', async () => {
+    const directoryName = 'AbCdefGhij_1'
+    const directory = join(root, directoryName)
+
+    await mkdir(directory, { recursive: true })
+    await writeFile(
+      join(directory, 'SKILL.md'),
+      '---\nname: changing-skill\ndescription: Changing skill.\n---\n\nInstructions.',
+    )
+    const library = writableLibrary(
+      createFsRoleLibrary({
+        publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+        rootForSpace: () => root,
+      }),
+    )
+    let detached = false
+
+    await expect(
+      library.inspectAndRemove(location, directoryName, {
+        assertSafe: async (pkg) => {
+          const members = [...pkg.files.keys()]
+
+          if (members.length !== 1 || members[0] !== 'SKILL.md') {
+            throw new Error(`unsafe package member: ${members.find((p) => p !== 'SKILL.md')}`)
+          }
+        },
+        remove: async (beforeDetach) => {
+          await mkdir(join(directory, 'references'))
+          await writeFile(join(directory, 'references', 'late.md'), '# Late\n')
+          await beforeDetach()
+          detached = true
+        },
+      }),
+    ).rejects.toThrow('unsafe package member: references/late.md')
+    expect(detached).toBe(false)
+    await expect(access(join(directory, 'SKILL.md'))).resolves.toBeUndefined()
+    await expect(access(join(directory, 'references', 'late.md'))).resolves.toBeUndefined()
+  })
+
+  it('vetoes an empty auxiliary directory in the fenced raw-member roster', async () => {
+    const directoryName = 'AbCdefGhij_1'
+    const directory = join(root, directoryName)
+
+    await mkdir(join(directory, 'references'), { recursive: true })
+    await writeFile(
+      join(directory, 'SKILL.md'),
+      '---\nname: empty-directory\ndescription: Empty directory proof.\n---\n\nInstructions.',
+    )
+    const library = writableLibrary(
+      createFsRoleLibrary({
+        publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+        rootForSpace: () => root,
+      }),
+    )
+    let detached = false
+
+    await expect(
+      library.inspectAndRemove(location, directoryName, {
+        assertSafe: async (_pkg, members = []) => {
+          if (members.length !== 1 || members[0] !== 'SKILL.md') {
+            throw new Error(`unsafe package member: ${members.find((p) => p !== 'SKILL.md')}`)
+          }
+        },
+        remove: async (beforeDetach) => {
+          await beforeDetach()
+          detached = true
+        },
+      }),
+    ).rejects.toThrow('unsafe package member: references')
+    expect(detached).toBe(false)
+    await expect(access(join(directory, 'SKILL.md'))).resolves.toBeUndefined()
+    await expect(lstat(join(directory, 'references'))).resolves.toMatchObject({})
+  })
+
+  it('vetoes detach when the manifest disappeared before fenced inspection', async () => {
+    const directoryName = 'AbCdefGhij_1'
+    const directory = join(root, directoryName)
+
+    await mkdir(directory, { recursive: true })
+    await writeFile(
+      join(directory, 'SKILL.md'),
+      '---\nname: changing-skill\ndescription: Changing skill.\n---\n\nInstructions.',
+    )
+    await writeFile(join(directory, 'asset.bin'), 'must survive')
+    const library = writableLibrary(
+      createFsRoleLibrary({
+        publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+        rootForSpace: () => root,
+      }),
+    )
+    let detached = false
+
+    await expect(
+      library.inspectAndRemove(location, directoryName, {
+        assertSafe: async () => undefined,
+        remove: async (beforeDetach) => {
+          await rm(join(directory, 'SKILL.md'))
+          await beforeDetach()
+          detached = true
+        },
+      }),
+    ).rejects.toMatchObject({
+      message: 'not found',
+      cause: 'ability package changed before delete',
+    })
+    expect(detached).toBe(false)
+    await expect(access(join(directory, 'asset.bin'))).resolves.toBeUndefined()
+  })
+
   it('finds an id-backed package by its manifest name after rename', async () => {
     const directoryName = 'AbCdefGhij_1'
 
@@ -45,9 +197,9 @@ describe('filesystem role library bounds', () => {
       }),
     )
 
-    await expect(library.getSkill(location, 'renamed-role')).resolves.toMatchObject({
-      directoryName,
-    })
+    await expect(library.getAbilitiesNamed(location, 'renamed-role')).resolves.toEqual(
+      new Map([['role', expect.objectContaining({ directoryName })]]),
+    )
     await expect(library.get(location, 'renamed-role')).resolves.toMatchObject({
       directoryName,
     })
@@ -58,6 +210,143 @@ describe('filesystem role library bounds', () => {
       directoryName,
     })
     await expect(library.exists(location, 'renamed-role')).resolves.toBe(true)
+  })
+
+  it('indexes same-name external packages independently by ability kind', async () => {
+    // Lowercase/uppercase deliberately make default JS sort disagree with the
+    // library's established localeCompare winner. This pins both contracts: one
+    // winner per kind for runtime, and the legacy global winner for full reads.
+    const skillDirectory = 'aBcdefGhij_1'
+    const secondSkillDirectory = 'mBcdefGhij_3'
+    const roleDirectory = 'BbcdefGhij_2'
+    const secondRoleDirectory = 'ZyXwvUtsrq_4'
+
+    await mkdir(join(root, skillDirectory), { recursive: true })
+    await writeFile(
+      join(root, skillDirectory, 'SKILL.md'),
+      '---\nname: shared-name\ndescription: External skill.\n---\n\nSkill instructions.',
+    )
+    await mkdir(join(root, secondSkillDirectory), { recursive: true })
+    await writeFile(
+      join(root, secondSkillDirectory, 'SKILL.md'),
+      '---\nname: shared-name\ndescription: Second external skill.\n---\n\nSecond skill instructions.',
+    )
+    await mkdir(join(root, roleDirectory), { recursive: true })
+    await writeFile(
+      join(root, roleDirectory, 'SKILL.md'),
+      '---\nname: shared-name\ndescription: External role.\nmetadata:\n  notarium.kind: role\n---\n\nRole instructions.',
+    )
+    await mkdir(join(root, secondRoleDirectory), { recursive: true })
+    await writeFile(
+      join(root, secondRoleDirectory, 'SKILL.md'),
+      '---\nname: shared-name\ndescription: Second external role.\nmetadata:\n  notarium.kind: role\n---\n\nSecond role instructions.',
+    )
+    const library = writableLibrary(
+      createFsRoleLibrary({
+        publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+        rootForSpace: () => root,
+      }),
+    )
+
+    await expect(library.getAbilitiesNamed(location, 'shared-name')).resolves.toEqual(
+      new Map([
+        ['role', expect.objectContaining({ directoryName: roleDirectory })],
+        ['skill', expect.objectContaining({ directoryName: skillDirectory })],
+      ]),
+    )
+    await expect(library.get(location, 'shared-name')).resolves.toMatchObject({
+      directoryName: skillDirectory,
+    })
+    const roles = createRolesService({
+      catalog: async () => [],
+      ...library.deps,
+      ...inMemoryAbilityPersistence(),
+    })
+    const context = { personalSpace: 'personal' }
+
+    await expect(roles.listAbilityResolution(context, SYSTEM_PRINCIPAL)).resolves.toMatchObject({
+      candidates: expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'skill',
+          effective: true,
+          locator: expect.objectContaining({ packageId: skillDirectory }),
+        }),
+        expect.objectContaining({
+          kind: 'role',
+          effective: true,
+          locator: expect.objectContaining({ packageId: roleDirectory }),
+        }),
+      ]),
+    })
+    await expect(
+      roles.loadEffective(context, SYSTEM_PRINCIPAL, 'shared-name', 4_000),
+    ).resolves.toMatchObject({
+      ok: true,
+      loaded: {
+        locator: { kind: 'role', packageId: roleDirectory },
+        role: { instructions: 'Role instructions.' },
+      },
+    })
+    await expect(
+      roles.loadEffectiveSkill(context, SYSTEM_PRINCIPAL, 'shared-name', 4_000),
+    ).resolves.toMatchObject({
+      ok: true,
+      loaded: {
+        locator: { kind: 'skill', packageId: skillDirectory },
+        skill: { instructions: 'Skill instructions.' },
+      },
+    })
+  })
+
+  it('rejects a composite Skill before it can win exact same-name resolution', async () => {
+    const invalidDirectory = 'AbCdefGhij_1'
+    const validDirectory = 'ZyXwvUtsrq_4'
+
+    expect(invalidDirectory.localeCompare(validDirectory)).toBeLessThan(0)
+    await mkdir(join(root, invalidDirectory), { recursive: true })
+    await writeFile(
+      join(root, invalidDirectory, 'SKILL.md'),
+      '---\nname: shared-skill\ndescription: Invalid composite.\nmetadata:\n  notarium.skills: ""\n---\n\nMust not win.',
+    )
+    await mkdir(join(root, validDirectory), { recursive: true })
+    await writeFile(
+      join(root, validDirectory, 'SKILL.md'),
+      '---\nname: shared-skill\ndescription: Valid standalone.\n---\n\nValid instructions.',
+    )
+    const library = writableLibrary(
+      createFsRoleLibrary({
+        publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+        rootForSpace: () => root,
+      }),
+    )
+    const roles = createRolesService({
+      catalog: async () => [],
+      ...library.deps,
+      ...inMemoryAbilityPersistence(),
+    })
+    const context = { personalSpace: 'personal' }
+
+    await expect(library.getAbilitiesNamed(location, 'shared-skill')).resolves.toEqual(
+      new Map([['skill', expect.objectContaining({ directoryName: validDirectory })]]),
+    )
+    await expect(roles.listAbilityResolution(context, SYSTEM_PRINCIPAL)).resolves.toMatchObject({
+      candidates: [
+        expect.objectContaining({
+          kind: 'skill',
+          effective: true,
+          locator: expect.objectContaining({ packageId: validDirectory }),
+        }),
+      ],
+    })
+    await expect(
+      roles.loadEffectiveSkill(context, SYSTEM_PRINCIPAL, 'shared-skill', 4_000),
+    ).resolves.toMatchObject({
+      ok: true,
+      loaded: {
+        locator: { kind: 'skill', packageId: validDirectory },
+        skill: { instructions: 'Valid instructions.' },
+      },
+    })
   })
 
   it('keeps exact lookup outside the bounded discovery window', async () => {
@@ -79,10 +368,24 @@ describe('filesystem role library bounds', () => {
         rootForSpace: () => root,
       }),
     )
+    const roles = createRolesService({
+      catalog: loadBundledAbilityInventory,
+      ...inMemoryAbilityPersistence(),
+      ...library.deps,
+    })
 
     await expect(library.listManifests(location)).resolves.toMatchObject({ truncated: true })
-    await expect(library.getSkill(location, 'role-299')).resolves.toMatchObject({
-      directoryName: packageDirectoryOf('role-299'),
+    await expect(library.getAbilitiesNamed(location, 'role-299')).resolves.toEqual(
+      new Map([
+        ['role', expect.objectContaining({ directoryName: packageDirectoryOf('role-299') })],
+      ]),
+    )
+    await expect(
+      roles.resolveOwnedAt(location, SYSTEM_PRINCIPAL, 'role', packageDirectoryOf('role-299')),
+    ).resolves.toMatchObject({
+      source: 'owned',
+      kind: 'role',
+      packageId: packageDirectoryOf('role-299'),
     })
   })
 
@@ -257,7 +560,7 @@ describe('filesystem role library bounds', () => {
     })
     await expect(
       roles.loadEffective({ personalSpace: 'personal' }, SYSTEM_PRINCIPAL, 'too-long', 4_000),
-    ).resolves.toBeNull()
+    ).resolves.toMatchObject({ ok: false, reason: 'not-found' })
   })
 
   it('rejects traversal paths before writing outside the package directory', async () => {

@@ -23,9 +23,10 @@ import type { AgentRoleDependencySkillDecl, AgentSkillDecl } from './types'
 export type AppliedAgentSkill = {
   declaration: AgentSkillDecl
   location: SkillHomeLocation
-  /** The package's exact id, which is also the id of its `SKILL.md` note: the applier
-   *  reads, renames and links the package by that one value. */
+  /** Immutable package directory address used by role links and runtime locators. */
   packageId: string
+  /** Settled note identity used by versioning, Activity and generic context rows. */
+  noteId: string
   /** The manifest name AFTER a declared rename — what a link label and a card show. */
   name: string
 }
@@ -72,7 +73,7 @@ const linkedPackageId = async (
   skillLocation: SkillHomeLocation,
   declaration: AgentRoleDependencySkillDecl,
 ): Promise<string> => {
-  const role = await library.getSkill(roleLocation, declaration.role)
+  const role = (await library.getAbilitiesNamed(roleLocation, declaration.role)).get('role')
   const manifest = role?.files.get('SKILL.md')
 
   if (!role || !manifest) {
@@ -140,7 +141,7 @@ const linkFromRole = async (
   noteId: string,
   label: string,
 ): Promise<void> => {
-  const role = await library.getSkill(roleLocation, roleName)
+  const role = (await library.getAbilitiesNamed(roleLocation, roleName)).get('role')
   const manifest = role?.files.get('SKILL.md')
 
   if (!role || !manifest) {
@@ -176,6 +177,8 @@ export const applyAgentSkillDeclarations = async ({
   library,
   resolveLocation,
   storeForSpace,
+  seedPackageFile,
+  createCustom,
 }: {
   declarations: readonly AgentSkillDecl[]
   roles: RolesService
@@ -185,38 +188,101 @@ export const applyAgentSkillDeclarations = async ({
     skill: SkillHomeLocation
     availability?: AbilityAvailability
   }>
-  storeForSpace: (space: string) => Promise<KnowledgeStore>
+  storeForSpace: (space: string) => Promise<KnowledgeStore & { reconcile?: () => Promise<void> }>
+  seedPackageFile?: (
+    location: SkillHomeLocation,
+    packageId: string,
+    path: string,
+    content: Uint8Array,
+  ) => Promise<void>
+  createCustom?: (
+    declaration: Extract<AgentSkillDecl, { source?: 'custom' }>,
+    location: SkillHomeLocation,
+    availability?: AbilityAvailability,
+  ) => Promise<{ packageId: string; noteId: string }>
 }): Promise<AppliedAgentSkill[]> => {
   const published: AppliedAgentSkill[] = []
 
   for (const declaration of declarations) {
     const location = await resolveLocation(declaration)
-    const noteId =
-      declaration.source === 'role-dependency'
-        ? await linkedPackageId(library, location.role, location.skill, declaration)
-        : declaration.source === 'catalog'
-          ? (
-              await roles.addSkillFromCatalog(
-                declaration.name,
-                location.skill,
-                location.availability,
-              )
-            ).noteId
-          : (
-              await roles.createCustomSkill(
-                declaration.name,
-                declaration.description,
-                declaration.instructions ?? '',
-                location.skill,
-                location.availability,
-              )
-            ).noteId
     const store = await storeForSpace(location.skill.space)
-    const finalName = await mutateSkill(store, noteId, declaration)
+    const created =
+      declaration.source === 'role-dependency'
+        ? (() => {
+            return linkedPackageId(library, location.role, location.skill, declaration).then(
+              async (packageId) => ({
+                packageId,
+                noteId:
+                  (await library.awaitReadableNoteIds(location.skill, [packageId])).get(
+                    packageId,
+                  ) ?? packageId,
+              }),
+            )
+          })()
+        : declaration.source === 'catalog'
+          ? roles
+              .addSkillFromCatalog(declaration.name, location.skill, location.availability)
+              .then(({ packageId, noteId }) => ({ packageId, noteId }))
+          : declaration.agentAudit && createCustom
+            ? createCustom(declaration, location.skill, location.availability)
+            : roles
+                .createCustomSkill(
+                  declaration.name,
+                  declaration.description,
+                  declaration.instructions ?? '',
+                  location.skill,
+                  location.availability,
+                )
+                .then(({ packageId, noteId }) => ({ packageId, noteId }))
+    const { packageId, noteId } = await created
+
+    if (!declaration.agentAudit) {
+      await store.reconcile?.()
+    }
+    const finalName =
+      declaration.agentAudit && !declaration.renameTo
+        ? declaration.name
+        : await mutateSkill(store, noteId, declaration)
+
+    for (const file of declaration.packageFiles ?? []) {
+      if (/\.md$/i.test(file.path)) {
+        const root = directoryOf((await store.read(noteId)).filePath ?? '')
+        const state = analyzeDocumentState({
+          source: new TextEncoder().encode(file.content),
+          role: DOCUMENT_ROLE.skillAuxiliary,
+          pathFallbackTitle: file.path.split('/').at(-1)!.replace(/\.md$/i, ''),
+        })
+        const projection = state.projection
+
+        if (!projection) {
+          throw new Error(`agent skill ${declaration.name} has invalid Markdown auxiliary`)
+        }
+        await store.write({
+          title: titleForWrite(projection),
+          content: projection.body,
+          frontmatter: projection.frontmatterEntries,
+          frontmatterMode: 'replace',
+          targetClass: 'skill',
+          restorePath: `${root}/${file.path}`,
+          principal: 'seed',
+        })
+      } else {
+        if (!seedPackageFile) {
+          throw new Error(`agent skill ${declaration.name} needs package seed support`)
+        }
+        await seedPackageFile(
+          location.skill,
+          packageId,
+          file.path,
+          new TextEncoder().encode(file.content),
+        )
+      }
+    }
     published.push({
       declaration,
       location: location.skill,
-      packageId: noteId,
+      packageId,
+      noteId,
       name: finalName,
     })
 
@@ -227,7 +293,7 @@ export const applyAgentSkillDeclarations = async ({
         location.role,
         location.skill,
         declaration.linkedRole,
-        noteId,
+        packageId,
         finalName,
       )
     }

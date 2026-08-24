@@ -25,6 +25,7 @@ import {
   FRONTMATTER_BYTE_CAP,
   IMPORT_SOURCE_FRONTMATTER_KEY,
   type LOGICAL_NOTE_STATE_FORMAT,
+  type PublishedResourceEvidence,
   RESTORE_OPERATION_PHASE,
   type RestoreOperationPersistence,
   type RestoreTerminalPersistence,
@@ -47,6 +48,37 @@ import { RestoreCoordinator } from './restoreCoordinator'
 const roots: string[] = []
 const NOTE_ID = '550e8400-e29b-41d4-a716-446655440000'
 const CREATED_AT = '2026-08-11T00:00:00.000Z'
+
+const projectionMethods = {
+  beginCausalPublication: async () => () => {},
+  adoptCausalPublication: async (_space: string, evidence: PublishedResourceEvidence) => {
+    const skillRoot = evidence.path.endsWith('/SKILL.md')
+    const role =
+      evidence.document?.role ?? (skillRoot ? DOCUMENT_ROLE.skillRoot : DOCUMENT_ROLE.generic)
+
+    return analyzeDocumentState({
+      source: evidence.source,
+      role,
+      ownerProof: evidence.ownerProof,
+      pathFallbackTitle: evidence.document?.pathFallbackTitle,
+      ...(role === DOCUMENT_ROLE.skillRoot
+        ? {
+            skillDirectoryName:
+              evidence.document?.skillDirectoryName ?? evidence.path.split('/').at(-2)!,
+          }
+        : {}),
+    })
+  },
+}
+
+const deferred = () => {
+  let resolve!: () => void
+  const promise = new Promise<void>((done) => {
+    resolve = done
+  })
+
+  return { promise, resolve }
+}
 
 const unsafeHistoricalState = (): DocumentState => {
   const source = new TextEncoder().encode(
@@ -216,6 +248,7 @@ const fixture = async (options: FixtureOptions = {}) => {
     await writeFile(join(notesDir, targetPath), currentState.source)
   }
   const spaces = {
+    ...projectionMethods,
     reconcileCausalProjection: async () => {},
     resumeLifecycle: async () => {},
   } as unknown as SpaceManager
@@ -908,6 +941,48 @@ describe('RestoreCoordinator recovery seams', () => {
     await f.metaDb.close()
   })
 
+  it('holds projection admission through exact adoption and terminal metadata', async () => {
+    const f = await fixture()
+    const base = f.metaDb.restoreTerminal
+    let projectionHeld = false
+    let projectionAdopted = false
+    const terminal: RestoreTerminalPersistence = {
+      ...base,
+      commit: async (input) => {
+        if (!projectionHeld || !projectionAdopted) {
+          throw new Error('restore terminal escaped causal projection admission')
+        }
+
+        return base.commit(input)
+      },
+    }
+    const spaces = {
+      ...projectionMethods,
+      beginCausalPublication: async () => {
+        projectionHeld = true
+        return () => {
+          projectionHeld = false
+        }
+      },
+      adoptCausalPublication: async (space: string, evidence: PublishedResourceEvidence) => {
+        if (!projectionHeld) {
+          throw new Error('restore projection adoption ran without admission')
+        }
+        projectionAdopted = true
+        return projectionMethods.adoptCausalPublication(space, evidence)
+      },
+      reconcileCausalProjection: async () => {},
+      resumeLifecycle: async () => {},
+    } as unknown as SpaceManager
+    const result = await f
+      .coordinator(proxiedMetaDb(f.metaDb, { restoreTerminal: terminal }), f.authority, spaces)
+      .execute(f.command)
+
+    expect(result).toMatchObject({ status: 'succeeded' })
+    expect(projectionHeld).toBe(false)
+    await f.metaDb.close()
+  })
+
   it('finalizes the accepted restore and reconciles a pathname replacement during commit', async () => {
     const f = await fixture()
     const base = f.metaDb.restoreTerminal
@@ -923,6 +998,7 @@ describe('RestoreCoordinator recovery seams', () => {
     }
     let reconciledSource: string | null = null
     const spaces = {
+      ...projectionMethods,
       reconcileCausalProjection: async () => {
         reconciledSource = await readFile(join(roots[0], 'notes', f.targetPath), 'utf8')
       },
@@ -964,6 +1040,7 @@ describe('RestoreCoordinator recovery seams', () => {
     }
     let reconciledSource: string | null = null
     const spaces = {
+      ...projectionMethods,
       reconcileCausalProjection: async () => {
         reconciledSource = await readFile(join(roots[0], 'notes', f.targetPath), 'utf8')
       },
@@ -1068,6 +1145,7 @@ describe('RestoreCoordinator recovery seams', () => {
     const f = await fixture()
     let repairAttempts = 0
     const spaces = {
+      ...projectionMethods,
       reconcileCausalProjection: async () => {
         repairAttempts++
         if (repairAttempts === 1) {
@@ -1868,6 +1946,60 @@ describe('RestoreCoordinator eligibility', () => {
       status: 'succeeded',
     })
     expect(rivalBlocked).toBe(true)
+    await f.metaDb.close()
+  })
+
+  it('takes the global mutation claim before the resource lease against an ordinary write', async () => {
+    const f = await fixture()
+    const globalRequested = deferred()
+    const placementRequested = deferred()
+    const releaseOrdinaryGlobal = deferred()
+    const spaces = {
+      ...projectionMethods,
+      beginCausalPublication: async () => {
+        globalRequested.resolve()
+        await releaseOrdinaryGlobal.promise
+        return () => {}
+      },
+      reconcileCausalProjection: async () => {},
+      resumeLifecycle: async () => {},
+    } as unknown as SpaceManager
+    const admitResource = f.authority.admitResource.bind(f.authority)
+    const authority = new Proxy(f.authority, {
+      get: (target, property, receiver) => {
+        if (property === 'admitResource') {
+          return async (...args: Parameters<SpaceResourceAuthority['admitResource']>) => {
+            if (args[2].startsWith('restore:')) {
+              placementRequested.resolve()
+            }
+
+            return admitResource(...args)
+          }
+        }
+        const value = Reflect.get(target, property, receiver) as unknown
+
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+    const restoring = f.coordinator(f.metaDb, authority, spaces).execute(f.command)
+    const first = await Promise.race([
+      globalRequested.promise.then(() => 'global' as const),
+      placementRequested.promise.then(() => 'placement' as const),
+    ])
+
+    if (first === 'global') {
+      const ordinaryPlacement = await f.authority.admitResource(
+        f.targetPath,
+        'exclusive',
+        'ordinary-write',
+      )
+      ordinaryPlacement.settle()
+    }
+    releaseOrdinaryGlobal.resolve()
+    await expect(restoring).resolves.toMatchObject({ status: 'succeeded' })
+
+    expect(first).toBe('global')
+    await expect(placementRequested.promise).resolves.toBeUndefined()
     await f.metaDb.close()
   })
 })

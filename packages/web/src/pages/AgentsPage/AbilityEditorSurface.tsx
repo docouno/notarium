@@ -88,11 +88,13 @@ export const AbilityEditorSurface = ({
   projects,
   skills,
   placement,
+  personalAvailable = true,
   spaceAvailable = true,
 }: {
   projects: MeAgentSkillsResponse['projects']
   skills: AgentAbilitySummary[]
   placement?: AbilityPlacement
+  personalAvailable?: boolean
   spaceAvailable?: boolean
 }) => {
   const { actionsHost } = useAgentsShell()
@@ -232,8 +234,12 @@ export const AbilityEditorSurface = ({
     {
       value: 'personal' as const,
       label: 'Personal',
-      disabled: published,
-      ...(published ? { title: 'Moving between Personal and a Space is not available yet' } : {}),
+      disabled: published || !personalAvailable,
+      ...(published
+        ? { title: 'Moving between Personal and a Space is not available yet' }
+        : !personalAvailable
+          ? { title: 'Personal installation is unavailable on this host' }
+          : {}),
     },
     {
       value: 'space' as const,
@@ -241,15 +247,23 @@ export const AbilityEditorSurface = ({
       disabled: published ? !placement?.movable : !spaceAvailable,
       ...(published && !placement?.movable && placement?.fixedReason
         ? { title: placement.fixedReason }
-        : {}),
+        : !published && !spaceAvailable
+          ? { title: 'Space installation is unavailable on this host' }
+          : {}),
     },
     {
       value: 'projects' as const,
       label: 'Projects',
-      disabled: published ? !placement?.movable || !projects.length : !projects.length,
+      disabled: published
+        ? !placement?.movable || !projects.length
+        : !spaceAvailable || !projects.length,
       ...(published && !placement?.movable && placement?.fixedReason
         ? { title: placement.fixedReason }
-        : {}),
+        : !published && !spaceAvailable
+          ? { title: 'Project installation is unavailable on this host' }
+          : !published && !projects.length
+            ? { title: 'No projects are available in this Space' }
+            : {}),
     },
   ]
   // The editor still carries the domain's own three placements; this control speaks

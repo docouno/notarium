@@ -241,6 +241,94 @@ describe('agent-roles real seed', () => {
         // case deliberately renames — an exact link keeps resolving across a rename,
         // and a link that resolves to nothing is what the defect produced.
         expect(installed?.name).toBe('grooming-evidence-mine')
+        const markdownPackage = [...personal].find(
+          ([, parsed]) => parsed.name === 'markdown-package-proof',
+        )
+        const assetPackage = [...personal].find(
+          ([, parsed]) => parsed.name === 'asset-package-proof',
+        )
+
+        expect(markdownPackage).toBeTruthy()
+        expect(assetPackage).toBeTruthy()
+        await expect(
+          readFile(
+            join(
+              dataDir,
+              'spaces/main',
+              SKILL_MOUNT,
+              markdownPackage![0],
+              'references/checklist.md',
+            ),
+            'utf8',
+          ),
+        ).resolves.toContain('A restorable package member')
+        await expect(
+          readFile(
+            join(dataDir, 'spaces/main', SKILL_MOUNT, assetPackage![0], 'assets/template.bin'),
+            'utf8',
+          ),
+        ).resolves.toBe('seeded binary-shaped resource')
+
+        const malformed = [...personal.values()].find(
+          (parsed) => parsed.name === 'malformed-attachment-proof',
+        )
+        expect(malformed?.linkedSkills).toEqual([
+          expect.objectContaining({ kind: 'invalid', reason: 'invalid-locator' }),
+        ])
+        const missing = [...personal.values()].find(
+          (parsed) => parsed.name === 'missing-dependency-proof',
+        )
+        const missingLink = missing?.linkedSkills[0]
+        expect(missingLink).toMatchObject({ kind: 'locator', label: 'deleted-dependency-proof' })
+        expect(personal.has(missingLink?.kind === 'locator' ? missingLink.packageId : '')).toBe(
+          false,
+        )
+
+        const oversized = [...personal].find(
+          ([, parsed]) => parsed.name === 'agent-created-oversized-proof',
+        )
+        expect(oversized).toBeTruthy()
+        const operation = db
+          .prepare(
+            `SELECT package_id, note_id, phase FROM ability_create_operations
+              WHERE package_id = ?`,
+          )
+          .get(oversized![0]) as { package_id: string; note_id: string; phase: string }
+        expect(operation.phase).toBe('succeeded')
+        expect(
+          (
+            await readFile(
+              join(dataDir, 'spaces/main', SKILL_MOUNT, operation.package_id, 'SKILL.md'),
+              'utf8',
+            )
+          ).length,
+        ).toBeGreaterThan(64 * 1024)
+        const revision = db
+          .prepare(
+            `SELECT principal, agent_owner, agent_name, session_name, session_attach, entry_role,
+                    kind, created_at, content_hash, semantic_fingerprint, restore_safety
+               FROM note_revisions WHERE note_id = ?`,
+          )
+          .all(operation.note_id)
+        expect(revision).toEqual([
+          expect.objectContaining({
+            principal: 'pat:seed:ability-author',
+            agent_owner: 'admin',
+            agent_name: 'Seed ability author',
+            session_name: 'Agent ability authoring',
+            session_attach: 'declared',
+            entry_role: 'origin',
+          }),
+        ])
+        expect(
+          db
+            .prepare(
+              `SELECT 1 FROM context_scope_pins AS pins
+                JOIN folders ON folders.id = pins.target_id
+               WHERE pins.note_id = ? AND folders.path = 'web'`,
+            )
+            .get(operation.note_id),
+        ).toBeTruthy()
       } finally {
         db.close()
       }
