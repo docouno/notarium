@@ -19,7 +19,9 @@ const PLAN_PART_PREFIX = '.import-plan.part-'
 
 // Grace over the stage→enqueue window: a freshly renamed FINAL may not have its enqueue
 // row yet, so it isn't treated as orphaned until the row could have committed.
-const FINAL_GRACE_MS = 60_000
+// Exported so a harness that needs a final judged by its ROW rather than its age can
+// clear the SAME window this sweep applies — a copied literal would drift.
+export const FINAL_GRACE_MS = 60_000
 // Must exceed any upload's max lifetime (Node bounds a request, a proxy an idle socket):
 // the PART sweep is age-only, so a shorter grace could delete a live-but-slow upload.
 const PART_GRACE_MS = 60 * 60_000

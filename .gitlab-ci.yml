@@ -400,18 +400,16 @@ visual:accept:
     # No install: the protocol is two dependency-free modules over node's own crypto.
     - node scripts/visualBaseline.mjs accept --candidate "$VISUAL_CANDIDATE"
 
-# Destructive backup → fresh-volume restore against the real runtime image. The smoke
-# driver is plain Node over the docker CLI, so the image only needs a node binary added
-# to the docker client.
+# Destructive backup → fresh-volume restore against the real runtime image, plus the
+# durable-import fixture off the builder stage. The adapter rule applied literally: the
+# builds, the image lifecycle and the cleanup all live in `make backup-smoke`, so this job
+# is the one command — see docs/ci.md for why `bash` is in the package set.
 verify:backup-smoke:
   stage: verify
   extends: [.dind, .heavy, .extended-rules]
   script:
-    - apk add --no-cache nodejs
-    - docker build --target runtime -t "notarium-backup-smoke:$CI_COMMIT_SHORT_SHA" -f docker/Dockerfile .
-    - BACKUP_SMOKE_IMAGE="notarium-backup-smoke:$CI_COMMIT_SHORT_SHA" node test/backup/smoke.mjs
-  after_script:
-    - docker image rm -f "notarium-backup-smoke:$CI_COMMIT_SHORT_SHA" || true
+    - apk add --no-cache nodejs make bash
+    - make backup-smoke
 
 # The release entrypoint's own drill: the real `scripts/releaseImage.mjs`, publishing a
 # pre-release into a throwaway registry. It needs no external credentials and publishes

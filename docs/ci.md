@@ -71,6 +71,24 @@ The full script is also the single CPU-only install contract: it disables
 onnxruntime-node's default CUDA/TensorRT postinstall download, which the product cannot
 use and which would otherwise add a second package host to the extended gate.
 
+**`verify:backup-smoke` is one command, because the drill's orchestration lives in
+`make backup-smoke`** — the adapter rule applied to a job that used to restate the build,
+the image name and the cleanup in YAML. What that target does with its two images, and why
+it tags them run-uniquely rather than leaving them untagged, is in
+[dev-environment.md](dev-environment.md). The job installs `nodejs make bash`: `bash` is not
+incidental — the Makefile declares `SHELL := /bin/bash`, which the `docker:27-cli` image does
+not carry. There is no `after_script`, because the target hands its own images back.
+
+**The shipped image carries no fixture entrypoint.** What the drill has to prove is that a
+REAL half-finished durable import survives the archive — an upload staged under the stable
+space id with a live `pending` queue row over it, which is what production maintenance
+recognises and keeps. That fixture is created by a one-shot container off the `builder`
+stage (`test/backup/durableImportFixture.ts`, through the same `dataPathsFromEnv` /
+meta-DB / staging seams the server composes), never by a test-only API in the runtime.
+The earlier drill wrote a bare file under the space SLUG with no row at all: production
+correctly reclaimed it past its grace, and a correct GC on a loaded machine read as a
+failed backup gate (#330).
+
 **Publishing is a human decision on a tree the gate has already passed — but not a
 human command.** Both release jobs are manual and sit in a later stage than `verify`,
 so a red gate means the button is never reachable; nothing has to cross-check "was this

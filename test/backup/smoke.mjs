@@ -1,5 +1,7 @@
 // Destructive restore drill, isolated in disposable Docker containers + volumes.
-// It proves the shipped production CLIs, live-write retry, and a cold rebuild.
+// It proves the shipped production CLIs, live-write retry, a cold rebuild, and that an
+// unfinished durable import crosses the archive with its bytes and its queue row intact
+// while maintenance runs. canon: docs/backup.md
 
 import { spawn } from 'node:child_process'
 import { createReadStream, createWriteStream } from 'node:fs'
@@ -9,11 +11,19 @@ import { join } from 'node:path'
 import { finished } from 'node:stream/promises'
 
 import { publishTarget } from '../../scripts/dockerHost.mjs'
+import { fixtureArgv } from './fixtureArgv.mjs'
 
+// Both are content-addressed image IDs handed over by `make backup-smoke`; this
+// driver never builds, tags or removes an image, so a parallel checkout's run can
+// never collide with — or garbage-collect — this one's inputs.
 const image = process.env.BACKUP_SMOKE_IMAGE
+const fixtureImage = process.env.BACKUP_SMOKE_FIXTURE_IMAGE
 
 if (!image) {
   throw new Error('BACKUP_SMOKE_IMAGE is required')
+}
+if (!fixtureImage) {
+  throw new Error('BACKUP_SMOKE_FIXTURE_IMAGE is required')
 }
 
 // Both the bind address and the probe host follow the daemon — see dockerHost.mjs
@@ -23,8 +33,19 @@ const { publishSpec, probeHost } = publishTarget(process.env.DOCKER_HOST, 3000)
 const suffix = `${process.pid}-${Date.now()}`
 const sourceContainer = `notarium-backup-source-${suffix}`
 const targetContainer = `notarium-backup-target-${suffix}`
+// One name per invocation: `--rm` removal is daemon-side and asynchronous, so reusing
+// a single name lets a later run collide with an earlier one still being reaped.
+const fixtureContainers = {
+  create: `notarium-backup-fixture-create-${suffix}`,
+  inspectSource: `notarium-backup-fixture-source-${suffix}`,
+  inspectTarget: `notarium-backup-fixture-target-${suffix}`,
+}
 const sourceVolume = `notarium-backup-source-${suffix}`
 const targetVolume = `notarium-backup-target-${suffix}`
+const importJobId = `backup-smoke-live-${suffix}`
+const importOrphanJobId = `backup-smoke-orphan-${suffix}`
+const importBytes = 'durable-import-bytes'
+const importFilename = 'backup-smoke-import.json'
 const work = await mkdtemp(join(tmpdir(), 'notarium-backup-smoke-'))
 const archive = join(work, 'notarium.zip')
 const password = 'backup-smoke-password'
@@ -197,8 +218,67 @@ const beginBackup = (container) => {
   return { attempt, done }
 }
 
+// One-shot helper off the Docker `builder` stage, which carries the workspace sources
+// the shipped runtime deliberately does not. uid 1000 matches the runtime's `node`
+// user, so what it writes into /data is what the server can read back.
+const runFixture = async (container, volume, mode, options) => {
+  const result = await run([
+    'run',
+    '--rm',
+    '--name',
+    container,
+    '--user',
+    '1000:1000',
+    '-v',
+    `${volume}:/data`,
+    '--entrypoint',
+    '/app/node_modules/.bin/tsx',
+    fixtureImage,
+    '/app/test/backup/durableImportFixture.ts',
+    ...fixtureArgv(mode, { 'data-dir': '/data', 'job-id': importJobId, ...options }),
+  ])
+  // The meta-DB logs any migration it applies to stdout, so the fixture's JSON
+  // document is the LAST line rather than the whole stream.
+  const document = result.stdout
+    .split('\n')
+    .filter((line) => line.trim())
+    .at(-1)
+
+  assert(document, `durable import fixture (${mode}) produced no output`)
+  try {
+    return JSON.parse(document)
+  } catch (err) {
+    throw new Error(
+      `durable import fixture (${mode}) did not end in a JSON document: ${err.message}\n${result.stdout}`,
+    )
+  }
+}
+
+/** Both staged finals as the container sees them — one probe per poll, so the
+ *  live file is re-checked on every iteration of the sweep barrier below. */
+const stagingState = async (container, live, orphan) => {
+  const seen = (
+    await run([
+      'exec',
+      container,
+      'sh',
+      '-lc',
+      `printf '%s %s' "$(test -e '${orphan}' && echo present || echo absent)" ` +
+        `"$(test -e '${live}' && echo present || echo absent)"`,
+    ])
+  ).stdout.split(' ')
+
+  // Orphan first, live second: a sweep landing between the two substitutions is then
+  // read as orphan-gone-and-live-gone, which fails, rather than as a clean break-out.
+  return { orphan: seen[0], live: seen[1] }
+}
+
 const cleanup = async ({ abortOnInterrupt = false } = {}) => {
-  for (const container of [sourceContainer, targetContainer]) {
+  for (const container of [
+    sourceContainer,
+    targetContainer,
+    ...Object.values(fixtureContainers),
+  ]) {
     if (abortOnInterrupt && interruptedSignal) {
       return
     }
@@ -287,7 +367,10 @@ try {
       '&& test -f /app/packages/server/dist/catalog/grooming/SKILL.md ' +
       '&& test -f /app/packages/server/dist/catalog/grooming-evidence/SKILL.md ' +
       '&& test -f /app/packages/server/dist/catalog/research/SKILL.md ' +
-      '&& test -f /app/packages/server/dist/catalog/research-evidence/SKILL.md',
+      '&& test -f /app/packages/server/dist/catalog/research-evidence/SKILL.md ' +
+      // The drill's fixture lives in the builder stage; a runtime that grew a copy
+      // would be shipping a test surface.
+      '&& test ! -e /app/test',
   ])
 
   await run(['volume', 'create', sourceVolume])
@@ -338,16 +421,69 @@ try {
   })
   versionToken = firstEdit.body.versionToken
 
-  await run([
-    'exec',
-    sourceContainer,
-    'sh',
-    '-lc',
-    `mkdir -p /data/jobs/imports/${space} && printf 'durable-import-bytes' > /data/jobs/imports/${space}/smoke.import`,
-  ])
   const spacesBefore = (await request(sourceBase, '/api/spaces', { cookie })).body.spaces.map(
     ({ id, slug }) => ({ id, slug }),
   )
+  // Production stages under the STABLE SPACE ID, so the fixture must too: the sweep
+  // finds a final wherever it sits and judges it by the job id in its NAME, so what a
+  // wrong directory breaks is not visibility but the row's `uploadRef` resolving to
+  // the bytes a re-claimed import would re-read.
+  const personal = spacesBefore.filter(({ slug }) => slug === space)
+
+  assert(personal.length === 1, `expected exactly one space with slug ${space}`)
+  const spaceId = personal[0].id
+  const fixture = await runFixture(fixtureContainers.create, sourceVolume, 'create', {
+    space: spaceId,
+    'orphan-job-id': importOrphanJobId,
+    principal: `user:${username}`,
+    filename: importFilename,
+    content: importBytes,
+    // Far enough ahead that no claim loop can touch the row mid-drill; the drill is
+    // about what maintenance KEEPS, not about running an import.
+    'run-at': new Date(Date.now() + 24 * 60 * 60_000).toISOString(),
+  })
+  const stagedJob = await request(sourceBase, `/api/s/${space}/jobs/${importJobId}`, { cookie })
+
+  assert(stagedJob.body.id === importJobId, 'staged import row is not readable in its space')
+  assert(stagedJob.body.kind === 'import', 'staged import row lost its kind')
+  assert(stagedJob.body.status === 'pending', 'staged import row is not live')
+
+  // The causal barrier: both finals are older than the staging grace, so the next
+  // scheduled maintenance pass judges them on their ROW. The control orphan
+  // disappearing is proof that pass ran; the live final surviving it — checked on
+  // every poll, not only at the end — is the property the backup must preserve.
+  // `create` returning proves both finals existed at these paths, so the barrier only
+  // has to watch the control go. Demanding to SEE it first would race the sweep: past
+  // its ageing the orphan is reclaimable immediately, and a tick landing before the
+  // first probe would fail a run in which everything worked.
+  const sweepDeadline = Date.now() + 130_000
+  let sweptOrphan = false
+
+  while (Date.now() < sweepDeadline) {
+    const staging = await stagingState(sourceContainer, fixture.upload.path, fixture.orphan.path)
+
+    assert(staging.live === 'present', 'maintenance reclaimed the LIVE import staging')
+    if (staging.orphan === 'absent') {
+      sweptOrphan = true
+      break
+    }
+    await wait(2_000)
+  }
+  assert(sweptOrphan, 'scheduled maintenance never reclaimed the row-less staging orphan')
+  const stagedBefore = await runFixture(fixtureContainers.inspectSource, sourceVolume, 'inspect', {
+    'orphan-ref': fixture.orphan.ref,
+  })
+
+  // Without this the lifecycle compare below would pass on `null === null`, which is
+  // the one way it could report success while proving nothing.
+  assert(stagedBefore.job, 'import row is not readable through the staging seams')
+  // Named explicitly: a field that failed to persist is null on BOTH sides, so the
+  // projection compare below would match it against itself and prove nothing.
+  assert(stagedBefore.job.filename === importFilename, 'import row lost its filename')
+  assert(stagedBefore.job.principal === `user:${username}`, 'import row lost its principal')
+  assert(stagedBefore.job.uploadRef === fixture.upload.ref, 'import row lost its upload ref')
+  assert(stagedBefore.upload.bytes === importBytes, 'durable import staging bytes changed')
+  assert(!stagedBefore.orphan.present, 'control orphan reappeared before the backup')
 
   const backup = beginBackup(sourceContainer)
   await Promise.race([
@@ -481,14 +617,6 @@ try {
     'revision chain ids/order/content changed after restore',
   )
 
-  const staged = await run([
-    'exec',
-    targetContainer,
-    'sh',
-    '-lc',
-    `cat /data/jobs/imports/${space}/smoke.import`,
-  ])
-  assert(staged.stdout === 'durable-import-bytes', 'durable import staging bytes changed')
   const restoredMtime = (
     await run([
       'exec',
@@ -502,6 +630,32 @@ try {
     Math.abs(Number(restoredMtime) - Number(sourceMtime)) <= 1,
     `note mtime changed: ${sourceMtime} -> ${restoredMtime}`,
   )
+  // The causal proof that maintenance spares a live upload is the SOURCE barrier
+  // above; the restored runtime's boot pass is fire-and-forget, so nothing here can
+  // wait on it. What this side proves is narrower and still the point: the archive
+  // carried the bytes and the row across unchanged.
+  const restoredJob = await request(targetBase, `/api/s/${space}/jobs/${importJobId}`, {
+    cookie: restoredCookie,
+  })
+
+  assert(restoredJob.body.id === importJobId, 'import job id changed after restore')
+  assert(restoredJob.body.kind === stagedJob.body.kind, 'import job kind changed after restore')
+  assert(
+    restoredJob.body.status === stagedJob.body.status,
+    'import job status changed after restore',
+  )
+  const stagedAfter = await runFixture(fixtureContainers.inspectTarget, targetVolume, 'inspect', {
+    'orphan-ref': fixture.orphan.ref,
+  })
+
+  assert(stagedAfter.job, 'import row did not survive the restore')
+
+  assert(
+    JSON.stringify(stagedAfter.job) === JSON.stringify(stagedBefore.job),
+    `import lifecycle changed: ${JSON.stringify(stagedBefore.job)} -> ${JSON.stringify(stagedAfter.job)}`,
+  )
+  assert(stagedAfter.upload.bytes === importBytes, 'durable import staging bytes changed')
+  assert(!stagedAfter.orphan.present, 'restore resurrected the reclaimed staging orphan')
   await run(['exec', targetContainer, 'sh', '-lc', 'test -d /data/engine'])
 
   console.log(
@@ -511,6 +665,7 @@ try {
       noteId,
       revisions: revisions.body.total,
       spaces: spacesAfter,
+      durableImport: stagedAfter.job,
     }),
   )
 } finally {

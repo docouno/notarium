@@ -75,7 +75,6 @@ CHECKUP_RUN_SUFFIX := $(shell date +%s)-$(shell echo $$$$)
 TEST_COMPOSE_PROJECT ?= notarium-test-$(CHECKOUT_SLUG)-$(CHECKOUT_HASH)-$(CHECKUP_RUN_SUFFIX)
 COMPOSE_TEST := docker compose -p $(TEST_COMPOSE_PROJECT) -f $(DIR)/compose.test.yml
 CHECKUP_IMAGE ?= notarium-checkup:$(TEST_COMPOSE_PROJECT)
-CHECKUP_BACKUP_IMAGE ?= notarium-backup-smoke:$(TEST_COMPOSE_PROJECT)
 CHECKUP_WORKSPACE_VOLUME ?= $(TEST_COMPOSE_PROJECT)-workspace
 CHECKUP_RUNNER_CONTAINER ?= $(TEST_COMPOSE_PROJECT)-runner
 NODE_TEST_IMAGE ?= node:24-slim
@@ -388,11 +387,7 @@ checkup: deps ## Run every portable gate; visual too when its external baselines
 	npm run typecheck
 	$(MAKE) --no-print-directory test-coverage
 	$(MAKE) --no-print-directory test-pg
-	@set -eu; \
-	  cleanup() { docker image rm $(CHECKUP_BACKUP_IMAGE) >/dev/null 2>&1 || true; }; \
-	  trap cleanup EXIT INT TERM; \
-	  cleanup; \
-	  $(MAKE) --no-print-directory backup-smoke BACKUP_SMOKE_IMAGE=$(CHECKUP_BACKUP_IMAGE)
+	$(MAKE) --no-print-directory backup-smoke
 	$(MAKE) --no-print-directory test-browser
 
 audit-runtime: ## Audit the full production dependency graph against exact reviewed exceptions
@@ -473,11 +468,58 @@ restore: ## DEV checkout only: restore BACKUP into a fresh bind root, retaining 
 	  trap - EXIT INT TERM; \
 	  echo "restore: verified; rollback data retained at $$rollback"
 
-BACKUP_SMOKE_IMAGE ?= notarium-backup-smoke:local
+# How many times the driver runs against the SAME pair of images. One is the gate;
+# a higher count is the acceptance sweep for a flake that only shows up across runs.
+BACKUP_SMOKE_RUNS ?= 1
 
+# A tag no other checkout and no other run can be holding; why the drill tags at all is
+# in docs/dev-environment.md. `CHECKOUT_SLUG` reduces to empty for a worktree named
+# entirely outside `[a-z0-9_-]`, and an empty component is an invalid reference, so fall
+# back to the path hash.
+BACKUP_SMOKE_TAG := notarium-backup-smoke:$(or $(CHECKOUT_SLUG),wt$(CHECKOUT_HASH))-$(CHECKUP_RUN_SUFFIX)
+
+# The ONE orchestration owner for this drill, local and CI alike — the YAML adapter
+# calls this target instead of restating the builds.
+#
+# No signal forwarding and no process wrapper: a foreground SIGINT/SIGTERM reaches the
+# driver directly, and the driver's own cleanup contract stays the single owner of the
+# containers, volumes and archive it created. The signal traps re-raise rather than
+# return, or the recipe would resume into the next build after a cancel.
 backup-smoke: ## Destructive backup→fresh-volume restore smoke in isolated Docker
-	docker build --target runtime -t $(BACKUP_SMOKE_IMAGE) -f docker/Dockerfile .
-	BACKUP_SMOKE_IMAGE=$(BACKUP_SMOKE_IMAGE) node test/backup/smoke.mjs
+	@set -eu; \
+	  case "$(BACKUP_SMOKE_RUNS)" in \
+	    ''|*[!0-9]*) echo "backup-smoke: BACKUP_SMOKE_RUNS must be a positive integer, got '$(BACKUP_SMOKE_RUNS)'"; exit 2;; \
+	  esac; \
+	  test "$(BACKUP_SMOKE_RUNS)" -ge 1 || { echo "backup-smoke: BACKUP_SMOKE_RUNS must be >= 1, got '$(BACKUP_SMOKE_RUNS)'"; exit 2; }; \
+	  tmp="$$(mktemp -d "$${TMPDIR:-/tmp}/notarium-backup-smoke-make-XXXXXX")"; \
+	  cleanup() { \
+	    for image in "$(BACKUP_SMOKE_TAG)-runtime" "$(BACKUP_SMOKE_TAG)-fixture"; do \
+	      docker image inspect "$$image" >/dev/null 2>&1 || continue; \
+	      docker image rm "$$image" >/dev/null 2>&1 \
+	        || echo "backup-smoke: could not drop $$image; it is still on this daemon" >&2; \
+	    done; \
+	    rm -rf "$$tmp"; \
+	  }; \
+	  trap cleanup EXIT; \
+	  trap 'trap - EXIT INT; cleanup; kill -INT $$$$' INT; \
+	  trap 'trap - EXIT TERM; cleanup; kill -TERM $$$$' TERM; \
+	  mkdir -p "$$tmp/driver"; \
+	  docker build --load -t "$(BACKUP_SMOKE_TAG)-runtime" --target runtime --iidfile "$$tmp/runtime.iid" -f docker/Dockerfile .; \
+	  docker build --load -t "$(BACKUP_SMOKE_TAG)-fixture" --target builder --iidfile "$$tmp/fixture.iid" -f docker/Dockerfile .; \
+	  test -s "$$tmp/runtime.iid" || { echo "backup-smoke: runtime build wrote no image id"; exit 2; }; \
+	  test -s "$$tmp/fixture.iid" || { echo "backup-smoke: fixture build wrote no image id"; exit 2; }; \
+	  runtime_image="$$(cat "$$tmp/runtime.iid")"; \
+	  fixture_image="$$(cat "$$tmp/fixture.iid")"; \
+	  run=1; \
+	  while [ "$$run" -le "$(BACKUP_SMOKE_RUNS)" ]; do \
+	    echo "backup-smoke: run $$run/$(BACKUP_SMOKE_RUNS) on $$runtime_image + $$fixture_image"; \
+	    BACKUP_SMOKE_IMAGE="$$runtime_image" \
+	      BACKUP_SMOKE_FIXTURE_IMAGE="$$fixture_image" \
+	      TMPDIR="$$tmp/driver" node test/backup/smoke.mjs; \
+	    leftover="$$(find "$$tmp/driver" -maxdepth 1 -name 'notarium-backup-smoke-*' -print -quit)"; \
+	    test -z "$$leftover" || { echo "backup-smoke: driver left $$leftover"; exit 2; }; \
+	    run=$$((run + 1)); \
+	  done
 
 # --- seed the local stand --------------------------------------------
 # (Re)fill the running stand from a declarative catalog case. The engine holds
