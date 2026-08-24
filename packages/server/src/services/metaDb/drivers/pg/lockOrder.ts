@@ -106,7 +106,7 @@ export const LOCK_LEVEL_OF_TABLE: Readonly<Record<string, LockLevel>> = {
  *  tiers 1–3 and BEFORE it deletes `folders` (L4f) and the ability tables (L4a) below
  *  it. A foreign key from a tier-4 table therefore inverts the pair: the writer holds
  *  L4f and waits for the space row, the purge holds the space row and waits for L4f,
- *  and Postgres answers `40P01`. Migration 0014 carried exactly that edge through
+ *  and Postgres answers `40P01`. `ability_availability` carried exactly that edge through
  *  three review rounds — the only foreign key to `spaces` this schema has ever had, in
  *  a meta-DB where every other table names its Space with a plain column. The pair
  *  probe over it stayed green throughout, because the two sides were released from one

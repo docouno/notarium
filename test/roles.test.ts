@@ -233,27 +233,6 @@ describe('role catalog and owned libraries', () => {
         roles.withCurrentOwnedTarget(stale, SYSTEM_PRINCIPAL, async ({ locator }) => locator),
       ).resolves.toBeNull()
     }
-
-    const legacy = createRolesService({
-      ...inMemoryAbilityPersistence(),
-      catalog: loadBundledAbilityInventory,
-      ...createInMemoryRoleLibrary(),
-      abilityPlacement: {
-        resolveMovedOwnedRoleLocator: async () => ({
-          toLocator: serializeAbilityLocator({
-            ...stale,
-            location: { scope: 'space', spaceId: 'shared' },
-          }),
-          registryNoteId: null,
-          manifestNoteId: null,
-        }),
-        moveOwnedRolePlacement: async () => {},
-      },
-    })
-
-    await expect(
-      legacy.withCurrentOwnedTarget(stale, SYSTEM_PRINCIPAL, async ({ locator }) => locator),
-    ).resolves.toBeNull()
   })
 
   it('uses no-row input but lets a recorded identity retire a reoccupied source', async () => {
@@ -281,8 +260,8 @@ describe('role catalog and owned libraries', () => {
     await backing.putIfAbsent(source, collision)
     let recorded: {
       toLocator: string
-      registryNoteId: string | null
-      manifestNoteId: string | null
+      registryNoteId: string
+      manifestNoteId: string
     } | null = null
     const reads: RoleLocation[] = []
     const roles = createRolesService({
@@ -4282,8 +4261,8 @@ describe('role catalog and owned libraries', () => {
     const staleKey = serializeAbilityLocator(stale)
     let trail: {
       toLocator: string
-      registryNoteId: string | null
-      manifestNoteId: string | null
+      registryNoteId: string
+      manifestNoteId: string
     } | null = null
     const moveOwnedRolePlacement = vi.fn(async (move) => {
       trail = {

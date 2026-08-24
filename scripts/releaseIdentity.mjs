@@ -7,7 +7,49 @@
 /** SemVer as the lockstep manifests spell it — no pre-release/build metadata: the
  *  published tag IS the version, and `0.1.0+local` would name an artifact the
  *  Changelog has no section for. */
-export const VERSION_PATTERN = /^\d+\.\d+\.\d+$/
+export const VERSION_PATTERN = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/
+
+export const parseProductVersion = (value) => {
+  if (typeof value !== 'string' || !VERSION_PATTERN.test(value)) {
+    return null
+  }
+  const [major, minor, patch] = value.split('.').map(Number)
+
+  return [major, minor, patch].every(Number.isSafeInteger) ? { major, minor, patch } : null
+}
+
+export const compareProductVersions = (left, right) => {
+  const parsedLeft = parseProductVersion(left)
+  const parsedRight = parseProductVersion(right)
+
+  if (!parsedLeft || !parsedRight) {
+    throw new TypeError(`product version compare requires canonical safe x.y.z values`)
+  }
+
+  for (const field of ['major', 'minor', 'patch']) {
+    if (parsedLeft[field] !== parsedRight[field]) {
+      return parsedLeft[field] > parsedRight[field] ? 1 : -1
+    }
+  }
+
+  return 0
+}
+
+export const bumpProductVersion = (version, bump) => {
+  const current = parseProductVersion(version)
+
+  if (!current || !['major', 'minor', 'patch'].includes(bump)) {
+    return null
+  }
+  const next =
+    bump === 'major'
+      ? [current.major + 1, 0, 0]
+      : bump === 'minor'
+        ? [current.major, current.minor + 1, 0]
+        : [current.major, current.minor, current.patch + 1]
+
+  return next.every(Number.isSafeInteger) ? next.join('.') : null
+}
 
 /** A Changelog entry ready to be released: an exact version heading with a real
  *  ISO date. `[Unreleased]` is not a release and never satisfies this. */
@@ -141,7 +183,7 @@ export const releaseBlockers = ({
 }) => {
   const blockers = []
 
-  if (!VERSION_PATTERN.test(version)) {
+  if (!parseProductVersion(version)) {
     blockers.push(`version "${version}" is not a clean x.y.z`)
   }
 
@@ -224,9 +266,15 @@ export const prereleaseBaseVersion = ({ version, releasePublished }) => {
   if (releasePublished === false) {
     return version
   }
-  const [major, minor, patch] = version.split('.').map(Number)
+  const next = bumpProductVersion(version, 'patch')
 
-  return `${major}.${minor}.${patch + 1}`
+  if (!next) {
+    throw new Error(
+      `cannot derive a pre-release base from product version ${JSON.stringify(version)}`,
+    )
+  }
+
+  return next
 }
 
 /** Turn the pending `[Unreleased]` section into a dated release section, leaving a

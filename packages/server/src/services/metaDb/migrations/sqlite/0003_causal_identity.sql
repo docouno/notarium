@@ -1,61 +1,12 @@
-ALTER TABLE note_revisions
-  ADD COLUMN semantic_fingerprint TEXT;
-
-ALTER TABLE note_revisions
-  ADD COLUMN restore_safety TEXT
-  CHECK (restore_safety IN ('safe', 'blocked', 'unknown'));
-
-CREATE TABLE revision_heads (
-  space TEXT NOT NULL,
-  note_id TEXT NOT NULL,
-  revision_id INTEGER NOT NULL UNIQUE,
-  semantic_fingerprint TEXT,
-  lifecycle TEXT NOT NULL CHECK (lifecycle IN ('live', 'deleted')),
-  PRIMARY KEY (space, note_id)
-);
-
-INSERT INTO revision_heads (note_id, space, revision_id, semantic_fingerprint, lifecycle)
-SELECT revisions.note_id,
-       revisions.space,
-       revisions.id,
-       revisions.semantic_fingerprint,
-       CASE WHEN revisions.kind = 'delete' THEN 'deleted' ELSE 'live' END
-  FROM note_revisions AS revisions
- WHERE revisions.integrity = 'trusted'
-   AND revisions.id = (
-   SELECT MAX(candidate.id)
-     FROM note_revisions AS candidate
-    WHERE candidate.space = revisions.space
-      AND candidate.note_id = revisions.note_id
-      AND candidate.integrity = 'trusted'
- );
-
-CREATE INDEX idx_revision_heads_space
-  ON revision_heads(space, revision_id);
-
-CREATE TRIGGER trg_revision_head_advance
-AFTER INSERT ON note_revisions
-FOR EACH ROW
-WHEN NEW.integrity = 'trusted'
-BEGIN
-  INSERT INTO revision_heads
-    (note_id, space, revision_id, semantic_fingerprint, lifecycle)
-  VALUES (
-    NEW.note_id,
-    NEW.space,
-    NEW.id,
-    NEW.semantic_fingerprint,
-    CASE WHEN NEW.kind = 'delete' THEN 'deleted' ELSE 'live' END
-  )
-  ON CONFLICT(space, note_id) DO UPDATE SET
-    revision_id = excluded.revision_id,
-    semantic_fingerprint = excluded.semantic_fingerprint,
-    lifecycle = excluded.lifecycle;
-END;
-
 ALTER TABLE note_identity
   ADD COLUMN address_revision INTEGER NOT NULL DEFAULT 1
   CHECK (address_revision > 0);
+
+ALTER TABLE note_identity
+  ADD COLUMN legacy_name_aliases TEXT NOT NULL DEFAULT '[]';
+
+ALTER TABLE note_identity
+  ADD COLUMN settlement_successor_id TEXT;
 
 CREATE UNIQUE INDEX idx_note_identity_live_space_path
   ON note_identity(space, file_path)
@@ -281,6 +232,18 @@ AND NOT EXISTS (
      AND note_id = NEW.note_id
      AND source_revision_id = CAST(NEW.source_rev AS TEXT)
      AND phase = 'physical-published'
+)
+AND NOT EXISTS (
+  SELECT 1 FROM ability_create_operations
+   WHERE space = NEW.space
+     AND note_id = NEW.note_id
+     AND target_path = (
+       SELECT file_path FROM note_identity
+        WHERE id = NEW.note_id AND space = NEW.space
+     )
+     AND phase = 'physical-published'
+     AND NEW.kind = 'write'
+     AND NEW.entry_role = 'origin'
 )
 BEGIN
   SELECT RAISE(ABORT, 'space lifecycle rejects revision append');

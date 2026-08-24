@@ -326,7 +326,7 @@ export const describeAbilityAvailabilityContract = (
     })
 
     // A target that is not a project of this home Space is the state the schema models
-    // explicitly — the `0014` retype trigger exists for it — so the refusal is asked by
+    // explicitly — the folder-retype cleanup trigger exists for it — so the refusal is asked by
     // CODE. Asserting the message instead froze a bare `Error`, which a route cannot
     // tell from a bug and answered 500 with an internal string.
     it('refuses a project outside the home Space with the purged code', async () => {

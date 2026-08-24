@@ -40,7 +40,7 @@ export const identityCollision: CaseSpec = {
     // What the settlement LEAVES: the claimant's contaminated revision, served as a
     // gap, and the ordinary edit that follows it. The pair is the whole point — the
     // gap must show as `unavailable` and the edit after it must stay an edit, which
-    // is only decidable from the role the writer stored (#327, migration 0005).
+    // is only decidable from the entry role the writer stored.
     b.event({
       op: 'edit',
       date: daysBefore(now, 3),

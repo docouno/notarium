@@ -13,6 +13,11 @@ import {
   type MetaMigration,
   runSqliteMigrations,
 } from '../../packages/server/src/services/metaDb/migrations'
+import {
+  approvedTargetCatalog,
+  type MetaDbCatalog,
+  sqliteMetaDbCatalog,
+} from '../meta-db-contract/metaDbCatalog'
 
 type LedgerRow = {
   version: number
@@ -24,6 +29,14 @@ type LedgerRow = {
 const sourceDirectory = fileURLToPath(
   new URL('../../packages/server/src/services/metaDb/migrations/', import.meta.url),
 )
+const sqliteGolden = JSON.parse(
+  readFileSync(
+    fileURLToPath(
+      new URL('../meta-db-contract/fixtures/metaDbCatalog.sqlite.json', import.meta.url),
+    ),
+    'utf8',
+  ),
+) as MetaDbCatalog
 
 describe('meta-DB migration assets and SQLite runner', () => {
   const databases: DatabaseSync[] = []
@@ -62,26 +75,10 @@ describe('meta-DB migration assets and SQLite runner', () => {
   it('loads the current checksummed dialect pairs from a clean baseline', () => {
     expect(migrations.map(({ version, name }) => ({ version, name }))).toEqual([
       { version: 0, name: 'baseline' },
-      { version: 1, name: 'agent_sessions' },
-      { version: 2, name: 'agent_session_role' },
-      { version: 3, name: 'revision_integrity' },
-      { version: 4, name: 'scoped_purge_fences' },
-      { version: 5, name: 'revision_entry_role' },
-      { version: 6, name: 'revision_state' },
-      { version: 7, name: 'revision_purge_cas' },
-      { version: 8, name: 'causal_metadata' },
-      { version: 9, name: 'agent_activity' },
-      { version: 10, name: 'import_reservations' },
-      { version: 11, name: 'legacy_name_aliases' },
-      { version: 12, name: 'identity_settlement_lineage' },
-      { version: 13, name: 'agent_session_role_identity' },
-      { version: 14, name: 'ability_availability' },
-      { version: 15, name: 'ability_preferences' },
-      { version: 16, name: 'ability_placement_trail' },
-      { version: 17, name: 'ability_create_operations' },
-      { version: 18, name: 'causal_operation_lifecycle' },
-      { version: 19, name: 'ability_placement_identity' },
-      { version: 20, name: 'ability_create_success_replay' },
+      { version: 1, name: 'revision_history' },
+      { version: 2, name: 'agent_state' },
+      { version: 3, name: 'causal_identity' },
+      { version: 4, name: 'import_reservations' },
     ])
     for (const migration of migrations) {
       expect(migration.checksum).toBe(checksumMigrationPair(migration.sqlite, migration.postgres))
@@ -117,42 +114,18 @@ describe('meta-DB migration assets and SQLite runner', () => {
           .all() as Array<{ type: string; count: number }>
       ).map(({ type, count }) => [type, count]),
     )
-    // Both lines land in one schema: main's import reservation pair (#302) on top of
-    // the agent session/availability/preference tables (#309). Two of the indexes are
-    // the second key each ability table is found again by: the availability policy's
-    // registry note, and the locator a placement move rewrites for every owner. The
-    // placement trail adds the third table of that group and its own two: the hop is
-    // read forwards (by `from_locator`, which is the primary key), re-pointed backwards
-    // (by `to_locator`, the sweep that keeps it one hop deep) and purged by Space.
-    // Two 0019 guards allow legacy identity-less rows to remain while refusing any
-    // new or rewritten hop that does not bind a registry note identity.
-    expect(counts).toEqual({ index: 64, table: 44, trigger: 33 })
+    expect(counts).toEqual({ index: 64, table: 43, trigger: 31 })
     expect(
       db.prepare("SELECT 1 FROM sqlite_schema WHERE name = 'meta_schema'").get(),
     ).toBeUndefined()
     expect((db.prepare('PRAGMA auto_vacuum').get() as { auto_vacuum: number }).auto_vacuum).toBe(2)
+    expect(sqliteMetaDbCatalog(db)).toEqual(approvedTargetCatalog(sqliteGolden))
   })
 
-  it('keeps a legacy identity-less trail row but requires identity on new and rewritten rows', () => {
+  it('requires both identities on every placement trail row', () => {
     const db = database()
-
-    runSqliteMigrations(db, migrations.slice(0, 19))
-    db.prepare(
-      `INSERT INTO ability_placement_trail (from_locator, to_locator, space_id)
-       VALUES ('legacy-from', 'legacy-to', 'space-main')`,
-    ).run()
-
     runSqliteMigrations(db)
 
-    expect(
-      db
-        .prepare(
-          `SELECT to_locator, registry_note_id, manifest_note_id
-             FROM ability_placement_trail
-            WHERE from_locator = 'legacy-from'`,
-        )
-        .get(),
-    ).toEqual({ to_locator: 'legacy-to', registry_note_id: null, manifest_note_id: null })
     expect(() =>
       db
         .prepare(
@@ -160,16 +133,7 @@ describe('meta-DB migration assets and SQLite runner', () => {
            VALUES ('new-from', 'new-to', 'space-main')`,
         )
         .run(),
-    ).toThrow(/requires both note identities/)
-    expect(() =>
-      db
-        .prepare(
-          `UPDATE ability_placement_trail
-              SET to_locator = 'legacy-next'
-            WHERE from_locator = 'legacy-from'`,
-        )
-        .run(),
-    ).toThrow(/requires both note identities/)
+    ).toThrow(/NOT NULL constraint failed/)
     expect(() =>
       db
         .prepare(
@@ -184,7 +148,7 @@ describe('meta-DB migration assets and SQLite runner', () => {
   it('releases success-only replay keys held by an existing rejected ability create', () => {
     const db = database()
 
-    runSqliteMigrations(db, migrations.slice(0, 20))
+    runSqliteMigrations(db)
     db.prepare(
       `INSERT INTO ability_create_operations
         (id, actor_digest, idempotency_digest, request_fingerprint, space, package_id,
@@ -193,8 +157,6 @@ describe('meta-DB migration assets and SQLite runner', () => {
        VALUES (?, 'actor', 'key', 'request', 'space-main', ?, ?, ?, 0, 'binding',
                'rejected', '{}', '2026-08-23T00:00:00.000Z', '2026-08-23T00:00:00.000Z')`,
     ).run('rejected-operation', 'PackageId001', 'RegistryNote1', 'first/SKILL.md')
-
-    runSqliteMigrations(db)
 
     expect(() =>
       db
@@ -231,37 +193,9 @@ describe('meta-DB migration assets and SQLite runner', () => {
     expect(ledger(db)).toEqual(before)
   })
 
-  it('adds a null role without losing an existing v1 session row', () => {
-    const db = database()
-    runSqliteMigrations(db, migrations.slice(0, 2))
-    db.prepare(
-      `INSERT INTO agent_sessions
-        (id, owner, name, named, parent_id, created_at, last_seen_at, calls)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run('ses_existingv1aa', 'alice', 'Existing', 1, null, 'created', 'seen', 7)
-
-    runSqliteMigrations(db)
-
-    expect(
-      db
-        .prepare(
-          'SELECT owner, name, calls, role, role_locator, role_context_project_id, project_id FROM agent_sessions WHERE id = ?',
-        )
-        .get('ses_existingv1aa'),
-    ).toEqual({
-      owner: 'alice',
-      name: 'Existing',
-      calls: 7,
-      role: null,
-      role_locator: null,
-      role_context_project_id: null,
-      project_id: null,
-    })
-  })
-
   it('adds an empty legacy alias set without guessing from existing names or paths', () => {
     const db = database()
-    runSqliteMigrations(db, migrations.slice(0, 10))
+    runSqliteMigrations(db, migrations.slice(0, 1))
     db.prepare(
       `INSERT INTO note_identity
         (id, file_path, space, created_at, materialized, deleted_at)
@@ -279,12 +213,12 @@ describe('meta-DB migration assets and SQLite runner', () => {
 
   it('adds empty settlement lineage without inferring ancestry from existing paths', () => {
     const db = database()
-    runSqliteMigrations(db, migrations.slice(0, 12))
+    runSqliteMigrations(db, migrations.slice(0, 1))
     db.prepare(
       `INSERT INTO note_identity
-        (id, file_path, space, created_at, materialized, deleted_at, legacy_name_aliases)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).run('existing-identity', 'same.md', 'main', null, 1, null, '[]')
+        (id, file_path, space, created_at, materialized, deleted_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run('existing-identity', 'same.md', 'main', null, 1, null)
 
     runSqliteMigrations(db)
 
@@ -295,9 +229,9 @@ describe('meta-DB migration assets and SQLite runner', () => {
     ).toEqual({ file_path: 'same.md', settlement_successor_id: null })
   })
 
-  it('adds the revision snapshot marker without relabelling legacy body blobs', () => {
+  it('keeps baseline body blobs as nullable state format', () => {
     const db = database()
-    runSqliteMigrations(db, migrations.slice(0, 6))
+    runSqliteMigrations(db, migrations.slice(0, 1))
     db.exec(`
       INSERT INTO revision_blobs (hash, content)
       VALUES ('legacy-hash', 'legacy body');
@@ -311,9 +245,44 @@ describe('meta-DB migration assets and SQLite runner', () => {
 
     expect(
       db
-        .prepare('SELECT content_hash, snapshot_format FROM note_revisions WHERE note_id = ?')
+        .prepare(
+          'SELECT id, content_hash, state_format, integrity, entry_role FROM note_revisions WHERE note_id = ?',
+        )
         .get('legacy-state'),
-    ).toEqual({ content_hash: 'legacy-hash', snapshot_format: null })
+    ).toEqual({
+      id: 1,
+      content_hash: 'legacy-hash',
+      state_format: null,
+      integrity: 'trusted',
+      entry_role: 'origin',
+    })
+    expect(
+      db.prepare('SELECT content FROM revision_blobs WHERE hash = ?').get('legacy-hash'),
+    ).toEqual({ content: 'legacy body' })
+    const defaults = db.prepare('PRAGMA table_info(note_revisions)').all() as Array<{
+      name: string
+      dflt_value: string | null
+    }>
+    expect(
+      defaults
+        .filter(({ name }) => name === 'integrity' || name === 'entry_role')
+        .map(({ name, dflt_value }) => ({ name, dflt_value })),
+    ).toEqual([
+      { name: 'integrity', dflt_value: null },
+      { name: 'entry_role', dflt_value: null },
+    ])
+    const appended = db
+      .prepare(
+        `INSERT INTO note_revisions
+          (note_id, space, kind, title, tags, created_at, integrity, entry_role)
+         VALUES ('next-state', 'main', 'write', 'Next', '[]', '2026-08-02', 'trusted', 'origin')`,
+      )
+      .run()
+    expect(appended.lastInsertRowid).toBe(2)
+
+    const fresh = database()
+    runSqliteMigrations(fresh)
+    expect(sqliteMetaDbCatalog(db)).toEqual(sqliteMetaDbCatalog(fresh))
   })
 
   it('keeps a pre-#327 purge fence global while scoping every new one', () => {
@@ -322,7 +291,7 @@ describe('meta-DB migration assets and SQLite runner', () => {
     // colliding id in ANOTHER space. Scoping it cannot be retroactive: a purge
     // already decided must not be re-opened by an upgrade.
     const db = database()
-    runSqliteMigrations(db, migrations.slice(0, 4))
+    runSqliteMigrations(db, migrations.slice(0, 1))
     db.prepare(`INSERT INTO revision_purge_fences (kind, entity_id) VALUES ('note', ?)`).run(
       'legacy-note',
     )
@@ -335,8 +304,8 @@ describe('meta-DB migration assets and SQLite runner', () => {
 
     const append = db.prepare(
       `INSERT INTO note_revisions
-         (note_id, space, kind, principal, title, tags, created_at, integrity)
-       VALUES (?, ?, 'write', 'ui', 'T', '[]', 'now', 'trusted')`,
+         (note_id, space, kind, principal, title, tags, created_at, integrity, entry_role)
+       VALUES (?, ?, 'write', 'ui', 'T', '[]', 'now', 'trusted', 'change')`,
     )
 
     // The legacy fence stays GLOBAL: it was decided when ids were not yet global,
@@ -360,11 +329,11 @@ describe('meta-DB migration assets and SQLite runner', () => {
     // any settlement, where no quarantine fixture would ever look.
     const db = database()
 
-    runSqliteMigrations(db, migrations.slice(0, 5))
+    runSqliteMigrations(db, migrations.slice(0, 1))
     const append = db.prepare(
       `INSERT INTO note_revisions
-         (note_id, space, base_rev, kind, principal, title, tags, created_at, integrity)
-       VALUES (?, ?, ?, ?, 'ui', 'T', '[]', ?, 'trusted')`,
+         (note_id, space, base_rev, kind, principal, title, tags, created_at)
+       VALUES (?, ?, ?, ?, 'ui', 'T', '[]', ?)`,
     )
 
     append.run('seen-first', 'alpha', null, 'external', '2026-06-10T10:00:00.000Z')
@@ -465,6 +434,11 @@ describe('meta-DB migration assets and SQLite runner', () => {
       { owner: 'dora', project: 'project-root', last_rev: '77' },
       { owner: 'erin', project: 'project-root', last_rev: '78' },
     ])
+    expect(
+      db
+        .prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'mcp_bookmarks'")
+        .get(),
+    ).toBeUndefined()
   })
 
   it('preserves pre-session audit rows and leaves their new attribution snapshot null', () => {
@@ -503,7 +477,7 @@ describe('meta-DB migration assets and SQLite runner', () => {
       db
         .prepare(
           `SELECT note_id, agent_owner, agent_name, session_id, session_name, session_attach,
-                  snapshot_format
+                  state_format
              FROM note_revisions WHERE note_id = 'legacy-note'`,
         )
         .get(),
@@ -514,7 +488,7 @@ describe('meta-DB migration assets and SQLite runner', () => {
       session_id: null,
       session_name: null,
       session_attach: null,
-      snapshot_format: null,
+      state_format: null,
     })
   })
 
@@ -560,6 +534,22 @@ describe('meta-DB migration assets and SQLite runner', () => {
     expect(
       (db.prepare('SELECT version FROM meta_schema').get() as { version: number }).version,
     ).toBe(26)
+  })
+
+  it('rejects a removed post-baseline ledger before applying target DDL', () => {
+    const db = database()
+    runSqliteMigrations(db, migrations.slice(0, 1))
+    db.prepare(
+      `INSERT INTO meta_migrations (version, name, checksum, applied_at)
+       VALUES (1, 'agent_sessions', ?, '2026-08-01T00:00:00.000Z')`,
+    ).run('sha256:0160a883e4a4e02183809ffc424fbf128c4558861022340b1debb641c498c8f0')
+
+    expect(() => runSqliteMigrations(db)).toThrow(/name mismatch/)
+    expect(
+      db
+        .prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'agent_sessions'")
+        .get(),
+    ).toBeUndefined()
   })
 
   it.each([

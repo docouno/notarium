@@ -1,7 +1,10 @@
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import pg from 'pg'
 import { afterEach, expect, it, vi } from 'vitest'
 
 import { AGENT_SYSTEM_OWNER } from '../../packages/server/src/services/authz'
+import { REVISION_PURGE_PROTOCOL } from '../../packages/server/src/services/metaDb/consts'
 import {
   checksumMigrationPair,
   loadMetaMigrations,
@@ -9,6 +12,7 @@ import {
   runPgMigrations,
 } from '../../packages/server/src/services/metaDb/migrations'
 import { PgMetaDb } from '../../packages/server/src/services/metaDb/pgMetaDb'
+import { approvedTargetCatalog, type MetaDbCatalog, pgMetaDbCatalog } from './metaDbCatalog'
 import type { PostgresTestSchema } from './postgresHarness'
 import { createPostgresTestSchema, describePostgres } from './postgresHarness'
 
@@ -18,6 +22,13 @@ type LedgerRow = {
   checksum: string
   applied_at: string
 }
+
+const postgresGolden = JSON.parse(
+  readFileSync(
+    fileURLToPath(new URL('./fixtures/metaDbCatalog.postgres.json', import.meta.url)),
+    'utf8',
+  ),
+) as MetaDbCatalog
 
 describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
   const schemas: PostgresTestSchema[] = []
@@ -94,37 +105,76 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
     }
   })
 
-  it('adds a null role without losing an existing v1 session row', async () => {
-    const testSchema = await createSchema('migration_session_role')
+  it('matches the normalized pre-cut catalog plus the approved deltas', async () => {
+    const testSchema = await createSchema('migration_golden')
     const pool = new pg.Pool({ connectionString: testSchema.scopedUrl })
     const client = await pool.connect()
 
     try {
-      await runPgMigrations(client, migrations.slice(0, 2))
+      await runPgMigrations(client)
+      expect(await pgMetaDbCatalog(client, testSchema.schema)).toEqual(
+        approvedTargetCatalog(postgresGolden),
+      )
+    } finally {
+      client.release()
+      await pool.end()
+    }
+  })
+
+  it('requires both identities on every placement trail row', async () => {
+    const testSchema = await createSchema('migration_placement_identity')
+    const pool = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const client = await pool.connect()
+
+    try {
+      await runPgMigrations(client)
+      await expect(
+        client.query(
+          `INSERT INTO ability_placement_trail (from_locator, to_locator, space_id)
+           VALUES ('old', 'new', 'space-main')`,
+        ),
+      ).rejects.toThrow(/null value in column "registry_note_id"/)
       await client.query(
-        `INSERT INTO agent_sessions
-          (id, owner, name, named, parent_id, created_at, last_seen_at, calls)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-        ['ses_existingv1aa', 'alice', 'Existing', true, null, 'created', 'seen', 7],
+        `INSERT INTO ability_placement_trail
+          (from_locator, to_locator, space_id, registry_note_id, manifest_note_id)
+         VALUES ('old', 'new', 'space-main', 'RegistryNote1', 'ManifestNote1')`,
       )
+    } finally {
+      await client.query('ROLLBACK').catch(() => {})
+      client.release()
+      await pool.end()
+    }
+  })
 
-      await runPgMigrations(client, migrations)
+  it('lets an accepted create reuse a key held only by rejected history', async () => {
+    const testSchema = await createSchema('migration_create_replay')
+    const pool = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const client = await pool.connect()
 
-      const result = await client.query(
-        'SELECT owner, name, calls, role, role_locator, role_context_project_id, project_id FROM agent_sessions WHERE id = $1',
-        ['ses_existingv1aa'],
+    try {
+      await runPgMigrations(client)
+      await client.query(
+        `INSERT INTO ability_create_operations
+          (id, actor_digest, idempotency_digest, request_fingerprint, space, package_id,
+           note_id, target_path, availability_required, stage_binding, phase,
+           prepared_evidence, created_at, updated_at)
+         VALUES
+          ('rejected-operation', 'actor', 'key', 'request', 'space-main', 'PackageId001',
+           'RegistryNote1', 'first/SKILL.md', false, 'binding', 'rejected', '{}', 'x', 'x'),
+          ('retry-operation', 'actor', 'key', 'request', 'space-main', 'PackageId002',
+           'RegistryNote2', 'second/SKILL.md', false, 'binding', 'accepted', '{}', 'y', 'y')`,
       )
-      expect(result.rows).toEqual([
-        {
-          owner: 'alice',
-          name: 'Existing',
-          calls: '7',
-          role: null,
-          role_locator: null,
-          role_context_project_id: null,
-          project_id: null,
-        },
-      ])
+      expect(
+        await client.query(
+          `SELECT id, phase FROM ability_create_operations
+            WHERE actor_digest = 'actor' AND idempotency_digest = 'key' ORDER BY id`,
+        ),
+      ).toMatchObject({
+        rows: [
+          { id: 'rejected-operation', phase: 'rejected' },
+          { id: 'retry-operation', phase: 'accepted' },
+        ],
+      })
     } finally {
       client.release()
       await pool.end()
@@ -137,7 +187,7 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
     const client = await pool.connect()
 
     try {
-      await runPgMigrations(client, migrations.slice(0, 10))
+      await runPgMigrations(client, migrations.slice(0, 1))
       await client.query(
         `INSERT INTO note_identity
           (id, file_path, space, created_at, materialized, deleted_at)
@@ -166,12 +216,12 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
     const client = await pool.connect()
 
     try {
-      await runPgMigrations(client, migrations.slice(0, 12))
+      await runPgMigrations(client, migrations.slice(0, 1))
       await client.query(
         `INSERT INTO note_identity
-          (id, file_path, space, created_at, materialized, deleted_at, legacy_name_aliases)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-        ['existing-identity', 'same.md', 'main', null, true, null, '[]'],
+          (id, file_path, space, created_at, materialized, deleted_at)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        ['existing-identity', 'same.md', 'main', null, true, null],
       )
 
       await runPgMigrations(client, migrations)
@@ -187,13 +237,13 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
     }
   })
 
-  it('adds the revision snapshot marker without relabelling legacy body blobs', async () => {
+  it('keeps baseline body blobs as nullable state format', async () => {
     const testSchema = await createSchema('migration_revision_state')
     const pool = new pg.Pool({ connectionString: testSchema.scopedUrl })
     const client = await pool.connect()
 
     try {
-      await runPgMigrations(client, migrations.slice(0, 6))
+      await runPgMigrations(client, migrations.slice(0, 1))
       await client.query('INSERT INTO revision_blobs (hash, content) VALUES ($1, $2)', [
         'legacy-hash',
         'legacy body',
@@ -208,10 +258,39 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
       await runPgMigrations(client, migrations)
 
       const result = await client.query(
-        'SELECT content_hash, snapshot_format FROM note_revisions WHERE note_id = $1',
+        `SELECT id::int AS id, content_hash, state_format, integrity, entry_role
+           FROM note_revisions WHERE note_id = $1`,
         ['legacy-state'],
       )
-      expect(result.rows).toEqual([{ content_hash: 'legacy-hash', snapshot_format: null }])
+      expect(result.rows).toEqual([
+        {
+          id: 1,
+          content_hash: 'legacy-hash',
+          state_format: null,
+          integrity: 'trusted',
+          entry_role: 'origin',
+        },
+      ])
+      expect(
+        await client.query('SELECT convert_from(content, $1) AS content FROM revision_blobs', [
+          'UTF8',
+        ]),
+      ).toMatchObject({ rows: [{ content: 'legacy body' }] })
+      const defaults = await client.query(
+        `SELECT column_name, column_default
+           FROM information_schema.columns
+          WHERE table_schema = $1 AND table_name = 'note_revisions'
+            AND column_name IN ('integrity', 'entry_role')
+          ORDER BY ordinal_position`,
+        [testSchema.schema],
+      )
+      expect(defaults.rows).toEqual([
+        { column_name: 'integrity', column_default: null },
+        { column_name: 'entry_role', column_default: null },
+      ])
+      expect(await pgMetaDbCatalog(client, testSchema.schema)).toEqual(
+        approvedTargetCatalog(postgresGolden),
+      )
     } finally {
       client.release()
       await pool.end()
@@ -228,12 +307,12 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
     const client = await pool.connect()
 
     try {
-      await runPgMigrations(client, migrations.slice(0, 5))
+      await runPgMigrations(client, migrations.slice(0, 1))
       const append = (noteId: string, space: string, baseRev: number | null, kind: string) =>
         client.query(
           `INSERT INTO note_revisions
-             (note_id, space, base_rev, kind, principal, title, tags, created_at, integrity)
-           VALUES ($1, $2, $3, $4, 'ui', 'T', '[]', '2026-06-10T10:00:00.000Z', 'trusted')`,
+             (note_id, space, base_rev, kind, principal, title, tags, created_at)
+           VALUES ($1, $2, $3, $4, 'ui', 'T', '[]', '2026-06-10T10:00:00.000Z')`,
           [noteId, space, baseRev, kind],
         )
 
@@ -269,13 +348,13 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
     }
   })
 
-  it('rejects the previous unconditional purge protocol after the CAS migration', async () => {
+  it('rejects the published purge token and accepts the semantic protocol', async () => {
     const testSchema = await createSchema('migration_revision_purge_cas')
     const pool = new pg.Pool({ connectionString: testSchema.scopedUrl })
     const client = await pool.connect()
 
     try {
-      await runPgMigrations(client, migrations.slice(0, 7))
+      await runPgMigrations(client, migrations.slice(0, 1))
       await client.query(
         `INSERT INTO note_revisions (note_id, space, kind, title, tags, created_at)
          VALUES ('rolling-purge', 'main', 'delete', 'Rolling purge', '[]', '2026-08-09')`,
@@ -290,7 +369,9 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
       await client.query('ROLLBACK')
 
       await client.query('BEGIN')
-      await client.query("SELECT set_config('notarium.revision_purge_protocol', 'v27', true)")
+      await client.query("SELECT set_config('notarium.revision_purge_protocol', $1, true)", [
+        REVISION_PURGE_PROTOCOL,
+      ])
       await client.query("DELETE FROM note_revisions WHERE note_id = 'rolling-purge'")
       await client.query('COMMIT')
       expect(
@@ -313,7 +394,7 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
     const client = await pool.connect()
 
     try {
-      await runPgMigrations(client, migrations.slice(0, 4))
+      await runPgMigrations(client, migrations.slice(0, 1))
       await client.query(
         `INSERT INTO revision_purge_fences (kind, entity_id) VALUES ('note', $1)`,
         ['legacy-note'],
@@ -329,8 +410,8 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
       const append = (noteId: string, space: string): Promise<unknown> =>
         client.query(
           `INSERT INTO note_revisions
-             (note_id, space, kind, principal, title, tags, created_at, integrity)
-           VALUES ($1, $2, 'write', 'ui', 'T', '[]', 'now', 'trusted')`,
+             (note_id, space, kind, principal, title, tags, created_at, integrity, entry_role)
+           VALUES ($1, $2, 'write', 'ui', 'T', '[]', 'now', 'trusted', 'change')`,
           [noteId, space],
         )
 
@@ -405,6 +486,9 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
         { owner: 'dora', project: 'project-root', last_rev: '77' },
         { owner: 'erin', project: 'project-root', last_rev: '78' },
       ])
+      expect(await client.query(`SELECT to_regclass('mcp_bookmarks') AS legacy`)).toMatchObject({
+        rows: [{ legacy: null }],
+      })
     } finally {
       client.release()
       await pool.end()
@@ -524,6 +608,29 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
       [testSchema.schema],
     )
     expect(Number(activity.rows[0]?.n)).toBe(0)
+  })
+
+  it('rejects a removed post-baseline ledger before applying target DDL', async () => {
+    const testSchema = await createSchema('migration_removed_prefix')
+    const pool = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const client = await pool.connect()
+
+    try {
+      await runPgMigrations(client, migrations.slice(0, 1))
+      await client.query(
+        `INSERT INTO meta_migrations (version, name, checksum, applied_at)
+         VALUES (1, 'agent_sessions', $1, '2026-08-01T00:00:00.000Z')`,
+        ['sha256:0160a883e4a4e02183809ffc424fbf128c4558861022340b1debb641c498c8f0'],
+      )
+
+      await expect(runPgMigrations(client)).rejects.toThrow(/name mismatch/)
+      expect(
+        await client.query(`SELECT to_regclass('agent_sessions') AS unexpected`),
+      ).toMatchObject({ rows: [{ unexpected: null }] })
+    } finally {
+      client.release()
+      await pool.end()
+    }
   })
 
   it('rejects an untracked schema containing only a user-defined type', async () => {

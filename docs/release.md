@@ -189,6 +189,27 @@ parent accepts the patched line; never widen an override to a range.
 
 ## Cutting a release
 
+Prepare the product line before its first release candidate:
+
+```bash
+npm run release:prepare -- 0.2.0
+```
+
+Prepare accepts one exact canonical `x.y.z` target and requires it to be strictly
+newer than the current lockstep version. It also requires a completely clean tree,
+including untracked files, and validates all ten tracked manifests plus the root and
+workspace records in `package-lock.json` before writing. On success only those version
+files change; `CHANGELOG.md`, HEAD and tags remain untouched. An npm or post-write
+verification failure restores their original bytes.
+
+Commit the prepared manifests and lockfile with the release-line work. From then until
+the stable cut, the repository names the version it is building while the Changelog
+honestly remains `[Unreleased]`:
+
+```text
+0.1.0 → release:prepare 0.2.0 → release-rc → release 0.2.0
+```
+
 Before cutting the tag, refresh the committed license corpus from a clean, full
 dependency install. The generator validates every visited package against
 `package-lock.json` and refuses a stale or lightweight `node_modules`:
@@ -222,8 +243,8 @@ diagnostic build is not size-checked; rebuild normally afterwards rather than le
 ungated `dist` behind.
 
 ```bash
-npm run release <patch|minor|major|x.y.z>   # bump the lockstep version, fold the
-                                            # Changelog, commit, tag vX.Y.Z
+npm run release 0.2.0                      # keep the prepared lockstep version,
+                                            # fold the Changelog, commit, tag vX.Y.Z
 git push && git push origin vX.Y.Z          # publish the commit and the tag
 ```
 
@@ -235,12 +256,14 @@ necessarily the remote the pipeline runs on: the gate resolves the source link t
 and an image whose source nobody can open is not traceable. If you push from a checkout
 with more than one remote, the tag goes to all of them first.
 
-`npm run release` (`scripts/release.mjs`) owns the *version*: it writes one
-version across every manifest, turns `[Unreleased]` into a dated section, commits
-and creates the annotated tag. `release:publish` (`scripts/releaseImage.mjs`) owns
-the *artifact*. They are separate because the tag has to be public before the
-image can honestly point at it — the artifact gate reads the public repository and
-refuses a tag it cannot find there.
+`npm run release:prepare` and `npm run release` share one import-safe orchestrator
+(`scripts/release.mjs`). Prepare owns the early version target; final release keeps
+that exact version, turns `[Unreleased]` into a dated section, commits and creates the
+annotated tag. Relative `patch|minor|major` inputs remain available to final release,
+but the normal RC flow uses the already prepared exact version.
+`release:publish` (`scripts/releaseImage.mjs`) owns the *artifact*. The boundaries are
+separate because the tag has to be public before the image can honestly point at it —
+the artifact gate reads the public repository and refuses a tag it cannot find there.
 
 A tag cut through a web UI works just as well as `git tag -a`, message or no message.
 The gate deliberately does not care about the shape of a tag: nothing here reads a
@@ -329,12 +352,12 @@ repository, through the same entrypoint:
 make release-rc
 ```
 
-Its version is the release it **precedes**, not the one already out. Between releases
-the manifests still hold the last cut version, so a naive `X.Y.Z-rc.N` would
-SemVer-order *below* a published `X.Y.Z` whose code it supersedes — and any
-version-sorting tool would read "upgrade to X.Y.Z" as forward when it is a downgrade.
-So the release checks whether `X.Y.Z` is already in the registry and, if it is (or if
-the registry cannot say), attaches the pre-release to `X.Y.(Z+1)` instead.
+Its version is the release it **precedes**, not the one already out. The required
+prepare step makes that intent explicit in the manifests before the first candidate,
+so a prepared `0.2.0` tree produces `0.2.0-rc.N`. The registry still decides only the
+candidate counter: `N` is the first free number for that prepared base. The publisher's
+existing fallback for an already-published manifest version remains fail-closed
+protection for an unprepared invocation, not the way a minor line is selected.
 
 It differs from a release in exactly four ways, all of them consequences of it not
 being one: no release tag is required (it builds from `HEAD`), the source revision

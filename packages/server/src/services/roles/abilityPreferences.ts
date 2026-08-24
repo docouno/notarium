@@ -49,7 +49,7 @@ export class InMemoryAbilityPreferences implements AbilityPreferencesPersistence
   private readonly records = new Map<string, PreferenceRow>()
   private readonly purgedNotes = new Set<string>()
   private readonly purgedSpaces = new Set<string>()
-  /** The durable `ability_placement_trail` (0016), as a Map: which address a package
+  /** The durable `ability_placement_trail`, as a Map: which address a package
    *  moved AWAY from, and the one it stands at now. Both drivers keep the same table
    *  for the same reason — carrying the rows is only half of an address change, and
    *  the other half is that a caller whose address is one statement older writes its
@@ -59,8 +59,8 @@ export class InMemoryAbilityPreferences implements AbilityPreferencesPersistence
     {
       to: string
       spaceId: string | null
-      registryNoteId: string | null
-      manifestNoteId: string | null
+      registryNoteId: string
+      manifestNoteId: string
     }
   >()
 
@@ -84,8 +84,8 @@ export class InMemoryAbilityPreferences implements AbilityPreferencesPersistence
 
   movedPlacement(locator: string): {
     toLocator: string
-    registryNoteId: string | null
-    manifestNoteId: string | null
+    registryNoteId: string
+    manifestNoteId: string
   } | null {
     const hop = this.moved.get(locator)
 

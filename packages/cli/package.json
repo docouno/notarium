@@ -1,6 +1,6 @@
 {
   "name": "notarium",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "license": "AGPL-3.0-only",
   "type": "module",
   "description": "Companion CLI for Notarium — the self-hosted, AI-agent-native knowledge workspace. The workspace itself ships as a Docker image.",

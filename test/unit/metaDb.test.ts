@@ -497,23 +497,6 @@ describe('SqliteMetaDb', () => {
       }
       await db.agentDeltaCursors.advance(sessionCursor, 'project-gone', '77', 'x')
       await db.agentDeltaCursors.advance(sessionCursor, 'project-keep', '88', 'x')
-      const putLegacyBookmark = inspect.prepare(
-        `INSERT INTO mcp_bookmarks (principal_id, space, last_rev, updated_at)
-         VALUES ('pat:al:legacy', ?, '1', 'x')`,
-      )
-
-      for (const legacyKey of [
-        victim,
-        'project-gone',
-        'gone',
-        'retired-gone',
-        keep,
-        'project-keep',
-        'shared-retired',
-      ]) {
-        putLegacyBookmark.run(legacyKey)
-      }
-
       // Child rows were written while the space was active. Archive only after seeding:
       // the lifecycle gate intentionally rejects new space-owned writes after closing.
       await db.spaces.upsert(
@@ -568,14 +551,6 @@ describe('SqliteMetaDb', () => {
       ).toEqual({ owners: 0, sessions: 0 })
       expect(await db.agentDeltaCursors.getOrInit({ owner: 'al' }, 'project-keep', 'y')).toBe('88')
       expect(await db.agentDeltaCursors.getOrInit(sessionCursor, 'project-keep', 'y')).toBe('88')
-      // Direct victim ids plus its unambiguous current/retired handles are scrubbed.
-      // A handle shared with the surviving space remains inert rather than being guessed.
-      expect(
-        inspect
-          .prepare('SELECT space FROM mcp_bookmarks ORDER BY space')
-          .all()
-          .map((row) => (row as { space: string }).space),
-      ).toEqual([keep, 'project-keep', 'shared-retired'].sort())
       // Context sets: the victim-homed set is gone; the keep-homed set survives, but its
       // attachment to the (now-purged) victim target was cascaded away.
       expect(await db.contextSets.getSet('set-gone')).toBeNull()

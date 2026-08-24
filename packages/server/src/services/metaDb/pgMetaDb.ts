@@ -5,6 +5,7 @@ import pg from 'pg'
 
 import { CAUSAL_BARRIER_KIND } from '@notarium/core'
 
+import { REVISION_PURGE_PROTOCOL } from './consts'
 import { createAbilityAvailabilityFacet } from './drivers/pg/abilityAvailability'
 import { createAbilityCreateFacet } from './drivers/pg/abilityCreate'
 import { createAbilityPlacementFacet } from './drivers/pg/abilityPlacement'
@@ -234,7 +235,9 @@ export class PgMetaDb implements MetaDb {
 
     try {
       await client.query('BEGIN')
-      await client.query("SELECT set_config('notarium.revision_purge_protocol', 'v27', true)")
+      await client.query("SELECT set_config('notarium.revision_purge_protocol', $1, true)", [
+        REVISION_PURGE_PROTOCOL,
+      ])
       // Enter at identity before the causal/revision tiers: ordinary identity
       // settlement uses the same order, so purge cannot form a cross-layer cycle.
       await lockSpaceIdentityRows(client, spaceId)
@@ -287,8 +290,8 @@ export class PgMetaDb implements MetaDb {
       await client.query('DELETE FROM note_identity WHERE space = $1', [spaceId])
       // An import's destination claims die with the space they point into (#302).
       // Between identity (L1) and favourites (L2a) because that is where L1r/L1p sit
-      // in the hierarchy; the claims themselves go by the ON DELETE CASCADE of
-      // migration 0010, which takes L1p after the header's L1r — the only order the
+      // in the hierarchy; the claims themselves go by the table pair's ON DELETE
+      // CASCADE, which takes L1p after the header's L1r — the only order the
       // ladder allows. A row left behind would hold paths in a space that no longer
       // exists, and its `activeJobIds` entry would keep the terminal-cleanup pass
       // fetching a job row this method also deletes.
@@ -358,54 +361,6 @@ export class PgMetaDb implements MetaDb {
       await client.query('DELETE FROM restore_operations WHERE space = $1', [spaceId])
       await client.query('DELETE FROM ability_create_operations WHERE space = $1', [spaceId])
       await client.query('DELETE FROM causal_outbox WHERE space = $1', [spaceId])
-      // Legacy rows may carry a space/project id, current slug, or retired space
-      // alias. Ids are authoritative; textual history is purged only when every
-      // live namespace resolves it to one project (fail closed on collisions).
-      await client.query(
-        `WITH candidates AS (
-           SELECT bookmarks.space AS legacy_key, folders.id AS project
-             FROM mcp_bookmarks AS bookmarks
-             JOIN folders ON folders.id = bookmarks.space AND folders.type = 'project'
-           UNION
-           SELECT bookmarks.space AS legacy_key, folders.id AS project
-             FROM mcp_bookmarks AS bookmarks
-             JOIN folders
-               ON folders.space = bookmarks.space
-              AND folders.path = ''
-              AND folders.type = 'project'
-           UNION
-           SELECT bookmarks.space AS legacy_key, folders.id AS project
-             FROM mcp_bookmarks AS bookmarks
-             JOIN spaces
-               ON spaces.slug = bookmarks.space
-               OR EXISTS (
-                 SELECT 1
-                   FROM jsonb_array_elements_text(COALESCE(spaces.aliases, '[]')::jsonb)
-                        AS alias(value)
-                  WHERE alias.value = bookmarks.space
-               )
-             JOIN folders
-               ON folders.space = spaces.id
-              AND folders.path = ''
-              AND folders.type = 'project'
-         ), uniquely_resolved AS (
-           SELECT legacy_key, MIN(project) AS project
-             FROM candidates
-            GROUP BY legacy_key
-           HAVING COUNT(DISTINCT project) = 1
-         )
-         DELETE FROM mcp_bookmarks
-          WHERE space = $1
-             OR space IN (SELECT id FROM folders WHERE space = $1 AND type = 'project')
-             OR space IN (
-               SELECT legacy_key
-                 FROM uniquely_resolved
-                WHERE project IN (
-                  SELECT id FROM folders WHERE space = $1 AND type = 'project'
-                )
-             )`,
-        [spaceId],
-      )
       // The project FK cascades both cursor tables from this parent delete. This
       // preserves the parent-first order used by concurrent session advance.
       //

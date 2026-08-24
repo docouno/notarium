@@ -1,66 +1,12 @@
-ALTER TABLE note_revisions
-  ADD COLUMN semantic_fingerprint TEXT;
-
-ALTER TABLE note_revisions
-  ADD COLUMN restore_safety TEXT
-  CHECK (restore_safety IN ('safe', 'blocked', 'unknown'));
-
-CREATE TABLE revision_heads (
-  space TEXT NOT NULL,
-  note_id TEXT NOT NULL,
-  revision_id BIGINT NOT NULL UNIQUE,
-  semantic_fingerprint TEXT,
-  lifecycle TEXT NOT NULL CHECK (lifecycle IN ('live', 'deleted')),
-  PRIMARY KEY (space, note_id)
-);
-
-INSERT INTO revision_heads (note_id, space, revision_id, semantic_fingerprint, lifecycle)
-SELECT DISTINCT ON (space, note_id)
-       note_id,
-       space,
-       id,
-       semantic_fingerprint,
-       CASE WHEN kind = 'delete' THEN 'deleted' ELSE 'live' END
-  FROM note_revisions
- WHERE integrity = 'trusted'
- ORDER BY space, note_id, id DESC;
-
-CREATE INDEX idx_revision_heads_space
-  ON revision_heads(space, revision_id);
-
-CREATE FUNCTION advance_revision_head()
-RETURNS trigger
-LANGUAGE plpgsql
-AS $$
-BEGIN
-  IF NEW.integrity <> 'trusted' THEN
-    RETURN NEW;
-  END IF;
-  INSERT INTO revision_heads
-    (note_id, space, revision_id, semantic_fingerprint, lifecycle)
-  VALUES (
-    NEW.note_id,
-    NEW.space,
-    NEW.id,
-    NEW.semantic_fingerprint,
-    CASE WHEN NEW.kind = 'delete' THEN 'deleted' ELSE 'live' END
-  )
-  ON CONFLICT (space, note_id) DO UPDATE SET
-    revision_id = EXCLUDED.revision_id,
-    semantic_fingerprint = EXCLUDED.semantic_fingerprint,
-    lifecycle = EXCLUDED.lifecycle;
-  RETURN NEW;
-END;
-$$;
-
-CREATE TRIGGER trg_revision_head_advance
-AFTER INSERT ON note_revisions
-FOR EACH ROW
-EXECUTE FUNCTION advance_revision_head();
-
 ALTER TABLE note_identity
   ADD COLUMN address_revision BIGINT NOT NULL DEFAULT 1
   CHECK (address_revision > 0);
+
+ALTER TABLE note_identity
+  ADD COLUMN legacy_name_aliases TEXT NOT NULL DEFAULT '[]';
+
+ALTER TABLE note_identity
+  ADD COLUMN settlement_successor_id TEXT;
 
 CREATE UNIQUE INDEX idx_note_identity_live_space_path
   ON note_identity(space, file_path)
@@ -436,6 +382,18 @@ BEGIN
           AND note_id = NEW.note_id
           AND source_revision_id = NEW.source_rev::text
           AND phase = 'physical-published'
+     )
+     AND NOT EXISTS (
+       SELECT 1
+         FROM ability_create_operations operation
+         JOIN note_identity identity
+           ON identity.id = operation.note_id AND identity.space = operation.space
+        WHERE operation.space = NEW.space
+          AND operation.note_id = NEW.note_id
+          AND operation.target_path = identity.file_path
+          AND operation.phase = 'physical-published'
+          AND NEW.kind = 'write'
+          AND NEW.entry_role = 'origin'
      ) THEN
     RAISE EXCEPTION 'space lifecycle rejects revision append: %', lifecycle_phase
       USING ERRCODE = '55000';

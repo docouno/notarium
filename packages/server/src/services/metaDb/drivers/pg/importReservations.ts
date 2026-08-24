@@ -341,7 +341,7 @@ export const createImportReservationsFacet = (ctx: PgDriverCtx): ImportReservati
         `UPDATE import_reservations SET status = 'closing', updated_at = $1 WHERE id = $2`,
         [now, header.row.id],
       )
-      // The claims go with the header, by the ON DELETE CASCADE of migration 0010 —
+      // The claims go with the header through the table pair's ON DELETE CASCADE —
       // which is what takes L1p here, in the one order the hierarchy allows (the
       // parent's L1r is already held). The register declares that level for this
       // transaction so the cascade is a stated fact rather than an invisible one;

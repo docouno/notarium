@@ -14,7 +14,7 @@
 //     the `latest` guard decides on);
 //   · the forward-only `:latest` rule decides on a version really read back from a
 //     registry — the one release-path input that unit tests cannot supply;
-//   · a second candidate is NAMED past the published one rather than overwriting it,
+//   · a second candidate on the prepared base is named past the published one rather than overwriting it,
 //     and the name is decided against what the registry really holds;
 //   · a pre-release never moves `latest`.
 //
@@ -331,35 +331,17 @@ try {
     '--first-publication still widens the forward-only :latest guard',
   )
 
-  // LAST because it changes what the next pre-release is CALLED. It costs a second
-  // full build (dependency layers hit the cache, the bundle and the verification do
-  // not), which is the price of deciding BOTH halves of the name against a registry
-  // rather than against a mock: publishing :X.Y.Z moves the base off it, and
-  // occupying rc.1 of that base makes the counter — which keeps no state of its own —
-  // read what is really there.
-  step('the next pre-release names the next patch, and the next free candidate')
-  const [maj, min, pat] = record.sourceVersion.split('.').map(Number)
-  const nextBase = `${maj}.${min}.${pat + 1}`
-  const seeded = []
-
-  for (const tag of [record.sourceVersion, `${nextBase}-rc.1`]) {
-    const ref = `${registry}/${imageName}:${tag}`
-
-    await docker(['tag', record.image, ref])
-    await docker(['push', ref])
-    seeded.push(ref)
-  }
-
-  const afterRelease = await releaseImage([...baseArgs, '--dry-run'])
-  const nextRecord = JSON.parse(afterRelease.stdout)
+  // LAST because it costs a second full build (dependency layers hit the cache,
+  // bundle and verification do not). The base stays the exact version prepared in
+  // the manifests; only the registry-owned counter moves.
+  step('the next pre-release keeps the prepared base and takes the next free candidate')
+  const nextCandidate = await releaseImage([...baseArgs, '--dry-run'])
+  const nextRecord = JSON.parse(nextCandidate.stdout)
 
   assert(
-    nextRecord.version === `${nextBase}-rc.2`,
-    `expected ${nextBase}-rc.2 (published ${record.sourceVersion} and ${nextBase}-rc.1), got ${nextRecord.version}`,
+    nextRecord.version === `${record.sourceVersion}-rc.2`,
+    `expected ${record.sourceVersion}-rc.2 after publishing rc.1, got ${nextRecord.version}`,
   )
-  for (const ref of seeded) {
-    await docker(['image', 'rm', '-f', ref], { allowFailure: true })
-  }
 
   console.log('\nrelease flow: ok')
 } catch (error) {

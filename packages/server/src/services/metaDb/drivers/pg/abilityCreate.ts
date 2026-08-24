@@ -1,13 +1,7 @@
 import { Buffer } from 'node:buffer'
 import type { PoolClient } from 'pg'
 import { ABILITY_AVAILABILITY_MODE } from '@notarium/contract'
-import {
-  CAUSAL_BARRIER_KIND,
-  DOCUMENT_STATE_FORMAT,
-  LOGICAL_NOTE_STATE_FORMAT,
-  REVISION_INTEGRITY,
-  SPACE_LIFECYCLE_PHASE,
-} from '@notarium/core'
+import { CAUSAL_BARRIER_KIND, REVISION_INTEGRITY, SPACE_LIFECYCLE_PHASE } from '@notarium/core'
 
 import { abilityCreateOperationOfRow, type AbilityCreateOperationRow } from '../../causalRows'
 import {
@@ -521,11 +515,11 @@ export const createAbilityCreateFacet = (ctx: PgDriverCtx): AbilityCreatePersist
         `INSERT INTO note_revisions
            (note_id, space, base_rev, their_rev, source_rev, kind, principal,
             agent_owner, agent_name, session_id, session_name, session_attach,
-            content_hash, semantic_fingerprint, restore_safety, snapshot_format, document_format,
+            content_hash, semantic_fingerprint, restore_safety, state_format,
             title, class, slug, tags, created_at, chars_added, chars_removed,
             entry_role, integrity)
          VALUES ($1, $2, NULL, NULL, NULL, $3, $4, $5, $6, $7, $8, $9, $10,
-                 $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+                 $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
          RETURNING id`,
         [
           revision.noteId,
@@ -540,12 +534,7 @@ export const createAbilityCreateFacet = (ctx: PgDriverCtx): AbilityCreatePersist
           revision.contentHash,
           revision.semanticFingerprint,
           revision.restoreSafety ?? null,
-          revision.stateFormat === LOGICAL_NOTE_STATE_FORMAT ? revision.stateFormat : null,
-          revision.stateFormat === DOCUMENT_STATE_FORMAT.markdown ||
-          revision.stateFormat === DOCUMENT_STATE_FORMAT.skill ||
-          revision.stateFormat === DOCUMENT_STATE_FORMAT.opaque
-            ? revision.stateFormat
-            : null,
+          revision.stateFormat ?? null,
           revision.title,
           revision.class,
           revision.slug,

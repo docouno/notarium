@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 
 import {
@@ -45,6 +47,21 @@ const report = (over: Partial<BenchmarkGateReport> = {}): BenchmarkGateReport =>
 })
 
 describe('session audit benchmark gates', () => {
+  it('keeps both bulk revision seeders on the final mandatory row contract', () => {
+    const source = readFileSync(
+      fileURLToPath(new URL('../../scripts/benchSessionAudit.ts', import.meta.url)),
+      'utf8',
+    )
+    const inserts = [...source.matchAll(/INSERT INTO note_revisions\s*\(([^)]*)\)/g)].map((match) =>
+      match[1]!.split(',').map((column) => column.trim()),
+    )
+
+    expect(inserts).toHaveLength(2)
+    for (const columns of inserts) {
+      expect(columns).toEqual(expect.arrayContaining(['entry_role', 'state_format', 'integrity']))
+    }
+  })
+
   it('requires a real baseline for the post phase', () => {
     expect(benchmarkGateFailures(report())).toContain('post phase requires BENCH_BASELINE')
   })

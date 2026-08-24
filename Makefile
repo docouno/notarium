@@ -558,8 +558,9 @@ release: deps ## Publish a traceable image: build from the release tag, verify i
 # A pre-release is its own target rather than a flag you have to remember: the two
 # differ in what they PROMISE (a release claims the version and moves `latest`; an
 # rc claims neither), and that is not a distinction to leave to a typo in an
-# argument list. RELEASE_FLAGS stays for the rare extras (--registry, --force-latest).
-release-rc: deps ## Publish a pre-release image :<version>-rc.<n> — no release tag needed, :latest untouched
+# argument list. The candidate base is the exact version already prepared in the
+# manifests. RELEASE_FLAGS stays for the rare extras (--registry, --force-latest).
+release-rc: deps ## Publish :<prepared-version>-rc.<n> — no release tag needed, :latest untouched
 	npm run release:image -- --prerelease $(RELEASE_FLAGS)
 
 # The SAME entrypoint against a throwaway local registry, so the parts that only

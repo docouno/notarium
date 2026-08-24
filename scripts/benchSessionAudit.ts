@@ -426,8 +426,9 @@ const createSqliteDriver = (): Driver => {
         `INSERT INTO note_revisions
            (note_id, space, kind, principal, content_hash, title, tags, created_at,
             chars_added, chars_removed, class, agent_owner, agent_name, session_id,
-            session_name, session_attach)
-         VALUES (?, 'bench-space', 'write', ?, NULL, ?, '[]', ?, 1, 0, 'user-doc', ?, ?, ?, ?, ?)`,
+            session_name, session_attach, entry_role, state_format, integrity)
+         VALUES (?, 'bench-space', 'write', ?, NULL, ?, '[]', ?, 1, 0, 'user-doc', ?, ?, ?, ?, ?,
+                 'change', NULL, 'trusted')`,
       )
       db.exec('BEGIN IMMEDIATE')
 
@@ -590,7 +591,7 @@ const createPostgresDriver = async (url: string): Promise<Driver> => {
           `INSERT INTO note_revisions
              (note_id, space, kind, principal, content_hash, title, tags, created_at,
               chars_added, chars_removed, class, agent_owner, agent_name, session_id,
-              session_name, session_attach)
+              session_name, session_attach, entry_role, state_format, integrity)
            SELECT 'bench-note-' || n,
                   'bench-space', 'write', 'pat:' || $1 || ':bench', NULL,
                   'Benchmark note ' || n, '[]',
@@ -605,7 +606,8 @@ const createPostgresDriver = async (url: string): Promise<Driver> => {
                        WHEN n <= $3 THEN 'Benchmark ses_other_' || lpad(((n - 101) % 100)::text, 3, '0')
                        ELSE NULL END,
                   CASE WHEN n <= $3 THEN CASE WHEN n % 2 = 0 THEN 'declared' ELSE 'inferred' END
-                       ELSE NULL END
+                       ELSE NULL END,
+                  'change', NULL, 'trusted'
              FROM generate_series(1, $4::integer) AS generated(n)`,
           [OWNER, TARGET_SESSION, sessionPerSource, half],
         )

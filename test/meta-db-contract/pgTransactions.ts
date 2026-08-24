@@ -111,7 +111,7 @@ export const PG_TRANSACTIONS: readonly PgTransaction[] = [
   //
   // `closeForJob` declares L1p although no statement of its own names that table:
   // `DELETE FROM import_reservations` takes it through the ON DELETE CASCADE of
-  // migration 0010. A cascade is an acquisition like any other, and the register is
+  // the import-reservation path FK. A cascade is an acquisition like any other, and the register is
   // where an acquisition becomes a stated fact — the live observer levels a
   // statement by its TARGET table, so this one is invisible to it by construction.
   // The order is the only one available: the cascade fires under the parent's L1r,

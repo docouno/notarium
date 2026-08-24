@@ -1,4 +1,4 @@
--- Import path reservation (#302): what a Markdown-tree import CLAIMS before it
+-- Import path reservation: what a Markdown-tree import claims before it
 -- writes anything, so two imports cannot decide the same destination and a
 -- crashed run's claim is re-adopted by its retry instead of being guessed at.
 --

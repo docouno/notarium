@@ -1,4 +1,4 @@
--- Import path reservation (#302) — the PostgreSQL twin of the SQLite table pair.
+-- Import path reservation — the PostgreSQL twin of the SQLite table pair.
 -- See the SQLite migration for why each column exists; the shapes are identical
 -- so the shared persistence contract can hold both dialects to one behaviour.
 CREATE TABLE import_reservations (

@@ -21,8 +21,8 @@ export const createAbilityPlacementFacet = (ctx: PgDriverCtx): AbilityPlacementP
     const row = result.rows[0] as
       | {
           to_locator: string
-          registry_note_id: string | null
-          manifest_note_id: string | null
+          registry_note_id: string
+          manifest_note_id: string
         }
       | undefined
 
@@ -98,9 +98,8 @@ export const createAbilityPlacementFacet = (ctx: PgDriverCtx): AbilityPlacementP
       // included, so it follows the address like the pointers above. Its lifecycle
       // keys (Space, registry note) are untouched by a move inside one Space. The move
       // carries no owner and rewrites the key for ALL of them at once, so it can name
-      // no prefix of the `(owner, locator)` primary key — `ability_preferences_locator`
-      // (migration 0015) is the index that keeps it from scanning every override in
-      // the installation.
+      // no prefix of the `(owner, locator)` primary key;
+      // `ability_preferences_locator` keeps that range indexed.
       //
       // …and being a RANGE is exactly why L4p is entered first, with BOTH locators. The
       // other writer of this table inserts a row keyed by the same locator and an owner

@@ -154,9 +154,9 @@ const revision = (noteId: string, over: Partial<RevisionInput> = {}): RevisionIn
   ...over,
 })
 
-/** A rolling peer without application advisory locks or a fence read. The
+/** A direct SQL writer without application advisory locks or a fence read. The
  * database trigger must still serialize and reject it. */
-const rawAppendWithoutApplicationLocks = async (
+const directAppendWithoutApplicationLocks = async (
   pool: pg.Pool,
   rev: RevisionInput,
   content: string | null,
@@ -175,8 +175,11 @@ const rawAppendWithoutApplicationLocks = async (
     }
     await client.query(
       `INSERT INTO note_revisions
-         (note_id, space, base_rev, their_rev, source_rev, kind, principal, content_hash, title, class, slug, tags, created_at, chars_added, chars_removed)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+         (note_id, space, base_rev, their_rev, source_rev, kind, principal, content_hash,
+          title, class, slug, tags, created_at, chars_added, chars_removed,
+          entry_role, state_format, integrity)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+               $16, $17, $18)`,
       [
         rev.noteId,
         rev.space,
@@ -193,6 +196,9 @@ const rawAppendWithoutApplicationLocks = async (
         rev.createdAt,
         rev.charsAdded,
         rev.charsRemoved,
+        rev.entryRole,
+        rev.stateFormat,
+        'trusted',
       ],
     )
     await client.query('COMMIT')
@@ -1046,97 +1052,6 @@ describePostgres('live Postgres driver', SUITE, () => {
     }
   })
 
-  it('purges only legacy bookmark handles that unambiguously belong to the space', async () => {
-    const testSchema = await createPostgresTestSchema('legacy_bookmark_purge')
-    const inspect = new pg.Pool({ connectionString: testSchema.scopedUrl })
-    const victim = 'space-legacy-gone'
-    const keep = 'space-legacy-keep'
-
-    try {
-      await testSchema.db.spaces.upsert({
-        id: victim,
-        slug: 'gone',
-        displayName: 'Gone',
-        notesDir: 'gone',
-        aliases: ['retired-gone', 'shared-retired'],
-        createdAt: '2026-08-04T10:00:00Z',
-        archivedAt: null,
-        archivedBy: null,
-      })
-      await testSchema.db.spaces.upsert({
-        id: keep,
-        slug: 'keep',
-        displayName: 'Keep',
-        notesDir: 'keep',
-        aliases: ['shared-retired'],
-        createdAt: '2026-08-04T10:00:00Z',
-        archivedAt: null,
-        archivedBy: null,
-      })
-      for (const [id, space, slug] of [
-        ['project-legacy-gone', victim, 'gone'],
-        ['project-legacy-keep', keep, 'keep'],
-      ]) {
-        await testSchema.db.projects.upsert({
-          id,
-          space,
-          path: '',
-          slug,
-          aliases: [],
-          pathAliases: [],
-          displayName: slug,
-          status: 'active',
-          lastSeen: '2026-08-04T10:00:00Z',
-          createdAt: '2026-08-04T10:00:00Z',
-        })
-      }
-      const legacyKeys = [
-        victim,
-        'project-legacy-gone',
-        'gone',
-        'retired-gone',
-        keep,
-        'project-legacy-keep',
-        'shared-retired',
-      ]
-      await inspect.query(
-        `INSERT INTO mcp_bookmarks (principal_id, space, last_rev, updated_at)
-         SELECT 'pat:alice:legacy', legacy_key, '1', '2026-08-04T10:00:00Z'
-           FROM unnest($1::text[]) AS legacy_key`,
-        [legacyKeys],
-      )
-      await testSchema.db.spaces.upsert({
-        id: victim,
-        slug: 'gone',
-        displayName: 'Gone',
-        notesDir: 'gone',
-        aliases: ['retired-gone', 'shared-retired'],
-        createdAt: '2026-08-04T10:00:00Z',
-        archivedAt: '2026-08-04T11:00:00Z',
-        archivedBy: 'user:admin',
-      })
-      await testSchema.db.spaceLifecycle.transition({
-        space: victim,
-        expectedPhases: ['active'],
-        phase: 'archived',
-        changedAt: '2026-08-04T11:00:00Z',
-        changedBy: 'user:admin',
-      })
-
-      await testSchema.db.purgeSpace(victim)
-
-      const remaining = await inspect.query<{ space: string }>(
-        'SELECT space FROM mcp_bookmarks ORDER BY space',
-      )
-      expect(remaining.rows.map(({ space }) => space)).toEqual(
-        [keep, 'project-legacy-keep', 'shared-retired'].sort(),
-      )
-    } finally {
-      await inspect.end()
-      await testSchema.teardown()
-    }
-  })
-
   it('atomically grants only while a stable space id exists and is active', async () => {
     const testSchema = await createPostgresTestSchema('grant_active_space')
     const space = {
@@ -1477,7 +1392,7 @@ describePostgres('live Postgres driver', SUITE, () => {
         releaseLegacy = resolveGate
       })
       const sharedHash = 'legacy-modern-new-hash'
-      legacyTask = rawAppendWithoutApplicationLocks(
+      legacyTask = directAppendWithoutApplicationLocks(
         legacyPool,
         revision('legacy-new-hash', { contentHash: sharedHash }),
         'shared new body',
@@ -1531,7 +1446,7 @@ describePostgres('live Postgres driver', SUITE, () => {
 
       purgeTask = testSchema.db.revisions.purgeNotes('space-a', ['legacy-terminal-race'])
       await waitForAdvisoryWaiters(testSchema, 1)
-      legacyTask = rawAppendWithoutApplicationLocks(legacyPool, input, 'late legacy body')
+      legacyTask = directAppendWithoutApplicationLocks(legacyPool, input, 'late direct body')
       const legacyRejection = expect(legacyTask).rejects.toThrow(
         /revision target was permanently purged: note/,
       )
@@ -1550,7 +1465,7 @@ describePostgres('live Postgres driver', SUITE, () => {
       await testSchema.db.revisions.append(spaceInput, 'space body')
       await testSchema.db.purgeSpace('space-b')
       await expect(
-        rawAppendWithoutApplicationLocks(legacyPool, spaceInput, 'late space body'),
+        directAppendWithoutApplicationLocks(legacyPool, spaceInput, 'late space body'),
       ).rejects.toThrow(/revision target was permanently purged: space/)
       expect(await testSchema.db.revisions.latestFor('space-b', 'legacy-space-terminal')).toBeNull()
     } finally {

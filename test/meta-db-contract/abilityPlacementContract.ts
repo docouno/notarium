@@ -315,7 +315,7 @@ export const describeAbilityPlacementContract = (
     // version" would send every later disable to a placement nothing occupies. In the
     // durable dialects the same order is what keeps the second move from re-pointing
     // the first move's row ONTO its own source, which is a row that forwards an
-    // address to itself — the one thing `0016` refuses outright.
+    // address to itself — the one thing the placement-trail CHECK refuses outright.
     it('stops forwarding an address a later move gives the package back', async () => {
       await db.abilityPlacement.moveOwnedRolePlacement(move)
       await expect(

@@ -1,0 +1,4702 @@
+{
+  "tables": [
+    {
+      "name": "ability_availability",
+      "columns": [
+        {
+          "name": "home_space",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "package_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 2
+        },
+        {
+          "name": "mode",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "registry_note_id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [
+        "mode in ('all-projects', 'selected-projects')"
+      ],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": "idx_ability_availability_registry_note",
+          "unique": false,
+          "columns": [
+            {
+              "name": "home_space",
+              "descending": false
+            },
+            {
+              "name": "registry_note_id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "home_space",
+              "descending": false
+            },
+            {
+              "name": "package_id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "ability_create_operations",
+      "columns": [
+        {
+          "name": "id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "actor_digest",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "idempotency_digest",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "request_fingerprint",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "space",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "package_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "note_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "target_path",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "availability_required",
+          "type": "integer",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "stage_binding",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "phase",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "prepared_evidence",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "physical_receipt",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "terminal_result",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "failure_code",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "created_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "updated_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [
+        "availability_required in (0, 1)",
+        "phase in ('accepted', 'physical-published', 'metadata-committed', 'succeeded', 'rejected', 'failed-recoverable')"
+      ],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": "idx_ability_create_operations_recovery",
+          "unique": false,
+          "columns": [
+            {
+              "name": "phase",
+              "descending": false
+            },
+            {
+              "name": "created_at",
+              "descending": false
+            },
+            {
+              "name": "id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": "idx_ability_create_operations_replay",
+          "unique": true,
+          "columns": [
+            {
+              "name": "actor_digest",
+              "descending": false
+            },
+            {
+              "name": "idempotency_digest",
+              "descending": false
+            }
+          ],
+          "predicate": "idempotency_digest is not null and phase <> 'rejected'"
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "note_id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "space",
+              "descending": false
+            },
+            {
+              "name": "package_id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "ability_placement_trail",
+      "columns": [
+        {
+          "name": "from_locator",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "to_locator",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "space_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "registry_note_id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "manifest_note_id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [
+        "from_locator <> to_locator"
+      ],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": "ability_placement_trail_space",
+          "unique": false,
+          "columns": [
+            {
+              "name": "space_id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": "ability_placement_trail_to",
+          "unique": false,
+          "columns": [
+            {
+              "name": "to_locator",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "from_locator",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "ability_preferences",
+      "columns": [
+        {
+          "name": "owner",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "locator",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 2
+        },
+        {
+          "name": "space_id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "registry_note_id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "updated_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [
+        "(space_id is null) = (registry_note_id is null)"
+      ],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": "ability_preferences_lifecycle",
+          "unique": false,
+          "columns": [
+            {
+              "name": "space_id",
+              "descending": false
+            },
+            {
+              "name": "registry_note_id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": "ability_preferences_locator",
+          "unique": false,
+          "columns": [
+            {
+              "name": "locator",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "owner",
+              "descending": false
+            },
+            {
+              "name": "locator",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "ability_project_bindings",
+      "columns": [
+        {
+          "name": "home_space",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "package_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 2
+        },
+        {
+          "name": "project_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 3
+        }
+      ],
+      "checks": [],
+      "foreignKeys": [
+        {
+          "columns": [
+            "home_space",
+            "package_id"
+          ],
+          "referencedTable": "ability_availability",
+          "referencedColumns": [
+            "home_space",
+            "package_id"
+          ],
+          "onUpdate": "no action",
+          "onDelete": "cascade"
+        },
+        {
+          "columns": [
+            "project_id"
+          ],
+          "referencedTable": "folders",
+          "referencedColumns": [
+            "id"
+          ],
+          "onUpdate": "no action",
+          "onDelete": "cascade"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_ability_project_bindings_project",
+          "unique": false,
+          "columns": [
+            {
+              "name": "project_id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "home_space",
+              "descending": false
+            },
+            {
+              "name": "package_id",
+              "descending": false
+            },
+            {
+              "name": "project_id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "agent_retrievals",
+      "columns": [
+        {
+          "name": "id",
+          "type": "integer",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "owner",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "principal",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "agent",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "tool",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "query",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "project",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "class_filter",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "result_count",
+          "type": "integer",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "top_score",
+          "type": "real",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "hits",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": "'[]'",
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "created_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "session_id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "session_name",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "session_attach",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [
+        "session_attach is null or session_attach in ('declared', 'inferred')"
+      ],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": "idx_agent_retrievals_owner_agent_created",
+          "unique": false,
+          "columns": [
+            {
+              "name": "owner",
+              "descending": false
+            },
+            {
+              "name": "agent",
+              "descending": false
+            },
+            {
+              "name": "created_at",
+              "descending": true
+            },
+            {
+              "name": "id",
+              "descending": true
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": "idx_agent_retrievals_owner_created",
+          "unique": false,
+          "columns": [
+            {
+              "name": "owner",
+              "descending": false
+            },
+            {
+              "name": "created_at",
+              "descending": true
+            },
+            {
+              "name": "id",
+              "descending": true
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": "idx_agent_retrievals_owner_outside_created",
+          "unique": false,
+          "columns": [
+            {
+              "name": "owner",
+              "descending": false
+            },
+            {
+              "name": "created_at",
+              "descending": true
+            },
+            {
+              "name": "id",
+              "descending": true
+            }
+          ],
+          "predicate": "session_id is null"
+        },
+        {
+          "name": "idx_agent_retrievals_owner_query",
+          "unique": false,
+          "columns": [
+            {
+              "name": "owner",
+              "descending": false
+            },
+            {
+              "name": "tool",
+              "descending": false
+            },
+            {
+              "name": "query",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": "idx_agent_retrievals_owner_session_created",
+          "unique": false,
+          "columns": [
+            {
+              "name": "owner",
+              "descending": false
+            },
+            {
+              "name": "session_id",
+              "descending": false
+            },
+            {
+              "name": "created_at",
+              "descending": true
+            },
+            {
+              "name": "id",
+              "descending": true
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "agent_sessions",
+      "columns": [
+        {
+          "name": "id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "owner",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "name",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "named",
+          "type": "integer",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "parent_id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "created_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "last_seen_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "calls",
+          "type": "integer",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "role",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "role_locator",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "role_context_project_id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "project_id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [
+        "calls >= 1",
+        "named in (0, 1)"
+      ],
+      "foreignKeys": [
+        {
+          "columns": [
+            "parent_id"
+          ],
+          "referencedTable": "agent_sessions",
+          "referencedColumns": [
+            "id"
+          ],
+          "onUpdate": "no action",
+          "onDelete": "set null"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_agent_sessions_owner_name_seen",
+          "unique": false,
+          "columns": [
+            {
+              "name": "owner",
+              "descending": false
+            },
+            {
+              "name": "name",
+              "descending": false
+            },
+            {
+              "name": "last_seen_at",
+              "descending": true
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": "idx_agent_sessions_owner_seen",
+          "unique": false,
+          "columns": [
+            {
+              "name": "owner",
+              "descending": false
+            },
+            {
+              "name": "last_seen_at",
+              "descending": true
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": "idx_agent_sessions_seen",
+          "unique": false,
+          "columns": [
+            {
+              "name": "last_seen_at",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "backup_generation_freeze",
+      "columns": [
+        {
+          "name": "singleton",
+          "type": "integer",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "owner",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "generation",
+          "type": "integer",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "key_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "active_hash",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "candidate_key_id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "candidate_hash",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "acquired_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "heartbeat_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "expires_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [
+        "(candidate_key_id is null and candidate_hash is null) or (candidate_key_id is not null and candidate_hash is not null)",
+        "expires_at > heartbeat_at",
+        "generation > 0",
+        "singleton = 1"
+      ],
+      "foreignKeys": [],
+      "indexes": []
+    },
+    {
+      "name": "causal_outbox",
+      "columns": [
+        {
+          "name": "id",
+          "type": "integer",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "space",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "generation",
+          "type": "integer",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "kind",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "operation_id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "resource_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "created_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "acknowledged_at",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": "idx_causal_outbox_pending",
+          "unique": false,
+          "columns": [
+            {
+              "name": "id",
+              "descending": false
+            }
+          ],
+          "predicate": "acknowledged_at is null"
+        }
+      ]
+    },
+    {
+      "name": "causal_outbox_deliveries",
+      "columns": [
+        {
+          "name": "subscriber_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "event_id",
+          "type": "integer",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 2
+        },
+        {
+          "name": "acknowledged_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [],
+      "foreignKeys": [
+        {
+          "columns": [
+            "event_id"
+          ],
+          "referencedTable": "causal_outbox",
+          "referencedColumns": [
+            "id"
+          ],
+          "onUpdate": "no action",
+          "onDelete": "cascade"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_causal_outbox_deliveries_event",
+          "unique": false,
+          "columns": [
+            {
+              "name": "event_id",
+              "descending": false
+            },
+            {
+              "name": "subscriber_id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "subscriber_id",
+              "descending": false
+            },
+            {
+              "name": "event_id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "context_order",
+      "columns": [
+        {
+          "name": "target_kind",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "target_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 2
+        },
+        {
+          "name": "target_space",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "entry_kind",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 3
+        },
+        {
+          "name": "entry_ref",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 4
+        },
+        {
+          "name": "rank",
+          "type": "integer",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": "idx_context_order_space",
+          "unique": false,
+          "columns": [
+            {
+              "name": "target_space",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": "idx_context_order_target",
+          "unique": false,
+          "columns": [
+            {
+              "name": "target_kind",
+              "descending": false
+            },
+            {
+              "name": "target_id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "target_kind",
+              "descending": false
+            },
+            {
+              "name": "target_id",
+              "descending": false
+            },
+            {
+              "name": "entry_kind",
+              "descending": false
+            },
+            {
+              "name": "entry_ref",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "context_scope_pins",
+      "columns": [
+        {
+          "name": "target_kind",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "target_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 2
+        },
+        {
+          "name": "target_space",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "note_space",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "note_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 3
+        },
+        {
+          "name": "created_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": "idx_context_scope_pins_note",
+          "unique": false,
+          "columns": [
+            {
+              "name": "note_space",
+              "descending": false
+            },
+            {
+              "name": "note_id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": "idx_context_scope_pins_space",
+          "unique": false,
+          "columns": [
+            {
+              "name": "target_space",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": "idx_context_scope_pins_target",
+          "unique": false,
+          "columns": [
+            {
+              "name": "target_kind",
+              "descending": false
+            },
+            {
+              "name": "target_id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "target_kind",
+              "descending": false
+            },
+            {
+              "name": "target_id",
+              "descending": false
+            },
+            {
+              "name": "note_id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "context_set_attachments",
+      "columns": [
+        {
+          "name": "set_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "target_kind",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 2
+        },
+        {
+          "name": "target_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 3
+        },
+        {
+          "name": "target_space",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "created_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "home_space",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": "idx_context_set_attach_home_space",
+          "unique": false,
+          "columns": [
+            {
+              "name": "home_space",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": "idx_context_set_attach_space",
+          "unique": false,
+          "columns": [
+            {
+              "name": "target_space",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": "idx_context_set_attach_target",
+          "unique": false,
+          "columns": [
+            {
+              "name": "target_kind",
+              "descending": false
+            },
+            {
+              "name": "target_id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "set_id",
+              "descending": false
+            },
+            {
+              "name": "target_kind",
+              "descending": false
+            },
+            {
+              "name": "target_id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "context_sets",
+      "columns": [
+        {
+          "name": "id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "home_space",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "name",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "items",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": "'[]'",
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "created_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": "idx_context_sets_home",
+          "unique": false,
+          "columns": [
+            {
+              "name": "home_space",
+              "descending": false
+            },
+            {
+              "name": "created_at",
+              "descending": true
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "favorites",
+      "columns": [
+        {
+          "name": "owner",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "space",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 2
+        },
+        {
+          "name": "kind",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 3
+        },
+        {
+          "name": "entity_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 4
+        },
+        {
+          "name": "created_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "rank",
+          "type": "integer",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": "idx_favorites_owner_space_order",
+          "unique": false,
+          "columns": [
+            {
+              "name": "owner",
+              "descending": false
+            },
+            {
+              "name": "space",
+              "descending": false
+            },
+            {
+              "name": "rank",
+              "descending": false
+            },
+            {
+              "name": "created_at",
+              "descending": true
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": "idx_favorites_space_entity",
+          "unique": false,
+          "columns": [
+            {
+              "name": "space",
+              "descending": false
+            },
+            {
+              "name": "kind",
+              "descending": false
+            },
+            {
+              "name": "entity_id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "owner",
+              "descending": false
+            },
+            {
+              "name": "space",
+              "descending": false
+            },
+            {
+              "name": "kind",
+              "descending": false
+            },
+            {
+              "name": "entity_id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "folders",
+      "columns": [
+        {
+          "name": "id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "space",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "path",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "slug",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "display_name",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "status",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": "'active'",
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "last_seen",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "created_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "aliases",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "type",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": "'project'",
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "path_aliases",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": "idx_folders_id_type",
+          "unique": true,
+          "columns": [
+            {
+              "name": "id",
+              "descending": false
+            },
+            {
+              "name": "type",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": "idx_folders_space_path",
+          "unique": true,
+          "columns": [
+            {
+              "name": "space",
+              "descending": false
+            },
+            {
+              "name": "path",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": "idx_folders_space_slug",
+          "unique": true,
+          "columns": [
+            {
+              "name": "space",
+              "descending": false
+            },
+            {
+              "name": "slug",
+              "descending": false
+            }
+          ],
+          "predicate": "type = 'project'"
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "import_reservation_paths",
+      "columns": [
+        {
+          "name": "reservation_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "entry_key",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 2
+        },
+        {
+          "name": "space",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "destination_path",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "target_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "expected_id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "ownership",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [
+        "ownership in ('existing-reference', 'fresh-owned')"
+      ],
+      "foreignKeys": [
+        {
+          "columns": [
+            "reservation_id"
+          ],
+          "referencedTable": "import_reservations",
+          "referencedColumns": [
+            "id"
+          ],
+          "onUpdate": "no action",
+          "onDelete": "cascade"
+        }
+      ],
+      "indexes": [
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "reservation_id",
+              "descending": false
+            },
+            {
+              "name": "entry_key",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "space",
+              "descending": false
+            },
+            {
+              "name": "destination_path",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "import_reservations",
+      "columns": [
+        {
+          "name": "id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "space",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "job_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "upload_ref",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "fence",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "status",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "created_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "updated_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [
+        "status in ('active', 'closing')"
+      ],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": "idx_import_reservations_job",
+          "unique": false,
+          "columns": [
+            {
+              "name": "job_id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "space",
+              "descending": false
+            },
+            {
+              "name": "upload_ref",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "installation_generation",
+      "columns": [
+        {
+          "name": "singleton",
+          "type": "integer",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "generation",
+          "type": "integer",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "phase",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "active_key_id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "active_hash",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "candidate_key_id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "candidate_hash",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "changed_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [
+        "(active_key_id is null and active_hash is null) or (active_key_id is not null and active_hash is not null)",
+        "(candidate_key_id is null and candidate_hash is null) or (candidate_key_id is not null and candidate_hash is not null)",
+        "generation > 0",
+        "phase <> 'active-installed' or (active_key_id is not null and candidate_key_id is null and candidate_hash is null)",
+        "phase = 'active-installed' or candidate_key_id is not null",
+        "phase in ('candidate-ready', 'publishing-active', 'active-installed')",
+        "singleton = 1"
+      ],
+      "foreignKeys": [],
+      "indexes": []
+    },
+    {
+      "name": "jobs",
+      "columns": [
+        {
+          "name": "id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "space",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "kind",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "status",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": "'pending'",
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "principal",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "params",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "progress_done",
+          "type": "integer",
+          "notNull": true,
+          "defaultValue": "0",
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "progress_total",
+          "type": "integer",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "phase",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "attempts",
+          "type": "integer",
+          "notNull": true,
+          "defaultValue": "0",
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "max_attempts",
+          "type": "integer",
+          "notNull": true,
+          "defaultValue": "3",
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "run_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "locked_at",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "locked_by",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "artifact_ref",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "artifact_bytes",
+          "type": "integer",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "artifact_name",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "result",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "error",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "created_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "updated_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "started_at",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "completed_at",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "expires_at",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": "idx_jobs_claim",
+          "unique": false,
+          "columns": [
+            {
+              "name": "status",
+              "descending": false
+            },
+            {
+              "name": "run_at",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": "idx_jobs_expires",
+          "unique": false,
+          "columns": [
+            {
+              "name": "expires_at",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": "idx_jobs_space",
+          "unique": false,
+          "columns": [
+            {
+              "name": "space",
+              "descending": false
+            },
+            {
+              "name": "created_at",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "mcp_bookmarks",
+      "columns": [
+        {
+          "name": "principal_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "space",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 2
+        },
+        {
+          "name": "last_rev",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "updated_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "principal_id",
+              "descending": false
+            },
+            {
+              "name": "space",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "mcp_dedup",
+      "columns": [
+        {
+          "name": "scope",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "key",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 2
+        },
+        {
+          "name": "note_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "version_token",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "created_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": "idx_mcp_dedup_created",
+          "unique": false,
+          "columns": [
+            {
+              "name": "created_at",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "scope",
+              "descending": false
+            },
+            {
+              "name": "key",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "mcp_delta_owner_cursors",
+      "columns": [
+        {
+          "name": "owner",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "project",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 2
+        },
+        {
+          "name": "project_type",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": "'project'",
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "last_rev",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "updated_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [
+        "project_type = 'project'"
+      ],
+      "foreignKeys": [
+        {
+          "columns": [
+            "project",
+            "project_type"
+          ],
+          "referencedTable": "folders",
+          "referencedColumns": [
+            "id",
+            "type"
+          ],
+          "onUpdate": "no action",
+          "onDelete": "cascade"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_mcp_delta_owner_project",
+          "unique": false,
+          "columns": [
+            {
+              "name": "project",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "owner",
+              "descending": false
+            },
+            {
+              "name": "project",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "mcp_delta_session_cursors",
+      "columns": [
+        {
+          "name": "session_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "project",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 2
+        },
+        {
+          "name": "project_type",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": "'project'",
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "last_rev",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "updated_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [
+        "project_type = 'project'"
+      ],
+      "foreignKeys": [
+        {
+          "columns": [
+            "project",
+            "project_type"
+          ],
+          "referencedTable": "folders",
+          "referencedColumns": [
+            "id",
+            "type"
+          ],
+          "onUpdate": "no action",
+          "onDelete": "cascade"
+        },
+        {
+          "columns": [
+            "session_id"
+          ],
+          "referencedTable": "agent_sessions",
+          "referencedColumns": [
+            "id"
+          ],
+          "onUpdate": "no action",
+          "onDelete": "cascade"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_mcp_delta_session_project",
+          "unique": false,
+          "columns": [
+            {
+              "name": "project",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "session_id",
+              "descending": false
+            },
+            {
+              "name": "project",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "meta_migrations",
+      "columns": [
+        {
+          "name": "version",
+          "type": "integer",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "name",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "checksum",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "applied_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "name",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "note_identity",
+      "columns": [
+        {
+          "name": "id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "file_path",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "created_at",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "materialized",
+          "type": "integer",
+          "notNull": true,
+          "defaultValue": "0",
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "deleted_at",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "space",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": "''",
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "address_revision",
+          "type": "integer",
+          "notNull": true,
+          "defaultValue": "1",
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "legacy_name_aliases",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": "'[]'",
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "settlement_successor_id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [
+        "address_revision > 0"
+      ],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": "idx_note_identity_live_space_path",
+          "unique": true,
+          "columns": [
+            {
+              "name": "space",
+              "descending": false
+            },
+            {
+              "name": "file_path",
+              "descending": false
+            }
+          ],
+          "predicate": "deleted_at is null"
+        },
+        {
+          "name": "idx_note_identity_space_path",
+          "unique": false,
+          "columns": [
+            {
+              "name": "space",
+              "descending": false
+            },
+            {
+              "name": "file_path",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "note_owner_proofs",
+      "columns": [
+        {
+          "name": "note_id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "space",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "address_revision",
+          "type": "integer",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "proof_revision",
+          "type": "integer",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "source_hash",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "proof_json",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "receipt_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "updated_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [
+        "address_revision > 0",
+        "proof_revision > 0"
+      ],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": "idx_note_owner_proofs_space",
+          "unique": false,
+          "columns": [
+            {
+              "name": "space",
+              "descending": false
+            },
+            {
+              "name": "note_id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "note_id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "space",
+              "descending": false
+            },
+            {
+              "name": "receipt_id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "note_revisions",
+      "columns": [
+        {
+          "name": "id",
+          "type": "integer",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "note_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "space",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "base_rev",
+          "type": "integer",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "their_rev",
+          "type": "integer",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "source_rev",
+          "type": "integer",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "kind",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "principal",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "content_hash",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "title",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "tags",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": "'[]'",
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "created_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "chars_added",
+          "type": "integer",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "chars_removed",
+          "type": "integer",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "class",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "slug",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "agent_owner",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "agent_name",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "session_id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "session_name",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "session_attach",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "integrity",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": "'trusted'",
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "entry_role",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": "'change'",
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "snapshot_format",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "document_format",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "semantic_fingerprint",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "restore_safety",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [
+        "document_format is null or document_format in ('markdown-v2', 'skill-markdown-v1', 'opaque-v1')",
+        "entry_role in ('origin', 'baseline', 'change')",
+        "restore_safety in ('safe', 'blocked', 'unknown')",
+        "session_attach is null or session_attach in ('declared', 'inferred')",
+        "snapshot_format is null or snapshot_format = 'markdown-v1'"
+      ],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": "idx_note_revisions_agent_created",
+          "unique": false,
+          "columns": [
+            {
+              "name": "agent_owner",
+              "descending": false
+            },
+            {
+              "name": "created_at",
+              "descending": true
+            },
+            {
+              "name": "id",
+              "descending": true
+            }
+          ],
+          "predicate": "agent_owner is not null"
+        },
+        {
+          "name": "idx_note_revisions_agent_outside_created",
+          "unique": false,
+          "columns": [
+            {
+              "name": "agent_owner",
+              "descending": false
+            },
+            {
+              "name": "created_at",
+              "descending": true
+            },
+            {
+              "name": "id",
+              "descending": true
+            }
+          ],
+          "predicate": "session_id is null and agent_owner is not null"
+        },
+        {
+          "name": "idx_note_revisions_agent_owner_name_created",
+          "unique": false,
+          "columns": [
+            {
+              "name": "agent_owner",
+              "descending": false
+            },
+            {
+              "name": "agent_name",
+              "descending": false
+            },
+            {
+              "name": "created_at",
+              "descending": true
+            },
+            {
+              "name": "id",
+              "descending": true
+            }
+          ],
+          "predicate": "integrity = 'trusted'"
+        },
+        {
+          "name": "idx_note_revisions_agent_session_created",
+          "unique": false,
+          "columns": [
+            {
+              "name": "agent_owner",
+              "descending": false
+            },
+            {
+              "name": "session_id",
+              "descending": false
+            },
+            {
+              "name": "created_at",
+              "descending": true
+            },
+            {
+              "name": "id",
+              "descending": true
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": "idx_note_revisions_base_rev",
+          "unique": false,
+          "columns": [
+            {
+              "name": "base_rev",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": "idx_note_revisions_note",
+          "unique": false,
+          "columns": [
+            {
+              "name": "note_id",
+              "descending": false
+            },
+            {
+              "name": "id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": "idx_note_revisions_source_rev",
+          "unique": false,
+          "columns": [
+            {
+              "name": "source_rev",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": "idx_note_revisions_space_created",
+          "unique": false,
+          "columns": [
+            {
+              "name": "space",
+              "descending": false
+            },
+            {
+              "name": "created_at",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": "idx_note_revisions_space_id",
+          "unique": false,
+          "columns": [
+            {
+              "name": "space",
+              "descending": false
+            },
+            {
+              "name": "id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": "idx_note_revisions_space_note",
+          "unique": false,
+          "columns": [
+            {
+              "name": "space",
+              "descending": false
+            },
+            {
+              "name": "note_id",
+              "descending": false
+            },
+            {
+              "name": "id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": "idx_note_revisions_their_rev",
+          "unique": false,
+          "columns": [
+            {
+              "name": "their_rev",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "oauth_access_tokens",
+      "columns": [
+        {
+          "name": "id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "token_hash",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "username",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "client_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "scope",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "expires_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "refresh_id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "revoked_at",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "created_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "last_used_at",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "spaces",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": "idx_oauth_access_user",
+          "unique": false,
+          "columns": [
+            {
+              "name": "username",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "oauth_auth_codes",
+      "columns": [
+        {
+          "name": "code_hash",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "client_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "username",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "redirect_uri",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "scope",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "code_challenge",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "code_challenge_method",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "expires_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "used_at",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "created_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "spaces",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "code_hash",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "oauth_clients",
+      "columns": [
+        {
+          "name": "client_id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "kind",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "redirect_uris",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "client_name",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "created_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "last_seen",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "activated_at",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": "idx_oauth_clients_pending",
+          "unique": false,
+          "columns": [
+            {
+              "name": "created_at",
+              "descending": false
+            }
+          ],
+          "predicate": "activated_at is null"
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "client_id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "oauth_refresh_tokens",
+      "columns": [
+        {
+          "name": "id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "token_hash",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "username",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "client_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "scope",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "expires_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "rotated_to",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "revoked_at",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "created_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "spaces",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": "idx_oauth_refresh_user",
+          "unique": false,
+          "columns": [
+            {
+              "name": "username",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "one_time_tokens",
+      "columns": [
+        {
+          "name": "id_hash",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "username",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "purpose",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "expires_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "used_at",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "created_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": "idx_one_time_user",
+          "unique": false,
+          "columns": [
+            {
+              "name": "username",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "id_hash",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "owner_proof_receipts",
+      "columns": [
+        {
+          "name": "space",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "receipt_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 2
+        },
+        {
+          "name": "note_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "address_revision",
+          "type": "integer",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "proof_revision",
+          "type": "integer",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "source_hash",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "proof_json",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "updated_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": "idx_owner_proof_receipts_note",
+          "unique": false,
+          "columns": [
+            {
+              "name": "space",
+              "descending": false
+            },
+            {
+              "name": "note_id",
+              "descending": false
+            },
+            {
+              "name": "proof_revision",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "space",
+              "descending": false
+            },
+            {
+              "name": "receipt_id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "pats",
+      "columns": [
+        {
+          "name": "id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "username",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "name",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "secret_hash",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "scope",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "spaces",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "expires_at",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "last_used_at",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "revoked_at",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "created_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": "idx_pats_user",
+          "unique": false,
+          "columns": [
+            {
+              "name": "username",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "restore_operation_notes",
+      "columns": [
+        {
+          "name": "operation_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "space",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "note_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 2
+        }
+      ],
+      "checks": [],
+      "foreignKeys": [
+        {
+          "columns": [
+            "operation_id"
+          ],
+          "referencedTable": "restore_operations",
+          "referencedColumns": [
+            "id"
+          ],
+          "onUpdate": "no action",
+          "onDelete": "cascade"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_restore_operation_notes_note",
+          "unique": false,
+          "columns": [
+            {
+              "name": "space",
+              "descending": false
+            },
+            {
+              "name": "note_id",
+              "descending": false
+            },
+            {
+              "name": "operation_id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "operation_id",
+              "descending": false
+            },
+            {
+              "name": "note_id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "restore_operations",
+      "columns": [
+        {
+          "name": "id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "space",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "note_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "endpoint",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "actor_digest",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "idempotency_digest",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "request_fingerprint",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "stage_binding",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "phase",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "source_revision_id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "expected_head_revision_id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "target_path",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "prepared_evidence",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "physical_receipt",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "terminal_result",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "failure_code",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "created_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "updated_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [
+        "phase in ('staged', 'prepared', 'physical-published', 'metadata-committed', 'succeeded', 'rejected', 'failed-recoverable')"
+      ],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": "idx_restore_operations_recovery",
+          "unique": false,
+          "columns": [
+            {
+              "name": "space",
+              "descending": false
+            },
+            {
+              "name": "phase",
+              "descending": false
+            },
+            {
+              "name": "created_at",
+              "descending": false
+            },
+            {
+              "name": "id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "actor_digest",
+              "descending": false
+            },
+            {
+              "name": "endpoint",
+              "descending": false
+            },
+            {
+              "name": "idempotency_digest",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "revision_blobs",
+      "columns": [
+        {
+          "name": "hash",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "content",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "hash",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "revision_heads",
+      "columns": [
+        {
+          "name": "space",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "note_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 2
+        },
+        {
+          "name": "revision_id",
+          "type": "integer",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "semantic_fingerprint",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "lifecycle",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [
+        "lifecycle in ('live', 'deleted')"
+      ],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": "idx_revision_heads_space",
+          "unique": false,
+          "columns": [
+            {
+              "name": "space",
+              "descending": false
+            },
+            {
+              "name": "revision_id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "revision_id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "space",
+              "descending": false
+            },
+            {
+              "name": "note_id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "revision_purge_fences",
+      "columns": [
+        {
+          "name": "kind",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "entity_id",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 2
+        },
+        {
+          "name": "space",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 3
+        }
+      ],
+      "checks": [
+        "kind in ('note', 'space')"
+      ],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "kind",
+              "descending": false
+            },
+            {
+              "name": "entity_id",
+              "descending": false
+            },
+            {
+              "name": "space",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "sessions",
+      "columns": [
+        {
+          "name": "id_hash",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "username",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "created_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "last_used_at",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "expires_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": "idx_sessions_user",
+          "unique": false,
+          "columns": [
+            {
+              "name": "username",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "id_hash",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "space_lifecycle",
+      "columns": [
+        {
+          "name": "space",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "phase",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "generation",
+          "type": "integer",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "cleanup_manifest",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "changed_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "changed_by",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [
+        "generation > 0",
+        "phase in ('active', 'closing', 'archived', 'purge-intent', 'metadata-cleaned', 'physical-cleaned', 'purged')"
+      ],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "space",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "space_members",
+      "columns": [
+        {
+          "name": "space",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "username",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 2
+        },
+        {
+          "name": "role",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "created_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": "idx_space_members_user",
+          "unique": false,
+          "columns": [
+            {
+              "name": "username",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "space",
+              "descending": false
+            },
+            {
+              "name": "username",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "spaces",
+      "columns": [
+        {
+          "name": "id",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "slug",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "notes_dir",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "display_name",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "aliases",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "created_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "archived_at",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "archived_by",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "id",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        },
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "slug",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    },
+    {
+      "name": "users",
+      "columns": [
+        {
+          "name": "username",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 1
+        },
+        {
+          "name": "display_name",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "password_hash",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "admin",
+          "type": "integer",
+          "notNull": true,
+          "defaultValue": "0",
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "disabled_at",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "created_at",
+          "type": "text",
+          "notNull": true,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        },
+        {
+          "name": "personal_space",
+          "type": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKeyPosition": 0
+        }
+      ],
+      "checks": [],
+      "foreignKeys": [],
+      "indexes": [
+        {
+          "name": null,
+          "unique": true,
+          "columns": [
+            {
+              "name": "username",
+              "descending": false
+            }
+          ],
+          "predicate": null
+        }
+      ]
+    }
+  ]
+}

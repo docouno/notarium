@@ -2110,9 +2110,7 @@ export const createRolesService = ({
         return moved?.source === 'owned' &&
           moved.kind === locator.kind &&
           moved.packageId === locator.packageId &&
-          moved.location.spaceId === locator.location.spaceId &&
-          recorded.registryNoteId &&
-          recorded.manifestNoteId
+          moved.location.spaceId === locator.location.spaceId
           ? {
               state: 'moved',
               locator: moved,

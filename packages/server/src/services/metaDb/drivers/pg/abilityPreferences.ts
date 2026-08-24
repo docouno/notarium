@@ -12,7 +12,7 @@ import { lockAbilityPreferencePackages } from './lockOrder'
 const locatorKey = (locator: AbilityPreferenceLocator): string => serializeAbilityLocator(locator)
 
 /** The address these keys stand at NOW. A placement move rewrites the locator column
- *  of this table and records the hop it made (`ability_placement_trail`, 0016), so an
+ *  of this table and records the hop in `ability_placement_trail`, so an
  *  address computed before that commit is not wrong — it is one hop behind, and the
  *  hop is written down. Resolving it is what makes an owner's choice survive a move it
  *  raced: the write lands where the package is, and a read holding the old spelling

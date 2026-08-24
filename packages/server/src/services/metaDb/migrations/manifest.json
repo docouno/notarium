@@ -10,143 +10,31 @@
     },
     {
       "version": 1,
-      "name": "agent_sessions",
-      "checksum": "sha256:0160a883e4a4e02183809ffc424fbf128c4558861022340b1debb641c498c8f0",
-      "sqlite": "sqlite/0001_agent_sessions.sql",
-      "postgres": "postgres/0001_agent_sessions.sql"
+      "name": "revision_history",
+      "checksum": "sha256:2c136dd95ba28384bf224b4bf753124bd195be022bb9b554f923232222dd9198",
+      "sqlite": "sqlite/0001_revision_history.sql",
+      "postgres": "postgres/0001_revision_history.sql"
     },
     {
       "version": 2,
-      "name": "agent_session_role",
-      "checksum": "sha256:f543adeacab17bad0aefeaa8d876e3432d762d5fc54020c67478c2c499976bb6",
-      "sqlite": "sqlite/0002_agent_session_role.sql",
-      "postgres": "postgres/0002_agent_session_role.sql"
+      "name": "agent_state",
+      "checksum": "sha256:2d1f6f9fc0bf69c048000b7251153b20778230692409b9841e05f37b45210fc4",
+      "sqlite": "sqlite/0002_agent_state.sql",
+      "postgres": "postgres/0002_agent_state.sql"
     },
     {
       "version": 3,
-      "name": "revision_integrity",
-      "checksum": "sha256:e3633d18d00181fff489615db64719bcc297bd0e02e8eab092b0d58da2eefdd0",
-      "sqlite": "sqlite/0003_revision_integrity.sql",
-      "postgres": "postgres/0003_revision_integrity.sql"
+      "name": "causal_identity",
+      "checksum": "sha256:4382c18dd9924e9f154b0509b4fa57b1ff3d8e1a2cc108faf5e3a88f36d3ac15",
+      "sqlite": "sqlite/0003_causal_identity.sql",
+      "postgres": "postgres/0003_causal_identity.sql"
     },
     {
       "version": 4,
-      "name": "scoped_purge_fences",
-      "checksum": "sha256:598342c63f8a9bf97a8bc58f98cc405f3296e303083a8357a80b99a913bbfc0f",
-      "sqlite": "sqlite/0004_scoped_purge_fences.sql",
-      "postgres": "postgres/0004_scoped_purge_fences.sql"
-    },
-    {
-      "version": 5,
-      "name": "revision_entry_role",
-      "checksum": "sha256:b9daaf10a822910e8033f547cfc0f0ecc0bc040478aa0d741f9be2fe96c5ad6f",
-      "sqlite": "sqlite/0005_revision_entry_role.sql",
-      "postgres": "postgres/0005_revision_entry_role.sql"
-    },
-    {
-      "version": 6,
-      "name": "revision_state",
-      "checksum": "sha256:6a8a6674f919e2cfd9e5a977dddb0b72fab86a1fe27565e6d3be759de1e31d0e",
-      "sqlite": "sqlite/0006_revision_state.sql",
-      "postgres": "postgres/0006_revision_state.sql"
-    },
-    {
-      "version": 7,
-      "name": "revision_purge_cas",
-      "checksum": "sha256:bd513b21af35ec545b43aff07f2ed3f8026a0b909e7fac2e157ffb99be19b5ea",
-      "sqlite": "sqlite/0007_revision_purge_cas.sql",
-      "postgres": "postgres/0007_revision_purge_cas.sql"
-    },
-    {
-      "version": 8,
-      "name": "causal_metadata",
-      "checksum": "sha256:8106ed1cf62c81345cad5e9961e21451fd4c121717d95b2af9aeb087172cbba9",
-      "sqlite": "sqlite/0008_causal_metadata.sql",
-      "postgres": "postgres/0008_causal_metadata.sql"
-    },
-    {
-      "version": 9,
-      "name": "agent_activity",
-      "checksum": "sha256:217b95da88599baa7ad42fc4445dcda37066f0ac92853e378b2a09509e6356e7",
-      "sqlite": "sqlite/0009_agent_activity.sql",
-      "postgres": "postgres/0009_agent_activity.sql"
-    },
-    {
-      "version": 10,
       "name": "import_reservations",
-      "checksum": "sha256:7a787a094f76b2be9278b3b3208202e40de598fcd51d08ea60c8ac16e30c54f3",
-      "sqlite": "sqlite/0010_import_reservations.sql",
-      "postgres": "postgres/0010_import_reservations.sql"
-    },
-    {
-      "version": 11,
-      "name": "legacy_name_aliases",
-      "checksum": "sha256:a5cd8f6c2b60a9177bdad18b7448fe4dc857a5afd3008206ecfd42b8f6aba51f",
-      "sqlite": "sqlite/0011_legacy_name_aliases.sql",
-      "postgres": "postgres/0011_legacy_name_aliases.sql"
-    },
-    {
-      "version": 12,
-      "name": "identity_settlement_lineage",
-      "checksum": "sha256:bfc46f505b4178d01a83404e2658457b9ca3623fd974e5b6f5e5e0b2b4452fe5",
-      "sqlite": "sqlite/0012_identity_settlement_lineage.sql",
-      "postgres": "postgres/0012_identity_settlement_lineage.sql"
-    },
-    {
-      "version": 13,
-      "name": "agent_session_role_identity",
-      "checksum": "sha256:51e7f0001c1a1ba530a35865c852bf4a535dce43c7a5abe2b4f1335dc82c5c17",
-      "sqlite": "sqlite/0013_agent_session_role_identity.sql",
-      "postgres": "postgres/0013_agent_session_role_identity.sql"
-    },
-    {
-      "version": 14,
-      "name": "ability_availability",
-      "checksum": "sha256:ff5693b24e7f9868fe955bd649be989b2f19839e18ec8bf8fbc36145709e6b8b",
-      "sqlite": "sqlite/0014_ability_availability.sql",
-      "postgres": "postgres/0014_ability_availability.sql"
-    },
-    {
-      "version": 15,
-      "name": "ability_preferences",
-      "checksum": "sha256:9af80d73170a70b75a8cdc4c1e70d1af55ffc1addda536293e106fb818d67840",
-      "sqlite": "sqlite/0015_ability_preferences.sql",
-      "postgres": "postgres/0015_ability_preferences.sql"
-    },
-    {
-      "version": 16,
-      "name": "ability_placement_trail",
-      "checksum": "sha256:067b1558e50f3a378e8615f0485e332afc36f4817048191235e41583ea12d6f2",
-      "sqlite": "sqlite/0016_ability_placement_trail.sql",
-      "postgres": "postgres/0016_ability_placement_trail.sql"
-    },
-    {
-      "version": 17,
-      "name": "ability_create_operations",
-      "checksum": "sha256:45244473599445272a9e417d505ced6b91ab0340ea988eb5958fe05eb2a86ff6",
-      "sqlite": "sqlite/0017_ability_create_operations.sql",
-      "postgres": "postgres/0017_ability_create_operations.sql"
-    },
-    {
-      "version": 18,
-      "name": "causal_operation_lifecycle",
-      "checksum": "sha256:8cf90a602c6d4cc6f30d42967ec8ddb157ad77f7975fa9024c50d45a9dc55e3c",
-      "sqlite": "sqlite/0018_causal_operation_lifecycle.sql",
-      "postgres": "postgres/0018_causal_operation_lifecycle.sql"
-    },
-    {
-      "version": 19,
-      "name": "ability_placement_identity",
-      "checksum": "sha256:d719dce2438115db61571e0a34f0e29770778ccfd85148ddf923bd7283a8bec8",
-      "sqlite": "sqlite/0019_ability_placement_identity.sql",
-      "postgres": "postgres/0019_ability_placement_identity.sql"
-    },
-    {
-      "version": 20,
-      "name": "ability_create_success_replay",
-      "checksum": "sha256:bd746f69eae0c0fe4777f493711711c7503554f7b78cdf29c9aabd3ff1f9f119",
-      "sqlite": "sqlite/0020_ability_create_success_replay.sql",
-      "postgres": "postgres/0020_ability_create_success_replay.sql"
+      "checksum": "sha256:0833cbdb122624db71d6fc53e6d1894ed090e057b27bf66292d70c9ac90b501e",
+      "sqlite": "sqlite/0004_import_reservations.sql",
+      "postgres": "postgres/0004_import_reservations.sql"
     }
   ]
 }

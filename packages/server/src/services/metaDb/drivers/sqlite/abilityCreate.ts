@@ -1,10 +1,5 @@
 import { ABILITY_AVAILABILITY_MODE } from '@notarium/contract'
-import {
-  DOCUMENT_STATE_FORMAT,
-  LOGICAL_NOTE_STATE_FORMAT,
-  REVISION_INTEGRITY,
-  SPACE_LIFECYCLE_PHASE,
-} from '@notarium/core'
+import { REVISION_INTEGRITY, SPACE_LIFECYCLE_PHASE } from '@notarium/core'
 
 import { abilityCreateOperationOfRow, type AbilityCreateOperationRow } from '../../causalRows'
 import {
@@ -390,10 +385,10 @@ export const createAbilityCreateFacet = (ctx: SqliteDriverCtx): AbilityCreatePer
           `INSERT INTO note_revisions
              (note_id, space, base_rev, their_rev, source_rev, kind, principal,
               agent_owner, agent_name, session_id, session_name, session_attach,
-              content_hash, semantic_fingerprint, restore_safety, snapshot_format, document_format,
+              content_hash, semantic_fingerprint, restore_safety, state_format,
               title, class, slug, tags, created_at, chars_added, chars_removed,
               entry_role, integrity)
-           VALUES (?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           VALUES (?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           revision.noteId,
@@ -408,12 +403,7 @@ export const createAbilityCreateFacet = (ctx: SqliteDriverCtx): AbilityCreatePer
           revision.contentHash,
           revision.semanticFingerprint,
           revision.restoreSafety ?? null,
-          revision.stateFormat === LOGICAL_NOTE_STATE_FORMAT ? revision.stateFormat : null,
-          revision.stateFormat === DOCUMENT_STATE_FORMAT.markdown ||
-            revision.stateFormat === DOCUMENT_STATE_FORMAT.skill ||
-            revision.stateFormat === DOCUMENT_STATE_FORMAT.opaque
-            ? revision.stateFormat
-            : null,
+          revision.stateFormat ?? null,
           revision.title,
           revision.class,
           revision.slug,

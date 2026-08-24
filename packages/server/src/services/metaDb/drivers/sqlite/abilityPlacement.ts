@@ -16,8 +16,8 @@ export const createAbilityPlacementFacet = (ctx: SqliteDriverCtx): AbilityPlacem
       .get(fromLocator) as
       | {
           to_locator: string
-          registry_note_id: string | null
-          manifest_note_id: string | null
+          registry_note_id: string
+          manifest_note_id: string
         }
       | undefined
 
@@ -68,9 +68,8 @@ export const createAbilityPlacementFacet = (ctx: SqliteDriverCtx): AbilityPlacem
       // included, so it follows the address like the pointers above. Its lifecycle
       // keys (Space, registry note) are untouched by a move inside one Space. The move
       // carries no owner and rewrites the key for ALL of them at once, so it can name
-      // no prefix of the `(owner, locator)` primary key — `ability_preferences_locator`
-      // (migration 0015) is the index that keeps it from scanning every override in
-      // the installation.
+      // no prefix of the `(owner, locator)` primary key;
+      // `ability_preferences_locator` keeps that range indexed.
       db.prepare('DELETE FROM ability_preferences WHERE locator = ?').run(move.toLocator)
       db.prepare('UPDATE ability_preferences SET locator = ? WHERE locator = ?').run(
         move.toLocator,

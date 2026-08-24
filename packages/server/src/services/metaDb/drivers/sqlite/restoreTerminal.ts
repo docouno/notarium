@@ -1,7 +1,5 @@
 import {
   canonicalLegacyNameAliases,
-  DOCUMENT_STATE_FORMAT,
-  LOGICAL_NOTE_STATE_FORMAT,
   RESTORE_OPERATION_PHASE,
   RESTORE_TERMINAL_CONFLICT,
   type RestoreTerminalPersistence,
@@ -216,10 +214,10 @@ export const createRestoreTerminalFacet = (ctx: SqliteDriverCtx): RestoreTermina
           `INSERT INTO note_revisions
              (note_id, space, base_rev, their_rev, source_rev, kind, principal,
               agent_owner, agent_name, session_id, session_name, session_attach,
-              content_hash, semantic_fingerprint, restore_safety, snapshot_format, document_format,
+              content_hash, semantic_fingerprint, restore_safety, state_format,
               title, class, slug, tags, created_at, chars_added, chars_removed,
               entry_role, integrity)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           revision.noteId,
@@ -237,12 +235,7 @@ export const createRestoreTerminalFacet = (ctx: SqliteDriverCtx): RestoreTermina
           revision.contentHash,
           revision.semanticFingerprint ?? null,
           revision.restoreSafety ?? null,
-          revision.stateFormat === LOGICAL_NOTE_STATE_FORMAT ? revision.stateFormat : null,
-          revision.stateFormat === DOCUMENT_STATE_FORMAT.markdown ||
-            revision.stateFormat === DOCUMENT_STATE_FORMAT.skill ||
-            revision.stateFormat === DOCUMENT_STATE_FORMAT.opaque
-            ? revision.stateFormat
-            : null,
+          revision.stateFormat ?? null,
           revision.title,
           revision.class,
           revision.slug,

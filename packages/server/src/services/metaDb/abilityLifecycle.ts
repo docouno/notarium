@@ -1,6 +1,6 @@
 // The ONE question both ability facets ask before they write owner state: is the
-// ability this state is ABOUT still there? Availability (`0014`) keys a policy by the
-// package directory inside a home Space; preferences (`0015`) key an override by the
+// ability this state is ABOUT still there? Availability keys a policy by the package
+// directory inside a home Space; preferences key an override by the
 // owner and the canonical locator. Different tables, different owners — but one
 // lifecycle, because both die of the same two events: the registry note purged for
 // good, or the whole Space purged for good.

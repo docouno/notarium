@@ -309,13 +309,11 @@ export type OwnedRolePlacementMove = {
   manifestNoteId: string
 }
 
-/** One persisted forwarding row. Nullable identities are possible only for a row
- * written before migration 0019. It is still RECORDED and retires the source spelling,
- * but cannot prove a target identity and must fail closed. */
+/** One persisted forwarding row, bound to both identities of the moved package. */
 export type OwnedRolePlacementTrail = {
   toLocator: string
-  registryNoteId: string | null
-  manifestNoteId: string | null
+  registryNoteId: string
+  manifestNoteId: string
 }
 
 /** Placement is part of an owned Role's ADDRESS: the context target encodes the
@@ -1492,7 +1490,7 @@ export type MetaDb = {
   abilityPlacement: AbilityPlacementPersistence
   oauth: OAuthPersistence
   jobs: JobsPersistence
-  /** Destination claims of a running import (#302). */
+  /** Destination claims of a running import. */
   importReservations: ImportReservationsPersistence
   /** Owner-scoped/cross-space, so NOT swept by purgeSpace (like oauth). */
   retrievalLog: RetrievalLogPersistence
@@ -1510,7 +1508,7 @@ export type MetaDb = {
   ): Promise<GrantMemberToActiveSpaceResult>
   /** Erase one space's rows across every facet in a single transaction (journal with
    *  CAS-blob GC, identity, folders/projects, favorites, sets, pins, order, memberships,
-   *  delta cursors and inert legacy bookmarks) + scrub its id from every `pats.spaces`
+   *  delta cursors) + scrub its id from every `pats.spaces`
    *  (an emptied PAT stays `[]` =
    *  no access, never widened — fail-closed). On-disk artefacts are removed by the
    *  composition root, not here (this layer owns no filesystem). Irreversible. */

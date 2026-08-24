@@ -11,7 +11,7 @@ import type { SqliteDriverCtx } from './context'
 const locatorKey = (locator: AbilityPreferenceLocator): string => serializeAbilityLocator(locator)
 
 /** The address these keys stand at NOW — the twin of the PostgreSQL facet's lookup,
- *  reading the same trail (`ability_placement_trail`, 0016) for the same reason: a
+ *  reading the same `ability_placement_trail` for the same reason: a
  *  placement move rewrites the locator this table is keyed by, and an override written
  *  at the address the package has just left is a choice nothing will ever read. One
  *  writer here means no advisory is needed to make the answer hold — the move cannot be

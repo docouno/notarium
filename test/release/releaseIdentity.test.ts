@@ -8,7 +8,9 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  bumpProductVersion,
   changelogEntryFor,
+  compareProductVersions,
   compareVersions,
   dirtyPathsFrom,
   firstFreePrerelease,
@@ -18,6 +20,7 @@ import {
   imageVersionFromInspect,
   isPublicSourceUrl,
   latestMoveDecision,
+  parseProductVersion,
   prereleaseBaseVersion,
   publicSourceUrl,
   publishedTagCommitFrom,
@@ -47,6 +50,36 @@ const releasable = (overrides: Record<string, unknown> = {}) => ({
 })
 
 describe('release gate', () => {
+  describe('product versions', () => {
+    it('parses canonical safe x.y.z values', () => {
+      expect(parseProductVersion('0.1.0')).toEqual({ major: 0, minor: 1, patch: 0 })
+      expect(parseProductVersion('12.34.56')).toEqual({ major: 12, minor: 34, patch: 56 })
+    })
+
+    it.each([
+      '01.2.3',
+      '1.02.3',
+      '1.2.03',
+      '-1.2.3',
+      '1.2.3-rc.1',
+      '1.2.3+build',
+      '9007199254740992.0.0',
+      '0.9007199254740992.0',
+      '0.0.9007199254740992',
+    ])('rejects %s', (version) => {
+      expect(parseProductVersion(version)).toBeNull()
+    })
+
+    it('compares and bumps through the same parsed representation', () => {
+      expect(compareProductVersions('0.2.0', '0.1.9')).toBe(1)
+      expect(compareProductVersions('0.2.0', '0.2.0')).toBe(0)
+      expect(bumpProductVersion('0.1.9', 'patch')).toBe('0.1.10')
+      expect(bumpProductVersion('0.1.9', 'minor')).toBe('0.2.0')
+      expect(bumpProductVersion('0.1.9', 'major')).toBe('1.0.0')
+      expect(bumpProductVersion('9007199254740991.0.0', 'major')).toBeNull()
+    })
+  })
+
   describe('a releasable tree', () => {
     it('passes when every fact lines up', () => {
       expect(releaseBlockers(releasable())).toEqual([])
@@ -96,6 +129,15 @@ describe('release gate', () => {
   describe('refusals', () => {
     it('refuses a version that is not a clean x.y.z', () => {
       expect(releaseBlockers(releasable({ version: '0.1.0-rc.1' })).join()).toMatch(
+        /not a clean x\.y\.z/,
+      )
+    })
+
+    it('refuses non-canonical and unsafe product components', () => {
+      expect(releaseBlockers(releasable({ version: '00.1.0' })).join()).toMatch(
+        /not a clean x\.y\.z/,
+      )
+      expect(releaseBlockers(releasable({ version: '9007199254740992.0.0' })).join()).toMatch(
         /not a clean x\.y\.z/,
       )
     })

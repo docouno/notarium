@@ -302,52 +302,6 @@ export class SqliteMetaDb implements MetaDb {
       db.prepare('DELETE FROM restore_operations WHERE space = ?').run(spaceId)
       db.prepare('DELETE FROM ability_create_operations WHERE space = ?').run(spaceId)
       db.prepare('DELETE FROM causal_outbox WHERE space = ?').run(spaceId)
-      // Legacy rows may carry a space/project id, current slug, or retired space
-      // alias. Ids are authoritative; resolve textual history only when all live
-      // namespaces identify exactly one project, so purge cannot steal an
-      // ambiguous bookmark from a surviving space.
-      db.prepare(
-        `WITH candidates AS (
-           SELECT bookmarks.space AS legacy_key, folders.id AS project
-             FROM mcp_bookmarks AS bookmarks
-             JOIN folders ON folders.id = bookmarks.space AND folders.type = 'project'
-           UNION
-           SELECT bookmarks.space AS legacy_key, folders.id AS project
-             FROM mcp_bookmarks AS bookmarks
-             JOIN folders
-               ON folders.space = bookmarks.space
-              AND folders.path = ''
-              AND folders.type = 'project'
-           UNION
-           SELECT bookmarks.space AS legacy_key, folders.id AS project
-             FROM mcp_bookmarks AS bookmarks
-             JOIN spaces
-               ON spaces.slug = bookmarks.space
-               OR EXISTS (
-                 SELECT 1 FROM json_each(COALESCE(spaces.aliases, '[]'))
-                  WHERE value = bookmarks.space
-               )
-             JOIN folders
-               ON folders.space = spaces.id
-              AND folders.path = ''
-              AND folders.type = 'project'
-         ), uniquely_resolved AS (
-           SELECT legacy_key, MIN(project) AS project
-             FROM candidates
-            GROUP BY legacy_key
-           HAVING COUNT(DISTINCT project) = 1
-         )
-         DELETE FROM mcp_bookmarks
-          WHERE space = ?
-             OR space IN (SELECT id FROM folders WHERE space = ? AND type = 'project')
-             OR space IN (
-               SELECT legacy_key
-                 FROM uniquely_resolved
-                WHERE project IN (
-                  SELECT id FROM folders WHERE space = ? AND type = 'project'
-                )
-             )`,
-      ).run(spaceId, spaceId, spaceId)
       // The type-aware project FK cascades both cursor tables from this parent
       // delete. Keeping cleanup parent-first matches concurrent session advance.
       db.prepare('DELETE FROM ability_project_bindings WHERE home_space = ?').run(spaceId)

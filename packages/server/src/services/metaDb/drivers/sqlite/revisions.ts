@@ -39,8 +39,7 @@ type RevisionRow = {
   content_hash: string | null
   semantic_fingerprint: string | null
   restore_safety: Revision['restoreSafety']
-  snapshot_format: string | null
-  document_format: string | null
+  state_format: string | null
   title: string
   class: string | null
   slug: string | null
@@ -94,7 +93,7 @@ const rawRevisionOfRow = (r: RevisionRow): Revision => ({
   contentHash: r.content_hash,
   semanticFingerprint: r.semantic_fingerprint,
   restoreSafety: r.restore_safety,
-  stateFormat: (r.document_format ?? r.snapshot_format) as Revision['stateFormat'],
+  stateFormat: r.state_format as Revision['stateFormat'],
   title: r.title,
   class: r.class ?? null,
   slug: r.slug ?? null,
@@ -198,8 +197,8 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
       const res = db
         .prepare(
           `INSERT INTO note_revisions
-               (note_id, space, base_rev, their_rev, source_rev, kind, entry_role, principal, agent_owner, agent_name, session_id, session_name, session_attach, content_hash, semantic_fingerprint, restore_safety, snapshot_format, document_format, title, class, slug, tags, created_at, chars_added, chars_removed, integrity)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+               (note_id, space, base_rev, their_rev, source_rev, kind, entry_role, principal, agent_owner, agent_name, session_id, session_name, session_attach, content_hash, semantic_fingerprint, restore_safety, state_format, title, class, slug, tags, created_at, chars_added, chars_removed, integrity)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           rev.noteId,
@@ -218,12 +217,7 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
           rev.contentHash,
           rev.semanticFingerprint ?? null,
           rev.restoreSafety ?? null,
-          rev.stateFormat === LOGICAL_NOTE_STATE_FORMAT ? rev.stateFormat : null,
-          rev.stateFormat === DOCUMENT_STATE_FORMAT.markdown ||
-            rev.stateFormat === DOCUMENT_STATE_FORMAT.skill ||
-            rev.stateFormat === DOCUMENT_STATE_FORMAT.opaque
-            ? rev.stateFormat
-            : null,
+          rev.stateFormat ?? null,
           rev.title,
           rev.class,
           rev.slug,
@@ -460,9 +454,10 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
     const qArgs = needle ? [`%${needle.replace(/[\\%_]/g, (c) => '\\' + c)}%`] : []
     const restorableExpr = `CASE WHEN revisions.content_hash IS NOT NULL
       AND (
-        revisions.document_format IS NULL
+        revisions.state_format IS NULL
+        OR revisions.state_format = '${LOGICAL_NOTE_STATE_FORMAT}'
         OR (
-          revisions.document_format <> 'opaque-v1'
+          revisions.state_format <> '${DOCUMENT_STATE_FORMAT.opaque}'
           AND revisions.restore_safety = 'safe'
         )
       ) THEN 1 ELSE 0 END`
@@ -519,7 +514,8 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
              ) AS revisions
             WHERE rn = 1 AND kind = 'delete'
               AND revisions.content_hash IS NOT NULL
-              AND revisions.document_format IS NULL${qFilter}${availabilityFilter}`,
+              AND (revisions.state_format IS NULL
+                   OR revisions.state_format = '${LOGICAL_NOTE_STATE_FORMAT}')${qFilter}${availabilityFilter}`,
         )
         .get(space, ...exArgs, ...qArgs) as { n: number }
     ).n
@@ -570,8 +566,8 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
       // Owner state of a package whose registry note is gone for good. The policy is
       // keyed by the package DIRECTORY, so the note that ends it is a SECOND key —
       // the directory is named by the id its manifest declared, and claim arbitration
-      // can leave the note carrying a different one, which is why migration 0015 gave
-      // the preference row both keys and 0014 gives the policy row both too. A row
+      // can leave the note carrying a different one, which is why the preference
+      // and policy rows both carry the registry identity. A row
       // whose writer did not know the note id keeps the pre-arbitration answer, and
       // only such a row: matching the package id for a row that HAS the key would
       // forget a live policy whose directory happens to be named like some other
