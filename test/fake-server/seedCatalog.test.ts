@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { AbilityLocator } from '@notarium/contract'
-import { encodeAbilityLocator } from '@notarium/core'
+import { encodeAbilityLocator, encodeWikilinkIdentity } from '@notarium/core'
 import { deterministicNoteId } from '@notarium/engine-memory'
 
 import { buildCaseWorld, caseToFixture, DEFAULT_NOW } from '../cases'
@@ -403,6 +403,40 @@ describe('seed catalog → fake backend (#175)', () => {
       const history = await json(app, `/api/note/revisions?id=${index.id}`)
 
       expect(history.total).toBeGreaterThan(0)
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('wiki-web: a bracket-title identity link targets one pinned note without a ghost', async () => {
+    const world = buildCaseWorld('wiki-web', { now: DEFAULT_NOW })
+    const app = await createApp(caseToFixture(world))
+    const targetId = 'seedWikiBracket1'
+    const sourceId = deterministicNoteId('wiki/bracket-link-source.md')
+
+    try {
+      const notes = await json(app, '/api/s/main/notes?limit=200')
+      const target = (notes.notes as Array<{ id: string; title: string }>).find(
+        (note) => note.title === '[MCP] Review',
+      )
+
+      expect(target).toEqual(expect.objectContaining({ id: targetId }))
+      const source = await json(app, `/api/note?id=${sourceId}`)
+      const address = encodeWikilinkIdentity(targetId)
+
+      expect(source.content).toContain(`[[${address}|&#91;MCP&#93; Review]]`)
+      const graph = await json(app, '/api/s/main/graph')
+      expect(graph.links).toContainEqual(
+        expect.objectContaining({ source: sourceId, target: targetId }),
+      )
+      expect(graph.nodes).toContainEqual(
+        expect.objectContaining({ id: targetId, title: '[MCP] Review', ghost: false }),
+      )
+      expect(
+        graph.nodes.some(
+          (node: { ghost: boolean; target?: string }) => node.ghost && node.target === address,
+        ),
+      ).toBe(false)
     } finally {
       await app.close()
     }

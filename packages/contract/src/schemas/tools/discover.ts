@@ -9,18 +9,20 @@ import { FolderEntrySchema, ProjectHandleSchema } from './primitives'
 
 /** Tool `list_notes`: `ls` a folder — its direct notes + subfolders, paginated.
  *  canon: docs/mcp-gateway.md#tools */
-export const ListNotesInputSchema = z.object({
-  ...sessionField,
-  project: ProjectHandleSchema.optional(),
-  /** A SPACE-relative folder to list (copy a `folders` entry's `path` back); omit =
-   *  the project/personal root. */
-  path: z.string().optional(),
-  /** Keep only notes carrying this tag (frontmatter `tags`). */
-  tag: z.string().optional(),
-  limit: z.number().int().min(1).max(100).default(50),
-  /** Opaque pagination cursor from a prior response's `nextCursor`. */
-  cursor: z.string().optional(),
-})
+export const ListNotesInputSchema = z
+  .object({
+    ...sessionField,
+    project: ProjectHandleSchema.optional(),
+    /** A SPACE-relative folder to list (copy a `folders` entry's `path` back); omit =
+     *  the project/personal root. */
+    path: z.string().optional(),
+    /** Keep only notes carrying this tag (frontmatter `tags`). */
+    tag: z.string().optional(),
+    limit: z.number().int().min(1).max(100).default(50),
+    /** Opaque pagination cursor from a prior response's `nextCursor`. */
+    cursor: z.string().optional(),
+  })
+  .strict()
 
 /** One note in a directory listing: `path` is SPACE-relative without `.md`; `tags`
  *  ride only when the engine could enrich the page cheaply. */
@@ -44,13 +46,15 @@ export const ListNotesOutputSchema = z.object({
 /** Tool `recent_activity`: the most recently-changed notes (absolute freshness),
  * distinct from start_session's bound-session or unbound-owner delta.
  * canon: docs/mcp-gateway.md#tools */
-export const RecentActivityInputSchema = z.object({
-  ...sessionField,
-  /** With it, narrows to that project (best-effort label filter — the journal isn't
-   *  path-indexed, so `truncated` when the window under-fills). */
-  project: ProjectHandleSchema.optional(),
-  limit: z.number().int().min(1).max(100).default(20),
-})
+export const RecentActivityInputSchema = z
+  .object({
+    ...sessionField,
+    /** With it, narrows to that project (best-effort label filter — the journal isn't
+     *  path-indexed, so `truncated` when the window under-fills). */
+    project: ProjectHandleSchema.optional(),
+    limit: z.number().int().min(1).max(100).default(20),
+  })
+  .strict()
 
 /** One recently-changed note from the journal; `kind`/`principal` tell a human edit
  *  from an agent's. */

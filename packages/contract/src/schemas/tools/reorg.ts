@@ -18,10 +18,12 @@ const FolderLeafSchema = DurableNonEmptyScalarSchema.refine(
 /** Tool `delete_note`: move a note to the trash — the agent's one destructive tool,
  *  reversible by construction (only the USER restores/purges).
  *  canon: docs/mcp-gateway.md#tools */
-export const DeleteNoteInputSchema = z.object({
-  ...sessionField,
-  ref: RefSchema,
-})
+export const DeleteNoteInputSchema = z
+  .object({
+    ...sessionField,
+    ref: RefSchema,
+  })
+  .strict()
 
 /** Confirms what was trashed: id, title, location + `class` (memory vs knowledge). */
 export const DeleteNoteOutputSchema = z.object({
@@ -34,11 +36,13 @@ export const DeleteNoteOutputSchema = z.object({
 /** Tool `move_note`: move a note to another folder, KEEPING its name (id, URL and
  *  inbound links survive). `toFolder` is a SPACE-relative `folders` path — feed one
  *  back, never hand-built. canon: docs/architecture.md#p7 */
-export const MoveNoteInputSchema = z.object({
-  ...sessionField,
-  ref: RefSchema,
-  toFolder: DurableNonEmptyScalarSchema.or(z.literal('')),
-})
+export const MoveNoteInputSchema = z
+  .object({
+    ...sessionField,
+    ref: RefSchema,
+    toFolder: DurableNonEmptyScalarSchema.or(z.literal('')),
+  })
+  .strict()
 
 /** Confirms the move: id (unchanged) + the new location; `project` can change when
  *  the move crosses a project's folder boundary. */
@@ -50,11 +54,13 @@ export const MoveNoteOutputSchema = z.object({
 /** Tool `rename_note`: change a note's TITLE (drives the filename); id and URL
  *  survive, LINK-SAFE (the old title becomes a resolving alias). No `versionToken`
  *  needed — a concurrent edit is still caught. canon: docs/architecture.md#p7 */
-export const RenameNoteInputSchema = z.object({
-  ...sessionField,
-  ref: RefSchema,
-  title: DurableNonEmptyScalarSchema,
-})
+export const RenameNoteInputSchema = z
+  .object({
+    ...sessionField,
+    ref: RefSchema,
+    title: DurableNonEmptyScalarSchema,
+  })
+  .strict()
 
 /** Confirms the rename: id, new `title`, a fresh `versionToken` and the new location
  *  (`path` followed the title). */
@@ -69,22 +75,26 @@ export const RenameNoteOutputSchema = z.object({
  *  every note inside keeps its id, URL and inbound links. `folder`/`toFolder` are
  *  SPACE-relative `folders` paths; `project?` selects the space.
  *  canon: docs/architecture.md#p7 */
-export const MoveFolderInputSchema = z.object({
-  ...sessionField,
-  folder: DurableNonEmptyScalarSchema,
-  toFolder: DurableNonEmptyScalarSchema.or(z.literal('')),
-  project: ProjectHandleSchema.optional(),
-})
+export const MoveFolderInputSchema = z
+  .object({
+    ...sessionField,
+    folder: DurableNonEmptyScalarSchema,
+    toFolder: DurableNonEmptyScalarSchema.or(z.literal('')),
+    project: ProjectHandleSchema.optional(),
+  })
+  .strict()
 
 /** Tool `rename_folder`: rename a folder in place (contents move with it). If the
  *  folder is a marked PROJECT, its files move but the HANDLE does not (use
  *  rename_project). canon: docs/architecture.md#p7 */
-export const RenameFolderInputSchema = z.object({
-  ...sessionField,
-  folder: DurableNonEmptyScalarSchema,
-  name: FolderLeafSchema,
-  project: ProjectHandleSchema.optional(),
-})
+export const RenameFolderInputSchema = z
+  .object({
+    ...sessionField,
+    folder: DurableNonEmptyScalarSchema,
+    name: FolderLeafSchema,
+    project: ProjectHandleSchema.optional(),
+  })
+  .strict()
 
 /** Confirms a folder move/rename: the folder's new `path` + `space?`. Folders have
  *  no wire id — addressed by path. canon: docs/contract.md#wire-v2 */
@@ -96,12 +106,14 @@ export const FolderReorgOutputSchema = z.object({
 /** Tool `rename_project`: change a project's HANDLE and/or display name (at least
  *  one), LINK-SAFE (the old handle stays a resolving alias). A ROOT project's handle
  *  is its space name and can't be changed here. canon: docs/architecture.md#p7 */
-export const RenameProjectInputSchema = z.object({
-  ...sessionField,
-  project: ProjectHandleSchema,
-  slug: z.string().min(1).optional(),
-  displayName: DurableDisplayNameSchema.optional(),
-})
+export const RenameProjectInputSchema = z
+  .object({
+    ...sessionField,
+    project: ProjectHandleSchema,
+    slug: z.string().min(1).optional(),
+    displayName: DurableDisplayNameSchema.optional(),
+  })
+  .strict()
 
 /** Confirms a project rename: id (unchanged), new `handle`/`displayName`, and
  *  past-handle `aliases` that still resolve. */

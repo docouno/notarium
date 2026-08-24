@@ -4,6 +4,7 @@ import type * as tokenOffsets from './tokenOffsets'
 import { locateWikilinks as actualLocateWikilinks } from './tokenOffsets'
 import {
   decodeWikilinkIdentity,
+  encodeWikilinkAlias,
   encodeWikilinkIdentity,
   isCreatableWikilinkTarget,
   isWikilinkIdentityTarget,
@@ -11,12 +12,27 @@ import {
   parseWikilinks,
   rewriteWikilinkIdentities,
   scanWikilinksFallback,
+  wikilinkPrefix,
   WikilinkRewriteError,
 } from './wikilinks'
 
 type TokenOffsets = typeof tokenOffsets
 
 describe('parseWikilinks', () => {
+  it('encodes alias metacharacters without changing safe labels or the stable target', () => {
+    expect(encodeWikilinkAlias('Safe title / #1 | ok')).toBe('Safe title / #1 | ok')
+    expect(encodeWikilinkAlias('&[MCP] <Review>')).toBe('&amp;&#91;MCP&#93; &lt;Review&gt;')
+
+    const target = encodeWikilinkIdentity('target-id')
+    const source = `[[${target}|${encodeWikilinkAlias('[MCP] Review')}]]`
+
+    expect(parseWikilinks(source)).toEqual([target])
+    expect(wikilinkPrefix(source)).toMatchObject({
+      target,
+      label: '&#91;MCP&#93; Review',
+    })
+  })
+
   it('extracts targets in order, keeping duplicates', () => {
     expect(parseWikilinks('a [[One]] b [[Two]] c [[One]]')).toEqual(['One', 'Two', 'One'])
   })

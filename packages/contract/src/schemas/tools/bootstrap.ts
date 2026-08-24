@@ -20,7 +20,7 @@ import {
 } from './primitives'
 import { UseRoleOutputSchema } from './roles'
 
-export const WhoamiInputSchema = z.object({})
+export const WhoamiInputSchema = z.object({}).strict()
 
 /** Tool `whoami`: the principal, its action ceiling (`read | write`), reachable
  *  projects and engine capabilities. canon: docs/mcp-gateway.md#tools */
@@ -31,7 +31,7 @@ export const WhoamiOutputSchema = z.object({
   capabilities: CapabilitiesSchema,
 })
 
-export const GetMyProjectsInputSchema = z.object({})
+export const GetMyProjectsInputSchema = z.object({}).strict()
 
 /** Tool `get_my_projects`: the project workspaces you can access (personal-domain
  *  projects appear by handle too). canon: docs/note-model.md#note-ontology */
@@ -55,6 +55,7 @@ export const StartSessionInputSchema = z
         id: AgentSessionIdSchema.optional(),
         name: z.string().trim().min(1).max(160).optional(),
       })
+      .strict()
       .refine((value) => Number(value.id !== undefined) + Number(value.name !== undefined) === 1, {
         message: 'provide exactly one of id or name',
       })

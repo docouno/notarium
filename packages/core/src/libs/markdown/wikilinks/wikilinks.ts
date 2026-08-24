@@ -25,6 +25,16 @@ export const encodeWikilinkIdentity = (id: string): string => {
   return `${WIKILINK_ID_PREFIX}${encodeURIComponent(id).replace(/\./g, '%2E')}`
 }
 
+/** Encode display text that must remain inside one `[[address|alias]]`. Entities keep
+ * the source grammar unambiguous while CommonMark/browser rendering restores text. */
+export const encodeWikilinkAlias = (label: string): string =>
+  label
+    .replace(/&/g, '&amp;')
+    .replace(/\[/g, '&#91;')
+    .replace(/\]/g, '&#93;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+
 /** Recover a stable id only from a well-formed reserved envelope. `null` means either
  *  another namespace or a malformed/empty payload; callers use
  *  `isWikilinkIdentityTarget` separately to keep malformed envelopes reserved. */

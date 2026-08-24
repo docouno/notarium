@@ -9,7 +9,8 @@ import {
   SystemAbilityNameConflictError,
 } from '../abilities'
 import { NoSuchAgentSessionError } from '../agentSessions'
-import { AuthError } from '../auth'
+import { AuthError, type AuthService } from '../auth'
+import { SYSTEM_PRINCIPAL } from '../authz'
 import { abilityTargetPurgedError } from '../metaDb'
 import {
   AbilityUnavailableError,
@@ -22,7 +23,8 @@ import {
   SkillAlreadyExistsError,
   SkillTooLargeForActivationError,
 } from '../roles'
-import { toolErrorMessage } from './gateway'
+import type { SpaceManager } from '../spaces'
+import { createGateway, toolErrorMessage } from './gateway'
 
 describe('toolErrorMessage', () => {
   it('tells a memory convergence loser to repeat without asking for a caller token', () => {
@@ -181,5 +183,25 @@ describe('toolErrorMessage', () => {
     )
     expect(errorLog).toHaveBeenCalledOnce()
     errorLog.mockRestore()
+  })
+})
+
+describe('MCP gateway input boundary', () => {
+  it('rejects an unknown argument before constructing a tool context', async () => {
+    const list = vi.fn(() => {
+      throw new Error('ctxFor must not read spaces for invalid input')
+    })
+    const gateway = createGateway({
+      spaces: { list } as unknown as SpaceManager,
+      auth: {} as AuthService,
+    })
+
+    const result = await gateway.callTool(SYSTEM_PRINCIPAL, 'whoami', { __unknown__: true })
+
+    expect(result.isError).toBe(true)
+    expect(result.content).toEqual([
+      expect.objectContaining({ type: 'text', text: expect.stringMatching(/invalid arguments/i) }),
+    ])
+    expect(list).not.toHaveBeenCalled()
   })
 })

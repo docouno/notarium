@@ -1,3 +1,4 @@
+import { encodeWikilinkAlias, encodeWikilinkIdentity } from '@notarium/core'
 import { daysBefore, WorldBuilder } from '../generators'
 import type { CaseSpec } from '../types'
 
@@ -41,6 +42,27 @@ export const wikiWeb: CaseSpec = {
       'Roadmap',
       `Depends on ${link('Search v1')} (renamed) and the still-unwritten ${link('Unwritten Spec')}.`,
       39,
+    )
+
+    // Existing-target MCP links keep the physical identity as their address while
+    // entity-encoding a bracket title only for the alias grammar. Pin the target id:
+    // both fake and real seed appliers must materialize the identity authored here.
+    const bracketTargetId = 'seedWikiBracket1'
+
+    b.note({
+      space: 'main',
+      id: bracketTargetId,
+      path: 'wiki/mcp-review.md',
+      title: '[MCP] Review',
+      content: '# [MCP] Review\n\nA literal title used by an identity-backed relation.',
+      tags: ['wiki'],
+      created: daysBefore(now, 38, 10),
+      principal: 'user:sergey',
+    })
+    note(
+      'Bracket Link Source',
+      `Exact existing target: [[${encodeWikilinkIdentity(bracketTargetId)}|${encodeWikilinkAlias('[MCP] Review')}]].`,
+      37,
     )
 
     // Topic notes — each links the hubs + a sibling, some link ghosts.

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import type { z } from 'zod'
 
 import {
   AbilitySummarySchema,
@@ -42,6 +43,7 @@ import {
   SearchOutputSchema,
   StartSessionInputSchema,
   toolActions,
+  type ToolName,
   toolNames,
   tools,
   UseRoleOutputSchema,
@@ -50,6 +52,47 @@ import {
   WhoamiOutputSchema,
   WriteResultSchema,
 } from '@notarium/contract/tools'
+
+type ValidToolInputs = {
+  [Name in ToolName]: z.input<(typeof tools)[Name]['input']>
+}
+
+const validToolInputs = {
+  start_session: {},
+  list_abilities: {},
+  get_ability: { ref: 'ability-ref' },
+  create_ability: {
+    kind: 'skill',
+    name: 'research',
+    description: 'Research carefully.',
+    instructions: '# Research\n\nResearch carefully.',
+    placement: { home: 'personal' },
+  },
+  edit_ability: { ref: 'ability-ref' },
+  delete_ability: { ref: 'ability-ref' },
+  use_role: { role: 'research' },
+  use_skill: { skill: 'research' },
+  whoami: {},
+  get_my_projects: {},
+  list_notes: {},
+  recent_activity: {},
+  search: { query: 'roadmap' },
+  get_note: { ref: 'fake-a' },
+  recall: { query: 'roadmap' },
+  remember_about_user: { observation: 'A durable fact.' },
+  create_note: { project: 'team', body: 'Body.' },
+  remember_about_project: { project: 'team', observation: 'A durable fact.' },
+  edit_note: { ref: 'fake-a', operation: 'append', content: 'More.' },
+  delete_note: { ref: 'fake-a' },
+  move_note: { ref: 'fake-a', toFolder: '' },
+  rename_note: { ref: 'fake-a', title: 'Renamed' },
+  move_folder: { folder: 'docs', toFolder: '' },
+  rename_folder: { folder: 'docs', name: 'renamed' },
+  rename_project: { project: 'team', displayName: 'Team' },
+  link: { from: 'fake-a', to: 'fake-b', relation: 'relates_to' },
+  create_notes: { project: 'team', notes: [{ body: 'Body.' }] },
+  link_many: { links: [{ from: 'fake-a', to: 'fake-b', relation: 'relates_to' }] },
+} satisfies ValidToolInputs
 
 // The MCP-gateway tool contract (#21, toolset-v1-spec §4) gets the same teeth
 // the /api/* contract has: the registry resolves every tool by name, the
@@ -101,6 +144,82 @@ describe('tool registry', () => {
   it('resolves a tool by name and validates a call against it', () => {
     expect(tools.search.input.safeParse({ query: 'roadmap' }).success).toBe(true)
     expect(tools.search.input.safeParse({}).success).toBe(false) // query is required
+  })
+
+  it('accepts a typed valid sample and rejects a root sentinel for every tool', () => {
+    expect(Object.keys(validToolInputs).sort()).toEqual([...toolNames].sort())
+
+    for (const name of toolNames) {
+      const base = tools[name].input.safeParse(validToolInputs[name])
+
+      expect(base.success, `${name}: valid sample`).toBe(true)
+
+      const withSentinel = tools[name].input.safeParse({
+        ...validToolInputs[name],
+        __unknown__: true,
+      })
+
+      expect(withSentinel.success, `${name}: root sentinel`).toBe(false)
+      if (!withSentinel.success) {
+        expect(withSentinel.error.issues).toContainEqual(
+          expect.objectContaining({ code: 'unrecognized_keys', path: [] }),
+        )
+      }
+    }
+  })
+
+  it('rejects unknown keys in authored nested and batch input objects', () => {
+    const cases = [
+      StartSessionInputSchema.safeParse({ session: { name: 'Review', __unknown__: true } }),
+      CreateNoteInputSchema.safeParse({
+        project: 'team',
+        body: 'Body.',
+        links: [{ to: 'fake-b', relation: 'relates_to', __unknown__: true }],
+      }),
+      CreateNotesInputSchema.safeParse({
+        project: 'team',
+        notes: [{ body: 'Body.', __unknown__: true }],
+      }),
+      LinkManyInputSchema.safeParse({
+        links: [{ from: 'fake-a', to: 'fake-b', relation: 'relates_to', __unknown__: true }],
+      }),
+      CreateAbilityInputSchema.safeParse({
+        kind: 'skill',
+        name: 'research',
+        description: 'Research carefully.',
+        instructions: '# Research\n\nResearch carefully.',
+        placement: { home: 'personal', __unknown__: true },
+      }),
+      CreateAbilityInputSchema.safeParse({
+        kind: 'role',
+        name: 'review',
+        description: 'Review carefully.',
+        instructions: '# Review\n\nReview carefully.',
+        placement: { home: 'personal' },
+        attachments: [{ ref: 'ability-ref', __unknown__: true }],
+      }),
+      EditAbilityInputSchema.safeParse({
+        ref: 'ability-ref',
+        home: { home: 'space', __unknown__: true },
+      }),
+      CreateAbilityInputSchema.safeParse({
+        kind: 'skill',
+        name: 'research',
+        description: 'Research carefully.',
+        instructions: '# Research\n\nResearch carefully.',
+        placement: { home: 'space', space: 'team' },
+        availability: { mode: 'all-projects', __unknown__: true },
+      }),
+    ]
+
+    for (const result of cases) {
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        expect(result.error.issues).toContainEqual(
+          expect.objectContaining({ code: 'unrecognized_keys' }),
+        )
+      }
+    }
   })
 
   it('maps every tool to exactly one #10 action — the scope-filter ceiling', () => {
@@ -435,6 +554,20 @@ describe('input defaults (session-bootstrap §4, toolset-v1-spec §3)', () => {
     expect(ListAbilitiesInputSchema.safeParse({ cursor: 'short' }).success).toBe(false)
     expect(ListAbilitiesInputSchema.safeParse({ cursor: 'abcdefghijklmnop' }).success).toBe(true)
   })
+  it('closes inherited #354 IMPL-48 instead of stripping include into a default read', () => {
+    expect(ListAbilitiesInputSchema.safeParse({ view: 'runtime' }).success).toBe(true)
+    const invalid = ListAbilitiesInputSchema.safeParse({
+      view: 'runtime',
+      include: 'effective',
+    })
+
+    expect(invalid.success).toBe(false)
+    if (!invalid.success) {
+      expect(invalid.error.issues).toContainEqual(
+        expect.objectContaining({ code: 'unrecognized_keys', path: [] }),
+      )
+    }
+  })
   it('discover/recall inputs enforce their numeric bounds (#102 phase 2)', () => {
     expect(ListNotesInputSchema.safeParse({ limit: 0 }).success).toBe(false)
     expect(ListNotesInputSchema.safeParse({ limit: 101 }).success).toBe(false)
@@ -594,7 +727,7 @@ describe('input validation (poka-yoke + #50/#54 fields)', () => {
     // No versionToken in the input — rename reads the note itself (CAS internal).
     expect(
       RenameNoteInputSchema.safeParse({ ref: 'fake-a', title: 'X', versionToken: 'v1' }).success,
-    ).toBe(true) // extra ignored
+    ).toBe(false) // unknown arguments are rejected rather than silently ignored
     expect(
       RenameNoteOutputSchema.safeParse({
         noteId: 'fake-a',
@@ -651,8 +784,8 @@ describe('input validation (poka-yoke + #50/#54 fields)', () => {
         displayName: 'New Name',
       }).success,
     ).toBe(true)
-    // Both omitted is structurally valid (the "at least one" rule is enforced in the
-    // handler, not zod — the transport reads `.shape`, so a top-level refine is out).
+    // Both omitted is structurally valid: the handler owns the public, domain-specific
+    // "at least one" error.
     expect(RenameProjectInputSchema.safeParse({ project: 'team/old' }).success).toBe(true)
     expect(RenameProjectInputSchema.safeParse({ slug: 'new' }).success).toBe(false) // project required
     expect(RenameProjectInputSchema.safeParse({ project: 'team/old', slug: '' }).success).toBe(
@@ -690,8 +823,8 @@ describe('input validation (poka-yoke + #50/#54 fields)', () => {
         .success,
     ).toBe(true)
     expect(LinkInputSchema.safeParse({ from: 'a', to: 'b', relation: '' }).success).toBe(false)
-    // The exactly-one-of(to,toTitle) rule is enforced in the gateway (a guided error),
-    // not the schema — the schema keeps `.shape` for the SDK, so both/neither parse here.
+    // The exactly-one-of(to,toTitle) rule is enforced in the gateway so both/neither
+    // receive its public, guided error.
     expect(LinkInputSchema.safeParse({ from: 'a', relation: 'rel' }).success).toBe(true)
   })
   it('create_notes / link_many: batch inputs + per-item result outputs (#102 phase 4)', () => {

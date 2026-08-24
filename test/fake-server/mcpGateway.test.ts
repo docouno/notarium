@@ -16,15 +16,19 @@ import type { FastifyInstance } from 'fastify'
 import type { AddressInfo } from 'node:net'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { decodeAbilityLocator, encodeWikilinkIdentity, sha256Hex } from '@notarium/core'
+import { deterministicNoteId } from '@notarium/engine-memory'
 import type { MutationGate } from '@notarium/server'
 
 import { createApp, type Fixture } from './app.js'
+import { InMemoryProjects } from './projects.js'
 import { InMemoryRetrievalLog } from './retrievalLog.js'
 import { InMemorySessionAudit } from './sessionAudit.js'
 
 const MARKER = 'zzmarker'
 const identityLink = (id: string, title: string): string =>
   `[[${encodeWikilinkIdentity(id)}|${title}]]`
+const bracketIdentityLink = (id: string): string =>
+  `[[${encodeWikilinkIdentity(id)}|&#91;MCP&#93; Review]]`
 
 /** Three spaces: alice's personal domain, a shared project, and a space alice
  *  cannot reach. Every note carries MARKER so one query fans out across them. */
@@ -1235,6 +1239,214 @@ describe('skill class MCP note door (V7)', () => {
     expect(combined).not.toContain(ability.noteId)
     expect(combined).not.toContain('v7-hidden-marker')
   })
+
+  it('publishes a closed top-level object schema for every surfaced tool', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const r = await rpc(port, { method: 'tools/list', params: {} }, { bearer })
+    const listed = r.json.result?.tools as Array<{
+      name: string
+      inputSchema: { additionalProperties?: boolean }
+    }>
+
+    expect(listed.map(({ name }) => name).sort()).toEqual(
+      [
+        'create_ability',
+        'create_note',
+        'create_notes',
+        'delete_ability',
+        'delete_note',
+        'edit_ability',
+        'edit_note',
+        'get_ability',
+        'get_my_projects',
+        'get_note',
+        'link',
+        'link_many',
+        'list_abilities',
+        'list_notes',
+        'move_folder',
+        'move_note',
+        'recall',
+        'recent_activity',
+        'remember_about_project',
+        'remember_about_user',
+        'rename_folder',
+        'rename_note',
+        'rename_project',
+        'search',
+        'start_session',
+        'use_role',
+        'use_skill',
+        'whoami',
+      ].sort(),
+    )
+    for (const tool of listed) {
+      expect(tool.inputSchema.additionalProperties, tool.name).toBe(false)
+    }
+  })
+})
+
+describe('tool input object boundary', () => {
+  const countingGate = () => {
+    let calls = 0
+
+    return {
+      gate: {
+        enter: async () => () => {},
+        run: async <T>(task: () => Promise<T>): Promise<T> => {
+          calls += 1
+          return task()
+        },
+        checkpoint: (task: () => Promise<void>) => {
+          const settlement = task()
+
+          return Object.assign(settlement, { settlement })
+        },
+      } satisfies MutationGate,
+      calls: () => calls,
+    }
+  }
+
+  const bootWithGate = async () => {
+    await app.close()
+    const counter = countingGate()
+
+    app = await createApp(fixture(), { mutationGate: counter.gate })
+    port = await listen(app)
+
+    return { counter, bearer: await patFor('alice', 'alice-password-1', 'write') }
+  }
+
+  it('returns a tool error before callback, session/audit, dedup, revision, or note writes', async () => {
+    const { counter, bearer } = await bootWithGate()
+    const cookie = await loginCookie('alice', 'alice-password-1')
+
+    const search = await callTool(port, 'search', { query: MARKER, __unknown__: true }, bearer)
+
+    expect(isError(search)).toBe(true)
+    expect(text(search)).toMatch(/invalid arguments/i)
+    expect(counter.calls()).toBe(0)
+
+    const inherited = await callTool(
+      port,
+      'list_abilities',
+      { view: 'runtime', include: 'effective' },
+      bearer,
+    )
+
+    expect(isError(inherited)).toBe(true)
+    expect(text(inherited)).toMatch(/invalid arguments/i)
+    expect(counter.calls()).toBe(0)
+    const audit = await app.inject({
+      method: 'GET',
+      url: '/api/me/agent-audit',
+      headers: { cookie },
+    })
+    expect(audit.json()).toMatchObject({ total: 0, events: [] })
+
+    const started = await callTool(
+      port,
+      'start_session',
+      { session: { name: 'Rejected session', __unknown__: true } },
+      bearer,
+    )
+
+    expect(isError(started)).toBe(true)
+    expect(text(started)).toMatch(/invalid arguments/i)
+    expect(counter.calls()).toBe(0)
+    const sessions = await app.inject({
+      method: 'GET',
+      url: '/api/me/agent-sessions?aggregates=0',
+      headers: { cookie },
+    })
+    expect(sessions.json()).toMatchObject({ total: 0, sessions: [] })
+
+    const args = {
+      project: 'team',
+      title: 'Rejected unknown input',
+      body: 'Body.',
+      idempotencyKey: 'unknown-input-retry',
+    }
+    const rejected = await callTool(port, 'create_note', { ...args, __unknown__: true }, bearer)
+
+    expect(isError(rejected)).toBe(true)
+    expect(text(rejected)).toMatch(/invalid arguments/i)
+    expect(counter.calls()).toBe(0)
+
+    const accepted = await callTool(port, 'create_note', args, bearer)
+
+    expect(isError(accepted)).toBe(false)
+    expect(structured(accepted).outcome).toBe('created')
+  })
+
+  it('rejects unknown nested and batch-item arguments before callback', async () => {
+    const { counter, bearer } = await bootWithGate()
+    const cases: Array<[string, Record<string, unknown>]> = [
+      [
+        'create_note',
+        {
+          project: 'team',
+          body: 'Body.',
+          links: [{ to: TEAM_NOTE_ID, relation: 'relates_to', __unknown__: true }],
+        },
+      ],
+      ['create_notes', { project: 'team', notes: [{ body: 'Body.', __unknown__: true }] }],
+      [
+        'link_many',
+        {
+          links: [
+            {
+              from: TEAM_NOTE_ID,
+              to: PERSONAL_NOTE_ID,
+              relation: 'relates_to',
+              __unknown__: true,
+            },
+          ],
+        },
+      ],
+      [
+        'create_ability',
+        {
+          kind: 'skill',
+          name: 'research',
+          description: 'Research carefully.',
+          instructions: '# Research\n\nResearch carefully.',
+          placement: { home: 'personal', __unknown__: true },
+        },
+      ],
+      [
+        'create_ability',
+        {
+          kind: 'role',
+          name: 'review',
+          description: 'Review carefully.',
+          instructions: '# Review\n\nReview carefully.',
+          placement: { home: 'personal' },
+          attachments: [{ ref: 'ability-ref', __unknown__: true }],
+        },
+      ],
+      ['edit_ability', { ref: 'ability-ref', home: { home: 'space', __unknown__: true } }],
+      [
+        'create_ability',
+        {
+          kind: 'skill',
+          name: 'research',
+          description: 'Research carefully.',
+          instructions: '# Research\n\nResearch carefully.',
+          placement: { home: 'space', space: 'team' },
+          availability: { mode: 'all-projects', __unknown__: true },
+        },
+      ],
+    ]
+
+    for (const [name, args] of cases) {
+      const result = await callTool(port, name, args, bearer)
+
+      expect(isError(result)).toBe(true)
+      expect(text(result)).toMatch(/invalid arguments/i)
+    }
+    expect(counter.calls()).toBe(0)
+  })
 })
 
 describe('whoami', () => {
@@ -1791,6 +2003,285 @@ describe('mark-as-project REST (#13 I0c)', () => {
     const id = ((await mark('docs', writer, { displayName: 'Docs' })).json() as { id: string }).id
     const reader = await patFor('bob', 'bob-password-01', 'write') // bob is a READER on team
     expect((await patch(id, reader, { slug: 'guides' })).statusCode).toBe(404)
+  })
+})
+
+describe('create_note reserved project-handle path prefixes', () => {
+  const nestedFixture = (): Fixture => {
+    const base = fixture()
+
+    return {
+      ...base,
+      spaces: base.spaces.map((space) =>
+        space.slug === 'team' ? { ...space, aliases: ['old-team'] } : space,
+      ),
+      projects: [
+        { id: 'proj-team-root', space: 'team', path: '', slug: 'team', displayName: 'Team' },
+        {
+          id: 'proj-team-docs',
+          space: 'team',
+          path: 'workspace/docs',
+          slug: 'docs',
+          displayName: 'Docs',
+          aliases: ['old-docs', 'shadowed', 'shared-project'],
+        },
+        {
+          id: 'proj-team-shadowed',
+          space: 'team',
+          path: 'workspace/shadowed',
+          slug: 'shadowed',
+          displayName: 'Shadowed',
+        },
+        {
+          id: 'proj-team-peer',
+          space: 'team',
+          path: 'workspace/peer',
+          slug: 'peer',
+          displayName: 'Peer',
+          aliases: ['shared-project'],
+        },
+        {
+          id: 'proj-team-other',
+          space: 'team',
+          path: 'workspace/other',
+          slug: 'other',
+          displayName: 'Other',
+        },
+      ],
+    }
+  }
+
+  const bootNested = async (): Promise<string> => {
+    await app.close()
+    app = await createApp(nestedFixture())
+    port = await listen(app)
+
+    return patFor('alice', 'alice-password-1', 'write')
+  }
+
+  it('keeps ordinary, exact space-relative, leading-slash, sibling, and exact handle-like folders', async () => {
+    const bearer = await bootNested()
+    const cases = [
+      { title: 'Relative path', path: 'research', prefix: 'workspace/docs/research/' },
+      {
+        title: 'Space relative path',
+        path: 'workspace/docs/reference',
+        prefix: 'workspace/docs/reference/',
+      },
+      { title: 'Leading slash path', path: '/drafts', prefix: 'workspace/docs/drafts/' },
+      {
+        title: 'Prefix sibling path',
+        path: 'team/docs-extra',
+        prefix: 'workspace/docs/team/docs-extra/',
+      },
+      {
+        title: 'Exact handle-like folder',
+        path: 'workspace/docs/team/docs/nested',
+        prefix: 'workspace/docs/team/docs/nested/',
+      },
+    ]
+
+    for (const entry of cases) {
+      const result = await callTool(
+        port,
+        'create_note',
+        { project: 'docs', title: entry.title, body: 'Body.', path: entry.path },
+        bearer,
+      )
+
+      expect(isError(result), entry.title).toBe(false)
+      expect(String(structured(result).path), entry.title).toMatch(entry.prefix)
+    }
+  })
+
+  it('rejects current and resolvable alias prefixes for the selected non-root project', async () => {
+    const bearer = await bootNested()
+    const cases = [
+      { project: 'docs', path: 'team/docs/current', prefix: 'team/docs' },
+      { project: 'team/docs', path: 'team/old-docs/project-alias', prefix: 'team/old-docs' },
+      { project: 'team/docs', path: 'old-team/docs/space-alias', prefix: 'old-team/docs' },
+      {
+        project: 'team/docs',
+        path: 'old-team/old-docs/both-aliases',
+        prefix: 'old-team/old-docs',
+      },
+    ]
+
+    for (const [index, entry] of cases.entries()) {
+      const result = await callTool(
+        port,
+        'create_note',
+        {
+          project: entry.project,
+          title: `Rejected prefix ${index}`,
+          body: 'Body.',
+          path: entry.path,
+        },
+        bearer,
+      )
+
+      expect(isError(result), entry.path).toBe(true)
+      expect(text(result), entry.path).toContain(`project \`${entry.project}\``)
+      expect(text(result), entry.path).toContain(`\`${entry.prefix}\``)
+      expect(text(result), entry.path).toMatch(/folder, not a project handle/i)
+    }
+  })
+
+  it('keeps shadowed, ambiguous, unknown, and different-project prefixes project-relative', async () => {
+    const bearer = await bootNested()
+    const cases = [
+      { title: 'Shadowed alias', path: 'team/shadowed/a' },
+      { title: 'Ambiguous alias', path: 'team/shared-project/b' },
+      { title: 'Unknown prefix', path: 'missing/docs/c' },
+      { title: 'Different project', path: 'team/other/d' },
+    ]
+
+    for (const entry of cases) {
+      const result = await callTool(
+        port,
+        'create_note',
+        { project: 'team/docs', title: entry.title, body: 'Body.', path: entry.path },
+        bearer,
+      )
+
+      expect(isError(result), entry.title).toBe(false)
+      expect(String(structured(result).path), entry.title).toMatch(`workspace/docs/${entry.path}/`)
+    }
+  })
+
+  it('does not classify a root project path even when its first two segments resolve the root', async () => {
+    const bearer = await bootNested()
+    const result = await callTool(
+      port,
+      'create_note',
+      { project: 'team', title: 'Root handle-like path', body: 'Body.', path: 'team/team/folder' },
+      bearer,
+    )
+
+    expect(isError(result)).toBe(false)
+    expect(String(structured(result).path)).toMatch('team/team/folder/')
+  })
+
+  it('memoizes batch prefix resolution, isolates a bad item, and does not burn idempotency', async () => {
+    const getByHandle = vi.spyOn(InMemoryProjects.prototype, 'getByHandle')
+
+    try {
+      const bearer = await bootNested()
+      const cookie = await loginCookie('alice', 'alice-password-1')
+      const badMiddle = {
+        title: 'Bad middle',
+        body: 'Body.',
+        path: 'team/docs/b',
+        idempotencyKey: 'bad-middle',
+      }
+
+      getByHandle.mockClear()
+      const batch = await callTool(
+        port,
+        'create_notes',
+        {
+          project: 'team/docs',
+          notes: [
+            { title: 'Good before', body: 'Body.', path: 'team/other/a' },
+            badMiddle,
+            { title: 'Good after', body: 'Body.', path: 'team/other/c' },
+          ],
+        },
+        bearer,
+      )
+      const results = structured(batch).results as Array<{
+        ok: boolean
+        outcome?: string
+        path?: string
+        error?: string
+      }>
+
+      expect(results.map(({ ok }) => ok)).toEqual([true, false, true])
+      expect(results[0].path).toMatch('workspace/docs/team/other/a/')
+      expect(results[1].error).toMatch(/folder, not a project handle/i)
+      expect(results[2].path).toMatch('workspace/docs/team/other/c/')
+      expect(getByHandle).toHaveBeenCalledTimes(3)
+
+      const rejectedSearch = structured(
+        await callTool(port, 'search', { query: 'Bad middle', project: 'team/docs' }, bearer),
+      ).results as Array<{ title: string }>
+      const rejectedParent = structured(
+        await callTool(
+          port,
+          'list_notes',
+          { project: 'team/docs', path: 'workspace/docs/team/docs' },
+          bearer,
+        ),
+      ) as {
+        items: Array<{ title: string }>
+        folders: Array<{ name: string }>
+      }
+      const rejectedId = deterministicNoteId('workspace/docs/team/docs/b/bad-middle.md')
+      const rejectedRevisions = await app.inject({
+        method: 'GET',
+        url: `/api/note/revisions?id=${rejectedId}`,
+        headers: { cookie },
+      })
+
+      expect(rejectedSearch.some(({ title }) => title === 'Bad middle')).toBe(false)
+      expect(rejectedParent.items.some(({ title }) => title === 'Bad middle')).toBe(false)
+      expect(rejectedParent.folders.some(({ name }) => name === 'b')).toBe(false)
+      expect(rejectedRevisions.statusCode).toBe(404)
+
+      const repeatedBatch = structured(
+        await callTool(port, 'create_notes', { project: 'team/docs', notes: [badMiddle] }, bearer),
+      ).results as Array<{ ok: boolean; outcome?: string; error?: string }>
+
+      expect(repeatedBatch).toEqual([
+        expect.objectContaining({
+          ok: false,
+          error: expect.stringMatching(/folder, not a project handle/i),
+        }),
+      ])
+
+      const repairedBatch = structured(
+        await callTool(
+          port,
+          'create_notes',
+          {
+            project: 'team/docs',
+            notes: [{ ...badMiddle, path: 'batch-retry' }],
+          },
+          bearer,
+        ),
+      ).results as Array<{ ok: boolean; outcome?: string }>
+
+      expect(repairedBatch).toEqual([expect.objectContaining({ ok: true, outcome: 'created' })])
+
+      const invalidAfterSuccess = structured(
+        await callTool(port, 'create_notes', { project: 'team/docs', notes: [badMiddle] }, bearer),
+      ).results as Array<{ ok: boolean; outcome?: string; error?: string }>
+
+      expect(invalidAfterSuccess).toEqual([
+        expect.objectContaining({
+          ok: false,
+          error: expect.stringMatching(/folder, not a project handle/i),
+        }),
+      ])
+
+      const invalid = {
+        project: 'team/docs',
+        title: 'Retry after invalid path',
+        body: 'Body.',
+        path: 'team/docs/retry',
+        idempotencyKey: 'invalid-path-retry',
+      }
+
+      expect(isError(await callTool(port, 'create_note', invalid, bearer))).toBe(true)
+      expect(isError(await callTool(port, 'create_note', invalid, bearer))).toBe(true)
+
+      const accepted = await callTool(port, 'create_note', { ...invalid, path: 'retry' }, bearer)
+
+      expect(isError(accepted)).toBe(false)
+      expect(structured(accepted).outcome).toBe('created')
+    } finally {
+      getByHandle.mockRestore()
+    }
   })
 })
 
@@ -4082,6 +4573,45 @@ describe('link (#21 stage 6)', () => {
     expect(await readContent(bearer, src.id)).toContain(identityLink(dst.id, 'A|B'))
   })
 
+  it('keeps a bracket-title target readable, exact, idempotent, and rename-safe', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const cookie = await loginCookie('alice', 'alice-password-1')
+    const src = await seed(bearer, 'Bracket Source')
+    const dst = await seed(bearer, '[MCP] Review')
+    const namesake = structured(
+      await callTool(
+        port,
+        'create_note',
+        { project: 'team', path: 'namesake', title: '[MCP] Review', body: 'Decoy.' },
+        bearer,
+      ),
+    ).noteId as string
+    const args = { from: src.id, to: dst.id, relation: 'relates_to' }
+
+    const first = await callTool(port, 'link', args, bearer)
+    const second = await callTool(port, 'link', args, bearer)
+
+    expect(isError(first)).toBe(false)
+    expect(isError(second)).toBe(false)
+    const beforeRename = await readContent(bearer, src.id)
+    expect(beforeRename.split(bracketIdentityLink(dst.id))).toHaveLength(2)
+    const linksBeforeRename = await teamLinks(cookie)
+
+    expect(linksBeforeRename.some((edge) => edge.source === src.id && edge.target === dst.id)).toBe(
+      true,
+    )
+    expect(
+      linksBeforeRename.some((edge) => edge.source === src.id && edge.target === namesake),
+    ).toBe(false)
+
+    await callTool(port, 'rename_note', { ref: dst.id, title: 'Renamed target' }, bearer)
+
+    expect(await readContent(bearer, src.id)).toBe(beforeRename)
+    expect(
+      (await teamLinks(cookie)).some((edge) => edge.source === src.id && edge.target === dst.id),
+    ).toBe(true)
+  })
+
   it('re-linking the same pair is an idempotent no-op (one line, not two)', async () => {
     const bearer = await patFor('alice', 'alice-password-1', 'write')
     const src = await seed(bearer, 'Idem Source')
@@ -4270,6 +4800,21 @@ describe('link (#21 stage 6)', () => {
     expect(text(r)).toMatch(/exactly one/i)
   })
 
+  it('keeps bracket-title forward references outside the existing-target fix', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const src = await seed(bearer, 'Bracket Forward Source')
+    const before = await readContent(bearer, src.id)
+    const result = await callTool(
+      port,
+      'link',
+      { from: src.id, toTitle: '[MCP] Review', relation: 'relates_to' },
+      bearer,
+    )
+
+    expect(isError(result)).toBe(true)
+    expect(await readContent(bearer, src.id)).toBe(before)
+  })
+
   it('rejects passing NEITHER to nor toTitle', async () => {
     const bearer = await patFor('alice', 'alice-password-1', 'write')
     const src = await seed(bearer, 'NoTarget Source')
@@ -4314,6 +4859,27 @@ describe('create_note #102 phase 4 channels (links / createdAt / fileName / warn
     const res = await app.inject({ method: 'GET', url: '/api/s/team/graph', headers: { cookie } })
     const links = res.json().links as Array<{ source: string; target: string }>
     expect(links.some((l) => l.source === srcId && l.target === target)).toBe(true)
+  })
+
+  it('serializes an inline existing bracket-title target with a readable alias', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const target = await seedTeam(bearer, '[MCP] Review')
+    const created = await callTool(
+      port,
+      'create_note',
+      {
+        project: 'team',
+        title: 'Bracket Inline Source',
+        body: 'Body.',
+        links: [{ to: target, relation: 'relates_to' }],
+      },
+      bearer,
+    )
+    const body = structured(
+      await callTool(port, 'get_note', { ref: structured(created).noteId }, bearer),
+    ).content as string
+
+    expect(body).toContain(bracketIdentityLink(target))
   })
 
   it('a bad inline link fails the whole create (atomic — the note is not created)', async () => {
@@ -4471,6 +5037,38 @@ describe('create_notes (#102 phase 4 batch)', () => {
     expect(links.some((l) => l.source === parentId && l.target === childId)).toBe(true)
   })
 
+  it('serializes an existing bracket-title target in a create_notes item', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const target = structured(
+      await callTool(
+        port,
+        'create_note',
+        { project: 'team', title: '[MCP] Review', body: 'Target.' },
+        bearer,
+      ),
+    ).noteId as string
+    const created = await callTool(
+      port,
+      'create_notes',
+      {
+        project: 'team',
+        notes: [
+          {
+            title: 'Bracket Batch Inline Source',
+            body: 'Body.',
+            links: [{ to: target, relation: 'relates_to' }],
+          },
+        ],
+      },
+      bearer,
+    )
+    const source = (structured(created).results as Array<{ noteId: string }>)[0].noteId
+    const body = structured(await callTool(port, 'get_note', { ref: source }, bearer))
+      .content as string
+
+    expect(body).toContain(bracketIdentityLink(target))
+  })
+
   it('a whole batch into a project the token cannot write is one 404-semantic error', async () => {
     const bearer = await patFor('bob', 'bob-password-01', 'write') // bob reads team, can't write
     const r = await callTool(
@@ -4569,6 +5167,22 @@ describe('link_many (#102 phase 4 batch)', () => {
     const res = await app.inject({ method: 'GET', url: '/api/s/team/graph', headers: { cookie } })
     return res.json().links as Array<{ source: string; target: string }>
   }
+
+  it('serializes and deduplicates a readable bracket-title existing target', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const source = await seed(bearer, 'Bracket Batch Source')
+    const target = await seed(bearer, '[MCP] Review')
+    const args = {
+      links: [{ from: source, to: target, relation: 'relates_to' }],
+    }
+
+    expect(isError(await callTool(port, 'link_many', args, bearer))).toBe(false)
+    expect(isError(await callTool(port, 'link_many', args, bearer))).toBe(false)
+    const body = structured(await callTool(port, 'get_note', { ref: source }, bearer))
+      .content as string
+
+    expect(body.split(bracketIdentityLink(target))).toHaveLength(2)
+  })
 
   it('creates several edges in one call; links sharing a from-note land together', async () => {
     const bearer = await patFor('alice', 'alice-password-1', 'write')

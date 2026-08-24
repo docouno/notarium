@@ -13,26 +13,30 @@ const roleSelector = {
   name: RoleNameSchema.optional(),
 }
 
-export const RoleSelectorSchema = z.object(roleSelector).superRefine((value, ctx) => {
-  const count = Number(value.role !== undefined) + Number(value.name !== undefined)
+export const RoleSelectorSchema = z
+  .object(roleSelector)
+  .strict()
+  .superRefine((value, ctx) => {
+    const count = Number(value.role !== undefined) + Number(value.name !== undefined)
 
-  if (count !== 1) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      message: 'provide exactly one of role or name',
-    })
-  }
-})
+    if (count !== 1) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'provide exactly one of role or name',
+      })
+    }
+  })
 
-/** Top-level stays a plain ZodObject because the MCP SDK reads `.shape`.
- * The handler enforces exactly-one selector. */
-export const UseRoleInputSchema = z.object({
-  ...sessionField,
-  ...roleSelector,
-  /** The current project handle when activating a project/space override. */
-  project: ProjectHandleSchema.optional(),
-  budgetTokens: z.number().int().min(100).max(16_000).default(4_000),
-})
+/** The handler enforces the exactly-one selector with its public guiding error. */
+export const UseRoleInputSchema = z
+  .object({
+    ...sessionField,
+    ...roleSelector,
+    /** The current project handle when activating a project/space override. */
+    project: ProjectHandleSchema.optional(),
+    budgetTokens: z.number().int().min(100).max(16_000).default(4_000),
+  })
+  .strict()
 
 const AttachmentFactsSchema = z.object({
   name: RoleNameSchema,

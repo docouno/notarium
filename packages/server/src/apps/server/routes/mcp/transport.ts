@@ -6,6 +6,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 // canon: docs/mcp-gateway.md#connect · docs/mcp-oauth.md#surfaces
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
+import type { z } from 'zod'
 import { AUTH_MODE } from '@notarium/contract'
 import { HTTP_STATUS } from '@notarium/contract/http'
 import type { InteractiveSignal } from '@notarium/core'
@@ -14,8 +15,12 @@ import type { MutationGate } from '../../../../libs/mutationGate'
 import type { AbilitiesService } from '../../../../services/abilities'
 import type { AuthService } from '../../../../services/auth'
 import { type Principal, SYSTEM_PRINCIPAL } from '../../../../services/authz'
-import { SERVER_INFO, SERVER_INSTRUCTIONS } from '../../../../services/mcp/descriptions'
-import { createGateway, type McpGateway } from '../../../../services/mcp/gateway'
+import {
+  SERVER_INFO,
+  SERVER_INSTRUCTIONS,
+  type ToolAnnotations,
+} from '../../../../services/mcp/descriptions'
+import { createGateway, type McpGateway, type ToolResult } from '../../../../services/mcp/gateway'
 import type {
   AgentDeltaCursorsPersistence,
   AgentSessionsPersistence,
@@ -65,25 +70,44 @@ export type McpOptions = {
   mutationGate?: MutationGate
 }
 
+type RegisterGatewayTool = (
+  name: string,
+  config: {
+    description: string
+    inputSchema: z.ZodTypeAny
+    outputSchema: z.ZodTypeAny
+    annotations: ToolAnnotations
+  },
+  callback: (args: unknown) => Promise<ToolResult>,
+) => void
+
 /** Per-request MCP server exposing only the tools this principal may see (the
  *  scope filter), each delegating to the gateway. canon: docs/mcp-gateway.md#security */
-const buildServer = (
+export const buildServer = (
   gateway: McpGateway,
   principal: Principal,
   mutationGate?: MutationGate,
 ): McpServer => {
   const server = new McpServer(SERVER_INFO, { instructions: SERVER_INSTRUCTIONS })
+  // The SDK's recursive schema-output generic exceeds TypeScript's instantiation
+  // limit over the dynamic registry union. This call surface preserves the SDK's
+  // runtime contract while keeping the callback boundary deliberately unknown.
+  const registerTool = server.registerTool.bind(server) as unknown as RegisterGatewayTool
 
   for (const t of gateway.listTools(principal)) {
-    server.registerTool(
+    // The runtime values remain the complete strict Zod objects.
+    const inputSchema: z.ZodTypeAny = t.input
+    const outputSchema: z.ZodTypeAny = t.output
+
+    registerTool(
       t.name,
       {
         description: t.description,
-        inputSchema: t.input.shape,
+        inputSchema,
         // The SDK re-validates structuredContent against this on success (skipped on
-        // isError); the gateway already validated the same shape — a second, wire-
+        // isError); the gateway already validated the same schema — a second, wire-
         // published guard, never a new failure mode.
-        outputSchema: t.output.shape,
+        outputSchema,
         annotations: t.annotations,
       },
       async (args: unknown) => {

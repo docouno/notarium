@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { describe, expect, it } from 'vitest'
+import { encodeWikilinkIdentity } from '@notarium/core'
 
 import { buildCaseWorld } from './build'
 
@@ -91,5 +92,45 @@ describe('the real seed applier', () => {
     }
     // The applier boots a real engine, applies migrations and replays a whole
     // case timeline; the default per-test budget is a fraction of that.
+  }, 180_000)
+
+  it('writes the wiki-web bracket target pin and its stable authored envelope', async () => {
+    const world = buildCaseWorld('wiki-web')
+    const targetId = 'seedWikiBracket1'
+    const creates = world.events.filter(
+      (event): event is Extract<(typeof world.events)[number], { op: 'create' }> =>
+        event.op === 'create',
+    )
+    const target = creates.find((event) => event.physicalId === targetId)
+    const source = creates.find((event) => event.title === 'Bracket Link Source')
+
+    expect(target?.op).toBe('create')
+    expect(source?.op).toBe('create')
+    const dataDir = await mkdtemp(join(tmpdir(), 'notarium-seed-real-wiki-'))
+
+    try {
+      await exec(
+        join(repoRoot, 'node_modules', '.bin', 'tsx'),
+        [join(repoRoot, 'scripts/seed.ts')],
+        {
+          cwd: repoRoot,
+          env: { ...process.env, CASE: 'wiki-web', DATA_DIR: dataDir, NOW: world.now },
+        },
+      )
+
+      const targetFile = await readFile(
+        join(dataDir, 'spaces', target!.space, target!.path),
+        'utf8',
+      )
+      const sourceFile = await readFile(
+        join(dataDir, 'spaces', source!.space, source!.path),
+        'utf8',
+      )
+
+      expect(targetFile).toContain(`notarium-id: ${targetId}`)
+      expect(sourceFile).toContain(`[[${encodeWikilinkIdentity(targetId)}|&#91;MCP&#93; Review]]`)
+    } finally {
+      await rm(dataDir, { recursive: true, force: true })
+    }
   }, 180_000)
 })

@@ -2,6 +2,7 @@
 // canon: docs/mcp-gateway.md#tools
 import { type BatchLinkResult, type LinkInput, type LinkManyInput } from '@notarium/contract/tools'
 import {
+  encodeWikilinkAlias,
   encodeWikilinkIdentity,
   isWikilinkIdentityTarget,
   linkNotes,
@@ -119,7 +120,7 @@ export const resolveLinkTitle = async (
     // node key (id in the read-model/client, storage path in the bare engine); the
     // alias keeps authored Markdown readable and survives rename/namesake collisions.
     const address = encodeWikilinkIdentity(targetId)
-    title = /[\]\r\n]/.test(display) ? address : `${address}|${display}`
+    title = /[\r\n]/.test(display) ? address : `${address}|${encodeWikilinkAlias(display)}`
   }
   // The wikilink target IS the title, so a title with a wikilink metacharacter would
   // resolve to the wrong note (or a ghost) — fail safe rather than link elsewhere.

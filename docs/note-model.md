@@ -9,8 +9,14 @@
 An unambiguous plain ID remains a valid authored target. Intent tools use the total
 reserved form **`[[notarium-id:<percent-encoded-id>|Readable title]]`**, so an opaque
 ID containing `#`, `|`, `]` or ending in `.md` cannot be mistaken for a human name,
-fragment, alias separator or storage filename. A miss in that namespace is a
-non-creatable tombstone: minting a different note cannot restore the missing identity.
+fragment, alias separator or storage filename. For an existing target the readable
+alias is a display snapshot, never an address: core encodes `&` first, then `[`, `]`,
+`<`, `>` as HTML entities. The wikilink parser therefore sees no closing delimiter,
+while CommonMark/browser rendering restores the exact title (including `[MCP] Review`)
+and navigation still uses the stable id. Forward `toTitle` remains the human-name
+grammar and does not gain bracket-title/ghost semantics from this encoding. A miss in
+that namespace is a non-creatable tombstone: minting a different note cannot restore
+the missing identity.
 When a resolved target disappears, the read-model re-derives every cached inbound source
 from its body against the post-delete index. A resolved edge is deliberately deduplicated
 and cannot remember whether the author wrote a human target, a stable envelope, or both;
@@ -31,7 +37,7 @@ order. Current path/name, custom slug and authored aliases therefore keep their 
 and cannot be shadowed by compatibility data.
 
 ### Outward terminology
-`space` (domain, boundary #16) is an internal addressing term, NOT exposed outward to the agent; the personal domain is implied from the PAT. The one descriptive exception is an effective role summary with `scope: 'space'`: it reports why that owned role won, but carries no space selector and cannot choose placement or access. **`project`** outward = the real addressable unit of work INSIDE a space (a marked folder-entity with the `.notariummeta` marker, #13), NOT a space. The handle = `(space, slug)` (the GitLab `group/project` model: `slug` is unique within a space, same-naming across spaces is disambiguated by the `space` field; the stable `id` is globally unique). The agent addresses a project by handle + relative path, the space is resolved behind the handle; the agent does NOT choose the space/class (poka-yoke). The model canon — [projects.md](projects.md). _(The former "outward-`project` = working space" and the double meaning of the term are canceled by #13: spaces stopped being called "project", real project-entities appeared; a reversal of #74-F3.)_
+`space` (domain, boundary #16) is an internal addressing term, NOT exposed outward to the agent; the personal domain is implied from the PAT. The one descriptive exception is an effective role summary with `scope: 'space'`: it reports why that owned role won, but carries no space selector and cannot choose placement or access. **`project`** outward = the real addressable unit of work INSIDE a space (a marked folder-entity with the `.notariummeta` marker, #13), NOT a space. The handle = `(space, slug)` (the GitLab `group/project` model: `slug` is unique within a space, same-naming across spaces is disambiguated by the `space` field; the stable `id` is globally unique). The agent addresses a project by handle plus a project-relative folder or an exact space-relative folder copied from `list_notes`; a duplicated handle prefix on a non-root project is rejected, while root grammar is intentionally collapsed. The space is resolved behind the handle; the agent does NOT choose the space/class (poka-yoke). The model canon — [projects.md](projects.md). _(The former "outward-`project` = working space" and the double meaning of the term are canceled by #13: spaces stopped being called "project", real project-entities appeared; a reversal of #74-F3.)_
 
 ### Classes and where intent-tools write <a id="note-classes"></a>
 | Class | Visibility | Who writes | Convention |
@@ -51,7 +57,7 @@ a temporary recovery constraint, not a claim that Agent Skills packages are sing
 door still handles full packages, and agent multi-file deletion waits for atomic batch tombstones.
 
 **The write-intent trio (#13)** — the agent does **not choose** the class/folder/space (poka-yoke), the tool imposes it:
-- `create_note` → class `user-doc` (knowledge into the project tree by handle `(space, slug)` + `path`);
+- `create_note` → class `user-doc` (knowledge into the project tree by handle `(space, slug)` + project-relative or exact space-relative `path`; a resolvable duplicated handle prefix is rejected for non-root projects);
 - `remember_about_user` → class `agent-memory` in the personal domain (memory about the user);
 - `remember_about_project` → class `agent-memory` in the agent-mount subdirectory `.notarium/memory/<id>/` (memory about the project; writing is symmetric to `remember_about_user`, reading is space-membership-scoped, not self:read).
 

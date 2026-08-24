@@ -27,39 +27,45 @@ export const LinkRelationSchema = DurableNonEmptyScalarSchema
 
 /** Tool `remember_about_user`: record a durable fact into the user's personal
  *  agent-memory. canon: docs/note-model.md#agent-memory */
-export const RememberAboutUserInputSchema = z.object({
-  ...sessionField,
-  observation: DurableNonEmptyTextSchema,
-  category: DurableScalarSchema.default('general'),
-  summary: DurableScalarSchema.optional(),
-  ...casFields,
-})
+export const RememberAboutUserInputSchema = z
+  .object({
+    ...sessionField,
+    observation: DurableNonEmptyTextSchema,
+    category: DurableScalarSchema.default('general'),
+    summary: DurableScalarSchema.optional(),
+    ...casFields,
+  })
+  .strict()
 
 /** One typed edge materialized inline while creating a note: `to` (note-id) XOR
  *  `toTitle` (forward-ref by title). canon: docs/note-model.md#note-ontology */
-export const InlineLinkSchema = z.object({
-  to: RefSchema.optional(),
-  toTitle: DurableNonEmptyScalarSchema.optional(),
-  relation: LinkRelationSchema,
-})
+export const InlineLinkSchema = z
+  .object({
+    to: RefSchema.optional(),
+    toTitle: DurableNonEmptyScalarSchema.optional(),
+    relation: LinkRelationSchema,
+  })
+  .strict()
 
 /** Tool `create_note`: create a `user-doc` KB note in a project — the agent picks
  *  neither space nor class. canon: docs/mcp-gateway.md#tools */
-export const CreateNoteInputSchema = z.object({
-  ...sessionField,
-  project: ProjectHandleSchema,
-  title: DurableScalarSchema.optional(),
-  body: DurableTextSchema,
-  // Structural path semantics stay in createOneNote so create_notes can fail one
-  // bad item without rejecting the whole batch at the transport boundary.
-  path: DurableScalarSchema.optional(),
-  type: DurableScalarSchema.optional(),
-  tags: z.array(DurableScalarSchema).optional(),
-  links: z.array(InlineLinkSchema).optional(),
-  createdAt: IsoTimestampSchema.optional(),
-  fileName: DurableScalarSchema.optional(),
-  ...casFields,
-})
+export const CreateNoteInputSchema = z
+  .object({
+    ...sessionField,
+    project: ProjectHandleSchema,
+    title: DurableScalarSchema.optional(),
+    body: DurableTextSchema,
+    // Structural path semantics stay in createOneNote so create_notes can fail one
+    // bad item without rejecting the whole batch at the transport boundary.
+    path: DurableScalarSchema.optional(),
+    type: DurableScalarSchema.optional(),
+    tags: z.array(DurableScalarSchema).optional(),
+    links: z.array(InlineLinkSchema).optional(),
+    createdAt: IsoTimestampSchema.optional(),
+    fileName: DurableScalarSchema.optional(),
+    ...casFields,
+  })
+  .strict()
 
 /** One note in a `create_notes` batch: create_note's fields minus `project`
  *  (hoisted to the batch) and `versionToken` (a create is additive). */
@@ -67,15 +73,17 @@ export const CreateNoteItemSchema = CreateNoteInputSchema.omit({
   project: true,
   session: true,
   versionToken: true,
-})
+}).strict()
 
 /** Tool `create_notes`: best-effort batch create in one project (per-item
  *  success/failure, never a rollback). canon: docs/mcp-gateway.md#tools */
-export const CreateNotesInputSchema = z.object({
-  ...sessionField,
-  project: ProjectHandleSchema,
-  notes: z.array(CreateNoteItemSchema).min(1).max(50),
-})
+export const CreateNotesInputSchema = z
+  .object({
+    ...sessionField,
+    project: ProjectHandleSchema,
+    notes: z.array(CreateNoteItemSchema).min(1).max(50),
+  })
+  .strict()
 
 /** One note's outcome in a `create_notes` batch: `index`/`title` correlate to the
  *  request; `ok:true` with the create echo, else `ok:false` + `error`. */
@@ -100,19 +108,23 @@ export const CreateNotesOutputSchema = z.object({
 
 /** One link in a `link_many` batch: `from` + a target (`to` XOR `toTitle`) +
  *  `relation`. Same edge semantics as `link`. */
-export const LinkItemSchema = z.object({
-  from: RefSchema,
-  to: RefSchema.optional(),
-  toTitle: DurableNonEmptyScalarSchema.optional(),
-  relation: LinkRelationSchema,
-})
+export const LinkItemSchema = z
+  .object({
+    from: RefSchema,
+    to: RefSchema.optional(),
+    toTitle: DurableNonEmptyScalarSchema.optional(),
+    relation: LinkRelationSchema,
+  })
+  .strict()
 
 /** Tool `link_many`: best-effort batch of typed links in one call.
  *  canon: docs/mcp-gateway.md#tools */
-export const LinkManyInputSchema = z.object({
-  ...sessionField,
-  links: z.array(LinkItemSchema).min(1).max(100),
-})
+export const LinkManyInputSchema = z
+  .object({
+    ...sessionField,
+    links: z.array(LinkItemSchema).min(1).max(100),
+  })
+  .strict()
 
 /** One link's outcome in a `link_many` batch: `index` correlates; `ok:true` with
  *  the `from` note's fresh `versionToken`, else `ok:false` + `error`. */
@@ -129,39 +141,45 @@ export const LinkManyOutputSchema = z.object({
 
 /** Tool `remember_about_project`: record a durable fact into the project's
  *  agent-memory. canon: docs/note-model.md#agent-memory */
-export const RememberAboutProjectInputSchema = z.object({
-  ...sessionField,
-  project: ProjectHandleSchema,
-  observation: DurableNonEmptyTextSchema,
-  category: DurableScalarSchema.default('general'),
-  summary: DurableScalarSchema.optional(),
-  ...casFields,
-})
+export const RememberAboutProjectInputSchema = z
+  .object({
+    ...sessionField,
+    project: ProjectHandleSchema,
+    observation: DurableNonEmptyTextSchema,
+    category: DurableScalarSchema.default('general'),
+    summary: DurableScalarSchema.optional(),
+    ...casFields,
+  })
+  .strict()
 /** The five word-based edit addressing modes. */
 export const EditOperationSchema = z.enum(enumValues(EDIT_OPERATION))
 /** Tool `edit_note`: modify a note incrementally via five word-based addressing
  *  modes (never positional). `section`/`find` are kept optional so one schema
  *  covers all modes — the edit op enforces the pairing.
  *  canon: docs/mcp-gateway.md#tools */
-export const EditNoteInputSchema = z.object({
-  ...sessionField,
-  ref: RefSchema,
-  operation: EditOperationSchema,
-  content: DurableTextSchema,
-  section: DurableScalarSchema.optional(),
-  find: DurableScalarSchema.optional(),
-  ...casFields,
-})
+export const EditNoteInputSchema = z
+  .object({
+    ...sessionField,
+    ref: RefSchema,
+    operation: EditOperationSchema,
+    content: DurableTextSchema,
+    section: DurableScalarSchema.optional(),
+    find: DurableScalarSchema.optional(),
+    ...casFields,
+  })
+  .strict()
 
 /** Tool `link`: create a typed wikilink between two notes in the same space
  *  (`to` note-id XOR `toTitle` forward-ref). canon: docs/note-model.md#note-ontology */
-export const LinkInputSchema = z.object({
-  ...sessionField,
-  from: RefSchema,
-  to: RefSchema.optional(),
-  toTitle: DurableNonEmptyScalarSchema.optional(),
-  relation: LinkRelationSchema,
-})
+export const LinkInputSchema = z
+  .object({
+    ...sessionField,
+    from: RefSchema,
+    to: RefSchema.optional(),
+    toTitle: DurableNonEmptyScalarSchema.optional(),
+    relation: LinkRelationSchema,
+  })
+  .strict()
 
 export const LinkOutputSchema = z.object({
   ok: z.literal(true),

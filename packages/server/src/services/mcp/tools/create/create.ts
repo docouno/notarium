@@ -38,6 +38,83 @@ const SECRET_PATTERNS: RegExp[] = [
 const detectSecretWarnings = (text: string): string[] =>
   SECRET_PATTERNS.some((re) => re.test(text)) ? ['possible-secret'] : []
 
+type ProjectPrefixCache = Map<string, string | null>
+
+const invalidFolder = (path: string | undefined): ToolFailure =>
+  new ToolFailure(`"${path}" is not a valid folder path inside the project`)
+
+/** Resolve create_note's two public folder forms without accepting a project handle
+ * as a third form. Prefix classification delegates alias/shadowing to resolveProject. */
+export const resolveCreateFolder = async (
+  ctx: Pick<Ctx, 'resolveProject'>,
+  rec: ProjectRecord,
+  projectHandle: string,
+  path: string | undefined,
+  prefixCache: ProjectPrefixCache,
+): Promise<string | undefined> => {
+  const rel = path ? safeRelAddress(path.replace(/^\/+/, '')) : ''
+
+  if (rel === null) {
+    throw invalidFolder(path)
+  }
+  const underProject = rec.path !== '' && (rel === rec.path || rel.startsWith(`${rec.path}/`))
+
+  if (underProject) {
+    return rel || undefined
+  }
+  // Root projects collapse project-relative and space-relative grammar. A prefix
+  // that resembles the root handle is therefore still an ordinary folder path.
+  if (rec.path === '') {
+    return rel || undefined
+  }
+
+  const segments = rel.split('/')
+
+  if (segments.length >= 2) {
+    const fullPrefix = segments.slice(0, 2).join('/')
+    let prefixedProjectId = prefixCache.get(fullPrefix)
+
+    if (!prefixCache.has(fullPrefix)) {
+      try {
+        prefixedProjectId = (await ctx.resolveProject(fullPrefix)).id
+      } catch (err) {
+        if (!(err instanceof ToolFailure)) {
+          throw err
+        }
+        prefixedProjectId = null
+      }
+      prefixCache.set(fullPrefix, prefixedProjectId ?? null)
+    }
+
+    if (prefixedProjectId === rec.id) {
+      const suffix = segments.slice(2).join('/')
+      const relativeAdvice = suffix
+        ? `Use the project-relative folder \`${suffix}\``
+        : 'Omit `path` to use the project root'
+      const spaceRelative = [rec.path, suffix].filter(Boolean).join('/')
+      const exactHandleLike = [rec.path, rel].filter(Boolean).join('/')
+
+      throw new ToolFailure(
+        `Invalid path for project \`${projectHandle}\`: \`${path}\` starts with project handle ` +
+          `\`${fullPrefix}\`, but \`path\` is a folder, not a project handle. ${relativeAdvice}, ` +
+          `or use the exact space-relative folder \`${spaceRelative}\` from list_notes. ` +
+          `If \`${fullPrefix}\` is a real subfolder name, use its exact space-relative path ` +
+          `\`${exactHandleLike}\` from list_notes.`,
+      )
+    }
+  }
+
+  // Re-vet the composed path against a corrupt registry placement as well as input.
+  const joined = [rec.path, rel].filter(Boolean).join('/')
+  const safe = safeRelAddress(joined)
+
+  if (safe === null) {
+    throw invalidFolder(path)
+  }
+
+  return safe || undefined
+}
+
 /** Resolve inline `links` to LinkSpecs. Throws on the first invalid link —
  *  a created note's edges are all-or-error, never silently partial. */
 const resolveInlineLinks = async (
@@ -68,33 +145,14 @@ const resolveInlineLinks = async (
 const createOneNote = async (
   ctx: Ctx,
   rec: ProjectRecord,
+  projectHandle: string,
   toolName: ToolName,
   item: CreateNoteItem,
   personal: string | null,
+  prefixCache: ProjectPrefixCache,
 ): Promise<Record<string, unknown>> => {
   const { title, body, path, type, tags, links, createdAt, fileName, idempotencyKey } = item
-  // Tolerant folder resolution: create_note.path is project-relative by contract, but
-  // list_notes/move_* report SPACE-relative — accept EITHER form so an agent pasting a
-  // path verbatim doesn't double the project prefix into a phantom folder. Strip a
-  // leading slash (mirrors move_note) before safeRelPath, which fails closed on an
-  // absolute path and rejects traversal/.notarium before the engine.
-  const rel = path ? safeRelAddress(path.replace(/^\/+/, '')) : ''
-
-  if (rel === null) {
-    throw new ToolFailure(`"${path}" is not a valid folder path inside the project`)
-  }
-  // Segment-boundary match (trailing `/` rejects a prefix-sibling like `${rec.path}x`):
-  // is the agent's path already space-relative under this project? Keep BOTH forms —
-  // narrowing to space-relative-only breaks legacy project-relative callers.
-  const underProject = rec.path !== '' && (rel === rec.path || rel.startsWith(`${rec.path}/`))
-  // Re-vet the COMPOSED path (belt-and-suspenders against a corrupt rec.path).
-  const joined = underProject ? rel : [rec.path, rel].filter(Boolean).join('/')
-  const safe = safeRelAddress(joined)
-
-  if (safe === null) {
-    throw new ToolFailure(`"${path}" is not a valid folder path inside the project`)
-  }
-  const dir = safe || undefined
+  const dir = await resolveCreateFolder(ctx, rec, projectHandle, path, prefixCache)
   // Body-first title: explicit `title` wins, else the body's leading `# H1`/first line.
   // A note we cannot title is refused with guidance, not stored as "(untitled)".
   const resolvedTitle = deriveNoteTitle(body, title)
@@ -166,7 +224,15 @@ export const handleCreateNote: Handler = async (ctx, rawArgs) => {
   if (!can(ctx.principal, 'space:write', { space: rec.space })) {
     throw new ToolFailure(`no such project: ${args.project}`)
   }
-  const structured = await createOneNote(ctx, rec, 'create_note', args, await ctx.personalSpace())
+  const structured = await createOneNote(
+    ctx,
+    rec,
+    args.project,
+    'create_note',
+    args,
+    await ctx.personalSpace(),
+    new Map(),
+  )
   // Show the folder the note ACTUALLY landed in (derived from the result path — the
   // tolerant resolution may differ from the raw input), matching list_notes' namespace.
   const landed = typeof structured.path === 'string' ? structured.path : undefined
@@ -187,6 +253,7 @@ export const handleCreateNotes: Handler = async (ctx, rawArgs) => {
     throw new ToolFailure(`no such project: ${project}`)
   }
   const personal = await ctx.personalSpace()
+  const prefixCache: ProjectPrefixCache = new Map()
   // Best-effort, NON-transactional: each item succeeds or fails on its own — one bad
   // item never rolls back the others. Per-item errors are sanitized (a collision
   // message can echo an untrusted title — threat-model).
@@ -196,7 +263,15 @@ export const handleCreateNotes: Handler = async (ctx, rawArgs) => {
     const item = notes[i]
 
     try {
-      const echo = await createOneNote(ctx, rec, 'create_notes', item, personal)
+      const echo = await createOneNote(
+        ctx,
+        rec,
+        project,
+        'create_notes',
+        item,
+        personal,
+        prefixCache,
+      )
       results.push({ ...echo, index: i, title: String(echo.title ?? ''), ok: true })
     } catch (err) {
       results.push({
