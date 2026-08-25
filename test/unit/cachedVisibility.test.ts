@@ -115,6 +115,34 @@ describe('CachedStore visibility hardening (#78 review)', () => {
     expect((await store.list({ scope: 'all' })).length).toBe(2)
   })
 
+  it('drops a warmed note fact when the live note is removed', async () => {
+    const inner = new InMemoryStore({
+      space: 'main',
+      now: '2026-06-14T00:00:00.000Z',
+      notes: [
+        {
+          id: 'fake-mem',
+          title: 'Memory',
+          class: 'agent-memory',
+          filePath: '.notarium/memory/memory.md',
+          content: 'eager body',
+        },
+      ],
+    })
+    const store = new CachedStore({ inner, pollIntervalMs: 0 })
+
+    cleanups.push(async () => {
+      store.stop()
+      await store.settle()
+    })
+    await store.start()
+    await store.read('fake-mem')
+    await expect(store.noteFacts!(['fake-mem'])).resolves.toHaveProperty('fake-mem')
+
+    await store.remove('fake-mem')
+    await expect(store.noteFacts!(['fake-mem'])).resolves.toEqual({})
+  })
+
   it('pushes class narrowing into the engine, then restores read-model metadata', async () => {
     const inner = new InMemoryStore({
       space: 'main',

@@ -3,6 +3,7 @@ import { agentAbilitiesSparse } from './cases/agentAbilitiesSparse'
 import { agentContext } from './cases/agentContext'
 import { agentRoles } from './cases/agentRoles'
 import { agentSessions } from './cases/agentSessions'
+import { contextOpen } from './cases/contextOpen'
 import { dashboardActivity } from './cases/dashboardActivity'
 import { demo } from './cases/demo'
 import { explorerScroll } from './cases/explorerScroll'
@@ -76,6 +77,7 @@ export const CASES: readonly CaseSpec[] = [
   agentAbilitiesRich,
   agentAbilitiesSparse,
   agentSessions,
+  contextOpen,
   memoryPerf,
   // import
   importThread,

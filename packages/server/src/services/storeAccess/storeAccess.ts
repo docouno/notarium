@@ -8,7 +8,7 @@
 // (anti-enumeration). id-addressed routes declare resource:'note' and defer their
 // check here, since it can only be made once the store is resolved.
 
-import type { NoteClass } from '@notarium/core'
+import { type NoteClass, type NoteMeta, READ_SCOPE } from '@notarium/core'
 
 import { type Action, can, type Principal } from '../authz'
 import type {
@@ -38,6 +38,8 @@ export type LiveNoteAccess = NoteAccess & {
   noteId: string
   note: Awaited<ReturnType<SpaceStore['read']>>
 }
+
+export type LiveNoteMetaAccess = NoteAccess & { noteId: string; meta: NoteMeta }
 
 export type StoreAccess = {
   /** Space id (already resolved from the URL slug) → live store; throws the typed
@@ -111,6 +113,37 @@ export const readNoteAccess = async (
   return { ...hit, noteId: note.id ?? id, note }
 }
 
+/** Resolve, authorise and find a live note in the read-model inventory without
+ * opening its body. The optional map is request-scoped so many set items in one
+ * space pay one snapshot list. A miss is honest degradation to readNoteAccess. */
+export const metaNoteAccess = async (
+  access: StoreAccess,
+  principal: Principal,
+  id: string,
+  action: Action,
+  inventories: Map<SpaceStore, Promise<Map<string, NoteMeta>>> = new Map(),
+): Promise<LiveNoteMetaAccess | null> => {
+  const hit = await access.noteStore(principal, id, action)
+
+  if (!hit) {
+    return null
+  }
+  if (typeof hit.store.list !== 'function') {
+    return null
+  }
+  let inventory = inventories.get(hit.store)
+
+  if (!inventory) {
+    inventory = hit.store
+      .list({ scope: READ_SCOPE.all })
+      .then((metas) => new Map(metas.flatMap((meta) => (meta.id ? [[meta.id, meta]] : []))))
+    inventories.set(hit.store, inventory)
+  }
+  const meta = (await inventory).get(id)
+
+  return meta ? { ...hit, noteId: meta.id ?? id, meta } : null
+}
+
 /** Deps for a scope-curation resolve; the cross-space registries are absent on a
  *  meta-DB-less host. */
 type ScopeResolveDeps = {
@@ -128,8 +161,27 @@ type ScopeResolveDeps = {
  *  foreign space / tombstone) degrade to null — the shared path so the human preview
  *  and the agent bundle drop the exact same refs (P5).
  *  canon: docs/architecture.md#p5 */
-const scopeNoteReader =
-  (deps: ScopeResolveDeps, principal: Principal) => async (noteId: string) => {
+const scopeNoteReader = (deps: ScopeResolveDeps, principal: Principal) => {
+  const inventories = new Map<SpaceStore, Promise<Map<string, NoteMeta>>>()
+
+  return async (noteId: string) => {
+    const metaHit = await metaNoteAccess(deps.store, principal, noteId, 'note:read', inventories)
+
+    if (metaHit && (!deps.noteClassAllowed || deps.noteClassAllowed(metaHit.meta.class))) {
+      const fact = metaHit.store.noteFacts
+        ? (await metaHit.store.noteFacts([metaHit.noteId]))[metaHit.noteId]
+        : undefined
+
+      if (fact) {
+        return {
+          noteId: metaHit.noteId,
+          tokens: fact.bodyTokens,
+          title: fact.title,
+          spaceSlug: deps.spaces.slugOf(metaHit.space) ?? metaHit.space,
+          filePath: metaHit.meta.filePath,
+        }
+      }
+    }
     const hit = await readNoteAccess(deps.store, principal, noteId, 'note:read')
 
     if (!hit || (deps.noteClassAllowed && !deps.noteClassAllowed(hit.note.class))) {
@@ -144,6 +196,7 @@ const scopeNoteReader =
       filePath: hit.note.filePath ?? '',
     }
   }
+}
 
 /** Resolve + weigh a scope's context sets under one reader (survivors weighed by
  *  body); no registry → no sets.

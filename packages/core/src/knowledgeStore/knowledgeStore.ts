@@ -643,6 +643,16 @@ export type Preview = {
   tokens: number
 }
 
+/** Small body-derived facts used by eager agent context. They are an optional
+ *  read-model accelerator: absence costs a normal read but never changes an answer. */
+export type NoteFacts = {
+  title: string
+  summary: string | null
+  snippet: string
+  muted: boolean
+  bodyTokens: number
+}
+
 export type SearchResult = {
   /** Same wire divergence as NoteMeta.id: required on the wire (the store drops hits it can't map). */
   id?: string
@@ -1212,6 +1222,9 @@ export type KnowledgeStore = {
   /** Batch previews: sequential, and the abort check between items lets a dead request stop costing
    *  engine time. */
   previews(ids: readonly string[], opts?: ReadOptions): Promise<Record<string, Preview>>
+  /** Batch body-derived facts without opening each note through the engine. Optional
+   *  accelerator; partial output means callers fall back per missing id. */
+  noteFacts?(ids: readonly string[]): Promise<Record<string, NoteFacts>>
   /** A synchronous cache-only peek so a notes window carries previews inline without an engine read.
    *  null = "cold, ask /api/previews". */
   previewPeek(id: string): Preview | null

@@ -54,13 +54,12 @@ export class Snapshot {
    *  the counter below already sees. Keying on the history as well only made the
    *  table drop on a reload that changed no name at all. */
   private index: LinkIndex | null = null
-  /** What the memoized table was built from. `notes.version` alone is total over
-   *  the note set (every set/delete/clear bumps it), so the retraction counter here
-   *  is not a second guard for the EXACT table — it is what {@link batchIndex}
-   *  compares, and it is recorded at build time so a batch caller can ask whether
-   *  an id has left the map since. */
+  /** What the memoized table was built from. `notes.resolveVersion` is total over
+   *  the fields `buildLinkIndex` consumes, without invalidating on timestamps/tags;
+   *  the retraction counter is what {@link batchIndex} compares so a batch caller
+   *  can ask whether an id has left the map since. */
   private indexKey: {
-    notes: number
+    resolve: number
     retractions: number
     folders: number
     aliases: FolderAlias[]
@@ -133,7 +132,7 @@ export class Snapshot {
   buildIndex(): LinkIndex {
     const folders = this.currentFolders()
     const key = {
-      notes: this.notes.version,
+      resolve: this.notes.resolveVersion,
       retractions: this.notes.retractions,
       folders: this.foldersVersion(),
       aliases: this.folderAliases,
@@ -142,7 +141,7 @@ export class Snapshot {
     if (
       this.index &&
       this.indexKey &&
-      this.indexKey.notes === key.notes &&
+      this.indexKey.resolve === key.resolve &&
       this.indexKey.folders === key.folders &&
       this.indexKey.aliases === key.aliases
     ) {

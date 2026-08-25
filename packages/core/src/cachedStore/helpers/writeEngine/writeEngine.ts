@@ -116,6 +116,24 @@ const legacyAliasesChanged = (
   (before?.length ?? 0) !== (after?.length ?? 0) ||
   (before ?? []).some((alias, index) => alias !== after?.[index])
 
+type WriteSnapshotEffect = { directoryChanged: boolean; graphChanged: boolean }
+const NO_WRITE_SNAPSHOT_EFFECT: WriteSnapshotEffect = {
+  directoryChanged: false,
+  graphChanged: false,
+}
+
+/** Inputs consumed by shapeGraph or buildLinkIndex. Timestamps, source locator,
+ * summary and body-without-edge-change are deliberately absent. */
+const graphInputsChanged = (before: NoteMeta | undefined, after: NoteMeta): boolean =>
+  !before ||
+  before.title !== after.title ||
+  before.class !== after.class ||
+  before.filePath !== after.filePath ||
+  before.slug !== after.slug ||
+  legacyAliasesChanged(before.aliases, after.aliases) ||
+  legacyAliasesChanged(before.legacyNameAliases, after.legacyNameAliases) ||
+  legacyAliasesChanged(before.tags, after.tags)
+
 const folderFailed = (detail: string): StoreError => {
   const err = new StoreError(`# Folder Failed: ${detail}`)
   err.isToolError = true
@@ -753,12 +771,12 @@ export class WriteEngine {
             this.host.reconcileSoon()
             return
           }
-          let directoryChanged = false
+          let writeEffect = NO_WRITE_SNAPSHOT_EFFECT
           const aliasesBefore = this.host.snap.notes.get(result.id)?.legacyNameAliases
           const removed: string[] = []
 
           this.host.afterNotesReady(() => {
-            directoryChanged = this.applyWrite(input, result, result.id!, undefined, false, removed)
+            writeEffect = this.applyWrite(input, result, result.id!, undefined, false, removed)
           })
           const aliasContextChanged = legacyAliasesChanged(
             aliasesBefore,
@@ -766,16 +784,23 @@ export class WriteEngine {
           )
 
           if (aliasContextChanged) {
+            writeEffect = { ...writeEffect, graphChanged: true }
+          }
+          if (aliasContextChanged) {
             this.host.markInnerLinkIdentitiesDirty()
             this.host.syncInnerLinkIdentities()
           }
-          if (directoryChanged || aliasContextChanged) {
+          if (writeEffect.directoryChanged || aliasContextChanged) {
             await this.host.rederiveGraphContext(
               result.filePath ? { upserts: [result.id], removed } : undefined,
             )
           }
           if (result.filePath) {
-            this.host.emitChanged([result.id], removed)
+            this.host.emitChanged(
+              [result.id],
+              removed,
+              writeEffect.graphChanged || aliasContextChanged,
+            )
           }
         }
 
@@ -962,12 +987,13 @@ export class WriteEngine {
       restoreVersionToken = result.versionToken
       const publishAfterIdentityFlush = !input.originalId && !this.host.isBulkActive()
 
+      let writeEffect = NO_WRITE_SNAPSHOT_EFFECT
+
       const publishWrite = async () => {
-        let directoryChanged = false
         const aliasesBefore = this.host.snap.notes.get(id)?.legacyNameAliases
 
         this.host.afterNotesReady(() => {
-          directoryChanged = this.applyWrite(input, result, id, originalPath, false, removed)
+          writeEffect = this.applyWrite(input, result, id, originalPath, false, removed)
         })
         if (!input.originalId) {
           // The lease was closed before inner.write. Register its durable cut
@@ -991,17 +1017,20 @@ export class WriteEngine {
           this.host.snap.notes.get(id)?.legacyNameAliases,
         )
 
+        if (aliasContextChanged) {
+          writeEffect = { ...writeEffect, graphChanged: true }
+        }
         if (publishAfterIdentityFlush || aliasContextChanged) {
           this.host.markInnerLinkIdentitiesDirty()
           this.host.syncInnerLinkIdentities()
         }
-        if (directoryChanged || aliasContextChanged) {
+        if (writeEffect.directoryChanged || aliasContextChanged) {
           await this.host.rederiveGraphContext(
             result.filePath ? { upserts: [id], removed } : undefined,
           )
         }
         if (!publishAfterIdentityFlush && result.filePath) {
-          this.host.emitChanged([id], removed)
+          this.host.emitChanged([id], removed, writeEffect.graphChanged || aliasContextChanged)
         }
       }
 
@@ -1061,6 +1090,7 @@ export class WriteEngine {
           })
         }
         if (legacyAliasesChanged(aliasesBefore, capturedLegacyNameAliases)) {
+          writeEffect = { ...writeEffect, graphChanged: true }
           this.host.markInnerLinkIdentitiesDirty()
           this.host.syncInnerLinkIdentities()
           await this.host.rederiveGraphContext(
@@ -1105,7 +1135,7 @@ export class WriteEngine {
       if (publishAfterIdentityFlush) {
         await this.host.flushIdentityPublication()
         if (result.filePath) {
-          this.host.emitChanged([id], removed)
+          this.host.emitChanged([id], removed, writeEffect.graphChanged)
         }
       }
 
@@ -1952,6 +1982,7 @@ export class WriteEngine {
 
       this.host.afterNotesReady(() => {
         this.host.previewCache.delete(id)
+        this.host.noteFactsCache.delete(id)
         if (!this.host.snap.notes.delete(id)) {
           return
         }
@@ -2013,11 +2044,11 @@ export class WriteEngine {
     originalPath?: string,
     publish = true,
     removedOut?: string[],
-  ): boolean {
+  ): WriteSnapshotEffect {
     if (!result.filePath) {
       // Engine didn't tell us where the note landed — let the feed catch up.
       this.host.reconcileSoon()
-      return false
+      return NO_WRITE_SNAPSHOT_EFFECT
     }
     const newPath = result.filePath
     const removed: string[] = []
@@ -2040,6 +2071,7 @@ export class WriteEngine {
       if (pathOwner && pathOwner !== id) {
         this.host.snap.notes.delete(pathOwner)
         this.host.previewCache.delete(pathOwner)
+        this.host.noteFactsCache.delete(pathOwner)
         this.host.snap.edgesBySource.delete(pathOwner)
         removed.push(pathOwner)
       }
@@ -2058,12 +2090,16 @@ export class WriteEngine {
         if (otherId !== id) {
           this.host.snap.notes.delete(otherId)
           this.host.previewCache.delete(otherId)
+          this.host.noteFactsCache.delete(otherId)
           this.host.snap.edgesBySource.delete(otherId)
           removed.push(otherId)
         }
       }
     }
     const prev = this.host.snap.notes.get(id)
+    const wasGraphVisible = Boolean(
+      prev && isVisibleOn(SURFACE.graph, prev.class ?? DEFAULT_NOTE_CLASS),
+    )
     // Authored date edit: when the write SETS `createdAt`, reset the
     // registry's pinned date too — else adoptMeta would read the stale first-seen
     // value back over the engine's fresh one on the next poll/restart (the registry
@@ -2156,7 +2192,7 @@ export class WriteEngine {
           ? rawSourceLocator
           : undefined
         : prev?.sourceLocator)
-    this.host.snap.notes.set(id, {
+    const nextMeta: NoteMeta = {
       id,
       title: input.title,
       ...(slug ? { slug } : {}),
@@ -2181,10 +2217,16 @@ export class WriteEngine {
       createdAt:
         authoredCreatedAt ??
         (prev !== undefined ? prev.createdAt : (rec?.createdAt ?? this.host.iso())),
-    })
+    }
+
+    this.host.snap.notes.set(id, nextMeta)
     // Write-through keeps the preview warm too: the very snippet the Feed will
     // ask for next is computed here, from data the save already carried.
     this.host.previewCache.set(id, derivePreview(input.content ?? '', input.tags))
+    // Exact write merging (raw frontmatter carry-forward, title projection) belongs
+    // to the engine. Drop the old fact and let the next context read derive once
+    // from the published file; this adds no parsing work to bulk import.
+    this.host.noteFactsCache.delete(id)
     const directoryChanged = this.host.dirs.add(directoryOf(newPath))
     // Directory context is part of the resolver index, so add it before deriving
     // even this note's own outbound edges.
@@ -2197,20 +2239,25 @@ export class WriteEngine {
     // rebuilt it on every write — the note the write just published moved the very
     // counter the memo is keyed on — so the corpus was walked per note anyway, one
     // layer down from the loop that was fixed. Under the bracket both halves defer.
-    this.host.snap.patchNoteEdges(id, input.content ?? '', {
+    const edgesChanged = this.host.snap.patchNoteEdges(id, input.content ?? '', {
       index: this.resolveIndex(),
       deferReresolve: this.host.isBulkActive(),
     })
+    const isGraphVisible = isVisibleOn(SURFACE.graph, nextMeta.class ?? DEFAULT_NOTE_CLASS)
+    const graphChanged =
+      removed.length > 0 ||
+      edgesChanged ||
+      ((wasGraphVisible || isGraphVisible) && graphInputsChanged(prev, nextMeta))
     // `removed` is the ids this one write displaced from its path binding — identity
     // bookkeeping of at most a couple of registry rows, never document-sized.
     // eslint-disable-next-line no-restricted-syntax
     removedOut?.push(...removed)
 
     if (publish) {
-      this.host.emitChanged([id], removed)
+      this.host.emitChanged([id], removed, graphChanged)
     }
 
-    return directoryChanged
+    return { directoryChanged, graphChanged }
   }
 
   private applyNoteMove(

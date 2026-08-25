@@ -194,25 +194,30 @@ export const useDashboardData = (space: string): DashData => {
   // show the previous space's data, however the loads race. When the new space resolves,
   // `loaded.space` matches again and its data shows. A same-space refetch keeps
   // `loaded.space === space` throughout, so stale-while-revalidate stays intact.
-  const [loaded, setLoaded] = useState<{ space: string | null; data: DashData }>({
+  const [loaded, setLoaded] = useState<{
+    space: string | null
+    data: DashData
+    /** Internal completion bit for the graph lane; `health: null` is also a valid
+     *  settled capability result, so null itself cannot distinguish loading. */
+    graphResolved: boolean
+  }>({
     space: null,
     data: EMPTY_DASH,
+    graphResolved: false,
   })
   const location = useLocation()
   const { subscribe } = useSync()
-  // Monotonic request token: a space switch (or a coalesced refetch) starts a new
-  // load; an older in-flight load that resolves later must NOT clobber a newer one.
-  const reqSeq = useRef(0)
+  // Journal and graph are independent freshness lanes. A shared sequence made a
+  // cheap `changed` refresh supersede an already-running graph refresh; under a
+  // steady write stream the expensive response was then discarded forever even
+  // though no newer graph request existed. Each lane now orders only itself.
+  const activityReqSeq = useRef(0)
+  const graphReqSeq = useRef(0)
 
-  const load = useCallback(async () => {
-    const seq = ++reqSeq.current
-    // Each channel resolves independently: a host without the journal 404s
-    // /activity (we hide that surface) but still has a graph + tree, so one
-    // failure never blanks the whole dashboard.
-    const [activity, graph, health, recent, projects, tags] = await Promise.all([
+  const loadActivity = useCallback(async () => {
+    const seq = ++activityReqSeq.current
+    const [activity, recent, projects, tags] = await Promise.all([
       api.activityGet(space, { tz: TZ }).catch(() => null),
-      api.graphGet(space).catch(() => null),
-      api.graphHealthGet(space).catch(() => null), // 404 on a host without it → Health empty
       api
         .activityEventsGet(space, { limit: RECENT_LIMIT })
         .then((r) => r.events)
@@ -227,42 +232,102 @@ export const useDashboardData = (space: string): DashData => {
         .catch(() => null),
     ])
 
-    if (reqSeq.current !== seq) {
+    if (activityReqSeq.current !== seq) {
       return
-    } // a newer load (or space switch) superseded us
-    setLoaded({
-      space,
-      data: {
-        activity,
-        activityResolved: true,
-        graph,
-        health,
-        recent,
-        projects,
-        tags,
-        loading: false,
-      },
+    }
+    setLoaded((prev) => {
+      const sameSpace = prev.space === space
+      const graphResolved = sameSpace && prev.graphResolved
+
+      return {
+        space,
+        graphResolved,
+        data: {
+          activity,
+          activityResolved: true,
+          graph: sameSpace ? prev.data.graph : null,
+          health: sameSpace ? prev.data.health : null,
+          recent,
+          projects,
+          tags,
+          loading: !graphResolved,
+        },
+      }
+    })
+  }, [space])
+
+  const loadGraph = useCallback(async () => {
+    const seq = ++graphReqSeq.current
+    // graphHealth 404s on a host without the optional capability; that resolves
+    // this lane honestly to an empty Health surface rather than blocking the rest.
+    const [graph, health] = await Promise.all([
+      api.graphGet(space).catch(() => null),
+      api.graphHealthGet(space).catch(() => null),
+    ])
+
+    if (graphReqSeq.current !== seq) {
+      return
+    }
+    setLoaded((prev) => {
+      const sameSpace = prev.space === space
+      const activityResolved = sameSpace && prev.data.activityResolved
+
+      return {
+        space,
+        graphResolved: true,
+        data: {
+          activity: sameSpace ? prev.data.activity : null,
+          activityResolved,
+          graph,
+          health,
+          recent: sameSpace ? prev.data.recent : [],
+          projects: sameSpace ? prev.data.projects : [],
+          tags: sameSpace ? prev.data.tags : null,
+          loading: !activityResolved,
+        },
+      }
     })
   }, [space])
 
   useEffect(() => {
-    void load()
-  }, [load])
+    void loadActivity()
+    void loadGraph()
+  }, [loadActivity, loadGraph])
 
-  // Freshness: a `changed` event means notes moved — refetch the lot, coalesced
-  // (a burst of saves costs one refresh a second). Mirrors GraphView's SSE wiring.
+  // Freshness, coalesced (a burst of saves costs one refresh a second). Two triggers with
+  // DIFFERENT reach: `changed` means notes moved, which is an Activity fact; `graph` means
+  // the server finished re-enriching the map, which is the only thing that makes the graph
+  // half worth re-reading. A window that saw both refetches both.
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | null = null
+    let wantActivity = false
+    let wantGraph = false
     const unsub = subscribe((e) => {
-      if (e.type !== STORE_EVENT.CHANGED) {
+      if (e.type !== STORE_EVENT.CHANGED && e.type !== STORE_EVENT.GRAPH) {
         return
+      }
+      if (e.type === STORE_EVENT.CHANGED) {
+        wantActivity = true
+      }
+      if (e.type === STORE_EVENT.GRAPH) {
+        wantGraph = true
       }
       if (timer) {
         return
       }
       timer = setTimeout(() => {
         timer = null
-        void load()
+        const activity = wantActivity
+        const graph = wantGraph
+
+        wantActivity = false
+        wantGraph = false
+        if (activity) {
+          void loadActivity()
+        }
+        if (graph) {
+          void loadGraph()
+        }
       }, CHANGED_COALESCE_MS)
     })
 
@@ -272,7 +337,7 @@ export const useDashboardData = (space: string): DashData => {
         clearTimeout(timer)
       }
     }
-  }, [subscribe, load])
+  }, [subscribe, loadActivity, loadGraph])
 
   // Show the loaded bundle ONLY for the space it belongs to; any other space is still
   // loading → the blank bundle (skeleton), never another space's data.

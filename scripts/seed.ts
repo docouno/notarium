@@ -1000,6 +1000,16 @@ const run = async (): Promise<void> => {
       throw new Error(`event references unknown space: ${spaceSlug}`)
     }
     const store = await manager.store(spaceId)
+    // The real applier can carry thousands of creates in one space. Bracket that
+    // replay exactly like the supported importer does: journal rows and injected
+    // clocks still settle per event below, while resolver/ghost/graph corpus work
+    // is paid once at the boundary instead of once per seeded note.
+    const bulkStore = store as typeof store & {
+      beginBulk?: () => void
+      endBulk?: () => Promise<void>
+    }
+
+    bulkStore.beginBulk?.()
 
     for (const e of spaceEvents) {
       clock = new Date(normDate(e.date))
@@ -1168,6 +1178,7 @@ const run = async (): Promise<void> => {
         }
       }
     }
+    await bulkStore.endBulk?.()
   }
 
   // 4a. Named restore/read edge states. These declarations intentionally bypass

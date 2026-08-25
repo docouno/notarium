@@ -289,3 +289,177 @@ describe('CachedStore.graphHealth path→id remap (#100)', () => {
     }
   })
 })
+
+describe('CachedStore.graphHealth derivation memo', () => {
+  // The engine's graph() materializes every note body and re-derives every edge,
+  // synchronously. Measured on the live instance this surface was called 681 times in
+  // six hours against a 1236-note space (p50 13.9s) and blocked the shared event loop
+  // in ~1.09s bursts, queueing every other request behind it. The memo keeps the FRESH
+  // derivation the metric needs while charging for it once per snapshot state.
+  const countingEngine = (metas: NoteMeta[], graph: Graph) => {
+    const engine = makeEngine(metas, graph)
+    let derivations = 0
+    const graphFn = engine.graph.bind(engine)
+
+    engine.graph = async (...args: Parameters<KnowledgeStore['graph']>) => {
+      derivations += 1
+      return graphFn(...args)
+    }
+
+    return { engine, derivations: () => derivations }
+  }
+
+  const oneNote: Graph = {
+    nodes: [{ id: 'a.md', title: 'A', filePath: 'a.md', folder: '', ghost: false, degree: 0 }],
+    links: [],
+  }
+
+  it('derives once for an unchanged corpus and again after the snapshot moves', async () => {
+    const { engine, derivations } = countingEngine([meta('a.md', 'A')], oneNote)
+    const store = new CachedStore({ inner: engine, pollIntervalMs: 0 })
+
+    await store.start()
+
+    // Boot adopts an edge baseline through the same engine call, so count from here.
+    const booted = derivations()
+    const first = await store.graphHealth()
+
+    expect(derivations()).toBe(booted + 1)
+
+    // Repeat on the SAME snapshot: the answer must be identical and free.
+    await expect(store.graphHealth()).resolves.toEqual(first)
+    await expect(store.graphHealth()).resolves.toEqual(first)
+    expect(derivations()).toBe(booted + 1)
+
+    // A rebuild must drop it: the metric describes the corpus, and a stale answer here
+    // is a wrong grooming number, not a slow one. `rescan()` is the coarsest mover —
+    // it ticks the cache epoch, which the token folds in precisely because `reset()`
+    // leaves `rev` alone.
+    const beforeRescan = derivations()
+
+    await store.rescan()
+    await store.graphHealth()
+    expect(derivations()).toBeGreaterThan(beforeRescan)
+
+    store.stop()
+    await store.settle()
+  })
+
+  it('joins concurrent callers onto one whole-corpus derivation', async () => {
+    const { engine, derivations } = countingEngine([meta('a.md', 'A')], oneNote)
+    const graphFn = engine.graph.bind(engine)
+    let release!: () => void
+    let markStarted!: () => void
+    let hold = false
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve
+    })
+
+    engine.graph = async (...args: Parameters<KnowledgeStore['graph']>) => {
+      const result = graphFn(...args)
+
+      if (hold) {
+        markStarted()
+        await gate
+      }
+
+      return result
+    }
+    const store = new CachedStore({ inner: engine, pollIntervalMs: 0 })
+
+    await store.start()
+    const booted = derivations()
+
+    hold = true
+    const first = store.graphHealth()
+    const second = store.graphHealth()
+
+    await started
+    expect(derivations()).toBe(booted + 1)
+
+    release()
+    const [firstHealth, secondHealth] = await Promise.all([first, second])
+
+    expect(firstHealth).toBe(secondHealth)
+    expect(firstHealth.totalLinks).toBe(0)
+    expect(derivations()).toBe(booted + 1)
+
+    store.stop()
+    await store.settle()
+  })
+
+  it('retries a transient rejection on the same graph revision', async () => {
+    const engine = makeEngine([meta('a.md', 'A')], oneNote)
+    const store = new CachedStore({ inner: engine, pollIntervalMs: 0 })
+
+    await store.start()
+    const graphFn = engine.graph.bind(engine)
+    let attempts = 0
+
+    engine.graph = async (...args: Parameters<KnowledgeStore['graph']>) => {
+      attempts += 1
+      if (attempts === 1) {
+        throw new Error('transient graph failure')
+      }
+
+      return graphFn(...args)
+    }
+
+    await expect(store.graphHealth()).rejects.toThrow('transient graph failure')
+    await expect(store.graphHealth()).resolves.toMatchObject({ totalLinks: 0 })
+    expect(attempts).toBe(2)
+
+    store.stop()
+    await store.settle()
+  })
+
+  it('skips hidden upserts but invalidates on empty repairs, visible changes and retractions', async () => {
+    const metas = [
+      meta('a.md', 'A'),
+      meta('.notarium/memory/context.md', 'Context', { class: 'agent-memory' }),
+    ]
+    const { engine, derivations } = countingEngine(metas, oneNote)
+    const store = new CachedStore({ inner: engine, pollIntervalMs: 0 })
+
+    await store.start()
+    await store.graphHealth()
+    const settled = derivations()
+    const rows = await store.list({ scope: 'all' })
+    const hiddenId = rows.find((row) => row.class === 'agent-memory')!.id!
+    const visibleId = rows.find((row) => row.class !== 'agent-memory')!.id!
+    const emitChanged = (upserts: string[], removed: string[] = []) =>
+      (
+        store as unknown as {
+          emit: (event: { type: 'changed'; upserts: string[]; removed: string[] }) => void
+        }
+      ).emit({ type: 'changed', upserts, removed })
+
+    emitChanged([hiddenId])
+    await store.graphHealth()
+    expect(derivations()).toBe(settled)
+
+    emitChanged([])
+    await store.graphHealth()
+    expect(derivations()).toBe(settled + 1)
+
+    emitChanged([visibleId])
+    await store.graphHealth()
+    expect(derivations()).toBe(settled + 2)
+
+    const internal = store as unknown as {
+      snap: { notes: Map<string, NoteMeta> }
+    }
+    const visible = internal.snap.notes.get(visibleId)!
+
+    internal.snap.notes.set(visibleId, { ...visible, class: 'agent-memory' })
+    emitChanged([visibleId])
+    await store.graphHealth()
+    expect(derivations()).toBe(settled + 3)
+
+    store.stop()
+    await store.settle()
+  })
+})

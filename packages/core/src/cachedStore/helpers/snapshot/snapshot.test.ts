@@ -111,6 +111,46 @@ describe('Snapshot resolve-table memoization', () => {
     expect(snap.resolvedTargetIds('[[Target]]')).toEqual(['t'])
   })
 
+  it('keeps the exact table across metadata changes outside the resolver input', () => {
+    const { snap, note } = setup()
+
+    note('n', 'note.md', 'Note', { tags: ['before'] })
+    const table = snap.buildIndex()
+
+    // This is the ordinary write/read shape: the write-through snapshot receives
+    // a new stamp/tags/source locator, then finalizeRead patches this note's edges.
+    // None of those fields names a wikilink target, so rebuilding all names is pure
+    // waste — and was the measured O(corpus) cost on every post-write note open.
+    note('n', 'note.md', 'Note', {
+      modifiedAt: '2026-08-25T00:00:00.000Z',
+      sourceLocator: 'import:next',
+      tags: ['after'],
+    })
+
+    expect(snap.buildIndex()).toBe(table)
+    snap.patchNoteEdges('n', 'Body without links')
+    expect(snap.buildIndex()).toBe(table)
+  })
+
+  it.each([
+    ['identity', { id: 'other-id' }],
+    ['title', { title: 'Renamed' }],
+    ['path', { filePath: 'moved/note.md' }],
+    ['slug', { slug: 'custom' }],
+    ['aliases', { aliases: ['Former'] }],
+    ['legacy aliases', { legacyNameAliases: ['legacy/note'] }],
+    ['class', { class: 'agent-memory' as const }],
+  ])('rebuilds when the note %s changes', (_field, change) => {
+    const { snap, note } = setup()
+
+    note('n', 'note.md', 'Note')
+    const table = snap.buildIndex()
+    const current = snap.notes.get('n')!
+
+    snap.notes.set('n', { ...current, ...change })
+    expect(snap.buildIndex()).not.toBe(table)
+  })
+
   it('sees a folder that appeared since the last table', () => {
     const { snap, note, setFolders } = setup()
 

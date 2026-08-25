@@ -1,6 +1,7 @@
 import type { IdentityRegistry } from '../../../identity'
 import type { IdentityRecord, KnowledgeStore, NoteContent } from '../../../knowledgeStore'
 import type { RevisionJournal } from '../../../revisionJournal'
+import type { NoteFactsCache } from '../../caches/noteFactsCache'
 import type { PreviewCache } from '../../caches/previewCache'
 import type { DirectoryIndex } from '../directoryIndex'
 import type { Snapshot } from '../snapshot'
@@ -12,6 +13,7 @@ export type WriteHost = {
   identity: IdentityRegistry
   journal: RevisionJournal
   previewCache: PreviewCache
+  noteFactsCache: NoteFactsCache
   dirs: DirectoryIndex
   iso: () => string
   reconcileSoon: () => void
@@ -48,6 +50,9 @@ export type WriteHost = {
   flushIdentityPublication: () => Promise<void>
   /** Preserve the pre-mutation population for a broad repair after retry. */
   rememberIdentityRepair: (before: ReadonlySet<string>) => void
-  emitChanged: (upserts: string[], removed: string[]) => void
+  /** Publish ordinary note freshness independently from graph freshness. A write
+   * whose graph inputs and derived edges are unchanged must still refresh Feed/
+   * Activity, but must not schedule a corpus-wide layout pass. */
+  emitChanged: (upserts: string[], removed: string[], graphChanged?: boolean) => void
   isBulkActive: () => boolean
 }

@@ -171,6 +171,37 @@ describe('rememberAboutUser', () => {
 })
 
 describe('buildMemoryIndex', () => {
+  it('uses derived facts without opening memory bodies', async () => {
+    const store = memStore([
+      {
+        id: 'mem-prefs',
+        title: 'listed title',
+        class: 'agent-memory',
+        content: 'body that must stay unread',
+      },
+    ])
+
+    store.noteFacts = async () => ({
+      'mem-prefs': {
+        title: 'projected title',
+        summary: null,
+        snippet: 'Derived snippet',
+        muted: true,
+        bodyTokens: 99,
+      },
+    })
+
+    await expect(buildMemoryIndex(store)).resolves.toEqual([
+      expect.objectContaining({
+        noteId: 'mem-prefs',
+        category: 'projected title',
+        summary: 'Derived snippet',
+        muted: true,
+      }),
+    ])
+    expect(store.readIds).toEqual([])
+  })
+
   it('emits the authoritative id returned by a read of a provisional memory row', async () => {
     const store = memStore([
       {

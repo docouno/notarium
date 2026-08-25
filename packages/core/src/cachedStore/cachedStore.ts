@@ -19,6 +19,7 @@ import type {
   MoveResult,
   MutationOptions,
   NoteContent,
+  NoteFacts,
   NoteMeta,
   Preview,
   PublishedResourceEvidence,
@@ -40,6 +41,7 @@ import type {
 } from '../knowledgeStore'
 import {
   DEFAULT_SPACE,
+  NOTE_CLASS,
   noteNotFound,
   READ_SCOPE,
   REVISION_KIND,
@@ -66,6 +68,7 @@ import { InMemoryRevisionPersistence, RevisionJournal } from '../revisionJournal
 import { derivePreview } from '../snippet'
 import { classesForScope, DEFAULT_NOTE_CLASS, isVisibleOn, SURFACE } from '../visibility'
 import { GraphCache } from './caches/graphCache'
+import { NoteFactsCache } from './caches/noteFactsCache'
 import { PreviewCache } from './caches/previewCache'
 import {
   GRAPH_REFRESH_DEBOUNCE_MS,
@@ -93,7 +96,14 @@ import type { CachedStoreOptions, StoreEventListener, Unsubscribe } from './type
  *  public surface (only the private emit() consumes it). */
 type EmitInput =
   | Exclude<StoreEvent, { type: 'changed' }>
-  | { type: 'changed'; upserts: string[]; removed: string[]; folders?: string[] }
+  | {
+      type: 'changed'
+      upserts: string[]
+      removed: string[]
+      folders?: string[]
+      /** Internal-only exact signal; omitted keeps conservative inference. */
+      graphChanged?: boolean
+    }
 
 type ExternalObservation = {
   noteId: string
@@ -297,6 +307,13 @@ export class CachedStore implements KnowledgeStore {
   /** Preview cache — LRU read-through; the class delegates every preview
    *  read/invalidation to it (see {@link PreviewCache}). */
   private readonly previewCache: PreviewCache
+  /** Tiny body-derived facts for eager context. Unlike previews this covers its
+   *  whole selected population and is never an LRU. */
+  private readonly noteFactsCache: NoteFactsCache
+  /** The current graph-health derivation and the snapshot token it describes. The
+   *  promise is cached, not only its result: concurrent dashboard clients must join
+   *  one whole-corpus pass instead of starting the same synchronous work in parallel. */
+  private graphHealthMemo: { token: string; promise: Promise<GraphHealth> } | null = null
   /** Raw-body reader (P5): shared with sweepFileIds' frontmatter id sweep, so it
    *  stays on the class and is handed to the preview cache too. */
   private readonly readBody?: (filePath: string) => Promise<string | null>
@@ -305,6 +322,10 @@ export class CachedStore implements KnowledgeStore {
    *  enriched/stale maps and the debounced background recompute; the class feeds
    *  it a shaped snapshot and forwards mutation ticks (see {@link GraphCache}). */
   private readonly graphCache: GraphCache
+  /** Class transitions can remove a currently-hidden upsert from the user graph.
+   *  Remember the last published conservative retraction counter so hidden body
+   *  writes can skip graph work without missing visible→hidden transitions. */
+  private lastGraphRetractions = 0
 
   private phase: ScanPhase = SCAN_PHASE.cold
   /** True once inventory + the full metadata merge + frontmatter id sweep
@@ -519,6 +540,10 @@ export class CachedStore implements KnowledgeStore {
         return this.inner.previewPeek(currentId)
       },
     })
+    this.noteFactsCache = new NoteFactsCache({
+      readBody,
+      getMeta: (id) => this.snap.notes.get(id),
+    })
     this.watcher = new WatchController({
       watch: inner.watch?.bind(inner),
       reconcile: () => void this.poll(),
@@ -585,6 +610,7 @@ export class CachedStore implements KnowledgeStore {
         identity: this.identity,
         journal: this.journal,
         previewCache: this.previewCache,
+        noteFactsCache: this.noteFactsCache,
         dirs: this.dirs,
         iso: () => this.iso(),
         reconcileSoon: () => this.reconcileSoon(),
@@ -600,7 +626,8 @@ export class CachedStore implements KnowledgeStore {
         markIdentityPublicationPending: () => this.markIdentityPublicationPending(),
         flushIdentityPublication: () => this.flushIdentityPublication(),
         rememberIdentityRepair: (before) => this.rememberIdentityRepair(before),
-        emitChanged: (upserts, removed) => this.emitMutationChanged(upserts, removed),
+        emitChanged: (upserts, removed, graphChanged) =>
+          this.emitMutationChanged(upserts, removed, { graphChanged }),
         isBulkActive: () => this.bulk.isActive,
       },
       { mutations: this.mutations, trashMutations: this.trashMutations },
@@ -844,6 +871,7 @@ export class CachedStore implements KnowledgeStore {
         this.resetMutationBarrier()
         this.snap.clear()
         this.previewCache.clear()
+        this.noteFactsCache.clear()
         this.graphCache.reset()
         this.dirs.clear()
         this.supersededIds.clear()
@@ -1286,6 +1314,27 @@ export class CachedStore implements KnowledgeStore {
     }
   }
 
+  /** Seed only the population eager context can ever read. The identity sweep
+   *  already holds these raw bytes; deriving 100-ish tiny facts here adds no I/O
+   *  and avoids analyzing the thousands of ordinary notes in the corpus. */
+  private seedEagerNoteFacts(path: string, raw: string): void {
+    const ids = this.snap.notes.idsAt(path)
+
+    if (ids.length !== 1) {
+      return
+    }
+    const id = ids[0]!
+    const meta = this.snap.notes.get(id)
+    const eager =
+      meta?.class === NOTE_CLASS.agentMemory ||
+      meta?.class === NOTE_CLASS.profile ||
+      (meta?.tags ?? []).includes('always-load')
+
+    if (eager) {
+      this.noteFactsCache.setFromRaw(id, raw)
+    }
+  }
+
   /** Reconcile frontmatter id claims for the given paths: read each file via
    *  the storage capability (P5), adopt its `notarium-id`, re-key the snapshot
    *  where the file's claim beats a minted id. This is what lets a note whose
@@ -1338,39 +1387,39 @@ export class CachedStore implements KnowledgeStore {
         // observation falls back to an engine read before journaling.
         unresolvedPaths.delete(path)
 
-        if (!claim || !isValidNoteId(claim)) {
-          continue
-        }
-        if (!identityPublicationPending) {
-          this.markIdentityPublicationPending()
-          identityPublicationPending = true
-        }
-        const res = await this.settleClaimAtPath(path, claim)
+        if (claim && isValidNoteId(claim)) {
+          if (!identityPublicationPending) {
+            this.markIdentityPublicationPending()
+            identityPublicationPending = true
+          }
+          const res = await this.settleClaimAtPath(path, claim)
 
-        // Whether the path MOVED and what the arbiter's last word was are two
-        // independent facts, and only the first decides a re-key. Gating the re-key
-        // on the verdict drops it whenever an earlier hop already moved the path and
-        // a later one ended in `duplicate` — the snapshot then keeps serving an id
-        // the settlement has tombstoned, and every poll after that mints another.
-        //
-        // Applied HERE rather than after the loop, because the pair cannot be
-        // recovered later: it is read off the path before and after the settlement,
-        // and a throw on any LATER path would leave the registry already moved — a
-        // retry then sees no movement at all and the snapshot keeps a tombstoned id
-        // for good. The publication fence is shut for the whole sweep, so moving the
-        // snapshot early is not observable.
-        if (res.previousId && res.settledId) {
-          rekeyed.push([res.previousId, res.settledId])
-          this.rekeySnapshot(res.previousId, res.settledId)
+          // Whether the path MOVED and what the arbiter's last word was are two
+          // independent facts, and only the first decides a re-key. Gating the re-key
+          // on the verdict drops it whenever an earlier hop already moved the path and
+          // a later one ended in `duplicate` — the snapshot then keeps serving an id
+          // the settlement has tombstoned, and every poll after that mints another.
+          //
+          // Applied HERE rather than after the loop, because the pair cannot be
+          // recovered later: it is read off the path before and after the settlement,
+          // and a throw on any LATER path would leave the registry already moved — a
+          // retry then sees no movement at all and the snapshot keeps a tombstoned id
+          // for good. The publication fence is shut for the whole sweep, so moving the
+          // snapshot early is not observable.
+          if (res.previousId && res.settledId) {
+            rekeyed.push([res.previousId, res.settledId])
+            this.rekeySnapshot(res.previousId, res.settledId)
+          }
+          if (res.outcome.kind === 'duplicate') {
+            // A user-copied file: two files claiming one id. The original
+            // keeps it; this copy lives under its registry id until a save
+            // through us rewrites its frontmatter.
+            console.warn(
+              `[cached-store] duplicate ${NOTE_ID_FRONTMATTER_KEY} "${claim}" in ${path} (owned by ${res.outcome.ownerPath}) — keeping the copy's registry id`,
+            )
+          }
         }
-        if (res.outcome.kind === 'duplicate') {
-          // A user-copied file: two files claiming one id. The original
-          // keeps it; this copy lives under its registry id until a save
-          // through us rewrites its frontmatter.
-          console.warn(
-            `[cached-store] duplicate ${NOTE_ID_FRONTMATTER_KEY} "${claim}" in ${path} (owned by ${res.outcome.ownerPath}) — keeping the copy's registry id`,
-          )
-        }
+        this.seedEagerNoteFacts(path, raw)
       }
     }
     if (identityPublicationPending) {
@@ -1613,6 +1662,7 @@ export class CachedStore implements KnowledgeStore {
       this.previewCache.delete(oldId)
       this.previewCache.set(newId, preview)
     }
+    this.noteFactsCache.rekey(oldId, newId)
     this.snap.renameEdges(oldId, newId)
   }
 
@@ -1658,6 +1708,7 @@ export class CachedStore implements KnowledgeStore {
   private adoptGraph(graph: Graph): void {
     this.graphCache.resetBaseline()
     this.snap.adoptEdgeBaseline(graph, this.inner.capabilities.identity)
+    this.lastGraphRetractions = this.snap.notes.retractions
   }
 
   // ── reads ───────────────────────────────────────────────────────────────────
@@ -1969,18 +2020,64 @@ export class CachedStore implements KnowledgeStore {
   /** Read-only grooming health. Bypasses the incremental edge cache graph() serves (a cached
    *  inbound edge isn't re-resolved when its target is renamed, so its `resolvedVia` would
    *  undercount): folds the engine's FRESH derivation after the SAME hidden-class filter, so the
-   *  metric is honest and visibility holds. One fresh derivation per call (a maintenance surface). */
+   *  metric is honest and visibility holds. One fresh derivation per snapshot revision. */
   async graphHealth(): Promise<GraphHealth> {
     await this.recoverIdentityForSurface()
     await this.recoverGraphContextForSurface()
     await this.ensureNotes()
     return this.readAcrossStableGraphTransition(async () => {
-      this.syncInnerLinkIdentities()
-      const graph = this.remapBareGraph(filterGraphForUser(await this.inner.graph()))
+      // Memoized on the graph's DERIVATION TOKEN, never on the incremental edge cache:
+      // the fresh derivation below is exactly what keeps `resolvedVia` honest (see the
+      // docblock above), so the memo caches that fresh result instead of replacing it.
+      // The token moves on every snapshot mutation and every rebuild, so an unchanged
+      // corpus answers for free while a changed one still re-derives.
+      //
+      // Why this is not a nicety: the engine's graph() materializes EVERY note body and
+      // re-derives every edge, synchronously. Measured on the live instance — 681 calls
+      // in 6h against a 1236-note space, p50 13.9s — it blocked the shared event loop in
+      // ~1.09s bursts, and every other request (note reads included) queued behind it.
+      const token = this.graphCache.derivationToken
+      const memo = this.isServingLive ? null : this.graphHealthMemo
 
-      await this.flushIdentityPublication()
-      await this.ensureIdentityPublished()
-      return aggregateGraphHealth(graph)
+      if (memo?.token === token) {
+        return await memo.promise
+      }
+      const promise = (async (): Promise<GraphHealth> => {
+        this.syncInnerLinkIdentities()
+        const graph = this.remapBareGraph(filterGraphForUser(await this.inner.graph()))
+
+        await this.flushIdentityPublication()
+        await this.ensureIdentityPublished()
+        return aggregateGraphHealth(graph)
+      })()
+      const entry = { token, promise }
+
+      if (!this.isServingLive) {
+        this.graphHealthMemo = entry
+      }
+
+      try {
+        const health = await promise
+
+        // Keep only a result for the state it actually describes. The old caller
+        // still receives its point-in-time answer, but a later caller must derive
+        // the snapshot that replaced it while the engine was working.
+        if (
+          this.graphHealthMemo === entry &&
+          (this.isServingLive || this.graphCache.derivationToken !== token)
+        ) {
+          this.graphHealthMemo = null
+        }
+
+        return health
+      } catch (err) {
+        // A rejected promise is never a cache entry: the next request retries the
+        // capability instead of pinning a transient engine failure to this revision.
+        if (this.graphHealthMemo === entry) {
+          this.graphHealthMemo = null
+        }
+        throw err
+      }
     })
   }
 
@@ -2750,6 +2847,7 @@ export class CachedStore implements KnowledgeStore {
     ) {
       // The body is in hand anyway — refresh the preview alongside the edges.
       this.previewCache.set(sourceId, derivePreview(detail.content, detail.frontmatter?.tags))
+      this.noteFactsCache.setFromNote(sourceId, detail)
       const changed = this.snap.patchNoteEdges(sourceId, detail.content)
 
       if (changed) {
@@ -2864,6 +2962,40 @@ export class CachedStore implements KnowledgeStore {
       }
     }
 
+    return out
+  }
+
+  /** Small body facts for eager context. Warm entries are pure map reads; a cold
+   *  entry derives from the raw file under the same stable path claim as previews.
+   *  Missing capability/file returns a partial map and the caller falls back per id. */
+  async noteFacts(ids: readonly string[]): Promise<Record<string, NoteFacts>> {
+    await this.recoverIdentityForSurface()
+    await this.ensureNotes()
+    await this.ensureIdentityPublished()
+
+    if (this.isServingLive) {
+      return {}
+    }
+    const out: Record<string, NoteFacts> = {}
+
+    for (const requestedId of ids) {
+      const id = this.canonicalMutationId(requestedId)
+      const hit = this.noteFactsCache.get(id)
+
+      if (hit) {
+        out[requestedId] = hit
+        continue
+      }
+      const fromFile = await this.mutations.runStable(
+        () => ({ noteIds: [id], paths: [this.snap.notes.get(id)?.filePath] }),
+        () => this.noteFactsCache.fromFile(id),
+      )
+
+      if (fromFile) {
+        out[requestedId] = fromFile
+      }
+    }
+    await this.ensureIdentityPublished()
     return out
   }
 
@@ -3182,9 +3314,11 @@ export class CachedStore implements KnowledgeStore {
     upserts: string[],
     removed: string[],
     {
+      graphChanged,
       invalidateExternalTransitions = true,
       syncLinkIdentities = true,
     }: {
+      graphChanged?: boolean
       invalidateExternalTransitions?: boolean
       syncLinkIdentities?: boolean
     } = {},
@@ -3211,7 +3345,7 @@ export class CachedStore implements KnowledgeStore {
       }
     }
     this.lastChangeAt = this.iso()
-    this.emit({ type: 'changed', upserts, removed })
+    this.emit({ type: 'changed', upserts, removed, graphChanged })
   }
 
   /** Re-derive the selected source notes from their live bodies after a target
@@ -3617,6 +3751,7 @@ export class CachedStore implements KnowledgeStore {
           // empty or a deletion during the error interval can survive forever.
           this.snap.clear()
           this.previewCache.clear()
+          this.noteFactsCache.clear()
           this.graphCache.reset()
           this.dirs.clear()
           this.supersededIds.clear()
@@ -3854,6 +3989,7 @@ export class CachedStore implements KnowledgeStore {
       }
       this.snap.edgesBySource.delete(id)
       this.previewCache.delete(id)
+      this.noteFactsCache.delete(id)
       // Tombstoned, not forgotten: if this was an external move, the new
       // path's frontmatter claim re-adopts the id in the sweep that follows.
       this.identity.markDeleted(meta.filePath)
@@ -3922,6 +4058,7 @@ export class CachedStore implements KnowledgeStore {
       // the delta body lacks the frontmatter tags, and a half-fresh snippet
       // (new text, stale chips) is worse than a lazy recompute on next view.
       this.previewCache.delete(id)
+      this.noteFactsCache.delete(id)
       const nextMeta = {
         ...(this.snap.notes.get(id) ?? adopted),
         title: adopted.title,
@@ -4421,6 +4558,7 @@ export class CachedStore implements KnowledgeStore {
         this.resetBarrier()
         this.snap.clear()
         this.previewCache.clear()
+        this.noteFactsCache.clear()
         this.graphCache.reset()
         this.supersededIds.clear()
         this.externalTransitions.clear()
@@ -4542,16 +4680,34 @@ export class CachedStore implements KnowledgeStore {
   // server-truth folders — what a client needs to refresh the destination of a
   // move it can't see in its own cache, multi-client sync).
   private emit(event: EmitInput): void {
+    const explicitGraphChanged = event.type === 'changed' ? event.graphChanged : undefined
     const out: StoreEvent =
       event.type === 'changed'
-        ? { ...event, folders: event.folders ?? this.foldersOf(event.upserts) }
+        ? {
+            type: 'changed',
+            upserts: event.upserts,
+            removed: event.removed,
+            folders: event.folders ?? this.foldersOf(event.upserts),
+          }
         : event
 
-    // Any 'changed' means the snapshot moved — the enriched graph for the
-    // previous revision is stale from here on; the background recompute
-    // chases it (debounced) so the request path never has to.
+    // Feed/Activity freshness and graph freshness are independent. The write path
+    // supplies an exact graphChanged bit after comparing shaped-node/resolver inputs
+    // and derived edges; external/read-repair callers omit it and stay conservative.
+    // Removals stay conservative because their class is already gone; the retraction
+    // counter covers same-id class transitions current visibility alone cannot see.
     if (out.type === 'changed') {
-      this.graphCache.onSnapshotChanged()
+      const graphChanged =
+        explicitGraphChanged ??
+        ((out.upserts.length === 0 && out.removed.length === 0) ||
+          out.removed.length > 0 ||
+          out.upserts.some((id) => this.snap.isGraphVisibleId(id)) ||
+          this.snap.notes.retractions !== this.lastGraphRetractions)
+
+      this.lastGraphRetractions = this.snap.notes.retractions
+      if (graphChanged) {
+        this.graphCache.onSnapshotChanged()
+      }
       // Bulk import: buffer the ids and broadcast one merged `changed` on a
       // short timer instead of fanning every note out to every subscriber. The
       // graph-refresh debounce above is already re-armed (cheap); only the

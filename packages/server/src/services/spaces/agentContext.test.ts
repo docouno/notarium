@@ -124,6 +124,37 @@ describe('agent-context identity producers', () => {
     })
   })
 
+  it('uses identity-published metadata and facts without opening pin/profile bodies', async () => {
+    const tagged = rekeyingStore()
+    const profile = rekeyingStore('profile')
+    const facts = async () => ({
+      'provisional-id': {
+        title: 'Projected title',
+        summary: null,
+        snippet: 'Body',
+        muted: false,
+        bodyTokens: 17,
+      },
+    })
+
+    tagged.store.noteFacts = facts
+    profile.store.noteFacts = facts
+    tagged.store.read = async () => {
+      throw new Error('pin body should stay unread')
+    }
+    profile.store.read = async () => {
+      throw new Error('profile body should stay unread')
+    }
+
+    await expect(weighAlwaysLoad(tagged.store)).resolves.toEqual([
+      expect.objectContaining({ noteId: 'provisional-id', title: 'Projected title', tokens: 17 }),
+    ])
+    await expect(personalProfilePin(profile.store)).resolves.toMatchObject({
+      noteId: 'provisional-id',
+      title: 'Projected title',
+    })
+  })
+
   it('routes pin toggles through the atomic tag port while mute keeps its CAS path', async () => {
     const { store, writes, tagMutations } = rekeyingStore()
 

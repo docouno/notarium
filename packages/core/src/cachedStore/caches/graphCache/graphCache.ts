@@ -5,9 +5,11 @@ import type { GraphCacheOptions } from './types'
 
 const GRAPH_ENRICHMENT_CANCELLED = Symbol('graph-enrichment-cancelled')
 
-/** Graph enrichment cache: the communities+layout pass runs at most once per snapshot
- *  revision, never on the request path. `rev` ticks on every snapshot mutation; `layoutPositions`
- *  warm-start the next layout. canon: docs/core.md#swr-graph */
+/** Graph enrichment cache: the communities+layout pass runs at most once per graph
+ *  revision, never on the request path. The owner ticks `rev` only when shaped-node/
+ *  resolver inputs or derived edges move; ordinary Feed/Activity freshness is a
+ *  separate channel. `layoutPositions` warm-start the next layout.
+ *  canon: docs/core.md#swr-graph */
 export class GraphCache {
   private readonly shape: () => Graph
   private readonly emitGraph: () => void
@@ -45,7 +47,7 @@ export class GraphCache {
     this.scheduler = scheduler
   }
 
-  /** A 'changed' event: the snapshot moved, so the enriched graph for the
+  /** A graph-relevant change: shaped graph inputs moved, so enrichment for the
    *  previous revision is stale from here on; tick the revision and re-arm the
    *  debounced recompute (which chases it so the request path never has to). */
   onSnapshotChanged(): void {
@@ -94,6 +96,16 @@ export class GraphCache {
    *  that a bulk import (which suppressed per-change refreshes) is over. */
   refreshSoon(): void {
     this.scheduleRefresh()
+  }
+
+  /** Identifies the exact snapshot state a graph derivation describes. Moves on every
+   *  snapshot mutation (`rev`) AND on every full rebuild (`epoch`) — both are needed,
+   *  because `reset()` ticks only the epoch, so a rev-only key would let a memo survive
+   *  a rescan that rebuilt the corpus underneath it. Exposed for a consumer that caches
+   *  its OWN fresh derivation (graph health) rather than reading this cache's
+   *  incremental map. */
+  get derivationToken(): string {
+    return `${this.epoch}:${this.rev}`
   }
 
   /** The SWR read path: the enriched map if current; else the last

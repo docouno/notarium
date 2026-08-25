@@ -25,6 +25,7 @@
     "seed": "tsx scripts/seed.ts",
     "seed-coverage": "tsx scripts/coverage.ts",
     "bench:import-markdown-tree": "tsx scripts/importMarkdownTreeBench.ts",
+    "bench:context-open": "tsx scripts/contextOpenBench.ts",
     "meta-migrations:check": "tsx scripts/metaMigrations.ts",
     "meta-migrations:checksum": "tsx scripts/metaMigrations.ts --checksum",
     "test": "vitest run",

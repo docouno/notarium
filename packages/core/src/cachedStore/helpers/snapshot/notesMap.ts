@@ -3,6 +3,30 @@ import { VersionedMap } from './versionedMap'
 
 const NO_IDS: readonly string[] = []
 
+const sameStrings = (
+  left: readonly string[] | undefined,
+  right: readonly string[] | undefined,
+): boolean => {
+  const leftLength = left?.length ?? 0
+  const rightLength = right?.length ?? 0
+
+  return (
+    leftLength === rightLength &&
+    (leftLength === 0 || left!.every((value, index) => value === right![index]))
+  )
+}
+
+/** Fields consumed by `buildLinkIndex`. Everything else (timestamps, tags,
+ *  source locator) may change without changing a single resolve answer. */
+const sameResolveInput = (left: NoteMeta, right: NoteMeta): boolean =>
+  left.id === right.id &&
+  left.title === right.title &&
+  left.class === right.class &&
+  left.filePath === right.filePath &&
+  left.slug === right.slug &&
+  sameStrings(left.aliases, right.aliases) &&
+  sameStrings(left.legacyNameAliases, right.legacyNameAliases)
+
 /** The snapshot's notes: metas by note-id, plus the derived facts the write
  *  path would otherwise recompute by walking the whole map on EVERY write —
  *  "which note lives at this storage path", "which notes claim an import source",
@@ -13,6 +37,11 @@ const NO_IDS: readonly string[] = []
  *  forgets, and the forgotten one is only visible as a write landing on top of a
  *  note the snapshot still holds. */
 export class NotesMap extends VersionedMap<string, NoteMeta> {
+  /** Exact invalidation signal for the wikilink resolve table. `version` is total
+   *  over every snapshot write; this narrower counter moves only when an input to
+   *  `buildLinkIndex` moves, so a body/timestamp write followed by a note read does
+   *  not pay an O(corpus) rebuild. */
+  resolveVersion = 0
   /** Changes after which a batch table may name an id it cannot safely hand out: a
    *  delete, a clear, or (conservatively) any class change. The important direction
    *  is a note LEAVING the user graph — the stale answer would expose a hidden id —
@@ -28,6 +57,9 @@ export class NotesMap extends VersionedMap<string, NoteMeta> {
   set(id: string, meta: NoteMeta): this {
     const prior = this.get(id)
 
+    if (!prior || !sameResolveInput(prior, meta)) {
+      this.resolveVersion++
+    }
     if (prior && prior.class !== meta.class) {
       this.retractions++
     }
@@ -65,6 +97,7 @@ export class NotesMap extends VersionedMap<string, NoteMeta> {
     const prior = this.get(id)
 
     if (prior) {
+      this.resolveVersion++
       this.retractions++
       this.unbind(prior.filePath, id)
       if (prior.sourceLocator) {
@@ -77,6 +110,7 @@ export class NotesMap extends VersionedMap<string, NoteMeta> {
 
   clear(): void {
     if (this.size) {
+      this.resolveVersion++
       this.retractions++
     }
     this.idsByPath.clear()

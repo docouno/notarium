@@ -76,6 +76,15 @@ export type CuratedRoleScope = {
   loadedTokens: number
 }
 
+type ResolvedContextNote = {
+  noteId?: string
+  content?: string
+  tokens?: number
+  title: string
+  spaceSlug: string
+  filePath: string
+}
+
 /** Flatten one curated layer into the exact note refs sent to an agent, preserving the
  * user's group order and the order inside each set. */
 export const loadedContextNotes = (
@@ -104,13 +113,7 @@ export const loadedContextNotes = (
  *  canon: docs/architecture.md#p5 */
 export const resolveContextSets = async (
   sets: readonly ContextSetRecord[],
-  read: (noteId: string) => Promise<{
-    noteId?: string
-    content: string
-    title: string
-    spaceSlug: string
-    filePath: string
-  } | null>,
+  read: (noteId: string) => Promise<ResolvedContextNote | null>,
 ): Promise<WeighedSet[]> =>
   Promise.all(
     sets.map(async (set) => {
@@ -125,7 +128,7 @@ export const resolveContextSets = async (
           return {
             noteId: note.noteId ?? ref.noteId,
             title: note.title,
-            tokens: estimateTokens(note.content),
+            tokens: note.tokens ?? estimateTokens(note.content ?? ''),
             space: note.spaceSlug,
             ...(isFolderPageNote(note.filePath) ? { folderOverview: true as const } : {}),
           }
@@ -145,13 +148,7 @@ export const resolveContextSets = async (
  *  pin bucket; a note pinned twice still dedups by id in {@link budgetSequence}. */
 export const resolveScopePins = async (
   noteIds: readonly string[],
-  read: (noteId: string) => Promise<{
-    noteId?: string
-    content: string
-    title: string
-    spaceSlug: string
-    filePath: string
-  } | null>,
+  read: (noteId: string) => Promise<ResolvedContextNote | null>,
 ): Promise<WeighedSetItem[]> => {
   const resolved = await Promise.all(
     noteIds.map(async (noteId) => {
@@ -164,7 +161,7 @@ export const resolveScopePins = async (
       return {
         noteId: note.noteId ?? noteId,
         title: note.title,
-        tokens: estimateTokens(note.content),
+        tokens: note.tokens ?? estimateTokens(note.content ?? ''),
         space: note.spaceSlug,
         ...(isFolderPageNote(note.filePath) ? { folderOverview: true as const } : {}),
       }
@@ -188,15 +185,18 @@ export const weighAlwaysLoad = async (
     ? all.filter((m) => isPathUnder(m.filePath, opts.pathPrefix as string))
     : all
   const tagged = inScope.filter((m) => (m.tags ?? []).includes(ALWAYS_LOAD_TAG))
+  const facts = store.noteFacts ? await store.noteFacts(tagged.map((meta) => meta.id!)) : {}
+
   return Promise.all(
     tagged.map(async (m) => {
-      const note = await store.read(m.id as string)
+      const fact = facts[m.id!]
+      const note = fact ? null : await store.read(m.id as string)
 
       return {
-        noteId: note.id ?? (m.id as string),
-        title: note.title ?? m.title,
-        tokens: estimateTokens(note.content),
-        ...(note.filePath && isFolderPageNote(note.filePath)
+        noteId: note?.id ?? (m.id as string),
+        title: fact?.title ?? note?.title ?? m.title,
+        tokens: fact?.bodyTokens ?? estimateTokens(note!.content),
+        ...(isFolderPageNote(note?.filePath ?? m.filePath)
           ? { folderOverview: true as const }
           : {}),
       }
@@ -215,8 +215,14 @@ export const personalProfilePin = async (store: KnowledgeStore): Promise<Weighed
   if (!meta?.id) {
     return null
   }
-  const note = await store.read(meta.id)
-  return { noteId: note.id ?? meta.id, title: note.title ?? meta.title, tokens: 0 }
+  const fact = store.noteFacts ? (await store.noteFacts([meta.id]))[meta.id] : undefined
+  const note = fact ? null : await store.read(meta.id)
+
+  return {
+    noteId: note?.id ?? meta.id,
+    title: fact?.title ?? note?.title ?? meta.title,
+    tokens: 0,
+  }
 }
 
 /** A scope's user-defined order: pin+set entries in rank order. Pins and sets share ONE

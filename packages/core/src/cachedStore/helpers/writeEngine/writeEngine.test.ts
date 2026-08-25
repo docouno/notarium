@@ -42,7 +42,7 @@ const hostFor = (
       }),
       resolvedTargetIds: () => [],
       sourceIdsTargeting: () => [],
-      patchNoteEdges: vi.fn(() => []),
+      patchNoteEdges: vi.fn(() => false),
       edgesBySource: new Map(),
       batchIndex: () => undefined,
     },
@@ -60,6 +60,7 @@ const hostFor = (
       },
     },
     previewCache: { delete: vi.fn(), set: vi.fn() },
+    noteFactsCache: { delete: vi.fn() },
     dirs: { has: () => true, add: vi.fn(() => false) },
     iso: () => '2026-08-18T00:00:00.000Z',
     reconcileSoon: vi.fn(),
@@ -80,6 +81,63 @@ const hostFor = (
 }
 
 describe('WriteEngine destination fence', () => {
+  it.each([
+    ['same derived edges', false, false],
+    ['changed derived edges', true, true],
+  ] as const)(
+    'publishes a visible body write with %s as graphChanged=%s',
+    async (_label, edgesChanged, expected) => {
+      const id = 'visible-note-id'
+      const path = 'visible.md'
+      const notes = new Map<string, NoteMeta>([
+        [
+          id,
+          {
+            id,
+            title: 'Visible',
+            class: 'user-doc',
+            filePath: path,
+            modifiedAt: null,
+            createdAt: null,
+          },
+        ],
+      ])
+      const live = {
+        id,
+        title: 'Visible',
+        class: 'user-doc',
+        filePath: path,
+        content: 'before',
+        frontmatter: {},
+        versionToken: 'before-token',
+        physicalIncarnation: { adapterId: 'test', claim: { kind: 'test', value: 'before' } },
+      } as unknown as NoteContent
+      const after = { ...live, content: 'after', versionToken: 'after-token' }
+      const { host } = hostFor(notes)
+
+      ;(host.snap.patchNoteEdges as ReturnType<typeof vi.fn>).mockReturnValue(edgesChanged)
+      ;(host.inner.read as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(live)
+        .mockResolvedValue(after)
+      ;(host.inner.write as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id,
+        title: 'Visible',
+        class: 'user-doc',
+        filePath: path,
+        versionToken: 'after-token',
+      })
+
+      await new WriteEngine(host).write({
+        originalId: id,
+        title: 'Visible',
+        content: 'after',
+        versionToken: exactVersionToken(live),
+      })
+
+      expect(host.emitChanged).toHaveBeenCalledWith([id], [], expected)
+    },
+  )
+
   it('enters aroundWrite after the mutation claim and releases it after finalize', async () => {
     const id = 'owned-note-id'
     const path = `${PACKAGE_DIR}/SKILL.md`
@@ -157,6 +215,7 @@ describe('WriteEngine destination fence', () => {
       'finalize',
       'around:finally',
     ])
+    expect(host.emitChanged).toHaveBeenCalledWith([id], [], false)
   })
 
   it('releases aroundWrite when the physical write fails', async () => {

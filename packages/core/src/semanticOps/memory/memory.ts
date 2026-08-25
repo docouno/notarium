@@ -298,25 +298,30 @@ export const buildMemoryIndex = async (
     classes: [NOTE_CLASS.agentMemory],
   })
   const out: MemoryIndexEntry[] = []
+  const eligible = metas.filter(
+    (meta) =>
+      meta.class === NOTE_CLASS.agentMemory &&
+      meta.id != null &&
+      memoryDirOf(meta.filePath, mountPrefix) === subdir,
+  )
+  const facts = store.noteFacts ? await store.noteFacts(eligible.map((meta) => meta.id!)) : {}
 
-  for (const m of metas) {
-    if (m.class !== NOTE_CLASS.agentMemory || m.id == null) {
-      continue
-    }
-    if (memoryDirOf(m.filePath, mountPrefix) !== subdir) {
-      continue
-    }
-    const note = await store.read(m.id)
-    const fmSummary =
-      typeof note.frontmatter?.summary === 'string' ? note.frontmatter.summary.trim() : ''
-    const summary = fmSummary || makeSnippet(note.content, 160)
+  for (const m of eligible) {
+    const fact = facts[m.id!]
+    const note = fact ? null : await store.read(m.id!)
+    const fmSummary = fact
+      ? (fact.summary?.trim() ?? '')
+      : typeof note!.frontmatter?.summary === 'string'
+        ? note!.frontmatter.summary.trim()
+        : ''
+    const summary = fmSummary || (fact ? fact.snippet : makeSnippet(note!.content, 160))
     out.push({
-      noteId: note.id ?? m.id,
-      category: note.title ?? m.title,
+      noteId: note?.id ?? m.id!,
+      category: fact?.title ?? note?.title ?? m.title,
       summary,
       // The eager profile carries the summary, not the body, so token cost = summary weight.
       tokens: estimateTokens(summary),
-      muted: isMutedFlag(note.frontmatter?.muted),
+      muted: fact?.muted ?? isMutedFlag(note!.frontmatter?.muted),
       createdAt: m.createdAt ?? null,
       modifiedAt: m.modifiedAt ?? null,
     })

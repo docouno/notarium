@@ -286,6 +286,7 @@ const run = async (): Promise<void> => {
     }
 
     const started = performance.now()
+    const cpuStarted = process.cpuUsage()
 
     loop.enable()
     // A refused probe after teardown is noise, not a finding — what the reader was
@@ -320,6 +321,8 @@ const run = async (): Promise<void> => {
     }
     const terminalAt = performance.now()
     const elapsedMs = terminalAt - started
+    const cpu = process.cpuUsage(cpuStarted)
+    const cpuMs = (cpu.user + cpu.system) / 1_000
 
     loop.disable()
     probing = false
@@ -452,6 +455,8 @@ const run = async (): Promise<void> => {
       source: SOURCE,
       notes: NOTES,
       elapsedMs: Math.round(elapsedMs),
+      cpuMs: Math.round(cpuMs),
+      cpuCoreRatio: Math.round((cpuMs / elapsedMs) * 100) / 100,
       notesPerSecond: Math.round((NOTES / elapsedMs) * 1000),
       rssPeakMb: Math.round(rssPeak / 1e6),
       rssDeltaMb: Math.round((rssPeak - rssBefore) / 1e6),
