@@ -148,8 +148,15 @@ export const parseNoteFile = (raw: string, path: string): ParsedNote => {
   // reader already steps over it, so only the block-less branch met the mark — sitting
   // where the title scan and the heading strip expect the first character, it cost the
   // note its own `# heading` title. Exactly one mark leads a file; a second is content.
+  // Stripped here and put back by `serializeNoteFile` from the file's own previous
+  // bytes: the mark belongs to the file, so an ordinary save and a strict restore give
+  // it the same answer, and neither invents one for a file that had none.
   const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw
-  const fm = parseFrontmatterBlock(text)
+  // A SECOND mark is content, so it cannot open a block: `FM_OPEN` tolerates one mark
+  // before the fence, which is right for the raw file and wrong for the text left after
+  // the prologue has already been taken off — it swallowed the author's byte and an
+  // ordinary save then wrote the file back with one mark fewer.
+  const fm = text.charCodeAt(0) === 0xfeff ? null : parseFrontmatterBlock(text)
   const afterFm = fm ? text.slice(fm.bodyStart) : text
   const frontmatter: Record<string, unknown> = {}
 
@@ -279,7 +286,10 @@ export const serializeNoteFile = ({
   // A full-state restore already split its canonical snapshot into authored
   // frontmatter and body. Reinterpreting a leading fenced block in that body
   // would hoist user prose into metadata and make restore destructive.
-  const inline = replacing ? null : parseFrontmatterBlock(body)
+  // A BODY has no encoding prologue — that belongs to the file — so a mark leading it is
+  // content, and a block cannot open behind one. `FM_OPEN` tolerates a mark because it is
+  // written for raw files; applying it here folded the author's byte into metadata.
+  const inline = replacing || body.charCodeAt(0) === 0xfeff ? null : parseFrontmatterBlock(body)
 
   // Anchors and aliases are order-dependent, while this serializer merges by key
   // and always replaces at least `title`. Refuse them on every incoming channel,
@@ -484,6 +494,14 @@ export const serializeNoteFile = ({
   // states — `singleLine`, not the raw value. Writing the raw one let a title with a
   // line terminator disagree with its own `title:`, and a heading that does not match
   // the title is never stripped on read: one stray copy stayed in the body forever.
-  const head = `---\n${frontmatterPayload}---\n\n# ${singleLine(title)}\n`
+  // The encoding prologue is a property of the FILE, not of anything we project, and this
+  // serializer rebuilds the file from scratch — so without carrying it over, an ordinary
+  // save silently rewrote a byte of somebody else's file. Exactly one mark leads a file
+  // (a second is content, the same law `FM_OPEN` states), it comes only from bytes that
+  // already had one, and `parseNoteFile` has stripped it off `cleanBody` already, so it
+  // cannot land twice. It sits outside the fences, so the frontmatter byte cap checked
+  // above is unaffected.
+  const bom = existingRaw?.charCodeAt(0) === 0xfeff ? '\uFEFF' : ''
+  const head = `${bom}---\n${frontmatterPayload}---\n\n# ${singleLine(title)}\n`
   return cleanBody ? `${head}\n${cleanBody}` : head
 }

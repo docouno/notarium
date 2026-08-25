@@ -12,15 +12,32 @@
 
 import { isDurableScalar } from '../../id'
 import { normTags } from '../../tags'
+import { FrontmatterGeometryError } from './frontmatterGeometryError'
 
 /**
- * Cut a leading YAML frontmatter block off a markdown document.
- * Tolerates a BOM and CRLF line endings; returns the body unchanged when no
- * frontmatter is present. The cheap strip — for previews/metrics that only need
- * the prose; use parseFrontmatterBlock when the entries themselves matter.
+ * Cut a leading YAML frontmatter block off a markdown document — the cheap strip, for
+ * previews/metrics/exports that only need the prose. It cuts exactly the block
+ * `parseFrontmatterBlock` reads and nothing else, so a `---` the domain calls a thematic
+ * break stays in the prose around it. Use the parser when the entries themselves matter.
+ * An oversized block degrades to "no block": every caller here renders text and has no
+ * failure branch to take.
  */
-export const stripFrontmatter = (content: string): string =>
-  (content || '').replace(/^\uFEFF?\s*---\r?\n[\s\S]*?\r?\n---\r?\n?/, '')
+export const stripFrontmatter = (content: string): string => {
+  const raw = content || ''
+
+  try {
+    const block = parseFrontmatterBlock(raw)
+    return block ? raw.slice(block.bodyStart) : raw
+  } catch (error) {
+    // Only the budget refusal degrades. Anything else is a real fault in the parser, and
+    // swallowing it here would hide it behind a document that merely looks block-less.
+    if (error instanceof FrontmatterLimitError) {
+      return raw
+    }
+
+    throw error
+  }
+}
 
 /** One frontmatter entry as RAW lines. `key` is null for passthrough lines the
  *  parser doesn't model (a comment at column 0) — they re-emit verbatim. Keeping
@@ -905,6 +922,121 @@ export const parseFrontmatterBlock = (raw: string): FrontmatterBlock | null => {
   return { entries, bodyStart }
 }
 
+/** One entry's CHARACTER span in the source, `[start, end)` with `end` just past the
+ *  line terminator of the entry's last line. Index-aligned with the block's `entries`. */
+export type FrontmatterSpan = { key: string | null; start: number; end: number }
+
+/** One frontmatter line, by the rule this parser and a YAML reader both use (`\r?\n`)
+ *  rather than the Markdown physical-line rule. The two disagree on a lone CR and on
+ *  U+2028/U+2029, and none of those ends a YAML line: walking the block with the wider
+ *  rule splits an entry the parser kept whole. `limit` is the payload end, so no walk
+ *  can wander past the closing fence. */
+const nextFrontmatterLineSpan = (
+  text: string,
+  start: number,
+  limit: number,
+): { end: number; next: number } | null => {
+  if (start >= limit) {
+    return null
+  }
+  const feed = text.indexOf('\n', start)
+  const breakAt = feed < 0 || feed >= limit ? limit : feed
+
+  return {
+    end: breakAt > start && text[breakAt - 1] === '\r' ? breakAt - 1 : breakAt,
+    next: Math.min(breakAt + 1, limit),
+  }
+}
+
+/** The payload between the fences, in character offsets of `raw`: `payloadStart` is the
+ *  first line after the opening fence, `payloadEnd` the start of the closing fence line
+ *  — the insertion point for a new entry. `bodyStart` comes from the parsed block.
+ *
+ *  A byte-order mark needs no compensation here: it shares the opening fence's line, and
+ *  this walk steps over that whole line. */
+export const frontmatterPayloadBounds = (
+  raw: string,
+  bodyStart: number,
+): { payloadStart: number; payloadEnd: number } => {
+  const payloadStart = nextFrontmatterLineSpan(raw, 0, bodyStart)?.next ?? bodyStart
+  let cursor = payloadStart
+  let payloadEnd = -1
+
+  while (cursor < bodyStart) {
+    const line = nextFrontmatterLineSpan(raw, cursor, bodyStart)
+
+    if (!line) {
+      break
+    }
+    if (trimYamlHorizontalEnd(raw.slice(cursor, line.end)) === '---') {
+      payloadEnd = cursor
+      break
+    }
+    cursor = line.next
+  }
+  if (payloadEnd < payloadStart) {
+    throw new FrontmatterGeometryError('geometry')
+  }
+
+  return { payloadStart, payloadEnd }
+}
+
+/** Where each parsed entry physically sits in `raw`. This is the geometry a writer needs
+ *  to change one entry and leave the rest byte-identical, and the geometry an analyzer
+ *  needs to bind a YAML node to the lines that carry it.
+ *
+ *  Fail-closed: a divergence between the parser's lines and the source throws rather than
+ *  returning a span that names somebody else's bytes. */
+export const frontmatterEntrySpans = (raw: string, block: FrontmatterBlock): FrontmatterSpan[] => {
+  const { payloadStart, payloadEnd } = frontmatterPayloadBounds(raw, block.bodyStart)
+  const spans: FrontmatterSpan[] = []
+  let cursor = payloadStart
+
+  for (const entry of block.entries) {
+    // A blank line BETWEEN entries is legal YAML that the parser drops: it is not an entry
+    // of its own, while a blank that BELONGS to one — block-scalar content, a paragraph
+    // break inside a continued value — stays in that entry's lines and is matched below.
+    // Stepping over exactly the dropped ones is what keeps this walk in sync with the
+    // parser; without it the first such blank shifts every later span.
+    if (!isYamlBlank(entry.lines[0] ?? '')) {
+      let blank = nextFrontmatterLineSpan(raw, cursor, payloadEnd)
+
+      while (blank && isYamlBlank(raw.slice(cursor, blank.end))) {
+        cursor = blank.next
+        blank = nextFrontmatterLineSpan(raw, cursor, payloadEnd)
+      }
+    }
+    const start = cursor
+
+    // Within an entry the lines stay consecutive — with one exception the parser itself
+    // creates: a blank following a KEYLESS entry is dropped outright rather than held
+    // (only a keyed entry can adopt one later), and a continuation line after it is still
+    // appended to that same entry. Its lines are then genuinely non-consecutive in the
+    // source, and refusing here would narrow the write channel over documents the parser
+    // describes perfectly.
+    for (const expected of entry.lines) {
+      let line = nextFrontmatterLineSpan(raw, cursor, payloadEnd)
+
+      while (
+        entry.key == null &&
+        line &&
+        !isYamlBlank(expected) &&
+        isYamlBlank(raw.slice(cursor, line.end))
+      ) {
+        cursor = line.next
+        line = nextFrontmatterLineSpan(raw, cursor, payloadEnd)
+      }
+      if (!line || raw.slice(cursor, line.end) !== expected) {
+        throw new FrontmatterGeometryError('geometry')
+      }
+      cursor = line.next
+    }
+    spans.push({ key: entry.key, start, end: cursor })
+  }
+
+  return spans
+}
+
 /** A block scalar's text, FLATTENED onto one line (its lines joined by spaces).
  *
  *  Reading it at all is what a real archive needs — a Jekyll/Hugo post writes its
@@ -1426,22 +1558,71 @@ export const frontmatterListEntry = (key: string, items: readonly string[]): Fro
     : [`${key}: []`],
 })
 
-/** Set (or replace) one scalar key in a document's leading frontmatter block,
- *  creating the block when the document has none. Used to materialize the
- *  internal note-id on write: the engine merges content-frontmatter into the
- *  file's, so injecting here is the whole write channel. */
+/** Set (or replace) one SERVICE key in a document's leading frontmatter block, creating
+ *  the block when the document has none. It re-materializes the internal note-id on bytes
+ *  that already exist — an ordinary save rebuilds the whole block instead.
+ *
+ *  Only the target key's own entry changes: every other entry keeps its bytes, its order
+ *  and its line endings, and duplicates of the target collapse onto the FIRST slot so the
+ *  reader's last-wins answer and this writer's answer are finally the same one. The whole
+ *  entry is replaced rather than the value inside it — a block list, a block scalar or a
+ *  bare `key:` has no value slot on its own line, and patching one glues the next line
+ *  onto the value.
+ *
+ *  Throws `FrontmatterGeometryError` instead of writing when the parser's entries no
+ *  longer describe the source, or when the target entry defines an anchor — ANY anchor,
+ *  whether or not something currently aliases it: this channel replaces the whole entry,
+ *  and proving that nothing points at the name is the document-wide question the byte
+ *  planner exists for, not one a line reader should answer.
+ *  canon: docs/core.md#identity */
 export const upsertFrontmatterKey = (content: string, key: string, value: string): string => {
-  const body = content || ''
-  const fm = /^(\uFEFF?\s*---\r?\n)([\s\S]*?)(\r?\n---(?:\r?\n|$))/.exec(body)
+  const raw = content || ''
+  const block = parseFrontmatterBlock(raw)
+  const line = frontmatterScalarEntry(key, value).lines[0]
 
-  if (!fm) {
-    return `---\n${key}: ${value}\n---\n${body}`
+  if (!block) {
+    const eol = raw.includes('\r\n') ? '\r\n' : '\n'
+    // The encoding prologue opens the FILE: a mark that no longer leads its bytes is not
+    // a mark at all, it is a stray zero-width space in the middle of the prose.
+    const start = raw.charCodeAt(0) === 0xfeff ? 1 : 0
+
+    return `${raw.slice(0, start)}---${eol}${line}${eol}---${eol}${raw.slice(start)}`
   }
-  const re = new RegExp(`^${key.replace(/[.*+?^${}()|[\]\\-]/g, '\\$&')}\\s*:.*$`, 'm')
-  const block = re.test(fm[2])
-    ? fm[2].replace(re, `${key}: ${value}`)
-    : `${fm[2]}\n${key}: ${value}`
-  return fm[1] + block + fm[3] + body.slice(fm[0].length)
+  const spans = frontmatterEntrySpans(raw, block)
+  const targets: FrontmatterSpan[] = []
+
+  for (let index = 0; index < spans.length; index++) {
+    if (spans[index].key !== key) {
+      continue
+    }
+    if (frontmatterEntryDefinesYamlAnchor(block.entries[index])) {
+      throw new FrontmatterGeometryError('anchored')
+    }
+    targets.push(spans[index])
+  }
+
+  if (!targets.length) {
+    const { payloadEnd } = frontmatterPayloadBounds(raw, block.bodyStart)
+    // The BLOCK's line ending, not the document's: a file whose frontmatter is LF and
+    // whose body is CRLF is one this project's own serializer writes, and a lone CRLF
+    // entry among LF ones is a line ending nobody in that block chose.
+    const blockEol = raw.slice(0, payloadEnd).endsWith('\r\n') ? '\r\n' : '\n'
+
+    return `${raw.slice(0, payloadEnd)}${line}${blockEol}${raw.slice(payloadEnd)}`
+  }
+  // The FIRST slot, not the last: it keeps the key where the file already carries it,
+  // among the author's own fields.
+  const [first, ...duplicates] = targets
+  const terminator = raw.slice(first.start, first.end).endsWith('\r\n') ? '\r\n' : '\n'
+  let out = `${raw.slice(0, first.start)}${line}${terminator}`
+  let read = first.end
+
+  for (const duplicate of duplicates) {
+    out += raw.slice(read, duplicate.start)
+    read = duplicate.end
+  }
+
+  return out + raw.slice(read)
 }
 
 /**

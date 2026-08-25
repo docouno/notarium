@@ -54,13 +54,30 @@ filtered population, not the page. `restoreAvailable` reports the host capabilit
 separately from intrinsic item state.
 
 Every row exposes both compatibility `restorable` (a blob exists) and the authoritative
-`restoreAvailability`:
+`restoreAvailability` <a id="availability"></a>:
 
 - `full` — exact Markdown/skill source proved safe;
 - `partial` — former `markdown-v1` or legacy body-only compatibility state;
 - `opaque`, `gap`, `blocked`, `unknown` — visible history but no safe restore;
+- `unreadable` — a blob IS stored and this server cannot open it, so unlike every value
+  above not even inspection is on offer;
 - `capability-unavailable` — state could be restored, but this host has no strict
   restore coordinator.
+
+**`gap` and `unreadable` are different facts and must not share words.** A gap means the
+body never passed through us; `unreadable` means the copy is here and the codec refuses
+it, because it proves a stored header against a fresh reading of that row's own source —
+so the refusal describes THIS reader, and no retry clears it. Telling someone their
+content was never captured, when it was, is the specific lie this separation exists to
+end; the refusal travels as its own `revision_content_unreadable`.
+
+**Only a surface that already opened the blob may answer `unreadable`.** The trash list
+builds a page of up to a hundred rows from journal columns and stays that way — saying
+the truth there would mean decoding every blob on the page. So `restoreAvailability` in
+the list, and the `restorableTotal`/`partialTotal` counters computed with it, can call a
+row restorable while the deleted-note view and the open revision — both of which fetch
+the body — say `unreadable` and withdraw Restore. That disagreement is deliberate and
+bounded: the surfaces that offer the button are the ones that know.
 
 Only `full` and `partial` enter `restorableTotal`; `partialTotal` is the subset that
 requires a lossy-copy warning. If strict durable bulk restore is unavailable, both

@@ -84,6 +84,7 @@ import { materializeRevisionState } from '../test/cases/revisionStates'
 import { agentSessionId } from '../test/cases/sessionIds'
 import { seedDurableImports } from './seedDurableImports'
 import { applySeedExternalRewrites, identityClaimRewrite } from './seedExternalRewrites'
+import { applySeedExternalSources } from './seedExternalSources'
 import {
   makeOwnerRemap,
   resolveSeedAgentActivityOwner,
@@ -1706,6 +1707,31 @@ const run = async (): Promise<void> => {
       }
     }),
   )
+  // Whole-file shapes no authoring write produces — an encoding prologue, prose opening
+  // with a `---` rule. AFTER the size-preserving rewrites above on purpose: those look
+  // for their own occurrence in the bytes the timeline wrote, and would not find it here.
+  const externalSources = await applySeedExternalSources(
+    (world.externalSources ?? []).map((decl) => {
+      const note = live.get(decl.note)
+
+      if (!note) {
+        throw new Error(`external source references unknown note ${decl.note}`)
+      }
+      const spaceId = idOf.get(note.spaceSlug)
+      const notesDir = spaceId ? notesDirOf(spaceId) : null
+
+      if (!notesDir) {
+        throw new Error(`external source cannot resolve space ${note.spaceSlug}`)
+      }
+
+      return {
+        note: decl.note,
+        filePath: join(notesDir, note.filePath),
+        source: decl.source,
+        tokens: { noteId: note.id, path: note.filePath, createdAt: note.createdAt },
+      }
+    }),
+  )
 
   // 9. Archive any space the case marks archived (#110): it moves to the Trash
   //    (Spaces tab) with its data intact. Done AFTER its notes are seeded — archiving
@@ -1767,6 +1793,7 @@ const run = async (): Promise<void> => {
           jobs,
           durableImports,
           externalRewrites,
+          externalSources,
         },
         login: { username: primary.username, password: primary.password ?? '(none)' },
         url: `http://localhost:${publicPort}`,

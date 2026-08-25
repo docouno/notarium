@@ -20,10 +20,6 @@ describe('makeSnippet', () => {
     expect(s).toBe('Intro bold and code. item one item two link and alias and Plain')
   })
 
-  it('drops a leading frontmatter block', () => {
-    expect(makeSnippet('---\ntags: [x]\n---\nBody text')).toBe('Body text')
-  })
-
   it('clamps at a word boundary with an ellipsis', () => {
     const s = makeSnippet('alpha bravo charlie delta echo', 14)
     expect(s).toBe('alpha bravo…')
@@ -39,6 +35,31 @@ describe('firstImage', () => {
     expect(firstImage('<img src="https://img.test/b.png">')).toBe('https://img.test/b.png')
     expect(firstImage('![local](attachments/pic.png)')).toBeNull()
     expect(firstImage('no images here')).toBeNull()
+  })
+})
+
+describe('derivePreview', () => {
+  // It takes a BODY and asks nothing about a leading block. A caller holding unparsed
+  // text strips it visibly at the call site instead — that is what keeps one file from
+  // growing two previews once normalisation leaves bytes that merely READ like a block.
+  it('does not re-decide what a body is', () => {
+    const looksLikeABlock = '---\ntags: [x]\n---\nBody text'
+
+    expect(derivePreview(looksLikeABlock).snippet).toContain('Body text')
+    expect(derivePreview(looksLikeABlock).snippet).toContain('tags')
+  })
+
+  it('agrees with the file-shaped derivation on one and the same note', () => {
+    const raw = '\n---\nA thought I wrote between two rules.\n---\nAnd the rest.\n'
+    // What the file parse hands a store as this note's body: the leading blank is gone,
+    // so these bytes now read like a block — and must still preview as the prose they are.
+    const body = '---\nA thought I wrote between two rules.\n---\nAnd the rest.\n'
+    const fromFile = derivePreviewFromFile(raw, 'rule-led-prose')
+    const fromBody = derivePreview(body)
+
+    expect(fromBody.snippet).toBe(fromFile.snippet)
+    expect(fromBody.words).toBe(fromFile.words)
+    expect(fromBody.words).toBe(10)
   })
 })
 
@@ -68,5 +89,17 @@ describe('derivePreviewFromFile', () => {
   it('keeps a first heading that is NOT the title', () => {
     const p = derivePreviewFromFile('# Different Heading\n\ntext', 'My Note')
     expect(p.snippet).toBe('Different Heading text')
+  })
+
+  it('keeps prose that opens with a rule — the preview strips a block, not a paragraph', () => {
+    const raw = '\n---\nA thought I wrote between two rules.\n---\nAnd the rest.\n'
+    const p = derivePreviewFromFile(raw, 'My Note')
+
+    expect(p.snippet).toContain('A thought I wrote between two rules.')
+    expect(p.snippet).toContain('And the rest.')
+    // Every FIELD of one preview answers over the same text. The counts used to be
+    // computed after a second, independent guess at where metadata ended, so a card
+    // showed a snippet of ten words beside a count of three.
+    expect(p.words).toBe(10)
   })
 })

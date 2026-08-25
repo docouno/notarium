@@ -4,9 +4,16 @@ import { TOKEN_ESTIMATE } from './consts'
 import { countWords, curateBudget, estimateTokens, tokenBudgetLoadedCount } from './metrics'
 
 describe('countWords', () => {
-  it('counts words ignoring frontmatter, code and tags', () => {
-    const body = '---\ntitle: x\n---\nOne two `skip me` three\n```\nnope\n```\n<b>four</b>'
+  it('counts words ignoring code and tags', () => {
+    const body = 'One two `skip me` three\n```\nnope\n```\n<b>four</b>'
     expect(countWords(body)).toBe(4)
+  })
+
+  // These take a BODY. Re-deciding where metadata ends is what let one document get two
+  // answers — a preview whose snippet held a paragraph its own word count had thrown away
+  // because a normalisation step in between had turned that prose into a leading block.
+  it('counts what it is given, without hunting for a leading block', () => {
+    expect(countWords('---\ntitle: x\n---\nOne two')).toBe(countWords('title x One two'))
   })
 })
 
@@ -15,9 +22,9 @@ describe('estimateTokens', () => {
     // 8 ASCII chars → 8/4 = 2; 6 Cyrillic chars → 6/2 = 3; rounded sum = 5.
     expect(estimateTokens('abcdefghПривет')).toBe(Math.round(8 / 4 + 6 / 2))
   })
-  it('drops frontmatter (metadata, not the loaded body)', () => {
+  it('weighs what it is given — the caller decides what the body is', () => {
     const withFm = '---\ntitle: Some Long Title Here\n---\nabcd'
-    expect(estimateTokens(withFm)).toBe(estimateTokens('abcd'))
+    expect(estimateTokens(withFm)).toBeGreaterThan(estimateTokens('abcd'))
   })
   it('counts code as real content (unlike countWords)', () => {
     expect(estimateTokens('```\nconst x = 1\n```')).toBeGreaterThan(0)

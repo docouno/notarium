@@ -1,16 +1,16 @@
-import { stripFrontmatter } from '../frontmatter'
 import { TOKEN_ESTIMATE } from './consts'
 
 /**
- * Rough word count over a note body (frontmatter and code stripped) — the
- * "content mass" signal behind the graph's "Size by → Words" and the editor's
- * status bar. Approximate by design: it sizes things *relatively*, so a
- * stable monotonic measure of how much prose a note carries is enough — no need
- * for a precise statistic. A pure libs function (depends only on stripFrontmatter
- * here) so any layer, including the web editor, can reuse it.
+ * Rough word count over a note BODY (code stripped) — the "content mass" signal behind
+ * the graph's "Size by → Words" and the editor's status bar. Approximate by design: it
+ * sizes things *relatively*, so a stable monotonic measure of how much prose a note
+ * carries is enough — no need for a precise statistic.
+ *
+ * Takes a BODY and does not re-decide where metadata ends; a caller holding unparsed text
+ * strips it itself.
  */
-export const countWords = (content: string): number => {
-  const text = stripFrontmatter(content)
+export const countWords = (body: string): number => {
+  const text = body
     .replace(/```[\s\S]*?```/g, ' ') // fenced code blocks
     .replace(/`[^`]*`/g, ' ') // inline code
     .replace(/<[^>]+>/g, ' ') // html tags
@@ -25,15 +25,15 @@ export const countWords = (content: string): number => {
  * text into ASCII and non-ASCII characters and divides each bucket by its
  * chars-per-token coefficient, because scripts differ wildly in BPE density
  * (Latin ≈4 chars/token, Cyrillic ≈2). Code and prose both count — the agent
- * loads them alike — but frontmatter is stripped (metadata, not the body the
- * agent reads). Approximate by design: it sizes context *relatively* so the
- * fattest pins stand out; a precise per-model count is not the point.
+ * loads them alike. Like `countWords` it takes a BODY and does not re-decide where
+ * metadata ends. Approximate by design: it sizes context *relatively* so the fattest
+ * pins stand out; a precise per-model count is not the point.
  */
 export const estimateTokens = (
-  content: string,
+  body: string,
   coeff: { asciiCharsPerToken: number; nonAsciiCharsPerToken: number } = TOKEN_ESTIMATE,
 ): number => {
-  const text = stripFrontmatter(content)
+  const text = body
   let ascii = 0
   let nonAscii = 0
 

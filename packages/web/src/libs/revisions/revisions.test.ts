@@ -10,6 +10,7 @@ describe('recoveryPresentation', () => {
     ['blocked', 'source-only', 'Source only'],
     ['unknown', 'source-only', 'Source only'],
     ['gap', 'record-only', 'No copy'],
+    ['unreadable', 'record-only', 'Unreadable copy'],
     ['capability-unavailable', 'host-unavailable', 'Restore unavailable'],
   ] as Array<[NoteRevision['restoreAvailability'], string, string]>)(
     '%s is a user outcome, not an internal enum',
@@ -18,6 +19,11 @@ describe('recoveryPresentation', () => {
       expect(recoveryPresentation(availability).reason.length).toBeGreaterThan(20)
     },
   )
+
+  it('does not tell a person their copy is gone when it is merely unreadable here', () => {
+    expect(recoveryPresentation('unreadable').reason).not.toBe(recoveryPresentation('gap').reason)
+    expect(recoveryPresentation('unreadable').reason).toMatch(/saved/i)
+  })
 })
 
 const wire = (over: Partial<NoteRevision> = {}): NoteRevision => ({

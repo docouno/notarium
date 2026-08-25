@@ -149,6 +149,17 @@ export const revisionHasNoContent = (revisionId: string): StoreError => {
   return err
 }
 
+/** A revision whose body WAS captured and which this reader cannot project. The caller's
+ *  copy is not lost and not absent; this server just cannot open it, and no retry changes
+ *  that. A tool error rather than a fault for the same reason as the gap above: nothing on
+ *  this server is broken, and the answer will not differ next time. */
+export const revisionContentUnreadable = (revisionId: string): StoreError => {
+  const err = new StoreError(`revision content cannot be read by this server: ${revisionId}`)
+  err.isToolError = true
+  err.reason = STORE_ERROR_REASON.revisionContentUnreadable
+  return err
+}
+
 /** A restore-from-trash named a note that isn't in the trash — never
  *  deleted, or already restored/purged. The caller's mistake (a stale trash
  *  list), not a server fault. */

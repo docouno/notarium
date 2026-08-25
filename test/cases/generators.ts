@@ -14,6 +14,7 @@ import type {
   DurableImportDecl,
   ExternalIdentityClaimDecl,
   ExternalRewriteDecl,
+  ExternalSourceDecl,
   FavoriteDecl,
   JobDecl,
   MemberDecl,
@@ -207,6 +208,7 @@ export class WorldBuilder {
   private readonly externalRewrites: ExternalRewriteDecl[] = []
   private readonly revisionStates: RevisionStateDecl[] = []
   private readonly externalIdentityClaims: ExternalIdentityClaimDecl[] = []
+  private readonly externalSources: ExternalSourceDecl[] = []
   private readonly events: CaseEvent[] = []
   private hasAuth = false
   private idSeq = 0
@@ -423,6 +425,13 @@ export class WorldBuilder {
     return this
   }
 
+  /** Plant whole-file bytes an authoring write cannot produce (an encoding prologue, a
+   *  leading `---` rule that is prose). Real stand only — see ExternalSourceDecl. */
+  externalSource(decl: ExternalSourceDecl): this {
+    this.externalSources.push(decl)
+    return this
+  }
+
   build(): CaseWorld {
     return {
       now: this.now.toISOString(),
@@ -458,6 +467,7 @@ export class WorldBuilder {
       ...(this.externalIdentityClaims.length
         ? { externalIdentityClaims: this.externalIdentityClaims }
         : {}),
+      ...(this.externalSources.length ? { externalSources: this.externalSources } : {}),
     }
   }
 

@@ -149,6 +149,15 @@ export const recoveryPresentation = (
         reason:
           'Notarium recorded the deletion, but the note content was never captured. There is no copy to restore.',
       }
+    case 'unreadable':
+      // `record-only`, same as a gap: what a person can DO is identical — no inspection
+      // and no restore — and the wire enum keeps the two causes apart for the words.
+      return {
+        kind: 'record-only',
+        label: 'Unreadable copy',
+        reason:
+          'A copy was saved, but this version of Notarium can no longer read it, so it cannot be inspected or restored.',
+      }
     case 'capability-unavailable':
       return {
         kind: 'host-unavailable',

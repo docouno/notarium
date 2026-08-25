@@ -14,7 +14,10 @@ import { afterEach, describe, expect, it } from 'vitest'
 import type { StoreEvent } from '@notarium/contract'
 
 type ChangedEvent = Extract<StoreEvent, { type: 'changed' }>
-import { CachedStore, NOTE_ID_FRONTMATTER_KEY } from '@notarium/core'
+// Read the claim back with the READER rather than grepping the bytes: an id may be
+// emitted quoted (the alphabet includes a leading `-`), and a substring assertion then
+// fails on ~1.6 % of generated ids — a test that is green by luck.
+import { CachedStore, frontmatterValue, NOTE_ID_FRONTMATTER_KEY } from '@notarium/core'
 import {
   createLocalFsFiles,
   createNodeSqliteDriver,
@@ -136,7 +139,7 @@ describe('cross-space note-id collision (#327)', () => {
     // name its own id, so the collision does not come back on the next boot.
     const betaRaw = readFileSync(join(beta.dir, 'copy.md'), 'utf8')
 
-    expect(betaRaw).toContain(`${NOTE_ID_FRONTMATTER_KEY}: ${betaId}`)
+    expect(frontmatterValue(betaRaw, NOTE_ID_FRONTMATTER_KEY)).toBe(betaId)
     expect(betaRaw).not.toContain(SHARED_ID)
     expect(betaRaw).toContain('beta body')
     // Alpha's bytes were never touched.
@@ -336,7 +339,7 @@ describe('cross-space note-id collision (#327)', () => {
 
     // The external writer's bytes survive, and they carry the settled identity.
     expect(raw).toContain('second body')
-    expect(raw).toContain(`${NOTE_ID_FRONTMATTER_KEY}: ${betaId}`)
+    expect(frontmatterValue(raw, NOTE_ID_FRONTMATTER_KEY)).toBe(betaId)
     // The INDEX describes those bytes, not the ones the proof started from —
     // this is what the final observation buys. A direct read would pass either
     // way (it serves from disk); the derived surfaces are where a stale proof
@@ -360,6 +363,57 @@ describe('cross-space note-id collision (#327)', () => {
     await beta.store.checkpoint()
     await beta.store.checkpoint()
     expect(changed).toEqual([])
+  })
+
+  it('leaves bytes it cannot rewrite alone, and keeps sweeping past them', async () => {
+    const { space } = world()
+    const alpha = space('alpha')
+
+    write(alpha.dir, 'note.md', noteWith(SHARED_ID, 'Alpha', 'alpha body'))
+    await alpha.store.start()
+
+    let betaDir = ''
+    let reads = 0
+    // The loser's claim is readable when the sweep arbitrates it, and an external
+    // writer turns it into an anchor the neighbouring field aliases before convergence
+    // reaches the bytes. Rewriting the entry would delete the anchor and leave
+    // `mirror: *i` dangling in a file that still parses — so convergence refuses.
+    const anchored = `---\n${NOTE_ID_FRONTMATTER_KEY}: &i ${SHARED_ID}\ntitle: Beta copy\nmirror: *i\n---\n\nbeta body\n`
+    const beta = space('beta', (real) =>
+      withFacets(real, {
+        base: {
+          read: async (path) => {
+            // Read 1 is the boot scan; the sweep arbitrates the claim off disk on its
+            // own; read 2 is the first observation convergence takes. Land the external
+            // rewrite there — that is the window this refusal exists for.
+            if (path === 'copy.md' && ++reads === 2) {
+              write(betaDir, 'copy.md', anchored)
+            }
+
+            return real.base.read(path)
+          },
+        },
+      }),
+    )
+
+    betaDir = beta.dir
+    write(betaDir, 'copy.md', noteWith(SHARED_ID, 'Beta copy', 'beta body'))
+
+    await beta.store.start()
+
+    // Not one byte of the author's file moved…
+    expect(readFileSync(join(betaDir, 'copy.md'), 'utf8')).toBe(anchored)
+    // …the space still booted and still serves the note, under the id the registry
+    // binds to its path rather than the one its bytes name…
+    expect((await beta.store.syncStatus()).scan).not.toMatchObject({ phase: 'error' })
+    const betaNotes = await beta.store.list()
+
+    expect(betaNotes).toHaveLength(1)
+    expect(betaNotes[0].id).not.toBe(SHARED_ID)
+    // …and the refusal is terminal, not a wedge: the next poll makes progress too.
+    await beta.store.checkpoint()
+    expect(readFileSync(join(betaDir, 'copy.md'), 'utf8')).toBe(anchored)
+    expect((await beta.store.list())[0].id).toBe(betaNotes[0].id)
   })
 
   it('fails closed on a file that never holds still, rather than publishing an unproven identity', async () => {
@@ -909,7 +963,7 @@ describe('cross-space note-id collision (#327)', () => {
     // on the next boot.
     const raw = readFileSync(join(betaDir, 'copy.md'), 'utf8')
 
-    expect(raw).toContain(`${NOTE_ID_FRONTMATTER_KEY}: ${copy!.id}`)
+    expect(frontmatterValue(raw, NOTE_ID_FRONTMATTER_KEY)).toBe(copy!.id)
     expect(raw).not.toContain(SHARED_ID)
     // …and alpha still owns the contested id, untouched.
     expect(await meta.identity.findById!(SHARED_ID)).toMatchObject({

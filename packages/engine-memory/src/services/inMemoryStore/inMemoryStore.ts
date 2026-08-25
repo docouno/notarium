@@ -99,6 +99,7 @@ import {
   STORAGE_OWNER_KEY,
   storedSlug,
   StoreError,
+  stripFrontmatter,
   stripTitleHeading,
   SURFACE,
   unionLegacyNameAliases,
@@ -1169,7 +1170,10 @@ export class InMemoryStore implements KnowledgeStore {
       return null
     }
     const n = this.notes[i]
-    return derivePreview(stripTitleHeading(n.content, n.title), n.tags)
+    // The fake keeps a note's authored text as given, inline frontmatter included (it has
+    // no serializer to fold it in — see the write path below), so this stand's "body" is
+    // unparsed and the block is answered for here.
+    return derivePreview(stripTitleHeading(stripFrontmatter(n.content), n.title), n.tags)
   }
 
   async search(q: string): Promise<SearchResult[]> {
@@ -1191,7 +1195,7 @@ export class InMemoryStore implements KnowledgeStore {
         modifiedAt: n.modifiedAt,
         createdAt: n.createdAt,
         score: 1,
-        snippet: makeSnippet(stripTitleHeading(n.content, n.title), 160),
+        snippet: makeSnippet(stripTitleHeading(stripFrontmatter(n.content), n.title), 160),
         noteType: n.noteType || DEFAULT_NOTE_TYPE,
         type: 'note',
       }))

@@ -32,6 +32,7 @@ import {
   REVISION_KIND,
   sha256Hex,
   SPACE_LIFECYCLE_PHASE,
+  STORE_ERROR_REASON,
 } from '@notarium/core'
 import {
   createLocalFsFiles,
@@ -91,6 +92,38 @@ const unsafeHistoricalState = (): DocumentState => {
   })
 
   return analyzeDocumentState({ source, pathFallbackTitle: 'note', ownerProof })
+}
+
+/** A blob no writer in this tree produces and only two analyzers can: the codec proves a
+ *  stored header against a FRESH reading of that row's own source, so moving a claim off
+ *  its field makes the re-derived fingerprint disagree with the stored one forever. Built
+ *  the same narrow way as the journal's own fixture. */
+const undecodableHistoricalState = (): DocumentState => {
+  const source = new TextEncoder().encode(
+    `---\nnotarium-id: ${NOTE_ID}\ntitle: Unreadable\n---\nbody\n`,
+  )
+  const ownerProof = bindStorageOwnerProof({
+    source,
+    owners: [{ key: 'notarium-id', ownership: 'value' }],
+    evidence: { kind: 'mutation-receipt', id: 'pre-upgrade-reader' },
+  })
+  const state = analyzeDocumentState({ source, pathFallbackTitle: 'note', ownerProof })
+  const offField = (range: { start: number; end: number }) => ({
+    start: range.start - 1,
+    end: range.end - 1,
+  })
+
+  return {
+    ...state,
+    provenance: {
+      ...state.provenance,
+      claims: state.provenance.claims.map((claim) => ({
+        ...claim,
+        valueRange: offField(claim.valueRange),
+        entryRange: offField(claim.entryRange),
+      })),
+    },
+  }
 }
 
 afterEach(async () => {
@@ -1521,6 +1554,14 @@ describe('RestoreCoordinator eligibility', () => {
       },
     },
     {
+      // A stored blob this reader cannot project: the copy IS here, so the refusal is a
+      // fact about this server, not about the row — and the trash dictionary now has a
+      // sentence for exactly that instead of blaming the document.
+      name: 'a stored copy this server cannot read',
+      reason: STORE_ERROR_REASON.revisionContentUnreadable,
+      options: { sourceState: undecodableHistoricalState() },
+    },
+    {
       name: 'opaque bytes',
       reason: 'opaque-source',
       options: {
@@ -1534,6 +1575,27 @@ describe('RestoreCoordinator eligibility', () => {
       name: 'unsafe owner anchor dependencies',
       reason: 'unsafe-source',
       options: { sourceState: unsafeHistoricalState() },
+    },
+    {
+      // The legacy channel plans over the LIVE file, and captured tags land as a whole
+      // entry — which is where an anchor lives when `tags:` runs over its own lines.
+      // Publishing that candidate would leave `mirror: *t` pointing at nothing.
+      name: 'a legacy projection that would orphan an alias in the live file',
+      reason: 'legacy-source-unsafe',
+      options: {
+        currentState: analyzeDocumentState({
+          source: new TextEncoder().encode(
+            '---\ntitle: Current\ntags: &t\n  - current\nmirror: *t\n---\ncurrent body\n',
+          ),
+          pathFallbackTitle: 'note',
+        }),
+        sourceRecord: {
+          content: 'legacy body\n',
+          stateFormat: null,
+          title: 'Legacy title',
+          tags: ['legacy'],
+        },
+      },
     },
     {
       name: 'a changed path-derived title',

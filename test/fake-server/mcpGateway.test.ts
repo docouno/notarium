@@ -2758,6 +2758,22 @@ describe('create_note', () => {
     expect(text(r)).toMatch(/needs a title/i)
   })
 
+  it('refuses a body-first note whose body opens with a horizontal rule (#156)', async () => {
+    // The same answer the fence above gets, and for the same reason: a rule opening a
+    // body is structure, not a title. It used to slip past — a second rule further down
+    // made the paragraph BELOW it the title and left the first one in the body as if it
+    // were metadata, so the note was stored under a title its author never wrote.
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const r = await callTool(
+      port,
+      'create_note',
+      { project: 'team', body: '\n---\nA thought I wrote between two rules.\n---\nAnd the rest.' },
+      bearer,
+    )
+    expect(isError(r)).toBe(true)
+    expect(text(r)).toMatch(/needs a title/i)
+  })
+
   it('rejects a traversal directory before any engine sees it', async () => {
     const bearer = await patFor('alice', 'alice-password-1', 'write')
     const r = await callTool(

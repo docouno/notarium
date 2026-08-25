@@ -21,8 +21,10 @@ import {
   type AuthorFilter,
   type Revision,
   REVISION_KIND,
+  REVISION_RESTORE_AVAILABILITY,
   type RevisionDetail,
   revisionRestoreAvailability,
+  STORE_ERROR_REASON,
 } from '../../../knowledgeStore'
 import { normAliases } from '../../../libs/aliases'
 import { frontmatterEntryValue, parseLogicalNoteState } from '../../../libs/markdown'
@@ -198,6 +200,11 @@ export class HistorySurface {
     return result
   }
 
+  /** The trash page, by the journal's COLUMNS alone. A row whose blob is stored but
+   *  unreadable therefore counts as restorable here and in `restorableTotal`, while the
+   *  detail surfaces — which open the blob — say `unreadable`. That disagreement is the
+   *  deliberate price of not decoding up to a hundred blobs per page.
+   *  canon: docs/trash.md#availability */
   async listTrashed(opts: {
     offset: number
     limit: number
@@ -480,9 +487,17 @@ export class HistorySurface {
     if (!tomb || tomb.kind !== REVISION_KIND.delete) {
       return null
     }
+    // This surface OPENS the blob, so unlike the trash list it can tell the two apart.
+    // canon: docs/trash.md#availability
+    let unreadable = false
     const detail =
       tomb.contentHash != null
-        ? await this.host.journal.detail(id, tomb.id).catch(() => null)
+        ? await this.host.journal.detail(id, tomb.id).catch((error: unknown) => {
+            unreadable =
+              (error as { reason?: string } | null)?.reason ===
+              STORE_ERROR_REASON.revisionContentUnreadable
+            return null
+          })
         : null
     const state = detail?.logicalState ? parseLogicalNoteState(detail.logicalState) : null
     const frontmatter: Record<string, unknown> = {}
@@ -531,8 +546,12 @@ export class HistorySurface {
       deleted: true,
       deletedAt: tomb.createdAt,
       deletedByPrincipal: tomb.principal,
+      // `restorable` stays a statement about the BLOB's existence, which is still true
+      // here — it is the availability beside it that says what can be done with it.
       restorable: tomb.contentHash != null,
-      restoreAvailability: revisionRestoreAvailability(tomb),
+      restoreAvailability: unreadable
+        ? REVISION_RESTORE_AVAILABILITY.unreadable
+        : revisionRestoreAvailability(tomb),
     }
   }
 

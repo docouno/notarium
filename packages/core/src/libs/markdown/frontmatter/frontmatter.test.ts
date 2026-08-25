@@ -5,11 +5,13 @@ import {
   FRONTMATTER_BYTE_CAP,
   frontmatterEntryDefinesYamlAnchor,
   frontmatterEntryOf,
+  frontmatterEntrySpans,
   frontmatterEntryValue,
   frontmatterEntryValueOf,
   frontmatterHasYamlNodeReferences,
   FrontmatterLimitError,
   frontmatterListEntry,
+  frontmatterPayloadBounds,
   frontmatterScalar,
   frontmatterScalarEntry,
   frontmatterTags,
@@ -17,8 +19,10 @@ import {
   isDurableFrontmatter,
   isWithinFrontmatterByteCap,
   parseFrontmatterBlock,
+  stripFrontmatter,
   unquoteScalar,
 } from './frontmatter'
+import { FrontmatterGeometryError } from './frontmatterGeometryError'
 
 describe('frontmatterTags', () => {
   it('reads a block list', () => {
@@ -811,5 +815,113 @@ describe('unquoteScalar (symmetric with the engine serializer, #113)', () => {
   it('frontmatterValue/frontmatterTags read a quoted title/tag without backslashes', () => {
     expect(frontmatterValue('---\ntitle: "\\"Gameverse\\""\n---\n', 'title')).toBe('"Gameverse"')
     expect(frontmatterTags('---\ntags:\n- "Re: \\"quoted\\""\n---\n')).toEqual(['Re: "quoted"'])
+  })
+})
+
+// The geometry of a parsed block: where each entry physically sits. It is what lets a
+// writer change one entry and leave every other byte alone, so it has to agree with the
+// parser exactly or fail rather than guess.
+describe('frontmatterEntrySpans', () => {
+  const spansOf = (raw: string) => {
+    const block = parseFrontmatterBlock(raw)
+
+    if (!block) {
+      throw new Error('fixture has no frontmatter block')
+    }
+
+    return { block, spans: frontmatterEntrySpans(raw, block) }
+  }
+
+  it('gives every entry back its own bytes, in order and without overlap', () => {
+    const raw = '---\ntitle: A\ntags:\n  - x\n  - y\n# note\nslug: s\n---\nbody\n'
+    const { block, spans } = spansOf(raw)
+
+    expect(spans.map((span) => span.key)).toEqual(block.entries.map((entry) => entry.key))
+    spans.forEach((span, index) => {
+      expect(raw.slice(span.start, span.end)).toBe(`${block.entries[index].lines.join('\n')}\n`)
+      if (index) {
+        expect(span.start).toBeGreaterThanOrEqual(spans[index - 1].end)
+      }
+    })
+  })
+
+  it('covers the payload with no holes when nothing separates the entries', () => {
+    const raw = '---\ntitle: A\nslug: s\n---\nbody\n'
+    const { payloadStart, payloadEnd } = frontmatterPayloadBounds(raw, spansOf(raw).block.bodyStart)
+    const { spans } = spansOf(raw)
+
+    expect(spans[0].start).toBe(payloadStart)
+    expect(spans[spans.length - 1].end).toBe(payloadEnd)
+    expect(raw.slice(payloadEnd)).toBe('---\nbody\n')
+  })
+
+  it("steps over a separator blank the parser drops, and keeps a scalar's own blanks", () => {
+    const raw = '---\ntitle: A\n\nnotes: |+\n  first\n\n\nslug: s\n---\nbody\n'
+    const { spans } = spansOf(raw)
+
+    expect(spans.map((span) => span.key)).toEqual(['title', 'notes', 'slug'])
+    expect(raw.slice(spans[1].start, spans[1].end)).toBe('notes: |+\n  first\n\n\n')
+    expect(raw.slice(spans[2].start, spans[2].end)).toBe('slug: s\n')
+  })
+
+  it('carries CRLF terminators inside the spans it reports', () => {
+    const raw = '---\r\ntitle: A\r\nslug: s\r\n---\r\nbody\r\n'
+    const { spans } = spansOf(raw)
+
+    expect(raw.slice(spans[0].start, spans[0].end)).toBe('title: A\r\n')
+    expect(raw.slice(spans[1].start, spans[1].end)).toBe('slug: s\r\n')
+  })
+
+  // The parser drops a blank that follows a KEYLESS entry outright — only a keyed entry
+  // can adopt one later — and still appends the continuation after it to that same entry.
+  // Its lines are then non-consecutive in the source, and a walk that insists on
+  // consecutiveness refuses documents the parser describes perfectly, which silently
+  // narrows what the identity channel may write to.
+  it.each([
+    ['a keyless list entry split by a blank', '---\n- name: a\n\n  role: b\n---\nbody\n'],
+    ['a comment entry split by a blank', '---\n# notes\n\n  more\n---\nbody\n'],
+    ['several blanks inside one keyless entry', '---\n- one\n\n  two\n\n  three\n---\nbody\n'],
+  ])('reconstructs %s from its span', (_name, raw) => {
+    const { block, spans } = spansOf(raw)
+
+    expect(spans).toHaveLength(block.entries.length)
+    expect(raw.slice(spans[0].start, spans[0].end)).toBe(
+      raw.slice(raw.indexOf('\n') + 1, raw.lastIndexOf('\n---') + 1),
+    )
+  })
+
+  it('still fails closed when a blank cannot explain the divergence', () => {
+    const raw = '---\n- one\n\n  two\n---\nbody\n'
+    const block = parseFrontmatterBlock(raw)!
+
+    // A keyless entry whose lines simply are not in the source: the blank-skip must not
+    // launder that into a match.
+    expect(() =>
+      frontmatterEntrySpans(raw, {
+        ...block,
+        entries: [{ key: null, lines: ['- one', '  three'] }],
+      }),
+    ).toThrow(FrontmatterGeometryError)
+  })
+
+  it('fails closed when the entries handed in do not describe the source', () => {
+    const raw = '---\ntitle: A\n---\nbody\n'
+    const block = parseFrontmatterBlock(raw)!
+
+    expect(() =>
+      frontmatterEntrySpans(raw, { ...block, entries: [{ key: 'title', lines: ['title: B'] }] }),
+    ).toThrow(FrontmatterGeometryError)
+  })
+})
+
+describe('stripFrontmatter degradation', () => {
+  // Every caller here presents text and has no failure branch to take, so an oversized
+  // block must read as "no block" rather than throw. Declared as a constraint by the
+  // design and, until this test, provable only by reading the code.
+  it('returns an oversized document whole instead of throwing', () => {
+    const huge = `---\n${'x'.repeat(FRONTMATTER_BYTE_CAP + 1)}\n---\nBody.\n`
+
+    expect(() => parseFrontmatterBlock(huge)).toThrow(FrontmatterLimitError)
+    expect(stripFrontmatter(huge)).toBe(huge)
   })
 })

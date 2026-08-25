@@ -388,6 +388,22 @@ export type RevisionStateDecl = {
       }
 }
 
+/** Raw bytes planted on disk for an existing note AFTER its ordinary timeline — the seam
+ *  for file shapes no authoring write can produce: an encoding prologue, or a leading
+ *  blank line before a `---` that is a thematic rule rather than a block.
+ *
+ *  Unlike ExternalRewriteDecl this deliberately CHANGES size and mtime, so it models an
+ *  ordinary external edit rather than the size-preserving sync shape #267 needs kept —
+ *  which is exactly why it cannot be expressed as one: inserting a mark adds three bytes.
+ *
+ *  Real applier only. The FAKE stand has no files at all, so it shows the note's
+ *  normalized state instead — the same honest split ExternalIdentityClaimDecl documents.
+ *  `{{noteId}}`, `{{path}}` and `{{createdAt}}` substitute as they do in revisionStates. */
+export type ExternalSourceDecl = {
+  note: string
+  source: { encoding: 'utf8' | 'base64'; data: string }
+}
+
 /** One CROSS-SPACE id collision written straight onto disk after the production
  *  write timeline (#327): `note`'s `notarium-id` frontmatter is replaced with the
  *  id `claimFrom` actually got, so two spaces' files claim one id — the shape a
@@ -580,6 +596,8 @@ export type CaseWorld = {
   revisionStates?: RevisionStateDecl[]
   /** Cross-space `notarium-id` collisions planted on disk (#327), real applier only. */
   externalIdentityClaims?: ExternalIdentityClaimDecl[]
+  /** Whole-file bytes planted on disk for shapes no write produces, real applier only. */
+  externalSources?: ExternalSourceDecl[]
 }
 
 /** What a case's `build` receives: a seeded RNG (reproducible), a scale knob

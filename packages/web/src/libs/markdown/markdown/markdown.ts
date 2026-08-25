@@ -2,6 +2,7 @@ import DOMPurify from 'dompurify'
 import { marked, Renderer } from 'marked'
 import markedFootnote from 'marked-footnote'
 import { markedHighlight } from 'marked-highlight'
+import { type FrontmatterBlock, parseFrontmatterBlock } from '@notarium/core/markdown'
 import { slugify } from '@notarium/core/slug'
 import { calloutExtension } from './callout'
 import { highlightCode } from './highlight'
@@ -143,22 +144,29 @@ marked.use({
 // render-time choice only. Paragraph/line spacing is tuned in styles/markdown.scss.
 marked.setOptions({ gfm: true, breaks: true })
 
-// Defensive strip of a leading YAML frontmatter block (#235): the normal content
-// path is body-only (the engine peels the leading YAML), but a raw paste / legacy
-// note / editor-preview of a draft could still open with a `---…---` block that
-// marked would render as a stray table/hr. Unlike core stripFrontmatter, this only
-// cuts a GENUINE frontmatter block — its first non-empty inner line must look like
-// a YAML key (`key:`). A body that opens with a `---` thematic break and has a later
-// `---` (prose sections, an AI export starting with a rule) is left intact, so the
-// strip can't silently eat content between two rules.
-const stripLeadingFrontmatter = (md: string): string => {
-  const m = /^\uFEFF?\s*---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(md)
+// Defensive strip of a leading YAML frontmatter block (#235): the normal content path is
+// body-only (the engine peels the leading YAML), but a raw paste / legacy note /
+// editor-preview of a draft could still open with a `---…---` block that marked would
+// render as a stray table/hr.
+//
+// WHERE that block is, is the domain's answer — the same parser the write path and the
+// title derivation ask, so a screen never hides bytes the rest of the system calls prose.
+// WHETHER to cut it stays this renderer's own, narrower question: a block whose first
+// line does not read like a YAML key is prose an author fenced deliberately (sections, an
+// AI export opening with a rule), and cutting it would eat visible content.
+export const stripLeadingFrontmatter = (md: string): string => {
+  let block: FrontmatterBlock | null
 
-  if (!m) {
+  try {
+    block = parseFrontmatterBlock(md)
+  } catch {
+    return md // an oversized block is not something a reader should throw over
+  }
+  if (!block) {
     return md
   }
-  const firstLine = m[1].split(/\r?\n/).find((l) => l.trim() !== '') ?? ''
-  return /^\s*[\w-]+\s*:/.test(firstLine) ? md.slice(m[0].length) : md
+  const firstLine = block.entries.flatMap((entry) => entry.lines).find((l) => l.trim() !== '') ?? ''
+  return /^\s*[\w-]+\s*:/.test(firstLine) ? md.slice(block.bodyStart) : md
 }
 
 export type RenderMarkdownOptions = {

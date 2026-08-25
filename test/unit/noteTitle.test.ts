@@ -8,9 +8,12 @@
 import { describe, expect, it } from 'vitest'
 import {
   deriveNoteTitle,
+  FRONTMATTER_BYTE_CAP,
   headingTitle,
   parseAtxH1Line,
+  parseFrontmatterBlock,
   promoteBodyTitle,
+  stripFrontmatter,
   stripTitleHeading,
 } from '@notarium/core'
 
@@ -289,5 +292,90 @@ describe('deriveNoteTitle — the read-only title the editor gates on', () => {
     expect(deriveNoteTitle('', 'Explicit')).toBe('Explicit')
     expect(deriveNoteTitle('# ')).toBe('')
     expect(deriveNoteTitle('')).toBe('')
+  })
+})
+
+// Which leading block a title is derived from is the PARSER's answer, not a second opinion
+// held here. Narrowly: a block opens on line one and closes on a `---` of its own, so a
+// rule preceded by a blank line or an indent is prose that titles nothing — and a fence
+// that DOES open line one is a block whatever its payload looks like.
+// canon: docs/core.md#write-through
+describe('promoteBodyTitle — the leading block is the one the domain reads', () => {
+  it.each([
+    [
+      'prose opening with a rule, a second rule below',
+      '\n---\nA thought I wrote between two rules.\n---\nAnd the rest.\n',
+    ],
+    ['prose opening with a rule and no second one', '---\nA thought with no second rule.\n'],
+    ['an indented fence the domain does not read as a block', '   ---\ntitle: X\n---\nFirst.\n'],
+    ['a code fence', '```\ncode\n```\n\nrest\n'],
+    ['a list', '- one\n- two\n'],
+    ['a quote', '> quoted\n\nrest\n'],
+  ])('derives no title and moves no byte for %s', (_name, src) => {
+    expect(deriveNoteTitle(src)).toBe('')
+    expect(promoteBodyTitle(src).body).toBe(src)
+  })
+
+  it.each([
+    ['a real inline block', '---\ntitle: X\n---\nFirst paragraph.\n', '---\ntitle: X\n---\n'],
+    [
+      'a real inline block behind a mark',
+      '\uFEFF---\ntitle: X\n---\nFirst paragraph.\n',
+      '\uFEFF---\ntitle: X\n---\n',
+    ],
+    [
+      // The domain DOES read this one — a fence on line one with a closing fence below is
+      // a block, whatever its payload looks like. The title therefore still comes from
+      // below it, and that is the point: one answer, not a nicer-looking one.
+      'a block whose payload is prose',
+      '---\nA thought I wrote between two rules.\n---\nAnd the rest.\n',
+      '---\nA thought I wrote between two rules.\n---\n',
+    ],
+  ])('carries %s through and titles the paragraph below it', (_name, src, carried) => {
+    const promoted = promoteBodyTitle(src)
+
+    expect(parseFrontmatterBlock(src)).not.toBeNull()
+    expect(promoted.title).not.toBe('')
+    expect(promoted.body).toBe(carried)
+  })
+
+  // Named because the amendment first undercounted them: these two forms changed answer
+  // as well, and both are the parser's own reading rather than a special case.
+  it('titles the paragraph below an EMPTY block, which is still a block', () => {
+    const src = '---\n---\nBody.\n'
+
+    expect(parseFrontmatterBlock(src)).not.toBeNull()
+    expect(promoteBodyTitle(src)).toEqual({ title: 'Body.', body: '---\n---\n' })
+  })
+
+  it('keeps trailing whitespace on a closing fence inside the block it belongs to', () => {
+    // It used to fall out of the block and land at the head of the body.
+    expect(promoteBodyTitle('---\ntitle: X\n---   \nFirst.\n').body).toBe('---\ntitle: X\n---   \n')
+  })
+
+  it('an explicit title still wins over every shape above', () => {
+    const src = '\n---\nA thought I wrote between two rules.\n---\nAnd the rest.\n'
+
+    expect(deriveNoteTitle(src, 'Explicit')).toBe('Explicit')
+  })
+
+  it('degrades to "no block" on an oversized one instead of throwing', () => {
+    // One consumer derives a draft title inside a React hook, where a throw is a blank
+    // screen; the parser itself refuses a block this big.
+    const huge = `---\n${'x'.repeat(FRONTMATTER_BYTE_CAP + 1)}\n---\nBody.\n`
+
+    expect(() => parseFrontmatterBlock(huge)).toThrow()
+    expect(() => deriveNoteTitle(huge)).not.toThrow()
+    expect(deriveNoteTitle(huge)).toBe('')
+    expect(promoteBodyTitle(huge).body).toBe(huge)
+  })
+
+  // The task's own invariant, asserted where all three answers meet.
+  it('agrees with the parser and the strip on the form this task is about', () => {
+    const src = '\n---\nA thought I wrote between two rules.\n---\nAnd the rest.\n'
+
+    expect(parseFrontmatterBlock(src)).toBeNull()
+    expect(stripFrontmatter(src)).toBe(src)
+    expect(promoteBodyTitle(src).body).toBe(src)
   })
 })

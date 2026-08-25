@@ -4,7 +4,16 @@
 // in the leading block only, honest null for anything fancier.
 
 import { describe, expect, it } from 'vitest'
-import { frontmatterValue, NOTE_ID_FRONTMATTER_KEY, upsertFrontmatterKey } from '@notarium/core'
+import { parse as parseYaml } from 'yaml'
+import {
+  FrontmatterGeometryError,
+  frontmatterValue,
+  NOTE_ID_FRONTMATTER_KEY,
+  parseFrontmatterBlock,
+  stripFrontmatter,
+  upsertFrontmatterKey,
+} from '@notarium/core'
+import { parseNoteFile } from '@notarium/engine'
 
 describe('frontmatterValue', () => {
   it('reads a scalar key from the leading frontmatter block', () => {
@@ -80,5 +89,118 @@ describe('upsertFrontmatterKey', () => {
   it('round-trips with frontmatterValue on an empty document', () => {
     const out = upsertFrontmatterKey('', 'notarium-id', 'fresh-id-0001')
     expect(frontmatterValue(out, 'notarium-id')).toBe('fresh-id-0001')
+  })
+})
+
+// The writer and the reader answer ONE question about where frontmatter is, and the
+// writer changes only the bytes of its own entry. Every row below used to fail.
+describe('upsertFrontmatterKey — only its own entry moves', () => {
+  const ID = 'AbCdEfGhIjKl'
+  const write = (doc: string) => upsertFrontmatterKey(doc, NOTE_ID_FRONTMATTER_KEY, ID)
+
+  it('prefixes a real block instead of writing into prose the domain does not read', () => {
+    const doc = '\n---\nA thought I wrote between two rules.\n---\nAnd the rest.\n'
+    const out = write(doc)
+
+    expect(parseFrontmatterBlock(doc)).toBeNull()
+    expect(out).toBe(`---\n${NOTE_ID_FRONTMATTER_KEY}: ${ID}\n---\n${doc}`)
+    expect(out.endsWith(doc)).toBe(true)
+    expect(parseNoteFile(out, 'a/x.md').idClaim).toBe(ID)
+  })
+
+  it('treats an indented opening fence as the prose the parser says it is', () => {
+    const doc = '   ---\ntitle: x\n---\nbody\n'
+    const out = write(doc)
+
+    expect(out).toBe(`---\n${NOTE_ID_FRONTMATTER_KEY}: ${ID}\n---\n${doc}`)
+    expect(parseNoteFile(out, 'a/x.md').idClaim).toBe(ID)
+  })
+
+  it('replaces a multi-line node whole, keeping the neighbours byte-for-byte', () => {
+    const out = write('---\nnotarium-id:\n  - foreign\ntitle: x\n---\nbody\n')
+
+    expect(out).toBe(`---\n${NOTE_ID_FRONTMATTER_KEY}: ${ID}\ntitle: x\n---\nbody\n`)
+    expect(parseNoteFile(out, 'a/x.md').idClaim).toBe(ID)
+  })
+
+  it('replaces a block scalar whole — its continuation lines do not survive as YAML', () => {
+    const out = write('---\nnotarium-id: |\n  weird\ntitle: x\n---\nbody\n')
+
+    expect(out).toBe(`---\n${NOTE_ID_FRONTMATTER_KEY}: ${ID}\ntitle: x\n---\nbody\n`)
+    expect(parseNoteFile(out, 'a/x.md').idClaim).toBe(ID)
+  })
+
+  it('collapses duplicates onto the first slot, so reader and writer name the same entry', () => {
+    const doc = '---\ntitle: X\nnotarium-id: AAAAAAAAAAAA\nnotarium-id: BBBBBBBBBBBB\n---\nbody\n'
+    const out = write(doc)
+
+    expect(out).toBe(`---\ntitle: X\n${NOTE_ID_FRONTMATTER_KEY}: ${ID}\n---\nbody\n`)
+    expect(parseNoteFile(out, 'a/x.md').idClaim).toBe(ID)
+    expect(write(out)).toBe(out) // idempotent: the second pass moves no byte
+  })
+
+  it('keeps the mark leading the file, and the note keeps its own heading title', () => {
+    const out = write('\uFEFF# Hi\n\nbody\n')
+
+    expect(out).toBe(`\uFEFF---\n${NOTE_ID_FRONTMATTER_KEY}: ${ID}\n---\n# Hi\n\nbody\n`)
+    expect(parseNoteFile(out, 'a/x.md').title).toBe('Hi')
+  })
+
+  it('writes the line ending of the block it joins, not of some other part of the file', () => {
+    // No block: the document's own ending is the only one there is.
+    expect(write('# Hi\r\n\r\nbody\r\n')).toBe(
+      `---\r\n${NOTE_ID_FRONTMATTER_KEY}: ${ID}\r\n---\r\n# Hi\r\n\r\nbody\r\n`,
+    )
+    expect(write('---\r\ntitle: X\r\n---\r\nbody\r\n')).toBe(
+      `---\r\ntitle: X\r\n${NOTE_ID_FRONTMATTER_KEY}: ${ID}\r\n---\r\nbody\r\n`,
+    )
+    // An LF block under a CRLF body — a shape this project's own serializer writes.
+    // A lone CRLF entry among LF ones is an ending nobody in that block chose.
+    expect(write('---\ntitle: X\n---\nbody\r\nmore\r\n')).toBe(
+      `---\ntitle: X\n${NOTE_ID_FRONTMATTER_KEY}: ${ID}\n---\nbody\r\nmore\r\n`,
+    )
+    // Whatever the line endings, the reader has to find the claim the writer just wrote.
+    for (const doc of [
+      '# Hi\r\n\r\nbody\r\n',
+      '---\r\ntitle: X\r\n---\r\nbody\r\n',
+      '---\ntitle: X\n---\nbody\r\nmore\r\n',
+    ]) {
+      expect(parseNoteFile(write(doc), 'a/x.md').idClaim).toBe(ID)
+    }
+  })
+
+  it("does not read the key out of somebody else's block scalar", () => {
+    const out = write('---\nsummary: |\n  notarium-id: fake\ntitle: x\n---\nbody\n')
+
+    expect(out).toBe(
+      `---\nsummary: |\n  notarium-id: fake\ntitle: x\n${NOTE_ID_FRONTMATTER_KEY}: ${ID}\n---\nbody\n`,
+    )
+    expect(parseNoteFile(out, 'a/x.md').idClaim).toBe(ID)
+  })
+
+  it('refuses rather than orphan a neighbour aliasing the anchor on its own entry', () => {
+    const payload = 'title: A\nnotarium-id: &i AbCdEfGhIjKl\nmirror: *i\n'
+    const doc = `---\n${payload}---\nbody\n`
+
+    expect(() => parseYaml(payload)).not.toThrow()
+    // What a value-blind rewrite leaves behind: the anchor gone, the alias dangling.
+    expect(() => parseYaml(payload.replace('&i AbCdEfGhIjKl', ID))).toThrow(/alias/i)
+    expect(() => write(doc)).toThrow(FrontmatterGeometryError)
+    expect(() => write(doc)).toThrow(/anchored/)
+  })
+
+  it('writes past an anchor that belongs to another entry', () => {
+    const out = write('---\ntitle: &t A\nnotarium-id: OldIdentity01\n---\nbody\n')
+
+    expect(out).toBe(`---\ntitle: &t A\n${NOTE_ID_FRONTMATTER_KEY}: ${ID}\n---\nbody\n`)
+    expect(parseNoteFile(out, 'a/x.md').idClaim).toBe(ID)
+  })
+
+  it('answers the same question stripFrontmatter and the parser do', () => {
+    const doc = '\n---\nA thought I wrote between two rules.\n---\nAnd the rest.\n'
+
+    expect(parseFrontmatterBlock(doc)).toBeNull()
+    expect(stripFrontmatter(doc)).toBe(doc)
+    expect(write(doc).endsWith(doc)).toBe(true)
   })
 })

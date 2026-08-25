@@ -109,7 +109,7 @@ and for `security` — it parses the sanitized HTML into a live DOM and checks t
 | `graph` | hubs/orphans/ghost-by-refcount/former-name/cross-folder communities (#38/#202) | graph, identity |
 | `graph-load` | scalable linked communities: 300 nodes / ~900 links per scale unit; `SCALE=10` reproduces the 3k/9k cold-enrichment workload (#195/#284) | graph, scale |
 | `search-corpus` | a spotlight corpus: same-named notes, content/path-match, tag case-fold (#188/#204) | search, content |
-| `external-edits` | a direct same-size, mtime-preserving markdown rewrite: search marker + graph edge must self-heal on server boot/poll (#267) | search, graph, content |
+| `external-edits` | writers that are not us: a same-size, mtime-preserving rewrite whose search marker + graph edge must self-heal on boot/poll (#267), plus whole-file shapes no write can produce — a byte-order-marked file and prose opening with a `---` rule | search, graph, content |
 | `identity-collision` | one `notarium-id` planted in two spaces on disk: the arbiter must leave a single durable owner and re-mint the loser on the next boot (#327) | identity, structure, history |
 | `legacy-slug-links` | notes moved from old ASCII-only filenames onto Unicode paths: one unique legacy link survives delete/restore, while a two-owner old basename remains a ghost | identity, graph, search, history, trash, structure |
 | `name-collisions` | the states that flow from "a title picks the file name": a folder primed for the refusal dialog, an already-uniquified `Retro`/`Retro 2`/`Retro 3` family, the same title in two folders, and a folder page whose reserved `index.md` deliberately does not collide — [note-model.md](note-model.md#create-collisions) | identity, structure |
@@ -240,6 +240,45 @@ stands display the same final content; it does not pretend to exercise a filesys
 watcher or add an authored activity row. Targeted engine tests cover all three real
 recovery routes: LocalFS change-token, exact watcher-path forcing, and a missed event
 recovered by the persisted bounded integrity sweep.
+
+### File shapes no write can produce (`externalSources`)
+
+The same case carries a second seam, and it exists because the #267 one deliberately
+cannot stretch: `externalRewrites` requires every replacement to preserve UTF-8 byte
+length, which is what makes it model an editor that changes content without changing
+size or mtime. Two shapes this project has to answer for cannot be planted that way —
+inserting an encoding prologue adds three bytes, and a leading blank line adds one.
+Loosening that contract would delete the very thing it pins, so `externalSources`
+declares WHOLE FILE bytes instead and deliberately changes size and mtime: it models an
+ordinary external edit, and the engine is expected to notice it.
+
+`{{noteId}}`, `{{path}}` and `{{createdAt}}` substitute exactly as they do in
+`revisionStates` — the same helper, not a second copy. The applier runs AFTER
+`externalRewrites`, so a size-preserving replacement still finds its occurrence in the
+bytes the timeline wrote.
+
+The `external-edits` case declares two:
+
+- `external/byte-order-marked.md` — a file a converter led with a UTF-8 mark. An
+  ordinary save must not drop that byte: the mark is a property of the file, not of
+  anything Notarium projects.
+- `external/rule-led-prose.md` — prose that opens with a `---` thematic rule. There is
+  no frontmatter block (one starts on the file's first line), so the opening paragraph
+  must survive an export with `frontmatter=strip` and must appear in the card preview.
+  **This one is one-shot on the stand.** Reading the note normalises its body — the
+  leading blank goes, which is what keeps blanks from compounding on every re-save — and
+  the remaining bytes then open with a fence on line one, so a subsequent SAVE folds them
+  into the file's frontmatter and the first paragraph is gone. Nothing reads it wrong
+  (export, preview and the title derivation all answer correctly on the planted bytes);
+  the merge semantics of `serializeNoteFile` are simply outside #396's scope. Verify this
+  state before editing the note, and re-seed if you have saved over it.
+
+**Real applier only, and this is a border rather than a gap.** The fake stand has no
+files at all, so it shows both notes as their ordinary timeline left them; a byte-order
+mark is a byte fact, and the fixture is a specification of a note's normalized state.
+`toFixture` validates the handles and applies nothing, which is the same honest split
+`externalIdentityClaims` already documents above. Only the real stand can plant the
+shape and prove the engine's answer to it.
 
 ### The `jobs` axis — export artifacts (#105/#101)
 
@@ -458,6 +497,13 @@ required to match its directory.
     of the body against itself. Strict restore durability itself is intentionally absent
     in the fake tier: public rows report `capability-unavailable`, `restorableTotal=0`,
     and restore endpoints answer 503 rather than simulating a weaker success.
+- **The fake does not express whole-file byte shapes.** An encoding prologue and a
+  leading `---` rule are facts about bytes on disk, and the fake tier has no disk. The
+  notes seeded with `externalSources` therefore appear normalized there while the real
+  stand carries the declared bytes. Trying to "express a BOM in the fixture" is out of
+  scope by construction, not an unfinished job — the store contract already tolerates
+  the divergence on purpose (`storeContract.ts` strips a leading mark before asserting
+  a file opens with `---`).
 - **Fake activity rows are keyed to the note they describe.** The projection stamps
   each row with `physicalIdOf` — the case's pinned physical id when it declared one
   (#302, above), else the id the in-memory store derives for that path — not the

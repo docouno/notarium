@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { parse as parseYaml } from 'yaml'
 
 import {
   analyzeDocumentState,
@@ -20,6 +21,10 @@ const bytes = (value: string): Uint8Array => new TextEncoder().encode(value)
  *  before the expectation ever sees it. */
 const exactText = (value: Uint8Array): string =>
   new TextDecoder('utf-8', { ignoreBOM: true }).decode(value)
+/** The YAML between the fences — so a test can assert what a STRICT reader makes of a
+ *  document, independently of this module's own conservative projection. */
+const payloadOf = (document: string): string =>
+  document.slice(document.indexOf('\n') + 1, document.lastIndexOf('\n---\n') + 1)
 
 describe('document state', () => {
   it('observes an exact owner only from unambiguous source bytes', () => {
@@ -218,6 +223,94 @@ describe('document state', () => {
     expect(
       analyzeDocumentState({ source: plan.source, pathFallbackTitle: 'note' }).restoreSafety,
     ).toEqual({ status: 'safe' })
+  })
+
+  // An entry-wide rewrite carries off whatever the entry defined — an anchor included —
+  // and an orphaned alias is not a PARSE error, so nothing downstream objects: the source
+  // still parses, the plan still verifies its own key, and the document quietly stops
+  // meaning what it said. `restoreSafety` cannot be the gate (it is hashed into stored
+  // revisions), so the plan checks its own candidate instead.
+  it('refuses a mutation that leaves a neighbour aliasing an anchor it just deleted', () => {
+    const source = '---\ntitle: A\ntags: &t\n  - a\nmirror: *t\n---\nbody\n'
+    const state = analyzeDocumentState({ source: bytes(source), pathFallbackTitle: 'note' })
+
+    // Everything the old gates look at says this document is fine, before and after.
+    expect(state.restoreSafety).toEqual({ status: 'safe' })
+    expect(parseYaml(payloadOf(source))).toEqual({ title: 'A', tags: ['a'], mirror: ['a'] })
+    expect(() => planDocumentMutation(state, { tags: ['x'] })).toThrow(/frontmatter unreadable/)
+  })
+
+  it.each([
+    {
+      shape: 'an anchor in a flow list, which keeps its slot on the key line',
+      source: '---\ntitle: A\ntags: &t [a, b]\nmirror: *t\n---\nbody\n',
+      intent: { tags: ['x'] },
+      expected: '---\ntitle: A\ntags: &t [x]\nmirror: *t\n---\nbody\n',
+    },
+    {
+      shape: 'an anchor on a scalar title',
+      source: '---\ntitle: &t A\nmirror: *t\n---\nbody\n',
+      intent: { title: 'Renamed' },
+      expected: '---\ntitle: &t Renamed\nmirror: *t\n---\nbody\n',
+    },
+    {
+      shape: 'an anchor in an entry the mutation never touches',
+      source: '---\ntitle: A\nkeep: &k v\ntags: [a]\nmirror: *k\n---\nbody\n',
+      intent: { tags: ['x'] },
+      expected: '---\ntitle: A\nkeep: &k v\ntags: [x]\nmirror: *k\n---\nbody\n',
+    },
+  ])('still plans over $shape', ({ source, intent, expected }) => {
+    const state = analyzeDocumentState({ source: bytes(source), pathFallbackTitle: 'note' })
+    const plan = planDocumentMutation(state, intent)
+
+    expect(new TextDecoder().decode(plan.source)).toBe(expected)
+    expect(() => parseYaml(payloadOf(expected))).not.toThrow()
+  })
+
+  // The check is asymmetric on purpose: a document that already had no readable projection
+  // is not something this plan broke, and refusing it would be a new prohibition.
+  it('still plans over a source whose projection was already unbuildable', () => {
+    const source = '---\ntitle: A\nmirror: *gone\n---\nbody\n'
+    const state = analyzeDocumentState({ source: bytes(source), pathFallbackTitle: 'note' })
+
+    expect(() => parseYaml(payloadOf(source))).toThrow(/alias/i)
+    expect(new TextDecoder().decode(planDocumentMutation(state, { tags: ['x'] }).source)).toBe(
+      '---\ntitle: A\nmirror: *gone\ntags: [x]\n---\nbody\n',
+    )
+  })
+
+  // Where a candidate loses its projection ENTIRELY, this planner deliberately stays
+  // quiet: `candidateFm` is null, the per-key promise has nothing to check, and the
+  // callers refuse in their own more precise words. Pinning it here keeps that division
+  // honest — the docblock above claims it, and a claim about callers needs a test.
+  it('hands back a plan whose candidate went opaque, leaving the verdict to its caller', () => {
+    const source =
+      '---\nname: my-skill\ndescription: does things\ntags: &t\n  - a\nmirror: *t\n---\n# My Skill\n\ninstructions\n'
+    const state = analyzeDocumentState({
+      source: bytes(source),
+      role: DOCUMENT_ROLE.skillRoot,
+      skillDirectoryName: 'my-skill',
+      pathFallbackTitle: 'SKILL',
+    })
+
+    expect(state.projection).not.toBeNull()
+    const plan = planDocumentMutation(state, { tags: ['x'] })
+    const candidate = analyzeDocumentState({
+      source: plan.source,
+      role: DOCUMENT_ROLE.skillRoot,
+      skillDirectoryName: 'my-skill',
+      pathFallbackTitle: 'SKILL',
+    })
+
+    // The plan exists, and it is unusable — which is exactly what the caller's own gate
+    // reads off it. The same document as a generic note is refused by the planner.
+    expect(candidate.projection).toBeNull()
+    expect(() =>
+      planDocumentMutation(
+        analyzeDocumentState({ source: bytes(source), pathFallbackTitle: 'note' }),
+        { tags: ['x'] },
+      ),
+    ).toThrow(/frontmatter unreadable/u)
   })
 
   // The proof channel binds to whatever field the physical authority named, and

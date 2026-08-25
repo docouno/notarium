@@ -1,3 +1,5 @@
+import { type FrontmatterBlock, parseFrontmatterBlock } from '../frontmatter'
+
 export type AtxH1Line = {
   /** Heading text after removing an optional CommonMark closing `#` sequence. */
   title: string
@@ -154,11 +156,22 @@ const scanOpening = (
   setext: boolean
   plain: boolean
 } => {
-  // Carry a leading inline-frontmatter block through untouched — the title lives
-  // in the markdown body below it, and serializeNoteFile folds this block into the
-  // file's own frontmatter.
-  const fm = /^\uFEFF?\s*---\r?\n[\s\S]*?\r?\n---\r?\n?/.exec(src)?.[0] ?? ''
-  const rest = src.slice(fm.length)
+  // Carry a leading inline-frontmatter block through untouched — the title lives in the
+  // markdown body below it, and serializeNoteFile folds this block into the file's own
+  // frontmatter. WHICH block that is, is not this file's opinion to hold.
+  // canon: docs/core.md#write-through
+  //
+  // Local to this call: the parser throws on an oversized block and this scan must not,
+  // because one consumer derives a draft title inside a React hook.
+  let block: FrontmatterBlock | null
+
+  try {
+    block = parseFrontmatterBlock(src)
+  } catch {
+    block = null
+  }
+  const fm = block ? src.slice(0, block.bodyStart) : ''
+  const rest = block ? src.slice(block.bodyStart) : src
   let start = 0
   let opening = nextPhysicalLineSpan(rest, start)
 

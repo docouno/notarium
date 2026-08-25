@@ -1540,6 +1540,16 @@ export class CachedStore implements KnowledgeStore {
         this.identity.markDeleted(filePath)
         return outcome
       }
+      if (result.status === 'unwritable') {
+        // Honest degradation (P5): the file's own bytes refuse the claim, and forcing it
+        // would rewrite entries this channel does not own. The note lives under the id the
+        // registry binds to its path, and the next sweep asks again.
+        console.warn(
+          `[cached-store] ${filePath} cannot carry ${NOTE_ID_FRONTMATTER_KEY} "${targetId}" (${result.reason}); the note keeps that id in the registry only`,
+        )
+
+        return outcome
+      }
       expected = result.observedId
       if (result.observedId == null) {
         // The file lost its claim entirely: nothing to arbitrate, just write the

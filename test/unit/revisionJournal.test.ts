@@ -22,6 +22,7 @@ import {
   revisionGapOf,
   RevisionJournal,
   sha256Hex,
+  STORE_ERROR_REASON,
 } from '@notarium/core'
 import type { Revision, RevisionInput, StoreDelta } from '@notarium/core'
 import { InMemoryStore, type StoreSnapshot } from '@notarium/engine-memory'
@@ -141,10 +142,12 @@ describe('revision journal (#12) — write-through', () => {
     // offset that misses the field does this — and nothing else about the fixture is
     // load-bearing either.
     //
-    // The subject is not the refusal. It is the JOURNAL's answer to a refusal: the
-    // vocabulary its readers already handle, rather than the codec's raw throw, which
+    // The subject is not the refusal. It is the JOURNAL's answer to a refusal: a
+    // classified cause its readers can act on, rather than the codec's raw throw, which
     // reached the one reader that maps errors to a status as an unclassified fault and
-    // turned an ordinary request for an old revision into a 500.
+    // turned an ordinary request for an old revision into a 500. And the cause has to be
+    // its OWN: this row's copy exists, so answering with the gap word would tell a person
+    // their content was never captured when it is merely unreadable here.
     const source = new TextEncoder().encode('---\nnotarium-id: AbCdefGhij_1\ntitle: A\n---\nbody\n')
     const proof = bindStorageOwnerProof({
       source,
@@ -203,8 +206,46 @@ describe('revision journal (#12) — write-through', () => {
     )
 
     await expect(journal.detail('drifted-proof-note', appended.id)).rejects.toMatchObject({
-      reason: 'revision_has_no_content',
+      reason: STORE_ERROR_REASON.revisionContentUnreadable,
       isToolError: true,
+    })
+  })
+
+  // The two causes live at different levels, and separating them must not move either.
+  // A row that genuinely never carried a body is not a journal REFUSAL at all — `detail`
+  // hands back a null content, and the gap word belongs to the restore surfaces that
+  // cannot act on it. Only the unreadable blob is the journal's own answer.
+  it('answers a never-captured row with a null body rather than a refusal', async () => {
+    const persistence = new InMemoryRevisionPersistence()
+    const journal = new RevisionJournal({ persistence, space: 'main' })
+    const appended = await persistence.append(
+      {
+        noteId: 'gap-note',
+        space: 'main',
+        baseRevisionId: null,
+        theirRevisionId: null,
+        sourceRevisionId: null,
+        kind: 'external',
+        entryRole: 'change',
+        principal: null,
+        contentHash: null,
+        semanticFingerprint: null,
+        restoreSafety: null,
+        stateFormat: null,
+        title: 'Never captured',
+        class: 'user-doc',
+        slug: null,
+        tags: [],
+        createdAt: '2026-06-12T11:00:00Z',
+        charsAdded: null,
+        charsRemoved: null,
+      },
+      null,
+    )
+
+    await expect(journal.detail('gap-note', appended.id)).resolves.toMatchObject({
+      contentHash: null,
+      content: null,
     })
   })
 

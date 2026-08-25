@@ -1072,7 +1072,11 @@ export class WriteEngine {
           if (materialized.status !== 'materialized') {
             this.host.reconcileSoon()
             throw new StoreError(
-              `reminted identity changed before materialization for ${previousId}`,
+              // `unwritable` is a refusal by the BYTES, not a claim that moved — saying
+              // "changed" sends the reader hunting for a writer that was never there.
+              materialized.status === 'unwritable'
+                ? `identity cannot be written into ${previousId}: ${materialized.reason}`
+                : `reminted identity changed before materialization for ${previousId}`,
             )
           }
           this.host.identity.markMaterialized(id)
@@ -1581,7 +1585,11 @@ export class WriteEngine {
 
           if (materialized.status !== 'materialized') {
             this.host.reconcileSoon()
-            throw new StoreError(`reminted identity changed before materialization for ${input.id}`)
+            throw new StoreError(
+              materialized.status === 'unwritable'
+                ? `identity cannot be written into ${input.id}: ${materialized.reason}`
+                : `reminted identity changed before materialization for ${input.id}`,
+            )
           }
           this.host.identity.markMaterialized(finalId)
           live = await this.host.inner.read(this.innerNoteKey(finalId, claimedPath), {
@@ -2222,7 +2230,10 @@ export class WriteEngine {
     this.host.snap.notes.set(id, nextMeta)
     // Write-through keeps the preview warm too: the very snippet the Feed will
     // ask for next is computed here, from data the save already carried.
-    this.host.previewCache.set(id, derivePreview(input.content ?? '', input.tags))
+    // The caller's own text, not a parsed body: an editor may send a leading inline block
+    // that the serializer folds into the file's frontmatter a moment later. This is the
+    // one preview producer that holds unparsed bytes, so it answers for the block HERE.
+    this.host.previewCache.set(id, derivePreview(stripFrontmatter(input.content ?? ''), input.tags))
     // Exact write merging (raw frontmatter carry-forward, title projection) belongs
     // to the engine. Drop the old fact and let the next context read derive once
     // from the published file; this adds no parsing work to bulk import.

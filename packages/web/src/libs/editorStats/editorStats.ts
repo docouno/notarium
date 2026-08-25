@@ -1,9 +1,11 @@
 import { countWords } from '@notarium/core/markdown'
 
-// Editor status-bar metrics (#115). `countWords` is reused from core (the same
-// prose count the graph's "Size by → Words" uses — frontmatter and code stripped)
-// so a note reads the same word count wherever it's shown. Characters are the raw
-// length of the body the editor holds; reading time is words at an average pace.
+// Editor status-bar metrics (#115). `countWords` is reused from core (the same prose
+// count the graph's "Size by → Words" uses — code stripped) so a note reads the same word
+// count wherever it's shown. It takes a BODY and does not go looking for a leading block,
+// which is why the editor counts what a person actually typed, inline frontmatter and all.
+// Characters are the raw length of the body the editor holds; reading time is words at an
+// average pace.
 export type TextStats = { words: number; chars: number; minutes: number }
 
 // Average adult silent-reading speed (~200–250 wpm); 200 is the conventional,

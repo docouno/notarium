@@ -11,9 +11,9 @@ import {
   REVISION_ENTRY_ROLE,
   REVISION_KIND,
   type RevisionBlob,
+  revisionContentUnreadable,
   type RevisionDetail,
   type RevisionEntryRole,
-  revisionHasNoContent,
   RevisionHeadConflictError,
   type RevisionInput,
   type RevisionPersistence,
@@ -242,15 +242,14 @@ export class RevisionJournal {
         // so a refusal here is a statement about THIS reader: an analyzer that has
         // since learned to read those bytes differently no longer reproduces the
         // metadata the writer of the day recorded, and no retry ever will. What the
-        // caller can act on is only that the body is not obtainable — which is the
-        // answer this journal already has, and which its readers already handle:
-        // both restore surfaces raise this very error one line later when `content`
-        // comes back null, and the deleted view degrades to none. Letting the raw
+        // caller can act on is that the body is not obtainable — but NOT that it was
+        // never captured: this row's copy exists, and saying otherwise tells a person
+        // their content is gone when it is merely unreadable here. Letting the raw
         // codec error escape instead reached the one reader that maps errors to a
         // status — the revision-detail door — as an unclassified fault, so an
         // ordinary request for an old revision answered 500. The cause stays in the
         // log (the server's handler prints it), never on the wire.
-        const refusal = revisionHasNoContent(revisionId)
+        const refusal = revisionContentUnreadable(revisionId)
 
         refusal.cause = error
         throw refusal

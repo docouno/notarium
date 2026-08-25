@@ -9,7 +9,7 @@ import { describe, expect, it } from 'vitest'
 // and is exercised live.
 import './markdown'
 import { errText } from '../mermaid'
-import { prefixDocumentFragments, wikiLinkTarget } from './markdown'
+import { prefixDocumentFragments, stripLeadingFrontmatter, wikiLinkTarget } from './markdown'
 
 const render = (src: string): string => marked.parse(src) as string
 
@@ -474,5 +474,41 @@ describe('errText (mermaid error caption)', () => {
 
   it('stringifies a non-Error throw', () => {
     expect(errText('boom')).toBe('boom')
+  })
+})
+
+// WHERE a leading block is, is the domain's answer — the same parser the write path and
+// the title derivation use, so a screen never hides bytes the rest of the system calls
+// prose. WHETHER to cut it stays this renderer's own, narrower question.
+describe('leading frontmatter strip', () => {
+  it('cuts a real block so marked does not render it as a stray table', () => {
+    expect(stripLeadingFrontmatter('---\ntitle: X\n---\nFirst paragraph.\n')).toBe(
+      'First paragraph.\n',
+    )
+  })
+
+  it.each([
+    ['a blank line before the fence', '\n---\ntitle: X\n---\nFirst paragraph.\n'],
+    ['an indent before the fence', '   ---\ntitle: X\n---\nFirst paragraph.\n'],
+  ])('keeps bytes the domain calls prose: %s', (_name, md) => {
+    // The domain reads no block here, so hiding these lines would show the reader a
+    // paragraph the write path cannot see — and a save would then refuse content that
+    // was never on screen.
+    expect(stripLeadingFrontmatter(md)).toBe(md)
+  })
+
+  it('keeps prose an author fenced deliberately, even when the domain calls it a block', () => {
+    // This renderer's own question: a first line that does not read like a YAML key is
+    // content, and cutting it would eat what the person wrote between two rules.
+    const md = '---\nA thought I wrote between two rules.\n---\nAnd the rest.\n'
+
+    expect(stripLeadingFrontmatter(md)).toBe(md)
+  })
+
+  it('does not throw on an oversized block', () => {
+    const huge = `---\n${'x'.repeat(70 * 1024)}\n---\nBody.\n`
+
+    expect(() => stripLeadingFrontmatter(huge)).not.toThrow()
+    expect(stripLeadingFrontmatter(huge)).toBe(huge)
   })
 })

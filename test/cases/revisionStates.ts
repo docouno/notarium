@@ -28,14 +28,20 @@ const sourceBytes = (
     ? new TextEncoder().encode(source.data)
     : Uint8Array.from(Buffer.from(source.data, 'base64'))
 
-const replaceSeedTokens = (
+/** Shared with the whole-file `externalSources` seam: one substitution rule for every
+ *  place a case authors bytes it cannot know the ids of yet. */
+export const replaceSeedTokens = (
   source: Uint8Array,
   context: { noteId: string; path: string; createdAt: string },
 ): Uint8Array => {
   let text: string
 
   try {
-    text = new TextDecoder('utf-8', { fatal: true }).decode(source)
+    // `ignoreBOM: true` means "do not EAT a leading mark" — the default consumes it, and
+    // these bytes are meant to land on disk verbatim. Without it a case that authors an
+    // encoding prologue silently gets a file without one, which is the exact shape the
+    // seam exists to plant.
+    text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(source)
   } catch {
     return source
   }

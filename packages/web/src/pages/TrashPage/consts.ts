@@ -20,6 +20,8 @@ export const DEFAULT_TOP_CHROME_H = 52
 
 export const RESTORE_REASONS = {
   revision_has_no_content: 'The deleted content was never captured, so there’s nothing to restore.',
+  revision_content_unreadable:
+    'The deleted copy was saved, but this version of Notarium can no longer read it.',
   note_not_in_trash: 'This item is no longer in the trash.',
   'physical-target-changed':
     'The original path is occupied by another note. Move or rename that note, then try restoring again.',

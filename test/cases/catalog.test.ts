@@ -948,6 +948,7 @@ describe('seed catalog (#175)', () => {
     externalRewrites: true,
     revisionStates: true,
     externalIdentityClaims: true,
+    externalSources: true,
   } as const satisfies Record<keyof CaseWorld, true>
 
   const WORLD_FIELD_NAMES = Object.keys(WORLD_FIELDS) as Array<keyof CaseWorld>

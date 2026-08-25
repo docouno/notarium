@@ -813,7 +813,8 @@ describe('NotariumStore external edit convergence', () => {
   it('reads a byte-order-marked note with no frontmatter by its own heading, undecodable bytes included', async () => {
     const root = await mkroot()
     // A converter that stamps a UTF-8 mark on a legacy-encoded file leaves BOTH: the
-    // mark and bytes no UTF-8 reader can decode. DocumentState has no projection to
+    // mark and bytes no UTF-8 reader can decode. The mark then has to survive the round
+    // trip — a save that drops it changes a file the user never asked us to change. DocumentState has no projection to
     // offer for those bytes, so read() falls through to the file parse — which must
     // still find the note's own heading title behind the mark. When it did not, the
     // note took its FILENAME as the title and kept mark plus heading in the body, and
@@ -845,8 +846,76 @@ describe('NotariumStore external edit convergence', () => {
       const after = await fs.readFile(join(root, savedPath), 'utf8')
 
       expect(after.match(/^# .*$/gm)).toEqual(['# Hello'])
-      expect(after).not.toContain('\uFEFF')
+      // The mark is the FILE's encoding prologue, and a save rebuilds the file: dropping
+      // it here would be this engine rewriting a byte of somebody else's document. It
+      // still leads the bytes, and there is still exactly one of it.
+      expect(after.charCodeAt(0)).toBe(0xfeff)
+      expect(after.match(/\uFEFF/gu)).toHaveLength(1)
       expect((await store.read(savedPath)).title).toBe('Hello')
+    } finally {
+      await store.stop()
+    }
+  })
+
+  it.each([
+    {
+      shape: 'a marked file with frontmatter',
+      bytes: '\uFEFF---\ntitle: Marked\n---\n\n# Marked\n\nbody\n',
+      title: 'Marked',
+    },
+    {
+      // A SECOND mark is ordinary content, wherever it sits — inside the prose…
+      shape: 'a file whose second mark is content',
+      bytes: '\uFEFF---\ntitle: Marked\n---\n\n# Marked\n\nbo\uFEFFdy\n',
+      title: 'Marked',
+    },
+    {
+      // …or immediately after the prologue, which is the harder case: the block reader
+      // tolerates one mark before its fence because it is written for raw FILES, so a
+      // second one used to be folded into the opening fence and dropped on save.
+      shape: 'a file led by two marks',
+      bytes: '\uFEFF\uFEFF---\ntitle: Marked\n---\n\n# Marked\n\nbody\n',
+      title: 'Marked',
+    },
+  ])('keeps the encoding prologue across an ordinary save: $shape', async ({ bytes, title }) => {
+    const root = await mkroot()
+
+    await fs.writeFile(join(root, 'marked.md'), bytes, 'utf8')
+    const store = createNotariumStore({ notesDir: root, integritySweepBatchSize: 0 })
+
+    try {
+      const read = await store.read('marked.md')
+      const saved = await store.write({
+        title,
+        content: `${read.content}\nanother line\n`,
+        originalId: 'marked.md',
+      })
+      const after = await fs.readFile(join(root, saved.filePath!), 'utf8')
+
+      expect(after.charCodeAt(0)).toBe(0xfeff)
+      expect(after.match(/\uFEFF/gu)).toHaveLength((bytes.match(/\uFEFF/gu) ?? []).length)
+      expect(after).toContain('another line')
+      expect((await store.read(saved.filePath!)).title).toBe(title)
+    } finally {
+      await store.stop()
+    }
+  })
+
+  it('invents no encoding prologue for a file that never had one', async () => {
+    const root = await mkroot()
+    const store = createNotariumStore({ notesDir: root, integritySweepBatchSize: 0 })
+
+    try {
+      const fresh = await store.write({ title: 'Plain', content: 'body\n' })
+
+      expect(await fs.readFile(join(root, fresh.filePath!), 'utf8')).not.toContain('\uFEFF')
+      const again = await store.write({
+        title: 'Plain',
+        content: 'body\nmore\n',
+        originalId: fresh.filePath!,
+      })
+
+      expect(await fs.readFile(join(root, again.filePath!), 'utf8')).not.toContain('\uFEFF')
     } finally {
       await store.stop()
     }

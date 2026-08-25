@@ -33,8 +33,26 @@ Each exact document also carries persisted restore safety: `safe`, `blocked` (a
 target owner value is structurally coupled, for example through a YAML anchor), or
 `unknown` (the parser cannot prove a safe byte-range mutation). Together with format
 and blob presence this becomes the public availability algebra: `full`, `partial`,
-`opaque`, `gap`, `blocked`, `unknown`; a host without the strict coordinator maps the
-otherwise restorable states to `capability-unavailable`.
+`opaque`, `gap`, `blocked`, `unknown`, `unreadable`; a host without the strict
+coordinator maps the otherwise restorable states to `capability-unavailable`. All but
+the last are projections of a row's own columns — `unreadable` is not, and only a
+surface that has already opened the blob may answer it ([trash](trash.md#availability)).
+
+**Restore safety is a stored value, so it cannot grow a new opinion.** It is hashed into
+the semantic fingerprint and compared in the blob header, which means widening what
+counts as unsafe would make revisions ALREADY on disk fail to decode — the very
+documents such a widening would exist to protect. So the planner carries the second
+guard instead, against its own candidate rather than against the source: a mutation
+that leaves the document parseable but no longer projectable is refused before it is
+published. The shape that does this is an entry-wide rewrite — a block list, a block
+scalar and a bare `key:` have no value slot on their own line, so replacing the value
+means replacing the entry, and an anchor defined there goes with it while a
+neighbour's alias keeps pointing at it. Unresolved aliases are not parse errors, so
+nothing else in the chain objects. The check is asymmetric on purpose: a source whose
+projection already failed is not something the plan broke, and refusing it would
+prohibit restoring documents that were always like that. Callers see the existing
+verdicts — `owner-provenance-conflict` on the exact branch, `legacy-source-unsafe` on
+the legacy one — and the file on disk is left untouched.
 `entry_role`: `origin` | `baseline` | `change` (#327) — WHAT the entry is in the note's life, decided by the writer at append and never inferred on read. `origin` = the note appeared through us; `baseline` = a synthetic pre-edit state or the first sighting of a note that already existed outside (real history, but not activity — counting it would double a pre-existing note's first edit); `change` = every later state. Before it, four consumers derived the same thing from `kind = 'external' AND base_rev IS NULL`, and quarantine (below) broke that approximation outright: with a contaminated past, a note's next ordinary edit has no trusted parent either, so it read as a first sighting and vanished from every Activity surface. The writer asks `hasAnyFor` — trusted AND quarantined — exactly once in a note's life, when there is no trusted latest at all. Quarantine does not change the role: it is a structural position, like `kind` and `createdAt`, not payload, so a gap keeps it and a contaminated baseline is still suppressed from `created`/`edited` while emitting as `unavailable`. The baseline-to-current carrier backfills the first parentless row per `(space,note_id)` and every current writer supplies the field explicitly; the final column has no mixed-version default.
 
 `integrity`: `trusted` | `quarantined` (#327). A cross-space id collision does not only mis-address rows, it CONTAMINATES chains: a revision's `base_rev`/`their_rev`/`source_rev` could point across a space boundary, so everything downstream of such a link was diffed, chained and attributed against state that never belonged to this note. Those rows are `quarantined` and served as **gaps**: the revision id, note, space, `kind` and time survive — which is what keeps cursors, totals, pages and session linkage exact — and everything that could attribute or reconstruct the state is withheld, with an additive `unavailableReason` on the wire. Nothing is invented in its place: no neutral author, no reconstructed parent, no alias. The taint belongs to the DEPENDENT row, never to a clean ancestor, and it flows downstream through EVERY space: an Alpha → Beta → Alpha chain quarantines the Beta row and the late Alpha row while the early clean Alpha row stays the trusted operational latest. Note-addressed reads are space-scoped for the same reason — the journal is shared across spaces, and a contaminated chain must not be readable through a sibling.

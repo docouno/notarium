@@ -48,6 +48,29 @@ export const historyRowLabels = (
   }
 }
 
+/** Whether Restore may be OFFERED for the revision on screen.
+ *
+ *  The timeline row is a projection of the journal's columns, and a revision whose blob is
+ *  stored but unreadable has columns that describe a perfectly restorable state — so the
+ *  row alone always says yes. The only party that knows better is this screen, which has
+ *  already asked for the body and been refused; without `detailUnreadable` the button
+ *  stays live and restore fails after the click. */
+export const canRestoreRevision = (input: {
+  revision: Pick<RevisionView, 'restoreAvailability'>
+  /** The host permits restore at all (capability, permissions). */
+  restorable: boolean
+  /** This revision's body came back as an unreadable stored copy. */
+  detailUnreadable: boolean
+  isLatest: boolean
+  restoring: boolean
+}): boolean =>
+  input.restorable &&
+  (input.revision.restoreAvailability === 'full' ||
+    input.revision.restoreAvailability === 'partial') &&
+  !input.detailUnreadable &&
+  !input.isLatest &&
+  !input.restoring
+
 export type DiffSegment = { value: string; kind: 'ctx' | 'add' | 'del' }
 export type DiffRow = { num: number; changed: boolean; segments: DiffSegment[] }
 

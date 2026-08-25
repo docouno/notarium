@@ -5,7 +5,11 @@ import type { CaseSpec } from '../types'
  *  graph edge without changing file size or mtime. The real seed writes the
  *  initial version through the production store, then mutates the markdown file
  *  behind its back. On the restarted stand, list/search/graph must all converge
- *  to the replacement content. */
+ *  to the replacement content.
+ *
+ *  It also carries the two file SHAPES an authoring write cannot produce, because they
+ *  arrive by the same route — a writer that is not us. Both are real-stand only: the fake
+ *  has no files, so it shows the notes normalized. */
 export const externalEdits: CaseSpec = {
   name: 'external-edits',
   description:
@@ -45,6 +49,45 @@ export const externalEdits: CaseSpec = {
         { from: 'stale-token', to: 'fresh-token' },
         { from: '[[Target A]]', to: '[[Target B]]' },
       ],
+    })
+    // A file a converter led with a UTF-8 mark. Saving this note must not quietly drop
+    // that byte — the mark belongs to the file, not to anything Notarium projects.
+    const marked = b.note({
+      space: 'main',
+      path: 'external/byte-order-marked.md',
+      title: 'Byte-order marked',
+      content: '# Byte-order marked\n\nPlaceholder replaced on disk.',
+      created: daysBefore(now, 9),
+      principal: 'user:sergey',
+    })
+
+    b.externalSource({
+      note: marked,
+      source: {
+        encoding: 'utf8',
+        data:
+          '\uFEFF---\ntitle: Byte-order marked\nnotarium-id: {{noteId}}\n---\n\n' +
+          '# Byte-order marked\n\nA converter stamped this file with an encoding prologue.\n',
+      },
+    })
+    // Prose that OPENS with a horizontal rule. The domain reads no frontmatter here (a
+    // block starts on line one), so the first paragraph must survive export with
+    // `frontmatter=strip` and must show up in the card preview.
+    const ruled = b.note({
+      space: 'main',
+      path: 'external/rule-led-prose.md',
+      title: 'Rule-led prose',
+      content: '# Rule-led prose\n\nPlaceholder replaced on disk.',
+      created: daysBefore(now, 8),
+      principal: 'user:sergey',
+    })
+
+    b.externalSource({
+      note: ruled,
+      source: {
+        encoding: 'utf8',
+        data: '\n---\nA thought I wrote between two rules.\n---\nAnd the rest.\n',
+      },
     })
 
     return b.build()

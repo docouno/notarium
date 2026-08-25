@@ -12,6 +12,7 @@ export const RestoreAvailabilitySchema = z.enum([
   'gap',
   'blocked',
   'unknown',
+  'unreadable',
   'capability-unavailable',
 ])
 

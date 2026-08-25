@@ -5,6 +5,7 @@ import {
   DOCUMENT_ROLE,
   type FrontmatterEntry,
   frontmatterEntryOf,
+  frontmatterPayloadBounds,
   isDurableFrontmatter,
   isGeneratedNoteId,
   MAX_SKILL_FILE_BYTES,
@@ -15,7 +16,32 @@ import {
   STORAGE_OWNER_KEY,
 } from '@notarium/core'
 
-const FRONTMATTER = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/
+/** The manifest block, by the same predicate the domain uses. It tolerates a leading
+ *  encoding mark because a file may carry one and a save preserves it.
+ *  canon: docs/core.md#write-through */
+const skillFrontmatter = (
+  raw: string,
+): { payload: string; body: string; manifestBytes: number } | null => {
+  const block = parseFrontmatterBlock(raw)
+
+  if (!block) {
+    return null
+  }
+  // The payload bounds come from the parser's own geometry rather than a hand-rolled
+  // slice: hunting the closing fence with `lastIndexOf('\n---')` finds the `\n` of a
+  // CRLF pair and leaves the `\r` on the last entry, which YAML then reads as part of
+  // that value — so a Windows-authored manifest came back with `name: "reviewer\r"`.
+  const { payloadStart, payloadEnd } = frontmatterPayloadBounds(raw, block.bodyStart)
+
+  return {
+    payload: raw.slice(payloadStart, payloadEnd),
+    body: raw.slice(block.bodyStart),
+    manifestBytes: Buffer.byteLength(raw.slice(0, block.bodyStart), 'utf8'),
+  }
+}
+
+/** Exactly one mark leads a file, and a rebuilt manifest has to keep leading with it. */
+const bomOf = (raw: string): string => (raw.charCodeAt(0) === 0xfeff ? '\uFEFF' : '')
 export { MAX_SKILL_FILE_BYTES, MAX_SKILL_MANIFEST_BYTES }
 export type ParsedSkill = SkillProjection
 export type BundledAbilityIdentity = {
@@ -64,12 +90,12 @@ export const parseSkillFile = (raw: string, directoryName: string): ParsedSkill 
   if (Buffer.byteLength(raw, 'utf8') > MAX_SKILL_FILE_BYTES) {
     throw new Error(`${directoryName}/SKILL.md: file is too large`)
   }
-  const match = FRONTMATTER.exec(raw)
+  const manifest = skillFrontmatter(raw)
 
-  if (!match) {
+  if (!manifest) {
     throw new Error(`${directoryName}/SKILL.md: YAML frontmatter is required`)
   }
-  if (Buffer.byteLength(match[0], 'utf8') > MAX_SKILL_MANIFEST_BYTES) {
+  if (manifest.manifestBytes > MAX_SKILL_MANIFEST_BYTES) {
     throw new Error(`${directoryName}/SKILL.md: YAML frontmatter is too large`)
   }
   const state = analyzeDocumentState({
@@ -116,12 +142,12 @@ export const withCatalogProvenance = (
   revision: string,
   noteId?: string,
 ): string => {
-  const match = FRONTMATTER.exec(raw)
+  const manifest = skillFrontmatter(raw)
 
-  if (!match) {
+  if (!manifest) {
     throw new Error('SKILL.md: YAML frontmatter is required')
   }
-  const frontmatter = parseMap(match[1], 'SKILL.md')
+  const frontmatter = parseMap(manifest.payload, 'SKILL.md')
   const metadata = metadataOf(frontmatter.metadata, 'SKILL.md')
   delete metadata['notarium.source']
   delete metadata['notarium.package-id']
@@ -134,7 +160,7 @@ export const withCatalogProvenance = (
     frontmatter[NOTE_ID_FRONTMATTER_KEY] = noteId
   }
 
-  return `---\n${stringify(frontmatter).trimEnd()}\n---\n\n${raw.slice(match[0].length).trimStart()}`
+  return `${bomOf(raw)}---\n${stringify(frontmatter).trimEnd()}\n---\n\n${manifest.body.trimStart()}`
 }
 
 /** Re-address one authored SKILL.md as a NEW package: the note id is the only thing
@@ -143,28 +169,28 @@ export const withCatalogProvenance = (
  * that IS the title, description, metadata, links — is carried verbatim, which is
  * what makes a copy a starting point instead of a reconstruction. */
 export const withFreshNoteId = (raw: string, noteId: string): string => {
-  const match = FRONTMATTER.exec(raw)
+  const manifest = skillFrontmatter(raw)
 
-  if (!match) {
+  if (!manifest) {
     throw new Error('SKILL.md: YAML frontmatter is required')
   }
-  const frontmatter = parseMap(match[1], 'SKILL.md')
+  const frontmatter = parseMap(manifest.payload, 'SKILL.md')
   frontmatter[NOTE_ID_FRONTMATTER_KEY] = noteId
 
-  return `---\n${stringify(frontmatter).trimEnd()}\n---\n\n${raw.slice(match[0].length).trimStart()}`
+  return `${bomOf(raw)}---\n${stringify(frontmatter).trimEnd()}\n---\n\n${manifest.body.trimStart()}`
 }
 
 export const withSkillLinks = (raw: string, links: readonly string[]): string => {
-  const match = FRONTMATTER.exec(raw)
+  const manifest = skillFrontmatter(raw)
 
-  if (!match) {
+  if (!manifest) {
     throw new Error('SKILL.md: YAML frontmatter is required')
   }
-  const frontmatter = parseMap(match[1], 'SKILL.md')
+  const frontmatter = parseMap(manifest.payload, 'SKILL.md')
   const metadata = metadataOf(frontmatter.metadata, 'SKILL.md')
   frontmatter.metadata = { ...metadata, 'notarium.skills': links.join(' ') }
 
-  return `---\n${stringify(frontmatter).trimEnd()}\n---\n\n${raw.slice(match[0].length).trimStart()}`
+  return `${bomOf(raw)}---\n${stringify(frontmatter).trimEnd()}\n---\n\n${manifest.body.trimStart()}`
 }
 
 /** Which of these tokens the frontmatter channel cannot write back, in the author's own

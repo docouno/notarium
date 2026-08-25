@@ -7,6 +7,7 @@
 
 import { type CSSProperties, useEffect, useMemo, useRef, useState } from 'react'
 import { REVISION_KIND } from '@notarium/contract/enums'
+import { STORE_ERROR_REASON } from '@notarium/core'
 import { Button } from '../../core/Button'
 import { useDialog } from '../../core/Dialog'
 import { Segmented } from '../../core/Segmented'
@@ -16,12 +17,13 @@ import { cx } from '../../libs/cx/cx'
 import { exactDateTime } from '../../libs/datetime'
 import { renderMarkdown } from '../../libs/markdown/markdown'
 import { useMarkdownEnhance } from '../../libs/markdown/useMarkdownEnhance'
-import type {
-  NoteHistorySource,
-  RevisionView as Revision,
-  RevisionDetailView,
+import {
+  type NoteHistorySource,
+  recoveryPresentation,
+  type RevisionView as Revision,
+  type RevisionDetailView,
 } from '../../libs/revisions'
-import { buildDiffRows } from './helpers'
+import { buildDiffRows, canRestoreRevision } from './helpers'
 import styles from './RevisionView.module.scss'
 
 type RevisionViewProps = {
@@ -37,6 +39,10 @@ type RevisionViewProps = {
   /** The note was rolled back — the host reloads the reader and closes this view. */
   onRestored: () => void
 }
+
+/** The one refusal that means "the copy is here and this server cannot open it" — the row
+ *  itself looks restorable, so nothing else on this screen can tell. */
+const UNREADABLE_REASON = STORE_ERROR_REASON.revisionContentUnreadable
 
 const isPartialState = (
   revision: Pick<Revision, 'contentHash' | 'stateFormat'> | undefined,
@@ -73,15 +79,27 @@ export const RevisionView = ({
   // Revision bodies by revision id. Content-addressed upstream; immutable —
   // an entry never goes stale, so the cache lives as long as the view.
   const detailsRef = useRef(new Map<string, RevisionDetailView>())
+  // Revisions whose blob is stored and which this server cannot open — see
+  // `canRestoreRevision` for why only this screen can know.
+  // canon: docs/trash.md#availability
+  const unreadableRef = useRef(new Set<string>())
+  // Ids this view has already asked for. A body is content-addressed and immutable, so one
+  // request per id is the whole contract — and without tracking the ATTEMPT, a refusal
+  // (which never lands in `detailsRef`) puts its own tick back through this effect.
+  const attemptedRef = useRef(new Set<string>())
   const [detailsTick, setDetailsTick] = useState(0)
 
   const baseId = revision.baseRevisionId
 
   useEffect(() => {
     const want = [revision.revisionId, baseId].filter(
-      (id): id is string => !!id && !detailsRef.current.has(id),
+      (id): id is string => !!id && !attemptedRef.current.has(id),
     )
     let dead = false
+
+    for (const id of want) {
+      attemptedRef.current.add(id)
+    }
 
     for (const id of want) {
       void source
@@ -92,8 +110,15 @@ export const RevisionView = ({
             setDetailsTick((n) => n + 1)
           }
         })
-        .catch(() => {
-          // A vanished revision (refetch raced a reset) just renders empty.
+        .catch((e: unknown) => {
+          // A vanished revision (refetch raced a reset) just renders empty; an unreadable
+          // one is a durable fact about this server and has to reach the button.
+          if ((e as { reason?: string } | null)?.reason === UNREADABLE_REASON) {
+            unreadableRef.current.add(id)
+            if (!dead) {
+              setDetailsTick((n) => n + 1)
+            }
+          }
         })
     }
 
@@ -104,9 +129,13 @@ export const RevisionView = ({
 
   const detail = detailsRef.current.get(revision.revisionId)
   const baseDetail = baseId ? detailsRef.current.get(baseId) : undefined
-  const baseLoaded = !baseId || detailsRef.current.has(baseId)
+  const baseUnreadable = Boolean(baseId && unreadableRef.current.has(baseId))
+  // An unreadable parent is loaded — the answer is just "this server cannot open it".
+  // Treating it as still-loading left the diff shimmering with nothing on screen.
+  const baseLoaded = !baseId || detailsRef.current.has(baseId) || baseUnreadable
   const activeView = detail?.contentMode === 'source' ? 'content' : view
   const comparisonIsGap = Boolean(baseId && baseLoaded && baseDetail?.contentMode === 'gap')
+  const comparisonIsUnreadable = baseUnreadable
   const comparisonIsSource = Boolean(baseId && baseLoaded && baseDetail?.contentMode === 'source')
 
   const diffRows = useMemo(() => {
@@ -141,11 +170,14 @@ export const RevisionView = ({
   )
   useMarkdownEnhance(contentRef, activeView === 'content' ? contentHtml : '')
 
-  const canRestore =
-    restorable &&
-    (revision.restoreAvailability === 'full' || revision.restoreAvailability === 'partial') &&
-    !isLatest &&
-    !restoring
+  const detailUnreadable = unreadableRef.current.has(revision.revisionId)
+  const canRestore = canRestoreRevision({
+    revision,
+    restorable,
+    detailUnreadable,
+    isLatest,
+    restoring,
+  })
   // Intrinsic state completeness and host restore capability are independent.
   // A none/fake host maps an otherwise restorable legacy row to
   // capability-unavailable, but it must remain visibly partial.
@@ -264,7 +296,20 @@ export const RevisionView = ({
         </div>
       ) : null}
 
-      {selectedUnavailable && revision.contentHash != null ? (
+      {detailUnreadable ? (
+        <div className={styles.partial} data-testid="history-unreadable">
+          {recoveryPresentation('unreadable').reason}
+        </div>
+      ) : null}
+
+      {comparisonIsUnreadable ? (
+        <div className={styles.gap} data-testid="history-comparison-unreadable">
+          Changes cannot be compared because this server can no longer read the parent
+          revision&rsquo;s saved copy.
+        </div>
+      ) : null}
+
+      {selectedUnavailable && !detailUnreadable && revision.contentHash != null ? (
         <div className={styles.partial} data-testid="history-unavailable">
           {revision.restoreAvailability === 'opaque'
             ? 'This revision is opaque source data. It can be inspected as plain source but not rendered or restored.'

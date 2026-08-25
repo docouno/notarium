@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { RevisionView } from '../../libs/revisions'
-import { historyRowLabels } from './helpers'
+import { canRestoreRevision, historyRowLabels } from './helpers'
 
 const row = (over: Partial<RevisionView> = {}): RevisionView => ({
   revisionId: '7',
@@ -65,4 +65,39 @@ describe('historyRowLabels', () => {
       historyRowLabels(row({ kind: 'restore', sourceRevisionId: '3' }), undefined, 'you').kind,
     ).toBe('Restored')
   })
+})
+
+describe('canRestoreRevision', () => {
+  const ask = (over: Partial<Parameters<typeof canRestoreRevision>[0]> = {}) =>
+    canRestoreRevision({
+      revision: row({ restoreAvailability: 'full' }),
+      restorable: true,
+      detailUnreadable: false,
+      isLatest: false,
+      restoring: false,
+      ...over,
+    })
+
+  it('offers restore for a complete copy this screen could read', () => {
+    expect(ask()).toBe(true)
+  })
+
+  // The row says `full` because the journal's columns say so; only this screen has
+  // asked for the body and been told the stored copy cannot be opened here.
+  it('withdraws it when the body came back unreadable, despite a restorable row', () => {
+    expect(ask({ detailUnreadable: true })).toBe(false)
+  })
+
+  it.each([
+    ['gap', { revision: row({ restoreAvailability: 'gap' }) }],
+    ['unreadable', { revision: row({ restoreAvailability: 'unreadable' }) }],
+    ['the latest revision', { isLatest: true }],
+    ['a host that cannot restore', { restorable: false }],
+    ['a restore already in flight', { restoring: true }],
+  ] as Array<[string, Partial<Parameters<typeof canRestoreRevision>[0]>]>)(
+    'keeps it off for %s',
+    (_name, over) => {
+      expect(ask(over)).toBe(false)
+    },
+  )
 })

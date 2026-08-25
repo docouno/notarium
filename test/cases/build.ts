@@ -15,6 +15,7 @@ import type {
   DurableImportDecl,
   ExternalIdentityClaimDecl,
   ExternalRewriteDecl,
+  ExternalSourceDecl,
   FavoriteDecl,
   JobDecl,
   MemberDecl,
@@ -138,6 +139,7 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
   const externalRewrites: ExternalRewriteDecl[] = []
   const revisionStates: RevisionStateDecl[] = []
   const externalIdentityClaims: ExternalIdentityClaimDecl[] = []
+  const externalSources: ExternalSourceDecl[] = []
   const events: CaseEvent[] = []
   const takenPaths = new Set<string>()
   const currentPathByNote = new Map<string, string>()
@@ -375,6 +377,9 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
         claimFrom: `${name}:${claim.claimFrom}`,
       })
     }
+    for (const source of world.externalSources ?? []) {
+      externalSources.push({ ...source, note: `${name}:${source.note}` })
+    }
     for (const rewrite of world.externalRewrites ?? []) {
       externalRewrites.push({ ...rewrite, note: `${name}:${rewrite.note}` })
     }
@@ -419,5 +424,6 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
     ...(externalRewrites.length ? { externalRewrites } : {}),
     ...(revisionStates.length ? { revisionStates } : {}),
     ...(externalIdentityClaims.length ? { externalIdentityClaims } : {}),
+    ...(externalSources.length ? { externalSources } : {}),
   })
 }

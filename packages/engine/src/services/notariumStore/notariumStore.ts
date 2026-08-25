@@ -73,6 +73,7 @@ import {
   type FolderAlias,
   freshNoteId,
   frontmatterEntryValue,
+  FrontmatterGeometryError,
   FrontmatterLimitError,
   frontmatterValue,
   type IdentityMaterialization,
@@ -2306,7 +2307,19 @@ export class NotariumStore implements KnowledgeStore {
         if (!mutation) {
           throw writeFailed('storage cannot rewrite an identity claim without replacing a race')
         }
-        const next = upsertFrontmatterKey(snapshot.raw, NOTE_ID_FRONTMATTER_KEY, targetId)
+        let next: string
+
+        try {
+          next = upsertFrontmatterKey(snapshot.raw, NOTE_ID_FRONTMATTER_KEY, targetId)
+        } catch (err) {
+          if (err instanceof FrontmatterGeometryError) {
+            // The claim loses to the author's bytes, not the other way round. Throwing here
+            // would abort the space's whole boot sweep over one file.
+            return { status: 'unwritable', reason: err.reason }
+          }
+
+          throw err
+        }
 
         if (!(await mutation.replaceIfAbsent(rel, rel, snapshot.raw, next))) {
           // Someone replaced the file between the snapshot and the swap. That is

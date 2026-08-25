@@ -32,6 +32,7 @@ import {
   SPACE_LIFECYCLE_PHASE,
   STORAGE_OWNER_KEY,
   type StorageOwnerProof,
+  STORE_ERROR_REASON,
   unionLegacyNameAliases,
 } from '@notarium/core'
 import {
@@ -877,7 +878,11 @@ export class RestoreCoordinator {
       try {
         historical = decodeDocumentState(bytesOf(sourceBlob))
       } catch {
-        return reject('not-restorable', 'invalid-document-state')
+        // The blob EXISTS — we are holding its bytes — and this reader cannot project
+        // them. Saying "invalid" blames the row for what is a fact about this server, and
+        // it is the same lie the journal's own vocabulary stopped telling.
+        // canon: docs/trash.md#availability
+        return reject('not-restorable', STORE_ERROR_REASON.revisionContentUnreadable)
       }
       const compatibility = documentRestoreCompatibility(historical, {
         role: target.role,

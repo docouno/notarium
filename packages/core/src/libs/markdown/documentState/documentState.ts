@@ -2,8 +2,11 @@ import { isMap, isScalar, type Pair, parseDocument, visit } from 'yaml'
 
 import { isValidNoteId } from '../../id'
 import {
+  type FrontmatterBlock,
   type FrontmatterEntry,
+  frontmatterEntrySpans,
   frontmatterEntryValue,
+  frontmatterPayloadBounds,
   frontmatterScalar,
   parseFrontmatterBlock,
 } from '../frontmatter'
@@ -72,6 +75,12 @@ type FrontmatterAnalysis = {
   fields: FieldRange[]
   projection: Record<string, unknown>
   yamlErrors: boolean
+  /** The document PARSED, but its semantic projection could not be built — an unresolved
+   * alias is the shape that produces it. Distinct from `yamlErrors`: the source stays
+   * perfectly readable, and only the meaning is gone. Deliberately not an input to
+   * `safetyOf`: that value is hashed into stored revisions, so widening it would make
+   * already-written blobs unreadable. */
+  projectionFailed: boolean
   ownerAnchorDependency: boolean
 }
 
@@ -163,109 +172,17 @@ const byteRange = (offsets: readonly number[], start: number, end: number): Byte
   return { start: byteStart, end: byteEnd }
 }
 
-/** One frontmatter line, by the rule the RAW PARSER and the YAML reader both use
- * (`\r?\n`) rather than the Markdown physical-line rule. The two disagree on a lone CR
- * and on U+2028/U+2029, and none of those ends a YAML line: reading this block with the
- * wider rule split an entry the parser had kept whole, so the analyzer declared its own
- * ranges corrupt and an ordinary title made the document unreadable. `limit` is the
- * payload end, so no walk can wander past the closing fence. */
-const nextFrontmatterLineSpan = (
-  text: string,
-  start: number,
-  limit: number,
-): { end: number; next: number } | null => {
-  if (start >= limit) {
-    return null
-  }
-  const feed = text.indexOf('\n', start)
-  const breakAt = feed < 0 || feed >= limit ? limit : feed
-
-  return {
-    end: breakAt > start && text[breakAt - 1] === '\r' ? breakAt - 1 : breakAt,
-    next: Math.min(breakAt + 1, limit),
-  }
-}
-
-/** A line the raw parser treats as a separator: horizontal whitespace only, exactly
- * `isYamlBlank` in `parseFrontmatterBlock`. `String.trim` is NOT the same predicate —
- * it also strips NBSP and friends, which the parser carries as a real entry. */
-const SEPARATOR_BLANK = /^[ \t]*$/
-
-// A byte-order mark needs no compensation HERE and never did: it shares the opening
-// fence's line, and this walk steps over that whole line to reach the payload. What the
-// mark does move is the mapping from text index to source byte, which is `offsets`' job
-// and is now correct because the text is decoded losslessly.
-const frontmatterBounds = (
-  text: string,
-  bodyStart: number,
-): { payloadStart: number; payloadEnd: number } => {
-  const payloadStart = nextFrontmatterLineSpan(text, 0, bodyStart)?.next ?? bodyStart
-  let cursor = payloadStart
-  let payloadEnd = -1
-
-  while (cursor < bodyStart) {
-    const line = nextFrontmatterLineSpan(text, cursor, bodyStart)
-
-    if (!line) {
-      break
-    }
-    if (text.slice(cursor, line.end).replace(/[ \t]+$/g, '') === '---') {
-      payloadEnd = cursor
-      break
-    }
-    cursor = line.next
-  }
-  if (payloadEnd < payloadStart) {
-    throw new Error('frontmatter parser returned inconsistent bounds')
-  }
-
-  return { payloadStart, payloadEnd }
-}
-
+/** The parser owns the block's character geometry; this file owns the translation of it
+ * into the byte coordinates persistence and materialization speak. */
 const entryRanges = (
   text: string,
-  entries: readonly FrontmatterEntry[],
-  payloadStart: number,
-  payloadEnd: number,
+  block: FrontmatterBlock,
   offsets: readonly number[],
-): Array<{ key: string | null; range: ByteRange }> => {
-  const ranges: Array<{ key: string | null; range: ByteRange }> = []
-  let cursor = payloadStart
-
-  for (const entry of entries) {
-    // A blank line BETWEEN entries is legal YAML that the raw parser drops: it is not an
-    // entry of its own, while a blank that BELONGS to one — block-scalar content, a
-    // paragraph break inside a continued value — stays in that entry's lines and is
-    // matched below. Stepping over exactly the dropped ones is what keeps this walk in
-    // sync with the parser. Without it the first such blank shifted every later range,
-    // the whole document was reported as corrupt, and since writing an owner key before
-    // the closing fence turns a TRAILING blank into an interior one, an ordinary note
-    // became unreadable the moment Notarium claimed it.
-    if (!SEPARATOR_BLANK.test(entry.lines[0] ?? '')) {
-      let blank = nextFrontmatterLineSpan(text, cursor, payloadEnd)
-
-      while (blank && SEPARATOR_BLANK.test(text.slice(cursor, blank.end))) {
-        cursor = blank.next
-        blank = nextFrontmatterLineSpan(text, cursor, payloadEnd)
-      }
-    }
-    const start = cursor
-
-    // Within an entry the lines stay exactly consecutive and byte-identical: a real
-    // divergence between parser and source still fails closed here.
-    for (const expected of entry.lines) {
-      const line = nextFrontmatterLineSpan(text, cursor, payloadEnd)
-
-      if (!line || text.slice(cursor, line.end) !== expected) {
-        throw new Error('frontmatter entry ranges do not match the source')
-      }
-      cursor = line.next
-    }
-    ranges.push({ key: entry.key, range: byteRange(offsets, start, cursor) })
-  }
-
-  return ranges
-}
+): Array<{ key: string | null; range: ByteRange }> =>
+  frontmatterEntrySpans(text, block).map((span) => ({
+    key: span.key,
+    range: byteRange(offsets, span.start, span.end),
+  }))
 
 const pairKey = (pair: Pair): string | null =>
   isScalar(pair.key) && typeof pair.key.value === 'string' ? pair.key.value : null
@@ -281,13 +198,14 @@ const analyzeFrontmatter = (text: string, offsets: readonly number[]): Frontmatt
       fields: [],
       projection: {},
       yamlErrors: false,
+      projectionFailed: false,
       ownerAnchorDependency: false,
     }
   }
-  const { payloadStart, payloadEnd } = frontmatterBounds(text, block.bodyStart)
+  const { payloadStart, payloadEnd } = frontmatterPayloadBounds(text, block.bodyStart)
   const payload = text.slice(payloadStart, payloadEnd)
   const doc = parseDocument(payload, { prettyErrors: false, uniqueKeys: false })
-  const entries = entryRanges(text, block.entries, payloadStart, payloadEnd, offsets)
+  const entries = entryRanges(text, block, offsets)
   const fields: FieldRange[] = []
   const anchored = new Map<string, ByteRange>()
   const aliases: Array<{ source: string; range: ByteRange }> = []
@@ -347,6 +265,7 @@ const analyzeFrontmatter = (text: string, offsets: readonly number[]): Frontmatt
     }
   }
   let projection: Record<string, unknown> = {}
+  let projectionFailed = false
 
   try {
     const value = doc.toJS({ maxAliasCount: 20 })
@@ -355,7 +274,10 @@ const analyzeFrontmatter = (text: string, offsets: readonly number[]): Frontmatt
       projection = value as Record<string, unknown>
     }
   } catch {
-    // The exact source remains readable; only semantic projection is unavailable.
+    // The exact source remains readable; only semantic projection is unavailable. Readers
+    // degrade to the empty projection as they always have — but a WRITER has to be able to
+    // tell whether its own candidate is what lost the meaning.
+    projectionFailed = true
   }
   const ownerEntries = fields
     .filter((field) => OWNER_KEYS.has(field.key as StorageOwnerKey))
@@ -374,6 +296,7 @@ const analyzeFrontmatter = (text: string, offsets: readonly number[]): Frontmatt
     fields,
     projection,
     yamlErrors: doc.errors.length > 0,
+    projectionFailed,
     ownerAnchorDependency,
   }
 }
@@ -1038,7 +961,7 @@ const insertionBeforeClosingFence = (
       bytes: UTF8.encode(`---${eol}${payload}${eol}---${eol}`),
     }
   }
-  const bounds = frontmatterBounds(text, block.bodyStart)
+  const bounds = frontmatterPayloadBounds(text, block.bodyStart)
   return {
     range: byteRange(offsets, bounds.payloadEnd, bounds.payloadEnd),
     bytes: UTF8.encode(`${payload}${eol}`),
@@ -1188,6 +1111,21 @@ export const planDocumentMutation = (
   const candidateFm = candidate.projection
     ? analyzeFrontmatter(candidateText, candidateOffsets)
     : null
+
+  // The plan's second promise, next to the per-key one below: a mutation may not cost the
+  // document its meaning. An entry-wide rewrite is the shape that does it — a block list, a
+  // block scalar and a bare `key:` have no value slot on their own line, so `patchField`
+  // replaces the whole entry and carries off any anchor defined there, leaving a
+  // neighbour's alias dangling. Nothing else notices: unresolved aliases are not PARSE
+  // errors, so `doc.errors` stays empty, `safetyOf` reads anchor dependency for owner keys
+  // only, and the analyzer swallows the failed projection by design.
+  //
+  // Asymmetric on purpose. A source whose projection ALREADY failed is not something this
+  // plan broke — it arrived that way, and refusing it here would be a new prohibition over
+  // documents the task promised nothing about.
+  if (candidateFm?.projectionFailed && !frontmatter.projectionFailed) {
+    throw new Error('document mutation made its frontmatter unreadable')
+  }
   const requestedOwners = Object.entries(intent.owners ?? {}) as Array<
     [StorageOwnerKey, string | null]
   >
@@ -1201,10 +1139,12 @@ export const planDocumentMutation = (
   // all (a sequence, a bare scalar), and it is the backstop for any future disagreement
   // between a range and the source it is supposed to address.
   //
-  // A candidate that cannot be READ AT ALL is deliberately not this check's verdict: it
-  // is a statement about the whole document rather than about one key, the caller owns a
-  // gate that says so in those words, and no plan whose candidate is opaque can be
-  // published by anyone.
+  // A candidate that cannot be READ AT ALL is deliberately not this check's verdict: it is
+  // a statement about the whole document rather than about one key, and the callers own a
+  // gate that says so in their own, more precise words — `candidate-is-unsafe` from the
+  // restore coordinator, an invalid-manifest refusal from ability publication. Answering
+  // here would replace those verdicts with a vaguer one. That division is pinned by tests
+  // on the callers, not assumed.
   const proposedClaims = (candidateFm ? requestedOwners : []).flatMap(([key, value]) => {
     const written = candidateFm?.fields.filter((entry) => entry.key === key) ?? []
 

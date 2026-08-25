@@ -539,6 +539,17 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
     }
   }
 
+  // Whole-file bytes are deliberately NOT projected either, and for a blunter reason than
+  // the collision above: the fake HAS no files. An encoding prologue and a leading `---`
+  // rule are byte facts, and the fixture is a specification of the note's normalized
+  // state — so the stand shows these notes as their timeline left them. Only the real
+  // applier can plant the shape and prove the engine's answer to it. See docs/seeds.md.
+  for (const source of world.externalSources ?? []) {
+    if (!notes.has(source.note)) {
+      throw new Error(`external source references unknown note ${source.note}`)
+    }
+  }
+
   // NB `SpaceDecl.archived` (#110) is NOT projected: the fake's SpaceFixture has no
   // archived field, so an archived space seeds LIVE here — space-archive is a real-stand
   // concern (the real applier calls manager.archive), verified live. See docs/seeds.md.

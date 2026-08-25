@@ -33,6 +33,9 @@ export const STORE_ERROR_REASON = {
   versionConflict: 'version_conflict',
   revisionNotFound: 'revision_not_found',
   revisionHasNoContent: 'revision_has_no_content',
+  /** The blob EXISTS and this reader cannot project it — a statement about the reader, and
+   *  deterministic, so no retry clears it. canon: docs/trash.md#availability */
+  revisionContentUnreadable: 'revision_content_unreadable',
   noteNotInTrash: 'note_not_in_trash',
   revisionsUnavailable: 'revisions_unavailable',
   memoryConvergenceExhausted: 'memory_convergence_exhausted',

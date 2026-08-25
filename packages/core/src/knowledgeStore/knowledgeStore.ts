@@ -8,6 +8,7 @@ import type {
   DocumentStateFormat,
   ExactOwnerObservation,
   FrontmatterEntry,
+  FrontmatterGeometryReason,
   LogicalNoteState,
   RestoreSafety,
   StorageOwnerProof,
@@ -95,6 +96,10 @@ export const REVISION_RESTORE_AVAILABILITY = {
   gap: 'gap',
   blocked: 'blocked',
   unknown: 'unknown',
+  /** A blob is stored and this reader cannot open it. Never a projection of a row's
+   *  columns — only a surface that already read the blob may answer it.
+   *  canon: docs/trash.md#availability */
+  unreadable: 'unreadable',
 } as const
 
 export type RevisionRestoreAvailability =
@@ -416,6 +421,11 @@ export type IdentityMaterialization =
    *  that has already committed stands, and the next scan removes the note. A racing
    *  replacement is NOT this — that one is re-observed inside the loop. */
   | { status: 'vanished' }
+  /** The bytes cannot carry the claim without rewriting entries this channel does not own.
+   *  Terminal like `vanished` and for the same reason — re-reading the same file reaches the
+   *  same answer — but a failure of the write, not of the path: the file is untouched and the
+   *  note keeps whatever id the registry binds to it. */
+  | { status: 'unwritable'; reason: FrontmatterGeometryReason }
 
 /** Driven port: identity persistence — the drivers implement it, the read-model's IdentityRegistry
  *  consumes it. Losing it degrades softly. canon: docs/core.md#identity · docs/architecture.md#p2 */

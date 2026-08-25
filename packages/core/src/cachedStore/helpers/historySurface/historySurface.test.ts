@@ -8,7 +8,12 @@ import { describe, expect, it } from 'vitest'
 
 import type { IdentityRegistry } from '../../../identity'
 import { claudeConversationSourceLocator } from '../../../importer'
-import { noteAlreadyExists, type WriteInput, type WriteResult } from '../../../knowledgeStore'
+import {
+  noteAlreadyExists,
+  STORE_ERROR_REASON,
+  type WriteInput,
+  type WriteResult,
+} from '../../../knowledgeStore'
 import {
   logicalNoteState,
   type LogicalNoteState,
@@ -30,6 +35,9 @@ type Seed = {
   class?: string | null
   contentHash?: string | null
   content?: string | null
+  /** Makes `journal.detail` REFUSE for this seed — the shape a stored-but-unreadable
+   *  blob produces, which no writer in this tree can create. */
+  detailError?: unknown
   lastPath?: string
   logicalState?: LogicalNoteState
 }
@@ -83,6 +91,9 @@ const makeHost = (opts: {
 
       if (!s) {
         return null
+      }
+      if (s.detailError) {
+        throw s.detailError
       }
 
       return {
@@ -319,6 +330,67 @@ describe('HistorySurface restore/purge guards', () => {
     await deleteTask
     expect(pagesWhenDeleteLanded).toBe(2)
     expect(page[0]?.noteId).toBe('new-delete')
+  })
+
+  // A blob that is stored and unreadable is a THIRD state, and the whole point of this
+  // vertical is that it stops wearing the gap's words. The trash list still answers from
+  // the journal's columns — a deliberate border, not an oversight — so only the surfaces
+  // that open the blob can tell the truth, and they must.
+  describe('a stored blob this reader cannot open', () => {
+    const unreadable = () =>
+      Object.assign(new Error('nope'), {
+        reason: STORE_ERROR_REASON.revisionContentUnreadable,
+        isToolError: true,
+      })
+
+    it("carries the reader's own refusal out of restore, instead of the gap word", async () => {
+      const host = makeHost({ seeds: { n1: { detailError: unreadable() } } })
+
+      await expect(
+        host.trash.restore({ id: 'n1', revisionId: 'rev-n1', versionToken: 't' }),
+      ).rejects.toMatchObject({ reason: STORE_ERROR_REASON.revisionContentUnreadable })
+    })
+
+    it('lowers availability on the deleted view, which already opened the blob', async () => {
+      const host = makeHost({ seeds: { n1: { detailError: unreadable() } } })
+
+      await expect(host.trash.deletedNoteView('n1')).resolves.toMatchObject({
+        restoreAvailability: 'unreadable',
+        // The blob EXISTS — this flag was never a claim about readability.
+        restorable: true,
+      })
+    })
+
+    it('keeps saying gap where the body genuinely never passed through us', async () => {
+      const host = makeHost({ seeds: { n1: { contentHash: null } } })
+
+      await expect(host.trash.deletedNoteView('n1')).resolves.toMatchObject({
+        restoreAvailability: 'gap',
+        restorable: false,
+      })
+    })
+
+    it('does not lower the deleted view for an ordinary refusal it cannot classify', async () => {
+      const host = makeHost({ seeds: { n1: { detailError: new Error('transient') } } })
+
+      // `partial` is what these fixtures' columns describe (no stateFormat = legacy row);
+      // the point is that an unclassified failure changes nothing at all.
+      await expect(host.trash.deletedNoteView('n1')).resolves.toMatchObject({
+        restoreAvailability: 'partial',
+      })
+    })
+
+    it('leaves the trash LIST answering from columns — the named border', async () => {
+      const host = makeHost({
+        seeds: { n1: { detailError: unreadable() } },
+        trashedPage: [{ noteId: 'n1' }],
+      })
+      const page = await host.trash.listTrashed({ offset: 0, limit: 10 })
+
+      // Deliberate disagreement with the detail surface above: reading it truthfully here
+      // would mean decoding every blob on a hundred-row page.
+      expect(page.items[0]).toMatchObject({ restoreAvailability: 'partial' })
+    })
   })
 
   it('restore surfaces revisionNotFound / revisionHasNoContent honestly', async () => {
