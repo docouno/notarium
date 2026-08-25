@@ -22,7 +22,7 @@ const deletedNote = (
 export const restoreStates: CaseSpec = {
   name: 'restore-states',
   description:
-    'Exact raw, blocked, legacy, gap, opaque UTF-8/base64 and direct-SKILL revision states for history/trash restore proof (#275).',
+    'Exact raw, blocked, legacy, gap, opaque UTF-8/base64 and direct-SKILL revision states for history/trash restore proof (#275), plus a live 830 KB note and a live control-byte note (#392).',
   axes: ['history', 'trash', 'note-classes'],
   build: ({ now }) => {
     const b = new WorldBuilder(now)
@@ -192,6 +192,45 @@ export const restoreStates: CaseSpec = {
           data: '---\nname: invalid--direct\n---\nThe package stays opaque because its machine name is invalid.\n',
         },
       },
+    })
+
+    // #392, kept alive on every stand from here on. Both sizes/bytes are CONSTANTS
+    // on purpose: SCALE multiplies generated volume by convention, but 830 000 bytes
+    // is the incident size the fingerprint must survive — a scaled-down copy would sit
+    // under the old product ceiling (~123k bytes) and prove nothing.
+    const LARGE_NOTE_BYTES = 830_000
+    const largeLine = 'An imported dialog line that once pushed the fingerprint past its limit.\n'
+    const largeBody =
+      largeLine
+        .repeat(Math.ceil(LARGE_NOTE_BYTES / largeLine.length))
+        .slice(0, LARGE_NOTE_BYTES - 1) + '\n'
+
+    b.note({
+      space: 'main',
+      path: 'restore/large-import.md',
+      title: 'Large import',
+      content: largeBody,
+      created: daysBefore(now, 35, 9),
+      principal: 'user:sergey',
+    })
+
+    // A LIVE note whose body carries a control byte from before the write fence
+    // existed. Planted through the external-rewrite seam (length-preserving, marker
+    // occurring once in the whole file): no store write can produce this state, which
+    // is the point — reads stay ordinary, and a write from MCP answers with the
+    // addressed refusal. Deliberately never repaired here, like identity-collision.
+    const controlByte = b.note({
+      space: 'main',
+      path: 'restore/control-byte.md',
+      title: 'Control byte survivor',
+      content:
+        '# Control byte survivor\n\nAn imported line where a CONTROL-MARKER byte survived the old fence.\n',
+      created: daysBefore(now, 34, 9),
+      principal: 'user:sergey',
+    })
+    b.externalRewrite({
+      note: controlByte,
+      replacements: [{ from: 'CONTROL-MARKER', to: 'CONTROL-MA\u0000KER' }],
     })
 
     return b.build()

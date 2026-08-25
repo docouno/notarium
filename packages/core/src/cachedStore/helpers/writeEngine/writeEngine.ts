@@ -24,7 +24,14 @@ import {
 } from '../../../knowledgeStore'
 import { IF_EXISTS, REVISION_KIND, STORE_ERROR_REASON } from '../../../knowledgeStore'
 import { nextAliasesMulti, normAliases } from '../../../libs/aliases'
-import { freshNoteId, isDurableScalar, isDurableText, isValidNoteId } from '../../../libs/id'
+import {
+  type DurableTextViolation,
+  firstDurableTextViolation,
+  freshNoteId,
+  isDurableScalar,
+  isDurableText,
+  isValidNoteId,
+} from '../../../libs/id'
 import {
   type DocumentState,
   encodeWikilinkIdentity,
@@ -121,7 +128,85 @@ const invalidWrite = (detail: string): StoreError => {
   return err
 }
 
-const assertWriteText = (input: WriteInput): void => {
+const codePointLabel = (violation: DurableTextViolation): string =>
+  `U+${violation.codePoint.toString(16).toUpperCase().padStart(4, '0')}`
+
+const violationNoun = (violation: DurableTextViolation): string =>
+  violation.kind === 'control'
+    ? `a control character ${codePointLabel(violation)}`
+    : `an unpaired UTF-16 surrogate ${codePointLabel(violation)}`
+
+const violationTail = (violation: DurableTextViolation): string =>
+  violation.total > 1 ? ` (and ${violation.total - 1} more)` : ''
+
+/** Violators printed as `?` so the refusal itself stays durable text. */
+const printableScalar = (value: string): string =>
+  [...value].map((char) => (isDurableScalar(char) ? char : '?')).join('')
+
+/** 1-based code-point column of `target` within its `\n`-line — the locator's own
+ *  coordinate rule applied at an arbitrary index, so a promoted title's violation can
+ *  be named in the CALLER's argument. A flat prefix-length shift would misplace it
+ *  whenever the trimmed prefix spans a line break. */
+const columnAt = (value: string, target: number): number => {
+  let column = 1
+
+  for (let index = 0; index < target && index < value.length; index++) {
+    const unit = value.charCodeAt(index)
+
+    if (unit === 0x0a) {
+      column = 1
+      continue
+    }
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1)
+
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        index++
+      }
+    }
+    column++
+  }
+
+  return column
+}
+
+/** The tag is named by VALUE: the pin path validates a merged list of live plus added
+ *  tags, so an ordinal would point at an element the caller never sent. */
+const assertDurableTag = (tag: string): void => {
+  if (!isDurableText(tag)) {
+    const violation = firstDurableTextViolation(tag)!
+
+    throw invalidWrite(
+      `tag "${printableScalar(tag)}" contains ${violationNoun(violation)} at column ${violation.column}${violationTail(violation)}`,
+    )
+  }
+  if (!isDurableScalar(tag)) {
+    throw invalidWrite(`tag "${printableScalar(tag)}" must be a single-line string`)
+  }
+}
+
+/** Refusals name the violating code point and its position in the value THIS
+ *  chokepoint received — on an edit path that is the merged document, not the
+ *  caller's fragment. `content` is checked first and on the authored value when the
+ *  caller supplied one: a title promoted out of a dirty body must never win the
+ *  message over the body itself. For `title` the verdict stays with the PROMOTED
+ *  value (trim strips U+000B/U+000C, and validating the original would start
+ *  refusing titles that are accepted today), while the coordinate is shifted back
+ *  into the caller's argument by the peeled trim prefix — whitespace only, so the
+ *  shift can neither hide nor manufacture a violation. */
+const assertWriteText = (
+  input: WriteInput,
+  authored?: { title?: string; content?: string },
+): void => {
+  const content = authored !== undefined ? authored.content : input.content
+
+  if (content != null && !isDurableText(content)) {
+    const violation = firstDurableTextViolation(content)!
+
+    throw invalidWrite(
+      `content contains ${violationNoun(violation)} at line ${violation.line}, column ${violation.column}${violationTail(violation)}`,
+    )
+  }
   const scalars: Array<[string, string | undefined]> = [
     ['title', input.title],
     ['directory', input.directory],
@@ -133,8 +218,27 @@ const assertWriteText = (input: WriteInput): void => {
   ]
 
   for (const [name, value] of scalars) {
-    if (value != null && !isDurableScalar(value)) {
-      throw invalidWrite(`${name} must be a well-formed single-line string`)
+    if (value == null) {
+      continue
+    }
+    if (!isDurableText(value)) {
+      const violation = firstDurableTextViolation(value)!
+      // The verdict came from the PROMOTED title; the coordinate is named in the
+      // caller's argument, at the index the promoted violator maps back to.
+      const column =
+        name === 'title' && authored?.title != null
+          ? columnAt(
+              authored.title,
+              authored.title.length - authored.title.trimStart().length + violation.index,
+            )
+          : violation.column
+
+      throw invalidWrite(
+        `${name} contains ${violationNoun(violation)} at column ${column}${violationTail(violation)}`,
+      )
+    }
+    if (!isDurableScalar(value)) {
+      throw invalidWrite(`${name} must be a single-line string`)
     }
   }
   for (const value of Array.isArray(input.tags)
@@ -142,12 +246,7 @@ const assertWriteText = (input: WriteInput): void => {
     : input.tags != null
       ? [input.tags]
       : []) {
-    if (!isDurableScalar(value)) {
-      throw invalidWrite('tags must be well-formed single-line strings')
-    }
-  }
-  if (input.content != null && !isDurableText(input.content)) {
-    throw invalidWrite('content contains invalid Unicode or control characters')
+    assertDurableTag(value)
   }
   if (input.frontmatter != null && !isDurableFrontmatter(input.frontmatter)) {
     throw invalidWrite('frontmatter contains invalid raw lines')
@@ -221,9 +320,7 @@ export class WriteEngine {
     const remove = new Set(input.remove ?? [])
 
     for (const tag of [...add, ...remove]) {
-      if (!isDurableScalar(tag)) {
-        throw invalidWrite('tags must be well-formed single-line strings')
-      }
+      assertDurableTag(tag)
     }
 
     return this.mutations.runStable(
@@ -271,7 +368,7 @@ export class WriteEngine {
           return { changed: false, tags }
         }
 
-        await this.writeClaimed({
+        const payload: WriteInput = {
           title: live.title ?? '',
           content: live.content,
           originalId: live.id ?? input.id,
@@ -280,7 +377,13 @@ export class WriteEngine {
           principal: input.principal,
           agent: input.agent,
           fileName: basenameOf(storagePath).replace(/\.md$/, ''),
-        })
+        }
+
+        // The same chokepoint check ordinary writes get: a pin is a write of the same
+        // note, and letting it skip to the bare engine answers the user with that
+        // engine's unaddressed refusal — the exact defect this grammar exists to fix.
+        assertWriteText(payload)
+        await this.writeClaimed(payload)
         return { changed: true, tags }
       },
     )
@@ -326,6 +429,8 @@ export class WriteEngine {
     // Title is a PROJECTION of the body: derive it and peel the leading title line off, so
     // the stored body never carries a duplicate `# title`. An explicit title wins; a content-less
     // write keeps its body untouched.
+    const authored = { title: input.title, content: input.content }
+
     {
       const promoted = promoteBodyTitle(input.content ?? '', input.title)
       input =
@@ -333,7 +438,7 @@ export class WriteEngine {
           ? { ...input, title: promoted.title, content: promoted.body }
           : { ...input, title: promoted.title }
     }
-    assertWriteText(input)
+    assertWriteText(input, authored)
     const directory = input.directory ?? ''
     const legacyImport = input.legacyImportRoot !== undefined
     const validDirectory = legacyImport
@@ -2096,6 +2201,9 @@ export class WriteEngine {
       index: this.resolveIndex(),
       deferReresolve: this.host.isBulkActive(),
     })
+    // `removed` is the ids this one write displaced from its path binding — identity
+    // bookkeeping of at most a couple of registry rows, never document-sized.
+    // eslint-disable-next-line no-restricted-syntax
     removedOut?.push(...removed)
 
     if (publish) {

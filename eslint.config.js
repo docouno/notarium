@@ -218,6 +218,81 @@ export default tseslint.config(
           message:
             'Take a tiered lock through drivers/pg/lockOrder (or revisionLocks) — the order is stated and checked there, and a lock taken here is invisible to both (#327).',
         },
+        {
+          selector: "CallExpression[callee.property.name='push'] > SpreadElement",
+          message:
+            'Spreading an array into arguments throws RangeError past ~125k elements (a function of remaining stack, not a constant). Where the length is a function of user data, push in a loop; where it is provably bounded, disable inline and name the bound.',
+        },
+        {
+          selector:
+            "CallExpression[callee.object.name='Math'][callee.property.name=/^(min|max)$/] > SpreadElement",
+          message:
+            'Spreading an array into arguments throws RangeError past ~125k elements (a function of remaining stack, not a constant). Where the length is a function of user data, fold with a loop/reduce; where it is provably bounded, disable inline and name the bound.',
+        },
+      ],
+    },
+  },
+  // ── Spread-into-arguments, server-side (#392) ────────────────────────────────
+  // The boundary criterion: these packages hold code whose ARRAY LENGTHS are a
+  // function of user data — document bytes, document lines, corpus rows, import
+  // batches — and an argument spread caps such an array at V8's argument limit
+  // (~125k, itself a function of remaining stack). `web` is excluded on the same
+  // criterion, not leniency: there an array length is a function of layout. Honest
+  // limit of the rule: it bans the two FORMS that have fired (`.push(...)`,
+  // `Math.min/max(...)`), not the class — a plain `f(...xs)` passes.
+  //
+  // A narrow `files` block REPLACES `no-restricted-syntax` wholesale for its files,
+  // so the repo-wide `TSEnumDeclaration` ban is repeated here, the pg-block's files
+  // are ignored here to keep the lock-order selectors (#327) alive for them (that
+  // block carries these two selectors itself), and the pg-block's OWN ignores —
+  // lockOrder.ts / revisionLocks.ts — get the third block below: skipped by both
+  // narrow blocks, they would otherwise carry no spread rule at all, and they are
+  // exactly where the next batch-shaped lock helper will be written.
+  {
+    files: ['packages/{core,engine,engine-memory,server}/src/**/*.ts'],
+    ignores: [
+      'packages/server/src/services/metaDb/drivers/pg/**/*.ts',
+      'packages/server/src/services/metaDb/pgMetaDb.ts',
+      'packages/server/src/services/metaDb/migrations/runPgMigrations.ts',
+    ],
+    rules: {
+      'no-restricted-syntax': [
+        'error',
+        { selector: 'TSEnumDeclaration', message: 'Use objects with `as const` instead of enum' },
+        {
+          selector: "CallExpression[callee.property.name='push'] > SpreadElement",
+          message:
+            'Spreading an array into arguments throws RangeError past ~125k elements (a function of remaining stack, not a constant). Where the length is a function of user data, push in a loop; where it is provably bounded, disable inline and name the bound.',
+        },
+        {
+          selector:
+            "CallExpression[callee.object.name='Math'][callee.property.name=/^(min|max)$/] > SpreadElement",
+          message:
+            'Spreading an array into arguments throws RangeError past ~125k elements (a function of remaining stack, not a constant). Where the length is a function of user data, fold with a loop/reduce; where it is provably bounded, disable inline and name the bound.',
+        },
+      ],
+    },
+  },
+  {
+    files: [
+      'packages/server/src/services/metaDb/drivers/pg/lockOrder.ts',
+      'packages/server/src/services/metaDb/drivers/pg/revisionLocks.ts',
+    ],
+    rules: {
+      'no-restricted-syntax': [
+        'error',
+        { selector: 'TSEnumDeclaration', message: 'Use objects with `as const` instead of enum' },
+        {
+          selector: "CallExpression[callee.property.name='push'] > SpreadElement",
+          message:
+            'Spreading an array into arguments throws RangeError past ~125k elements (a function of remaining stack, not a constant). Where the length is a function of user data, push in a loop; where it is provably bounded, disable inline and name the bound.',
+        },
+        {
+          selector:
+            "CallExpression[callee.object.name='Math'][callee.property.name=/^(min|max)$/] > SpreadElement",
+          message:
+            'Spreading an array into arguments throws RangeError past ~125k elements (a function of remaining stack, not a constant). Where the length is a function of user data, fold with a loop/reduce; where it is provably bounded, disable inline and name the bound.',
+        },
       ],
     },
   },

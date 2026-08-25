@@ -138,7 +138,9 @@ describe('toolErrorMessage', () => {
       const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
 
       expect(clientFailureOf(error)).toBeNull()
-      expect(toolErrorMessage(error, 'create_ability')).toBe('internal error')
+      expect(toolErrorMessage(error, 'create_ability')).toMatch(
+        /^internal error \(ref: [0-9a-f]{6}\)$/,
+      )
       expect(errorLog).toHaveBeenCalledOnce()
       errorLog.mockRestore()
     })
@@ -169,7 +171,9 @@ describe('toolErrorMessage', () => {
       const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
       const error = Object.assign(new Error('postgres://agent:secret@db.internal/notarium'), marker)
 
-      expect(toolErrorMessage(error, 'edit_ability')).toBe('internal error')
+      expect(toolErrorMessage(error, 'edit_ability')).toMatch(
+        /^internal error \(ref: [0-9a-f]{6}\)$/,
+      )
       expect(errorLog).toHaveBeenCalledOnce()
       errorLog.mockRestore()
     },
@@ -178,10 +182,26 @@ describe('toolErrorMessage', () => {
   it('keeps an unexpected error opaque', () => {
     const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
 
-    expect(toolErrorMessage(new Error('database password leaked'), 'edit_ability')).toBe(
-      'internal error',
+    expect(toolErrorMessage(new Error('database password leaked'), 'edit_ability')).toMatch(
+      /^internal error \(ref: [0-9a-f]{6}\)$/,
     )
     expect(errorLog).toHaveBeenCalledOnce()
+    errorLog.mockRestore()
+  })
+
+  // The ref is the whole point: the SAME six hex chars must sit in the client answer
+  // and in the server log line beside the real message, or the owner has an opaque
+  // error with no way to find its cause.
+  it('correlates an opaque failure with its server log line by ref', () => {
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const message = toolErrorMessage(new Error('database password leaked'), 'edit_ability')
+    const ref = /^internal error \(ref: ([0-9a-f]{6})\)$/.exec(message)?.[1]
+
+    expect(ref).toBeDefined()
+    expect(errorLog).toHaveBeenCalledWith(
+      `[mcp] edit_ability [${ref}] ->`,
+      'database password leaked',
+    )
     errorLog.mockRestore()
   })
 })

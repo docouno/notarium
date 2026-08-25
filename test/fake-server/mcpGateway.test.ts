@@ -700,7 +700,7 @@ describe('ability authoring vertical', () => {
 
     expect(isError(duplicate)).toBe(true)
     expect(text(duplicate)).toContain('already exists in personal')
-    expect(text(duplicate)).not.toBe('internal error')
+    expect(text(duplicate)).not.toMatch(/^internal error/)
   })
 
   it('returns an actionable dependency refusal from an actual role create', async () => {
@@ -722,7 +722,28 @@ describe('ability authoring vertical', () => {
 
     expect(isError(refused)).toBe(true)
     expect(text(refused)).toMatch(/attachment|attachments/)
-    expect(text(refused)).not.toBe('internal error')
+    expect(text(refused)).not.toMatch(/^internal error/)
+  })
+
+  // The durable-text refusal reaches the agent with an address (task 392). The SDK
+  // validates tool input against the SAME zod schema BEFORE the gateway callback and
+  // throws McpError(InvalidParams) with a JSON dump of the issues — so the positional
+  // predicate message must be proven HERE, on the real wire: the string gateway.ts
+  // assembles for invalid arguments never appears on it.
+  it('names the code point and position for a control byte in create_note.body', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const refused = await callTool(
+      port,
+      'create_note',
+      { project: 'team', title: 'Dirty note', body: 'clean first line\nse\u0000cond line' },
+      bearer,
+    )
+
+    expect(isError(refused)).toBe(true)
+    expect(text(refused)).toContain(
+      'must not contain a control character (U+0000 at line 2, column 3)',
+    )
+    expect(text(refused)).toContain('body')
   })
 
   it('makes the first create revision durable with the agent principal', async () => {

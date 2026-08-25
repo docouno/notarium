@@ -26,15 +26,91 @@ export const isWellFormedUnicode = (value: string): boolean => {
   return true
 }
 
+/** The positional half of the durable-text fence, duplicated from core `libs/id`
+ *  exactly like `isWellFormedUnicode` above: the P8 seam keeps this package free of a
+ *  core dependency, and `test/primitiveParity.test.ts` holds the two copies together.
+ *  One pass by contract: "first" is the smallest UTF-16 index regardless of kind. */
+export type DurableTextViolation = {
+  kind: 'control' | 'surrogate'
+  codePoint: number
+  /** 0-based UTF-16 index in the value. */
+  index: number
+  /** 1-based; lines are cut by `\n` only — a lone CR is legal content, not a break. */
+  line: number
+  /** 1-based, counted in code points within the line. */
+  column: number
+  /** Violations of the SAME kind in the whole value. */
+  total: number
+}
+
+export const firstDurableTextViolation = (value: string): DurableTextViolation | null => {
+  let first: DurableTextViolation | null = null
+  let line = 1
+  let column = 1
+
+  for (let index = 0; index < value.length; index++) {
+    const unit = value.charCodeAt(index)
+    let kind: DurableTextViolation['kind'] | null = null
+
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1)
+
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        index++
+        column++
+        continue
+      }
+      kind = 'surrogate'
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      kind = 'surrogate'
+    } else if (
+      unit <= 0x08 ||
+      unit === 0x0b ||
+      unit === 0x0c ||
+      (unit >= 0x0e && unit <= 0x1f) ||
+      (unit >= 0x7f && unit <= 0x9f)
+    ) {
+      kind = 'control'
+    }
+    if (kind) {
+      if (first == null) {
+        first = { kind, codePoint: unit, index, line, column, total: 1 }
+      } else if (first.kind === kind) {
+        first.total++
+      }
+      column++
+      continue
+    }
+    if (unit === 0x0a) {
+      line++
+      column = 1
+    } else {
+      column++
+    }
+  }
+
+  return first
+}
+
+/** Predicate grammar — no field name: zod's issue `path` carries the field, and the
+ *  same schema serves body-sized text and one-line scalars, so the position always
+ *  names line AND column in the submitted value. */
+const violationMessage = (violation: DurableTextViolation): string => {
+  const codePoint = `U+${violation.codePoint.toString(16).toUpperCase().padStart(4, '0')}`
+  const noun = violation.kind === 'control' ? 'a control character' : 'an unpaired UTF-16 surrogate'
+  const more = violation.total > 1 ? `; ${violation.total - 1} more` : ''
+
+  return `must not contain ${noun} (${codePoint} at line ${violation.line}, column ${violation.column}${more})`
+}
+
 /** A UTF-8-persistable text value. Newlines/tabs are valid document content. */
-export const DurableTextSchema = z.string().refine(
-  (value) =>
-    isWellFormedUnicode(value) &&
-    // Intentional C0/C1 ranges: these are the exact non-text controls rejected at ingress.
-    // eslint-disable-next-line no-control-regex
-    !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(value),
-  'must contain well-formed Unicode and no binary control characters',
-)
+export const DurableTextSchema = z.string().superRefine((value, ctx) => {
+  const violation = firstDurableTextViolation(value)
+
+  if (violation) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: violationMessage(violation) })
+  }
+})
 
 /** One durable identity/path/frontmatter scalar: never a physical line break. */
 export const DurableScalarSchema = DurableTextSchema.refine(

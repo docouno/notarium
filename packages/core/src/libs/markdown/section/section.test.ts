@@ -102,4 +102,17 @@ describe('replaceMarkdownSection', () => {
       expect(res.headings).toEqual([])
     }
   })
+
+  // The tail after the replaced section is user data, so its line count is unbounded —
+  // an edit near the top of a long document must not fail because of what FOLLOWS it.
+  it('replaces a section whose tail runs hundreds of thousands of lines', () => {
+    const body = `# A\nold\n# B\n${'tail\n'.repeat(500000)}`
+    const res = replaceMarkdownSection(body, 'A', 'new content')
+
+    expect(res.ok).toBe(true)
+    if (res.ok) {
+      expect(res.body.startsWith('# A\n\nnew content\n\n# B\ntail\n')).toBe(true)
+      expect(res.body.endsWith('tail\n')).toBe(true)
+    }
+  })
 })

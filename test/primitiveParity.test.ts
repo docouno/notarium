@@ -3,6 +3,7 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  firstDurableTextViolation as contractViolationOf,
   DurableAddressPathSchema,
   DurablePathSchema,
   DurableScalarSchema,
@@ -10,6 +11,7 @@ import {
   PortablePathComponentSchema,
 } from '@notarium/contract'
 import {
+  firstDurableTextViolation as coreViolationOf,
   isDurableScalar,
   isDurableText,
   isPortablePathComponent,
@@ -133,6 +135,17 @@ const explicitCases = [
   'notarium-id:abc',
   '[[wiki]]',
   '#tag',
+  // Locator-parity shapes, one per plausible mutant: emoji before the violator
+  // (column in UTF-16 units / index in code points), a violator past a real line
+  // break (0-based line), a violator past a LONE CR (CR treated as a break), several
+  // of one kind plus one of the other (total across kinds), and both kind orders
+  // (a two-pass scan agrees on one order and diverges on the other).
+  '🎉🎉\u0000after',
+  'first\nsec\u0000ond',
+  'first\rsec\u0000ond',
+  'a\u0000b\u0000c\uD800',
+  'a\u0000b\uD800c',
+  'a\uD800b\u0000c',
 ]
 
 const CORPUS = [...new Set([...singleCodeUnits, ...surrogatePairs, ...bytes255, ...explicitCases])]
@@ -190,6 +203,28 @@ describe('primitive grammar drift across the P8 core/contract seam', () => {
     expect(drift).toEqual([])
   })
 
+  it('locates the first durable-text violation identically across the seam', () => {
+    const drift: string[] = []
+
+    for (const value of CORPUS) {
+      const wire = contractViolationOf(value)
+      const engine = coreViolationOf(value)
+
+      if (JSON.stringify(wire) !== JSON.stringify(engine)) {
+        drift.push(
+          `locator: ${diagnosticValue(value)} → contract=${JSON.stringify(wire)} core=${JSON.stringify(engine)}`,
+        )
+      }
+      // The locator and the predicate are two halves of ONE fence: a value the
+      // predicate refuses must have an address, and a located value must be refused.
+      if ((engine === null) !== isDurableText(value)) {
+        drift.push(`locator↔predicate: ${diagnosticValue(value)}`)
+      }
+    }
+
+    expect(drift).toEqual([])
+  })
+
   it('probes every UTF-16 code unit plus the explicit multi-unit cases', () => {
     // A silently shrunken corpus would turn this file green without proving
     // anything, so the coverage claim above is itself asserted.
@@ -198,6 +233,9 @@ describe('primitive grammar drift across the P8 core/contract seam', () => {
     expect(singleCodeUnits[0xffff]).toBe('\uffff')
     expect(singleCodeUnits.every((value, unit) => value === String.fromCharCode(unit))).toBe(true)
     expect(CORPUS).toContain(String.fromCharCode(0xd800)) // a lone high surrogate
+    expect(CORPUS).toContain('🎉🎉\u0000after')
+    expect(CORPUS).toContain('first\rsec\u0000ond')
+    expect(CORPUS).toContain('a\uD800b\u0000c')
     expect(CORPUS).toEqual(expect.arrayContaining(superscriptDeviceNames))
     expect(CORPUS).toContain('a'.repeat(256))
   })

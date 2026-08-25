@@ -523,6 +523,21 @@ export const createGateway = (deps: GatewayDeps): McpGateway => {
   }
 }
 
+/** Mint the opaque projection of an unclassified failure: six random hex chars that
+ *  appear BOTH in the client's `internal error (ref: …)` and in the server log line
+ *  beside the real message, so the instance owner can find the cause without the
+ *  error class or any content crossing the wire. Random by construction — a ref
+ *  derived from the error or its message would be a side channel. */
+const opaqueFailure = (name: string, err: unknown): string => {
+  const bytes = new Uint8Array(3)
+
+  crypto.getRandomValues(bytes)
+  const ref = [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('')
+
+  console.error(`[mcp] ${name} [${ref}] ->`, (err as Error)?.message)
+  return `internal error (ref: ${ref})`
+}
+
 /** The actionable message for a thrown error, shared by mapError and the batch
  *  handlers. Explicit client failures carry their safe projection; legacy note-tool
  *  markers retain their existing guidance. Anything else is logged and reported
@@ -550,8 +565,7 @@ export const toolErrorMessage = (err: unknown, name: string): string => {
   }
   if (e.isConflict) {
     if (CLIENT_FAILURE_ONLY_TOOLS.has(name)) {
-      console.error(`[mcp] ${name} ->`, (err as Error)?.message)
-      return 'internal error'
+      return opaqueFailure(name, err)
     }
 
     return 'This note changed since you last read it. Re-read it with get_note to get the current versionToken, then retry.'
@@ -561,8 +575,7 @@ export const toolErrorMessage = (err: unknown, name: string): string => {
   // would let a storage error bypass the new no-leak boundary with an arbitrary
   // `message` merely because it happened to carry `isToolError` or `isNotFound`.
   if (CLIENT_FAILURE_ONLY_TOOLS.has(name)) {
-    console.error(`[mcp] ${name} ->`, (err as Error)?.message)
-    return 'internal error'
+    return opaqueFailure(name, err)
   }
   if (e.isNotFound) {
     return e.message || 'not found'
@@ -570,8 +583,8 @@ export const toolErrorMessage = (err: unknown, name: string): string => {
   if (e.isToolError) {
     return e.message || 'the request could not be completed'
   }
-  console.error(`[mcp] ${name} ->`, (err as Error)?.message)
-  return 'internal error'
+
+  return opaqueFailure(name, err)
 }
 
 /** Map a thrown error to an actionable tool-error result (whole-call failure). */

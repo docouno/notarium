@@ -249,8 +249,18 @@ export const handleLinkMany: Handler = async (ctx, rawArgs) => {
       }
     }
   }
+  // The unreachable-by-design backstop still goes through toolErrorMessage: a bare
+  // string here would be the one batch element whose failure has no ref and no log
+  // line to find it by.
   const results: BatchLinkResult[] = links.map(
-    (_, i) => byIndex.get(i) ?? { index: i, ok: false, error: 'internal error' },
+    (_, i) =>
+      byIndex.get(i) ?? {
+        index: i,
+        ok: false,
+        error: sanitizeText(
+          toolErrorMessage(new Error('link_many item resolved to no result'), 'link_many'),
+        ),
+      },
   )
   const ok = results.filter((r) => r.ok).length
   const failed = results.length - ok

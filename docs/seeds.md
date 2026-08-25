@@ -99,7 +99,7 @@ and for `security` — it parses the sanitized HTML into a live DOM and checks t
 | `trash-long` | a large composite trash: a long list of deleted notes (scale) beyond the viewport — scroll-glass chrome (#185/#247) + deleted spaces (the Notes/Spaces toggle), a deleted folder, a note from a project, restored | trash, history, scale |
 | `trash-recovery` | realistic recovery queue: many exact copies, one older partial copy, source-only and record-only rows, an archived space, a live path collision; `SCALE=5` crosses Select-all-N pagination | trash, history, scale |
 | `history-rich` | a deep revision chain, 2 authors, rename, raw plugin frontmatter and a metadata-only revision visible in Changes (#203/#160) | history, identity |
-| `restore-states` | exact CRLF/comments/Unicode + receipt-owned fields in live history and a safe deleted state, blocked YAML-owner coupling, legacy partial, honest gap, opaque UTF-8/binary and valid/invalid direct `SKILL.md` states (#275) | history, trash, note-classes |
+| `restore-states` | exact CRLF/comments/Unicode + receipt-owned fields in live history and a safe deleted state, blocked YAML-owner coupling, legacy partial, honest gap, opaque UTF-8/binary and valid/invalid direct `SKILL.md` states (#275); a live 830 KB note (constant — `SCALE` does not multiply it) and a live control-byte note planted via the external-rewrite seam, whose MCP write answers with the addressed refusal (#392) | history, trash, note-classes |
 
 **Graph / identity / search:**
 

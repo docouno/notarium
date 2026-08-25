@@ -198,6 +198,8 @@ export const createJobsFacet = (ctx: SqliteDriverCtx): JobsPersistence => ({
     }
     if (opts?.statuses?.length) {
       where.push(`status IN (${opts.statuses.map(() => '?').join(', ')})`)
+      // A subset of the job-status enum — bounded by its cardinality.
+      // eslint-disable-next-line no-restricted-syntax
       args.push(...opts.statuses)
     }
     const limit = Math.max(1, Math.min(opts?.limit ?? 50, 500))

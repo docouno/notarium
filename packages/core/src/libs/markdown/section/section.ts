@@ -86,7 +86,11 @@ export const replaceMarkdownSection = (
     out.push('', repl)
   }
   if (after.length) {
-    out.push('', ...after)
+    // The tail's line count is user data: a spread here throws past ~125k arguments.
+    out.push('')
+    for (const line of after) {
+      out.push(line)
+    }
   }
 
   return { ok: true, body: out.join('\n') }

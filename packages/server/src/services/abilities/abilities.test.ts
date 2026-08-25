@@ -426,7 +426,7 @@ describe('AbilitiesService authoring policy', () => {
     await expect(abilities.get('authoring', principal('write'), owned)).rejects.toBe(failure)
     const message = toolErrorMessage(failure, 'get_ability')
 
-    expect(message).toBe('internal error')
+    expect(message).toMatch(/^internal error \(ref: [0-9a-f]{6}\)$/)
     expect(message).not.toContain('/private/meta.db')
     errorLog.mockRestore()
   })

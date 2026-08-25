@@ -142,6 +142,8 @@ export const createSummaryCollector = (): SummaryCollector => {
       const row = rowOf(file, format)
 
       if (row && warnings?.length) {
+        // Converter warnings for ONE file — a handful of fixed notice kinds.
+        // eslint-disable-next-line no-restricted-syntax
         row.warnings.push(...warnings)
       }
     },

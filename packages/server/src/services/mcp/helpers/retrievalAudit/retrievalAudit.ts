@@ -62,6 +62,8 @@ export const retrievalRowOf = (
       project: a.project ?? null,
       classFilter: a.class ?? null,
       resultCount: results.length,
+      // Scores of one search response, capped by the tool's result limit.
+      // eslint-disable-next-line no-restricted-syntax
       topScore: scores.length ? Math.max(...scores) : null,
       hits: results.slice(0, RETRIEVAL_HITS_KEPT).map(retrievalHitOf),
     }

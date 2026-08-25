@@ -108,6 +108,8 @@ export const resolveFolderReference = (
     }
   }
 
+  // One name's alias claims — the registry rows behind a single wikilink spelling.
+  // eslint-disable-next-line no-restricted-syntax
   const longest = claims.length ? Math.max(...claims.map((claim) => claim.aliasLength)) : 0
 
   if (currentClaim && currentClaim.length >= longest) {

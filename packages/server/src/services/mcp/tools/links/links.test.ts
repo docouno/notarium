@@ -108,4 +108,50 @@ describe('link source class linearization', () => {
     expect(single.write).not.toHaveBeenCalled()
     expect(grouped.write).not.toHaveBeenCalled()
   })
+
+  // Criterion: a per-ITEM batch failure carries the same correlation ref as a
+  // whole-call one — the same six hex chars in the item error and in the server log
+  // line beside the real message. Without this, an opaque batch element is the one
+  // failure the instance owner cannot find.
+  it('gives an unclassified per-item failure a ref correlated with the log line', async () => {
+    const source = {
+      id: 'source-id',
+      class: NOTE_CLASS.userDoc,
+      title: 'Source',
+      content: 'Body.',
+      frontmatter: {},
+      filePath: 'source.md',
+      versionToken: 'source-token',
+    }
+    const store = {
+      read: vi.fn().mockResolvedValue(source),
+      write: vi.fn().mockRejectedValue(new Error('database exploded')),
+    }
+    const ctx = {
+      principal: { id: 'agent' },
+      store: {
+        noteStore: vi.fn().mockResolvedValue({ space: 'main', store }),
+        spaceStore: vi.fn().mockResolvedValue({
+          resolveWikilink: vi
+            .fn()
+            .mockRejectedValue(Object.assign(new Error('not found'), { isNotFound: true })),
+        }),
+      },
+    } as unknown as Ctx
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    try {
+      const result = await handleLinkMany(ctx, {
+        links: [{ from: 'source-id', toTitle: 'Future note', relation: 'relates_to' }],
+      })
+      const error = (result.structured as { results: Array<{ ok: boolean; error?: string }> })
+        .results[0].error!
+      const ref = /^internal error \(ref: ([0-9a-f]{6})\)$/.exec(error)?.[1]
+
+      expect(ref).toBeDefined()
+      expect(errorLog).toHaveBeenCalledWith(`[mcp] link_many [${ref}] ->`, 'database exploded')
+    } finally {
+      errorLog.mockRestore()
+    }
+  })
 })

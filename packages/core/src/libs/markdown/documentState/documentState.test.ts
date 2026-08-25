@@ -753,3 +753,299 @@ describe('document state', () => {
     expect(state.semanticFingerprint).toBe(analyzeDocumentState({ source }).semanticFingerprint)
   })
 })
+
+// Every `ds1:` value below is a contract with ALREADY-PERSISTED data: live `v3:` version
+// tokens are this fingerprint verbatim, and `decodeDocumentState` recomputes it from a
+// stored blob's own bytes and refuses the revision FOREVER on a mismatch — there is no
+// error a caller can retry out of. So no value here may ever change, and none may be
+// re-snapped from the current code: a pin captured after an implementation change would
+// prove only that the change agrees with itself.
+describe('document state fingerprint pins', () => {
+  const ownedSource = bytes('---\nnotarium-id: AbCdefGhij_1\n---\n# T\n\nbody\n')
+  const ownedProof = (generatedContainer: boolean) =>
+    bindStorageOwnerProof({
+      source: ownedSource,
+      owners: [{ key: STORAGE_OWNER_KEY.id, ownership: 'entry' }],
+      evidence: { kind: 'mutation-receipt', id: 'receipt-1' },
+      generatedContainer,
+    })
+  const anchorSource = bytes('---\nnotarium-id: &owner abc\ncopy: *owner\ntitle: A\n---\nbody')
+
+  // The length pairs pin the 8-byte big-endian length prefix exactly on its carry
+  // boundaries (255→256, 65535→65536) — the bytes that break first when `frame` is
+  // rewritten.
+  it.each([
+    { name: 'empty', input: { source: bytes('') }, pin: 'ds1:4189321331c74634' },
+    {
+      name: 'plain-body',
+      input: { source: bytes('# Title\n\nbody text\n') },
+      pin: 'ds1:e31279b2d991d747',
+    },
+    {
+      name: 'no-heading',
+      input: { source: bytes('just a body line\n') },
+      pin: 'ds1:b78f572f4efa8f6e',
+    },
+    {
+      name: 'frontmatter',
+      input: { source: bytes('---\ntitle: T\ntags:\n  - a\n---\n\n# Title\n\nbody\n') },
+      pin: 'ds1:25c71a405272da20',
+    },
+    {
+      name: 'path-fallback',
+      input: { source: bytes('body only\n'), pathFallbackTitle: 'From Path' },
+      pin: 'ds1:a29d45cbdaec2530',
+    },
+    {
+      name: 'multibyte',
+      input: { source: bytes('# Заголовок\n\nтело 🎉 текст\n') },
+      pin: 'ds1:6c413af799bfcd89',
+    },
+    { name: 'crlf', input: { source: bytes('# T\r\n\r\nbody\r\n') }, pin: 'ds1:8dd280a28b5d1383' },
+    {
+      name: 'bom',
+      input: { source: bytes('﻿# T\n\nbody\n') },
+      pin: 'ds1:d5b87dddefe9cfcb',
+    },
+    { name: 'len-255', input: { source: bytes('a'.repeat(255)) }, pin: 'ds1:00559dda5583e562' },
+    { name: 'len-256', input: { source: bytes('a'.repeat(256)) }, pin: 'ds1:b153b0ef447fbe5d' },
+    {
+      name: 'len-65535',
+      input: { source: bytes('a'.repeat(65535)) },
+      pin: 'ds1:3130b22ccbf16ccf',
+    },
+    {
+      name: 'len-65536',
+      input: { source: bytes('a'.repeat(65536)) },
+      pin: 'ds1:2f25c080b34c44df',
+    },
+    {
+      name: 'invalid-yaml',
+      input: { source: bytes('---\ntitle: [unclosed\n---\n\nbody\n') },
+      pin: 'ds1:935ab3ecb46e1380',
+    },
+    {
+      name: 'opaque-bytes',
+      input: { source: Uint8Array.of(0xff, 0xfe, 0x00, 0x01, 0x02) },
+      pin: 'ds1:0179e7b0ad0c8361',
+    },
+    {
+      name: 'skill-root',
+      input: {
+        source: bytes(
+          '---\nname: demo-skill\ndescription: A demo skill\n---\n\n# Demo Skill\n\ninstructions\n',
+        ),
+        role: DOCUMENT_ROLE.skillRoot,
+        skillDirectoryName: 'demo-skill',
+      },
+      pin: 'ds1:944b87a0b9a41221',
+    },
+    {
+      name: 'skill-auxiliary',
+      input: { source: bytes('# Title\n\nbody text\n'), role: DOCUMENT_ROLE.skillAuxiliary },
+      pin: 'ds1:d462e3a38bc76604',
+    },
+    {
+      name: 'blocked-duplicate-target-mapping',
+      input: { source: bytes('---\ntitle: A\ntitle: B\n---\n\nbody\n') },
+      pin: 'ds1:73484355816bb38f',
+    },
+  ])('pins $name', ({ input, pin }) => {
+    expect(analyzeDocumentState(input).semanticFingerprint).toBe(pin)
+  })
+
+  it('pins blocked/owner-anchor-dependency under a value claim', () => {
+    const proof = bindStorageOwnerProof({
+      source: anchorSource,
+      owners: [{ key: STORAGE_OWNER_KEY.id, ownership: 'value' }],
+      evidence: { kind: 'mutation-receipt', id: 'receipt-1' },
+    })
+    const state = analyzeDocumentState({ source: anchorSource, ownerProof: proof })
+
+    expect(state.restoreSafety).toEqual({ status: 'blocked', reason: 'owner-anchor-dependency' })
+    expect(state.semanticFingerprint).toBe('ds1:fc8617474058aa10')
+  })
+
+  // The `generatedContainer` flag is dropped when there are no claims, so this pair is
+  // only a pair UNDER a claim — with an empty claim list both inputs collapse to one
+  // fingerprint and the container branch goes unpinned behind a green test.
+  it('pins both container provenances under a claim, and they differ', () => {
+    const generated = analyzeDocumentState({ source: ownedSource, ownerProof: ownedProof(true) })
+    const authored = analyzeDocumentState({ source: ownedSource, ownerProof: ownedProof(false) })
+
+    expect(generated.provenance.claims).toHaveLength(1)
+    expect(generated.semanticFingerprint).toBe('ds1:1f2d5bb60421fc0e')
+    expect(authored.semanticFingerprint).toBe('ds1:86c91ceebb05c202')
+    expect(generated.semanticFingerprint).not.toBe(authored.semanticFingerprint)
+  })
+
+  // Claims are handed over in the REVERSE of their key-sorted order on purpose: the
+  // fingerprint sorts them, and a pin built from an already-sorted input would keep
+  // passing if the sort were lost.
+  it('pins a multi-slice fingerprint over claims given in unsorted order', () => {
+    const source = bytes(
+      '---\nnotarium-id: AbCdefGhij_1\nnotarium-created: 2026-08-18T00:00:00.000Z\ntitle: A\n---\n\nbody\n',
+    )
+    const proof = bindStorageOwnerProof({
+      source,
+      owners: [
+        { key: STORAGE_OWNER_KEY.id, ownership: 'value' },
+        { key: STORAGE_OWNER_KEY.created, ownership: 'entry' },
+      ],
+      evidence: { kind: 'mutation-receipt', id: 'receipt-1' },
+    })
+    const state = analyzeDocumentState({ source, ownerProof: proof })
+
+    expect(proof.claims.map((claim) => claim.key)).toEqual([
+      STORAGE_OWNER_KEY.id,
+      STORAGE_OWNER_KEY.created,
+    ])
+    expect(state.provenance.claims).toHaveLength(2)
+    expect(state.semanticFingerprint).toBe('ds1:e866acf77ccb4c36')
+  })
+
+  // Blobs captured from a live stand BEFORE any fingerprint change (task 392, V1.0
+  // snapshot). Unlike the input pins above, these prove the irreversible surface
+  // directly: a stored blob's header fingerprint must keep matching a fresh reading of
+  // its own bytes, or `decodeDocumentState` turns the revision into
+  // `revisionHasNoContent` for good. The claims blob is the load-bearing one — its
+  // fingerprint depends on header provenance, which no source-only pin exercises.
+  it.each([
+    {
+      name: 'a claimed generated-container note',
+      pin: 'ds1:6db45937e12d4370',
+      claims: 1,
+      base64:
+        'TkRTMQAAAZF7ImZvcm1hdCI6Im1hcmtkb3duLXYyIiwicm9sZSI6ImdlbmVyaWMiLCJwcm92ZW5hbmNlIjp7InZlcnNpb24iOjEsImNsYWltcyI6W3sia2V5Ijoibm90YXJpdW0taWQiLCJvd25lcnNoaXAiOiJlbnRyeSIsInZhbHVlUmFuZ2UiOnsic3RhcnQiOjUyLCJlbmQiOjY2fSwiZW50cnlSYW5nZSI6eyJzdGFydCI6MzksImVuZCI6Njd9LCJldmlkZW5jZSI6eyJraW5kIjoibXV0YXRpb24tcmVjZWlwdCIsImlkIjoiZUJoeGQ1SW5JbzJfOnJlY2VpcHQtMSJ9fV0sImdlbmVyYXRlZENvbnRhaW5lciI6dHJ1ZX0sInJlc3RvcmVTYWZldHkiOnsic3RhdHVzIjoic2FmZSJ9LCJwYXRoRmFsbGJhY2tUaXRsZSI6Im1lZXRpbmctbm90ZXMiLCJzZW1hbnRpY0ZpbmdlcnByaW50IjoiZHMxOjZkYjQ1OTM3ZTEyZDQzNzAifS0tLQp0aXRsZTogTWVldGluZyBub3Rlcwp0eXBlOiBtZWV0aW5nCm5vdGFyaXVtLWlkOiAiLVlmX2tMTm53R0gxIgpjcmVhdGVkOiAyMDIwLTAzLTA0VDEwOjAwOjAwLjAwMFoKLS0tCgojIE1lZXRpbmcgbm90ZXMKCkFuIG9sZCBtZWV0aW5nIGZyb20gdGhlIGFyY2hpdmUg4oCUIHllYXItZm9ybWF0IGRhdGUu',
+    },
+    {
+      name: 'a directly-authored skill note',
+      pin: 'ds1:324dc38a8dca02e8',
+      claims: 0,
+      base64:
+        'TkRTMQAAAOV7ImZvcm1hdCI6InNraWxsLW1hcmtkb3duLXYxIiwicm9sZSI6InNraWxsLXJvb3QiLCJwcm92ZW5hbmNlIjp7InZlcnNpb24iOjEsImNsYWltcyI6W119LCJyZXN0b3JlU2FmZXR5Ijp7InN0YXR1cyI6InNhZmUifSwicGF0aEZhbGxiYWNrVGl0bGUiOm51bGwsInNlbWFudGljRmluZ2VycHJpbnQiOiJkczE6MzI0ZGMzOGE4ZGNhMDJlOCIsInNraWxsRGlyZWN0b3J5TmFtZSI6InZhbGlkLWRpcmVjdCJ9LS0tCm5hbWU6IHZhbGlkLWRpcmVjdApkZXNjcmlwdGlvbjogQSB2YWxpZCBkaXJlY3RseS1hdXRob3JlZCBza2lsbAotLS0KRm9sbG93IHRoZXNlIGV4YWN0IGluc3RydWN0aW9ucy4K',
+    },
+    {
+      name: 'an opaque byte revision',
+      pin: 'ds1:15887c37abd5d5c6',
+      claims: 0,
+      base64:
+        'TkRTMQAAANx7ImZvcm1hdCI6Im9wYXF1ZS12MSIsInJvbGUiOiJvcGFxdWUiLCJwcm92ZW5hbmNlIjp7InZlcnNpb24iOjEsImNsYWltcyI6W119LCJyZXN0b3JlU2FmZXR5Ijp7InN0YXR1cyI6InVua25vd24iLCJyZWFzb24iOiJwYXJzZXItcmFuZ2UtdW5jZXJ0YWludHkifSwicGF0aEZhbGxiYWNrVGl0bGUiOm51bGwsInNlbWFudGljRmluZ2VycHJpbnQiOiJkczE6MTU4ODdjMzdhYmQ1ZDVjNiJ9/wD+YQ==',
+    },
+  ])('decodes a persisted pre-change revision blob: $name', ({ pin, claims, base64 }) => {
+    const blob = Uint8Array.from(atob(base64), (char) => char.charCodeAt(0))
+    const decoded = decodeDocumentState(blob)
+
+    expect(decoded.semanticFingerprint).toBe(pin)
+    expect(decoded.provenance.claims).toHaveLength(claims)
+    if (claims > 0) {
+      expect(decoded.provenance.generatedContainer).toBe(true)
+    }
+  })
+})
+
+// The streaming accumulator against the retired BigInt reference, over the SAME framed
+// stream — so the length prefix is under test, not just the hash arithmetic. The oracle
+// collects its stream with a loop rather than a spread: the spread is exactly the form
+// the reference died of (and the lint rule now bans), and it is no part of the framing
+// contract — only the byte order is. Composition of `fingerprintOf` is NOT covered
+// here; the golden pins above own that.
+describe('fingerprint accumulator parity', () => {
+  const oracleFingerprint = (source: Uint8Array): string => {
+    const stream: number[] = []
+
+    const frame = (payload: Uint8Array): void => {
+      const length = BigInt(payload.byteLength)
+
+      for (let shift = 56n; shift >= 0n; shift -= 8n) {
+        stream.push(Number((length >> shift) & 0xffn))
+      }
+      for (const byte of payload) {
+        stream.push(byte)
+      }
+    }
+    const add = (value: string | Uint8Array): void =>
+      frame(typeof value === 'string' ? new TextEncoder().encode(value) : value)
+
+    // The framed sequence `fingerprintOf` emits for an opaque state with no claims.
+    add('notarium.document-state.fingerprint.v1')
+    add(DOCUMENT_STATE_FORMAT.opaque)
+    add(DOCUMENT_ROLE.opaque)
+    add('unknown')
+    add('parser-range-uncertainty')
+    add('')
+    add('authored-container')
+    add(source)
+
+    let hash = 0xcbf29ce484222325n
+
+    for (const byte of stream) {
+      hash ^= BigInt(byte)
+      hash = (hash * 0x100000001b3n) & 0xffffffffffffffffn
+    }
+
+    return `ds1:${hash.toString(16).padStart(16, '0')}`
+  }
+  const produced = (source: Uint8Array): string =>
+    opaqueDocumentState({ source }).semanticFingerprint
+
+  it('agrees on every single-byte input', () => {
+    for (let byte = 0; byte < 256; byte++) {
+      const source = Uint8Array.of(byte)
+
+      expect(produced(source)).toBe(oracleFingerprint(source))
+    }
+  })
+
+  it('agrees on 1000-byte runs of every byte value', () => {
+    for (let byte = 0; byte < 256; byte++) {
+      const source = new Uint8Array(1000).fill(byte)
+
+      expect(produced(source)).toBe(oracleFingerprint(source))
+    }
+  }, 30_000)
+
+  it('agrees on 2000 deterministic pseudo-random arrays', () => {
+    // Math.imul keeps the LCG in exact 32-bit arithmetic — a float multiply would shed
+    // low bits past 2^53 — so the corpus is reproducible: no Math.random() here.
+    let seed = 123456789
+
+    const next = (): number => {
+      seed = (Math.imul(seed, 1103515245) + 12345) & 0x7fffffff
+
+      return seed
+    }
+
+    for (let run = 0; run < 2000; run++) {
+      const source = new Uint8Array(next() % 401)
+
+      for (let index = 0; index < source.length; index++) {
+        source[index] = next() & 0xff
+      }
+      expect(produced(source)).toBe(oracleFingerprint(source))
+    }
+  }, 30_000)
+})
+
+// Document size and the caller's stack position must not decide whether a note has a
+// state at all. No test here asserts a byte threshold: the old failure point was a
+// function of REMAINING stack, not of any constant these assertions could pin.
+describe('document state at size', () => {
+  const markdownOf = (payloadBytes: number): Uint8Array =>
+    bytes(`# Big\n\n${'a'.repeat(payloadBytes)}\n`)
+
+  it.each([{ mib: 2 }, { mib: 8 }])('returns a state for a $mib MiB document', ({ mib }) => {
+    const state = analyzeDocumentState({ source: markdownOf(mib * 1024 * 1024) })
+
+    expect(state.format).toBe(DOCUMENT_STATE_FORMAT.markdown)
+    expect(state.semanticFingerprint).toMatch(/^ds1:[0-9a-f]{16}$/)
+  })
+
+  it('returns a state from 2000 call frames deep', () => {
+    const source = markdownOf(2 * 1024 * 1024)
+    const descend = (depth: number): string =>
+      depth > 0 ? descend(depth - 1) : analyzeDocumentState({ source }).semanticFingerprint
+
+    expect(descend(2000)).toBe(analyzeDocumentState({ source }).semanticFingerprint)
+  })
+})

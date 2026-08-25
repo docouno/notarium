@@ -693,25 +693,59 @@ const safetyOf = (fm: FrontmatterAnalysis, proof: StorageOwnerProof): RestoreSaf
   return { status: 'safe' }
 }
 
-const frame = (chunks: number[], bytes: Uint8Array): void => {
-  const length = BigInt(bytes.byteLength)
+// The framed byte stream below is the order every stored `ds1:` token and revision
+// blob was written in, so it can never change; the accumulator must STREAM it, because
+// the framed length is a function of document size and any intermediate per-byte array
+// puts that size into one argument list — V8 aborts a spread past ~125k arguments.
+type Fnv64 = { hi: number; lo: number }
 
-  for (let shift = 56n; shift >= 0n; shift -= 8n) {
-    chunks.push(Number((length >> shift) & 0xffn))
-  }
-  chunks.push(...bytes)
+const FNV_OFFSET_HI = 0xcbf29ce4
+const FNV_OFFSET_LO = 0x84222325
+
+/** One 64-bit FNV-1a step on two uint32 halves: xor the byte in, multiply by the FNV
+ *  prime modulo 2^64. The prime 0x100000001b3 is 2^40 + 0x1b3 — two non-zero 16-bit
+ *  limbs — so the multiply is four partial products, each exact in float64. */
+const fnvStep = (hash: Fnv64, byte: number): void => {
+  const lo = (hash.lo ^ byte) >>> 0
+  const a0 = lo & 0xffff
+  const a1 = lo >>> 16
+  const a2 = hash.hi & 0xffff
+  const a3 = hash.hi >>> 16
+  let carry = a0 * 0x1b3
+  const r0 = carry & 0xffff
+
+  carry = (carry >>> 16) + a1 * 0x1b3
+  const r1 = carry & 0xffff
+
+  carry = (carry >>> 16) + a2 * 0x1b3 + a0 * 0x100
+  const r2 = carry & 0xffff
+
+  carry = (carry >>> 16) + a3 * 0x1b3 + a1 * 0x100
+
+  hash.lo = ((r1 << 16) | r0) >>> 0
+  hash.hi = (((carry & 0xffff) << 16) | r2) >>> 0
 }
 
-const fnvBytes = (bytes: Uint8Array): string => {
-  let hash = 0xcbf29ce484222325n
+const frame = (hash: Fnv64, bytes: Uint8Array): void => {
+  const length = bytes.byteLength
+  // The high word must come from a division: `>>> shift` reads its operand as 32-bit
+  // and would silently wrap the prefix past 4 GiB.
+  const hiWord = Math.floor(length / 0x100000000)
+  const loWord = length >>> 0
 
+  for (let shift = 24; shift >= 0; shift -= 8) {
+    fnvStep(hash, (hiWord >>> shift) & 0xff)
+  }
+  for (let shift = 24; shift >= 0; shift -= 8) {
+    fnvStep(hash, (loWord >>> shift) & 0xff)
+  }
   for (const byte of bytes) {
-    hash ^= BigInt(byte)
-    hash = (hash * 0x100000001b3n) & 0xffffffffffffffffn
+    fnvStep(hash, byte)
   }
-
-  return hash.toString(16).padStart(16, '0')
 }
+
+const fnvDigest = (hash: Fnv64): string =>
+  hash.hi.toString(16).padStart(8, '0') + hash.lo.toString(16).padStart(8, '0')
 
 const authoredSlices = (source: Uint8Array, proof: StorageOwnerProof): Uint8Array[] => {
   const excluded = proof.claims
@@ -738,9 +772,9 @@ const fingerprintOf = (
     'format' | 'role' | 'source' | 'provenance' | 'restoreSafety' | 'pathFallbackTitle'
   >,
 ): string => {
-  const chunks: number[] = []
+  const hash: Fnv64 = { hi: FNV_OFFSET_HI, lo: FNV_OFFSET_LO }
   const add = (value: string | Uint8Array): void =>
-    frame(chunks, typeof value === 'string' ? UTF8.encode(value) : value)
+    frame(hash, typeof value === 'string' ? UTF8.encode(value) : value)
 
   add('notarium.document-state.fingerprint.v1')
   add(state.format)
@@ -757,7 +791,7 @@ const fingerprintOf = (
     add(slice)
   }
 
-  return `ds1:${fnvBytes(Uint8Array.from(chunks))}`
+  return `ds1:${fnvDigest(hash)}`
 }
 
 const opaqueState = (

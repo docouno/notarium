@@ -111,7 +111,9 @@ const resolveScope = (
   }
   if (!granted.length) {
     granted.push(
+      // eslint-disable-next-line no-restricted-syntax -- literal fallback scopes, at most two
       ...(scope === 'write' ? ['read', 'write'] : ['read']),
+      // eslint-disable-next-line no-restricted-syntax -- literal offline grant, zero or one
       ...(offline ? ['offline_access'] : []),
     )
   }

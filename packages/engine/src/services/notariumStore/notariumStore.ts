@@ -1664,6 +1664,8 @@ export class NotariumStore implements KnowledgeStore {
 
     if (previous != null && selected.length < this.integritySweepBatchSize) {
       selected.push(
+        // Bounded by the SQL LIMIT: at most integritySweepBatchSize rows in total.
+        // eslint-disable-next-line no-restricted-syntax
         ...(await this.sql.all<{ path: string }>(
           `SELECT path FROM notes WHERE path <= ? ORDER BY path LIMIT ?`,
           [previous, this.integritySweepBatchSize - selected.length],

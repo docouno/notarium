@@ -215,6 +215,8 @@ export const createIdentityFacet = (ctx: PgDriverCtx): IdentityPersistence => ({
       }
       await client.query('COMMIT')
       // Back in the caller's order: the write-behind pairs outcomes with what it sent.
+      // One write-behind flush — the dirty ids the drain lane snapshotted for this batch.
+      // eslint-disable-next-line no-restricted-syntax
       outcomes.push(...records.map((r) => outcomeById.get(r.id) as IdentityClaimOutcome))
     } catch (err) {
       await client.query('ROLLBACK')

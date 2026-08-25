@@ -115,6 +115,8 @@ const authorClauseSqlite = (author?: AuthorFilter): { clause: string; params: st
 
   if (author.exact.length) {
     parts.push(`principal IN (${author.exact.map(() => '?').join(',')})`)
+    // An author filter names a handful of principals, not a corpus.
+    // eslint-disable-next-line no-restricted-syntax
     params.push(...author.exact)
   }
   for (const p of author.prefixes) {
@@ -349,12 +351,16 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
     }
     if (excludeClasses.length) {
       where.push(classFilterSqlite(excludeClasses).replace(/^ AND /, ''))
+      // At most one entry per note class — the enum bounds it.
+      // eslint-disable-next-line no-restricted-syntax
       args.push(...excludeClasses)
     }
     if (author) {
       const au = authorClauseSqlite(author)
       // `au.clause` already leads with ' AND ' — strip it: this list is AND-joined.
       where.push(au.clause.replace(/^ AND /, ''))
+      // The author clause carries the same handful of principals as its filter.
+      // eslint-disable-next-line no-restricted-syntax
       args.push(...au.params)
     }
     const whereSql = where.join(' AND ')
