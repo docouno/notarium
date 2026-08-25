@@ -2531,6 +2531,86 @@ describe('role catalog → Add → effective → active walking skeleton', () =>
     expect(after.json().personalSpace).toBeNull()
   })
 
+  it('narrowed away from an EXISTING personal domain: plain not-found, hint does not flip, control still unavailable (#395)', async () => {
+    // The default host is operator-static (spaceCreate:false); maya HAS maya-home.
+    const mayaCookie = await login('maya', 'maya')
+    const mayaNarrowed = await app.inject({
+      method: 'POST',
+      url: '/api/me/tokens',
+      headers: { cookie: mayaCookie },
+      payload: { name: 'narrowed', scope: 'write', spaces: ['team'] }, // away from maya-home
+    })
+    expect(mayaNarrowed.statusCode).toBe(201)
+    const mayaBearer = mayaNarrowed.json().token as string
+
+    const freshCookie = await login('fresh', 'fresh')
+    const freshTok = await app.inject({
+      method: 'POST',
+      url: '/api/me/tokens',
+      headers: { cookie: freshCookie },
+      payload: { name: 'plain', scope: 'write' }, // non-narrowed, and fresh has NO personal domain
+    })
+    expect(freshTok.statusCode).toBe(201)
+    const freshBearer = freshTok.json().token as string
+
+    await app.listen({ port: 0, host: '127.0.0.1' })
+    const port = (app.server.address() as AddressInfo).port
+    const createPersonalSkill = async (bearer: string, key: string): Promise<Rpc> =>
+      (await (
+        await fetch(`http://127.0.0.1:${port}/mcp`, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            accept: 'application/json, text/event-stream',
+            authorization: `Bearer ${bearer}`,
+          },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'tools/call',
+            params: {
+              name: 'create_ability',
+              arguments: {
+                kind: 'skill',
+                name: `personal-${key}`,
+                description: 'no durable side effect on refusal',
+                instructions: '# personal\n\nbody',
+                placement: { home: 'personal' },
+                idempotencyKey: key,
+              },
+            },
+          }),
+        })
+      ).json()) as Rpc
+
+    // Narrowed away from an EXISTING personal domain → a plain, message-free not-found,
+    // NOT the actionable "unavailable". Keeping this 404 is what preserves docs/auth.md:13.
+    const narrowedRefusal = await createPersonalSkill(mayaBearer, 'narrowed-away-existing')
+    expect(narrowedRefusal.result?.isError).toBe(true)
+    expect(contentText(narrowedRefusal)).toBe('not found')
+
+    // Control: a NON-narrowed cred that genuinely has no personal domain on this static
+    // host still hears the actionable "unavailable" — the distinction is real.
+    const staticRefusal = await createPersonalSkill(freshBearer, 'static-no-personal')
+    expect(staticRefusal.result?.isError).toBe(true)
+    expect(contentText(staticRefusal)).toBe('role installation is unavailable for this location')
+
+    // The install hint reads the host's capability, not this token's reach — no flip.
+    const asNarrowed = await app.inject({
+      method: 'GET',
+      url: '/api/me/agent-roles?q=zznone',
+      headers: { authorization: `Bearer ${mayaBearer}` },
+    })
+    const asCookie = await app.inject({
+      method: 'GET',
+      url: '/api/me/agent-roles?q=zznone',
+      headers: { cookie: mayaCookie },
+    })
+    expect(asNarrowed.json().installAvailability.personal).toBe(
+      asCookie.json().installAvailability.personal,
+    )
+  })
+
   it('advertises and enforces pointer-less static Personal installs as unavailable', async () => {
     await enableStaticPersonalFallback()
     const cookie = await login('fresh', 'fresh')

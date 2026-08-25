@@ -10,6 +10,7 @@
 // sees (an agent's bearer PAT vs a human's UI session).
 
 import type { FastifyInstance } from 'fastify'
+import { createHash, randomBytes } from 'node:crypto'
 import type { AddressInfo } from 'node:net'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
@@ -85,6 +86,10 @@ const callTool = async (
   return res.status === 200 ? ((await res.json()) as Rpc) : ({} as Rpc)
 }
 const isError = (r: Rpc): boolean => Boolean(r.result?.isError)
+const structured = (r: Rpc): Record<string, unknown> =>
+  (r.result?.structuredContent as Record<string, unknown>) ?? {}
+const toolText = (r: Rpc): string =>
+  ((r.result?.content as Array<{ text: string }>) ?? []).map((c) => c.text).join('\n')
 
 const loginCookie = async (username: string, password: string): Promise<string> => {
   const login = await app.inject({
@@ -277,5 +282,255 @@ describe('personal layer (#13): profile', () => {
     // The save minted the domain.
     expect((await getJson('/api/me', cookie)).personalSpace).toBeTruthy()
     expect((await getJson('/api/me/profile', cookie)).content).toBe('hello')
+  })
+})
+
+describe('space narrowing binds the personal domain (#395)', () => {
+  const bearerHeaders = (bearer: string) => ({ authorization: `Bearer ${bearer}` })
+
+  /** Mint sam's PAT the Settings way, with an optional space narrowing. */
+  const narrowedPat = async (
+    spaces: string[] | null,
+    scope: 'read' | 'write' = 'read',
+  ): Promise<string> => {
+    const cookie = await loginCookie('sam', 'sam-password-1')
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/me/tokens',
+      headers: { cookie },
+      payload: { name: 'narrowed', scope, ...(spaces ? { spaces } : {}) },
+    })
+    expect(created.statusCode).toBe(201)
+    return created.json().token as string
+  }
+
+  /** Fill the personal domain with a profile always-load note AND one memory category,
+   *  so an "empty" read below proves the narrowing hid real content, not an empty box. */
+  const seedPersonal = async (): Promise<string> => {
+    const cookie = await loginCookie('sam', 'sam-password-1')
+    const write = await patFor('sam', 'sam-password-1') // non-narrowed write PAT
+    const saved = await app.inject({
+      method: 'PUT',
+      url: '/api/me/profile',
+      headers: { cookie },
+      payload: { content: 'Always: answer in RU.' },
+    })
+    expect(saved.statusCode).toBe(200)
+    const mem = await callTool(
+      'remember_about_user',
+      { observation: 'Prefers concise summaries.', category: 'preferences', summary: 'RU.' },
+      write,
+    )
+    expect(isError(mem)).toBe(false)
+    return cookie
+  }
+
+  const slugsOf = (list: Array<{ slug: string }>): string[] => list.map((s) => s.slug).sort()
+
+  it('reads the personal domain empty and never leaks its address', async () => {
+    await seedPersonal()
+    const pat = await narrowedPat(['main']) // narrowed to the WORK space, away from personal
+    const h = bearerHeaders(pat)
+
+    // Positive control: the token is live and reaches the work space. Without it every
+    // assertion below stays green with the vertical unimplemented.
+    expect((await app.inject({ method: 'GET', url: '/api/me', headers: h })).statusCode).toBe(200)
+
+    // Five content surfaces — honest empty.
+    expect(
+      (await app.inject({ method: 'GET', url: '/api/me/memory', headers: h })).json().categories,
+    ).toEqual([])
+    const ac = (
+      await app.inject({ method: 'GET', url: '/api/me/agent-context', headers: h })
+    ).json()
+    expect(ac.pins).toEqual([])
+    expect(ac.memory).toEqual([])
+    expect(
+      (await app.inject({ method: 'GET', url: '/api/me/profile', headers: h })).json(),
+    ).toMatchObject({
+      content: '',
+      noteId: null,
+      displayName: 'Sam',
+    })
+    const ssProfile = structured(await callTool('start_session', {}, pat)).profile as {
+      alwaysLoad: unknown[]
+      memory: unknown[]
+    }
+    expect(ssProfile.alwaysLoad).toEqual([])
+    expect(ssProfile.memory).toEqual([])
+
+    // Two address surfaces — the personal slug is gone by BOTH keys, and the me/spaces
+    // lists match (their divergence was itself the leak).
+    const me = (await app.inject({ method: 'GET', url: '/api/me', headers: h })).json()
+    expect(me.personalSpace).toBeNull()
+    const meSlugs = slugsOf(me.spaces)
+    expect(meSlugs).not.toContain('sam-personal')
+    const apiSpaces = slugsOf(
+      (await app.inject({ method: 'GET', url: '/api/spaces', headers: h })).json().spaces,
+    )
+    expect(meSlugs).toEqual(apiSpaces)
+    const session = (
+      await app.inject({ method: 'GET', url: '/api/auth/session', headers: h })
+    ).json()
+    expect(session.me.personalSpace).toBeNull()
+    expect(slugsOf(session.me.spaces)).not.toContain('sam-personal')
+
+    // Three self-scoped audit surfaces — closed by the ceiling.
+    for (const url of [
+      '/api/me/agent-audit',
+      '/api/me/agent-sessions',
+      '/api/me/agent-sessions/all',
+    ]) {
+      expect((await app.inject({ method: 'GET', url, headers: h })).statusCode).toBe(404)
+    }
+  })
+
+  it('a non-narrowed token still reaches the personal domain, but the audit ceiling closes it', async () => {
+    await seedPersonal()
+    const pat = await narrowedPat(null) // non-narrowed read
+    const h = bearerHeaders(pat)
+
+    const me = (await app.inject({ method: 'GET', url: '/api/me', headers: h })).json()
+    expect(me.personalSpace).toBe('sam-personal')
+    expect(slugsOf(me.spaces)).toContain('sam-personal')
+    expect(
+      (await app.inject({ method: 'GET', url: '/api/me/memory', headers: h })).json().categories
+        .length,
+    ).toBeGreaterThan(0)
+
+    // Audit is closed by the ceiling (self:manage), not by narrowing — a non-narrowed PAT hits it too.
+    for (const url of [
+      '/api/me/agent-audit',
+      '/api/me/agent-sessions',
+      '/api/me/agent-sessions/all',
+    ]) {
+      expect((await app.inject({ method: 'GET', url, headers: h })).statusCode).toBe(404)
+    }
+  })
+
+  it('a token narrowed to INCLUDE the personal domain sees it, like the cookie', async () => {
+    const cookie = await seedPersonal()
+    const pat = await narrowedPat(['main', 'sam-personal'])
+    const h = bearerHeaders(pat)
+
+    const me = (await app.inject({ method: 'GET', url: '/api/me', headers: h })).json()
+    expect(me.personalSpace).toBe('sam-personal')
+    expect(slugsOf(me.spaces)).toContain('sam-personal')
+    expect(
+      (await app.inject({ method: 'GET', url: '/api/me/memory', headers: h })).json().categories
+        .length,
+    ).toBeGreaterThan(0)
+
+    // Cookie baseline is untouched.
+    const meCookie = (
+      await app.inject({ method: 'GET', url: '/api/me', headers: { cookie } })
+    ).json()
+    expect(meCookie.personalSpace).toBe('sam-personal')
+    expect(slugsOf(meCookie.spaces)).toContain('sam-personal')
+  })
+
+  it('the cookie session still reaches the audit surfaces (ceiling passes a manage cred)', async () => {
+    const cookie = await seedPersonal()
+
+    for (const url of [
+      '/api/me/agent-audit',
+      '/api/me/agent-sessions',
+      '/api/me/agent-sessions/all',
+    ]) {
+      expect((await app.inject({ method: 'GET', url, headers: { cookie } })).statusCode).toBe(200)
+    }
+  })
+
+  it('a narrowed write is refused for the RIGHT reason: narrowing, not a false degraded-domain', async () => {
+    await seedPersonal() // sam-personal exists → the ONLY honest reason is the narrowing
+    const pat = await narrowedPat(['main'], 'write')
+    const r = await callTool(
+      'remember_about_user',
+      { observation: 'x', category: 'preferences', summary: 'y' },
+      pat,
+    )
+    expect(isError(r)).toBe(true)
+    expect(toolText(r)).toContain('your token is not scoped to your personal memory domain.')
+    expect(toolText(r)).not.toContain('this host cannot provision')
+  })
+
+  it('a narrowed OAuth access token is bound too (not just a PAT)', async () => {
+    const cookie = await seedPersonal()
+    // DCR → consent (cookie) narrowed to main → code → token.
+    const reg = await app.inject({
+      method: 'POST',
+      url: '/oauth/register',
+      payload: { redirect_uris: ['https://claude.ai/api/mcp/auth_callback'], client_name: 'C' },
+    })
+    const clientId = reg.json().client_id as string
+    const verifier = randomBytes(32).toString('base64url')
+    const challenge = createHash('sha256').update(verifier).digest('base64url')
+    const base = {
+      response_type: 'code',
+      client_id: clientId,
+      redirect_uri: 'https://claude.ai/api/mcp/auth_callback',
+      scope: 'read write offline_access',
+      code_challenge: challenge,
+      code_challenge_method: 'S256',
+    }
+    const authz = await app.inject({
+      method: 'POST',
+      url: '/oauth/authorize',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', cookie },
+      payload: new URLSearchParams({ ...base, decision: 'approve', 'space:main': 'on' }).toString(),
+    })
+    expect(authz.statusCode).toBe(302)
+    const code = new URL(authz.headers.location as string).searchParams.get('code') as string
+    const tok = (
+      await app.inject({
+        method: 'POST',
+        url: '/oauth/token',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        payload: new URLSearchParams({
+          grant_type: 'authorization_code',
+          code,
+          redirect_uri: 'https://claude.ai/api/mcp/auth_callback',
+          client_id: clientId,
+          code_verifier: verifier,
+        }).toString(),
+      })
+    ).json()
+    const h = bearerHeaders(tok.access_token as string)
+
+    const me = (await app.inject({ method: 'GET', url: '/api/me', headers: h })).json()
+    expect(me.personalSpace).toBeNull()
+    expect(slugsOf(me.spaces)).not.toContain('sam-personal')
+    const ac = (
+      await app.inject({ method: 'GET', url: '/api/me/agent-context', headers: h })
+    ).json()
+    expect(ac.pins).toEqual([])
+    expect(ac.memory).toEqual([])
+  })
+})
+
+describe('degraded personal domain still refuses by the true reason (#395)', () => {
+  it('a non-narrowed write on a static host without a personal domain gets the degraded reason', async () => {
+    await app.close()
+    app = await createApp({
+      now: '2026-06-14T12:00:00.000Z',
+      capabilities: { spaceCreate: false }, // engine cannot mint namespaces → degrade to first space
+      spaces: [{ slug: 'main', displayName: 'Main', notes: [] }],
+      auth: {
+        users: [{ username: 'sam', password: 'sam-password-1', displayName: 'Sam' }],
+        members: [{ space: 'main', username: 'sam', role: 'owner' }],
+      },
+    })
+    port = await listen(app)
+    const write = await patFor('sam', 'sam-password-1') // non-narrowed
+    const r = await callTool(
+      'remember_about_user',
+      { observation: 'x', category: 'preferences', summary: 'y' },
+      write,
+    )
+    expect(isError(r)).toBe(true)
+    // The pair with the narrowed-write test above pins the guard ORDER: narrowing first,
+    // degraded second. A non-narrowed cred on a genuinely degraded domain must still hear
+    // the degraded reason.
+    expect(toolText(r)).toContain('this host cannot provision a private memory domain for you')
   })
 })

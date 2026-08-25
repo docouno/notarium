@@ -424,6 +424,31 @@ describe('agent-context pult (#165): preview', () => {
     expect(typeof ctx.index.folderCount).toBe('number')
   })
 
+  it('a token narrowed away from personal gets the project axis but no embedded personal background (#395)', async () => {
+    const cookie = await loginCookie('sam', 'sam-password-1')
+    // Read PAT narrowed to the WORK space only — sam-personal is out of reach.
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/me/tokens',
+      headers: { cookie },
+      payload: { name: 'narrowed', scope: 'read', spaces: ['main'] },
+    })
+    expect(created.statusCode).toBe(201)
+    const bearer = created.json().token as string
+    const ctx = (
+      await app.inject({
+        method: 'GET',
+        url: '/api/s/main/projects/proj-main-docs/agent-context',
+        headers: { authorization: `Bearer ${bearer}` },
+      })
+    ).json()
+    // The project's own axis still loads (main is in reach)…
+    expect((ctx.pins as Array<{ noteId: string }>).map((p) => p.noteId)).toContain('fake-pin-docs')
+    // …but the embedded personal background is empty — narrowing hid sam-personal.
+    expect(ctx.personal.pins).toEqual([])
+    expect(ctx.personal.memory).toEqual([])
+  })
+
   it('PROJECT agent-context answers the same 404 for an unknown or foreign-space id (anti-enum #16)', async () => {
     const cookie = await loginCookie('sam', 'sam-password-1')
     expect(

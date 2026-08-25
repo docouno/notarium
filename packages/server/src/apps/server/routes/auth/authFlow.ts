@@ -31,7 +31,7 @@ export const authFlowRoutes = async (
     AuthSessionResponseSchema.parse({
       mode: auth.mode,
       setup: await auth.setupOpen(),
-      me: req.principal.username ? await auth.me(req.principal.username) : null,
+      me: req.principal.username ? await auth.me(req.principal.username, req.principal) : null,
     }),
   )
 

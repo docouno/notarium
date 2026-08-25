@@ -44,10 +44,15 @@ export const MeSchema = z.object({
     }),
   ),
   /** The user's personal domain: the space their agent memory and
-   *  profile live in. null until provisioned, or on hosts whose engine can't mint
-   *  spaces (P5). NOT one of `spaces` the UI lists as projects — the Personal
-   *  section keys off it separately.
-   *  canon: docs/architecture.md#p5 */
+   *  profile live in. null in three cases: not provisioned yet; a host whose
+   *  engine can't mint spaces (P5); OR the requesting credential is a PAT/OAuth
+   *  token narrowed away from this space (#395) — so the field is now
+   *  PRINCIPAL-DEPENDENT: two credentials of the same owner on the same host can
+   *  see different values, and a narrowed token also drops the space from
+   *  `spaces` above. A cookie session carries no narrowing and always sees it.
+   *  NOT one of `spaces` the UI lists as projects — the Personal section keys off
+   *  it separately.
+   *  canon: docs/architecture.md#p5 · docs/auth.md#model */
   personalSpace: SpaceSlugSchema.nullable(),
 })
 

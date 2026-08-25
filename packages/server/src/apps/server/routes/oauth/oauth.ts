@@ -6,6 +6,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 
 import { HTTP_STATUS } from '@notarium/contract/http'
 
+import { isCrossOrigin } from '../../../../libs/requestOrigin'
 import type { AuthService } from '../../../../services/auth'
 import { AuthError, SESSION_COOKIE } from '../../../../services/auth'
 import type { OAuthClientRecord, OAuthPersistence } from '../../../../services/metaDb'
@@ -35,7 +36,7 @@ export const wwwAuthenticateChallenge = (base: string): string =>
   `Bearer resource_metadata="${base}/.well-known/oauth-protected-resource", scope="read write"`
 
 /** Canonical external origin of THIS request (the host the browser addressed).
- *  Keep in sync with the host derivation in authz.ts. canon: docs/auth.md#csrf-and-proxy */
+ *  Keep in sync with the host derivation in libs/requestOrigin. canon: docs/auth.md#csrf-and-proxy */
 export const baseUrlOf = (req: FastifyRequest, configured?: string): string => {
   if (configured) {
     return configured.replace(/\/+$/, '')
@@ -52,23 +53,6 @@ export const baseUrlOf = (req: FastifyRequest, configured?: string): string => {
 const pickHeader = (v: string | string[] | undefined): string | undefined => {
   const s = Array.isArray(v) ? v[0] : v
   return s ? s.split(',')[0].trim() : undefined
-}
-
-/** Reject cross-site POSTs to the consent form (belt over SameSite=Lax): these routes
- *  live outside /api, so the installAuthz crossOrigin hook doesn't cover them. */
-const crossSite = (req: FastifyRequest): boolean => {
-  const origin = req.headers.origin
-
-  if (!origin) {
-    return false
-  }
-  const host = pickHeader(req.headers['x-forwarded-host']) || req.headers.host
-
-  try {
-    return new URL(origin).host !== host
-  } catch {
-    return true
-  }
 }
 
 /** Sets the session cookie after an inline /authorize login, so the user stays signed in. */
@@ -210,6 +194,15 @@ export const registerOAuthRoutes = async (
     const userSpaceSlugs = async (username: string | null): Promise<string[] | null> =>
       username ? (await opts.auth.me(username)).spaces.map((s) => s.slug) : null
 
+    // The consenting identity on BOTH /oauth/authorize verbs is a cookie session ONLY.
+    // A bearer cred (PAT or OAuth access token) is treated as ABSENT, not refused: a
+    // refusal issued only on a valid token would itself be a liveness oracle for a
+    // leaked cred. canon: docs/mcp-oauth.md#security
+    const consentingSession = async (req: FastifyRequest) => {
+      const authed = await opts.auth.authenticate(req.headers)
+      return authed?.viaCookie === true ? authed : null
+    }
+
     scope.get('/oauth/authorize', async (req, reply) => {
       let params: AuthorizeParams
       let client: OAuthClientRecord
@@ -222,7 +215,7 @@ export const registerOAuthRoutes = async (
         const status = err instanceof OAuthError ? err.status : HTTP_STATUS.BAD_REQUEST
         return reply.code(status).type('text/html').send(renderErrorPage(msg))
       }
-      const authed = await opts.auth.authenticate(req.headers)
+      const authed = await consentingSession(req)
       const username = authed?.principal.username ?? null
       return reply.type('text/html').send(
         renderConsentPage({
@@ -236,7 +229,7 @@ export const registerOAuthRoutes = async (
     })
 
     scope.post('/oauth/authorize', async (req, reply) => {
-      if (crossSite(req)) {
+      if (isCrossOrigin(req)) {
         return reply
           .code(HTTP_STATUS.FORBIDDEN)
           .type('text/html')
@@ -264,7 +257,7 @@ export const registerOAuthRoutes = async (
       // A session BEFORE this POST distinguishes approve-with-picker (issue now) from
       // inline login (no picker seen yet → re-render consent WITH the picker, issue only
       // on the next approve).
-      const preAuthed = (await opts.auth.authenticate(req.headers))?.principal.username ?? null
+      const preAuthed = (await consentingSession(req))?.principal.username ?? null
 
       if (!preAuthed) {
         const u = body.username?.trim()

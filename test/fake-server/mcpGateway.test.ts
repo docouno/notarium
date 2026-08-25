@@ -6026,6 +6026,53 @@ describe('auth envelope', () => {
   })
 })
 
+describe('cross-origin cookie guard on /mcp (#395)', () => {
+  /** POST /mcp over the real socket with a chosen cookie/origin. The positive
+   *  same-origin case NEEDS the real socket: on app.inject light-my-request stamps
+   *  host as <hostname>:80 and new URL().host drops the default port, so same-origin
+   *  never matches — here host is 127.0.0.1:<port> and the origin matches by itself. */
+  const post = (headers: Record<string, string>) =>
+    fetch(`http://127.0.0.1:${port}/mcp`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        ...headers,
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
+    })
+
+  it('a cookie POST from a foreign Origin is refused 403 (JSON-RPC -32003), tool not run', async () => {
+    const cookie = await loginCookie('alice', 'alice-password-1')
+    const res = await post({ cookie, origin: 'https://evil.example' })
+    expect(res.status).toBe(403)
+    const body = (await res.json()) as Rpc
+    expect(body.error?.code).toBe(-32003)
+    expect(body.result).toBeUndefined() // never reached the gateway
+  })
+
+  it('a cookie POST from the same origin runs (200)', async () => {
+    const cookie = await loginCookie('alice', 'alice-password-1')
+    const res = await post({ cookie, origin: `http://127.0.0.1:${port}` })
+    expect(res.status).toBe(200)
+    expect(((await res.json()) as Rpc).result?.tools).toBeDefined()
+  })
+
+  it('a cookie POST with no Origin runs (200) — non-browser clients omit it', async () => {
+    const cookie = await loginCookie('alice', 'alice-password-1')
+    const res = await post({ cookie })
+    expect(res.status).toBe(200)
+    expect(((await res.json()) as Rpc).result?.tools).toBeDefined()
+  })
+
+  it('a bearer PAT from a foreign Origin runs (200) — the guard is about cookies, not bearers', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'read')
+    const res = await post({ authorization: `Bearer ${bearer}`, origin: 'https://evil.example' })
+    expect(res.status).toBe(200)
+    expect(((await res.json()) as Rpc).result?.tools).toBeDefined()
+  })
+})
+
 describe('none-mode (single principal, the operator opt-out)', () => {
   let noneApp: FastifyInstance
   let nonePort: number

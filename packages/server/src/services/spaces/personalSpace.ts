@@ -148,7 +148,18 @@ export const peekPersonalSpace = async (
     return firstSpace(spaces)
   }
   const id = await auth.personalSpaceOf(principal.username)
-  return id && spaces.has(id) ? id : null
+
+  if (!id || !spaces.has(id)) {
+    return null
+  }
+  // A credential narrowed by space away from the personal domain must not read it:
+  // narrowing is stored as ids and peek returns an id, so the comparison is direct.
+  // A cookie session carries `spaces: null` — the guard is inert for it.
+  if (principal.spaces && !principal.spaces.has(id)) {
+    return null
+  }
+
+  return id
 }
 
 /** ensurePersonalSpace keyed by username — for the auth flow (setup/accept-invite),

@@ -172,7 +172,7 @@ export type AuthCtx = {
     purpose: OneTimeTokenRecord['purpose'],
   ) => Promise<{ token: string; path: string }>
   liveOneTime: (token: string) => Promise<OneTimeTokenRecord | null>
-  me: (username: string) => Promise<MeView>
+  me: (username: string, principal?: Principal) => Promise<MeView>
 }
 
 export function createAuthService({
@@ -452,7 +452,7 @@ export function createAuthService({
     return rec
   }
 
-  const me = async (username: string): Promise<MeView> => {
+  const me = async (username: string, principal?: Principal): Promise<MeView> => {
     const user = await db.getUser(username)
 
     if (!user) {
@@ -464,6 +464,12 @@ export function createAuthService({
     const recs = records ? new Map(records.map((s) => [s.id, s])) : null
     const toSlug = (id: string): string | undefined => (recs ? recs.get(id)?.slug : id)
     const grants = await db.grantsFor(user.username)
+    // A space-narrowed credential (PAT/OAuth) projects the owner's membership through its
+    // own narrowing — the same `can(space:read)` filter /api/spaces already applies, here
+    // expressed on the narrowing directly since the owner grant exists by construction. A
+    // cookie session carries `spaces: null`, so the filter is inert and its view unchanged.
+    const narrowedOut = (spaceId: string): boolean =>
+      Boolean(principal?.spaces) && !principal!.spaces!.has(spaceId)
     return {
       username: user.username,
       displayName: user.displayName,
@@ -475,13 +481,16 @@ export function createAuthService({
         // Drop a grant whose space is unlisted (stale membership) OR ARCHIVED: an archived
         // space isn't served, so its absence here is what drives the client takeover. The
         // grant stays in the DB, so a restore brings the space straight back.
-        if (!slug || rec?.archivedAt) {
+        if (!slug || rec?.archivedAt || narrowedOut(g.space)) {
           return []
         }
         const aliases = rec ? [...(aliasesForSpace?.(rec.id) ?? [])] : []
         return [{ slug, role: g.role, ...(aliases.length ? { aliases } : {}) }]
       }),
-      personalSpace: user.personalSpace ? (toSlug(user.personalSpace) ?? null) : null,
+      personalSpace:
+        user.personalSpace && !narrowedOut(user.personalSpace)
+          ? (toSlug(user.personalSpace) ?? null)
+          : null,
     }
   }
 

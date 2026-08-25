@@ -474,6 +474,8 @@ const CALL_REGISTERS: readonly CallRegister[] = [
     askedFrom: {
       'packages/server/src/services/abilities/helpers/placement/placement.ts#prepareCreate':
         'the shared human/MCP create preflight',
+      'packages/server/src/services/abilities/helpers/placement/placement.ts#rawPersonalSpaceFor':
+        'only the system/no-username branch, where narrowing does not apply, so the host-capability resolver reuses the same Personal/operator-static classification (#395)',
       'packages/server/src/services/abilities/helpers/placement/placement.ts#writableSharedSpace':
         'rejects an explicit Space placement that aliases the canonical Personal root',
       'packages/server/src/services/abilities/helpers/inventory/inventory.ts#listRoles':

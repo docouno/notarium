@@ -1,10 +1,11 @@
 // The authz perimeter: Fastify wiring that binds the pure policy (services/authz)
 // to the HTTP boundary — a fail-closed boot-assert plus a global preHandler chokepoint.
 // canon: docs/auth.md#model
-import type { FastifyInstance, FastifyRequest } from 'fastify'
+import type { FastifyInstance } from 'fastify'
 import { AUTH_MODE } from '@notarium/contract'
 import { HTTP_STATUS } from '@notarium/contract/http'
 
+import { isCrossOrigin } from '../../../libs/requestOrigin'
 import type { AuthService } from '../../../services/auth'
 import { type AuthzConfig, can, type Principal, SYSTEM_PRINCIPAL } from '../../../services/authz'
 
@@ -17,28 +18,6 @@ declare module 'fastify' {
      *  non-space routes or an unknown slug (already 404'd by can()).
      *  canon: docs/core.md#identity */
     spaceId: string
-  }
-}
-
-/** Same-origin guard for cookie-auth mutations (the second line after SameSite=Lax).
- *  canon: docs/auth.md#csrf-and-proxy */
-const crossOrigin = (req: FastifyRequest): boolean => {
-  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') {
-    return false
-  }
-  const origin = req.headers.origin
-
-  if (!origin) {
-    return false
-  }
-  const forwarded = req.headers['x-forwarded-host']
-  const host =
-    (Array.isArray(forwarded) ? forwarded[0] : forwarded)?.split(',')[0].trim() || req.headers.host
-
-  try {
-    return new URL(origin).host !== host
-  } catch {
-    return true
   }
 }
 
@@ -97,7 +76,7 @@ export const installAuthz = (
           .code(HTTP_STATUS.UNAUTHORIZED)
           .send({ error: 'unauthorized', reason: setup ? 'setup_required' : 'unauthorized' })
       }
-      if (authed.viaCookie && crossOrigin(req)) {
+      if (authed.viaCookie && isCrossOrigin(req)) {
         return reply.code(HTTP_STATUS.FORBIDDEN).send({ error: 'cross-origin request rejected' })
       }
     }

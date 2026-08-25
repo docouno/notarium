@@ -503,6 +503,202 @@ describe('the full authorization-code + PKCE flow', () => {
   })
 })
 
+describe('consent is session-only (#395)', () => {
+  /** Mint alice's PAT the way the Settings UI does — the cred whose leak the invariant guards. */
+  const mintPat = async (cookie: string): Promise<string> => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/me/tokens',
+      headers: { cookie },
+      payload: { name: 'leaked', scope: 'read' },
+    })
+    expect(res.statusCode).toBe(201)
+    return res.json().token as string
+  }
+
+  /** The slice a leaked-cred holder can observe. `date` is excluded because inject
+   *  stamps it from the wall clock at second granularity and the valid-cred side is
+   *  slower (it hits the DB); `connection` is transport noise. Everything else —
+   *  status, every remaining header, the exact payload — must not depend on whether
+   *  the presented bearer is alive. */
+  const comparable = (res: { statusCode: number; rawPayload: Buffer; headers: object }) => {
+    const headers: Record<string, unknown> = { ...res.headers }
+    delete headers.date
+    delete headers.connection
+    return { statusCode: res.statusCode, headers, payload: res.rawPayload.toString('utf8') }
+  }
+
+  it('a bearer cred cannot approve consent, and its validity is invisible (POST)', async () => {
+    const cookie = await login('alice', 'alice-password-1')
+    const pat = await mintPat(cookie)
+    const oauthTok = (await fullFlow(cookie)).access_token as string
+
+    // Positive control: both creds ARE live at the REST chokepoint. Without this,
+    // every expectation below stays green with the vertical unimplemented — a dead
+    // cred cannot mint a code either.
+    for (const bearer of [pat, oauthTok]) {
+      const me = await app.inject({
+        method: 'GET',
+        url: '/api/me',
+        headers: { authorization: `Bearer ${bearer}` },
+      })
+      expect(me.statusCode).toBe(200)
+    }
+
+    const clientId = await registerClient()
+    const { challenge } = makePkce()
+    const attempt = (bearer: string) =>
+      app.inject({
+        method: 'POST',
+        url: '/oauth/authorize',
+        headers: { ...FORM, authorization: `Bearer ${bearer}` },
+        payload: form({
+          response_type: 'code',
+          client_id: clientId,
+          redirect_uri: REDIRECT,
+          scope: 'read write offline_access',
+          code_challenge: challenge,
+          code_challenge_method: 'S256',
+          all_spaces: 'on',
+          decision: 'approve',
+        }),
+      })
+    const viaPat = await attempt(pat)
+    const viaOauth = await attempt(oauthTok)
+    const viaGarbage = await attempt('ntp_deadbeef_nope')
+
+    for (const res of [viaPat, viaOauth, viaGarbage]) {
+      expect(res.statusCode).not.toBe(302)
+      expect(res.headers.location).toBeUndefined()
+      expect(res.headers['set-cookie']).toBeUndefined()
+    }
+    expect(comparable(viaPat)).toEqual(comparable(viaGarbage))
+    expect(comparable(viaOauth)).toEqual(comparable(viaGarbage))
+  })
+
+  it('a bearer cred does not unlock the consent page — no owner name, no space list (GET)', async () => {
+    const cookie = await login('alice', 'alice-password-1')
+    const pat = await mintPat(cookie)
+    // Positive control (see the POST twin).
+    expect(
+      (
+        await app.inject({
+          method: 'GET',
+          url: '/api/me',
+          headers: { authorization: `Bearer ${pat}` },
+        })
+      ).statusCode,
+    ).toBe(200)
+
+    const clientId = await registerClient()
+    const { challenge } = makePkce()
+    const page = (bearer: string) =>
+      app.inject({
+        method: 'GET',
+        url: `/oauth/authorize?${new URLSearchParams({
+          response_type: 'code',
+          client_id: clientId,
+          redirect_uri: REDIRECT,
+          scope: 'read write offline_access',
+          code_challenge: challenge,
+          code_challenge_method: 'S256',
+        }).toString()}`,
+        headers: { authorization: `Bearer ${bearer}` },
+      })
+    const viaPat = await page(pat)
+    const viaGarbage = await page('ntp_deadbeef_nope')
+
+    expect(viaPat.statusCode).toBe(200)
+    expect(viaPat.body).not.toContain('Signed in as')
+    expect(viaPat.body).not.toContain('name="space:')
+    expect(comparable(viaPat)).toEqual(comparable(viaGarbage))
+  })
+
+  it('the inline two-step still narrows: the second POST picks alpha, the token cannot reach beta', async () => {
+    const clientId = await registerClient()
+    const { verifier, challenge } = makePkce()
+    const base = {
+      response_type: 'code',
+      client_id: clientId,
+      redirect_uri: REDIRECT,
+      scope: 'read write offline_access',
+      code_challenge: challenge,
+      code_challenge_method: 'S256',
+      decision: 'approve',
+    }
+    const loginRes = await app.inject({
+      method: 'POST',
+      url: '/oauth/authorize',
+      headers: FORM,
+      payload: form({ ...base, username: 'alice', password: 'alice-password-1' }),
+    })
+    expect(loginRes.statusCode).toBe(200)
+    expect(loginRes.body).toContain('name="space:alpha"') // consent re-rendered WITH the picker
+    const cookie = (loginRes.headers['set-cookie'] as string).split(';')[0]
+
+    const approve = await app.inject({
+      method: 'POST',
+      url: '/oauth/authorize',
+      headers: { ...FORM, cookie },
+      payload: form({ ...base, 'space:alpha': 'on' }),
+    })
+    expect(approve.statusCode).toBe(302)
+    const code = new URL(approve.headers.location as string).searchParams.get('code') as string
+    const tok = (
+      await app.inject({
+        method: 'POST',
+        url: '/oauth/token',
+        headers: FORM,
+        payload: form({
+          grant_type: 'authorization_code',
+          code,
+          redirect_uri: REDIRECT,
+          client_id: clientId,
+          code_verifier: verifier,
+        }),
+      })
+    ).json()
+    const auth = { authorization: `Bearer ${tok.access_token as string}` }
+    expect(
+      (await app.inject({ method: 'GET', url: '/api/s/alpha/notes', headers: auth })).statusCode,
+    ).toBe(200)
+    expect(
+      (await app.inject({ method: 'GET', url: '/api/s/beta/notes', headers: auth })).statusCode,
+    ).toBe(404)
+  })
+
+  it('a cross-origin cookie approve is rejected — the consent form shares the one CSRF guard', async () => {
+    const cookie = await login('alice', 'alice-password-1')
+    const clientId = await registerClient()
+    const { challenge } = makePkce()
+    const approve = (extraHeaders: Record<string, string>) =>
+      app.inject({
+        method: 'POST',
+        url: '/oauth/authorize',
+        headers: { ...FORM, cookie, ...extraHeaders },
+        payload: form({
+          response_type: 'code',
+          client_id: clientId,
+          redirect_uri: REDIRECT,
+          code_challenge: challenge,
+          code_challenge_method: 'S256',
+          all_spaces: 'on',
+          decision: 'approve',
+        }),
+      })
+    // Foreign Origin → 403 HTML, no code minted (the second CSRF line on consent).
+    const cross = await approve({ origin: 'https://evil.example' })
+    expect(cross.statusCode).toBe(403)
+    expect(cross.body).toContain('cross-origin request rejected')
+    expect(cross.headers.location).toBeUndefined()
+    // Control: the identical approve WITHOUT a foreign Origin still mints a code — the
+    // guard blocks cross-site, not the normal flow.
+    const ok = await approve({})
+    expect(ok.statusCode).toBe(302)
+    expect(new URL(ok.headers.location as string).searchParams.get('code')).toMatch(/^ntac_/)
+  })
+})
+
 describe('PKCE + code safety', () => {
   it('a wrong code_verifier is rejected (invalid_grant)', async () => {
     const cookie = await login('alice', 'alice-password-1')

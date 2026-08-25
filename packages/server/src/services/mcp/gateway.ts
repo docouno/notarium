@@ -34,7 +34,7 @@ import type {
 } from '../metaDb'
 import { type MarkerStore } from '../projects'
 import type { RolesService } from '../roles'
-import { ensurePersonalSpace, type SpaceManager } from '../spaces'
+import { ensurePersonalSpace, peekPersonalSpace, type SpaceManager } from '../spaces'
 import { createStoreAccess, type StoreAccess } from '../storeAccess'
 import { TOOL_META, type ToolAnnotations } from './descriptions'
 import { projectSummaryOf } from './helpers/projectAddressing'
@@ -264,15 +264,11 @@ export const createGateway = (deps: GatewayDeps): McpGateway => {
   const ctxFor = (principal: Principal): Ctx => {
     // Both return the STABLE space id — the gateway addresses stores/meta-DB by id;
     // only handle/space EMISSION translates back to slug.
-    const personalSpace = async (): Promise<string | null> => {
-      // none-mode/system principal owns the host — its personal domain is the
-      // host's first space.
-      if (principal.system) {
-        return deps.spaces.list()[0]?.id ?? null
-      }
-
-      return principal.username ? deps.auth.personalSpaceOf(principal.username) : null
-    }
+    // One resolve point on the read path: peek honours the space narrowing (a
+    // credential narrowed away from the personal domain reads it empty) and the
+    // system/first-space fallback both. canon: docs/auth.md#model
+    const personalSpace = async (): Promise<string | null> =>
+      peekPersonalSpace({ auth: deps.auth, spaces: deps.spaces }, principal)
     const readableSpaces = async (): Promise<string[]> =>
       deps.spaces
         .list()

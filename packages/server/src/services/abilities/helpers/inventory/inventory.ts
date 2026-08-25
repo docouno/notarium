@@ -122,8 +122,9 @@ export const createAbilityInventory = (
     query: AgentPackageLibraryQuery,
   ): Promise<HumanAbilityPage> => {
     const scopedSpaces = scopedSpacesFor(principal, query)
-    const [personal, projectSources, bundled] = await Promise.all([
+    const [personal, hostPersonal, projectSources, bundled] = await Promise.all([
       placement.personalSpaceFor(principal),
+      placement.rawPersonalSpaceFor(principal),
       projectSourcesFor(scopedSpaces),
       roles.listBundledAbilities(principal),
     ])
@@ -229,7 +230,7 @@ export const createAbilityInventory = (
           .map(({ project }) => project),
         ...(truncated ? { truncated: true } : {}),
         installAvailability: {
-          personal: placement.personalInstallAvailable(ABILITY_KIND.skill, personal),
+          personal: placement.personalInstallAvailable(ABILITY_KIND.skill, hostPersonal),
           spaces: Object.fromEntries(
             scopedSpaces
               .filter((space) => space !== personal && can(principal, 'space:write', { space }))
@@ -251,8 +252,9 @@ export const createAbilityInventory = (
     query: AgentPackageLibraryQuery,
   ): Promise<HumanAbilityPage> => {
     const scopedSpaces = scopedSpacesFor(principal, query)
-    const [personal, projectSources, bundled] = await Promise.all([
+    const [personal, hostPersonal, projectSources, bundled] = await Promise.all([
       placement.personalSpaceFor(principal),
+      placement.rawPersonalSpaceFor(principal),
       projectSourcesFor(scopedSpaces),
       roles.listBundledAbilities(principal),
     ])
@@ -383,7 +385,7 @@ export const createAbilityInventory = (
         activeRole,
         ...(inventoryTruncated ? { truncated: true } : {}),
         installAvailability: {
-          personal: placement.personalInstallAvailable(ABILITY_KIND.role, personal),
+          personal: placement.personalInstallAvailable(ABILITY_KIND.role, hostPersonal),
           projects: Object.fromEntries(
             projectSources
               .filter(({ project }) => summaries.includes(project))

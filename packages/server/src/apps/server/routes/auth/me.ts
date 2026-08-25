@@ -321,7 +321,7 @@ export const meRoutes = async (
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
     } // 'none' mode: no user to describe
 
-    return MeSchema.parse(await auth.me(req.principal.username))
+    return MeSchema.parse(await auth.me(req.principal.username, req.principal))
   })
 
   app.post('/api/me/password', { config: authz('self:manage', 'host') }, async (req, reply) => {
@@ -1067,10 +1067,11 @@ export const meRoutes = async (
     return OkResponseSchema.parse({ ok: true })
   })
 
-  // Compatibility feed for retrieval-only clients; the UI is session-first.
+  // Retrieval-only compatibility read-model; the UI is session-first. self:manage keeps
+  // this self-scoped audit session-only — no bearer (narrowed or not) may read it (#395).
   // A meta-DB-less host has nothing captured → an honest empty audit.
   // canon: docs/projects.md#activity-auditing-agent-work-243-321-mem-audita
-  app.get('/api/me/agent-audit', { config: authz('self:read', 'host') }, async (req, reply) => {
+  app.get('/api/me/agent-audit', { config: authz('self:manage', 'host') }, async (req, reply) => {
     const owner = agentOwnerOf(req.principal)
 
     if (!retrievalLog || !owner) {
@@ -1137,64 +1138,68 @@ export const meRoutes = async (
 
   // Retained lifecycle rows and archived audit snapshots are folded server-side;
   // global retrieval insights ride only the first page unless explicitly skipped.
-  app.get('/api/me/agent-sessions', { config: authz('self:read', 'host') }, async (req, reply) => {
-    const q = AgentSessionsQuerySchema.safeParse(req.query)
+  app.get(
+    '/api/me/agent-sessions',
+    { config: authz('self:manage', 'host') },
+    async (req, reply) => {
+      const q = AgentSessionsQuerySchema.safeParse(req.query)
 
-    if (!q.success) {
-      return reply.code(HTTP_STATUS.BAD_REQUEST).send({ error: q.error.issues[0]?.message })
-    }
-    const owner = agentOwnerOf(req.principal)
-    const includeAggregates = !q.data.cursor && q.data.aggregates !== '0'
-    const before = decodeSummaryCursor(q.data.cursor)
+      if (!q.success) {
+        return reply.code(HTTP_STATUS.BAD_REQUEST).send({ error: q.error.issues[0]?.message })
+      }
+      const owner = agentOwnerOf(req.principal)
+      const includeAggregates = !q.data.cursor && q.data.aggregates !== '0'
+      const before = decodeSummaryCursor(q.data.cursor)
 
-    if (!owner || !sessionAudit) {
+      if (!owner || !sessionAudit) {
+        return AgentSessionsResponseSchema.parse({
+          sessions: [],
+          total: 0,
+          active: 0,
+          outside: null,
+          hasMore: false,
+          nextCursor: null,
+          aggregates: includeAggregates
+            ? { totalQueries: 0, missCount: 0, top: [], misses: [] }
+            : null,
+        })
+      }
+      const activeSince = new Date(Date.now() - AGENT_SESSION_IDLE_MS).toISOString()
+      const [overview, aggregates] = await Promise.all([
+        sessionAudit.overview({
+          owner,
+          activeSince,
+          type:
+            q.data.filter === 'reads'
+              ? 'retrieval'
+              : q.data.filter === 'writes'
+                ? 'write'
+                : undefined,
+          limit: q.data.limit,
+          before,
+        }),
+        includeAggregates && retrievalLog
+          ? retrievalLog.aggregates(owner)
+          : Promise.resolve(
+              includeAggregates ? { totalQueries: 0, missCount: 0, top: [], misses: [] } : null,
+            ),
+      ])
+      const last = overview.hasMore ? overview.items.at(-1) : null
       return AgentSessionsResponseSchema.parse({
-        sessions: [],
-        total: 0,
-        active: 0,
-        outside: null,
-        hasMore: false,
-        nextCursor: null,
-        aggregates: includeAggregates
-          ? { totalQueries: 0, missCount: 0, top: [], misses: [] }
-          : null,
+        sessions: overview.items,
+        total: overview.total,
+        active: overview.active,
+        outside: overview.outside,
+        hasMore: overview.hasMore,
+        nextCursor: last ? encodeAuditCursor({ at: last.lastSeenAt, id: last.id }) : null,
+        aggregates,
       })
-    }
-    const activeSince = new Date(Date.now() - AGENT_SESSION_IDLE_MS).toISOString()
-    const [overview, aggregates] = await Promise.all([
-      sessionAudit.overview({
-        owner,
-        activeSince,
-        type:
-          q.data.filter === 'reads'
-            ? 'retrieval'
-            : q.data.filter === 'writes'
-              ? 'write'
-              : undefined,
-        limit: q.data.limit,
-        before,
-      }),
-      includeAggregates && retrievalLog
-        ? retrievalLog.aggregates(owner)
-        : Promise.resolve(
-            includeAggregates ? { totalQueries: 0, missCount: 0, top: [], misses: [] } : null,
-          ),
-    ])
-    const last = overview.hasMore ? overview.items.at(-1) : null
-    return AgentSessionsResponseSchema.parse({
-      sessions: overview.items,
-      total: overview.total,
-      active: overview.active,
-      outside: overview.outside,
-      hasMore: overview.hasMore,
-      nextCursor: last ? encodeAuditCursor({ at: last.lastSeenAt, id: last.id }) : null,
-      aggregates,
-    })
-  })
+    },
+  )
 
   app.get(
     '/api/me/agent-sessions/:id',
-    { config: authz('self:read', 'host') },
+    { config: authz('self:manage', 'host') },
     async (req, reply) => {
       const q = AgentSessionEventsQuerySchema.safeParse(req.query)
 

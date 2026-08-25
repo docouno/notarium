@@ -12,6 +12,7 @@ import { HTTP_STATUS } from '@notarium/contract/http'
 import type { InteractiveSignal } from '@notarium/core'
 
 import type { MutationGate } from '../../../../libs/mutationGate'
+import { isCrossOrigin } from '../../../../libs/requestOrigin'
 import type { AbilitiesService } from '../../../../services/abilities'
 import type { AuthService } from '../../../../services/auth'
 import { type Principal, SYSTEM_PRINCIPAL } from '../../../../services/authz'
@@ -184,6 +185,16 @@ export const registerMcp = async (
 
       if (!authed) {
         return challenge401(req, reply)
+      }
+      // Cookie mutations get the same second CSRF line REST has (belt over SameSite=Lax).
+      // A bearer cred carries no cookie, so it is never cross-origin here.
+      // canon: docs/auth.md#csrf-and-proxy
+      if (authed.viaCookie && isCrossOrigin(req)) {
+        return reply.code(HTTP_STATUS.FORBIDDEN).send({
+          jsonrpc: '2.0',
+          error: { code: -32003, message: 'cross-origin request rejected' },
+          id: null,
+        })
       }
       principal = authed.principal
     }

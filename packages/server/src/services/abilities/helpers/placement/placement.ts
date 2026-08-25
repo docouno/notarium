@@ -45,6 +45,20 @@ export const createAbilityPlacement = ({
     return peekPersonalSpace({ auth, spaces }, principal)
   }
 
+  /** The owner's live personal space IGNORING this token's narrowing — the host-capability
+   *  view. `personalSpaceFor` (narrowed) drives content and the actual write target; this
+   *  one feeds the install-availability hint and the personal-scope create guard, so a
+   *  narrowed token neither flips the hint nor escalates its refusal past a plain
+   *  not-found. It reproduces the pre-narrowing resolve exactly, so the availability the
+   *  hint reports is identical to what the owner's own session sees on the same host. */
+  const rawPersonalSpaceFor = async (principal: Principal): Promise<string | null> => {
+    if (principal.system || !principal.username) {
+      return personalSpaceFor(principal)
+    }
+    const id = await auth.personalSpaceOf(principal.username)
+    return id && spaces.has(id) ? id : null
+  }
+
   const personalInstallAvailable = (
     kind: AbilityCreateRequest['kind'],
     personalSpace: string | null,
@@ -202,9 +216,15 @@ export const createAbilityPlacement = ({
     let location: RoleLocation
 
     if (request.body.scope === ROLE_SCOPE.personal) {
-      const available = personalInstallAvailable(request.kind, personalSpace)
+      // Availability reads the host capability (the owner's real personal domain), not
+      // this token's reach: a narrowed token whose owner HAS a personal domain skips the
+      // "unavailable" throw and is refused by writablePersonalSpace with a message-free
+      // not-found instead. `personalSpace` (narrowed) is null for such a token, which is
+      // exactly the null knownPersonal that triggers that refusal.
+      const hostPersonal = await rawPersonalSpaceFor(principal)
+      const available = personalInstallAvailable(request.kind, hostPersonal)
 
-      if (!personalSpace && !available) {
+      if (!hostPersonal && !available) {
         throw new RoleInstallUnavailableError('role installation is unavailable for this location')
       }
       const personal = await writablePersonalSpace(principal, personalSpace)
@@ -260,6 +280,7 @@ export const createAbilityPlacement = ({
     contextProjectsFor,
     activeProjectsFor,
     personalSpaceFor,
+    rawPersonalSpaceFor,
     personalInstallAvailable,
     writableProject,
     resolveAvailabilityHandles,

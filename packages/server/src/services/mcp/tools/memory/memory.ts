@@ -37,6 +37,14 @@ export const handleRememberUser: Handler = async (ctx, rawArgs) => {
       // ensurePersonalDomain MINTS on first touch (side-effect); personalSpace() only peeks.
       const space = await ctx.ensurePersonalDomain()
       mintedSpace = space
+      // Narrowing binds FIRST: personalSpace() now returns null for a token narrowed away
+      // from the personal domain, so a degraded-domain check ahead of this would fire on a
+      // narrowed token and blame the host with a false reason. No can() check here,
+      // deliberately: a space minted this request isn't yet in the auth-time grant snapshot,
+      // so can() would wrongly 404 a fresh user's first memory.
+      if (ctx.principal.spaces && !ctx.principal.spaces.has(space)) {
+        throw new ToolFailure('your token is not scoped to your personal memory domain.')
+      }
       // SECURITY: read-by-id is NOT visibility-scoped, so private memory must land only in a
       // genuinely private domain. If the minted space differs from the recorded personalSpace(),
       // this is the shared-default degradation (co-members could read it by id) — refuse.
@@ -44,12 +52,6 @@ export const handleRememberUser: Handler = async (ctx, rawArgs) => {
         throw new ToolFailure(
           'this host cannot provision a private memory domain for you — personal memory is unavailable here.',
         )
-      }
-      // No can() check here, deliberately: a space minted this request isn't yet in the
-      // auth-time grant snapshot, so can() would wrongly 404 a fresh user's first memory.
-      // The PAT's optional space narrowing still binds (checked next).
-      if (ctx.principal.spaces && !ctx.principal.spaces.has(space)) {
-        throw new ToolFailure('your token is not scoped to your personal memory domain.')
       }
       const spaceStore = await ctx.spaces.store(space)
       const r = await rememberAboutUser(spaceStore, {
