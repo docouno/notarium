@@ -104,6 +104,10 @@ export const AbilityEditorSurface = ({
   const { resolved } = useHotkeys()
   const { editorPreview, setEditorPreview, editorKey } = useEditorPreview(draft)
 
+  // Unreachable from either caller, and it has to stay that way: this component OWNS the
+  // route's aside (#393), so a render that returns nothing would take the panel with it.
+  // `AbilityDetailPage` and `AbilityDraftPage` both check the same draft before handing
+  // the route over, and both seed `abilityKind` on the session they check.
   if (!draft || !editor.isAbility || !editor.abilityKind) {
     return null
   }

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Link, useLocation, useNavigate, useParams } from 'react-router'
 import type {
@@ -45,6 +45,7 @@ import { AbilityActionsMenu } from './AbilityActionsMenu'
 import { AbilityEditorSurface } from './AbilityEditorSurface'
 import { AgentsPanel } from './AgentsPanel'
 import { useAgentsShell } from './AgentsProvider'
+import { AsidePlaceholder } from './AsidePlaceholder'
 import { CatalogAbilityAddDialog, type CatalogInstallAvailability } from './CatalogAbilityAddDialog'
 import { projectContextScope } from './helpers/contextScope'
 import { projectChoiceLabels } from './helpers/format'
@@ -59,21 +60,11 @@ const locatorFromParams = (
     locator?: string
     packageId?: string
   },
-  expectedKind?: 'role' | 'skill',
+  kind: 'role' | 'skill',
   expectedSource?: 'owned' | 'system' | 'catalog',
 ): AbilityLocator | null => {
-  const kind =
-    expectedKind ??
-    (params.kind === 'roles'
-      ? ABILITY_KIND.role
-      : params.kind === 'skills'
-        ? ABILITY_KIND.skill
-        : null)
   const source = expectedSource ?? params.source
 
-  if (!kind) {
-    return null
-  }
   if (source === ABILITY_SOURCE.owned && params.locator) {
     const decoded = decodeAbilityLocator(params.locator)
     return decoded?.source === ABILITY_SOURCE.owned && decoded.kind === kind ? decoded : null
@@ -94,7 +85,10 @@ export const AbilityDetailPage = ({
   expectedKind,
   expectedSource,
 }: {
-  expectedKind?: 'role' | 'skill'
+  /** Which kind this route opens. Required: it labels the aside before the ability is
+   *  read, so a route that did not declare it would label the toggle differently in the
+   *  skeleton than after the read. */
+  expectedKind: 'role' | 'skill'
   expectedSource?: 'owned' | 'system' | 'catalog'
 }) => {
   const params = useParams()
@@ -611,38 +605,72 @@ export const AbilityDetailPage = ({
     setBusy(false)
   }
 
+  // The aside is part of the ROUTE, so its label exists before the ability does. Reading
+  // it off `ability` instead would leave the skeleton's toggle labelled differently from
+  // the loaded one.
+  const asideLabel = `${expectedKind} details`
+  // The panel is present in every state of the route (#393); what it holds is what
+  // changes. `blank` belongs to the failed branch only — the other one is, by
+  // construction, still reading.
+  //
+  // Every branch below that answers for the ability itself returns the panel as the SECOND
+  // child of a fragment, so React reconciles it in place instead of remounting it when the
+  // state changes. A remount is not cosmetic here: `AsideGroups` focuses itself whenever it
+  // mounts on a narrow viewport, so a skeleton that gave way to content would drag focus
+  // back into the drawer and reset the panel's scroll. The editor branch is the exception
+  // and has to be: there the panel changes OWNER, and a remount is the price of the
+  // handover, not an accident of shape.
+  const panelOf = (body: ReactNode) => (
+    <AgentsPanel
+      panels={[{ id: 'details', label: 'Details', render: () => body }]}
+      defaultLayout={[{ panels: ['details'], activeTab: 'details' }]}
+      label={asideLabel}
+    />
+  )
+
   if (failed) {
     // The same error surface the note page shows, with the same way out of it — an
     // error a user cannot retry is a dead end, not a state.
     return (
-      <StateView
-        tone="error"
-        code="Error"
-        icon={<IconX size={30} />}
-        title="Couldn’t open this ability"
-        description={failed}
-        testId="ability-error"
-        actions={
-          <Button
-            variant="primary"
-            onClick={() => {
-              setFailed(null)
-              void load()
-            }}
-          >
-            Try again
-          </Button>
-        }
-      />
+      <>
+        <StateView
+          tone="error"
+          code="Error"
+          icon={<IconX size={30} />}
+          title="Couldn’t open this ability"
+          description={failed}
+          testId="ability-error"
+          actions={
+            <Button
+              variant="primary"
+              onClick={() => {
+                setFailed(null)
+                void load()
+              }}
+            >
+              Try again
+            </Button>
+          }
+        />
+        {panelOf(
+          <AsidePlaceholder
+            loading={false}
+            blank="This ability didn’t open, so there is nothing to describe."
+          />,
+        )}
+      </>
     )
   }
   if (!detail) {
     return (
-      <div className={styles.detailSkeleton} data-testid="ability-detail-skeleton">
-        <Skeleton w="46%" h={34} radius={6} />
-        <SkeletonText lines={4} lastWidth="62%" />
-        <SkeletonText lines={5} lastWidth="40%" />
-      </div>
+      <>
+        <div className={styles.detailSkeleton} data-testid="ability-detail-skeleton">
+          <Skeleton w="46%" h={34} radius={6} />
+          <SkeletonText lines={4} lastWidth="62%" />
+          <SkeletonText lines={5} lastWidth="40%" />
+        </div>
+        {panelOf(<AsidePlaceholder loading />)}
+      </>
     )
   }
   const { ability, health } = detail
@@ -864,53 +892,51 @@ export const AbilityDetailPage = ({
   )
 
   return (
-    <article className={`${styles.page} doc`} data-testid="agent-ability-detail">
-      {detail.truncated && (
-        <Notice variant="warning">This preview reached the host token limit.</Notice>
-      )}
-      {health && !health.healthy && (
-        <Notice variant="warning">
-          This role has unavailable attachments. Agent activation remains fail-closed.
-        </Notice>
-      )}
-      {health?.attachments.length ? (
-        <div className={styles.health}>
-          {health.attachments.map(({ attachment, health: state }, index) => (
-            <Chip key={`${index}:${JSON.stringify(attachment)}`}>
-              {attachment.kind === 'exact'
-                ? (skills.find(
-                    (candidate) =>
-                      encodeAbilityLocator(candidate.locator) ===
-                      encodeAbilityLocator(attachment.locator),
-                  )?.title ?? attachment.label)
-                : attachment.raw}{' '}
-              · {state}
-            </Chip>
-          ))}
-        </div>
-      ) : null}
-      <header className="doc-head">
-        <h1 className="doc-title">{ability.title}</h1>
-      </header>
-      <div ref={markdownRef} className="markdown" dangerouslySetInnerHTML={{ __html: html }} />
-      {actionsHost ? createPortal(actions, actionsHost) : null}
-      <AgentsPanel
-        panels={[{ id: 'details', label: 'Details', render: () => settings }]}
-        defaultLayout={[{ panels: ['details'], activeTab: 'details' }]}
-        label={`${ability.locator.kind} details`}
-      />
-      {catalogAddOpen && (
-        <CatalogAbilityAddDialog
-          kind={ability.locator.kind}
-          name={ability.name}
-          space={space}
-          spaceAvailable={canWrite && personalSpace?.slug !== space}
-          projects={inventory?.projects ?? []}
-          install={installTargets}
-          onAdd={addCatalog}
-          onClose={() => setCatalogAddOpen(false)}
-        />
-      )}
-    </article>
+    <>
+      <article className={`${styles.page} doc`} data-testid="agent-ability-detail">
+        {detail.truncated && (
+          <Notice variant="warning">This preview reached the host token limit.</Notice>
+        )}
+        {health && !health.healthy && (
+          <Notice variant="warning">
+            This role has unavailable attachments. Agent activation remains fail-closed.
+          </Notice>
+        )}
+        {health?.attachments.length ? (
+          <div className={styles.health}>
+            {health.attachments.map(({ attachment, health: state }, index) => (
+              <Chip key={`${index}:${JSON.stringify(attachment)}`}>
+                {attachment.kind === 'exact'
+                  ? (skills.find(
+                      (candidate) =>
+                        encodeAbilityLocator(candidate.locator) ===
+                        encodeAbilityLocator(attachment.locator),
+                    )?.title ?? attachment.label)
+                  : attachment.raw}{' '}
+                · {state}
+              </Chip>
+            ))}
+          </div>
+        ) : null}
+        <header className="doc-head">
+          <h1 className="doc-title">{ability.title}</h1>
+        </header>
+        <div ref={markdownRef} className="markdown" dangerouslySetInnerHTML={{ __html: html }} />
+        {actionsHost ? createPortal(actions, actionsHost) : null}
+        {catalogAddOpen && (
+          <CatalogAbilityAddDialog
+            kind={ability.locator.kind}
+            name={ability.name}
+            space={space}
+            spaceAvailable={canWrite && personalSpace?.slug !== space}
+            projects={inventory?.projects ?? []}
+            install={installTargets}
+            onAdd={addCatalog}
+            onClose={() => setCatalogAddOpen(false)}
+          />
+        )}
+      </article>
+      {panelOf(settings)}
+    </>
   )
 }

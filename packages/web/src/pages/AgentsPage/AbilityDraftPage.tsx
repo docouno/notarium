@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { type ReactNode, useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router'
 import type { AgentAbilitySummary, MeAgentSkillsResponse } from '@notarium/contract'
 import { ABILITY_AVAILABILITY_MODE, ABILITY_KIND, ROLE_SCOPE } from '@notarium/contract/enums'
@@ -20,7 +20,9 @@ import { errorText } from '../../libs/errors'
 import { agentAbilityRoute, agentRolesRoute, agentSkillsRoute } from '../../libs/routing/routePaths'
 import { api } from '../../services/api'
 import { AbilityEditorSurface } from './AbilityEditorSurface'
+import { AgentsPanel } from './AgentsPanel'
 import { useAgentsShell } from './AgentsProvider'
+import { AsidePlaceholder } from './AsidePlaceholder'
 import { abilityDraftSessionOf, abilityDraftSync } from './helpers/abilityDraftSync'
 import { loadSkillInventory } from './helpers/skillInventory'
 
@@ -318,26 +320,46 @@ export const AbilityDraftPage = ({ expectedKind }: { expectedKind?: 'roles' | 's
     owner,
   ])
 
+  // Both states that stop short of the editor keep the route's aside — the surface owns
+  // it in the third, so exactly one component mounts it at a time (#393). Both return it
+  // as the SECOND child of a fragment, so moving between them reconciles the panel in
+  // place; a remount would re-focus the drawer on a narrow viewport.
+  const panelOf = (body: ReactNode) => (
+    <AgentsPanel
+      panels={[{ id: 'details', label: 'Details', render: () => body }]}
+      defaultLayout={[{ panels: ['details'], activeTab: 'details' }]}
+      label={`${abilityKind} details`}
+    />
+  )
+
   if (failed) {
     return (
-      <StateView
-        tone="error"
-        code="Error"
-        icon={<IconX size={30} />}
-        title="Couldn’t open this draft"
-        description={failed}
-        testId="ability-draft-error"
-        actions={
-          <Button
-            variant="primary"
-            onClick={() =>
-              navigate(abilityKind === ABILITY_KIND.role ? agentRolesRoute() : agentSkillsRoute())
-            }
-          >
-            Back to {abilityKind === ABILITY_KIND.role ? 'roles' : 'skills'}
-          </Button>
-        }
-      />
+      <>
+        <StateView
+          tone="error"
+          code="Error"
+          icon={<IconX size={30} />}
+          title="Couldn’t open this draft"
+          description={failed}
+          testId="ability-draft-error"
+          actions={
+            <Button
+              variant="primary"
+              onClick={() =>
+                navigate(abilityKind === ABILITY_KIND.role ? agentRolesRoute() : agentSkillsRoute())
+              }
+            >
+              Back to {abilityKind === ABILITY_KIND.role ? 'roles' : 'skills'}
+            </Button>
+          }
+        />
+        {panelOf(
+          <AsidePlaceholder
+            loading={false}
+            blank="This draft didn’t open, so there is nothing to describe."
+          />,
+        )}
+      </>
     )
   }
   // WHOSE draft, by the same pair the writer above is keyed on: `+ New` from a draft
@@ -346,7 +368,14 @@ export const AbilityDraftPage = ({ expectedKind }: { expectedKind?: 'roles' | 's
   // editor answers for the session, so showing it here would put the previous
   // draft's body under the new draft's address.
   if (!inventory || !editing.isEditing || !abilityDraftSessionOf(editing.draft, owner, draftId)) {
-    return null
+    return (
+      // The empty first slot is what keeps the panel at the same fragment position as the
+      // branch above — this state has no content of its own to put there.
+      <>
+        {null}
+        {panelOf(<AsidePlaceholder loading />)}
+      </>
+    )
   }
 
   return (

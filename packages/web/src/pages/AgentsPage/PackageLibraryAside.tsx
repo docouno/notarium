@@ -206,23 +206,21 @@ export const PackageLibraryFilters = ({
             <p className={styles.unavailable}>The selected project is no longer available.</p>
           )}
           {facets && facets.projects.length > 0 && (
-            <div className={styles.projectList}>
-              <FolderTree
-                nodes={facets.projects.map(({ project, count }) => ({
-                  name: project.displayName,
-                  path: project.handle,
-                  count,
-                  children: [],
-                }))}
-                expanded={NO_EXPANDED_PROJECTS}
-                onToggleExpand={() => {}}
-                isSelected={(project) => state.project === project}
-                onToggle={(project) =>
-                  onChange({ project: state.project === project ? null : project })
-                }
-                swatch={false}
-              />
-            </div>
+            <FolderTree
+              nodes={facets.projects.map(({ project, count }) => ({
+                name: project.displayName,
+                path: project.handle,
+                count,
+                children: [],
+              }))}
+              expanded={NO_EXPANDED_PROJECTS}
+              onToggleExpand={() => {}}
+              isSelected={(project) => state.project === project}
+              onToggle={(project) =>
+                onChange({ project: state.project === project ? null : project })
+              }
+              swatch={false}
+            />
           )}
         </AsideSection>
       )}

@@ -24,7 +24,7 @@ export const AgentsPanel = ({
   modalLabel?: string
 }) => {
   const { asideOpen, toggleAside, narrowLayout: narrow } = useChrome()
-  const { actionsHost, asideHost, setContentInert } = useAgentsShell()
+  const { toggleHost, asideHost, setContentInert } = useAgentsShell()
   const previousAsideOpen = useRef(asideOpen)
   const openerRef = useRef<HTMLButtonElement | null>(null)
   const restoreFocus = useRef(false)
@@ -65,6 +65,10 @@ export const AgentsPanel = ({
     toggleAside()
   }, [narrow, setContentInert, toggleAside])
 
+  // A guard, not a state any route SHOWING SECTION CONTENT reaches: since #393 those
+  // mount one panel in every state they have, so an empty array here means a caller built
+  // its panels from data instead of from the route. The section's 404 and its redirect
+  // routes mount no panel at all — they render inside the shell without being a surface.
   if (!panels.length) {
     return null
   }
@@ -105,7 +109,7 @@ export const AgentsPanel = ({
 
   return (
     <>
-      {!asideOpen && actionsHost ? createPortal(openToggle, actionsHost) : null}
+      {!asideOpen && toggleHost ? createPortal(openToggle, toggleHost) : null}
       {aside && asideHost ? createPortal(aside, asideHost) : null}
     </>
   )

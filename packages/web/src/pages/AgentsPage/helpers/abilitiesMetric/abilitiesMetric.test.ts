@@ -2,13 +2,10 @@ import { describe, expect, it } from 'vitest'
 import { abilitiesMetric } from './abilitiesMetric'
 
 describe('the Abilities pill’s identity line', () => {
-  // The counts come from the listing scoped to the active Space; the library under
-  // the pill is owner-wide. Unqualified, "2 roles" reads as a count of the seven
-  // cards below it.
-  it('names the scope the counts were taken in', () => {
-    expect(abilitiesMetric({ count: 2, activeRole: null, truncated: false }, null)).toBe(
-      '2 roles · in this Space',
-    )
+  // Counts, the active role and skills — and nothing else. The line lives in the first
+  // of three pills, so every clause it carries is width the two beside it do not have.
+  it('joins only the parts it was given', () => {
+    expect(abilitiesMetric({ count: 2, activeRole: null, truncated: false }, null)).toBe('2 roles')
     expect(
       abilitiesMetric(
         { count: 2, activeRole: 'writer', truncated: false },
@@ -17,7 +14,7 @@ describe('the Abilities pill’s identity line', () => {
           truncated: false,
         },
       ),
-    ).toBe('2 roles · writer active · 3 skills · in this Space')
+    ).toBe('2 roles · writer active · 3 skills')
   })
 
   it('keeps the counts themselves as they read today', () => {

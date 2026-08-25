@@ -116,7 +116,7 @@ export const ActivityFilters = ({
             </button>
           }
         >
-          <div className={styles.agentList} data-testid="activity-agent-list">
+          <div data-testid="activity-agent-list">
             <FolderTree
               nodes={agents.map((item) => ({
                 name: item.agent,

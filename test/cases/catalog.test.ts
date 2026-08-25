@@ -9,7 +9,9 @@ import {
   shapeGraph,
 } from '@notarium/core'
 import { InMemoryStore } from '@notarium/engine-memory'
-
+// The budget the seeded window is measured against, read from its owner rather than
+// written down here: a case tuned to a number this test invents proves nothing.
+import { PROJECT_TOKEN_BUDGET } from '../../packages/server/src/services/spaces/agentContext'
 import { buildCasesWorld, buildCaseWorld, DEFAULT_NOW, mergeWorlds } from './build'
 import { normDate } from './generators'
 import { CASES, getCase, listCases } from './registry'
@@ -385,6 +387,33 @@ describe('seed catalog (#175)', () => {
       retrievals.filter((r) => r.query === 'deploy prod checklist' && (r.hits ?? []).length === 0),
     ).toHaveLength(3)
     expect(w.auth?.connectedApps?.some((app) => app.appName === 'Claude')).toBe(true)
+    // The Budget Lab project whose two heavy pins leave Q with less than the personal set
+    // costs, so the cut lands INSIDE the set (#393) — the only place in the catalogue where
+    // a trimmed set item and a trimmed pin sit under one caption. Both sides of that window
+    // are DERIVED, not written down: the budget from the server's own constant, the span
+    // from the set's members. `fatBody` writes ~4 ASCII characters per token, so the sizes
+    // the case declares are readable back off the events. Move either pin, or resize any
+    // member of `Frontend Canon`, and the cut walks out of the set — which is exactly what
+    // this has to catch, because nothing else in the suite opens that route.
+    expect(w.projects).toContainEqual(
+      expect.objectContaining({ space: 'budget-lab', path: 'set-trim' }),
+    )
+
+    const tokensOf = (predicate: (path: string) => boolean): number[] =>
+      w.events.flatMap((event) =>
+        event.op === 'create' && predicate(event.path)
+          ? [Math.round((event.content ?? '').length / 4)]
+          : [],
+      )
+    const setMembers = tokensOf((path) => ['frontend.md', 'api.md', 'naming.md'].includes(path))
+    const setTrimPins = tokensOf((path) => path.startsWith('set-trim/'))
+    const remainder = PROJECT_TOKEN_BUDGET - setTrimPins.reduce((sum, tokens) => sum + tokens, 0)
+
+    expect(setTrimPins).toHaveLength(2)
+    expect(setMembers).toHaveLength(3)
+    // Inside the set: the first member fits the remainder, the whole set does not.
+    expect(remainder).toBeGreaterThan(setMembers[0]!)
+    expect(remainder).toBeLessThan(setMembers.reduce((sum, tokens) => sum + tokens, 0))
 
     const overview = w.events.find(
       (event) => event.op === 'create' && event.path === 'product/index.md',
@@ -407,6 +436,27 @@ describe('seed catalog (#175)', () => {
     expect(sessions.some((session) => session.name.length === 160)).toBe(true)
     expect(sessions.find((session) => session.ref === 'expired')?.retained).toBe(false)
     expect(world.retrievals?.some((retrieval) => retrieval.sessionRef === 'expired')).toBe(true)
+    // The Agent facet in the Activity aside has no pagination and, since #393, no ceiling
+    // of its own — so how many labels the owner has IS the state. Retrievals are the only
+    // way to add one without a session or a write, both of which are counted whole above.
+    // Owner by the same rule the contract states — an absent one is inherited from the
+    // bound session, not from the primary owner — so the count is of labels the STAND
+    // OWNER's facet will actually carry.
+    const ownerOf = (ref: string | undefined, explicit: string | undefined): string | undefined =>
+      explicit ?? sessions.find((session) => session.ref === ref)?.owner ?? 'sergey'
+
+    expect(
+      new Set(
+        [
+          ...(world.retrievals ?? [])
+            .filter((retrieval) => ownerOf(retrieval.sessionRef, retrieval.owner) === 'sergey')
+            .map((retrieval) => retrieval.agent),
+          ...world.events
+            .filter((event) => event.agentAudit && !event.agentAudit.owner)
+            .map((event) => event.agentAudit?.agent),
+        ].filter(Boolean),
+      ).size,
+    ).toBeGreaterThanOrEqual(5)
     expect(world.events.some((event) => event.agentAudit?.sessionRef === 'expired')).toBe(true)
     expect(
       world.retrievals?.some(
@@ -629,7 +679,11 @@ describe('seed catalog (#175)', () => {
       ['project:product/web', 7],
       ['space', 14],
     ])
-    expect(world.projects?.filter((project) => project.space === 'product')).toHaveLength(5)
+    // Fifteen of these twenty hold no ability at all, and that is the point: the Project
+    // facet in the library aside has no pagination, so the LENGTH of the list is a state
+    // (#393). With `main`'s own project the facet runs twenty-one rows — see
+    // FACET_PROJECTS in the case.
+    expect(world.projects?.filter((project) => project.space === 'product')).toHaveLength(20)
     // The authored H1 is the human title on every surface that lists a role, and this
     // one is long enough to force truncation in cards, explorer rows and breadcrumbs.
     const longTitled = roles.find((role) => role.name === 'release-readiness-and-handoff-review')
@@ -638,7 +692,7 @@ describe('seed catalog (#175)', () => {
         .length,
     ).toBeGreaterThan(60)
     expect(roles.filter((role) => role.name === 'shared-reviewer')).toHaveLength(2)
-    // One role in three V18 states: a Space base narrowed to two of the five projects,
+    // One role in three V18 states: a Space base narrowed to two of the Space's projects,
     // its own version in one of them, and a version whose base never existed.
     expect(roles).toContainEqual(
       expect.objectContaining({

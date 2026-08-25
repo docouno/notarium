@@ -19,6 +19,8 @@ import { ApiError } from '../../services/api'
 // nothing that is asserted is minted inside a mock factory.
 
 const harness = vi.hoisted(() => ({
+  panels: [] as Array<{ panels: number; label: string }>,
+  mounts: 0,
   api: {
     meAgentContextGet: vi.fn(),
     meRoleContextGet: vi.fn(),
@@ -76,6 +78,35 @@ vi.mock('./AgentsProvider', () => ({
   useAgentsShell: () => harness.shell,
   useAgentsSummary: () => harness.summary,
 }))
+// The panel is the shell's adapter, not this page's subject: it reads `useChrome`, which
+// throws outside its provider. What it renders has its own unit (`ContextAside.test.ts`);
+// the stub records what the page asked it to host, which is how "this route has an aside
+// at all" (#393) is asserted here.
+vi.mock('./AgentsPanel', async () => {
+  const { useEffect, useRef } = await import('react')
+
+  return {
+    AgentsPanel: (props: { panels: unknown[]; label: string }) => {
+      // Every LIVE panel, not the last one seen: one record cannot tell one panel from two
+      // mounted at once. The record is kept CURRENT on every render — a route that starts
+      // with a panel and later hands over an empty array would otherwise read as healthy —
+      // and removed by identity when this panel actually goes away. `mounts` counts
+      // mountings, so a panel torn down and rebuilt between two states is visible as such.
+      const mine = useRef({ panels: props.panels.length, label: props.label }).current
+
+      mine.panels = props.panels.length
+      mine.label = props.label
+      useEffect(() => {
+        harness.panels.push(mine)
+        harness.mounts += 1
+        return () => {
+          harness.panels = harness.panels.filter((entry) => entry !== mine)
+        }
+      }, [mine])
+      return null
+    },
+  }
+})
 
 import { ContextPage } from './ContextPage'
 ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
@@ -359,9 +390,15 @@ describe('the Context constructor and the role an address names (#309)', () => {
     // negatives below are read against a world where each one demonstrably shows up:
     // the row badge, the block caption over the list, and the row's own meta line — the
     // last of which lives in the card body, which is why the rows are opened first.
+    // The caption counts the lane it stands over — pins AND sets — so it reads the sum
+    // of the dropped pin and the dropped set member, not the pin alone.
     expect(textOf(live, 'context-role-pins')).toContain('Trimmed')
     expect(textOf(live, 'context-role-pins')).toContain('Over the token budget')
-    expect(textOf(live, 'context-role')).toContain('≈300 trimmed')
+    expect(textOf(live, 'context-role')).toContain('≈600 trimmed')
+    // The rule the caption serves: a layer's tally on the scale IS the sum of the captions
+    // under it. Reading only the caption would leave the halves free to disagree, which is
+    // the state this vertical found. U+2212, the way the meter prints it.
+    expect(textOf(live, 'context-aggregate-role')).toContain('−600')
     expect(textOf(live, 'context-aggregate-role')).toContain('Role · Release Reviewer')
     // A set states the verdict in two more places, and BOTH are read here by row rather
     // than over the panel: the trimmed pin above already puts the word in the panel, so
@@ -384,8 +421,8 @@ describe('the Context constructor and the role an address names (#309)', () => {
     expect(textOf(off, 'context-role-pins')).toContain('Cutover Steps')
     // Read over the WHOLE panel, and case-insensitively: the caption under the block
     // head writes the same verdict in lower case, one level above the list, and it is
-    // the loudest of the three — a red "≈600 trimmed — over the token budget" across a
-    // layer no one weighed.
+    // the loudest of the three — the live half above reads it as "≈600 trimmed", so a
+    // caption that survived unweighing would say that about a budget nobody spent.
     const said = textOf(off, 'context-role').toLowerCase()
 
     expect(said).not.toContain('trimmed')
@@ -405,6 +442,19 @@ describe('the Context constructor and the role an address names (#309)', () => {
     // The band stays — the panel below it has to remain reachable from the Personal tab —
     // and reads zero, which is exactly what this layer costs the budget the agent spends.
     expect(boxOf(off, 'context-aggregate-role')?.getAttribute('data-loaded-tokens')).toBe('0')
+  })
+
+  // The tab used to be the one route of the section without an aside, which is what made
+  // the content column jump 340px on the way in and out of it (#393).
+  it('gives the route one aside panel of its own', async () => {
+    harness.api.meAgentContextGet.mockResolvedValue(previewAnswer())
+    harness.panels = []
+    harness.mounts = 0
+    await render()
+
+    expect(harness.panels).toEqual([{ panels: 1, label: 'context details' }])
+    // One mounting for the whole settle: the panel is not rebuilt as the scopes arrive.
+    expect(harness.mounts).toBe(1)
   })
 
   it('asks the identity door from where the reader stands, not from nowhere', async () => {

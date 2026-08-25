@@ -19,16 +19,17 @@ import { encodeAbilityLocator } from '@notarium/core'
 import { useProjects } from '../../composers/ProjectsProvider'
 import { useSpace } from '../../composers/SpaceProvider'
 import { CHANGED_COALESCE_MS, useSync } from '../../composers/SyncProvider'
-import { Chip } from '../../core/Chips'
+import type { LayoutSpec } from '../../core/AsideGroups'
 import { useDialog } from '../../core/Dialog'
-import { IconFolderKanban } from '../../core/Icons'
 import { Notice } from '../../core/Notice'
 import { Select } from '../../core/Select'
 import { useToast } from '../../core/Toast'
 import { agentContextRoute, memoryNoteRoute, noteRoute } from '../../libs/routing/routePaths'
 import { api, ApiError } from '../../services/api'
+import { AgentsPanel } from './AgentsPanel'
 import { useAgentsShell, useAgentsSummary } from './AgentsProvider'
 import { EMPTY_PERSONAL, EMPTY_PROJECT } from './consts'
+import { ContextAside } from './ContextAside'
 import { AggregateBar } from './ContextMeters'
 import { AggregateBarSkeleton } from './ContextSkeletons'
 import { orderSetItemsIn, reRankByEntries } from './helpers/contextOrder'
@@ -91,6 +92,10 @@ const ROLE_INACTIVE_NOTICE: Record<RoleInactiveReason, string> = {
   unhealthy:
     'This role’s attachments no longer resolve, so a session refuses to raise it. What it loads is still yours to change.',
 }
+
+/** One group, one tab, always — the route has a single panel, so nothing here depends
+ *  on state and nothing is persisted. */
+const CONTEXT_ASIDE_LAYOUT: LayoutSpec = [{ panels: ['details'], activeTab: 'details' }]
 
 export const ContextPage = () => {
   const { space, spaces: allSpaces, personalSpace, reportNoteSpace, canWrite } = useSpace()
@@ -1088,20 +1093,6 @@ export const ContextPage = () => {
         onToggleMute={toggleMute}
         testIdBase="context-project-memory"
       />
-
-      <div className={styles.block}>
-        <div className={styles.blockHead}>
-          <IconFolderKanban size={13} />
-          <span>Auto</span>
-        </div>
-        {currentProject && (
-          <p className={styles.auto} data-testid="context-auto">
-            <Chip>{currentProject.index.noteCount} notes</Chip>
-            <Chip>{currentProject.index.folderCount} folders</Chip>
-            <span className={styles.muted}>+ recent changes</span>
-          </p>
-        )}
-      </div>
     </section>
   ) : null
 
@@ -1206,6 +1197,39 @@ export const ContextPage = () => {
             : null}
         </div>
       </div>
+
+      <AgentsPanel
+        panels={[
+          {
+            id: 'details',
+            label: 'Details',
+            render: () => (
+              <ContextAside
+                loading={!contextIsCurrent}
+                roleFailed={failed.includes('role context')}
+                scopeFailed={contextLoadFailed}
+                roleUnavailable={roleSelectionUnavailable}
+                roleLayer={roleLayer}
+                isRoleScope={isRoleScope}
+                isProjectScope={isProjectScope}
+                roleRoute={!!selectedRoleLocator}
+                // Dropped as soon as the slug is known not to resolve: from there the
+                // effect below sends the reader to Personal, and a row reserved for a
+                // project that will never arrive would be taken back unfilled.
+                projectRoute={
+                  scope !== 'personal' && !selectedRoleLocator && (!projects || !!projectScope)
+                }
+                project={currentProject}
+                personal={personalScope}
+                spaces={allSpaces}
+                projects={projects}
+              />
+            ),
+          },
+        ]}
+        defaultLayout={CONTEXT_ASIDE_LAYOUT}
+        label="context details"
+      />
 
       {picker && (
         <PinPicker

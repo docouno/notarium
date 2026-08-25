@@ -22,7 +22,8 @@ const fatBody = (title: string, tokens: number): string => {
 /** The #165/#208 agent-context demo world: a personal domain with pins (incl. HEAVY
  *  ones that overflow the personal budget) + memory, a heavy "Atlas" team space with a
  *  pinned product project + project memory, a note-heavy archive, and a dedicated
- *  "Budget Lab" space isolating each #208 token-budget case (fits / squeeze / no-pins)
+ *  "Budget Lab" space isolating each #208 token-budget case (fits / squeeze / no-pins /
+ *  set-trim)
  *  so the personal-embeds-into-project-budget nesting is reproducible. */
 export const agentContext: CaseSpec = {
   name: 'agent-context',
@@ -351,6 +352,11 @@ export const agentContext: CaseSpec = {
       path: 'no-pins',
       displayName: 'No pins — full personal, zero project',
     })
+    b.project({
+      space: 'budget-lab',
+      path: 'set-trim',
+      displayName: 'Set trim — the cut lands inside a set',
+    })
 
     // fits: small project pins → the project loads cheap, the whole personal background
     // embeds under Q with headroom (in a rich project MORE personal fits than under P).
@@ -368,11 +374,12 @@ export const agentContext: CaseSpec = {
     }
     // squeeze: two fat project pins (≈25k) eat the front of Q=38k → the personal background
     // embeds only PARTIALLY into the ≈13k remainder (the crux — project outranks the general
-    // scope, but personal is squeezed, not zeroed). The real engine lists pins ORDER BY path,
-    // so the personal side leads with the heavy home pins (7k+5k+3k=15k); the remainder admits
-    // the first two (≈12k) and TRIMS the third — a heavy home pin visibly squeezed out (with
-    // the small pins + set + memory behind it), distinct from both "fits" (full embed) and a
-    // fully-trimmed project. Sized so the boundary falls ON a heavy pin (not just set items).
+    // scope, but personal is squeezed, not zeroed). The personal side follows its own saved
+    // order (#210), which leads with the `Frontend Canon` SET (≈3.4k) and then the heavy
+    // home pins: the remainder admits the set and the first pin (≈10.4k) and TRIMS the next
+    // one — a heavy home pin visibly squeezed out, with the small pins and memory behind it,
+    // distinct from both "fits" (full embed) and a fully-trimmed project. Sized so the
+    // boundary falls ON a heavy pin; `set-trim` below is where it falls inside the set.
     const squeeze: Array<[string, number]> = [
       ['Squeeze Runbook A', 15_000],
       ['Squeeze Runbook B', 10_000],
@@ -387,6 +394,32 @@ export const agentContext: CaseSpec = {
         pin: true,
         content: fatBody(title, tokens),
         created: daysBefore(now, 8 - i, 10),
+        principal: 'user:sergey',
+      })
+    })
+    // set-trim: project pins eat Q down to ≈2.4k, and the personal order leads with the
+    // `Frontend Canon` SET — so the budget runs out INSIDE it: the first item loads and the
+    // rest do not. `squeeze` deliberately puts the boundary on a heavy pin, which leaves the
+    // one state where a trimmed SET ITEM and a trimmed PIN are on screen together
+    // unreachable on any stand — and that is exactly the state where a caption that counts
+    // only pins under-reports its own list (#393). Sizes are fixed, and the landing window
+    // is the set's own span (1.4k…3.4k), so the estimator's drift cannot move the cut out
+    // of it.
+    ;(
+      [
+        ['Set Trim Runbook A', 20_000],
+        ['Set Trim Runbook B', 15_600],
+      ] as Array<[string, number]>
+    ).forEach(([title, tokens], i) => {
+      b.note({
+        space: 'budget-lab',
+        path: `set-trim/pin-${pad(i + 1)}.md`,
+        title,
+        noteType: 'runbook',
+        tags: ['budget', 'set-trim'],
+        pin: true,
+        content: fatBody(title, tokens),
+        created: daysBefore(now, 7 - i, 10),
         principal: 'user:sergey',
       })
     })

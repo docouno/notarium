@@ -38,7 +38,6 @@ export type AgentsAbilityExplorerPage = Paged & {
   items: AgentAbilitySummary[]
   projects: MeAgentRolesResponse['projects']
   nextCursor: string | null
-  truncated: boolean
 }
 
 export type AgentsSessionExplorerPage = Paged & {

@@ -10,7 +10,7 @@ import { ContextCard } from '../../widgets/ContextCard'
 import { StatusBadge, TokenMeter } from './ContextMeters'
 import { CardListSkeleton } from './ContextSkeletons'
 import { parseEntryKey, pinKey, setKey } from './helpers/contextOrder'
-import { pinsTrimmed } from './helpers/contextTrim'
+import { pinsTrimmed, setsTrimmed } from './helpers/contextTrim'
 import { formatTokens } from './helpers/format'
 import type { ContextPinView, ContextSetItemView, ContextSetRowView } from './types'
 import styles from './ContextPage.module.scss'
@@ -167,8 +167,11 @@ export const SetItemRow = ({
 
 /** A context set AS A PIN-LIST ROW (#209): an expandable card badged `Set` that reveals its
  *  member notes (each itself expandable, each removable from its own menu) — progressive
- *  disclosure, no separate manager. Weight = the sum of its loaded items against the scope
- *  budget. The row menu adds notes, unpins the set from this scope, or deletes it everywhere. */
+ *  disclosure, no separate manager. Weight = what the WHOLE set would cost against the scope
+ *  budget — every member, dropped ones included — and the meter reads `trimmed` as soon as
+ *  one member was dropped. That is the row's own claim about the set, not a share of the
+ *  block caption above it, which sums only what the budget actually dropped.
+ *  The row menu adds notes, unpins the set from this scope, or deletes it everywhere. */
 export const SetRow = ({
   set,
   previews,
@@ -309,7 +312,7 @@ export const PinsBlock = ({
   listTestId: string
   editable?: boolean
 }) => {
-  const trimmedTokens = pins ? pinsTrimmed(pins) : 0
+  const trimmedTokens = pins ? pinsTrimmed(pins) + setsTrimmed(sets ?? []) : 0
   const empty = pins != null && pins.length === 0 && (sets == null || sets.length === 0)
   // Pins AND sets in ONE list, ordered by the server-curated `order` (#210): they share the
   // rank space, so a set can sit above a pin. Rendered as one DnD-reorderable list; the drag

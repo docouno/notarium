@@ -269,6 +269,29 @@ export const agentSessions: CaseSpec = {
       hits: [{ note: acknowledgedByRoot, score: 0.88 }],
       daysAgo: 0.05,
     })
+    // Two more labels for the owner, and nothing else: the Agent facet in the Activity
+    // aside is a flat list without pagination, so how many rows it has is a state of its
+    // own (#393) — five is where it stops fitting beside the Retrieval query above it.
+    // Retrievals are the only way to add one that costs no session and no write, both of
+    // which are counted whole by the assertions around this case.
+    b.retrieval({
+      owner: 'sergey',
+      principal: 'pat:Codex:seed',
+      agent: 'Codex',
+      tool: 'search',
+      query: 'rollout owner',
+      hits: [{ note: acknowledgedByRoot, score: 0.64 }],
+      daysAgo: 0.07,
+    })
+    b.retrieval({
+      owner: 'sergey',
+      principal: 'pat:Cursor:seed',
+      agent: 'Cursor',
+      tool: 'recall',
+      query: 'what changed in the migration',
+      hits: [],
+      daysAgo: 0.08,
+    })
 
     // Three deliberately divergent positions over the same project journal:
     // restored root sees two changes, fork sees one, a fresh session starts from

@@ -18,12 +18,7 @@ import {
 import { Notice } from '../../core/Notice'
 import { cx } from '../../libs/cx/cx'
 import { drainPages } from '../../libs/paging'
-import {
-  agentAbilityRoute,
-  agentActivityRoute,
-  agentRolesRoute,
-  agentSkillsRoute,
-} from '../../libs/routing/routePaths'
+import { agentAbilityRoute, agentActivityRoute } from '../../libs/routing/routePaths'
 import { api } from '../../services/api'
 import { TreeState, type TreeStatus } from '../../widgets/TreeState'
 import {
@@ -35,7 +30,6 @@ import {
 import { useAuth } from '../AuthProvider'
 import { useSpace } from '../SpaceProvider'
 import { ExplorerVirtualRows } from './ExplorerVirtualRows'
-import { hasPlacementsElsewhere } from './helpers/placementsElsewhere'
 import { MemoryTree } from './MemoryTree'
 import styles from './AgentsExplorer.module.scss'
 import tree from './Sidebar.module.scss'
@@ -226,7 +220,6 @@ export const AgentsExplorer = ({
               items: page.items,
               projects: page.projects,
               nextCursor: page.nextCursor,
-              truncated: page.truncated ?? false,
             }
           }
           const first = await read(cursor)
@@ -236,7 +229,6 @@ export const AgentsExplorer = ({
           }
           items.push(...first.items)
           const projects = previous?.projects ?? first.projects
-          const truncated = previous?.truncated ?? first.truncated ?? false
           const drained = await drainPages(read, {
             from: first.nextCursor,
             pages: wanted - loaded - 1,
@@ -256,7 +248,6 @@ export const AgentsExplorer = ({
             items,
             projects,
             nextCursor: drained.nextCursor,
-            truncated,
             pages: loaded + 1 + drained.read,
           })
         }
@@ -568,22 +559,6 @@ export const AgentsExplorer = ({
             )
           }}
         />
-        {/* The tree is the active Space; placements elsewhere are reached through
-            the global library rather than poured into a Space-scoped tree. */}
-        {hasPlacementsElsewhere({
-          truncated: abilities?.truncated ?? false,
-          activeSpaceId: scope?.spaceId ?? null,
-          personalSpaceId: personalSpace?.id ?? null,
-          spaces,
-        }) && (
-          <Link
-            className={styles.hint}
-            to={dataset === 'roles' ? agentRolesRoute() : agentSkillsRoute()}
-            data-testid="agents-explorer-elsewhere"
-          >
-            Placements in other Spaces →
-          </Link>
-        )}
         {continuationError && (
           <Notice
             variant="error"

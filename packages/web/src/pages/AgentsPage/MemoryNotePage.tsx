@@ -16,13 +16,14 @@ import { MetaPanel } from '../../widgets/MetaPanel'
 import { NotePage } from '../NotePage'
 import { AgentsPanel } from './AgentsPanel'
 import { useAgentsShell } from './AgentsProvider'
+import { AsidePlaceholder } from './AsidePlaceholder'
 import styles from './MemoryNotePage.module.scss'
 
 /** Agent-memory keeps the complete Agents shell while switching between reader
  * and the shared document editor. The selected Context scope rides in the URL,
  * so Save, Cancel, reload and canonical slug replacement cannot lose the rail. */
 export const MemoryNotePage = () => {
-  const { mode, note, folders } = useNotes()
+  const { mode, note, folders, navigating, noteError } = useNotes()
   const { canWrite } = useSpace()
   const editing = useEditing()
   const { actionsHost, setBreadcrumbTail } = useAgentsShell()
@@ -91,7 +92,34 @@ export const MemoryNotePage = () => {
             render: () => <MetaPanel note={readableMemory} />,
           },
         ]
-      : []
+      : // A note still arriving, a read that failed, a note of another class and a
+        // deleted one all land here — and none of them is a reason for the route to lose
+        // its aside. `panels` never goes empty, so the toggle stays and the content
+        // column keeps its width through every one of them (#393).
+        //
+        // `navigating` alone is not "still loading": the reader raises it from a passive
+        // effect, so the first commit under a new URL has neither the note nor the flag.
+        // A note that is simply absent without an error is still on its way; a read that
+        // failed says so, the way the neighbouring routes do.
+        [
+          {
+            id: 'details',
+            label: 'Details',
+            render: () =>
+              navigating || (!note && !noteError) ? (
+                <AsidePlaceholder loading />
+              ) : (
+                <AsidePlaceholder
+                  loading={false}
+                  blank={
+                    noteError
+                      ? 'This note didn’t open, so there is nothing to describe.'
+                      : 'This note has no memory details to show.'
+                  }
+                />
+              ),
+          },
+        ]
 
   return (
     <div className={styles.page} data-testid="memory-note-surface">
@@ -115,7 +143,7 @@ export const MemoryNotePage = () => {
       <AgentsPanel
         panels={panels}
         defaultLayout={[{ panels: ['details'], activeTab: 'details' }]}
-        label="Memory details"
+        label="memory details"
       />
     </div>
   )

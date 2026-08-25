@@ -897,3 +897,296 @@ test('agent context and note routes canonicalize legacy forms', async ({ page })
   await page.goto('/m/fake-deploy')
   await expect(page).toHaveURL(/\/n\/fake-deploy/)
 })
+
+// ── one aside per route, one owner per aside (#393) ──────────────────────────
+// The section's routes are one surface and have to agree on three things: the aside is
+// there, exactly one component owns it, and nothing inside it scrolls except the panel
+// body. All three are read as computed style and counts rather than as pixels — a nested
+// scroll box is pixel-identical in a screenshot and is only felt under a wheel.
+
+/** Every surface names its own panel, so the toggle's label is also the proof that the
+ *  route's OWN panel is the one mounted. Worded as a fenced alternation rather than
+ *  `/^(Open|Close) /`: below 720px the sidebar's own toggle reads `Close sidebar`, and a
+ *  bare prefix would match two buttons and fail on strictness instead of on the invariant. */
+const ASIDE_TOGGLE =
+  /^(Open|Close) (role|skill|context|library|activity|memory) (details|filters|panels)$/
+
+/** A gate every intercepted request waits on, opened once by the test. Deliberately ONE
+ *  promise for all of them: a per-request promise leaves the second request held forever,
+ *  and nothing releases it — `page.unroute` does not. */
+const openable = () => {
+  let open!: () => void
+  const held = new Promise<void>((release) => {
+    open = release
+  })
+
+  return { held, open: () => open() }
+}
+
+const asideState = (page: Page) =>
+  page.evaluate(() => {
+    const groups = document.querySelector('[data-testid="aside-groups"]')
+    const describe = (element: Element) =>
+      `${element.tagName.toLowerCase()}.${element.className || '(no class)'}`
+
+    const scrolls = (element: Element) => {
+      const overflowY = getComputedStyle(element).overflowY
+
+      return overflowY === 'auto' || overflowY === 'scroll'
+    }
+    // A native multi-line control scrolls its own value — that is the platform's box, not
+    // a layout box the panel put around a list, and the same is true everywhere else in
+    // the app. The invariant is about boxes WE nest, so the editor's description field is
+    // excluded by kind rather than by name.
+    const control = (element: Element) => element.tagName === 'TEXTAREA'
+    const panel = (element: Element) =>
+      element.getAttribute('role') === 'tabpanel' && !element.hasAttribute('hidden')
+    const inside = groups ? [...groups.querySelectorAll('*')].filter(scrolls) : []
+
+    return {
+      groups: document.querySelectorAll('[data-testid="aside-groups"]').length,
+      contentWidth: document.querySelector('[data-testid="content-scroll"]')?.clientWidth ?? 0,
+      owners: inside.filter(panel).length,
+      // Anything else that takes a wheel inside the aside — the thing this invariant is
+      // about. Reported by name so a failure says WHICH box came back.
+      nested: inside.filter((element) => !panel(element) && !control(element)).map(describe),
+    }
+  })
+
+const stopWidth = async (page: Page): Promise<number> => (await asideState(page)).contentWidth
+
+test('every route of the section keeps one aside, one owner and one scroller', async ({ page }) => {
+  await login(page, 'sam', 'sam-password-1')
+  const roleLocator = await ownedRoleLocator(page, 'research', 'personal')
+  // A draft is left open at the end of the walk; leaving it must not stall on a confirm.
+  page.on('dialog', (dialog) => void dialog.accept())
+
+  await page.goto('/agents/abilities/roles')
+  await expect(page.getByTestId('agents-roles')).toBeVisible()
+  await page.getByRole('button', { name: 'Open library filters' }).click()
+  await expect(page.getByTestId('aside-groups')).toBeVisible()
+
+  // The aside is ONE persisted preference, so it is opened once and everything below
+  // reads the same open aside on a different route.
+  const stop = async (aside: string): Promise<number> => {
+    const toggle = page.getByRole('button', { name: ASIDE_TOGGLE })
+    await expect(toggle).toHaveCount(1)
+    await expect(toggle).toHaveAccessibleName(`Close ${aside}`)
+
+    const state = await asideState(page)
+
+    const { contentWidth, ...invariant } = state
+
+    expect({ route: aside, ...invariant }).toEqual({
+      route: aside,
+      groups: 1,
+      owners: 1,
+      nested: [],
+    })
+    return contentWidth
+  }
+  const widths: Array<[string, number]> = [['library filters', await stop('library filters')]]
+
+  await page.getByTestId('agents-tab-context').click()
+  await expect(page.getByTestId('agents-context')).toBeVisible()
+  widths.push(['context details', await stop('context details')])
+
+  await page.getByTestId('agents-tab-activity').click()
+  widths.push(['activity panels', await stop('activity panels')])
+
+  await page.goto(`/agents/abilities/roles/owned/${encodeURIComponent(roleLocator)}`)
+  await expect(page.getByTestId('agent-ability-detail')).toBeVisible()
+  widths.push(['role details (card)', await stop('role details')])
+
+  // Editing the card hands the panel over to the editor surface. The handover is the one
+  // place where a page that kept its own panel would put TWO on screen — the shape the
+  // brief calls out by name — and `stop()` counts them.
+  await page.getByRole('button', { name: 'Edit', exact: true }).click()
+  await expect(page.getByTestId('ability-editor')).toBeVisible()
+  widths.push(['role details (card, editing)', await stop('role details')])
+  await page.getByRole('button', { name: 'Cancel', exact: true }).click()
+  await expect(page.getByTestId('agent-ability-detail')).toBeVisible()
+
+  await page.goto('/m/fake-project-memory/deploy-memory?context=docs')
+  await expect(page.getByTestId('memory-note-surface')).toBeVisible()
+  widths.push(['memory details', await stop('memory details')])
+
+  // The draft route is the one place where two components mount a panel in sequence — the
+  // page while the inventory lands, the editor surface after it. Both name the panel the
+  // same way, so a stop taken at an arbitrary moment cannot say which of the two it saw:
+  // the inventory read is held open, and the invariant is read on BOTH sides of it.
+  const inventory = openable()
+
+  await page.route('**/api/me/agent-skills?*', async (route) => {
+    await inventory.held
+    await route.continue()
+  })
+  await page.goto('/agents/abilities/roles')
+  await page.getByTestId('role-create').click()
+  await expect(page).toHaveURL(/\/agents\/abilities\/roles\/new\//)
+  await expect(page.getByTestId('aside-placeholder')).toBeVisible()
+  widths.push(['role details (draft, waiting)', await stop('role details')])
+  inventory.open()
+  await expect(page.getByTestId('ability-editor')).toBeVisible()
+  widths.push(['role details (draft, editing)', await stop('role details')])
+  await page.unroute('**/api/me/agent-skills?*')
+
+  // The point of the whole walk: the content column never resizes under the reader.
+  expect(new Set(widths.map(([, width]) => width)).size).toBe(1)
+  expect(widths.every(([, width]) => width > 0)).toBe(true)
+})
+
+test('the aside toggle keeps its place to the right of the page’s own actions', async ({
+  page,
+}) => {
+  await login(page, 'sam', 'sam-password-1')
+
+  // Read with the aside CLOSED — that is the only state where the toggle is in the topbar
+  // at all. The memory route is the one that exposed the order: its own action arrives
+  // with the note, i.e. after the panel has already mounted (#393).
+  await page.goto('/m/fake-project-memory/deploy-memory?context=docs')
+  await expect(page.getByTestId('memory-note-surface')).toBeVisible()
+
+  const edit = page.getByRole('button', { name: 'Edit', exact: true })
+  const separator = page.getByTestId('topbar-action-separator')
+  const toggle = page.getByRole('button', { name: 'Open memory details' })
+
+  await expect(edit).toBeVisible()
+  await expect(toggle).toBeVisible()
+
+  const [editBox, separatorBox, toggleBox] = await Promise.all([
+    edit.boundingBox(),
+    separator.boundingBox(),
+    toggle.boundingBox(),
+  ])
+
+  expect(editBox!.x).toBeLessThan(separatorBox!.x)
+  expect(separatorBox!.x).toBeLessThan(toggleBox!.x)
+})
+
+test('an ability keeps its aside and its width while reading, and after a failed read', async ({
+  page,
+}) => {
+  await login(page, 'sam', 'sam-password-1')
+  const roleLocator = await ownedRoleLocator(page, 'research', 'personal')
+  const card = `/agents/abilities/roles/owned/${encodeURIComponent(roleLocator)}`
+
+  await page.goto(card)
+  await expect(page.getByTestId('agent-ability-detail')).toBeVisible()
+  await page.getByRole('button', { name: 'Open role details' }).click()
+  const loaded = await stopWidth(page)
+
+  expect(loaded).toBeGreaterThan(0)
+
+  // The state the jump was measured in: the read is held open, so the page is a skeleton
+  // and the panel has nothing to describe yet. Both the toggle and the width are the
+  // loaded ones — that is the whole invariant.
+  //
+  // One gate for EVERY matching request, opened once. A handler that mints its own promise
+  // per request holds the second one forever — and this page re-reads whenever the section
+  // is invalidated, so a second request is not hypothetical. The route is registered before
+  // the navigation, or the read the test means to hold slips past it.
+  const gate = openable()
+
+  await page.route('**/api/me/agent-abilities/*', async (route) => {
+    await gate.held
+    await route.continue()
+  })
+  await page.goto(card)
+  await expect(page.getByTestId('ability-detail-skeleton')).toBeVisible()
+  await expect(page.getByRole('button', { name: ASIDE_TOGGLE })).toHaveAccessibleName(
+    'Close role details',
+  )
+  await expect(page.getByTestId('aside-placeholder')).toBeVisible()
+  expect(await stopWidth(page)).toBe(loaded)
+  gate.open()
+  await expect(page.getByTestId('agent-ability-detail')).toBeVisible()
+  await page.unroute('**/api/me/agent-abilities/*')
+
+  await page.route('**/api/me/agent-abilities/*', (route) =>
+    route.fulfill({ status: 500, json: { error: 'boom' } }),
+  )
+  await page.reload()
+  await expect(page.getByTestId('ability-error')).toBeVisible()
+  await expect(page.getByRole('button', { name: ASIDE_TOGGLE })).toHaveAccessibleName(
+    'Close role details',
+  )
+  await expect(page.getByTestId('aside-groups')).toHaveCount(1)
+  // The panel says which of the two it is, rather than going blank in both.
+  await expect(page.getByTestId('aside-placeholder')).toContainText('didn’t open')
+  expect(await stopWidth(page)).toBe(loaded)
+})
+
+test('a memory note that will not open keeps its aside and says which state it is in', async ({
+  page,
+}) => {
+  await login(page, 'sam', 'sam-password-1')
+
+  const memory = '/m/fake-project-memory/deploy-memory?context=docs'
+
+  await page.goto(memory)
+  await expect(page.getByTestId('memory-note-surface')).toBeVisible()
+  await page.getByRole('button', { name: 'Open memory details' }).click()
+  const loaded = await stopWidth(page)
+
+  expect(loaded).toBeGreaterThan(0)
+
+  // Held, not failed: the panel reserves its shape rather than announcing that a note it
+  // has not read has nothing to show (#393).
+  const gate = openable()
+
+  await page.route('**/api/note?*', async (route) => {
+    await gate.held
+    await route.continue()
+  })
+  await page.goto(memory)
+  await expect(page.getByTestId('aside-placeholder')).toBeVisible()
+  await expect(page.getByTestId('aside-placeholder')).toHaveText('')
+  expect(await stopWidth(page)).toBe(loaded)
+  gate.open()
+  await expect(page.getByRole('heading', { name: 'deploy-memory' })).toBeVisible()
+  await page.unroute('**/api/note?*')
+
+  await page.route('**/api/note?*', (route) => route.fulfill({ status: 500, json: { error: 'x' } }))
+  await page.goto(memory)
+  await expect(page.getByTestId('aside-placeholder')).toContainText('didn’t open')
+  await expect(page.getByRole('button', { name: ASIDE_TOGGLE })).toHaveAccessibleName(
+    'Close memory details',
+  )
+  expect(await stopWidth(page)).toBe(loaded)
+})
+
+test('the Context details panel witnesses the scope and commands nothing', async ({ page }) => {
+  await login(page, 'sam', 'sam-password-1')
+
+  await page.goto('/agents/context')
+  await expect(page.getByTestId('agents-context')).toBeVisible()
+  await page.getByRole('button', { name: 'Open context details' }).click()
+  const panel = page.getByTestId('context-details')
+  await expect(panel).toBeVisible()
+  // Addressed by field LABEL: `AsideField` has no testId of its own, and counting
+  // anonymous nodes would pass just as happily on the wrong three.
+  await expect(panel.getByText('Effective role', { exact: true })).toBeVisible()
+  await expect(panel.getByText('Composition', { exact: true })).toBeVisible()
+  await expect(panel.getByText('Auto', { exact: true })).toHaveCount(0)
+  await expect(panel.getByRole('button')).toHaveCount(0)
+  await expect(panel.getByRole('link')).toHaveCount(0)
+
+  await page.getByTestId('context-role-selector').click()
+  await page
+    .getByRole('group', { name: 'Personal' })
+    .getByRole('menuitemradio', { name: 'Research' })
+    .click()
+  await expect(panel.getByText('Placement', { exact: true })).toBeVisible()
+  // The role document is the single way out of a panel that is otherwise a witness.
+  await expect(panel.getByRole('link')).toHaveCount(1)
+  await expect(panel.getByRole('button')).toHaveCount(0)
+
+  await page.goto('/s/main')
+  await page.getByRole('link', { name: 'Agents' }).click()
+  await page.getByTestId('agents-tab-context').click()
+  await page.getByTestId('context-scope-tab-docs').click()
+  await expect(page).toHaveURL(/\/agents\/context\/docs$/)
+  await expect(panel.getByText('Auto', { exact: true })).toBeVisible()
+  await expect(panel.getByRole('button')).toHaveCount(0)
+})

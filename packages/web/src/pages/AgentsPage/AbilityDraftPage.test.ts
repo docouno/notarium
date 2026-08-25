@@ -20,6 +20,7 @@ const editorStub = {
 }
 
 const harness = vi.hoisted(() => ({
+  panels: [] as Array<{ panels: number; label: string }>,
   loadSkillInventory: vi.fn(),
   api: {
     agentRolesGet: vi.fn(),
@@ -61,6 +62,33 @@ vi.mock('../../composers/SpaceProvider', () => ({
 vi.mock('./AgentsProvider', () => ({
   useAgentsShell: () => ({ actionsHost: null, setBreadcrumbTail: () => {} }),
 }))
+// The panel is the shell's adapter, not this page's subject: it reads `useChrome`, which
+// throws outside its provider, and `useAgentsShell`, which this file stubs down to the two
+// members the page itself uses. The stub records what the page asked it to host, so "the
+// route keeps its aside in every state" (#393) is assertable here.
+vi.mock('./AgentsPanel', async () => {
+  const { useEffect, useRef } = await import('react')
+
+  return {
+    AgentsPanel: (props: { panels: unknown[]; label: string }) => {
+      // Every LIVE panel, not the last one seen: one record cannot tell one panel from two
+      // mounted at once. The record is kept CURRENT on every render — a route that starts
+      // with a panel and later hands over an empty array would otherwise read as healthy —
+      // and removed by identity when this panel actually goes away.
+      const mine = useRef({ panels: props.panels.length, label: props.label }).current
+
+      mine.panels = props.panels.length
+      mine.label = props.label
+      useEffect(() => {
+        harness.panels.push(mine)
+        return () => {
+          harness.panels = harness.panels.filter((entry) => entry !== mine)
+        }
+      }, [mine])
+      return null
+    },
+  }
+})
 vi.mock('./AbilityEditorSurface', async () => {
   const { createElement: h } = await import('react')
 
@@ -159,9 +187,15 @@ describe('the new-ability page', () => {
 
     harness.loadSkillInventory.mockReturnValueOnce(seeding.promise)
     harness.params = { kind: 'roles', draftId: 'y' }
+    harness.panels = []
     await render()
 
     expect(editor()).toBeNull()
+    // No editor yet, but the route still owns an aside — otherwise the content column
+    // would resize under the reader between the two (#393). The surface is stubbed in this
+    // file, so "one panel, not two" is an e2e question; what is asserted here is that the
+    // page mounts one at all, with the route's own label.
+    expect(harness.panels).toEqual([{ panels: 1, label: 'role details' }])
 
     await act(async () => {
       seeding.resolve(inventory())

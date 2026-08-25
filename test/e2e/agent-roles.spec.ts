@@ -95,13 +95,16 @@ const setAbilityInstructions = async (page: Page, instructions: string) => {
 }
 
 /** The global right-aside is a PERSISTED preference, and this is its storage key
- *  (`STORAGE_KEYS.asideOpen`). Read rather than guessed from the DOM on purpose:
- *  the aside and its opener are mutually exclusive, both are portaled into hosts a
- *  page mounts as `null`, and a page with no panels yet renders NEITHER — so two
- *  consecutive DOM reads can straddle a frame in which the aside vanished. A helper
- *  that samples that frame while the aside is open goes on to click an opener that
- *  will never be rendered again, and waits out the whole timeout. The preference has
- *  no such frame: nothing but this spec's own clicks ever changes it. */
+ *  (`STORAGE_KEYS.asideOpen`). Read rather than guessed from the DOM on purpose: the
+ *  aside and its opener are mutually exclusive and both are portaled into hosts a page
+ *  mounts as `null`, so two consecutive DOM reads can straddle a frame in which neither
+ *  is painted. A helper that samples such a frame goes on to click an opener that is not
+ *  there yet and waits out the whole timeout. The preference has no such frame: nothing
+ *  but this spec's own clicks ever changes it.
+ *
+ *  Since #393 a route of this section no longer goes panel-less: every state, including
+ *  the skeleton and the error screen, mounts one. `AgentsPanel`'s empty-`panels` guard
+ *  stays as a guard, not as a state any route of the section reaches. */
 const ABILITY_ASIDE_PREFERENCE = 'bm-aside'
 
 /** Leave the ability aside open, whatever it was doing when we arrived. */

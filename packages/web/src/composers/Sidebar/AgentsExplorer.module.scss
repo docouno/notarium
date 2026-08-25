@@ -1,24 +1,11 @@
 /* The Agents explorer wears the file tree's row classes (Sidebar.module.scss), the
  * same way MemoryTree does — groups are ordinary collapsible tree rows, not a local
- * caption skin. This file only styles what sits BELOW the list: the bounded-view
- * hint, the continuation sentinel and the pointer to the global library. */
-.hint,
+ * caption skin. This file only styles what sits BELOW the list: the continuation
+ * sentinel and its failure notice. */
 .sentinel,
-
 .page-error {
   margin: 8px;
   font-size: 11px;
-}
-
-/* The way out of the scope: quiet by default, a link when reached for. */
-.hint {
-  display: block;
-  color: var(--text-faint);
-  text-decoration: none;
-}
-
-.hint:hover {
-  color: var(--text);
 }
 
 .sentinel {

@@ -59,9 +59,8 @@ always present), that Space, its Projects, then System and Catalog — in that o
 closest to the user first. The request carries the exact `spaceId`, and the server
 applies it BEFORE the global location cap, so the Space the user is in is listed whole
 instead of competing with every readable Space for one bounded scan. Placements
-elsewhere are reached through the global library, which stays unscoped; the explorer
-links to it rather than pouring other Spaces into the tree. Sessions remain the one
-owner-global dataset.
+elsewhere are reached through the global library on the Abilities tab, which stays
+unscoped. Sessions remain the one owner-global dataset.
 
 Groups are ordinary collapsible tree rows — the same rows the Memory dataset uses,
 with a chevron, a scope icon (Personal / Space / Project / System / Catalog) and the

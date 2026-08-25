@@ -43,6 +43,29 @@ const SKILL_TITLES = [
   ['budget-watch', 'Budget watch', 'Notice a cost before the invoice does.'],
 ] as const
 
+/** Projects nobody placed an ability in — they exist to give the library aside's Project
+ *  facet its real LENGTH. The facet has no pagination and no scroller of its own (#393),
+ *  so how many rows it has IS a state: at twenty-one, the sections above it scroll out of
+ *  the aside, which is what the owner's own instance does and what no other case shows.
+ *  They carry no roles on purpose — placement groups are asserted whole. */
+const FACET_PROJECTS = [
+  ['analytics', 'Analytics'],
+  ['billing', 'Billing'],
+  ['brand', 'Brand'],
+  ['data-platform', 'Data platform'],
+  ['design-system', 'Design system'],
+  ['docs', 'Docs'],
+  ['growth', 'Growth'],
+  ['infra', 'Infra'],
+  ['integrations', 'Integrations'],
+  ['onboarding', 'Onboarding'],
+  ['payments', 'Payments'],
+  ['pricing', 'Pricing'],
+  ['search', 'Search'],
+  ['support', 'Support'],
+  ['sync', 'Sync'],
+] as const
+
 export const agentAbilitiesRich: CaseSpec = {
   name: 'agent-abilities-rich',
   description:
@@ -60,6 +83,10 @@ export const agentAbilitiesRich: CaseSpec = {
     b.project({ space: 'product', path: 'api', slug: 'api', displayName: 'API' })
     b.project({ space: 'product', path: 'mobile', slug: 'mobile', displayName: 'Mobile' })
     b.project({ space: 'product', path: 'legacy', slug: 'legacy', displayName: 'Legacy' })
+
+    for (const [slug, displayName] of FACET_PROJECTS) {
+      b.project({ space: 'product', path: slug, slug, displayName })
+    }
 
     b.user({ username: 'sergey', password: 'sergey', displayName: 'Sergey', admin: true })
     b.user({ username: 'maya', password: 'maya', displayName: 'Maya' })
@@ -162,7 +189,7 @@ export const agentAbilitiesRich: CaseSpec = {
       target: { kind: 'space', space: 'product' },
     })
     // One role, three V18 states at once (#309): a Space base narrowed to two of the
-    // Space's five projects, and its own version in one of them. The card must show a single
+    // Space's projects, and its own version in one of them. The card must show a single
     // entry with its versions hanging off it — two same-name cards read as a
     // duplicate bug, which is what this state used to look like.
     b.agentRole({

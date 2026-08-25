@@ -559,7 +559,7 @@ test('flat-stream skeleton has the loaded row geometry', async ({ page }) => {
   expect(skeletonHeight).toBe(loadedHeight)
 })
 
-test('agent facet stays visible, compact and URL-restorable', async ({ page }) => {
+test('agent facet stays visible and URL-restorable', async ({ page }) => {
   await login(page)
   await page.goto('/agents/activity?group=session')
   const openPanels = page.getByRole('button', { name: 'Open activity panels' })
@@ -571,7 +571,11 @@ test('agent facet stays visible, compact and URL-restorable', async ({ page }) =
   const agentList = facet.getByTestId('activity-agent-list')
   const claude = agentList.getByTitle('Claude')
   await expect(agentList).toBeVisible()
-  await expect(agentList).toHaveCSS('max-height', '128px')
+  // The facet has no box of its own since #393: the wheel over it moves the aside, not a
+  // list inside a list. Read as computed style, because that is the whole difference —
+  // a nested scroller is pixel-identical in a screenshot.
+  await expect(agentList).toHaveCSS('overflow-y', 'visible')
+  await expect(agentList).toHaveCSS('max-height', 'none')
   await expect(page.getByTestId('activity-query-filter')).toBeVisible()
   expect(
     await page

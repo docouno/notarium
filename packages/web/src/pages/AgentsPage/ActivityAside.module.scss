@@ -80,10 +80,3 @@
   gap: 10px;
   padding: 12px var(--gutter);
 }
-
-.agent-list {
-  max-height: 128px;
-  min-height: 0;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-}

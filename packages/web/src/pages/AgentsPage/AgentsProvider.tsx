@@ -87,6 +87,11 @@ export const useAgentsSummary = (): AgentsSummary => useContext(AgentsSummaryCon
 
 type AgentsShellSlots = {
   actionsHost: HTMLElement | null
+  /** The aside toggle's own slot, kept to the RIGHT of the page's actions. Two hosts
+   *  rather than one, because a portal appends its children when it MOUNTS: a page whose
+   *  actions arrive with its data (every state-bearing route since #393) would otherwise
+   *  land them past a toggle that mounted with the panel a moment earlier. */
+  toggleHost: HTMLElement | null
   asideHost: HTMLElement | null
   setContentInert: (inert: boolean) => void
   setBreadcrumbTail: (tail: Crumb | null) => void
@@ -94,6 +99,7 @@ type AgentsShellSlots = {
 
 const AgentsShellContext = createContext<AgentsShellSlots>({
   actionsHost: null,
+  toggleHost: null,
   asideHost: null,
   setContentInert: () => {},
   setBreadcrumbTail: () => {},
@@ -114,6 +120,7 @@ export const AgentsChrome = () => {
   const { projects } = useProjects()
   const { revealNatural, scope, versions } = useAgentsExplorer()
   const [actionsHost, setActionsHost] = useState<HTMLElement | null>(null)
+  const [toggleHost, setToggleHost] = useState<HTMLElement | null>(null)
   const [asideHost, setAsideHost] = useState<HTMLElement | null>(null)
   const [contentInert, setContentInert] = useState(false)
   const [breadcrumbTail, setBreadcrumbTailState] = useState<{
@@ -350,11 +357,16 @@ export const AgentsChrome = () => {
   return (
     <AgentsSummaryContext.Provider value={{ ...summary, updateContext }}>
       <AgentsShellContext.Provider
-        value={{ actionsHost, asideHost, setContentInert, setBreadcrumbTail }}
+        value={{ actionsHost, toggleHost, asideHost, setContentInert, setBreadcrumbTail }}
       >
         <PageFrame
           topbarLeft={<Breadcrumbs trail={trail} spaceLess />}
-          topbarActions={<div ref={setActionsHost} style={{ display: 'contents' }} />}
+          topbarActions={
+            <>
+              <div ref={setActionsHost} style={{ display: 'contents' }} />
+              <div ref={setToggleHost} style={{ display: 'contents' }} />
+            </>
+          }
           aside={<div ref={setAsideHost} style={{ display: 'contents' }} />}
           contentInert={contentInert}
         >

@@ -26,6 +26,8 @@ type DialogProps = {
 }
 
 const harness = vi.hoisted(() => ({
+  panels: [] as Array<{ panels: number; label: string }>,
+  mounts: 0,
   api: {
     agentAbilityGet: vi.fn(),
     agentAbilitySave: vi.fn(),
@@ -109,7 +111,35 @@ vi.mock('./AbilityEditorSurface', async () => {
     AbilityEditorSurface: () => h('div', { 'data-testid': 'ability-editor-surface' }),
   }
 })
-vi.mock('./AgentsPanel', () => ({ AgentsPanel: () => null }))
+// The panel is the shell's adapter, not this page's subject: it reads `useChrome`, which
+// throws outside its provider. The stub records what the page asked it to host and clears
+// that record when the panel actually goes away, so "the route keeps its aside in every
+// state" (#393) is assertable here rather than only in a browser.
+vi.mock('./AgentsPanel', async () => {
+  const { useEffect, useRef } = await import('react')
+
+  return {
+    AgentsPanel: (props: { panels: unknown[]; label: string }) => {
+      // Every LIVE panel, not the last one seen: one record cannot tell one panel from two
+      // mounted at once. The record is kept CURRENT on every render — a route that starts
+      // with a panel and later hands over an empty array would otherwise read as healthy —
+      // and removed by identity when this panel actually goes away. `mounts` counts
+      // mountings, so a panel torn down and rebuilt between two states is visible as such.
+      const mine = useRef({ panels: props.panels.length, label: props.label }).current
+
+      mine.panels = props.panels.length
+      mine.label = props.label
+      useEffect(() => {
+        harness.panels.push(mine)
+        harness.mounts += 1
+        return () => {
+          harness.panels = harness.panels.filter((entry) => entry !== mine)
+        }
+      }, [mine])
+      return null
+    },
+  }
+})
 vi.mock('./AbilityActionsMenu', () => ({
   AbilityActionsMenu: (props: MenuProps) => {
     harness.menu = props
@@ -237,7 +267,7 @@ describe('the ability page', () => {
   let root: Root
   let gone: boolean
 
-  const render = (props: Parameters<typeof AbilityDetailPage>[0] = {}) =>
+  const render = (props: Partial<Parameters<typeof AbilityDetailPage>[0]> = {}) =>
     act(async () =>
       root.render(
         createElement(AbilityDetailPage, {
@@ -559,11 +589,41 @@ describe('the ability page', () => {
   // boundary above it replaces the entire Agents surface with the crash screen.
   it('answers a malformed bundled address with its own error state', async () => {
     harness.params = { packageId: 'foo' }
+    harness.panels = []
     await render({ expectedKind: 'role', expectedSource: 'system' })
 
     expect(document.querySelector('[data-testid="ability-error"]')).not.toBeNull()
     expect(document.body.textContent).toContain('Invalid ability address.')
     expect(harness.api.agentAbilityGet).not.toHaveBeenCalled()
+    // The aside belongs to the route, so the error screen keeps it — with the route's own
+    // label, which exists before any ability does (#393).
+    expect(harness.panels).toEqual([{ panels: 1, label: 'role details' }])
+  })
+
+  // The state the brief measured the jump in: the content column must not resize while
+  // the read is in flight, which it cannot do unless the panel is already there.
+  it('holds the aside open while the ability is still being read', async () => {
+    const pending = deferred<AgentAbilityDetailResponse>()
+
+    harness.api.agentAbilityGet.mockImplementationOnce(() => pending.promise)
+    address('Reviewer1234')
+    // `mounts` only ever grows, so it is the one that needs clearing; the live-panel array
+    // empties itself when the previous case unmounts its root.
+    harness.mounts = 0
+    await render()
+
+    expect(document.querySelector('[data-testid="ability-detail-skeleton"]')).not.toBeNull()
+    expect(harness.panels).toEqual([{ panels: 1, label: 'role details' }])
+
+    await act(async () => {
+      pending.resolve(detailOf('Reviewer1234'))
+    })
+
+    expect(document.querySelector('[data-testid="agent-ability-detail"]')).not.toBeNull()
+    expect(harness.panels).toEqual([{ panels: 1, label: 'role details' }])
+    // Once, not twice: the skeleton and the loaded card hold the SAME panel. A rebuilt one
+    // would re-focus the drawer and reset its scroll on a narrow viewport (#393).
+    expect(harness.mounts).toBe(1)
   })
 
   // Arriving at a freshly created version opens its draft before this page has ever
