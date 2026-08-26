@@ -114,8 +114,8 @@ export type ToolListing = {
   name: ToolName
   description: string
   annotations: ToolAnnotations
-  input: z.AnyZodObject
-  output: z.AnyZodObject
+  input: z.ZodObject
+  output: z.ZodObject
 }
 
 /** CallToolResult (structural subset): Markdown text + machine-readable

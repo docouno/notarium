@@ -87,12 +87,12 @@ export const UseRoleOutputSchema = z.object({
 export const UseSkillInputSchema = z
   .object({
     ...sessionField,
-    skill: RoleNameSchema.describe(
+    skill: RoleNameSchema.optional().describe(
       'Canonical standalone-skill selector. Provide exactly one of `skill` or compatibility alias `name`.',
-    ).optional(),
-    name: RoleNameSchema.describe(
+    ),
+    name: RoleNameSchema.optional().describe(
       'Compatibility alias for `skill`. Provide exactly one of `skill` or `name`, never both.',
-    ).optional(),
+    ),
     project: ProjectHandleSchema.optional(),
     budgetTokens: z.number().int().min(100).max(16_000).default(4_000),
   })

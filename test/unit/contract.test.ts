@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest'
 import {
+  ActivityEventsQuerySchema,
   AddAgentRoleRequestSchema,
   AddAgentRoleResponseSchema,
   AddAgentSkillRequestSchema,
   AddAgentSkillResponseSchema,
   AgentAbilityDetailResponseSchema,
+  AgentAuditQuerySchema,
   AgentContextQuerySchema,
   AgentPackageLibraryQuerySchema,
   AgentSessionEventsQuerySchema,
@@ -21,6 +23,7 @@ import {
   ErrorResponseSchema,
   GraphNodeSchema,
   GraphResponseSchema,
+  JobSchema,
   MarkProjectRequestSchema,
   MeAgentContextResponseSchema,
   MeAgentRolesResponseSchema,
@@ -33,6 +36,7 @@ import {
   MuteNoteRequestSchema,
   MuteNoteResponseSchema,
   NoteDetailResponseSchema,
+  NoteRevisionsQuerySchema,
   NotesQuerySchema,
   NotesResponseSchema,
   PatchProjectRequestSchema,
@@ -60,12 +64,14 @@ import {
   SetAgentAbilityEnabledResponseSchema,
   SpaceSlugSchema,
   SpacesResponseSchema,
+  TrashQuerySchema,
   TrashRestoreManyRequestSchema,
   TrashRestoreManyResponseSchema,
   TreeChildrenQuerySchema,
   TreeChildrenResponseSchema,
   UpdateNoteRequestSchema,
 } from '@notarium/contract'
+import { RecallInputSchema, RoleSelectorSchema } from '@notarium/contract/tools'
 
 // These tests give the /api/* contract teeth: they pin the v2 shapes (#54 —
 // camelCase, note-ids, ISO instants, no permalink) by validating
@@ -89,6 +95,178 @@ describe('GET /api/me/agent-sessions/:id query', () => {
   it('rejects NUL before binding text filters to a database driver', () => {
     expect(AgentSessionEventsQuerySchema.safeParse({ q: 'before\0after' }).success).toBe(false)
     expect(AgentSessionEventsQuerySchema.safeParse({ agent: 'CLI\0hidden' }).success).toBe(false)
+  })
+})
+
+describe('zod 4 migration boundaries', () => {
+  it('matches the static zod 3 REST coercion/preprocess baseline on 25 ordinary inputs', () => {
+    const defaults = { sort: 'modified', offset: 0, depth: 'subtree', tz: 0 }
+    const cases: Array<{
+      name: string
+      input: Record<string, unknown>
+      expected: false | Record<string, unknown>
+    }> = [
+      { name: 'empty object', input: {}, expected: defaults },
+      { name: 'offset empty', input: { offset: '' }, expected: defaults },
+      { name: 'offset text', input: { offset: 'abc' }, expected: false },
+      { name: 'offset null', input: { offset: null }, expected: defaults },
+      { name: 'offset boolean', input: { offset: true }, expected: { ...defaults, offset: 1 } },
+      { name: 'offset array', input: { offset: [] }, expected: defaults },
+      { name: 'offset float', input: { offset: '1.5' }, expected: false },
+      { name: 'limit empty', input: { limit: '' }, expected: false },
+      { name: 'limit text', input: { limit: 'abc' }, expected: false },
+      { name: 'limit null', input: { limit: null }, expected: false },
+      { name: 'limit boolean', input: { limit: true }, expected: { ...defaults, limit: 1 } },
+      { name: 'limit array', input: { limit: [] }, expected: false },
+      { name: 'limit float', input: { limit: '1.5' }, expected: false },
+      {
+        name: 'folders scalar',
+        input: { folders: 'docs' },
+        expected: { ...defaults, folders: ['docs'] },
+      },
+      {
+        name: 'folders array',
+        input: { folders: ['docs', 'work'] },
+        expected: { ...defaults, folders: ['docs', 'work'] },
+      },
+      { name: 'folders empty', input: { folders: [] }, expected: { ...defaults, folders: [] } },
+      { name: 'tags scalar', input: { tags: 'red' }, expected: { ...defaults, tags: ['red'] } },
+      {
+        name: 'tags array',
+        input: { tags: ['red', 'blue'] },
+        expected: { ...defaults, tags: ['red', 'blue'] },
+      },
+      { name: 'tags empty', input: { tags: [] }, expected: { ...defaults, tags: [] } },
+      { name: 'timezone empty', input: { tz: '' }, expected: defaults },
+      { name: 'timezone text', input: { tz: 'abc' }, expected: false },
+      { name: 'timezone null', input: { tz: null }, expected: defaults },
+      { name: 'timezone boolean', input: { tz: true }, expected: { ...defaults, tz: 1 } },
+      { name: 'timezone array', input: { tz: [] }, expected: defaults },
+      { name: 'timezone float', input: { tz: '1.5' }, expected: false },
+    ]
+
+    expect(cases).toHaveLength(25)
+    for (const { name, input, expected } of cases) {
+      const result = NotesQuerySchema.safeParse(input)
+      expect(result.success, name).toBe(expected !== false)
+      if (result.success && expected !== false) {
+        expect(result.data, name).toEqual(expected)
+      }
+    }
+  })
+
+  it('keeps the approved safe-integer narrowing on MCP and every unbounded REST offset', () => {
+    const unsafeInteger = Number.MAX_SAFE_INTEGER + 1
+    const restOffsetSchemas = [
+      NotesQuerySchema,
+      TrashQuerySchema,
+      NoteRevisionsQuerySchema,
+      TreeChildrenQuerySchema,
+      ActivityEventsQuerySchema,
+      AgentAuditQuerySchema,
+    ]
+
+    for (const schema of restOffsetSchemas) {
+      const result = schema.safeParse({ offset: String(unsafeInteger) })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        expect(result.error.issues).toContainEqual(
+          expect.objectContaining({ code: 'too_big', maximum: Number.MAX_SAFE_INTEGER }),
+        )
+      }
+    }
+
+    const recall = RecallInputSchema.safeParse({ query: 'q', maxPerSource: unsafeInteger })
+    expect(recall.success).toBe(false)
+    if (!recall.success) {
+      expect(recall.error.issues).toContainEqual(
+        expect.objectContaining({ code: 'too_big', maximum: Number.MAX_SAFE_INTEGER }),
+      )
+    }
+  })
+
+  it('requires Job.result because every wire producer emits the key', () => {
+    const withoutResult = {
+      id: 'job-1',
+      kind: 'export',
+      status: 'pending',
+      progress: { done: 0, total: null, ratio: null, phase: null },
+      artifact: null,
+      error: null,
+      createdAt: '2026-08-25T00:00:00.000Z',
+      updatedAt: '2026-08-25T00:00:00.000Z',
+      completedAt: null,
+    }
+
+    const missing = JobSchema.safeParse(withoutResult)
+    expect(missing.success).toBe(false)
+    if (!missing.success) {
+      expect(missing.error.issues).toContainEqual(
+        expect.objectContaining({ code: 'invalid_type', path: ['result'] }),
+      )
+    }
+    expect(JobSchema.safeParse({ ...withoutResult, result: null }).success).toBe(true)
+  })
+
+  it('keeps all seven custom diagnostics and their paths exact', () => {
+    const cases = [
+      {
+        result: RoleSelectorSchema.safeParse({}),
+        expected: { code: 'custom', path: [], message: 'provide exactly one of role or name' },
+      },
+      {
+        result: DurableScalarSchema.safeParse('ok\0bad'),
+        expected: {
+          code: 'custom',
+          path: [],
+          message: 'must not contain a control character (U+0000 at line 1, column 3)',
+        },
+      },
+      {
+        result: UpdateNoteRequestSchema.safeParse({
+          originalId: 'note-1',
+          versionToken: 'v1',
+          attachments: [],
+        }),
+        expected: {
+          code: 'custom',
+          path: [],
+          message: 'abilityLocator and attachments must be passed together',
+        },
+      },
+      {
+        result: AddAgentRoleRequestSchema.safeParse({ name: 'review', scope: 'project' }),
+        expected: { code: 'custom', path: ['project'], message: 'project is required' },
+      },
+      {
+        result: AddAgentRoleRequestSchema.safeParse({
+          name: 'review',
+          scope: 'personal',
+          project: 'main',
+        }),
+        expected: {
+          code: 'custom',
+          path: ['project'],
+          message: 'project is only valid for project scope',
+        },
+      },
+      {
+        result: AgentSessionEventsQuerySchema.safeParse({ tool: 'search' }),
+        expected: { code: 'custom', path: [], message: 'tool requires q' },
+      },
+      {
+        result: AgentSessionEventsQuerySchema.safeParse({ q: 'query', filter: 'writes' }),
+        expected: { code: 'custom', path: [], message: 'query filter only applies to reads' },
+      },
+    ]
+
+    expect(cases).toHaveLength(7)
+    for (const { result, expected } of cases) {
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        expect(result.error.issues).toEqual([expect.objectContaining(expected)])
+      }
+    }
   })
 })
 

@@ -23,5 +23,5 @@ export const AgentSessionIdSchema = z.string().regex(/^ses_[A-Za-z0-9_-]{12}$/)
 /** Every auditable/delta-relevant tool carries this field. Batch tools attach once
  * at the outer call, never per item. whoami/get_my_projects deliberately omit it. */
 export const sessionField = {
-  session: AgentSessionIdSchema.describe('the sessionId from start_session').optional(),
+  session: AgentSessionIdSchema.optional().describe('the sessionId from start_session'),
 }

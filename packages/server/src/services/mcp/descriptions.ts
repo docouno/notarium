@@ -326,11 +326,11 @@ export const TOOL_META = {
   },
 } as const satisfies Record<string, ToolMeta>
 
-/** The MCP `serverInfo` (returned in `initialize`). */
-export const SERVER_INFO = { name: 'notarium', version: '0.11.0' } as const
+/** The MCP server identity. */
+export const SERVER_INFO = { name: 'notarium', version: '0.12.0' } as const
 
-/** The server `instructions` text (returned in `initialize`) — the main lever on
- *  call ordering; keep it a STATIC literal (no note content) and under ~200 words. */
+/** The server `instructions` text — the main lever on call ordering; keep it a
+ *  STATIC literal (no note content) and under ~200 words. */
 export const SERVER_INSTRUCTIONS = [
   'Call `start_session` first. When it returns `session.id`, retain that id and pass it as the top-level `session` argument on every subsequent tool call. Notarium is your knowledge workspace; the bootstrap also loads your profile, projects, activation-ready roles and skills, and what changed since you last looked. If it returns `nextAction`, follow that exact `list_abilities` call before ability activation or answering. Activate a matching role with `use_role` and a matching standalone skill with `use_skill`.',
   'Search before you write: `search` finds existing notes — and now your own agent-memory too — so you do not create duplicates. To browse structure use `list_notes` (an `ls` of a folder) and `recent_activity` (the latest changes).',

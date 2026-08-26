@@ -32,7 +32,7 @@ export const NoteDetailResponseSchema = z.object({
    *  the package's manifest name, which remains the note identity label. */
   documentTitle: z.string().optional(),
   content: z.string(),
-  frontmatter: z.record(z.unknown()),
+  frontmatter: z.record(z.string(), z.unknown()),
   /** The editable display slug, lifted from frontmatter `slug:`; the
    *  client builds the canonical `/n/<id>/<slug>` URL from it. Absent when the
    *  note has no custom slug (the URL tail then derives from the title). */

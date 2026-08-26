@@ -71,7 +71,7 @@ export const GetNoteOutputSchema = z.object({
   noteId: z.string(),
   title: z.string(),
   content: z.string(),
-  frontmatter: z.record(z.unknown()),
+  frontmatter: z.record(z.string(), z.unknown()),
   ...locationFields,
   class: NoteClassSchema.optional(),
   versionToken: z.string(),

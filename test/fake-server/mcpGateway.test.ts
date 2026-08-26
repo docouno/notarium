@@ -1,6 +1,6 @@
 // The MCP gateway leg of the conformance pack (#21, stage 3): the agent-facing
 // JSON-RPC tool surface at /mcp, exercised over a REAL socket (app.listen +
-// fetch) so the official @modelcontextprotocol/sdk transport runs end to end —
+// fetch) so the official MCP server/node transports run end to end —
 // the same streamable-HTTP path a hosted agent (Claude API MCP connector)
 // drives. Like the REST conformance legs, it runs over the PRODUCTION buildApp +
 // AuthService + chokepoint; only the engine and persistence are swapped (#18).
@@ -13,12 +13,17 @@
 // token, none-mode running the system principal.
 
 import type { FastifyInstance } from 'fastify'
+import { readFile } from 'node:fs/promises'
 import type { AddressInfo } from 'node:net'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { decodeAbilityLocator, encodeWikilinkIdentity, sha256Hex } from '@notarium/core'
 import { deterministicNoteId } from '@notarium/engine-memory'
 import type { MutationGate } from '@notarium/server'
 
+import {
+  SERVER_INFO,
+  SERVER_INSTRUCTIONS,
+} from '../../packages/server/src/services/mcp/descriptions'
 import { createApp, type Fixture } from './app.js'
 import { InMemoryProjects } from './projects.js'
 import { InMemoryRetrievalLog } from './retrievalLog.js'
@@ -134,7 +139,16 @@ afterEach(async () => {
   await app.close()
 })
 
-type Rpc = { result?: Record<string, unknown>; error?: { code: number; message: string } }
+type Rpc = {
+  result?: Record<string, unknown>
+  error?: { code: number; message: string; data?: unknown }
+}
+
+const MODERN_PROTOCOL_VERSION = '2026-07-28'
+const MODERN_PROTOCOL_META_KEY = 'io.modelcontextprotocol/protocolVersion'
+const MODERN_CLIENT_INFO_META_KEY = 'io.modelcontextprotocol/clientInfo'
+const MODERN_CLIENT_CAPABILITIES_META_KEY = 'io.modelcontextprotocol/clientCapabilities'
+const MODERN_SERVER_INFO_META_KEY = 'io.modelcontextprotocol/serverInfo'
 
 /** One JSON-RPC POST to /mcp. Stateless: each call is independent, so a
  *  tools/list or tools/call needs no prior initialize on the wire. */
@@ -156,6 +170,55 @@ const rpc = async (
   return { status: res.status, json }
 }
 
+/** One 2026-07-28 request with its per-request envelope and standard headers.
+ * Unlike rpc, non-200 JSON bodies remain visible for protocol-ladder assertions. */
+const modernRpc = async (
+  p: number,
+  body: { method: string; params?: Record<string, unknown> },
+  opts: {
+    bearer?: string
+    id?: string | number
+    jsonrpcVersion?: string
+    methodHeader?: string | false
+    name?: string
+    protocolVersion?: string
+  } = {},
+): Promise<{ status: number; json: Rpc }> => {
+  const protocolVersion = opts.protocolVersion ?? MODERN_PROTOCOL_VERSION
+  const params = body.params ?? {}
+  const priorMeta =
+    params._meta !== null && typeof params._meta === 'object' && !Array.isArray(params._meta)
+      ? (params._meta as Record<string, unknown>)
+      : {}
+  const res = await fetch(`http://127.0.0.1:${p}/mcp`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      accept: 'application/json, text/event-stream',
+      'mcp-protocol-version': protocolVersion,
+      ...(opts.methodHeader === false ? {} : { 'mcp-method': opts.methodHeader ?? body.method }),
+      ...(opts.name ? { 'mcp-name': opts.name } : {}),
+      ...(opts.bearer ? { authorization: `Bearer ${opts.bearer}` } : {}),
+    },
+    body: JSON.stringify({
+      jsonrpc: opts.jsonrpcVersion ?? '2.0',
+      id: opts.id ?? 1,
+      method: body.method,
+      params: {
+        ...params,
+        _meta: {
+          [MODERN_PROTOCOL_META_KEY]: protocolVersion,
+          [MODERN_CLIENT_INFO_META_KEY]: { name: 'notarium-test', version: '1.0.0' },
+          [MODERN_CLIENT_CAPABILITIES_META_KEY]: {},
+          ...priorMeta,
+        },
+      },
+    }),
+  })
+
+  return { status: res.status, json: (await res.json()) as Rpc }
+}
+
 const callTool = async (
   p: number,
   name: string,
@@ -164,12 +227,34 @@ const callTool = async (
 ): Promise<Rpc> =>
   (await rpc(p, { method: 'tools/call', params: { name, arguments: args } }, { bearer })).json
 
+const callModernTool = async (
+  p: number,
+  name: string,
+  args: Record<string, unknown>,
+  bearer?: string,
+): Promise<Rpc> =>
+  (
+    await modernRpc(
+      p,
+      { method: 'tools/call', params: { name, arguments: args } },
+      { bearer, name },
+    )
+  ).json
+
 /** A tools/call result's structuredContent (machine fields). */
 const structured = (r: Rpc): Record<string, unknown> =>
   (r.result?.structuredContent as Record<string, unknown>) ?? {}
 const isError = (r: Rpc): boolean => Boolean(r.result?.isError)
 const text = (r: Rpc): string =>
   ((r.result?.content as Array<{ text: string }>) ?? []).map((c) => c.text).join('\n')
+
+const expectToolNotFound = (r: Rpc): void => {
+  expect(r.result).toBeUndefined()
+  expect(r.error).toMatchObject({
+    code: -32602,
+    message: expect.stringMatching(/tool .* not found/i),
+  })
+}
 
 /** Log in through the real endpoint and return the session cookie — the human
  *  (UI) credential path, used to contrast a human-attributed write with an
@@ -255,6 +340,344 @@ describe('initialize handshake', () => {
     expect((r.json.result?.serverInfo as { name: string }).name).toBe('notarium')
     expect(typeof r.json.result?.instructions).toBe('string')
     expect(r.json.result?.instructions as string).toMatch(/start_session/i)
+  })
+
+  it('echoes both retained revisions without advertising list changes', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'read')
+
+    for (const protocolVersion of ['2025-11-25', '2025-06-18']) {
+      const r = await rpc(
+        port,
+        {
+          method: 'initialize',
+          params: {
+            protocolVersion,
+            capabilities: {},
+            clientInfo: { name: 'legacy-test', version: '1.0.0' },
+          },
+        },
+        { bearer },
+      )
+
+      expect(r.status).toBe(200)
+      expect(r.json.result?.protocolVersion).toBe(protocolVersion)
+      expect(r.json.result?.capabilities).toMatchObject({ tools: { listChanged: false } })
+    }
+  })
+
+  it('leaves legacy subscriptions on the SDK 200 method-not-found response', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'read')
+    const r = await rpc(port, { method: 'subscriptions/listen', params: {} }, { bearer })
+
+    expect(r.status).toBe(200)
+    expect(r.json.error?.code).toBe(-32601)
+  })
+
+  it('does not add modern cache hints to legacy tools/list', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'read')
+    const r = await rpc(port, { method: 'tools/list', params: {} }, { bearer })
+
+    expect(r.status).toBe(200)
+    expect(r.json.result).not.toHaveProperty('ttlMs')
+    expect(r.json.result).not.toHaveProperty('cacheScope')
+  })
+})
+
+describe('2026-07-28 per-request protocol', () => {
+  it('discovers the server without initialize and suppresses subscription advertising', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'read')
+    const r = await modernRpc(port, { method: 'server/discover' }, { bearer })
+
+    expect(r.status).toBe(200)
+    expect(r.json.result?.supportedVersions).toEqual([MODERN_PROTOCOL_VERSION])
+    expect(r.json.result?.instructions).toBe(SERVER_INSTRUCTIONS)
+    expect(r.json.result?.capabilities).toMatchObject({ tools: { listChanged: false } })
+    expect(
+      (r.json.result?._meta as Record<string, unknown> | undefined)?.[MODERN_SERVER_INFO_META_KEY],
+    ).toMatchObject({ name: 'notarium' })
+  })
+
+  it('calls a tool directly through the modern envelope', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const r = await modernRpc(
+      port,
+      { method: 'tools/call', params: { name: 'whoami', arguments: {} } },
+      { bearer, name: 'whoami' },
+    )
+
+    expect(r.status).toBe(200)
+    expect(r.json.result?.isError).not.toBe(true)
+    expect(r.json.result?.resultType).toBe('complete')
+    expect(r.json.result?.structuredContent).toMatchObject({ scope: 'write' })
+  })
+
+  it('publishes private five-minute cache hints on modern tools/list', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'read')
+    const r = await modernRpc(port, { method: 'tools/list' }, { bearer })
+
+    expect(r.status).toBe(200)
+    expect(r.json.result).toMatchObject({ ttlMs: 300_000, cacheScope: 'private' })
+  })
+
+  it('publishes private five-minute cache hints on server/discover', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'read')
+    const r = await modernRpc(port, { method: 'server/discover' }, { bearer })
+
+    expect(r.status).toBe(200)
+    expect(r.json.result).toMatchObject({ ttlMs: 300_000, cacheScope: 'private' })
+  })
+
+  it('keeps the visible tool order byte-for-byte deterministic', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const first = await modernRpc(port, { method: 'tools/list' }, { bearer })
+    const second = await modernRpc(port, { method: 'tools/list' }, { bearer })
+
+    expect(first.status).toBe(200)
+    expect(second.status).toBe(200)
+    expect(JSON.stringify(first.json.result?.tools)).toBe(JSON.stringify(second.json.result?.tools))
+  })
+
+  it('stamps the current server identity on SDK-served modern results', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const r = await modernRpc(
+      port,
+      { method: 'tools/call', params: { name: 'whoami', arguments: {} } },
+      { bearer, name: 'whoami' },
+    )
+
+    expect(r.status).toBe(200)
+    expect(
+      (r.json.result?._meta as Record<string, unknown> | undefined)?.[MODERN_SERVER_INFO_META_KEY],
+    ).toEqual({ name: 'notarium', version: '0.12.0' })
+  })
+
+  it('reports the supported revision for a foreign modern envelope', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'read')
+    const r = await modernRpc(
+      port,
+      { method: 'server/discover' },
+      { bearer, protocolVersion: '2099-01-01' },
+    )
+
+    expect(r.status).toBe(400)
+    expect(r.json.error).toMatchObject({
+      code: -32022,
+      data: { supported: [MODERN_PROTOCOL_VERSION] },
+    })
+  })
+
+  it('keeps the read/write scope filter on the modern tools/list', async () => {
+    const readBearer = await patFor('alice', 'alice-password-1', 'read')
+    const writeBearer = await patFor('alice', 'alice-password-1', 'write')
+    const read = await modernRpc(port, { method: 'tools/list' }, { bearer: readBearer })
+    const write = await modernRpc(port, { method: 'tools/list' }, { bearer: writeBearer })
+
+    expect(read.status).toBe(200)
+    expect(write.status).toBe(200)
+    expect(read.json.result?.tools as unknown[]).toHaveLength(11)
+    expect(write.json.result?.tools as unknown[]).toHaveLength(28)
+  })
+
+  it('keeps honest degradation without meta facets and in AUTH_MODE=none', async () => {
+    const degradedFixture = fixture()
+    degradedFixture.noAgentSessions = true
+    degradedFixture.noGatewayState = true
+    degradedFixture.noContextFacets = true
+    const degradedApp = await createApp(degradedFixture)
+    const degradedPort = await listen(degradedApp)
+    const noneApp = await createApp({
+      spaces: [{ slug: 'main', notes: [] }],
+      projects: [{ space: 'main', path: '' }],
+    })
+    const nonePort = await listen(noneApp)
+
+    try {
+      const bearer = await patFor('alice', 'alice-password-1', 'read', degradedApp)
+      const started = await callModernTool(
+        degradedPort,
+        'start_session',
+        { session: { name: 'Modern degraded session' } },
+        bearer,
+      )
+      const system = await callModernTool(nonePort, 'whoami', {})
+
+      expect(isError(started)).toBe(false)
+      expect(structured(started)).not.toHaveProperty('session')
+      expect(isError(system)).toBe(false)
+      expect(structured(system)).toMatchObject({ principal: 'ui', scope: 'write' })
+    } finally {
+      await degradedApp.close()
+      await noneApp.close()
+    }
+  })
+
+  it('routes both eras through the same gateway and retrieval audit', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'read')
+    const cookie = await loginCookie('alice', 'alice-password-1')
+    const legacy = await callTool(port, 'search', { query: MARKER }, bearer)
+    const modern = await callModernTool(port, 'search', { query: MARKER }, bearer)
+
+    expect(isError(legacy)).toBe(false)
+    expect(isError(modern)).toBe(false)
+    expect(structured(modern)).toEqual(structured(legacy))
+
+    const auditResponse = await app.inject({
+      method: 'GET',
+      url: '/api/me/agent-audit',
+      headers: { cookie },
+    })
+    const audit = auditResponse.json() as {
+      events: Array<{
+        agent: string | null
+        hits: unknown[]
+        principal: string
+        query: string
+        resultCount: number
+        tool: string
+        topScore: number | null
+      }>
+    }
+    const comparable = audit.events.map(
+      ({ agent, hits, principal, query, resultCount, tool, topScore }) => ({
+        agent,
+        hits,
+        principal,
+        query,
+        resultCount,
+        tool,
+        topScore,
+      }),
+    )
+
+    expect(auditResponse.statusCode).toBe(200)
+    expect(comparable).toHaveLength(2)
+    expect(comparable[0]).toEqual(comparable[1])
+  })
+
+  it('rejects conformant subscriptions without holding the request open', async () => {
+    await app.close()
+    const scheduler = {
+      enterInteractive: vi.fn(),
+      exitInteractive: vi.fn(),
+    }
+    app = await createApp(fixture(), { scheduler })
+    port = await listen(app)
+    const bearer = await patFor('alice', 'alice-password-1', 'read')
+    scheduler.enterInteractive.mockClear()
+    scheduler.exitInteractive.mockClear()
+    const r = await modernRpc(
+      port,
+      { method: 'subscriptions/listen', params: { notifications: {} } },
+      { bearer, id: 'subscription-proof' },
+    )
+
+    expect(r.status).toBe(404)
+    expect(r.json).toEqual({
+      jsonrpc: '2.0',
+      id: 'subscription-proof',
+      error: { code: -32601, message: 'Method not found' },
+    })
+    expect(scheduler.enterInteractive).toHaveBeenCalledTimes(1)
+    expect(scheduler.exitInteractive).toHaveBeenCalledTimes(1)
+  })
+
+  it('leaves non-conformant subscriptions to the modern validation ladder', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'read')
+    const foreign = await modernRpc(
+      port,
+      { method: 'subscriptions/listen' },
+      { bearer, protocolVersion: '2099-01-01' },
+    )
+    const missingMethod = await modernRpc(
+      port,
+      { method: 'subscriptions/listen' },
+      { bearer, methodHeader: false },
+    )
+
+    expect(foreign.status).toBe(400)
+    expect(foreign.json.error?.code).toBe(-32022)
+    expect(missingMethod.status).toBe(400)
+    expect(missingMethod.json.error?.code).toBe(-32020)
+  })
+
+  it('preserves the modern ladder for a subscription header/body version mismatch', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'read')
+    const mismatchedVersion = await modernRpc(
+      port,
+      {
+        method: 'subscriptions/listen',
+        params: { _meta: { [MODERN_PROTOCOL_META_KEY]: MODERN_PROTOCOL_VERSION } },
+      },
+      { bearer, protocolVersion: '2099-01-01' },
+    )
+
+    expect(mismatchedVersion.status).toBe(400)
+    expect(mismatchedVersion.json.error?.code).toBe(-32020)
+  })
+
+  it('preserves the modern ladder for a malformed subscription envelope', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'read')
+    const r = await modernRpc(
+      port,
+      {
+        method: 'subscriptions/listen',
+        params: { _meta: { [MODERN_CLIENT_CAPABILITIES_META_KEY]: undefined } },
+      },
+      { bearer },
+    )
+
+    expect(r.status).toBe(400)
+    expect(r.json.error?.code).toBe(-32602)
+  })
+
+  it('preserves the modern ladder for an invalid subscription JSON-RPC shape', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'read')
+    const r = await modernRpc(
+      port,
+      { method: 'subscriptions/listen' },
+      { bearer, jsonrpcVersion: '1.0' },
+    )
+
+    expect(r.status).toBe(400)
+    expect(r.json.error?.code).toBe(-32600)
+  })
+
+  it('preserves the modern method validator when subscription notifications are missing', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'read')
+    const r = await modernRpc(port, { method: 'subscriptions/listen' }, { bearer })
+
+    expect(r.status).toBe(200)
+    expect(r.json.error?.code).toBe(-32602)
+  })
+
+  it('preserves the modern method validator for an invalid subscription filter', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'read')
+    const r = await modernRpc(
+      port,
+      {
+        method: 'subscriptions/listen',
+        params: { notifications: { toolsListChanged: 'yes' } },
+      },
+      { bearer },
+    )
+
+    expect(r.status).toBe(200)
+    expect(r.json.error?.code).toBe(-32602)
+  })
+})
+
+describe('2026-07-28 release contract', () => {
+  it('bumps the observable MCP server version from the main baseline', () => {
+    expect(SERVER_INFO.version).not.toBe('0.11.0')
+    expect(SERVER_INFO.version).toBe('0.12.0')
+  })
+
+  it('lists the split MCP v2 runtime packages instead of the legacy SDK', async () => {
+    const notices = await readFile(new URL('../../THIRD_PARTY_NOTICES.md', import.meta.url), 'utf8')
+
+    expect(notices).not.toContain('@modelcontextprotocol/sdk')
+    expect(notices).toContain('@modelcontextprotocol/server')
+    expect(notices).toContain('@modelcontextprotocol/node')
   })
 })
 
@@ -1267,6 +1690,7 @@ describe('skill class MCP note door (V7)', () => {
     const listed = r.json.result?.tools as Array<{
       name: string
       inputSchema: { additionalProperties?: boolean }
+      outputSchema: { additionalProperties?: boolean }
     }>
 
     expect(listed.map(({ name }) => name).sort()).toEqual(
@@ -1303,6 +1727,7 @@ describe('skill class MCP note door (V7)', () => {
     )
     for (const tool of listed) {
       expect(tool.inputSchema.additionalProperties, tool.name).toBe(false)
+      expect(tool.outputSchema.additionalProperties, tool.name).toBe(false)
     }
   })
 })
@@ -1466,6 +1891,72 @@ describe('tool input object boundary', () => {
       expect(isError(result)).toBe(true)
       expect(text(result)).toMatch(/invalid arguments/i)
     }
+    expect(counter.calls()).toBe(0)
+  })
+
+  it('keeps publication and pre-callback strictness on the modern path', async () => {
+    const { counter, bearer } = await bootWithGate()
+    const listed = await modernRpc(port, { method: 'tools/list' }, { bearer })
+    const tools = listed.json.result?.tools as Array<{
+      name: string
+      inputSchema: { additionalProperties?: boolean }
+      outputSchema: { additionalProperties?: boolean }
+    }>
+
+    expect(listed.status).toBe(200)
+    expect(tools).toHaveLength(28)
+    for (const tool of tools) {
+      expect(tool.inputSchema.additionalProperties, tool.name).toBe(false)
+      expect(tool.outputSchema.additionalProperties, tool.name).toBe(false)
+    }
+
+    const results = await Promise.all([
+      callModernTool(port, 'search', { query: MARKER, __unknown__: true }, bearer),
+      callModernTool(
+        port,
+        'create_note',
+        {
+          project: 'team',
+          body: 'Body.',
+          links: [{ to: TEAM_NOTE_ID, relation: 'relates_to', __unknown__: true }],
+        },
+        bearer,
+      ),
+      callModernTool(
+        port,
+        'create_notes',
+        { project: 'team', notes: [{ body: 'Body.', __unknown__: true }] },
+        bearer,
+      ),
+    ])
+
+    for (const result of results) {
+      expect(isError(result)).toBe(true)
+      expect(text(result)).toMatch(/invalid arguments/i)
+    }
+
+    const readBearer = await patFor('alice', 'alice-password-1', 'read')
+    const legacyHidden = await rpc(
+      port,
+      {
+        method: 'tools/call',
+        params: { name: 'remember_about_user', arguments: { observation: 'x', category: 'y' } },
+      },
+      { bearer: readBearer },
+    )
+    const modernHidden = await modernRpc(
+      port,
+      {
+        method: 'tools/call',
+        params: { name: 'remember_about_user', arguments: { observation: 'x', category: 'y' } },
+      },
+      { bearer: readBearer, name: 'remember_about_user' },
+    )
+
+    expect(legacyHidden.status).toBe(200)
+    expect(modernHidden.status).toBe(200)
+    expectToolNotFound(legacyHidden.json)
+    expectToolNotFound(modernHidden.json)
     expect(counter.calls()).toBe(0)
   })
 })
@@ -2967,8 +3458,7 @@ describe('remember_about_user (#21 stage 7)', () => {
       { observation: 'x', category: 'y' },
       bearer,
     )
-    expect(isError(r)).toBe(true)
-    expect(text(r)).toMatch(/not found/i)
+    expectToolNotFound(r)
   })
 })
 
@@ -3169,8 +3659,7 @@ describe('remember_about_project (#13 I1)', () => {
       { project: 'team/team', observation: 'x', category: 'y' },
       bearer,
     )
-    expect(isError(r)).toBe(true)
-    expect(text(r)).toMatch(/not found/i)
+    expectToolNotFound(r)
   })
 })
 
@@ -3587,8 +4076,7 @@ describe('edit_note (#21 stage 5)', () => {
     // anti-enumeration shape (it never confirms the tool exists). The gateway's
     // own scopeAllows check in callTool is the defence-in-depth for any
     // non-SDK caller that reaches it directly.
-    expect(isError(r)).toBe(true)
-    expect(text(r)).toMatch(/not found/i)
+    expectToolNotFound(r)
   })
 
   // ── #102 phase 3: replace mode + the full integrity echo + memory-as-a-note ───────
@@ -3871,8 +4359,7 @@ describe('delete (#102 phase 3)', () => {
   it('a read-only PAT cannot call delete — neither listed nor callable', async () => {
     const bearer = await patFor('alice', 'alice-password-1', 'read')
     const r = await callTool(port, 'delete_note', { ref: TEAM_NOTE_ID }, bearer)
-    expect(isError(r)).toBe(true)
-    expect(text(r)).toMatch(/not found/i)
+    expectToolNotFound(r)
   })
 })
 
@@ -4006,8 +4493,7 @@ describe('move_note / rename_note (#102 phase 5)', () => {
     const listed = structured(await callTool(port, 'whoami', {}, bearer)) // sanity: read PAT works
     expect(listed).toBeTruthy()
     const r = await callTool(port, 'move_note', { ref: TEAM_NOTE_ID, toFolder: 'x' }, bearer)
-    expect(isError(r)).toBe(true)
-    expect(text(r)).toMatch(/not found|cannot use/i)
+    expectToolNotFound(r)
   })
 
   // ── rename ──────────────────────────────────────────────────────────────────
@@ -4083,8 +4569,7 @@ describe('move_note / rename_note (#102 phase 5)', () => {
   it('a read-only PAT cannot call rename_note', async () => {
     const bearer = await patFor('alice', 'alice-password-1', 'read')
     const r = await callTool(port, 'rename_note', { ref: TEAM_NOTE_ID, title: 'X' }, bearer)
-    expect(isError(r)).toBe(true)
-    expect(text(r)).toMatch(/not found|cannot use/i)
+    expectToolNotFound(r)
   })
 })
 
@@ -4318,8 +4803,7 @@ describe('move_folder / rename_folder / rename_project (#102 phase 6)', () => {
       { project: 'team', folder: 'x', toFolder: 'y' },
       bearer,
     )
-    expect(isError(r)).toBe(true)
-    expect(text(r)).toMatch(/not found|cannot use/i)
+    expectToolNotFound(r)
   })
 
   it('a no-op on a NON-existent folder is a 404, not a false "already there" success', async () => {
@@ -4495,8 +4979,7 @@ describe('move_folder / rename_folder / rename_project (#102 phase 6)', () => {
   it('a read-only PAT cannot call rename_project', async () => {
     const bearer = await patFor('alice', 'alice-password-1', 'read')
     const r = await callTool(port, 'rename_project', { project: 'team', displayName: 'X' }, bearer)
-    expect(isError(r)).toBe(true)
-    expect(text(r)).toMatch(/not found|cannot use/i)
+    expectToolNotFound(r)
   })
 
   it('renaming an unreachable project is a 404-semantic error', async () => {
@@ -4757,8 +5240,7 @@ describe('link (#21 stage 6)', () => {
       { from: TEAM_NOTE_ID, to: TEAM_NOTE_ID, relation: 'rel' },
       bearer,
     )
-    expect(isError(r)).toBe(true)
-    expect(text(r)).toMatch(/not found/i)
+    expectToolNotFound(r)
   })
 
   // ── #102 phase 4: forward-reference by title ─────────────────────────────────────
@@ -5191,7 +5673,7 @@ describe('create_notes (#102 phase 4 batch)', () => {
       { project: 'team', notes: [{ title: 'X', body: 'y' }] },
       bearer,
     )
-    expect(isError(r)).toBe(true)
+    expectToolNotFound(r)
   })
 })
 
@@ -5326,7 +5808,7 @@ describe('link_many (#102 phase 4 batch)', () => {
       { links: [{ from: TEAM_NOTE_ID, to: TEAM_NOTE_ID, relation: 'rel' }] },
       bearer,
     )
-    expect(isError(r)).toBe(true)
+    expectToolNotFound(r)
   })
 })
 

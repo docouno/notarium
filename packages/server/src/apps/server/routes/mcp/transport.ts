@@ -1,10 +1,20 @@
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
-// The MCP wire adapter: the @modelcontextprotocol/sdk drives the JSON-RPC
+import {
+  NodeStreamableHTTPServerTransport,
+  toNodeHandler,
+  toWebRequest,
+} from '@modelcontextprotocol/node'
+import {
+  classifyInboundRequest,
+  createMcpHandler,
+  isLegacyRequest,
+  isSpecType,
+  McpServer,
+} from '@modelcontextprotocol/server'
+// The MCP wire adapter: the official MCP packages drive the JSON-RPC
 // envelope + handshake; the gateway (services/mcp/gateway) supplies tools + policy.
 // A dedicated POST /mcp, self-authenticating (installAuthz guards only /api) and
 // stateless (fresh server per request, scoped to the authenticated principal).
 // canon: docs/mcp-gateway.md#connect · docs/mcp-oauth.md#surfaces
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import type { z } from 'zod'
 import { AUTH_MODE } from '@notarium/contract'
@@ -82,6 +92,9 @@ type RegisterGatewayTool = (
   callback: (args: unknown) => Promise<ToolResult>,
 ) => void
 
+const MODERN_PROTOCOL_VERSION = '2026-07-28'
+const SUBSCRIPTIONS_LISTEN_METHOD = 'subscriptions/listen'
+
 /** Per-request MCP server exposing only the tools this principal may see (the
  *  scope filter), each delegating to the gateway. canon: docs/mcp-gateway.md#security */
 export const buildServer = (
@@ -89,7 +102,14 @@ export const buildServer = (
   principal: Principal,
   mutationGate?: MutationGate,
 ): McpServer => {
-  const server = new McpServer(SERVER_INFO, { instructions: SERVER_INSTRUCTIONS })
+  const server = new McpServer(SERVER_INFO, {
+    instructions: SERVER_INSTRUCTIONS,
+    capabilities: { tools: { listChanged: false } },
+    cacheHints: {
+      'tools/list': { ttlMs: 300_000, cacheScope: 'private' },
+      'server/discover': { ttlMs: 300_000, cacheScope: 'private' },
+    },
+  })
   // The SDK's recursive schema-output generic exceeds TypeScript's instantiation
   // limit over the dynamic registry union. This call surface preserves the SDK's
   // runtime contract while keeping the callback boundary deliberately unknown.
@@ -120,6 +140,25 @@ export const buildServer = (
   }
 
   return server
+}
+
+const modernSubscriptionId = (
+  inbound: ReturnType<typeof classifyInboundRequest>,
+  mcpMethodHeader: string | undefined,
+): string | number | undefined => {
+  if (
+    inbound.kind !== 'modern' ||
+    inbound.messageKind !== 'request' ||
+    inbound.classification.era !== 'modern' ||
+    inbound.classification.revision !== MODERN_PROTOCOL_VERSION ||
+    inbound.message.method !== SUBSCRIPTIONS_LISTEN_METHOD ||
+    mcpMethodHeader !== inbound.message.method ||
+    !isSpecType.SubscriptionsListenRequest(inbound.message)
+  ) {
+    return undefined
+  }
+
+  return inbound.message.id
 }
 
 /** Register the `/mcp` endpoint on the host. Call before the SPA fallback. */
@@ -199,25 +238,72 @@ export const registerMcp = async (
       principal = authed.principal
     }
 
-    const server = buildServer(gateway, principal, mutationGate)
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined, // stateless: one pair per request
-      enableJsonResponse: true,
-    })
-    // Transport-level errors (socket/protocol) would otherwise vanish — log them.
-    transport.onerror = (err) => console.error('[mcp] transport ->', err.message)
-    reply.raw.on('close', () => {
-      void transport.close()
-      void server.close()
-    })
-    await server.connect(transport)
-    // Once we hijack, Fastify's error handler is bypassed — so an unexpected throw
-    // must be caught here, or the agent hangs with no reply.
-    reply.hijack()
+    let hijacked = false
+
     try {
-      await transport.handleRequest(req.raw, reply.raw, req.body)
+      const probe = await toWebRequest(req.raw, req.body)
+      const legacy = await isLegacyRequest(probe)
+
+      if (!legacy) {
+        const mcpMethodHeader = probe.headers.get('mcp-method') ?? undefined
+        const inbound = classifyInboundRequest({
+          httpMethod: probe.method,
+          protocolVersionHeader: probe.headers.get('mcp-protocol-version') ?? undefined,
+          mcpMethodHeader,
+          mcpNameHeader: probe.headers.get('mcp-name') ?? undefined,
+          body: req.body,
+        })
+        const subscriptionId = modernSubscriptionId(inbound, mcpMethodHeader)
+
+        if (subscriptionId !== undefined) {
+          return reply.code(HTTP_STATUS.NOT_FOUND).send({
+            jsonrpc: '2.0',
+            id: subscriptionId,
+            error: { code: -32601, message: 'Method not found' },
+          })
+        }
+      }
+
+      // Both transports write directly to the Node response. Once hijacked,
+      // every unexpected throw must be handled here or the agent hangs.
+      reply.hijack()
+      hijacked = true
+
+      if (legacy) {
+        const server = buildServer(gateway, principal, mutationGate)
+        const transport = new NodeStreamableHTTPServerTransport({
+          sessionIdGenerator: undefined, // stateless: one pair per request
+          enableJsonResponse: true,
+        })
+        // Transport-level errors (socket/protocol) would otherwise vanish — log them.
+        transport.onerror = (err) => console.error('[mcp] transport ->', err.message)
+        reply.raw.on('close', () => {
+          void transport.close()
+          void server.close()
+        })
+        await server.connect(transport)
+        await transport.handleRequest(req.raw, reply.raw, req.body)
+        return
+      }
+
+      const handler = createMcpHandler(() => buildServer(gateway, principal, mutationGate), {
+        legacy: 'reject',
+        responseMode: 'auto',
+        onerror: (err) => console.error('[mcp] handler ->', err.message),
+      })
+      const handleModern = toNodeHandler(handler, {
+        onerror: (err) => console.error('[mcp] adapter ->', err.message),
+      })
+      await handleModern(req.raw, reply.raw, req.body)
     } catch (err) {
       console.error('[mcp] handleRequest ->', (err as Error)?.message)
+      if (!hijacked) {
+        return reply.code(HTTP_STATUS.INTERNAL_SERVER_ERROR).send({
+          jsonrpc: '2.0',
+          error: { code: -32603, message: 'Internal error' },
+          id: null,
+        })
+      }
       if (!reply.raw.headersSent) {
         reply.raw.writeHead(500, { 'content-type': 'application/json' })
         reply.raw.end(
