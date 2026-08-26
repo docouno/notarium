@@ -72,7 +72,7 @@ describe('canRestoreRevision', () => {
     canRestoreRevision({
       revision: row({ restoreAvailability: 'full' }),
       restorable: true,
-      detailUnreadable: false,
+      bodyUnrestorable: false,
       isLatest: false,
       restoring: false,
       ...over,
@@ -85,7 +85,7 @@ describe('canRestoreRevision', () => {
   // The row says `full` because the journal's columns say so; only this screen has
   // asked for the body and been told the stored copy cannot be opened here.
   it('withdraws it when the body came back unreadable, despite a restorable row', () => {
-    expect(ask({ detailUnreadable: true })).toBe(false)
+    expect(ask({ bodyUnrestorable: true })).toBe(false)
   })
 
   it.each([

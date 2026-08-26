@@ -146,10 +146,19 @@ Persistence is a meta-DB facet (`packages/server/src/services/metaDb`) over the 
   `not-restorable` (422), or pre-accept `busy` (503).
 
 The UI renders only `contentMode: markdown` through the Markdown renderer. Opaque
-source is plain `<pre>` text/base64 and has no diff or restore action; gaps are empty.
+source is plain `<pre>` text/base64 and has no diff or restore action; a gap is named
+rather than left blank, whether the row already says so or the body comes back empty
+because the row was listed before a quarantine emptied it.
 Changes compares exact snapshots only when both sides are Markdown. Legacy rows remain
 labelled partial and compare bodies only. A restore keeps its idempotency key across an
 ambiguous network result and repeats the same POST until terminal.
+
+A body is asked for once per revision id and every outcome ends the wait: the body, a
+refusal this server cannot read, or a failed request — the last two are named on screen
+rather than left shimmering, except on a row that never had a body, where the row's own
+line already says there is nothing to load. The shimmer states one thing only, that a body is still on
+its way, so Changes drops it as soon as either side settles as anything but Markdown,
+because no rows can come of that pair however the other side lands.
 
 ## Deliberate boundaries
 

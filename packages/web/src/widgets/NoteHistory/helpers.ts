@@ -53,21 +53,22 @@ export const historyRowLabels = (
  *  The timeline row is a projection of the journal's columns, and a revision whose blob is
  *  stored but unreadable has columns that describe a perfectly restorable state — so the
  *  row alone always says yes. The only party that knows better is this screen, which has
- *  already asked for the body and been refused; without `detailUnreadable` the button
- *  stays live and restore fails after the click. */
+ *  already asked for the body; without `bodyUnrestorable` the button stays live and
+ *  restore fails after the click. */
 export const canRestoreRevision = (input: {
   revision: Pick<RevisionView, 'restoreAvailability'>
   /** The host permits restore at all (capability, permissions). */
   restorable: boolean
-  /** This revision's body came back as an unreadable stored copy. */
-  detailUnreadable: boolean
+  /** The body came back with nothing to restore: refused as an unreadable stored copy, or
+   *  empty because the row was listed before a quarantine emptied it. */
+  bodyUnrestorable: boolean
   isLatest: boolean
   restoring: boolean
 }): boolean =>
   input.restorable &&
   (input.revision.restoreAvailability === 'full' ||
     input.revision.restoreAvailability === 'partial') &&
-  !input.detailUnreadable &&
+  !input.bodyUnrestorable &&
   !input.isLatest &&
   !input.restoring
 

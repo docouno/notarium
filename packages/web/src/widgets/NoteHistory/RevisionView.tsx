@@ -44,6 +44,17 @@ type RevisionViewProps = {
  *  itself looks restorable, so nothing else on this screen can tell. */
 const UNREADABLE_REASON = STORE_ERROR_REASON.revisionContentUnreadable
 
+/** What this view knows about a body it asked for: the body, or the reason there will never
+ *  be one. Any outcome ends the wait — only a missing entry is still loading. */
+type DetailEntry =
+  { status: 'ok'; detail: RevisionDetailView } | { status: 'unreadable' } | { status: 'failed' }
+
+/** Whether this side can still turn into diff rows. Every settled outcome other than a
+ *  markdown body — a gap, opaque source, a refusal, a failed request — rules rows out for
+ *  good, whichever of the two sides it lands on. */
+const canYieldRows = (entry: DetailEntry | undefined) =>
+  !entry || (entry.status === 'ok' && entry.detail.contentMode === 'markdown')
+
 const isPartialState = (
   revision: Pick<Revision, 'contentHash' | 'stateFormat'> | undefined,
 ): boolean =>
@@ -76,18 +87,14 @@ export const RevisionView = ({
   const { confirm, alert } = useDialog()
   const [view, setView] = useState<'diff' | 'content'>('diff')
   const [restoring, setRestoring] = useState(false)
-  // Revision bodies by revision id. Content-addressed upstream; immutable —
-  // an entry never goes stale, so the cache lives as long as the view.
-  const detailsRef = useRef(new Map<string, RevisionDetailView>())
-  // Revisions whose blob is stored and which this server cannot open — see
-  // `canRestoreRevision` for why only this screen can know.
-  // canon: docs/trash.md#availability
-  const unreadableRef = useRef(new Set<string>())
-  // Ids this view has already asked for. A body is content-addressed and immutable, so one
-  // request per id is the whole contract — and without tracking the ATTEMPT, a refusal
-  // (which never lands in `detailsRef`) puts its own tick back through this effect.
+  // What came back, by revision id. Bodies are content-addressed upstream and immutable, so
+  // an entry never goes stale and the cache lives as long as this view instance. State, not
+  // a ref: an arriving body has to re-render the view that asked for it.
+  const [loaded, setLoaded] = useState<ReadonlyMap<string, DetailEntry>>(() => new Map())
+  // Ids this view has already asked for, and the only filter on what to request: a body is
+  // content-addressed and immutable, so one request per id is the whole contract. A ref,
+  // not state: it has to be true the instant the request goes out, before any render.
   const attemptedRef = useRef(new Set<string>())
-  const [detailsTick, setDetailsTick] = useState(0)
 
   const baseId = revision.baseRevisionId
 
@@ -95,48 +102,47 @@ export const RevisionView = ({
     const want = [revision.revisionId, baseId].filter(
       (id): id is string => !!id && !attemptedRef.current.has(id),
     )
-    let dead = false
 
     for (const id of want) {
       attemptedRef.current.add(id)
     }
 
+    const record = (id: string, entry: DetailEntry) =>
+      setLoaded((prev) => new Map(prev).set(id, entry))
+
     for (const id of want) {
       void source
         .detail(id)
-        .then((d) => {
-          detailsRef.current.set(id, d)
-          if (!dead) {
-            setDetailsTick((n) => n + 1)
-          }
-        })
+        .then((d) => record(id, { status: 'ok', detail: d }))
         .catch((e: unknown) => {
-          // A vanished revision (refetch raced a reset) just renders empty; an unreadable
-          // one is a durable fact about this server and has to reach the button.
-          if ((e as { reason?: string } | null)?.reason === UNREADABLE_REASON) {
-            unreadableRef.current.add(id)
-            if (!dead) {
-              setDetailsTick((n) => n + 1)
-            }
-          }
+          // An unreadable copy is a durable fact about this server and has to reach the
+          // button; anything else (network, 500, a revision that vanished under a reset)
+          // says nothing about the copy. Both end the wait — one attempt per id, see above.
+          record(
+            id,
+            (e as { reason?: string } | null)?.reason === UNREADABLE_REASON
+              ? { status: 'unreadable' }
+              : { status: 'failed' },
+          )
         })
     }
+    // No cleanup and no completion in the deps: this effect is about ISSUING the requests,
+    // and it re-runs only when what to ask for actually changes.
+  }, [source, revision.revisionId, baseId])
 
-    return () => {
-      dead = true
-    }
-  }, [source, revision.revisionId, baseId, detailsTick])
-
-  const detail = detailsRef.current.get(revision.revisionId)
-  const baseDetail = baseId ? detailsRef.current.get(baseId) : undefined
-  const baseUnreadable = Boolean(baseId && unreadableRef.current.has(baseId))
-  // An unreadable parent is loaded — the answer is just "this server cannot open it".
-  // Treating it as still-loading left the diff shimmering with nothing on screen.
-  const baseLoaded = !baseId || detailsRef.current.has(baseId) || baseUnreadable
+  const selectedEntry = loaded.get(revision.revisionId)
+  const baseEntry = baseId ? loaded.get(baseId) : undefined
+  const detail = selectedEntry?.status === 'ok' ? selectedEntry.detail : undefined
+  const baseDetail = baseEntry?.status === 'ok' ? baseEntry.detail : undefined
+  // Two screens ask different questions of the same wait: the content tab wants "is MY body
+  // still coming", the diff wants "can a row still come of this pair" (see canYieldRows).
+  const awaitingSelected = !selectedEntry
+  const rowsStillPossible = canYieldRows(selectedEntry) && (!baseId || canYieldRows(baseEntry))
   const activeView = detail?.contentMode === 'source' ? 'content' : view
-  const comparisonIsGap = Boolean(baseId && baseLoaded && baseDetail?.contentMode === 'gap')
-  const comparisonIsUnreadable = baseUnreadable
-  const comparisonIsSource = Boolean(baseId && baseLoaded && baseDetail?.contentMode === 'source')
+  const comparisonIsGap = baseDetail?.contentMode === 'gap'
+  const comparisonIsUnreadable = baseEntry?.status === 'unreadable'
+  const comparisonIsSource = baseDetail?.contentMode === 'source'
+  const comparisonFailed = baseEntry?.status === 'failed'
 
   const diffRows = useMemo(() => {
     if (!detail || detail.contentMode !== 'markdown') {
@@ -170,11 +176,18 @@ export const RevisionView = ({
   )
   useMarkdownEnhance(contentRef, activeView === 'content' ? contentHtml : '')
 
-  const detailUnreadable = unreadableRef.current.has(revision.revisionId)
+  // What the screen states about this revision. A body that came back outranks the row it
+  // was listed from: a row fetched before a quarantine still carries a hash and no reason.
+  const shownState = detail ?? revision
+  // canon: docs/trash.md#availability
+  const detailUnreadable = selectedEntry?.status === 'unreadable'
+  const detailFailed = selectedEntry?.status === 'failed'
   const canRestore = canRestoreRevision({
     revision,
     restorable,
-    detailUnreadable,
+    // Nothing to restore either way: the copy is refused, or the body came back empty
+    // because the row was listed before a quarantine emptied it.
+    bodyUnrestorable: detailUnreadable || detail?.contentMode === 'gap',
     isLatest,
     restoring,
   })
@@ -309,6 +322,21 @@ export const RevisionView = ({
         </div>
       ) : null}
 
+      {/* Unlike a refusal, a failed request says nothing about the copy — the row still
+          rules whether Restore is offered. Gated on a body existing at all, so it cannot
+          contradict the "nothing was captured here" line below. */}
+      {detailFailed && revision.contentHash != null ? (
+        <div className={styles.partial} data-testid="history-error">
+          This version could not be loaded: the request for its saved copy failed.
+        </div>
+      ) : null}
+
+      {comparisonFailed ? (
+        <div className={styles.gap} data-testid="history-comparison-error">
+          Changes cannot be compared because the request for the parent revision failed.
+        </div>
+      ) : null}
+
       {selectedUnavailable && !detailUnreadable && revision.contentHash != null ? (
         <div className={styles.partial} data-testid="history-unavailable">
           {revision.restoreAvailability === 'opaque'
@@ -321,14 +349,16 @@ export const RevisionView = ({
         </div>
       ) : null}
 
-      {revision.contentHash == null ? (
+      {/* No body to show: either the row already says so, or the body came back a gap
+          because the note was quarantined after this row was listed. */}
+      {revision.contentHash == null || detail?.contentMode === 'gap' ? (
         <div className={styles.gap} data-testid="history-gap">
-          {revision.unavailableReason != null
+          {shownState.unavailableReason != null
             ? // WITHHELD, not uncaptured (#327): the server refused to attribute or
               // reconstruct this state, so naming a cause it didn't claim would be
               // the same invention as calling its writer external.
               'This point is unavailable: the note’s identity was in doubt here, so nothing about the change can be shown.'
-            : revision.kind === REVISION_KIND.delete
+            : shownState.kind === REVISION_KIND.delete
               ? 'The note was deleted at this point.'
               : 'An external change was detected here, but its content could not be captured.'}
         </div>
@@ -373,9 +403,11 @@ export const RevisionView = ({
                 </span>
               </div>
             ))
-          ) : comparisonIsGap || comparisonIsSource || detail?.contentMode === 'source' ? null : (
+          ) : rowsStillPossible ? (
+            // The shimmer promises rows, so it may only show while rows are still possible.
+            // Every other reason there are none is named by a line above.
             <RevisionSkeleton />
-          )}
+          ) : null}
         </div>
       ) : detail?.contentMode === 'markdown' ? (
         <div
@@ -384,9 +416,9 @@ export const RevisionView = ({
           data-testid="history-content"
           dangerouslySetInnerHTML={{ __html: contentHtml }}
         />
-      ) : (
+      ) : awaitingSelected ? (
         <RevisionSkeleton />
-      )}
+      ) : null}
     </div>
   )
 }
