@@ -9,6 +9,11 @@
   "description": "Notarium — a modern, self-hosted, AI-agent-native knowledge workspace with an Obsidian-style knowledge graph, on a markdown-file-first engine",
   "license": "AGPL-3.0-only",
   "author": "Sergey Padurets",
+  "packageManager": "npm@11.19.0",
+  "engines": {
+    "node": ">=24",
+    "npm": ">=11.18"
+  },
   "scripts": {
     "deps:lean": "npm ci --include-workspace-root --workspace=notarium --workspace=@notarium/contract --workspace=@notarium/core --workspace=@notarium/desktop --workspace=@notarium/engine --workspace=@notarium/engine-memory --workspace=@notarium/server --workspace=@notarium/web --prefer-offline --no-audit --fund=false",
     "deps:full": "ONNXRUNTIME_NODE_INSTALL=skip npm ci --prefer-offline --no-audit --fund=false",

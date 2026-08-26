@@ -128,6 +128,16 @@ separate concern. npm workspace links contain checkout-specific paths,
 and each development stand must own its state. npm's normal user cache still makes
 installs incremental.
 
+Step 4 goes through `make dev` → `make deps`, which installs on the host — so a new
+worktree bootstraps only under a Node and npm that clear the floor `package.json`
+declares, and `.npmrc`'s `engine-strict` makes that a refusal rather than a warning.
+Worth knowing before you create one, because the global npm is one per MACHINE while
+worktrees are many: bring it up once and every checkout after it is fine. The cure is
+`npm i -g npm@<version>`, which needs `sudo` wherever the global prefix is root-owned and
+must not have it under nvm. A worktree that trips over this at step 4 already has its
+`.env` written and a port reserved, so fix the npm and re-run rather than recreating the
+slot.
+
 The copied `.env` can contain credentials or external database URLs. It remains
 gitignored, but review it before starting a stand when isolation from shared external
 services matters.

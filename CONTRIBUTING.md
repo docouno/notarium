@@ -22,7 +22,18 @@ The split that trips people up first is `engine` vs `engine-vector`: semantic se
 
 ## Working on the host
 
-Node 24 is expected.
+Node 24 and npm 11.18 are the floor, both declared in `package.json` → `engines`;
+`packageManager` names the one exact npm installed by the contours whose base image
+carries an older one. `.npmrc` sets
+`engine-strict`, so the floor is a refusal rather than a warning: an install below it
+stops with `EBADENGINE` instead of succeeding. That is deliberate — below npm 11.18 a
+root `overrides` entry whose target sits behind a workspace link is silently dropped from
+the lockfile it writes (npm/cli issue 9659), and the tree it installs looks perfectly
+fine. Anything past the floor is accepted, so read the message before reaching for a
+cure: it prints both bounds and both running versions, and a current npm on Node 22 needs
+the Node upgrade, not `npm i -g`. Where npm is the one to move, `npm i -g npm@<version>`
+does it — with `sudo` wherever the global prefix is root-owned, without it under nvm.
+Yarn and pnpm are refused outright by `packageManager`: this repository is npm-only.
 
 For parallel tasks, use the repository's shared Worktrunk lifecycle rather than raw
 `git worktree` commands. The one-time install, team path layout and daily commands are

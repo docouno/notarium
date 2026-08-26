@@ -216,6 +216,14 @@ test-coverage: ## Build and run full coverage (including native vector tests) in
 # Keep the database off the host network: Vitest runs in the test container on
 # the same private Compose network. The project suffix isolates this ephemeral
 # topology from the checkout's already-running dev stand.
+#
+# All four containerised runners below install with the DECLARED npm: no base image in
+# this repository carries an npm that clears the floor package.json declares, and .npmrc
+# makes `npm ci` refuse it outright (engine-strict). So the pin is what lets these targets
+# install at all, and npm itself reports its absence — there is no separate check. The
+# block is the one from `.gitlab-ci.yml` and `docker/Dockerfile` verbatim: its own
+# `set -eu`, nothing chained with `&&`, so its exit status is the install's wherever it
+# is pasted rather than only while it happens to be last.
 test-pg: ## Run meta-DB contracts/migrations against ephemeral live Postgres
 	@set -eu; \
 	  cleanup() { \
@@ -237,8 +245,13 @@ test-pg: ## Run meta-DB contracts/migrations against ephemeral live Postgres
 	      -cf - . | tar -C /app -xf -"; \
 	  docker run --rm --name $(CHECKUP_RUNNER_CONTAINER) \
 	    --mount "type=volume,src=$(CHECKUP_WORKSPACE_VOLUME),dst=/app" \
-	    --workdir /app -e HOME=/tmp --entrypoint npm "$(NODE_TEST_IMAGE)" \
-	    run deps:lean; \
+	    --workdir /app -e HOME=/tmp --entrypoint sh "$(NODE_TEST_IMAGE)" -c \
+	    "set -eu; \
+	     pinned_npm=\"\$$(node -p \"(/^npm@([0-9]+[.][0-9]+[.][0-9]+([-][0-9A-Za-z.-]+)?)([+].*)?$$/.exec(require('./package.json').packageManager)||[,''])[1]\")\"; \
+	     [ -n \"\$$pinned_npm\" ] || { echo 'package.json packageManager must be npm@<x.y.z>' >&2; exit 1; }; \
+	     npm i -g \"npm@\$$pinned_npm\"; \
+	     npm -v; \
+	     npm run deps:lean"; \
 	  $(COMPOSE_TEST) up -d --wait postgres; \
 	  docker run --rm --name $(CHECKUP_RUNNER_CONTAINER) \
 	    --network "$(TEST_COMPOSE_PROJECT)_default" \
@@ -277,8 +290,13 @@ import-bench: ## Run the Markdown-tree import scale bench in Docker: make import
 	      -cf - . | tar -C /app -xf -"; \
 	  docker run --rm --name $(CHECKUP_RUNNER_CONTAINER) \
 	    --mount "type=volume,src=$(CHECKUP_WORKSPACE_VOLUME),dst=/app" \
-	    --workdir /app -e HOME=/tmp --entrypoint npm "$(NODE_TEST_IMAGE)" \
-	    run deps:lean; \
+	    --workdir /app -e HOME=/tmp --entrypoint sh "$(NODE_TEST_IMAGE)" -c \
+	    "set -eu; \
+	     pinned_npm=\"\$$(node -p \"(/^npm@([0-9]+[.][0-9]+[.][0-9]+([-][0-9A-Za-z.-]+)?)([+].*)?$$/.exec(require('./package.json').packageManager)||[,''])[1]\")\"; \
+	     [ -n \"\$$pinned_npm\" ] || { echo 'package.json packageManager must be npm@<x.y.z>' >&2; exit 1; }; \
+	     npm i -g \"npm@\$$pinned_npm\"; \
+	     npm -v; \
+	     npm run deps:lean"; \
 	  docker run --rm --name $(CHECKUP_RUNNER_CONTAINER) \
 	    --mount "type=volume,src=$(CHECKUP_WORKSPACE_VOLUME),dst=/app" \
 	    --workdir /app -e HOME=/tmp -e NOTES=$(NOTES) -e SOURCE=$(SOURCE) \
@@ -312,8 +330,13 @@ bench-session-audit: ## Benchmark the session activity read-model on SQLite and 
 	      -cf - . | tar -C /app -xf -"; \
 	  docker run --rm --name $(CHECKUP_RUNNER_CONTAINER) \
 	    --mount "type=volume,src=$(CHECKUP_WORKSPACE_VOLUME),dst=/app" \
-	    --workdir /app -e HOME=/tmp --entrypoint npm "$(NODE_TEST_IMAGE)" \
-	    run deps:lean; \
+	    --workdir /app -e HOME=/tmp --entrypoint sh "$(NODE_TEST_IMAGE)" -c \
+	    "set -eu; \
+	     pinned_npm=\"\$$(node -p \"(/^npm@([0-9]+[.][0-9]+[.][0-9]+([-][0-9A-Za-z.-]+)?)([+].*)?$$/.exec(require('./package.json').packageManager)||[,''])[1]\")\"; \
+	     [ -n \"\$$pinned_npm\" ] || { echo 'package.json packageManager must be npm@<x.y.z>' >&2; exit 1; }; \
+	     npm i -g \"npm@\$$pinned_npm\"; \
+	     npm -v; \
+	     npm run deps:lean"; \
 	  $(COMPOSE_TEST) up -d --wait postgres; \
 	  docker run --rm --name $(CHECKUP_RUNNER_CONTAINER) \
 	    --user $(HOST_UID):$(HOST_GID) \
@@ -353,8 +376,13 @@ test-browser: ## Run container-native e2e and installed visual baselines
 	      -cf - . | tar -C /app -xf -"; \
 	  docker run --rm --name $(CHECKUP_RUNNER_CONTAINER) \
 	    --mount "type=volume,src=$(CHECKUP_WORKSPACE_VOLUME),dst=/app" \
-	    --workdir /app -e HOME=/tmp --entrypoint npm "$(PLAYWRIGHT_TEST_IMAGE)" \
-	    run deps:lean; \
+	    --workdir /app -e HOME=/tmp --entrypoint sh "$(PLAYWRIGHT_TEST_IMAGE)" -c \
+	    "set -eu; \
+	     pinned_npm=\"\$$(node -p \"(/^npm@([0-9]+[.][0-9]+[.][0-9]+([-][0-9A-Za-z.-]+)?)([+].*)?$$/.exec(require('./package.json').packageManager)||[,''])[1]\")\"; \
+	     [ -n \"\$$pinned_npm\" ] || { echo 'package.json packageManager must be npm@<x.y.z>' >&2; exit 1; }; \
+	     npm i -g \"npm@\$$pinned_npm\"; \
+	     npm -v; \
+	     npm run deps:lean"; \
 	  docker run --rm --name $(CHECKUP_RUNNER_CONTAINER) --ipc=host \
 	    --mount "type=volume,src=$(CHECKUP_WORKSPACE_VOLUME),dst=/app" \
 	    --workdir /app -e HOME=/tmp -e CI=1 \

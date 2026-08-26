@@ -33,6 +33,16 @@ chunk over the [per-chunk budget](pwa.md#bundle-size) turns the lane red without
 or a line of YAML of its own. Same red locally, in the image builder and in the Playwright
 build, because all four call that one script — which is the adapter rule applied literally.
 
+**Lanes that run `npm ci` install the declared npm first.** Not for tidiness: `.npmrc`
+sets `engine-strict`, and no base image here ships an npm that clears the floor
+`package.json` declares, so without the pin the install refuses outright. The version is
+read from `packageManager` — the adapter rule again, the number lives in the repo. In
+`.lean` the pin goes before the `chown`, because the npm cache is configured inside
+`$CI_PROJECT_DIR` and root-owned cache entries would then make the unprivileged `npm ci`
+refuse the folder. Lanes that never install — the release lanes only run `npm audit`, and
+`extended:unit` runs inside the `--target test` image, which inherits the builder's pin —
+carry no pin.
+
 **The extended lane runs on events, never on a timer.** Its inputs are pinned — the
 base image by digest, dependencies by lockfile — so the same commit a week later
 renders the same answer, and a scheduled run would re-verify an unchanged input. What

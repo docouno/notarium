@@ -104,6 +104,29 @@ default:
   # archive that was never produced.
   image: node:24
   before_script:
+    # The declared npm. The base image ships one below the floor package.json sets, so
+    # under engine-strict the `npm ci` below cannot run until this line has done its
+    # work — the pin is load-bearing and needs no checker of its own. The number is
+    # derived from `packageManager`; the pattern anchors the whole `npm@<x.y.z>` shape,
+    # because a bare split accepts `npm@latest` and `npm@ `.
+    #
+    # The block carries its own `set -eu` and chains nothing with `&&`, so it aborts on
+    # the spot no matter what surrounds it or follows it. That independence is the point:
+    # the same shape is copied into `docker/Dockerfile` and the `make` runners, where the
+    # harness supplies neither. Relying on the caller is what broke twice before — a
+    # failure inside an and-list is ignored by `set -e`, and the runner does not check
+    # status per line either (FF_ENABLE_BASH_EXIT_CODE_CHECK is off by default).
+    #
+    # It goes FIRST, before the chown: .npm-cache puts npm_config_cache inside
+    # $CI_PROJECT_DIR, so installing as root afterwards leaves root-owned cache entries
+    # that the su'd `npm ci` then refuses outright. It also cannot be wrapped in
+    # `su node -c '…'` — the expression carries single quotes that would close it.
+    - |
+      set -eu
+      pinned_npm="$(node -p "(/^npm@([0-9]+[.][0-9]+[.][0-9]+([-][0-9A-Za-z.-]+)?)([+].*)?$/.exec(require('./package.json').packageManager)||[,''])[1]")"
+      [ -n "$pinned_npm" ] || { echo 'package.json packageManager must be npm@<x.y.z>' >&2; exit 1; }
+      npm i -g "npm@$pinned_npm"
+      npm -v
     # Run UNPRIVILEGED. The data-root boot guard is covered by tests that chmod a
     # directory to 0o500 and require the write to be refused — root ignores that, so as
     # root the guard silently proves nothing. GitLab clones as root, hence the chown.
@@ -204,6 +227,13 @@ extended:postgres:
     POSTGRES_DB: notarium_test
     TEST_PG_URL: postgres://notarium:notarium@postgres:5432/notarium_test
   script:
+    # The declared npm — see the .lean pin above for why this line exists.
+    - |
+      set -eu
+      pinned_npm="$(node -p "(/^npm@([0-9]+[.][0-9]+[.][0-9]+([-][0-9A-Za-z.-]+)?)([+].*)?$/.exec(require('./package.json').packageManager)||[,''])[1]")"
+      [ -n "$pinned_npm" ] || { echo 'package.json packageManager must be npm@<x.y.z>' >&2; exit 1; }
+      npm i -g "npm@$pinned_npm"
+      npm -v
     - npm run deps:lean
     # GitLab starts services but does not wait for them to be ready, and a suite that
     # loses that race reads as a broken contract rather than a cold database. Poll the
@@ -235,6 +265,13 @@ extended:e2e:
   variables:
     CI: '1'
   script:
+    # The declared npm — see the .lean pin above for why this line exists.
+    - |
+      set -eu
+      pinned_npm="$(node -p "(/^npm@([0-9]+[.][0-9]+[.][0-9]+([-][0-9A-Za-z.-]+)?)([+].*)?$/.exec(require('./package.json').packageManager)||[,''])[1]")"
+      [ -n "$pinned_npm" ] || { echo 'package.json packageManager must be npm@<x.y.z>' >&2; exit 1; }
+      npm i -g "npm@$pinned_npm"
+      npm -v
     - npm run deps:lean
     - npm run e2e
   artifacts:
@@ -274,6 +311,13 @@ extended:visual:
   # that renders and publishes succeeds at exactly that, and a separate job carries the
   # pass/fail.
   script:
+    # The declared npm — see the .lean pin above for why this line exists.
+    - |
+      set -eu
+      pinned_npm="$(node -p "(/^npm@([0-9]+[.][0-9]+[.][0-9]+([-][0-9A-Za-z.-]+)?)([+].*)?$/.exec(require('./package.json').packageManager)||[,''])[1]")"
+      [ -n "$pinned_npm" ] || { echo 'package.json packageManager must be npm@<x.y.z>' >&2; exit 1; }
+      npm i -g "npm@$pinned_npm"
+      npm -v
     - npm run deps:lean
     - VISUAL_S3_KEY_ID="$VISUAL_S3_READ_KEY_ID" VISUAL_S3_SECRET="$VISUAL_S3_READ_SECRET"
       node scripts/visualBaseline.mjs pull
@@ -368,6 +412,13 @@ extended:visual-bootstrap:
     VISUAL_S3_KEY_ID: $VISUAL_S3_WRITE_KEY_ID
     VISUAL_S3_SECRET: $VISUAL_S3_WRITE_SECRET
   script:
+    # The declared npm — see the .lean pin above for why this line exists.
+    - |
+      set -eu
+      pinned_npm="$(node -p "(/^npm@([0-9]+[.][0-9]+[.][0-9]+([-][0-9A-Za-z.-]+)?)([+].*)?$/.exec(require('./package.json').packageManager)||[,''])[1]")"
+      [ -n "$pinned_npm" ] || { echo 'package.json packageManager must be npm@<x.y.z>' >&2; exit 1; }
+      npm i -g "npm@$pinned_npm"
+      npm -v
     - npm run deps:lean
     - npx playwright test test/visual --update-snapshots
     - node scripts/visualBaseline.mjs publish

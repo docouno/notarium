@@ -422,6 +422,36 @@ const runtimeAbout = async (ref) => {
   }
 }
 
+// `.npmrc` ships in the image because engine-strict has to be in effect for the
+// installs the build itself runs. That makes a repo file with a credential shape a
+// published artifact, so the appliance states what that file is allowed to contain
+// instead of hoping nothing was added: an allowlist, because a denylist of secret
+// shapes is a guessing game and npm config has too many legal spellings.
+//
+// The report prints the KEY only. A detector that echoes the offending line would
+// paste the credential it just found into a build log that outlives the build.
+const NPMRC_SCRIPT = `
+const fs = require('node:fs')
+const ALLOWED = new Set(['engine-strict=true'])
+const directives = fs
+  .readFileSync('/app/.npmrc', 'utf8')
+  .split('\\n')
+  .map((line) => line.trim())
+  .filter((line) => line && !line.startsWith(';') && !line.startsWith('#'))
+
+if (!directives.length) {
+  throw new Error('/app/.npmrc carries no directives: engine-strict is not in effect here')
+}
+
+const unexpected = directives
+  .filter((line) => !ALLOWED.has(line))
+  .map((line) => line.split('=')[0].slice(0, 60))
+
+if (unexpected.length) {
+  throw new Error('unexpected .npmrc directives: ' + unexpected.join(', '))
+}
+`
+
 const CORPUS_PARITY_SCRIPT = `
 const fs = require('node:fs')
 const path = require('node:path')
@@ -564,6 +594,15 @@ const smoke = async (ref, expected) => {
 
   if (!bundled.stdout) {
     die(`smoke: the SPA bundle does not carry commit ${expected.shortCommit}`)
+  }
+
+  say('  · .npmrc directives …')
+  const npmrc = docker(['run', '--rm', '--entrypoint', 'node', ref, '-e', NPMRC_SCRIPT], {
+    quiet: true,
+  })
+
+  if (!npmrc.ok) {
+    die(`smoke: ${npmrc.stderr.trim().split('\n').pop()}`)
   }
 
   say('  · license corpus parity …')

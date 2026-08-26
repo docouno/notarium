@@ -46,7 +46,7 @@ RUN apt-get update \
 # Install deps against the lockfile first for better layer caching. npm
 # workspaces: the lockfile covers every package, so each workspace manifest must
 # be present before `npm ci`.
-COPY package.json package-lock.json ./
+COPY package.json package-lock.json .npmrc ./
 COPY packages/cli/package.json packages/cli/
 COPY packages/contract/package.json packages/contract/
 COPY packages/core/package.json packages/core/
@@ -68,6 +68,22 @@ COPY packages/engine-memory/package.json packages/engine-memory/
 COPY packages/engine-vector/package.json packages/engine-vector/
 COPY packages/server/package.json packages/server/
 COPY packages/web/package.json packages/web/
+# The pinned base ships an npm below the floor package.json declares, and .npmrc — kept
+# in the COPY above for exactly this reason — makes that a refusal rather than a warning
+# (engine-strict), so `npm run deps:full` below cannot run until the declared npm is
+# installed. The line is therefore self-verifying: drop it and the next layer fails with
+# EBADENGINE. The number is derived from `packageManager`, never repeated. The block is
+# byte-identical to the one in `.gitlab-ci.yml` and the `make` runners, and carries its
+# own `set -eu` and no `&&` so that it aborts the same way in all three — a chain is only
+# fail-closed while it is the last command of its script, which is a property of the
+# caller, not of the block. Twice a copy landed somewhere it was not.
+RUN set -eu; \
+  pinned_npm="$(node -p "(/^npm@([0-9]+[.][0-9]+[.][0-9]+([-][0-9A-Za-z.-]+)?)([+].*)?$/.exec(require('./package.json').packageManager)||[,''])[1]")"; \
+  [ -n "$pinned_npm" ] || { echo 'package.json packageManager must be npm@<x.y.z>' >&2; exit 1; }; \
+  npm i -g "npm@$pinned_npm"; \
+  npm cache clean --force; \
+  npm -v
+
 RUN npm run deps:full
 
 # Bundle the SPA (vite → packages/web/dist) and the server (tsup →
@@ -135,7 +151,7 @@ RUN chmod 0755 /usr/local/bin/notarium \
 # devDependencies — bundled by the build stage, skipped here. The workspace
 # manifests must be present for npm ci, and @notarium/web's one also anchors
 # the SPA lookup (the server resolves packages/web/dist through it).
-COPY package.json package-lock.json ./
+COPY package.json package-lock.json .npmrc ./
 COPY packages/cli/package.json packages/cli/
 COPY packages/contract/package.json packages/contract/
 COPY packages/core/package.json packages/core/
@@ -152,6 +168,16 @@ COPY packages/engine-memory/package.json packages/engine-memory/
 COPY packages/engine-vector/package.json packages/engine-vector/
 COPY packages/server/package.json packages/server/
 COPY packages/web/package.json packages/web/
+# The same declared npm as the builder stage, for the same reason. The cache purge shares
+# this RUN because union layers do not give bytes back: as one layer the pin costs
+# +3.4 MB compressed against +13.1 MB split in two, and this is the published stage.
+RUN set -eu; \
+  pinned_npm="$(node -p "(/^npm@([0-9]+[.][0-9]+[.][0-9]+([-][0-9A-Za-z.-]+)?)([+].*)?$/.exec(require('./package.json').packageManager)||[,''])[1]")"; \
+  [ -n "$pinned_npm" ] || { echo 'package.json packageManager must be npm@<x.y.z>' >&2; exit 1; }; \
+  npm i -g "npm@$pinned_npm"; \
+  npm cache clean --force; \
+  npm -v
+
 RUN npm run deps:full -- --omit=dev && npm cache clean --force
 
 # The bundled server + the built SPA. No .env — config comes from the environment.
