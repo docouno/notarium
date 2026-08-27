@@ -1,6 +1,8 @@
 import type {
   FileClaim,
   FileClaimedRemoval,
+  FileConditionalDirectoryMove,
+  FileConditionalDirectoryMoveResult,
   FileObservation,
   FilePackagePublication,
   FileProofTransition,
@@ -61,8 +63,7 @@ export type AdmissionDiagnostic = {
 
 /** The base inventory the authority itself needs: enumerate a placement, read a
  *  manifest, and tell a directory from a file. Deliberately three operations and
- *  not the whole port — the authority owns physical bytes and admission, so it
- *  has no business reaching a directory move or a note write. */
+ *  not the whole port — physical mutations remain named optional capabilities. */
 export type ResourceAuthorityFileView = {
   scan(): Promise<FileStat[]>
   read(path: string): Promise<string | null>
@@ -78,6 +79,7 @@ export type ResourceAuthorityFileCapabilities = {
   resourceObservation?: FileResourceObservation
   resourcePublication?: FileResourcePublication
   claimedRemoval?: FileClaimedRemoval
+  conditionalDirectoryMove?: FileConditionalDirectoryMove
   packagePublication?: FilePackagePublication
   strictPublication?: FileStrictPublication
 }
@@ -116,6 +118,9 @@ export const resourceAuthorityAdapterOf = (
       : {}),
     ...(assembly.capabilities.claimedRemoval
       ? { claimedRemoval: assembly.capabilities.claimedRemoval }
+      : {}),
+    ...(assembly.capabilities.conditionalDirectoryMove
+      ? { conditionalDirectoryMove: assembly.capabilities.conditionalDirectoryMove }
       : {}),
     ...(assembly.capabilities.packagePublication
       ? { packagePublication: assembly.capabilities.packagePublication }
@@ -174,6 +179,24 @@ export type PackagePublicationView = {
   publishIfAbsent(
     request: Omit<ResourcePackagePublicationRequest, 'expectedRoot'>,
   ): Promise<ResourcePublicationResult>
+}
+
+export type ResourceDirectoryMoveProof = {
+  adapterId: string
+  claim: FileClaim & { kind: 'present' }
+}
+
+export type ResourceConditionalDirectoryMoveResult =
+  | Exclude<FileConditionalDirectoryMoveResult, { status: 'moved' }>
+  | { status: 'moved'; targetProof: ResourceDirectoryMoveProof }
+
+/** A source/target/proof route resolved once at composition. The method is an
+ * admitted entry: RoleLibrary already owns the placement/package leases, while
+ * the authority keeps adapter routing and claims out of that caller. */
+export type ConditionalDirectoryMoveView = {
+  moveIfClaimed(
+    expectedSourceProof: ResourceDirectoryMoveProof,
+  ): Promise<ResourceConditionalDirectoryMoveResult>
 }
 
 export type ResourceProofTransition = Omit<FileProofTransition, 'path'> & { path: string }

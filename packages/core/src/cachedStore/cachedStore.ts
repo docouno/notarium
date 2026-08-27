@@ -127,6 +127,11 @@ type ReadEffects = {
   changedIds: Set<string>
 }
 
+type ExactNoteTarget = {
+  id: string
+  filePath: string
+}
+
 const exactObservedMeta = (note: NoteContent, fallback: NoteMeta): NoteMeta => ({
   ...fallback,
   title: note.title ?? fallback.title,
@@ -2219,10 +2224,8 @@ export class CachedStore implements KnowledgeStore {
    *  returned — opening a note heals its part of the graph (the engine's
    *  relation index may lag or lie). */
   async read(id: string, opts?: ReadOptions): Promise<NoteContent> {
-    if (!opts?.mutationClaimed) {
-      await this.recoverIdentityForSurface()
-    }
-    const content = await this.readInternal(id, opts, opts?.mutationClaimed === true)
+    await this.recoverIdentityForSurface()
+    const content = await this.readInternal(id, opts, false)
 
     await this.ensureIdentityPublished()
     return content
@@ -2499,8 +2502,9 @@ export class CachedStore implements KnowledgeStore {
     opts?: ReadOptions,
     effects?: ReadEffects,
     admissionHeld = false,
+    claimedIds?: ReadonlySet<string>,
   ): Promise<NoteContent> {
-    return this.readInternal(id, opts, true, effects, admissionHeld)
+    return this.readInternal(id, opts, true, effects, admissionHeld, claimedIds)
   }
 
   private async readInternal(
@@ -2509,6 +2513,7 @@ export class CachedStore implements KnowledgeStore {
     mainClaimed: boolean,
     effects?: ReadEffects,
     admissionHeld = false,
+    mainClaimedIds?: ReadonlySet<string>,
   ): Promise<NoteContent> {
     const identityTarget = normalizeWikilinkTarget(rawId)
     const identityEnvelopeSyntax = isWikilinkIdentityTarget(identityTarget)
@@ -2660,19 +2665,28 @@ export class CachedStore implements KnowledgeStore {
       }
       const bodyClaim = detail.frontmatter?.[NOTE_ID_FRONTMATTER_KEY]
 
-      if (
-        claimedIds &&
-        !this.inner.capabilities.identity &&
-        typeof bodyClaim === 'string' &&
-        isValidNoteId(bodyClaim)
-      ) {
-        const claimedId = this.canonicalMutationId(bodyClaim)
+      if (claimedIds) {
+        const strictClaimedObservation = mainClaimed && mainClaimedIds !== undefined
+        const disclosedIds = [
+          strictClaimedObservation ? detail.id : undefined,
+          (strictClaimedObservation || !this.inner.capabilities.identity) &&
+          typeof bodyClaim === 'string' &&
+          isValidNoteId(bodyClaim)
+            ? bodyClaim
+            : undefined,
+        ]
 
-        if (claimedId !== current.id && !claimedIds.has(claimedId)) {
-          // The body disclosed a resource the first claim could not know. Do
-          // not patch any state yet: release, expand the stable claim and read
-          // again so an already-admitted forced-id operation orders first.
-          return { kind: 'expand', noteId: claimedId }
+        for (const disclosedId of disclosedIds) {
+          if (!disclosedId) {
+            continue
+          }
+          const claimedId = this.canonicalMutationId(disclosedId)
+
+          if (claimedId !== current.id && !claimedIds.has(claimedId)) {
+            // The exact observation disclosed a resource the first claim could
+            // not know. Do not patch identity, preview or graph state outside it.
+            return { kind: 'expand', noteId: claimedId }
+          }
         }
       }
       // Exact-path reads are expected to answer the claimed path. An engine
@@ -2747,7 +2761,7 @@ export class CachedStore implements KnowledgeStore {
         throw err
       }
       if (mainClaimed) {
-        const attempt = await perform()
+        const attempt = await perform(mainClaimedIds)
 
         if (attempt.kind === 'complete') {
           return attempt.content
@@ -3574,6 +3588,96 @@ export class CachedStore implements KnowledgeStore {
   }
 
   // ── mutations — delegated to WriteEngine ───────────────────────
+
+  /** Execute a host compound operation under one stable exact note/path claim.
+   * The claim stays private to this read-model; nested callers may reuse only a
+   * scope that already covers the same current target.
+   * @see docs/core.md#write-through */
+  async withExactNoteClaim<T>(
+    noteId: string,
+    task: (current: NoteContent) => Promise<T>,
+  ): Promise<T> {
+    if (this.mutations.hasClaimContext()) {
+      if (!this.mutations.holds()) {
+        throw new Error('inherited mutation claim context has expired')
+      }
+
+      const target = this.exactNoteTarget(noteId)
+
+      return this.mutations.runWithinHeld(this.exactNoteClaim(target), () =>
+        this.runExactNoteTask(noteId, task),
+      )
+    }
+
+    const releaseIntent = await this.mutationAdmission.acquire('mutation')
+    let intentReleased = false
+
+    try {
+      await this.ensureMutationReady()
+      await this.recoverIdentityForSurface()
+      const pending = this.mutations.runStable(
+        () => this.exactNoteClaim(this.exactNoteTarget(noteId)),
+        () => this.runExactNoteTask(noteId, task),
+      )
+
+      // Match ordinary writes: once the exact claim is synchronously queued, the
+      // fair resource coordinator owns ordering and unrelated reads may proceed.
+      releaseIntent()
+      intentReleased = true
+      return await pending
+    } finally {
+      if (!intentReleased) {
+        releaseIntent()
+      }
+    }
+  }
+
+  private exactNoteTarget(noteId: string): ExactNoteTarget {
+    const id = this.canonicalMutationId(noteId)
+    const filePath = this.identity.pathFor(id) ?? this.snap.notes.get(id)?.filePath
+
+    if (!filePath) {
+      throw noteNotFound(id)
+    }
+
+    return { id, filePath }
+  }
+
+  private exactNoteClaim(target: ExactNoteTarget) {
+    return { noteIds: [target.id], paths: [target.filePath] }
+  }
+
+  private async runExactNoteTask<T>(
+    noteId: string,
+    task: (current: NoteContent) => Promise<T>,
+  ): Promise<T> {
+    const target = this.exactNoteTarget(noteId)
+    const current = await this.readClaimed(
+      target.id,
+      undefined,
+      undefined,
+      true,
+      new Set([target.id]),
+    )
+    const observedId = current.id ? this.canonicalMutationId(current.id) : undefined
+
+    // The claim names an id, so the observation handed to the compound task must
+    // answer to that id. An identity-capable engine that returns a body with no
+    // id of its own makes the decorator mint one from its own registry, and the
+    // task would then edit a note the lease never fenced. The PATH axis needs no
+    // second test here: an observation off the claimed path is already refused
+    // above, before finalizeRead, and re-deriving the target after the read
+    // cannot move either axis — every mutation that could conflicts with this
+    // very lease and is still queued behind it.
+    if (observedId !== target.id) {
+      throw new Error('exact note observation escaped the held mutation claim')
+    }
+
+    const result = await task(current)
+
+    await this.ensureIdentityPublished()
+    return result
+  }
 
   write(input: WriteInput, opts?: MutationOptions): Promise<WriteResult> {
     return this.runMutation(() => this.writes.write(this.canonicalWriteInput(input), opts))

@@ -435,7 +435,9 @@ is still `503` with reason
 `role_install_unavailable` — composition refusal happens before a personal space
 is minted or a byte is staged. Presence answers for the deployment, not for every
 pathname: a mount or filesystem that refuses the package commit itself yields the
-same typed `503`, and nothing was published at that failing target either.
+same typed `503`, and nothing was published at that failing target either. A placement move unwinds by default,
+so the same reading holds; the one exception is a move whose unwind was itself refused, where the
+reason rides a package that really is at the target it calls unusable.
 
 A folder move has no corresponding availability read model. The client invokes
 the move, and the store then refuses the request at runtime when

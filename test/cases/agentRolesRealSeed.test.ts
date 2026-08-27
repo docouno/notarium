@@ -6,7 +6,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { promisify } from 'node:util'
 import { describe, expect, it } from 'vitest'
 
-import { parseAbilityLocator } from '@notarium/core'
+import { frontmatterValue, parseAbilityLocator } from '@notarium/core'
 import { parseSkillFile } from '@notarium/server'
 
 import { buildCasesWorld } from './build'
@@ -223,10 +223,12 @@ describe('agent-roles real seed', () => {
         // library and say so in the link. Seeded with no answer to "which space is
         // personal" the link came out `[[notarium-id:space:…]]` — an address
         // `ownedPlacementOf` refuses — and the stand still reported a healthy seed.
-        const personal = packagesOf.get(spaces.find((space) => space.slug === 'main')!.id)!
-        const projectRole = [...personal.values()].find(
-          (parsed) => parsed.role && parsed.name === 'grooming',
+        const mainSpaceId = spaces.find((space) => space.slug === 'main')!.id
+        const personal = packagesOf.get(mainSpaceId)!
+        const projectRolePackage = [...personal].find(
+          ([, parsed]) => parsed.role && parsed.name === 'grooming',
         )
+        const projectRole = projectRolePackage?.[1]
         expect(projectRole?.linkedSkills).toEqual([
           expect.objectContaining({
             kind: 'locator',
@@ -241,6 +243,30 @@ describe('agent-roles real seed', () => {
         // case deliberately renames — an exact link keeps resolving across a rename,
         // and a link that resolves to nothing is what the defect produced.
         expect(installed?.name).toBe('grooming-evidence-mine')
+
+        // The published manifest and the identity row have to name the SAME note. A
+        // PROJECT placement is the shape where they can diverge — the package lives
+        // under the reserved `_projects/<encoded-project>` root instead of the library
+        // root — and `notarium-id` is what a later rename, restore or exact locator
+        // resolves against, so a manifest carrying a foreign id is a silent swap that
+        // no count of published packages would show. Read off the real seeder, on the
+        // seeded meta-DB this row already holds open.
+        const roleIdentity = db
+          .prepare(
+            `SELECT id, file_path FROM note_identity
+              WHERE space = ? AND file_path LIKE ? AND deleted_at IS NULL`,
+          )
+          .get(mainSpaceId, `%/${projectRolePackage![0]}/SKILL.md`) as
+          { file_path: string; id: string } | undefined
+
+        expect(roleIdentity?.file_path).toContain('_projects/')
+        expect(roleIdentity?.file_path).toContain(`/${projectRolePackage![0]}/SKILL.md`)
+        expect(
+          frontmatterValue(
+            await readFile(join(dataDir, 'spaces', 'main', roleIdentity!.file_path), 'utf8'),
+            'notarium-id',
+          ),
+        ).toBe(roleIdentity?.id)
         const markdownPackage = [...personal].find(
           ([, parsed]) => parsed.name === 'markdown-package-proof',
         )

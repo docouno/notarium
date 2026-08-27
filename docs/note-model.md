@@ -93,6 +93,24 @@ under note CAS, then the placement-owned `home`/availability state, and returns 
 version token and per-step outcome. The generic `POST /api/note` ability arm calls the same authored
 document producer; it is not a parallel serializer. The ability surface omits generic note metadata
 and changes only manifest identity, instructions, and (for Roles) the authored attachment list.
+A strict Owned capture first holds the root note's exact id/path claim and only then reads the physical
+manifest under package admission. It returns one immutable registry id/path/version plus manifest
+owner/package snapshot and releases both scopes before access, detail, and dependency work. Every
+document, enabled, availability, or move mutation reopens that captured dual identity in the same
+`note → placement/package` order; no package-admitted callback reads the note projection. A semantic
+document no-op still performs this fresh proof but writes neither package bytes nor a note revision;
+explicit `home`/availability/enabled steps requested in the same compound operation remain separate
+fresh steps with their existing partial-result order. A physical placement move hands the admitted
+manifest claim to the adapter at its original source path; the adapter binds that resource to the
+directory transition and returns a fresh target-scoped proof for finalize/rollback. Callers never
+compare an opaque claim across paths, and an external source replacement is reported unavailable.
+Initial exact capture resolves the package through the cached class metadata projection; it does not
+materialize sibling bodies. After that registry id is known, the document path observes only the exact
+note and its own manifest — that part does not grow with the library. Two axes around it still do, and
+neither is claimed to be constant: the locator-to-registry projection above, and the placement-wide name
+check every package write performs, which reads the neighbouring manifests to answer whether a name is
+free. Both are reported as measured numbers rather than asserted away. Because `skill` is graph-hidden,
+an authored edit emits no graph transition and preserves the warm graph-health derivation revision.
 A generic note/history/trash reference remains `/n/<note-id>`—there is no
 parallel `/skill` resolver. Create and Add return only
 after the common note projection can read the returned exact id, so immediate navigation cannot

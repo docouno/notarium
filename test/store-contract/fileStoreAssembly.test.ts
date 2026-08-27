@@ -125,14 +125,15 @@ describe('FileStoreAssembly — the producer boundary', () => {
 
     expect(Object.keys(adapter.capabilities).sort()).toEqual([
       'claimedRemoval',
+      'conditionalDirectoryMove',
       'packagePublication',
       'resourceExport',
       'resourceObservation',
       'resourcePublication',
       'strictPublication',
     ])
-    // Moving a folder or rewriting a note is the store's business; the authority
-    // owns bytes and admission, and cannot name either operation.
+    // Generic folder moves and note rewrites remain the store's business. The
+    // authority receives only the conditional proof-bound directory transition.
     expect(adapter.capabilities).not.toHaveProperty('directoryNoReplaceMove')
     expect(adapter.capabilities).not.toHaveProperty('conditionalFileMutation')
     expect(adapter.capabilities).not.toHaveProperty('watch')

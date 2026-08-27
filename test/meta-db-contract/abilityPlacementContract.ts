@@ -42,8 +42,12 @@ const move = {
   toLocator: serializeAbilityLocator(spaceLocator),
   registryNoteId: REGISTRY_NOTE_ID,
   manifestNoteId: MANIFEST_NOTE_ID,
+  trail: 'record' as const,
 }
 
+/** A DEMOTION: a second move, in its own right, that happens to run the first one
+ *  backwards. It records a hop like any other move, because the package really did
+ *  take the address it is going to and the spelling it leaves has to forward there. */
 const reverseMove = {
   fromTargetId: TO_TARGET,
   toTargetId: FROM_TARGET,
@@ -51,7 +55,13 @@ const reverseMove = {
   toLocator: serializeAbilityLocator(projectLocator),
   registryNoteId: REGISTRY_NOTE_ID,
   manifestNoteId: MANIFEST_NOTE_ID,
+  trail: 'record' as const,
 }
+
+/** The UNDO of `move`, which is not the same operation as the demotion above even
+ *  though its ends are identical: it unwinds a hop this caller recorded moments ago,
+ *  so the journal must end up with no hop at all rather than with a counter-hop. */
+const cancelMove = { ...reverseMove, trail: 'cancel' as const }
 
 /** BOTH spellings of the one package, asked in ONE question — the shape the hot path
  *  asks in. `isEnabled` and `disabled` are the same question at two arities, and only
@@ -237,6 +247,53 @@ export const describeAbilityPlacementContract = (
       })
     })
 
+    /** The undo of a promotion, which is where the journal's ERASING operation earns
+     *  its place. A hop tombstones the address it names — every reader of this table
+     *  refuses on the row alone, without asking whether the destination holds anything
+     *  — so answering an undone hop with a counter-hop leaves the package addressable
+     *  from neither spelling the moment the step that would clear the counter-hop is
+     *  interrupted. `cancel` removes the hop instead, and needs no step after it. */
+    it('erases the hop it walks back instead of answering it with a counter-hop', async () => {
+      await db.scopePins.addPin({
+        targetKind: 'role',
+        targetId: FROM_TARGET,
+        targetSpace: 'space-main',
+        noteSpace: 'space-main',
+        noteId: 'PinnedNote01',
+        createdAt: '2026-08-17T00:00:00Z',
+      })
+      await db.abilityPreferences.setEnabled(
+        'user:alice',
+        { locator: projectLocator, registryNoteId: 'RegistryNote1' },
+        false,
+        '2026-08-17T00:00:00Z',
+      )
+
+      await db.abilityPlacement.moveOwnedRolePlacement(move)
+      await db.abilityPlacement.moveOwnedRolePlacement(cancelMove)
+
+      // NEITHER spelling forwards: the package is back where it started and answers
+      // for itself there, exactly as it did before the promotion was attempted.
+      await expect(
+        db.abilityPlacement.resolveMovedOwnedRoleLocator(move.fromLocator),
+      ).resolves.toBeNull()
+      await expect(
+        db.abilityPlacement.resolveMovedOwnedRoleLocator(move.toLocator),
+      ).resolves.toBeNull()
+      // The rows the hop carried came back with it — an erased trail with the pointers
+      // left at the destination would be the same silent loss the move exists to avoid.
+      await expect(db.scopePins.pinsForTarget('role', FROM_TARGET)).resolves.toMatchObject([
+        { noteId: 'PinnedNote01' },
+      ])
+      await expect(db.scopePins.pinsForTarget('role', TO_TARGET)).resolves.toEqual([])
+      await expect(db.abilityPreferences.isEnabled('user:alice', projectLocator)).resolves.toBe(
+        false,
+      )
+      // …and the address the package never kept says nothing about it any more, so a
+      // later disable written at the Space spelling does not reach the project package.
+      await expect(db.abilityPreferences.isEnabled('user:alice', spaceLocator)).resolves.toBe(true)
+    })
+
     it('leaves pointer tables empty when the old placement holds nothing', async () => {
       await expect(db.abilityPlacement.moveOwnedRolePlacement(move)).resolves.toBeUndefined()
       await expect(db.contextSets.setsForTarget('role', TO_TARGET)).resolves.toEqual([])
@@ -326,6 +383,7 @@ export const describeAbilityPlacementContract = (
           toLocator: move.fromLocator,
           registryNoteId: REGISTRY_NOTE_ID,
           manifestNoteId: MANIFEST_NOTE_ID,
+          trail: 'record',
         }),
       ).resolves.toBeUndefined()
 
@@ -498,6 +556,30 @@ export const describeAbilityPlacementPreferencesOnlyContract = (
       await expect(abilityPreferences.isEnabled('user:alice', spaceLocator)).resolves.toBe(false)
       await expect(abilityPreferences.isEnabled('user:alice', projectLocator)).resolves.toBe(false)
       await expect(bothSpellings(abilityPreferences, 'user:alice')).resolves.toEqual(BOTH_DISABLED)
+    })
+
+    /** The same erasure in the host that keeps only this table: the forwarding lives in
+     *  the preference port here, so `cancel` has to leave BOTH spellings unforwarded or
+     *  a meta-DB-less deployment keeps the dead end the durable ones no longer have. */
+    it('erases the hop it walks back instead of answering it with a counter-hop', async () => {
+      const { abilityPlacement, abilityPreferences } = await factory()
+
+      await disable(abilityPreferences, 'user:alice', projectLocator)
+
+      await abilityPlacement.moveOwnedRolePlacement(move)
+      await abilityPlacement.moveOwnedRolePlacement(cancelMove)
+
+      await expect(
+        abilityPlacement.resolveMovedOwnedRoleLocator(move.fromLocator),
+      ).resolves.toBeNull()
+      await expect(
+        abilityPlacement.resolveMovedOwnedRoleLocator(move.toLocator),
+      ).resolves.toBeNull()
+      await expect(abilityPreferences.isEnabled('user:alice', projectLocator)).resolves.toBe(false)
+      await expect(abilityPreferences.isEnabled('user:alice', spaceLocator)).resolves.toBe(true)
+      await expect(bothSpellings(abilityPreferences, 'user:alice')).resolves.toEqual(
+        new Set([serializeAbilityLocator(projectLocator)]),
+      )
     })
 
     it('clears a destination the moving package left behind by hand', async () => {

@@ -10,11 +10,12 @@
 // instance would make the cases order-dependent.
 
 import { Buffer } from 'node:buffer'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type {
   RoleLibrary,
   RoleLocation,
+  RolePackageTarget,
   SkillPackage,
 } from '../../packages/server/src/services/roles'
 import type { WritableRoleLibrary } from '../roleLibraryComposition'
@@ -29,13 +30,22 @@ export const ROLE_LIBRARY_CONTRACT_PREFIX = 'RoleLibrary publication contract �
 export const packageDirectoryOf = (name: string): string =>
   Buffer.from(name).toString('base64url').padEnd(12, 'A').slice(0, 12)
 
-export const packageOf = (name: string, body: string): SkillPackage => ({
-  directoryName: packageDirectoryOf(name),
-  files: new Map([
-    ['SKILL.md', Buffer.from(`---\nname: ${name}\ndescription: ${name}.\n---\n\n${body}`)],
-    ['references/guide.md', Buffer.from(`# ${name}\n\n${body}\n`)],
-  ]),
-})
+export const packageOf = (name: string, body: string): SkillPackage => {
+  const directoryName = packageDirectoryOf(name)
+
+  return {
+    directoryName,
+    files: new Map([
+      [
+        'SKILL.md',
+        Buffer.from(
+          `---\nnotarium-id: ${directoryName}\nname: ${name}\ndescription: ${name}.\n---\n\n${body}`,
+        ),
+      ],
+      ['references/guide.md', Buffer.from(`# ${name}\n\n${body}\n`)],
+    ]),
+  }
+}
 
 const bytesOf = async (library: RoleLibrary, location: RoleLocation, name: string) => {
   const pkg = await library.get(location, name)
@@ -296,6 +306,44 @@ export const describeRoleLibraryContract = (
         ),
       ).resolves.toBe(false)
       await expect(bytesOf(library, version, 'wanted')).resolves.toEqual(before)
+    })
+
+    // ── captured identity ───────────────────────────────────────────────────
+    // The port's two strict writes take the identity their caller captured EARLIER —
+    // production writes durable state between the capture and the write — so both owe
+    // the same answer when the package at that address is no longer that identity.
+
+    it('refuses a strict write against an identity that is not at the address', async () => {
+      const pkg = packageOf('wanted', 'Owned.')
+
+      await expect(library.putIfAbsent(version, pkg)).resolves.toBe(true)
+      const captured = await library.captureExactPackage(version, pkg.directoryName)
+
+      expect(captured).not.toBeNull()
+      // The manifest half of the identity, and the half that has to carry the refusal:
+      // the registry id is what the caller addressed the note BY, so an implementation
+      // comparing it compares a value with itself.
+      const stale: RolePackageTarget = {
+        kind: captured!.kind,
+        registryNoteId: captured!.registryNoteId,
+        manifestNoteId: packageDirectoryOf('other'),
+      }
+      const task = vi.fn(async () => 'ran')
+
+      await expect(
+        library.withExactPackageMutation(version, pkg.directoryName, stale, task),
+      ).resolves.toBeNull()
+      expect(task).not.toHaveBeenCalled()
+      // Never `true`, and nothing moved. Implementations refuse a move by throwing,
+      // but the floor asserted here is the one every one of them owes.
+      await expect(
+        library.movePackage(version, location, pkg.directoryName, undefined, undefined, stale).then(
+          (moved) => moved,
+          () => false,
+        ),
+      ).resolves.toBe(false)
+      await expect(library.getByDirectory(location, pkg.directoryName)).resolves.toBeNull()
+      await expect(library.getByDirectory(version, pkg.directoryName)).resolves.not.toBeNull()
     })
   })
 }

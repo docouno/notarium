@@ -734,6 +734,7 @@ export class WriteEngine {
       const live = input.originalId
         ? await this.host.inner.read(this.innerNoteKey(input.originalId), {
             identityOnly: supportsExactIdentityAddress(this.host.inner),
+            ...(opts?.resourceAdmitted ? { resourceAdmitted: true } : {}),
           })
         : undefined
 
@@ -931,7 +932,14 @@ export class WriteEngine {
       }
       live = await this.host.inner.read(
         this.innerNoteKey(input.originalId, storageKey),
-        supportsExactIdentityAddress(this.host.inner) ? { identityOnly: true } : undefined,
+        supportsExactIdentityAddress(this.host.inner)
+          ? {
+              identityOnly: true,
+              ...(opts?.resourceAdmitted ? { resourceAdmitted: true } : {}),
+            }
+          : opts?.resourceAdmitted
+            ? { resourceAdmitted: true }
+            : undefined,
       )
 
       await opts?.assertCurrent?.(live)

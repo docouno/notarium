@@ -26,6 +26,10 @@ const hostFor = (
       read: vi.fn(),
       write: vi.fn(),
       remove: vi.fn(),
+      // Prod shape of the path-keyed engine: `capabilities.identity` is false, yet the
+      // read-model registry makes the exact stable-id envelope addressable. Omitting
+      // `setLinkIdentities` here would test a capability pair no engine ships.
+      setLinkIdentities: vi.fn(),
     },
     snap: {
       notes: Object.assign(notes, {
@@ -267,6 +271,68 @@ describe('WriteEngine destination fence', () => {
     ).rejects.toThrow('physical failed')
     expect(events).toEqual(['around:enter', 'around:finally'])
   })
+
+  it.each([
+    ['path-keyed engine with the identity registry', false],
+    ['identity-owning engine', true],
+  ] as const)(
+    'keeps the pre-write identity observation inside an admitted resource scope (%s)',
+    async (_label, identity) => {
+      const id = 'owned-note-id'
+      const path = `${PACKAGE_DIR}/SKILL.md`
+      const notes = new Map<string, NoteMeta>([
+        [
+          id,
+          {
+            id,
+            title: 'Owned',
+            class: 'skill',
+            filePath: path,
+            modifiedAt: null,
+            createdAt: null,
+          },
+        ],
+      ])
+      const live = {
+        id,
+        title: 'Owned',
+        class: 'skill',
+        filePath: path,
+        content: 'before',
+        frontmatter: {},
+        versionToken: 'before-token',
+        physicalIncarnation: { adapterId: 'test', claim: { kind: 'test', value: 'before' } },
+      } as unknown as NoteContent
+      const after = { ...live, content: 'after', versionToken: 'after-token' }
+      const { host } = hostFor(notes)
+
+      ;(host.inner.capabilities as { identity: boolean }).identity = identity
+      ;(host.inner.read as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(live)
+        .mockResolvedValue(after)
+      ;(host.inner.write as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id,
+        title: 'Owned',
+        class: 'skill',
+        filePath: path,
+        versionToken: 'after-token',
+      })
+
+      await new WriteEngine(host).write(
+        {
+          originalId: id,
+          title: 'Owned',
+          content: 'after',
+          versionToken: exactVersionToken(live),
+        },
+        { resourceAdmitted: true },
+      )
+
+      expect((host.inner.read as ReturnType<typeof vi.fn>).mock.calls[0]?.[1]).toMatchObject({
+        resourceAdmitted: true,
+      })
+    },
+  )
 
   /** `<pkg>/references/SKILL.md` ends like a manifest and is an auxiliary: the engine
    *  renames it, so the claim the fence takes has to cover where it lands. */

@@ -1,5 +1,6 @@
 import type {
   KnowledgeStore,
+  NoteContent,
   StoreEvent,
   TagMutationInput,
   TagMutationResult,
@@ -12,6 +13,8 @@ import type { SpaceMarkerFacet } from '../projects'
 export type SpaceStore = KnowledgeStore & {
   /** Host-internal metadata delta owned by CachedStore's note mutation fence. */
   mutateTags(input: TagMutationInput): Promise<TagMutationResult>
+  /** Host compound operation under one stable exact note/path claim. */
+  withExactNoteClaim<T>(noteId: string, task: (current: NoteContent) => Promise<T>): Promise<T>
   start?(): Promise<void>
   /** Await the note-id registry checkpoint after a lazy boot. Global id routing
    * uses this before handing the store to an ordinary read. */

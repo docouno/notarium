@@ -16,7 +16,7 @@ import { createLocalFsFiles } from '@notarium/engine'
 import { describeFileStoreFacets } from './fileStoreFacets'
 import { createMemoryFileStore } from './memoryFileStore'
 
-const ALL_CAPABILITIES = [
+const MEMORY_CAPABILITIES = [
   'exactRead',
   'resourceExport',
   'conditionalFileMutation',
@@ -31,12 +31,16 @@ const ALL_CAPABILITIES = [
   'watch',
 ] as const
 
+// Physical-incarnation continuity is intentionally LocalFS-only. The memory
+// adapter must not fake an inode/claim axis it cannot represent.
+const LOCALFS_CAPABILITIES = [...MEMORY_CAPABILITIES, 'conditionalDirectoryMove'] as const
+
 const ALL_ACCELERATORS = ['exactDirectorySpelling'] as const
 
 describeFileStoreFacets(
   'LocalFS',
   {
-    capabilities: ALL_CAPABILITIES,
+    capabilities: LOCALFS_CAPABILITIES,
     accelerators: ALL_ACCELERATORS,
     strictRestartDurable: true,
   },
@@ -53,7 +57,7 @@ describeFileStoreFacets(
 describeFileStoreFacets(
   'a memory adapter declaring every facet',
   {
-    capabilities: ALL_CAPABILITIES,
+    capabilities: MEMORY_CAPABILITIES,
     accelerators: ALL_ACCELERATORS,
     strictRestartDurable: false,
   },

@@ -1,5 +1,14 @@
 import { execFileSync } from 'node:child_process'
-import { promises as fs } from 'node:fs'
+import {
+  appendFileSync,
+  promises as fs,
+  mkdirSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -1280,6 +1289,1047 @@ describe('localFs pathname occupancy', () => {
     await expect(fs.lstat(join(root, 'source'))).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
+  itDirMove('binds the directory that held the pathname when the observation opened', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+
+    await fs.mkdir(join(root, 'source'))
+    await fs.writeFile(join(root, 'source', 'SKILL.md'), 'manifest')
+    await fs.mkdir(join(root, 'foreign'))
+    await fs.link(join(root, 'source', 'SKILL.md'), join(root, 'foreign', 'SKILL.md'))
+    const realLstat = fs.lstat.bind(fs)
+    let samples = 0
+
+    vi.spyOn(fs, 'lstat').mockImplementation(async (path, options) => {
+      // Swapped INSIDE the observation window, before the sample that closes it.
+      // Both directories present the same inode, so the resource half of the
+      // claim is satisfied either way and only the order of the directory sample
+      // decides which directory the claim ends up naming.
+      if (String(path) === join(root, 'source', 'SKILL.md') && ++samples === 2) {
+        renameSync(join(root, 'source'), join(root, 'stash'))
+        renameSync(join(root, 'foreign'), join(root, 'source'))
+      }
+
+      return Reflect.apply(realLstat, fs, [path, options] as never) as never
+    })
+    const observed = await files.capabilities.resourceObservation!.observe('source/SKILL.md', {
+      bindDirectory: true,
+    })
+
+    expect(observed.kind).toBe('present')
+    if (observed.kind !== 'present') {
+      return
+    }
+    vi.restoreAllMocks()
+    // Naming the directory the read STARTED in is what fails closed here: naming
+    // the one it ended in would certify the stranger as the package just read.
+    await expect(
+      files.capabilities.conditionalDirectoryMove!.moveIfClaimed({
+        sourcePath: 'source',
+        targetPath: 'target',
+        sourceProofPath: 'source/SKILL.md',
+        expectedSourceProof: observed.claim,
+      }),
+    ).resolves.toEqual({ status: 'conflict' })
+    await expect(fs.lstat(join(root, 'target'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  itDirMove('refuses a proof that names no directory to move', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+    const move = files.capabilities.conditionalDirectoryMove!
+
+    await fs.mkdir(join(root, 'source'))
+    await fs.writeFile(join(root, 'source', 'SKILL.md'), 'manifest')
+    const ours = await fs.lstat(join(root, 'source'), { bigint: true })
+    // The same resource, observed WITHOUT asking which directory held it. Every
+    // question this claim can answer, a stranger's hardlink of that resource
+    // answers identically — so there is no directory for `moved` to be true
+    // about, and no answer this facet could give would be one.
+    const unbound = await files.capabilities.resourceObservation!.observe('source/SKILL.md')
+
+    expect(unbound.kind).toBe('present')
+    if (unbound.kind !== 'present') {
+      return
+    }
+    const request = {
+      sourcePath: 'source',
+      targetPath: 'target',
+      sourceProofPath: 'source/SKILL.md',
+    }
+
+    await expect(
+      move.moveIfClaimed({ ...request, expectedSourceProof: unbound.claim }),
+    ).rejects.toThrow('directory move proof must name the directory it was observed in')
+    // A malformed request, not a race: refused before the medium is touched.
+    await expect(fs.lstat(join(root, 'target'))).rejects.toMatchObject({ code: 'ENOENT' })
+    const bound = await files.capabilities.resourceObservation!.observe('source/SKILL.md', {
+      bindDirectory: true,
+    })
+
+    expect(bound.kind).toBe('present')
+    if (bound.kind !== 'present') {
+      return
+    }
+    // The very same transition, asked with the bound form of the very same
+    // observation, goes through — so the refusal above is about the proof and
+    // nothing else.
+    await expect(
+      move.moveIfClaimed({ ...request, expectedSourceProof: bound.claim }),
+    ).resolves.toMatchObject({ status: 'moved' })
+    expect((await fs.lstat(join(root, 'target'), { bigint: true })).ino).toBe(ours.ino)
+  })
+
+  it('conditions ordinary claim-checked facets on a directory-bound claim', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+
+    await fs.mkdir(join(root, 'pkg'))
+    await fs.writeFile(join(root, 'pkg', 'SKILL.md'), 'manifest')
+    const bound = await files.capabilities.resourceObservation!.observe('pkg/SKILL.md', {
+      bindDirectory: true,
+    })
+    const plain = await files.capabilities.resourceObservation!.observe('pkg/SKILL.md')
+
+    expect(bound.kind).toBe('present')
+    expect(plain.kind).toBe('present')
+    if (bound.kind !== 'present' || plain.kind !== 'present') {
+      return
+    }
+    // The two claims describe one incarnation and differ only in what the bound
+    // one additionally NAMES. A facet that conditions on a pathname must accept
+    // either — the directory half is not part of the question it asks.
+    expect(bound.claim.value).not.toBe(plain.claim.value)
+    await expect(
+      files.capabilities.claimedRemoval!.removeIfClaimed('pkg/SKILL.md', 'manifest', bound.claim),
+    ).resolves.toBe(true)
+    await expect(fs.lstat(join(root, 'pkg', 'SKILL.md'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  itDirMove('decides a replaced proof before it commits anything', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+    const manifest = 'byte-identical manifest'
+
+    await fs.mkdir(join(root, 'source'))
+    await fs.writeFile(join(root, 'source', 'SKILL.md'), manifest)
+    const observed = await files.capabilities.resourceObservation!.observe('source/SKILL.md', {
+      bindDirectory: true,
+    })
+
+    expect(observed.kind).toBe('present')
+    if (observed.kind !== 'present') {
+      return
+    }
+    const ours = await fs.lstat(join(root, 'source'), { bigint: true })
+    const realLstat = fs.lstat.bind(fs)
+    let samples = 0
+
+    vi.spyOn(fs, 'lstat').mockImplementation(async (path, options) => {
+      // The descriptor still holds the claimed incarnation, so every question put
+      // to it answers "carried" — only the PATHNAME stopped naming it.
+      if (String(path) === join(root, 'source', 'SKILL.md') && ++samples === 2) {
+        renameSync(join(root, 'source', 'SKILL.md'), join(root, 'source', 'displaced.md'))
+        writeFileSync(join(root, 'source', 'SKILL.md'), manifest)
+      }
+      // Reached only if the publication went ahead anyway: the source pathname is
+      // taken back, so a decision deferred until after the commit could no longer
+      // be undone and would have to be reported as a standing transition.
+      if (String(path) === join(root, 'target')) {
+        mkdirSync(join(root, 'source'), { recursive: true })
+      }
+
+      return Reflect.apply(realLstat, fs, [path, options] as never) as never
+    })
+    await expect(
+      files.capabilities.conditionalDirectoryMove!.moveIfClaimed({
+        sourcePath: 'source',
+        targetPath: 'target',
+        sourceProofPath: 'source/SKILL.md',
+        expectedSourceProof: observed.claim,
+      }),
+    ).resolves.toEqual({ status: 'conflict' })
+    expect((await fs.lstat(join(root, 'source'), { bigint: true })).ino).toBe(ours.ino)
+    await expect(fs.lstat(join(root, 'target'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  itDirMove('moves only the directory carrying the claimed source resource', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+    const manifest = 'byte-identical manifest'
+
+    await fs.mkdir(join(root, 'source'))
+    await fs.writeFile(join(root, 'source', 'SKILL.md'), manifest)
+    const observed = await files.capabilities.resourceObservation!.observe('source/SKILL.md', {
+      bindDirectory: true,
+    })
+
+    expect(observed.kind).toBe('present')
+    if (observed.kind !== 'present') {
+      return
+    }
+    const original = await fs.lstat(join(root, 'source', 'SKILL.md'), { bigint: true })
+    const realLstat = fs.lstat.bind(fs)
+    let sourceProofStats = 0
+
+    vi.spyOn(fs, 'lstat').mockImplementation(async (path, options) => {
+      const result = await Reflect.apply(realLstat, fs, [path, options] as never)
+
+      if (String(path) === join(root, 'source', 'SKILL.md') && ++sourceProofStats === 2) {
+        await fs.rename(
+          join(root, 'source', 'SKILL.md'),
+          join(root, 'source', 'displaced-SKILL.md'),
+        )
+        await fs.writeFile(join(root, 'source', 'SKILL.md'), manifest)
+      }
+
+      return result as never
+    })
+    await expect(
+      files.capabilities.conditionalDirectoryMove!.moveIfClaimed({
+        sourcePath: 'source',
+        targetPath: 'target',
+        sourceProofPath: 'source/SKILL.md',
+        expectedSourceProof: observed.claim,
+      }),
+    ).resolves.toEqual({ status: 'conflict' })
+    const replacement = await fs.lstat(join(root, 'source', 'SKILL.md'), { bigint: true })
+
+    expect(replacement.ino).not.toBe(original.ino)
+    await expect(fs.readFile(join(root, 'source', 'SKILL.md'), 'utf8')).resolves.toBe(manifest)
+    await expect(fs.lstat(join(root, 'target'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  itDirMove('refuses a move whose claimed proof is missing or superseded', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+    const move = files.capabilities.conditionalDirectoryMove!
+
+    await fs.mkdir(join(root, 'source'))
+    await fs.writeFile(join(root, 'source', 'SKILL.md'), 'manifest')
+    const observed = await files.capabilities.resourceObservation!.observe('source/SKILL.md', {
+      bindDirectory: true,
+    })
+
+    expect(observed.kind).toBe('present')
+    if (observed.kind !== 'present') {
+      return
+    }
+    const request = {
+      sourcePath: 'source',
+      targetPath: 'target',
+      sourceProofPath: 'source/SKILL.md',
+      expectedSourceProof: observed.claim,
+    }
+
+    // Rewritten under the same name: a resource whose incarnation the caller
+    // never saw is not a resource it can be moving.
+    await fs.writeFile(join(root, 'source', 'SKILL.md'), 'rewritten')
+    await expect(move.moveIfClaimed(request)).resolves.toEqual({ status: 'conflict' })
+    // Gone entirely: absence is an answer about the world, not a fault to raise.
+    await fs.rm(join(root, 'source', 'SKILL.md'))
+    await expect(move.moveIfClaimed(request)).resolves.toEqual({ status: 'conflict' })
+    await expect(fs.lstat(join(root, 'target'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  itDirMove('answers conflict for every way the proof can be swapped mid-claim', async () => {
+    const swaps: { name: string; before: boolean; swap: (path: string) => void }[] = [
+      // Unlinked between the path sample and the open: the open fails ENOENT.
+      { name: 'unlinked before the open', before: false, swap: (path) => unlinkSync(path) },
+      // Unlinked between the read and the closing path sample: that lstat fails.
+      {
+        name: 'unlinked before the closing sample',
+        before: true,
+        swap: (path) => unlinkSync(path),
+      },
+      // Replaced by a symlink: O_NOFOLLOW turns the open into ELOOP rather than
+      // reading whatever the link points at.
+      {
+        name: 'replaced by a symlink',
+        before: false,
+        swap: (path) => {
+          unlinkSync(path)
+          symlinkSync(path, path)
+        },
+      },
+      // Replaced by a directory: the open SUCCEEDS, and only comparing the opened
+      // incarnation against the sampled one stops the read of a directory fd.
+      {
+        name: 'replaced by a directory',
+        before: false,
+        swap: (path) => {
+          unlinkSync(path)
+          mkdirSync(path)
+        },
+      },
+    ]
+
+    for (const { name, before, swap } of swaps) {
+      const root = await mkroot()
+      const files = createLocalFsFiles(root)
+
+      await fs.mkdir(join(root, 'source'))
+      await fs.writeFile(join(root, 'source', 'SKILL.md'), 'manifest')
+      const observed = await files.capabilities.resourceObservation!.observe('source/SKILL.md', {
+        bindDirectory: true,
+      })
+
+      expect(observed.kind, name).toBe('present')
+      if (observed.kind !== 'present') {
+        return
+      }
+      const proofPath = join(root, 'source', 'SKILL.md')
+      const realLstat = fs.lstat.bind(fs)
+      let samples = 0
+
+      vi.spyOn(fs, 'lstat').mockImplementation(async (path, options) => {
+        // `before` picks which side of the sample the writer gets in: the first
+        // sample opens the claim, the second closes it.
+        const swapping = String(path) === proofPath && ++samples === (before ? 2 : 1)
+
+        if (swapping && before) {
+          swap(proofPath)
+        }
+        const result = await Reflect.apply(realLstat, fs, [path, options] as never).catch(
+          (error: unknown) => {
+            throw error
+          },
+        )
+
+        if (swapping && !before) {
+          swap(proofPath)
+        }
+
+        return result as never
+      })
+      await expect(
+        files.capabilities.conditionalDirectoryMove!.moveIfClaimed({
+          sourcePath: 'source',
+          targetPath: 'target',
+          sourceProofPath: 'source/SKILL.md',
+          expectedSourceProof: observed.claim,
+        }),
+        name,
+      ).resolves.toEqual({ status: 'conflict' })
+      await expect(fs.lstat(join(root, 'target')), name).rejects.toMatchObject({ code: 'ENOENT' })
+      vi.restoreAllMocks()
+    }
+  })
+
+  itDirMove('refuses a target entry whose matching inode is no longer a directory', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+
+    await fs.mkdir(join(root, 'source'))
+    await fs.writeFile(join(root, 'source', 'SKILL.md'), 'manifest')
+    const observed = await files.capabilities.resourceObservation!.observe('source/SKILL.md', {
+      bindDirectory: true,
+    })
+
+    expect(observed.kind).toBe('present')
+    if (observed.kind !== 'present') {
+      return
+    }
+    const ours = await fs.lstat(join(root, 'source'), { bigint: true })
+    const realLstat = fs.lstat.bind(fs)
+    let samples = 0
+
+    vi.spyOn(fs, 'lstat').mockImplementation(async (path, options) => {
+      const result = await Reflect.apply(realLstat, fs, [path, options] as never)
+
+      // Inode numbers are RECYCLED: a directory destroyed under us frees its
+      // number for the next allocation on that filesystem, and no test can ask a
+      // kernel to hand it back on cue. So the pair is left true and the kind is
+      // overridden — the one field a reallocated number cannot keep.
+      if (String(path) === join(root, 'target') && ++samples === 1) {
+        return Object.create(result as object, {
+          isDirectory: { value: () => false },
+        }) as never
+      }
+
+      return result as never
+    })
+    await expect(
+      files.capabilities.conditionalDirectoryMove!.moveIfClaimed({
+        sourcePath: 'source',
+        targetPath: 'target',
+        sourceProofPath: 'source/SKILL.md',
+        expectedSourceProof: observed.claim,
+      }),
+    ).resolves.toEqual({ status: 'conflict' })
+    expect((await fs.lstat(join(root, 'source'), { bigint: true })).ino).toBe(ours.ino)
+    await expect(fs.lstat(join(root, 'target'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  itDirMove('never opens a proof pathname that is not a regular file', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+
+    await fs.mkdir(join(root, 'source'))
+    await fs.writeFile(join(root, 'source', 'real.md'), 'manifest')
+    // Observed inside the source directory, so the request DOES name the
+    // directory to move and the only question left is the proof pathname itself.
+    const observed = await files.capabilities.resourceObservation!.observe('source/real.md', {
+      bindDirectory: true,
+    })
+
+    expect(observed.kind).toBe('present')
+    if (observed.kind !== 'present') {
+      return
+    }
+    await fs.mkdir(join(root, 'source', 'SKILL.md'))
+    await fs.symlink(join(root, 'source', 'real.md'), join(root, 'source', 'LINK.md'))
+    const open = vi.spyOn(fs, 'open')
+
+    for (const proof of ['source/SKILL.md', 'source/LINK.md']) {
+      await expect(
+        files.capabilities.conditionalDirectoryMove!.moveIfClaimed({
+          sourcePath: 'source',
+          targetPath: 'target',
+          sourceProofPath: proof,
+          expectedSourceProof: observed.claim,
+        }),
+        proof,
+      ).resolves.toEqual({ status: 'conflict' })
+    }
+    // The pathname sample already answered. Handing an unopenable — or worse, an
+    // openable — non-regular pathname to the kernel adds a decision the claim
+    // cannot use and a descriptor nobody asked for.
+    expect(open).not.toHaveBeenCalled()
+    await expect(fs.lstat(join(root, 'target'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  itDirMove('answers conflict when the proof changes under the read that claims it', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+
+    await fs.mkdir(join(root, 'source'))
+    await fs.writeFile(join(root, 'source', 'SKILL.md'), 'manifest')
+    const observed = await files.capabilities.resourceObservation!.observe('source/SKILL.md', {
+      bindDirectory: true,
+    })
+
+    expect(observed.kind).toBe('present')
+    if (observed.kind !== 'present') {
+      return
+    }
+    const proofPath = join(root, 'source', 'SKILL.md')
+    const realOpen = fs.open.bind(fs)
+    let grown = false
+
+    vi.spyOn(fs, 'open').mockImplementation(async (path, ...rest) => {
+      const handle = await Reflect.apply(realOpen, fs, [path, ...rest] as never)
+
+      if (String(path) !== proofPath) {
+        return handle as never
+      }
+
+      // A writer that lands strictly between the read and the sample that closes
+      // it: the bytes in hand are already stale, and the descriptor is the only
+      // thing that can say so. Comparing size against those bytes would raise a
+      // fault instead — a benign concurrent write is a conflict, not a crash.
+      return {
+        stat: async (options: unknown) => Reflect.apply(handle.stat, handle, [options] as never),
+        readFile: async () => {
+          const bytes = await handle.readFile()
+
+          if (!grown) {
+            grown = true
+            appendFileSync(proofPath, ' plus')
+          }
+
+          return bytes
+        },
+        close: async () => handle.close(),
+      } as never
+    })
+    await expect(
+      files.capabilities.conditionalDirectoryMove!.moveIfClaimed({
+        sourcePath: 'source',
+        targetPath: 'target',
+        sourceProofPath: 'source/SKILL.md',
+        expectedSourceProof: observed.claim,
+      }),
+    ).resolves.toEqual({ status: 'conflict' })
+    await expect(fs.lstat(join(root, 'target'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  itDirMove('leaves an occupied destination alone and says so', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+
+    await fs.mkdir(join(root, 'source'))
+    await fs.writeFile(join(root, 'source', 'SKILL.md'), 'manifest')
+    await fs.mkdir(join(root, 'target'))
+    await fs.writeFile(join(root, 'target', 'SKILL.md'), 'incumbent')
+    const observed = await files.capabilities.resourceObservation!.observe('source/SKILL.md', {
+      bindDirectory: true,
+    })
+
+    expect(observed.kind).toBe('present')
+    if (observed.kind !== 'present') {
+      return
+    }
+    await expect(
+      files.capabilities.conditionalDirectoryMove!.moveIfClaimed({
+        sourcePath: 'source',
+        targetPath: 'target',
+        sourceProofPath: 'source/SKILL.md',
+        expectedSourceProof: observed.claim,
+      }),
+    ).resolves.toEqual({ status: 'occupied' })
+    await expect(fs.readFile(join(root, 'target', 'SKILL.md'), 'utf8')).resolves.toBe('incumbent')
+    await expect(fs.readFile(join(root, 'source', 'SKILL.md'), 'utf8')).resolves.toBe('manifest')
+  })
+
+  itDirMove('rolls back a committed move whose proof was rewritten in place', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+
+    await fs.mkdir(join(root, 'source'))
+    await fs.writeFile(join(root, 'source', 'SKILL.md'), 'manifest')
+    const observed = await files.capabilities.resourceObservation!.observe('source/SKILL.md', {
+      bindDirectory: true,
+    })
+
+    expect(observed.kind).toBe('present')
+    if (observed.kind !== 'present') {
+      return
+    }
+    const ours = await fs.lstat(join(root, 'source'), { bigint: true })
+    const realLstat = fs.lstat.bind(fs)
+    let rewritten = false
+
+    vi.spyOn(fs, 'lstat').mockImplementation(async (path, options) => {
+      // Same inode, same pathname, new content: the directory did arrive, and the
+      // resource the caller claimed is not the one standing in it. The descriptor
+      // held open since the claim is the only witness that can tell the difference.
+      if (!rewritten && String(path) === join(root, 'target')) {
+        rewritten = true
+        appendFileSync(join(root, 'target', 'SKILL.md'), ' plus')
+      }
+
+      return Reflect.apply(realLstat, fs, [path, options] as never) as never
+    })
+    await expect(
+      files.capabilities.conditionalDirectoryMove!.moveIfClaimed({
+        sourcePath: 'source',
+        targetPath: 'target',
+        sourceProofPath: 'source/SKILL.md',
+        expectedSourceProof: observed.claim,
+      }),
+    ).resolves.toEqual({ status: 'conflict' })
+    expect((await fs.lstat(join(root, 'source'), { bigint: true })).ino).toBe(ours.ino)
+    await expect(fs.lstat(join(root, 'target'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  itDirMove('throws without a transition when the source leaves before publication', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+
+    await fs.mkdir(join(root, 'source'))
+    await fs.writeFile(join(root, 'source', 'SKILL.md'), 'manifest')
+    const observed = await files.capabilities.resourceObservation!.observe('source/SKILL.md', {
+      bindDirectory: true,
+    })
+
+    expect(observed.kind).toBe('present')
+    if (observed.kind !== 'present') {
+      return
+    }
+    const realLstat = fs.lstat.bind(fs)
+    let samples = 0
+
+    vi.spyOn(fs, 'lstat').mockImplementation(async (path, options) => {
+      const result = await Reflect.apply(realLstat, fs, [path, options] as never)
+
+      // The claim is complete and the publication has not started: whatever
+      // happens next is a PRE-commit failure, and the caller must be able to read
+      // an exception as "nothing moved" without inspecting the tree.
+      if (String(path) === join(root, 'source', 'SKILL.md') && ++samples === 2) {
+        renameSync(join(root, 'source'), join(root, 'elsewhere'))
+      }
+
+      return result as never
+    })
+    await expect(
+      files.capabilities.conditionalDirectoryMove!.moveIfClaimed({
+        sourcePath: 'source',
+        targetPath: 'target',
+        sourceProofPath: 'source/SKILL.md',
+        expectedSourceProof: observed.claim,
+      }),
+    ).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(fs.lstat(join(root, 'target'))).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(fs.readFile(join(root, 'elsewhere', 'SKILL.md'), 'utf8')).resolves.toBe('manifest')
+  })
+
+  itDirMove('reports a committed move whose target left before it could roll back', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+
+    await fs.mkdir(join(root, 'source'))
+    await fs.writeFile(join(root, 'source', 'SKILL.md'), 'manifest')
+    await fs.mkdir(join(root, 'foreign'))
+    await fs.writeFile(join(root, 'foreign', 'SKILL.md'), 'foreign manifest')
+    const observed = await files.capabilities.resourceObservation!.observe('source/SKILL.md', {
+      bindDirectory: true,
+    })
+
+    expect(observed.kind).toBe('present')
+    if (observed.kind !== 'present') {
+      return
+    }
+    const realLstat = fs.lstat.bind(fs)
+    let samples = 0
+
+    vi.spyOn(fs, 'lstat').mockImplementation(async (path, options) => {
+      if (String(path) === join(root, 'target')) {
+        samples++
+        // First: a stranger takes the published pathname, so the move must undo
+        // itself. Then: the stranger leaves too, so there is nothing left to
+        // sample — and the answer still has to name what went wrong, because the
+        // caller's directory is committed at a pathname it no longer holds.
+        if (samples === 1) {
+          renameSync(join(root, 'target'), join(root, 'displaced'))
+          renameSync(join(root, 'foreign'), join(root, 'target'))
+        }
+        if (samples === 2) {
+          rmSync(join(root, 'target'), { recursive: true })
+        }
+      }
+
+      return Reflect.apply(realLstat, fs, [path, options] as never) as never
+    })
+    await expect(
+      files.capabilities.conditionalDirectoryMove!.moveIfClaimed({
+        sourcePath: 'source',
+        targetPath: 'target',
+        sourceProofPath: 'source/SKILL.md',
+        expectedSourceProof: observed.claim,
+      }),
+    ).resolves.toEqual({
+      status: 'committed-error',
+      reason: 'directory moved but its claimed source resource did not reach the target',
+    })
+  })
+
+  itDirMove('returns a target-scoped proof that can condition a reverse move', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+
+    await fs.mkdir(join(root, 'source'))
+    await fs.writeFile(join(root, 'source', 'SKILL.md'), 'manifest')
+    const observed = await files.capabilities.resourceObservation!.observe('source/SKILL.md', {
+      bindDirectory: true,
+    })
+
+    expect(observed.kind).toBe('present')
+    if (observed.kind !== 'present') {
+      return
+    }
+    const moved = await files.capabilities.conditionalDirectoryMove!.moveIfClaimed({
+      sourcePath: 'source',
+      targetPath: 'target',
+      sourceProofPath: 'source/SKILL.md',
+      expectedSourceProof: observed.claim,
+    })
+
+    expect(moved.status).toBe('moved')
+    if (moved.status !== 'moved') {
+      return
+    }
+    await expect(
+      files.capabilities.conditionalDirectoryMove!.moveIfClaimed({
+        sourcePath: 'target',
+        targetPath: 'source',
+        sourceProofPath: 'target/SKILL.md',
+        expectedSourceProof: moved.targetProof,
+      }),
+    ).resolves.toMatchObject({ status: 'moved' })
+    await expect(fs.readFile(join(root, 'source', 'SKILL.md'), 'utf8')).resolves.toBe('manifest')
+  })
+
+  itDirMove('reports when a proof failure cannot roll the committed directory back', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+
+    await fs.mkdir(join(root, 'source'))
+    await fs.writeFile(join(root, 'source', 'SKILL.md'), 'manifest')
+    const observed = await files.capabilities.resourceObservation!.observe('source/SKILL.md', {
+      bindDirectory: true,
+    })
+
+    expect(observed.kind).toBe('present')
+    if (observed.kind !== 'present') {
+      return
+    }
+    const realLstat = fs.lstat.bind(fs)
+    let replaced = false
+
+    vi.spyOn(fs, 'lstat').mockImplementation(async (path, options) => {
+      if (!replaced && String(path) === join(root, 'target', 'SKILL.md')) {
+        replaced = true
+        await fs.rename(
+          join(root, 'target', 'SKILL.md'),
+          join(root, 'target', 'displaced-SKILL.md'),
+        )
+        await fs.writeFile(join(root, 'target', 'SKILL.md'), 'manifest')
+        await fs.mkdir(join(root, 'source'))
+      }
+
+      return Reflect.apply(realLstat, fs, [path, options] as never) as never
+    })
+    await expect(
+      files.capabilities.conditionalDirectoryMove!.moveIfClaimed({
+        sourcePath: 'source',
+        targetPath: 'target',
+        sourceProofPath: 'source/SKILL.md',
+        expectedSourceProof: observed.claim,
+      }),
+    ).resolves.toMatchObject({ status: 'committed-error' })
+    await expect(fs.readFile(join(root, 'target', 'SKILL.md'), 'utf8')).resolves.toBe('manifest')
+    await expect(fs.lstat(join(root, 'source'))).resolves.toMatchObject({})
+  })
+
+  itDirMove('restores the source when the committed move cannot be inspected', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+
+    await fs.mkdir(join(root, 'source'))
+    await fs.writeFile(join(root, 'source', 'SKILL.md'), 'manifest')
+    const observed = await files.capabilities.resourceObservation!.observe('source/SKILL.md', {
+      bindDirectory: true,
+    })
+
+    expect(observed.kind).toBe('present')
+    if (observed.kind !== 'present') {
+      return
+    }
+    const ours = await fs.lstat(join(root, 'source'), { bigint: true })
+    const realLstat = fs.lstat.bind(fs)
+    let removed = false
+
+    vi.spyOn(fs, 'lstat').mockImplementation(async (path, options) => {
+      // The publication is already committed; an external writer then unlinks the
+      // very resource the adapter is about to sample, so the post-commit question
+      // does not fail an assertion — it THROWS.
+      if (!removed && String(path) === join(root, 'target', 'SKILL.md')) {
+        removed = true
+        unlinkSync(join(root, 'target', 'SKILL.md'))
+      }
+
+      return Reflect.apply(realLstat, fs, [path, options] as never) as never
+    })
+    await expect(
+      files.capabilities.conditionalDirectoryMove!.moveIfClaimed({
+        sourcePath: 'source',
+        targetPath: 'target',
+        sourceProofPath: 'source/SKILL.md',
+        expectedSourceProof: observed.claim,
+      }),
+    ).rejects.toMatchObject({ code: 'ENOENT' })
+    // A throw is only allowed to leave the source placement owning the directory:
+    // that is the containment the caller is told it can rely on.
+    expect((await fs.lstat(join(root, 'source'), { bigint: true })).ino).toBe(ours.ino)
+    await expect(fs.lstat(join(root, 'target'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  itDirMove('reports a committed move whose inspection threw and could not roll back', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+
+    await fs.mkdir(join(root, 'source'))
+    await fs.writeFile(join(root, 'source', 'SKILL.md'), 'manifest')
+    const observed = await files.capabilities.resourceObservation!.observe('source/SKILL.md', {
+      bindDirectory: true,
+    })
+
+    expect(observed.kind).toBe('present')
+    if (observed.kind !== 'present') {
+      return
+    }
+    const ours = await fs.lstat(join(root, 'source'), { bigint: true })
+    const realLstat = fs.lstat.bind(fs)
+    let removed = false
+
+    vi.spyOn(fs, 'lstat').mockImplementation(async (path, options) => {
+      // Same throwing post-commit sample, plus the source pathname taken back by
+      // the same writer — so the transition cannot be undone and the caller has
+      // to be TOLD it stands rather than handed an exception that implies it does not.
+      if (!removed && String(path) === join(root, 'target', 'SKILL.md')) {
+        removed = true
+        unlinkSync(join(root, 'target', 'SKILL.md'))
+        mkdirSync(join(root, 'source'))
+      }
+
+      return Reflect.apply(realLstat, fs, [path, options] as never) as never
+    })
+    await expect(
+      files.capabilities.conditionalDirectoryMove!.moveIfClaimed({
+        sourcePath: 'source',
+        targetPath: 'target',
+        sourceProofPath: 'source/SKILL.md',
+        expectedSourceProof: observed.claim,
+      }),
+    ).resolves.toMatchObject({
+      status: 'committed-error',
+      reason: expect.stringContaining('directory move committed before proof failed'),
+    })
+    expect((await fs.lstat(join(root, 'target'), { bigint: true })).ino).toBe(ours.ino)
+  })
+
+  itDirMove('refuses a target proof carried by a directory it never moved', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+    const manifest = 'byte-identical manifest'
+
+    await fs.mkdir(join(root, 'source'))
+    await fs.writeFile(join(root, 'source', 'SKILL.md'), manifest)
+    // The foreign package's manifest is a HARD LINK to ours, so every question
+    // the proof can ask about it — dev, ino, size, ctime, mtime, bytes — answers
+    // "carried". Only the identity of the directory that arrived at the target
+    // pathname separates our publication from someone else's.
+    await fs.mkdir(join(root, 'foreign'))
+    await fs.link(join(root, 'source', 'SKILL.md'), join(root, 'foreign', 'SKILL.md'))
+    const observed = await files.capabilities.resourceObservation!.observe('source/SKILL.md', {
+      bindDirectory: true,
+    })
+
+    expect(observed.kind).toBe('present')
+    if (observed.kind !== 'present') {
+      return
+    }
+    const ours = await fs.lstat(join(root, 'source'), { bigint: true })
+    const realLstat = fs.lstat.bind(fs)
+    let swapped = false
+
+    vi.spyOn(fs, 'lstat').mockImplementation(async (path, options) => {
+      // Synchronous on purpose: the whole swap has to land between the committed
+      // publication and the very first sample of the target, or the two halves of
+      // the pair would not be observed against the same tree.
+      if (!swapped && String(path) === join(root, 'target')) {
+        swapped = true
+        renameSync(join(root, 'target'), join(root, 'displaced'))
+        renameSync(join(root, 'foreign'), join(root, 'target'))
+      }
+
+      return Reflect.apply(realLstat, fs, [path, options] as never) as never
+    })
+    await expect(
+      files.capabilities.conditionalDirectoryMove!.moveIfClaimed({
+        sourcePath: 'source',
+        targetPath: 'target',
+        sourceProofPath: 'source/SKILL.md',
+        expectedSourceProof: observed.claim,
+      }),
+    ).resolves.toEqual({
+      status: 'committed-error',
+      reason: 'directory moved but its claimed source resource did not reach the target',
+    })
+    // Never `moved`: a target proof handed back here would bind the caller's
+    // placement and reach to a package this adapter did not move.
+    expect((await fs.lstat(join(root, 'target'), { bigint: true })).ino).not.toBe(ours.ino)
+    expect((await fs.lstat(join(root, 'displaced'), { bigint: true })).ino).toBe(ours.ino)
+  })
+
+  itDirMove('never rolls a foreign directory back onto the source placement', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+
+    await fs.mkdir(join(root, 'source'))
+    await fs.writeFile(join(root, 'source', 'SKILL.md'), 'manifest')
+    await fs.mkdir(join(root, 'foreign'))
+    await fs.writeFile(join(root, 'foreign', 'SKILL.md'), 'foreign manifest')
+    const observed = await files.capabilities.resourceObservation!.observe('source/SKILL.md', {
+      bindDirectory: true,
+    })
+
+    expect(observed.kind).toBe('present')
+    if (observed.kind !== 'present') {
+      return
+    }
+    const ours = await fs.lstat(join(root, 'source'), { bigint: true })
+    const realLstat = fs.lstat.bind(fs)
+    let swapped = false
+
+    vi.spyOn(fs, 'lstat').mockImplementation(async (path, options) => {
+      // Published, then dispossessed: an external writer parks our directory
+      // elsewhere and leaves a stranger holding the target pathname.
+      if (!swapped && String(path) === join(root, 'target')) {
+        swapped = true
+        renameSync(join(root, 'target'), join(root, 'displaced'))
+        renameSync(join(root, 'foreign'), join(root, 'target'))
+      }
+
+      return Reflect.apply(realLstat, fs, [path, options] as never) as never
+    })
+    await expect(
+      files.capabilities.conditionalDirectoryMove!.moveIfClaimed({
+        sourcePath: 'source',
+        targetPath: 'target',
+        sourceProofPath: 'source/SKILL.md',
+        expectedSourceProof: observed.claim,
+      }),
+    ).resolves.toEqual({
+      status: 'committed-error',
+      reason: 'directory moved but its claimed source resource did not reach the target',
+    })
+    // A rollback here would be a lie twice over: it would report `conflict` —
+    // "nothing was moved" — while installing a stranger's package under the
+    // source placement the caller still believes it owns.
+    await expect(fs.lstat(join(root, 'source'))).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(fs.readFile(join(root, 'target', 'SKILL.md'), 'utf8')).resolves.toBe(
+      'foreign manifest',
+    )
+    expect((await fs.lstat(join(root, 'displaced'), { bigint: true })).ino).toBe(ours.ino)
+  })
+
+  itDirMove('refuses to move back a directory it never moved out', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+    const move = files.capabilities.conditionalDirectoryMove!
+
+    await fs.mkdir(join(root, 'source'))
+    await fs.writeFile(join(root, 'source', 'SKILL.md'), 'manifest')
+    // A stranger hardlinks our manifest BEFORE anyone samples it, so the ctime
+    // bump `link` causes is already inside the claim we are handed, and the twin
+    // answers every question a file proof can ask: dev, ino, ctime, size, bytes.
+    await fs.mkdir(join(root, 'foreign'))
+    await fs.link(join(root, 'source', 'SKILL.md'), join(root, 'foreign', 'SKILL.md'))
+    await fs.writeFile(join(root, 'foreign', 'payload.md'), 'stranger')
+    const observed = await files.capabilities.resourceObservation!.observe('source/SKILL.md', {
+      bindDirectory: true,
+    })
+
+    expect(observed.kind).toBe('present')
+    if (observed.kind !== 'present') {
+      return
+    }
+    const forward = await move.moveIfClaimed({
+      sourcePath: 'source',
+      targetPath: 'target',
+      sourceProofPath: 'source/SKILL.md',
+      expectedSourceProof: observed.claim,
+    })
+
+    expect(forward.status).toBe('moved')
+    if (forward.status !== 'moved') {
+      return
+    }
+    const ours = await fs.lstat(join(root, 'target'), { bigint: true })
+
+    // Between the two halves of the caller's own transaction the stranger takes
+    // the target pathname — no mock needed, the window is simply the gap between
+    // two adapter calls.
+    await fs.rename(join(root, 'target'), join(root, 'displaced'))
+    await fs.rename(join(root, 'foreign'), join(root, 'target'))
+    await expect(
+      move.moveIfClaimed({
+        sourcePath: 'target',
+        targetPath: 'source',
+        sourceProofPath: 'target/SKILL.md',
+        expectedSourceProof: forward.targetProof,
+      }),
+    ).resolves.toEqual({ status: 'conflict' })
+    // `moved` here would install the stranger's directory, payload and all, under
+    // the source placement the caller believes it is restoring its own package to.
+    await expect(fs.lstat(join(root, 'source'))).rejects.toMatchObject({ code: 'ENOENT' })
+    expect((await fs.lstat(join(root, 'displaced'), { bigint: true })).ino).toBe(ours.ino)
+  })
+
+  itDirMove('refuses a move proof that does not live inside the source directory', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+    const move = files.capabilities.conditionalDirectoryMove!
+    const outside = 'directory move proof must be below its source directory'
+
+    await fs.mkdir(join(root, 'lib', 'source'), { recursive: true })
+    await fs.writeFile(join(root, 'lib', 'source', 'SKILL.md'), 'manifest')
+    await fs.mkdir(join(root, 'other'))
+    await fs.writeFile(join(root, 'other', 'SKILL.md'), 'manifest')
+    const observed = await files.capabilities.resourceObservation!.observe('other/SKILL.md')
+
+    expect(observed.kind).toBe('present')
+    if (observed.kind !== 'present') {
+      return
+    }
+    const request = { sourcePath: 'lib/source', targetPath: 'lib/target' }
+
+    // Sideways: a resource the move does not carry is untouched BY the move, so
+    // it would answer "still exactly as claimed" from outside the directory and
+    // certify a transition nothing was ever proven about.
+    await expect(
+      move.moveIfClaimed({
+        ...request,
+        sourceProofPath: 'other/SKILL.md',
+        expectedSourceProof: observed.claim,
+      }),
+    ).rejects.toThrow(outside)
+    // The directory is not a resource it can carry through itself,
+    await expect(
+      move.moveIfClaimed({
+        ...request,
+        sourceProofPath: 'lib/source',
+        expectedSourceProof: observed.claim,
+      }),
+    ).rejects.toThrow(outside)
+    // and its parent stays behind entirely.
+    await expect(
+      move.moveIfClaimed({
+        ...request,
+        sourceProofPath: 'lib',
+        expectedSourceProof: observed.claim,
+      }),
+    ).rejects.toThrow(outside)
+    await expect(fs.lstat(join(root, 'lib', 'target'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  itDirMove('refuses a source pathname that is not itself a directory', async () => {
+    const root = await mkroot()
+    const files = createLocalFsFiles(root)
+    const move = files.capabilities.conditionalDirectoryMove!
+
+    await fs.mkdir(join(root, 'real'))
+    await fs.writeFile(join(root, 'real', 'SKILL.md'), 'manifest')
+    await fs.writeFile(join(root, 'plain'), 'not a package')
+    // A symlink POINTING at a package is not the package: renaming it publishes a
+    // link at the target while the directory the caller claimed never moves, and
+    // every proof question below it still answers through the link.
+    await fs.symlink(join(root, 'real'), join(root, 'source'))
+    const observed = await files.capabilities.resourceObservation!.observe('source/SKILL.md', {
+      bindDirectory: true,
+    })
+
+    expect(observed.kind).toBe('present')
+    if (observed.kind !== 'present') {
+      return
+    }
+    await expect(
+      move.moveIfClaimed({
+        sourcePath: 'source',
+        targetPath: 'target',
+        sourceProofPath: 'source/SKILL.md',
+        expectedSourceProof: observed.claim,
+      }),
+    ).rejects.toMatchObject({ code: 'ENOTDIR' })
+    await expect(
+      move.moveIfClaimed({
+        sourcePath: 'plain',
+        targetPath: 'target',
+        sourceProofPath: 'plain/SKILL.md',
+        expectedSourceProof: observed.claim,
+      }),
+    ).rejects.toThrow('directory move source is not a directory entry')
+    // The unconditional facet answers the same question the same way: a link is
+    // not the directory it names, whichever entry point asks.
+    await expect(
+      files.capabilities.directoryNoReplaceMove!.renameDirIfAbsent('source', 'target'),
+    ).rejects.toMatchObject({ code: 'ENOTDIR' })
+    await expect(fs.lstat(join(root, 'target'))).rejects.toMatchObject({ code: 'ENOENT' })
+    expect((await fs.lstat(join(root, 'source'), { bigint: true })).isSymbolicLink()).toBe(true)
+  })
+
   itDirMove('accepts a directory destination that is the exact same pathname entry', async () => {
     const root = await mkroot()
     const files = createLocalFsFiles(root)
@@ -1326,6 +2376,39 @@ describe('localFs pathname occupancy', () => {
     await expect(fs.lstat(join(externalRoot, 'target'))).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
+  itCrossDevice('refuses a conditional move whose destination is a foreign mount', async () => {
+    const root = await mkroot()
+    const externalRoot = await fs.mkdtemp('/dev/shm/notarium-dir-conditional-')
+
+    roots.push(externalRoot)
+    const files = createLocalFsFiles(root)
+
+    await fs.mkdir(join(root, 'source'))
+    await fs.writeFile(join(root, 'source', 'SKILL.md'), 'manifest')
+    await fs.symlink(externalRoot, join(root, 'other-fs'))
+    const observed = await files.capabilities.resourceObservation!.observe('source/SKILL.md', {
+      bindDirectory: true,
+    })
+
+    expect(observed.kind).toBe('present')
+    if (observed.kind !== 'present') {
+      return
+    }
+    // Refused on the medium, before the claim is even sampled: the syscall this
+    // facet is built on cannot cross a mount, and the fallback a caller would be
+    // tempted to write — copy, then delete — is not the same operation at all.
+    await expect(
+      files.capabilities.conditionalDirectoryMove!.moveIfClaimed({
+        sourcePath: 'source',
+        targetPath: 'other-fs/target',
+        sourceProofPath: 'source/SKILL.md',
+        expectedSourceProof: observed.claim,
+      }),
+    ).rejects.toMatchObject({ code: 'ENOTSUP' })
+    await expect(fs.readFile(join(root, 'source', 'SKILL.md'), 'utf8')).resolves.toBe('manifest')
+    await expect(fs.lstat(join(externalRoot, 'target'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
   it('omits the directory no-replace capability on a runtime that cannot perform it', async () => {
     const root = await mkroot()
     const actualArch = process.arch
@@ -1345,10 +2428,11 @@ describe('localFs pathname occupancy', () => {
       Object.defineProperty(process, 'arch', { configurable: true, value: actualArch })
     }
 
-    // All THREE, together. Directory move, package install and strict publication
+    // All FOUR, together. Generic/conditional directory move, package install and strict publication
     // rest on the same runtime primitive, so a build that keeps any one of them
     // here would be advertising an operation this host cannot perform.
     expect(Object.hasOwn(files.capabilities, 'directoryNoReplaceMove')).toBe(false)
+    expect(Object.hasOwn(files.capabilities, 'conditionalDirectoryMove')).toBe(false)
     expect(Object.hasOwn(files.capabilities, 'packagePublication')).toBe(false)
     expect(Object.hasOwn(files.capabilities, 'strictPublication')).toBe(false)
     // What stays is what a caller can still do: the base port and every facet
@@ -1373,6 +2457,7 @@ describe('localFs pathname occupancy', () => {
     const provided = renameNoReplaceIfAvailable() !== undefined
 
     expect(Object.hasOwn(files.capabilities, 'directoryNoReplaceMove')).toBe(provided)
+    expect(Object.hasOwn(files.capabilities, 'conditionalDirectoryMove')).toBe(provided)
     expect(Object.hasOwn(files.capabilities, 'packagePublication')).toBe(provided)
     expect(Object.hasOwn(files.capabilities, 'strictPublication')).toBe(provided)
   })

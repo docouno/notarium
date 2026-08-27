@@ -18,6 +18,7 @@ const snapshotAdapter = (adapter: ResourceAuthorityAdapter): ResourceAuthorityAd
   const resourceObservation = capabilities.resourceObservation
   const resourcePublication = capabilities.resourcePublication
   const claimedRemoval = capabilities.claimedRemoval
+  const conditionalDirectoryMove = capabilities.conditionalDirectoryMove
   const packagePublication = capabilities.packagePublication
   const strictPublication = capabilities.strictPublication
 
@@ -56,6 +57,16 @@ const snapshotAdapter = (adapter: ResourceAuthorityAdapter): ResourceAuthorityAd
         ? {
             claimedRemoval: Object.freeze({
               removeIfClaimed: frozenBoundMethod(claimedRemoval, claimedRemoval.removeIfClaimed),
+            }),
+          }
+        : {}),
+      ...(conditionalDirectoryMove
+        ? {
+            conditionalDirectoryMove: Object.freeze({
+              moveIfClaimed: frozenBoundMethod(
+                conditionalDirectoryMove,
+                conditionalDirectoryMove.moveIfClaimed,
+              ),
             }),
           }
         : {}),

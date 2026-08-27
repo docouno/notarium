@@ -28,6 +28,12 @@ type Lease = {
   retry: (claim: Claim) => Promise<Lease>
 }
 
+type HeldClaim = {
+  active: boolean
+  claim: Claim
+  children: Set<Promise<unknown>>
+}
+
 const cleanPath = (path: string): string => path.replace(/^\/+|\/+$/g, '')
 
 const values = (
@@ -76,12 +82,29 @@ const contains = (superset: Set<string>, subset: Set<string>): boolean => {
   return true
 }
 
+const isUnder = (path: string, prefix: string): boolean =>
+  path === prefix || path.startsWith(`${prefix}/`)
+
+const pathsCover = (held: Claim, paths: Set<string>): boolean => {
+  for (const path of paths) {
+    if (!held.paths.has(path) && ![...held.prefixes].some((prefix) => isUnder(path, prefix))) {
+      return false
+    }
+  }
+
+  return true
+}
+
+/** A global lease fences everything, so it covers any candidate. Below that, a
+ *  candidate PATH may also fall under a held prefix — the same reach `conflicts`
+ *  gives that prefix — while a candidate PREFIX must be one the lease itself took. */
 const covers = (held: Claim, current: Claim): boolean =>
-  (!current.global || held.global) &&
-  contains(held.resources, current.resources) &&
-  contains(held.noteIds, current.noteIds) &&
-  contains(held.paths, current.paths) &&
-  contains(held.prefixes, current.prefixes)
+  held.global ||
+  (!current.global &&
+    contains(held.resources, current.resources) &&
+    contains(held.noteIds, current.noteIds) &&
+    pathsCover(held, current.paths) &&
+    contains(held.prefixes, current.prefixes))
 
 const intersects = (a: Set<string>, b: Set<string>): boolean => {
   for (const value of a) {
@@ -92,9 +115,6 @@ const intersects = (a: Set<string>, b: Set<string>): boolean => {
 
   return false
 }
-
-const isUnder = (path: string, prefix: string): boolean =>
-  path === prefix || path.startsWith(`${prefix}/`)
 
 const conflicts = (a: Claim, b: Claim): boolean => {
   if (a.global || b.global) {
@@ -138,23 +158,61 @@ export class MutationCoordinator {
   private readonly active = new Set<Waiter>()
   private waiting: Waiter[] = []
   private nextTicket = 0
-  /** Tracks, per async call chain, whether a lease of THIS coordinator is already
-   *  held. Claims are not re-entrant and the queue is fair, so a task that takes
-   *  one while holding another can wait forever behind a waiter that wants what it
-   *  holds. Work that must run claimed but can be reached from either side asks
-   *  `holds()` instead of guessing from its call site. */
-  private readonly leased = new AsyncLocalStorage<true>()
+  /** Tracks the active normalized claim of THIS coordinator per async call chain.
+   * Claims are not re-entrant and the queue is fair, so a task that takes one while
+   * holding another can wait forever behind a waiter that wants what it holds.
+   * Each admitted callback owns a child scope: detached descendants retain its
+   * async-local object, but cannot join after that callback completes. */
+  private readonly leased = new AsyncLocalStorage<HeldClaim>()
 
-  /** Whether the caller is already running inside one of this coordinator's leases. */
+  /** Whether this call chain inherited a claim context, including one whose
+   * lease has already expired. A late detached descendant must not mistake an
+   * inactive inherited context for a fresh top-level caller. */
+  hasClaimContext(): boolean {
+    return this.leased.getStore() !== undefined
+  }
+
+  /** Whether the caller runs inside a still-ACTIVE lease of this coordinator.
+   * An inherited context alone does not answer that: a detached descendant keeps
+   * the async-local object after the lease callback it was started from has
+   * already returned. Coverage of a specific candidate is not asked here — the
+   * only thing that adopts one, `runWithinHeld`, tests it where it acts on it. */
   holds(): boolean {
-    return this.leased.getStore() === true
+    return this.leased.getStore()?.active === true
+  }
+
+  /** Run a callback inside the caller's already-held covering claim and join its
+   * lifetime to that lease. This does not acquire or re-enter the fair queue: it
+   * is the scoped adoption point used by exact-note compound operations only. */
+  runWithinHeld<T>(candidate: MutationClaim, task: () => Promise<T>): Promise<T> {
+    const parent = this.leased.getStore()
+
+    if (!parent?.active || !covers(parent.claim, normalizeClaim(candidate))) {
+      return Promise.reject(new Error('mutation claim is not covered by an active caller lease'))
+    }
+
+    const child: HeldClaim = {
+      active: true,
+      claim: parent.claim,
+      children: new Set(),
+    }
+    const pending = this.runHeld(child, task)
+
+    parent.children.add(pending)
+    void pending.then(
+      () => parent.children.delete(pending),
+      () => parent.children.delete(pending),
+    )
+    return pending
   }
 
   async run<T>(claim: MutationClaim, task: () => Promise<T>): Promise<T> {
-    const lease = await this.acquireNormalized(normalizeClaim(claim))
+    const normalized = normalizeClaim(claim)
+    const lease = await this.acquireNormalized(normalized)
+    const held: HeldClaim = { active: true, claim: normalized, children: new Set() }
 
     try {
-      return await this.leased.run(true, task)
+      return await this.runHeld(held, task)
     } finally {
       lease.release()
     }
@@ -195,11 +253,22 @@ export class MutationCoordinator {
         lease = await lease.retry(claim)
         continue
       }
+      const held: HeldClaim = { active: true, claim, children: new Set() }
+
       try {
-        return await this.leased.run(true, task)
+        return await this.runHeld(held, task)
       } finally {
         lease.release()
       }
+    }
+  }
+
+  private async runHeld<T>(held: HeldClaim, task: () => Promise<T>): Promise<T> {
+    try {
+      return await this.leased.run(held, task)
+    } finally {
+      held.active = false
+      await Promise.allSettled([...held.children])
     }
   }
 

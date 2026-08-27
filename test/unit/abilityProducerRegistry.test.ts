@@ -375,16 +375,16 @@ const CALL_REGISTERS: readonly CallRegister[] = [
     },
   },
   {
-    producer: 'withOwnedAt',
-    why: 'a live document identity and its physical package stay admitted through the exact target proof callback.',
+    producer: 'captureOwnedAt',
+    why: 'a live document identity is captured with its physical package before detail or delete preparation continues.',
     askedFrom: {
       'packages/server/src/services/abilities/abilities.ts#locateOwnedPackageForDocument':
         'the human package-root door starts from a live document rather than a stale locator',
     },
   },
   {
-    producer: 'withCurrentOwnedTarget',
-    why: 'all stale package consumers share trail-first authority and keep dual identity proof admitted through the consumer callback.',
+    producer: 'captureCurrentOwnedTarget',
+    why: 'all stale package consumers share trail-first authority and return one immutable dual-identity snapshot.',
     askedFrom: {
       'packages/server/src/services/abilities/abilities.ts#captureOwnedAuthoringTarget':
         'the shared authoring capture resolves placement authority for get/save/edit/remove and version forks without loading unrelated detail projections',
@@ -393,37 +393,43 @@ const CALL_REGISTERS: readonly CallRegister[] = [
     },
   },
   {
-    producer: 'resolveMovedOwnedRoleLocator',
-    why: 'the domain distinguishes no row from a recorded invalid row and rechecks the authority under package admission.',
+    producer: 'captureOwnedTarget',
+    why: 'a carried dual-identity proof is reopened as a released immutable snapshot before later compound steps.',
     askedFrom: {
-      'packages/server/src/services/roles/roles.ts#authority':
-        'the resolver-local authority selector distinguishes absent, valid and invalid recorded rows',
-      'packages/server/src/services/roles/roles.ts#withOwnedTarget':
-        'a carried proof fails closed when its locator has since become a retired source',
+      'packages/server/src/services/abilities/abilities.ts#captureOwnedAuthoringTarget':
+        'later save/edit steps recapture the same durable target before reading access and detail',
     },
   },
   {
-    producer: 'withExactPackageRead',
-    why: 'placement authority, exact package bytes and projected registry note identity must be one shared package-admission decision.',
+    producer: 'resolveMovedOwnedRoleLocator',
+    why: 'the domain distinguishes no row from a recorded invalid row and rechecks the authority under package admission.',
     askedFrom: {
-      'packages/server/src/services/roles/roles.ts#withCurrentOwnedTarget':
-        'the authority resolver exact-reads only its selected source or target under the lease',
-      'packages/server/src/services/roles/roles.ts#withOwnedTarget':
-        'a carried dual-identity proof is revalidated at the next consumer linearization',
-      'packages/server/src/services/roles/roles.ts#withOwnedAt':
+      'packages/server/src/services/roles/roles.ts#currentAuthority':
+        'the resolver-local authority selector distinguishes absent, valid and invalid recorded rows',
+      'packages/server/src/services/roles/roles.ts#captureOwnedTarget':
+        'a carried proof fails closed when its locator has since become a retired source',
+      'packages/server/src/services/roles/roles.ts#withOwnedTargetMutation':
+        'a carried proof cannot mutate a source retired by a placement move',
+    },
+  },
+  {
+    producer: 'captureExactPackage',
+    why: 'Core exact-note projection and exact package bytes form one released immutable snapshot.',
+    askedFrom: {
+      'packages/server/src/services/roles/roles.ts#captureAt':
+        'current and carried targets share the exact capture and identity validation',
+      'packages/server/src/services/roles/roles.ts#captureOwnedAt':
         'the human document door binds its live registry identity to exact physical bytes',
-      'packages/server/src/services/roles/roles.ts#moveRolePlacement':
-        'move captures kind and both identities before handing proof to the exclusive move producer',
+      'packages/server/src/services/roles/roles.ts#resolveOwnedAt':
+        'exact address resolution requires a projected physical package',
     },
   },
   {
     producer: 'withExactPackageMutation',
-    why: 'identity-bound writes acquire exclusive placement then shared package admission and retain both through the consumer mutation.',
+    why: 'identity-bound writes acquire Core exact-note, exclusive placement and exclusive package admission and retain all three through the task.',
     askedFrom: {
-      'packages/server/src/services/roles/roles.ts#withCurrentOwnedTarget':
-        'the first authoring mutation keeps trail authority and both identities live through the callback',
-      'packages/server/src/services/roles/roles.ts#withOwnedTarget':
-        'later save steps revalidate carried identity proof under a fresh mutation admission',
+      'packages/server/src/services/roles/roles.ts#withOwnedTargetMutation':
+        'later save steps revalidate carried identity proof under a fresh ordered mutation scope',
     },
   },
   {
@@ -539,11 +545,13 @@ const CALL_REGISTERS: readonly CallRegister[] = [
         'the application service resolved human words and asks the domain to mint the placement',
       'packages/server/src/services/roles/roles.ts#resolveOwnedAt':
         'an exact package found at a service-owned placement',
-      'packages/server/src/services/roles/roles.ts#withCurrentOwnedTarget':
+      'packages/server/src/services/roles/roles.ts#captureCurrentOwnedTarget':
         'the trail authority already selected one exact package placement',
-      'packages/server/src/services/roles/roles.ts#withOwnedTarget':
+      'packages/server/src/services/roles/roles.ts#captureOwnedTarget':
         'a carried proof reopens only its service-minted placement',
-      'packages/server/src/services/roles/roles.ts#withOwnedAt':
+      'packages/server/src/services/roles/roles.ts#withOwnedTargetMutation':
+        'a carried proof mutates only its service-minted placement',
+      'packages/server/src/services/roles/roles.ts#captureOwnedAt':
         'the human document target is checked at a service-minted exact placement',
     },
   },

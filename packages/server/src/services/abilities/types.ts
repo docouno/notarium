@@ -18,7 +18,7 @@ import type {
   SystemAbilityLocator,
 } from '@notarium/contract'
 import type { AbilitySummary, RuntimeAbilitySummary } from '@notarium/contract/tools'
-import type { MutationOptions, NoteContent, WriteInput, WriteResult } from '@notarium/core'
+import type { NoteContent, WriteInput, WriteResult } from '@notarium/core'
 
 import type { AuthService } from '../auth'
 import type { Principal } from '../authz'
@@ -160,9 +160,9 @@ export type AbilityDocumentWrite = {
    * semantic no-op. The generic note door can carry additional metadata and leaves
    * this false. */
   semanticNoop?: boolean
-  /** Entered after the store's mutation claim; revalidates and holds the exact
-   * package identity through the admitted physical write. */
-  aroundWrite?: MutationOptions['aroundWrite']
+  /** Revalidate and retain the exact NoteStore → package scope through one document
+   * task. An applied write nests this under the store claim; a no-op enters it itself. */
+  withTargetMutation?<T>(task: (current: OwnedAbilitySnapshot) => Promise<T>): Promise<T>
 }
 
 export type AuthoredWriteResult = WriteResult & {

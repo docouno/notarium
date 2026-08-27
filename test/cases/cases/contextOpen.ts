@@ -14,8 +14,8 @@ const sizedBody = (title: string, bytes: number, link?: string): string => {
 export const contextOpen: CaseSpec = {
   name: 'context-open',
   description:
-    'Production-shaped #394 performance stand: 3.8k notes across project/personal spaces, linked dashboard graph, large memory categories, profile, and 12 large always-load pins.',
-  axes: ['agent-memory', 'activity', 'graph', 'note-classes', 'scale', 'structure'],
+    'Production-shaped #394/#399 performance stand: 3.8k notes across project/personal spaces, one editable Project Role, linked dashboard graph, large memory categories, profile, and 12 large always-load pins.',
+  axes: ['agent-memory', 'agent-roles', 'activity', 'graph', 'note-classes', 'scale', 'structure'],
   build: ({ now, scale }) => {
     const b = new WorldBuilder(now)
 
@@ -30,6 +30,15 @@ export const contextOpen: CaseSpec = {
     })
     b.member({ space: 'context-lab', username: 'sergey', role: 'owner' })
     b.project({ space: 'context-lab', path: 'product', displayName: 'Context Product' })
+
+    b.agentRole({
+      source: 'custom',
+      name: 'context-benchmark',
+      description: 'Exercise exact Project Role authoring without waking the ordinary corpus.',
+      instructions:
+        '# Context benchmark\n\nKeep the performance marker scoped to this hidden role package.',
+      target: { kind: 'project', space: 'context-lab', path: 'product' },
+    })
 
     const corpus = (space: string, root: string, count: number) => {
       for (let index = 1; index <= count; index++) {

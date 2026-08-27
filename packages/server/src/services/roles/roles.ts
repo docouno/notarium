@@ -43,6 +43,7 @@ import {
   RoleAlreadyExistsError,
   RoleDependencyConflictError,
   RoleInstallUnavailableError,
+  RolePlacementUnconfirmedError,
   SkillAlreadyExistsError,
   SkillTooLargeForActivationError,
 } from './errors'
@@ -52,7 +53,7 @@ import {
   type RoleLibrary,
   type RolePackagePublication,
   type RolePackagePublicationPolicy,
-  type RolePackageReader,
+  type RolePackageSnapshot,
   type SkillPackage,
   validateSkillPackage,
 } from './library'
@@ -2029,6 +2030,126 @@ export const createRolesService = ({
     )
   }
 
+  const captureAt = async (
+    location: AddressedPlacement,
+    locator: OwnedAbilityLocator,
+    expected?: Pick<OwnedAbilityTarget, 'registryNoteId' | 'manifestNoteId'>,
+  ): Promise<OwnedAbilitySnapshot | null> => {
+    const captured = await library.captureExactPackage(
+      location,
+      locator.packageId,
+      expected?.registryNoteId,
+    )
+
+    if (!captured) {
+      return null
+    }
+    let parsed: ParsedPackage
+
+    try {
+      parsed = parsePackage(captured.pkg)
+    } catch {
+      return null
+    }
+    const exact = ownedAbilityLocator(location, parsed)
+
+    if (
+      !exact ||
+      serializeAbilityLocator(exact) !== serializeAbilityLocator(locator) ||
+      (expected !== undefined &&
+        (captured.registryNoteId !== expected.registryNoteId ||
+          captured.manifestNoteId !== expected.manifestNoteId))
+    ) {
+      return null
+    }
+
+    return { ...captured, locator: exact }
+  }
+
+  type CurrentAuthority =
+    | { state: 'current'; locator: OwnedAbilityLocator }
+    | {
+        state: 'moved'
+        locator: OwnedAbilityLocator
+        registryNoteId: string
+        manifestNoteId: string
+      }
+    | { state: 'invalid' }
+
+  const currentAuthority = async (locator: OwnedAbilityLocator): Promise<CurrentAuthority> => {
+    const recorded = await abilityPlacement.resolveMovedOwnedRoleLocator(
+      serializeAbilityLocator(locator),
+    )
+
+    if (!recorded) {
+      return { state: 'current', locator }
+    }
+    const moved = parseAbilityLocator(recorded.toLocator)
+
+    return moved?.source === 'owned' &&
+      moved.kind === locator.kind &&
+      moved.packageId === locator.packageId &&
+      moved.location.spaceId === locator.location.spaceId
+      ? {
+          state: 'moved',
+          locator: moved,
+          registryNoteId: recorded.registryNoteId,
+          manifestNoteId: recorded.manifestNoteId,
+        }
+      : { state: 'invalid' }
+  }
+
+  const sameAuthority = (left: CurrentAuthority, right: CurrentAuthority): boolean =>
+    left.state === right.state &&
+    left.state !== 'invalid' &&
+    right.state !== 'invalid' &&
+    serializeAbilityLocator(left.locator) === serializeAbilityLocator(right.locator) &&
+    (left.state === 'current' ||
+      (right.state === 'moved' &&
+        left.registryNoteId === right.registryNoteId &&
+        left.manifestNoteId === right.manifestNoteId))
+
+  const captureCurrentOwnedTarget = async (
+    locator: OwnedAbilityLocator,
+    principal: Principal,
+  ): Promise<OwnedAbilitySnapshot | null> => {
+    if (!can(principal, 'space:read', { space: locator.location.spaceId })) {
+      return null
+    }
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const selected = await currentAuthority(locator)
+
+      if (selected.state === 'invalid') {
+        return null
+      }
+      const location = addressed({
+        scope: selected.locator.location.scope,
+        space: selected.locator.location.spaceId,
+        ...(selected.locator.location.scope === ROLE_SCOPE.project
+          ? { projectId: selected.locator.location.projectId }
+          : {}),
+      })
+      const captured = await captureAt(
+        location,
+        selected.locator,
+        selected.state === 'moved'
+          ? {
+              registryNoteId: selected.registryNoteId,
+              manifestNoteId: selected.manifestNoteId,
+            }
+          : undefined,
+      )
+      const checked = await currentAuthority(locator)
+
+      if (sameAuthority(selected, checked)) {
+        return captured
+      }
+    }
+
+    return null
+  }
+
   return {
     resolveOwnedPlacement: (location, personalSpace) => {
       if (location.scope === ROLE_SCOPE.personal) {
@@ -2045,173 +2166,45 @@ export const createRolesService = ({
         return null
       }
       const at = addressed(location)
-      const parsed = await exactOwnedPackage(at, packageId)
+      const captured = await library.captureExactPackage(at, packageId)
 
-      if (!parsed || parsed.skill.role !== (kind === ABILITY_KIND.role)) {
+      if (!captured || captured.kind !== kind) {
+        return null
+      }
+      let parsed: ParsedPackage
+
+      try {
+        parsed = parsePackage(captured.pkg)
+      } catch {
         return null
       }
       const locator = ownedAbilityLocator(at, parsed)
 
-      return locator && (await projectedNoteId(at, packageId)) ? locator : null
+      return locator
     },
-    withOwnedAt: async (location, principal, kind, packageId, registryNoteId, task) => {
+    captureOwnedAt: async (location, principal, kind, packageId, registryNoteId) => {
       if (!can(principal, 'space:read', { space: location.space })) {
         return null
       }
       const at = addressed(location)
+      const captured = await library.captureExactPackage(at, packageId, registryNoteId)
 
-      return library.withExactPackageRead(at, packageId, async (read) => {
-        const snapshot = await read()
-
-        if (!snapshot || snapshot.registryNoteId !== registryNoteId) {
-          return null
-        }
-        let parsed: ParsedPackage
-
-        try {
-          parsed = parsePackage(snapshot.pkg)
-        } catch {
-          return null
-        }
-        const manifest = snapshot.pkg.files.get('SKILL.md')
-        const owner = manifest ? exactOwnerObservation(manifest) : { kind: 'unproven' as const }
-        const locator = ownedAbilityLocator(at, parsed)
-
-        return locator &&
-          parsed.skill.role === (kind === ABILITY_KIND.role) &&
-          owner.kind === 'claimed'
-          ? task({ locator, registryNoteId, manifestNoteId: owner.id, pkg: snapshot.pkg })
-          : null
-      })
-    },
-    withCurrentOwnedTarget: async (locator, principal, task, mode = 'read') => {
-      if (!can(principal, 'space:read', { space: locator.location.spaceId })) {
+      if (!captured || captured.kind !== kind) {
         return null
       }
-      type Authority =
-        | { state: 'current'; locator: OwnedAbilityLocator }
-        | {
-            state: 'moved'
-            locator: OwnedAbilityLocator
-            registryNoteId: string
-            manifestNoteId: string
-          }
-        | { state: 'invalid' }
-      const authority = async (): Promise<Authority> => {
-        const recorded = await abilityPlacement.resolveMovedOwnedRoleLocator(
-          serializeAbilityLocator(locator),
-        )
+      let parsed: ParsedPackage
 
-        if (!recorded) {
-          return { state: 'current', locator }
-        }
-        const moved = parseAbilityLocator(recorded.toLocator)
-
-        return moved?.source === 'owned' &&
-          moved.kind === locator.kind &&
-          moved.packageId === locator.packageId &&
-          moved.location.spaceId === locator.location.spaceId
-          ? {
-              state: 'moved',
-              locator: moved,
-              registryNoteId: recorded.registryNoteId,
-              manifestNoteId: recorded.manifestNoteId,
-            }
-          : { state: 'invalid' }
+      try {
+        parsed = parsePackage(captured.pkg)
+      } catch {
+        return null
       }
-      const sameAuthority = (left: Authority, right: Authority): boolean =>
-        left.state === right.state &&
-        left.state !== 'invalid' &&
-        right.state !== 'invalid' &&
-        serializeAbilityLocator(left.locator) === serializeAbilityLocator(right.locator) &&
-        (left.state === 'current' ||
-          (right.state === 'moved' &&
-            left.registryNoteId === right.registryNoteId &&
-            left.manifestNoteId === right.manifestNoteId))
+      const locator = ownedAbilityLocator(at, parsed)
 
-      // A back-move can win while this reader waits for one side's package admission.
-      // Retry the newly selected authority a bounded number of times; sustained churn
-      // is not a reason to guess at either address.
-      for (let attempt = 0; attempt < 3; attempt++) {
-        const selected = await authority()
-
-        if (selected.state === 'invalid') {
-          return null
-        }
-        const selectedLocation = addressed({
-          scope: selected.locator.location.scope,
-          space: selected.locator.location.spaceId,
-          ...(selected.locator.location.scope === ROLE_SCOPE.project
-            ? { projectId: selected.locator.location.projectId }
-            : {}),
-        })
-        let changed = false
-
-        const admitted = async (read: RolePackageReader) => {
-          const checked = await authority()
-
-          if (!sameAuthority(selected, checked)) {
-            changed = true
-            return null
-          }
-          const snapshot = await read()
-
-          if (!snapshot) {
-            return null
-          }
-          let parsed: ParsedPackage
-
-          try {
-            parsed = parsePackage(snapshot.pkg)
-          } catch (error) {
-            console.warn(
-              `[roles] ignoring invalid ${selectedLocation.scope} package ${selected.locator.packageId}:`,
-              (error as Error).message,
-            )
-            return null
-          }
-          if (parsed.skill.role !== (selected.locator.kind === ABILITY_KIND.role)) {
-            return null
-          }
-          const manifest = snapshot.pkg.files.get('SKILL.md')
-          const owner = manifest ? exactOwnerObservation(manifest) : { kind: 'unproven' as const }
-
-          if (
-            owner.kind !== 'claimed' ||
-            (selected.state === 'moved' &&
-              (snapshot.registryNoteId !== selected.registryNoteId ||
-                owner.id !== selected.manifestNoteId))
-          ) {
-            return null
-          }
-          const exact = ownedAbilityLocator(selectedLocation, parsed)
-
-          if (
-            !exact ||
-            serializeAbilityLocator(exact) !== serializeAbilityLocator(selected.locator)
-          ) {
-            return null
-          }
-
-          return task({
-            locator: exact,
-            registryNoteId: snapshot.registryNoteId,
-            manifestNoteId: owner.id,
-            pkg: snapshot.pkg,
-          })
-        }
-        const resolved = await (mode === 'mutation'
-          ? library.withExactPackageMutation(selectedLocation, selected.locator.packageId, admitted)
-          : library.withExactPackageRead(selectedLocation, selected.locator.packageId, admitted))
-
-        if (!changed) {
-          return resolved
-        }
-      }
-
-      return null
+      return locator ? { ...captured, locator } : null
     },
-    withOwnedTarget: async (target, principal, task, mode = 'read') => {
+    captureCurrentOwnedTarget,
+    captureOwnedTarget: async (target, principal) => {
       const { locator } = target
 
       if (!can(principal, 'space:read', { space: locator.location.spaceId })) {
@@ -2228,39 +2221,69 @@ export const createRolesService = ({
           : {}),
       })
 
-      const admitted = async (read: RolePackageReader) => {
-        const snapshot = await read()
+      return captureAt(location, locator, target)
+    },
+    withOwnedTargetMutation: async (target, principal, task) => {
+      const { locator } = target
 
-        if (!snapshot || snapshot.registryNoteId !== target.registryNoteId) {
-          return null
-        }
-        let parsed: ParsedPackage
-
-        try {
-          parsed = parsePackage(snapshot.pkg)
-        } catch {
-          return null
-        }
-        const manifest = snapshot.pkg.files.get('SKILL.md')
-        const owner = manifest ? exactOwnerObservation(manifest) : { kind: 'unproven' as const }
-        const exact = ownedAbilityLocator(location, parsed)
-
-        if (
-          parsed.skill.role !== (locator.kind === ABILITY_KIND.role) ||
-          owner.kind !== 'claimed' ||
-          owner.id !== target.manifestNoteId ||
-          !exact ||
-          serializeAbilityLocator(exact) !== serializeAbilityLocator(locator)
-        ) {
-          return null
-        }
-
-        return task({ ...target, pkg: snapshot.pkg })
+      if (!can(principal, 'space:read', { space: locator.location.spaceId })) {
+        return null
       }
+      if (await abilityPlacement.resolveMovedOwnedRoleLocator(serializeAbilityLocator(locator))) {
+        return null
+      }
+      const location = addressed({
+        scope: locator.location.scope,
+        space: locator.location.spaceId,
+        ...(locator.location.scope === ROLE_SCOPE.project
+          ? { projectId: locator.location.projectId }
+          : {}),
+      })
 
-      return mode === 'mutation'
-        ? library.withExactPackageMutation(location, locator.packageId, admitted)
-        : library.withExactPackageRead(location, locator.packageId, admitted)
+      return library.withExactPackageMutation(
+        location,
+        locator.packageId,
+        { kind: locator.kind, ...target },
+        async (captured: RolePackageSnapshot) => {
+          let parsed: ParsedPackage
+
+          try {
+            parsed = parsePackage(captured.pkg)
+          } catch {
+            return null
+          }
+          // The exact locator the manifest under the lease yields, and the task is run
+          // against THAT rather than against the one the caller held. Comparing the two
+          // would add nothing: the address is the selector this mutation was opened by
+          // and `withExactPackageMutation` has already revalidated the kind against the
+          // captured target under the same lease, so the only thing left for this line
+          // to say is whether the manifest yields an owned address at all.
+          const exact = ownedAbilityLocator(location, parsed)
+
+          return exact ? task({ ...captured, locator: exact }) : null
+        },
+      )
+    },
+    readOwnedAbilityMetadataState: async (context, principal, snapshot) => {
+      const { locator } = snapshot
+      const location = exactLocationIn(context, principal, locator)
+
+      if (!location) {
+        return null
+      }
+      const [enabled, availability] = await Promise.all([
+        abilityPreferences.isEnabled(preferenceOwner(principal), locator),
+        location.scope === ROLE_SCOPE.space
+          ? abilityAvailability.get(location.space, locator.packageId)
+          : Promise.resolve(null),
+      ])
+
+      return {
+        enabled,
+        ...(location.scope === ROLE_SCOPE.space
+          ? { availability: abilityAvailabilityOf(availability, locator.kind) }
+          : {}),
+      }
     },
     canAddSkillAt: (target) => publication.availableFor(target),
     canAddRoleAt: (target, personalSpace) => {
@@ -2353,42 +2376,19 @@ export const createRolesService = ({
       }
 
       const location = exactLocationIn(context, principal, locator)
+      const snapshot = location ? await captureAt(location, locator) : null
 
-      if (!location) {
-        return null
-      }
-      const parsed = await exactOwnedPackage(location, locator.packageId)
-
-      if (!parsed) {
-        return null
-      }
-      const noteIds = await library.readableNoteIds(location, [locator.packageId])
-      const noteId = noteIds.get(locator.packageId)
-
-      if (!noteId) {
-        return null
-      }
-
-      return describeOwnedParsed(
-        context,
-        principal,
-        locator,
-        location,
-        parsed,
-        noteId,
-        budgetTokens,
-      )
+      return snapshot ? describeOwnedSnapshot(context, principal, snapshot, budgetTokens) : null
     },
 
     describeOwnedAbility: describeOwnedSnapshot,
 
     setEnabled: async (context, principal, locator, enabled) => {
       const owner = preferenceOwner(principal)
-      const target: OwnedAbilityTarget | null =
-        'registryNoteId' in locator ? (locator as OwnedAbilityTarget) : null
+      const target: OwnedAbilityTarget | null = 'locator' in locator ? locator : null
       const exactLocator: ActiveRoleLocator = target
         ? target.locator
-        : (locator as ActiveRoleLocator)
+        : (locator as Extract<ActiveRoleLocator, { source: 'system' }>)
 
       if (exactLocator.source === 'system') {
         const parsed = await systemPackageById(exactLocator.packageId)
@@ -2409,38 +2409,20 @@ export const createRolesService = ({
       if (!location) {
         throw new AbilityUnavailableError('Owned ability is unavailable to this principal')
       }
-      let registryNoteId = target?.registryNoteId
-
       if (!target) {
-        const parsed = await exactOwnedPackage(location, exactLocator.packageId)
-
-        if (!parsed || parsed.skill.role !== (exactLocator.kind === 'role')) {
-          throw new AbilityUnavailableError('no such Owned ability')
-        }
-        registryNoteId = (await library.readableNoteIds(location, [exactLocator.packageId])).get(
-          exactLocator.packageId,
-        )
-      }
-
-      if (!registryNoteId) {
-        // The same package the DETAIL answers 404 for. A bare Error here made one door
-        // call it a server fault and the other call it absent.
-        throw new AbilityUnavailableError('Owned ability has no readable registry identity')
+        throw new AbilityUnavailableError('Owned ability mutation needs a captured target')
       }
       await abilityPreferences.setEnabled(
         owner,
-        { locator: exactLocator, registryNoteId },
+        { locator: exactLocator, registryNoteId: target.registryNoteId },
         enabled,
         new Date().toISOString(),
       )
     },
 
     setAbilityAvailability: async (context, principal, locator, availability) => {
-      const target: OwnedAbilityTarget | null =
-        'registryNoteId' in locator ? (locator as OwnedAbilityTarget) : null
-      const exactLocator: OwnedAbilityLocator = target
-        ? target.locator
-        : (locator as OwnedAbilityLocator)
+      const target = locator
+      const exactLocator = target.locator
       const location = ownedPlacementOf(exactLocator, context.personalSpace)
 
       if (
@@ -2451,25 +2433,11 @@ export const createRolesService = ({
           'Owned ability availability is unavailable to this principal',
         )
       }
-      let registryNoteId = target?.registryNoteId
-
-      if (!target) {
-        const parsed = await exactOwnedPackage(location, exactLocator.packageId)
-
-        if (!parsed || parsed.skill.role !== (exactLocator.kind === 'role')) {
-          throw new AbilityUnavailableError('no such Owned ability')
-        }
-        registryNoteId = (await projectedNoteId(location, exactLocator.packageId)) ?? undefined
-      }
-
-      if (!registryNoteId) {
-        throw new AbilityUnavailableError('Owned ability has no readable registry identity')
-      }
       await abilityAvailability.set(
         location.space,
         exactLocator.packageId,
         availability,
-        registryNoteId,
+        target.registryNoteId,
       )
     },
 
@@ -2645,159 +2613,296 @@ export const createRolesService = ({
     },
 
     moveRolePlacement: async (principal, requestedTarget, personalSpace) => {
-      const locator =
-        'registryNoteId' in requestedTarget ? requestedTarget.locator : requestedTarget
+      const locator = requestedTarget.locator
       const placed = ownedPlacementOf(locator, personalSpace)
       const from = placed && projectPlacement(placed)
       const to = from && spaceRootOf(from.space, personalSpace)
 
       if (!from || !to || !can(principal, 'space:write', { space: from.space })) {
-        // The one move leads to a Space root, so every role that has no such root
-        // above it has nowhere to go: a base is already there, and Personal IS the
-        // root — a different SPACE, which the engine cannot move a note across.
         throw new AbilityUnavailableError('this role cannot change where it belongs')
       }
       const space = from.space
-      const captured = await library.withExactPackageRead(from, locator.packageId, async (read) => {
-        const snapshot = await read()
-
-        if (!snapshot) {
-          return null
-        }
-        const manifest = snapshot.pkg.files.get('SKILL.md')
-        const owner = manifest ? exactOwnerObservation(manifest) : { kind: 'unproven' as const }
-        let current: ParsedPackage | null = null
-
-        try {
-          current = parsePackage(snapshot.pkg)
-        } catch {
-          return null
-        }
-
-        if (!current.skill.role || owner.kind !== 'claimed') {
-          return null
-        }
-        const target: OwnedAbilityTarget & {
-          locator: Extract<OwnedAbilityLocator, { kind: 'role' }>
-        } = {
-          locator,
-          registryNoteId: snapshot.registryNoteId,
-          manifestNoteId: owner.id,
-        }
-
-        return 'registryNoteId' in requestedTarget &&
-          (requestedTarget.registryNoteId !== target.registryNoteId ||
-            requestedTarget.manifestNoteId !== target.manifestNoteId)
-          ? null
-          : { parsed: current, target }
-      })
-
-      if (!captured) {
-        throw new AbilityUnavailableError('no such Owned Role')
+      const moved = ownedRoleLocator(to, locator.packageId)
+      const availability: AbilityAvailability = {
+        mode: ABILITY_AVAILABILITY_MODE.selectedProjects,
+        projectIds: [from.projectId],
       }
-      const { parsed, target } = captured
-      const name = parsed.skill.name
-      const release = await acquireAddFence(to, name)
+      let reachBefore: AbilityAvailability | null = null
 
-      try {
-        // Checked BEFORE anything moves. A base and its version legally share a name
-        // precisely because they sit in different placements, so a move into an
-        // occupied name is the ordinary case, not an edge — and neither silently
-        // merging nor overwriting is an answer the user could have meant.
-        if (await library.exists(to, name)) {
-          throw new RoleAlreadyExistsError(`role "${name}" already exists in ${to.scope}`)
-        }
-        // Reach is part of what moves, so it is part of what must come back. Absence
-        // of a row READS as all-projects for a role, which means a half-undone move
-        // would not leave the reach untouched — it would widen it to the whole Space.
-        const reachBefore = await abilityAvailability.get(space, locator.packageId)
-        const movedNoteId = target.registryNoteId
-        const intoTarget = await publisherAt(to)
+      /** `false` says the row is still the one this move wrote. Reach is the last
+       *  effect an undo puts back and the only one whose residue is safe in both
+       *  directions: a narrowing row left behind can make the role reach FEWER
+       *  projects than it should, never more, and its owner rewrites it through the
+       *  ordinary availability door as soon as the package is addressable again. */
+      const restoreReach = async (): Promise<boolean> =>
+        (reachBefore
+          ? abilityAvailability.set(
+              space,
+              locator.packageId,
+              reachBefore,
+              requestedTarget.registryNoteId,
+            )
+          : abilityAvailability.clear(space, locator.packageId)
+        )
+          .then(() => true)
+          .catch((error: Error) => {
+            console.error('[roles] failed to undo role reach:', error.message)
 
-        const moved = ownedRoleLocator(to, locator.packageId)
-        // Reach belongs to a Space home and only to it. Coming up from a project the
-        // role keeps exactly the reach it had — the one project it served — because a
-        // move must not widen what a role applies to.
-        const availability: AbilityAvailability = {
-          mode: ABILITY_AVAILABILITY_MODE.selectedProjects,
-          projectIds: [from.projectId],
-        }
-        // Written BEFORE the package is readable at its new home, the same order
-        // publication already keeps: for a role the ABSENCE of a row reads as
-        // all-projects, so moving first opens a window — however short — in which a
-        // role narrowed to one project answers in every project of its Space. Early is
-        // harmless: the package is still a project placement, which reaches its own
-        // project by construction and never consults this row.
-        await abilityAvailability.set(space, locator.packageId, availability, movedNoteId)
+            return false
+          })
+
+      /** The placement trail is the third durable effect of a move, and the only one
+       *  the library knows nothing about: it is written by `finalize`, so a rollback
+       *  the library drives (`lifecycle.rollback`) can only undo the reach.
+       *
+       *  Both directions are the same call with its ends swapped, so they share one
+       *  body: an undo that could not finish has to be able to put the address back
+       *  on the package it failed to bring home. They differ in ONE thing, and it is
+       *  the thing that decides whether an interrupted undo is recoverable: the
+       *  backward call CANCELS the hop rather than answering it with a counter-hop.
+       *
+       *  A counter-hop reads as an ordinary forwarding row, and every trail row
+       *  tombstones the address it names whether or not the destination holds anything
+       *  (`captureOwnedTarget` and `withOwnedTargetMutation` refuse on the row alone).
+       *  So a compensating step is the only thing that could remove it — and that step
+       *  is exactly the one an undo can be interrupted at. Left behind with the bytes
+       *  still at the new home, it named the role from both spellings at once and no
+       *  ordinary door reached it again. `cancel` needs no step after it. */
+      const carryPlacementTrail = async (
+        snapshot: RolePackageSnapshot,
+        direction: 'forward' | 'back',
+      ): Promise<boolean> => {
+        const forward = direction === 'forward'
+
+        return abilityPlacement
+          .moveOwnedRolePlacement({
+            fromTargetId: roleContextTargetIdOf(forward ? from : to, locator.packageId),
+            toTargetId: roleContextTargetIdOf(forward ? to : from, locator.packageId),
+            fromLocator: serializeAbilityLocator(forward ? locator : moved),
+            toLocator: serializeAbilityLocator(forward ? moved : locator),
+            registryNoteId: snapshot.registryNoteId,
+            manifestNoteId: snapshot.manifestNoteId,
+            trail: forward ? 'record' : 'cancel',
+          })
+          .then(() => true)
+          .catch((error: Error) => {
+            console.error('[roles] failed to carry role placement trail:', error.message)
+
+            return false
+          })
+      }
+
+      /** The physical half of the undo, and the only half the library owns. The reverse
+       *  goes through the same `moveFrom` protocol as the forward one — so the same
+       *  conditional directory move, the same destination name check, the same
+       *  admissions — because a plain rename back would publish over whatever holds
+       *  the source pathname now.
+       *
+       *  It is keyed on the dual identity this move COMMITTED, not on whatever the
+       *  read model resolves at the new home now: an undo that accepted a different
+       *  identity there would be carrying back a package it cannot prove is ours, and
+       *  the whole reason it is running is that the identity at that address is not
+       *  the committed one. Failing to prove it is the correct answer, not a gap.
+       *
+       *  `true` means the bytes are home again. */
+      const reverseCommittedBytes = async (snapshot: RolePackageSnapshot): Promise<boolean> => {
         try {
-          const published = await intoTarget.moveFrom(
-            from,
+          const reverted = await (
+            await publisherAt(from)
+          ).moveFrom(
+            to,
             locator.packageId,
             {
-              kind: target.locator.kind,
-              registryNoteId: target.registryNoteId,
-              manifestNoteId: target.manifestNoteId,
+              kind: snapshot.kind,
+              registryNoteId: snapshot.registryNoteId,
+              manifestNoteId: snapshot.manifestNoteId,
             },
-            ({ manifestNoteId }) => {
-              if (!manifestNoteId) {
-                throw new AbilityUnavailableError('ability package has no physical owner identity')
-              }
+            {
+              beforeMove: async () => undefined,
+              finalize: async () => undefined,
+              rollback: async () => undefined,
+            },
+          )
 
-              return abilityPlacement.moveOwnedRolePlacement({
+          return reverted.status === 'moved'
+        } catch (error) {
+          if (isRolePackageMoveRollbackError(error)) {
+            // `physicalMoveCommitted` is DIRECTIONAL: it says the transition this call
+            // requested stayed at its own target — and the target of a reverse move is
+            // the placement the package came from. So the bytes are home and only the
+            // proof of it failed, which is exactly how the layer that raises the marker
+            // reads its own reverse transition. Taking it for "still at the new home"
+            // here is what left the reach row and the trail describing a placement the
+            // package no longer occupies.
+            console.error('[roles] role move undo landed without proof:', error.message)
+
+            return true
+          }
+          console.error('[roles] failed to undo role move:', (error as Error).message)
+
+          return false
+        }
+      }
+
+      /** Undo a move whose physical transition is already committed. There is no
+       *  transaction across a filesystem and a meta-DB, so the three effects come back
+       *  in the order that leaves every FAILURE on a coherent state — "some of it" is
+       *  the one outcome this operation may not leave behind. The trail — the ADDRESS
+       *  — goes first, because nothing has moved yet and its refusal costs nothing;
+       *  the bytes second, and if THEY refuse the address goes back onto them; the
+       *  reach row last, so the row narrowing a Space-placed package outlives the
+       *  package's stay there, the same order that keeps a promotion from widening.
+       *
+       *  `refused` means the package is still at its new home, whole — the "committed,
+       *  undo impossible" outcome `rolePackageMoveRollbackError` already names for a
+       *  failed finalize. `split` means a compensating step failed too and durable
+       *  state is spread across both placements; reporting that as either of the other
+       *  two would be a lie.
+       *
+       *  What `split` may NOT be is a dead end, and that is a property of the trail
+       *  rather than of this order: the undo CANCELS the hop instead of writing a
+       *  counter-hop, so the one step that can be interrupted here — putting the hop
+       *  back after the bytes refused to come home — leaves both spellings unforwarded.
+       *  The package then answers for itself at whichever placement it is standing at,
+       *  which is the difference between state an owner can still rewrite and a role
+       *  that is listed and unreachable through every door at once. */
+      const undoCommittedMove = async (
+        snapshot: RolePackageSnapshot,
+      ): Promise<'undone' | 'refused' | 'split'> => {
+        if (!(await carryPlacementTrail(snapshot, 'back'))) {
+          return 'refused'
+        }
+
+        if (!(await reverseCommittedBytes(snapshot))) {
+          return (await carryPlacementTrail(snapshot, 'forward')) ? 'refused' : 'split'
+        }
+
+        return (await restoreReach()) ? 'undone' : 'split'
+      }
+      let result
+
+      try {
+        result = await (
+          await publisherAt(to)
+        ).moveFrom(
+          from,
+          locator.packageId,
+          {
+            kind: locator.kind,
+            registryNoteId: requestedTarget.registryNoteId,
+            manifestNoteId: requestedTarget.manifestNoteId,
+          },
+          {
+            beforeMove: async (snapshot) => {
+              reachBefore = await abilityAvailability.get(space, locator.packageId)
+              try {
+                await abilityAvailability.set(
+                  space,
+                  locator.packageId,
+                  availability,
+                  snapshot.registryNoteId,
+                )
+              } catch (error) {
+                await restoreReach()
+                throw error
+              }
+            },
+            finalize: async (snapshot) => {
+              await abilityPlacement.moveOwnedRolePlacement({
                 fromTargetId: roleContextTargetIdOf(from, locator.packageId),
                 toTargetId: roleContextTargetIdOf(to, locator.packageId),
                 fromLocator: serializeAbilityLocator(locator),
                 toLocator: serializeAbilityLocator(moved),
-                registryNoteId: movedNoteId,
-                manifestNoteId,
+                registryNoteId: snapshot.registryNoteId,
+                manifestNoteId: snapshot.manifestNoteId,
+                trail: 'record',
               })
             },
+            rollback: async () => {
+              await restoreReach()
+            },
+          },
+        )
+      } catch (error) {
+        if (isRolePackageMoveRollbackError(error)) {
+          console.error('[roles] failed to undo role move: source was reoccupied')
+        }
+        throw isRolePackageMoveRollbackError(error) ? error.cause : error
+      }
+
+      if (result.status === 'missing') {
+        throw new AbilityUnavailableError('no such Owned Role')
+      }
+      let parsed: ParsedPackage
+
+      try {
+        parsed = parsePackage(result.snapshot.pkg)
+      } catch {
+        throw new AbilityUnavailableError('no such Owned Role')
+      }
+      const name = parsed.skill.name
+
+      if (result.status === 'occupied') {
+        throw new RoleAlreadyExistsError(`role "${name}" already exists in ${to.scope}`)
+      }
+      let noteIds: ReadonlyMap<string, string>
+
+      try {
+        noteIds = await library.awaitReadableNoteIds(to, [locator.packageId])
+      } catch (error) {
+        // The barrier itself refused to answer, and it runs AFTER the commit. Nothing
+        // is undone: naming this "unavailable" would invite a retry that then races
+        // the very package this call published — the outcome the Add path already
+        // refuses to produce after ITS commit. What the caller must not lose is the
+        // address, so the answer is typed and carries the new home, because that is
+        // where the package now is and where the next read has to go.
+        throw new RolePlacementUnconfirmedError(
+          `role "${name}" moved to its ${to.scope}, but this deployment could not confirm it is readable there`,
+          moved,
+          error,
+        )
+      }
+      const noteId = noteIds.get(locator.packageId)
+
+      if (!noteId || noteId !== result.snapshot.registryNoteId) {
+        // Fail-closed on a post-move projection mismatch. All three durable effects
+        // have landed — the bytes at the new home, the reach row, the placement trail
+        // — and the read model publishes an identity at that home which is NOT the one
+        // this move committed. A partially committed move is not an outcome this
+        // operation may leave behind, so every effect is undone before answering, and
+        // the answer is a typed bounded failure rather than a bare 500.
+        const failure = new RoleInstallUnavailableError(
+          `role "${name}" could not be moved to its ${to.scope}`,
+        )
+        const undone = await undoCommittedMove(result.snapshot)
+
+        // Same shape as the library-driven case above: the wire answer is the cause,
+        // and the operator log is where the difference between a refused undo and a
+        // half-landed one is recorded.
+        if (undone === 'refused') {
+          console.error('[roles] failed to undo role move: the new home could not be released')
+        } else if (undone === 'split') {
+          console.error(
+            '[roles] failed to undo role move: durable state is split across placements',
           )
-
-          if (!published) {
-            throw new RoleAlreadyExistsError(`role "${name}" already exists in ${to.scope}`)
-          }
-        } catch (error) {
-          // `moveFrom` rolls a finalize failure back while it still owns both package
-          // admissions. Only its typed rollback failure means the package remains at
-          // the target and the target reach must be preserved.
-          if (!isRolePackageMoveRollbackError(error)) {
-            await (
-              reachBefore
-                ? abilityAvailability.set(space, locator.packageId, reachBefore, movedNoteId)
-                : abilityAvailability.clear(space, locator.packageId)
-            ).catch((err: Error) => {
-              console.error(`[roles] failed to undo the reach of ${name}:`, err.message)
-            })
-          } else {
-            console.error(`[roles] failed to undo the move of ${name}: source was reoccupied`)
-          }
-          throw isRolePackageMoveRollbackError(error) ? error.cause : error
         }
-        const noteIds = await library.awaitReadableNoteIds(to, [locator.packageId])
-        const noteId = noteIds.get(locator.packageId)
+        throw failure
+      }
 
-        if (!noteId) {
-          throw new Error(`role "${name}" was moved without a readable note identity`)
-        }
-
-        return {
+      return {
+        locator: moved,
+        target: {
           locator: moved,
-          target: {
-            locator: moved,
-            registryNoteId: target.registryNoteId,
-            manifestNoteId: target.manifestNoteId,
-          },
-          availability,
-          role: {
-            ...summaryOf(parsed, to.scope),
-            space,
-            packageId: locator.packageId,
-            noteId,
-          },
-        }
-      } finally {
-        release()
+          registryNoteId: result.snapshot.registryNoteId,
+          manifestNoteId: result.snapshot.manifestNoteId,
+        },
+        availability,
+        role: {
+          ...summaryOf(parsed, to.scope),
+          space,
+          packageId: locator.packageId,
+          noteId,
+        },
       }
     },
 

@@ -2,18 +2,22 @@ import { Buffer } from 'node:buffer'
 import { describe, expect, it, vi } from 'vitest'
 
 import { ABILITY_KIND, AbilityHealthSchema, type OwnedAbilityLocator } from '@notarium/contract'
-import { serializeAbilityLocator } from '@notarium/core'
+import { exactOwnerObservation, serializeAbilityLocator } from '@notarium/core'
 
+import { clientFailureOf } from '../packages/server/src/libs/clientFailure'
 import { type Principal, SYSTEM_PRINCIPAL } from '../packages/server/src/services/authz'
 import type { Ctx } from '../packages/server/src/services/mcp/gateway'
 import { activateRole, activateSkill } from '../packages/server/src/services/mcp/tools/roles'
 import { loadSavedSessionRole } from '../packages/server/src/services/mcp/tools/session/session'
 import {
   AbilityUnavailableError,
+  createInMemoryAbilityPlacement,
   createInMemoryRoleLibrary,
+  createProjectedRolePackageScope,
   createRolesService,
   InMemoryAbilityAvailability,
   inMemoryAbilityPersistence,
+  InMemoryAbilityPreferences,
   loadBundledAbilityInventory,
   packageRevision,
   parseRoleContextTarget,
@@ -25,6 +29,7 @@ import {
   type RoleLibraryComposition,
   type RoleLocation,
   rolePackageMoveRollbackError,
+  RolePlacementUnconfirmedError,
   type RolePublicationTarget,
   type RolesService,
   SkillAlreadyExistsError,
@@ -61,6 +66,34 @@ const loadedOf = <T>(outcome: { ok: boolean; loaded?: T }): T => {
   return outcome.loaded
 }
 
+const capturedTarget = async (
+  roles: RolesService,
+  principal: Principal,
+  locator: OwnedAbilityLocator,
+) => {
+  const target = await roles.captureCurrentOwnedTarget(locator, principal)
+
+  if (!target) {
+    throw new AbilityUnavailableError('no such Owned ability')
+  }
+
+  return target
+}
+
+const capturedRoleTarget = async (
+  roles: RolesService,
+  principal: Principal,
+  locator: Extract<OwnedAbilityLocator, { kind: 'role' }>,
+) => {
+  const target = await capturedTarget(roles, principal, locator)
+
+  if (target.locator.kind !== ABILITY_KIND.role) {
+    throw new AbilityUnavailableError('no such Owned Role')
+  }
+
+  return { ...target, locator: target.locator }
+}
+
 const forkRoleVersion = async (
   roles: RolesService,
   principal: Principal,
@@ -68,11 +101,7 @@ const forkRoleVersion = async (
   personalSpace: string | null,
   projectId: string,
 ) => {
-  const source = await roles.withCurrentOwnedTarget(
-    locator,
-    principal,
-    async (snapshot) => snapshot,
-  )
+  const source = await roles.captureCurrentOwnedTarget(locator, principal)
 
   if (!source || source.locator.kind !== ABILITY_KIND.role) {
     throw new AbilityUnavailableError('no such Owned Role')
@@ -229,9 +258,7 @@ describe('role catalog and owned libraries', () => {
         },
       })
 
-      await expect(
-        roles.withCurrentOwnedTarget(stale, SYSTEM_PRINCIPAL, async ({ locator }) => locator),
-      ).resolves.toBeNull()
+      await expect(roles.captureCurrentOwnedTarget(stale, SYSTEM_PRINCIPAL)).resolves.toBeNull()
     }
   })
 
@@ -270,21 +297,17 @@ describe('role catalog and owned libraries', () => {
       publication: backing.deps.publication,
       library: {
         ...backing.deps.library,
-        withExactPackageRead: (location, directoryName, task) => {
+        captureExactPackage: async (location, directoryName) => {
           reads.push(location)
-          return backing.deps.library.withExactPackageRead(location, directoryName, (read) =>
-            task(async () => {
-              const snapshot = await read()
+          const snapshot = await backing.deps.library.captureExactPackage(location, directoryName)
 
-              return snapshot
-                ? {
-                    ...snapshot,
-                    registryNoteId:
-                      location.scope === 'space' ? 'RegistryOriginal' : 'CollisionRegistry',
-                  }
-                : null
-            }),
-          )
+          return snapshot
+            ? {
+                ...snapshot,
+                registryNoteId:
+                  location.scope === 'space' ? 'RegistryOriginal' : 'CollisionRegistry',
+              }
+            : null
         },
       },
       abilityPlacement: {
@@ -293,9 +316,9 @@ describe('role catalog and owned libraries', () => {
       },
     })
 
-    await expect(
-      roles.withCurrentOwnedTarget(stale, SYSTEM_PRINCIPAL, async ({ locator }) => locator),
-    ).resolves.toEqual(stale)
+    await expect(roles.captureCurrentOwnedTarget(stale, SYSTEM_PRINCIPAL)).resolves.toMatchObject({
+      locator: stale,
+    })
     expect(reads).toEqual([source])
 
     reads.length = 0
@@ -304,9 +327,9 @@ describe('role catalog and owned libraries', () => {
       registryNoteId: 'RegistryOriginal',
       manifestNoteId: 'ManifestOriginal',
     }
-    await expect(
-      roles.withCurrentOwnedTarget(stale, SYSTEM_PRINCIPAL, async ({ locator }) => locator),
-    ).resolves.toEqual(moved)
+    await expect(roles.captureCurrentOwnedTarget(stale, SYSTEM_PRINCIPAL)).resolves.toMatchObject({
+      locator: moved,
+    })
     // The old placement is a TOMBSTONE once a row exists. Its live collision is never
     // even opened; only the recorded target is exact-read.
     expect(reads).toEqual([target])
@@ -360,13 +383,11 @@ describe('role catalog and owned libraries', () => {
         publication: backing.deps.publication,
         library: {
           ...backing.deps.library,
-          withExactPackageRead: (location, directoryName, task) =>
-            backing.deps.library.withExactPackageRead(location, directoryName, (read) =>
-              task(async () => {
-                const snapshot = await read()
-                return snapshot ? { ...snapshot, registryNoteId: projectedRegistryNoteId } : null
-              }),
-            ),
+          captureExactPackage: async (location, directoryName) => {
+            const snapshot = await backing.deps.library.captureExactPackage(location, directoryName)
+
+            return snapshot ? { ...snapshot, registryNoteId: projectedRegistryNoteId } : null
+          },
         },
         abilityPlacement: {
           resolveMovedOwnedRoleLocator: async () => ({
@@ -378,9 +399,7 @@ describe('role catalog and owned libraries', () => {
         },
       })
 
-      await expect(
-        roles.withCurrentOwnedTarget(stale, SYSTEM_PRINCIPAL, async ({ locator }) => locator),
-      ).resolves.toBeNull()
+      await expect(roles.captureCurrentOwnedTarget(stale, SYSTEM_PRINCIPAL)).resolves.toBeNull()
     },
   )
 
@@ -400,14 +419,17 @@ describe('role catalog and owned libraries', () => {
       publication: composition.publication,
       library: {
         ...composition.library,
-        withExactPackageRead: (_location, _directoryName, task) =>
-          task(async () => ({
-            pkg: {
-              directoryName: packageId,
-              files: new Map([['SKILL.md', Buffer.from('not valid frontmatter')]]),
-            },
-            registryNoteId: 'OriginalRegistry',
-          })),
+        captureExactPackage: async () => ({
+          pkg: {
+            directoryName: packageId,
+            files: new Map([['SKILL.md', Buffer.from('not valid frontmatter')]]),
+          },
+          kind: ABILITY_KIND.role,
+          registryNoteId: 'OriginalRegistry',
+          manifestNoteId: 'OriginalRegistry',
+          filePath: `.notarium/skills/${packageId}/SKILL.md`,
+          versionToken: 'invalid-version',
+        }),
       },
       abilityPlacement: {
         resolveMovedOwnedRoleLocator: async () => ({
@@ -419,9 +441,7 @@ describe('role catalog and owned libraries', () => {
       },
     })
 
-    await expect(
-      roles.withCurrentOwnedTarget(stale, SYSTEM_PRINCIPAL, async ({ locator }) => locator),
-    ).resolves.toBeNull()
+    await expect(roles.captureCurrentOwnedTarget(stale, SYSTEM_PRINCIPAL)).resolves.toBeNull()
   })
 
   it('retries authority when a back-move commits while the shared read waits', async () => {
@@ -454,9 +474,9 @@ describe('role catalog and owned libraries', () => {
       publication: backing.deps.publication,
       library: {
         ...backing.deps.library,
-        withExactPackageRead: (location, directoryName, task) => {
+        captureExactPackage: (location, directoryName) => {
           readLocations.push(location)
-          return backing.deps.library.withExactPackageRead(location, directoryName, task)
+          return backing.deps.library.captureExactPackage(location, directoryName)
         },
       },
       abilityPlacement: {
@@ -467,9 +487,9 @@ describe('role catalog and owned libraries', () => {
       },
     })
 
-    await expect(
-      roles.withCurrentOwnedTarget(stale, SYSTEM_PRINCIPAL, async ({ locator }) => locator),
-    ).resolves.toEqual(moved)
+    await expect(roles.captureCurrentOwnedTarget(stale, SYSTEM_PRINCIPAL)).resolves.toMatchObject({
+      locator: moved,
+    })
     expect(readLocations).toEqual([source, target])
     expect(authorityReads).toBe(4)
   })
@@ -490,11 +510,23 @@ describe('role catalog and owned libraries', () => {
       const original = claimed(pkg('review', 'Original.', 'Original body.'), 'OriginalId')
       let current = { ...original, directoryName: packageId }
       let registryNoteId = 'OriginalRegistry'
-      const exact: RoleLibraryComposition['library']['withExactPackageRead'] = async (
-        _location,
-        _directoryName,
-        task,
-      ) => task(async () => ({ pkg: current, registryNoteId }))
+
+      const exact: RoleLibraryComposition['library']['captureExactPackage'] = async () => {
+        const manifest = current.files.get('SKILL.md')!
+        const owner = exactOwnerObservation(manifest)
+        const parsed = parseSkillFile(Buffer.from(manifest).toString('utf8'), current.directoryName)
+
+        return owner.kind === 'claimed'
+          ? {
+              pkg: current,
+              kind: parsed.role ? ABILITY_KIND.role : ABILITY_KIND.skill,
+              registryNoteId,
+              manifestNoteId: owner.id,
+              filePath: `.notarium/skills/${current.directoryName}/SKILL.md`,
+              versionToken: 'current-version',
+            }
+          : null
+      }
       const composition = createInMemoryRoleLibrary()
       const roles = createRolesService({
         ...inMemoryAbilityPersistence(),
@@ -502,15 +534,20 @@ describe('role catalog and owned libraries', () => {
         publication: composition.publication,
         library: {
           ...composition.library,
-          withExactPackageRead: exact,
-          withExactPackageMutation: exact,
+          captureExactPackage: exact,
+          withExactPackageMutation: async (location, directoryName, expected, task) => {
+            const snapshot = await exact(location, directoryName)
+
+            return snapshot &&
+              snapshot.kind === expected.kind &&
+              snapshot.registryNoteId === expected.registryNoteId &&
+              snapshot.manifestNoteId === expected.manifestNoteId
+              ? task(snapshot)
+              : null
+          },
         },
       })
-      const target = await roles.withCurrentOwnedTarget(
-        locator,
-        SYSTEM_PRINCIPAL,
-        async (proof) => proof,
-      )
+      const target = await roles.captureCurrentOwnedTarget(locator, SYSTEM_PRINCIPAL)
 
       expect(target).toMatchObject({
         registryNoteId: 'OriginalRegistry',
@@ -521,7 +558,7 @@ describe('role catalog and owned libraries', () => {
       const called = vi.fn()
 
       await expect(
-        roles.withOwnedTarget(target!, SYSTEM_PRINCIPAL, async (proof) => {
+        roles.withOwnedTargetMutation(target!, SYSTEM_PRINCIPAL, async (proof) => {
           called(proof)
           return true
         }),
@@ -560,7 +597,11 @@ describe('role catalog and owned libraries', () => {
             registryNoteId: packageId,
             manifestNoteId: 'OriginalId',
           },
-          async () => undefined,
+          {
+            beforeMove: async () => undefined,
+            finalize: async () => undefined,
+            rollback: async () => undefined,
+          },
         ),
       ).rejects.toBeInstanceOf(AbilityUnavailableError)
       await expect(library.getByDirectory(source, packageId)).resolves.not.toBeNull()
@@ -860,7 +901,12 @@ describe('role catalog and owned libraries', () => {
       ok: true,
       loaded: { role: { source: 'owned', instructions: 'Personal instructions.' } },
     })
-    await roles.setEnabled(context, SYSTEM_PRINCIPAL, locator, false)
+    await roles.setEnabled(
+      context,
+      SYSTEM_PRINCIPAL,
+      await capturedTarget(roles, SYSTEM_PRINCIPAL, locator),
+      false,
+    )
     await expect(
       roles.loadEffective(context, SYSTEM_PRINCIPAL, 'research', 4_000),
     ).resolves.toMatchObject({ ok: true, loaded: { role: { source: 'system' } } })
@@ -903,12 +949,12 @@ describe('role catalog and owned libraries', () => {
     await roles.setEnabled(
       context,
       SYSTEM_PRINCIPAL,
-      {
+      await capturedTarget(roles, SYSTEM_PRINCIPAL, {
         source: 'owned',
         kind: 'role',
         packageId: shared.noteId,
         location: { scope: 'space', spaceId: 'shared' },
-      },
+      }),
       false,
     )
     await library.putIfAbsent(
@@ -1147,7 +1193,10 @@ describe('role catalog and owned libraries', () => {
         '---\nname: research\ndescription: Broken replacement.\nmetadata:\n  notarium.kind: role\n  notarium.skills: "[[notarium-id:space:broken|evidence]]"\n---\n\nBroken instructions.',
       ),
     )
-    await library.putIfAbsent({ scope: 'personal', space: 'personal' }, role)
+    await library.putIfAbsent(
+      { scope: 'personal', space: 'personal' },
+      claimed(role, role.directoryName),
+    )
     const locator = {
       source: 'owned',
       kind: 'role',
@@ -1224,18 +1273,24 @@ describe('role catalog and owned libraries', () => {
     const unwritable = '[[notarium-id:space:broken|ev\u2028idence]]'
     const writable = '[[notarium-id:space:broken|evidence]]'
     const roleId = 'Unwritable_1'
-    await library.putIfAbsent(home, {
-      ...pkg('unwritable-role', 'Carries a token YAML cannot write.', 'Body.'),
-      directoryName: roleId,
-      files: new Map([
-        [
-          'SKILL.md',
-          Buffer.from(
-            `---\nname: unwritable-role\ndescription: Carries a token YAML cannot write.\nmetadata:\n  notarium.kind: role\n  notarium.skills: "${unwritable} ${writable}"\n---\n\nBody.`,
-          ),
-        ],
-      ]),
-    })
+    await library.putIfAbsent(
+      home,
+      claimed(
+        {
+          ...pkg('unwritable-role', 'Carries a token YAML cannot write.', 'Body.'),
+          directoryName: roleId,
+          files: new Map([
+            [
+              'SKILL.md',
+              Buffer.from(
+                `---\nname: unwritable-role\ndescription: Carries a token YAML cannot write.\nmetadata:\n  notarium.kind: role\n  notarium.skills: "${unwritable} ${writable}"\n---\n\nBody.`,
+              ),
+            ],
+          ]),
+        },
+        roleId,
+      ),
+    )
     const locator = {
       source: 'owned',
       kind: 'role',
@@ -1304,43 +1359,58 @@ describe('role catalog and owned libraries', () => {
       },
     }
 
-    await library.putIfAbsent(space, {
-      ...skillPkg('disabled-skill', 'Disabled skill.'),
-      directoryName: disabledId,
-    })
-    await library.putIfAbsent(space, {
-      ...skillPkg('unavailable-skill', 'Unavailable skill.'),
-      directoryName: unavailableId,
-    })
-    await library.putIfAbsent(space, {
-      ...pkg('wrong-kind', 'A role, not a skill.', 'Wrong kind.'),
-      directoryName: wrongKindId,
-    })
+    await library.putIfAbsent(
+      space,
+      claimed(
+        { ...skillPkg('disabled-skill', 'Disabled skill.'), directoryName: disabledId },
+        disabledId,
+      ),
+    )
+    await library.putIfAbsent(
+      space,
+      claimed(
+        { ...skillPkg('unavailable-skill', 'Unavailable skill.'), directoryName: unavailableId },
+        unavailableId,
+      ),
+    )
+    await library.putIfAbsent(
+      space,
+      claimed(
+        { ...pkg('wrong-kind', 'A role, not a skill.', 'Wrong kind.'), directoryName: wrongKindId },
+        wrongKindId,
+      ),
+    )
     await abilityAvailability.set('shared', unavailableId, {
       mode: 'selected-projects',
       projectIds: ['project-b'],
     })
-    await library.putIfAbsent(project, {
-      ...pkg('health-matrix', 'Exercise every attachment health.', 'Health matrix.'),
-      directoryName: roleId,
-      files: new Map([
-        [
-          'SKILL.md',
-          Buffer.from(
-            `---\nname: health-matrix\ndescription: Exercise every attachment health.\nmetadata:\n  notarium.kind: role\n  notarium.skills: "[[notarium-id:system:_55UeQqGnMrH|research-evidence]] [[notarium-id:space:MissingSkil1|missing-skill]] [[notarium-id:space:${disabledId}|disabled-skill]] [[notarium-id:space:${unavailableId}|unavailable-skill]] [[notarium-id:space:${wrongKindId}|wrong-kind]] [[notarium-id:space:broken|invalid-skill]]"\n---\n\nHealth matrix.`,
-          ),
-        ],
-      ]),
-    })
+    await library.putIfAbsent(
+      project,
+      claimed(
+        {
+          ...pkg('health-matrix', 'Exercise every attachment health.', 'Health matrix.'),
+          directoryName: roleId,
+          files: new Map([
+            [
+              'SKILL.md',
+              Buffer.from(
+                `---\nname: health-matrix\ndescription: Exercise every attachment health.\nmetadata:\n  notarium.kind: role\n  notarium.skills: "[[notarium-id:system:_55UeQqGnMrH|research-evidence]] [[notarium-id:space:MissingSkil1|missing-skill]] [[notarium-id:space:${disabledId}|disabled-skill]] [[notarium-id:space:${unavailableId}|unavailable-skill]] [[notarium-id:space:${wrongKindId}|wrong-kind]] [[notarium-id:space:broken|invalid-skill]]"\n---\n\nHealth matrix.`,
+              ),
+            ],
+          ]),
+        },
+        roleId,
+      ),
+    )
     await roles.setEnabled(
       context,
       SYSTEM_PRINCIPAL,
-      {
+      await capturedTarget(roles, SYSTEM_PRINCIPAL, {
         source: 'owned',
         kind: 'skill',
         packageId: disabledId,
         location: { scope: 'space', spaceId: 'shared' },
-      },
+      }),
       false,
     )
 
@@ -1411,22 +1481,31 @@ describe('role catalog and owned libraries', () => {
     // carry it: the authored list is rebuilt from what came back, so an attachment
     // missing here is an attachment deleted from the author's file on the next attach.
     const longestToken = `[[${'z'.repeat(1_024)}]]`
-    await library.putIfAbsent(space, {
-      ...skillPkg('evidence', 'A real dependency.'),
-      directoryName: dependencyId,
-    })
-    await library.putIfAbsent(space, {
-      ...pkg('overlong-role', 'Names what it may not.', 'Overlong.'),
-      directoryName: roleId,
-      files: new Map([
-        [
-          'SKILL.md',
-          Buffer.from(
-            `---\nname: overlong-role\ndescription: Names what it may not.\nmetadata:\n  notarium.kind: role\n  notarium.skills: "[[notarium-id:space:${dependencyId}|${overlongLabel}]] ${longestToken}"\n---\n\nOverlong.`,
-          ),
-        ],
-      ]),
-    })
+    await library.putIfAbsent(
+      space,
+      claimed(
+        { ...skillPkg('evidence', 'A real dependency.'), directoryName: dependencyId },
+        dependencyId,
+      ),
+    )
+    await library.putIfAbsent(
+      space,
+      claimed(
+        {
+          ...pkg('overlong-role', 'Names what it may not.', 'Overlong.'),
+          directoryName: roleId,
+          files: new Map([
+            [
+              'SKILL.md',
+              Buffer.from(
+                `---\nname: overlong-role\ndescription: Names what it may not.\nmetadata:\n  notarium.kind: role\n  notarium.skills: "[[notarium-id:space:${dependencyId}|${overlongLabel}]] ${longestToken}"\n---\n\nOverlong.`,
+              ),
+            ],
+          ]),
+        },
+        roleId,
+      ),
+    )
 
     const detail = await roles.describeAbility(
       context,
@@ -1914,10 +1993,15 @@ describe('role catalog and owned libraries', () => {
     })
     const locator = spaceRoleLocator(base.packageId, 'shared')
 
-    await roles.setAbilityAvailability({ personalSpace: 'personal' }, SYSTEM_PRINCIPAL, locator, {
-      mode: 'selected-projects',
-      projectIds: ['project-a'],
-    })
+    await roles.setAbilityAvailability(
+      { personalSpace: 'personal' },
+      SYSTEM_PRINCIPAL,
+      await capturedTarget(roles, SYSTEM_PRINCIPAL, locator),
+      {
+        mode: 'selected-projects',
+        projectIds: ['project-a'],
+      },
+    )
 
     // Where the reach answers, resume and activation agree.
     await expect(
@@ -2872,10 +2956,16 @@ describe('role catalog and owned libraries', () => {
     await expect(
       roles.serializeOwnedRoleAttachments(SYSTEM_PRINCIPAL, asPersonal, [], 'personal'),
     ).rejects.toBeInstanceOf(AbilityUnavailableError)
+    const asSpaceTarget = await roles.captureCurrentOwnedTarget(asSpace, SYSTEM_PRINCIPAL)
+
+    expect(asSpaceTarget).not.toBeNull()
     await expect(
-      roles.setAbilityAvailability({ personalSpace: 'personal' }, SYSTEM_PRINCIPAL, asSpace, {
-        mode: 'all-projects',
-      }),
+      roles.setAbilityAvailability(
+        { personalSpace: 'personal' },
+        SYSTEM_PRINCIPAL,
+        asSpaceTarget!,
+        { mode: 'all-projects' },
+      ),
     ).rejects.toBeInstanceOf(AbilityUnavailableError)
 
     // The base/version entries ask the same address question, so they get the same
@@ -2949,7 +3039,11 @@ describe('role catalog and owned libraries', () => {
     // promotion into a personal root would turn a project role into one of the owner's
     // own, in a library the space rules do not govern. Still refused.
     await expect(
-      roles.moveRolePlacement(SYSTEM_PRINCIPAL, inProject(other.packageId), 'personal'),
+      roles.moveRolePlacement(
+        SYSTEM_PRINCIPAL,
+        await capturedRoleTarget(roles, SYSTEM_PRINCIPAL, inProject(other.packageId)),
+        'personal',
+      ),
     ).rejects.toBeInstanceOf(AbilityUnavailableError)
     // Refused BEFORE anything moved: a promotion into a personal root would have
     // turned a project role into one of the owner's own, in a library the space
@@ -2980,7 +3074,7 @@ describe('role catalog and owned libraries', () => {
     await roles.setAbilityAvailability(
       { personalSpace: null },
       SYSTEM_PRINCIPAL,
-      spaceRoleLocator(created.packageId, 'shared'),
+      await capturedTarget(roles, SYSTEM_PRINCIPAL, spaceRoleLocator(created.packageId, 'shared')),
       { mode: 'selected-projects', projectIds: ['project-api'] },
     )
 
@@ -3027,7 +3121,7 @@ describe('role catalog and owned libraries', () => {
     await roles.setAbilityAvailability(
       { personalSpace: null },
       SYSTEM_PRINCIPAL,
-      spaceRoleLocator(shared.packageId, 'shared'),
+      await capturedTarget(roles, SYSTEM_PRINCIPAL, spaceRoleLocator(shared.packageId, 'shared')),
       { mode: 'selected-projects', projectIds: ['project-api'] },
     )
 
@@ -3129,10 +3223,10 @@ describe('role catalog and owned libraries', () => {
       publication: backing.deps.publication,
       library: {
         ...backing.deps.library,
-        withExactPackageRead: async (location, directoryName, task) => {
+        captureExactPackage: async (location, directoryName) => {
           sourceAdmitted = true
           try {
-            return await backing.deps.library.withExactPackageRead(location, directoryName, task)
+            return await backing.deps.library.captureExactPackage(location, directoryName)
           } finally {
             sourceAdmitted = false
           }
@@ -3207,7 +3301,7 @@ describe('role catalog and owned libraries', () => {
     await roles.setAbilityAvailability(
       { personalSpace: null },
       SYSTEM_PRINCIPAL,
-      spaceRoleLocator(base.packageId, 'shared'),
+      await capturedTarget(roles, SYSTEM_PRINCIPAL, spaceRoleLocator(base.packageId, 'shared')),
       { mode: 'selected-projects', projectIds: ['project-api'] },
     )
 
@@ -3349,7 +3443,7 @@ describe('role catalog and owned libraries', () => {
     await roles.setAbilityAvailability(
       { personalSpace: null },
       SYSTEM_PRINCIPAL,
-      spaceRoleLocator(role.packageId, 'shared'),
+      await capturedTarget(roles, SYSTEM_PRINCIPAL, spaceRoleLocator(role.packageId, 'shared')),
       { mode: 'selected-projects', projectIds: ['project-api', 'project-web'] },
     )
     await availability.set('shared', skillId, {
@@ -3396,6 +3490,10 @@ describe('role catalog and owned libraries', () => {
               ([directoryName]) => directoryName !== unprojected,
             ),
           ),
+        captureExactPackage: async (location, directoryName, expectedRegistryNoteId) =>
+          directoryName === unprojected
+            ? null
+            : inner.captureExactPackage(location, directoryName, expectedRegistryNoteId),
       },
     })
     const base = await roles.createCustomRole('review', 'Review.', 'Review it.', {
@@ -3435,9 +3533,7 @@ describe('role catalog and owned libraries', () => {
       roles.listRoleVersions(SYSTEM_PRINCIPAL, baseLocator, null, ['project-web']),
     ).resolves.toEqual([])
     // …and the writes that take it must refuse it the same way the reader does.
-    await expect(
-      roles.setEnabled({ personalSpace: null }, SYSTEM_PRINCIPAL, baseLocator, false),
-    ).rejects.toBeInstanceOf(AbilityUnavailableError)
+    await expect(roles.captureCurrentOwnedTarget(baseLocator, SYSTEM_PRINCIPAL)).resolves.toBeNull()
     await expect(
       roles.serializeOwnedRoleAttachments(SYSTEM_PRINCIPAL, baseLocator, [], null),
     ).rejects.toBeInstanceOf(AbilityUnavailableError)
@@ -3515,7 +3611,12 @@ describe('role catalog and owned libraries', () => {
     } as const
 
     // The owner turns the shared skill off FOR THEMSELVES. Nothing about the package changed.
-    await roles.setEnabled({ personalSpace: null }, SYSTEM_PRINCIPAL, skillLocator, false)
+    await roles.setEnabled(
+      { personalSpace: null },
+      SYSTEM_PRINCIPAL,
+      await capturedTarget(roles, SYSTEM_PRINCIPAL, skillLocator),
+      false,
+    )
 
     await expect(
       roles.serializeOwnedRoleAttachments(SYSTEM_PRINCIPAL, roleLocator, attachments, null),
@@ -3617,7 +3718,12 @@ describe('role catalog and owned libraries', () => {
       location: { scope: 'space', spaceId: 'shared' },
     } as const
 
-    await roles.setEnabled({ personalSpace: 'personal' }, SYSTEM_PRINCIPAL, locator, false)
+    await roles.setEnabled(
+      { personalSpace: 'personal' },
+      SYSTEM_PRINCIPAL,
+      await capturedTarget(roles, SYSTEM_PRINCIPAL, locator),
+      false,
+    )
 
     // The address still names the same shared role: pins, sets and ordering stay editable.
     await expect(
@@ -3648,10 +3754,15 @@ describe('role catalog and owned libraries', () => {
       location: { scope: 'space', spaceId: 'shared' },
     } as const
 
-    await roles.setAbilityAvailability({ personalSpace: 'personal' }, SYSTEM_PRINCIPAL, locator, {
-      mode: 'selected-projects',
-      projectIds: ['project-a'],
-    })
+    await roles.setAbilityAvailability(
+      { personalSpace: 'personal' },
+      SYSTEM_PRINCIPAL,
+      await capturedTarget(roles, SYSTEM_PRINCIPAL, locator),
+      {
+        mode: 'selected-projects',
+        projectIds: ['project-a'],
+      },
+    )
 
     await expect(
       roles.effectiveRoleAt(projectContext('project-a', 'shared'), SYSTEM_PRINCIPAL, locator),
@@ -3773,7 +3884,12 @@ describe('role catalog and owned libraries', () => {
     ).resolves.toMatchObject({ active: true })
 
     // The owner switches the attached skill off for themselves. The package is untouched.
-    await roles.setEnabled(context, SYSTEM_PRINCIPAL, skillLocator, false)
+    await roles.setEnabled(
+      context,
+      SYSTEM_PRINCIPAL,
+      await capturedTarget(roles, SYSTEM_PRINCIPAL, skillLocator),
+      false,
+    )
 
     // Resume refuses the role...
     await expect(
@@ -4247,6 +4363,101 @@ describe('role catalog and owned libraries', () => {
     })
   })
 
+  /** Every owned door takes an ADDRESS and a claim about what stands at it, and the
+   *  two are independent: a locator is a string a caller kept, and the package at that
+   *  address is whatever the library holds now. Answering from the address alone hands
+   *  a caller the bytes of a different ability under the identity it asked for — so
+   *  each door re-derives the locator from the manifest it actually read and refuses
+   *  unless the two are the same address, kind included. */
+  it('refuses every owned door when the package is not the ability the locator names', async () => {
+    const library = writableLibrary(createInMemoryRoleLibrary())
+    const roles = createRolesService({
+      catalog: async () => [],
+      ...library.deps,
+      ...inMemoryAbilityPersistence(),
+    })
+    const space = { scope: 'space', space: 'shared' } as const
+    const project = { scope: 'project', space: 'shared', projectId: 'project-web' } as const
+    const standalone = claimed(skillPkg('field-notes', 'Field notes.'), 'ManifestNote1')
+    const packageId = standalone.directoryName
+
+    await expect(library.putIfAbsent(space, standalone)).resolves.toBe(true)
+    await expect(library.putIfAbsent(project, standalone)).resolves.toBe(true)
+
+    const asRole = {
+      source: 'owned',
+      kind: 'role',
+      packageId,
+      location: { scope: 'space', spaceId: 'shared' },
+    } as const
+    const target = { locator: asRole, registryNoteId: packageId, manifestNoteId: 'ManifestNote1' }
+
+    // A Space-placed standalone skill, addressed as a Role. The address exists, the
+    // package is there, and the identity it carries is the one the caller expects —
+    // only the KIND disagrees, and that is enough to make it a different ability.
+    await expect(roles.captureCurrentOwnedTarget(asRole, SYSTEM_PRINCIPAL)).resolves.toBeNull()
+    await expect(roles.captureOwnedTarget(target, SYSTEM_PRINCIPAL)).resolves.toBeNull()
+    await expect(
+      roles.withOwnedTargetMutation(target, SYSTEM_PRINCIPAL, async () => 'mutated'),
+    ).resolves.toBeNull()
+    await expect(
+      roles.resolveOwnedAt(space, SYSTEM_PRINCIPAL, ABILITY_KIND.role, packageId),
+    ).resolves.toBeNull()
+    await expect(
+      roles.captureOwnedAt(space, SYSTEM_PRINCIPAL, ABILITY_KIND.role, packageId, packageId),
+    ).resolves.toBeNull()
+
+    // …and the same package one placement down, where the kind it DOES have has no
+    // address at all: a standalone skill is addressed by its Space or by Personal, so a
+    // project placement names a locator that cannot be spelled. The doors that answer
+    // with a locator have nothing to answer with, and must not invent one.
+    await expect(
+      roles.resolveOwnedAt(project, SYSTEM_PRINCIPAL, ABILITY_KIND.skill, packageId),
+    ).resolves.toBeNull()
+    await expect(
+      roles.captureOwnedAt(project, SYSTEM_PRINCIPAL, ABILITY_KIND.skill, packageId, packageId),
+    ).resolves.toBeNull()
+    // The same package at that project, addressed as a Role: here the manifest yields
+    // NO owned locator at all — a standalone skill has no project spelling — so there
+    // is nothing to compare the caller's address against, and "nothing" is a refusal
+    // rather than a licence to hand back the bytes.
+    const asProjectRole = {
+      source: 'owned',
+      kind: 'role',
+      packageId,
+      location: { scope: 'project', spaceId: 'shared', projectId: 'project-web' },
+    } as const
+
+    await expect(
+      roles.captureCurrentOwnedTarget(asProjectRole, SYSTEM_PRINCIPAL),
+    ).resolves.toBeNull()
+    await expect(
+      roles.captureOwnedTarget(
+        { locator: asProjectRole, registryNoteId: packageId, manifestNoteId: 'ManifestNote1' },
+        SYSTEM_PRINCIPAL,
+      ),
+    ).resolves.toBeNull()
+
+    // The control: the SAME package answers every one of those doors at the address
+    // whose kind it really has, so none of the refusals above is a door that is simply
+    // shut.
+    const asSkill = {
+      source: 'owned',
+      kind: 'skill',
+      packageId,
+      location: { scope: 'space', spaceId: 'shared' },
+    } as const
+
+    await expect(roles.captureCurrentOwnedTarget(asSkill, SYSTEM_PRINCIPAL)).resolves.toMatchObject(
+      {
+        locator: asSkill,
+      },
+    )
+    await expect(
+      roles.captureOwnedAt(space, SYSTEM_PRINCIPAL, ABILITY_KIND.skill, packageId, packageId),
+    ).resolves.toMatchObject({ locator: asSkill })
+  })
+
   it('keeps distinct physical and projected identities through move and stale resolution', async () => {
     const library = writableLibrary(createInMemoryRoleLibrary())
     const source = { scope: 'project' as const, space: 'shared', projectId: 'project-web' }
@@ -4287,7 +4498,11 @@ describe('role catalog and owned libraries', () => {
       directoryName: packageId,
     })
 
-    const promoted = await roles.moveRolePlacement(SYSTEM_PRINCIPAL, stale, null)
+    const promoted = await roles.moveRolePlacement(
+      SYSTEM_PRINCIPAL,
+      await capturedRoleTarget(roles, SYSTEM_PRINCIPAL, stale),
+      null,
+    )
 
     expect(moveOwnedRolePlacement).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -4295,9 +4510,525 @@ describe('role catalog and owned libraries', () => {
         manifestNoteId,
       }),
     )
-    await expect(
-      roles.withCurrentOwnedTarget(stale, SYSTEM_PRINCIPAL, async ({ locator }) => locator),
-    ).resolves.toEqual(promoted.locator)
+    await expect(roles.captureCurrentOwnedTarget(stale, SYSTEM_PRINCIPAL)).resolves.toMatchObject({
+      locator: promoted.locator,
+    })
+  })
+
+  /** A move has THREE durable effects — the package bytes, the reach row and the
+   *  placement trail — and the barrier that catches a foreign identity at the new
+   *  home runs after all three have landed. So the assertion is not "it threw": it is
+   *  that nothing of the move survives the refusal, and that the refusal is a typed
+   *  bounded failure the routes already answer for rather than a bare 500. */
+  it('undoes every durable effect when post-move projection resolves a foreign identity', async () => {
+    const library = writableLibrary(createInMemoryRoleLibrary())
+    const availability = new InMemoryAbilityAvailability()
+    const preferences = new InMemoryAbilityPreferences()
+    const roles = createRolesService({
+      catalog: async () => [],
+      ...library.deps,
+      abilityAvailability: availability,
+      abilityPreferences: preferences,
+      abilityPlacement: createInMemoryAbilityPlacement({ abilityPreferences: preferences }),
+    })
+    const project = { scope: 'project', space: 'shared', projectId: 'project-web' } as const
+    const spaceRoot = { scope: 'space', space: 'shared' } as const
+    const version = await roles.createCustomRole(
+      'projection-race',
+      'Post-move projection race.',
+      'Keep the committed identity whole.',
+      project,
+    )
+    const locator = {
+      source: 'owned',
+      kind: 'role',
+      packageId: version.packageId,
+      location: { scope: 'project', spaceId: 'shared', projectId: 'project-web' },
+    } as const
+    const target = await capturedRoleTarget(roles, SYSTEM_PRINCIPAL, locator)
+    const awaitReadable = library.deps.library.awaitReadableNoteIds.bind(library.deps.library)
+
+    library.deps.library.awaitReadableNoteIds = async (location, packageIds) => {
+      const projected = new Map(await awaitReadable(location, packageIds))
+
+      if (location.scope === 'space' && packageIds.includes(version.packageId)) {
+        projected.set(version.packageId, 'ForeignRegistry')
+      }
+
+      return projected
+    }
+
+    const failure = await roles
+      .moveRolePlacement(SYSTEM_PRINCIPAL, target, null)
+      .then(() => null)
+      .catch((error: unknown) => error)
+
+    // Typed and bounded: a bare Error carries no client failure at all, and the two
+    // callers turn that into a 500 and into a `message: 'internal error'` step whose
+    // locator points at the placement this role was supposed to have left.
+    expect(failure).toBeInstanceOf(RoleInstallUnavailableError)
+    expect(clientFailureOf(failure)).toEqual({
+      kind: 'actionable',
+      message: expect.stringContaining('projection-race'),
+    })
+    // 1. The bytes are back where they started, and the new home is empty again.
+    await expect(library.getSkillByDirectory(project, version.packageId)).resolves.not.toBeNull()
+    await expect(library.getSkillByDirectory(spaceRoot, version.packageId)).resolves.toBeNull()
+    // 2. The reach row a Space placement needs was written before the move and must
+    //    not outlive it: a project-placed role's reach IS its placement.
+    await expect(availability.get('shared', version.packageId)).resolves.toBeNull()
+    // 3. The placement trail must not redirect the address the role still stands at.
+    expect(preferences.movedLocator(serializeAbilityLocator(locator))).toBeNull()
+    // …which is the same thing said from the caller's side: a recapture of the
+    // original locator answers at the project, not at the Space.
+    await expect(roles.captureCurrentOwnedTarget(locator, SYSTEM_PRINCIPAL)).resolves.toMatchObject(
+      { locator: { location: { scope: 'project' } } },
+    )
+  })
+
+  /** The undo is a real move back, so it can fail the same way the forward one can.
+   *  When it does, the package IS at its new home and the target-owned state must
+   *  stay with it — the existing "committed, undo impossible" outcome, not a second
+   *  contract invented for this barrier. */
+  it('keeps the new home whole when the post-move undo cannot land', async () => {
+    const availability = new InMemoryAbilityAvailability()
+    const preferences = new InMemoryAbilityPreferences()
+    const composition = createInMemoryRoleLibrary()
+    let undoAttempted = false
+    const library = writableLibrary(
+      interceptPublication(composition, {
+        moveFrom: async (into, _from, _directoryName, _expected, _lifecycle, next) => {
+          // Only the REVERSE move — the one whose destination is the project — is
+          // refused, so the forward move commits all three effects first.
+          if (into.scope === 'project') {
+            undoAttempted = true
+            return { status: 'missing' as const }
+          }
+
+          return next()
+        },
+      }),
+    )
+    const roles = createRolesService({
+      catalog: async () => [],
+      ...library.deps,
+      abilityAvailability: availability,
+      abilityPreferences: preferences,
+      abilityPlacement: createInMemoryAbilityPlacement({ abilityPreferences: preferences }),
+    })
+    const project = { scope: 'project', space: 'shared', projectId: 'project-web' } as const
+    const spaceRoot = { scope: 'space', space: 'shared' } as const
+    const version = await roles.createCustomRole(
+      'undo-refused',
+      'The undo is refused.',
+      'Keep the committed identity whole.',
+      project,
+    )
+    const locator = {
+      source: 'owned',
+      kind: 'role',
+      packageId: version.packageId,
+      location: { scope: 'project', spaceId: 'shared', projectId: 'project-web' },
+    } as const
+    const target = await capturedRoleTarget(roles, SYSTEM_PRINCIPAL, locator)
+    const awaitReadable = library.deps.library.awaitReadableNoteIds.bind(library.deps.library)
+
+    library.deps.library.awaitReadableNoteIds = async (location, packageIds) => {
+      const projected = new Map(await awaitReadable(location, packageIds))
+
+      if (location.scope === 'space' && packageIds.includes(version.packageId)) {
+        projected.set(version.packageId, 'ForeignRegistry')
+      }
+
+      return projected
+    }
+
+    await expect(roles.moveRolePlacement(SYSTEM_PRINCIPAL, target, null)).rejects.toBeInstanceOf(
+      RoleInstallUnavailableError,
+    )
+    expect(undoAttempted).toBe(true)
+    await expect(library.getSkillByDirectory(spaceRoot, version.packageId)).resolves.not.toBeNull()
+    // The package is at the Space, so the state that describes a Space placement stays
+    // with it: clearing reach here would publish the role into every project.
+    await expect(availability.get('shared', version.packageId)).resolves.toMatchObject({
+      mode: 'selected-projects',
+      projectIds: ['project-web'],
+    })
+    // The address is undone BEFORE the bytes are, so a package that could not come
+    // home has to have that address put back on it — named, not merely present, and
+    // said again from the caller's side: the locator its owner still holds resolves
+    // at the placement the package actually kept.
+    expect(preferences.movedLocator(serializeAbilityLocator(locator))).toBe(
+      serializeAbilityLocator(spaceRoleLocator(version.packageId, 'shared')),
+    )
+    await expect(roles.captureCurrentOwnedTarget(locator, SYSTEM_PRINCIPAL)).resolves.toMatchObject(
+      { locator: { location: { scope: 'space' } } },
+    )
+  })
+
+  /** One committed move whose post-move barrier does not confirm the new home — the
+   *  only door into the undo path, and the state on the far side of it is what the
+   *  cases below are about. So what varies is only which durable effect refuses and
+   *  how the barrier fails; the twenty lines that get a move committed are not what
+   *  any of them says. */
+  const committedMove = async (options: {
+    availability?: InMemoryAbilityAvailability
+    intercept?: Parameters<typeof interceptPublication>[1]
+    placement?: (
+      base: ReturnType<typeof createInMemoryAbilityPlacement>,
+    ) => ReturnType<typeof createInMemoryAbilityPlacement>
+    barrier: 'foreign-identity' | 'unanswered'
+  }) => {
+    const availability = options.availability ?? new InMemoryAbilityAvailability()
+    const preferences = new InMemoryAbilityPreferences()
+    const composition = createInMemoryRoleLibrary()
+    const library = writableLibrary(
+      options.intercept ? interceptPublication(composition, options.intercept) : composition,
+    )
+    const base = createInMemoryAbilityPlacement({ abilityPreferences: preferences })
+    const roles = createRolesService({
+      catalog: async () => [],
+      ...library.deps,
+      abilityAvailability: availability,
+      abilityPreferences: preferences,
+      abilityPlacement: options.placement ? options.placement(base) : base,
+    })
+    const project = { scope: 'project', space: 'shared', projectId: 'project-web' } as const
+    const spaceRoot = { scope: 'space', space: 'shared' } as const
+    const version = await roles.createCustomRole(
+      'committed-move',
+      'A move that is already committed.',
+      'Keep the committed identity whole.',
+      project,
+    )
+    const locator = {
+      source: 'owned',
+      kind: 'role',
+      packageId: version.packageId,
+      location: { scope: 'project', spaceId: 'shared', projectId: 'project-web' },
+    } as const
+    const target = await capturedRoleTarget(roles, SYSTEM_PRINCIPAL, locator)
+    const awaitReadable = library.deps.library.awaitReadableNoteIds.bind(library.deps.library)
+
+    // The barrier is the last step of the move, so it is where a POST-COMMIT failure
+    // is injected: an identity that is not the one this move committed, or no answer
+    // at all. Both leave all three durable effects at the new home.
+    library.deps.library.awaitReadableNoteIds = async (location, packageIds) => {
+      if (location.scope !== 'space' || !packageIds.includes(version.packageId)) {
+        return awaitReadable(location, packageIds)
+      }
+      if (options.barrier === 'unanswered') {
+        throw new Error('the projection barrier timed out')
+      }
+      const projected = new Map(await awaitReadable(location, packageIds))
+
+      projected.set(version.packageId, 'ForeignRegistry')
+
+      return projected
+    }
+
+    return {
+      availability,
+      failure: await roles
+        .moveRolePlacement(SYSTEM_PRINCIPAL, target, null)
+        .then(() => null)
+        .catch((error: unknown) => error),
+      library,
+      locator,
+      packageId: version.packageId,
+      preferences,
+      project,
+      recapture: () => roles.captureCurrentOwnedTarget(locator, SYSTEM_PRINCIPAL),
+      roles,
+      spaceRoot,
+    }
+  }
+
+  /** The marker a failed physical rollback raises is DIRECTIONAL: it says the
+   *  transition its own call requested stayed at that call's target. Raised by the
+   *  REVERSE move, that target is the placement the package came from — so the bytes
+   *  are home and only the proof of it failed, which is how the layer that raises it
+   *  reads its own reverse. Read as "still at the new home", it left the reach row and
+   *  the trail describing a placement the package no longer occupied. */
+  it('finishes the undo when the reverse move lands its bytes without proof', async () => {
+    let reverseAttempted = false
+    const {
+      availability,
+      failure,
+      library,
+      locator,
+      packageId,
+      preferences,
+      project,
+      recapture,
+      spaceRoot,
+    } = await committedMove({
+      barrier: 'foreign-identity',
+      intercept: {
+        moveFrom: async (into, _from, _directoryName, _expected, _lifecycle, next) => {
+          const result = await next()
+
+          // Exactly the shape a `committed-error` reverse takes one layer down: the
+          // directory transition IS at its target, and the claim that proves it is
+          // the same package could not be carried through.
+          if (into.scope === 'project' && result.status === 'moved') {
+            reverseAttempted = true
+            throw rolePackageMoveRollbackError(
+              new AbilityUnavailableError(
+                'directory moved but its claimed source resource did not reach the target',
+              ),
+            )
+          }
+
+          return result
+        },
+      },
+    })
+
+    expect(reverseAttempted).toBe(true)
+    expect(failure).toBeInstanceOf(RoleInstallUnavailableError)
+    // The bytes are home, so every piece of state that says where the package IS came
+    // home with them — bytes, reach row and trail, or none of it.
+    await expect(library.getSkillByDirectory(project, packageId)).resolves.not.toBeNull()
+    await expect(library.getSkillByDirectory(spaceRoot, packageId)).resolves.toBeNull()
+    await expect(availability.get('shared', packageId)).resolves.toBeNull()
+    expect(preferences.movedLocator(serializeAbilityLocator(locator))).toBeNull()
+    await expect(recapture()).resolves.toMatchObject({
+      locator: { location: { scope: 'project' } },
+    })
+  })
+
+  /** There is no transaction across a filesystem and a meta-DB, so the undo runs in
+   *  the order that keeps every failure on a coherent state. The trail is the ADDRESS
+   *  and goes first: nothing has moved when it runs, so its refusal costs nothing and
+   *  the answer is the outcome this operation already names — the package is still at
+   *  its new home, whole. Undone after the bytes instead, the same refusal left a role
+   *  standing at one placement while its address redirected to the other. */
+  it('refuses the whole undo when the placement trail cannot come back', async () => {
+    let reverseAttempted = false
+    const {
+      availability,
+      failure,
+      library,
+      locator,
+      packageId,
+      preferences,
+      project,
+      recapture,
+      spaceRoot,
+    } = await committedMove({
+      barrier: 'foreign-identity',
+      intercept: {
+        moveFrom: async (into, _from, _directoryName, _expected, _lifecycle, next) => {
+          reverseAttempted ||= into.scope === 'project'
+
+          return next()
+        },
+      },
+      placement: (base) => ({
+        ...base,
+        // Only the reverse hop is refused — the one whose destination is the project
+        // — so the forward move commits all three effects first.
+        moveOwnedRolePlacement: async (move) => {
+          if (move.toTargetId.startsWith('project:')) {
+            throw new Error('meta-DB is unavailable')
+          }
+
+          return base.moveOwnedRolePlacement(move)
+        },
+      }),
+    })
+
+    expect(failure).toBeInstanceOf(RoleInstallUnavailableError)
+    expect(reverseAttempted).toBe(false)
+    await expect(library.getSkillByDirectory(spaceRoot, packageId)).resolves.not.toBeNull()
+    await expect(library.getSkillByDirectory(project, packageId)).resolves.toBeNull()
+    await expect(availability.get('shared', packageId)).resolves.toMatchObject({
+      mode: 'selected-projects',
+      projectIds: ['project-web'],
+    })
+    expect(preferences.movedLocator(serializeAbilityLocator(locator))).toBe(
+      serializeAbilityLocator(spaceRoleLocator(packageId, 'shared')),
+    )
+    // The role is whole at the home it kept: the locator its owner holds still
+    // redirects there, which is what "still at its new home" has to mean.
+    await expect(recapture()).resolves.toMatchObject({ locator: { location: { scope: 'space' } } })
+  })
+
+  /** Reach is the last effect the undo puts back, so it is the only one that can be
+   *  left behind — and its residue is the safe one: a narrowing row makes the role
+   *  reach fewer projects than it should, never more. What may not happen is the
+   *  operation reporting that outcome as either of the other two. */
+  it('reports an undo that could not put the reach row back as neither of the others', async () => {
+    const availability = new InMemoryAbilityAvailability()
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    try {
+      availability.clear = async () => {
+        throw new Error('meta-DB is unavailable')
+      }
+      const { failure, library, locator, packageId, preferences, project, recapture, spaceRoot } =
+        await committedMove({ availability, barrier: 'foreign-identity' })
+
+      expect(failure).toBeInstanceOf(RoleInstallUnavailableError)
+      // The package and the address that finds it are both home…
+      await expect(library.getSkillByDirectory(project, packageId)).resolves.not.toBeNull()
+      await expect(library.getSkillByDirectory(spaceRoot, packageId)).resolves.toBeNull()
+      expect(preferences.movedLocator(serializeAbilityLocator(locator))).toBeNull()
+      await expect(recapture()).resolves.toMatchObject({
+        locator: { location: { scope: 'project' } },
+      })
+      // …and the row that outlived them narrows the role to the project it is standing
+      // in, which its owner can rewrite through the ordinary availability door.
+      await expect(availability.get('shared', packageId)).resolves.toMatchObject({
+        mode: 'selected-projects',
+        projectIds: ['project-web'],
+      })
+      expect(errorLog).toHaveBeenCalledWith(
+        '[roles] failed to undo role move: durable state is split across placements',
+      )
+      // Not "the new home could not be released": the new home was released.
+      expect(errorLog).not.toHaveBeenCalledWith(
+        '[roles] failed to undo role move: the new home could not be released',
+      )
+    } finally {
+      errorLog.mockRestore()
+    }
+  })
+
+  /** The interrupted undo, and the state it may not leave behind. The address comes
+   *  back first, so when the BYTES then refuse to come home the undo has to put the
+   *  address back onto them — and that compensating step can fail too. Whatever it
+   *  leaves is `split` by definition; what it may not leave is a role no door reaches.
+   *
+   *  Which is what a counter-hop left. Every reader of the trail refuses on the ROW,
+   *  not on what stands at its destination (`captureOwnedTarget`, `withOwnedTargetMutation`
+   *  and `captureCurrentOwnedTarget` all do), so a row pointing at the placement the
+   *  package failed to reach tombstoned the placement it actually kept: the role stayed
+   *  in the listing and every get/edit/save/delete/move answered `null`, with nothing
+   *  but a hand-edited meta-DB to get it back. Cancelling the hop instead of answering
+   *  it leaves both spellings unforwarded, and an unforwarded address answers for
+   *  itself. */
+  it('leaves the role reachable when the undo cannot put the address back either', async () => {
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    try {
+      let recorded = 0
+      const {
+        availability,
+        failure,
+        library,
+        locator,
+        packageId,
+        preferences,
+        project,
+        roles,
+        spaceRoot,
+      } = await committedMove({
+        barrier: 'foreign-identity',
+        intercept: {
+          // The bytes refuse to come home, which is what makes the undo reach for the
+          // address it has already given back.
+          moveFrom: async (into, _from, _directoryName, _expected, _lifecycle, next) =>
+            into.scope === 'project' ? { status: 'missing' as const } : next(),
+        },
+        placement: (base) => ({
+          ...base,
+          moveOwnedRolePlacement: async (move) => {
+            // The forward hop lands; the one that would put it BACK does not. Every
+            // other step of the undo has already succeeded, so this is the last
+            // durable write of the operation and nothing runs after it.
+            if (move.trail === 'record' && ++recorded > 1) {
+              throw new Error('meta-DB is unavailable')
+            }
+
+            return base.moveOwnedRolePlacement(move)
+          },
+        }),
+      })
+
+      expect(failure).toBeInstanceOf(RoleInstallUnavailableError)
+      expect(errorLog).toHaveBeenCalledWith(
+        '[roles] failed to undo role move: durable state is split across placements',
+      )
+      // The package is at the Space — the undo could not bring it back…
+      await expect(library.getSkillByDirectory(spaceRoot, packageId)).resolves.not.toBeNull()
+      await expect(library.getSkillByDirectory(project, packageId)).resolves.toBeNull()
+      // …and NEITHER spelling forwards, so nothing tombstones the address it is at.
+      expect(preferences.movedLocator(serializeAbilityLocator(locator))).toBeNull()
+      expect(
+        preferences.movedLocator(serializeAbilityLocator(spaceRoleLocator(packageId, 'shared'))),
+      ).toBeNull()
+      // Which is the whole point, said through the doors an owner actually has: the
+      // role can be captured and mutated at the placement it kept.
+      const kept = await roles.captureOwnedTarget(
+        {
+          locator: spaceRoleLocator(packageId, 'shared'),
+          registryNoteId: packageId,
+          manifestNoteId: packageId,
+        },
+        SYSTEM_PRINCIPAL,
+      )
+
+      expect(kept).not.toBeNull()
+      await expect(
+        roles.withOwnedTargetMutation(kept!, SYSTEM_PRINCIPAL, async () => 'reachable'),
+      ).resolves.toBe('reachable')
+      // The reach row is the residue this outcome is allowed to keep, and it narrows.
+      await expect(availability.get('shared', packageId)).resolves.toMatchObject({
+        mode: 'selected-projects',
+        projectIds: ['project-web'],
+      })
+    } finally {
+      errorLog.mockRestore()
+    }
+  })
+
+  /** The barrier can fail by THROWING, and it runs after the commit. Nothing is undone
+   *  for it: an "unavailable" answer invites a retry that would then race the very
+   *  package this call published — the outcome the Add path refuses to produce after
+   *  ITS commit. Which leaves the whole duty of the answer to be typed and to address
+   *  the home the role now has. */
+  it('names the new home when the post-move barrier cannot answer at all', async () => {
+    const {
+      availability,
+      failure,
+      library,
+      locator,
+      packageId,
+      preferences,
+      project,
+      recapture,
+      spaceRoot,
+    } = await committedMove({ barrier: 'unanswered' })
+
+    expect(failure).toBeInstanceOf(RolePlacementUnconfirmedError)
+    expect(failure).not.toBeInstanceOf(RoleInstallUnavailableError)
+    expect(clientFailureOf(failure)).toEqual({
+      kind: 'actionable',
+      message: expect.stringContaining('committed-move'),
+    })
+    // The barrier's own words stay in the cause, for the operator log and not the wire.
+    expect((failure as RolePlacementUnconfirmedError).cause).toMatchObject({
+      message: 'the projection barrier timed out',
+    })
+    // The address the answer carries is the one the package is at…
+    expect((failure as RolePlacementUnconfirmedError).locator).toEqual(
+      spaceRoleLocator(packageId, 'shared'),
+    )
+    // …because all three effects are still committed there: undoing a whole move over
+    // a barrier that timed out would trade a readable package for a physical move
+    // nobody asked for.
+    await expect(library.getSkillByDirectory(spaceRoot, packageId)).resolves.not.toBeNull()
+    await expect(library.getSkillByDirectory(project, packageId)).resolves.toBeNull()
+    await expect(availability.get('shared', packageId)).resolves.toMatchObject({
+      mode: 'selected-projects',
+      projectIds: ['project-web'],
+    })
+    expect(preferences.movedLocator(serializeAbilityLocator(locator))).toBe(
+      serializeAbilityLocator(spaceRoleLocator(packageId, 'shared')),
+    )
+    await expect(recapture()).resolves.toMatchObject({ locator: { location: { scope: 'space' } } })
   })
 
   /** Reach is written BEFORE the package is readable at its new home. For a role the
@@ -4340,12 +5071,12 @@ describe('role catalog and owned libraries', () => {
 
     await roles.moveRolePlacement(
       SYSTEM_PRINCIPAL,
-      {
+      await capturedRoleTarget(roles, SYSTEM_PRINCIPAL, {
         source: 'owned',
         kind: 'role',
         packageId: version.packageId,
         location: { scope: 'project', spaceId: 'shared', projectId: 'project-web' },
-      },
+      }),
       null,
     )
 
@@ -4385,7 +5116,11 @@ describe('role catalog and owned libraries', () => {
       location: { scope: 'project', spaceId: 'shared', projectId: 'project-web' },
     } as const
 
-    const promoted = await roles.moveRolePlacement(SYSTEM_PRINCIPAL, locator, null)
+    const promoted = await roles.moveRolePlacement(
+      SYSTEM_PRINCIPAL,
+      await capturedRoleTarget(roles, SYSTEM_PRINCIPAL, locator),
+      null,
+    )
 
     expect(promoted.locator).toEqual(spaceRoleLocator(version.packageId, 'shared'))
     expect(promoted.availability).toEqual({
@@ -4440,14 +5175,14 @@ describe('role catalog and owned libraries', () => {
       ...inMemoryAbilityPersistence(),
       catalog: loadBundledAbilityInventory,
       ...interceptPublication(library.deps, {
-        moveFrom: async (_into, _from, _directoryName, _expected, _finalize, next) => {
-          const moved = await next(async () => undefined)
+        moveFrom: async (_into, _from, _directoryName, _expected, lifecycle, next) => {
+          const moved = await next({ ...lifecycle, finalize: async () => undefined })
 
-          if (moved) {
+          if (moved.status === 'moved') {
             throw rolePackageMoveRollbackError(failure)
           }
 
-          return false
+          return moved
         },
       }),
       abilityAvailability: availability,
@@ -4467,12 +5202,12 @@ describe('role catalog and owned libraries', () => {
     await expect(
       roles.moveRolePlacement(
         SYSTEM_PRINCIPAL,
-        {
+        await capturedRoleTarget(roles, SYSTEM_PRINCIPAL, {
           source: 'owned',
           kind: 'role',
           packageId: version.packageId,
           location: { scope: 'project', spaceId: 'shared', projectId: 'project-web' },
-        },
+        }),
         null,
       ),
     ).rejects.toBe(failure)
@@ -4507,12 +5242,21 @@ describe('role catalog and owned libraries', () => {
     } as const
     const context = projectContext('project-web', 'shared')
 
-    await roles.setEnabled(context, SYSTEM_PRINCIPAL, locator, false)
+    await roles.setEnabled(
+      context,
+      SYSTEM_PRINCIPAL,
+      await capturedTarget(roles, SYSTEM_PRINCIPAL, locator),
+      false,
+    )
     await expect(
       roles.loadEffective(context, SYSTEM_PRINCIPAL, 'review', 4_000),
     ).resolves.toMatchObject({ ok: false, reason: 'disabled' })
 
-    const promoted = await roles.moveRolePlacement(SYSTEM_PRINCIPAL, locator, null)
+    const promoted = await roles.moveRolePlacement(
+      SYSTEM_PRINCIPAL,
+      await capturedRoleTarget(roles, SYSTEM_PRINCIPAL, locator),
+      null,
+    )
 
     // The preference row is keyed by the LOCATOR, and a promotion changes it. Left
     // behind, the row names a placement that no longer exists and the absent row at
@@ -4549,12 +5293,12 @@ describe('role catalog and owned libraries', () => {
     await expect(
       roles.moveRolePlacement(
         SYSTEM_PRINCIPAL,
-        {
+        await capturedRoleTarget(roles, SYSTEM_PRINCIPAL, {
           source: 'owned',
           kind: 'role',
           packageId: version.packageId,
           location: { scope: 'project', spaceId: 'shared', projectId: 'project-web' },
-        },
+        }),
         null,
       ),
     ).rejects.toBeInstanceOf(RoleAlreadyExistsError)
@@ -4595,12 +5339,12 @@ describe('role catalog and owned libraries', () => {
     await expect(
       roles.moveRolePlacement(
         SYSTEM_PRINCIPAL,
-        {
+        await capturedRoleTarget(roles, SYSTEM_PRINCIPAL, {
           source: 'owned',
           kind: 'role',
           packageId: version.packageId,
           location: { scope: 'project', spaceId: 'shared', projectId: 'project-web' },
-        },
+        }),
         null,
       ),
     ).rejects.toBe(failure)
@@ -4618,5 +5362,99 @@ describe('role catalog and owned libraries', () => {
     // The reach written for the base it did not become must not survive either: for a
     // role a leftover row is not neutral, it is a reach.
     await expect(availability.get('shared', version.packageId)).resolves.toBeNull()
+  })
+})
+
+/** The production composition seam of design 02, tested as the unit the composition
+ *  root actually installs. It is the ONLY place in the exact-package path where a
+ *  registry note is bound to a package ADDRESS: every strict caller downstream
+ *  resolves its note by id and compares that id against a copy of itself. */
+describe('projected role package scope', () => {
+  const PACKAGE = {
+    directoryName: 'AbCdefGhij_1',
+    filePath: '.notarium/skills/_projects/cHJvamVjdC13ZWI/AbCdefGhij_1/SKILL.md',
+  }
+
+  const scopeOver = (
+    notes: ReadonlyArray<{ id: string; filePath: string; versionToken?: string }>,
+  ) => {
+    const claimedNotes: string[] = []
+    const scope = createProjectedRolePackageScope(async () => ({
+      list: async () => notes,
+      withExactNoteClaim: async (noteId, task) => {
+        claimedNotes.push(noteId)
+        const current = notes.find((note) => note.id === noteId)
+
+        if (!current) {
+          throw Object.assign(new Error('not found'), { isNotFound: true })
+        }
+
+        return task({ versionToken: 'v1', ...current })
+      },
+    }))
+
+    return { claimedNotes, scope }
+  }
+
+  it('resolves an unexpected capture by path and hands its registry facts on', async () => {
+    const { claimedNotes, scope } = scopeOver([{ id: 'RegistryNote1', filePath: PACKAGE.filePath }])
+
+    await expect(
+      scope('shared', PACKAGE, undefined, async (projection) => projection),
+    ).resolves.toEqual({
+      registryNoteId: 'RegistryNote1',
+      filePath: PACKAGE.filePath,
+      versionToken: 'v1',
+    })
+    expect(claimedNotes).toEqual(['RegistryNote1'])
+  })
+
+  it('refuses an expected registry note that no longer stands at the addressed package', async () => {
+    // The package moved between the caller's read and this claim: the note is still
+    // the note, and the address the caller named is no longer where it lives. Nothing
+    // downstream can catch this — a mutation compares its expected registry id with
+    // the very id this seam was handed.
+    const { claimedNotes, scope } = scopeOver([
+      { id: 'RegistryNote1', filePath: '.notarium/skills/AbCdefGhij_1/SKILL.md' },
+    ])
+    const task = vi.fn(async (projection: unknown) => projection)
+
+    await expect(scope('shared', PACKAGE, 'RegistryNote1', task)).resolves.toBeNull()
+    // Claimed — so the refusal is the identity check, not a candidate that was never
+    // resolved — and the RoleLibrary callback never ran under it.
+    expect(claimedNotes).toEqual(['RegistryNote1'])
+    expect(task).not.toHaveBeenCalled()
+  })
+
+  it('refuses a claimed note with no version token', async () => {
+    const { scope } = scopeOver([
+      { id: 'RegistryNote1', filePath: PACKAGE.filePath, versionToken: '' },
+    ])
+    const task = vi.fn(async (projection: unknown) => projection)
+
+    await expect(scope('shared', PACKAGE, 'RegistryNote1', task)).resolves.toBeNull()
+    expect(task).not.toHaveBeenCalled()
+  })
+
+  it('answers absent for an address nothing is published at, and only for that', async () => {
+    const { claimedNotes, scope } = scopeOver([])
+
+    // No candidate at all: nothing is claimed, because there is nothing to claim.
+    await expect(scope('shared', PACKAGE, undefined, async () => 'ran')).resolves.toBeNull()
+    expect(claimedNotes).toEqual([])
+    // A named candidate the store does not have is the same answer — but a store
+    // failure that is NOT "no such note" stays loud.
+    await expect(scope('shared', PACKAGE, 'Vanished0001', async () => 'ran')).resolves.toBeNull()
+
+    const failing = createProjectedRolePackageScope(async () => ({
+      list: async () => [],
+      withExactNoteClaim: async () => {
+        throw new Error('store is stopping')
+      },
+    }))
+
+    await expect(failing('shared', PACKAGE, 'RegistryNote1', async () => 'ran')).rejects.toThrow(
+      'store is stopping',
+    )
   })
 })

@@ -22,6 +22,9 @@ export {
   renameNoReplaceIfAvailable,
   type FileClaim,
   type FileClaimedRemoval,
+  type FileConditionalDirectoryMove,
+  type FileConditionalDirectoryMoveRequest,
+  type FileConditionalDirectoryMoveResult,
   type FileConditionalMutation,
   type FileDirectoryNoReplaceMove,
   type FileEntryIdentity,
@@ -53,6 +56,7 @@ export {
 } from './libs/files'
 export {
   assertCanonicalResourceRoot,
+  type ConditionalDirectoryMoveView,
   preflightResourceRoots,
   ResourceAdmission,
   resourceAuthorityAdapterOf,
@@ -71,6 +75,8 @@ export {
   type ResourceAuthorityFileCapabilities,
   type ResourceAuthorityFileView,
   type ResourceAuthorityOwner,
+  type ResourceConditionalDirectoryMoveResult,
+  type ResourceDirectoryMoveProof,
   type ResourceObservation,
   type ResourcePackagePublicationRequest,
   type ResourceProofTransition,

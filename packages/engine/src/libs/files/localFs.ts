@@ -26,6 +26,7 @@ import { renameNoReplace, renameNoReplaceIfAvailable } from './renameNoReplace'
 import { FilePackagePublicationUnavailableError } from './types'
 import type {
   FileClaim,
+  FileConditionalDirectoryMoveResult,
   FileObservation,
   FilePackagePublication,
   FilePublicationResult,
@@ -348,8 +349,15 @@ export const createLocalFsFiles = (root: string): FileStoreAssembly => {
     mtimeMs: null,
   })
 
+  /** The directory a resource was observed in rides inside the claim, but it is
+   *  not part of what a claim MEANS to the facets that condition on one
+   *  pathname: they ask "is this still the incarnation I saw", and a folder
+   *  replaced around an untouched file is not an answer they can act on. So
+   *  equality is over the carried resource, and the directory half is read
+   *  explicitly — and only — by the facet that moves the directory itself. */
   const claimMatches = (left: FileClaim, right: FileClaim): boolean =>
-    left.kind === right.kind && left.value === right.value
+    left.kind === right.kind &&
+    splitDirectoryBinding(left.value).carried === splitDirectoryBinding(right.value).carried
 
   const occupiedClaim = (stat: BigIntStats): { kind: 'present'; value: string } => ({
     kind: 'present',
@@ -376,10 +384,19 @@ export const createLocalFsFiles = (root: string): FileStoreAssembly => {
     }
   }
 
+  const sameRegularVersion = (left: BigIntStats, right: BigIntStats): boolean =>
+    left.isFile() &&
+    right.isFile() &&
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.size === right.size &&
+    left.ctimeNs === right.ctimeNs &&
+    left.mtimeNs === right.mtimeNs
+
   const claimInode = (
     claim: FileClaim & { kind: 'present' },
   ): { dev: bigint; ino: bigint } | null => {
-    const parts = claim.value.split(':')
+    const parts = splitDirectoryBinding(claim.value).carried.split(':')
 
     if (parts.length !== 8 || parts.slice(0, 3).join(':') !== 'localfs:present:v1') {
       return null
@@ -388,6 +405,48 @@ export const createLocalFsFiles = (root: string): FileStoreAssembly => {
       return { dev: BigInt(parts[3]), ino: BigInt(parts[4]) }
     } catch {
       return null
+    }
+  }
+
+  /** A proof this adapter minted for a directory transition it performed: the
+   *  claim of the carried resource, prefixed with the identity of the directory
+   *  that carried it. A file claim alone answers dev, ino, ctime, size and bytes
+   *  — every one of which a HARDLINKED twin in a stranger's directory answers
+   *  identically — so it cannot say WHICH directory arrived. Only a caller that
+   *  received `moved` holds one of these, so handing it back is a statement about
+   *  the directory it moved. A plain observation claim carries no such statement
+   *  and binds no directory: its holder has moved nothing yet. */
+  const directoryBoundProofPattern = /^localfs:moved-in:v1:(-?\d+):(-?\d+):(localfs:present:v1:.+)$/
+
+  const directoryBoundProof = (
+    directory: BigIntStats,
+    carried: { kind: 'present'; value: string },
+  ): { kind: 'present'; value: string } => ({
+    kind: 'present',
+    value: `localfs:moved-in:v1:${directory.dev}:${directory.ino}:${carried.value}`,
+  })
+
+  const splitDirectoryBinding = (
+    value: string,
+  ): { directory: { dev: bigint; ino: bigint } | null; carried: string } => {
+    const bound = directoryBoundProofPattern.exec(value)
+
+    return bound
+      ? { directory: { dev: BigInt(bound[1]), ino: BigInt(bound[2]) }, carried: bound[3] }
+      : { directory: null, carried: value }
+  }
+
+  const splitDirectoryBoundProof = (
+    proof: FileClaim & { kind: 'present' },
+  ): {
+    directory: { dev: bigint; ino: bigint } | null
+    carried: FileClaim & { kind: 'present' }
+  } => {
+    const split = splitDirectoryBinding(proof.value)
+
+    return {
+      directory: split.directory,
+      carried: split.carried === proof.value ? proof : { kind: 'present', value: split.carried },
     }
   }
 
@@ -415,7 +474,7 @@ export const createLocalFsFiles = (root: string): FileStoreAssembly => {
    * stable after another process has already replaced its directory entry. */
   const observeRegular = async (
     rel: string,
-    options?: { maxBytes?: number },
+    options?: { maxBytes?: number; bindDirectory?: boolean },
   ): Promise<FileObservation> => {
     const path = abs(rel)
 
@@ -448,6 +507,16 @@ export const createLocalFsFiles = (root: string): FileStoreAssembly => {
         if (options?.maxBytes != null && before.size > BigInt(options.maxBytes)) {
           return { kind: 'unavailable', reason: 'too-large', mtimeMs: null }
         }
+        // Sampled BEFORE the resource window rather than after it, and that
+        // order is the whole guarantee: a directory swapped at any point from
+        // here on leaves the claim naming a directory that no longer holds the
+        // pathname, so the transition conditioned on it refuses. Sampling after
+        // the window would fail the other way round — it would name the
+        // STRANGER's directory as the one the caller had just read from.
+        const directory = options?.bindDirectory
+          ? await fs.lstat(dirname(path), { bigint: true })
+          : null
+
         try {
           handle = await fs.open(
             path,
@@ -463,16 +532,8 @@ export const createLocalFsFiles = (root: string): FileStoreAssembly => {
           throw err
         }
         const opened = await handle.stat({ bigint: true })
-        const sameVersion = (left: typeof opened, right: typeof opened): boolean =>
-          left.isFile() &&
-          right.isFile() &&
-          left.dev === right.dev &&
-          left.ino === right.ino &&
-          left.size === right.size &&
-          left.ctimeNs === right.ctimeNs &&
-          left.mtimeNs === right.mtimeNs
 
-        if (!sameVersion(before, opened)) {
+        if (!sameRegularVersion(before, opened)) {
           continue
         }
         const bytes = new Uint8Array(await handle.readFile())
@@ -487,17 +548,19 @@ export const createLocalFsFiles = (root: string): FileStoreAssembly => {
           }
           throw err
         }
-        if (!sameVersion(opened, after) || !sameVersion(after, pathAfter)) {
+        if (!sameRegularVersion(opened, after) || !sameRegularVersion(after, pathAfter)) {
           continue
+        }
+
+        const claim = {
+          kind: 'present' as const,
+          value: `localfs:present:v1:${after.dev}:${after.ino}:${after.ctimeNs}:${after.size}:${sha256Bytes(bytes)}`,
         }
 
         return {
           kind: 'present',
           bytes,
-          claim: {
-            kind: 'present',
-            value: `localfs:present:v1:${after.dev}:${after.ino}:${after.ctimeNs}:${after.size}:${sha256Bytes(bytes)}`,
-          },
+          claim: directory ? directoryBoundProof(directory, claim) : claim,
           mtimeMs: nsToMs(after.mtimeNs),
         }
       } finally {
@@ -1850,6 +1913,239 @@ export const createLocalFsFiles = (root: string): FileStoreAssembly => {
         throw Object.assign(new Error('directory move source changed externally'), {
           code: 'ESTALE',
         })
+      })
+
+  /** Hold an open descriptor to the exact regular-file incarnation claimed at
+   *  its SOURCE pathname. Unlike a hardlink, the descriptor does not change
+   *  ctime and therefore does not invalidate the claim merely by retaining it. */
+  const claimExpectedRegular = async (
+    rel: string,
+    expected: FileClaim & { kind: 'present' },
+  ): Promise<{
+    handle: Awaited<ReturnType<typeof fs.open>>
+    stat: BigIntStats
+    bytes: Uint8Array
+  } | null> => {
+    const path = abs(rel)
+
+    for (let attempt = 0; attempt < OBSERVATION_ATTEMPTS; attempt++) {
+      let handle: Awaited<ReturnType<typeof fs.open>> | undefined
+
+      try {
+        let before: BigIntStats
+
+        try {
+          before = await fs.lstat(path, { bigint: true })
+        } catch (error) {
+          if (errnoCode(error) === 'ENOENT') {
+            return null
+          }
+          throw error
+        }
+        if (!before.isFile()) {
+          return null
+        }
+        try {
+          handle = await fs.open(
+            path,
+            fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | (fsConstants.O_NOFOLLOW ?? 0),
+          )
+        } catch (error) {
+          if (['ENOENT', 'ELOOP'].includes(errnoCode(error) ?? '')) {
+            continue
+          }
+          throw error
+        }
+        const opened = await handle.stat({ bigint: true })
+
+        if (!sameRegularVersion(before, opened)) {
+          continue
+        }
+        const bytes = new Uint8Array(await handle.readFile())
+        const after = await handle.stat({ bigint: true })
+        let pathAfter: BigIntStats
+
+        try {
+          pathAfter = await fs.lstat(path, { bigint: true })
+        } catch (error) {
+          if (errnoCode(error) === 'ENOENT') {
+            continue
+          }
+          throw error
+        }
+        if (
+          !sameRegularVersion(opened, after) ||
+          !sameRegularVersion(after, pathAfter) ||
+          !claimMatches(presentProofFromStat(after, bytes).claim, expected)
+        ) {
+          return null
+        }
+        const claimed = handle
+
+        handle = undefined
+        return { handle: claimed, stat: after, bytes }
+      } finally {
+        await handle?.close().catch(() => {})
+      }
+    }
+
+    return null
+  }
+
+  const conditionalDirectoryMoveWith =
+    (publish: typeof renameNoReplace) =>
+    ({
+      sourcePath,
+      targetPath,
+      sourceProofPath,
+      expectedSourceProof,
+    }: {
+      sourcePath: string
+      targetPath: string
+      sourceProofPath: string
+      expectedSourceProof: FileClaim & { kind: 'present' }
+    }): Promise<FileConditionalDirectoryMoveResult> =>
+      withStorageLock(async () => {
+        await ensureRecoveredUnlocked()
+        const source = abs(sourcePath)
+        const target = abs(targetPath)
+        const sourceProof = abs(sourceProofPath)
+        const proofSuffix = relative(source, sourceProof)
+
+        // Between two normalised absolute paths `relative` answers in the form
+        // `(../)*rest`, so a leading `..` — alone or as the first segment — is the
+        // entire containment question, and an empty answer means the proof IS the
+        // source directory rather than something the move can carry.
+        if (!proofSuffix || proofSuffix === '..' || proofSuffix.startsWith(`..${sep}`)) {
+          throw new Error('directory move proof must be below its source directory')
+        }
+        const targetProof = resolve(target, proofSuffix)
+        const boundDirectory = splitDirectoryBoundProof(expectedSourceProof).directory
+
+        // The request has to DETERMINE a directory, and a claim over a resource
+        // does not: a stranger holding a hardlink of that resource answers every
+        // question such a claim can ask. Only two proofs name one — an
+        // observation that sampled the containing directory alongside the
+        // resource, and a proof this facet minted for a transition it performed.
+        // Anything else is a question with no truthful answer rather than a race
+        // to report, so it is refused here, before the medium is touched.
+        if (!boundDirectory) {
+          throw new Error('directory move proof must name the directory it was observed in')
+        }
+
+        await fs.mkdir(dirname(target), { recursive: true })
+        const [sourceBefore, targetParent] = await Promise.all([
+          fs.lstat(source, { bigint: true }),
+          fs.stat(dirname(target), { bigint: true }),
+        ])
+
+        if (!sourceBefore.isDirectory()) {
+          throw Object.assign(new Error('directory move source is not a directory entry'), {
+            code: 'ENOTDIR',
+          })
+        }
+        if (sourceBefore.dev !== targetParent.dev) {
+          throw Object.assign(new Error('atomic directory no-replace cannot cross filesystems'), {
+            code: 'ENOTSUP',
+          })
+        }
+        // Whoever holds the source pathname NOW is a different question from the
+        // directory the proof names, and a different directory answering it is a
+        // conflict, not a transition.
+        if (sourceBefore.dev !== boundDirectory.dev || sourceBefore.ino !== boundDirectory.ino) {
+          return { status: 'conflict' }
+        }
+        const proof = await claimExpectedRegular(
+          sourceProofPath,
+          splitDirectoryBoundProof(expectedSourceProof).carried,
+        )
+
+        if (!proof) {
+          return { status: 'conflict' }
+        }
+        let committed = false
+
+        const restoreSource = async (): Promise<boolean> => {
+          let targetBefore: BigIntStats
+
+          try {
+            targetBefore = await fs.lstat(target, { bigint: true })
+          } catch {
+            return false
+          }
+          // Never move a replacement directory back over the source merely
+          // because it won the target pathname after our publication.
+          if (targetBefore.dev !== sourceBefore.dev || targetBefore.ino !== sourceBefore.ino) {
+            return false
+          }
+          const restored = await publish(target, source)
+
+          // A successful reverse no-replace transition proves the forward
+          // target no longer owns that directory. Subsequent source sampling is
+          // a new observation, not part of deciding which lifecycle side won.
+          return restored
+        }
+
+        try {
+          const moved = await publish(source, target)
+
+          if (!moved) {
+            return { status: 'occupied' }
+          }
+          committed = true
+          const [targetDirectory, heldAfter, targetProofAfter] = await Promise.all([
+            fs.lstat(target, { bigint: true }),
+            proof.handle.stat({ bigint: true }),
+            fs.lstat(targetProof, { bigint: true }),
+          ])
+          const directoryCarried =
+            targetDirectory.isDirectory() &&
+            targetDirectory.dev === sourceBefore.dev &&
+            targetDirectory.ino === sourceBefore.ino
+          const proofCarried =
+            sameRegularVersion(proof.stat, heldAfter) &&
+            sameRegularVersion(heldAfter, targetProofAfter)
+
+          if (directoryCarried && proofCarried) {
+            return {
+              status: 'moved',
+              targetProof: directoryBoundProof(
+                targetDirectory,
+                presentProofFromStat(targetProofAfter, proof.bytes).claim,
+              ),
+            }
+          }
+          if (await restoreSource()) {
+            committed = false
+            return { status: 'conflict' }
+          }
+
+          return {
+            status: 'committed-error',
+            reason: 'directory moved but its claimed source resource did not reach the target',
+          }
+        } catch (error) {
+          if (!committed) {
+            throw error
+          }
+          try {
+            if (await restoreSource()) {
+              committed = false
+              throw error
+            }
+          } catch (rollbackError) {
+            if (!committed) {
+              throw rollbackError
+            }
+          }
+
+          return {
+            status: 'committed-error',
+            reason: `directory move committed before proof failed: ${(error as Error).message}`,
+          }
+        } finally {
+          await proof.handle.close().catch(() => {})
+        }
       })
 
   const strictStagePaths = (operationId: string): StrictStagePaths => {
@@ -3321,15 +3617,17 @@ export const createLocalFsFiles = (root: string): FileStoreAssembly => {
         },
       },
 
-      // Three contracts, one runtime fact. Directory move, package install and
-      // strict publication each need the same atomic no-replace namespace
-      // transition, so a runtime that cannot perform it declares none of them —
-      // and does so here, before any of the three has created a root, a staging
-      // tree or a journal entry to be found later.
+      // Four contracts, one runtime fact. Generic directory move, conditional
+      // directory continuity, package install and strict publication each need
+      // the same atomic no-replace namespace transition, so a runtime that
+      // cannot perform it declares none of them — before any operation starts.
       ...(atomicDirectoryRename
         ? {
             directoryNoReplaceMove: {
               renameDirIfAbsent: renameDirIfAbsentWith(atomicDirectoryRename),
+            },
+            conditionalDirectoryMove: {
+              moveIfClaimed: conditionalDirectoryMoveWith(atomicDirectoryRename),
             },
             packagePublication: packagePublicationWith(atomicDirectoryRename),
             strictPublication: strictPublicationWith(atomicDirectoryRename),

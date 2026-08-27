@@ -197,52 +197,45 @@ export const createAbilityDocumentWriter = (
         if (!currentId || !live.versionToken) {
           throw new Error('ability document has no version token')
         }
-        // `skipped` is a commit verdict, not a fact the released preparation snapshot
-        // may assert. Enter the ordinary write claim, then replace only its physical
-        // callback with an exact read while the package identity is admitted too.
-        const result = await write.target.store.write(
-          {
-            ...write.input,
-            originalId: currentId,
-            preservePath: true,
-          },
-          {
-            aroundWrite: async () => {
-              const verify = async () => {
-                const current = await write.target.store.read(currentId, {
-                  identityOnly: true,
-                  mutationClaimed: true,
-                  resourceAdmitted: true,
-                })
-                const id = current.id ?? currentId
-
-                if (!current.versionToken) {
-                  throw new Error('ability document has no version token')
-                }
-                if (current.versionToken !== write.input.versionToken) {
-                  throw versionConflict({ ...current, id, versionToken: current.versionToken })
-                }
-
-                return {
-                  id,
+        if (!write.withTargetMutation) {
+          throw new Error('ability semantic no-op has no exact target mutation scope')
+        }
+        const verified = await write.withTargetMutation(async (current) =>
+          current.versionToken === write.input.versionToken
+            ? {
+                applied: {
+                  id: current.registryNoteId,
                   filePath: current.filePath,
-                  title: current.title,
-                  class: current.class,
+                  title: live.title,
+                  class: live.class,
                   versionToken: current.versionToken,
-                }
+                },
               }
-
-              return write.aroundWrite ? write.aroundWrite(verify) : verify()
-            },
-            ...(write.aroundWrite ? { resourceAdmitted: true } : {}),
-          },
+            : { applied: null },
         )
 
-        if (!result.id || !result.versionToken) {
-          throw new Error('ability no-op produced no identity or version token')
+        if (!verified.applied) {
+          // `current` on a 409 is ONE live observation by contract — the body and title
+          // the conflict dialog shows are the ones its token retries against. The exact
+          // scope answers with a token only; pairing it with the released preparation
+          // snapshot would show the writer its OWN body as "latest saved" and let the
+          // retry overwrite the revision it never saw. So staleness is reported out of
+          // the scope, and the payload is read once after release by the ordinary read
+          // every other conflict in the system carries.
+          const current = await write.target.store.read(currentId)
+
+          if (!current.versionToken) {
+            throw new Error('ability document has no version token')
+          }
+
+          throw versionConflict({
+            ...current,
+            id: current.id ?? currentId,
+            versionToken: current.versionToken,
+          })
         }
 
-        return { ...result, id: result.id, versionToken: result.versionToken, outcome: 'skipped' }
+        return { ...verified.applied, outcome: 'skipped' }
       }
       let links: string[] | undefined
       let attachmentFrontmatter
@@ -290,7 +283,12 @@ export const createAbilityDocumentWriter = (
       }
       const result = await write.target.store.write(
         input,
-        write.aroundWrite ? { aroundWrite: write.aroundWrite, resourceAdmitted: true } : undefined,
+        write.withTargetMutation
+          ? {
+              aroundWrite: (physical) => write.withTargetMutation!(() => physical()),
+              resourceAdmitted: true,
+            }
+          : undefined,
       )
 
       if (!result.id || !result.versionToken) {

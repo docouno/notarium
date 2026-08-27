@@ -247,10 +247,22 @@ export type OwnedAbilityTarget = {
   manifestNoteId: string
 }
 
-/** Immutable package bytes captured with the two independent identity proofs under
- * one package admission. Consumers may derive detail after release, then revalidate
- * `target` at the eventual mutation boundary. */
-export type OwnedAbilitySnapshot = OwnedAbilityTarget & { pkg: SkillPackage }
+/** Immutable package and registry facts captured under Core exact-note then package
+ * admission. Consumers derive detail after release and carry only `target` into a
+ * later mutation scope. */
+export type OwnedAbilitySnapshot = OwnedAbilityTarget & {
+  filePath: string
+  versionToken: string
+  pkg: SkillPackage
+}
+
+/** Mutable persistence facets of one already-revalidated Owned package. Package
+ * detail, attachment health and dependency traversal are deliberately not part of
+ * this state: metadata mutations read it while retaining their exact mutation scope. */
+export type OwnedAbilityMetadataState = {
+  enabled: boolean
+  availability?: AbilityAvailability
+}
 
 export type SkillInventoryEntry = {
   name: string
@@ -368,30 +380,38 @@ export type RolesService = {
   /** Bind a live document-door identity to its exact package placement. Unlike stale
    * locator resolution this never follows placement history: the document id is the
    * authority and must still own this physical manifest under admission. */
-  withOwnedAt<T>(
+  captureOwnedAt(
     location: RoleLocation,
     principal: Principal,
     kind: AbilityKind,
     packageId: string,
     registryNoteId: string,
-    task: (snapshot: OwnedAbilitySnapshot) => Promise<T>,
-  ): Promise<T | null>
-  /** Resolve the authoritative target and keep its identity proof live through the
-   * callback. A recorded hop retires its source even when it is reoccupied. */
-  withCurrentOwnedTarget<T>(
+  ): Promise<OwnedAbilitySnapshot | null>
+  /** Resolve and capture the authoritative target. A recorded hop retires its source
+   * even when the old package address is reoccupied. */
+  captureCurrentOwnedTarget(
     locator: OwnedAbilityLocator,
     principal: Principal,
-    task: (snapshot: OwnedAbilitySnapshot) => Promise<T>,
-    mode?: 'read' | 'mutation',
-  ): Promise<T | null>
-  /** Re-open a previously proven target and compare both independent identities
-   * under admission before the callback reaches its read/mutation linearization. */
-  withOwnedTarget<T>(
+  ): Promise<OwnedAbilitySnapshot | null>
+  /** Re-open a previously proven target and capture current registry/package facts. */
+  captureOwnedTarget(
+    target: OwnedAbilityTarget,
+    principal: Principal,
+  ): Promise<OwnedAbilitySnapshot | null>
+  /** Revalidate a captured target under Core exact-note then exclusive RoleLibrary
+   * admission and retain both through the mutation task. */
+  withOwnedTargetMutation<T>(
     target: OwnedAbilityTarget,
     principal: Principal,
     task: (snapshot: OwnedAbilitySnapshot) => Promise<T>,
-    mode?: 'read' | 'mutation',
   ): Promise<T | null>
+  /** Read only producer-owned persistence for an already-revalidated snapshot.
+   * This must not reopen package admission or build full Role detail. */
+  readOwnedAbilityMetadataState(
+    context: EffectiveRoleContext,
+    principal: Principal,
+    snapshot: OwnedAbilitySnapshot,
+  ): Promise<OwnedAbilityMetadataState | null>
   listBundledAbilities(principal: Principal): Promise<AgentAbilitySummary[]>
   /** `kind` is REQUIRED to pass: no caller has ever wanted both, and every one of
    *  them already knows which it is asking for. A default would let a new caller
@@ -453,7 +473,7 @@ export type RolesService = {
   setEnabled(
     context: EffectiveRoleContext,
     principal: Principal,
-    locator: ActiveRoleLocator | OwnedAbilityTarget,
+    locator: SystemAbilityLocator | OwnedAbilityTarget,
     enabled: boolean,
   ): Promise<void>
   /** Where a Space-homed ability is effective. Both kinds answer it — the reach of a
@@ -463,7 +483,7 @@ export type RolesService = {
   setAbilityAvailability(
     context: EffectiveRoleContext,
     principal: Principal,
-    locator: OwnedAbilityLocator | OwnedAbilityTarget,
+    locator: OwnedAbilityTarget,
     availability: AbilityAvailability,
   ): Promise<void>
   /** Which of the named projects hold a version of this Space base. Asked with the
@@ -485,7 +505,7 @@ export type RolesService = {
   ): Promise<Extract<OwnedAbilityLocator, { kind: 'role' }> | null>
   /** Fork an already admitted Space base snapshot into a project version of the SAME
    * role: same name, captured body and attachments, its own package address. Authority
-   * selection belongs to `withCurrentOwnedTarget`; this sink never reopens a locator. */
+   * selection belongs to `captureCurrentOwnedTarget`; this sink never reopens a locator. */
   createRoleVersion(
     principal: Principal,
     source: OwnedAbilitySnapshot & {
@@ -500,9 +520,7 @@ export type RolesService = {
    * different Space), and when the role is already a base. */
   moveRolePlacement(
     principal: Principal,
-    target:
-      | Extract<OwnedAbilityLocator, { kind: 'role' }>
-      | (OwnedAbilityTarget & { locator: Extract<OwnedAbilityLocator, { kind: 'role' }> }),
+    target: OwnedAbilityTarget & { locator: Extract<OwnedAbilityLocator, { kind: 'role' }> },
     personalSpace: string | null,
   ): Promise<MovedRole>
   /** Validate and serialize a complete replacement of an Owned Role's authored

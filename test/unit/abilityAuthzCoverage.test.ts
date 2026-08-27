@@ -40,11 +40,7 @@ const forkRoleVersion = async (
   principal: Principal,
   locator: Extract<OwnedAbilityLocator, { kind: 'role' }>,
 ) => {
-  const source = await roles.withCurrentOwnedTarget(
-    locator,
-    principal,
-    async (snapshot) => snapshot,
-  )
+  const source = await roles.captureCurrentOwnedTarget(locator, principal)
 
   if (!source || source.locator.kind !== ABILITY_KIND.role) {
     throw new AbilityUnavailableError('no such Owned Role')
@@ -56,6 +52,20 @@ const forkRoleVersion = async (
     'personal',
     'project-a',
   )
+}
+
+const capturedTarget = async (
+  roles: RolesService,
+  principal: Principal,
+  locator: OwnedAbilityLocator,
+) => {
+  const target = await roles.captureCurrentOwnedTarget(locator, principal)
+
+  if (!target) {
+    throw new AbilityUnavailableError('no such Owned ability')
+  }
+
+  return target
 }
 
 /** A real caller. `system: false` is the entire point: it is the only way any rule in
@@ -180,14 +190,24 @@ describe('ability service authorization — the nine gates the system principal 
     const narrowed = { mode: 'selected-projects' as const, projectIds: ['project-a'] }
 
     await expect(
-      roles.setAbilityAvailability({ personalSpace: 'personal' }, reader, locator, narrowed),
+      roles.setAbilityAvailability(
+        { personalSpace: 'personal' },
+        reader,
+        await capturedTarget(roles, reader, locator),
+        narrowed,
+      ),
     ).rejects.toBeInstanceOf(AbilityUnavailableError)
     // Refused BEFORE the row was touched: reach decides where a role answers at all,
     // so a refusal that still wrote would be the whole failure this gate prevents.
     await expect(abilityAvailability.get('shared', base.packageId)).resolves.toBeNull()
 
     await expect(
-      roles.setAbilityAvailability({ personalSpace: 'personal' }, writer, locator, narrowed),
+      roles.setAbilityAvailability(
+        { personalSpace: 'personal' },
+        writer,
+        await capturedTarget(roles, writer, locator),
+        narrowed,
+      ),
     ).resolves.toBeUndefined()
     await expect(abilityAvailability.get('shared', base.packageId)).resolves.toMatchObject(narrowed)
   })
@@ -243,16 +263,30 @@ describe('ability service authorization — the nine gates the system principal 
     const version = await roles.createCustomRole('review', 'Review.', 'The way.', PROJECT)
     const locator = projectRole(version.packageId)
 
-    await expect(roles.moveRolePlacement(reader, locator, 'personal')).rejects.toBeInstanceOf(
-      AbilityUnavailableError,
-    )
+    await expect(
+      roles.moveRolePlacement(
+        reader,
+        {
+          ...(await capturedTarget(roles, reader, locator)),
+          locator,
+        },
+        'personal',
+      ),
+    ).rejects.toBeInstanceOf(AbilityUnavailableError)
     // Nothing moved: the package is still where it was, and the Space root is free.
     await expect(library.getSkillByDirectory(PROJECT, version.packageId)).resolves.not.toBeNull()
     await expect(library.getSkillByDirectory(SHARED, version.packageId)).resolves.toBeNull()
 
-    await expect(roles.moveRolePlacement(writer, locator, 'personal')).resolves.toMatchObject({
-      locator: { location: { scope: 'space', spaceId: 'shared' } },
-    })
+    await expect(
+      roles.moveRolePlacement(
+        writer,
+        {
+          ...(await capturedTarget(roles, writer, locator)),
+          locator,
+        },
+        'personal',
+      ),
+    ).resolves.toMatchObject({ locator: { location: { scope: 'space', spaceId: 'shared' } } })
   })
 
   it('refuses to rewrite a role attachment list for a read-only caller', async () => {

@@ -75,12 +75,20 @@ export const createAbilityPlacementFacet = (ctx: SqliteDriverCtx): AbilityPlacem
         move.toLocator,
         move.fromLocator,
       )
-      // The hop itself, in the same three statements and the same order as the
-      // PostgreSQL twin: clear the destination's own forwarding first (it is occupied
-      // now), then re-point whatever pointed at the source, then record the source.
-      // Carrying the rows is half an address change; without this, an override written
-      // at the address just left sits where nothing reads it and the role its owner
-      // switched off reads as enabled at the address it now has.
+      // The hop itself, in the same statements and the same order as the PostgreSQL
+      // twin: clear the destination's own forwarding first (it is occupied now), then
+      // re-point whatever pointed at the source, then — only for a `record` — make the
+      // source forward. Carrying the rows is half an address change; without this, an
+      // override written at the address just left sits where nothing reads it and the
+      // role its owner switched off reads as enabled at the address it now has.
+      //
+      // The first two statements are the whole of a `cancel`, and that is not an
+      // omission: this move is walking the package back along a hop its caller
+      // recorded, so the destination delete IS the removal of that hop, and the source
+      // must end up forwarding NOWHERE. Writing a counter-hop instead would leave a row
+      // that only a further compensating step could remove — and a trail row is read
+      // fail-closed, so an interrupted compensation left the package unreachable from
+      // both of its spellings at once.
       const space = abilitySpaceOfLocator(move.fromLocator)
 
       if (space !== null) {
@@ -90,15 +98,17 @@ export const createAbilityPlacementFacet = (ctx: SqliteDriverCtx): AbilityPlacem
              SET to_locator = ?, registry_note_id = ?, manifest_note_id = ?
            WHERE to_locator = ?`,
         ).run(move.toLocator, move.registryNoteId, move.manifestNoteId, move.fromLocator)
-        db.prepare(
-          `INSERT INTO ability_placement_trail
-             (from_locator, to_locator, space_id, registry_note_id, manifest_note_id)
-           VALUES (?, ?, ?, ?, ?)
-           ON CONFLICT (from_locator) DO UPDATE SET
-             to_locator = excluded.to_locator,
-             registry_note_id = excluded.registry_note_id,
-             manifest_note_id = excluded.manifest_note_id`,
-        ).run(move.fromLocator, move.toLocator, space, move.registryNoteId, move.manifestNoteId)
+        if (move.trail === 'record') {
+          db.prepare(
+            `INSERT INTO ability_placement_trail
+               (from_locator, to_locator, space_id, registry_note_id, manifest_note_id)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT (from_locator) DO UPDATE SET
+               to_locator = excluded.to_locator,
+               registry_note_id = excluded.registry_note_id,
+               manifest_note_id = excluded.manifest_note_id`,
+          ).run(move.fromLocator, move.toLocator, space, move.registryNoteId, move.manifestNoteId)
+        }
       }
 
       // Exact resume is fail-closed by design, so an episode left on the old locator

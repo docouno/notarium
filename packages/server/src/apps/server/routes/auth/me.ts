@@ -43,6 +43,7 @@ import {
   MeMemoryResponseSchema,
   MeSchema,
   OkResponseSchema,
+  OwnedRoleAbilityLocatorSchema,
   PasswordChangeRequestSchema,
   PatCreateRequestSchema,
   PatCreateResponseSchema,
@@ -82,6 +83,7 @@ import {
   RoleAlreadyExistsError,
   RoleDependencyConflictError,
   RoleInstallUnavailableError,
+  RolePlacementUnconfirmedError,
   SkillAlreadyExistsError,
   weighRoleContext,
 } from '../../../../services/roles'
@@ -798,7 +800,7 @@ export const meRoutes = async (
   app.put(
     '/api/me/agent-abilities/:locator/home',
     { config: authz('self:manage', 'host') },
-    async (req) => {
+    async (req, reply) => {
       if (!abilities) {
         throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
       }
@@ -816,6 +818,35 @@ export const meRoutes = async (
         }
         if (error instanceof RoleInstallUnavailableError) {
           throw installUnavailable()
+        }
+        if (error instanceof RolePlacementUnconfirmedError) {
+          // The one answer on this route that is neither a success nor a refusal: the
+          // move COMMITTED — bytes, reach row and placement trail all at the new home —
+          // and only the read-model barrier that confirms it failed. So the status stays
+          // the 5xx it is, but not `role_install_unavailable`: that reason states the
+          // operation was refused, and the Add path already refuses to name a failure
+          // after its own commit because a caller who retries on it races the very
+          // package this call published.
+          //
+          // What the caller must not lose is the ADDRESS. The package is at the Space
+          // now, and the locator it was called with names the placement the role has
+          // left — a client that falls back to it addresses a home this role no longer
+          // has. Carried in the same `{ error, reason, … }` envelope every other failure
+          // on these routes uses, and in the same locator shape the success answer
+          // carries, so nothing about the successful response had to change to say it.
+          //
+          // Logged here rather than left to the app-level handler: that handler prints
+          // `err.cause` only for errors that reach it by being thrown, and this one is
+          // returned. The barrier's own words live nowhere else.
+          console.error(
+            `[api] ${req.method} ${req.url} ->`,
+            error.cause ? `${error.message} (${String(error.cause)})` : error.message,
+          )
+          return reply.code(HTTP_STATUS.INTERNAL_SERVER_ERROR).send({
+            error: error.message,
+            reason: 'role_placement_unconfirmed',
+            locator: OwnedRoleAbilityLocatorSchema.parse(error.locator),
+          })
         }
         throw error
       }

@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
-import type { OwnedAbilityLocator, SystemAbilityLocator } from '@notarium/contract'
+import type {
+  AgentAbilityAvailabilityState,
+  OwnedAbilityLocator,
+  SystemAbilityLocator,
+} from '@notarium/contract'
 import {
   analyzeDocumentState,
   DOCUMENT_ROLE,
@@ -47,6 +51,11 @@ const targetOf = (locator: OwnedAbilityLocator, registryNoteId = locator.package
 
 const snapshotOf = (locator: OwnedAbilityLocator, registryNoteId = locator.packageId) => ({
   ...targetOf(locator, registryNoteId),
+  filePath:
+    locator.location.scope === 'project'
+      ? `.notarium/skills/_projects/${Buffer.from(locator.location.projectId).toString('base64url')}/${locator.packageId}/SKILL.md`
+      : `.notarium/skills/${locator.packageId}/SKILL.md`,
+  versionToken: registryNoteId === 'OwnedNote001' ? 'owned-version' : `${registryNoteId}-version`,
   pkg: {
     directoryName: locator.packageId,
     files: new Map([
@@ -85,68 +94,84 @@ const readerWithWriteCeiling = (): Principal => ({
 })
 
 const world = () => {
-  const describeAbility = vi.fn(async (_context, _principal, locator) =>
-    locator.source === 'system'
-      ? {
-          locator,
-          source: 'system' as const,
-          title: 'System skill',
-          name: 'system-skill',
-          description: 'Bundled.',
-          instructions: 'System instructions.',
-          enabled: true,
-          truncated: false,
-        }
-      : locator.source === 'owned'
+  const describeAbility = vi.fn<RolesService['describeAbility']>(
+    async (_context, _principal, locator) =>
+      locator.source === 'system'
         ? {
             locator,
-            source: 'owned' as const,
-            title: 'Owned skill',
-            name: 'owned-skill',
-            description: 'Owned.',
-            instructions: 'Owned instructions.',
+            source: 'system' as const,
+            title: 'System skill',
+            name: 'system-skill',
+            description: 'Bundled.',
+            instructions: 'System instructions.',
             enabled: true,
-            noteId: 'OwnedNote001',
-            origin: 'custom' as const,
-            availability: { mode: 'all-projects' as const },
             truncated: false,
           }
-        : {
-            locator,
-            source: 'catalog' as const,
-            title: 'Catalog skill',
-            name: 'catalog-skill',
-            description: 'Template.',
-            instructions: 'Catalog instructions.',
-            truncated: false,
-          },
+        : locator.source === 'owned'
+          ? {
+              locator,
+              source: 'owned' as const,
+              title: 'Owned skill',
+              name: 'owned-skill',
+              description: 'Owned.',
+              instructions: 'Owned instructions.',
+              enabled: true,
+              noteId: 'OwnedNote001',
+              origin: 'custom' as const,
+              availability: { mode: 'all-projects' as const },
+              truncated: false,
+            }
+          : {
+              locator,
+              source: 'catalog' as const,
+              title: 'Catalog skill',
+              name: 'catalog-skill',
+              description: 'Template.',
+              instructions: 'Catalog instructions.',
+              truncated: false,
+            },
+  )
+  const describeOwnedAbility = vi.fn<RolesService['describeOwnedAbility']>(
+    async (context, currentPrincipal, snapshot) =>
+      describeAbility(context, currentPrincipal, snapshot.locator, 1_000_000),
+  )
+  const readOwnedAbilityMetadataState = vi.fn<RolesService['readOwnedAbilityMetadataState']>(
+    async () => ({
+      enabled: true,
+      availability: { mode: 'all-projects' },
+    }),
   )
   const inspectAndRemoveOwned = vi.fn(async (_locator, _personal, options) => {
     await options.assertSafe(new Map([['SKILL.md', new Uint8Array()]]))
     await options.remove(async () => undefined)
     return true
   })
-  const setEnabled = vi.fn(async () => undefined)
-  const withCurrentOwnedTarget = vi.fn(async (locator, _principal, task) =>
-    task(snapshotOf(locator, 'OwnedNote001')),
+  const setEnabled = vi.fn<RolesService['setEnabled']>(async () => undefined)
+  const setAbilityAvailability = vi.fn<RolesService['setAbilityAvailability']>(
+    async () => undefined,
   )
-  const withOwnedTarget = vi.fn(async (target, _principal, task) =>
+  const captureCurrentOwnedTarget = vi.fn(async (locator) => snapshotOf(locator, 'OwnedNote001'))
+  const captureOwnedTarget = vi.fn(async (target) =>
+    snapshotOf(target.locator, target.registryNoteId),
+  )
+  const withOwnedTargetMutation = vi.fn(async (target, _principal, task) =>
     task(snapshotOf(target.locator, target.registryNoteId)),
   )
-  const withOwnedAt = vi.fn(async (_location, _principal, kind, packageId, registryNoteId, task) =>
-    task(snapshotOf({ ...owned, kind, packageId } as OwnedAbilityLocator, registryNoteId)),
+  const captureOwnedAt = vi.fn(async (_location, _principal, kind, packageId, registryNoteId) =>
+    snapshotOf({ ...owned, kind, packageId } as OwnedAbilityLocator, registryNoteId),
   )
   const roles = {
     describeAbility,
-    describeOwnedAbility: vi.fn(async (context, currentPrincipal, snapshot) =>
-      describeAbility(context, currentPrincipal, snapshot.locator),
-    ),
+    describeOwnedAbility,
+    readOwnedAbilityMetadataState,
     inspectAndRemoveOwned,
     manifestPath: vi.fn(() => `.notarium/skills/${owned.packageId}/SKILL.md`),
-    withCurrentOwnedTarget,
-    withOwnedTarget,
-    withOwnedAt,
+    captureCurrentOwnedTarget,
+    captureOwnedTarget,
+    withOwnedTargetMutation,
+    captureOwnedAt,
     setEnabled,
+    setAbilityAvailability,
   } as unknown as RolesService
   const source = Buffer.from(
     `---\nnotarium-id: OwnedSkill01\nname: owned-skill\ndescription: Owned.\n---\n\n# Owned skill\n\nOwned instructions.\n`,
@@ -189,21 +214,29 @@ const world = () => {
       has: (id: string) => id === 'personal' || id === 'shared',
     } as unknown as SpaceManager,
     auth: { personalSpaceOf: vi.fn(async () => 'personal') } as unknown as AuthService,
+    projects: {
+      getById: vi.fn(async (id: string) => ({ id, space: 'shared' })),
+      listForSpaces: vi.fn(async () => []),
+    } as unknown as ProjectsPersistence,
     store: { noteStore } as unknown as StoreAccess,
   })
 
   return {
     abilities,
     describeAbility,
+    describeOwnedAbility,
     inspectAndRemoveOwned,
     noteStore,
     note,
     removeDir,
     physicalWrite,
     read,
+    readOwnedAbilityMetadataState,
+    setAbilityAvailability,
     setEnabled,
-    withCurrentOwnedTarget,
-    withOwnedTarget,
+    captureCurrentOwnedTarget,
+    captureOwnedTarget,
+    withOwnedTargetMutation,
     write,
   }
 }
@@ -317,7 +350,7 @@ describe('AbilitiesService authoring policy', () => {
     const packagePath = '.notarium/skills/OwnedSkill01'
     const snapshot = snapshotOf(owned, 'OwnedNote001')
     let outerActive = false
-    const withCurrentOwnedTarget = vi.fn(async (_locator, _principal, task) => {
+    const captureCurrentOwnedTarget = vi.fn(async () => {
       const outer = await admission.admit({
         scope: 'package',
         mode: 'shared',
@@ -334,7 +367,7 @@ describe('AbilitiesService authoring policy', () => {
       void rival.then((lease) => lease.settle())
 
       try {
-        return await task(snapshot)
+        return snapshot
       } finally {
         outerActive = false
         outer.settle()
@@ -357,7 +390,7 @@ describe('AbilitiesService authoring policy', () => {
       }
     })
     const roles = {
-      withCurrentOwnedTarget,
+      captureCurrentOwnedTarget,
       describeOwnedAbility,
       // The former callback path reached this ordinary exact reader and queued a
       // second shared lease behind `rival-package-mutation`.
@@ -417,6 +450,54 @@ describe('AbilitiesService authoring policy', () => {
     expect(noteStore).toHaveBeenCalledTimes(1)
   })
 
+  // The capture and the note read are two observations of one package. Admitting a pair
+  // that disagrees would hand the caller a token from one revision and a package body
+  // from another — the three tests below hold each half of that agreement, and its bound.
+  it('re-captures when a commit lands between the package snapshot and the note read', async () => {
+    const { abilities, captureCurrentOwnedTarget, noteStore } = world()
+
+    captureCurrentOwnedTarget.mockResolvedValueOnce({
+      ...snapshotOf(owned, 'OwnedNote001'),
+      versionToken: 'previous-version',
+    })
+
+    await expect(abilities.get('authoring', principal('write'), owned)).resolves.toMatchObject({
+      writable: true,
+      versionToken: 'owned-version',
+    })
+    expect(captureCurrentOwnedTarget).toHaveBeenCalledTimes(2)
+    expect(noteStore).toHaveBeenCalledTimes(2)
+  })
+
+  it('re-captures when the package moved between the snapshot and the note read', async () => {
+    const { abilities, captureCurrentOwnedTarget, noteStore } = world()
+
+    captureCurrentOwnedTarget.mockResolvedValueOnce({
+      ...snapshotOf(owned, 'OwnedNote001'),
+      filePath: `.notarium/skills/_projects/${Buffer.from('project-a').toString('base64url')}/${owned.packageId}/SKILL.md`,
+    })
+
+    await expect(abilities.get('authoring', principal('write'), owned)).resolves.toMatchObject({
+      writable: true,
+      versionToken: 'owned-version',
+    })
+    expect(captureCurrentOwnedTarget).toHaveBeenCalledTimes(2)
+    expect(noteStore).toHaveBeenCalledTimes(2)
+  })
+
+  it('refuses a capture that never agrees rather than retrying without a bound', async () => {
+    const { abilities, captureCurrentOwnedTarget, noteStore } = world()
+
+    captureCurrentOwnedTarget.mockResolvedValue({
+      ...snapshotOf(owned, 'OwnedNote001'),
+      versionToken: 'never-settles',
+    })
+
+    await expect(abilities.get('authoring', principal('write'), owned)).resolves.toBeNull()
+    expect(captureCurrentOwnedTarget).toHaveBeenCalledTimes(3)
+    expect(noteStore).toHaveBeenCalledTimes(3)
+  })
+
   it('preserves an operational Owned read failure for the opaque MCP boundary', async () => {
     const { abilities, read } = world()
     const failure = new Error('sqlite read failed at /private/meta.db')
@@ -448,9 +529,9 @@ describe('AbilitiesService authoring policy', () => {
   })
 
   it('does not reach the physical write when final target revalidation fails', async () => {
-    const { abilities, physicalWrite, withOwnedTarget } = world()
+    const { abilities, physicalWrite, withOwnedTargetMutation } = world()
 
-    withOwnedTarget.mockResolvedValueOnce(null)
+    withOwnedTargetMutation.mockResolvedValueOnce(null)
     await expect(
       abilities.edit(principal('write'), owned, {
         versionToken: 'owned-version',
@@ -463,11 +544,15 @@ describe('AbilitiesService authoring policy', () => {
   })
 
   it('does not apply later steps when a prepared document no-op races a write', async () => {
-    const { abilities, note, physicalWrite, read, setEnabled } = world()
+    const { abilities, note, physicalWrite, read, setEnabled, withOwnedTargetMutation } = world()
 
-    read
-      .mockResolvedValueOnce(note)
-      .mockResolvedValueOnce({ ...note, versionToken: 'concurrent-version' })
+    read.mockResolvedValueOnce(note)
+    withOwnedTargetMutation.mockImplementationOnce(async (target, _principal, task) =>
+      task({
+        ...snapshotOf(target.locator, target.registryNoteId),
+        versionToken: 'concurrent-version',
+      }),
+    )
 
     await expect(
       abilities.edit(principal('write'), owned, {
@@ -486,6 +571,122 @@ describe('AbilitiesService authoring policy', () => {
     })
     expect(physicalWrite).not.toHaveBeenCalled()
     expect(setEnabled).not.toHaveBeenCalled()
+  })
+
+  it('rechecks enabled under target mutation before deciding a no-op', async () => {
+    const {
+      abilities,
+      describeOwnedAbility,
+      readOwnedAbilityMetadataState,
+      setEnabled,
+      withOwnedTargetMutation,
+    } = world()
+    let enabled = false
+    let racePending = true
+    let mutationScoped = false
+    const fullDescribeScopes: boolean[] = []
+    const metadataReadScopes: boolean[] = []
+    const fullDescribe = describeOwnedAbility.getMockImplementation()!
+
+    withOwnedTargetMutation.mockImplementation(async (target, _principal, task) => {
+      if (racePending) {
+        racePending = false
+        enabled = true
+      }
+      mutationScoped = true
+      try {
+        return await task(snapshotOf(target.locator, target.registryNoteId))
+      } finally {
+        mutationScoped = false
+      }
+    })
+    describeOwnedAbility.mockImplementation(async (...args) => {
+      fullDescribeScopes.push(mutationScoped)
+      return fullDescribe(...args)
+    })
+    readOwnedAbilityMetadataState.mockImplementation(async () => {
+      metadataReadScopes.push(mutationScoped)
+      return { enabled, availability: { mode: 'all-projects' } }
+    })
+    setEnabled.mockImplementation(async (_context, _principal, _target, requested) => {
+      expect(mutationScoped).toBe(true)
+      enabled = requested
+    })
+
+    await expect(
+      abilities.edit(principal('write'), owned, { enabled: false }),
+    ).resolves.toMatchObject({ steps: [{ step: 'enabled', outcome: 'applied' }] })
+    expect(enabled).toBe(false)
+
+    await expect(
+      abilities.edit(principal('write'), owned, { enabled: false }),
+    ).resolves.toMatchObject({ steps: [{ step: 'enabled', outcome: 'skipped' }] })
+    expect(withOwnedTargetMutation).toHaveBeenCalledTimes(2)
+    expect(readOwnedAbilityMetadataState).toHaveBeenCalledTimes(2)
+    expect(setEnabled).toHaveBeenCalledOnce()
+    expect(fullDescribeScopes.length).toBeGreaterThan(0)
+    expect(fullDescribeScopes.every((scoped) => !scoped)).toBe(true)
+    expect(metadataReadScopes).toEqual([true, true])
+  })
+
+  it('rechecks availability under target mutation before deciding a no-op', async () => {
+    const {
+      abilities,
+      describeOwnedAbility,
+      readOwnedAbilityMetadataState,
+      setAbilityAvailability,
+      withOwnedTargetMutation,
+    } = world()
+    let availability: AgentAbilityAvailabilityState = { mode: 'all-projects' }
+    let racePending = true
+    let mutationScoped = false
+    const fullDescribeScopes: boolean[] = []
+    const metadataReadScopes: boolean[] = []
+    const fullDescribe = describeOwnedAbility.getMockImplementation()!
+
+    withOwnedTargetMutation.mockImplementation(async (target, _principal, task) => {
+      if (racePending) {
+        racePending = false
+        availability = { mode: 'selected-projects', projectIds: [] }
+      }
+      mutationScoped = true
+      try {
+        return await task(snapshotOf(target.locator, target.registryNoteId))
+      } finally {
+        mutationScoped = false
+      }
+    })
+    describeOwnedAbility.mockImplementation(async (...args) => {
+      fullDescribeScopes.push(mutationScoped)
+      return fullDescribe(...args)
+    })
+    readOwnedAbilityMetadataState.mockImplementation(async () => {
+      metadataReadScopes.push(mutationScoped)
+      return { enabled: true, availability }
+    })
+    setAbilityAvailability.mockImplementation(async (_context, _principal, _target, requested) => {
+      expect(mutationScoped).toBe(true)
+      availability = requested
+    })
+
+    await expect(
+      abilities.edit(principal('write'), owned, {
+        availability: { mode: 'all-projects' },
+      }),
+    ).resolves.toMatchObject({ steps: [{ step: 'availability', outcome: 'applied' }] })
+    expect(availability).toEqual({ mode: 'all-projects' })
+
+    await expect(
+      abilities.edit(principal('write'), owned, {
+        availability: { mode: 'all-projects' },
+      }),
+    ).resolves.toMatchObject({ steps: [{ step: 'availability', outcome: 'skipped' }] })
+    expect(withOwnedTargetMutation).toHaveBeenCalledTimes(2)
+    expect(readOwnedAbilityMetadataState).toHaveBeenCalledTimes(2)
+    expect(setAbilityAvailability).toHaveBeenCalledOnce()
+    expect(fullDescribeScopes.length).toBeGreaterThan(0)
+    expect(fullDescribeScopes.every((scoped) => !scoped)).toBe(true)
+    expect(metadataReadScopes).toEqual([true, true])
   })
 
   it('turns an authored CAS conflict into an actionable get_ability retry', async () => {
@@ -595,13 +796,13 @@ describe('AbilitiesService authoring policy', () => {
             truncated: false,
           },
     )
-    const withCurrentOwnedTarget = vi.fn(async () => null)
+    const captureCurrentOwnedTarget = vi.fn(async () => null)
     const roles = {
       describeAbility,
       describeOwnedAbility: vi.fn(async (context, currentPrincipal, snapshot) =>
         describeAbility(context, currentPrincipal, snapshot.locator),
       ),
-      withCurrentOwnedTarget,
+      captureCurrentOwnedTarget,
       listRoleVersions: vi.fn(async () => []),
       findRoleBase: vi.fn(async () => null),
     } as unknown as RolesService
@@ -655,12 +856,7 @@ describe('AbilitiesService authoring policy', () => {
     })
 
     await expect(abilities.get('authoring', principal('write'), stale)).resolves.toBeNull()
-    expect(withCurrentOwnedTarget).toHaveBeenCalledWith(
-      stale,
-      expect.anything(),
-      expect.any(Function),
-      'read',
-    )
+    expect(captureCurrentOwnedTarget).toHaveBeenCalledWith(stale, expect.anything())
   })
 
   it('resolves a stale authoring ref only through its recorded move target', async () => {
@@ -676,10 +872,11 @@ describe('AbilitiesService authoring policy', () => {
       packageId: stale.packageId,
       location: { scope: 'space', spaceId: 'shared' },
     }
-    const withCurrentOwnedTarget = vi.fn(async (_locator, _principal, task) =>
-      task(snapshotOf(moved, 'MovedNote001')),
+    const captureCurrentOwnedTarget = vi.fn(async () => snapshotOf(moved, 'MovedNote001'))
+    const captureOwnedTarget = vi.fn(async (target) =>
+      snapshotOf(target.locator, target.registryNoteId),
     )
-    const withOwnedTarget = vi.fn(async (target, _principal, task) =>
+    const withOwnedTargetMutation = vi.fn(async (target, _principal, task) =>
       task(snapshotOf(target.locator, target.registryNoteId)),
     )
     const describeAbility = vi.fn(async (_context, _principal, locator) =>
@@ -705,11 +902,18 @@ describe('AbilitiesService authoring policy', () => {
       describeOwnedAbility: vi.fn(async (context, currentPrincipal, snapshot) =>
         describeAbility(context, currentPrincipal, snapshot.locator),
       ),
-      withCurrentOwnedTarget,
-      withOwnedTarget,
+      captureCurrentOwnedTarget,
+      captureOwnedTarget,
+      withOwnedTargetMutation,
       listRoleVersions: vi.fn(async () => []),
     } as unknown as RolesService
-    const note = { ...world().note, id: 'MovedNote001' }
+    const movedSnapshot = snapshotOf(moved, 'MovedNote001')
+    const note = {
+      ...world().note,
+      id: 'MovedNote001',
+      filePath: movedSnapshot.filePath,
+      versionToken: movedSnapshot.versionToken,
+    }
     const abilities = createAbilities({
       roles,
       projects: {
@@ -732,12 +936,7 @@ describe('AbilitiesService authoring policy', () => {
     await expect(abilities.get('authoring', principal('write'), stale)).resolves.toMatchObject({
       ability: { locator: moved },
     })
-    expect(withCurrentOwnedTarget).toHaveBeenCalledWith(
-      stale,
-      expect.anything(),
-      expect.any(Function),
-      'read',
-    )
+    expect(captureCurrentOwnedTarget).toHaveBeenCalledWith(stale, expect.anything())
   })
 
   it.each(['get', 'save', 'edit', 'remove'] as const)(
@@ -793,10 +992,11 @@ describe('AbilitiesService authoring policy', () => {
         health: { healthy: true, attachments: [] },
         truncated: false,
       }))
-      const withCurrentOwnedTarget = vi.fn(async (_locator, _principal, task) =>
-        task(snapshotOf(moved, 'MovedNote001')),
+      const captureCurrentOwnedTarget = vi.fn(async () => snapshotOf(moved, 'MovedNote001'))
+      const captureOwnedTarget = vi.fn(async (target) =>
+        snapshotOf(target.locator, target.registryNoteId),
       )
-      const withOwnedTarget = vi.fn(async (target, _principal, task) =>
+      const withOwnedTargetMutation = vi.fn(async (target, _principal, task) =>
         task(snapshotOf(target.locator, target.registryNoteId)),
       )
       const setEnabled = vi.fn(async () => undefined)
@@ -810,8 +1010,10 @@ describe('AbilitiesService authoring policy', () => {
         describeOwnedAbility: vi.fn(async (context, currentPrincipal, snapshot) =>
           describeAbility(context, currentPrincipal, snapshot.locator),
         ),
-        withCurrentOwnedTarget,
-        withOwnedTarget,
+        captureCurrentOwnedTarget,
+        captureOwnedTarget,
+        withOwnedTargetMutation,
+        readOwnedAbilityMetadataState: vi.fn(async () => ({ enabled: true })),
         setEnabled,
         inspectAndRemoveOwned,
         listRoleVersions: vi.fn(async () => []),
@@ -880,12 +1082,7 @@ describe('AbilitiesService authoring policy', () => {
         )
       }
 
-      expect(withCurrentOwnedTarget).toHaveBeenCalledWith(
-        stale,
-        expect.anything(),
-        expect.any(Function),
-        'read',
-      )
+      expect(captureCurrentOwnedTarget).toHaveBeenCalledWith(stale, expect.anything())
       expect(describeAbility).not.toHaveBeenCalledWith(
         expect.anything(),
         expect.anything(),
@@ -896,22 +1093,25 @@ describe('AbilitiesService authoring policy', () => {
   )
 
   it.each(['get', 'save', 'edit', 'remove'] as const)(
-    'keeps the admitted identity live through stale %s linearization',
+    'releases capture before stale %s detail and revalidates mutations',
     async (operation) => {
       let admitted = false
       let revalidating = false
       let reoccupied = false
       const authority = snapshotOf(owned, 'OwnedNote001')
-      const withCurrentOwnedTarget = vi.fn(async (_locator, _principal, task) => {
+      const captureCurrentOwnedTarget = vi.fn(async () => {
         admitted = true
         try {
-          return await task(authority)
+          return authority
         } finally {
           admitted = false
           reoccupied = operation === 'remove'
         }
       })
-      const withOwnedTarget = vi.fn(async (target, _principal, task) => {
+      const captureOwnedTarget = vi.fn(async (target) =>
+        reoccupied ? null : snapshotOf(target.locator, target.registryNoteId),
+      )
+      const withOwnedTargetMutation = vi.fn(async (target, _principal, task) => {
         if (reoccupied) {
           return null
         }
@@ -961,8 +1161,13 @@ describe('AbilitiesService authoring policy', () => {
         describeOwnedAbility: vi.fn(async (context, currentPrincipal, snapshot) =>
           describeAbility(context, currentPrincipal, snapshot.locator),
         ),
-        withCurrentOwnedTarget,
-        withOwnedTarget,
+        captureCurrentOwnedTarget,
+        captureOwnedTarget,
+        withOwnedTargetMutation,
+        readOwnedAbilityMetadataState: vi.fn(async () => ({
+          enabled: true,
+          availability: { mode: 'selected-projects', projectIds: [] },
+        })),
         inspectAndRemoveOwned,
         setAbilityAvailability: vi.fn(),
       } as unknown as RolesService
@@ -978,8 +1183,8 @@ describe('AbilitiesService authoring policy', () => {
             space: 'shared',
             store: {
               read: vi.fn(async () => {
-                if (!admitted) {
-                  throw new Error('read escaped admitted identity')
+                if (admitted) {
+                  throw new Error('read retained package admission')
                 }
 
                 return note
@@ -1006,7 +1211,7 @@ describe('AbilitiesService authoring policy', () => {
         ).resolves.toMatchObject({
           steps: [
             { step: 'document', outcome: 'applied' },
-            { step: 'availability', outcome: 'failed' },
+            { step: 'availability', outcome: 'skipped' },
           ],
         })
         expect(write).toHaveBeenCalledOnce()
@@ -1096,11 +1301,10 @@ describe('AbilitiesService authoring policy', () => {
       packageId,
       location: { scope: 'project', spaceId: 'shared', projectId: 'project-b' },
     }
-    const withOwnedAt = vi.fn(
-      async (location, _principal, _kind, _packageId, registryNoteId, task) =>
-        location.scope === 'project' && location.projectId === 'project-b'
-          ? task(targetOf(actual, registryNoteId))
-          : null,
+    const captureOwnedAt = vi.fn(async (location, _principal, _kind, _packageId, registryNoteId) =>
+      location.scope === 'project' && location.projectId === 'project-b'
+        ? { ...snapshotOf(actual, registryNoteId), filePath: pathAt('project-b') }
+        : null,
     )
     const inspectAndRemoveOwned = vi.fn(async (expected, _personal, options) => {
       await options.assertSafe(new Map([['SKILL.md', new Uint8Array()]]))
@@ -1112,7 +1316,7 @@ describe('AbilitiesService authoring policy', () => {
       return true
     })
     const roles = {
-      withOwnedAt,
+      captureOwnedAt,
       manifestPath: vi.fn((location) =>
         location.scope === 'project'
           ? pathAt(location.projectId!)
@@ -1162,13 +1366,12 @@ describe('AbilitiesService authoring policy', () => {
       abilities.removeDocument(principal('write'), target!, { principal: 'pat:alice:write' }),
     ).resolves.toBe(true)
     expect(inspectAndRemoveOwned).toHaveBeenCalledWith(
-      targetOf(actual, note.id),
+      expect.objectContaining(targetOf(actual, note.id)),
       null,
       expect.objectContaining({ assertSafe: expect.any(Function), remove: expect.any(Function) }),
     )
-    expect(withOwnedAt).not.toHaveBeenCalledWith(
+    expect(captureOwnedAt).not.toHaveBeenCalledWith(
       expect.objectContaining({ projectId: 'project-a' }),
-      expect.anything(),
       expect.anything(),
       expect.anything(),
       expect.anything(),

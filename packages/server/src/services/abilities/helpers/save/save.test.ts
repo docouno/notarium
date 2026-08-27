@@ -4,7 +4,7 @@ import { analyzeDocumentState, DOCUMENT_ROLE, type NoteContent } from '@notarium
 
 import type { AuthService } from '../../../auth'
 import type { Principal } from '../../../authz'
-import type { RolesService } from '../../../roles'
+import type { OwnedAbilitySnapshot, RolesService } from '../../../roles'
 import type { SpaceManager, SpaceStore } from '../../../spaces'
 import type {
   AbilityAttachmentIntent,
@@ -36,27 +36,47 @@ const PRINCIPAL: Principal = {
   spaces: null,
 }
 
-const world = () => {
-  const source = Buffer.from(
-    `---\nnotarium-id: ${ROLE_ID}\nname: retry-role\ndescription: Retry role.\nmetadata:\n  notarium.kind: role\n  notarium.skills: "[[notarium-id:system:${SKILL_ID}|proof-skill]]"\n---\n\n# Retry role\n\nCurrent body.\n`,
+const manifestOf = (heading: string, body: string) =>
+  Buffer.from(
+    `---\nnotarium-id: ${ROLE_ID}\nname: retry-role\ndescription: Retry role.\nmetadata:\n  notarium.kind: role\n  notarium.skills: "[[notarium-id:system:${SKILL_ID}|proof-skill]]"\n---\n\n# ${heading}\n\n${body}\n`,
   )
+
+/** One revision of the package as the store would serve it: the manifest bytes, and
+ * the id/token/body view a read of those bytes produces. Body and token move together
+ * here for the same reason they must move together on a 409 payload. */
+const revisionOf = (source: Buffer, versionToken: string, filePath: string): NoteContent => {
   const documentState = analyzeDocumentState({
     source,
     role: DOCUMENT_ROLE.skillRoot,
     skillDirectoryName: ROLE_ID,
   })
   const projection = documentState.projection!
-  const note: NoteContent = {
+
+  return {
     id: ROLE_ID,
     title: projection.title,
     content: projection.body,
     frontmatter: {},
-    filePath: `.notarium/skills/${ROLE_ID}/SKILL.md`,
-    versionToken: 'current-version',
+    filePath,
+    versionToken,
     documentState,
   }
+}
+
+const world = () => {
+  const source = manifestOf('Retry role', 'Current body.')
+  const note = revisionOf(source, 'current-version', `.notarium/skills/${ROLE_ID}/SKILL.md`)
+  // What the package holds RIGHT NOW, as opposed to `note` — the snapshot preparation
+  // captured and released. A concurrent writer moves this one and only this one.
+  let live = note
+  let liveSource = source
+
+  const commitConcurrently = (heading: string, body: string, versionToken: string) => {
+    liveSource = manifestOf(heading, body)
+    live = revisionOf(liveSource, versionToken, live.filePath!)
+  }
   const write = vi.fn()
-  const read = vi.fn(async () => note)
+  const read = vi.fn(async () => live)
   const storeWrite = vi.fn(async (input, options) => {
     const physical = () => write(input)
 
@@ -84,6 +104,16 @@ const world = () => {
     store: { read, write: storeWrite } as unknown as SpaceStore,
     note,
   } as unknown as AbilityDocumentTarget
+
+  const withTargetMutation = async <T>(task: (current: OwnedAbilitySnapshot) => Promise<T>) =>
+    task({
+      locator: ROLE_LOCATOR,
+      registryNoteId: ROLE_ID,
+      manifestNoteId: ROLE_ID,
+      filePath: live.filePath!,
+      versionToken: live.versionToken!,
+      pkg: { directoryName: ROLE_ID, files: new Map([['SKILL.md', liveSource]]) },
+    })
   const document = (content: string, attachments: AbilityAttachmentIntent = [ATTACHMENT]) => ({
     target,
     input: writer.writeInput({
@@ -97,9 +127,18 @@ const world = () => {
     locator: ROLE_LOCATOR,
     attachments,
     semanticNoop: true,
+    withTargetMutation,
   })
 
-  return { document, read, serializeOwnedRoleAttachments, storeWrite, write, writer }
+  return {
+    commitConcurrently,
+    document,
+    read,
+    serializeOwnedRoleAttachments,
+    storeWrite,
+    write,
+    writer,
+  }
 }
 
 describe('ability authored document preparation', () => {
@@ -197,26 +236,52 @@ describe('ability authored document preparation', () => {
       outcome: 'skipped',
     })
     expect(serializeOwnedRoleAttachments).not.toHaveBeenCalled()
-    expect(storeWrite).toHaveBeenCalledOnce()
+    expect(storeWrite).not.toHaveBeenCalled()
     expect(write).not.toHaveBeenCalled()
   })
 
   it('conflicts when an apparent no-op changes after preparation', async () => {
-    const { document, read, storeWrite, write, writer } = world()
+    const { commitConcurrently, document, storeWrite, write, writer } = world()
     const candidate = document('# Retry role\n\nCurrent body.\n')
     const commit = await writer.prepareDocument(PRINCIPAL, candidate)
 
-    read.mockResolvedValueOnce({
-      ...candidate.target.note,
-      versionToken: 'concurrent-version',
+    commitConcurrently('Retry role', 'Foreign body.', 'concurrent-version')
+
+    // The whole point of the payload: the dialog shows `current` as "latest saved
+    // version" and retries with `current.versionToken`. A body from the released
+    // preparation snapshot next to the concurrent writer's token would show this
+    // writer its OWN text as the one it is about to overwrite.
+    await expect(commit()).rejects.toMatchObject({
+      reason: 'version_conflict',
+      current: {
+        id: ROLE_ID,
+        versionToken: 'concurrent-version',
+        title: 'Retry role',
+        content: 'Foreign body.\n',
+      },
     })
+    expect(storeWrite).not.toHaveBeenCalled()
+    expect(write).not.toHaveBeenCalled()
+  })
+
+  it('carries the concurrent title on a no-op conflict, never the prepared one', async () => {
+    const { commitConcurrently, document, writer } = world()
+    const commit = await writer.prepareDocument(
+      PRINCIPAL,
+      document('# Retry role\n\nCurrent body.\n'),
+    )
+
+    commitConcurrently('Renamed role', 'Foreign body.', 'concurrent-version')
 
     await expect(commit()).rejects.toMatchObject({
       reason: 'version_conflict',
-      current: { id: ROLE_ID, versionToken: 'concurrent-version' },
+      current: {
+        id: ROLE_ID,
+        versionToken: 'concurrent-version',
+        title: 'Renamed role',
+        content: 'Foreign body.\n',
+      },
     })
-    expect(storeWrite).toHaveBeenCalledOnce()
-    expect(write).not.toHaveBeenCalled()
   })
 
   it('still validates attachments before a new authored write', async () => {

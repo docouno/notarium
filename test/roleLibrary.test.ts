@@ -358,7 +358,7 @@ describe('filesystem role library bounds', () => {
         await mkdir(join(root, directoryName), { recursive: true })
         await writeFile(
           join(root, directoryName, 'SKILL.md'),
-          `---\nname: ${name}\ndescription: Role ${index}.\nmetadata:\n  notarium.kind: role\n---\n\nInstructions ${index}.`,
+          `---\nnotarium-id: ${directoryName}\nname: ${name}\ndescription: Role ${index}.\nmetadata:\n  notarium.kind: role\n---\n\nInstructions ${index}.`,
         )
       }),
     )

@@ -307,6 +307,22 @@ export type OwnedRolePlacementMove = {
   /** Exact owner claim read from the moved SKILL.md under source package admission.
    * Claim arbitration may make it differ from `registryNoteId`; both are authority. */
   manifestNoteId: string
+  /** What this move leaves in the forwarding journal, and the reason the journal has
+   *  an ERASING operation at all: `ability_placement_trail` is read fail-closed —
+   *  every row tombstones the address it names, whether or not anything stands at the
+   *  address it points to. So a hop that answers for a placement the package does not
+   *  occupy is not stale data, it is a role no door can reach.
+   *
+   *  `record` — the package took a new address: the source starts forwarding to it.
+   *
+   *  `cancel` — this move takes the package BACK along a hop the caller recorded, so
+   *  the hop is REMOVED rather than answered with a counter-hop. Both spellings are
+   *  then unforwarded, and the one the bytes are at answers for itself. A counter-hop
+   *  is what made an interrupted undo unrecoverable: the compensating step that would
+   *  have removed it is exactly the step that can fail, and the row it leaves points
+   *  at an empty placement while the package sits at the address the row tombstones.
+   *  Erasing is the operation with no such step — nothing has to run afterwards. */
+  trail: 'record' | 'cancel'
 }
 
 /** One persisted forwarding row, bound to both identities of the moved package. */

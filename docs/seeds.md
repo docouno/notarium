@@ -136,7 +136,7 @@ and for `security` — it parses the sanitized HTML into a live DOM and checks t
 | `agent-roles` | five principals keep the boundary visible: Fresh is catalog-only; Bob owns an idle Personal fork; the default stand owner Sergey owns a Personal `release-reviewer` with distinct Base/Role pins plus editable Personal and Main-project Memory rows; Maya owns switchable Personal `research`/`grooming` presets plus same-name Research Space + two Project role forks. Its skill library has Personal and Space homes, `coder` bound to Team Alpha/Beta but not Gamma, an all-projects skill, a direct catalog fork with provenance, an exact-linked rename, a custom exact link, duplicate names, and a deleted package retained as a broken role reference. A long Custom role preserves authored body and carries one legacy malformed attachment for preserve-vs-detach editing; another owned role remains in Personal Trash. Robin can inspect the Team home read-only. Base Personal/Project pins remain visible, each role placement has a distinct pin, the Team Project role adds a set plus an oversized tail that trims under the shared `Role → Project → Personal` budget, and an active episode rehydrates `research` | agent-roles, agent-sessions, agent-memory, auth, structure, scale |
 | `agent-abilities-rich` | the same axis at VOLUME on the default login, where `agent-roles` proves boundaries with one placement each: Personal, Space and three Project role groups populated at once, BOTH inventories past the library/explorer page sizes, a title long enough to force truncation everywhere it is listed, one display name deliberately held at two placements, a `launch-review` Space role narrowed to two of the Space's projects with its own version in one of them, a version whose base was never created, and a Space skill fleet whose availability differs per project (all / one / several). It seeds project and personal Catalog dependencies at their real homes, exact-linked rename, malformed and deleted attachment health, plus the RC package-delete boundaries: both Markdown and non-Markdown auxiliaries make agent `delete_ability` refuse and preserve the package, while the unchanged human multi-file door can remove the Markdown package into Trash. `agent-created-oversized-proof` is published through the durable agent creator with PAT/session provenance, exceeds 64k characters, and is pinned by its real note id into Web; it simultaneously proves Activity attribution, fail-closed `use_skill` and generic MCP context filtering. Most of its projects hold no ability at all, and that is deliberate: the library aside's Project facet has no pagination and no scroller of its own, so the LENGTH of that facet is the state — long enough that the aside's own scroller is the one that moves. Counts are derived from `buildCasesWorld`, never pinned in prose. | agent-roles, agent-memory, agent-audit, structure, auth, scale |
 | `agent-abilities-sparse` | the other end of the same axis: a first-run stand with System and Catalog plus exactly one Owned skill and no Owned role at all — the empty groups, the single-row group and the skeleton geometry that a fully populated stand can never show | agent-roles, structure, auth |
-| `context-open` | production-shaped #394 performance stand: 1100-note project + 2700-note personal corpus, linked graph/activity, 90 × ~6.5 KB project-memory categories (`SCALE=.045` → 4; `1` → 90; `3` → 270), 8 personal categories, 12 × ~13.7 KB always-load pins and a profile note; SCALE changes only the project-memory count | agent-memory, activity, graph, note-classes, scale, structure |
+| `context-open` | production-shaped #394/#399 performance stand: 1100-note project + 2700-note personal corpus, one editable Custom Project Role in `context-lab/product`, linked graph/activity, 90 × ~6.5 KB project-memory categories (`SCALE=.045` → 4; `1` → 90; `3` → 270), 8 personal categories, 12 × ~13.7 KB always-load pins and a profile note; SCALE changes only the project-memory count | agent-memory, agent-roles, activity, graph, note-classes, scale, structure |
 | `memory-perf` | 2700 ordinary notes + 4 personal-memory categories + 1 project-partition sentinel; reproduces memory-mount scaling, partition isolation, and graph-inert memory links | agent-memory, note-classes, scale |
 | `import-thread` | one rich imported thread | import, content |
 | `import` | a multi-format layout (claude/chatgpt/memory-json) + backdated dates-as-data → Feed year-spread (#11/#223); source-addressable Claude/ChatGPT notes carry canonical `notarium-source`, including two same-titled CJK project docs with distinct portable placement, beside one deliberately source-less legacy predecessor; plus `dropped/` — the states of a dragged-in `.md` archive whose OWN frontmatter was lifted (#280): authored tags + date, an Obsidian note titled by its file name with `aliases:` and plugin keys kept, a Jekyll post whose `title:` beats a differing body `# H1`, and a frontmatter-less note dated by the file's mtime; plus `vault/` — a Markdown TREE imported from a `.zip` (#302), its nested folders reproduced and its internal exact `[[notarium-id:…]]` links repointed at the COPIES (with a fenced-code copy left as authored) | import, content, activity |
@@ -172,6 +172,51 @@ make seed CASE=dashboard-activity SCALE=1 SEED=x PASSWORD=secret
 make seed CASE=reader-showcase,graph,trash-mixed    # COMBINATION of cases
 make seed-coverage                                  # coverage matrix
 ```
+
+`context-open` is also the production-shaped Ability mutation stand. After seeding and starting it,
+`BENCH_PHASE=pre BENCH_COMMIT=<frozen-commit> BENCH_IMAGE=<image-id>
+BENCH_CONTAINER=<running-container>
+BENCH_OUTPUT=/tmp/context-open-pre.json npm run bench:context-open`
+captures the frozen baseline. The final gate is `BENCH_PHASE=post BENCH_COMMIT=<reviewed-commit>
+BENCH_IMAGE=<image-id>
+BENCH_CONTAINER=<running-container>
+BENCH_BASELINE=/tmp/context-open-pre.json npm run bench:context-open`; plain
+`npm run bench:context-open` is a post run too and fails closed without baseline and provenance. It
+measures the existing Note/Context/Dashboard/graph-health surfaces and the seeded
+`context-benchmark` Project Role through real MCP `get_ability`/`edit_ability`. The script mints a
+temporary write PAT and always revokes it, records applied/no-op/stale-conflict raw samples, runs
+unrelated-note and liveness probes alongside every edit, then repeats the user-surface bundle after
+the mutation series. Reports land in `test-results/context-open-bench/` unless `BENCH_OUTPUT` is
+set. Post runs enforce the 500 ms p95 / 1 s max bound on **every** measured operation — the applied
+edit, the semantic no-op and the stale conflict alike, because the frozen defect hung a no-op — plus
+the heartbeat bound. At the pinned twelve samples those two numbers are one: a nearest-rank p95 IS the
+worst of twelve, so the 1 s bound restates the run's own abort rather than adding a second test, and it
+regains independent meaning only at twenty samples or more. The before→after user surfaces are compared
+by MEDIAN alone, against the greater of +20 % and +5 ms over the baseline median. There is deliberately
+no relative p95 leg on them: judged that way a surface is judged by its single worst sample, whose swing
+between runs of one unchanged image is wider than the allowance itself — on one recorded pair the leg
+cried louder on a clean control run than on the same build under injected load. A distribution shift is
+what the median leg is for; a lone worst sample still counts where it means something, inside the
+absolute edit budgets. All three operations must actually have been
+measured: a post report that publishes no stats for one of them, or whose cycles simply omit it, is
+rejected by name rather than skipped, so the budget cannot be escaped by not measuring. The same
+holds for the heartbeat series — absent stats are a named failure, not an unbounded pass — and for
+the post and baseline surface stats, which are checked for sample count and finite non-negative
+values before either side is compared. `ABILITY_TIMEOUT_MS` defaults to the 1 s
+correctness bound, and a post report that was taken with any other timeout is rejected: the bound is
+a property of the run, not of the numbers it publishes, so a looser abort would let a hung edit
+resolve late and still read as bounded. Each measured call must also report the outcome its name
+claims — applied → `applied`, no-op → `skipped`, stale conflict → `failed` — so a fast call that did
+not do the work cannot pass as a fast edit. A frozen pre-fix server may therefore
+record the edit timeout as a `pre` report without hiding the earlier surface baseline, while the
+same timeout makes a `post` run fail. Commit and build time are read back from `/api/about`; image
+digest, OCI revision and OCI created time are read independently from the healthy running container
+with `docker inspect` and must match the runtime build; every stand-identity mismatch is reported at once rather than one throw at a time. `BENCH_COMMIT`/`BENCH_IMAGE` are expected
+assertions, never report fields. The frozen pre report is accepted only for the exact
+`main@5ce60d45` 1 s `AbortError` shape and must be the unchanged passing output of this harness.
+A baseline file that carries no ability-edit section at all — an older or foreign report — comes back
+as a named failure rather than a crash. The data-root fingerprint is derived from stable
+project/memory/note/Role ids.
 
 **Combining.** `CASE` accepts a comma-separated list — the cases **compose** into a
 single stand: spaces are merged by slug, users/projects/members are deduplicated,
@@ -410,6 +455,16 @@ share the role, skill and availability appliers; a host supplies only its own cl
 preference facet. The rows the REAL applier writes are read back out of the seeded meta-DB by
 `test/cases/agentRolesRealSeed.test.ts` — the count the seeder reports says nothing about what
 landed in them.
+
+That same combined row also carries the Project-Role identity proof: a role published under the
+reserved `_projects/<encoded-project>` root must have a manifest whose `notarium-id` equals the
+`note_identity` row for the same file, since that id — not the directory — is what a rename, a
+restore or an exact locator resolves. The proof rides the abilities-merge seed that row already
+runs, deliberately NOT a second seed of `context-open`: that case's corpus is fixed at 1100 + 2700
+notes (`SCALE` moves only the project-memory count), so a real run of it costs ~85 s on its own and
+times out under a loaded `make checkup`, while the placement it would demonstrate is the same one.
+That `context-open` declares exactly one Custom Project Role in `context-lab/product` is asserted
+against the case world in `test/cases/cases/contextOpen.test.ts`, in milliseconds.
 
 The bundled inventory is part of every seeded stand: `research` plus `research-evidence` are
 System, while `grooming` plus `grooming-evidence` are Catalog. The `agent-roles` case combines that

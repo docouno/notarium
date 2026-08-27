@@ -37,9 +37,11 @@ import {
   type AdmissionLease,
   type AdmissionMode,
   type CanonicalResourceRoot,
+  type ConditionalDirectoryMoveView,
   type MutationReceipt,
   type PackagePublicationView,
   type ResourceAuthorityAdapter,
+  type ResourceConditionalDirectoryMoveResult,
   type ResourceObservation,
   type ResourcePackagePublicationRequest,
   type ResourcePublicationRequest,
@@ -984,6 +986,59 @@ export class SpaceResourceAuthority {
     }
   }
 
+  /** Resolve one conditional directory transition without touching the medium.
+   * The returned method is usable only under the caller's existing authority
+   * admission; absence is the adapter capability answer, not a late exception. */
+  conditionalDirectoryMoveFor(
+    sourcePath: string,
+    targetPath: string,
+    proofRelativePath: string,
+  ): ConditionalDirectoryMoveView | null {
+    this.assertRootsStable()
+    const source = normalizePath(sourcePath)
+    const target = normalizePath(targetPath)
+    const proofRelative = normalizePath(proofRelativePath)
+    const sourceProof = normalizePath(`${source}/${proofRelative}`)
+    const routedSource = this.route(source)
+    const routedTarget = this.route(target)
+    const routedProof = this.route(sourceProof)
+    const adapter = routedSource.adapter
+
+    if (routedTarget.adapter !== adapter || routedProof.adapter !== adapter) {
+      return null
+    }
+    const move = adapter.capabilities.conditionalDirectoryMove
+
+    if (!move) {
+      return null
+    }
+
+    return {
+      moveIfClaimed: async (expectedSourceProof) => {
+        this.assertAdmitted()
+        if (expectedSourceProof.adapterId !== adapter.id) {
+          return { status: 'conflict' }
+        }
+        const result = await move.moveIfClaimed({
+          sourcePath: routedSource.relativePath,
+          targetPath: routedTarget.relativePath,
+          sourceProofPath: routedProof.relativePath,
+          expectedSourceProof: snapshotClaim(expectedSourceProof.claim),
+        })
+
+        return result.status === 'moved'
+          ? ({
+              status: 'moved',
+              targetProof: {
+                adapterId: adapter.id,
+                claim: snapshotClaim(result.targetProof),
+              },
+            } satisfies ResourceConditionalDirectoryMoveResult)
+          : result
+      },
+    }
+  }
+
   supportsRestartDurableStrict(path: string): boolean {
     this.assertRootsStable()
     const { adapter } = this.route(normalizePath(path))
@@ -1068,6 +1123,18 @@ export class SpaceResourceAuthority {
    * resource/package lease. Strict multi-system commands use this instead of
    * nesting another admission request under their long-lived lease. */
   async observeStrictAdmitted(path: string, maxBytes?: number): Promise<ResourceObservation> {
+    return this.strictObservation(path, maxBytes, false)
+  }
+
+  /** Both strict entries ask the same question of their arguments and differ only
+   * in what the resulting claim additionally names, so the question is asked in
+   * one place: two copies would be two guards, and only one of them would ever be
+   * the one a test broke. */
+  private strictObservation(
+    path: string,
+    maxBytes: number | undefined,
+    bindDirectory: boolean,
+  ): Promise<ResourceObservation> {
     this.assertAdmitted()
     const canonicalPath = normalizePath(path)
 
@@ -1075,7 +1142,26 @@ export class SpaceResourceAuthority {
       throw new Error('observation maxBytes must be a non-negative safe integer')
     }
 
-    return this.observeAdmitted(canonicalPath, maxBytes)
+    return this.observeAdmitted(canonicalPath, maxBytes, bindDirectory)
+  }
+
+  /** The strict observation a DIRECTORY transition can be conditioned on. It
+   * differs from `observeStrictAdmitted` in one respect — the claim it returns
+   * also names the directory that held the pathname — and it is a separate entry
+   * rather than a flag because that binding makes the claim additionally
+   * sensitive to the containing directory being replaced. Callers that persist a
+   * claim as durable evidence must NOT get that sensitivity by default; callers
+   * that will move the directory cannot do without it.
+   *
+   * Handing the claim straight to `conditionalDirectoryMoveFor(...).moveIfClaimed`
+   * is what makes `moved` mean "the directory you observed", instead of "some
+   * directory that presents a resource answering to your claim" — which a
+   * stranger holding a hardlink of it answers just as well. */
+  async observeDirectoryBoundAdmitted(
+    path: string,
+    maxBytes?: number,
+  ): Promise<ResourceObservation> {
+    return this.strictObservation(path, maxBytes, true)
   }
 
   /** Compensation-only conditional delete. The publication claim is kept
@@ -1192,7 +1278,11 @@ export class SpaceResourceAuthority {
     return strict.discard(snapshot.operationId, snapshot.binding)
   }
 
-  private async observeAdmitted(path: string, maxBytes?: number): Promise<ResourceObservation> {
+  private async observeAdmitted(
+    path: string,
+    maxBytes?: number,
+    bindDirectory?: boolean,
+  ): Promise<ResourceObservation> {
     const { adapter, relativePath } = this.route(path)
 
     if (!adapter.capabilities.resourceObservation) {
@@ -1203,7 +1293,12 @@ export class SpaceResourceAuthority {
     const observation = snapshotObservation(
       await adapter.capabilities.resourceObservation.observe(
         relativePath,
-        maxBytes == null ? undefined : { maxBytes },
+        maxBytes == null && bindDirectory !== true
+          ? undefined
+          : {
+              ...(maxBytes == null ? {} : { maxBytes }),
+              ...(bindDirectory === true ? { bindDirectory: true } : {}),
+            },
       ),
     )
 

@@ -236,9 +236,15 @@ a missing field or key reads as unavailable, so an older response fails closed. 
 placements, its package and the home its linked skills live in, and a target is offered only
 when both are publishable. A direct POST to an unavailable target answers `503` with reason
 `role_install_unavailable`, before a personal space is minted or a byte is staged; the same
-typed answer covers a commit the medium refuses on one pathname, and in either case nothing was
-published there. It is not a rollback of the whole request: linked skills already published for
-this role stay, and a retry reuses them rather than forking a second copy.
+typed answer covers a commit the medium refuses on one pathname, and in both of those cases
+nothing was published there. A placement MOVE that cannot confirm its new home unwinds by default —
+bytes, address and reach all go back, and the answer means what it means everywhere else. Only when
+that unwind is itself refused does the same reason ride state that did change, and only then does the
+package stay at the home the answer calls unusable. A move whose unwind LANDED but whose confirmation
+never arrived is a different answer entirely: it names the new home rather than an unavailable one,
+because the package is there and readable by the address it carries. It is not a rollback of the whole request:
+linked skills already published for this role stay, and a retry reuses them rather than forking a
+second copy.
 
 Roles may be owned at Personal, Space, or Project placement, with human effective precedence
 `Owned Project > Owned Space > Owned Personal > System`; their Project packages live under the reserved

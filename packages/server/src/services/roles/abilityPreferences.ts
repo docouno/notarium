@@ -185,6 +185,7 @@ export class InMemoryAbilityPreferences implements AbilityPreferencesPersistence
     toLocator: string,
     registryNoteId: string,
     manifestNoteId: string,
+    trail: 'record' | 'cancel',
   ): void {
     const carried: Array<[string, PreferenceRow]> = []
 
@@ -209,18 +210,27 @@ export class InMemoryAbilityPreferences implements AbilityPreferencesPersistence
     // source now points at the destination (so the trail stays one hop deep), and the
     // source starts forwarding. Without it, an owner who switches this role off
     // holding the pre-move address writes at an address nothing reads.
+    //
+    // A `cancel` takes the first two steps and not the third, for the reason spelled
+    // out on `OwnedRolePlacementMove.trail`: it is walking the package back along a hop
+    // its caller recorded, so the destination delete removes that hop and both
+    // spellings end up forwarding nowhere. A counter-hop would need a later step to
+    // clear it, and a trail row tombstones its own address whether or not the
+    // destination holds anything.
     this.moved.delete(toLocator)
     for (const [from, hop] of this.moved) {
       if (hop.to === fromLocator) {
         this.moved.set(from, { ...hop, to: toLocator, registryNoteId, manifestNoteId })
       }
     }
-    this.moved.set(fromLocator, {
-      to: toLocator,
-      spaceId: abilitySpaceOfLocator(fromLocator),
-      registryNoteId,
-      manifestNoteId,
-    })
+    if (trail === 'record') {
+      this.moved.set(fromLocator, {
+        to: toLocator,
+        spaceId: abilitySpaceOfLocator(fromLocator),
+        registryNoteId,
+        manifestNoteId,
+      })
+    }
   }
 
   /** One or more registry notes are gone for good in this Space. */

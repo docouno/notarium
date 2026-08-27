@@ -90,6 +90,22 @@ const observingAdapter = (
 ): Pick<ResourceAuthorityAdapter, 'files' | 'capabilities'> =>
   adapterFiles({ resourceObservation: { observe } })
 
+/** What the admitted-entry table needs from an adapter: observation for the read
+ *  entries plus the conditional directory move whose VIEW is the admitted entry.
+ *  Both capabilities SUCCEED unconditionally, so a call that gets past the
+ *  admission question resolves — an entry that stopped asking cannot pass the
+ *  refusal test by failing for some unrelated reason. */
+const admittedEntryAdapter = (): Pick<ResourceAuthorityAdapter, 'files' | 'capabilities'> =>
+  adapterFiles({
+    resourceObservation: { observe: async () => present(1) },
+    conditionalDirectoryMove: {
+      moveIfClaimed: async () => ({
+        status: 'moved',
+        targetProof: { kind: 'present', value: 'test:target' },
+      }),
+    },
+  })
+
 /** Observation plus a publication that always succeeds — the pair the lifecycle
  *  tests need, and nothing else. */
 const publishingFiles = (
@@ -120,6 +136,14 @@ const LEASE_GATES = ['admitResource', 'admitPackage', 'admitSkillPlacement'] as 
  *  admitted, never whether the space is still accepting — the fence drains them. */
 const ADMITTED_ENTRIES = [
   'assertSkillManifestNameAvailableAdmitted',
+  // A resolver by shape, an admitted entry by substance: the view it hands back
+  // takes NO lease of its own and asks `assertAdmitted` instead, which is exactly
+  // what puts it on this side of the split. `packagePublicationFor` below is the
+  // contrast — its view takes its own lease through a gate, so the question is
+  // asked there and it belongs to neither list. The prototype name is the only
+  // handle the classification has, so it stands here for the call it resolves.
+  'conditionalDirectoryMoveFor',
+  'observeDirectoryBoundAdmitted',
   'observeLinkedAdmitted',
   'observeStrictAdmitted',
   'publishAdmitted',
@@ -155,6 +179,7 @@ const NEITHER = [
   'removeClaimed',
   'reopenAdmission',
   'resourcePathContext',
+  'strictObservation',
   'route',
   'stageStrict',
   'supportsRestartDurableStrict',
@@ -170,6 +195,14 @@ const admittedEntryCalls = (
   return {
     assertSkillManifestNameAvailableAdmitted: () =>
       authority.assertSkillManifestNameAvailableAdmitted('pkg/SKILL.md', Uint8Array.of(1)),
+    // Resolving the route is a query and stays silent; the CALL it hands back is
+    // the entry, so that is what the table invokes.
+    conditionalDirectoryMoveFor: async () =>
+      authority.conditionalDirectoryMoveFor('pkg', 'moved', 'SKILL.md')!.moveIfClaimed({
+        adapterId: 'root',
+        claim: { kind: 'present', value: 'test:source' },
+      }),
+    observeDirectoryBoundAdmitted: () => authority.observeDirectoryBoundAdmitted('pkg/SKILL.md'),
     observeLinkedAdmitted: () =>
       authority.observeLinkedAdmitted('pkg/note.md', 'pkg/SKILL.md', () => true),
     observeStrictAdmitted: () => authority.observeStrictAdmitted('note.md'),
@@ -2100,6 +2133,209 @@ describe('SpaceResourceAuthority', () => {
     expect(observationOnly.packagePublicationFor('.skills', 'audit')).toBeNull()
   })
 
+  it('routes a conditional directory move and keeps its claim adapter-bound', async () => {
+    const move = vi.fn(async () => ({
+      status: 'moved' as const,
+      targetProof: { kind: 'present' as const, value: 'adapter:target' },
+    }))
+    const authority = new SpaceResourceAuthority('space', [
+      {
+        id: 'skills',
+        prefix: '.skills',
+        ...adapterFiles({ conditionalDirectoryMove: { moveIfClaimed: move } }),
+      },
+    ])
+    const view = authority.conditionalDirectoryMoveFor(
+      '.skills/source',
+      '.skills/target',
+      'SKILL.md',
+    )
+
+    expect(view).not.toBeNull()
+    const lease = await authority.admitPackage('.skills/source', 'exclusive', 'move-test')
+
+    await expect(
+      view!.moveIfClaimed({
+        adapterId: 'other',
+        claim: { kind: 'present', value: 'other:source' },
+      }),
+    ).resolves.toEqual({ status: 'conflict' })
+    expect(move).not.toHaveBeenCalled()
+    await expect(
+      view!.moveIfClaimed({
+        adapterId: 'skills',
+        claim: { kind: 'present', value: 'adapter:source' },
+      }),
+    ).resolves.toEqual({
+      status: 'moved',
+      targetProof: {
+        adapterId: 'skills',
+        claim: { kind: 'present', value: 'adapter:target' },
+      },
+    })
+    expect(move).toHaveBeenCalledWith({
+      sourcePath: 'source',
+      targetPath: 'target',
+      sourceProofPath: 'source/SKILL.md',
+      expectedSourceProof: { kind: 'present', value: 'adapter:source' },
+    })
+    lease.settle()
+  })
+
+  it('withholds conditional directory movement when routing or capability is incomplete', () => {
+    // Every adapter here but `plain` CAN perform the move, so a withheld view is
+    // attributable to the route alone — with a capability-less adapter under the
+    // source, "null" would mean the same thing whatever the routing decided.
+    const authority = new SpaceResourceAuthority('space', [
+      { id: 'notes', prefix: '', ...admittedEntryAdapter() },
+      { id: 'skills', prefix: '.skills', ...admittedEntryAdapter() },
+      { id: 'nested', prefix: 'lib/pkg/nested', ...admittedEntryAdapter() },
+      { id: 'plain', prefix: 'plain', ...adapterFiles({}) },
+    ])
+
+    // A destination another adapter owns is not a transition this one can make:
+    // the atomic no-replace rename exists inside one medium, not between two.
+    expect(authority.conditionalDirectoryMoveFor('source', '.skills/target', 'SKILL.md')).toBeNull()
+    // Same for the proof — a nested mount can own a pathname below the moving
+    // directory, and then the resource proving the move is not the adapter's to
+    // carry, however plainly it reads as "inside" the source.
+    expect(authority.conditionalDirectoryMoveFor('lib/pkg', 'lib/moved', 'nested/SKILL.md')).toBe(
+      null,
+    )
+    expect(authority.conditionalDirectoryMoveFor('plain/source', 'plain/target', 'SKILL.md')).toBe(
+      null,
+    )
+    // The same three paths on one capable adapter DO resolve, so none of the
+    // above is a view withheld for some reason of its own.
+    expect(authority.conditionalDirectoryMoveFor('lib/pkg', 'lib/moved', 'SKILL.md')).not.toBeNull()
+  })
+
+  it('refuses an impossible byte budget from either strict observation', async () => {
+    const authority = new SpaceResourceAuthority('space', [
+      { id: 'root', prefix: '', ...admittedEntryAdapter() },
+    ])
+    const budget = /maxBytes must be a non-negative safe integer/
+
+    await expect(authority.observeStrictAdmitted('pkg/SKILL.md', -1)).rejects.toThrow(budget)
+    await expect(authority.observeDirectoryBoundAdmitted('pkg/SKILL.md', 1.5)).rejects.toThrow(
+      budget,
+    )
+    // Both entries still answer for a budget that IS expressible, so neither is
+    // refusing for some reason of its own.
+    await expect(authority.observeStrictAdmitted('pkg/SKILL.md', 8)).resolves.toMatchObject({
+      kind: 'present',
+    })
+    await expect(authority.observeDirectoryBoundAdmitted('pkg/SKILL.md', 8)).resolves.toMatchObject(
+      { kind: 'present' },
+    )
+  })
+
+  it('refuses to move a package directory that replaced the one it observed', async () => {
+    const root = await mkroot()
+    await fs.mkdir(join(root, 'source'))
+    await fs.writeFile(join(root, 'source', 'SKILL.md'), 'manifest')
+    // A stranger hardlinks our manifest BEFORE anyone samples it, so the ctime
+    // bump `link` causes is already inside the observation, and the twin answers
+    // every question a file claim can ask: dev, ino, ctime, size, bytes.
+    await fs.mkdir(join(root, 'foreign'))
+    await fs.link(join(root, 'source', 'SKILL.md'), join(root, 'foreign', 'SKILL.md'))
+    await fs.writeFile(join(root, 'foreign', 'payload.md'), 'stranger')
+    const authority = new SpaceResourceAuthority('space', [
+      resourceAuthorityAdapterOf(
+        { id: 'skills', prefix: '.skills', physicalRoot: root },
+        createLocalFsFiles(root),
+      ),
+    ])
+    // The two steps RoleLibrary takes, in its order: observe the manifest, then
+    // condition the placement move on that observation.
+    const observed = await authority.observeDirectoryBoundAdmitted('.skills/source/SKILL.md')
+
+    expect(observed.kind).toBe('present')
+    if (observed.kind !== 'present') {
+      return
+    }
+    const ours = await fs.lstat(join(root, 'source'), { bigint: true })
+
+    // Between those two steps the stranger takes the source pathname.
+    await fs.rename(join(root, 'source'), join(root, 'stash'))
+    await fs.rename(join(root, 'foreign'), join(root, 'source'))
+    const view = authority.conditionalDirectoryMoveFor(
+      '.skills/source',
+      '.skills/target',
+      'SKILL.md',
+    )
+
+    await expect(
+      view!.moveIfClaimed({ adapterId: 'skills', claim: observed.claim }),
+    ).resolves.toEqual({ status: 'conflict' })
+    // `moved` here would publish the stranger's directory, payload and all, under
+    // the placement the caller believes holds the package it just read.
+    await expect(fs.lstat(join(root, 'target'))).rejects.toMatchObject({ code: 'ENOENT' })
+    expect((await fs.lstat(join(root, 'stash'), { bigint: true })).ino).toBe(ours.ino)
+    await expect(fs.readFile(join(root, 'source', 'payload.md'), 'utf8')).resolves.toBe('stranger')
+  })
+
+  it('rechecks a physical root before resolving a conditional directory move', async () => {
+    const parent = await mkroot()
+    const late = join(parent, 'late')
+    const elsewhere = await mkroot()
+    const authority = new SpaceResourceAuthority('space', [
+      { id: 'root', prefix: '', physicalRoot: late, ...admittedEntryAdapter() },
+    ])
+    await fs.symlink(elsewhere, late)
+
+    expect(() => authority.conditionalDirectoryMoveFor('source', 'target', 'SKILL.md')).toThrow(
+      /changed after preflight/,
+    )
+  })
+
+  it('carries a real adapter conditional move through routing and back', async () => {
+    const root = await mkroot()
+    await fs.mkdir(join(root, 'source'))
+    await fs.writeFile(join(root, 'source', 'SKILL.md'), 'manifest')
+    const authority = new SpaceResourceAuthority('space', [
+      resourceAuthorityAdapterOf(
+        { id: 'skills', prefix: '.skills', physicalRoot: root },
+        createLocalFsFiles(root),
+      ),
+    ])
+    // The entry a directory transition is conditioned on: an ordinary observation
+    // hands back a claim that names no directory, and the adapter refuses it.
+    const observed = await authority.observeDirectoryBoundAdmitted('.skills/source/SKILL.md')
+
+    expect(observed.kind).toBe('present')
+    if (observed.kind !== 'present') {
+      return
+    }
+    // A real adapter, a real medium: the assembly's capability has to survive
+    // being turned into an authority adapter, or the whole facet silently
+    // becomes "this location cannot move roles" on every real deployment.
+    const view = authority.conditionalDirectoryMoveFor(
+      '.skills/source',
+      '.skills/target',
+      'SKILL.md',
+    )
+
+    expect(view).not.toBeNull()
+    const moved = await view!.moveIfClaimed({ adapterId: 'skills', claim: observed.claim })
+
+    expect(moved.status).toBe('moved')
+    if (moved.status !== 'moved') {
+      return
+    }
+    expect(moved.targetProof.adapterId).toBe('skills')
+    await expect(fs.readFile(join(root, 'target', 'SKILL.md'), 'utf8')).resolves.toBe('manifest')
+    // And the proof it hands back conditions the reverse leg on the same medium.
+    const back = authority.conditionalDirectoryMoveFor(
+      '.skills/target',
+      '.skills/source',
+      'SKILL.md',
+    )
+
+    await expect(back!.moveIfClaimed(moved.targetProof)).resolves.toMatchObject({ status: 'moved' })
+    await expect(fs.readFile(join(root, 'source', 'SKILL.md'), 'utf8')).resolves.toBe('manifest')
+  })
+
   it('rejects non-package roots, duplicate files and invalid paths before storage work', async () => {
     const absent = { kind: 'absent' as const, value: 'test:absent' }
     const observe = vi.fn(async () => ({ kind: 'absent' as const, claim: absent, mtimeMs: null }))
@@ -2561,7 +2797,7 @@ describe('SpaceResourceAuthority', () => {
 
   it('refuses every admitted entry that reaches a closed space with no lease at all', async () => {
     const authority = new SpaceResourceAuthority('space', [
-      { id: 'root', prefix: '', ...observingAdapter(async () => present(1)) },
+      { id: 'root', prefix: '', ...admittedEntryAdapter() },
     ])
 
     await authority.closeAdmission()
@@ -2617,7 +2853,7 @@ describe('SpaceResourceAuthority', () => {
       Object.keys(
         admittedEntryCalls(
           new SpaceResourceAuthority('space', [
-            { id: 'root', prefix: '', ...observingAdapter(async () => present(1)) },
+            { id: 'root', prefix: '', ...admittedEntryAdapter() },
           ]),
         ),
       ).sort(),

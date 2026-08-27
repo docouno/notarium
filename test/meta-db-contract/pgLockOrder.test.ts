@@ -925,6 +925,7 @@ describePostgres('Postgres lock order', { timeout: SUITE_TIMEOUT_MS }, () => {
           toLocator: 'owned:role:space:alpha:AbCdefGhij_1',
           registryNoteId: 'note-a',
           manifestNoteId: 'note-a',
+          trail: 'record',
         }),
       )
 

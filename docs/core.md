@@ -59,7 +59,39 @@ keeps admission fail-closed for durable recovery; after terminal commit, cleanup
 an acknowledgement failure cannot turn the committed operation back into a failed write. Startup
 replays the durable operation and drains the outbox before public admission.
 
-Every in-process mutation through the read-model enters fair, process-local coordinated checkpoints. The storage claim combines opaque domain resources, stable note-id, exact source/destination paths, and folder prefixes; equal resources/ids/paths and path↔prefix or overlapping-prefix relations conflict, while unrelated notes keep their parallel throughput. Source-aware fresh imports use the full locator as an opaque resource, so two creates serialize even when mutable titles choose different canonical paths; the winner is then visible to the follower's under-lease owner re-check through the snapshot's locator reverse index, without a corpus scan per imported record. Claims derived from mutable state are re-read after waiting: if a preceding move changed a path or its owner, the waiter retains every observed resource and atomically requeues its original ticket until the claim is stable. Its ticket keeps priority over later waiters that are still queued; work that was genuinely unrelated under the old claim may already be active and is allowed to finish. The storage checkpoint spans host-owned preparation, CAS verify, path selection, the engine mutation, identity/snapshot updates, synchronous enqueue of the journal state, and host-owned project/folder registry finalization. It orders overlapping write/move/remove operations and the storage leg of restore; a folder move/delete cannot interleave with a child write, directory create, or create in its destination subtree. Folder delete re-enumerates its victims after acquiring the prefix and holds it through every tombstone plus `removeDir` — a note written through this `CachedStore` cannot appear after the initial list and be erased without history. Conflicting waiters keep arrival order across stable-claim retries, so a waiting folder operation cannot starve behind a stream of later child writes.
+Owned Ability package deletion goes through the same `removeDir` order described below: the
+Space-global storage claim first, then the package owner inspects and detaches through resource
+admission.
+
+Every in-process mutation through the read-model enters fair, process-local coordinated checkpoints. The storage claim combines opaque domain resources, stable note-id, exact source/destination paths, and prefixes; equal resources/ids/paths and path↔prefix or overlapping-prefix relations conflict, while unrelated notes keep their parallel throughput. The prefix axis is a namespace, not a folder path: today a removal claims the link-target buckets it invalidates, and folder-wide operations do not narrow to their subtree at all — they take the Space-global claim. Source-aware fresh imports use the full locator as an opaque resource, so two creates serialize even when mutable titles choose different canonical paths; the winner is then visible to the follower's under-lease owner re-check through the snapshot's locator reverse index, without a corpus scan per imported record. Claims derived from mutable state are re-read after waiting: if a preceding move changed a path or its owner, the waiter retains every observed resource and atomically requeues its original ticket until the claim is stable. Its ticket keeps priority over later waiters that are still queued; work that was genuinely unrelated under the old claim may already be active and is allowed to finish. The storage checkpoint spans host-owned preparation, CAS verify, path selection, the engine mutation, identity/snapshot updates, synchronous enqueue of the journal state, and host-owned project/folder registry finalization. It orders overlapping write/move/remove operations and the storage leg of restore; a folder move/delete cannot interleave with a child write, directory create, or create in its destination subtree. Folder delete takes the Space-global storage claim, then re-enumerates its victims and holds that claim through every tombstone plus `removeDir` — a note written through this `CachedStore` cannot appear after the initial list and be erased without history. Folder move is Space-global for the same reason; narrowing either is a separate redesign. Conflicting waiters keep arrival order across stable-claim retries, so a waiting folder operation cannot starve behind a stream of later child writes.
+
+Host compound work that must compose this checkpoint with another authority enters through
+`CachedStore.withExactNoteClaim`. The read-model waits for ordinary mutation/identity readiness,
+queues one stable current note-id/path claim, observes that exact note under the claim, and retains it
+through the host callback. The callback receives the current `NoteContent`, never a lease or claim.
+A nested call may skip the queue only when the active async-local claim already covers the complete
+current target (a global claim covers an exact target); any note/path/global expansion fails before
+enqueue or side effects. This is deliberately narrower than coordinator reentrancy: ordinary nested
+`run`/`runStable` calls remain forbidden, a manually acquired causal-publication lease does not gain
+async-local reuse, and every nested callback admitted before its parent finishes is joined to the
+lease lifetime. A detached descendant that has not entered by that boundary loses coverage instead
+of reviving the expired parent scope.
+
+Strict Owned Ability operations compose that scope in one host-owned order. The server projects the
+candidate root, enters `withExactNoteClaim`, checks that the claimed note still stands at the package
+address the caller named and carries a version token, and only then lets RoleLibrary acquire shared
+capture or exclusive placement/package admission. Path equality is the whole binding here: the note's
+class follows from its mount, and the store already refuses an observation that escapes the claim it
+named, so neither is asked a second time. A capture
+returns immutable registry plus manifest identity and releases both scopes before access, detail, or
+dependency reads. A mutation reopens only that captured target and retains `Core exact → RoleLibrary`
+through the physical or metadata task; RoleLibrary never calls the note projection from inside its
+admission. An authored semantic no-op uses the same fresh scope to compare the caller token and returns
+`skipped` without a synthetic store write, revision, graph event, or host finalize effect.
+The locator-to-registry capture may still scan the cached `skill` metadata projection; that discovery
+cost is reported separately from exact work. A hidden `skill` edit does not checkpoint or reconcile
+the corpus, invoke an engine graph derivation, advance the user-graph revision, or invalidate a warm
+graph-health result.
 
 A direct read takes a storage checkpoint before engine I/O and its identity, preview, or edge repair. A stable note-id continues to mean that note if its former path is reused, while path/title resolvers are resolved again after earlier queued mutations. A bare-engine body can reveal a new frontmatter identity even for an already-materialized note: the first pass only discovers it, then repeats the read under a stable claim expanded with every disclosed id before applying rekey/preview/edges. Mutation admission remains closed across those passes, so neither an already-admitted forced-id operation nor a later caller can cross the identity transition, while reads of independent known notes retain narrow-claim parallelism. Read and mutation admission alternate in fair cohorts: once the opposite side is waiting, later peers cannot extend the active cohort, and mutation admission is released as soon as the narrow resource claim is queued rather than after engine I/O. An otherwise unresolved engine resolver still takes the rare global checkpoint. A cold raw-file preview fill takes the note/path checkpoint as well, so a delayed old fill cannot overwrite a newer write-through preview.
 

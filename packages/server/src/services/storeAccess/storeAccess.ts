@@ -86,7 +86,6 @@ export const readNoteAccess = async (
   principal: Principal,
   id: string,
   action: Action,
-  options?: { resourceAdmitted?: boolean },
 ): Promise<LiveNoteAccess | null> => {
   const hit = await access.noteStore(principal, id, action)
 
@@ -96,9 +95,7 @@ export const readNoteAccess = async (
   let note: Awaited<ReturnType<typeof hit.store.read>>
 
   try {
-    note = await (options?.resourceAdmitted
-      ? hit.store.read(id, { resourceAdmitted: true })
-      : hit.store.read(id))
+    note = await hit.store.read(id)
   } catch (error) {
     if ((error as { isNotFound?: boolean }).isNotFound) {
       return null

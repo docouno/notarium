@@ -100,14 +100,31 @@ the physical receipt and outbox event, and stores the terminal response.
 The authority reaches storage through its own named view, never the whole port:
 a three-operation inventory — enumerate, read, tell a directory from a file — plus the
 physical-byte capabilities it depends on, each present or absent on its own. Exact
-observation, claim-bound publication, claimed removal, aggregate package publication and
-the restart-durable strict protocol are five separate declarations, so an adapter that can
-observe but not publish, or publish single resources but not install a package, says
-exactly that. A missing one refuses the operation it names — `OBSERVATION_UNAVAILABLE`,
+observation, claim-bound publication, claimed removal, conditional proof-bound directory
+movement, aggregate package publication and the restart-durable strict protocol are six
+separate declarations, so an adapter that can observe but not publish, or publish single
+resources but not install a package, says exactly that. A missing one refuses the operation it names — `OBSERVATION_UNAVAILABLE`,
 `PUBLICATION_UNAVAILABLE`, `PACKAGE_PUBLICATION_UNAVAILABLE`,
-`STRICT_PUBLICATION_UNAVAILABLE` — and leaves the rest working. Note writes and directory
-moves are not reachable from this view at all: they belong to the note store, and one
-adapter offering two unadmitted routes to the same bytes is what the split removes. Recovery can
+`STRICT_PUBLICATION_UNAVAILABLE` — and leaves the rest working. Note writes are not reachable from this view at all: they belong to the note store, and one
+adapter offering two unadmitted routes to the same bytes is what the split removes. The one
+namespace transition the authority does name is deliberately narrow: a package placement move
+must prove that the moved directory carries the exact physical incarnation of the manifest
+that was admitted at its source path, and only the adapter holding that resource can prove it.
+So the facet is conditional and proof-bound — it takes the source claim, returns a proof of the
+transition itself, and reports a transition it could not undo as a typed committed error. That
+returned proof is opaque: only the adapter that minted it can read it, and it names both the moved
+resource and the directory that carried it. A plain file claim cannot stand in, because a manifest
+hardlinked into a stranger's directory answers one just as truthfully from either side of a swap —
+and the obvious cheaper test, refusing a proof whose file has more than one link, does not work: the
+kernel's change stamp is coarse enough that linking and unlinking inside one tick leaves the claim
+untouched. Directory identity is what the transition is conditioned on, so strict observation grew a
+second, opt-in flavour that names the containing directory; the plain one is unchanged, because its
+claims are durable restore evidence compared by raw equality across restarts. The facet accepts
+nothing else: a proof over the resource alone is refused as a malformed request rather than answered
+with a guess, since the question "move the directory holding this resource" has no truthful answer
+while a stranger's directory can present a hardlink of it.
+An adapter that renames directories but cannot prove a contained resource's continuity omits
+the facet rather than emulating it; a generic directory move stays outside this view. Recovery can
 resume every accepted phase after process exit; replay returns the stored result and
 never appends a second revision.
 

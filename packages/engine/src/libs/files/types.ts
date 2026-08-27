@@ -278,11 +278,73 @@ export type FileDirectoryNoReplaceMove = {
   renameDirIfAbsent(from: string, to: string): Promise<boolean>
 }
 
+export type FileConditionalDirectoryMoveRequest = {
+  sourcePath: string
+  targetPath: string
+  /** A regular resource below `sourcePath` whose physical incarnation identifies
+   *  the directory transition. The claim is valid only at this original path;
+   *  the adapter owns carrying that incarnation through the move. */
+  sourceProofPath: string
+  /** Either an observation claim over that resource — which binds the resource
+   *  only, because a caller that has moved nothing has no directory to be held
+   *  to — or a `targetProof` from an earlier `moved` result, which additionally
+   *  binds the directory that transition moved and makes a reverse move refuse
+   *  any other directory now holding the source pathname. */
+  expectedSourceProof: FileClaim & { kind: 'present' }
+}
+
+export type FileConditionalDirectoryMoveResult =
+  | {
+      status: 'moved'
+      /** An opaque proof of THIS transition, minted at the target: the adapter
+       *  binds both the carried resource and the identity of the directory that
+       *  carried it. Feeding it back as `expectedSourceProof` therefore names the
+       *  directory the caller moved, which a claim over the resource alone cannot
+       *  do — a hardlinked twin of that resource in a stranger's directory answers
+       *  every question a file claim asks. Only the minting adapter can read it. */
+      targetProof: FileClaim & { kind: 'present' }
+    }
+  /** Destination was occupied; no source→target transition occurred. */
+  | { status: 'occupied' }
+  /** Source proof changed. Any attempted transition was restored to source. */
+  | { status: 'conflict' }
+  | {
+      /** The source→target directory transition remains committed after a proof
+       *  failure because the adapter could not safely restore the source path. */
+      status: 'committed-error'
+      reason: string
+    }
+
+/** Bind an opaque claim at one source resource to an atomic directory
+ * no-replace transition. This is deliberately separate from the generic
+ * directory move facet: adapters that can rename directories but cannot prove
+ * a contained resource's physical continuity omit it rather than emulate it. */
+export type FileConditionalDirectoryMove = {
+  /** Thrown errors are pre-commit or follow a proven source restoration. Every
+   *  failure that leaves the requested transition at target is a typed
+   *  `committed-error` result, so lifecycle owners never have to guess. */
+  moveIfClaimed(
+    request: FileConditionalDirectoryMoveRequest,
+  ): Promise<FileConditionalDirectoryMoveResult>
+}
+
 /** Exact physical observation for provenance-sensitive operations. Unlike
  *  `FileExactRead`, this distinguishes absence from an occupied non-regular path
  *  and binds bytes/change claim/mtime to one stable adapter sample. */
 export type FileResourceObservation = {
-  observe(path: string, options?: { maxBytes?: number }): Promise<FileObservation>
+  /** `bindDirectory` asks the adapter to sample the identity of the directory
+   *  that held the pathname during the observation and carry it INSIDE the
+   *  present claim. A claim over a resource alone cannot say which directory it
+   *  was in — a hardlinked twin in a stranger's directory answers dev, ino,
+   *  ctime, size and bytes identically — so a caller that will condition a
+   *  DIRECTORY transition on this observation has to ask for it here, where the
+   *  two facts are sampled together. Every other caller gets the same claim it
+   *  always got: the binding is opt-in because it makes the claim additionally
+   *  sensitive to the containing directory being replaced. */
+  observe(
+    path: string,
+    options?: { maxBytes?: number; bindDirectory?: boolean },
+  ): Promise<FileObservation>
 }
 
 /** Atomically publish against adapter claims and return proof transitions
@@ -363,6 +425,7 @@ export type FileStoreCapabilities = {
   entryIdentity?: FileEntryIdentity
   fileNoReplaceMove?: FileNoReplaceMove
   directoryNoReplaceMove?: FileDirectoryNoReplaceMove
+  conditionalDirectoryMove?: FileConditionalDirectoryMove
   resourceObservation?: FileResourceObservation
   resourcePublication?: FileResourcePublication
   claimedRemoval?: FileClaimedRemoval

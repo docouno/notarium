@@ -59,6 +59,7 @@ import {
 } from '../../services/projects'
 import {
   createFsRoleLibrary,
+  createProjectedRolePackageScope,
   createRolesService,
   inMemoryAbilityPersistence,
   loadBundledAbilityInventory,
@@ -628,6 +629,7 @@ export const createServer = async ({
           : null
       },
       rootForSpace: skillRootForSpace,
+      withProjectedRolePackage: createProjectedRolePackageScope((space) => manager.store(space)),
       projectPublishedPackages: async (space, packages, options) => {
         const store = await manager.store(space)
 
@@ -659,11 +661,7 @@ export const createServer = async ({
           if (!note?.id) {
             continue
           }
-          const readable = await store.read(note.id)
-
-          if (readable.filePath === pkg.filePath) {
-            projected.set(pkg.directoryName, note.id)
-          }
+          projected.set(pkg.directoryName, note.id)
         }
 
         return projected

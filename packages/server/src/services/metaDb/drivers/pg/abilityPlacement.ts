@@ -123,10 +123,17 @@ export const createAbilityPlacementFacet = (ctx: PgDriverCtx): AbilityPlacementP
       //      pointed OUT of it belongs to the placement this package just undid;
       //   2. whatever pointed AT the source now points at the destination, so the
       //      trail stays one hop deep and no reader ever walks a chain;
-      //   3. the source itself starts forwarding.
+      //   3. the source itself starts forwarding — but ONLY for a `record`.
       //
       // (1) before (2) is what keeps a promotion undone by hand from writing a row
       // that forwards an address to itself.
+      //
+      // A `cancel` stops after (2), and (1) is what makes it an erasure: this move
+      // walks the package back along a hop its caller recorded, so that hop is the
+      // destination's own forwarding and deleting it IS the undo. The alternative —
+      // (3) writing the counter-hop — leaves a row only a further compensating step can
+      // remove, and every trail row is read fail-closed; an interrupted compensation
+      // then left the package tombstoned at the address it actually stands at.
       const space = abilitySpaceOfLocator(move.fromLocator)
 
       if (space !== null) {
@@ -139,16 +146,18 @@ export const createAbilityPlacementFacet = (ctx: PgDriverCtx): AbilityPlacementP
             WHERE to_locator = $4`,
           [move.toLocator, move.registryNoteId, move.manifestNoteId, move.fromLocator],
         )
-        await client.query(
-          `INSERT INTO ability_placement_trail
-             (from_locator, to_locator, space_id, registry_note_id, manifest_note_id)
-           VALUES ($1, $2, $3, $4, $5)
-           ON CONFLICT (from_locator) DO UPDATE SET
-             to_locator = excluded.to_locator,
-             registry_note_id = excluded.registry_note_id,
-             manifest_note_id = excluded.manifest_note_id`,
-          [move.fromLocator, move.toLocator, space, move.registryNoteId, move.manifestNoteId],
-        )
+        if (move.trail === 'record') {
+          await client.query(
+            `INSERT INTO ability_placement_trail
+               (from_locator, to_locator, space_id, registry_note_id, manifest_note_id)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (from_locator) DO UPDATE SET
+               to_locator = excluded.to_locator,
+               registry_note_id = excluded.registry_note_id,
+               manifest_note_id = excluded.manifest_note_id`,
+            [move.fromLocator, move.toLocator, space, move.registryNoteId, move.manifestNoteId],
+          )
+        }
       }
 
       // Exact resume is fail-closed by design, so an episode left on the old locator

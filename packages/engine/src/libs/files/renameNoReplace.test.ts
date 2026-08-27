@@ -309,8 +309,8 @@ describe('the runtime facts reach the decision', () => {
     },
   )
 
-  /** Which of the primitive's three dependents the freshly built adapter declares.
-   *  Asked as one object so a partial answer fails as a partial answer: the three
+  /** Which of the primitive's four dependents the freshly built adapter declares.
+   *  Asked as one object so a partial answer fails as a partial answer: the four
    *  rest on the SAME runtime fact, and any build where they disagree is
    *  advertising an operation the host cannot perform. */
   const declaredNoReplaceFacets = (): Record<string, boolean> => {
@@ -318,6 +318,7 @@ describe('the runtime facts reach the decision', () => {
 
     return {
       directoryNoReplaceMove: Object.hasOwn(capabilities, 'directoryNoReplaceMove'),
+      conditionalDirectoryMove: Object.hasOwn(capabilities, 'conditionalDirectoryMove'),
       packagePublication: Object.hasOwn(capabilities, 'packagePublication'),
       strictPublication: Object.hasOwn(capabilities, 'strictPublication'),
     }
@@ -340,6 +341,7 @@ describe('the runtime facts reach the decision', () => {
 
         expect(declaredNoReplaceFacets()).toEqual({
           directoryNoReplaceMove: declared,
+          conditionalDirectoryMove: declared,
           packagePublication: declared,
           strictPublication: declared,
         })
@@ -353,6 +355,7 @@ describe('the runtime facts reach the decision', () => {
 
       expect(declaredNoReplaceFacets()).toEqual({
         directoryNoReplaceMove: false,
+        conditionalDirectoryMove: false,
         packagePublication: false,
         strictPublication: false,
       })

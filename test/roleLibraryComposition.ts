@@ -12,6 +12,7 @@ import {
   type RoleLibraryComposition,
   type RoleLocation,
   type RolePackagePublication,
+  type RolePackageTarget,
   type SkillPackage,
 } from '../packages/server/src/services/roles'
 
@@ -22,6 +23,18 @@ export type WritableRoleLibrary = RoleLibrary & {
     to: RoleLocation,
     directoryName: string,
     finalize?: (evidence: { manifestNoteId: string | null }) => Promise<void>,
+    /** The third lifecycle hook, observable for the same reason the other two are.
+     *  `rollback` is what a caller undoes its OWN durable state with — the reach row,
+     *  the placement trail — so a fixture that swallows it proves the bytes moved back
+     *  and nothing about the state that describes where they are. Every path that
+     *  restores the source has to call it, and a default no-op cannot say which did. */
+    rollback?: () => Promise<void>,
+    /** The identity the move revalidates, when a case needs it observed EARLIER than
+     *  the move. Production captures its target long before `moveFrom` — a reach row
+     *  and a placement trail are written in between — so a driver that always
+     *  recaptured here would hand the move two observations of one moment, and no
+     *  case behind it could express a package that changed under its caller. */
+    expected?: RolePackageTarget,
   ): Promise<boolean>
   /** The two dependencies `createRolesService` takes, carried alongside so a suite
    *  that writes through this wrapper cannot hand the service a DIFFERENT
@@ -45,8 +58,29 @@ export const writableLibrary = (composition: RoleLibraryComposition): WritableRo
   putIfAbsent: async (location, pkg) => (await handleFor(composition, location)).putIfAbsent(pkg),
   // The destination owns the move, and the source rides along as a parameter —
   // the same asymmetry the handle itself carries.
-  movePackage: async (from, to, directoryName, finalize = async () => undefined) => {
-    return (await handleFor(composition, to)).moveFrom(from, directoryName, null, finalize)
+  movePackage: async (
+    from,
+    to,
+    directoryName,
+    finalize = async () => undefined,
+    rollback = async () => undefined,
+    expected,
+  ) => {
+    const handle = await handleFor(composition, to)
+    const captured =
+      expected ?? (await composition.library.captureExactPackage(from, directoryName))
+    const target = captured ?? {
+      kind: 'role' as const,
+      registryNoteId: directoryName,
+      manifestNoteId: directoryName,
+    }
+    const result = await handle.moveFrom(from, directoryName, target, {
+      beforeMove: async () => undefined,
+      finalize: (snapshot) => finalize({ manifestNoteId: snapshot.manifestNoteId }),
+      rollback,
+    })
+
+    return result.status === 'moved'
   },
 })
 
@@ -69,11 +103,11 @@ export const interceptPublication = (
       from: RoleLocation,
       directoryName: string,
       expected: Parameters<RolePackagePublication['moveFrom']>[2],
-      finalize: (evidence: { manifestNoteId: string | null }) => Promise<void>,
+      lifecycle: Parameters<RolePackagePublication['moveFrom']>[3],
       next: (
-        finalize?: (evidence: { manifestNoteId: string | null }) => Promise<void>,
-      ) => Promise<boolean>,
-    ) => Promise<boolean>
+        lifecycle?: Parameters<RolePackagePublication['moveFrom']>[3],
+      ) => ReturnType<RolePackagePublication['moveFrom']>,
+    ) => ReturnType<RolePackagePublication['moveFrom']>
   },
 ): RoleLibraryComposition => ({
   library: composition.library,
@@ -91,17 +125,17 @@ export const interceptPublication = (
           intercept.putIfAbsent
             ? intercept.putIfAbsent(location, pkg, () => handle.putIfAbsent(pkg))
             : handle.putIfAbsent(pkg),
-        moveFrom: (from, directoryName, expected, finalize) =>
+        moveFrom: (from, directoryName, expected, lifecycle) =>
           intercept.moveFrom
             ? intercept.moveFrom(
                 location,
                 from,
                 directoryName,
                 expected,
-                finalize,
-                (selected = finalize) => handle.moveFrom(from, directoryName, expected, selected),
+                lifecycle,
+                (selected = lifecycle) => handle.moveFrom(from, directoryName, expected, selected),
               )
-            : handle.moveFrom(from, directoryName, expected, finalize),
+            : handle.moveFrom(from, directoryName, expected, lifecycle),
       }
     },
   },

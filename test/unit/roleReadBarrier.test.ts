@@ -87,7 +87,6 @@ describe('RolesService — which questions pay for the publication barrier', () 
   it('does not cross it for any read of an already published role', async () => {
     const role = await roles.createCustomRole('review', 'Team review.', 'The team way.', SPACE)
     const locator = spaceRoleLocator(role.packageId)
-
     crossings = []
 
     // Each read is asserted to have ANSWERED. A read that returned null early would
@@ -119,11 +118,17 @@ describe('RolesService — which questions pay for the publication barrier', () 
 
     crossings = []
 
+    // Inside the window, not before it: resolving the exact target is the FIRST step
+    // of every one of these writes, and a step measured outside the window is a step
+    // whose barrier nobody counts.
+    const target = await roles.captureCurrentOwnedTarget(locator, SYSTEM_PRINCIPAL)
+
+    expect(target).not.toBeNull()
     // These two WRITE — to durable rows, not to the library — and they still may not
     // stop the space. A toggle that reconciles the whole placement is how one user
     // switching a role off blocks every other writer in the Space.
-    await roles.setEnabled(CONTEXT, SYSTEM_PRINCIPAL, locator, false)
-    await roles.setAbilityAvailability(CONTEXT, SYSTEM_PRINCIPAL, locator, {
+    await roles.setEnabled(CONTEXT, SYSTEM_PRINCIPAL, target!, false)
+    await roles.setAbilityAvailability(CONTEXT, SYSTEM_PRINCIPAL, target!, {
       mode: 'all-projects',
     })
 

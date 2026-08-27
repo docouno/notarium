@@ -638,9 +638,6 @@ export type ReadOptions = {
    *  lease, so a physical read must use admitted observations instead of trying
    *  to acquire that lease recursively. */
   resourceAdmitted?: boolean
-  /** Trusted host hint: the caller is inside this store's MutationCoordinator
-   * claim and needs an exact verification read without reacquiring that claim. */
-  mutationClaimed?: boolean
 }
 
 /** A note's Feed-card enrichment: snippet, first image, tags, word count, and a model-agnostic

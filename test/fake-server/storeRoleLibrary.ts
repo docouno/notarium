@@ -9,13 +9,16 @@ import {
   READ_SCOPE,
 } from '@notarium/core'
 import {
+  AbilityUnavailableError,
   InvalidSkillPackageError,
   isResolvableAbilityManifest,
   parseSkillFile,
   type RoleLibrary,
   type RoleLibraryListing,
   type RoleLocation,
+  rolePackageMoveRollbackError,
   type RolePackagePublication,
+  type RolePackageSnapshot,
   type SeedableRoleLibraryComposition,
   type SkillPackage,
   validateSkillPackage,
@@ -114,7 +117,6 @@ export const createStoreRoleLibrary = (
   const packageByDirectory = async (
     location: RoleLocation,
     directoryName: string,
-    mutationClaimed = false,
   ): Promise<SkillPackage | null> => {
     const store = await storeForSpace(location.space)
     const root = packageRoot(location, directoryName)
@@ -130,10 +132,7 @@ export const createStoreRoleLibrary = (
         continue
       }
       const relative = note.filePath.slice(root.length + 1)
-      const content = await store.read(
-        note.id ?? note.filePath,
-        mutationClaimed ? { mutationClaimed: true } : undefined,
-      )
+      const content = await store.read(note.id ?? note.filePath)
       const source = content.documentState?.source
 
       if (source) {
@@ -238,6 +237,88 @@ export const createStoreRoleLibrary = (
     return projected
   }
 
+  const withExactPackageScope = async <T>(
+    location: RoleLocation,
+    directoryName: string,
+    expectedRegistryNoteId: string | undefined,
+    task: (snapshot: RolePackageSnapshot) => Promise<T>,
+  ): Promise<T | null> => {
+    const store = await storeForSpace(location.space)
+    const filePath = `${packageRoot(location, directoryName)}/SKILL.md`
+    const registryNoteId =
+      expectedRegistryNoteId ??
+      (await store.list({ scope: READ_SCOPE.all, classes: [NOTE_CLASS.skill] })).find(
+        (candidate) => candidate.filePath === filePath,
+      )?.id
+
+    if (!registryNoteId) {
+      return null
+    }
+    const project = async (current: Awaited<ReturnType<KnowledgeStore['read']>>) => {
+      const manifest = current.documentState?.source
+
+      if (
+        !manifest ||
+        !current.versionToken ||
+        current.id !== registryNoteId ||
+        current.filePath !== filePath
+      ) {
+        return null
+      }
+      let parsed
+
+      try {
+        parsed = parseSkillFile(Buffer.from(manifest).toString('utf8'), directoryName)
+      } catch {
+        return null
+      }
+      const owner = exactOwnerObservation(manifest)
+
+      return owner.kind === 'claimed'
+        ? task({
+            registryNoteId,
+            filePath,
+            versionToken: current.versionToken,
+            kind: parsed.role ? ABILITY_KIND.role : ABILITY_KIND.skill,
+            manifestNoteId: owner.id,
+            pkg: {
+              directoryName,
+              files: new Map([['SKILL.md', Uint8Array.from(manifest)]]),
+            },
+          })
+        : null
+    }
+    const exactStore = store as KnowledgeStore & {
+      withExactNoteClaim?<Result>(
+        noteId: string,
+        task: (current: Awaited<ReturnType<KnowledgeStore['read']>>) => Promise<Result>,
+      ): Promise<Result>
+    }
+
+    try {
+      return exactStore.withExactNoteClaim
+        ? await exactStore.withExactNoteClaim(registryNoteId, project)
+        : await project(await store.read(registryNoteId))
+    } catch (error) {
+      if ((error as { isNotFound?: unknown }).isNotFound === true) {
+        return null
+      }
+      throw error
+    }
+  }
+
+  const captureExactPackage = (
+    location: RoleLocation,
+    directoryName: string,
+    expectedRegistryNoteId?: string,
+  ): Promise<RolePackageSnapshot | null> =>
+    withExactPackageScope(
+      location,
+      directoryName,
+      expectedRegistryNoteId,
+      async (snapshot) => snapshot,
+    )
+
   const listing = async (location: RoleLocation): Promise<RoleLibraryListing> => {
     const all = await packagesAt(location)
     const limit = Math.max(0, maxPackages() ?? MAX_LIBRARY_PACKAGES)
@@ -330,89 +411,124 @@ export const createStoreRoleLibrary = (
     to: RoleLocation,
     directoryName: string,
     expected: Parameters<RolePackagePublication['moveFrom']>[2],
-    finalize: (evidence: { manifestNoteId: string | null }) => Promise<void>,
-  ): Promise<boolean> => {
+    lifecycle: Parameters<RolePackagePublication['moveFrom']>[3],
+  ): ReturnType<RolePackagePublication['moveFrom']> => {
     if (from.space !== to.space) {
       throw new Error('a package move cannot cross spaces')
     }
-    const pkg = await packageByDirectory(from, directoryName)
-    const name = pkg && parsedName(pkg)
-    const manifest = pkg?.files.get('SKILL.md')
-    const parsed = manifest
-      ? parseSkillFile(Buffer.from(manifest).toString('utf8'), directoryName)
-      : null
-    const owner = manifest ? exactOwnerObservation(manifest) : { kind: 'unproven' as const }
-    const registryNoteId = (await noteIdsAt(from, [directoryName])).get(directoryName)
+    const snapshot = await captureExactPackage(from, directoryName, expected.registryNoteId)
 
-    if (!pkg || !name || !parsed) {
-      return false
+    if (!snapshot) {
+      return { status: 'missing' }
     }
     if (
-      expected &&
-      ((parsed.role ? ABILITY_KIND.role : ABILITY_KIND.skill) !== expected.kind ||
-        registryNoteId !== expected.registryNoteId ||
-        owner.kind !== 'claimed' ||
-        owner.id !== expected.manifestNoteId)
+      snapshot.kind !== expected.kind ||
+      snapshot.registryNoteId !== expected.registryNoteId ||
+      snapshot.manifestNoteId !== expected.manifestNoteId
     ) {
-      return false
+      throw new AbilityUnavailableError('ability package changed before move')
     }
-    if (
-      (await packageByDirectory(to, directoryName)) != null ||
-      (await packageByName(to, name)) != null
-    ) {
-      return false
-    }
-    const store = await storeForSpace(from.space)
-    const notes = await store.list({ scope: READ_SCOPE.all, classes: [NOTE_CLASS.skill] })
-    const sourceRoot = packageRoot(from, directoryName)
-    const targetRoot = packageRoot(to, directoryName)
+    const name = parsedName(snapshot.pkg)
 
-    // Production moves the directory and lets identity survive the path change on
-    // the frontmatter claim. The fake has no filesystem, so it re-addresses each
-    // member BY ITS EXISTING ID — same guarantee, stated instead of inherited.
-    for (const note of notes) {
-      if (!note.filePath?.startsWith(`${sourceRoot}/`) || !note.id) {
-        continue
+    if (!name) {
+      return { status: 'missing' }
+    }
+
+    return claimPlacement(to, async () => {
+      if (
+        (await packageByDirectory(to, directoryName)) != null ||
+        (await packageByName(to, name)) != null
+      ) {
+        return { status: 'occupied', snapshot } as const
       }
-      const relative = note.filePath.slice(sourceRoot.length + 1)
-      const content = await store.read(note.id)
-      const projection = content.documentState?.projection
+      const store = await storeForSpace(from.space)
+      const notes = await store.list({ scope: READ_SCOPE.all, classes: [NOTE_CLASS.skill] })
+      const sourceRoot = packageRoot(from, directoryName)
+      const targetRoot = packageRoot(to, directoryName)
+      const members = notes
+        .filter(
+          (note): note is typeof note & { filePath: string; id: string } =>
+            note.filePath?.startsWith(`${sourceRoot}/`) === true && note.id != null,
+        )
+        .sort((left, right) =>
+          left.filePath === `${sourceRoot}/SKILL.md`
+            ? -1
+            : right.filePath === `${sourceRoot}/SKILL.md`
+              ? 1
+              : left.filePath.localeCompare(right.filePath),
+        )
 
-      if (!projection) {
-        throw new Error(`fake role package member is unreadable: ${note.filePath}`)
+      if (members[0]?.filePath !== `${sourceRoot}/SKILL.md`) {
+        throw new AbilityUnavailableError('ability package changed before move')
       }
-      await store.write(
-        {
-          id: note.id,
-          originalId: note.id,
-          versionToken: content.versionToken,
-          title: content.title ?? projection.title,
-          content: projection.body,
-          frontmatter: projection.frontmatterEntries,
-          frontmatterMode: 'replace',
-          targetClass: NOTE_CLASS.skill,
-          restorePath: `${targetRoot}/${relative}`,
-        },
-        { internalAddress: true },
-      )
-    }
-    // The non-note members move with the directory, exactly as they do on disk.
-    for (const [relative, bytes] of resourcesUnder(from.space, sourceRoot)) {
-      resources.delete(resourceKey(from.space, `${sourceRoot}/${relative}`))
-      resources.set(resourceKey(to.space, `${targetRoot}/${relative}`), bytes)
-    }
+      await lifecycle.beforeMove(snapshot)
+      let physicalMoveStarted = false
 
-    try {
-      await finalize({ manifestNoteId: owner.kind === 'claimed' ? owner.id : null })
-      return true
-    } catch (error) {
-      const restored = await movePackage(to, from, directoryName, expected, async () => undefined)
+      try {
+        // Production moves the directory and lets identity survive the path change on
+        // the frontmatter claim. The fake has no filesystem, so it re-addresses each
+        // member BY ITS EXISTING ID. The root uses the version and bytes captured under
+        // the exact scope above — never a fresh token read after release — so the Store
+        // CAS rejects a same-path replacement before lifecycle finalize.
+        for (const note of members) {
+          const relative = note.filePath.slice(sourceRoot.length + 1)
+          const content = await store.read(note.id)
+          const capturedManifest =
+            relative === 'SKILL.md' ? snapshot.pkg.files.get('SKILL.md') : undefined
+          const projection = capturedManifest
+            ? analyzeDocumentState({
+                source: capturedManifest,
+                role: DOCUMENT_ROLE.skillRoot,
+                pathFallbackTitle: content.title ?? 'SKILL',
+                skillDirectoryName: directoryName,
+              }).projection
+            : content.documentState?.projection
 
-      if (!restored) {
+          if (!projection) {
+            throw new Error(`fake role package member is unreadable: ${note.filePath}`)
+          }
+          await store.write(
+            {
+              id: note.id,
+              originalId: note.id,
+              versionToken: relative === 'SKILL.md' ? snapshot.versionToken : content.versionToken,
+              title: content.title ?? projection.title,
+              content: projection.body,
+              frontmatter: projection.frontmatterEntries,
+              frontmatterMode: 'replace',
+              targetClass: NOTE_CLASS.skill,
+              restorePath: `${targetRoot}/${relative}`,
+            },
+            { internalAddress: true },
+          )
+          physicalMoveStarted ||= relative === 'SKILL.md'
+        }
+        // The non-note members move with the directory, exactly as they do on disk.
+        for (const [relative, bytes] of resourcesUnder(from.space, sourceRoot)) {
+          resources.delete(resourceKey(from.space, `${sourceRoot}/${relative}`))
+          resources.set(resourceKey(to.space, `${targetRoot}/${relative}`), bytes)
+        }
+
+        await lifecycle.finalize(snapshot)
+        return { status: 'moved', snapshot } as const
+      } catch (error) {
+        if (!physicalMoveStarted) {
+          await lifecycle.rollback()
+          throw error
+        }
+        const restored = await movePackage(to, from, directoryName, expected, {
+          beforeMove: async () => undefined,
+          finalize: async () => undefined,
+          rollback: async () => undefined,
+        })
+
+        if (restored.status !== 'moved') {
+          throw rolePackageMoveRollbackError(error)
+        }
+        await lifecycle.rollback()
         throw error
       }
-      throw error
-    }
+    })
   }
 
   const library: RoleLibrary = {
@@ -442,21 +558,12 @@ export const createStoreRoleLibrary = (
         ? { directoryName: pkg.directoryName, files: new Map([['SKILL.md', manifest]]) }
         : null
     },
-    withExactPackageRead: async (location, directoryName, task) =>
-      task(async () => {
-        const pkg = await packageByDirectory(location, directoryName)
-        const registryNoteId = (await noteIdsAt(location, [directoryName])).get(directoryName)
-
-        return pkg && registryNoteId ? { pkg: clone(pkg), registryNoteId } : null
-      }),
-    withExactPackageMutation: async (location, directoryName, task) =>
-      claimPlacement(location, () =>
-        task(async () => {
-          const pkg = await packageByDirectory(location, directoryName, true)
-          const registryNoteId = (await noteIdsAt(location, [directoryName])).get(directoryName)
-
-          return pkg && registryNoteId ? { pkg: clone(pkg), registryNoteId } : null
-        }),
+    captureExactPackage,
+    withExactPackageMutation: (location, directoryName, expected, task) =>
+      withExactPackageScope(location, directoryName, expected.registryNoteId, async (captured) =>
+        captured.kind === expected.kind && captured.manifestNoteId === expected.manifestNoteId
+          ? claimPlacement(location, () => task(captured))
+          : null,
       ),
     // A name no package may carry occupies nothing. Asked here, ahead of any lookup,
     // exactly where the shipped library asks it: a fake that answered `true` for a
@@ -486,20 +593,23 @@ export const createStoreRoleLibrary = (
     readableNoteIds: async (location, directoryNames) => noteIdsAt(location, directoryNames),
     inspectAndRemove: async (location, directoryName, options) => {
       let found = false
+      const root = packageRoot(location, directoryName)
+      const captured = await packageByDirectory(location, directoryName)
+      const files = captured
+        ? new Map<string, Uint8Array>([
+            ['SKILL.md', Uint8Array.from(captured.files.get('SKILL.md')!)],
+          ])
+        : null
 
-      await options.remove(async (victimNoteIds) => {
-        const root = packageRoot(location, directoryName)
-        const pkg = await packageByDirectory(location, directoryName, true)
-
-        if (!pkg) {
-          throw new Error('ability package changed before delete')
-        }
-        const files = new Map<string, Uint8Array>([
-          ['SKILL.md', Uint8Array.from(pkg.files.get('SKILL.md')!)],
-        ])
-
+      if (files) {
         for (const [relative, bytes] of resourcesUnder(location.space, root)) {
           files.set(relative, Uint8Array.from(bytes))
+        }
+      }
+
+      await options.remove(async (victimNoteIds) => {
+        if (!files) {
+          throw new Error('ability package changed before delete')
         }
         if (options.expected) {
           const manifest = files.get('SKILL.md')!
@@ -544,8 +654,8 @@ export const createStoreRoleLibrary = (
       availableFor: () => true,
       publicationFor: async (location) => ({
         putIfAbsent: (pkg) => putIfAbsent(location, pkg),
-        moveFrom: (origin, directoryName, expected, finalize) =>
-          movePackage(origin, location, directoryName, expected, finalize),
+        moveFrom: (origin, directoryName, expected, lifecycle) =>
+          movePackage(origin, location, directoryName, expected, lifecycle),
       }),
     },
   }

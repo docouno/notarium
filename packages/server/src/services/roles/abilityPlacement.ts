@@ -23,6 +23,7 @@ export const createInMemoryAbilityPlacement = (facets: {
       move.toLocator,
       move.registryNoteId,
       move.manifestNoteId,
+      move.trail,
     )
   },
 })

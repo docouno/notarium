@@ -30,11 +30,15 @@ import {
   SpaceResourceAuthorityRegistry,
 } from '@notarium/engine'
 import {
+  AbilityUnavailableError,
   createFsRoleLibrary,
   InvalidSkillPackageError,
+  isRolePackageMoveRollbackError,
   type PublishDirectoryIfAbsent,
   RoleInstallUnavailableError,
   type RoleLocation,
+  type SkillPackage,
+  type WithProjectedRolePackage,
 } from '../../packages/server/src/services/roles'
 import { isReclaimableInstallStaging } from '../../packages/server/src/services/roles/installStaging'
 import { writableLibrary } from '../roleLibraryComposition'
@@ -526,6 +530,56 @@ describe('role library promotion refusals', () => {
     await expect(entriesOf(mount)).resolves.toEqual([])
   })
 
+  /** Identity is one decision, and a composition root that answers it half-way is
+   *  refused at construction — before it has a library to hand anyone. Both halves
+   *  answer "which note id is readable at this package address": the bulk projection
+   *  for a listing, the exact scope for every capture and mutation. Configure one and
+   *  the two answer differently for the same package, silently. */
+  it('refuses a composition that projects package identity only half-way', () => {
+    const mount = 'unused-by-this-refusal'
+    const bulk = async () => new Map<string, string>()
+    const scope: WithProjectedRolePackage = async (_space, pkg, expectedRegistryNoteId, task) =>
+      task({
+        registryNoteId: expectedRegistryNoteId ?? pkg.directoryName,
+        filePath: pkg.filePath,
+        versionToken: 'registry-version',
+      })
+
+    // The bulk listing would speak the host's note ids; every strict path would speak
+    // package addresses.
+    expect(() =>
+      createFsRoleLibrary({
+        publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+        rootForSpace: () => mount,
+        projectPublishedPackages: bulk,
+      }),
+    ).toThrow(/one decision/)
+    // The mirror image, and the one nothing refused before: the strict paths would
+    // speak the host's note ids while the listing kept answering `directoryName`.
+    expect(() =>
+      createFsRoleLibrary({
+        publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+        rootForSpace: () => mount,
+        withProjectedRolePackage: scope,
+      }),
+    ).toThrow(/one decision/)
+    // Both halves, or neither, build.
+    expect(() =>
+      createFsRoleLibrary({
+        publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+        rootForSpace: () => mount,
+        projectPublishedPackages: bulk,
+        withProjectedRolePackage: scope,
+      }),
+    ).not.toThrow()
+    expect(() =>
+      createFsRoleLibrary({
+        publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+        rootForSpace: () => mount,
+      }),
+    ).not.toThrow()
+  })
+
   it('refuses two placements that are one, and a move across two spaces', async () => {
     const mount = await mkmount()
     const directoryName = packageDirectoryOf('wanted')
@@ -578,36 +632,28 @@ describe('role library promotion refusals', () => {
     async () => {
       const mount = await mkmount()
       const pkg = packageOf('wanted', 'Owned.')
+      const { authority, library } = admittedLibraryAt(mount)
 
-      // Seeded without an authority: the SOURCE is not what this case is about.
-      await expect(libraryAt(mount).putIfAbsent(PROJECT, pkg)).resolves.toBe(true)
+      await expect(library.putIfAbsent(PROJECT, pkg)).resolves.toBe(true)
 
       let release: () => void = () => {}
       const held = new Promise<void>((resolve) => {
         release = resolve
       })
       const asked: string[] = []
-      const authority = {
-        packagePublicationFor: () => ({
-          publishIfAbsent: async () => ({ status: 'conflict' as const }),
-        }),
-        admitSkillPlacement: async (path: string) => {
+      const admitPlacement = authority.admitSkillPlacement.bind(authority)
+
+      vi.spyOn(authority, 'admitSkillPlacement').mockImplementation(async (...args) => {
+        const path = args[0]
+        const owner = args[2]
+
+        if (owner === 'role-move-placement') {
           asked.push(path)
           await held
-          return { settle: () => {} }
-        },
-        admitPackage: async () => ({ settle: () => {} }),
-        // The reads this move makes on its way; only the leases are under test.
-        observe: async () => ({ kind: 'present', bytes: pkg.files.get('SKILL.md')! }),
-      }
-      const library = writableLibrary(
-        createFsRoleLibrary({
-          publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
-          rootForSpace: () => mount,
-          resourcePrefixForSpace: () => '',
-          authorityForSpace: () => authority as never,
-        }),
-      )
+        }
+
+        return admitPlacement(...args)
+      })
       const move = library.movePackage(PROJECT, PERSONAL, pkg.directoryName)
       const raced = await Promise.race([
         move.then(() => 'moved'),
@@ -621,7 +667,7 @@ describe('role library promotion refusals', () => {
       // only the per-package ones lets a move and a publication both find the manifest
       // name free and both take it.
       expect(raced).toBe('waiting')
-      expect(asked).toEqual([`${pkg.directoryName}/SKILL.md`])
+      expect(asked).toEqual([`${SKILL_PREFIX}/${pkg.directoryName}/SKILL.md`])
       release()
       await expect(move).resolves.toBe(true)
     },
@@ -649,8 +695,8 @@ describe('role library promotion refusals', () => {
       })
 
       await finalizing
-      const sourceRead = library.withExactPackageRead(PROJECT, pkg.directoryName, (read) => read())
-      const targetRead = library.withExactPackageRead(PERSONAL, pkg.directoryName, (read) => read())
+      const sourceRead = library.captureExactPackage(PROJECT, pkg.directoryName)
+      const targetRead = library.captureExactPackage(PERSONAL, pkg.directoryName)
       const raced = await Promise.race([
         Promise.all([sourceRead, targetRead]).then(() => 'read'),
         new Promise((resolve) => setTimeout(() => resolve('waiting'), 60)),
@@ -663,6 +709,569 @@ describe('role library promotion refusals', () => {
       await expect(targetRead).resolves.toMatchObject({
         pkg: { directoryName: pkg.directoryName },
         registryNoteId: pkg.directoryName,
+      })
+    },
+  )
+
+  itAtomicPublish(
+    'rejects a byte-identical new-inode replacement after source observation',
+    async () => {
+      const mount = await mkmount()
+      const registry = new SpaceResourceAuthorityRegistry()
+      const compositions = new NotariumStoreCompositionOwner()
+      const authority = ensureNotariumResourceAuthority({
+        spaceId: PERSONAL.space,
+        resourceAuthorityRegistry: registry,
+        composition: compositions.getOrCreate(PERSONAL.space, [
+          { class: 'skill', dir: mount, prefix: SKILL_PREFIX },
+        ]),
+      })
+      const original = packageOf('wanted', 'Original body.')
+      const source = join(projectRoot(mount), original.directoryName)
+      const displaced = join(mount, `.externally-displaced-${original.directoryName}.md`)
+      let replaced = false
+      const moveFor = authority.conditionalDirectoryMoveFor.bind(authority)
+
+      vi.spyOn(authority, 'conditionalDirectoryMoveFor').mockImplementation(
+        (sourcePath, targetPath, proofRelativePath) => {
+          const view = moveFor(sourcePath, targetPath, proofRelativePath)
+
+          return view
+            ? {
+                moveIfClaimed: async (expected) => {
+                  if (!replaced && sourcePath.includes(original.directoryName)) {
+                    replaced = true
+                    const manifest = join(source, 'SKILL.md')
+                    const bytes = await actualFs.readFile(manifest)
+
+                    await actualFs.rename(manifest, displaced)
+                    await actualFs.writeFile(manifest, bytes)
+                  }
+
+                  return view.moveIfClaimed(expected)
+                },
+              }
+            : null
+        },
+      )
+      const composition = createFsRoleLibrary({
+        publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+        rootForSpace: () => mount,
+        resourcePrefixForSpace: () => SKILL_PREFIX,
+        authorityForSpace: async () => authority,
+      })
+      const library = writableLibrary(composition)
+
+      await expect(library.putIfAbsent(PROJECT, original)).resolves.toBe(true)
+      const captured = await library.captureExactPackage(PROJECT, original.directoryName)
+      const publisher = await composition.publication.publicationFor(PERSONAL)
+      const events: string[] = []
+
+      expect(captured).not.toBeNull()
+      expect(publisher).not.toBeNull()
+      await expect(
+        publisher!.moveFrom(PROJECT, original.directoryName, captured!, {
+          beforeMove: async () => {
+            events.push('before')
+          },
+          finalize: async () => {
+            events.push('finalize')
+          },
+          rollback: async () => {
+            events.push('rollback')
+          },
+        }),
+      ).rejects.toBeInstanceOf(AbilityUnavailableError)
+
+      expect(replaced).toBe(true)
+      expect(events).toEqual(['before', 'rollback'])
+      await expect(library.getByDirectory(PERSONAL, original.directoryName)).resolves.toBeNull()
+      const restored = await library.getByDirectory(PROJECT, original.directoryName)
+
+      expect(restored!.files.get('SKILL.md')).toEqual(original.files.get('SKILL.md'))
+      const [oldManifest, replacementManifest] = await Promise.all([
+        actualFs.lstat(displaced, { bigint: true }),
+        actualFs.lstat(join(source, 'SKILL.md'), { bigint: true }),
+      ])
+
+      expect(replacementManifest.ino).not.toBe(oldManifest.ino)
+    },
+  )
+
+  /** A host whose adapter cannot bind a directory transition to a claim over the
+   *  manifest inside it can still RENAME the directory — which is exactly why this is
+   *  a refusal and not a fallback. Every other admission is in place here, so falling
+   *  through would publish the package at its new home with nothing proving the bytes
+   *  that arrived are the bytes that left, and the lifecycle would commit a reach row
+   *  and a placement trail around it. The move is refused before the first of the three
+   *  durable effects is written. */
+  itAtomicPublish('refuses a move no adapter can prove, before anything is written', async () => {
+    const mount = await mkmount()
+    const { authority, library } = admittedLibraryAt(mount)
+    const composition = createFsRoleLibrary({
+      publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+      rootForSpace: () => mount,
+      resourcePrefixForSpace: () => SKILL_PREFIX,
+      authorityForSpace: async () => authority,
+    })
+    const original = packageOf('wanted', 'Original body.')
+
+    await expect(library.putIfAbsent(PROJECT, original)).resolves.toBe(true)
+    const captured = await library.captureExactPackage(PROJECT, original.directoryName)
+    const publisher = await composition.publication.publicationFor(PERSONAL)
+
+    expect(captured).not.toBeNull()
+    expect(publisher).not.toBeNull()
+    // The capability, and only it: the placement and package admissions this move
+    // needs are all still granted, so nothing but the proof is missing.
+    vi.spyOn(authority, 'conditionalDirectoryMoveFor').mockReturnValue(null)
+    const events: string[] = []
+
+    await expect(
+      publisher!.moveFrom(PROJECT, original.directoryName, captured!, {
+        beforeMove: async () => {
+          events.push('before')
+        },
+        finalize: async () => {
+          events.push('finalize')
+        },
+        rollback: async () => {
+          events.push('rollback')
+        },
+      }),
+    ).rejects.toBeInstanceOf(RoleInstallUnavailableError)
+
+    // Refused, not half-done: the lifecycle was never entered, so there is no reach row
+    // and no trail to undo…
+    expect(events).toEqual([])
+    // …and the bytes are where they were, at the placement the caller asked to leave.
+    await expect(library.getByDirectory(PERSONAL, original.directoryName)).resolves.toBeNull()
+    await expect(library.getByDirectory(PROJECT, original.directoryName)).resolves.toMatchObject({
+      directoryName: original.directoryName,
+    })
+  })
+
+  /** The mirror of that refusal, on the host that has no projection at all. There the
+   *  package address is the only identity there is, so the snapshot has to carry the
+   *  path the package actually occupies under the library root — a host with no
+   *  resource prefix has no prefix to put in front of it, not "no path". The consumer
+   *  is real: an owned save compares this path with the note it is about to write. */
+  it('addresses a package by its own directory when the host projects nothing', async () => {
+    const mount = await mkmount()
+    const library = libraryAt(mount)
+    const original = packageOf('wanted', 'Original body.')
+
+    await expect(library.putIfAbsent(PERSONAL, original)).resolves.toBe(true)
+    await expect(
+      library.captureExactPackage(PERSONAL, original.directoryName),
+    ).resolves.toMatchObject({ filePath: `${original.directoryName}/SKILL.md` })
+  })
+
+  /** …and the composition that passes THAT check and is still incoherent: both halves of
+   *  the projection are wired, but the host names no resource prefix for the space, so
+   *  there is no address to project a package at. Answering with the bare directory name
+   *  would hand the exact scope a path that names nothing, and it would resolve — for
+   *  whatever note happens to sit at that path in the host's own coordinates. */
+  it('refuses to project a package the host has no resource address for', async () => {
+    const scope: WithProjectedRolePackage = async (_space, pkg, expectedRegistryNoteId, task) =>
+      task({
+        registryNoteId: expectedRegistryNoteId ?? pkg.directoryName,
+        filePath: pkg.filePath,
+        versionToken: 'registry-version',
+      })
+    const asked: string[] = []
+    const composition = createFsRoleLibrary({
+      publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+      rootForSpace: () => 'unused-by-this-refusal',
+      // The pair is complete, so construction is allowed — and the space still has no
+      // skill mount to address packages inside.
+      resourcePrefixForSpace: () => null,
+      projectPublishedPackages: async (_space, packages) => {
+        asked.push(...packages.map((pkg) => pkg.filePath))
+        return new Map<string, string>()
+      },
+      withProjectedRolePackage: async (space, pkg, expectedRegistryNoteId, task) => {
+        asked.push(pkg.filePath)
+        return scope(space, pkg, expectedRegistryNoteId, task)
+      },
+    })
+
+    await expect(
+      composition.library.captureExactPackage(PERSONAL, packageDirectoryOf('wanted')),
+    ).rejects.toThrow('role library has no projected resource path')
+    // Refused before the projection was asked anything: an address it cannot build is
+    // not an address it may guess at.
+    expect(asked).toEqual([])
+  })
+
+  /** A manifest that declares `notarium.skills` and is not a role cannot be resolved as
+   *  an ability at all, so the NAME it carries is not a name anything holds. The
+   *  destination check has to agree with `manifestIndex`, which already skips such a
+   *  package: disagreeing means a role can never be moved to a placement where some
+   *  unresolvable package happens to carry its name, and nothing the owner can do from
+   *  the outside would ever release it. */
+  itAtomicPublish('moves onto a name only an unresolvable manifest carries', async () => {
+    const mount = await mkmount()
+    const { authority, library } = admittedLibraryAt(mount)
+    const composition = createFsRoleLibrary({
+      publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+      rootForSpace: () => mount,
+      resourcePrefixForSpace: () => SKILL_PREFIX,
+      authorityForSpace: async () => authority,
+    })
+    const linkedDirectory = packageDirectoryOf('wanted-linked')
+    const unresolvable: SkillPackage = {
+      directoryName: linkedDirectory,
+      files: new Map([
+        [
+          'SKILL.md',
+          Buffer.from(
+            `---\nnotarium-id: ${linkedDirectory}\nname: wanted\ndescription: wanted.\nmetadata:\n  notarium.skills: linked\n---\n\nUnresolvable.\n`,
+          ),
+        ],
+      ]),
+    }
+    const original = packageOf('wanted', 'Original body.')
+
+    await expect(library.putIfAbsent(PERSONAL, unresolvable)).resolves.toBe(true)
+    await expect(library.putIfAbsent(PROJECT, original)).resolves.toBe(true)
+    const captured = await library.captureExactPackage(PROJECT, original.directoryName)
+    const publisher = await composition.publication.publicationFor(PERSONAL)
+
+    expect(captured).not.toBeNull()
+    expect(publisher).not.toBeNull()
+    await expect(
+      publisher!.moveFrom(PROJECT, original.directoryName, captured!, {
+        beforeMove: async () => undefined,
+        finalize: async () => undefined,
+        rollback: async () => undefined,
+      }),
+    ).resolves.toMatchObject({ status: 'moved' })
+    await expect(library.getByDirectory(PERSONAL, original.directoryName)).resolves.toMatchObject({
+      directoryName: original.directoryName,
+    })
+  })
+
+  /** The destination walk is bounded, and the bound is not decoration: it is a full
+   *  directory scan that reads one manifest per entry, run inside the move's own
+   *  admissions. Unbounded, a placement someone filled with entries turns every move
+   *  into an unbounded read under a lease the rest of the space queues behind. */
+  itAtomicPublish('refuses to walk a destination past its entry bound', async () => {
+    const mount = await mkmount()
+    const { authority, library } = admittedLibraryAt(mount)
+    const composition = createFsRoleLibrary({
+      publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+      rootForSpace: () => mount,
+      resourcePrefixForSpace: () => SKILL_PREFIX,
+      authorityForSpace: async () => authority,
+    })
+    const original = packageOf('wanted', 'Original body.')
+
+    await expect(library.putIfAbsent(PROJECT, original)).resolves.toBe(true)
+    const captured = await library.captureExactPackage(PROJECT, original.directoryName)
+    const publisher = await composition.publication.publicationFor(PERSONAL)
+
+    expect(captured).not.toBeNull()
+    expect(publisher).not.toBeNull()
+    await Promise.all(
+      Array.from({ length: 1_025 }, (_, index) =>
+        writeFile(join(mount, `filler-${index}.md`), '# filler\n'),
+      ),
+    )
+    const events: string[] = []
+
+    await expect(
+      publisher!.moveFrom(PROJECT, original.directoryName, captured!, {
+        beforeMove: async () => {
+          events.push('before')
+        },
+        finalize: async () => {
+          events.push('finalize')
+        },
+        rollback: async () => {
+          events.push('rollback')
+        },
+      }),
+    ).rejects.toThrow('role library has too many entries')
+
+    // Refused before the lifecycle was entered, so there is nothing to undo.
+    expect(events).toEqual([])
+  })
+
+  /** The forward transition's own `committed-error`: the package is AT the destination
+   *  and the proof that it is the same package is missing. The lifecycle must not be
+   *  rolled back for it — the reach row and the placement trail describe where the
+   *  bytes are, and the bytes are at the new home — so the caller is handed the marker
+   *  that says exactly that instead of the ordinary "the destination was occupied". */
+  itAtomicPublish('keeps the lifecycle when the forward move commits without proof', async () => {
+    const mount = await mkmount()
+    const { authority, library } = admittedLibraryAt(mount)
+    const composition = createFsRoleLibrary({
+      publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+      rootForSpace: () => mount,
+      resourcePrefixForSpace: () => SKILL_PREFIX,
+      authorityForSpace: async () => authority,
+    })
+    const original = packageOf('wanted', 'Original body.')
+
+    await expect(library.putIfAbsent(PROJECT, original)).resolves.toBe(true)
+    const captured = await library.captureExactPackage(PROJECT, original.directoryName)
+    const publisher = await composition.publication.publicationFor(PERSONAL)
+
+    expect(captured).not.toBeNull()
+    expect(publisher).not.toBeNull()
+    vi.spyOn(authority, 'conditionalDirectoryMoveFor').mockReturnValue({
+      moveIfClaimed: async () => ({
+        status: 'committed-error' as const,
+        reason: 'directory moved but its claimed source resource did not reach the target',
+      }),
+    })
+    const events: string[] = []
+    const failure = await publisher!
+      .moveFrom(PROJECT, original.directoryName, captured!, {
+        beforeMove: async () => {
+          events.push('before')
+        },
+        finalize: async () => {
+          events.push('finalize')
+        },
+        rollback: async () => {
+          events.push('rollback')
+        },
+      })
+      .then(() => null)
+      .catch((error: unknown) => error)
+
+    // Not `occupied` — the destination is not held by someone else, it is held by THIS
+    // package — and not a plain throw either: the marker is what tells the layer above
+    // that the physical transition stayed at its target.
+    expect(isRolePackageMoveRollbackError(failure)).toBe(true)
+    expect((failure as { cause?: Error }).cause).toBeInstanceOf(AbilityUnavailableError)
+    // The adapter's own words survive as the cause's cause, for the operator log; the
+    // class itself says only "not found" on the wire.
+    expect((failure as { cause?: { cause?: unknown } }).cause?.cause).toContain(
+      'did not reach the target',
+    )
+    // The lifecycle was entered and NOT unwound: a rollback here would clear the reach
+    // row of a package that is standing at the placement that row describes.
+    expect(events).toEqual(['before'])
+  })
+
+  /** The same undo on a host with no resource authority at all, where there is no claim
+   *  to move a directory against and the library publishes the pathname itself. The
+   *  rollback has to take THAT route rather than the claim-bound one: reading an
+   *  authority off a context this host never built is not a stricter check, it is a
+   *  crash in the middle of an undo that was about to succeed. */
+  itAtomicPublish('undoes a committed move on a host with no resource authority', async () => {
+    const mount = await mkmount()
+    const composition = createFsRoleLibrary({
+      publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+      rootForSpace: () => mount,
+    })
+    const library = writableLibrary(composition)
+    const original = packageOf('wanted', 'Original body.')
+
+    await expect(library.putIfAbsent(PROJECT, original)).resolves.toBe(true)
+    const captured = await library.captureExactPackage(PROJECT, original.directoryName)
+    const publisher = await composition.publication.publicationFor(PERSONAL)
+    const events: string[] = []
+    const finalizeFailure = new Error('the placement trail could not be written')
+
+    expect(captured).not.toBeNull()
+    expect(publisher).not.toBeNull()
+    await expect(
+      publisher!.moveFrom(PROJECT, original.directoryName, captured!, {
+        beforeMove: async () => {
+          events.push('before')
+        },
+        finalize: async () => {
+          events.push('finalize')
+          throw finalizeFailure
+        },
+        rollback: async () => {
+          events.push('rollback')
+        },
+      }),
+    ).rejects.toBe(finalizeFailure)
+
+    expect(events).toEqual(['before', 'finalize', 'rollback'])
+    await expect(library.getByDirectory(PERSONAL, original.directoryName)).resolves.toBeNull()
+    await expect(library.getByDirectory(PROJECT, original.directoryName)).resolves.toMatchObject({
+      directoryName: original.directoryName,
+    })
+  })
+
+  /** The other half of the same rule, and the half that decides what the caller is
+   *  told: a reverse transition that did NOT commit leaves the package at its new home,
+   *  so the lifecycle must stay exactly as the forward move left it and the answer must
+   *  be the marker rather than the failure that started the undo. Rolled back here, the
+   *  reach row and the trail would describe the placement the package no longer
+   *  occupies, and the caller would be told the move simply failed. */
+  itAtomicPublish('keeps the lifecycle when the reverse move does not commit', async () => {
+    const mount = await mkmount()
+    const { authority, library } = admittedLibraryAt(mount)
+    const composition = createFsRoleLibrary({
+      publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+      rootForSpace: () => mount,
+      resourcePrefixForSpace: () => SKILL_PREFIX,
+      authorityForSpace: async () => authority,
+    })
+    const original = packageOf('wanted', 'Original body.')
+    const moveFor = authority.conditionalDirectoryMoveFor.bind(authority)
+    const resolved: Array<[string, string]> = []
+
+    vi.spyOn(authority, 'conditionalDirectoryMoveFor').mockImplementation(
+      (sourcePath, targetPath, proofRelativePath) => {
+        const view = moveFor(sourcePath, targetPath, proofRelativePath)
+
+        if (!view) {
+          return null
+        }
+        const forward = resolved[0]
+        const reverse = forward?.[0] === targetPath && forward[1] === sourcePath
+
+        resolved.push([sourcePath, targetPath])
+
+        return {
+          moveIfClaimed: async (expected) =>
+            // The source pathname is held by something else now, so the package cannot
+            // come home — the one outcome of a reverse move that leaves it where it is.
+            reverse ? { status: 'occupied' as const } : view.moveIfClaimed(expected),
+        }
+      },
+    )
+
+    await expect(library.putIfAbsent(PROJECT, original)).resolves.toBe(true)
+    const captured = await library.captureExactPackage(PROJECT, original.directoryName)
+    const publisher = await composition.publication.publicationFor(PERSONAL)
+    const events: string[] = []
+    const finalizeFailure = new Error('the placement trail could not be written')
+
+    expect(captured).not.toBeNull()
+    expect(publisher).not.toBeNull()
+    const failure = await publisher!
+      .moveFrom(PROJECT, original.directoryName, captured!, {
+        beforeMove: async () => {
+          events.push('before')
+        },
+        finalize: async () => {
+          events.push('finalize')
+          throw finalizeFailure
+        },
+        rollback: async () => {
+          events.push('rollback')
+        },
+      })
+      .then(() => null)
+      .catch((error: unknown) => error)
+
+    expect(isRolePackageMoveRollbackError(failure)).toBe(true)
+    expect((failure as { cause?: unknown }).cause).toBe(finalizeFailure)
+    expect(events).toEqual(['before', 'finalize'])
+    expect(resolved).toHaveLength(2)
+    // The package really is at the new home, which is what the marker claims.
+    await expect(library.getByDirectory(PERSONAL, original.directoryName)).resolves.toMatchObject({
+      directoryName: original.directoryName,
+    })
+    await expect(library.getByDirectory(PROJECT, original.directoryName)).resolves.toBeNull()
+  })
+
+  /** `committed-error` is DIRECTIONAL: it says the transition the call requested is
+   *  still at that call's target. Raised by the REVERSE move, that target is the
+   *  placement the package came from — so the bytes are home and only the proof of it
+   *  failed. Read as "not restored", the rollback is skipped and the lifecycle keeps
+   *  describing a home the package no longer occupies, while the marker tells the layer
+   *  above that the undo was impossible. The physical fact and the report would then
+   *  disagree, which is the one thing this protocol exists to prevent. */
+  itAtomicPublish(
+    'rolls the lifecycle back when the reverse move lands without proof',
+    async () => {
+      const mount = await mkmount()
+      const registry = new SpaceResourceAuthorityRegistry()
+      const compositions = new NotariumStoreCompositionOwner()
+      const authority = ensureNotariumResourceAuthority({
+        spaceId: PERSONAL.space,
+        resourceAuthorityRegistry: registry,
+        composition: compositions.getOrCreate(PERSONAL.space, [
+          { class: 'skill', dir: mount, prefix: SKILL_PREFIX },
+        ]),
+      })
+      const original = packageOf('wanted', 'Original body.')
+      const moveFor = authority.conditionalDirectoryMoveFor.bind(authority)
+      const resolved: Array<[string, string]> = []
+
+      vi.spyOn(authority, 'conditionalDirectoryMoveFor').mockImplementation(
+        (sourcePath, targetPath, proofRelativePath) => {
+          const view = moveFor(sourcePath, targetPath, proofRelativePath)
+
+          if (!view) {
+            return null
+          }
+          // The reverse transition is the one whose ends are the forward move's, swapped
+          // — named by its addresses rather than by call order, because what makes the
+          // result directional is which placement it commits AT.
+          const forward = resolved[0]
+          const reverse = forward?.[0] === targetPath && forward[1] === sourcePath
+
+          resolved.push([sourcePath, targetPath])
+
+          return {
+            moveIfClaimed: async (expected) => {
+              const result = await view.moveIfClaimed(expected)
+
+              // The directory transition really happened; only the claim that proves the
+              // carried resource is the same one could not be minted at the target.
+              return reverse && result.status === 'moved'
+                ? ({
+                    status: 'committed-error',
+                    reason:
+                      'directory moved but its claimed source resource did not reach the target',
+                  } as const)
+                : result
+            },
+          }
+        },
+      )
+      const composition = createFsRoleLibrary({
+        publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+        rootForSpace: () => mount,
+        resourcePrefixForSpace: () => SKILL_PREFIX,
+        authorityForSpace: async () => authority,
+      })
+      const library = writableLibrary(composition)
+
+      await expect(library.putIfAbsent(PROJECT, original)).resolves.toBe(true)
+      const captured = await library.captureExactPackage(PROJECT, original.directoryName)
+      const publisher = await composition.publication.publicationFor(PERSONAL)
+      const events: string[] = []
+      const finalizeFailure = new Error('the placement trail could not be written')
+
+      expect(captured).not.toBeNull()
+      expect(publisher).not.toBeNull()
+      await expect(
+        publisher!.moveFrom(PROJECT, original.directoryName, captured!, {
+          beforeMove: async () => {
+            events.push('before')
+          },
+          finalize: async () => {
+            events.push('finalize')
+            throw finalizeFailure
+          },
+          rollback: async () => {
+            events.push('rollback')
+          },
+        }),
+        // The caller gets the failure it actually suffered, not the marker that names an
+        // undo which did not happen — the marker is reserved for a package left at the
+        // destination, and this one is not.
+      ).rejects.toBe(finalizeFailure)
+
+      expect(events).toEqual(['before', 'finalize', 'rollback'])
+      expect(resolved).toHaveLength(2)
+      // …and the physical fact the answer rests on: the bytes came home.
+      await expect(library.getByDirectory(PERSONAL, original.directoryName)).resolves.toBeNull()
+      await expect(library.getByDirectory(PROJECT, original.directoryName)).resolves.toMatchObject({
+        directoryName: original.directoryName,
       })
     },
   )
@@ -681,12 +1290,20 @@ describe('role library promotion refusals', () => {
     const held = new Promise<void>((resolve) => {
       release = resolve
     })
-    const mutation = library.withExactPackageMutation(PROJECT, pkg.directoryName, async (read) => {
-      expect(await read()).toMatchObject({ pkg: { directoryName: pkg.directoryName } })
-      entered()
-      await held
-      return true
-    })
+    const target = await library.captureExactPackage(PROJECT, pkg.directoryName)
+
+    expect(target).not.toBeNull()
+    const mutation = library.withExactPackageMutation(
+      PROJECT,
+      pkg.directoryName,
+      target!,
+      async (snapshot) => {
+        expect(snapshot).toMatchObject({ pkg: { directoryName: pkg.directoryName } })
+        entered()
+        await held
+        return true
+      },
+    )
 
     await admitted
     const moving = library.movePackage(PROJECT, PERSONAL, pkg.directoryName)
@@ -701,20 +1318,174 @@ describe('role library promotion refusals', () => {
     await expect(moving).resolves.toBe(true)
   })
 
+  itAtomicPublish(
+    'enters the Core projection scope before every exact package admission',
+    async () => {
+      const mount = await mkmount()
+      const registry = new SpaceResourceAuthorityRegistry()
+      const compositions = new NotariumStoreCompositionOwner()
+      const authority = ensureNotariumResourceAuthority({
+        spaceId: PERSONAL.space,
+        resourceAuthorityRegistry: registry,
+        composition: compositions.getOrCreate(PERSONAL.space, [
+          { class: 'skill', dir: mount, prefix: SKILL_PREFIX },
+        ]),
+      })
+      const events: string[] = []
+
+      const withProjectedRolePackage: WithProjectedRolePackage = async (
+        _space,
+        pkg,
+        expectedRegistryNoteId,
+        task,
+      ) => {
+        events.push('core:enter')
+        try {
+          return await task({
+            registryNoteId: expectedRegistryNoteId ?? pkg.directoryName,
+            filePath: pkg.filePath,
+            versionToken: 'registry-version',
+          })
+        } finally {
+          events.push('core:exit')
+        }
+      }
+      const bulkProjection = vi.fn(
+        async (_space, packages: readonly { directoryName: string }[]) =>
+          new Map(packages.map((pkg) => [pkg.directoryName, pkg.directoryName])),
+      )
+      const composition = createFsRoleLibrary({
+        publishDirectoryIfAbsent: renameNoReplaceIfAvailable(),
+        rootForSpace: () => mount,
+        resourcePrefixForSpace: () => SKILL_PREFIX,
+        authorityForSpace: async () => authority,
+        projectPublishedPackages: bulkProjection,
+        withProjectedRolePackage,
+      })
+      const library = writableLibrary(composition)
+      const pkg = packageOf('wanted', 'Owned.')
+
+      await library.putIfAbsent(PROJECT, pkg)
+      // A sibling already living at the DESTINATION placement. The move has to decide
+      // whether its manifest name is free, and this is the package that answer has to
+      // look at — so it is also the package a name check done through the ordinary
+      // observation path would take a nested shared lease on.
+      await library.putIfAbsent(PERSONAL, packageOf('resident', 'Already here.'))
+      // Which placement each lease is TAKEN ON, not just in which mode. The move holds
+      // one exclusive lease per side and the order between them is what stops two
+      // opposite moves of one package from holding each other's half — an order a
+      // record of modes alone cannot tell apart from its own reverse.
+      const placementOf = (resourcePath: string): string =>
+        resourcePath.includes('/_projects/') ? 'project' : 'personal'
+      const originalPackageAdmission = authority.admitPackage.bind(authority)
+      const admitPackage = vi.spyOn(authority, 'admitPackage')
+      admitPackage.mockImplementation(async (...args) => {
+        events.push(`package:${placementOf(args[0])}:${args[1]}`)
+        return originalPackageAdmission(...args)
+      })
+      const originalPlacementAdmission = authority.admitSkillPlacement.bind(authority)
+      const admitPlacement = vi.spyOn(authority, 'admitSkillPlacement')
+      admitPlacement.mockImplementation(async (...args) => {
+        events.push(`placement:${placementOf(args[0])}:${args[1]}`)
+        return originalPlacementAdmission(...args)
+      })
+
+      const captured = await library.captureExactPackage(PROJECT, pkg.directoryName)
+
+      expect(captured).not.toBeNull()
+      expect(events).toEqual(['core:enter', 'package:project:shared', 'core:exit'])
+      expect(bulkProjection).not.toHaveBeenCalled()
+
+      events.length = 0
+      await library.withExactPackageMutation(PROJECT, pkg.directoryName, captured!, async () => {
+        events.push('task')
+      })
+      expect(events).toEqual([
+        'core:enter',
+        'placement:project:exclusive',
+        'package:project:exclusive',
+        'task',
+        'core:exit',
+      ])
+      expect(bulkProjection).not.toHaveBeenCalled()
+
+      events.length = 0
+      await library.readableNoteIds(PROJECT, [pkg.directoryName])
+      expect(events).toEqual([])
+      expect(bulkProjection).toHaveBeenCalledOnce()
+
+      events.length = 0
+      bulkProjection.mockClear()
+      const publication = await composition.publication.publicationFor(PERSONAL)
+      const moved = await publication!.moveFrom(PROJECT, pkg.directoryName, captured!, {
+        beforeMove: async () => {
+          events.push('before-move')
+        },
+        finalize: async () => {
+          events.push('finalize')
+        },
+        rollback: async () => {
+          events.push('rollback')
+        },
+      })
+
+      expect(moved.status).toBe('moved')
+      expect(events).toEqual([
+        'core:enter',
+        // Destination first, then source — the fixed order, by address.
+        'placement:personal:exclusive',
+        'package:personal:exclusive',
+        'package:project:exclusive',
+        'before-move',
+        'finalize',
+        'core:exit',
+      ])
+      // …and NOTHING for the resident sibling. The destination name check reads sibling
+      // manifests directly under the placement lease, exactly as publication does; a
+      // check routed through the ordinary observation path would add one shared package
+      // lease per sibling on top of the three exclusives this move already holds.
+      expect(events.filter((event) => event.endsWith(':shared'))).toEqual([])
+      expect(bulkProjection).not.toHaveBeenCalled()
+    },
+  )
+
   itAtomicPublish('rolls a finalize failure back before releasing either package', async () => {
     const mount = await mkmount()
     const { library } = admittedLibraryAt(mount)
     const pkg = packageOf('wanted', 'Owned.')
     const failure = new Error('placement metadata unavailable')
+    const rolledBack: string[] = []
 
     await expect(library.putIfAbsent(PROJECT, pkg)).resolves.toBe(true)
     await expect(
-      library.movePackage(PROJECT, PERSONAL, pkg.directoryName, async () => {
-        throw failure
-      }),
+      library.movePackage(
+        PROJECT,
+        PERSONAL,
+        pkg.directoryName,
+        async () => {
+          throw failure
+        },
+        async () => {
+          // Observed from INSIDE the hook, while both packages are still admitted:
+          // the caller's undo has to see the bytes back at the source, or it would be
+          // restoring state that describes a placement the package has not returned to.
+          // Read through the raw filesystem, not the library — asking the library here
+          // would queue behind the very package admissions this move still holds.
+          rolledBack.push(
+            await actualFs
+              .lstat(join(projectRoot(mount), pkg.directoryName, 'SKILL.md'))
+              .then(() => 'at-source')
+              .catch(() => 'elsewhere'),
+          )
+        },
+      ),
     ).rejects.toBe(failure)
     await expect(library.getByDirectory(PROJECT, pkg.directoryName)).resolves.not.toBeNull()
     await expect(library.getByDirectory(PERSONAL, pkg.directoryName)).resolves.toBeNull()
+    // The bytes alone do not close this: the caller wrote reach BEFORE the move and
+    // undoes it here. Without the hook the package is at its source with a reach that
+    // narrows it to a project it never left.
+    expect(rolledBack).toEqual(['at-source'])
   })
 
   itAtomicPublish(
@@ -741,6 +1512,117 @@ describe('role library promotion refusals', () => {
       await expect(entriesOf(mount)).resolves.toEqual(['_projects', 'wanted'])
     },
   )
+
+  /** The OTHER refusal, and a different code path from the one above: the manifest
+   *  NAME is free, so the move commits to the transition and only the publication of
+   *  the package pathname fails. `beforeMove` has already run by then — the caller has
+   *  durable state on the destination — so this branch owes it the same undo a failed
+   *  finalize does. */
+  itAtomicPublish('rolls back when the destination package address is taken', async () => {
+    const mount = await mkmount()
+    const library = libraryAt(mount)
+    const pkg = packageOf('wanted', 'Owned.')
+    const rolledBack: string[] = []
+
+    await expect(library.putIfAbsent(PROJECT, pkg)).resolves.toBe(true)
+    // The package ADDRESS, not its manifest name: the name check passes (this
+    // directory carries no SKILL.md, so no manifest index sees it) and the atomic
+    // publication of the pathname is what refuses.
+    await mkdir(join(mount, pkg.directoryName))
+    await writeFile(join(mount, pkg.directoryName, 'stranger.md'), 'not ours')
+
+    await expect(
+      library.movePackage(PROJECT, PERSONAL, pkg.directoryName, undefined, async () => {
+        rolledBack.push('rollback')
+      }),
+    ).resolves.toBe(false)
+    expect(rolledBack).toEqual(['rollback'])
+    await expect(library.getByDirectory(PROJECT, pkg.directoryName)).resolves.not.toBeNull()
+    await expect(readFile(join(mount, pkg.directoryName, 'stranger.md'), 'utf8')).resolves.toBe(
+      'not ours',
+    )
+  })
+
+  /** The dual identity of a captured package, taken apart one member at a time. The
+   *  package stays exactly where the capture found it and keeps its address — what
+   *  changes is what its manifest CLAIMS: the note it is, or the ability kind it
+   *  declares. Both are ordinary states of a mount a user also edits by hand, and
+   *  both are invisible to the registry side: the id a strict caller carries is the
+   *  id it selected its note by, so only the manifest read under admission can see
+   *  that the two identities came apart. */
+  const RECLAIMED: [string, string, Record<string, unknown>][] = [
+    [
+      'a manifest that now claims another note',
+      `notarium-id: ${packageDirectoryOf('other')}\nname: wanted\ndescription: wanted.`,
+      { kind: 'skill', manifestNoteId: packageDirectoryOf('other') },
+    ],
+    [
+      'a manifest that now declares another kind',
+      `notarium-id: ${packageDirectoryOf('wanted')}\nname: wanted\ndescription: wanted.\nmetadata:\n  notarium.kind: role`,
+      { kind: 'role', manifestNoteId: packageDirectoryOf('wanted') },
+    ],
+  ]
+
+  for (const [label, frontmatter, reclaimed] of RECLAIMED) {
+    /** One published package, one target captured before the rewrite, and the state
+     *  the rewrite actually produced — asserted, so each case moves exactly ONE
+     *  member of the identity and stands on that member alone. */
+    const capturedBeforeRewrite = async () => {
+      const mount = await mkmount()
+      const { library } = admittedLibraryAt(mount)
+      const pkg = packageOf('wanted', 'Owned.')
+
+      await expect(library.putIfAbsent(PROJECT, pkg)).resolves.toBe(true)
+      const captured = await library.captureExactPackage(PROJECT, pkg.directoryName)
+
+      expect(captured).toMatchObject({
+        kind: 'skill',
+        registryNoteId: pkg.directoryName,
+        manifestNoteId: pkg.directoryName,
+      })
+      await writeFile(
+        join(projectRoot(mount), pkg.directoryName, 'SKILL.md'),
+        `---\n${frontmatter}\n---\n\nRewritten outside the port.\n`,
+      )
+      await expect(library.captureExactPackage(PROJECT, pkg.directoryName)).resolves.toMatchObject({
+        registryNoteId: pkg.directoryName,
+        ...reclaimed,
+      })
+
+      return { captured: captured!, library, pkg }
+    }
+
+    itAtomicPublish(`refuses an exact mutation against ${label}`, async () => {
+      const { captured, library, pkg } = await capturedBeforeRewrite()
+      const task = vi.fn(async () => 'ran')
+
+      // `null`, and the callback never ran: a mutation admitted on a captured
+      // identity may not act on a package that is no longer that identity.
+      await expect(
+        library.withExactPackageMutation(PROJECT, pkg.directoryName, captured, task),
+      ).resolves.toBeNull()
+      expect(task).not.toHaveBeenCalled()
+    })
+
+    itAtomicPublish(`refuses a move against ${label}`, async () => {
+      const { captured, library, pkg } = await capturedBeforeRewrite()
+      const finalize = vi.fn(async () => undefined)
+      const rollback = vi.fn(async () => undefined)
+
+      // The move carries the target its caller captured EARLIER — production writes
+      // a reach row and a placement trail in between — so the identity it revalidates
+      // is an observation of the past, not of this instant.
+      await expect(
+        library.movePackage(PROJECT, PERSONAL, pkg.directoryName, finalize, rollback, captured),
+      ).rejects.toBeInstanceOf(AbilityUnavailableError)
+      // Refused before the transition, so there is nothing to undo and no lifecycle
+      // hook may have run: the caller's durable state is still the source's.
+      expect(finalize).not.toHaveBeenCalled()
+      expect(rollback).not.toHaveBeenCalled()
+      await expect(library.getByDirectory(PERSONAL, pkg.directoryName)).resolves.toBeNull()
+      await expect(library.getByDirectory(PROJECT, pkg.directoryName)).resolves.not.toBeNull()
+    })
+  }
 })
 
 describeAtomicPublish('filesystem role library publication', () => {

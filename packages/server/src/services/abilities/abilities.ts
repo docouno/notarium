@@ -24,6 +24,7 @@ import {
   RoleAlreadyExistsError,
   RoleInstallUnavailableError,
   type RoleLocation,
+  RolePlacementUnconfirmedError,
   type RolesService,
   SkillAlreadyExistsError,
   type SkillHomeLocation,
@@ -211,14 +212,7 @@ export const createAbilities = (options: CreateAbilitiesOptions): AbilitiesServi
       if (roles.manifestPath(location, packageId) !== manifestPath) {
         continue
       }
-      const found = await roles.withOwnedAt(
-        location,
-        principal,
-        kind,
-        packageId,
-        registryNoteId,
-        async (target) => target,
-      )
+      const found = await roles.captureOwnedAt(location, principal, kind, packageId, registryNoteId)
 
       if (found) {
         return found
@@ -240,26 +234,37 @@ export const createAbilities = (options: CreateAbilitiesOptions): AbilitiesServi
     ) {
       return null
     }
-    const admitted = async (snapshot: OwnedAbilitySnapshot) => {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const snapshot =
+        'registryNoteId' in subject
+          ? await roles.captureOwnedTarget(subject, principal)
+          : await roles.captureCurrentOwnedTarget(subject, principal)
+
+      if (!snapshot) {
+        return null
+      }
       const context = await contextFor(principal, snapshot.locator)
 
       if (!context) {
         return null
       }
-      const access = await readNoteAccess(store, principal, snapshot.registryNoteId, 'note:write', {
-        resourceAdmitted: true,
-      })
+      const access = await readNoteAccess(store, principal, snapshot.registryNoteId, 'note:write')
 
-      return access?.note.versionToken &&
+      if (!access) {
+        return null
+      }
+      if (
+        access.note.versionToken &&
         access.noteId === snapshot.registryNoteId &&
-        access.note.id === snapshot.registryNoteId
-        ? { snapshot, context, access }
-        : null
+        access.note.id === snapshot.registryNoteId &&
+        access.note.filePath === snapshot.filePath &&
+        access.note.versionToken === snapshot.versionToken
+      ) {
+        return { snapshot, context, access }
+      }
     }
 
-    return 'registryNoteId' in subject
-      ? roles.withOwnedTarget(subject, principal, admitted, 'read')
-      : roles.withCurrentOwnedTarget(subject, principal, admitted, 'read')
+    return null
   }
 
   const withOwnedAuthoringTarget = async <T>(
@@ -269,6 +274,7 @@ export const createAbilities = (options: CreateAbilitiesOptions): AbilitiesServi
       authority: OwnedAbilityTarget
       snapshot: OwnedAbilitySnapshot
       locator: OwnedAbilityTarget['locator']
+      context: EffectiveRoleContext
       detail: NonNullable<Awaited<ReturnType<typeof getHuman>>> & {
         ability: Extract<
           NonNullable<Awaited<ReturnType<typeof getHuman>>>['ability'],
@@ -330,6 +336,7 @@ export const createAbilities = (options: CreateAbilitiesOptions): AbilitiesServi
       authority: captured.snapshot,
       snapshot: captured.snapshot,
       locator: captured.snapshot.locator,
+      context: captured.context,
       detail: {
         ...detail,
         ability: detail.ability as Extract<typeof detail.ability, { source: 'owned' }>,
@@ -342,15 +349,34 @@ export const createAbilities = (options: CreateAbilitiesOptions): AbilitiesServi
     principal: Principal,
     target: OwnedAbilityTarget,
     task: (snapshot: OwnedAbilitySnapshot) => Promise<T>,
-  ): Promise<T | null> => roles.withOwnedTarget(target, principal, task, 'mutation')
+  ): Promise<T | null> => roles.withOwnedTargetMutation(target, principal, task)
 
-  const aroundTargetWrite =
+  const withFreshMetadataTarget = <T>(
+    principal: Principal,
+    target: OwnedAbilityTarget,
+    context: EffectiveRoleContext,
+    task: (
+      snapshot: OwnedAbilitySnapshot,
+      state: { enabled: boolean; availability?: AgentAbilityAvailabilityState },
+    ) => Promise<T>,
+  ): Promise<T | null> =>
+    withRevalidatedTarget(principal, target, async (snapshot) => {
+      const state = await roles.readOwnedAbilityMetadataState(context, principal, snapshot)
+
+      if (!state) {
+        throw new AbilityUnavailableError('no such Owned ability')
+      }
+
+      return task(snapshot, state)
+    })
+
+  const withTargetMutation =
     (
       principal: Principal,
       target: OwnedAbilityTarget,
-    ): NonNullable<AbilityDocumentWrite['aroundWrite']> =>
-    async (write) => {
-      const result = await withRevalidatedTarget(principal, target, async () => write())
+    ): NonNullable<AbilityDocumentWrite['withTargetMutation']> =>
+    async (task) => {
+      const result = await withRevalidatedTarget(principal, target, task)
 
       if (!result) {
         throw new AbilityUnavailableError('no such Owned ability')
@@ -584,21 +610,15 @@ export const createAbilities = (options: CreateAbilitiesOptions): AbilitiesServi
       // The legacy human toggle is an owner-scoped preference, not package authoring:
       // a reader may disable a readable ability for themselves. Agent edit/save paths
       // intentionally do not call this door and keep the writer-only helper above.
-      const applied = await roles.withCurrentOwnedTarget(
-        locator,
-        principal,
-        async (snapshot) => {
-          const context = await contextFor(principal, snapshot.locator)
-
-          if (!context) {
-            return false
-          }
-
-          await roles.setEnabled(context, principal, snapshot, enabled)
-          return true
-        },
-        'mutation',
-      )
+      const captured = await roles.captureCurrentOwnedTarget(locator, principal)
+      const context = captured ? await contextFor(principal, captured.locator) : null
+      const applied =
+        captured && context
+          ? await roles.withOwnedTargetMutation(captured, principal, async (snapshot) => {
+              await roles.setEnabled(context, principal, snapshot, enabled)
+              return true
+            })
+          : null
 
       if (!applied) {
         throw new AbilityUnavailableError('no such ability')
@@ -656,7 +676,7 @@ export const createAbilities = (options: CreateAbilitiesOptions): AbilitiesServi
               }
             : {}),
           semanticNoop: true,
-          aroundWrite: aroundTargetWrite(principal, admitted.authority),
+          withTargetMutation: withTargetMutation(principal, admitted.authority),
         })
 
         return { ...admitted, commitDocument }
@@ -701,6 +721,12 @@ export const createAbilities = (options: CreateAbilitiesOptions): AbilitiesServi
           currentTarget = movedRole.target
           steps.push({ step: ABILITY_SAVE_STEP.home, outcome: ABILITY_SAVE_OUTCOME.applied })
         } catch (error) {
+          // A move can fail AFTER it committed, and then the package is at its new
+          // home whatever this step reports. The locator is the address the client
+          // reads and retries with, so it follows the package rather than the step.
+          if (error instanceof RolePlacementUnconfirmedError) {
+            currentLocator = error.locator
+          }
           steps.push(failedStep(ABILITY_SAVE_STEP.home, error))
           return {
             locator: currentLocator,
@@ -721,22 +747,27 @@ export const createAbilities = (options: CreateAbilitiesOptions): AbilitiesServi
             }
 
       try {
-        const outcome = await withOwnedAuthoringTarget(principal, currentTarget, async (live) => {
-          const current: AgentAbilityAvailabilityState =
-            live.detail.ability.availability ??
-            (live.locator.kind === ABILITY_KIND.role
-              ? { mode: ABILITY_AVAILABILITY_MODE.allProjects }
-              : { mode: ABILITY_AVAILABILITY_MODE.selectedProjects, projectIds: [] })
+        const outcome = await withOwnedAuthoringTarget(principal, currentTarget, async (live) =>
+          withFreshMetadataTarget(
+            principal,
+            live.authority,
+            live.context,
+            async (snapshot, state) => {
+              const current: AgentAbilityAvailabilityState =
+                state.availability ??
+                (snapshot.locator.kind === ABILITY_KIND.role
+                  ? { mode: ABILITY_AVAILABILITY_MODE.allProjects }
+                  : { mode: ABILITY_AVAILABILITY_MODE.selectedProjects, projectIds: [] })
 
-          if (sameReach(current, desired)) {
-            return ABILITY_SAVE_OUTCOME.skipped
-          }
+              if (sameReach(current, desired)) {
+                return ABILITY_SAVE_OUTCOME.skipped
+              }
 
-          return withRevalidatedTarget(principal, live.authority, async (snapshot) => {
-            await applyAvailability(principal, snapshot, desired)
-            return ABILITY_SAVE_OUTCOME.applied
-          })
-        })
+              await applyAvailability(principal, snapshot, desired)
+              return ABILITY_SAVE_OUTCOME.applied
+            },
+          ),
+        )
 
         if (!outcome) {
           throw new AbilityUnavailableError('no such Owned ability')
@@ -754,21 +785,21 @@ export const createAbilities = (options: CreateAbilitiesOptions): AbilitiesServi
     }
     if (request.enabled !== undefined) {
       try {
-        const outcome = await withOwnedAuthoringTarget(principal, currentTarget, async (live) => {
-          if (request.enabled === live.detail.ability.enabled) {
-            return ABILITY_SAVE_OUTCOME.skipped
-          }
-          const context = await contextFor(principal, live.locator)
+        const outcome = await withOwnedAuthoringTarget(principal, currentTarget, async (live) =>
+          withFreshMetadataTarget(
+            principal,
+            live.authority,
+            live.context,
+            async (snapshot, state) => {
+              if (request.enabled === state.enabled) {
+                return ABILITY_SAVE_OUTCOME.skipped
+              }
 
-          if (!context) {
-            throw new AbilityUnavailableError('no such ability')
-          }
-
-          return withRevalidatedTarget(principal, live.authority, async (snapshot) => {
-            await roles.setEnabled(context, principal, snapshot, request.enabled!)
-            return ABILITY_SAVE_OUTCOME.applied
-          })
-        })
+              await roles.setEnabled(live.context, principal, snapshot, request.enabled!)
+              return ABILITY_SAVE_OUTCOME.applied
+            },
+          ),
+        )
 
         if (!outcome) {
           throw new AbilityUnavailableError('no such Owned ability')
@@ -842,7 +873,7 @@ export const createAbilities = (options: CreateAbilitiesOptions): AbilitiesServi
               }
             : {}),
           semanticNoop: true,
-          aroundWrite: aroundTargetWrite(principal, admitted.authority),
+          withTargetMutation: withTargetMutation(principal, admitted.authority),
         })
 
         return { ...admitted, commitDocument }
@@ -900,6 +931,11 @@ export const createAbilities = (options: CreateAbilitiesOptions): AbilitiesServi
           currentTarget = moved.target
           steps.push({ step: ABILITY_SAVE_STEP.home, outcome: ABILITY_SAVE_OUTCOME.applied })
         } catch (error) {
+          // Same reason as the covers-driven move above: an unconfirmed move is still
+          // a committed one, and the answer has to address the home the role now has.
+          if (error instanceof RolePlacementUnconfirmedError) {
+            currentLocator = error.locator
+          }
           steps.push(failedStep(ABILITY_SAVE_STEP.home, error))
           return { locator: currentLocator, ...(versionToken ? { versionToken } : {}), steps }
         }
@@ -934,22 +970,27 @@ export const createAbilities = (options: CreateAbilitiesOptions): AbilitiesServi
           currentLocator.location.spaceId,
           request.availability,
         )
-        const outcome = await withOwnedAuthoringTarget(principal, currentTarget, async (live) => {
-          const current: AgentAbilityAvailabilityState =
-            live.detail.ability.availability ??
-            (live.locator.kind === ABILITY_KIND.role
-              ? { mode: ABILITY_AVAILABILITY_MODE.allProjects }
-              : { mode: ABILITY_AVAILABILITY_MODE.selectedProjects, projectIds: [] })
+        const outcome = await withOwnedAuthoringTarget(principal, currentTarget, async (live) =>
+          withFreshMetadataTarget(
+            principal,
+            live.authority,
+            live.context,
+            async (snapshot, state) => {
+              const current: AgentAbilityAvailabilityState =
+                state.availability ??
+                (snapshot.locator.kind === ABILITY_KIND.role
+                  ? { mode: ABILITY_AVAILABILITY_MODE.allProjects }
+                  : { mode: ABILITY_AVAILABILITY_MODE.selectedProjects, projectIds: [] })
 
-          if (sameReach(current, desired)) {
-            return ABILITY_SAVE_OUTCOME.skipped
-          }
+              if (sameReach(current, desired)) {
+                return ABILITY_SAVE_OUTCOME.skipped
+              }
 
-          return withRevalidatedTarget(principal, live.authority, async (snapshot) => {
-            await applyAvailability(principal, snapshot, desired)
-            return ABILITY_SAVE_OUTCOME.applied
-          })
-        })
+              await applyAvailability(principal, snapshot, desired)
+              return ABILITY_SAVE_OUTCOME.applied
+            },
+          ),
+        )
 
         if (!outcome) {
           throw new AbilityUnavailableError('no such Owned ability')
@@ -963,21 +1004,21 @@ export const createAbilities = (options: CreateAbilitiesOptions): AbilitiesServi
 
     if (request.enabled !== undefined) {
       try {
-        const outcome = await withOwnedAuthoringTarget(principal, currentTarget, async (live) => {
-          if (request.enabled === live.detail.ability.enabled) {
-            return ABILITY_SAVE_OUTCOME.skipped
-          }
-          const context = await contextFor(principal, live.locator)
+        const outcome = await withOwnedAuthoringTarget(principal, currentTarget, async (live) =>
+          withFreshMetadataTarget(
+            principal,
+            live.authority,
+            live.context,
+            async (snapshot, state) => {
+              if (request.enabled === state.enabled) {
+                return ABILITY_SAVE_OUTCOME.skipped
+              }
 
-          if (!context) {
-            throw new AbilityUnavailableError('no such ability')
-          }
-
-          return withRevalidatedTarget(principal, live.authority, async (snapshot) => {
-            await roles.setEnabled(context, principal, snapshot, request.enabled!)
-            return ABILITY_SAVE_OUTCOME.applied
-          })
-        })
+              await roles.setEnabled(live.context, principal, snapshot, request.enabled!)
+              return ABILITY_SAVE_OUTCOME.applied
+            },
+          ),
+        )
 
         if (!outcome) {
           throw new AbilityUnavailableError('no such Owned ability')

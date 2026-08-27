@@ -1,6 +1,9 @@
 export type {
   FileClaim,
   FileClaimedRemoval,
+  FileConditionalDirectoryMove,
+  FileConditionalDirectoryMoveRequest,
+  FileConditionalDirectoryMoveResult,
   FileConditionalMutation,
   FileDirectoryNoReplaceMove,
   FileEntryIdentity,

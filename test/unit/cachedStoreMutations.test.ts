@@ -18,6 +18,7 @@ import {
   InMemoryRevisionPersistence,
   type KnowledgeStore,
   type MoveInput,
+  type NoteContent,
   RevisionJournal,
   type StoreDelta,
   type StoreEvent,
@@ -2217,6 +2218,363 @@ for (const [name, createHarness] of variants) {
       return { ...harness, alpha: alpha.id!, beta: beta.id! }
     }
 
+    it('holds one exact note scope while unrelated notes stay readable', async () => {
+      const { store, alpha, beta } = await setup()
+      const alphaBefore = await store.read(alpha)
+      const entered = deferred()
+      const release = deferred()
+      let sameReadSettled = false
+      let sameWriteSettled = false
+      const scope = store.withExactNoteClaim(alpha, async (current) => {
+        expect(current).toMatchObject({ id: alpha, filePath: 'from/alpha.md' })
+        entered.resolve()
+        await release.promise
+        return current.versionToken
+      })
+
+      let sameRead: Promise<unknown> | undefined
+      let sameWrite: Promise<unknown> | undefined
+
+      try {
+        await entered.promise
+        sameRead = store.read(alpha).then((value) => {
+          sameReadSettled = true
+          return value
+        })
+        const before = await store.read(beta)
+        sameWrite = store
+          .write({
+            originalId: alpha,
+            title: 'Alpha',
+            content: 'alpha-v2',
+            versionToken: alphaBefore.versionToken,
+          })
+          .then((value) => {
+            sameWriteSettled = true
+            return value
+          })
+
+        await nextTurn()
+        expect(before.id).toBe(beta)
+        expect(sameReadSettled).toBe(false)
+        expect(sameWriteSettled).toBe(false)
+
+        release.resolve()
+        const token = await scope
+        await Promise.all([sameRead, sameWrite])
+        expect(token).toBeTruthy()
+        expect(sameWriteSettled).toBe(true)
+        await expect(store.read(alpha)).resolves.toMatchObject({ content: 'alpha-v2' })
+      } finally {
+        release.resolve()
+        await Promise.allSettled([scope, sameRead, sameWrite].filter((task) => task !== undefined))
+      }
+    })
+
+    it('reuses a covered nested exact scope and rejects expansion before enqueue', async () => {
+      const { store, alpha, beta } = await setup()
+
+      await expect(
+        store.withExactNoteClaim(alpha, async (outer) => {
+          await expect(
+            store.withExactNoteClaim(alpha, async (inner) => inner.filePath),
+          ).resolves.toBe(outer.filePath)
+          await expect(store.withExactNoteClaim(beta, async () => undefined)).rejects.toThrow(
+            /not covered/i,
+          )
+          // An UNKNOWN nested target has no current path to compare against a
+          // held claim at all: it must be refused as missing, never widened into
+          // a coarser claim that the held one happens to cover.
+          await expect(
+            store.withExactNoteClaim('missing-note', async () => undefined),
+          ).rejects.toThrow(/note not found: missing-note/i)
+          await expect(store.read(beta)).resolves.toMatchObject({ id: beta })
+          return outer.id
+        }),
+      ).resolves.toBe(alpha)
+    })
+
+    it('retains the exact lease until a detached covered child finishes', async () => {
+      const { store, alpha, beta } = await setup()
+      const childEntered = deferred()
+      const releaseChild = deferred()
+      const order: string[] = []
+      let child!: Promise<string>
+      let contenderEntered = false
+
+      const outer = store.withExactNoteClaim(alpha, async () => {
+        child = store.withExactNoteClaim(alpha, async () => {
+          order.push('child:start')
+          childEntered.resolve()
+          await releaseChild.promise
+          order.push('child:end')
+          return 'child-finished'
+        })
+        await childEntered.promise
+        order.push('outer:return')
+      })
+
+      await childEntered.promise
+      const contender = store.withExactNoteClaim(alpha, async () => {
+        contenderEntered = true
+        order.push('contender')
+      })
+
+      try {
+        await nextTurn()
+        expect(contenderEntered).toBe(false)
+        await expect(store.read(beta)).resolves.toMatchObject({ id: beta })
+
+        releaseChild.resolve()
+        await expect(child).resolves.toBe('child-finished')
+        await Promise.all([outer, contender])
+        expect(order).toEqual(['child:start', 'outer:return', 'child:end', 'contender'])
+      } finally {
+        releaseChild.resolve()
+        await Promise.allSettled([outer, child, contender])
+      }
+    })
+
+    it('releases a retained exact lease after a detached child rejects', async () => {
+      const { store, alpha, beta } = await setup()
+      const childEntered = deferred()
+      const rejectChild = deferred()
+      let child!: Promise<void>
+      let contenderEntered = false
+
+      const outer = store.withExactNoteClaim(alpha, async () => {
+        child = store.withExactNoteClaim(alpha, async () => {
+          childEntered.resolve()
+          await rejectChild.promise
+          throw new Error('detached child failure')
+        })
+        void child.catch(() => undefined)
+        await childEntered.promise
+      })
+
+      await childEntered.promise
+      const contender = store.withExactNoteClaim(alpha, async () => {
+        contenderEntered = true
+      })
+
+      try {
+        await nextTurn()
+        expect(contenderEntered).toBe(false)
+
+        rejectChild.resolve()
+        await expect(child).rejects.toThrow('detached child failure')
+        await expect(outer).resolves.toBeUndefined()
+        await expect(contender).resolves.toBeUndefined()
+        await expect(store.read(alpha)).resolves.toMatchObject({ id: alpha })
+        await expect(store.read(beta)).resolves.toMatchObject({ id: beta })
+      } finally {
+        rejectChild.resolve()
+        await Promise.allSettled([outer, child, contender])
+      }
+    })
+
+    it('rejects an expired inherited exact scope instead of reacquiring after a move', async () => {
+      const { store, alpha, beta } = await setup()
+      const continueDetached = deferred()
+
+      const detach = (id: string) => async () => {
+        await continueDetached.promise
+        return store.withExactNoteClaim(id, async (current) => current.filePath)
+      }
+      let movedTarget!: Promise<string | undefined>
+      let goneTarget!: Promise<string | undefined>
+
+      await store.withExactNoteClaim(alpha, async () => {
+        movedTarget = detach(alpha)()
+        goneTarget = detach(beta)()
+      })
+      void movedTarget.catch(() => undefined)
+      void goneTarget.catch(() => undefined)
+
+      await store.move({ id: alpha, destinationPath: 'moved/alpha.md' })
+      await store.remove(beta)
+      continueDetached.resolve()
+
+      // The dead context is refused BEFORE the target is derived from the
+      // read-model. A descendant of a finished lease is a caller error whatever
+      // became of its note meanwhile — never a "note not found" the host would
+      // read as "somebody deleted it".
+      await expect(goneTarget).rejects.toThrow(/claim context has expired/i)
+      await expect(movedTarget).rejects.toThrow(/claim context has expired/i)
+      await expect(
+        store.withExactNoteClaim(alpha, async (current) => current.filePath),
+      ).resolves.toBe('moved/alpha.md')
+    })
+
+    it('re-derives the exact path after waiting behind a move', async () => {
+      const { inner, store, alpha } = await setup()
+      const gate = gateMove(inner, (input) => input.destinationPath === 'moved/alpha.md')
+      const moving = store.move({ id: alpha, destinationPath: 'moved/alpha.md' })
+
+      await gate.entered
+      let entered = false
+      const scope = store.withExactNoteClaim(alpha, async (current) => {
+        entered = true
+        // Re-deriving the target is not the claim. The lease was queued on
+        // 'from/alpha.md' and must now HOLD the path the move produced: a nested
+        // scope is admitted by COVERAGE alone, so it is refused whenever the
+        // retained claim is still the stale one this waiter arrived with.
+        await expect(
+          store.withExactNoteClaim(alpha, async (nested) => nested.filePath),
+        ).resolves.toBe(current.filePath)
+        return current.filePath
+      })
+
+      try {
+        await nextTurn()
+        expect(entered).toBe(false)
+        gate.release()
+        await moving
+        await expect(scope).resolves.toBe('moved/alpha.md')
+      } finally {
+        gate.release()
+        await Promise.allSettled([moving, scope])
+      }
+    })
+
+    // The PATH axis of the compound observation. `runExactNoteTask` deliberately
+    // re-checks only the id and names this refusal as the reason it needs no
+    // second path test of its own — so the refusal itself has to be held down.
+    it('refuses a compound observation answered off the claimed path', async () => {
+      const { inner, store, alpha, beta } = await setup()
+      const alphaPath = (await store.read(alpha)).filePath
+      const betaPath = (await store.read(beta)).filePath
+      const read = inner.read.bind(inner)
+      let reached = false
+
+      inner.read = async (id, opts) => {
+        const detail = await read(id, opts)
+
+        // A degraded resolver that answers the claimed address with the NEIGHBOUR's
+        // file. Its id channel still says alpha, so only the path comparison can
+        // keep beta's body from being handed to the task under alpha's claim.
+        return detail.filePath === alphaPath ? { ...detail, filePath: betaPath } : detail
+      }
+
+      await expect(
+        store.withExactNoteClaim(alpha, async () => {
+          reached = true
+        }),
+      ).rejects.toThrow(/note not found/i)
+      expect(reached).toBe(false)
+    })
+
+    // The compound's own observation is read INSIDE its claim, so it must not go
+    // back for identity admission. A restore keeps that admission for its whole
+    // lease, and a claimed read queued behind it would be waiting on a mutation
+    // that is free to be waiting on this very claim.
+    it('reads its exact observation without re-entering identity admission', async () => {
+      const { revisions, store, alpha, beta } = await setup()
+      await store.remove(beta, { principal: 'test' })
+      const gate = gateRevisionGet(revisions)
+      const restore = store.restoreFromTrash(beta, { principal: 'test' })
+
+      await gate.entered
+      let entered = false
+      const scope = store.withExactNoteClaim(alpha, async (current) => {
+        entered = true
+        return current.filePath
+      })
+
+      try {
+        for (let turn = 0; turn < 5; turn += 1) {
+          await nextTurn()
+        }
+        expect(entered).toBe(true)
+        await expect(scope).resolves.toBe('from/alpha.md')
+      } finally {
+        gate.release()
+        await Promise.allSettled([restore, scope])
+      }
+    })
+
+    it('releases the exact scope after callback failure', async () => {
+      const { store, alpha, beta } = await setup()
+
+      await expect(
+        store.withExactNoteClaim(alpha, async () => {
+          throw new Error('compound failure')
+        }),
+      ).rejects.toThrow('compound failure')
+      await expect(store.read(alpha)).resolves.toMatchObject({ id: alpha })
+      await expect(store.read(beta)).resolves.toMatchObject({ id: beta })
+    })
+
+    it('fails closed on an exact target with no current path, before it claims', async () => {
+      const { inner, store, alpha, beta } = await setup()
+      const alphaToken = (await store.read(alpha)).versionToken
+      const read = inner.read.bind(inner)
+      let innerReadReached = false
+
+      inner.read = async (id, opts) => {
+        if (id.includes('missing-note')) {
+          innerReadReached = true
+        }
+
+        return read(id, opts)
+      }
+      // Park an unrelated mutation inside the engine: it holds its own claim for
+      // as long as the gate is shut. A refusal that first took a claim — the
+      // Space-wide one an empty target degrades into, or any other — would queue
+      // behind this and could not answer while it is parked.
+      const gate = gateWrite(
+        inner,
+        (input) =>
+          input.originalId === alpha ||
+          input.originalId === encodeWikilinkIdentity(alpha) ||
+          input.id === alpha,
+      )
+      const parked = store.write({
+        title: 'Alpha',
+        content: 'alpha-v2',
+        originalId: alpha,
+        versionToken: alphaToken,
+      })
+      let parkedSettled = false
+
+      void parked.then(
+        () => {
+          parkedSettled = true
+        },
+        () => {
+          parkedSettled = true
+        },
+      )
+
+      try {
+        await gate.entered
+
+        let refusalSettled = false
+        const refusal = store.withExactNoteClaim('missing-note', async () => undefined)
+
+        void refusal.then(
+          () => {
+            refusalSettled = true
+          },
+          () => {
+            refusalSettled = true
+          },
+        )
+        for (let turn = 0; turn < 10; turn += 1) {
+          await nextTurn()
+        }
+
+        expect(refusalSettled).toBe(true)
+        expect(parkedSettled).toBe(false)
+        expect(innerReadReached).toBe(false)
+        await expect(refusal).rejects.toThrow(/note not found: missing-note/i)
+      } finally {
+        gate.release()
+        await Promise.allSettled([parked])
+      }
+      await expect(store.read(beta)).resolves.toMatchObject({ id: beta })
+    })
+
     it('does not dispatch an alternate-spelling folder source to the engine', async () => {
       const { inner, store } = await setup()
       const move = vi.spyOn(inner, 'move')
@@ -2811,6 +3169,261 @@ for (const [name, createHarness] of variants) {
     })
   })
 }
+
+describe('CachedStore exact-note owner expansion', () => {
+  it('rejects a body-disclosed owner outside the claim before read side effects', async () => {
+    const harness = await createNotariumHarness()
+
+    try {
+      const alpha = await harness.store.write({ title: 'Alpha', content: 'alpha' })
+      const beta = await harness.store.write({ title: 'Beta', content: 'beta' })
+      const alphaBefore = await harness.store.read(alpha.id!)
+      const listBefore = await harness.store.list()
+      // finalizeRead stamps preview/facts/edges under the CLAIMED id, not under
+      // the id the body discloses. So the claimed note is the surface a guard
+      // that ran too late corrupts — assert it, not only the disclosed one.
+      const claimedPreviewBefore = await harness.store.preview(alpha.id!)
+      const claimedFactsBefore = await harness.store.noteFacts!([alpha.id!])
+      const previewBefore = await harness.store.preview(beta.id!)
+      const factsBefore = await harness.store.noteFacts!([beta.id!])
+      const graphBefore = await harness.store.graph()
+      const events: StoreEvent[] = []
+
+      harness.store.subscribe((event) => {
+        if (event.type === 'changed' || event.type === 'graph') {
+          events.push(event)
+        }
+      })
+      const read = harness.inner.read.bind(harness.inner)
+
+      harness.inner.read = async (id, opts) => {
+        const current = await read(id, opts)
+
+        return current.filePath === alphaBefore.filePath
+          ? {
+              ...current,
+              id: beta.id,
+              // Links OUT of the claimed note: patching these edges is a
+              // snapshot change, so a late guard also leaks a `changed` event.
+              content: 'foreign preview [[Beta]]',
+              frontmatter: { ...current.frontmatter, 'notarium-id': beta.id },
+            }
+          : current
+      }
+
+      await expect(
+        harness.store.withExactNoteClaim(alpha.id!, async () => undefined),
+      ).rejects.toThrow(/claim expansion/i)
+      expect(await harness.store.list()).toEqual(listBefore)
+      expect(harness.store.previewPeek(alpha.id!)).toEqual(claimedPreviewBefore)
+      await expect(harness.store.noteFacts!([alpha.id!])).resolves.toEqual(claimedFactsBefore)
+      expect(harness.store.previewPeek(beta.id!)).toEqual(previewBefore)
+      await expect(harness.store.noteFacts!([beta.id!])).resolves.toEqual(factsBefore)
+      await expect(harness.store.graph()).resolves.toEqual(graphBefore)
+      expect(events).toEqual([])
+      await expect(harness.store.read(beta.id!)).resolves.toMatchObject({
+        id: beta.id,
+        filePath: 'beta.md',
+      })
+    } finally {
+      await harness.close()
+    }
+  })
+
+  // An identity-capable engine owns an id channel of its own, so it discloses a
+  // foreign owner through two independent axes. Both must expand the claim; the
+  // fake below is the only harness here whose `capabilities.identity` is true.
+  for (const [axis, disclose] of [
+    [
+      'the engine id channel',
+      (detail: NoteContent, foreignId: string): NoteContent => ({ ...detail, id: foreignId }),
+    ],
+    [
+      'a body claim',
+      (detail: NoteContent, foreignId: string): NoteContent => ({
+        ...detail,
+        frontmatter: { ...detail.frontmatter, 'notarium-id': foreignId },
+      }),
+    ],
+  ] as const) {
+    it(`rejects an owner disclosed through ${axis} on an identity-capable engine`, async () => {
+      const harness = await createMemoryHarness()
+
+      try {
+        const alpha = await harness.store.write({ title: 'Alpha', content: 'alpha' })
+        const beta = await harness.store.write({ title: 'Beta', content: 'beta' })
+        const alphaBefore = await harness.store.read(alpha.id!)
+        const listBefore = await harness.store.list()
+        const previewBefore = await harness.store.preview(beta.id!)
+        const factsBefore = await harness.store.noteFacts!([beta.id!])
+        const graphBefore = await harness.store.graph()
+        const events: StoreEvent[] = []
+
+        harness.store.subscribe((event) => {
+          if (event.type === 'changed' || event.type === 'graph') {
+            events.push(event)
+          }
+        })
+        const read = harness.inner.read.bind(harness.inner)
+
+        harness.inner.read = async (id, opts) => {
+          const current = await read(id, opts)
+
+          return current.filePath === alphaBefore.filePath
+            ? disclose({ ...current, content: 'foreign preview [[Alpha]]' }, beta.id!)
+            : current
+        }
+
+        await expect(
+          harness.store.withExactNoteClaim(alpha.id!, async () => undefined),
+        ).rejects.toThrow(/claim expansion/i)
+        expect(await harness.store.list()).toEqual(listBefore)
+        expect(harness.store.previewPeek(beta.id!)).toEqual(previewBefore)
+        await expect(harness.store.noteFacts!([beta.id!])).resolves.toEqual(factsBefore)
+        await expect(harness.store.graph()).resolves.toEqual(graphBefore)
+        expect(events).toEqual([])
+        await expect(harness.store.read(beta.id!)).resolves.toMatchObject({
+          id: beta.id,
+          filePath: 'beta.md',
+        })
+      } finally {
+        await harness.close()
+      }
+    })
+  }
+})
+
+// The production engine has no identity channel, so every public read in this
+// Space takes the SAME PhaseGate the compound claim takes — the read cohort
+// against the mutation cohort. A mutation intent stranded between admission and
+// the queued claim therefore does not fail one caller: it freezes the Space.
+describe('CachedStore exact-note admission', () => {
+  it('hands back mutation admission when the exact claim fails before it is queued', async () => {
+    const harness = await createNotariumHarness()
+
+    try {
+      const alpha = await harness.store.write({ title: 'Alpha', content: 'alpha' })
+
+      // Stopping is the cheap way to fail `ensureMutationReady()`; a refused
+      // identity flush reaches the same place. Either way the throw lands after
+      // admission was taken and before the claim reaches the coordinator.
+      harness.store.stop()
+      await expect(
+        harness.store.withExactNoteClaim(alpha.id!, async () => undefined),
+      ).rejects.toThrow(/store is stopping/i)
+
+      let readSettled = false
+      const read = harness.store.read(alpha.id!).then(
+        () => {
+          readSettled = true
+        },
+        () => {
+          readSettled = true
+        },
+      )
+
+      for (let turn = 0; turn < 10; turn += 1) {
+        await nextTurn()
+      }
+      expect(readSettled).toBe(true)
+      await read
+    } finally {
+      // `close()` waits for that same gate to drain, so bound it: a stranded
+      // intent has to surface as the assertion above, not as a teardown timeout
+      // that hides which check caught the leak.
+      await Promise.race([harness.close(), new Promise((resolve) => setTimeout(resolve, 500))])
+    }
+  })
+})
+
+describe('CachedStore exact-note claim identity', () => {
+  it('takes the exact claim on the durable id behind a superseded spelling', async () => {
+    const notesDir = mkdtempSync(join(tmpdir(), 'notarium-exact-superseded-'))
+    const inner = createNotariumStore({
+      mounts: [{ class: 'user-doc', dir: notesDir, prefix: '' }],
+    })
+    const durableId = 'durable-exact-claim-id'
+    let store: CachedStore | undefined
+
+    try {
+      await inner.write({ id: durableId, title: 'Legacy', content: 'legacy body' })
+      const listEntered = deferred()
+      const releaseList = deferred()
+      const list = inner.list.bind(inner)
+      let gated = true
+
+      inner.list = async () => {
+        const result = await list()
+
+        if (gated) {
+          gated = false
+          listEntered.resolve()
+          await releaseList.promise
+        }
+
+        return result
+      }
+      store = new CachedStore({
+        inner,
+        pollIntervalMs: 0,
+        readBody: (filePath) => readFile(join(notesDir, filePath), 'utf8'),
+      })
+      const boot = store.start()
+
+      await listEntered.promise
+      const phaseOneId = (await store.list()).find((note) => note.filePath === 'legacy.md')?.id
+
+      if (!phaseOneId) {
+        throw new Error('phase-1 note must be visible')
+      }
+      releaseList.resolve()
+      await boot
+      expect(phaseOneId).not.toBe(durableId)
+
+      // A phase-1 client keeps addressing the note by the id it was handed. The
+      // compound claim is a resource claim: it has to name the id the sweep
+      // settled on, or it fences a spelling nothing else in the queue uses.
+      await expect(
+        store.withExactNoteClaim(phaseOneId, async (current) => current.id),
+      ).resolves.toBe(durableId)
+    } finally {
+      store?.stop()
+      await store?.settle()
+      rmSync(notesDir, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses to hand a compound task an observation outside its claim', async () => {
+    const harness = await createMemoryHarness()
+
+    try {
+      const alpha = await harness.store.write({ title: 'Alpha', content: 'alpha' })
+      const alphaBefore = await harness.store.read(alpha.id!)
+      const read = harness.inner.read.bind(harness.inner)
+      let observed: string | undefined
+
+      // An identity-capable engine that answers the claimed path with no id of
+      // its own. The decorator then has to mint one from its own registry, and
+      // that minted id is nothing the held claim names.
+      harness.inner.read = async (id, opts) => {
+        const current = await read(id, opts)
+
+        return current.filePath === alphaBefore.filePath
+          ? ({ ...current, id: undefined } as unknown as NoteContent)
+          : current
+      }
+
+      await expect(
+        harness.store.withExactNoteClaim(alpha.id!, async (current) => {
+          observed = current.id
+        }),
+      ).rejects.toThrow(/escaped the held mutation claim/i)
+      expect(observed).toBeUndefined()
+    } finally {
+      await harness.close()
+    }
+  })
+})
 
 // canon: docs/note-model.md#create-collisions
 for (const [name, createHarness] of variants) {

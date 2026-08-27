@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { MutationCoordinator } from './mutationCoordinator'
+import { type MutationClaim, MutationCoordinator } from './mutationCoordinator'
 
 const deferred = () => {
   let resolve!: () => void
@@ -270,5 +270,225 @@ describe('MutationCoordinator', () => {
       },
     )
     expect(coordinator.holds()).toBe(false)
+  })
+
+  it('adopts a candidate a held prefix or a held global lease already reaches', async () => {
+    const coordinator = new MutationCoordinator()
+    const entered: string[] = []
+    const adopt = (claim: MutationClaim, label: string) =>
+      coordinator.runWithinHeld(claim, async () => {
+        entered.push(label)
+      })
+
+    await coordinator.run(
+      { noteIds: ['a'], paths: ['/one/a.md/'], prefixes: ['one/assets'] },
+      async () => {
+        await expect(
+          adopt({ noteIds: ['a'], paths: ['one/a.md'] }, 'exact'),
+        ).resolves.toBeUndefined()
+        // A candidate PATH inside a held PREFIX is inside exactly the reach that
+        // prefix already fences, so adopting it widens nothing…
+        await expect(
+          adopt({ noteIds: ['a'], paths: ['one/assets/icon.png'] }, 'under-prefix'),
+        ).resolves.toBeUndefined()
+        // …while a candidate PREFIX has to be one the lease itself took, and an
+        // opaque RESOURCE has no containment order at all: only equality.
+        await expect(adopt({ prefixes: ['one/assets/deep'] }, 'sub-prefix')).rejects.toThrow(
+          /not covered by an active caller lease/i,
+        )
+        await expect(adopt({ resources: ['source:v1:a'] }, 'resource')).rejects.toThrow(
+          /not covered by an active caller lease/i,
+        )
+      },
+    )
+
+    // A global lease fences everything, so it reaches both a narrow candidate and
+    // a global one — the only lease that reaches a global candidate at all.
+    await coordinator.run({ global: true }, async () => {
+      await expect(
+        adopt({ noteIds: ['a'], paths: ['one/a.md'] }, 'narrow-under-global'),
+      ).resolves.toBeUndefined()
+      await expect(adopt({ global: true }, 'global-under-global')).resolves.toBeUndefined()
+    })
+
+    expect(entered).toEqual(['exact', 'under-prefix', 'narrow-under-global', 'global-under-global'])
+  })
+
+  it('retains the lease until an admitted covered child settles', async () => {
+    const coordinator = new MutationCoordinator()
+    const childEntered = deferred()
+    const releaseChild = deferred()
+    const tryLateJoin = deferred()
+    const order: string[] = []
+    let child!: Promise<void>
+    let lateJoin!: Promise<void>
+
+    const outer = coordinator.run({ noteIds: ['a'] }, async () => {
+      lateJoin = (async () => {
+        await tryLateJoin.promise
+        return coordinator.runWithinHeld({ noteIds: ['a'] }, async () => {
+          order.push('late')
+        })
+      })()
+      child = coordinator.runWithinHeld({ noteIds: ['a'] }, async () => {
+        order.push('child:start')
+        childEntered.resolve()
+        await releaseChild.promise
+        order.push('child:end')
+      })
+      await childEntered.promise
+      order.push('outer:return')
+    })
+
+    await childEntered.promise
+    const contender = coordinator.run({ noteIds: ['a'] }, async () => {
+      order.push('contender')
+    })
+    const unrelated = coordinator.run({ noteIds: ['b'] }, async () => {
+      order.push('unrelated')
+    })
+
+    await Promise.resolve()
+    expect(order).toEqual(['child:start', 'outer:return', 'unrelated'])
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    tryLateJoin.resolve()
+    await expect(lateJoin).rejects.toThrow(/active caller lease/i)
+
+    releaseChild.resolve()
+    await Promise.all([outer, child, contender, unrelated])
+    expect(order).toEqual(['child:start', 'outer:return', 'unrelated', 'child:end', 'contender'])
+  })
+
+  // A claimed callback that THROWS is the ordinary production path — every
+  // failure cut runs through it — so the lease has to outlive a child that is
+  // still inside it exactly as it does on the success path.
+  it('retains the lease for a running child when the callback throws', async () => {
+    const coordinator = new MutationCoordinator()
+    const childEntered = deferred()
+    const releaseChild = deferred()
+    const order: string[] = []
+    let child!: Promise<void>
+
+    const outer = coordinator.run({ noteIds: ['a'] }, async () => {
+      child = coordinator.runWithinHeld({ noteIds: ['a'] }, async () => {
+        order.push('child:start')
+        childEntered.resolve()
+        await releaseChild.promise
+        order.push('child:end')
+      })
+      await childEntered.promise
+      throw new Error('boom')
+    })
+
+    await childEntered.promise
+    const contender = coordinator.run({ noteIds: ['a'] }, async () => {
+      order.push('contender')
+    })
+
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(order).toEqual(['child:start'])
+    releaseChild.resolve()
+    await expect(outer).rejects.toThrow('boom')
+    await Promise.all([child, contender])
+    expect(order).toEqual(['child:start', 'child:end', 'contender'])
+  })
+
+  it('refuses an uncovered candidate inside an active lease', async () => {
+    const coordinator = new MutationCoordinator()
+    const entered: string[] = []
+
+    await coordinator.run({ noteIds: ['a'], paths: ['one/a.md'] }, async () => {
+      // The lease is active and this IS its callback, so only the coverage test
+      // on the candidate can keep these three outside it.
+      await expect(
+        coordinator.runWithinHeld({ noteIds: ['b'] }, async () => {
+          entered.push('other-note')
+        }),
+      ).rejects.toThrow(/not covered by an active caller lease/i)
+      await expect(
+        coordinator.runWithinHeld({ global: true }, async () => {
+          entered.push('global')
+        }),
+      ).rejects.toThrow(/not covered by an active caller lease/i)
+      await expect(
+        coordinator.runWithinHeld({ paths: ['two/b.md'] }, async () => {
+          entered.push('other-path')
+        }),
+      ).rejects.toThrow(/not covered by an active caller lease/i)
+      // …while the candidate the lease does cover still adopts it.
+      await expect(
+        coordinator.runWithinHeld({ noteIds: ['a'], paths: ['one/a.md'] }, async () => {
+          entered.push('covered')
+          return 'covered'
+        }),
+      ).resolves.toBe('covered')
+    })
+
+    expect(entered).toEqual(['covered'])
+    // A refused candidate joined no lifetime: the lease is free immediately.
+    await expect(
+      coordinator.run({ noteIds: ['a'], paths: ['one/a.md'] }, async () => 'after'),
+    ).resolves.toBe('after')
+  })
+
+  it('expires claim coverage when the lease callback finishes', async () => {
+    const coordinator = new MutationCoordinator()
+    const continueDetached = deferred()
+    let detached!: Promise<void>
+
+    await coordinator.run({ noteIds: ['a'] }, async () => {
+      expect(coordinator.hasClaimContext()).toBe(true)
+      await Promise.resolve()
+      await expect(
+        coordinator.runWithinHeld({ noteIds: ['a'] }, async () => undefined),
+      ).resolves.toBeUndefined()
+
+      detached = (async () => {
+        await continueDetached.promise
+        expect(coordinator.hasClaimContext()).toBe(true)
+        expect(coordinator.holds()).toBe(false)
+        return coordinator.runWithinHeld({ noteIds: ['a'] }, async () => undefined)
+      })()
+    })
+
+    expect(coordinator.hasClaimContext()).toBe(false)
+    continueDetached.resolve()
+    await expect(detached).rejects.toThrow(/active caller lease/i)
+  })
+
+  it('expires claim coverage when the lease callback throws', async () => {
+    const coordinator = new MutationCoordinator()
+    const continueDetached = deferred()
+    let detached!: Promise<unknown>
+
+    await expect(
+      coordinator.run({ noteIds: ['a'] }, async () => {
+        detached = (async () => {
+          await continueDetached.promise
+          return coordinator.runWithinHeld({ noteIds: ['a'] }, async () => 'joined')
+        })()
+        throw new Error('boom')
+      }),
+    ).rejects.toThrow('boom')
+
+    // The failed lease is gone and the note belongs to the next caller: a
+    // descendant that shows up afterwards must not join the dead claim beside it.
+    const contender = coordinator.run({ noteIds: ['a'] }, async () => 'contender')
+
+    continueDetached.resolve()
+    await expect(detached).rejects.toThrow(/active caller lease/i)
+    await expect(contender).resolves.toBe('contender')
+  })
+
+  it('does not attach manually acquired claims to the async caller', async () => {
+    const coordinator = new MutationCoordinator()
+    const release = await coordinator.acquire({ global: true })
+
+    try {
+      expect(coordinator.hasClaimContext()).toBe(false)
+      expect(coordinator.holds()).toBe(false)
+    } finally {
+      release()
+    }
   })
 })
