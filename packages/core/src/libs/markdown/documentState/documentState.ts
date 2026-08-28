@@ -3,6 +3,7 @@ import { isMap, isScalar, type Pair, parseDocument, visit } from 'yaml'
 import { isValidNoteId } from '../../id'
 import {
   type FrontmatterBlock,
+  frontmatterBlockEol,
   type FrontmatterEntry,
   frontmatterEntrySpans,
   frontmatterEntryValue,
@@ -946,11 +947,11 @@ const insertionBeforeClosingFence = (
 ): DocumentPatch => {
   const text = STRICT_UTF8.decode(state.source)
   const block = parseFrontmatterBlock(text)
-  const eol = text.includes('\r\n') ? '\r\n' : '\n'
-  const payload = lines.join(eol)
   const offsets = utf16ByteOffsets(text)
 
   if (!block) {
+    const eol = frontmatterBlockEol(text)
+    const payload = lines.join(eol)
     // A generated envelope opens the document — but the encoding prologue opens the
     // FILE, and a mark that no longer leads its bytes is not a mark at all: it becomes a
     // stray zero-width space in the middle of the prose.
@@ -962,6 +963,8 @@ const insertionBeforeClosingFence = (
     }
   }
   const bounds = frontmatterPayloadBounds(text, block.bodyStart)
+  const eol = frontmatterBlockEol(text, bounds)
+  const payload = lines.join(eol)
   return {
     range: byteRange(offsets, bounds.payloadEnd, bounds.payloadEnd),
     bytes: UTF8.encode(`${payload}${eol}`),

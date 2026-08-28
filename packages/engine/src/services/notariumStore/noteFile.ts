@@ -12,13 +12,22 @@
 import {
   CREATED_FALLBACK_FRONTMATTER_KEY,
   DEFAULT_NOTE_TYPE,
+  type FrontmatterBlock,
+  frontmatterBlockEol,
   type FrontmatterEntry,
+  frontmatterEntryIsBlockScalar,
   frontmatterEntryOf,
+  frontmatterEntrySpans,
   frontmatterEntryValue,
+  FrontmatterGeometryError,
   frontmatterHasYamlNodeReferences,
   FrontmatterLimitError,
   frontmatterListEntry,
+  type FrontmatterPayloadBounds,
+  frontmatterPayloadBounds,
+  frontmatterScalar,
   frontmatterScalarEntry,
+  type FrontmatterSpan,
   IMPORT_SOURCE_FRONTMATTER_KEY,
   isImportNoteSourceLocator,
   isValidNoteId,
@@ -27,6 +36,7 @@ import {
   normAliases,
   normTags,
   NOTE_ID_FRONTMATTER_KEY,
+  parseBodyFrontmatterBlock,
   parseFrontmatterBlock,
   singleLine,
   slugify,
@@ -254,6 +264,316 @@ export type SerializeInput = {
   existingRaw?: string | null
 }
 
+export type NoteFileSource = {
+  raw: string
+  block: FrontmatterBlock | null
+  bounds: FrontmatterPayloadBounds | null
+  spans: readonly FrontmatterSpan[] | null
+}
+
+export type NoteFileAssembly = {
+  title: string
+  cleanBody: string
+  keyless: readonly FrontmatterEntry[]
+  entries: readonly FrontmatterEntry[]
+  live: readonly boolean[]
+  touched: readonly boolean[]
+  replacing: boolean
+  source: NoteFileSource | null
+}
+
+const entryInline = (entry: FrontmatterEntry): string | null => {
+  const line = entry.lines[0]
+
+  if (!entry.key || line == null) {
+    return null
+  }
+  const colon = line.indexOf(':')
+  return colon < 0 ? null : line.slice(colon + 1).trim()
+}
+
+const rawFlowItems = (inline: string): string[] | null => {
+  if (!inline.startsWith('[') || !inline.endsWith(']')) {
+    return null
+  }
+  const body = inline.slice(1, -1)
+
+  if (!body.trim()) {
+    return []
+  }
+  const out: string[] = []
+  let start = 0
+  let quote: '"' | "'" | null = null
+
+  for (let i = 0; i < body.length; i++) {
+    const char = body[i]
+
+    if (quote === '"') {
+      if (char === '\\') {
+        i++
+      } else if (char === '"') {
+        quote = null
+      }
+      continue
+    }
+    if (quote === "'") {
+      if (char === "'" && body[i + 1] === "'") {
+        i++
+      } else if (char === "'") {
+        quote = null
+      }
+      continue
+    }
+    if (char === '"' || char === "'") {
+      quote = char
+    } else if (char === ',') {
+      const item = body.slice(start, i).trim()
+
+      if (!item) {
+        return null
+      }
+      out.push(item)
+      start = i + 1
+    }
+  }
+  if (quote) {
+    return null
+  }
+  const tail = body.slice(start).trim()
+
+  if (!tail) {
+    return null
+  }
+  out.push(tail)
+  return out
+}
+
+const rawListItems = (entry: FrontmatterEntry): string[] | null => {
+  const inline = entryInline(entry)
+
+  if (inline?.startsWith('[')) {
+    return entry.lines.length === 1 ? rawFlowItems(inline) : null
+  }
+  if (inline !== '' || entry.lines.length < 2) {
+    return null
+  }
+  const out: string[] = []
+
+  for (const line of entry.lines.slice(1)) {
+    const item = /^ *-[ \t]+(.*)$/.exec(line)
+
+    if (!item) {
+      return null
+    }
+    out.push(item[1].trim())
+  }
+
+  return out
+}
+
+const isQuoted = (raw: string | null | undefined): boolean => {
+  const first = raw?.trim()[0]
+  return first === '"' || first === "'"
+}
+
+const sameValues = (left: readonly string[], right: readonly string[]): boolean =>
+  left.length === right.length && left.every((value, index) => value === right[index])
+
+const LIST_CHANNELS: Readonly<Record<string, (value: unknown) => string[] | undefined>> = {
+  aliases: normAliases,
+  tags: normTags,
+}
+
+type AlignedChannelItem = { value: string; raw: string }
+
+/** Keep each normalized channel item paired with the raw YAML item it came from.
+ * A normalizer may trim or drop an item (aliases drops blanks), so indexing the
+ * original raw list by a normalized index can validate the next item against the
+ * wrong quoting. */
+const alignedChannelItems = (
+  projected: readonly string[],
+  raw: readonly string[],
+  normalise: (value: unknown) => string[] | undefined,
+): AlignedChannelItem[] | null => {
+  if (projected.length !== raw.length) {
+    return null
+  }
+  const aligned: AlignedChannelItem[] = []
+
+  for (let index = 0; index < projected.length; index++) {
+    const value = normalise([projected[index]])
+
+    if (!value || value.length > 1) {
+      return null
+    }
+    if (value.length === 1) {
+      aligned.push({ value: value[0], raw: raw[index] })
+    }
+  }
+
+  return aligned
+}
+
+/** Preserve an authored typed entry only when both the line reader and a real
+ * YAML reader keep seeing the same channel value. This is a data-integrity gate,
+ * not a formatting optimisation: unreadable, lossy or under-quoted forms must be
+ * canonicalised once so later readers do not disagree with the index. */
+const sameChannelValue = (
+  existing: FrontmatterEntry,
+  incoming: FrontmatterEntry,
+  key: string,
+): boolean => {
+  if (frontmatterEntryIsBlockScalar(existing) || frontmatterEntryIsBlockScalar(incoming)) {
+    return false
+  }
+  const current = frontmatterEntryValue(existing)
+  const next = frontmatterEntryValue(incoming)
+
+  if (current === null || next === null) {
+    return false
+  }
+  if (typeof current === 'string' || typeof next === 'string') {
+    if (typeof current !== 'string' || typeof next !== 'string' || current !== next) {
+      return false
+    }
+
+    return !frontmatterScalar(next).startsWith('"') || isQuoted(entryInline(existing))
+  }
+  const normalise = LIST_CHANNELS[key]
+
+  if (!normalise) {
+    return false
+  }
+  const currentValue = normalise(current)
+  const nextValue = normalise(next)
+  const currentRaw = rawListItems(existing)
+  const nextRaw = rawListItems(incoming)
+  const currentItems = currentRaw && alignedChannelItems(current, currentRaw, normalise)
+  const nextItems = nextRaw && alignedChannelItems(next, nextRaw, normalise)
+
+  if (
+    !currentValue ||
+    !nextValue ||
+    !currentItems ||
+    !nextItems ||
+    !sameValues(
+      currentValue,
+      currentItems.map((item) => item.value),
+    ) ||
+    !sameValues(
+      nextValue,
+      nextItems.map((item) => item.value),
+    ) ||
+    !sameValues(currentValue, nextValue)
+  ) {
+    return false
+  }
+
+  return nextValue.every(
+    (value, index) =>
+      !frontmatterScalar(value).startsWith('"') || isQuoted(currentItems[index]?.raw),
+  )
+}
+
+const emitEntries = (entries: readonly FrontmatterEntry[], eol: '\n' | '\r\n'): string =>
+  entries
+    .flatMap((entry) => entry.lines)
+    .map((line) => `${line}${eol}`)
+    .join('')
+
+const assertFrontmatterPayload = (payload: string): void => {
+  if (!isWithinFrontmatterByteCap(payload)) {
+    throw new FrontmatterLimitError()
+  }
+}
+
+const canonicalNoteFile = (
+  assembly: NoteFileAssembly,
+  eol: '\n' | '\r\n',
+  preserveBom: boolean,
+): string => {
+  const { title, cleanBody, keyless, entries, live, source } = assembly
+  const payload = emitEntries([...keyless, ...entries.filter((_, index) => live[index])], eol)
+
+  assertFrontmatterPayload(payload)
+  const bom = preserveBom && source?.raw.charCodeAt(0) === 0xfeff ? '\uFEFF' : ''
+  const head = `${bom}---${eol}${payload}---${eol}${eol}# ${singleLine(title)}${eol}`
+  return cleanBody ? `${head}${eol}${cleanBody}` : head
+}
+
+const splicedNoteFile = (assembly: NoteFileAssembly, source: NoteFileSource): string => {
+  const { title, cleanBody, keyless, entries, live, touched } = assembly
+  const { raw, block, bounds, spans } = source
+
+  if (!block || !bounds || !spans || spans.length > entries.length) {
+    throw new FrontmatterGeometryError('geometry')
+  }
+  const blockEol = frontmatterBlockEol(raw, bounds)
+  let payload = emitEntries(keyless, blockEol)
+  let cursor = bounds.payloadStart
+
+  for (let index = 0; index < spans.length; index++) {
+    const span = spans[index]
+
+    if (span.start < cursor || span.end < span.start || span.end > bounds.payloadEnd) {
+      throw new FrontmatterGeometryError('geometry')
+    }
+    payload += raw.slice(cursor, span.start)
+    if (live[index]) {
+      if (touched[index]) {
+        const terminator = raw.slice(span.start, span.end).endsWith('\r\n') ? '\r\n' : '\n'
+        payload += emitEntries([entries[index]], terminator)
+      } else {
+        payload += raw.slice(span.start, span.end)
+      }
+    }
+    cursor = span.end
+  }
+  payload += raw.slice(cursor, bounds.payloadEnd)
+  payload += emitEntries(
+    entries.slice(spans.length).filter((_, offset) => live[spans.length + offset]),
+    blockEol,
+  )
+  assertFrontmatterPayload(payload)
+
+  let closingRaw = raw.slice(bounds.payloadEnd, block.bodyStart)
+  const headEol = closingRaw.endsWith('\r\n') ? '\r\n' : closingRaw.endsWith('\n') ? '\n' : blockEol
+
+  if (!closingRaw.endsWith('\n')) {
+    closingRaw += blockEol
+  }
+  const head = `${raw.slice(0, bounds.payloadStart)}${payload}${closingRaw}${headEol}# ${singleLine(title)}${headEol}`
+  return cleanBody ? `${head}${headEol}${cleanBody}` : head
+}
+
+/** Pure final assembler. Existing geometry enables a lossless splice; an
+ * impossible parser/source mismatch falls back to the former canonical rebuild
+ * instead of guessing a span or publishing partial bytes. */
+export const assembleNoteFile = (assembly: NoteFileAssembly): string => {
+  const { source, replacing } = assembly
+
+  if (!source) {
+    return canonicalNoteFile(assembly, '\n', false)
+  }
+  if (replacing) {
+    return canonicalNoteFile(assembly, '\n', true)
+  }
+  if (!source.block) {
+    return canonicalNoteFile(assembly, frontmatterBlockEol(source.raw), true)
+  }
+  try {
+    return splicedNoteFile(assembly, source)
+  } catch (error) {
+    if (!(error instanceof FrontmatterGeometryError)) {
+      throw error
+    }
+    const eol = source.bounds
+      ? frontmatterBlockEol(source.raw, source.bounds)
+      : frontmatterBlockEol(source.raw)
+    return canonicalNoteFile(assembly, eol, true)
+  }
+}
+
 /** Build the file: existing frontmatter ∪ the imported note's own ∪ the body's
  *  inline frontmatter ∪ our fields (ours win), then the storage-format `# title`
  *  heading and the body. */
@@ -274,11 +594,26 @@ export const serializeNoteFile = ({
   existingRaw,
 }: SerializeInput): string => {
   const replacing = frontmatterMode === 'replace'
+  const existingBlock =
+    !replacing && existingRaw != null ? parseFrontmatterBlock(existingRaw) : null
+  const source: NoteFileSource | null =
+    existingRaw == null
+      ? null
+      : { raw: existingRaw, block: existingBlock, bounds: null, spans: null }
+
+  if (source?.block) {
+    try {
+      source.bounds = frontmatterPayloadBounds(source.raw, source.block.bodyStart)
+      source.spans = frontmatterEntrySpans(source.raw, source.block)
+    } catch (error) {
+      if (!(error instanceof FrontmatterGeometryError)) {
+        throw error
+      }
+    }
+  }
   const existingEntries: FrontmatterEntry[] = replacing
     ? (frontmatter ?? []).map((entry) => ({ key: entry.key, lines: [...entry.lines] }))
-    : existingRaw != null
-      ? (parseFrontmatterBlock(existingRaw)?.entries ?? [])
-      : []
+    : (existingBlock?.entries ?? [])
   // Inline frontmatter riding the body is another incoming metadata channel. Parse
   // it before the safety gate so a caller cannot bypass the raw-entry check by
   // placing `&anchor` / `*alias` in `body` instead of WriteInput.frontmatter.
@@ -286,10 +621,7 @@ export const serializeNoteFile = ({
   // A full-state restore already split its canonical snapshot into authored
   // frontmatter and body. Reinterpreting a leading fenced block in that body
   // would hoist user prose into metadata and make restore destructive.
-  // A BODY has no encoding prologue — that belongs to the file — so a mark leading it is
-  // content, and a block cannot open behind one. `FM_OPEN` tolerates a mark because it is
-  // written for raw files; applying it here folded the author's byte into metadata.
-  const inline = replacing || body.charCodeAt(0) === 0xfeff ? null : parseFrontmatterBlock(body)
+  const inline = replacing ? null : parseBodyFrontmatterBlock(body)
 
   // Anchors and aliases are order-dependent, while this serializer merges by key
   // and always replaces at least `title`. Refuse them on every incoming channel,
@@ -313,6 +645,7 @@ export const serializeNoteFile = ({
   // A large imported block may contain tens of thousands of distinct authored
   // keys, so `findIndex` per entry turns one upload into quadratic event-loop work.
   const live = entries.map(() => true)
+  const touched = entries.map(() => false)
   const positions = new Map<string, number[]>()
 
   for (let i = 0; i < entries.length; i++) {
@@ -344,6 +677,13 @@ export const serializeNoteFile = ({
     }
     const occupied = positions.get(key)
 
+    if (
+      occupied?.length === 1 &&
+      live[occupied[0]] &&
+      sameChannelValue(entries[occupied[0]], entry, key)
+    ) {
+      return
+    }
     if (occupied?.length) {
       // Replace at the first live occurrence: this preserves the key's anchor
       // among surrounding authored fields/comments while collapsing every later
@@ -352,6 +692,7 @@ export const serializeNoteFile = ({
       const [anchor, ...duplicates] = occupied
       entries[anchor] = entry
       live[anchor] = true
+      touched[anchor] = true
       for (const i of duplicates) {
         live[i] = false
       }
@@ -360,6 +701,7 @@ export const serializeNoteFile = ({
     }
     const appended = entries.push(entry) - 1
     live.push(true)
+    touched.push(true)
     positions.set(key, [appended])
   }
 
@@ -400,6 +742,8 @@ export const serializeNoteFile = ({
       }
       if (e.key) {
         put(e)
+      } else {
+        keyless.push(e)
       }
     }
     cleanBody = body.slice(inline.bodyStart).replace(/^\r?\n/, '')
@@ -480,28 +824,14 @@ export const serializeNoteFile = ({
     }
   }
 
-  const fmLines = [...keyless, ...entries.filter((_, index) => live[index])].flatMap((e) => e.lines)
-  const frontmatterPayload = `${fmLines.join('\n')}\n`
-
-  // Check the exact bytes that will sit between the fences, including the final
-  // line break. Otherwise a near-cap existing block can accept one more typed
-  // field, write bytes that our own parser rejects, and only discover the damage
-  // after the atomic file replacement has already happened.
-  if (!isWithinFrontmatterByteCap(frontmatterPayload)) {
-    throw new FrontmatterLimitError()
-  }
-  // The heading repeats the title, so it must repeat the SAME string the frontmatter
-  // states — `singleLine`, not the raw value. Writing the raw one let a title with a
-  // line terminator disagree with its own `title:`, and a heading that does not match
-  // the title is never stripped on read: one stray copy stayed in the body forever.
-  // The encoding prologue is a property of the FILE, not of anything we project, and this
-  // serializer rebuilds the file from scratch — so without carrying it over, an ordinary
-  // save silently rewrote a byte of somebody else's file. Exactly one mark leads a file
-  // (a second is content, the same law `FM_OPEN` states), it comes only from bytes that
-  // already had one, and `parseNoteFile` has stripped it off `cleanBody` already, so it
-  // cannot land twice. It sits outside the fences, so the frontmatter byte cap checked
-  // above is unaffected.
-  const bom = existingRaw?.charCodeAt(0) === 0xfeff ? '\uFEFF' : ''
-  const head = `${bom}---\n${frontmatterPayload}---\n\n# ${singleLine(title)}\n`
-  return cleanBody ? `${head}\n${cleanBody}` : head
+  return assembleNoteFile({
+    title,
+    cleanBody,
+    keyless,
+    entries,
+    live,
+    touched,
+    replacing,
+    source,
+  })
 }

@@ -746,6 +746,21 @@ describe('CachedStore — preview cache (#64)', () => {
     expect(read).not.toHaveBeenCalled()
   })
 
+  it('keeps rule-fenced prose in the write-through preview', async () => {
+    const { inner, store } = await make()
+    const res = await store.write({
+      title: 'Rule-led prose',
+      directory: 'demo',
+      content: '---\nAn authored opening.\n---\nAnd the rest.\n',
+    })
+    const read = vi.spyOn(inner, 'read')
+    const preview = await store.preview(res.id!)
+
+    expect(preview.snippet).toContain('An authored opening.')
+    expect(preview.snippet).toContain('And the rest.')
+    expect(read).not.toHaveBeenCalled()
+  })
+
   it('an external upsert invalidates the entry; the next view recomputes lazily', async () => {
     const inner = new InMemoryStore(FIXTURE)
     const feed = inner.changes.bind(inner)

@@ -15,16 +15,17 @@ import {
   type SearchInput,
 } from '@notarium/contract/tools'
 import {
+  FrontmatterLimitError,
   type Graph,
   isPathUnder,
   listHeadings,
   memoryDirOf,
   type NoteClass,
+  parseBodyFrontmatterBlock,
   queryNotes,
   READ_SCOPE,
   recall,
   type RecallTarget,
-  stripFrontmatter,
   treeChildren,
 } from '@notarium/core'
 
@@ -48,6 +49,18 @@ const LIST_FOLDERS_LIMIT = 200
  *  over-fetch a deep window then filter. Multiplier + hard cap. */
 const RECENT_PROJECT_OVERFETCH = 5
 const RECENT_OVERFETCH_CAP = 200
+
+const bodyWithoutMetadata = (body: string): string => {
+  try {
+    const block = parseBodyFrontmatterBlock(body)
+    return block ? body.slice(block.bodyStart) : body
+  } catch (error) {
+    if (error instanceof FrontmatterLimitError) {
+      return body
+    }
+    throw error
+  }
+}
 
 export const handleSearch: Handler = async (ctx, rawArgs) => {
   const { query, project, class: classFilter, responseFormat, limit } = rawArgs as SearchInput
@@ -171,11 +184,12 @@ export const handleGetNote: Handler = async (ctx, rawArgs) => {
     await ctx.projectsInSpace(hit.space),
   )
   const path = notePath(note.filePath)
-  // detailed also surfaces the heading outline (valid replaceSection targets, same extractor edit_note matches)
+  // Detailed also surfaces the heading outline (valid replaceSection targets); the shared
+  // body-frontmatter reader keeps rule-fenced prose visible to both operations.
   // and graph edges. agent-memory notes aren't graph nodes → empty links, honest.
   const detailed = responseFormat === RESPONSE_FORMAT.detailed
   const outline = detailed
-    ? listHeadings(stripFrontmatter(note.content)).map((h) => ({
+    ? listHeadings(bodyWithoutMetadata(note.content)).map((h) => ({
         level: h.level,
         title: sanitizeText(h.text),
       }))

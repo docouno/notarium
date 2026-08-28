@@ -208,6 +208,30 @@ describe('editNote', () => {
     expect(store.writes).toHaveLength(0)
   })
 
+  it('writes a findReplace inside rule-fenced prose instead of swallowing it as a no-op', async () => {
+    const store = fakeStore('---\nOld authored thought.\n---\nrest\n')
+    const before = computeVersionToken(store.body)
+    const result = await editNote(store, {
+      noteId: 'note-1',
+      operation: 'findReplace',
+      find: 'Old authored thought.',
+      content: 'New authored thought.',
+    })
+
+    expect(store.writes).toHaveLength(1)
+    expect(store.body).toContain('New authored thought.')
+    expect(result.versionToken).not.toBe(before)
+  })
+
+  it('keeps the prior no-throw degradation for an oversized body opening', async () => {
+    const store = fakeStore(`---\n${'x'.repeat(70 * 1024)}\n---\nrest\n`)
+
+    await expect(
+      editNote(store, { noteId: 'note-1', operation: 'append', content: 'more' }),
+    ).resolves.toBeDefined()
+    expect(store.writes).toHaveLength(1)
+  })
+
   it('preserves the note tags on a body edit (an omitted-tags write would clear them)', async () => {
     const store = fakeStore('body', { frontmatter: { tags: ['keep', 'these'] } })
     await editNote(store, { noteId: 'note-1', operation: 'append', content: 'more' })

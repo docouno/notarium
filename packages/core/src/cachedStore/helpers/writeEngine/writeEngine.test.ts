@@ -142,6 +142,60 @@ describe('WriteEngine destination fence', () => {
     },
   )
 
+  it('does not turn an oversized post-write body projection into a failed mutation', async () => {
+    const id = 'oversized-body-id'
+    const path = 'oversized.md'
+    const content = `---\n${'x'.repeat(70 * 1024)}\n---\nrest\n`
+    const notes = new Map<string, NoteMeta>([
+      [
+        id,
+        {
+          id,
+          title: 'Oversized',
+          class: 'user-doc',
+          filePath: path,
+          modifiedAt: null,
+          createdAt: null,
+        },
+      ],
+    ])
+    const live = {
+      id,
+      title: 'Oversized',
+      class: 'user-doc',
+      filePath: path,
+      content: 'before',
+      frontmatter: {},
+      versionToken: 'before-token',
+      physicalIncarnation: { adapterId: 'test', claim: { kind: 'test', value: 'before' } },
+    } as unknown as NoteContent
+    const after = { ...live, content, versionToken: 'after-token' }
+    const { host } = hostFor(notes)
+
+    ;(host.inner.read as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce(live)
+      .mockResolvedValue(after)
+    ;(host.inner.write as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id,
+      title: 'Oversized',
+      class: 'user-doc',
+      filePath: path,
+      versionToken: 'after-token',
+    })
+
+    await expect(
+      new WriteEngine(host).write({
+        originalId: id,
+        title: 'Oversized',
+        content,
+        frontmatterMode: 'replace',
+        versionToken: exactVersionToken(live),
+      }),
+    ).resolves.toBeDefined()
+    expect(host.previewCache.set).toHaveBeenCalled()
+    expect(host.emitChanged).toHaveBeenCalledWith([id], [], false)
+  })
+
   it('enters aroundWrite after the mutation claim and releases it after finalize', async () => {
     const id = 'owned-note-id'
     const path = `${PACKAGE_DIR}/SKILL.md`

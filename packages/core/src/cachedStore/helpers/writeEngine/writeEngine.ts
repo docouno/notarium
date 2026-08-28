@@ -37,8 +37,10 @@ import {
   encodeWikilinkIdentity,
   frontmatterEntryOf,
   frontmatterEntryValue,
+  FrontmatterLimitError,
   isDurableFrontmatter,
   type LogicalNoteState,
+  parseBodyFrontmatterBlock,
   promoteBodyTitle,
   stripFrontmatter,
   stripTitleHeading,
@@ -80,6 +82,18 @@ const normAuthoredDate = (v?: string): string | undefined => {
   }
   const t = Date.parse(v)
   return Number.isNaN(t) ? undefined : new Date(t).toISOString()
+}
+
+const bodyWithoutMetadata = (body: string): string => {
+  try {
+    const block = parseBodyFrontmatterBlock(body)
+    return block ? body.slice(block.bodyStart) : body
+  } catch (error) {
+    if (error instanceof FrontmatterLimitError) {
+      return body
+    }
+    throw error
+  }
 }
 
 /** How far `uniquify` will count before giving up and surfacing the collision. A
@@ -2238,10 +2252,13 @@ export class WriteEngine {
     this.host.snap.notes.set(id, nextMeta)
     // Write-through keeps the preview warm too: the very snippet the Feed will
     // ask for next is computed here, from data the save already carried.
-    // The caller's own text, not a parsed body: an editor may send a leading inline block
-    // that the serializer folds into the file's frontmatter a moment later. This is the
-    // one preview producer that holds unparsed bytes, so it answers for the block HERE.
-    this.host.previewCache.set(id, derivePreview(stripFrontmatter(input.content ?? ''), input.tags))
+    // The caller's own text, not a parsed file: a record-bearing opening is folded into
+    // frontmatter, while rule-fenced prose remains visible body. This is the one preview
+    // producer holding pre-serialization bytes, so it applies the shared body answer here.
+    this.host.previewCache.set(
+      id,
+      derivePreview(bodyWithoutMetadata(input.content ?? ''), input.tags),
+    )
     // Exact write merging (raw frontmatter carry-forward, title projection) belongs
     // to the engine. Drop the old fact and let the next context read derive once
     // from the published file; this adds no parsing work to bulk import.

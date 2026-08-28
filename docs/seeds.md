@@ -109,7 +109,7 @@ and for `security` — it parses the sanitized HTML into a live DOM and checks t
 | `graph` | hubs/orphans/ghost-by-refcount/former-name/cross-folder communities (#38/#202) | graph, identity |
 | `graph-load` | scalable linked communities: 300 nodes / ~900 links per scale unit; `SCALE=10` reproduces the 3k/9k cold-enrichment workload (#195/#284) | graph, scale |
 | `search-corpus` | a spotlight corpus: same-named notes, content/path-match, tag case-fold (#188/#204) | search, content |
-| `external-edits` | writers that are not us: a same-size, mtime-preserving rewrite whose search marker + graph edge must self-heal on boot/poll (#267), plus whole-file shapes no write can produce — a byte-order-marked file and prose opening with a `---` rule | search, graph, content |
+| `external-edits` | writers that are not us: a same-size, mtime-preserving rewrite whose search marker + graph edge must self-heal on boot/poll (#267), plus exact whole-file shapes — a byte-order-marked file, stable rule-led prose and a full CRLF storage form for byte-preserving saves | search, graph, content |
 | `identity-collision` | one `notarium-id` planted in two spaces on disk: the arbiter must leave a single durable owner and re-mint the loser on the next boot (#327) | identity, structure, history |
 | `legacy-slug-links` | notes moved from old ASCII-only filenames onto Unicode paths: one unique legacy link survives delete/restore, while a two-owner old basename remains a ghost | identity, graph, search, history, trash, structure |
 | `name-collisions` | the states that flow from "a title picks the file name": a folder primed for the refusal dialog, an already-uniquified `Retro`/`Retro 2`/`Retro 3` family, the same title in two folders, and a folder page whose reserved `index.md` deliberately does not collide — [note-model.md](note-model.md#create-collisions) | identity, structure |
@@ -291,8 +291,9 @@ recovered by the persisted bounded integrity sweep.
 The same case carries a second seam, and it exists because the #267 one deliberately
 cannot stretch: `externalRewrites` requires every replacement to preserve UTF-8 byte
 length, which is what makes it model an editor that changes content without changing
-size or mtime. Two shapes this project has to answer for cannot be planted that way —
-inserting an encoding prologue adds three bytes, and a leading blank line adds one.
+size or mtime. Three shapes this project has to answer for cannot be planted that way —
+an encoding prologue adds three bytes, a leading blank line adds one, and the complete
+CRLF storage form must control every terminator rather than replace equal-size tokens.
 Loosening that contract would delete the very thing it pins, so `externalSources`
 declares WHOLE FILE bytes instead and deliberately changes size and mtime: it models an
 ordinary external edit, and the engine is expected to notice it.
@@ -302,27 +303,29 @@ ordinary external edit, and the engine is expected to notice it.
 `externalRewrites`, so a size-preserving replacement still finds its occurrence in the
 bytes the timeline wrote.
 
-The `external-edits` case declares two:
+The `external-edits` case declares three stable file surfaces:
 
 - `external/byte-order-marked.md` — a file a converter led with a UTF-8 mark. An
   ordinary save must not drop that byte: the mark is a property of the file, not of
   anything Notarium projects.
-- `external/rule-led-prose.md` — prose that opens with a `---` thematic rule. There is
-  no frontmatter block (one starts on the file's first line), so the opening paragraph
-  must survive an export with `frontmatter=strip` and must appear in the card preview.
-  **This one is one-shot on the stand.** Reading the note normalises its body — the
-  leading blank goes, which is what keeps blanks from compounding on every re-save — and
-  the remaining bytes then open with a fence on line one, so a subsequent SAVE folds them
-  into the file's frontmatter and the first paragraph is gone. Nothing reads it wrong
-  (export, preview and the title derivation all answer correctly on the planted bytes);
-  the merge semantics of `serializeNoteFile` are simply outside #396's scope. Verify this
-  state before editing the note, and re-seed if you have saved over it.
+- `external/rule-led-prose.md` — prose that opens with a `---` thematic rule. The planted
+  file has a separator blank before it, and after read normalization the shared BODY
+  predicate still keeps the record-less block as content. The opening paragraph must
+  survive an export with `frontmatter=strip` and must appear in the card preview.
+  Reading normalises the one separator blank before the body, but the shared body reader
+  still classifies the rule-fenced paragraph as content. Repeated Save must therefore keep
+  both rules and both prose lines byte-for-byte; this is no longer a one-shot state.
+- `external/crlf-preserved.md` — a complete storage-form note: CRLF frontmatter with a
+  quoted title, indented `tags:` list and substituted `notarium-id`, followed by the
+  canonical CRLF title heading and body. Change `Body line two.` through `edit_note
+  findReplace`; only that physical line may differ, and a repeated no-op Save is a byte
+  fixpoint. The web editor is not the EOL gate because it normalises body line endings.
 
 **Real applier only, and this is a border rather than a gap.** The fake stand has no
-files at all, so it shows both notes as their ordinary timeline left them; a byte-order
-mark is a byte fact, and the fixture is a specification of a note's normalized state.
-`toFixture` validates the handles and applies nothing, which is the same honest split
-`externalIdentityClaims` already documents above. Only the real stand can plant the
+files at all, so it shows these notes as their ordinary timelines left them; a byte-order
+mark and CRLF terminators are byte facts, while the fixture specifies normalized note
+state. `toFixture` validates the handles and applies nothing, which is the same honest
+split `externalIdentityClaims` already documents above. Only the real stand can plant the
 shape and prove the engine's answer to it.
 
 ### The `jobs` axis — export artifacts (#105/#101)

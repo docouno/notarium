@@ -4,16 +4,18 @@
 // in the leading block only, honest null for anything fancier.
 
 import { describe, expect, it } from 'vitest'
-import { parse as parseYaml } from 'yaml'
+import { parseDocument, parse as parseYaml } from 'yaml'
 import {
   FrontmatterGeometryError,
+  frontmatterPayloadBounds,
   frontmatterValue,
   NOTE_ID_FRONTMATTER_KEY,
   parseFrontmatterBlock,
+  promoteBodyTitle,
   stripFrontmatter,
   upsertFrontmatterKey,
 } from '@notarium/core'
-import { parseNoteFile } from '@notarium/engine'
+import { parseNoteFile, serializeNoteFile } from '@notarium/engine'
 
 describe('frontmatterValue', () => {
   it('reads a scalar key from the leading frontmatter block', () => {
@@ -92,6 +94,48 @@ describe('upsertFrontmatterKey', () => {
   })
 })
 
+describe('body-frontmatter save validity', () => {
+  it.each([
+    ['keyed metadata', '---\ntype: note\n---\n# T\n\nx\n'],
+    ['comment plus metadata', '---\n# note\ntype: x\n---\n# T\n\ny\n'],
+    ['rule-fenced prose', '---\nA loose thought.\n---\nrest\n'],
+    ['comment-only prose', '---\n# authored\n---\nrest\n'],
+    ['mixed metadata and prose', '---\nauthor: Ada\nA loose thought.\n---\nrest\n'],
+    ['empty block', '---\n---\nbody\n'],
+    ['body mark', '\uFEFF---\ntitle: X\n---\nbody\n'],
+    ['trailing fence bytes', '---\ntitle: X\n---   \nbody\n'],
+    ['prose-shaped key', '---\nA thought: I wrote it.\n---\nrest\n'],
+    ['multiline keyless', '---\n# section: notes\n  still mine\ntype: note\n---\nrest\n'],
+  ])('emits valid file YAML for %s', (_name, body) => {
+    const promoted = promoteBodyTitle(body, 'T')
+    const out = serializeNoteFile({ title: promoted.title, body: promoted.body })
+    const block = parseFrontmatterBlock(out)!
+    const { payloadStart, payloadEnd } = frontmatterPayloadBounds(out, block.bodyStart)
+
+    expect(parseDocument(out.slice(payloadStart, payloadEnd)).errors).toHaveLength(0)
+  })
+
+  it('realigns raw aliases after normalization drops a blank item', () => {
+    const existingRaw =
+      '---\ntitle: Old\naliases: [" ", 2024, Old]\nnotarium-id: idAAAAAAAAAA\n---\n\n# Old\n\nbody\n'
+    const out = serializeNoteFile({
+      title: 'New',
+      aliases: ['2024', 'Old'],
+      id: 'idAAAAAAAAAA',
+      body: 'body\n',
+      existingRaw,
+    })
+    const block = parseFrontmatterBlock(out)!
+    const { payloadStart, payloadEnd } = frontmatterPayloadBounds(out, block.bodyStart)
+    const parsed = parseDocument(out.slice(payloadStart, payloadEnd))
+
+    expect(parsed.errors).toHaveLength(0)
+    expect((parsed.toJS() as { aliases: unknown }).aliases).toEqual(['2024', 'Old'])
+    expect(parseNoteFile(out, 'new.md').aliases).toEqual(['2024', 'Old'])
+    expect(out).not.toContain('aliases: [" ", 2024, Old]')
+  })
+})
+
 // The writer and the reader answer ONE question about where frontmatter is, and the
 // writer changes only the bytes of its own entry. Every row below used to fail.
 describe('upsertFrontmatterKey — only its own entry moves', () => {
@@ -167,6 +211,14 @@ describe('upsertFrontmatterKey — only its own entry moves', () => {
     ]) {
       expect(parseNoteFile(write(doc), 'a/x.md').idClaim).toBe(ID)
     }
+  })
+
+  it('uses payload majority and ignores a later CRLF outlier when choosing a new line', () => {
+    const mixed = '---\r\ntitle: X\na: one\r\nb: two\r\n---\r\nbody\r\n'
+    const blockless = '# Hi\n```\r\ncode\r\n```\n'
+
+    expect(write(mixed)).toContain(`${NOTE_ID_FRONTMATTER_KEY}: ${ID}\r\n---\r\n`)
+    expect(write(blockless)).toContain(`---\n${NOTE_ID_FRONTMATTER_KEY}: ${ID}\n---\n`)
   })
 
   it("does not read the key out of somebody else's block scalar", () => {

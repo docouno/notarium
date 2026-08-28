@@ -3,7 +3,9 @@ import { parse as parseYaml } from 'yaml'
 
 import {
   FRONTMATTER_BYTE_CAP,
+  frontmatterBlockEol,
   frontmatterEntryDefinesYamlAnchor,
+  frontmatterEntryIsBlockScalar,
   frontmatterEntryOf,
   frontmatterEntrySpans,
   frontmatterEntryValue,
@@ -18,6 +20,7 @@ import {
   frontmatterValue,
   isDurableFrontmatter,
   isWithinFrontmatterByteCap,
+  parseBodyFrontmatterBlock,
   parseFrontmatterBlock,
   stripFrontmatter,
   unquoteScalar,
@@ -794,6 +797,70 @@ tags: ["a\\b", "a\"b"]
 
     expect(block.entries.map((entry) => entry.key)).toEqual(['title', 'next'])
     expect(Date.now() - t0).toBeLessThan(1_000)
+  })
+})
+
+describe('parseBodyFrontmatterBlock', () => {
+  it.each([
+    ['keyed metadata', '---\ntype: note\n---\nbody\n', true],
+    ['metadata plus a column comment', '---\n# note\ntype: note\n---\nbody\n', true],
+    ['rule-fenced prose', '---\nA loose thought.\n---\nbody\n', false],
+    ['a comment without a key', '---\n# authored heading\n---\nbody\n', false],
+    ['a keyed record plus prose', '---\nauthor: Ada\nA loose thought.\n---\nbody\n', false],
+    [
+      'a multiline keyless entry',
+      '---\n# section: notes\n  still mine\ntype: note\n---\nbody\n',
+      false,
+    ],
+    ['an encoding mark in body bytes', '\uFEFF---\ntitle: X\n---\nbody\n', false],
+  ])('%s', (_name, body, expected) => {
+    expect(Boolean(parseBodyFrontmatterBlock(body))).toBe(expected)
+  })
+
+  it('propagates the raw parser budget refusal', () => {
+    const huge = `---\n${'x'.repeat(FRONTMATTER_BYTE_CAP + 1)}\n---\nbody\n`
+    expect(() => parseBodyFrontmatterBlock(huge)).toThrow(FrontmatterLimitError)
+  })
+})
+
+describe('frontmatterEntryIsBlockScalar', () => {
+  it.each(['|', '>', '>-', '|+', '|2', '|-2'])('recognises %s', (indicator) => {
+    const entry = parseFrontmatterBlock(`---\nx: ${indicator}\n  value\n---\n`)!.entries[0]
+    expect(frontmatterEntryIsBlockScalar(entry)).toBe(true)
+  })
+
+  it.each(['x: scalar', 'x:\n  - a', 'x:\n- a', 'x:', 'x: [a]', 'x:\n  nested: value', 'x: |pipe'])(
+    'rejects %s',
+    (yaml) => {
+      const entry = parseFrontmatterBlock(`---\n${yaml}\n---\n`)!.entries[0]
+      expect(frontmatterEntryIsBlockScalar(entry)).toBe(false)
+    },
+  )
+})
+
+describe('frontmatterBlockEol', () => {
+  const eolOf = (raw: string) => {
+    const block = parseFrontmatterBlock(raw)!
+    return frontmatterBlockEol(raw, frontmatterPayloadBounds(raw, block.bodyStart))
+  }
+
+  it('uses the majority payload terminator, not a first or last outlier', () => {
+    expect(eolOf('---\r\na: one\nb: two\r\nc: three\r\n---\r\n')).toBe('\r\n')
+    expect(eolOf('---\na: one\r\nb: two\nc: three\n---\n')).toBe('\n')
+    expect(eolOf('---\r\na: one\r\nb: two\r\nc: three\n---\r\n')).toBe('\r\n')
+    expect(eolOf('---\na: one\nb: two\nc: three\r\n---\n')).toBe('\n')
+  })
+
+  it('breaks ties, including an empty payload, with the opening fence', () => {
+    expect(eolOf('---\r\na: one\nb: two\r\n---\r\n')).toBe('\r\n')
+    expect(eolOf('---\na: one\r\nb: two\n---\n')).toBe('\n')
+    expect(eolOf('---\r\n---\r\n')).toBe('\r\n')
+  })
+
+  it('uses the first physical line without a block and otherwise LF', () => {
+    expect(frontmatterBlockEol('# title\r\n\r\nbody\n')).toBe('\r\n')
+    expect(frontmatterBlockEol('# title\n```\r\ncode\r\n```\n')).toBe('\n')
+    expect(frontmatterBlockEol('one line')).toBe('\n')
   })
 })
 

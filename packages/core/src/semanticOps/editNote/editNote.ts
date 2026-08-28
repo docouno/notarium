@@ -9,7 +9,12 @@
 import type { KnowledgeStore, MutationOptions } from '../../knowledgeStore'
 import { StoreError, versionConflict } from '../../knowledgeStore'
 import { sha256Hex } from '../../libs/hash'
-import { replaceMarkdownSection, stripFrontmatter, stripTitleHeading } from '../../libs/markdown'
+import {
+  FrontmatterLimitError,
+  parseBodyFrontmatterBlock,
+  replaceMarkdownSection,
+  stripTitleHeading,
+} from '../../libs/markdown'
 import { normTags } from '../../libs/tags'
 import { EDIT_OPERATION } from './consts'
 import type { EditNoteInput, EditResult } from './types'
@@ -21,6 +26,18 @@ import type { EditNoteInput, EditResult } from './types'
  *  the host maps the flag, not the class, to an actionable 400-class tool error. */
 export class EditError extends StoreError {
   isToolError = true as const
+}
+
+const bodyWithoutMetadata = (body: string): string => {
+  try {
+    const block = parseBodyFrontmatterBlock(body)
+    return block ? body.slice(block.bodyStart) : body
+  } catch (error) {
+    if (error instanceof FrontmatterLimitError) {
+      return body
+    }
+    throw error
+  }
 }
 
 /** Apply one edit operation to a note body. PURE — no I/O. Returns the new body,
@@ -140,14 +157,15 @@ export const editNote = async (
   }
   const next = applyEdit(note.content, input)
   // No-op detection mirrors the journal's content normalisation
-  // (stripTitleHeading∘stripFrontmatter) — not raw equality — so an edit whose
-  // result is EFFECTIVELY unchanged (an empty append, or prepending the title
+  // (stripTitleHeading after the shared body-frontmatter read) — not raw equality — so
+  // an edit whose result is EFFECTIVELY unchanged (an empty append, or prepending the title
   // heading the reader strips back off) writes NOTHING. A spurious write here
   // would lay down a synthesized 'external' baseline; the real revision then
   // dedups to nothing against it, leaving the baseline as the latest, so
   // read_note would report {principal:null, kind:'external'} for a note the
   // agent just touched. Skipping keeps provenance honest.
-  const normalise = (body: string): string => stripTitleHeading(stripFrontmatter(body), note.title)
+  const normalise = (body: string): string =>
+    stripTitleHeading(bodyWithoutMetadata(body), note.title)
 
   if (normalise(next) === normalise(note.content)) {
     return { id, versionToken: current }

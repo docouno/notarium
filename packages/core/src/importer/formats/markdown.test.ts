@@ -247,6 +247,15 @@ describe('markdownFileToNote — frontmatter is lifted, not stripped (#280)', ()
     )
   })
 
+  it('imports a rule-fenced body verbatim and takes its title from the file name', () => {
+    const body = '---\nA thought I wrote between two rules.\n---\n# Heading\ntext\n'
+    const note = markdownFileToNote(`---\nauthor: Ada\n---\n\n${body}`, 'ai-export.md')
+
+    expect(note.title).toBe('ai-export')
+    expect(note.body).toBe(body.trimEnd())
+    expect((note.frontmatter ?? []).flatMap((entry) => entry.lines)).toEqual(['author: Ada'])
+  })
+
   it('carries an entire commented block list/map instead of lifting only their prefix', () => {
     const raw = [
       'tags:',

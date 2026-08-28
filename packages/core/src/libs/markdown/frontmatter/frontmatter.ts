@@ -922,9 +922,49 @@ export const parseFrontmatterBlock = (raw: string): FrontmatterBlock | null => {
   return { entries, bodyStart }
 }
 
+/** Read a leading metadata block from NOTE BODY bytes. A raw file and a body ask
+ * different questions: a body's fenced opening is metadata only when it carries
+ * at least one keyed record and every keyless entry is a column-zero YAML comment.
+ * The file reader remains deliberately syntax-only. */
+export const parseBodyFrontmatterBlock = (body: string): FrontmatterBlock | null => {
+  // A byte-order mark belongs only at the start of a file. Inside an already-split
+  // body it is authored content, even though the raw-file grammar accepts one.
+  if (body.charCodeAt(0) === 0xfeff) {
+    return null
+  }
+  const block = parseFrontmatterBlock(body)
+
+  if (!block) {
+    return null
+  }
+  let hasKey = false
+
+  for (const entry of block.entries) {
+    if (entry.key !== null) {
+      hasKey = true
+      continue
+    }
+    if (entry.lines.some((line) => !COLUMN_COMMENT.test(line))) {
+      return null
+    }
+  }
+
+  return hasKey ? block : null
+}
+
+/** Whether an entry opens a YAML block scalar (`|`, `>`, plus valid indicators).
+ * Projection can flatten that syntax into a string, but a typed scalar writer may
+ * not treat the authored form as equivalent to its own one-line representation. */
+export const frontmatterEntryIsBlockScalar = (entry: FrontmatterEntry): boolean => {
+  const inline = entryInline(entry)
+  return inline !== null && BLOCK_SCALAR.test(inline)
+}
+
 /** One entry's CHARACTER span in the source, `[start, end)` with `end` just past the
  *  line terminator of the entry's last line. Index-aligned with the block's `entries`. */
 export type FrontmatterSpan = { key: string | null; start: number; end: number }
+
+export type FrontmatterPayloadBounds = { payloadStart: number; payloadEnd: number }
 
 /** One frontmatter line, by the rule this parser and a YAML reader both use (`\r?\n`)
  *  rather than the Markdown physical-line rule. The two disagree on a lone CR and on
@@ -957,7 +997,7 @@ const nextFrontmatterLineSpan = (
 export const frontmatterPayloadBounds = (
   raw: string,
   bodyStart: number,
-): { payloadStart: number; payloadEnd: number } => {
+): FrontmatterPayloadBounds => {
   const payloadStart = nextFrontmatterLineSpan(raw, 0, bodyStart)?.next ?? bodyStart
   let cursor = payloadStart
   let payloadEnd = -1
@@ -979,6 +1019,41 @@ export const frontmatterPayloadBounds = (
   }
 
   return { payloadStart, payloadEnd }
+}
+
+/** Choose the terminator for a NEW frontmatter line without normalising existing
+ * bytes. Existing blocks use the majority of physical payload lines, with the
+ * opening fence as a deterministic tie-break; block-less documents use their
+ * first physical line and otherwise default to LF. Callers that already parsed a
+ * block pass its bounds so this helper never reparses a hot write path. */
+export const frontmatterBlockEol = (
+  raw: string,
+  bounds?: FrontmatterPayloadBounds,
+): '\n' | '\r\n' => {
+  if (!bounds) {
+    const firstFeed = raw.indexOf('\n')
+    return firstFeed > 0 && raw[firstFeed - 1] === '\r' ? '\r\n' : '\n'
+  }
+  const openingEol = raw.slice(0, bounds.payloadStart).endsWith('\r\n') ? '\r\n' : '\n'
+  let lf = 0
+  let crlf = 0
+  let cursor = bounds.payloadStart
+
+  while (cursor < bounds.payloadEnd) {
+    const feed = raw.indexOf('\n', cursor)
+
+    if (feed < 0 || feed >= bounds.payloadEnd) {
+      break
+    }
+    if (feed > cursor && raw[feed - 1] === '\r') {
+      crlf++
+    } else {
+      lf++
+    }
+    cursor = feed + 1
+  }
+
+  return crlf === lf ? openingEol : crlf > lf ? '\r\n' : '\n'
 }
 
 /** Where each parsed entry physically sits in `raw`. This is the geometry a writer needs
@@ -1560,7 +1635,7 @@ export const frontmatterListEntry = (key: string, items: readonly string[]): Fro
 
 /** Set (or replace) one SERVICE key in a document's leading frontmatter block, creating
  *  the block when the document has none. It re-materializes the internal note-id on bytes
- *  that already exist — an ordinary save rebuilds the whole block instead.
+ *  that already exist; ordinary saves use the general span-aware file serializer.
  *
  *  Only the target key's own entry changes: every other entry keeps its bytes, its order
  *  and its line endings, and duplicates of the target collapse onto the FIRST slot so the
@@ -1581,7 +1656,7 @@ export const upsertFrontmatterKey = (content: string, key: string, value: string
   const line = frontmatterScalarEntry(key, value).lines[0]
 
   if (!block) {
-    const eol = raw.includes('\r\n') ? '\r\n' : '\n'
+    const eol = frontmatterBlockEol(raw)
     // The encoding prologue opens the FILE: a mark that no longer leads its bytes is not
     // a mark at all, it is a stray zero-width space in the middle of the prose.
     const start = raw.charCodeAt(0) === 0xfeff ? 1 : 0
@@ -1602,13 +1677,10 @@ export const upsertFrontmatterKey = (content: string, key: string, value: string
   }
 
   if (!targets.length) {
-    const { payloadEnd } = frontmatterPayloadBounds(raw, block.bodyStart)
-    // The BLOCK's line ending, not the document's: a file whose frontmatter is LF and
-    // whose body is CRLF is one this project's own serializer writes, and a lone CRLF
-    // entry among LF ones is a line ending nobody in that block chose.
-    const blockEol = raw.slice(0, payloadEnd).endsWith('\r\n') ? '\r\n' : '\n'
+    const bounds = frontmatterPayloadBounds(raw, block.bodyStart)
+    const blockEol = frontmatterBlockEol(raw, bounds)
 
-    return `${raw.slice(0, payloadEnd)}${line}${blockEol}${raw.slice(payloadEnd)}`
+    return `${raw.slice(0, bounds.payloadEnd)}${line}${blockEol}${raw.slice(bounds.payloadEnd)}`
   }
   // The FIRST slot, not the last: it keeps the key where the file already carries it,
   // among the author's own fields.

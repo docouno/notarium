@@ -109,6 +109,27 @@ export const describeKnowledgeStoreContract = (
       expect((await store.list()).some((note) => note.title.startsWith('bad'))).toBe(false)
     })
 
+    it('agrees that anchor-looking rule-fenced prose is body, not incoming metadata', async () => {
+      const title = 'Contract Rule-led Prose'
+      const content = '---\nanchorKey: &shared value\nA loose thought.\ncopy: *shared\n---\nrest\n'
+      const created = await store.write({ title, directory: dir, content })
+      const ref = created.id ?? idOf(byTitle(await store.list(), title)!)
+
+      try {
+        expect((await store.read(ref)).content).toBe(content)
+      } finally {
+        await store.remove(ref)
+      }
+
+      await expect(
+        store.write({
+          title: 'Contract Real Anchored Metadata',
+          directory: dir,
+          content: '---\nanchorKey: &shared value\ncopy: *shared\n---\nrest\n',
+        }),
+      ).rejects.toThrow()
+    })
+
     it('rejects non-canonical or hidden write destinations at the store boundary', async () => {
       for (const directory of [
         `${dir}/.lost`,

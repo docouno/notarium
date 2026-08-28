@@ -2,7 +2,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { sha256Hex } from '@notarium/core'
+import { editNote, sha256Hex } from '@notarium/core'
 
 import type { FileStat, FileStore, FileStoreAssembly } from '../../libs/files'
 import { createLocalFsFiles } from '../../libs/files'
@@ -94,6 +94,50 @@ afterEach(async () => {
 })
 
 describe('NotariumStore external edit convergence', () => {
+  it('preserves every other CRLF storage line through edit_note findReplace', async () => {
+    const root = await mkroot()
+    const path = 'crlf-preserved.md'
+    const before = [
+      '---',
+      'title: "CRLF preserved"',
+      'tags:',
+      '  - external',
+      '  - crlf',
+      'notarium-id: idAAAAAAAAAA',
+      '---',
+      '',
+      '# CRLF preserved',
+      '',
+      'Body line one.',
+      'Body line two.',
+      '',
+    ].join('\r\n')
+    await writePreservingMtime(root, path, before)
+    const store = createNotariumStore({ notesDir: root, integritySweepBatchSize: 0 })
+
+    try {
+      await editNote(store, {
+        noteId: 'idAAAAAAAAAA',
+        operation: 'findReplace',
+        find: 'Body line two.',
+        content: 'Body line TWO.',
+      })
+      const after = await fs.readFile(join(root, path), 'utf8')
+      const beforeLines = before.match(/[^\n]*\n|[^\n]+$/g) ?? []
+      const afterLines = after.match(/[^\n]*\n|[^\n]+$/g) ?? []
+      const changed = beforeLines.flatMap((line, index) =>
+        line === afterLines[index] ? [] : [index + 1],
+      )
+
+      expect(Buffer.byteLength(after)).toBe(Buffer.byteLength(before))
+      expect(changed).toEqual([12])
+      expect(after.match(/\r\n/g)).toHaveLength(12)
+      expect(after.replace(/\r\n/g, '')).not.toContain('\n')
+    } finally {
+      await store.stop()
+    }
+  })
+
   it('uses the LocalFS change token to catch a same-size, same-mtime edit on the next poll', async () => {
     const root = await mkroot()
     await writePreservingMtime(root, 'a.md', '# Target A\n\nA')

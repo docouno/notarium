@@ -295,10 +295,8 @@ describe('deriveNoteTitle — the read-only title the editor gates on', () => {
   })
 })
 
-// Which leading block a title is derived from is the PARSER's answer, not a second opinion
-// held here. Narrowly: a block opens on line one and closes on a `---` of its own, so a
-// rule preceded by a blank line or an indent is prose that titles nothing — and a fence
-// that DOES open line one is a block whatever its payload looks like.
+// A body block is incoming metadata only when the shared body reader finds at least one
+// keyed record and no non-comment keyless prose. File-frontmatter syntax stays broader.
 // canon: docs/core.md#write-through
 describe('promoteBodyTitle — the leading block is the one the domain reads', () => {
   it.each([
@@ -311,6 +309,13 @@ describe('promoteBodyTitle — the leading block is the one the domain reads', (
     ['a code fence', '```\ncode\n```\n\nrest\n'],
     ['a list', '- one\n- two\n'],
     ['a quote', '> quoted\n\nrest\n'],
+    ['a block behind a body mark', '\uFEFF---\ntitle: X\n---\nFirst paragraph.\n'],
+    [
+      'a fenced block whose payload is prose',
+      '---\nA thought I wrote between two rules.\n---\nAnd the rest.\n',
+    ],
+    ['an empty fenced block', '---\n---\nBody.\n'],
+    ['a comment-only fenced block', '---\n# authored heading\n---\nBody.\n'],
   ])('derives no title and moves no byte for %s', (_name, src) => {
     expect(deriveNoteTitle(src)).toBe('')
     expect(promoteBodyTitle(src).body).toBe(src)
@@ -319,17 +324,14 @@ describe('promoteBodyTitle — the leading block is the one the domain reads', (
   it.each([
     ['a real inline block', '---\ntitle: X\n---\nFirst paragraph.\n', '---\ntitle: X\n---\n'],
     [
-      'a real inline block behind a mark',
-      '\uFEFF---\ntitle: X\n---\nFirst paragraph.\n',
-      '\uFEFF---\ntitle: X\n---\n',
+      'a keyed block with a leading comment',
+      '---\n# note\ntype: x\n---\nFirst paragraph.\n',
+      '---\n# note\ntype: x\n---\n',
     ],
     [
-      // The domain DOES read this one — a fence on line one with a closing fence below is
-      // a block, whatever its payload looks like. The title therefore still comes from
-      // below it, and that is the point: one answer, not a nicer-looking one.
-      'a block whose payload is prose',
-      '---\nA thought I wrote between two rules.\n---\nAnd the rest.\n',
-      '---\nA thought I wrote between two rules.\n---\n',
+      'a prose-looking keyed record',
+      '---\nA thought: I wrote it.\n---\nAnd the rest.\n',
+      '---\nA thought: I wrote it.\n---\n',
     ],
   ])('carries %s through and titles the paragraph below it', (_name, src, carried) => {
     const promoted = promoteBodyTitle(src)
@@ -337,15 +339,6 @@ describe('promoteBodyTitle — the leading block is the one the domain reads', (
     expect(parseFrontmatterBlock(src)).not.toBeNull()
     expect(promoted.title).not.toBe('')
     expect(promoted.body).toBe(carried)
-  })
-
-  // Named because the amendment first undercounted them: these two forms changed answer
-  // as well, and both are the parser's own reading rather than a special case.
-  it('titles the paragraph below an EMPTY block, which is still a block', () => {
-    const src = '---\n---\nBody.\n'
-
-    expect(parseFrontmatterBlock(src)).not.toBeNull()
-    expect(promoteBodyTitle(src)).toEqual({ title: 'Body.', body: '---\n---\n' })
   })
 
   it('keeps trailing whitespace on a closing fence inside the block it belongs to', () => {

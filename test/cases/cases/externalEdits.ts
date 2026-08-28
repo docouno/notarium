@@ -7,9 +7,9 @@ import type { CaseSpec } from '../types'
  *  behind its back. On the restarted stand, list/search/graph must all converge
  *  to the replacement content.
  *
- *  It also carries the two file SHAPES an authoring write cannot produce, because they
- *  arrive by the same route — a writer that is not us. Both are real-stand only: the fake
- *  has no files, so it shows the notes normalized. */
+ *  It also carries file SHAPES that must be planted as exact bytes, because they arrive
+ *  by the same route — a writer that is not us. They are real-stand only: the fake has no
+ *  files, so it shows the notes normalized. */
 export const externalEdits: CaseSpec = {
   name: 'external-edits',
   description:
@@ -70,9 +70,9 @@ export const externalEdits: CaseSpec = {
           '# Byte-order marked\n\nA converter stamped this file with an encoding prologue.\n',
       },
     })
-    // Prose that OPENS with a horizontal rule. The domain reads no frontmatter here (a
-    // block starts on line one), so the first paragraph must survive export with
-    // `frontmatter=strip` and must show up in the card preview.
+    // Prose that OPENS with a horizontal rule. The planted file begins with a separator
+    // blank; after read normalization the shared body predicate still keeps its
+    // record-less block as content. Save/export/preview must retain the first paragraph.
     const ruled = b.note({
       space: 'main',
       path: 'external/rule-led-prose.md',
@@ -87,6 +87,27 @@ export const externalEdits: CaseSpec = {
       source: {
         encoding: 'utf8',
         data: '\n---\nA thought I wrote between two rules.\n---\nAnd the rest.\n',
+      },
+    })
+    // A complete storage-form CRLF note. Editing one body line through edit_note must
+    // preserve the authored title quoting, list indentation and every other terminator.
+    const crlf = b.note({
+      space: 'main',
+      path: 'external/crlf-preserved.md',
+      title: 'CRLF preserved',
+      content: '# CRLF preserved\n\nPlaceholder replaced on disk.',
+      created: daysBefore(now, 7),
+      principal: 'user:sergey',
+    })
+
+    b.externalSource({
+      note: crlf,
+      source: {
+        encoding: 'utf8',
+        data:
+          '---\r\ntitle: "CRLF preserved"\r\ntags:\r\n  - external\r\n  - crlf\r\n' +
+          'notarium-id: {{noteId}}\r\n---\r\n\r\n# CRLF preserved\r\n\r\n' +
+          'Body line one.\r\nBody line two.\r\n',
       },
     })
 

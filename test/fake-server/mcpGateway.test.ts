@@ -16,7 +16,12 @@ import type { FastifyInstance } from 'fastify'
 import { readFile } from 'node:fs/promises'
 import type { AddressInfo } from 'node:net'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { decodeAbilityLocator, encodeWikilinkIdentity, sha256Hex } from '@notarium/core'
+import {
+  decodeAbilityLocator,
+  encodeWikilinkIdentity,
+  FRONTMATTER_BYTE_CAP,
+  sha256Hex,
+} from '@notarium/core'
 import { deterministicNoteId } from '@notarium/engine-memory'
 import type { MutationGate } from '@notarium/server'
 
@@ -6765,6 +6770,81 @@ describe('navigation — list_notes / recent_activity / get_note links (#102 pha
     )
     expect(concise.outline).toBeUndefined()
     expect(concise.links).toBeUndefined()
+  })
+
+  it('get_note outline and replaceSection agree on headings inside rule-fenced prose', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const created = structured(
+      await callTool(
+        port,
+        'create_note',
+        {
+          project: 'team',
+          title: 'Rule-led outline',
+          body: '---\n# Authored heading\nloose prose\n---\n# Rest\nbody\n',
+        },
+        bearer,
+      ),
+    )
+    const before = structured(await callTool(port, 'get_note', { ref: created.noteId }, bearer))
+
+    expect((before.outline as Array<{ title: string }>).map((item) => item.title)).toEqual([
+      'Authored heading',
+      'Rest',
+    ])
+
+    const edited = structured(
+      await callTool(
+        port,
+        'edit_note',
+        {
+          ref: created.noteId,
+          operation: 'replaceSection',
+          section: 'Authored heading',
+          content: 'updated prose',
+          versionToken: before.versionToken,
+        },
+        bearer,
+      ),
+    )
+    const after = structured(await callTool(port, 'get_note', { ref: edited.noteId }, bearer))
+
+    expect(after.content).toContain('# Authored heading\n\nupdated prose')
+    expect((after.outline as Array<{ title: string }>).map((item) => item.title)).toEqual([
+      'Authored heading',
+      'Rest',
+    ])
+  })
+
+  it('get_note outline degrades an oversized body opening to authored content', async () => {
+    const oversized = fixture()
+
+    oversized.spaces
+      .find((space) => space.slug === 'team')!
+      .notes.push({
+        title: 'Oversized outline',
+        filePath: 'oversized-outline.md',
+        modifiedAt: '2026-06-13T00:00:00.000Z',
+        createdAt: '2026-06-03T00:00:00.000Z',
+        tags: [],
+        content: `---\ntitle: metadata\n${'x'.repeat(FRONTMATTER_BYTE_CAP + 1)}\n---\n# Visible heading\nbody\n`,
+      })
+    await app.close()
+    app = await createApp(oversized)
+    port = await listen(app)
+    const bearer = await patFor('alice', 'alice-password-1', 'read')
+    const result = structured(
+      await callTool(
+        port,
+        'get_note',
+        { ref: deterministicNoteId('oversized-outline.md') },
+        bearer,
+      ),
+    )
+
+    expect((result.outline as Array<{ title: string }>).map((item) => item.title)).toContain(
+      'Visible heading',
+    )
   })
 
   it('recall caps a single large source so neighbours still fit (#102 phase 2 width)', async () => {

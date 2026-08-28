@@ -89,6 +89,7 @@ import {
   NOTE_ID_FRONTMATTER_KEY,
   noteAlreadyExists,
   noteNotFound,
+  parseBodyFrontmatterBlock,
   parseFrontmatterBlock,
   parseFrontmatterLines,
   resolveLink,
@@ -1319,12 +1320,12 @@ export class InMemoryStore implements KnowledgeStore {
     }
     // Keep this lazy: collision and CAS errors are the caller's primary contract
     // and must win before the semantic frontmatter refusal. The real serializer
-    // also treats a leading frontmatter block in `body` as incoming metadata, so
+    // also treats a leading record-bearing block in `body` as incoming metadata, so
     // the fake must reject references there even though it need not implement the
     // real engine's general inline-frontmatter merge for this safety fence.
     const incomingHasYamlNodeReferences = (): boolean =>
       (!replacing && frontmatterHasYamlNodeReferences(frontmatter)) ||
-      (!replacing && frontmatterHasYamlNodeReferences(parseFrontmatterBlock(content)?.entries))
+      (!replacing && frontmatterHasYamlNodeReferences(parseBodyFrontmatterBlock(content)?.entries))
     // Carry-forward semantics matching the real engine's serializeNoteFile: an
     // UNDEFINED field leaves the note's existing value untouched (the semantic
     // ops re-send what they read, #21 — a write that omitted them would wrongly

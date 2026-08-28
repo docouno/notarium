@@ -1,4 +1,4 @@
-import { type FrontmatterBlock, parseFrontmatterBlock } from '../frontmatter'
+import { type FrontmatterBlock, parseBodyFrontmatterBlock } from '../frontmatter'
 
 export type AtxH1Line = {
   /** Heading text after removing an optional CommonMark closing `#` sequence. */
@@ -156,9 +156,9 @@ const scanOpening = (
   setext: boolean
   plain: boolean
 } => {
-  // Carry a leading inline-frontmatter block through untouched — the title lives in the
-  // markdown body below it, and serializeNoteFile folds this block into the file's own
-  // frontmatter. WHICH block that is, is not this file's opinion to hold.
+  // Carry a leading body-frontmatter block through untouched — the title lives in the
+  // markdown below it, and serializeNoteFile folds only record-bearing blocks into the
+  // file's own frontmatter. WHICH body block qualifies is not this file's opinion.
   // canon: docs/core.md#write-through
   //
   // Local to this call: the parser throws on an oversized block and this scan must not,
@@ -166,7 +166,7 @@ const scanOpening = (
   let block: FrontmatterBlock | null
 
   try {
-    block = parseFrontmatterBlock(src)
+    block = parseBodyFrontmatterBlock(src)
   } catch {
     block = null
   }
@@ -231,7 +231,8 @@ export const headingTitle = (content: string): string => {
  *  reference def); a setext heading (prose + `===`/`---` underline) counts and is peeled with its
  *  underline. The leading line is REMOVED only when it genuinely CARRIES the title: an `# H1` equal
  *  to the title, or a plain line promoted with no explicit title — never a differing heading, nor a
- *  plain line that merely coincides with an explicit title. Leading inline frontmatter is preserved. */
+ *  plain line that merely coincides with an explicit title. Leading record-bearing body
+ *  frontmatter is preserved; rule-fenced prose stays in the body. */
 export const promoteBodyTitle = (
   content: string,
   explicit?: string,

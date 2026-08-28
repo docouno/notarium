@@ -2,7 +2,7 @@ import DOMPurify from 'dompurify'
 import { marked, Renderer } from 'marked'
 import markedFootnote from 'marked-footnote'
 import { markedHighlight } from 'marked-highlight'
-import { type FrontmatterBlock, parseFrontmatterBlock } from '@notarium/core/markdown'
+import { parseBodyFrontmatterBlock } from '@notarium/core/markdown'
 import { slugify } from '@notarium/core/slug'
 import { calloutExtension } from './callout'
 import { highlightCode } from './highlight'
@@ -144,29 +144,16 @@ marked.use({
 // render-time choice only. Paragraph/line spacing is tuned in styles/markdown.scss.
 marked.setOptions({ gfm: true, breaks: true })
 
-// Defensive strip of a leading YAML frontmatter block (#235): the normal content path is
-// body-only (the engine peels the leading YAML), but a raw paste / legacy note /
-// editor-preview of a draft could still open with a `---…---` block that marked would
-// render as a stray table/hr.
-//
-// WHERE that block is, is the domain's answer — the same parser the write path and the
-// title derivation ask, so a screen never hides bytes the rest of the system calls prose.
-// WHETHER to cut it stays this renderer's own, narrower question: a block whose first
-// line does not read like a YAML key is prose an author fenced deliberately (sections, an
-// AI export opening with a rule), and cutting it would eat visible content.
+// Defensive strip for draft/raw body surfaces. The shared body reader distinguishes
+// incoming metadata from prose fenced between thematic rules, so rendering cannot hide
+// bytes the write path keeps as content.
 export const stripLeadingFrontmatter = (md: string): string => {
-  let block: FrontmatterBlock | null
-
   try {
-    block = parseFrontmatterBlock(md)
+    const block = parseBodyFrontmatterBlock(md)
+    return block ? md.slice(block.bodyStart) : md
   } catch {
     return md // an oversized block is not something a reader should throw over
   }
-  if (!block) {
-    return md
-  }
-  const firstLine = block.entries.flatMap((entry) => entry.lines).find((l) => l.trim() !== '') ?? ''
-  return /^\s*[\w-]+\s*:/.test(firstLine) ? md.slice(block.bodyStart) : md
 }
 
 export type RenderMarkdownOptions = {

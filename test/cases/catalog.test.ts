@@ -1061,6 +1061,19 @@ describe('seed catalog (#175)', () => {
     expect(combined.events.some((e) => e.noteId === rewrite?.note)).toBe(true)
   })
 
+  it('declares a complete CRLF storage form for byte-preserving save checks', () => {
+    const world = buildCaseWorld('external-edits', { now: DEFAULT_NOW })
+    const source = world.externalSources?.find((item) =>
+      item.source.data.includes('CRLF preserved'),
+    )
+
+    expect(source?.source.data).toContain('title: "CRLF preserved"\r\n')
+    expect(source?.source.data).toContain('tags:\r\n  - external\r\n  - crlf\r\n')
+    expect(source?.source.data).toContain(
+      'notarium-id: {{noteId}}\r\n---\r\n\r\n# CRLF preserved\r\n\r\n',
+    )
+  })
+
   describe('caseToFixture (the fake projection)', () => {
     it.each(NAMES)('"%s": reduces to a valid fixture (live snapshot + activity)', (name) => {
       const w = buildCaseWorld(name, { scale: 0.1, now: DEFAULT_NOW })

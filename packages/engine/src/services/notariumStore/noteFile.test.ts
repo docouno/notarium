@@ -5,15 +5,28 @@ import {
   FRONTMATTER_BYTE_CAP,
   frontmatterEntryValue,
   FrontmatterLimitError,
+  frontmatterPayloadBounds,
+  frontmatterScalarEntry,
   IMPORT_SOURCE_FRONTMATTER_KEY,
   markdownFileToNote,
   parseFrontmatterBlock,
+  promoteBodyTitle,
 } from '@notarium/core'
 
-import { parseNoteFile, serializeNoteFile } from './noteFile'
+import { assembleNoteFile, parseNoteFile, serializeNoteFile } from './noteFile'
 
 const YAML_NODE_REFERENCE_WRITE_ERROR =
   'frontmatter with YAML anchors or aliases is not supported by writes'
+
+const physicalLines = (raw: string): string[] => raw.match(/[^\n]*\n|[^\n]+$/g) ?? []
+
+const changedPhysicalLines = (before: string, after: string): number => {
+  const left = physicalLines(before)
+  const right = physicalLines(after)
+
+  expect(right).toHaveLength(left.length)
+  return left.filter((line, index) => line !== right[index]).length
+}
 
 const BM_FILE = `---
 title: Engine Live Probe
@@ -327,6 +340,369 @@ describe('serializeNoteFile', () => {
     // '' → an explicit clear back to the implicit default.
     const cleared = serializeNoteFile({ title: 'T', slug: '', body: 'b', existingRaw: withSlug })
     expect(parseNoteFile(cleared, 't.md').slug).toBeNull()
+  })
+})
+
+describe('serializeNoteFile — unchanged typed channels', () => {
+  const storageFile = (overrides: string[] = []): string =>
+    [
+      '---',
+      'title: "My note"',
+      'tags:',
+      '  - Work/Projects',
+      '  - ml',
+      'notarium-id: idAAAAAAAAAA',
+      ...overrides,
+      '---',
+      '',
+      '# My note',
+      '',
+      'Body line one.',
+      'Body line two.',
+      '',
+    ].join('\n')
+
+  it('changes only the authored body line and preserves quoting plus list indentation', () => {
+    const existingRaw = storageFile()
+    const out = serializeNoteFile({
+      title: 'My note',
+      tags: ['Work/Projects', 'ml'],
+      id: 'idAAAAAAAAAA',
+      body: 'Body line one.\nBody line TWO.\n',
+      existingRaw,
+    })
+
+    expect(changedPhysicalLines(existingRaw, out)).toBe(1)
+    expect(out).toContain('title: "My note"\n')
+    expect(out).toContain('tags:\n  - Work/Projects\n  - ml\n')
+  })
+
+  it.each(["title: 'Hello: world'", "title: ' padded '", "title: 'a #b'"])(
+    'keeps a safe single-quoted scalar: %s',
+    (titleLine) => {
+      const title = titleLine.slice(titleLine.indexOf("'") + 1, -1)
+      const existingRaw = `---\n${titleLine}\n---\n\n# ${title}\n\nbody\n`
+      const out = serializeNoteFile({ title, body: 'body\n', existingRaw })
+
+      expect(out).toBe(existingRaw)
+    },
+  )
+
+  it('keeps a flow list but canonicalises a scalar list channel', () => {
+    const flow = '---\ntitle: T\ntags: [a, b]\n---\n\n# T\n\nbody\n'
+    const scalar = flow.replace('tags: [a, b]', 'tags: a, b')
+
+    expect(
+      serializeNoteFile({ title: 'T', tags: ['a', 'b'], body: 'body\n', existingRaw: flow }),
+    ).toBe(flow)
+    expect(
+      serializeNoteFile({ title: 'T', tags: ['a', 'b'], body: 'body\n', existingRaw: scalar }),
+    ).toContain('tags:\n- a\n- b\n')
+  })
+
+  it.each([
+    ['title: 2024', 'title: "2024"'],
+    ['title: null', 'title: "null"'],
+  ])('canonicalises a scalar whose YAML type would differ: %s', (authored, expected) => {
+    const title = authored.slice('title: '.length)
+    const existingRaw = `---\n${authored}\n---\n\n# ${title}\n\nbody\n`
+    const out = serializeNoteFile({ title, body: 'body\n', existingRaw })
+
+    expect(out).toContain(`${expected}\n`)
+  })
+
+  it('canonicalises block scalars, under-quoted list elements and dropped empty elements', () => {
+    const owner = '---\ntitle: T\nnotarium-id: |\n  idAAAAAAAAAA\n---\n\n# T\n\nbody\n'
+    const numeric = '---\ntitle: T\ntags:\n  - 2024\n  - ml\n---\n\n# T\n\nbody\n'
+    const empty = '---\ntitle: T\ntags: [ml, ""]\n---\n\n# T\n\nbody\n'
+
+    expect(
+      serializeNoteFile({ title: 'T', id: 'idAAAAAAAAAA', body: 'body\n', existingRaw: owner }),
+    ).toContain('notarium-id: idAAAAAAAAAA\n')
+    expect(
+      serializeNoteFile({ title: 'T', tags: ['2024', 'ml'], body: 'body\n', existingRaw: numeric }),
+    ).toContain('tags:\n- "2024"\n- ml\n')
+    expect(
+      serializeNoteFile({ title: 'T', tags: ['ml'], body: 'body\n', existingRaw: empty }),
+    ).toContain('tags:\n- ml\n')
+  })
+
+  it('canonicalises muted once and then reaches a byte fixpoint', () => {
+    const existingRaw = '---\ntitle: T\nmuted: true\n---\n\n# T\n\nbody\n'
+    const first = serializeNoteFile({ title: 'T', muted: true, body: 'body\n', existingRaw })
+    const second = serializeNoteFile({
+      title: 'T',
+      muted: true,
+      body: 'body\n',
+      existingRaw: first,
+    })
+
+    expect(first).toContain('muted: "true"\n')
+    expect(second).toBe(first)
+  })
+
+  it('still collapses duplicates when the first value already matches', () => {
+    const existingRaw =
+      '---\ntitle: T\nnotarium-id: idAAAAAAAAAA\nnotarium-id: staleBBBBBB\n---\n\n# T\n\nbody\n'
+    const out = serializeNoteFile({
+      title: 'T',
+      id: 'idAAAAAAAAAA',
+      body: 'body\n',
+      existingRaw,
+    })
+
+    expect(out.match(/^notarium-id:/gm)).toHaveLength(1)
+    expect(out).toContain('notarium-id: idAAAAAAAAAA\n')
+  })
+
+  it('does not turn an unchanged typed field into a repair heuristic for invalid neighbours', () => {
+    const existingRaw = '---\ntitle: T\ntags: [a, b]\n- authored root item\n---\n\n# T\n\nbody\n'
+    const out = serializeNoteFile({
+      title: 'T',
+      tags: ['a', 'b'],
+      body: 'body\n',
+      existingRaw,
+    })
+
+    expect(out).toBe(existingRaw)
+  })
+})
+
+describe('serializeNoteFile — lossless frontmatter splice', () => {
+  it('changes one physical line in a full CRLF storage file', () => {
+    const existingRaw = [
+      '---',
+      'title: "My note"',
+      'tags:',
+      '  - Work/Projects',
+      '  - ml',
+      'notarium-id: idAAAAAAAAAA',
+      '---',
+      '',
+      '# My note',
+      '',
+      'Body line one.',
+      'Body line two.',
+      '',
+    ].join('\r\n')
+    const out = serializeNoteFile({
+      title: 'My note',
+      tags: ['Work/Projects', 'ml'],
+      id: 'idAAAAAAAAAA',
+      body: 'Body line one.\r\nBody line TWO.\r\n',
+      existingRaw,
+    })
+
+    expect(changedPhysicalLines(existingRaw, out)).toBe(1)
+  })
+
+  it('preserves separator blanks and trailing closing-fence bytes', () => {
+    const existingRaw = '---\ntitle: T\n\ntags: [a, b]\n---   \n\n# T\n\nBody one.\nBody two.\n'
+    const out = serializeNoteFile({
+      title: 'T',
+      tags: ['a', 'b'],
+      body: 'Body one.\nBody TWO.\n',
+      existingRaw,
+    })
+
+    expect(out).toContain('title: T\n\ntags: [a, b]\n---   \n')
+    expect(changedPhysicalLines(existingRaw, out)).toBe(1)
+  })
+
+  it('drops only a tombstoned entry span and keeps both authored separators', () => {
+    const existingRaw = '---\ntitle: T\n\nslug: custom\n\nauthor: Ada\n---\n\n# T\n\nbody\n'
+    const expected = '---\ntitle: T\n\n\nauthor: Ada\n---\n\n# T\n\nbody\n'
+    const out = serializeNoteFile({
+      title: 'T',
+      slug: '',
+      body: 'body\n',
+      existingRaw,
+    })
+
+    expect(out).toBe(expected)
+    expect(serializeNoteFile({ title: 'T', slug: '', body: 'body\n', existingRaw: out })).toBe(out)
+  })
+
+  it('uses payload majority and opening-fence tie-break for appended entries', () => {
+    const crlfMajority = '---\r\ntitle: T\na: one\r\nb: two\r\n---\r\n\r\n# T\r\n\r\nbody\r\n'
+    const lfTie = '---\ntitle: T\r\na: one\n---\n\n# T\n\nbody\n'
+    const crlfOut = serializeNoteFile({
+      title: 'T',
+      id: 'idAAAAAAAAAA',
+      body: 'body\r\n',
+      existingRaw: crlfMajority,
+    })
+    const lfOut = serializeNoteFile({
+      title: 'T',
+      id: 'idAAAAAAAAAA',
+      body: 'body\n',
+      existingRaw: lfTie,
+    })
+
+    expect(crlfOut).toContain('notarium-id: idAAAAAAAAAA\r\n---\r\n')
+    expect(lfOut).toContain('notarium-id: idAAAAAAAAAA\n---\n')
+  })
+
+  it('uses the first physical line when creating a block', () => {
+    const crlf = '# T\r\n\r\nbody\r\n'
+    const lfWithLaterCrlf = '# T\n```\r\ncode\r\n```\n'
+
+    expect(serializeNoteFile({ title: 'T', body: 'body\r\n', existingRaw: crlf })).toContain(
+      '---\r\ntitle: T\r\n---\r\n',
+    )
+    expect(
+      serializeNoteFile({ title: 'T', body: '```\r\ncode\r\n```\n', existingRaw: lfWithLaterCrlf }),
+    ).toContain('---\ntitle: T\n---\n')
+  })
+
+  it.each([
+    ['without a terminator', '---\ntitle: T\n---'],
+    ['with a terminator', '---\ntitle: T\n---\n'],
+  ])('makes a closing fence at EOF a byte fixpoint: %s', (_name, prefix) => {
+    const first = serializeNoteFile({ title: 'T', body: '', existingRaw: prefix })
+    const second = serializeNoteFile({ title: 'T', body: '', existingRaw: first })
+
+    expect(second).toBe(first)
+    expect(first).not.toContain('---\n\n\n# T')
+  })
+
+  it('falls back to a canonical rebuild when supplied geometry is inconsistent', () => {
+    const raw = '---\ntitle: Old\n---\n\n# Old\n\nbody\n'
+    const block = parseFrontmatterBlock(raw)!
+    const bounds = frontmatterPayloadBounds(raw, block.bodyStart)
+    const out = assembleNoteFile({
+      title: 'New',
+      cleanBody: 'body\n',
+      keyless: [],
+      entries: [frontmatterScalarEntry('title', 'New')],
+      live: [true],
+      touched: [true],
+      replacing: false,
+      source: {
+        raw,
+        block,
+        bounds,
+        spans: [{ key: 'title', start: bounds.payloadEnd + 1, end: bounds.payloadEnd + 2 }],
+      },
+    })
+
+    expect(out).toBe('---\ntitle: New\n---\n\n# New\n\nbody\n')
+  })
+
+  it('keeps an authored empty body empty', () => {
+    const existingRaw = '---\ntitle: T\n---\n\n# T\n'
+    expect(serializeNoteFile({ title: 'T', body: '', existingRaw })).toBe(existingRaw)
+  })
+})
+
+describe('serializeNoteFile — leading body block matrix', () => {
+  const cases = [
+    {
+      name: 'keyed metadata',
+      body: '---\ntype: note\n---\n# T\n\nx\n',
+      expectedBody: 'x\n',
+      metadata: true,
+    },
+    {
+      name: 'a comment plus keyed metadata',
+      body: '---\n# note\ntype: x\n---\n# T\n\ny\n',
+      expectedBody: 'y\n',
+      metadata: true,
+    },
+    {
+      name: 'rule-fenced prose',
+      body: '---\nA thought I wrote between two rules.\n---\nAnd the rest.\n',
+      expectedBody: '---\nA thought I wrote between two rules.\n---\nAnd the rest.\n',
+      metadata: false,
+    },
+    {
+      name: 'a comment-only block',
+      body: '---\n# just a comment\n---\nrest\n',
+      expectedBody: '---\n# just a comment\n---\nrest\n',
+      metadata: false,
+    },
+    {
+      name: 'a keyed record plus loose prose',
+      body: '---\nauthor: Ada\nA loose thought.\n---\nrest\n',
+      expectedBody: '---\nauthor: Ada\nA loose thought.\n---\nrest\n',
+      metadata: false,
+    },
+    {
+      name: 'an empty block',
+      body: '---\n---\nBody.\n',
+      expectedBody: '---\n---\nBody.\n',
+      metadata: false,
+    },
+    {
+      name: 'a block behind a body mark',
+      body: '\uFEFF---\ntitle: X\n---\nFirst.\n',
+      expectedBody: '\uFEFF---\ntitle: X\n---\nFirst.\n',
+      metadata: false,
+    },
+    {
+      name: 'a keyed block with trailing closing-fence bytes',
+      body: '---\ntitle: X\n---   \nFirst.\n',
+      expectedBody: 'First.\n',
+      metadata: true,
+    },
+    {
+      name: 'prose that parses as a key',
+      body: '---\nA thought: I wrote it.\n---\nrest\n',
+      expectedBody: 'rest\n',
+      metadata: true,
+    },
+    {
+      name: 'ordinary structural prose',
+      body: '- one\n- two\n',
+      expectedBody: '- one\n- two\n',
+      metadata: false,
+    },
+    {
+      name: 'a multiline keyless entry',
+      body: '---\n# section: notes\n  still mine\ntype: note\n---\nrest\n',
+      expectedBody: '---\n# section: notes\n  still mine\ntype: note\n---\nrest\n',
+      metadata: false,
+    },
+  ] as const
+
+  it.each(cases)('preserves the specified bytes for $name', ({ body, expectedBody, metadata }) => {
+    const promoted = promoteBodyTitle(body, 'T')
+    const out = serializeNoteFile({ title: promoted.title, body: promoted.body })
+    const parsed = parseNoteFile(out, 't.md')
+
+    expect(parsed.body).toBe(expectedBody)
+    const header = out.slice(0, parseFrontmatterBlock(out)!.bodyStart)
+
+    if (!metadata) {
+      expect(header).not.toContain('A loose thought.')
+      expect(header).not.toContain('still mine')
+    }
+
+    const again = serializeNoteFile({
+      title: parsed.title,
+      body: parsed.body,
+      existingRaw: out,
+    })
+    expect(again).toBe(out)
+  })
+
+  it('moves a qualifying body comment once, without deduplicating against the file header', () => {
+    const existingRaw = '---\n# note\ntitle: T\n---\n\n# T\n\nold\n'
+    const body = '---\n# note\ntype: x\n---\nnew\n'
+    const out = serializeNoteFile({ title: 'T', body, existingRaw })
+
+    expect(out.match(/^# note$/gm)).toHaveLength(2)
+    expect(parseNoteFile(out, 't.md').body).toBe('new\n')
+  })
+
+  it('keeps every byte of the bug-report body through repeated saves', () => {
+    const body = '---\nA thought I wrote between two rules.\n---\nAnd the rest.\n'
+    const first = serializeNoteFile({ title: 'T', body })
+    const parsed = parseNoteFile(first, 't.md')
+    const second = serializeNoteFile({ title: parsed.title, body: parsed.body, existingRaw: first })
+
+    expect(parsed.body).toBe(body)
+    expect(second).toBe(first)
   })
 })
 
@@ -760,6 +1136,14 @@ describe('serializeNoteFile ∘ parseNoteFile — round-trip invariants (propert
     'C#',
   ]
   const TAGS = [[], ['a'], ['работа', '2025'], ['#hash'], ['a: b']]
+  const BODIES = [
+    { input: 'Body line.', expected: 'Body line.' },
+    {
+      input: '---\nA thought I wrote between two rules.\n---\nAnd the rest.\n',
+      expected: '---\nA thought I wrote between two rules.\n---\nAnd the rest.\n',
+    },
+    { input: '---\ntype: note\n---\nBody line.\n', expected: 'Body line.\n' },
+  ]
 
   it('holds over a generated corpus of hostile frontmatter shapes', () => {
     let seed = 0x2802_2026
@@ -774,13 +1158,14 @@ describe('serializeNoteFile ∘ parseNoteFile — round-trip invariants (propert
       const carriedEntries = parseFrontmatterBlock(`---\n${block}\n---\n`)?.entries ?? []
       const title = TITLES[rnd(TITLES.length)]
       const tags = TAGS[rnd(TAGS.length)]
+      const body = BODIES[rnd(BODIES.length)]
       const input = {
         title,
         tags,
         id: 'idAAAAAAAAAA',
         createdAt: '2019-04-01T00:00:00.000Z',
         frontmatter: carriedEntries,
-        body: 'Body line.',
+        body: body.input,
       }
       const file = serializeNoteFile(input)
       const parsed = parseNoteFile(file, 'note.md')
@@ -800,6 +1185,7 @@ describe('serializeNoteFile ∘ parseNoteFile — round-trip invariants (propert
       expect([where, parsed.tags]).toEqual([where, tags])
       expect([where, parsed.idClaim]).toEqual([where, 'idAAAAAAAAAA'])
       expect([where, parsed.createdAt]).toEqual([where, '2019-04-01T00:00:00.000Z'])
+      expect([where, parsed.body]).toEqual([where, body.expected])
 
       const emitted = parseFrontmatterBlock(file)!
 
@@ -849,9 +1235,29 @@ describe('serializeNoteFile ∘ parseNoteFile — round-trip invariants (propert
       }
 
       // (4) a re-save is a fixpoint — the file must stop changing.
-      const again = serializeNoteFile({ ...input, frontmatter: undefined, existingRaw: file })
+      const again = serializeNoteFile({
+        ...input,
+        body: parsed.body,
+        frontmatter: undefined,
+        existingRaw: file,
+      })
       expect([where, again]).toEqual([where, file])
       expect([where, parseNoteFile(again, 'note.md').title]).toEqual([where, parsed.title])
+
+      // The same fixed point over a CRLF storage form exercises the span writer's
+      // second axis: existing raw geometry and physical terminators, not just body shape.
+      if (i % 3 === 0) {
+        const crlfFile = file.replace(/\n/g, '\r\n')
+        const crlfParsed = parseNoteFile(crlfFile, 'note.md')
+        const crlfAgain = serializeNoteFile({
+          ...input,
+          body: crlfParsed.body,
+          frontmatter: undefined,
+          existingRaw: crlfFile,
+        })
+
+        expect([where, crlfAgain]).toEqual([where, crlfFile])
+      }
 
       // (5) the IMPORT leg: dropping our own exported file back in must reproduce the
       // same note and must not stack another copy of the storage heading.

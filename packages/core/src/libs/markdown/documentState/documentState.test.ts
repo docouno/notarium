@@ -612,6 +612,30 @@ describe('document state', () => {
     ).toEqual({ status: 'safe' })
   })
 
+  it('uses the shared block EOL rule for owner insertions', () => {
+    const probes = [
+      {
+        source: '---\r\ntitle: Historical\na: one\r\nb: two\r\n---\r\nbody\r\n',
+        expected: 'notarium-id: note-id\r\n---\r\n',
+      },
+      {
+        source: '---\ntitle: Historical\r\na: one\n---\nbody\n',
+        expected: 'notarium-id: note-id\n---\n',
+      },
+      {
+        source: '# Historical\n```\r\ncode\r\n```\n',
+        expected: '---\nnotarium-id: note-id\n---\n',
+      },
+    ]
+
+    for (const probe of probes) {
+      const state = analyzeDocumentState({ source: bytes(probe.source), pathFallbackTitle: 'note' })
+      const plan = planDocumentMutation(state, { owners: { [STORAGE_OWNER_KEY.id]: 'note-id' } })
+
+      expect(new TextDecoder().decode(plan.source)).toContain(probe.expected)
+    }
+  })
+
   // U+2028 and a lone CR end a Markdown line but not a YAML one, and the raw parser
   // reads frontmatter by the YAML rule. Reading the same block by the Markdown rule
   // split an entry the parser had kept whole, so an ordinary title carrying one of

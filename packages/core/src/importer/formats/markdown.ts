@@ -13,6 +13,7 @@ import {
   frontmatterHasYamlNodeReferences,
   FrontmatterLimitError,
   headingTitle,
+  parseBodyFrontmatterBlock,
   parseFrontmatterBlock,
   promoteBodyTitle,
 } from '../../libs/markdown'
@@ -132,13 +133,13 @@ export const markdownFileToNote = (
   // content line is not first and the title scan below misses the heading.
   const afterFm = (fm ? text.slice(fm.bodyStart) : text).replace(/^(?:\r?\n)+/, '')
 
-  // A second confirmed block would be interpreted differently by the real file
+  // A second record-bearing body block would be interpreted differently by the real file
   // serializer (which merges inline body frontmatter) and the in-memory engine
   // (which keeps it as body). Refuse that ambiguous source shape. A lone thematic
   // `---` with no closing fence still parses as null and remains ordinary prose.
   if (fm) {
     try {
-      if (parseFrontmatterBlock(afterFm)) {
+      if (parseBodyFrontmatterBlock(afterFm)) {
         throw new ImportError(`${fileName}: a second leading frontmatter block is unsupported`)
       }
     } catch (err) {

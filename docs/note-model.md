@@ -387,6 +387,16 @@ the basename because it carries no move intent. The same no-intent rule preserve
 deterministic imported basenames; only an explicit title/folder/fileName change requests
 a move.
 
+An ordinary content save also preserves authored bytes outside the changed channel. Existing
+frontmatter is patched by physical entry spans: untouched entries, separator blanks, fence bytes,
+the byte-order mark and their line terminators are copied verbatim. A typed field whose channel
+value is unchanged keeps its authored quoting/indentation only when the line reader and YAML agree
+on that value; lossy, block-scalar or under-quoted forms are canonicalized once. A genuinely new
+frontmatter line follows the majority terminator of the block's physical payload (the opening fence
+breaks a tie); a file without a block follows its first physical line. A fenced opening inside note
+BODY is metadata only under the record-bearing rule in [core.md](core.md#write-through), so prose
+between thematic rules remains body through repeated saves.
+
 The operation claim is persistent under `.notarium-fs-ops`, not merely an in-memory
 rollback. `preparing` permits no public mutation; `active` is the recovery intent; `done`
 makes private cleanup retryable. Every read/scan/mutation first recovers an active intent,

@@ -477,9 +477,8 @@ describe('errText (mermaid error caption)', () => {
   })
 })
 
-// WHERE a leading block is, is the domain's answer — the same parser the write path and
-// the title derivation use, so a screen never hides bytes the rest of the system calls
-// prose. WHETHER to cut it stays this renderer's own, narrower question.
+// The renderer consumes the shared BODY answer, so it cannot hide bytes the writer keeps
+// as prose or expose metadata the writer folds into the file header.
 describe('leading frontmatter strip', () => {
   it('cuts a real block so marked does not render it as a stray table', () => {
     expect(stripLeadingFrontmatter('---\ntitle: X\n---\nFirst paragraph.\n')).toBe(
@@ -498,10 +497,22 @@ describe('leading frontmatter strip', () => {
   })
 
   it('keeps prose an author fenced deliberately, even when the domain calls it a block', () => {
-    // This renderer's own question: a first line that does not read like a YAML key is
-    // content, and cutting it would eat what the person wrote between two rules.
     const md = '---\nA thought I wrote between two rules.\n---\nAnd the rest.\n'
 
+    expect(stripLeadingFrontmatter(md)).toBe(md)
+  })
+
+  it.each([
+    ['a leading comment plus a keyed record', '---\n# note\ntype: x\n---\nBody.\n'],
+    ['a prose-looking keyed record', '---\nA thought: I wrote it.\n---\nBody.\n'],
+  ])('cuts body metadata: %s', (_name, md) => {
+    expect(stripLeadingFrontmatter(md)).toBe('Body.\n')
+  })
+
+  it.each([
+    ['a keyed record plus loose prose', '---\nauthor: Ada\nA loose thought.\n---\nBody.\n'],
+    ['a block behind a body mark', '\uFEFF---\ntitle: X\n---\nBody.\n'],
+  ])('keeps authored body bytes: %s', (_name, md) => {
     expect(stripLeadingFrontmatter(md)).toBe(md)
   })
 
