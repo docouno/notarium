@@ -31,6 +31,7 @@
     "seed-coverage": "tsx scripts/coverage.ts",
     "bench:import-markdown-tree": "tsx scripts/importMarkdownTreeBench.ts",
     "bench:context-open": "tsx scripts/contextOpenBench.ts",
+    "bench:write-path": "tsx scripts/writePathBenchGates.ts",
     "bench:graph-revision-memory": "node --expose-gc --import tsx scripts/graphRevisionMemory.ts",
     "bench:graph-revision-corpus": "tsx scripts/graphRevisionCorpus.ts",
     "bench:graph-revision": "tsx scripts/graphRevisionBench.ts",

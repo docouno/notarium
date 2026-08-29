@@ -97,7 +97,7 @@ export const encodeDocumentState = (state: DocumentState): Uint8Array => {
   return output
 }
 
-export const decodeDocumentState = (blob: Uint8Array): DocumentState => {
+const documentStateFrame = (blob: Uint8Array): { header: Header; sourceStart: number } => {
   if (
     blob.byteLength < MAGIC.byteLength + 4 ||
     !MAGIC.every((value, index) => blob[index] === value)
@@ -113,7 +113,17 @@ export const decodeDocumentState = (blob: Uint8Array): DocumentState => {
   if (sourceStart > blob.byteLength) {
     throw new Error('truncated document-state blob')
   }
+
   const header = parseHeader(JSON.parse(STRICT_UTF8.decode(blob.slice(headerStart, sourceStart))))
+  return { header, sourceStart }
+}
+
+/** Source-byte length carried by one valid NDS1 frame, without decoding its document. */
+export const documentStateSourceByteLength = (blob: Uint8Array): number =>
+  blob.byteLength - documentStateFrame(blob).sourceStart
+
+export const decodeDocumentState = (blob: Uint8Array): DocumentState => {
+  const { header, sourceStart } = documentStateFrame(blob)
   const input = {
     source: blob.slice(sourceStart),
     role: header.role,

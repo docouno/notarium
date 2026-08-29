@@ -1661,12 +1661,74 @@ describe('production MCP ability mutation — real createServer composition', ()
   })
 
   it('lets the periodic poll progress after the exact edit without leaving HOL', async () => {
-    // The one row whose subject IS a background producer, so it keeps exactly one
-    // and no more: `boot` silences the watcher and the write-through reconcile
-    // (see `isolateBackgroundReconcile`), and the interval below is what remains.
-    // Neither of the other two may satisfy this row on the timer's behalf.
-    await boot(50)
+    const stage = async <T>(name: string, promise: Promise<T>): Promise<T> => {
+      try {
+        return await settles(promise)
+      } catch (error) {
+        throw new Error(`${name}: ${(error as Error).message}`, { cause: error })
+      }
+    }
+
+    // Drive the exact producer the periodic timer calls through its public test/host
+    // entrypoint. Waiting for a real 50 ms interval made this queue-order proof depend
+    // on whether a loaded Vitest process gave timers a turn inside an arbitrary budget.
+    const stores = new Set<CachedStore>()
+    const startOriginal = CachedStore.prototype.start
+
+    vi.spyOn(CachedStore.prototype, 'start').mockImplementation(function (
+      this: CachedStore,
+    ): Promise<void> {
+      stores.add(this)
+      return Reflect.apply(startOriginal, this, []) as Promise<void>
+    })
+    await boot()
     const role = await createRole('reconcile-progress')
+
+    expect(stores.size).toBe(1)
+    const store = [...stores][0]!
+    const exactOriginal = CachedStore.prototype.withExactNoteClaim
+    const gatedRoleId = role.noteId
+    let targetCalls = 0
+    let exactHeld = false
+    const entered = deferred()
+    const release = deferred()
+    const pollRequested = deferred()
+    const runOriginal = MutationCoordinator.prototype.run
+
+    vi.spyOn(MutationCoordinator.prototype, 'run').mockImplementation(async function <T>(
+      this: MutationCoordinator,
+      claim: MutationClaim,
+      task: () => Promise<T>,
+    ): Promise<T> {
+      const pending = Reflect.apply(runOriginal, this, [claim, task]) as Promise<T>
+
+      if (exactHeld && claim.global) {
+        pollRequested.resolve()
+      }
+
+      return pending
+    })
+
+    vi.spyOn(CachedStore.prototype, 'withExactNoteClaim').mockImplementation(async function <T>(
+      this: CachedStore,
+      noteId: string,
+      task: (current: NoteContent) => Promise<T>,
+    ): Promise<T> {
+      if (noteId === gatedRoleId && ++targetCalls === 2) {
+        return callExactNoteClaim(exactOriginal, this, noteId, async (current) => {
+          exactHeld = true
+          entered.resolve()
+          try {
+            await release.promise
+            return await task(current)
+          } finally {
+            exactHeld = false
+          }
+        })
+      }
+
+      return callExactNoteClaim(exactOriginal, this, noteId, task)
+    })
     const unrelated = await app!.inject({
       method: 'POST',
       url: `/api/s/${personalSlug}/notes`,
@@ -1688,82 +1750,36 @@ describe('production MCP ability mutation — real createServer composition', ()
       return (response.json() as { delta: { lastPollAt: string | null } }).delta.lastPollAt
     }
 
-    await waitUntil(async () => (await pollStatus()) !== null)
-    const exactOriginal = CachedStore.prototype.withExactNoteClaim
-    const entered = deferred()
-    const release = deferred()
-    const periodicRequested = deferred()
-    let targetCalls = 0
-    let exactHeld = false
-    const runOriginal = MutationCoordinator.prototype.run
-
-    vi.spyOn(MutationCoordinator.prototype, 'run').mockImplementation(async function <T>(
-      this: MutationCoordinator,
-      claim: MutationClaim,
-      task: () => Promise<T>,
-    ): Promise<T> {
-      if (exactHeld && claim.global) {
-        periodicRequested.resolve()
-      }
-
-      return Reflect.apply(runOriginal, this, [claim, task]) as Promise<T>
-    })
-
-    vi.spyOn(CachedStore.prototype, 'withExactNoteClaim').mockImplementation(async function <T>(
-      this: CachedStore,
-      noteId: string,
-      task: (current: NoteContent) => Promise<T>,
-    ): Promise<T> {
-      if (noteId === role.noteId && ++targetCalls === 2) {
-        return callExactNoteClaim(exactOriginal, this, noteId, async (current) => {
-          exactHeld = true
-          entered.resolve()
-          try {
-            await release.promise
-            return await task(current)
-          } finally {
-            exactHeld = false
-          }
-        })
-      }
-
-      return callExactNoteClaim(exactOriginal, this, noteId, task)
-    })
+    await stage('baseline reconcile', store.reconcile())
+    const heldPoll = (await pollStatus())!
     const editing = editRole(role, '# Reconcile progress\n\nUpdated.')
 
-    await barrier(entered.promise)
-    const heldPoll = (await pollStatus())!
+    await stage('exact edit entry', entered.promise)
     const followingRead = app!.inject({
       method: 'GET',
       url: `/api/note?id=${encodeURIComponent(unrelatedId)}`,
       headers: { cookie },
     })
 
-    try {
-      await barrier(periodicRequested.promise)
-      expect(await pollStatus()).toBe(heldPoll)
-      // The HOL half of this row, and the reason the read is awaited HERE rather
-      // than after the release: it was issued before the periodic producer asked
-      // for its global claim, so the fair queue puts it ahead of that claim, and
-      // the edit fences its own target only. Finishing inside a window that
-      // nothing but `release.resolve()` below can end is what says so — an edit
-      // that fenced the store instead would leave this read parked until then.
-      const read = await settles(followingRead)
+    // The HOL half of this row: an exact edit fences its own target only, so an
+    // unrelated read completes while that exact claim is still deliberately held.
+    const read = await stage('unrelated read', followingRead)
 
-      expect(read.statusCode, read.body).toBe(200)
-      expect(exactHeld).toBe(true)
+    expect(read.statusCode, read.body).toBe(200)
+    expect(exactHeld).toBe(true)
+    const polling = store.reconcile()
+
+    try {
+      await stage('poll claim request', pollRequested.promise)
+      expect(await pollStatus()).toBe(heldPoll)
     } finally {
       release.resolve()
     }
-    const edited = await settles(editing)
+    const [edited] = await stage('edit and poll completion', Promise.all([editing, polling]))
 
     expect(edited.result?.isError, toolText(edited)).not.toBe(true)
-    await waitUntil(async () => {
-      const current = await pollStatus()
-
-      return current !== null && Date.parse(current) > Date.parse(heldPoll)
-    })
-    await settles(readRole(role.ref))
+    expect(Date.parse((await pollStatus())!)).toBeGreaterThan(Date.parse(heldPoll))
+    await stage('post-poll read', readRole(role.ref))
   }, 30_000)
 
   it('keeps package delete behind its existing Core-global claim', async () => {

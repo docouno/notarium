@@ -26,8 +26,8 @@ export const stripFrontmatter = (content: string): string => {
   const raw = content || ''
 
   try {
-    const block = parseFrontmatterBlock(raw)
-    return block ? raw.slice(block.bodyStart) : raw
+    const geometry = scanFrontmatterGeometry(raw)
+    return geometry ? raw.slice(geometry.bodyStart) : raw
   } catch (error) {
     // Only the budget refusal degrades. Anything else is a real fault in the parser, and
     // swallowing it here would hide it behind a document that merely looks block-less.
@@ -699,9 +699,13 @@ export const frontmatterHasYamlNodeReferences = (
 export const frontmatterEntryDefinesYamlAnchor = (entry: FrontmatterEntry): boolean =>
   frontmatterYamlNodeReferences([entry]).anchor
 
-/** Split a document's leading frontmatter into entries; null when there is none.
- *  `bodyStart` points right after the closing delimiter line. */
-export const parseFrontmatterBlock = (raw: string): FrontmatterBlock | null => {
+type FrontmatterGeometry = {
+  blockStart: number
+  closeStart: number
+  bodyStart: number
+}
+
+const scanFrontmatterGeometry = (raw: string): FrontmatterGeometry | null => {
   const open = FM_OPEN.exec(raw)
 
   if (!open) {
@@ -772,6 +776,19 @@ export const parseFrontmatterBlock = (raw: string): FrontmatterBlock | null => {
   if (closeStart === -1) {
     return null
   }
+
+  return { blockStart, closeStart, bodyStart }
+}
+
+/** Split a document's leading frontmatter into entries; null when there is none.
+ *  `bodyStart` points right after the closing delimiter line. */
+export const parseFrontmatterBlock = (raw: string): FrontmatterBlock | null => {
+  const geometry = scanFrontmatterGeometry(raw)
+
+  if (!geometry) {
+    return null
+  }
+  const { blockStart, closeStart, bodyStart } = geometry
 
   const block = raw.slice(blockStart, closeStart)
   const entries: FrontmatterEntry[] = []

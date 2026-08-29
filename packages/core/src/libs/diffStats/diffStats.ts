@@ -13,8 +13,12 @@ export type DiffStats = { charsAdded: number; charsRemoved: number }
  *  queue on a megabyte-scale paste. */
 const MAX_DIFF_CHARS = 1_000_000
 
+/** Whether two character counts fit the journal's word-diff budget. */
+export const isDiffStatsWithinBudget = (beforeChars: number, afterChars: number): boolean =>
+  beforeChars + afterChars <= MAX_DIFF_CHARS
+
 export const diffStats = (before: string, after: string): DiffStats | null => {
-  if (before.length + after.length > MAX_DIFF_CHARS) {
+  if (!isDiffStatsWithinBudget(before.length, after.length)) {
     return null
   }
   let charsAdded = 0

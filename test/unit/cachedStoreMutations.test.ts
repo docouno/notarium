@@ -2475,6 +2475,20 @@ for (const [name, createHarness] of variants) {
       const restore = store.restoreFromTrash(beta, { principal: 'test' })
 
       await gate.entered
+      // A filesystem-backed exact read may take any number of event-loop turns.
+      // Reject the forbidden read admission itself so the regression fails
+      // causally instead of racing an arbitrary timer budget.
+      const admission = Reflect.get(store, 'mutationAdmission') as {
+        acquire: (mode: 'read' | 'mutation') => Promise<() => void>
+      }
+      const acquireAdmission = admission.acquire.bind(admission)
+      const admissionSpy = vi.spyOn(admission, 'acquire').mockImplementation((mode) => {
+        if (mode === 'read') {
+          return Promise.reject(new Error('exact observation re-entered read admission'))
+        }
+
+        return acquireAdmission(mode)
+      })
       let entered = false
       const scope = store.withExactNoteClaim(alpha, async (current) => {
         entered = true
@@ -2482,12 +2496,11 @@ for (const [name, createHarness] of variants) {
       })
 
       try {
-        for (let turn = 0; turn < 5; turn += 1) {
-          await nextTurn()
-        }
-        expect(entered).toBe(true)
         await expect(scope).resolves.toBe('from/alpha.md')
+        expect(entered).toBe(true)
+        expect(admissionSpy).not.toHaveBeenCalledWith('read')
       } finally {
+        admissionSpy.mockRestore()
         gate.release()
         await Promise.allSettled([restore, scope])
       }

@@ -84,7 +84,7 @@ PLAYWRIGHT_TEST_IMAGE ?= mcr.microsoft.com/playwright:v1.60.0-jammy
 
 .DEFAULT_GOAL := help
 .PHONY: help prepare deps deps-vector doctor dev up start down stop restart logs ps sh \
-        checkup audit-runtime test-coverage test-pg test-browser import-bench graph-revision-gate bench-session-audit backup restore backup-smoke seed seed-list \
+        checkup audit-runtime test-coverage test-pg test-browser import-bench write-perf-gate graph-revision-gate bench-session-audit backup restore backup-smoke seed seed-list \
         footage demo-shots demo-preview demo-plates image release release-rc release-smoke save clean
 
 help: ## List available targets
@@ -302,6 +302,9 @@ import-bench: ## Run the Markdown-tree import scale bench in Docker: make import
 	    --workdir /app -e HOME=/tmp -e NOTES=$(NOTES) -e SOURCE=$(SOURCE) \
 	    --entrypoint npm "$(NODE_TEST_IMAGE)" run bench:import-markdown-tree
 
+write-perf-gate: ## Prove the bounded Markdown/frontmatter write-path costs
+	npm run bench:write-path
+
 # --- graph revision production gate ----------------------------------------
 # One command owns the #410 disposable contour: traceable runtime image, neutral
 # 1357-note/20.3-MiB seed, vector+graph-enabled server, isolated GC memory report
@@ -511,6 +514,7 @@ test-browser: ## Run container-native e2e and installed visual baselines
 checkup: deps ## Run every portable gate; visual too when its external baselines are present
 	npm run format:check
 	npm run canon:check
+	$(MAKE) --no-print-directory write-perf-gate
 	npm run meta-migrations:check
 	npm run audit:runtime
 	npm run lint

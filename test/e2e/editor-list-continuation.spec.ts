@@ -117,8 +117,13 @@ test('slash menu keeps owning Enter before markdown continuation', async ({ page
 
   const menu = page.locator('.cm-tooltip-autocomplete')
   await expect(menu).toBeVisible()
-  await page.keyboard.type('code')
-  await expect(menu.getByRole('option', { name: /Code block/ })).toBeVisible()
+  const codeBlock = menu.getByRole('option', { name: /Code block/ })
+
+  // CodeMirror deliberately ignores completion-keymap input for the first 75 ms
+  // after opening a menu. Model an actual typed query and wait for its selected
+  // option instead of racing Enter against that upstream interaction guard.
+  await page.keyboard.type('code', { delay: 50 })
+  await expect(codeBlock).toHaveAttribute('aria-selected', 'true')
   await page.keyboard.press('Enter')
 
   await expect(menu).toBeHidden()

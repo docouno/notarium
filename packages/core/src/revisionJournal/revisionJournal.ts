@@ -19,7 +19,7 @@ import {
   type RevisionPersistence,
   type TrashAvailabilityFilter,
 } from '../knowledgeStore'
-import { diffStats } from '../libs/diffStats'
+import { diffStats, isDiffStatsWithinBudget } from '../libs/diffStats'
 import { sha256Hex } from '../libs/hash'
 import {
   decodeDocumentState,
@@ -32,6 +32,7 @@ import {
   type LogicalNoteState,
   parseLogicalNoteState,
 } from '../libs/markdown'
+import { documentStateSourceByteLength } from '../libs/markdown/documentState/codec'
 import type { JournalOptions, JournalRecordInput } from './types'
 
 const sameTags = (a: readonly string[], b: readonly string[]) =>
@@ -380,8 +381,8 @@ export class RevisionJournal {
       (await this.isDuplicate(latest, rev, input))
     ) {
       // Same state again — a no-op save, or the delta poll echoing our own
-      // write back (a reindex re-surfaces everything we write). Not a revision. Slug is in
-      // the key so a slug-only change (e.g. an external clear) still records.
+      // write back (a reindex re-surfaces everything we write). Document rows use
+      // their semantic fingerprint; only the legacy key includes slug and tags.
       return null
     }
 
@@ -402,6 +403,9 @@ export class RevisionJournal {
       latest.stateFormat === input.documentState.format &&
       latest.contentHash != null
     ) {
+      if (latest.semanticFingerprint != null) {
+        return latest.semanticFingerprint === input.documentState.semanticFingerprint
+      }
       const blob = await this.persistence.content(latest.contentHash)
 
       if (blob == null) {
@@ -463,15 +467,41 @@ export class RevisionJournal {
 
         return
       }
-      const current = stateBlob(input)
+      const format = rev.stateFormat ?? null
+      let currentText: string | null
 
-      if (current == null) {
+      if (
+        input.documentState != null &&
+        (format === DOCUMENT_STATE_FORMAT.markdown || format === DOCUMENT_STATE_FORMAT.skill)
+      ) {
+        currentText = documentSourceText(input.documentState)
+      } else {
+        const current = stateBlob(input)
+
+        if (current == null) {
+          return
+        }
+        currentText = comparableText(current, format)
+      }
+      if (currentText == null) {
         return
       }
-      const currentText = comparableText(current, rev.stateFormat ?? null)
+      if (
+        latest &&
+        base != null &&
+        (latest.stateFormat === DOCUMENT_STATE_FORMAT.markdown ||
+          latest.stateFormat === DOCUMENT_STATE_FORMAT.skill)
+      ) {
+        const baseTextLowerBound =
+          typeof base === 'string' ? base.length : documentStateSourceByteLength(base) / 3
+
+        if (!isDiffStatsWithinBudget(baseTextLowerBound, currentText.length)) {
+          return
+        }
+      }
       const baseText = comparableText(base, latest?.stateFormat ?? null)
 
-      if (currentText == null || (latest && baseText == null)) {
+      if (latest && baseText == null) {
         return
       }
       const stats = diffStats(baseText ?? '', currentText)

@@ -17,8 +17,36 @@ export const matchMathBlock = (source: string): MathSyntaxMatch | undefined => {
 
 /** Locate a later display-math opener which may interrupt a paragraph. */
 export const mathBlockStart = (source: string): number | undefined => {
-  const match = /\n {0,3}(?:\$\$|\\\[)/.exec(source)
-  return match ? match.index + 1 : undefined
+  const afterLineBreak = (marker: string): number | undefined => {
+    let markerAt = source.indexOf(marker)
+
+    while (markerAt !== -1) {
+      let lineBreakAt = markerAt - 1
+      let spaces = 0
+
+      while (spaces < 3 && source[lineBreakAt] === ' ') {
+        lineBreakAt--
+        spaces++
+      }
+      if (source[lineBreakAt] === '\n') {
+        return lineBreakAt + 1
+      }
+      markerAt = source.indexOf(marker, markerAt + 1)
+    }
+
+    return undefined
+  }
+  const dollar = afterLineBreak('$$')
+  const bracket = afterLineBreak('\\[')
+
+  if (dollar === undefined) {
+    return bracket
+  }
+  if (bracket === undefined) {
+    return dollar
+  }
+
+  return Math.min(dollar, bracket)
 }
 
 const INLINE_PAREN = /^\\\(([\s\S]+?)\\\)/
@@ -56,6 +84,6 @@ export const matchMathInline = (source: string): MathSyntaxMatch | undefined => 
 
 /** Locate the next possible inline math opener. */
 export const mathInlineStart = (source: string): number | undefined => {
-  const match = /\$|\\[([]/.exec(source)
-  return match?.index
+  const index = source.indexOf('$')
+  return index === -1 ? undefined : index
 }

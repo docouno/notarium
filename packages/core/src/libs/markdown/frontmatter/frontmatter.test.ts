@@ -473,6 +473,48 @@ describe('parseFrontmatterBlock', () => {
     ).toThrow('frontmatter exceeds the 64 KiB limit')
   })
 
+  it.each([
+    ['a lone carriage return', '\r'],
+    ['a Unicode line separator', '\u2028'],
+  ])('does not treat %s as a frontmatter line boundary', (_name, separator) => {
+    const raw = `---\ntitle: A${separator}---\nbody`
+
+    expect(parseFrontmatterBlock(raw)).toBeNull()
+    expect(stripFrontmatter(raw)).toBe(raw)
+  })
+
+  it('does not accept a closing fence in the middle of a line', () => {
+    const raw = '---\ntitle: A ---\nbody'
+
+    expect(parseFrontmatterBlock(raw)).toBeNull()
+    expect(stripFrontmatter(raw)).toBe(raw)
+  })
+
+  it.each([
+    ['CJK code points', '界', 3],
+    ['surrogate pairs', '😀', 4],
+  ])('counts %s at the UTF-8 byte-cap boundary', (_name, char, bytes) => {
+    const unitsAtCap = Math.floor((FRONTMATTER_BYTE_CAP - 4) / bytes)
+    const atCap = `---\nx: ${char.repeat(unitsAtCap)}\n---\nbody`
+    const overCap = `---\nx: ${char.repeat(unitsAtCap + 1)}\n---\nbody`
+
+    expect(parseFrontmatterBlock(atCap)).not.toBeNull()
+    expect(() => parseFrontmatterBlock(overCap)).toThrow(FrontmatterLimitError)
+    expect(stripFrontmatter(overCap)).toBe(overCap)
+  })
+
+  it.each([
+    ['closing fence at EOF', '---\ntitle: A\n---', ''],
+    ['empty block', '---\n---\nbody', 'body'],
+    ['body starts with another fence', '---\ntitle: A\n---\n---\nbody', '---\nbody'],
+  ])('keeps the recorded geometry for %s', (_name, raw, body) => {
+    const block = parseFrontmatterBlock(raw)
+
+    expect(block).not.toBeNull()
+    expect(stripFrontmatter(raw)).toBe(body)
+    expect(raw.slice(block!.bodyStart)).toBe(body)
+  })
+
   it('checks the same UTF-8 cap for bare snapshot frontmatter', () => {
     expect(isWithinFrontmatterByteCap('a'.repeat(FRONTMATTER_BYTE_CAP))).toBe(true)
     expect(isWithinFrontmatterByteCap('é'.repeat(FRONTMATTER_BYTE_CAP / 2))).toBe(true)

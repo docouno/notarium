@@ -289,10 +289,6 @@ type WikilinkToken = { type: typeof WIKILINK_TOKEN; raw: string; target: string 
 const wikilinkExtractionExtension: TokenizerAndRendererExtension = {
   name: WIKILINK_TOKEN,
   level: 'inline',
-  start: (source) => {
-    const index = source.indexOf('[[')
-    return index === -1 ? undefined : index
-  },
   tokenizer: (source) => {
     const match = wikilinkPrefix(source)
 
@@ -304,10 +300,19 @@ const wikilinkExtractionExtension: TokenizerAndRendererExtension = {
   },
 }
 
+let inlineMathPresent: boolean | undefined
+let blockMathPresent: boolean | undefined
+
+const gatedMathBlockStart = (source: string): number | undefined =>
+  blockMathPresent === false ? undefined : mathBlockStart(source)
+
+const gatedMathInlineStart = (source: string): number | undefined =>
+  inlineMathPresent === false ? undefined : mathInlineStart(source)
+
 const mathBlockExtractionBarrier: TokenizerAndRendererExtension = {
   name: 'notariumMathBlock',
   level: 'block',
-  start: mathBlockStart,
+  start: gatedMathBlockStart,
   tokenizer: (source) => {
     const match = matchMathBlock(source)
     return match ? { type: 'notariumMathBlock', raw: match.raw } : undefined
@@ -317,7 +322,7 @@ const mathBlockExtractionBarrier: TokenizerAndRendererExtension = {
 const mathInlineExtractionBarrier: TokenizerAndRendererExtension = {
   name: 'notariumMathInline',
   level: 'inline',
-  start: mathInlineStart,
+  start: gatedMathInlineStart,
   tokenizer: (source) => {
     const match = matchMathInline(source)
     return match ? { type: 'notariumMathInline', raw: match.raw } : undefined
@@ -335,10 +340,22 @@ wikilinkMarkdown.use({
  *  the targets, a rewrite reads the offsets, and neither can hold an opinion the
  *  other contradicts. `start` is an offset into `lexed`, which is what the lexer
  *  was handed — not necessarily the author's bytes (see `lexerSource`). */
-const lexWikilinks = (lexed: string): LocatedWikilink[] =>
-  locateWikilinks(wikilinkMarkdown.lexer(lexed), lexed)
-    .map((link) => ({ ...link, target: normalizeWikilinkTarget(link.target) }))
-    .filter((link) => link.target !== '')
+const lexWikilinks = (lexed: string): LocatedWikilink[] => {
+  const previousInlineMathPresent = inlineMathPresent
+  const previousBlockMathPresent = blockMathPresent
+
+  inlineMathPresent = lexed.includes('$')
+  blockMathPresent = lexed.includes('$$') || lexed.includes('\\[')
+
+  try {
+    return locateWikilinks(wikilinkMarkdown.lexer(lexed), lexed)
+      .map((link) => ({ ...link, target: normalizeWikilinkTarget(link.target) }))
+      .filter((link) => link.target !== '')
+  } finally {
+    inlineMathPresent = previousInlineMathPresent
+    blockMathPresent = previousBlockMathPresent
+  }
+}
 
 /** Extract with the same CommonMark/GFM block and inline grammar the UI renders.
  *  A source regex cannot faithfully distinguish prose from fenced/indented code,
