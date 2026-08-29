@@ -1045,6 +1045,70 @@ describe('CachedStore write ingress', () => {
     }
   })
 
+  it('rejects an external replacement inside the production conditional commit', async () => {
+    const h = await createNotariumHarness()
+    const realRename = fsPromises.rename.bind(fsPromises)
+
+    try {
+      const created = await h.store.write({ title: 'Note', content: 'original body' })
+      const before = await h.store.read(created.id!)
+      const notePath = join(h.notesDir!, before.filePath!)
+      const externalPath = join(h.notesDir!, '.external-replacement')
+      const externalBytes = '---\ntitle: External\nnotarium-id: ExternalRace1\n---\n\nexternal body'
+      const staleBody = 'stale app body'
+      const innerWrite = vi.spyOn(h.inner, 'write')
+      let replacementInjected = false
+
+      expect(before.physicalIncarnation).toBeDefined()
+      await fsPromises.writeFile(externalPath, externalBytes)
+      const renameSpy = vi
+        .spyOn(fsPromises, 'rename')
+        .mockImplementation(async (source, target) => {
+          if (
+            !replacementInjected &&
+            String(source) === notePath &&
+            String(target).startsWith(join(h.notesDir!, '.notarium-fs-ops')) &&
+            String(target).endsWith('/detached-source')
+          ) {
+            replacementInjected = true
+            await realRename(externalPath, notePath)
+          }
+
+          return realRename(source, target)
+        })
+
+      try {
+        await expect(
+          h.store.write({
+            originalId: created.id,
+            title: 'Note',
+            content: staleBody,
+            versionToken: before.versionToken,
+          }),
+        ).rejects.toThrow(/source changed during move/i)
+      } finally {
+        renameSpy.mockRestore()
+      }
+
+      expect(replacementInjected).toBe(true)
+      expect(innerWrite).toHaveBeenCalledTimes(1)
+      expect(innerWrite.mock.calls[0]![0].expectedSource).toEqual(before.physicalIncarnation)
+      await expect(readFile(notePath, 'utf8')).resolves.toBe(externalBytes)
+      const entries = await fsPromises.readdir(h.notesDir!, { withFileTypes: true })
+
+      expect(entries.map(({ name }) => name)).not.toContain('.notarium-fs-ops')
+      const diskBodies = await Promise.all(
+        entries
+          .filter((entry) => entry.isFile())
+          .map((entry) => readFile(join(h.notesDir!, entry.name), 'utf8')),
+      )
+
+      expect(diskBodies.join('\n')).not.toContain(staleBody)
+    } finally {
+      await h.close()
+    }
+  })
+
   it('rejects invalid carried frontmatter before it reaches the inner engine', async () => {
     const h = await createMemoryHarness()
 
