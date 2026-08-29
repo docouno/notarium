@@ -11,6 +11,7 @@ export {
   type EngineMount,
   type EngineMountFileAccelerators,
   type EngineMountFileCapabilities,
+  type GraphAdjacencyBuildObservation,
   type NotariumStoreOptions,
   type NotariumStoreComposition,
   NotariumStoreCompositionOwner,

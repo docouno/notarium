@@ -18,7 +18,12 @@ import {
 } from '../../libs/resourceAuthority'
 import { createNodeSqliteDriver, type SqlDriver } from '../../libs/sql'
 import { NotariumStore } from './notariumStore'
-import { type EngineMount, engineMountOf, type SearchTuning } from './types'
+import {
+  type EngineMount,
+  engineMountOf,
+  type GraphAdjacencyBuildObservation,
+  type SearchTuning,
+} from './types'
 
 type CreateNotariumStoreCommonOptions = {
   /** Stable space identity used by the shared resource authority. */
@@ -41,6 +46,11 @@ type CreateNotariumStoreCommonOptions = {
    *  channel knobs. Composition root sets it from env; absent → conservative
    *  defaults. */
   searchTuning?: Partial<SearchTuning>
+  /** Exact-generation in-memory wikilink parser cache. Default true; false is
+   * the schema-free operational rollback to reference derivation. */
+  wikilinkParseCache?: boolean
+  /** Optional private observer for successful adjacency publications. */
+  onGraphAdjacencyBuilt?: (observation: GraphAdjacencyBuildObservation) => void | Promise<void>
   /** Process-global background scheduler (#196): the shared cooperative gate the
    *  embed backfill yields to. The composition root builds one and hands the SAME
    *  instance to every space's store. Absent → the loop yields with a plain
@@ -295,6 +305,8 @@ export const createNotariumStore = ({
   embedder,
   chunker,
   searchTuning,
+  wikilinkParseCache,
+  onGraphAdjacencyBuilt,
   scheduler,
   integritySweepBatchSize,
 }: CreateNotariumStoreOptions): NotariumStore => {
@@ -356,6 +368,8 @@ export const createNotariumStore = ({
     embedder: resolvedEmbedder,
     chunker,
     searchTuning,
+    wikilinkParseCache,
+    onGraphAdjacencyBuilt,
     scheduler,
     integritySweepBatchSize,
   })

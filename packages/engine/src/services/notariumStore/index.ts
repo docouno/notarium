@@ -13,6 +13,7 @@ export {
   type EngineMountFileAccelerators,
   type EngineMountFileCapabilities,
   engineMountOf,
+  type GraphAdjacencyBuildObservation,
   type NotariumStoreOptions,
   type SearchTuning,
 } from './types'

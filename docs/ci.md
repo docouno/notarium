@@ -73,13 +73,38 @@ cannot run on a lean install: it reads manifests that only arrive with the embed
 carrier, so its gate stays closed there. The vec0 suites, by contrast, moved back into
 the lean lane in #317 — a gate closed on every lean run is a gate that reports on `main`
 instead of on the change (#274 reached `main` that way). What the lean lane still cannot
-answer is exactly two things, and both have their own extended job: that license corpus,
-and the live-Postgres dialect contracts behind `extended:postgres`. `deps:lean` and
+answer is the complete license corpus, the live-Postgres dialect contracts behind
+`extended:postgres`, and the production-shaped graph-revision contour below. `deps:lean` and
 `deps:full` are npm scripts precisely so the Makefile, this pipeline and the future
 public gate cannot drift apart on what "install" means.
 The full script is also the single CPU-only install contract: it disables
 onnxruntime-node's default CUDA/TensorRT postinstall download, which the product cannot
 use and which would otherwise add a second package host to the extended gate.
+
+**`extended:unit` calls one graph-revision command after the coverage suite.**
+`make graph-revision-gate` owns the full #410 contour: it builds traceable runtime and
+runner images from the same tree, seeds the neutral 1357-note / ≥20.3 MiB corpus into an
+isolated volume, requires effective vector + graph channels, performs one warm mutation
+while health/search/unrelated-read/heartbeat run together, and runs the isolated
+`--expose-gc` memory sampler. The runtime report reads the actual Markdown count and bytes
+observed in the shared volume; it does not restate the generator's expected size. A private,
+non-wire observer on the concrete production engine records successful adjacency generations:
+the named source→target edge must be absent in the warm generation and present in a later
+generation after graph-enabled search. Search ranking and REST/MCP contracts are not used as
+the completion signal. The YAML installs
+only `bash` + `make` and invokes that
+command; image lifecycle, exact OCI identity, cleanup, thresholds, reports and the compact
+e5 test tier stay in the repo target/scripts. Its model cache is an ephemeral writable tmpfs;
+the runtime image and application data volume remain unchanged. The existing `context-open` baseline is a
+different scenario and is not changed or reused. Both graph-revision reports are
+disposable job evidence under `test-results/graph-revision/`, not committed baselines.
+The dind daemon cannot mount the job checkout, so runner inputs and both JSON reports
+cross the Docker API with `docker cp`; the target never bind-mounts a client path. The
+memory report also carries exact cold single-flight and warm-mutation counter deltas
+(`metadataRows`, body reads, parser calls, hit/miss/join, retries/fallback and entries),
+while the runtime report owns the HTTP/vector/adjacency-completion latency proof.
+CI always supplies `CI_COMMIT_SHA`. Locally, the target infers `HEAD` only from a clean checkout;
+a dirty tree must name its frozen identity explicitly or the target refuses before building.
 
 **`verify:backup-smoke` is one command, because the drill's orchestration lives in
 `make backup-smoke`** — the adapter rule applied to a job that used to restate the build,

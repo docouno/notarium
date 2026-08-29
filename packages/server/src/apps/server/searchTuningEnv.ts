@@ -11,3 +11,9 @@ export const graphSearchTuning = (
   const on = (graphBoostEnv ?? 'off') !== 'off'
   return on ? undefined : { wGraph: 0 }
 }
+
+/** Migration-free rollback for the engine-local parsed-wikilink cache. It ships
+ * ON; only the literal `off` returns both engine derivations to their atomic
+ * full-body reference path after process restart. */
+export const wikilinkParseCacheFromEnv = (raw: string | undefined): boolean =>
+  (raw ?? 'on') !== 'off'

@@ -121,6 +121,14 @@ export type NotariumStoreOptions = {
    *  sets it once (env), the eval harness sweeps it via setSearchTuning. Absent →
    *  the conservative defaults. */
   searchTuning?: Partial<SearchTuning>
+  /** Cache exact-generation wikilink labels inside this store. Default true.
+   * Literal false is the migration-free operational rollback to the atomic
+   * full-body reference derivation. */
+  wikilinkParseCache?: boolean
+  /** Private build-completion observer for production-shaped diagnostics. It is
+   * not a KnowledgeStore capability and is never exposed through REST/MCP. A
+   * failing observer cannot invalidate an already-published adjacency. */
+  onGraphAdjacencyBuilt?: (observation: GraphAdjacencyBuildObservation) => void | Promise<void>
   /** The process-global background scheduler (#196): the embed backfill awaits a
    *  turn from it between notes so it yields the cores/event-loop to interactive
    *  traffic (in ANY space) instead of starving it on a large first index. Absent
@@ -140,6 +148,15 @@ export type NotariumStoreOptions = {
    *  INDEX_MIGRATIONS. */
   migrations?: readonly IndexMigration[]
 }
+
+/** Immutable view of one successfully published graph-search adjacency. The
+ * callback can prove a concrete edge without exposing the adjacency map itself. */
+export type GraphAdjacencyBuildObservation = Readonly<{
+  generation: number
+  totalNodes: number
+  directedEdges: number
+  hasEdge: (source: string, target: string) => boolean
+}>
 
 /** Reciprocal-Rank-Fusion + graph-channel knobs (#81 Stage 4b). All channels fuse
  *  in JS over per-channel ranks (RRF, k = rrfK): score = Σ w_c/(k + rank_c). The

@@ -137,6 +137,7 @@ and for `security` — it parses the sanitized HTML into a live DOM and checks t
 | `agent-abilities-rich` | the same axis at VOLUME on the default login, where `agent-roles` proves boundaries with one placement each: Personal, Space and three Project role groups populated at once, BOTH inventories past the library/explorer page sizes, a title long enough to force truncation everywhere it is listed, one display name deliberately held at two placements, a `launch-review` Space role narrowed to two of the Space's projects with its own version in one of them, a version whose base was never created, and a Space skill fleet whose availability differs per project (all / one / several). It seeds project and personal Catalog dependencies at their real homes, exact-linked rename, malformed and deleted attachment health, plus the RC package-delete boundaries: both Markdown and non-Markdown auxiliaries make agent `delete_ability` refuse and preserve the package, while the unchanged human multi-file door can remove the Markdown package into Trash. `agent-created-oversized-proof` is published through the durable agent creator with PAT/session provenance, exceeds 64k characters, and is pinned by its real note id into Web; it simultaneously proves Activity attribution, fail-closed `use_skill` and generic MCP context filtering. Most of its projects hold no ability at all, and that is deliberate: the library aside's Project facet has no pagination and no scroller of its own, so the LENGTH of that facet is the state — long enough that the aside's own scroller is the one that moves. Counts are derived from `buildCasesWorld`, never pinned in prose. | agent-roles, agent-memory, agent-audit, structure, auth, scale |
 | `agent-abilities-sparse` | the other end of the same axis: a first-run stand with System and Catalog plus exactly one Owned skill and no Owned role at all — the empty groups, the single-row group and the skeleton geometry that a fully populated stand can never show | agent-roles, structure, auth |
 | `context-open` | production-shaped #394/#399 performance stand: 1100-note project + 2700-note personal corpus, one editable Custom Project Role in `context-lab/product`, linked graph/activity, 90 × ~6.5 KB project-memory categories (`SCALE=.045` → 4; `1` → 90; `3` → 270), 8 personal categories, 12 × ~13.7 KB always-load pins and a profile note; SCALE changes only the project-memory count | agent-memory, agent-roles, activity, graph, note-classes, scale, structure |
+| `graph-revision` | production-shaped #410 benchmark fixture: one mutation source selected by `revision-query-marker` and one adjacency target; `make graph-revision-gate` adds the deterministic 1355-note filler corpus to reach 1357 notes / ≥20.3 MiB / 2013 wikilinks without making every catalog projection carry benchmark bytes | graph, search, scale, structure |
 | `memory-perf` | 2700 ordinary notes + 4 personal-memory categories + 1 project-partition sentinel; reproduces memory-mount scaling, partition isolation, and graph-inert memory links | agent-memory, note-classes, scale |
 | `import-thread` | one rich imported thread | import, content |
 | `import` | a multi-format layout (claude/chatgpt/memory-json) + backdated dates-as-data → Feed year-spread (#11/#223); source-addressable Claude/ChatGPT notes carry canonical `notarium-source`, including two same-titled CJK project docs with distinct portable placement, beside one deliberately source-less legacy predecessor; plus `dropped/` — the states of a dragged-in `.md` archive whose OWN frontmatter was lifted (#280): authored tags + date, an Obsidian note titled by its file name with `aliases:` and plugin keys kept, a Jekyll post whose `title:` beats a differing body `# H1`, and a frontmatter-less note dated by the file's mtime; plus `vault/` — a Markdown TREE imported from a `.zip` (#302), its nested folders reproduced and its internal exact `[[notarium-id:…]]` links repointed at the COPIES (with a fenced-code copy left as authored) | import, content, activity |
@@ -170,8 +171,30 @@ make seed CASE=reader-showcase                      # (re)seed the local stand
 make seed CASE=tree-sort                            # explorer Name/Created/Modified QA
 make seed CASE=dashboard-activity SCALE=1 SEED=x PASSWORD=secret
 make seed CASE=reader-showcase,graph,trash-mixed    # COMBINATION of cases
+make graph-revision-gate                           # disposable #410 runtime + memory gate
+make graph-revision-gate GRAPH_REVISION_COMMIT=<frozen-tree> # explicit dirty-tree proof
 make seed-coverage                                  # coverage matrix
 ```
+
+`graph-revision` is a gate fixture rather than a manual showcase. `make graph-revision-gate`
+builds a provenance-labelled production image, seeds the fixed corpus into an isolated volume,
+expands the two benchmark seed notes with the deterministic benchmark-only filler corpus,
+observes the resulting Markdown file count and bytes from that volume rather than trusting the
+generator's constant,
+starts it with `VECTOR_SEARCH=on`, `GRAPH_BOOST=on` and the compact e5 tier, then mutates one
+source while graph health, graph-enabled search, an unrelated note read and HTTP heartbeat run
+concurrently. A private non-wire observer on the production engine must show that the exact
+source→target edge is absent before mutation and present in a later adjacency generation after
+graph-enabled search. Adjacency completion and unrelated reads must finish within 1 s, health within
+300 ms, no heartbeat may block over 1 s, and accumulated lateness must stay below 3 s. The same
+command runs `node --expose-gc` in a separate container and records five baseline and
+five post-fill heap/RSS samples plus structural cache counts. A second cold store proves that health
+and adjacency join one load per generation; its warm one-note mutation then proves one write-through
+parse, zero body reads, and metadata-only hits in both consumers. Reports live under
+`test-results/graph-revision/`; no frozen latency or arbitrary memory baseline is imported.
+The bare command infers `HEAD` only for a clean checkout. A dirty working tree fails closed unless
+the caller supplies its frozen tree/checkpoint identity explicitly, so local reports cannot label
+uncommitted contents as the current commit.
 
 `context-open` is also the production-shaped Ability mutation stand. After seeding and starting it,
 `BENCH_PHASE=pre BENCH_COMMIT=<frozen-commit> BENCH_IMAGE=<image-id>

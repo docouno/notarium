@@ -344,6 +344,12 @@ const lexWikilinks = (lexed: string): LocatedWikilink[] =>
  *  A source regex cannot faithfully distinguish prose from fenced/indented code,
  *  raw HTML blocks, blockquotes, tables, and multiline code spans. */
 export const parseWikilinks = (content: string): string[] => {
+  // Every supported wikilink starts with the literal `[[`. Most notes contain
+  // none; avoid constructing a full CommonMark/GFM token tree merely to prove
+  // that absence on every write-through cache publication (#410).
+  if (!content.includes('[[')) {
+    return []
+  }
   try {
     return lexWikilinks(content || '').map((link) => link.target)
   } catch {

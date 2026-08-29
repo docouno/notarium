@@ -58,7 +58,7 @@ import {
   collectPreviews,
   decodeWikilinkIdentity,
   DEFAULT_NOTE_TYPE,
-  deriveNoteEdges,
+  deriveNoteEdgesFromLabels,
   derivePreview,
   destinationOwnerConflict,
   directoryOf,
@@ -106,6 +106,7 @@ import {
   noteFilePath,
   noteNotFound,
   parseFrontmatterBlock,
+  parseWikilinks,
   registerLinkIdentity,
   resolveLink,
   sha256Hex,
@@ -133,7 +134,7 @@ import {
   sameFileClaim,
   type SpaceResourceAuthority,
 } from '../../libs/resourceAuthority'
-import type { SqlDriver } from '../../libs/sql'
+import type { SqlDriver, SqlValue } from '../../libs/sql'
 import { parseNoteFile, serializeNoteFile } from './noteFile'
 import {
   INDEX_MIGRATIONS,
@@ -152,7 +153,14 @@ import {
   VEC_TEARDOWN,
   vecSchema,
 } from './schema'
-import type { EngineMount, NotariumStoreOptions, NoteRow, SearchTuning } from './types'
+import type {
+  EngineMount,
+  GraphAdjacencyBuildObservation,
+  NotariumStoreOptions,
+  NoteRow,
+  SearchTuning,
+} from './types'
+import { WikilinkLabelCache, type WikilinkLabelCacheStats } from './wikilinkLabelCache'
 
 /** The meta columns `metaOf()` projects — everything the read-model's snapshot needs
  *  EXCEPT the note `body`. The whole read/reconcile path (space-open seed, list(),
@@ -181,6 +189,17 @@ type ReconcileRow = Pick<NoteRow, 'path' | 'class' | 'mtime_ms' | 'size' | 'seq'
   rowid: number
   change_token: string | null
   source_hash: string | null
+}
+
+type WikilinkMetadataRow = NoteMetaRow &
+  Pick<NoteRow, 'seq'> & {
+    rowid: number
+    source_hash: string | null
+  }
+
+type WikilinkDerivationRow = NoteMetaRow & {
+  rowid: number
+  labels: readonly string[]
 }
 
 /** The engine's ONE way to read a note's bytes as text — the same one
@@ -252,6 +271,9 @@ type GraphAdjacency = {
  *  rather than spin. */
 const STABLE_SNAPSHOT_ATTEMPTS = 8
 const MATERIALIZE_ATTEMPTS = 8
+const WIKILINK_DERIVATION_ATTEMPTS = 3
+const SOURCE_HASH_PATTERN = /^[a-f0-9]{64}$/
+const WIKILINK_GENERATION_CHANGED = Symbol('wikilink-generation-changed')
 
 /** Same file version: content verification is still the arbiter, this only says
  *  the medium has not published a new generation at that pathname. */
@@ -623,16 +645,19 @@ export class NotariumStore implements KnowledgeStore {
   private searchTuning: SearchTuning
   /** In-memory wikilink adjacency for the graph channel (#81 Stage 4b). The FIRST
    *  build is synchronous (a query awaits it once); after a mutation the LAST-GOOD
-   *  cache keeps serving while a background rebuild refreshes it — a full-corpus
-   *  re-parse is O(corpus) and scales with note size / link density (measured
-   *  ~90ms loop-block on 2k light notes, up to ~seconds on a large or dense one),
-   *  too slow to sit on the per-query path after every edit. `graphDirty` marks a pending refresh;
+   *  cache keeps serving while a background rebuild refreshes it. Rebuild still
+   *  resolves and shapes O(corpus), but exact-generation label hits avoid reading
+   *  or parsing unchanged bodies (#410). `graphDirty` marks a pending refresh;
    *  `graphBuilding` is the in-flight rebuild (single-flight). Slight staleness is
    *  fine for a re-ranking signal (a new neighbour misses one cycle, a deleted one is
    *  dropped at the fetch step). */
   private graphCache: GraphAdjacency | null = null
   private graphDirty = true
   private graphBuilding: Promise<void> | null = null
+  private graphAdjacencyGeneration = 0
+  private readonly onGraphAdjacencyBuilt?: (
+    observation: GraphAdjacencyBuildObservation,
+  ) => void | Promise<void>
   /** The space's folder path-history (#100 phase 3), fed by the wrapping read-model
    *  (the engine never reads the `.notariummeta` markers it lives in — a server
    *  concern). Used as buildLinkIndex's folder-alias pass so a path-form
@@ -710,6 +735,8 @@ export class NotariumStore implements KnowledgeStore {
   private readonly integritySweepBatchSize: number
   private readonly forcedReadPaths = new Set<string>()
   private fingerprintsReady = false
+  private readonly wikilinkParseCacheEnabled: boolean
+  private readonly wikilinkLabels = new WikilinkLabelCache()
 
   /** The index-schema migration ladder (schema.ts). Injectable so a test can drive
    *  ensureReady through a synthetic APPENDED step; production always uses the
@@ -738,6 +765,8 @@ export class NotariumStore implements KnowledgeStore {
     embedder,
     chunker,
     searchTuning,
+    wikilinkParseCache = true,
+    onGraphAdjacencyBuilt,
     scheduler,
     integritySweepBatchSize = INTEGRITY_SWEEP_BATCH_SIZE,
     migrations,
@@ -771,6 +800,8 @@ export class NotariumStore implements KnowledgeStore {
     this.sql = sql
     this.relationType = relationType
     this.searchTuning = { ...DEFAULT_SEARCH_TUNING, ...searchTuning }
+    this.wikilinkParseCacheEnabled = wikilinkParseCache
+    this.onGraphAdjacencyBuilt = onGraphAdjacencyBuilt
     this.scheduler = scheduler
     if (!Number.isSafeInteger(integritySweepBatchSize) || integritySweepBatchSize < 0) {
       throw new Error('NotariumStore: integritySweepBatchSize must be a non-negative integer')
@@ -812,11 +843,37 @@ export class NotariumStore implements KnowledgeStore {
     this.searchTuning = { ...this.searchTuning, ...patch }
   }
 
+  /** Structural diagnostics for repo-owned performance gates. This is not a
+   * KnowledgeStore capability or wire field; production and tests reach the same
+   * concrete engine instance composed by createNotariumStore. */
+  wikilinkParseCacheStats(): WikilinkLabelCacheStats & { enabled: boolean } {
+    return { enabled: this.wikilinkParseCacheEnabled, ...this.wikilinkLabels.stats() }
+  }
+
   /** Mark the graph adjacency stale on a note mutation (#81 Stage 4b). Keeps the
-   *  last-good cache so in-flight/next queries don't block on a ~1.5s full re-parse;
+   *  last-good cache so in-flight/next queries do not wait for fresh O(corpus) resolution;
    *  ensureGraphAdjacency refreshes it in the background. */
   private invalidateGraphCache(): void {
     this.graphDirty = true
+  }
+
+  /** The single cache-owning primitive for every runtime notes deletion. SQL
+   * RETURNING couples eviction to the rows the delete actually removed, so a
+   * failed guarded delete cannot evict a newer incarnation and a rowid recycled
+   * later never inherits parsed labels from its predecessor. */
+  private async deleteIndexedRows(where: string, params: SqlValue[]): Promise<number[]> {
+    const deleted = await this.sql.all<{ rowid: number }>(
+      `DELETE FROM notes WHERE ${where} RETURNING rowid`,
+      params,
+    )
+    const rowids = deleted.map(({ rowid }) => rowid)
+
+    if (rowids.length) {
+      this.wikilinkLabels.evict(rowids)
+      this.invalidateGraphCache()
+    }
+
+    return rowids
   }
 
   // ── mount routing ─────────────────────────────────────────────────────────
@@ -1284,14 +1341,12 @@ export class NotariumStore implements KnowledgeStore {
     }
   }
 
-  /** A time-budgeted cooperative yield for the heavy read passes that parse every note
-   *  body in a tight synchronous loop and have NO natural loop boundary of their own —
-   *  the wikilink derivation shared by `graph()` and the search channel's
-   *  `rebuildGraphAdjacency()` (#222). Unlike the reindex (which yields for free at every
-   *  `await mount.files.read()`), these block the shared loop end-to-end (graph() ~270ms
-   *  / adjacency rebuild ~1.5s on a big space). This returns a closure that breaks the
-   *  loop with a plain macrotask once `budgetMs` of uninterrupted work has elapsed, so
-   *  other spaces' navigation and /api/health interleave between chunks.
+  /** A time-budgeted cooperative yield for cold/reference wikilink parsing and the
+   *  warm per-row edge-shaping loops in `graph()` / `rebuildGraphAdjacency()`
+   *  (#222/#410). Exact-generation label hits remove the corpus-wide parser cost,
+   *  but resolver/shape remain O(corpus) and the rollback path intentionally reads
+   *  every body. Unlike reindex (which yields at each storage read), those loops have
+   *  no natural macrotask boundary, so this closure supplies one after `budgetMs`.
    *
    *  Deliberately NOT `awaitBackgroundTurn` (the #196 scheduler gate): that gate
    *  DEFERS while any interactive request is in flight, but both callers sit on
@@ -2062,8 +2117,7 @@ export class NotariumStore implements KnowledgeStore {
       }
       for (const row of rows) {
         if (!seen.has(row.path)) {
-          await this.sql.run(`DELETE FROM notes WHERE path = ?`, [row.path])
-          this.invalidateGraphCache() // a removed note can change the wikilink graph (#81 Stage 4b)
+          await this.deleteIndexedRows(`path = ?`, [row.path])
         }
       }
       // Cursor records a bounded ATTEMPT, not universal read success. A
@@ -2183,7 +2237,51 @@ export class NotariumStore implements KnowledgeStore {
     // across renames, the same key FTS and note_vectors ride. The loop dedups by
     // content_hash, so a touch with unchanged content costs only a count query.
     if (published.rowid != null) {
-      await this.recordFingerprint(published.rowid, published.seq, sourceHash, stat.changeToken)
+      let labelPublication = this.wikilinkParseCacheEnabled
+        ? this.wikilinkLabels.beginPublication(published.rowid, published.seq)
+        : undefined
+
+      try {
+        await this.recordFingerprint(published.rowid, published.seq, sourceHash, stat.changeToken)
+        if (labelPublication) {
+          const publication = labelPublication
+
+          try {
+            const exactFingerprint = await this.sourceFingerprint(published.rowid, published.seq)
+
+            if (exactFingerprint === sourceHash && isVisibleOn(SURFACE.graph, cls)) {
+              // A path-only move keeps rowid + raw bytes. Its existing exact entry is
+              // already valid, so do not re-run the markdown parser merely because
+              // the resolver metadata/path changed.
+              let labels = this.wikilinkLabels.get(published.rowid, sourceHash)
+
+              if (!labels) {
+                this.wikilinkLabels.observeParserCall()
+                labels = parseWikilinks(parsed.body)
+              }
+              this.wikilinkLabels.publish(publication, sourceHash, labels)
+              labelPublication = undefined
+            } else {
+              // Hidden class transitions and missing/invalid fingerprints must never
+              // leave an entry that later looks graph-visible by rowid alone.
+              this.wikilinkLabels.discardPublication(publication)
+              labelPublication = undefined
+            }
+          } catch (error) {
+            // The note and its exact fingerprint are already durably published. A
+            // cache-only verification read must not turn that successful mutation
+            // into a false failed-save response; leave this row cold and let the
+            // coherent loader/reference path answer the next derivation.
+            this.wikilinkLabels.discardPublication(publication)
+            labelPublication = undefined
+            console.error('[notarium] wikilink cache publication skipped:', error)
+          }
+        }
+      } finally {
+        if (labelPublication) {
+          this.wikilinkLabels.cancelPublication(labelPublication)
+        }
+      }
       if (this.vecReady) {
         this.enqueueEmbed(BigInt(published.rowid))
       }
@@ -2362,8 +2460,7 @@ export class NotariumStore implements KnowledgeStore {
     const raw = stat ? await mount.files.read(rel) : null
 
     if (!stat || raw == null) {
-      await this.sql.run(`DELETE FROM notes WHERE path = ?`, [fullPath])
-      this.invalidateGraphCache() // a removed note can change the wikilink graph (#81 Stage 4b)
+      await this.deleteIndexedRows(`path = ?`, [fullPath])
       return
     }
     await this.upsertRow(fullPath, mount.class, stat, raw)
@@ -2757,13 +2854,11 @@ export class NotariumStore implements KnowledgeStore {
       }
       const prefix = `${clean}/`
 
-      await this.sql.run(
-        `DELETE FROM notes
-         WHERE path = ? COLLATE BINARY
+      await this.deleteIndexedRows(
+        `path = ? COLLATE BINARY
             OR substr(path, 1, length(?)) = ? COLLATE BINARY`,
         [clean, prefix, prefix],
       )
-      this.invalidateGraphCache() // removing notes can change the wikilink graph (#81 Stage 4b)
       // Dropping a whole subtree (a project, a deep folder) can free a lot of index
       // pages at runtime — the one bulk-free path that isn't a boot teardown or an
       // embed re-write (#198). Compact them back to the OS instead of waiting for the
@@ -2899,8 +2994,7 @@ export class NotariumStore implements KnowledgeStore {
         : await mount.files.read(relativePath)
 
     if (raw == null) {
-      await this.sql.run(`DELETE FROM notes WHERE path = ?`, [row.path])
-      this.invalidateGraphCache() // dropping a stale row can change the wikilink graph (#81 Stage 4b)
+      await this.deleteIndexedRows(`path = ?`, [row.path])
       throw noteNotFound(rawId)
     }
     const source = exactSource ?? new TextEncoder().encode(raw)
@@ -3315,9 +3409,8 @@ export class NotariumStore implements KnowledgeStore {
   /** The best-available adjacency for the graph channel (#81 Stage 4b). The first
    *  call (no cache) builds synchronously so the very first query has the channel;
    *  afterwards it returns the LAST-GOOD cache immediately and kicks a background
-   *  refresh when stale — a full-corpus re-parse (O(corpus): ~90ms loop-block on 2k
-   *  light notes, more on a large or dense one) must NOT sit on the per-query path
-   *  after every edit. Returns null only while the first build is
+   *  refresh when stale. Warm rebuilds reuse parsed labels, but O(corpus) metadata
+   *  resolution still does not belong on each query. Returns null only while the first build is
    *  in flight or after a build failure (the caller skips the graph channel; fts+vec
    *  stands). */
   private async ensureGraphAdjacency(): Promise<GraphAdjacency | null> {
@@ -3348,7 +3441,7 @@ export class NotariumStore implements KnowledgeStore {
    *  A CHANGE re-marks the graph dirty so the next query rebuilds with the new
    *  aliases (so a path-form `[[oldpath/note]]` resolves after a folder rename).
    *  The read-model re-feeds on EVERY poll; this short-circuits an unchanged list
-   *  so a quiet base never re-parses the whole corpus each cycle (the search-graph
+   *  so a quiet base never rebuilds the whole adjacency each cycle (the search-graph
    *  cache only invalidates on a real row change otherwise). */
   setFolderAliases(aliases: ReadonlyArray<{ current: string; alias: string }>): void {
     const next = aliases.map((a) => ({ current: a.current, alias: a.alias }))
@@ -3458,6 +3551,129 @@ export class NotariumStore implements KnowledgeStore {
     }
   }
 
+  /** Today's atomic reference producer. It remains the rollback and failure
+   * fallback: one SQL statement returns metadata + bodies from one DB snapshot,
+   * then the canonical parser runs without consulting or populating the cache. */
+  private async referenceWikilinkRows(): Promise<WikilinkDerivationRow[]> {
+    this.wikilinkLabels.observeFallback()
+    const rows = await this.sql.all<NoteMetaRow & { rowid: number; body: string }>(
+      `SELECT rowid AS rowid, ${NOTE_META_COLS}, body FROM notes ORDER BY path`,
+    )
+
+    this.wikilinkLabels.observeMetadataRows(rows.length)
+    this.wikilinkLabels.observeBodyRead(rows.length)
+
+    return rows.map((row) => {
+      if (!isVisibleOn(SURFACE.graph, row.class)) {
+        return { ...row, labels: [] }
+      }
+      this.wikilinkLabels.observeParserCall()
+      return { ...row, labels: parseWikilinks(row.body) }
+    })
+  }
+
+  private async wikilinkMetadataCut(): Promise<WikilinkMetadataRow[] | null> {
+    if (!this.fingerprintsReady) {
+      return null
+    }
+    const rows = await this.sql.all<WikilinkMetadataRow>(
+      `SELECT notes.rowid AS rowid, ${NOTE_META_COLS}, notes.seq,
+              CASE WHEN file_fingerprints.note_seq = notes.seq
+                   THEN file_fingerprints.source_hash ELSE NULL END AS source_hash
+         FROM notes
+         LEFT JOIN file_fingerprints ON file_fingerprints.note_rowid = notes.rowid
+        ORDER BY notes.path`,
+    )
+
+    this.wikilinkLabels.observeMetadataRows(rows.length)
+    this.wikilinkLabels.prune(
+      new Set(
+        rows.filter((row) => isVisibleOn(SURFACE.graph, row.class)).map(({ rowid }) => rowid),
+      ),
+    )
+    return rows
+  }
+
+  private loadWikilinkLabels(row: WikilinkMetadataRow): Promise<readonly string[]> {
+    const sourceHash = row.source_hash
+
+    if (!sourceHash || !SOURCE_HASH_PATTERN.test(sourceHash)) {
+      return Promise.reject(new Error('graph-visible row has no exact source fingerprint'))
+    }
+
+    return this.wikilinkLabels.load(row.rowid, row.seq, sourceHash, async () => {
+      const current = await this.sql.get<{
+        rowid: number
+        seq: number
+        source_hash: string
+        body: string
+      }>(
+        `SELECT notes.rowid AS rowid, notes.seq,
+                file_fingerprints.source_hash AS source_hash, notes.body
+           FROM notes
+           JOIN file_fingerprints ON file_fingerprints.note_rowid = notes.rowid
+          WHERE notes.rowid = ?
+            AND notes.seq = ?
+            AND file_fingerprints.note_seq = notes.seq
+            AND file_fingerprints.source_hash = ?`,
+        [row.rowid, row.seq, sourceHash],
+      )
+
+      if (!current) {
+        throw WIKILINK_GENERATION_CHANGED
+      }
+      this.wikilinkLabels.observeBodyRead()
+      this.wikilinkLabels.observeParserCall()
+      return parseWikilinks(current.body)
+    })
+  }
+
+  /** Take a metadata-only cut, fill exact-generation misses, and retry the WHOLE
+   * cut when a body changed between those two async SQL calls. Exhaustion or any
+   * fingerprint/loader failure returns the atomic reference answer, never partial
+   * labels. */
+  private async wikilinkDerivationRows(): Promise<WikilinkDerivationRow[]> {
+    if (!this.wikilinkParseCacheEnabled) {
+      return this.referenceWikilinkRows()
+    }
+
+    for (let attempt = 0; attempt < WIKILINK_DERIVATION_ATTEMPTS; attempt++) {
+      const rows = await this.wikilinkMetadataCut().catch((error: unknown) => {
+        console.error('[notarium] wikilink metadata cut failed; using reference path:', error)
+        return null
+      })
+
+      if (!rows) {
+        return this.referenceWikilinkRows()
+      }
+      try {
+        const derived: WikilinkDerivationRow[] = []
+
+        for (const row of rows) {
+          derived.push({
+            ...row,
+            labels: isVisibleOn(SURFACE.graph, row.class) ? await this.loadWikilinkLabels(row) : [],
+          })
+        }
+
+        return derived
+      } catch (error) {
+        if (error === WIKILINK_GENERATION_CHANGED) {
+          if (attempt + 1 < WIKILINK_DERIVATION_ATTEMPTS) {
+            this.wikilinkLabels.observeRetry()
+            continue
+          }
+        } else {
+          console.error('[notarium] wikilink cache load failed; using reference path:', error)
+        }
+
+        return this.referenceWikilinkRows()
+      }
+    }
+
+    return this.referenceWikilinkRows()
+  }
+
   /** Rebuild the undirected wikilink adjacency from the current note set, reusing the
    *  SAME core derivation graph() uses (one parser, one ghost algebra — slug/rename/
    *  ghost resolution stays canonical, not reimplemented in SQL). Node ids are storage
@@ -3472,21 +3688,7 @@ export class NotariumStore implements KnowledgeStore {
 
     this.graphDirty = false
     try {
-      const rows = await this.sql.all<{
-        path: string
-        title: string
-        class: NoteClass
-        id_claim: string | null
-        aliases: string
-        slug: string | null
-        body: string
-      }>(
-        // ORDER BY path: a deterministic row order so the buildLinkIndex collision
-        // tie-break (two live notes sharing a slugified name) is stable run-to-run
-        // and matches list()/changes() — an unordered SELECT let the boot graph and a
-        // read-refresh disagree on which same-named note an edge points at (#100).
-        `SELECT path, title, class, id_claim, aliases, slug, body FROM notes ORDER BY path`,
-      )
+      const rows = await this.wikilinkDerivationRows()
       const graphRows = rows.filter((row) => isVisibleOn(SURFACE.graph, row.class))
       const metas = graphRows.map((r) =>
         this.linkMeta(
@@ -3517,17 +3719,23 @@ export class NotariumStore implements KnowledgeStore {
         }
         s.add(b)
       }
-      // Same cooperative fairness break as graph() (#222): this re-parses every body
-      // in a tight synchronous loop (O(corpus); measured ~90ms loop-block on 2k light
-      // notes, more on a large or dense one), and it runs on the search read path —
-      // first query awaits it, and any edit kicks a background
-      // rebuild — so left ungated it monopolizes the shared loop and starves every other
-      // space. `graphDirty` was cleared before the await, so yielding here is safe: a
+      // Same cooperative fairness break as graph() (#222/#410): cold/reference
+      // derivation may still parse, while the warm path resolves/shapes every row.
+      // It runs on the search read path, so yield between rows. `graphDirty` was
+      // cleared before the await, therefore a
       // mutation mid-rebuild re-marks it and the next ensureGraphAdjacency refreshes.
       const coopYield = this.coopYielder()
+      const resolvedLabels = new Map<string, ReturnType<typeof resolveLink>>()
 
       for (const row of graphRows) {
-        const { edges } = deriveNoteEdges(row.path, row.body, index, this.relationType)
+        const { edges } = deriveNoteEdgesFromLabels(
+          row.path,
+          row.labels,
+          index,
+          this.relationType,
+          undefined,
+          resolvedLabels,
+        )
 
         for (const e of edges) {
           if (!realIds.has(e.target)) {
@@ -3548,6 +3756,18 @@ export class NotariumStore implements KnowledgeStore {
         return
       }
       this.graphCache = { adj, degree, total: realIds.size }
+      const observation: GraphAdjacencyBuildObservation = Object.freeze({
+        generation: ++this.graphAdjacencyGeneration,
+        totalNodes: realIds.size,
+        directedEdges: [...adj.values()].reduce((sum, neighbours) => sum + neighbours.size, 0),
+        hasEdge: (source, target) => adj.get(source)?.has(target) ?? false,
+      })
+
+      try {
+        await this.onGraphAdjacencyBuilt?.(observation)
+      } catch (error) {
+        console.error('[notarium] graph adjacency observer failed:', error)
+      }
     } catch (err) {
       console.error('[notarium] graph adjacency rebuild failed:', err)
       this.graphDirty = true // leave it dirty so the next query retries
@@ -3560,12 +3780,7 @@ export class NotariumStore implements KnowledgeStore {
    *  storage paths (bare engine), unresolved targets become ghosts. */
   async graph(): Promise<Graph> {
     await this.ensureReady()
-    // Meta + body only (#222): graph() is the one read path that genuinely needs
-    // bodies (wikilink derivation), but not the vector/hash/mtime columns `SELECT *`
-    // dragged along.
-    const rows = await this.sql.all<NoteMetaRow & { body: string }>(
-      `SELECT ${NOTE_META_COLS}, body FROM notes ORDER BY path`,
-    )
+    const rows = await this.wikilinkDerivationRows()
     const metas = rows.map((r) => this.linkMeta(this.metaOf(r)))
     const graphRows = rows.filter((row) => isVisibleOn(SURFACE.graph, row.class))
     const graphMetas = graphRows.map((row) => this.linkMeta(this.metaOf(row)))
@@ -3579,19 +3794,20 @@ export class NotariumStore implements KnowledgeStore {
     this.registerLinkIdentities(index, graphRows)
     const edgesBySource = new Map<string, GraphLink[]>()
     const ghosts = new Map<string, GhostStub>()
-    // Cooperative fairness break (#222): deriving edges re-parses every note body for
-    // wikilinks — a heavy synchronous pass (bootScan runs it on every open; its search-
-    // channel twin rebuildGraphAdjacency() gets the same break). Yield every ~8ms so it
-    // can't monopolize the shared loop.
+    // Cooperative fairness break (#222/#410): cold/reference work may parse bodies;
+    // warm work still resolves and shapes every source. Yield between rows so neither
+    // path monopolizes the shared loop.
     const coopYield = this.coopYielder()
+    const resolvedLabels = new Map<string, ReturnType<typeof resolveLink>>()
 
     for (const row of graphRows) {
-      const { edges, ghosts: stubs } = deriveNoteEdges(
+      const { edges, ghosts: stubs } = deriveNoteEdgesFromLabels(
         row.path,
-        row.body,
+        row.labels,
         index,
         this.relationType,
         provenance,
+        resolvedLabels,
       )
 
       if (edges.length) {
@@ -4226,10 +4442,7 @@ export class NotariumStore implements KnowledgeStore {
       : { version: 1 as const, claims: [] }
 
     if (renameSource) {
-      await this.sql.run(`DELETE FROM notes WHERE path = ? AND seq = ?`, [
-        renameSource,
-        sourceRow!.seq,
-      ])
+      await this.deleteIndexedRows(`path = ? AND seq = ?`, [renameSource, sourceRow!.seq])
     }
     if (mutationReceipt) {
       await this.reindexPublishedPath(dest, candidateSource, mutationReceipt, ownerProof)
@@ -4601,8 +4814,7 @@ export class NotariumStore implements KnowledgeStore {
     // The row resolved above is part of the delete claim. A concurrent reconcile
     // may have published another version at the same path while filesystem awaits
     // were in flight; never erase that newer index row by pathname alone.
-    await this.sql.run(`DELETE FROM notes WHERE path = ? AND seq = ?`, [row.path, row.seq])
-    this.invalidateGraphCache() // a removed note can change the wikilink graph (#81 Stage 4b)
+    await this.deleteIndexedRows(`path = ? AND seq = ?`, [row.path, row.seq])
   }
 
   // ── sync surface ────────────────────────────────────────────────────────────

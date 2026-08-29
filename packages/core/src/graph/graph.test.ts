@@ -9,7 +9,13 @@ import {
 } from '../knowledgeStore'
 import { encodeWikilinkIdentity } from '../libs/markdown'
 import { buildLinkIndex, resolveLink } from '../referenceResolver'
-import { aggregateGraphHealth, dedupeEdges, deriveNoteEdges, shapeGraph } from './graph'
+import {
+  aggregateGraphHealth,
+  dedupeEdges,
+  deriveNoteEdges,
+  deriveNoteEdgesFromLabels,
+  shapeGraph,
+} from './graph'
 
 describe('dedupeEdges', () => {
   it('keeps first occurrence, preserves order, distinguishes by type', () => {
@@ -60,6 +66,32 @@ describe('deriveNoteEdges', () => {
       },
     ])
     expect(ghosts.map((g) => g.id)).toEqual(['ghost:nowhere'])
+  })
+
+  it('shares label resolution across sources without sharing self-link filtering', () => {
+    const resolved = new Map<string, ReturnType<typeof resolveLink>>()
+    const self = deriveNoteEdgesFromLabels(
+      'demo/Carbon.md',
+      ['Carbon'],
+      index,
+      'links-to',
+      undefined,
+      resolved,
+    )
+    const other = deriveNoteEdgesFromLabels(
+      'BookStack.md',
+      ['Carbon'],
+      index,
+      'links-to',
+      undefined,
+      resolved,
+    )
+
+    expect(resolved.size).toBe(1)
+    expect(self.edges).toEqual([])
+    expect(other.edges).toEqual([
+      { source: 'BookStack.md', target: 'demo/Carbon.md', type: 'links-to' },
+    ])
   })
 })
 

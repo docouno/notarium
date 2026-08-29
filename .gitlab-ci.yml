@@ -191,6 +191,7 @@ extended:unit:
   stage: extended
   extends: [.dind, .heavy, .extended-rules]
   script:
+    - apk add --no-cache bash make
     - docker build --target test -t "notarium-test:$CI_COMMIT_SHORT_SHA" -f docker/Dockerfile .
     # Makefile, README.md and all of scripts/ bar the SPA size gate are kept OUT of the
     # image on purpose — they are tooling and docs the product does not ship — but the
@@ -207,6 +208,7 @@ extended:unit:
     - docker cp ./scripts/. "notarium-test-run-$CI_JOB_ID:/app/scripts"
     - docker cp ./README.md "notarium-test-run-$CI_JOB_ID:/app/README.md"
     - docker start --attach "notarium-test-run-$CI_JOB_ID"
+    - make graph-revision-gate GRAPH_REVISION_COMMIT="$CI_COMMIT_SHA"
   after_script:
     - docker rm -f "notarium-test-run-$CI_JOB_ID" || true
     - docker image rm -f "notarium-test:$CI_COMMIT_SHORT_SHA" || true

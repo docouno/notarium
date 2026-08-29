@@ -1,5 +1,6 @@
 // Process entry: env → config → listen.
 
+import { mkdir, rename, writeFile } from 'node:fs/promises'
 import { availableParallelism } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -21,8 +22,8 @@ import {
   ensureDataRoot,
   legacyMetaDbAt,
 } from './dataPaths'
-import { graphSearchTuning } from './searchTuningEnv'
-import { createServer } from './server'
+import { graphSearchTuning, wikilinkParseCacheFromEnv } from './searchTuningEnv'
+import { createServer, type CreateServerOptions } from './server'
 import { spacesFromEnv } from './spacesFromEnv'
 
 loadEnv()
@@ -169,6 +170,60 @@ if (VECTOR_SEARCH && !localEmbedderAvailable()) {
 // OFF by default, opt in with GRAPH_BOOST=on. Rides the hybrid capability — inert
 // with vector search off. canon: docs/search.md#graph-channel-hub-robust-1-hop
 const searchTuning = graphSearchTuning(process.env.GRAPH_BOOST)
+const wikilinkParseCache = wikilinkParseCacheFromEnv(process.env.WIKILINK_PARSE_CACHE)
+
+const graphAdjacencyObservation = (() => {
+  const file = process.env.GRAPH_ADJACENCY_OBSERVATION_FILE?.trim()
+
+  if (!file) {
+    return undefined
+  }
+  const required = (name: string): string => {
+    const value = process.env[name]?.trim()
+
+    if (!value) {
+      throw new Error(`${name} is required with GRAPH_ADJACENCY_OBSERVATION_FILE`)
+    }
+
+    return value
+  }
+
+  return {
+    file,
+    space: required('GRAPH_ADJACENCY_OBSERVATION_SPACE'),
+    source: required('GRAPH_ADJACENCY_OBSERVATION_SOURCE'),
+    target: required('GRAPH_ADJACENCY_OBSERVATION_TARGET'),
+  }
+})()
+
+const onGraphAdjacencyBuilt: CreateServerOptions['onGraphAdjacencyBuilt'] =
+  graphAdjacencyObservation
+    ? async (space, observation) => {
+        if (space.slug !== graphAdjacencyObservation.space) {
+          return
+        }
+        const output = {
+          generation: observation.generation,
+          totalNodes: observation.totalNodes,
+          directedEdges: observation.directedEdges,
+          source: graphAdjacencyObservation.source,
+          target: graphAdjacencyObservation.target,
+          hasEdge: observation.hasEdge(
+            graphAdjacencyObservation.source,
+            graphAdjacencyObservation.target,
+          ),
+        }
+        const temporary = `${graphAdjacencyObservation.file}.${process.pid}.tmp`
+
+        await mkdir(dirname(graphAdjacencyObservation.file), { recursive: true })
+        await writeFile(temporary, `${JSON.stringify(output)}\n`, 'utf8')
+        await rename(temporary, graphAdjacencyObservation.file)
+      }
+    : undefined
+
+console.log(
+  `[notarium] wikilink parse cache ${wikilinkParseCache ? 'ON' : 'OFF (reference derivation)'}`,
+)
 
 // The notes-mount root for runtime-created spaces is decided HERE, together with
 // the space set — it also gates spaceCreate/purge, so root and mode can't be
@@ -258,6 +313,8 @@ const app = await createServer({
   spacesRoot,
   embedder,
   searchTuning,
+  wikilinkParseCache,
+  onGraphAdjacencyBuilt,
   backgroundQuietMs: BACKFILL_QUIET_MS,
   backgroundDripMs: BACKFILL_DRIP_MS,
   // Canonical public origin for the OAuth connector facade's discovery docs; set

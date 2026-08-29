@@ -84,7 +84,7 @@ PLAYWRIGHT_TEST_IMAGE ?= mcr.microsoft.com/playwright:v1.60.0-jammy
 
 .DEFAULT_GOAL := help
 .PHONY: help prepare deps deps-vector doctor dev up start down stop restart logs ps sh \
-        checkup audit-runtime test-coverage test-pg test-browser import-bench bench-session-audit backup restore backup-smoke seed seed-list \
+        checkup audit-runtime test-coverage test-pg test-browser import-bench graph-revision-gate bench-session-audit backup restore backup-smoke seed seed-list \
         footage demo-shots demo-preview demo-plates image release release-rc release-smoke save clean
 
 help: ## List available targets
@@ -301,6 +301,108 @@ import-bench: ## Run the Markdown-tree import scale bench in Docker: make import
 	    --mount "type=volume,src=$(CHECKUP_WORKSPACE_VOLUME),dst=/app" \
 	    --workdir /app -e HOME=/tmp -e NOTES=$(NOTES) -e SOURCE=$(SOURCE) \
 	    --entrypoint npm "$(NODE_TEST_IMAGE)" run bench:import-markdown-tree
+
+# --- graph revision production gate ----------------------------------------
+# One command owns the #410 disposable contour: traceable runtime image, neutral
+# 1357-note/20.3-MiB seed, vector+graph-enabled server, isolated GC memory report
+# and the concurrent one-note mutation probe. Nothing is published.
+GRAPH_REVISION_COMMIT ?= $(if $(CI_COMMIT_SHA),$(CI_COMMIT_SHA),$(shell if test -z "$$(git status --porcelain --untracked-files=normal 2>/dev/null)"; then git rev-parse HEAD 2>/dev/null; else echo unknown; fi))
+GRAPH_REVISION_BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+GRAPH_REVISION_OUTPUT_DIR ?= $(CURDIR)/test-results/graph-revision
+GRAPH_REVISION_RUNTIME_IMAGE ?= notarium-graph-revision-runtime:$(TEST_COMPOSE_PROJECT)
+GRAPH_REVISION_RUNNER_IMAGE ?= notarium-graph-revision-runner:$(TEST_COMPOSE_PROJECT)
+GRAPH_REVISION_CONTAINER ?= $(TEST_COMPOSE_PROJECT)-graph-revision
+GRAPH_REVISION_SEED_CONTAINER ?= $(TEST_COMPOSE_PROJECT)-graph-seed
+GRAPH_REVISION_RUNNER_CONTAINER ?= $(TEST_COMPOSE_PROJECT)-graph-runner
+GRAPH_REVISION_VOLUME ?= $(TEST_COMPOSE_PROJECT)-graph-data
+GRAPH_REVISION_NETWORK ?= $(TEST_COMPOSE_PROJECT)-graph-net
+
+graph-revision-gate: ## Run the #410 production-shaped graph revision + memory gates
+	@set -euo pipefail; \
+	  cleanup() { \
+	    docker rm -f "$(GRAPH_REVISION_CONTAINER)" "$(GRAPH_REVISION_SEED_CONTAINER)" "$(GRAPH_REVISION_RUNNER_CONTAINER)" >/dev/null 2>&1 || true; \
+	    docker volume rm -f "$(GRAPH_REVISION_VOLUME)" >/dev/null 2>&1 || true; \
+	    docker network rm "$(GRAPH_REVISION_NETWORK)" >/dev/null 2>&1 || true; \
+	    docker image rm -f "$(GRAPH_REVISION_RUNTIME_IMAGE)" "$(GRAPH_REVISION_RUNNER_IMAGE)" >/dev/null 2>&1 || true; \
+	  }; \
+	  trap cleanup EXIT INT TERM; \
+	  cleanup; \
+	  test "$(GRAPH_REVISION_COMMIT)" != unknown || { echo 'graph revision gate requires a clean commit or explicit frozen tree identity' >&2; exit 2; }; \
+	  mkdir -p "$(GRAPH_REVISION_OUTPUT_DIR)"; \
+	  docker build --target runtime -t "$(GRAPH_REVISION_RUNTIME_IMAGE)" \
+	    --build-arg GIT_SHA="$(GRAPH_REVISION_COMMIT)" \
+	    --build-arg GIT_REVISION="$(GRAPH_REVISION_COMMIT)" \
+	    --build-arg BUILD_TIME="$(GRAPH_REVISION_BUILD_TIME)" \
+	    -f docker/Dockerfile .; \
+	  docker build --target builder -t "$(GRAPH_REVISION_RUNNER_IMAGE)" \
+	    --build-arg GIT_SHA="$(GRAPH_REVISION_COMMIT)" \
+	    --build-arg BUILD_TIME="$(GRAPH_REVISION_BUILD_TIME)" \
+	    -f docker/Dockerfile .; \
+	  docker volume create "$(GRAPH_REVISION_VOLUME)" >/dev/null; \
+	  docker network create "$(GRAPH_REVISION_NETWORK)" >/dev/null; \
+	  tar -cf - scripts test | docker run --rm -i --name "$(GRAPH_REVISION_SEED_CONTAINER)" \
+	    --mount "type=volume,src=$(GRAPH_REVISION_VOLUME),dst=/data" \
+	    --workdir /app -e DATA_DIR=/data -e CASE=graph-revision \
+	    -e SEED_USER=admin -e SEED_PASSWORD=admin \
+	    --entrypoint sh "$(GRAPH_REVISION_RUNNER_IMAGE)" -c 'tar -C /app -xf -; npm run seed'; \
+	  tar -cf - scripts test | docker run --rm -i --name "$(GRAPH_REVISION_SEED_CONTAINER)" \
+	    --mount "type=volume,src=$(GRAPH_REVISION_VOLUME),dst=/data" \
+	    --workdir /app -e GRAPH_REVISION_NOTES_DIR=/data/spaces/graph-revision \
+	    -e GRAPH_REVISION_CORPUS_OUTPUT=/data/graph-revision-corpus.json \
+	    --entrypoint sh "$(GRAPH_REVISION_RUNNER_IMAGE)" -c 'tar -C /app -xf -; npm run bench:graph-revision-corpus'; \
+	  docker run --rm \
+	    --mount "type=volume,src=$(GRAPH_REVISION_VOLUME),dst=/data" \
+	    --entrypoint chown "$(GRAPH_REVISION_RUNNER_IMAGE)" -R node:node /data; \
+	  docker create --name "$(GRAPH_REVISION_RUNNER_CONTAINER)" \
+	    --workdir /app -e GRAPH_REVISION_MEMORY_OUTPUT=/tmp/graph-revision-memory.json \
+	    --entrypoint npm "$(GRAPH_REVISION_RUNNER_IMAGE)" run bench:graph-revision-memory >/dev/null; \
+	  docker cp ./scripts/. "$(GRAPH_REVISION_RUNNER_CONTAINER):/app/scripts"; \
+	  docker start --attach "$(GRAPH_REVISION_RUNNER_CONTAINER)"; \
+	  docker cp "$(GRAPH_REVISION_RUNNER_CONTAINER):/tmp/graph-revision-memory.json" \
+	    "$(GRAPH_REVISION_OUTPUT_DIR)/memory.json"; \
+	  docker rm -f "$(GRAPH_REVISION_RUNNER_CONTAINER)" >/dev/null; \
+	  docker run -d --name "$(GRAPH_REVISION_CONTAINER)" \
+	    --network "$(GRAPH_REVISION_NETWORK)" --network-alias notarium \
+	    --mount "type=volume,src=$(GRAPH_REVISION_VOLUME),dst=/data" \
+	    --mount "type=tmpfs,dst=/app/node_modules/@huggingface/transformers/.cache,tmpfs-mode=1777" \
+	    -e AUTH_MODE=password -e VECTOR_SEARCH=on -e GRAPH_BOOST=on \
+	    -e GRAPH_ADJACENCY_OBSERVATION_FILE=/data/graph-revision-adjacency.json \
+	    -e GRAPH_ADJACENCY_OBSERVATION_SPACE=graph-revision \
+	    -e GRAPH_ADJACENCY_OBSERVATION_SOURCE=source/graph-revision-source.md \
+	    -e GRAPH_ADJACENCY_OBSERVATION_TARGET=target/adjacency-target.md \
+	    -e WIKILINK_PARSE_CACHE=on -e EMBED_MODEL=Xenova/multilingual-e5-small \
+	    -e EMBED_DIMENSIONS=384 -e 'EMBED_QUERY_PREFIX=query: ' -e 'EMBED_PASSAGE_PREFIX=passage: ' \
+	    -e EMBED_WORKERS=2 -e EMBED_THREADS=1 -e EMBED_CPU_MEM_ARENA=off \
+	    "$(GRAPH_REVISION_RUNTIME_IMAGE)" >/dev/null; \
+	  healthy=0; \
+	  for attempt in $$(seq 1 120); do \
+	    state="$$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' "$(GRAPH_REVISION_CONTAINER)")"; \
+	    if [ "$$state" = healthy ]; then healthy=1; break; fi; \
+	    if [ "$$state" = unhealthy ]; then docker logs "$(GRAPH_REVISION_CONTAINER)"; exit 1; fi; \
+	    sleep 5; \
+	  done; \
+	  if [ "$$healthy" != 1 ]; then docker logs "$(GRAPH_REVISION_CONTAINER)"; echo 'graph revision server did not become healthy' >&2; exit 1; fi; \
+	  image="$$(docker inspect --format '{{.Image}}' "$(GRAPH_REVISION_CONTAINER)")"; \
+	  revision="$$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$(GRAPH_REVISION_CONTAINER)")"; \
+	  test "$$revision" = "$(GRAPH_REVISION_COMMIT)" || { echo "graph revision OCI revision mismatch: $$revision" >&2; exit 1; }; \
+	  docker create --name "$(GRAPH_REVISION_RUNNER_CONTAINER)" \
+	    --network "$(GRAPH_REVISION_NETWORK)" \
+	    --mount "type=volume,src=$(GRAPH_REVISION_VOLUME),dst=/benchmark-data,readonly" \
+	    --workdir /app -e BASE_URL=http://notarium:3000 \
+	    -e BENCH_COMMIT="$(GRAPH_REVISION_COMMIT)" -e BENCH_IMAGE="$$image" \
+	    -e BENCH_IMAGE_REVISION="$$revision" -e BENCH_CONTAINER="$(GRAPH_REVISION_CONTAINER)" \
+	    -e GRAPH_REVISION_CORPUS_REPORT=/benchmark-data/graph-revision-corpus.json \
+	    -e GRAPH_REVISION_ADJACENCY_REPORT=/benchmark-data/graph-revision-adjacency.json \
+	    -e GRAPH_REVISION_OUTPUT=/tmp/graph-revision-runtime.json \
+	    --entrypoint npm "$(GRAPH_REVISION_RUNNER_IMAGE)" run bench:graph-revision >/dev/null; \
+	  docker cp ./scripts/. "$(GRAPH_REVISION_RUNNER_CONTAINER):/app/scripts"; \
+	  if ! docker start --attach "$(GRAPH_REVISION_RUNNER_CONTAINER)"; then \
+	    docker logs "$(GRAPH_REVISION_CONTAINER)"; \
+	    exit 1; \
+	  fi; \
+	  docker cp "$(GRAPH_REVISION_RUNNER_CONTAINER):/tmp/graph-revision-runtime.json" \
+	    "$(GRAPH_REVISION_OUTPUT_DIR)/runtime.json"; \
+	  docker rm -f "$(GRAPH_REVISION_RUNNER_CONTAINER)" >/dev/null
 
 # --- session activity read-model benchmark ----------------------------------
 BENCH_PHASE ?= pre

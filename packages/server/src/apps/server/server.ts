@@ -18,6 +18,7 @@ import {
   createNotariumStore,
   type Embedder,
   ensureNotariumResourceAuthority,
+  type GraphAdjacencyBuildObservation,
   NotariumStoreCompositionOwner,
   renameNoReplaceIfAvailable,
   type SearchTuning,
@@ -199,6 +200,18 @@ export type CreateServerOptions = {
   /** Hybrid-search RRF fusion tuning, applied to every space. Unset ⇒ conservative
    *  defaults. */
   searchTuning?: Partial<SearchTuning>
+  /** Engine-local parsed-wikilink cache mode. False selects the atomic reference
+   * derivation without changing files, index schema or canonical data. */
+  wikilinkParseCache?: boolean
+  /** Private per-space observer for successfully published graph adjacency.
+   * Production-shaped gates use it without adding a wire capability. */
+  onGraphAdjacencyBuilt?: (
+    space: SpaceRecord,
+    observation: GraphAdjacencyBuildObservation,
+  ) => void | Promise<void>
+  /** Embedded-host/test observer for the concrete per-space engine after every
+   * composition option has been applied. It exposes no wire or runtime capability. */
+  onEngineCreated?: (engine: ReturnType<typeof createNotariumStore>, space: SpaceRecord) => void
   /** Canonical PUBLIC origin the OAuth facade advertises (issuer/resource) — set
    *  for a stable issuer behind a proxy. Unset ⇒ derived per-request from forwarded
    *  headers. canon: docs/mcp-oauth.md#config */
@@ -232,6 +245,9 @@ export const createServer = async ({
   spacesRoot,
   embedder,
   searchTuning,
+  wikilinkParseCache,
+  onGraphAdjacencyBuilt,
+  onEngineCreated,
   publicBaseUrl,
   trustProxy,
   backgroundQuietMs,
@@ -482,8 +498,13 @@ export const createServer = async ({
         indexDb: cfg.indexDb || join(engineDataDir, `${rec.notesDir}.db`),
         embedder,
         searchTuning,
+        wikilinkParseCache,
+        onGraphAdjacencyBuilt: onGraphAdjacencyBuilt
+          ? (observation) => onGraphAdjacencyBuilt(rec, observation)
+          : undefined,
         scheduler,
       })
+      onEngineCreated?.(engine, rec)
       return new CachedStore({
         inner: engine,
         identityPersistence: metaDb?.identity,

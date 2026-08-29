@@ -62,6 +62,22 @@ export const deriveNoteEdges = (
    *  edge carries `resolvedVia`; omit it and edges stay lean (the read-model's
    *  incremental write-through path passes none). */
   provenance?: Map<string, ResolvedVia>,
+): { edges: GraphLink[]; ghosts: GhostStub[] } =>
+  deriveNoteEdgesFromLabels(sourceId, parseWikilinks(content), index, relationType, provenance)
+
+/** Derive one note's outbound edges from labels that were parsed from the exact
+ *  source generation earlier. Keeping resolution separate from markdown parsing
+ *  lets engine read models cache the expensive, body-only half while rebuilding
+ *  the resolver from current metadata on every graph revision. `resolved` is
+ *  derivation-scoped: equal labels share one resolver lookup across sources, but
+ *  self-link filtering remains source-specific below. */
+export const deriveNoteEdgesFromLabels = (
+  sourceId: string,
+  labels: readonly string[],
+  index: LinkIndex,
+  relationType: string,
+  provenance?: Map<string, ResolvedVia>,
+  resolved?: Map<string, ReturnType<typeof resolveLink>>,
 ): { edges: GraphLink[]; ghosts: GhostStub[] } => {
   // Collapse duplicate source→target edges, but when the SAME target is reached
   // both by its current name and by a former one (a note that links [[Gagarin]]
@@ -73,8 +89,14 @@ export const deriveNoteEdges = (
   const byKey = new Map<string, GraphLink>()
   const ghosts: GhostStub[] = []
 
-  for (const label of parseWikilinks(content)) {
-    const { targetId, ghost, resolvedVia } = resolveLink(label, index, provenance)
+  for (const label of labels) {
+    let resolution = resolved?.get(label)
+
+    if (!resolution) {
+      resolution = resolveLink(label, index, provenance)
+      resolved?.set(label, resolution)
+    }
+    const { targetId, ghost, resolvedVia } = resolution
 
     if (!ghost && targetId === sourceId) {
       continue

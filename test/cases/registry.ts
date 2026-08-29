@@ -13,6 +13,7 @@ import { feedScroll } from './cases/feedScroll'
 import { folderPage } from './cases/folderPage'
 import { graph } from './cases/graph'
 import { graphLoad } from './cases/graphLoad'
+import { graphRevision } from './cases/graphRevision'
 import { historyRich } from './cases/historyRich'
 import { identityCollision } from './cases/identityCollision'
 import { importLayout } from './cases/importLayout'
@@ -62,6 +63,7 @@ export const CASES: readonly CaseSpec[] = [
   wikiWeb,
   graph,
   graphLoad,
+  graphRevision,
   searchCorpus,
   externalEdits,
   identityCollision,
