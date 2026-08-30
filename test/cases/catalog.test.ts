@@ -989,6 +989,7 @@ describe('seed catalog (#175)', () => {
     scopePins: true,
     contextOrder: true,
     auth: true,
+    providers: true,
     events: true,
     favorites: true,
     retrievals: true,

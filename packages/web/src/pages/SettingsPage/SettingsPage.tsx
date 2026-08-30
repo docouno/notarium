@@ -1,5 +1,6 @@
 import { AUTH_MODE } from '@notarium/contract/enums'
 import { useAuth } from '../../composers/AuthProvider'
+import { useSpace } from '../../composers/SpaceProvider'
 import { SettingsLayout, type SettingsTab } from '../../layouts/SettingsLayout'
 import { settingsRoute } from '../../libs/routing/routePaths'
 
@@ -8,6 +9,7 @@ import { settingsRoute } from '../../libs/routing/routePaths'
 // principal, so a mode-'none' host shows only Appearance.
 export const SettingsPage = () => {
   const { mode, me } = useAuth()
+  const { capabilities } = useSpace()
   const user = mode === AUTH_MODE.password ? me : null
   const groups: SettingsTab[][] = [
     [
@@ -20,6 +22,12 @@ export const SettingsPage = () => {
             { id: 'profile', label: 'Profile' },
             { id: 'account', label: 'Account' },
             { id: 'connected-apps', label: 'Connected apps' },
+          ]
+        : []),
+      ...(capabilities.providers
+        ? [
+            { id: 'credentials', label: 'Credentials' },
+            { id: 'providers', label: 'Model providers' },
           ]
         : []),
       // About is general info — visible to everyone, including a mode-'none' host.

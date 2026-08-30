@@ -16,6 +16,7 @@ import { InMemoryOAuthPersistence } from './oauthPersistence.js'
 
 const fixture = (): Fixture => ({
   now: '2026-06-20T12:00:00.000Z',
+  capabilities: { providers: true },
   spaces: [
     {
       slug: 'alpha',
@@ -1072,6 +1073,36 @@ describe('connected apps (#96)', () => {
       headers: { authorization: `Bearer ${access}` },
     })
     expect(res.statusCode).toBe(404)
+  })
+
+  it('keeps provider credential inventory session-only for an OAuth connector', async () => {
+    const { access, cookie } = await connect()
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/providers/credentials',
+      headers: { cookie },
+      payload: {
+        name: 'OAuth-hidden',
+        kind: 'bearer',
+        secret: 'oauth-hidden-secret',
+        origin: 'https://provider.example',
+      },
+    })
+    expect(created.statusCode).toBe(200)
+    const id = created.json().credential.id as string
+
+    const listed = await app.inject({
+      method: 'GET',
+      url: '/api/providers/credentials',
+      headers: { authorization: `Bearer ${access}` },
+    })
+    const detail = await app.inject({
+      method: 'GET',
+      url: `/api/providers/credentials/${id}`,
+      headers: { authorization: `Bearer ${access}` },
+    })
+    expect(listed.statusCode).toBe(404)
+    expect(detail.statusCode).toBe(404)
   })
 
   it('Disconnect revokes the REFRESH token too — the app cannot mint a fresh access token', async () => {

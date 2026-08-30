@@ -325,6 +325,35 @@ const tableOf = (catalog: MetaDbCatalog, name: string): CatalogTable => {
   return table
 }
 
+/** The tables the provider contour adds, which the pre-cut golden cannot contain by
+ *  construction. The golden gate answers one question — did COMPACTING the published
+ *  ladder change the schema it produced — and a table that did not exist before the
+ *  cut is outside it. They are named here rather than described in catalog form: a
+ *  second spelling of their DDL would have to be kept in step with the migrations by
+ *  hand, while their shape is already held by the schema object counts, the meta-DB
+ *  contract suites, the foreign-key assertion and the lock-order register. */
+export const PROVIDER_CONTOUR_TABLES: readonly string[] = [
+  'credentials',
+  'provider_attachments',
+  'provider_call_log',
+  'provider_resources',
+  'secret_keyring',
+]
+
+/** Splits a live catalog into the published line the golden describes and the names of
+ *  the contour tables on top of it, so both halves are asserted rather than one. */
+export const splitProviderContour = (
+  live: MetaDbCatalog,
+): { published: MetaDbCatalog; contour: string[] } => ({
+  published: {
+    tables: live.tables.filter((table) => !PROVIDER_CONTOUR_TABLES.includes(table.name)),
+  },
+  contour: live.tables
+    .filter((table) => PROVIDER_CONTOUR_TABLES.includes(table.name))
+    .map((table) => table.name)
+    .sort(),
+})
+
 export const approvedTargetCatalog = (golden: MetaDbCatalog): MetaDbCatalog => {
   const target = structuredClone(golden)
   target.tables = target.tables.filter((table) => table.name !== 'mcp_bookmarks')

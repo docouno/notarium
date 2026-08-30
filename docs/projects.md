@@ -191,9 +191,19 @@ get_my_projects() → { projects: [{
 The `role` field IS ABOLISHED (project ≠ a space role; membership is an attribute of the space, not the project). Scope = space membership (anti-enumeration 404, as `/api/spaces` #16), **INCLUDING the personal domain**: projects marked in it are in the list (#13 2026-06-20); the personal domain itself as a space is not listed (from the PAT).
 
 ```
-whoami() → { principal, scope: "read"|"write", projects: ProjectSummary[] }
+whoami() → {
+  principal,
+  scope: "read"|"write",
+  projects: ProjectSummary[],
+  capabilities: { vector, trash, revisions },
+  hasModel: boolean
+}
 ```
 `ProjectRoleSchema` (slug+role) is abolished together with `role`; whoami returns the same `ProjectSummary` as `get_my_projects` (one form outward).
+`capabilities` describes the host engine. `hasModel` is separate because it is
+derived from the caller's effective provider resources; it is always present and
+is `false` when providers are disabled or no usable resource is available. It is
+the intentionally coarse agent projection described in [providers.md](providers.md#enable-and-access).
 
 ```
 start_session(project?: ProjectHandle, task?, acknowledge?, responseFormat?)

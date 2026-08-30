@@ -64,6 +64,14 @@ import {
   SetupRequestSchema,
 } from './schemas/rest/auth'
 import {
+  CredentialCreateRequestSchema,
+  CredentialDeleteResponseSchema,
+  CredentialPatchRequestSchema,
+  CredentialReferenceConflictResponseSchema,
+  CredentialResponseSchema,
+  CredentialsResponseSchema,
+} from './schemas/rest/credentials'
+import {
   FavoriteMutationResponseSchema,
   FavoritePutRequestSchema,
   FavoritesResponseSchema,
@@ -131,6 +139,33 @@ import {
   ProjectRowSchema,
   ProjectsResponseSchema,
 } from './schemas/rest/projects'
+import {
+  ProviderAttachmentAcceptRequestSchema,
+  ProviderAttachmentAcceptResponseSchema,
+  ProviderAttachmentConflictResponseSchema,
+  ProviderAttachmentDetachResponseSchema,
+  ProviderAttachmentDetailResponseSchema,
+  ProviderAttachmentOfferRequestSchema,
+  ProviderAttachmentOfferResponseSchema,
+  ProviderAttachmentsResponseSchema,
+  ProviderRetargetConflictResponseSchema,
+  ProviderRetargetRequestSchema,
+  ProviderRetargetResponseSchema,
+} from './schemas/rest/providerAttachments'
+import {
+  ProviderEffectiveEntrySchema,
+  ProviderEffectiveResponseSchema,
+  ProviderInventoryQuerySchema,
+  ProviderResourceCreateRequestSchema,
+  ProviderResourceDeleteResponseSchema,
+  ProviderResourcePatchRequestSchema,
+  ProviderResourceResponseSchema,
+  ProviderResourcesResponseSchema,
+  ProviderResourceStatusesRequestSchema,
+  ProviderResourceStatusesResponseSchema,
+  ProviderValidateRequestSchema,
+  ProviderValidateResponseSchema,
+} from './schemas/rest/providers'
 import { SearchResponseSchema } from './schemas/rest/search'
 import { PurgeSpaceRequestSchema, SpaceSchema, SpacesResponseSchema } from './schemas/rest/spaces'
 import { StatusResponseSchema, StoreEventSchema } from './schemas/rest/sync'
@@ -320,6 +355,72 @@ export const contract = {
   contextSetItemsOrder: {
     request: ContextSetOrderRequestSchema,
     response: ContextSetResponseSchema,
+  },
+  providerCredentials: {
+    request: ProviderInventoryQuerySchema,
+    response: CredentialsResponseSchema,
+  },
+  providerCredential: { response: CredentialResponseSchema },
+  providerCredentialCreate: {
+    request: CredentialCreateRequestSchema,
+    response: CredentialResponseSchema,
+  },
+  providerCredentialPatch: {
+    request: CredentialPatchRequestSchema,
+    response: CredentialResponseSchema,
+    conflict: CredentialReferenceConflictResponseSchema,
+  },
+  providerCredentialDelete: {
+    response: CredentialDeleteResponseSchema,
+    conflict: CredentialReferenceConflictResponseSchema,
+  },
+  providerResources: {
+    request: ProviderInventoryQuerySchema,
+    response: ProviderResourcesResponseSchema,
+  },
+  providerResource: { response: ProviderResourceResponseSchema },
+  providerResourceCreate: {
+    request: ProviderResourceCreateRequestSchema,
+    response: ProviderResourceResponseSchema,
+  },
+  providerResourcePatch: {
+    request: ProviderResourcePatchRequestSchema,
+    response: ProviderResourceResponseSchema,
+  },
+  providerResourceDelete: { response: ProviderResourceDeleteResponseSchema },
+  providerResourceStatuses: {
+    request: ProviderResourceStatusesRequestSchema,
+    response: ProviderResourceStatusesResponseSchema,
+  },
+  providerResourceValidate: {
+    request: ProviderValidateRequestSchema,
+    response: ProviderValidateResponseSchema,
+  },
+  providerEffective: {
+    request: ProviderInventoryQuerySchema,
+    response: ProviderEffectiveResponseSchema,
+  },
+  providerEffectiveDetail: { response: ProviderEffectiveEntrySchema },
+  providerAttachments: {
+    request: ProviderInventoryQuerySchema,
+    response: ProviderAttachmentsResponseSchema,
+  },
+  providerAttachmentDetail: { response: ProviderAttachmentDetailResponseSchema },
+  providerAttachmentOffer: {
+    request: ProviderAttachmentOfferRequestSchema,
+    response: ProviderAttachmentOfferResponseSchema,
+    conflict: ProviderAttachmentConflictResponseSchema,
+  },
+  providerAttachmentAccept: {
+    request: ProviderAttachmentAcceptRequestSchema,
+    response: ProviderAttachmentAcceptResponseSchema,
+    conflict: ProviderAttachmentConflictResponseSchema,
+  },
+  providerAttachmentDetach: { response: ProviderAttachmentDetachResponseSchema },
+  providerCredentialRetarget: {
+    request: ProviderRetargetRequestSchema,
+    response: ProviderRetargetResponseSchema,
+    conflict: ProviderRetargetConflictResponseSchema,
   },
   profile: { response: ProfileResponseSchema },
   profilePut: { request: ProfilePutRequestSchema, response: ProfileResponseSchema },

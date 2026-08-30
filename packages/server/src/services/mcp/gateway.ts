@@ -34,6 +34,7 @@ import type {
   ScopePinsPersistence,
 } from '../metaDb'
 import { type MarkerStore } from '../projects'
+import type { ProviderRegistry } from '../providerRegistry'
 import type { RolesService } from '../roles'
 import { ensurePersonalSpace, peekPersonalSpace, type SpaceManager } from '../spaces'
 import { createStoreAccess, type StoreAccess } from '../storeAccess'
@@ -74,6 +75,7 @@ export type GatewayDeps = {
   auth: AuthService
   roles?: RolesService
   abilities?: AbilitiesService
+  providerRegistry?: Pick<ProviderRegistry, 'hasUsableForPrincipal'>
   /** Durable, owner-scoped agent episodes. Absent means the whole session feature
    *  degrades away: start_session emits no session and regular calls ignore it. */
   sessions?: AgentSessionsPersistence
@@ -162,6 +164,7 @@ export type Ctx = {
   agentSessions?: AgentSessions
   roles?: RolesService
   abilities?: AbilitiesService
+  providerRegistry?: Pick<ProviderRegistry, 'hasUsableForPrincipal'>
   /** Stable session owner: username in password mode, reserved `@system` in none mode. */
   sessionOwner: string | null
   /** Episode attached to this call. start_session fills it after opening one. */
@@ -298,6 +301,7 @@ export const createGateway = (deps: GatewayDeps): McpGateway => {
       agentSessions,
       roles: deps.roles,
       abilities: deps.abilities,
+      providerRegistry: deps.providerRegistry,
       sessionOwner: agentOwnerOf(principal),
       now,
       personalSpace,

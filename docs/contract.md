@@ -30,6 +30,58 @@ The surface splits into three route classes (#16):
 - **Space-scoped** — under the `/api/s/<slug>/…` prefix (notes, tree, buckets, graph, search, status, events, note creation, folder moves). A request without a space physically has no route — fail-closed by construction. Its Feed list projection may carry compact `noteType` and only the requested `card:true` field values; detail-only state and unreadable/truncation bookkeeping never ride this window.
 - **Id-addressed global** — `/api/note*`, `/api/previews`, `/api/move`: the arbiter of which space a note lives in is the identity registry, not a query parameter. The ordinary `POST /api/note` update may carry an authored-field patch inside the same document CAS. `PUT /api/note/fields` is the atomic custom-field point-intent used by Meta, boards and agents; it resolves the space from the note id, not from client input, and returns the fresh note token. Future system metadata may share the resource path through explicit typed members, never by bypassing protected keys inside the generic `fields` map.
 - **Host-level** — `/api/spaces`, `/api/config`, `/api/health`, `/api/about`.
+- **Provider management** — `/api/providers/resources*` and
+  `/api/providers/credentials*` are host-addressed but session-only (`self:manage`).
+  The ownership, network and recovery guarantees behind these wires live in
+  [providers.md](providers.md).
+  Inventory and id-addressed reads are owner-only; a foreign id and a missing id have
+  the same 404 response. Secret and resource-header values are write-only. Credential
+  detail exposes only its non-secret configuration and typed resource references;
+  narrowed PAT/OAuth tokens cannot discover either inventory.
+  A resource create sends the complete header map. A resource PATCH instead sends
+  header operations: a string sets/replaces one value, `null` deletes that name,
+  and a name absent from the map keeps its existing ciphertext. This distinction is
+  load-bearing: the client sees names only and cannot honestly reconstruct a full map.
+  `POST /api/providers/resources/:id/validate` is the one route that makes a real
+  outbound call. It is owner-only for the same reason — the call spends the owner's
+  credential — and it is declared `self:manage` rather than checked: `manage` is
+  above any token's ceiling, so the route is session-only by construction. Its
+  outcome is per PURPOSE, not per resource: one address can serve chat and refuse
+  embeddings. The outcome is stored only if the resource and credential runtime
+  epochs it was taken under are both unchanged, and it is projected on READ by two
+  independent rules: the provider's own sentence reaches the owner and a host admin
+  only — it is prose about the OWNER's account, not about the address — and on a
+  private address the outcomes derived from what the address answered additionally
+  collapse into a plain works/does-not-work, because telling them apart is an oracle
+  on internal state.
+  `GET /api/providers/effective` is the other half of the family and the only one
+  that answers about someone else's records: what this principal may actually call —
+  what they own, plus what the Spaces they belong to were given — with a named
+  `unusableBecause` beside everything they may not. It is session-only for a sharper
+  reason than the rest: a narrowed token learns THAT the host has a model from the
+  MCP `whoami`, never the names, owners and addresses behind it. A resource row is
+  projected by AUDIENCE — the owner and a host admin get the addressee, its header
+  names, its vendor, its private-network opt-in and its timeouts; anyone else gets
+  what the resource serves, who pays for it, and `addressIsPrivate` — the DERIVED
+  fact of whether the call leaves the host, never the opt-in, which is legal on a
+  public origin and would read as "inside our network". The withheld fields are
+  ABSENT rather than nulled. An offer nobody has accepted yet is not a row here at
+  all: consent is the one place it is disclosed.
+  Provider consent has one space-scoped inventory,
+  `GET /api/s/:space/providers/attachments`, and three id-addressed mutations:
+  `POST /api/providers/attachments` offers an owned resource to a Space or project,
+  `POST /api/providers/attachments/:id/accept` conditionally accepts the epochs the
+  manager was shown, and `DELETE /api/providers/attachments/:id` detaches it. Each
+  attachment view carries those current epochs separately as `currentEpochs`; the
+  epochs on the attachment row remain the previously accepted pair (or null for a
+  pending offer). An epoch conflict returns a fresh view for one review-and-retry. The
+  list is `space:manage`; accept/detach use host authentication plus the same check
+  in-handler because their path contains no Space. `POST
+  /api/providers/credentials/:id/retarget` changes one credential origin and every
+  referencing resource address atomically; its request names the complete current
+  reference set, so different path components are never guessed. Conflict responses
+  carry the current disclosure diff or the per-resource exit (`detach` versus
+  `fix-or-delete`), while foreign and vanished ids stay one 404.
 
 ## Operation registry <a id="registry"></a>
 
@@ -60,4 +112,10 @@ One inclusion language across every selection facet (folders #93, tags #109, cla
 
 - `packages/contract/src/` — schemas + registry + zod-free consts.
 - `packages/server/src/apps/server/routes/` — REST transport + `wire.ts`.
+- `packages/contract/src/schemas/rest/providers.ts`, `providerAttachments.ts` and
+  `credentials.ts` — provider
+  resource/credential shapes; `consts/providers.ts` is their zod-free vocabulary. It
+  also holds the vocabulary of the provider call itself — delivery state, failure
+  classes, journal outcomes and usage counters — because the meta-DB persists those
+  words and may not reach into the runtime that produces them.
 - `packages/web/src/services/api/` — client, typed by the contract.

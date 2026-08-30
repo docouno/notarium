@@ -7,7 +7,7 @@ production packages and the optional vector native stack. First-party code is un
 the root LICENSE / NOTICE / COMMERCIAL-LICENSE.md. Browser-bundle notices live
 in packages/web/public/licenses/THIRD_PARTY_NOTICES.txt.
 
-210 components.
+211 components.
 
 | Package | Version | License |
 | --- | --- | --- |
@@ -214,6 +214,7 @@ in packages/web/public/licenses/THIRD_PARTY_NOTICES.txt.
 | toidentifier | 1.0.1 | MIT |
 | tslib | 2.8.1 | 0BSD |
 | type-fest | 0.13.1 | (MIT OR CC0-1.0) |
+| undici | 7.29.0 | MIT |
 | undici-types | 7.24.6 | MIT |
 | util-deprecate | 1.0.2 | MIT |
 | xtend | 4.0.2 | MIT |
@@ -23736,6 +23737,37 @@ Permission is hereby granted, free of charge, to any person obtaining a copy of 
 The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+````
+
+---
+
+## undici  7.29.0  —  MIT
+https://github.com/nodejs/undici
+
+### LICENSE
+
+````text
+MIT License
+
+Copyright (c) Matteo Collina and Undici contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 ````
 
 ---

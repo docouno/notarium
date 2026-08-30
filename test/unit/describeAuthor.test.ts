@@ -44,7 +44,11 @@ const setup = async () => {
   }
   await db.insertPat(pat({ id: 'alice-key', username: 'alice', name: 'Alice Laptop' }))
   await db.insertPat(pat({ id: 'bob-key', username: 'bob', name: 'Bob Secret CLI' }))
-  return createAuthService({ mode: 'password', persistence: db })
+  return createAuthService({
+    mode: 'password',
+    persistence: db,
+    removeMemberAndProviderAttachments: (space, username) => db.removeMember(space, username),
+  })
 }
 
 describe('describeAuthor (#13 — viewer-relative, privacy-filtered attribution)', () => {

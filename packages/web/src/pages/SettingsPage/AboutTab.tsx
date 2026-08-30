@@ -225,6 +225,7 @@ export const AboutTab = () => {
               </Row>
             )}
             <Row label="Auth mode">{about.admin.authMode}</Row>
+            {about.admin.providers && <Row label="Providers">Enabled</Row>}
             <Row label="Space creation">{about.admin.spaceCreate ? 'Enabled' : 'Disabled'}</Row>
             <Row label="Metadata DB">{about.admin.metaDb}</Row>
             <Row label="Uptime">{fmtUptime(about.admin.uptimeSeconds)}</Row>

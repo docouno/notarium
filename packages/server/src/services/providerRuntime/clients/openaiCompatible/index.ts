@@ -1,0 +1,1 @@
+export { callOpenAiCompatible } from './openaiCompatible'

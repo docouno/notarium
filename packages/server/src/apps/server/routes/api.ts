@@ -16,6 +16,7 @@ import { buildApiRouteCtx } from './_shared'
 import { activityRoutes } from './activity'
 import { authRoutes } from './auth'
 import { contextSetsRoutes } from './contextSets'
+import { credentialsRoutes } from './credentials'
 import { eventsRoutes } from './events'
 import { exportRoutes } from './export'
 import { favoritesRoutes } from './favorites'
@@ -27,6 +28,8 @@ import { jobsRoutes } from './jobs'
 import { noteRoutes } from './note'
 import { notesRoutes } from './notes'
 import { projectsRoutes } from './projects'
+import { providerAttachmentsRoutes } from './providerAttachments'
+import { providersRoutes } from './providers'
 import { searchRoutes } from './search'
 import { spacesRoutes } from './spaces'
 import { trashRoutes } from './trash'
@@ -76,6 +79,9 @@ export const apiRoutes = async (app: FastifyInstance, opts: ApiRoutesOptions) =>
   await noteRoutes(app, ctx)
   await foldersRoutes(app, ctx)
   await projectsRoutes(app, ctx)
+  await providersRoutes(app, ctx)
+  await credentialsRoutes(app, ctx)
+  await providerAttachmentsRoutes(app, ctx)
   await contextSetsRoutes(app, ctx)
   await trashRoutes(app, ctx)
 }

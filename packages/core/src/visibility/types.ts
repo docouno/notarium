@@ -1,6 +1,6 @@
 /** The full per-class policy set. The read columns
  *  (feed/tree/userSearch/graph/agentRecall) drive visibility; index/versioned/
- *  replicate are lifecycle axes consumers read directly. */
+ *  replicate/providerEgress are policy axes consumers read directly. */
 export type ClassPolicy = {
   /** In the derived FTS/vector index? (agent-memory is indexed — agentRecall
    *  needs it — yet hidden from user surfaces: index ≠ visible.) */
@@ -19,4 +19,6 @@ export type ClassPolicy = {
   versioned: boolean
   /** Synced between stores/devices? */
   replicate: boolean
+  /** May the note content cross the model-provider egress boundary? */
+  providerEgress: boolean
 }

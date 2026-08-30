@@ -56,6 +56,11 @@ const TWO: Fixture = {
   ],
 }
 
+const ARCHIVED: Fixture = {
+  ...base(),
+  spaces: [base().spaces[0], { slug: 'old', displayName: 'Old', archived: true, notes: [] }],
+}
+
 const AUDIT_SESSION_ID = 'ses_resetwrite01'
 const withAuditSession = (value: Fixture): Fixture => ({
   ...value,
@@ -148,6 +153,16 @@ describe('reset hook fixture swap (#127: opaque space ids)', () => {
     expect(work2).not.toBe(work1)
     // The slug still resolves cleanly to exactly the new id (no stale row shadowing).
     expect((await app.inject({ method: 'GET', url: '/api/s/work/notes' })).statusCode).toBe(200)
+  })
+
+  it('seeds a runtime Space archived and repeats the reset without a lifecycle race', async () => {
+    expect((await reset(ARCHIVED)).statusCode).toBe(200)
+    expect((await spacesOf()).map((space) => space.slug)).toEqual(['main'])
+    expect((await app.inject({ method: 'GET', url: '/api/s/old/notes' })).statusCode).toBe(404)
+
+    expect((await reset(base())).statusCode).toBe(200)
+    expect((await reset(ARCHIVED)).statusCode).toBe(200)
+    expect((await spacesOf()).map((space) => space.slug)).toEqual(['main'])
   })
 
   it('a retired alias cannot capture a current slug introduced by the next fixture', async () => {

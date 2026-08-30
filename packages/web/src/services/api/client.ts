@@ -1,6 +1,9 @@
 import type {
+  CredentialReference,
   ImportSummary,
   NoteExistsResponse,
+  ProviderAttachmentView,
+  ProviderRetargetConflictReference,
   NoteDetail as WireNoteDetail,
 } from '@notarium/contract'
 import { HTTP_STATUS } from '@notarium/contract/http'
@@ -42,6 +45,13 @@ export class ApiError extends Error {
   /** Field-level causes of a `reason: 'validation'` 400 — present so a form can
    *  point at the offending field; the generic message is the lead issue. */
   issues?: { path: string; message: string }[]
+  /** Provider management conflicts return the safe references the UI must explain.
+   *  Credential references and retarget references are distinguishable by their
+   *  `kind` / `resolution` fields; neither shape contains a secret. */
+  references?: CredentialReference[] | ProviderRetargetConflictReference[]
+  /** Fresh attachment projection returned with an epoch conflict. The acceptance
+   *  surface replaces its stale row with this instead of painting an error. */
+  providerView?: ProviderAttachmentView
   /** A synchronous import that failed AFTER writing some notes carries what it did
    *  finish. The error is the outcome, but the notes are real — dropping this would
    *  tell the user nothing happened. canon: docs/import.md#what-an-import-reports-302 */
@@ -233,6 +243,13 @@ export const req = async <T>(path: string, opts: RequestInit = {}): Promise<T> =
     }
     if (Array.isArray(data.issues)) {
       err.issues = data.issues as { path: string; message: string }[]
+    }
+    if (Array.isArray(data.references)) {
+      err.references = data.references as
+        CredentialReference[] | ProviderRetargetConflictReference[]
+    }
+    if (data.view) {
+      err.providerView = data.view as ProviderAttachmentView
     }
     throw err
   }

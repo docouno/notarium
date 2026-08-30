@@ -3,6 +3,7 @@
 
 import pg from 'pg'
 
+import { DEFAULT_CREDENTIAL_HEADER } from '@notarium/contract'
 import { CAUSAL_BARRIER_KIND } from '@notarium/core'
 
 import { REVISION_PURGE_PROTOCOL } from './consts'
@@ -17,6 +18,7 @@ import { createCausalOutboxFacet } from './drivers/pg/causalOutbox'
 import type { PgDriverCtx } from './drivers/pg/context'
 import { createContextOrderFacet } from './drivers/pg/contextOrder'
 import { createContextSetsFacet } from './drivers/pg/contextSets'
+import { createCredentialsFacet } from './drivers/pg/credentials'
 import { createFavoritesFacet } from './drivers/pg/favorites'
 import { createFoldersFacet } from './drivers/pg/folders'
 import { createGatewayFacet } from './drivers/pg/gateway'
@@ -26,25 +28,54 @@ import { createInstallationGenerationFacet } from './drivers/pg/installationGene
 import { createJobsFacet } from './drivers/pg/jobs'
 import {
   lockContextOrderScopesOfSpace,
+  lockProviderAttachmentRows,
+  lockProviderCredentialRows,
+  lockProviderMembershipRow,
+  lockProviderResourceRows,
+  lockProviderSpaceRow,
   lockRevisionWideScan,
   lockSpaceIdentityRows,
 } from './drivers/pg/lockOrder'
 import { createOAuthFacet } from './drivers/pg/oauth'
 import { createOwnerProofsFacet } from './drivers/pg/ownerProofs'
 import { createProjectsFacet } from './drivers/pg/projects'
+import {
+  acceptProviderAttachment,
+  createProviderAttachmentsFacet,
+  detachProviderAttachment,
+  offerProviderAttachment,
+  transitionProviderAttachments,
+} from './drivers/pg/providerAttachments'
+import { createProviderCallLogFacet } from './drivers/pg/providerCallLog'
+import { createProviderCiphertextsFacet } from './drivers/pg/providerCiphertexts'
+import { createProviderResourcesFacet } from './drivers/pg/providerResources'
 import { createRestoreOperationsFacet } from './drivers/pg/restoreOperations'
 import { createRestoreTerminalFacet } from './drivers/pg/restoreTerminal'
 import { createRetrievalLogFacet } from './drivers/pg/retrievalLog'
 import { lockRevisionKeys } from './drivers/pg/revisionLocks'
 import { createRevisionsFacet } from './drivers/pg/revisions'
 import { createScopePinsFacet } from './drivers/pg/scopePins'
+import { createSecretKeyringFacet } from './drivers/pg/secretKeyring'
 import { createSessionAuditFacet } from './drivers/pg/sessionAudit'
 import { createSessionsFacet } from './drivers/pg/sessions'
 import { createSpaceLifecycleFacet } from './drivers/pg/spaceLifecycle'
 import { createSpacesFacet } from './drivers/pg/spaces'
 import { runPgMigrations } from './migrations'
-import { spaceOfRow, type SpaceRow } from './rows'
-import type { GrantMemberToActiveSpaceResult, MetaDb, SpaceRole } from './types'
+import {
+  credentialOfRow,
+  type CredentialRow,
+  providerResourceOfRow,
+  type ProviderResourceRow,
+  spaceOfRow,
+  type SpaceRow,
+} from './rows'
+import type {
+  GrantMemberToActiveSpaceResult,
+  MetaDb,
+  ProviderRetargetInput,
+  ProviderRetargetResult,
+  SpaceRole,
+} from './types'
 
 export class PgMetaDb implements MetaDb {
   private pool: pg.Pool | null = null
@@ -173,6 +204,8 @@ export class PgMetaDb implements MetaDb {
 
   readonly installationGeneration = createInstallationGenerationFacet(this.ctx)
 
+  readonly secretKeyring = createSecretKeyringFacet(this.ctx)
+
   readonly ownerProofs = createOwnerProofsFacet(this.ctx)
 
   readonly spaces = createSpacesFacet(this.ctx)
@@ -224,6 +257,189 @@ export class PgMetaDb implements MetaDb {
     } catch (err) {
       await client.query('ROLLBACK')
       throw err
+    } finally {
+      client.release()
+    }
+  }
+
+  readonly offerProviderAttachment: MetaDb['offerProviderAttachment'] = (record, disclosureOf) =>
+    offerProviderAttachment(this.ctx, record, disclosureOf)
+
+  readonly acceptProviderAttachment: MetaDb['acceptProviderAttachment'] = (input, disclosureOf) =>
+    acceptProviderAttachment(this.ctx, input, disclosureOf)
+
+  readonly detachProviderAttachment: MetaDb['detachProviderAttachment'] = (id) =>
+    detachProviderAttachment(this.ctx, id)
+
+  async retargetProviderCredential(input: ProviderRetargetInput): Promise<ProviderRetargetResult> {
+    await this.ensureInit()
+    const client = await this.required.connect()
+
+    try {
+      await client.query('BEGIN')
+      await lockProviderCredentialRows(client, [input.credentialId])
+      const credentialResult = await client.query('SELECT * FROM credentials WHERE id = $1', [
+        input.credentialId,
+      ])
+      const credentialRow = credentialResult.rows[0] as CredentialRow | undefined
+
+      if (!credentialRow || credentialRow.owner !== input.owner) {
+        await client.query('COMMIT')
+        return { status: 'missing' }
+      }
+      const credential = credentialOfRow(credentialRow)
+
+      if (credential.runtimeEpoch !== input.expectedCredentialRuntimeEpoch) {
+        await client.query('COMMIT')
+        return { status: 'conflict' }
+      }
+      const referenceResult = await client.query(
+        'SELECT * FROM provider_resources WHERE credential_id = $1 ORDER BY id',
+        [input.credentialId],
+      )
+      const referenceIds = (referenceResult.rows as ProviderResourceRow[]).map(({ id }) => id)
+      const requested = new Map(input.resources.map((resource) => [resource.id, resource]))
+
+      if (requested.size !== referenceIds.length || referenceIds.some((id) => !requested.has(id))) {
+        await client.query('COMMIT')
+        return { status: 'references-changed' }
+      }
+      // The credential epoch is the first WRITE in the contour. Any later conflict
+      // rolls the transaction back; writing it after the resource locks would re-enter
+      // L5c from L5r and make the global order self-contradictory.
+      await client.query(
+        `UPDATE credentials SET origin = $2, consent_epoch = consent_epoch + 1,
+           runtime_epoch = runtime_epoch + 1 WHERE id = $1`,
+        [input.credentialId, input.origin],
+      )
+      await lockProviderResourceRows(client, referenceIds)
+      const currentResult = await client.query(
+        'SELECT * FROM provider_resources WHERE id = ANY($1::text[]) ORDER BY id',
+        [referenceIds],
+      )
+      const references = (currentResult.rows as ProviderResourceRow[]).map(providerResourceOfRow)
+
+      if (
+        references.length !== referenceIds.length ||
+        references.some((current) => {
+          const next = requested.get(current.id)
+          return (
+            !next ||
+            current.owner !== input.owner ||
+            current.credentialId !== input.credentialId ||
+            current.runtimeEpoch !== next.expectedRuntimeEpoch
+          )
+        })
+      ) {
+        await client.query('ROLLBACK')
+        return { status: 'conflict' }
+      }
+      for (const current of references) {
+        const next = requested.get(current.id)!
+
+        const injectionHeader =
+          credential.injection.header || DEFAULT_CREDENTIAL_HEADER[credential.kind][current.wire]
+        const credentialConditionalFailure =
+          new URL(next.baseUrl).origin !== input.origin ||
+          Object.hasOwn(current.headers, injectionHeader)
+
+        if (next.detachCredential !== credentialConditionalFailure) {
+          await client.query('ROLLBACK')
+          return { status: 'conflict' }
+        }
+      }
+      const resourceIds = references.map(({ id }) => id)
+      const baseUrls = references.map(({ id }) => requested.get(id)!.baseUrl)
+      const credentialIds = references.map(({ id }) =>
+        requested.get(id)!.detachCredential ? null : input.credentialId,
+      )
+      const updated = await client.query(
+        `UPDATE provider_resources AS resource
+            SET base_url = next.base_url,
+                credential_id = next.credential_id,
+                consent_epoch = resource.consent_epoch + 1,
+                runtime_epoch = resource.runtime_epoch + 1,
+                last_check = '{}'
+           FROM unnest($1::text[], $2::text[], $3::text[])
+                AS next(id, base_url, credential_id)
+          WHERE resource.id = next.id`,
+        [resourceIds, baseUrls, credentialIds],
+      )
+
+      if (updated.rowCount !== references.length) {
+        await client.query('ROLLBACK')
+        return { status: 'conflict' }
+      }
+      await transitionProviderAttachments(client, referenceIds)
+      const storedCredentialResult = await client.query('SELECT * FROM credentials WHERE id = $1', [
+        input.credentialId,
+      ])
+      const storedResourcesResult = await client.query(
+        'SELECT * FROM provider_resources WHERE id = ANY($1::text[]) ORDER BY id',
+        [referenceIds],
+      )
+      await client.query('COMMIT')
+      return {
+        status: 'retargeted',
+        credential: credentialOfRow(storedCredentialResult.rows[0] as CredentialRow),
+        resources: (storedResourcesResult.rows as ProviderResourceRow[]).map(providerResourceOfRow),
+      }
+    } catch (error) {
+      await client.query('ROLLBACK')
+      throw error
+    } finally {
+      client.release()
+    }
+  }
+
+  async removeMemberAndProviderAttachments(spaceId: string, username: string): Promise<void> {
+    await this.ensureInit()
+    const client = await this.required.connect()
+
+    try {
+      await client.query('BEGIN')
+      await lockRevisionKeys(client, 'space', [spaceId])
+      const space = await lockProviderSpaceRow(client, spaceId)
+
+      if (!space.exists) {
+        await client.query('COMMIT')
+        return
+      }
+      await lockProviderMembershipRow(client, spaceId, username)
+      const resourcesResult = await client.query(
+        `SELECT DISTINCT resource.id
+           FROM provider_resources resource
+           JOIN provider_attachments attachment ON attachment.resource_id = resource.id
+          WHERE resource.owner = $1 AND attachment.target_space = $2
+          ORDER BY resource.id`,
+        [username, spaceId],
+      )
+      const resourceIds = (resourcesResult.rows as Array<{ id: string }>).map(({ id }) => id)
+      await lockProviderResourceRows(client, resourceIds)
+      const attachmentsResult = await client.query(
+        `SELECT attachment.id
+           FROM provider_attachments attachment
+           JOIN provider_resources resource ON resource.id = attachment.resource_id
+          WHERE resource.owner = $1 AND attachment.target_space = $2
+          ORDER BY attachment.id`,
+        [username, spaceId],
+      )
+      const attachmentIds = (attachmentsResult.rows as Array<{ id: string }>).map(({ id }) => id)
+      await lockProviderAttachmentRows(client, attachmentIds)
+
+      if (attachmentIds.length > 0) {
+        await client.query('DELETE FROM provider_attachments WHERE id = ANY($1::text[])', [
+          attachmentIds,
+        ])
+      }
+      await client.query('DELETE FROM space_members WHERE space = $1 AND username = $2', [
+        spaceId,
+        username,
+      ])
+      await client.query('COMMIT')
+    } catch (error) {
+      await client.query('ROLLBACK')
+      throw error
     } finally {
       client.release()
     }
@@ -321,8 +537,7 @@ export class PgMetaDb implements MetaDb {
       // It is HELD from here to COMMIT, across L4f and the ability tables below it,
       // and that is what makes `spaces` a table no foreign key may point at: a key
       // would have a tier-4 writer take this same row implicitly, from underneath.
-      // eslint-disable-next-line no-restricted-syntax -- outside the ladder: the space row, which no foreign key may point at (lockOrder: NO_FOREIGN_KEY_MAY_POINT_AT)
-      await client.query('SELECT id FROM spaces WHERE id = $1 FOR UPDATE', [spaceId])
+      await lockProviderSpaceRow(client, spaceId)
       await client.query(
         `INSERT INTO revision_purge_fences (kind, entity_id, space) VALUES ('space', $1, $1)
          ON CONFLICT (kind, entity_id, space) DO NOTHING`,
@@ -377,6 +592,24 @@ export class PgMetaDb implements MetaDb {
       // The forwarding rows of this Space go with the overrides they forward: nothing
       // stands at either end of them any more.
       await client.query('DELETE FROM ability_placement_trail WHERE space_id = $1', [spaceId])
+      // The Space revision stripe taken above blocks late offers. Enter the provider
+      // contour at the attachment level, lock the exact rows, then delete them before
+      // the ordinary space row. Credentials/resources are owner-keyed and survive.
+      const providerAttachmentRows = await client.query(
+        'SELECT id FROM provider_attachments WHERE target_space = $1 ORDER BY id',
+        [spaceId],
+      )
+      await lockProviderAttachmentRows(
+        client,
+        (providerAttachmentRows.rows as Array<{ id: string }>).map((row) => row.id),
+      )
+      const providerAttachmentIds = (providerAttachmentRows.rows as Array<{ id: string }>).map(
+        (row) => row.id,
+      )
+      await client.query(
+        'DELETE FROM provider_attachments WHERE target_space = $1 AND id = ANY($2::text[])',
+        [spaceId, providerAttachmentIds],
+      )
       await client.query('DELETE FROM space_members WHERE space = $1', [spaceId])
       // Job rows only; on-disk artifacts are swept by the runner's TTL GC (this layer owns no filesystem).
       await client.query('DELETE FROM jobs WHERE space = $1', [spaceId])
@@ -442,6 +675,16 @@ export class PgMetaDb implements MetaDb {
   readonly abilityPreferences = createAbilityPreferencesFacet(this.ctx)
 
   readonly abilityPlacement = createAbilityPlacementFacet(this.ctx)
+
+  readonly credentials = createCredentialsFacet(this.ctx)
+
+  readonly providerResources = createProviderResourcesFacet(this.ctx)
+
+  readonly providerAttachments = createProviderAttachmentsFacet(this.ctx)
+
+  readonly providerCallLog = createProviderCallLogFacet(this.ctx)
+
+  readonly providerCiphertexts = createProviderCiphertextsFacet(this.ctx)
 
   readonly retrievalLog = createRetrievalLogFacet(this.ctx)
 

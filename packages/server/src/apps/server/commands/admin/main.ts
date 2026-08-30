@@ -1,7 +1,5 @@
-// Out-of-band admin CLI for locked-out recovery (lost admin password, or the
-// only admin left). Runs directly against the meta-DB, so it works while the
-// server is stopped OR running (SQLite WAL tolerates a second writer; Postgres
-// always does).
+// Out-of-band admin CLI for account recovery and key maintenance. Individual
+// key commands state their stricter operator preconditions.
 // canon: docs/auth.md#access-recovery-admin-cli
 
 import { randomBytes } from 'node:crypto'
@@ -13,6 +11,11 @@ import { parseCommandLine, type ParsedCommandLine } from '../../../../libs/comma
 import { loadEnv } from '../../../../libs/env'
 import { createAuthService } from '../../../../services/auth'
 import type { SpaceRole } from '../../../../services/authz'
+import {
+  CredentialKeyring,
+  credentialKeyringConfigFromEnv,
+  CredentialKeyringService,
+} from '../../../../services/credentialKeyring'
 import {
   InstallationReplayKey,
   ReplayKeyring,
@@ -91,6 +94,9 @@ const main = async (): Promise<void> => {
     'create-admin': ['password', 'random', 'display'],
     grant: [],
     'recover-replay-key': ['expected-key-id', 'apply'],
+    'rotate-credential-key': ['expected-key-id', 'apply'],
+    'purge-unreadable-secrets': ['expected-key-id', 'apply'],
+    'reconcile-credential-keyring': ['expected-key-id', 'apply'],
   }
 
   if (command && !Object.hasOwn(allowedByCommand, command)) {
@@ -120,7 +126,30 @@ const main = async (): Promise<void> => {
   console.error(`meta-db: ${shownUrl}`)
   const metaDb = createMetaDb(metaDbUrl)
   // The service owns hashing + session-kill semantics; the CLI just drives it.
-  const auth = createAuthService({ mode: AUTH_MODE.password, persistence: metaDb.auth })
+  const auth = createAuthService({
+    mode: AUTH_MODE.password,
+    persistence: metaDb.auth,
+    removeMemberAndProviderAttachments: (space, username) =>
+      metaDb.removeMemberAndProviderAttachments(space, username),
+  })
+
+  const credentialRecovery = (): CredentialKeyringService => {
+    const paths = dataPathsFromEnv(process.env)
+    const replay = replayKeyringConfigFromEnv(paths.dataDir, metaDbUrl, process.env)
+    const config = credentialKeyringConfigFromEnv(
+      {
+        dataDir: paths.dataDir,
+        metaDbUrl,
+        packedRoots: [paths.defaultSpacesRoot, paths.jobsDataDir, replay.path],
+      },
+      process.env,
+    )
+    return new CredentialKeyringService({
+      persistence: metaDb.secretKeyring,
+      keyring: new CredentialKeyring(config.path, config.packedRoots),
+      ciphertexts: metaDb.providerCiphertexts,
+    })
+  }
 
   try {
     switch (command) {
@@ -249,6 +278,105 @@ const main = async (): Promise<void> => {
         break
       }
 
+      case 'reconcile-credential-keyring': {
+        if (rest.length > 0) {
+          die(
+            'usage: reconcile-credential-keyring --expected-key-id <database-active-id> [--apply]',
+          )
+        }
+        const expectedKeyId =
+          parsed.value('expected-key-id') ??
+          die(
+            'usage: reconcile-credential-keyring --expected-key-id <database-active-id> [--apply]',
+          )
+        const result = await credentialRecovery()
+          .reconcileHistorical({ expectedKeyId, apply: parsed.has('apply') })
+          .catch((err) => die((err as Error).message))
+
+        if (result.applied) {
+          console.log(`✓ credential keyring pointer reconciled to ${result.active.keyId}`)
+        } else {
+          console.log(
+            `dry-run: database-active credential key ${result.active.keyId} at generation ${result.active.generation} is readable`,
+          )
+          console.log(
+            'stop every serving process, recheck the snapshot pair, then repeat with --apply',
+          )
+        }
+        break
+      }
+
+      case 'rotate-credential-key': {
+        if (rest.length > 0) {
+          die('usage: rotate-credential-key --expected-key-id <active-id> [--apply]')
+        }
+        const expectedKeyId =
+          parsed.value('expected-key-id') ??
+          die('usage: rotate-credential-key --expected-key-id <active-id> [--apply]')
+        const result = await credentialRecovery()
+          .rotate({ expectedKeyId, apply: parsed.has('apply') })
+          .catch((err) => die((err as Error).message))
+
+        if (!result.applied) {
+          console.log(
+            `dry-run: credential key ${result.activeKeyId}; ${result.references.credentials} credential and ${result.references.headers} header references will be rewrapped`,
+          )
+          console.log(
+            'stop every serving process, recheck the active key id, then repeat with --apply',
+          )
+        } else {
+          console.log(
+            `✓ credential key rotated to ${result.activeKeyId}; rewrapped ${result.rewrapped.credentials} credentials and ${result.rewrapped.headers} headers`,
+          )
+          console.log(`  retired keys: ${result.retiredKeyIds.join(', ') || 'none'}`)
+          console.log(
+            '  immutable retired key files remain in secret-keyring for historical backups; do not delete files still covered by backup retention',
+          )
+        }
+        break
+      }
+
+      case 'purge-unreadable-secrets': {
+        if (rest.length > 0) {
+          die('usage: purge-unreadable-secrets --expected-key-id <database-active-id> [--apply]')
+        }
+        const expectedKeyId =
+          parsed.value('expected-key-id') ??
+          die('usage: purge-unreadable-secrets --expected-key-id <database-active-id> [--apply]')
+        const result = await credentialRecovery()
+          .purgeUnreadable({ expectedKeyId, apply: parsed.has('apply') })
+          .catch((err) => die((err as Error).message))
+
+        if (!result.plan.affected.length) {
+          console.log('(no unreadable credential or header rows)')
+        }
+        for (const impact of result.plan.affected) {
+          console.log(
+            [
+              impact.kind,
+              impact.owner,
+              impact.recordId,
+              impact.disabledResourceIds.length
+                ? `disabled resources: ${impact.disabledResourceIds.join(',')}`
+                : 'disabled resources: none',
+            ].join('\t'),
+          )
+        }
+        if (result.applied) {
+          console.log(
+            `✓ unreadable provider secrets purged; credential key ${result.previousKeyId} replaced by ${result.activeKeyId}`,
+          )
+        } else {
+          console.log(
+            `dry-run: complete loss of credential key ${result.previousKeyId} confirmed; no rows changed`,
+          )
+          console.log(
+            'stop every serving process, review the affected owners, then repeat with --apply',
+          )
+        }
+        break
+      }
+
       default:
         console.log(
           [
@@ -259,6 +387,12 @@ const main = async (): Promise<void> => {
             '  create-admin <username> [...]             create an admin (locked-out recovery)',
             '  grant <username> <space> <role>           set space membership',
             '  recover-replay-key --expected-key-id ID   dry-run shared-keyring recovery',
+            '  rotate-credential-key --expected-key-id ID',
+            '                                             dry-run credential-key rotation',
+            '  reconcile-credential-keyring --expected-key-id ID',
+            '                                             dry-run historical-keyring reconcile',
+            '  purge-unreadable-secrets --expected-key-id ID',
+            '                                             dry-run lost-secret purge',
             '',
             `meta-db: ${shownUrl}`,
           ].join('\n'),

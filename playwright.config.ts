@@ -25,6 +25,7 @@ const AUTH_SPECS = [
   '**/e2e/space-create.spec.ts',
   '**/e2e/space-rename.spec.ts',
 ]
+const PROVIDER_SPECS = ['**/e2e/providers.spec.ts', '**/visual/providers.spec.ts']
 const REAL_STACK_SPECS = '**/e2e-real/**'
 
 const PORT = Number(process.env.E2E_PORT || 8788)
@@ -33,6 +34,7 @@ const PORT = Number(process.env.E2E_PORT || 8788)
 // authenticates), so password-mode journeys need a second instance booted
 // from an auth-enabled fixture.
 const AUTH_PORT = PORT + 1
+const PROVIDERS_PORT = PORT + 2
 
 export default defineConfig({
   testDir: 'test',
@@ -60,7 +62,7 @@ export default defineConfig({
       use: { ...devices['Desktop Chrome'] },
       // Project-level filters replace the top-level filter, so repeat the
       // production-stack fence beside the auth split.
-      testIgnore: [...AUTH_SPECS, REAL_STACK_SPECS],
+      testIgnore: [...AUTH_SPECS, ...PROVIDER_SPECS, REAL_STACK_SPECS],
     },
     // Password-mode journeys (#10/#13) against the auth-booted fake (AUTH_PORT):
     // the login gate + the personal layer (a signed-in user's profile/memory).
@@ -68,6 +70,11 @@ export default defineConfig({
       name: 'chromium-auth',
       use: { ...devices['Desktop Chrome'], baseURL: `http://localhost:${AUTH_PORT}` },
       testMatch: AUTH_SPECS,
+    },
+    {
+      name: 'chromium-providers',
+      use: { ...devices['Desktop Chrome'], baseURL: `http://localhost:${PROVIDERS_PORT}` },
+      testMatch: PROVIDER_SPECS,
     },
   ],
   webServer: [
@@ -87,6 +94,12 @@ export default defineConfig({
       // dist to exist (the fake serves it as static) and boots the auth world.
       command: `until [ -f packages/web/dist/index.html ]; do sleep 1; done; PORT=${AUTH_PORT} FIXTURE=test/fixtures/auth.json npx tsx test/fake-server/main.ts`,
       url: `http://localhost:${AUTH_PORT}/api/health`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+    },
+    {
+      command: `until [ -f packages/web/dist/index.html ]; do sleep 1; done; PORT=${PROVIDERS_PORT} FIXTURE=test/fixtures/providers.json npx tsx test/fake-server/main.ts`,
+      url: `http://localhost:${PROVIDERS_PORT}/api/health`,
       reuseExistingServer: !process.env.CI,
       timeout: 120_000,
     },

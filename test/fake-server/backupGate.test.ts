@@ -1,4 +1,5 @@
 import type { FastifyInstance } from 'fastify'
+import { createServer, type Server } from 'node:http'
 import net from 'node:net'
 import { afterEach, describe, expect, it } from 'vitest'
 
@@ -18,6 +19,17 @@ const fixture = (): Fixture => ({
   spaces: [{ slug: 'w', displayName: 'W', notes: [] }],
 })
 
+const providerFixture = (port: number): Fixture => ({
+  ...fixture(),
+  capabilities: { providers: true },
+  providerPrivateOrigins: [`http://provider.test:${port}`],
+  providerRuntime: { transport: { lookup: async () => [{ address: '127.0.0.1', family: 4 }] } },
+  auth: {
+    users: [{ username: 'alice', password: 'alice-password-1', admin: true }],
+    members: [{ space: 'w', username: 'alice', role: 'owner' }],
+  },
+})
+
 const connectPost = async (app: FastifyInstance, path: string): Promise<net.Socket> => {
   const address = app.server.address()
   const port = typeof address === 'object' && address ? address.port : 0
@@ -35,12 +47,94 @@ const connectPost = async (app: FastifyInstance, path: string): Promise<net.Sock
 }
 
 let app: FastifyInstance
+const providers: Server[] = []
 
 afterEach(async () => {
   await app.close()
+  for (const server of providers.splice(0)) {
+    server.closeAllConnections()
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
 })
 
 describe('online-backup HTTP mutation lifecycle', () => {
+  it('exempts the real long provider route in both gate hooks, and nothing beside it', async () => {
+    const gate = createMutationGate()
+    const providerReached = deferred()
+    const providerRelease = deferred()
+    const mutationStarted = deferred()
+    const mutationDone = deferred()
+    const provider = createServer(async (_request, response) => {
+      providerReached.resolve()
+      await providerRelease.promise
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ choices: [{ message: { content: 'ok' } }] }))
+    })
+    providers.push(provider)
+    await new Promise<void>((resolve) => provider.listen(0, '127.0.0.1', resolve))
+    const port = (provider.address() as net.AddressInfo).port
+    app = await createApp(providerFixture(port), { mutationGate: gate })
+    // A stand-in only for the HELD side: `POST` on a resource id is not a real
+    // route, and the point is that the exemption is a per-route list rather than a
+    // prefix over the provider family.
+    app.post('/api/providers/resources/:id', { config: { authz: { public: true } } }, async () => {
+      mutationStarted.resolve()
+      await mutationDone.promise
+      return { ok: true }
+    })
+    const login = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      payload: { username: 'alice', password: 'alice-password-1' },
+    })
+    const cookie = (login.headers['set-cookie'] as string).split(';')[0]
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/providers/resources',
+      headers: { cookie },
+      payload: {
+        name: 'Local runtime',
+        wire: 'openai-compatible',
+        baseUrl: `http://provider.test:${port}/api/v1`,
+        allowPrivateNetwork: true,
+        purposes: ['chat'],
+        models: [{ name: 'local/model', dimensions: null, status: 'available' }],
+      },
+    })
+    expect(created.statusCode).toBe(200)
+    const id = created.json().resource.id as string
+
+    const validating = app.inject({
+      method: 'POST',
+      url: `/api/providers/resources/${id}/validate?purpose=chat`,
+      headers: { cookie },
+      payload: { purpose: 'chat' },
+    })
+    await providerReached.promise
+    // The provider is still thinking, and a checkpoint sails through: this is the
+    // whole point of the exemption — a 120 s local call must not freeze every
+    // mutation on the instance, nor make `make backup` fail as if it were broken.
+    await expect(gate.checkpoint(async () => {})).resolves.toBeUndefined()
+    providerRelease.resolve()
+    await expect(validating).resolves.toMatchObject({ statusCode: 200 })
+
+    const mutating = app.inject({
+      method: 'POST',
+      url: `/api/providers/resources/${id}`,
+    })
+    await mutationStarted.promise
+    let checkpointRan = false
+    const checkpoint = gate.checkpoint(async () => {
+      checkpointRan = true
+    })
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    expect(checkpointRan).toBe(false)
+    mutationDone.resolve()
+    await checkpoint
+    await mutating
+    expect(checkpointRan).toBe(true)
+  })
+
   it('holds the gate until an aborted request handler actually settles', async () => {
     const gate = createMutationGate()
     const handlerStarted = deferred()

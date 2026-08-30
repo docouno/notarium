@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { CREDENTIAL_KEYRING_STATUS } from '../../consts/providers'
 import { META_DB, SEARCH_MODE } from '../../consts/spaces'
 import { enumValues } from '../../libs/enumValues'
 import { IsoTimestampSchema, SpaceSlugSchema } from '../primitives'
@@ -19,6 +20,9 @@ export const ConfigSchema = z.object({
      *  namespaces; an operator-static host leaves it false so the create UI
      *  hides honestly. */
     spaceCreate: z.boolean(),
+    /** Is the model-provider subsystem enabled for this deployment? Stable for
+     *  ordinary users so provider settings can hide honestly. */
+    providers: z.boolean(),
   }),
 })
 
@@ -61,6 +65,10 @@ export const HostAboutResponseSchema = z.object({
       /** The wired embedder, or null on an FTS-only host. */
       embedder: z.object({ id: z.string(), dimensions: z.number() }).nullable(),
       authMode: AuthModeSchema,
+      /** Present only when the subsystem is enabled; absence is the off signal
+       *  on this admin-only diagnostics tier. */
+      providers: z.boolean().optional(),
+      credentialKeyring: z.enum(enumValues(CREDENTIAL_KEYRING_STATUS)).optional(),
       spaceCreate: z.boolean(),
       metaDb: MetaDbSchema,
       uptimeSeconds: z.number(),

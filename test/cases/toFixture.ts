@@ -550,9 +550,10 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
     }
   }
 
-  // NB `SpaceDecl.archived` (#110) is NOT projected: the fake's SpaceFixture has no
-  // archived field, so an archived space seeds LIVE here — space-archive is a real-stand
-  // concern (the real applier calls manager.archive), verified live. See docs/seeds.md.
+  // Archive is projected too: provider resolution must retain an accepted row and
+  // name `space-archived`, which cannot be proven by a fixture that silently serves
+  // the target as live. createApp applies the real SpaceManager lifecycle after all
+  // declarations have been seeded, matching the real applier's ordering.
   const spaces: SpaceFixture[] = world.spaces.map((s) => {
     const live: NoteSnapshot[] = [...notes.values()]
       .filter((n) => n.space === s.slug && !n.deleted)
@@ -577,6 +578,7 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
       slug: s.slug,
       displayName: s.displayName,
       aliases: s.aliases,
+      archived: s.archived,
       notes: live,
       fieldSchema: s.fieldSchema,
       fieldSchemaRaw: s.fieldSchemaRaw,
@@ -609,6 +611,7 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
           password: u.password,
           displayName: u.displayName,
           admin: u.admin,
+          disabled: u.disabled,
           personalSpace: u.personalSpace ?? personalSpaceByUser.get(u.username),
         })),
         members: world.auth.members,
@@ -658,6 +661,13 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
     spaces,
     projects,
     auth,
+    ...(world.providers
+      ? {
+          capabilities: { providers: world.providers.enabled },
+          providers: world.providers,
+          providerPrivateOrigins: world.providers.privateOrigins,
+        }
+      : {}),
     agentSessions,
     agentRoles: world.agentRoles,
     agentSkills: world.agentSkills,

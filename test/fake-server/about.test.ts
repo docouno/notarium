@@ -8,7 +8,7 @@
 import type { FastifyInstance } from 'fastify'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
-import { HostAboutResponseSchema } from '@notarium/contract'
+import { ConfigSchema, HostAboutResponseSchema } from '@notarium/contract'
 
 import { createApp, type Fixture } from './app.js'
 
@@ -50,6 +50,11 @@ const loginCookie = async (username: string, password: string): Promise<string> 
 const about = async (headers: Record<string, string> = {}) => {
   const res = await app.inject({ method: 'GET', url: '/api/about', headers })
   return { res, body: () => HostAboutResponseSchema.parse(res.json()) }
+}
+
+const config = async (headers: Record<string, string> = {}) => {
+  const res = await app.inject({ method: 'GET', url: '/api/config', headers })
+  return { res, body: () => ConfigSchema.parse(res.json()) }
 }
 
 describe('/api/about', () => {
@@ -103,6 +108,24 @@ describe('/api/about', () => {
       expect(a.admin?.uptimeSeconds).toBeGreaterThanOrEqual(0)
       expect(a.admin?.spaces.map((s) => s.slug).sort()).toEqual(['main', 'work'])
       expect(a.admin?.spaces.every((s) => s.engine === 'notarium')).toBe(true)
+      expect(a.admin).not.toHaveProperty('providers')
+      expect((await config()).body().capabilities.providers).toBe(false)
+    })
+
+    it('publishes an enabled subsystem to both host readers', async () => {
+      await app.close()
+      app = await createApp({ ...noneFixture(), capabilities: { providers: true } })
+
+      expect((await about()).body().admin?.providers).toBe(true)
+      expect((await config()).body().capabilities.providers).toBe(true)
+    })
+
+    it('keeps the config shape honest on a bare buildApp without HostInfo', async () => {
+      await app.close()
+      app = await createApp(noneFixture(), { omitAbout: true })
+
+      expect((await config()).body().capabilities.providers).toBe(false)
+      expect((await about()).body().admin).not.toHaveProperty('providers')
     })
 
     it('admin spaces reflect a space minted at runtime (live list, not a boot snapshot)', async () => {
@@ -144,6 +167,15 @@ describe('/api/about', () => {
       expect(a.admin).toBeNull()
       expect(typeof a.build.version).toBe('string') // base info still flows
       expect(a.search.mode).toBe('fts')
+    })
+
+    it('exposes the user capability without leaking the admin block', async () => {
+      await app.close()
+      app = await createApp({ ...passwordFixture(), capabilities: { providers: true } })
+      const cookie = await loginCookie('bob', 'bob-password-1')
+
+      expect((await config({ cookie })).body().capabilities.providers).toBe(true)
+      expect((await about({ cookie })).body().admin).toBeNull()
     })
   })
 })

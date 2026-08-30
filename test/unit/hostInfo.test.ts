@@ -4,6 +4,8 @@
 
 import { describe, expect, it } from 'vitest'
 
+import type { CredentialKeyringStatus } from '@notarium/contract'
+
 import { hostInfoFrom } from '../../packages/server/src/libs/hostInfo'
 
 describe('hostInfoFrom (#97)', () => {
@@ -15,6 +17,24 @@ describe('hostInfoFrom (#97)', () => {
       embedderDims: null,
       graphBoost: false,
     })
+    expect(h.deployment.providers).toBe(false)
+  })
+
+  it('publishes the explicit provider-subsystem capability', () => {
+    const credentialKeyring: { status: CredentialKeyringStatus } = { status: 'ready' }
+    const input = {
+      authMode: 'none' as const,
+      metaDbFlavour: 'none' as const,
+      spaces: [],
+      providers: true,
+      credentialKeyring,
+    }
+
+    const host = hostInfoFrom(input)
+    expect(host.deployment.providers).toBe(true)
+    expect(host.deployment.credentialKeyring).toBe(credentialKeyring)
+    credentialKeyring.status = 'unreadable'
+    expect(host.deployment.credentialKeyring?.status).toBe('unreadable')
   })
 
   it('reports the wired embedder and engages the graph channel by default', () => {

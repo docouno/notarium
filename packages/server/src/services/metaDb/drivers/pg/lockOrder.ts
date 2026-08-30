@@ -19,13 +19,15 @@ import type { PoolClient } from 'pg'
 //   L2d  `context_scope_pins` → L2e per-scope order advisory → L2f `context_order`
 //   L3m  wide-scan mutex → L3s/L3n/L3b space/note/blob stripes → L3t revision tables
 //   L4f  `folders` → L4a `ability_availability`/`ability_project_bindings` →
-//   L4p  `ability_preferences`
+//   L4p  `ability_preferences` → L5k `secret_keyring` →
+//   L5c `credentials` → L5r `provider_resources` → L5a `provider_attachments` →
+//   L5g `provider_call_log`
 //
-// Tier 4 is last because the two transactions that span it end there: a whole-space
-// purge drops the registry after the revision tier, and an availability write reads
-// the project rows it is about to bind BEFORE it writes the binding. Both directions
-// are one order only when `folders` outranks the ability tables — the other way round
-// is a cycle, and Postgres resolves cycles with `40P01`.
+// Tier 4 closes the note/ability contour. L5k begins the provider contour with its
+// instance-global active-key fence; later provider tables append below it. Within
+// tier 4 a whole-space purge and an availability write are one order only when
+// `folders` outranks the ability tables — the other way round is a cycle, and
+// Postgres resolves cycles with `40P01`.
 //
 // Postgres cannot enforce an ordering, so the enforcement is ours and it is in two
 // halves, both required: ESLint keeps every tiered lock inside this module (a lock
@@ -61,6 +63,11 @@ export const LOCK_LEVELS = [
   'L4f',
   'L4a',
   'L4p',
+  'L5k',
+  'L5c',
+  'L5r',
+  'L5a',
+  'L5g',
 ] as const
 
 export type LockLevel = (typeof LOCK_LEVELS)[number]
@@ -90,6 +97,11 @@ export const LOCK_LEVEL_OF_TABLE: Readonly<Record<string, LockLevel>> = {
   // still lands where the package is. Written and read under the same advisory, by the
   // same two transactions, so it is the same level — not a level of its own.
   ability_placement_trail: 'L4p',
+  secret_keyring: 'L5k',
+  credentials: 'L5c',
+  provider_resources: 'L5r',
+  provider_attachments: 'L5a',
+  provider_call_log: 'L5g',
 }
 
 /** Tables no FOREIGN KEY may point at, and the reason the ladder cannot survive one.
@@ -153,6 +165,7 @@ export const LEVELS_NO_STATEMENT_CAN_ENTER: readonly LockLevel[] = [
   'L3n',
   'L3b',
   'L4p',
+  'L5k',
 ]
 
 /** What a helper hands back about the lock it just took: the level it entered, the
@@ -218,6 +231,173 @@ const takeScopeAdvisoryLocks = async (
   for (const key of keys) {
     await client.query('SELECT pg_advisory_xact_lock($1, $2)', [namespace, key])
   }
+}
+
+const SECRET_KEYRING_LOCK_NS = 0x7365_634b // 'secK'
+
+/** The common provider/Space fence. These rows are deliberately outside the tier
+ * ladder: `spaces` cannot be an FK parent of provider rows, and membership must be
+ * held before entering L5 so offer and removeMember cannot pass each other. Every
+ * provider lifecycle transaction takes them in this exact order: Space, member,
+ * credential, resource, attachment. */
+export const lockProviderSpaceRow = async (
+  client: PoolClient,
+  space: string,
+): Promise<{ exists: boolean; archivedAt: string | null; phase: string | null }> => {
+  const result = await client.query(
+    `SELECT spaces.id, spaces.archived_at, space_lifecycle.phase
+       FROM spaces
+       LEFT JOIN space_lifecycle ON space_lifecycle.space = spaces.id
+      WHERE spaces.id = $1
+      FOR UPDATE OF spaces`,
+    [space],
+  )
+  const row = result.rows[0] as
+    { id: string; archived_at: string | null; phase: string | null } | undefined
+
+  return { exists: Boolean(row), archivedAt: row?.archived_at ?? null, phase: row?.phase ?? null }
+}
+
+export const lockProviderMembershipRows = async (
+  client: PoolClient,
+  space: string,
+  usernames: readonly string[],
+): Promise<ReadonlySet<string>> => {
+  const keys = [...new Set(usernames.filter((username) => username !== '@system'))].sort()
+
+  if (!keys.length) {
+    return new Set()
+  }
+  const result = await client.query(
+    `SELECT username FROM space_members
+      WHERE space = $1 AND username = ANY($2::text[])
+      ORDER BY username FOR UPDATE`,
+    [space, keys],
+  )
+
+  return new Set((result.rows as Array<{ username: string }>).map(({ username }) => username))
+}
+
+export const lockProviderMembershipRow = async (
+  client: PoolClient,
+  space: string,
+  username: string,
+): Promise<boolean> =>
+  username === '@system' ||
+  (await lockProviderMembershipRows(client, space, [username])).has(username)
+
+/** L5k — the instance-global active-key fence. The advisory covers the empty-table
+ *  bootstrap case; row locks then keep every existing generation stable until commit. */
+export const lockSecretKeyring = async (
+  client: PoolClient,
+): Promise<{ lock: LockHold; rows: Array<{ key_id: string }> }> => {
+  await client.query('SELECT pg_advisory_xact_lock($1, $2)', [SECRET_KEYRING_LOCK_NS, 0])
+  const result = await client.query(
+    'SELECT * FROM secret_keyring WHERE retired_at IS NULL ORDER BY generation FOR UPDATE',
+  )
+
+  return {
+    lock: hold('L5k', ['credential-keyring'], ['credential-keyring'], 'range'),
+    rows: result.rows as Array<{ key_id: string }>,
+  }
+}
+
+const lockProviderRows = async (
+  client: PoolClient,
+  table: 'credentials' | 'provider_resources' | 'provider_attachments',
+  ids: readonly string[],
+): Promise<{ keys: string[]; rows: Array<{ id: string }> }> => {
+  const keys = [...new Set(ids)].sort()
+
+  if (!keys.length) {
+    return { keys, rows: [] }
+  }
+  const result = await client.query(
+    `SELECT id FROM ${table} WHERE id = ANY($1::text[]) ORDER BY id FOR UPDATE`,
+    [keys],
+  )
+  const rows = result.rows as Array<{ id: string }>
+
+  return { keys, rows }
+}
+
+/** Provider contour locks. Each returns a LockHold so the live order observer sees
+ * the entry; missing ids remain declared-but-unheld and their INSERT is ordered. */
+export const lockProviderCredentialRows = async (client: PoolClient, ids: readonly string[]) => {
+  const { keys, rows } = await lockProviderRows(client, 'credentials', ids)
+  return {
+    lock: hold(
+      'L5c',
+      keys,
+      rows.map((row) => row.id),
+    ),
+    rows,
+  }
+}
+
+export const lockProviderResourceRows = async (client: PoolClient, ids: readonly string[]) => {
+  const { keys, rows } = await lockProviderRows(client, 'provider_resources', ids)
+  return {
+    lock: hold(
+      'L5r',
+      keys,
+      rows.map((row) => row.id),
+    ),
+    rows,
+  }
+}
+
+export const lockProviderAttachmentRows = async (client: PoolClient, ids: readonly string[]) => {
+  const { keys, rows } = await lockProviderRows(client, 'provider_attachments', ids)
+  return {
+    lock: hold(
+      'L5a',
+      keys,
+      rows.map((row) => row.id),
+    ),
+    rows,
+  }
+}
+
+const PROVIDER_CALL_LOG_LOCK_NS = 0x7063_614c // 'pcaL'
+
+/** L5g — the journal tail, and the one provider level whose key is not a row id.
+ *  An interactive intent inserts an id nobody else can name, so the statement is its
+ *  own lock and the helper only declares the key rule 3 orders. A durable job call is
+ *  different: two re-claims of the SAME logical call have no row to meet on until one
+ *  of them has inserted, and under READ COMMITTED they would both read "no attempt
+ *  yet" and both send. The advisory is where they meet instead. */
+export const lockProviderCallLogEntry = async (
+  client: PoolClient,
+  entry: { id: string; job: { jobId: string; jobCallKey: string } | null },
+): Promise<{ lock: LockHold }> => {
+  if (!entry.job) {
+    return { lock: hold('L5g', [entry.id], []) }
+  }
+  const key = `${entry.job.jobId}\u0000${entry.job.jobCallKey}`
+  await client.query('SELECT pg_advisory_xact_lock($1, $2)', [
+    PROVIDER_CALL_LOG_LOCK_NS,
+    hash32(key),
+  ])
+
+  return { lock: hold('L5g', [key], [key], 'range') }
+}
+
+/** Full-carrier recovery/rotation scans cannot discover their row ids before they
+ * exclude inserts. Table locks make the scanned set stable; ordinary writers still
+ * enter by their exact row helpers in the same provider-level order. */
+export const lockProviderCredentialRange = async (
+  client: PoolClient,
+): Promise<{ lock: LockHold }> => {
+  await client.query('LOCK TABLE credentials IN SHARE ROW EXCLUSIVE MODE')
+  return { lock: hold('L5c', [], [], 'range') }
+}
+
+export const lockProviderResourceRange = async (
+  client: PoolClient,
+): Promise<{ lock: LockHold }> => {
+  await client.query('LOCK TABLE provider_resources IN SHARE ROW EXCLUSIVE MODE')
+  return { lock: hold('L5r', [], [], 'range') }
 }
 
 // ── L0j · per-job import fence ───────────────────────────────────────────────

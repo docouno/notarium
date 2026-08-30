@@ -34,6 +34,17 @@ export const createSpacesFacet = (ctx: PgDriverCtx): SpacesPersistence => ({
     const r = res.rows[0] as SpaceRow | undefined
     return r ? spaceOfRow(r) : null
   },
+  getMany: async (ids) => {
+    if (ids.length === 0) {
+      return []
+    }
+    await ctx.ensureInit()
+    const result = await ctx.required.query(
+      'SELECT * FROM spaces WHERE id = ANY($1::text[]) ORDER BY id',
+      [[...new Set(ids)]],
+    )
+    return (result.rows as SpaceRow[]).map(spaceOfRow)
+  },
   getBySlug: async (slug: string) => {
     await ctx.ensureInit()
     const res = await ctx.required.query('SELECT * FROM spaces WHERE slug = $1', [slug])

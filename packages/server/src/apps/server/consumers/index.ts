@@ -1,12 +1,17 @@
 // Durable job layer barrel: a meta-DB-backed queue worker (jobRunner) + per-kind handlers.
 // canon: docs/jobs.md#durable-job-layer-105
 
-export { createJobRunner, JobAbortedError, TerminalJobError } from './jobRunner'
+export { createJobRunner, JobAbortedError, JobRetryError, TerminalJobError } from './jobRunner'
 export type { JobContext, JobHandler, JobResult, JobRunner, JobRunnerOptions } from './jobRunner'
 export { createExportHandler } from './exportJob'
 export type { ExportHandlerDeps, ExportParams } from './exportJob'
 export { createImportHandler } from './importJob'
 export type { ImportHandlerDeps, ImportParams } from './importJob'
+export {
+  type ProviderJobCallInput,
+  type ProviderJobRegistry,
+  runProviderJobCall,
+} from './providerJob'
 export { jobToWire } from './wire'
 export { ARTIFACT_TTL_MS } from './jobRunner'
 

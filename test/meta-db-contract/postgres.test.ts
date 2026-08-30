@@ -22,7 +22,11 @@ import { describeImportReservationsContract } from './importReservationsContract
 import { describeJobsContract } from './jobsContract'
 import { describeLegacyNameAliasesContract } from './legacyNameAliasesContract'
 import { createPostgresTestSchema, describePostgres } from './postgresHarness'
+import { describeProviderCallLogContract } from './providerCallLogContract'
+import { describeProviderCiphertextsContract } from './providerCiphertextsContract'
+import { describeProviderFacetsContract } from './providerFacetsContract'
 import { describeRevisionPersistenceContract } from './revisionPersistenceContract'
+import { describeSecretKeyringContract } from './secretKeyringContract'
 import { describeSessionAuditContract } from './sessionAuditContract'
 import { describeSpaceLifecycleWriterContract } from './spaceLifecycleWriterContract'
 
@@ -211,6 +215,51 @@ const directAppendWithoutApplicationLocks = async (
 }
 
 describePostgres('live Postgres driver', SUITE, () => {
+  describeSecretKeyringContract('Postgres', async () => {
+    const testSchema = await createPostgresTestSchema('secret_keyring')
+    return { persistence: testSchema.db.secretKeyring, teardown: testSchema.teardown }
+  })
+
+  describeProviderFacetsContract('Postgres', async () => {
+    const testSchema = await createPostgresTestSchema('providers_contract')
+    return {
+      secretKeyring: testSchema.db.secretKeyring,
+      credentials: testSchema.db.credentials,
+      resources: testSchema.db.providerResources,
+      attachments: testSchema.db.providerAttachments,
+      lifecycle: testSchema.db,
+      ciphertexts: testSchema.db.providerCiphertexts,
+      spaces: testSchema.db.spaces,
+      auth: testSchema.db.auth,
+      retargetProviderCredential: (input) => testSchema.db.retargetProviderCredential(input),
+      removeMemberAndProviderAttachments: (space, username) =>
+        testSchema.db.removeMemberAndProviderAttachments(space, username),
+      purgeSpace: (space: string) => testSchema.db.purgeSpace(space),
+      teardown: () => testSchema.teardown(),
+    }
+  })
+
+  describeProviderCallLogContract('Postgres', async () => {
+    const testSchema = await createPostgresTestSchema('provider_call_log')
+    return {
+      callLog: testSchema.db.providerCallLog,
+      jobs: testSchema.db.jobs,
+      purgeSpace: (space: string) => testSchema.db.purgeSpace(space),
+      teardown: () => testSchema.teardown(),
+    }
+  })
+
+  describeProviderCiphertextsContract('Postgres', async () => {
+    const testSchema = await createPostgresTestSchema('provider_ciphertexts')
+    return {
+      secretKeyring: testSchema.db.secretKeyring,
+      credentials: testSchema.db.credentials,
+      resources: testSchema.db.providerResources,
+      ciphertexts: testSchema.db.providerCiphertexts,
+      teardown: testSchema.teardown,
+    }
+  })
+
   describeAbilityPreferencesContract('Postgres', async () => {
     const testSchema = await createPostgresTestSchema('ability_preferences')
     return { db: testSchema.db, teardown: testSchema.teardown }

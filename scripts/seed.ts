@@ -25,6 +25,8 @@
 
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve as resolvePath, sep } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
+import { Client } from 'pg'
 
 import {
   AGENT_MEMORY_MOUNT,
@@ -52,6 +54,9 @@ import {
   createMarkerStore,
   createMetaDb,
   createRolesService,
+  CredentialKeyring,
+  credentialKeyringConfigFromEnv,
+  CredentialKeyringService,
   dataPathsFromEnv,
   describeMetaDbUrl,
   DurableAbilityCreator,
@@ -62,10 +67,16 @@ import {
   loadBundledAbilityInventory,
   localFsAnchoredFiles,
   markFolderAsProject,
+  META_DB_TARGET_KIND,
+  metaDbTargetOf,
   mintOAuthAccessToken,
   mintOAuthRefreshToken,
   ownedRoleLocator,
+  type ProviderAttachmentRecord,
+  ProviderRegistry,
+  type ProviderResourceRecord,
   renameProjectSlug,
+  replayKeyringConfigFromEnv,
   roleContextTargetOf,
   sha256,
   SpaceManager,
@@ -78,6 +89,7 @@ import type { AgentRoleTargetDecl, CaseWorld, ContextSetAttachDecl, UserDecl } f
 import { applyAgentAbilityPreferences } from '../test/cases/applyAbilityPreferences'
 import { applyAgentRoleDeclarations } from '../test/cases/applyAgentRoles'
 import { applyAgentSkillDeclarations } from '../test/cases/applyAgentSkills'
+import { applyProviderSeed } from '../test/cases/applyProviders'
 import { normDate } from '../test/cases/generators'
 import { personalSpaceForPlacement } from '../test/cases/personalSpaceSeam'
 import { resolveAvailabilityDecl } from '../test/cases/resolveAvailability'
@@ -163,6 +175,95 @@ const routeOf = (path: string, cls: string | undefined): MountRoute => {
   return { directory: dirOf(path), fileName: base(path) }
 }
 
+type ProviderSeedOverrides = {
+  resources: ProviderResourceRecord[]
+  attachments: ProviderAttachmentRecord[]
+}
+
+/** Apply only the two states product writes intentionally refuse: a credential
+ * origin mismatch / unreadable header carrier, and a near-expiry pending row.
+ * The normal rows were already written through ProviderRegistry + production
+ * persistence. Both durable drivers get the same exact final record. */
+const applyProviderSeedOverrides = async (
+  metaDbUrl: string,
+  overrides: ProviderSeedOverrides,
+): Promise<void> => {
+  if (!overrides.resources.length && !overrides.attachments.length) {
+    return
+  }
+  const target = metaDbTargetOf(metaDbUrl)
+
+  if (target.kind === META_DB_TARGET_KIND.memory) {
+    throw new Error('provider seed corrupt states require a durable meta-DB')
+  }
+  if (target.kind === META_DB_TARGET_KIND.file) {
+    const db = new DatabaseSync(target.path)
+
+    try {
+      db.exec('BEGIN IMMEDIATE')
+      const resource = db.prepare(
+        'UPDATE provider_resources SET base_url = ?, headers = ? WHERE id = ?',
+      )
+      const attachment = db.prepare('UPDATE provider_attachments SET expires_at = ? WHERE id = ?')
+
+      for (const record of overrides.resources) {
+        const result = resource.run(record.baseUrl, JSON.stringify(record.headers), record.id)
+
+        if (result.changes !== 1) {
+          throw new Error(`provider seed resource override missed ${record.id}`)
+        }
+      }
+      for (const record of overrides.attachments) {
+        const result = attachment.run(record.expiresAt, record.id)
+
+        if (result.changes !== 1) {
+          throw new Error(`provider seed attachment override missed ${record.id}`)
+        }
+      }
+      db.exec('COMMIT')
+    } catch (error) {
+      db.exec('ROLLBACK')
+      throw error
+    } finally {
+      db.close()
+    }
+
+    return
+  }
+
+  const client = new Client({ connectionString: target.url })
+  await client.connect()
+  try {
+    await client.query('BEGIN')
+    for (const record of overrides.resources) {
+      const result = await client.query(
+        'UPDATE provider_resources SET base_url = $1, headers = $2 WHERE id = $3',
+        [record.baseUrl, JSON.stringify(record.headers), record.id],
+      )
+
+      if (result.rowCount !== 1) {
+        throw new Error(`provider seed resource override missed ${record.id}`)
+      }
+    }
+    for (const record of overrides.attachments) {
+      const result = await client.query(
+        'UPDATE provider_attachments SET expires_at = $1 WHERE id = $2',
+        [record.expiresAt, record.id],
+      )
+
+      if (result.rowCount !== 1) {
+        throw new Error(`provider seed attachment override missed ${record.id}`)
+      }
+    }
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    await client.end()
+  }
+}
+
 const run = async (): Promise<void> => {
   if (process.argv.includes('--list')) {
     for (const c of listCases()) {
@@ -198,6 +299,15 @@ const run = async (): Promise<void> => {
 
   // CASE may be a single case or a comma-list to COMBINE (feed-scroll,trash-mixed).
   const world: CaseWorld = buildCasesWorld(caseName, { seed, scale, now: nowIso })
+
+  if (process.argv.includes('--provider-enabled')) {
+    process.stdout.write(world.providers ? String(world.providers.enabled) : '')
+    return
+  }
+  if (process.argv.includes('--provider-private-origins')) {
+    process.stdout.write(world.providers?.privateOrigins?.join(',') ?? '')
+    return
+  }
   console.log(`seed: case=${caseName} scale=${scale} seed=${seed} now=${nowIso}`)
   console.log(`seed: spacesRoot=${spacesRoot} metaDb=${describeMetaDbUrl(metaDbUrl)}`)
 
@@ -451,7 +561,7 @@ const run = async (): Promise<void> => {
       displayName: u.displayName || u.username,
       passwordHash: u.password ? await hashPassword(u.password) : null,
       admin: Boolean(u.admin),
-      disabledAt: null,
+      disabledAt: u.disabled ? t : null,
       createdAt: t,
       personalSpace: personalSlug ? (idOf.get(personalSlug) ?? null) : null,
     })
@@ -514,6 +624,65 @@ const run = async (): Promise<void> => {
     now: () => clock,
   })
   const projectRows = await metaDb.projects.listForSpaces([...idOf.values()])
+  const providerSeedOverrides: ProviderSeedOverrides = { resources: [], attachments: [] }
+
+  if (world.providers) {
+    const replayKeyring = replayKeyringConfigFromEnv(
+      dataPaths.dataDir,
+      dataPaths.metaDbUrl,
+      process.env,
+    )
+    const keyringConfig = credentialKeyringConfigFromEnv(
+      {
+        dataDir: dataPaths.dataDir,
+        metaDbUrl: dataPaths.metaDbUrl,
+        packedRoots: [dataPaths.defaultSpacesRoot, dataPaths.jobsDataDir, replayKeyring.path],
+      },
+      process.env,
+    )
+    const keyring = new CredentialKeyringService({
+      persistence: metaDb.secretKeyring,
+      keyring: new CredentialKeyring(keyringConfig.path, keyringConfig.packedRoots),
+      ciphertexts: metaDb.providerCiphertexts,
+      now: () => new Date(nowIso),
+    })
+    await keyring.bootstrap()
+    const registry = new ProviderRegistry({
+      credentials: metaDb.credentials,
+      resources: metaDb.providerResources,
+      attachments: metaDb.providerAttachments,
+      attachmentLifecycle: metaDb,
+      spaces: metaDb.spaces,
+      projects: metaDb.projects,
+      directory: metaDb.auth,
+      keyring,
+      privateOrigins: new Set(world.providers.privateOrigins ?? []),
+      authMode: 'password',
+      now: () => new Date(nowIso),
+    })
+    const applied = await applyProviderSeed({
+      declaration: world.providers,
+      registry,
+      ownerOf: asUser,
+      resolveSpace: (slug) => idOf.get(slug) ?? null,
+      resolveProject: async (spaceSlug, path) => {
+        const space = idOf.get(spaceSlug)
+        const record = projectRows.find(
+          (candidate) => candidate.space === space && candidate.path === path,
+        )
+        return record ? { id: record.id, space: record.space } : null
+      },
+      overrideResource: (record) => {
+        providerSeedOverrides.resources.push(record)
+      },
+      overrideAttachment: (record) => {
+        providerSeedOverrides.attachments.push(record)
+      },
+    })
+    console.log(
+      `seed: providers credentials=${applied.credentials.size} resources=${applied.resources.size} attachments=${applied.attachments.size} served=${world.providers.enabled}`,
+    )
+  }
 
   const seedStoreForSpace = async (space: string) => {
     const store = await manager.store(space)
@@ -1793,6 +1962,7 @@ const run = async (): Promise<void> => {
 
   await manager.stopAll()
   await metaDb.close()
+  await applyProviderSeedOverrides(metaDbUrl, providerSeedOverrides)
 
   const publicPort = process.env.PORT || '3000'
   // A loud, human banner so the login is obvious in the seed output (the machine-

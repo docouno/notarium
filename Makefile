@@ -84,7 +84,7 @@ PLAYWRIGHT_TEST_IMAGE ?= mcr.microsoft.com/playwright:v1.60.0-jammy
 
 .DEFAULT_GOAL := help
 .PHONY: help prepare deps deps-vector doctor dev up start down stop restart logs ps sh \
-        checkup audit-runtime test-coverage test-pg test-browser import-bench bench-fields-snapshot write-perf-gate graph-revision-gate bench-session-audit backup restore backup-smoke seed seed-list \
+        checkup audit-runtime test-coverage test-pg test-browser import-bench provider-scale-gate bench-fields-snapshot write-perf-gate graph-revision-gate bench-session-audit backup restore backup-smoke seed seed-list \
         footage demo-shots demo-preview demo-plates image release release-rc release-smoke save clean
 
 help: ## List available targets
@@ -301,6 +301,26 @@ import-bench: ## Run the Markdown-tree import scale bench in Docker: make import
 	    --mount "type=volume,src=$(CHECKUP_WORKSPACE_VOLUME),dst=/app" \
 	    --workdir /app -e HOME=/tmp -e NOTES=$(NOTES) -e SOURCE=$(SOURCE) \
 	    --entrypoint npm "$(NODE_TEST_IMAGE)" run bench:import-markdown-tree
+
+# --- provider contour scale gate -------------------------------------------
+# One production SQLite driver over 10k credentials/resources/journal rows. The
+# gate asserts correctness and prints timings; machine-dependent latency is an
+# artifact, not a frozen threshold. The test image keeps Node/native deps identical
+# to coverage and CI while the benchmark script remains a read-only bind.
+PROVIDER_SCALE_RECORDS ?= 10000
+provider-scale-gate: ## Measure provider startup, key maintenance and journal retention at >=10k rows
+	@set -eu; \
+	  cleanup() { \
+	    docker rm -f $(CHECKUP_RUNNER_CONTAINER) >/dev/null 2>&1 || true; \
+	    docker image rm $(CHECKUP_IMAGE) >/dev/null 2>&1 || true; \
+	  }; \
+	  trap cleanup EXIT INT TERM; \
+	  cleanup; \
+	  docker build --target test -t $(CHECKUP_IMAGE) -f docker/Dockerfile .; \
+	  docker run --rm --name $(CHECKUP_RUNNER_CONTAINER) \
+	    --mount "type=bind,src=$(CURDIR)/scripts,dst=/app/scripts,readonly" \
+	    --workdir /app -e PROVIDER_SCALE_RECORDS=$(PROVIDER_SCALE_RECORDS) \
+	    --entrypoint npm "$(CHECKUP_IMAGE)" run bench:provider-scale
 
 # --- fields projection snapshot-memory bench --------------------------------
 # [#384] What the authored-frontmatter projection costs the read-model's snapshot,
@@ -722,7 +742,14 @@ seed: deps prepare ## (Re)seed the local stand from a catalog case — default l
 	CASE=$(CASE) SCALE=$(or $(SCALE),1) SEED=$(or $(SEED),default) PORT=$(SEED_PORT) \
 	  $(if $(PASSWORD),SEED_PASSWORD=$(PASSWORD),) $(SEED_ENV) \
 	  npx tsx scripts/seed.ts
-	$(COMPOSE_DEV) up -d --build
+	@set -eu; \
+	  provider_enabled="$$(CASE=$(CASE) SCALE=$(or $(SCALE),1) SEED=$(or $(SEED),default) $(SEED_ENV) npx tsx scripts/seed.ts --provider-enabled)"; \
+	  if test -n "$$provider_enabled"; then \
+	    provider_origins="$$(CASE=$(CASE) SCALE=$(or $(SCALE),1) SEED=$(or $(SEED),default) $(SEED_ENV) npx tsx scripts/seed.ts --provider-private-origins)"; \
+	    PROVIDERS_ENABLED="$$provider_enabled" PROVIDERS_PRIVATE_ORIGINS="$$provider_origins" $(COMPOSE_DEV) up -d --build; \
+	  else \
+	    $(COMPOSE_DEV) up -d --build; \
+	  fi
 	@echo ""
 	@echo "  ┌─ dev stand ready ──────────────────────────────"
 	@echo "  │   URL:    http://localhost:$(SEED_PORT)"

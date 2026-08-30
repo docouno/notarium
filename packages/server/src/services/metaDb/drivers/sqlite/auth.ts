@@ -51,6 +51,18 @@ export const createAuthFacet = (ctx: SqliteDriverCtx): AuthPersistence => ({
       UserRow | undefined
     return r ? userOfRow(r) : null
   },
+  getUsers: async (usernames) => {
+    if (usernames.length === 0) {
+      return []
+    }
+    await ctx.ensureInit()
+    const rows = ctx.required
+      .prepare(
+        'SELECT * FROM users WHERE username IN (SELECT value FROM json_each(?)) ORDER BY username',
+      )
+      .all(JSON.stringify([...new Set(usernames)])) as UserRow[]
+    return rows.map(userOfRow)
+  },
   listUsers: async () => {
     await ctx.ensureInit()
     const rows = ctx.required
@@ -208,6 +220,24 @@ export const createAuthFacet = (ctx: SqliteDriverCtx): AuthPersistence => ({
       .prepare('SELECT space, role FROM space_members WHERE username = ? ORDER BY space')
       .all(username) as Array<{ space: string; role: SpaceRole }>
     return rows.map((r) => ({ space: r.space, role: r.role }))
+  },
+  grantsForUsers: async (usernames) => {
+    if (usernames.length === 0) {
+      return []
+    }
+    await ctx.ensureInit()
+    const rows = ctx.required
+      .prepare(
+        `SELECT username, space, role FROM space_members
+          WHERE username IN (SELECT value FROM json_each(?))
+          ORDER BY username, space`,
+      )
+      .all(JSON.stringify([...new Set(usernames)])) as Array<{
+      username: string
+      space: string
+      role: SpaceRole
+    }>
+    return rows.map((row) => ({ ...row }))
   },
   membersOf: async (space) => {
     await ctx.ensureInit()

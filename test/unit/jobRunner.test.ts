@@ -15,6 +15,7 @@ import {
   createJobRunner,
   JobAbortedError,
   type JobHandler,
+  JobRetryError,
 } from '../../packages/server/src/apps/server/consumers/jobRunner'
 import type { ArtifactStore } from '../../packages/server/src/libs/artifactStore'
 import { SqliteMetaDb } from '../../packages/server/src/services/metaDb/sqliteMetaDb'
@@ -175,6 +176,27 @@ describe('createJobRunner (#105)', () => {
     expect(j?.attempts).toBe(3) // three claims, then the cap fails it terminally
     expect(runs).toBe(3)
     expect(j?.error).toBe('boom')
+  })
+
+  it('uses an explicit bounded server delay only for a JobRetryError', async () => {
+    const now = new Date('2026-08-24T12:00:00.000Z')
+
+    const handler: JobHandler = async () => {
+      throw new JobRetryError('provider asked us to wait', 12_345)
+    }
+    const { db, runner } = setup({ export: handler }, { now: () => now })
+    await enqueue(db, { maxAttempts: 2, createdAt: now.toISOString() })
+    runner.start()
+    runner.wake()
+    await waitFor(async () => {
+      const row = await db.jobs.get('j1')
+      return row?.status === 'pending' && row.attempts === 1
+    })
+    const job = await db.jobs.get('j1')
+
+    expect(job?.attempts).toBe(1)
+    expect(job?.runAt).toBe('2026-08-24T12:00:12.345Z')
+    expect(job?.error).toBe('provider asked us to wait')
   })
 
   it('cooperative cancel aborts the in-flight handler', async () => {

@@ -17,7 +17,7 @@ A bare `docker run … docouno/notarium` therefore starts the foreground server.
 | `backup` | Stream a verified online ZIP | `docker exec notarium backup` + the safe publication snippet in the runbook |
 | `backup verify` | Validate a ZIP without changing data | `docker exec -i notarium backup verify < file` |
 | `restore` | Install a ZIP into an empty data root | One-off stopped/fresh-volume container |
-| `admin` | Out-of-band account recovery | `docker exec -it notarium admin …` |
+| `admin` | Out-of-band account recovery and key maintenance | `docker exec -it notarium admin …` |
 | `healthcheck` | Probe the local `/api/health` endpoint | Docker `HEALTHCHECK` |
 | `version` | Print version, commit, build time and source revision (`--json` for scripts) | Support and compatibility checks |
 | `help` / `--help` | Describe the CLI or one command | Any container |

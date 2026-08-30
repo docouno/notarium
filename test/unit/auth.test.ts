@@ -72,6 +72,8 @@ describe('me: space aliases are wire capabilities, not raw history', () => {
       mode: 'password',
       persistence,
       spaces,
+      removeMemberAndProviderAttachments: (space, username) =>
+        persistence.removeMember(space, username),
     })
 
     await expect(auth.me('bob')).resolves.toEqual({
@@ -104,6 +106,8 @@ describe('ensureOwners: a personal domain never gets the admin fan-out (#13 priv
       mode: 'password',
       persistence,
       now: () => new Date('2026-06-20T12:00:00.000Z'),
+      removeMemberAndProviderAttachments: (space, username) =>
+        persistence.removeMember(space, username),
     })
 
     // Both spaces are orphans (no member rows) at boot — e.g. sam-personal lost its
@@ -193,6 +197,8 @@ describe('credential usage persistence', () => {
         tracked += 1
         return task()
       },
+      removeMemberAndProviderAttachments: (space, username) =>
+        persistence.removeMember(space, username),
     })
 
     await expect(
@@ -294,7 +300,10 @@ describe('can(): scopes(token) ∩ grants(principal), case by case', () => {
 // the REST ownership check. notifyJobChanged/notifyJobOf filter by principalId.
 describe('job SSE event is owner-scoped (#105)', () => {
   it('delivers the `job` event only to the owning principal’s handles in that space', () => {
-    const auth = createAuthService({ mode: 'none' })
+    const auth = createAuthService({
+      mode: 'none',
+      removeMemberAndProviderAttachments: async () => {},
+    })
     const got: Record<string, unknown[]> = { ownerMain: [], memberMain: [], ownerOther: [] }
     const mk = (principalId: string, space: string, sink: unknown[]) => ({
       principalId,
@@ -321,7 +330,10 @@ describe('job SSE event is owner-scoped (#105)', () => {
 
 describe('agent-session SSE event is owner-scoped', () => {
   it('delivers the invalidation to every owner tab and no other user', () => {
-    const auth = createAuthService({ mode: 'none' })
+    const auth = createAuthService({
+      mode: 'none',
+      removeMemberAndProviderAttachments: async () => {},
+    })
     const got = { aliceMain: 0, aliceOther: 0, bobMain: 0 }
     const register = (username: string, space: string, changed: () => void) =>
       auth.registerSse({

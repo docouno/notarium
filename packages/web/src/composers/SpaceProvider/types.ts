@@ -10,7 +10,7 @@ export type SpaceContextValue = {
    *  offer an explicit "Personal" destination + resolve its name, without
    *  leaking it into the workspace list. null on a host without one. */
   personalSpace: Space | null
-  capabilities: { spaceCreate: boolean }
+  capabilities: { spaceCreate: boolean; providers: boolean }
   /** Can the principal mutate content in the ACTIVE space (role ≥ writer, own
    *  personal domain, or a 'none' host)? The single switch the chrome reads to
    *  hide every create/edit/delete affordance from a reader — who would otherwise

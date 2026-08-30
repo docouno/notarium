@@ -5,6 +5,8 @@ import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
+import { DEFAULT_CREDENTIAL_HEADER } from '@notarium/contract'
+
 import { createAbilityAvailabilityFacet } from './drivers/sqlite/abilityAvailability'
 import { createAbilityCreateFacet } from './drivers/sqlite/abilityCreate'
 import { createAbilityPlacementFacet } from './drivers/sqlite/abilityPlacement'
@@ -15,6 +17,7 @@ import { createCausalOutboxFacet } from './drivers/sqlite/causalOutbox'
 import type { SqliteDriverCtx } from './drivers/sqlite/context'
 import { createContextOrderFacet } from './drivers/sqlite/contextOrder'
 import { createContextSetsFacet } from './drivers/sqlite/contextSets'
+import { createCredentialsFacet } from './drivers/sqlite/credentials'
 import { createFavoritesFacet } from './drivers/sqlite/favorites'
 import { createFoldersFacet } from './drivers/sqlite/folders'
 import { createGatewayFacet } from './drivers/sqlite/gateway'
@@ -25,19 +28,43 @@ import { createJobsFacet } from './drivers/sqlite/jobs'
 import { createOAuthFacet } from './drivers/sqlite/oauth'
 import { createOwnerProofsFacet } from './drivers/sqlite/ownerProofs'
 import { createProjectsFacet } from './drivers/sqlite/projects'
+import {
+  acceptProviderAttachment,
+  createProviderAttachmentsFacet,
+  detachProviderAttachment,
+  offerProviderAttachment,
+  transitionProviderAttachments,
+} from './drivers/sqlite/providerAttachments'
+import { createProviderCallLogFacet } from './drivers/sqlite/providerCallLog'
+import { createProviderCiphertextsFacet } from './drivers/sqlite/providerCiphertexts'
+import { createProviderResourcesFacet } from './drivers/sqlite/providerResources'
 import { createRestoreOperationsFacet } from './drivers/sqlite/restoreOperations'
 import { createRestoreTerminalFacet } from './drivers/sqlite/restoreTerminal'
 import { createRetrievalLogFacet } from './drivers/sqlite/retrievalLog'
 import { createRevisionsFacet } from './drivers/sqlite/revisions'
 import { createScopePinsFacet } from './drivers/sqlite/scopePins'
+import { createSecretKeyringFacet } from './drivers/sqlite/secretKeyring'
 import { createSessionAuditFacet } from './drivers/sqlite/sessionAudit'
 import { createSessionsFacet } from './drivers/sqlite/sessions'
 import { createSpaceLifecycleFacet } from './drivers/sqlite/spaceLifecycle'
 import { createSpacesFacet } from './drivers/sqlite/spaces'
 import { IN_MEMORY_DB } from './metaDbUrl'
 import { runSqliteMigrations } from './migrations'
-import { spaceOfRow, type SpaceRow } from './rows'
-import type { GrantMemberToActiveSpaceResult, MetaDb, SpaceRole } from './types'
+import {
+  credentialOfRow,
+  type CredentialRow,
+  providerResourceOfRow,
+  type ProviderResourceRow,
+  spaceOfRow,
+  type SpaceRow,
+} from './rows'
+import type {
+  GrantMemberToActiveSpaceResult,
+  MetaDb,
+  ProviderRetargetInput,
+  ProviderRetargetResult,
+  SpaceRole,
+} from './types'
 
 /** Gate the boot-time reclaim below this freelist size — pages, not bytes:
  *  64 pages ≈ 256 KiB at the 4 KiB default. */
@@ -147,6 +174,8 @@ export class SqliteMetaDb implements MetaDb {
 
   readonly installationGeneration = createInstallationGenerationFacet(this.ctx)
 
+  readonly secretKeyring = createSecretKeyringFacet(this.ctx)
+
   readonly ownerProofs = createOwnerProofsFacet(this.ctx)
 
   // ── space registry facet ────────────────────────────────────────────
@@ -198,6 +227,129 @@ export class SqliteMetaDb implements MetaDb {
     } catch (err) {
       db.exec('ROLLBACK')
       throw err
+    }
+  }
+
+  readonly offerProviderAttachment: MetaDb['offerProviderAttachment'] = (record, disclosureOf) =>
+    offerProviderAttachment(this.ctx, record, disclosureOf)
+
+  readonly acceptProviderAttachment: MetaDb['acceptProviderAttachment'] = (input, disclosureOf) =>
+    acceptProviderAttachment(this.ctx, input, disclosureOf)
+
+  readonly detachProviderAttachment: MetaDb['detachProviderAttachment'] = (id) =>
+    detachProviderAttachment(this.ctx, id)
+
+  async retargetProviderCredential(input: ProviderRetargetInput): Promise<ProviderRetargetResult> {
+    await this.ensureInit()
+    const db = this.required
+    db.exec('BEGIN IMMEDIATE')
+    try {
+      const credentialRow = db
+        .prepare('SELECT * FROM credentials WHERE id = ?')
+        .get(input.credentialId) as CredentialRow | undefined
+
+      if (!credentialRow || credentialRow.owner !== input.owner) {
+        db.exec('COMMIT')
+        return { status: 'missing' }
+      }
+      const credential = credentialOfRow(credentialRow)
+
+      if (credential.runtimeEpoch !== input.expectedCredentialRuntimeEpoch) {
+        db.exec('COMMIT')
+        return { status: 'conflict' }
+      }
+      const referenceRows = db
+        .prepare('SELECT * FROM provider_resources WHERE credential_id = ? ORDER BY id')
+        .all(input.credentialId) as ProviderResourceRow[]
+      const references = referenceRows.map(providerResourceOfRow)
+      const requested = new Map(input.resources.map((resource) => [resource.id, resource]))
+
+      if (requested.size !== references.length || references.some(({ id }) => !requested.has(id))) {
+        db.exec('COMMIT')
+        return { status: 'references-changed' }
+      }
+      for (const current of references) {
+        const next = requested.get(current.id)!
+
+        if (current.runtimeEpoch !== next.expectedRuntimeEpoch) {
+          db.exec('COMMIT')
+          return { status: 'conflict' }
+        }
+        if (current.owner !== input.owner) {
+          db.exec('COMMIT')
+          return { status: 'conflict' }
+        }
+        const injectionHeader =
+          credential.injection.header || DEFAULT_CREDENTIAL_HEADER[credential.kind][current.wire]
+        const credentialConditionalFailure =
+          new URL(next.baseUrl).origin !== input.origin ||
+          Object.hasOwn(current.headers, injectionHeader)
+
+        if (next.detachCredential !== credentialConditionalFailure) {
+          db.exec('COMMIT')
+          return { status: 'conflict' }
+        }
+      }
+      db.prepare(
+        `UPDATE credentials SET origin = ?, consent_epoch = consent_epoch + 1,
+           runtime_epoch = runtime_epoch + 1 WHERE id = ?`,
+      ).run(input.origin, input.credentialId)
+      const updateResource = db.prepare(
+        `UPDATE provider_resources SET base_url = ?, credential_id = ?,
+           consent_epoch = consent_epoch + 1, runtime_epoch = runtime_epoch + 1,
+           last_check = '{}' WHERE id = ?`,
+      )
+
+      for (const current of references) {
+        const next = requested.get(current.id)!
+        updateResource.run(
+          next.baseUrl,
+          next.detachCredential ? null : input.credentialId,
+          current.id,
+        )
+      }
+      transitionProviderAttachments(
+        this.ctx,
+        references.map(({ id }) => id),
+      )
+      const storedCredential = credentialOfRow(
+        db
+          .prepare('SELECT * FROM credentials WHERE id = ?')
+          .get(input.credentialId) as CredentialRow,
+      )
+      const storedResources = (
+        db
+          .prepare(
+            'SELECT * FROM provider_resources WHERE id IN (SELECT value FROM json_each(?)) ORDER BY id',
+          )
+          .all(JSON.stringify(references.map(({ id }) => id))) as ProviderResourceRow[]
+      ).map(providerResourceOfRow)
+      db.exec('COMMIT')
+      return { status: 'retargeted', credential: storedCredential, resources: storedResources }
+    } catch (error) {
+      db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  async removeMemberAndProviderAttachments(spaceId: string, username: string): Promise<void> {
+    await this.ensureInit()
+    const db = this.required
+    db.exec('BEGIN IMMEDIATE')
+    try {
+      db.prepare(
+        `DELETE FROM provider_attachments
+          WHERE target_space = ?
+            AND resource_id IN (SELECT id FROM provider_resources WHERE owner = ?)`,
+      ).run(spaceId, username)
+      db.prepare('DELETE FROM space_members WHERE space = ? AND username = ?').run(
+        spaceId,
+        username,
+      )
+      db.exec('COMMIT')
+    } catch (error) {
+      db.exec('ROLLBACK')
+      throw error
     }
   }
 
@@ -309,6 +461,10 @@ export class SqliteMetaDb implements MetaDb {
       db.prepare('DELETE FROM ability_preferences WHERE space_id = ?').run(spaceId)
       // The forwarding rows of this Space go with the overrides they forward.
       db.prepare('DELETE FROM ability_placement_trail WHERE space_id = ?').run(spaceId)
+      // Provider credentials/resources are owner-keyed and survive a Space purge.
+      // Attachments are scope rows and leave explicitly; target_space deliberately
+      // has no FK to spaces because the PostgreSQL twin cannot order that implicit lock.
+      db.prepare('DELETE FROM provider_attachments WHERE target_space = ?').run(spaceId)
       db.prepare('DELETE FROM folders WHERE space = ?').run(spaceId)
       db.prepare('DELETE FROM favorites WHERE space = ?').run(spaceId)
       db.prepare(
@@ -388,6 +544,16 @@ export class SqliteMetaDb implements MetaDb {
   readonly abilityPreferences = createAbilityPreferencesFacet(this.ctx)
 
   readonly abilityPlacement = createAbilityPlacementFacet(this.ctx)
+
+  readonly credentials = createCredentialsFacet(this.ctx)
+
+  readonly providerResources = createProviderResourcesFacet(this.ctx)
+
+  readonly providerAttachments = createProviderAttachmentsFacet(this.ctx)
+
+  readonly providerCallLog = createProviderCallLogFacet(this.ctx)
+
+  readonly providerCiphertexts = createProviderCiphertextsFacet(this.ctx)
 
   // ── agent retrieval audit facet ────────────────────────────────────
 

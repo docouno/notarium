@@ -4,7 +4,14 @@
 // precisely because nothing pinned it, so pin it (and the scope derivations) here.
 
 import { describe, expect, it } from 'vitest'
-import { CLASS_POLICY, classesForScope, isVisibleOn, NOTE_CLASSES } from '@notarium/core'
+import {
+  CLASS_POLICY,
+  classesForScope,
+  isVisibleOn,
+  NOTE_CLASS,
+  NOTE_CLASSES,
+  SURFACE,
+} from '@notarium/core'
 
 describe('class visibility policy (#78)', () => {
   it('the profile class (#159) is hidden from EVERY discovery surface', () => {
@@ -17,6 +24,7 @@ describe('class visibility policy (#78)', () => {
       agentRecall: false,
       versioned: true,
       replicate: true,
+      providerEgress: true,
     })
     // Every read-facing surface answers false for the profile.
     for (const surface of ['feed', 'tree', 'userSearch', 'graph', 'agentRecall'] as const) {
@@ -42,6 +50,7 @@ describe('class visibility policy (#78)', () => {
       agentRecall: false,
       versioned: true,
       replicate: true,
+      providerEgress: true,
     })
     for (const surface of ['feed', 'tree', 'userSearch', 'graph', 'agentRecall'] as const) {
       expect(isVisibleOn(surface, 'skill')).toBe(false)
@@ -56,5 +65,20 @@ describe('class visibility policy (#78)', () => {
     // Guard the contrast that makes profile distinct from memory: agent-memory is
     // recall-visible, profile is not.
     expect(classesForScope('agentRecall').has('agent-memory')).toBe(true)
+  })
+
+  it('declares model-provider egress as a separate policy axis for every class', () => {
+    expect(CLASS_POLICY.attachment.providerEgress).toBe(false)
+    expect(CLASS_POLICY.derived.providerEgress).toBe(false)
+    expect(new Set(NOTE_CLASSES.filter((cls) => CLASS_POLICY[cls].providerEgress))).toEqual(
+      new Set([NOTE_CLASS.userDoc, NOTE_CLASS.agentMemory, NOTE_CLASS.profile, NOTE_CLASS.skill]),
+    )
+
+    for (const cls of NOTE_CLASSES) {
+      expect(CLASS_POLICY[cls]).toHaveProperty('providerEgress')
+    }
+
+    expect(Object.keys(CLASS_POLICY['user-doc'])).toHaveLength(9)
+    expect(Object.keys(SURFACE)).toHaveLength(5)
   })
 })

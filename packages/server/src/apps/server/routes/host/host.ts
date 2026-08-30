@@ -27,7 +27,12 @@ export const hostRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
 
   app.get('/api/config', { config: authz('config:read', 'host') }, async () =>
     // canon: docs/auth.md#model
-    ConfigSchema.parse({ capabilities: spaces.capabilities }),
+    ConfigSchema.parse({
+      capabilities: {
+        ...spaces.capabilities,
+        providers: hostInfo.deployment.providers,
+      },
+    }),
   )
 
   // Admin-only block gates runtime/embedder/deployment shape — don't leak infrastructure to non-admins.
@@ -47,6 +52,10 @@ export const hostRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
                 ? { id: hostInfo.search.embedderId, dimensions: hostInfo.search.embedderDims ?? 0 }
                 : null,
             authMode: hostInfo.deployment.authMode,
+            ...(hostInfo.deployment.providers ? { providers: true } : {}),
+            ...(hostInfo.deployment.credentialKeyring
+              ? { credentialKeyring: hostInfo.deployment.credentialKeyring.status }
+              : {}),
             spaceCreate: spaces.capabilities.spaceCreate,
             metaDb: hostInfo.deployment.metaDb,
             uptimeSeconds: Math.round(process.uptime()),

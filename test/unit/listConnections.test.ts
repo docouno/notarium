@@ -82,7 +82,13 @@ const setup = async (seed: (oauth: InMemoryOAuthPersistence) => Promise<void>) =
   const oauth = new InMemoryOAuthPersistence()
   await oauth.upsertClient(client({ clientId: 'chatgpt' }))
   await seed(oauth)
-  return createAuthService({ mode: 'password', persistence: db, oauth, now: () => NOW })
+  return createAuthService({
+    mode: 'password',
+    persistence: db,
+    oauth,
+    now: () => NOW,
+    removeMemberAndProviderAttachments: (space, username) => db.removeMember(space, username),
+  })
 }
 
 describe('listConnections — last-used recovery (#158)', () => {

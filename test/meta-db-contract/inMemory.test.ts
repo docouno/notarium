@@ -23,6 +23,7 @@ import { createInMemoryAbilityPlacement as createFakeServerAbilityPlacement } fr
 import { InMemoryAbilityPreferences as FakeServerAbilityPreferences } from '../fake-server/abilityPreferences'
 import { InMemoryAgentDeltaCursors } from '../fake-server/agentDeltaCursors'
 import { InMemoryAgentSessions } from '../fake-server/agentSessions'
+import { InMemoryAuthPersistence } from '../fake-server/authPersistence'
 import { InMemoryContextOrder } from '../fake-server/contextOrder'
 import { InMemoryContextSets } from '../fake-server/contextSets'
 import { InMemoryFavorites } from '../fake-server/favorites'
@@ -30,7 +31,10 @@ import { InMemoryFolders } from '../fake-server/folders'
 import { InMemoryGatewayState } from '../fake-server/gatewayState'
 import { InMemoryIdentity } from '../fake-server/identity'
 import { InMemoryProjects } from '../fake-server/projects'
+import { InMemoryProviderCallLog } from '../fake-server/providerCallLog'
+import { createInMemoryProviderPersistence } from '../fake-server/providers'
 import { InMemoryScopePins } from '../fake-server/scopePins'
+import { InMemorySecretKeyringPersistence } from '../fake-server/secretKeyring'
 import { InMemorySpaces } from '../fake-server/spaces'
 import { describeAbilityAvailabilityContract } from './abilityAvailabilityContract'
 import {
@@ -44,7 +48,11 @@ import { describeCausalMetadataContract } from './causalMetadataContract'
 import { describeFavoritesContract } from './favoritesContract'
 import { describeGatewayStateContract } from './gatewayStateContract'
 import { describeLegacyNameAliasesContract } from './legacyNameAliasesContract'
+import { describeProviderCallLogContract } from './providerCallLogContract'
+import { describeProviderCiphertextsContract } from './providerCiphertextsContract'
+import { describeProviderFacetsContract } from './providerFacetsContract'
 import { describeRevisionPersistenceContract } from './revisionPersistenceContract'
+import { describeSecretKeyringContract } from './secretKeyringContract'
 
 /** The phases a Space never comes back from — asked of the DRIVERS' list, not of a
  *  copy of it. A second spelling here would be a fence that agrees with the drivers
@@ -55,6 +63,63 @@ const hasEnded = (record: { phase: string } | null): boolean => spaceLifecycleHa
 describeGatewayStateContract('in-memory twin', async () => ({
   persistence: new InMemoryGatewayState(),
 }))
+
+describeSecretKeyringContract('in-memory twin', async () => ({
+  persistence: new InMemorySecretKeyringPersistence(),
+}))
+
+describeProviderFacetsContract('in-memory twin', async () => {
+  const spaces = new InMemorySpaces()
+  const auth = new InMemoryAuthPersistence()
+  const secretKeyring = new InMemorySecretKeyringPersistence()
+  const providers = createInMemoryProviderPersistence({
+    spaceIsLive: async (space) => (await spaces.getById(space)) != null,
+    ownerIsMember: async (space, owner) =>
+      (await auth.grantsFor(owner)).some((grant) => grant.space === space),
+    activeCiphertextKey: () => secretKeyring.activeWrite(),
+    retireCiphertextKeys: (keyIds, retiredAt) => secretKeyring.retireKeys(keyIds, retiredAt),
+  })
+  return {
+    secretKeyring,
+    credentials: providers.credentials,
+    resources: providers.providerResources,
+    attachments: providers.providerAttachments,
+    lifecycle: providers,
+    ciphertexts: providers.providerCiphertexts,
+    spaces,
+    auth,
+    retargetProviderCredential: (input) => providers.retargetProviderCredential(input),
+    removeMemberAndProviderAttachments: (space, username) =>
+      providers.coordinator.run(() => {
+        providers.removeProviderAttachmentsForMemberInsideCoordinator(space, username)
+        return auth.removeMember(space, username)
+      }),
+    purgeSpace: (space: string) =>
+      providers.coordinator.run(() => {
+        providers.purgeSpaceInsideCoordinator(space)
+        spaces.delete(space)
+      }),
+  }
+})
+
+describeProviderCallLogContract('in-memory twin', async () => ({
+  callLog: new InMemoryProviderCallLog(),
+}))
+
+describeProviderCiphertextsContract('in-memory twin', async () => {
+  const secretKeyring = new InMemorySecretKeyringPersistence()
+  const providers = createInMemoryProviderPersistence({
+    spaceIsLive: async () => true,
+    activeCiphertextKey: () => secretKeyring.activeWrite(),
+    retireCiphertextKeys: (keyIds, retiredAt) => secretKeyring.retireKeys(keyIds, retiredAt),
+  })
+  return {
+    secretKeyring,
+    credentials: providers.credentials,
+    resources: providers.providerResources,
+    ciphertexts: providers.providerCiphertexts,
+  }
+})
 
 describeLegacyNameAliasesContract('in-memory twin', async () => {
   const identity = new InMemoryIdentity()

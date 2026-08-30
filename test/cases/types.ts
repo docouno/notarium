@@ -78,6 +78,8 @@ export type UserDecl = {
   password?: string
   displayName?: string
   admin?: boolean
+  /** Seed a deactivated account while keeping its memberships and owned records. */
+  disabled?: boolean
   /** The space slug that is this user's personal domain (#21). */
   personalSpace?: string
 }
@@ -573,6 +575,73 @@ export type FavoriteDecl = {
   ref: string
 }
 
+/** Provider declarations are a side-channel over the same shared case world as
+ * auth/jobs/favorites: both appliers use the production registry for reachable
+ * states, then their own raw persistence seam for the two deliberately corrupt
+ * states no product mutation may create. Values are synthetic seed material. */
+export type ProviderCredentialSeedDecl = {
+  ref: string
+  owner: string
+  name: string
+  kind: 'bearer' | 'header'
+  secret: string
+  origin: string
+  injection?: { header: string; prefix: string }
+  disabled?: boolean
+  rpm?: number | null
+  tpm?: number | null
+}
+
+export type ProviderResourceSeedDecl = {
+  ref: string
+  owner: string
+  name: string
+  wire: 'openai-compatible' | 'ollama'
+  baseUrl: string
+  headers?: Record<string, string>
+  allowPrivateNetwork?: boolean
+  purposes: Array<'chat' | 'embedding'>
+  models?: Array<{
+    name: string
+    dimensions: number | null
+    status: 'available' | 'model-unavailable'
+  }>
+  defaultModel?: string | null
+  credential?: string | null
+  disabled?: boolean
+  firstByteTimeoutMs?: number | null
+  callTimeoutMs?: number | null
+  /** Post-apply corruption: the regular create uses baseUrl first, then the raw
+   * seam moves the resource to a different origin behind its credential. */
+  mismatchedBaseUrl?: string
+  /** Post-apply corruption: replace every encrypted header carrier with a valid
+   * envelope naming a key that does not exist in the seeded keyring. */
+  unreadableHeaders?: boolean
+}
+
+export type ProviderAttachmentSeedDecl = {
+  ref: string
+  resource: string
+  target: { kind: 'space'; space: string } | { kind: 'project'; space: string; path: string }
+  manager: string
+  state: 'pending' | 'active' | 'awaiting-reconsent'
+  /** Only for pending: replace the ordinary 14-day TTL with a near-expiry row. */
+  expiresInMs?: number
+  /** Only for awaiting-reconsent: an accepted row is changed through the product
+   * registry so stored epochs/disclosure remain old while current state moves. */
+  reconsentBaseUrl?: string
+}
+
+export type ProviderSeedDecl = {
+  /** Controls the served capability, not whether the rows are seeded. `false`
+   * therefore models a disabled subsystem over an already-populated database. */
+  enabled: boolean
+  privateOrigins?: string[]
+  credentials: ProviderCredentialSeedDecl[]
+  resources: ProviderResourceSeedDecl[]
+  attachments: ProviderAttachmentSeedDecl[]
+}
+
 export type CaseWorld = {
   /** The determinism anchor: the case's "today". Fixed so a re-seed is byte-stable
    *  (visual snapshots) and the heatmap's window is reproducible. */
@@ -586,6 +655,8 @@ export type CaseWorld = {
   /** Per-scope user-defined pin+set order (#210) — order = load priority. */
   contextOrder?: ContextOrderDecl[]
   auth?: AuthDecl
+  /** Credential/resource/attachment state, projected through both seed appliers. */
+  providers?: ProviderSeedDecl
   /** Chronological note operations (the appliers sort defensively). */
   events: CaseEvent[]
   /** Starred entities (#42/#245) — real applier only (see FavoriteDecl). */

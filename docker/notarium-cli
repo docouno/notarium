@@ -75,8 +75,12 @@ Usage:
   notarium admin passwd <username> [--password PW | --random]
   notarium admin create-admin <username> [--password PW | --random] [--display NAME]
   notarium admin grant <username> <space> <owner|writer|reader>
+  notarium admin recover-replay-key --expected-key-id ID [--apply]
+  notarium admin rotate-credential-key --expected-key-id ID [--apply]
+  notarium admin reconcile-credential-keyring --expected-key-id ID [--apply]
+  notarium admin purge-unreadable-secrets --expected-key-id ID [--apply]
 
-Emergency, out-of-band account recovery against the configured metadata DB.
+Emergency account recovery and key maintenance against the configured metadata DB.
 EOF
 }
 

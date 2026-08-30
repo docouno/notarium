@@ -19,15 +19,17 @@ sqlite/0001_revision_history.sql
 sqlite/0002_agent_state.sql
 sqlite/0003_causal_identity.sql
 sqlite/0004_import_reservations.sql
+sqlite/0005_provider_contour.sql
 postgres/0000_baseline.sql
 postgres/0001_revision_history.sql
 postgres/0002_agent_state.sql
 postgres/0003_causal_identity.sql
 postgres/0004_import_reservations.sql
+postgres/0005_provider_contour.sql
 ```
 
 `0000_baseline` is the published `v0.1.0` support floor. Its bytes and pair
-checksum are immutable. The four later carriers are the supported transition
+checksum are immutable. The five later carriers are the supported transition
 from that baseline to the current schema; development-only predecessor ladders
 are not accepted prefixes.
 
@@ -145,6 +147,57 @@ frozen import plan; the plan remains the authority. There is deliberately no
 “bytes landed” flag because publication and such a flag cannot be atomic across
 the filesystem/database boundary. See [import.md](import.md#who-owns-a-destination-while-the-import-runs).
 
+### `0005_provider_contour`
+
+One carrier for one subsystem: the master-key witness, the registry a call is
+addressed by, and the journal it is recorded in. They are not three carriers
+because no supported deployment has ever had a subset of them.
+
+- `secret_keyring` records the canary and generation witness of each credential
+  master key. Key files and the active pointer stay filesystem state; `state` is
+  only that pointer's projection. A key is admitted `readable`, the pointer is
+  published, then the row becomes `active` — the prepublication witness is what
+  separates crash recovery from restoring an older database beside a descendant
+  keyring, without a phase or candidate column.
+- `credentials` and `provider_resources` are owner state; `provider_attachments`
+  binds a resource to a Space. Credential secrets and resource header values are
+  reversible envelopes and the database stores no plaintext copy.
+- A resource may omit its credential, but a present reference is
+  `ON DELETE RESTRICT`; deleting a resource cascades its attachments.
+  `target_space` stays a plain, non-null indexed column, because a foreign key to
+  `spaces` would take an implicit parent lock from below the ladder — the explicit
+  lifecycle fence prevents a late offer and `purgeSpace` deletes the rows itself.
+- `provider_call_log` holds one row per request the executor was allowed to send,
+  written in two phases: the intent commits before the transport may send and the
+  outcome closes the same row. It has no foreign key at all — `resource_id` and
+  `credential_id` are historical snapshots, where a `RESTRICT` would make a
+  credential delete a lie and a `CASCADE` would erase the evidence.
+
+Credentials and resources survive a Space purge because they are owner state, and
+so does the journal: whether a Space's content left through some resource is a
+question asked after the Space is gone. A resource mutation replaces a row only at
+the `runtime_epoch` the caller read, so two call configurations cannot commit under
+one epoch, and a credential mutation serializes at its own epoch — call-affecting
+fields bump it and reset every referencing resource's `last_check` in the same
+credential→resource transaction, while origin and injection also bump the separate
+consent epoch. A `validate` outcome is written the same way rather than by a short
+`UPDATE`, since `last_check` is a per-purpose collection the owner edits
+concurrently, and its condition spans both the resource epoch and the referenced
+credential's, because a secret rotation moves no resource field yet must invalidate
+a check in flight. Complete keyring-loss recovery is one transaction over both
+ciphertext carriers and rolls the whole change back rather than landing half of it.
+
+The journal carries no prompt or response column: it is an audit of who called
+what, not a second store of user content. `delivery_state` is three-valued — the
+transport can only say whether bytes could have left, while `sent` is the
+executor's stronger fact that the provider answered — and `retry_safe` is explicit
+rather than derived from a status code. `UNIQUE (job_id, job_call_key, attempt_no)`
+is the durable send-fence and the index a job re-claim reads its latest attempt by;
+all three are null for an interactive call and nulls are distinct, so those rows
+never collide. Spend lives on the event with the source that reported it, absent
+counters mean unknown rather than zero, and no total is stored anywhere — the
+rollup is summed from the rows.
+
 ## Lock and lifecycle invariants
 
 The normative PostgreSQL order lives in
@@ -165,6 +218,15 @@ not introduce hidden edges that contradict it.
   remains a helper-less autocommit statement; `agent_sessions.role_locator` is
   outside the ladder, so an exact resume with a stale address fails closed. These
   are current concurrency gaps, not compatibility paths in the migration ladder.
+- The provider contour follows tier 4, opening with the instance-global
+  `secret_keyring` fence and continuing credentials → resources → attachments →
+  call journal. Every ciphertext writer enters the keyring fence first, and a
+  whole-Space purge enters only the attachment tail. Recovery and rotation scans
+  take range locks before reading the carrier inventory, so an insert cannot
+  appear behind the scan. The journal tail is the one provider level keyed by
+  something other than a row id: two re-claims of one logical job call have no
+  row to meet on until one has inserted, so they meet on an advisory over that
+  call.
 - Import cancellation and reaping enter the same job/header/path fence as a
   claimed write. Heartbeats remain outside so a slow member can renew its lease
   while holding the write fence.

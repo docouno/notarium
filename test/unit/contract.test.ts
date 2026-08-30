@@ -301,8 +301,13 @@ describe('zod 4 migration boundaries', () => {
 
 describe('GET /api/config', () => {
   it('is just the capability facts (#99 dropped the default-space pointer) and rejects the engine-leak fields', () => {
-    expect(ConfigSchema.safeParse({ capabilities: { spaceCreate: false } }).success).toBe(true)
-    expect(ConfigSchema.safeParse({ capabilities: { spaceCreate: true } }).success).toBe(true)
+    expect(
+      ConfigSchema.safeParse({ capabilities: { spaceCreate: false, providers: false } }).success,
+    ).toBe(true)
+    expect(
+      ConfigSchema.safeParse({ capabilities: { spaceCreate: true, providers: true } }).success,
+    ).toBe(true)
+    expect(ConfigSchema.safeParse({ capabilities: { spaceCreate: false } }).success).toBe(false)
     // capabilities is required; the old engine-endpoint leak fields never validated.
     expect(ConfigSchema.safeParse({ space: 'main' }).success).toBe(false)
     expect(

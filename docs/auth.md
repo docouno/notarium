@@ -7,6 +7,13 @@ Canon for auth (#10). Decisions locked in on 2026-06-12 (discussion in #10 on to
 - **The principal is generalized** (P14): a human with a session, an agent with a PAT, and (in the future, stage 2) a share-token — one mechanism. On each request the principal is assembled ONCE at authentication time (from grants in the meta-DB) and thereafter the decision is purely synchronous: `can(principal, action, resource)`.
 - **Decision formula**: `effective = scopes(token) ∩ grants(principal)`. Scopes are the ceiling of actions for the credential (session = `manage`, PAT = `read`|`write`); grants are the membership `space_member(space, username, role: owner|writer|reader)`. Management actions (issuing a PAT, members, users, creating spaces) sit ABOVE `write` — a leaked PAT cannot issue a token or grant access.
 - **Roles within a space**: a reader sees everything in the space, a writer mutates notes, an owner manages members. "Share a subset" = a separate space. Finer granularity — #67.
+- **Provider grants follow membership atomically** (#387): removing a member also
+  removes, in the same meta-DB transition, every attachment in that Space whose
+  provider resource they own. Removing an unrelated member touches no provider row.
+  Offer and removal share the Space/member fence, so an offer checked before the
+  removal either commits first and is deleted with it, or waits and is refused after
+  the membership disappears. Deactivation is different and reversible: it changes no
+  attachment row; resolution reports the owner as disabled until reactivation.
 - **Username immutable** (the same rule as SpaceSlug): the key for membership, the journal, and management routes; the renameable field is `displayName`.
 - **Host-admin ≠ data access**: an admin manages users, creates spaces, and repairs the membership of any space (a recovery path for spaces born from config), but READING a space's data requires membership. Boot rule: a space without a single member gets owner rows for all active admins (this covers the first launch and spaces added via config); curated membership is not touched by boot.
 - **Refusal semantics**: anonymous → 401 (with `reason: setup_required` while there are no users); authenticated without a grant → the same 404 as "no such thing" (anti-enumeration, §2 of research #16). The `/api/spaces` list is itself a membership filter; `/api/config` returns only `capabilities` (the host-global `defaultSpace` was removed in #99 as a legacy vestige — the client lands on `me.personalSpace`, otherwise the first readable one from `/api/spaces`; #73 previously returned a membership-relative `defaultSpace`, its null branch became unreachable by construction and the field was removed from the wire).
@@ -41,7 +48,7 @@ Login and new OAuth client admission (DCR + pending CIMD) use Fastify's canonica
 
 ## Access recovery (admin CLI)
 
-There is no SMTP and only an admin issues a reset link — which means "lost the password of the only admin" = lockout without an out-of-band tool (the same gap that Gitea/Immich close with a CLI). The tool is `packages/server/src/apps/server/commands/admin/main.ts`; it works directly against the meta-DB (SQLite WAL tolerates a second writer — you can do it with the server live; Postgres always):
+There is no SMTP and only an admin issues a reset link — which means "lost the password of the only admin" = lockout without an out-of-band tool (the same gap that Gitea/Immich close with a CLI). The tool is `packages/server/src/apps/server/commands/admin/main.ts`; account recovery works directly against the meta-DB while the server is live (SQLite WAL tolerates a second writer; Postgres always). Key-maintenance commands below carry their own stricter operator procedure:
 
 - dev: `npm -w @notarium/server run admin -- <cmd>` (via tsx);
 - prod (docker): `docker compose exec notarium admin <cmd>` — `admin` is a public command shipped in the image and reaches the same CLI as `notarium admin`.
@@ -57,6 +64,21 @@ recheck both `META_DB_URL` and `NOTARIUM_REPLAY_KEYRING_DIR`; the command checks
 the topology, stable id, and complete absence again immediately before starting
 the witnessed replacement saga. Present, corrupt, or mismatched files are never
 overwritten by this recovery path.
+
+Provider credential master-key rotation is the separate command
+`rotate-credential-key --expected-key-id <active-id> [--apply]`. It is a dry
+run unless `--apply` is present: the preview counts credential secrets and
+resource header values that still name the source generations. Before applying,
+stop every serving process and verify the active id again. The command publishes
+a new write key, rewraps both ciphertext carriers in serialized batches without
+changing their field AAD or consent/runtime epochs, and retires a source
+generation only after a final zero-reference scan under the common active-key
+fence. Retirement changes the DB row only; immutable key files remain in
+`secret-keyring` for archives inside the retention window.
+
+Historical reconciliation, complete-loss purge and the deliberately expensive
+`@system` maintenance procedure are documented together in
+[providers.md](providers.md#backup-restore-and-recovery).
 
 `grant` accepts what an operator can actually have: the current space slug, a retired
 slug alias, or the exact stable space id. Slug/alias resolution uses the same

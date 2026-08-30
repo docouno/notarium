@@ -38,6 +38,7 @@ import type {
 import { isAbilityTargetPurgedError } from '../../services/metaDb'
 import type { BulkRestoreCoordinator, RestoreCoordinator } from '../../services/noteRestore'
 import type { MarkerStore } from '../../services/projects'
+import type { ProviderRegistry } from '../../services/providerRegistry'
 import { AbilityUnavailableError, type RolesService } from '../../services/roles'
 import type { SpaceManager } from '../../services/spaces'
 import { createStoreAccess } from '../../services/storeAccess'
@@ -49,6 +50,14 @@ import { registerMcp } from './routes/mcp'
 import { registerOAuthRoutes } from './routes/oauth'
 import { conflictToWire } from './routes/wire'
 
+const LONG_MUTATION_PATH = [/^\/api\/providers\/resources\/[^/]+\/validate$/]
+
+const mutationRunsOutsideRequestGate = (rawPath: string): boolean => {
+  const pathname = rawPath.split('?', 1)[0]
+
+  return pathname === '/mcp' || LONG_MUTATION_PATH.some((pattern) => pattern.test(pathname))
+}
+
 /** Assembly inputs for the host. Optional facets are absent on a meta-DB-less host
  *  and degrade honestly (the surface 404s / returns empty) rather than break.
  *  canon: docs/architecture.md#p5 */
@@ -58,6 +67,7 @@ export type BuildAppOptions = {
   sessions?: AgentSessionsPersistence
   customAbilityCreator?: CustomAbilityCreator
   roles?: RolesService
+  providerRegistry?: ProviderRegistry
   agentDeltaCursors?: AgentDeltaCursorsPersistence
   gatewayState?: GatewayStatePersistence
   projects?: ProjectsPersistence
@@ -104,6 +114,7 @@ export const buildApp = async ({
   sessions,
   customAbilityCreator,
   roles,
+  providerRegistry,
   agentDeltaCursors,
   gatewayState,
   retrievalLog,
@@ -139,7 +150,12 @@ export const buildApp = async ({
     routerOptions: { maxParamLength: 512 },
     trustProxy: trustProxy ?? false,
   })
-  const authService = auth ?? createAuthService({ mode: AUTH_MODE.none })
+  const authService =
+    auth ??
+    createAuthService({
+      mode: AUTH_MODE.none,
+      removeMemberAndProviderAttachments: async () => {},
+    })
   const abilities = roles
     ? createAbilities({
         roles,
@@ -213,7 +229,10 @@ export const buildApp = async ({
     app.addHook('onRoute', (route) => {
       const methods = Array.isArray(route.method) ? route.method : [route.method]
 
-      if (!methods.some((method) => mutating.has(method)) || route.path === '/mcp') {
+      if (
+        !methods.some((method) => mutating.has(method)) ||
+        mutationRunsOutsideRequestGate(route.path)
+      ) {
         return
       }
       const handler = route.handler
@@ -233,7 +252,7 @@ export const buildApp = async ({
     })
 
     app.addHook('onRequest', async (req, reply) => {
-      if (!mutating.has(req.method) || req.url === '/mcp') {
+      if (!mutating.has(req.method) || mutationRunsOutsideRequestGate(req.url)) {
         return
       }
       const controller = new AbortController()
@@ -400,6 +419,7 @@ export const buildApp = async ({
     sessionAudit,
     sessions,
     roles,
+    providerRegistry,
     abilities,
     markerStore,
     fieldSchemaStore,
@@ -429,6 +449,7 @@ export const buildApp = async ({
     auth: authService,
     roles,
     abilities,
+    providerRegistry,
     sessions,
     agentDeltaCursors,
     gatewayState,

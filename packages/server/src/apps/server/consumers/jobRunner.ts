@@ -3,9 +3,11 @@
 
 import type { ArtifactStore } from '../../../libs/artifactStore'
 import type { JobRecord, JobsPersistence } from '../../../services/metaDb'
+import { JobRetryError } from './jobRetryError'
 import { TerminalJobError } from './terminalJobError'
 
 export { TerminalJobError } from './terminalJobError'
+export { JobRetryError } from './jobRetryError'
 
 /** Thrown by ctx.report() when the job is no longer ours (canceled/reaped); the runner
  *  treats it as a clean stop, not a failure. */
@@ -368,7 +370,9 @@ export const createJobRunner = (opts: JobRunnerOptions): JobRunner => {
       // so a reviving stale worker can't resurrect a peer's row.
       if (job.attempts < job.maxAttempts) {
         const backoff =
-          cfg.backoffBaseMs * 2 ** (job.attempts - 1) + Math.floor(Math.random() * 1_000)
+          err instanceof JobRetryError
+            ? err.retryAfterMs
+            : cfg.backoffBaseMs * 2 ** (job.attempts - 1) + Math.floor(Math.random() * 1_000)
         const retryAt = new Date(nowDate().getTime() + backoff).toISOString()
         await jobs.fail(job.id, lease, { error: message, retryAt, now: nowIso() })
       } else {

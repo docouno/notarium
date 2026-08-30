@@ -1,6 +1,20 @@
 import { type ABILITY_AVAILABILITY_MODE } from '@notarium/contract'
 import type { OwnedAbilityLocator, SystemAbilityLocator } from '@notarium/contract'
 import type {
+  AttachmentState,
+  CredentialInjection,
+  CredentialKind,
+  ProviderCallOutcome,
+  ProviderDeliveryState,
+  ProviderDisclosureSnapshot,
+  ProviderLastCheck,
+  ProviderModel,
+  ProviderTargetKind,
+  ProviderUsage,
+  Purpose,
+  Wire,
+} from '@notarium/contract'
+import type {
   AgentSessionAttach,
   CausalOutboxPersistence,
   IdentityPersistence,
@@ -17,6 +31,452 @@ import type {
 } from '@notarium/core'
 
 import { defineClientFailure } from '../../libs/clientFailure'
+import type { CredentialKeyState } from '../credentialKeyring/consts'
+import type { UnreadableSecretPlan } from '../credentialKeyring/types'
+
+export type SecretKeyringRecord = {
+  keyId: string
+  canary: string
+  state: CredentialKeyState
+  generation: number
+  createdAt: string
+  retiredAt: string | null
+}
+
+export type AdmitReadableSecretKeyResult =
+  | { status: 'inserted'; record: SecretKeyringRecord }
+  | { status: 'present'; record: SecretKeyringRecord }
+  | { status: 'conflict' }
+
+export type ProjectActiveSecretKeyResult =
+  | { status: 'projected'; record: SecretKeyringRecord }
+  | { status: 'missing' }
+  | { status: 'retired'; record: SecretKeyringRecord }
+  | { status: 'generation-conflict'; record: SecretKeyringRecord }
+
+export type ProjectRotationSecretKeyResult =
+  | { status: 'projected'; record: SecretKeyringRecord }
+  | { status: 'active-changed'; activeKeyId: string | null }
+  | { status: 'missing' }
+  | { status: 'retired'; record: SecretKeyringRecord }
+  | { status: 'generation-conflict'; record: SecretKeyringRecord }
+
+export type SecretKeyringPersistence = {
+  init(): Promise<void>
+  list(): Promise<SecretKeyringRecord[]>
+  active(): Promise<SecretKeyringRecord[]>
+  admitReadable(record: SecretKeyringRecord): Promise<AdmitReadableSecretKeyResult>
+  projectActive(input: { keyId: string; generation: number }): Promise<ProjectActiveSecretKeyResult>
+  projectRotationActive(
+    input: { expectedKeyId: string; keyId: string; generation: number },
+    publishPointer: () => Promise<void>,
+  ): Promise<ProjectRotationSecretKeyResult>
+  replaceNonRetiredWith(record: SecretKeyringRecord): Promise<void>
+}
+
+// ── provider facets ──────────────────────────────────────────────────
+
+export type CiphertextWrite = {
+  keyId: string
+  generation: number
+}
+
+export type CredentialRecord = {
+  id: string
+  owner: string
+  name: string
+  kind: CredentialKind
+  /** Reversible envelope ciphertext; plaintext never crosses this port. */
+  secret: string
+  origin: string
+  injection: CredentialInjection
+  disabledAt: string | null
+  rpm: number | null
+  tpm: number | null
+  consentEpoch: number
+  runtimeEpoch: number
+}
+
+export type CredentialMutableFields = Pick<
+  CredentialRecord,
+  'name' | 'secret' | 'origin' | 'injection' | 'disabledAt' | 'rpm' | 'tpm'
+>
+
+export type CredentialReferenceValidator = (
+  credential: CredentialRecord,
+  references: readonly ProviderResourceRecord[],
+) => readonly string[]
+
+export type CredentialMutationInput = {
+  id: string
+  expectedRuntimeEpoch: number
+  changes: Partial<CredentialMutableFields>
+  /** Present exactly when `changes.secret` is a freshly encrypted ciphertext. */
+  ciphertext: CiphertextWrite | null
+  runtimeChanged: boolean
+  consentChanged: boolean
+  validateReferences: CredentialReferenceValidator
+}
+
+export type CredentialMutationResult =
+  | { status: 'updated'; record: CredentialRecord }
+  | { status: 'conflict'; record: CredentialRecord }
+  | { status: 'references-invalid'; references: ProviderResourceRecord[] }
+  | { status: 'missing' }
+
+export type CredentialDeleteResult =
+  | { status: 'deleted' }
+  | { status: 'referenced'; references: ProviderResourceRecord[] }
+  | { status: 'missing' }
+
+export type ProviderPagePosition = { sort: string; id: string }
+export type ProviderPageInput = { after: ProviderPagePosition | null; limit: number }
+export type ProviderIdPage = { ids: string[]; total: number }
+export type ProviderPositionPage = { positions: ProviderPagePosition[]; hasMore: boolean }
+
+export type CredentialsPersistence = {
+  create(record: CredentialRecord, ciphertext: CiphertextWrite): Promise<void>
+  mutate(input: CredentialMutationInput): Promise<CredentialMutationResult>
+  get(id: string): Promise<CredentialRecord | null>
+  getMany?(ids: readonly string[]): Promise<CredentialRecord[]>
+  pageIdsForOwner(owner: string, input: ProviderPageInput): Promise<ProviderIdPage>
+  list(): Promise<CredentialRecord[]>
+  listForOwner(owner: string): Promise<CredentialRecord[]>
+  references(id: string): Promise<ProviderResourceRecord[]>
+  deleteIfUnreferenced(id: string): Promise<CredentialDeleteResult>
+}
+
+export type ProviderResourceRecord = {
+  id: string
+  owner: string
+  name: string
+  wire: Wire
+  baseUrl: string
+  /** Canonical header name → reversible envelope ciphertext. */
+  headers: Record<string, string>
+  allowPrivateNetwork: boolean
+  purposes: Purpose[]
+  models: ProviderModel[]
+  defaultModel: string | null
+  credentialId: string | null
+  consentEpoch: number
+  runtimeEpoch: number
+  disabledAt: string | null
+  lastCheck: Partial<Record<Purpose, ProviderLastCheck>>
+  /** Null selects the address-derived profile after pinned DNS resolution. */
+  firstByteTimeoutMs: number | null
+  /** Null selects the address-derived profile after pinned DNS resolution. */
+  callTimeoutMs: number | null
+}
+
+/** Conditional write of a `validate` outcome. `lastCheck` is per-purpose, so the
+ *  write is a serialized read-modify-write of the JSON column, not a blind UPDATE
+ *  that would drop the sibling purpose. The condition spans TWO rows because the
+ *  credential is a different table: a secret rotation moves no resource field, yet
+ *  it must invalidate an in-flight check. */
+export type ProviderLastCheckWrite = {
+  resourceId: string
+  purpose: Purpose
+  lastCheck: ProviderLastCheck
+  /** Measured model facts, materialized in the SAME conditional transaction — a
+   *  stale outcome must not leave its measurement behind. */
+  model: ProviderModel | null
+  expectedRuntimeEpoch: number
+  expectedCredentialId: string | null
+  expectedCredentialRuntimeEpoch: number | null
+}
+
+export type ProviderLastCheckResult =
+  | { status: 'recorded'; record: ProviderResourceRecord }
+  | { status: 'stale'; record: ProviderResourceRecord }
+  | { status: 'missing' }
+
+export type ProviderResourcesPersistence = {
+  create(record: ProviderResourceRecord, ciphertext: CiphertextWrite | null): Promise<void>
+  replaceIfRuntimeEpoch(
+    record: ProviderResourceRecord,
+    ciphertext: CiphertextWrite | null,
+    expectedRuntimeEpoch: number,
+    expectedCredentialId: string | null,
+    preserveModels?: boolean,
+  ): Promise<
+    | { status: 'replaced'; record: ProviderResourceRecord }
+    | { status: 'conflict'; record: ProviderResourceRecord }
+    | { status: 'missing' }
+  >
+  get(id: string): Promise<ProviderResourceRecord | null>
+  getMany?(ids: readonly string[]): Promise<ProviderResourceRecord[]>
+  pageIdsForOwner(owner: string, input: ProviderPageInput): Promise<ProviderIdPage>
+  pageEffectiveIds(
+    owner: string,
+    spaces: readonly string[],
+    input: ProviderPageInput,
+  ): Promise<ProviderIdPage>
+  /** Count-free effective-candidate walk for boolean/existence consumers. */
+  scanEffectivePage(
+    owner: string,
+    spaces: readonly string[],
+    input: ProviderPageInput,
+  ): Promise<ProviderPositionPage>
+  list(): Promise<ProviderResourceRecord[]>
+  listForOwner(owner: string): Promise<ProviderResourceRecord[]>
+  delete(id: string): Promise<void>
+  /** Serialized read-modify-write. System materialization does not bump runtimeEpoch. */
+  materializeModel(id: string, model: ProviderModel): Promise<ProviderResourceRecord | null>
+  recordLastCheck(input: ProviderLastCheckWrite): Promise<ProviderLastCheckResult>
+}
+
+export type ProviderCiphertextCounts = {
+  credentials: number
+  headers: number
+}
+
+export type ProviderCiphertextCarrier =
+  | { kind: 'credential'; recordId: string; field: 'secret'; ciphertext: string }
+  | { kind: 'header'; recordId: string; field: string; ciphertext: string }
+
+export type ProviderCiphertextRewrap = (carrier: ProviderCiphertextCarrier) => Promise<string>
+
+export type ProviderCiphertextsPersistence = {
+  hasCiphertext(): Promise<boolean>
+  previewUnreadable(readableKeyIds: ReadonlySet<string>): Promise<UnreadableSecretPlan>
+  purgeUnreadable(
+    readableKeyIds: ReadonlySet<string>,
+    changedAt: string,
+  ): Promise<UnreadableSecretPlan>
+  countReferences(keyIds: ReadonlySet<string>): Promise<ProviderCiphertextCounts>
+  rewrapBatch(input: {
+    active: CiphertextWrite
+    sourceKeyIds: ReadonlySet<string>
+    limit: number
+    rewrap: ProviderCiphertextRewrap
+  }): Promise<{ rewrapped: ProviderCiphertextCounts }>
+  retireKeys(input: {
+    active: CiphertextWrite
+    sourceKeyIds: ReadonlySet<string>
+    retiredAt: string
+  }): Promise<
+    | {
+        status: 'retired'
+        references: ProviderCiphertextCounts
+        retiredKeyIds: string[]
+      }
+    | { status: 'references-remain'; references: ProviderCiphertextCounts }
+  >
+}
+
+export type ProviderAttachmentRecord = {
+  id: string
+  resourceId: string
+  targetKind: ProviderTargetKind
+  targetId: string
+  targetSpace: string
+  state: AttachmentState
+  resourceEpoch: number | null
+  credentialEpoch: number | null
+  disclosure: ProviderDisclosureSnapshot | null
+  createdAt: string
+  expiresAt: string
+}
+
+export type ProviderAttachmentsPersistence = {
+  get(id: string): Promise<ProviderAttachmentRecord | null>
+  getMany(ids: readonly string[]): Promise<ProviderAttachmentRecord[]>
+  listForResource(resourceId: string): Promise<ProviderAttachmentRecord[]>
+  listForSpace(targetSpace: string): Promise<ProviderAttachmentRecord[]>
+  listForSpaces?(targetSpaces: readonly string[]): Promise<ProviderAttachmentRecord[]>
+  listForResourcesInSpaces(
+    resourceIds: readonly string[],
+    targetSpaces: readonly string[],
+  ): Promise<ProviderAttachmentRecord[]>
+  pageIdsForSpace(
+    targetSpace: string,
+    pendingAfter: string,
+    input: ProviderPageInput,
+  ): Promise<ProviderIdPage>
+}
+
+export type ProviderDisclosureBuilder = (
+  resource: ProviderResourceRecord,
+  credential: CredentialRecord | null,
+  targetSpace: string,
+) => ProviderDisclosureSnapshot
+
+export type ProviderAttachmentTransitionState = {
+  record: ProviderAttachmentRecord
+  resource: ProviderResourceRecord
+  credential: CredentialRecord | null
+}
+
+export type ProviderAttachmentOfferResult =
+  | ({ status: 'offered' } & ProviderAttachmentTransitionState)
+  | ({ status: 'already-attached' } & ProviderAttachmentTransitionState)
+  | { status: 'missing-resource' }
+  | { status: 'target-gone' }
+  | { status: 'owner-not-member' }
+
+export type ProviderAttachmentAcceptResult =
+  | ({
+      status: 'accepted' | 'already-active' | 'epoch-conflict' | 'expired'
+    } & ProviderAttachmentTransitionState)
+  | { status: 'missing' }
+  | { status: 'target-gone' }
+  | { status: 'owner-not-member' }
+
+export type ProviderAttachmentDetachResult =
+  | { status: 'detached'; targetSpace: string }
+  | { status: 'missing' }
+  | { status: 'target-gone' }
+  | { status: 'manager-not-member' }
+
+export type ProviderAttachmentLifecyclePersistence = {
+  /** Upserts only a pending row. A non-pending row remains byte-for-byte unchanged. */
+  offerProviderAttachment(
+    record: ProviderAttachmentRecord,
+    disclosureOf: ProviderDisclosureBuilder,
+  ): Promise<ProviderAttachmentOfferResult>
+  acceptProviderAttachment(
+    input: {
+      id: string
+      expectedResourceEpoch: number
+      expectedCredentialEpoch: number | null
+      acceptedAt: string
+      /** Null is the host-admin/system recovery override; otherwise rechecked under fence. */
+      manager: string | null
+    },
+    disclosureOf: ProviderDisclosureBuilder,
+  ): Promise<ProviderAttachmentAcceptResult>
+  detachProviderAttachment(input: {
+    id: string
+    /** Null is the host-admin/system recovery override. */
+    manager: string | null
+  }): Promise<ProviderAttachmentDetachResult>
+}
+
+export type ProviderRetargetInput = {
+  owner: string
+  credentialId: string
+  expectedCredentialRuntimeEpoch: number
+  origin: string
+  resources: Array<{
+    id: string
+    expectedRuntimeEpoch: number
+    baseUrl: string
+    detachCredential: boolean
+  }>
+}
+
+export type ProviderRetargetResult =
+  | {
+      status: 'retargeted'
+      credential: CredentialRecord
+      resources: ProviderResourceRecord[]
+    }
+  | { status: 'missing' }
+  | { status: 'conflict' }
+  | { status: 'references-changed' }
+
+/** One request the executor was allowed to send. Written in two phases: the intent
+ *  commits BEFORE the transport may send, and the outcome closes the same row when the
+ *  call settles. There are no prompt or response columns, and there never will be —
+ *  the journal is an audit of WHO called WHAT, not a second store of user content.
+ *
+ *  Owner-keyed and cross-Space, exactly like the per-user oauth facet, so `purgeSpace`
+ *  does NOT sweep it: "did that Space's content leave through this resource" is a
+ *  question asked after the Space is gone. */
+export type ProviderCallLogRecord = {
+  id: string
+  owner: string
+  /** The full principal id (`user:…` | `pat:…` | `oauth:…`) — the "which agent" lens. */
+  principal: string
+  /** Friendly name of the acting agent, snapshotted at write time so token rotation
+   *  cannot rewrite history. */
+  agent: string | null
+  /** Historical snapshots, both without a foreign key: the audit outlives them. */
+  resourceId: string
+  credentialId: string | null
+  /** The addressee's host — the address without its path. */
+  host: string
+  /** The Spaces whose content this call may carry; empty for a probe. */
+  spaces: string[]
+  /** The durable correlation. All three are null for an interactive call. */
+  jobId: string | null
+  jobCallKey: string | null
+  attemptNo: number | null
+  deliveryState: ProviderDeliveryState
+  /** Explicit, never derived from an HTTP status: true only for an outcome that
+   *  PROVES the request was not processed. */
+  retrySafe: boolean
+  outcome: ProviderCallOutcome
+  /** Null is "spend unknown", which is not zero. */
+  usage: ProviderUsage | null
+  createdAt: string
+  settledAt: string | null
+}
+
+export type ProviderCallIntentInput = {
+  id: string
+  owner: string
+  principal: string
+  agent: string | null
+  resourceId: string
+  credentialId: string | null
+  host: string
+  spaces: readonly string[]
+  /** Present exactly for a durable job call — the logical call the fence keys on. */
+  job: { jobId: string; jobCallKey: string } | null
+  createdAt: string
+}
+
+/** `blocked` is the send-fence refusing a resend: the latest attempt of this logical
+ *  job call either is still open or was answered, and neither proves the provider was
+ *  not paid. The caller reports the previous row rather than opening a second request. */
+export type ProviderCallIntentResult =
+  | { status: 'recorded'; record: ProviderCallLogRecord }
+  | { status: 'blocked'; record: ProviderCallLogRecord }
+
+export type ProviderCallSettleInput = {
+  id: string
+  deliveryState: ProviderDeliveryState
+  retrySafe: boolean
+  outcome: ProviderCallOutcome
+  usage: ProviderUsage | null
+  settledAt: string
+}
+
+/** The provider call journal. `append` is EXPECTED, unlike the agent-retrieval audit
+ *  it borrows its genre from: a refused intent aborts the call instead of being
+ *  swallowed, because an unrecorded send is exactly what the journal exists to
+ *  prevent. */
+export type ProviderCallLogPersistence = {
+  /** Records and COMMITS the intent, or refuses it at the durable send-fence. */
+  intent(input: ProviderCallIntentInput): Promise<ProviderCallIntentResult>
+  /** Closes an open row. A row already terminal is left alone and returned as it is. */
+  settle(input: ProviderCallSettleInput): Promise<ProviderCallLogRecord | null>
+  get(id: string): Promise<ProviderCallLogRecord | null>
+  /** The highest attempt of one logical durable call, or null when it has none. */
+  latestForJobCall(jobId: string, jobCallKey: string): Promise<ProviderCallLogRecord | null>
+  /** Bounded retention: terminal settled rows only; live job evidence is preserved. */
+  pruneTerminalBefore(before: string, limit?: number): Promise<number>
+  listForOwner(owner: string): Promise<ProviderCallLogRecord[]>
+}
+
+export const PROVIDER_PERSISTENCE_ERROR = {
+  staleCiphertextKey: 'PROVIDER_STALE_CIPHERTEXT_KEY',
+  credentialNotOwned: 'PROVIDER_CREDENTIAL_NOT_OWNED',
+  credentialOriginMismatch: 'PROVIDER_CREDENTIAL_ORIGIN_MISMATCH',
+  credentialInjectionCollision: 'PROVIDER_CREDENTIAL_INJECTION_COLLISION',
+  attachmentTargetGone: 'PROVIDER_ATTACHMENT_TARGET_GONE',
+  attachmentNotPending: 'PROVIDER_ATTACHMENT_NOT_PENDING',
+} as const
+
+export type ProviderPersistenceErrorCode =
+  (typeof PROVIDER_PERSISTENCE_ERROR)[keyof typeof PROVIDER_PERSISTENCE_ERROR]
+
+export const providerPersistenceError = (
+  code: ProviderPersistenceErrorCode,
+  message: string,
+): Error => Object.assign(new Error(message), { code })
 
 /** Derived space registry row; the `.notariummeta` marker is the source of truth.
  *  canon: docs/spaces.md#model · docs/architecture.md#p7 */
@@ -44,6 +504,7 @@ export type SpacesPersistence = {
   /** A slug collision surfaces as a driver UNIQUE violation — the rename caller maps it to 409. */
   upsert(record: SpaceRecord): Promise<void>
   getById(id: string): Promise<SpaceRecord | null>
+  getMany?(ids: readonly string[]): Promise<SpaceRecord[]>
   /** CURRENT slug only; alias history resolves in SpaceManager, not here. */
   getBySlug(slug: string): Promise<SpaceRecord | null>
   list(): Promise<SpaceRecord[]>
@@ -720,6 +1181,7 @@ export type AuthPersistence = {
   /** Throws on a duplicate username (the unique key IS the check). */
   createUser(user: UserRecord): Promise<void>
   getUser(username: string): Promise<UserRecord | null>
+  getUsers?(usernames: readonly string[]): Promise<UserRecord[]>
   listUsers(): Promise<UserRecord[]>
   updateUser(
     username: string,
@@ -748,6 +1210,9 @@ export type AuthPersistence = {
   ): Promise<void>
 
   grantsFor(username: string): Promise<Array<{ space: string; role: SpaceRole }>>
+  grantsForUsers?(
+    usernames: readonly string[],
+  ): Promise<Array<{ username: string; space: string; role: SpaceRole }>>
   /** Joined with users for the display name — what the members UI lists. */
   membersOf(
     space: string,
@@ -1484,6 +1949,12 @@ export type MetaDb = {
   spaceLifecycle: SpaceLifecyclePersistence
   causalOutbox: CausalOutboxPersistence
   installationGeneration: InstallationGenerationPersistence
+  secretKeyring: SecretKeyringPersistence
+  credentials: CredentialsPersistence
+  providerResources: ProviderResourcesPersistence
+  providerAttachments: ProviderAttachmentsPersistence
+  providerCallLog: ProviderCallLogPersistence
+  providerCiphertexts: ProviderCiphertextsPersistence
   ownerProofs: OwnerProofPersistence
   spaces: SpacesPersistence
   auth: AuthPersistence
@@ -1522,6 +1993,11 @@ export type MetaDb = {
     role: SpaceRole,
     createdAt: string,
   ): Promise<GrantMemberToActiveSpaceResult>
+  retargetProviderCredential(input: ProviderRetargetInput): Promise<ProviderRetargetResult>
+  removeMemberAndProviderAttachments(spaceId: string, username: string): Promise<void>
+  offerProviderAttachment: ProviderAttachmentLifecyclePersistence['offerProviderAttachment']
+  acceptProviderAttachment: ProviderAttachmentLifecyclePersistence['acceptProviderAttachment']
+  detachProviderAttachment: ProviderAttachmentLifecyclePersistence['detachProviderAttachment']
   /** Erase one space's rows across every facet in a single transaction (journal with
    *  CAS-blob GC, identity, folders/projects, favorites, sets, pins, order, memberships,
    *  delta cursors) + scrub its id from every `pats.spaces`

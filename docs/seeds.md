@@ -44,7 +44,7 @@ space-id — the consistency invariants from the task statement fall out «for f
 2. **Cases** (`test/cases/cases/`) — they **compose** fragments + structure + activity
    (they do not inline content). Reader cases are built FROM the corpus and auto-grow
    together with it.
-3. **Axes + coverage matrix** (`axes.ts`, `coverage.ts`) — 20 product axes, each tied to
+3. **Axes + coverage matrix** (`axes.ts`, `coverage.ts`) — 21 product axes, each tied to
    surfaces + a canon doc; cases tag `axes`. `make seed-coverage` prints the matrix; the
    coverage test fails on a gap.
 4. **Appliers** — `caseToFixture` (fake) and `scripts/seed.ts` (real). The case model is
@@ -155,6 +155,20 @@ counters stops distinguishing a re-derived row from an adopted one.
 |---|---|---|
 | `demo` | a self-hosting developer's knowledge base (architecture / decisions / runbooks / an incident) — the source for the landing-page, README and docs-site screenshots. Strings live per-locale in `test/cases/demo/`; the case owns only the shape. Carries ONE agent-signed revision on purpose (the history frame). Shot with `make demo-shots` — see [demo-screenshots.md](demo-screenshots.md) | content, structure, history, activity, graph, search, auth |
 
+**Model providers:**
+
+| Case | About | Axes |
+|---|---|---|
+| `providers` | encrypted credential/resource carriers in both appliers; two resources sharing one credential, an unreferenced credential, resource without credential, disabled/mismatched/unreadable/deactivated-owner states, active/pending/awaiting-reconsent attachments, a near-expiry offer and an archived target whose attachment remains intact | providers, auth |
+| `providers-disabled` | the subsystem capability is off over a non-empty encrypted provider database: routes/tabs stay absent while credential/resource rows and backup input survive | providers, auth |
+
+`make provider-scale-gate` is the disposable volume counterpart to these manual cases. It
+loads 10,000 credentials, resources, attachments and terminal call rows through the real
+SQLite provider contour, then prints numeric startup, effective-resolution, consent,
+retarget, key-rotation and retention results. Correctness and constant persistence-port
+counts are asserted; machine-dependent milliseconds and heap are recorded, not frozen as
+thresholds.
+
 **Agent memory / import:**
 
 | Case | About | Axes |
@@ -178,10 +192,10 @@ Normally each applier derives a note's physical identity for itself — the fake
 
 ## Axes and coverage
 
-20 axes (`axes.ts`): `content`, `structure`, `folder-page`, `activity`, `history`,
+21 axes (`axes.ts`): `content`, `structure`, `folder-page`, `activity`, `history`,
 `trash`, `identity`, `search`, `graph`, `agent-memory`, `note-classes`, `import`,
-`jobs`, `scale`, `auth`, `favorites`, `fields`, `agent-audit`, `agent-sessions`, `agent-roles`. Each is tied to
-surfaces + canon docs.
+`jobs`, `scale`, `auth`, `favorites`, `agent-audit`, `agent-sessions`, `agent-roles`,
+`fields`, `providers`. Each is tied to surfaces + canon docs.
 
 ```
 make seed-coverage      # axis×case + feature×fragment matrix + gaps
@@ -196,6 +210,9 @@ caught rather than silently skipped.
 ```
 make seed-list                                     # list of cases
 make seed CASE=reader-showcase                      # (re)seed the local stand
+make seed CASE=providers                            # provider management/consent states
+make seed CASE=providers-disabled                   # populated DB, served capability off
+make provider-scale-gate                            # 10k provider startup/read/maintenance artifact
 make seed CASE=tree-sort                            # explorer Name/Created/Modified QA
 make seed CASE=dashboard-activity SCALE=1 SEED=x PASSWORD=secret
 make seed CASE=reader-showcase,graph,trash-mixed    # COMBINATION of cases
@@ -281,6 +298,10 @@ host-bind `docker/volumes/data`). Env without Make: `CASE`, `SCALE`, `SEED`, `NO
 from **the same resolver as the server** (`dataPathsFromEnv`, [a single data-root](architecture.md#data-root)),
 not from its own copy: it writes exactly the files that the stand later reads, so a
 divergence would seed one stand but bring up another.
+For a provider case, the same world also supplies the dev runtime's
+`PROVIDERS_ENABLED` and exact `PROVIDERS_PRIVATE_ORIGINS`: `providers-disabled`
+therefore starts with populated encrypted rows and no provider routes/tabs, while an
+unrelated case keeps the checkout's ordinary `.env` values.
 The default login for the stand is **`admin` / `admin`** (see «Login» below).
 
 `tree-sort` is the deliberate exception with its own `sam` / `seed-pass` user and personal memory. On the real file-backed stand, authored `createdAt` is exact, while absolute `modifiedAt` may cluster around seed time because the engine observes filesystem mtime. The replay order still makes relative Modified ordering deterministic; the case tests that ordering, not the displayed wall-clock value.
@@ -567,6 +588,11 @@ required to match its directory.
   `restore`→`store.restoreFromTrash` (an honest `kind:'restore'` revision), an
   `externalRewrite`→a same-size/mtime direct markdown write after the timeline, an
   `archived` space→`manager.archive` after the seed (moves to Trash→Spaces, data intact).
+  Provider declarations mint the canonical credential keyring before the first
+  ciphertext, then run through `ProviderRegistry` and production persistence. The two
+  deliberately impossible product states (origin mismatch and a carrier naming a lost
+  key) are applied after the normal write through a backend-specific raw transaction;
+  SQLite and PostgreSQL receive the same final record.
   Declared `revisionStates` are appended through the production revision persistence after
   the ordinary timeline, with the real note id, expected-head CAS, encoded bytes, semantic
   fingerprint and persisted restore safety.
@@ -596,13 +622,20 @@ required to match its directory.
   ("the fake does not express Enable/Disable"), and it was the reason no browser gate
   could START from a disabled ability — it could only click one off. Proven end to end
   in `test/fake-server/seedCatalog.test.ts`.
+  Provider declarations use the same shared applier. The fake mints a temporary
+  filesystem keyring through `CredentialKeyringService`, stores real envelopes in its
+  strict in-memory persistence, applies the named raw corruptions only after a valid
+  create, and archives target Spaces through the real `SpaceManager` lifecycle.
 
 ## Deliberate caveats
 
-- **The fake does not express space-archive.** In the fake's projection an archived
-  space sits as LIVE (there is no field in `SpaceFixture`). On the REAL stand it is
-  honest (the seeder calls `manager.archive`). Verified live.
-  - *Blob readability* used to be listed here too — it no longer is (#256). The fake
+- **Space archive is expressed by both appliers.** The fake creates an archived case
+  Space as a runtime (not config-pinned) Space, seeds its rows, then calls the same
+  `SpaceManager.archive` lifecycle as the real applier. This is required for provider
+  resolution to keep an accepted attachment and return `space-archived` rather than
+  silently serving the target as live.
+  - *Blob readability* used to be listed here too — it is also no longer a caveat
+    (#256). The fake
     projection now stamps every seeded revision with the body it carried and
     content-addresses it into the blob table, exactly like a live write, so a
     tombstone keeps the note's last known content. Two things fall out of the same change: a seeded revision chain

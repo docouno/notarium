@@ -66,6 +66,7 @@ describe('createServer — runtime space creation (#69)', () => {
 
     const config = (await app.inject({ method: 'GET', url: '/api/config' })).json()
     expect(config.capabilities.spaceCreate).toBe(true)
+    expect(config.capabilities.providers).toBe(false)
 
     // Mint a space that is NOT in SPACES_CONFIG.
     const created = await app.inject({
@@ -265,6 +266,7 @@ describe('createServer — runtime space creation (#69)', () => {
 
     const config = (await app.inject({ method: 'GET', url: '/api/config' })).json()
     expect(config.capabilities.spaceCreate).toBe(false)
+    expect(config.capabilities.providers).toBe(false)
     const created = await app.inject({
       method: 'POST',
       url: '/api/spaces',

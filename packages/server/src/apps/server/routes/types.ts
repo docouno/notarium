@@ -20,6 +20,7 @@ import type {
 } from '../../../services/metaDb'
 import type { BulkRestoreCoordinator, RestoreCoordinator } from '../../../services/noteRestore'
 import type { MarkerStore } from '../../../services/projects'
+import type { ProviderRegistry } from '../../../services/providerRegistry'
 import type { RolesService } from '../../../services/roles'
 import type { SpaceManager } from '../../../services/spaces'
 
@@ -30,6 +31,7 @@ export type ApiRoutesOptions = {
   spaces: SpaceManager
   auth: AuthService
   roles?: RolesService
+  providerRegistry?: ProviderRegistry
   abilities?: AbilitiesService
   sessions?: AgentSessionsPersistence
   projects?: ProjectsPersistence

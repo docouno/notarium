@@ -14,6 +14,7 @@ import {
 import { backupControlSocketFromEnv } from '../../libs/backupControl'
 import { loadEnv } from '../../libs/env'
 import { trustProxyFromEnv } from '../../libs/trustProxy'
+import { credentialKeyringConfigFromEnv } from '../../services/credentialKeyring'
 import { replayKeyringConfigFromEnv } from '../../services/installationReplayKey'
 import {
   type DataPaths,
@@ -22,6 +23,11 @@ import {
   ensureDataRoot,
   legacyMetaDbAt,
 } from './dataPaths'
+import {
+  providerCallLogRetentionFromEnv,
+  providersEnabledFromEnv,
+  providersPrivateOriginsFromEnv,
+} from './providersEnv'
 import { graphSearchTuning, wikilinkParseCacheFromEnv } from './searchTuningEnv'
 import { createServer, type CreateServerOptions } from './server'
 import { spacesFromEnv } from './spacesFromEnv'
@@ -53,6 +59,35 @@ const dataPaths = ((): DataPaths => {
 const replayKeyring = (() => {
   try {
     return replayKeyringConfigFromEnv(dataPaths.dataDir, dataPaths.metaDbUrl, process.env)
+  } catch (err) {
+    console.error(`\n[notarium] ${(err as Error).message}\n`)
+    process.exit(1)
+  }
+})()
+const credentialKeyring = (() => {
+  try {
+    return credentialKeyringConfigFromEnv(
+      {
+        dataDir: dataPaths.dataDir,
+        metaDbUrl: dataPaths.metaDbUrl,
+        packedRoots: [dataPaths.defaultSpacesRoot, dataPaths.jobsDataDir, replayKeyring.path],
+      },
+      process.env,
+    )
+  } catch (err) {
+    console.error(`\n[notarium] ${(err as Error).message}\n`)
+    process.exit(1)
+  }
+})()
+const providers = (() => {
+  try {
+    return {
+      enabled: providersEnabledFromEnv(process.env.PROVIDERS_ENABLED),
+      privateOrigins: providersPrivateOriginsFromEnv(process.env.PROVIDERS_PRIVATE_ORIGINS),
+      callLogRetentionDays: providerCallLogRetentionFromEnv(
+        process.env.PROVIDERS_CALL_LOG_RETENTION_DAYS,
+      ),
+    }
   } catch (err) {
     console.error(`\n[notarium] ${(err as Error).message}\n`)
     process.exit(1)
@@ -324,6 +359,8 @@ const app = await createServer({
   trustProxy: TRUST_PROXY || undefined,
   backupControlSocket: backupControlSocketFromEnv(),
   replayKeyring,
+  credentialKeyring,
+  providers,
 }).catch((err: unknown) => {
   console.error(`\n[notarium] ${(err as Error).message}\n`)
   console.error(err)

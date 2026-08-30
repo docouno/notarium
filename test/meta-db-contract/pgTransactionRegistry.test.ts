@@ -19,6 +19,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   LEVELS_NO_STATEMENT_CAN_ENTER,
+  LOCK_LEVEL_OF_TABLE,
   LOCK_LEVELS,
   type LockLevel,
   NO_FOREIGN_KEY_MAY_POINT_AT,
@@ -393,6 +394,20 @@ describe('Postgres transaction register', () => {
     }
 
     expect(offenders).toEqual([])
+  })
+
+  it('keeps every current provider contour table in the lock hierarchy', () => {
+    const providerTables = [
+      'secret_keyring',
+      'credentials',
+      'provider_resources',
+      'provider_attachments',
+      'provider_call_log',
+    ]
+
+    expect(providerTables.filter((table) => Object.hasOwn(LOCK_LEVEL_OF_TABLE, table))).toEqual(
+      providerTables,
+    )
   })
 
   // The question NO gate asked: not "is this level in order", but "is there a way INTO

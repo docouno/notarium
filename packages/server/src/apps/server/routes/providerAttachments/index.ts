@@ -1,0 +1,1 @@
+export { providerAttachmentsRoutes } from './providerAttachments'

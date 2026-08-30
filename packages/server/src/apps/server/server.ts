@@ -34,6 +34,11 @@ import { notesDirReader } from '../../libs/notesDir'
 import { DurableAbilityCreator } from '../../services/abilities'
 import { type AuthMode, createAuthService } from '../../services/auth'
 import { CausalOutboxProjector, causalReplicaId } from '../../services/causalOutboxProjector'
+import {
+  CredentialKeyring,
+  type CredentialKeyringConfig,
+  CredentialKeyringService,
+} from '../../services/credentialKeyring'
 import { createFieldSchemaStore } from '../../services/fields'
 import { closeTerminalImportReservations } from '../../services/import'
 import {
@@ -46,6 +51,7 @@ import {
   META_DB_TARGET_KIND,
   metaDbFlavourOf,
   metaDbTargetOf,
+  pruneProviderCallLogRetention,
   type SpaceRecord,
 } from '../../services/metaDb'
 import { BulkRestoreCoordinator, RestoreCoordinator } from '../../services/noteRestore'
@@ -59,6 +65,8 @@ import {
   readRootMarker,
   scanProjectsAtBoot,
 } from '../../services/projects'
+import { ProviderRegistry } from '../../services/providerRegistry'
+import { ProviderRuntime } from '../../services/providerRuntime'
 import {
   createFsRoleLibrary,
   createProjectedRolePackageScope,
@@ -76,6 +84,7 @@ import {
   JOB_KIND_IMPORT,
   jobToWire,
 } from './consumers'
+import type { ProviderConfig } from './providersEnv'
 
 /** Per-space engine config. canon: docs/architecture.md#p11 */
 export type SpaceConfig = {
@@ -231,6 +240,12 @@ export type CreateServerOptions = {
   /** Installation-wide HMAC keyring. The process entry always supplies it;
    *  embedded/test hosts may omit it until they enable durable restore replay. */
   replayKeyring?: ReplayKeyringConfig
+  /** Reversible provider-secret keyring. Config is validated even while providers
+   *  are off; no filesystem state is created until the subsystem is enabled. */
+  credentialKeyring?: CredentialKeyringConfig
+  /** Model-provider subsystem deploy config. Absent on embedded/test hosts means
+   *  disabled with no operator-admitted private origins. */
+  providers?: ProviderConfig
 }
 
 export const createServer = async ({
@@ -255,6 +270,8 @@ export const createServer = async ({
   backgroundDripMs,
   backupControlSocket,
   replayKeyring,
+  credentialKeyring,
+  providers,
 }: CreateServerOptions): Promise<FastifyInstance> => {
   // `createServer` is also a public composition boundary (tests and embedders call
   // it without going through spacesFromEnv). Reject labels that could not be
@@ -287,7 +304,43 @@ export const createServer = async ({
           topology: replayKeyring.topology,
         })
       : undefined
+  const credentialKeyringService =
+    metaDb && credentialKeyring && providers?.enabled
+      ? new CredentialKeyringService({
+          persistence: metaDb.secretKeyring,
+          keyring: new CredentialKeyring(credentialKeyring.path, credentialKeyring.packedRoots),
+          ciphertexts: metaDb.providerCiphertexts,
+        })
+      : undefined
   const mutationGate = createMutationGate()
+  // The journal is not optional, so neither is the meta-DB: a host that cannot record
+  // a call does not make one. Without persistence the registry is absent anyway and
+  // nothing would ever reach this runtime.
+  const providerRuntime =
+    metaDb && providers?.enabled
+      ? new ProviderRuntime({
+          privateOrigins: providers.privateOrigins,
+          callLog: metaDb.providerCallLog,
+          mutationGate,
+        })
+      : undefined
+  const providerRegistry =
+    metaDb && credentialKeyringService && providers?.enabled
+      ? new ProviderRegistry({
+          credentials: metaDb.credentials,
+          resources: metaDb.providerResources,
+          attachments: metaDb.providerAttachments,
+          attachmentLifecycle: metaDb,
+          spaces: metaDb.spaces,
+          projects: metaDb.projects,
+          directory: metaDb.auth,
+          keyring: credentialKeyringService,
+          privateOrigins: providers.privateOrigins,
+          runtime: providerRuntime,
+          mutationGate,
+          authMode: authMode ?? AUTH_MODE.password,
+        })
+      : undefined
   // The ONE process-global cooperative scheduler — a single instance gates all
   // spaces, so embed backfill and graph enrichment yield to every space's traffic.
   const scheduler = new BackgroundScheduler({
@@ -310,6 +363,9 @@ export const createServer = async ({
     spaces: metaDb?.spaces,
     aliasesForSpace: (id) => manager.resolvableAliasesOf(id),
     runMutation: (task) => mutationGate.run(task),
+    removeMemberAndProviderAttachments: metaDb
+      ? (space, username) => metaDb.removeMemberAndProviderAttachments(space, username)
+      : async () => {},
   })
   const configBySlug = new Map(spaces.map((s) => [s.slug, s]))
 
@@ -743,11 +799,17 @@ export const createServer = async ({
           // row-aware once its job is terminal/gone; an in-progress `.import.part` is
           // invisible to that pass and reclaimed only past the part-grace (a crash
           // leftover). A live/retrying import keeps its source regardless of age.
-          onMaintenance: () =>
-            staging.sweepOrphans(async (id) => {
+          onMaintenance: async () => {
+            await staging.sweepOrphans(async (id) => {
               const j = await metaDb.jobs.get(id)
               return !!j && (j.status === 'pending' || j.status === 'running')
-            }, Date.now()),
+            }, Date.now())
+            await pruneProviderCallLogRetention(metaDb.providerCallLog, {
+              now: new Date(),
+              days:
+                providers?.callLogRetentionDays === undefined ? 90 : providers.callLogRetentionDays,
+            })
+          },
           // Terminal claims close before retention can remove the row that proves
           // the job ended, and before the staging sweep reclaims what it read.
           onTerminalCleanup: () =>
@@ -769,11 +831,14 @@ export const createServer = async ({
     authMode: authMode ?? AUTH_MODE.password,
     metaDbFlavour: metaDbFlavourOf(metaDbUrl),
     spaces,
+    providers: providers?.enabled,
+    credentialKeyring: credentialKeyringService?.diagnostic,
   })
   const app = await buildApp({
     spaces: manager,
     auth,
     roles,
+    providerRegistry,
     scheduler,
     sessions: metaDb?.sessions,
     customAbilityCreator,
@@ -822,6 +887,11 @@ export const createServer = async ({
     // Installation recovery precedes lifecycle replay and disk discovery: no
     // watcher or public mutation may observe an ambiguous replay-key generation.
     await installationReplayKey?.bootstrap()
+    const credentialKey = await credentialKeyringService?.bootstrap()
+
+    if (credentialKeyringService && !credentialKey) {
+      console.error(`[providers] ${credentialKeyringService.errorMessage()}`)
+    }
     // init provisions config spaces AND recovers runtime spaces from the registry —
     // runtime spaces live only in the registry, so without this they'd vanish on restart.
     await manager.init()
@@ -865,6 +935,7 @@ export const createServer = async ({
     await backupControl?.start()
   })
   app.addHook('onClose', async () => {
+    providerRuntime?.close()
     await backupControl?.close().catch(() => {})
     await causalOutboxProjector?.stop().catch(() => {})
     // Stop the job runner FIRST: abort in-flight handlers and release their

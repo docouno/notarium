@@ -17,13 +17,62 @@ import { describeIdentityPersistenceContract } from './identityPersistenceContra
 import { describeImportReservationsContract } from './importReservationsContract'
 import { describeJobsContract } from './jobsContract'
 import { describeLegacyNameAliasesContract } from './legacyNameAliasesContract'
+import { describeProviderCallLogContract } from './providerCallLogContract'
+import { describeProviderCiphertextsContract } from './providerCiphertextsContract'
+import { describeProviderFacetsContract } from './providerFacetsContract'
 import { describeRevisionPersistenceContract } from './revisionPersistenceContract'
+import { describeSecretKeyringContract } from './secretKeyringContract'
 import { describeSessionAuditContract } from './sessionAuditContract'
 import { describeSpaceLifecycleWriterContract } from './spaceLifecycleWriterContract'
 
 describeGatewayStateContract('SQLite', async () => {
   const db = new SqliteMetaDb(':memory:')
   return { persistence: db.gateway, teardown: () => db.close() }
+})
+
+describeSecretKeyringContract('SQLite', async () => {
+  const db = new SqliteMetaDb(':memory:')
+  return { persistence: db.secretKeyring, teardown: () => db.close() }
+})
+
+describeProviderFacetsContract('SQLite', async () => {
+  const db = new SqliteMetaDb(':memory:')
+  return {
+    secretKeyring: db.secretKeyring,
+    credentials: db.credentials,
+    resources: db.providerResources,
+    attachments: db.providerAttachments,
+    lifecycle: db,
+    ciphertexts: db.providerCiphertexts,
+    spaces: db.spaces,
+    auth: db.auth,
+    retargetProviderCredential: (input) => db.retargetProviderCredential(input),
+    removeMemberAndProviderAttachments: (space, username) =>
+      db.removeMemberAndProviderAttachments(space, username),
+    purgeSpace: (space: string) => db.purgeSpace(space),
+    teardown: () => db.close(),
+  }
+})
+
+describeProviderCallLogContract('SQLite', async () => {
+  const db = new SqliteMetaDb(':memory:')
+  return {
+    callLog: db.providerCallLog,
+    jobs: db.jobs,
+    purgeSpace: (space: string) => db.purgeSpace(space),
+    teardown: () => db.close(),
+  }
+})
+
+describeProviderCiphertextsContract('SQLite', async () => {
+  const db = new SqliteMetaDb(':memory:')
+  return {
+    secretKeyring: db.secretKeyring,
+    credentials: db.credentials,
+    resources: db.providerResources,
+    ciphertexts: db.providerCiphertexts,
+    teardown: () => db.close(),
+  }
 })
 
 describeAgentDeltaCursorsContract('SQLite', async () => {

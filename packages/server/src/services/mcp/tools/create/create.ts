@@ -1,6 +1,6 @@
 // create_note / create_notes: the knowledge-write path.
 // canon: docs/mcp-gateway.md#tools
-import { NOTE_CLASS } from '@notarium/contract'
+import { detectSecretWarnings, NOTE_CLASS } from '@notarium/contract'
 import {
   type BatchCreateResult,
   type CreateNoteInput,
@@ -20,23 +20,6 @@ import { handleOf } from '../../helpers/projectAddressing'
 import { writeAttributionOf } from '../../helpers/writeAttribution'
 import { sanitizeText } from '../../sanitize'
 import { resolveLinkTitle } from '../links'
-
-/** Deliberately narrow credential detectors for the non-binding secret nudge:
- *  a noisy false positive trains agents to ignore it; never blocks the write. */
-const SECRET_PATTERNS: RegExp[] = [
-  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/,
-  /\bAKIA[0-9A-Z]{16}\b/, // AWS access key id
-  /\bghp_[A-Za-z0-9]{36}\b/, // GitHub personal access token
-  /\bgithub_pat_[A-Za-z0-9_]{22,}\b/, // GitHub fine-grained PAT
-  /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/, // Slack token
-  /\bsk-[A-Za-z0-9]{20,}\b/, // OpenAI-style secret key
-  /\bAIza[0-9A-Za-z_-]{35}\b/, // Google API key
-  /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{6,}/, // JWT
-  /(?:api[_-]?key|secret|password|passwd|token)["'`]?\s*[:=]\s*["'`][^"'`\s]{12,}["'`]/i,
-]
-
-const detectSecretWarnings = (text: string): string[] =>
-  SECRET_PATTERNS.some((re) => re.test(text)) ? ['possible-secret'] : []
 
 type ProjectPrefixCache = Map<string, string | null>
 

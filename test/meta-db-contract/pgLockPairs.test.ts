@@ -34,7 +34,12 @@ import { expect } from 'vitest'
 import { type IdentityRecord, serializeAbilityLocator } from '@notarium/core'
 
 import { abilityPackageOfLocator } from '../../packages/server/src/services/metaDb/abilityAddress'
-import { ABILITY_TARGET_PURGED, type MetaDb } from '../../packages/server/src/services/metaDb/types'
+import {
+  ABILITY_TARGET_PURGED,
+  type MetaDb,
+  PROVIDER_PERSISTENCE_ERROR,
+} from '../../packages/server/src/services/metaDb/types'
+import { providerDisclosureOf } from '../../packages/server/src/services/providerRegistry'
 import { createPostgresTestSchema, describePostgres } from './postgresHarness'
 
 const AT = '2026-08-11T10:00:00.000Z'
@@ -42,21 +47,26 @@ const SPACE = 'alpha'
 const NOTE = 'note-a'
 const PROJECT = 'project-alpha'
 const PACKAGE = 'AbCdefGhij_1'
+const PROVIDER_KEY = { keyId: 'ck_111111111111111111111111', generation: 1 }
+const NEXT_PROVIDER_KEY = { keyId: 'ck_222222222222222222222222', generation: 2 }
 const DEADLOCK = '40P01'
 
-/** The 32-bit key `lockOrder` builds a per-scope advisory on, spelled here because a
- *  probe that held some other number would wait on nothing and pass. Same hash, same
- *  input (`kind:id`) — if the producer's ever stops being this, the probe stops seeing
- *  two waiters and says so. */
-const scopeLockKey = (targetKind: string, targetId: string): number => {
+/** The 32-bit hash every advisory key in `lockOrder` is built with, spelled here
+ *  because a probe that held some other number would wait on nothing and pass. If the
+ *  producer's ever stops being this, the probe stops seeing two waiters and says so. */
+const hash32 = (value: string): number => {
   let hash = 0
 
-  for (const character of `${targetKind}:${targetId}`) {
+  for (const character of value) {
     hash = (Math.imul(31, hash) + character.charCodeAt(0)) | 0
   }
 
   return hash
 }
+
+/** The per-scope advisory key: same hash, same input (`kind:id`). */
+const scopeLockKey = (targetKind: string, targetId: string): number =>
+  hash32(`${targetKind}:${targetId}`)
 
 type Probe = { id: string; run: (db: MetaDb) => Promise<unknown> }
 
@@ -173,6 +183,68 @@ const PROBES: readonly Probe[] = [
         trail: 'record',
       }),
   },
+  {
+    // The current provider-space writer: target-space fence (L3s), resource (L5r),
+    // then attachment (L5a). Vertical 14 adds retargeting to the same pair matrix.
+    id: 'providerAttachments.offerProviderAttachment',
+    run: (db) =>
+      db.offerProviderAttachment(
+        {
+          id: 'provider-attachment-probe',
+          resourceId: 'provider-resource-probe',
+          targetKind: 'space',
+          targetId: SPACE,
+          targetSpace: SPACE,
+          state: 'pending',
+          resourceEpoch: null,
+          credentialEpoch: null,
+          disclosure: null,
+          createdAt: AT,
+          expiresAt: '2026-08-25T00:00:00.000Z',
+        },
+        providerDisclosureOf,
+      ),
+  },
+  {
+    id: 'providerAttachments.acceptProviderAttachment',
+    run: (db) =>
+      db.acceptProviderAttachment(
+        {
+          id: 'provider-attachment-probe',
+          expectedResourceEpoch: 0,
+          expectedCredentialEpoch: 0,
+          acceptedAt: AT,
+          manager: 'al',
+        },
+        providerDisclosureOf,
+      ),
+  },
+  {
+    id: 'providerAttachments.detachProviderAttachment',
+    run: (db) => db.detachProviderAttachment({ id: 'provider-attachment-probe', manager: 'al' }),
+  },
+  {
+    id: 'pgMetaDb.retargetProviderCredential',
+    run: (db) =>
+      db.retargetProviderCredential({
+        owner: 'al',
+        credentialId: 'provider-credential-probe',
+        expectedCredentialRuntimeEpoch: 0,
+        origin: 'https://provider-next.example',
+        resources: [
+          {
+            id: 'provider-resource-probe',
+            expectedRuntimeEpoch: 0,
+            baseUrl: 'https://provider-next.example/v1',
+            detachCredential: false,
+          },
+        ],
+      }),
+  },
+  {
+    id: 'pgMetaDb.removeMemberAndProviderAttachments',
+    run: (db) => db.removeMemberAndProviderAttachments(SPACE, 'al'),
+  },
   { id: 'revisions.purgeNotes', run: (db) => db.revisions.purgeNotes(SPACE, [NOTE]) },
   { id: 'pgMetaDb.purgeSpace', run: (db) => db.purgeSpace(SPACE) },
 ]
@@ -210,6 +282,16 @@ const seed = async (db: MetaDb): Promise<void> => {
     lastSeen: AT,
     createdAt: AT,
   })
+  await db.auth.createUser({
+    username: 'al',
+    displayName: 'Al',
+    passwordHash: null,
+    admin: false,
+    disabledAt: null,
+    createdAt: AT,
+    personalSpace: null,
+  })
+  await db.auth.upsertMember(SPACE, 'al', 'owner', AT)
   await db.identity.claimMany([identity(NOTE), identity('note-observed-neighbour')])
   await db.contextSets.createSet({
     id: 'set-1',
@@ -238,6 +320,68 @@ const seed = async (db: MetaDb): Promise<void> => {
     { entryKind: 'pin', entryRef: NOTE },
     { entryKind: 'set', entryRef: 'set-1' },
   ])
+  await db.secretKeyring.replaceNonRetiredWith({
+    ...PROVIDER_KEY,
+    canary: `v1.${PROVIDER_KEY.keyId}.YWJj`,
+    state: 'active',
+    createdAt: AT,
+    retiredAt: null,
+  })
+  await db.credentials.create(
+    {
+      id: 'provider-credential-probe',
+      owner: 'al',
+      name: 'Provider credential',
+      kind: 'bearer',
+      secret: `v1.${PROVIDER_KEY.keyId}.YWJj`,
+      origin: 'https://provider.example',
+      injection: { header: '', prefix: 'Bearer ' },
+      disabledAt: null,
+      rpm: null,
+      tpm: null,
+      consentEpoch: 0,
+      runtimeEpoch: 0,
+    },
+    PROVIDER_KEY,
+  )
+  await db.providerResources.create(
+    {
+      id: 'provider-resource-probe',
+      owner: 'al',
+      name: 'Provider resource',
+      wire: 'openai-compatible',
+      baseUrl: 'https://provider.example/v1',
+      headers: {},
+      allowPrivateNetwork: false,
+      purposes: ['chat'],
+      models: [],
+      defaultModel: null,
+      credentialId: 'provider-credential-probe',
+      consentEpoch: 0,
+      runtimeEpoch: 0,
+      disabledAt: null,
+      lastCheck: {},
+      firstByteTimeoutMs: 30_000,
+      callTimeoutMs: 300_000,
+    },
+    null,
+  )
+  await db.offerProviderAttachment(
+    {
+      id: 'provider-attachment-probe',
+      resourceId: 'provider-resource-probe',
+      targetKind: 'space',
+      targetId: SPACE,
+      targetSpace: SPACE,
+      state: 'pending',
+      resourceEpoch: null,
+      credentialEpoch: null,
+      disclosure: null,
+      createdAt: AT,
+      expiresAt: '2026-08-25T00:00:00.000Z',
+    },
+    providerDisclosureOf,
+  )
   await db.revisions.append(
     {
       noteId: NOTE,
@@ -720,6 +864,157 @@ describePostgres('Postgres deadlock probes', PROBE_SUITE, () => {
         (await db.scopePins.pinsForTarget('role', toTargetId)).map((pin) => pin.noteId),
       ).toEqual([NOTE])
       expect(await db.scopePins.pinsForTarget('role', fromTargetId)).toEqual([])
+    } finally {
+      await release()
+      await gate.end().catch(() => {})
+      await testSchema.teardown()
+    }
+  })
+
+  it('serializes two re-claims of one logical job call so only one may send', async () => {
+    const testSchema = await createPostgresTestSchema('lock_pairs_call_log')
+    const db = testSchema.db
+    const gate = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const job = { jobId: 'job-1', jobCallKey: 'embed-batch-0' }
+    const intent = (id: string) =>
+      db.providerCallLog
+        .intent({
+          id,
+          owner: 'al',
+          principal: 'user:al',
+          agent: null,
+          resourceId: 'resource-a',
+          credentialId: null,
+          host: 'provider.example',
+          spaces: [],
+          job,
+          createdAt: AT,
+        })
+        .then(
+          (result) => result,
+          (error: unknown) => error,
+        )
+
+    let release = async (): Promise<void> => {}
+
+    try {
+      const held = await gate.connect()
+
+      release = async () => {
+        release = async () => {}
+        await held.query('COMMIT').catch(() => {})
+        held.release()
+      }
+      await held.query('BEGIN')
+      await held.query('SELECT pg_advisory_xact_lock($1, $2)', [
+        // The producer's namespace and key, spelled out: a probe holding some other
+        // number would wait on nothing and pass while the fence was missing.
+        0x7063_614c,
+        hash32(`${job.jobId}\u0000${job.jobCallKey}`),
+      ])
+
+      const first = intent('call-1')
+      const second = intent('call-2')
+
+      await requireWaiters(testSchema.admin, testSchema.schema, 2)
+      await release()
+
+      // Both re-claims read "no attempt yet" if nothing serializes them, and both
+      // send. Here one records and the other is refused BY the first — the second
+      // never becomes an upstream request, and it is not a unique violation either.
+      const outcomes = [await first, await second] as Array<{ status?: string }>
+      expect(outcomes.map((outcome) => outcome.status).sort()).toEqual(['blocked', 'recorded'])
+      expect(await db.providerCallLog.listForOwner('al')).toHaveLength(1)
+      expect(await db.providerCallLog.latestForJobCall(job.jobId, job.jobCallKey)).toMatchObject({
+        attemptNo: 1,
+      })
+    } finally {
+      await release()
+      await gate.end().catch(() => {})
+      await testSchema.teardown()
+    }
+  })
+
+  it('serializes the final zero-reference retirement against a stale ciphertext writer', async () => {
+    const testSchema = await createPostgresTestSchema('lock_pairs_key_retire')
+    const db = testSchema.db
+    const gate = new pg.Pool({ connectionString: testSchema.scopedUrl })
+
+    let release = async (): Promise<void> => {}
+
+    try {
+      await db.secretKeyring.replaceNonRetiredWith({
+        ...PROVIDER_KEY,
+        canary: `v1.${PROVIDER_KEY.keyId}.YWJj`,
+        state: 'active',
+        createdAt: AT,
+        retiredAt: null,
+      })
+      await db.secretKeyring.admitReadable({
+        ...NEXT_PROVIDER_KEY,
+        canary: `v1.${NEXT_PROVIDER_KEY.keyId}.YWJj`,
+        state: 'readable',
+        createdAt: AT,
+        retiredAt: null,
+      })
+      await db.secretKeyring.projectActive(NEXT_PROVIDER_KEY)
+      const held = await gate.connect()
+
+      release = async () => {
+        release = async () => {}
+        await held.query('COMMIT').catch(() => {})
+        held.release()
+      }
+      await held.query('BEGIN')
+      await held.query('SELECT pg_advisory_xact_lock($1, $2)', [0x7365_634b, 0])
+
+      const staleWriter = db.credentials
+        .create(
+          {
+            id: 'credential-after-final-scan',
+            owner: 'user:al',
+            name: 'Stale writer',
+            kind: 'bearer',
+            secret: `v1.${PROVIDER_KEY.keyId}.YWJj`,
+            origin: 'https://provider.example',
+            injection: { header: '', prefix: 'Bearer ' },
+            disabledAt: null,
+            rpm: null,
+            tpm: null,
+            consentEpoch: 0,
+            runtimeEpoch: 0,
+          },
+          PROVIDER_KEY,
+        )
+        .then(
+          () => null,
+          (error: unknown) => error,
+        )
+      const retiring = db.providerCiphertexts
+        .retireKeys({
+          active: NEXT_PROVIDER_KEY,
+          sourceKeyIds: new Set([PROVIDER_KEY.keyId]),
+          retiredAt: AT,
+        })
+        .then(
+          (result) => result,
+          (error: unknown) => error,
+        )
+
+      await requireWaiters(testSchema.admin, testSchema.schema, 2)
+      await release()
+
+      expect(await staleWriter).toMatchObject({
+        code: PROVIDER_PERSISTENCE_ERROR.staleCiphertextKey,
+      })
+      expect(await retiring).toMatchObject({
+        status: 'retired',
+        retiredKeyIds: [PROVIDER_KEY.keyId],
+      })
+      expect(await db.credentials.get('credential-after-final-scan')).toBeNull()
+      expect(
+        (await db.secretKeyring.list()).find((row) => row.keyId === PROVIDER_KEY.keyId)?.retiredAt,
+      ).toBe(AT)
     } finally {
       await release()
       await gate.end().catch(() => {})

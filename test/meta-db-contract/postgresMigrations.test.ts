@@ -12,7 +12,13 @@ import {
   runPgMigrations,
 } from '../../packages/server/src/services/metaDb/migrations'
 import { PgMetaDb } from '../../packages/server/src/services/metaDb/pgMetaDb'
-import { approvedTargetCatalog, type MetaDbCatalog, pgMetaDbCatalog } from './metaDbCatalog'
+import {
+  approvedTargetCatalog,
+  type MetaDbCatalog,
+  pgMetaDbCatalog,
+  PROVIDER_CONTOUR_TABLES,
+  splitProviderContour,
+} from './metaDbCatalog'
 import type { PostgresTestSchema } from './postgresHarness'
 import { createPostgresTestSchema, describePostgres } from './postgresHarness'
 
@@ -112,9 +118,9 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
 
     try {
       await runPgMigrations(client)
-      expect(await pgMetaDbCatalog(client, testSchema.schema)).toEqual(
-        approvedTargetCatalog(postgresGolden),
-      )
+      const live = splitProviderContour(await pgMetaDbCatalog(client, testSchema.schema))
+      expect(live.contour).toEqual(PROVIDER_CONTOUR_TABLES)
+      expect(live.published).toEqual(approvedTargetCatalog(postgresGolden))
     } finally {
       client.release()
       await pool.end()
@@ -174,6 +180,191 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
           { id: 'rejected-operation', phase: 'rejected' },
           { id: 'retry-operation', phase: 'accepted' },
         ],
+      })
+    } finally {
+      client.release()
+      await pool.end()
+    }
+  })
+
+  it('adds the keyring with its single-active fence after the published line', async () => {
+    const testSchema = await createSchema('migration_contour_keyring')
+    const pool = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const client = await pool.connect()
+
+    try {
+      await runPgMigrations(
+        client,
+        migrations.slice(
+          0,
+          migrations.findIndex((migration) => migration.name === 'provider_contour'),
+        ),
+      )
+      expect(await client.query("SELECT to_regclass('secret_keyring') AS keyring")).toMatchObject({
+        rows: [{ keyring: null }],
+      })
+
+      await runPgMigrations(client, migrations)
+      await client.query(
+        `INSERT INTO secret_keyring
+          (key_id, canary, state, generation, created_at, retired_at)
+         VALUES ($1, $2, 'active', 1, $3, NULL)`,
+        [
+          'ck_111111111111111111111111',
+          'v1.ck_111111111111111111111111.Y2lwaGVydGV4dA',
+          '2026-08-22T00:00:00.000Z',
+        ],
+      )
+
+      expect(
+        await client.query('SELECT key_id, state, generation::integer FROM secret_keyring'),
+      ).toMatchObject({
+        rows: [
+          {
+            key_id: 'ck_111111111111111111111111',
+            state: 'active',
+            generation: 1,
+          },
+        ],
+      })
+      await expect(
+        client.query(
+          `INSERT INTO secret_keyring
+            (key_id, canary, state, generation, created_at, retired_at)
+           VALUES ($1, 'canary', 'active', 2, $2, NULL)`,
+          ['ck_222222222222222222222222', '2026-08-22T00:00:01.000Z'],
+        ),
+      ).rejects.toMatchObject({ code: '23505' })
+    } finally {
+      client.release()
+      await pool.end()
+    }
+  })
+
+  it('adds the provider facets with the two ordered foreign keys', async () => {
+    const testSchema = await createSchema('migration_contour_facets')
+    const pool = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const client = await pool.connect()
+
+    try {
+      // Pinned to the migration UNDER TEST, not to "everything but the last": a later
+      // migration would otherwise silently move this probe onto its own predecessor.
+      await runPgMigrations(
+        client,
+        migrations.slice(
+          0,
+          migrations.findIndex((migration) => migration.name === 'provider_contour'),
+        ),
+      )
+      expect(await client.query("SELECT to_regclass('credentials') AS credentials")).toMatchObject({
+        rows: [{ credentials: null }],
+      })
+
+      await runPgMigrations(client, migrations)
+      const tables = await client.query(
+        `SELECT to_regclass('credentials') AS credentials,
+                to_regclass('provider_resources') AS resources,
+                to_regclass('provider_attachments') AS attachments`,
+      )
+      expect(tables.rows[0]).toEqual({
+        credentials: 'credentials',
+        resources: 'provider_resources',
+        attachments: 'provider_attachments',
+      })
+      const foreignKeys = await client.query(
+        `SELECT child.relname AS child, parent.relname AS parent, fk.confdeltype
+           FROM pg_constraint AS fk
+           JOIN pg_class AS child ON child.oid = fk.conrelid
+           JOIN pg_class AS parent ON parent.oid = fk.confrelid
+          WHERE fk.contype = 'f'
+            AND fk.connamespace = to_regnamespace(current_schema())
+            AND child.relname IN ('provider_resources', 'provider_attachments')
+          ORDER BY child.relname, parent.relname`,
+      )
+      expect(foreignKeys.rows).toEqual([
+        { child: 'provider_attachments', parent: 'provider_resources', confdeltype: 'c' },
+        { child: 'provider_resources', parent: 'credentials', confdeltype: 'r' },
+      ])
+    } finally {
+      client.release()
+      await pool.end()
+    }
+  })
+
+  it('adds the call journal with the send-fence key and no foreign key of its own', async () => {
+    const testSchema = await createSchema('migration_contour_call_log')
+    const pool = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const client = await pool.connect()
+
+    try {
+      await runPgMigrations(
+        client,
+        migrations.slice(
+          0,
+          migrations.findIndex((migration) => migration.name === 'provider_contour'),
+        ),
+      )
+      expect(await client.query("SELECT to_regclass('provider_call_log') AS log")).toMatchObject({
+        rows: [{ log: null }],
+      })
+
+      await runPgMigrations(client, migrations)
+      expect(await client.query("SELECT to_regclass('provider_call_log') AS log")).toMatchObject({
+        rows: [{ log: 'provider_call_log' }],
+      })
+      // The audit outlives what it names, so it points at nothing: a RESTRICT would
+      // make a credential delete a lie and a CASCADE would erase the evidence.
+      const foreignKeys = await client.query(
+        `SELECT parent.relname AS parent
+           FROM pg_constraint AS fk
+           JOIN pg_class AS child ON child.oid = fk.conrelid
+           JOIN pg_class AS parent ON parent.oid = fk.confrelid
+          WHERE fk.contype = 'f'
+            AND fk.connamespace = to_regnamespace(current_schema())
+            AND child.relname = 'provider_call_log'`,
+      )
+      expect(foreignKeys.rows).toEqual([])
+      const retentionIndex = await client.query(
+        `SELECT indexdef
+           FROM pg_indexes
+          WHERE schemaname = current_schema()
+            AND indexname = 'idx_provider_call_log_retention'`,
+      )
+      expect(retentionIndex.rows).toHaveLength(1)
+      expect((retentionIndex.rows[0] as { indexdef: string }).indexdef).toMatch(
+        /\(settled_at, id, job_id\) WHERE \(settled_at IS NOT NULL\)$/u,
+      )
+
+      const row = (id: string, jobId: string | null, attempt: number | null) => [
+        id,
+        'alice',
+        'user:alice',
+        null,
+        'resource-a',
+        null,
+        'provider.example',
+        '[]',
+        jobId,
+        jobId ? 'embed' : null,
+        attempt,
+        'may-have-sent',
+        false,
+        'in-flight',
+        null,
+        '2026-08-24T00:00:00.000Z',
+        null,
+      ]
+      const insert = `INSERT INTO provider_call_log
+          (id, owner, principal, agent, resource_id, credential_id, host, spaces,
+           job_id, job_call_key, attempt_no, delivery_state, retry_safe, outcome,
+           token_usage, created_at, settled_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`
+      await client.query(insert, row('call-job', 'job-1', 1))
+      // Two interactive rows carry three NULLs each and must not collide on them.
+      await client.query(insert, row('call-interactive-a', null, null))
+      await client.query(insert, row('call-interactive-b', null, null))
+      await expect(client.query(insert, row('call-job-twin', 'job-1', 1))).rejects.toMatchObject({
+        code: '23505',
       })
     } finally {
       client.release()
@@ -288,9 +479,9 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
         { column_name: 'integrity', column_default: null },
         { column_name: 'entry_role', column_default: null },
       ])
-      expect(await pgMetaDbCatalog(client, testSchema.schema)).toEqual(
-        approvedTargetCatalog(postgresGolden),
-      )
+      const live = splitProviderContour(await pgMetaDbCatalog(client, testSchema.schema))
+      expect(live.contour).toEqual(PROVIDER_CONTOUR_TABLES)
+      expect(live.published).toEqual(approvedTargetCatalog(postgresGolden))
     } finally {
       client.release()
       await pool.end()

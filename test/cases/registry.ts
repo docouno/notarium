@@ -28,6 +28,7 @@ import { multiSpace } from './cases/multiSpace'
 import { nameCollisions } from './cases/nameCollisions'
 import { nonLatinNames } from './cases/nonLatinNames'
 import { noteClasses } from './cases/noteClasses'
+import { providers, providersDisabled } from './cases/providers'
 import { readerShowcase } from './cases/readerShowcase'
 import { restoreStates } from './cases/restoreStates'
 import { scrollbars } from './cases/scrollbars'
@@ -86,6 +87,9 @@ export const CASES: readonly CaseSpec[] = [
   agentSessions,
   contextOpen,
   memoryPerf,
+  // model providers / credentials / consent
+  providers,
+  providersDisabled,
   // import
   importThread,
   importLayout,

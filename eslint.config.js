@@ -15,6 +15,48 @@ import unusedImports from 'eslint-plugin-unused-imports'
 import globals from 'globals'
 import tseslint from 'typescript-eslint'
 
+const PROVIDER_FACET_WRITE =
+  /\bUPDATE\s+(?:credentials|provider_resources)(?:\s+AS\s+\w+)?\s+SET\b/iu
+const PROVIDER_FACET_WRITE_OWNERS = [
+  '/services/metaDb/drivers/sqlite/credentials.ts',
+  '/services/metaDb/drivers/pg/credentials.ts',
+  '/services/metaDb/drivers/sqlite/providerResources.ts',
+  '/services/metaDb/drivers/pg/providerResources.ts',
+  '/services/metaDb/drivers/sqlite/providerCiphertexts.ts',
+  '/services/metaDb/drivers/pg/providerCiphertexts.ts',
+  '/services/metaDb/sqliteMetaDb.ts',
+  '/services/metaDb/pgMetaDb.ts',
+]
+
+const providerEpochPlugin = {
+  rules: {
+    'owned-facet-writes': {
+      meta: {
+        type: 'problem',
+        schema: [],
+        messages: {
+          owner:
+            'Write provider credential/resource columns through their driver facet; retarget, re-encryption and purge-unreadable are the only named system exceptions.',
+        },
+      },
+      create(context) {
+        const filename = context.filename.replaceAll('\\', '/')
+        const ownsWrite = PROVIDER_FACET_WRITE_OWNERS.some((suffix) => filename.endsWith(suffix))
+        const inspect = (node, value) => {
+          if (!ownsWrite && typeof value === 'string' && PROVIDER_FACET_WRITE.test(value)) {
+            context.report({ node, messageId: 'owner' })
+          }
+        }
+
+        return {
+          Literal: (node) => inspect(node, node.value),
+          TemplateElement: (node) => inspect(node, node.value.raw),
+        }
+      },
+    },
+  },
+}
+
 export default tseslint.config(
   {
     ignores: [
@@ -53,6 +95,16 @@ export default tseslint.config(
       'no-alert': 'error',
       'no-console': 'error',
     },
+  },
+
+  // Provider consent epochs are default-fail-closed by WRITE OWNER. Every SQL write
+  // to the two mutable facets stays in their driver modules; the two facade retarget
+  // methods and providerCiphertexts' re-encryption/recovery paths are the three named
+  // exceptions. The companion source registry classifies each owned method.
+  {
+    files: ['packages/server/src/**/*.ts'],
+    plugins: { 'provider-epochs': providerEpochPlugin },
+    rules: { 'provider-epochs/owned-facet-writes': 'error' },
   },
 
   // Keep the contract's zod barrel out of the browser bundle (#56). Web takes

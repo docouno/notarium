@@ -26,6 +26,7 @@ export type Axis =
   | 'scale'
   | 'auth'
   | 'favorites'
+  | 'providers'
   | 'fields'
 
 export type AxisInfo = {
@@ -157,6 +158,17 @@ export const AXES: readonly AxisInfo[] = [
     title: 'Favorites lens / merged Files rail',
     surfaces: ['rail', 'explorer', 'feed-favorite-facet', 'dashboard-card'],
     refs: ['#42', '#245'],
+  },
+  {
+    axis: 'providers',
+    title: 'Model providers / credentials / consent',
+    surfaces: [
+      'settings-credentials',
+      'settings-model-providers',
+      'management-provider-access',
+      'mcp-whoami',
+    ],
+    refs: ['#387', 'providers.md', 'contract.md', 'mcp-gateway.md'],
   },
 ]
 

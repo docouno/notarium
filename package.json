@@ -30,6 +30,7 @@
     "seed": "tsx scripts/seed.ts",
     "seed-coverage": "tsx scripts/coverage.ts",
     "bench:import-markdown-tree": "tsx scripts/importMarkdownTreeBench.ts",
+    "bench:provider-scale": "tsx scripts/providerScaleBench.ts",
     "bench:fields-snapshot": "NODE_OPTIONS=--expose-gc tsx scripts/fieldsSnapshotBench.ts",
     "bench:context-open": "tsx scripts/contextOpenBench.ts",
     "bench:write-path": "tsx scripts/writePathBenchGates.ts",

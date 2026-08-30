@@ -41,6 +41,7 @@ import {
   LOCK_LEVEL_REQUIRES,
   LOCK_LEVELS,
 } from '../../packages/server/src/services/metaDb/drivers/pg/lockOrder'
+import { providerDisclosureOf } from '../../packages/server/src/services/providerRegistry'
 import { pooledPgTransactions } from './pgTransactions'
 import { createPostgresTestSchema, describePostgres } from './postgresHarness'
 
@@ -809,6 +810,252 @@ describePostgres('Postgres lock order', { timeout: SUITE_TIMEOUT_MS }, () => {
           expiresAt: '2026-08-11T11:05:00.000Z',
         }),
       )
+      const firstCredentialKey = {
+        keyId: 'ck_111111111111111111111111',
+        canary: 'v1.ck_111111111111111111111111.Y2lwaGVydGV4dA',
+        state: 'readable' as const,
+        generation: 1,
+        createdAt: AT,
+        retiredAt: null,
+      }
+      await run('secretKeyring.admitReadable', () =>
+        db.secretKeyring.admitReadable(firstCredentialKey),
+      )
+      await run('secretKeyring.projectActive', () =>
+        db.secretKeyring.projectActive({ keyId: firstCredentialKey.keyId, generation: 1 }),
+      )
+      const secondCredentialKey = {
+        ...firstCredentialKey,
+        keyId: 'ck_222222222222222222222222',
+        canary: 'v1.ck_222222222222222222222222.Y2lwaGVydGV4dA',
+        generation: 2,
+      }
+      await db.secretKeyring.admitReadable(secondCredentialKey)
+      await run('secretKeyring.projectRotationActive', () =>
+        db.secretKeyring.projectRotationActive(
+          {
+            expectedKeyId: firstCredentialKey.keyId,
+            keyId: secondCredentialKey.keyId,
+            generation: 2,
+          },
+          async () => {},
+        ),
+      )
+      await run('secretKeyring.replaceNonRetiredWith', () =>
+        db.secretKeyring.replaceNonRetiredWith({
+          ...secondCredentialKey,
+        }),
+      )
+      const providerKey = { keyId: 'ck_222222222222222222222222', generation: 2 }
+      await db.auth.createUser({
+        username: 'provider-owner',
+        displayName: 'Provider owner',
+        passwordHash: null,
+        admin: false,
+        disabledAt: null,
+        createdAt: AT,
+        personalSpace: null,
+      })
+      await db.auth.upsertMember('alpha', 'provider-owner', 'owner', AT)
+      const providerCredential = {
+        id: 'provider-credential',
+        owner: 'provider-owner',
+        name: 'Credential',
+        kind: 'bearer' as const,
+        secret: `v1.${providerKey.keyId}.YWJj`,
+        origin: 'https://provider.example',
+        injection: { header: '', prefix: 'Bearer ' },
+        disabledAt: null,
+        rpm: null,
+        tpm: null,
+        consentEpoch: 0,
+        runtimeEpoch: 0,
+      }
+      await run('credentials.create', () => db.credentials.create(providerCredential, providerKey))
+      const providerResource = {
+        id: 'provider-resource',
+        owner: 'provider-owner',
+        name: 'Resource',
+        wire: 'openai-compatible' as const,
+        baseUrl: 'https://provider.example/v1',
+        headers: { 'x-title': `v1.${providerKey.keyId}.YWJj` },
+        allowPrivateNetwork: false,
+        purposes: ['chat' as const],
+        models: [],
+        defaultModel: null,
+        credentialId: providerCredential.id,
+        consentEpoch: 0,
+        runtimeEpoch: 0,
+        disabledAt: null,
+        lastCheck: {},
+        firstByteTimeoutMs: 30_000,
+        callTimeoutMs: 300_000,
+      }
+      await run('providerResources.create', () =>
+        db.providerResources.create(providerResource, providerKey),
+      )
+      await run('credentials.mutate', () =>
+        db.credentials.mutate({
+          id: providerCredential.id,
+          expectedRuntimeEpoch: 0,
+          changes: { name: 'Credential updated', secret: providerCredential.secret },
+          ciphertext: providerKey,
+          runtimeChanged: true,
+          consentChanged: false,
+          validateReferences: () => [],
+        }),
+      )
+      await run('providerResources.replaceIfRuntimeEpoch', () =>
+        db.providerResources.replaceIfRuntimeEpoch(
+          { ...providerResource, name: 'Resource CAS' },
+          providerKey,
+          0,
+          providerCredential.id,
+        ),
+      )
+      await run('providerResources.materializeModel', () =>
+        db.providerResources.materializeModel(providerResource.id, {
+          name: 'model-a',
+          dimensions: null,
+          status: 'available',
+        }),
+      )
+      await run('providerResources.recordLastCheck', () =>
+        db.providerResources.recordLastCheck({
+          resourceId: providerResource.id,
+          purpose: 'chat',
+          lastCheck: {
+            status: 'ready',
+            checkedAt: AT,
+            diagnostic: null,
+            credentialProven: true,
+          },
+          model: { name: 'model-a', dimensions: null, status: 'available' },
+          expectedRuntimeEpoch: 0,
+          expectedCredentialId: providerCredential.id,
+          expectedCredentialRuntimeEpoch: 1,
+        }),
+      )
+      const providerAttachment = {
+        id: 'provider-attachment',
+        resourceId: providerResource.id,
+        targetKind: 'space' as const,
+        targetId: 'alpha',
+        targetSpace: 'alpha',
+        state: 'pending' as const,
+        resourceEpoch: null,
+        credentialEpoch: null,
+        disclosure: null,
+        createdAt: AT,
+        expiresAt: '2026-08-25T00:00:00.000Z',
+      }
+      await run('providerAttachments.offerProviderAttachment', () =>
+        db.offerProviderAttachment(providerAttachment, providerDisclosureOf),
+      )
+      await run('providerAttachments.acceptProviderAttachment', () =>
+        db.acceptProviderAttachment(
+          {
+            id: providerAttachment.id,
+            expectedResourceEpoch: 0,
+            expectedCredentialEpoch: 0,
+            acceptedAt: AT,
+            manager: 'provider-owner',
+          },
+          providerDisclosureOf,
+        ),
+      )
+      await run('providerAttachments.detachProviderAttachment', () =>
+        db.detachProviderAttachment({
+          id: providerAttachment.id,
+          manager: 'provider-owner',
+        }),
+      )
+      await run('providerResources.delete', () => db.providerResources.delete(providerResource.id))
+      await run('providerResources.create', () =>
+        db.providerResources.create(providerResource, providerKey),
+      )
+      await run('providerAttachments.offerProviderAttachment', () =>
+        db.offerProviderAttachment(providerAttachment, providerDisclosureOf),
+      )
+      await run('pgMetaDb.retargetProviderCredential', () =>
+        db.retargetProviderCredential({
+          owner: 'provider-owner',
+          credentialId: providerCredential.id,
+          expectedCredentialRuntimeEpoch: 1,
+          origin: 'https://provider-next.example',
+          resources: [
+            {
+              id: providerResource.id,
+              expectedRuntimeEpoch: 0,
+              baseUrl: 'https://provider-next.example/v1',
+              detachCredential: false,
+            },
+          ],
+        }),
+      )
+      await run('pgMetaDb.removeMemberAndProviderAttachments', () =>
+        db.removeMemberAndProviderAttachments('alpha', 'provider-owner'),
+      )
+      const disposableCredential = {
+        ...providerCredential,
+        id: 'provider-credential-disposable',
+        name: 'Disposable',
+      }
+      await run('credentials.create', () =>
+        db.credentials.create(disposableCredential, providerKey),
+      )
+      await run('credentials.deleteIfUnreferenced', () =>
+        db.credentials.deleteIfUnreferenced(disposableCredential.id),
+      )
+      await run('providerCiphertexts.rewrapBatch', () =>
+        db.providerCiphertexts.rewrapBatch({
+          active: providerKey,
+          sourceKeyIds: new Set<string>(),
+          limit: 1,
+          rewrap: async (carrier) => carrier.ciphertext,
+        }),
+      )
+      await run('providerCiphertexts.retireKeys', () =>
+        db.providerCiphertexts.retireKeys({
+          active: providerKey,
+          sourceKeyIds: new Set<string>(),
+          retiredAt: AT,
+        }),
+      )
+      await run('providerCallLog.intent', () =>
+        db.providerCallLog.intent({
+          id: 'provider-call-1',
+          owner: 'al',
+          principal: 'user:al',
+          agent: null,
+          resourceId: providerResource.id,
+          credentialId: providerCredential.id,
+          host: 'provider.example',
+          spaces: ['alpha'],
+          // The durable shape: it is the one that takes the advisory over the
+          // logical call, because two re-claims have no row to meet on.
+          job: { jobId: 'job-1', jobCallKey: 'embed-batch-0' },
+          createdAt: AT,
+        }),
+      )
+      await run('providerCallLog.intent', () =>
+        db.providerCallLog.intent({
+          id: 'provider-call-2',
+          owner: 'al',
+          principal: 'user:al',
+          agent: null,
+          resourceId: providerResource.id,
+          credentialId: providerCredential.id,
+          host: 'provider.example',
+          spaces: [],
+          // …and the interactive shape, whose key is the fresh row id instead.
+          job: null,
+          createdAt: AT,
+        }),
+      )
+      await run('providerCiphertexts.purgeUnreadable', () =>
+        db.providerCiphertexts.purgeUnreadable(new Set([providerKey.keyId]), AT),
+      )
       await run('spaceLifecycle.transition', () =>
         db.spaceLifecycle.transition({
           space: 'alpha',
@@ -1201,7 +1448,18 @@ describePostgres('Postgres lock order', { timeout: SUITE_TIMEOUT_MS }, () => {
         expect.arrayContaining(['L1', 'L2a', 'L2c', 'L2d', 'L2e', 'L2f', 'L3m', 'L3n', 'L3t']),
       )
       expect(purge).toEqual(
-        expect.arrayContaining(['L1', 'L2a', 'L2b', 'L2c', 'L2d', 'L2e', 'L2f', 'L3m', 'L3t']),
+        expect.arrayContaining([
+          'L1',
+          'L2a',
+          'L2b',
+          'L2c',
+          'L2d',
+          'L2e',
+          'L2f',
+          'L3m',
+          'L3t',
+          'L5a',
+        ]),
       )
       // Same reason as above: a reserve that claimed nothing would never enter L1p,
       // and the level that arbitrates destinations would go unobserved.

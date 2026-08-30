@@ -242,6 +242,9 @@ describe('online data backup and restore', () => {
     expect(result.manifest.files.map((file) => file.path)).not.toContain(
       'data/jobs/imports/main/upload.import.part',
     )
+    expect(result.manifest.files.some((file) => file.path.startsWith('data/secret-keyring/'))).toBe(
+      false,
+    )
     expect(result.manifest.files.map((file) => file.path)).not.toContain(
       'data/spaces/main/.12345678-1234-1234-1234-123456789abc.tmp',
     )
@@ -440,6 +443,59 @@ describe('online data backup and restore', () => {
       /manifest checksums/,
     )
     expect(await readdir(target)).toEqual([])
+  })
+
+  it('rejects a manifest that explicitly admits the provider credential keyring', async () => {
+    const source = await fixture()
+    await mkdir(join(source.data, 'secret-keyring', 'keys'), { recursive: true })
+    await writeFile(
+      join(source.data, 'secret-keyring', 'keys', 'ck_111111111111111111111111.json'),
+      'must stay outside the archive',
+    )
+    const result = await createOnlineDataBackup({
+      layout: layoutFor(source.data),
+      output: source.archive,
+      quietMs: 0,
+      checkpoint: async () => {},
+    })
+    source.db.close()
+    expect(result.manifest.files.some((file) => file.path.startsWith('data/secret-keyring/'))).toBe(
+      false,
+    )
+
+    const payload = Buffer.from('credential-key-material')
+    const path = 'data/secret-keyring/keys/ck_111111111111111111111111.json'
+    const tampered = join(source.parent, 'credential-keyring.zip')
+    const zip = new AdmZip(source.archive)
+    const manifest = JSON.parse(zip.readAsText('manifest.json')) as {
+      files: Array<{
+        path: string
+        size: number
+        sha256: string
+        mtimeMs: number
+      }>
+      directories: string[]
+    }
+    manifest.directories.push('data/secret-keyring', 'data/secret-keyring/keys')
+    manifest.files.push({
+      path,
+      size: payload.length,
+      sha256: createHash('sha256').update(payload).digest('hex'),
+      mtimeMs: Date.now(),
+    })
+    zip.addFile(path, payload)
+    zip.updateFile('manifest.json', Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`))
+    zip.writeZip(tampered)
+
+    await expect(verifyDataBackup({ input: tampered })).rejects.toThrow(
+      /must not contain the provider credential keyring/,
+    )
+    await expect(
+      restoreDataBackup({
+        layout: layoutFor(join(source.parent, 'credential-keyring-target')),
+        input: tampered,
+      }),
+    ).rejects.toThrow(/must not contain the provider credential keyring/)
   })
 
   it('retries a DB-only concurrent commit and restores the committed row', async () => {
@@ -656,6 +712,9 @@ describe('online data backup and restore', () => {
     await expect(
       restoreDataBackup({ layout: layoutFor(target), input: source.archive }),
     ).rejects.toThrow(/fresh empty DATA_DIR/)
+    await expect(
+      restoreDataBackup({ layout: layoutFor(target), input: source.archive }),
+    ).rejects.toThrow(/archive first, then place the matching secret-keyring/)
     expect(await readFile(join(target, 'keep.txt'), 'utf8')).toBe('do not touch')
 
     const interrupted = join(source.parent, 'interrupted')

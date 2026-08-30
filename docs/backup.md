@@ -53,7 +53,14 @@ application checkpoints. The freeze blocks replay-key replacement without
 holding a database transaction during filesystem I/O; expiry makes a crashed
 backup producer recoverable. Each checkpoint queues HTTP mutations, durable jobs
 and MCP calls (nominally read-only tools can persist cursors/audit); ordinary
-HTTP reads remain available. It waits for active work, reconciles external note
+HTTP reads remain available. Two paths are named exceptions to the REQUEST-level
+hold, and both still take the gate around their own writes: `/mcp`, whose tool
+calls enter it one at a time, and the provider `validate` operation, whose
+outbound call can take up to two minutes on a local model and would otherwise
+hold the instance read-only for that whole time. The exception is a per-route
+list, not a prefix — provider credential and resource mutations stay inside the
+barrier. Its price is real: a snapshot may catch a provider call in flight, and
+the restored archive reads that call's outcome as unknown. It waits for active work, reconciles external note
 edits, drains identity/history write-behind, then releases the gate. SQLite's online backup
 API folds `meta.db` and committed WAL pages into one standalone database while
 Markdown and durable job files are staged. A stage is accepted only when hashes,
@@ -83,6 +90,18 @@ contains:
   generation pointer;
 - `manifest.json`: format version, timestamp, exact directories, file sizes,
   mtimes, SHA-256 checksums, and the witnessed installation generation.
+
+`data/secret-keyring/` is deliberately absent. Provider credential ciphertext
+is in `meta.db`, but its reversible master keys must be retained separately;
+otherwise possession of one ZIP would disclose every live provider credential.
+The producer omits the directory and verification/restore reject an archive
+whose manifest tries to admit it.
+
+Boot rejects both lexical containment and a static external symlink whose real
+target is under a packed root before creating a key. A hard link, bind mount, or
+filesystem swap after that check requires host-level control and is outside this
+application guarantee; do not place provider keys under a notes/jobs mount by
+another name.
 
 Only Notarium-owned incomplete files are omitted: dot-named atomic note temps,
 exact `.<package-id>.install-<uuid>` role-package staging directories at a Personal/Space library root or
@@ -131,6 +150,10 @@ set, size/hash mismatches, malformed mtime metadata, resource-limit violations,
 failed SQLite `integrity_check`, and any DB/pointer/key generation mismatch. It
 does not read or change live `DATA_DIR`.
 
+Verification cannot test whether provider credentials decrypt: their
+`secret-keyring` is intentionally not in the ZIP and is supplied only after
+restore.
+
 Checksums detect accidental corruption; they do not authenticate an archive
 against an attacker who can replace payload and manifest together. Treat backup
 storage as trusted, access-controlled state, or add signing/encryption in the
@@ -162,6 +185,7 @@ docker compose stop notarium
 # Move the old volume aside; attach/create a fresh empty /data in Compose here.
 docker compose run --rm --no-deps -T notarium restore \
   < notarium-20260722.zip
+# Place the separately retained secret-keyring into the fresh DATA_DIR now.
 docker compose up -d --force-recreate --no-deps notarium
 ```
 
@@ -178,6 +202,26 @@ matrix and installed together before startup. The meta-DB must carry a migration
 closed; restore does not guess its version or stamp it automatically. Upgrade
 and verify such an owned instance with its version-specific operator procedure
 before moving it across the baseline boundary.
+
+The provider credential keyring is a third, separately retained input. The only
+supported order is: restore into the fresh empty `DATA_DIR`, place the matching
+`secret-keyring`, then start Notarium for the first time. Placing it before
+restore makes the target non-empty and restore refuses; starting before placing
+it can publish a new pointer. An exact historical keyring snapshot starts
+directly. A descendant keyring whose pointer names a newer generation requires
+`admin reconcile-credential-keyring --expected-key-id …` before normal startup.
+
+Keep every credential key file needed by the retention window of your archives.
+Rotation retires a generation in the DB but does not delete its immutable file:
+an older archive may still contain ciphertext under that generation.
+
+If only the Notarium ZIP survives and the credential keyring is completely
+lost, notes, spaces, search state and accounts still restore; provider
+credentials do not. `admin purge-unreadable-secrets --expected-key-id …` is a
+two-step dry-run/`--apply` disaster procedure that removes only the lost
+provider-secret state before a new key is minted.
+The exact command gates and the limits of this recovery are in
+[providers.md](providers.md#backup-restore-and-recovery).
 
 Verify at minimum:
 

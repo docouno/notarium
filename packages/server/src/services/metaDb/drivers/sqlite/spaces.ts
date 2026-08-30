@@ -38,6 +38,16 @@ export const createSpacesFacet = (ctx: SqliteDriverCtx): SpacesPersistence => ({
       SpaceRow | undefined
     return r ? spaceOfRow(r) : null
   },
+  getMany: async (ids) => {
+    if (ids.length === 0) {
+      return []
+    }
+    await ctx.ensureInit()
+    const rows = ctx.required
+      .prepare('SELECT * FROM spaces WHERE id IN (SELECT value FROM json_each(?)) ORDER BY id')
+      .all(JSON.stringify([...new Set(ids)])) as SpaceRow[]
+    return rows.map(spaceOfRow)
+  },
   getBySlug: async (slug: string) => {
     await ctx.ensureInit()
     const r = ctx.required.prepare('SELECT * FROM spaces WHERE slug = ?').get(slug) as

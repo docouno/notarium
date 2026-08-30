@@ -72,6 +72,7 @@ describe('contract conformance over the seed fixture', () => {
     expect(ConfigSchema.safeParse(cfg).success).toBe(true)
     expect(cfg.defaultSpace).toBeUndefined() // no host-global default anymore
     expect(cfg.capabilities.spaceCreate).toBe(false) // base fixture: static host
+    expect(cfg.capabilities.providers).toBe(false) // provider subsystem is opt-in
   })
   it('GET /api/spaces — the host lists its spaces (slug on the wire, id opaque #100 phase 4)', async () => {
     const body = await get('/api/spaces')

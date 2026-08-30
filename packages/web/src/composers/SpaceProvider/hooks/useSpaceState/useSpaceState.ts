@@ -29,7 +29,7 @@ export const useSpaceState = (): SpaceContextValue | null => {
   const [ready, setReady] = useState(false)
   const [spaces, setSpaces] = useState<Space[]>([])
   const [archivedSpaces, setArchivedSpaces] = useState<Space[]>([])
-  const [capabilities, setCapabilities] = useState({ spaceCreate: false })
+  const [capabilities, setCapabilities] = useState({ spaceCreate: false, providers: false })
   const [active, setActive] = useState<string>(() => {
     // Pre-fetch guess only (children render after `ready`, once the real list
     // arrives): URL → last-active → the user's personal space. No host-global

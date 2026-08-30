@@ -3,6 +3,7 @@ import { HTTP_STATUS } from '@notarium/contract/http'
 import { authApi } from './auth'
 import { ApiError } from './client'
 import { contextApi } from './context'
+import { credentialsApi } from './credentials'
 import { fieldsApi } from './fields'
 import { foldersApi } from './folders'
 import { graphApi } from './graph'
@@ -12,6 +13,8 @@ import { meApi } from './me'
 import { membersApi } from './members'
 import { notesApi } from './notes'
 import { projectsApi } from './projects'
+import { providerAttachmentsApi } from './providerAttachments'
+import { providersApi } from './providers'
 import { searchApi } from './search'
 import { spacesApi } from './spaces'
 import { syncApi } from './sync'
@@ -48,6 +51,9 @@ export const api = {
   ...authApi,
   ...meApi,
   ...contextApi,
+  ...credentialsApi,
+  ...providersApi,
+  ...providerAttachmentsApi,
   ...usersApi,
   ...membersApi,
   ...importApi,

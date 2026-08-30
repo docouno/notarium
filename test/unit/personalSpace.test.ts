@@ -58,7 +58,11 @@ const makeManager = (canMint = true) =>
 
 const makeAuth = async () => {
   const db = new InMemoryAuthPersistence()
-  const auth = createAuthService({ mode: 'password', persistence: db })
+  const auth = createAuthService({
+    mode: 'password',
+    persistence: db,
+    removeMemberAndProviderAttachments: (space, username) => db.removeMember(space, username),
+  })
   await db.createUser({
     username: 'alice',
     displayName: 'Alice',
@@ -110,7 +114,11 @@ describe('ensurePersonalSpace (#21/#13)', () => {
 
   it('normalises an untidy username into a valid slug base', async () => {
     const db = new InMemoryAuthPersistence()
-    const auth = createAuthService({ mode: 'password', persistence: db })
+    const auth = createAuthService({
+      mode: 'password',
+      persistence: db,
+      removeMemberAndProviderAttachments: (space, username) => db.removeMember(space, username),
+    })
     await db.createUser({
       username: 'Ann.O Nymous',
       displayName: 'Ann',
@@ -179,7 +187,11 @@ describe('ensurePersonalSpace (#21/#13)', () => {
     // 'Bob' and 'bob' both slugify to base 'bob' — the mint must hand them
     // distinct, separately-owned spaces (no cross-user personal-space sharing).
     const db = new InMemoryAuthPersistence()
-    const auth = createAuthService({ mode: 'password', persistence: db })
+    const auth = createAuthService({
+      mode: 'password',
+      persistence: db,
+      removeMemberAndProviderAttachments: (space, username) => db.removeMember(space, username),
+    })
 
     for (const username of ['Bob', 'bob']) {
       await db.createUser({

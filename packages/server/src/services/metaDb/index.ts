@@ -8,6 +8,23 @@ export {
   metaDbTargetOf,
 } from './metaDbUrl'
 export { auditWriteGapOf } from './rows'
+// The one predicate for "we still hold the key that wrapped this": recovery plans and
+// the effective list must not disagree about which ciphertext is unreadable.
+export { providerCiphertextKeyId } from './providerCiphertexts'
+// The journal's two derivations, both pure and both deliberately NOT columns: a stale
+// intent read as `outcome-unknown`, and the spend rollup summed from the events.
+export {
+  PROVIDER_CALL_LOG_RETENTION_DEFAULT_DAYS,
+  PROVIDER_CALL_LOG_RETENTION_ENV,
+  providerCallLicensesAnotherAttempt,
+  providerCallLogRetentionBefore,
+  providerCallLogRetentionFromEnv,
+  providerCallOutcomeAsRead,
+  providerCallUsageTotals,
+  pruneProviderCallLogRetention,
+  type ProviderCallUsageTotals,
+  type ProviderCallLogRetentionDays,
+} from './providerCallLog'
 // The half of the ability fence a host with an in-memory lifecycle journal answers
 // itself. Exported so the twins' `spaceEnded` and the drivers' `phase IN (…)` cannot
 // be two lists.
@@ -18,8 +35,10 @@ export { abilityPackageOfLocator, abilitySpaceOfLocator } from './abilityAddress
 export {
   ABILITY_CREATE_PHASE,
   ABILITY_TARGET_PURGED,
+  PROVIDER_PERSISTENCE_ERROR,
   abilityTargetPurgedError,
   isAbilityTargetPurgedError,
+  providerPersistenceError,
 } from './types'
 export { SqliteMetaDb } from './sqliteMetaDb'
 export { PgMetaDb } from './pgMetaDb'
@@ -45,6 +64,7 @@ export type {
   AgentSessionNamedStart,
   AgentSessionsPersistence,
   AuthPersistence,
+  CiphertextWrite,
   ContextOrderEntryKind,
   ContextOrderPersistence,
   ContextOrderRecord,
@@ -53,6 +73,13 @@ export type {
   ContextSetRecord,
   ContextSetsPersistence,
   ContextSetTargetKind,
+  CredentialRecord,
+  CredentialDeleteResult,
+  CredentialMutationInput,
+  CredentialMutationResult,
+  CredentialMutableFields,
+  CredentialReferenceValidator,
+  CredentialsPersistence,
   DedupResult,
   FavoriteEntityKind,
   FavoriteRecord,
@@ -80,6 +107,32 @@ export type {
   ProjectRecord,
   ProjectsPersistence,
   ProjectStatus,
+  ProjectRotationSecretKeyResult,
+  ProviderAttachmentRecord,
+  ProviderAttachmentAcceptResult,
+  ProviderAttachmentLifecyclePersistence,
+  ProviderAttachmentOfferResult,
+  ProviderAttachmentTransitionState,
+  ProviderAttachmentsPersistence,
+  ProviderDisclosureBuilder,
+  ProviderCallIntentInput,
+  ProviderCallIntentResult,
+  ProviderCallLogPersistence,
+  ProviderCallLogRecord,
+  ProviderCallSettleInput,
+  ProviderCiphertextCarrier,
+  ProviderCiphertextCounts,
+  ProviderCiphertextRewrap,
+  ProviderCiphertextsPersistence,
+  ProviderPersistenceErrorCode,
+  ProviderIdPage,
+  ProviderPageInput,
+  ProviderPagePosition,
+  ProviderPositionPage,
+  ProviderResourceRecord,
+  ProviderResourcesPersistence,
+  ProviderRetargetInput,
+  ProviderRetargetResult,
   RetrievalAggregates,
   RetrievalHistoryQuery,
   RetrievalHit,
@@ -90,6 +143,8 @@ export type {
   RetrievalTool,
   ScopePinRecord,
   ScopePinsPersistence,
+  SecretKeyringPersistence,
+  SecretKeyringRecord,
   SessionRecord,
   AbilityAvailability,
   AbilityAvailabilityPersistence,

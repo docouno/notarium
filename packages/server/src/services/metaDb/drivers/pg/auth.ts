@@ -63,6 +63,17 @@ export const createAuthFacet = (ctx: PgDriverCtx): AuthPersistence => ({
     const res = await ctx.required.query('SELECT * FROM users WHERE username = $1', [username])
     return res.rows[0] ? userOfRow(res.rows[0] as UserRow) : null
   },
+  getUsers: async (usernames) => {
+    if (usernames.length === 0) {
+      return []
+    }
+    await ctx.ensureInit()
+    const result = await ctx.required.query(
+      'SELECT * FROM users WHERE username = ANY($1::text[]) ORDER BY username',
+      [[...new Set(usernames)]],
+    )
+    return (result.rows as UserRow[]).map(userOfRow)
+  },
   listUsers: async () => {
     await ctx.ensureInit()
     const res = await ctx.required.query('SELECT * FROM users ORDER BY created_at, username')
@@ -226,6 +237,19 @@ export const createAuthFacet = (ctx: PgDriverCtx): AuthPersistence => ({
       space: r.space,
       role: r.role,
     }))
+  },
+  grantsForUsers: async (usernames) => {
+    if (usernames.length === 0) {
+      return []
+    }
+    await ctx.ensureInit()
+    const result = await ctx.required.query(
+      `SELECT username, space, role FROM space_members
+        WHERE username = ANY($1::text[])
+        ORDER BY username, space`,
+      [[...new Set(usernames)]],
+    )
+    return result.rows as Array<{ username: string; space: string; role: SpaceRole }>
   },
   membersOf: async (space) => {
     await ctx.ensureInit()

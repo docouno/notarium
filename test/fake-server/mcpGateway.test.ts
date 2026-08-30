@@ -1997,6 +1997,99 @@ describe('whoami', () => {
     // #102: capabilities declared so the agent doesn't probe. The fake runs the
     // CachedStore read-model over InMemoryStore → trash + revisions on, vector off.
     expect(s.capabilities).toEqual({ vector: false, trash: true, revisions: true })
+    expect(s.hasModel).toBe(false)
+    // Zod objects strip unknown keys by default. This exact wire assertion catches
+    // a handler field forgotten in WhoamiOutputSchema instead of accepting its loss.
+    expect(Object.keys(s)).toEqual(['principal', 'scope', 'projects', 'capabilities', 'hasModel'])
+  })
+
+  it('derives hasModel from the principal effective list', async () => {
+    await app.close()
+    let teamId = ''
+    app = await createApp(
+      { ...fixture(), capabilities: { providers: true } },
+      {
+        onProviderPersistence: (_providers, idOf) => {
+          teamId = idOf('team')
+        },
+      },
+    )
+    port = await listen(app)
+
+    const alice = await loginCookie('alice', 'alice-password-1')
+    const alicePat = await patFor('alice', 'alice-password-1', 'read')
+    const bob = await loginCookie('bob', 'bob-password-01')
+    const whoami = () => callTool(port, 'whoami', {}, alicePat)
+
+    const createResource = async (
+      cookie: string,
+      name: string,
+      credentialId: string | null = null,
+    ): Promise<string> => {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/providers/resources',
+        headers: { cookie },
+        payload: {
+          name,
+          wire: 'openai-compatible',
+          baseUrl: 'https://openrouter.ai/api/v1',
+          credentialId,
+          purposes: ['chat'],
+          models: [{ name: 'gpt-4o-mini', dimensions: null, status: 'available' }],
+        },
+      })
+      expect(response.statusCode).toBe(200)
+      return response.json().resource.id as string
+    }
+
+    expect(structured(await whoami()).hasModel).toBe(false)
+
+    const usable = await createResource(alice, 'Usable')
+    expect(structured(await whoami()).hasModel).toBe(true)
+
+    const disabledResource = await app.inject({
+      method: 'PATCH',
+      url: `/api/providers/resources/${usable}`,
+      headers: { cookie: alice },
+      payload: { disabled: true },
+    })
+    expect(disabledResource.statusCode).toBe(200)
+
+    const credential = await app.inject({
+      method: 'POST',
+      url: '/api/providers/credentials',
+      headers: { cookie: alice },
+      payload: {
+        name: 'Disabled credential',
+        kind: 'bearer',
+        secret: 'sk-or-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        origin: 'https://openrouter.ai',
+        injection: { header: '', prefix: 'Bearer ' },
+      },
+    })
+    expect(credential.statusCode).toBe(200)
+    const credentialId = credential.json().credential.id as string
+    await createResource(alice, 'Credential-backed', credentialId)
+    const disabledCredential = await app.inject({
+      method: 'PATCH',
+      url: `/api/providers/credentials/${credentialId}`,
+      headers: { cookie: alice },
+      payload: { disabled: true },
+    })
+    expect(disabledCredential.statusCode).toBe(200)
+    expect(structured(await whoami()).hasModel).toBe(false)
+
+    const foreign = await createResource(bob, 'Pending foreign')
+    const offered = await app.inject({
+      method: 'POST',
+      url: '/api/providers/attachments',
+      headers: { cookie: bob },
+      payload: { resourceId: foreign, targetKind: 'space', targetId: teamId },
+    })
+    expect(offered.statusCode).toBe(200)
+    expect(offered.json()).toMatchObject({ view: { attachment: { state: 'pending' } } })
+    expect(structured(await whoami()).hasModel).toBe(false)
   })
 })
 

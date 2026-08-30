@@ -23,12 +23,14 @@ import { UseRoleOutputSchema } from './roles'
 export const WhoamiInputSchema = z.object({}).strict()
 
 /** Tool `whoami`: the principal, its action ceiling (`read | write`), reachable
- *  projects and engine capabilities. canon: docs/mcp-gateway.md#tools */
+ *  projects, engine capabilities and principal-specific model availability.
+ *  canon: docs/mcp-gateway.md#tools */
 export const WhoamiOutputSchema = z.object({
   principal: z.string(),
   scope: PatScopeSchema,
   projects: z.array(ProjectSummarySchema),
   capabilities: CapabilitiesSchema,
+  hasModel: z.boolean(),
 })
 
 export const GetMyProjectsInputSchema = z.object({}).strict()

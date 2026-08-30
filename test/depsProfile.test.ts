@@ -85,6 +85,12 @@ describe('dependency profiles', () => {
     expect(scripts['deps:full']).toMatch(/^ONNXRUNTIME_NODE_INSTALL=skip npm ci\b/)
   })
 
+  it('declares the provider transport client in the server runtime graph', () => {
+    const server = manifest('packages/server/package.json').dependencies as Record<string, string>
+
+    expect(Object.keys(server)).toContain('undici')
+  })
+
   itFullDeps('contains no unused Linux GPU execution providers after a full install', () => {
     const linuxRuntime = join(root, 'node_modules/onnxruntime-node/bin/napi-v6/linux/x64')
     const gpuProviders = readdirSync(linuxRuntime).filter((file) => /cuda|tensorrt/i.test(file))

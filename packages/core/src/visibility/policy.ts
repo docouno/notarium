@@ -21,6 +21,7 @@ export const CLASS_POLICY: Record<NoteClass, ClassPolicy> = {
     agentRecall: true,
     versioned: true,
     replicate: true,
+    providerEgress: true,
   },
   [NOTE_CLASS.attachment]: {
     index: false,
@@ -31,6 +32,7 @@ export const CLASS_POLICY: Record<NoteClass, ClassPolicy> = {
     agentRecall: false,
     versioned: true,
     replicate: true,
+    providerEgress: false,
   },
   [NOTE_CLASS.derived]: {
     index: false,
@@ -41,6 +43,7 @@ export const CLASS_POLICY: Record<NoteClass, ClassPolicy> = {
     agentRecall: false,
     versioned: false,
     replicate: false,
+    providerEgress: false,
   },
   [NOTE_CLASS.agentMemory]: {
     // Indexed (recall needs it) and versioned/replicated as truth, but hidden
@@ -54,6 +57,7 @@ export const CLASS_POLICY: Record<NoteClass, ClassPolicy> = {
     agentRecall: true,
     versioned: true,
     replicate: true,
+    providerEgress: true,
   },
   [NOTE_CLASS.profile]: {
     // The reserved personal-profile note: HUMAN-authored "about me",
@@ -75,6 +79,7 @@ export const CLASS_POLICY: Record<NoteClass, ClassPolicy> = {
     agentRecall: false,
     versioned: true,
     replicate: true,
+    providerEgress: true,
   },
   [NOTE_CLASS.skill]: {
     // Installed Agent Skills are file truth in the hidden skills mount. They are
@@ -91,6 +96,7 @@ export const CLASS_POLICY: Record<NoteClass, ClassPolicy> = {
     agentRecall: false,
     versioned: true,
     replicate: true,
+    providerEgress: true,
   },
 }
 

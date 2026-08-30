@@ -43,7 +43,7 @@ The names/descriptions the agent sees in `tools/list` are static and live in [de
   episode state. `skill` is the canonical selector; `name` is the same compatibility alias that
   `use_role` offers, and callers provide exactly one. It fails closed instead of truncating when
   the body exceeds its runtime budget.
-- `whoami` — who I am and what I may do (principal-id, the read|write ceiling, project memberships) + the engine's `capabilities` (`vector`/`trash`/`revisions`) — so as not to probe blindly.
+- `whoami` — who I am and what I may do (principal-id, the read|write ceiling, project memberships), the engine's `capabilities` (`vector`/`trash`/`revisions`) and the separate principal-specific `hasModel` boolean. `hasModel` is always present; it is false when providers are disabled or the effective list has no usable model resource. The response never exposes provider names, model names or statuses ([provider boundary](providers.md#enable-and-access)).
 - `get_my_projects` — the list of accessible projects with their slugs (for the `project` argument — do not guess the slug). The personal domain is **not** in the list (it is implied by the token).
 
 **Discover / navigate**

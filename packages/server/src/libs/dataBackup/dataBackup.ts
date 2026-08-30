@@ -38,6 +38,7 @@ const FORMAT_VERSION = 1
 const DATA = 'data'
 const META_DB = `${DATA}/meta.db`
 const REPLAY_KEYRING = `${DATA}/replay-keyring`
+const CREDENTIAL_KEYRING = `${DATA}/secret-keyring`
 const MANIFEST = 'manifest.json'
 const ATOMIC_NOTE_TEMP = /^\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/i
 // A per-run temp of the import contour: the half-written upload, and the plan
@@ -960,6 +961,12 @@ const parseManifest = async (stage: string, limits: ResourceLimits): Promise<Bac
 
   for (const file of value.files) {
     if (
+      typeof file?.path === 'string' &&
+      (file.path === CREDENTIAL_KEYRING || file.path.startsWith(`${CREDENTIAL_KEYRING}/`))
+    ) {
+      throw new Error('backup must not contain the provider credential keyring')
+    }
+    if (
       !file ||
       typeof file.path !== 'string' ||
       !validArchivePath(file.path) ||
@@ -984,6 +991,12 @@ const parseManifest = async (stage: string, limits: ResourceLimits): Promise<Bac
   const seenDirectories = new Set<string>()
 
   for (const directory of value.directories) {
+    if (
+      typeof directory === 'string' &&
+      (directory === CREDENTIAL_KEYRING || directory.startsWith(`${CREDENTIAL_KEYRING}/`))
+    ) {
+      throw new Error('backup must not contain the provider credential keyring')
+    }
     if (
       typeof directory !== 'string' ||
       !validArchivePath(directory) ||
@@ -1235,10 +1248,12 @@ export const restoreDataBackup = async ({
   if (existing.length > 0) {
     if (existing.some((name) => name.startsWith('.notarium-restore-'))) {
       throw new Error(
-        `restore target contains an interrupted restore; discard this fresh target and restore into a new empty DATA_DIR: ${layout.dataDir}`,
+        `restore target contains an interrupted restore; discard this fresh target and restore into a new empty DATA_DIR, then place the matching secret-keyring before first start: ${layout.dataDir}`,
       )
     }
-    throw new Error(`restore target must be a fresh empty DATA_DIR: ${layout.dataDir}`)
+    throw new Error(
+      `restore target must be a fresh empty DATA_DIR; restore the archive first, then place the matching secret-keyring before first start: ${layout.dataDir}`,
+    )
   }
 
   const stage = join(layout.dataDir, `.notarium-restore-${randomUUID()}`)

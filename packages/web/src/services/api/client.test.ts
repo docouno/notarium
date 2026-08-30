@@ -181,6 +181,37 @@ describe('synchronous import stream', () => {
   })
 })
 
+describe('provider conflict transport', () => {
+  it('keeps safe references and the fresh attachment view on ApiError', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              error: 'epoch-conflict',
+              reason: 'epoch-conflict',
+              references: [{ kind: 'provider-resource', id: 'r-1', name: 'Main' }],
+              view: { attachment: { id: 'a-1' } },
+            }),
+            { status: 409, headers: { 'content-type': 'application/json' } },
+          ),
+      ),
+    )
+
+    const failure = await req('/api/providers/attachments/a-1/accept').catch(
+      (cause: unknown) => cause,
+    )
+
+    expect(failure).toBeInstanceOf(ApiError)
+    expect((failure as ApiError).reason).toBe('epoch-conflict')
+    expect((failure as ApiError).references).toEqual([
+      { kind: 'provider-resource', id: 'r-1', name: 'Main' },
+    ])
+    expect((failure as ApiError).providerView).toMatchObject({ attachment: { id: 'a-1' } })
+  })
+})
+
 describe('conflict envelope parsing', () => {
   it('admits a structurally valid current note and refuses a malformed CAS payload', async () => {
     const respond = (current: unknown) =>

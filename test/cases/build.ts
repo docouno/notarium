@@ -21,6 +21,9 @@ import type {
   MemberDecl,
   PendingOAuthClientDecl,
   ProjectDecl,
+  ProviderAttachmentSeedDecl,
+  ProviderCredentialSeedDecl,
+  ProviderResourceSeedDecl,
   RetrievalDecl,
   RevisionStateDecl,
   ScopePinDecl,
@@ -140,6 +143,11 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
   const revisionStates: RevisionStateDecl[] = []
   const externalIdentityClaims: ExternalIdentityClaimDecl[] = []
   const externalSources: ExternalSourceDecl[] = []
+  const providerPrivateOrigins = new Set<string>()
+  const providerCredentials: ProviderCredentialSeedDecl[] = []
+  const providerResources: ProviderResourceSeedDecl[] = []
+  const providerAttachments: ProviderAttachmentSeedDecl[] = []
+  let providerEnabled: boolean | undefined
   const events: CaseEvent[] = []
   const takenPaths = new Set<string>()
   const currentPathByNote = new Map<string, string>()
@@ -220,6 +228,7 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
           users.set(u.username, {
             ...prev,
             admin: prev.admin || u.admin,
+            disabled: prev.disabled || u.disabled,
             personalSpace: prev.personalSpace ?? u.personalSpace,
           })
         }
@@ -244,6 +253,32 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
         if (!pendingOAuthClients.has(key)) {
           pendingOAuthClients.set(key, client)
         }
+      }
+    }
+    if (world.providers) {
+      if (providerEnabled !== undefined && providerEnabled !== world.providers.enabled) {
+        throw new Error('cannot combine enabled and disabled provider seed worlds')
+      }
+      providerEnabled = world.providers.enabled
+      for (const origin of world.providers.privateOrigins ?? []) {
+        providerPrivateOrigins.add(origin)
+      }
+      for (const credential of world.providers.credentials) {
+        providerCredentials.push({ ...credential, ref: `${name}:${credential.ref}` })
+      }
+      for (const resource of world.providers.resources) {
+        providerResources.push({
+          ...resource,
+          ref: `${name}:${resource.ref}`,
+          credential: resource.credential ? `${name}:${resource.credential}` : resource.credential,
+        })
+      }
+      for (const attachment of world.providers.attachments) {
+        providerAttachments.push({
+          ...attachment,
+          ref: `${name}:${attachment.ref}`,
+          resource: `${name}:${attachment.resource}`,
+        })
       }
     }
     for (const e of world.events) {
@@ -424,6 +459,17 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
             : {}),
         }
       : undefined,
+    ...(providerEnabled !== undefined
+      ? {
+          providers: {
+            enabled: providerEnabled,
+            privateOrigins: [...providerPrivateOrigins].sort(),
+            credentials: providerCredentials,
+            resources: providerResources,
+            attachments: providerAttachments,
+          },
+        }
+      : {}),
     events,
     favorites: favorites.size ? [...favorites.values()] : undefined,
     ...(retrievals.length ? { retrievals } : {}),

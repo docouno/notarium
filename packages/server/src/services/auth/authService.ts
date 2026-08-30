@@ -126,6 +126,9 @@ export type CreateAuthServiceOptions = {
   /** Tracks read-side credential usage writes in the online-backup mutation gate
    *  without adding their latency to the request. */
   runMutation?: <T>(task: () => Promise<T>) => Promise<T>
+  /** One durable transition: provider rows owned by the departing member leave
+   * before the membership row, under the same Space fence. */
+  removeMemberAndProviderAttachments: (space: string, username: string) => Promise<void>
 }
 
 export type AuthService = ReturnType<typeof createAuthService>
@@ -153,6 +156,7 @@ export type AuthCtx = {
   notifyRenameOf: (space: string) => void
   notifyAgentSessionsOf: (owner: string) => void
   notifyJobOf: (space: string, ownerPrincipalId: string, payload: unknown) => void
+  removeMemberAndProviderAttachments: (space: string, username: string) => Promise<void>
   registerFail: (key: string) => void
   failKey: (username: string, ip: string) => string
   ipKey: (ip: string) => string
@@ -184,6 +188,7 @@ export function createAuthService({
   now,
   passwordVerifier,
   runMutation,
+  removeMemberAndProviderAttachments,
 }: CreateAuthServiceOptions) {
   if (mode === AUTH_MODE.password && !persistence) {
     throw new Error(
@@ -514,6 +519,7 @@ export function createAuthService({
     notifyRenameOf,
     notifyAgentSessionsOf,
     notifyJobOf,
+    removeMemberAndProviderAttachments,
     registerFail,
     failKey,
     ipKey,

@@ -23,12 +23,14 @@ import {
   CachedStore,
   DOCUMENT_ROLE,
   type FieldSchema,
+  freshNoteId,
   InMemoryRestoreOperationPersistence,
   type InMemoryRevisionPersistence,
   InMemorySpaceLifecyclePersistence,
   type InteractiveSignal,
   REVISION_ENTRY_ROLE,
   sha256Hex,
+  SPACE_LIFECYCLE_PHASE,
 } from '@notarium/core'
 import { InMemoryStore, type StoreSnapshot } from '@notarium/engine-memory'
 import {
@@ -58,7 +60,13 @@ import {
   ownedSkillLocator,
   projectHandleOf,
   type ProjectRecord,
+  PROVIDER_CALL_KIND,
+  PROVIDER_RETRY_MODE,
+  ProviderRegistry,
+  ProviderRuntime,
+  type ProviderRuntimeOptions,
   type RoleLocation,
+  runProviderJobCall,
   type SkillHomeLocation,
   type SpaceDef,
   spaceLifecycleHasEnded,
@@ -67,10 +75,12 @@ import {
   SqliteMetaDb,
   SYSTEM_PRINCIPAL,
   SystemAbilityNameConflictError,
+  TerminalJobError,
 } from '@notarium/server'
 import { applyAgentAbilityPreferences } from '../cases/applyAbilityPreferences'
 import { applyAgentRoleDeclarations } from '../cases/applyAgentRoles'
 import { applyAgentSkillDeclarations } from '../cases/applyAgentSkills'
+import { applyProviderSeed } from '../cases/applyProviders'
 import { personalSpaceForPlacement } from '../cases/personalSpaceSeam'
 import { resolveAvailabilityDecl } from '../cases/resolveAvailability'
 import type {
@@ -78,6 +88,7 @@ import type {
   AgentRoleDecl,
   AgentRoleTargetDecl,
   AgentSkillDecl,
+  ProviderSeedDecl,
 } from '../cases/types'
 import { createInMemoryAbilityPlacement } from './abilityPlacement'
 import { InMemoryAbilityPreferences } from './abilityPreferences'
@@ -87,13 +98,17 @@ import { AuditedRevisionPersistence } from './auditedRevisionPersistence'
 import { InMemoryAuthPersistence } from './authPersistence'
 import { InMemoryContextOrder } from './contextOrder'
 import { InMemoryContextSets } from './contextSets'
+import { createFakeCredentialKeyring } from './credentialKeyring'
 import { InMemoryFavorites } from './favorites'
 import { InMemoryFolders } from './folders'
 import { InMemoryGatewayState } from './gatewayState'
 import { InMemoryOAuthPersistence } from './oauthPersistence'
 import { InMemoryProjects } from './projects'
+import { InMemoryProviderCallLog } from './providerCallLog'
+import { createInMemoryProviderPersistence, type InMemoryProviderPersistence } from './providers'
 import { InMemoryRetrievalLog } from './retrievalLog'
 import { InMemoryScopePins } from './scopePins'
+import { InMemorySecretKeyringPersistence } from './secretKeyring'
 import { InMemorySessionAudit } from './sessionAudit'
 import { InMemorySpaces } from './spaces'
 import { createStoreRoleLibrary } from './storeRoleLibrary'
@@ -140,6 +155,7 @@ export type ActivityFixture = {
 export type SpaceFixture = {
   slug: string
   displayName?: string
+  archived?: boolean
   /** Past slugs pre-seeded into the real SpaceManager registry. */
   aliases?: string[]
   notes: StoreSnapshot['notes']
@@ -161,6 +177,7 @@ export type AuthFixture = {
     password?: string
     displayName?: string
     admin?: boolean
+    disabled?: boolean
     /** Pre-seed the user's personal domain pointer; omit = null
      *  (provisioned lazily on first agent touch). */
     personalSpace?: string
@@ -192,7 +209,11 @@ export type Fixture = {
   now?: string
   spaces: SpaceFixture[]
   projects?: ProjectFixture[]
-  capabilities?: { spaceCreate?: boolean }
+  capabilities?: { spaceCreate?: boolean; providers?: boolean }
+  providerPrivateOrigins?: string[]
+  providers?: ProviderSeedDecl
+  /** Pinned lookup / limiter clock for a validate probe against a local server. */
+  providerRuntime?: Omit<ProviderRuntimeOptions, 'privateOrigins' | 'callLog' | 'mutationGate'>
   auth?: AuthFixture
   agentSessions?: AgentSessionRecord[]
   agentRoles?: AgentRoleDecl[]
@@ -228,6 +249,25 @@ export type Fixture = {
    *  that branch is otherwise unreachable outside a published artifact.
    *  canon: docs/release.md#identity */
   build?: { version: string; commit: string | null; builtAt: string | null; source: string | null }
+}
+
+const TEST_PROVIDER_JOB_KIND = '__test-provider-call'
+const TEST_PROVIDER_JOB_CALL_KEY = 'reply'
+
+type TestProviderCallParams = {
+  resourceId: string
+  model: string
+}
+
+const testProviderCallParams = (value: unknown): TestProviderCallParams | null => {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return null
+  }
+  const { resourceId, model } = value as Record<string, unknown>
+
+  return typeof resourceId === 'string' && resourceId && typeof model === 'string' && model
+    ? { resourceId, model }
+    : null
 }
 
 /** Expand the fixture's terse project declarations into full registry rows.
@@ -372,8 +412,23 @@ export const createApp = async (
     scheduler?: InteractiveSignal
     mutationGate?: MutationGate
     trustProxy?: string[]
+    omitAbout?: boolean
     passwordVerifier?: (password: string, encoded: string) => Promise<boolean>
     oauthPersistence?: InMemoryOAuthPersistence
+    /** The provider journal, injected so a test can read the rows a real call left:
+     *  the subsystem publishes no route over them, deliberately and permanently. */
+    providerCallLog?: InMemoryProviderCallLog
+    /** Test read-model seam for persisted job params/result/error/phase. */
+    onJobsPersistence?: (jobs: MetaDb['jobs']) => void
+    /** Test-only access to archive a configured Space without the product guard. */
+    onSpacesPersistence?: (spaces: InMemorySpaces) => void
+    /** The provider facets, handed back so a test can put an attachment into a state
+     *  the acceptance surface will produce once vertical 14 ships it. `idOf` comes
+     *  with them because an attachment addresses a Space by its stable id. */
+    onProviderPersistence?: (
+      persistence: InMemoryProviderPersistence,
+      idOf: (slug: string) => string,
+    ) => void
     /** Test-only seam for deterministic interleavings around the real routes. */
     configureWorld?: (world: SpaceWorld & { slug: string }) => void
   } = {},
@@ -427,6 +482,56 @@ export const createApp = async (
   // SpaceManager mints an opaque space_id (id ≠ slug) instead of collapsing
   // id ≡ slug — the prerequisite for e2e to see the wire's id→slug projection seam.
   const spacesRegistry = new InMemorySpaces()
+  opts.onSpacesPersistence?.(spacesRegistry)
+  // Declared here, not at the auth block below: provider resolution derives owner
+  // deactivation and owner membership from these rows, so the registry needs them
+  // at construction.
+  const authDb = new InMemoryAuthPersistence()
+  const secretKeyring = new InMemorySecretKeyringPersistence()
+  const providerPersistence = createInMemoryProviderPersistence({
+    spaceIsLive: async (space) =>
+      (await spacesRegistry.getById(space)) != null &&
+      !spaceLifecycleHasEnded(await spaceLifecycle.get(space)),
+    ownerIsMember: async (space, owner) =>
+      (await authDb.grantsFor(owner)).some((grant) => grant.space === space),
+    activeCiphertextKey: () => secretKeyring.activeWrite(),
+    retireCiphertextKeys: (keyIds, retiredAt) => secretKeyring.retireKeys(keyIds, retiredAt),
+  })
+  const fakeCredentialKeyring =
+    fixture.capabilities?.providers || fixture.providers
+      ? createFakeCredentialKeyring(providerPersistence.providerCiphertexts, secretKeyring)
+      : undefined
+  const providerCallLog = opts.providerCallLog ?? new InMemoryProviderCallLog()
+  const providerRuntime = fixture.capabilities?.providers
+    ? new ProviderRuntime({
+        privateOrigins: new Set(fixture.providerPrivateOrigins ?? []),
+        callLog: providerCallLog,
+        mutationGate: opts.mutationGate,
+        ...(fixture.providerRuntime ?? {}),
+      })
+    : undefined
+  const providerSeedRegistry = fakeCredentialKeyring
+    ? new ProviderRegistry({
+        credentials: providerPersistence.credentials,
+        resources: providerPersistence.providerResources,
+        attachments: providerPersistence.providerAttachments,
+        attachmentLifecycle: providerPersistence,
+        spaces: spacesRegistry,
+        projects,
+        directory: authDb,
+        keyring: fakeCredentialKeyring.service,
+        privateOrigins: new Set(fixture.providerPrivateOrigins ?? []),
+        runtime: providerRuntime,
+        mutationGate: opts.mutationGate,
+        authMode: fixture.auth ? 'password' : 'none',
+        now: fixture.now ? () => new Date(fixture.now!) : undefined,
+      })
+    : undefined
+  const providerRegistry = fixture.capabilities?.providers ? providerSeedRegistry : undefined
+
+  if (providerSeedRegistry && fakeCredentialKeyring) {
+    await fakeCredentialKeyring.service.bootstrap()
+  }
 
   const buildWorld = (rec: SpaceRecord, notes: StoreSnapshot['notes']): SpaceWorld => {
     // The engine + read-model address the space by its STABLE id, exactly
@@ -456,10 +561,16 @@ export const createApp = async (
     return world
   }
 
-  const defs: SpaceDef[] = fixture.spaces.map((s) => ({
-    slug: s.slug,
-    displayName: s.displayName || s.slug,
-  }))
+  // An archived case Space is runtime-created before being archived. Putting it
+  // into config defs would make the lifecycle correctly refuse the archive as a
+  // pinned deployment Space, which is a different state from the case's soft-
+  // archived user Space.
+  const defs: SpaceDef[] = fixture.spaces
+    .filter((space) => !space.archived)
+    .map((space) => ({
+      slug: space.slug,
+      displayName: space.displayName || space.slug,
+    }))
   // A meta-DB that backs ONLY the `spaces` facet (the only one SpaceManager reads):
   // it resolves-or-mints each space's opaque id via provisionSpaceIdentity. The fake
   // owns identity in the engines, not a meta-DB — so `identity.findById` is left
@@ -495,10 +606,13 @@ export const createApp = async (
     // real drivers transactionally, but here me() already drops a grant whose space the
     // registry no longer lists, so the wire shows the space gone without touching authDb.
     purgeSpace: async (id: string) => {
-      spacesRegistry.delete(id)
-      // The Space's overrides go with it and the fence closes behind them — the
-      // second half of what the driver does in one transaction.
-      abilityPreferences.spacePurged(id)
+      await providerPersistence.coordinator.run(() => {
+        providerPersistence.purgeSpaceInsideCoordinator(id)
+        spacesRegistry.delete(id)
+        // The Space's overrides go with it and the fence closes behind them — the
+        // second half of what the driver does in one transaction.
+        abilityPreferences.spacePurged(id)
+      })
     },
   }
   const manager = new SpaceManager({
@@ -519,7 +633,10 @@ export const createApp = async (
     // whether it's OFFERED follows the live fixture (capability honesty per
     // world — the harness swaps fixtures at runtime).
     createSpace: async (rec) => {
-      worlds.set(rec.id, buildWorld(rec, []))
+      worlds.set(
+        rec.id,
+        buildWorld(rec, fixture.spaces.find((space) => space.slug === rec.slug)?.notes ?? []),
+      )
     },
     // Permanent purge: drop the in-memory world (the on-disk analogue). The
     // registry row is removed by metaDbStub.purgeSpace above.
@@ -549,6 +666,22 @@ export const createApp = async (
   // Boot: resolve-or-mint each config space's id (populates the registry), then a
   // stable slug→id translator for the seeders below.
   await manager.init()
+  for (const space of fixture.spaces) {
+    if (!space.archived) {
+      continue
+    }
+    manager.add({ slug: space.slug, displayName: space.displayName || space.slug })
+    const id = manager.resolveId(space.slug) as string
+    const record = manager.recOf(id)
+
+    if (!record) {
+      throw new Error(`fixture could not mint archived Space: ${space.slug}`)
+    }
+    await spacesRegistry.upsert(record)
+    await spaceLifecycle.ensure(id, SPACE_LIFECYCLE_PHASE.active, record.createdAt)
+    await manager.store(id)
+  }
+  spacesRegistry.seed(manager.list())
   const fieldSchemaStore = createInMemoryFieldSchemaStore()
 
   for (const seeded of fixture.spaces) {
@@ -594,6 +727,7 @@ export const createApp = async (
 
     return id
   }
+  opts.onProviderPersistence?.(providerPersistence, idOf)
   // Seed the project registry from the fixture (the marker scan that would normally
   // populate it is I0c). Registry-only here (no markerStore) — markFolderAsProject
   // upserts the row directly. AFTER init so space-slugs translate to their ids.
@@ -949,7 +1083,6 @@ export const createApp = async (
   // The auth world: the PRODUCTION service over an in-memory
   // persistence — mode follows the BOOT fixture (a runtime world-swap can't
   // change how the app authenticates, mirroring a real host).
-  const authDb = new InMemoryAuthPersistence()
   // The OAuth connector facade's token store — validated through the SAME
   // auth chokepoint, so it joins the production AuthService here.
   const oauthDb = opts.oauthPersistence ?? new InMemoryOAuthPersistence()
@@ -964,6 +1097,11 @@ export const createApp = async (
     // invisible only while id ≡ slug.
     spaces: spacesRegistry,
     aliasesForSpace: (id) => manager.resolvableAliasesOf(id),
+    removeMemberAndProviderAttachments: (space, username) =>
+      providerPersistence.coordinator.run(() => {
+        providerPersistence.removeProviderAttachmentsForMemberInsideCoordinator(space, username)
+        return authDb.removeMember(space, username)
+      }),
   })
 
   const seedAuth = async (af: AuthFixture | undefined) => {
@@ -979,7 +1117,7 @@ export const createApp = async (
         displayName: u.displayName || u.username,
         passwordHash: u.password ? await memoHash(u.password) : null,
         admin: Boolean(u.admin),
-        disabledAt: null,
+        disabledAt: u.disabled ? t : null,
         createdAt: t,
         // Seeded users get their personal domain lazily on first agent touch
         // — the fixture seeds projects, not the personal pointer. The pointer
@@ -994,6 +1132,47 @@ export const createApp = async (
   }
   await seedAuth(fixture.auth)
 
+  const seedProviders = async (fx: Fixture) => {
+    if (!fx.providers) {
+      return
+    }
+    if (!providerSeedRegistry) {
+      throw new Error('provider seed fixture has no credential keyring')
+    }
+    await applyProviderSeed({
+      declaration: fx.providers,
+      registry: providerSeedRegistry,
+      resolveSpace: (slug) => manager.resolveId(slug),
+      resolveProject: async (space, path) => {
+        const record = projectRecords(fx, idOf).find(
+          (candidate) => candidate.space === idOf(space) && candidate.path === path,
+        )
+        return record ? { id: record.id, space: record.space } : null
+      },
+      overrideResource: (record) => providerPersistence.injectProviderResource(record),
+      overrideAttachment: (record) => providerPersistence.injectProviderAttachment(record),
+    })
+  }
+
+  /** Fake fixtures now project Space archive as a real lifecycle state because
+   * provider resolution must name `space-archived` instead of silently losing the
+   * attachment. Reset first restores every old world, then reapplies the next one. */
+  const applyArchivedSpaces = async (fx: Fixture) => {
+    for (const record of manager.listArchived()) {
+      await manager.restore(record.id)
+    }
+    for (const space of fx.spaces) {
+      if (!space.archived) {
+        continue
+      }
+      const id = idOf(space.slug)
+      await manager.archive(id, SYSTEM_PRINCIPAL.id)
+    }
+  }
+
+  await seedProviders(fixture)
+  await applyArchivedSpaces(fixture)
+
   // MCP durable state: per-session/project delta cursors plus write-retry dedup,
   // over in-memory twins the harness resets.
   const gatewayState = new InMemoryGatewayState()
@@ -1006,6 +1185,7 @@ export const createApp = async (
     authMode: fixture.auth ? 'password' : 'none',
     metaDbFlavour: 'none',
     spaces: defs.map((d) => ({ slug: d.slug, engine: 'notarium' as const })),
+    providers: fixture.capabilities?.providers,
   })
   // The durable job layer: the fake wires the REAL runner over an
   // in-memory SQLite jobs facet (`:memory:`) + a tmp FS artifact store, so the async
@@ -1014,6 +1194,7 @@ export const createApp = async (
   // the export handler unchanged.
   const jobsEnabled = !fixture.noJobs
   const jobsMeta = new SqliteMetaDb(':memory:')
+  opts.onJobsPersistence?.(jobsMeta.jobs)
   const artifactsDir = mkdtempSync(join(tmpdir(), 'notarium-fake-jobs-'))
   const artifacts = createFsArtifactStore(artifactsDir)
   // Durable import: the fake wires the REAL import handler over a tmp staging
@@ -1033,6 +1214,31 @@ export const createApp = async (
         resolveStore: (space) => manager.store(space),
         staging,
       }),
+      ...(providerRegistry
+        ? {
+            [TEST_PROVIDER_JOB_KIND]: async (ctx) => {
+              const params = testProviderCallParams(ctx.job.params)
+
+              if (!params) {
+                throw new TerminalJobError('invalid-provider-job')
+              }
+              const result = await runProviderJobCall(ctx, providerRegistry, {
+                resourceId: params.resourceId,
+                jobCallKey: TEST_PROVIDER_JOB_CALL_KEY,
+                operation: {
+                  kind: PROVIDER_CALL_KIND.chat,
+                  model: params.model,
+                  messages: [{ role: 'user', content: 'Reply with OK.' }],
+                  stream: true,
+                  maxOutputTokens: 32,
+                },
+                inputUpperBound: 8,
+                outputTokenBudget: 32,
+              })
+              return { result }
+            },
+          }
+        : {}),
     },
     onUpdate: (job) => auth.notifyJobChanged(job.space, job.principal, jobToWire(job)),
     onMaintenance: () =>
@@ -1040,6 +1246,7 @@ export const createApp = async (
         const j = await jobsMeta.jobs.get(id)
         return !!j && (j.status === 'pending' || j.status === 'running')
       }, Date.now()),
+    ...(providerRegistry ? { pollIntervalMs: 10, staleAfterMs: 3_000 } : {}),
   })
 
   const app = await buildApp({
@@ -1048,6 +1255,7 @@ export const createApp = async (
     sessions: fixture.noAgentSessions ? undefined : agentSessions,
     customAbilityCreator,
     roles,
+    providerRegistry,
     agentDeltaCursors,
     gatewayState: fixture.noGatewayState ? undefined : gatewayState,
     retrievalLog,
@@ -1070,7 +1278,7 @@ export const createApp = async (
     // faithfully so a future rename e2e gets it for free; no existing route changes.
     spacesPersistence: spacesRegistry,
     spaDist: opts.spaDist,
-    about,
+    about: opts.omitAbout ? undefined : about,
     build: fixture.build,
     // The OAuth facade is active only in 'password' mode (none-mode hosts serve
     // the authless connector) — mirrors the production wiring in server.ts.
@@ -1082,6 +1290,133 @@ export const createApp = async (
     trustProxy: opts.trustProxy,
   })
 
+  // Test-only durable provider consumer. Production has no enqueue surface or job
+  // kind until #95 supplies an actual background feature; the adapter itself is real.
+  app.post(
+    '/api/__test/providers/jobs',
+    { config: { authz: { public: true } } },
+    async (req, reply) => {
+      const body = testProviderCallParams(req.body)
+      const spaceRaw =
+        typeof req.body === 'object' && req.body !== null && !Array.isArray(req.body)
+          ? (req.body as Record<string, unknown>).space
+          : null
+      const space = typeof spaceRaw === 'string' ? manager.resolveId(spaceRaw) : null
+
+      if (!providerRegistry || !jobsEnabled) {
+        return reply.code(404).send({ error: 'provider_jobs_unavailable' })
+      }
+      if (!body || !space) {
+        return reply.code(400).send({ error: 'invalid_provider_job' })
+      }
+      const now = new Date().toISOString()
+      const delayRaw =
+        typeof req.body === 'object' && req.body !== null && !Array.isArray(req.body)
+          ? (req.body as Record<string, unknown>).delayMs
+          : null
+      const delayMs =
+        typeof delayRaw === 'number' && Number.isSafeInteger(delayRaw) && delayRaw >= 0
+          ? delayRaw
+          : 0
+      const idRaw =
+        typeof req.body === 'object' && req.body !== null && !Array.isArray(req.body)
+          ? (req.body as Record<string, unknown>).jobId
+          : null
+      const maxAttemptsRaw =
+        typeof req.body === 'object' && req.body !== null && !Array.isArray(req.body)
+          ? (req.body as Record<string, unknown>).maxAttempts
+          : null
+      const queued = await jobsMeta.jobs.enqueue({
+        id: typeof idRaw === 'string' && idRaw ? idRaw : freshNoteId(),
+        space,
+        kind: TEST_PROVIDER_JOB_KIND,
+        principal: SYSTEM_PRINCIPAL.id,
+        params: body,
+        progressTotal: 1,
+        maxAttempts:
+          typeof maxAttemptsRaw === 'number' &&
+          Number.isSafeInteger(maxAttemptsRaw) &&
+          maxAttemptsRaw > 0
+            ? maxAttemptsRaw
+            : undefined,
+        runAt: new Date(Date.parse(now) + delayMs).toISOString(),
+        createdAt: now,
+      })
+      jobRunner.wake()
+      return reply.code(202).send(jobToWire(queued))
+    },
+  )
+
+  // Test-only interactive streaming driver. `longLived` keeps it out of the
+  // scheduler counter; cancellation is its own AbortController on socket close.
+  app.post(
+    '/api/__test/providers/stream',
+    { config: { authz: { public: true }, longLived: true } },
+    async (req, reply) => {
+      const body = testProviderCallParams(req.body)
+      const spaceRaw =
+        typeof req.body === 'object' && req.body !== null && !Array.isArray(req.body)
+          ? (req.body as Record<string, unknown>).space
+          : null
+      const space = typeof spaceRaw === 'string' ? manager.resolveId(spaceRaw) : null
+
+      if (!providerRegistry) {
+        return reply.code(404).send({ error: 'providers_unavailable' })
+      }
+      if (!body || !space) {
+        return reply.code(400).send({ error: 'invalid_provider_stream' })
+      }
+      const controller = new AbortController()
+
+      const disconnected = () => {
+        if (!reply.raw.writableEnded) {
+          controller.abort(new Error('provider stream client disconnected'))
+        }
+      }
+      reply.raw.once('close', disconnected)
+      reply.hijack()
+      reply.raw.writeHead(200, {
+        'content-type': 'text/plain; charset=utf-8',
+        'cache-control': 'no-store',
+      })
+      reply.raw.flushHeaders()
+
+      try {
+        await providerRegistry.executeForScope({
+          space,
+          principal: SYSTEM_PRINCIPAL.id,
+          agent: null,
+          resourceId: body.resourceId,
+          operation: {
+            kind: PROVIDER_CALL_KIND.chat,
+            model: body.model,
+            messages: [{ role: 'user', content: 'Reply with OK.' }],
+            stream: true,
+            maxOutputTokens: 32,
+          },
+          retryMode: PROVIDER_RETRY_MODE.none,
+          job: null,
+          rateLimit: { inputUpperBound: 8, outputTokenBudget: 32 },
+          signal: controller.signal,
+          onText: ({ text }) => {
+            if (!reply.raw.destroyed) {
+              reply.raw.write(text)
+            }
+          },
+        })
+        if (!reply.raw.destroyed) {
+          reply.raw.end()
+        }
+      } catch (error) {
+        if (!controller.signal.aborted && !reply.raw.destroyed) {
+          reply.raw.destroy(error instanceof Error ? error : new Error(String(error)))
+        }
+      } finally {
+        reply.raw.removeListener('close', disconnected)
+      }
+    },
+  )
+
   // Test-only: re-seed every space from the fixture (optionally a NEW fixture
   // passed in the body — the e2e suite swaps worlds per spec this way), wipe
   // the journals and the auth world, drop test-created spaces and rebuild the
@@ -1089,6 +1424,9 @@ export const createApp = async (
   app.post('/api/__test/reset', { config: { authz: { public: true } } }, async (req) => {
     const next = (req.body as { fixture?: Fixture } | null)?.fixture ?? baseFixture
     fixture = next
+    for (const record of manager.listArchived()) {
+      await manager.restore(record.id)
+    }
     // Worlds + manager are keyed by the stable id now: map each live world
     // back to its record to compare slugs, and drop the ones gone from `next`.
     // (The harness wires no `isPersonalSpace`, so manager.remove never invokes the
@@ -1128,7 +1466,15 @@ export const createApp = async (
       } else {
         // A brand-new space: the manager mints its opaque id; store() builds the world.
         manager.add({ slug: s.slug, displayName: s.displayName || s.slug })
-        await manager.store(manager.resolveId(s.slug) as string)
+        const id = manager.resolveId(s.slug) as string
+        const minted = manager.recOf(id)
+
+        if (!minted) {
+          throw new Error(`fixture reset could not mint Space: ${s.slug}`)
+        }
+        await spacesRegistry.upsert(minted)
+        await spaceLifecycle.ensure(id, SPACE_LIFECYCLE_PHASE.active, minted.createdAt)
+        await manager.store(id)
       }
     }
     for (const s of next.spaces) {
@@ -1166,6 +1512,10 @@ export const createApp = async (
     contextSets.clear()
     scopePins.clear()
     contextOrder.clear()
+    providerPersistence.clear()
+    providerCallLog.clear()
+    await seedProviders(next)
+    await applyArchivedSpaces(next)
     // Folder identities are minted at runtime (no fixture seed), so a reset just
     // wipes them.
     folders.clear()
@@ -1182,6 +1532,7 @@ export const createApp = async (
     await jobsMeta.close()
     await rm(artifactsDir, { recursive: true, force: true }).catch(() => {})
     await rm(stagingDir, { recursive: true, force: true }).catch(() => {})
+    await fakeCredentialKeyring?.close().catch(() => {})
     await manager.stopAll()
   })
   return app

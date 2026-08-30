@@ -37,6 +37,12 @@ services:
       # websocket must target :443 rather than the server port — otherwise live
       # reload silently fails to connect. Override if you tunnel on another port.
       HMR_CLIENT_PORT: ${HMR_CLIENT_PORT:-443}
+      # Provider seed cases carry runtime capability/origins in the same catalog
+      # world as their rows. Shell overrides from `make seed` win here; ordinary
+      # `make dev` still interpolates the checkout's .env values.
+      PROVIDERS_ENABLED: ${PROVIDERS_ENABLED:-false}
+      PROVIDERS_PRIVATE_ORIGINS: ${PROVIDERS_PRIVATE_ORIGINS:-}
+      PROVIDERS_CALL_LOG_RETENTION_DAYS: ${PROVIDERS_CALL_LOG_RETENTION_DAYS:-90}
       # Poll the bind mount so file changes are detected reliably across the
       # host→container boundary.
       CHOKIDAR_USEPOLLING: "true"

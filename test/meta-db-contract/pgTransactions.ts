@@ -50,6 +50,40 @@ export const PG_TRANSACTIONS: readonly PgTransaction[] = [
   { id: 'installationGeneration.acquireBackupFreeze', levels: [] },
   { id: 'installationGeneration.compareAndSet', levels: [] },
   { id: 'installationGeneration.renewBackupFreeze', levels: [] },
+  { id: 'secretKeyring.admitReadable', levels: ['L5k'] },
+  { id: 'secretKeyring.projectActive', levels: ['L5k'] },
+  { id: 'secretKeyring.projectRotationActive', levels: ['L5k'] },
+  { id: 'secretKeyring.replaceNonRetiredWith', levels: ['L5k'] },
+  { id: 'credentials.create', levels: ['L5k', 'L5c'] },
+  { id: 'credentials.mutate', levels: ['L5k', 'L5c', 'L5r', 'L5a'] },
+  { id: 'credentials.deleteIfUnreferenced', levels: ['L5c'] },
+  { id: 'providerResources.create', levels: ['L5k', 'L5c', 'L5r'] },
+  { id: 'providerResources.replaceIfRuntimeEpoch', levels: ['L5k', 'L5c', 'L5r', 'L5a'] },
+  // The resource delete enters L5a through the attachment FK cascade. As with the
+  // import-path cascade below, the live observer sees only the explicit parent DML.
+  { id: 'providerResources.delete', levels: ['L5r', 'L5a'] },
+  { id: 'providerResources.materializeModel', levels: ['L5r'] },
+  // The conditional validate write reads the referenced credential row under the
+  // same fence, so it enters L5c before L5r like every other two-facet member.
+  { id: 'providerResources.recordLastCheck', levels: ['L5c', 'L5r'] },
+  {
+    id: 'providerAttachments.offerProviderAttachment',
+    levels: ['L3s', 'L5c', 'L5r', 'L5a'],
+  },
+  {
+    id: 'providerAttachments.acceptProviderAttachment',
+    levels: ['L3s', 'L5c', 'L5r', 'L5a'],
+  },
+  { id: 'providerAttachments.detachProviderAttachment', levels: ['L3s', 'L5r', 'L5a'] },
+  { id: 'pgMetaDb.retargetProviderCredential', levels: ['L5c', 'L5r', 'L5a'] },
+  { id: 'pgMetaDb.removeMemberAndProviderAttachments', levels: ['L3s', 'L5r', 'L5a'] },
+  // The journal tail. It points at nothing and nothing points at it, so its only
+  // ordering duty is to stay last; the durable send-fence is an advisory on the
+  // logical call, taken at the same level as the insert it protects.
+  { id: 'providerCallLog.intent', levels: ['L5g'] },
+  { id: 'providerCiphertexts.purgeUnreadable', levels: ['L5k', 'L5c', 'L5r'] },
+  { id: 'providerCiphertexts.rewrapBatch', levels: ['L5k', 'L5c', 'L5r'] },
+  { id: 'providerCiphertexts.retireKeys', levels: ['L5k'] },
   { id: 'restoreOperations.transition', levels: [] },
   { id: 'restoreTerminal.finalize', levels: [] },
   { id: 'spaceLifecycle.transition', levels: [] },
@@ -174,6 +208,7 @@ export const PG_TRANSACTIONS: readonly PgTransaction[] = [
       'L4f',
       'L4a',
       'L4p',
+      'L5a',
     ],
     exempt: 'wide-scan',
     sweeps: {

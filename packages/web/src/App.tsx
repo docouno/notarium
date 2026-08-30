@@ -26,6 +26,7 @@ import { HotkeysProvider } from './composers/HotkeysProvider'
 import { ImportDropZone } from './composers/ImportDropZone'
 import { NotesProvider } from './composers/NotesProvider'
 import { ProjectsProvider } from './composers/ProjectsProvider'
+import { ProviderSurfaceGate } from './composers/ProviderSurfaceGate'
 import { Sidebar } from './composers/Sidebar'
 import { SpaceAccessProvider } from './composers/SpaceAccessProvider'
 import { SpaceProvider, useSpace } from './composers/SpaceProvider'
@@ -60,8 +61,10 @@ import {
   AccountTab,
   AppearanceTab,
   ConnectedAppsTab,
+  CredentialsTab,
   KeyboardTab,
   ProfileTab,
+  ProviderResourcesTab,
   SettingsPage,
   UsersTab,
 } from './pages/SettingsPage'
@@ -73,6 +76,7 @@ import {
   ImportTab,
   MembersTab,
   ProjectsTab,
+  ProviderAttachmentsTab,
   WorkspaceSettingsPage,
 } from './pages/WorkspaceSettingsPage'
 
@@ -202,6 +206,22 @@ const router = createBrowserRouter([
           { path: 'profile', element: <ProfileTab /> },
           { path: 'account', element: <AccountTab /> },
           { path: 'connected-apps', element: <ConnectedAppsTab /> },
+          {
+            path: 'credentials',
+            element: (
+              <ProviderSurfaceGate scope="settings">
+                <CredentialsTab />
+              </ProviderSurfaceGate>
+            ),
+          },
+          {
+            path: 'providers',
+            element: (
+              <ProviderSurfaceGate scope="settings">
+                <ProviderResourcesTab />
+              </ProviderSurfaceGate>
+            ),
+          },
           { path: 'about', element: <AboutTab /> },
           { path: 'users', element: <UsersTab /> },
         ],
@@ -398,6 +418,14 @@ const router = createBrowserRouter([
           { path: 'general', element: <GeneralTab /> },
           { path: 'members', element: <MembersTab /> },
           { path: 'projects', element: <ProjectsTab /> },
+          {
+            path: 'providers',
+            element: (
+              <ProviderSurfaceGate scope="workspace">
+                <ProviderAttachmentsTab />
+              </ProviderSurfaceGate>
+            ),
+          },
           { path: 'fields', element: <FieldsTab /> },
           { path: 'import', element: <ImportTab /> },
           { path: 'export', element: <ExportTab /> },

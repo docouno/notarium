@@ -35,6 +35,13 @@
       "checksum": "sha256:0833cbdb122624db71d6fc53e6d1894ed090e057b27bf66292d70c9ac90b501e",
       "sqlite": "sqlite/0004_import_reservations.sql",
       "postgres": "postgres/0004_import_reservations.sql"
+    },
+    {
+      "version": 5,
+      "name": "provider_contour",
+      "checksum": "sha256:258a1fa1e3538675665f2fa3cc5e38e82aef064fc894a3b6d8461e6d2a2f9d12",
+      "sqlite": "sqlite/0005_provider_contour.sql",
+      "postgres": "postgres/0005_provider_contour.sql"
     }
   ]
 }

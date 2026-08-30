@@ -15,6 +15,7 @@ import type {
   ContextSetItemRef,
   ContextSetRecord,
   ContextSetTargetKind,
+  CredentialRecord,
   FolderRecord,
   JobRecord,
   JobStatus,
@@ -24,6 +25,9 @@ import type {
   PatRecord,
   ProjectRecord,
   ProjectStatus,
+  ProviderAttachmentRecord,
+  ProviderCallLogRecord,
+  ProviderResourceRecord,
   RetrievalHit,
   RetrievalLogRecord,
   RetrievalTool,
@@ -32,6 +36,157 @@ import type {
   SpaceRole,
   UserRecord,
 } from './types'
+
+const jsonOf = <T>(raw: string | null | undefined, fallback: T): T => {
+  if (!raw) {
+    return fallback
+  }
+  try {
+    return JSON.parse(raw) as T
+  } catch {
+    return fallback
+  }
+}
+
+// ── provider facet rows ──────────────────────────────────────────────
+
+export type CredentialRow = {
+  id: string
+  owner: string
+  name: string
+  kind: CredentialRecord['kind']
+  secret: string
+  origin: string
+  injection: string
+  disabled_at: string | null
+  rpm: number | string | null
+  tpm: number | string | null
+  consent_epoch: number | string
+  runtime_epoch: number | string
+}
+
+export const credentialOfRow = (row: CredentialRow): CredentialRecord => ({
+  id: row.id,
+  owner: row.owner,
+  name: row.name,
+  kind: row.kind,
+  secret: row.secret,
+  origin: row.origin,
+  injection: jsonOf(row.injection, { header: '', prefix: '' }),
+  disabledAt: row.disabled_at,
+  rpm: row.rpm == null ? null : Number(row.rpm),
+  tpm: row.tpm == null ? null : Number(row.tpm),
+  consentEpoch: Number(row.consent_epoch),
+  runtimeEpoch: Number(row.runtime_epoch),
+})
+
+export type ProviderResourceRow = {
+  id: string
+  owner: string
+  name: string
+  wire: ProviderResourceRecord['wire']
+  base_url: string
+  headers: string
+  allow_private_network: number | boolean
+  purposes: string
+  models: string
+  default_model: string | null
+  credential_id: string | null
+  consent_epoch: number | string
+  runtime_epoch: number | string
+  disabled_at: string | null
+  last_check: string
+  first_byte_timeout_ms: number | string | null
+  call_timeout_ms: number | string | null
+}
+
+export const providerResourceOfRow = (row: ProviderResourceRow): ProviderResourceRecord => ({
+  id: row.id,
+  owner: row.owner,
+  name: row.name,
+  wire: row.wire,
+  baseUrl: row.base_url,
+  headers: jsonOf(row.headers, {}),
+  allowPrivateNetwork: Boolean(row.allow_private_network),
+  purposes: jsonOf(row.purposes, []),
+  models: jsonOf(row.models, []),
+  defaultModel: row.default_model,
+  credentialId: row.credential_id,
+  consentEpoch: Number(row.consent_epoch),
+  runtimeEpoch: Number(row.runtime_epoch),
+  disabledAt: row.disabled_at,
+  lastCheck: jsonOf(row.last_check, {}),
+  firstByteTimeoutMs: row.first_byte_timeout_ms == null ? null : Number(row.first_byte_timeout_ms),
+  callTimeoutMs: row.call_timeout_ms == null ? null : Number(row.call_timeout_ms),
+})
+
+export type ProviderAttachmentRow = {
+  id: string
+  resource_id: string
+  target_kind: ProviderAttachmentRecord['targetKind']
+  target_id: string
+  target_space: string
+  state: ProviderAttachmentRecord['state']
+  resource_epoch: number | string | null
+  credential_epoch: number | string | null
+  disclosure_snapshot: string | null
+  created_at: string
+  expires_at: string
+}
+
+export const providerAttachmentOfRow = (row: ProviderAttachmentRow): ProviderAttachmentRecord => ({
+  id: row.id,
+  resourceId: row.resource_id,
+  targetKind: row.target_kind,
+  targetId: row.target_id,
+  targetSpace: row.target_space,
+  state: row.state,
+  resourceEpoch: row.resource_epoch == null ? null : Number(row.resource_epoch),
+  credentialEpoch: row.credential_epoch == null ? null : Number(row.credential_epoch),
+  disclosure: jsonOf(row.disclosure_snapshot, null),
+  createdAt: row.created_at,
+  expiresAt: row.expires_at,
+})
+
+export type ProviderCallLogRow = {
+  id: string
+  owner: string
+  principal: string
+  agent: string | null
+  resource_id: string
+  credential_id: string | null
+  host: string
+  spaces: string | null
+  job_id: string | null
+  job_call_key: string | null
+  attempt_no: number | string | null
+  delivery_state: ProviderCallLogRecord['deliveryState']
+  retry_safe: number | boolean
+  outcome: ProviderCallLogRecord['outcome']
+  token_usage: string | null
+  created_at: string
+  settled_at: string | null
+}
+
+export const providerCallLogOfRow = (row: ProviderCallLogRow): ProviderCallLogRecord => ({
+  id: row.id,
+  owner: row.owner,
+  principal: row.principal,
+  agent: row.agent,
+  resourceId: row.resource_id,
+  credentialId: row.credential_id,
+  host: row.host,
+  spaces: jsonOf(row.spaces, []),
+  jobId: row.job_id,
+  jobCallKey: row.job_call_key,
+  attemptNo: row.attempt_no == null ? null : Number(row.attempt_no),
+  deliveryState: row.delivery_state,
+  retrySafe: Boolean(row.retry_safe),
+  outcome: row.outcome,
+  usage: jsonOf(row.token_usage, null),
+  createdAt: row.created_at,
+  settledAt: row.settled_at,
+})
 
 /** A row of the `spaces` table. */
 export type SpaceRow = {

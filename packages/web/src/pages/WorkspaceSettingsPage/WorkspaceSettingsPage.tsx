@@ -23,6 +23,7 @@ export const WorkspaceSettingsPage = () => {
   // PATCH 404s — hide rather than offer a dead form). Excluded on the personal domain (its
   // handle/name are internal). A writer/reader never sees it.
   const canManage = canManageSpace(me, mode, space) && capabilities.spaceCreate
+  const canManageProviders = canManageSpace(me, mode, space) && capabilities.providers
   const groups: SettingsTab[][] = [
     onPersonal
       ? [
@@ -33,6 +34,7 @@ export const WorkspaceSettingsPage = () => {
           ...(canManage ? [{ id: 'general', label: 'General' }] : []),
           { id: 'members', label: 'Members' },
           { id: 'projects', label: 'Projects' },
+          ...(canManageProviders ? [{ id: 'providers', label: 'Model providers' }] : []),
           ...(canWrite ? [{ id: 'fields', label: 'Fields' }] : []),
         ],
     // Export (#17) / Import (#11) are per-space data actions, not management —

@@ -47,7 +47,7 @@ export const createMemberships = (ctx: AuthCtx) => ({
     ) {
       throw new AuthError(HTTP_STATUS.BAD_REQUEST, 'a space needs an owner', 'last_owner')
     }
-    await ctx.db.removeMember(space, username)
+    await ctx.removeMemberAndProviderAttachments(space, username)
     // Revoke = disconnect: drop the member's channels on THIS space only; their
     // OTHER-space streams stay (still legit) but get nudged to de-list this one.
     ctx.dropSse((h) => h.username === username && h.space === space)

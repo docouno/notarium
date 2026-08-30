@@ -16,6 +16,8 @@ import {
 import {
   approvedTargetCatalog,
   type MetaDbCatalog,
+  PROVIDER_CONTOUR_TABLES,
+  splitProviderContour,
   sqliteMetaDbCatalog,
 } from '../meta-db-contract/metaDbCatalog'
 
@@ -79,6 +81,7 @@ describe('meta-DB migration assets and SQLite runner', () => {
       { version: 2, name: 'agent_state' },
       { version: 3, name: 'causal_identity' },
       { version: 4, name: 'import_reservations' },
+      { version: 5, name: 'provider_contour' },
     ])
     for (const migration of migrations) {
       expect(migration.checksum).toBe(checksumMigrationPair(migration.sqlite, migration.postgres))
@@ -114,12 +117,39 @@ describe('meta-DB migration assets and SQLite runner', () => {
           .all() as Array<{ type: string; count: number }>
       ).map(({ type, count }) => [type, count]),
     )
-    expect(counts).toEqual({ index: 64, table: 43, trigger: 31 })
+    // On top of the published line, the provider contour adds five tables — the
+    // keyring, the three facets and the call journal — and eleven named indexes: the
+    // keyring's single-active partial, eight lookup/page keys across the facets, plus
+    // the journal's owner and retention indexes. Every primary/UNIQUE autoindex stays
+    // excluded by the query above, the journal's send-fence key among them.
+    expect(counts).toEqual({ index: 75, table: 48, trigger: 31 })
     expect(
       db.prepare("SELECT 1 FROM sqlite_schema WHERE name = 'meta_schema'").get(),
     ).toBeUndefined()
     expect((db.prepare('PRAGMA auto_vacuum').get() as { auto_vacuum: number }).auto_vacuum).toBe(2)
-    expect(sqliteMetaDbCatalog(db)).toEqual(approvedTargetCatalog(sqliteGolden))
+    const retentionPlan = db
+      .prepare(
+        `EXPLAIN QUERY PLAN
+         SELECT entry.id
+           FROM provider_call_log AS entry
+           LEFT JOIN jobs AS job ON job.id = entry.job_id
+          WHERE entry.outcome <> 'in-flight' AND entry.settled_at IS NOT NULL
+            AND entry.settled_at < '2026-08-30T00:00:00.000Z'
+            AND (
+              entry.job_id IS NULL OR job.id IS NULL
+              OR job.status NOT IN ('pending', 'running')
+            )
+          ORDER BY entry.settled_at, entry.id
+          LIMIT 1000`,
+      )
+      .all() as Array<{ detail: string }>
+    expect(retentionPlan.map(({ detail }) => detail).join('\n')).toContain(
+      'USING INDEX idx_provider_call_log_retention',
+    )
+    expect(retentionPlan.map(({ detail }) => detail).join('\n')).not.toContain('USE TEMP B-TREE')
+    const live = splitProviderContour(sqliteMetaDbCatalog(db))
+    expect(live.contour).toEqual(PROVIDER_CONTOUR_TABLES)
+    expect(live.published).toEqual(approvedTargetCatalog(sqliteGolden))
   })
 
   it('requires both identities on every placement trail row', () => {
@@ -191,6 +221,34 @@ describe('meta-DB migration assets and SQLite runner', () => {
     runSqliteMigrations(db)
 
     expect(ledger(db)).toEqual(before)
+  })
+
+  it('adds the whole provider contour over a published-line schema that has rows', () => {
+    const db = database()
+    const upTo = migrations.findIndex((migration) => migration.name === 'provider_contour')
+    runSqliteMigrations(db, migrations.slice(0, upTo))
+    db.prepare(
+      `INSERT INTO note_identity
+        (id, file_path, space, created_at, materialized, deleted_at, legacy_name_aliases)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run('existing-identity', 'kept.md', 'main', null, 1, null, '[]')
+    for (const table of PROVIDER_CONTOUR_TABLES) {
+      expect(
+        db.prepare('SELECT 1 FROM sqlite_schema WHERE name = ?').get(table),
+        `${table} exists before its carrier`,
+      ).toBeUndefined()
+    }
+
+    runSqliteMigrations(db, migrations)
+
+    // The carrier only adds: the published line's own rows are untouched, and every
+    // contour table arrives empty rather than guessed at from anything.
+    expect(
+      db.prepare('SELECT file_path FROM note_identity WHERE id = ?').get('existing-identity'),
+    ).toEqual({ file_path: 'kept.md' })
+    for (const table of PROVIDER_CONTOUR_TABLES) {
+      expect(db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get(), table).toEqual({ n: 0 })
+    }
   })
 
   it('adds an empty legacy alias set without guessing from existing names or paths', () => {

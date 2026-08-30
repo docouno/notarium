@@ -1093,6 +1093,7 @@ describe('structuredContent shapes (MCP object-wrapped)', () => {
           },
         ],
         capabilities: caps,
+        hasModel: true,
       }).success,
     ).toBe(true)
     expect(
@@ -1101,12 +1102,23 @@ describe('structuredContent shapes (MCP object-wrapped)', () => {
         scope: 'manage',
         projects: [],
         capabilities: caps,
+        hasModel: false,
       }).success,
     ).toBe(false)
     // #102 phase 1: capabilities is a required declaration — a whoami without it is invalid.
     expect(
       WhoamiOutputSchema.safeParse({ principal: 'pat:ann:1', scope: 'write', projects: [] })
         .success,
+    ).toBe(false)
+    // #387: the model capability is principal-specific and always present, even
+    // when the provider subsystem is disabled.
+    expect(
+      WhoamiOutputSchema.safeParse({
+        principal: 'pat:ann:1',
+        scope: 'write',
+        projects: [],
+        capabilities: caps,
+      }).success,
     ).toBe(false)
   })
 })
