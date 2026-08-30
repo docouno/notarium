@@ -6,7 +6,6 @@
 import { CONTEXT_ENTRY_KIND, NOTE_CLASS } from '@notarium/contract'
 import {
   basenameOf,
-  curateBudget,
   estimateTokens,
   isFolderPageNote,
   isPathUnder,
@@ -54,6 +53,19 @@ export type WeighedSetItem = WeighedPin & { space: string }
 /** A context set resolved for a scope: its ACCESSIBLE items only (per-reader degradation
  *  already applied), weighed. canon: docs/projects.md#context-sets-209-reusable-cross-space-bundles */
 export type WeighedSet = { id: string; name: string; homeSpace: string; items: WeighedSetItem[] }
+/** A context set before per-item I/O. Budgeted consumers resolve this raw membership
+ * lazily in the shared strict sequence; the role identity door deliberately keeps
+ * using {@link resolveContextSets} because it is an unbudgeted editing surface. */
+export type ScopeSetRefs = {
+  id: string
+  name: string
+  homeSpace: string
+  items: ReadonlyArray<{ noteId: string }>
+  read: (noteId: string) => Promise<ResolvedContextNote | null>
+  /** REST may expose raw totals/cursors only to a reader of the set's home space. */
+  coordinatesVisible: boolean
+}
+export type ScopeSetInput = WeighedSet | ScopeSetRefs
 /** A set after curation. `homeSpace` rides through so the pult addresses the set's CRUD
  *  against its real home; item `order` and set `order` are user-ordered positions. */
 export type CuratedSet = {
@@ -61,12 +73,18 @@ export type CuratedSet = {
   name: string
   homeSpace: string
   order: number
-  items: Array<WeighedSetItem & { loaded: boolean; order: number }>
+  items: Array<WeighedSetItem & { loaded: boolean; order: number; sourceIndex: number }>
+  itemsTotal: number
+  itemsLoaded: number
+  itemsCursor: number
+  trimmed: boolean
+  /** Internal disclosure verdict. Zod strips it from the public response. */
+  coordinatesVisible: boolean
 }
 
 export type RoleScopeInput = {
   pins: WeighedPin[]
-  sets: WeighedSet[]
+  sets: ScopeSetInput[]
   order?: ScopeOrder
 }
 
@@ -234,7 +252,22 @@ const orderKey = (kind: 'pin' | 'set', ref: string) => `${kind}:${ref}`
 
 /** One pin-like entry riding a scope budget (a pin OR a set item), tagged with its
  *  `bucket`/`setIdx` so survivors can be re-bucketed after the joint budgeting. */
-type ScopeEntry = WeighedPin & { space: string; bucket: string; setIdx: number }
+type ScopeEntry = WeighedPin & {
+  space: string
+  bucket: string
+  setIdx: number
+  sourceIndex?: number
+}
+type ScopeEntryRef =
+  | { kind: 'pin'; entry: ScopeEntry }
+  | {
+      kind: 'set'
+      bucket: string
+      setIdx: number
+      sourceIndex: number
+      rawNoteId: string
+      resolve: () => Promise<WeighedSetItem | null>
+    }
 /** One draggable GROUP of a scope's pin+set list: a pin (one entry) or a set (all its
  *  items, moving together). `pos` is the 0-based wire `order` so the client renders the
  *  interleaved list without re-deriving the sequence. */
@@ -243,7 +276,50 @@ type ScopeGroup = {
   ref: string
   setIdx: number
   pos: number
-  entries: ScopeEntry[]
+  entries: Iterable<ScopeEntryRef>
+}
+
+const isResolvedSet = (set: ScopeSetInput): set is WeighedSet => !('read' in set)
+
+const resolvedSetItem =
+  (item: WeighedSetItem): (() => Promise<WeighedSetItem>) =>
+  async () =>
+    item
+
+const rawSetItem =
+  (set: ScopeSetRefs, noteId: string): (() => Promise<WeighedSetItem | null>) =>
+  async () => {
+    const note = await set.read(noteId)
+
+    if (!note) {
+      return null
+    }
+
+    return {
+      noteId: note.noteId ?? noteId,
+      title: note.title,
+      tokens: note.tokens ?? estimateTokens(note.content ?? ''),
+      space: note.spaceSlug,
+      ...(isFolderPageNote(note.filePath) ? { folderOverview: true as const } : {}),
+    }
+  }
+
+function* setEntryRefs(set: ScopeSetInput, setIdx: number, bucket: string) {
+  for (let sourceIndex = 0; sourceIndex < set.items.length; sourceIndex += 1) {
+    const item = set.items[sourceIndex]
+    const noteId = item.noteId
+
+    yield {
+      kind: 'set' as const,
+      bucket,
+      setIdx,
+      sourceIndex,
+      rawNoteId: noteId,
+      resolve: isResolvedSet(set)
+        ? resolvedSetItem(item as WeighedSetItem)
+        : rawSetItem(set, noteId),
+    }
+  }
 }
 
 /** Order a scope's pin+set GROUPS by the user overlay: ranked first, then the unranked in
@@ -252,7 +328,7 @@ type ScopeGroup = {
 const orderGroups = (
   pins: WeighedPin[],
   pinBucket: string,
-  sets: WeighedSet[],
+  sets: ScopeSetInput[],
   setBucket: string,
   order: ScopeOrder,
 ): ScopeGroup[] => {
@@ -262,13 +338,18 @@ const orderGroups = (
       kind: CONTEXT_ENTRY_KIND.pin,
       ref: p.noteId,
       setIdx: -1,
-      entries: [{ ...p, space: p.space ?? '', bucket: pinBucket, setIdx: -1 }],
+      entries: [
+        {
+          kind: 'pin' as const,
+          entry: { ...p, space: p.space ?? '', bucket: pinBucket, setIdx: -1 },
+        },
+      ],
     })),
     ...sets.map((s, i) => ({
       kind: CONTEXT_ENTRY_KIND.set,
       ref: s.id,
       setIdx: i,
-      entries: s.items.map((it) => ({ ...it, bucket: setBucket, setIdx: i })),
+      entries: setEntryRefs(s, i, setBucket),
     })),
   ]
   return raw
@@ -281,43 +362,173 @@ const orderGroups = (
     .map(({ g }, pos) => ({ ...g, pos }))
 }
 
-/** Dedup an ORDERED entry sequence by note id (first occurrence wins — a note pinned AND
- *  in a set loads ONCE, higher rank wins), then budget survivors jointly with the memory
- *  summaries under ONE budget: the strict prefix that fits is `loaded`. Muted memory is
- *  excluded from the budget but KEPT (loaded:false) so the audit still shows it. */
-const budgetSequence = <M extends CuratableMemory>(
-  entries: readonly ScopeEntry[],
-  memory: M[],
-  budget: number,
-): {
+type ResolveStopReason = 'budget' | 'item-cap' | 'resolve-cap' | 'exhausted'
+type ResolvedTrace = {
+  setIdx: number
+  sourceIndex: number
+  rawNoteId: string
+  canonicalNoteId: string | null
+}
+
+type CuratedSequence<M extends CuratableMemory> = {
   entries: Array<ScopeEntry & { loaded: boolean }>
   memory: Array<M & { loaded: boolean }>
   loadedTokens: number
-  totalTokens: number
-} => {
-  const seen = new Set<string>()
-  const survivors = entries.filter((e) => (seen.has(e.noteId) ? false : (seen.add(e.noteId), true)))
-  const active = memory.filter((m) => !m.muted)
-  const weights = [...survivors.map((e) => e.tokens), ...active.map((m) => m.tokens)]
-  const { loaded, loadedTokens, totalTokens } = curateBudget(weights, budget, SCOPE_ITEM_CAP)
-  const entriesOut = survivors.map((e, i) => ({ ...e, loaded: loaded[i] }))
-  const activeLoaded = new Map(active.map((m, k) => [m.noteId, loaded[survivors.length + k]]))
-  const memoryOut = memory.map((m) => ({
-    ...m,
-    loaded: m.muted ? false : (activeLoaded.get(m.noteId) ?? false),
-  }))
-  return { entries: entriesOut, memory: memoryOut, loadedTokens, totalTokens }
+  loadedIds: Set<string>
+  traces: Map<string, ResolvedTrace[]>
+  stopReason: ResolveStopReason
+  stopGroup: number | null
 }
 
-/** Re-bucket budgeted survivors into curated pins + sets, stamping each with its
- *  user-order position. An empty set keeps its group position (read from `groups`, not the
- *  items) so a fully-dropped set still renders where the user placed it. */
-const rebucket = (
-  entries: Array<ScopeEntry & { loaded: boolean }>,
+/** Resolve and curate one Role→Project→Personal sequence. Set refs are the only lazy
+ * entries: each is resolved just before the budget decision, so neither a token stop nor
+ * either safety cap can trigger speculative body work beyond the strict prefix. */
+const curateSequence = async <M extends CuratableMemory>(
   groups: ScopeGroup[],
+  memory: M[],
+  budget: number,
+): Promise<CuratedSequence<M>> => {
+  const entries: Array<ScopeEntry & { loaded: boolean }> = []
+  const seen = new Set<string>()
+  const loadedIds = new Set<string>()
+  const traces = new Map<string, ResolvedTrace[]>()
+  let loadedTokens = 0
+  let loadedCount = 0
+  let resolveAttempts = 0
+  let stopReason: ResolveStopReason = 'exhausted'
+  let stopGroup: number | null = null
+
+  const stop = (reason: Exclude<ResolveStopReason, 'exhausted'>, groupIndex: number) => {
+    if (stopGroup == null) {
+      stopReason = reason
+      stopGroup = groupIndex
+    }
+  }
+
+  const addKnown = (entry: ScopeEntry, groupIndex: number) => {
+    if (seen.has(entry.noteId)) {
+      return
+    }
+    seen.add(entry.noteId)
+
+    if (stopGroup != null) {
+      entries.push({ ...entry, loaded: false })
+      return
+    }
+    if (loadedCount >= SCOPE_ITEM_CAP) {
+      stop('item-cap', groupIndex)
+      entries.push({ ...entry, loaded: false })
+      return
+    }
+    if (loadedTokens + entry.tokens > budget) {
+      stop('budget', groupIndex)
+      entries.push({ ...entry, loaded: false })
+      return
+    }
+    loadedCount += 1
+    loadedTokens += entry.tokens
+    loadedIds.add(entry.noteId)
+    entries.push({ ...entry, loaded: true })
+  }
+
+  for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
+    if (stopGroup != null && groups[groupIndex].kind === CONTEXT_ENTRY_KIND.set) {
+      continue
+    }
+    const iterator = groups[groupIndex].entries[Symbol.iterator]()
+
+    while (true) {
+      if (groups[groupIndex].kind === CONTEXT_ENTRY_KIND.set) {
+        if (stopGroup != null) {
+          break
+        }
+        if (loadedCount >= SCOPE_ITEM_CAP) {
+          stop('item-cap', groupIndex)
+          break
+        }
+        if (resolveAttempts >= SCOPE_ITEM_CAP) {
+          stop('resolve-cap', groupIndex)
+          break
+        }
+      }
+      const next = iterator.next()
+
+      if (next.done) {
+        break
+      }
+      const ref = next.value
+
+      if (ref.kind === 'pin') {
+        addKnown(ref.entry, groupIndex)
+        continue
+      }
+      const item = await ref.resolve()
+      resolveAttempts += 1
+      const trace: ResolvedTrace = {
+        setIdx: ref.setIdx,
+        sourceIndex: ref.sourceIndex,
+        rawNoteId: ref.rawNoteId,
+        canonicalNoteId: item?.noteId ?? null,
+      }
+      const bucket = traces.get(ref.bucket) ?? []
+      bucket.push(trace)
+      traces.set(ref.bucket, bucket)
+
+      if (item && !seen.has(item.noteId)) {
+        addKnown(
+          {
+            ...item,
+            bucket: ref.bucket,
+            setIdx: ref.setIdx,
+            sourceIndex: ref.sourceIndex,
+          },
+          groupIndex,
+        )
+      }
+      if (resolveAttempts >= SCOPE_ITEM_CAP && stopGroup == null) {
+        stop('resolve-cap', groupIndex)
+      }
+    }
+  }
+
+  const memoryOut = memory.map((item) => ({ ...item, loaded: false }))
+
+  if (stopGroup == null) {
+    for (let index = 0; index < memory.length; index += 1) {
+      const item = memory[index]
+
+      if (item.muted) {
+        continue
+      }
+      if (loadedCount >= SCOPE_ITEM_CAP) {
+        stopReason = 'item-cap'
+        stopGroup = groups.length
+        break
+      }
+      if (loadedTokens + item.tokens > budget) {
+        stopReason = 'budget'
+        stopGroup = groups.length
+        break
+      }
+      memoryOut[index].loaded = true
+      loadedCount += 1
+      loadedTokens += item.tokens
+    }
+  }
+
+  return { entries, memory: memoryOut, loadedTokens, loadedIds, traces, stopReason, stopGroup }
+}
+
+/** Re-bucket processed survivors into curated pins + set audit windows. Raw set
+ * membership stays intact in counters even when access degradation or a hard stop means
+ * a row is absent from the weighed preview. */
+const rebucket = (
+  result: CuratedSequence<CuratableMemory>,
+  groups: ScopeGroup[],
+  groupOffset: number,
   pinBucket: string,
   setBucket: string,
-  sets: WeighedSet[],
+  sets: ScopeSetInput[],
 ): { pins: CuratedPin[]; sets: CuratedSet[] } => {
   const pinPos = new Map(
     groups.filter((g) => g.kind === CONTEXT_ENTRY_KIND.pin).map((g) => [g.ref, g.pos]),
@@ -325,7 +536,7 @@ const rebucket = (
   const setPos = new Map(
     groups.filter((g) => g.kind === CONTEXT_ENTRY_KIND.set).map((g) => [g.setIdx, g.pos]),
   )
-  const pins = entries
+  const pins = result.entries
     .filter((e) => e.bucket === pinBucket)
     // Carry `space` only for a CROSS-SPACE pin — a local tag pin has space ''
     // and stays space-less on the wire (undefined = same-space).
@@ -338,23 +549,51 @@ const rebucket = (
       ...(e.space ? { space: e.space } : {}),
       ...(e.folderOverview ? { folderOverview: true as const } : {}),
     }))
-  const setsOut = sets.map((s, i) => ({
-    id: s.id,
-    name: s.name,
-    homeSpace: s.homeSpace,
-    order: setPos.get(i) ?? 0,
-    items: entries
+  const setGroupIndex = new Map(
+    groups
+      .map((group, index) => ({ group, index: groupOffset + index }))
+      .filter(({ group }) => group.kind === CONTEXT_ENTRY_KIND.set)
+      .map(({ group, index }) => [group.setIdx, index]),
+  )
+  const traces = result.traces.get(setBucket) ?? []
+  const setsOut = sets.map((s, i) => {
+    const rows = result.entries
       .filter((e) => e.bucket === setBucket && e.setIdx === i)
-      .map((e, idx) => ({
+      .map((e) => ({
         noteId: e.noteId,
         title: e.title,
         tokens: e.tokens,
         space: e.space,
         loaded: e.loaded,
-        order: idx,
+        order: e.sourceIndex ?? 0,
+        sourceIndex: e.sourceIndex ?? 0,
         ...(e.folderOverview ? { folderOverview: true as const } : {}),
-      })),
-  }))
+      }))
+    const represented = new Set(rows.map((row) => row.sourceIndex))
+    let itemsCursor = 0
+
+    while (itemsCursor < s.items.length && represented.has(itemsCursor)) {
+      itemsCursor += 1
+    }
+    const setTraces = traces.filter((trace) => trace.setIdx === i)
+    const groupIndex = setGroupIndex.get(i) ?? Number.POSITIVE_INFINITY
+    const coordinatesVisible = isResolvedSet(s) ? true : s.coordinatesVisible
+
+    return {
+      id: s.id,
+      name: s.name,
+      homeSpace: s.homeSpace,
+      order: setPos.get(i) ?? 0,
+      items: rows,
+      itemsTotal: s.items.length,
+      itemsLoaded: setTraces.filter(
+        (trace) => trace.canonicalNoteId != null && result.loadedIds.has(trace.canonicalNoteId),
+      ).length,
+      itemsCursor,
+      trimmed: s.items.length > 0 && result.stopGroup != null && groupIndex >= result.stopGroup,
+      coordinatesVisible,
+    }
+  })
   return { pins, sets: setsOut }
 }
 
@@ -363,7 +602,7 @@ const sumLoaded = (arr: ReadonlyArray<{ loaded: boolean; tokens: number }>) =>
 
 type ScopeLayer = {
   pins: WeighedPin[]
-  sets: WeighedSet[]
+  sets: ScopeSetInput[]
   order: ScopeOrder
 }
 
@@ -376,32 +615,32 @@ type CuratedLayer = {
 /** Curate an arbitrary specific→general layer sequence under one envelope. This is the
  * structural primitive behind Personal, Project→Personal and Role→Project→Personal;
  * dedup and strict-prefix trimming happen once across the whole live session. */
-const curateLayers = <M extends CuratableMemory>(
+const curateLayers = async <M extends CuratableMemory>(
   layers: ScopeLayer[],
   memory: M[],
   budget: number,
-): {
+): Promise<{
   layers: CuratedLayer[]
   memory: Array<M & { loaded: boolean }>
   loadedTokens: number
-  totalTokens: number
-} => {
+  stopReason: ResolveStopReason
+}> => {
   const groups = layers.map((layer, index) =>
     orderGroups(layer.pins, `layer-${index}-pin`, layer.sets, `layer-${index}-set`, layer.order),
   )
-  const result = budgetSequence(
-    groups.flatMap((layer) => layer.flatMap((group) => group.entries)),
-    memory,
-    budget,
-  )
+  const flatGroups = groups.flat()
+  const result = await curateSequence(flatGroups, memory, budget)
+  let groupOffset = 0
   const curated = layers.map((layer, index): CuratedLayer => {
     const rebucketed = rebucket(
-      result.entries,
+      result,
       groups[index],
+      groupOffset,
       `layer-${index}-pin`,
       `layer-${index}-set`,
       layer.sets,
     )
+    groupOffset += groups[index].length
 
     return {
       ...rebucketed,
@@ -413,29 +652,29 @@ const curateLayers = <M extends CuratableMemory>(
     layers: curated,
     memory: result.memory,
     loadedTokens: result.loadedTokens,
-    totalTokens: result.totalTokens,
+    stopReason: result.stopReason,
   }
 }
 
 /** Curate a PERSONAL scope: pins + set items in the user's ORDER, then the eager memory
  *  summaries, deduped and trimmed to the SINGLE budget. The order is also the load
  *  PRIORITY — a higher entry survives the trim. */
-export const curatePersonalScope = <M extends CuratableMemory>(
+export const curatePersonalScope = async <M extends CuratableMemory>(
   pins: WeighedPin[],
-  sets: WeighedSet[],
+  sets: ScopeSetInput[],
   memory: M[],
   budget: number,
   order: ScopeOrder = [],
   role?: RoleScopeInput,
-): {
+): Promise<{
   pins: CuratedPin[]
   sets: CuratedSet[]
   role?: CuratedRoleScope
   memory: Array<M & { loaded: boolean }>
   loadedTokens: number
-  totalTokens: number
-} => {
-  const result = curateLayers(
+  stopReason: ResolveStopReason
+}> => {
+  const result = await curateLayers(
     [
       ...(role ? [{ pins: role.pins, sets: role.sets, order: role.order ?? [] }] : []),
       { pins, sets, order },
@@ -452,7 +691,7 @@ export const curatePersonalScope = <M extends CuratableMemory>(
     ...(roleLayer ? { role: roleLayer } : {}),
     memory: result.memory,
     loadedTokens: result.loadedTokens,
-    totalTokens: result.totalTokens,
+    stopReason: result.stopReason,
   }
 }
 
@@ -461,17 +700,17 @@ export const curatePersonalScope = <M extends CuratableMemory>(
  *  (re-trimmed against Q − projectLoaded). One deduped sequence — a note pinned in the
  *  project AND carried by a personal set loads once, project wins.
  */
-export const curateProjectScope = <M extends CuratableMemory>(
+export const curateProjectScope = async <M extends CuratableMemory>(
   projectPins: WeighedPin[],
-  projectSets: WeighedSet[],
+  projectSets: ScopeSetInput[],
   personalPins: WeighedPin[],
-  personalSets: WeighedSet[],
+  personalSets: ScopeSetInput[],
   personalMemory: M[],
   budget: number,
   projectOrder: ScopeOrder = [],
   personalOrder: ScopeOrder = [],
   role?: RoleScopeInput,
-): {
+): Promise<{
   pins: CuratedPin[]
   sets: CuratedSet[]
   role?: CuratedRoleScope
@@ -483,9 +722,9 @@ export const curateProjectScope = <M extends CuratableMemory>(
     loadedTokens: number
   }
   loadedTokens: number
-  totalTokens: number
-} => {
-  const result = curateLayers(
+  stopReason: ResolveStopReason
+}> => {
+  const result = await curateLayers(
     [
       ...(role ? [{ pins: role.pins, sets: role.sets, order: role.order ?? [] }] : []),
       { pins: projectPins, sets: projectSets, order: projectOrder },
@@ -511,7 +750,30 @@ export const curateProjectScope = <M extends CuratableMemory>(
       loadedTokens: personalLoadedTokens,
     },
     loadedTokens: result.loadedTokens,
-    totalTokens: result.totalTokens,
+    stopReason: result.stopReason,
+  }
+}
+
+/** Shared group-order producer for the unbudgeted role identity door. It intentionally
+ * does not deduplicate set membership or invent load verdicts. */
+export const scopeLayerOrder = (
+  pins: WeighedPin[],
+  sets: ScopeSetInput[],
+  order: ScopeOrder = [],
+): { pinOrder: Map<string, number>; setOrder: Map<string, number> } => {
+  const groups = orderGroups(pins, 'pin', sets, 'set', order)
+
+  return {
+    pinOrder: new Map(
+      groups
+        .filter((group) => group.kind === CONTEXT_ENTRY_KIND.pin)
+        .map((group) => [group.ref, group.pos]),
+    ),
+    setOrder: new Map(
+      groups
+        .filter((group) => group.kind === CONTEXT_ENTRY_KIND.set)
+        .map((group) => [group.ref, group.pos]),
+    ),
   }
 }
 

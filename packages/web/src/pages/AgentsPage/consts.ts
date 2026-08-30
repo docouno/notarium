@@ -9,7 +9,6 @@ export const EMPTY_PERSONAL: MeAgentContext = {
   memory: [],
   sets: [],
   loadedTokens: 0,
-  totalTokens: 0,
   budgetTokens: 0,
 }
 // A failed fetch commits an EMPTY (not null) scope so the panel degrades to the empty
@@ -22,7 +21,6 @@ export const EMPTY_PROJECT: ProjectAgentContext = {
   projectLoadedTokens: 0,
   personal: { pins: [], sets: [], memory: [], loadedTokens: 0 },
   loadedTokens: 0,
-  totalTokens: 0,
   budgetTokens: 0,
   index: { noteCount: 0, folderCount: 0 },
 }

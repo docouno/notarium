@@ -434,6 +434,8 @@ export const moveFolderToDomain = (path: string, destinationPath: string): MoveI
 import { Buffer } from 'node:buffer'
 
 import type {
+  ContextLayerPin,
+  ContextLayerSetView,
   ContextPin,
   ContextSetView,
   OwnedAbilityLocator,
@@ -442,6 +444,46 @@ import type {
 } from '@notarium/contract'
 
 import { abilityReachesProject, type AddressedRoleStatus } from '../../../services/roles'
+import type { CuratedSet } from '../../../services/spaces'
+
+/** Budget-set projection after MCP has consumed the complete internal counters. A
+ * reader outside the home space receives neither denominator/cursor nor raw positions. */
+export const contextSetViewOf = (set: CuratedSet): ContextSetView => {
+  const base = {
+    id: set.id,
+    name: set.name,
+    homeSpace: set.homeSpace,
+    order: set.order,
+    itemsLoaded: set.itemsLoaded,
+    trimmed: set.trimmed,
+  }
+
+  return set.coordinatesVisible
+    ? {
+        ...base,
+        items: set.items.map((item) => ({
+          ...item,
+          sourceIndex: item.sourceIndex ?? item.order,
+        })),
+        itemsTotal: set.itemsTotal,
+        itemsCursor: set.itemsCursor,
+      }
+    : {
+        ...base,
+        homeSpace: '' as const,
+        items: set.items.map((item, order) => ({
+          noteId: item.noteId,
+          title: item.title,
+          tokens: item.tokens,
+          space: item.space,
+          loaded: item.loaded,
+          // `item.order` aliases the raw source coordinate. A reader outside the
+          // set's home receives only a dense order over rows they can already see.
+          order,
+          ...(item.folderOverview ? { folderOverview: true as const } : {}),
+        })),
+      }
+}
 
 /** Does this ability's reach cover that project? Only a Space home carries a reach at
  *  all; the rest is the service's rule, asked rather than restated. Spelled out here,
@@ -452,20 +494,19 @@ export const abilityReaches = (ability: AgentAbilitySummary, projectId: string):
   ability.locator.location.scope !== ROLE_SCOPE.space ||
   abilityReachesProject(ability.availability, projectId, ability.locator.kind)
 
-/** One addressed role, in the three arms its placement can take. The single producer of
- *  those arms: both context previews built the same three-arm literal by hand, and the
- *  moment the wire type became a union on `source` neither answer validated. Callers
- *  decide WHEN a role is stated — the preview doors only when the agent loads it, the
- *  identity door whenever the caller may read it — and this decides only HOW. */
-export const roleContextViewOf = (
+type WithoutRoleLayer<T> = T extends unknown ? Omit<T, 'pins' | 'sets' | 'loadedTokens'> : never
+type RoleContextBase = WithoutRoleLayer<RoleContextView>
+
+/** One addressed role's placement arms and identity facts. Budget and identity doors
+ * attach their independent layer shapes directly; neither manufactures fields only to
+ * delete them again. */
+export const roleContextBaseOf = (
   status: AddressedRoleStatus,
   locator: Extract<OwnedAbilityLocator, { kind: 'role' }>,
   spaceSlugOf: (space: string) => string,
   projectHandle: string | null,
-  layer: { pins: ContextPin[]; sets: ContextSetView[]; loadedTokens: number } | undefined,
-): RoleContextView => {
-  const own = layer ?? { pins: [], sets: [], loadedTokens: 0 }
-  const facts = { ...status.role.role, locator, ...own }
+): RoleContextBase => {
+  const facts = { ...status.role.role, locator }
   const location = status.role.location
 
   return location.scope === ROLE_SCOPE.personal
@@ -480,43 +521,30 @@ export const roleContextViewOf = (
         }
 }
 
-/** The same role, as the door that CONFIGURES it states it: identity plus the layer,
- *  with every budget word removed. Built by calling the producer above rather than by
- *  writing the three scope arms a second time — a second author of the arms is exactly
- *  the duplication `roleContextViewOf` was extracted to end. What this adds is one
- *  deletion, in one place: `loaded` and `loadedTokens` are claims about a budget, and
- *  this door weighs none. */
+export const roleContextViewOf = (
+  status: AddressedRoleStatus,
+  locator: Extract<OwnedAbilityLocator, { kind: 'role' }>,
+  spaceSlugOf: (space: string) => string,
+  projectHandle: string | null,
+  layer: { pins: ContextPin[]; sets: ContextSetView[]; loadedTokens: number } | undefined,
+): RoleContextView =>
+  ({
+    ...roleContextBaseOf(status, locator, spaceSlugOf, projectHandle),
+    ...(layer ?? { pins: [], sets: [], loadedTokens: 0 }),
+  }) as RoleContextView
+
+/** The same role as the unbudgeted CONFIGURATION door states it. */
 export const roleContextIdentityOf = (
   status: AddressedRoleStatus,
   locator: Extract<OwnedAbilityLocator, { kind: 'role' }>,
   spaceSlugOf: (space: string) => string,
   projectHandle: string | null,
-  layer: { pins: ContextPin[]; sets: ContextSetView[] },
-): RoleContextIdentity => {
-  const view = roleContextViewOf(status, locator, spaceSlugOf, projectHandle, {
+  layer: { pins: ContextLayerPin[]; sets: ContextLayerSetView[] },
+): RoleContextIdentity =>
+  ({
+    ...roleContextBaseOf(status, locator, spaceSlugOf, projectHandle),
     ...layer,
-    loadedTokens: 0,
-  })
-
-  // The two deletions this door is FOR, by name and in one place, so the shapes cannot
-  // drift apart quietly: `loaded` on every row, `loadedTokens` on the role.
-  const unweighed = <T extends { loaded: boolean }>(row: T): Omit<T, 'loaded'> => {
-    const copy: Omit<T, 'loaded'> & { loaded?: boolean } = { ...row }
-
-    delete copy.loaded
-
-    return copy
-  }
-  const identity: Omit<RoleContextView, 'loadedTokens'> & { loadedTokens?: number } = { ...view }
-
-  delete identity.loadedTokens
-
-  return {
-    ...identity,
-    pins: view.pins.map(unweighed),
-    sets: view.sets.map((set) => ({ ...set, items: set.items.map(unweighed) })),
-  } as RoleContextIdentity
-}
+  }) as RoleContextIdentity
 
 /** An Owned, enabled Role as the Context constructor sees it. One producer because two
  *  routes built the same literal by hand and neither carried `source`: the moment the

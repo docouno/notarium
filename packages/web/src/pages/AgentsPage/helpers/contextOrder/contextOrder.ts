@@ -11,31 +11,27 @@ export const parseEntryKey = (key: string): ContextOrderEntry => {
   return { kind: key.slice(0, i) as 'pin' | 'set', ref: key.slice(i + 1) }
 }
 
-/** Reorder a set's items to a note-id sequence (client mirror of the server's `orderItems`):
- *  named ids first, any unnamed current item appended (an optimistic reorder never drops one). */
+/** Reorder the named subset exactly like the server's slot-preserving `orderItems`:
+ * unnamed current items keep their slots while named slots refill in request order. */
 export const orderItemsBy = <T extends { noteId: string }>(
   items: readonly T[],
   noteIds: readonly string[],
 ): T[] => {
   const byId = new Map(items.map((it) => [it.noteId, it]))
   const seen = new Set<string>()
-  const out: T[] = []
+  const queue: T[] = []
 
   for (const id of noteIds) {
     const it = byId.get(id)
 
     if (it && !seen.has(id)) {
-      out.push(it)
+      queue.push(it)
       seen.add(id)
     }
   }
-  for (const it of items) {
-    if (!seen.has(it.noteId)) {
-      out.push(it)
-    }
-  }
+  let index = 0
 
-  return out
+  return items.map((item) => (seen.has(item.noteId) ? queue[index++] : item))
 }
 
 /** Apply a set's new ITEM order to every copy of that set in a scope's list (#210). A set

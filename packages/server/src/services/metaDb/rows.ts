@@ -343,14 +343,23 @@ export const parseContextSetItems = (raw: string | null): ContextSetItemRef[] =>
       return []
     }
 
-    return v.flatMap((x) =>
-      x &&
-      typeof x === 'object' &&
-      typeof (x as ContextSetItemRef).space === 'string' &&
-      typeof (x as ContextSetItemRef).noteId === 'string'
-        ? [{ space: (x as ContextSetItemRef).space, noteId: (x as ContextSetItemRef).noteId }]
-        : [],
-    )
+    const items: ContextSetItemRef[] = []
+
+    for (const item of v) {
+      if (
+        item &&
+        typeof item === 'object' &&
+        typeof (item as ContextSetItemRef).space === 'string' &&
+        typeof (item as ContextSetItemRef).noteId === 'string'
+      ) {
+        items.push({
+          space: (item as ContextSetItemRef).space,
+          noteId: (item as ContextSetItemRef).noteId,
+        })
+      }
+    }
+
+    return items
   } catch {
     return []
   }
@@ -361,23 +370,35 @@ export const parseContextSetItems = (raw: string | null): ContextSetItemRef[] =>
  *  partial-view reorder never shoves a deduped-hidden or concurrently-added member to the tail
  *  (an append-to-tail scheme would silently relocate it across every attached scope). */
 export const orderItems = (
-  items: readonly ContextSetItemRef[],
-  noteIds: readonly string[],
+  items: ContextSetItemRef[],
+  order: ReadonlyArray<string | ContextSetItemRef>,
 ): ContextSetItemRef[] => {
-  const byId = new Map(items.map((it) => [it.noteId, it]))
-  const named = new Set<string>()
-  const queue: ContextSetItemRef[] = []
+  const byId = new Map<string, ContextSetItemRef>()
+  const selected = new Map<string, ContextSetItemRef>()
 
-  for (const id of noteIds) {
-    const it = byId.get(id)
+  for (const item of items) {
+    byId.set(item.noteId, item)
+  }
 
-    if (it && !named.has(id)) {
-      named.add(id)
-      queue.push(it)
+  for (const entry of order) {
+    const id = typeof entry === 'string' ? entry : entry.noteId
+    const item = byId.get(id)
+
+    if (item && !selected.has(id)) {
+      selected.set(id, item)
     }
   }
-  let qi = 0
-  return items.map((it) => (named.has(it.noteId) ? queue[qi++] : it))
+  const queue = selected.values()
+
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index]
+
+    if (selected.has(item.noteId)) {
+      items[index] = queue.next().value!
+    }
+  }
+
+  return items
 }
 
 export const contextSetOfRow = (r: ContextSetRow): ContextSetRecord => ({

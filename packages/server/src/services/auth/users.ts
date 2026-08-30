@@ -77,9 +77,11 @@ export const createUsers = (ctx: AuthCtx) => ({
       ...(patch.disabled !== undefined ? { disabledAt: patch.disabled ? ctx.nowIso() : null } : {}),
     })
     if (patch.disabled === true) {
+      // disabledAt is already durable: remove live delivery authority before any
+      // cleanup await can expose owner-private frames in the committed-disabled gap.
+      ctx.dropSse((h) => h.username === username)
       await ctx.db.deleteSessionsFor(username)
       await ctx.db.deleteOneTimesFor(username)
-      ctx.dropSse((h) => h.username === username)
     }
 
     return userView((await ctx.db.getUser(username)) as UserRecord)

@@ -18,13 +18,17 @@ import { advanceConnectionRevisions, advanceObservationEpoch } from './connectio
 
 // The app's single server-push subscription (#60): one EventSource feeds every
 // consumer — the sidebar sync indicator reads `status`, NotesProvider rides
-// `changed`/`status` to keep the list fresh, GraphView refetches the graph.
+// `changed`/`status` to keep the list fresh, GraphView refetches the graph. A consumer
+// may multiplex additional readable spaces onto that SAME socket when its current
+// active-space surface intentionally renders cross-space data.
 // Components subscribe through this context instead of opening their own
 // connections (the indicator must not cost a second SSE stream).
-// The channel is PER SPACE (#16): switching spaces closes the old stream and
-// opens the new one — an event from another space physically cannot arrive.
+// The channel is rooted in one ACTIVE SPACE (#16): switching spaces closes the old
+// stream. Cross-space context rows may explicitly add readable supplemental buses to
+// that same socket; ordinary space-scoped consumers never request them.
 
 type Listener = (event: StoreEvent) => void
+type ContextListener = (event: StoreEvent, sourceSpace?: string) => void
 
 /** How far back `changedLastMinute` counts — the "+M/min" activity window. */
 const RATE_WINDOW_MS = 60_000
@@ -48,6 +52,9 @@ export type SyncContextValue = {
    *  consumer includes the value in snapshot requests so missed `changed`
    *  frames are reconciled by the first response from the new connection. */
   connectionRevision: number
+  /** A supplemental watch expansion reached server readiness. Context snapshots
+   * reconcile the pre-subscription window without waking unrelated consumers. */
+  contextWatchRevision: number
   /** Monotonic truth epoch advanced synchronously before every changed frame
    *  and on every reconnect. Requests capture it before they start. */
   observationEpoch: () => number
@@ -57,6 +64,12 @@ export type SyncContextValue = {
   membersRev: number
   /** Owner-global durable agent-session changes observed on this tab's SSE socket. */
   agentSessionsRev: number
+  /** Principal grants changed, including a non-active-space revoke. */
+  accessRevision: number
+  /** Replace the readable supplemental spaces multiplexed onto the active socket. */
+  watchSpaces: (spaces: readonly string[]) => void
+  /** Context-only event tap: active changed frames plus supplemental changed ids. */
+  subscribeContext: (listener: ContextListener) => () => void
 }
 
 const SyncContext = createContext<SyncContextValue | null>(null)
@@ -83,23 +96,45 @@ export const SyncProvider = ({ children }: { children: ReactNode }) => {
   const [status, setStatus] = useState<SyncStatus | null>(null)
   const [membersRev, setMembersRev] = useState(0)
   const [agentSessionsRev, setAgentSessionsRev] = useState(0)
+  const [accessRevision, setAccessRevision] = useState(0)
   const [connectionRevision, setConnectionRevision] = useState(0)
+  const [contextWatchRevision, setContextWatchRevision] = useState(0)
+  const [watchedSpaces, setWatchedSpaces] = useState<string[]>([])
   const connectionRevisionRef = useRef(0)
+  const openedSpaceRef = useRef<string | null>(null)
+  const openedWatchKeyRef = useRef('')
+  const activeStreamRef = useRef<(() => void) | null>(null)
+  const pendingStreamRef = useRef<(() => void) | null>(null)
+  const streamGenerationRef = useRef(0)
+  const handoffNeedsReconciliationRef = useRef(false)
   const observationEpochRef = useRef(0)
   const agentSessionsRevisionRef = useRef(0)
   const listeners = useRef(new Set<Listener>())
+  const contextListeners = useRef(new Set<ContextListener>())
   const changes = useRef<Array<{ at: number; count: number }>>([])
 
   useEffect(() => {
-    // A fresh space = a fresh read-model: the stale status must not flash
-    // while the new stream's first frame is in flight.
-    setStatus(null)
-    changes.current = []
+    const generation = ++streamGenerationRef.current
+
+    if (openedSpaceRef.current !== null && openedSpaceRef.current !== space) {
+      activeStreamRef.current?.()
+      activeStreamRef.current = null
+    }
+    pendingStreamRef.current?.()
+    pendingStreamRef.current = null
+    if (openedSpaceRef.current !== space) {
+      // A fresh space = a fresh read-model: the stale status must not flash
+      // while the new stream's first frame is in flight. A watch-only replacement
+      // keeps both the active status and its one-minute activity window.
+      setStatus(null)
+      changes.current = []
+    }
 
     let stopped = false
     let reopen: ReturnType<typeof setTimeout> | null = null
 
     let unsub: () => void = () => {}
+    let openedOnce = false
 
     const onEvent = (event: StoreEvent) => {
       if (event.type === STORE_EVENT.STATUS) {
@@ -123,6 +158,15 @@ export const SyncProvider = ({ children }: { children: ReactNode }) => {
           // one consumer's bug must not starve the others of events
         }
       }
+      if (event.type === STORE_EVENT.CHANGED) {
+        for (const listener of contextListeners.current) {
+          try {
+            listener(event)
+          } catch {
+            // Context listener isolation matches the ordinary bus.
+          }
+        }
+      }
     }
 
     const onError = (closed: boolean) => {
@@ -130,7 +174,20 @@ export const SyncProvider = ({ children }: { children: ReactNode }) => {
       // 401/404 a revoked principal now gets, #111). Ask the access detector
       // whether this is a real revocation (→ takeover); a transient blip stays
       // CONNECTING and the browser handles it, so we ignore that here.
-      if (!closed || stopped) {
+      if (stopped) {
+        // A controlled replacement retains this stream until the server declares
+        // the new watch set ready. If the retained leg becomes unavailable first,
+        // the overlap proof is gone and the replacement must reconcile snapshots.
+        if (activeStreamRef.current === unsub) {
+          handoffNeedsReconciliationRef.current = true
+        }
+        if (closed) {
+          verify()
+        }
+
+        return
+      }
+      if (!closed) {
         return
       }
       verify()
@@ -138,8 +195,15 @@ export const SyncProvider = ({ children }: { children: ReactNode }) => {
       // transient server restart recovers without a reload. A confirmed loss
       // unmounts this provider (the takeover), which clears the timer.
       unsub()
+      if (activeStreamRef.current === unsub) {
+        activeStreamRef.current = null
+      }
+      if (pendingStreamRef.current === unsub) {
+        pendingStreamRef.current = null
+      }
       reopen = setTimeout(() => {
         if (!stopped) {
+          openedOnce = false
           open()
         }
       }, REOPEN_DELAY_MS)
@@ -150,6 +214,7 @@ export const SyncProvider = ({ children }: { children: ReactNode }) => {
     // switcher and a role change takes — no reload. refresh() updates `me`
     // (grants/role), reloadSpaces() the membership-filtered list.
     const onAccess = () => {
+      setAccessRevision((revision) => revision + 1)
       reloadSpaces()
       reloadArchived()
       void refresh()
@@ -165,6 +230,19 @@ export const SyncProvider = ({ children }: { children: ReactNode }) => {
       setAgentSessionsRev(agentSessionsRevisionRef.current)
     }
 
+    const onContextEvent = (event: StoreEvent, sourceSpace: string) => {
+      if (event.type !== STORE_EVENT.CHANGED) {
+        return
+      }
+      for (const listener of contextListeners.current) {
+        try {
+          listener(event, sourceSpace)
+        } catch {
+          // One Context consumer cannot starve another.
+        }
+      }
+    }
+
     // This space's slug changed (#100 phase 4 / #123), renamed from another tab: adopt the
     // new slug live. reloadSpaces re-fetches the list (new slug + the old one in
     // aliases) and rename-follows the active slug; refresh updates `me.spaces` so the
@@ -174,7 +252,16 @@ export const SyncProvider = ({ children }: { children: ReactNode }) => {
       void refresh()
     }
 
-    const onOpen = () => {
+    const watchKey = watchedSpaces.join('\u0000')
+    const controlledWatchChange =
+      openedSpaceRef.current === space && openedWatchKeyRef.current !== watchKey
+    const openedWatches = new Set(
+      openedWatchKeyRef.current ? openedWatchKeyRef.current.split('\u0000') : [],
+    )
+    const expandsWatch =
+      controlledWatchChange && watchedSpaces.some((watched) => !openedWatches.has(watched))
+
+    const advanceRevisions = () => {
       const revisions = advanceConnectionRevisions({
         connectionRevision: connectionRevisionRef.current,
         observationEpoch: observationEpochRef.current,
@@ -188,6 +275,38 @@ export const SyncProvider = ({ children }: { children: ReactNode }) => {
       setAgentSessionsRev(agentSessionsRevisionRef.current)
     }
 
+    const onReady = (reconnected: boolean) => {
+      if (!openedOnce) {
+        openedOnce = true
+        if (stopped) {
+          unsub()
+          return
+        }
+        const previous = activeStreamRef.current
+
+        activeStreamRef.current = unsub
+        if (pendingStreamRef.current === unsub) {
+          pendingStreamRef.current = null
+        }
+        if (previous && previous !== unsub) {
+          previous()
+        }
+      }
+      openedSpaceRef.current = space
+      openedWatchKeyRef.current = watchKey
+      const reconcileHandoff = handoffNeedsReconciliationRef.current
+
+      handoffNeedsReconciliationRef.current = false
+      if (!reconnected && controlledWatchChange && !reconcileHandoff) {
+        if (expandsWatch) {
+          setContextWatchRevision((revision) => revision + 1)
+        }
+
+        return
+      }
+      advanceRevisions()
+    }
+
     const open = () => {
       unsub = api.events(
         space,
@@ -197,8 +316,12 @@ export const SyncProvider = ({ children }: { children: ReactNode }) => {
         onMembers,
         onRename,
         onAgentSessions,
-        onOpen,
+        undefined,
+        watchedSpaces,
+        onContextEvent,
+        onReady,
       )
+      pendingStreamRef.current = unsub
     }
     open()
 
@@ -207,14 +330,34 @@ export const SyncProvider = ({ children }: { children: ReactNode }) => {
       if (reopen) {
         clearTimeout(reopen)
       }
-      unsub()
+      queueMicrotask(() => {
+        // The live generation is the handoff proof: a newer effect keeps the old
+        // socket until its replacement opens; an unmount closes it in this microtask.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        if (streamGenerationRef.current !== generation) {
+          return
+        }
+        const owned = new Set([unsub, pendingStreamRef.current, activeStreamRef.current])
+
+        pendingStreamRef.current = null
+        activeStreamRef.current = null
+        for (const close of owned) {
+          close?.()
+        }
+      })
     }
-  }, [space, verify, reloadSpaces, reloadArchived, refresh])
+  }, [space, verify, reloadSpaces, reloadArchived, refresh, watchedSpaces])
 
   const subscribe = useCallback((listener: Listener) => {
     listeners.current.add(listener)
     return () => {
       listeners.current.delete(listener)
+    }
+  }, [])
+  const subscribeContext = useCallback((listener: ContextListener) => {
+    contextListeners.current.add(listener)
+    return () => {
+      contextListeners.current.delete(listener)
     }
   }, [])
 
@@ -232,6 +375,15 @@ export const SyncProvider = ({ children }: { children: ReactNode }) => {
   }, [])
 
   const observationEpoch = useCallback(() => observationEpochRef.current, [])
+  const watchSpaces = useCallback((spaces: readonly string[]) => {
+    const next = [...new Set(spaces.filter(Boolean))].sort()
+
+    setWatchedSpaces((current) =>
+      current.length === next.length && current.every((item, index) => item === next[index])
+        ? current
+        : next,
+    )
+  }, [])
 
   return (
     <SyncContext.Provider
@@ -240,9 +392,13 @@ export const SyncProvider = ({ children }: { children: ReactNode }) => {
         changedLastMinute,
         subscribe,
         connectionRevision,
+        contextWatchRevision,
         observationEpoch,
         membersRev,
         agentSessionsRev,
+        accessRevision,
+        watchSpaces,
+        subscribeContext,
       }}
     >
       {children}

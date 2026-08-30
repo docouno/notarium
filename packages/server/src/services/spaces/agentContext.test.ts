@@ -8,6 +8,8 @@ import {
   personalProfilePin,
   resolveContextSets,
   resolveScopePins,
+  SCOPE_ITEM_CAP,
+  type ScopeSetRefs,
   setNoteMuted,
   setNotePinned,
   weighAlwaysLoad,
@@ -44,6 +46,15 @@ const set = (id: string, ...items: Array<[string, number]>): WeighedSet => ({
 })
 
 const BIG = 1_000_000 // a budget nothing can exhaust
+
+const rawSet = (id: string, count: number, read: ScopeSetRefs['read']): ScopeSetRefs => ({
+  id,
+  name: id,
+  homeSpace: 'sp',
+  items: Array.from({ length: count }, (_, index) => ({ noteId: `${id}-${index}` })),
+  read,
+  coordinatesVisible: true,
+})
 
 const rekeyingStore = (noteClass: NoteClass = 'user-doc') => {
   const writes: WriteInput[] = []
@@ -350,8 +361,8 @@ describe('pin mutation FIFO', () => {
 })
 
 describe('curatePersonalScope (#208/#209)', () => {
-  it('loads everything under budget; muted memory is off the budget but still listed (loaded:false)', () => {
-    const r = curatePersonalScope(
+  it('loads everything under budget; muted memory is off the budget but still listed (loaded:false)', async () => {
+    const r = await curatePersonalScope(
       [pin('p1', 10), pin('p2', 10)],
       [],
       [mem('m1', 5), mem('m2', 5, true), mem('m3', 5)],
@@ -363,14 +374,12 @@ describe('curatePersonalScope (#208/#209)', () => {
       ['m2', false],
       ['m3', true],
     ])
-    // totalTokens counts only ACTIVE (non-muted) weight: pins 20 + active memory 10.
     expect(r.loadedTokens).toBe(30)
-    expect(r.totalTokens).toBe(30)
   })
 
-  it('pins load FIRST, then memory — the strict prefix trims memory once the budget is spent', () => {
+  it('pins load FIRST, then memory — the strict prefix trims memory once the budget is spent', async () => {
     // pins 10+10 = 20 fit budget 22; the first memory (5) overflows → memory all trimmed.
-    const r = curatePersonalScope(
+    const r = await curatePersonalScope(
       [pin('p1', 10), pin('p2', 10)],
       [],
       [mem('m1', 5), mem('m2', 5, true), mem('m3', 5)],
@@ -383,11 +392,10 @@ describe('curatePersonalScope (#208/#209)', () => {
       ['m3', false],
     ])
     expect(r.loadedTokens).toBe(20)
-    expect(r.totalTokens).toBe(30)
   })
 
-  it('a pin that overflows trims itself and every later pin AND all memory (priority preserved)', () => {
-    const r = curatePersonalScope(
+  it('a pin that overflows trims itself and every later pin AND all memory (priority preserved)', async () => {
+    const r = await curatePersonalScope(
       [pin('p1', 10), pin('p2', 10), pin('p3', 10)],
       [],
       [mem('m1', 1)],
@@ -398,19 +406,19 @@ describe('curatePersonalScope (#208/#209)', () => {
     expect(r.loadedTokens).toBe(10)
   })
 
-  it('is a no-op on empty inputs', () => {
-    expect(curatePersonalScope([], [], [], BIG)).toEqual({
+  it('is a no-op on empty inputs', async () => {
+    expect(await curatePersonalScope([], [], [], BIG)).toEqual({
       pins: [],
       sets: [],
       memory: [],
       loadedTokens: 0,
-      totalTokens: 0,
+      stopReason: 'exhausted',
     })
   })
 
-  it('SET items load AFTER local pins, BEFORE memory (specific > general)', () => {
+  it('SET items load AFTER local pins, BEFORE memory (specific > general)', async () => {
     // chain [p1:10, s.a:10, s.b:10, m1:10] against 25: 10+10=20 fit, +10=30 overflows → 2 loaded.
-    const r = curatePersonalScope(
+    const r = await curatePersonalScope(
       [pin('p1', 10)],
       [set('front', ['a', 10], ['b', 10])],
       [mem('m1', 10)],
@@ -425,17 +433,20 @@ describe('curatePersonalScope (#208/#209)', () => {
     expect(r.loadedTokens).toBe(20)
   })
 
-  it('DEDUP: a note pinned AND carried by a set loads once (as the pin), dropped from the set view', () => {
-    const r = curatePersonalScope([pin('a', 10)], [set('front', ['a', 10], ['b', 10])], [], BIG)
+  it('DEDUP: a note pinned AND carried by a set loads once (as the pin), dropped from the set view', async () => {
+    const r = await curatePersonalScope(
+      [pin('a', 10)],
+      [set('front', ['a', 10], ['b', 10])],
+      [],
+      BIG,
+    )
     expect(r.pins.map((p) => p.noteId)).toEqual(['a'])
     // 'a' deduped out of the set; only 'b' survives there.
     expect(r.sets[0].items.map((item) => item.noteId)).toEqual(['b'])
-    // total = pin a (10) + set b (10), NOT counted twice.
-    expect(r.totalTokens).toBe(20)
     expect(r.loadedTokens).toBe(20)
   })
 
-  it('keeps a folder-overview marker when an ordered set wins pin/set dedup', () => {
+  it('keeps a folder-overview marker when an ordered set wins pin/set dedup', async () => {
     const markedSet: WeighedSet = {
       id: 'overview-set',
       name: 'Overview set',
@@ -450,7 +461,7 @@ describe('curatePersonalScope (#208/#209)', () => {
         },
       ],
     }
-    const r = curatePersonalScope([pin('overview', 10)], [markedSet], [], BIG, [
+    const r = await curatePersonalScope([pin('overview', 10)], [markedSet], [], BIG, [
       { kind: 'set', ref: 'overview-set' },
       { kind: 'pin', ref: 'overview' },
     ])
@@ -459,18 +470,21 @@ describe('curatePersonalScope (#208/#209)', () => {
     expect(r.sets[0].items).toEqual([
       expect.objectContaining({ noteId: 'overview', folderOverview: true }),
     ])
-    expect(r.totalTokens).toBe(10)
   })
 
-  it('DEDUP across two sets: the same note in set A and set B survives only in A (first wins)', () => {
-    const r = curatePersonalScope([], [set('A', ['x', 5]), set('B', ['x', 5], ['y', 5])], [], BIG)
+  it('DEDUP across two sets: the same note in set A and set B survives only in A (first wins)', async () => {
+    const r = await curatePersonalScope(
+      [],
+      [set('A', ['x', 5]), set('B', ['x', 5], ['y', 5])],
+      [],
+      BIG,
+    )
     expect(r.sets[0].items.map((item) => item.noteId)).toEqual(['x'])
     expect(r.sets[1].items.map((item) => item.noteId)).toEqual(['y'])
-    expect(r.totalTokens).toBe(10) // x once + y
   })
 
-  it('LOOSE cross-space pins ride the pin bucket and keep their `space` on the wire; a plain pin carries none', () => {
-    const r = curatePersonalScope(
+  it('LOOSE cross-space pins ride the pin bucket and keep their `space` on the wire; a plain pin carries none', async () => {
+    const r = await curatePersonalScope(
       [pin('local', 10), crossPin('far', 10, 'conventions')],
       [],
       [],
@@ -482,9 +496,9 @@ describe('curatePersonalScope (#208/#209)', () => {
     expect(r.pins.find((p) => p.noteId === 'local')?.space).toBeUndefined()
   })
 
-  it('DEDUP: a note both TAG-pinned and CROSS-pinned (or in a set) loads once, first occurrence wins', () => {
+  it('DEDUP: a note both TAG-pinned and CROSS-pinned (or in a set) loads once, first occurrence wins', async () => {
     // Local tag pin 'a' precedes a cross-space pin 'a' and a set carrying 'a' → one load.
-    const r = curatePersonalScope(
+    const r = await curatePersonalScope(
       [pin('a', 10), crossPin('a', 10, 'other')],
       [set('s', ['a', 10], ['b', 10])],
       [],
@@ -493,13 +507,166 @@ describe('curatePersonalScope (#208/#209)', () => {
     expect(r.pins.map((p) => p.noteId)).toEqual(['a']) // the tag pin wins (space-less)
     expect(r.pins[0].space).toBeUndefined()
     expect(r.sets[0].items.map((item) => item.noteId)).toEqual(['b'])
-    expect(r.totalTokens).toBe(20) // a once + b
+  })
+})
+
+describe('bounded context-set resolve (#406)', () => {
+  it('gives 250- and 1000-ref sets the same exact resolve-cap prefix', async () => {
+    const run = async (count: number) => {
+      const calls: string[] = []
+      let materialized = 0
+      const scopeSet = rawSet('same-prefix', count, async (noteId) => {
+        calls.push(noteId)
+        return { noteId, title: noteId, tokens: 1, spaceSlug: 'sp', filePath: `${noteId}.md` }
+      })
+
+      for (const item of scopeSet.items) {
+        const noteId = item.noteId
+
+        Object.defineProperty(item, 'noteId', {
+          configurable: true,
+          get: () => {
+            materialized += 1
+            return noteId
+          },
+        })
+      }
+
+      return {
+        calls,
+        materialized: () => materialized,
+        result: await curatePersonalScope([], [scopeSet], [], BIG),
+      }
+    }
+    const bounded = await run(250)
+    const oversized = await run(1000)
+
+    expect(bounded.calls).toHaveLength(250)
+    expect(oversized.calls).toHaveLength(250)
+    expect(bounded.materialized()).toBe(250)
+    expect(oversized.materialized()).toBe(250)
+    expect(oversized.calls).toEqual(bounded.calls)
+    expect(bounded.result.stopReason).toBe('resolve-cap')
+    expect(oversized.result.stopReason).toBe('resolve-cap')
+    expect(bounded.result.sets[0]).toMatchObject({
+      itemsLoaded: 250,
+      itemsCursor: 250,
+      trimmed: true,
+    })
+    expect(oversized.result.sets[0]).toMatchObject({
+      itemsLoaded: 250,
+      itemsCursor: 250,
+      trimmed: true,
+    })
+    expect(oversized.result.sets[0].items).toEqual(bounded.result.sets[0].items)
+  })
+
+  it('does not resolve a lazy set row after pins already exhausted the item cap', async () => {
+    let reads = 0
+    const pins = Array.from({ length: SCOPE_ITEM_CAP }, (_, index) => pin(`pin-${index}`, 0))
+    const tail = rawSet('tail', 1, async (noteId) => {
+      reads += 1
+      return { noteId, title: noteId, tokens: 1, spaceSlug: 'sp', filePath: `${noteId}.md` }
+    })
+    const result = await curatePersonalScope(pins, [tail], [], BIG)
+
+    expect(reads).toBe(0)
+    expect(result.stopReason).toBe('item-cap')
+    expect(result.sets[0]).toMatchObject({
+      items: [],
+      itemsLoaded: 0,
+      itemsCursor: 0,
+      trimmed: true,
+    })
+  })
+
+  it('resolves exactly one overflow row and blocks later groups', async () => {
+    const calls: string[] = []
+    const scopeSet = rawSet('heavy', 10, async (noteId) => {
+      calls.push(noteId)
+      return { noteId, title: noteId, tokens: 10, spaceSlug: 'sp', filePath: `${noteId}.md` }
+    })
+    const result = await curatePersonalScope([], [scopeSet], [], 25, [
+      { kind: 'set', ref: 'heavy' },
+    ])
+
+    expect(calls).toHaveLength(3)
+    expect(result.stopReason).toBe('budget')
+    expect(result.sets[0].items.map((item) => item.loaded)).toEqual([true, true, false])
+    expect(result.sets[0]).toMatchObject({ itemsLoaded: 2, itemsCursor: 3, trimmed: true })
+  })
+
+  it('caps degraded refs and counts loaded dedup refs honestly', async () => {
+    const degraded = await curatePersonalScope(
+      [],
+      [rawSet('missing', 1000, async () => null)],
+      [],
+      BIG,
+    )
+    expect(degraded.stopReason).toBe('resolve-cap')
+    expect(degraded.sets[0]).toMatchObject({
+      itemsLoaded: 0,
+      itemsCursor: 0,
+      trimmed: true,
+    })
+
+    const duplicate = rawSet('duplicate', 2, async () => ({
+      noteId: 'canonical',
+      title: 'Canonical',
+      tokens: 1,
+      spaceSlug: 'sp',
+      filePath: 'canonical.md',
+    }))
+    const complete = await curatePersonalScope([], [duplicate], [], BIG)
+    expect(complete.stopReason).toBe('exhausted')
+    expect(complete.sets[0]).toMatchObject({
+      itemsLoaded: 2,
+      itemsTotal: 2,
+      itemsCursor: 1,
+      trimmed: false,
+    })
+    expect(complete.sets[0].items).toHaveLength(1)
+  })
+
+  it('keeps every more-general layer unloaded after a hard resolve stop', async () => {
+    const projectSet = rawSet('project-heavy', 1000, async (noteId) => ({
+      noteId,
+      title: noteId,
+      tokens: 1,
+      spaceSlug: 'sp',
+      filePath: `${noteId}.md`,
+    }))
+    const personalSet = rawSet('personal-later', 1, async (noteId) => ({
+      noteId,
+      title: noteId,
+      tokens: 1,
+      spaceSlug: 'sp',
+      filePath: `${noteId}.md`,
+    }))
+    const result = await curateProjectScope(
+      [],
+      [projectSet],
+      [pin('personal-pin', 1)],
+      [personalSet],
+      [mem('personal-memory', 1)],
+      BIG,
+    )
+
+    expect(result.stopReason).toBe('resolve-cap')
+    expect(result.personal.pins[0].loaded).toBe(false)
+    expect(result.personal.sets[0]).toMatchObject({
+      items: [],
+      itemsLoaded: 0,
+      itemsCursor: 0,
+      trimmed: true,
+    })
+    expect(result.personal.memory[0].loaded).toBe(false)
   })
 })
 
 describe('curateProjectScope (#208/#209)', () => {
-  it('project pins load FIRST, then the personal background embeds fully into the remainder', () => {
-    const r = curateProjectScope(
+  it('project pins load FIRST, then the personal background embeds fully into the remainder', async () => {
+    const r = await curateProjectScope(
       [pin('j1', 10)],
       [],
       [pin('p1', 8), pin('p2', 8)],
@@ -516,12 +683,11 @@ describe('curateProjectScope (#208/#209)', () => {
     ])
     expect(r.personal.loadedTokens).toBe(20) // 8 + 8 + 4 active memory
     expect(r.loadedTokens).toBe(30)
-    expect(r.totalTokens).toBe(30)
   })
 
-  it('SQUEEZE: fat project pins take the front of Q → personal embeds only PARTIALLY (loaded:false on the tail)', () => {
+  it('SQUEEZE: fat project pins take the front of Q → personal embeds only PARTIALLY (loaded:false on the tail)', async () => {
     // chain [j1:10, p1:8, p2:8, m1:4] against 24: 10+8=18 fit, +8=26 overflows → loadedCount 2.
-    const r = curateProjectScope(
+    const r = await curateProjectScope(
       [pin('j1', 10)],
       [],
       [pin('p1', 8), pin('p2', 8)],
@@ -536,9 +702,9 @@ describe('curateProjectScope (#208/#209)', () => {
     expect(r.loadedTokens).toBe(18)
   })
 
-  it('the flat loaded[] maps to the RIGHT segment — a personal pin gets its own verdict, not a shifted one', () => {
+  it('the flat loaded[] maps to the RIGHT segment — a personal pin gets its own verdict, not a shifted one', async () => {
     // chain [j1:5, j2:5, p1:5, p2:5, m1:5] against 17: first three fit (15), p2 overflows.
-    const r = curateProjectScope(
+    const r = await curateProjectScope(
       [pin('j1', 5), pin('j2', 5)],
       [],
       [pin('p1', 5), pin('p2', 5)],
@@ -553,17 +719,17 @@ describe('curateProjectScope (#208/#209)', () => {
     expect(r.personal.loadedTokens).toBe(5)
   })
 
-  it('project-DOMINANT: the project pins alone spend Q → the personal background loads nothing', () => {
-    const r = curateProjectScope([pin('j1', 14)], [], [pin('p1', 8)], [], [mem('m1', 4)], 15)
+  it('project-DOMINANT: the project pins alone spend Q → the personal background loads nothing', async () => {
+    const r = await curateProjectScope([pin('j1', 14)], [], [pin('p1', 8)], [], [mem('m1', 4)], 15)
     expect(r.projectLoadedTokens).toBe(14)
     expect(r.personal.pins.map((p) => p.loaded)).toEqual([false])
     expect(r.personal.memory.map((m) => m.loaded)).toEqual([false])
     expect(r.personal.loadedTokens).toBe(0)
   })
 
-  it('project SETS load after project pins, before personal; project set tokens count as project-loaded', () => {
+  it('project SETS load after project pins, before personal; project set tokens count as project-loaded', async () => {
     // chain [j1:5, projSet.a:5, p1:5, m1:5] against BIG — all load.
-    const r = curateProjectScope(
+    const r = await curateProjectScope(
       [pin('j1', 5)],
       [set('canon', ['a', 5])],
       [pin('p1', 5)],
@@ -577,17 +743,23 @@ describe('curateProjectScope (#208/#209)', () => {
     expect(r.loadedTokens).toBe(20)
   })
 
-  it('DEDUP: a note in a project pin AND a personal set loads once under the project (project wins)', () => {
-    const r = curateProjectScope([pin('a', 5)], [], [], [set('mine', ['a', 5], ['b', 5])], [], BIG)
+  it('DEDUP: a note in a project pin AND a personal set loads once under the project (project wins)', async () => {
+    const r = await curateProjectScope(
+      [pin('a', 5)],
+      [],
+      [],
+      [set('mine', ['a', 5], ['b', 5])],
+      [],
+      BIG,
+    )
     expect(r.pins.map((p) => p.noteId)).toEqual(['a'])
     expect(r.personal.sets[0].items.map((item) => item.noteId)).toEqual(['b']) // 'a' deduped to the project pin
-    expect(r.totalTokens).toBe(10) // a once + b
   })
 })
 
 describe('role-first context curation (#308)', () => {
-  it('loads Role → Project → Personal under one budget and deduplicates to the role', () => {
-    const r = curateProjectScope(
+  it('loads Role → Project → Personal under one budget and deduplicates to the role', async () => {
+    const r = await curateProjectScope(
       [pin('shared', 5), pin('project', 5)],
       [],
       [pin('personal', 5)],
@@ -607,10 +779,9 @@ describe('role-first context curation (#308)', () => {
     expect(r.personal.pins.map((item) => [item.noteId, item.loaded])).toEqual([['personal', false]])
     expect(r.personal.memory.map((item) => [item.noteId, item.loaded])).toEqual([['memory', false]])
     expect(r.loadedTokens).toBe(15)
-    expect(r.totalTokens).toBe(25)
   })
 
-  it('keeps role order independent and applies a strict prefix', () => {
+  it('keeps role order independent and applies a strict prefix', async () => {
     const role = {
       pins: [pin('first', 8), pin('second', 8)],
       sets: [set('role-set', ['set-note', 8])],
@@ -620,7 +791,7 @@ describe('role-first context curation (#308)', () => {
         { kind: 'pin' as const, ref: 'first' },
       ],
     }
-    const combined = curatePersonalScope([], [], [], 17, [], role)
+    const combined = await curatePersonalScope([], [], [], 17, [], role)
 
     expect(combined.role?.sets[0].items[0].loaded).toBe(true)
     expect(combined.role?.pins.map((item) => [item.noteId, item.loaded])).toEqual([
@@ -631,8 +802,8 @@ describe('role-first context curation (#308)', () => {
 })
 
 describe('order overlay (#210)', () => {
-  it('default (no overlay): pins keep insertion order, THEN sets — dense 0-based positions', () => {
-    const r = curatePersonalScope([pin('p1', 5), pin('p2', 5)], [set('s', ['a', 5])], [], BIG)
+  it('default (no overlay): pins keep insertion order, THEN sets — dense 0-based positions', async () => {
+    const r = await curatePersonalScope([pin('p1', 5), pin('p2', 5)], [set('s', ['a', 5])], [], BIG)
     expect(r.pins.map((p) => [p.noteId, p.order])).toEqual([
       ['p1', 0],
       ['p2', 1],
@@ -640,8 +811,8 @@ describe('order overlay (#210)', () => {
     expect(r.sets[0].order).toBe(2)
   })
 
-  it('a set dragged ABOVE a pin loads first and carries the lower position (pins & sets share one rank space)', () => {
-    const r = curatePersonalScope([pin('p1', 5)], [set('s', ['a', 5])], [], BIG, [
+  it('a set dragged ABOVE a pin loads first and carries the lower position (pins & sets share one rank space)', async () => {
+    const r = await curatePersonalScope([pin('p1', 5)], [set('s', ['a', 5])], [], BIG, [
       { kind: 'set', ref: 's' },
       { kind: 'pin', ref: 'p1' },
     ])
@@ -649,15 +820,15 @@ describe('order overlay (#210)', () => {
     expect(r.pins[0].order).toBe(1)
   })
 
-  it('order = budget PRIORITY: dragging a pin to the top saves it from a squeeze that trims the default-first one', () => {
+  it('order = budget PRIORITY: dragging a pin to the top saves it from a squeeze that trims the default-first one', async () => {
     // Two 10-token pins under budget 12 → only the FIRST in the sequence loads.
-    const def = curatePersonalScope([pin('p1', 10), pin('p2', 10)], [], [], 12)
+    const def = await curatePersonalScope([pin('p1', 10), pin('p2', 10)], [], [], 12)
     expect(def.pins.map((p) => [p.noteId, p.loaded])).toEqual([
       ['p1', true],
       ['p2', false],
     ])
     // Drag p2 to the top → p2 now loads, p1 trims. The wire array comes out in the new order.
-    const r = curatePersonalScope([pin('p1', 10), pin('p2', 10)], [], [], 12, [
+    const r = await curatePersonalScope([pin('p1', 10), pin('p2', 10)], [], [], 12, [
       { kind: 'pin', ref: 'p2' },
       { kind: 'pin', ref: 'p1' },
     ])
@@ -667,11 +838,15 @@ describe('order overlay (#210)', () => {
     ])
   })
 
-  it('an entry absent from the overlay sorts AFTER the ranked ones, in the default order (self-healing)', () => {
+  it('an entry absent from the overlay sorts AFTER the ranked ones, in the default order (self-healing)', async () => {
     // Only p2 is ranked (dragged to front); p1 + the set fall back to their default order behind it.
-    const r = curatePersonalScope([pin('p1', 5), pin('p2', 5)], [set('s', ['a', 5])], [], BIG, [
-      { kind: 'pin', ref: 'p2' },
-    ])
+    const r = await curatePersonalScope(
+      [pin('p1', 5), pin('p2', 5)],
+      [set('s', ['a', 5])],
+      [],
+      BIG,
+      [{ kind: 'pin', ref: 'p2' }],
+    )
     expect(r.pins.map((p) => [p.noteId, p.order])).toEqual([
       ['p2', 0],
       ['p1', 1],
@@ -679,8 +854,8 @@ describe('order overlay (#210)', () => {
     expect(r.sets[0].order).toBe(2)
   })
 
-  it('set items carry their within-set index as `order` (a set is one draggable group)', () => {
-    const r = curatePersonalScope([], [set('s', ['a', 5], ['b', 5], ['c', 5])], [], BIG)
+  it('set items carry their within-set index as `order` (a set is one draggable group)', async () => {
+    const r = await curatePersonalScope([], [set('s', ['a', 5], ['b', 5], ['c', 5])], [], BIG)
     expect(r.sets[0].items.map((i) => [i.noteId, i.order])).toEqual([
       ['a', 0],
       ['b', 1],
@@ -688,8 +863,8 @@ describe('order overlay (#210)', () => {
     ])
   })
 
-  it('project & personal blocks are ordered INDEPENDENTLY (each its own overlay, each 0-based)', () => {
-    const r = curateProjectScope(
+  it('project & personal blocks are ordered INDEPENDENTLY (each its own overlay, each 0-based)', async () => {
+    const r = await curateProjectScope(
       [pin('j1', 5), pin('j2', 5)],
       [],
       [pin('p1', 5), pin('p2', 5)],

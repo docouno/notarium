@@ -53,6 +53,54 @@ type AcceptedCausalPublication = {
   operationId: string
 }
 
+type ResolvedNoteIdentity = {
+  id: string
+  space: string
+  filePath: string
+  deletedAt: string | null
+}
+
+/** Follow only the durable settlement edge returned by identity persistence. An ordinary
+ * tombstone stays addressable as a tombstone so the existing read fallback can collapse it to a
+ * miss. Once traversal begins, a missing, foreign, cyclic, or still-deleted successor is an
+ * incomplete proof and fails closed. */
+const canonicalIdentityRecord = (
+  requestedId: string,
+  records: ReadonlyMap<string, IdentityRecord>,
+): IdentityRecord | null => {
+  const first = records.get(requestedId)
+
+  if (!first) {
+    return null
+  }
+  let current = first
+  let followed = false
+  const seen = new Set<string>()
+
+  while (current.deletedAt && current.settlementSuccessorId) {
+    if (seen.has(current.id) || current.settlementSuccessorId === current.id) {
+      return null
+    }
+    seen.add(current.id)
+    const successor = records.get(current.settlementSuccessorId)
+
+    if (!successor || successor.space !== first.space) {
+      return null
+    }
+    current = successor
+    followed = true
+  }
+
+  return followed && current.deletedAt ? null : current
+}
+
+const resolvedNoteIdentity = (record: IdentityRecord): ResolvedNoteIdentity => ({
+  id: record.id,
+  space: record.space,
+  filePath: record.filePath,
+  deletedAt: record.deletedAt,
+})
+
 export class SpaceManager {
   private readonly entries = new Map<string, SpaceEntry>()
   /** current slug + slugified aliases → id; current wins over an alias. */
@@ -820,12 +868,32 @@ export class SpaceManager {
 
   /** Global id → space resolution: the registry arbitrates; a meta-DB-less host
    *  falls back to polling each live store.
-   *  Tombstoned ids resolve too — the read path decides what a deleted note answers. */
-  async resolveNote(id: string): Promise<{ space: string; deletedAt: string | null } | null> {
+   *  Exact settlement lineage resolves to its live successor after restart. Ordinary
+   *  tombstones still resolve as tombstones — the read path decides what they answer. */
+  async resolveNote(
+    id: string,
+  ): Promise<{ id: string; space: string; filePath: string; deletedAt: string | null } | null> {
+    if (this.metaDb?.identity.findByIds) {
+      return (await this.resolveNotes([id])).get(id) ?? null
+    }
     const findById = this.metaDb?.identity.findById
 
     if (findById) {
-      const rec: IdentityRecord | null = await findById(id)
+      const records = new Map<string, IdentityRecord>()
+      const queried = new Set<string>()
+      let nextId: string | undefined = id
+
+      while (nextId && !queried.has(nextId)) {
+        queried.add(nextId)
+        const record: IdentityRecord | null = await findById(nextId)
+
+        if (!record) {
+          break
+        }
+        records.set(record.id, record)
+        nextId = record.deletedAt ? record.settlementSuccessorId : undefined
+      }
+      const rec = canonicalIdentityRecord(id, records)
 
       if (!rec) {
         return null
@@ -839,7 +907,7 @@ export class SpaceManager {
         entry.identityReadyRequired = true
       }
 
-      return { space: rec.space, deletedAt: rec.deletedAt }
+      return resolvedNoteIdentity(rec)
     }
     for (const [spaceId, entry] of this.entries) {
       if (entry.lifecycle !== SPACE_LIFECYCLE_PHASE.active) {
@@ -851,11 +919,101 @@ export class SpaceManager {
       const notes = await store.list({ scope: READ_SCOPE.all })
 
       if (notes.some((n) => n.id === id)) {
-        return { space: spaceId, deletedAt: null }
+        const note = notes.find((candidate) => candidate.id === id)!
+
+        return { id: note.id!, space: spaceId, filePath: note.filePath, deletedAt: null }
       }
     }
 
     return null
+  }
+
+  /** Exact multi-id twin of resolveNote. Production identity drivers answer each lineage depth
+   * with bounded IN/ANY queries; a meta-DB-less host preserves the existing store fallback. */
+  async resolveNotes(
+    ids: readonly string[],
+  ): Promise<
+    Map<string, { id: string; space: string; filePath: string; deletedAt: string | null }>
+  > {
+    const wanted = [...new Set(ids)]
+    const findByIds = this.metaDb?.identity.findByIds
+
+    if (findByIds) {
+      const initial = await findByIds(wanted)
+      const resolved = new Map<
+        string,
+        { id: string; space: string; filePath: string; deletedAt: string | null }
+      >()
+
+      // The ordinary path is all live rows plus unrelated tombstones. Keep it at one
+      // result map and one pass; lineage maps/sets exist only when a durable edge does.
+      if (!initial.some((record) => record.deletedAt && record.settlementSuccessorId)) {
+        for (const rec of initial) {
+          const entry = this.entries.get(rec.space)
+
+          if (entry?.lifecycle === SPACE_LIFECYCLE_PHASE.active) {
+            entry.identityReadyRequired = true
+          }
+          resolved.set(rec.id, resolvedNoteIdentity(rec))
+        }
+
+        return resolved
+      }
+
+      const records = new Map(initial.map((record) => [record.id, record]))
+      const queried = new Set(wanted)
+      let frontier = new Set(
+        initial.flatMap((record) =>
+          record.deletedAt && record.settlementSuccessorId ? [record.settlementSuccessorId] : [],
+        ),
+      )
+
+      while (frontier.size > 0) {
+        const frontierIds = [...frontier].filter((id) => !queried.has(id))
+
+        if (frontierIds.length === 0) {
+          break
+        }
+        frontierIds.forEach((id) => queried.add(id))
+        const next = await findByIds(frontierIds)
+
+        next.forEach((record) => records.set(record.id, record))
+        frontier = new Set(
+          next.flatMap((record) =>
+            record.deletedAt && record.settlementSuccessorId ? [record.settlementSuccessorId] : [],
+          ),
+        )
+      }
+      for (const requestedId of wanted) {
+        const rec = canonicalIdentityRecord(requestedId, records)
+
+        if (!rec) {
+          continue
+        }
+        const entry = this.entries.get(rec.space)
+
+        if (entry?.lifecycle === SPACE_LIFECYCLE_PHASE.active) {
+          entry.identityReadyRequired = true
+        }
+        resolved.set(requestedId, resolvedNoteIdentity(rec))
+      }
+
+      return resolved
+    }
+    const resolved = new Map<
+      string,
+      { id: string; space: string; filePath: string; deletedAt: string | null }
+    >()
+
+    for (const id of wanted) {
+      const hit = await this.resolveNote(id)
+
+      if (hit) {
+        resolved.set(id, hit)
+      }
+    }
+
+    return resolved
   }
 
   /** Mint a new space (capability-gated); recovers an existing registry row instead

@@ -18,16 +18,24 @@ import { rekeyReferences } from './identityRefs'
 import { IDENTITY_COLUMNS, type IdentityRow, lockIdentityRows, readIdentityRows } from './lockOrder'
 import { rekeyAndQuarantineRevisions } from './revisionQuarantine'
 
-const recordOfRow = (r: IdentityRow): IdentityRecord => ({
-  id: r.id,
-  legacyNameAliases: canonicalLegacyNameAliases(parseJson(r.legacy_name_aliases)),
-  filePath: r.file_path,
-  space: r.space,
-  createdAt: r.created_at,
-  materialized: r.materialized,
-  deletedAt: r.deleted_at,
-  addressRevision: Number(r.address_revision),
-})
+const recordOfRow = (r: IdentityRow): IdentityRecord => {
+  const record: IdentityRecord = {
+    id: r.id,
+    legacyNameAliases: canonicalLegacyNameAliases(parseJson(r.legacy_name_aliases)),
+    filePath: r.file_path,
+    space: r.space,
+    createdAt: r.created_at,
+    materialized: r.materialized,
+    deletedAt: r.deleted_at,
+    addressRevision: Number(r.address_revision),
+  }
+
+  if (r.settlement_successor_id) {
+    record.settlementSuccessorId = r.settlement_successor_id
+  }
+
+  return record
+}
 
 const parseJson = (raw: string | null): unknown => {
   try {
@@ -148,6 +156,14 @@ export const createIdentityFacet = (ctx: PgDriverCtx): IdentityPersistence => ({
     const [row] = await readIdentityRows(ctx.required, [id])
 
     return row ? recordOfRow(row) : null
+  },
+  findByIds: async (ids: readonly string[]) => {
+    await ctx.ensureInit()
+    const wanted = [...new Set(ids)]
+    const rows = await readIdentityRows(ctx.required, wanted)
+    const byId = new Map(rows.map((row) => [row.id, recordOfRow(row)]))
+
+    return wanted.flatMap((id) => (byId.has(id) ? [byId.get(id)!] : []))
   },
   claimMany: async (records: readonly IdentityRecord[]) => {
     if (!records.length) {

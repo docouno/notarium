@@ -24,6 +24,31 @@ const exportText = (content: string | Uint8Array): string =>
 
 const frontmatter = (yaml: string) => parseFrontmatterLines(yaml)
 
+describe('InMemoryStore raw file accessor', () => {
+  it('uses the exact export serializer without widening KnowledgeStore', async () => {
+    const store = new InMemoryStore({
+      space: 'main',
+      notes: [
+        {
+          id: 'raw-note',
+          title: 'Raw note',
+          filePath: 'raw.md',
+          content: 'body',
+          summary: 'Summary',
+          muted: true,
+        },
+      ],
+    })
+    const exported: Array<{ content: string | Uint8Array }> = []
+
+    for await (const entry of store.exportNotes({ scope: 'all' })) {
+      exported.push(entry)
+    }
+    expect(store.rawFileAt('raw.md')).toBe(exportText(exported[0].content))
+    expect(store.rawFileAt('missing.md')).toBeNull()
+  })
+})
+
 describe('InMemoryStore snapshot primary metadata', () => {
   it('canonicalizes seeded Type and Created before either read projection', async () => {
     const store = new InMemoryStore({

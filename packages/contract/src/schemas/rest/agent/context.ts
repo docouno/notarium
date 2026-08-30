@@ -43,18 +43,21 @@ export const ContextPinSchema = PinnedNoteSchema.extend({
  *  `loaded` reflects the joint pins+memory (+ embedded personal in a project) trim. */
 export const ContextMemorySchema = MemoryCategorySchema.extend({ loaded: z.boolean() })
 
-/** One note reference inside a set as its MANAGER sees it (home-space CRUD): move-safe
- *  global id, home space slug, resolved title. Inaccessible refs degrade (see
- *  `space` below), never dropped from the set definition. */
-export const ContextSetRefSchema = z.object({
+/** One raw note reference inside a set as its MANAGER sees it (home-space CRUD).
+ * Presentation and per-reader degradation belong to the paginated item door. */
+export const ContextSetStoredRefSchema = z.object({ noteId: z.string() })
+
+/** One requested audit-page row. Nullable presentation keeps the raw membership
+ * removable without turning a missing or inaccessible note into an oracle. */
+const ContextSetPageItemBaseSchema = z.object({
+  sourceIndex: z.number().int().nonnegative(),
   noteId: z.string(),
-  /** The item's home-space SLUG — or `null` when the READER can't reach the note
-   *  (honest degradation): an inaccessible ref keeps its `noteId` (for the remove-item
-   *  endpoint) but nulls BOTH `space` and `title`, so a home-space member never learns the
-   *  slug of a space they aren't in. */
-  space: z.string().nullable(),
-  title: z.string().nullable(),
 })
+
+export const ContextSetPageItemSchema = z.union([
+  ContextSetPageItemBaseSchema.extend({ space: z.string(), title: z.string() }),
+  ContextSetPageItemBaseSchema.extend({ space: z.null(), title: z.null() }),
+])
 
 /** Where a set is attached (its scope binding). `label` is a per-reader safe display
  * handle for Personal, Project, or an exact owned role placement. */
@@ -73,7 +76,7 @@ export const ContextSetSchema = z.object({
   name: z.string(),
   homeSpace: z.string(),
   personal: z.boolean(),
-  items: z.array(ContextSetRefSchema),
+  items: z.array(ContextSetStoredRefSchema),
   attachments: z.array(ContextSetAttachmentSchema),
   createdAt: z.string(),
 })
@@ -87,22 +90,59 @@ export const ContextSetResponseSchema = z.object({ set: ContextSetSchema })
 /** One set item as a SCOPE preview sees it: resolved items riding the scope's
  *  budget. Only items THIS viewer can reach (degraded ones omitted — the preview mirrors
  *  the agent's real load), each weighed by body with the server's `loaded`; `space` is the
- *  home slug. NOTE: the inherited `order` on an item just mirrors its ARRAY INDEX
- *  and is NOT read by the client (item order IS array order); it is kept only for
- *  shape-symmetry with a pin row. The load-bearing `order` is on a top-level pin/set. */
-export const ContextSetItemSchema = ContextPinSchema.extend({ space: z.string() })
+ *  home slug. With home coordinates visible, inherited `order` mirrors the raw source
+ *  index for compatibility; otherwise it is dense presentation order and reveals no gap.
+ *  `sourceIndex` is the explicit coordinate used to merge an overlapping audit page.
+ *  The load-bearing group `order` is on the top-level set. */
+export const ContextSetItemSchema = ContextPinSchema.extend({
+  space: z.string(),
+  /** Raw membership coordinate. Omitted with total/cursor when the home space is hidden. */
+  sourceIndex: z.number().int().nonnegative().optional(),
+})
 
-export const ContextSetViewSchema = z.object({
+export const ContextSetBaseViewSchema = z.object({
   id: z.string(),
   name: z.string(),
   /** The set's HOME space slug — lets a scope panel address its CRUD (delete / edit items)
    *  against the real home even when cross-space-homed, without a second round-trip. */
   homeSpace: z.string(),
-  items: z.array(ContextSetItemSchema),
   /** POSITION in the scope's ONE pin+set sequence — same rank space as
    *  {@link ContextPinSchema.order}, so the client interleaves pins and sets. Server-curated. */
   order: z.number().int(),
 })
+
+const ContextSetViewFields = {
+  itemsLoaded: z.number().int().nonnegative(),
+  /** Hard token/curation/resolve stop; access-only degradation remains neutral. */
+  trimmed: z.boolean(),
+}
+
+const ContextSetCoordinateItemSchema = ContextSetItemSchema.extend({
+  sourceIndex: z.number().int().nonnegative(),
+})
+
+const ContextSetHiddenItemSchema = ContextSetItemSchema.extend({
+  sourceIndex: z.undefined().optional(),
+})
+
+/** Coordinate-bearing and no-home projections are separate executable variants:
+ * a hidden home can never smuggle a denominator/cursor/item coordinate through parse. */
+export const ContextSetViewSchema = z.union([
+  ContextSetBaseViewSchema.extend({
+    homeSpace: z.string().min(1),
+    items: z.array(ContextSetCoordinateItemSchema),
+    ...ContextSetViewFields,
+    itemsTotal: z.number().int().nonnegative(),
+    itemsCursor: z.number().int().nonnegative(),
+  }),
+  ContextSetBaseViewSchema.extend({
+    homeSpace: z.literal(''),
+    items: z.array(ContextSetHiddenItemSchema),
+    ...ContextSetViewFields,
+    itemsTotal: z.undefined().optional(),
+    itemsCursor: z.undefined().optional(),
+  }),
+])
 
 const RoleContextFieldsSchema = {
   pins: z.array(ContextPinSchema),
@@ -157,8 +197,8 @@ export const RoleInactiveReasonSchema = z.enum(['disabled', 'out-of-reach', 'unh
  *  stays: how heavy a note is belongs to the note, not to anyone's budget. */
 export const ContextLayerPinSchema = ContextPinSchema.omit({ loaded: true })
 
-export const ContextLayerSetViewSchema = ContextSetViewSchema.extend({
-  items: z.array(ContextSetItemSchema.omit({ loaded: true })),
+export const ContextLayerSetViewSchema = ContextSetBaseViewSchema.extend({
+  items: z.array(ContextSetItemSchema.omit({ loaded: true, sourceIndex: true })),
 })
 
 const RoleContextLayerFieldsSchema = {
@@ -236,9 +276,10 @@ export const ContextOrderRequestSchema = z.object({
   entries: z.array(ContextOrderEntrySchema).max(1000),
 })
 
-/** Reorder the ITEMS inside a set: the full new sequence of the set's note ids.
- *  A set's item order is a property of the set (shared across every scope it attaches to),
- *  so this is a home-space write, not a per-scope overlay. */
+/** Reorder the visible ITEMS inside a set. Omitted membership keeps its current slot,
+ *  so a bounded preview/page can reorder what it knows without fetching the whole set.
+ *  A set's item order is shared across every scope it attaches to, therefore this is a
+ *  home-space write rather than a per-scope overlay. */
 export const ContextSetOrderRequestSchema = z.object({ noteIds: z.array(z.string()).max(1000) })
 
 export const ContextSetCreateRequestSchema = z.object({ name: z.string().min(1).max(200) })
@@ -247,6 +288,42 @@ export const ContextSetPatchRequestSchema = z.object({ name: z.string().min(1).m
 
 /** Add a cross-space ref to a set: the item's space (slug) + its note id. */
 export const ContextSetItemRequestSchema = z.object({ space: z.string(), noteId: z.string() })
+
+export const ContextSetItemsQuerySchema = z
+  .object({
+    offset: z.coerce.number().int().nonnegative().default(0),
+    limit: z.coerce.number().int().min(1).max(200).default(50),
+  })
+  .strict()
+
+export const ContextSetItemsResponseSchema = z.object({
+  items: z.array(ContextSetPageItemSchema),
+  total: z.number().int().nonnegative(),
+})
+
+export const ContextSetItemsAddRequestSchema = z.object({
+  items: z.array(ContextSetItemRequestSchema).min(1).max(1000),
+})
+
+export const ContextSetItemAddFailureSchema = z.discriminatedUnion('reason', [
+  z.object({
+    id: z.string(),
+    reason: z.literal('not_found'),
+    error: z.literal('Note is unavailable'),
+  }),
+  z.object({
+    id: z.string(),
+    reason: z.literal('conflict'),
+    error: z.literal('Reference changed while the set was updated'),
+  }),
+])
+
+export const ContextSetItemsAddResponseSchema = z.object({
+  ok: z.literal(true),
+  added: z.array(z.string()),
+  failed: z.array(ContextSetItemAddFailureSchema),
+  set: ContextSetSchema,
+})
 
 /** Pin a note into a scope from ANY readable space: the note's space slug + id.
  *  A note in the scope's own space prefers the location-bound `always-load` tag;
@@ -278,11 +355,9 @@ export const MeAgentContextResponseSchema = z.object({
    *  the viewer can't reach are omitted (the preview mirrors the agent's real load). */
   sets: z.array(ContextSetViewSchema),
   /** The token scale, server-derived so the human sees the agent's EXACT cost:
-   *  `loadedTokens` = pins+memory that fit `P`; `totalTokens` = every active (non-muted)
-   *  pin+memory weight; `budgetTokens` (`P`) echoed from server config (one source of
-   *  truth) so the UI draws its bar without baking in a number. */
+   *  `loadedTokens` = pins+memory that fit `P`; `budgetTokens` (`P`) is echoed from
+   *  server config so the UI draws its bar without baking in a number. */
   loadedTokens: z.number().int(),
-  totalTokens: z.number().int(),
   budgetTokens: z.number().int(),
 })
 
@@ -316,10 +391,8 @@ export const ProjectAgentContextResponseSchema = z.object({
     loadedTokens: z.number().int(),
   }),
   /** The joint token scale: `loadedTokens` = project + personal that fit `Q`,
-   *  `totalTokens` = every eager weight in play (project pins + personal pins+memory),
    *  `budgetTokens` = `Q` (echoed from config, per-project override later). */
   loadedTokens: z.number().int(),
-  totalTokens: z.number().int(),
   budgetTokens: z.number().int(),
   index: z.object({
     noteCount: z.number().int(),
@@ -332,7 +405,9 @@ export type ContextPin = z.infer<typeof ContextPinSchema>
 
 export type ContextMemory = z.infer<typeof ContextMemorySchema>
 
-export type ContextSetRef = z.infer<typeof ContextSetRefSchema>
+export type ContextSetStoredRef = z.infer<typeof ContextSetStoredRefSchema>
+
+export type ContextSetPageItem = z.infer<typeof ContextSetPageItemSchema>
 
 export type ContextSetAttachment = z.infer<typeof ContextSetAttachmentSchema>
 
@@ -347,6 +422,10 @@ export type ContextSetItem = z.infer<typeof ContextSetItemSchema>
 export type ContextSetView = z.infer<typeof ContextSetViewSchema>
 
 export type RoleContextView = z.infer<typeof RoleContextViewSchema>
+
+export type ContextLayerPin = z.infer<typeof ContextLayerPinSchema>
+
+export type ContextLayerSetView = z.infer<typeof ContextLayerSetViewSchema>
 
 export type RoleContextIdentity = z.infer<typeof RoleContextIdentitySchema>
 
@@ -365,6 +444,14 @@ export type ContextSetCreateRequest = z.infer<typeof ContextSetCreateRequestSche
 export type ContextSetPatchRequest = z.infer<typeof ContextSetPatchRequestSchema>
 
 export type ContextSetItemRequest = z.infer<typeof ContextSetItemRequestSchema>
+
+export type ContextSetItemsQuery = z.infer<typeof ContextSetItemsQuerySchema>
+
+export type ContextSetItemsResponse = z.infer<typeof ContextSetItemsResponseSchema>
+
+export type ContextSetItemsAddRequest = z.infer<typeof ContextSetItemsAddRequestSchema>
+
+export type ContextSetItemsAddResponse = z.infer<typeof ContextSetItemsAddResponseSchema>
 
 export type ContextPinRequest = z.infer<typeof ContextPinRequestSchema>
 

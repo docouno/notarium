@@ -8,6 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- **Large context sets now have an inline paginated audit and a bulk-add door.** The Context constructor shows loaded/total membership, keeps unavailable raw positions removable, invalidates stale pages after mutations, and builds a 1000-note set with one request instead of 1000 sequential writes.
 - **Model providers can now be configured, validated and shared with explicit Space consent.** Session-only Settings manage write-only encrypted credentials and OpenAI-compatible/Ollama resources; connection checks use a pinned, bounded SSRF-resistant transport and leave a secret-free call journal with process-local RPM/TPM limits. Resource owners can offer access to a Space or Project, managers accept a literal disclosure and re-consent to recipient-affecting changes, effective resolution explains unusable states, and MCP `whoami.hasModel` exposes only the resulting capability. The credential keyring is retained separately from Notarium backups, with dry-run-first rotation, historical-snapshot reconciliation and complete-loss purge commands.
 - **The MCP gateway now serves the stateless 2026-07-28 protocol directly.** Modern clients use `server/discover` instead of an initialization session, receive private five-minute cache hints on discovery and tool listings, and share the same authenticated tool gate with retained 2025 clients.
 - **Agent work now has durable sessions, independent delta cursors and a unified Activity view.** Sessions survive token rotation, can resume or fork explicitly, retain a sticky project and exact active Role, and keep concurrent agents from consuming each other's unseen changes. Role context presets load ahead of project and personal context under the same budget, while reads and attributed writes stay visible after a session is archived.
@@ -17,6 +18,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Changed
 
+- **Context-set manager responses now return raw `{noteId}` membership only.** Per-item title/space presentation moved to the bounded page endpoint, and agent-context previews no longer expose the misleading `totalTokens` field.
 - **MCP tool schemas now use JSON Schema 2020-12 on both protocol eras.** Local `$ref` entries and the former `execution` field are gone, while strict input and output object boundaries remain enforced.
 - **Validation now follows Zod 4 across MCP and REST.** Error issue codes, messages and the rendered REST error text may differ from the previous release; integer fields now reject values outside JavaScript's safe-integer range, and job results always include the `result` key (with `null` while unfinished).
 - **Revision history now versions the complete byte-safe document state.** Metadata-only edits participate in CAS and history, exact Markdown and Skill bytes restore without re-rendering, opaque bytes remain explicit, and legacy body-only rows stay visibly partial. The meta-DB upgrade from `0.1.0` is now four checksummed subsystem carriers with one `state_format`, final placement identities, conservative legacy cursor transfer and no compatibility claim for unpublished development schemas.
@@ -28,6 +30,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- **A large context set no longer resolves every saved reference before applying its budget.** Role → Project → Personal curation stops at the exact token/count/resolve boundary, manager mutations do not reopen every item body, and bulk identity conflicts roll back and retry without discarding unrelated valid refs.
 - **Creating a note can no longer silently replace the occupant of its derived filename.** Create defaults to fail, Duplicate chooses a free name under the mutation claim, and the editor's conflict can open the existing note. Titles in any script now receive a visible Unicode-safe filename (with a stable-id fallback for letterless titles), so a restart cannot hide the note as `.md`.
 - **Folder and feed navigation no longer depends on request arrival order.** Concurrent folder listings keep every accepted result, the first Explorer load unions the active note's chain with the normal expansion and retries failed listings, and filtered feeds refresh when an external move enters the selected subtree.
 - **Imported Markdown keeps authored metadata and stable source identity.** Safe frontmatter is preserved while modeled fields are lifted, unsupported YAML fails visibly, and a canonical source locator—not a lossy generated path—deduplicates foreign notes.

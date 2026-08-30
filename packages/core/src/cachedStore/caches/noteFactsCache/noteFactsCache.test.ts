@@ -34,6 +34,7 @@ describe('NoteFactsCache', () => {
       snippet: 'Body with Link and markup.',
       muted: true,
       bodyTokens: estimateTokens('Body with [[Link]] and **markup**.'),
+      noteClass: 'agent-memory',
     })
   })
 

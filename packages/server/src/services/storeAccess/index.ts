@@ -1,6 +1,10 @@
 export {
+  canonicalMetaNoteAccess,
+  canonicalMetaNoteAccessMany,
   createStoreAccess,
+  metaNoteAccess,
   readNoteAccess,
+  resolveScopeContextSets,
   weighScopeContextSets,
   weighScopeOrder,
   weighScopePins,

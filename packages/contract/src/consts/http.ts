@@ -18,3 +18,12 @@ export const HTTP_STATUS = {
 } as const
 
 export type HttpStatus = (typeof HTTP_STATUS)[keyof typeof HTTP_STATUS]
+
+/** Server-observed request interval used by the production-shaped liveness proof.
+ * It begins in `onRequest`, before body parsing and pre-handler authorization, and
+ * ends in `onSend` after response serialization. Values share the server process's
+ * monotonic performance time origin. */
+export const REQUEST_TIMING_HEADER = {
+  STARTED_AT: 'x-notarium-handler-started-at',
+  ENDED_AT: 'x-notarium-handler-ended-at',
+} as const

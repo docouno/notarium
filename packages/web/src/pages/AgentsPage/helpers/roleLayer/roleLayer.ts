@@ -1,5 +1,5 @@
 import type { RoleContextIdentity, RoleContextView } from '@notarium/contract'
-import type { ContextPinView, ContextSetRowView } from '../../types'
+import type { ContextPinView, ContextSetItemView, ContextSetRowView } from '../../types'
 
 /** The role panel's rows, assembled from the TWO doors that each own half the answer
  *  (#309).
@@ -19,6 +19,12 @@ export const roleLayerRows = (
   weighed: Pick<RoleContextView, 'pins' | 'sets'> | undefined,
 ): { pins: ContextPinView[]; sets: ContextSetRowView[] } => {
   const pinVerdict = new Map((weighed?.pins ?? []).map((pin) => [pin.noteId, pin.loaded]))
+  const loadedIds = new Set([
+    ...(weighed?.pins ?? []).filter((pin) => pin.loaded).map((pin) => pin.noteId),
+    ...(weighed?.sets ?? []).flatMap((set) =>
+      set.items.filter((item) => item.loaded).map((item) => item.noteId),
+    ),
+  ])
   // A note can sit in two sets of the same layer, and the budget trims a SET ITEM, not
   // a note — so the verdict is keyed by the pair, never by the note alone.
   const itemVerdict = new Map(
@@ -26,14 +32,38 @@ export const roleLayerRows = (
       set.items.map((item) => [`${set.id}\u0000${item.noteId}`, item.loaded] as const),
     ),
   )
+  const weighedSetById = new Map((weighed?.sets ?? []).map((set) => [set.id, set]))
   const weigh = <T extends object>(row: T, verdict: boolean | undefined): T =>
     verdict === undefined ? row : { ...row, loaded: verdict }
 
   return {
-    pins: layer.pins.map((pin) => weigh<ContextPinView>(pin, pinVerdict.get(pin.noteId))),
-    sets: layer.sets.map((set) => ({
-      ...set,
-      items: set.items.map((item) => weigh(item, itemVerdict.get(`${set.id}\u0000${item.noteId}`))),
-    })),
+    pins: layer.pins.map((pin) =>
+      weigh<ContextPinView>(
+        pin,
+        pinVerdict.get(pin.noteId) ?? (weighed ? loadedIds.has(pin.noteId) : undefined),
+      ),
+    ),
+    sets: layer.sets.map((set) => {
+      const weighedSet = weighedSetById.get(set.id)
+      const items = set.items.map((item) =>
+        weigh<ContextSetItemView>(
+          item,
+          itemVerdict.get(`${set.id}\u0000${item.noteId}`) ??
+            (weighed ? loadedIds.has(item.noteId) : undefined),
+        ),
+      )
+
+      return {
+        ...set,
+        items,
+        ...(weighedSet
+          ? {
+              trimmed: weighedSet.trimmed,
+              itemsLoaded: items.filter((item) => item.loaded === true).length,
+              hasBudgetVerdict: true,
+            }
+          : {}),
+      }
+    }),
   }
 }

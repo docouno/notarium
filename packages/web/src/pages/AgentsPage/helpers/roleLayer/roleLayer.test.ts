@@ -68,14 +68,19 @@ describe('the role panel rows', () => {
     expect(rows.sets.map((set) => set.items[0].loaded)).toEqual([true, false])
   })
 
-  it('leaves a row the preview did not mention unweighed', () => {
-    const rows = roleLayerRows(layer, {
+  it('marks an unprocessed active-role tail unloaded unless a dedup winner loaded', () => {
+    const withDedupWinner = {
+      ...layer,
+      sets: [{ ...layer.sets[0], items: [{ ...pin('a', 0), space: 'me' }] }, layer.sets[1]],
+    } as unknown as Pick<RoleContextIdentity, 'pins' | 'sets'>
+    const rows = roleLayerRows(withDedupWinner, {
       pins: [{ ...pin('a', 0), loaded: true }],
       sets: [],
     } as unknown as Pick<RoleContextView, 'pins' | 'sets'>)
 
     expect(rows.pins[0].loaded).toBe(true)
-    expect('loaded' in rows.pins[1]).toBe(false)
-    expect('loaded' in rows.sets[0].items[0]).toBe(false)
+    expect(rows.pins[1].loaded).toBe(false)
+    expect(rows.sets[0].items[0].loaded).toBe(true)
+    expect(rows.sets[1].items[0].loaded).toBe(false)
   })
 })

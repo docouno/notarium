@@ -334,6 +334,14 @@
   background: color-mix(in srgb, var(--text-faint) 16%, transparent);
 }
 
+.meterSpacer {
+  height: 6px;
+}
+
+.tailActions {
+  margin-top: 8px;
+}
+
 .meterFill {
   display: block;
   height: 100%;

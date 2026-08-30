@@ -1,4 +1,9 @@
-import type { ContextPin, ContextSetView, MemoryCategory } from '@notarium/contract'
+import type {
+  ContextPin,
+  ContextSetPageItem,
+  ContextSetView,
+  MemoryCategory,
+} from '@notarium/contract'
 
 /** A pin as a context PANEL renders it (#309). `loaded` is optional because it is a
  *  claim about a budget, and not every source of a pin weighs one: the scope previews
@@ -7,10 +12,32 @@ import type { ContextPin, ContextSetView, MemoryCategory } from '@notarium/contr
  *  therefore means "nobody said", which is why every reader below asks `=== false`
  *  rather than `!loaded` — the two differ exactly on the layer no one weighed. */
 export type ContextPinView = Omit<ContextPin, 'loaded'> & { loaded?: boolean }
-export type ContextSetItemView = Omit<ContextSetView['items'][number], 'loaded'> & {
+export type ContextSetItemView = Omit<
+  ContextSetView['items'][number],
+  'loaded' | 'title' | 'space' | 'tokens'
+> & {
   loaded?: boolean
+  title: string | null
+  space: string | null
+  /** Page-only rows have no weight; absence must not render a zero-token meter. */
+  tokens?: number
 }
-export type ContextSetRowView = Omit<ContextSetView, 'items'> & { items: ContextSetItemView[] }
+export type ContextSetRowView = Omit<ContextSetView, 'items' | 'itemsLoaded' | 'trimmed'> & {
+  items: ContextSetItemView[]
+  itemsLoaded?: number
+  trimmed?: boolean
+  /** True only when the active preview supplied budget verdicts for this set. */
+  hasBudgetVerdict?: boolean
+}
+export type ContextSetTailState = {
+  items: ContextSetPageItem[]
+  total: number
+  nextOffset: number
+  loading: boolean
+  error?: boolean
+  /** Temporary visible order while a partial reorder write/reload is in flight. */
+  optimisticOrder?: string[]
+}
 
 // The scale's TWO scopes (#208). Colour encodes SELECTION, not identity (heatmap
 // ramp, #33): the ACTIVE band is the bright top step (toward white), every other band

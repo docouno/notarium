@@ -353,6 +353,10 @@ export type IdentityRecord = {
   /** Tombstone. Kept, not deleted: a tombstoned id re-adopting from the new file's frontmatter is
    *  how a materialized note survives an external move (which surfaces as remove+add). */
   deletedAt: string | null
+  /** Explicit durable lineage written by an accepted identity settlement. Read projections may
+   *  expose it so exact-id access can follow a retired address after restart; ordinary tombstones
+   *  omit it and never infer ancestry from path reuse. Persistence writers ignore this field. */
+  settlementSuccessorId?: string
 }
 
 /** What a batch claim did to ONE record. A row whose id already belongs to a DIFFERENT space is
@@ -453,6 +457,9 @@ export type IdentityPersistence = {
   /** Point lookup across ALL spaces — the resolver behind the space-free surfaces. Optional: a
    *  host without it falls back to asking each live store. */
   findById?(id: string): Promise<IdentityRecord | null>
+  /** Bounded exact batch lookup for request doors carrying many ids. Unlike `loadAll`, this
+   *  never snapshots a space; rows are returned in first-requested-id order. */
+  findByIds?(ids: readonly string[]): Promise<IdentityRecord[]>
   close(): Promise<void>
 }
 /** A typed placement: a directory whose notes all take ONE class (enforced). A space is a set of
@@ -667,6 +674,8 @@ export type NoteFacts = {
   snippet: string
   muted: boolean
   bodyTokens: number
+  /** Optional exact class carried by body-fact accelerators for policy filtering. */
+  noteClass?: NoteClass
 }
 
 export type SearchResult = {

@@ -1,6 +1,7 @@
 import type {
   ContextSetAttachmentRecord,
   ContextSetItemRef,
+  ContextSetItemsAddResult,
   ContextSetRecord,
   ContextSetsPersistence,
   ContextSetTargetKind,
@@ -56,20 +57,51 @@ export class InMemoryContextSets implements ContextSetsPersistence {
     return { ...s, items: s.items.map((i) => ({ ...i })) }
   }
 
-  async removeItem(id: string, noteId: string): Promise<ContextSetRecord | null> {
+  async addItems(
+    id: string,
+    refs: readonly ContextSetItemRef[],
+  ): Promise<ContextSetItemsAddResult> {
+    const s = this.sets.get(id)
+
+    if (!s) {
+      return { set: null, added: [], conflicts: [] }
+    }
+    const seen = new Set(s.items.map((item) => item.noteId))
+    const added: string[] = []
+
+    for (const ref of refs) {
+      if (seen.has(ref.noteId)) {
+        continue
+      }
+      seen.add(ref.noteId)
+      added.push(ref.noteId)
+      s.items.push({ ...ref })
+    }
+
+    return {
+      set: { ...s, items: s.items.map((item) => ({ ...item })) },
+      added,
+      conflicts: [],
+    }
+  }
+
+  async removeItem(id: string, ref: ContextSetItemRef): Promise<ContextSetRecord | null> {
     const s = this.sets.get(id)
 
     if (!s) {
       return null
     }
-    s.items = s.items.filter((i) => i.noteId !== noteId)
+    s.items = s.items.filter((i) => i.noteId !== ref.noteId)
     return { ...s, items: s.items.map((i) => ({ ...i })) }
   }
 
   // Reorder items SLOT-PRESERVING (#210): named ids refill named slots in request order;
   // an unnamed current item (deduped-hidden in the reordering scope, or concurrently added)
   // keeps its original slot — mirrors the drivers' `orderItems`.
-  async reorderItems(id: string, noteIds: readonly string[]): Promise<ContextSetRecord | null> {
+  async reorderItems(
+    id: string,
+    refs: readonly ContextSetItemRef[],
+  ): Promise<ContextSetRecord | null> {
     const s = this.sets.get(id)
 
     if (!s) {
@@ -79,7 +111,7 @@ export class InMemoryContextSets implements ContextSetsPersistence {
     const named = new Set<string>()
     const queue: ContextSetItemRef[] = []
 
-    for (const noteId of noteIds) {
+    for (const { noteId } of refs) {
       const it = byId.get(noteId)
 
       if (it && !named.has(noteId)) {

@@ -179,6 +179,7 @@ thresholds.
 | `agent-abilities-rich` | the same axis at VOLUME on the default login, where `agent-roles` proves boundaries with one placement each: Personal, Space and three Project role groups populated at once, BOTH inventories past the library/explorer page sizes, a title long enough to force truncation everywhere it is listed, one display name deliberately held at two placements, a `launch-review` Space role narrowed to two of the Space's projects with its own version in one of them, a version whose base was never created, and a Space skill fleet whose availability differs per project (all / one / several). It seeds project and personal Catalog dependencies at their real homes, exact-linked rename, malformed and deleted attachment health, plus the RC package-delete boundaries: both Markdown and non-Markdown auxiliaries make agent `delete_ability` refuse and preserve the package, while the unchanged human multi-file door can remove the Markdown package into Trash. `agent-created-oversized-proof` is published through the durable agent creator with PAT/session provenance, exceeds 64k characters, and is pinned by its real note id into Web; it simultaneously proves Activity attribution, fail-closed `use_skill` and generic MCP context filtering. Most of its projects hold no ability at all, and that is deliberate: the library aside's Project facet has no pagination and no scroller of its own, so the LENGTH of that facet is the state — long enough that the aside's own scroller is the one that moves. Counts are derived from `buildCasesWorld`, never pinned in prose. | agent-roles, agent-memory, agent-audit, structure, auth, scale |
 | `agent-abilities-sparse` | the other end of the same axis: a first-run stand with System and Catalog plus exactly one Owned skill and no Owned role at all — the empty groups, the single-row group and the skeleton geometry that a fully populated stand can never show | agent-roles, structure, auth |
 | `context-open` | production-shaped #394/#399 performance stand: 1100-note project + 2700-note personal corpus, one editable Custom Project Role in `context-lab/product`, linked graph/activity, 90 × ~6.5 KB project-memory categories (`SCALE=.045` → 4; `1` → 90; `3` → 270), 8 personal categories, 12 × ~13.7 KB always-load pins and a profile note; SCALE changes only the project-memory count | agent-memory, agent-roles, activity, graph, note-classes, scale, structure |
+| `context-sets-cost` | dedicated #406 performance/manual stand: 1100-note project corpus, six large pins, a 1000-member attached set, an isolated 5-member dedup set, a full role-identity set and an empty bulk target; it owns the membership-bound benchmark data root and never changes frozen `context-open` | agent-memory, agent-roles, auth, scale, structure |
 | `graph-revision` | production-shaped #410 benchmark fixture: one mutation source selected by `revision-query-marker` and one adjacency target; `make graph-revision-gate` adds the deterministic 1355-note filler corpus to reach 1357 notes / ≥20.3 MiB / 2013 wikilinks without making every catalog projection carry benchmark bytes | graph, search, scale, structure |
 | `memory-perf` | 2700 ordinary notes + 4 personal-memory categories + 1 project-partition sentinel; reproduces memory-mount scaling, partition isolation, and graph-inert memory links | agent-memory, note-classes, scale |
 | `import-thread` | one rich imported thread | import, content |
@@ -217,6 +218,7 @@ make seed CASE=tree-sort                            # explorer Name/Created/Modi
 make seed CASE=dashboard-activity SCALE=1 SEED=x PASSWORD=secret
 make seed CASE=reader-showcase,graph,trash-mixed    # COMBINATION of cases
 make graph-revision-gate                           # disposable #410 runtime + memory gate
+make seed CASE=context-sets-cost                   # #406 heavy/small/role context-set states
 make graph-revision-gate GRAPH_REVISION_COMMIT=<frozen-tree> # explicit dirty-tree proof
 make seed-coverage                                  # coverage matrix
 ```
@@ -285,6 +287,22 @@ assertions, never report fields. The frozen pre report is accepted only for the 
 A baseline file that carries no ability-edit section at all — an older or foreign report — comes back
 as a named failure rather than a crash. The data-root fingerprint is derived from stable
 project/memory/note/Role ids.
+
+`npm run bench:context-sets-cost` is the provenance-bound #406 harness. Its frozen pre
+must run on `5edc7b3`, prove that add-many is absent, and record manager/reorder/eager plus
+idle-heartbeat samples. Every post bulk sample creates a fresh empty set outside the timed
+interval, applies the same 1000 normalized refs in one request while health pulses run,
+validates `added=1000` and membership 1000, and deletes the temporary set in `finally`.
+The data-root digest includes the project, heavy set membership and pin/set order; driver
+tests, not REST diagnostics, own transaction-attempt and update-count evidence. Reports
+must contain a positive sample count, derived statistics must match their raw samples,
+and every applied bulk sample must contain its own repeated heartbeat sequence. The
+liveness envelope is evaluated from server-observed health-handler durations plus the
+first/inter-handler/tail coverage gaps inside the bulk server interval. That interval begins
+in the route's `onRequest` hook, before Fastify parses the 1000-ref body or runs pre-handler
+authorization, and ends after response serialization; parser/auth CPU starvation therefore
+cannot hide outside the proof. Client heartbeat duration remains diagnostic only, because host
+scheduling after a completed response is not server event-loop starvation.
 
 **Combining.** `CASE` accepts a comma-separated list — the cases **compose** into a
 single stand: spaces are merged by slug, users/projects/members are deduplicated,
@@ -673,12 +691,15 @@ required to match its directory.
 - **The `attachment` / `derived` / `encrypted` classes are not seeded** — these are
   engine mounts for derived/encrypted data, not user content (a future iteration if
   needed). What is seeded: `user-doc` / `agent-memory` / `profile` / `skill`.
-- **The fake does not express context sets (#209), cross-space loose pins (#209), and order (#210).**
+- **The generic fake projection does not express context sets (#209), cross-space loose pins (#209), and order (#210).**
   The fake's snapshot carries no stable note-id that a set item / scope pin / order entry
   refers to — so `world.contextSets`, `world.scopePins`, and `world.contextOrder` are
   projected only by the REAL applier (`scripts/seed.ts`, which has a logical→real map;
   order references pins by logical note-id and sets by NAME, and is resolved after the
-  sets are created). All three surfaces are exercised through the fake's REST instead, by
+  sets are created). A test that needs a large prebuilt set may opt into the fake app's
+  injected `contextSets` + reset-aware `seedContextSets` seam; it runs after live identities
+  and projects exist and uses the in-memory engine's exact raw-file accessor for real
+  `CachedStore.noteFacts`. Generic `toFixture` remains unchanged. All three surfaces are exercised through the fake's REST instead, by
   the conformance suite under `test/fake-server/`
   (`contextSets.test.ts`, `scopePins.test.ts`, `contextOrder.test.ts`).
 - **Scope order (#210) = `b.contextOrderFor({scope, entries})`** — `entries` in the

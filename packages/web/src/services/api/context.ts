@@ -4,6 +4,8 @@ import type {
   AgentSessionEvents,
   AgentSessions,
   ContextOrderEntry,
+  ContextSetItemsAddResponse,
+  ContextSetItemsResponse,
   ContextSetResponse,
   ContextSetsResponse,
   MeAgentContext,
@@ -186,6 +188,19 @@ export const contextApi = {
         method: 'DELETE',
       },
     ).then((d) => d.set),
+  contextSetItemsGet: (space: string, id: string, offset = 0, limit = 50) =>
+    req<ContextSetItemsResponse>(
+      `${sp(space)}/context-sets/${encodeURIComponent(id)}/items?offset=${offset}&limit=${limit}`,
+    ),
+  contextSetItemsAdd: (
+    space: string,
+    id: string,
+    items: Array<{ space: string; noteId: string }>,
+  ) =>
+    req<ContextSetItemsAddResponse>(
+      `${sp(space)}/context-sets/${encodeURIComponent(id)}/add-many`,
+      { method: 'POST', body: JSON.stringify({ items }) },
+    ),
   /** Attach/detach a set to a PROJECT scope (a shared set only). */
   contextSetAttachProject: (space: string, projectId: string, id: string) =>
     req<{ ok: true }>(

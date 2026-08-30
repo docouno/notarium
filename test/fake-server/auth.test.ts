@@ -881,10 +881,57 @@ describe('SSE: revoke = disconnect', () => {
     expect(removed.status).toBe(200)
 
     // The server hangs up: the stream ends instead of idling.
-    const end = await Promise.race([
+    let end = await Promise.race([
       reader.read().then((r) => (r.done ? 'CLOSED' : 'DATA')),
       new Promise<string>((resolve) => setTimeout(() => resolve('TIMEOUT'), 1500)),
     ])
+
+    if (end === 'DATA') {
+      end = await Promise.race([
+        reader.read().then((r) => (r.done ? 'CLOSED' : 'DATA')),
+        new Promise<string>((resolve) => setTimeout(() => resolve('TIMEOUT'), 1_500)),
+      ])
+    }
+    expect(end).toBe('CLOSED')
+  })
+
+  it('removing a supplemental membership closes a socket rooted in another space', async () => {
+    await app.listen({ port: 0, host: '127.0.0.1' })
+    const { port } = app.server.address() as { port: number }
+    const base = `http://127.0.0.1:${port}`
+    const aliceCookie = await fetch(`${base}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ username: 'alice', password: 'alice-password-1' }),
+    }).then((response) => (response.headers.get('set-cookie') as string).split(';')[0])
+    const stream = await fetch(`${base}/api/s/beta/events?watch=alpha`, {
+      headers: { cookie: aliceCookie },
+    })
+    const reader = stream.body!.getReader()
+    await reader.read()
+    const rootCookie = await fetch(`${base}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ username: 'root', password: 'root-password-1' }),
+    }).then((response) => (response.headers.get('set-cookie') as string).split(';')[0])
+
+    const removed = await fetch(`${base}/api/s/alpha/members/alice`, {
+      method: 'DELETE',
+      headers: { cookie: rootCookie },
+    })
+    expect(removed.status).toBe(200)
+    let end = await Promise.race([
+      reader.read().then((result) => (result.done ? 'CLOSED' : 'DATA')),
+      new Promise<string>((resolve) => setTimeout(() => resolve('TIMEOUT'), 1_500)),
+    ])
+
+    if (end === 'DATA') {
+      end = await Promise.race([
+        reader.read().then((result) => (result.done ? 'CLOSED' : 'DATA')),
+        new Promise<string>((resolve) => setTimeout(() => resolve('TIMEOUT'), 1_500)),
+      ])
+    }
+
     expect(end).toBe('CLOSED')
   })
 })

@@ -1138,6 +1138,14 @@ export class InMemoryStore implements KnowledgeStore {
     }
   }
 
+  /** Exact raw-file view for hosts that already own this in-memory engine. This is
+   * intentionally not a KnowledgeStore method: it is the fake/storage accelerator twin
+   * of reading one file by path and reuses the export serializer byte-for-byte. */
+  rawFileAt(filePath: string): string | null {
+    const note = this.notes.find((candidate) => candidate.filePath === filePath)
+    return note ? this.fileBytesOf(note) : null
+  }
+
   /** Reconstruct a note's file bytes from the snapshot (#17 export). */
   private fileBytesOf(n: StoredNote): string {
     const body = stripTitleHeading(n.content, n.title)

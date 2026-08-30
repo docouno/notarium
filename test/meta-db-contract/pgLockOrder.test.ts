@@ -1126,8 +1126,18 @@ describePostgres('Postgres lock order', { timeout: SUITE_TIMEOUT_MS }, () => {
 
         return db.contextSets.addItem('set-1', { space: 'alpha', noteId: 'note-a' })
       })
-      await run('contextSets.reorderItems', () => db.contextSets.reorderItems('set-1', ['note-a']))
-      await run('contextSets.removeItem', () => db.contextSets.removeItem('set-1', 'note-a'))
+      await run('contextSets.addItems', () =>
+        db.contextSets.addItems('set-1', [
+          { space: 'alpha', noteId: 'note-a' },
+          { space: 'alpha', noteId: 'note-b' },
+        ]),
+      )
+      await run('contextSets.reorderItems', () =>
+        db.contextSets.reorderItems('set-1', [{ space: 'alpha', noteId: 'note-a' }]),
+      )
+      await run('contextSets.removeItem', () =>
+        db.contextSets.removeItem('set-1', { space: 'alpha', noteId: 'note-a' }),
+      )
       await run('scopePins.addPin', () =>
         db.scopePins.addPin({
           targetKind: 'project',

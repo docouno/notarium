@@ -32,6 +32,12 @@ import { EMPTY_PERSONAL, EMPTY_PROJECT } from './consts'
 import { ContextAside } from './ContextAside'
 import { AggregateBar } from './ContextMeters'
 import { AggregateBarSkeleton } from './ContextSkeletons'
+import {
+  buildContextMembershipIndex,
+  contextMembershipHasAny,
+  type ContextMembershipIndex,
+  contextSetIdsForNotes,
+} from './helpers/contextMembership'
 import { orderSetItemsIn, reRankByEntries } from './helpers/contextOrder'
 import { CONTEXT_ROLE_PARAM } from './helpers/contextScope'
 import { memoryState, memoryTrimmed, pinsTrimmed, setsTrimmed } from './helpers/contextTrim'
@@ -43,6 +49,7 @@ import { PinPicker } from './PinPicker'
 import { PinsBlock } from './PinsBlock'
 import type {
   ContextSetRowView,
+  ContextSetTailState,
   MemoryItem,
   ProjectScope,
   ScopeCard,
@@ -63,8 +70,8 @@ import styles from './ContextPage.module.scss'
 // curates the loaded/trimmed split (one shared scan with start_session), so the pult
 // shows EXACTLY what the agent loads — the web never re-derives the trim. Because a
 // scope is ONE budget, the scale can never read "budget still free, yet trimming".
-// Every note carries a weight meter (its share of the scope budget) so the fattest —
-// the ones worth trimming — stand out.
+// Every weighed preview note carries a meter (its share of the scope budget) so the
+// fattest stand out; page-only audit rows deliberately invent no weight.
 
 /** Resolution order, and therefore reading order: the role that would actually win
  *  in this context is listed first. */
@@ -93,9 +100,123 @@ const ROLE_INACTIVE_NOTICE: Record<RoleInactiveReason, string> = {
     'This role’s attachments no longer resolve, so a session refuses to raise it. What it loads is still yours to change.',
 }
 
+export const blockSetTailIn = (blocks: Map<string, number>, setId: string): void => {
+  blocks.set(setId, (blocks.get(setId) ?? 0) + 1)
+}
+
+export const unblockSetTailIn = (blocks: Map<string, number>, setId: string): boolean => {
+  const remaining = (blocks.get(setId) ?? 1) - 1
+
+  if (remaining > 0) {
+    blocks.set(setId, remaining)
+    return false
+  } else {
+    blocks.delete(setId)
+    return true
+  }
+}
+
+export const queueSetTailReorderIn = (pending: Map<string, number>, setId: string): void => {
+  pending.set(setId, (pending.get(setId) ?? 0) + 1)
+}
+
+export const flushSetTailReorders = async (
+  pending: Map<string, number>,
+  invalidate: (setId: string) => void,
+  load: () => Promise<void>,
+  unblock: (setId: string) => void,
+): Promise<void> => {
+  const batch = [...pending]
+  pending.clear()
+  batch.forEach(([setId]) => invalidate(setId))
+  try {
+    await load()
+  } finally {
+    for (const [setId, count] of batch) {
+      for (let index = 0; index < count; index += 1) {
+        unblock(setId)
+      }
+    }
+  }
+}
+
+export type ContextLoadOutcome = 'committed' | 'stale' | 'superseded'
+
+export const createContextCommitBarrier = () => {
+  let revision = 0
+  const waiters = new Set<{
+    after: number
+    resolve: () => void
+    reject: (error: unknown) => void
+  }>()
+
+  return {
+    publish: () => {
+      revision += 1
+      for (const waiter of [...waiters]) {
+        if (revision > waiter.after) {
+          waiters.delete(waiter)
+          waiter.resolve()
+        }
+      }
+    },
+    waitFor: (request: () => Promise<ContextLoadOutcome>) =>
+      new Promise<void>((resolve, reject) => {
+        const waiter = { after: revision, resolve, reject }
+
+        waiters.add(waiter)
+        void request()
+          .then((outcome) => {
+            if (outcome === 'stale') {
+              waiters.delete(waiter)
+              resolve()
+            }
+          })
+          .catch((error) => {
+            waiters.delete(waiter)
+            reject(error)
+          })
+      }),
+    cancel: () => {
+      for (const waiter of waiters) {
+        waiter.resolve()
+      }
+      waiters.clear()
+    },
+  }
+}
+
 /** One group, one tab, always — the route has a single panel, so nothing here depends
  *  on state and nothing is persisted. */
 const CONTEXT_ASIDE_LAYOUT: LayoutSpec = [{ panels: ['details'], activeTab: 'details' }]
+
+const contextNoteIdsOf = (...roots: unknown[]): Set<string> => {
+  const ids = new Set<string>()
+  const stack = [...roots]
+
+  while (stack.length > 0) {
+    const value = stack.pop()
+
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        stack.push(item)
+      }
+    } else if (value && typeof value === 'object') {
+      const record = value as Record<string, unknown>
+
+      if (typeof record.noteId === 'string') {
+        ids.add(record.noteId)
+      }
+      for (const child of Object.values(record)) {
+        if (child && typeof child === 'object') {
+          stack.push(child)
+        }
+      }
+    }
+  }
+
+  return ids
+}
 
 export const ContextPage = () => {
   const { space, spaces: allSpaces, personalSpace, reportNoteSpace, canWrite } = useSpace()
@@ -105,7 +226,13 @@ export const ContextPage = () => {
   const toast = useToast()
   const { confirm } = useDialog()
   const { scope: routeScope } = useParams()
-  const { subscribe } = useSync()
+  const {
+    accessRevision,
+    connectionRevision,
+    contextWatchRevision,
+    subscribeContext,
+    watchSpaces,
+  } = useSync()
   const { updateContext } = useAgentsSummary()
   const { setBreadcrumbTail } = useAgentsShell()
 
@@ -135,6 +262,28 @@ export const ContextPage = () => {
   // The caller's sets with their HOME space (#209) — feeds the picker's set selector and
   // resolves the home-space-scoped CRUD (item add/remove, delete); refreshed on mutation.
   const [allSets, setAllSets] = useState<ContextSet[]>([])
+  const tailMembershipIndexRef = useRef<ContextMembershipIndex>(new Map())
+  const [setTails, setSetTails] = useState<Record<string, ContextSetTailState>>({})
+  const [tailWake, setTailWake] = useState<Record<string, number>>({})
+  const setTailsRef = useRef(setTails)
+  const tailSeq = useRef(new Map<string, number>())
+  const blockedTailReloads = useRef(new Map<string, number>())
+  const pendingReorderTailBlocks = useRef(new Map<string, number>())
+  const liveLoadRef = useRef<() => Promise<ContextLoadOutcome>>(async () => 'stale')
+  const managerSeq = useRef(0)
+  const managerFreshRef = useRef(false)
+  const contextCommitBarrier = useRef(createContextCommitBarrier()).current
+  const observedTailSpaces = useRef(new Set<string>())
+  const previewTailSpaces = useRef(new Set<string>())
+  const pagedTailSpaces = useRef(new Map<string, Set<string>>())
+  const invalidatedTailSpaces = useRef(new Set<string>())
+  const watchSpaceByNote = useRef(new Map<string, string>())
+  const acceptedSetCursors = useRef(new Map<string, number>())
+  const [tailSpaceRevision, setTailSpaceRevision] = useState(0)
+  const seenAccessRevision = useRef(accessRevision)
+  const seenConnectionRevision = useRef(connectionRevision)
+  const seenContextWatchRevision = useRef(contextWatchRevision)
+  const relevantContextIdsRef = useRef(new Set<string>())
   // Which scope's panels the ONE scale is focused on (#208). Follows the route by
   // default (a project route focuses the project); a click on the Personal tab switches
   // inline — so the embedded personal background is inspectable without a stacked panel.
@@ -153,6 +302,169 @@ export const ContextPage = () => {
   // authoritative. Optimistic re-rank still happens synchronously, so the UI is instant.
   const reorderChain = useRef<Promise<void>>(Promise.resolve())
   const reorderSeq = useRef(0)
+
+  const spaceWatchKey = useCallback(
+    (slug: string, noteId: string) => {
+      const activeId =
+        (personalSpace?.slug === space || personalSpace?.aliases?.includes(space)
+          ? personalSpace.id
+          : undefined) ??
+        (allSpaces ?? []).find(
+          (candidate) => candidate.slug === space || candidate.aliases?.includes(space),
+        )?.id
+      const remembered = watchSpaceByNote.current.get(noteId)
+
+      // A note's already-observed stable owner outranks a stale slug carried by an
+      // older preview/page. Retired aliases may later become another space's current
+      // slug; resolving the spelling first would silently move the watch to that space.
+      if (remembered) {
+        return remembered === activeId ? null : remembered
+      }
+      if (slug === space) {
+        return null
+      }
+      const watched =
+        personalSpace?.slug === slug
+          ? personalSpace.id
+          : (allSpaces ?? []).find(
+              (candidate) => candidate.slug === slug || candidate.aliases?.includes(slug),
+            )?.id
+
+      if (watched) {
+        watchSpaceByNote.current.set(noteId, watched)
+      }
+
+      return watched ?? null
+    },
+    [allSpaces, personalSpace, space],
+  )
+  const publishTailSpaces = useCallback(() => {
+    const next = new Set(previewTailSpaces.current)
+
+    for (const spaces of pagedTailSpaces.current.values()) {
+      spaces.forEach((watched) => next.add(watched))
+    }
+    const current = [...observedTailSpaces.current].sort()
+    const replacement = [...next].sort().slice(0, 250)
+
+    if (
+      current.length !== replacement.length ||
+      current.some((watched, index) => watched !== replacement[index])
+    ) {
+      observedTailSpaces.current = new Set(replacement)
+      setTailSpaceRevision((revision) => revision + 1)
+    }
+  }, [])
+  const replacePreviewTailSpaces = useCallback(
+    (sets: readonly ContextSetRowView[]) => {
+      const next = new Set<string>()
+      const retainedSets = new Set<string>()
+
+      for (const set of sets) {
+        for (const item of set.items) {
+          if (item.space) {
+            const watched = spaceWatchKey(item.space, item.noteId)
+
+            if (watched) {
+              next.add(watched)
+            }
+          }
+        }
+        if (set.homeSpace && set.itemsTotal !== undefined) {
+          retainedSets.add(set.id)
+          if (invalidatedTailSpaces.current.delete(set.id)) {
+            pagedTailSpaces.current.delete(set.id)
+          }
+        }
+      }
+      previewTailSpaces.current = next
+      for (const setId of pagedTailSpaces.current.keys()) {
+        if (!retainedSets.has(setId)) {
+          pagedTailSpaces.current.delete(setId)
+        }
+      }
+      for (const setId of invalidatedTailSpaces.current) {
+        if (!retainedSets.has(setId)) {
+          invalidatedTailSpaces.current.delete(setId)
+        }
+      }
+      publishTailSpaces()
+    },
+    [publishTailSpaces, spaceWatchKey],
+  )
+  const observeTailPage = useCallback(
+    (
+      setId: string,
+      items: ReadonlyArray<{ noteId: string; space?: string | null }>,
+      reset: boolean,
+    ) => {
+      const next = reset ? new Set<string>() : new Set(pagedTailSpaces.current.get(setId) ?? [])
+
+      for (const item of items) {
+        if (item.space) {
+          const watched = spaceWatchKey(item.space, item.noteId)
+
+          if (watched) {
+            next.add(watched)
+          }
+        }
+      }
+      if (next.size > 0) {
+        pagedTailSpaces.current.set(setId, next)
+      } else {
+        pagedTailSpaces.current.delete(setId)
+      }
+      publishTailSpaces()
+    },
+    [publishTailSpaces, spaceWatchKey],
+  )
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      watchSpaces([...observedTailSpaces.current])
+    }, 50)
+
+    return () => clearTimeout(timer)
+  }, [space, tailSpaceRevision, watchSpaces])
+  useEffect(
+    () => () => {
+      watchSpaces([])
+    },
+    [watchSpaces],
+  )
+
+  useEffect(() => {
+    setTailsRef.current = setTails
+    tailMembershipIndexRef.current = buildContextMembershipIndex(
+      Object.entries(setTails).map(([id, tail]) => ({ id, items: tail.items })),
+    )
+  }, [setTails])
+  const invalidateSetTail = useCallback((setId: string, preserveWatch = false) => {
+    tailSeq.current.set(setId, (tailSeq.current.get(setId) ?? 0) + 1)
+    if (!preserveWatch) {
+      invalidatedTailSpaces.current.add(setId)
+    }
+    setSetTails((current) => {
+      const next = { ...current }
+      delete next[setId]
+      return next
+    })
+  }, [])
+  const invalidateAllTails = useCallback(() => {
+    for (const setId of Object.keys(setTailsRef.current)) {
+      tailSeq.current.set(setId, (tailSeq.current.get(setId) ?? 0) + 1)
+      invalidatedTailSpaces.current.add(setId)
+    }
+    setSetTails({})
+  }, [])
+  const blockSetTail = useCallback((setId: string) => {
+    blockSetTailIn(blockedTailReloads.current, setId)
+  }, [])
+  const unblockSetTail = useCallback((setId: string) => {
+    if (unblockSetTailIn(blockedTailReloads.current, setId)) {
+      setTailWake((current) => ({ ...current, [setId]: (current[setId] ?? 0) + 1 }))
+    }
+  }, [])
 
   const projectScope: ProjectScope | null = useMemo(() => {
     if (scope === 'personal') {
@@ -184,11 +496,20 @@ export const ContextPage = () => {
   // opened for A from saving into B after URL navigation.
   useEffect(() => {
     liveContextKey.current = requestContextKey
+    contextCommitBarrier.cancel()
+    observedTailSpaces.current.clear()
+    previewTailSpaces.current.clear()
+    pagedTailSpaces.current.clear()
+    invalidatedTailSpaces.current.clear()
+    watchSpaceByNote.current.clear()
+    acceptedSetCursors.current.clear()
+    setTailSpaceRevision((revision) => revision + 1)
     setPicker(null)
+    invalidateAllTails()
     setFailed((current) =>
       current.filter((item) => item !== 'personal context' && item !== 'project context'),
     )
-  }, [requestContextKey])
+  }, [requestContextKey, contextCommitBarrier, invalidateAllTails])
 
   // The scale defaults to the route's scope: a project route focuses the project band,
   // the personal route the (only) personal band. A reset here — keyed to the project
@@ -242,12 +563,58 @@ export const ContextPage = () => {
     }
   }, [scope, projects, projectsSpace, projectScope, space, reportNoteSpace, navigate, searchParams])
 
+  const reconcileSetTailAccess = useCallback(
+    (
+      sets: readonly ContextSetRowView[],
+      observedIdentitySets: readonly ContextSetRowView[] = [],
+    ) => {
+      const coordinateCursors = new Map(
+        sets.flatMap((set) =>
+          set.homeSpace && set.itemsTotal !== undefined
+            ? [[set.id, set.itemsCursor ?? 0] as const]
+            : [],
+        ),
+      )
+      const shifted = new Set<string>()
+
+      for (const [setId, cursor] of coordinateCursors) {
+        const previous = acceptedSetCursors.current.get(setId)
+
+        if (previous !== undefined && previous !== cursor) {
+          shifted.add(setId)
+          invalidatedTailSpaces.current.add(setId)
+        }
+      }
+      acceptedSetCursors.current = coordinateCursors
+      replacePreviewTailSpaces([...sets, ...observedIdentitySets])
+
+      setSetTails((current) => {
+        const stale = Object.keys(current).filter(
+          (setId) => !coordinateCursors.has(setId) || shifted.has(setId),
+        )
+
+        if (stale.length === 0) {
+          return current
+        }
+        const next = { ...current }
+
+        for (const setId of stale) {
+          tailSeq.current.set(setId, (tailSeq.current.get(setId) ?? 0) + 1)
+          delete next[setId]
+        }
+
+        return next
+      })
+    },
+    [replacePreviewTailSpaces],
+  )
+
   const load = useCallback(async () => {
     // A project deep-link renders before ProjectsProvider has resolved its slug. Do not
     // briefly treat that unresolved project route as Personal: that can flash a same-name
     // personal role preset, then remove it while the real project preview is loading.
     if (scope !== 'personal' && !projectScope) {
-      return
+      return 'stale' as const
     }
     // Bail on a stale scope BEFORE consuming a sequence number. A `load` re-fired from a
     // mute/pin finally captured the project it was created on; if the user has since
@@ -256,7 +623,7 @@ export const ContextPage = () => {
     const myContextKey = requestContextKey
 
     if (myContextKey !== liveContextKey.current) {
-      return
+      return 'stale' as const
     }
     const my = ++seq.current
     const fails: string[] = []
@@ -300,9 +667,17 @@ export const ContextPage = () => {
         askIdentity(),
       ])
 
-      if (my !== seq.current || myContextKey !== liveContextKey.current) {
-        return
+      if (myContextKey !== liveContextKey.current) {
+        return 'stale' as const
       }
+      if (my !== seq.current) {
+        return 'superseded' as const
+      }
+      reconcileSetTailAccess(
+        [...proj.sets, ...proj.personal.sets, ...(proj.role?.sets ?? [])],
+        identity.named?.role.sets ?? [],
+      )
+      relevantContextIdsRef.current = contextNoteIdsOf(proj, identity.named)
       setProject(proj)
       setProjectMemory(projMem)
       setPersonal(null)
@@ -310,7 +685,8 @@ export const ContextPage = () => {
       setRoleUnnamed(identity.unnamed)
       setLoadedContextKey(myContextKey)
       setFailed(fails)
-      return
+      contextCommitBarrier.publish()
+      return 'committed' as const
     }
     const [ctx, identity] = await Promise.all([
       api.meAgentContextGet(selectedRoleLocator || undefined).catch(() => {
@@ -320,9 +696,17 @@ export const ContextPage = () => {
       askIdentity(),
     ])
 
-    if (my !== seq.current || myContextKey !== liveContextKey.current) {
-      return
+    if (myContextKey !== liveContextKey.current) {
+      return 'stale' as const
     }
+    if (my !== seq.current) {
+      return 'superseded' as const
+    }
+    reconcileSetTailAccess(
+      [...ctx.sets, ...(ctx.role?.sets ?? [])],
+      identity.named?.role.sets ?? [],
+    )
+    relevantContextIdsRef.current = contextNoteIdsOf(ctx, identity.named)
     setPersonal(ctx)
     updateContext(ctx)
     setProject(null)
@@ -331,11 +715,26 @@ export const ContextPage = () => {
     setRoleUnnamed(identity.unnamed)
     setLoadedContextKey(myContextKey)
     setFailed(fails)
-  }, [scope, space, projectScope, selectedRoleLocator, requestContextKey, updateContext])
+    contextCommitBarrier.publish()
+    return 'committed' as const
+  }, [
+    scope,
+    space,
+    projectScope,
+    selectedRoleLocator,
+    requestContextKey,
+    updateContext,
+    contextCommitBarrier,
+    reconcileSetTailAccess,
+  ])
 
   useEffect(() => {
     void load()
   }, [load])
+  useEffect(() => {
+    liveLoadRef.current = load
+  }, [load])
+  useEffect(() => () => contextCommitBarrier.cancel(), [contextCommitBarrier])
 
   // Pinned notes carry only id+title — fetch their previews so a pin card shows a
   // DESCRIPTION (collapsed) and its meta (tags · reading length) on expand, not a
@@ -392,13 +791,50 @@ export const ContextPage = () => {
   // Live freshness: the active space's SSE stream covers project changes; coalesce.
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | null = null
-    const unsub = subscribe((event) => {
-      if (event.type !== STORE_EVENT.CHANGED || timer) {
+    const changedIds = new Set<string>()
+    const unsub = subscribeContext((event, sourceSpace) => {
+      if (event.type !== STORE_EVENT.CHANGED) {
+        return
+      }
+      const eventIds = [...event.upserts, ...event.removed]
+      const touchesVisibleTail = contextMembershipHasAny(tailMembershipIndexRef.current, eventIds)
+      const hasLoadingTail = Object.values(setTailsRef.current).some((tail) => tail.loading)
+
+      if (
+        sourceSpace &&
+        managerFreshRef.current &&
+        !eventIds.some((noteId) => relevantContextIdsRef.current.has(noteId)) &&
+        !touchesVisibleTail &&
+        !hasLoadingTail
+      ) {
+        return
+      }
+      for (const noteId of eventIds) {
+        changedIds.add(noteId)
+      }
+      if (timer) {
         return
       }
       timer = setTimeout(() => {
         timer = null
-        void load()
+        const changed = new Set(changedIds)
+        changedIds.clear()
+        const cachedSetIds = Object.keys(setTailsRef.current)
+        const changedSetIds = contextSetIdsForNotes(
+          tailMembershipIndexRef.current,
+          changed,
+          new Set(cachedSetIds),
+        )
+        const affected = managerFreshRef.current
+          ? cachedSetIds.filter(
+              (setId) => changedSetIds.has(setId) || setTailsRef.current[setId]?.loading,
+            )
+          : cachedSetIds
+        affected.forEach(blockSetTail)
+        affected.forEach((setId) => invalidateSetTail(setId))
+        void contextCommitBarrier.waitFor(liveLoadRef.current).finally(() => {
+          affected.forEach(unblockSetTail)
+        })
       }, CHANGED_COALESCE_MS)
     })
 
@@ -406,9 +842,10 @@ export const ContextPage = () => {
       if (timer) {
         clearTimeout(timer)
       }
+      changedIds.clear()
       unsub()
     }
-  }, [subscribe, load])
+  }, [subscribeContext, contextCommitBarrier, invalidateSetTail, blockSetTail, unblockSetTail])
 
   // Mute is id-addressed server-side (#207): flip `muted` optimistically wherever the
   // note lives (personal scope, the project's embedded personal, or the project audit),
@@ -437,18 +874,167 @@ export const ContextPage = () => {
   )
 
   // The caller's sets (with home space, #209) — refreshed on mount + every mutation.
-  const reloadSets = useCallback(() => {
-    void api
-      .contextSetsGet()
-      .then(setAllSets)
-      .catch(() => {})
+  const reloadSets = useCallback(async () => {
+    const my = ++managerSeq.current
+    managerFreshRef.current = false
+
+    try {
+      const sets = await api.contextSetsGet()
+
+      if (my === managerSeq.current) {
+        setAllSets(sets)
+        managerFreshRef.current = true
+      }
+    } catch {
+      // The preview remains usable with the last committed manager snapshot.
+    }
   }, [])
   useEffect(() => {
-    reloadSets()
+    void reloadSets()
   }, [reloadSets])
+
+  const refreshAllTailTruth = useCallback(
+    async (hidePreview: boolean, preserveTailWatches = false) => {
+      const affected = Object.keys(setTailsRef.current)
+
+      affected.forEach(blockSetTail)
+      affected.forEach((setId) => invalidateSetTail(setId, preserveTailWatches))
+      if (hidePreview) {
+        setLoadedContextKey(null)
+      }
+      void reloadSets()
+      try {
+        await contextCommitBarrier.waitFor(liveLoadRef.current)
+      } finally {
+        affected.forEach(unblockSetTail)
+      }
+    },
+    [blockSetTail, contextCommitBarrier, invalidateSetTail, reloadSets, unblockSetTail],
+  )
+  useEffect(() => {
+    if (seenConnectionRevision.current === connectionRevision) {
+      return
+    }
+    seenConnectionRevision.current = connectionRevision
+    void refreshAllTailTruth(false)
+  }, [connectionRevision, refreshAllTailTruth])
+  useEffect(() => {
+    if (seenContextWatchRevision.current === contextWatchRevision) {
+      return
+    }
+    seenContextWatchRevision.current = contextWatchRevision
+    // This reload closes snapshot→subscription loss. Preserve the page bus that
+    // caused the expansion until its replacement page arrives; contracting it here
+    // creates expansion→reset→contraction feedback under ordinary latency.
+    void refreshAllTailTruth(false, true)
+  }, [contextWatchRevision, refreshAllTailTruth])
+  useEffect(() => {
+    if (seenAccessRevision.current === accessRevision) {
+      return
+    }
+    seenAccessRevision.current = accessRevision
+    observedTailSpaces.current.clear()
+    previewTailSpaces.current.clear()
+    pagedTailSpaces.current.clear()
+    invalidatedTailSpaces.current.clear()
+    watchSpaceByNote.current.clear()
+    setPicker(null)
+    setTailSpaceRevision((revision) => revision + 1)
+    void refreshAllTailTruth(true)
+  }, [accessRevision, refreshAllTailTruth])
   const homeSpaceOf = useCallback(
     (setId: string) => allSets.find((s) => s.id === setId)?.homeSpace,
     [allSets],
+  )
+  const loadSetTail = useCallback(
+    (set: ContextSetRowView, reset = false) => {
+      if (
+        !set.homeSpace ||
+        set.itemsTotal === undefined ||
+        blockedTailReloads.current.has(set.id)
+      ) {
+        return
+      }
+      const current = setTailsRef.current[set.id]
+      const offset = reset ? (set.itemsCursor ?? 0) : (current?.nextOffset ?? set.itemsCursor ?? 0)
+      const request = (tailSeq.current.get(set.id) ?? 0) + 1
+      tailSeq.current.set(set.id, request)
+      setSetTails((tails) => ({
+        ...tails,
+        [set.id]: {
+          items: reset ? [] : (tails[set.id]?.items ?? []),
+          total: set.itemsTotal!,
+          nextOffset: offset,
+          loading: true,
+        },
+      }))
+      void api
+        .contextSetItemsGet(set.homeSpace, set.id, offset, 50)
+        .then((page) => {
+          if (tailSeq.current.get(set.id) !== request) {
+            return
+          }
+          observeTailPage(set.id, page.items, reset)
+          setSetTails((tails) => {
+            const previous = reset ? [] : (tails[set.id]?.items ?? [])
+            const byIndex = new Map(previous.map((item) => [item.sourceIndex, item]))
+
+            for (const item of page.items) {
+              byIndex.set(item.sourceIndex, item)
+            }
+
+            return {
+              ...tails,
+              [set.id]: {
+                items: [...byIndex.values()].sort(
+                  (left, right) => left.sourceIndex - right.sourceIndex,
+                ),
+                total: page.total,
+                nextOffset: page.items.length === 0 ? page.total : offset + page.items.length,
+                loading: false,
+              },
+            }
+          })
+        })
+        .catch(() => {
+          if (tailSeq.current.get(set.id) !== request) {
+            return
+          }
+          if (reset) {
+            // Expansion reconciliation retained this page's bus only while fresh
+            // truth was in flight. A failed replacement displays no cached row, so
+            // release the obsolete owner instead of watching it indefinitely.
+            pagedTailSpaces.current.delete(set.id)
+            publishTailSpaces()
+          }
+          setSetTails((tails) => ({
+            ...tails,
+            [set.id]: {
+              ...(tails[set.id] ?? {
+                items: [],
+                total: set.itemsTotal!,
+                nextOffset: offset,
+                loading: false,
+              }),
+              loading: false,
+              error: true,
+            },
+          }))
+        })
+    },
+    [observeTailPage, publishTailSpaces],
+  )
+  const refreshMembership = useCallback(
+    async (setId: string) => {
+      blockSetTail(setId)
+      invalidateSetTail(setId)
+      try {
+        await contextCommitBarrier.waitFor(load)
+      } finally {
+        unblockSetTail(setId)
+      }
+    },
+    [blockSetTail, contextCommitBarrier, invalidateSetTail, load, unblockSetTail],
   )
 
   // The ACTIVE scope decides where a set attaches + where a NEW set is homed.
@@ -608,6 +1194,8 @@ export const ContextPage = () => {
   // Save a set (the picker's Set mode): create-or-reuse, add the cross-space items, attach here.
   const saveSet = async ({ setId, name, items, home: homeIn }: SetSave) => {
     setPicker(null)
+    let savedSetId = setId
+
     try {
       let id = setId
       // Existing set: address its own home (carried from the view/allSets), never fall back
@@ -617,21 +1205,17 @@ export const ContextPage = () => {
       if (!id) {
         const created = await api.contextSetCreate(scopeHomeSpace, name)
         id = created.id
+        savedSetId = id
         home = created.homeSpace
       }
       // Attach FIRST so even a partial membership yields a VISIBLE, completable set — never
       // an invisible orphan the user believes failed and re-creates. Then add items
       // best-effort: one deleted/unreachable note can't abort the whole batch (#209 review).
       await attachToScope(id)
-      let failedCount = 0
+      const result =
+        items.length > 0 ? await api.contextSetItemsAdd(home, id, items) : { failed: [] }
+      const failedCount = result.failed.length
 
-      for (const it of items) {
-        try {
-          await api.contextSetItemAdd(home, id, it.space, it.noteId)
-        } catch {
-          failedCount++
-        }
-      }
       if (failedCount > 0) {
         toast.error(
           `Added the set, but ${failedCount} of ${items.length} note${items.length === 1 ? '' : 's'} couldn’t be added.`,
@@ -640,8 +1224,12 @@ export const ContextPage = () => {
     } catch {
       toast.error('Couldn’t save the set.')
     } finally {
-      reloadSets()
-      void load()
+      void reloadSets()
+      if (savedSetId) {
+        await refreshMembership(savedSetId)
+      } else {
+        await load()
+      }
     }
   }
 
@@ -657,8 +1245,8 @@ export const ContextPage = () => {
     } catch {
       toast.error('Couldn’t detach the set.')
     } finally {
-      reloadSets()
-      void load()
+      void reloadSets()
+      await refreshMembership(set.id)
     }
   }
 
@@ -685,7 +1273,8 @@ export const ContextPage = () => {
     } catch {
       toast.error('Couldn’t delete the set.')
     } finally {
-      reloadSets()
+      invalidateSetTail(set.id)
+      void reloadSets()
       void load()
     }
   }
@@ -696,8 +1285,8 @@ export const ContextPage = () => {
     } catch {
       toast.error('Couldn’t remove the note.')
     } finally {
-      reloadSets()
-      void load()
+      void reloadSets()
+      await refreshMembership(set.id)
     }
   }
 
@@ -711,8 +1300,14 @@ export const ContextPage = () => {
     write: () => Promise<unknown>,
     errMsg: string,
     alsoReloadSets = false,
+    tailSetId?: string,
   ): void => {
     const mySeq = ++reorderSeq.current
+
+    if (tailSetId) {
+      blockSetTail(tailSetId)
+      queueSetTailReorderIn(pendingReorderTailBlocks.current, tailSetId)
+    }
     reorderChain.current = reorderChain.current
       .catch(() => {})
       .then(async () => {
@@ -722,10 +1317,15 @@ export const ContextPage = () => {
           toast.error(errMsg)
         }
         if (mySeq === reorderSeq.current) {
-          if (alsoReloadSets) {
-            reloadSets()
+          if (alsoReloadSets || pendingReorderTailBlocks.current.size > 0) {
+            void reloadSets()
           }
-          await load()
+          await flushSetTailReorders(
+            pendingReorderTailBlocks.current,
+            invalidateSetTail,
+            () => contextCommitBarrier.waitFor(load),
+            unblockSetTail,
+          )
         }
       })
   }
@@ -770,9 +1370,9 @@ export const ContextPage = () => {
     )
   }
 
-  // Reorder the ITEMS inside a set (#210) — a home-space write, so it addresses the set's real
-  // home. Optimistic on every list that may show this set (personal + the project's embedded
-  // personal + project sets).
+  // Reorder the ITEMS inside a set (#210) — a home-space write, so it addresses the set's
+  // real home. The merged preview+page list keeps one temporary visible order until the
+  // successful reset/reload establishes new authoritative source coordinates.
   const reorderSetItems = (set: ContextSetRowView, noteIds: string[]) => {
     const reorder = <I extends { noteId: string }, S extends { id: string; items: I[] }>(
       sets: S[],
@@ -788,10 +1388,26 @@ export const ContextPage = () => {
         : p,
     )
     setRoleIdentity((r) => (r ? { ...r, role: { ...r.role, sets: reorder(r.role.sets) } } : r))
+    tailSeq.current.set(set.id, (tailSeq.current.get(set.id) ?? 0) + 1)
+    if (set.itemsTotal !== undefined) {
+      setSetTails((current) => ({
+        ...current,
+        [set.id]: {
+          ...(current[set.id] ?? {
+            items: [],
+            total: set.itemsTotal!,
+            nextOffset: set.itemsCursor ?? 0,
+            loading: false,
+          }),
+          optimisticOrder: noteIds,
+        },
+      }))
+    }
     serializeReorder(
       () => api.contextSetItemsOrder(set.homeSpace, set.id, noteIds),
       'Couldn’t reorder the set.',
       true,
+      set.id,
     )
   }
 
@@ -1033,6 +1649,9 @@ export const ContextPage = () => {
     onDeleteSet: deleteSet,
     onRemoveItem: removeSetItem,
     onReorderSetItems: reorderSetItems,
+    tails: setTails,
+    tailWake,
+    onLoadSetTail: loadSetTail,
   }
 
   const profileSection = (

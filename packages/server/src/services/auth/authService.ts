@@ -89,6 +89,8 @@ export type SseHandle = {
   principalId: string
   username: string | null
   space: string
+  /** Active space plus every supplemental store bus owned by this socket. */
+  spaces?: ReadonlySet<string>
   close: () => void
   notify: () => void
   notifyMembers: () => void

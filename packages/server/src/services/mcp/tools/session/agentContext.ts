@@ -97,8 +97,7 @@ export const curateAgentContext = async (
   const personalOrder = personal
     ? await weighScopeOrder(dependencies, { kind: CONTEXT_KIND.personal, id: personal })
     : []
-  const setsTrimmed = (sets: CuratedSet[]) =>
-    sets.some((set) => set.items.some((item) => !item.loaded))
+  const setsTrimmed = (sets: CuratedSet[]) => sets.some((set) => set.itemsLoaded < set.itemsTotal)
   // A System role is not placed, so it owns no context sets, pins or order: the
   // role-scoped layer is an Owned-placement question and simply has no System answer.
   const roleScope =
@@ -106,7 +105,7 @@ export const curateAgentContext = async (
       ? await weighRoleContext(dependencies, ctx.principal, activeRole)
       : undefined
   const roleContextFrom = (
-    role: NonNullable<ReturnType<typeof curatePersonalScope>['role']>,
+    role: NonNullable<Awaited<ReturnType<typeof curatePersonalScope>>['role']>,
   ): NonNullable<UseRoleOutput['context']> => ({
     alwaysLoad: loadedContextNotes(role.pins, role.sets).map((note) => ({
       ...note,
@@ -116,7 +115,7 @@ export const curateAgentContext = async (
   })
 
   if (!hinted) {
-    const curated = curatePersonalScope(
+    const curated = await curatePersonalScope(
       personalPins,
       personalSets,
       personalMemory,
@@ -153,7 +152,7 @@ export const curateAgentContext = async (
     kind: CONTEXT_KIND.project,
     id: hinted.id,
   })
-  const curated = curateProjectScope(
+  const curated = await curateProjectScope(
     projectPins,
     projectSets,
     personalPins,

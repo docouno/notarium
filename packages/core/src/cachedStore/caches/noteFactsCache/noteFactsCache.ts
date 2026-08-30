@@ -10,12 +10,14 @@ const factsOf = (
   title: string,
   content: string,
   frontmatter: Record<string, unknown>,
+  noteClass?: NoteContent['class'],
 ): NoteFacts => ({
   title,
   summary: typeof frontmatter.summary === 'string' ? frontmatter.summary : null,
   snippet: makeSnippet(content, 160),
   muted: frontmatter.muted === true || frontmatter.muted === 'true',
   bodyTokens: estimateTokens(content),
+  ...(noteClass ? { noteClass } : {}),
 })
 
 /** Whole-population cache of tiny body facts. It intentionally stores no body and
@@ -42,7 +44,12 @@ export class NoteFactsCache {
   setFromNote(id: string, note: NoteContent): void {
     this.set(
       id,
-      factsOf(note.title ?? this.getMeta(id)?.title ?? '', note.content, note.frontmatter),
+      factsOf(
+        note.title ?? this.getMeta(id)?.title ?? '',
+        note.content,
+        note.frontmatter,
+        note.class,
+      ),
     )
   }
 
@@ -63,7 +70,7 @@ export class NoteFactsCache {
     if (!projection) {
       return false
     }
-    this.set(id, factsOf(projection.title, projection.body, projection.frontmatter))
+    this.set(id, factsOf(projection.title, projection.body, projection.frontmatter, meta.class))
     return true
   }
 

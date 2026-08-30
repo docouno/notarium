@@ -127,7 +127,7 @@ write PAT.
 - **CAS on writes.** A `versionToken` supplied to `edit_note` must come from a fresh `get_note`; a concurrent edit → `versionConflict`. Omitting it means the tool reads and writes under its own fresh token, never a write without CAS.
 - **Personal domain ⟂ project.** The agent's memory — about the user (`remember_about_user`) and about a project (`remember_about_project`) — always lands in agent-memory (hidden from discovery, visible to the user in a separate section). Shared knowledge (`create_note`) goes to the named project (class `user-doc`). The agent does not decide "where" — the tool does.
 - **Memory = one file per category = just a note.** `remember_about_user(observation, category)` appends to the category's file; `category` is a label ("preferences"), **not a path**. `summary` feeds the derived profile index. To correct/delete a single recorded fact — `edit_note` by `noteId` (which `remember_*` returns): `findReplace` of the fact's text (an empty `content` to remove) or `replace` of the whole category. There is **no** separate "observation addressing" by id — memory is edited with the same word-based modes as any note (#102 phase 3).
-- **Honest truncation.** Bundles (`start_session`, `recall`) under a budget set `truncated:true` — top up via `search`/`get_note`.
+- **Honest truncation.** Bundles (`start_session`, `recall`) set `truncated:true` when a token budget, a curation safety cap, or an unresolved/inaccessible context-set member leaves authored context undelivered. `search`/`get_note` can top up budget truncation, but a set tail is audited through its paginated human context-set door; the boolean intentionally reveals no denominator or hidden coordinate.
 
 ## Agent episodes <a id="agent-sessions"></a>
 

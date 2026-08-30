@@ -4,9 +4,9 @@ export type SyncRevisions = {
   agentSessionsRevision: number
 }
 
-/** EventSource reconnects reuse the same object, so `open` — not construction —
- * advances the render signal, synchronous request epoch and owner-global
- * projections whose named events may have been missed while disconnected. */
+/** EventSource reconnects reuse the same object. The server's `ready` marker — not
+ * construction or browser `open` — advances the render signal, synchronous request
+ * epoch and owner-global projections whose named events may have been missed. */
 export const advanceConnectionRevisions = (current: SyncRevisions): SyncRevisions => ({
   connectionRevision: current.connectionRevision + 1,
   observationEpoch: current.observationEpoch + 1,

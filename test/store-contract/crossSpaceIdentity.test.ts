@@ -32,7 +32,11 @@ import type { Principal } from '../../packages/server/src/services/authz'
 import { SqliteMetaDb } from '../../packages/server/src/services/metaDb/sqliteMetaDb'
 import { SpaceManager } from '../../packages/server/src/services/spaces'
 import type { SpaceStore } from '../../packages/server/src/services/spaces'
-import { createStoreAccess, readNoteAccess } from '../../packages/server/src/services/storeAccess'
+import {
+  canonicalMetaNoteAccessMany,
+  createStoreAccess,
+  readNoteAccess,
+} from '../../packages/server/src/services/storeAccess'
 import { withFacets } from './fileStoreAssembly'
 
 const SHARED_ID = 'shared-note1'
@@ -227,6 +231,103 @@ describe('cross-space note-id collision (#327)', () => {
       upserts: expect.arrayContaining([durableId]),
       removed: expect.arrayContaining([provisionalId]),
     })
+  })
+
+  it('resolves a durable settlement successor in one exact batch after a fresh store boot', async () => {
+    const { meta, space } = world()
+    const retiredId = 'retired-id01'
+    const successorId = 'successor001'
+    const ordinaryTombstoneId = 'ordinary0001'
+    const at = '2026-06-11T12:00:00.000Z'
+    const retired = {
+      id: retiredId,
+      legacyNameAliases: [],
+      filePath: 'note.md',
+      space: 'alpha',
+      createdAt: '2026-06-10T00:00:00.000Z',
+      materialized: true,
+      deletedAt: null,
+    }
+
+    await meta.identity.init()
+    await meta.spaces.upsert({
+      id: 'alpha',
+      slug: 'alpha',
+      displayName: 'Alpha',
+      notesDir: 'alpha',
+      aliases: [],
+      createdAt: '2026-06-10T00:00:00.000Z',
+      archivedAt: null,
+      archivedBy: null,
+    })
+    await meta.identity.claimMany([
+      retired,
+      {
+        ...retired,
+        id: ordinaryTombstoneId,
+        filePath: 'ordinary.md',
+        deletedAt: at,
+      },
+    ])
+    await meta.identity.settleFileClaim({
+      space: 'alpha',
+      filePath: retired.filePath,
+      current: retired,
+      observedId: successorId,
+      at,
+    })
+
+    const alpha = space('alpha')
+
+    write(alpha.dir, retired.filePath, noteWith(successorId, 'Successor', 'live body'))
+    const spaces = new SpaceManager({
+      spaces: [{ slug: 'alpha', displayName: 'Alpha' }],
+      createStore: () => alpha.store as unknown as SpaceStore,
+      metaDb: meta,
+    })
+
+    await spaces.init()
+    const access = createStoreAccess(spaces)
+    const principal: Principal = {
+      id: 'user:alpha',
+      username: 'alpha',
+      admin: false,
+      scope: 'read',
+      grants: new Map([['alpha', 'reader']]),
+      spaces: new Set(['alpha']),
+      system: false,
+    }
+    const identities = await spaces.resolveNotes([retiredId, successorId, ordinaryTombstoneId])
+
+    expect(identities.get(retiredId)).toMatchObject({
+      id: successorId,
+      space: 'alpha',
+      deletedAt: null,
+    })
+    expect(identities.get(successorId)).toMatchObject({ id: successorId, space: 'alpha' })
+    await expect(spaces.store('alpha')).resolves.toBe(alpha.store)
+    await expect(alpha.store.read(successorId)).resolves.toMatchObject({
+      id: successorId,
+      content: expect.stringContaining('live body'),
+    })
+    const storeHits = await access.noteStores!(
+      principal,
+      [retiredId, successorId, ordinaryTombstoneId],
+      'note:read',
+    )
+
+    expect(storeHits.get(retiredId)).toMatchObject({ noteId: successorId, deletedAt: null })
+    expect(storeHits.get(successorId)).toMatchObject({ noteId: successorId, deletedAt: null })
+    const resolved = await canonicalMetaNoteAccessMany(
+      access,
+      principal,
+      [retiredId, successorId, ordinaryTombstoneId],
+      'note:read',
+    )
+
+    expect(resolved.get(retiredId)).toMatchObject({ space: 'alpha', noteId: successorId })
+    expect(resolved.get(successorId)).toMatchObject({ space: 'alpha', noteId: successorId })
+    expect(resolved.has(ordinaryTombstoneId)).toBe(false)
   })
 
   it('proves the loser’s index row against its rewritten bytes, then goes quiet', async () => {

@@ -21,6 +21,7 @@ import {
   resolveContextSets,
   resolveScopePins,
   type ScopeOrder,
+  type ScopeSetRefs,
   type SpaceManager,
   spaceNotFound,
   type SpaceStore,
@@ -29,7 +30,13 @@ import {
 } from '../spaces'
 
 /** A note's resolved, access-checked store and its registry-assigned space id. */
-export type NoteAccess = { store: SpaceStore; space: string }
+export type NoteAccess = {
+  store: SpaceStore
+  space: string
+  noteId?: string
+  filePath?: string
+  deletedAt?: string | null
+}
 
 /** A live note resolved through the registry and then re-read from its owning store.
  *  `noteId` is the authoritative identity returned by the read-model; during a cold
@@ -49,6 +56,13 @@ export type StoreAccess = {
    *  unknown id / foreign space / no store, all mapped to one typed 404. Tombstones
    *  resolve; the read path decides what a deleted note answers. */
   noteStore(principal: Principal, id: string, action: Action): Promise<NoteAccess | null>
+  /** Exact multi-id lookup. Optional for narrow test/fake ports; production batches
+   * identity rows and boots each owning store once. */
+  noteStores?(
+    principal: Principal,
+    ids: readonly string[],
+    action: Action,
+  ): Promise<Map<string, NoteAccess>>
 }
 
 /** Bind the resolvers to a space layer once per app. */
@@ -73,7 +87,59 @@ export const createStoreAccess = (spaces: SpaceManager): StoreAccess => ({
       return null
     }
 
-    return { store: await spaces.store(resolved.space), space: resolved.space }
+    let store: SpaceStore
+
+    try {
+      store = await spaces.store(resolved.space)
+    } catch (error) {
+      if ((error as { isNotFound?: boolean }).isNotFound) {
+        return null
+      }
+      throw error
+    }
+
+    return {
+      store,
+      space: resolved.space,
+      noteId: resolved.id,
+      filePath: resolved.filePath,
+      deletedAt: resolved.deletedAt,
+    }
+  },
+  noteStores: async (principal, ids, action) => {
+    const resolved = await spaces.resolveNotes(ids)
+    const stores = new Map<string, Promise<SpaceStore | null>>()
+    const result = new Map<string, NoteAccess>()
+
+    for (const [requestedId, note] of resolved) {
+      if (!can(principal, action, { space: note.space })) {
+        continue
+      }
+      let store = stores.get(note.space)
+
+      if (!store) {
+        store = spaces.store(note.space).catch((error) => {
+          if ((error as { isNotFound?: boolean }).isNotFound) {
+            return null
+          }
+          throw error
+        })
+        stores.set(note.space, store)
+      }
+      const liveStore = await store
+
+      if (liveStore) {
+        result.set(requestedId, {
+          store: liveStore,
+          space: note.space,
+          noteId: note.id,
+          filePath: note.filePath,
+          deletedAt: note.deletedAt,
+        })
+      }
+    }
+
+    return result
   },
 })
 
@@ -95,7 +161,7 @@ export const readNoteAccess = async (
   let note: Awaited<ReturnType<typeof hit.store.read>>
 
   try {
-    note = await hit.store.read(id)
+    note = await hit.store.read(hit.noteId ?? id)
   } catch (error) {
     if ((error as { isNotFound?: boolean }).isNotFound) {
       return null
@@ -141,6 +207,67 @@ export const metaNoteAccess = async (
   return meta ? { ...hit, noteId: meta.id ?? id, meta } : null
 }
 
+/** Resolve authoritative identity and access through the exact registry row without
+ * snapshotting the owning store or opening the note body. */
+export const canonicalMetaNoteAccess = async (
+  access: StoreAccess,
+  principal: Principal,
+  id: string,
+  action: Action,
+): Promise<(NoteAccess & { noteId: string }) | null> => {
+  const hit = await access.noteStore(principal, id, action)
+
+  if (!hit) {
+    return null
+  }
+  if (hit.deletedAt) {
+    const live = await readNoteAccess(access, principal, id, action)
+
+    return live ? { store: live.store, space: live.space, noteId: live.noteId } : null
+  }
+
+  return { ...hit, noteId: hit.noteId ?? id }
+}
+
+/** Batch twin for bulk doors. Exact live rows stay body-free; only tombstones pay
+ * their bounded successor read fallback. The result keys are caller-requested ids. */
+export const canonicalMetaNoteAccessMany = async (
+  access: StoreAccess,
+  principal: Principal,
+  ids: readonly string[],
+  action: Action,
+): Promise<Map<string, NoteAccess & { noteId: string }>> => {
+  let hits: Map<string, NoteAccess>
+
+  if (access.noteStores) {
+    hits = await access.noteStores(principal, ids, action)
+  } else {
+    hits = new Map()
+    for (const id of new Set(ids)) {
+      const hit = await access.noteStore(principal, id, action)
+
+      if (hit) {
+        hits.set(id, hit)
+      }
+    }
+  }
+  const result = new Map<string, NoteAccess & { noteId: string }>()
+
+  for (const [requestedId, hit] of hits) {
+    if (hit.deletedAt) {
+      const live = await readNoteAccess(access, principal, requestedId, action)
+
+      if (live) {
+        result.set(requestedId, { store: live.store, space: live.space, noteId: live.noteId })
+      }
+    } else {
+      result.set(requestedId, { ...hit, noteId: hit.noteId ?? requestedId })
+    }
+  }
+
+  return result
+}
+
 /** Deps for a scope-curation resolve; the cross-space registries are absent on a
  *  meta-DB-less host. */
 type ScopeResolveDeps = {
@@ -159,23 +286,27 @@ type ScopeResolveDeps = {
  *  and the agent bundle drop the exact same refs (P5).
  *  canon: docs/architecture.md#p5 */
 const scopeNoteReader = (deps: ScopeResolveDeps, principal: Principal) => {
-  const inventories = new Map<SpaceStore, Promise<Map<string, NoteMeta>>>()
-
   return async (noteId: string) => {
-    const metaHit = await metaNoteAccess(deps.store, principal, noteId, 'note:read', inventories)
+    const access = await deps.store.noteStore(principal, noteId, 'note:read')
 
-    if (metaHit && (!deps.noteClassAllowed || deps.noteClassAllowed(metaHit.meta.class))) {
-      const fact = metaHit.store.noteFacts
-        ? (await metaHit.store.noteFacts([metaHit.noteId]))[metaHit.noteId]
+    if (access && access.deletedAt == null) {
+      const canonicalId = access.noteId ?? noteId
+      const fact = access.store.noteFacts
+        ? (await access.store.noteFacts([canonicalId]))[canonicalId]
         : undefined
 
-      if (fact) {
+      if (
+        fact &&
+        access.filePath !== undefined &&
+        (!deps.noteClassAllowed ||
+          (fact.noteClass !== undefined && deps.noteClassAllowed(fact.noteClass)))
+      ) {
         return {
-          noteId: metaHit.noteId,
+          noteId: canonicalId,
           tokens: fact.bodyTokens,
           title: fact.title,
-          spaceSlug: deps.spaces.slugOf(metaHit.space) ?? metaHit.space,
-          filePath: metaHit.meta.filePath,
+          spaceSlug: deps.spaces.slugOf(access.space) ?? access.space,
+          filePath: access.filePath,
         }
       }
     }
@@ -202,7 +333,7 @@ export const weighScopeContextSets = async (
   deps: ScopeResolveDeps,
   principal: Principal,
   target: { kind: ContextSetTargetKind; id: string },
-): Promise<WeighedSet[]> => {
+): Promise<ScopeSetRefs[]> => {
   if (!deps.contextSets) {
     return []
   }
@@ -211,15 +342,39 @@ export const weighScopeContextSets = async (
   if (sets.length === 0) {
     return []
   }
+  const read = scopeNoteReader(deps, principal)
+  return sets.map((set) => {
+    const coordinatesVisible = can(principal, 'space:read', { space: set.homeSpace })
+
+    return {
+      id: set.id,
+      name: set.name,
+      homeSpace: coordinatesVisible ? (deps.spaces.slugOf(set.homeSpace) ?? set.homeSpace) : '',
+      items: set.items,
+      read,
+      coordinatesVisible,
+    }
+  })
+}
+
+/** The unbudgeted role-identity editor keeps the historical full projection. It is
+ * deliberately separate from the lazy budget producer above so pagination/counters do
+ * not leak into the identity wire. */
+export const resolveScopeContextSets = async (
+  deps: ScopeResolveDeps,
+  principal: Principal,
+  target: { kind: ContextSetTargetKind; id: string },
+): Promise<WeighedSet[]> => {
+  if (!deps.contextSets) {
+    return []
+  }
+  const sets = await deps.contextSets.setsForTarget(target.kind, target.id)
   const resolved = await resolveContextSets(sets, scopeNoteReader(deps, principal))
-  // homeSpace is emitted as the SLUG (web CRUD addresses the set through /api/s/:space,
-  // which resolves slugs only; the record stores the opaque id — id!=slug on a meta-DB host).
-  // SECURITY: blank it for a reader who can't space:read the home space rather than disclose
-  // a space they aren't in (the set row still shows its name + reachable items).
-  return resolved.map((s) => ({
-    ...s,
-    homeSpace: can(principal, 'space:read', { space: s.homeSpace })
-      ? (deps.spaces.slugOf(s.homeSpace) ?? s.homeSpace)
+
+  return resolved.map((set) => ({
+    ...set,
+    homeSpace: can(principal, 'space:read', { space: set.homeSpace })
+      ? (deps.spaces.slugOf(set.homeSpace) ?? set.homeSpace)
       : '',
   }))
 }

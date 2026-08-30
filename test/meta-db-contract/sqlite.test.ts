@@ -11,6 +11,8 @@ import { describeAbilityPreferencesContract } from './abilityPreferencesContract
 import { describeAgentDeltaCursorsContract } from './agentDeltaCursorsContract'
 import { describeAgentSessionsContract } from './agentSessionsContract'
 import { describeCausalMetadataContract } from './causalMetadataContract'
+import { describeContextSetBulkIdentityContract } from './contextSetBulkIdentityContract'
+import { describeContextSetsContract } from './contextSetsContract'
 import { describeFavoritesContract } from './favoritesContract'
 import { describeGatewayStateContract } from './gatewayStateContract'
 import { describeIdentityPersistenceContract } from './identityPersistenceContract'
@@ -104,6 +106,48 @@ describeAbilityCreateContract('SQLite', async () => {
 describeFavoritesContract('SQLite', async () => {
   const db = new SqliteMetaDb(':memory:')
   return { persistence: db.favorites, teardown: () => db.close() }
+})
+
+describeContextSetsContract('SQLite', async () => {
+  const db = new SqliteMetaDb(':memory:')
+  return { persistence: db.contextSets, teardown: () => db.close() }
+})
+
+describeContextSetBulkIdentityContract('SQLite', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'notarium-context-set-bulk-contract-'))
+  const path = join(dir, 'meta.sqlite')
+  const db = new SqliteMetaDb(path)
+
+  await db.contextSets.getSet('migration-probe')
+  const observer = new DatabaseSync(path)
+  observer.exec(`
+    CREATE TABLE context_set_update_audit (set_id TEXT NOT NULL);
+    CREATE TRIGGER context_set_update_count
+      AFTER UPDATE ON context_sets
+      BEGIN
+        INSERT INTO context_set_update_audit(set_id) VALUES (NEW.id);
+      END;
+  `)
+
+  return {
+    contextSets: db.contextSets,
+    identity: db.identity,
+    updateCount: async () =>
+      Number(
+        (
+          observer
+            .prepare(
+              "SELECT COUNT(*) AS count FROM context_set_update_audit WHERE set_id = 'bulk-observed'",
+            )
+            .get() as { count: number }
+        ).count,
+      ),
+    teardown: async () => {
+      observer.close()
+      await db.close()
+      rmSync(dir, { recursive: true, force: true })
+    },
+  }
 })
 
 describeImportReservationsContract('SQLite', async () => {

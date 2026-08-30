@@ -105,7 +105,7 @@ import {
   weighScopeOrder,
   weighScopePins,
 } from '../../../../services/storeAccess'
-import { contextRoleSummaryOf, roleContextViewOf } from '../wire'
+import { contextRoleSummaryOf, contextSetViewOf, roleContextViewOf } from '../wire'
 import { authz, setSessionCookie } from './_helpers'
 
 const encodeAuditCursor = (value: Record<string, string>): string =>
@@ -470,7 +470,6 @@ export const meRoutes = async (
         memory: [],
         sets: [],
         loadedTokens: 0,
-        totalTokens: 0,
         budgetTokens: PERSONAL_TOKEN_BUDGET,
       })
     }
@@ -502,7 +501,7 @@ export const meRoutes = async (
     const roleContext = selectedRole?.active
       ? await weighRoleContext(resolveDeps, req.principal, selectedRole.role)
       : undefined
-    const curated = curatePersonalScope(
+    const curated = await curatePersonalScope(
       [...tagPins, ...loosePins],
       sets,
       memory,
@@ -517,7 +516,9 @@ export const meRoutes = async (
             abilityContext.locator,
             (space) => space,
             null,
-            curated.role,
+            curated.role
+              ? { ...curated.role, sets: curated.role.sets.map(contextSetViewOf) }
+              : undefined,
           )
         : undefined
     return MeAgentContextResponseSchema.parse({
@@ -529,9 +530,8 @@ export const meRoutes = async (
       ...(roleView ? { role: roleView } : {}),
       pins: curated.pins,
       memory: await withAuthors(curated.memory, req.principal.username, auth.describeAuthor),
-      sets: curated.sets,
+      sets: curated.sets.map(contextSetViewOf),
       loadedTokens: curated.loadedTokens,
-      totalTokens: curated.totalTokens,
       budgetTokens: PERSONAL_TOKEN_BUDGET,
     })
   })

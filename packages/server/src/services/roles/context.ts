@@ -9,6 +9,7 @@ import type {
 } from '../metaDb'
 import type { SpaceManager } from '../spaces'
 import {
+  resolveScopeContextSets,
   type StoreAccess,
   weighScopeContextSets,
   weighScopeOrder,
@@ -104,6 +105,24 @@ export const weighRoleContext = async (
   const [pins, sets, order] = await Promise.all([
     weighScopePins(deps, principal, selector),
     weighScopeContextSets(deps, principal, selector),
+    weighScopeOrder(deps, selector),
+  ])
+
+  return { target, pins, sets, order }
+}
+
+/** Unbudgeted editable role layer. Unlike the preview producer, this resolves the full
+ * authored membership and deliberately carries no budget counters or pagination state. */
+export const resolveRoleContext = async (
+  deps: RoleContextDeps,
+  principal: Principal,
+  resolved: ResolvedOwnedRole,
+) => {
+  const target = roleContextTargetOf(resolved)
+  const selector = { kind: CONTEXT_KIND.role, id: target.id } as const
+  const [pins, sets, order] = await Promise.all([
+    weighScopePins(deps, principal, selector),
+    resolveScopeContextSets(deps, principal, selector),
     weighScopeOrder(deps, selector),
   ])
 

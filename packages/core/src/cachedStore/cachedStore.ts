@@ -322,6 +322,7 @@ export class CachedStore implements KnowledgeStore {
   /** Raw-body reader (P5): shared with sweepFileIds' frontmatter id sweep, so it
    *  stays on the class and is handed to the preview cache too. */
   private readonly readBody?: (filePath: string) => Promise<string | null>
+  private readonly readBodyIdentityClaims: boolean
 
   /** Graph enrichment cache + SWR — owns the revision counter,
    *  enriched/stale maps and the debounced background recompute; the class feeds
@@ -483,6 +484,7 @@ export class CachedStore implements KnowledgeStore {
     relationType = 'links-to',
     previewCacheSize = 20_000,
     readBody,
+    readBodyIdentityClaims = true,
     folderAliases,
     scheduler,
     now = () => new Date(),
@@ -526,6 +528,7 @@ export class CachedStore implements KnowledgeStore {
     })
     this.pollIntervalMs = pollIntervalMs
     this.readBody = readBody
+    this.readBodyIdentityClaims = readBodyIdentityClaims
     this.snap = new Snapshot(
       relationType,
       () => this.dirs.list(),
@@ -1395,7 +1398,7 @@ export class CachedStore implements KnowledgeStore {
         // observation falls back to an engine read before journaling.
         unresolvedPaths.delete(path)
 
-        if (claim && isValidNoteId(claim)) {
+        if (this.readBodyIdentityClaims && claim && isValidNoteId(claim)) {
           if (!identityPublicationPending) {
             this.markIdentityPublicationPending()
             identityPublicationPending = true

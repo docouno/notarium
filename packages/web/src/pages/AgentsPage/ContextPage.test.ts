@@ -4,6 +4,7 @@ import { act, createElement } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../../services/api'
+import { SetItemRow, SetRow } from './PinsBlock'
 
 // The Context constructor against the TWO doors it now reads (#309). The role a URL
 // addresses is two different questions with two different owners, and the page has to
@@ -27,7 +28,10 @@ const harness = vi.hoisted(() => ({
     projectAgentContextGet: vi.fn(),
     projectMemoryGet: vi.fn(),
     previewsPost: vi.fn(),
+    noteMute: vi.fn(),
+    notesGet: vi.fn(),
     contextSetsGet: vi.fn(),
+    contextSetItemsGet: vi.fn(),
   },
   search: new URLSearchParams(),
   navigate: vi.fn(),
@@ -39,7 +43,15 @@ const harness = vi.hoisted(() => ({
   // Identity-stable, like the real providers: a fresh object per render would rebuild
   // `load` on every commit and spin the page forever instead of testing it.
   projects: { projects: [] as unknown[], projectsSpace: 'me' },
-  sync: { subscribe: () => () => {} },
+  syncListeners: [] as Array<(event: unknown, sourceSpace?: string) => void>,
+  sync: {
+    accessRevision: 0,
+    connectionRevision: 0,
+    contextWatchRevision: 0,
+    subscribe: vi.fn(),
+    subscribeContext: vi.fn(),
+    watchSpaces: vi.fn(),
+  },
   dialog: { confirm: vi.fn() },
   shell: { actionsHost: null, setBreadcrumbTail: () => {} },
   summary: { updateContext: () => {} },
@@ -69,7 +81,7 @@ vi.mock('react-router', () => ({
 vi.mock('../../composers/ProjectsProvider', () => ({ useProjects: () => harness.projects }))
 vi.mock('../../composers/SpaceProvider', () => ({ useSpace: () => harness.space }))
 vi.mock('../../composers/SyncProvider', () => ({
-  CHANGED_COALESCE_MS: 0,
+  CHANGED_COALESCE_MS: 10,
   useSync: () => harness.sync,
 }))
 vi.mock('../../core/Dialog', () => ({ useDialog: () => harness.dialog }))
@@ -108,7 +120,14 @@ vi.mock('./AgentsPanel', async () => {
   }
 })
 
-import { ContextPage } from './ContextPage'
+import {
+  blockSetTailIn,
+  ContextPage,
+  createContextCommitBarrier,
+  flushSetTailReorders,
+  queueSetTailReorderIn,
+  unblockSetTailIn,
+} from './ContextPage'
 ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
 const LOCATOR = 'owned-role-locator'
@@ -175,7 +194,14 @@ const weighedRole = {
     { ...layerPin('note-a', 'Release Checklist', 0), loaded: true },
     { ...layerPin('note-b', 'Rollback Notes', 1), loaded: false },
   ],
-  sets: [{ ...layerSet, items: [{ ...layerItem('note-c', 'Cutover Steps', 0), loaded: false }] }],
+  sets: [
+    {
+      ...layerSet,
+      items: [{ ...layerItem('note-c', 'Cutover Steps', 0), loaded: false }],
+      itemsLoaded: 0,
+      trimmed: true,
+    },
+  ],
   loadedTokens: 300,
 }
 
@@ -186,7 +212,6 @@ const previewAnswer = (role?: unknown) => ({
   memory: [],
   sets: [],
   loadedTokens: 1200,
-  totalTokens: 1200,
   budgetTokens: 4000,
 })
 
@@ -214,7 +239,6 @@ const projectPreviewAnswer = (role?: unknown) => ({
   projectLoadedTokens: 0,
   personal: { pins: [], sets: [], memory: [], loadedTokens: 0 },
   loadedTokens: 1200,
-  totalTokens: 1200,
   budgetTokens: 4000,
   index: { noteCount: 0, folderCount: 0 },
 })
@@ -295,6 +319,7 @@ beforeEach(() => {
   localStorage.clear()
   PARAMS.scope = 'personal'
   harness.projects = { projects: [], projectsSpace: 'me' }
+  harness.space.spaces = []
   harness.search = new URLSearchParams({ role: LOCATOR })
   harness.setSearchParams.mockReset()
   harness.navigate.mockReset()
@@ -304,7 +329,29 @@ beforeEach(() => {
   harness.api.projectAgentContextGet.mockReset().mockResolvedValue(projectPreviewAnswer())
   harness.api.projectMemoryGet.mockReset().mockResolvedValue([])
   harness.api.previewsPost.mockReset().mockResolvedValue({ previews: {} })
+  harness.api.noteMute.mockReset().mockResolvedValue({ ok: true })
+  harness.api.notesGet.mockReset().mockResolvedValue({ notes: [], total: 0 })
   harness.api.contextSetsGet.mockReset().mockResolvedValue([])
+  harness.api.contextSetItemsGet.mockReset().mockResolvedValue({ items: [], total: 0 })
+  harness.syncListeners = []
+  harness.sync.accessRevision = 0
+  harness.sync.connectionRevision = 0
+  harness.sync.contextWatchRevision = 0
+  harness.sync.watchSpaces.mockReset()
+  harness.sync.subscribe.mockReset().mockImplementation((listener: (event: unknown) => void) => {
+    harness.syncListeners.push(listener)
+    return () => {
+      harness.syncListeners = harness.syncListeners.filter((candidate) => candidate !== listener)
+    }
+  })
+  harness.sync.subscribeContext
+    .mockReset()
+    .mockImplementation((listener: (event: unknown) => void) => {
+      harness.syncListeners.push(listener)
+      return () => {
+        harness.syncListeners = harness.syncListeners.filter((candidate) => candidate !== listener)
+      }
+    })
 })
 
 afterEach(async () => {
@@ -318,6 +365,307 @@ afterEach(async () => {
 })
 
 describe('the Context constructor and the role an address names (#309)', () => {
+  it('releases independent and overlapping set-tail blocks without stranding either set', () => {
+    const blocks = new Map<string, number>()
+
+    blockSetTailIn(blocks, 'set-a')
+    blockSetTailIn(blocks, 'set-b')
+    expect(unblockSetTailIn(blocks, 'set-a')).toBe(true)
+    expect(blocks.has('set-a')).toBe(false)
+    expect(blocks.has('set-b')).toBe(true)
+    expect(unblockSetTailIn(blocks, 'set-b')).toBe(true)
+
+    blockSetTailIn(blocks, 'set-a')
+    blockSetTailIn(blocks, 'set-a')
+    expect(unblockSetTailIn(blocks, 'set-a')).toBe(false)
+    expect(blocks.get('set-a')).toBe(1)
+    expect(unblockSetTailIn(blocks, 'set-a')).toBe(true)
+    expect(blocks.size).toBe(0)
+  })
+
+  it('keeps every queued set blocked until one authoritative preview flush completes', async () => {
+    const pending = new Map<string, number>()
+    const invalidated: string[] = []
+    const unblocked: string[] = []
+    const barrier = createContextCommitBarrier()
+    const request = vi.fn().mockResolvedValue('superseded')
+
+    queueSetTailReorderIn(pending, 'set-a')
+    queueSetTailReorderIn(pending, 'set-b')
+    queueSetTailReorderIn(pending, 'set-a')
+    const flushing = flushSetTailReorders(
+      pending,
+      (setId) => invalidated.push(setId),
+      () => barrier.waitFor(request),
+      (setId) => unblocked.push(setId),
+    )
+
+    expect(invalidated).toEqual(['set-a', 'set-b'])
+    expect(request).toHaveBeenCalledTimes(1)
+    await Promise.resolve()
+    expect(unblocked).toEqual([])
+    expect(pending.size).toBe(0)
+    barrier.publish()
+    await flushing
+    expect(unblocked).toEqual(['set-a', 'set-a', 'set-b'])
+  })
+
+  it('settles stale preview waits and cancels superseded waits when their context leaves', async () => {
+    const barrier = createContextCommitBarrier()
+
+    await expect(barrier.waitFor(async () => 'stale')).resolves.toBeUndefined()
+
+    let settled = false
+    const superseded = barrier
+      .waitFor(async () => 'superseded')
+      .then(() => {
+        settled = true
+      })
+
+    await Promise.resolve()
+    expect(settled).toBe(false)
+    barrier.cancel()
+    await superseded
+    expect(settled).toBe(true)
+  })
+
+  it('keeps a cross-boundary optimistic set order and wakes an expanded cleared tail', async () => {
+    const mount = document.createElement('div')
+    document.body.append(mount)
+    host = mount
+    const set = {
+      id: 'set-optimistic',
+      name: 'Optimistic set',
+      homeSpace: 'main',
+      order: 0,
+      items: [
+        {
+          sourceIndex: 0,
+          noteId: 'preview-note',
+          title: 'Preview note',
+          tokens: 100,
+          loaded: true,
+          order: 0,
+          space: 'main',
+        },
+      ],
+      itemsLoaded: 1,
+      itemsTotal: 2,
+      itemsCursor: 1,
+      trimmed: true,
+    }
+    const onLoadTail = vi.fn()
+    const props = {
+      set,
+      previews: {},
+      scale: 4_000,
+      onOpen: vi.fn(),
+      onAddNotes: vi.fn(),
+      onDetach: vi.fn(),
+      onDelete: vi.fn(),
+      onRemoveItem: vi.fn(),
+      onReorderItems: vi.fn(),
+      onLoadTail,
+    }
+
+    await act(async () => {
+      root = createRoot(mount)
+      root.render(
+        createElement(SetRow, {
+          ...props,
+          tail: {
+            items: [{ sourceIndex: 1, noteId: 'tail-note', title: 'Tail note', space: 'main' }],
+            total: 2,
+            nextOffset: 2,
+            loading: false,
+            optimisticOrder: ['tail-note', 'preview-note'],
+          },
+        }),
+      )
+    })
+    await act(async () => {
+      ;(boxOf(mount, 'context-set-row-row') as HTMLElement).click()
+    })
+    const ordered = [...mount.querySelectorAll('[data-testid="context-set-item-row"]')].map(
+      (row) => row.textContent,
+    )
+
+    expect(ordered[0]).toContain('Tail note')
+    expect(ordered[1]).toContain('Preview note')
+
+    await act(async () => {
+      root?.render(createElement(SetRow, { ...props, tailWake: 0 }))
+    })
+    expect(onLoadTail).toHaveBeenCalledTimes(1)
+    await act(async () => {
+      root?.render(createElement(SetRow, { ...props, tailWake: 1 }))
+    })
+    expect(onLoadTail).toHaveBeenCalledTimes(2)
+  })
+
+  it('drops a cached coordinate tail immediately when the preview loses home access', async () => {
+    const mount = document.createElement('div')
+    document.body.append(mount)
+    host = mount
+    const set = {
+      id: 'set-access-transition',
+      name: 'Access transition',
+      homeSpace: 'main',
+      order: 0,
+      items: [
+        {
+          sourceIndex: 0,
+          noteId: 'visible-note',
+          title: 'Visible note',
+          tokens: 100,
+          loaded: true,
+          order: 0,
+          space: 'main',
+        },
+      ],
+      itemsLoaded: 1,
+      itemsTotal: 2,
+      itemsCursor: 1,
+      trimmed: true,
+    }
+    const props = {
+      previews: {},
+      scale: 4_000,
+      onOpen: vi.fn(),
+      onAddNotes: vi.fn(),
+      onDetach: vi.fn(),
+      onDelete: vi.fn(),
+      onRemoveItem: vi.fn(),
+      onReorderItems: vi.fn(),
+      onLoadTail: vi.fn(),
+    }
+
+    await act(async () => {
+      root = createRoot(mount)
+      root.render(
+        createElement(SetRow, {
+          ...props,
+          set,
+          tail: {
+            items: [
+              {
+                sourceIndex: 1,
+                noteId: 'privileged-note',
+                title: 'Privileged cached title',
+                space: 'main',
+              },
+            ],
+            total: 2,
+            nextOffset: 2,
+            loading: false,
+          },
+        }),
+      )
+    })
+    await act(async () => {
+      ;(boxOf(mount, 'context-set-row-row') as HTMLElement).click()
+    })
+    expect(visibleText(mount)).toContain('Privileged cached title')
+    expect(headerOf(mount, 'context-set-row', set.name)).toContain('Set · 2')
+
+    await act(async () => {
+      root?.render(
+        createElement(SetRow, {
+          ...props,
+          set: {
+            ...set,
+            homeSpace: '',
+            items: [
+              {
+                ...set.items[0],
+                sourceIndex: undefined,
+                order: 0,
+              },
+            ],
+            itemsTotal: undefined,
+            itemsCursor: undefined,
+          },
+          tail: {
+            items: [
+              {
+                sourceIndex: 1,
+                noteId: 'privileged-note',
+                title: 'Privileged cached title',
+                space: 'main',
+              },
+            ],
+            total: 2,
+            nextOffset: 2,
+            loading: false,
+          },
+        }),
+      )
+    })
+
+    expect(visibleText(mount)).not.toContain('Privileged cached title')
+    expect(headerOf(mount, 'context-set-row', set.name)).toContain('Set · 1')
+    expect(visibleText(mount)).not.toContain('Show more notes')
+  })
+
+  it('lets an authoritative unavailable page row suppress overlapping preview presentation', async () => {
+    const mount = document.createElement('div')
+    document.body.append(mount)
+    host = mount
+    const noteId = 'revoked-overlap'
+
+    await act(async () => {
+      root = createRoot(mount)
+      root.render(
+        createElement(SetRow, {
+          set: {
+            id: 'set-overlap-revoked',
+            name: 'Overlap revoked',
+            homeSpace: 'main',
+            order: 0,
+            items: [
+              {
+                sourceIndex: 1,
+                noteId,
+                title: 'Stale readable title',
+                tokens: 100,
+                loaded: true,
+                order: 1,
+                space: 'main',
+              },
+            ],
+            itemsLoaded: 1,
+            itemsTotal: 2,
+            itemsCursor: 0,
+            trimmed: false,
+          },
+          tail: {
+            items: [{ sourceIndex: 1, noteId, title: null, space: null }],
+            total: 2,
+            nextOffset: 2,
+            loading: false,
+          },
+          previews: { [noteId]: { snippet: 'Stale privileged snippet' } as never },
+          scale: 4_000,
+          onOpen: vi.fn(),
+          onAddNotes: vi.fn(),
+          onDetach: vi.fn(),
+          onDelete: vi.fn(),
+          onRemoveItem: vi.fn(),
+          onReorderItems: vi.fn(),
+          onLoadTail: vi.fn(),
+        }),
+      )
+    })
+    await act(async () => {
+      ;(boxOf(mount, 'context-set-row-row') as HTMLElement).click()
+    })
+
+    expect(visibleText(mount)).toContain('Unavailable note')
+    expect(visibleText(mount)).not.toContain('Stale readable title')
+    expect(visibleText(mount)).not.toContain('Stale privileged snippet')
+    expect(boxOf(mount, 'context-set-item-row')?.querySelector('[class*="meterTrack"]')).toBeNull()
+  })
+
   it('renders the role layer the identity door hands back, not the one the preview weighs', async () => {
     // The preview knows nothing about this role — the agent does not load it here.
     harness.api.meAgentContextGet.mockResolvedValue(previewAnswer())
@@ -405,7 +753,10 @@ describe('the Context constructor and the role an address names (#309)', () => {
     // a join that stopped carrying verdicts to set members would leave every assertion
     // above green while the member and the set it sits in silently lost their badge.
     expect(headerOf(live, 'context-set-item', 'Cutover Steps')).toContain('Trimmed')
-    expect(headerOf(live, 'context-set-row', 'Release Kit')).toContain('Trimmed')
+    const liveSet = headerOf(live, 'context-set-row', 'Release Kit')
+
+    expect(liveSet).toContain('Trimmed')
+    expect(liveSet).toContain('≈0')
     await unmount(live)
 
     // Nobody weighed it now, so nothing is reported dropped: `Trimmed` is a claim about
@@ -438,10 +789,839 @@ describe('the Context constructor and the role an address names (#309)', () => {
     expect(member).toContain('≈300')
     expect(member).not.toContain('Trimmed')
     expect(set).toContain('Set · 1')
+    expect(set).toContain('≈300')
     expect(set).not.toContain('Trimmed')
     // The band stays — the panel below it has to remain reachable from the Personal tab —
     // and reads zero, which is exactly what this layer costs the budget the agent spends.
     expect(boxOf(off, 'context-aggregate-role')?.getAttribute('data-loaded-tokens')).toBe('0')
+  })
+
+  it('loads and merges the bounded raw tail by sourceIndex when a set expands', async () => {
+    harness.search = new URLSearchParams()
+    harness.api.meAgentContextGet.mockResolvedValue({
+      ...previewAnswer(),
+      sets: [
+        {
+          id: 'set-paged',
+          name: 'Paged set',
+          homeSpace: 'main',
+          order: 0,
+          items: [
+            {
+              noteId: 'preview-note',
+              title: 'Preview note',
+              tokens: 100,
+              loaded: true,
+              order: 0,
+              sourceIndex: 0,
+              space: 'main',
+            },
+          ],
+          itemsLoaded: 1,
+          itemsTotal: 3,
+          itemsCursor: 1,
+          trimmed: true,
+        },
+      ],
+    })
+    harness.api.contextSetItemsGet.mockResolvedValue({
+      total: 3,
+      items: [
+        { sourceIndex: 1, noteId: 'missing-note', title: null, space: null },
+        { sourceIndex: 2, noteId: 'tail-note', title: 'Tail note', space: 'main' },
+      ],
+    })
+    const mount = await render()
+
+    await expandRows(mount)
+    await act(async () => {})
+    expect(harness.api.contextSetItemsGet).toHaveBeenCalledWith('main', 'set-paged', 1, 50)
+    expect(textOf(mount, 'context-personal-pins')).toContain('Preview note')
+    expect(textOf(mount, 'context-personal-pins')).toContain('Unavailable note')
+    expect(textOf(mount, 'context-personal-pins')).toContain('Tail note')
+    expect(headerOf(mount, 'context-set-row', 'Paged set')).toContain('1 of 3')
+  })
+
+  it('keeps cached set pages on unrelated SSE and invalidates only a referenced note', async () => {
+    harness.search = new URLSearchParams()
+    harness.api.meAgentContextGet.mockResolvedValue({
+      ...previewAnswer(),
+      sets: [
+        {
+          id: 'set-paged',
+          name: 'Paged set',
+          homeSpace: 'main',
+          order: 0,
+          items: [
+            {
+              noteId: 'preview-note',
+              title: 'Preview note',
+              tokens: 100,
+              loaded: true,
+              order: 0,
+              sourceIndex: 0,
+              space: 'main',
+            },
+          ],
+          itemsLoaded: 1,
+          itemsTotal: 2,
+          itemsCursor: 1,
+          trimmed: true,
+        },
+      ],
+    })
+    harness.api.contextSetsGet.mockResolvedValue([
+      {
+        id: 'set-paged',
+        name: 'Paged set',
+        homeSpace: 'main',
+        personal: false,
+        items: [{ noteId: 'preview-note' }, { noteId: 'tail-note' }],
+        attachments: [],
+        createdAt: '2026-08-30T00:00:00.000Z',
+      },
+    ])
+    harness.api.contextSetItemsGet.mockResolvedValue({
+      total: 2,
+      items: [{ sourceIndex: 1, noteId: 'tail-note', title: 'Tail note', space: 'main' }],
+    })
+    const mount = await render()
+
+    await expandRows(mount)
+    await act(async () => {})
+    expect(harness.api.contextSetItemsGet).toHaveBeenCalledTimes(1)
+    await act(async () => {
+      harness.syncListeners[0]?.(
+        {
+          type: 'changed',
+          upserts: ['unrelated-note'],
+          removed: [],
+          folders: [],
+        },
+        'sp-foreign',
+      )
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    })
+    expect(harness.api.contextSetItemsGet).toHaveBeenCalledTimes(1)
+    expect(harness.api.meAgentContextGet).toHaveBeenCalledTimes(1)
+    expect(textOf(mount, 'context-personal-pins')).toContain('Tail note')
+
+    await act(async () => {
+      harness.syncListeners[0]?.(
+        {
+          type: 'changed',
+          upserts: ['another-unrelated-note'],
+          removed: [],
+          folders: [],
+        },
+        'sp-foreign',
+      )
+      harness.syncListeners[0]?.(
+        {
+          type: 'changed',
+          upserts: ['tail-note'],
+          removed: [],
+          folders: [],
+        },
+        'sp-foreign',
+      )
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    })
+    await act(async () => {})
+    expect(harness.api.contextSetItemsGet).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps a queued relevant SSE frame across the initial manager commit', async () => {
+    harness.search = new URLSearchParams()
+    const previewSet = {
+      id: 'set-manager-race',
+      name: 'Manager race',
+      homeSpace: 'main',
+      order: 0,
+      items: [],
+      itemsLoaded: 0,
+      itemsTotal: 1,
+      itemsCursor: 0,
+      trimmed: true,
+    }
+    harness.api.meAgentContextGet.mockResolvedValue({ ...previewAnswer(), sets: [previewSet] })
+    let resolveManager!: (sets: unknown[]) => void
+    harness.api.contextSetsGet.mockReturnValue(
+      new Promise((resolve) => {
+        resolveManager = resolve
+      }),
+    )
+    harness.api.contextSetItemsGet.mockResolvedValue({
+      total: 1,
+      items: [{ sourceIndex: 0, noteId: 'tail-note', title: 'Tail note', space: 'main' }],
+    })
+    const mount = await render()
+
+    await expandRows(mount)
+    expect(harness.api.contextSetItemsGet).toHaveBeenCalledTimes(1)
+    await act(async () => {
+      harness.syncListeners[0]?.({
+        type: 'changed',
+        upserts: [],
+        removed: ['tail-note'],
+        folders: [],
+      })
+    })
+    await act(async () => {
+      resolveManager([
+        {
+          id: previewSet.id,
+          name: previewSet.name,
+          homeSpace: 'main',
+          personal: false,
+          items: [{ noteId: 'tail-note' }],
+          attachments: [],
+          createdAt: '2026-08-30T00:00:00.000Z',
+        },
+      ])
+      await Promise.resolve()
+    })
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    })
+    await act(async () => {})
+    expect(harness.api.contextSetItemsGet).toHaveBeenCalledTimes(2)
+  })
+
+  it('conservatively invalidates a cached tail while the manager snapshot is absent', async () => {
+    harness.search = new URLSearchParams()
+    const previewSet = {
+      id: 'set-manager-pending',
+      name: 'Manager pending',
+      homeSpace: 'main',
+      order: 0,
+      items: [],
+      itemsLoaded: 0,
+      itemsTotal: 1,
+      itemsCursor: 0,
+      trimmed: true,
+    }
+    harness.api.meAgentContextGet.mockResolvedValue({ ...previewAnswer(), sets: [previewSet] })
+    let resolveManager!: (sets: unknown[]) => void
+    harness.api.contextSetsGet.mockReturnValue(
+      new Promise((resolve) => {
+        resolveManager = resolve
+      }),
+    )
+    harness.api.contextSetItemsGet.mockResolvedValue({
+      total: 1,
+      items: [{ sourceIndex: 0, noteId: 'tail-note', title: 'Tail note', space: 'main' }],
+    })
+    const mount = await render()
+
+    await expandRows(mount)
+    expect(harness.api.contextSetItemsGet).toHaveBeenCalledTimes(1)
+    await act(async () => {
+      harness.syncListeners[0]?.({
+        type: 'changed',
+        upserts: [],
+        removed: ['tail-note'],
+        folders: [],
+      })
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    })
+    await act(async () => {})
+    expect(harness.api.contextSetItemsGet).toHaveBeenCalledTimes(2)
+
+    await act(async () => {
+      resolveManager([])
+      await Promise.resolve()
+    })
+  })
+
+  it('does not reuse cached presentation for an unavailable page row', async () => {
+    const mount = document.createElement('div')
+    document.body.append(mount)
+    host = mount
+    const onOpen = vi.fn()
+
+    await act(async () => {
+      root = createRoot(mount)
+      root.render(
+        createElement(SetItemRow, {
+          item: {
+            sourceIndex: 7,
+            noteId: 'revoked-note',
+            title: null,
+            space: null,
+            order: 7,
+          },
+          preview: { snippet: 'Previously readable secret' } as never,
+          scale: 4_000,
+          onOpen,
+          onRemove: vi.fn(),
+        }),
+      )
+    })
+
+    expect(visibleText(mount)).toContain('Unavailable note')
+    expect(visibleText(mount)).not.toContain('Previously readable secret')
+    expect(mount.querySelector('[class*="meterTrack"]')).toBeNull()
+    await act(async () => {
+      ;(boxOf(mount, 'context-set-item-menu') as HTMLElement).click()
+    })
+    expect(document.body.textContent).not.toContain('Open note')
+    expect(onOpen).not.toHaveBeenCalled()
+  })
+
+  it('shows a tail error and retries the same bounded page', async () => {
+    harness.search = new URLSearchParams()
+    harness.api.meAgentContextGet.mockResolvedValue({
+      ...previewAnswer(),
+      sets: [
+        {
+          id: 'set-retry',
+          name: 'Retry set',
+          homeSpace: 'main',
+          order: 0,
+          items: [],
+          itemsLoaded: 0,
+          itemsTotal: 1,
+          itemsCursor: 0,
+          trimmed: true,
+        },
+      ],
+    })
+    harness.api.contextSetItemsGet
+      .mockRejectedValueOnce(new Error('temporary page failure'))
+      .mockResolvedValueOnce({
+        total: 1,
+        items: [{ sourceIndex: 0, noteId: 'tail-note', title: 'Tail note', space: 'main' }],
+      })
+    const mount = await render()
+
+    await expandRows(mount)
+    await act(async () => {})
+    const retry = [...mount.querySelectorAll('button')].find((button) =>
+      button.textContent?.includes('Retry loading notes'),
+    )
+
+    expect(retry).toBeTruthy()
+    await act(async () => retry?.click())
+    await act(async () => {})
+    expect(harness.api.contextSetItemsGet).toHaveBeenCalledTimes(2)
+    expect(textOf(mount, 'context-personal-pins')).toContain('Tail note')
+  })
+
+  it('does not expose a page action or denominator without home-space coordinates', async () => {
+    harness.search = new URLSearchParams()
+    harness.api.meAgentContextGet.mockResolvedValue({
+      ...previewAnswer(),
+      sets: [
+        {
+          id: 'set-hidden-home',
+          name: 'Hidden home',
+          homeSpace: '',
+          order: 0,
+          items: [
+            {
+              noteId: 'visible-note',
+              title: 'Visible note',
+              tokens: 100,
+              loaded: true,
+              order: 0,
+              space: 'main',
+            },
+          ],
+          itemsLoaded: 1,
+          trimmed: false,
+        },
+      ],
+    })
+    const mount = await render()
+
+    await expandRows(mount)
+    const header = headerOf(mount, 'context-set-row', 'Hidden home')
+
+    expect(header).toContain('Set · 1')
+    expect(header).not.toMatch(/\d+ of \d+/u)
+    expect(textOf(mount, 'context-personal-pins')).not.toContain('Show more notes')
+    expect(harness.api.contextSetItemsGet).not.toHaveBeenCalled()
+  })
+
+  it('drops coordinate tails and reloads the preview on a non-active-space access change', async () => {
+    harness.search = new URLSearchParams()
+    harness.space.spaces = [
+      { id: 'sp-foreign', slug: 'foreign', displayName: 'Foreign' },
+      { id: 'sp-other', slug: 'other', displayName: 'Other' },
+    ] as never[]
+    const readable = {
+      id: 'set-access-revision',
+      name: 'Access revision',
+      homeSpace: 'foreign',
+      order: 0,
+      items: [],
+      itemsLoaded: 0,
+      itemsTotal: 1,
+      itemsCursor: 0,
+      trimmed: true,
+    }
+    harness.api.meAgentContextGet.mockResolvedValueOnce({
+      ...previewAnswer(),
+      sets: [readable],
+    })
+    harness.api.contextSetItemsGet.mockResolvedValue({
+      total: 1,
+      items: [
+        {
+          sourceIndex: 0,
+          noteId: 'foreign-note',
+          title: 'Privileged foreign title',
+          space: 'foreign',
+        },
+      ],
+    })
+    const mount = await render()
+
+    await expandRows(mount)
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 60))
+    })
+    expect(visibleText(mount)).toContain('Privileged foreign title')
+    expect(harness.sync.watchSpaces).toHaveBeenLastCalledWith(['sp-foreign'])
+
+    harness.api.meAgentContextGet.mockResolvedValue({
+      ...previewAnswer(),
+      sets: [
+        {
+          ...readable,
+          homeSpace: '',
+          items: [
+            {
+              noteId: 'visible-note',
+              title: 'Dense visible row',
+              tokens: 100,
+              loaded: true,
+              order: 0,
+              space: 'other',
+            },
+          ],
+          itemsLoaded: 1,
+          itemsTotal: undefined,
+          itemsCursor: undefined,
+          trimmed: false,
+        },
+      ],
+    })
+    harness.sync.accessRevision += 1
+    await act(async () => {
+      root?.render(createElement(ContextPage))
+    })
+    await act(async () => {})
+    await expandRows(mount)
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 60))
+    })
+
+    expect(visibleText(mount)).toContain('Dense visible row')
+    expect(visibleText(mount)).not.toContain('Privileged foreign title')
+    expect(visibleText(mount)).not.toContain('Show more notes')
+    expect(harness.sync.watchSpaces).toHaveBeenLastCalledWith(['sp-other'])
+  })
+
+  it('ignores a stale tail response after relevant SSE resets the generation', async () => {
+    harness.search = new URLSearchParams()
+    const set = {
+      id: 'set-stale',
+      name: 'Stale set',
+      homeSpace: 'main',
+      order: 0,
+      items: [],
+      itemsLoaded: 0,
+      itemsTotal: 1,
+      itemsCursor: 0,
+      trimmed: true,
+    }
+    harness.api.meAgentContextGet.mockResolvedValue({ ...previewAnswer(), sets: [set] })
+    harness.api.contextSetsGet.mockResolvedValue([
+      {
+        id: set.id,
+        name: set.name,
+        homeSpace: 'main',
+        personal: false,
+        items: [{ noteId: 'tail-note' }],
+        attachments: [],
+        createdAt: '2026-08-30T00:00:00.000Z',
+      },
+    ])
+    let resolveStale!: (page: unknown) => void
+    const stale = new Promise((resolve) => {
+      resolveStale = resolve
+    })
+    harness.api.contextSetItemsGet.mockReturnValueOnce(stale).mockResolvedValue({
+      total: 1,
+      items: [{ sourceIndex: 0, noteId: 'tail-note', title: 'Fresh row', space: 'main' }],
+    })
+    const mount = await render()
+
+    await expandRows(mount)
+    expect(harness.api.contextSetItemsGet).toHaveBeenCalledTimes(1)
+    await act(async () => {
+      harness.syncListeners[0]?.(
+        {
+          type: 'changed',
+          upserts: ['tail-note'],
+          removed: [],
+          folders: [],
+        },
+        'sp-foreign',
+      )
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    })
+    await act(async () => {})
+    expect(harness.api.contextSetItemsGet).toHaveBeenCalledTimes(2)
+    await act(async () => {
+      resolveStale({
+        total: 1,
+        items: [{ sourceIndex: 0, noteId: 'tail-note', title: 'Stale secret', space: 'main' }],
+      })
+      await stale
+    })
+    expect(textOf(mount, 'context-personal-pins')).toContain('Fresh row')
+    expect(textOf(mount, 'context-personal-pins')).not.toContain('Stale secret')
+  })
+
+  it('keeps an SSE-invalidated tail blocked until the newest preview commits its cursor', async () => {
+    harness.search = new URLSearchParams()
+    const initialSet = {
+      id: 'set-sse-superseded',
+      name: 'SSE superseded',
+      homeSpace: 'main',
+      order: 0,
+      items: [
+        {
+          noteId: 'preview-note',
+          title: 'Preview note',
+          tokens: 100,
+          loaded: true,
+          order: 0,
+          sourceIndex: 0,
+          space: 'main',
+        },
+      ],
+      itemsLoaded: 1,
+      itemsTotal: 2,
+      itemsCursor: 1,
+      trimmed: true,
+    }
+    let resolveA!: (value: unknown) => void
+    let resolveB!: (value: unknown) => void
+    const previewA = new Promise((resolve) => {
+      resolveA = resolve
+    })
+    const previewB = new Promise((resolve) => {
+      resolveB = resolve
+    })
+
+    harness.api.meAgentContextGet
+      .mockResolvedValueOnce({ ...previewAnswer(), sets: [initialSet] })
+      .mockReturnValueOnce(previewA)
+      .mockReturnValueOnce(previewB)
+    harness.api.contextSetsGet.mockResolvedValue([
+      {
+        id: initialSet.id,
+        name: initialSet.name,
+        homeSpace: 'main',
+        personal: false,
+        items: [{ noteId: 'preview-note' }, { noteId: 'tail-note' }],
+        attachments: [],
+        createdAt: '2026-08-30T00:00:00.000Z',
+      },
+    ])
+    harness.api.contextSetItemsGet
+      .mockResolvedValueOnce({
+        total: 2,
+        items: [{ sourceIndex: 1, noteId: 'tail-note', title: 'Old tail', space: 'main' }],
+      })
+      .mockResolvedValueOnce({
+        total: 1,
+        items: [{ sourceIndex: 0, noteId: 'tail-note', title: 'New first row', space: 'main' }],
+      })
+    const mount = await render()
+
+    await expandRows(mount)
+    await act(async () => {})
+    expect(harness.api.contextSetItemsGet).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      harness.syncListeners[0]?.({
+        type: 'changed',
+        upserts: ['tail-note'],
+        removed: [],
+        folders: [],
+      })
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    })
+    await act(async () => {
+      harness.syncListeners[0]?.({
+        type: 'changed',
+        upserts: ['tail-note'],
+        removed: [],
+        folders: [],
+      })
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    })
+    await act(async () => {
+      resolveA({ ...previewAnswer(), sets: [initialSet] })
+      await previewA
+    })
+    expect(harness.api.contextSetItemsGet).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      resolveB({
+        ...previewAnswer(),
+        sets: [
+          {
+            ...initialSet,
+            items: [],
+            itemsLoaded: 0,
+            itemsTotal: 1,
+            itemsCursor: 0,
+          },
+        ],
+      })
+      await previewB
+    })
+    await act(async () => {})
+
+    expect(harness.api.contextSetItemsGet).toHaveBeenCalledTimes(2)
+    expect(harness.api.contextSetItemsGet).toHaveBeenLastCalledWith('main', initialSet.id, 0, 50)
+    expect(visibleText(mount)).toContain('New first row')
+  })
+
+  it('drops a cached tail when a mutation commits a different preview cursor', async () => {
+    harness.search = new URLSearchParams()
+    const previewItems = (count: number) =>
+      Array.from({ length: count }, (_, sourceIndex) => ({
+        noteId: `note-${sourceIndex}`,
+        title: `Note ${sourceIndex}`,
+        tokens: 100,
+        loaded: true,
+        order: sourceIndex,
+        sourceIndex,
+        space: 'main',
+      }))
+    const memory = {
+      noteId: 'memory-note',
+      category: 'decisions',
+      summary: 'Decision memory',
+      tokens: 100,
+      loaded: true,
+      muted: false,
+      author: null,
+      modifiedAt: null,
+    }
+    const initialSet = {
+      id: 'set-cursor-shift',
+      name: 'Cursor shift',
+      homeSpace: 'main',
+      order: 0,
+      items: previewItems(10),
+      itemsLoaded: 10,
+      itemsTotal: 60,
+      itemsCursor: 10,
+      trimmed: true,
+    }
+    const shiftedSet = {
+      ...initialSet,
+      items: previewItems(5),
+      itemsLoaded: 5,
+      itemsCursor: 5,
+    }
+
+    harness.api.meAgentContextGet
+      .mockResolvedValueOnce({ ...previewAnswer(), memory: [memory], sets: [initialSet] })
+      .mockResolvedValue({
+        ...previewAnswer(),
+        memory: [{ ...memory, muted: true }],
+        sets: [shiftedSet],
+      })
+    harness.api.contextSetItemsGet
+      .mockResolvedValueOnce({
+        total: 60,
+        items: Array.from({ length: 50 }, (_, index) => ({
+          sourceIndex: index + 10,
+          noteId: `note-${index + 10}`,
+          title: `Note ${index + 10}`,
+          space: 'main',
+        })),
+      })
+      .mockResolvedValueOnce({
+        total: 60,
+        items: Array.from({ length: 50 }, (_, index) => ({
+          sourceIndex: index + 5,
+          noteId: `note-${index + 5}`,
+          title: `Note ${index + 5}`,
+          space: 'main',
+        })),
+      })
+    const mount = await render()
+
+    await expandRows(mount)
+    expect(harness.api.contextSetItemsGet).toHaveBeenLastCalledWith('main', initialSet.id, 10, 50)
+    await act(async () => {
+      ;(boxOf(mount, 'context-memory-row-menu') as HTMLElement).click()
+    })
+    const mute = [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')].find((item) =>
+      item.textContent?.includes('Mute'),
+    )
+
+    await act(async () => mute?.click())
+    await act(async () => {})
+
+    expect(harness.api.contextSetItemsGet).toHaveBeenLastCalledWith('main', initialSet.id, 5, 50)
+    expect(visibleText(mount)).toContain('Note 5')
+  })
+
+  it('keeps a known stable note owner when another space reuses its retired slug', async () => {
+    harness.search = new URLSearchParams()
+    harness.space.spaces = [
+      { id: 'sp-a', slug: 'alpha-new', aliases: ['retired'], displayName: 'Alpha' },
+      { id: 'sp-b', slug: 'retired', aliases: [], displayName: 'Beta' },
+    ] as never[]
+    const set = (itemSpace: string) => ({
+      id: 'set-reused-slug',
+      name: 'Reused slug',
+      homeSpace: '',
+      order: 0,
+      items: [
+        {
+          noteId: 'note-owned-by-a',
+          title: 'Owned by A',
+          tokens: 100,
+          loaded: true,
+          order: 0,
+          space: itemSpace,
+        },
+      ],
+      itemsLoaded: 1,
+      trimmed: false,
+    })
+
+    harness.api.meAgentContextGet
+      .mockResolvedValueOnce({ ...previewAnswer(), sets: [set('alpha-new')] })
+      .mockResolvedValue({ ...previewAnswer(), sets: [set('retired')] })
+    await render()
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 60)))
+    expect(harness.sync.watchSpaces).toHaveBeenLastCalledWith(['sp-a'])
+
+    harness.sync.connectionRevision += 1
+    await act(async () => root?.render(createElement(ContextPage)))
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 60)))
+
+    expect(harness.sync.watchSpaces).toHaveBeenLastCalledWith(['sp-a'])
+  })
+
+  it('closes the picker immediately when live access changes', async () => {
+    harness.search = new URLSearchParams()
+    const mount = await render()
+
+    await act(async () => {
+      ;(boxOf(mount, 'context-add-personal-pin') as HTMLElement).click()
+    })
+    expect(document.querySelector('[data-testid="pin-picker"]')).not.toBeNull()
+
+    harness.sync.accessRevision += 1
+    await act(async () => root?.render(createElement(ContextPage)))
+
+    expect(document.querySelector('[data-testid="pin-picker"]')).toBeNull()
+  })
+
+  it('watches foreign rows displayed only by the role identity layer', async () => {
+    harness.space.spaces = [
+      { id: 'sp-main', slug: 'main', aliases: [], displayName: 'Main' },
+    ] as never[]
+    await render()
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 60)))
+
+    expect(harness.sync.watchSpaces).toHaveBeenLastCalledWith(['sp-main'])
+  })
+
+  it('reconciles Context when a supplemental watch expansion reaches readiness', async () => {
+    harness.search = new URLSearchParams()
+    await render()
+    expect(harness.api.meAgentContextGet).toHaveBeenCalledTimes(1)
+
+    harness.sync.contextWatchRevision += 1
+    await act(async () => root?.render(createElement(ContextPage)))
+    await act(async () => {})
+
+    expect(harness.api.meAgentContextGet).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps page watch ownership while expansion reconciliation reloads a slow tail', async () => {
+    harness.search = new URLSearchParams()
+    harness.space.spaces = [
+      { id: 'sp-foreign', slug: 'foreign', aliases: [], displayName: 'Foreign' },
+    ] as never[]
+    const set = {
+      id: 'set-watch-expansion',
+      name: 'Watch expansion',
+      homeSpace: 'main',
+      order: 0,
+      items: [],
+      itemsLoaded: 0,
+      itemsTotal: 1,
+      itemsCursor: 0,
+      trimmed: true,
+    }
+    let resolveReplacement!: (value: unknown) => void
+    const replacement = new Promise((resolve) => {
+      resolveReplacement = resolve
+    })
+
+    harness.api.meAgentContextGet.mockResolvedValue({ ...previewAnswer(), sets: [set] })
+    harness.api.contextSetItemsGet
+      .mockResolvedValueOnce({
+        total: 1,
+        items: [
+          {
+            sourceIndex: 0,
+            noteId: 'foreign-note',
+            title: 'Foreign note',
+            space: 'foreign',
+          },
+        ],
+      })
+      .mockReturnValueOnce(replacement)
+    const mount = await render()
+
+    await expandRows(mount)
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 60)))
+    expect(harness.sync.watchSpaces).toHaveBeenLastCalledWith(['sp-foreign'])
+
+    harness.sync.contextWatchRevision += 1
+    await act(async () => root?.render(createElement(ContextPage)))
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 60)))
+
+    expect(harness.api.contextSetItemsGet).toHaveBeenCalledTimes(2)
+    expect(harness.sync.watchSpaces).toHaveBeenLastCalledWith(['sp-foreign'])
+    await act(async () => {
+      resolveReplacement({
+        total: 1,
+        items: [
+          {
+            sourceIndex: 0,
+            noteId: 'foreign-note',
+            title: 'Fresh foreign note',
+            space: 'foreign',
+          },
+        ],
+      })
+      await replacement
+    })
+    harness.api.contextSetItemsGet.mockRejectedValueOnce(new Error('replacement unavailable'))
+    harness.sync.contextWatchRevision += 1
+    await act(async () => root?.render(createElement(ContextPage)))
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 120)))
+
+    expect(harness.api.contextSetItemsGet).toHaveBeenCalledTimes(3)
+    expect(harness.sync.watchSpaces).toHaveBeenLastCalledWith([])
   })
 
   // The tab used to be the one route of the section without an aside, which is what made

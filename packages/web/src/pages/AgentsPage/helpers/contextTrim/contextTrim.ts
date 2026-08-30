@@ -19,7 +19,7 @@ export const setsTrimmed = (sets: ContextSetRowView[]): number =>
   sets
     .flatMap((s) => s.items)
     .filter((i) => i.loaded === false)
-    .reduce((sum, i) => sum + i.tokens, 0)
+    .reduce((sum, i) => sum + (i.tokens ?? 0), 0)
 /** Sum the token weight trimmed across the eager (non-muted) memory categories. */
 export const memoryTrimmed = (memory: ContextMemory[]): number =>
   memory.filter((m) => !m.muted && !m.loaded).reduce((sum, m) => sum + m.tokens, 0)

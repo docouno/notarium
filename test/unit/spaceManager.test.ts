@@ -6,6 +6,7 @@
 
 import { describe, expect, it, vi } from 'vitest'
 import {
+  type IdentityRecord,
   InMemoryRestoreOperationPersistence,
   InMemorySpaceLifecyclePersistence,
   type KnowledgeStore,
@@ -200,8 +201,98 @@ describe('SpaceManager', () => {
       ],
       createStore: (rec) => stubStore(rec.slug === 'b' ? [{ id: 'note-in-b' }] : []),
     })
-    expect(await manager.resolveNote('note-in-b')).toEqual({ space: 'b', deletedAt: null })
+    expect(await manager.resolveNote('note-in-b')).toEqual({
+      id: 'note-in-b',
+      space: 'b',
+      filePath: 'f.md',
+      deletedAt: null,
+    })
     expect(await manager.resolveNote('ghost')).toBeNull()
+  })
+
+  it('batch-follows explicit settlement lineage and fails closed on incomplete chains', async () => {
+    const space = 'space-a'
+    const rec = (id: string, over: Partial<IdentityRecord> = {}): IdentityRecord => ({
+      id,
+      legacyNameAliases: [],
+      filePath: `${id}.md`,
+      space,
+      createdAt: null,
+      materialized: true,
+      deletedAt: null,
+      ...over,
+    })
+    const records = new Map(
+      [
+        rec('retired-root', {
+          deletedAt: '2026-06-12T00:00:00.000Z',
+          settlementSuccessorId: 'retired-mid',
+        }),
+        rec('retired-mid', {
+          deletedAt: '2026-06-12T00:00:00.000Z',
+          settlementSuccessorId: 'live-note',
+        }),
+        rec('live-note'),
+        rec('ordinary', { deletedAt: '2026-06-12T00:00:00.000Z' }),
+        rec('missing-root', {
+          deletedAt: '2026-06-12T00:00:00.000Z',
+          settlementSuccessorId: 'missing-next',
+        }),
+        rec('foreign-root', {
+          deletedAt: '2026-06-12T00:00:00.000Z',
+          settlementSuccessorId: 'foreign-next',
+        }),
+        rec('foreign-next', { space: 'space-b' }),
+        rec('cycle-a', {
+          deletedAt: '2026-06-12T00:00:00.000Z',
+          settlementSuccessorId: 'cycle-b',
+        }),
+        rec('cycle-b', {
+          deletedAt: '2026-06-12T00:00:00.000Z',
+          settlementSuccessorId: 'cycle-a',
+        }),
+      ].map((record) => [record.id, record]),
+    )
+    const findByIds = vi.fn(async (ids: readonly string[]) =>
+      ids.flatMap((id) => (records.has(id) ? [records.get(id)!] : [])),
+    )
+    const metaDb = fakeMetaDb()!
+
+    Object.assign(metaDb, { identity: { findByIds } })
+    await metaDb.spaces.upsert({
+      id: space,
+      slug: 'a',
+      displayName: 'A',
+      notesDir: 'a',
+      aliases: [],
+      createdAt: '2026-06-11T00:00:00.000Z',
+      archivedAt: null,
+      archivedBy: null,
+    })
+    const manager = new SpaceManager({
+      spaces: [{ slug: 'a', displayName: 'A' }],
+      createStore: () => stubStore(),
+      metaDb,
+    })
+
+    await manager.init()
+    const resolved = await manager.resolveNotes([
+      'retired-root',
+      'ordinary',
+      'missing-root',
+      'foreign-root',
+      'cycle-a',
+    ])
+
+    expect(resolved.get('retired-root')).toMatchObject({ id: 'live-note', deletedAt: null })
+    expect(resolved.get('ordinary')).toMatchObject({
+      id: 'ordinary',
+      deletedAt: expect.any(String),
+    })
+    expect(resolved.has('missing-root')).toBe(false)
+    expect(resolved.has('foreign-root')).toBe(false)
+    expect(resolved.has('cycle-a')).toBe(false)
+    expect(findByIds).toHaveBeenCalledTimes(3)
   })
 
   it('resolves an archived identity without booting its unavailable store', async () => {
@@ -246,7 +337,9 @@ describe('SpaceManager', () => {
 
     await manager.init()
     await expect(manager.resolveNote('archived-note')).resolves.toEqual({
+      id: 'archived-note',
       space: archived.id,
+      filePath: 'note.md',
       deletedAt: null,
     })
     expect(createStore).not.toHaveBeenCalled()

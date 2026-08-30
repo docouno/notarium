@@ -84,12 +84,78 @@ export const createContextSetsFacet = (ctx: PgDriverCtx): ContextSetsPersistence
       client.release()
     }
   },
-  removeItem: async (id: string, noteId: string) => {
+  addItems: async (id: string, refs: readonly ContextSetItemRef[]) => {
     await ctx.ensureInit()
     const client = await ctx.required.connect()
 
     try {
       await client.query('BEGIN')
+      const identity = await enterIdentityTierForReferences(client, refs)
+      const canonicalIds: string[] = []
+      const conflicts: string[] = []
+
+      for (const [index, ref] of refs.entries()) {
+        try {
+          canonicalIds[index] = identity.canonical(ref.space, ref.noteId)
+        } catch (error) {
+          const referenceId = (error as { referenceId?: unknown }).referenceId
+
+          if (typeof referenceId !== 'string') {
+            throw error
+          }
+          conflicts.push(referenceId)
+        }
+      }
+      if (conflicts.length > 0) {
+        await client.query('ROLLBACK')
+        return { set: null, added: [], conflicts: [...new Set(conflicts)] }
+      }
+      const { row } = await lockContextSetRow(client, id)
+
+      if (!row) {
+        await client.query('ROLLBACK')
+        return { set: null, added: [], conflicts: [] }
+      }
+      const rec = contextSetOfRow(row)
+      const seen = new Set<string>()
+
+      rec.items.forEach((item) => seen.add(item.noteId))
+      const added: string[] = []
+      const next = [...rec.items]
+
+      for (const [index, ref] of refs.entries()) {
+        const noteId = canonicalIds[index]
+
+        if (seen.has(noteId)) {
+          continue
+        }
+        seen.add(noteId)
+        added.push(noteId)
+        next.push(noteId === ref.noteId ? ref : { ...ref, noteId })
+      }
+      if (added.length > 0) {
+        await client.query('UPDATE context_sets SET items = $1 WHERE id = $2', [
+          JSON.stringify(next),
+          id,
+        ])
+      }
+      await client.query('COMMIT')
+      return { set: { ...rec, items: next }, added, conflicts: [] }
+    } catch (error) {
+      await client.query('ROLLBACK')
+      throw error
+    } finally {
+      client.release()
+    }
+  },
+  removeItem: async (id: string, ref: ContextSetItemRef) => {
+    await ctx.ensureInit()
+    const client = await ctx.required.connect()
+
+    try {
+      await client.query('BEGIN')
+      const identity = await enterIdentityTierForReferences(client, [ref.noteId])
+      const noteId = identity.canonical(ref.space, ref.noteId)
       const { row } = await lockContextSetRow(client, id)
 
       if (!row) {
@@ -114,12 +180,17 @@ export const createContextSetsFacet = (ctx: PgDriverCtx): ContextSetsPersistence
       client.release()
     }
   },
-  reorderItems: async (id: string, noteIds: readonly string[]) => {
+  reorderItems: async (id: string, refs: readonly ContextSetItemRef[]) => {
     await ctx.ensureInit()
     const client = await ctx.required.connect()
 
     try {
       await client.query('BEGIN')
+      const identity = await enterIdentityTierForReferences(
+        client,
+        refs.map((ref) => ref.noteId),
+      )
+      const noteIds = refs.map((ref) => identity.canonical(ref.space, ref.noteId))
       const { row } = await lockContextSetRow(client, id)
 
       if (!row) {

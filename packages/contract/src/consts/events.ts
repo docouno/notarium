@@ -13,6 +13,10 @@ export const SSE_EVENT = {
   AGENT_SESSIONS: 'agent-sessions',
   /** Owner-scoped async-job progress. */
   JOB: 'job',
+  /** Changed ids from explicitly watched cross-space Context rows. */
+  CONTEXT_CHANGED: 'context-changed',
+  /** Every authorised active/supplemental bus is subscribed; a handoff may commit. */
+  READY: 'ready',
 } as const
 
 export type SseEvent = (typeof SSE_EVENT)[keyof typeof SSE_EVENT]

@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import type { ContextOrderEntry, Preview } from '@notarium/contract'
 import { Button } from '../../core/Button'
 import { Chip } from '../../core/Chips'
@@ -9,10 +9,15 @@ import { type ReorderHandle, useReorder } from '../../libs/dnd/reorder'
 import { ContextCard } from '../../widgets/ContextCard'
 import { StatusBadge, TokenMeter } from './ContextMeters'
 import { CardListSkeleton } from './ContextSkeletons'
-import { parseEntryKey, pinKey, setKey } from './helpers/contextOrder'
+import { orderItemsBy, parseEntryKey, pinKey, setKey } from './helpers/contextOrder'
 import { pinsTrimmed, setsTrimmed } from './helpers/contextTrim'
 import { formatTokens } from './helpers/format'
-import type { ContextPinView, ContextSetItemView, ContextSetRowView } from './types'
+import type {
+  ContextPinView,
+  ContextSetItemView,
+  ContextSetRowView,
+  ContextSetTailState,
+} from './types'
 import styles from './ContextPage.module.scss'
 
 export const PinEmptyState = ({
@@ -115,10 +120,9 @@ export const PinRow = ({
   )
 }
 
-/** One member note of a set as seen INSIDE the expanded set (#209): the same expandable card
- *  as a pin (title + home-space chip + weight meter → expands to its preview). The row menu
- *  opens the note or removes it FROM THE SET — a reversible, per-item trim (neutral, distinct
- *  from unpinning the whole set). A note the viewer can't reach never reaches this list. */
+/** One member note of a set as seen INSIDE the expanded set (#209). Resolved rows keep the
+ * pin-like preview/meter; an unavailable paged row remains removable but exposes neither
+ * content, an open action nor an invented zero weight. */
 export const SetItemRow = ({
   item,
   preview,
@@ -139,18 +143,30 @@ export const SetItemRow = ({
   <ContextCard
     title={
       <span className={styles.itemTitle}>
-        <span className={styles.itemName}>{item.title || 'Untitled'}</span>
+        <span className={styles.itemName}>{item.title ?? 'Unavailable note'}</span>
         <span className={styles.itemBadges} data-testid="context-item-badges">
           {item.folderOverview && <Chip>Folder overview</Chip>}
-          <Chip>{item.space}</Chip>
+          {item.space && <Chip>{item.space}</Chip>}
           {item.loaded === false && <StatusBadge state="trimmed" />}
         </span>
-        <TokenMeter tokens={item.tokens} scale={scale} trimmed={item.loaded === false} />
+        {item.tokens === undefined ? (
+          <span className={styles.meterSpacer} aria-hidden />
+        ) : (
+          <TokenMeter tokens={item.tokens} scale={scale} trimmed={item.loaded === false} />
+        )}
       </span>
     }
-    summary={preview?.snippet}
+    summary={item.title == null ? undefined : preview?.snippet}
     menu={[
-      { label: 'Open note', icon: <IconExternal size={15} />, onClick: () => onOpen(item.noteId) },
+      ...(item.title == null
+        ? []
+        : [
+            {
+              label: 'Open note',
+              icon: <IconExternal size={15} />,
+              onClick: () => onOpen(item.noteId),
+            },
+          ]),
       ...(editable
         ? [
             { divider: true } as const,
@@ -167,10 +183,9 @@ export const SetItemRow = ({
 
 /** A context set AS A PIN-LIST ROW (#209): an expandable card badged `Set` that reveals its
  *  member notes (each itself expandable, each removable from its own menu) — progressive
- *  disclosure, no separate manager. Weight = what the WHOLE set would cost against the scope
- *  budget — every member, dropped ones included — and the meter reads `trimmed` as soon as
- *  one member was dropped. That is the row's own claim about the set, not a share of the
- *  block caption above it, which sums only what the budget actually dropped.
+ *  disclosure, no separate manager. A budgeted row meters only loaded known weight; an
+ *  unweighed identity row meters its complete resolved membership. `trimmed` is the explicit
+ *  set-level hard-stop verdict, independent from access-only degradation.
  *  The row menu adds notes, unpins the set from this scope, or deletes it everywhere. */
 export const SetRow = ({
   set,
@@ -182,6 +197,9 @@ export const SetRow = ({
   onDelete,
   onRemoveItem,
   onReorderItems,
+  tail,
+  tailWake = 0,
+  onLoadTail,
   reorder,
   editable = true,
 }: {
@@ -194,18 +212,86 @@ export const SetRow = ({
   onDelete: (set: ContextSetRowView) => void
   onRemoveItem: (set: ContextSetRowView, noteId: string) => void
   onReorderItems: (set: ContextSetRowView, noteIds: string[]) => void
+  tail?: ContextSetTailState
+  tailWake?: number
+  onLoadTail: (set: ContextSetRowView, reset?: boolean) => void
   reorder?: ReorderHandle
   editable?: boolean
 }) => {
-  const total = set.items.reduce((s, i) => s + i.tokens, 0)
-  const trimmed = set.items.some((i) => i.loaded === false)
+  const [expanded, setExpanded] = useState(false)
+  const hasBudgetVerdict =
+    set.hasBudgetVerdict === true || set.items.some((item) => item.loaded !== undefined)
+  const total = set.items.reduce(
+    (sum, item) => sum + (!hasBudgetVerdict || item.loaded === true ? (item.tokens ?? 0) : 0),
+    0,
+  )
+  const trimmed = set.trimmed === true
+  const coordinateTail = set.homeSpace && set.itemsTotal !== undefined ? tail : undefined
+  const mergedItems = useMemo(() => {
+    const byIndex = new Map<number, ContextSetItemView>()
+
+    for (const item of set.items) {
+      if (item.sourceIndex !== undefined) {
+        byIndex.set(item.sourceIndex, item)
+      }
+    }
+    for (const item of coordinateTail?.items ?? []) {
+      const preview = byIndex.get(item.sourceIndex)
+      const unavailable = item.title == null || item.space == null
+
+      byIndex.set(item.sourceIndex, {
+        ...(preview ?? {}),
+        ...item,
+        order: item.sourceIndex,
+        ...(unavailable
+          ? {
+              folderOverview: undefined,
+              loaded: undefined,
+              space: null,
+              title: null,
+              tokens: undefined,
+            }
+          : {}),
+      })
+    }
+
+    const merged =
+      byIndex.size > 0
+        ? [...byIndex.values()].sort(
+            (left, right) => (left.sourceIndex ?? 0) - (right.sourceIndex ?? 0),
+          )
+        : set.items
+
+    return coordinateTail?.optimisticOrder
+      ? orderItemsBy(merged, coordinateTail.optimisticOrder)
+      : merged
+  }, [set.items, coordinateTail?.items, coordinateTail?.optimisticOrder])
+  const rawTotal = set.itemsTotal
+  const visibleCoordinates = new Set(
+    mergedItems.flatMap((item) => (item.sourceIndex === undefined ? [] : [item.sourceIndex])),
+  )
+  const hasMore = rawTotal !== undefined && visibleCoordinates.size < rawTotal
+
+  useEffect(() => {
+    if (expanded && hasMore && !coordinateTail) {
+      onLoadTail(set, true)
+    }
+  }, [coordinateTail, expanded, hasMore, onLoadTail, set, tailWake])
   // The set's OWN item order (#210) — a separate reorder list nested inside the expanded set.
   // Its `drag` is isolated from the outer pin+set list (each useReorder owns its own state),
   // so dragging a member never nudges the set among the pins. <2 items ⇒ inert.
-  const itemKeys = set.items.map((i) => i.noteId)
+  const itemKeys = mergedItems.map((item) => String(item.sourceIndex ?? item.order))
+  const itemByKey = new Map(itemKeys.map((key, index) => [key, mergedItems[index]]))
   const { handleFor: itemHandle, listProps: itemListProps } = useReorder(
     itemKeys,
-    (next) => onReorderItems(set, next),
+    (next) =>
+      onReorderItems(
+        set,
+        next.flatMap((key) => {
+          const item = itemByKey.get(key)
+          return item ? [item.noteId] : []
+        }),
+      ),
     !editable || itemKeys.length < 2,
   )
   return (
@@ -214,7 +300,12 @@ export const SetRow = ({
         <span className={styles.itemTitle}>
           <span className={styles.itemName}>{set.name}</span>
           <span className={styles.itemBadges}>
-            <Chip variant="accent">Set · {set.items.length}</Chip>
+            <Chip variant="accent">Set · {rawTotal ?? set.items.length}</Chip>
+            {rawTotal !== undefined && (set.itemsLoaded ?? 0) < rawTotal && (
+              <Chip>
+                {set.itemsLoaded ?? 0} of {rawTotal}
+              </Chip>
+            )}
             {trimmed && <StatusBadge state="trimmed" />}
           </span>
           <TokenMeter tokens={total} scale={scale} trimmed={trimmed} />
@@ -222,23 +313,38 @@ export const SetRow = ({
       }
       details={
         <div className={styles.list} {...itemListProps}>
-          {set.items.length === 0 ? (
+          {mergedItems.length === 0 && !hasMore ? (
             <p className={styles.blockCaption}>
               No notes to show — items in spaces you can’t access are hidden.
             </p>
           ) : (
-            set.items.map((item) => (
+            mergedItems.map((item) => (
               <SetItemRow
-                key={item.noteId}
+                key={`${item.sourceIndex ?? item.order}:${item.noteId}`}
                 item={item}
                 preview={previews[item.noteId]}
                 scale={scale}
                 onOpen={onOpen}
                 onRemove={() => onRemoveItem(set, item.noteId)}
-                reorder={itemHandle(item.noteId)}
+                reorder={itemHandle(String(item.sourceIndex ?? item.order))}
                 editable={editable}
               />
             ))
+          )}
+          {hasMore && (
+            <div className={styles.tailActions}>
+              {coordinateTail?.loading ? (
+                <CardListSkeleton rows={2} />
+              ) : coordinateTail?.error ? (
+                <Button variant="ghost" onClick={() => onLoadTail(set)}>
+                  Retry loading notes
+                </Button>
+              ) : (
+                <Button variant="ghost" onClick={() => onLoadTail(set)}>
+                  Show more notes
+                </Button>
+              )}
+            </div>
           )}
         </div>
       }
@@ -265,6 +371,8 @@ export const SetRow = ({
           : undefined
       }
       reorder={reorder}
+      open={expanded}
+      onToggle={setExpanded}
       testId="context-set-row"
     />
   )
@@ -287,6 +395,9 @@ export const PinsBlock = ({
   onRemoveItem,
   onReorder,
   onReorderSetItems,
+  tails,
+  tailWake,
+  onLoadSetTail,
   emptyHint,
   addTestId,
   listTestId,
@@ -307,6 +418,9 @@ export const PinsBlock = ({
   onReorder: (entries: ContextOrderEntry[]) => void
   /** Persist a new item order inside a set (#210). */
   onReorderSetItems: (set: ContextSetRowView, noteIds: string[]) => void
+  tails: Record<string, ContextSetTailState>
+  tailWake: Record<string, number>
+  onLoadSetTail: (set: ContextSetRowView, reset?: boolean) => void
   emptyHint: string
   addTestId: string
   listTestId: string
@@ -396,6 +510,9 @@ export const PinsBlock = ({
                   onDelete={onDeleteSet}
                   onRemoveItem={onRemoveItem}
                   onReorderItems={onReorderSetItems}
+                  tail={tails[e.set.id]}
+                  tailWake={tailWake[e.set.id] ?? 0}
+                  onLoadTail={onLoadSetTail}
                   reorder={handleFor(e.key)}
                   editable={editable}
                 />

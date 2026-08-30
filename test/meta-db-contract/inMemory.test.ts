@@ -45,6 +45,7 @@ import { describeAbilityPreferencesContract } from './abilityPreferencesContract
 import { describeAgentDeltaCursorsContract } from './agentDeltaCursorsContract'
 import { describeAgentSessionsContract } from './agentSessionsContract'
 import { describeCausalMetadataContract } from './causalMetadataContract'
+import { describeContextSetsContract } from './contextSetsContract'
 import { describeFavoritesContract } from './favoritesContract'
 import { describeGatewayStateContract } from './gatewayStateContract'
 import { describeLegacyNameAliasesContract } from './legacyNameAliasesContract'
@@ -158,6 +159,10 @@ describeAgentSessionsContract('in-memory twin', async () => ({
 }))
 
 describeFavoritesContract('in-memory twin', async () => ({ persistence: new InMemoryFavorites() }))
+
+describeContextSetsContract('in-memory twin', async () => ({
+  persistence: new InMemoryContextSets(),
+}))
 
 // The three ability twins, through the SAME contracts the durable drivers answer. The
 // cascades a Map cannot have are supplied the way this host really has them: the

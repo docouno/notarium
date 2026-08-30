@@ -29,17 +29,26 @@ type IdentityRow = {
 
 const SELECT_COLUMNS =
   'id, file_path, space, created_at, materialized, deleted_at, address_revision, legacy_name_aliases, settlement_successor_id'
+const SQLITE_ID_BATCH = 500
 
-const recordOfRow = (r: IdentityRow): IdentityRecord => ({
-  id: r.id,
-  legacyNameAliases: canonicalLegacyNameAliases(parseJson(r.legacy_name_aliases)),
-  filePath: r.file_path,
-  space: r.space,
-  createdAt: r.created_at,
-  materialized: r.materialized !== 0,
-  deletedAt: r.deleted_at,
-  addressRevision: Number(r.address_revision),
-})
+const recordOfRow = (r: IdentityRow): IdentityRecord => {
+  const record: IdentityRecord = {
+    id: r.id,
+    legacyNameAliases: canonicalLegacyNameAliases(parseJson(r.legacy_name_aliases)),
+    filePath: r.file_path,
+    space: r.space,
+    createdAt: r.created_at,
+    materialized: r.materialized !== 0,
+    deletedAt: r.deleted_at,
+    addressRevision: Number(r.address_revision),
+  }
+
+  if (r.settlement_successor_id) {
+    record.settlementSuccessorId = r.settlement_successor_id
+  }
+
+  return record
+}
 
 const parseJson = (raw: string | null): unknown => {
   try {
@@ -104,6 +113,24 @@ export const createIdentityFacet = (ctx: SqliteDriverCtx): IdentityPersistence =
       .get(id) as IdentityRow | undefined
 
     return r ? recordOfRow(r) : null
+  },
+  findByIds: async (ids: readonly string[]) => {
+    await ctx.ensureInit()
+    const wanted = [...new Set(ids)]
+    const byId = new Map<string, IdentityRecord>()
+
+    for (let offset = 0; offset < wanted.length; offset += SQLITE_ID_BATCH) {
+      const chunk = wanted.slice(offset, offset + SQLITE_ID_BATCH)
+      const rows = ctx.required
+        .prepare(
+          `SELECT ${SELECT_COLUMNS} FROM note_identity WHERE id IN (${chunk.map(() => '?').join(', ')})`,
+        )
+        .all(...chunk) as IdentityRow[]
+
+      rows.forEach((row) => byId.set(row.id, recordOfRow(row)))
+    }
+
+    return wanted.flatMap((id) => (byId.has(id) ? [byId.get(id)!] : []))
   },
   claimMany: async (records: readonly IdentityRecord[]) => {
     if (!records.length) {

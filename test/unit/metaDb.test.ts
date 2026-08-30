@@ -599,10 +599,10 @@ describe('SqliteMetaDb', () => {
       expect(readd?.items).toHaveLength(2)
       expect((await db.contextSets.getSet('cs1'))?.items).toHaveLength(2)
       // removeItem drops by noteId and returns the updated set; a missing set → null.
-      const removed = await db.contextSets.removeItem('cs1', 'n2')
+      const removed = await db.contextSets.removeItem('cs1', { space: 'spc-b', noteId: 'n2' })
       expect(removed?.items).toEqual([{ space: 'spc-a', noteId: 'n1' }])
       expect(await db.contextSets.addItem('missing', { space: 'spc-a', noteId: 'x' })).toBeNull()
-      expect(await db.contextSets.removeItem('missing', 'x')).toBeNull()
+      expect(await db.contextSets.removeItem('missing', { space: 'spc-a', noteId: 'x' })).toBeNull()
       // Re-add n2 so the rest of the flow (attach/detach/delete) sees a 2-item set.
       await db.contextSets.addItem('cs1', { space: 'spc-b', noteId: 'n2' })
       expect((await db.contextSets.getSet('cs1'))?.items).toHaveLength(2)
@@ -684,7 +684,7 @@ describe('SqliteMetaDb', () => {
       // Concurrent add + remove of DIFFERENT ids likewise both land.
       await Promise.all([
         db.contextSets.addItem('cs2', { space: 'spc-c', noteId: 'c' }),
-        db.contextSets.removeItem('cs2', 'a'),
+        db.contextSets.removeItem('cs2', { space: 'spc-a', noteId: 'a' }),
       ])
       expect((await db.contextSets.getSet('cs2'))?.items.map((i) => i.noteId).sort()).toEqual([
         'b',
@@ -706,15 +706,16 @@ describe('SqliteMetaDb', () => {
         createdAt: 'x',
       })
       // A full sequence permutes every slot.
-      const r = await db.contextSets.reorderItems('cs3', ['c', 'a', 'b'])
+      const ref = (noteId: string) => ({ space: 'sp', noteId })
+      const r = await db.contextSets.reorderItems('cs3', ['c', 'a', 'b'].map(ref))
       expect(r?.items.map((i) => i.noteId)).toEqual(['c', 'a', 'b'])
       // A PARTIAL sequence (a member the reordering view couldn't see): only the NAMED slots are
       // permuted; the unnamed 'c' keeps its ORIGINAL slot (index 0), NOT shoved to the tail — so a
       // deduped-hidden member isn't silently relocated across every scope the set attaches to. An
       // unknown id ('zzz') is ignored.
-      const r2 = await db.contextSets.reorderItems('cs3', ['b', 'zzz', 'a'])
+      const r2 = await db.contextSets.reorderItems('cs3', ['b', 'zzz', 'a'].map(ref))
       expect(r2?.items.map((i) => i.noteId)).toEqual(['c', 'b', 'a'])
-      expect(await db.contextSets.reorderItems('missing', ['a'])).toBeNull()
+      expect(await db.contextSets.reorderItems('missing', [ref('a')])).toBeNull()
     })
   })
 

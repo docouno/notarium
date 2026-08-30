@@ -25,6 +25,8 @@ export const ContextCard = ({
   menu,
   muted = false,
   reorder,
+  open,
+  onToggle,
   testId,
 }: {
   title: ReactNode
@@ -38,6 +40,8 @@ export const ContextCard = ({
   muted?: boolean
   /** Make the row a drag handle for list reordering (#210). Absent ⇒ a plain card. */
   reorder?: ReorderHandle
+  open?: boolean
+  onToggle?: (open: boolean) => void
   testId?: string
 }) => {
   const [menuAt, setMenuAt] = useState<{ x: number; y: number } | null>(null)
@@ -72,6 +76,8 @@ export const ContextCard = ({
         expandable={canExpand}
         aside={aside}
         reorder={reorder}
+        open={open}
+        onToggle={onToggle}
         grip={reorder ? <IconGrip size={15} /> : undefined}
         onContextMenu={
           hasMenu

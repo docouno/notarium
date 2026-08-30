@@ -10,10 +10,13 @@
 //   - Delete cascades its attachments.
 
 import type { FastifyInstance } from 'fastify'
+import { request as httpRequest } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { REQUEST_TIMING_HEADER } from '@notarium/contract'
 
 import { createApp, type Fixture } from './app.js'
+import { InMemoryContextSets } from './contextSets'
 
 const fixture = (): Fixture => ({
   now: '2026-07-07T12:00:00.000Z',
@@ -108,6 +111,62 @@ let port: number
 const listen = async (instance: FastifyInstance): Promise<number> => {
   await instance.listen({ port: 0, host: '127.0.0.1' })
   return (instance.server.address() as AddressInfo).port
+}
+
+const postJsonInTwoChunks = async (
+  path: string,
+  cookie: string,
+  payload: unknown,
+  pauseMs: number,
+  serverReceived: Promise<void>,
+): Promise<{
+  body: string
+  headers: Record<string, string | string[] | undefined>
+  status: number
+}> => {
+  const body = JSON.stringify(payload)
+  const splitAt = Math.floor(body.length / 2)
+
+  return new Promise((resolve, reject) => {
+    const request = httpRequest(
+      {
+        host: '127.0.0.1',
+        port,
+        path,
+        method: 'POST',
+        headers: {
+          cookie,
+          'content-length': Buffer.byteLength(body),
+          'content-type': 'application/json',
+        },
+      },
+      (response) => {
+        const chunks: Buffer[] = []
+
+        response.on('data', (chunk: Buffer) => chunks.push(chunk))
+        response.on('end', () => {
+          resolve({
+            body: Buffer.concat(chunks).toString('utf8'),
+            headers: response.headers,
+            status: response.statusCode ?? 0,
+          })
+        })
+      },
+    )
+
+    request.on('error', reject)
+    request.on('socket', (socket) => socket.setNoDelay(true))
+    request.flushHeaders()
+    request.write(body.slice(0, splitAt), (error) => {
+      if (error) {
+        reject(error)
+        return
+      }
+      void serverReceived
+        .then(() => new Promise((done) => setTimeout(done, pauseMs)))
+        .then(() => request.end(body.slice(splitAt)), reject)
+    })
+  })
 }
 
 beforeEach(async () => {
@@ -246,29 +305,44 @@ describe('context sets (#209)', () => {
     expect(item).toMatchObject({ noteId: 'conv-overview', folderOverview: true })
   })
 
-  it('DEGRADES per reader: a member of the project but NOT the set’s home space gets the set with its items dropped', async () => {
+  it('DEGRADES per reader without exposing raw coordinates from the hidden home', async () => {
     const sam = await loginCookie('sam', 'sam-password-1')
-    const setId = await makeSet(sam, 'conventions', 'Front', [['conventions', 'conv-a']])
+    const setId = await makeSet(sam, 'conventions', 'Front', [
+      ['conventions', 'conv-a'],
+      ['product', 'prod-note'],
+    ])
     await send('PUT', `/api/s/product/projects/${PROJECT}/context-sets/${setId}`, sam)
 
     const mallory = await loginCookie('mallory', 'mallory-password-1')
     const mBearer = await patFor(mallory)
     const ctx = await getJson(`/api/s/product/projects/${PROJECT}/agent-context`, mallory)
-    const sets = ctx.sets as Array<{ items: unknown[]; homeSpace: string; name: string }>
-    // The set is still attached (visible), but conv-a is inaccessible to mallory → dropped.
+    const sets = ctx.sets as Array<{
+      items: Array<{ noteId: string; order: number; sourceIndex?: number }>
+      homeSpace: string
+      name: string
+      itemsTotal?: number
+      itemsCursor?: number
+    }>
+    // The set is still attached and its product note is visible, but conv-a is
+    // inaccessible. The surviving row gets a dense visible order, not raw index 1.
     expect(sets).toHaveLength(1)
-    expect(sets[0].items).toHaveLength(0)
+    expect(sets[0].items).toEqual([expect.objectContaining({ noteId: 'prod-note', order: 0 })])
     // …and its home-space slug is blanked for her (she isn't a conventions member and can
     // never CRUD it there) — no cross-space slug leak (#209). The name still shows (the set
     // is deliberately attached to her project).
     expect(sets[0].homeSpace).toBe('')
     expect(sets[0].name).toBe('Front')
+    expect(sets[0].itemsTotal).toBeUndefined()
+    expect(sets[0].itemsCursor).toBeUndefined()
+    expect(sets[0].items.some((item) => item.sourceIndex !== undefined)).toBe(false)
     // …and it never reaches her agent bundle either.
     const ss = await startSession(mBearer, { project: 'product/web' })
     const always = (ss.project as { alwaysLoad: Array<{ noteId: string }> }).alwaysLoad.map(
       (p) => p.noteId,
     )
     expect(always).not.toContain('conv-a')
+    expect(always).toContain('prod-note')
+    expect(ss.truncated).toBe(true)
   })
 
   it('a set attached to MY personal scope rides /api/me/agent-context and the profile alwaysLoad', async () => {
@@ -399,11 +473,10 @@ describe('context sets (#209)', () => {
     expect(ninaSet?.attachments.filter((a) => a.kind === 'project')).toEqual([])
   })
 
-  it('management view DEGRADES per reader: an unreachable item keeps its ref with title=null (not dropped)', async () => {
+  it('management view keeps raw membership without resolving presentation', async () => {
     // A set homed in PRODUCT with a cross-space item from CONVENTIONS. sam (member of both)
     // can add it; mallory (member of product, NOT conventions) lists the set but cannot reach
-    // the item — describeContextSet must RETAIN the ref and null its title (an honest "no
-    // access" row), UNLIKE the agent-context path which DROPS inaccessible items entirely.
+    // the item — the manager keeps only the stored ref and does not resolve an access oracle.
     const sam = await loginCookie('sam', 'sam-password-1')
     const setId = await makeSet(sam, 'product', 'Mixed', [['conventions', 'conv-a']])
 
@@ -412,13 +485,455 @@ describe('context sets (#209)', () => {
     const set = (
       list.sets as Array<{
         id: string
-        items: Array<{ noteId: string; title: string | null; space: string | null }>
+        items: Array<{ noteId: string }>
       }>
     ).find((s) => s.id === setId)
     expect(set).toBeTruthy()
     expect(set?.items).toHaveLength(1) // ref RETAINED (not dropped)
     expect(set?.items[0].noteId).toBe('conv-a')
-    expect(set?.items[0].title).toBeNull() // title nulled — honest no-access
-    expect(set?.items[0].space).toBeNull() // …and the home-space slug nulled too — no leak
+    expect(set?.items[0]).toEqual({ noteId: 'conv-a' })
+  })
+
+  it('paginates raw membership before bounded presentation and degrades inaccessible rows', async () => {
+    const sam = await loginCookie('sam', 'sam-password-1')
+    const setId = await makeSet(sam, 'product', 'Paged', [
+      ['conventions', 'conv-a'],
+      ['product', 'prod-note'],
+    ])
+    const page = await app.inject({
+      method: 'GET',
+      url: `/api/s/product/context-sets/${setId}/items?offset=0&limit=1`,
+      headers: { cookie: sam },
+    })
+    expect(page.statusCode).toBe(200)
+    expect(page.json()).toEqual({
+      total: 2,
+      items: [
+        {
+          sourceIndex: 0,
+          noteId: 'conv-a',
+          title: 'Front Conventions',
+          space: 'conventions',
+        },
+      ],
+    })
+
+    const mallory = await loginCookie('mallory', 'mallory-password-1')
+    const degraded = await app.inject({
+      method: 'GET',
+      url: `/api/s/product/context-sets/${setId}/items?offset=0&limit=1`,
+      headers: { cookie: mallory },
+    })
+    expect(degraded.json()).toEqual({
+      total: 2,
+      items: [{ sourceIndex: 0, noteId: 'conv-a', title: null, space: null }],
+    })
+  })
+
+  it('does not build a second whole-space inventory after slicing an item page', async () => {
+    await app.close()
+    let conventionLists = 0
+
+    app = await createApp(fixture(), {
+      configureWorld: ({ slug, store }) => {
+        if (slug !== 'conventions') {
+          return
+        }
+        const list = store.list.bind(store)
+
+        vi.spyOn(store, 'list').mockImplementation(async (...args) => {
+          conventionLists += 1
+          return list(...args)
+        })
+      },
+    })
+    port = await listen(app)
+    const sam = await loginCookie('sam', 'sam-password-1')
+    const setId = await makeSet(sam, 'product', 'Bounded page', [['conventions', 'conv-a']])
+
+    conventionLists = 0
+    const page = await app.inject({
+      method: 'GET',
+      url: `/api/s/product/context-sets/${setId}/items?offset=0&limit=1`,
+      headers: { cookie: sam },
+    })
+
+    expect(page.statusCode).toBe(200)
+    // The fake has no global identity registry, so noteStore pays its documented one-list
+    // fallback. The page presenter must not add metaNoteAccess's second full inventory.
+    expect(conventionLists).toBe(1)
+  })
+
+  it('adds a mixed batch in one request with private failures and raw response items', async () => {
+    const cookie = await loginCookie('sam', 'sam-password-1')
+    const setId = await makeSet(cookie, 'product', 'Bulk', [])
+    const added = await app.inject({
+      method: 'POST',
+      url: `/api/s/product/context-sets/${setId}/add-many`,
+      headers: { cookie },
+      payload: {
+        items: [
+          { space: 'conventions', noteId: 'conv-a' },
+          { space: 'conventions', noteId: 'conv-b' },
+          { space: 'conventions', noteId: 'unknown' },
+        ],
+      },
+    })
+    expect(added.statusCode).toBe(200)
+    const serverStartedAt = Number(added.headers[REQUEST_TIMING_HEADER.STARTED_AT])
+    const serverEndedAt = Number(added.headers[REQUEST_TIMING_HEADER.ENDED_AT])
+
+    expect(serverStartedAt).toBeGreaterThan(0)
+    expect(serverEndedAt).toBeGreaterThan(serverStartedAt)
+    expect(added.json()).toMatchObject({
+      ok: true,
+      added: ['conv-a', 'conv-b'],
+      failed: [{ id: 'unknown', reason: 'not_found', error: 'Note is unavailable' }],
+      set: { items: [{ noteId: 'conv-a' }, { noteId: 'conv-b' }] },
+    })
+
+    const duplicate = await app.inject({
+      method: 'POST',
+      url: `/api/s/product/context-sets/${setId}/add-many`,
+      headers: { cookie },
+      // A forged/wrong hint cannot become authority; the global fallback still
+      // resolves the readable note and keeps the idempotent result.
+      payload: { items: [{ space: 'product', noteId: 'conv-a' }] },
+    })
+    expect(duplicate.json()).toMatchObject({ added: [], failed: [] })
+  })
+
+  it('starts bulk liveness timing before the request body finishes parsing', async () => {
+    const cookie = await loginCookie('sam', 'sam-password-1')
+    const setId = await makeSet(cookie, 'product', 'Timed bulk', [])
+    const pauseMs = 80
+    // Do not start the pause at the client write call: the kernel may buffer that
+    // tiny first chunk. The server's request event proves Fastify has received the
+    // headers and can enter its onRequest hook before we hold the remaining bytes.
+    const serverReceived = new Promise<void>((resolve) =>
+      app.server.once('request', () => resolve()),
+    )
+    const response = await postJsonInTwoChunks(
+      `/api/s/product/context-sets/${setId}/add-many`,
+      cookie,
+      { items: [{ space: 'conventions', noteId: 'conv-a' }] },
+      pauseMs,
+      serverReceived,
+    )
+
+    expect(response.status).toBe(200)
+    const serverStartedAt = Number(response.headers[REQUEST_TIMING_HEADER.STARTED_AT])
+    const serverEndedAt = Number(response.headers[REQUEST_TIMING_HEADER.ENDED_AT])
+
+    expect(JSON.parse(response.body)).toMatchObject({ ok: true, added: ['conv-a'] })
+    expect(serverEndedAt - serverStartedAt).toBeGreaterThanOrEqual(pauseMs / 2)
+  })
+
+  it('collapses inaccessible, unknown, and deleted bulk refs to one failure shape', async () => {
+    const sam = await loginCookie('sam', 'sam-password-1')
+    const removed = await app.inject({
+      method: 'DELETE',
+      url: '/api/note?id=prod-note',
+      headers: { cookie: sam },
+    })
+    expect(removed.statusCode).toBe(200)
+    const mallory = await loginCookie('mallory', 'mallory-password-1')
+    const setId = await makeSet(mallory, 'product', 'Private failures', [])
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/s/product/context-sets/${setId}/add-many`,
+      headers: { cookie: mallory },
+      payload: {
+        items: [
+          { space: 'conventions', noteId: 'conv-a' },
+          { space: 'product', noteId: 'unknown' },
+          { space: 'product', noteId: 'prod-note' },
+        ],
+      },
+    })
+
+    expect(response.statusCode).toBe(200)
+    expect(response.json().failed).toEqual(
+      ['conv-a', 'unknown', 'prod-note'].map((id) => ({
+        id,
+        reason: 'not_found',
+        error: 'Note is unavailable',
+      })),
+    )
+  })
+
+  it('ignores hint spellings without allocating a whole-space inventory', async () => {
+    await app.close()
+    let conventionLists = 0
+
+    app = await createApp(fixture(), {
+      configureWorld: ({ slug, store }) => {
+        if (slug !== 'conventions') {
+          return
+        }
+        const list = store.list.bind(store)
+
+        vi.spyOn(store, 'list').mockImplementation(async (...args) => {
+          conventionLists += 1
+          return list(...args)
+        })
+      },
+    })
+    port = await listen(app)
+    const cookie = await loginCookie('sam', 'sam-password-1')
+    const setId = await makeSet(cookie, 'product', 'Hint aliases', [])
+    conventionLists = 0
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/s/product/context-sets/${setId}/add-many`,
+      headers: { cookie },
+      payload: {
+        items: [
+          { space: 'CONVENTIONS!', noteId: 'conv-a' },
+          { space: 'conventions', noteId: 'conv-b' },
+        ],
+      },
+    })
+
+    expect(response.statusCode).toBe(200)
+    expect(response.json()).toMatchObject({ added: ['conv-a', 'conv-b'], failed: [] })
+    // This meta-DB-less fake pays one documented exact-id list fallback per input.
+    // Production resolves both through O(1) identity rows; neither path builds a Map/Set copy.
+    expect(conventionLists).toBe(2)
+  })
+
+  it('removes every conflict returned by an attempt and retries valid refs once', async () => {
+    await app.close()
+    class ConflictingContextSets extends InMemoryContextSets {
+      attempts: string[][] = []
+
+      override async addItems(id: string, refs: readonly { space: string; noteId: string }[]) {
+        this.attempts.push(refs.map((ref) => ref.noteId))
+
+        if (this.attempts.length === 1) {
+          return { set: null, added: [], conflicts: ['conv-b'] }
+        }
+
+        return super.addItems(id, refs)
+      }
+    }
+    const facet = new ConflictingContextSets()
+    app = await createApp(fixture(), { contextSets: facet })
+    port = await listen(app)
+    const cookie = await loginCookie('sam', 'sam-password-1')
+    const setId = await makeSet(cookie, 'product', 'Conflict retry', [])
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/s/product/context-sets/${setId}/add-many`,
+      headers: { cookie },
+      payload: {
+        items: [
+          { space: 'conventions', noteId: 'conv-a' },
+          { space: 'conventions', noteId: 'conv-b' },
+        ],
+      },
+    })
+
+    expect(response.statusCode).toBe(200)
+    expect(facet.attempts).toEqual([['conv-a', 'conv-b'], ['conv-a']])
+    expect(response.json()).toMatchObject({
+      added: ['conv-a'],
+      failed: [
+        {
+          id: 'conv-b',
+          reason: 'conflict',
+          error: 'Reference changed while the set was updated',
+        },
+      ],
+      set: { items: [{ noteId: 'conv-a' }] },
+    })
+  })
+
+  it('fails closed when a bulk identity conflict cannot name progress', async () => {
+    await app.close()
+    const facet = new InMemoryContextSets()
+
+    vi.spyOn(facet, 'addItems').mockRejectedValue(
+      Object.assign(new Error('identity changed'), { isConflict: true }),
+    )
+    app = await createApp(fixture(), { contextSets: facet })
+    port = await listen(app)
+    const cookie = await loginCookie('sam', 'sam-password-1')
+    const setId = await makeSet(cookie, 'product', 'Unnameable conflict', [])
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/s/product/context-sets/${setId}/add-many`,
+      headers: { cookie },
+      payload: { items: [{ space: 'conventions', noteId: 'conv-a' }] },
+    })
+
+    expect(response.statusCode).toBe(409)
+    expect((await facet.getSet(setId))?.items).toEqual([])
+  })
+
+  it('keeps the real CachedStore fact path identical for 250 and 1000 door refs', async () => {
+    const run = async (count: number) => {
+      await app.close()
+      const seeded = fixture()
+      const conventions = seeded.spaces.find((space) => space.slug === 'conventions')!
+      const ids = Array.from(
+        { length: count },
+        (_, index) => `door-${String(index).padStart(4, '0')}`,
+      )
+
+      conventions.notes.push(
+        ...ids.map((id, index) => ({
+          id,
+          title: `Door note ${index}`,
+          class: 'user-doc' as const,
+          filePath: `door/note-${String(index).padStart(4, '0')}.md`,
+          content: 'bounded fact path',
+        })),
+      )
+      const facet = new InMemoryContextSets()
+      const factIds: string[] = []
+      let factCalls = 0
+      let fullReads = 0
+
+      app = await createApp(seeded, {
+        contextSets: facet,
+        configureWorld: ({ slug, engine, store }) => {
+          if (slug !== 'conventions') {
+            return
+          }
+          const noteFacts = store.noteFacts!.bind(store)
+          const read = engine.read.bind(engine)
+
+          vi.spyOn(store, 'noteFacts').mockImplementation(async (requested) => {
+            factCalls += 1
+            factIds.push(...requested)
+            return noteFacts(requested)
+          })
+          vi.spyOn(engine, 'read').mockImplementation(async (...args) => {
+            fullReads += 1
+            return read(...args)
+          })
+        },
+        seedContextSets: async ({ contextSets, projectIdOf, spaceIdOf }) => {
+          const setId = 'door-bounded-set'
+          const homeSpace = spaceIdOf('conventions')
+
+          await contextSets.createSet({
+            id: setId,
+            homeSpace,
+            name: 'Door bounded set',
+            items: ids.map((noteId) => ({ space: homeSpace, noteId })),
+            createdAt: '2026-07-07T12:00:00.000Z',
+          })
+          await contextSets.attach({
+            setId,
+            targetKind: 'project',
+            targetId: await projectIdOf('product', 'web'),
+            targetSpace: spaceIdOf('product'),
+            createdAt: '2026-07-07T12:00:00.000Z',
+          })
+        },
+      })
+      port = await listen(app)
+      const cookie = await loginCookie('sam', 'sam-password-1')
+
+      factCalls = 0
+      factIds.length = 0
+      fullReads = 0
+      const preview = await getJson(`/api/s/product/projects/${PROJECT}/agent-context`, cookie)
+      const afterPreview = { factCalls, factIds: [...factIds], fullReads }
+
+      await getJson('/api/context-sets', cookie)
+      const reordered = await send(
+        'PUT',
+        '/api/s/conventions/context-sets/door-bounded-set/order',
+        cookie,
+        { noteIds: ids },
+      )
+      expect(reordered.statusCode).toBe(200)
+      expect({ factCalls, factIds, fullReads }).toEqual(afterPreview)
+
+      return { preview, ...afterPreview }
+    }
+    const bounded = await run(250)
+    const oversized = await run(1_000)
+
+    expect(bounded.factCalls).toBe(250)
+    expect(oversized.factCalls).toBe(250)
+    expect(oversized.factIds).toEqual(bounded.factIds)
+    expect(bounded.fullReads).toBe(0)
+    expect(oversized.fullReads).toBe(0)
+    expect(oversized.preview.sets[0]).toMatchObject({
+      itemsLoaded: 250,
+      itemsCursor: 250,
+      trimmed: true,
+    })
+  }, 20_000)
+
+  it('seeds an injected context facet after identities and repeats it after reset', async () => {
+    await app.close()
+    const facet = new InMemoryContextSets()
+    let seedCalls = 0
+    let engineReads = 0
+
+    app = await createApp(fixture(), {
+      contextSets: facet,
+      configureWorld: ({ slug, engine }) => {
+        if (slug !== 'conventions') {
+          return
+        }
+        const read = engine.read.bind(engine)
+        vi.spyOn(engine, 'read').mockImplementation(async (...args) => {
+          engineReads += 1
+          return read(...args)
+        })
+      },
+      seedContextSets: async ({ contextSets, projectIdOf, noteIdAt, spaceIdOf }) => {
+        seedCalls += 1
+        const setId = 'seeded-context-set'
+        await contextSets.createSet({
+          id: setId,
+          homeSpace: spaceIdOf('conventions'),
+          name: 'Seeded',
+          items: [
+            {
+              space: spaceIdOf('conventions'),
+              noteId: await noteIdAt('conventions', 'front.md'),
+            },
+          ],
+          createdAt: '2026-07-07T12:00:00.000Z',
+        })
+        await contextSets.attach({
+          setId,
+          targetKind: 'project',
+          targetId: await projectIdOf('product', 'web'),
+          targetSpace: spaceIdOf('product'),
+          createdAt: '2026-07-07T12:00:00.000Z',
+        })
+      },
+    })
+    port = await listen(app)
+    const cookie = await loginCookie('sam', 'sam-password-1')
+    const first = await getJson(`/api/s/product/projects/${PROJECT}/agent-context`, cookie)
+
+    expect(first.sets[0]).toMatchObject({ id: 'seeded-context-set', itemsLoaded: 1 })
+    expect(engineReads).toBe(0)
+    await getJson('/api/context-sets', cookie)
+    const duplicate = await send(
+      'POST',
+      '/api/s/conventions/context-sets/seeded-context-set/items',
+      cookie,
+      { space: 'conventions', noteId: 'conv-a' },
+    )
+    expect(duplicate.statusCode).toBe(200)
+    expect(duplicate.json().set.items).toEqual([{ noteId: 'conv-a' }])
+    // Single-add still performs its one input authorization read; the raw mutation
+    // response does not walk the existing membership again.
+    expect(engineReads).toBe(1)
+    await app.inject({ method: 'POST', url: '/api/__test/reset', payload: {} })
+    const resetCookie = await loginCookie('sam', 'sam-password-1')
+    const second = await getJson(`/api/s/product/projects/${PROJECT}/agent-context`, resetCookie)
+    expect(second.sets[0]).toMatchObject({ id: 'seeded-context-set', itemsLoaded: 1 })
+    expect(seedCalls).toBe(2)
   })
 })

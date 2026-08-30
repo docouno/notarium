@@ -924,6 +924,12 @@ export type ContextSetAttachmentRecord = {
   createdAt: string
 }
 
+export type ContextSetItemsAddResult = {
+  set: ContextSetRecord | null
+  added: string[]
+  conflicts: string[]
+}
+
 /** Persistence for context sets + their scope attachments (a delete cascades
  *  attachments). OPTIONAL — a meta-DB-less host has no sets. */
 export type ContextSetsPersistence = {
@@ -934,12 +940,16 @@ export type ContextSetsPersistence = {
   /** Atomic idempotent-by-noteId add (serialized read-mutate-write so concurrent
    *  edits don't clobber); returns the updated set, `null` = gone. */
   addItem(id: string, ref: ContextSetItemRef): Promise<ContextSetRecord | null>
-  /** Atomic remove by noteId (same serialization as {@link addItem}). `null` = gone. */
-  removeItem(id: string, noteId: string): Promise<ContextSetRecord | null>
-  /** Atomic reorder to the given note-id sequence. SLOT-PRESERVING — an item not named
+  /** One transaction attempt for a bulk add. Identity conflicts are collected before
+   * any membership write and returned so the application can remove them and retry. */
+  addItems(id: string, refs: readonly ContextSetItemRef[]): Promise<ContextSetItemsAddResult>
+  /** Atomic remove by exact note reference (same identity→set serialization as
+   *  {@link addItem}). `null` = gone. */
+  removeItem(id: string, ref: ContextSetItemRef): Promise<ContextSetRecord | null>
+  /** Atomic reorder to the given exact-reference sequence. SLOT-PRESERVING — an item not named
    *  (deduped-out of the reader's view, or added concurrently) keeps its original slot,
    *  never moved to the tail. Unknown ids ignored. `null` = gone. */
-  reorderItems(id: string, noteIds: readonly string[]): Promise<ContextSetRecord | null>
+  reorderItems(id: string, refs: readonly ContextSetItemRef[]): Promise<ContextSetRecord | null>
   deleteSet(id: string): Promise<void>
   attach(record: ContextSetAttachmentRecord): Promise<void>
   detach(setId: string, targetKind: ContextSetTargetKind, targetId: string): Promise<void>

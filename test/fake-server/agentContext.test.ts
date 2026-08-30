@@ -281,7 +281,6 @@ describe('agent-context pult (#165): preview', () => {
     expect(ctx.budgetTokens).toBe(PERSONAL_TOKEN_BUDGET)
     expect(ctx.loadedTokens).toBeLessThanOrEqual(ctx.budgetTokens)
     expect(ctx.loadedTokens + perPinTokens).toBeGreaterThan(ctx.budgetTokens)
-    expect(ctx.totalTokens).toBe(pins.reduce((sum, p) => sum + p.tokens, 0))
   })
 
   it('PERSONAL agent-context: pins load first, then memory rides the SAME budget — over-budget pins trim ALL memory (#208 memory[].loaded)', async () => {
@@ -1009,7 +1008,10 @@ describe('the addressed role vs the role the agent loads (#309)', () => {
     }
 
     const named = await getJson(`/api/me/agent-roles/${personalRole}/context`, cookie)
-    const sets = named.role.sets as Array<{ id: string; items: Array<{ noteId: string }> }>
+    const sets = named.role.sets as Array<{
+      id: string
+      items: Array<{ noteId: string; sourceIndex?: number }>
+    }>
 
     // Both memberships are real and both are the author's — the surface that edits them
     // has to show both, or one of them cannot be removed at all.
@@ -1017,6 +1019,9 @@ describe('the addressed role vs the role the agent loads (#309)', () => {
     expect(sets.map((set) => set.items.filter((item) => item.noteId === shared).length)).toEqual([
       1, 1,
     ])
+    expect(sets.flatMap((set) => set.items).every((item) => item.sourceIndex === undefined)).toBe(
+      true,
+    )
   })
 
   /** The picker offers what the agent would load. A role the viewer switched off is not

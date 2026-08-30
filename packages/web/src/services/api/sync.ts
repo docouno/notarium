@@ -31,7 +31,11 @@ export const syncApi = {
    *  without a reload.
    *
    *  `onAgentSessions` fires on the owner-scoped `agent-sessions` event. It is a
-   *  nudge only; the owner-gated session REST routes remain the source of truth. */
+   *  nudge only; the owner-gated session REST routes remain the source of truth.
+   *  `onReady` fires only after the server acquired every authorised active and
+   *  supplemental bus; unlike browser `open`, it is safe as a watch handoff barrier.
+   *  `watchSpaces` multiplexes explicitly rendered cross-space context rows onto this
+   *  same EventSource; the server re-checks read access for every requested slug. */
   events: (
     space: string,
     onEvent: (event: StoreEvent) => void,
@@ -40,11 +44,38 @@ export const syncApi = {
     onMembers?: () => void,
     onRename?: () => void,
     onAgentSessions?: () => void,
-    onOpen?: () => void,
+    onOpen?: (reconnected: boolean) => void,
+    watchSpaces: readonly string[] = [],
+    onContextEvent?: (event: StoreEvent, sourceSpace: string) => void,
+    onReady?: (reconnected: boolean) => void,
   ): (() => void) => {
-    const es = new EventSource(`${sp(space)}/events`)
+    const candidates = [
+      ...new Set(watchSpaces.filter((candidate) => candidate && candidate !== space)),
+    ]
+      .sort()
+      .slice(0, 250)
+    let watch = ''
 
-    es.onopen = () => onOpen?.()
+    for (const candidate of candidates) {
+      const next = watch ? `${watch},${candidate}` : candidate
+
+      if (encodeURIComponent(next).length > 4_096) {
+        break
+      }
+      watch = next
+    }
+    const es = new EventSource(
+      `${sp(space)}/events${watch ? `?watch=${encodeURIComponent(watch)}` : ''}`,
+    )
+
+    let opened = false
+    let currentOpenIsReconnect = false
+
+    es.onopen = () => {
+      currentOpenIsReconnect = opened
+      onOpen?.(currentOpenIsReconnect)
+      opened = true
+    }
     es.onmessage = (m) => {
       try {
         onEvent(JSON.parse(m.data as string) as StoreEvent)
@@ -64,6 +95,23 @@ export const syncApi = {
     }
     if (onAgentSessions) {
       es.addEventListener(SSE_EVENT.AGENT_SESSIONS, () => onAgentSessions())
+    }
+    if (onContextEvent) {
+      es.addEventListener(SSE_EVENT.CONTEXT_CHANGED, (event) => {
+        try {
+          const payload = JSON.parse((event as MessageEvent).data as string) as {
+            sourceSpace: string
+            event: StoreEvent
+          }
+
+          onContextEvent(payload.event, payload.sourceSpace)
+        } catch {
+          // A malformed supplemental frame is dropped like an ordinary data frame.
+        }
+      })
+    }
+    if (onReady) {
+      es.addEventListener(SSE_EVENT.READY, () => onReady(currentOpenIsReconnect))
     }
 
     return () => es.close()

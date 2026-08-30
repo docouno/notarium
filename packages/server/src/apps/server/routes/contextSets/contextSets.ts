@@ -6,6 +6,10 @@ import {
   ContextPinRequestSchema,
   ContextSetCreateRequestSchema,
   ContextSetItemRequestSchema,
+  ContextSetItemsAddRequestSchema,
+  ContextSetItemsAddResponseSchema,
+  ContextSetItemsQuerySchema,
+  ContextSetItemsResponseSchema,
   ContextSetOrderRequestSchema,
   ContextSetPatchRequestSchema,
   ContextSetResponseSchema,
@@ -14,22 +18,26 @@ import {
   OkResponseSchema,
   RoleContextQuerySchema,
 } from '@notarium/contract'
-import { HTTP_STATUS } from '@notarium/contract/http'
+import { HTTP_STATUS, REQUEST_TIMING_HEADER } from '@notarium/contract/http'
 import { decodeAbilityLocator, freshNoteId } from '@notarium/core'
 
 import { can } from '../../../../services/authz'
-import type { ContextSetRecord } from '../../../../services/metaDb'
+import type { ContextSetItemRef, ContextSetRecord } from '../../../../services/metaDb'
 import { projectSummaryOf } from '../../../../services/projects'
 import {
   ownedRoleLocator,
   parseRoleContextTarget,
   type ResolvedOwnedRole,
+  resolveRoleContext,
   roleContextTargetOf,
-  weighRoleContext,
 } from '../../../../services/roles'
-import { curatePersonalScope } from '../../../../services/spaces'
+import { scopeLayerOrder } from '../../../../services/spaces'
 import { peekPersonalSpace } from '../../../../services/spaces'
-import { readNoteAccess } from '../../../../services/storeAccess'
+import {
+  canonicalMetaNoteAccess,
+  canonicalMetaNoteAccessMany,
+  readNoteAccess,
+} from '../../../../services/storeAccess'
 import { type ApiRouteCtx, authz, notFound, s } from '../_shared'
 import { roleContextIdentityOf } from '../wire'
 
@@ -69,19 +77,8 @@ export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) 
   // ── context sets: named cross-space collections + scope attachments ──
   // canon: docs/projects.md#context-sets-209-reusable-cross-space-bundles
 
-  /** Wire view of a set for the manager, degraded per-reader. */
+  /** Raw membership view for the manager. Presentation belongs to the bounded page door. */
   const describeContextSet = async (req: FastifyRequest, set: ContextSetRecord) => {
-    const items = await Promise.all(
-      set.items.map(async (ref) => {
-        const hit = await readNoteAccess(ctx.storeAccess, req.principal, ref.noteId, 'note:read')
-        return {
-          noteId: hit?.noteId ?? ref.noteId,
-          // Null the space like the title — never leak the slug of a space the reader can't reach.
-          space: hit ? (spaces.slugOf(hit.space) ?? hit.space) : null,
-          title: hit ? (hit.note.title ?? '') : null,
-        }
-      }),
-    )
     const attachments = contextSets ? await contextSets.attachmentsForSet(set.id) : []
     // A property of the CALLER, not of an attachment: reading it per item asked the
     // same question once per row of the set.
@@ -160,7 +157,9 @@ export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) 
       name: set.name,
       homeSpace: spaces.slugOf(set.homeSpace) ?? set.homeSpace,
       personal: await auth.isPersonalSpace(set.homeSpace),
-      items,
+      // The final wire schema strips `space`; avoid manufacturing an intermediate
+      // thousand-object membership projection before that one validated clone.
+      items: set.items,
       attachments: attachmentsWire,
       createdAt: set.createdAt,
     }
@@ -246,6 +245,75 @@ export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) 
     },
   )
 
+  app.get(
+    s('/context-sets/:id/items'),
+    { config: authz('space:read', 'space') },
+    async (req, reply) => {
+      if (!contextSets) {
+        return notFound(reply)
+      }
+      const id = (req.params as { id?: string }).id ?? ''
+      const set = await contextSets.getSet(id)
+
+      if (!set || set.homeSpace !== req.spaceId) {
+        return notFound(reply)
+      }
+      const query = ContextSetItemsQuerySchema.parse(req.query)
+      const page = set.items.slice(query.offset, query.offset + query.limit)
+      const hits = await Promise.all(
+        page.map((item) => ctx.storeAccess.noteStore(req.principal, item.noteId, 'note:read')),
+      )
+      const idsByStore = new Map<NonNullable<(typeof hits)[number]>['store'], Set<string>>()
+
+      for (const [index, hit] of hits.entries()) {
+        if (!hit?.store.noteFacts) {
+          continue
+        }
+        const ids = idsByStore.get(hit.store) ?? new Set<string>()
+        ids.add(page[index].noteId)
+        idsByStore.set(hit.store, ids)
+      }
+      const factsByStore = new Map<
+        NonNullable<(typeof hits)[number]>['store'],
+        Awaited<ReturnType<NonNullable<NonNullable<(typeof hits)[number]>['store']['noteFacts']>>>
+      >()
+      await Promise.all(
+        [...idsByStore].map(async ([store, ids]) => {
+          factsByStore.set(store, await store.noteFacts!([...ids]))
+        }),
+      )
+      const items = await Promise.all(
+        page.map(async (item, index) => {
+          const access = hits[index]
+          const fact = access ? factsByStore.get(access.store)?.[item.noteId] : undefined
+
+          if (access && fact) {
+            return {
+              sourceIndex: query.offset + index,
+              noteId: item.noteId,
+              title: fact.title,
+              space: spaces.slugOf(access.space) ?? access.space,
+            }
+          }
+          const live = await readNoteAccess(
+            ctx.storeAccess,
+            req.principal,
+            item.noteId,
+            'note:read',
+          )
+          return {
+            sourceIndex: query.offset + index,
+            noteId: live?.noteId ?? item.noteId,
+            title: live ? (live.note.title ?? '') : null,
+            space: live ? (spaces.slugOf(live.space) ?? live.space) : null,
+          }
+        }),
+      )
+
+      return ContextSetItemsResponseSchema.parse({ items, total: set.items.length })
+    },
+  )
+
   // Item space comes from the registry (via noteStore), never the request body.
   app.post(
     s('/context-sets/:id/items'),
@@ -288,6 +356,147 @@ export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) 
     },
   )
 
+  app.post(
+    s('/context-sets/:id/add-many'),
+    {
+      config: authz('space:write', 'space'),
+      // Begin before Fastify consumes the 1000-ref JSON body or runs pre-handler
+      // authorization. Otherwise a parser/auth CPU stall falls outside the
+      // liveness interval even though it blocks every request on the server.
+      onRequest: async (_req, reply) => {
+        reply.header(REQUEST_TIMING_HEADER.STARTED_AT, performance.timeOrigin + performance.now())
+      },
+      // End after Fastify serialized the 1000-ref response, not merely when the
+      // handler returned. The liveness interval therefore covers the JSON tail too.
+      onSend: async (_req, reply, payload) => {
+        reply.header(REQUEST_TIMING_HEADER.ENDED_AT, performance.timeOrigin + performance.now())
+        return payload
+      },
+    },
+    async (req, reply) => {
+      if (!contextSets) {
+        return notFound(reply)
+      }
+      const id = (req.params as { id?: string }).id ?? ''
+      const set = await contextSets.getSet(id)
+
+      if (!set || set.homeSpace !== req.spaceId) {
+        return notFound(reply)
+      }
+      const body = ContextSetItemsAddRequestSchema.safeParse(req.body ?? {})
+
+      if (!body.success) {
+        return reply
+          .code(HTTP_STATUS.BAD_REQUEST)
+          .send({ error: body.error.issues[0]?.message || 'bad request' })
+      }
+      const failed: Array<{
+        id: string
+        reason: 'not_found' | 'conflict'
+        error: 'Note is unavailable' | 'Reference changed while the set was updated'
+        inputIndex: number
+      }> = []
+      const inputOrder = new Map<string, number>()
+      let candidates: ContextSetItemRef[] = body.data.items
+      const inputCount = candidates.length
+      let candidateCount = 0
+      const accessBatchSize = 25
+      const accessById = await canonicalMetaNoteAccessMany(
+        ctx.storeAccess,
+        req.principal,
+        candidates.map((item) => item.noteId),
+        'note:read',
+      )
+
+      for (let offset = 0; offset < inputCount; offset += accessBatchSize) {
+        const end = Math.min(offset + accessBatchSize, inputCount)
+
+        for (let inputIndex = offset; inputIndex < end; inputIndex += 1) {
+          const item = body.data.items[inputIndex]
+          // The body's space remains a non-authoritative compatibility hint. Exact
+          // identity registry resolution is O(1), access-checked and returns the
+          // canonical id without snapshotting either the hinted or global store.
+          const hit = accessById.get(item.noteId)
+
+          if (hit) {
+            // Reuse the contract parser's mutable output object and compact valid
+            // refs in place. The hot path no longer creates a second 1000-object set.
+            item.space = hit.space
+            item.noteId = hit.noteId
+            candidates[candidateCount] = item
+            candidateCount += 1
+            inputOrder.set(hit.noteId, inputIndex)
+          } else {
+            failed.push({
+              id: item.noteId,
+              reason: 'not_found',
+              error: 'Note is unavailable',
+              inputIndex,
+            })
+          }
+        }
+        if (offset + accessBatchSize < inputCount) {
+          await new Promise<void>((resolve) => setImmediate(resolve))
+        }
+      }
+      candidates.length = candidateCount
+      const added: string[] = []
+      let updated: ContextSetRecord | null = null
+
+      while (candidates.length > 0) {
+        const attempt = await contextSets.addItems(id, candidates)
+
+        if (attempt.conflicts.length === 0) {
+          updated = attempt.set
+          for (const noteId of attempt.added) {
+            added.push(noteId)
+          }
+          break
+        }
+        const conflicts = new Set(attempt.conflicts)
+        const next = candidates.filter((candidate) => !conflicts.has(candidate.noteId))
+
+        if (next.length === candidates.length) {
+          throw Object.assign(new Error('context set identity conflict made no progress'), {
+            isConflict: true,
+          })
+        }
+        for (const noteId of conflicts) {
+          failed.push({
+            id: noteId,
+            reason: 'conflict',
+            error: 'Reference changed while the set was updated',
+            inputIndex: inputOrder.get(noteId) ?? Number.MAX_SAFE_INTEGER,
+          })
+        }
+        candidates = next
+      }
+      updated ??= await contextSets.getSet(id)
+
+      if (!updated) {
+        return notFound(reply)
+      }
+      // Persistence and response validation/serialization are two allocation-heavy
+      // phases. Give health/SSE work a turn instead of joining them into one GC cliff.
+      await new Promise<void>((resolve) => setImmediate(resolve))
+
+      const response = ContextSetItemsAddResponseSchema.parse({
+        ok: true,
+        added,
+        failed: failed
+          .sort((left, right) => left.inputIndex - right.inputIndex)
+          .map((failure) => ({
+            id: failure.id,
+            reason: failure.reason,
+            error: failure.error,
+          })),
+        set: await describeContextSet(req, updated),
+      })
+
+      return response
+    },
+  )
+
   app.delete(
     s('/context-sets/:id/items/:noteId'),
     { config: authz('space:write', 'space') },
@@ -303,7 +512,10 @@ export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) 
       }
       const requestedId = p.noteId ?? ''
       const live = await readNoteAccess(ctx.storeAccess, req.principal, requestedId, 'note:read')
-      const updated = await contextSets.removeItem(set.id, live?.noteId ?? requestedId)
+      const ref = live
+        ? { space: live.space, noteId: live.noteId }
+        : set.items.find((item) => item.noteId === requestedId)
+      const updated = ref ? await contextSets.removeItem(set.id, ref) : set
 
       if (!updated) {
         return notFound(reply)
@@ -313,8 +525,8 @@ export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) 
     },
   )
 
-  // Atomic rewrite to the given note-id sequence: unknown ids ignored, a
-  // concurrently-added item missing from the sequence is appended (never dropped).
+  // Atomic slot-preserving reorder of the named note ids. Unknown ids are ignored;
+  // unnamed or concurrently-added membership keeps its current slot.
   app.put(
     s('/context-sets/:id/order'),
     { config: authz('space:write', 'space') },
@@ -335,13 +547,38 @@ export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) 
           .code(HTTP_STATUS.BAD_REQUEST)
           .send({ error: body.error.issues[0]?.message || 'bad request' })
       }
-      const noteIds = await Promise.all(
-        body.data.noteIds.map(async (noteId) => {
-          const live = await readNoteAccess(ctx.storeAccess, req.principal, noteId, 'note:read')
-          return live?.noteId ?? noteId
-        }),
-      )
-      const updated = await contextSets.reorderItems(id, noteIds)
+      const itemById = new Map(set.items.map((item) => [item.noteId, item]))
+      const unresolvedIds: string[] = []
+
+      for (const noteId of body.data.noteIds) {
+        if (!itemById.has(noteId)) {
+          unresolvedIds.push(noteId)
+        }
+      }
+      const accessById = unresolvedIds.length
+        ? await canonicalMetaNoteAccessMany(
+            ctx.storeAccess,
+            req.principal,
+            unresolvedIds,
+            'note:read',
+          )
+        : new Map<string, never>()
+      const refs: ContextSetItemRef[] = []
+
+      for (const noteId of body.data.noteIds) {
+        const current = itemById.get(noteId)
+
+        if (current) {
+          refs.push(current)
+          continue
+        }
+        const live = accessById.get(noteId)
+
+        if (live) {
+          refs.push(itemById.get(live.noteId) ?? { space: live.space, noteId: live.noteId })
+        }
+      }
+      const updated = await contextSets.reorderItems(id, refs)
 
       if (!updated) {
         return notFound(reply)
@@ -498,7 +735,12 @@ export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) 
           if (entry.kind !== 'pin') {
             return { entryKind: entry.kind, entryRef: entry.ref }
           }
-          const live = await readNoteAccess(ctx.storeAccess, req.principal, entry.ref, 'note:read')
+          const live = await canonicalMetaNoteAccess(
+            ctx.storeAccess,
+            req.principal,
+            entry.ref,
+            'note:read',
+          )
           return { entryKind: entry.kind, entryRef: live?.noteId ?? entry.ref }
         }),
       )
@@ -575,7 +817,7 @@ export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) 
         placement.scope === 'project' && placement.projectId
           ? await projects?.getById(placement.projectId)
           : null
-      const layer = await weighRoleContext(
+      const layer = await resolveRoleContext(
         { store: ctx.storeAccess, spaces, contextSets, scopePins, contextOrder },
         req.principal,
         status.role,
@@ -587,22 +829,16 @@ export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) 
       // with the row gone there was no `Remove from set` to reach it by. So the sequence
       // comes from the shared producer and the CONTENT stays exactly what the author put
       // on the role.
-      const ordered = curatePersonalScope([], [], [], Number.MAX_SAFE_INTEGER, [], layer)
-      const pinOrder = new Map((ordered.role?.pins ?? []).map((pin) => [pin.noteId, pin.order]))
-      const setOrder = new Map((ordered.role?.sets ?? []).map((set) => [set.id, set.order]))
-      // `loaded` is a formality here: the identity producer below strips it, because this
-      // door weighs no budget. Kept true rather than invented false — under a budget
-      // nothing can exceed, that is also what curation says about every row it kept.
+      const { pinOrder, setOrder } = scopeLayerOrder(layer.pins, layer.sets, layer.order)
       const authored = {
         pins: layer.pins.map((pin, index) => ({
           ...pin,
-          loaded: true,
           order: pinOrder.get(pin.noteId) ?? index,
         })),
         sets: layer.sets.map((set, index) => ({
           ...set,
           order: setOrder.get(set.id) ?? index,
-          items: set.items.map((item, itemIndex) => ({ ...item, loaded: true, order: itemIndex })),
+          items: set.items.map((item, itemIndex) => ({ ...item, order: itemIndex })),
         })),
       }
 
@@ -786,7 +1022,12 @@ export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) 
           if (entry.kind !== 'pin') {
             return { entryKind: entry.kind, entryRef: entry.ref }
           }
-          const live = await readNoteAccess(ctx.storeAccess, req.principal, entry.ref, 'note:read')
+          const live = await canonicalMetaNoteAccess(
+            ctx.storeAccess,
+            req.principal,
+            entry.ref,
+            'note:read',
+          )
           return { entryKind: entry.kind, entryRef: live?.noteId ?? entry.ref }
         }),
       )

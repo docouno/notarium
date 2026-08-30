@@ -506,9 +506,9 @@ export const readIdentityRows = async (
   return res.rows as IdentityRow[]
 }
 
-/** UNLOCKED probe: the live rows standing at these paths — the successors a retired
- *  reference canonicalizes onto. Read once before the tier-1 entry (to widen the set)
- *  and once after it (to prove nothing appeared in between). */
+/** UNLOCKED probe: live occupants at exact paths. Restore uses it only to widen and
+ *  re-check its destination conflict set; reference lineage is id-addressed through
+ *  `settlement_successor_id`, never inferred from this path lookup. */
 export const readLiveIdentityAtPaths = async (
   client: Queryable,
   paths: ReadonlyArray<{ space: string; filePath: string }>,

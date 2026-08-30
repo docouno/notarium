@@ -41,7 +41,7 @@ import {
   weighScopePins,
 } from '../../../../services/storeAccess'
 import { type ApiRouteCtx, authz, notFound, s } from '../_shared'
-import { contextRoleSummaryOf, roleContextViewOf } from '../wire'
+import { contextRoleSummaryOf, contextSetViewOf, roleContextViewOf } from '../wire'
 
 export const projectsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
   const { projects, markerStore, folders, spaces, spaceStoreFor, principalId } = ctx
@@ -383,7 +383,7 @@ export const projectsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => 
       const roleContext = selectedRole?.active
         ? await weighRoleContext(resolveDeps, req.principal, selectedRole.role)
         : undefined
-      const curated = curateProjectScope(
+      const curated = await curateProjectScope(
         projectPins,
         projectSets,
         [...personalTagPins, ...personalLoose],
@@ -401,7 +401,9 @@ export const projectsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => 
               selectedRoleLocator,
               (roleSpace) => spaces.slugOf(roleSpace) ?? roleSpace,
               projectSummaryOf(rec, spaces.slugOf(rec.space) ?? rec.space).handle,
-              curated.role,
+              curated.role
+                ? { ...curated.role, sets: curated.role.sets.map(contextSetViewOf) }
+                : undefined,
             )
           : undefined
       return ProjectAgentContextResponseSchema.parse({
@@ -417,11 +419,11 @@ export const projectsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => 
         ...(roleListing.truncated ? { rolesTruncated: true } : {}),
         ...(roleView ? { role: roleView } : {}),
         pins: curated.pins,
-        sets: curated.sets,
+        sets: curated.sets.map(contextSetViewOf),
         projectLoadedTokens: curated.projectLoadedTokens,
         personal: {
           pins: curated.personal.pins,
-          sets: curated.personal.sets,
+          sets: curated.personal.sets.map(contextSetViewOf),
           memory: await withAuthors(
             curated.personal.memory,
             req.principal.username,
@@ -430,7 +432,6 @@ export const projectsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => 
           loadedTokens: curated.personal.loadedTokens,
         },
         loadedTokens: curated.loadedTokens,
-        totalTokens: curated.totalTokens,
         budgetTokens: PROJECT_TOKEN_BUDGET,
         index,
       })

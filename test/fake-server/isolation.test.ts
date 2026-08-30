@@ -134,6 +134,38 @@ describe('two-space isolation: B never sees A (space-scoped surfaces)', () => {
     expect(next).toBe('SILENT')
   })
 
+  it('SSE: one active socket can explicitly multiplex a readable foreign space', async () => {
+    await app.listen({ port: 0, host: '127.0.0.1' })
+    const { port } = app.server.address() as { port: number }
+    const ctrl = new AbortController()
+    const res = await fetch(`http://127.0.0.1:${port}/api/s/beta/events?watch=alpha`, {
+      signal: ctrl.signal,
+    })
+    const reader = res.body!.getReader()
+    await reader.read()
+
+    const save = await fetch(`http://127.0.0.1:${port}/api/s/alpha/notes`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ title: 'Alpha Watched', directory: 'secrets', content: 'new' }),
+    })
+    expect(save.status).toBe(200)
+
+    const next = await Promise.race([
+      reader.read().then((result) => new TextDecoder().decode(result.value)),
+      new Promise<string>((resolve) => setTimeout(() => resolve('SILENT'), 1_000)),
+    ])
+    expect(next).not.toBe('SILENT')
+    expect(next).toContain('changed')
+    const foreignRemainder = await Promise.race([
+      reader.read().then((result) => new TextDecoder().decode(result.value)),
+      new Promise<string>((resolve) => setTimeout(() => resolve('SILENT'), 400)),
+    ])
+
+    expect(foreignRemainder).toBe('SILENT')
+    ctrl.abort()
+  })
+
   it('a fresh note in alpha is invisible to beta but visible to alpha', async () => {
     await post('/api/s/alpha/notes', { title: 'Alpha Fresh', directory: 'secrets', content: 'x' })
     const alpha = await get('/api/s/alpha/notes')

@@ -1,6 +1,12 @@
 import type { FastifyInstance } from 'fastify'
 
-import { AUTH_MODE, ConfigSchema, HostAboutResponseSchema, META_DB } from '@notarium/contract'
+import {
+  AUTH_MODE,
+  ConfigSchema,
+  HostAboutResponseSchema,
+  META_DB,
+  REQUEST_TIMING_HEADER,
+} from '@notarium/contract'
 
 import { buildInfo } from '../../../../libs/buildInfo'
 import { hostInfoFrom } from '../../../../libs/hostInfo'
@@ -23,7 +29,20 @@ export const hostRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
   const engineBySlug = new Map(hostInfo.deployment.engines.map((e) => [e.slug, e.engine]))
 
   // Liveness probe; the ONLY public route (explicit authz opt-out).
-  app.get('/api/health', { config: { authz: { public: true } } }, async () => ({ ok: true }))
+  app.get(
+    '/api/health',
+    {
+      config: { authz: { public: true } },
+      onRequest: async (_req, reply) => {
+        reply.header(REQUEST_TIMING_HEADER.STARTED_AT, performance.timeOrigin + performance.now())
+      },
+      onSend: async (_req, reply, payload) => {
+        reply.header(REQUEST_TIMING_HEADER.ENDED_AT, performance.timeOrigin + performance.now())
+        return payload
+      },
+    },
+    async () => ({ ok: true }),
+  )
 
   app.get('/api/config', { config: authz('config:read', 'host') }, async () =>
     // canon: docs/auth.md#model

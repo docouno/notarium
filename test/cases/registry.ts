@@ -4,6 +4,7 @@ import { agentContext } from './cases/agentContext'
 import { agentRoles } from './cases/agentRoles'
 import { agentSessions } from './cases/agentSessions'
 import { contextOpen } from './cases/contextOpen'
+import { contextSetsCost } from './cases/contextSetsCost'
 import { dashboardActivity } from './cases/dashboardActivity'
 import { demo } from './cases/demo'
 import { explorerScroll } from './cases/explorerScroll'
@@ -86,6 +87,7 @@ export const CASES: readonly CaseSpec[] = [
   agentAbilitiesSparse,
   agentSessions,
   contextOpen,
+  contextSetsCost,
   memoryPerf,
   // model providers / credentials / consent
   providers,

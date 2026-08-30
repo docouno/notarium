@@ -138,17 +138,24 @@ export const referenceIdentityConflict = (noteId: string): Error =>
       name: 'ReferenceIdentityConflictError',
       isConflict: true,
       reason: STORE_ERROR_REASON.referenceIdentityConflict,
+      referenceId: noteId,
     },
   )
 
 /** One identity row as a reference writer sees it. */
-export type LiveIdentityRow = { id: string; space: string; file_path: string; deleted_at: unknown }
+export type LiveIdentityRow = {
+  id: string
+  space: string
+  file_path: string
+  deleted_at: unknown
+  settlement_successor_id: string | null
+}
 
 /** The id a reference must be stored under, decided from rows the caller has
  *  ALREADY locked (identity first, facets after). A live same-space id passes
- *  through; a retired one canonicalizes onto the single live row of the same
- *  `(space, file_path)`; a foreign owner or an ambiguous path is a conflict —
- *  never a guess.
+ *  through; a retired one canonicalizes only through its explicit settlement
+ *  lineage. A later note merely reusing the path is unrelated and never inherits
+ *  the reference.
  *
  *  An id this registry has never seen passes through UNCHANGED: it has no
  *  settlement to race with, and an engine that owns identity itself (the
@@ -163,7 +170,7 @@ export const canonicalReferenceId = (
   noteSpace: string,
   noteId: string,
   row: LiveIdentityRow | undefined,
-  liveAtPath: readonly LiveIdentityRow[],
+  rowsById: ReadonlyMap<string, LiveIdentityRow>,
 ): string => {
   if (!row) {
     return noteId
@@ -174,19 +181,35 @@ export const canonicalReferenceId = (
   if (!row.deleted_at) {
     return noteId
   }
-  // A tombstone with NOTHING live at its path is an ordinary deleted note, not a
-  // re-key: a reference to it is stale exactly the way a reference to an id this
-  // registry never knew is stale. A conflict here could never clear — a deleted
-  // note does not return to its path on its own — and the caller is told to
-  // retry, so it would take the scope out of service permanently.
-  if (!liveAtPath.length) {
-    return noteId
-  }
-  // Two live notes at one path is a real ambiguity: which one inherited the
-  // reference is not knowable, and guessing moves it onto the wrong note.
-  if (liveAtPath.length > 1) {
-    throw referenceIdentityConflict(noteId)
+  let current = row
+  let followed = false
+  const seen = new Set<string>()
+
+  while (current.deleted_at) {
+    const successorId = current.settlement_successor_id
+
+    // An ordinary tombstone has no lineage. Preserve the stale id exactly as before;
+    // path reuse is not evidence that another note inherited it.
+    if (!successorId) {
+      if (!followed) {
+        return noteId
+      }
+      throw referenceIdentityConflict(noteId)
+    }
+    if (seen.has(current.id) || successorId === current.id) {
+      throw referenceIdentityConflict(noteId)
+    }
+    seen.add(current.id)
+    const successor = rowsById.get(successorId)
+
+    // Missing/foreign lineage means the transaction does not hold enough truth to
+    // attach anything. Retry against the settled registry instead of guessing.
+    if (!successor || successor.space !== noteSpace) {
+      throw referenceIdentityConflict(noteId)
+    }
+    current = successor
+    followed = true
   }
 
-  return liveAtPath[0].id
+  return current.id
 }

@@ -5,7 +5,7 @@
 import { AUTH_MODE, SPACE_ROLE } from '@notarium/contract'
 import { HTTP_STATUS } from '@notarium/contract/http'
 import type { SpaceRole } from '../authz'
-import { type AuthCtx, AuthError } from './authService'
+import { type AuthCtx, AuthError, type SseHandle } from './authService'
 
 export const createMemberships = (ctx: AuthCtx) => ({
   membersOf: (space: string) => ctx.db.membersOf(space),
@@ -48,10 +48,16 @@ export const createMemberships = (ctx: AuthCtx) => ({
       throw new AuthError(HTTP_STATUS.BAD_REQUEST, 'a space needs an owner', 'last_owner')
     }
     await ctx.removeMemberAndProviderAttachments(space, username)
-    // Revoke = disconnect: drop the member's channels on THIS space only; their
-    // OTHER-space streams stay (still legit) but get nudged to de-list this one.
-    ctx.dropSse((h) => h.username === username && h.space === space)
-    ctx.notifySse((h) => h.username === username && h.space !== space)
+    const revokedSocket = (h: SseHandle) =>
+      h.username === username && (h.space === space || h.spaces?.has(space) === true)
+
+    // Put the grant-refresh nudge on every affected socket before closing it. The
+    // remaining active-space stream may be valid, but its supplemental authority is not.
+    ctx.notifySse(revokedSocket)
+    ctx.dropSse(revokedSocket)
+    ctx.notifySse(
+      (h) => h.username === username && h.space !== space && h.spaces?.has(space) !== true,
+    )
     ctx.notifyMembersOf(space)
     return ctx.db.membersOf(space)
   },

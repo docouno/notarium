@@ -102,6 +102,26 @@ const PROBES: readonly Probe[] = [
     run: (db) => db.contextSets.addItem('set-1', { space: SPACE, noteId: NOTE }),
   },
   {
+    id: 'contextSets.addItems',
+    run: (db) =>
+      db.contextSets.addItems('set-1', [
+        { space: SPACE, noteId: NOTE },
+        { space: SPACE, noteId: 'note-b' },
+      ]),
+  },
+  {
+    id: 'contextSets.removeItem',
+    run: (db) => db.contextSets.removeItem('set-1', { space: SPACE, noteId: NOTE }),
+  },
+  {
+    id: 'contextSets.reorderItems',
+    run: (db) =>
+      db.contextSets.reorderItems('set-1', [
+        { space: SPACE, noteId: 'note-b' },
+        { space: SPACE, noteId: NOTE },
+      ]),
+  },
+  {
     id: 'scopePins.addPin',
     run: (db) =>
       db.scopePins.addPin({

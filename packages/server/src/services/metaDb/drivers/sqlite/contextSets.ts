@@ -13,7 +13,11 @@ import type {
   ContextSetTargetKind,
 } from '../../types'
 import type { SqliteDriverCtx } from './context'
-import { resolveLiveIdentityForWrite } from './liveIdentity'
+import {
+  canonicalizeReferenceBatchForWrite,
+  enterIdentityTierForReferences,
+  resolveLiveIdentityForWrite,
+} from './liveIdentity'
 
 export const createContextSetsFacet = (ctx: SqliteDriverCtx): ContextSetsPersistence => ({
   createSet: async (r: ContextSetRecord) => {
@@ -79,43 +83,123 @@ export const createContextSetsFacet = (ctx: SqliteDriverCtx): ContextSetsPersist
       throw err
     }
   },
-  removeItem: async (id: string, noteId: string) => {
+  addItems: async (id: string, refs: readonly ContextSetItemRef[]) => {
     await ctx.ensureInit()
-    const row = ctx.required
-      .prepare('SELECT id, home_space, name, items, created_at FROM context_sets WHERE id = ?')
-      .get(id) as ContextSetRow | undefined
+    const db = ctx.required
+    db.exec('BEGIN IMMEDIATE')
+    try {
+      const canonicalIds: string[] = []
+      const conflicts: string[] = []
+      const identity = enterIdentityTierForReferences(db, refs)
 
-    if (!row) {
-      return null
+      for (const [index, ref] of refs.entries()) {
+        try {
+          canonicalIds[index] = identity.canonical(ref.space, ref.noteId)
+        } catch (error) {
+          const referenceId = (error as { referenceId?: unknown }).referenceId
+
+          if (typeof referenceId !== 'string') {
+            throw error
+          }
+          conflicts.push(referenceId)
+        }
+      }
+      if (conflicts.length > 0) {
+        db.exec('ROLLBACK')
+        return { set: null, added: [], conflicts: [...new Set(conflicts)] }
+      }
+      const row = db
+        .prepare('SELECT id, home_space, name, items, created_at FROM context_sets WHERE id = ?')
+        .get(id) as ContextSetRow | undefined
+
+      if (!row) {
+        db.exec('COMMIT')
+        return { set: null, added: [], conflicts: [] }
+      }
+      const rec = contextSetOfRow(row)
+      const seen = new Set<string>()
+
+      rec.items.forEach((item) => seen.add(item.noteId))
+      const added: string[] = []
+      const next = [...rec.items]
+
+      for (const [index, ref] of refs.entries()) {
+        const noteId = canonicalIds[index]
+
+        if (seen.has(noteId)) {
+          continue
+        }
+        seen.add(noteId)
+        added.push(noteId)
+        next.push(noteId === ref.noteId ? ref : { ...ref, noteId })
+      }
+      if (added.length > 0) {
+        db.prepare('UPDATE context_sets SET items = ? WHERE id = ?').run(JSON.stringify(next), id)
+      }
+      db.exec('COMMIT')
+      return { set: { ...rec, items: next }, added, conflicts: [] }
+    } catch (error) {
+      db.exec('ROLLBACK')
+      throw error
     }
-    const rec = contextSetOfRow(row)
-    const items = rec.items.filter((r) => r.noteId !== noteId)
+  },
+  removeItem: async (id: string, ref: ContextSetItemRef) => {
+    await ctx.ensureInit()
+    const db = ctx.required
 
-    if (items.length !== rec.items.length) {
-      ctx.required
-        .prepare('UPDATE context_sets SET items = ? WHERE id = ?')
-        .run(JSON.stringify(items), id)
+    db.exec('BEGIN IMMEDIATE')
+    try {
+      const identity = enterIdentityTierForReferences(db, [ref])
+      const noteId = identity.canonical(ref.space, ref.noteId)
+      const row = db
+        .prepare('SELECT id, home_space, name, items, created_at FROM context_sets WHERE id = ?')
+        .get(id) as ContextSetRow | undefined
+
+      if (!row) {
+        db.exec('COMMIT')
+        return null
+      }
+      const rec = contextSetOfRow(row)
+      const items = rec.items.filter((item) => item.noteId !== noteId)
+
+      if (items.length !== rec.items.length) {
+        db.prepare('UPDATE context_sets SET items = ? WHERE id = ?').run(JSON.stringify(items), id)
+      }
+      db.exec('COMMIT')
+      return { ...rec, items }
+    } catch (error) {
+      db.exec('ROLLBACK')
+      throw error
     }
-
-    return { ...rec, items }
   },
   // Partial noteIds is non-destructive: items not named keep their slot, never dropped or moved
   // to the tail.
-  reorderItems: async (id: string, noteIds: readonly string[]) => {
+  reorderItems: async (id: string, refs: readonly ContextSetItemRef[]) => {
     await ctx.ensureInit()
-    const row = ctx.required
-      .prepare('SELECT id, home_space, name, items, created_at FROM context_sets WHERE id = ?')
-      .get(id) as ContextSetRow | undefined
+    const db = ctx.required
 
-    if (!row) {
-      return null
+    db.exec('BEGIN IMMEDIATE')
+    try {
+      const canonical = canonicalizeReferenceBatchForWrite(db, refs)
+      const order = canonical ? refs.map((ref) => canonical.get(ref.noteId) ?? ref.noteId) : refs
+      const row = db
+        .prepare('SELECT id, home_space, name, items, created_at FROM context_sets WHERE id = ?')
+        .get(id) as ContextSetRow | undefined
+
+      if (!row) {
+        db.exec('COMMIT')
+        return null
+      }
+      const rec = contextSetOfRow(row)
+      const items = orderItems(rec.items, order)
+
+      db.prepare('UPDATE context_sets SET items = ? WHERE id = ?').run(JSON.stringify(items), id)
+      db.exec('COMMIT')
+      return { ...rec, items }
+    } catch (error) {
+      db.exec('ROLLBACK')
+      throw error
     }
-    const rec = contextSetOfRow(row)
-    const items = orderItems(rec.items, noteIds)
-    ctx.required
-      .prepare('UPDATE context_sets SET items = ? WHERE id = ?')
-      .run(JSON.stringify(items), id)
-    return { ...rec, items }
   },
   deleteSet: async (id: string) => {
     await ctx.ensureInit()

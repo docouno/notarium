@@ -28,6 +28,17 @@ const copyRecord = (record: IdentityRecord): IdentityRecord => ({
   legacyNameAliases: canonicalLegacyNameAliases(record.legacyNameAliases),
 })
 
+const projectedRecord = (
+  record: IdentityRecord,
+  successors: ReadonlyMap<string, string>,
+): IdentityRecord => {
+  const projected = copyRecord(record)
+  const successorId = successors.get(record.id)
+
+  delete projected.settlementSuccessorId
+  return successorId ? { ...projected, settlementSuccessorId: successorId } : projected
+}
+
 export class InMemoryIdentity implements IdentityPersistence {
   /** The global table, keyed by id across every space. */
   readonly rows = new Map<string, IdentityRecord>()
@@ -41,7 +52,13 @@ export class InMemoryIdentity implements IdentityPersistence {
 
   constructor(seed: readonly IdentityRecord[] = []) {
     for (const rec of seed) {
-      this.rows.set(rec.id, copyRecord(rec))
+      const stored = copyRecord(rec)
+
+      delete stored.settlementSuccessorId
+      this.rows.set(rec.id, stored)
+      if (rec.settlementSuccessorId) {
+        this.settlementSuccessors.set(rec.id, rec.settlementSuccessorId)
+      }
     }
   }
 
@@ -49,12 +66,22 @@ export class InMemoryIdentity implements IdentityPersistence {
 
   async loadAll(space: string): Promise<IdentityRecord[]> {
     this.loadedFor.push(space)
-    return [...this.rows.values()].filter((r) => r.space === space).map(copyRecord)
+    return [...this.rows.values()]
+      .filter((r) => r.space === space)
+      .map((record) => projectedRecord(record, this.settlementSuccessors))
   }
 
   async findById(id: string): Promise<IdentityRecord | null> {
     const row = this.rows.get(id)
-    return row ? copyRecord(row) : null
+    return row ? projectedRecord(row, this.settlementSuccessors) : null
+  }
+
+  async findByIds(ids: readonly string[]): Promise<IdentityRecord[]> {
+    return [...new Set(ids)].flatMap((id) => {
+      const row = this.rows.get(id)
+
+      return row ? [projectedRecord(row, this.settlementSuccessors)] : []
+    })
   }
 
   async claimMany(records: readonly IdentityRecord[]): Promise<IdentityClaimOutcome[]> {

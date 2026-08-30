@@ -3,7 +3,7 @@
 // table — P14's `effective = scopes(token) ∩ grants(principal)` pinned case by
 // case, against the spec in docs/auth.md.
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import {
   type Action,
@@ -24,6 +24,15 @@ import {
 } from '@notarium/server'
 
 import { InMemoryAuthPersistence } from '../fake-server/authPersistence'
+
+const deferred = () => {
+  let resolve!: () => void
+  const promise = new Promise<void>((done) => {
+    resolve = done
+  })
+
+  return { promise, resolve }
+}
 
 describe('me: space aliases are wire capabilities, not raw history', () => {
   it('does not fall back to raw history when no resolver capability is wired', async () => {
@@ -325,6 +334,87 @@ describe('job SSE event is owner-scoped (#105)', () => {
     expect(got.ownerMain).toEqual([{ id: 'j1', status: 'running' }]) // owner in the space got it
     expect(got.memberMain).toEqual([]) // a fellow member did NOT — no status/artifact leak
     expect(got.ownerOther).toEqual([]) // the same principal in a different space did NOT
+  })
+})
+
+describe('SSE access-loss linearization', () => {
+  const handle = (username: string, space: string, close: () => void, job: () => void) => ({
+    principalId: `user:${username}`,
+    username,
+    space,
+    close,
+    notify: () => {},
+    notifyMembers: () => {},
+    notifyRename: () => {},
+    notifyAgentSessions: () => {},
+    notifyJob: job,
+  })
+
+  it('drops a disabled user before awaiting session cleanup', async () => {
+    const persistence = new InMemoryAuthPersistence()
+    const cleanup = deferred()
+    const close = vi.fn()
+    const job = vi.fn()
+
+    await persistence.createUser({
+      username: 'alice',
+      displayName: 'Alice',
+      passwordHash: 'x',
+      admin: false,
+      disabledAt: null,
+      createdAt: '2026-08-30T00:00:00.000Z',
+      personalSpace: null,
+    })
+    const deleteSessionsFor = persistence.deleteSessionsFor.bind(persistence)
+
+    vi.spyOn(persistence, 'deleteSessionsFor').mockImplementation(async (username) => {
+      await cleanup.promise
+      return deleteSessionsFor(username)
+    })
+    const auth = createAuthService({
+      mode: 'password',
+      persistence,
+      removeMemberAndProviderAttachments: async () => {},
+    })
+
+    auth.registerSse(handle('alice', 'main', close, job))
+    const disabling = auth.patchUser('root', 'alice', { disabled: true })
+
+    await vi.waitFor(async () =>
+      expect((await persistence.getUser('alice'))?.disabledAt).not.toBeNull(),
+    )
+    expect(close).toHaveBeenCalledOnce()
+    auth.notifyJobChanged('main', 'user:alice', { marker: 'after-disable' })
+    expect(job).not.toHaveBeenCalled()
+    cleanup.resolve()
+    await disabling
+  })
+
+  it('drops an archived-space handle before awaiting members for surviving-tab nudges', async () => {
+    const persistence = new InMemoryAuthPersistence()
+    const members = deferred()
+    const close = vi.fn()
+    const job = vi.fn()
+    const membersOf = persistence.membersOf.bind(persistence)
+
+    vi.spyOn(persistence, 'membersOf').mockImplementation(async (space) => {
+      await members.promise
+      return membersOf(space)
+    })
+    const auth = createAuthService({
+      mode: 'password',
+      persistence,
+      removeMemberAndProviderAttachments: async () => {},
+    })
+
+    auth.registerSse(handle('alice', 'main', close, job))
+    const archived = auth.notifySpaceArchived('main')
+
+    expect(close).toHaveBeenCalledOnce()
+    auth.notifyJobChanged('main', 'user:alice', { marker: 'after-archive' })
+    expect(job).not.toHaveBeenCalled()
+    members.resolve()
+    await archived
   })
 })
 

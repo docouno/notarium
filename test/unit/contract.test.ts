@@ -14,6 +14,9 @@ import {
   BucketsResponseSchema,
   ConfigSchema,
   ConflictResponseSchema,
+  ContextSetItemsAddResponseSchema,
+  ContextSetPageItemSchema,
+  ContextSetViewSchema,
   contract,
   CreateAbilityVersionRequestSchema,
   CreateAgentRoleRequestSchema,
@@ -124,6 +127,97 @@ describe('GET /api/me/agent-sessions/:id query', () => {
   it('rejects NUL before binding text filters to a database driver', () => {
     expect(AgentSessionEventsQuerySchema.safeParse({ q: 'before\0after' }).success).toBe(false)
     expect(AgentSessionEventsQuerySchema.safeParse({ agent: 'CLI\0hidden' }).success).toBe(false)
+  })
+})
+
+describe('context-set privacy contracts', () => {
+  const item = {
+    noteId: 'note-1',
+    title: 'Readable note',
+    loaded: true,
+    tokens: 10,
+    order: 0,
+    space: 'main',
+  }
+
+  it('makes home visibility and every raw coordinate one executable variant', () => {
+    expect(
+      ContextSetViewSchema.safeParse({
+        id: 'set-1',
+        name: 'Set',
+        homeSpace: 'main',
+        order: 0,
+        items: [{ ...item, sourceIndex: 0 }],
+        itemsLoaded: 1,
+        itemsTotal: 1,
+        itemsCursor: 1,
+        trimmed: false,
+      }).success,
+    ).toBe(true)
+    expect(
+      ContextSetViewSchema.safeParse({
+        id: 'set-1',
+        name: 'Set',
+        homeSpace: '',
+        order: 0,
+        items: [item],
+        itemsLoaded: 1,
+        trimmed: false,
+      }).success,
+    ).toBe(true)
+    expect(
+      ContextSetViewSchema.safeParse({
+        id: 'set-1',
+        name: 'Set',
+        homeSpace: '',
+        order: 0,
+        items: [{ ...item, sourceIndex: 900 }],
+        itemsLoaded: 1,
+        itemsTotal: 1_000,
+        itemsCursor: 0,
+        trimmed: true,
+      }).success,
+    ).toBe(false)
+  })
+
+  it('admits only the two constant privacy-safe bulk failure shapes', () => {
+    const response = {
+      ok: true,
+      added: [],
+      set: {
+        id: 'set-1',
+        name: 'Set',
+        homeSpace: 'main',
+        personal: false,
+        items: [],
+        attachments: [],
+        createdAt: '2026-08-30T00:00:00.000Z',
+      },
+    }
+
+    expect(
+      ContextSetItemsAddResponseSchema.safeParse({
+        ...response,
+        failed: [{ id: 'x', reason: 'not_found', error: 'Note is unavailable' }],
+      }).success,
+    ).toBe(true)
+    expect(
+      ContextSetItemsAddResponseSchema.safeParse({
+        ...response,
+        failed: [{ id: 'x', error: 'owner=/private/path' }],
+      }).success,
+    ).toBe(false)
+  })
+
+  it('rejects asymmetric unavailable page presentation', () => {
+    expect(
+      ContextSetPageItemSchema.safeParse({
+        sourceIndex: 0,
+        noteId: 'note-1',
+        title: 'Leaked title',
+        space: null,
+      }).success,
+    ).toBe(false)
   })
 })
 

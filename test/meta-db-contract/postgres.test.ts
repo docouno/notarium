@@ -15,6 +15,8 @@ import { describeAbilityPreferencesContract } from './abilityPreferencesContract
 import { describeAgentDeltaCursorsContract } from './agentDeltaCursorsContract'
 import { describeAgentSessionsContract } from './agentSessionsContract'
 import { describeCausalMetadataContract } from './causalMetadataContract'
+import { describeContextSetBulkIdentityContract } from './contextSetBulkIdentityContract'
+import { describeContextSetsContract } from './contextSetsContract'
 import { describeFavoritesContract } from './favoritesContract'
 import { describeGatewayStateContract } from './gatewayStateContract'
 import { describeIdentityPersistenceContract } from './identityPersistenceContract'
@@ -263,6 +265,46 @@ describePostgres('live Postgres driver', SUITE, () => {
   describeAbilityPreferencesContract('Postgres', async () => {
     const testSchema = await createPostgresTestSchema('ability_preferences')
     return { db: testSchema.db, teardown: testSchema.teardown }
+  })
+
+  describeContextSetsContract('Postgres', async () => {
+    const testSchema = await createPostgresTestSchema('context_sets')
+    return { persistence: testSchema.db.contextSets, teardown: testSchema.teardown }
+  })
+
+  describeContextSetBulkIdentityContract('Postgres', async () => {
+    const testSchema = await createPostgresTestSchema('context_set_bulk_identity')
+    const observer = new pg.Pool({ connectionString: testSchema.scopedUrl })
+
+    await testSchema.db.contextSets.getSet('migration-probe')
+    await observer.query(`
+      CREATE TABLE context_set_update_audit (set_id TEXT NOT NULL);
+      CREATE FUNCTION count_context_set_update() RETURNS trigger AS $$
+      BEGIN
+        INSERT INTO context_set_update_audit(set_id) VALUES (NEW.id);
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+      CREATE TRIGGER context_set_update_count
+        AFTER UPDATE ON context_sets
+        FOR EACH ROW EXECUTE FUNCTION count_context_set_update();
+    `)
+
+    return {
+      contextSets: testSchema.db.contextSets,
+      identity: testSchema.db.identity,
+      updateCount: async () => {
+        const result = await observer.query(
+          "SELECT COUNT(*) AS count FROM context_set_update_audit WHERE set_id = 'bulk-observed'",
+        )
+
+        return Number(result.rows[0].count)
+      },
+      teardown: async () => {
+        await observer.end()
+        await testSchema.teardown()
+      },
+    }
   })
 
   describeAbilityAvailabilityContract('Postgres', async () => {

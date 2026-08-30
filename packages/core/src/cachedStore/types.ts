@@ -47,6 +47,10 @@ export type CachedStoreOptions = {
    *  it unset and the engine path serves, just slower. Any error/null falls
    *  back to the engine — this can make things faster, never wronger. */
   readBody?: (filePath: string) => Promise<string | null>
+  /** Whether raw reads are also evidence for the CachedStore identity arbiter.
+   * Defaults true. A host whose inner engine already owns and materializes identity may
+   * set false while still using raw reads for facts/previews; this avoids two owners. */
+  readBodyIdentityClaims?: boolean
   /** The space's folder path-history: identified folders' current→past
    *  path pairs, injected from the server's folder registry (the engine doesn't
    *  read the `.notariummeta` markers folder identity lives in, so the read-model

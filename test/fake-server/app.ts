@@ -28,6 +28,7 @@ import {
   type InMemoryRevisionPersistence,
   InMemorySpaceLifecyclePersistence,
   type InteractiveSignal,
+  READ_SCOPE,
   REVISION_ENTRY_ROLE,
   sha256Hex,
   SPACE_LIFECYCLE_PHASE,
@@ -431,6 +432,14 @@ export const createApp = async (
     ) => void
     /** Test-only seam for deterministic interleavings around the real routes. */
     configureWorld?: (world: SpaceWorld & { slug: string }) => void
+    contextSets?: InMemoryContextSets
+    /** Runs only after live space/project/note identities exist, initially and after reset. */
+    seedContextSets?: (ctx: {
+      contextSets: InMemoryContextSets
+      spaceIdOf(slug: string): string
+      projectIdOf(spaceSlug: string, path: string): Promise<string>
+      noteIdAt(spaceSlug: string, filePath: string): Promise<string>
+    }) => void | Promise<void>
   } = {},
 ): Promise<FastifyInstance> => {
   // The boot fixture is canonical: a body-less reset always restores IT, not
@@ -444,7 +453,7 @@ export const createApp = async (
   const projects = new InMemoryProjects()
   const folders = new InMemoryFolders(projects)
   const favorites = new InMemoryFavorites()
-  const contextSets = new InMemoryContextSets()
+  const contextSets = opts.contextSets ?? new InMemoryContextSets()
   const scopePins = new InMemoryScopePins()
   const contextOrder = new InMemoryContextOrder()
   // Declared here rather than beside the meta-DB stub below because the ability twins
@@ -548,6 +557,10 @@ export const createApp = async (
       // No external change source exists for an in-memory base — polling would
       // only burn cycles. Determinism also wants no timers.
       pollIntervalMs: 0,
+      readBody: async (filePath) => engine.rawFileAt(filePath),
+      // InMemoryStore already owns/materializes identity. Raw bytes are still the
+      // authoritative facts/preview source, but must not install a second path owner.
+      readBodyIdentityClaims: false,
       // Folder path-history: same wiring as production server.ts (the
       // folders registry keys by the space id, set on the id-addressed move routes).
       folderAliases: async () =>
@@ -589,9 +602,7 @@ export const createApp = async (
   const metaDbStub: Pick<
     MetaDb,
     'spaces' | 'spaceLifecycle' | 'restoreOperations' | 'jobs' | 'adoptLegacyRows' | 'purgeSpace'
-  > & {
-    identity: { findById: undefined }
-  } = {
+  > & { identity: { findById: undefined } } = {
     spaces: spacesRegistry,
     spaceLifecycle,
     restoreOperations,
@@ -732,6 +743,39 @@ export const createApp = async (
   // populate it is I0c). Registry-only here (no markerStore) — markFolderAsProject
   // upserts the row directly. AFTER init so space-slugs translate to their ids.
   projects.seed(projectRecords(fixture, idOf))
+  const seedContextSetFacet = async () => {
+    if (!opts.seedContextSets) {
+      return
+    }
+    await opts.seedContextSets({
+      contextSets,
+      spaceIdOf: idOf,
+      projectIdOf: async (spaceSlug, path) => {
+        const match = (await projects.listForSpace(idOf(spaceSlug))).find(
+          (project) => project.path === path,
+        )
+
+        if (!match) {
+          throw new Error(`fixture project not found: ${spaceSlug}/${path}`)
+        }
+
+        return match.id
+      },
+      noteIdAt: async (spaceSlug, filePath) => {
+        const store = await manager.store(idOf(spaceSlug))
+        const matches = (await store.list({ scope: READ_SCOPE.all })).filter(
+          (note) => note.filePath === filePath && note.id,
+        )
+
+        if (matches.length !== 1) {
+          throw new Error(`fixture note path is absent or ambiguous: ${spaceSlug}/${filePath}`)
+        }
+
+        return matches[0].id!
+      },
+    })
+  }
+  await seedContextSetFacet()
   const roleLibrary = createStoreRoleLibrary(
     async (space) => manager.store(space),
     // Read per call: a reset swaps the whole world, and with it the bound a fixture
@@ -1512,6 +1556,7 @@ export const createApp = async (
     contextSets.clear()
     scopePins.clear()
     contextOrder.clear()
+    await seedContextSetFacet()
     providerPersistence.clear()
     providerCallLog.clear()
     await seedProviders(next)

@@ -70,6 +70,7 @@ export type {
   ContextOrderRecord,
   ContextSetAttachmentRecord,
   ContextSetItemRef,
+  ContextSetItemsAddResult,
   ContextSetRecord,
   ContextSetsPersistence,
   ContextSetTargetKind,

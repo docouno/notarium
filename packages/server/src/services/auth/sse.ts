@@ -43,10 +43,18 @@ export const createSse = (ctx: AuthCtx) => ({
    *  to reloadSpaces. Call AFTER the registry marks it archived.
    */
   notifySpaceArchived: async (spaceId: string): Promise<void> => {
+    const archivedSocket = (h: SseHandle) => h.space === spaceId || h.spaces?.has(spaceId) === true
+
+    // Archive is already durable when this hook runs. Close delivery authority before
+    // the member-list read used only to wake OTHER surviving tabs.
+    ctx.notifySse(archivedSocket)
+    ctx.dropSse(archivedSocket)
     const members = await ctx.db.membersOf(spaceId)
-    ctx.dropSse((h) => h.space === spaceId)
+
     for (const m of members) {
-      ctx.notifySse((h) => h.username === m.username && h.space !== spaceId)
+      ctx.notifySse(
+        (h) => h.username === m.username && h.space !== spaceId && h.spaces?.has(spaceId) !== true,
+      )
     }
   },
 

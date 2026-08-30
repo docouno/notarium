@@ -93,6 +93,49 @@ export const describeIdentityPersistenceContract = (
       expect(await alpha.findById!('X')).toMatchObject({ space: 'alpha', filePath: 'shared.md' })
     })
 
+    it('batch-resolves only requested identities in first-requested order', async () => {
+      await alpha.claimMany([
+        record({ id: 'batch-a', filePath: 'batch-a.md' }),
+        record({ id: 'batch-b', filePath: 'batch-b.md' }),
+      ])
+
+      await expect(alpha.findByIds!(['batch-b', 'missing', 'batch-a', 'batch-b'])).resolves.toEqual(
+        [
+          expect.objectContaining({ id: 'batch-b', filePath: 'batch-b.md' }),
+          expect.objectContaining({ id: 'batch-a', filePath: 'batch-a.md' }),
+        ],
+      )
+    })
+
+    it('carries durable settlement lineage through exact point and batch reads', async () => {
+      const retiredId = 'lineageold01'
+      const successorId = 'lineagenew01'
+      const current = record({ id: retiredId, filePath: 'lineage.md', materialized: true })
+
+      await alpha.claimMany([current])
+      await alpha.settleFileClaim({
+        space: 'alpha',
+        filePath: current.filePath,
+        current,
+        observedId: successorId,
+        at: AT,
+      })
+
+      await expect(alpha.findById!(retiredId)).resolves.toMatchObject({
+        id: retiredId,
+        deletedAt: AT,
+        settlementSuccessorId: successorId,
+      })
+      await expect(alpha.findByIds!([retiredId, successorId])).resolves.toEqual([
+        expect.objectContaining({
+          id: retiredId,
+          deletedAt: AT,
+          settlementSuccessorId: successorId,
+        }),
+        expect.objectContaining({ id: successorId, deletedAt: null }),
+      ])
+    })
+
     // The header's promise, actually raced: both spaces reach for an ABSENT id at
     // once. Every other case here awaits one call before making the next, which two
     // independent sessions never do and which cannot tell a transaction apart from
@@ -512,6 +555,74 @@ export const describeIdentityPersistenceContract = (
         rank: null,
       })
       expect(await alphaDb.favorites.ids('user:alpha', 'alpha', 'note')).toEqual(['Y'])
+    })
+
+    it('canonicalizes stale context-set remove and reorder inside their transactions', async () => {
+      const retiredId = 'set-retired1'
+      const successorId = 'setsuccess01'
+      const otherId = 'set-other001'
+      const staleRetired = { space: 'alpha', noteId: retiredId }
+      const other = { space: 'alpha', noteId: otherId }
+
+      await alpha.claimMany([
+        record({ id: retiredId, filePath: 'set-note.md', materialized: true }),
+      ])
+      for (const id of ['settled-remove', 'settled-reorder']) {
+        await alphaDb.contextSets.createSet({
+          id,
+          homeSpace: 'alpha',
+          name: id,
+          items: [staleRetired, other],
+          createdAt: AT,
+        })
+      }
+
+      // These refs model a route resolution that completed before settlement. The
+      // persistence calls begin only after the transactional re-key has committed.
+      await alpha.settleFileClaim({
+        space: 'alpha',
+        filePath: 'set-note.md',
+        current: record({ id: retiredId, filePath: 'set-note.md', materialized: true }),
+        observedId: successorId,
+        at: AT,
+      })
+      expect((await alphaDb.contextSets.getSet('settled-remove'))?.items).toEqual([
+        { space: 'alpha', noteId: successorId },
+        other,
+      ])
+
+      const removed = await alphaDb.contextSets.removeItem('settled-remove', staleRetired)
+      const reordered = await alphaDb.contextSets.reorderItems('settled-reorder', [
+        other,
+        staleRetired,
+      ])
+
+      expect(removed?.items).toEqual([other])
+      expect(reordered?.items).toEqual([other, { space: 'alpha', noteId: successorId }])
+    })
+
+    it('does not attach an unrelated note that later reuses an ordinary tombstone path', async () => {
+      await alpha.claimMany([record({ id: 'old', filePath: 'reused.md', materialized: true })])
+      await alpha.claimMany([
+        record({ id: 'old', filePath: 'reused.md', materialized: true, deletedAt: AT }),
+      ])
+      await alpha.claimMany([
+        record({ id: 'replacement', filePath: 'reused.md', materialized: true }),
+      ])
+      await alphaDb.contextSets.createSet({
+        id: 'path-reuse-set',
+        homeSpace: 'alpha',
+        name: 'Path reuse',
+        items: [],
+        createdAt: AT,
+      })
+
+      const result = await alphaDb.contextSets.addItems('path-reuse-set', [
+        { space: 'alpha', noteId: 'old' },
+      ])
+
+      expect(result).toMatchObject({ added: ['old'], conflicts: [] })
+      expect(result.set?.items).toEqual([{ space: 'alpha', noteId: 'old' }])
     })
 
     it('refuses a stale reorder whose membership a settlement carried onto a new id', async () => {
