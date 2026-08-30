@@ -20,8 +20,8 @@ test('Feed date range narrows from URL and clears from the aside (#201)', async 
 
   await page.getByTitle('Open panel').click()
   await expect(page.getByTestId('feed-date-filter')).toContainText('Created date')
-  await expect(page.getByTestId('feed-date-from')).toContainText('2 Jun 2026')
-  await expect(page.getByTestId('feed-date-to')).toContainText('2 Jun 2026')
+  await expect(page.getByTestId('feed-date-from')).toContainText('Jun 2, 2026')
+  await expect(page.getByTestId('feed-date-to')).toContainText('Jun 2, 2026')
 
   await page.getByTestId('feed-date-filter-reset').click()
   await expect(page).not.toHaveURL(/[?&](from|to)=/)
@@ -44,8 +44,7 @@ test('Feed date picker writes URL state and sends timezone to the API (#201)', a
   await page.getByTestId('feed-date-to').click()
   await page
     .getByRole('dialog', { name: 'Choose date' })
-    .getByRole('button', { name: '2' })
-    .first()
+    .getByRole('button', { name: 'Jun 2, 2026', exact: true })
     .click()
   await expect(page).toHaveURL(
     (url) =>
@@ -115,16 +114,16 @@ test('Feed date range prevents an end date before the start (#201)', async ({ pa
   let dialog = page.getByRole('dialog', { name: 'Choose date' })
   await expect(dialog).toBeVisible()
   await expect(dialog.getByRole('button', { name: 'Previous' })).toBeDisabled()
-  await expect(dialog.getByRole('button', { name: '1' }).first()).toBeDisabled()
-  await expect(dialog.getByRole('button', { name: '2' }).first()).toBeEnabled()
+  await expect(dialog.getByRole('button', { name: 'Jun 1, 2026', exact: true })).toBeDisabled()
+  await expect(dialog.getByRole('button', { name: 'Jun 2, 2026', exact: true })).toBeEnabled()
 
   await page.keyboard.press('Escape')
   await page.getByTestId('feed-date-from').click()
   dialog = page.getByRole('dialog', { name: 'Choose date' })
   await expect(dialog).toBeVisible()
   await expect(dialog.getByRole('button', { name: 'Next' })).toBeDisabled()
-  await expect(dialog.getByRole('button', { name: '3' }).first()).toBeDisabled()
-  await expect(dialog.getByRole('button', { name: '2' }).first()).toBeEnabled()
+  await expect(dialog.getByRole('button', { name: 'Jun 3, 2026', exact: true })).toBeDisabled()
+  await expect(dialog.getByRole('button', { name: 'Jun 2, 2026', exact: true })).toBeEnabled()
 })
 
 test('Feed empty clear drops all URL filter axes at once (#201)', async ({ page }) => {
@@ -156,8 +155,7 @@ test('Feed ignores stale to-before-from URLs without blocking the From picker (#
   await page.getByTestId('feed-date-from').click()
   await page
     .getByRole('dialog', { name: 'Choose date' })
-    .getByRole('button', { name: '10' })
-    .first()
+    .getByRole('button', { name: 'Jun 10, 2026', exact: true })
     .click()
   await expect(page).toHaveURL(
     (url) => url.searchParams.get('from') === '2026-06-10' && !url.searchParams.has('to'),

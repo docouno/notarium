@@ -29,6 +29,13 @@ import { type EngineMount, engineMountOf } from './types'
 import { describeVector } from './vectorGate.fixture'
 
 describe('planIndexMigration', () => {
+  it('narrows FTS update churn to the columns the virtual table owns', () => {
+    const sql = INDEX_MIGRATIONS.at(-1)?.sql ?? ''
+
+    expect(sql).toContain('AFTER UPDATE OF title, body, tags ON notes')
+    expect(sql).not.toContain('AFTER UPDATE ON notes')
+  })
+
   it('a fresh index (no version at all) builds from 0 without a teardown', () => {
     expect(planIndexMigration({ ladderVersion: undefined, legacyVersion: undefined })).toEqual({
       fromVersion: 0,
@@ -179,7 +186,9 @@ describeVector('index migration preserves vectors', () => {
    *  the replay then trips over its own ALTER ("duplicate column name"). */
   const seedEmbeddedIndex = async () => {
     const emb = countingEmbedder()
-    const sourceLocatorStep = INDEX_MIGRATIONS.at(-2)!
+    const sourceLocatorStep = INDEX_MIGRATIONS.find((step) =>
+      step.sql.includes('ADD COLUMN source_locator'),
+    )!
     const store = new NotariumStore({
       mounts: [userMount(notesDir)],
       sql: createNodeSqliteDriver(indexDb, { vec: true }),
@@ -296,7 +305,17 @@ describeVector('index migration preserves vectors', () => {
   it('adds nullable source_locator without rowid, FTS, vector or hidden backfill churn', async () => {
     const locator = claudeConversationSourceLocator('pre-task-authored')!
     const emb = countingEmbedder()
-    let store = createNotariumStore({ notesDir, indexDb, embedder: emb.embedder })
+    const sourceStep = INDEX_MIGRATIONS.findIndex((step) =>
+      step.sql.includes('ADD COLUMN source_locator'),
+    )
+    expect(sourceStep).toBeGreaterThan(0)
+    const throughSource = INDEX_MIGRATIONS.slice(0, sourceStep + 1)
+    let store = new NotariumStore({
+      mounts: [userMount(notesDir)],
+      sql: createNodeSqliteDriver(indexDb, { vec: true }),
+      embedder: emb.embedder,
+      migrations: throughSource,
+    })
     const path = await writePath(store, {
       title: 'Tagged before the migration',
       content: 'stable body',
@@ -322,14 +341,18 @@ describeVector('index migration preserves vectors', () => {
     // Reproduce the immediately-pre-task index: the file already contains an
     // authored same-name key, but the derived row has no projection column yet.
     await before.run(`ALTER TABLE notes DROP COLUMN source_locator`)
-    await before.run(`ALTER TABLE document_proofs DROP COLUMN context_json`)
     await before.run(`UPDATE meta SET value = ? WHERE key = ?`, [
-      String(INDEX_MIGRATIONS.length - 2),
+      String(sourceStep),
       INDEX_VERSION_KEY,
     ])
     await before.close()
 
-    store = createNotariumStore({ notesDir, indexDb, embedder: emb.embedder })
+    store = new NotariumStore({
+      mounts: [userMount(notesDir)],
+      sql: createNodeSqliteDriver(indexDb, { vec: true }),
+      embedder: emb.embedder,
+      migrations: throughSource,
+    })
     const listed = await store.list()
     await store.whenVectorsSettled()
     expect(listed.find((note) => note.filePath === path)?.sourceLocator).toBeUndefined()

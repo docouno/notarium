@@ -1,15 +1,21 @@
 import { useEffect } from 'react'
 import { createPortal } from 'react-dom'
 import { NOTE_CLASS } from '@notarium/contract/enums'
+import { useAuth } from '../../composers/AuthProvider'
 import { useChrome } from '../../composers/ChromeProvider'
 import { useEditing } from '../../composers/EditingProvider'
+import { useFieldSchemaForSpace } from '../../composers/FieldSchemaProvider'
 import { useHotkeys } from '../../composers/HotkeysProvider'
+import { useInlineNoteFields } from '../../composers/NoteInspector/hooks/useInlineNoteFields'
 import { useNotes } from '../../composers/NotesProvider'
 import { useSpace } from '../../composers/SpaceProvider'
 import { Button } from '../../core/Button'
 import { IconEdit, IconEye } from '../../core/Icons'
+import { useToast } from '../../core/Toast'
 import { useEditorPreview } from '../../layouts/DocumentLayout/hooks/useEditorPreview'
+import { canWriteSpace } from '../../libs/access'
 import { editorBindings } from '../../libs/hotkeys'
+import { api } from '../../services/api'
 import { EditorBody } from '../../widgets/EditorBody'
 import { EditorMeta } from '../../widgets/EditorMeta'
 import { MetaPanel } from '../../widgets/MetaPanel'
@@ -23,9 +29,12 @@ import styles from './MemoryNotePage.module.scss'
  * and the shared document editor. The selected Context scope rides in the URL,
  * so Save, Cancel, reload and canonical slug replacement cannot lose the rail. */
 export const MemoryNotePage = () => {
-  const { mode, note, folders, navigating, noteError } = useNotes()
-  const { canWrite } = useSpace()
+  const { mode, note, navigating, noteError, reloadNote } = useNotes()
+  const { space } = useSpace()
+  const { me, mode: authMode } = useAuth()
+  const toast = useToast()
   const editing = useEditing()
+  const fieldSchema = useFieldSchemaForSpace(note?.space ?? space)
   const { actionsHost, setBreadcrumbTail } = useAgentsShell()
   const { editorMode, focusMode, setFocusMode, typewriter, toggleFocus, toggleTypewriter } =
     useChrome()
@@ -33,6 +42,24 @@ export const MemoryNotePage = () => {
   const { editorPreview, setEditorPreview, editorKey } = useEditorPreview(editing.draft)
   const readableMemory =
     mode === 'read' && note?.class === NOTE_CLASS.agentMemory && !note.deleted ? note : null
+  const noteSpace = note?.space ?? space
+  const canWriteNote = Boolean(readableMemory?.id) && canWriteSpace(me, authMode, noteSpace)
+  const canWriteFields =
+    canWriteNote &&
+    !fieldSchema.loading &&
+    fieldSchema.valueWrites &&
+    readableMemory?.fieldsWritable !== false
+  const {
+    values: fieldValues,
+    busyKey: fieldBusyKey,
+    setField,
+  } = useInlineNoteFields({
+    note: readableMemory,
+    canWrite: canWriteFields,
+    write: api.noteFieldsPut,
+    reload: reloadNote,
+    onError: (message) => toast.error(message),
+  })
 
   useEffect(() => {
     setBreadcrumbTail(readableMemory?.title ? { label: readableMemory.title } : null)
@@ -61,7 +88,7 @@ export const MemoryNotePage = () => {
         {editorPreview ? <IconEdit size={15} /> : <IconEye size={15} />}
         {editorPreview ? 'Edit' : 'Preview'}
       </Button>
-      {canWrite && (
+      {canWriteNote && (
         <Button
           variant="primary"
           disabled={!editing.editor.canSave || editing.saving}
@@ -71,7 +98,7 @@ export const MemoryNotePage = () => {
         </Button>
       )}
     </>
-  ) : readableMemory && canWrite ? (
+  ) : readableMemory && canWriteNote ? (
     <Button variant="ghost" onClick={editing.startEdit}>
       <IconEdit size={15} /> Edit
     </Button>
@@ -81,7 +108,21 @@ export const MemoryNotePage = () => {
         {
           id: 'details',
           label: 'Details',
-          render: () => <EditorMeta editor={editing.editor} folders={folders} />,
+          render: () => (
+            <EditorMeta
+              editor={editing.editor}
+              schema={fieldSchema.fields}
+              documentClass={note?.class}
+              agentKind={note?.agentKind}
+              modifiedAt={note?.modifiedAt}
+              fieldWritesAllowed={fieldSchema.valueWrites && note?.fieldsWritable !== false}
+              fieldWriteError={
+                note?.fieldsWriteError ?? (!fieldSchema.valueWrites ? fieldSchema.error : null)
+              }
+              fieldSchemaError={fieldSchema.error}
+              onRetryFieldSchema={fieldSchema.error ? fieldSchema.reload : undefined}
+            />
+          ),
         },
       ]
     : readableMemory
@@ -89,7 +130,30 @@ export const MemoryNotePage = () => {
           {
             id: 'details',
             label: 'Details',
-            render: () => <MetaPanel note={readableMemory} />,
+            render: () => (
+              <MetaPanel
+                note={readableMemory}
+                space={noteSpace}
+                schema={fieldSchema.fields}
+                fieldValues={fieldValues}
+                canWrite={canWriteFields}
+                busyKey={fieldBusyKey}
+                onSetField={(key, value) => void setField(key, value)}
+                schemaError={
+                  (canWriteNote ? readableMemory.fieldsWriteError : undefined) ?? fieldSchema.error
+                }
+                schemaErrorMessage={
+                  canWriteNote && readableMemory.fieldsWriteError
+                    ? 'Custom field editing is unavailable'
+                    : undefined
+                }
+                onRetrySchema={
+                  (!canWriteNote || !readableMemory.fieldsWriteError) && fieldSchema.error
+                    ? () => void fieldSchema.reload()
+                    : undefined
+                }
+              />
+            ),
           },
         ]
       : // A note still arriving, a read that failed, a note of another class and a

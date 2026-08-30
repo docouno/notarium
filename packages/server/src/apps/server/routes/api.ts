@@ -19,6 +19,7 @@ import { contextSetsRoutes } from './contextSets'
 import { eventsRoutes } from './events'
 import { exportRoutes } from './export'
 import { favoritesRoutes } from './favorites'
+import { fieldsRoutes } from './fields'
 import { foldersRoutes } from './folders'
 import { graphRoutes } from './graph'
 import { hostRoutes } from './host'
@@ -65,6 +66,7 @@ export const apiRoutes = async (app: FastifyInstance, opts: ApiRoutesOptions) =>
   await eventsRoutes(app, ctx)
   await notesRoutes(app, ctx)
   await favoritesRoutes(app, ctx)
+  await fieldsRoutes(app, ctx)
   await treeRoutes(app, ctx)
   await graphRoutes(app, ctx)
   await activityRoutes(app, ctx)

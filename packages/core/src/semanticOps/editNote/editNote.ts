@@ -8,6 +8,7 @@
 
 import type { KnowledgeStore, MutationOptions } from '../../knowledgeStore'
 import { StoreError, versionConflict } from '../../knowledgeStore'
+import { validatedFieldPatchChanges } from '../../libs/fields'
 import { sha256Hex } from '../../libs/hash'
 import {
   FrontmatterLimitError,
@@ -15,7 +16,6 @@ import {
   replaceMarkdownSection,
   stripTitleHeading,
 } from '../../libs/markdown'
-import { normTags } from '../../libs/tags'
 import { EDIT_OPERATION } from './consts'
 import type { EditNoteInput, EditResult } from './types'
 
@@ -46,6 +46,10 @@ const bodyWithoutMetadata = (body: string): string => {
  *  operation cannot be satisfied. */
 export const applyEdit = (body: string, input: EditNoteInput): string => {
   const { operation, content, section, find } = input
+
+  if (operation === undefined || content === undefined) {
+    throw new EditError('operation and content must be provided together')
+  }
 
   switch (operation) {
     case EDIT_OPERATION.append: {
@@ -145,7 +149,7 @@ export const editNote = async (
   input: EditNoteInput,
   options?: MutationOptions,
 ): Promise<EditResult> => {
-  const note = await store.read(input.noteId)
+  const note = input.current ?? (await store.read(input.noteId))
   await options?.assertCurrent?.(note)
   const current = note.versionToken ?? ''
   const id = note.id ?? input.noteId
@@ -155,7 +159,13 @@ export const editNote = async (
   if (input.versionToken && input.versionToken !== current) {
     throw versionConflict({ ...note, id, versionToken: current })
   }
-  const next = applyEdit(note.content, input)
+  const hasOperation = input.operation !== undefined
+  const hasContent = input.content !== undefined
+
+  if (hasOperation !== hasContent) {
+    throw new EditError('operation and content must be provided together')
+  }
+  const next = hasOperation ? applyEdit(note.content, input) : note.content
   // No-op detection mirrors the journal's content normalisation
   // (stripTitleHeading after the shared body-frontmatter read) — not raw equality — so
   // an edit whose result is EFFECTIVELY unchanged (an empty append, or prepending the title
@@ -167,23 +177,28 @@ export const editNote = async (
   const normalise = (body: string): string =>
     stripTitleHeading(bodyWithoutMetadata(body), note.title)
 
-  if (normalise(next) === normalise(note.content)) {
+  const bodyChanged = normalise(next) !== normalise(note.content)
+  const fieldsChanged = input.fields
+    ? validatedFieldPatchChanges(input.fields, note.documentState)
+    : false
+
+  if (!bodyChanged && !fieldsChanged) {
     return { id, versionToken: current }
   }
-  // Carry the note's tags/type forward: an edit changes only the body, but a
-  // write that omits them would clear them (the engine normalises absent tags to
-  // []), exactly as the UI editor re-sends them. No directory → the note stays
-  // in its current mount/folder; the class is never relabelled on an edit.
+  // Typed channels stay absent: a semantic body/field edit does not own type or
+  // tags, and both engines preserve an omitted channel byte-for-byte. Re-emitting
+  // them would canonicalise unrelated authored frontmatter on a point intent.
   const r = await store.write(
     {
       title: note.title ?? '',
-      content: next,
+      content: bodyChanged ? next : note.content,
       originalId: id,
       versionToken: current,
-      tags: normTags(note.frontmatter?.tags),
-      noteType: typeof note.frontmatter?.type === 'string' ? note.frontmatter.type : undefined,
       principal: input.principal,
       agent: input.agent,
+      fields: input.fields,
+      fieldsUnquoted: input.fieldsUnquoted,
+      ...(!bodyChanged ? { derivedContentUnchanged: true as const } : {}),
     },
     options,
   )
@@ -192,9 +207,11 @@ export const editNote = async (
   // modes it confirms the post-edit size/hash without a get_note. Same caveat as
   // create_note — the engine may strip a leading inline-frontmatter/`# title` on
   // store, so this echoes what we sent the engine, not a re-read of disk.
-  return {
-    ...r,
-    bodyBytes: Buffer.byteLength(next, 'utf8'),
-    bodyHash: await sha256Hex(next),
-  }
+  return bodyChanged
+    ? {
+        ...r,
+        bodyBytes: Buffer.byteLength(next, 'utf8'),
+        bodyHash: await sha256Hex(next),
+      }
+    : r
 }

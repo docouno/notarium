@@ -33,6 +33,37 @@ const repoRoot = fileURLToPath(new URL('../../', import.meta.url))
 const CASE = 'import'
 
 describe('the real seed applier', () => {
+  it('writes exact raw field-schema states into their real space resources', async () => {
+    const world = buildCaseWorld('fields')
+    const rawSchemas = world.spaces.flatMap((space) =>
+      space.fieldSchemaRaw ? [{ slug: space.slug, raw: space.fieldSchemaRaw }] : [],
+    )
+
+    expect(rawSchemas.length).toBeGreaterThan(0)
+    const dataDir = await mkdtemp(join(tmpdir(), 'notarium-seed-real-fields-'))
+
+    try {
+      await exec(
+        join(repoRoot, 'node_modules', '.bin', 'tsx'),
+        [join(repoRoot, 'scripts/seed.ts')],
+        {
+          cwd: repoRoot,
+          env: { ...process.env, CASE: 'fields', DATA_DIR: dataDir, NOW: world.now },
+        },
+      )
+
+      for (const schema of rawSchemas) {
+        const file = await readFile(
+          join(dataDir, 'spaces', schema.slug, '.notarium/fields/schema.yaml'),
+          'utf8',
+        )
+        expect(file).toBe(schema.raw)
+      }
+    } finally {
+      await rm(dataDir, { recursive: true, force: true })
+    }
+  }, 180_000)
+
   it('writes every case-pinned physical id into the notes it seeds', async () => {
     const world = buildCaseWorld(CASE)
     const pinned = world.events.flatMap((e) =>

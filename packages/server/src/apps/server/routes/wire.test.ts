@@ -4,11 +4,37 @@ import { NoteDetailResponseSchema, NoteRevisionDetailResponseSchema } from '@not
 import {
   analyzeDocumentState,
   type NoteContent,
+  type NoteMeta,
   type RevisionDetail,
   sha256Hex,
 } from '@notarium/core'
 
-import { noteDetailToWire, revisionDetailToWire } from './wire'
+import { conflictToWire, noteDetailToWire, noteToWire, revisionDetailToWire } from './wire'
+
+describe('note list wire', () => {
+  it('projects the protected type separately from requested custom card fields', () => {
+    const note: NoteMeta = {
+      id: 'note-1',
+      title: 'Task',
+      filePath: 'task.md',
+      modifiedAt: null,
+      createdAt: null,
+      noteType: 'task',
+      fields: {
+        keys: { status: 'doing', hidden: 'kept-off-wire' },
+        truncated: ['type'],
+      },
+    }
+
+    expect(noteToWire(note, ['status'])).toMatchObject({
+      noteType: 'task',
+      fields: { status: 'doing' },
+    })
+    expect(noteToWire({ ...note, noteType: undefined, fields: { keys: {} } })).toMatchObject({
+      noteType: 'note',
+    })
+  })
+})
 
 const baseRevision = (overrides: Partial<RevisionDetail> = {}): RevisionDetail => ({
   id: 'revision-1',
@@ -230,5 +256,40 @@ describe('live note detail wire', () => {
       documentTitle: 'Authored title',
       content: 'Body.\n',
     })
+  })
+
+  it('derives full detail fields and authored order from the document projection', () => {
+    const source = [
+      '---',
+      'title: Fields',
+      'alpha: one',
+      'broken:',
+      '  nested: value',
+      'reviewers:',
+      '- ann',
+      '- bo',
+      '---',
+      '',
+      '# Fields',
+      '',
+    ].join('\n')
+    const wire = NoteDetailResponseSchema.parse(noteDetailToWire(live(source, 'fields')))
+
+    expect((wire as Record<string, unknown>).fields).toEqual({
+      keys: { alpha: 'one', reviewers: ['ann', 'bo'] },
+      unreadable: ['broken'],
+      order: ['title', 'alpha', 'broken', 'reviewers'],
+    })
+  })
+
+  it('uses the full detail mapper for a version-conflict current note', () => {
+    const current = live(
+      '---\ntype: task\nstatus: doing\ncreated: 2026-08-24\n---\n\n# Fields\n\nBody.\n',
+      'fields',
+    ) as NoteContent & { id: string; versionToken: string }
+
+    expect(NoteDetailResponseSchema.parse(conflictToWire(current))).toEqual(
+      NoteDetailResponseSchema.parse(noteDetailToWire(current)),
+    )
   })
 })

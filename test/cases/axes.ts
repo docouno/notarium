@@ -26,6 +26,7 @@ export type Axis =
   | 'scale'
   | 'auth'
   | 'favorites'
+  | 'fields'
 
 export type AxisInfo = {
   axis: Axis
@@ -144,6 +145,12 @@ export const AXES: readonly AxisInfo[] = [
     title: 'Auth / space topology',
     surfaces: ['switcher', 'members'],
     refs: ['#10', '#16', '#99', 'auth.md'],
+  },
+  {
+    axis: 'fields',
+    title: 'Declared meta fields',
+    surfaces: ['feed-field-facet', 'note-sidebar', 'card-chip', 'space-settings-fields'],
+    refs: ['#384', 'note-model.md', 'feed-page.md'],
   },
   {
     axis: 'favorites',

@@ -233,13 +233,21 @@ DROP TABLE IF EXISTS meta;
  *  embedded_hash sentinel ride along untouched — no re-embed.
  *
  *  A NON-additive reshape (dropping/retyping a column — a rowid-resetting table
- *  rebuild — or a change to how rows are derived) is deliberately NOT expressible
- *  here: it would silently misattribute the rowid-keyed vectors and desync the
- *  external-content FTS, and the invalidation signal must survive a crash (a transient
- *  boot-local flag does not). When one is genuinely needed, introduce it with a
- *  PERSISTENT rebuild marker (like the embedder-identity meta keys) that forces a
- *  vector wipe+re-embed AND an FTS rebuild — plus its own tests. Until then a full
- *  teardown, always legal for a derived index (P2), is the escape. */
+ *  rebuild) is deliberately NOT expressible here: it would silently misattribute the
+ *  rowid-keyed vectors and desync the external-content FTS. When one is genuinely
+ *  needed, introduce it with a PERSISTENT rebuild marker (like the embedder-identity
+ *  meta keys) that forces a vector wipe+re-embed AND an FTS rebuild — plus its own
+ *  tests. Until then a full teardown, always legal for a derived index (P2), is the
+ *  escape.
+ *
+ *  ONE exception to derivation-neutrality, and it carries its own condition: a step
+ *  MAY change how a row derives from its file if the SAME transaction clears
+ *  `file_fingerprints` and every rescan exit knows the new projection. The wipe makes
+ *  each row source-verify once, so the skip-by-mtime+size shortcut cannot leave a
+ *  stale projection behind; and because fingerprints are deliberately separate from
+ *  `notes.content_hash` and from FTS, clearing them touches neither vectors nor the
+ *  FTS schema — the persistent invalidation signal rides the ladder itself instead of
+ *  a second version marker beside it. */
 export type IndexMigration = { sql: string }
 
 const FILE_FINGERPRINT_SCHEMA = `
@@ -279,8 +287,33 @@ const IMPORT_SOURCE_SCHEMA = `
 ALTER TABLE notes ADD COLUMN source_locator TEXT;
 `
 
+/** The authored-frontmatter column, and the `file_fingerprints` wipe that makes every
+ *  already-indexed row source-verify it. That same already-paid pass materializes
+ *  canonical legacy source locators consistently instead of only on field-bearing rows.
+ *  The default is a note with no author keys,
+ *  which is a valid NON-empty blob: the empty string is reserved as the poll sentinel
+ *  for "this row's column was not selected".
+ *  canon: docs/search.md#how-it-is-indexed-write-path */
+const NOTE_FIELDS_SCHEMA = `
+ALTER TABLE notes ADD COLUMN fields TEXT NOT NULL DEFAULT '{"keys":{}}';
+DELETE FROM file_fingerprints;
+`
+
 const DOCUMENT_PROOF_CONTEXT_SCHEMA = `
 ALTER TABLE document_proofs ADD COLUMN context_json TEXT;
+`
+
+/** Metadata-only writes must not delete+reinsert unchanged FTS rows. SQLite's
+ * original broad UPDATE trigger fires even when only `fields`/mtime/seq changed;
+ * narrow it to the three columns the FTS table actually owns. */
+const FTS_UPDATE_TRIGGER_SCHEMA = `
+DROP TRIGGER IF EXISTS notes_au;
+CREATE TRIGGER notes_au AFTER UPDATE OF title, body, tags ON notes BEGIN
+  INSERT INTO notes_fts(notes_fts, rowid, title, body, tags)
+  VALUES ('delete', old.rowid, old.title, old.body, old.tags);
+  INSERT INTO notes_fts(rowid, title, body, tags)
+  VALUES (new.rowid, new.title, new.body, new.tags);
+END;
 `
 
 /** The ladder. INDEX_MIGRATIONS[0] is the FROZEN baseline — the meta+notes+FTS schema
@@ -296,8 +329,13 @@ export const INDEX_MIGRATIONS: readonly IndexMigration[] = [
   { sql: FILE_FINGERPRINT_VERSION_SCHEMA },
   { sql: NOTE_ID_CLAIM_INDEX_SCHEMA },
   { sql: DOCUMENT_PROOF_SCHEMA },
+  // `source_locator` and proof context shipped on main before the task-local
+  // `fields` projection. Preserve that published lineage and append fields: a
+  // deployed index must neither skip fields nor replay an existing main column.
   { sql: IMPORT_SOURCE_SCHEMA },
   { sql: DOCUMENT_PROOF_CONTEXT_SCHEMA },
+  { sql: NOTE_FIELDS_SCHEMA },
+  { sql: FTS_UPDATE_TRIGGER_SCHEMA },
 ]
 
 /** The current ladder length — the integer version an index converges to. */

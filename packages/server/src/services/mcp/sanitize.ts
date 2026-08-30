@@ -2,6 +2,7 @@
 // canon: docs/mcp-gateway.md#security
 // Deliberately conservative: only the angle brackets of a small control-tag set become guillemets ‹›; we
 // never strip/rewrite arbitrary markup, so legit notes about XML/code/prompts stay faithful yet inert.
+import { isUnsafeMcpFieldKey } from '@notarium/contract/tools'
 
 /** Control/turn-boundary pseudo-tags to defang; kept deliberately small (broadening corrupts legit notes). */
 const CONTROL_TAGS =
@@ -11,20 +12,31 @@ const CONTROL_TAGS =
 export const sanitizeText = (text: string): string =>
   text.replace(CONTROL_TAGS, (tag) => tag.replace(/</g, '‹').replace(/>/g, '›'))
 
+/** Agent-only field-key fence. Human REST and Markdown stay open-world; an MCP
+ * surface must neither reflect nor accept a pseudo-control tag as an address. */
+export { isUnsafeMcpFieldKey }
+
 /** Defang the string leaves of a frontmatter map. Shallow by design — nested YAML is NOT recursed
  *  (a documented v1 carve-out); the high-value injection surface is the body/snippet/title. */
-export const sanitizeFrontmatter = (fm: Record<string, unknown>): Record<string, unknown> => {
-  const out: Record<string, unknown> = {}
+export const sanitizeFrontmatter = (
+  fm: Record<string, unknown>,
+): { frontmatter: Record<string, unknown>; unsafeKeysOmitted: number } => {
+  const frontmatter = Object.create(null) as Record<string, unknown>
+  let unsafeKeysOmitted = 0
 
   for (const [k, v] of Object.entries(fm)) {
+    if (isUnsafeMcpFieldKey(k)) {
+      unsafeKeysOmitted++
+      continue
+    }
     if (typeof v === 'string') {
-      out[k] = sanitizeText(v)
+      frontmatter[k] = sanitizeText(v)
     } else if (Array.isArray(v)) {
-      out[k] = v.map((e) => (typeof e === 'string' ? sanitizeText(e) : e))
+      frontmatter[k] = v.map((e) => (typeof e === 'string' ? sanitizeText(e) : e))
     } else {
-      out[k] = v
+      frontmatter[k] = v
     }
   }
 
-  return out
+  return { frontmatter, unsafeKeysOmitted }
 }

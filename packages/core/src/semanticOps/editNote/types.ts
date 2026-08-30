@@ -1,14 +1,22 @@
 // Domain types for the edit_note semantic op.
 
-import type { AgentWriteAttribution, WriteResult } from '../../knowledgeStore'
+import type { AgentWriteAttribution, NoteContent, WriteResult } from '../../knowledgeStore'
+import type { FieldPatch } from '../../libs/fields'
 import type { EditOperation } from './consts'
 export type EditNoteInput = {
   /** The note-id to edit (the transport resolves a ref to this first). */
   noteId: string
-  operation: EditOperation
+  /** Host-proven fresh note from an access/class door. Reusing it avoids a second
+   * full materialization; the physical write still owns the final CAS. */
+  current?: NoteContent
+  operation?: EditOperation
   /** The text to add (append/prepend), the new section body (replaceSection),
    *  or the replacement (findReplace). */
-  content: string
+  content?: string
+  /** Point patch over authored frontmatter; may be the whole edit. */
+  fields?: FieldPatch
+  /** Host-resolved byte-shape hint for declared number/checkbox values. */
+  fieldsUnquoted?: string[]
   /** Heading to replace under — required by replaceSection. */
   section?: string
   /** Exact, unique snippet to replace — required by findReplace. */

@@ -6,6 +6,7 @@ import { useChrome } from '../../composers/ChromeProvider'
 import { useEditing } from '../../composers/EditingProvider'
 import { useFavorites } from '../../composers/FavoritesProvider'
 import { useFeed } from '../../composers/FeedProvider'
+import { useFieldSchemaForSpace } from '../../composers/FieldSchemaProvider'
 import { useHotkeys } from '../../composers/HotkeysProvider'
 import { NoteInspector } from '../../composers/NoteInspector'
 import { useNotes } from '../../composers/NotesProvider'
@@ -61,7 +62,8 @@ export const DocumentLayout = () => {
   const { projects } = useProjects()
   const toast = useToast()
   const copy = useCopy()
-  const { note, mode, folders, activeId, openNote, reloadNote, tree } = useNotes()
+  const { note, mode, activeId, openNote, reloadNote, tree } = useNotes()
+  const editorFieldSchema = useFieldSchemaForSpace(note?.space ?? space)
   const {
     isEditing,
     draft,
@@ -344,7 +346,20 @@ export const DocumentLayout = () => {
   const asideNode =
     !asideOpen || !canPanel ? null : isEditing ? (
       <Aside title="Note details" headerAction={panelToggle}>
-        <EditorMeta editor={editor} folders={folders} />
+        <EditorMeta
+          editor={editor}
+          schema={editorFieldSchema.fields}
+          documentClass={note?.class}
+          agentKind={note?.agentKind}
+          modifiedAt={note?.modifiedAt}
+          fieldWritesAllowed={editorFieldSchema.valueWrites && note?.fieldsWritable !== false}
+          fieldWriteError={
+            note?.fieldsWriteError ??
+            (!editorFieldSchema.valueWrites ? editorFieldSchema.error : null)
+          }
+          fieldSchemaError={editorFieldSchema.error}
+          onRetryFieldSchema={editorFieldSchema.error ? editorFieldSchema.reload : undefined}
+        />
       </Aside>
     ) : feedActive ? (
       <AsideGroups

@@ -12,7 +12,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { HTTP_STATUS } from '@notarium/contract/http'
 
-import { ApiError } from './client'
+import { ApiError, req } from './client'
 import { type ImportProgressLine, importStart } from './import'
 
 /** A response body that hands the reader raw BYTES in chunks of `chunkBytes`, with
@@ -178,5 +178,43 @@ describe('synchronous import stream', () => {
     expect((failure as ApiError).message).toBe('the archive ended early')
     // The notes are already on disk; losing this would tell the user nothing happened.
     expect((failure as ApiError).partial).toEqual(partialSummary)
+  })
+})
+
+describe('conflict envelope parsing', () => {
+  it('admits a structurally valid current note and refuses a malformed CAS payload', async () => {
+    const respond = (current: unknown) =>
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(
+          async () =>
+            new Response(
+              JSON.stringify({ error: 'conflict', reason: 'version_conflict', current }),
+              { status: HTTP_STATUS.CONFLICT, headers: { 'Content-Type': 'application/json' } },
+            ),
+        ),
+      )
+    respond({
+      id: 'note-1',
+      content: 'latest',
+      frontmatter: { status: 'done' },
+      fields: { keys: { status: 'done' }, order: ['status'] },
+      versionToken: 'v2',
+    })
+    const valid = (await req('/api/note').catch((error: unknown) => error)) as ApiError
+
+    expect(valid).toBeInstanceOf(ApiError)
+    expect(valid.current).toMatchObject({ id: 'note-1', versionToken: 'v2' })
+
+    respond({
+      id: 'note-1',
+      content: 'latest',
+      frontmatter: {},
+      versionToken: { attackerControlled: true },
+    })
+    const invalid = (await req('/api/note').catch((error: unknown) => error)) as ApiError
+
+    expect(invalid).toBeInstanceOf(ApiError)
+    expect(invalid.current).toBeUndefined()
   })
 })

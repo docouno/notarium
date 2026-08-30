@@ -10,8 +10,8 @@
      Segoe UI on Windows, Roboto on Android). Used as the fallback under the
      bundled fonts AND as the reading "System" preset (the OS font, zero fetch),
      kept SEPARATE from --font-sans so "System" never means the Inter UI font. */
-  --font-system: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
-    Helvetica, Arial, sans-serif;
+  --font-system:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
   /* App UI font (#27): Inter by default — a bundled web font for a consistent,
      polished interface on EVERY OS (notably Linux, where the system sans is a
      lottery), falling back to the OS stack until it loads. Preloaded in
@@ -22,8 +22,7 @@
      "whatever mono the system has"). It loads wherever code/the editor appear —
      accepted tradeoff for the quality. Falls back to the system mono if not yet
      loaded. The 'mono' / 'fira-code' reading presets sit on top of this. */
-  --font-mono: 'JetBrains Mono', 'SFMono-Regular', Consolas, 'Liberation Mono',
-    Menlo, monospace;
+  --font-mono: 'JetBrains Mono', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
 
   /* Reading typography (#27) — defaults for the rendered markdown body. The
      preset overrides keyed by data-reading-font/-size live in reading.scss;
@@ -60,12 +59,95 @@
   --accent: #6d4ee0;
   --accent-2: #5a3dc4;
   --accent-soft: #efeaff;
-  --danger: #e5484d;
-  --warning: #b97f17;
-  --ok: #2e9d5b;
-  /* Info blue — the one callout (#117) hue the semantic palette lacked (note/info/
-     abstract); the rest reuse --ok/--warning/--danger/--accent. */
-  --callout-info: #2f7bd1;
+  --accent-on-solid: #fff;
+  --danger-on-solid: #fff;
+  /* One semantic tone system. Persisted field names address `solid`; primitives
+     consume the matching fg/surface/border channels instead of inventing their
+     own alpha recipes. Dark overrides only the solids below — every derived
+     channel follows the active theme's text/background automatically. */
+  --tone-slate-solid: #64748b;
+  --tone-red-solid: #dc2626;
+  --tone-orange-solid: #ea580c;
+  --tone-amber-solid: #d97706;
+  --tone-green-solid: #15803d;
+  --tone-teal-solid: #0f766e;
+  --tone-blue-solid: #2563eb;
+  --tone-violet-solid: #7c3aed;
+
+  --tone-slate-fg: color-mix(in srgb, var(--tone-slate-solid) 48%, var(--text));
+  --tone-slate-surface: color-mix(in srgb, var(--tone-slate-solid) 24%, var(--bg-elevated));
+  --tone-slate-border: color-mix(in srgb, var(--tone-slate-solid) 52%, var(--bg-elevated));
+  --tone-red-fg: color-mix(in srgb, var(--tone-red-solid) 76%, var(--text));
+  --tone-red-surface: color-mix(in srgb, var(--tone-red-solid) 24%, var(--bg-elevated));
+  --tone-red-border: color-mix(in srgb, var(--tone-red-solid) 52%, var(--bg-elevated));
+  --tone-orange-fg: color-mix(in srgb, var(--tone-orange-solid) 60%, var(--text));
+  --tone-orange-surface: color-mix(in srgb, var(--tone-orange-solid) 24%, var(--bg-elevated));
+  --tone-orange-border: color-mix(in srgb, var(--tone-orange-solid) 52%, var(--bg-elevated));
+  --tone-amber-fg: color-mix(in srgb, var(--tone-amber-solid) 55%, var(--text));
+  --tone-amber-surface: color-mix(in srgb, var(--tone-amber-solid) 24%, var(--bg-elevated));
+  --tone-amber-border: color-mix(in srgb, var(--tone-amber-solid) 52%, var(--bg-elevated));
+  --tone-green-fg: color-mix(in srgb, var(--tone-green-solid) 76%, var(--text));
+  --tone-green-surface: color-mix(in srgb, var(--tone-green-solid) 24%, var(--bg-elevated));
+  --tone-green-border: color-mix(in srgb, var(--tone-green-solid) 52%, var(--bg-elevated));
+  --tone-teal-fg: color-mix(in srgb, var(--tone-teal-solid) 76%, var(--text));
+  --tone-teal-surface: color-mix(in srgb, var(--tone-teal-solid) 24%, var(--bg-elevated));
+  --tone-teal-border: color-mix(in srgb, var(--tone-teal-solid) 52%, var(--bg-elevated));
+  --tone-blue-fg: color-mix(in srgb, var(--tone-blue-solid) 76%, var(--text));
+  --tone-blue-surface: color-mix(in srgb, var(--tone-blue-solid) 24%, var(--bg-elevated));
+  --tone-blue-border: color-mix(in srgb, var(--tone-blue-solid) 52%, var(--bg-elevated));
+  --tone-violet-fg: color-mix(in srgb, var(--tone-violet-solid) 76%, var(--text));
+  --tone-violet-surface: color-mix(in srgb, var(--tone-violet-solid) 24%, var(--bg-elevated));
+  --tone-violet-border: color-mix(in srgb, var(--tone-violet-solid) 52%, var(--bg-elevated));
+
+  --field-color-slate: var(--tone-slate-solid);
+  --field-color-slate-fg: var(--tone-slate-fg);
+  --field-color-slate-surface: var(--tone-slate-surface);
+  --field-color-slate-border: var(--tone-slate-border);
+  --field-color-red: var(--tone-red-solid);
+  --field-color-red-fg: var(--tone-red-fg);
+  --field-color-red-surface: var(--tone-red-surface);
+  --field-color-red-border: var(--tone-red-border);
+  --field-color-orange: var(--tone-orange-solid);
+  --field-color-orange-fg: var(--tone-orange-fg);
+  --field-color-orange-surface: var(--tone-orange-surface);
+  --field-color-orange-border: var(--tone-orange-border);
+  --field-color-amber: var(--tone-amber-solid);
+  --field-color-amber-fg: var(--tone-amber-fg);
+  --field-color-amber-surface: var(--tone-amber-surface);
+  --field-color-amber-border: var(--tone-amber-border);
+  --field-color-green: var(--tone-green-solid);
+  --field-color-green-fg: var(--tone-green-fg);
+  --field-color-green-surface: var(--tone-green-surface);
+  --field-color-green-border: var(--tone-green-border);
+  --field-color-teal: var(--tone-teal-solid);
+  --field-color-teal-fg: var(--tone-teal-fg);
+  --field-color-teal-surface: var(--tone-teal-surface);
+  --field-color-teal-border: var(--tone-teal-border);
+  --field-color-blue: var(--tone-blue-solid);
+  --field-color-blue-fg: var(--tone-blue-fg);
+  --field-color-blue-surface: var(--tone-blue-surface);
+  --field-color-blue-border: var(--tone-blue-border);
+  --field-color-violet: var(--tone-violet-solid);
+  --field-color-violet-fg: var(--tone-violet-fg);
+  --field-color-violet-surface: var(--tone-violet-surface);
+  --field-color-violet-border: var(--tone-violet-border);
+
+  --danger: var(--tone-red-solid);
+  --danger-fg: var(--tone-red-fg);
+  --danger-surface: var(--tone-red-surface);
+  --danger-border: var(--tone-red-border);
+  --warning: var(--tone-amber-solid);
+  --warning-fg: var(--tone-amber-fg);
+  --warning-surface: var(--tone-amber-surface);
+  --warning-border: var(--tone-amber-border);
+  --ok: var(--tone-green-solid);
+  --ok-fg: var(--tone-green-fg);
+  --ok-surface: var(--tone-green-surface);
+  --ok-border: var(--tone-green-border);
+  --callout-info: var(--tone-blue-solid);
+  --info-fg: var(--tone-blue-fg);
+  --info-surface: var(--tone-blue-surface);
+  --info-border: var(--tone-blue-border);
   /* Modal/overlay dim layer. Theme-toned on purpose: a plain rgba(0,0,0)
      reads neutral on light but muddy over dark surfaces — each theme dims
      with its own deep tone (dark derives it from --bg-rail via color-mix). */
@@ -104,6 +186,12 @@
   --radius-md: 8px;
   --radius-lg: 12px;
   --radius-pill: 999px;
+  /* Shared control geometry. A no-icon control's text starts at inset-x; controls
+     with a leading glyph add icon-gap without changing the base inset. */
+  --control-height: 32px;
+  --control-inset-x: 10px;
+  --control-icon-gap: 6px;
+  --control-trailing-inset-x: 6px;
   /* Reading column width — shared by the reader (.doc) and the editor's centered
      title/body columns so a note's width never shifts between read and edit. */
   --doc-width: 740px;
@@ -224,10 +312,16 @@
   --accent: #8b7cf6;
   --accent-2: #7c6cf0;
   --accent-soft: rgba(139, 124, 246, 0.16);
-  --danger: #ef5a5a;
-  --warning: #d9a03f;
-  --ok: #3fb368;
-  --callout-info: #5b9bf0;
+  --accent-on-solid: #17171b;
+  --danger-on-solid: #17171b;
+  --tone-slate-solid: #94a3b8;
+  --tone-red-solid: #f87171;
+  --tone-orange-solid: #fb923c;
+  --tone-amber-solid: #fbbf24;
+  --tone-green-solid: #4ade80;
+  --tone-teal-solid: #2dd4bf;
+  --tone-blue-solid: #60a5fa;
+  --tone-violet-solid: #a78bfa;
   --backdrop-dim: color-mix(in srgb, var(--bg-rail) 70%, transparent);
   --shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
   /* Faint neutral active-line wash; the selection below is also neutral now, so

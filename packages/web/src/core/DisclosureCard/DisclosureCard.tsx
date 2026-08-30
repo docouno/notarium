@@ -102,7 +102,15 @@ export const DisclosureCard = ({
     >
       <div className={styles.header}>
         {grip != null && (
-          <span className={styles.grip} aria-hidden="true">
+          <span
+            className={styles.grip}
+            role={reorder ? 'button' : undefined}
+            tabIndex={reorder ? 0 : undefined}
+            aria-label={reorder ? 'Reorder item' : undefined}
+            aria-hidden={reorder ? undefined : true}
+            title={reorder ? 'Move with Arrow Up or Arrow Down' : undefined}
+            onKeyDown={reorder?.onKeyDown}
+          >
             {grip}
           </span>
         )}

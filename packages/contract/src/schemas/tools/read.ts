@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { IsoTimestampSchema, NoteClassSchema } from '../primitives'
+import { IsoTimestampSchema, NoteClassSchema, prototypeSafeRecord } from '../primitives'
 import { locationFields, sessionField } from './_fields'
 import {
   ProjectHandleSchema,
@@ -71,7 +71,8 @@ export const GetNoteOutputSchema = z.object({
   noteId: z.string(),
   title: z.string(),
   content: z.string(),
-  frontmatter: z.record(z.string(), z.unknown()),
+  frontmatter: prototypeSafeRecord(z.unknown()),
+  unsafeFrontmatterKeysOmitted: z.number().int().positive().optional(),
   ...locationFields,
   class: NoteClassSchema.optional(),
   versionToken: z.string(),
@@ -83,6 +84,12 @@ export const GetNoteOutputSchema = z.object({
       incoming: z.array(NoteLinkSchema),
     })
     .optional(),
+})
+
+/** JSON-schema publication twin: prototype safety is a runtime parsing concern,
+ * while MCP discovery needs a representable open-object schema. */
+export const GetNotePublishedOutputSchema = GetNoteOutputSchema.extend({
+  frontmatter: z.record(z.string(), z.unknown()),
 })
 
 /** Tool `recall`: assemble a token-budgeted context bundle around a query (seed

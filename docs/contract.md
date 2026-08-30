@@ -27,8 +27,8 @@ The wire speaks the domain's language; engines map their dialects at their own e
 
 The surface splits into three route classes (#16):
 
-- **Space-scoped** — under the `/api/s/<slug>/…` prefix (notes, tree, buckets, graph, search, status, events, note creation, folder moves). A request without a space physically has no route — fail-closed by construction.
-- **Id-addressed global** — `/api/note*`, `/api/previews`, `/api/move`: the arbiter of which space a note lives in is the identity registry, not a query parameter.
+- **Space-scoped** — under the `/api/s/<slug>/…` prefix (notes, tree, buckets, graph, search, status, events, note creation, folder moves). A request without a space physically has no route — fail-closed by construction. Its Feed list projection may carry compact `noteType` and only the requested `card:true` field values; detail-only state and unreadable/truncation bookkeeping never ride this window.
+- **Id-addressed global** — `/api/note*`, `/api/previews`, `/api/move`: the arbiter of which space a note lives in is the identity registry, not a query parameter. The ordinary `POST /api/note` update may carry an authored-field patch inside the same document CAS. `PUT /api/note/fields` is the atomic custom-field point-intent used by Meta, boards and agents; it resolves the space from the note id, not from client input, and returns the fresh note token. Future system metadata may share the resource path through explicit typed members, never by bypassing protected keys inside the generic `fields` map.
 - **Host-level** — `/api/spaces`, `/api/config`, `/api/health`, `/api/about`.
 
 ## Operation registry <a id="registry"></a>

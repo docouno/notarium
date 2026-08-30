@@ -2,25 +2,48 @@
    metadata-aside field chrome (folder combobox / type input) and the ContextMenu
    floating surface (glass-float, set in DatePicker.tsx). */
 
+.picker { position: relative; width: 100%; }
 .trigger {
-  display: flex; align-items: center; gap: 6px; width: 100%; height: 32px;
-  padding: 0 6px 0 9px;
+  display: flex; align-items: center; gap: var(--control-icon-gap); width: 100%; height: var(--control-height);
+  padding: 0 var(--control-trailing-inset-x) 0 var(--control-inset-x);
   border: 1px solid var(--border); border-radius: var(--radius-sm);
   background: var(--bg-elevated); color: var(--text);
   font-size: 13px; font-family: var(--font-mono); text-align: left; cursor: pointer;
 }
+.has-value .trigger { padding-right: calc(var(--control-trailing-inset-x) + 24px); }
 .trigger:hover { border-color: var(--border-strong); }
 .trigger:focus-visible { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); outline: none; }
-.trigger.disabled { opacity: 0.6; cursor: default; }
+.picker.disabled { opacity: 0.6; }
+.picker.disabled .trigger { cursor: default; }
 .trigger-icon { display: flex; color: var(--text-faint); flex-shrink: 0; }
 .trigger-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .trigger-label.placeholder { color: var(--text-faint); }
 .clear {
+  position: absolute; right: var(--control-trailing-inset-x); top: 50%; transform: translateY(-50%);
   display: flex; align-items: center; justify-content: center;
-  width: 20px; height: 20px; border-radius: var(--radius-xs); flex-shrink: 0;
-  color: var(--text-faint); cursor: pointer;
+  width: 20px; height: 20px; padding: 0; border: none; border-radius: var(--radius-xs);
+  background: transparent; color: var(--text-faint); cursor: pointer;
 }
 .clear:hover { background: var(--bg-hover); color: var(--text-dim); }
+
+.picker.quiet .trigger {
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+  font-family: var(--font-sans);
+}
+.picker.quiet.disabled { opacity: 1; }
+.picker.quiet .clear { opacity: 0; }
+.picker.quiet:hover .trigger,
+.picker.quiet .trigger:focus-visible {
+  border-color: var(--border);
+  background: var(--bg);
+}
+.picker.quiet:hover .clear,
+.picker.quiet:focus-within .clear { opacity: 1; }
+@media (hover: none) {
+  .picker.quiet .clear { opacity: 1; }
+}
 
 /* Floating calendar */
 .popover {
@@ -83,7 +106,7 @@
 .day.today { box-shadow: inset 0 0 0 1px var(--border-strong); }
 .day.focused { box-shadow: inset 0 0 0 1px var(--accent); }
 .day.selected {
-  background: var(--accent); color: #fff; font-weight: 600;
+  background: var(--accent); color: var(--accent-on-solid); font-weight: 600;
 }
 .day.selected:hover { background: var(--accent); }
 
@@ -105,7 +128,7 @@
 .cell.blocked:hover,
 .cell:disabled:hover { background: transparent; }
 .cell.today { box-shadow: inset 0 0 0 1px var(--border-strong); }
-.cell.selected { background: var(--accent); color: #fff; font-weight: 600; }
+.cell.selected { background: var(--accent); color: var(--accent-on-solid); font-weight: 600; }
 .cell.selected:hover { background: var(--accent); }
 
 .footer { display: flex; justify-content: flex-end; margin-top: 8px; }

@@ -17,6 +17,28 @@ const json = (app: FastifyInstance, url: string) =>
   app.inject({ method: 'GET', url }).then((r) => r.json())
 
 describe('seed catalog → fake backend (#175)', () => {
+  it('fields: the catalog schema reaches the production REST route', async () => {
+    const fixture = caseToFixture(buildCaseWorld('fields', { now: DEFAULT_NOW }))
+    fixture.auth = undefined
+    const app = await createApp(fixture)
+
+    try {
+      const schema = await json(app, '/api/s/fields-lab/fields/schema')
+      expect(schema.fields[0]).toMatchObject({
+        key: 'status',
+        type: 'enum',
+        card: true,
+        values: [
+          { key: 'beklog', label: 'Бэклог', color: 'slate' },
+          { key: 'v-rabote', label: 'В работе', color: 'amber' },
+          { key: 'gotovo', label: 'Готово', color: 'green' },
+        ],
+      })
+    } finally {
+      await app.close()
+    }
+  })
+
   it('trash-mixed: seeded deleted rows surface in the trash without runtime deletes', async () => {
     const world = buildCaseWorld('trash-mixed', { now: DEFAULT_NOW })
     const app = await createApp(caseToFixture(world))

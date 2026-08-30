@@ -421,6 +421,30 @@ describe('createServer — configured role mount', () => {
       }
     })
 
+    it('keeps the durable field schema outside both user and all-scope note exports', async () => {
+      const current = await app!.inject({ method: 'GET', url: '/api/s/main/fields/schema' })
+      const saved = await app!.inject({
+        method: 'PUT',
+        url: '/api/s/main/fields/schema',
+        payload: {
+          version: 1,
+          fields: [{ key: 'status', type: 'text' }],
+          versionToken: current.json().versionToken,
+        },
+      })
+
+      expect(saved.statusCode, saved.body).toBe(200)
+      expect(await readFile(join(notesDir, '.notarium/fields/schema.yaml'), 'utf8')).toContain(
+        'key: status',
+      )
+      for (const url of ['/api/s/main/export', '/api/s/main/export?scope=all']) {
+        const archive = await app!.inject({ method: 'GET', url })
+        const names = new AdmZip(archive.rawPayload).getEntries().map((entry) => entry.entryName)
+
+        expect(names).not.toContain('.notarium/fields/schema.yaml')
+      }
+    })
+
     it('registers a package resource as a note and keeps it inside its package', async () => {
       await addPackageResources()
       const guideId = await guideNoteId()

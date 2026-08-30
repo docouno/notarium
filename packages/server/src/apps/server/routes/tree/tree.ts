@@ -50,6 +50,9 @@ export const treeRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
       q.data,
       await folderIdentitiesFor(space, projectRows),
     )
-    return TreeChildrenResponseSchema.parse({ ...step, notes: step.notes.map(noteToWire) })
+    return TreeChildrenResponseSchema.parse({
+      ...step,
+      notes: step.notes.map((note) => noteToWire(note)),
+    })
   })
 }

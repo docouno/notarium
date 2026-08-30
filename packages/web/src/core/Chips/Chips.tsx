@@ -1,4 +1,5 @@
 import { type CSSProperties, type ReactNode } from 'react'
+import type { FieldColor } from '@notarium/contract'
 import { foldTag } from '@notarium/core/tags'
 import { cx } from '../../libs/cx/cx'
 import { isModifiedClick } from '../../libs/routing/routePaths'
@@ -19,6 +20,8 @@ export const Chip = ({
   title,
   testId,
   maxWidth,
+  color,
+  ariaLabel,
 }: {
   icon?: ReactNode
   children: ReactNode
@@ -27,15 +30,35 @@ export const Chip = ({
   title?: string
   testId?: string
   maxWidth?: string | number
+  color?: FieldColor
+  ariaLabel?: string
 }) => (
   <span
     className={cx(styles.chip, variant === 'accent' && styles.accent, className)}
     title={title}
+    role={ariaLabel ? 'img' : undefined}
+    aria-label={ariaLabel}
     data-testid={testId}
-    style={maxWidth != null ? ({ maxWidth } as CSSProperties) : undefined}
+    style={
+      color || maxWidth != null
+        ? ({
+            ...(maxWidth != null ? { maxWidth } : {}),
+            ...(color
+              ? {
+                  '--chip-solid': `var(--field-color-${color})`,
+                  '--chip-fg': `var(--field-color-${color}-fg)`,
+                  '--chip-surface': `var(--field-color-${color}-surface)`,
+                  '--chip-border': `var(--field-color-${color}-border)`,
+                }
+              : {}),
+          } as CSSProperties)
+        : undefined
+    }
   >
     {icon}
-    <span className={styles.label}>{children}</span>
+    <span className={styles.label} aria-hidden={ariaLabel ? true : undefined}>
+      {children}
+    </span>
   </span>
 )
 
@@ -116,29 +139,67 @@ export const RemovableTagChip = ({
   title?: string
   testId?: string
   maxWidth?: string | number
-}) => {
-  const style = maxWidth != null ? ({ maxWidth } as CSSProperties) : undefined
-  const label = title ?? tag
-  return (
-    <span
-      className={cx(styles.chip, styles.tagChip, styles.removableTagChip, className)}
-      title={label}
-      data-testid={testId}
-      style={style}
+}) => (
+  <RemovableChip
+    value={tag}
+    onRemove={onRemove}
+    prefix="#"
+    tag
+    className={className}
+    title={title}
+    testId={testId}
+    maxWidth={maxWidth}
+  />
+)
+
+export const RemovableChip = ({
+  value,
+  onRemove,
+  removeAriaLabel,
+  disabled = false,
+  prefix,
+  tag = false,
+  className,
+  title,
+  testId,
+  maxWidth,
+}: {
+  value: string
+  onRemove: () => void
+  removeAriaLabel?: string
+  disabled?: boolean
+  prefix?: ReactNode
+  tag?: boolean
+  className?: string
+  title?: string
+  testId?: string
+  maxWidth?: string | number
+}) => (
+  <span
+    className={cx(
+      styles.chip,
+      tag && styles.tagChip,
+      styles.removableChip,
+      tag && styles.removableTagChip,
+      className,
+    )}
+    title={title ?? value}
+    data-testid={testId}
+    style={maxWidth != null ? ({ maxWidth } as CSSProperties) : undefined}
+  >
+    {prefix != null && <span className={styles.tagHash}>{prefix}</span>}
+    <span className={styles.label}>{value}</span>
+    <button
+      type="button"
+      className={styles.chipRemove}
+      disabled={disabled}
+      onClick={onRemove}
+      aria-label={removeAriaLabel ?? `Remove ${value}`}
     >
-      <span className={styles.tagHash}>#</span>
-      <span className={styles.label}>{tag}</span>
-      <button
-        type="button"
-        className={styles.tagRemove}
-        onClick={onRemove}
-        aria-label={`Remove ${tag}`}
-      >
-        <IconX size={14} />
-      </button>
-    </span>
-  )
-}
+      <IconX size={14} />
+    </button>
+  </span>
+)
 
 // Tag pills for a note's tags. Read surfaces show all tags by default; compact
 // surfaces such as Feed cards may pass `max` to cap them. `itemClassName` rides

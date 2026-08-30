@@ -54,4 +54,16 @@ describe('toolchain declaration', () => {
 
     expect(npmrc).toContain('engine-strict=true')
   })
+
+  it('installs the declared npm before the fields benchmark dependency contour', () => {
+    const makefile = read('Makefile')
+    const target = makefile.slice(
+      makefile.indexOf('bench-fields-snapshot:'),
+      makefile.indexOf('write-perf-gate:'),
+    )
+
+    expect(target).toContain('pinned_npm=')
+    expect(target).toContain('npm i -g')
+    expect(target.indexOf('npm i -g')).toBeLessThan(target.indexOf('npm run deps:lean'))
+  })
 })

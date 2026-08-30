@@ -10,25 +10,41 @@ import {
 import { editNote } from '@notarium/core'
 
 import { safeRelAddress } from '../../../../libs/relPath'
+import { prepareFieldWrite } from '../../../fields'
 import { type Handler, ToolFailure } from '../../gateway'
 import { dedupedWrite, wireSpace, writeEcho, type WriteRun } from '../../helpers/dedup'
 import { mcpNoteMutationOptions, openMcpNoteDoor } from '../../helpers/noteDoor'
 import { notePath, projectLabelForNote } from '../../helpers/projectAddressing'
 import { writeAttributionOf } from '../../helpers/writeAttribution'
-import { sanitizeText } from '../../sanitize'
+import { isUnsafeMcpFieldKey, sanitizeText } from '../../sanitize'
 
 export const handleEditNote: Handler = async (ctx, rawArgs) => {
-  const { ref, operation, content, section, find, versionToken, idempotencyKey } =
+  const { ref, operation, content, fields, section, find, versionToken, idempotencyKey } =
     rawArgs as EditNoteInput
+  const hasOperation = operation !== undefined
+  const hasContent = content !== undefined
+  const fieldKeys = Object.getOwnPropertyNames(fields ?? {})
+  const fieldPatch = fieldKeys.length ? fields : undefined
+
+  if (fieldKeys.some(isUnsafeMcpFieldKey)) {
+    throw new ToolFailure('field key is not available through the agent interface')
+  }
+
+  if (hasOperation !== hasContent) {
+    throw new ToolFailure('`operation` and `content` must be provided together')
+  }
+  if (!hasOperation && fieldKeys.length === 0) {
+    throw new ToolFailure('provide an operation/content pair, at least one field, or both')
+  }
   // Set inside the run; stays undefined on an idempotency replay (run skipped) —
   // writeEcho omits path/space on a skip anyway.
   let editSpace: string | undefined
   // Idempotency-key only, no content-hash window (edit_note is not a create): a
   // keyless retry of an additive append DUPLICATES. The key returns the original
   // edit's {noteId, versionToken}.
-  const preflight = await openMcpNoteDoor(ctx, ref, 'note:write')
+  const preflight = idempotencyKey ? await openMcpNoteDoor(ctx, ref, 'note:write') : null
 
-  if (!preflight) {
+  if (idempotencyKey && !preflight) {
     throw new ToolFailure('no such note, or you do not have access to it')
   }
   const { result, wasHit } = await dedupedWrite<WriteRun>(
@@ -43,15 +59,21 @@ export const handleEditNote: Handler = async (ctx, rawArgs) => {
         throw new ToolFailure('no such note, or you do not have access to it')
       }
       editSpace = hit.space
+      const fieldsUnquoted = fieldPatch
+        ? await prepareFieldWrite(ctx.fieldSchemaStore, hit.space, fieldPatch)
+        : undefined
       // canon: docs/contract.md#cas
       const r = await editNote(
         hit.store,
         {
           noteId: ref,
+          current: hit.note,
           operation,
           content,
           section,
           find,
+          fields: fieldPatch,
+          fieldsUnquoted,
           versionToken,
           ...writeAttributionOf(ctx),
         },
@@ -69,7 +91,11 @@ export const handleEditNote: Handler = async (ctx, rawArgs) => {
   const structured = writeEcho(result, wasHit, {
     space: wireSpace(ctx, editSpace, await ctx.personalSpace()),
   })
-  const markdown = `Edited note \`${result.noteId}\` (${operation})${wasHit ? ' — idempotent replay, no change' : ''}.`
+  const changes = [
+    ...(operation ? [operation] : []),
+    ...(fieldKeys.length ? [`fields: ${fieldKeys.map(sanitizeText).join(', ')}`] : []),
+  ].join('; ')
+  const markdown = `Edited note \`${result.noteId}\` (${changes})${wasHit ? ' — idempotent replay, no change' : ''}.`
   return { markdown, structured }
 }
 

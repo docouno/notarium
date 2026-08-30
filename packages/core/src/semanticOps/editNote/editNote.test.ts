@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import type { KnowledgeStore, NoteContent, WriteInput, WriteResult } from '../../knowledgeStore'
 import { sha256Hex } from '../../libs/hash'
+import { analyzeDocumentState } from '../../libs/markdown'
 import { computeVersionToken } from '../../libs/versionToken'
 import { applyEdit, EditError, editNote } from './editNote'
 
@@ -139,20 +140,31 @@ describe('applyEdit', () => {
  *  actually happened so a no-op can be asserted to write nothing. */
 const fakeStore = (
   initial: string,
-  opts: { title?: string; frontmatter?: Record<string, unknown> } = {},
+  opts: { title?: string; frontmatter?: Record<string, unknown>; rawFrontmatter?: string } = {},
 ): KnowledgeStore & { writes: WriteInput[]; body: string } => {
   const store = {
     body: initial,
     title: opts.title ?? 'Note',
     frontmatter: opts.frontmatter ?? {},
     writes: [] as WriteInput[],
-    read: async (): Promise<NoteContent> => ({
-      id: 'note-1',
-      title: store.title,
-      content: store.body,
-      frontmatter: store.frontmatter,
-      versionToken: computeVersionToken(store.body),
-    }),
+    read: async (): Promise<NoteContent> => {
+      const documentState = opts.rawFrontmatter
+        ? analyzeDocumentState({
+            source: new TextEncoder().encode(
+              `---\n${opts.rawFrontmatter}\n---\n\n# ${store.title}\n\n${store.body}`,
+            ),
+            pathFallbackTitle: store.title,
+          })
+        : undefined
+      return {
+        id: 'note-1',
+        title: store.title,
+        content: store.body,
+        frontmatter: store.frontmatter,
+        ...(documentState ? { documentState } : {}),
+        versionToken: computeVersionToken(store.body),
+      }
+    },
     write: async (input: WriteInput): Promise<WriteResult> => {
       const live = computeVersionToken(store.body)
 
@@ -200,12 +212,77 @@ describe('editNote', () => {
     expect(r.versionToken).toBe(before)
   })
 
+  it('writes a fields-only edit once and omits the body integrity echo', async () => {
+    const store = fakeStore('unchanged', {
+      frontmatter: { status: 'backlog', type: 'task', tags: ['keep', 'these'] },
+      rawFrontmatter: 'title: Note\ntype: "task"\ntags: [keep, these]\nstatus: backlog',
+    })
+    const result = await editNote(store, { noteId: 'note-1', fields: { status: 'doing' } })
+
+    expect(store.writes).toHaveLength(1)
+    expect(store.writes[0]).toMatchObject({
+      content: 'unchanged',
+      fields: { status: 'doing' },
+    })
+    expect(store.writes[0].noteType).toBeUndefined()
+    expect(store.writes[0].tags).toBeUndefined()
+    expect(result.bodyBytes).toBeUndefined()
+    expect(result.bodyHash).toBeUndefined()
+  })
+
+  it('skips an equal fields-only patch only after validating the addressed entry', async () => {
+    const store = fakeStore('unchanged', {
+      frontmatter: { status: 'doing' },
+      rawFrontmatter: 'title: Note\nstatus: doing',
+    })
+    await editNote(store, { noteId: 'note-1', fields: { status: 'doing' } })
+    expect(store.writes).toHaveLength(0)
+
+    const duplicate = fakeStore('unchanged', {
+      frontmatter: { status: 'doing' },
+      rawFrontmatter: 'title: Note\nstatus: doing\nstatus: doing',
+    })
+    await expect(
+      editNote(duplicate, { noteId: 'note-1', fields: { status: 'doing' } }),
+    ).rejects.toMatchObject({ reason: 'duplicate_field_key' })
+    expect(duplicate.writes).toHaveLength(0)
+  })
+
+  it('refuses a partial operation/content pair before applying an edit', async () => {
+    const store = fakeStore('unchanged')
+    await expect(editNote(store, { noteId: 'note-1', operation: 'append' })).rejects.toBeInstanceOf(
+      EditError,
+    )
+    await expect(editNote(store, { noteId: 'note-1', content: 'x' })).rejects.toBeInstanceOf(
+      EditError,
+    )
+    expect(store.writes).toHaveLength(0)
+  })
+
   it('detects an effective no-op the reader strips off (prepending the title heading)', async () => {
     // Prepending "# Foo" to a note titled "Foo": read() strips that heading, so
     // the note is unchanged to any reader — must NOT write (would lay a baseline).
     const store = fakeStore('body text', { title: 'Foo' })
     await editNote(store, { noteId: 'note-1', operation: 'prepend', content: '# Foo' })
     expect(store.writes).toHaveLength(0)
+  })
+
+  it('keeps the original body bytes when an effective body no-op accompanies a field patch', async () => {
+    const store = fakeStore('body text', {
+      title: 'Foo',
+      rawFrontmatter: 'title: Foo\nstatus: backlog',
+    })
+
+    await editNote(store, {
+      noteId: 'note-1',
+      operation: 'prepend',
+      content: '# Foo',
+      fields: { status: 'doing' },
+    })
+
+    expect(store.writes).toHaveLength(1)
+    expect(store.writes[0].content).toBe('body text')
+    expect(store.body).toBe('body text')
   })
 
   it('writes a findReplace inside rule-fenced prose instead of swallowing it as a no-op', async () => {
@@ -233,10 +310,13 @@ describe('editNote', () => {
   })
 
   it('preserves the note tags on a body edit (an omitted-tags write would clear them)', async () => {
-    const store = fakeStore('body', { frontmatter: { tags: ['keep', 'these'] } })
+    const store = fakeStore('body', {
+      frontmatter: { type: 'task', tags: ['keep', 'these'] },
+    })
     await editNote(store, { noteId: 'note-1', operation: 'append', content: 'more' })
     expect(store.writes).toHaveLength(1)
-    expect(store.writes[0].tags).toEqual(['keep', 'these'])
+    expect(store.writes[0].noteType).toBeUndefined()
+    expect(store.writes[0].tags).toBeUndefined()
   })
 
   it('refuses a stale caller token with a conflict, before writing', async () => {

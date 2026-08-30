@@ -631,8 +631,11 @@ export class CachedStore implements KnowledgeStore {
         markIdentityPublicationPending: () => this.markIdentityPublicationPending(),
         flushIdentityPublication: () => this.flushIdentityPublication(),
         rememberIdentityRepair: (before) => this.rememberIdentityRepair(before),
-        emitChanged: (upserts, removed, graphChanged) =>
-          this.emitMutationChanged(upserts, removed, { graphChanged }),
+        emitChanged: (upserts, removed, graphChanged, linkIdentitiesChanged = true) =>
+          this.emitMutationChanged(upserts, removed, {
+            graphChanged,
+            syncLinkIdentities: linkIdentitiesChanged,
+          }),
         isBulkActive: () => this.bulk.isActive,
       },
       { mutations: this.mutations, trashMutations: this.trashMutations },
@@ -4136,6 +4139,11 @@ export class CachedStore implements KnowledgeStore {
         // a bare `{ ...meta }` would drop a legacy note's snapshot-only aliases
         // every poll (the engine's inventory omits them), re-ghosting the heal.
         aliases: this.snap.aliasesFor(id, meta.aliases, meta.title),
+        // Absence vs. a present empty blob is the whole rule, and it is stated on
+        // `NoteMeta.fields`: the poll re-sends the column only for rows that moved,
+        // so the previous value carries; `{"keys":{}}` arriving means the file lost
+        // its last author key and must lose it here too.
+        ...((meta.fields ?? prev?.fields) ? { fields: meta.fields ?? prev?.fields } : {}),
         modifiedAt: changed ? this.preciseStamp(meta.modifiedAt) : (prev?.modifiedAt ?? null),
         // Keep the first-seen creation date: the engine may bump its createdAt
         // on a reindex, and "when was this written" shouldn't move because the

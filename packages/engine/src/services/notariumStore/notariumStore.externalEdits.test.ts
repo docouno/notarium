@@ -731,23 +731,44 @@ describe('NotariumStore external edit convergence', () => {
     const indexDb = join(dbRoot, 'index.db')
     await writePreservingMtime(root, 'probe.md', '# Probe\n\nbody')
     const adapter = staticTokenFiles(root)
+    const sourceLocatorStep = INDEX_MIGRATIONS.find((step) =>
+      step.sql.includes('ADD COLUMN source_locator'),
+    )!
+    const fieldsStep = INDEX_MIGRATIONS.find((step) => step.sql.includes('ADD COLUMN fields'))!
+    const documentProofStep = INDEX_MIGRATIONS.find((step) =>
+      step.sql.includes('CREATE TABLE IF NOT EXISTS document_proofs'),
+    )!
+    const contextJsonStep = INDEX_MIGRATIONS.find((step) =>
+      step.sql.includes('ADD COLUMN context_json'),
+    )!
+    const fingerprintsStep = INDEX_MIGRATIONS.find((step) =>
+      step.sql.includes('CREATE TABLE IF NOT EXISTS file_fingerprints'),
+    )!
+    const fingerprintVersionStep = INDEX_MIGRATIONS.find((step) =>
+      step.sql.includes('ADD COLUMN note_seq'),
+    )!
     let store = new NotariumStore({
       mounts: userMount(adapter.assembly),
       sql: createNodeSqliteDriver(indexDb),
       integritySweepBatchSize: 0,
-      // Current write SQL needs the newest notes-table shape. Remove that
-      // column after seeding to reproduce the exact pre-step baseline.
+      // Current read/write SQL needs the latest additive shape. Remove those
+      // additions after seeding to reproduce the exact pre-step baseline.
       migrations: [
         INDEX_MIGRATIONS[0],
-        INDEX_MIGRATIONS[4],
-        INDEX_MIGRATIONS.at(-2)!,
-        INDEX_MIGRATIONS.at(-1)!,
+        fingerprintsStep,
+        fingerprintVersionStep,
+        documentProofStep,
+        sourceLocatorStep,
+        contextJsonStep,
+        fieldsStep,
       ],
     })
     const seed = await store.changes(null)
     await store.stop()
     const legacy = createNodeSqliteDriver(indexDb)
+    await legacy.exec(`DROP TRIGGER notes_fingerprint_ad; DROP TABLE file_fingerprints;`)
     await legacy.run(`ALTER TABLE notes DROP COLUMN source_locator`)
+    await legacy.run(`ALTER TABLE notes DROP COLUMN fields`)
     await legacy.run(`ALTER TABLE document_proofs DROP COLUMN context_json`)
     await legacy.run(`UPDATE meta SET value = '1' WHERE key = ?`, [INDEX_VERSION_KEY])
     await legacy.close()

@@ -23,8 +23,11 @@ import type {
   TrashItem as WireTrashItem,
 } from '@notarium/contract'
 import {
+  buildNoteDetailFields,
+  DEFAULT_NOTE_TYPE,
   DOCUMENT_STATE_FORMAT,
   documentSourceText,
+  fieldDocumentWriteError,
   frontmatterScalarEntry,
   RESOLVED_VIA,
   REVISION_ENTRY_ROLE,
@@ -62,16 +65,32 @@ const isoOrUndefined = (v: string | undefined): string | undefined =>
 
 /** One /api/notes row. `id` is widened to optional here though the wire requires
  *  it — stamped upstream by the identity layer, enforced by a downstream zod parse. */
-export const noteToWire = (n: NoteMeta): Omit<WireNote, 'id'> & { id?: string } => ({
-  id: n.id,
-  title: n.title,
-  class: n.class,
-  filePath: n.filePath,
-  ...(n.slug ? { slug: n.slug } : {}),
-  ...(n.aliases?.length ? { aliases: n.aliases } : {}),
-  modifiedAt: n.modifiedAt,
-  createdAt: n.createdAt,
-})
+export const noteToWire = (
+  n: NoteMeta,
+  cardFieldKeys?: readonly string[],
+): Omit<WireNote, 'id'> & { id?: string } => {
+  const fields = Object.create(null) as Record<string, string | string[]>
+  const noteType = n.noteType || DEFAULT_NOTE_TYPE
+
+  for (const key of cardFieldKeys ?? []) {
+    if (n.fields && Object.hasOwn(n.fields.keys, key)) {
+      fields[key] = n.fields.keys[key]
+    }
+  }
+
+  return {
+    id: n.id,
+    title: n.title,
+    class: n.class,
+    filePath: n.filePath,
+    ...(n.slug ? { slug: n.slug } : {}),
+    ...(n.aliases?.length ? { aliases: n.aliases } : {}),
+    modifiedAt: n.modifiedAt,
+    createdAt: n.createdAt,
+    noteType,
+    ...(Object.keys(fields).length ? { fields } : {}),
+  }
+}
 
 export const noteDetailToWire = (
   d: NoteContent,
@@ -89,6 +108,7 @@ export const noteDetailToWire = (
     (titleOrigin?.kind === 'frontmatter' && titleOrigin.coupledH1Range)
       ? titleOrigin.title
       : undefined
+  const fieldsWriteError = d.documentState ? fieldDocumentWriteError(d.documentState) : undefined
 
   return {
     id: d.id,
@@ -104,6 +124,13 @@ export const noteDetailToWire = (
     filePath: d.filePath,
     content: d.content,
     frontmatter: d.frontmatter,
+    ...(d.documentState?.projection
+      ? {
+          fields: buildNoteDetailFields(d.documentState.projection.frontmatterEntries),
+          fieldsWritable: fieldsWriteError === undefined,
+          ...(fieldsWriteError ? { fieldsWriteError } : {}),
+        }
+      : {}),
     ...(d.slug ? { slug: d.slug } : {}),
     ...(d.aliases?.length ? { aliases: d.aliases } : {}),
     ...(d.modifiedAt != null ? { modifiedAt: d.modifiedAt } : {}),
@@ -134,16 +161,8 @@ export const noteDetailToWire = (
   }
 }
 
-export const conflictToWire = (c: ConflictNote): WireNoteDetail => ({
-  id: c.id,
-  title: c.title,
-  filePath: c.filePath,
-  content: c.content,
-  frontmatter: c.frontmatter,
-  ...(c.slug ? { slug: c.slug } : {}),
-  ...(c.aliases?.length ? { aliases: c.aliases } : {}),
-  versionToken: c.versionToken,
-})
+export const conflictToWire = (c: ConflictNote): WireNoteDetail =>
+  noteDetailToWire(c) as WireNoteDetail
 
 export const searchResultToWire = (
   r: SearchResult,
@@ -372,6 +391,7 @@ export const createToDomain = (body: CreateNoteRequest, principal: string): Writ
   directory: body.directory,
   noteType: body.noteType,
   tags: body.tags,
+  fields: body.fields,
   slug: body.slug,
   // Absent stays absent — a normal save never touches `created`.
   createdAt: isoOrUndefined(body.createdAt),
@@ -390,6 +410,7 @@ export const updateToDomain = (body: UpdateNoteRequest, principal: string): Writ
   directory: body.directory,
   noteType: body.noteType,
   tags: body.tags,
+  fields: body.fields,
   slug: body.slug,
   createdAt: isoOrUndefined(body.createdAt),
   frontmatter: skillFrontmatter(body),

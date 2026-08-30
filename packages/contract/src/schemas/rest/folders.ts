@@ -32,6 +32,7 @@ export const CreateFolderPageRequestSchema = z.object({
   content: noteWriteFields.content,
   noteType: noteWriteFields.noteType,
   tags: noteWriteFields.tags,
+  fields: noteWriteFields.fields,
   slug: noteWriteFields.slug,
   createdAt: noteWriteFields.createdAt,
 })

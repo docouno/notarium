@@ -34,6 +34,7 @@ import { notesDirReader } from '../../libs/notesDir'
 import { DurableAbilityCreator } from '../../services/abilities'
 import { type AuthMode, createAuthService } from '../../services/auth'
 import { CausalOutboxProjector, causalReplicaId } from '../../services/causalOutboxProjector'
+import { createFieldSchemaStore } from '../../services/fields'
 import { closeTerminalImportReservations } from '../../services/import'
 import {
   InstallationReplayKey,
@@ -344,6 +345,7 @@ export const createServer = async ({
     // up front rather than at the first Mark as project.
     anchoredFilesForRoot: localFsAnchoredFiles(),
   })
+  const fieldSchemaStore = createFieldSchemaStore((id) => notesDirOfId(id))
 
   // First-provision only (idempotent): mark the space root as a project — always
   // an addressable root so create_note works immediately — and seat the space id
@@ -383,6 +385,7 @@ export const createServer = async ({
     // a stray config space's operator-managed dir untouched.
     onPurge: spacesRoot
       ? async (rec) => {
+          fieldSchemaStore.clear(rec.id)
           resourceAuthorities.remove(rec.id)
           storeCompositions.remove(rec.id)
           const cfg = configForRec(rec)
@@ -786,6 +789,7 @@ export const createServer = async ({
     contextOrder: metaDb?.contextOrder,
     spacesPersistence: metaDb?.spaces,
     markerStore,
+    fieldSchemaStore,
     spaDist: webDist(),
     about: hostInfo,
     // Async export via the durable job layer. Absent meta-DB ⇒ undefined ⇒

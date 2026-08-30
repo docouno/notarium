@@ -85,16 +85,16 @@ $head-gap: 12px;
   z-index: 1;
 
   &[data-variant='success'] {
-    color: var(--ok);
+    color: var(--ok-fg);
   }
   &[data-variant='info'] {
     color: var(--accent);
   }
   &[data-variant='warning'] {
-    color: var(--warning);
+    color: var(--warning-fg);
   }
   &[data-variant='error'] {
-    color: var(--danger);
+    color: var(--danger-fg);
   }
 }
 

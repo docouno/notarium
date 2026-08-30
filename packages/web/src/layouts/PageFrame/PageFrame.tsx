@@ -1,4 +1,12 @@
-import { type ReactNode, useLayoutEffect, useRef, useState } from 'react'
+import {
+  createContext,
+  type ReactNode,
+  type RefObject,
+  useContext,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from 'react'
 import { useChrome } from '../../composers/ChromeProvider'
 import { IconPanelLeft } from '../../core/Icons'
 import { IconToggle } from '../../core/IconToggle'
@@ -43,6 +51,21 @@ type PageFrameProps = {
   /** Native inert is used while a narrow full-screen aside covers the page. */
   contentInert?: boolean
   children: ReactNode
+}
+
+const PageFrameScrollContext = createContext<RefObject<HTMLDivElement | null> | null>(null)
+
+/** The scroll owner of the current PageFrame. Floating descendants use the SAME
+ * element for scroll-aware chrome instead of discovering it through the DOM or
+ * installing a second observer. */
+export const usePageFrameScroll = (): RefObject<HTMLDivElement | null> => {
+  const scrollRef = useContext(PageFrameScrollContext)
+
+  if (!scrollRef) {
+    throw new Error('usePageFrameScroll must be used inside PageFrame')
+  }
+
+  return scrollRef
 }
 
 /** Shared divider between page actions and a view-level topbar control. */
@@ -131,7 +154,9 @@ export const PageFrame = ({
           data-testid="content-scroll"
           className={cx(styles.contentScroll, contentClassName)}
         >
-          {children}
+          <PageFrameScrollContext.Provider value={scrollRef}>
+            {children}
+          </PageFrameScrollContext.Provider>
         </div>
       </main>
       {aside}

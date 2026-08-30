@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useBlocker, useLocation, useNavigate } from 'react-router'
-import { NOTE_CLASS } from '@notarium/contract/enums'
+import type { FieldDeclaration } from '@notarium/contract'
+import { FIELD_TYPE, NOTE_CLASS } from '@notarium/contract/enums'
 import { HTTP_STATUS } from '@notarium/contract/http'
 import {
   DEFAULT_NOTE_TYPE,
@@ -8,8 +9,11 @@ import {
   resolveFolderReference,
   STORE_ERROR_REASON,
 } from '@notarium/core'
+import { deriveNoteTitle } from '@notarium/core/markdown'
 import { useDialog } from '../../../../core/Dialog'
 import { useToast } from '../../../../core/Toast'
+import { canWriteSpace } from '../../../../libs/access'
+import { fieldDisplayName, fieldEnumOptionDisplayName } from '../../../../libs/fields'
 import {
   feedRoute,
   folderRoute,
@@ -20,6 +24,8 @@ import {
 import { folderOf } from '../../../../libs/tree/tree'
 import type { NoteDetailView, SaveInput } from '../../../../libs/wire'
 import { api, ApiError } from '../../../../services/api'
+import { useAuth } from '../../../AuthProvider'
+import { useFieldSchemaForSpace } from '../../../FieldSchemaProvider'
 import { useNotes } from '../../../NotesProvider'
 import { useSpace } from '../../../SpaceProvider'
 import type { EditingContextValue, EditingSessionAdapter, Ghost } from '../../types'
@@ -36,13 +42,43 @@ import styles from '../../EditingProvider.module.scss'
 const fitsInLabel = (title: string): boolean =>
   [...title].reduce((width, ch) => width + (ch.codePointAt(0)! > 0x2e7f ? 2 : 1), 0) <= 24
 
+const conflictFieldValue = (
+  value: unknown,
+  present: boolean,
+  declaration: FieldDeclaration | undefined,
+): string => {
+  if (!present || value === null) {
+    return 'Removed'
+  }
+  if (Array.isArray(value)) {
+    return value.length ? value.join(', ') : 'Empty'
+  }
+  if (declaration?.type === FIELD_TYPE.enum && typeof value === 'string') {
+    const option = declaration.values?.find((candidate) => candidate.key === value)
+
+    if (option) {
+      return fieldEnumOptionDisplayName(option)
+    }
+  }
+
+  return String(value) || 'Empty'
+}
+
+const conflictChannelValue = (value: unknown, empty = '—'): string => {
+  if (Array.isArray(value)) {
+    return value.length ? value.map(String).join(', ') : empty
+  }
+
+  return value == null || value === '' ? empty : String(value)
+}
+
 export const useEditingState = (): EditingContextValue => {
-  const { space, canWrite, personalSpace } = useSpace()
+  const { space, canWrite } = useSpace()
+  const { me, mode: authMode } = useAuth()
   const { nav, note, clearReader, refreshFolders, openNote, reloadNote, tree } = useNotes()
+  const fieldSchema = useFieldSchemaForSpace(note?.space ?? space)
   const folders = useMemo(() => tree?.folders ?? [], [tree?.folders])
-  const canWriteOpenNote =
-    canWrite ||
-    (note?.class === NOTE_CLASS.skill && personalSpace != null && note.space === personalSpace.slug)
+  const canWriteOpenNote = note ? canWriteSpace(me, authMode, note.space ?? space) : canWrite
   const { confirm, alert, choice } = useDialog()
   const toast = useToast()
   const navigate = useNavigate()
@@ -288,6 +324,10 @@ export const useEditingState = (): EditingContextValue => {
       content: documentTitle ? `# ${documentTitle}\n\n${note.content}` : note.content,
       tags: Array.isArray(note.frontmatter?.tags) ? (note.frontmatter.tags as string[]) : [],
       noteType: (note.frontmatter?.type as string) || DEFAULT_NOTE_TYPE,
+      frontmatter: note.frontmatter,
+      fieldDetails: note.fields,
+      fieldValues: note.fields?.keys,
+      fieldsStructured: note.fields !== undefined,
       // Prefill the editable creation date (#186) from the note's resolved instant.
       createdAt: note.createdAt ?? null,
     })
@@ -449,12 +489,7 @@ export const useEditingState = (): EditingContextValue => {
       // ⌘/Ctrl+Enter shortcut, which bypasses any button gating.
       const externalSession = sessionRef.current
       const canWriteDraft =
-        externalSession?.canWrite ??
-        (canWrite ||
-          (draftRef.current?.isNew === false &&
-            note?.class === NOTE_CLASS.skill &&
-            personalSpace != null &&
-            note.space === personalSpace.slug))
+        externalSession?.canWrite ?? (draftRef.current?.isNew ? canWrite : canWriteOpenNote)
 
       if (!canWriteDraft) {
         toast.error('You have read-only access to this space.')
@@ -518,7 +553,9 @@ export const useEditingState = (): EditingContextValue => {
         if (isEdit) {
           // Same id — the URL holds still across the save (even a rename); the
           // reader just refreshes in place.
-          await reloadNote()
+          if (!(await reloadNote())) {
+            toast.error('Note was saved, but the latest version could not be refreshed.')
+          }
         } else {
           // A uniquify retry lands under a name the user did not type — say which,
           // so the rename they consented to is still visible.
@@ -564,7 +601,7 @@ export const useEditingState = (): EditingContextValue => {
       note,
       space,
       canWrite,
-      personalSpace,
+      canWriteOpenNote,
       refreshFolders,
       openNote,
       reloadNote,
@@ -607,6 +644,84 @@ export const useEditingState = (): EditingContextValue => {
         // conflicts again (with whatever is live by then) and the only way
         // through is "Save my version". Time may pass between viewing and
         // saving; a plain-looking Save must never overwrite silently.
+        const currentFields = current.fields?.keys ?? Object.create(null)
+        const unreadableFields = new Set(current.fields?.unreadable ?? [])
+        const changedFieldKeys = Object.getOwnPropertyNames(payload.fields ?? {})
+        const customConflictFields = changedFieldKeys.map((key) => {
+          const declaration = fieldSchema.byKey.get(key)
+
+          return {
+            key,
+            label: fieldDisplayName(declaration ?? { key }),
+            latest: unreadableFields.has(key)
+              ? 'Unreadable value'
+              : conflictFieldValue(
+                  currentFields[key],
+                  Object.hasOwn(currentFields, key),
+                  declaration,
+                ),
+            draft: conflictFieldValue(
+              payload.fields?.[key],
+              Object.hasOwn(payload.fields ?? {}, key),
+              declaration,
+            ),
+          }
+        })
+        const currentType =
+          typeof current.frontmatter.type === 'string' && current.frontmatter.type
+            ? current.frontmatter.type
+            : DEFAULT_NOTE_TYPE
+        const currentTags = Array.isArray(current.frontmatter.tags)
+          ? current.frontmatter.tags
+          : current.frontmatter.tags == null
+            ? []
+            : [current.frontmatter.tags]
+        const noteSystemFields = sessionRef.current
+          ? []
+          : [
+              {
+                key: 'system:title',
+                label: 'Title',
+                latest: conflictChannelValue(current.title),
+                draft: conflictChannelValue(deriveNoteTitle(payload.content ?? '')),
+              },
+              {
+                key: 'system:type',
+                label: 'Type',
+                latest: conflictChannelValue(currentType),
+                draft: conflictChannelValue(payload.noteType ?? DEFAULT_NOTE_TYPE),
+              },
+              {
+                key: 'system:folder',
+                label: 'Folder',
+                latest: conflictChannelValue(folderOf(current.filePath ?? ''), 'Root'),
+                draft: conflictChannelValue(payload.directory, 'Root'),
+              },
+              {
+                key: 'system:slug',
+                label: 'Slug',
+                latest: conflictChannelValue(current.slug, 'Default from title'),
+                draft: conflictChannelValue(payload.slug, 'Default from title'),
+              },
+              {
+                key: 'system:tags',
+                label: 'Tags',
+                latest: conflictChannelValue(currentTags),
+                draft: conflictChannelValue(payload.tags),
+              },
+              ...(payload.createdAt !== undefined
+                ? [
+                    {
+                      key: 'system:created',
+                      label: 'Created',
+                      latest: conflictChannelValue(current.createdAt),
+                      draft: conflictChannelValue(payload.createdAt),
+                    },
+                  ]
+                : []),
+            ]
+        const conflictFields = [...noteSystemFields, ...customConflictFields]
+
         await alert({
           size: 'lg',
           title: 'Latest saved version',
@@ -619,6 +734,21 @@ export const useEditingState = (): EditingContextValue => {
               <pre className={styles.conflictBody} data-testid="conflict-current-content">
                 {current.content}
               </pre>
+              {conflictFields.length > 0 && (
+                <div
+                  className={styles.conflictFields}
+                  data-testid="conflict-current-fields"
+                  aria-label="Fields overwritten by this save"
+                >
+                  {conflictFields.map((field) => (
+                    <div className={styles.conflictField} key={field.key}>
+                      <strong>{field.label}</strong>
+                      <span>Latest: {field.latest}</span>
+                      <span>Your draft: {field.draft}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
             </>
           ),
           confirmLabel: 'Back to my draft',
@@ -627,7 +757,7 @@ export const useEditingState = (): EditingContextValue => {
       // 'cancel' / Escape: keep editing with the stale token — a later save
       // conflicts again, which is honest.
     },
-    [choice, alert, saveDraft],
+    [choice, alert, fieldSchema.byKey, saveDraft],
   )
 
   // Cancel falls back to whatever the reader holds underneath the overlay: the

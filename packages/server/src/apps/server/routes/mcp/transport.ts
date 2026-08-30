@@ -16,7 +16,7 @@ import {
 // stateless (fresh server per request, scoped to the authenticated principal).
 // canon: docs/mcp-gateway.md#connect · docs/mcp-oauth.md#surfaces
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
-import type { z } from 'zod'
+import { z } from 'zod'
 import { AUTH_MODE } from '@notarium/contract'
 import { HTTP_STATUS } from '@notarium/contract/http'
 import type { InteractiveSignal } from '@notarium/core'
@@ -26,6 +26,7 @@ import { isCrossOrigin } from '../../../../libs/requestOrigin'
 import type { AbilitiesService } from '../../../../services/abilities'
 import type { AuthService } from '../../../../services/auth'
 import { type Principal, SYSTEM_PRINCIPAL } from '../../../../services/authz'
+import type { FieldSchemaStore } from '../../../../services/fields'
 import {
   SERVER_INFO,
   SERVER_INSTRUCTIONS,
@@ -66,6 +67,7 @@ export type McpOptions = {
   scopePins?: ScopePinsPersistence
   contextOrder?: ContextOrderPersistence
   markerStore?: MarkerStore
+  fieldSchemaStore?: FieldSchemaStore
   /** On ⇒ an unauthenticated /mcp answers 401 with the RFC 9728 WWW-Authenticate
    *  challenge; off ⇒ a plain 401. */
   oauthChallenge?: boolean
@@ -85,8 +87,8 @@ type RegisterGatewayTool = (
   name: string,
   config: {
     description: string
-    inputSchema: z.ZodTypeAny
-    outputSchema: z.ZodTypeAny
+    inputSchema: unknown
+    outputSchema: unknown
     annotations: ToolAnnotations
   },
   callback: (args: unknown) => Promise<ToolResult>,
@@ -94,6 +96,33 @@ type RegisterGatewayTool = (
 
 const MODERN_PROTOCOL_VERSION = '2026-07-28'
 const SUBSCRIPTIONS_LISTEN_METHOD = 'subscriptions/listen'
+
+const publishableSchema = (
+  runtime: z.ZodTypeAny,
+  published: z.ZodTypeAny,
+  io: 'input' | 'output',
+) => ({
+  '~standard': {
+    version: 1 as const,
+    vendor: 'notarium-zod',
+    validate: async (value: unknown) => {
+      const parsed = await runtime.safeParseAsync(value)
+
+      return parsed.success
+        ? { value: parsed.data }
+        : {
+            issues: parsed.error.issues.map((issue) => ({
+              message: issue.message,
+              path: issue.path,
+            })),
+          }
+    },
+    jsonSchema: {
+      input: () => z.toJSONSchema(published, { io }),
+      output: () => z.toJSONSchema(published, { io }),
+    },
+  },
+})
 
 /** Per-request MCP server exposing only the tools this principal may see (the
  *  scope filter), each delegating to the gateway. canon: docs/mcp-gateway.md#security */
@@ -117,8 +146,12 @@ export const buildServer = (
 
   for (const t of gateway.listTools(principal)) {
     // The runtime values remain the complete strict Zod objects.
-    const inputSchema: z.ZodTypeAny = t.input
-    const outputSchema: z.ZodTypeAny = t.output
+    const inputSchema = t.publishedInput
+      ? publishableSchema(t.input, t.publishedInput, 'input')
+      : t.input
+    const outputSchema = t.publishedOutput
+      ? publishableSchema(t.output, t.publishedOutput, 'output')
+      : t.output
 
     registerTool(
       t.name,
@@ -179,6 +212,7 @@ export const registerMcp = async (
     scopePins,
     contextOrder,
     markerStore,
+    fieldSchemaStore,
     oauthChallenge,
     publicBaseUrl,
     scheduler,
@@ -200,6 +234,7 @@ export const registerMcp = async (
     scopePins,
     contextOrder,
     markerStore,
+    fieldSchemaStore,
     runMutation: mutationGate ? (task) => mutationGate.run(task) : undefined,
   })
 

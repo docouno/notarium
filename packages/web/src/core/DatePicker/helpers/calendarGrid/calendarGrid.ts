@@ -1,4 +1,4 @@
-import { MONTHS, YEARS_PER_PAGE } from '../../consts'
+import { YEARS_PER_PAGE } from '../../consts'
 
 const pad = (n: number) => String(n).padStart(2, '0')
 
@@ -22,17 +22,6 @@ export const fromKey = (v: string): { y: number; m: number; d: number } | null =
 
 export const yearsStart = (y: number) => Math.floor(y / YEARS_PER_PAGE) * YEARS_PER_PAGE
 export const daysInMonthOf = (y: number, m: number) => new Date(y, m + 1, 0).getDate()
-
-/** The label the trigger shows: a parsed value as `3 Nov 2024`, else the placeholder. */
-export const displayLabel = (value: string): string | null => {
-  const p = fromKey(value)
-
-  if (!p) {
-    return null
-  }
-
-  return `${p.d} ${MONTHS[p.m].slice(0, 3)} ${p.y}`
-}
 
 // Monday-based weekday index (the app's week starts Monday — listing buckets too).
 export const mondayIndex = (jsDay: number) => (jsDay + 6) % 7

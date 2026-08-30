@@ -1,15 +1,26 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { matchPath, useLocation, useSearchParams } from 'react-router'
-import type { TagFacet } from '@notarium/contract'
-import { BUCKET_GRAN, FAVORITE_ENTITY_KIND, NOTE_SORT } from '@notarium/contract/enums'
+import type { FieldFacet, TagFacet } from '@notarium/contract'
+import {
+  BUCKET_GRAN,
+  FAVORITE_ENTITY_KIND,
+  FIELD_FACET_DEFAULT_LIMIT,
+  FIELD_SCHEMA_MAX_FIELDS,
+  NOTE_SORT,
+} from '@notarium/contract/enums'
 import { STORE_EVENT } from '@notarium/contract/events'
-import { FEED_URL_PARAMS, feedRoute } from '../../../../libs/routing/routePaths'
+import {
+  FEED_URL_PARAMS,
+  feedRoute,
+  workspaceSettingsRoute,
+} from '../../../../libs/routing/routePaths'
 import { STORAGE_KEYS } from '../../../../libs/storageKeys'
 import { toggleFolder as toggleFolderSet } from '../../../../libs/tree/tree'
 import type { Bucket, NoteView } from '../../../../libs/wire'
 import { api } from '../../../../services/api'
 import { primePreviews } from '../../../../services/previews'
 import { useFavorites } from '../../../FavoritesProvider'
+import { useFieldSchema } from '../../../FieldSchemaProvider'
 import { useNotes } from '../../../NotesProvider'
 import { useSpace } from '../../../SpaceProvider'
 import { CHANGED_COALESCE_MS, useSync } from '../../../SyncProvider'
@@ -21,13 +32,18 @@ import { evictFarPages } from './helpers/evictFarPages'
 import { favoriteNoteSignature } from './helpers/favoriteNoteSignature'
 import {
   clearDateRangeParam,
+  clearFieldParam,
   clearFiltersParam,
   clearTagsParam,
+  fieldDayParam,
+  fieldEqParam,
   setDateFromParam,
   setDateToParam,
   setFavoriteParam,
   setQParam,
   setSortParam,
+  toggleFieldDayParam,
+  toggleFieldParam,
   toggleTagParam,
 } from './helpers/feedUrlParams'
 import {
@@ -59,10 +75,18 @@ export const useFeedState = () => {
   const { space } = useSpace()
   const location = useLocation()
   const onFeedRoute = matchPath(feedRoute(space), location.pathname) != null
+  const onFieldsRoute =
+    matchPath(workspaceSettingsRoute(space, 'fields'), location.pathname) != null
+  const fieldFacetActive = onFeedRoute || onFieldsRoute
   const { folderTree, tree, remember, dirOfId } = useNotes()
   const { subscribe, connectionRevision, observationEpoch } = useSync()
   const [searchParams, setSearchParams] = useSearchParams()
   const favorites = useFavorites()
+  const {
+    fields: fieldDeclarations,
+    revision: fieldSchemaRevision,
+    loading: fieldSchemaLoading,
+  } = useFieldSchema()
   const rawDateFrom = searchParams.get(FEED_URL_PARAMS.from) ?? ''
   const rawDateTo = searchParams.get(FEED_URL_PARAMS.to) ?? ''
   const dateFrom = isLocalDate(rawDateFrom) ? rawDateFrom : ''
@@ -122,7 +146,59 @@ export const useFeedState = () => {
     () => setSearchParams((prev) => clearTagsParam(prev), { replace: false }),
     [setSearchParams],
   )
-  // The full-text query (#190) is the third filter axis, also URL-borne (`?q=`),
+  const fieldFilters = useMemo(
+    () => searchParams.getAll(FEED_URL_PARAMS.field).sort(),
+    [searchParams],
+  )
+  const fieldAnyFilters = useMemo(
+    () => searchParams.getAll(FEED_URL_PARAMS.fieldAny).sort(),
+    [searchParams],
+  )
+  const fieldDayFilters = useMemo(
+    () => searchParams.getAll(FEED_URL_PARAMS.fieldDay).sort(),
+    [searchParams],
+  )
+  const fieldBadFilters = useMemo(
+    () => searchParams.getAll(FEED_URL_PARAMS.fieldBad).sort(),
+    [searchParams],
+  )
+  const fieldSet = useMemo(() => new Set(fieldFilters), [fieldFilters])
+  const fieldDaySet = useMemo(() => new Set(fieldDayFilters), [fieldDayFilters])
+  const isFieldSelected = useCallback(
+    (key: string, value: string) => fieldSet.has(fieldEqParam(key, value)),
+    [fieldSet],
+  )
+  const isFieldDaySelected = useCallback(
+    (key: string, day: string) => fieldDaySet.has(fieldDayParam(key, day)),
+    [fieldDaySet],
+  )
+  const isFieldActive = useCallback(
+    (key: string) => {
+      const address = `note.${key}`
+      return (
+        fieldFilters.some((value) => value.startsWith(`${address}:`)) ||
+        fieldDayFilters.some((value) => value.startsWith(`${address}:`)) ||
+        fieldAnyFilters.includes(address) ||
+        fieldBadFilters.includes(address)
+      )
+    },
+    [fieldAnyFilters, fieldBadFilters, fieldDayFilters, fieldFilters],
+  )
+  const toggleField = useCallback(
+    (key: string, value: string) =>
+      setSearchParams((prev) => toggleFieldParam(prev, key, value), { replace: false }),
+    [setSearchParams],
+  )
+  const toggleFieldDay = useCallback(
+    (key: string, day: string) =>
+      setSearchParams((prev) => toggleFieldDayParam(prev, key, day), { replace: false }),
+    [setSearchParams],
+  )
+  const clearField = useCallback(
+    (key: string) => setSearchParams((prev) => clearFieldParam(prev, key), { replace: false }),
+    [setSearchParams],
+  )
+  // The full-text query (#190) is another filter axis, also URL-borne (`?q=`),
   // so a search survives reload/back-forward and a topbar "search in Feed" from
   // anywhere is just a navigation to `/feed?q=…`. Trimmed for a stable query
   // identity; empty = no text filter. Composes with folders ∧ tags — the window,
@@ -213,7 +289,7 @@ export const useFeedState = () => {
   // guards (`queryRef.current !== key`) are space-aware — without it an in-place
   // space switch (FeedProvider doesn't remount) could apply space-A's late window
   // into space-B and reopen the inflight-dedupe hole.
-  const queryKey = `${space}|conn:${connectionRevision}|${sort}|${includeList.join(' ')}|${tags.join(' ')}|${q}|${dateFrom}|${dateTo}|${favorite ? `fav:${favoriteNoteSig}` : ''}`
+  const queryKey = `${space}|conn:${connectionRevision}|schema:${fieldSchemaRevision}|${sort}|${includeList.join(' ')}|${tags.join(' ')}|${JSON.stringify(fieldFilters)}|${JSON.stringify(fieldDayFilters)}|${JSON.stringify(fieldAnyFilters)}|${JSON.stringify(fieldBadFilters)}|${q}|${dateFrom}|${dateTo}|${favorite ? `fav:${favoriteNoteSig}` : ''}`
 
   const fetchPage = useCallback(
     async (page: number) => {
@@ -237,6 +313,10 @@ export const useFeedState = () => {
           ...(includeList.length ? { folders: includeList } : {}),
           // The tag filter (#109): OR/union over the selected set, server-applied.
           ...(tags.length ? { tags } : {}),
+          ...(fieldFilters.length ? { field: fieldFilters } : {}),
+          ...(fieldDayFilters.length ? { fieldDay: fieldDayFilters } : {}),
+          ...(fieldAnyFilters.length ? { fieldAny: fieldAnyFilters } : {}),
+          ...(fieldBadFilters.length ? { fieldBad: fieldBadFilters } : {}),
           // The full-text membership filter (#190): narrow to notes matching q.
           ...(q ? { q } : {}),
           // Date range (#201): local-day bounds. The server uses the current sort axis.
@@ -283,12 +363,27 @@ export const useFeedState = () => {
         }
       }
     },
-    [space, sort, includeList, tags, q, dateFrom, dateTo, favorite, remember, observationEpoch],
+    [
+      space,
+      sort,
+      includeList,
+      tags,
+      fieldFilters,
+      fieldDayFilters,
+      fieldAnyFilters,
+      fieldBadFilters,
+      q,
+      dateFrom,
+      dateTo,
+      favorite,
+      remember,
+      observationEpoch,
+    ],
   )
 
   // Query flip: drop the window, refetch the head.
   useEffect(() => {
-    if (!onFeedRoute || queryRef.current === queryKey) {
+    if (!onFeedRoute || fieldSchemaLoading || queryRef.current === queryKey) {
       return
     }
     queryRef.current = queryKey
@@ -299,7 +394,7 @@ export const useFeedState = () => {
     setPages(pagesRef.current)
     setTotal(null)
     void fetchPage(0)
-  }, [onFeedRoute, queryKey, fetchPage])
+  }, [onFeedRoute, fieldSchemaLoading, queryKey, fetchPage])
 
   // ── date buckets (#64): the grouped layout's skeleton ──────────────────────
   // One cheap histogram request per (sort, folder, group) tells the Feed every
@@ -328,6 +423,10 @@ export const useFeedState = () => {
         group,
         ...(includeList.length ? { folders: includeList } : {}),
         ...(tags.length ? { tags } : {}),
+        ...(fieldFilters.length ? { field: fieldFilters } : {}),
+        ...(fieldDayFilters.length ? { fieldDay: fieldDayFilters } : {}),
+        ...(fieldAnyFilters.length ? { fieldAny: fieldAnyFilters } : {}),
+        ...(fieldBadFilters.length ? { fieldBad: fieldBadFilters } : {}),
         ...(q ? { q } : {}),
         ...(dateFrom ? { from: dateFrom } : {}),
         ...(dateTo ? { to: dateTo } : {}),
@@ -343,7 +442,21 @@ export const useFeedState = () => {
     } catch {
       // keep the last good grouping on screen until the next refetch
     }
-  }, [space, sort, includeList, tags, q, dateFrom, dateTo, favorite, group])
+  }, [
+    space,
+    sort,
+    includeList,
+    tags,
+    fieldFilters,
+    fieldDayFilters,
+    fieldAnyFilters,
+    fieldBadFilters,
+    q,
+    dateFrom,
+    dateTo,
+    favorite,
+    group,
+  ])
   // Changing the DATA (sort/folder) invalidates the histogram AND reloads the
   // window behind a skeleton, so blank it (the ungrouped beat is hidden by the
   // skeleton). Changing only the GROUPING keeps the current grouped layout until
@@ -405,14 +518,71 @@ export const useFeedState = () => {
   useEffect(() => {
     void fetchTags()
   }, [fetchTags])
+  const [fieldFacetState, setFieldFacetState] = useState<{
+    space: string
+    fields: FieldFacet[]
+    truncated?: true
+    status: 'loading' | 'ready' | 'error'
+  }>(() => ({ space, fields: [], status: 'loading' }))
+  const fieldFacetRequestSeq = useRef(0)
+  const fieldFacet = fieldFacetState.space === space ? fieldFacetState.fields : []
+  const fieldFacetReady = fieldFacetState.space === space && fieldFacetState.status === 'ready'
+  const fetchFields = useCallback(async () => {
+    const requestSeq = ++fieldFacetRequestSeq.current
+    const requestedSpace = space
+    setFieldFacetState((current) => ({
+      space: requestedSpace,
+      fields: current.space === requestedSpace ? current.fields : [],
+      status: 'loading',
+    }))
+
+    try {
+      const response = await api.fieldsGet(space, {
+        limit: onFieldsRoute ? FIELD_SCHEMA_MAX_FIELDS : FIELD_FACET_DEFAULT_LIMIT,
+        valuesLimit: onFieldsRoute ? 0 : undefined,
+      })
+
+      if (requestSeq === fieldFacetRequestSeq.current) {
+        setFieldFacetState({
+          space: requestedSpace,
+          fields: response.fields,
+          ...(response.truncated ? { truncated: true as const } : {}),
+          status: 'ready',
+        })
+      }
+    } catch {
+      if (requestSeq === fieldFacetRequestSeq.current) {
+        setFieldFacetState((current) => ({
+          space: requestedSpace,
+          fields: current.space === requestedSpace ? current.fields : [],
+          status: 'error',
+        }))
+      }
+    }
+  }, [onFieldsRoute, space])
+  useEffect(() => {
+    if (fieldFacetActive) {
+      void fetchFields()
+    }
+  }, [fetchFields, fieldFacetActive, fieldSchemaRevision])
 
   // SSE freshness: refetch the held window when a change touches our scope.
   // canon: docs/feed-page.md#data-flow
   useEffect(() => {
-    let timer: ReturnType<typeof setTimeout> | null = null
+    let windowTimer: ReturnType<typeof setTimeout> | null = null
+    let fieldFacetTimer: ReturnType<typeof setTimeout> | null = null
     const off = subscribe((event) => {
       if (event.type !== STORE_EVENT.CHANGED) {
         return
+      }
+      // The field facet describes the whole corpus, not the selected folder.
+      // Coalesce it independently so an irrelevant window event still refreshes
+      // field vocabulary/counts without pulling unrelated window pages or buckets.
+      if (fieldFacetActive && !fieldFacetTimer) {
+        fieldFacetTimer = setTimeout(() => {
+          fieldFacetTimer = null
+          void fetchFields()
+        }, CHANGED_COALESCE_MS)
       }
       if (selected.size > 0) {
         // A change concerns us when it touches a VISIBLE note — i.e. one that sits
@@ -440,11 +610,11 @@ export const useFeedState = () => {
 
       pagesRef.current = nextPages
       setPages(nextPages)
-      if (timer) {
+      if (windowTimer) {
         return
       }
-      timer = setTimeout(() => {
-        timer = null
+      windowTimer = setTimeout(() => {
+        windowTimer = null
         const refreshPages = feedPagesToRefresh(pendingRefreshPages.current, pagesRef.current)
 
         pendingRefreshPages.current.clear()
@@ -459,11 +629,23 @@ export const useFeedState = () => {
 
     return () => {
       off()
-      if (timer) {
-        clearTimeout(timer)
+      if (windowTimer) {
+        clearTimeout(windowTimer)
+      }
+      if (fieldFacetTimer) {
+        clearTimeout(fieldFacetTimer)
       }
     }
-  }, [subscribe, selected, dirOfId, fetchPage, fetchBuckets, fetchTags])
+  }, [
+    subscribe,
+    selected,
+    dirOfId,
+    fetchPage,
+    fetchBuckets,
+    fetchTags,
+    fetchFields,
+    fieldFacetActive,
+  ])
 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEYS.feedSort, sortPref)
@@ -500,6 +682,20 @@ export const useFeedState = () => {
     toggleTag,
     clearTags,
     tagFacet,
+    fieldFilters,
+    fieldDayFilters,
+    fieldAnyFilters,
+    fieldBadFilters,
+    isFieldSelected,
+    isFieldDaySelected,
+    isFieldActive,
+    toggleField,
+    toggleFieldDay,
+    clearField,
+    fieldFacet,
+    fieldFacetTruncated: fieldFacetState.space === space && fieldFacetState.truncated === true,
+    fieldFacetReady,
+    fieldDeclarations,
     q,
     setQ,
     clearFilters,

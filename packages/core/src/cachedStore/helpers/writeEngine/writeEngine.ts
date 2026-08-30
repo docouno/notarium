@@ -25,6 +25,12 @@ import {
 import { IF_EXISTS, REVISION_KIND, STORE_ERROR_REASON } from '../../../knowledgeStore'
 import { nextAliasesMulti, normAliases } from '../../../libs/aliases'
 import {
+  buildNoteFields,
+  fieldPatchEmissions,
+  type NoteFields,
+  patchNoteFields,
+} from '../../../libs/fields'
+import {
   type DurableTextViolation,
   firstDurableTextViolation,
   freshNoteId,
@@ -35,6 +41,7 @@ import {
 import {
   type DocumentState,
   encodeWikilinkIdentity,
+  type FrontmatterEntry,
   frontmatterEntryOf,
   frontmatterEntryValue,
   FrontmatterLimitError,
@@ -46,6 +53,7 @@ import {
   stripTitleHeading,
 } from '../../../libs/markdown'
 import { MutationCoordinator } from '../../../libs/mutationCoordinator'
+import { DEFAULT_NOTE_TYPE, normalizeNoteType } from '../../../libs/noteType'
 import {
   basenameOf,
   directoryOf,
@@ -62,6 +70,7 @@ import {
 } from '../../../libs/path'
 import { effectiveSlug, slugify, storedSlug } from '../../../libs/slug'
 import { normTags } from '../../../libs/tags'
+import { indexedTypedFrontmatter } from '../../../libs/typedFrontmatter'
 import { computeVersionToken } from '../../../libs/versionToken'
 import type { LinkIndex } from '../../../referenceResolver'
 import type { JournalRecordInput } from '../../../revisionJournal'
@@ -82,6 +91,44 @@ const normAuthoredDate = (v?: string): string | undefined => {
   }
   const t = Date.parse(v)
   return Number.isNaN(t) ? undefined : new Date(t).toISOString()
+}
+
+/** The optimistic mirror of the serializer's `drop`: a typed channel that CLEARS its
+ *  key takes it out of the file outright, so it has to leave every list of the
+ *  projection too — the value, the unreadable mark and the truncated mark alike.
+ *  Removal only shrinks the blob, so the cap it was measured under still holds.
+ *
+ *  Applied to what the write CARRIES FORWARD, never to the finished blob: the
+ *  serializer drops the key before it measures the block, so a merge that lets the
+ *  key take part in the cap and subtracts it afterwards keeps the sacrifice it
+ *  caused — a demoted value, an incremented `truncatedMore`/`unreadableMore` — for a
+ *  key the file does not have. The two `More` counters name keys already lost to the
+ *  cap, so they carry as they are. */
+const withoutFieldKeys = (
+  fields: NoteFields | undefined,
+  cleared: readonly string[],
+): NoteFields | undefined => {
+  if (!fields) {
+    return undefined
+  }
+  const gone = new Set(cleared)
+  const keys = Object.create(null) as NoteFields['keys']
+
+  for (const key of Object.getOwnPropertyNames(fields.keys)) {
+    if (!gone.has(key)) {
+      keys[key] = fields.keys[key]
+    }
+  }
+  const unreadable = (fields.unreadable ?? []).filter((key) => !gone.has(key))
+  const truncated = (fields.truncated ?? []).filter((key) => !gone.has(key))
+
+  return {
+    keys,
+    ...(unreadable.length ? { unreadable } : {}),
+    ...(fields.unreadableMore ? { unreadableMore: fields.unreadableMore } : {}),
+    ...(truncated.length ? { truncated } : {}),
+    ...(fields.truncatedMore ? { truncatedMore: fields.truncatedMore } : {}),
+  }
 }
 
 const bodyWithoutMetadata = (body: string): string => {
@@ -130,10 +177,15 @@ const legacyAliasesChanged = (
   (before?.length ?? 0) !== (after?.length ?? 0) ||
   (before ?? []).some((alias, index) => alias !== after?.[index])
 
-type WriteSnapshotEffect = { directoryChanged: boolean; graphChanged: boolean }
+type WriteSnapshotEffect = {
+  directoryChanged: boolean
+  graphChanged: boolean
+  linkIdentitiesChanged: boolean
+}
 const NO_WRITE_SNAPSHOT_EFFECT: WriteSnapshotEffect = {
   directoryChanged: false,
   graphChanged: false,
+  linkIdentitiesChanged: false,
 }
 
 /** Inputs consumed by shapeGraph or buildLinkIndex. Timestamps, source locator,
@@ -147,6 +199,13 @@ const graphInputsChanged = (before: NoteMeta | undefined, after: NoteMeta): bool
   legacyAliasesChanged(before.aliases, after.aliases) ||
   legacyAliasesChanged(before.legacyNameAliases, after.legacyNameAliases) ||
   legacyAliasesChanged(before.tags, after.tags)
+
+/** Inputs the bare engine's authoritative id→path projection actually receives.
+ * Body, ordinary metadata and human aliases do not belong to this batch. */
+const linkIdentityInputsChanged = (before: NoteMeta | undefined, after: NoteMeta): boolean =>
+  !before ||
+  before.filePath !== after.filePath ||
+  legacyAliasesChanged(before.legacyNameAliases, after.legacyNameAliases)
 
 const folderFailed = (detail: string): StoreError => {
   const err = new StoreError(`# Folder Failed: ${detail}`)
@@ -279,6 +338,20 @@ const assertWriteText = (
       ? [input.tags]
       : []) {
     assertDurableTag(value)
+  }
+  for (const key of Object.getOwnPropertyNames(input.fields ?? {})) {
+    const value = input.fields?.[key]
+
+    for (const item of value == null ? [] : Array.isArray(value) ? value : [value]) {
+      if (!isDurableScalar(item)) {
+        throw invalidWrite('field values must be well-formed single-line strings')
+      }
+    }
+  }
+  for (const key of input.fieldsUnquoted ?? []) {
+    if (!isDurableScalar(key)) {
+      throw invalidWrite('unquoted field keys must be well-formed single-line strings')
+    }
   }
   if (input.frontmatter != null && !isDurableFrontmatter(input.frontmatter)) {
     throw invalidWrite('frontmatter contains invalid raw lines')
@@ -1040,11 +1113,13 @@ export class WriteEngine {
         )
 
         if (aliasContextChanged) {
-          writeEffect = { ...writeEffect, graphChanged: true }
+          writeEffect = { ...writeEffect, graphChanged: true, linkIdentitiesChanged: true }
         }
-        if (publishAfterIdentityFlush || aliasContextChanged) {
+        if (writeEffect.linkIdentitiesChanged) {
           this.host.markInnerLinkIdentitiesDirty()
-          this.host.syncInnerLinkIdentities()
+          if (!this.host.isBulkActive()) {
+            this.host.syncInnerLinkIdentities()
+          }
         }
         if (writeEffect.directoryChanged || aliasContextChanged) {
           await this.host.rederiveGraphContext(
@@ -1052,7 +1127,12 @@ export class WriteEngine {
           )
         }
         if (!publishAfterIdentityFlush && result.filePath) {
-          this.host.emitChanged([id], removed, writeEffect.graphChanged || aliasContextChanged)
+          this.host.emitChanged(
+            [id],
+            removed,
+            writeEffect.graphChanged || aliasContextChanged,
+            false,
+          )
         }
       }
 
@@ -1116,7 +1196,7 @@ export class WriteEngine {
           })
         }
         if (legacyAliasesChanged(aliasesBefore, capturedLegacyNameAliases)) {
-          writeEffect = { ...writeEffect, graphChanged: true }
+          writeEffect = { ...writeEffect, graphChanged: true, linkIdentitiesChanged: true }
           this.host.markInnerLinkIdentitiesDirty()
           this.host.syncInnerLinkIdentities()
           await this.host.rederiveGraphContext(
@@ -1161,7 +1241,7 @@ export class WriteEngine {
       if (publishAfterIdentityFlush) {
         await this.host.flushIdentityPublication()
         if (result.filePath) {
-          this.host.emitChanged([id], removed, writeEffect.graphChanged)
+          this.host.emitChanged([id], removed, writeEffect.graphChanged, false)
         }
       }
 
@@ -2212,6 +2292,83 @@ export class WriteEngine {
           ? []
           : prev?.tags
     const tags = input.tags === undefined ? carriedTags : (normTags(input.tags) ?? [])
+    // The field axis on the optimistic snapshot. Every channel the serializer merges
+    // is mirrored here, in its order: raw frontmatter, the inline block a body may
+    // carry, then the typed keys that have no metadata field of their own — which is
+    // why those override an incoming key of the same name here as they do on disk.
+    // Semantics are the serializer's — a PATCH, unlike the tags above: a key this
+    // write never mentions survives in the file, so dropping it here would blank the
+    // note's fields until the next poll. A replacing write is the one exception; it
+    // rebuilds the block, and only the typed channels merge on top.
+    // The body's leading block is NOT a channel on a replacing write: that write
+    // carries a canonical split already, and the serializer refuses to re-read a
+    // fenced block there rather than hoist prose into metadata — so the block stays
+    // in the body and none of its keys reach the file's frontmatter (noteFile.ts,
+    // `const inline = replacing ? null : parseFrontmatterBlock(body)`; the memory
+    // engine mirrors it verbatim). Merging it here would invent a key the file
+    // does not carry.
+    const inlineEntries = replacing
+      ? []
+      : (parseBodyFrontmatterBlock(input.content ?? '')?.entries ?? [])
+    const typedEmissions = indexedTypedFrontmatter({
+      noteType: input.noteType,
+      summary: input.summary,
+      muted: input.muted,
+    })
+    // The emissions read in the SAME shape both serializers read them in — an entry
+    // `put`s the key in its own slot, no entry CLEARS it (`TypedFrontmatterEmission`
+    // says so once, and `noteFile.emit` and the memory engine's
+    // `withIndexedTypedChannels` fold exactly this). They fold it straight onto a
+    // list of entries; the mirror cannot, because what it merges onto is a finished
+    // blob and not a block, so it needs both halves before the merge starts. One
+    // reading of one two-state verdict, in one pass — not a second predicate.
+    const emittedFields: FrontmatterEntry[] = []
+    const clearedFieldKeys: string[] = []
+
+    for (const emission of fieldPatchEmissions(input.fields ?? {}, input.fieldsUnquoted)) {
+      if (emission.entry) {
+        emittedFields.push(emission.entry)
+      } else {
+        clearedFieldKeys.push(emission.key)
+      }
+    }
+
+    for (const emission of typedEmissions) {
+      if (emission.entry) {
+        emittedFields.push(emission.entry)
+      } else {
+        clearedFieldKeys.push(emission.key)
+      }
+    }
+    // A typed channel that CLEARS its key `drop`s it from the block BEFORE the
+    // serializer measures the file, so the mirror has to take it out before the cap
+    // runs too — on both sides of the merge. Subtracting it from the finished blob
+    // instead leaves the sacrifice the key itself caused standing for a key the file
+    // no longer has: its value demoted to `truncated`, a name pushed out of a list
+    // into `truncatedMore`/`unreadableMore`. Those counters are what the sidebar sums
+    // into "unindexed keys", and the phantom term is one no poll can explain.
+    const cleared = new Set(clearedFieldKeys)
+    const incomingFields = [
+      ...(input.frontmatter ?? []),
+      ...inlineEntries,
+      ...emittedFields,
+    ].filter((entry) => !entry.key || !cleared.has(entry.key))
+    const carriedFields = cleared.size
+      ? withoutFieldKeys(prev?.fields, clearedFieldKeys)
+      : prev?.fields
+    // "No author keys" is a STATE of the column, spelled `{"keys":{}}` — the derivation
+    // never answers "no column here", and neither may the mirror. Absence is the poll's
+    // sentinel for "this row did not move, keep what you had" (`applyDelta`), so
+    // leaving it here on a note that carried nothing and was sent nothing publishes the
+    // one thing the file cannot mean. It is also the most common file in the corpus —
+    // frontmatter that is title and id and nothing else — and the boundary gate reads
+    // the mirror's blob, so on that shape it threw instead of comparing. The replacing
+    // branch already spells it; this makes the two agree.
+    const fields = replacing
+      ? buildNoteFields(incomingFields)
+      : incomingFields.length
+        ? patchNoteFields(carriedFields, incomingFields)
+        : (carriedFields ?? buildNoteFields([]))
     const rawSourceLocator = incomingSourceLocator
       ? frontmatterEntryValue(incomingSourceLocator)
       : undefined
@@ -2222,6 +2379,19 @@ export class WriteEngine {
           ? rawSourceLocator
           : undefined
         : prev?.sourceLocator)
+    // Type is a primary note projection, not a best-effort custom-field value. The
+    // fields blob may legitimately sacrifice a late-authored `type` to its byte cap,
+    // while the engine still reads that same entry from the complete frontmatter and
+    // stores it in `note_type`. Mirror the serializer's last-wins merge from the
+    // uncapped entries; deriving it from `fields.keys` makes only the optimistic
+    // CachedStore snapshot briefly lie until the next poll.
+    const incomingTypeEntry = frontmatterEntryOf(incomingFields, 'type')
+    const incomingTypeValue = incomingTypeEntry && frontmatterEntryValue(incomingTypeEntry)
+    const projectedNoteType =
+      typeof incomingTypeValue === 'string' && incomingTypeValue.trim()
+        ? incomingTypeValue.trim()
+        : DEFAULT_NOTE_TYPE
+    const noteTypeAddressed = replacing || cleared.has('type') || incomingTypeEntry !== undefined
     const nextMeta: NoteMeta = {
       id,
       title: input.title,
@@ -2233,6 +2403,10 @@ export class WriteEngine {
           ? { legacyNameAliases: [...rec.legacyNameAliases] }
           : {}),
       ...(tags?.length ? { tags } : {}),
+      noteType:
+        (input.noteType !== undefined ? normalizeNoteType(input.noteType) : undefined) ??
+        (noteTypeAddressed ? projectedNoteType : (prev?.noteType ?? DEFAULT_NOTE_TYPE)),
+      ...(fields ? { fields } : {}),
       ...(sourceLocator ? { sourceLocator } : {}),
       // Class is mount-derived and AUTHORITATIVE from the write result — no optimistic guess, so an
       // edit of a hidden note never briefly flips to user-doc. Falls back to prior/targetClass only
@@ -2250,19 +2424,22 @@ export class WriteEngine {
     }
 
     this.host.snap.notes.set(id, nextMeta)
+    const preserveDerived = input.derivedContentUnchanged === true
+
     // Write-through keeps the preview warm too: the very snippet the Feed will
     // ask for next is computed here, from data the save already carried.
     // The caller's own text, not a parsed file: a record-bearing opening is folded into
     // frontmatter, while rule-fenced prose remains visible body. This is the one preview
     // producer holding pre-serialization bytes, so it applies the shared body answer here.
-    this.host.previewCache.set(
-      id,
-      derivePreview(bodyWithoutMetadata(input.content ?? ''), input.tags),
-    )
+    if (!preserveDerived) {
+      this.host.previewCache.set(id, derivePreview(bodyWithoutMetadata(input.content ?? ''), tags))
+    }
     // Exact write merging (raw frontmatter carry-forward, title projection) belongs
     // to the engine. Drop the old fact and let the next context read derive once
     // from the published file; this adds no parsing work to bulk import.
-    this.host.noteFactsCache.delete(id)
+    if (!preserveDerived) {
+      this.host.noteFactsCache.delete(id)
+    }
     const directoryChanged = this.host.dirs.add(directoryOf(newPath))
     // Directory context is part of the resolver index, so add it before deriving
     // even this note's own outbound edges.
@@ -2275,10 +2452,12 @@ export class WriteEngine {
     // rebuilt it on every write — the note the write just published moved the very
     // counter the memo is keyed on — so the corpus was walked per note anyway, one
     // layer down from the loop that was fixed. Under the bracket both halves defer.
-    const edgesChanged = this.host.snap.patchNoteEdges(id, input.content ?? '', {
-      index: this.resolveIndex(),
-      deferReresolve: this.host.isBulkActive(),
-    })
+    const edgesChanged = preserveDerived
+      ? false
+      : this.host.snap.patchNoteEdges(id, input.content ?? '', {
+          index: this.resolveIndex(),
+          deferReresolve: this.host.isBulkActive(),
+        })
     const isGraphVisible = isVisibleOn(SURFACE.graph, nextMeta.class ?? DEFAULT_NOTE_CLASS)
     const graphChanged =
       removed.length > 0 ||
@@ -2290,10 +2469,19 @@ export class WriteEngine {
     removedOut?.push(...removed)
 
     if (publish) {
-      this.host.emitChanged([id], removed, graphChanged)
+      this.host.emitChanged(
+        [id],
+        removed,
+        graphChanged,
+        removed.length > 0 || linkIdentityInputsChanged(prev, nextMeta),
+      )
     }
 
-    return { directoryChanged, graphChanged }
+    return {
+      directoryChanged,
+      graphChanged,
+      linkIdentitiesChanged: removed.length > 0 || linkIdentityInputsChanged(prev, nextMeta),
+    }
   }
 
   private applyNoteMove(

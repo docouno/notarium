@@ -10,6 +10,8 @@ import { explorerScroll } from './cases/explorerScroll'
 import { externalEdits } from './cases/externalEdits'
 import { favorites } from './cases/favorites'
 import { feedScroll } from './cases/feedScroll'
+import { fields } from './cases/fields'
+import { fieldsScale } from './cases/fieldsScale'
 import { folderPage } from './cases/folderPage'
 import { graph } from './cases/graph'
 import { graphLoad } from './cases/graphLoad'
@@ -70,6 +72,9 @@ export const CASES: readonly CaseSpec[] = [
   nameCollisions,
   legacySlugLinks,
   nonLatinNames,
+  // declared meta fields (the field axis)
+  fields,
+  fieldsScale,
   // content / reader
   readerShowcase,
   longDocument,

@@ -23,7 +23,7 @@
 // the seeder writes the very files the stand then reads, so a drift between the
 // two would seed one stand and start another.
 
-import { mkdir, readFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve as resolvePath, sep } from 'node:path'
 
 import {
@@ -45,6 +45,7 @@ import {
 import {
   ARTIFACT_TTL_MS,
   createExportHandler,
+  createFieldSchemaStore,
   createFsArtifactStore,
   createFsImportStagingStore,
   createFsRoleLibrary,
@@ -228,6 +229,7 @@ const run = async (): Promise<void> => {
   const markerStore = createMarkerStore((id) => notesDirOf(id), {
     anchoredFilesForRoot: localFsAnchoredFiles(),
   })
+  const fieldSchemaStore = createFieldSchemaStore((id) => notesDirOf(id))
   const resourceAuthorities = new SpaceResourceAuthorityRegistry()
   const storeCompositions = new NotariumStoreCompositionOwner()
 
@@ -309,6 +311,45 @@ const run = async (): Promise<void> => {
     const rec = await manager.create({ slug: s.slug, displayName: s.displayName || s.slug })
     idOf.set(s.slug, rec.id)
     records.set(s.slug, rec)
+  }
+
+  // 1b. Apply the space-owned declaration document through its production CAS
+  // service. It is a sibling structural resource, not a note and not a journal row.
+  let fieldSchemas = 0
+
+  for (const declaration of world.spaces) {
+    if (!declaration.fieldSchema && !declaration.fieldSchemaRaw) {
+      continue
+    }
+    const space = idOf.get(declaration.slug)
+
+    if (!space) {
+      throw new Error(`field schema references unknown space: ${declaration.slug}`)
+    }
+    if (declaration.fieldSchemaRaw) {
+      const notesDir = notesDirOf(space)
+
+      if (!notesDir) {
+        throw new Error(`field schema has no notes directory: ${declaration.slug}`)
+      }
+      const schemaDir = join(notesDir, '.notarium/fields')
+
+      await mkdir(schemaDir, { recursive: true })
+      await writeFile(join(schemaDir, 'schema.yaml'), declaration.fieldSchemaRaw, 'utf8')
+      fieldSchemaStore.clear(space)
+      fieldSchemas++
+      continue
+    }
+    const current = await fieldSchemaStore.read(space)
+    const written = await fieldSchemaStore.update(space, {
+      ...declaration.fieldSchema!,
+      versionToken: current.versionToken,
+    })
+
+    if (written.status !== 'saved') {
+      throw new Error(`could not seed field schema for ${declaration.slug}: ${written.status}`)
+    }
+    fieldSchemas++
   }
 
   // Author alias history only after every current slug exists. This mirrors the
@@ -1793,6 +1834,7 @@ const run = async (): Promise<void> => {
           jobs,
           durableImports,
           externalRewrites,
+          fieldSchemas,
           externalSources,
         },
         login: { username: primary.username, password: primary.password ?? '(none)' },

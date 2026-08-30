@@ -4,13 +4,20 @@ import {
   AuthorSchema,
   DurableAddressPathSchema,
   DurableNonEmptyScalarSchema,
+  FieldPatchSchema,
   IsoTimestampSchema,
   NoteClassSchema,
+  prototypeSafeRecord,
   SpaceSlugSchema,
 } from '../primitives'
 import { noteWriteFields } from './_fields'
 import { AuthoredAttachmentSchema, OwnedRoleAbilityLocatorSchema } from './agent/abilities'
 import { LiteralSourceSchema, RestoreAvailabilitySchema } from './history'
+import { NoteFieldsWireSchema } from './notes'
+
+export const NoteDetailFieldsWireSchema = NoteFieldsWireSchema.extend({
+  order: z.array(z.string()),
+})
 
 export const NoteDetailResponseSchema = z.object({
   id: z.string(),
@@ -32,7 +39,13 @@ export const NoteDetailResponseSchema = z.object({
    *  the package's manifest name, which remains the note identity label. */
   documentTitle: z.string().optional(),
   content: z.string(),
-  frontmatter: z.record(z.string(), z.unknown()),
+  frontmatter: prototypeSafeRecord(z.unknown()),
+  /** Complete authored values for the read-mode inspector plus metadata describing
+   * which keys the capped index projection cannot answer. */
+  fields: NoteDetailFieldsWireSchema.optional(),
+  /** Whether custom-field controls can safely rewrite this exact document. */
+  fieldsWritable: z.boolean().optional(),
+  fieldsWriteError: z.string().optional(),
   /** The editable display slug, lifted from frontmatter `slug:`; the
    *  client builds the canonical `/n/<id>/<slug>` URL from it. Absent when the
    *  note has no custom slug (the URL tail then derives from the title). */
@@ -186,6 +199,18 @@ export const MuteNoteRequestSchema = z.object({ id: z.string(), muted: z.boolean
 
 export const MuteNoteResponseSchema = z.object({ ok: z.literal(true), muted: z.boolean() })
 
+/** PUT /api/note/fields — one atomic point patch over authored frontmatter. */
+export const SetNoteFieldsRequestSchema = z.object({
+  id: DurableNonEmptyScalarSchema,
+  versionToken: z.string().optional(),
+  fields: FieldPatchSchema,
+})
+
+export const SetNoteFieldsResponseSchema = z.object({
+  ok: z.literal(true),
+  versionToken: z.string(),
+})
+
 export type NoteDetail = z.infer<typeof NoteDetailResponseSchema>
 
 export type CreateNoteRequest = z.infer<typeof CreateNoteRequestSchema>
@@ -207,6 +232,10 @@ export type RemoveResponse = z.infer<typeof RemoveResponseSchema>
 export type MoveResponse = z.infer<typeof MoveResponseSchema>
 
 export type PinNoteRequest = z.infer<typeof PinNoteRequestSchema>
+
+export type SetNoteFieldsRequest = z.infer<typeof SetNoteFieldsRequestSchema>
+
+export type SetNoteFieldsResponse = z.infer<typeof SetNoteFieldsResponseSchema>
 
 export type PinNoteResponse = z.infer<typeof PinNoteResponseSchema>
 

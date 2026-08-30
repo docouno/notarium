@@ -4,8 +4,8 @@
 .field {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 5px 9px;
+  gap: var(--control-icon-gap);
+  padding: 5px var(--control-inset-x);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   background: var(--bg-elevated);

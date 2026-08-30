@@ -17,6 +17,8 @@ const AUTH_SPECS = [
   '**/e2e/agent-activity.spec.ts',
   '**/e2e/agent-roles.spec.ts',
   '**/e2e/explorer-sort.spec.ts',
+  '**/e2e/fields-settings.spec.ts',
+  '**/e2e/note-fields.spec.ts',
   '**/e2e/personal-layer.spec.ts',
   '**/e2e/project-memory.spec.ts',
   '**/e2e/space-access.spec.ts',

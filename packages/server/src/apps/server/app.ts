@@ -18,6 +18,7 @@ import type { ImportStagingStore } from '../../libs/importStaging'
 import type { MutationGate, MutationRelease } from '../../libs/mutationGate'
 import { createAbilities, type CustomAbilityCreator } from '../../services/abilities'
 import { AuthError, type AuthService, createAuthService } from '../../services/auth'
+import type { FieldSchemaStore } from '../../services/fields'
 import type {
   AgentDeltaCursorsPersistence,
   AgentSessionAuditPersistence,
@@ -68,6 +69,7 @@ export type BuildAppOptions = {
   retrievalLog?: RetrievalLogPersistence
   sessionAudit?: AgentSessionAuditPersistence
   markerStore?: MarkerStore
+  fieldSchemaStore?: FieldSchemaStore
   spacesPersistence?: SpacesPersistence
   spaDist?: string
   about?: HostInfo
@@ -113,6 +115,7 @@ export const buildApp = async ({
   scopePins,
   contextOrder,
   markerStore,
+  fieldSchemaStore,
   spacesPersistence,
   spaDist,
   about,
@@ -294,6 +297,7 @@ export const buildApp = async ({
         existing?: ExistingNote
         suggestedTitle?: string
         reason?: string
+        code?: string
       },
       req,
       reply,
@@ -317,6 +321,14 @@ export const buildApp = async ({
         return reply
           .code(HTTP_STATUS.BAD_REQUEST)
           .send({ error: message, reason: 'validation', issues })
+      }
+      if (
+        err.code === 'FST_ERR_CTP_INVALID_JSON_BODY' ||
+        err.code === 'FST_ERR_CTP_EMPTY_JSON_BODY'
+      ) {
+        return reply
+          .code(HTTP_STATUS.BAD_REQUEST)
+          .send({ error: err.message, reason: 'invalid_json' })
       }
       // The cause, where the error carries one the message deliberately does not (an
       // anti-enumeration 404 says the same thing to every caller; the log does not).
@@ -390,6 +402,7 @@ export const buildApp = async ({
     roles,
     abilities,
     markerStore,
+    fieldSchemaStore,
     spacesPersistence,
     about,
     build,
@@ -426,6 +439,7 @@ export const buildApp = async ({
     scopePins,
     contextOrder,
     markerStore,
+    fieldSchemaStore,
     oauthChallenge: Boolean(oauth),
     publicBaseUrl,
     // The MCP handler hijacks the reply, so the app-level onResponse hook can't

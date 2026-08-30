@@ -1,7 +1,18 @@
 import { z } from 'zod'
+import {
+  FIELD_FACET_DEFAULT_LIMIT,
+  FIELD_FACET_MAX_VALUES,
+  FIELD_SCHEMA_MAX_FIELDS,
+  PROJECTED_FIELD_KEYS,
+} from '../../consts/fields'
 import { BUCKET_GRAN, DATE_FIELD, DEPTH, NOTE_SORT, SORT_DIR } from '../../consts/notes'
 import { enumValues } from '../../libs/enumValues'
-import { IsoTimestampSchema, NoteClassSchema } from '../primitives'
+import {
+  DurableScalarSchema,
+  IsoTimestampSchema,
+  NoteClassSchema,
+  prototypeSafeRecord,
+} from '../primitives'
 
 export const PreviewSchema = z.object({
   snippet: z.string(),
@@ -43,8 +54,35 @@ export const NoteListItemSchema = z.object({
    *  this window server-side.
    *  canon: docs/architecture.md#p11 · docs/note-model.md#note-classes */
   class: NoteClassSchema.optional(),
+  /** Authored note type projected for compact card metadata. Absent when the
+   * default is implicit or the snapshot cannot prove it. */
+  noteType: DurableScalarSchema.optional(),
+  /** Values requested for card presentation. This compact map deliberately omits
+   * the index blob's unreadable/truncation bookkeeping. */
+  fields: prototypeSafeRecord(z.union([z.string(), z.array(z.string())])).optional(),
   preview: PreviewSchema.nullable().optional(),
 })
+
+/** One note's authored frontmatter as the index carries it — the wire's own reading
+ *  of the fields blob. Author keys sit one level down so they can never collide with
+ *  the fixed members; empty name lists and zero counters never ride, because the
+ *  serialized blob is compared as a STRING to decide whether a row changed.
+ *  The nested maps use the prototype-safe record parser: an authored own
+ *  `__proto__` stays data instead of mutating a prototype or disappearing.
+ *  canon: docs/architecture.md#literals */
+export const NoteFieldsWireSchema = z
+  .object({
+    keys: prototypeSafeRecord(z.union([z.string(), z.array(z.string())])),
+    unreadable: z.array(z.string()).min(1).optional(),
+    unreadableMore: z.number().int().positive().optional(),
+    truncated: z.array(z.string()).min(1).optional(),
+    truncatedMore: z.number().int().positive().optional(),
+  })
+  // Build a response shape on top of this one with `.extend()`: `.merge()` takes the
+  // unknown-key policy from its ARGUMENT and hands back a copy that STRIPS unknown
+  // members instead of refusing them. test/enumDrift.test.ts derives the note-detail
+  // shape the way V06 will and requires the refusal, so this is a gate, not advice.
+  .strict()
 
 /** How a notes window is ordered. `created`/`modified` are newest-first and
  *  mirror the Feed's two date signals (`created` hides notes whose createdAt
@@ -75,17 +113,177 @@ const TagSet = z.preprocess(
   z.array(z.string()).max(100).optional(),
 )
 
+type FieldCondition =
+  | { kind: 'eq'; value: string }
+  | { kind: 'day'; value: string }
+  | { kind: 'present' }
+  | { kind: 'unreadable' }
+
+type ParsedFieldAddress = { ns: 'note'; key: string; condition: FieldCondition }
+type FieldQueryKind = FieldCondition['kind']
+
+const projectedFieldKeys = new Set<string>(PROJECTED_FIELD_KEYS)
+
+const isLocalDate = (value: string): boolean => {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    return false
+  }
+  const [year, month, day] = value.split('-').map(Number)
+  const date = new Date(Date.UTC(year, month - 1, day))
+
+  return (
+    date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day
+  )
+}
+
+const projectedFieldMessage = (key: string): string => {
+  if (key === 'tags') {
+    return 'field key "tags" uses the tags query axis (?tags=)'
+  }
+  if (key === 'created') {
+    return 'field key "created" uses the date query axis (?from= and ?to=)'
+  }
+  if (key === 'notarium-source') {
+    return 'field key "notarium-source" is import provenance and is not addressable here'
+  }
+  if (key === 'notarium-id' || key === 'notarium-created') {
+    return `storage-owned field key "${key}" is not addressable here`
+  }
+
+  return `field key "${key}" is projected onto note metadata and is not addressable here`
+}
+
+const parseFieldAddress = (
+  raw: string,
+  kind: FieldQueryKind,
+): ParsedFieldAddress | { error: string } => {
+  const dot = raw.indexOf('.')
+
+  if (dot <= 0) {
+    return { error: 'field address requires a namespace, for example note.status' }
+  }
+  const namespace = raw.slice(0, dot)
+
+  if (namespace === 'file') {
+    return { error: 'field namespace "file" is reserved and is not supported in v1' }
+  }
+  if (namespace !== 'note') {
+    return { error: 'unsupported field namespace; only "note" is supported' }
+  }
+  const address = raw.slice(dot + 1)
+  const carriesValue = kind === 'eq' || kind === 'day'
+  const colon = carriesValue ? address.indexOf(':') : -1
+
+  if (carriesValue && colon < 0) {
+    return {
+      error:
+        kind === 'day'
+          ? 'field day must be <namespace>.<key>:YYYY-MM-DD'
+          : 'field equality must be <namespace>.<key>:<value>',
+    }
+  }
+  const key = carriesValue ? address.slice(0, colon) : address
+
+  if (!key) {
+    return { error: 'field key must not be empty' }
+  }
+  if (projectedFieldKeys.has(key)) {
+    return { error: projectedFieldMessage(key) }
+  }
+  if (!carriesValue) {
+    return { ns: 'note', key, condition: { kind } }
+  }
+  const value = address.slice(colon + 1)
+
+  if (kind === 'day' && !isLocalDate(value)) {
+    return { error: 'field day requires a valid YYYY-MM-DD calendar date' }
+  }
+
+  return { ns: 'note', key, condition: { kind, value } }
+}
+
+const fieldSet = (kind: FieldQueryKind) => {
+  const item = z.string().superRefine((value, ctx) => {
+    const parsed = parseFieldAddress(value, kind)
+
+    if ('error' in parsed) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: parsed.error })
+    }
+  })
+
+  return z.preprocess(
+    (value) => (value == null ? undefined : Array.isArray(value) ? value : [value]),
+    z.array(item).max(100).optional(),
+  )
+}
+
+export const fieldFilterQueryFields = {
+  field: fieldSet('eq').describe('repeatable note.<key>:<value> equality filters'),
+  fieldDay: fieldSet('day').describe('repeatable declared-date note.<key>:YYYY-MM-DD filters'),
+  fieldAny: fieldSet('present').describe('repeatable note.<key> presence filters'),
+  fieldBad: fieldSet('unreadable').describe('repeatable note.<key> unreadable-value filters'),
+}
+
+type FieldFilterQuery = {
+  field?: string[]
+  fieldDay?: string[]
+  fieldAny?: string[]
+  fieldBad?: string[]
+}
+
+export const parseFieldFilter = (query: FieldFilterQuery) => {
+  const nodes = new Map<string, { op: 'or'; ns: 'note'; key: string; values: FieldCondition[] }>()
+
+  const append = (raw: string, kind: FieldQueryKind) => {
+    const parsed = parseFieldAddress(raw, kind)
+
+    if ('error' in parsed) {
+      throw new Error(parsed.error)
+    }
+    const id = `${parsed.ns}\u0000${parsed.key}`
+    const clause = nodes.get(id)
+
+    if (clause) {
+      const duplicate = clause.values.some((condition) =>
+        condition.kind !== parsed.condition.kind
+          ? false
+          : (condition.kind === 'eq' && parsed.condition.kind === 'eq') ||
+              (condition.kind === 'day' && parsed.condition.kind === 'day')
+            ? condition.value === parsed.condition.value
+            : true,
+      )
+
+      if (!duplicate) {
+        clause.values.push(parsed.condition)
+      }
+    } else {
+      nodes.set(id, { op: 'or', ns: parsed.ns, key: parsed.key, values: [parsed.condition] })
+    }
+  }
+
+  for (const raw of query.field ?? []) {
+    append(raw, 'eq')
+  }
+  for (const raw of query.fieldDay ?? []) {
+    append(raw, 'day')
+  }
+  for (const raw of query.fieldAny ?? []) {
+    append(raw, 'present')
+  }
+  for (const raw of query.fieldBad ?? []) {
+    append(raw, 'unreadable')
+  }
+
+  return nodes.size === 0 ? undefined : { op: 'and' as const, nodes: [...nodes.values()] }
+}
+
 /** A local calendar day in URL/query state. It is deliberately NOT an ISO instant:
  *  the client sends the user's visible day (`YYYY-MM-DD`) plus `tz`, and the server
  *  applies inclusive local-day bounds to the active date axis. */
 const LocalDate = z
   .string()
   .regex(/^\d{4}-\d{2}-\d{2}$/, 'expected YYYY-MM-DD')
-  .refine((v) => {
-    const [y, m, d] = v.split('-').map(Number)
-    const dt = new Date(Date.UTC(y, m - 1, d))
-    return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d
-  }, 'invalid calendar date')
+  .refine(isLocalDate, 'invalid calendar date')
 
 /** The date axis a range filter applies to; omitted = follow the `sort` axis. */
 export const DateFieldSchema = z.enum(enumValues(DATE_FIELD))
@@ -108,6 +306,7 @@ export const NotesQuerySchema = z.object({
   /** Keep notes carrying ANY of these tags — see TagSet. Composes with
    *  `folder`/`folders`; `total`, window and histogram describe the filtered set. */
   tags: TagSet,
+  ...fieldFilterQueryFields,
   /** Full-text MEMBERSHIP filter: the engine's lexical FTS answers WHICH
    *  notes contain the words; the list then slices/sorts/windows that subset. It
    *  NARROWS, it does not rank — ordering stays by `sort` (date). Empty/absent = no
@@ -155,6 +354,7 @@ export const BucketsQuerySchema = z.object({
   depth: z.enum(enumValues(DEPTH)).default(DEPTH.subtree),
   folders: FolderSet,
   tags: TagSet,
+  ...fieldFilterQueryFields,
   q: z.string().optional(),
   from: LocalDate.optional(),
   to: LocalDate.optional(),
@@ -214,6 +414,41 @@ export const TagsResponseSchema = z.object({
   total: z.number(),
 })
 
+export const FieldsQuerySchema = z.object({
+  q: z.string().optional(),
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(FIELD_SCHEMA_MAX_FIELDS)
+    .default(FIELD_FACET_DEFAULT_LIMIT),
+  valuesLimit: z.coerce
+    .number()
+    .int()
+    .min(0)
+    .max(FIELD_FACET_MAX_VALUES)
+    .default(FIELD_FACET_MAX_VALUES),
+})
+
+export const FieldFacetValueSchema = z.object({
+  value: z.string(),
+  count: z.number().int().nonnegative(),
+})
+
+export const FieldFacetSchema = z.object({
+  key: z.string(),
+  declared: z.boolean(),
+  notes: z.number().int().nonnegative(),
+  values: z.array(FieldFacetValueSchema),
+  total: z.number().int().nonnegative(),
+})
+
+export const FieldsResponseSchema = z.object({
+  fields: z.array(FieldFacetSchema),
+  total: z.number().int().nonnegative(),
+  truncated: z.literal(true).optional(),
+})
+
 /** The cold half of the preview story: the Feed asks for ONE batch per viewport
  *  (never per card) and aborts on scroll-away — the server stops deriving on
  *  disconnect. The cap bounds a single request's worst-case engine work; bulk
@@ -244,6 +479,11 @@ export type TagsQuery = z.infer<typeof TagsQuerySchema>
 export type TagFacet = z.infer<typeof TagFacetSchema>
 
 export type TagsResponse = z.infer<typeof TagsResponseSchema>
+
+export type FieldsQuery = z.infer<typeof FieldsQuerySchema>
+export type FieldFacetValue = z.infer<typeof FieldFacetValueSchema>
+export type FieldFacet = z.infer<typeof FieldFacetSchema>
+export type FieldsResponse = z.infer<typeof FieldsResponseSchema>
 
 export type Preview = z.infer<typeof PreviewSchema>
 

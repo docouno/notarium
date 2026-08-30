@@ -4,6 +4,7 @@ import {
   RevisionKindSchema,
   RevisionUnavailableReasonSchema,
 } from '../primitives'
+import { fieldFilterQueryFields } from '../rest/notes'
 import { locationFields, sessionField } from './_fields'
 import { FolderEntrySchema, ProjectHandleSchema } from './primitives'
 
@@ -18,6 +19,7 @@ export const ListNotesInputSchema = z
     path: z.string().optional(),
     /** Keep only notes carrying this tag (frontmatter `tags`). */
     tag: z.string().optional(),
+    ...fieldFilterQueryFields,
     limit: z.number().int().min(1).max(100).default(50),
     /** Opaque pagination cursor from a prior response's `nextCursor`. */
     cursor: z.string().optional(),

@@ -28,6 +28,7 @@ import { WriteResultSchema } from './primitives'
 import {
   GetNoteInputSchema,
   GetNoteOutputSchema,
+  GetNotePublishedOutputSchema,
   RecallInputSchema,
   RecallOutputSchema,
   SearchInputSchema,
@@ -57,6 +58,7 @@ import {
   CreateNotesInputSchema,
   CreateNotesOutputSchema,
   EditNoteInputSchema,
+  EditNotePublishedInputSchema,
   LinkInputSchema,
   LinkManyInputSchema,
   LinkManyOutputSchema,
@@ -82,12 +84,20 @@ export const tools = {
   list_notes: { input: ListNotesInputSchema, output: ListNotesOutputSchema },
   recent_activity: { input: RecentActivityInputSchema, output: RecentActivityOutputSchema },
   search: { input: SearchInputSchema, output: SearchOutputSchema },
-  get_note: { input: GetNoteInputSchema, output: GetNoteOutputSchema },
+  get_note: {
+    input: GetNoteInputSchema,
+    output: GetNoteOutputSchema,
+    publishedOutput: GetNotePublishedOutputSchema,
+  },
   recall: { input: RecallInputSchema, output: RecallOutputSchema },
   remember_about_user: { input: RememberAboutUserInputSchema, output: WriteResultSchema },
   create_note: { input: CreateNoteInputSchema, output: WriteResultSchema },
   remember_about_project: { input: RememberAboutProjectInputSchema, output: WriteResultSchema },
-  edit_note: { input: EditNoteInputSchema, output: WriteResultSchema },
+  edit_note: {
+    input: EditNoteInputSchema,
+    publishedInput: EditNotePublishedInputSchema,
+    output: WriteResultSchema,
+  },
   // Note reorg — verb_entity, addressed by note-id.
   delete_note: { input: DeleteNoteInputSchema, output: DeleteNoteOutputSchema },
   move_note: { input: MoveNoteInputSchema, output: MoveNoteOutputSchema },

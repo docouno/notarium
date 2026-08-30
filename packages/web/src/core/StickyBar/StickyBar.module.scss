@@ -1,15 +1,31 @@
-/* Sticky toolbar strip: stays put while the content under it scrolls. The frosted
-   material + bottom edge come from the shared `.glass` / `.glass-edge-bottom`
-   classes (added in StickyBar.tsx) so scrolled-under text stays readable without a
-   hard opaque band; here it's only the layout. Horizontal padding mirrors the
-   topbar (--gutter), so controls line up column-for-column with the actions above. */
+/* Shared sticky-bar geometry. Material/rim/shape come from global glass utilities;
+   this module owns the placement and the DS content inset for each surface form. */
 .bar {
   position: sticky;
-  top: 0;
   z-index: 2;
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+.top {
+  top: 0;
+}
+
+.bottom {
+  bottom: 0;
+}
+
+/* Full-width strip: preserve the historical revision/deleted-banner geometry. */
+.edge {
   min-height: 44px;
   padding: 6px var(--gutter);
+}
+
+/* Content-local bottom panel: the symmetric bleed + inset push the material outside
+   the content line while controls stay aligned to it. `glass-panel` owns the shape. */
+.panel {
+  min-height: 48px;
+  margin-inline: -12px;
+  padding: 8px 12px;
 }

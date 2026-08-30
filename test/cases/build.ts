@@ -155,12 +155,27 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
       if (!prev) {
         spaces.set(s.slug, s)
       } else {
+        if (
+          prev.fieldSchema &&
+          s.fieldSchema &&
+          JSON.stringify(prev.fieldSchema) !== JSON.stringify(s.fieldSchema)
+        ) {
+          throw new Error(`combined cases declare conflicting field schemas for ${s.slug}`)
+        }
+        if (prev.fieldSchemaRaw && s.fieldSchemaRaw && prev.fieldSchemaRaw !== s.fieldSchemaRaw) {
+          throw new Error(`combined cases declare conflicting raw field schemas for ${s.slug}`)
+        }
+        if ((prev.fieldSchema && s.fieldSchemaRaw) || (prev.fieldSchemaRaw && s.fieldSchema)) {
+          throw new Error(`combined cases mix parsed and raw field schemas for ${s.slug}`)
+        }
         const aliases = [...new Set([...(prev.aliases ?? []), ...(s.aliases ?? [])])]
         spaces.set(s.slug, {
           ...prev,
           archived: prev.archived || s.archived,
           personalFor: prev.personalFor ?? s.personalFor,
           displayName: prev.displayName ?? s.displayName,
+          fieldSchema: prev.fieldSchema ?? s.fieldSchema,
+          fieldSchemaRaw: prev.fieldSchemaRaw ?? s.fieldSchemaRaw,
           ...(aliases.length ? { aliases } : {}),
         })
       }

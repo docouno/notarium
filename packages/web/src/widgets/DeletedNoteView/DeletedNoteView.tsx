@@ -1,3 +1,4 @@
+import type { FieldDeclaration } from '@notarium/contract'
 import { Button } from '../../core/Button'
 import { IconClock, IconTrash } from '../../core/Icons'
 import { StickyBar } from '../../core/StickyBar'
@@ -18,6 +19,7 @@ import styles from './DeletedNoteView.module.scss'
 type DeletedNoteViewProps = {
   note: NoteDetailView
   notes?: NoteView[]
+  schema?: readonly FieldDeclaration[]
   onOpenWikiLink?: (id: string) => void
   onUnresolvedWiki?: (target: string) => void
   /** Resurrect the note (same note-id). */
@@ -35,6 +37,7 @@ type DeletedNoteViewProps = {
 export const DeletedNoteView = ({
   note,
   notes,
+  schema,
   onOpenWikiLink,
   onUnresolvedWiki,
   onRestore,
@@ -101,6 +104,7 @@ export const DeletedNoteView = ({
         <NoteReader
           note={note}
           notes={notes}
+          schema={schema}
           onOpenWikiLink={onOpenWikiLink}
           onUnresolvedWiki={onUnresolvedWiki}
         />

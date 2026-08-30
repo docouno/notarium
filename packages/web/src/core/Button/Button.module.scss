@@ -14,8 +14,14 @@
   transition: background 0.12s, border-color 0.12s;
 }
 .btn:hover { background: var(--bg-hover); }
+.btn.colored {
+  background: var(--button-surface);
+  border-color: var(--button-border);
+  color: var(--text);
+}
+.btn.colored:hover { background: var(--button-surface); border-color: var(--button-solid); }
 
-.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-on-solid); }
 .btn.primary:hover { filter: brightness(1.05); }
 .btn.primary:disabled { opacity: 0.55; cursor: default; }
 
@@ -31,17 +37,17 @@
 /* Cautionary action (e.g. restore overwrites the current state): a soft warm
    tint, louder than ghost but not a red alarm. */
 .btn.warning {
-  background: color-mix(in srgb, var(--warning) 14%, var(--bg-elevated));
-  border-color: color-mix(in srgb, var(--warning) 45%, transparent);
-  color: var(--warning);
+  background: var(--warning-surface);
+  border-color: var(--warning-border);
+  color: var(--warning-fg);
 }
 .btn.warning:hover {
-  background: color-mix(in srgb, var(--warning) 22%, var(--bg-elevated));
+  background: color-mix(in srgb, var(--warning) 32%, var(--bg-elevated));
 }
 .btn.warning:disabled { opacity: 0.55; cursor: default; }
 
 /* Solid destructive button — used for the confirm action in danger dialogs. */
-.btn.danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+.btn.danger { background: var(--danger); border-color: var(--danger); color: var(--danger-on-solid); }
 /* Hover stays red, just a shade darker (same hue) — a solid danger button must
    not turn grey. */
 .btn.danger:hover {

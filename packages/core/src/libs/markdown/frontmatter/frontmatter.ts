@@ -207,7 +207,7 @@ type PlainMappingLine = { key: string; inline: string }
  *  The first colon followed by separation whitespace (or end-of-line) is the YAML
  *  key/value separator. A colon inside a plain key is therefore safe when it is
  *  not followed by whitespace (`https://example: note`). */
-const isSafePlainMappingKey = (key: string): boolean => {
+export const isSafePlainMappingKey = (key: string): boolean => {
   if (
     !key ||
     key !== trimYamlHorizontal(key) ||
@@ -269,6 +269,9 @@ export const FRONTMATTER_BYTE_CAP = 64 * 1024
  *  deterministic bad upload as terminal while ordinary file readers retain the
  *  precise cause. */
 export class FrontmatterLimitError extends Error {
+  readonly isToolError = true
+  readonly reason = 'frontmatter_too_large'
+
   constructor() {
     super(`frontmatter exceeds the ${FRONTMATTER_BYTE_CAP / 1024} KiB limit`)
     this.name = 'FrontmatterLimitError'
@@ -278,7 +281,7 @@ export class FrontmatterLimitError extends Error {
 /** UTF-8 byte count without allocating an encoded copy. Lone surrogates count as
  *  TextEncoder's replacement sequence; callers that require durability reject
  *  them separately. */
-const utf8Bytes = (value: string): number => {
+export const utf8Bytes = (value: string): number => {
   let bytes = 0
 
   for (let i = 0; i < value.length; i++) {
@@ -1317,9 +1320,7 @@ const simpleFlowList = (inline: string): string[] | null => {
     if (value == null) {
       return null
     }
-    if (value) {
-      out.push(value)
-    }
+    out.push(value)
   }
 
   return out
@@ -1346,9 +1347,7 @@ const blockList = (lines: readonly string[]): string[] | null => {
     if (value == null) {
       return null
     }
-    if (value) {
-      out.push(value)
-    }
+    out.push(value)
   }
 
   return out
@@ -1638,9 +1637,13 @@ export const frontmatterScalar = (v: string): string => {
     : flat
 }
 
-export const frontmatterScalarEntry = (key: string, v: string): FrontmatterEntry => ({
+export const frontmatterScalarEntry = (
+  key: string,
+  v: string,
+  opts?: { unquoted?: boolean },
+): FrontmatterEntry => ({
   key,
-  lines: [`${key}: ${frontmatterScalar(v)}`],
+  lines: [`${key}: ${opts?.unquoted ? singleLine(v) : frontmatterScalar(v)}`],
 })
 
 export const frontmatterListEntry = (key: string, items: readonly string[]): FrontmatterEntry => ({

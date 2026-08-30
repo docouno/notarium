@@ -131,6 +131,25 @@ const WORLD = {
         },
       ],
     },
+    {
+      slug: 'casey-personal',
+      displayName: 'Casey Personal',
+      fieldSchema: {
+        version: 1,
+        fields: [{ key: 'status', type: 'text', label: 'Status' }],
+      },
+      notes: [
+        {
+          id: 'fake-casey-memory',
+          title: 'casey-memory',
+          filePath: 'casey-memory.md',
+          class: 'agent-memory',
+          summary: 'Casey memory',
+          frontmatter: 'status: personal',
+          content: '# casey-memory\n\nOwned personal memory.',
+        },
+      ],
+    },
   ],
   projects: [
     { space: 'main', path: 'docs', slug: 'docs', displayName: 'Docs', aliases: ['old-docs'] },
@@ -166,11 +185,19 @@ const WORLD = {
         password: 'robin-password-1',
         displayName: 'Robin',
       },
+      {
+        username: 'casey',
+        password: 'casey-password-1',
+        displayName: 'Casey',
+        personalSpace: 'casey-personal',
+      },
     ],
     members: [
       { space: 'main', username: 'sam', role: 'owner' },
       { space: 'main', username: 'robin', role: 'reader' },
+      { space: 'main', username: 'casey', role: 'reader' },
       { space: 'sam-personal', username: 'sam', role: 'owner' },
+      { space: 'casey-personal', username: 'casey', role: 'owner' },
     ],
   },
 }
@@ -189,6 +216,30 @@ const login = async (page: Page, username: string, password: string) => {
   await page.getByTestId('auth-password').fill(password)
   await page.getByTestId('auth-submit').click()
   await expect(page.getByTestId('auth-login')).not.toBeVisible()
+}
+
+const dragAfter = async (page: Page, source: string, target: string) => {
+  const sourceHandle = await page.getByTestId(source).elementHandle()
+  const targetHandle = await page.getByTestId(target).elementHandle()
+
+  expect(sourceHandle).not.toBeNull()
+  expect(targetHandle).not.toBeNull()
+  await page.evaluate(
+    ([from, to]) => {
+      const dataTransfer = new DataTransfer()
+      const fire = (element: Element, type: string, clientY = 0) =>
+        element.dispatchEvent(
+          new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer, clientY }),
+        )
+      const targetBox = to.getBoundingClientRect()
+
+      fire(from, 'dragstart')
+      fire(to, 'dragover', targetBox.bottom - 1)
+      fire(to, 'drop', targetBox.bottom - 1)
+      fire(from, 'dragend')
+    },
+    [sourceHandle!, targetHandle!] as const,
+  )
 }
 
 const ownedRoleLocator = async (
@@ -375,6 +426,64 @@ test('direct pins and context-set items keep the title and show a Folder overvie
   }))
   expect(titleGeometry.clientWidth).toBeGreaterThan(0)
   expect(titleGeometry.scrollWidth).toBeGreaterThan(0)
+})
+
+test('keyboard reorder is isolated for nested set items and mouse reorder still works', async ({
+  page,
+}) => {
+  await login(page, 'sam', 'sam-password-1')
+  const created = await page.request.post('/api/s/sam-personal/context-sets', {
+    data: { name: 'Keyboard set' },
+  })
+  expect(created.ok()).toBe(true)
+  const setId = ((await created.json()) as { set: { id: string } }).set.id
+
+  for (const noteId of ['fake-scratch', 'fake-grooming']) {
+    expect(
+      (
+        await page.request.post(`/api/s/sam-personal/context-sets/${setId}/items`, {
+          data: { space: 'sam-personal', noteId },
+        })
+      ).ok(),
+    ).toBe(true)
+  }
+  expect((await page.request.put(`/api/me/context-sets/${setId}`)).ok()).toBe(true)
+
+  await page.goto('/agents/context/personal')
+  const outer = page.getByTestId('context-personal-pins')
+  const outerOrder = () =>
+    outer
+      .locator(':scope > :is([data-testid="context-pin-row"], [data-testid="context-set-row"])')
+      .evaluateAll((rows) => rows.map((row) => row.getAttribute('data-testid')))
+  await expect.poll(outerOrder).toEqual(['context-pin-row', 'context-set-row'])
+
+  const setRow = page.getByTestId('context-set-row').filter({ hasText: 'Keyboard set' })
+  await setRow.getByTestId('context-set-row-row').click()
+  const nestedOrder = () =>
+    setRow
+      .getByTestId('context-set-item')
+      .evaluateAll((rows) => rows.map((row) => row.textContent ?? ''))
+  await expect
+    .poll(nestedOrder)
+    .toEqual([expect.stringContaining('Scratch'), expect.stringContaining('Grooming Checklist')])
+
+  const groomingGrip = setRow
+    .getByTestId('context-set-item')
+    .filter({ hasText: 'Grooming Checklist' })
+    .getByRole('button', { name: 'Reorder item' })
+  await groomingGrip.focus()
+  await groomingGrip.press('ArrowUp')
+  await expect
+    .poll(nestedOrder)
+    .toEqual([expect.stringContaining('Grooming Checklist'), expect.stringContaining('Scratch')])
+  await expect.poll(outerOrder).toEqual(['context-pin-row', 'context-set-row'])
+
+  await setRow.getByRole('button', { name: 'Reorder item' }).first().focus()
+  await setRow.getByRole('button', { name: 'Reorder item' }).first().press('ArrowUp')
+  await expect.poll(outerOrder).toEqual(['context-set-row', 'context-pin-row'])
+
+  await dragAfter(page, 'context-set-row', 'context-pin-row')
+  await expect.poll(outerOrder).toEqual(['context-pin-row', 'context-set-row'])
 })
 
 test('a project route focuses the project; the Personal tab switches to it inline (#208)', async ({
@@ -857,6 +966,32 @@ test('Memory read and edit keep the Agents shell and originating project scope',
   await expect(page.getByTestId('memory-tree')).toBeVisible()
   await expect(activeMemory.getByRole('link')).toHaveAttribute('aria-current', 'page')
   await expect(page.getByLabel('Breadcrumb')).toContainText('Agents/Context/Memory/deploy-memory')
+})
+
+test('personal Memory remains editable while the active workspace grant is reader', async ({
+  page,
+}) => {
+  await login(page, 'casey', 'casey-password-1')
+  await page.goto('/s/main')
+  await expect(page.getByTestId('space-switcher')).toContainText('Main')
+  await page.goto('/m/fake-casey-memory')
+
+  await expect(page.getByRole('heading', { name: 'casey-memory' })).toBeVisible()
+  await page.getByRole('button', { name: 'Edit', exact: true }).click()
+  await page.getByRole('button', { name: 'Open memory details' }).click()
+  await expect(page.getByTestId('editor-meta')).toBeVisible()
+  await page.getByTestId('editor-meta').getByRole('textbox', { name: 'Status value' }).fill('kept')
+  const editor = page.locator('.cm-content')
+  await editor.click()
+  await page.keyboard.press('ControlOrMeta+a')
+  await page.keyboard.type('# casey-memory\n\nEdited while Main stays read-only.')
+  const saved = page.waitForResponse(
+    (response) => response.request().method() === 'POST' && response.url().endsWith('/api/note'),
+  )
+  await page.getByRole('button', { name: 'Save', exact: true }).click()
+
+  expect((await saved).request().postDataJSON()).toMatchObject({ fields: { status: 'kept' } })
+  await expect(page.getByText('Edited while Main stays read-only.')).toBeVisible()
 })
 
 test('agent context and note routes canonicalize legacy forms', async ({ page }) => {

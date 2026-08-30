@@ -13,6 +13,7 @@ import type {
   Author,
   AuthoredAttachment,
   CreateNoteRequest,
+  FieldPatch,
   IfExists,
   OwnedAbilityLocator,
   Preview,
@@ -69,8 +70,10 @@ export type NoteView = {
   aliases?: string[]
   modifiedAt: string | null
   createdAt: string | null
+  noteType?: string
   /** Warm cached preview, present only on a window asked for it (?preview=1). */
   preview?: Preview | null
+  fields?: WireNote['fields']
 }
 
 export const noteView = (n: WireNote): NoteView => ({
@@ -82,7 +85,9 @@ export const noteView = (n: WireNote): NoteView => ({
   aliases: n.aliases,
   modifiedAt: n.modifiedAt,
   createdAt: n.createdAt,
+  noteType: n.noteType,
   preview: n.preview,
+  fields: n.fields,
 })
 
 export type NoteDetailView = {
@@ -105,6 +110,9 @@ export type NoteDetailView = {
   aliases?: string[]
   content: string
   frontmatter: Record<string, unknown>
+  fields?: WireNoteDetail['fields']
+  fieldsWritable?: boolean
+  fieldsWriteError?: string
   modifiedAt?: string | null
   /** The note's resolved creation instant (#186), full ISO-8601 UTC — the editor
    *  prefills the editable date field from it. null/absent when the engine knows
@@ -139,6 +147,9 @@ export const noteDetailView = (d: WireNoteDetail): NoteDetailView => ({
   aliases: d.aliases,
   content: d.content,
   frontmatter: d.frontmatter,
+  fields: d.fields,
+  fieldsWritable: d.fieldsWritable,
+  fieldsWriteError: d.fieldsWriteError,
   modifiedAt: d.modifiedAt,
   createdAt: d.createdAt,
   versionToken: d.versionToken,
@@ -284,6 +295,9 @@ export type SaveInput = {
   directory?: string
   noteType?: string
   tags?: string[] | string
+  /** Authored field changes owned by this editor draft. Omitted when no value
+   * differs from the snapshot. */
+  fields?: FieldPatch
   /** The custom display slug (#100 phase 1) the editor addresses: a value sets it,
    *  '' clears it back to the implicit default. */
   slug?: string
@@ -309,6 +323,7 @@ export const createInputToWire = (i: SaveInput): CreateNoteRequest => ({
   directory: i.directory,
   noteType: i.noteType,
   tags: i.tags,
+  fields: i.fields,
   slug: i.slug,
   createdAt: i.createdAt,
   ifExists: i.ifExists,
@@ -322,6 +337,7 @@ export const updateInputToWire = (i: SaveInput): UpdateNoteRequest => ({
   directory: i.directory,
   noteType: i.noteType,
   tags: i.tags,
+  fields: i.fields,
   slug: i.slug,
   createdAt: i.createdAt,
   originalId: i.originalId as string,

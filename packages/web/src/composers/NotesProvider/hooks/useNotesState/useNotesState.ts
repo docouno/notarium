@@ -109,6 +109,12 @@ export const useNotesState = (): NotesContextValue => {
   const explorerSortRef = useRef(explorerSort)
   const explorerSortDirRef = useRef(explorerSortDir)
   const activeIdRef = useRef<string | null>(null)
+  const fetchNoteTaskRef = useRef<{
+    id: string
+    task: Promise<boolean>
+  } | null>(null)
+  const detailUpsertEpochRef = useRef(new Map<string, number>())
+  const reloadNoteTaskRef = useRef<{ id: string; task: Promise<boolean> } | null>(null)
   const noteRef = useRef<NoteDetailView | null>(null)
   const preserveSpaceOnNoteOpenRef = useRef<string | null>(null)
   const readyRef = useRef(false)
@@ -532,6 +538,7 @@ export const useNotesState = (): NotesContextValue => {
   )
 
   const clearReader = useCallback(() => {
+    detailUpsertEpochRef.current.clear()
     setNote(null)
     setActiveId(null)
     setMode('empty')
@@ -547,6 +554,17 @@ export const useNotesState = (): NotesContextValue => {
   // blip is reloadNote(), below.
   const fetchNote = useCallback(
     async (id: string): Promise<NoteDetailView | null> => {
+      let settleTask!: (loaded: boolean) => void
+      const settled = new Promise<boolean>((resolve) => {
+        settleTask = resolve
+      })
+      let loaded = false
+
+      fetchNoteTaskRef.current = { id, task: settled }
+      const retainedEpoch = detailUpsertEpochRef.current.get(id) ?? 0
+
+      detailUpsertEpochRef.current.clear()
+      detailUpsertEpochRef.current.set(id, retainedEpoch)
       // Latest-wins (#68): claim a token and abort the prior open. Every state
       // write below is gated on this still being the newest call, so an
       // out-of-order or superseded answer can never touch the reader.
@@ -567,6 +585,7 @@ export const useNotesState = (): NotesContextValue => {
         // never a blank reader or an endlessly-retried request.
         for (let attempt = 0; attempt < 2; attempt++) {
           const observedAt = observationEpoch()
+          const upsertEpoch = detailUpsertEpochRef.current.get(id) ?? 0
           let n: NoteDetailView
 
           try {
@@ -586,6 +605,9 @@ export const useNotesState = (): NotesContextValue => {
           if (!isCurrent()) {
             return null
           } // a newer open landed first — drop this answer
+          if ((detailUpsertEpochRef.current.get(id) ?? 0) !== upsertEpoch) {
+            continue
+          }
           const prevKnown = seenRef.current.get(n.id || id) ?? seenRef.current.get(id)
           const known = asNote(n, prevKnown)
           const admitted = isSeenObservationAccepted(
@@ -641,6 +663,7 @@ export const useNotesState = (): NotesContextValue => {
             navigate(rekeyedRoute, { replace: true, state: location.state })
           }
 
+          loaded = true
           return n
         }
         setNote(null)
@@ -656,6 +679,10 @@ export const useNotesState = (): NotesContextValue => {
       } finally {
         if (isCurrent()) {
           setLoading(false)
+        }
+        settleTask(loaded)
+        if (fetchNoteTaskRef.current?.task === settled) {
+          fetchNoteTaskRef.current = null
         }
       }
     },
@@ -712,77 +739,101 @@ export const useNotesState = (): NotesContextValue => {
   // fetchNote, an ordinary transport failure keeps the last view. Once an
   // authoritative epoch rejects that view, however, a failed retry clears it
   // into the scoped error state instead of leaving known-stale live content.
-  const reloadNote = useCallback(async () => {
+  const reloadNote = useCallback((): Promise<boolean> => {
     const id = activeIdRef.current
 
     if (!id) {
-      return
+      return Promise.resolve(false)
     }
-    let admissionRejected = false
+    const opening = fetchNoteTaskRef.current
 
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const observedAt = observationEpoch()
+    if (opening?.id === id) {
+      return opening.task
+    }
+    if (reloadNoteTaskRef.current?.id === id) {
+      return reloadNoteTaskRef.current.task
+    }
+    const task = (async () => {
+      let admissionRejected = false
 
-      try {
-        const n = await api.noteGet(id)
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const observedAt = observationEpoch()
+        const upsertEpoch = detailUpsertEpochRef.current.get(id) ?? 0
 
-        // A navigation may have moved the reader on while this in-place refresh
-        // was in flight — don't let a stale reload clobber the newly-open note (#68).
-        if (activeIdRef.current !== id) {
-          return
+        try {
+          const n = await api.noteGet(id)
+
+          // A navigation may have moved the reader on while this in-place refresh
+          // was in flight — don't let a stale reload clobber the newly-open note (#68).
+          if (activeIdRef.current !== id) {
+            return false
+          }
+          if ((detailUpsertEpochRef.current.get(id) ?? 0) !== upsertEpoch) {
+            continue
+          }
+          const known = asNote(n)
+          const admitted = isSeenObservationAccepted(
+            n.id || id,
+            n.deleted === true,
+            removedSeenIdsRef.current,
+            observedAt,
+            observationEpoch(),
+          )
+
+          if (!admitted || (!n.deleted && !known)) {
+            admissionRejected = true
+            continue
+          }
+          if (known && !remember([known], [], observedAt).length) {
+            admissionRejected = true
+            continue
+          }
+          const keepSourceSpace = preserveSpaceOnNoteOpenRef.current === spaceRef.current
+
+          setNote(n)
+          setNoteError(null)
+          if (
+            !keepSourceSpace &&
+            n.space &&
+            ((n.class !== NOTE_CLASS.agentMemory && n.class !== NOTE_CLASS.skill) ||
+              n.space !== personalSpace?.slug)
+          ) {
+            reportNoteSpace(n.space)
+          }
+          if (known) {
+            setLastNote(known)
+          }
+
+          setNav({ type: 'folder', folder: folderOf(n.filePath) })
+          return true
+        } catch (e) {
+          if (admissionRejected && activeIdRef.current === id) {
+            // We already know the displayed live snapshot is older than an
+            // authoritative removal. A failed retry must not leave that stale
+            // content on screen; show the scoped error with its normal Retry UI.
+            setNote(null)
+            setNoteError(classifyNoteError(e))
+          }
+
+          // An ordinary transient in-place refresh keeps the current note.
+          return false
         }
-        const known = asNote(n)
-        const admitted = isSeenObservationAccepted(
-          n.id || id,
-          n.deleted === true,
-          removedSeenIdsRef.current,
-          observedAt,
-          observationEpoch(),
-        )
-
-        if (!admitted || (!n.deleted && !known)) {
-          admissionRejected = true
-          continue
-        }
-        if (known && !remember([known], [], observedAt).length) {
-          admissionRejected = true
-          continue
-        }
-        const keepSourceSpace = preserveSpaceOnNoteOpenRef.current === spaceRef.current
-
-        setNote(n)
-        setNoteError(null)
-        if (
-          !keepSourceSpace &&
-          n.space &&
-          ((n.class !== NOTE_CLASS.agentMemory && n.class !== NOTE_CLASS.skill) ||
-            n.space !== personalSpace?.slug)
-        ) {
-          reportNoteSpace(n.space)
-        }
-        if (known) {
-          setLastNote(known)
-        }
-
-        setNav({ type: 'folder', folder: folderOf(n.filePath) })
-        return
-      } catch (e) {
-        if (admissionRejected && activeIdRef.current === id) {
-          // We already know the displayed live snapshot is older than an
-          // authoritative removal. A failed retry must not leave that stale
-          // content on screen; show the scoped error with its normal Retry UI.
-          setNote(null)
-          setNoteError(classifyNoteError(e))
-        }
-
-        // An ordinary transient in-place refresh keeps the current note.
-        return
       }
-    }
-    if (admissionRejected && activeIdRef.current === id) {
-      setNote(null)
-      setNoteError({ kind: 'notFound' })
-    }
+      if (admissionRejected && activeIdRef.current === id) {
+        setNote(null)
+        setNoteError({ kind: 'notFound' })
+      }
+
+      return false
+    })()
+
+    reloadNoteTaskRef.current = { id, task }
+    void task.finally(() => {
+      if (reloadNoteTaskRef.current?.task === task) {
+        reloadNoteTaskRef.current = null
+      }
+    })
+    return task
   }, [remember, reportNoteSpace, personalSpace?.slug, observationEpoch])
 
   // Apply a location to the reader/scope state. `/n/<id>/…` and `/m/<id>/…` resolve by id
@@ -876,6 +927,7 @@ export const useNotesState = (): NotesContextValue => {
     setTreeLoaded(false)
     commitFolderNotes(new Map())
     removedSeenIdsRef.current.clear()
+    detailUpsertEpochRef.current.clear()
     commitSeen(new Map())
     // Tree (sidebar) and reader (the URL's target) are independent — boot them in
     // PARALLEL so the reader never waits on the tree. Serializing these was the
@@ -943,6 +995,7 @@ export const useNotesState = (): NotesContextValue => {
     // unioned with the old folders we resolve from our cache, so a relocation by
     // another client refreshes both endpoints (#94 multi-client sync).
     let destFolders = new Set<string>()
+    let activeDetailTokens = new Map<string, string | undefined>()
     const off = subscribe((event) => {
       if (event.type === STORE_EVENT.CHANGED) {
         forget(event.removed)
@@ -954,6 +1007,15 @@ export const useNotesState = (): NotesContextValue => {
             touched.add(id)
           }
         }
+        const active = activeIdRef.current
+
+        if (active && event.upserts.includes(active)) {
+          activeDetailTokens.set(active, noteRef.current?.versionToken)
+          detailUpsertEpochRef.current.set(
+            active,
+            (detailUpsertEpochRef.current.get(active) ?? 0) + 1,
+          )
+        }
         for (const f of event.folders ?? []) {
           destFolders.add(f)
         } // ?? : tolerate an older server
@@ -964,9 +1026,21 @@ export const useNotesState = (): NotesContextValue => {
           timer = null
           const ids = touched
           const dests = destFolders
+          const detailTokens = activeDetailTokens
           touched = new Set()
           destFolders = new Set()
-          void refreshData(ids && ids.size ? ids : null, dests)
+          activeDetailTokens = new Map()
+          const activeAtFlush = activeIdRef.current
+          const activeUpsertWasAlreadyRead =
+            activeAtFlush != null &&
+            detailTokens.has(activeAtFlush) &&
+            noteRef.current?.versionToken !== detailTokens.get(activeAtFlush)
+          const refreshActive =
+            activeAtFlush != null && ids?.has(activeAtFlush) && !activeUpsertWasAlreadyRead
+          void Promise.all([
+            refreshData(ids && ids.size ? ids : null, dests),
+            refreshActive ? reloadNote() : Promise.resolve(false),
+          ])
         }, CHANGED_COALESCE_MS)
         return
       }
@@ -992,7 +1066,7 @@ export const useNotesState = (): NotesContextValue => {
         clearTimeout(timer)
       }
     }
-  }, [subscribe, loadTree, refreshData, applyLocation, forget])
+  }, [subscribe, loadTree, refreshData, reloadNote, applyLocation, forget])
 
   const value: NotesContextValue = {
     tree,

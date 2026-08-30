@@ -1,79 +1,74 @@
 import { type ReactNode, useMemo } from 'react'
+import type { FieldDeclaration } from '@notarium/contract'
+import { DEFAULT_NOTE_TYPE } from '@notarium/core'
 import { TagChips } from '../../core/Chips'
-import { IconFolder } from '../../core/Icons'
+import { absoluteDate, exactDateTime } from '../../libs/datetime'
 import { feedTagRoute } from '../../libs/routing/routePaths'
+import type { NoteDetailView } from '../../libs/wire'
+import { FieldRows } from '../FieldRows'
+import type { EditableFieldValue } from '../FieldRows/FieldValueControl'
+import { FieldSchemaWarning } from '../FieldSchemaWarning'
 import styles from './MetaPanel.module.scss'
 
-// Read-only note metadata for the reading-mode inspector — the counterpart to
-// EditorMeta (which is editable, edit-mode only). Folder is derived from the
-// storage path; type/tags/class and any remaining frontmatter are shown as-is.
-// Dates aren't here: GET /api/note carries no created/modified yet (they live in
-// the Feed's list layer) — surfacing them is a separate, non-blocking step (#35).
-type MetaNote = {
-  filePath?: string
-  frontmatter?: Record<string, unknown>
-  class?: string
-}
-
-// Frontmatter keys kept OUT of the generic "other frontmatter" dump: the ones
-// shown as dedicated rows (type, tags), plus structural/storage fields that
-// aren't user-authored metadata — `title` repeats the heading, `permalink` is a
-// legacy storage artifact, `notarium-id` is the identity stamp (#51).
-const HIDDEN_KEYS = new Set(['type', 'tags', 'title', 'permalink', 'notarium-id', 'id'])
+type MetaNote = Pick<
+  NoteDetailView,
+  'frontmatter' | 'fields' | 'class' | 'agentKind' | 'createdAt' | 'modifiedAt'
+>
 
 const Field = ({ label, children }: { label: string; children: ReactNode }) => (
-  <div className={styles.field}>
+  <div className={styles.field} data-field={label}>
     <span className={styles.label}>{label}</span>
     <div className={styles.value}>{children}</div>
   </div>
 )
 
-const formatValue = (v: unknown): string => {
-  if (v == null) {
-    return ''
-  }
-  if (Array.isArray(v)) {
-    return v.map(formatValue).join(', ')
-  }
-  if (typeof v === 'object') {
-    return JSON.stringify(v)
-  }
-
-  return String(v)
-}
-
 export const MetaPanel = ({
   note,
   space,
+  schema = [],
+  fieldValues,
+  canWrite = false,
+  busyKey,
+  onSetField,
   onOpenTag,
+  schemaError = null,
+  schemaErrorMessage,
+  onRetrySchema,
 }: {
   note: MetaNote
   space?: string
+  schema?: readonly FieldDeclaration[]
+  fieldValues?: Record<string, string | string[]>
+  canWrite?: boolean
+  busyKey?: string | null
+  onSetField?: (key: string, value: EditableFieldValue | null) => void
   onOpenTag?: (foldedTag: string) => void
+  schemaError?: string | null
+  schemaErrorMessage?: string
+  onRetrySchema?: () => void
 }) => {
-  const fm = useMemo(() => note.frontmatter || {}, [note.frontmatter])
-  const path = (note.filePath || '').replace(/\.md$/, '')
-  const folder = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : ''
-  const type = typeof fm.type === 'string' ? fm.type : ''
+  const frontmatter = useMemo(() => note.frontmatter || {}, [note.frontmatter])
+  const type =
+    typeof frontmatter.type === 'string' && frontmatter.type ? frontmatter.type : DEFAULT_NOTE_TYPE
+  const created = absoluteDate(note.createdAt)
+  const modified = absoluteDate(note.modifiedAt)
   const tags = useMemo<string[]>(
-    () => (Array.isArray(fm.tags) ? fm.tags.map(String) : fm.tags ? [String(fm.tags)] : []),
-    [fm.tags],
-  )
-  // Everything else from the frontmatter, so nothing the note carries is hidden
-  // (the agent-native angle: notes accrue arbitrary frontmatter — #21).
-  const extra = useMemo(
-    () => Object.entries(fm).filter(([k, v]) => !HIDDEN_KEYS.has(k) && v != null && v !== ''),
-    [fm],
+    () =>
+      Array.isArray(frontmatter.tags)
+        ? frontmatter.tags.map(String)
+        : frontmatter.tags
+          ? [String(frontmatter.tags)]
+          : [],
+    [frontmatter.tags],
   )
 
   return (
     <div className={styles.metaPanel} data-testid="meta-panel">
-      <Field label="Folder">
-        <span className={styles.folder}>
-          <IconFolder size={14} />
-          {folder || <span className={styles.muted}>Root</span>}
-        </span>
-      </Field>
+      <FieldSchemaWarning
+        error={schemaError}
+        message={schemaErrorMessage}
+        onRetry={onRetrySchema}
+      />
       <Field label="Type">
         {type ? (
           <span className={styles.pill}>{type}</span>
@@ -81,16 +76,44 @@ export const MetaPanel = ({
           <span className={styles.muted}>—</span>
         )}
       </Field>
+      <FieldRows
+        frontmatter={frontmatter}
+        details={note.fields}
+        values={fieldValues}
+        schema={schema}
+        readOnly={!canWrite || note.fields === undefined}
+        appearance="inline"
+        showDateIcon={false}
+        agentKind={note.agentKind}
+        busyKey={busyKey}
+        onSetField={note.fields === undefined ? undefined : onSetField}
+      />
       {note.class && (
         <Field label="Class">
-          <span
-            className={styles.pill}
-            title="Storage class — follows where the note is mounted (read-only)"
-          >
+          <span className={styles.pill} title="Storage class">
             {note.class}
           </span>
         </Field>
       )}
+      {!note.class && (
+        <Field label="Class">
+          <span className={styles.muted}>—</span>
+        </Field>
+      )}
+      <Field label="Created">
+        {created ? (
+          <span title={exactDateTime(note.createdAt)}>{created}</span>
+        ) : (
+          <span className={styles.muted}>—</span>
+        )}
+      </Field>
+      <Field label="Modified">
+        {modified ? (
+          <span title={exactDateTime(note.modifiedAt)}>{modified}</span>
+        ) : (
+          <span className={styles.muted}>—</span>
+        )}
+      </Field>
       <Field label="Tags">
         {tags.length ? (
           <span className={styles.tags}>
@@ -104,15 +127,6 @@ export const MetaPanel = ({
           <span className={styles.muted}>—</span>
         )}
       </Field>
-      {extra.length > 0 && (
-        <div className={styles.extra}>
-          {extra.map(([k, v]) => (
-            <Field key={k} label={k}>
-              <span className={styles.extraValue}>{formatValue(v)}</span>
-            </Field>
-          ))}
-        </div>
-      )}
     </div>
   )
 }

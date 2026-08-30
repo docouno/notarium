@@ -1,10 +1,15 @@
 import { type MouseEvent, type ReactNode, useEffect, useMemo, useRef } from 'react'
+import type { FieldDeclaration } from '@notarium/contract'
+import { DEFAULT_NOTE_TYPE } from '@notarium/core'
 import { effectiveSlug } from '@notarium/core/slug'
-import { TagChips } from '../../core/Chips'
+import { Chip, TagChips } from '../../core/Chips'
+import { absoluteDate, exactDateTime } from '../../libs/datetime'
+import { cardFieldValues } from '../../libs/fields'
 import { renderMarkdown, wikiLinkTarget } from '../../libs/markdown/markdown'
 import { useMarkdownEnhance } from '../../libs/markdown/useMarkdownEnhance'
 import { feedTagRoute, isModifiedClick, noteRouteForClass } from '../../libs/routing/routePaths'
 import type { NoteDetailView, NoteView } from '../../libs/wire'
+import { FieldSchemaWarning } from '../FieldSchemaWarning'
 import { resolveKnownWiki } from './resolveKnownWiki'
 import styles from './NoteReader.module.scss'
 
@@ -21,9 +26,12 @@ type NoteReaderProps = {
   /** A tag-chip click (#109): open the tag's feed (`?tag=<folded>`). The shared
    *  tag chip uses it for SPA navigation while preserving native new-tab clicks. */
   onOpenTag?: (tag: string) => void
+  schema?: readonly FieldDeclaration[]
   /** Optional content that belongs under the rendered note body but inside the
    *  same document column, e.g. a folder page's direct-children summary (#213). */
   afterContent?: ReactNode
+  schemaError?: string | null
+  onRetrySchema?: () => void
 }
 
 export const NoteReader = ({
@@ -32,7 +40,10 @@ export const NoteReader = ({
   onOpenWikiLink,
   onUnresolvedWiki,
   onOpenTag,
+  schema = [],
   afterContent,
+  schemaError = null,
+  onRetrySchema,
 }: NoteReaderProps) => {
   const html = useMemo(() => renderMarkdown(note.content || ''), [note.content])
   const ref = useRef<HTMLDivElement>(null)
@@ -41,7 +52,13 @@ export const NoteReader = ({
   // injected nodes on innerHTML swap).
   useMarkdownEnhance(ref, html)
   const fm = note.frontmatter || {}
+  const noteType = typeof fm.type === 'string' && fm.type ? fm.type : DEFAULT_NOTE_TYPE
   const tags = (Array.isArray(fm.tags) ? fm.tags : fm.tags ? [fm.tags] : []) as string[]
+  const created = absoluteDate(note.createdAt)
+  const shownFields = useMemo(
+    () => cardFieldValues(note.fields?.keys, schema),
+    [note.fields?.keys, schema],
+  )
   // A tag chip links to its feed when we know the note's space (#109). The
   // shared TagChips primitive preserves the authored label but gives href/data-tag
   // the folded filter key (`ML` and `ml` land on the same feed).
@@ -159,9 +176,38 @@ export const NoteReader = ({
   return (
     <article className="doc">
       <header className="doc-head">
+        <FieldSchemaWarning error={schemaError} onRetry={onRetrySchema ?? (() => undefined)} />
         <h1 className="doc-title">{note.documentTitle || note.title}</h1>
-        <div className={styles.docMeta}>
-          {fm.type ? <span className={styles.pill}>{fm.type as string}</span> : null}
+        <div className={styles.docMeta} data-testid="note-detail-meta">
+          {created ? (
+            <span
+              className={styles.date}
+              title={`Created: ${exactDateTime(note.createdAt)}`}
+              aria-label={`Created: ${created}`}
+              data-testid="note-detail-created"
+            >
+              {created}
+            </span>
+          ) : null}
+          <Chip
+            variant="accent"
+            title={`Type: ${noteType}`}
+            ariaLabel={`Type: ${noteType}`}
+            testId="note-detail-type"
+          >
+            {noteType}
+          </Chip>
+          {shownFields.map((field) => (
+            <Chip
+              key={field.key}
+              color={field.color}
+              title={`${field.fieldLabel}: ${field.label}`}
+              ariaLabel={`${field.fieldLabel}: ${field.label}`}
+              testId="note-detail-field"
+            >
+              {field.label}
+            </Chip>
+          ))}
           <TagChips tags={tags} hrefForTag={tagHref} onOpenTag={onOpenTag} />
         </div>
       </header>

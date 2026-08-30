@@ -33,6 +33,67 @@ export const clearTagsParam = (prev: URLSearchParams): URLSearchParams => {
   return sp
 }
 
+export const fieldEqParam = (key: string, value: string): string => `note.${key}:${value}`
+export const fieldDayParam = (key: string, day: string): string => `note.${key}:${day}`
+
+export const toggleFieldParam = (
+  prev: URLSearchParams,
+  key: string,
+  value: string,
+): URLSearchParams => {
+  const sp = new URLSearchParams(prev)
+  const expression = fieldEqParam(key, value)
+  const current = sp.getAll(FEED_URL_PARAMS.field)
+  sp.delete(FEED_URL_PARAMS.field)
+  const next = current.includes(expression)
+    ? current.filter((candidate) => candidate !== expression)
+    : [...current, expression]
+
+  for (const candidate of next) {
+    sp.append(FEED_URL_PARAMS.field, candidate)
+  }
+
+  return sp
+}
+
+export const toggleFieldDayParam = (
+  prev: URLSearchParams,
+  key: string,
+  day: string,
+): URLSearchParams => {
+  const sp = new URLSearchParams(prev)
+  const expression = fieldDayParam(key, day)
+  const current = sp.getAll(FEED_URL_PARAMS.fieldDay)
+
+  sp.delete(FEED_URL_PARAMS.fieldDay)
+  for (const candidate of current.includes(expression)
+    ? current.filter((value) => value !== expression)
+    : [...current, expression]) {
+    sp.append(FEED_URL_PARAMS.fieldDay, candidate)
+  }
+
+  return sp
+}
+
+export const clearFieldParam = (prev: URLSearchParams, key: string): URLSearchParams => {
+  const sp = new URLSearchParams(prev)
+  const address = `note.${key}`
+
+  const keep = (param: string, predicate: (value: string) => boolean) => {
+    const values = sp.getAll(param).filter(predicate)
+    sp.delete(param)
+    for (const value of values) {
+      sp.append(param, value)
+    }
+  }
+
+  keep(FEED_URL_PARAMS.field, (value) => !value.startsWith(`${address}:`))
+  keep(FEED_URL_PARAMS.fieldDay, (value) => !value.startsWith(`${address}:`))
+  keep(FEED_URL_PARAMS.fieldAny, (value) => value !== address)
+  keep(FEED_URL_PARAMS.fieldBad, (value) => value !== address)
+  return sp
+}
+
 export const setQParam = (prev: URLSearchParams, next: string): URLSearchParams => {
   const sp = new URLSearchParams(prev)
   const t = next.trim()
@@ -108,6 +169,10 @@ export const clearDateRangeParam = (prev: URLSearchParams): URLSearchParams => {
 export const clearFiltersParam = (prev: URLSearchParams): URLSearchParams => {
   const sp = new URLSearchParams(prev)
   sp.delete(FEED_URL_PARAMS.tag)
+  sp.delete(FEED_URL_PARAMS.field)
+  sp.delete(FEED_URL_PARAMS.fieldDay)
+  sp.delete(FEED_URL_PARAMS.fieldAny)
+  sp.delete(FEED_URL_PARAMS.fieldBad)
   sp.delete(FEED_URL_PARAMS.q)
   sp.delete(FEED_URL_PARAMS.from)
   sp.delete(FEED_URL_PARAMS.to)

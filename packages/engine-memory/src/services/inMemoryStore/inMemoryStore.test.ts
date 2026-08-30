@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { parse as parseYaml } from 'yaml'
 
 import {
@@ -8,7 +8,10 @@ import {
   documentStateVersionToken,
   FRONTMATTER_BYTE_CAP,
   IMPORT_SOURCE_FRONTMATTER_KEY,
+  indexedTypedFrontmatter,
   parseFrontmatterLines,
+  serializeNoteFields,
+  type TypedFrontmatterChannels,
 } from '@notarium/core'
 
 import { deterministicNoteId, InMemoryStore } from './inMemoryStore'
@@ -20,6 +23,33 @@ const exportText = (content: string | Uint8Array): string =>
   typeof content === 'string' ? content : new TextDecoder().decode(content)
 
 const frontmatter = (yaml: string) => parseFrontmatterLines(yaml)
+
+describe('InMemoryStore snapshot primary metadata', () => {
+  it('canonicalizes seeded Type and Created before either read projection', async () => {
+    const store = new InMemoryStore({
+      space: 'main',
+      notes: [
+        {
+          id: 'canonical-seed',
+          title: 'Canonical seed',
+          filePath: 'canonical-seed.md',
+          content: 'body',
+          noteType: '  task  ',
+          createdAt: '2026-08-29T10:00:00+03:00',
+        },
+      ],
+    })
+
+    expect((await store.list())[0]).toMatchObject({
+      noteType: 'task',
+      createdAt: '2026-08-29T07:00:00.000Z',
+    })
+    expect(await store.read('canonical-seed')).toMatchObject({
+      createdAt: '2026-08-29T07:00:00.000Z',
+      frontmatter: { type: 'task', created: '2026-08-29T07:00:00.000Z' },
+    })
+  })
+})
 
 describe('InMemoryStore import source provenance', () => {
   const locator = claudeConversationSourceLocator('conversation-一')!
@@ -50,6 +80,19 @@ describe('InMemoryStore import source provenance', () => {
       throw new Error('source-tagged note was not exported')
     }
     expect(exportText(exported.content)).toContain(`${IMPORT_SOURCE_FRONTMATTER_KEY}: ${locator}`)
+  })
+
+  it('does not let body-inline frontmatter mint import provenance', async () => {
+    const store = new InMemoryStore({ space: 'main', notes: [] })
+    const created = await store.write({
+      title: 'Authored',
+      content: `---\n${IMPORT_SOURCE_FRONTMATTER_KEY}: ${locator}\nclient: Acme\n---\n\nbody`,
+    })
+    const read = await store.read(created.id!)
+
+    expect(read.sourceLocator).toBeUndefined()
+    expect(read.frontmatter).not.toHaveProperty(IMPORT_SOURCE_FRONTMATTER_KEY)
+    expect(read.frontmatter).toMatchObject({ client: 'Acme' })
   })
 
   it('indexes a canonical direct-file claim but not an invalid one', async () => {
@@ -307,6 +350,83 @@ describe('InMemoryStore document-state parity', () => {
     expect((await ancestorOnly.read('nested-helper')).documentState?.role).toBe(
       DOCUMENT_ROLE.generic,
     )
+  })
+
+  it('protects manifest name/description only on the skill root', async () => {
+    const store = new InMemoryStore({
+      space: 'main',
+      notes: [
+        {
+          id: 'root',
+          title: 'demo',
+          class: 'skill',
+          filePath: 'skills/demo/SKILL.md',
+          content: 'Instructions',
+          frontmatter: 'name: demo\ndescription: Demo skill',
+        },
+        {
+          id: 'helper',
+          title: 'Helper',
+          class: 'skill',
+          filePath: 'skills/demo/references/helper.md',
+          content: 'Reference',
+        },
+      ],
+    })
+    const root = await store.read('root')
+
+    for (const key of ['name', 'description']) {
+      await expect(
+        store.write({
+          originalId: 'root',
+          title: root.title!,
+          content: root.content,
+          versionToken: root.versionToken,
+          fields: { [key]: 'overwrite' },
+        }),
+      ).rejects.toMatchObject({ reason: 'protected_field_key' })
+    }
+    const helper = await store.read('helper')
+    await expect(
+      store.write({
+        originalId: 'helper',
+        title: helper.title!,
+        content: helper.content,
+        versionToken: helper.versionToken,
+        fields: { description: 'ordinary helper metadata' },
+      }),
+    ).resolves.toMatchObject({ id: 'helper' })
+  })
+
+  it('analyzes document safety only when a write actually addresses custom fields', async () => {
+    const store = new InMemoryStore({
+      space: 'main',
+      notes: [{ id: 'note', title: 'Note', filePath: 'note.md', content: 'body' }],
+    })
+    const analyze = vi.spyOn(
+      store as unknown as { documentStateOf: (note: unknown) => unknown },
+      'documentStateOf',
+    )
+    const first = await store.read('note')
+    analyze.mockClear()
+
+    await store.write({
+      originalId: 'note',
+      title: 'Note',
+      content: 'updated body',
+      versionToken: first.versionToken,
+    })
+    const fieldlessCalls = analyze.mock.calls.length
+    const second = await store.read('note')
+    analyze.mockClear()
+    await store.write({
+      originalId: 'note',
+      title: 'Note',
+      content: second.content,
+      versionToken: second.versionToken,
+      fields: { status: 'done' },
+    })
+    expect(analyze.mock.calls.length).toBe(fieldlessCalls + 1)
   })
 
   /** "Is this the package ROOT?" has exactly one producer in the fake, and it is the
@@ -864,6 +984,225 @@ describe('InMemoryStore — carried frontmatter is the same note however it arri
   })
 })
 
+// The claim `carriedTyped` states in prose — that a live import (`write()`) and a
+// seeded fixture (`load()`) make the same note out of the same keys — held by nothing
+// but that comment until now, which is exactly how the two doors came apart: round 1's
+// fix taught `write()` to PUT a typed key into its authored slot and left `load()`
+// stripping the raw key and letting the export append it at the end. Same keys, two
+// notes (owner's decision, fork 23).
+//
+// What they owe is TWO claims, and stating it as one is what made it false. The doors
+// are handed the carry in two different states: `load()` models bytes already on disk
+// and keeps them verbatim — duplicate authored keys and keyless lines included, by its
+// own written rule — while `write()` models an import arriving at a file and runs the
+// carry through the same `existing ∪ incoming` merge the real serializer runs, which
+// NORMALIZES it (a duplicate collapses onto the first occurrence's slot, keyless lines
+// move ahead of the keyed ones). Both behaviours are right, and the difference is real:
+// `dup: one / dup: two` and a comment between two authored keys give two files.
+//
+//   · the FILE, byte for byte — owed on a carry already in the form that merge leaves
+//     behind, and on no other. The comparison is the whole string rather than a
+//     projection: a key that moved is a key whose value the cap may drop, and slot,
+//     duplicate collapse and the clear are all visible in it.
+//   · the COLUMN — owed on ANY carry whatever, and it is the claim every field query,
+//     facet and card plate downstream actually reads. It holds by construction rather
+//     than by luck: `collect` (core/libs/fields) dedups by key at its FIRST authored
+//     position and skips keyless entries before a single byte is weighed, so the
+//     normalization the merge performs is precisely the normalization the column
+//     performs anyway. Which also makes it the sharp statement about the forms above:
+//     whatever those two files do NOT share is invisible from the index.
+//
+// The split is COMPUTED from the carry, never hand-labelled per form, and both of its
+// sides are gated as non-empty below — a corpus that stopped reaching one of them would
+// leave half of this claim standing on nothing at all.
+describe('InMemoryStore — what both doors owe from the same keys (fork 23)', () => {
+  /** Every channel that reaches BOTH doors: the raw carry plus the typed snapshot
+   *  fields `write()` also takes as WriteInput. `aliases` is deliberately absent —
+   *  it is alias-HISTORY, seeded only, and `write()` derives it from the rename
+   *  instead of accepting it, so the two doors are not the same channel there. */
+  const DOORS: Array<{
+    name: string
+    carry: string
+    typed: TypedFrontmatterChannels & Record<string, unknown>
+  }> = [
+    {
+      name: 'a typed key authored between ordinary ones, re-stated with its own value',
+      carry: 'alpha: 1\nsummary: authored digest\nbeta: 2',
+      typed: { summary: 'authored digest' },
+    },
+    {
+      name: 'a typed key authored between ordinary ones, re-stated with a new value',
+      carry: 'alpha: 1\nsummary: authored digest\nbeta: 2',
+      typed: { summary: 'a new digest' },
+    },
+    {
+      name: 'a typed key cleared',
+      carry: 'alpha: 1\nsummary: authored digest\nbeta: 2',
+      typed: { summary: '' },
+    },
+    { name: 'type authored first', carry: 'type: task\nalpha: 1', typed: { noteType: 'decision' } },
+    {
+      name: 'muted authored between, in the quoted spelling the corpus carries',
+      carry: 'alpha: 1\nmuted: "true"\nbeta: 2',
+      typed: { muted: true },
+    },
+    {
+      name: 'muted un-set',
+      carry: 'alpha: 1\nmuted: "true"\nbeta: 2',
+      typed: { muted: false },
+    },
+    {
+      name: 'all three indexed channels at once',
+      carry: 'type: task\nalpha: 1\nsummary: d\nbeta: 2\nmuted: "true"',
+      typed: { noteType: 'decision', summary: 'e', muted: true },
+    },
+    {
+      name: 'a typed key the author never wrote',
+      carry: 'alpha: 1\nbeta: 2',
+      typed: { summary: 'appended' },
+    },
+    {
+      name: 'a typed key authored twice — the put collapses the duplicate',
+      carry: 'summary: one\nalpha: 1\nsummary: two',
+      typed: { summary: 'three' },
+    },
+    {
+      name: 'a typed key whose authored value is unreadable',
+      carry: 'alpha: 1\nsummary:\n  nested: 1\nbeta: 2',
+      typed: { summary: 'plain' },
+    },
+    // The form that turns the slot from cosmetics into the answer: past the blob cap
+    // the tail of the authored order loses its VALUE, so a `summary` that keeps its
+    // authored slot stays queryable and one appended at the end does not.
+    {
+      name: 'a typed key authored first, with the blob cap in play',
+      carry: `summary: authored digest\n${Array.from(
+        { length: 260 },
+        (_, i) => `key${i}: value-${i}`,
+      ).join('\n')}`,
+      typed: { summary: 'a new digest' },
+    },
+    {
+      name: 'the keys that project onto metadata of the note’s own',
+      carry: 'tags: [a]\nslug: s\nalpha: 1',
+      typed: { tags: ['x'], slug: 'y' },
+    },
+    {
+      name: 'a projected date replacing an authored one',
+      carry: 'alpha: 1\ncreated: 2020-01-02\nbeta: 2',
+      typed: { createdAt: '2021-03-04T00:00:00.000Z' },
+    },
+    {
+      name: 'a projected date beside an UNREADABLE authored one',
+      carry: 'alpha: 1\ncreated:\n  nested: 1\nbeta: 2',
+      typed: { createdAt: '2021-03-04T00:00:00.000Z' },
+    },
+    // The two shapes the one-claim version of this gate was false on, in the corpus so
+    // that the split above is exercised instead of merely described. Neither door is
+    // wrong on them: a fixture is bytes, an import is a merge.
+    {
+      name: 'a custom key authored twice, beside a typed channel',
+      carry: 'dup: one\ndup: two\ntype: task\nalpha: 1',
+      typed: { noteType: 'decision' },
+    },
+    {
+      name: 'comments between the authored keys',
+      carry: '# lead\nalpha: 1\n# mid\nsummary: authored digest\n# tail\nbeta: 2',
+      typed: { summary: 'a new digest' },
+    },
+  ]
+
+  /** WHERE the file is owed, computed from the carry rather than declared per form.
+   *  `write()` puts the carry through the merge a real file gets and `load()` does not,
+   *  so identical bytes are owed exactly where that merge changes nothing the doors do
+   *  not both change anyway: no keyless line among the keyed ones, and no key authored
+   *  twice — unless the typed emission is about to collapse that key on BOTH sides
+   *  regardless, which it is for a key it owns (`putCarried` replaces at the first slot
+   *  and drops the rest; a clear drops them all). The owned set is read off core's own
+   *  emitter instead of being re-listed here, so a fourth indexed channel moves this
+   *  predicate with it. */
+  const owedTheWholeFile = (door: (typeof DOORS)[number]): boolean => {
+    const entries = frontmatter(door.carry)
+    const collapsed = new Set(indexedTypedFrontmatter(door.typed).map((emission) => emission.key))
+    const keyed = entries.flatMap((entry) => (entry.key === null ? [] : [entry.key]))
+    const lastKeyless = entries.map((entry) => entry.key === null).lastIndexOf(true)
+    const firstKeyed = entries.findIndex((entry) => entry.key !== null)
+
+    return (
+      keyed.every((key, index) => keyed.indexOf(key) === index || collapsed.has(key)) &&
+      (lastKeyless === -1 || firstKeyed === -1 || lastKeyless < firstKeyed)
+    )
+  }
+
+  const fileOf = async (store: InMemoryStore): Promise<string> => {
+    for await (const e of store.exportNotes()) {
+      if (e.path === 'door.md') {
+        return exportText(e.content)
+      }
+    }
+
+    throw new Error('door.md is missing from the export')
+  }
+
+  /** The blob the index derives — taken off the store's own snapshot, which `metaOf`
+   *  builds by reconstructing the very file `fileOf` returns. So this is not a second
+   *  source of truth beside the bytes; it is the projection of them that decides what a
+   *  field query answers. */
+  const columnOf = async (store: InMemoryStore): Promise<string> => {
+    const note = (await store.list()).find((n) => n.filePath === 'door.md')!
+
+    expect(note.fields).toBeDefined()
+
+    return serializeNoteFields(note.fields!)
+  }
+
+  it('the corpus reaches both sides of the split', () => {
+    const owed = DOORS.filter(owedTheWholeFile)
+
+    expect({
+      owingTheWholeFile: owed.length > 0,
+      owingOnlyTheColumn: owed.length < DOORS.length,
+    }).toEqual({ owingTheWholeFile: true, owingOnlyTheColumn: true })
+  })
+
+  for (const door of DOORS) {
+    it(`${door.name}`, async () => {
+      const seeded = new InMemoryStore({
+        space: 'main',
+        now: '2026-06-10T12:00:00.000Z',
+        notes: [
+          {
+            title: 'Door',
+            filePath: 'door.md',
+            content: 'body',
+            frontmatter: door.carry,
+            ...door.typed,
+          },
+        ],
+      })
+      const written = new InMemoryStore({
+        space: 'main',
+        now: '2026-06-10T12:00:00.000Z',
+        notes: [],
+      })
+      await written.write({
+        title: 'Door',
+        fileName: 'door',
+        content: 'body',
+        frontmatter: frontmatter(door.carry),
+        ...door.typed,
+      })
+
+      // Owed on every form, whatever the doors did with the raw lines.
+      expect(await columnOf(seeded)).toBe(await columnOf(written))
+      // …and the bytes themselves, wherever the merge had nothing to normalize.
+      if (owedTheWholeFile(door)) {
+        expect(await fileOf(seeded)).toBe(await fileOf(written))
+      }
+    })
+  }
+})
+
 // Found in review round 4: the export drops a carried `aliases:`/`slug:` only
 // because a typed field re-emits it — and `carriedTyped` populates that field ONLY
 // for the value shapes the shared reader models. For anything fancier the typed
@@ -1261,6 +1600,50 @@ describe('InMemoryStore — carried frontmatter merges like the real file serial
     ).rejects.toThrowError(new Error(YAML_NODE_REFERENCE_WRITE_ERROR))
     expect(await store.read('r')).toEqual(before)
     expect(await exported(store)).toBe(exportedBefore)
+  })
+
+  // The one ingress the shared typed emission cannot touch. An anchored carry is kept
+  // VERBATIM so its references survive, which means `type`/`summary`/`muted` never get
+  // put into it — and the export's own typed pass is the only thing that still writes
+  // them. Nothing in the repository entered that pass once both doors started putting
+  // the three into the carry (fork 23): the whole suite stayed green with it stubbed
+  // out, and a branch no test can enter is indistinguishable from one that was deleted.
+  // Deleting it here would be silent DATA LOSS — the projection says `summary` and the
+  // file does not.
+  it('still emits the indexed typed channels on an anchored carry that has no line for them', async () => {
+    const store = new InMemoryStore({
+      space: 'main',
+      notes: [
+        {
+          id: 'r',
+          title: 'R',
+          filePath: 'r.md',
+          content: 'body',
+          frontmatter: 'author: &a Sergey\nauthor-copy: *a',
+          noteType: 'journal',
+          summary: 'Typed summary',
+          muted: true,
+        },
+      ],
+    })
+    const file = await exported(store)
+
+    // Through core's emitter, not by hand: `muted` rides the corpus in the quoted
+    // spelling, and a hand-written `muted: true` here would be a second answer.
+    expect(file).toContain('type: journal')
+    expect(file).toContain('summary: Typed summary')
+    expect(file).toContain('muted: "true"')
+    // The anchored owner and its alias both survive — the reason the carry is verbatim.
+    expect(file).toContain('author: &a Sergey')
+    expect(file).toContain('author-copy: *a')
+
+    const live = await store.read('r')
+
+    expect(live.frontmatter).toMatchObject({
+      type: 'journal',
+      summary: 'Typed summary',
+      muted: 'true',
+    })
   })
 
   it('keeps an anchored notarium-created owner when createdAt is projected explicitly', async () => {
@@ -1995,5 +2378,81 @@ describe('InMemoryStore — the note’s own identity is never the carry’s to 
     expect(view.frontmatter.title).toBeUndefined()
     expect(view.frontmatter['notarium-id']).toBeUndefined()
     expect(view.frontmatter.author).toBe('S')
+  })
+})
+
+describe('InMemoryStore field axis memoization', () => {
+  const authored = 'status: in progress\nowner: ann'
+  const seed = () =>
+    new InMemoryStore({
+      space: 'main',
+      notes: [
+        {
+          id: 'memo-note',
+          title: 'Memo',
+          filePath: 'memo.md',
+          content: 'body',
+          frontmatter: authored,
+        },
+      ],
+    })
+  const fieldsOf = async (store: InMemoryStore) =>
+    (await store.list()).find((n) => n.id === 'memo-note')!.fields
+
+  it('serves the same projection twice without re-deriving it', async () => {
+    const store = seed()
+    const first = await fieldsOf(store)
+
+    // Same object, not merely an equal one: the second read came out of the memo
+    // rather than off a second file reconstruction.
+    expect(await fieldsOf(store)).toBe(first)
+    expect(first!.keys).toEqual({ status: 'in progress', owner: 'ann' })
+  })
+
+  it('re-derives after a write, a move and a re-seed', async () => {
+    const store = seed()
+
+    expect((await fieldsOf(store))!.keys.status).toBe('in progress')
+    // A write replaces the note object outright.
+    const read = await store.read('memo-note')
+
+    await store.write({
+      title: 'Memo',
+      content: 'body',
+      originalId: 'memo-note',
+      versionToken: read.versionToken,
+      frontmatter: frontmatter('status: done'),
+    })
+    expect((await fieldsOf(store))!.keys).toEqual({ status: 'done', owner: 'ann' })
+
+    // A move edits the note IN PLACE, so object identity says nothing changed and the
+    // physical write claim is the only thing that does. Its bytes happen not to move —
+    // which is exactly why the assert is on IDENTITY: without the claim in the key this
+    // read would be served from the memo, and the guard against an in-place mutation
+    // that DOES touch the bytes would be gone with nothing to notice.
+    await store.makeDir('archive')
+    const beforeMove = await fieldsOf(store)
+
+    await store.move({ id: 'memo-note', destinationPath: 'archive/memo.md' })
+    const afterMove = await fieldsOf(store)
+
+    expect(afterMove).not.toBe(beforeMove)
+    expect(afterMove!.keys).toEqual({ status: 'done', owner: 'ann' })
+
+    // A re-seed is this store's only external-edit channel: the fixture behind the
+    // note changed, and the memo of the corpus it replaced must not answer for it.
+    store.load({
+      space: 'main',
+      notes: [
+        {
+          id: 'memo-note',
+          title: 'Memo',
+          filePath: 'memo.md',
+          content: 'body',
+          frontmatter: 'status: reopened',
+        },
+      ],
+    })
+    expect((await fieldsOf(store))!.keys).toEqual({ status: 'reopened' })
   })
 })

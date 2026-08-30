@@ -31,9 +31,9 @@
   border: 1px solid var(--border-strong);
 }
 .error .figure {
-  color: var(--danger);
-  background: color-mix(in srgb, var(--danger) 10%, transparent);
-  border: 1px solid color-mix(in srgb, var(--danger) 24%, transparent);
+  color: var(--danger-fg);
+  background: var(--danger-surface);
+  border: 1px solid var(--danger-border);
 }
 
 .code {
@@ -43,7 +43,7 @@
   text-transform: uppercase;
   color: var(--text-faint);
 }
-.error .code { color: color-mix(in srgb, var(--danger) 80%, var(--text-faint)); }
+.error .code { color: var(--danger-fg); }
 
 .title {
   margin: 1px 0 0;

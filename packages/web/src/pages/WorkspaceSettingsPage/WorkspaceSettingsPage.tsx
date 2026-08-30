@@ -25,11 +25,15 @@ export const WorkspaceSettingsPage = () => {
   const canManage = canManageSpace(me, mode, space) && capabilities.spaceCreate
   const groups: SettingsTab[][] = [
     onPersonal
-      ? [{ id: 'projects', label: 'Projects' }]
+      ? [
+          { id: 'projects', label: 'Projects' },
+          ...(canWrite ? [{ id: 'fields', label: 'Fields' }] : []),
+        ]
       : [
           ...(canManage ? [{ id: 'general', label: 'General' }] : []),
           { id: 'members', label: 'Members' },
           { id: 'projects', label: 'Projects' },
+          ...(canWrite ? [{ id: 'fields', label: 'Fields' }] : []),
         ],
     // Export (#17) / Import (#11) are per-space data actions, not management —
     // their own group so a divider separates moving notes in/out from the

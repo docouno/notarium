@@ -44,7 +44,7 @@ space-id — the consistency invariants from the task statement fall out «for f
 2. **Cases** (`test/cases/cases/`) — they **compose** fragments + structure + activity
    (they do not inline content). Reader cases are built FROM the corpus and auto-grow
    together with it.
-3. **Axes + coverage matrix** (`axes.ts`, `coverage.ts`) — 19 product axes, each tied to
+3. **Axes + coverage matrix** (`axes.ts`, `coverage.ts`) — 20 product axes, each tied to
    surfaces + a canon doc; cases tag `axes`. `make seed-coverage` prints the matrix; the
    coverage test fails on a gap.
 4. **Appliers** — `caseToFixture` (fake) and `scripts/seed.ts` (real). The case model is
@@ -114,6 +114,34 @@ and for `security` — it parses the sanitized HTML into a live DOM and checks t
 | `legacy-slug-links` | notes moved from old ASCII-only filenames onto Unicode paths: one unique legacy link survives delete/restore, while a two-owner old basename remains a ghost | identity, graph, search, history, trash, structure |
 | `name-collisions` | the states that flow from "a title picks the file name": a folder primed for the refusal dialog, an already-uniquified `Retro`/`Retro 2`/`Retro 3` family, the same title in two folders, and a folder page whose reserved `index.md` deliberately does not collide — [note-model.md](note-model.md#create-collisions) | identity, structure |
 
+**Declared meta fields (the field axis):**
+
+| Case | About | Axes |
+|---|---|---|
+| `fields` | a shared writer/reader field lab plus the authored-frontmatter corpus and real schema: all six types, stable enum labels/colors, semantic palette, five uncapped `card:true`, exact list scalar ` Doe, Jane `, day/moment, empty/mismatch/protected/open-world and every indexed cap state, including primary Type outside the blob. Three sibling spaces carry exact future/form/structural `schema.yaml` states. Both fake and real appliers materialize valid and raw schema resources without hand preparation | fields, auth |
+| `fields-scale` | 10000 notes with twelve author keys each (ten scalars and two lists) — the corpus the snapshot's field projection is measured on by `make bench-fields-snapshot`, and the one the ladder's re-derivation is priced on by `FIELDS_BACKFILL_CASE=fields-scale npx vitest run test/integration/fieldsBackfill.test.ts` (that gate namespaces its knobs on purpose — a bare `CASE` exported for the seed CLI must not steer a test `npm test` sweeps up) | fields, scale |
+
+**The last three states of `fields` are sized FROM `FIELDS_BLOB_BYTE_CAP`, never against it.**
+The cap-overflow notes carry twice the cap's worth of key names, computed in the case rather
+than typed in, so retuning the cap retunes the corpus with it. Written the other way round —
+literal counts tuned to a 1.2× margin — a cap raised from 4096 to 6144 switched all three
+states off without a single red test, and every derived number here and in the case's comments
+went on describing a split that no longer happened. `test/cases/fields.test.ts` is the gate:
+it demands the states, and it demands the margin they are sized to.
+
+**Its POPULATIONS are held the same way — as shapes, not as counts.** The three the brief's
+criterion 7 reads off this case (a board of three notes and three values — a corpus too small
+for a threshold to judge, the same shape at 40 notes where the key identifies rather than
+groups, and a list key whose distinct values outnumber its notes without any of them alone) are
+what the facet's selection rule has to tell apart, and the numbers they come to are consequences
+rather than decisions: how many distinct reviewers 20 notes show is what `i % REVIEWERS.length`
+produces, not something anyone chose. So the row above states the relations, the case declares
+the vocabularies, and the gate derives every count from the seeded notes — including the one
+comparison that is a count at all, `distinct reviewers == REVIEWERS.length`, which holds two
+derived things against each other. The same gate demands that some notes carry NO author keys:
+without them `FIELDS_BACKFILL_CASE=fields` reports `rowsRederived == filesRead` and the pair of
+counters stops distinguishing a re-derived row from an adopted one.
+
 **Content / reader:**
 
 | Case | About | Axes |
@@ -150,9 +178,9 @@ Normally each applier derives a note's physical identity for itself — the fake
 
 ## Axes and coverage
 
-19 axes (`axes.ts`): `content`, `structure`, `folder-page`, `activity`, `history`,
+20 axes (`axes.ts`): `content`, `structure`, `folder-page`, `activity`, `history`,
 `trash`, `identity`, `search`, `graph`, `agent-memory`, `note-classes`, `import`,
-`jobs`, `scale`, `auth`, `favorites`, `agent-audit`, `agent-sessions`, `agent-roles`. Each is tied to
+`jobs`, `scale`, `auth`, `favorites`, `fields`, `agent-audit`, `agent-sessions`, `agent-roles`. Each is tied to
 surfaces + canon docs.
 
 ```
@@ -412,6 +440,11 @@ same typed projections from the final carry as its write does (`type`/`tags`/`al
 empty clears, and remove their raw shadow so it cannot reappear on export. Skipping either rule
 would make the fake disagree with the real file after import (pinned by `inMemoryStore.test.ts`).
 
+A space declaration may carry **`fieldSchema`**. It is outside the note timeline: the
+real applier publishes `.notarium/fields/schema.yaml` through the production CAS service,
+and the fake seeds the stateful in-memory counterpart consumed by the same REST routes. A
+schema never fabricates a note, journal row, or index event.
+
 A create declaration may additionally carry typed **`sourceLocator`**. Both appliers materialize it through the same trusted `WriteInput.sourceLocator`/`NoteSnapshot.sourceLocator` channel, so the file contains reserved `notarium-source` while ordinary frontmatter/public projections do not. This is distinct from authored `frontmatter`: putting the same key there models fresh untrusted carry and must not mint a claim. Omitting `sourceLocator` is how a case deliberately preserves a source-less legacy import state.
 
 Ordinary seeded history remains a readable compatibility projection: the fake writes a
@@ -520,7 +553,10 @@ required to match its directory.
   into the reader cases + the coverage matrix + the honesty test.
 - **+case** → a new file in `cases/*` (exports a `CaseSpec` with `axes`) + a row in
   `registry.ts`. Both appliers and the CLI will pick it up.
-- **+axis** → a row in `axes.ts` (the coverage test will see it).
+- **+axis** → a row in `axes.ts` (the coverage test will see it) **and the same axis added
+  to the count and the list in [Axes and coverage](#axes-and-coverage)**. The test sees a
+  new row; nothing sees that sentence, so it is the half that rots — `fields` (#384) landed
+  with the count still reading 19 and the axis missing from the list.
 
 ## Appliers (details)
 

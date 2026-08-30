@@ -64,6 +64,11 @@ test('two tabs, one note: the slower save conflicts; "Show latest" keeps the dra
   // "Show latest": the live version is visible, the draft stays in the editor
   await dialog.getByRole('button', { name: 'Show latest' }).click()
   await expect(page.getByTestId('conflict-current-content')).toContainText('Body from tab two.')
+  const overwritten = page.getByTestId('conflict-current-fields')
+
+  for (const label of ['Title', 'Type', 'Folder', 'Slug', 'Tags']) {
+    await expect(overwritten.getByText(label, { exact: true })).toBeVisible()
+  }
   await page.getByRole('button', { name: 'Back to my draft' }).click()
   await expect(page.locator('.cm-content')).toContainText('Body from tab one.')
 
@@ -81,6 +86,65 @@ test('two tabs, one note: the slower save conflicts; "Show latest" keeps the dra
   // across tabs now.
   await tab2.reload()
   await expect(tab2.locator('.markdown')).toContainText('Body from tab one.')
+})
+
+test('Show latest names the concurrent custom-field value an overwrite would replace', async ({
+  page,
+  baseURL,
+}) => {
+  const schema = (await (await page.request.get(`${baseURL}/api/s/main/fields/schema`)).json()) as {
+    versionToken: string
+  }
+  const schemaWrite = await page.request.put(`${baseURL}/api/s/main/fields/schema`, {
+    data: {
+      version: 1,
+      versionToken: schema.versionToken,
+      fields: [
+        {
+          key: 'status',
+          type: 'enum',
+          label: 'Status',
+          values: [
+            { key: 'backlog', label: 'Backlog' },
+            { key: 'doing', label: 'In progress' },
+            { key: 'blocked', label: 'Blocked' },
+          ],
+        },
+      ],
+    },
+  })
+  expect(schemaWrite.ok()).toBe(true)
+  const initial = (await (await page.request.get(`${baseURL}/api/note?id=${NOTE}`)).json()) as {
+    versionToken: string
+  }
+  const initialWrite = await page.request.put(`${baseURL}/api/note/fields`, {
+    data: { id: NOTE, versionToken: initial.versionToken, fields: { status: 'backlog' } },
+  })
+  expect(initialWrite.ok()).toBe(true)
+
+  const tab2 = await page.context().newPage()
+  await openCarbonEditor(page)
+  await openCarbonEditor(tab2)
+  await page.bringToFront()
+  await page.getByTitle('Open panel').click()
+  await tab2.bringToFront()
+  await tab2.getByTitle('Open panel').click()
+  const chooseStatus = async (target: Page, name: string) => {
+    await target.bringToFront()
+    await target.getByTestId('editor-meta').getByRole('button', { name: 'Status value' }).click()
+    await target.getByRole('menuitemradio', { name }).click()
+  }
+
+  await chooseStatus(tab2, 'Blocked')
+  await saveAndExpectClosed(tab2)
+  await chooseStatus(page, 'In progress')
+  await page.getByRole('button', { name: 'Save' }).click()
+  await page.getByRole('dialog').getByRole('button', { name: 'Show latest' }).click()
+
+  const fields = page.getByTestId('conflict-current-fields')
+  await expect(fields).toContainText('Status')
+  await expect(fields).toContainText('Latest: Blocked')
+  await expect(fields).toContainText('Your draft: In progress')
 })
 
 test('"Save my version" retries with the fresh token and wins explicitly', async ({ page }) => {

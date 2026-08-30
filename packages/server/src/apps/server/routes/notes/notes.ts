@@ -7,6 +7,7 @@ import {
   FAVORITE_ENTITY_KIND,
   NotesQuerySchema,
   NotesResponseSchema,
+  parseFieldFilter,
   SaveResponseSchema,
   TagsQuerySchema,
   TagsResponseSchema,
@@ -15,12 +16,13 @@ import { HTTP_STATUS } from '@notarium/contract/http'
 import { bucketCounts, deriveNoteTitle, type NoteMeta, queryNotes, tagFacet } from '@notarium/core'
 
 import { safeRelAddress } from '../../../../libs/relPath'
+import { fieldDayFilterError, prepareFieldWrite } from '../../../../services/fields'
 import type { SpaceStore } from '../../../../services/spaces'
 import { type ApiRouteCtx, authz, missing, s } from '../_shared'
 import { createToDomain, noteToWire } from '../wire'
 
 export const notesRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
-  const { spaceStoreFor, favoriteOwner, favorites, principalId } = ctx
+  const { spaceStoreFor, favoriteOwner, favorites, principalId, fieldSchemaStore } = ctx
 
   /** Cap on the lexical-hit set intersected into a `q`-narrowed Feed query.
    *  list() and search() both default to scope 'user', so the intersection stays visibility-consistent.
@@ -59,12 +61,39 @@ export const notesRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
         .send({ error: q.error.issues[0]?.message || 'bad query' })
     }
     const store = await spaceStoreFor(req)
-    const ids = q.data.favorite === '1' ? await favoriteNoteIdsFor(req) : undefined
-    const page = queryNotes(await notesForQuery(store, q.data.q), { ...q.data, ids })
-    const withPreview = q.data.preview === '1'
+    const {
+      field,
+      fieldDay,
+      fieldAny,
+      fieldBad,
+      q: textQuery,
+      favorite,
+      preview,
+      ...query
+    } = q.data
+    const [notes, schema, ids] = await Promise.all([
+      notesForQuery(store, textQuery),
+      fieldSchemaStore?.read(req.spaceId),
+      favorite === '1' ? favoriteNoteIdsFor(req) : Promise.resolve(undefined),
+    ])
+    const fields = parseFieldFilter({ field, fieldDay, fieldAny, fieldBad })
+    const fieldError = fieldDayFilterError(fields, schema)
+
+    if (fieldError) {
+      return reply.code(HTTP_STATUS.BAD_REQUEST).send({ error: fieldError })
+    }
+    const page = queryNotes(notes, {
+      ...query,
+      fields,
+      ids,
+    })
+    const withPreview = preview === '1'
+    const cardFieldKeys = (schema?.fields ?? [])
+      .filter((declaration) => declaration.card === true)
+      .map((declaration) => declaration.key)
     return NotesResponseSchema.parse({
       notes: page.notes.map((n) => ({
-        ...noteToWire(n),
+        ...noteToWire(n, cardFieldKeys),
         ...(withPreview ? { preview: n.id ? store.previewPeek(n.id) : null } : {}),
       })),
       total: page.total,
@@ -80,9 +109,24 @@ export const notesRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
         .code(HTTP_STATUS.BAD_REQUEST)
         .send({ error: q.error.issues[0]?.message || 'bad query' })
     }
-    const ids = q.data.favorite === '1' ? await favoriteNoteIdsFor(req) : undefined
+    const { field, fieldDay, fieldAny, fieldBad, q: textQuery, favorite, ...query } = q.data
+    const [ids, schema] = await Promise.all([
+      favorite === '1' ? favoriteNoteIdsFor(req) : Promise.resolve(undefined),
+      fieldDay?.length ? fieldSchemaStore?.read(req.spaceId) : Promise.resolve(undefined),
+    ])
+    const fields = parseFieldFilter({ field, fieldDay, fieldAny, fieldBad })
+    const fieldError = fieldDayFilterError(fields, schema)
+
+    if (fieldError) {
+      return reply.code(HTTP_STATUS.BAD_REQUEST).send({ error: fieldError })
+    }
+
     return BucketsResponseSchema.parse(
-      bucketCounts(await notesForQuery(await spaceStoreFor(req), q.data.q), { ...q.data, ids }),
+      bucketCounts(await notesForQuery(await spaceStoreFor(req), textQuery), {
+        ...query,
+        fields,
+        ids,
+      }),
     )
   })
 
@@ -128,7 +172,14 @@ export const notesRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
       directory = safe
     }
     const store = await spaceStoreFor(req)
-    const r = await store.write(createToDomain({ ...parsed, directory }, principalId(req)))
+    const hasFields = Object.getOwnPropertyNames(parsed.fields ?? {}).length > 0
+    const fieldsUnquoted = hasFields
+      ? await prepareFieldWrite(fieldSchemaStore, req.spaceId, parsed.fields!)
+      : undefined
+    const r = await store.write({
+      ...createToDomain({ ...parsed, directory }, principalId(req)),
+      ...(fieldsUnquoted ? { fieldsUnquoted } : {}),
+    })
     return SaveResponseSchema.parse({
       ok: true,
       id: r.id,

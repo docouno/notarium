@@ -97,7 +97,13 @@ test('footer space is reserved before selection, so showing it does not jump the
     })
   const before = await metrics()
 
-  await page.getByTestId('trash-row-check').last().check({ force: true })
+  // This invariant is about the footer geometry, not Playwright scrolling a virtual
+  // checkbox into view. Address the deterministic tail of the first server page and
+  // dispatch its click synchronously: an actionability scroll can otherwise rebuild
+  // the overscan window between resolving `.last()` and React receiving the event.
+  const tail = page.getByRole('checkbox', { name: 'Select Design draft 16', exact: true })
+  await expect(tail).toBeVisible()
+  await tail.dispatchEvent('click')
   await expect(page.getByTestId('trash-footer')).toBeVisible()
   const after = await metrics()
 

@@ -254,6 +254,7 @@ export const renderNote = (
     space?: string
     project?: string
     versionToken: string
+    unsafeFrontmatterKeysOmitted?: number
     provenance?: Provenance
     outline?: Array<{ level: number; title: string }>
     links?: { outgoing: NoteLink[]; incoming: NoteLink[] }
@@ -261,13 +262,20 @@ export const renderNote = (
   format: 'concise' | 'detailed',
 ): string => {
   const where = whereLabel(note)
+  const unsafeFrontmatterWarning = note.unsafeFrontmatterKeysOmitted
+    ? `_${note.unsafeFrontmatterKeysOmitted} unsafe frontmatter ${note.unsafeFrontmatterKeysOmitted === 1 ? 'key was' : 'keys were'} omitted from the agent view._`
+    : ''
 
   if (format === RESPONSE_FORMAT.concise) {
     const firstPara = note.content.split('\n\n')[0]?.trim() ?? ''
     const brief = firstPara.length > 500 ? `${firstPara.slice(0, 500)}…` : firstPara
-    return `# ${note.title}${where}\n\n${brief}`
+    return `# ${note.title}${where}\n\n${brief}${unsafeFrontmatterWarning ? `\n\n${unsafeFrontmatterWarning}` : ''}`
   }
   const parts = [`# ${note.title}${where}\n\n${note.content}`]
+
+  if (note.unsafeFrontmatterKeysOmitted) {
+    parts.push(unsafeFrontmatterWarning)
+  }
 
   if (note.outline && note.outline.length) {
     const lines = note.outline.map((h) => `${'  '.repeat(Math.max(0, h.level - 1))}- ${h.title}`)

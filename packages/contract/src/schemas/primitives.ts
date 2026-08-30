@@ -128,6 +128,69 @@ export const DurableNonEmptyScalarSchema = DurableScalarSchema.refine(
   'must not be empty',
 )
 
+export const FieldValueSchema = z.union([
+  DurableScalarSchema,
+  z.array(DurableScalarSchema),
+  z.null(),
+])
+
+/** Parse a JSON object without assigning through Object.prototype. Zod's record
+ * parser writes into a normal object and silently loses an own `__proto__`; read
+ * contracts are open-world file projections, so they must preserve every own key.
+ * Write ingress keeps its separate explicit rejection policy below. */
+export const prototypeSafeRecord = <Schema extends z.ZodTypeAny>(schema: Schema) =>
+  z.unknown().transform((value, ctx): Record<string, z.output<Schema>> => {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Expected object record' })
+      return Object.create(null) as Record<string, z.output<Schema>>
+    }
+    const result = Object.create(null) as Record<string, z.output<Schema>>
+
+    for (const key of Object.getOwnPropertyNames(value)) {
+      const parsed = schema.safeParse((value as Record<string, unknown>)[key])
+
+      if (!parsed.success) {
+        for (const issue of parsed.error.issues) {
+          ctx.addIssue({ ...issue, path: [key, ...issue.path] })
+        }
+      } else {
+        result[key] = parsed.data
+      }
+    }
+
+    return result
+  })
+
+const PROTO_REJECTION_KEY = '__proto__ (unsupported field key)'
+
+/** z.record assigns through ordinary object properties and silently loses an
+ * own `__proto__`. Rewrite that raw key to an invalid value so the transport
+ * rejects it explicitly; host-internal store callers remain able to address it. */
+export const FieldPatchSchema = z.preprocess(
+  (value) => {
+    if (
+      value === null ||
+      typeof value !== 'object' ||
+      Array.isArray(value) ||
+      !Object.hasOwn(value, '__proto__')
+    ) {
+      return value
+    }
+    const rejected = Object.create(null) as Record<string, unknown>
+
+    for (const key of Object.getOwnPropertyNames(value)) {
+      if (key !== '__proto__') {
+        rejected[key] = (value as Record<string, unknown>)[key]
+      }
+    }
+    rejected[PROTO_REJECTION_KEY] = { error: 'unsupported field key __proto__' }
+    return rejected
+  },
+  z.record(DurableScalarSchema, FieldValueSchema),
+)
+
+export type FieldPatch = z.infer<typeof FieldPatchSchema>
+
 /** A persisted human-facing label. It is a scalar because project markers and
  *  registry rows must agree on the exact value across re-clone/recovery, and it
  *  is bounded to keep every write surface from amplifying metadata storage. */

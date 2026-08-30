@@ -82,6 +82,10 @@ export const FEED_URL_PARAMS = {
   q: 'q',
   /** Singular + repeated (`?tag=a&tag=b`); the wire's plural `tags` is a separate key. */
   tag: 'tag',
+  field: 'field',
+  fieldDay: 'fieldDay',
+  fieldAny: 'fieldAny',
+  fieldBad: 'fieldBad',
   from: 'from',
   to: 'to',
   favorite: 'favorite',

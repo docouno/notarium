@@ -1,23 +1,30 @@
-import { useRef, useState } from 'react'
+import { type CSSProperties, useRef, useState } from 'react'
+import type { FieldColor } from '@notarium/contract'
 import { cx } from '../../libs/cx/cx'
-import { ContextMenu } from '../ContextMenu'
+import { ContextMenu, type MenuItem } from '../ContextMenu'
 import { IconChevron } from '../Icons'
 import styles from './Select.module.scss'
 
-type SelectOption<T extends string> = {
+export type SelectOption<T extends string> = {
   value: T
   label: string
+  color?: FieldColor
   /** Options carrying the same group are listed together under its caption, so the
    *  group name is stated once instead of being suffixed onto every label. */
   group?: string
 }
 
 type SelectProps<T extends string> = {
-  value: T
+  value?: T
   onChange: (value: T) => void
-  options: SelectOption<T>[]
+  options: readonly SelectOption<T>[]
+  placeholder?: string
+  clearLabel?: string
+  onClear?: () => void
   disabled?: boolean
   className?: string
+  appearance?: 'default' | 'quiet'
+  showSelectedSwatch?: boolean
   /** Raise the option list above modals — set when the Select lives inside a dialog
    *  (its ContextMenu list would otherwise portal below the modal). */
   elevated?: boolean
@@ -37,8 +44,13 @@ export const Select = <T extends string = string>({
   value,
   onChange,
   options,
+  placeholder = '',
+  clearLabel,
+  onClear,
   disabled = false,
   className,
+  appearance = 'default',
+  showSelectedSwatch = true,
   elevated = false,
   'data-testid': testId,
   'aria-label': ariaLabel,
@@ -46,6 +58,35 @@ export const Select = <T extends string = string>({
   const triggerRef = useRef<HTMLButtonElement>(null)
   const [menu, setMenu] = useState<{ x: number; y: number; width: number } | null>(null)
   const selected = options.find((o) => o.value === value)
+  const swatch = (color?: FieldColor) =>
+    color ? (
+      <span
+        className={styles.swatch}
+        style={{ '--select-solid': `var(--field-color-${color})` } as CSSProperties}
+      />
+    ) : undefined
+  const items: MenuItem[] = []
+
+  if (onClear) {
+    items.push({
+      label: clearLabel ?? placeholder,
+      radioGroup: ariaLabel ?? 'Select option',
+      active: value === undefined,
+      onClick: onClear,
+    })
+  }
+  options.forEach((option, index) => {
+    if (option.group && option.group !== options[index - 1]?.group) {
+      items.push({ heading: option.group })
+    }
+    items.push({
+      label: option.label,
+      icon: swatch(option.color),
+      radioGroup: option.group ?? ariaLabel ?? 'Select option',
+      active: option.value === value,
+      onClick: () => onChange(option.value),
+    })
+  })
 
   const open = () => {
     if (disabled) {
@@ -63,15 +104,33 @@ export const Select = <T extends string = string>({
       <button
         ref={triggerRef}
         type="button"
-        className={cx(styles.trigger, disabled && styles.disabled, className)}
+        className={cx(
+          styles.trigger,
+          appearance === 'quiet' && styles.quiet,
+          disabled && styles.disabled,
+          className,
+        )}
         disabled={disabled}
         aria-label={ariaLabel}
         aria-haspopup="menu"
         aria-expanded={menu != null}
         data-testid={testId}
+        style={
+          selected?.color
+            ? ({
+                '--select-solid': `var(--field-color-${selected.color})`,
+                '--select-fg': `var(--field-color-${selected.color}-fg)`,
+                '--select-surface': `var(--field-color-${selected.color}-surface)`,
+                '--select-border': `var(--field-color-${selected.color}-border)`,
+              } as CSSProperties)
+            : undefined
+        }
         onClick={() => (menu ? setMenu(null) : open())}
       >
-        <span className={styles.value}>{selected?.label ?? ''}</span>
+        <span className={styles.value}>
+          {showSelectedSwatch && swatch(selected?.color)}
+          <span>{selected?.label ?? placeholder}</span>
+        </span>
         <IconChevron size={14} className={cx(styles.chevron, menu && styles.open)} />
       </button>
       {menu && (
@@ -81,17 +140,7 @@ export const Select = <T extends string = string>({
           minWidth={menu.width}
           elevated={elevated}
           ignoreRef={triggerRef}
-          items={options.flatMap((o, index) => {
-            const opening = o.group && o.group !== options[index - 1]?.group
-            const row = {
-              label: o.label,
-              radioGroup: o.group ?? ariaLabel ?? 'Select option',
-              active: o.value === value,
-              onClick: () => onChange(o.value),
-            }
-
-            return opening ? [{ heading: o.group }, row] : [row]
-          })}
+          items={items}
           onClose={() => setMenu(null)}
         />
       )}

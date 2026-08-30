@@ -14,6 +14,7 @@ import type {
   TreeChildrenQuery,
 } from '../knowledgeStore'
 import { BUCKET_GRAN, DATE_FIELD, DEPTH, NOTE_SORT, SORT_DIR } from '../knowledgeStore'
+import { compileFieldFilter } from '../libs/fields'
 import { directoryOf, isFolderPageNote } from '../libs/path'
 import { buildTagFacet, matchesTags } from '../libs/tags'
 import type {
@@ -209,6 +210,10 @@ export const queryNotes = (notes: readonly NoteMeta[], q: NotesQuery): NotesWind
   // same population.
   if (q.tags && q.tags.length) {
     list = list.filter((n) => matchesTags(n.tags, q.tags))
+  }
+  if (q.fields) {
+    const matchesFields = compileFieldFilter(q.fields)
+    list = list.filter((n) => matchesFields(n.fields))
   }
   // Date range: inclusive local calendar days on the selected date axis.
   // Applied before sort/slice so `total`, the window and buckets all agree.
@@ -450,6 +455,7 @@ export const bucketCounts = (notes: readonly NoteMeta[], q: BucketsQuery): Bucke
     depth: q.depth,
     folders: q.folders,
     tags: q.tags,
+    fields: q.fields,
     from: q.from,
     to: q.to,
     tz: q.tz,

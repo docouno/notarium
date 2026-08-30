@@ -10,8 +10,11 @@
 // frontmatter its author wrote (#280).
 
 import {
+  assertFieldPatchWritable,
+  buildNoteFieldsBlob,
   CREATED_FALLBACK_FRONTMATTER_KEY,
-  DEFAULT_NOTE_TYPE,
+  type FieldPatch,
+  fieldPatchEmissions,
   type FrontmatterBlock,
   frontmatterBlockEol,
   type FrontmatterEntry,
@@ -32,19 +35,21 @@ import {
   isImportNoteSourceLocator,
   isValidNoteId,
   isWithinFrontmatterByteCap,
+  mutedFrontmatter,
   nextPhysicalLineSpan,
   normAliases,
   normTags,
   NOTE_ID_FRONTMATTER_KEY,
+  noteTypeFrontmatter,
   parseBodyFrontmatterBlock,
   parseFrontmatterBlock,
   singleLine,
   slugify,
   stripTitleHeading,
+  summaryFrontmatter,
+  type TypedFrontmatterEmission,
+  yamlNodeReferenceWriteError,
 } from '@notarium/core'
-
-const YAML_NODE_REFERENCE_WRITE_ERROR =
-  'frontmatter with YAML anchors or aliases is not supported by writes'
 
 /** A frontmatter date → ISO-8601 UTC, or null when absent/unparseable. The file
  *  is the creation date's source of truth (#11 import / round-trip): a `created:`
@@ -84,6 +89,13 @@ export type ParsedNote = {
    * version the whole logical note must use these rather than reverse-engineer
    * YAML from the deliberately-small Record view. */
   frontmatterEntries: FrontmatterEntry[]
+  /** The author's frontmatter as the index column stores it: the serialized fields
+   *  blob. Derived from the entries rather than the Record above, which cannot tell
+   *  an absent key from one whose value the reader could not project. Built on FIRST
+   *  READ and memoized: most callers of the parse (the heal pass, the identity
+   *  materialization loop on every write, `read()`) never look at it, while a note at
+   *  the frontmatter cap costs milliseconds to build on a shared event loop. */
+  fields: string
   /** The body as read() serves it: frontmatter and encoding prologue split off, the
    *  storage-format title heading stripped. */
   body: string
@@ -168,7 +180,7 @@ export const parseNoteFile = (raw: string, path: string): ParsedNote => {
   // ordinary save then wrote the file back with one mark fewer.
   const fm = text.charCodeAt(0) === 0xfeff ? null : parseFrontmatterBlock(text)
   const afterFm = fm ? text.slice(fm.bodyStart) : text
-  const frontmatter: Record<string, unknown> = {}
+  const frontmatter = Object.create(null) as Record<string, unknown>
 
   for (const e of fm?.entries ?? []) {
     if (!e.key) {
@@ -197,6 +209,9 @@ export const parseNoteFile = (raw: string, path: string): ParsedNote => {
   // slugify it, but an externally-authored `slug: My Custom Slug` is normalised
   // here so the resolve key and the URL tail stay the same clean slug.
   const fmSlug = typeof frontmatter.slug === 'string' ? slugify(frontmatter.slug) : ''
+  const entries = fm?.entries ?? []
+  let fields: string | undefined
+
   return {
     title,
     noteType:
@@ -210,7 +225,11 @@ export const parseNoteFile = (raw: string, path: string): ParsedNote => {
     sourceLocator: isImportNoteSourceLocator(sourceLocator) ? sourceLocator : null,
     createdAt: fmDate(frontmatter.created) ?? fmDate(frontmatter[CREATED_FALLBACK_FRONTMATTER_KEY]),
     frontmatter,
-    frontmatterEntries: fm?.entries ?? [],
+    frontmatterEntries: entries,
+    get fields(): string {
+      fields ??= buildNoteFieldsBlob(entries)
+      return fields
+    },
     body: stripTitleHeading(afterFm.replace(/^\r?\n/, ''), title),
   }
 }
@@ -234,9 +253,7 @@ export type SerializeInput = {
    *  summary alone (preserved as a passthrough entry), a string sets it. */
   summary?: string
   /** The agent-memory `muted` opt-out flag (#165): undefined leaves any existing
-   *  `muted:` alone (passthrough), true writes `muted: true`, false drops it.
-   *  Re-read via the generic frontmatter map as the STRING 'true' (valueOf doesn't
-   *  coerce) — the read-side normalises ('true'|true), see core memory.ts. */
+   *  `muted:` alone (passthrough), a boolean sets or clears it. */
   muted?: boolean
   /** The identity materialization channel (P7/#51). */
   id?: string
@@ -254,6 +271,8 @@ export type SerializeInput = {
    *  into typed channels and the `notarium-id` claim, so this never smuggles in an
    *  identity. */
   frontmatter?: readonly FrontmatterEntry[]
+  fields?: FieldPatch
+  fieldsUnquoted?: string[]
   /** Full-state restore: incoming entries replace the authored set rather than
    * merge under the live file. System title/id are still materialized below. */
   frontmatterMode?: 'replace'
@@ -589,11 +608,14 @@ export const serializeNoteFile = ({
   sourceLocator,
   createdAt,
   frontmatter,
+  fields,
+  fieldsUnquoted,
   frontmatterMode,
   body,
   existingRaw,
 }: SerializeInput): string => {
   const replacing = frontmatterMode === 'replace'
+  assertFieldPatchWritable(fields, undefined, { frontmatterMode })
   const existingBlock =
     !replacing && existingRaw != null ? parseFrontmatterBlock(existingRaw) : null
   const source: NoteFileSource | null =
@@ -634,7 +656,7 @@ export const serializeNoteFile = ({
     frontmatterHasYamlNodeReferences(inline?.entries) ||
     (!replacing && existingRaw != null && frontmatterHasYamlNodeReferences(existingEntries))
   ) {
-    throw new Error(YAML_NODE_REFERENCE_WRITE_ERROR)
+    throw yamlNodeReferenceWriteError()
   }
   const entries = existingEntries
   const incomingCreated = frontmatter && frontmatterEntryOf(frontmatter, 'created')
@@ -749,14 +771,30 @@ export const serializeNoteFile = ({
     cleanBody = body.slice(inline.bodyStart).replace(/^\r?\n/, '')
   }
 
-  put(frontmatterScalarEntry('title', title))
-  if (noteType !== undefined) {
-    if (noteType && noteType !== DEFAULT_NOTE_TYPE) {
-      put(frontmatterScalarEntry('type', noteType))
+  for (const emission of fieldPatchEmissions(fields ?? {}, fieldsUnquoted)) {
+    if (emission.entry) {
+      put(emission.entry)
     } else {
-      drop('type')
+      drop(emission.key)
     }
   }
+
+  // Three of the typed channels below have no metadata field of their own and reach
+  // the index only through the key they write here, so what they write is decided
+  // once, in core, and the write path's optimistic mirror asks the same function.
+  const emit = (emission: TypedFrontmatterEmission | undefined): void => {
+    if (!emission) {
+      return
+    }
+    if (emission.entry) {
+      put(emission.entry)
+    } else {
+      drop(emission.key)
+    }
+  }
+
+  put(frontmatterScalarEntry('title', title))
+  emit(noteTypeFrontmatter(noteType))
   if (tags !== undefined) {
     if (tags.length) {
       put(frontmatterListEntry('tags', tags))
@@ -783,24 +821,8 @@ export const serializeNoteFile = ({
       drop('slug')
     }
   }
-  // undefined = leave any existing summary as a passthrough entry; a string
-  // sets/overwrites it (an empty string drops it — an explicit clear).
-  if (summary !== undefined) {
-    if (summary) {
-      put(frontmatterScalarEntry('summary', summary))
-    } else {
-      drop('summary')
-    }
-  }
-  // The human-set memory opt-out (#165): undefined leaves it as a passthrough,
-  // true writes `muted: true`, false clears it (an explicit un-mute).
-  if (muted !== undefined) {
-    if (muted) {
-      put(frontmatterScalarEntry('muted', 'true'))
-    } else {
-      drop('muted')
-    }
-  }
+  emit(summaryFrontmatter(summary))
+  emit(mutedFrontmatter(muted))
   if (id) {
     put(frontmatterScalarEntry(NOTE_ID_FRONTMATTER_KEY, id))
   }

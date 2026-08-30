@@ -1,22 +1,57 @@
-import { type CSSProperties, type ImgHTMLAttributes } from 'react'
+import { type CSSProperties, type ImgHTMLAttributes, useMemo } from 'react'
 import { CardLink } from '../../core/CardLink'
-import { TagChips } from '../../core/Chips'
+import { Chip, TagChips } from '../../core/Chips'
 import { Skeleton, SkeletonText } from '../../core/Skeleton'
 import { cx } from '../../libs/cx/cx'
 import { absoluteDate } from '../../libs/datetime'
+import { cardFieldValues, type PresentedCardField } from '../../libs/fields'
 import type { NoteView } from '../../libs/wire'
 import { FEED_COLS, type FeedCols, type FeedState } from '../FeedProvider'
+import { useFieldSchema } from '../FieldSchemaProvider'
 import { LINES } from './consts'
 import { useCardPreview } from './hooks/useCardPreview'
 import styles from './FeedView.module.scss'
 
 // The date pill (neutral grey). Rendered as a bare sibling so a card/row can
-// order it itself — date first in the grid (chips sit bottom-left), date last in
-// the list (meta pinned to the right edge). The Feed keeps the `feedDate` class
+// order it itself. The Feed keeps the `feedDate` class
 // for its contextual overrides (the timeline gutter restyles it). Tag pills come
 // from the shared <TagChips> (the dense-grid `display:none` rides `feedTag`).
 const DateChip = ({ date }: { date: string }) =>
-  date ? <span className={styles.feedDate}>{date}</span> : null
+  date ? (
+    <span className={styles.feedDate} data-testid="feed-date-chip">
+      {date}
+    </span>
+  ) : null
+
+const useCardFields = (note: NoteView): PresentedCardField[] => {
+  const schema = useFieldSchema()
+
+  return useMemo(() => cardFieldValues(note.fields, schema.fields), [note.fields, schema.fields])
+}
+
+const TypeChip = ({ noteType }: { noteType?: string }) =>
+  noteType ? (
+    <Chip variant="accent" className={styles.feedTag} title="Type" testId="feed-type-chip">
+      {noteType}
+    </Chip>
+  ) : null
+
+const FieldChips = ({ fields }: { fields: readonly PresentedCardField[] }) => (
+  <>
+    {fields.map((field) => (
+      <Chip
+        key={field.key}
+        className={styles.feedTag}
+        color={field.color}
+        title={`${field.fieldLabel}: ${field.label}`}
+        ariaLabel={`${field.fieldLabel}: ${field.label}`}
+        testId="feed-field-chip"
+      >
+        {field.label}
+      </Chip>
+    ))}
+  </>
+)
 
 const thumbProps = (src: string): ImgHTMLAttributes<HTMLImageElement> => ({
   src,
@@ -44,7 +79,9 @@ export const FeedCard = ({
   lines: number
 }) => {
   const { ref, meta, loading, href, tags } = useCardPreview(note)
+  const fields = useCardFields(note)
   const date = absoluteDate(dateValue)
+  const tagBudget = Math.max(0, 4 - fields.length - (note.noteType ? 1 : 0))
   return (
     <CardLink
       ref={ref}
@@ -67,13 +104,15 @@ export const FeedCard = ({
           meta?.snippet && <span className={styles.feedSnippet}>{meta.snippet}</span>
         )}
       </span>
-      {(date || tags.length > 0 || loading) && (
+      {(fields.length > 0 || date || note.noteType || tags.length > 0 || loading) && (
         <span className={styles.feedChips}>
           <DateChip date={date} />
+          <TypeChip noteType={note.noteType} />
+          <FieldChips fields={fields} />
           {loading ? (
             <Skeleton className="feed-chip-skeleton" />
           ) : (
-            <TagChips tags={tags} max={4} itemClassName={styles.feedTag} />
+            <TagChips tags={tags} max={tagBudget} itemClassName={styles.feedTag} />
           )}
         </span>
       )}
@@ -106,7 +145,9 @@ export const FeedTimelineRow = ({
   withRule: boolean
 }) => {
   const { ref, meta, loading, href, tags } = useCardPreview(note)
+  const fields = useCardFields(note)
   const date = absoluteDate(dateValue)
+  const tagBudget = Math.max(0, 4 - fields.length - (note.noteType ? 1 : 0))
   return (
     <CardLink
       ref={ref}
@@ -124,10 +165,12 @@ export const FeedTimelineRow = ({
         <div className={styles.feedTlHead}>
           <span className={styles.feedTlTitle}>{note.title}</span>
           <span className={styles.feedTlTags}>
+            <TypeChip noteType={note.noteType} />
+            <FieldChips fields={fields} />
             {loading ? (
               <Skeleton className="feed-chip-skeleton" />
             ) : (
-              <TagChips tags={tags} max={4} itemClassName={styles.feedTag} />
+              <TagChips tags={tags} max={tagBudget} itemClassName={styles.feedTag} />
             )}
           </span>
         </div>

@@ -365,6 +365,11 @@ a list** — a drop lands BETWEEN rows, producing a new order. That lives in its
 - Each list owns **its own** `useReorder` instance, so a nested list (a set's items inside the
   pin list) never reacts to the outer list's drag — the outer instance's `active` ref is null
   while the inner one is active.
+- The same `ReorderHandle` carries the keyboard path. `DisclosureCard` gives its grip a real focus
+  target; `ArrowUp` / `ArrowDown` move the row by one place and stop propagation. The stop is a
+  correctness rule, not polish: a focused grip inside a context set must move only that member,
+  never the containing set in the outer pin list. Pointer DnD remains alongside this path and
+  keeps the responsive-drop rules above.
 - Order = **load priority** (#210): the new sequence is persisted as a per-scope overlay
   (`context_order` facet) and the server curates the budget trim in that order — so the pult's
   order IS the agent's load order. Pins and sets share one rank space (a set can outrank a pin).

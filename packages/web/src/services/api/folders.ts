@@ -44,6 +44,7 @@ export const foldersApi = {
         content: input.content,
         noteType: input.noteType,
         tags: input.tags,
+        fields: input.fields,
         slug: input.slug,
         createdAt: input.createdAt,
       }),

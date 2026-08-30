@@ -9,26 +9,32 @@
   border-radius: var(--radius-sm);
 }
 
+.notice.colored {
+  color: var(--notice-fg);
+  background: var(--notice-surface);
+  border-color: var(--notice-border);
+}
+
 .error {
-  color: var(--danger);
-  background: color-mix(in srgb, var(--danger) 10%, transparent);
-  border-color: color-mix(in srgb, var(--danger) 22%, transparent);
+  color: var(--danger-fg);
+  background: var(--danger-surface);
+  border-color: var(--danger-border);
 }
 
 .warning {
-  color: var(--warning);
-  background: color-mix(in srgb, var(--warning) 12%, transparent);
-  border-color: color-mix(in srgb, var(--warning) 26%, transparent);
+  color: var(--warning-fg);
+  background: var(--warning-surface);
+  border-color: var(--warning-border);
 }
 
 .success {
-  color: var(--ok);
-  background: color-mix(in srgb, var(--ok) 12%, transparent);
-  border-color: color-mix(in srgb, var(--ok) 26%, transparent);
+  color: var(--ok-fg);
+  background: var(--ok-surface);
+  border-color: var(--ok-border);
 }
 
 .info {
-  color: var(--accent);
-  background: var(--accent-soft);
-  border-color: color-mix(in srgb, var(--accent) 22%, transparent);
+  color: var(--info-fg);
+  background: var(--info-surface);
+  border-color: var(--info-border);
 }

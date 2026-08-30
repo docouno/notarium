@@ -26,6 +26,11 @@ export type CaseDate = string
 export type SpaceDecl = {
   slug: string
   displayName?: string
+  /** One durable `.notarium/fields/schema.yaml` declaration set. It is not a
+   * note event: both appliers route it through the field-schema service. */
+  fieldSchema?: FieldSchemaDecl
+  /** Exact schema.yaml for catalogized future/form/structural read modes. */
+  fieldSchemaRaw?: string
   /** Past human-facing slugs that still resolve to this space. Applied to both
    *  the fake registry and the real meta-DB/marker so alias-boundary cases are
    *  reproducible rather than hand-edited after every seed. */
@@ -38,6 +43,21 @@ export type SpaceDecl = {
    *  seeding, so it appears in the Trash (Spaces tab) with its data intact. (The fake
    *  projection seeds it live — space-archive is a real-stand concern.) */
   archived?: boolean
+}
+
+export type FieldSchemaDecl = {
+  version: 1
+  fields: Array<{
+    key: string
+    type: 'text' | 'number' | 'date' | 'checkbox' | 'list' | 'enum'
+    label?: string
+    card?: boolean
+    values?: Array<{
+      key: string
+      label?: string
+      color?: 'slate' | 'red' | 'orange' | 'amber' | 'green' | 'teal' | 'blue' | 'violet'
+    }>
+  }>
 }
 
 /** A marked-folder project (#13). `path: ''` is a root project owning the whole

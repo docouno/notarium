@@ -53,6 +53,11 @@ export type WriteHost = {
   /** Publish ordinary note freshness independently from graph freshness. A write
    * whose graph inputs and derived edges are unchanged must still refresh Feed/
    * Activity, but must not schedule a corpus-wide layout pass. */
-  emitChanged: (upserts: string[], removed: string[], graphChanged?: boolean) => void
+  emitChanged: (
+    upserts: string[],
+    removed: string[],
+    graphChanged?: boolean,
+    linkIdentitiesChanged?: boolean,
+  ) => void
   isBulkActive: () => boolean
 }

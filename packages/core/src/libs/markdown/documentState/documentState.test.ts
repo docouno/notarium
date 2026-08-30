@@ -27,6 +27,18 @@ const payloadOf = (document: string): string =>
   document.slice(document.indexOf('\n') + 1, document.lastIndexOf('\n---\n') + 1)
 
 describe('document state', () => {
+  it('projects __proto__ as own frontmatter data on a null-prototype map', () => {
+    const state = analyzeDocumentState({
+      source: bytes('---\n__proto__:\n- attacker\nnormal: value\n---\nbody'),
+      pathFallbackTitle: 'note',
+    })
+    const projection = state.projection!.frontmatter
+
+    expect(Object.getPrototypeOf(projection)).toBeNull()
+    expect(Object.getOwnPropertyNames(projection)).toEqual(['__proto__', 'normal'])
+    expect(projection.__proto__).toEqual(['attacker'])
+  })
+
   it('observes an exact owner only from unambiguous source bytes', () => {
     expect(exactOwnerObservation(bytes('body'))).toEqual({ kind: 'absent' })
     expect(exactOwnerObservation(bytes('---\nnotarium-id: note-id\n---\nbody'))).toEqual({

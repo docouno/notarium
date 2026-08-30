@@ -1,6 +1,40 @@
 import { z } from 'zod'
-import { SpaceSlugSchema } from '../primitives'
+import { FieldPatchSchema, FieldValueSchema, SpaceSlugSchema } from '../primitives'
 import { ProjectHandleSchema } from './primitives'
+
+const CONTROL_TAG_KEY =
+  /<\/?(?:system|systemprompt|instructions?|assistant|developer|human|user|tool_call|tool_result|tool_use|function_calls?|function_results?|antml)\b[^>]*>/i
+
+/** Shared by the MCP input contract and output sanitizer so a pseudo-control key
+ * is refused before nested validation can reflect it back to an agent. */
+export const isUnsafeMcpFieldKey = (key: string): boolean => CONTROL_TAG_KEY.test(key)
+
+export const McpFieldPatchSchema = z.unknown().transform((value, ctx) => {
+  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    if (Object.getOwnPropertyNames(value).some(isUnsafeMcpFieldKey)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'field key is not available through the agent interface',
+      })
+      return z.NEVER
+    }
+  }
+  const parsed = FieldPatchSchema.safeParse(value)
+
+  if (!parsed.success) {
+    for (const issue of parsed.error.issues) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: issue.message, path: issue.path })
+    }
+
+    return z.NEVER
+  }
+
+  return parsed.data
+})
+
+/** JSON-schema publication twin. Runtime validation stays on McpFieldPatchSchema;
+ * this shape only tells clients the exact open record grammar. */
+export const McpFieldPatchPublishedSchema = z.record(z.string(), FieldValueSchema)
 
 /** The THREE-state location an agent reads on a hit/change — a single `project?`
  *  can't tell a free note in a work space from a personal-domain one, so all three

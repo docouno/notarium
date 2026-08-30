@@ -216,6 +216,13 @@ export type NoteRow = {
    *  note has no custom slug (the implicit slug(title) default is not stored). */
   slug: string | null
   body: string
+  /** The author's own frontmatter as the serialized fields blob — the note's whole
+   *  metadata surface beyond the typed columns above. OPTIONAL because the column is
+   *  the newest ladder rung: a store pinned to a shorter ladder has no such column, so
+   *  `SELECT *` hands back a row without the member (never NULL — the column is NOT
+   *  NULL wherever it exists). The optionality is load-bearing: it is what makes
+   *  `JSON.parse(row.fields)` a compile error instead of a throw on exactly those rows. */
+  fields?: string
   /** sha-256 over the chunker OUTPUT (per-chunk text joined by NUL) at last index —
    *  the vector-invalidation arbiter (#81/P13); changes iff the embed input changes
    *  (a whitespace-only edit the chunker trims does NOT churn it). Null on a row never

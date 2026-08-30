@@ -3,7 +3,66 @@ import type { AuthoredAttachment, OwnedAbilityLocator } from '@notarium/contract
 import { ABILITY_AVAILABILITY_MODE } from '@notarium/contract/enums'
 import { asciiSlug, DEFAULT_NOTE_TYPE, isSkillName } from '@notarium/core'
 import { deriveNoteTitle } from '@notarium/core/markdown'
-import type { SaveInput } from '../../libs/wire'
+import type { NoteDetailView, SaveInput } from '../../libs/wire'
+
+type EditableFields = Record<string, string | string[]>
+
+const cloneFields = (source: EditableFields | undefined): EditableFields => {
+  const copy = Object.create(null) as EditableFields
+
+  for (const key of Object.getOwnPropertyNames(source ?? {})) {
+    copy[key] = source![key]
+  }
+
+  return copy
+}
+
+export const changedFields = (
+  before: EditableFields | undefined,
+  after: EditableFields,
+): NonNullable<SaveInput['fields']> => {
+  const patch = Object.create(null) as NonNullable<SaveInput['fields']>
+  const keys = new Set([
+    ...Object.getOwnPropertyNames(before ?? {}),
+    ...Object.getOwnPropertyNames(after),
+  ])
+
+  for (const key of keys) {
+    const had = Object.hasOwn(before ?? {}, key)
+    const has = Object.hasOwn(after, key)
+
+    if (!has && had) {
+      patch[key] = null
+    } else if (has && (!had || JSON.stringify(before![key]) !== JSON.stringify(after[key]))) {
+      patch[key] = after[key]
+    }
+  }
+
+  return patch
+}
+
+export const fieldsWithPending = (
+  fields: EditableFields,
+  pendingFields: Record<string, string>,
+): EditableFields => {
+  const effective = cloneFields(fields)
+
+  for (const key of Object.getOwnPropertyNames(pendingFields)) {
+    const pending = pendingFields[key]
+
+    if (!pending) {
+      continue
+    }
+    const current = effective[key]
+    effective[key] = Array.isArray(current)
+      ? [...current, pending]
+      : current === undefined
+        ? [pending]
+        : [current, pending]
+  }
+
+  return effective
+}
 
 // The metadata aside edits the creation date (#186) as a CALENDAR DAY (`<input
 // type="date">` → `YYYY-MM-DD`), but the note stores a full ISO-8601 instant — the
@@ -86,6 +145,16 @@ export type Draft = {
   content: string
   tags: string[]
   noteType: string
+  /** Public frontmatter projection retained for protected/open-world rows in the
+   * metadata editor. */
+  frontmatter?: Record<string, unknown>
+  /** Structural detail used for order and unreadable/truncated states. */
+  fieldDetails?: NoteDetailView['fields']
+  /** Editable projected values as they stood when the draft opened. */
+  fieldValues?: EditableFields
+  /** True for a normal/new Markdown draft; false for an opaque detail whose
+   * authored field shape cannot be proven. */
+  fieldsStructured?: boolean
   /** The ability's short manifest description, the one field the aside edits. */
   abilityDescription?: string
   attachments?: AuthoredAttachment[]
@@ -116,7 +185,7 @@ export const abilityMachineName = (title: string, fallback: string): string => {
 
 // Shared editing state for a note draft. The edit UI is split across regions — the
 // topbar actions, the main column (the document) and the right aside (folder/slug/
-// type/tags) — so the live form state is lifted here and handed to each region
+// type/tags/authored fields) — so the live form state is lifted here and handed to each region
 // instead of living inside one editor component. Since #156 the title is no longer a
 // field: it's the document's leading `# H1`, so `derivedTitle` below is computed FROM
 // the body (the same rule the server applies on save) and drives the save-gate and
@@ -126,6 +195,10 @@ export function useNoteDraft(initialDraft: Draft | null) {
   const [directory, setDirectory] = useState(initialDraft?.directory || '')
   const [tags, setTags] = useState<string[]>(initialDraft?.tags || [])
   const [noteType, setNoteType] = useState(initialDraft?.noteType || DEFAULT_NOTE_TYPE)
+  const [fields, setFields] = useState<EditableFields>(() => cloneFields(initialDraft?.fieldValues))
+  const [pendingFields, setPendingFields] = useState<Record<string, string>>(() =>
+    Object.create(null),
+  )
   const [abilityDescription, setAbilityDescription] = useState(
     initialDraft?.abilityDescription || '',
   )
@@ -181,6 +254,8 @@ export function useNoteDraft(initialDraft: Draft | null) {
     setDirectory(initialDraft?.directory || '')
     setTags(initialDraft?.tags || [])
     setNoteType(initialDraft?.noteType || DEFAULT_NOTE_TYPE)
+    setFields(cloneFields(initialDraft?.fieldValues))
+    setPendingFields(Object.create(null))
     setAbilityDescription(initialDraft?.abilityDescription || '')
     setAttachments(initialDraft?.attachments ?? [])
     setAbilityHome(initialDraft?.abilityHome ?? 'personal')
@@ -218,6 +293,9 @@ export function useNoteDraft(initialDraft: Draft | null) {
   // changed (the body now carries the title, so a title edit flips contentDirty).
   // Tags compared via JSON so order matters and tag values containing spaces or
   // commas can't collide (a plain join could read ["a b"] and ["a","b"] as equal).
+  const effectiveFields = fieldsWithPending(fields, pendingFields)
+  const fieldsPatch = changedFields(initialDraft?.fieldValues, effectiveFields)
+  const authoredFieldsDirty = Object.getOwnPropertyNames(fieldsPatch).length > 0
   const fieldsDirty =
     slug !== (initialDraft?.slug || '') ||
     directory !== (initialDraft?.directory || '') ||
@@ -231,7 +309,8 @@ export function useNoteDraft(initialDraft: Draft | null) {
         initialDraft?.abilityProjects ?? [],
       ) ||
     createdDate !== createdSeed ||
-    JSON.stringify(tags) !== JSON.stringify(initialDraft?.tags || [])
+    JSON.stringify(tags) !== JSON.stringify(initialDraft?.tags || []) ||
+    authoredFieldsDirty
   const dirty = !!initialDraft && (fieldsDirty || contentDirty)
 
   // Saveable once the document yields a title; for an *existing* note we also
@@ -288,6 +367,7 @@ export function useNoteDraft(initialDraft: Draft | null) {
       directory: directory.trim(),
       noteType: noteType.trim() || DEFAULT_NOTE_TYPE,
       tags,
+      ...(authoredFieldsDirty ? { fields: fieldsPatch } : {}),
       content: readContent(),
       // Authored creation date (#186): sent ONLY when the user moved it off the seed
       // AND a day is set — so a normal save never restamps `created`, and clearing the
@@ -308,6 +388,36 @@ export function useNoteDraft(initialDraft: Draft | null) {
     setTags,
     noteType,
     setNoteType,
+    fields,
+    setField: (key: string, value: string | string[] | null) =>
+      setFields((current) => {
+        const next = cloneFields(current)
+
+        if (value === null) {
+          delete next[key]
+        } else {
+          next[key] = value
+        }
+
+        return next
+      }),
+    setPendingField: (key: string, value: string) =>
+      setPendingFields((current) => {
+        const next = Object.assign(Object.create(null) as Record<string, string>, current)
+
+        if (value) {
+          next[key] = value
+        } else {
+          delete next[key]
+        }
+
+        return next
+      }),
+    fieldDetails: initialDraft?.fieldDetails,
+    frontmatter: initialDraft?.frontmatter ?? {},
+    fieldsStructured:
+      initialDraft?.fieldsStructured ??
+      Boolean(initialDraft?.isNew && initialDraft.documentKind !== 'ability'),
     abilityDescription,
     setAbilityDescription,
     attachments,

@@ -2,8 +2,10 @@
    and the rendered `.markdown` body are global — see styles/shared.scss and
    markdown.scss. */
 .doc-meta { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; }
-.pill {
-  font-size: 11.5px; font-weight: 500;
-  background: var(--accent-soft); color: var(--accent);
-  padding: 2px 9px; border-radius: var(--radius-sm); text-transform: lowercase;
+.date {
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+  color: var(--text-dim);
+  font-size: 11.5px;
 }

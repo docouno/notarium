@@ -39,6 +39,10 @@ export const FeedView = ({ feed, onOpen }: { feed: FeedState; onOpen: (id: strin
     setGroup,
     selected,
     tags,
+    fieldFilters,
+    fieldDayFilters,
+    fieldAnyFilters,
+    fieldBadFilters,
     resetFolders,
     q,
     clearFilters,
@@ -51,9 +55,16 @@ export const FeedView = ({ feed, onOpen }: { feed: FeedState; onOpen: (id: strin
     error,
     loaded,
   } = feed
-  // A filter is active when any Feed filter axis narrows the window (#109/#190/#201),
+  // A filter is active when any Feed filter axis narrows the window (#109/#190/#201/#384),
   // so a dead-end can offer one escape even when the aside is collapsed.
-  const filtered = selected.size > 0 || tags.length > 0 || Boolean(q || dateFrom || dateTo)
+  const filtered =
+    selected.size > 0 ||
+    tags.length > 0 ||
+    fieldFilters.length > 0 ||
+    fieldDayFilters.length > 0 ||
+    fieldAnyFilters.length > 0 ||
+    fieldBadFilters.length > 0 ||
+    Boolean(q || dateFrom || dateTo)
   const dateOf = (n: NoteView): string | null =>
     sort === NOTE_SORT.created ? n.createdAt : n.modifiedAt
 

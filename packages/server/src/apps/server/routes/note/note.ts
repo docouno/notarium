@@ -19,6 +19,8 @@ import {
   RestoreRequestSchema,
   RestoreResponseSchema,
   SaveResponseSchema,
+  SetNoteFieldsRequestSchema,
+  SetNoteFieldsResponseSchema,
   UpdateNoteRequestSchema,
 } from '@notarium/contract'
 import { HTTP_STATUS } from '@notarium/contract/http'
@@ -29,8 +31,11 @@ import {
   FOLDER_PAGE_BASENAME,
   folderPageFilePath,
   isFolderPageNote,
+  normalizeNoteType,
   normalizeWikilinkTarget,
+  normTags,
   type Preview,
+  promoteBodyTitle,
   revisionNotFound,
   revisionsUnavailable,
   STORE_ERROR_REASON,
@@ -39,9 +44,10 @@ import {
 import { redactsKeyId, withAuthors } from '../../../../libs/authors'
 import { safeRelAddress } from '../../../../libs/relPath'
 import { can } from '../../../../services/authz'
+import { prepareFieldWrite } from '../../../../services/fields'
 import { lastSegment } from '../../../../services/projects'
 import { RoleDependencyConflictError } from '../../../../services/roles'
-import { setNoteMuted, setNotePinned } from '../../../../services/spaces'
+import { setNoteFields, setNoteMuted, setNotePinned } from '../../../../services/spaces'
 import { type ApiRouteCtx, authz, missing, notFound, s } from '../_shared'
 import {
   moveToDomain,
@@ -62,6 +68,7 @@ export const noteRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
     auth,
     principalId,
     restoreCoordinator,
+    fieldSchemaStore,
     abilities,
   } = ctx
 
@@ -273,6 +280,42 @@ export const noteRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
       { ...parsed, directory, originalId: live.id ?? parsed.originalId },
       principalId(req),
     )
+    const hasFields = Object.getOwnPropertyNames(parsed.fields ?? {}).length > 0
+    const fieldsUnquoted = hasFields
+      ? await prepareFieldWrite(fieldSchemaStore, hit.space, parsed.fields!)
+      : undefined
+    const promoted = promoteBodyTitle(domain.content ?? '', domain.title)
+    const sameTags =
+      domain.tags === undefined ||
+      JSON.stringify(normTags(domain.tags) ?? []) ===
+        JSON.stringify(normTags(live.frontmatter.tags) ?? [])
+    const sameType =
+      domain.noteType === undefined ||
+      normalizeNoteType(domain.noteType) ===
+        normalizeNoteType(
+          typeof live.frontmatter.type === 'string' ? live.frontmatter.type : 'note',
+        )
+    const sameCreated =
+      domain.createdAt === undefined || new Date(domain.createdAt).toISOString() === live.createdAt
+    const sameDirectory =
+      domain.directory === undefined ||
+      (live.filePath !== undefined && domain.directory === directoryOf(live.filePath))
+    const sameSlug =
+      domain.slug === undefined || (domain.slug || undefined) === (live.slug || undefined)
+    const derivedContentUnchanged =
+      hasFields &&
+      promoted.title === live.title &&
+      promoted.body === live.content &&
+      sameTags &&
+      sameType &&
+      sameCreated &&
+      sameDirectory &&
+      sameSlug
+    const preparedDomain = {
+      ...domain,
+      ...(fieldsUnquoted ? { fieldsUnquoted } : {}),
+      ...(derivedContentUnchanged ? { derivedContentUnchanged: true as const } : {}),
+    }
 
     if (skillRoot && abilities) {
       try {
@@ -283,7 +326,7 @@ export const noteRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
         }
         const saved = await abilities.writeDocument(req.principal, {
           target,
-          input: domain,
+          input: preparedDomain,
           description: parsed.description,
           ...(parsed.abilityLocator && parsed.attachments
             ? { locator: parsed.abilityLocator, attachments: parsed.attachments }
@@ -307,7 +350,7 @@ export const noteRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
       }
     }
     const r = await hit.store.write({
-      ...domain,
+      ...preparedDomain,
       // A folder page's identity is the reserved basename `index.md`, not its title —
       // preserve it on edit so saving the body doesn't demote it to a child note.
       ...(live.filePath && isFolderPageNote(live.filePath)
@@ -321,6 +364,33 @@ export const noteRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
       filePath: r.filePath,
       versionToken: r.versionToken,
     })
+  })
+
+  // Point patch over authored frontmatter. The schema only decides byte shape;
+  // undeclared keys remain writable (open world).
+  app.put('/api/note/fields', { config: authz('note:write', 'note') }, async (req, reply) => {
+    const body = SetNoteFieldsRequestSchema.safeParse(req.body)
+
+    if (!body.success) {
+      return reply
+        .code(HTTP_STATUS.BAD_REQUEST)
+        .send({ error: body.error.issues[0]?.message || 'bad request' })
+    }
+    const hit = await noteStore(req.principal, body.data.id, 'note:write')
+
+    if (!hit) {
+      return notFound(reply)
+    }
+    const result = await setNoteFields({
+      store: hit.store,
+      fieldSchemaStore,
+      space: hit.space,
+      id: body.data.id,
+      versionToken: body.data.versionToken,
+      fields: body.data.fields,
+      principal: principalId(req),
+    })
+    return SetNoteFieldsResponseSchema.parse({ ok: true, versionToken: result.versionToken })
   })
 
   // ── init-context curation write channels ─────────────────────────────

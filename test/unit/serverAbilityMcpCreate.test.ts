@@ -382,4 +382,67 @@ describe('production MCP ability create — real FS + SQLite', () => {
       raw.close()
     }
   })
+
+  it('prepares declared field byte shape before the ability document save door', async () => {
+    const { cookie, setup, token } = await setupToken()
+    const created = await call(token, 'create_ability', {
+      kind: 'skill',
+      name: 'field-byte-shape',
+      description: 'Ability field write proof.',
+      instructions: '# Field byte shape\n\nBefore.',
+      placement: { home: 'personal' },
+      idempotencyKey: 'field-byte-shape-one',
+    })
+    expect(created.result?.isError).not.toBe(true)
+    const operationDb = new DatabaseSync(join(root, 'meta.db'), { readOnly: true })
+    let operation: { note_id: string; target_path: string }
+
+    try {
+      operation = operationDb
+        .prepare(
+          `SELECT note_id, target_path FROM ability_create_operations WHERE phase = 'succeeded'`,
+        )
+        .get() as { note_id: string; target_path: string }
+    } finally {
+      operationDb.close()
+    }
+    const personal = setup.json().personalSpace as string
+    const schema = await app!.inject({
+      method: 'GET',
+      url: `/api/s/${personal}/fields/schema`,
+      headers: { cookie },
+    })
+    const schemaSaved = await app!.inject({
+      method: 'PUT',
+      url: `/api/s/${personal}/fields/schema`,
+      headers: { cookie },
+      payload: {
+        version: 1,
+        fields: [{ key: 'priority', type: 'number' }],
+        versionToken: schema.json().versionToken,
+      },
+    })
+    expect(schemaSaved.statusCode, schemaSaved.body).toBe(200)
+    const before = await app!.inject({
+      method: 'GET',
+      url: `/api/note?id=${operation.note_id}`,
+      headers: { cookie },
+    })
+    const saved = await app!.inject({
+      method: 'POST',
+      url: '/api/note',
+      headers: { cookie },
+      payload: {
+        content: '# Field byte shape\n\nAfter.',
+        originalId: operation.note_id,
+        versionToken: before.json().versionToken,
+        fields: { priority: '3' },
+      },
+    })
+
+    expect(saved.statusCode, saved.body).toBe(200)
+    await expect(
+      readFile(join(root, 'spaces', setup.json().personalSpace, operation.target_path), 'utf8'),
+    ).resolves.toMatch(/\npriority: 3\n/u)
+  }, 15_000)
 })

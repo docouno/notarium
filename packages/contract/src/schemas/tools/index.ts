@@ -1,6 +1,11 @@
 export * from './bootstrap'
 export * from './abilities'
-export { AgentSessionIdSchema } from './_fields'
+export {
+  AgentSessionIdSchema,
+  isUnsafeMcpFieldKey,
+  McpFieldPatchPublishedSchema,
+  McpFieldPatchSchema,
+} from './_fields'
 export * from './discover'
 export * from './primitives'
 export * from './read'

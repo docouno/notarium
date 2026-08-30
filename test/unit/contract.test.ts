@@ -17,10 +17,13 @@ import {
   contract,
   CreateAbilityVersionRequestSchema,
   CreateAgentRoleRequestSchema,
+  CreateFolderPageRequestSchema,
   CreateNoteRequestSchema,
   DurablePathSchema,
   DurableScalarSchema,
   ErrorResponseSchema,
+  FieldDeclarationSchema,
+  FieldsResponseSchema,
   GraphNodeSchema,
   GraphResponseSchema,
   JobSchema,
@@ -39,6 +42,7 @@ import {
   NoteRevisionsQuerySchema,
   NotesQuerySchema,
   NotesResponseSchema,
+  parseFieldFilter,
   PatchProjectRequestSchema,
   PatchSpaceRequestSchema,
   PinNoteRequestSchema,
@@ -62,6 +66,8 @@ import {
   SetAgentAbilityAvailabilityResponseSchema,
   SetAgentAbilityEnabledRequestSchema,
   SetAgentAbilityEnabledResponseSchema,
+  SetNoteFieldsRequestSchema,
+  SetNoteFieldsResponseSchema,
   SpaceSlugSchema,
   SpacesResponseSchema,
   TrashQuerySchema,
@@ -79,6 +85,29 @@ import { RecallInputSchema, RoleSelectorSchema } from '@notarium/contract/tools'
 // spaces in paths, root notes, ghost links, notes without createdAt) and by
 // rejecting malformed payloads. The fake backend (#18.2) and any future host
 // must satisfy exactly these.
+
+describe('field declaration contract', () => {
+  it('separates an enum option stable key from its editable label', () => {
+    expect(
+      FieldDeclarationSchema.parse({
+        key: 'status',
+        type: 'enum',
+        values: [{ key: 'in-progress', label: 'In progress', color: 'amber' }],
+      }),
+    ).toEqual({
+      key: 'status',
+      type: 'enum',
+      values: [{ key: 'in-progress', label: 'In progress', color: 'amber' }],
+    })
+    expect(
+      FieldDeclarationSchema.safeParse({
+        key: 'status',
+        type: 'enum',
+        values: [{ value: 'In progress', color: 'amber' }],
+      }).success,
+    ).toBe(false)
+  })
+})
 
 describe('GET /api/me/agent-sessions/:id query', () => {
   it('allows a query fragment across all retrieval tools and keeps tool as an optional narrowing', () => {
@@ -450,6 +479,135 @@ describe('previews (#64)', () => {
     expect(NotesQuerySchema.safeParse({ preview: '1' }).success).toBe(true)
     expect(NotesQuerySchema.safeParse({ preview: 'yes' }).success).toBe(false)
   })
+  it('parses one field grammar into OR-within-key and AND-between-keys', () => {
+    const parsed = NotesQuerySchema.parse({
+      field: ['note.status:wip', 'note.status:done', 'note.url:https://example.com'],
+      fieldDay: 'note.due:2026-09-01',
+      fieldAny: 'note.owner',
+      fieldBad: 'note.shape',
+    })
+
+    expect(parseFieldFilter(parsed)).toEqual({
+      op: 'and',
+      nodes: [
+        {
+          op: 'or',
+          ns: 'note',
+          key: 'status',
+          values: [
+            { kind: 'eq', value: 'wip' },
+            { kind: 'eq', value: 'done' },
+          ],
+        },
+        {
+          op: 'or',
+          ns: 'note',
+          key: 'url',
+          values: [{ kind: 'eq', value: 'https://example.com' }],
+        },
+        {
+          op: 'or',
+          ns: 'note',
+          key: 'due',
+          values: [{ kind: 'day', value: '2026-09-01' }],
+        },
+        { op: 'or', ns: 'note', key: 'owner', values: [{ kind: 'present' }] },
+        { op: 'or', ns: 'note', key: 'shape', values: [{ kind: 'unreadable' }] },
+      ],
+    })
+  })
+  it('validates the fieldDay calendar grammar before building the typed predicate', () => {
+    expect(NotesQuerySchema.safeParse({ fieldDay: 'note.due:2026-02-29' }).success).toBe(false)
+    expect(NotesQuerySchema.safeParse({ fieldDay: 'note.due:2026-09-01' }).success).toBe(true)
+    expect(parseFieldFilter(NotesQuerySchema.parse({ fieldDay: 'note.due:2026-09-01' }))).toEqual({
+      op: 'and',
+      nodes: [
+        {
+          op: 'or',
+          ns: 'note',
+          key: 'due',
+          values: [{ kind: 'day', value: '2026-09-01' }],
+        },
+      ],
+    })
+  })
+  it('deduplicates repeated field conditions before the matcher sees them', () => {
+    const parsed = NotesQuerySchema.parse({
+      field: ['note.status:wip', 'note.status:wip'],
+      fieldAny: ['note.status', 'note.status'],
+      fieldBad: ['note.status', 'note.status'],
+    })
+
+    expect(parseFieldFilter(parsed)?.nodes).toEqual([
+      {
+        op: 'or',
+        ns: 'note',
+        key: 'status',
+        values: [{ kind: 'eq', value: 'wip' }, { kind: 'present' }, { kind: 'unreadable' }],
+      },
+    ])
+  })
+  it.each([
+    ['status:wip', 'namespace'],
+    ['file.name:x', 'reserved'],
+    ['other.name:x', 'only "note"'],
+    ['note.status', '<namespace>.<key>:<value>'],
+    ['note.:x', 'must not be empty'],
+    ['note.tags:work', 'tags query axis'],
+    ['note.created:2026-08-21', 'date query axis'],
+    ['note.notarium-source:external', 'import provenance'],
+    ['note.notarium-id:x', 'storage-owned'],
+    ['note.title:Hello', 'projected onto note metadata'],
+  ])('rejects field equality %s with an actionable reason', (field, reason) => {
+    const result = NotesQuerySchema.safeParse({ field })
+
+    expect(result.success).toBe(false)
+    expect(result.success ? '' : result.error.issues[0].message).toContain(reason)
+  })
+  it('keeps operator-shaped RHS values literal and lets presence address a colon-shaped key', () => {
+    expect(NotesQuerySchema.safeParse({ field: 'note.k:*' }).success).toBe(true)
+    const parsed = NotesQuerySchema.parse({
+      field: ['note.estimate:>3', 'note.period:[2026-01-01..2026-02-01]'],
+    })
+
+    expect(parseFieldFilter(parsed)?.nodes).toEqual([
+      {
+        op: 'or',
+        ns: 'note',
+        key: 'estimate',
+        values: [{ kind: 'eq', value: '>3' }],
+      },
+      {
+        op: 'or',
+        ns: 'note',
+        key: 'period',
+        values: [{ kind: 'eq', value: '[2026-01-01..2026-02-01]' }],
+      },
+    ])
+    expect(NotesQuerySchema.safeParse({ fieldAny: 'note.https://example' }).success).toBe(true)
+  })
+  it('fails loudly when parseFieldFilter is called without schema validation', () => {
+    expect(() => parseFieldFilter({ field: ['garbage'] })).toThrow(/namespace/)
+  })
+  it('accepts the two-level field facet response', () => {
+    expect(
+      FieldsResponseSchema.safeParse({
+        fields: [
+          {
+            key: 'status',
+            declared: true,
+            notes: 2,
+            values: [
+              { value: 'wip', count: 2 },
+              { value: 'done', count: 0 },
+            ],
+            total: 2,
+          },
+        ],
+        total: 1,
+      }).success,
+    ).toBe(true)
+  })
   it('accepts date range filter days and rejects invalid calendar days (#201)', () => {
     expect(
       NotesQuerySchema.safeParse({
@@ -639,6 +797,77 @@ describe('GET /api/note', () => {
       NoteDetailResponseSchema.safeParse({ id: 'fake-a', content: '# hi', frontmatter: {} })
         .success,
     ).toBe(false)
+  })
+
+  it('keeps structured authored fields for the reading-mode inspector', () => {
+    const detail = NoteDetailResponseSchema.parse({
+      id: 'fake-a',
+      content: '# hi',
+      frontmatter: { status: 'Doing' },
+      versionToken: 'v1:abc',
+      fields: {
+        keys: { status: 'Doing' },
+        unreadable: ['broken'],
+        truncated: ['large'],
+        truncatedMore: 2,
+        order: ['status', 'broken', 'large'],
+      },
+    })
+
+    expect((detail as Record<string, unknown>).fields).toEqual({
+      keys: { status: 'Doing' },
+      unreadable: ['broken'],
+      truncated: ['large'],
+      truncatedMore: 2,
+      order: ['status', 'broken', 'large'],
+    })
+  })
+})
+
+describe('GET /api/s/:space/notes card fields', () => {
+  it('keeps only the compact key/value map on a list row', () => {
+    const page = NotesResponseSchema.parse({
+      notes: [
+        {
+          id: 'fake-a',
+          title: 'A',
+          filePath: 'a.md',
+          modifiedAt: '2026-08-22T00:00:00.000Z',
+          createdAt: '2026-08-22T00:00:00.000Z',
+          noteType: 'task',
+          fields: { status: 'Doing', reviewers: ['ann', 'bo'] },
+        },
+      ],
+      total: 1,
+    })
+
+    expect((page.notes[0] as Record<string, unknown>).fields).toEqual({
+      status: 'Doing',
+      reviewers: ['ann', 'bo'],
+    })
+    expect((page.notes[0] as Record<string, unknown>).noteType).toBe('task')
+  })
+})
+
+describe('ordinary note Save fields', () => {
+  it('keeps the field patch on both create and update requests', () => {
+    const fields = { status: 'Doing', reviewers: ['ann'], removed: null }
+    const created = CreateNoteRequestSchema.parse({ content: '# A', fields })
+    const updated = UpdateNoteRequestSchema.parse({
+      content: '# A',
+      originalId: 'note-a',
+      versionToken: 'v1:a',
+      fields,
+    })
+    const folderPage = CreateFolderPageRequestSchema.parse({
+      folderPath: 'docs',
+      content: '# Docs',
+      fields,
+    })
+
+    expect((created as Record<string, unknown>).fields).toEqual(fields)
+    expect((updated as Record<string, unknown>).fields).toEqual(fields)
+    expect((folderPage as Record<string, unknown>).fields).toEqual(fields)
   })
 })
 
@@ -942,6 +1171,8 @@ describe('agent context constructor (#165)', () => {
     expect(contract.pinNote.request).toBe(PinNoteRequestSchema)
     expect(contract.pinNote.response).toBe(PinNoteResponseSchema)
     expect(contract.muteNote.request).toBe(MuteNoteRequestSchema)
+    expect(contract.setNoteFields.request).toBe(SetNoteFieldsRequestSchema)
+    expect(contract.setNoteFields.response).toBe(SetNoteFieldsResponseSchema)
     expect(contract.muteNote.response).toBe(MuteNoteResponseSchema)
   })
 

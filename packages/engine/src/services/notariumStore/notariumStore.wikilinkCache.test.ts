@@ -96,6 +96,40 @@ describe('NotariumStore exact-generation wikilink cache', () => {
     }
   })
 
+  it('carries warm labels across a field-only source change without reparsing the body', async () => {
+    const dir = await root()
+    const store = createNotariumStore({ notesDir: dir, integritySweepBatchSize: 0 })
+
+    try {
+      await store.write({ title: 'Target', content: 'body' })
+      const source = await store.write({ title: 'Source', content: 'See [[Target]]' })
+      await store.graph()
+      const before = store.wikilinkParseCacheStats()
+      const current = await store.read(source.filePath!)
+
+      await store.write({
+        originalId: source.filePath,
+        title: 'Source',
+        content: current.content,
+        versionToken: current.versionToken,
+        fields: { status: 'done' },
+      })
+
+      expect(store.wikilinkParseCacheStats()).toMatchObject({
+        parserCalls: before.parserCalls,
+        bodyReads: before.bodyReads,
+      })
+      expect((await store.graph()).links).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ source: source.filePath, target: 'target.md' }),
+        ]),
+      )
+      expect(store.wikilinkParseCacheStats().parserCalls).toBe(before.parserCalls)
+    } finally {
+      await store.stop()
+    }
+  })
+
   it('keeps a durable write successful when cache-only fingerprint verification fails', async () => {
     const dir = await root()
     const base = createNodeSqliteDriver(':memory:')

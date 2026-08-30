@@ -21,6 +21,7 @@ import {
 import { EditingProvider } from './composers/EditingProvider'
 import { FavoritesProvider } from './composers/FavoritesProvider'
 import { FeedProvider } from './composers/FeedProvider'
+import { FieldSchemaProvider } from './composers/FieldSchemaProvider'
 import { HotkeysProvider } from './composers/HotkeysProvider'
 import { ImportDropZone } from './composers/ImportDropZone'
 import { NotesProvider } from './composers/NotesProvider'
@@ -31,6 +32,7 @@ import { SpaceProvider, useSpace } from './composers/SpaceProvider'
 import { SpotlightProvider } from './composers/SpotlightProvider'
 import { SyncProvider } from './composers/SyncProvider'
 import { ErrorBoundary } from './core/ErrorBoundary'
+import { SemanticPalettePlate } from './core/SemanticPalettePlate'
 import { DocumentLayout } from './layouts/DocumentLayout'
 import { useAutoHideScrollbars } from './libs/hooks/useAutoHideScrollbars'
 import {
@@ -66,6 +68,7 @@ import {
 import { TrashPage } from './pages/TrashPage'
 import {
   ExportTab,
+  FieldsTab,
   GeneralTab,
   ImportTab,
   MembersTab,
@@ -129,38 +132,40 @@ const AppShell = () => {
             <SyncProvider>
               <NotesProvider>
                 <FavoritesProvider>
-                  {/* The Spotlight quick-switcher (#31) — the ⌘/Ctrl+P jump-to-note,
-                      also the rail Search icon and the `/` hotkey since the rail
-                      Search VIEW was removed in favour of the topbar search (#190). */}
-                  <SpotlightProvider>
-                    <EditingProvider>
-                      {/* HotkeysProvider (#30): the single keyboard dispatcher. Sits
-                          here so its handlers can reach every provider above (chrome
-                          toggles, editing draft, spotlight, navigation); it owns the
-                          global listeners, the cheat sheet and the customisation. */}
-                      <HotkeysProvider>
-                        <FeedProvider>
-                          <AgentsExplorerProvider>
-                            <div className="app">
-                              <Sidebar />
-                              {/* A page crash is caught HERE (#65), so the sidebar/chrome
-                                survive while the content area shows a state screen;
-                                navigating away (resetKey) clears it. The outermost
-                                boundary in main.tsx is the last resort for the rest. */}
-                              <ErrorBoundary resetKey={location.pathname}>
-                                <Outlet />
-                              </ErrorBoundary>
-                              {/* Drag a text file anywhere in the window → import it as a
-                                note into the folder under the cursor / current scope
-                                (#223). A portal overlay; rides `Files` drags only, so it
-                                never collides with the tree's move-DnD. */}
-                              <ImportDropZone />
-                            </div>
-                          </AgentsExplorerProvider>
-                        </FeedProvider>
-                      </HotkeysProvider>
-                    </EditingProvider>
-                  </SpotlightProvider>
+                  <FieldSchemaProvider>
+                    {/* The Spotlight quick-switcher (#31) — the ⌘/Ctrl+P jump-to-note,
+                        also the rail Search icon and the `/` hotkey since the rail
+                        Search VIEW was removed in favour of the topbar search (#190). */}
+                    <SpotlightProvider>
+                      <EditingProvider>
+                        {/* HotkeysProvider (#30): the single keyboard dispatcher. Sits
+                            here so its handlers can reach every provider above (chrome
+                            toggles, editing draft, spotlight, navigation); it owns the
+                            global listeners, the cheat sheet and the customisation. */}
+                        <HotkeysProvider>
+                          <FeedProvider>
+                            <AgentsExplorerProvider>
+                              <div className="app">
+                                <Sidebar />
+                                {/* A page crash is caught HERE (#65), so the sidebar/chrome
+                                  survive while the content area shows a state screen;
+                                  navigating away (resetKey) clears it. The outermost
+                                  boundary in main.tsx is the last resort for the rest. */}
+                                <ErrorBoundary resetKey={location.pathname}>
+                                  <Outlet />
+                                </ErrorBoundary>
+                                {/* Drag a text file anywhere in the window → import it as a
+                                  note into the folder under the cursor / current scope
+                                  (#223). A portal overlay; rides `Files` drags only, so it
+                                  never collides with the tree's move-DnD. */}
+                                <ImportDropZone />
+                              </div>
+                            </AgentsExplorerProvider>
+                          </FeedProvider>
+                        </HotkeysProvider>
+                      </EditingProvider>
+                    </SpotlightProvider>
+                  </FieldSchemaProvider>
                 </FavoritesProvider>
               </NotesProvider>
             </SyncProvider>
@@ -172,6 +177,10 @@ const AppShell = () => {
 }
 
 const router = createBrowserRouter([
+  {
+    path: '__test/semantic-palette',
+    element: window.__NOTARIUM_TEST__ ? <SemanticPalettePlate /> : <NotFoundPage />,
+  },
   {
     element: <AppShell />,
     children: [
@@ -389,6 +398,7 @@ const router = createBrowserRouter([
           { path: 'general', element: <GeneralTab /> },
           { path: 'members', element: <MembersTab /> },
           { path: 'projects', element: <ProjectsTab /> },
+          { path: 'fields', element: <FieldsTab /> },
           { path: 'import', element: <ImportTab /> },
           { path: 'export', element: <ExportTab /> },
         ],

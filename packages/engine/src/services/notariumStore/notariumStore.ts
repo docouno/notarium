@@ -50,6 +50,7 @@ import type {
 import {
   aggregateGraphHealth,
   analyzeDocumentState,
+  assertFieldPatchWritable,
   basenameOf,
   bindStorageOwnerProof,
   boundNameToBytes,
@@ -106,6 +107,7 @@ import {
   noteFilePath,
   noteNotFound,
   parseFrontmatterBlock,
+  parseNoteFields,
   parseWikilinks,
   registerLinkIdentity,
   resolveLink,
@@ -162,16 +164,39 @@ import type {
 } from './types'
 import { WikilinkLabelCache, type WikilinkLabelCacheStats } from './wikilinkLabelCache'
 
-/** The meta columns `metaOf()` projects — everything the read-model's snapshot needs
- *  EXCEPT the note `body`. The whole read/reconcile path (space-open seed, list(),
- *  every poll) runs synchronous `node:sqlite` on the shared loop, so it must SELECT
- *  exactly these, never `SELECT *` (#222): `metaOf` never touches `body`, so pulling
- *  the body column for a metadata projection materializes the entire corpus's bodies
- *  for nothing — O(corpus bytes) of loop-blocking work that stalls every other space.
+/** The NARROW meta projection: what `metaOf()` reads that every full-corpus pass has
+ *  to pay for, and nothing else. The whole read/reconcile path (space-open seed,
+ *  list(), every poll) runs synchronous `node:sqlite` on the shared loop, so none of
+ *  it may run `SELECT *` (#222): `metaOf` never touches `body`, so pulling the body
+ *  column for a metadata projection materializes the entire corpus's bodies for
+ *  nothing — O(corpus bytes) of loop-blocking work that stalls every other space.
  *  Bodies are fetched only where genuinely used: the delta's changed upserts and the
- *  graph's wikilink derivation. */
+ *  graph's wikilink derivation.
+ *
+ *  Since #384 that ban is served by TWO lists, and this is NOT the one the read-model
+ *  reads: `list()` and the boot seed of `changes()` take `metaColsWithFields`, and
+ *  the delta poll appends the same blob under its `CASE WHEN seq > ?` guard. What
+ *  still takes this list is the pair of full-corpus passes that decode no FIELDS
+ *  column — `graph()` and the link-index scan in `resolveRow`. Not "no authored
+ *  metadata": both go through `metaOf`, which parses `aliases` and `tags` for every
+ *  row and always did. What they are spared is the per-row JSON decode #384 added,
+ *  which is the only decode either of them would pay for nothing. So a column the
+ *  read-model needs belongs in the OTHER list, and putting it here is how #222 comes
+ *  back; which read takes which list, and what the per-row decode costs those two, is
+ *  stated once, in the canon below.
+ *  canon: docs/search.md#how-it-is-indexed-write-path */
 const NOTE_META_COLS =
-  'path, title, class, created_at, modified_at, id_claim, source_locator, aliases, slug, tags'
+  'path, title, class, created_at, modified_at, note_type, id_claim, source_locator, aliases, slug, tags'
+/** The empty string a delta poll parks in `fields` for a row it did not re-send.
+ *  Distinct from the column's default, which is a valid blob meaning "no author
+ *  keys" — conflating the two would resurrect a value cleared outside.
+ *
+ *  Both ends take it from here: `metaOf` reads it, and the poll's `CASE` spells it out
+ *  of this constant instead of writing a second `''` by hand. A sentinel named on the
+ *  reading side and spelled literally on the parking side is exactly the split
+ *  `docs/architecture.md:177` asks a named constant to prevent — the parked value would
+ *  have been the one thing about the sentinel that no name covered. */
+const FIELDS_NOT_SELECTED = ''
 type NoteMetaRow = Pick<
   NoteRow,
   | 'path'
@@ -179,12 +204,13 @@ type NoteMetaRow = Pick<
   | 'class'
   | 'created_at'
   | 'modified_at'
+  | 'note_type'
   | 'id_claim'
   | 'source_locator'
   | 'aliases'
   | 'slug'
   | 'tags'
->
+> & { fields?: string }
 type ReconcileRow = Pick<NoteRow, 'path' | 'class' | 'mtime_ms' | 'size' | 'seq'> & {
   rowid: number
   change_token: string | null
@@ -735,6 +761,18 @@ export class NotariumStore implements KnowledgeStore {
   private readonly integritySweepBatchSize: number
   private readonly forcedReadPaths = new Set<string>()
   private fingerprintsReady = false
+  /** Whether the fields column has been stepped onto this index yet. Sibling of the
+   *  flag above and read for the same reason: a store pinned to a truncated ladder
+   *  (the migration tests) must still write, select and reconcile rows. */
+  private fieldsReady = false
+  /** Rescan work since boot, for the migration gate and the numbers a re-derivation is
+   *  reported with: files whose bytes the scan actually read, and rows the scan
+   *  actually re-derived. A forced re-derivation publishes no delta on the boot pass,
+   *  so counting is the only honest measure of what it cost. Both are stamped by
+   *  `doRescan` alone: `reconcileScannedFile` also serves the identity-materialization
+   *  path, whose work is not rescan work, and counting it there lets `rowsRederived`
+   *  exceed `filesRead` — a state no scan can produce. */
+  private readonly rescanCounters = { filesRead: 0, rowsRederived: 0 }
   private readonly wikilinkParseCacheEnabled: boolean
   private readonly wikilinkLabels = new WikilinkLabelCache()
 
@@ -1101,6 +1139,9 @@ export class NotariumStore implements KnowledgeStore {
         `PRAGMA table_info(file_fingerprints)`,
       )
       this.fingerprintsReady = fingerprintColumns.some((column) => column.name === 'note_seq')
+      const noteColumns = await this.sql.all<{ name: string }>(`PRAGMA table_info(notes)`)
+
+      this.fieldsReady = noteColumns.some((column) => column.name === 'fields')
       // The vector half (#81), only with an embedder: builds note_vectors, wipes
       // a stale partition (model/chunker drift OR a notes rebuild), and may degrade
       // to FTS if vec0 turns out absent. Done before rescan so upsertRow can enqueue
@@ -1828,8 +1869,11 @@ export class NotariumStore implements KnowledgeStore {
 
   /** A pre-fingerprint row can adopt the current raw hash without publishing a
    *  fake external edit when every index-visible projection already matches.
-   *  Frontmatter unknown to the index does not block adoption: direct reads
-   *  already serve it from disk, while no derived surface is stale. */
+   *  Every index-visible projection includes the authored frontmatter blob, so a
+   *  row whose fields column predates the current derivation is NOT adopted — that
+   *  is what turns the ladder's fingerprint wipe into an actual re-derivation. Once
+   *  that step is active, the same pass also completes every canonical source claim;
+   *  otherwise locator adoption would depend on an unrelated custom field. */
   private materializedRowMatches(
     row: NoteRow,
     cls: NoteClass,
@@ -1847,6 +1891,8 @@ export class NotariumStore implements KnowledgeStore {
       row.aliases === JSON.stringify(parsed.aliases) &&
       row.slug === parsed.slug &&
       row.body === parsed.body &&
+      (!this.fieldsReady || row.fields === parsed.fields) &&
+      (!this.fieldsReady || row.source_locator === (parsed.sourceLocator ?? null)) &&
       (parsed.createdAt == null || row.created_at === parsed.createdAt)
     )
   }
@@ -1880,14 +1926,17 @@ export class NotariumStore implements KnowledgeStore {
   /** Content verification after a stat/watcher/sweep candidate was selected.
    *  A matching raw hash only refreshes the cheap token. A legacy row with no
    *  fingerprint adopts the hash if its materialized projection already matches;
-   *  every semantic mismatch goes through the normal upsert/delta path. */
+   *  every semantic mismatch goes through the normal upsert/delta path.
+   *  @returns whether the row was re-derived (an upsert published), for the caller to
+   *  attribute to ITS pass — this seam serves both the rescan and the write path's
+   *  identity materialization, and only the caller knows which work it just did. */
   private async reconcileScannedFile(
     row: ReconcileRow | undefined,
     fullPath: string,
     cls: NoteClass,
     stat: FileStat,
     raw: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const sourceHash = await sha256Hex(raw)
     const metadataChanged =
       !row || row.class !== cls || row.mtime_ms !== stat.mtimeMs || row.size !== stat.size
@@ -1897,11 +1946,11 @@ export class NotariumStore implements KnowledgeStore {
 
       if (indexedSourceHash === sourceHash) {
         await this.recordFingerprint(row.rowid, row.seq, sourceHash, stat.changeToken)
-        return
+        return false
       }
       if (indexedSourceHash != null) {
         await this.upsertRow(fullPath, cls, stat, raw, sourceHash)
-        return
+        return true
       }
       const materialized = await this.sql.get<NoteRow>(`SELECT * FROM notes WHERE rowid = ?`, [
         row.rowid,
@@ -1909,11 +1958,11 @@ export class NotariumStore implements KnowledgeStore {
 
       if (materialized && this.materializedRowMatches(materialized, cls, fullPath, raw)) {
         await this.recordFingerprint(row.rowid, row.seq, sourceHash, stat.changeToken)
-        return
+        return false
       }
     }
-
     await this.upsertRow(fullPath, cls, stat, raw, sourceHash)
+    return true
   }
 
   /** One-shot heal for notes written before the name formula had an id rung (#296):
@@ -2103,8 +2152,11 @@ export class NotariumStore implements KnowledgeStore {
         if (raw == null) {
           continue
         } // vanished between scan and read — next poll converges
+        this.rescanCounters.filesRead++
         try {
-          await this.reconcileScannedFile(row, fullPath, mount.class, entry, raw)
+          if (await this.reconcileScannedFile(row, fullPath, mount.class, entry, raw)) {
+            this.rescanCounters.rowsRederived++
+          }
         } catch (err) {
           // An oversized metadata block belongs to this one file. Keep scanning
           // healthy siblings and retry the bad path on a later rescan; unrelated
@@ -2156,8 +2208,28 @@ export class NotariumStore implements KnowledgeStore {
     raw: string,
     knownSourceHash?: string,
   ): Promise<void> {
-    this.invalidateGraphCache() // any row change can shift the wikilink graph (#81 Stage 4b)
     const parsed = parseNoteFile(raw, fullPath)
+    const existing = await this.sql.get<
+      Pick<
+        NoteRow,
+        | 'seq'
+        | 'title'
+        | 'class'
+        | 'note_type'
+        | 'id_claim'
+        | 'source_locator'
+        | 'tags'
+        | 'aliases'
+        | 'slug'
+        | 'body'
+        | 'content_hash'
+      > & { rowid: number }
+    >(
+      `SELECT rowid, seq, title, class, note_type, id_claim, source_locator,
+              tags, aliases, slug, body, content_hash
+         FROM notes WHERE path = ?`,
+      [fullPath],
+    )
     // `modified` is always the file's real mtime; `created:` frontmatter (an
     // import, #11) overrides birthtime so a note keeps the date it happened.
     const modifiedAt = isoOrNull(stat.mtimeMs)
@@ -2165,47 +2237,96 @@ export class NotariumStore implements KnowledgeStore {
     const tags = JSON.stringify(parsed.tags)
     const aliases = JSON.stringify(parsed.aliases)
     const slug = parsed.slug // #100 phase 1: NULL when no custom `slug:` in frontmatter
+    const noteType = parsed.noteType ?? DEFAULT_NOTE_TYPE
     // content_hash is computed for EVERY upsert (cheap), not just when an embedder
     // is wired in: it must be present so that adding an embedder on a later boot
     // can backfill vectors for files that didn't change (#81/P13 invalidation
     // arbiter; mtime/size are the cheap pre-filter the rescan already applies).
-    const contentHash = await this.embedContentHash(parsed.title, parsed.body)
+    const vectorInputsUnchanged = Boolean(
+      existing && existing.title === parsed.title && existing.body === parsed.body,
+    )
+    const contentHash =
+      vectorInputsUnchanged && existing?.content_hash
+        ? existing.content_hash
+        : await this.embedContentHash(parsed.title, parsed.body)
     const sourceHash = knownSourceHash ?? (await sha256Hex(raw))
+    const graphInputsUnchanged = Boolean(
+      existing &&
+      existing.title === parsed.title &&
+      existing.class === cls &&
+      existing.id_claim === parsed.idClaim &&
+      existing.aliases === aliases &&
+      existing.slug === slug &&
+      existing.body === parsed.body,
+    )
+    const metadataOnly = Boolean(graphInputsUnchanged && existing?.tags === tags)
+    const vectorChanged = !existing || existing.content_hash !== contentHash
+    const priorLabels =
+      existing && existing.body === parsed.body && this.wikilinkParseCacheEnabled
+        ? await this.sourceFingerprint(existing.rowid, existing.seq).then((fingerprint) =>
+            fingerprint ? this.wikilinkLabels.get(existing.rowid, fingerprint) : undefined,
+          )
+        : undefined
+
+    if (!graphInputsUnchanged) {
+      this.invalidateGraphCache()
+    }
     // created_at on UPDATE rides COALESCE(claim, existing): a `created:` frontmatter
     // claim (import #11 / an authored date edit #186) REFRESHES the index so the new
     // date is visible at once; a note with NO claim keeps its first-seen value (NULL
     // param → existing), so a birthtime flap on a re-stat never moves an un-dated
     // note's Feed position. The INSERT branch seeds created_at for a brand-new row.
+    const fieldsSet = this.fieldsReady ? 'fields = ?, ' : ''
+    const fieldsValue = this.fieldsReady ? [parsed.fields] : []
     const published = await this.publishWithSeq(async (seq) => {
-      const updated = await this.sql.run(
-        `UPDATE notes SET title = ?, class = ?, mtime_ms = ?, size = ?, modified_at = ?,
+      const updated = metadataOnly
+        ? await this.sql.run(
+            `UPDATE notes SET mtime_ms = ?, size = ?, modified_at = ?, note_type = ?,
+                              created_at = COALESCE(?, created_at), source_locator = ?,
+                              ${fieldsSet}seq = ?
+             WHERE path = ?`,
+            [
+              stat.mtimeMs,
+              stat.size,
+              modifiedAt,
+              noteType,
+              parsed.createdAt,
+              parsed.sourceLocator,
+              ...fieldsValue,
+              seq,
+              fullPath,
+            ],
+          )
+        : await this.sql.run(
+            `UPDATE notes SET title = ?, class = ?, mtime_ms = ?, size = ?, modified_at = ?,
                           note_type = ?, created_at = COALESCE(?, created_at),
-                          id_claim = ?, source_locator = ?, tags = ?, aliases = ?, slug = ?, body = ?, content_hash = ?, seq = ?
+                          id_claim = ?, source_locator = ?, tags = ?, aliases = ?, slug = ?, body = ?, ${fieldsSet}content_hash = ?, seq = ?
          WHERE path = ?`,
-        [
-          parsed.title,
-          cls,
-          stat.mtimeMs,
-          stat.size,
-          modifiedAt,
-          parsed.noteType ?? DEFAULT_NOTE_TYPE,
-          parsed.createdAt,
-          parsed.idClaim,
-          parsed.sourceLocator,
-          tags,
-          aliases,
-          slug,
-          parsed.body,
-          contentHash,
-          seq,
-          fullPath,
-        ],
-      )
+            [
+              parsed.title,
+              cls,
+              stat.mtimeMs,
+              stat.size,
+              modifiedAt,
+              noteType,
+              parsed.createdAt,
+              parsed.idClaim,
+              parsed.sourceLocator,
+              tags,
+              aliases,
+              slug,
+              parsed.body,
+              ...fieldsValue,
+              contentHash,
+              seq,
+              fullPath,
+            ],
+          )
 
       if (updated.changes === 0) {
         await this.sql.run(
-          `INSERT INTO notes (path, title, class, mtime_ms, size, created_at, modified_at, note_type, id_claim, source_locator, tags, aliases, slug, body, content_hash, seq)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO notes (path, title, class, mtime_ms, size, created_at, modified_at, note_type, id_claim, source_locator, tags, aliases, slug, body, ${this.fieldsReady ? 'fields, ' : ''}content_hash, seq)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ${this.fieldsReady ? '?, ' : ''}?, ?)`,
           [
             fullPath,
             parsed.title,
@@ -2214,13 +2335,14 @@ export class NotariumStore implements KnowledgeStore {
             stat.size,
             createdAt,
             modifiedAt,
-            parsed.noteType ?? DEFAULT_NOTE_TYPE,
+            noteType,
             parsed.idClaim,
             parsed.sourceLocator,
             tags,
             aliases,
             slug,
             parsed.body,
+            ...fieldsValue,
             contentHash,
             seq,
           ],
@@ -2253,13 +2375,17 @@ export class NotariumStore implements KnowledgeStore {
               // A path-only move keeps rowid + raw bytes. Its existing exact entry is
               // already valid, so do not re-run the markdown parser merely because
               // the resolver metadata/path changed.
-              let labels = this.wikilinkLabels.get(published.rowid, sourceHash)
+              let labels = priorLabels ?? this.wikilinkLabels.get(published.rowid, sourceHash)
 
-              if (!labels) {
+              if (!labels && !vectorInputsUnchanged) {
                 this.wikilinkLabels.observeParserCall()
                 labels = parseWikilinks(parsed.body)
               }
-              this.wikilinkLabels.publish(publication, sourceHash, labels)
+              if (labels) {
+                this.wikilinkLabels.publish(publication, sourceHash, labels)
+              } else {
+                this.wikilinkLabels.discardPublication(publication)
+              }
               labelPublication = undefined
             } else {
               // Hidden class transitions and missing/invalid fingerprints must never
@@ -2282,7 +2408,7 @@ export class NotariumStore implements KnowledgeStore {
           this.wikilinkLabels.cancelPublication(labelPublication)
         }
       }
-      if (this.vecReady) {
+      if (this.vecReady && vectorChanged) {
         this.enqueueEmbed(BigInt(published.rowid))
       }
     }
@@ -2500,6 +2626,8 @@ export class NotariumStore implements KnowledgeStore {
     try {
       const parsed = row.context_json ? (JSON.parse(row.context_json) as unknown) : null
 
+      const skillDirectoryName = (parsed as { skillDirectoryName?: unknown }).skillDirectoryName
+
       if (
         parsed &&
         typeof parsed === 'object' &&
@@ -2507,7 +2635,10 @@ export class NotariumStore implements KnowledgeStore {
           (parsed as { role?: DocumentRole }).role as DocumentRole,
         ) &&
         ((parsed as { pathFallbackTitle?: unknown }).pathFallbackTitle === null ||
-          typeof (parsed as { pathFallbackTitle?: unknown }).pathFallbackTitle === 'string')
+          typeof (parsed as { pathFallbackTitle?: unknown }).pathFallbackTitle === 'string') &&
+        (skillDirectoryName === undefined ||
+          skillDirectoryName === null ||
+          typeof skillDirectoryName === 'string')
       ) {
         document = parsed as NonNullable<PublishedResourceEvidence['document']>
       }
@@ -2702,16 +2833,26 @@ export class NotariumStore implements KnowledgeStore {
     return this.sql.get<NoteRow>(`SELECT * FROM notes WHERE path = ?`, [resolved.targetId])
   }
 
+  /** `fields` is OPTIONAL and its absence is not its emptiness: a caller may omit the
+   *  column (the graph/resolve selects, the adjacency rebuild's literal row) or park
+   *  the poll sentinel in it, and either must leave the snapshot's previous value to
+   *  carry forward. A decoded `{"keys":{}}` is the opposite — the note's last author
+   *  key was removed, and the snapshot must drop it now, not at the next restart. */
   private metaOf(
-    row: Pick<NoteRow, 'path' | 'title' | 'class' | 'modified_at' | 'created_at'> & {
+    row: Pick<NoteRow, 'path' | 'title' | 'class' | 'modified_at' | 'created_at' | 'note_type'> & {
       source_locator?: string | null
       aliases?: string
       slug?: string | null
       tags?: string
+      fields?: string
     },
   ): NoteMeta {
     const aliases = parseJsonArray(row.aliases)
     const tags = parseJsonArray(row.tags) // #109: the tag axis on the snapshot (column already SELECTed)
+    const fields =
+      row.fields == null || row.fields === FIELDS_NOT_SELECTED
+        ? undefined
+        : parseNoteFields(row.fields)
     return {
       title: row.title,
       class: row.class,
@@ -2720,9 +2861,33 @@ export class NotariumStore implements KnowledgeStore {
       ...(row.slug ? { slug: row.slug } : {}), // #100 phase 1: custom slug only
       ...(aliases.length ? { aliases } : {}),
       ...(tags.length ? { tags } : {}),
+      noteType: row.note_type || DEFAULT_NOTE_TYPE,
+      ...(fields ? { fields } : {}),
       modifiedAt: row.modified_at,
       createdAt: row.created_at,
     }
+  }
+
+  /** The snapshot projection PLUS the authored-fields column, for the reads whose
+   *  consumer decodes it: `list()` and the boot seed of `changes()`. The delta poll
+   *  carries the same column but spells it itself, because there it rides the
+   *  `CASE WHEN seq > ?` guard rather than the bare column list. `graph()` and the
+   *  resolve fallback deliberately keep the narrow `NOTE_META_COLS` — both walk the
+   *  whole corpus, neither reads fields, and a mandatory JSON decode per row is
+   *  measurable against their loop-block budget. */
+  private get metaColsWithFields(): string {
+    return this.fieldsReady ? `${NOTE_META_COLS}, fields` : NOTE_META_COLS
+  }
+
+  /** Rescan work since boot — see `rescanCounters` for what the two numbers mean and
+   *  which pass is allowed to stamp them.
+   *
+   *  Public with no product caller, and deliberately so: a forced re-derivation
+   *  publishes no delta, so nothing downstream can observe what one cost, and these
+   *  counters are the only honest measure of it. Every consumer is a gate — the
+   *  backfill's integration test and the fields read-path suite. */
+  rescanStats(): { filesRead: number; rowsRederived: number } {
+    return { ...this.rescanCounters }
   }
 
   // ── reads ───────────────────────────────────────────────────────────────────
@@ -2744,7 +2909,7 @@ export class NotariumStore implements KnowledgeStore {
     // O(mount rows), not O(the whole corpus). Scope remains a read-model concern.
     const where = classes ? ` WHERE class IN (${classes.map(() => '?').join(',')})` : ''
     const rows = await this.sql.all<NoteMetaRow>(
-      `SELECT ${NOTE_META_COLS} FROM notes${where} ORDER BY path`,
+      `SELECT ${this.metaColsWithFields} FROM notes${where} ORDER BY path`,
       classes,
     )
     return rows.map((r) => this.metaOf(r))
@@ -3696,6 +3861,7 @@ export class NotariumStore implements KnowledgeStore {
             path: r.path,
             title: r.title,
             class: r.class,
+            note_type: r.note_type,
             aliases: r.aliases,
             slug: r.slug,
             modified_at: null,
@@ -3861,6 +4027,8 @@ export class NotariumStore implements KnowledgeStore {
       legacyImportRoot,
       createdAt,
       frontmatter,
+      fields,
+      fieldsUnquoted,
       frontmatterMode,
       preservePath,
       preserveAliases,
@@ -3872,6 +4040,10 @@ export class NotariumStore implements KnowledgeStore {
     opts?: MutationOptions,
   ): Promise<WriteResult> {
     await this.ensureReady()
+    const fieldInputs = Object.getOwnPropertyNames(fields ?? {}).flatMap((key) => {
+      const value = fields?.[key]
+      return value == null ? [] : Array.isArray(value) ? value : [value]
+    })
     const scalarInputs = [
       title,
       directory,
@@ -3880,6 +4052,8 @@ export class NotariumStore implements KnowledgeStore {
       summary,
       fileName,
       createdAt,
+      ...fieldInputs,
+      ...(fieldsUnquoted ?? []),
       sourceLocator,
     ]
     const tagInputs = Array.isArray(tags) ? tags : tags != null ? [tags] : []
@@ -4196,6 +4370,27 @@ export class NotariumStore implements KnowledgeStore {
             )
           )?.proof
         : undefined
+    const currentRole =
+      fields !== undefined &&
+      sourceRow &&
+      mount.class === 'skill' &&
+      isSkillPackageRootPath(sourceRel)
+        ? DOCUMENT_ROLE.skillRoot
+        : DOCUMENT_ROLE.generic
+    const currentDocumentState =
+      fields !== undefined && sourceRow && existingRaw != null
+        ? analyzeDocumentState({
+            source: new TextEncoder().encode(existingRaw),
+            role: currentRole,
+            ownerProof: priorOwnerProof,
+            pathFallbackTitle: basenameOf(sourceRow.path).replace(/\.md$/i, ''),
+            ...(currentRole === DOCUMENT_ROLE.skillRoot
+              ? { skillDirectoryName: basenameOf(directoryOf(sourceRow.path)) }
+              : {}),
+          })
+        : undefined
+
+    assertFieldPatchWritable(fields, currentDocumentState, { frontmatterMode })
     // The slug to persist (#100 phase 1, lazy): cleaned + kept only when it diverges
     // from slug(title). undefined = not addressed (slug stays as the file has it),
     // '' = clear back to the implicit default, a value = a custom slug.
@@ -4236,6 +4431,8 @@ export class NotariumStore implements KnowledgeStore {
       sourceLocator,
       createdAt,
       frontmatter,
+      fields,
+      fieldsUnquoted,
       frontmatterMode,
       body: content,
       existingRaw,
@@ -4880,13 +5077,21 @@ export class NotariumStore implements KnowledgeStore {
       // Boot seed: inventory only, no upserts — so never touch the body column.
       if (Number.isNaN(since)) {
         const rows = await this.sql.all<NoteMetaRow>(
-          `SELECT ${NOTE_META_COLS} FROM notes ORDER BY path`,
+          `SELECT ${this.metaColsWithFields} FROM notes ORDER BY path`,
         )
         return { cursor: next, upserts: [], inventory: rows.map((r) => this.metaOf(r)) }
       }
       // Delta poll: ONE atomic snapshot. The CASE keeps the body blob out of the
       // result set for unchanged rows (SQLite decodes `body` only where seq > since),
       // so a big space's poll stops re-reading its whole corpus every interval.
+      // The parked value comes from the constant, not from a second `''` written out
+      // here: `metaOf` reads the sentinel by name, and a poll that spelled it by hand
+      // would be the one end of the pair no name covered. It is spliced rather than
+      // bound because the shape of this statement is itself gated by a test that reads
+      // the SQL text.
+      const fieldsCase = this.fieldsReady
+        ? `, CASE WHEN seq > ? THEN fields ELSE '${FIELDS_NOT_SELECTED}' END AS fields`
+        : ''
       const rows = await this.sql.all<
         NoteMetaRow & { seq: number; body: string; requires_exact_state: number }
       >(
@@ -4895,9 +5100,9 @@ export class NotariumStore implements KnowledgeStore {
                 EXISTS(
                   SELECT 1 FROM document_proofs
                    WHERE document_proofs.note_rowid = notes.rowid
-                ) AS requires_exact_state
+                ) AS requires_exact_state${fieldsCase}
            FROM notes ORDER BY path`,
-        [since],
+        this.fieldsReady ? [since, since] : [since],
       )
       const inventory: NoteMeta[] = []
       const upserts: NoteChange[] = []

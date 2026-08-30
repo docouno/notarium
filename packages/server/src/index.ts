@@ -19,6 +19,7 @@ export {
 export * from './services/auth'
 export * from './services/authz'
 export * from './services/agentSessions'
+export * from './services/fields'
 export * from './services/abilities'
 export * from './services/roles'
 export * from './apps/server/consumers'

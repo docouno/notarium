@@ -221,6 +221,23 @@ describe('HistorySurface restore/purge guards', () => {
     )
   })
 
+  it('keeps deleted-note __proto__ as own frontmatter data', async () => {
+    const state = logicalNoteState({
+      title: 'Proto',
+      body: 'body',
+      frontmatter: parseFrontmatterLines('__proto__: secret'),
+    })
+    const { trash } = makeHost({
+      seeds: { 'n-proto': { title: 'Proto', logicalState: state } },
+    })
+
+    const deleted = await trash.deletedNoteView('n-proto')
+
+    expect(Object.getPrototypeOf(deleted?.frontmatter)).toBeNull()
+    expect(Object.hasOwn(deleted?.frontmatter ?? {}, '__proto__')).toBe(true)
+    expect(deleted?.frontmatter.__proto__).toBe('secret')
+  })
+
   it('restoreTrash restores the good ids and reports per-id failures without aborting the batch', async () => {
     const { trash, calls } = makeHost({
       // 'ok' is restorable; 'bad' has no tombstone → restoreFromTrash throws noteNotInTrash

@@ -4,6 +4,7 @@ import type { HostInfo } from '../../../libs/hostInfo'
 import type { ImportStagingStore } from '../../../libs/importStaging'
 import type { AbilitiesService } from '../../../services/abilities'
 import type { AuthService } from '../../../services/auth'
+import type { FieldSchemaStore } from '../../../services/fields'
 import type {
   AgentSessionAuditPersistence,
   AgentSessionsPersistence,
@@ -40,6 +41,7 @@ export type ApiRoutesOptions = {
   retrievalLog?: RetrievalLogPersistence
   sessionAudit?: AgentSessionAuditPersistence
   markerStore?: MarkerStore
+  fieldSchemaStore?: FieldSchemaStore
   spacesPersistence?: SpacesPersistence
   about?: HostInfo
   /** This build's identity. Absent ⇒ the bundle's own inlined identity, which is

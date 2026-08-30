@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   claudeConversationSourceLocator,
+  DEFAULT_NOTE_TYPE,
   FRONTMATTER_BYTE_CAP,
   frontmatterEntryValue,
   FrontmatterLimitError,
@@ -10,7 +11,9 @@ import {
   IMPORT_SOURCE_FRONTMATTER_KEY,
   markdownFileToNote,
   parseFrontmatterBlock,
+  parseNoteFields,
   promoteBodyTitle,
+  PROTECTED_FIELD_KEYS,
 } from '@notarium/core'
 
 import { assembleNoteFile, parseNoteFile, serializeNoteFile } from './noteFile'
@@ -1035,6 +1038,18 @@ describe('serializeNoteFile — carried frontmatter', () => {
     expect(parseNoteFile(out, 't.md').frontmatter.author).toBe('New')
   })
 
+  it('keeps __proto__ as own frontmatter data without changing the projection prototype', () => {
+    const scalar = parseNoteFile('---\n__proto__: secret\nnormal: value\n---\nbody', 'a.md')
+    const list = parseNoteFile('---\n__proto__:\n- attacker\nnormal: value\n---\nbody', 'b.md')
+
+    expect(Object.getPrototypeOf(scalar.frontmatter)).toBeNull()
+    expect(Object.getOwnPropertyNames(scalar.frontmatter)).toEqual(['__proto__', 'normal'])
+    expect(scalar.frontmatter.__proto__).toBe('secret')
+    expect(Object.getPrototypeOf(list.frontmatter)).toBeNull()
+    expect(Object.getOwnPropertyNames(list.frontmatter)).toEqual(['__proto__', 'normal'])
+    expect(list.frontmatter.__proto__).toEqual(['attacker'])
+  })
+
   it('rejects the final emitted payload when typed fields push it over the metadata cap', () => {
     const existingRaw = `---\npad: ${'a'.repeat(FRONTMATTER_BYTE_CAP - 8)}\n---\n\n# T\n`
 
@@ -1268,5 +1283,173 @@ describe('serializeNoteFile ∘ parseNoteFile — round-trip invariants (propert
       expect([where, reimported.title]).toEqual([where, parsed.title.trim()])
       expect([where, reimported.body.startsWith('# ')]).toEqual([where, false])
     }
+  })
+})
+
+describe('the protected field keys cover every key this serializer owns', () => {
+  it('leaves no typed channel addressable through the field axis', () => {
+    // Drive every typed channel at once and read back the keys the serializer put.
+    // A channel added later without joining the protected list would become writable
+    // through the field channel and silently overwritten by the next typed write.
+    const out = serializeNoteFile({
+      title: 'Owned',
+      noteType: 'task',
+      tags: ['a'],
+      aliases: ['old'],
+      slug: 'owned',
+      summary: 'digest',
+      muted: true,
+      id: 'AbCdefGhij_1',
+      createdAt: '2026-08-20T00:00:00.000Z',
+      body: 'body',
+    })
+    const written = (parseFrontmatterBlock(out)?.entries ?? [])
+      .map((entry) => entry.key)
+      .filter((key): key is string => Boolean(key))
+
+    expect(written.length).toBeGreaterThan(0)
+    for (const key of written) {
+      expect(PROTECTED_FIELD_KEYS as readonly string[]).toContain(key)
+    }
+    // And none of them reaches the index column, so a field predicate can never
+    // answer for a key the note projects onto metadata of its own.
+    expect(parseNoteFields(parseNoteFile(out, 'owned.md').fields).keys).toEqual({
+      type: 'task',
+      summary: 'digest',
+      muted: 'true',
+    })
+  })
+})
+
+describe('serializeNoteFile — point field patch', () => {
+  it('updates an existing key in place, appends new keys and removes only nulls', () => {
+    const before = serializeNoteFile({
+      title: 'Fields',
+      id: 'field-note',
+      frontmatter: parseFrontmatterBlock(
+        '---\nstatus: backlog\nkeep: untouched\nremoved: old\n---\n',
+      )!.entries,
+      body: 'body',
+    })
+    const after = serializeNoteFile({
+      title: 'Fields',
+      id: 'field-note',
+      body: 'body',
+      existingRaw: before,
+      fields: {
+        status: 'doing',
+        removed: null,
+        blank: '',
+        reviewers: ['ann', 'bo'],
+        priority: '3',
+      },
+      fieldsUnquoted: ['priority'],
+    })
+    const changed = before
+      .split('\n')
+      .map((line, index) => [line, after.split('\n')[index]] as const)
+      .filter(([left, right]) => left !== right)
+
+    expect(after).toContain('status: doing\nkeep: untouched')
+    expect(after).not.toContain('removed:')
+    expect(after).toContain('blank: ""')
+    expect(after).toContain('reviewers:\n- ann\n- bo')
+    expect(after).toContain('priority: 3')
+    // Replacing an existing scalar is the narrow painful scenario: one line.
+    const statusOnly = serializeNoteFile({
+      title: 'Fields',
+      id: 'field-note',
+      body: 'body',
+      existingRaw: before,
+      fields: { status: 'doing' },
+    })
+    expect(
+      before.split('\n').filter((line, index) => line !== statusOnly.split('\n')[index]),
+    ).toEqual(['status: backlog'])
+    expect(changed.length).toBeGreaterThan(1)
+  })
+
+  it('normalises a frontmatter-less imported file on its first field write', () => {
+    const imported = 'intro\n\n# Real Title\n\nauthor body'
+    const written = serializeNoteFile({
+      title: 'Real Title',
+      body: imported,
+      existingRaw: imported,
+      fields: { status: 'doing' },
+    })
+
+    expect(written).toMatch(/^---\nstatus: doing\ntitle: Real Title\n---\n\n# Real Title\n/)
+    expect(written.match(/^# Real Title$/gm)).toHaveLength(2)
+    const second = serializeNoteFile({
+      title: 'Real Title',
+      body: parseNoteFile(written, 'real-title.md').body,
+      existingRaw: written,
+      fields: { status: 'done' },
+    })
+    expect(written.split('\n').filter((line, index) => line !== second.split('\n')[index])).toEqual(
+      ['status: doing'],
+    )
+  })
+})
+
+describe('serializeNoteFile — the typed keys that only the frontmatter carries', () => {
+  const existing = serializeNoteFile({
+    title: 'T',
+    noteType: 'task',
+    summary: 'old digest',
+    muted: true,
+    body: 'body',
+  })
+
+  it('writes each of the three, in the block position it already occupies', () => {
+    expect(existing).toContain('type: task')
+    expect(existing).toContain('summary: old digest')
+    expect(existing).toContain('muted: "true"')
+
+    const again = serializeNoteFile({
+      title: 'T',
+      noteType: 'idea',
+      summary: 'new digest',
+      body: 'body',
+      existingRaw: existing,
+    })
+
+    expect(parseFrontmatterBlock(again)!.entries.map((e) => e.key)).toEqual([
+      'title',
+      'type',
+      'summary',
+      'muted',
+    ])
+    expect(parseNoteFile(again, 't.md').frontmatter).toMatchObject({
+      type: 'idea',
+      summary: 'new digest',
+      muted: 'true',
+    })
+  })
+
+  it('takes the key out of the file when the channel clears it', () => {
+    // The implicit type is never spelled; an empty digest and a false opt-out are
+    // explicit clears. All three leave the block rather than standing there empty.
+    const cleared = serializeNoteFile({
+      title: 'T',
+      noteType: DEFAULT_NOTE_TYPE,
+      summary: '',
+      muted: false,
+      body: 'body',
+      existingRaw: existing,
+    })
+
+    expect(parseFrontmatterBlock(cleared)!.entries.map((e) => e.key)).toEqual(['title'])
+    expect(parseNoteFields(parseNoteFile(cleared, 't.md').fields).keys).toEqual({})
+  })
+
+  it('leaves all three alone when no channel speaks', () => {
+    const untouched = serializeNoteFile({ title: 'T', body: 'other body', existingRaw: existing })
+
+    expect(parseNoteFields(parseNoteFile(untouched, 't.md').fields).keys).toEqual({
+      type: 'task',
+      summary: 'old digest',
+      muted: 'true',
+    })
   })
 })

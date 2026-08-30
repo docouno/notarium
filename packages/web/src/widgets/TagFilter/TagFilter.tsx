@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { TagFacet } from '@notarium/contract'
+import { FacetChip } from '../../core/FacetChip'
 import { IconChevron, IconSearch, IconX } from '../../core/Icons'
 import { cx } from '../../libs/cx/cx'
 import { nestFolders, type SkeletonNode } from '../../libs/tree/tree'
@@ -129,38 +130,30 @@ export const TagFilter = ({
   // glance). Below the threshold it's hidden and `q` stays empty (the tree path).
   const showSearch = tags.length > SEARCH_THRESHOLD
 
-  // One chip: a pill that toggles the tag, plus a ▾ expander when it has children.
-  // Two buttons (not a button-in-button) joined into one pill shape by the CSS.
+  // One chip: a pill that toggles the tag, plus a separate ▾ action when it has children.
   const Chip = ({ node }: { node: SkeletonNode }) => {
     const on = selected.has(node.path)
     const hasKids = node.children.length > 0
     const open = expanded.has(node.path)
     return (
-      <span className={cx(styles.chip, on && styles.chipOn, hasKids && styles.chipParent)}>
-        <button
-          type="button"
-          className={styles.chipMain}
-          onClick={() => onToggle(node.path)}
-          aria-pressed={on}
-          title={node.path}
-        >
-          <span className={styles.hash}>#</span>
-          <span className={styles.name}>{node.name}</span>
-          <span className={styles.count}>{node.count}</span>
-        </button>
-        {hasKids && (
-          <button
-            type="button"
-            className={cx(styles.chipExp, open && styles.chipExpOpen)}
-            onClick={() => toggleExpand(node.path)}
-            aria-label={open ? 'Collapse' : 'Expand'}
-            aria-expanded={open}
-            tabIndex={-1}
-          >
-            <IconChevron size={12} />
-          </button>
-        )}
-      </span>
+      <FacetChip
+        icon="#"
+        label={node.name}
+        count={node.count}
+        selected={on}
+        onClick={() => onToggle(node.path)}
+        title={node.path}
+        trailingAction={
+          hasKids
+            ? {
+                icon: <IconChevron size={12} />,
+                ariaLabel: `${open ? 'Collapse' : 'Expand'} ${node.name}`,
+                expanded: open,
+                onClick: () => toggleExpand(node.path),
+              }
+            : undefined
+        }
+      />
     )
   }
 
@@ -178,7 +171,7 @@ export const TagFilter = ({
         >
           <div className={styles.subHead}>
             <span className={styles.subBranch}>↳</span>
-            <span className={styles.hash}>#</span>
+            <span className={styles.subHash}>#</span>
             {n.name}
           </div>
           <div className={styles.cloud}>
@@ -241,19 +234,15 @@ export const TagFilter = ({
             {matches.map((m) => {
               const on = selected.has(m.tag)
               return (
-                <span key={m.tag} className={cx(styles.chip, on && styles.chipOn)}>
-                  <button
-                    type="button"
-                    className={styles.chipMain}
-                    onClick={() => onToggle(m.tag)}
-                    aria-pressed={on}
-                    title={m.tag}
-                  >
-                    <span className={styles.hash}>#</span>
-                    <span className={styles.name}>{m.tag}</span>
-                    <span className={styles.count}>{m.count}</span>
-                  </button>
-                </span>
+                <FacetChip
+                  key={m.tag}
+                  icon="#"
+                  label={m.tag}
+                  count={m.count}
+                  selected={on}
+                  onClick={() => onToggle(m.tag)}
+                  title={m.tag}
+                />
               )
             })}
           </div>

@@ -535,6 +535,8 @@ describe('parseFrontmatterBlock', () => {
     expect(of('---\ntags:\n- a\n-  b\n---\n')).toEqual(['a', 'b'])
     expect(of("---\ntitle: 'X'\n---\n")).toBe('X')
     expect(of('---\nempty:\n---\n')).toBeNull()
+    expect(of('---\nitems: [""]\n---\n')).toEqual([''])
+    expect(of('---\nitems:\n- ""\n---\n')).toEqual([''])
   })
 
   it('splits a simple flow list quote-aware, without treating quoted commas as separators', () => {
@@ -590,10 +592,12 @@ tags: ["a\\b", "a\"b"]
     const raw = `---\n${[
       ...frontmatterScalarEntry('title', 'A: B').lines,
       ...frontmatterListEntry('tags', ['x', '[y]']).lines,
+      ...frontmatterListEntry('items', ['']).lines,
     ].join('\n')}\n---\nbody`
     const block = parseFrontmatterBlock(raw)!
     expect(frontmatterEntryValue(block.entries[0])).toBe('A: B')
     expect(frontmatterEntryValue(block.entries[1])).toEqual(['x', '[y]'])
+    expect(frontmatterEntryValue(block.entries[2])).toEqual([''])
   })
 
   it('frontmatterScalar quotes what a YAML reader would otherwise mis-parse', () => {

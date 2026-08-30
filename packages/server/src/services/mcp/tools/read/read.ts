@@ -1,6 +1,6 @@
 // Read tools: search / get_note / recall / list_notes / recent_activity — the agent's retrieval surface.
 // canon: docs/mcp-gateway.md#tools
-import { NOTE_CLASS, NOTE_SORT } from '@notarium/contract'
+import { NOTE_CLASS, NOTE_SORT, parseFieldFilter } from '@notarium/contract'
 import {
   type FolderEntry,
   type GetNoteInput,
@@ -30,6 +30,7 @@ import {
 } from '@notarium/core'
 
 import { safeRelAddress } from '../../../../libs/relPath'
+import { fieldDayFilterError } from '../../../fields'
 import { type ProjectRecord } from '../../../metaDb'
 import { type SpaceStore } from '../../../spaces'
 import { type Handler, ToolFailure } from '../../gateway'
@@ -42,7 +43,7 @@ import {
   renderRecentActivity,
   renderSearch,
 } from '../../helpers/render'
-import { sanitizeFrontmatter, sanitizeText } from '../../sanitize'
+import { isUnsafeMcpFieldKey, sanitizeFrontmatter, sanitizeText } from '../../sanitize'
 
 const LIST_FOLDERS_LIMIT = 200
 /** recent_activity project filter is a post-filter (journal isn't path-indexed):
@@ -195,11 +196,15 @@ export const handleGetNote: Handler = async (ctx, rawArgs) => {
       }))
     : undefined
   const links = detailed ? await noteLinks(hit.store, noteId) : undefined
+  const sanitizedFrontmatter = sanitizeFrontmatter(note.frontmatter)
   const structured = {
     noteId,
     title: sanitizeText(note.title ?? '(untitled)'),
     content: sanitizeText(note.content),
-    frontmatter: sanitizeFrontmatter(note.frontmatter),
+    frontmatter: sanitizedFrontmatter.frontmatter,
+    ...(sanitizedFrontmatter.unsafeKeysOmitted
+      ? { unsafeFrontmatterKeysOmitted: sanitizedFrontmatter.unsafeKeysOmitted }
+      : {}),
     ...(hit.space === personal ? {} : { space: spaceSlug }),
     ...(projectHandle ? { project: projectHandle } : {}),
     ...(path ? { path } : {}),
@@ -324,7 +329,8 @@ const folderInSubtree = (f: string, base: string): boolean =>
   base === '' || f === base || f.startsWith(`${base}/`)
 
 export const handleListNotes: Handler = async (ctx, rawArgs) => {
-  const { project, path, tag, limit, cursor } = rawArgs as ListNotesInput
+  const { project, path, tag, field, fieldDay, fieldAny, fieldBad, limit, cursor } =
+    rawArgs as ListNotesInput
 
   let space: string
   let base = '' // project root (space-relative); '' = personal domain / root project
@@ -362,18 +368,31 @@ export const handleListNotes: Handler = async (ctx, rawArgs) => {
     }
   }
 
+  // Direct notes only — one ls level, not the subtree. Tag filter is case-insensitive and hierarchical (`ml` also lists `ml/nlp`).
+  // canon: docs/note-model.md#tags-as-a-navigation-axis-109
+  const fieldFilter = parseFieldFilter({ field, fieldDay, fieldAny, fieldBad })
+
+  if (fieldFilter?.nodes.some((node) => isUnsafeMcpFieldKey(node.key))) {
+    throw new ToolFailure('field key is not available through the agent interface')
+  }
+  const fieldError = fieldDayFilterError(
+    fieldFilter,
+    fieldDay?.length ? await ctx.fieldSchemaStore?.read(space) : undefined,
+  )
+
+  if (fieldError) {
+    throw new ToolFailure(fieldError)
+  }
   const store = await ctx.spaces.store(space)
   const spaceNotes = (await store.list({ scope: READ_SCOPE.user })).filter((m) => m.id != null)
   const dirs = store.listDirs ? await store.listDirs() : []
-
-  // Direct notes only — one ls level, not the subtree. Tag filter is case-insensitive and hierarchical (`ml` also lists `ml/nlp`).
-  // canon: docs/note-model.md#tags-as-a-navigation-axis-109
   const direct = queryNotes(spaceNotes, {
     sort: NOTE_SORT.title,
     offset: 0,
     folder,
     depth: 'direct',
     ...(tag ? { tags: [tag] } : {}),
+    fields: fieldFilter,
   }).notes
 
   const total = direct.length

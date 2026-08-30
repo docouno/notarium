@@ -68,12 +68,16 @@ test('clicking a ghost link creates the note from it (create-from-ghost, #25/#35
   await expect(page.locator('.cm-content')).toContainText('# Missing Element')
 })
 
-test('Meta shows read-only metadata: folder, tags, class (#35)', async ({ page }) => {
+test('Meta shows custom fields before the system tail, without a folder duplicate (#35)', async ({
+  page,
+}) => {
   await openTitanium(page)
   await page.getByTestId('aside-tab-meta').click()
   const meta = page.getByTestId('meta-panel')
   await expect(meta).toBeVisible()
-  await expect(meta).toContainText('demo') // folder from filePath demo/Titanium.md
+  await expect(meta.locator('[data-field="Folder"]')).toHaveCount(0)
+  await expect(meta.locator('[data-field="Created"]')).toBeVisible()
+  await expect(meta.locator('[data-field="Modified"]')).toBeVisible()
   await expect(meta).toContainText('metal')
   await expect(meta).toContainText('element')
 })

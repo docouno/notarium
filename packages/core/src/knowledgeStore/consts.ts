@@ -1,5 +1,7 @@
 // Domain constants for the KnowledgeStore port.
 
+import { FIELD_WRITE_ERROR_REASON } from '../libs/fields/consts'
+
 /** The default space handle a store serves when the host wires none — the
  *  single-space fallback (the composition root normally passes a real space).
  *  One source so the read-model and the identity registry can't drift. */
@@ -45,6 +47,7 @@ export const STORE_ERROR_REASON = {
    *  plan settled on. Deterministic: the plan is stale, so retrying it unchanged
    *  reaches the same answer. canon: docs/import.md#importing-a-markdown-tree-302 */
   destinationOwnerConflict: 'destination_owner_conflict',
+  ...FIELD_WRITE_ERROR_REASON,
 } as const
 
 /** What a CREATE does when a note already occupies its destination path.

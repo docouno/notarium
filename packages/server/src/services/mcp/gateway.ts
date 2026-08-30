@@ -19,6 +19,7 @@ import type { AbilitiesService } from '../abilities'
 import { type AgentSessions, type BoundAgentSession, createAgentSessions } from '../agentSessions'
 import type { AuthService } from '../auth'
 import { type Action, agentOwnerOf, can, type Principal, scopeAllows } from '../authz'
+import type { FieldSchemaStore } from '../fields'
 import type {
   AgentDeltaCursorsPersistence,
   AgentSessionsPersistence,
@@ -95,6 +96,9 @@ export type GatewayDeps = {
   /** The `.notariummeta` marker store: on-disk truth, written through before the
    *  derived registry cache. Absent (the e2e fake) → registry-only, no marker file. */
   markerStore?: MarkerStore
+  /** Space-owned field declarations used by field writes without exposing a
+   * schema-management tool to agents. */
+  fieldSchemaStore?: FieldSchemaStore
   /** The context-sets registry. Absent (meta-DB-less host) → no sets exist
    *  (honest degradation; the location-bound pin still works). */
   contextSets?: ContextSetsPersistence
@@ -116,6 +120,8 @@ export type ToolListing = {
   annotations: ToolAnnotations
   input: z.ZodObject
   output: z.ZodObject
+  publishedInput?: z.ZodObject
+  publishedOutput?: z.ZodObject
 }
 
 /** CallToolResult (structural subset): Markdown text + machine-readable
@@ -142,6 +148,7 @@ export type Ctx = {
   /** Folder path-history + marker store, written through by the container-reorg tools. */
   folders?: FolderIdentityPersistence
   markerStore?: MarkerStore
+  fieldSchemaStore?: FieldSchemaStore
   contextSets?: ContextSetsPersistence
   scopePins?: ScopePinsPersistence
   contextOrder?: ContextOrderPersistence
@@ -281,6 +288,7 @@ export const createGateway = (deps: GatewayDeps): McpGateway => {
       projects: deps.projects,
       folders: deps.folders,
       markerStore: deps.markerStore,
+      fieldSchemaStore: deps.fieldSchemaStore,
       contextSets: deps.contextSets,
       scopePins: deps.scopePins,
       contextOrder: deps.contextOrder,
@@ -408,13 +416,23 @@ export const createGateway = (deps: GatewayDeps): McpGateway => {
         // TypeError on the whole list.
         .filter((name) => name in TOOL_META)
         .filter((name) => scopeAllows(principal, toolActions[name] as Action))
-        .map((name) => ({
-          name,
-          description: TOOL_META[name as keyof typeof TOOL_META].description,
-          annotations: TOOL_META[name as keyof typeof TOOL_META].annotations,
-          input: tools[name].input,
-          output: tools[name].output,
-        })),
+        .map((name) => {
+          const definition = tools[name]
+
+          return {
+            name,
+            description: TOOL_META[name as keyof typeof TOOL_META].description,
+            annotations: TOOL_META[name as keyof typeof TOOL_META].annotations,
+            input: definition.input,
+            output: definition.output,
+            ...('publishedInput' in definition
+              ? { publishedInput: definition.publishedInput }
+              : {}),
+            ...('publishedOutput' in definition
+              ? { publishedOutput: definition.publishedOutput }
+              : {}),
+          }
+        }),
 
     callTool: async (principal, name, args) => {
       const handler = HANDLERS[name as ToolName]

@@ -330,6 +330,7 @@ describe('folder pages (#212): create / resolve / hide-from-children', () => {
         folderPath: 'docs',
         content: '# Docs\n\nSection overview.',
         tags: ['guide'],
+        fields: { status: 'draft' },
         slug: 'docs-home',
       },
     })
@@ -343,6 +344,7 @@ describe('folder pages (#212): create / resolve / hide-from-children', () => {
       slug: 'docs-home',
     })
     expect(note.json().frontmatter.tags).toEqual(['guide'])
+    expect(note.json().frontmatter.status).toBe('draft')
   })
 
   it('editing a folder page keeps the reserved index.md basename', async () => {

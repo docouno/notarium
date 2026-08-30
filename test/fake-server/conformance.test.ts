@@ -10,6 +10,7 @@ import {
   BucketsResponseSchema,
   ConfigSchema,
   ErrorResponseSchema,
+  FieldsResponseSchema,
   GraphHealthResponseSchema,
   GraphResponseSchema,
   MoveResponseSchema,
@@ -48,6 +49,22 @@ const get = async (url: string) => (await app.inject({ method: 'GET', url })).js
 const post = (url: string, payload: object): Promise<LightMyRequestResponse> =>
   app.inject({ method: 'POST', url, payload })
 const del = (url: string): Promise<LightMyRequestResponse> => app.inject({ method: 'DELETE', url })
+
+const setFields = async (
+  filePath: string,
+  fields: Record<string, string | string[] | null>,
+): Promise<void> => {
+  const page = await get('/api/s/main/notes?sort=modified')
+  const note = page.notes.find((candidate: { filePath: string }) => candidate.filePath === filePath)
+  const detail = await get(`/api/note?id=${encodeURIComponent(note.id)}`)
+  const response = await app.inject({
+    method: 'PUT',
+    url: '/api/note/fields',
+    payload: { id: note.id, versionToken: detail.versionToken, fields },
+  })
+
+  expect(response.statusCode).toBe(200)
+}
 
 describe('contract conformance over the seed fixture', () => {
   it('GET /api/config — just the capability facts (#99 dropped the default-space pointer)', async () => {
@@ -169,6 +186,74 @@ describe('contract conformance over the seed fixture', () => {
     const notes = await get('/api/s/main/notes?sort=modified&tags=element')
     expect(b.total).toBe(notes.total) // == 2, the lockstep invariant
     expect(b.buckets.reduce((acc: number, x: { count: number }) => acc + x.count, 0)).toBe(b.total)
+  })
+  it('GET /api/notes?field= filters the window and keeps buckets in lockstep', async () => {
+    await setFields('demo/Carbon.md', {
+      status: 'wip',
+      reviewers: ['ann', 'bo'],
+      marker: '*',
+      estimate: '>3',
+      period: '[1..2]',
+    })
+    await setFields('demo/Titanium.md', { status: 'done', reviewers: ['bo'] })
+
+    const status = await get('/api/s/main/notes?sort=modified&field=note.status:wip')
+    expect(NotesResponseSchema.safeParse(status).success).toBe(true)
+    expect(status.total).toBe(1)
+    expect(status.notes.map((note: { title: string }) => note.title)).toEqual(['Carbon'])
+    expect((await get('/api/s/main/notes?field=note.reviewers:ann')).total).toBe(1)
+    expect((await get('/api/s/main/notes?field=note.marker:*')).total).toBe(1)
+    expect((await get('/api/s/main/notes?field=note.estimate:%3E3')).total).toBe(1)
+    expect((await get('/api/s/main/notes?field=note.period:%5B1..2%5D')).total).toBe(1)
+    expect(
+      (await get('/api/s/main/notes?field=note.status:missing&fieldAny=note.status')).total,
+    ).toBe(2)
+
+    const buckets = await get(
+      '/api/s/main/notes/buckets?sort=modified&group=month&field=note.status:wip',
+    )
+    expect(buckets.total).toBe(status.total)
+    expect(
+      buckets.buckets.reduce((total: number, bucket: { count: number }) => total + bucket.count, 0),
+    ).toBe(status.total)
+  })
+  it('routes fieldBad through the same-key OR branch on the REST surface', async () => {
+    const fixture = loadFixture()
+    fixture.spaces[0].notes[0].frontmatter = 'shape:\n  nested: value'
+    const scoped = await createApp(fixture)
+    const response = await scoped.inject({
+      method: 'GET',
+      url: '/api/s/main/notes?field=note.shape:missing&fieldBad=note.shape',
+    })
+
+    expect(response.statusCode).toBe(200)
+    expect(response.json().notes.map((note: { title: string }) => note.title)).toContain('Titanium')
+  })
+  it('GET /api/s/:space/fields returns the useful open-world facet with honest counts', async () => {
+    await setFields('demo/Carbon.md', { status: 'wip' })
+    await setFields('demo/Titanium.md', { status: 'done' })
+
+    const response = await get('/api/s/main/fields')
+    expect(FieldsResponseSchema.safeParse(response).success).toBe(true)
+    expect(response.fields.find((field: { key: string }) => field.key === 'status')).toMatchObject({
+      declared: false,
+      notes: 2,
+      values: [
+        { value: 'done', count: 1 },
+        { value: 'wip', count: 1 },
+      ],
+      total: 2,
+    })
+  })
+  it.each([
+    ['field=status:wip', 'namespace'],
+    ['field=file.name:x', 'reserved'],
+    ['field=note.tags:work', 'tags query axis'],
+  ])('GET /api/notes rejects %s with an actionable 400', async (query, reason) => {
+    const response = await app.inject({ method: 'GET', url: `/api/s/main/notes?${query}` })
+
+    expect(response.statusCode).toBe(400)
+    expect(response.json().error).toContain(reason)
   })
   // #190: the full-text membership filter `q` — one more axis (folder ∧ tag ∧ q).
   it('GET /api/notes?q= — narrows to notes the engine matches (#190)', async () => {

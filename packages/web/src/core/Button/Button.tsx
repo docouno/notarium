@@ -1,4 +1,5 @@
-import { type ButtonHTMLAttributes, forwardRef } from 'react'
+import { type ButtonHTMLAttributes, type CSSProperties, forwardRef } from 'react'
+import type { FieldColor } from '@notarium/contract'
 import { cx } from '../../libs/cx/cx'
 import styles from './Button.module.scss'
 
@@ -15,10 +16,12 @@ export type ButtonProps = {
   icon?: boolean
   /** Pressed look while a controlled menu/panel is open (ghost buttons). */
   active?: boolean
+  /** Semantic tone channels. Used by field-aware surfaces and the palette proof. */
+  color?: FieldColor
 } & ButtonHTMLAttributes<HTMLButtonElement>
 
 export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
-  ({ variant, icon, active, className, ...rest }, ref) => (
+  ({ variant, icon, active, color, className, style, ...rest }, ref) => (
     // Spread caller props first; the component's own props win after it. `className`
     // is pulled out and merged (not just overridden) so a caller can extend the
     // button's classes without clobbering them.
@@ -27,11 +30,22 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
       ref={ref}
       className={cx(
         styles.btn,
+        color && styles.colored,
         variant && styles[variant],
         icon && styles.icon,
         active && styles.active,
         className,
       )}
+      style={
+        color
+          ? ({
+              ...style,
+              '--button-solid': `var(--field-color-${color})`,
+              '--button-surface': `var(--field-color-${color}-surface)`,
+              '--button-border': `var(--field-color-${color}-border)`,
+            } as CSSProperties)
+          : style
+      }
     />
   ),
 )

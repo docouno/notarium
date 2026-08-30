@@ -47,6 +47,18 @@ describe('CachedStore(NotariumStore) large-note lifecycle', () => {
       const afterCreate = await store.read(created.id!)
 
       expect(afterCreate.content).toBe(body)
+      await store.write({
+        title: 'Large import',
+        content: afterCreate.content,
+        originalId: created.id!,
+        versionToken: afterCreate.versionToken,
+        fields: { status: 'review' },
+      })
+      await store.settle()
+      const afterField = await store.read(created.id!)
+
+      expect(afterField.content).toBe(body)
+      expect(afterField.frontmatter.status).toBe('review')
 
       const appended = body + 'appended tail line\n'
 
@@ -54,7 +66,7 @@ describe('CachedStore(NotariumStore) large-note lifecycle', () => {
         title: 'Large import',
         content: appended,
         originalId: created.id!,
-        versionToken: afterCreate.versionToken,
+        versionToken: afterField.versionToken,
       })
       await store.settle()
       const afterAppend = await store.read(created.id!)

@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { DurableScalarSchema, DurableTextSchema } from '../primitives'
+import { DurableScalarSchema, DurableTextSchema, FieldPatchSchema } from '../primitives'
 
 export const SkillNameSchema = z
   .string()
@@ -47,6 +47,10 @@ export const noteWriteFields = {
   directory: DurableScalarSchema.optional(),
   noteType: DurableScalarSchema.optional(),
   tags: z.union([z.array(DurableScalarSchema), DurableScalarSchema]).optional(),
+  /** Authored frontmatter point patch carried by the ordinary editor Save. The
+   * same domain patch also powers the dedicated point endpoint; the UI intent,
+   * not a second patch grammar, decides which route is used. */
+  fields: FieldPatchSchema.optional(),
   /** The editable display slug the user typed — three-state like the
    *  domain WriteInput: absent LEAVES the file's `slug:` untouched, a string SETS
    *  it (cleaned + kept only when it diverges from slug(title)), `''` CLEARS a

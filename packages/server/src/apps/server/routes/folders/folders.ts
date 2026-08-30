@@ -24,6 +24,7 @@ import {
 } from '@notarium/core'
 
 import { safeRelAddress, safeRelPath } from '../../../../libs/relPath'
+import { prepareFieldWrite } from '../../../../services/fields'
 import {
   acquireMarkPrefixLock,
   ensureFolderIdentity,
@@ -47,7 +48,8 @@ const folderExistsIn = async (store: KnowledgeStore, path: string): Promise<bool
 }
 
 export const foldersRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
-  const { spaceStoreFor, projects, folders, markerStore, spaces, principalId } = ctx
+  const { spaceStoreFor, projects, folders, markerStore, spaces, principalId, fieldSchemaStore } =
+    ctx
 
   // Folder move/rename; a marked folder's `.notariummeta` sibling rides the fs.rename, so
   // identity travels with the dir for free.
@@ -304,6 +306,10 @@ export const foldersRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
           ...(authoredTags.includes(ALWAYS_LOAD_TAG) ? [] : [ALWAYS_LOAD_TAG]),
         ]
       : body.data.tags
+    const hasFields = Object.getOwnPropertyNames(body.data.fields ?? {}).length > 0
+    const fieldsUnquoted = hasFields
+      ? await prepareFieldWrite(fieldSchemaStore, space, body.data.fields!)
+      : undefined
     let folderId = ''
     let r
     const folderMissing = new Error('folder disappeared before page creation')
@@ -316,6 +322,8 @@ export const foldersRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
           directory: folderPath || undefined,
           noteType: body.data.noteType,
           tags,
+          fields: body.data.fields,
+          ...(fieldsUnquoted ? { fieldsUnquoted } : {}),
           slug: body.data.slug,
           createdAt: body.data.createdAt ? new Date(body.data.createdAt).toISOString() : undefined,
           fileName: FOLDER_PAGE_BASENAME,

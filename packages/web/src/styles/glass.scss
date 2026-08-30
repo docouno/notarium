@@ -22,17 +22,33 @@
 .glass-edge-bottom {
   border-bottom: 1px solid var(--glass-border);
   /* inner top line = the specular rim; the outer shadow = depth under the bar. */
-  box-shadow: inset 0 1px 0 var(--glass-highlight), var(--glass-shadow);
+  box-shadow:
+    inset 0 1px 0 var(--glass-highlight),
+    var(--glass-shadow);
 }
 .glass-edge-top {
   border-top: 1px solid var(--glass-border);
-  box-shadow: inset 0 1px 0 var(--glass-highlight), 0 -1px 2px rgba(0, 0, 0, 0.04);
+  box-shadow:
+    inset 0 1px 0 var(--glass-highlight),
+    0 -1px 2px rgba(0, 0, 0, 0.04);
 }
 .glass-float {
   border: 1px solid var(--glass-border);
   /* single box-shadow source: the rim + a drop tunable per surface (--glass-drop).
      Floating surfaces drop their own box-shadow so this stays the one source. */
-  box-shadow: inset 0 1px 0 var(--glass-highlight), var(--glass-drop);
+  box-shadow:
+    inset 0 1px 0 var(--glass-highlight),
+    var(--glass-drop);
+}
+
+/* Content-local edge panel: unlike a full-width strip it has visible SIDE edges and
+   rounded leading corners, but stays anchored to the content boundary (no bottom rim,
+   no floating drop). `overflow:hidden` clips the grain/material to the same shape. */
+.glass-panel {
+  border-left: 1px solid var(--glass-border);
+  border-right: 1px solid var(--glass-border);
+  border-radius: var(--radius-md) var(--radius-md) 0 0;
+  overflow: hidden;
 }
 
 /* Scroll-aware chrome (#185) — a floating top bar that interpolates its WHOLE
@@ -47,25 +63,56 @@
   background: color-mix(in srgb, var(--glass-bg) calc(var(--glass-lift, 0) * 100%), transparent);
   /* blur grows from 0 with the lift; calc inlined (not via a custom prop) so nothing
      leaks into descendants through inheritance. */
-  -webkit-backdrop-filter: blur(calc(var(--glass-blur) * var(--glass-lift, 0))) saturate(var(--glass-saturate));
-  backdrop-filter: blur(calc(var(--glass-blur) * var(--glass-lift, 0))) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(calc(var(--glass-blur) * var(--glass-lift, 0)))
+    saturate(var(--glass-saturate));
+  backdrop-filter: blur(calc(var(--glass-blur) * var(--glass-lift, 0)))
+    saturate(var(--glass-saturate));
 }
 .glass-scroll.glass-edge-bottom {
-  border-bottom-color: color-mix(in srgb, var(--glass-border) calc(var(--glass-lift, 0) * 100%), transparent);
+  border-bottom-color: color-mix(
+    in srgb,
+    var(--glass-border) calc(var(--glass-lift, 0) * 100%),
+    transparent
+  );
   box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--glass-highlight) calc(var(--glass-lift, 0) * 100%), transparent),
+    inset 0 1px 0
+      color-mix(in srgb, var(--glass-highlight) calc(var(--glass-lift, 0) * 100%), transparent),
     0 1px 2px rgba(16, 24, 40, calc(var(--glass-lift, 0) * 0.05));
 }
-.glass-scroll.glass-edge-bottom::after { opacity: calc(var(--glass-grain, 0) * var(--glass-lift, 0)); }
+.glass-scroll.glass-edge-bottom::after {
+  opacity: calc(var(--glass-grain, 0) * var(--glass-lift, 0));
+}
 /* Bottom-bar variant (a footer): the rim + shadow sit ABOVE and rise with the same
    lift — full while content remains under the bar, gone once scrolled to the end. */
 .glass-scroll.glass-edge-top {
-  border-top-color: color-mix(in srgb, var(--glass-border) calc(var(--glass-lift, 0) * 100%), transparent);
+  border-top-color: color-mix(
+    in srgb,
+    var(--glass-border) calc(var(--glass-lift, 0) * 100%),
+    transparent
+  );
   box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--glass-highlight) calc(var(--glass-lift, 0) * 100%), transparent),
+    inset 0 1px 0
+      color-mix(in srgb, var(--glass-highlight) calc(var(--glass-lift, 0) * 100%), transparent),
     0 -1px 2px rgba(0, 0, 0, calc(var(--glass-lift, 0) * 0.04));
 }
-.glass-scroll.glass-edge-top::after { opacity: calc(var(--glass-grain, 0) * var(--glass-lift, 0)); }
+.glass-scroll.glass-edge-top::after {
+  opacity: calc(var(--glass-grain, 0) * var(--glass-lift, 0));
+}
+
+/* A scroll-aware content panel raises its side rim with the same lift as the leading
+   edge. At rest the whole shape is visually absent; no permanent narrow-column plate. */
+.glass-scroll.glass-panel {
+  border-left-color: color-mix(
+    in srgb,
+    var(--glass-border) calc(var(--glass-lift, 0) * 100%),
+    transparent
+  );
+  border-right-color: color-mix(
+    in srgb,
+    var(--glass-border) calc(var(--glass-lift, 0) * 100%),
+    transparent
+  );
+}
 
 /* Optional grain (#72) — a faint fractal-noise tooth over the LARGE frosted bars.
    It kills the gradient banding backdrop-filter can show on a wide translucent
@@ -98,7 +145,10 @@
     -webkit-backdrop-filter: none;
     backdrop-filter: none;
   }
-  .glass-edge-bottom::after, .glass-edge-top::after { display: none; }
+  .glass-edge-bottom::after,
+  .glass-edge-top::after {
+    display: none;
+  }
   /* Scroll-aware bars can't fade a translucent fill in (that would briefly let text
      show through — the very thing this mode opts out of). Stay opaque ALWAYS; the
      opaque fill equals the page bg, so the bar still reads flat at the top, and only
@@ -108,11 +158,24 @@
     -webkit-backdrop-filter: none;
     backdrop-filter: none;
   }
-  .glass-scroll.glass-edge-bottom::after, .glass-scroll.glass-edge-top::after { display: none; }
+  .glass-scroll.glass-edge-bottom::after,
+  .glass-scroll.glass-edge-top::after {
+    display: none;
+  }
 }
 @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
-  .glass { background: var(--glass-bg-opaque); }
-  .glass-edge-bottom::after, .glass-edge-top::after { display: none; }
-  .glass-scroll { background: var(--glass-bg-opaque); }
-  .glass-scroll.glass-edge-bottom::after, .glass-scroll.glass-edge-top::after { display: none; }
+  .glass {
+    background: var(--glass-bg-opaque);
+  }
+  .glass-edge-bottom::after,
+  .glass-edge-top::after {
+    display: none;
+  }
+  .glass-scroll {
+    background: var(--glass-bg-opaque);
+  }
+  .glass-scroll.glass-edge-bottom::after,
+  .glass-scroll.glass-edge-top::after {
+    display: none;
+  }
 }

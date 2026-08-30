@@ -98,7 +98,7 @@ const cloneEntry = (entry: FrontmatterEntry): FrontmatterEntry => ({
 const genericFrontmatterProjection = (
   entries: readonly FrontmatterEntry[] | undefined,
 ): Record<string, unknown> => {
-  const projection: Record<string, unknown> = {}
+  const projection = Object.create(null) as Record<string, unknown>
 
   for (const entry of entries ?? []) {
     if (!entry.key || entry.key === 'title' || OWNER_KEYS.has(entry.key as StorageOwnerKey)) {

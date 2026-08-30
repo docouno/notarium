@@ -4,7 +4,13 @@ import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { DOCUMENT_ROLE, sha256Hex, STORAGE_OWNER_KEY } from '@notarium/core'
+import {
+  bindStorageOwnerProof,
+  DOCUMENT_ROLE,
+  sha256Hex,
+  STORAGE_OWNER_KEY,
+  STORE_ERROR_REASON,
+} from '@notarium/core'
 import { createNotariumStore } from './createNotariumStore'
 
 const roots: string[] = []
@@ -222,6 +228,85 @@ describe('NotariumStore resource authority', () => {
     }
   })
 
+  it('drops malformed persisted document context instead of publishing it as exact state', async () => {
+    const root = await mkroot()
+    const indexDb = join(root, '.index.db')
+    const skillRoot = join(root, '.notarium', 'skills')
+    const notePath = '.notarium/skills/demo/SKILL.md'
+    const absolute = join(root, notePath)
+    const source = new TextEncoder().encode(
+      '---\nname: demo\ndescription: Demo skill\nnotarium-id: stable-id\n---\n\nInstructions',
+    )
+    await fs.mkdir(join(skillRoot, 'demo'), { recursive: true })
+    await fs.writeFile(absolute, source)
+    const sourceHash = await sha256Hex(source)
+    const proof = bindStorageOwnerProof({
+      source,
+      owners: [{ key: STORAGE_OWNER_KEY.id, ownership: 'entry' }],
+      evidence: { kind: 'mutation-receipt', id: 'receipt-1' },
+    })
+    let store = createNotariumStore({
+      mounts: [
+        { class: 'user-doc', dir: root, prefix: '' },
+        { class: 'skill', dir: skillRoot, prefix: '.notarium/skills' },
+      ],
+      indexDb,
+      spaceId: 'space-a',
+    })
+    await store.list()
+
+    await store.adoptPublishedResource!({
+      path: notePath,
+      source,
+      ownerProof: proof,
+      document: {
+        role: DOCUMENT_ROLE.skillRoot,
+        pathFallbackTitle: 'Demo',
+        skillDirectoryName: 'demo',
+      },
+      receipt: {
+        id: 'receipt-1',
+        semanticEventTime: '2026-08-24T00:00:00.000Z',
+        candidateHash: sourceHash,
+        transitions: [
+          {
+            path: notePath,
+            before: { kind: 'absent', value: 'absent' },
+            after: { kind: 'present', value: sourceHash },
+            mtimeMs: Date.parse('2026-08-24T00:00:00.000Z'),
+          },
+        ],
+      },
+    })
+    await store.stop()
+
+    const db = new DatabaseSync(indexDb)
+    db.prepare(`UPDATE document_proofs SET context_json = ?`).run(
+      JSON.stringify({
+        role: DOCUMENT_ROLE.skillRoot,
+        pathFallbackTitle: 'Demo',
+        skillDirectoryName: 42,
+      }),
+    )
+    db.close()
+
+    store = createNotariumStore({
+      mounts: [
+        { class: 'user-doc', dir: root, prefix: '' },
+        { class: 'skill', dir: skillRoot, prefix: '.notarium/skills' },
+      ],
+      indexDb,
+      spaceId: 'space-a',
+    })
+    try {
+      const detail = await store.read(notePath)
+
+      expect(detail.documentState?.skillDirectoryName).toBe('demo')
+    } finally {
+      await store.stop()
+    }
+  })
+
   it('carries a proven owner through a later body-only mutation', async () => {
     const root = await mkroot()
     const store = createNotariumStore({ notesDir: root })
@@ -274,6 +359,40 @@ describe('NotariumStore resource authority', () => {
       await fs.writeFile(join(skillRoot, 'demo', 'SKILL.md'), '# no manifest')
       const invalid = await store.read('.notarium/skills/demo/reference.md')
       expect(invalid.documentState?.role).toBe(DOCUMENT_ROLE.generic)
+    } finally {
+      await store.stop()
+    }
+  })
+
+  it('refuses field writes to the typed identity of a skill root', async () => {
+    const root = await mkroot()
+    const skillRoot = join(root, '.notarium', 'skills')
+    const manifest = join(skillRoot, 'demo', 'SKILL.md')
+    await fs.mkdir(join(skillRoot, 'demo'), { recursive: true })
+    const before = '---\nname: demo\ndescription: Demo skill\n---\n\nInstructions'
+    await fs.writeFile(manifest, before)
+    const store = createNotariumStore({
+      mounts: [
+        { class: 'user-doc', dir: root, prefix: '' },
+        { class: 'skill', dir: skillRoot, prefix: '.notarium/skills' },
+      ],
+    })
+
+    try {
+      await store.list()
+      const live = await store.read('.notarium/skills/demo/SKILL.md')
+
+      for (const key of ['name', 'description']) {
+        await expect(
+          store.write({
+            originalId: '.notarium/skills/demo/SKILL.md',
+            title: live.title!,
+            content: live.content,
+            fields: { [key]: 'overwrite' },
+          }),
+        ).rejects.toMatchObject({ reason: STORE_ERROR_REASON.protectedFieldKey })
+      }
+      await expect(fs.readFile(manifest, 'utf8')).resolves.toBe(before)
     } finally {
       await store.stop()
     }

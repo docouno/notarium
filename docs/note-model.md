@@ -230,11 +230,113 @@ and every ordinary note item remain; no extra diagnostic field is added to the a
 
 ### Note meta-fields
 - `notarium-id` — identity (#51), in the frontmatter (P7).
-- `notarium-source` — reserved source-addressable import provenance. It is logical/file state (therefore part of CAS/history/restore/export), not a `StorageOwnerKey` and not public/authored metadata. `NoteMeta`/`NoteContent` carry an internal typed `sourceLocator`; ordinary REST/MCP/frontmatter projections omit it. A canonical direct external field is file truth, while fresh Markdown/public/inline carry is stripped. The derived index projects it into nullable `source_locator` without backfilling unchanged legacy rows.
+- `notarium-source` — reserved source-addressable import provenance. It is logical/file state (therefore part of CAS/history/restore/export), not a `StorageOwnerKey` and not public/authored metadata. `NoteMeta`/`NoteContent` carry an internal typed `sourceLocator`; ordinary REST/MCP/frontmatter projections omit it. A canonical direct external field is file truth, while fresh Markdown/public/inline carry is stripped. The derived index projects it into nullable `source_locator`. The source-column step alone does not scan legacy rows; a later full-corpus derivation backfill materializes every canonical claim it necessarily reads, never only the subset whose unrelated projection also changed.
 - `kind`/`class` — the note's class (`user-doc` / `agent-memory` / …); the single point of surface filtering (a policy invariant, not a bypassable `WHERE` — #74 §2).
 - `summary` — on `agent-memory` files; feeds the derived memory-index. Write semantics (#102): a `summary` passed to `remember_*` **overwrites** the previous one, an omitted one is **carry-forward** (the previous is kept); the response carries `summaryUpdated` (true = overwritten, false = kept) — there is no silent loss.
 - `type`, `tags` — the `user-doc` ontology (escape-parameters of `create_note`); `path` is normalized, `..`/absolute paths are rejected.
 - always-load — **scoped** `(scope, tag)`, not a flat global tag: user-level is always loaded, project-level — only on a hint (#22, bootstrap §2).
+
+The primary `type` projection is canonical at every write/read-model seam: edge whitespace is
+removed and an empty value means the implicit `note` type rather than a second blank identity.
+An explicitly authored creation date likewise projects as one UTC ISO instant immediately; a
+later file derivation cannot change the value shape exposed by list and detail reads.
+
+#### Fields as a typed axis (#301/#384) <a id="fields-as-a-typed-axis-301"></a>
+
+Authored frontmatter is an open-world field source: undeclared keys remain readable and
+indexable, while a space may declare presentation and validation metadata in
+`<notesDir>/.notarium/fields/schema.yaml`. The document is durable file truth with
+`version: 1`; it is not a note, creates no index row or revision-journal history, and is
+not consulted when the engine derives a note's fields column. A missing document means an
+empty declaration set, not an error.
+
+The v1 declaration types are `text`, `number`, `date`, `checkbox`, `list`, and `enum`.
+An enum stores its stable option key in the note and keeps the editable display label plus
+ordered catalog in the schema. `color` stores one semantic palette name (`slate`, `red`, `orange`, `amber`,
+`green`, `teal`, `blue`, `violet`), never a raw CSS color; built-in palette expansion is
+therefore additive and does not migrate existing files. Each name resolves per theme to shared
+`solid / fg / surface / border` channels also used by system feedback primitives. A field key is the exact raw YAML
+key — case-sensitive, without tag folding. Protected typed/storage keys cannot be declared.
+
+Schema writes are full-document CAS over an opaque `versionToken`. The writer edits live
+YAML nodes so comments and unknown keys on surviving nodes remain; field and enum-value
+order is the sequence order on disk. A structurally invalid or newer document, or one with
+ignored declarations, is exposed read-only and is never silently healed. The document is
+bounded to 64 KiB, 128 declarations, and 256 values per enum; every declaration may set
+`card: true`. Readers may GET the schema; writers may PUT it. A denied write follows the
+repository-wide 404 anti-enumeration contract.
+
+The human management surface is the Space Management → Fields tab. It edits one full-document
+draft against the schema token and exposes read-only/error snapshots without healing them. The UI
+shows one human field name and hides the technical frontmatter key. On create, that key is derived
+with the shared `slugify` + `uniqueSlug` rules, follows the name until the first save, then stays
+stable; a legacy declaration without `label` gets a humanised display fallback without exposing the
+raw key. An enum option has the same split: a hidden stable `key`, an editable `label`, and an
+optional color. Its key is generated and uniquified from the label until the first save, then stays
+stable; note files, filters and APIs carry the key while every human surface shows the label (or a
+humanised key fallback for a hand-written option). Renaming a label is therefore one schema CAS and
+does not rewrite notes. Field display names are unique in one space schema after case/edge-space
+normalization; enum option display names are unique only inside their owning enum, so different
+fields may both contain `Done`. A manual duplicate is a recoverable form error: no UI suffix,
+automatic merge, rename or corpus rewrite is invented. Saved rows are collapsed by default. The field sequence itself and each
+enum catalog are pointer-and-keyboard reorderable, and that document order is the presentation
+order. Removing a declaration or catalog option leaves every note byte untouched.
+
+Field values have one domain point-patch shape carried by the ordinary create/update note Save,
+the REST point-intent (`PUT /api/note/fields`), and MCP (`edit_note.fields`). Meta uses the REST
+path for immediate custom-field edits; boards and agents use the same semantics. The normal
+editor includes only changed fields in its one document Save/CAS and never sends a second request.
+A point write carries no filename intent and an equal patch is a semantic no-op: neither path nor
+`modifiedAt`/feed ordering changes when the value did not.
+A missing key in the patch is untouched, `null` removes the authored entry, and `''`/`[]` remain explicit empty values. Undeclared keys are first-class; declarations
+select presentation and the byte form of valid number/checkbox scalars, never coerce a value.
+Protected typed/storage keys are rejected, as are `name` and `description` on an Agent Skill
+root; those two names remain ordinary authored keys on other notes. A patch also refuses an
+unsafe document, a duplicate addressed key, or an addressed value whose raw YAML cannot be
+projected, so a point edit cannot erase bytes it does not understand.
+
+Schema read state is classified internally; the wire carries value-write capability separately
+from schema-management `readOnly`. Storage/unreadable and structurally invalid documents block
+value writes with `field_schema_unavailable`; a future-version document or recoverable form
+violation still permits value writes but produces no unquoted-byte advice. A cached transport
+error is read-only until Retry succeeds instead of silently enabling stale controls.
+A missing schema file is the normal open-world state. Insufficient `note:write` follows the
+same 404 anti-enumeration contract as every id-addressed note mutation.
+
+The note detail carries a structural field view derived from the file: complete projected
+values, unreadable names, authored key order, and the names/counters the bounded index would
+drop. It also reports whether this exact document is safely field-writable: anchors/aliases,
+unsafe restore state and duplicate authored field keys disable controls before a guaranteed
+refusal. The Meta panel therefore presents Type first, followed by custom metadata: every declaration
+in schema order (including absent values, displayed as `—`), then undeclared keys in file order; the
+stable tail is Class, Created, Modified, Tags. Folder is not repeated beside breadcrumbs/DnD.
+Unreadable and unindexed states stay visible, protected keys are read-only, and a type mismatch
+is shown as authored rather than coerced. A writer gets quiet custom controls: rest looks like a
+value, hover/focus reveals chrome without moving the row, and one point write commits one key. A
+reader gets the same ordering without enabled controls. All declared rows render immediately;
+undeclared readable rows are revealed in authored-order pages of 64 so a valid 64 KiB block does
+not create thousands of DOM controls. Nothing is discarded and this is not a card-field cap.
+EditorMeta reuses those quiet controls but
+binds them to the shared draft/Save, then continues Class, Slug, Created, Modified, Tags; Slug exists
+only there. Type/Created/Tags inline mutation is deferred. Empty string/list values remain distinct
+in storage and filtering but display as the same neutral `—` as absence; they are not warnings.
+Removal is explicit `null`. A declared checkbox uses the shared Switch; absence looks off until the
+first toggle, while Remove remains the operation that restores absence.
+
+The MCP surface has one security carve-out from exact open-world addressing. A technical key whose
+raw spelling contains an MCP pseudo-control tag is omitted from `get_note.frontmatter`, with
+`unsafeFrontmatterKeysOmitted` reporting the count; agent field writes and filters reject it without
+reflecting the raw key. Human REST/UI and Markdown remain exact. No second alias/codec is introduced.
+
+List rows carry a different, deliberately compact projection: only `key → value` for declarations
+with `card: true`. The Feed combines those values with the active space schema for enum display
+labels and colors. Card metadata is ordered date → Type → value-only card fields → Tags. Every
+present `card: true` value renders in schema order; Type and fields consume the tag budget, while
+the date remains its leading anchor. Tight card layouts clip overflow instead of dropping fields
+from the presentation model. A mismatched value stays visible as a neutral plaque;
+the card never carries the detail response's unreadable/truncation bookkeeping. Field plaques ride
+the list window, not the preview cache, so they are present before a cold snippet/tags preview.
+The detail header uses the matching read order Created → Type → value-only card fields → Tags.
 
 #### Tags as a navigation axis (#109)
 A tag is a **navigation axis**, not just a string in the frontmatter. The canonical normalization function is `core/libs/tags` `foldTag` (one across all engines and the client, like `slugify`): **case-insensitive** (`ML`/`ml`/`Ml` — one tag) and **hierarchical** by `/` (segments are trim+lowercase, empties collapse: `Work / Projects` ≡ `work/projects`). Folding happens **only on read/match** — the frontmatter is not rewritten (the original case is stored and shown in the chip; the resolution/grouping key is the folded one). The match is **hierarchical** (`noteHasTag`): a query for the parent `ml` catches descendants `ml/nlp`, `ml/nlp/bert` (a subtree cascade, like folders), but NOT a same-named tag across a segment boundary (`ml` ≠ `mlops`). Where the axis lives: **the read-model snapshot** — the engine returns `tags` on `NoteMeta` (the `notes.tags` column already existed, is FTS-indexed for full-text; for navigation it is NOT an engine table), so the window/histogram/facet/graph are computed over the snapshot under the single visibility checkpoint #78 (agent-memory tags are not exposed on the default surface). The filter (`NotesQuery.tags`) is **OR/union** over the set (the unified model "you added a value → you see more", the same as the folder facet; within a facet it's OR, between facets folder ∧ tag is AND), the contract is an array (a repeatable query-key), the UI multi-selects tags. A future "narrow"/AND mode — a UI toggle over the same array. The `GET /api/s/:space/tags` facet returns a tree of nodes (a flat list of paths+counts, the client nests them like folders) — `count` = subtree population, `direct` = exactly this tag; the shaper is shared — `core/libs/tags` `buildTagFacet` (the same one on the server and in the graph on the client). **The axis UI (feed+graph unified):** the tag-facet = **hierarchical chips + search + top-N** (NOT a tree — on a real base it's too long; NOT a flat cloud — it loses the hierarchy). The interaction model is **inclusion** (as in the whole application): by default nothing is selected, a click on a chip adds a tag (highlighted in accent), a parent chip `▾` expands its children below the cloud, the header × resets; the active filter is read in the aside, **no chips above the content**. On a note's page tags = neutral chips (ready for a per-tag color), clickable → `?tag=`. The canon — recap #109.

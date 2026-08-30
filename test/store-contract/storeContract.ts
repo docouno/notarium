@@ -13,14 +13,21 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 
 import { SyncStatusSchema } from '@notarium/contract'
 import {
+  buildNoteFields,
   encodeWikilinkIdentity,
   type ExportEntry,
+  FIELDS_BLOB_BYTE_CAP,
   IF_EXISTS,
   type KnowledgeStore,
   type NoteClass,
+  type NoteFields,
   type NoteMeta,
+  parseFrontmatterBlock,
   parseFrontmatterLines,
+  serializeNoteFields,
   STORE_ERROR_REASON,
+  utf8Bytes,
+  type WriteInput,
 } from '@notarium/core'
 
 export type StoreFactory = () => Promise<{
@@ -61,6 +68,79 @@ export const describeKnowledgeStoreContract = (
      *  stores (what the wire requires), the storage path for bare
      *  engines (paths, not permalinks, are the engine-side key). */
     const idOf = (n: NoteMeta) => n.id ?? n.filePath
+
+    /** The snapshot as the ENGINE derives it, as opposed to the one a write just put
+     *  there optimistically. Behind the read-model that needs a delta poll, and
+     *  `reconcile()` is the handle the decorator publishes for exactly this (hosts and
+     *  the periodic timer drive the same one); a bare engine has no optimistic layer at
+     *  all — its list() re-reads its own index on every call. Neither half is taken on
+     *  trust: callers pin the result against the note's own FILE bytes below, so a leg
+     *  where this call did nothing still has to agree with what is on disk. */
+    const listDerived = async (): Promise<NoteMeta[]> => {
+      await (store as { reconcile?: () => Promise<void> }).reconcile?.()
+      return store.list()
+    }
+
+    /** The field axis as the note's own bytes state it, read from OUTSIDE the engine
+     *  through the same core builder both engines derive their column with. Null for an
+     *  engine that cannot export — then the snapshot is all there is to check.
+     *
+     *  What this is worth depends on the leg, and pretending otherwise is how a check
+     *  becomes decoration. On the file engine the export reads the FILE and the column
+     *  is the index's own derivation — two sources. On the memory engine there is no
+     *  independent source of bytes BY CONSTRUCTION: `exportNotes()` reconstructs them
+     *  from the same stored note the projection is built from, and both go through this
+     *  same expression, so comparing a bare-engine snapshot with this is `f(x) === f(x)`.
+     *  What holds the fake to the real engine there is `fieldsParity.test.ts`, not this;
+     *  what this still catches on a memory leg is the layer ABOVE it — the read-model's
+     *  optimistic mirror, which is a projection of WriteInput and never touches either
+     *  expression. */
+    const fieldsOnDisk = async (filePath: string): Promise<NoteFields | null> => {
+      if (!store.exportNotes) {
+        return null
+      }
+      // `scope: 'all'`, not the default: an export defaults to `classesForScope('user')`
+      // on both engines, so on a note of any other class this helper would walk the
+      // whole export without meeting it and throw the "listed but missing" error below
+      // — a failure with nothing to do with the axis it is here to check. Every fields
+      // test in this spec writes `user-doc` today; `fieldsParity.test.ts` deliberately
+      // sweeps all four classes, and this check has to survive being pointed at one.
+      for await (const entry of store.exportNotes({ scope: 'all' })) {
+        if (entry.path === filePath) {
+          // An engine that preserves bytes verbatim exports them as bytes.
+          const raw =
+            typeof entry.content === 'string'
+              ? entry.content
+              : new TextDecoder().decode(entry.content)
+
+          return buildNoteFields(parseFrontmatterBlock(raw)?.entries ?? [])
+        }
+      }
+
+      throw new Error(`${filePath} is listed but missing from the engine's export`)
+    }
+
+    /** A snapshot has to say what the FILE says, ORDERING included: authored order is
+     *  the order the cap sacrifices from the tail of, so a blob that merely holds the
+     *  same keys is not the same answer — `toEqual` over a hand-written key map cannot
+     *  see a key that moved, and a key that moved is a key whose value the cap may drop.
+     *
+     *  Used on BOTH sides of the poll, which is the point. On a derived snapshot it is
+     *  unconditional. On the write's own optimistic mirror it is the boundary design/00
+     *  draws in "What the optimistic mirror may promise": below the cap the mirror owes
+     *  the file byte equality, with one named exception — a write that touches a key
+     *  which is unprojectable before or after it, because the projection carries
+     *  `unreadable`/`truncated` as lists of NAMES with no positions and cannot know
+     *  where such a key sits. At the cap the mirror owes nothing about composition or
+     *  order until the next poll. Callers that cross either line say so where they do
+     *  it, and assert what IS owed there instead of falling silent. */
+    const expectAgreesWithFile = async (note: NoteMeta) => {
+      const onDisk = await fieldsOnDisk(note.filePath)
+
+      if (onDisk) {
+        expect(serializeNoteFields(note.fields!)).toBe(serializeNoteFields(onDisk))
+      }
+    }
 
     beforeAll(async () => {
       ;({ store, directory: dir, teardown } = await factory())
@@ -673,6 +753,45 @@ export const describeKnowledgeStoreContract = (
       await store.remove(id)
     })
 
+    it('canonicalizes typed Type and Created immediately and after derivation', async () => {
+      const authored = '2026-08-29T10:00:00+03:00'
+      const canonical = '2026-08-29T07:00:00.000Z'
+      const created = await store.write({
+        title: 'Canonical Primary Metadata',
+        directory: dir,
+        content: 'body',
+        noteType: '  task  ',
+        createdAt: authored,
+      })
+      const id = created.id ?? idOf(byTitle(await store.list(), 'Canonical Primary Metadata')!)
+
+      try {
+        let listed = byTitle(await store.list(), 'Canonical Primary Metadata')!
+
+        expect(listed.noteType).toBe('task')
+        expect(listed.createdAt).toBe(canonical)
+        expect((await store.read(id)).createdAt).toBe(canonical)
+
+        listed = byTitle(await listDerived(), 'Canonical Primary Metadata')!
+        expect(listed.noteType).toBe('task')
+        expect(listed.createdAt).toBe(canonical)
+
+        await store.write({
+          title: 'Canonical Primary Metadata',
+          directory: dir,
+          content: 'body',
+          originalId: id,
+          versionToken: store.capabilities.cas ? (await store.read(id)).versionToken : undefined,
+          noteType: '',
+        })
+
+        expect(byTitle(await store.list(), 'Canonical Primary Metadata')!.noteType).toBe('note')
+        expect(byTitle(await listDerived(), 'Canonical Primary Metadata')!.noteType).toBe('note')
+      } finally {
+        await store.remove(id)
+      }
+    })
+
     it('a note dated by birthtime keeps its date across a plain edit — no createdAt flap', async () => {
       const tokenFor = async (ref: string): Promise<string | undefined> =>
         store.capabilities.cas ? (await store.read(ref)).versionToken : undefined
@@ -779,6 +898,626 @@ export const describeKnowledgeStoreContract = (
 
         if (n) {
           await store.remove(idOf(n))
+        }
+      }
+    })
+
+    it('the field axis on the snapshot carries every author key state', async () => {
+      const TITLE_FIELDS = 'Contract Fields'
+      // Every one of these arrives through the RAW channel: the typed channels
+      // (`noteType`, `summary`, `muted`) belong to the note's own metadata on one
+      // engine and to a carried line on the other, and only the raw channel gives
+      // both engines the same file to derive from.
+      const authored = [
+        'status: in progress',
+        'reviewers:',
+        '- ann',
+        '- bo',
+        "blank: ''",
+        'broken:',
+        '  nested: 1',
+        'type: task',
+        'summary: a digest',
+        'muted: "true"',
+      ].join('\n')
+      await store.write({
+        title: TITLE_FIELDS,
+        directory: dir,
+        content: 'field axis body',
+        frontmatter: parseFrontmatterLines(authored),
+      })
+
+      try {
+        const listed = byTitle(await store.list(), TITLE_FIELDS)!
+        const id = idOf(listed)
+        expect(listed.noteType).toBe('task')
+        const read1 = await store.read(id)
+
+        // Engines that model no frontmatter at all — honest skip, decided on the
+        // frontmatter projection rather than on the axis this test is here to check.
+        if (read1.frontmatter?.status !== 'in progress') {
+          return
+        }
+        const created = {
+          status: 'in progress',
+          reviewers: ['ann', 'bo'],
+          blank: '',
+          type: 'task',
+          summary: 'a digest',
+          muted: 'true',
+        }
+        // Read back from the list WITHOUT a poll in between: on the read-model the
+        // axis has to land on the optimistic snapshot, or a just-saved note drops out
+        // of every field filter and facet for a poll interval.
+        const meta = byTitle(await store.list(), TITLE_FIELDS)!
+
+        expect(meta.fields).toBeDefined()
+        expect(meta.fields!.keys).toEqual(created)
+        // A value the reader cannot project is a state of its own, not an absence.
+        expect(meta.fields!.unreadable).toEqual(['broken'])
+        // …and the same answer BYTE for byte, which the key map above cannot say: a key
+        // that merely moved passes `toEqual` and is a different answer at the cap.
+        //
+        // Design/00's one exception — a write touching a key unprojectable before or
+        // after it — is not what makes this safe, and `broken:` is authored by this very
+        // write, so by the letter of the rule the exception IS in play. What makes it
+        // safe is that this is a CREATE: the mirror has no previous projection to merge
+        // into, so `patchNoteFields(undefined, …)` is a plain build off the same entries
+        // the derivation reads, with nothing to place from a list of bare names. The
+        // exception needs a previous projection to bite, and here there is none.
+        await expectAgreesWithFile(meta)
+        // The keys the note projects onto metadata of its own never enter the axis.
+        for (const key of ['title', 'tags', 'aliases', 'slug', 'created', 'notarium-id']) {
+          expect(meta.fields!.keys[key]).toBeUndefined()
+        }
+        // …and then AGAIN off the engine's own derivation. The read above only proves
+        // what the write path mirrored into the snapshot; three of this spec's legs run
+        // behind the read-model, where a derivation that disagrees swaps the note's
+        // fields out from under the user one poll later instead of failing loudly.
+        const derived = byTitle(await listDerived(), TITLE_FIELDS)!
+
+        expect(derived.fields!.keys).toEqual(created)
+        expect(derived.fields!.unreadable).toEqual(['broken'])
+        // …and it answers to the file, which is what makes "after the poll" a claim
+        // rather than an assumption.
+        await expectAgreesWithFile(derived)
+
+        // A write that mentions ONE key is a patch, not a replacement: the serializer
+        // leaves every unmentioned key on disk, so the snapshot must keep them too.
+        await store.write({
+          title: TITLE_FIELDS,
+          directory: dir,
+          content: read1.content,
+          originalId: id,
+          versionToken: read1.versionToken,
+          frontmatter: parseFrontmatterLines('status: done'),
+        })
+        const patchedState = { ...created, status: 'done' }
+        const patched = byTitle(await store.list(), TITLE_FIELDS)!
+
+        expect(patched.fields!.keys).toEqual(patchedState)
+        expect(patched.fields!.unreadable).toEqual(['broken'])
+        // The patch re-states `status`, which is projectable both before and after it,
+        // and `broken` — the one key the mirror could not place — is left alone. So the
+        // named exception is not in play and the mirror still owes the file its exact
+        // bytes: `status` back in ITS slot, not appended after `muted`.
+        await expectAgreesWithFile(patched)
+
+        const patchedDerived = byTitle(await listDerived(), TITLE_FIELDS)!
+
+        expect(patchedDerived.fields!.keys).toEqual(patchedState)
+        expect(patchedDerived.fields!.unreadable).toEqual(['broken'])
+        await expectAgreesWithFile(patchedDerived)
+      } finally {
+        const n = byTitle(await store.list(), TITLE_FIELDS)
+
+        if (n) {
+          await store.remove(idOf(n))
+        }
+      }
+    })
+
+    it('field writes patch, remove and preserve authored values with byte-shape parity', async () => {
+      const title = 'Contract Field Writes'
+      await store.write({
+        title,
+        directory: dir,
+        content: 'body stays',
+        frontmatter: parseFrontmatterLines(
+          'status: backlog\nkeep: untouched\nremoved: old\npriority: "1"',
+        ),
+      })
+
+      try {
+        const listed = byTitle(await store.list(), title)!
+        const id = idOf(listed)
+        const before = await store.read(id)
+        const fields = Object.create(null) as NonNullable<WriteInput['fields']>
+        Object.assign(fields, {
+          status: 'doing',
+          reviewers: ['ann', 'bo'],
+          emptyItem: [''],
+          emptyList: [],
+          blank: '',
+          priority: '3',
+          removed: null,
+        })
+        fields.__proto__ = 'ordinary author value'
+        await store.write({
+          title,
+          directory: dir,
+          content: before.content,
+          originalId: id,
+          versionToken: before.versionToken,
+          fields,
+          fieldsUnquoted: ['priority'],
+        })
+        const after = await store.read(id)
+
+        expect(after.content).toBe('body stays')
+        expect(after.frontmatter).toMatchObject({
+          status: 'doing',
+          keep: 'untouched',
+          reviewers: ['ann', 'bo'],
+          emptyItem: [''],
+          emptyList: [],
+          blank: '',
+          priority: '3',
+        })
+        expect(after.frontmatter).not.toHaveProperty('removed')
+        expect(after.logicalState?.markdown).toContain('priority: 3')
+        expect(after.logicalState?.markdown).not.toContain('priority: "3"')
+        expect(after.logicalState?.markdown).toContain('reviewers:\n- ann\n- bo')
+        expect(after.logicalState?.markdown).toContain('emptyItem:\n- ""')
+        const optimistic = byTitle(await store.list(), title)!
+        expect(optimistic.fields?.keys).toMatchObject({
+          status: 'doing',
+          keep: 'untouched',
+          reviewers: ['ann', 'bo'],
+          emptyItem: [''],
+          emptyList: [],
+          blank: '',
+          priority: '3',
+        })
+        expect(optimistic.fields?.keys.removed).toBeUndefined()
+        expect(Object.hasOwn(optimistic.fields?.keys ?? {}, '__proto__')).toBe(true)
+        expect(optimistic.fields?.keys.__proto__).toBe('ordinary author value')
+        await expectAgreesWithFile(optimistic)
+        await expectAgreesWithFile(byTitle(await listDerived(), title)!)
+
+        const bodyWrite = await store.read(id)
+        await store.write({
+          title,
+          directory: dir,
+          content: 'body changed without fields',
+          originalId: id,
+          versionToken: bodyWrite.versionToken,
+        })
+        expect((await store.read(id)).frontmatter).toMatchObject({
+          status: 'doing',
+          priority: '3',
+          keep: 'untouched',
+        })
+      } finally {
+        const note = byTitle(await store.list(), title)
+
+        if (note) {
+          await store.remove(idOf(note))
+        }
+      }
+    })
+
+    it('a fields-only write keeps carried tags in the write-through preview', async () => {
+      const title = 'Contract Field Preview Tags'
+      const created = await store.write({
+        title,
+        directory: dir,
+        content: 'preview body',
+        tags: ['planning', 'roadmap'],
+      })
+
+      try {
+        const id = created.id ?? idOf(byTitle(await store.list(), title)!)
+        const before = await store.read(id)
+        expect((await store.preview(id)).tags).toEqual(['planning', 'roadmap'])
+
+        await store.write({
+          title,
+          directory: dir,
+          content: before.content,
+          originalId: id,
+          versionToken: before.versionToken,
+          fields: { status: 'doing' },
+        })
+
+        expect((await store.preview(id)).tags).toEqual(['planning', 'roadmap'])
+      } finally {
+        const note = byTitle(await store.list(), title)
+
+        if (note) {
+          await store.remove(idOf(note))
+        }
+      }
+    })
+
+    it('field writes refuse every lossy target before changing any byte', async () => {
+      const seedRaw = async (title: string, yaml: string) => {
+        await store.write({
+          title,
+          directory: dir,
+          content: 'body',
+          frontmatter: parseFrontmatterLines(yaml),
+          frontmatterMode: 'replace',
+        })
+        const note = byTitle(await store.list(), title)!
+        return { id: idOf(note), note }
+      }
+
+      const update = async (id: string, title: string, fields: WriteInput['fields']) => {
+        const before = await store.read(id)
+        return store.write({
+          title,
+          directory: dir,
+          content: before.content,
+          originalId: id,
+          versionToken: before.versionToken,
+          fields,
+        })
+      }
+      const titles = [
+        'Contract Field Protected',
+        'Contract Field Unreadable',
+        'Contract Field Duplicate',
+        'Contract Field Unsafe',
+        'Contract Field Anchor',
+        'Contract Field Large',
+        'Contract Field Durable',
+      ]
+
+      try {
+        const protectedNote = await seedRaw(titles[0], 'title: Contract Field Protected')
+        await expect(
+          update(protectedNote.id, titles[0], { status: 'doing', tags: 'wrong channel' }),
+        ).rejects.toMatchObject({ reason: STORE_ERROR_REASON.protectedFieldKey })
+        expect((await store.read(protectedNote.id)).frontmatter).not.toHaveProperty('status')
+
+        const unreadable = await seedRaw(
+          titles[1],
+          'title: Contract Field Unreadable\nk: { nested: true }',
+        )
+        await expect(update(unreadable.id, titles[1], { k: 'replace' })).rejects.toMatchObject({
+          reason: STORE_ERROR_REASON.unreadableFieldValue,
+        })
+
+        const duplicate = await seedRaw(
+          titles[2],
+          'title: Contract Field Duplicate\nk: first\nk: second',
+        )
+        await expect(update(duplicate.id, titles[2], { k: 'replace' })).rejects.toMatchObject({
+          reason: STORE_ERROR_REASON.duplicateFieldKey,
+        })
+
+        const unsafe = await seedRaw(titles[3], 'title: Contract Field Unsafe\nbroken: [a')
+        await expect(update(unsafe.id, titles[3], { k: 'replace' })).rejects.toMatchObject({
+          reason: `${STORE_ERROR_REASON.unsafeDocument}:invalid-yaml`,
+        })
+
+        const anchored = await seedRaw(titles[4], 'title: Contract Field Anchor\na: &x value')
+        await expect(update(anchored.id, titles[4], { k: 'replace' })).rejects.toMatchObject({
+          reason: STORE_ERROR_REASON.yamlNodeReference,
+        })
+
+        const large = await seedRaw(titles[5], 'title: Contract Field Large')
+        await expect(
+          update(large.id, titles[5], { huge: 'x'.repeat(100_000) }),
+        ).rejects.toMatchObject({ reason: STORE_ERROR_REASON.frontmatterTooLarge })
+
+        const durable = await seedRaw(titles[6], 'title: Contract Field Durable')
+        await expect(update(durable.id, titles[6], { bad: `x\u2028y` })).rejects.toMatchObject({
+          isToolError: true,
+        })
+        await expect(update(durable.id, titles[6], { 'a: b': 'x' })).rejects.toMatchObject({
+          isToolError: true,
+        })
+      } finally {
+        for (const title of titles) {
+          const note = byTitle(await store.list(), title)
+
+          if (note) {
+            try {
+              await store.remove(idOf(note))
+            } catch {
+              // The unsafe/anchored fixtures intentionally cannot establish exact
+              // storage ownership behind CachedStore. The suite teardown owns their
+              // isolated store/root; refusing their destructive cleanup is expected.
+            }
+          }
+        }
+      }
+    })
+
+    it('the field axis degrades by the cap, and every degenerate form is legible', async () => {
+      // The three states past "the key has a value" — a name whose VALUE the cap
+      // dropped, and the two counters that stand for names the cap could not even
+      // list. They are the states an engine is most likely to compute differently and
+      // the ones a facet and a `fieldAny` query read literally, so the spec pins them
+      // on every leg rather than only where the blob happens to fit.
+      const named = (f: NoteFields) => Object.getOwnPropertyNames(f.keys).length
+      /** The authored order each form is written in — the order the cap sacrifices from
+       *  the TAIL of (design/00, rule 1). Named separately from the lines so the
+       *  assertions below can be about the order itself rather than about a total: a
+       *  head/sum pair is true of any partition whatsoever, including one that kept the
+       *  tail and demoted the middle. */
+      const valuesPastTheCap = Array.from({ length: 260 }, (_, index) => `key${index}`)
+      const namesPastTheCap = Array.from(
+        { length: 900 },
+        (_, index) => `a-rather-long-authored-key-${index}`,
+      )
+      const unreadableNamesPastTheCap = Array.from(
+        { length: 900 },
+        (_, index) => `an-unreadable-key-number-${index}`,
+      )
+      const forms: Array<{
+        title: string
+        authored: string
+        noteType?: string
+        holds: (f: NoteFields) => void
+      }> = [
+        {
+          title: 'Contract Fields Truncated',
+          authored: valuesPastTheCap.map((key, index) => `${key}: value-${index}`).join('\n'),
+          holds: (f) => {
+            // The head of the AUTHORED order keeps its values; the tail is demoted to
+            // a name in `truncated` — findable by key, no longer by value. Stated as the
+            // partition itself: the valued keys followed by the demoted ones ARE the
+            // authored order, which says in one line that the cut is a suffix, that the
+            // cap moved values out without losing keys, and that each key is accounted
+            // for exactly once — the sum the sidebar's "unindexed" line is taken over.
+            expect(f.keys.key0).toBe('value-0')
+            expect(f.truncated?.length).toBeGreaterThan(0)
+            expect(f.keys[f.truncated![0]]).toBeUndefined()
+            expect(f.truncatedMore).toBeUndefined()
+            expect([...Object.getOwnPropertyNames(f.keys), ...f.truncated!]).toEqual(
+              valuesPastTheCap,
+            )
+          },
+        },
+        {
+          title: 'Contract Fields Primary Type',
+          authored: `${Array.from(
+            { length: 140 },
+            (_, index) => `open-field-${index}: ${'x'.repeat(30)}`,
+          ).join('\n')}\ntype: task`,
+          noteType: 'task',
+          holds: (f) => {
+            expect(f.truncated).toContain('type')
+          },
+        },
+        {
+          title: 'Contract Fields Truncated More',
+          authored: namesPastTheCap.map((key, index) => `${key}: v${index}`).join('\n'),
+          holds: (f) => {
+            // Past the point where even the NAMES fit, the list degenerates into a
+            // count: the note still reports that it has unindexed keys, and the sidebar
+            // reads the file for the rest.
+            expect(f.truncatedMore).toBeGreaterThan(0)
+            // Values go first and go WHOLE — nothing is left half-indexed once the cap
+            // has come for the names.
+            expect(named(f)).toBe(0)
+            // The counter stands for what did NOT fit, beside the names that did. An
+            // implementation that reports `truncated.length` here — or one that counts
+            // every key twice — passes "greater than zero" and erases the difference
+            // between "the name is visible" and "the name is gone", which is the pair
+            // criterion 7 reads `fieldAny` against.
+            expect(f.truncated!.length).toBeGreaterThan(0)
+            // …and the names it still lists are the HEAD of the authored order, by the
+            // same rule one rung down: names are given up from the tail too. The pair of
+            // counts alone would hold for a list that kept the last names instead.
+            expect(f.truncated).toEqual(namesPastTheCap.slice(0, f.truncated!.length))
+            expect(f.truncated!.length + f.truncatedMore!).toBe(900)
+          },
+        },
+        {
+          title: 'Contract Fields Unreadable More',
+          authored: unreadableNamesPastTheCap
+            .map((key, index) => `${key}:\n  nested: ${index}`)
+            .join('\n'),
+          holds: (f) => {
+            // Its own counter, not the truncated one: collapsing the two would erase
+            // the difference between "we could not read it" and "it did not fit",
+            // which is the whole of what `fieldBad` answers.
+            expect(f.unreadableMore).toBeGreaterThan(0)
+            expect(f.truncatedMore).toBeUndefined()
+            // Nothing readable was authored, so nothing is valued and nothing was
+            // demoted — the same accounting on the other counter.
+            expect(named(f)).toBe(0)
+            expect(f.truncated).toBeUndefined()
+            expect(f.unreadable!.length).toBeGreaterThan(0)
+            expect(f.unreadable).toEqual(unreadableNamesPastTheCap.slice(0, f.unreadable!.length))
+            expect(f.unreadable!.length + f.unreadableMore!).toBe(900)
+          },
+        },
+      ]
+
+      try {
+        for (const form of forms) {
+          await store.write({
+            title: form.title,
+            directory: dir,
+            content: 'a note the cap has to speak about',
+            frontmatter: parseFrontmatterLines(form.authored),
+          })
+          const optimistic = byTitle(await store.list(), form.title)!
+
+          // Engines that model no frontmatter at all — honest skip, same shape as the
+          // state test above.
+          if (!optimistic.fields) {
+            return
+          }
+          form.holds(optimistic.fields)
+          if (form.noteType) {
+            expect(optimistic.noteType).toBe(form.noteType)
+          }
+          expect(utf8Bytes(serializeNoteFields(optimistic.fields))).toBeLessThanOrEqual(
+            FIELDS_BLOB_BYTE_CAP,
+          )
+
+          const derived = byTitle(await listDerived(), form.title)!
+
+          form.holds(derived.fields!)
+          if (form.noteType) {
+            expect(derived.noteType).toBe(form.noteType)
+          }
+          expect(utf8Bytes(serializeNoteFields(derived.fields!))).toBeLessThanOrEqual(
+            FIELDS_BLOB_BYTE_CAP,
+          )
+          await expectAgreesWithFile(derived)
+        }
+      } finally {
+        for (const form of forms) {
+          const note = byTitle(await store.list(), form.title)
+
+          if (note) {
+            await store.remove(idOf(note))
+          }
+        }
+      }
+    }, 10_000)
+
+    // The boundary design/00 draws around the optimistic mirror ("What the optimistic
+    // mirror may promise"), and the reason it is asserted HERE: that document names the
+    // contract suite as the gate's home, because the promise is about a pair — what a
+    // write left in the snapshot against what the engine derives from the file — and no
+    // single-layer unit test has both halves.
+    //
+    // It is one `it` on purpose. Below the cap the mirror owes the file its exact bytes;
+    // AT the cap it owes nothing about composition or order until the next poll. Two
+    // tests would let the second half be read as "the cap is untested", which is exactly
+    // the silence that let this class run six generations: a rule that lives only in
+    // prose is a rule nobody notices breaking.
+    it('the optimistic axis answers the file below the cap and stops promising at it', async () => {
+      // A bare engine has no optimistic layer at all — its list() re-reads its own
+      // index, so the two snapshots below are the same derivation and the boundary is
+      // met trivially. The promise exists only where a write publishes a guess, and
+      // `reconcile()` is the handle the read-model publishes for exactly that.
+      const servesAMirror =
+        typeof (store as { reconcile?: () => Promise<void> }).reconcile === 'function'
+      const BELOW = 'Contract Mirror Below Cap'
+      const AT = 'Contract Mirror At Cap'
+      const GROWN = 'Contract Mirror Past Cap'
+      const AT_KEYS = 260
+
+      const patch = async (title: string, frontmatter: string) => {
+        const note = byTitle(await store.list(), title)!
+        const read = await store.read(idOf(note))
+
+        await store.write({
+          title,
+          directory: dir,
+          content: read.content,
+          originalId: idOf(note),
+          versionToken: read.versionToken,
+          frontmatter: parseFrontmatterLines(frontmatter),
+        })
+
+        return byTitle(await store.list(), title)!
+      }
+
+      try {
+        await store.write({
+          title: BELOW,
+          directory: dir,
+          content: 'a note the mirror owes the file',
+          frontmatter: parseFrontmatterLines('alpha: 1\nbeta: 2\ngamma: 3'),
+        })
+        const below = byTitle(await store.list(), BELOW)!
+
+        // Engines that model no frontmatter at all — honest skip, same shape as the
+        // tests above.
+        if (!below.fields) {
+          return
+        }
+        // A RE-STATED key, not a new one: the slot is the whole question. A mirror that
+        // drops the key and appends it agrees on the key set and disagrees on the bytes,
+        // and the bytes are what the cap sacrifices from the tail of.
+        const belowPatched = await patch(BELOW, 'beta: two')
+
+        expect(belowPatched.fields!.keys).toEqual({ alpha: '1', beta: 'two', gamma: '3' })
+        await expectAgreesWithFile(belowPatched)
+        await expectAgreesWithFile(byTitle(await listDerived(), BELOW)!)
+
+        await store.write({
+          title: AT,
+          directory: dir,
+          content: 'a note whose blob sits at the cap',
+          frontmatter: parseFrontmatterLines(
+            Array.from({ length: AT_KEYS }, (_, i) => `key${i}: value-${i}`).join('\n'),
+          ),
+        })
+        await listDerived()
+        // The same shape of write, one cap up — and this one SHORTENS its key, freeing
+        // budget. The file's derivation spends it on the next value in authored order.
+        // The mirror cannot: it holds that key's NAME in `truncated` and never had its
+        // bytes, so it has nothing to put back. That is the loss design/00 measures, and
+        // the whole of why the promise stops here.
+        const mirror = (await patch(AT, 'key0: v')).fields!
+        const settled = byTitle(await listDerived(), AT)!.fields!
+        const knownToTheFile = new Set([
+          ...Object.getOwnPropertyNames(settled.keys),
+          ...(settled.unreadable ?? []),
+          ...(settled.truncated ?? []),
+        ])
+
+        // …and the KIND of divergence allowed: composition and order, nothing else. It
+        // may value fewer keys than the file, or more — but never a key the file does
+        // not have, and never a different value for a key they both carry. A mirror that
+        // invented a key or served a stale value would not be "not authoritative", it
+        // would be wrong.
+        for (const key of Object.getOwnPropertyNames(mirror.keys)) {
+          expect(knownToTheFile.has(key)).toBe(true)
+          if (Object.hasOwn(settled.keys, key)) {
+            expect(mirror.keys[key]).toEqual(settled.keys[key])
+          }
+        }
+        // The divergence is not hypothetical on a leg that has a mirror, and pinning it
+        // is what keeps "allowed to differ" from quietly becoming "happens to agree":
+        // the first name the mirror carries in `truncated` is a key the file's own
+        // derivation values. The mirror could not resurrect it — it never had the bytes.
+        if (servesAMirror) {
+          expect(mirror.truncated?.length).toBeGreaterThan(0)
+          expect(mirror.keys[mirror.truncated![0]]).toBeUndefined()
+          expect(settled.keys[mirror.truncated![0]]).toBeDefined()
+        }
+        // And it converges: after the poll the note answers the file, byte for byte.
+        // Without this the paragraph above would license a mirror that never settles.
+        await expectAgreesWithFile(byTitle(await listDerived(), AT)!)
+
+        // The one thing "not authoritative" does NOT excuse. A merge only ever grows
+        // the blob, so it has to end where a build does — at the cap, measured, by the
+        // same code. Publishing it unmeasured would let a series of writes walk one
+        // note's snapshot past the per-note ceiling the cap exists to be, and no amount
+        // of composition licence covers that. Its own note because the patch above
+        // SHRINKS its key: a mirror that never measured would still fit there.
+        await store.write({
+          title: GROWN,
+          directory: dir,
+          content: 'a note a write pushes past the cap',
+          frontmatter: parseFrontmatterLines(
+            Array.from({ length: AT_KEYS }, (_, i) => `key${i}: value-${i}`).join('\n'),
+          ),
+        })
+        await listDerived()
+        const grown = (await patch(GROWN, `key0: ${'x'.repeat(600)}`)).fields!
+
+        expect(utf8Bytes(serializeNoteFields(grown))).toBeLessThanOrEqual(FIELDS_BLOB_BYTE_CAP)
+        await expectAgreesWithFile(byTitle(await listDerived(), GROWN)!)
+      } finally {
+        for (const title of [BELOW, AT, GROWN]) {
+          const note = byTitle(await store.list(), title)
+
+          if (note) {
+            await store.remove(idOf(note))
+          }
         }
       }
     })

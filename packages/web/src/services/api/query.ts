@@ -26,6 +26,18 @@ export const notesQs = (p: NotesQueryParams): string => {
   for (const t of p.tags || []) {
     q.append(QUERY_KEY.tags, t)
   }
+  for (const field of p.field || []) {
+    q.append(QUERY_KEY.field, field)
+  }
+  for (const field of p.fieldDay || []) {
+    q.append(QUERY_KEY.fieldDay, field)
+  }
+  for (const field of p.fieldAny || []) {
+    q.append(QUERY_KEY.fieldAny, field)
+  }
+  for (const field of p.fieldBad || []) {
+    q.append(QUERY_KEY.fieldBad, field)
+  }
   if (p.q) {
     q.set(QUERY_KEY.q, p.q)
   }

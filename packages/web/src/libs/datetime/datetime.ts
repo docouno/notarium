@@ -14,9 +14,23 @@
 // a relative label is a render-time snapshot — it does not self-tick; callers that
 // want it fresh re-render (the connections list refetches on mount).
 
+const CALENDAR_DAY = /^(\d{4})-(\d{2})-(\d{2})$/
+
 const parse = (value: string | null | undefined): Date | null => {
   if (!value) {
     return null
+  }
+  const calendar = CALENDAR_DAY.exec(value)
+
+  if (calendar) {
+    const year = Number(calendar[1])
+    const month = Number(calendar[2]) - 1
+    const day = Number(calendar[3])
+    const local = new Date(year, month, day)
+
+    return local.getFullYear() === year && local.getMonth() === month && local.getDate() === day
+      ? local
+      : null
   }
   const d = new Date(value)
   return Number.isNaN(d.getTime()) ? null : d
@@ -47,6 +61,17 @@ export const absoluteDate = (value: string | null | undefined): string => {
   const d = parse(value)
   return d ? d.toLocaleDateString(undefined, ABS_DATE_OPTS) : ''
 }
+
+/** A custom date field owns its authored calendar day, even when the stored scalar
+ * also carries an instant suffix. Display the same YYYY-MM-DD prefix that DatePicker
+ * edits instead of shifting it through the viewer's timezone. */
+export const fieldDate = (value: string | null | undefined): string =>
+  absoluteDate(value?.includes('T') ? value.slice(0, 10) : value)
+
+/** Replace only the calendar-day portion of a day/instant field value. Clearing
+ *  stays empty; an instant keeps its authored time/offset suffix byte-for-byte. */
+export const replaceCalendarDay = (value: string, day: string): string =>
+  day ? `${day}${value.includes('T') ? value.slice(10) : ''}` : ''
 
 /** Compact calendar date for dense UI rows (#188): current-year dates stay short
  *  ("Jun 03"), older ones add the year. '' for empty/invalid. */

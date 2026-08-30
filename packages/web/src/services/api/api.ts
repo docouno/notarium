@@ -3,6 +3,7 @@ import { HTTP_STATUS } from '@notarium/contract/http'
 import { authApi } from './auth'
 import { ApiError } from './client'
 import { contextApi } from './context'
+import { fieldsApi } from './fields'
 import { foldersApi } from './folders'
 import { graphApi } from './graph'
 import { importApi } from './import'
@@ -36,6 +37,7 @@ export type { BucketsQueryParams, NotesQueryParams } from './types'
 export const api = {
   ...spacesApi,
   ...notesApi,
+  ...fieldsApi,
   ...jobsApi,
   ...graphApi,
   ...searchApi,

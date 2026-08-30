@@ -97,7 +97,7 @@ export type NotesContextValue = {
   openNote: (id: string) => Promise<void>
   /** Re-fetch the open note (post-mutation: rename/move keep the id — and the
    *  URL — stable, so the reader refreshes in place instead of re-routing). */
-  reloadNote: () => Promise<void>
+  reloadNote: () => Promise<boolean>
   clearReader: () => void
 }
 

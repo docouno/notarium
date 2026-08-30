@@ -578,6 +578,8 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
       displayName: s.displayName,
       aliases: s.aliases,
       notes: live,
+      fieldSchema: s.fieldSchema,
+      fieldSchemaRaw: s.fieldSchemaRaw,
       activity: activityBySpace.get(s.slug),
     }
   })

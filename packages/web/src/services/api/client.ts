@@ -76,6 +76,92 @@ export const setSpaceAccessProbe = (fn: ((slug: string) => void) | null): void =
   spaceAccessProbe = fn
 }
 
+const record = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === 'object' && !Array.isArray(value)
+const strings = (value: unknown): value is string[] =>
+  Array.isArray(value) && value.every((item) => typeof item === 'string')
+const fieldValues = (value: unknown): boolean =>
+  record(value) &&
+  Object.getOwnPropertyNames(value).every(
+    (key) => typeof value[key] === 'string' || strings(value[key]),
+  )
+
+/** Error envelopes are not trusted merely because the happy note endpoint is typed.
+ * Keep this lightweight (no Zod in the browser bundle), but admit only the exact
+ * conflict members the editor can render or reuse as a CAS token. */
+const conflictCurrent = (value: unknown): WireNoteDetail | undefined => {
+  if (
+    !record(value) ||
+    typeof value.id !== 'string' ||
+    typeof value.content !== 'string' ||
+    !record(value.frontmatter) ||
+    typeof value.versionToken !== 'string'
+  ) {
+    return undefined
+  }
+  const result: WireNoteDetail = {
+    id: value.id,
+    content: value.content,
+    frontmatter: value.frontmatter,
+    versionToken: value.versionToken,
+  }
+
+  for (const key of [
+    'space',
+    'title',
+    'filePath',
+    'class',
+    'agentKind',
+    'documentTitle',
+    'slug',
+  ] as const) {
+    const member = value[key]
+
+    if (member !== undefined) {
+      if (typeof member !== 'string') {
+        return undefined
+      }
+      Object.assign(result, { [key]: member })
+    }
+  }
+  if (value.aliases !== undefined) {
+    if (!strings(value.aliases)) {
+      return undefined
+    }
+    result.aliases = value.aliases
+  }
+  for (const key of ['modifiedAt', 'createdAt'] as const) {
+    const member = value[key]
+
+    if (member !== undefined) {
+      if (member !== null && typeof member !== 'string') {
+        return undefined
+      }
+      Object.assign(result, { [key]: member })
+    }
+  }
+  if (value.fields !== undefined) {
+    const fields = value.fields
+
+    if (
+      !record(fields) ||
+      !fieldValues(fields.keys) ||
+      !strings(fields.order) ||
+      !['unreadable', 'truncated'].every(
+        (key) => fields[key] === undefined || strings(fields[key]),
+      ) ||
+      !['unreadableMore', 'truncatedMore'].every(
+        (key) => fields[key] === undefined || typeof fields[key] === 'number',
+      )
+    ) {
+      return undefined
+    }
+    result.fields = fields as WireNoteDetail['fields']
+  }
+
+  return result
+}
+
 // Pull the slug out of a space-scoped path (/api/s/<slug>/…); null for any other
 // route family (host-level, id-addressed) — those never carry a space grant.
 const spaceOfPath = (path: string): string | null => {
@@ -131,7 +217,11 @@ export const req = async <T>(path: string, opts: RequestInit = {}): Promise<T> =
       err.operationId = data.operationId
     }
     if (err.reason === 'version_conflict' && data.current) {
-      err.current = noteDetailView(data.current as WireNoteDetail)
+      const current = conflictCurrent(data.current)
+
+      if (current) {
+        err.current = noteDetailView(current)
+      }
     }
     if (err.reason === 'note_already_exists') {
       if (data.existing) {

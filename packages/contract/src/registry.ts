@@ -69,6 +69,11 @@ import {
   FavoritesResponseSchema,
 } from './schemas/rest/favorites'
 import {
+  FieldSchemaConflictResponseSchema,
+  FieldSchemaResponseSchema,
+  FieldSchemaUpdateSchema,
+} from './schemas/rest/fields'
+import {
   CreateFolderPageRequestSchema,
   CreateFolderPageResponseSchema,
   CreateFolderRequestSchema,
@@ -97,11 +102,15 @@ import {
   PinNoteResponseSchema,
   RemoveResponseSchema,
   SaveResponseSchema,
+  SetNoteFieldsRequestSchema,
+  SetNoteFieldsResponseSchema,
   UpdateNoteRequestSchema,
 } from './schemas/rest/note'
 import {
   BucketsQuerySchema,
   BucketsResponseSchema,
+  FieldsQuerySchema,
+  FieldsResponseSchema,
   NotesQuerySchema,
   NotesResponseSchema,
   PreviewsRequestSchema,
@@ -168,6 +177,13 @@ export const contract = {
   treeChildren: { request: TreeChildrenQuerySchema, response: TreeChildrenResponseSchema },
   buckets: { request: BucketsQuerySchema, response: BucketsResponseSchema },
   tags: { request: TagsQuerySchema, response: TagsResponseSchema },
+  fields: { request: FieldsQuerySchema, response: FieldsResponseSchema },
+  fieldSchema: { response: FieldSchemaResponseSchema },
+  fieldSchemaPut: {
+    request: FieldSchemaUpdateSchema,
+    response: FieldSchemaResponseSchema,
+    conflict: FieldSchemaConflictResponseSchema,
+  },
   graph: { response: GraphResponseSchema },
   note: { response: NoteDetailResponseSchema },
   previews: { request: PreviewsRequestSchema, response: PreviewsResponseSchema },
@@ -180,6 +196,11 @@ export const contract = {
   update: {
     request: UpdateNoteRequestSchema,
     response: SaveResponseSchema,
+    conflict: ConflictResponseSchema,
+  },
+  setNoteFields: {
+    request: SetNoteFieldsRequestSchema,
+    response: SetNoteFieldsResponseSchema,
     conflict: ConflictResponseSchema,
   },
   revisions: { request: NoteRevisionsQuerySchema, response: NoteRevisionsResponseSchema },

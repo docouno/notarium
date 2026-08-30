@@ -500,7 +500,7 @@ export class HistorySurface {
           })
         : null
     const state = detail?.logicalState ? parseLogicalNoteState(detail.logicalState) : null
-    const frontmatter: Record<string, unknown> = {}
+    const frontmatter = Object.create(null) as Record<string, unknown>
     let sourceLocator: string | undefined
 
     for (const entry of state?.frontmatter ?? []) {

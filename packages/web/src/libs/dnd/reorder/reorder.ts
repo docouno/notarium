@@ -1,4 +1,9 @@
-import { type DragEvent as ReactDragEvent, useRef, useState } from 'react'
+import {
+  type DragEvent as ReactDragEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+  useRef,
+  useState,
+} from 'react'
 
 import { TEXT_PLAIN_MIME } from '../dnd'
 
@@ -67,6 +72,7 @@ export type ReorderHandle = {
   onDragStart: (e: ReactDragEvent) => void
   onDragOver: (e: ReactDragEvent) => void
   onDragEnd: (e: ReactDragEvent) => void
+  onKeyDown: (e: ReactKeyboardEvent) => void
   dropIndicator: 'before' | 'after' | null
   dragging: boolean
 }
@@ -158,6 +164,24 @@ export const useReorder = (
         setTarget(key, dropsAfter(e))
       },
       onDragEnd: end,
+      onKeyDown: (e) => {
+        if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') {
+          return
+        }
+        e.preventDefault()
+        e.stopPropagation()
+        const index = keys.indexOf(key)
+        const neighbour = e.key === 'ArrowUp' ? keys[index - 1] : keys[index + 1]
+
+        if (index < 0 || neighbour === undefined) {
+          return
+        }
+        const next = reorderKeys(keys, key, neighbour, e.key === 'ArrowDown')
+
+        if (!sameOrder(next, keys)) {
+          onReorder(next)
+        }
+      },
       dropIndicator:
         over && over.key === key && active.current !== key
           ? over.after

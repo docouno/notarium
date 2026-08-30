@@ -2,6 +2,7 @@
 // via the host's thin transport mappers (docs/contract.md#mappers).
 // canon: docs/architecture.md#p8
 
+import type { FieldFilter, FieldPatch, NoteFields } from '../libs/fields'
 import type {
   DocumentRole,
   DocumentState,
@@ -536,6 +537,14 @@ export type NoteMeta = {
   /** The note's tags, as authored. On the snapshot this is THE tag axis (Feed/graph filter, facet,
    *  histogram), matched via the shared `foldTag`/`matchesTags`. */
   tags?: string[]
+  /** Typed primary note kind, projected independently from the bounded custom-fields blob. */
+  noteType?: string
+  /** The note's authored frontmatter beyond the typed fields above — THE field axis
+   *  on the snapshot. Absent means "this row did not carry the column", never "the
+   *  note has no author keys": a delta poll sends it only for changed rows, and the
+   *  read-model carries the previous value forward.
+   *  canon: docs/note-model.md#note-ontology */
+  fields?: NoteFields
   /** Last content change. An engine that only knows the day reports midnight UTC; the read-model
    *  upgrades it from the journal and its own write/delta stamps. */
   modifiedAt: string | null
@@ -763,6 +772,14 @@ export type WriteInput = {
    *  `notarium-id` claim, so this cannot smuggle in an identity.
    *  canon: docs/import.md#drag-and-drop-of-text-files-223 */
   frontmatter?: readonly FrontmatterEntry[]
+  /** Point patch over authored frontmatter. Missing keys stay untouched; null
+   * removes one key. Host calls resolve byte-shape hints from the space schema. */
+  fields?: FieldPatch
+  /** Host-proven point intent: title/body/tags/resolver inputs are byte-equivalent
+   * to the live note, so body-derived caches and indexes stay valid. */
+  derivedContentUnchanged?: true
+  /** Host-internal keys whose valid number/checkbox scalars may be emitted bare. */
+  fieldsUnquoted?: string[]
   /** Host-internal full-state restore mode. `replace` makes the supplied raw
    * frontmatter the complete authored set instead of merging it into the live
    * file. Ordinary writes/imports omit it and retain merge semantics. */
@@ -1071,6 +1088,7 @@ export type NotesQuery = {
   /** Tag filter: keep notes carrying ANY listed tag (OR), matched case-insensitively and
    *  hierarchically (`ml` also matches `ml/nlp`). */
   tags?: string[]
+  fields?: FieldFilter
   /** Date range: inclusive local-day bounds on the selected axis. `dateField` absent = use the
    *  sort axis (`title` → `modified`); `tz` = minutes east of UTC. */
   from?: string
@@ -1089,6 +1107,7 @@ export type BucketsQuery = {
   depth: Depth
   folders?: string[]
   tags?: string[]
+  fields?: FieldFilter
   from?: string
   to?: string
   dateField?: DateField

@@ -84,7 +84,7 @@ PLAYWRIGHT_TEST_IMAGE ?= mcr.microsoft.com/playwright:v1.60.0-jammy
 
 .DEFAULT_GOAL := help
 .PHONY: help prepare deps deps-vector doctor dev up start down stop restart logs ps sh \
-        checkup audit-runtime test-coverage test-pg test-browser import-bench write-perf-gate graph-revision-gate bench-session-audit backup restore backup-smoke seed seed-list \
+        checkup audit-runtime test-coverage test-pg test-browser import-bench bench-fields-snapshot write-perf-gate graph-revision-gate bench-session-audit backup restore backup-smoke seed seed-list \
         footage demo-shots demo-preview demo-plates image release release-rc release-smoke save clean
 
 help: ## List available targets
@@ -302,6 +302,50 @@ import-bench: ## Run the Markdown-tree import scale bench in Docker: make import
 	    --workdir /app -e HOME=/tmp -e NOTES=$(NOTES) -e SOURCE=$(SOURCE) \
 	    --entrypoint npm "$(NODE_TEST_IMAGE)" run bench:import-markdown-tree
 
+# --- fields projection snapshot-memory bench --------------------------------
+# [#384] What the authored-frontmatter projection costs the read-model's snapshot,
+# measured on the `fields-scale` catalog corpus: 10 000 notes with a dozen author
+# keys each. Two numbers come out — the cost of the author KEYS (authored against a
+# title-only corpus, both projecting the column) and the cost of the PROJECTION
+# itself (the same corpus on the ladder as it stood before the fields step, where
+# the column does not exist at all). Both are printed, neither is asserted: a heap
+# threshold pinned to one machine is a flaky test wearing a benchmark's clothes.
+# Containerised for the same reason import-bench and test-pg are — these numbers go
+# into the task's recap as the figure the NEXT task compares against, and a heap
+# delta is only comparable across runs if the Node build, the V8 flags and the
+# dependency profile underneath it are the same. The npm script carries
+# NODE_OPTIONS=--expose-gc, which the measurement requires and cannot fake.
+bench-fields-snapshot: ## Measure the fields projection's snapshot memory in Docker: make bench-fields-snapshot [SCALE=1] [CASE=fields-scale]
+	@set -eu; \
+	  cleanup() { \
+	    docker rm -f $(CHECKUP_RUNNER_CONTAINER) >/dev/null 2>&1 || true; \
+	    docker volume rm -f $(CHECKUP_WORKSPACE_VOLUME) >/dev/null 2>&1 || true; \
+	  }; \
+	  trap cleanup EXIT INT TERM; \
+	  cleanup; \
+	  docker volume create $(CHECKUP_WORKSPACE_VOLUME) >/dev/null; \
+	  docker run --rm --name $(CHECKUP_RUNNER_CONTAINER) \
+	    --mount "type=bind,src=$(CURDIR),dst=/source,readonly" \
+	    --mount "type=volume,src=$(CHECKUP_WORKSPACE_VOLUME),dst=/app" \
+	    --entrypoint sh "$(NODE_TEST_IMAGE)" -c \
+	    "tar -C /source --exclude='./.git' --exclude='./.env' --exclude='./.data' \
+	      --exclude='./node_modules' --exclude='./packages/*/node_modules' \
+	      --exclude='./packages/*/dist' --exclude='./docker/volumes' \
+	      --exclude='./coverage' --exclude='./test-results' --exclude='./playwright-report' \
+	      -cf - . | tar -C /app -xf -"; \
+	  docker run --rm --name $(CHECKUP_RUNNER_CONTAINER) \
+	    --mount "type=volume,src=$(CHECKUP_WORKSPACE_VOLUME),dst=/app" \
+	    --workdir /app -e HOME=/tmp --entrypoint sh "$(NODE_TEST_IMAGE)" -c \
+	    "set -eu; \
+	     pinned_npm=\"\$$(node -p \"(/^npm@([0-9]+[.][0-9]+[.][0-9]+([-][0-9A-Za-z.-]+)?)([+].*)?$$/.exec(require('./package.json').packageManager)||[,''])[1]\")\"; \
+	     [ -n \"\$$pinned_npm\" ] || { echo 'package.json packageManager must be npm@<x.y.z>' >&2; exit 1; }; \
+	     npm i -g \"npm@\$$pinned_npm\"; \
+	     npm -v; \
+	     npm run deps:lean"; \
+	  docker run --rm --name $(CHECKUP_RUNNER_CONTAINER) \
+	    --mount "type=volume,src=$(CHECKUP_WORKSPACE_VOLUME),dst=/app" \
+	    --workdir /app -e HOME=/tmp -e SCALE=$(or $(SCALE),1) -e CASE=$(or $(CASE),fields-scale) \
+	    --entrypoint npm "$(NODE_TEST_IMAGE)" run bench:fields-snapshot
 write-perf-gate: ## Prove the bounded Markdown/frontmatter write-path costs
 	npm run bench:write-path
 

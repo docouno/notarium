@@ -1,0 +1,24 @@
+.plate {
+  min-width: 900px;
+  padding: 24px;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.plate h1 {
+  margin: 0 0 18px;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 80px 100px 110px 130px minmax(160px, 1fr) 110px;
+  align-items: center;
+  gap: 12px;
+  min-height: 52px;
+}
+
+.row > strong {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-transform: capitalize;
+}

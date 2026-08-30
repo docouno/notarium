@@ -370,10 +370,10 @@ describe('what one write costs the read-model (#302)', () => {
     // differing only in what is already there, because a second write inside one
     // stack can only be compared against the tree the first one left.
     //
-    // What this does NOT claim: an INTERACTIVE write (outside an import bracket) is
-    // still O(corpus) in the read-model — it republishes the whole id registry to a
-    // path-keyed engine and rebuilds the exact resolve table. Both are deliberate,
-    // both are outside #302, and neither is what made the import quadratic.
+    // What this does NOT claim: an arbitrary INTERACTIVE identity-changing write
+    // (outside an import bracket) still republishes the whole id registry to a
+    // path-keyed engine and may rebuild resolver context. A host-proven field-only
+    // edit now skips those paths, but that narrower proof lives with the fields gate.
     const busy = await freshStack(25)
     const empty = await freshStack(1)
 

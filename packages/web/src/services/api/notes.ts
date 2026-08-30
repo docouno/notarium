@@ -11,6 +11,8 @@ import type {
   PreviewsResponse,
   RemoveResponse,
   SaveResponse,
+  SetNoteFieldsRequest,
+  SetNoteFieldsResponse,
   SortDir,
   TagsResponse,
   Tree,
@@ -60,6 +62,18 @@ export const notesApi = {
     }
     for (const t of params.tags || []) {
       q.append(QUERY_KEY.tags, t)
+    }
+    for (const field of params.field || []) {
+      q.append(QUERY_KEY.field, field)
+    }
+    for (const field of params.fieldDay || []) {
+      q.append(QUERY_KEY.fieldDay, field)
+    }
+    for (const field of params.fieldAny || []) {
+      q.append(QUERY_KEY.fieldAny, field)
+    }
+    for (const field of params.fieldBad || []) {
+      q.append(QUERY_KEY.fieldBad, field)
     }
     if (params.q) {
       q.set(QUERY_KEY.q, params.q)
@@ -167,6 +181,11 @@ export const notesApi = {
           method: 'POST',
           body: JSON.stringify(createInputToWire(input)),
         }).then(saveResultView),
+  noteFieldsPut: (body: SetNoteFieldsRequest) =>
+    req<SetNoteFieldsResponse>('/api/note/fields', {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    }),
   // The note's timeline window (#12), newest first, with the honest total.
   revisionsGet: (id: string, opts: { offset?: number; limit?: number } = {}) => {
     const q = new URLSearchParams({ id })

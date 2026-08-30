@@ -6,7 +6,14 @@
 
 import { describe, expect, it } from 'vitest'
 
-import { absoluteDate, compactDate, exactDateTime, timeAgo } from './datetime'
+import {
+  absoluteDate,
+  compactDate,
+  exactDateTime,
+  fieldDate,
+  replaceCalendarDay,
+  timeAgo,
+} from './datetime'
 
 const NOW = new Date('2026-06-25T12:00:00.000Z')
 const ago = (ms: number) => new Date(NOW.getTime() - ms).toISOString()
@@ -84,6 +91,27 @@ describe('absoluteDate (#179 — canonical absolute date-only)', () => {
     expect(absoluteDate(undefined)).toBe('')
     expect(absoluteDate('nope')).toBe('')
   })
+
+  it('keeps a date-only value on its authored local calendar day', () => {
+    const previous = process.env.TZ
+
+    process.env.TZ = 'America/Los_Angeles'
+    try {
+      expect(absoluteDate('2026-09-01')).toBe(
+        new Date(2026, 8, 1).toLocaleDateString(undefined, {
+          month: 'short',
+          day: 'numeric',
+          year: 'numeric',
+        }),
+      )
+    } finally {
+      if (previous === undefined) {
+        delete process.env.TZ
+      } else {
+        process.env.TZ = previous
+      }
+    }
+  })
 })
 
 describe('compactDate (#188 — dense absolute date)', () => {
@@ -108,5 +136,19 @@ describe('compactDate (#188 — dense absolute date)', () => {
   it('empty / invalid input → ""', () => {
     expect(compactDate(undefined, NOW)).toBe('')
     expect(compactDate('nope', NOW)).toBe('')
+  })
+})
+
+describe('replaceCalendarDay', () => {
+  it('keeps an instant suffix and handles day-only and clear values', () => {
+    expect(replaceCalendarDay('2026-09-01T10:00:00Z', '2026-09-02')).toBe('2026-09-02T10:00:00Z')
+    expect(replaceCalendarDay('2026-09-01', '2026-09-02')).toBe('2026-09-02')
+    expect(replaceCalendarDay('2026-09-01T10:00:00Z', '')).toBe('')
+  })
+})
+
+describe('fieldDate', () => {
+  it('formats the authored calendar prefix without timezone-shifting an instant', () => {
+    expect(fieldDate('2026-09-01T23:30:00-11:00')).toBe(absoluteDate('2026-09-01'))
   })
 })

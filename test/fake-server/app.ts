@@ -22,6 +22,7 @@ import {
   analyzeDocumentState,
   CachedStore,
   DOCUMENT_ROLE,
+  type FieldSchema,
   InMemoryRestoreOperationPersistence,
   type InMemoryRevisionPersistence,
   InMemorySpaceLifecyclePersistence,
@@ -38,6 +39,7 @@ import {
   createFsArtifactStore,
   createFsImportStagingStore,
   createImportHandler,
+  createInMemoryFieldSchemaStore,
   createJobRunner,
   createRolesService,
   type CustomAbilityCreator,
@@ -141,6 +143,8 @@ export type SpaceFixture = {
   /** Past slugs pre-seeded into the real SpaceManager registry. */
   aliases?: string[]
   notes: StoreSnapshot['notes']
+  fieldSchema?: FieldSchema
+  fieldSchemaRaw?: string
   /** Seeded revision history for the activity dashboard. */
   activity?: ActivityFixture[]
 }
@@ -520,6 +524,7 @@ export const createApp = async (
     // Permanent purge: drop the in-memory world (the on-disk analogue). The
     // registry row is removed by metaDbStub.purgeSpace above.
     onPurge: async (rec) => {
+      fieldSchemaStore.clear(rec.id)
       worlds.get(rec.id)?.revisions.clear()
       worlds.delete(rec.id)
     },
@@ -544,6 +549,19 @@ export const createApp = async (
   // Boot: resolve-or-mint each config space's id (populates the registry), then a
   // stable slug→id translator for the seeders below.
   await manager.init()
+  const fieldSchemaStore = createInMemoryFieldSchemaStore()
+
+  for (const seeded of fixture.spaces) {
+    const id = manager.resolveId(seeded.slug)
+
+    if (id) {
+      if (seeded.fieldSchemaRaw) {
+        fieldSchemaStore.seedRaw(id, seeded.fieldSchemaRaw)
+      } else {
+        fieldSchemaStore.seed(id, seeded.fieldSchema)
+      }
+    }
+  }
   // A fixture authors the current slug plus its retired handles. Config provision
   // mints the current record; apply the history afterward through the same
   // persistence + in-memory seams a committed rename updates.
@@ -1041,6 +1059,7 @@ export const createApp = async (
     scopePins: fixture.noContextFacets ? undefined : scopePins,
     contextOrder: fixture.noContextFacets ? undefined : contextOrder,
     markerStore: opts.markerStore,
+    fieldSchemaStore,
     // Omitted when the fixture opts out (noJobs) → the async routes 404, exercising the
     // capability-degradation tier the way a real meta-DB-less host does.
     jobs: jobsEnabled ? jobsMeta.jobs : undefined,
@@ -1080,6 +1099,7 @@ export const createApp = async (
 
       if (!rec || !next.spaces.some((s) => s.slug === rec.slug)) {
         const world = worlds.get(id)
+        fieldSchemaStore.clear(id)
         await manager.remove(id)
         world?.revisions.clear()
         worlds.delete(id)
@@ -1120,6 +1140,11 @@ export const createApp = async (
         throw new Error(`fixture aliases reference undeclared space: ${s.slug}`)
       }
       manager.applyRename({ ...record, aliases: [...(s.aliases ?? [])] })
+      if (s.fieldSchemaRaw) {
+        fieldSchemaStore.seedRaw(record.id, s.fieldSchemaRaw)
+      } else {
+        fieldSchemaStore.seed(record.id, s.fieldSchema)
+      }
     }
     // Mirror the registry to the live entries: drops removed spaces, picks up the
     // fresh ids of re-added ones (manager.add mints but doesn't persist) — so id↔slug

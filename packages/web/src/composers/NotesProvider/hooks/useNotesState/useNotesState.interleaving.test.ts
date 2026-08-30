@@ -608,7 +608,7 @@ describe('useNotesState interleavings', () => {
     harness.api.noteGet
       .mockReturnValueOnce(staleLive.promise)
       .mockReturnValueOnce(freshDeleted.promise)
-    let reloaded!: Promise<void>
+    let reloaded!: Promise<boolean>
 
     await act(async () => {
       reloaded = state.reloadNote()
@@ -622,6 +622,51 @@ describe('useNotesState interleavings', () => {
     await act(async () => freshDeleted.resolve(detail(true)))
     await reloaded
     expect(state.note?.deleted).toBe(true)
+  })
+
+  it('does not repeat an SSE detail read already satisfied after that event', async () => {
+    vi.useFakeTimers()
+    setPath('/n/D')
+    harness.api.noteGet
+      .mockResolvedValueOnce(detail())
+      .mockResolvedValueOnce({ ...detail(), versionToken: 'v2', content: 'fresh' })
+    render()
+    await settle()
+
+    await emitChanged(['D'], [])
+    await act(async () => {
+      await state.reloadNote()
+    })
+    await act(async () => vi.advanceTimersByTimeAsync(1))
+
+    expect(state.note?.versionToken).toBe('v2')
+    expect(harness.api.noteGet).toHaveBeenCalledTimes(2)
+  })
+
+  it('retries an opening detail whose response predates an upsert event', async () => {
+    vi.useFakeTimers()
+    const stale = deferred<NoteDetailView>()
+    const fresh = deferred<NoteDetailView>()
+
+    harness.api.noteGet.mockReturnValueOnce(stale.promise).mockReturnValueOnce(fresh.promise)
+    render()
+    await settle()
+    let opened!: Promise<void>
+
+    await act(async () => {
+      opened = state.openNote('D')
+      await Promise.resolve()
+    })
+    await emitChanged(['D'], [])
+    await act(async () => vi.advanceTimersByTimeAsync(1))
+
+    await act(async () => stale.resolve({ ...detail(), content: 'stale' }))
+    expect(harness.api.noteGet).toHaveBeenCalledTimes(2)
+    await act(async () => fresh.resolve({ ...detail(), versionToken: 'v2', content: 'fresh' }))
+    await opened
+
+    expect(state.note?.content).toBe('fresh')
+    expect(harness.api.noteGet).toHaveBeenCalledTimes(2)
   })
 
   it('rejects a late deleted detail after restore and retries the live note', async () => {

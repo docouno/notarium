@@ -85,6 +85,54 @@ const hostFor = (
 }
 
 describe('WriteEngine destination fence', () => {
+  it('preserves body-derived caches for a host-proven field-only intent', async () => {
+    const id = 'field-only-id'
+    const path = 'field-only.md'
+    const meta: NoteMeta = {
+      id,
+      title: 'Field only',
+      class: 'user-doc',
+      filePath: path,
+      fields: { keys: { status: 'todo' } },
+      modifiedAt: null,
+      createdAt: null,
+    }
+    const notes = new Map([[id, meta]])
+    const live = {
+      ...meta,
+      content: 'unchanged body',
+      frontmatter: { status: 'todo' },
+      versionToken: 'before-token',
+      physicalIncarnation: { adapterId: 'test', claim: { kind: 'test', value: 'before' } },
+    } as unknown as NoteContent
+    const { host } = hostFor(notes)
+
+    ;(host.inner.read as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce(live)
+      .mockResolvedValue({ ...live, versionToken: 'after-token' })
+    ;(host.inner.write as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id,
+      title: meta.title,
+      class: meta.class,
+      filePath: path,
+      versionToken: 'after-token',
+    })
+
+    await new WriteEngine(host).write({
+      originalId: id,
+      title: meta.title,
+      content: live.content,
+      versionToken: exactVersionToken(live),
+      fields: { status: 'done' },
+      derivedContentUnchanged: true,
+    })
+
+    expect(host.previewCache.set).not.toHaveBeenCalled()
+    expect(host.noteFactsCache.delete).not.toHaveBeenCalled()
+    expect(host.snap.patchNoteEdges).not.toHaveBeenCalled()
+    expect(host.emitChanged).toHaveBeenCalledWith([id], [], false, false)
+  })
+
   it.each([
     ['same derived edges', false, false],
     ['changed derived edges', true, true],
@@ -138,7 +186,7 @@ describe('WriteEngine destination fence', () => {
         versionToken: exactVersionToken(live),
       })
 
-      expect(host.emitChanged).toHaveBeenCalledWith([id], [], expected)
+      expect(host.emitChanged).toHaveBeenCalledWith([id], [], expected, false)
     },
   )
 
@@ -193,7 +241,7 @@ describe('WriteEngine destination fence', () => {
       }),
     ).resolves.toBeDefined()
     expect(host.previewCache.set).toHaveBeenCalled()
-    expect(host.emitChanged).toHaveBeenCalledWith([id], [], false)
+    expect(host.emitChanged).toHaveBeenCalledWith([id], [], false, false)
   })
 
   it('enters aroundWrite after the mutation claim and releases it after finalize', async () => {
@@ -273,7 +321,7 @@ describe('WriteEngine destination fence', () => {
       'finalize',
       'around:finally',
     ])
-    expect(host.emitChanged).toHaveBeenCalledWith([id], [], false)
+    expect(host.emitChanged).toHaveBeenCalledWith([id], [], false, false)
   })
 
   it('releases aroundWrite when the physical write fails', async () => {

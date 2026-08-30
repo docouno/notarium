@@ -1,8 +1,8 @@
 import { type MouseEvent as ReactMouseEvent, useRef, useState } from 'react'
 import { cx } from '../../libs/cx/cx'
+import { absoluteDate } from '../../libs/datetime'
 import { IconCalendar, IconX } from '../Icons'
 import { CalendarPopover } from './CalendarPopover'
-import { displayLabel } from './helpers/calendarGrid'
 import styles from './DatePicker.module.scss'
 
 // A calendar date picker — a calendar-day value chosen from a popover month grid.
@@ -20,6 +20,8 @@ type DatePickerProps = {
   /** The selected day as `YYYY-MM-DD`; '' = unset. */
   value: string
   onChange: (value: string) => void
+  /** Explicit removal capability. Omit for required/system dates. */
+  onClear?: () => void
   /** Earliest selectable day as `YYYY-MM-DD`; invalid/absent = unbounded. */
   min?: string
   /** Latest selectable day as `YYYY-MM-DD`; invalid/absent = unbounded. */
@@ -27,6 +29,8 @@ type DatePickerProps = {
   placeholder?: string
   disabled?: boolean
   className?: string
+  icon?: boolean
+  appearance?: 'default' | 'quiet'
   'aria-label'?: string
   'data-testid'?: string
 }
@@ -34,17 +38,20 @@ type DatePickerProps = {
 export const DatePicker = ({
   value,
   onChange,
+  onClear,
   min,
   max,
   placeholder = 'Pick a date',
   disabled = false,
   className,
+  icon = true,
+  appearance = 'default',
   'aria-label': ariaLabel,
   'data-testid': testId,
 }: DatePickerProps) => {
   const triggerRef = useRef<HTMLButtonElement>(null)
   const [open, setOpen] = useState(false)
-  const label = displayLabel(value)
+  const label = absoluteDate(value) || null
 
   const openMenu = () => {
     if (!disabled) {
@@ -54,41 +61,53 @@ export const DatePicker = ({
 
   const clear = (e: ReactMouseEvent) => {
     e.stopPropagation()
-    onChange('')
+    onClear?.()
   }
+  const clearLabel = `Clear ${ariaLabel ?? 'date'}`
 
   return (
     <>
-      <button
-        ref={triggerRef}
-        type="button"
-        className={cx(styles.trigger, disabled && styles.disabled, className)}
-        disabled={disabled}
-        aria-label={ariaLabel}
-        aria-haspopup="dialog"
-        aria-expanded={open}
-        data-testid={testId}
-        onClick={() => (open ? setOpen(false) : openMenu())}
+      <div
+        className={cx(
+          styles.picker,
+          onClear && styles.hasValue,
+          appearance === 'quiet' && styles.quiet,
+          disabled && styles.disabled,
+          className,
+        )}
       >
-        <span className={styles.triggerIcon}>
-          <IconCalendar size={14} />
-        </span>
-        <span className={cx(styles.triggerLabel, !label && styles.placeholder)}>
-          {label ?? placeholder}
-        </span>
-        {label && !disabled && (
-          <span
+        <button
+          ref={triggerRef}
+          type="button"
+          className={styles.trigger}
+          disabled={disabled}
+          aria-label={ariaLabel}
+          aria-haspopup="dialog"
+          aria-expanded={open}
+          data-testid={testId}
+          onClick={() => (open ? setOpen(false) : openMenu())}
+        >
+          {icon && (
+            <span className={styles.triggerIcon}>
+              <IconCalendar size={14} />
+            </span>
+          )}
+          <span className={cx(styles.triggerLabel, !label && styles.placeholder)}>
+            {label ?? placeholder}
+          </span>
+        </button>
+        {onClear && !disabled && (
+          <button
+            type="button"
             className={styles.clear}
-            role="button"
-            tabIndex={-1}
-            aria-label="Clear date"
+            aria-label={clearLabel}
             onMouseDown={(e) => e.preventDefault()}
             onClick={clear}
           >
             <IconX size={13} />
-          </span>
+          </button>
         )}
-      </button>
+      </div>
       {open && (
         <CalendarPopover
           value={value}
@@ -98,8 +117,14 @@ export const DatePicker = ({
           onPick={(v) => {
             onChange(v)
             setOpen(false)
+            queueMicrotask(() => triggerRef.current?.focus())
           }}
-          onClose={() => setOpen(false)}
+          onClose={(restoreFocus) => {
+            setOpen(false)
+            if (restoreFocus) {
+              queueMicrotask(() => triggerRef.current?.focus())
+            }
+          }}
         />
       )}
     </>

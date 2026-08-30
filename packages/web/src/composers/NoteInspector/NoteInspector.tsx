@@ -1,10 +1,17 @@
 import { type ReactNode, useMemo } from 'react'
 
 import { AsideGroups, type AsidePanelDef, type LayoutSpec } from '../../core/AsideGroups'
+import { useToast } from '../../core/Toast'
+import { canWriteSpace } from '../../libs/access'
 import { STORAGE_KEYS } from '../../libs/storageKeys'
-import type { GraphNodeView as GraphNode } from '../../libs/wire'
+import type { GraphNodeView as GraphNode, NoteDetailView } from '../../libs/wire'
+import { api } from '../../services/api'
 import { MetaPanel } from '../../widgets/MetaPanel'
+import { useAuth } from '../AuthProvider'
+import { useFieldSchemaForSpace } from '../FieldSchemaProvider'
+import { useNotes } from '../NotesProvider'
 import { GraphPanel } from './GraphPanel'
+import { useInlineNoteFields } from './hooks/useInlineNoteFields'
 import { LinkList } from './LinkList'
 import { useNoteGraph } from './useNoteGraph'
 
@@ -24,10 +31,8 @@ const DEFAULT_LAYOUT: LayoutSpec = [
   { panels: ['links', 'backlinks'], activeTab: 'links' },
 ]
 
-type MetaNote = { filePath?: string; frontmatter?: Record<string, unknown>; class?: string }
-
 type NoteInspectorProps = {
-  note: MetaNote | null
+  note: NoteDetailView | null
   activeId?: string | null
   space: string
   theme?: string
@@ -55,6 +60,30 @@ export const NoteInspector = ({
   headerAction,
 }: NoteInspectorProps) => {
   const { data, error, depth, setDepth, slice, backlinks, outgoing } = useNoteGraph(activeId, space)
+  const { me, mode } = useAuth()
+  const { reloadNote } = useNotes()
+  const toast = useToast()
+  const noteSpace = note?.space ?? space
+  const fieldSchema = useFieldSchemaForSpace(noteSpace)
+  const canWriteNote = Boolean(note?.id) && !note?.deleted && canWriteSpace(me, mode, noteSpace)
+  const canWriteFields =
+    canWriteNote &&
+    !fieldSchema.loading &&
+    fieldSchema.valueWrites &&
+    note?.fieldsWritable !== false
+  const documentFieldError = canWriteNote ? note?.fieldsWriteError : undefined
+
+  const {
+    values: fieldValues,
+    busyKey: fieldBusyKey,
+    setField,
+  } = useInlineNoteFields({
+    note,
+    canWrite: canWriteFields,
+    write: api.noteFieldsPut,
+    reload: reloadNote,
+    onError: (message) => toast.error(message),
+  })
 
   const panels = useMemo<AsidePanelDef[]>(() => {
     const defs: AsidePanelDef[] = [
@@ -105,7 +134,25 @@ export const NoteInspector = ({
       {
         id: 'meta',
         label: 'Meta',
-        render: () => <MetaPanel note={note ?? {}} space={space} onOpenTag={onOpenTag} />,
+        render: () => (
+          <MetaPanel
+            note={note ?? { frontmatter: {} }}
+            space={noteSpace}
+            schema={fieldSchema.fields}
+            fieldValues={fieldValues}
+            canWrite={canWriteFields}
+            busyKey={fieldBusyKey}
+            onSetField={(key, value) => void setField(key, value)}
+            onOpenTag={onOpenTag}
+            schemaError={documentFieldError ?? fieldSchema.error}
+            schemaErrorMessage={
+              documentFieldError ? 'Custom field editing is unavailable' : undefined
+            }
+            onRetrySchema={
+              !documentFieldError && fieldSchema.error ? () => void fieldSchema.reload() : undefined
+            }
+          />
+        ),
       },
     ]
 
@@ -129,7 +176,13 @@ export const NoteInspector = ({
     outgoing,
     backlinks,
     note,
-    space,
+    noteSpace,
+    fieldSchema,
+    fieldValues,
+    canWriteFields,
+    documentFieldError,
+    fieldBusyKey,
+    setField,
     historyContent,
   ])
 

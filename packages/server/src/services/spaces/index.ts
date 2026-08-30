@@ -1,5 +1,6 @@
 export { SpaceManager } from './spaceManager'
 export { spaceNotFound } from './errors'
+export { setNoteFields, type SetNoteFieldsInput } from './noteFields'
 export { resolveSpaceRecord } from './spaceResolver'
 export type { DiscoveredSpace, SpaceDef, SpaceManagerOptions, SpaceStore } from './types'
 export {

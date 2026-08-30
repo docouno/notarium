@@ -4,6 +4,7 @@ import { NOTE_CLASS } from '@notarium/contract/enums'
 import { directoryOf, isFolderPageNote } from '@notarium/core'
 import { effectiveSlug } from '@notarium/core/slug'
 import { useEditing } from '../../composers/EditingProvider'
+import { useFieldSchemaForSpace } from '../../composers/FieldSchemaProvider'
 import { FolderChildrenSummary } from '../../composers/FolderChildrenSummary'
 import { type NoteError, useNotes } from '../../composers/NotesProvider'
 import { useSpace } from '../../composers/SpaceProvider'
@@ -36,6 +37,7 @@ export const NotePage = () => {
   const { mode, note, noteError, knownNotes, navigating, openNote, reloadNote } = useNotes()
   const { openOrCreateFromWiki } = useEditing()
   const { space, canWrite, personalSpace } = useSpace()
+  const fieldSchema = useFieldSchemaForSpace(note?.space ?? space)
   const { confirm } = useDialog()
   const toast = useToast()
   const navigate = useNavigate()
@@ -117,6 +119,7 @@ export const NotePage = () => {
       <DeletedNoteView
         note={note}
         notes={knownNotes}
+        schema={fieldSchema.fields}
         onOpenWikiLink={openNote}
         onUnresolvedWiki={openOrCreateFromWiki}
         canManage={canManageNote}
@@ -184,6 +187,9 @@ export const NotePage = () => {
     <NoteReader
       note={note}
       notes={knownNotes}
+      schema={fieldSchema.fields}
+      schemaError={fieldSchema.error}
+      onRetrySchema={() => void fieldSchema.reload()}
       onOpenWikiLink={openNote}
       // A link the session cache can't resolve: ask the server, then open it
       // (real but unloaded) or offer to create it (a genuine ghost — #65

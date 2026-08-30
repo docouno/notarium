@@ -498,6 +498,63 @@ describe('queryNotes — tag filter (#109)', () => {
   })
 })
 
+describe('queryNotes — field filter', () => {
+  const withFields: NoteMeta[] = [
+    note('wip.md', { fields: { keys: { status: 'wip', reviewers: ['ann', 'bo'] } } }),
+    note('done.md', { fields: { keys: { status: 'done', reviewers: ['bo'] } } }),
+    note('broken.md', { fields: { keys: {}, unreadable: ['status'] } }),
+    note('plain.md'),
+  ]
+  const status = {
+    op: 'and' as const,
+    nodes: [
+      {
+        op: 'or' as const,
+        ns: 'note' as const,
+        key: 'status',
+        values: [{ kind: 'eq' as const, value: 'wip' }],
+      },
+    ],
+  }
+
+  it('narrows the window by scalar equality and list containment', () => {
+    expect(queryNotes(withFields, q({ fields: status })).notes.map((n) => n.filePath)).toEqual([
+      'wip.md',
+    ])
+    expect(
+      queryNotes(
+        withFields,
+        q({
+          fields: {
+            op: 'and',
+            nodes: [
+              {
+                op: 'or',
+                ns: 'note',
+                key: 'reviewers',
+                values: [{ kind: 'eq', value: 'ann' }],
+              },
+            ],
+          },
+        }),
+      ).total,
+    ).toBe(1)
+  })
+
+  it('keeps the field-filtered histogram in lockstep with the window', () => {
+    const buckets = bucketCounts(withFields, {
+      sort: 'modified',
+      group: 'month',
+      depth: 'subtree',
+      tz: 0,
+      fields: status,
+    })
+
+    expect(buckets.total).toBe(queryNotes(withFields, q({ fields: status })).total)
+    expect(buckets.buckets.reduce((total, bucket) => total + bucket.count, 0)).toBe(buckets.total)
+  })
+})
+
 describe('tagFacet (#109 the tag tree)', () => {
   it('builds a folder-like tree: parents carry subtree counts, leaves direct counts', () => {
     const f = tagFacet(TAGGED)

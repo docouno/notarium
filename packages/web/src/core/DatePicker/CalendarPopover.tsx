@@ -7,6 +7,7 @@ import {
 } from 'react'
 import { createPortal } from 'react-dom'
 import { cx } from '../../libs/cx/cx'
+import { absoluteDate } from '../../libs/datetime'
 import { useDismiss } from '../../libs/hooks/useDismiss'
 import { IconChevronLeft, IconChevronRight } from '../Icons'
 import { MONTHS, MONTHS_SHORT, WEEKDAYS, YEARS_PER_PAGE } from './consts'
@@ -35,7 +36,7 @@ export const CalendarPopover = ({
   max?: string
   anchor: RefObject<HTMLButtonElement | null>
   onPick: (value: string) => void
-  onClose: () => void
+  onClose: (restoreFocus?: boolean) => void
 }) => {
   const ref = useRef<HTMLDivElement>(null)
   const bounds = boundsOf(min, max)
@@ -78,13 +79,36 @@ export const CalendarPopover = ({
     setPos({ left, top })
   }, [anchor, view, mode])
 
-  useDismiss(true, onClose, { inside: [ref, anchor], viewport: true })
+  useDismiss(true, () => onClose(false), { inside: [ref, anchor], viewport: true })
 
-  // Take focus on open so the arrow keys drive the grid immediately (the root is the
-  // keydown handler). Done once, after the first position pass.
+  // Focus the roving day itself so assistive technology announces every arrow move.
   useLayoutEffect(() => {
-    ref.current?.focus()
-  }, [])
+    if (mode !== 'days') {
+      return
+    }
+    const key = toKey(view.y, view.m, focus)
+    ref.current?.querySelector<HTMLButtonElement>(`[data-calendar-day="${key}"]`)?.focus()
+  }, [focus, mode, view.m, view.y])
+
+  useLayoutEffect(() => {
+    if (mode === 'months') {
+      const preferred = ref.current?.querySelector<HTMLButtonElement>(
+        `[data-calendar-month="${view.m}"]`,
+      )
+      ;(preferred?.disabled
+        ? ref.current?.querySelector<HTMLButtonElement>('[data-calendar-month]:not(:disabled)')
+        : preferred
+      )?.focus()
+    } else if (mode === 'years') {
+      const preferred = ref.current?.querySelector<HTMLButtonElement>(
+        `[data-calendar-year="${view.y}"]`,
+      )
+      ;(preferred?.disabled
+        ? ref.current?.querySelector<HTMLButtonElement>('[data-calendar-year]:not(:disabled)')
+        : preferred
+      )?.focus()
+    }
+  }, [mode, view.m, view.y])
 
   const shiftMonth = (delta: number) => {
     const d = new Date(view.y, view.m + delta, 1)
@@ -146,7 +170,11 @@ export const CalendarPopover = ({
     } else if (e.key === 'PageDown') {
       e.preventDefault()
       shiftMonth(1)
-    } else if (e.key === 'Enter' || e.key === ' ') {
+    } else if (e.key === 'Escape') {
+      e.preventDefault()
+      e.stopPropagation()
+      onClose(true)
+    } else if ((e.key === 'Enter' || e.key === ' ') && e.currentTarget === ref.current) {
       e.preventDefault()
       const key = toKey(view.y, view.m, focus)
 
@@ -176,7 +204,32 @@ export const CalendarPopover = ({
       role="dialog"
       aria-label="Choose date"
       tabIndex={-1}
-      onKeyDown={onKeyDown}
+      onKeyDownCapture={(event) => {
+        if (event.key === 'Escape') {
+          event.preventDefault()
+          event.stopPropagation()
+          onClose(true)
+        } else if (event.key === 'Tab') {
+          const focusable = [
+            ...(ref.current?.querySelectorAll<HTMLElement>('button:not(:disabled)') ?? []),
+          ]
+          const first = focusable[0]
+          const last = focusable.at(-1)
+
+          if (event.shiftKey && document.activeElement === first) {
+            event.preventDefault()
+            last?.focus()
+          } else if (!event.shiftKey && document.activeElement === last) {
+            event.preventDefault()
+            first?.focus()
+          }
+        }
+      }}
+      onKeyDown={(event) => {
+        if (event.target === event.currentTarget) {
+          onKeyDown(event)
+        }
+      }}
       onMouseMove={() => {
         if (kbd) {
           setKbd(false)
@@ -221,7 +274,7 @@ export const CalendarPopover = ({
               </span>
             ))}
           </div>
-          <div className={styles.grid}>
+          <div className={styles.grid} aria-label={`${MONTHS[view.m]} ${view.y}`}>
             {dayCells(view).map((c, i) => {
               const key = toKey(c.y, c.m, c.d)
               const blocked = !dayAllowed(key, bounds)
@@ -230,7 +283,9 @@ export const CalendarPopover = ({
                   key={i}
                   type="button"
                   disabled={blocked}
-                  tabIndex={-1}
+                  tabIndex={c.inMonth && c.d === focus && !blocked ? 0 : -1}
+                  data-calendar-day={key}
+                  aria-label={absoluteDate(key)}
                   aria-pressed={key === value}
                   aria-current={key === todayKey ? 'date' : undefined}
                   className={cx(
@@ -246,6 +301,7 @@ export const CalendarPopover = ({
                       onPick(key)
                     }
                   }}
+                  onKeyDown={onKeyDown}
                 >
                   {c.d}
                 </button>
@@ -265,6 +321,7 @@ export const CalendarPopover = ({
                 type="button"
                 disabled={blocked}
                 tabIndex={blocked ? -1 : 0}
+                data-calendar-month={idx}
                 aria-pressed={selected?.y === view.y && selected?.m === idx}
                 className={cx(
                   styles.cell,
@@ -300,6 +357,7 @@ export const CalendarPopover = ({
                 type="button"
                 disabled={blocked}
                 tabIndex={blocked ? -1 : 0}
+                data-calendar-year={yr}
                 aria-pressed={selected?.y === yr}
                 className={cx(
                   styles.cell,

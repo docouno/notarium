@@ -33,6 +33,40 @@
   color: var(--text-faint);
 }
 
+.field-facets {
+  display: flex;
+  flex-direction: column;
+}
+
+.field-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px var(--gutter) 6px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+  font-weight: 600;
+}
+
+.field-facet {
+  min-width: 0;
+}
+
+.field-values {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding: 0 var(--gutter) 12px;
+}
+
+.field-empty {
+  padding: 0 var(--gutter) 12px;
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
 .date-filter {
   display: flex;
   flex-direction: column;

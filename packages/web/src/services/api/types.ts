@@ -3,7 +3,7 @@ import type { SaveInput } from '../../libs/wire'
 
 export type FolderPageCreateInput = Pick<
   SaveInput,
-  'content' | 'noteType' | 'tags' | 'slug' | 'createdAt'
+  'content' | 'noteType' | 'tags' | 'fields' | 'slug' | 'createdAt'
 >
 
 /** GET …/notes window params (#64) — mirrors the contract's NotesQuery.
@@ -21,6 +21,10 @@ export type NotesQueryParams = {
   /** Tag filter (#109): keep notes carrying any listed tag (OR, hierarchical).
    *  Each rides as a repeated `tags` query key. */
   tags?: string[]
+  field?: string[]
+  fieldDay?: string[]
+  fieldAny?: string[]
+  fieldBad?: string[]
   /** Full-text membership filter (#190): keep only notes matching this query —
    *  one more filter alongside folders/tags (the window/total/histogram all
    *  describe the q-narrowed population). Empty/absent = no text filter. */
@@ -49,6 +53,10 @@ export type BucketsQueryParams = {
   folders?: string[]
   /** Same tag filter as the matching notes window (#109). */
   tags?: string[]
+  field?: string[]
+  fieldDay?: string[]
+  fieldAny?: string[]
+  fieldBad?: string[]
   /** Same full-text membership filter as the matching notes window (#190). */
   q?: string
   /** Same date range filter as the matching notes window (#201). */

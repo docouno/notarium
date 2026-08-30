@@ -548,7 +548,7 @@ describe('CachedStore — delta reconcile', () => {
     expect(notes).toHaveLength(1)
     expect(notes[0].title).toBe('Titanium Mk2')
     // first-seen createdAt survives the engine's reindex bump
-    expect(notes[0].createdAt).toBe('2026-06-01T10:00:00Z')
+    expect(notes[0].createdAt).toBe('2026-06-01T10:00:00.000Z')
 
     const g = await store.graph()
     expect(g.links).toEqual([{ source: TITANIUM, target: 'ghost:brand-new', type: 'links_to' }])

@@ -9,7 +9,7 @@ import {
   IsoTimestampSchema,
   SpaceSlugSchema,
 } from '../primitives'
-import { sessionField } from './_fields'
+import { McpFieldPatchPublishedSchema, McpFieldPatchSchema, sessionField } from './_fields'
 import { ProjectHandleSchema, RefSchema } from './primitives'
 
 /** CAS + idempotency mixin for the create/edit tools (`link` takes neither —
@@ -161,13 +161,18 @@ export const EditNoteInputSchema = z
   .object({
     ...sessionField,
     ref: RefSchema,
-    operation: EditOperationSchema,
-    content: DurableTextSchema,
+    operation: EditOperationSchema.optional(),
+    content: DurableTextSchema.optional(),
+    fields: McpFieldPatchSchema.optional(),
     section: DurableScalarSchema.optional(),
     find: DurableScalarSchema.optional(),
     ...casFields,
   })
   .strict()
+
+export const EditNotePublishedInputSchema = EditNoteInputSchema.extend({
+  fields: McpFieldPatchPublishedSchema.optional(),
+})
 
 /** Tool `link`: create a typed wikilink between two notes in the same space
  *  (`to` note-id XOR `toTitle` forward-ref). canon: docs/note-model.md#note-ontology */
