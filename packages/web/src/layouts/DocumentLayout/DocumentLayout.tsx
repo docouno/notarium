@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from 'react'
+import { lazy, Suspense, useCallback, useMemo, useRef, useState } from 'react'
 import { Outlet, useLocation, useNavigate } from 'react-router'
 import { NOTE_CLASS } from '@notarium/contract/enums'
 import { isFolderPageNote, type ParsedViewBlock, parseViewDocument } from '@notarium/core'
@@ -37,13 +37,14 @@ import {
   IconTrash,
 } from '../../core/Icons'
 import { IconToggle } from '../../core/IconToggle'
+import { Skeleton, SkeletonText } from '../../core/Skeleton'
 import { useCopy, useToast } from '../../core/Toast'
 import { canPinNote, isPinned, noteFolderOf } from '../../libs/agentPin'
 import { cx } from '../../libs/cx/cx'
 import { editorBindings } from '../../libs/hotkeys'
 import { feedRoute, graphRoute, parseAppPath } from '../../libs/routing/routePaths'
 import { api } from '../../services/api/api'
-import { EditorBody } from '../../widgets/EditorBody'
+import { loadEditorBody, useLazyEditorAutoFocus } from '../../widgets/EditorBody'
 import { EditorMeta } from '../../widgets/EditorMeta'
 import { FeedAside } from '../../widgets/FeedAside'
 import { HistoryTimeline, RevisionView } from '../../widgets/NoteHistory'
@@ -54,6 +55,20 @@ import { buildTrail } from './helpers/breadcrumbs'
 import { useEditorPreview } from './hooks/useEditorPreview'
 import { useNoteHistory } from './hooks/useNoteHistory'
 import styles from './DocumentLayout.module.scss'
+
+const EditorBody = lazy(loadEditorBody)
+
+const EditorLoadingSkeleton = () => (
+  <div
+    className={styles.editorLoadingSkeleton}
+    data-testid="editor-loading-skeleton"
+    aria-hidden="true"
+  >
+    <Skeleton w="58%" h={32} />
+    <SkeletonText lines={4} lastWidth="46%" />
+    <SkeletonText lines={6} lastWidth="64%" />
+  </div>
+)
 
 // Frame for all document pages (Home / Feed / folder browse / note): document
 // actions in the shared topbar, the content column and the right aside. The
@@ -114,6 +129,10 @@ export const DocumentLayout = () => {
     ),
     [draft?.directory, space, viewRefresh],
   )
+  const viewPresentation = useCallback(
+    (type: string) => VIEW_READER_REGISTRY.get(type)?.presentation ?? 'document',
+    [],
+  )
 
   const {
     historySel,
@@ -129,6 +148,7 @@ export const DocumentLayout = () => {
   const kebabRef = useRef<HTMLButtonElement>(null)
 
   const { editorPreview, setEditorPreview, editorKey } = useEditorPreview(draft)
+  const shouldAutoFocusEditor = useLazyEditorAutoFocus(Boolean(isEditing && draft), editorKey)
 
   // Cancel guards against a destructive misclick: with unsaved edits it confirms
   // first (and the button itself goes red); with nothing changed it just closes.
@@ -442,19 +462,23 @@ export const DocumentLayout = () => {
         {/* The editing surface follows the global Source/WYSIWYM setting (#116, #180);
             the Edit/Preview button in the topbar flips raw↔rendered within it. */}
         {isEditing && draft && (
-          <EditorBody
-            key={editorKey}
-            editor={editor}
-            preview={editorPreview}
-            mode={editorMode === 'wysiwym' ? 'wysiwym' : 'source'}
-            focus={focusMode}
-            typewriter={typewriter}
-            onSetFocus={setFocusMode}
-            onToggleFocus={toggleFocus}
-            onToggleTypewriter={toggleTypewriter}
-            editorKeys={editorBindings(resolved)}
-            renderViewBlock={renderDraftViewBlock}
-          />
+          <Suspense fallback={<EditorLoadingSkeleton />}>
+            <EditorBody
+              key={editorKey}
+              editor={editor}
+              preview={editorPreview}
+              mode={editorMode === 'wysiwym' ? 'wysiwym' : 'source'}
+              focus={focusMode}
+              typewriter={typewriter}
+              onSetFocus={setFocusMode}
+              onToggleFocus={toggleFocus}
+              onToggleTypewriter={toggleTypewriter}
+              editorKeys={editorBindings(resolved)}
+              renderViewBlock={renderDraftViewBlock}
+              viewPresentation={viewPresentation}
+              shouldAutoFocus={shouldAutoFocusEditor}
+            />
+          </Suspense>
         )}
 
         {!isEditing && historySel && historySource && (

@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { type ComponentType, useEffect } from 'react'
 import {
   createBrowserRouter,
   Navigate,
@@ -34,7 +34,7 @@ import { SpotlightProvider } from './composers/SpotlightProvider'
 import { SyncProvider } from './composers/SyncProvider'
 import { ErrorBoundary } from './core/ErrorBoundary'
 import { SemanticPalettePlate } from './core/SemanticPalettePlate'
-import { DocumentLayout } from './layouts/DocumentLayout'
+import { Skeleton, SkeletonText } from './core/Skeleton'
 import { useAutoHideScrollbars } from './libs/hooks/useAutoHideScrollbars'
 import {
   agentActivityRoute,
@@ -49,37 +49,25 @@ import {
   SPACE_PREFIX,
   spaceRoute,
 } from './libs/routing/routePaths'
-import { AgentsChrome, MemoryNotePage } from './pages/AgentsPage'
-import { FeedPage } from './pages/FeedPage'
-import { FilesPage } from './pages/FilesPage'
-import { FolderPage } from './pages/FolderPage'
-import { GraphPage } from './pages/GraphPage'
-import { NotePage } from './pages/NotePage'
 import { NotFoundPage } from './pages/NotFoundPage'
-import {
-  AboutTab,
-  AccountTab,
-  AppearanceTab,
-  ConnectedAppsTab,
-  CredentialsTab,
-  KeyboardTab,
-  ProfileTab,
-  ProviderResourcesTab,
-  SettingsPage,
-  TelemetryTab,
-  UsersTab,
-} from './pages/SettingsPage'
-import { TrashPage } from './pages/TrashPage'
-import {
-  ExportTab,
-  FieldsTab,
-  GeneralTab,
-  ImportTab,
-  MembersTab,
-  ProjectsTab,
-  ProviderAttachmentsTab,
-  WorkspaceSettingsPage,
-} from './pages/WorkspaceSettingsPage'
+
+const loadRouteComponent =
+  <Module extends object, Key extends keyof Module>(load: () => Promise<Module>, name: Key) =>
+  async () => ({ Component: (await load())[name] as ComponentType })
+
+const RouteLoadingFallback = () => (
+  <main
+    className="main"
+    aria-busy="true"
+    aria-label="Loading page"
+    data-testid="route-loading-skeleton"
+  >
+    <div className="doc">
+      <Skeleton w="52%" h={34} radius="var(--radius-md)" style={{ marginBottom: 24 }} />
+      <SkeletonText lines={5} lastWidth="44%" />
+    </div>
+  </main>
+)
 
 const ActivityRedirect = ({ preserveId = false }: { preserveId?: boolean }) => {
   const { id } = useParams<{ id: string }>()
@@ -189,43 +177,88 @@ const router = createBrowserRouter([
   {
     element: <AppShell />,
     children: [
-      { path: `${SPACE_PREFIX}/:space/graph`, element: <GraphPage /> },
+      {
+        path: `${SPACE_PREFIX}/:space/graph`,
+        lazy: loadRouteComponent(() => import('./pages/GraphPage'), 'GraphPage'),
+        hydrateFallbackElement: <RouteLoadingFallback />,
+      },
       // Trash (#79): own standalone page like the graph — the sidebar stays, the
       // page owns the main area (a list of deleted notes with restore/purge).
-      { path: `${SPACE_PREFIX}/:space/trash`, element: <TrashPage /> },
+      {
+        path: `${SPACE_PREFIX}/:space/trash`,
+        lazy: loadRouteComponent(() => import('./pages/TrashPage'), 'TrashPage'),
+        hydrateFallbackElement: <RouteLoadingFallback />,
+      },
       // Settings (#28): own page (like the graph — sidebar stays, the page owns
       // the main area). Each section is a routed tab so it deep-links; the bare
       // path lands on the first one. User settings are space-free; workspace
       // management is scoped to a space (/s/<space>/management).
       {
         path: SETTINGS_PREFIX,
-        element: <SettingsPage />,
+        lazy: loadRouteComponent(() => import('./pages/SettingsPage'), 'SettingsPage'),
+        hydrateFallbackElement: <RouteLoadingFallback />,
         children: [
           { index: true, element: <Navigate to="appearance" replace /> },
-          { path: 'appearance', element: <AppearanceTab /> },
-          { path: 'keyboard', element: <KeyboardTab /> },
-          { path: 'profile', element: <ProfileTab /> },
-          { path: 'account', element: <AccountTab /> },
-          { path: 'connected-apps', element: <ConnectedAppsTab /> },
+          {
+            path: 'appearance',
+            lazy: loadRouteComponent(() => import('./pages/SettingsPage'), 'AppearanceTab'),
+          },
+          {
+            path: 'keyboard',
+            lazy: loadRouteComponent(() => import('./pages/SettingsPage'), 'KeyboardTab'),
+          },
+          {
+            path: 'profile',
+            lazy: loadRouteComponent(() => import('./pages/SettingsPage'), 'ProfileTab'),
+          },
+          {
+            path: 'account',
+            lazy: loadRouteComponent(() => import('./pages/SettingsPage'), 'AccountTab'),
+          },
+          {
+            path: 'connected-apps',
+            lazy: loadRouteComponent(() => import('./pages/SettingsPage'), 'ConnectedAppsTab'),
+          },
           {
             path: 'credentials',
-            element: (
-              <ProviderSurfaceGate scope="settings">
-                <CredentialsTab />
-              </ProviderSurfaceGate>
-            ),
+            lazy: async () => {
+              const { CredentialsTab } = await import('./pages/SettingsPage')
+
+              return {
+                Component: () => (
+                  <ProviderSurfaceGate scope="settings">
+                    <CredentialsTab />
+                  </ProviderSurfaceGate>
+                ),
+              }
+            },
           },
           {
             path: 'providers',
-            element: (
-              <ProviderSurfaceGate scope="settings">
-                <ProviderResourcesTab />
-              </ProviderSurfaceGate>
-            ),
+            lazy: async () => {
+              const { ProviderResourcesTab } = await import('./pages/SettingsPage')
+
+              return {
+                Component: () => (
+                  <ProviderSurfaceGate scope="settings">
+                    <ProviderResourcesTab />
+                  </ProviderSurfaceGate>
+                ),
+              }
+            },
           },
-          { path: 'about', element: <AboutTab /> },
-          { path: 'telemetry', element: <TelemetryTab /> },
-          { path: 'users', element: <UsersTab /> },
+          {
+            path: 'about',
+            lazy: loadRouteComponent(() => import('./pages/SettingsPage'), 'AboutTab'),
+          },
+          {
+            path: 'telemetry',
+            lazy: loadRouteComponent(() => import('./pages/SettingsPage'), 'TelemetryTab'),
+          },
+          {
+            path: 'users',
+            lazy: loadRouteComponent(() => import('./pages/SettingsPage'), 'UsersTab'),
+          },
         ],
       },
       // Agents (#13): role/skill packages, the context constructor and session audit.
@@ -233,7 +266,8 @@ const router = createBrowserRouter([
       // The bare prefix lands on the role-first package library.
       {
         path: AGENTS_PREFIX,
-        element: <AgentsChrome />,
+        lazy: loadRouteComponent(() => import('./pages/AgentsPage/AgentsProvider'), 'AgentsChrome'),
+        hydrateFallbackElement: <RouteLoadingFallback />,
         children: [
           { index: true, element: <Navigate to={agentRolesRoute()} replace /> },
           { path: 'abilities', element: <Navigate to={agentRolesRoute()} replace /> },
@@ -406,35 +440,77 @@ const router = createBrowserRouter([
         ],
       },
       {
-        element: <AgentsChrome />,
+        lazy: loadRouteComponent(() => import('./pages/AgentsPage/AgentsProvider'), 'AgentsChrome'),
+        hydrateFallbackElement: <RouteLoadingFallback />,
         children: [
-          { path: `${MEMORY_NOTE_PREFIX}/:id/*`, element: <MemoryNotePage /> },
-          { path: `${MEMORY_NOTE_PREFIX}/:id`, element: <MemoryNotePage /> },
+          {
+            path: `${MEMORY_NOTE_PREFIX}/:id/*`,
+            lazy: loadRouteComponent(
+              () => import('./pages/AgentsPage/MemoryNotePage'),
+              'MemoryNotePage',
+            ),
+          },
+          {
+            path: `${MEMORY_NOTE_PREFIX}/:id`,
+            lazy: loadRouteComponent(
+              () => import('./pages/AgentsPage/MemoryNotePage'),
+              'MemoryNotePage',
+            ),
+          },
         ],
       },
       {
         path: `${SPACE_PREFIX}/:space/management`,
-        element: <WorkspaceSettingsPage />,
+        lazy: loadRouteComponent(
+          () => import('./pages/WorkspaceSettingsPage'),
+          'WorkspaceSettingsPage',
+        ),
+        hydrateFallbackElement: <RouteLoadingFallback />,
         children: [
           { index: true, element: <Navigate to="general" replace /> },
-          { path: 'general', element: <GeneralTab /> },
-          { path: 'members', element: <MembersTab /> },
-          { path: 'projects', element: <ProjectsTab /> },
+          {
+            path: 'general',
+            lazy: loadRouteComponent(() => import('./pages/WorkspaceSettingsPage'), 'GeneralTab'),
+          },
+          {
+            path: 'members',
+            lazy: loadRouteComponent(() => import('./pages/WorkspaceSettingsPage'), 'MembersTab'),
+          },
+          {
+            path: 'projects',
+            lazy: loadRouteComponent(() => import('./pages/WorkspaceSettingsPage'), 'ProjectsTab'),
+          },
           {
             path: 'providers',
-            element: (
-              <ProviderSurfaceGate scope="workspace">
-                <ProviderAttachmentsTab />
-              </ProviderSurfaceGate>
-            ),
+            lazy: async () => {
+              const { ProviderAttachmentsTab } = await import('./pages/WorkspaceSettingsPage')
+
+              return {
+                Component: () => (
+                  <ProviderSurfaceGate scope="workspace">
+                    <ProviderAttachmentsTab />
+                  </ProviderSurfaceGate>
+                ),
+              }
+            },
           },
-          { path: 'fields', element: <FieldsTab /> },
-          { path: 'import', element: <ImportTab /> },
-          { path: 'export', element: <ExportTab /> },
+          {
+            path: 'fields',
+            lazy: loadRouteComponent(() => import('./pages/WorkspaceSettingsPage'), 'FieldsTab'),
+          },
+          {
+            path: 'import',
+            lazy: loadRouteComponent(() => import('./pages/WorkspaceSettingsPage'), 'ImportTab'),
+          },
+          {
+            path: 'export',
+            lazy: loadRouteComponent(() => import('./pages/WorkspaceSettingsPage'), 'ExportTab'),
+          },
         ],
       },
       {
-        element: <DocumentLayout />,
+        lazy: loadRouteComponent(() => import('./layouts/DocumentLayout'), 'DocumentLayout'),
+        hydrateFallbackElement: <RouteLoadingFallback />,
         children: [
           { index: true, element: <SpaceRedirect /> },
           // The dashboard (#33/#216): the space home + its deep surfaces are ONE
@@ -454,20 +530,38 @@ const router = createBrowserRouter([
               { path: `${SEGMENTS.dashboard}/health`, element: <HealthSurface /> },
             ],
           },
-          { path: `${SPACE_PREFIX}/:space/feed`, element: <FeedPage /> },
+          {
+            path: `${SPACE_PREFIX}/:space/feed`,
+            lazy: loadRouteComponent(() => import('./pages/FeedPage'), 'FeedPage'),
+          },
           // A note by identity; space-free — the registry resolves (#16); the
           // trailing slug segment is decorative (#51).
-          { path: `${NOTE_PREFIX}/:id/*`, element: <NotePage /> },
-          { path: `${NOTE_PREFIX}/:id`, element: <NotePage /> },
+          {
+            path: `${NOTE_PREFIX}/:id/*`,
+            lazy: loadRouteComponent(() => import('./pages/NotePage'), 'NotePage'),
+          },
+          {
+            path: `${NOTE_PREFIX}/:id`,
+            lazy: loadRouteComponent(() => import('./pages/NotePage'), 'NotePage'),
+          },
           // An agent-memory note by identity. Same reader as /n, distinct route
           // surface so the chrome stays in Agents/Memory before detail loads.
           // A folder's durable PAGE address (#212), space-free like /n — the
           // registry resolves the id; the resolver redirects to the page note or
           // the folder's current /files/<path>.
-          { path: `${FOLDER_PREFIX}/:id`, element: <FolderPage /> },
+          {
+            path: `${FOLDER_PREFIX}/:id`,
+            lazy: loadRouteComponent(() => import('./pages/FolderPage'), 'FolderPage'),
+          },
           // Folders only — notes have no URL in the files namespace (#51).
-          { path: `${SPACE_PREFIX}/:space/files/*`, element: <FilesPage /> },
-          { path: `${SPACE_PREFIX}/:space/files`, element: <FilesPage /> },
+          {
+            path: `${SPACE_PREFIX}/:space/files/*`,
+            lazy: loadRouteComponent(() => import('./pages/FilesPage'), 'FilesPage'),
+          },
+          {
+            path: `${SPACE_PREFIX}/:space/files`,
+            lazy: loadRouteComponent(() => import('./pages/FilesPage'), 'FilesPage'),
+          },
           // Pre-#16 space-less bookmarks keep their meaning in the active space.
           { path: 'feed', element: <SpaceRedirect suffix="/feed" /> },
           { path: 'graph', element: <SpaceRedirect suffix="/graph" /> },

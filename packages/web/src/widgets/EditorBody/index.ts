@@ -1,1 +1,1 @@
-export * from './EditorBody'
+export * from './lazy'

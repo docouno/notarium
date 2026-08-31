@@ -85,6 +85,73 @@ const login = async (page: Page, username = 'sergey', password = username) => {
   await expect(page.getByTestId('auth-login')).not.toBeVisible()
 }
 
+const javaScriptKey = (url: string) => {
+  const parsed = new URL(url)
+
+  return `${parsed.pathname}${parsed.search}`
+}
+
+const loadedJavaScript = async (page: Page): Promise<Set<string>> =>
+  new Set(
+    await page.evaluate(() =>
+      performance
+        .getEntriesByType('resource')
+        .map((entry) => new URL(entry.name))
+        .filter((url) => url.pathname.endsWith('.js'))
+        .map((url) => `${url.pathname}${url.search}`),
+    ),
+  )
+
+const settleJavaScriptDemand = async (page: Page) => {
+  await page.evaluate(async () => {
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+    )
+    const response = await fetch('/api/me')
+
+    if (!response.ok) {
+      throw new Error(`UI settle request failed with ${response.status}`)
+    }
+  })
+}
+
+const holdExactJavaScript = async (page: Page, javaScript: ReadonlySet<string>) => {
+  let open!: () => void
+  let settled = false
+  let disposition: 'continue' | 'abort' = 'continue'
+  const held = new Promise<void>((resolve) => {
+    open = resolve
+  })
+  const requested = new Set<string>()
+
+  await page.route(
+    (url) => javaScript.has(javaScriptKey(url.href)),
+    async (route) => {
+      requested.add(javaScriptKey(route.request().url()))
+      await held
+      if (disposition === 'abort') {
+        await route.abort()
+      } else {
+        await route.continue()
+      }
+    },
+  )
+
+  const settle = (next: 'continue' | 'abort') => {
+    if (!settled) {
+      settled = true
+      disposition = next
+      open()
+    }
+  }
+
+  return {
+    requested,
+    release: () => settle('continue'),
+    abort: () => settle('abort'),
+  }
+}
+
 const setAbilityInstructions = async (page: Page, instructions: string) => {
   const editor = page.locator('.cm-content')
   await editor.click()
@@ -869,6 +936,121 @@ test('@v16 the global aside stays user-controlled across read, edit and sections
   await expect(page.getByTestId('package-library-filters')).toBeVisible()
   await page.getByTestId('ability-owned-release-captain').click()
   await expect(page.getByTestId('ability-settings')).toBeVisible()
+})
+
+test('@spa-load-size ability detail and a fresh draft request the same discovered editor JavaScript', async ({
+  page,
+  browser,
+  baseURL,
+}) => {
+  if (!baseURL) {
+    throw new Error('chromium-auth baseURL is required')
+  }
+
+  await login(page, 'maya')
+  await page.goto('/agents/abilities/roles')
+  await page.getByTestId('ability-owned-release-captain').click()
+  await expect(page.getByTestId('agent-ability-detail')).toBeVisible()
+  await expect(page.locator('.cm-content')).toHaveCount(0)
+  const detailUrl = page.url()
+
+  await settleJavaScriptDemand(page)
+  await page.evaluate(() => performance.clearResourceTimings())
+  await page.getByRole('button', { name: 'Edit', exact: true }).click()
+  await expect(page.locator('.cm-content')).toBeVisible()
+  await settleJavaScriptDemand(page)
+  const discoveredEditorJavaScript = await loadedJavaScript(page)
+
+  expect(discoveredEditorJavaScript.size).toBeGreaterThan(0)
+
+  const detailContext = await browser.newContext({ baseURL })
+  const detailPage = await detailContext.newPage()
+  const detailGate = await holdExactJavaScript(detailPage, discoveredEditorJavaScript)
+
+  try {
+    await login(detailPage, 'maya')
+    await detailPage.goto(detailUrl)
+    await expect(detailPage.getByTestId('agent-ability-detail')).toBeVisible()
+    await expect(detailPage.locator('.cm-content')).toHaveCount(0)
+    await settleJavaScriptDemand(detailPage)
+    expect(detailGate.requested.size).toBe(0)
+
+    await detailPage.getByRole('button', { name: 'Edit', exact: true }).click()
+    await expect(
+      detailPage.getByTestId('ability-editor').getByTestId('editor-loading-skeleton'),
+    ).toBeVisible()
+    await expect
+      .poll(() => [...detailGate.requested].sort())
+      .toEqual([...discoveredEditorJavaScript].sort())
+
+    detailGate.release()
+    await expect(detailPage.locator('.cm-content')).toContainText('Release captain')
+    await setAbilityInstructions(
+      detailPage,
+      '# Release captain\n\nThe lazy editor preserves authored state.',
+    )
+    await expect(detailPage.getByTestId('ability-save')).toBeEnabled()
+  } finally {
+    detailGate.release()
+    await detailContext.close()
+  }
+
+  const rejectionContext = await browser.newContext({ baseURL })
+  const rejectionPage = await rejectionContext.newPage()
+  const rejectionGate = await holdExactJavaScript(rejectionPage, discoveredEditorJavaScript)
+
+  try {
+    await login(rejectionPage, 'maya')
+    await rejectionPage.goto(detailUrl)
+    await expect(rejectionPage.getByTestId('agent-ability-detail')).toBeVisible()
+    await settleJavaScriptDemand(rejectionPage)
+    expect(rejectionGate.requested.size).toBe(0)
+
+    await rejectionPage.getByRole('button', { name: 'Edit', exact: true }).click()
+    await expect(
+      rejectionPage.getByTestId('ability-editor').getByTestId('editor-loading-skeleton'),
+    ).toBeVisible()
+    await expect
+      .poll(() => [...rejectionGate.requested].sort())
+      .toEqual([...discoveredEditorJavaScript].sort())
+
+    rejectionGate.abort()
+    await expect(rejectionPage.getByTestId('crash-state')).toBeVisible()
+  } finally {
+    rejectionGate.release()
+    await rejectionContext.close()
+  }
+
+  const draftContext = await browser.newContext({ baseURL })
+  const draftPage = await draftContext.newPage()
+  const draftGate = await holdExactJavaScript(draftPage, discoveredEditorJavaScript)
+
+  try {
+    await login(draftPage, 'maya')
+    await draftPage.goto('/agents/abilities/roles')
+    await expect(draftPage.getByTestId('agents-roles')).toBeVisible()
+    await settleJavaScriptDemand(draftPage)
+    expect(draftGate.requested.size).toBe(0)
+
+    await draftPage.getByTestId('role-create').click()
+    await expect(draftPage).toHaveURL(/\/agents\/abilities\/roles\/new\//)
+    await expect(
+      draftPage.getByTestId('ability-editor').getByTestId('editor-loading-skeleton'),
+    ).toBeVisible()
+    await expect
+      .poll(() => [...draftGate.requested].sort())
+      .toEqual([...discoveredEditorJavaScript].sort())
+
+    draftGate.release()
+    await setAbilityInstructions(draftPage, '# Lazy role\n\nDraft state survives code loading.')
+    await expect(draftPage.locator('.cm-content')).toContainText(
+      'Draft state survives code loading.',
+    )
+    await expect(draftPage.getByTestId('ability-save')).toBeEnabled()
+  } finally {
+    draftGate.release()
+    await draftContext.close()
+  }
 })
 
 test('@v14 project drafts expose exact project identities and eligible skills only', async ({

@@ -8,7 +8,7 @@ import {
   useRef,
   useState,
 } from 'react'
-import type { ParsedViewBlock } from '@notarium/core'
+import type { ParsedViewBlock, ReaderPresentation } from '@notarium/core'
 import { CodeEditor, type EditorStatsReport } from '../../core/CodeEditor'
 import { ContextMenu, type MenuItem } from '../../core/ContextMenu'
 import { IconCrosshair, IconTypewriter } from '../../core/Icons'
@@ -130,6 +130,8 @@ export const EditorBody = ({
   onToggleTypewriter,
   editorKeys,
   renderViewBlock,
+  viewPresentation,
+  shouldAutoFocus,
 }: {
   editor: EditorBodyBinding
   preview: boolean
@@ -145,6 +147,10 @@ export const EditorBody = ({
    *  formatting + the focus/typewriter toggles — follow the user's preset/overrides. */
   editorKeys?: EditorBinding[]
   renderViewBlock?: (block: ParsedViewBlock) => ReactNode
+  viewPresentation?: (type: string) => ReaderPresentation
+  /** Resolve-time focus ownership for a lazy first mount. If the user moved focus
+   *  into live metadata while code was pending, the editor must not steal it. */
+  shouldAutoFocus?: () => boolean
 }) => {
   const viewRef = useRef<EditorView | null>(null)
   const [stats, setStats] = useState<EditorStatsReport>(() => ({
@@ -190,6 +196,11 @@ export const EditorBody = ({
     [preview, previewSrc, renderViewBlock],
   )
   const previewHtml = previewDocument.html
+  const primaryReader = previewDocument.views?.primaryReader
+  const workspacePreview =
+    preview &&
+    primaryReader?.kind === 'value' &&
+    viewPresentation?.(primaryReader.value) === 'workspace'
   // Preview is the same rendered view as the reader (editor.md invariant), so it gets
   // the same post-render enhancements: copy buttons, table fades, mermaid diagrams
   // (#236). The ref is on the conditionally-mounted preview div — null while editing,
@@ -217,7 +228,11 @@ export const EditorBody = ({
 
   return (
     <>
-      <div className={styles.bodyCol} data-testid="editor-body-column">
+      <div
+        className={cx(styles.bodyCol, workspacePreview && styles.workspaceBodyCol)}
+        data-testid="editor-body-column"
+        data-view-presentation={workspacePreview ? 'workspace' : undefined}
+      >
         <div className={styles.editorBody}>
           {/* The editor stays mounted in Preview (display:none), so its text, undo
               history and cursor all survive the round-trip — only the live getter
@@ -233,17 +248,23 @@ export const EditorBody = ({
               cursor={editor.isNew ? 'end' : 'start'}
               onReady={registerContent}
               onChange={editor.onContentChange}
-              onView={(view) => (viewRef.current = view)}
+              onView={(view) => {
+                viewRef.current = view
+                if (view && shouldAutoFocus?.()) {
+                  view.focus()
+                }
+              }}
               onStats={setStats}
               onToggleFocus={onToggleFocus}
               onToggleTypewriter={onToggleTypewriter}
               editorKeys={editorKeys}
+              autoFocus={shouldAutoFocus == null}
             />
           </div>
           {preview && (
             <MarkdownDocument
               rootRef={previewRef}
-              className="markdown"
+              className={cx('markdown', workspacePreview && styles.workspacePreview)}
               data-testid="editor-preview"
               html={previewHtml}
               viewBlocks={previewDocument.views?.blocks}

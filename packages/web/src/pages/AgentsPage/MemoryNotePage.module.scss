@@ -3,3 +3,14 @@
   min-height: 560px;
   flex-direction: column;
 }
+
+.editor-loading-skeleton {
+  display: flex;
+  width: 100%;
+  max-width: var(--doc-width);
+  margin: 0 auto;
+  padding: var(--editor-body-padding, 44px 0 16vh);
+  flex: 1 0 auto;
+  flex-direction: column;
+  gap: 18px;
+}

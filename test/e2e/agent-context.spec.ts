@@ -218,6 +218,73 @@ const login = async (page: Page, username: string, password: string) => {
   await expect(page.getByTestId('auth-login')).not.toBeVisible()
 }
 
+const javaScriptKey = (url: string) => {
+  const parsed = new URL(url)
+
+  return `${parsed.pathname}${parsed.search}`
+}
+
+const loadedJavaScript = async (page: Page): Promise<Set<string>> =>
+  new Set(
+    await page.evaluate(() =>
+      performance
+        .getEntriesByType('resource')
+        .map((entry) => new URL(entry.name))
+        .filter((url) => url.pathname.endsWith('.js'))
+        .map((url) => `${url.pathname}${url.search}`),
+    ),
+  )
+
+const settleJavaScriptDemand = async (page: Page) => {
+  await page.evaluate(async () => {
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+    )
+    const response = await fetch('/api/me')
+
+    if (!response.ok) {
+      throw new Error(`UI settle request failed with ${response.status}`)
+    }
+  })
+}
+
+const holdExactJavaScript = async (page: Page, javaScript: ReadonlySet<string>) => {
+  let open!: () => void
+  let settled = false
+  let disposition: 'continue' | 'abort' = 'continue'
+  const held = new Promise<void>((resolve) => {
+    open = resolve
+  })
+  const requested = new Set<string>()
+
+  await page.route(
+    (url) => javaScript.has(javaScriptKey(url.href)),
+    async (route) => {
+      requested.add(javaScriptKey(route.request().url()))
+      await held
+      if (disposition === 'abort') {
+        await route.abort()
+      } else {
+        await route.continue()
+      }
+    },
+  )
+
+  const settle = (next: 'continue' | 'abort') => {
+    if (!settled) {
+      settled = true
+      disposition = next
+      open()
+    }
+  }
+
+  return {
+    requested,
+    release: () => settle('continue'),
+    abort: () => settle('abort'),
+  }
+}
+
 const dragAfter = async (page: Page, source: string, target: string) => {
   const sourceHandle = await page.getByTestId(source).elementHandle()
   const targetHandle = await page.getByTestId(target).elementHandle()
@@ -966,6 +1033,94 @@ test('Memory read and edit keep the Agents shell and originating project scope',
   await expect(page.getByTestId('memory-tree')).toBeVisible()
   await expect(activeMemory.getByRole('link')).toHaveAttribute('aria-current', 'page')
   await expect(page.getByLabel('Breadcrumb')).toContainText('Agents/Context/Memory/deploy-memory')
+})
+
+test('@spa-load-size agent-memory read defers the discovered editor JavaScript until Edit', async ({
+  page,
+  browser,
+  baseURL,
+}) => {
+  if (!baseURL) {
+    throw new Error('chromium-auth baseURL is required')
+  }
+  const memoryUrl = '/m/fake-project-memory/deploy-memory?context=docs'
+
+  await login(page, 'sam', 'sam-password-1')
+  await page.goto('/s/main')
+  await expect(page.getByTestId('space-switcher')).toContainText('Main')
+  await page.goto(memoryUrl)
+  await expect(page.getByRole('heading', { name: 'deploy-memory' })).toBeVisible()
+  await expect(page.locator('.cm-content')).toHaveCount(0)
+  await settleJavaScriptDemand(page)
+  await page.evaluate(() => performance.clearResourceTimings())
+
+  await page.getByRole('button', { name: 'Edit', exact: true }).click()
+  await expect(page.locator('.cm-content')).toBeVisible()
+  await settleJavaScriptDemand(page)
+  const discoveredEditorJavaScript = await loadedJavaScript(page)
+
+  expect(discoveredEditorJavaScript.size).toBeGreaterThan(0)
+
+  const proofContext = await browser.newContext({ baseURL })
+  const proofPage = await proofContext.newPage()
+  const gate = await holdExactJavaScript(proofPage, discoveredEditorJavaScript)
+
+  try {
+    await login(proofPage, 'sam', 'sam-password-1')
+    await proofPage.goto('/s/main')
+    await expect(proofPage.getByTestId('space-switcher')).toContainText('Main')
+    await proofPage.goto(memoryUrl)
+    await expect(proofPage.getByRole('heading', { name: 'deploy-memory' })).toBeVisible()
+    await expect(proofPage.locator('.cm-content')).toHaveCount(0)
+    await settleJavaScriptDemand(proofPage)
+    expect(gate.requested.size).toBe(0)
+
+    await proofPage.getByRole('button', { name: 'Edit', exact: true }).click()
+    await expect(
+      proofPage.getByTestId('memory-note-surface').getByTestId('editor-loading-skeleton'),
+    ).toBeVisible()
+    await expect
+      .poll(() => [...gate.requested].sort())
+      .toEqual([...discoveredEditorJavaScript].sort())
+
+    gate.release()
+    const editor = proofPage.locator('.cm-content')
+    await expect(editor).toContainText('Deploys need two approvals.')
+    await editor.fill('# deploy-memory\n\nLazy memory editor keeps its draft.')
+    await expect(editor).toContainText('Lazy memory editor keeps its draft.')
+    await expect(proofPage.getByRole('button', { name: 'Save', exact: true })).toBeEnabled()
+  } finally {
+    gate.release()
+    await proofContext.close()
+  }
+
+  const rejectionContext = await browser.newContext({ baseURL })
+  const rejectionPage = await rejectionContext.newPage()
+  const rejectionGate = await holdExactJavaScript(rejectionPage, discoveredEditorJavaScript)
+
+  try {
+    await login(rejectionPage, 'sam', 'sam-password-1')
+    await rejectionPage.goto('/s/main')
+    await expect(rejectionPage.getByTestId('space-switcher')).toContainText('Main')
+    await rejectionPage.goto(memoryUrl)
+    await expect(rejectionPage.getByRole('heading', { name: 'deploy-memory' })).toBeVisible()
+    await settleJavaScriptDemand(rejectionPage)
+    expect(rejectionGate.requested.size).toBe(0)
+
+    await rejectionPage.getByRole('button', { name: 'Edit', exact: true }).click()
+    await expect(
+      rejectionPage.getByTestId('memory-note-surface').getByTestId('editor-loading-skeleton'),
+    ).toBeVisible()
+    await expect
+      .poll(() => [...rejectionGate.requested].sort())
+      .toEqual([...discoveredEditorJavaScript].sort())
+
+    rejectionGate.abort()
+    await expect(rejectionPage.getByTestId('crash-state')).toBeVisible()
+  } finally {
+    rejectionGate.release()
+    await rejectionContext.close()
+  }
 })
 
 test('personal Memory remains editable while the active workspace grant is reader', async ({

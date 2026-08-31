@@ -257,10 +257,18 @@ export const HotkeysProvider = ({ children }: { children: ReactNode }) => {
         if (e.target instanceof Element && e.target.closest('[role="dialog"]')) {
           return
         }
-        if (ed.editor.canSave && !ed.saving) {
-          e.preventDefault()
-          void ed.saveDraft(ed.editor.buildPayload())
-        }
+        e.preventDefault()
+        // This dispatcher runs in bubble phase, after the focused ChipInput/TextValue
+        // handles Enter. React may not have committed that state yet, so build the
+        // payload in a microtask; useNoteDraft's event-time refs already carry both a
+        // focused text edit and an uncommitted list token from this key event.
+        queueMicrotask(() => {
+          const current = editingRef.current
+
+          if (current.isEditing && current.editor.canSave && !current.saving) {
+            void current.saveDraft(current.editor.buildPayload())
+          }
+        })
 
         return
       }

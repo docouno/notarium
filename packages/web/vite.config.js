@@ -43,7 +43,10 @@ const allowedHosts = (() => {
   const raw = process.env.ALLOWED_HOSTS
   if (!raw) return undefined
   if (raw.trim() === 'all') return true
-  return raw.split(',').map((s) => s.trim()).filter(Boolean)
+  return raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
 })()
 
 // When the dev server is reached through an HTTPS tunnel, the page loads on :443
@@ -51,9 +54,7 @@ const allowedHosts = (() => {
 // websocket on :443 instead of the server port — otherwise live reload silently
 // fails to connect.
 // Set HMR_CLIENT_PORT=443 for tunnel access; leave unset for plain localhost.
-const hmrClientPort = process.env.HMR_CLIENT_PORT
-  ? Number(process.env.HMR_CLIENT_PORT)
-  : undefined
+const hmrClientPort = process.env.HMR_CLIENT_PORT ? Number(process.env.HMR_CLIENT_PORT) : undefined
 
 // PWA: installable app shell + static precache. DELIBERATELY shell-only —
 // /api is never cached (privacy: single-user/no-auth today; offline DATA is its
@@ -82,51 +83,14 @@ const pwaDisabled = process.env.VITE_PWA === 'off'
 // canon: docs/pwa.md#bundle-size
 const PRECACHE_MAX_FILE_BYTES = 2 * 1024 * 1024
 
-// Synchronous heavyweight vendor families, split out of the application entry. A name is
-// matched exactly unless it ends in `-`, which matches a package-name prefix.
+// Named vendor cache boundaries. Markdown math/highlighting are synchronous parts
+// of the application entry; view-carrier stays demand-bound to document/view code.
+// A name is matched exactly unless it ends in `-`, which matches a package-name prefix.
 // canon: docs/pwa.md#bundle-size
 const CHUNK_FAMILIES = {
-  editor: [
-    'codemirror',
-    '@codemirror/autocomplete',
-    '@codemirror/commands',
-    '@codemirror/lang-css',
-    '@codemirror/lang-html',
-    '@codemirror/lang-javascript',
-    '@codemirror/lang-markdown',
-    '@codemirror/language',
-    '@codemirror/language-data',
-    '@codemirror/search',
-    '@codemirror/state',
-    '@codemirror/view',
-    '@lezer/common',
-    '@lezer/css',
-    '@lezer/highlight',
-    '@lezer/html',
-    '@lezer/javascript',
-    '@lezer/lr',
-    '@lezer/markdown',
-  ],
   'markdown-math': ['katex'],
   'syntax-highlighting': ['highlight.js'],
   'view-carrier': ['yaml'],
-  graph: [
-    'bezier-js',
-    'd3-array',
-    'd3-drag',
-    'd3-force-3d',
-    'd3-scale',
-    'd3-scale-chromatic',
-    'd3-selection',
-    'd3-zoom',
-    'force-graph',
-    'graphology',
-    'graphology-',
-    'kapsule',
-    'react-force-graph-2d',
-    'react-kapsule',
-    'tinycolor2',
-  ],
 }
 
 // The LAST `node_modules/` wins, so a nested copy (`a/node_modules/b`) counts as b.
@@ -199,7 +163,12 @@ export default defineConfig({
         icons: [
           { src: 'pwa-192x192.png', sizes: '192x192', type: 'image/png' },
           { src: 'pwa-512x512.png', sizes: '512x512', type: 'image/png' },
-          { src: 'maskable-icon-512x512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
+          {
+            src: 'maskable-icon-512x512.png',
+            sizes: '512x512',
+            type: 'image/png',
+            purpose: 'maskable',
+          },
         ],
       },
       workbox: {

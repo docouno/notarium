@@ -378,3 +378,42 @@ test('writer moves a focused card by keyboard without a resting control', async 
   )
   await expect(page.getByTestId('insertion-placeholder')).toHaveCount(0)
 })
+
+test('lazy editor Preview gives workspace view blocks their reader geometry', async ({ page }) => {
+  await page.setViewportSize({ width: 1800, height: 1000 })
+  await page.goto('/n/vboard000001')
+  await expect(page.getByTestId('board-scroller')).toBeVisible()
+
+  await page.getByRole('button', { name: 'Edit', exact: true }).click()
+  const editor = page.locator('.cm-content')
+
+  await expect(editor).toBeVisible()
+  await expect(page.getByTestId('board-scroller')).toHaveCount(0)
+  await page.getByRole('button', { name: 'Preview', exact: true }).click()
+
+  const preview = page.getByTestId('editor-preview')
+
+  await expect(preview).toBeVisible()
+  await expect(preview.getByTestId('board-scroller')).toBeVisible()
+  await expect(preview.getByRole('tab', { name: 'Tasks' })).toHaveAttribute('aria-selected', 'true')
+  await expect(page.getByTestId('editor-body-column')).toHaveAttribute(
+    'data-view-presentation',
+    'workspace',
+  )
+  const geometry = await preview.evaluate((root) => {
+    const board = root.querySelector<HTMLElement>('[data-testid="board-scroller"]')!
+
+    return {
+      width: root.getBoundingClientRect().width,
+      boardBottom: board.getBoundingClientRect().bottom,
+      overflow: getComputedStyle(root).overflow,
+    }
+  })
+
+  expect(geometry.width).toBeGreaterThan(1200)
+  expect(geometry.boardBottom).toBeCloseTo(1000, 0)
+  expect(geometry.overflow).toBe('hidden')
+
+  await page.getByRole('button', { name: 'Edit', exact: true }).click()
+  await expect(editor).toBeFocused()
+})

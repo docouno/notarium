@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { lazy, Suspense, useEffect } from 'react'
 import { createPortal } from 'react-dom'
 import { NOTE_CLASS } from '@notarium/contract/enums'
 import { useAuth } from '../../composers/AuthProvider'
@@ -11,12 +11,13 @@ import { useNotes } from '../../composers/NotesProvider'
 import { useSpace } from '../../composers/SpaceProvider'
 import { Button } from '../../core/Button'
 import { IconEdit, IconEye } from '../../core/Icons'
+import { Skeleton, SkeletonText } from '../../core/Skeleton'
 import { useToast } from '../../core/Toast'
 import { useEditorPreview } from '../../layouts/DocumentLayout/hooks/useEditorPreview'
 import { canWriteSpace } from '../../libs/access'
 import { editorBindings } from '../../libs/hotkeys'
 import { api } from '../../services/api'
-import { EditorBody } from '../../widgets/EditorBody'
+import { loadEditorBody, useLazyEditorAutoFocus } from '../../widgets/EditorBody'
 import { EditorMeta } from '../../widgets/EditorMeta'
 import { MetaPanel } from '../../widgets/MetaPanel'
 import { NotePage } from '../NotePage'
@@ -24,6 +25,20 @@ import { AgentsPanel } from './AgentsPanel'
 import { useAgentsShell } from './AgentsProvider'
 import { AsidePlaceholder } from './AsidePlaceholder'
 import styles from './MemoryNotePage.module.scss'
+
+const EditorBody = lazy(loadEditorBody)
+
+const EditorLoadingSkeleton = () => (
+  <div
+    className={styles.editorLoadingSkeleton}
+    data-testid="editor-loading-skeleton"
+    aria-hidden="true"
+  >
+    <Skeleton w="52%" h={32} />
+    <SkeletonText lines={5} lastWidth="42%" />
+    <SkeletonText lines={4} lastWidth="68%" />
+  </div>
+)
 
 /** Agent-memory keeps the complete Agents shell while switching between reader
  * and the shared document editor. The selected Context scope rides in the URL,
@@ -40,6 +55,10 @@ export const MemoryNotePage = () => {
     useChrome()
   const { resolved } = useHotkeys()
   const { editorPreview, setEditorPreview, editorKey } = useEditorPreview(editing.draft)
+  const shouldAutoFocusEditor = useLazyEditorAutoFocus(
+    Boolean(editing.isEditing && editing.draft),
+    editorKey,
+  )
   const readableMemory =
     mode === 'read' && note?.class === NOTE_CLASS.agentMemory && !note.deleted ? note : null
   const noteSpace = note?.space ?? space
@@ -188,18 +207,21 @@ export const MemoryNotePage = () => {
   return (
     <div className={styles.page} data-testid="memory-note-surface">
       {editing.isEditing && editing.draft ? (
-        <EditorBody
-          key={editorKey}
-          editor={editing.editor}
-          preview={editorPreview}
-          mode={editorMode === 'wysiwym' ? 'wysiwym' : 'source'}
-          focus={focusMode}
-          typewriter={typewriter}
-          onSetFocus={setFocusMode}
-          onToggleFocus={toggleFocus}
-          onToggleTypewriter={toggleTypewriter}
-          editorKeys={editorBindings(resolved)}
-        />
+        <Suspense fallback={<EditorLoadingSkeleton />}>
+          <EditorBody
+            key={editorKey}
+            editor={editing.editor}
+            preview={editorPreview}
+            mode={editorMode === 'wysiwym' ? 'wysiwym' : 'source'}
+            focus={focusMode}
+            typewriter={typewriter}
+            onSetFocus={setFocusMode}
+            onToggleFocus={toggleFocus}
+            onToggleTypewriter={toggleTypewriter}
+            editorKeys={editorBindings(resolved)}
+            shouldAutoFocus={shouldAutoFocusEditor}
+          />
+        </Suspense>
       ) : (
         <NotePage />
       )}

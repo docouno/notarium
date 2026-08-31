@@ -1,3 +1,4 @@
+import { lazy, Suspense } from 'react'
 import { createPortal } from 'react-dom'
 import type {
   AbilitySkillLocator,
@@ -19,15 +20,30 @@ import { Button } from '../../core/Button'
 import { Checkbox } from '../../core/Checkbox'
 import { IconEdit, IconEye } from '../../core/Icons'
 import { Segmented } from '../../core/Segmented'
+import { Skeleton, SkeletonText } from '../../core/Skeleton'
 import { Textarea } from '../../core/Textarea'
 import { useEditorPreview } from '../../layouts/DocumentLayout/hooks/useEditorPreview'
 import { editorBindings } from '../../libs/hotkeys'
-import { EditorBody } from '../../widgets/EditorBody'
+import { loadEditorBody, useLazyEditorAutoFocus } from '../../widgets/EditorBody'
 import { AbilityProjectsField } from './AbilityProjectsField'
 import { AgentsPanel } from './AgentsPanel'
 import { useAgentsShell } from './AgentsProvider'
 import { projectChoiceLabels } from './helpers/format'
 import styles from './AbilityEditorSurface.module.scss'
+
+const EditorBody = lazy(loadEditorBody)
+
+const EditorLoadingSkeleton = () => (
+  <div
+    className={styles.editorLoadingSkeleton}
+    data-testid="editor-loading-skeleton"
+    aria-hidden="true"
+  >
+    <Skeleton w="64%" h={32} />
+    <SkeletonText lines={4} lastWidth="54%" />
+    <SkeletonText lines={5} lastWidth="38%" />
+  </div>
+)
 
 /** A skill this role may attach: the server judges it in EVERY project the role
  *  covers, so the editor offers exactly the same set. A skill that reaches two of the
@@ -103,6 +119,7 @@ export const AbilityEditorSurface = ({
     useChrome()
   const { resolved } = useHotkeys()
   const { editorPreview, setEditorPreview, editorKey } = useEditorPreview(draft)
+  const shouldAutoFocusEditor = useLazyEditorAutoFocus(true, editorKey)
 
   // Unreachable from either caller, and it has to stay that way: this component OWNS the
   // route's aside (#393), so a render that returns nothing would take the panel with it.
@@ -400,18 +417,21 @@ export const AbilityEditorSurface = ({
 
   return (
     <div className={styles.page} data-testid="ability-editor">
-      <EditorBody
-        key={editorKey}
-        editor={editor}
-        preview={editorPreview}
-        mode={editorMode === 'wysiwym' ? 'wysiwym' : 'source'}
-        focus={focusMode}
-        typewriter={typewriter}
-        onSetFocus={setFocusMode}
-        onToggleFocus={toggleFocus}
-        onToggleTypewriter={toggleTypewriter}
-        editorKeys={editorBindings(resolved)}
-      />
+      <Suspense fallback={<EditorLoadingSkeleton />}>
+        <EditorBody
+          key={editorKey}
+          editor={editor}
+          preview={editorPreview}
+          mode={editorMode === 'wysiwym' ? 'wysiwym' : 'source'}
+          focus={focusMode}
+          typewriter={typewriter}
+          onSetFocus={setFocusMode}
+          onToggleFocus={toggleFocus}
+          onToggleTypewriter={toggleTypewriter}
+          editorKeys={editorBindings(resolved)}
+          shouldAutoFocus={shouldAutoFocusEditor}
+        />
+      </Suspense>
       {actionsHost ? createPortal(actions, actionsHost) : null}
       <AgentsPanel
         panels={[{ id: 'details', label: 'Details', render: () => aside }]}

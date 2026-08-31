@@ -196,9 +196,11 @@ export function useNoteDraft(initialDraft: Draft | null) {
   const [tags, setTags] = useState<string[]>(initialDraft?.tags || [])
   const [noteType, setNoteType] = useState(initialDraft?.noteType || DEFAULT_NOTE_TYPE)
   const [fields, setFields] = useState<EditableFields>(() => cloneFields(initialDraft?.fieldValues))
+  const fieldsRef = useRef(fields)
   const [pendingFields, setPendingFields] = useState<Record<string, string>>(() =>
     Object.create(null),
   )
+  const pendingFieldsRef = useRef(pendingFields)
   const [abilityDescription, setAbilityDescription] = useState(
     initialDraft?.abilityDescription || '',
   )
@@ -254,8 +256,13 @@ export function useNoteDraft(initialDraft: Draft | null) {
     setDirectory(initialDraft?.directory || '')
     setTags(initialDraft?.tags || [])
     setNoteType(initialDraft?.noteType || DEFAULT_NOTE_TYPE)
-    setFields(cloneFields(initialDraft?.fieldValues))
-    setPendingFields(Object.create(null))
+    const nextFields = cloneFields(initialDraft?.fieldValues)
+    const nextPendingFields = Object.create(null) as Record<string, string>
+
+    fieldsRef.current = nextFields
+    setFields(nextFields)
+    pendingFieldsRef.current = nextPendingFields
+    setPendingFields(nextPendingFields)
     setAbilityDescription(initialDraft?.abilityDescription || '')
     setAttachments(initialDraft?.attachments ?? [])
     setAbilityHome(initialDraft?.abilityHome ?? 'personal')
@@ -360,6 +367,12 @@ export function useNoteDraft(initialDraft: Draft | null) {
       }
     }
 
+    // A list input commits its pending token in the SAME key event that the global
+    // save shortcut observes. React has not rendered the state update yet, so read
+    // the synchronously maintained refs rather than this render's closed-over values.
+    const payloadFields = fieldsWithPending(fieldsRef.current, pendingFieldsRef.current)
+    const payloadFieldsPatch = changedFields(initialDraft?.fieldValues, payloadFields)
+
     return {
       // Always addressed (#100 phase 1): a value sets the custom slug, '' clears it back
       // to the implicit default. The host softens/lazies it (storedSlug).
@@ -367,7 +380,9 @@ export function useNoteDraft(initialDraft: Draft | null) {
       directory: directory.trim(),
       noteType: noteType.trim() || DEFAULT_NOTE_TYPE,
       tags,
-      ...(authoredFieldsDirty ? { fields: fieldsPatch } : {}),
+      ...(Object.getOwnPropertyNames(payloadFieldsPatch).length > 0
+        ? { fields: payloadFieldsPatch }
+        : {}),
       content: readContent(),
       // Authored creation date (#186): sent ONLY when the user moved it off the seed
       // AND a day is set — so a normal save never restamps `created`, and clearing the
@@ -377,6 +392,33 @@ export function useNoteDraft(initialDraft: Draft | null) {
         ? { createdAt: dateInputToIso(createdDate) }
         : {}),
     }
+  }
+
+  const setField = (key: string, value: string | string[] | null) => {
+    const next = cloneFields(fieldsRef.current)
+
+    if (value === null) {
+      delete next[key]
+    } else {
+      next[key] = value
+    }
+    fieldsRef.current = next
+    setFields(next)
+  }
+
+  const setPendingField = (key: string, value: string) => {
+    const next = Object.assign(
+      Object.create(null) as Record<string, string>,
+      pendingFieldsRef.current,
+    )
+
+    if (value) {
+      next[key] = value
+    } else {
+      delete next[key]
+    }
+    pendingFieldsRef.current = next
+    setPendingFields(next)
   }
 
   return {
@@ -389,30 +431,8 @@ export function useNoteDraft(initialDraft: Draft | null) {
     noteType,
     setNoteType,
     fields,
-    setField: (key: string, value: string | string[] | null) =>
-      setFields((current) => {
-        const next = cloneFields(current)
-
-        if (value === null) {
-          delete next[key]
-        } else {
-          next[key] = value
-        }
-
-        return next
-      }),
-    setPendingField: (key: string, value: string) =>
-      setPendingFields((current) => {
-        const next = Object.assign(Object.create(null) as Record<string, string>, current)
-
-        if (value) {
-          next[key] = value
-        } else {
-          delete next[key]
-        }
-
-        return next
-      }),
+    setField,
+    setPendingField,
     fieldDetails: initialDraft?.fieldDetails,
     frontmatter: initialDraft?.frontmatter ?? {},
     fieldsStructured:

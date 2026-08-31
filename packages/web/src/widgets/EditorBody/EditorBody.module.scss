@@ -27,6 +27,52 @@
   min-height: 50vh;
 }
 
+/* A workspace view in Preview owns the page geometry just like its saved reader.
+   Source editing stays in the prose-width column above; only the rendered preview
+   drops that cap and gives the view placeholder the remaining viewport height. */
+.workspace-body-col {
+  max-width: none;
+  height: calc(100dvh - var(--chrome-h));
+  margin: 0;
+  padding-top: 18px;
+  padding-bottom: 0;
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.workspace-body-col .editor-body,
+.workspace-preview {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.workspace-preview > :global([data-notarium-view-block]) {
+  flex: 1;
+  min-height: 0;
+}
+
+.workspace-preview :global([data-view-block]) {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+}
+
+.workspace-preview :global([data-view-content]),
+.workspace-preview :global([data-board]) {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
 /* The status bar is CHROME, not content — so it floats at the bottom of the main
    column exactly like the topbar floats at the top, instead of riding inside the
    scroll flow. position:absolute with its containing block = PageFrame's `.frame`

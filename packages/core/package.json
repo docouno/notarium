@@ -4,6 +4,7 @@
   "license": "AGPL-3.0-only",
   "private": true,
   "type": "module",
+  "sideEffects": false,
   "description": "Notarium domain core: KnowledgeStore port, pure services and libs. Host-agnostic — no node/fs/HTTP/React (P9)",
   "exports": {
     ".": "./src/index.ts",

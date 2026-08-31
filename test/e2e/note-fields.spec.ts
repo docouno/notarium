@@ -131,6 +131,64 @@ const openMeta = async (page: Page, title: string) => {
   await expect(page.getByTestId('meta-panel')).toBeVisible()
 }
 
+const javaScriptKey = (url: string) => {
+  const parsed = new URL(url)
+
+  return `${parsed.pathname}${parsed.search}`
+}
+
+const loadedJavaScript = async (page: Page): Promise<Set<string>> =>
+  new Set(
+    await page.evaluate(() =>
+      performance
+        .getEntriesByType('resource')
+        .map((entry) => new URL(entry.name))
+        .filter((url) => url.pathname.endsWith('.js'))
+        .map((url) => `${url.pathname}${url.search}`),
+    ),
+  )
+
+const settleJavaScriptDemand = async (page: Page) => {
+  await page.evaluate(async () => {
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+    )
+    const response = await fetch('/api/me')
+
+    if (!response.ok) {
+      throw new Error(`UI settle request failed with ${response.status}`)
+    }
+  })
+}
+
+const holdExactJavaScript = async (page: Page, javaScript: ReadonlySet<string>) => {
+  let open!: () => void
+  let released = false
+  const held = new Promise<void>((resolve) => {
+    open = resolve
+  })
+  const requested = new Set<string>()
+
+  await page.route(
+    (url) => javaScript.has(javaScriptKey(url.href)),
+    async (route) => {
+      requested.add(javaScriptKey(route.request().url()))
+      await held
+      await route.continue()
+    },
+  )
+
+  return {
+    requested,
+    release: () => {
+      if (!released) {
+        released = true
+        open()
+      }
+    },
+  }
+}
+
 test('all card fields render and custom values share quiet inline and editor controls', async ({
   page,
 }) => {
@@ -482,6 +540,127 @@ test('editor save shortcut owns focused text and an uncommitted list item', asyn
   expect(response.request().postDataJSON()).toMatchObject({
     fields: { client: 'Shortcut client', reviewers: ['ann', 'bo', 'carol'] },
   })
+})
+
+test('@spa-load-size lazy editor preserves metadata focus and accepts Save before its body resolves', async ({
+  page,
+  browser,
+  baseURL,
+}) => {
+  if (!baseURL) {
+    throw new Error('chromium-auth baseURL is required')
+  }
+
+  await login(page, 'owner', 'owner-password-1')
+  await page.goto('/n/field-note')
+  await openMeta(page, 'Field note')
+  await settleJavaScriptDemand(page)
+  await page.evaluate(() => performance.clearResourceTimings())
+  await page.getByRole('button', { name: 'Edit', exact: true }).click()
+  await expect(page.locator('.cm-content')).toBeVisible()
+  await settleJavaScriptDemand(page)
+  const discoveredEditorJavaScript = await loadedJavaScript(page)
+
+  expect(discoveredEditorJavaScript.size).toBeGreaterThan(0)
+
+  const focusContext = await browser.newContext({ baseURL })
+  await focusContext.addInitScript(() => window.localStorage.clear())
+  const focusPage = await focusContext.newPage()
+  const focusGate = await holdExactJavaScript(focusPage, discoveredEditorJavaScript)
+
+  try {
+    await login(focusPage, 'owner', 'owner-password-1')
+    await focusPage.goto('/n/field-note')
+    await openMeta(focusPage, 'Field note')
+    await settleJavaScriptDemand(focusPage)
+    expect(focusGate.requested.size).toBe(0)
+
+    await focusPage.getByRole('button', { name: 'Edit', exact: true }).click()
+    await expect(focusPage.getByTestId('editor-loading-skeleton')).toBeVisible()
+    await expect
+      .poll(() => [...focusGate.requested].sort())
+      .toEqual([...discoveredEditorJavaScript].sort())
+
+    const client = focusPage
+      .getByTestId('editor-meta')
+      .getByRole('textbox', { name: 'Client value' })
+    await client.fill('Focus stays here')
+    await expect(client).toBeFocused()
+    focusGate.release()
+    await expect(focusPage.locator('.cm-content')).toBeVisible()
+    await expect(client).toBeFocused()
+    await focusPage.keyboard.type(' after resolve')
+    await expect(client).toHaveValue('Focus stays here after resolve')
+  } finally {
+    focusGate.release()
+    await focusContext.close()
+  }
+
+  const saveContext = await browser.newContext({ baseURL })
+  await saveContext.addInitScript(() => window.localStorage.clear())
+  const savePage = await saveContext.newPage()
+  const saveGate = await holdExactJavaScript(savePage, discoveredEditorJavaScript)
+
+  try {
+    await login(savePage, 'owner', 'owner-password-1')
+    await savePage.goto('/n/field-note')
+    await openMeta(savePage, 'Field note')
+    await settleJavaScriptDemand(savePage)
+    expect(saveGate.requested.size).toBe(0)
+
+    await savePage.getByRole('button', { name: 'Edit', exact: true }).click()
+    await expect(savePage.getByTestId('editor-loading-skeleton')).toBeVisible()
+    await expect
+      .poll(() => [...saveGate.requested].sort())
+      .toEqual([...discoveredEditorJavaScript].sort())
+
+    const editorMeta = savePage.getByTestId('editor-meta')
+    await editorMeta.getByRole('textbox', { name: 'Client value' }).fill('Shortcut client')
+    const reviewers = editorMeta.getByRole('textbox', { name: 'Reviewers value' })
+    await reviewers.fill('carol')
+    const saved = savePage.waitForResponse(
+      (response) => response.request().method() === 'POST' && response.url().endsWith('/api/note'),
+    )
+    await reviewers.press('ControlOrMeta+Enter')
+    const response = await saved
+
+    expect(response.status()).toBe(200)
+    expect(response.request().postDataJSON()).toMatchObject({
+      fields: { client: 'Shortcut client', reviewers: ['ann', 'bo', 'carol'] },
+    })
+  } finally {
+    saveGate.release()
+    await saveContext.close()
+  }
+})
+
+test('a cached editor draft swap restores focus to the fresh title line', async ({ page }) => {
+  await login(page, 'owner', 'owner-password-1')
+  await page.goto('/n/field-note')
+  await expect(page.getByRole('heading', { level: 1, name: 'Field note' })).toBeVisible()
+  await page.getByTestId('rail-settings').click()
+  await page.getByTestId('settings-tab-keyboard').click()
+  await page
+    .getByTestId('hotkey-row-note.new')
+    .getByRole('button', { name: 'Add a shortcut' })
+    .click()
+  await page.keyboard.press('ControlOrMeta+d')
+  await page.goBack()
+  await page.goBack()
+  await openMeta(page, 'Field note')
+  await page.getByRole('button', { name: 'Edit', exact: true }).click()
+  await expect(page.locator('.cm-content')).toBeVisible()
+
+  const client = page.getByTestId('editor-meta').getByRole('textbox', { name: 'Client value' })
+  await client.focus()
+  await expect(client).toBeFocused()
+  await client.press('ControlOrMeta+d')
+
+  await expect(page).toHaveURL(/\?new=1/)
+  const freshEditor = page.locator('.cm-content')
+  await expect(freshEditor).toBeFocused()
+  await page.keyboard.type('Fresh title')
+  await expect(freshEditor).toContainText('# Fresh title')
 })
 
 test('schema transport failure keeps custom controls read-only but allows body-only Edit', async ({

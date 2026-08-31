@@ -1,10 +1,17 @@
+import { lazy, Suspense } from 'react'
+
 import { EmptyState } from '../../core/EmptyState'
-import { ForceGraphCanvas } from '../../core/ForceGraphCanvas'
 import { IconGraph } from '../../core/Icons'
 import { Skeleton } from '../../core/Skeleton'
 import { cx } from '../../libs/cx/cx'
 import type { GraphView as Graph, GraphNodeView as GraphNode } from '../../libs/wire'
 import styles from './panels.module.scss'
+
+const ForceGraphCanvas = lazy(async () => {
+  const { ForceGraphCanvas: LoadedForceGraphCanvas } = await import('../../core/ForceGraphCanvas')
+
+  return { default: LoadedForceGraphCanvas }
+})
 
 type GraphPanelProps = {
   /** null until the first /api/graph load resolves (drives the skeleton). */
@@ -68,20 +75,22 @@ export const GraphPanel = ({
           />
         </div>
       ) : (
-        <ForceGraphCanvas
-          graph={slice}
-          theme={theme}
-          activeId={activeId}
-          onOpen={onOpen}
-          onCreateFromGhost={onCreateFromGhost}
-          // Size by each note's full-vault connectivity (not the local slice), and
-          // match the graph page's "100%" spacing so both views read the same. The
-          // active note is marked by its ring + centre.
-          sizeBy="degree"
-          spacing={1.1}
-          fitPadding={40}
-          maxZoom={2}
-        />
+        <Suspense fallback={<GraphSkeleton />}>
+          <ForceGraphCanvas
+            graph={slice}
+            theme={theme}
+            activeId={activeId}
+            onOpen={onOpen}
+            onCreateFromGhost={onCreateFromGhost}
+            // Size by each note's full-vault connectivity (not the local slice), and
+            // match the graph page's "100%" spacing so both views read the same. The
+            // active note is marked by its ring + centre.
+            sizeBy="degree"
+            spacing={1.1}
+            fitPadding={40}
+            maxZoom={2}
+          />
+        </Suspense>
       )}
       {/* Locate this note in the full graph: switch to the graph view with this
           note pinned as the focus, so you see its place in the whole vault. */}
