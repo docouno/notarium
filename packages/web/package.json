@@ -13,7 +13,7 @@
   },
   "scripts": {
     "dev": "vite",
-    "build": "vite build && node ../../scripts/checkWebBundleBudget.mjs",
+    "build": "node --no-maglev ../../node_modules/vite/bin/vite.js build && node --no-maglev ../../scripts/checkWebBundleBudget.mjs",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "pwa:assets": "pwa-assets-generator"

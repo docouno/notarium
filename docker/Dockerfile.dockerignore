@@ -4,6 +4,9 @@ dist
 .git
 .gitignore
 .env
+review.env
+visual-handoff.json
+visual-pulled-base.json
 *.log
 # Gitignored scratch space some checkouts keep beside the sources — never image
 # content, and it can be large enough to slow the build context down on its own.
@@ -14,6 +17,7 @@ dist
 # boot guard would then find that dead copy at /app/.data and refuse to start.
 # `docker/` below already covers `docker/volumes/`.
 .data
+backups
 
 # Test/build output that only ever flows the other way. `make save` drops its
 # tarball at the repo root, and it is the image — copying it back in is circular.

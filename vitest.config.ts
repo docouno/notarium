@@ -1,6 +1,9 @@
 import { fileURLToPath } from 'node:url'
 
 import { defineConfig } from 'vitest/config'
+import { resolveCheckupProfile } from './scripts/checkup/profile.mjs'
+
+const checkupProfile = resolveCheckupProfile()
 
 // Unit layer (Layer 2 of the test strategy): pure functions tested
 // against the spec, not the implementation. No React/DOM here — these are
@@ -24,6 +27,9 @@ export default defineConfig({
     environment: 'node',
     // The default reporter counts skips; this one names the gate behind each.
     reporters: ['default', './test/skipSummary.ts'],
+    maxWorkers: checkupProfile.effective.vitestWorkers,
+    minWorkers: checkupProfile.effective.vitestWorkers,
+    fileParallelism: checkupProfile.effective.fileParallelism,
     // *.test.ts under test/ (unit layer + fake-server conformance) plus
     // co-located unit tests inside packages (the target layout). The
     // Playwright e2e/visual layers use *.spec.ts and a separate runner, so
@@ -79,8 +85,10 @@ export default defineConfig({
         'packages/server/src/services/metaDb/pgMetaDb.ts',
         'packages/server/src/services/metaDb/migrations/runPgMigrations.ts',
       ],
-      reporter: ['text-summary', 'json-summary', 'html'],
+      reporter: ['text-summary', 'json-summary', 'html', 'cobertura'],
       reportsDirectory: './coverage',
+      reportOnFailure: true,
+      processingConcurrency: checkupProfile.effective.coverageProcessingConcurrency,
       // Ratchet floors from the 2026-07-11 baseline (measured lines/branches/funcs):
       // contract 100/100/100 · core 94/88/99 · engine 88/87/97 · engine-memory 94/88/95.
       // Set just under measured so decomposition can't silently drop coverage; raise as

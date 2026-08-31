@@ -15,12 +15,12 @@
 
 SHELL := /bin/bash
 
-# Load .env first so it wins over the defaults below, and `export` it so the
-# values reach `docker compose` for ${...} interpolation (compose otherwise looks
-# for .env next to the compose files in docker/, not here). Container-side vars
-# are still injected per service via `env_file:`. Missing .env is fine (`-`).
+# Load .env first so it wins over the defaults below. Its values are exported
+# after the Makefile-owned defaults are declared; a bare `export` would also
+# export every lazy internal variable and force their `$(shell ...)` expressions
+# before every recipe. Container-side vars are still injected per service via
+# `env_file:`. Missing .env is fine (`-`).
 -include .env
-export
 
 # --- image coordinates (override via env or `make IMAGE_NAME=...`) ----------
 # REGISTRY is empty by default, so IMAGE_NAME alone resolves against Docker Hub.
@@ -33,6 +33,17 @@ IMAGE      ?= $(if $(REGISTRY),$(REGISTRY)/,)$(IMAGE_NAME)
 VERSION    ?= $(shell node -p "require('./package.json').version" 2>/dev/null || echo dev)
 HOST_UID   ?= $(shell id -u)
 HOST_GID   ?= $(shell id -g)
+
+# Compose reads interpolation variables from the process environment because its
+# files live under docker/ rather than beside the repository .env. Export only the
+# actual dotenv contract plus Makefile defaults that recipes consume as environment;
+# variables inherited from the caller or set on the make command line remain exported
+# by GNU Make itself. Keep the guard: `export` with an empty name list means export ALL.
+DOTENV_KEYS := $(shell sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' .env 2>/dev/null)
+ifneq ($(strip $(DOTENV_KEYS)),)
+export $(DOTENV_KEYS)
+endif
+export SHELL REGISTRY IMAGE_NAME IMAGE VERSION HOST_UID HOST_GID
 # The two install profiles are `deps:lean` / `deps:full` in package.json, NOT here.
 # CI runs them straight from a bare node image, which has no make, and any second
 # provider has to reach the same two commands — one definition, or the lean workspace
@@ -81,6 +92,21 @@ NODE_TEST_IMAGE ?= node:24-slim
 # Keep this tag byte-for-byte aligned with the exact @playwright/test version in
 # package.json; Playwright refuses to launch when client and browser image drift.
 PLAYWRIGHT_TEST_IMAGE ?= mcr.microsoft.com/playwright:v1.60.0-jammy
+
+# Every standalone target that copies the checkout into a disposable volume uses the
+# same closed host-state boundary. Keep visual baselines available to test-browser, but
+# never send local docs, review output, backups or generated archives to a container.
+# The exact checkup snapshot has a stricter manifest contract; this is the matching
+# best-effort boundary for standalone targets that intentionally accept a live checkout.
+SOURCE_COPY_TAR_EXCLUDES := \
+	--exclude='./.git' --exclude='./.env' --exclude='./review.env' \
+	--exclude='./visual-handoff.json' \
+	--exclude='./visual-pulled-base.json' \
+	--exclude='./.data' --exclude='./.docs-local' --exclude='./backups' \
+	--exclude='./notarium-*.tar.gz' --exclude='./*.log' \
+	--exclude='./node_modules' --exclude='./packages/*/node_modules' \
+	--exclude='./packages/*/dist' --exclude='./docker/volumes' \
+	--exclude='./coverage' --exclude='./test-results' --exclude='./playwright-report'
 
 .DEFAULT_GOAL := help
 .PHONY: help prepare deps deps-vector doctor dev up start down stop restart logs ps sh \
@@ -210,6 +236,8 @@ test-coverage: ## Build and run full coverage (including native vector tests) in
 	    --mount "type=bind,src=$(CURDIR)/Makefile,dst=/app/Makefile,readonly" \
 	    --mount "type=bind,src=$(CURDIR)/scripts,dst=/app/scripts,readonly" \
 	    --mount "type=bind,src=$(CURDIR)/README.md,dst=/app/README.md,readonly" \
+	    -e CHECKUP_CPU_CEILING -e CHECKUP_VITEST_WORKERS \
+	    -e CHECKUP_COVERAGE_CONCURRENCY -e CHECKUP_REQUIRE_AFFINITY=1 \
 	    --entrypoint npm "$(CHECKUP_IMAGE)" run test:coverage
 
 # --- live database contracts -----------------------------------------------
@@ -238,11 +266,7 @@ test-pg: ## Run meta-DB contracts/migrations against ephemeral live Postgres
 	    --mount "type=bind,src=$(CURDIR),dst=/source,readonly" \
 	    --mount "type=volume,src=$(CHECKUP_WORKSPACE_VOLUME),dst=/app" \
 	    --entrypoint sh "$(NODE_TEST_IMAGE)" -c \
-	    "tar -C /source --exclude='./.git' --exclude='./.env' --exclude='./.data' \
-	      --exclude='./node_modules' --exclude='./packages/*/node_modules' \
-	      --exclude='./packages/*/dist' --exclude='./docker/volumes' \
-	      --exclude='./coverage' --exclude='./test-results' --exclude='./playwright-report' \
-	      -cf - . | tar -C /app -xf -"; \
+	    "tar -C /source $(SOURCE_COPY_TAR_EXCLUDES) -cf - . | tar -C /app -xf -"; \
 	  docker run --rm --name $(CHECKUP_RUNNER_CONTAINER) \
 	    --mount "type=volume,src=$(CHECKUP_WORKSPACE_VOLUME),dst=/app" \
 	    --workdir /app -e HOME=/tmp --entrypoint sh "$(NODE_TEST_IMAGE)" -c \
@@ -257,6 +281,8 @@ test-pg: ## Run meta-DB contracts/migrations against ephemeral live Postgres
 	    --network "$(TEST_COMPOSE_PROJECT)_default" \
 	    --mount "type=volume,src=$(CHECKUP_WORKSPACE_VOLUME),dst=/app" \
 	    --workdir /app -e HOME=/tmp \
+	    -e CHECKUP_CPU_CEILING -e CHECKUP_VITEST_WORKERS \
+	    -e CHECKUP_COVERAGE_CONCURRENCY -e CHECKUP_REQUIRE_AFFINITY=1 \
 	    -e TEST_PG_URL=postgres://notarium:notarium@postgres:5432/notarium_test \
 	    --entrypoint npm "$(NODE_TEST_IMAGE)" run test:pg
 
@@ -283,11 +309,7 @@ import-bench: ## Run the Markdown-tree import scale bench in Docker: make import
 	    --mount "type=bind,src=$(CURDIR),dst=/source,readonly" \
 	    --mount "type=volume,src=$(CHECKUP_WORKSPACE_VOLUME),dst=/app" \
 	    --entrypoint sh "$(NODE_TEST_IMAGE)" -c \
-	    "tar -C /source --exclude='./.git' --exclude='./.env' --exclude='./.data' \
-	      --exclude='./node_modules' --exclude='./packages/*/node_modules' \
-	      --exclude='./packages/*/dist' --exclude='./docker/volumes' \
-	      --exclude='./coverage' --exclude='./test-results' --exclude='./playwright-report' \
-	      -cf - . | tar -C /app -xf -"; \
+	    "tar -C /source $(SOURCE_COPY_TAR_EXCLUDES) -cf - . | tar -C /app -xf -"; \
 	  docker run --rm --name $(CHECKUP_RUNNER_CONTAINER) \
 	    --mount "type=volume,src=$(CHECKUP_WORKSPACE_VOLUME),dst=/app" \
 	    --workdir /app -e HOME=/tmp --entrypoint sh "$(NODE_TEST_IMAGE)" -c \
@@ -348,11 +370,7 @@ bench-fields-snapshot: ## Measure the fields projection's snapshot memory in Doc
 	    --mount "type=bind,src=$(CURDIR),dst=/source,readonly" \
 	    --mount "type=volume,src=$(CHECKUP_WORKSPACE_VOLUME),dst=/app" \
 	    --entrypoint sh "$(NODE_TEST_IMAGE)" -c \
-	    "tar -C /source --exclude='./.git' --exclude='./.env' --exclude='./.data' \
-	      --exclude='./node_modules' --exclude='./packages/*/node_modules' \
-	      --exclude='./packages/*/dist' --exclude='./docker/volumes' \
-	      --exclude='./coverage' --exclude='./test-results' --exclude='./playwright-report' \
-	      -cf - . | tar -C /app -xf -"; \
+	    "tar -C /source $(SOURCE_COPY_TAR_EXCLUDES) -cf - . | tar -C /app -xf -"; \
 	  docker run --rm --name $(CHECKUP_RUNNER_CONTAINER) \
 	    --mount "type=volume,src=$(CHECKUP_WORKSPACE_VOLUME),dst=/app" \
 	    --workdir /app -e HOME=/tmp --entrypoint sh "$(NODE_TEST_IMAGE)" -c \
@@ -501,11 +519,7 @@ bench-session-audit: ## Benchmark the session activity read-model on SQLite and 
 	    --mount "type=bind,src=$(CURDIR),dst=/source,readonly" \
 	    --mount "type=volume,src=$(CHECKUP_WORKSPACE_VOLUME),dst=/app" \
 	    --entrypoint sh "$(NODE_TEST_IMAGE)" -c \
-	    "tar -C /source --exclude='./.git' --exclude='./.env' --exclude='./.data' \
-	      --exclude='./node_modules' --exclude='./packages/*/node_modules' \
-	      --exclude='./packages/*/dist' --exclude='./docker/volumes' \
-	      --exclude='./coverage' --exclude='./test-results' --exclude='./playwright-report' \
-	      -cf - . | tar -C /app -xf -"; \
+	    "tar -C /source $(SOURCE_COPY_TAR_EXCLUDES) -cf - . | tar -C /app -xf -"; \
 	  docker run --rm --name $(CHECKUP_RUNNER_CONTAINER) \
 	    --mount "type=volume,src=$(CHECKUP_WORKSPACE_VOLUME),dst=/app" \
 	    --workdir /app -e HOME=/tmp --entrypoint sh "$(NODE_TEST_IMAGE)" -c \
@@ -548,11 +562,7 @@ test-browser: ## Run container-native e2e and installed visual baselines
 	    --mount "type=bind,src=$(CURDIR),dst=/source,readonly" \
 	    --mount "type=volume,src=$(CHECKUP_WORKSPACE_VOLUME),dst=/app" \
 	    --entrypoint sh "$(NODE_TEST_IMAGE)" -c \
-	    "tar -C /source --exclude='./.git' --exclude='./.env' --exclude='./.data' \
-	      --exclude='./node_modules' --exclude='./packages/*/node_modules' \
-	      --exclude='./packages/*/dist' --exclude='./docker/volumes' \
-	      --exclude='./coverage' --exclude='./test-results' --exclude='./playwright-report' \
-	      -cf - . | tar -C /app -xf -"; \
+	    "tar -C /source $(SOURCE_COPY_TAR_EXCLUDES) -cf - . | tar -C /app -xf -"; \
 	  docker run --rm --name $(CHECKUP_RUNNER_CONTAINER) \
 	    --mount "type=volume,src=$(CHECKUP_WORKSPACE_VOLUME),dst=/app" \
 	    --workdir /app -e HOME=/tmp --entrypoint sh "$(PLAYWRIGHT_TEST_IMAGE)" -c \
@@ -573,8 +583,9 @@ test-browser: ## Run container-native e2e and installed visual baselines
 	      --mount "type=volume,src=$(CHECKUP_WORKSPACE_VOLUME),dst=/app" \
 	      --workdir /app -e HOME=/tmp -e CI=1 \
 	      -e PLAYWRIGHT_HTML_OUTPUT_DIR=/tmp/playwright-report \
-	      --entrypoint npx "$(PLAYWRIGHT_TEST_IMAGE)" \
-	      playwright test test/visual --output=/tmp/test-results; \
+	    --entrypoint node "$(PLAYWRIGHT_TEST_IMAGE)" \
+	      --no-maglev node_modules/@playwright/test/cli.js \
+	      test test/visual --output=/tmp/test-results; \
 	  else \
 	    echo "visual: skipped — external baselines are not present in this checkout"; \
 	  fi
@@ -585,18 +596,8 @@ test-browser: ## Run container-native e2e and installed visual baselines
 # Browser tests share the canonical Playwright container but not a long-lived
 # server; each runner owns its webServer and the trap removes its disposable
 # source/dependency volume.
-checkup: deps ## Run every portable gate; visual too when its external baselines are present
-	npm run format:check
-	npm run canon:check
-	$(MAKE) --no-print-directory write-perf-gate
-	npm run meta-migrations:check
-	npm run audit:runtime
-	npm run lint
-	npm run typecheck
-	$(MAKE) --no-print-directory test-coverage
-	$(MAKE) --no-print-directory test-pg
-	$(MAKE) --no-print-directory backup-smoke
-	$(MAKE) --no-print-directory test-browser
+checkup: ## Run every portable gate from one immutable, reported source session
+	node scripts/checkup/index.mjs run
 
 audit-runtime: ## Audit the full production dependency graph against exact reviewed exceptions
 	npm run audit:runtime

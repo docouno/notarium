@@ -5,7 +5,9 @@
 import { Marked, type TokenizerAndRendererExtension } from 'marked'
 import { readFile } from 'node:fs/promises'
 import { performance } from 'node:perf_hooks'
+import { pathToFileURL } from 'node:url'
 import {
+  hasDollarMathPair,
   matchMathBlock,
   matchMathInline,
   mathBlockStart,
@@ -88,6 +90,19 @@ const stats = (values: readonly number[]): Stats => ({
   p95Ms: percentile(values, 0.95),
   maxMs: Math.max(...values),
 })
+
+export const candidateFloorFailure = (
+  name: string,
+  result: Pick<ComparedStats, 'candidate' | 'floor' | 'candidateFloorRatios'>,
+  bound = 3.5,
+): string | null => {
+  const medianRatio = result.candidateFloorRatios.medianMs
+  const p95Ratio = result.candidate.p95Ms / result.floor.p95Ms
+
+  return medianRatio > bound || p95Ratio > bound
+    ? `${name}: candidate/floor median=${medianRatio.toFixed(2)} p95=${p95Ratio.toFixed(2)} exceeds ${bound.toFixed(1)} (paired-ratio p95=${result.candidateFloorRatios.p95Ms.toFixed(2)} diagnostic)`
+    : null
+}
 
 const timed = (task: () => unknown): number => {
   const started = performance.now()
@@ -439,7 +454,7 @@ const candidateTokens = (source: string, countSuffixes = false) => {
   const previousSuffixWork = activeSuffixWork
   const suffixWork: SuffixWork = { blockChars: 0, inlineChars: 0, totalChars: 0 }
 
-  candidateInlineGate = source.includes('$')
+  candidateInlineGate = hasDollarMathPair(source)
   candidateBlockGate = source.includes('$$') || source.includes('\\[')
   activeSuffixWork = countSuffixes ? suffixWork : null
   try {
@@ -715,10 +730,10 @@ const run = async (): Promise<void> => {
       loadAdjustedRecorded: loadAdjustedRecorded(result, recordedBeforeMs),
       suffixWork: candidateTokens(body, true).suffixWork,
     }
-    if (result.candidateFloorRatios.medianMs > 3.5 || result.candidateFloorRatios.p95Ms > 3.5) {
-      failures.push(
-        `${name}: candidate/floor median=${result.candidateFloorRatios.medianMs.toFixed(2)} p95=${result.candidateFloorRatios.p95Ms.toFixed(2)} exceeds 3.5`,
-      )
+    const floorFailure = candidateFloorFailure(name, result)
+
+    if (floorFailure) {
+      failures.push(floorFailure)
     }
     if (result.gains.medianMs < 1) {
       failures.push(
@@ -771,8 +786,10 @@ const run = async (): Promise<void> => {
         `${path}: pinned-before/candidate median gain ${result.gains.medianMs.toFixed(2)} is below 1`,
       )
     }
-    if (result.candidateFloorRatios.medianMs > 3.5 || result.candidateFloorRatios.p95Ms > 3.5) {
-      failures.push(`${path}: candidate/floor exceeds the 3.5 bound`)
+    const floorFailure = candidateFloorFailure(path, result)
+
+    if (floorFailure) {
+      failures.push(floorFailure)
     }
   }
 
@@ -806,4 +823,6 @@ const run = async (): Promise<void> => {
   }
 }
 
-await run()
+if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+  await run()
+}

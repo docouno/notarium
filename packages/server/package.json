@@ -13,7 +13,7 @@
     "admin": "tsx src/apps/server/commands/admin/main.ts",
     "backup": "tsx src/apps/server/commands/backup/main.ts",
     "restore": "tsx src/apps/server/commands/restore/main.ts",
-    "build": "tsup",
+    "build": "node --no-maglev ../../node_modules/tsup/dist/cli-default.js",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

@@ -1,7 +1,13 @@
 import { Marked, type TokenizerAndRendererExtension } from 'marked'
 
 import { isValidNoteId, RESERVED_NOTE_ID_PREFIX } from '../../id'
-import { matchMathBlock, matchMathInline, mathBlockStart, mathInlineStart } from '../math'
+import {
+  hasDollarMathPair,
+  matchMathBlock,
+  matchMathInline,
+  mathBlockStart,
+  mathInlineStart,
+} from '../math'
 import { lexerSource, type LocatedWikilink, locateWikilinks, WIKILINK_TOKEN } from './tokenOffsets'
 
 /** Reserved target envelope for a stable note identity. Human note names never enter
@@ -344,7 +350,7 @@ const lexWikilinks = (lexed: string): LocatedWikilink[] => {
   const previousInlineMathPresent = inlineMathPresent
   const previousBlockMathPresent = blockMathPresent
 
-  inlineMathPresent = lexed.includes('$')
+  inlineMathPresent = hasDollarMathPair(lexed)
   blockMathPresent = lexed.includes('$$') || lexed.includes('\\[')
 
   try {

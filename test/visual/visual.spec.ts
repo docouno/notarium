@@ -1,5 +1,6 @@
 import type { Page } from '@playwright/test'
 import { expect, test } from '../e2e/fixtures'
+import { visualScreenshot } from './screenshot'
 
 // Visual regression matrix (#18.4). One base resolution (1440×900) — responsive
 // resolutions come after the responsive work lands. For every page we sweep the
@@ -34,6 +35,12 @@ type Cell = Omit<State, 'theme'>
 
 const apply = async (page: Page, s: State) => {
   await page.setViewportSize({ width: W, height: H })
+  // The base fixture deliberately points its two cover images at the reserved
+  // example.test host. Letting those lazy requests reach the network races the
+  // pending thumb boxes against thumbProps' onError self-hide: the two states are
+  // exactly the 4,181-pixel retry-pass seen in CI. Fail them locally and
+  // deterministically; feed shots below observe the resulting product state.
+  await page.route('https://example.test/**', (route) => route.abort('failed'))
   if (s.clock) {
     await page.clock.install({ time: new Date('2026-06-10T12:00:00') })
     await page.route('**/api/s/*/activity?*', async (route) => {
@@ -87,14 +94,22 @@ const syncSettled = (page: Page) =>
 
 const shot = async (page: Page, name: string) => {
   await syncSettled(page)
-  await expect(page).toHaveScreenshot(`${name}.png`)
+  await visualScreenshot(page, name)
 }
 
 const graphShot = async (page: Page, name: string) => {
   await syncSettled(page)
   // animations:'allow' — the default 'disabled' injects a freeze stylesheet that
   // blanks the force-graph <canvas>; the graph has no CSS animations anyway.
-  await expect(page).toHaveScreenshot(`${name}.png`, { animations: 'allow' })
+  await visualScreenshot(page, name, { animations: 'allow' })
+}
+
+const waitFeed = async (page: Page) => {
+  await expect(page.locator('[data-testid="feed-item"]').first()).toContainText(/\w/)
+  // A dead preview URL is removed by the product's image-error handler. This is
+  // the observable boundary after both lazy image requests and the virtualized
+  // rows they resize have settled; first-card text alone is not that boundary.
+  await expect(page.locator('[data-testid="feed-item"] img:visible')).toHaveCount(0)
 }
 
 for (const theme of ['dark', 'light'] as const) {
@@ -128,7 +143,7 @@ for (const theme of ['dark', 'light'] as const) {
       test(`rail ${c.rail} · aside ${c.aside}${w}`, async ({ page }) => {
         await apply(page, { theme, clock: true, ...c })
         await page.goto('/feed')
-        await expect(page.locator('[data-testid="feed-item"]').first()).toContainText(/\w/)
+        await waitFeed(page)
         await shot(page, `feed-${c.rail}-${c.aside}${w}-${theme}`)
       })
     }

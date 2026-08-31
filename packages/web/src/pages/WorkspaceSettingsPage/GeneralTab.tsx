@@ -84,10 +84,9 @@ export const GeneralTab = () => {
     return <Navigate to={workspaceSettingsRoute(space, 'members')} replace />
   }
   if (!active) {
-    // A data-router lazy navigation keeps this outgoing branch mounted until the
-    // destination module is ready. Archiving removes the active row while its
-    // fallback navigation is still pending; do not let this stale branch's
-    // self-guard replace that navigation with a route inside the deleted space.
+    // Archive may remove the active row via its access nudge before the data-router's
+    // lazy fallback navigation has loaded its destination. Keep this outgoing branch
+    // inert while deleting so its self-guard cannot redirect back into the deleted space.
     if (deleting) {
       return null
     }

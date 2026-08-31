@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { mathBlockStart, mathInlineStart } from './math'
+import { hasDollarMathPair, mathBlockStart, mathInlineStart } from './math'
 
 const previousMathBlockStart = (source: string): number | undefined => {
   const match = /\n {0,3}(?:\$\$|\\\[)/.exec(source)
@@ -13,6 +13,13 @@ describe('math start hooks', () => {
     expect(mathInlineStart('$')).toBe(0)
     expect(mathInlineStart('abc')).toBeUndefined()
     expect(mathInlineStart('a\\(b\\) c\\[d\\]')).toBeUndefined()
+  })
+
+  it('opens the expensive inline start hint only when dollar math can close', () => {
+    expect(hasDollarMathPair('$ price')).toBe(false)
+    expect(hasDollarMathPair('$x$')).toBe(true)
+    expect(hasDollarMathPair('$$')).toBe(true)
+    expect(hasDollarMathPair('plain')).toBe(false)
   })
 
   it('matches the previous display-math scan on an exhaustive short corpus', () => {

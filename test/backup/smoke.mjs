@@ -51,6 +51,7 @@ const archive = join(work, 'notarium.zip')
 const password = 'backup-smoke-password'
 const username = 'backup-owner'
 const activeDockerChildren = new Map()
+const checkupSession = process.env.CHECKUP_SESSION_ID
 let interruptedSignal = null
 let cleanupPromise = null
 let cleanupPassPromise = null
@@ -61,7 +62,18 @@ const spawnDocker = (args, options, { allowInterrupted = false } = {}) => {
   if (interruptedSignal && !allowInterrupted) {
     throw new Error(`backup smoke interrupted by ${interruptedSignal}`)
   }
-  const child = spawn('docker', args, options)
+  const labelledArgs =
+    checkupSession && (args[0] === 'run' || args[0] === 'create')
+      ? [
+          args[0],
+          '--label',
+          'notarium.checkup.runner=true',
+          '--label',
+          `notarium.checkup.session=${checkupSession}`,
+          ...args.slice(1),
+        ]
+      : args
+  const child = spawn('docker', labelledArgs, options)
   const done = new Promise((resolve) => {
     const untrack = () => {
       activeDockerChildren.delete(child)
@@ -274,11 +286,7 @@ const stagingState = async (container, live, orphan) => {
 }
 
 const cleanup = async ({ abortOnInterrupt = false } = {}) => {
-  for (const container of [
-    sourceContainer,
-    targetContainer,
-    ...Object.values(fixtureContainers),
-  ]) {
+  for (const container of [sourceContainer, targetContainer, ...Object.values(fixtureContainers)]) {
     if (abortOnInterrupt && interruptedSignal) {
       return
     }

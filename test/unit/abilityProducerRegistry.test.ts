@@ -136,6 +136,7 @@ const SCANNED_ROOTS: Readonly<Record<string, number>> = {
 /** Everything else under `test/`, each with the reason it is not scanned. */
 const UNSCANNED_TEST_DIRECTORIES: Readonly<Record<string, string>> = {
   backup: 'backup-format fixtures: archive bytes, no ability domain',
+  checkup: 'repository orchestration contracts, no ability domain',
   demo: 'screenshot scripting for the marketing shots, driven through the UI',
   e2e: 'Playwright specs and their page helpers, on a separate runner',
   'e2e-real': 'Playwright against a real seeded stand, same separate runner',

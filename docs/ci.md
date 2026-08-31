@@ -15,7 +15,7 @@ logic belongs in a repo script.
 | `lean` | `lean:static`, `lean:unit`, `lean:build` | every push and merge request |
 | `lean` | `lean:release-preflight` | a release tag only — answers in seconds whether this ref can publish at all |
 | `extended` | `extended:unit`, `extended:postgres`, `extended:e2e`, `extended:visual` | a release or rehearsal tag, the default branch, on demand elsewhere |
-| `extended` | `extended:visual-bootstrap` | manual, and only on the default branch or a rehearsal tag — it replaces the canonical baselines rather than proposing a candidate |
+| `extended` | `checkup:compare` | manual on a `ci/*` rehearsal tag; byte-identical subjects, legacy/candidate orchestration inside one runner |
 | `verify` | `visual:gate`, `visual:accept`, `verify:backup-smoke`, `verify:release-smoke` | with the extended lane |
 | `release` | `release:rc` | manual; the default branch or a `-rc.N` tag |
 | `release` | `release:publish` | manual; a `vX.Y.Z` tag only |
@@ -91,10 +91,10 @@ observed in the shared volume; it does not restate the generator's expected size
 non-wire observer on the concrete production engine records successful adjacency generations:
 the named source→target edge must be absent in the warm generation and present in a later
 generation after graph-enabled search. Search ranking and REST/MCP contracts are not used as
-the completion signal. The YAML installs
-only `bash` + `make` and invokes that
-command; image lifecycle, exact OCI identity, cleanup, thresholds, reports and the compact
-e5 test tier stay in the repo target/scripts. Its model cache is an ephemeral writable tmpfs;
+the completion signal. The job's `node:24-alpine` image runs the repo-owned coverage,
+profile and graph scripts; YAML adds the Docker client plugins plus `bash` + `make`, then
+invokes that command. Image lifecycle, exact OCI identity, cleanup, thresholds, reports
+and the compact e5 test tier stay in the repo target/scripts. Its model cache is an ephemeral writable tmpfs;
 the runtime image and application data volume remain unchanged. The existing `context-open` baseline is a
 different scenario and is not changed or reused. Both graph-revision reports are
 disposable job evidence under `test-results/graph-revision/`, not committed baselines.
@@ -105,6 +105,46 @@ memory report also carries exact cold single-flight and warm-mutation counter de
 while the runtime report owns the HTTP/vector/adjacency-completion latency proof.
 CI always supplies `CI_COMMIT_SHA`. Locally, the target infers `HEAD` only from a clean checkout;
 a dirty tree must name its frozen identity explicitly or the target refuses before building.
+
+**Coverage has two GitLab surfaces, both produced by that same unit run.** The job's
+`coverage:` regex reads only Vitest's `Lines` summary, which feeds the job/MR percentage
+and coverage history. The runner also copies `coverage/cobertura-coverage.xml` out of the
+stopped Docker container before cleanup and publishes it `when: always` as both a
+downloadable artifact and `artifacts:reports:coverage_report`, which feeds changed-line
+annotations. One does not substitute for the other. `reportOnFailure` keeps diagnostic
+XML on a red suite; the adapter then returns the original test exit rather than laundering
+it into artifact success. Before publication, a strict parser from the exact test image
+rejects truncated/malformed XML and non-repository-relative class filenames. The XML
+contract is capped at GitLab's 10 MiB limit.
+
+**The extended unit profile is repo-owned and bounded.** The committed tuple is CPU
+ceiling 4 / Vitest workers 4 / coverage processing 4. `scripts/checkup/profile.mjs`
+applies an exact Linux affinity for canonical evidence, prints requested/effective values,
+never scales up on extra nested-Docker CPUs, and coherently clamps on smaller runtimes.
+The coverage adapter resolves that tuple once in the job runtime, passes its effective
+CPU/workers/processing values into the test container and requires affinity there. The
+YAML does not restate those numbers.
+
+**`checkup:compare` is measurement, not another implementation of the gate.** Historical
+trees are retained as negative controls because their export, timing, worker and browser
+failures cannot form a three-green timing cohort. The manual rehearsal therefore
+materializes the exact candidate commit twice and uses its one driver in normalized
+legacy mode (standalone coverage → PG → backup → browser) and candidate mode
+(session-owned reuse plus PG ∥ browser). All source, corpus and stability bytes are
+identical; only orchestration differs. Warm-up and measured runs alternate order in one
+dind/cache protocol. The report keeps driver execution wall, phase wall, max and lease
+wait separate; GitLab scheduler/resource-group queue is outside the speed denominator.
+Each subject keeps separate stdout/stderr logs. A failed subject stops the cohort but
+still writes the aggregate with completed runs, the failed-run paths and its exit/signal,
+so `artifacts:when: always` has a machine-readable verdict rather than only a stack trace.
+The accepted orchestration benchmark is not rerun automatically after every hardening
+patch or patch-equivalent rebase. A fresh legacy cohort is required only when the phase
+DAG, artifact-count model or claimed savings changes; ordinary closeout fixes use targeted
+contracts and one final candidate/full rehearsal.
+The job starts from `node:24-alpine`, adds the Docker client plugins for the existing dind
+service and declares a four-hour ceiling: the repository's engine-strict Node floor is met,
+while the roughly 160-minute reference cohort still has bounded room for cache variance and
+cleanup. The driver prints periodic progress while detailed child streams remain in files.
 
 **`verify:backup-smoke` is one command, because the drill's orchestration lives in
 `make backup-smoke`** — the adapter rule applied to a job that used to restate the build,
@@ -181,14 +221,14 @@ Layout, all content-addressed:
 v1/blobs/sha256/<file-digest>        one PNG, shared by every snapshot that uses it
 v1/snapshots/sha256/<digest>.json    a manifest: cell name → blob digest
 v1/channels/main.json                the pointer that says which snapshot is canonical
-v1/channels/candidates/<slug>.json   a proposed snapshot, slug = <ref>-<commit>
-reviews/<date>-<slug>/index.html     presigned links to what changed
+v1/channels/candidates/<slug>.json   proposed snapshot, slug = <ref>-<commit>-<pipeline>-<job>
+reviews/<date>-<slug>/index.html     presigned links to what that producer job changed
 ```
 
 The review key is dated and carries the candidate slug because it is browsed by hand:
 a listing sorts chronologically, the name says which ref and commit it belongs to, and
-it is literally the slug `visual:accept` takes — so the folder answers "which one am I
-accepting" without a lookup.
+the page repeats the exact producer identity carried by the handoff — so the folder
+answers "which reviewed run is this" without a lookup.
 
 Blobs are **global**, not per-snapshot: a snapshot with five changed cells costs five
 PNGs, not the whole set. That is the only thing that keeps the storage bill flat as
@@ -206,9 +246,49 @@ Playwright's tolerance, not byte for byte. Carrying its fresh render into the ne
 baseline would let sub-threshold noise accumulate approval by approval until it
 crosses the threshold on its own.
 
-**An approval expires by construction.** The candidate slug carries the exact commit,
-so pushing a new one means `visual:accept` addresses a candidate that does not exist,
-rather than silently blessing different pixels.
+**An approval cannot drift.** The candidate slug carries the exact commit,
+pipeline and producer job. Only after its review page succeeds does `publish` create
+the immutable pointer and fixed `visual-handoff.json` containing its
+candidate/commit/pipeline/job/base/snapshot identity. `visual:accept` consumes that
+artifact rather than recomputing it or trusting overridable environment variables,
+then verifies the pointer, content-addressed manifest and unchanged base channel before
+moving `main`. Accept jobs share `resource_group: visual-baseline-accept`, so the base
+check and move are serialized. Another producer run gets a different address and cannot
+redirect this handoff; a stale base or overwritten/mismatched pointer fails closed.
+
+**A render never rebases itself.** `pull` removes stale local evidence first and writes
+`visual-pulled-base.json` (including an explicit `null` channel) only after every blob
+was verified and the local directory was materialized. Publish reads that exact base,
+checks that `main` still names it, and fetches its manifest by the recorded snapshot;
+it never substitutes the channel current at publish time. The read-only verdict performs
+the same channel check with reader credentials, so A→B, A→none and none→A transitions
+are red rather than a stale green or a candidate merged onto unrelated pixels.
+
+**Retry is diagnostic, never green.** Fake and real Playwright configs set
+`failOnFlakyTests`; a first failure may still retry to collect a trace, but the job remains
+red. Visual comparison keeps its inverted publish flow, so it materializes the result
+in the fixed handoff artifact and `visual:gate` owns the red verdict beside pixel diffs
+and non-pixel failures. Broken/report-integrity evidence publishes nothing. On an
+established exact base, a retry-pass may coexist with stable diffs: its fresh bytes are
+excluded, the exact accepted cell digest is carried and bound into manifest/pointer/
+handoff, while the stable diffs remain reviewable. Accepting those stable cells does not
+make the current run green: the gate still reports every flaky cell, and the next pipeline
+proves convergence. A first baseline, unknown flaky cell or flakes-only run still has no
+candidate.
+
+The pinned Playwright image's Node 24 runtime is kept off Maglev for browser builds,
+budget checks, runners, preview composition and long-lived fake/real servers. This is a
+narrow best-effort fence for native deaths observed under contention, not a retry or a
+root fix: the
+[related Node 24 corruption](https://github.com/nodejs/node/issues/64841) is not
+fundamentally Maglev. A JavaScript failure or native process death still stays red;
+the durable exit is a Playwright image on Node
+[26.8.0+](https://nodejs.org/en/blog/release/v26.8.0) or a future fixed Node 24.
+The Playwright configs preserve a real desktop bus when present and otherwise pass
+`DBUS_SESSION_BUS_ADDRESS=disabled:` only to the browser child. Without it Chrome writes
+that fallback into the process environment itself beside an [upstream-documented TSan
+race](https://chromium.googlesource.com/chromium/src.git/+/2fc330d0b93d4bfd7bd04b9fdd3102e529901f91);
+the fixed fallback keeps the absent session bus explicit and avoids native `getenv` crashes.
 
 ### What the gate reads
 
@@ -219,11 +299,17 @@ a real change, and walking the directory would publish that flake as one. Playwr
 `flaky` status is exactly that case and is dropped — the retry already is the second
 render, so nothing has to be rendered twice on purpose.
 
-Two numbers reach the gate, because they are two different verdicts:
+Three numbers reach the gate through `visual-handoff.json`, because they are three
+different verdicts. `review.env` mirrors them only for informational/UI use; GitLab
+variable precedence makes dotenv unsuitable as an authority:
 
 - `VISUAL_DIFFS` — cells whose pixels moved. Reviewable, acceptable.
-- `VISUAL_FAILURES` — tests that failed **without** a screenshot (a timeout, a broken
-  page). There is nothing to review and accepting a baseline will not fix it.
+- `VISUAL_FAILURES` — non-pixel failures: a test without a screenshot, a skipped or
+  zero-test run, a global runner error, inconsistent stats, or a duplicate declared
+  cell name. There is nothing to review and accepting a baseline will not fix it.
+- `VISUAL_FLAKES` — tests that passed only on retry. The gate stays red and names them.
+  With stable diffs on an established base, the review explicitly carries their old
+  accepted digests; otherwise no candidate is published.
 
 `extended:visual` succeeds even when the pixels differ, and `visual:gate` carries the
 verdict. That is not laxity — it is the only arrangement GitLab allows: an
@@ -233,8 +319,8 @@ skips the dependant. "The failing job produces the review link" is not expressib
 
 The gate exists only in the pipelines where the comparison ran, and only speaks when it
 actually reported. Both halves are deliberate: it carries `needs: extended:visual`, so a
-comparison that died before writing its dotenv skips the gate rather than letting it
-read an empty report as "nothing moved" (that failure is already red through the
+comparison that died before writing its handoff skips the gate rather than letting it
+read a missing report as "nothing moved" (that failure is already red through the
 comparison itself); and it carries the extended lane's own events as rules, so a merge
 request that only ran `lean` shows no visual verdict rather than a green one. It was
 previously present in every pipeline, and reported "matches the accepted baseline" in
@@ -247,8 +333,26 @@ runs where nothing had been compared at all.
 2. `visual:gate` is red, names the count, and prints the review page's **bucket path**.
 3. Open that page out of the bucket by hand (download `index.html`, open it locally —
    the images inside are presigned and load for seven days).
-4. If the new rendering is correct, run **`visual:accept`**. It moves the channel to
-   the candidate you just looked at. No render, no recompute.
+4. If the new rendering is correct, run **`visual:accept`** in that pipeline. It reads
+   the exact producer identity from `extended:visual`'s fixed artifact, verifies the immutable
+   pointer and snapshot, then moves the channel. No render, no recompute.
+
+The first run uses exactly the same flow. With no `main` channel, `pull` materializes
+an empty baseline set, Playwright reports every named screenshot as new, and `publish`
+creates a candidate and review page containing the whole matrix. `visual:accept` then
+moves the channel to that reviewed candidate. There is no separate command that can
+replace the channel from an unreviewed `--update-snapshots` render.
+Every candidate is fail-closed: an empty/inconsistent report and any broken or skipped
+test publish nothing. Retry-passes cannot contribute bytes: only stable diffs may form a
+candidate, and only when every flaky cell already exists in the exact pulled base.
+The first run has the additional requirement that it contain at least one new image,
+because there is no accepted snapshot from which it could carry cells forward.
+
+All `toHaveScreenshot` calls in the visual projects resolve into
+`test/visual/visual.spec.ts-snapshots/` and use the canonical
+`*-chromium-linux.png` renderer suffix. A new spec or project therefore adds cells to
+the same manifest instead of silently creating a second snapshot directory that the
+storage protocol never reads.
 
 **Why a path and not a link.** Both ways of handing over a presigned URL are closed:
 printed in a job log it comes out with `[MASKED]` where `X-Amz-Credential` sits,
@@ -262,21 +366,6 @@ part of this contour yet.
 once means a global change — a font, a colour token, a browser bump — or that the
 baselines were produced on a different class of machine than the one comparing them.
 Both are worth understanding before accepting; the first is usually intended.
-
-### Bootstrapping
-
-`extended:visual-bootstrap` is manual and one-off: it renders the whole set with
-`--update-snapshots` in the canonical image, on the runner that will be checking it,
-and publishes it as a first candidate. Deliberately not seeded from a developer
-machine — that way the question "does this host render like the runner" never has to
-be asked, and the invariant "baselines are produced by the lane that verifies them"
-holds from the first snapshot.
-
-It is offered on the default branch and on a rehearsal tag, and nowhere else. This is
-the one button in the contour that *replaces* the canonical set instead of proposing a
-candidate for review, so it does not belong in an arbitrary merge request's pipeline
-one stray click away. Needing it on a branch means tagging that branch `ci/<label>`,
-which is the same explicit, disposable act the rest of the lane is rehearsed with.
 
 ### Known gap
 
@@ -318,7 +407,11 @@ passes the chosen pair in as, rather than by its `*_READ_*` / `*_WRITE_*` name a
 
 Because the writer is protected, it is absent on ordinary branches — and the lane
 degrades honestly there: it still compares and still fails on a difference, it just
-cannot offer a review page, and it never pretends to have published one.
+cannot offer a review page, and it never pretends to have published one. The adapter
+checks both optional writer fields with default-safe shell expansion under `set -u`;
+if either is absent, it runs the local verdict path and still emits the dotenv report.
+The same path always emits the authoritative `visual-handoff.json`; downstream jobs do
+not read verdict or identity from environment variables.
 
 ## What the runner has to provide
 

@@ -50,12 +50,14 @@ notarium-*.tar.gz
 # place the recipe lives rather than a second copy of the same bytes.
 /assets/og/
 
-# Records CI jobs write INTO the checkout: the visual lane's dotenv report and its
-# Playwright JSON, and the release entrypoint's published identity. Job artefacts, not
+# Records CI jobs write INTO the checkout: the visual lane's dotenv/handoff reports and
+# its Playwright JSON, and the release entrypoint's published identity. Job artefacts, not
 # sources. `release.json` in particular MUST be here — the release gate refuses a dirty
 # tree, and `--json | tee release.json` creates the file before the gate reads
 # `git status`, so without this line the lane cannot publish anything at all.
 review.env
+visual-handoff.json
+visual-pulled-base.json
 visual-report.json
 release.json
 

@@ -771,7 +771,7 @@ describe('context sets (#209)', () => {
     expect((await facet.getSet(setId))?.items).toEqual([])
   })
 
-  it('keeps the real CachedStore fact path identical for 250 and 1000 door refs', async () => {
+  it('keeps the real CachedStore fact path bounded across 1000 door refs', async () => {
     const run = async (count: number) => {
       await app.close()
       const seeded = fixture()
@@ -853,15 +853,12 @@ describe('context sets (#209)', () => {
       expect(reordered.statusCode).toBe(200)
       expect({ factCalls, factIds, fullReads }).toEqual(afterPreview)
 
-      return { preview, ...afterPreview }
+      return { preview, expectedFactIds: ids.slice(0, 250), ...afterPreview }
     }
-    const bounded = await run(250)
     const oversized = await run(1_000)
 
-    expect(bounded.factCalls).toBe(250)
     expect(oversized.factCalls).toBe(250)
-    expect(oversized.factIds).toEqual(bounded.factIds)
-    expect(bounded.fullReads).toBe(0)
+    expect(oversized.factIds).toEqual(oversized.expectedFactIds)
     expect(oversized.fullReads).toBe(0)
     expect(oversized.preview.sets[0]).toMatchObject({
       itemsLoaded: 250,

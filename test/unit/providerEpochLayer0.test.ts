@@ -4,6 +4,10 @@ import { describe, expect, it } from 'vitest'
 
 const REPO = path.resolve(import.meta.dirname, '../..')
 const RULE = 'provider-epochs/owned-facet-writes'
+// Loading the flat config and its TypeScript plugins is the expensive part. Reusing one
+// engine keeps this contract structural instead of making two cold ESLint startups race
+// Vitest's ordinary five-second test timeout under CI contention.
+const eslint = new ESLint({ cwd: REPO })
 const WRITE = `export const mutate = (db: { prepare: (sql: string) => unknown }) =>
   db.prepare('UPDATE provider_resources SET base_url = ? WHERE id = ?')
 `
@@ -12,7 +16,6 @@ const ALIASED_WRITE = `export const mutate = (db: { prepare: (sql: string) => un
 `
 
 const lintAs = async (relativePath: string, code = WRITE): Promise<string[]> => {
-  const eslint = new ESLint({ cwd: REPO })
   const [result] = await eslint.lintText(code, { filePath: path.join(REPO, relativePath) })
 
   return result.messages.filter(({ ruleId }) => ruleId === RULE).map(({ message }) => message)

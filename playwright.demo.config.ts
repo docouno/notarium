@@ -13,6 +13,10 @@ import { defineConfig, devices } from '@playwright/test'
 
 const PORT = Number(process.env.DEMO_PORT || 8790)
 const LOCALE = process.env.LOCALE || 'en'
+const BROWSER_ENV = {
+  ...process.env,
+  DBUS_SESSION_BUS_ADDRESS: process.env.DBUS_SESSION_BUS_ADDRESS ?? 'disabled:',
+}
 
 // The world's "today" — noon UTC of the day the shots are taken, shared by the
 // seeded world and the browser clock so the two never disagree about what "3 days
@@ -38,6 +42,7 @@ export default defineConfig({
     baseURL: `http://localhost:${PORT}`,
     // Screenshots are taken explicitly; nothing here is a baseline comparison.
     trace: 'off',
+    launchOptions: { env: BROWSER_ENV },
   },
   projects: [
     {
@@ -56,7 +61,7 @@ export default defineConfig({
     // The fake serves the built SPA and /api from one origin, seeded straight from
     // the catalog — no intermediate fixture JSON, so the pixels and
     // `make seed CASE=demo` can't drift apart.
-    command: `VITE_PWA=off npm run build && PORT=${PORT} CASE=demo LOCALE=${LOCALE} NOW=${NOW} npx tsx test/fake-server/main.ts`,
+    command: `VITE_PWA=off npm run build && PORT=${PORT} CASE=demo LOCALE=${LOCALE} NOW=${NOW} node --no-maglev --import tsx test/fake-server/main.ts`,
     url: `http://localhost:${PORT}/api/health`,
     reuseExistingServer: !process.env.CI,
     timeout: 180_000,

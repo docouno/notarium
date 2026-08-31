@@ -87,3 +87,12 @@ export const mathInlineStart = (source: string): number | undefined => {
   const index = source.indexOf('$')
   return index === -1 ? undefined : index
 }
+
+/** Whether dollar math could possibly close. The Marked start hook is only a
+ * performance hint; one unmatched dollar cannot produce a token, and keeping the
+ * hook active makes every later inline suffix rescan for a marker that does not exist. */
+export const hasDollarMathPair = (source: string): boolean => {
+  const first = source.indexOf('$')
+
+  return first !== -1 && source.indexOf('$', first + 1) !== -1
+}

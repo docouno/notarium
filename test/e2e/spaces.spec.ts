@@ -160,11 +160,19 @@ test('delete a space → it lands in the Trash (Spaces), restore brings it back 
   await page.goto('/')
   await createNamed(page, 'Scratch Space')
   await expect(page).toHaveURL(/\/s\/scratch-space$/)
+  await expect(page.getByTestId('space-switcher')).toContainText('Scratch Space')
 
   // Delete from Management → General → Danger zone.
   await page.goto('/s/scratch-space/management/general')
   await page.getByTestId('space-delete').click()
+  const archived = page.waitForResponse((response) => {
+    const request = response.request()
+    return (
+      request.method() === 'DELETE' && new URL(response.url()).pathname === '/api/s/scratch-space'
+    )
+  })
   await page.getByRole('button', { name: 'Move to Trash' }).click()
+  expect((await archived).ok()).toBeTruthy()
 
   // Redirected off the deleted space; it's gone from the switcher.
   await expect(page).not.toHaveURL(/\/s\/scratch-space/)
@@ -191,9 +199,17 @@ test('permanently delete a space from the Trash via the bulk footer (#110)', asy
   await page.goto('/')
   await createNamed(page, 'Scratch Space')
   await expect(page).toHaveURL(/\/s\/scratch-space$/)
+  await expect(page.getByTestId('space-switcher')).toContainText('Scratch Space')
   await page.goto('/s/scratch-space/management/general')
   await page.getByTestId('space-delete').click()
+  const archived = page.waitForResponse((response) => {
+    const request = response.request()
+    return (
+      request.method() === 'DELETE' && new URL(response.url()).pathname === '/api/s/scratch-space'
+    )
+  })
   await page.getByRole('button', { name: 'Move to Trash' }).click()
+  expect((await archived).ok()).toBeTruthy()
   await expect(page).not.toHaveURL(/\/s\/scratch-space/)
 
   await page.goto('/s/main/trash?tab=spaces')

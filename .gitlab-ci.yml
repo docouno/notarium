@@ -190,28 +190,70 @@ lean:build:
 extended:unit:
   stage: extended
   extends: [.dind, .heavy, .extended-rules]
+  # Repo-owned coverage/profile/graph scripts require the declared Node >=24.
+  # Add the Docker client side to that runtime; the service still owns the daemon.
+  image: node:24-alpine
   script:
-    - apk add --no-cache bash make
+    - apk add --no-cache bash docker-cli docker-cli-buildx docker-cli-compose make
     - docker build --target test -t "notarium-test:$CI_COMMIT_SHORT_SHA" -f docker/Dockerfile .
-    # Makefile, README.md and all of scripts/ bar the SPA size gate are kept OUT of the
-    # image on purpose — they are tooling and docs the product does not ship — but the
-    # suite needs all three: the backup tests drive the real Makefile, the release and
-    # seed tests import scripts/*.mjs, and the preview suite derives its headline from
-    # README.md rather than keeping a second copy of it. They go into the CONTAINER,
-    # never into the image. Under dind the daemon cannot see this checkout, so they
-    # travel over the API. Keep this list and the Makefile's in step.
+    # Makefile, Dockerfile.dockerignore, README.md and all of scripts/ bar the SPA size
+    # gate are kept OUT of the image on purpose — they are tooling and docs the product
+    # does not ship — but the suite needs all four: adapter tests inspect the source-copy
+    # deny contract, backup tests drive the real Makefile, release and seed tests import
+    # scripts/*.mjs, and the preview suite derives its headline from README.md rather
+    # than keeping a second copy of it. They go into the CONTAINER, never into the image.
+    # Under dind the daemon cannot see this checkout, so they travel over the API.
     # Hence `scripts/.`, which copies the CONTENTS: `/app/scripts` already exists (it
     # holds that one gate script), and a bare `./scripts` would land inside it as
     # `/app/scripts/scripts`.
-    - docker create --name "notarium-test-run-$CI_JOB_ID" --entrypoint npm "notarium-test:$CI_COMMIT_SHORT_SHA" run test:coverage
-    - docker cp ./Makefile "notarium-test-run-$CI_JOB_ID:/app/Makefile"
-    - docker cp ./scripts/. "notarium-test-run-$CI_JOB_ID:/app/scripts"
-    - docker cp ./README.md "notarium-test-run-$CI_JOB_ID:/app/README.md"
-    - docker start --attach "notarium-test-run-$CI_JOB_ID"
+    - node scripts/checkup/ciCoverage.mjs --image "notarium-test:$CI_COMMIT_SHORT_SHA" --container "notarium-test-run-$CI_JOB_ID"
     - make graph-revision-gate GRAPH_REVISION_COMMIT="$CI_COMMIT_SHA"
+  coverage: '/^Lines\s*:\s*[0-9]+(?:\.[0-9]+)?%/'
+  artifacts:
+    when: always
+    expire_in: 7 days
+    access: developer
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+    paths:
+      - coverage/cobertura-coverage.xml
   after_script:
     - docker rm -f "notarium-test-run-$CI_JOB_ID" || true
     - docker image rm -f "notarium-test:$CI_COMMIT_SHORT_SHA" || true
+
+# Candidate-only normalized orchestration rehearsal. Both detached subjects use the
+# exact candidate bytes; only the candidate driver's legacy/candidate phase DAG differs.
+# This removes known historical correctness/runtime flakes from the speed denominator,
+# while scheduler/resource-group queue stays outside execution wall.
+checkup:compare:
+  stage: extended
+  extends: [.dind, .heavy]
+  # The docker CLI image's Alpine repository currently carries Node 22, while the
+  # repository is engine-strict on Node >=24. Start from the declared runtime and
+  # add only the Docker client side; the dind service remains the same daemon.
+  image: node:24-alpine
+  # One warm-up plus 3x2 measured full runs is about 160 minutes on the reference
+  # runner. Keep a finite ceiling with enough room for cleanup and cache variance.
+  timeout: 4h
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^ci\//
+      when: manual
+      allow_failure: true
+    - when: never
+  script:
+    - apk add --no-cache bash docker-cli docker-cli-buildx docker-cli-compose git make
+    - npm i -g "npm@$(node -p "require('./package.json').packageManager.slice(4)")"
+    - npm run deps:lean
+    - node scripts/checkup/compare.mjs --base "$CI_COMMIT_SHA" --candidate "$CI_COMMIT_SHA" --runs "${CHECKUP_COMPARE_RUNS:-3}" --warmups "${CHECKUP_COMPARE_WARMUPS:-1}"
+  artifacts:
+    when: always
+    expire_in: 7 days
+    access: developer
+    paths:
+      - test-results/checkup-compare.json
+      - test-results/checkup-compare-runs/
 
 # The live-dialect contracts. No dind: Postgres is an ordinary service on the job's
 # network, which is what the Makefile target builds a whole disposable Compose topology
@@ -288,9 +330,9 @@ extended:e2e:
 
 # Visual regression against the canonical baselines in private object storage.
 #
-# The candidate slug carries the exact commit, which is what makes an approval expire by
-# construction: push a new commit and the approve job addresses a candidate that does not
-# exist, rather than silently blessing different pixels.
+# The candidate slug carries the exact commit, pipeline and producer job. Its fixed
+# handoff identity makes approval expire by construction: accept verifies the exact
+# pointer/snapshot instead of trusting an overridable variable or recomputed address.
 #
 # Reader credentials are enough to compare. Publishing a candidate needs the writer, which
 # is a protected variable and therefore absent on ordinary branches — so the job degrades
@@ -301,7 +343,6 @@ extended:visual:
   image: mcr.microsoft.com/playwright:v1.60.0-jammy
   variables:
     CI: '1'
-    VISUAL_CANDIDATE: $CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
     # What the run decided is read from Playwright's own report, not from the files it
     # left behind: an attempt that PASSES writes no artefact, so a directory walk sees
     # only the failed attempt of a flaky cell and publishes it as a change.
@@ -325,15 +366,18 @@ extended:visual:
       node scripts/visualBaseline.mjs pull
     - |
       set +e
-      npx playwright test test/visual --reporter=list,json
+      node --no-maglev node_modules/@playwright/test/cli.js test test/visual --reporter=list,json
       set -e
-      if [ -n "$VISUAL_S3_WRITE_KEY_ID" ]; then
+      if [ -n "${VISUAL_S3_WRITE_KEY_ID:-}" ] && [ -n "${VISUAL_S3_WRITE_SECRET:-}" ]; then
+        candidate="$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA-$CI_PIPELINE_ID-$CI_JOB_ID"
         VISUAL_S3_KEY_ID="$VISUAL_S3_WRITE_KEY_ID" VISUAL_S3_SECRET="$VISUAL_S3_WRITE_SECRET" \
           node scripts/visualBaseline.mjs publish \
-            --candidate "$VISUAL_CANDIDATE" --commit "$CI_COMMIT_SHA" --pipeline "$CI_PIPELINE_ID"
+            --candidate "$candidate" --commit "$CI_COMMIT_SHA" \
+            --pipeline "$CI_PIPELINE_ID" --job "$CI_JOB_ID"
       else
         echo "visual: no writer credentials on this ref — comparison only, no candidate"
-        node scripts/visualBaseline.mjs verdict
+        VISUAL_S3_KEY_ID="$VISUAL_S3_READ_KEY_ID" VISUAL_S3_SECRET="$VISUAL_S3_READ_SECRET" \
+          node scripts/visualBaseline.mjs verdict
       fi
   artifacts:
     when: always
@@ -342,16 +386,18 @@ extended:visual:
     reports:
       dotenv: review.env
     paths:
+      - visual-handoff.json
       - playwright-report/
       - test-results/
 
-# The verdict, and the only thing here that is allowed to be red. It reads what the
-# comparison published as dotenv variables, so it needs no artefacts, no image and no
-# credentials.
+# The verdict, and the only thing here that is allowed to be red. It reads the fixed
+# schema-versioned handoff artifact; dotenv remains informational because higher-
+# precedence manual/project variables can override it.
 #
-# TWO numbers, because they are two different verdicts. Pixels that moved are looked at
-# and accepted; a test that failed without producing a screenshot has nothing to accept
-# and is simply a red suite. Collapsing them would let a timeout pass for "no diffs".
+# THREE numbers, because they are three different verdicts. Pixels that moved are looked
+# at and accepted; a test that failed without producing a screenshot has nothing to
+# accept; and a retry-pass is a diagnostic flake that stays red. Collapsing them would
+# let a timeout or retry pass for "no diffs".
 #
 # Two mechanisms, because they answer different halves:
 #
@@ -360,11 +406,13 @@ extended:visual:
 #            Spelled out instead of extending .extended-rules: this job runs `always` and
 #            that rule set does not.
 #   needs  — WHETHER it can speak. Tied to the comparison, so a run that died before
-#            reporting skips the gate instead of reading an empty dotenv as zero.
+#            reporting skips the gate instead of reading a missing handoff as zero.
 visual:gate:
   stage: verify
   image: node:24-slim
-  needs: ['extended:visual']
+  needs:
+    - job: extended:visual
+      artifacts: true
   # `always`, not `on_success`: a red e2e in the same stage must not swallow the pixel
   # verdict — the two report on different things.
   rules:
@@ -377,54 +425,7 @@ visual:gate:
     - when: manual
       allow_failure: true
   script:
-    - |
-      if [ "${VISUAL_FAILURES:-0}" != "0" ]; then
-        echo "visual: $VISUAL_FAILURES test(s) failed without a screenshot — this is not a pixel change."
-        echo "visual: read extended:visual's log; accepting a baseline will not fix it."
-        exit 1
-      fi
-      if [ "${VISUAL_DIFFS:-0}" != "0" ]; then
-        echo "visual: $VISUAL_DIFFS cells differ from the accepted baseline."
-        echo "visual: review page — $VISUAL_REVIEW"
-        echo "visual: open it out of the bucket, and run visual:accept if the new rendering is right."
-        exit 1
-      fi
-      echo "visual: matches the accepted baseline"
-
-# Generates the FIRST baseline set, in the canonical image, on the runner that will be
-# checking it. Deliberately not seeded from a developer machine: doing it here means the
-# question "does this host render like the runner" never has to be asked.
-extended:visual-bootstrap:
-  stage: extended
-  extends: .npm-cache
-  image: mcr.microsoft.com/playwright:v1.60.0-jammy
-  # Offered only where a baseline may legitimately be born: the default branch, or a
-  # rehearsal tag standing in for it. This is the one button in the contour that REPLACES
-  # the canonical set rather than proposing a candidate for review.
-  rules:
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      when: manual
-      allow_failure: true
-    - if: $CI_COMMIT_TAG =~ /^ci\//
-      when: manual
-      allow_failure: true
-  variables:
-    CI: '1'
-    VISUAL_CANDIDATE: $CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
-    VISUAL_S3_KEY_ID: $VISUAL_S3_WRITE_KEY_ID
-    VISUAL_S3_SECRET: $VISUAL_S3_WRITE_SECRET
-  script:
-    # The declared npm — see the .lean pin above for why this line exists.
-    - |
-      set -eu
-      pinned_npm="$(node -p "(/^npm@([0-9]+[.][0-9]+[.][0-9]+([-][0-9A-Za-z.-]+)?)([+].*)?$/.exec(require('./package.json').packageManager)||[,''])[1]")"
-      [ -n "$pinned_npm" ] || { echo 'package.json packageManager must be npm@<x.y.z>' >&2; exit 1; }
-      npm i -g "npm@$pinned_npm"
-      npm -v
-    - npm run deps:lean
-    - npx playwright test test/visual --update-snapshots
-    - node scripts/visualBaseline.mjs publish
-      --candidate "$VISUAL_CANDIDATE" --commit "$CI_COMMIT_SHA" --pipeline "$CI_PIPELINE_ID" --bootstrap
+    - node scripts/visualBaseline.mjs gate
 
 # --- verify ------------------------------------------------------------------
 # Where the built ARTEFACT proves itself, as opposed to the source. Its own stage because
@@ -440,18 +441,18 @@ visual:accept:
   stage: verify
   image: node:24-slim
   when: manual
-  # `artifacts: false` because this job addresses the candidate by slug and reads nothing
-  # the comparison left behind.
+  resource_group: visual-baseline-accept
+  # The exact producer/base/snapshot identity comes from the fixed handoff artifact. A
+  # recomputed or environment-overridden slug cannot redirect this privileged move.
   needs:
     - job: extended:visual
-      artifacts: false
+      artifacts: true
   variables:
-    VISUAL_CANDIDATE: $CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
     VISUAL_S3_KEY_ID: $VISUAL_S3_WRITE_KEY_ID
     VISUAL_S3_SECRET: $VISUAL_S3_WRITE_SECRET
   script:
     # No install: the protocol is two dependency-free modules over node's own crypto.
-    - node scripts/visualBaseline.mjs accept --candidate "$VISUAL_CANDIDATE"
+    - node scripts/visualBaseline.mjs accept
 
 # Destructive backup → fresh-volume restore against the real runtime image, plus the
 # durable-import fixture off the builder stage. The adapter rule applied literally: the

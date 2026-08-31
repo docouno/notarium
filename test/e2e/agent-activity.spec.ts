@@ -124,11 +124,21 @@ test('trace-first call detail and instance telemetry settings stay inspectable',
     .getByRole('button', { name: 'Toggle call details for list_notes' })
     .press('Enter')
   await expect(compactListCall).toContainText('"status": "expired_or_missing"')
+  const errorsResponse = page.waitForResponse((response) => {
+    const url = new URL(response.url())
+
+    return (
+      url.pathname === '/api/me/agent-sessions/all' &&
+      url.searchParams.get('outcome') === 'errors' &&
+      !url.searchParams.has('filter')
+    )
+  })
+
   await page.getByRole('button', { name: 'Errors', exact: true }).click()
   await expect(page).toHaveURL(/outcome=errors/)
+  expect((await errorsResponse).ok()).toBeTruthy()
   const errorRows = page.getByTestId('agent-call-row')
-  await expect(errorRows.first()).toBeVisible()
-  expect(await errorRows.count()).toBeLessThan(18)
+  await expect(errorRows).toHaveCount(7)
   await page
     .getByRole('group', { name: 'Filter by call outcome' })
     .getByRole('button', { name: 'All', exact: true })
@@ -268,14 +278,6 @@ test('Retry after a failed older page keeps the cached stream and its cursor', a
 test('Session grouping filters before pagination and separates nested episode timelines', async ({
   page,
 }) => {
-  const overviewRequests: URL[] = []
-  page.on('request', (request) => {
-    const url = new URL(request.url())
-
-    if (url.pathname === '/api/me/agent-sessions') {
-      overviewRequests.push(url)
-    }
-  })
   await login(page)
   await page.goto('/agents/activity?show=writes')
   const flatHeadingType = await page
@@ -284,9 +286,14 @@ test('Session grouping filters before pagination and separates nested episode ti
       const style = getComputedStyle(node)
       return { color: style.color, fontSize: style.fontSize, fontWeight: style.fontWeight }
     })
+  const writesOverview = page.waitForRequest((request) => {
+    const url = new URL(request.url())
+    return url.pathname === '/api/me/agent-sessions' && url.searchParams.get('filter') === 'writes'
+  })
   await page.getByRole('button', { name: 'Session', exact: true }).click()
 
   await expect(page).toHaveURL(/\/agents\/activity\?show=writes&group=session$/)
+  const writesOverviewUrl = new URL((await writesOverview).url())
   expect(
     await page.getByText('Recent episodes', { exact: true }).evaluate((node) => {
       const style = getComputedStyle(node)
@@ -295,7 +302,7 @@ test('Session grouping filters before pagination and separates nested episode ti
   ).toEqual(flatHeadingType)
   await expect(page.getByTestId('activity-session-list')).toBeVisible()
   await expect(page.getByTestId('activity-session-outside')).toBeVisible()
-  expect(overviewRequests.at(-1)?.searchParams.get('filter')).toBe('writes')
+  expect(writesOverviewUrl.searchParams.get('filter')).toBe('writes')
   await expect(page.getByText('3 sessions')).toBeVisible()
   const activityMain = page.locator('main.main')
   await expect(activityMain.getByText('release planning', { exact: true })).toHaveCount(0)
@@ -379,9 +386,14 @@ test('Session grouping filters before pagination and separates nested episode ti
   await archived.getByRole('button', { name: 'Load older episode activity' }).click()
   await expect(archived.getByTestId('session-write-row')).toHaveCount(54)
 
+  const readsOverview = page.waitForRequest((request) => {
+    const url = new URL(request.url())
+    return url.pathname === '/api/me/agent-sessions' && url.searchParams.get('filter') === 'reads'
+  })
   await page.getByRole('button', { name: 'Reads', exact: true }).click()
   await expect(page).toHaveURL(/\/agents\/activity\?show=reads&group=session$/)
-  expect(overviewRequests.at(-1)?.searchParams.get('filter')).toBe('reads')
+  const readsOverviewUrl = new URL((await readsOverview).url())
+  expect(readsOverviewUrl.searchParams.get('filter')).toBe('reads')
   await expect(page.getByText('0 sessions')).toBeVisible()
   await expect(activityMain.getByText('release planning', { exact: true })).toHaveCount(0)
   await expect(page.getByTestId('activity-session-events')).toHaveCount(0)
@@ -839,12 +851,17 @@ test('Diagnostics opts in once and narrows the stream with one URL write', async
     'true',
   )
   await expect(queryFilter.getByRole('button', { name: 'Apply query' })).toHaveCount(0)
+  const debouncedRequest = page.waitForRequest((request) => {
+    const url = new URL(request.url())
+    return (
+      url.pathname === '/api/me/agent-sessions/all' &&
+      url.searchParams.get('q') === 'legacy rollout guide' &&
+      !url.searchParams.has('tool')
+    )
+  })
   await queryFilter.getByRole('textbox', { name: 'Retrieval query' }).fill('legacy rollout guide')
   await expect(page).toHaveURL(/\/agents\/activity\?show=reads&q=legacy\+rollout\+guide$/)
-  const debouncedRequest = eventRequests
-    .filter((url) => url.searchParams.get('q') === 'legacy rollout guide')
-    .at(-1)
-  expect(debouncedRequest?.searchParams.has('tool')).toBe(false)
+  expect(new URL((await debouncedRequest).url()).searchParams.has('tool')).toBe(false)
   await queryFilter.getByRole('button', { name: 'Clear search' }).click()
   await expect(page).toHaveURL(/\/agents\/activity\?show=reads$/)
 
@@ -1060,6 +1077,7 @@ test('the narrow aside is one inert-safe drawer and keeps persistence across 720
   await open.click()
 
   const aside = page.getByTestId('aside-groups')
+  const main = page.locator('main')
   await expect(aside).toBeVisible()
   await expect(aside).toHaveAttribute('role', 'dialog')
   await expect(aside).toHaveAttribute('aria-modal', 'true')
@@ -1074,7 +1092,7 @@ test('the narrow aside is one inert-safe drawer and keeps persistence across 720
   await expect(diagnosticsTab).toHaveAttribute('aria-selected', 'true')
   await page.keyboard.press('Shift+Tab')
   expect(await aside.evaluate((node) => node.contains(document.activeElement))).toBe(true)
-  await expect(page.locator('main')).toHaveAttribute('inert', '')
+  await expect(main).toHaveAttribute('inert', '')
   await expect(page.getByRole('button', { name: /activity panels/ })).toHaveCount(1)
   const box = await aside.boundingBox()
   expect(box?.width).toBeLessThanOrEqual(375)
@@ -1083,13 +1101,16 @@ test('the narrow aside is one inert-safe drawer and keeps persistence across 720
 
   await page.setViewportSize({ width: 721, height: 760 })
   await expect(aside).toBeVisible()
+  await expect(main).not.toHaveAttribute('inert', '')
   expect(await page.evaluate(() => localStorage.getItem('bm-aside'))).toBe('1')
   await page.setViewportSize({ width: 719, height: 760 })
-  await expect(aside).toBeVisible()
+  await expect(aside).toHaveAttribute('role', 'dialog')
+  await expect(aside).toHaveAttribute('aria-modal', 'true')
+  await expect(main).toHaveAttribute('inert', '')
 
   await page.keyboard.press('Escape')
   await expect(aside).toHaveCount(0)
-  await expect(page.locator('main')).not.toHaveAttribute('inert', '')
+  await expect(main).not.toHaveAttribute('inert', '')
   await expect(page.getByRole('button', { name: 'Open activity panels' })).toBeFocused()
   expect(page.url()).toBe(url)
   expect(await page.evaluate(() => localStorage.getItem('bm-aside'))).toBe('0')

@@ -1,5 +1,6 @@
 import type { Page } from '@playwright/test'
 import { expect, test } from '../e2e/fixtures'
+import { visualScreenshot } from './screenshot'
 
 const addCredential = async (page: Page) => {
   const response = await page.request.post('/api/providers/credentials', {
@@ -36,7 +37,7 @@ for (const theme of ['dark', 'light'] as const) {
     await page.goto('/settings/providers')
     await page.getByTestId('provider-new').click()
     await expect(page.getByTestId('provider-disclosure')).toBeVisible()
-    await expect(page).toHaveScreenshot(`provider-resource-form-${theme}.png`)
+    await visualScreenshot(page, `provider-resource-form-${theme}`)
   })
 
   test(`provider credential setup form — ${theme}`, async ({ page }) => {
@@ -45,7 +46,7 @@ for (const theme of ['dark', 'light'] as const) {
     await page.goto('/settings/credentials')
     await page.getByTestId('credential-new').click()
     await expect(page.getByTestId('credential-advanced-content')).toHaveCount(0)
-    await expect(page).toHaveScreenshot(`provider-credential-form-${theme}.png`)
+    await visualScreenshot(page, `provider-credential-form-${theme}`)
   })
 
   test(`provider credential inventory — ${theme}`, async ({ page }) => {
@@ -54,7 +55,7 @@ for (const theme of ['dark', 'light'] as const) {
     await addCredential(page)
     await page.goto('/settings/credentials')
     await expect(page.getByTestId('credential-list')).toBeVisible()
-    await expect(page).toHaveScreenshot(`provider-credentials-table-${theme}.png`)
+    await visualScreenshot(page, `provider-credentials-table-${theme}`)
   })
 
   test(`provider resource inventory — ${theme}`, async ({ page }) => {
@@ -63,7 +64,7 @@ for (const theme of ['dark', 'light'] as const) {
     await addResource(page)
     await page.goto('/settings/providers')
     await expect(page.getByTestId('provider-list')).toBeVisible()
-    await expect(page).toHaveScreenshot(`provider-resources-table-${theme}.png`)
+    await visualScreenshot(page, `provider-resources-table-${theme}`)
   })
 
   test(`provider resource task disclosures — ${theme}`, async ({ page }) => {
@@ -75,6 +76,6 @@ for (const theme of ['dark', 'light'] as const) {
     await expect(page.getByTestId('provider-advanced-content')).toHaveCount(0)
     await expect(page.getByTestId('provider-checks')).toBeVisible()
     await expect(page.getByTestId('provider-sharing')).toBeVisible()
-    await expect(page).toHaveScreenshot(`provider-resource-tasks-${theme}.png`)
+    await visualScreenshot(page, `provider-resource-tasks-${theme}`)
   })
 }

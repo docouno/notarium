@@ -1,5 +1,7 @@
 import { defineConfig, devices } from '@playwright/test'
 
+import { VISUAL_SNAPSHOT_PATH_TEMPLATE } from './scripts/visualBaseline.mjs'
+
 // E2E layer (#18.3): the production bundle driven in a real browser against the
 // deterministic fake backend (#18.2), which serves both the SPA and /api from
 // one origin. Behaviour journeys live here; the visual matrix (#18.4) will add
@@ -35,9 +37,28 @@ const PORT = Number(process.env.E2E_PORT || 8788)
 // from an auth-enabled fixture.
 const AUTH_PORT = PORT + 1
 const PROVIDERS_PORT = PORT + 2
+const PREBUILT = process.env.PLAYWRIGHT_PREBUILT === '1'
+const PREBUILT_CHECK = PREBUILT ? 'node scripts/checkup/browserArtifact.mjs verify && ' : ''
+const BUILD = PREBUILT ? '' : 'VITE_PWA=off npm run build && '
+// Node 24.15–24.18 has an upstream Maglev concurrency crash under CPU pressure.
+// Keep the browser runner and its long-lived fake servers on the narrower upstream
+// workaround; --jitless would also avoid it, but needlessly slows every JS tier.
+const TSX = 'node --no-maglev --import tsx'
+const BROWSER_ENV = {
+  ...process.env,
+  DBUS_SESSION_BUS_ADDRESS: process.env.DBUS_SESSION_BUS_ADDRESS ?? 'disabled:',
+}
 
 export default defineConfig({
   testDir: 'test',
+  // Every visual spec shares one external manifest. The project name is deliberately
+  // not part of the path: both visual projects use the same canonical Chromium/Linux
+  // renderer, while the explicit screenshot names keep their cells disjoint.
+  expect: {
+    toHaveScreenshot: {
+      pathTemplate: VISUAL_SNAPSHOT_PATH_TEMPLATE,
+    },
+  },
   // Behaviour journeys (test/e2e) + the visual matrix (test/visual). Only *.spec.ts
   // — the unit layer is *.test.ts under vitest and must not load here.
   testMatch: '**/*.spec.ts',
@@ -51,10 +72,12 @@ export default defineConfig({
   workers: 1,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 1 : 0,
+  failOnFlakyTests: true,
   reporter: process.env.CI ? [['list'], ['html', { open: 'never' }]] : 'list',
   use: {
     baseURL: `http://localhost:${PORT}`,
     trace: 'on-first-retry',
+    launchOptions: { env: BROWSER_ENV },
   },
   projects: [
     {
@@ -84,7 +107,7 @@ export default defineConfig({
       // every spec — non-deterministic noise over the fake backend. The install
       // UI is driven by PwaProvider, not the SW, so it's still covered (a synthetic
       // beforeinstallprompt in pwa.spec.ts); the real SW is verified live.
-      command: `VITE_PWA=off npm run build && PORT=${PORT} FIXTURE=test/fixtures/base.json npx tsx test/fake-server/main.ts`,
+      command: `${PREBUILT_CHECK}${BUILD}PORT=${PORT} FIXTURE=test/fixtures/base.json ${TSX} test/fake-server/main.ts`,
       url: `http://localhost:${PORT}/api/health`,
       reuseExistingServer: !process.env.CI,
       timeout: 120_000,
@@ -92,13 +115,13 @@ export default defineConfig({
     {
       // The base server's command owns the SPA build; this one only waits for
       // dist to exist (the fake serves it as static) and boots the auth world.
-      command: `until [ -f packages/web/dist/index.html ]; do sleep 1; done; PORT=${AUTH_PORT} FIXTURE=test/fixtures/auth.json npx tsx test/fake-server/main.ts`,
+      command: `until [ -f packages/web/dist/index.html ]; do sleep 1; done; PORT=${AUTH_PORT} FIXTURE=test/fixtures/auth.json ${TSX} test/fake-server/main.ts`,
       url: `http://localhost:${AUTH_PORT}/api/health`,
       reuseExistingServer: !process.env.CI,
       timeout: 120_000,
     },
     {
-      command: `until [ -f packages/web/dist/index.html ]; do sleep 1; done; PORT=${PROVIDERS_PORT} FIXTURE=test/fixtures/providers.json npx tsx test/fake-server/main.ts`,
+      command: `until [ -f packages/web/dist/index.html ]; do sleep 1; done; PORT=${PROVIDERS_PORT} FIXTURE=test/fixtures/providers.json ${TSX} test/fake-server/main.ts`,
       url: `http://localhost:${PROVIDERS_PORT}/api/health`,
       reuseExistingServer: !process.env.CI,
       timeout: 120_000,

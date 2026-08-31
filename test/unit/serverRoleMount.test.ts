@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { frontmatterEntryValueOf } from '@notarium/core'
 import { renameNoReplaceIfAvailable } from '@notarium/engine'
 import { createServer } from '../../packages/server/src/apps/server/server'
 import { SYSTEM_PRINCIPAL } from '../../packages/server/src/services/authz'
@@ -666,12 +667,11 @@ describe('createServer — configured role mount', () => {
       }
       expect(registryId).not.toBe(claimedId)
       const settledManifest = await readFile(join(roleDirectory, 'SKILL.md'), 'utf8')
+      const expectedId = verdict === 'duplicate' ? claimedId : registryId
 
-      if (verdict === 'duplicate') {
-        expect(settledManifest).toContain(`\nnotarium-id: ${claimedId}\n`)
-      } else {
-        expect(settledManifest).toContain(`\nnotarium-id: ${registryId}\n`)
-      }
+      // The writer quotes YAML-sensitive IDs (for example a generated value beginning
+      // with `-`). Assert the durable semantic identity, not one legal serialization.
+      expect(frontmatterEntryValueOf(settledManifest, 'notarium-id')).toBe(expectedId)
     },
     15_000,
   )

@@ -6,6 +6,15 @@ import { defineConfig, devices } from '@playwright/test'
 // SSE projector from the named trash-recovery seed so transport seams cannot be
 // replaced by page.route fixtures without losing this proof.
 const PORT = Number(process.env.REAL_E2E_PORT || 8792)
+const READY_PORT = Number(process.env.REAL_E2E_READY_PORT || PORT + 1)
+const PREBUILT = process.env.PLAYWRIGHT_PREBUILT === '1'
+const PREBUILT_CHECK = PREBUILT ? 'node scripts/checkup/browserArtifact.mjs verify && ' : ''
+const BUILD = PREBUILT ? '' : 'VITE_PWA=off npm run build -w @notarium/web && '
+const TSX = 'node --no-maglev --import tsx'
+const BROWSER_ENV = {
+  ...process.env,
+  DBUS_SESSION_BUS_ADDRESS: process.env.DBUS_SESSION_BUS_ADDRESS ?? 'disabled:',
+}
 
 export default defineConfig({
   testDir: 'test/e2e-real',
@@ -14,16 +23,18 @@ export default defineConfig({
   workers: 1,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 1 : 0,
+  failOnFlakyTests: true,
   reporter: 'list',
   outputDir: 'test-results/real',
   use: {
     ...devices['Desktop Chrome'],
     baseURL: `http://localhost:${PORT}`,
     trace: 'on-first-retry',
+    launchOptions: { env: BROWSER_ENV },
   },
   webServer: {
-    command: `VITE_PWA=off npm run build -w @notarium/web && REAL_E2E_PORT=${PORT} npx tsx test/e2e-real/start.ts`,
-    url: `http://localhost:${PORT}/api/health`,
+    command: `${PREBUILT_CHECK}${BUILD}REAL_E2E_PORT=${PORT} ${TSX} test/e2e-real/start.ts`,
+    url: `http://localhost:${READY_PORT}/ready`,
     reuseExistingServer: false,
     timeout: 180_000,
   },

@@ -29,7 +29,7 @@
 // manifest indefinitely. Harmless while the matrix keeps its shape; it needs real
 // handling when the responsive work (#26) reshapes the set of frames.
 
-import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -38,12 +38,12 @@ import { getObject, headObject, presignGet, putObject, sha256hex } from './visua
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const SNAPSHOT_DIR = join(root, 'test/visual/visual.spec.ts-snapshots')
 
-// Playwright names a baseline `<cell>-<project>-<platform>.png` but its failure
-// artefacts only `<cell>-actual.png`, so the two have to be related by a suffix we
-// know rather than one we can read off the files. Overridable, and asserted against
-// the manifest below — guessing wrong would silently pair a cell with the wrong
-// baseline, which is the one mistake this whole protocol exists to prevent.
-const SUFFIX = process.env.VISUAL_SNAPSHOT_SUFFIX || '-chromium-linux.png'
+// Playwright failure artefacts are only `<cell>-actual.png`, so config and protocol
+// share one fixed canonical renderer/path contract. An environment override here
+// could make the publisher name cells differently from the runner that rendered them.
+export const VISUAL_SNAPSHOT_SUFFIX = '-chromium-linux.png'
+export const VISUAL_SNAPSHOT_PATH_TEMPLATE =
+  '{testDir}/visual/visual.spec.ts-snapshots/{arg}-chromium-linux{ext}'
 
 // WHERE the baselines live is deployment configuration, not source. No defaults: a
 // fork running its own visual lane points these at its own storage, and a default
@@ -72,18 +72,106 @@ const CHANNEL = 'v1/channels/main.json'
  * still true in a month, and says exactly where to look until there is a service that
  * can serve these pages properly.
  *
- * The two counts are separate because they mean different things: pixels that moved
- * are reviewed and accepted, a test that failed without a screenshot is a red suite
- * and there is nothing to accept.
+ * The three counts are separate because they mean different things: pixels that moved
+ * are reviewed and accepted, non-pixel/report-integrity failures are a red suite, and
+ * a retry-pass stays red without contributing fresh bytes to a candidate.
  */
 const REVIEW_ENV_FILE = 'review.env'
+const HANDOFF_FILE = 'visual-handoff.json'
+const PULLED_BASE_FILE = 'visual-pulled-base.json'
 const REPORT_FILE = 'visual-report.json'
 
-const writeReviewEnv = (path, diffs, failures) =>
+const dotenvValue = (name, value) => {
+  const text = String(value ?? '')
+
+  if (!text || /[\r\n]/u.test(text)) {
+    throw new Error(`${name} must be a non-empty single-line value`)
+  }
+
+  return text
+}
+
+export const reviewEnvironment = (path, diffs, failures, flakes, acceptTarget) => {
+  const lines = [
+    `VISUAL_REVIEW=${path || '—'}`,
+    `VISUAL_DIFFS=${diffs}`,
+    `VISUAL_FAILURES=${failures}`,
+    `VISUAL_FLAKES=${flakes}`,
+  ]
+
+  if (acceptTarget) {
+    for (const [name, value] of [
+      ['VISUAL_CANDIDATE', acceptTarget.candidate],
+      ['VISUAL_CANDIDATE_COMMIT', acceptTarget.commit],
+      ['VISUAL_CANDIDATE_PIPELINE', acceptTarget.pipeline],
+      ['VISUAL_CANDIDATE_JOB', acceptTarget.job],
+      ['VISUAL_CANDIDATE_SNAPSHOT', acceptTarget.snapshot],
+      ['VISUAL_CANDIDATE_BASE_SNAPSHOT', acceptTarget.baseSnapshot ?? 'none'],
+    ]) {
+      lines.push(`${name}=${dotenvValue(name, value)}`)
+    }
+  }
+
+  return `${lines.join('\n')}\n`
+}
+const writeReviewEnv = (path, diffs, failures, flakes, acceptTarget = null) =>
   writeFile(
     join(root, REVIEW_ENV_FILE),
-    `VISUAL_REVIEW=${path || '—'}\nVISUAL_DIFFS=${diffs}\nVISUAL_FAILURES=${failures}\n`,
+    reviewEnvironment(path, diffs, failures, flakes, acceptTarget),
   )
+export const visualHandoff = (path, diffs, failures, flakes, acceptTarget, flakyCells) => ({
+  schema: 2,
+  review: path || null,
+  counts: { diffs, failures, flakes },
+  flakyCells,
+  accept: acceptTarget ?? null,
+})
+
+export const pulledBaseEvidence = (snapshot) => ({
+  schema: 1,
+  snapshot: snapshot ?? null,
+})
+
+export const assertPulledBaseEvidence = (evidence) => {
+  if (evidence?.schema !== 1) {
+    throw new Error(
+      `pulled visual base schema mismatch: expected 1, got ${evidence?.schema ?? '—'}`,
+    )
+  }
+  if (evidence.snapshot !== null && (typeof evidence.snapshot !== 'string' || !evidence.snapshot)) {
+    throw new Error('pulled visual base snapshot must be a non-empty string or null')
+  }
+
+  return evidence
+}
+
+export const assertChannelMatchesPulledBase = (pulled, currentSnapshot) => {
+  assertPulledBaseEvidence(pulled)
+  const current = currentSnapshot ?? null
+
+  if (current !== pulled.snapshot) {
+    throw new Error(
+      `visual channel moved after pull: pulled ${pulled.snapshot ?? 'no channel'}, current ${current ?? 'no channel'}`,
+    )
+  }
+}
+const writeVisualOutcome = async (
+  path,
+  diffs,
+  failures,
+  flakes,
+  acceptTarget = null,
+  flakyCells = [],
+) => {
+  const handoff = assertVisualHandoff(
+    visualHandoff(path, diffs, failures, flakes, acceptTarget, flakyCells),
+  )
+
+  await Promise.all([
+    writeReviewEnv(path, diffs, failures, flakes, acceptTarget),
+    writeFile(join(root, HANDOFF_FILE), `${JSON.stringify(handoff, null, 2)}\n`),
+  ])
+}
 const blobKey = (digest) => `v1/blobs/sha256/${digest}`
 const snapshotKey = (digest) => `v1/snapshots/sha256/${digest}.json`
 const candidateKey = (slug) => `v1/channels/candidates/${slug}.json`
@@ -104,8 +192,7 @@ export const flags = (argv) => {
     }
     const next = argv[i + 1]
     // A valueless flag is `true` — including the LAST argument, where `next` is
-    // undefined. Reading that as "no value given, so undefined" turns `--bootstrap`
-    // into a silent no-op precisely when it is typed the natural way.
+    // undefined. Keep boolean command flags independent from their position.
     out[argv[i].slice(2)] = next === undefined || next.startsWith('--') ? true : argv[(i += 1)]
   }
 
@@ -138,6 +225,38 @@ export const mergeCells = (baselineCells, rendered) => {
   return { cells, changed }
 }
 
+/** Normalize report artefacts into manifest cells before reading or uploading bytes.
+ *  A shared snapshot directory makes screenshot arguments global: two specs/projects
+ *  using the same argument would otherwise silently overwrite one manifest entry. */
+export const normalizeReportedCells = (reported) => {
+  const seen = new Set()
+
+  return reported.map((entry) => {
+    const cell = `${entry.stem}${VISUAL_SNAPSHOT_SUFFIX}`
+
+    if (seen.has(cell)) {
+      throw new Error(`duplicate rendered cell "${cell}" in Playwright report`)
+    }
+    seen.add(cell)
+
+    return { ...entry, cell }
+  })
+}
+
+/** A first candidate has no accepted cells to carry forward, so accepting a partial
+ *  run would make omissions canonical. Later runs keep old cells on failures; the
+ *  initial transition must contain at least one image and no broken/flaky tests. */
+export const assertInitialCandidate = ({ cells, broken, flaky, integrity = [] }) => {
+  if (!cells.length) {
+    throw new Error('first candidate produced no screenshots')
+  }
+  if (broken.length || flaky.length || integrity.length) {
+    throw new Error(
+      `first candidate is incomplete (${broken.length} broken, ${flaky.length} flaky, ${integrity.length} report-integrity failures)`,
+    )
+  }
+}
+
 /**
  * What the run actually decided, read from Playwright's own JSON report rather than
  * from the files it left behind.
@@ -158,21 +277,74 @@ export const mergeCells = (baselineCells, rendered) => {
  * case and is dropped here, which is the whole flake guard — the retry already IS the
  * second render, so nothing needs to be rendered twice on purpose.
  *
- * `broken` carries the third possibility, which the pixel count cannot express: a test
- * that failed without producing a screenshot at all (a timeout, a broken page). It has
- * no diff to review, and silently contributing nothing would leave the gate green on a
- * red suite.
+ * `broken` carries screenshot-less test failures. `integrity` carries failures of the
+ * report as evidence: global runner errors, skipped/zero tests and duplicate declared
+ * cell names. Neither can be accepted as a pixel change.
  */
 export const reportOutcome = (report) => {
   const cells = []
   const flaky = []
   const broken = []
+  const integrity = []
+  const declared = new Map()
+  let testCount = 0
+  let observedSkipped = 0
+
+  const titleFor = (spec, test) =>
+    `${test.projectName ? `[${test.projectName}] ` : ''}${spec.title || '(untitled test)'}`
+
+  const declareCells = (spec, test) => {
+    const lastResult = test.results?.[test.results.length - 1]
+    const annotations = test.annotations?.length
+      ? test.annotations
+      : (lastResult?.annotations ?? [])
+    const visualAnnotations = annotations.filter((annotation) => annotation.type === 'visual-cell')
+    const cells = []
+
+    if (visualAnnotations.length !== 1) {
+      integrity.push(
+        `${titleFor(spec, test)} declared ${visualAnnotations.length} visual cells; expected exactly one`,
+      )
+    }
+
+    for (const annotation of visualAnnotations) {
+      const name = annotation.description
+
+      if (typeof name !== 'string' || !name) {
+        integrity.push(`${titleFor(spec, test)} declared an empty visual cell`)
+        continue
+      }
+      const cell = `${name}${VISUAL_SNAPSHOT_SUFFIX}`
+      const owner = declared.get(cell)
+
+      if (owner) {
+        integrity.push(
+          `duplicate declared visual cell "${cell}": ${owner} and ${titleFor(spec, test)}`,
+        )
+      } else {
+        declared.set(cell, titleFor(spec, test))
+      }
+      cells.push(cell)
+    }
+
+    return cells
+  }
 
   const visit = (suite) => {
     for (const spec of suite.specs ?? []) {
       for (const test of spec.tests ?? []) {
+        testCount += 1
+        const declaredCells = declareCells(spec, test)
+
+        if (test.status === 'skipped') {
+          observedSkipped += 1
+          integrity.push(`skipped visual test: ${titleFor(spec, test)}`)
+          continue
+        }
         if (test.status === 'flaky') {
-          flaky.push(spec.title)
+          if (declaredCells.length === 1) {
+            flaky.push({ title: titleFor(spec, test), cell: declaredCells[0] })
+          }
           continue
         }
         if (test.status !== 'unexpected') {
@@ -186,15 +358,30 @@ export const reportOutcome = (report) => {
           broken.push(spec.title)
           continue
         }
-        for (const { path } of actuals) {
-          const stem = basename(path, '-actual.png')
-
-          cells.push({
-            stem,
-            actual: path,
-            diff: attachments.find((a) => a.path?.endsWith(`${stem}-diff.png`))?.path,
-          })
+        if (actuals.length !== 1) {
+          integrity.push(
+            `${titleFor(spec, test)} attached ${actuals.length} actual screenshots; expected exactly one`,
+          )
+          continue
         }
+        if (declaredCells.length !== 1) {
+          continue
+        }
+        const path = actuals[0].path
+        const stem = basename(path, '-actual.png')
+        const actualCell = `${stem}${VISUAL_SNAPSHOT_SUFFIX}`
+
+        if (actualCell !== declaredCells[0]) {
+          integrity.push(
+            `${titleFor(spec, test)} declared visual cell "${declaredCells[0]}" but attached "${actualCell}"`,
+          )
+          continue
+        }
+        cells.push({
+          stem,
+          actual: path,
+          diff: attachments.find((a) => a.path?.endsWith(`${stem}-diff.png`))?.path,
+        })
       }
     }
     for (const child of suite.suites ?? []) {
@@ -206,7 +393,210 @@ export const reportOutcome = (report) => {
     visit(suite)
   }
 
-  return { cells, flaky, broken }
+  for (const error of report.errors ?? []) {
+    integrity.push(`Playwright global error: ${error?.message ?? String(error)}`)
+  }
+
+  const statsSkipped = Number(report.stats?.skipped ?? 0)
+
+  for (let i = observedSkipped; i < statsSkipped; i += 1) {
+    integrity.push(`Playwright stats report skipped visual test ${i + 1} of ${statsSkipped}`)
+  }
+
+  const statsTotal = report.stats
+    ? ['expected', 'unexpected', 'flaky', 'skipped'].reduce(
+        (sum, key) => sum + Number(report.stats[key] ?? 0),
+        0,
+      )
+    : null
+
+  if (statsTotal !== null && statsTotal !== testCount) {
+    integrity.push(
+      `Playwright stats count ${statsTotal} does not match ${testCount} serialized visual tests`,
+    )
+  }
+
+  if (testCount === 0 || statsTotal === 0) {
+    integrity.push('Playwright report contains zero visual tests')
+  }
+
+  return { cells, flaky, broken, integrity }
+}
+
+export const visualFailureCount = ({ broken, integrity }) => broken.length + integrity.length
+export const blocksCandidate = (outcome) => visualFailureCount(outcome) > 0
+
+export const bindCarriedFlakyCells = (flaky, baselineCells) =>
+  flaky.map(({ cell, title }) => {
+    const digest = baselineCells[cell]
+
+    if (typeof digest !== 'string' || !digest) {
+      throw new Error(`flaky visual cell "${cell}" has no accepted baseline to carry`)
+    }
+
+    return { cell, digest, title }
+  })
+
+export const assertProducerIdentity = ({ candidate, commit, pipeline, job }) => {
+  const identity = {
+    candidate: dotenvValue('VISUAL_CANDIDATE', candidate),
+    commit: dotenvValue('VISUAL_CANDIDATE_COMMIT', commit),
+    pipeline: dotenvValue('VISUAL_CANDIDATE_PIPELINE', pipeline),
+    job: dotenvValue('VISUAL_CANDIDATE_JOB', job),
+  }
+
+  if (!identity.candidate.endsWith(`-${identity.pipeline}-${identity.job}`)) {
+    throw new Error('candidate slug must end with its exact pipeline and producer job ids')
+  }
+
+  return identity
+}
+
+export const candidatePointer = ({
+  candidate,
+  commit,
+  pipeline,
+  job,
+  snapshot,
+  baseSnapshot,
+  review,
+  carriedFlakyCells,
+}) => ({
+  schema: 2,
+  candidate: dotenvValue('VISUAL_CANDIDATE', candidate),
+  commit: dotenvValue('VISUAL_CANDIDATE_COMMIT', commit),
+  pipeline: dotenvValue('VISUAL_CANDIDATE_PIPELINE', pipeline),
+  job: dotenvValue('VISUAL_CANDIDATE_JOB', job),
+  snapshot: dotenvValue('VISUAL_CANDIDATE_SNAPSHOT', snapshot),
+  baseSnapshot:
+    baseSnapshot === null ? null : dotenvValue('VISUAL_CANDIDATE_BASE_SNAPSHOT', baseSnapshot),
+  review: dotenvValue('VISUAL_REVIEW', review),
+  carriedFlakyCells,
+})
+
+export const assertCandidatePointer = (pointer, expected) => {
+  if (pointer?.schema !== 2) {
+    throw new Error(`candidate pointer schema mismatch: expected 2, got ${pointer?.schema ?? '—'}`)
+  }
+
+  for (const [field, envName] of [
+    ['candidate', 'VISUAL_CANDIDATE'],
+    ['commit', 'VISUAL_CANDIDATE_COMMIT'],
+    ['pipeline', 'VISUAL_CANDIDATE_PIPELINE'],
+    ['job', 'VISUAL_CANDIDATE_JOB'],
+    ['snapshot', 'VISUAL_CANDIDATE_SNAPSHOT'],
+    ['review', 'VISUAL_REVIEW'],
+  ]) {
+    const wanted = dotenvValue(envName, expected[field])
+
+    if (pointer?.[field] !== wanted) {
+      throw new Error(
+        `candidate ${field} mismatch: expected ${wanted}, got ${pointer?.[field] ?? '—'}`,
+      )
+    }
+  }
+  const wantedBase =
+    expected.baseSnapshot === null
+      ? null
+      : dotenvValue('VISUAL_CANDIDATE_BASE_SNAPSHOT', expected.baseSnapshot)
+
+  if (pointer?.baseSnapshot !== wantedBase) {
+    throw new Error(
+      `candidate baseSnapshot mismatch: expected ${wantedBase ?? 'none'}, got ${pointer?.baseSnapshot ?? 'none'}`,
+    )
+  }
+  if (JSON.stringify(pointer?.carriedFlakyCells) !== JSON.stringify(expected.carriedFlakyCells)) {
+    throw new Error('candidate carriedFlakyCells mismatch')
+  }
+}
+
+export const assertVisualHandoff = (handoff) => {
+  if (handoff?.schema !== 2) {
+    throw new Error(`visual handoff schema mismatch: expected 2, got ${handoff?.schema ?? '—'}`)
+  }
+  for (const name of ['diffs', 'failures', 'flakes']) {
+    const value = handoff.counts?.[name]
+
+    if (!Number.isInteger(value) || value < 0) {
+      throw new Error(`visual handoff ${name} must be a non-negative integer`)
+    }
+  }
+  if (handoff.review !== null) {
+    dotenvValue('VISUAL_REVIEW', handoff.review)
+  }
+  if (!Array.isArray(handoff.flakyCells) || handoff.flakyCells.length !== handoff.counts.flakes) {
+    throw new Error('visual handoff flaky cell list does not match its count')
+  }
+  for (const row of handoff.flakyCells) {
+    dotenvValue('visual flaky cell', row.cell)
+    dotenvValue('visual flaky title', row.title)
+    if (row.digest !== undefined) {
+      dotenvValue('visual flaky digest', row.digest)
+    }
+  }
+  if (handoff.accept) {
+    assertProducerIdentity(handoff.accept)
+    assertCandidatePointer(handoff.accept, handoff.accept)
+    if (handoff.review !== handoff.accept.review) {
+      throw new Error('visual handoff review does not match its candidate pointer')
+    }
+    if (handoff.counts.diffs === 0 || handoff.counts.failures) {
+      throw new Error('visual handoff exposes an accept target without clean stable diffs')
+    }
+    if (handoff.counts.flakes && handoff.accept.baseSnapshot === null) {
+      throw new Error('visual handoff cannot carry flaky cells without an accepted base')
+    }
+    if (JSON.stringify(handoff.flakyCells) !== JSON.stringify(handoff.accept.carriedFlakyCells)) {
+      throw new Error('visual handoff flaky cells do not match its candidate pointer')
+    }
+    if (handoff.flakyCells.some(({ digest }) => typeof digest !== 'string' || !digest)) {
+      throw new Error('accepted visual handoff must bind every carried flaky digest')
+    }
+  }
+
+  return handoff
+}
+
+export const visualGateSummary = (handoff) => {
+  const evidence = assertVisualHandoff(handoff)
+  const { diffs, failures, flakes } = evidence.counts
+  const lines = []
+
+  if (failures) {
+    lines.push(
+      `visual: ${failures} non-pixel failure(s) — broken/skipped tests or invalid report evidence.`,
+      "visual: read extended:visual's log; accepting a baseline cannot fix these.",
+    )
+  }
+  if (flakes) {
+    lines.push(
+      `visual: ${flakes} test(s) passed only on retry — their fresh pixels were excluded and retry keeps this gate red.`,
+      ...evidence.flakyCells.map(({ cell, title }) => `visual: flaky — ${title} (${cell})`),
+    )
+  }
+  if (diffs) {
+    lines.push(
+      `visual: ${diffs} cells differ from the accepted baseline.`,
+      `visual: review page — ${evidence.review ?? '—'}`,
+      'visual: open it out of the bucket, and run visual:accept if the new rendering is right.',
+    )
+  }
+
+  return {
+    red: Boolean(failures || flakes || diffs),
+    lines: lines.length ? lines : ['visual: matches the accepted baseline'],
+  }
+}
+
+export const assertCarriedFlakyDigests = (carriedFlakyCells, candidateCells, baseCells) => {
+  for (const { cell, digest } of carriedFlakyCells) {
+    if (baseCells?.[cell] !== digest) {
+      throw new Error(`flaky visual cell "${cell}" no longer matches its accepted base digest`)
+    }
+    if (candidateCells?.[cell] !== digest) {
+      throw new Error(`candidate changed carried flaky cell "${cell}"`)
+    }
+  }
 }
 
 /** Every baseline name must carry the suffix we pair failure artefacts by. Guessing
@@ -221,17 +611,25 @@ export const assertSuffix = (cellNames, suffix) => {
 
 /** Say out loud what was dropped and what has no diff to look at. A guard that
  *  silently swallows cells is indistinguishable from one that is not running. */
-const sayOutcome = ({ flaky, broken }) => {
+const sayOutcome = ({ flaky, broken, integrity = [] }) => {
   if (flaky.length) {
-    say(`visual-baseline: ${flaky.length} cell(s) flaked and passed on retry — not published`)
-    for (const title of flaky) {
-      say(`  flaky: ${title}`)
+    say(
+      `visual-baseline: ${flaky.length} cell(s) flaked and passed on retry — fresh bytes excluded`,
+    )
+    for (const { title, cell } of flaky) {
+      say(`  flaky: ${title} (${cell})`)
     }
   }
   if (broken.length) {
     say(`visual-baseline: ${broken.length} test(s) failed without a screenshot — see the job log`)
     for (const title of broken) {
       say(`  failed: ${title}`)
+    }
+  }
+  if (integrity.length) {
+    say(`visual-baseline: ${integrity.length} report-integrity failure(s) — not published`)
+    for (const failure of integrity) {
+      say(`  invalid: ${failure}`)
     }
   }
 }
@@ -254,32 +652,82 @@ const writeJson = (bucket, key, value) =>
 /** The manifest is addressed by its own digest, which is what makes a snapshot
  *  immutable: the same set of cells and identity always lands on the same key, and a
  *  different one cannot overwrite it. */
-const manifestDigest = (manifest) => sha256hex(JSON.stringify(manifest.cells))
+export const manifestDigest = (manifest) => sha256hex(JSON.stringify(manifest))
 
-const currentManifest = async () => {
+export const bindManifestToChannel = (channelSnapshot, manifest) => {
+  if (manifest.snapshot && manifest.snapshot !== channelSnapshot) {
+    throw new Error(
+      `channel points at snapshot ${channelSnapshot}, but the manifest identifies itself as ${manifest.snapshot}`,
+    )
+  }
+
+  // Legacy manifests already contain this field, but the channel is the authority for
+  // their address. Materializing it here keeps the stale-base guard correct even for a
+  // pre-field manifest instead of weakening "no channel" and "unknown base" into the
+  // same state.
+  return { ...manifest, snapshot: channelSnapshot }
+}
+
+const currentChannelSnapshot = async () => {
   const channel = await readJson(baselineBucket, CHANNEL)
 
   if (!channel) {
     return null
   }
-  const manifest = await readJson(baselineBucket, snapshotKey(channel.snapshot))
-
-  if (!manifest) {
-    die(`channel points at snapshot ${channel.snapshot}, which does not exist`)
+  if (typeof channel.snapshot !== 'string' || !channel.snapshot) {
+    throw new Error('visual channel has no valid snapshot identity')
   }
 
-  return manifest
+  return channel.snapshot
+}
+
+const manifestAtSnapshot = async (snapshot) => {
+  if (snapshot === null) {
+    return null
+  }
+  const manifest = await readJson(baselineBucket, snapshotKey(snapshot))
+
+  if (!manifest) {
+    throw new Error(`snapshot ${snapshot} does not exist`)
+  }
+
+  return bindManifestToChannel(snapshot, manifest)
+}
+
+const currentManifest = async () => {
+  const snapshot = await currentChannelSnapshot()
+
+  return manifestAtSnapshot(snapshot)
 }
 
 // --- pull --------------------------------------------------------------------
 // Into a staging directory, verifying every blob against the digest the manifest
 // names, and only then swapping. A half-finished download must never be able to
 // leave a partial set of "canonical" images behind for the next run to compare to.
+const writePulledBase = async (snapshot) => {
+  const path = join(root, PULLED_BASE_FILE)
+  const staging = `${path}.staging`
+  const evidence = assertPulledBaseEvidence(pulledBaseEvidence(snapshot))
+
+  await writeFile(staging, `${JSON.stringify(evidence, null, 2)}\n`)
+  await rename(staging, path)
+}
+
 const pull = async () => {
+  await Promise.all([
+    rm(join(root, PULLED_BASE_FILE), { force: true }),
+    rm(join(root, `${PULLED_BASE_FILE}.staging`), { force: true }),
+  ])
   const manifest = await currentManifest()
 
   if (!manifest) {
     say('visual-baseline: no channel yet — nothing to compare against (first run)')
+    // `pull` materializes the remote channel locally. If the remote has no channel,
+    // stale files from an earlier local pull must not become an undeclared baseline:
+    // the ordinary run should render every cell as new and publish one reviewable
+    // candidate through the same flow used for later additions.
+    await rm(SNAPSHOT_DIR, { recursive: true, force: true })
+    await writePulledBase(null)
 
     return
   }
@@ -309,6 +757,7 @@ const pull = async () => {
   await rename(SNAPSHOT_DIR, previous).catch(() => {})
   await rename(staging, SNAPSHOT_DIR)
   await rm(previous, { recursive: true, force: true })
+  await writePulledBase(manifest.snapshot)
 
   say(`visual-baseline: pulled ${cells.length} cells from snapshot ${manifest.snapshot ?? ''}`)
 }
@@ -326,74 +775,144 @@ const readReport = async (path) => {
   return JSON.parse(raw)
 }
 
-const publish = async ({ candidate, commit, pipeline, bootstrap, report = REPORT_FILE }) => {
-  if (!candidate) {
-    die('publish needs --candidate <slug>')
+const readVisualHandoff = async (path = HANDOFF_FILE) => {
+  const raw = await readFile(join(root, path), 'utf8').catch(() => null)
+
+  if (!raw) {
+    throw new Error(`no visual handoff at ${path}`)
   }
-  // Bootstrapping is an EXPLICIT act, not something inferred from a missing pointer.
-  // Inferring it means the meaning of a run depends on remote state: the same command
-  // publishes a comparison one day and a whole new baseline set the next, and the
-  // difference is invisible at the call site.
-  const baseline = bootstrap ? null : await currentManifest()
 
-  if (!baseline && !bootstrap) {
-    die('no channel yet — pass --bootstrap to publish the rendered set as a first baseline')
+  return assertVisualHandoff(JSON.parse(raw))
+}
+
+const readPulledBase = async () => {
+  const raw = await readFile(join(root, PULLED_BASE_FILE), 'utf8').catch(() => null)
+
+  if (!raw) {
+    throw new Error('no successful visual pull evidence')
   }
-  // Bootstrap renders the whole set with --update-snapshots, so every test passes and
-  // there is no verdict to read: the snapshot directory IS the candidate.
-  const outcome = baseline ? reportOutcome(await readReport(report)) : null
 
-  let cells
+  return assertPulledBaseEvidence(JSON.parse(raw))
+}
 
-  if (baseline) {
+const publish = async ({ candidate, commit, pipeline, job, report = REPORT_FILE }) => {
+  let producer
+
+  try {
+    producer = assertProducerIdentity({ candidate, commit, pipeline, job })
+  } catch (error) {
+    die(error.message)
+  }
+
+  const outcome = reportOutcome(await readReport(report))
+  const failures = visualFailureCount(outcome)
+
+  sayOutcome(outcome)
+
+  // Broken/report-integrity failures never produce a candidate. Flakes need the exact
+  // pulled baseline before they can be classified as safe carry-forward cells.
+  if (blocksCandidate(outcome)) {
+    say('visual-baseline: non-pixel failures — no candidate published')
+    await writeVisualOutcome(null, 0, failures, outcome.flaky.length, null, outcome.flaky)
+
+    return
+  }
+
+  // The rendered pixels belong to the channel pulled before Playwright started. Never
+  // silently rebase them onto a channel that moved during the run: compare first, then
+  // fetch exactly the pulled manifest, before reading a PNG or writing remote state.
+  let pulled
+  let baseline
+
+  try {
+    pulled = await readPulledBase()
+    assertChannelMatchesPulledBase(pulled, await currentChannelSnapshot())
+    baseline = await manifestAtSnapshot(pulled.snapshot)
+  } catch (error) {
+    say(`visual-baseline: ${error.message} — no candidate published`)
+    await writeVisualOutcome(null, 0, failures + 1, outcome.flaky.length, null, outcome.flaky)
+
+    return
+  }
+  const baselineCells = baseline?.cells ?? {}
+  const initial = pulled.snapshot === null
+
+  try {
+    assertSuffix(Object.keys(baselineCells), VISUAL_SNAPSHOT_SUFFIX)
+  } catch (error) {
+    die(error.message)
+  }
+
+  if (initial) {
     try {
-      assertSuffix(Object.keys(baseline.cells), SUFFIX)
+      assertInitialCandidate(outcome)
     } catch (error) {
-      die(`${error.message} — set VISUAL_SNAPSHOT_SUFFIX`)
+      say(`visual-baseline: ${error.message} — no candidate published`)
+      await writeVisualOutcome(
+        null,
+        0,
+        Math.max(1, failures),
+        outcome.flaky.length,
+        null,
+        outcome.flaky,
+      )
+
+      return
     }
-    cells = { ...baseline.cells }
-  } else {
-    // Bootstrap: no channel exists, so the run generated the whole set itself and the
-    // snapshot directory is the candidate.
-    cells = {}
-    for (const name of await readdir(SNAPSHOT_DIR).catch(() => [])) {
-      if (name.endsWith('.png')) {
-        cells[name] = sha256hex(await readFile(join(SNAPSHOT_DIR, name)))
-      }
-    }
-    say(`visual-baseline: bootstrapping a first snapshot from ${Object.keys(cells).length} cells`)
   }
 
-  let changed = []
+  let carriedFlakyCells
+
+  try {
+    carriedFlakyCells = bindCarriedFlakyCells(outcome.flaky, baselineCells)
+  } catch (error) {
+    say(`visual-baseline: ${error.message} — no candidate published`)
+    await writeVisualOutcome(null, 0, failures + 1, outcome.flaky.length, null, outcome.flaky)
+
+    return
+  }
+
+  if (outcome.flaky.length && !outcome.cells.length) {
+    say('visual-baseline: flakes only — no stable pixel changes to publish')
+    await writeVisualOutcome(null, 0, failures, outcome.flaky.length, null, carriedFlakyCells)
+
+    return
+  }
+
+  let reported
+
+  try {
+    reported = normalizeReportedCells(outcome.cells)
+  } catch (error) {
+    say(`visual-baseline: ${error.message} — no candidate published`)
+    await writeVisualOutcome(null, 0, failures + 1, outcome.flaky.length, null, carriedFlakyCells)
+
+    return
+  }
+
+  if (await headObject(config, baselineBucket, candidateKey(producer.candidate))) {
+    die(`candidate "${producer.candidate}" already exists; producer identities are immutable`)
+  }
+
   const uploads = new Map()
+  const rendered = []
+  const diffFor = new Map()
 
-  if (baseline) {
-    const rendered = []
-    const diffFor = new Map()
+  for (const { cell, actual, diff } of reported) {
+    const bytes = await readFile(actual)
+    const digest = sha256hex(bytes)
 
-    for (const { stem, actual, diff } of outcome.cells) {
-      const bytes = await readFile(actual)
-      const digest = sha256hex(bytes)
-
-      rendered.push([`${stem}${SUFFIX}`, digest])
-      diffFor.set(`${stem}${SUFFIX}`, diff)
-      uploads.set(digest, bytes)
-    }
-
-    const merged = mergeCells(cells, rendered)
-
-    cells = merged.cells
-    changed = merged.changed.map((entry) => ({ ...entry, diff: diffFor.get(entry.cell) }))
-    sayOutcome(outcome)
-  } else {
-    for (const [name, digest] of Object.entries(cells)) {
-      uploads.set(digest, await readFile(join(SNAPSHOT_DIR, name)))
-    }
+    rendered.push([cell, digest])
+    diffFor.set(cell, diff)
+    uploads.set(digest, bytes)
   }
+  const merged = mergeCells(baselineCells, rendered)
+  const cells = merged.cells
+  const changed = merged.changed.map((entry) => ({ ...entry, diff: diffFor.get(entry.cell) }))
 
-  if (baseline && !changed.length) {
-    say('visual-baseline: nothing differs from the channel — no candidate published')
-    await writeReviewEnv(null, 0, outcome.broken.length)
+  if (!changed.length) {
+    say('visual-baseline: no reviewable screenshot changes — no candidate published')
+    await writeVisualOutcome(null, 0, failures, outcome.flaky.length, null, carriedFlakyCells)
 
     return
   }
@@ -407,34 +926,59 @@ const publish = async ({ candidate, commit, pipeline, bootstrap, report = REPORT
   }
 
   const manifest = {
-    schema: 1,
+    // Schema 2 hashes the complete manifest identity. Schema 1 snapshots remain valid
+    // read-only bases, but their digest covered only the cell map.
+    schema: 2,
     cells,
     identity: {
-      commit: commit ?? null,
-      pipeline: pipeline ?? null,
+      commit: producer.commit,
+      pipeline: producer.pipeline,
+      job: producer.job,
+      baseSnapshot: pulled.snapshot,
+      carriedFlakyCells,
       image: process.env.PLAYWRIGHT_TEST_IMAGE ?? null,
     },
   }
   const digest = manifestDigest(manifest)
 
   await writeJson(baselineBucket, snapshotKey(digest), { ...manifest, snapshot: digest })
-  await writeJson(baselineBucket, candidateKey(candidate), {
+  const review = await publishReview({
+    candidate: producer.candidate,
+    changed,
+    cells,
+    pipeline: producer.pipeline,
+    job: producer.job,
+    commit: producer.commit,
+    carriedFlakyCells,
+  })
+  const pointer = candidatePointer({
+    ...producer,
     snapshot: digest,
-    commit: commit ?? null,
-    pipeline: pipeline ?? null,
+    baseSnapshot: pulled.snapshot,
+    review,
+    carriedFlakyCells,
   })
 
-  const review = await publishReview({ candidate, changed, cells, pipeline, commit })
+  // The review must exist before an accept address does. If any review upload fails,
+  // the immutable snapshot may be orphaned, but there is no pointer anyone can accept.
+  await writeJson(baselineBucket, candidateKey(producer.candidate), pointer)
 
   const total = Object.keys(cells).length
 
-  say(`visual-baseline: candidate ${candidate} → snapshot ${digest}`)
+  say(`visual-baseline: candidate ${producer.candidate} → snapshot ${digest}`)
   say(
-    baseline
-      ? `visual-baseline: ${changed.length} of ${total} cells changed`
-      : `visual-baseline: ${total} cells, all of them new`,
+    initial
+      ? `visual-baseline: ${total} cells, all of them new`
+      : `visual-baseline: ${changed.length} of ${total} cells changed`,
   )
-  await writeReviewEnv(review, changed.length, outcome ? outcome.broken.length : 0)
+  await writeVisualOutcome(
+    review,
+    changed.length,
+    failures,
+    outcome.flaky.length,
+    pointer,
+    carriedFlakyCells,
+  )
   if (review) {
     say(`visual-baseline: review page at ${review}`)
   }
@@ -450,10 +994,17 @@ const publish = async ({ candidate, commit, pipeline, bootstrap, report = REPORT
 // The page is reached by opening it OUT of the bucket by hand, so its key has to be
 // legible in a listing of hundreds: `<date>-<candidate>` sorts chronologically and
 // names the exact ref and commit, where a bare pipeline id ("2334") identifies a
-// review only to whoever still remembers that number. It is also literally the
-// candidate slug `visual:accept` takes, so the folder name answers "which one do I
-// accept" without a lookup.
-const publishReview = async ({ candidate, changed, cells, pipeline, commit }) => {
+// review only to whoever still remembers that number. The fixed handoff carries this
+// same job-unique slug, so the folder and privileged accept address cannot drift.
+const publishReview = async ({
+  candidate,
+  changed,
+  cells,
+  pipeline,
+  job,
+  commit,
+  carriedFlakyCells,
+}) => {
   if (!changed.length) {
     return null
   }
@@ -461,7 +1012,7 @@ const publishReview = async ({ candidate, changed, cells, pipeline, commit }) =>
   const prefix = `reviews/${day}-${candidate}`
   const rows = []
 
-  for (const { cell, digest, diff } of changed) {
+  for (const { cell, digest, diff, added } of changed) {
     let diffUrl = null
 
     if (diff) {
@@ -472,6 +1023,7 @@ const publishReview = async ({ candidate, changed, cells, pipeline, commit }) =>
     }
     rows.push({
       cell,
+      added,
       diffUrl,
       actual: presignGet(config, baselineBucket, blobKey(digest)),
       expected: null,
@@ -484,6 +1036,8 @@ const publishReview = async ({ candidate, changed, cells, pipeline, commit }) =>
     total: Object.keys(cells).length,
     commit,
     pipeline,
+    job,
+    carriedFlakyCells,
     day,
   })
   const key = `${prefix}/index.html`
@@ -504,7 +1058,37 @@ const escapeHtml = (value) =>
     (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c],
   )
 
-export const renderReview = ({ candidate, rows, total, commit, pipeline, day }) => `<!doctype html>
+const reviewLead = (rows, total, carriedFlakyCells) => {
+  const added = rows.filter((row) => row.added).length
+  const changed = rows.length - added
+
+  const counts =
+    added === rows.length
+      ? `${added} new cells.`
+      : added
+        ? `${changed} changed and ${added} new cells (${rows.length} of ${total}).`
+        : `${changed} of ${total} cells changed.`
+  const drift =
+    changed > total / 2
+      ? ' Most of the matrix moved at once — that is usually render drift, not a design change.'
+      : ''
+  const flaky = carriedFlakyCells.length
+    ? ` ${carriedFlakyCells.length} flaky cell(s) were excluded; their exact accepted digests are carried from the base. Accepting the stable diffs does not make this run green.`
+    : ''
+
+  return `${counts}${drift}${flaky}`
+}
+
+export const renderReview = ({
+  candidate,
+  rows,
+  total,
+  commit,
+  pipeline,
+  job,
+  carriedFlakyCells,
+  day,
+}) => `<!doctype html>
 <meta charset="utf-8">
 <title>visual review — ${escapeHtml(candidate)}</title>
 <style>
@@ -521,17 +1105,19 @@ export const renderReview = ({ candidate, rows, total, commit, pipeline, day }) 
   img { width: 100%; border: 1px solid #333; background: #000 }
 </style>
 <h1>visual review — ${escapeHtml(candidate)}</h1>
-<p class="lead">${rows.length} of ${total} cells changed.${
-  rows.length > total / 2
-    ? ' Most of the matrix moved at once — that is usually render drift, not a design change.'
+<p class="lead">${reviewLead(rows, total, carriedFlakyCells)}</p>
+${
+  carriedFlakyCells.length
+    ? `<p>carried flaky cells: ${carriedFlakyCells.map(({ cell }) => escapeHtml(cell)).join(', ')}</p>`
     : ''
-}</p>
+}
 <!-- Written into the page, not only into the key: whoever opens this file has
      downloaded it out of a bucket and no longer has the folder name in front of them. -->
 <dl>
   <dt>candidate</dt><dd>${escapeHtml(candidate)}</dd>
   <dt>commit</dt><dd>${escapeHtml(commit ?? '—')}</dd>
   <dt>pipeline</dt><dd>${escapeHtml(pipeline ?? '—')}</dd>
+  <dt>producer job</dt><dd>${escapeHtml(job ?? '—')}</dd>
   <dt>rendered</dt><dd>${escapeHtml(day)}</dd>
   <dt>to accept</dt><dd>run visual:accept on this pipeline</dd>
 </dl>
@@ -551,24 +1137,102 @@ ${rows
 // --- accept ------------------------------------------------------------------
 // The only privileged operation, and it does nothing but move a pointer at pixels
 // that were uploaded and looked at earlier.
-const accept = async ({ candidate }) => {
-  if (!candidate) {
-    die('accept needs --candidate <slug>')
+const accept = async ({ handoff = HANDOFF_FILE }) => {
+  let evidence
+
+  try {
+    evidence = await readVisualHandoff(handoff)
+  } catch (error) {
+    die(error.message)
   }
-  const pointer = await readJson(baselineBucket, candidateKey(candidate))
+  const expected = evidence.accept
+
+  if (!expected) {
+    die('visual handoff contains no acceptable candidate')
+  }
+  const pointer = await readJson(baselineBucket, candidateKey(expected.candidate))
 
   if (!pointer) {
-    die(`no candidate "${candidate}"`)
+    die(`no candidate "${expected.candidate}"`)
   }
-  if (!(await headObject(config, baselineBucket, snapshotKey(pointer.snapshot)))) {
-    die(`candidate points at snapshot ${pointer.snapshot}, which does not exist`)
+  try {
+    assertCandidatePointer(pointer, expected)
+  } catch (error) {
+    die(error.message)
+  }
+  const manifest = await readJson(baselineBucket, snapshotKey(expected.snapshot))
+
+  if (!manifest) {
+    die(`candidate points at snapshot ${expected.snapshot}, which does not exist`)
+  }
+  if (manifest.schema !== 2) {
+    die(`candidate snapshot schema mismatch: expected 2, got ${manifest.schema ?? '—'}`)
+  }
+  const { snapshot: manifestSnapshot, ...manifestBody } = manifest
+
+  if (
+    manifestSnapshot !== expected.snapshot ||
+    manifestDigest(manifestBody) !== expected.snapshot
+  ) {
+    die(`snapshot ${expected.snapshot} does not match its immutable content address`)
+  }
+  for (const field of ['commit', 'pipeline', 'job', 'baseSnapshot']) {
+    if (manifest.identity?.[field] !== expected[field]) {
+      die(
+        `snapshot ${field} mismatch: expected ${expected[field]}, got ${manifest.identity?.[field] ?? '—'}`,
+      )
+    }
+  }
+  if (
+    JSON.stringify(manifest.identity?.carriedFlakyCells) !==
+    JSON.stringify(expected.carriedFlakyCells)
+  ) {
+    die('snapshot carriedFlakyCells mismatch')
+  }
+  const channel = await readJson(baselineBucket, CHANNEL)
+  const currentSnapshot = channel?.snapshot ?? null
+
+  if (currentSnapshot !== expected.baseSnapshot) {
+    die(
+      `candidate is stale: based on ${expected.baseSnapshot ?? 'no channel'}, current channel is ${currentSnapshot ?? 'absent'}`,
+    )
+  }
+  try {
+    const baseManifest = await manifestAtSnapshot(expected.baseSnapshot)
+
+    assertCarriedFlakyDigests(expected.carriedFlakyCells, manifest.cells, baseManifest?.cells ?? {})
+  } catch (error) {
+    die(error.message)
   }
   await writeJson(baselineBucket, CHANNEL, {
-    snapshot: pointer.snapshot,
-    commit: pointer.commit ?? null,
-    acceptedFrom: candidate,
+    snapshot: expected.snapshot,
+    commit: expected.commit,
+    acceptedFrom: expected.candidate,
+    acceptedPipeline: expected.pipeline,
+    acceptedJob: expected.job,
   })
-  say(`visual-baseline: channel now at snapshot ${pointer.snapshot}`)
+  say(`visual-baseline: channel now at snapshot ${expected.snapshot}`)
+}
+
+// The verify job reads the fixed artifact, not dotenv variables: GitLab lets manual,
+// project and pipeline variables override dotenv, so environment counts are useful UI
+// metadata but cannot be the authority for a red/green decision.
+const gate = async ({ handoff = HANDOFF_FILE }) => {
+  let evidence
+
+  try {
+    evidence = await readVisualHandoff(handoff)
+  } catch (error) {
+    die(error.message)
+  }
+  const summary = visualGateSummary(evidence)
+
+  for (const line of summary.lines) {
+    say(line)
+  }
+  if (summary.red) {
+    process.exitCode = 1
+  }
 }
 
 // --- verdict -----------------------------------------------------------------
@@ -578,10 +1242,28 @@ const accept = async ({ candidate }) => {
 // would be a gate that quietly stops gating exactly where most work happens.
 const verdict = async ({ report = REPORT_FILE }) => {
   const outcome = reportOutcome(await readReport(report))
+  const failures = visualFailureCount(outcome)
 
   sayOutcome(outcome)
+  try {
+    const pulled = await readPulledBase()
+
+    assertChannelMatchesPulledBase(pulled, await currentChannelSnapshot())
+  } catch (error) {
+    say(`visual-baseline: ${error.message} — comparison is stale`)
+    await writeVisualOutcome(null, 0, failures + 1, outcome.flaky.length, null, outcome.flaky)
+
+    return
+  }
   say(`visual-baseline: ${outcome.cells.length} cell(s) differ from the pulled baseline`)
-  await writeReviewEnv(null, outcome.cells.length, outcome.broken.length)
+  await writeVisualOutcome(
+    null,
+    outcome.cells.length,
+    failures,
+    outcome.flaky.length,
+    null,
+    outcome.flaky,
+  )
 }
 
 // --- entry -------------------------------------------------------------------
@@ -590,7 +1272,7 @@ const verdict = async ({ report = REPORT_FILE }) => {
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
   const [command, ...rest] = process.argv.slice(2)
   const options = flags(rest)
-  const remote = command !== 'verdict'
+  const remote = command !== 'gate'
 
   // Named one by one rather than as "storage is not configured": a half-set
   // environment is the normal failure here (a credential pair present, the bucket
@@ -602,13 +1284,8 @@ if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) 
       ['VISUAL_S3_KEY_ID', config.keyId],
       ['VISUAL_S3_SECRET', config.secret],
       ['VISUAL_S3_BASELINE_BUCKET', baselineBucket],
-      // Only a comparing publish writes a review page. `pull` and `accept` never touch
-      // that bucket, and neither does `--bootstrap`: it has no baseline to differ from,
-      // so there is nothing to review. Demanding the variable there would block the one
-      // command that has to run before the lane can work at all.
-      ...(command === 'publish' && !options.bootstrap
-        ? [['VISUAL_S3_REVIEW_BUCKET', reviewBucket]]
-        : []),
+      // Every publish is reviewable, including the first one against an empty channel.
+      ...(command === 'publish' ? [['VISUAL_S3_REVIEW_BUCKET', reviewBucket]] : []),
     ]
       .filter(([, value]) => !value)
       .map(([name]) => name)
@@ -622,6 +1299,8 @@ if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) 
 
   if (command === 'verdict') {
     await verdict(options)
+  } else if (command === 'gate') {
+    await gate(options)
   } else if (command === 'pull') {
     await pull()
   } else if (command === 'publish') {
@@ -629,6 +1308,6 @@ if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) 
   } else if (command === 'accept') {
     await accept(options)
   } else {
-    die(`unknown command "${command ?? ''}" — expected pull, publish, accept or verdict`)
+    die(`unknown command "${command ?? ''}" — expected pull, publish, accept, verdict or gate`)
   }
 }

@@ -580,16 +580,24 @@ test('@v15 continuation failures stay visible and bounded until explicit retry',
   })
 
   await page.goto('/agents/abilities/roles')
-  // Both continuations are driven by their sentinel coming into view, and a real page
-  // of rows keeps both below the fold — so both are asked for explicitly.
-  for (const root of ['agents-explorer-roles', 'agents-roles']) {
-    await page
+  // Trigger both first continuations without scrolling. A user-facing click scrolls
+  // the off-screen sentinel into the observer margin first, so the observer and the
+  // click can race into two requests; scrolling alone can leave the sentinel there
+  // for too few frames to fire. The contract under test starts after the failure:
+  // once parked, real observer events must not retry without an explicit click.
+  const continuations = [
+    ['agents-explorer-roles', 'agents-explorer-more-error'],
+    ['agents-roles', 'ability-library-more-error'],
+  ] as const
+
+  for (const [root, error] of continuations) {
+    const continuation = page
       .getByTestId(root)
-      .getByRole('button', { name: /Load more|Retry/ })
-      .scrollIntoViewIfNeeded()
+      .getByRole('button', { name: 'Load more', exact: true })
+
+    await continuation.evaluate((button) => (button as HTMLButtonElement).click())
+    await expect(page.getByTestId(error)).toBeVisible()
   }
-  await expect(page.getByTestId('agents-explorer-more-error')).toBeVisible()
-  await expect(page.getByTestId('ability-library-more-error')).toBeVisible()
   await expect
     .poll(() => ({ explorerFailures, libraryFailures }))
     .toEqual({ explorerFailures: 1, libraryFailures: 1 })

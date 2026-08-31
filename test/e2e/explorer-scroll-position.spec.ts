@@ -56,6 +56,18 @@ const setScrollTop = (page: Page, top: number) =>
   railScroll(page).evaluate((el: HTMLElement, t: number) => {
     el.scrollTo({ top: t })
   }, top)
+const setScrollTopAndWaitForEvent = (page: Page, top: number) =>
+  railScroll(page).evaluate(async (el: HTMLElement, t: number) => {
+    if (el.scrollTop === t) {
+      return
+    }
+    const scrolled = new Promise<void>((resolve) => {
+      el.addEventListener('scroll', () => resolve(), { once: true })
+    })
+
+    el.scrollTo({ top: t })
+    await scrolled
+  }, top)
 // The chevron is the folder row's first button ("Toggle folder"); clicking it
 // toggles without the folder-page navigation a name click can carry.
 const folderTwisty = (page: Page, path: string) =>
@@ -253,7 +265,9 @@ test('anchoring: a reflow ABOVE the viewport shifts scrollTop to hold the visibl
   // makes that floor immune to sub-pixel rounding of the scrollTop we set.
   const { margin, headH, rowH } = await listGeometry(page)
   const anchorTop = Math.round(margin + folderRowIndex(2) * rowH + rowH / 2 - headH)
-  await setScrollTop(page, anchorTop)
+  // scrollTop itself changes synchronously, but the component captures its anchor in
+  // the scroll event. Wait for that exact event before triggering the reflow.
+  await setScrollTopAndWaitForEvent(page, anchorTop)
 
   const area01Row = page.locator('[data-testid="tree-folder"][data-path="area-01"]')
   const area02Row = page.locator('[data-testid="tree-folder"][data-path="area-02"]')
@@ -415,10 +429,12 @@ test('expanding a folder BELOW the open note does NOT move the scroll (symmetry 
 
   // This never moved the scroll even before the fix (a below reflow leaves
   // activeIndex untouched) — lock it so a future change can't regress the
-  // symmetric half.
+  // symmetric half. Compare immediately around EXPANSION: under a slow layout,
+  // Playwright may scroll the partially visible twisty while collapsing it.
   await belowFolder.click()
+  const beforeExpand = await scrollTopOf(page)
   await belowFolder.click()
   await expect(belowNote).toBeVisible()
-  await expect.poll(() => scrollTopOf(page)).toBe(0)
+  await expect.poll(() => scrollTopOf(page)).toBe(beforeExpand)
   await expect(active).toBeInViewport()
 })
